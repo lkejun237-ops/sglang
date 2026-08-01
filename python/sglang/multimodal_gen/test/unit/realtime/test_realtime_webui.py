@@ -87,8 +87,8 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert "Info" not in index_html
     assert 'id="steps" type="number" value="4"' in index_html
     assert 'id="guidance" type="number" value="1"' in index_html
-    assert "styles.css?v=realtime-record-v50" in index_html
-    assert "app.js?v=realtime-record-v96" in index_html
+    assert "styles.css?v=realtime-record-v51" in index_html
+    assert "app.js?v=realtime-record-v97" in index_html
     assert 'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v10";' in app_js
     assert 'const DEFAULT_TARGET_FPS = configuredNumber("targetFps", 16);' in app_js
     assert "const DEFAULT_FRAME_INTERPOLATION_EXP = 1;" in app_js
@@ -215,3 +215,28 @@ def test_realtime_webui_exports_replayable_session_artifact_with_input_trace():
     assert ".json" in app_js
     assert ".html" in app_js
     assert "recordingAssetBaseUrl" in app_js
+
+
+def test_realtime_webui_shows_live_trace_topology_panel():
+    repo_root = Path(__file__).resolve().parents[6]
+    app_js = (
+        repo_root / "python/sglang/multimodal_gen/apps/realtime_webui/app.js"
+    ).read_text()
+    index_html = (
+        repo_root / "python/sglang/multimodal_gen/apps/realtime_webui/index.html"
+    ).read_text()
+    styles_css = (
+        repo_root / "python/sglang/multimodal_gen/apps/realtime_webui/styles.css"
+    ).read_text()
+
+    assert 'id="previewViewBtn"' in index_html
+    assert 'id="traceViewBtn"' in index_html
+    assert 'id="tracePanel"' in index_html
+    assert "Current Request Topology" in index_html
+    assert 'id="traceTopology"' in index_html
+    assert 'id="traceEventList"' in index_html
+    assert "function setWorkspaceView" in app_js
+    assert "function updateRealtimeTracePanel" in app_js
+    assert "currentSessionArtifact" in app_js
+    assert ".workspace-switcher" in styles_css
+    assert ".trace-panel" in styles_css

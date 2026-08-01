@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>sglang-diffusion Realtime Studio</title>
-    <link rel="stylesheet" href="./styles.css?v=realtime-record-v50" />
+    <link rel="stylesheet" href="./styles.css?v=realtime-record-v51" />
   </head>
   <body>
     <main class="shell">
@@ -94,7 +94,11 @@
       </section>
 
       <section class="workspace" aria-label="Realtime workspace">
-        <section class="stage" aria-label="Realtime preview">
+        <div class="workspace-switcher" aria-label="Workspace view">
+          <button id="previewViewBtn" class="workspace-view-button is-active" type="button">Preview</button>
+          <button id="traceViewBtn" class="workspace-view-button" type="button">Trace</button>
+        </div>
+        <section id="previewPanel" class="stage view-panel is-active" aria-label="Realtime preview">
           <div class="topbar">
             <span id="statusDot" class="dot"></span>
             <span id="statusText">Idle</span>
@@ -163,6 +167,24 @@
           </div>
         </section>
 
+        <section id="tracePanel" class="trace-panel view-panel" aria-label="Realtime trace">
+          <div class="trace-header">
+            <div>
+              <div class="section-title">Realtime Trace</div>
+              <h2>Current Request Topology</h2>
+            </div>
+            <div class="trace-summary">
+              <span>Trace<b id="traceIdText">-</b></span>
+              <span>Chunk<b id="traceChunkText">-</b></span>
+              <span>Events<b id="traceEventsText">0</b></span>
+            </div>
+          </div>
+          <div id="traceTopology" class="trace-topology" aria-label="Trace topology"></div>
+          <div id="traceMetrics" class="trace-metrics" aria-label="Trace metrics"></div>
+          <div class="section-title">Recent Trace Events</div>
+          <div id="traceEventList" class="trace-event-list"></div>
+        </section>
+
         <section class="panel presets" aria-label="Presets and camera">
           <div id="modelSectionTitle" class="section-title">LingBot</div>
           <div class="spec-grid">
@@ -180,6 +202,6 @@
     </main>
   <script src="./runtime-config.js"></script>
   <script src="./playback_controller.js?v=realtime-playback-v21"></script>
-  <script src="./app.js?v=realtime-record-v96"></script>
+  <script src="./app.js?v=realtime-record-v97"></script>
 </body>
 </html>

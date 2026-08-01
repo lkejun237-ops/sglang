@@ -295,6 +295,7 @@ let recordingStartedAtMs = 0;
 let recordingBaseFileName = "";
 let currentSessionArtifact = null;
 let recordingArtifact = null;
+let renderedTraceChunks = new Set();
 const decodeRequests = new Map();
 let controlStateController = null;
 let lastSentEventId = 0;
@@ -362,6 +363,7 @@ function drawIdle() {
   }
   setPreviewState("idle");
   renderedPreviewFrames = 0;
+  renderedTraceChunks = new Set();
   ctx.fillStyle = "#11140f";
   ctx.fillRect(0, 0, w, h);
 }
@@ -721,7 +723,7 @@ function createSessionArtifact({ init = currentRequestSnapshot(), referenceImage
     started_client_perf_ms: performance.now(),
     app: {
       name: "sglang-realtime-webui",
-      version: "realtime-record-v96",
+      version: "realtime-record-v97",
       page_url: window.location.href,
       user_agent: navigator.userAgent,
     },
@@ -791,6 +793,7 @@ function recordTrajectoryEvent(type, detail = {}, artifact = currentSessionArtif
   if (artifact.events.length > SESSION_ARTIFACT_EVENT_LIMIT) {
     artifact.events.splice(0, artifact.events.length - SESSION_ARTIFACT_EVENT_LIMIT);
   }
+  updateRealtimeTracePanel();
   return event;
 }
 
@@ -1000,6 +1003,127 @@ function escapeHtmlText(value) {
 
 function escapeHtmlAttribute(value) {
   return escapeHtmlText(value).replace(/"/g, "&quot;");
+}
+
+function setWorkspaceView(view) {
+  const activeView = view === "trace" ? "trace" : "preview";
+  $("previewViewBtn")?.classList.toggle("is-active", activeView === "preview");
+  $("traceViewBtn")?.classList.toggle("is-active", activeView === "trace");
+  $("previewPanel")?.classList.toggle("is-active", activeView === "preview");
+  $("tracePanel")?.classList.toggle("is-active", activeView === "trace");
+  if (activeView === "trace") updateRealtimeTracePanel();
+}
+
+function updateRealtimeTracePanel() {
+  const panel = $("tracePanel");
+  if (!panel) return;
+  const artifact = currentSessionArtifact;
+  $("traceIdText").textContent = artifact?.trace_id ? shortTraceId(artifact.trace_id) : "-";
+  const latestChunk = artifact?.chunks?.[artifact.chunks.length - 1];
+  $("traceChunkText").textContent = latestChunk ? `#${latestChunk.chunk_index}` : "-";
+  $("traceEventsText").textContent = String(artifact?.events?.length || 0);
+  $("traceTopology").innerHTML = buildLiveTraceTopologyHtml(artifact);
+  $("traceMetrics").innerHTML = buildLiveTraceMetricsHtml(artifact);
+  $("traceEventList").innerHTML = buildLiveTraceEventsHtml(artifact);
+}
+
+function shortTraceId(traceId) {
+  const text = String(traceId || "");
+  if (text.length <= 18) return text || "-";
+  return `${text.slice(0, 8)}...${text.slice(-6)}`;
+}
+
+function buildLiveTraceTopologyHtml(artifact) {
+  const nodes = liveTraceNodes(artifact);
+  return nodes.map((node) => `
+    <div class="trace-node">
+      <strong>${escapeHtmlText(node.name)}</strong>
+      <span>${escapeHtmlText(node.subtitle)}</span>
+      <b>${escapeHtmlText(node.duration)}</b>
+    </div>
+  `).join("");
+}
+
+function liveTraceNodes(artifact) {
+  const latestChunk = artifact?.chunks?.[artifact.chunks.length - 1] || {};
+  const events = artifact?.events || [];
+  const initSent = latestEvent(events, "init_sent");
+  const frameReceived = latestEvent(events, "frame_batch_received");
+  const rendered = latestEvent(events, "client.chunk_first_rendered");
+  const clientDelta = initSent && frameReceived
+    ? Math.max(0, Number(frameReceived.client_ms || 0) - Number(initSent.client_ms || 0))
+    : null;
+  const frontendDecode = rendered && frameReceived
+    ? Math.max(0, Number(rendered.client_ms || 0) - Number(frameReceived.client_ms || 0))
+    : null;
+  return [
+    { name: "Browser", subtitle: "input + render", duration: artifact ? `t+${formatTraceMs(artifactClientMs(artifact))}` : "-" },
+    { name: "Gateway", subtitle: "WS edge", duration: networkHandshakeLabel(events) },
+    { name: "Realtime API", subtitle: "session + batch", duration: clientDelta == null ? "-" : formatTraceMs(clientDelta) },
+    { name: "Scheduler", subtitle: "forward", duration: latestChunk.scheduler_forward_ms ? formatTraceMs(latestChunk.scheduler_forward_ms) : "-" },
+    { name: "VAE Encode", subtitle: "input latents", duration: latestChunk.vae_encode_ms ? formatTraceMs(latestChunk.vae_encode_ms) : "-" },
+    { name: "Denoising", subtitle: "DiT / model", duration: latestChunk.denoise_ms ? formatTraceMs(latestChunk.denoise_ms) : "-" },
+    { name: "VAE Decode", subtitle: "output frames", duration: latestChunk.vae_decode_ms ? formatTraceMs(latestChunk.vae_decode_ms) : "-" },
+    { name: "Transport", subtitle: "WebP + WS", duration: latestChunk.ws_write_ms ? formatTraceMs(latestChunk.ws_write_ms) : "-" },
+    { name: "Frontend", subtitle: "decode + canvas", duration: frontendDecode == null ? formatTraceMs(lastDecodeMs || 0) : formatTraceMs(frontendDecode) },
+  ];
+}
+
+function latestEvent(events, type) {
+  for (let index = events.length - 1; index >= 0; index--) {
+    if (events[index].type === type) return events[index];
+  }
+  return null;
+}
+
+function networkHandshakeLabel(events) {
+  const open = latestEvent(events, "socket_open");
+  const initSent = latestEvent(events, "init_sent");
+  if (!open || !initSent) return "-";
+  return formatTraceMs(Math.max(0, Number(open.client_ms || 0) - Number(initSent.client_ms || 0)));
+}
+
+function buildLiveTraceMetricsHtml(artifact) {
+  const latestChunk = artifact?.chunks?.[artifact.chunks.length - 1] || {};
+  const metrics = [
+    ["chunk total", latestChunk.chunk_total_ms ? formatTraceMs(latestChunk.chunk_total_ms) : "-"],
+    ["scheduler", latestChunk.scheduler_forward_ms ? formatTraceMs(latestChunk.scheduler_forward_ms) : "-"],
+    ["denoise", latestChunk.denoise_ms ? formatTraceMs(latestChunk.denoise_ms) : "-"],
+    ["VAE encode", latestChunk.vae_encode_ms ? formatTraceMs(latestChunk.vae_encode_ms) : "-"],
+    ["VAE decode", latestChunk.vae_decode_ms ? formatTraceMs(latestChunk.vae_decode_ms) : "-"],
+    ["frames", latestChunk.num_frames || "-"],
+    ["bytes", latestChunk.ws_payload_bytes ? formatBytes(latestChunk.ws_payload_bytes) : "-"],
+  ];
+  return metrics.map(([label, value]) => `
+    <span><b>${escapeHtmlText(value)}</b>${escapeHtmlText(label)}</span>
+  `).join("");
+}
+
+function buildLiveTraceEventsHtml(artifact) {
+  const events = (artifact?.events || []).slice(-16).reverse();
+  if (!events.length) {
+    return '<div class="trace-event-item"><b>No trace events yet</b><code>Generate or record to populate this view.</code><span></span></div>';
+  }
+  return events.map((event) => {
+    const detail = { ...event };
+    delete detail.type;
+    delete detail.client_ms;
+    delete detail.wall_time;
+    return `
+      <div class="trace-event-item">
+        <b>${escapeHtmlText(event.type)}</b>
+        <span>client ${escapeHtmlText(formatTraceMs(event.client_ms || 0))}</span>
+        <code>${escapeHtmlText(JSON.stringify(detail))}</code>
+      </div>
+    `;
+  }).join("");
+}
+
+function formatTraceMs(value) {
+  const ms = Number(value || 0);
+  if (!Number.isFinite(ms)) return "-";
+  if (ms >= 1000) return `${(ms / 1000).toFixed(ms >= 10000 ? 1 : 2)}s`;
+  return `${Math.round(ms)}ms`;
 }
 
 function startRecording() {
@@ -1999,6 +2123,15 @@ function renderLoop(now) {
     lastDisplayLagMs = now - (item.receivedAt || now);
     $("decodeText").textContent = `${Math.round(item.decodeMs || lastDecodeMs)} ms`;
     $("displayLagText").textContent = `${(lastDisplayLagMs / 1000).toFixed(1)} s`;
+    if (!renderedTraceChunks.has(item.chunk)) {
+      renderedTraceChunks.add(item.chunk);
+      recordTrajectoryEvent("client.chunk_first_rendered", {
+        chunk_index: item.chunk,
+        event_id: item.eventId || item.event_id || 0,
+        decode_ms: Math.round(item.decodeMs || lastDecodeMs || 0),
+        display_lag_ms: Math.round(lastDisplayLagMs || 0),
+      });
+    }
     updateStats();
   } else if (decision.action === "hold") {
     updateStats();
@@ -2936,6 +3069,7 @@ applyQueryParams()
 scheduleRenderLoop();
 updateRecordButton();
 updateRecordFolderButton();
+updateRealtimeTracePanel();
 $("connectBtn").onclick = connect;
 $("stopBtn").onclick = () => closeSession();
 $("sendPromptBtn").onclick = () => sendEvent("prompt", $("prompt").value);
@@ -2950,6 +3084,8 @@ $("recordBtn").onclick = () => {
 if ($("recordFolderBtn")) {
   $("recordFolderBtn").onclick = chooseRecordingDirectory;
 }
+$("previewViewBtn").onclick = () => setWorkspaceView("preview");
+$("traceViewBtn").onclick = () => setWorkspaceView("trace");
 $("firstFrame").onchange = () => drawReferencePreview($("firstFrame").files[0]);
 $("generationMode").addEventListener("change", () => {
   syncGenerationModeUi();
