@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>sglang-diffusion Realtime Studio</title>
-    <link rel="stylesheet" href="./styles.css?v=realtime-record-v49" />
+    <link rel="stylesheet" href="./styles.css?v=realtime-record-v50" />
   </head>
   <body>
     <main class="shell">
@@ -16,10 +16,16 @@
         <label>Server<input id="serverUrl" value="ws://127.0.0.1:30000/v1/realtime_video/generate" /></label>
         <label>Model<input id="model" value="" placeholder="auto from /v1/models" /></label>
         <div class="section-title">Reference</div>
+        <label>Mode
+          <select id="generationMode">
+            <option value="t2v" selected>Text only</option>
+            <option value="reference">Reference image</option>
+          </select>
+        </label>
         <label class="reference-upload">
           <input id="firstFrame" type="file" accept="image/*" />
           <canvas id="referencePreview" width="320" height="180"></canvas>
-          <span id="referenceName">Preset reference</span>
+          <span id="referenceName">Text-only generation</span>
         </label>
         <div class="section-title">Generate the scene</div>
         <label>Prompt<textarea id="prompt" rows="4">A cinematic handheld shot of a quiet city street at dusk, soft reflections, natural motion.</textarea></label>
@@ -98,6 +104,9 @@
               <span id="recordLabel">Record</span>
               <span id="recordDuration" class="record-button-duration">00:00</span>
             </button>
+            <button id="recordFolderBtn" class="record-folder-button" type="button" title="Choose recording folder">
+              <span id="recordFolderLabel">Folder</span>
+            </button>
             <span class="topbar-spacer"></span>
             <label class="preview-scale-control">Preview
               <input id="previewScale" type="range" min="80" max="170" value="100" />
@@ -171,6 +180,6 @@
     </main>
   <script src="./runtime-config.js"></script>
   <script src="./playback_controller.js?v=realtime-playback-v21"></script>
-  <script src="./app.js?v=realtime-record-v94"></script>
+  <script src="./app.js?v=realtime-record-v95"></script>
 </body>
 </html>

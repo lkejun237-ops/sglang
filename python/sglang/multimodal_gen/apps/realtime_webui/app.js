@@ -12,6 +12,11 @@ function configuredNumber(name, fallback) {
   return Number.isFinite(value) ? value : fallback;
 }
 
+function configuredGenerationMode(fallback) {
+  const mode = String(UI_CONFIG.generationMode || fallback || "t2v").toLowerCase();
+  return mode === "reference" ? "reference" : "t2v";
+}
+
 const DEFAULT_PREVIEW_OUTPUT_FORMAT = "webp";
 const DEFAULT_PREVIEW_OUTPUT_QUALITY = 55;
 const MAX_WEBP_PREVIEW_OUTPUT_QUALITY = 80;
@@ -26,6 +31,7 @@ const DEFAULT_UPSCALING_SCALE = 2;
 const DEFAULT_UPSCALING_MODEL =
   "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth";
 const DEFAULT_PREVIEW_SCALE = 100;
+const DEFAULT_GENERATION_MODE = configuredGenerationMode("t2v");
 const RECONNECT_CLOSE_TIMEOUT_MS = 15000;
 const DECODE_QUEUE_SECONDS = 0.5;
 const STARTUP_DECODE_QUEUE_SECONDS = 0.75;
@@ -67,6 +73,8 @@ const CONTROL_ACTION_META = {
 
 function applyRuntimeUiConfig() {
   $("fps").value = String(DEFAULT_TARGET_FPS);
+  $("generationMode").value = DEFAULT_GENERATION_MODE;
+  syncGenerationModeUi();
   $("guidance").value = String(
     configuredNumber("guidanceScale", Number($("guidance").value)),
   );
@@ -274,6 +282,13 @@ let recordingFps = DEFAULT_TARGET_FPS;
 let recordingTimer = 0;
 let recordingSaving = false;
 let recordingEncodeChain = Promise.resolve();
+let recordingDirectoryHandle = null;
+let recordingMediaRecorder = null;
+let recordingStream = null;
+let recordingChunks = [];
+let recordingMimeType = "";
+let recordingFrameTimer = 0;
+let recordingStartedAtMs = 0;
 const decodeRequests = new Map();
 let controlStateController = null;
 let lastSentEventId = 0;
@@ -581,9 +596,13 @@ function closeFrames(items) {
   for (const item of items || []) item.image?.close?.();
 }
 
-function recordingFileName() {
+function recordingFileName(extension = recordingExtensionForMimeType(recordingMimeType)) {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  return `sglang-realtime-${stamp}.mp4`;
+  return `sglang-realtime-${stamp}${extension}`;
+}
+
+function recordingExtensionForMimeType(mimeType) {
+  return String(mimeType || "").includes("mp4") ? ".mp4" : ".webm";
 }
 
 function updateRecordButton() {
@@ -595,8 +614,22 @@ function updateRecordButton() {
   $("recordLabel").textContent = recordingSaving
     ? "Saving"
     : recordingActive ? "Stop" : "Record";
-  const elapsedMs = recordingActive ? recordingFrameIndex / Math.max(1, recordingFps) * 1000 : 0;
+  const elapsedMs = recordingActive
+    ? performance.now() - recordingStartedAtMs
+    : 0;
   $("recordDuration").textContent = formatRecordingDuration(elapsedMs);
+}
+
+function updateRecordFolderButton() {
+  const button = $("recordFolderBtn");
+  if (!button) return;
+  const supported = Boolean(window.showDirectoryPicker);
+  button.disabled = recordingSaving || !supported;
+  button.classList.toggle("is-selected", Boolean(recordingDirectoryHandle));
+  $("recordFolderLabel").textContent = recordingDirectoryHandle ? "Folder OK" : "Folder";
+  button.title = supported
+    ? "Choose recording folder"
+    : "Recording will download to the browser downloads folder";
 }
 
 function formatRecordingDuration(elapsedMs) {
@@ -608,82 +641,264 @@ function formatRecordingDuration(elapsedMs) {
 
 function startRecording() {
   if (recordingActive || recordingSaving) return;
-  if (!window.VideoEncoder || !window.VideoFrame) {
-    setStatus("MP4 unsupported", "error");
-    addHistory("MP4 recording requires WebCodecs H.264 support");
+  if (!window.MediaRecorder || !recordingCanvas.captureStream) {
+    setStatus("Recording unsupported", "error");
+    addHistory("recording requires MediaRecorder canvas capture support");
+    return;
+  }
+  prepareRecordingCanvasSize();
+  recordingFps = Math.max(1, previewPlaybackTargetFps());
+  const stream = recordingCanvas.captureStream(recordingFps);
+  const mimeType = preferredRecordingMimeType();
+  const recorderOptions = {
+    videoBitsPerSecond: recordingVideoBitrate(),
+  };
+  if (mimeType) recorderOptions.mimeType = mimeType;
+  let recorder;
+  try {
+    recorder = new MediaRecorder(stream, recorderOptions);
+  } catch (error) {
+    stream.getTracks().forEach((track) => track.stop());
+    setStatus("Recording unsupported", "error");
+    addHistory(error.message || "recording start failed");
     return;
   }
   recordingActive = true;
-  recordingSamples = [];
-  recordingEncoder = null;
-  recordingEncoderReady = null;
-  recordingEncoderConfig = null;
+  recordingSaving = false;
+  recordingMediaRecorder = recorder;
+  recordingStream = stream;
+  recordingChunks = [];
+  recordingMimeType = recorder.mimeType || mimeType || "video/webm";
   recordingFrameIndex = 0;
-  recordingFps = Math.max(1, previewPlaybackTargetFps());
-  recordingEncodeChain = Promise.resolve();
+  recordingStartedAtMs = performance.now();
+  const fileName = recordingFileName(recordingExtensionForMimeType(recordingMimeType));
+  captureRecordingCanvasFrame();
+  recorder.ondataavailable = (event) => {
+    if (event.data?.size) recordingChunks.push(event.data);
+  };
+  recorder.onerror = (event) => {
+    const error = event.error || event;
+    recordingActive = false;
+    addHistory(error?.message || "recording stream failed");
+    stopRecordingStream();
+    updateRecordButton();
+    updateRecordFolderButton();
+  };
+  recorder.onstop = () => {
+    finalizeRecording(fileName).catch((error) => {
+      addHistory(error.message || "recording save failed");
+      setStatus("Save failed", "error");
+      recordingSaving = false;
+      updateRecordButton();
+      updateRecordFolderButton();
+    });
+  };
+  recorder.start(250);
+  recordingFrameTimer = window.setInterval(() => {
+    captureRecordingCanvasFrame();
+    updateRecordButton();
+  }, 1000 / recordingFps);
   recordingTimer = window.setInterval(updateRecordButton, 250);
   updateRecordButton();
+  updateRecordFolderButton();
   addHistory("recording started");
 }
 
-async function stopRecording() {
+function stopRecording() {
   if (!recordingActive || recordingSaving) return;
   recordingActive = false;
   if (recordingTimer) {
     window.clearInterval(recordingTimer);
     recordingTimer = 0;
   }
+  if (recordingFrameTimer) {
+    window.clearInterval(recordingFrameTimer);
+    recordingFrameTimer = 0;
+  }
   recordingSaving = true;
   updateRecordButton();
-
-  let fileHandle = null;
-  const fileName = recordingFileName();
+  updateRecordFolderButton();
   try {
-    if (window.showSaveFilePicker) {
-      fileHandle = await window.showSaveFilePicker({
-        suggestedName: fileName,
-        types: [{
-          description: "MP4 video",
-          accept: { "video/mp4": [".mp4"] },
-        }],
+    if (recordingMediaRecorder && recordingMediaRecorder.state !== "inactive") {
+      recordingMediaRecorder.stop();
+    } else {
+      finalizeRecording(recordingFileName()).catch((error) => {
+        addHistory(error.message || "recording save failed");
+        setStatus("Save failed", "error");
       });
     }
-    await recordingEncodeChain;
-    if (!recordingEncoder || !recordingSamples.length) throw new Error("No frames were recorded");
-    await recordingEncoder.flush();
-    const mp4Blob = buildRecordingMp4();
-    if (fileHandle) {
-      const writable = await fileHandle.createWritable();
-      await writable.write(mp4Blob);
-      await writable.close();
-    } else {
-      downloadBlob(mp4Blob, fileName);
-    }
-    addHistory(`saved ${recordingSamples.length} frames as mp4`);
   } catch (error) {
-    if (error?.name === "AbortError") {
-      addHistory("recording save canceled");
-    } else {
-      addHistory(error.message || "recording save failed");
-      setStatus("Save failed", "error");
-    }
-  } finally {
-    recordingEncoder?.close?.();
-    recordingEncoder = null;
-    recordingEncoderReady = null;
+    addHistory(error.message || "recording stop failed");
+    setStatus("Save failed", "error");
     recordingSaving = false;
-    recordingSamples = [];
+    stopRecordingStream();
     updateRecordButton();
+    updateRecordFolderButton();
   }
 }
 
-function recordDecodedFrameBatch(decodedFrames) {
-  if (!recordingActive || recordingSaving) return;
-  for (const item of decodedFrames) {
-    if (!recordingActive) break;
-    recordDecodedFrame(item.image);
+function preferredRecordingMimeType() {
+  const types = [
+    "video/webm;codecs=vp9",
+    "video/webm;codecs=vp8",
+    "video/webm",
+    "video/mp4;codecs=avc1.42E01E",
+    "video/mp4",
+  ];
+  return types.find((type) => window.MediaRecorder.isTypeSupported(type)) || "";
+}
+
+function recordingVideoBitrate() {
+  return Math.round(Math.min(
+    80_000_000,
+    Math.max(12_000_000, recordingCanvas.width * recordingCanvas.height * recordingFps * 0.55),
+  ));
+}
+
+function prepareRecordingCanvasSize() {
+  const width = Math.max(2, canvas.width);
+  const height = Math.max(2, canvas.height);
+  if (recordingCanvas.width !== width || recordingCanvas.height !== height) {
+    recordingCanvas.width = width;
+    recordingCanvas.height = height;
   }
-  updateRecordButton();
+}
+
+function captureRecordingCanvasFrame() {
+  if (!recordingActive && !recordingSaving) return;
+  prepareRecordingCanvasSize();
+  recordingCtx.drawImage(canvas, 0, 0, recordingCanvas.width, recordingCanvas.height);
+  drawRecordingKeyOverlay(recordingCtx, activeRecordingActions());
+  recordingFrameIndex += 1;
+}
+
+function activeRecordingActions() {
+  return controlStateController
+    ? Array.from(controlStateController.activeActions).sort()
+    : [];
+}
+
+function drawRecordingKeyOverlay(targetCtx, actions) {
+  if (!actions.length) return;
+  const labels = actions.map((action) => recordingActionLabel(action));
+  const padding = 16;
+  const gap = 8;
+  targetCtx.save();
+  targetCtx.font = "600 24px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
+  targetCtx.textBaseline = "middle";
+  let x = padding;
+  const y = padding;
+  for (const label of labels) {
+    const metrics = targetCtx.measureText(label);
+    const width = Math.ceil(metrics.width + 28);
+    const height = 42;
+    drawRoundedRecordingRect(targetCtx, x, y, width, height, 8);
+    targetCtx.fillStyle = "#fffdf7";
+    targetCtx.fillText(label, x + 14, y + height / 2 + 1);
+    x += width + gap;
+  }
+  targetCtx.restore();
+}
+
+function drawRoundedRecordingRect(targetCtx, x, y, width, height, radius) {
+  const r = Math.min(radius, width / 2, height / 2);
+  targetCtx.beginPath();
+  targetCtx.moveTo(x + r, y);
+  targetCtx.arcTo(x + width, y, x + width, y + height, r);
+  targetCtx.arcTo(x + width, y + height, x, y + height, r);
+  targetCtx.arcTo(x, y + height, x, y, r);
+  targetCtx.arcTo(x, y, x + width, y, r);
+  targetCtx.closePath();
+  targetCtx.fillStyle = "rgba(17, 20, 15, 0.78)";
+  targetCtx.fill();
+  targetCtx.strokeStyle = "rgba(255, 253, 247, 0.24)";
+  targetCtx.lineWidth = 2;
+  targetCtx.stroke();
+}
+
+function recordingActionLabel(action) {
+  const key = {
+    w: "W",
+    a: "A",
+    s: "S",
+    d: "D",
+    i: "↑",
+    j: "←",
+    k: "↓",
+    l: "→",
+  }[action] || action.toUpperCase();
+  const label = CONTROL_ACTION_META[action]?.label || action;
+  return `${key} ${label}`;
+}
+
+async function chooseRecordingDirectory() {
+  if (!window.showDirectoryPicker) {
+    addHistory("folder picker unavailable; recording downloads automatically");
+    updateRecordFolderButton();
+    return;
+  }
+  try {
+    recordingDirectoryHandle = await window.showDirectoryPicker({
+      id: "sglang-realtime-recordings",
+      mode: "readwrite",
+    });
+    addHistory("recording folder selected");
+  } catch (error) {
+    if (error?.name !== "AbortError") {
+      addHistory(error.message || "recording folder selection failed");
+    }
+  } finally {
+    updateRecordFolderButton();
+  }
+}
+
+async function finalizeRecording(fileName) {
+  try {
+    const blob = new Blob(recordingChunks, { type: recordingMimeType || "video/webm" });
+    if (!blob.size) throw new Error("No frames were recorded");
+    await saveRecordingBlob(blob, fileName);
+    const mb = (blob.size / 1024 / 1024).toFixed(1);
+    addHistory(`saved ${recordingFrameIndex} frames · ${mb} MB`);
+  } finally {
+    stopRecordingStream();
+    recordingMediaRecorder = null;
+    recordingChunks = [];
+    recordingSaving = false;
+    updateRecordButton();
+    updateRecordFolderButton();
+  }
+}
+
+async function saveRecordingBlob(blob, fileName) {
+  if (recordingDirectoryHandle) {
+    try {
+      const permission = await recordingDirectoryHandle.queryPermission?.({ mode: "readwrite" });
+      if (permission !== "granted") {
+        const requested = await recordingDirectoryHandle.requestPermission?.({ mode: "readwrite" });
+        if (requested !== "granted") throw new Error("recording folder permission denied");
+      }
+      const fileHandle = await recordingDirectoryHandle.getFileHandle(fileName, {
+        create: true,
+      });
+      const writable = await fileHandle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return;
+    } catch (error) {
+      addHistory(error.message || "recording folder save failed; downloading");
+      recordingDirectoryHandle = null;
+    }
+  }
+  downloadBlob(blob, fileName);
+}
+
+function stopRecordingStream() {
+  recordingStream?.getTracks?.().forEach((track) => track.stop());
+  recordingStream = null;
+}
+
+function recordDecodedFrameBatch(decodedFrames) {
+  void decodedFrames;
 }
 
 function recordDecodedFrame(image) {
@@ -1388,6 +1603,7 @@ function scheduleRenderLoop() {
 }
 
 async function readFirstFrame() {
+  if (isTextOnlyGeneration()) return undefined;
   const file = $("firstFrame").files[0];
   if (file) return new Uint8Array(await file.arrayBuffer());
   if (selectedReferenceBytes) return selectedReferenceBytes;
@@ -1396,6 +1612,49 @@ async function readFirstFrame() {
     return selectedReferenceBytes;
   }
   return undefined;
+}
+
+function selectedGenerationMode() {
+  return $("generationMode").value === "reference" ? "reference" : "t2v";
+}
+
+function isTextOnlyGeneration() {
+  return selectedGenerationMode() === "t2v";
+}
+
+function setGenerationMode(mode, { addToHistory = false } = {}) {
+  $("generationMode").value = mode === "reference" ? "reference" : "t2v";
+  syncGenerationModeUi();
+  if (addToHistory) {
+    addHistory(isTextOnlyGeneration() ? "mode text only" : "mode reference image");
+  }
+}
+
+function syncGenerationModeUi() {
+  const textOnly = isTextOnlyGeneration();
+  const upload = document.querySelector(".reference-upload");
+  upload?.classList.toggle("is-text-only", textOnly);
+  $("firstFrame").disabled = textOnly;
+  if (textOnly) {
+    drawTextOnlyReferencePreview();
+  } else if (!selectedReferenceLabel) {
+    $("referenceName").textContent = "Choose or preset reference";
+  }
+}
+
+function drawTextOnlyReferencePreview() {
+  const preview = $("referencePreview");
+  const previewCtx = preview.getContext("2d", { alpha: false });
+  previewCtx.fillStyle = "#e5e7df";
+  previewCtx.fillRect(0, 0, preview.width, preview.height);
+  previewCtx.fillStyle = "#697062";
+  previewCtx.font = "600 18px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
+  previewCtx.textAlign = "center";
+  previewCtx.textBaseline = "middle";
+  previewCtx.fillText("T2V", preview.width / 2, preview.height / 2 - 8);
+  previewCtx.font = "13px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
+  previewCtx.fillText("text only", preview.width / 2, preview.height / 2 + 16);
+  $("referenceName").textContent = "Text-only generation";
 }
 
 async function fetchReferenceBytes(url) {
@@ -1437,10 +1696,14 @@ function drawReferencePreviewFromImageSource(src, label) {
 }
 
 function drawReferencePreview(file) {
+  if (file) setGenerationMode("reference");
   selectedReferenceBytes = null;
   selectedReferenceUrl = "";
   selectedReferenceLabel = file ? file.name : "";
-  if (!file) return;
+  if (!file) {
+    syncGenerationModeUi();
+    return;
+  }
   drawReferencePreviewFromImageSource(URL.createObjectURL(file), file.name);
 }
 
@@ -1527,17 +1790,18 @@ async function connect() {
     }
     resetStreamStats();
     const epoch = ++streamEpoch;
-    if (!$("firstFrame").files[0] && !selectedReferenceBytes && !selectedReferenceUrl) {
+    if (!isTextOnlyGeneration() && !$("firstFrame").files[0] && !selectedReferenceBytes && !selectedReferenceUrl) {
       await setPresetReference(presets[0]);
     }
     const firstFrame = await readFirstFrame();
-    if (!firstFrame) {
+    if (!isTextOnlyGeneration() && !firstFrame) {
       setStatus("Pick a reference", "error");
       setPreviewState("idle");
       addHistory("reference image required");
       $("connectBtn").disabled = false;
       return;
     }
+    const textOnlyGeneration = isTextOnlyGeneration();
     const previewTransportParams = readPreviewTransportParams();
     const frameInterpolationParams = readFrameInterpolationParams();
     const superResolutionParams = readSuperResolutionParams();
@@ -1554,7 +1818,7 @@ async function connect() {
       realtime_causal_sink_size: readOptionalInteger("sinkSize"),
       realtime_causal_kv_cache_num_frames: readOptionalInteger("windowFrames"),
       max_chunks: $("continuous").checked ? undefined : 1,
-      first_frame: firstFrame,
+      ...(firstFrame ? { first_frame: firstFrame } : {}),
       ...previewTransportParams,
       ...frameInterpolationParams,
       ...superResolutionParams,
@@ -1573,7 +1837,9 @@ async function connect() {
       socket.send(pack(init));
       setStatus("Starting", "live");
       addHistory(
-        `session started with ${selectedReferenceLabel || "uploaded reference"}`
+        textOnlyGeneration
+          ? "session started as text-only"
+          : `session started with ${selectedReferenceLabel || "uploaded reference"}`
       );
     };
     socket.onclose = (event) => {
@@ -1691,7 +1957,7 @@ async function decodeAndEnqueueFrameBatch(header, data, epoch) {
   if (!renderedPreviewFrames && decodedFrames.length) {
     drawFrame(decodedFrames[0].image, { close: false, markRendered: false });
   }
-  // record source frames before preview playback can hold or drop for latency
+  // Recording captures the displayed canvas so playback holds/drops and key overlays match the user view.
   recordDecodedFrameBatch(decodedFrames);
   const enqueueResult = playbackController.enqueueDecodedFrames(header, decodedFrames, now);
   closeFrames(enqueueResult.droppedFrames);
@@ -1785,7 +2051,11 @@ async function applyPreset(preset, options = {}) {
   $("fps").value = UI_CONFIG.targetFps == null ? preset.fps : DEFAULT_TARGET_FPS;
   updateOutputSizeText();
   syncPlaybackTargetFps();
-  await setPresetReference(preset);
+  if (!isTextOnlyGeneration()) {
+    await setPresetReference(preset);
+  } else {
+    drawTextOnlyReferencePreview();
+  }
   if (sendRuntimeEvents) {
     sendEvent("prompt", preset.prompt, `prompt update · ${preset.name}`);
   }
@@ -2074,6 +2344,10 @@ async function applyQueryParams() {
   else applyDefaultServerUrl();
   const model = params.get("model");
   if (model) $("model").value = model;
+  const mode = params.get("mode") || params.get("generation_mode");
+  if (mode === "reference" || mode === "t2v") {
+    setGenerationMode(mode);
+  }
   $("transportFormat").value = params.get("transport") || DEFAULT_PREVIEW_OUTPUT_FORMAT;
   $("transportQuality").value = params.get("quality") || String(DEFAULT_PREVIEW_OUTPUT_QUALITY);
   const playbackParam = params.get("playback");
@@ -2220,6 +2494,7 @@ applyQueryParams()
   .catch(showError);
 scheduleRenderLoop();
 updateRecordButton();
+updateRecordFolderButton();
 $("connectBtn").onclick = connect;
 $("stopBtn").onclick = () => closeSession();
 $("sendPromptBtn").onclick = () => sendEvent("prompt", $("prompt").value);
@@ -2231,7 +2506,14 @@ $("recordBtn").onclick = () => {
     startRecording();
   }
 };
+if ($("recordFolderBtn")) {
+  $("recordFolderBtn").onclick = chooseRecordingDirectory;
+}
 $("firstFrame").onchange = () => drawReferencePreview($("firstFrame").files[0]);
+$("generationMode").addEventListener("change", () => {
+  syncGenerationModeUi();
+  addHistory(isTextOnlyGeneration() ? "mode text only" : "mode reference image");
+});
 $("size").addEventListener("input", () => updateOutputSizeText());
 $("fps").addEventListener("input", syncPlaybackTargetFps);
 $("playbackMode").addEventListener("change", () => syncPlaybackMode());
