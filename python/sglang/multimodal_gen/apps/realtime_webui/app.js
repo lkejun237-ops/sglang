@@ -2123,20 +2123,26 @@ function renderLoop(now) {
     lastDisplayLagMs = now - (item.receivedAt || now);
     $("decodeText").textContent = `${Math.round(item.decodeMs || lastDecodeMs)} ms`;
     $("displayLagText").textContent = `${(lastDisplayLagMs / 1000).toFixed(1)} s`;
-    if (!renderedTraceChunks.has(item.chunk)) {
-      renderedTraceChunks.add(item.chunk);
-      recordTrajectoryEvent("client.chunk_first_rendered", {
-        chunk_index: item.chunk,
-        event_id: item.eventId || item.event_id || 0,
-        decode_ms: Math.round(item.decodeMs || lastDecodeMs || 0),
-        display_lag_ms: Math.round(lastDisplayLagMs || 0),
-      });
-    }
+    recordChunkFirstRendered(item.chunk, {
+      event_id: item.eventId || item.event_id || 0,
+      decode_ms: Math.round(item.decodeMs || lastDecodeMs || 0),
+      display_lag_ms: Math.round(lastDisplayLagMs || 0),
+    });
     updateStats();
   } else if (decision.action === "hold") {
     updateStats();
   }
   scheduleRenderLoop();
+}
+
+function recordChunkFirstRendered(chunkIndex, detail = {}) {
+  const chunk = Number(chunkIndex || 0);
+  if (renderedTraceChunks.has(chunk)) return;
+  renderedTraceChunks.add(chunk);
+  recordTrajectoryEvent("client.chunk_first_rendered", {
+    chunk_index: chunk,
+    ...detail,
+  });
 }
 
 function scheduleRenderLoop() {
@@ -2520,6 +2526,11 @@ async function decodeAndEnqueueFrameBatch(header, data, epoch) {
   const now = performance.now();
   if (!renderedPreviewFrames && decodedFrames.length) {
     drawFrame(decodedFrames[0].image, { close: false, markRendered: false });
+    recordChunkFirstRendered(header.chunk_index, {
+      event_id: header.event_id || 0,
+      decode_ms: Math.round(lastDecodeMs || 0),
+      display_lag_ms: Math.round(now - (header.__received_at || now)),
+    });
   }
   // Recording captures the displayed canvas so playback holds/drops and key overlays match the user view.
   recordDecodedFrameBatch(decodedFrames);

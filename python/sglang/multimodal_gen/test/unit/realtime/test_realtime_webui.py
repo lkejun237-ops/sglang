@@ -208,6 +208,7 @@ def test_realtime_webui_exports_replayable_session_artifact_with_input_trace():
     assert "camera_actions_sent" in app_js
     assert "server_chunk_stats" in app_js
     assert "frame_batch_received" in app_js
+    assert "client.chunk_first_rendered" in app_js
     assert "reference_image" in app_js
     assert "first_frame_sha256" in app_js
     assert "function buildReplayHtml" in app_js
