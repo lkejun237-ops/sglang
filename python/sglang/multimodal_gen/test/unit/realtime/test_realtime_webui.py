@@ -88,7 +88,7 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert 'id="steps" type="number" value="4"' in index_html
     assert 'id="guidance" type="number" value="1"' in index_html
     assert "styles.css?v=realtime-record-v50" in index_html
-    assert "app.js?v=realtime-record-v95" in index_html
+    assert "app.js?v=realtime-record-v96" in index_html
     assert 'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v10";' in app_js
     assert 'const DEFAULT_TARGET_FPS = configuredNumber("targetFps", 16);' in app_js
     assert "const DEFAULT_FRAME_INTERPOLATION_EXP = 1;" in app_js
@@ -191,3 +191,27 @@ def test_realtime_webui_records_current_canvas_with_key_overlay_to_folder():
     assert "activeRecordingActions()" in app_js
     assert "saveRecordingBlob" in app_js
     assert ".record-folder-button" in styles_css
+
+
+def test_realtime_webui_exports_replayable_session_artifact_with_input_trace():
+    repo_root = Path(__file__).resolve().parents[6]
+    app_js = (
+        repo_root / "python/sglang/multimodal_gen/apps/realtime_webui/app.js"
+    ).read_text()
+
+    assert "function createSessionArtifact" in app_js
+    assert "let currentSessionArtifact = null;" in app_js
+    assert "function recordTrajectoryEvent" in app_js
+    assert "prompt_update" in app_js
+    assert "key_down" in app_js
+    assert "key_up" in app_js
+    assert "camera_actions_sent" in app_js
+    assert "server_chunk_stats" in app_js
+    assert "frame_batch_received" in app_js
+    assert "reference_image" in app_js
+    assert "first_frame_sha256" in app_js
+    assert "function buildReplayHtml" in app_js
+    assert "function saveRecordingArtifactFiles" in app_js
+    assert ".json" in app_js
+    assert ".html" in app_js
+    assert "recordingAssetBaseUrl" in app_js
