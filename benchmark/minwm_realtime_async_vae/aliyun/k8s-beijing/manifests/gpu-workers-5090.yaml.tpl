@@ -383,6 +383,14 @@ spec:
             - {name: taehv, mountPath: /models/taehv, readOnly: true}
             - {name: runtime-tools-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
             - {name: runtime-tools-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
+            - {name: runtime-utils-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
+            - {name: runtime-utils-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
             - {name: shm, mountPath: /dev/shm}
         - name: denoiser-1
           image: ${GPU_RUNTIME_IMAGE}
@@ -494,6 +502,14 @@ spec:
             - {name: taehv, mountPath: /models/taehv, readOnly: true}
             - {name: runtime-tools-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
             - {name: runtime-tools-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
+            - {name: runtime-utils-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
+            - {name: runtime-utils-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
             - {name: shm, mountPath: /dev/shm}
         - name: denoiser-2
           image: ${GPU_RUNTIME_IMAGE}
@@ -605,6 +621,14 @@ spec:
             - {name: taehv, mountPath: /models/taehv, readOnly: true}
             - {name: runtime-tools-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
             - {name: runtime-tools-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
+            - {name: runtime-utils-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
+            - {name: runtime-utils-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
             - {name: shm, mountPath: /dev/shm}
         - name: denoiser-3
           image: ${GPU_RUNTIME_IMAGE}
@@ -716,6 +740,14 @@ spec:
             - {name: taehv, mountPath: /models/taehv, readOnly: true}
             - {name: runtime-tools-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
             - {name: runtime-tools-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
+            - {name: runtime-utils-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
+            - {name: runtime-utils-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
             - {name: shm, mountPath: /dev/shm}
         - name: denoiser-4
           image: ${GPU_RUNTIME_IMAGE}
@@ -827,6 +859,14 @@ spec:
             - {name: taehv, mountPath: /models/taehv, readOnly: true}
             - {name: runtime-tools-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
             - {name: runtime-tools-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
+            - {name: runtime-utils-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
+            - {name: runtime-utils-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
             - {name: shm, mountPath: /dev/shm}
         - name: denoiser-5
           image: ${GPU_RUNTIME_IMAGE}
@@ -938,6 +978,14 @@ spec:
             - {name: taehv, mountPath: /models/taehv, readOnly: true}
             - {name: runtime-tools-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
             - {name: runtime-tools-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
+            - {name: runtime-utils-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
+            - {name: runtime-utils-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
             - {name: shm, mountPath: /dev/shm}
         - name: denoiser-6
           image: ${GPU_RUNTIME_IMAGE}
@@ -1049,6 +1097,14 @@ spec:
             - {name: taehv, mountPath: /models/taehv, readOnly: true}
             - {name: runtime-tools-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
             - {name: runtime-tools-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
+            - {name: runtime-utils-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
+            - {name: runtime-utils-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
             - {name: shm, mountPath: /dev/shm}
       volumes:
         - {name: worker-epoch-denoiser-0, emptyDir: {}}
@@ -1061,6 +1117,9 @@ spec:
         - {name: startup-lock, emptyDir: {}}
         - {name: shm, emptyDir: {medium: Memory, sizeLimit: 256Gi}}
         - {name: runtime-tools-patch, configMap: {name: zing-runtime-tools-patch}}
+        - {name: runtime-realtime-patch, configMap: {name: zing-runtime-realtime-patch}}
+        - {name: runtime-utils-patch, configMap: {name: zing-runtime-utils-patch}}
+        - {name: runtime-openai-realtime-entrypoint-patch, configMap: {name: zing-runtime-openai-realtime-entrypoint-patch}}
         - name: model
           hostPath:
             path: /data/zing-realtime/model-cache/zing/model
@@ -1199,9 +1258,18 @@ spec:
           volumeMounts:
             - {name: worker-epoch-vae-0, mountPath: /var/run/minwm-worker}
             - {name: taehv, mountPath: /models/taehv, readOnly: true}
-            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_client.py, subPath: async_vae_client.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_worker.py, subPath: async_vae_worker.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_metrics.py, subPath: async_vae_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/h264_media_pipeline.py, subPath: h264_media_pipeline.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_reservation.py, subPath: worker_reservation.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/exact_vae_backend.py, subPath: exact_vae_backend.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
             - {name: runtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/realtime_vae_server.py, subPath: realtime_vae_server.py, readOnly: true}
-            - {name: runtime-utils-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/utils, readOnly: true}
+            - {name: runtime-utils-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/utils/logging_utils.py, subPath: logging_utils.py, readOnly: true}
+            - {name: runtime-utils-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_trace.py, subPath: realtime_trace.py, readOnly: true}
+            - {name: runtime-utils-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
             - {name: runtime-envs-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/envs.py, subPath: envs.py, readOnly: true}
             - {name: runtime-dep-shims, mountPath: /opt/sglang/python/prometheus_client.py, subPath: prometheus_client.py, readOnly: true}
             - {name: runtime-dep-shims, mountPath: /opt/sglang/python/sitecustomize.py, subPath: sitecustomize.py, readOnly: true}

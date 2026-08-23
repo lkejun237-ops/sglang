@@ -46,6 +46,7 @@ WEBUI_STATIC_SOURCE_DIR="${WEBUI_STATIC_SOURCE_DIR:-${REPO_ROOT}/python/sglang/m
 RUNTIME_SOURCE_PATCH_VERSION="${RUNTIME_SOURCE_PATCH_VERSION:-runtime-v2-h264-20260822}"
 RUNTIME_REALTIME_SOURCE_DIR="${RUNTIME_REALTIME_SOURCE_DIR:-${REPO_ROOT}/python/sglang/multimodal_gen/runtime/realtime}"
 RUNTIME_ENTRYPOINT_SOURCE_DIR="${RUNTIME_ENTRYPOINT_SOURCE_DIR:-${REPO_ROOT}/python/sglang/multimodal_gen/runtime/entrypoints}"
+RUNTIME_OPENAI_REALTIME_ENTRYPOINT_SOURCE_DIR="${RUNTIME_OPENAI_REALTIME_ENTRYPOINT_SOURCE_DIR:-${RUNTIME_ENTRYPOINT_SOURCE_DIR}/openai/realtime}"
 RUNTIME_UTILS_SOURCE_DIR="${RUNTIME_UTILS_SOURCE_DIR:-${REPO_ROOT}/python/sglang/multimodal_gen/runtime/utils}"
 MINWM_PROFILE_LAUNCHER_SOURCE="${MINWM_PROFILE_LAUNCHER_SOURCE:-${REPO_ROOT}/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py}"
 RUNTIME_SHIMS_SOURCE_DIR="${RUNTIME_SHIMS_SOURCE_DIR:-${SCRIPT_DIR}/runtime-shims}"
@@ -267,6 +268,9 @@ apply_runtime_source_patch() {
     realtime_coordinator_server.py
     realtime_vae_server.py
   )
+  local openai_realtime_entrypoint_files=(
+    realtime_video_api.py
+  )
   local utils_files=(
     logging_utils.py
     realtime_video.py
@@ -276,6 +280,12 @@ apply_runtime_source_patch() {
   for file in "${entrypoint_files[@]}"; do
     if [[ ! -f "${RUNTIME_ENTRYPOINT_SOURCE_DIR}/${file}" ]]; then
       printf 'missing runtime entrypoint file: %s\n' "${RUNTIME_ENTRYPOINT_SOURCE_DIR}/${file}" >&2
+      return 1
+    fi
+  done
+  for file in "${openai_realtime_entrypoint_files[@]}"; do
+    if [[ ! -f "${RUNTIME_OPENAI_REALTIME_ENTRYPOINT_SOURCE_DIR}/${file}" ]]; then
+      printf 'missing OpenAI realtime entrypoint file: %s\n' "${RUNTIME_OPENAI_REALTIME_ENTRYPOINT_SOURCE_DIR}/${file}" >&2
       return 1
     fi
   done
@@ -297,13 +307,18 @@ apply_runtime_source_patch() {
   done
 
   ssh -o BatchMode=yes "${SSH_HOST}" \
-    "rm -rf '${remote_patch_dir}' && mkdir -p '${remote_patch_dir}/realtime' '${remote_patch_dir}/entrypoints' '${remote_patch_dir}/utils' '${remote_patch_dir}/tools' '${remote_patch_dir}/shims'"
+    "rm -rf '${remote_patch_dir}' && mkdir -p '${remote_patch_dir}/realtime' '${remote_patch_dir}/entrypoints' '${remote_patch_dir}/openai-realtime-entrypoints' '${remote_patch_dir}/utils' '${remote_patch_dir}/tools' '${remote_patch_dir}/shims'"
   scp -q "${RUNTIME_REALTIME_SOURCE_DIR}"/*.py "${SSH_HOST}:${remote_patch_dir}/realtime/"
   local entrypoint_sources=()
   for file in "${entrypoint_files[@]}"; do
     entrypoint_sources+=("${RUNTIME_ENTRYPOINT_SOURCE_DIR}/${file}")
   done
   scp -q "${entrypoint_sources[@]}" "${SSH_HOST}:${remote_patch_dir}/entrypoints/"
+  local openai_realtime_entrypoint_sources=()
+  for file in "${openai_realtime_entrypoint_files[@]}"; do
+    openai_realtime_entrypoint_sources+=("${RUNTIME_OPENAI_REALTIME_ENTRYPOINT_SOURCE_DIR}/${file}")
+  done
+  scp -q "${openai_realtime_entrypoint_sources[@]}" "${SSH_HOST}:${remote_patch_dir}/openai-realtime-entrypoints/"
   local utils_sources=()
   for file in "${utils_files[@]}"; do
     utils_sources+=("${RUNTIME_UTILS_SOURCE_DIR}/${file}")
@@ -323,6 +338,7 @@ set -Eeuo pipefail
 kubectl -n "${NAMESPACE}" delete configmap \
   zing-runtime-realtime-patch \
   zing-runtime-entrypoint-patch \
+  zing-runtime-openai-realtime-entrypoint-patch \
   zing-runtime-utils-patch \
   zing-runtime-tools-patch \
   zing-runtime-envs-patch \
@@ -334,6 +350,8 @@ kubectl -n "${NAMESPACE}" create configmap zing-runtime-entrypoint-patch \
   --from-file="${REMOTE_PATCH_DIR}/entrypoints/realtime_gateway_server.py" \
   --from-file="${REMOTE_PATCH_DIR}/entrypoints/realtime_coordinator_server.py" \
   --from-file="${REMOTE_PATCH_DIR}/entrypoints/realtime_vae_server.py"
+kubectl -n "${NAMESPACE}" create configmap zing-runtime-openai-realtime-entrypoint-patch \
+  --from-file="${REMOTE_PATCH_DIR}/openai-realtime-entrypoints/realtime_video_api.py"
 kubectl -n "${NAMESPACE}" create configmap zing-runtime-utils-patch \
   --from-file="${REMOTE_PATCH_DIR}/utils"
 kubectl -n "${NAMESPACE}" create configmap zing-runtime-tools-patch \

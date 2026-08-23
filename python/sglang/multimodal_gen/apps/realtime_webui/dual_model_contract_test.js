@@ -6,6 +6,7 @@ const root = __dirname;
 const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
 const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
 const app = fs.readFileSync(path.join(root, "app.js"), "utf8");
+const h264 = fs.readFileSync(path.join(root, "h264_websocket_session.js"), "utf8");
 
 assert.equal(
   (html.match(/class="model-player"/g) || []).length,
@@ -106,13 +107,13 @@ assert.match(html, /<span>FPS<b id="lingbot2RateText">-<\/b><\/span>/, "LingBot2
 assert.match(html, /<span>FPS<b id="minwmPerfFps">-<\/b><\/span>/, "MinWM should show stage FPS");
 assert.match(html, /<span>FPS<b id="lingbot2PerfFps">-<\/b><\/span>/, "LingBot2 should show stage FPS");
 assert.match(html, /下行带宽<b id="minwmPerfData">-<\/b>/, "Zing should show measured downlink bandwidth");
-assert.match(html, /VAE 编码队列<b id="minwmPerfH264Queue">-<\/b>/, "Zing should show VAE encoder queue latency");
+assert.match(html, /H\.264 队列<b id="minwmPerfH264Queue">-<\/b>/, "Zing should show H.264 queue latency");
 assert.match(html, /H\.264 写入<b id="minwmPerfH264Feed">-<\/b>/, "Zing should show H.264 encoder feed latency");
 assert.match(html, /WS 下行<b id="minwmPerfDownlink">-<\/b>/, "Zing should show wire downlink latency separately");
 assert.match(html, /MSE 队列<b id="minwmPerfMseQueue">-<\/b>/, "Zing should show browser append queue latency");
 assert.match(html, /MSE 追加<b id="minwmPerfMseAppend">-<\/b>/, "Zing should show SourceBuffer append latency");
 assert.match(html, /播放缓冲<b id="minwmPerfPlaybackBuffer">-<\/b>/, "Zing should show playback lead");
-assert.match(html, /VAE 编码队列<b id="lingbot2PerfH264Queue">-<\/b>/, "LingBot2 should show VAE encoder queue latency");
+assert.match(html, /H\.264 队列<b id="lingbot2PerfH264Queue">-<\/b>/, "LingBot2 should show H.264 queue latency");
 assert.match(html, /H\.264 写入<b id="lingbot2PerfH264Feed">-<\/b>/, "LingBot2 should show H.264 encoder feed latency");
 assert.match(html, /WS 下行<b id="lingbot2PerfDownlink">-<\/b>/, "LingBot2 should show wire downlink latency separately");
 assert.match(html, /MSE 队列<b id="lingbot2PerfMseQueue">-<\/b>/, "LingBot2 should show browser append queue latency");
@@ -145,6 +146,16 @@ assert.match(
   app,
   /primaryControlSentEpochByEvent[\s\S]*?lastControlToVideoMs: Math\.max/,
   "Zing should measure the first rendered frame after each control event",
+);
+assert.match(
+  app,
+  /function freshProtocolMetric\(value, observedAtMs, ttlMs = 5000\)/,
+  "H.264 input-to-video metrics should expire when they are no longer fresh",
+);
+assert.match(
+  h264,
+  /lastPresentedControlToVideoAtMs: presentedEpochMs/,
+  "H.264 should timestamp presented input-to-video measurements",
 );
 assert.match(
   app,
@@ -229,11 +240,11 @@ for (const selector of ["model-slot-config", "stage-controls", "prompt-update-he
 assert.match(html, /playback_controller\.js\?v=realtime-playback-v34/);
 assert.match(html, /model_session\.js\?v=dual-h264-telemetry-v1/);
 assert.match(html, /dual_model_controller\.js\?v=dual-model-v6/);
-assert.match(html, /h264_websocket_session\.js\?v=h264-live-edge-rate-v2/);
+assert.match(html, /h264_websocket_session\.js\?v=h264-live-edge-rate-v3/);
 assert.match(html, /prompt_rewrite_controller\.js\?v=prompt-rewrite-v3/);
 assert.match(html, /world_rules_controller\.js\?v=world-rules-v4/);
 assert.match(html, /styles\.css\?v=world-studio-single-zing-v3/);
-assert.match(html, /app\.js\?v=world-studio-single-zing-v10-recording/);
+assert.match(html, /app\.js\?v=world-studio-single-zing-v11-metrics/);
 assert.match(html, /id="minwmH264Viewport"/);
 assert.match(html, /id="lingbot2H264Viewport"/);
 assert.match(html, /id="minwmPerfScheduler"/);

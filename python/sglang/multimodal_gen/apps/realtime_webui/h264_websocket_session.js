@@ -747,6 +747,10 @@
         const sentEpochMs = sentEventIds.length
           ? this.controlSentEpochByEvent.get(sentEventIds[0])
           : 0;
+        const presentedEpochMs = Date.now();
+        const controlToVideoMs = sentEpochMs && isFirstForEvent
+          ? Math.max(0, presentedEpochMs - sentEpochMs)
+          : null;
         const stats = {
           frames: this.framesPresented,
           framesDecoded: this.framesPresented,
@@ -757,14 +761,17 @@
           lastEncodeToPresentMs: metadata.h264EncodedEpochMs
             ? Math.max(
                 0,
-                Date.now() - metadata.h264EncodedEpochMs + this.lastGatewayClockOffsetMs,
+                presentedEpochMs - metadata.h264EncodedEpochMs + this.lastGatewayClockOffsetMs,
               )
             : 0,
           lastPresentedAfterMetadataMs: metadata.metadataReceivedAtMs
             ? Math.max(0, Number(now || performance.now()) - metadata.metadataReceivedAtMs)
             : 0,
-          ...(sentEpochMs && isFirstForEvent
-            ? { lastPresentedControlToVideoMs: Math.max(0, Date.now() - sentEpochMs) }
+          ...(controlToVideoMs !== null
+            ? {
+                lastPresentedControlToVideoMs: controlToVideoMs,
+                lastPresentedControlToVideoAtMs: presentedEpochMs,
+              }
             : {}),
         };
         this._emitStats(stats);

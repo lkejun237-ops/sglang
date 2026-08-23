@@ -2326,6 +2326,14 @@ function protocolMetric(...values) {
   return null;
 }
 
+function freshProtocolMetric(value, observedAtMs, ttlMs = 5000) {
+  const metric = protocolMetric(value);
+  if (metric === null) return null;
+  const observedAt = Number(observedAtMs || 0);
+  if (observedAt > 0 && Date.now() - observedAt > ttlMs) return null;
+  return metric;
+}
+
 function protocolMetricText(value) {
   return value === null ? "-" : performanceMs(value);
 }
@@ -2382,9 +2390,12 @@ function renderProtocolPerformance(key, stats = {}) {
     telemetry.denoiser_ms,
     telemetry.modelDenoiseMs,
   );
-  const e2eMs = protocolMetric(
-    stats.lastPresentedControlToVideoMs,
-    stats.lastControlToVideoMs,
+  const e2eMs = (
+    freshProtocolMetric(
+      stats.lastPresentedControlToVideoMs,
+      stats.lastPresentedControlToVideoAtMs,
+    )
+    ?? protocolMetric(stats.lastControlToVideoMs)
   );
   $(`${key}PerfData`).textContent = bytesReceived > 0
     ? `${Number(receiveMbps || 0).toFixed(1)} Mb/s`
