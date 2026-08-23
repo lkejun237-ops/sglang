@@ -244,7 +244,7 @@ assert.match(html, /h264_websocket_session\.js\?v=h264-live-edge-rate-v3/);
 assert.match(html, /prompt_rewrite_controller\.js\?v=prompt-rewrite-v3/);
 assert.match(html, /world_rules_controller\.js\?v=world-rules-v4/);
 assert.match(html, /styles\.css\?v=world-studio-single-zing-v3/);
-assert.match(html, /app\.js\?v=world-studio-single-zing-v11-metrics/);
+assert.match(html, /app\.js\?v=world-studio-single-zing-v12-skills/);
 assert.match(html, /id="minwmH264Viewport"/);
 assert.match(html, /id="lingbot2H264Viewport"/);
 assert.match(html, /id="minwmPerfScheduler"/);
@@ -338,7 +338,7 @@ assert.match(app, /return \[\.\.\.presets, \.\.\.customWorldPresets\]/, "custom 
 assert.match(app, /await writeStoredCustomWorld\(record\)/, "custom worlds should persist in browser storage");
 assert.match(
   app,
-  /const connectionReport = await dualModelController\.connect\(init\);[\s\S]*?rememberEnteredWorld\(/,
+  /const connectionReport = await dualModelController\.connect\((?:init|connectionInit)\);[\s\S]*?rememberEnteredWorld\(/,
   "custom worlds should only be saved after a model connection succeeds",
 );
 assert.match(
@@ -423,7 +423,7 @@ assert.doesNotMatch(
 );
 
 const server = fs.readFileSync(path.join(root, "server.py"), "utf8");
-assert.match(app, /const connectionReport = await dualModelController\.connect\(init\)/);
+assert.match(app, /const connectionReport = await dualModelController\.connect\((?:init|connectionInit)\)/);
 assert.match(app, /const delivery = dualModelController\.sendEvent\(kind, payload\)/);
 assert.match(app, /formatModelDelivery\(delivery\.sent\)/);
 assert.match(app, /trackPendingModelEvent\(delivery/);
@@ -463,7 +463,7 @@ assert.match(app, /enabled:\s*\(init\) => modelSelected\("lingbot2"\) && init\.g
 assert.match(app, /function drawRecordingComparisonPreview\(/);
 assert.match(app, /createFullscreenController/);
 const placeholderIndex = app.indexOf("await drawInitialReferencePlaceholders(firstFrame);");
-const connectIndex = app.indexOf("dualModelController.connect(init)", placeholderIndex);
+const connectIndex = app.indexOf("dualModelController.connect(connectionInit)", placeholderIndex);
 const activateRulesIndex = app.indexOf("worldRulesController.activate(preparedWorldRules)", placeholderIndex);
 assert.ok(
   placeholderIndex >= 0 && connectIndex > placeholderIndex,

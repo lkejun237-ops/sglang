@@ -153,6 +153,13 @@
         client_sent_perf_ms: sentAt,
         client_sent_epoch_ms: Date.now(),
       };
+      if (kind === "skill") {
+        const skillId = typeof payload === "string" ? payload : payload?.id;
+        if (skillId) envelope.id = String(skillId);
+      } else if (kind === "direction") {
+        const text = typeof payload === "string" ? payload : payload?.text;
+        if (text) envelope.text = String(text);
+      }
       this.latestEvents.set(kind, envelope);
       const sent = {};
       for (const key of this.activeKeys) {

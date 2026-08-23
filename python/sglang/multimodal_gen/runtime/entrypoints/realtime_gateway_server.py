@@ -927,8 +927,11 @@ def create_app(
                     # Skill activation: the browser sends only an id. The gateway
                     # looks up the prompt, so the prompt never passes through the
                     # browser.
+                    payload_id = None
+                    if isinstance(control.get("payload"), dict):
+                        payload_id = control["payload"].get("id")
                     skill = (world_session.get("skills") or {}).get(
-                        str(control.get("id") or "")
+                        str(control.get("id") or payload_id or "")
                     )
                     if skill is None or directions is None:
                         _log_gateway_trace(

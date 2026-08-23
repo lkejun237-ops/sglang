@@ -7,16 +7,21 @@
       rewrite,
       sendPrompt,
       restoreDelayMs = 10000,
+      restoreStartTimeoutMs = 30000,
+      waitForEventApplied = null,
       setTimer = global.setTimeout.bind(global),
       clearTimer = global.clearTimeout.bind(global),
     }) {
       this.rewrite = rewrite;
       this.sendPrompt = sendPrompt;
       this.restoreDelayMs = restoreDelayMs;
+      this.restoreStartTimeoutMs = restoreStartTimeoutMs;
+      this.waitForEventApplied = waitForEventApplied;
       this.setTimer = setTimer;
       this.clearTimer = clearTimer;
       this.persistentPrompt = "";
       this.restoreTimer = null;
+      this.restoreWaitToken = null;
       this.sessionGeneration = 0;
       this.requestGeneration = 0;
     }
@@ -124,20 +129,41 @@
         this.persistentPrompt = prompt;
       } else {
         const restorePrompt = previousPrompt;
-        let restoreTimer = null;
-        restoreTimer = this.setTimer(() => {
-          if (this.restoreTimer !== restoreTimer) return;
-          this.restoreTimer = null;
-          if (sessionGeneration !== this.sessionGeneration) return;
-          this.sendPrompt(restorePrompt, {
-            changeType: PERSISTENT,
-            phase: "restore",
-            trigger: "rule",
-            rule: "one_time_timeout_restore",
-            afterMs: this.restoreDelayMs,
-          });
-        }, this.restoreDelayMs);
-        this.restoreTimer = restoreTimer;
+        const restoreWaitToken = {};
+        this.restoreWaitToken = restoreWaitToken;
+        const scheduleRestore = (result = {}) => {
+          if (this.restoreWaitToken !== restoreWaitToken) return;
+          if (result.superseded) {
+            this.restoreWaitToken = null;
+            return;
+          }
+          let restoreTimer = null;
+          restoreTimer = this.setTimer(() => {
+            if (this.restoreTimer !== restoreTimer) return;
+            this.restoreTimer = null;
+            this.restoreWaitToken = null;
+            if (sessionGeneration !== this.sessionGeneration) return;
+            this.sendPrompt(restorePrompt, {
+              changeType: PERSISTENT,
+              phase: "restore",
+              trigger: "rule",
+              rule: "one_time_timeout_restore",
+              afterMs: this.restoreDelayMs,
+            });
+          }, this.restoreDelayMs);
+          this.restoreTimer = restoreTimer;
+        };
+        if (typeof this.waitForEventApplied === "function") {
+          Promise.resolve(
+            this.waitForEventApplied(eventId, {
+              timeoutMs: this.restoreStartTimeoutMs,
+            }),
+          )
+            .catch(() => ({ timeout: true }))
+            .then(scheduleRestore);
+        } else {
+          scheduleRestore();
+        }
       }
       return { prompt, change_type: changeType, event_id: eventId };
     }
@@ -145,6 +171,7 @@
     _cancelRestore() {
       if (this.restoreTimer !== null) this.clearTimer(this.restoreTimer);
       this.restoreTimer = null;
+      this.restoreWaitToken = null;
     }
   }
 

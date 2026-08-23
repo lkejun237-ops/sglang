@@ -803,6 +803,7 @@ let runtimeSkillCooldownUiTimer = 0;
 let lastSentEventId = 0;
 let lastSampledEventId = 0;
 const pendingModelEvents = new Map();
+const modelEventApplyWaiters = new Map();
 const traceTopologyApi = window.SGLangRealtimeTraceTopology || {};
 const traceTopology = traceTopologyApi.createRealtimeTraceTopology
   ? traceTopologyApi.createRealtimeTraceTopology({ maxEvents: 220 })
@@ -1408,6 +1409,66 @@ function beginPromptLogSession(prompt, rule = "session_start") {
   });
 }
 
+function gatewayWorldSkills(preparedRules = {}) {
+  return (Array.isArray(preparedRules.skills) ? preparedRules.skills : [])
+    .map((skill) => {
+      const prompt = String(skill?.prepared?.prompt || skill?.prompt || "").trim();
+      const id = String(skill?.id || "").trim();
+      if (!id || !prompt) return null;
+      return {
+        id,
+        prompt,
+        change_type: skill?.prepared?.change_type === "persistent"
+          ? "persistent"
+          : "one_time",
+      };
+    })
+    .filter(Boolean);
+}
+
+function usesAuthorizedWorldGateway() {
+  if (UI_CONFIG.worldGatewaySkillControl === true) return true;
+  if (UI_CONFIG.worldGatewaySkillControl === false) return false;
+  const candidates = [
+    DUAL_MODEL_CONFIG.minwm?.h264WsUrl,
+    DUAL_MODEL_CONFIG.minwm?.wsUrl,
+    UI_CONFIG.h264WebSocketBaseUrl,
+    $("serverUrl")?.value,
+  ];
+  return candidates.some((value) => String(value || "").includes("authorized_generate"));
+}
+
+function withGatewayWorldSkills(init, preparedRules) {
+  if (!usesAuthorizedWorldGateway()) return init;
+  const skills = gatewayWorldSkills(preparedRules);
+  if (!skills.length) return init;
+  return {
+    ...init,
+    _world: {
+      ...(init._world || {}),
+      skills,
+    },
+  };
+}
+
+function sendGatewaySkillControl(skillId, prepared, metadata = {}) {
+  if (!usesAuthorizedWorldGateway()) return null;
+  const eventId = sendEvent(
+    "skill",
+    { id: skillId },
+    `skill trigger · ${metadata.skillName || skillId}`,
+  );
+  if (!eventId) return null;
+  const prompt = String(prepared?.prompt || "").trim();
+  if (prompt) {
+    const changeType = prepared?.change_type === "persistent" ? "persistent" : "one_time";
+    appendPromptLog(prompt, { ...metadata, changeType, phase: "prepared" });
+    markRecordingPromptSent(prompt, { ...metadata, changeType, phase: "prepared" }, eventId);
+    recordPromptHistory(prompt, "skill_update", eventId);
+  }
+  return eventId;
+}
+
 const promptRewriteController = new PromptRewriteController({
   rewrite: rewriteRuntimePrompt,
   sendPrompt: (prompt, metadata) => {
@@ -1427,12 +1488,27 @@ const promptRewriteController = new PromptRewriteController({
     }
     return eventId;
   },
+  waitForEventApplied: waitForModelEventApplied,
   restoreDelayMs: 10000,
 });
 worldRulesController = new WorldRulesController({
   completeRule: completeWorldRule,
   dispatchPrepared: (prepared, metadata) => {
     markRecordingPromptSubmitted(metadata.instruction || metadata.skillName || metadata.goalName || "");
+    if (metadata.trigger === "skill" && metadata.skillId) {
+      const gatewayEventId = sendGatewaySkillControl(
+        metadata.skillId,
+        prepared,
+        metadata,
+      );
+      if (gatewayEventId) {
+        return {
+          prompt: prepared.prompt,
+          change_type: prepared.change_type,
+          event_id: gatewayEventId,
+        };
+      }
+    }
     return promptRewriteController.submitPrepared(
       prepared,
       metadata.instruction || "",
@@ -2126,6 +2202,7 @@ function resetStreamStats() {
   if (playbackAckTimer) window.clearTimeout(playbackAckTimer);
   playbackAckTimer = 0;
   lastSampledEventId = 0;
+  resolveAllModelEventWaiters({ applied: false, superseded: true, reason: "reset" });
   pendingModelEvents.clear();
   lastRenderedChunk = null;
   renderedTraceChunks = new Set();
@@ -5905,7 +5982,7 @@ async function triggerWorldSkill(skillId) {
     }
     setPromptRewriteStatus(
       result.change_type === "one_time"
-        ? `已触发「${skill.name}」· 一次性，10 秒后恢复`
+        ? `已触发「${skill.name}」· 一次性，画面应用后约 10 秒恢复`
         : `已触发「${skill.name}」· 持久状态`,
       result.change_type,
     );
@@ -6349,6 +6426,7 @@ async function connect() {
         numFrames: continuousT2V ? undefined : numFrames,
       }),
     });
+    const connectionInit = withGatewayWorldSkills(init, preparedWorldRules);
     const referenceImage = await createReferenceImageMeta(enteredFirstFrame);
     beginSessionArtifact(init, referenceImage);
     if (currentSessionArtifact && currentTrace) {
@@ -6367,7 +6445,7 @@ async function connect() {
     worldExperienceReady = false;
     setStatus("Loading world", "live");
     addHistory("model connected · waiting for first visible Zing frame");
-    const connectionReport = await dualModelController.connect(init);
+    const connectionReport = await dualModelController.connect(connectionInit);
     if (epoch !== streamEpoch) return;
     void rememberEnteredWorld(
       enteredFirstFrame,
@@ -6825,10 +6903,10 @@ function sendEvent(kind, payload, historyText = null) {
   } else {
     recordTrajectoryEvent(`${kind}_event_sent`, { event_id: eventId, payload });
   }
-  if (kind === "camera_actions" || kind === "prompt") {
+  if (kind === "camera_actions" || kind === "prompt" || kind === "skill") {
     if (delivery.sent.minwm) {
       playbackController.noteInputEvent(eventId, performance.now(), {
-        cutoverMode: kind === "prompt"
+        cutoverMode: kind === "prompt" || kind === "skill"
           ? "prompt"
           : cameraActionHasActiveMotion(payload)
             ? "motion"
@@ -6860,14 +6938,61 @@ function formatModelDelivery(sent = {}) {
 }
 
 function trackPendingModelEvent(delivery, kind) {
-  if (kind !== "prompt" && kind !== "camera_actions") return;
+  if (kind !== "prompt" && kind !== "skill" && kind !== "camera_actions") return;
   const pending = new Set(
     Object.entries(delivery.sent)
       .filter(([, sent]) => sent)
       .map(([key]) => key),
   );
   if (!pending.size) return;
-  pendingModelEvents.set(delivery.eventId, { kind, pending });
+  pendingModelEvents.set(delivery.eventId, { kind, pending, applied: false, superseded: false });
+}
+
+function resolveModelEventWaiters(eventId, result) {
+  const waiters = modelEventApplyWaiters.get(eventId);
+  if (!waiters) return;
+  modelEventApplyWaiters.delete(eventId);
+  waiters.forEach((waiter) => {
+    window.clearTimeout(waiter.timer);
+    waiter.resolve({ eventId, ...result });
+  });
+}
+
+function resolveAllModelEventWaiters(result) {
+  for (const [eventId] of modelEventApplyWaiters) {
+    resolveModelEventWaiters(eventId, result);
+  }
+}
+
+function waitForModelEventApplied(eventId, options = {}) {
+  const normalizedEventId = Number(eventId || 0);
+  if (!normalizedEventId) {
+    return Promise.resolve({ eventId: normalizedEventId, applied: false });
+  }
+  const pendingEvent = pendingModelEvents.get(normalizedEventId);
+  if (!pendingEvent || !pendingEvent.pending.size) {
+    return Promise.resolve({ eventId: normalizedEventId, applied: true });
+  }
+  const timeoutMs = Math.max(0, Number(options.timeoutMs || 0));
+  return new Promise((resolve) => {
+    const waiter = {
+      resolve,
+      timer: window.setTimeout(() => {
+        const waiters = modelEventApplyWaiters.get(normalizedEventId) || [];
+        const index = waiters.indexOf(waiter);
+        if (index >= 0) waiters.splice(index, 1);
+        if (!waiters.length) modelEventApplyWaiters.delete(normalizedEventId);
+        resolve({
+          eventId: normalizedEventId,
+          applied: false,
+          timeout: true,
+        });
+      }, timeoutMs),
+    };
+    const waiters = modelEventApplyWaiters.get(normalizedEventId) || [];
+    waiters.push(waiter);
+    modelEventApplyWaiters.set(normalizedEventId, waiters);
+  });
 }
 
 function markModelEventApplied(key, eventId) {
@@ -6878,11 +7003,19 @@ function markModelEventApplied(key, eventId) {
   for (const [pendingEventId, event] of pendingModelEvents) {
     if (pendingEventId > appliedEventId || !event.pending.has(key)) continue;
     event.pending.delete(key);
-    if (event.kind === "prompt") {
+    if (event.kind === "prompt" || event.kind === "skill") {
       const outcome = pendingEventId === appliedEventId ? "applied" : "superseded";
-      addHistory(`${modelLabel(key)} prompt ${outcome} · event#${pendingEventId}`);
+      if (pendingEventId === appliedEventId) event.applied = true;
+      else event.superseded = true;
+      addHistory(`${modelLabel(key)} ${event.kind} ${outcome} · event#${pendingEventId}`);
     }
-    if (!event.pending.size) pendingModelEvents.delete(pendingEventId);
+    if (!event.pending.size) {
+      pendingModelEvents.delete(pendingEventId);
+      resolveModelEventWaiters(pendingEventId, {
+        applied: Boolean(event.applied),
+        superseded: Boolean(event.superseded),
+      });
+    }
   }
 }
 
@@ -7636,7 +7769,7 @@ async function sendRuntimePromptUpdate() {
     input.value = "";
     updateRecordingPromptDraft("");
     if (result.change_type === "one_time") {
-      setPromptRewriteStatus("已发送 · 一次性指令，10 秒后恢复持久状态", "one_time");
+      setPromptRewriteStatus("已发送 · 一次性指令，画面应用后约 10 秒恢复持久状态", "one_time");
     } else {
       setPromptRewriteStatus("已发送 · 持久指令", "persistent");
     }
