@@ -7,6 +7,7 @@ import json
 import pytest
 from download_model_artifact import (
     resolve_model_source,
+    s3_addressing_config,
     stage_model,
     validate_control_files,
     validate_release_controls,
@@ -16,6 +17,22 @@ MODEL_NAME = "minwm"
 MODEL_VERSION = "gs3200-ema-student-v1"
 RELEASE_ID = "20260810T042157Z-c302d572"
 PREFIX = f"models/{MODEL_NAME}/{MODEL_VERSION}/{RELEASE_ID}"
+
+
+def test_s3_addressing_config_is_opt_in(monkeypatch):
+    monkeypatch.delenv("AWS_S3_ADDRESSING_STYLE", raising=False)
+    assert s3_addressing_config() == {}
+
+
+def test_s3_addressing_config_accepts_virtual_style(monkeypatch):
+    monkeypatch.setenv("AWS_S3_ADDRESSING_STYLE", "virtual")
+    assert s3_addressing_config() == {"addressing_style": "virtual"}
+
+
+def test_s3_addressing_config_rejects_unknown_style(monkeypatch):
+    monkeypatch.setenv("AWS_S3_ADDRESSING_STYLE", "invalid")
+    with pytest.raises(ValueError, match="AWS_S3_ADDRESSING_STYLE"):
+        s3_addressing_config()
 
 
 def _artifact() -> tuple[dict[str, bytes], bytes, bytes, bytes]:

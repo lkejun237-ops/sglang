@@ -559,6 +559,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def s3_addressing_config() -> dict[str, str]:
+    style = os.environ.get("AWS_S3_ADDRESSING_STYLE", "").strip().lower()
+    if not style:
+        return {}
+    if style not in {"auto", "virtual", "path"}:
+        raise ValueError(
+            "AWS_S3_ADDRESSING_STYLE must be one of: auto, virtual, path"
+        )
+    return {"addressing_style": style}
+
+
 def main() -> None:
     import boto3
     from botocore.config import Config
@@ -572,10 +583,13 @@ def main() -> None:
         model_version=args.model_version,
         model_release_id=args.model_release_id,
     )
+    config_kwargs = {"retries": {"mode": "adaptive", "max_attempts": 8}}
+    if s3_config := s3_addressing_config():
+        config_kwargs["s3"] = s3_config
     client = boto3.client(
         "s3",
         region_name=args.region,
-        config=Config(retries={"mode": "adaptive", "max_attempts": 8}),
+        config=Config(**config_kwargs),
     )
     result = stage_model(
         client=client,
