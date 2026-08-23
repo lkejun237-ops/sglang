@@ -348,6 +348,33 @@ def create_crt_transfer_manager(client: Any, concurrency: int, part_size: int) -
     return manager
 
 
+def preferred_transfer_client() -> str:
+    preferred = os.environ.get("S3_TRANSFER_CLIENT", "crt").strip().lower()
+    if preferred not in {"crt", "classic"}:
+        raise ValueError("S3_TRANSFER_CLIENT must be one of: crt, classic")
+    return preferred
+
+
+def transfer_backend_name() -> str:
+    return "awscrt" if preferred_transfer_client() == "crt" else "classic"
+
+
+def create_runtime_transfer_manager(client: Any, concurrency: int, part_size: int) -> Any:
+    preferred = preferred_transfer_client()
+    if preferred == "crt":
+        return create_crt_transfer_manager(client, concurrency, part_size)
+
+    from boto3.s3.transfer import TransferConfig, create_transfer_manager
+
+    config = TransferConfig(
+        multipart_threshold=part_size,
+        multipart_chunksize=part_size,
+        max_concurrency=concurrency,
+        preferred_transfer_client="classic",
+    )
+    return create_transfer_manager(client, config)
+
+
 def _download_files(
     client: Any,
     manager_factory: Callable[[Any, int, int], Any],
@@ -437,7 +464,7 @@ def stage_model(
     expected_revision: str | None,
     concurrency: int,
     part_size: int,
-    manager_factory: Callable[[Any, int, int], Any] = create_crt_transfer_manager,
+    manager_factory: Callable[[Any, int, int], Any] = create_runtime_transfer_manager,
 ) -> dict[str, Any]:
     prefix = _safe_s3_prefix(prefix)
     _safe_model_component("model-name", expected_model_name)
@@ -473,7 +500,7 @@ def stage_model(
 
         if _cache_matches(destination, info_body, ready_body, manifest_body, files):
             return {
-                "backend": "awscrt",
+                "backend": transfer_backend_name(),
                 "bytes": total_bytes,
                 "cache_hit": True,
                 "destination": str(destination),
@@ -520,7 +547,7 @@ def stage_model(
 
         elapsed_seconds = time.monotonic() - started
         return {
-            "backend": "awscrt",
+            "backend": transfer_backend_name(),
             "bytes": total_bytes,
             "cache_hit": False,
             "concurrency": concurrency,

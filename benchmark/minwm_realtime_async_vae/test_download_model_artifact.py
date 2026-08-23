@@ -6,9 +6,11 @@ import json
 
 import pytest
 from download_model_artifact import (
+    preferred_transfer_client,
     resolve_model_source,
     s3_addressing_config,
     stage_model,
+    transfer_backend_name,
     validate_control_files,
     validate_release_controls,
 )
@@ -33,6 +35,24 @@ def test_s3_addressing_config_rejects_unknown_style(monkeypatch):
     monkeypatch.setenv("AWS_S3_ADDRESSING_STYLE", "invalid")
     with pytest.raises(ValueError, match="AWS_S3_ADDRESSING_STYLE"):
         s3_addressing_config()
+
+
+def test_transfer_client_defaults_to_crt(monkeypatch):
+    monkeypatch.delenv("S3_TRANSFER_CLIENT", raising=False)
+    assert preferred_transfer_client() == "crt"
+    assert transfer_backend_name() == "awscrt"
+
+
+def test_transfer_client_accepts_classic_for_s3_compatible_storage(monkeypatch):
+    monkeypatch.setenv("S3_TRANSFER_CLIENT", "classic")
+    assert preferred_transfer_client() == "classic"
+    assert transfer_backend_name() == "classic"
+
+
+def test_transfer_client_rejects_unknown_client(monkeypatch):
+    monkeypatch.setenv("S3_TRANSFER_CLIENT", "invalid")
+    with pytest.raises(ValueError, match="S3_TRANSFER_CLIENT"):
+        preferred_transfer_client()
 
 
 def _artifact() -> tuple[dict[str, bytes], bytes, bytes, bytes]:
