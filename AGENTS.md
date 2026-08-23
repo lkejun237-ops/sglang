@@ -1,5 +1,24 @@
 # Repository instructions
 
+## World-platform error language
+
+All error information owned by the Seedleap world-platform integration must be
+English. This rule is mandatory for `authorized_generate`, session-payload
+validation, world-service callbacks, and their tests and documentation:
+
+- WebSocket error `content`, error codes, and close reasons must be English;
+- browser-visible error `content` must use friendly plain English without
+  implementation terms; stable codes and server logs carry technical detail;
+- lifecycle and rewrite callback error reasons must be English;
+- internal exception text must stay in server logs and must never be forwarded
+  to the browser or world-service;
+- stable error codes must use ASCII identifiers; do not use localized text as a
+  code or branch on human-readable messages.
+
+When any of these values or close codes change, update
+`world-service/docs/asyncapi-gateway.yaml` in the frontend contract repository.
+Chinese comments and ordinary product content are not error information.
+
 ## MinWM hardware-specific jobs
 
 When a task creates or changes a MinWM deployment or benchmark manifest:
