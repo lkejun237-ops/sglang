@@ -85,6 +85,38 @@ _IDEMPOTENT_COORDINATOR_RELEASE_REASONS = frozenset(
 )
 _WORKER_SLOT_FIELDS = frozenset(field.name for field in fields(WorkerSlot))
 
+# Browser-facing text for the world-platform route is a product contract. Keep
+# it fixed, friendly, and free of coordinator/worker details. Unknown reasons
+# collapse to SESSION_UNAVAILABLE so a coordinator response can never inject
+# arbitrary text into the browser message, close reason, or lifecycle callback.
+_WORLD_ERROR_MESSAGES = {
+    "SESSION_INVALID": "We couldn't start this world. Return to the worlds list and try again.",
+    "CAPACITY_EXHAUSTED": "No spots are available right now. Your place in line is saved.",
+    "USER_SESSION_LIMIT": "You are already playing somewhere else. Finish that game before starting another.",
+    "INVALID_SESSION_IDENTITY": "We couldn't start this world. Your place in line is saved.",
+    "LEASE_LOST": "The connection was interrupted. Return to the worlds list to continue.",
+    "WORKER_LOST": "The connection was interrupted. Return to the worlds list to continue.",
+    "LEASE_RENEW_CONFLICT": "The connection was interrupted. Return to the worlds list to continue.",
+    "ADMISSION_QUEUE_FULL": "A lot of players are joining right now. Your place in line is saved.",
+    "SESSION_UNAVAILABLE": "We couldn't start this world. Your place in line is saved.",
+    "GATEWAY_SESSION_FAILED": "Something went wrong. Return to the worlds list and try again.",
+}
+_WORLD_RETRYABLE_CLOSE_CODES = frozenset(
+    {
+        "CAPACITY_EXHAUSTED",
+        "ADMISSION_QUEUE_FULL",
+    }
+)
+
+
+def _world_error(reason: str) -> tuple[str, str, int]:
+    code = reason if reason in _WORLD_ERROR_MESSAGES else "SESSION_UNAVAILABLE"
+    if code == "GATEWAY_SESSION_FAILED":
+        close_code = 1011
+    else:
+        close_code = 1013 if code in _WORLD_RETRYABLE_CLOSE_CODES else 1008
+    return code, _WORLD_ERROR_MESSAGES[code], close_code
+
 
 def _parse_ui_config(raw: str) -> dict[str, Any]:
     try:
@@ -1002,6 +1034,21 @@ def create_app(
                             raise ProtocolViolation(
                                 "Denoiser control messages must be binary"
                             )
+                        if principal is not None:
+                            control_message = msgspec.msgpack.decode(wire)
+                            if (
+                                isinstance(control_message, dict)
+                                and control_message.get("type") == "error"
+                            ):
+                                # The engine's content is unrestricted internal
+                                # text. Do not copy it into logs or contracts;
+                                # let the shared world error handler emit the
+                                # fixed product code/message and callback.
+                                logger.error(
+                                    "World engine reported a session error run_id=%s",
+                                    principal.run_id,
+                                )
+                                raise RuntimeError("world engine session failed")
                         if not worker_message_allowed(wire):
                             message_type = worker_message_type(wire)
                             raise ProtocolViolation(
@@ -1226,35 +1273,62 @@ def create_app(
                 exc_info=True,
             )
             try:
+                code, content, close_code = _world_error("SESSION_INVALID")
                 await asyncio.wait_for(
-                    sender.error("SESSION_INVALID", code="SESSION_INVALID"),
+                    sender.error(content, code=code),
                     timeout=browser_send_timeout_s,
                 )
-                await websocket.close(code=1008, reason="SESSION_INVALID")
+                await websocket.close(code=close_code, reason=code)
             except Exception:
                 pass
         except CoordinatorRejected as exc:
-            world_session["admit_rejected"] = exc.reason
+            if principal is not None:
+                code, content, close_code = _world_error(exc.reason)
+                world_session["admit_rejected"] = code
+                error_fields: dict[str, Any] = {"code": code, "reason": code}
+                if exc.retry_after_s is not None:
+                    error_fields["retry_after_s"] = exc.retry_after_s
+            else:
+                # The legacy showcase interface intentionally keeps its
+                # existing wire behavior; this audit covers only the
+                # world-platform route.
+                code = exc.reason
+                content = f"realtime admission rejected: {exc.reason}"
+                close_code = 1013 if exc.reason == "CAPACITY_EXHAUSTED" else 1008
+                world_session["admit_rejected"] = exc.reason
+                error_fields = {
+                    "reason": code,
+                    "retry_after_s": exc.retry_after_s,
+                }
             try:
                 await asyncio.wait_for(
-                    sender.error(
-                        f"realtime admission rejected: {exc.reason}",
-                        reason=exc.reason,
-                        retry_after_s=exc.retry_after_s,
-                    ),
+                    sender.error(content, **error_fields),
                     timeout=browser_send_timeout_s,
                 )
-                close_code = 1013 if exc.reason == "CAPACITY_EXHAUSTED" else 1008
-                await websocket.close(code=close_code, reason=exc.reason)
+                await websocket.close(code=close_code, reason=code)
             except Exception:
                 pass
         except AdmissionQueueFull as exc:
+            if principal is not None:
+                code, content, close_code = _world_error(exc.reason)
+                world_session["admit_rejected"] = code
+            else:
+                code = exc.reason
+                content = f"realtime admission rejected: {exc.reason}"
+                close_code = 1013
             try:
                 await asyncio.wait_for(
-                    sender.error(f"realtime admission rejected: {exc.reason}"),
+                    sender.error(
+                        content,
+                        **(
+                            {"code": code, "reason": code}
+                            if principal is not None
+                            else {}
+                        ),
+                    ),
                     timeout=browser_send_timeout_s,
                 )
-                await websocket.close(code=1013, reason=exc.reason)
+                await websocket.close(code=close_code, reason=code)
             except Exception:
                 pass
         except WebSocketDisconnect:
@@ -1262,20 +1336,52 @@ def create_app(
         except OutputRouteClosed:
             # Output path closed by the system side, such as VAE or route failure;
             # this is not user behavior.
-            world_session["system_error"] = "output route closed"
+            if principal is not None:
+                code, content, close_code = _world_error("GATEWAY_SESSION_FAILED")
+                world_session["system_error"] = code
+                try:
+                    await asyncio.wait_for(
+                        sender.error(content, code=code),
+                        timeout=browser_send_timeout_s,
+                    )
+                    await websocket.close(code=close_code, reason=code)
+                except Exception:
+                    pass
+            else:
+                world_session["system_error"] = "output route closed"
         except Exception as exc:
-            # str() can be empty, e.g. bare TimeoutError, so guard splitlines()[0].
-            detail = (str(exc).splitlines() or [type(exc).__name__])[0]
-            world_session["system_error"] = detail
+            if principal is not None:
+                code, content, close_code = _world_error("GATEWAY_SESSION_FAILED")
+                world_session["system_error"] = code
+                close_reason = code
+                logger.exception(
+                    "World gateway session failed run_id=%s",
+                    principal.run_id,
+                )
+            else:
+                # Preserve the legacy showcase wire behavior. Only the
+                # authorized world-platform route hides exception details.
+                # str() can be empty, e.g. bare TimeoutError, so guard the first
+                # line while keeping the legacy message shape unchanged.
+                detail = (str(exc).splitlines() or [type(exc).__name__])[0]
+                content = f"realtime gateway error: {detail}"
+                world_session["system_error"] = detail
+                close_reason = "gateway session failed"
             try:
                 # The browser might be the non-reading peer that caused the error,
                 # so even the notification must be bounded. Otherwise we could
                 # hang before finally and leak the reservation.
                 await asyncio.wait_for(
-                    sender.error(f"realtime gateway error: {detail}"),
+                    sender.error(
+                        content,
+                        **({"code": code} if principal is not None else {}),
+                    ),
                     timeout=browser_send_timeout_s,
                 )
-                await websocket.close(code=1011, reason="gateway session failed")
+                await websocket.close(
+                    code=close_code if principal is not None else 1011,
+                    reason=close_reason,
+                )
             except Exception:
                 pass
         finally:
@@ -1320,7 +1426,7 @@ def create_app(
                         principal.run_id,
                         trace_id,
                         fault="client",
-                        reason="init payload mismatch",
+                        reason="SESSION_INVALID",
                         established=established,
                     )
                 elif assignment is None:
@@ -1328,7 +1434,7 @@ def create_app(
                         principal.run_id,
                         trace_id,
                         fault="ours",
-                        reason="not admitted",
+                        reason="SESSION_UNAVAILABLE",
                         established=established,
                     )
                 elif world_session.get("deadline_hit"):
