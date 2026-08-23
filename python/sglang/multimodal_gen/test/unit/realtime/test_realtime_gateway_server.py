@@ -10,11 +10,13 @@ from fastapi.testclient import TestClient
 
 from sglang.multimodal_gen.runtime.entrypoints import realtime_gateway_server
 from sglang.multimodal_gen.runtime.entrypoints.realtime_gateway_server import (
+    _WORLD_ERROR_MESSAGES,
     HTTPCoordinatorClient,
     _browser_send_trace_fields,
-    _parse_args,
     _build_world_platform,
+    _parse_args,
     _parse_ui_config,
+    _world_error,
     create_app,
 )
 from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import (
@@ -281,6 +283,71 @@ def test_gateway_cli_defaults_to_a_bounded_64_waiter_queue(monkeypatch):
     )
 
     assert _parse_args().max_admission_waiters == 64
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_code", "expected_close_code"),
+    (
+        ("CAPACITY_EXHAUSTED", "CAPACITY_EXHAUSTED", 1013),
+        ("ADMISSION_QUEUE_FULL", "ADMISSION_QUEUE_FULL", 1013),
+        ("USER_SESSION_LIMIT", "USER_SESSION_LIMIT", 1008),
+        ("LEASE_LOST", "LEASE_LOST", 1008),
+        ("GATEWAY_SESSION_FAILED", "GATEWAY_SESSION_FAILED", 1011),
+        ("COORDINATOR_HTTP_503", "SESSION_UNAVAILABLE", 1008),
+        ("internal failure: sensitive detail", "SESSION_UNAVAILABLE", 1008),
+    ),
+)
+def test_world_platform_errors_are_fixed_and_sanitize_unknown_reasons(
+    reason, expected_code, expected_close_code
+):
+    code, content, close_code = _world_error(reason)
+
+    assert code == expected_code
+    assert close_code == expected_close_code
+    assert content == _WORLD_ERROR_MESSAGES[expected_code]
+    assert not any("\u4e00" <= char <= "\u9fff" for char in content)
+    assert reason not in content
+
+
+def test_world_platform_browser_errors_are_friendly_and_non_technical():
+    forbidden_terms = {
+        "coordinator",
+        "database",
+        "exception",
+        "gateway",
+        "model",
+        "schema",
+        "token",
+        "worker",
+    }
+
+    for content in _WORLD_ERROR_MESSAGES.values():
+        lowered = content.lower()
+        assert not any(term in lowered for term in forbidden_terms)
+
+
+def test_browser_sender_error_includes_the_protocol_version_and_fixed_code():
+    class Socket:
+        def __init__(self):
+            self.wire = None
+
+        async def send_bytes(self, wire):
+            self.wire = wire
+
+    async def run():
+        socket = Socket()
+        sender = realtime_gateway_server._BrowserSender(socket)
+        code, content, _ = _world_error("SESSION_INVALID")
+        await sender.error(content, code=code)
+        return decode_message(socket.wire)
+
+    message = asyncio.run(run())
+    assert message == {
+        "version": 2,
+        "type": "error",
+        "code": "SESSION_INVALID",
+        "content": _WORLD_ERROR_MESSAGES["SESSION_INVALID"],
+    }
 
 
 @pytest.mark.parametrize(
