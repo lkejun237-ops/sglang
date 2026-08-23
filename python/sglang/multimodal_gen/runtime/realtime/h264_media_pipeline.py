@@ -164,6 +164,9 @@ class H264MediaPipeline:
         self._encoder_start_times: deque[float] = deque(maxlen=4096)
         self._minimum_event_id = 0
         self._startup_drop_remaining = config.startup_drop_frames
+        # final completion 是网关判断媒体已经收完的屏障，必须等 ffmpeg stdout
+        # 真正到 EOF 后才能发送；否则网关可能先关浏览器连接，丢掉编码器尾帧。
+        self._pending_final_completion: _ChunkCompletion | None = None
         self.dropped_frames = 0
         self.latency_dropped_frames = 0
         self.startup_dropped_frames = 0
@@ -240,14 +243,39 @@ class H264MediaPipeline:
     async def close(self) -> None:
         if self._closed:
             return
-        await self._drain_pending()
+        failure: BaseException | None = None
+        try:
+            await self._drain_pending()
+        except BaseException as exc:
+            failure = exc
         self._closed = True
         self._queue_ready.set()
         self._runner.cancel()
         await asyncio.gather(self._runner, return_exceptions=True)
-        await self._stop_ffmpeg()
-        self._queue.clear()
-        self._queued_frames = 0
+        try:
+            await self._stop_ffmpeg()
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+            else:
+                logger.warning(
+                    "VAE H.264 encoder cleanup also failed: session_id=%s "
+                    "generation_id=%s",
+                    self.session_id,
+                    self.generation_id,
+                    exc_info=exc,
+                )
+        try:
+            # 只有 FIFO 队列、ffmpeg stdout 与进程退出都成功，final marker
+            # 才能承担“媒体完整”的语义；任何失败都宁可让验收报红，不能伪绿。
+            if failure is None and self._pending_final_completion is not None:
+                await self._send_completion(self._pending_final_completion)
+                self._pending_final_completion = None
+        finally:
+            self._queue.clear()
+            self._queued_frames = 0
+        if failure is not None:
+            raise failure
 
     async def _drain_pending(self) -> None:
         """把队列里剩余的帧与完成标记发完再拆管线。
@@ -261,7 +289,8 @@ class H264MediaPipeline:
         "maximum session lifetime reached"。
         """
         if self._runner.done():
-            return
+            self._raise_if_failed()
+            raise RuntimeError("VAE H.264 pipeline stopped before final drain")
         marker = _DrainMarker(event=asyncio.Event())
         self._queue.append(marker)
         self._queue_ready.set()
@@ -275,6 +304,7 @@ class H264MediaPipeline:
                 self.generation_id,
                 self._queued_frames,
             )
+            raise RuntimeError("VAE H.264 pipeline drain timed out") from None
 
     def _raise_if_failed(self) -> None:
         if not self._runner.done() or self._runner.cancelled():
@@ -305,7 +335,16 @@ class H264MediaPipeline:
                     item.event.set()
                     continue
                 if isinstance(item, _ChunkCompletion):
-                    await self._send_completion(item)
+                    if item.is_final_chunk:
+                        if self._pending_final_completion is not None:
+                            raise ProtocolViolation(
+                                "duplicate final H.264 chunk completion"
+                            )
+                        # 最后一块的完成标记不能早于编码器 EOF。close() 会先关
+                        # stdin、等 stdout 排空，再把这个标记作为媒体尾部屏障发出。
+                        self._pending_final_completion = item
+                    else:
+                        await self._send_completion(item)
                     continue
                 frame = item
                 if (
@@ -434,8 +473,6 @@ class H264MediaPipeline:
             "-loglevel",
             "warning",
             "-nostdin",
-            "-fflags",
-            "nobuffer",
             "-flags",
             "low_delay",
             "-f",
@@ -642,23 +679,34 @@ class H264MediaPipeline:
                 codec="h264",
                 scope="frame",
             )
+        failure: BaseException | None = None
         if process is not None:
             if process.stdin is not None:
                 with contextlib.suppress(Exception):
                     process.stdin.close()
             # 关掉 stdin 后 ffmpeg 会把缓冲里的帧冲出来，stdout 泵读到 EOF 自然退出。
-            # 不等它就等于把最后一个 GOP 的画面丢掉（正常收尾路径才等）。
-            if self._stdout_task is not None:
-                with contextlib.suppress(Exception):
+            # 只有 stdout 正常 EOF 且进程以 0 退出，调用方才能发送 final marker。
+            try:
+                if self._stdout_task is not None:
                     await asyncio.wait_for(
                         asyncio.shield(self._stdout_task),
                         timeout=CLOSE_DRAIN_TIMEOUT_S,
                     )
-            try:
-                await asyncio.wait_for(process.wait(), timeout=2)
-            except TimeoutError:
-                process.kill()
-                await process.wait()
+                return_code = await asyncio.wait_for(
+                    process.wait(), timeout=CLOSE_DRAIN_TIMEOUT_S
+                )
+                if return_code != 0:
+                    raise RuntimeError(
+                        f"H.264 encoder exited with status {return_code}"
+                    )
+            except BaseException as exc:
+                failure = exc
+                with contextlib.suppress(Exception):
+                    process.kill()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(
+                        process.wait(), timeout=CLOSE_DRAIN_TIMEOUT_S
+                    )
         tasks = [
             task for task in (self._stdout_task, self._stderr_task) if task is not None
         ]
@@ -667,3 +715,7 @@ class H264MediaPipeline:
                 task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if failure is not None:
+            if isinstance(failure, TimeoutError):
+                raise RuntimeError("H.264 encoder drain timed out") from failure
+            raise failure

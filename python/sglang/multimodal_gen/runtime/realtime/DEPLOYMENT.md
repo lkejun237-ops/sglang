@@ -69,41 +69,58 @@ Filtering unknown fields avoids transient WebSocket init failures such as:
 WorkerSlot.__init__() got an unexpected keyword argument 'oldest_consumed_age_s'
 ```
 
-## Live ConfigMap hotfix, 2026-08-21 (must be removed after the next image)
+## B300 H.264 ConfigMap overlays
 
-The H.264 tail-drain fix in this commit is currently shipped to the B300 lab
-namespace as a ConfigMap overlay rather than a rebuilt image:
+### Retired overlay, 2026-08-21
 
-- ConfigMap `realtime-h264-drain-fix-20260821` holds two files:
-  `h264_media_pipeline.py` and `realtime_gateway_server.py`.
-- `zing-vae` and `zing-vae-b200` mount the pipeline file over
-  `.../runtime/realtime/h264_media_pipeline.py` via `subPath`.
-- `gateway` mounts the server file over
-  `.../runtime/entrypoints/realtime_gateway_server.py` via `subPath`, and its
-  `--output-drain-timeout-s` was lowered from 90 to 8 in the same patch.
+The first tail-drain fix was temporarily shipped to the B300 lab namespace as
+ConfigMap `realtime-h264-drain-fix-20260821`. It overlaid
+`h264_media_pipeline.py` on `zing-vae` / `zing-vae-b200` and
+`realtime_gateway_server.py` on `gateway`.
 
-This mirrors the pre-existing `realtime-watchdog-code-20260820` overlay and
-carries the same hazard, which is the reason for this note:
+It was retired before 2026-08-24: the ConfigMap and all three mounts are gone,
+the VAE image contains that fix, and `gateway` retains
+`--output-drain-timeout-s=8`.
+
+### Live EOF-barrier overlay, 2026-08-24 (remove after the next image)
+
+Strict production E2E found that a complete 78-chunk / 1249-frame session
+delivered only 1244 complete fMP4 fragments. Denoiser and VAE decode both
+finished all 1249 frames. The loss was confined to H.264 finalization:
+
+- FFmpeg input flag `-fflags nobuffer` deterministically discarded one frame;
+- final `media_chunk_complete` reached Gateway before FFmpeg stdout EOF, so
+  Gateway could tear down the output route before the remaining fragments.
+
+Until an image containing the EOF-barrier fix is rolled out, ConfigMap
+`realtime-h264-eof-fix-20260824` overlays only
+`.../runtime/realtime/h264_media_pipeline.py` on `zing-vae` and the scaled-to-zero
+`zing-vae-b200` template. The patch removes `nobuffer` and sends final completion
+only after the FIFO queue drained, stdout reached EOF, and FFmpeg exited with
+status zero. `gateway`, coordinator, and denoisers are not overlaid.
+
+This overlay carries the usual `subPath` hazard:
 
 **A `subPath` ConfigMap mount pins that file forever.** It survives pod
 restarts, scaling, and `kubectl set image` — which is what makes it a usable
-hotfix, but it also means a newer image's copy of the same file is silently
-shadowed by the 2026-08-21 snapshot. The overlay is an escape hatch, not an
+hotfix, but it also means a newer image's copy of the same file will be silently
+shadowed by the 2026-08-24 snapshot. The overlay is an escape hatch, not an
 upgrade path.
 
-Required follow-up once an image containing this commit is rolled out:
+Required follow-up once an image containing the EOF-barrier fix is rolled out:
 
-1. Remove the `h264-drain-fix` volume and its `volumeMounts` from `zing-vae`,
-   `zing-vae-b200`, and `gateway`.
-2. Keep `--output-drain-timeout-s=8`; 90 was the value that turned a missing
-   final-chunk marker into a 90-second seat hold.
-3. Delete ConfigMap `realtime-h264-drain-fix-20260821`.
+1. Remove the `h264-eof-fix` volume and its `volumeMount` from `zing-vae` and
+   `zing-vae-b200` in the same rollout that changes the image.
+2. Delete ConfigMap `realtime-h264-eof-fix-20260824`.
+3. Keep `gateway --output-drain-timeout-s=8`.
+4. Run strict E2E at least three times and require `media_batch` count to equal
+   complete `moof+mdat` fragment count on every run.
 
-Verification that the overlay is gone and the image carries the fix:
+Verification while the overlay is active:
 
 ```sh
 kubectl -n minwm-zing-b300-sp1-20260819 exec deploy/zing-vae -c vae -- \
-  grep -c CLOSE_DRAIN_TIMEOUT_S \
+  sh -c '! grep -q nobuffer "$1" && grep -q _pending_final_completion "$1"' sh \
   /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/h264_media_pipeline.py
 ```
 
