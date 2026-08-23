@@ -53,10 +53,11 @@ one-session-per-user admission fence.
 
 The same pattern is used for realtime runtime code. `APPLY_RUNTIME_SOURCE_PATCH`
 defaults to `true` and creates ConfigMaps for the current `runtime/realtime`
-package, realtime entrypoints, the denoiser `realtime_video_api.py` entrypoint,
-and small compatibility shims. This keeps the gateway/coordinator/VAE protocol
-at v2 and preserves in-band chunk telemetry for WebUI metrics even when the
-cached runtime image lacks those source files or Python packages. The VAE uses
+package, realtime entrypoints, the denoiser `realtime_video_api.py` and matching
+`generate_session.py` entrypoints, and small compatibility shims. This keeps the
+gateway/coordinator/VAE protocol at v2 and preserves in-band chunk telemetry for
+WebUI metrics even when the cached runtime image lacks those source files or
+Python packages. The VAE uses
 the `imageio-ffmpeg` binary bundled in the runtime image through
 `H264_FFMPEG_BIN`; override it only when the selected image provides another
 working FFmpeg path.

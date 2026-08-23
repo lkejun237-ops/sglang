@@ -384,6 +384,7 @@ spec:
             - {name: runtime-tools-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
             - {name: runtime-tools-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/generate_session.py, subPath: generate_session.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
@@ -391,6 +392,7 @@ spec:
             - {name: runtime-utils-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
             - {name: runtime-utils-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/generate_session.py, subPath: generate_session.py, readOnly: true}
             - {name: shm, mountPath: /dev/shm}
         - name: denoiser-1
           image: ${GPU_RUNTIME_IMAGE}
@@ -503,6 +505,7 @@ spec:
             - {name: runtime-tools-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
             - {name: runtime-tools-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/generate_session.py, subPath: generate_session.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
@@ -510,6 +513,7 @@ spec:
             - {name: runtime-utils-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
             - {name: runtime-utils-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/generate_session.py, subPath: generate_session.py, readOnly: true}
             - {name: shm, mountPath: /dev/shm}
         - name: denoiser-2
           image: ${GPU_RUNTIME_IMAGE}
@@ -622,6 +626,7 @@ spec:
             - {name: runtime-tools-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
             - {name: runtime-tools-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/generate_session.py, subPath: generate_session.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
@@ -629,6 +634,7 @@ spec:
             - {name: runtime-utils-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
             - {name: runtime-utils-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/generate_session.py, subPath: generate_session.py, readOnly: true}
             - {name: shm, mountPath: /dev/shm}
         - name: denoiser-3
           image: ${GPU_RUNTIME_IMAGE}
@@ -741,6 +747,7 @@ spec:
             - {name: runtime-tools-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
             - {name: runtime-tools-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/generate_session.py, subPath: generate_session.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
@@ -748,6 +755,7 @@ spec:
             - {name: runtime-utils-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
             - {name: runtime-utils-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/generate_session.py, subPath: generate_session.py, readOnly: true}
             - {name: shm, mountPath: /dev/shm}
         - name: denoiser-4
           image: ${GPU_RUNTIME_IMAGE}
@@ -860,6 +868,7 @@ spec:
             - {name: runtime-tools-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
             - {name: runtime-tools-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/generate_session.py, subPath: generate_session.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
@@ -867,6 +876,7 @@ spec:
             - {name: runtime-utils-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
             - {name: runtime-utils-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/generate_session.py, subPath: generate_session.py, readOnly: true}
             - {name: shm, mountPath: /dev/shm}
         - name: denoiser-5
           image: ${GPU_RUNTIME_IMAGE}
@@ -979,6 +989,7 @@ spec:
             - {name: runtime-tools-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
             - {name: runtime-tools-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/generate_session.py, subPath: generate_session.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
@@ -986,6 +997,7 @@ spec:
             - {name: runtime-utils-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
             - {name: runtime-utils-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/generate_session.py, subPath: generate_session.py, readOnly: true}
             - {name: shm, mountPath: /dev/shm}
         - name: denoiser-6
           image: ${GPU_RUNTIME_IMAGE}
@@ -1098,6 +1110,7 @@ spec:
             - {name: runtime-tools-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
             - {name: runtime-tools-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/tools/minwm_profile_launcher.py, subPath: minwm_profile_launcher.py, readOnly: true}
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/generate_session.py, subPath: generate_session.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
@@ -1105,6 +1118,7 @@ spec:
             - {name: runtime-utils-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
             - {name: runtime-utils-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/utils/realtime_video.py, subPath: realtime_video.py, readOnly: true}
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
+            - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/generate_session.py, subPath: generate_session.py, readOnly: true}
             - {name: shm, mountPath: /dev/shm}
       volumes:
         - {name: worker-epoch-denoiser-0, emptyDir: {}}

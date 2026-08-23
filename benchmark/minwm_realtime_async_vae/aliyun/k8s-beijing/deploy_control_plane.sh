@@ -270,6 +270,7 @@ apply_runtime_source_patch() {
   )
   local openai_realtime_entrypoint_files=(
     realtime_video_api.py
+    generate_session.py
   )
   local utils_files=(
     logging_utils.py
@@ -351,7 +352,8 @@ kubectl -n "${NAMESPACE}" create configmap zing-runtime-entrypoint-patch \
   --from-file="${REMOTE_PATCH_DIR}/entrypoints/realtime_coordinator_server.py" \
   --from-file="${REMOTE_PATCH_DIR}/entrypoints/realtime_vae_server.py"
 kubectl -n "${NAMESPACE}" create configmap zing-runtime-openai-realtime-entrypoint-patch \
-  --from-file="${REMOTE_PATCH_DIR}/openai-realtime-entrypoints/realtime_video_api.py"
+  --from-file="${REMOTE_PATCH_DIR}/openai-realtime-entrypoints/realtime_video_api.py" \
+  --from-file="${REMOTE_PATCH_DIR}/openai-realtime-entrypoints/generate_session.py"
 kubectl -n "${NAMESPACE}" create configmap zing-runtime-utils-patch \
   --from-file="${REMOTE_PATCH_DIR}/utils"
 kubectl -n "${NAMESPACE}" create configmap zing-runtime-tools-patch \
