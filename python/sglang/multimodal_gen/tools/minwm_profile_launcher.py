@@ -52,6 +52,17 @@ COMMON_SERVER_ARGS = (
     ("--realtime-causal-kv-cache-num-frames", "32"),
 )
 
+PROFILE_OVERRIDABLE_SERVER_ARGS = frozenset(
+    {
+        "--num-gpus",
+        "--tp-size",
+        "--sp-degree",
+        "--ulysses-degree",
+        "--ring-degree",
+        "--enable-cuda-graph",
+    }
+)
+
 PROFILE_SERVER_ARGS = {
     PROFILE_SM120_32G_SPEED: (
         ("--text-encoder-cpu-offload", "true"),
@@ -89,6 +100,7 @@ class GPUInfo:
     name: str
     capability: tuple[int, int]
     total_memory_mib: int
+    visible_device_count: int = 1
 
 
 def resolve_profile(requested: str, gpu: GPUInfo) -> str:
@@ -97,8 +109,27 @@ def resolve_profile(requested: str, gpu: GPUInfo) -> str:
 
     major = gpu.capability[0]
     if requested == PROFILE_AUTO:
-        if gpu.capability == (9, 0) or major == 10:
+        if gpu.capability == (9, 0):
             return PROFILE_RESIDENT_SPEED
+        if gpu.capability == (10, 0):
+            if gpu.total_memory_mib < 180_000:
+                raise ValueError(
+                    "SM100 GPU memory does not match the validated B200 profile: "
+                    f"{gpu.total_memory_mib} MiB"
+                )
+            return PROFILE_RESIDENT_SPEED
+        if gpu.capability == (10, 3):
+            if gpu.total_memory_mib < 250_000:
+                raise ValueError(
+                    "SM103 GPU memory does not match the validated B300 profile: "
+                    f"{gpu.total_memory_mib} MiB"
+                )
+            return PROFILE_RESIDENT_SPEED
+        if major == 10:
+            raise ValueError(
+                "unsupported MinWM datacenter Blackwell capability: "
+                f"{gpu.capability}; expected SM100 or SM103"
+            )
         if major != 12:
             raise ValueError(
                 "unsupported MinWM inference GPU capability: "
@@ -184,6 +215,7 @@ def _reject_managed_overrides(server_args: list[str]) -> None:
         + PROFILE_SERVER_ARGS[PROFILE_SM120_32G_SPEED]
         + PROFILE_SERVER_ARGS[PROFILE_SM120_HIGHMEM_SPEED]
     }
+    managed.difference_update(PROFILE_OVERRIDABLE_SERVER_ARGS)
     managed.add("--vae-config.taehv-checkpoint-path")
     conflicts = sorted(
         option
@@ -193,6 +225,23 @@ def _reject_managed_overrides(server_args: list[str]) -> None:
     if conflicts:
         raise ValueError(
             "profile-managed server args cannot be overridden: " + ", ".join(conflicts)
+        )
+
+
+def _validate_topology_overrides(server_args: list[str], gpu: GPUInfo) -> None:
+    requested_num_gpus = _option_value(server_args, "--num-gpus")
+    if requested_num_gpus is None:
+        return
+    try:
+        num_gpus = int(requested_num_gpus)
+    except ValueError as exc:
+        raise ValueError(
+            f"--num-gpus must be an integer, got {requested_num_gpus!r}"
+        ) from exc
+    if not 1 <= num_gpus <= gpu.visible_device_count:
+        raise ValueError(
+            "--num-gpus must be between 1 and the visible CUDA device count "
+            f"({gpu.visible_device_count}), got {num_gpus}"
         )
 
 
@@ -206,6 +255,7 @@ def build_launch_contract(
 ) -> dict:
     resolved_profile = resolve_profile(requested_profile, gpu)
     _reject_managed_overrides(server_args)
+    _validate_topology_overrides(server_args, gpu)
     if validate_artifacts:
         _validate_artifacts(server_args, taehv_path)
 
@@ -214,7 +264,14 @@ def build_launch_contract(
         "-m",
         "sglang.multimodal_gen.runtime.launch_server",
     ]
+    overridden_topology = {
+        option
+        for option in PROFILE_OVERRIDABLE_SERVER_ARGS
+        if _option_value(server_args, option) is not None
+    }
     for option, value in COMMON_SERVER_ARGS:
+        if option in overridden_topology:
+            continue
         command.extend((option, value))
     command.extend(("--vae-config.taehv-checkpoint-path", str(taehv_path)))
     for option, value in PROFILE_SERVER_ARGS[resolved_profile]:
@@ -233,13 +290,27 @@ def build_launch_contract(
 def _detect_gpu() -> GPUInfo:
     import torch
 
-    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
-        raise ValueError("MinWM hardware profiles require exactly one visible CUDA GPU")
-    properties = torch.cuda.get_device_properties(0)
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+        raise ValueError("MinWM hardware profiles require at least one visible CUDA GPU")
+    device_count = torch.cuda.device_count()
+    capabilities = {
+        tuple(torch.cuda.get_device_capability(index)) for index in range(device_count)
+    }
+    names = {torch.cuda.get_device_name(index) for index in range(device_count)}
+    if len(capabilities) != 1 or len(names) != 1:
+        raise ValueError(
+            "MinWM hardware profiles require homogeneous visible CUDA GPUs, got "
+            f"names={sorted(names)}, capabilities={sorted(capabilities)}"
+        )
+    memory_mib = [
+        int(torch.cuda.get_device_properties(index).total_memory // (1024**2))
+        for index in range(device_count)
+    ]
     return GPUInfo(
-        name=torch.cuda.get_device_name(0),
-        capability=tuple(torch.cuda.get_device_capability(0)),
-        total_memory_mib=int(properties.total_memory // (1024**2)),
+        name=names.pop(),
+        capability=capabilities.pop(),
+        total_memory_mib=min(memory_mib),
+        visible_device_count=device_count,
     )
 
 

@@ -195,6 +195,17 @@ The explicit `sm120-32g-speed` policy may be selected on a larger SM120 GPU to
 qualify the exact low-memory policy; `auto` still chooses the high-memory policy
 on RTX PRO 6000.
 
+The image and build inputs are identical across GPU families. Hardware changes
+only the launch contract selected by `--profile auto`: RTX 5090 resolves to the
+32-GiB SM120 policy, while an SM103 B300 with at least 250,000 MiB per GPU
+resolves to the resident policy. A Pod may
+expose multiple GPUs only when they have the same product name and compute
+capability. Topology flags such as `--num-gpus`, `--sp-degree`, and
+`--ulysses-degree` may be passed after `--`; the launcher verifies that the
+requested GPU count does not exceed the visible device count. All attention,
+offload, Tianpeng window, and cache-policy settings remain profile-owned and
+cannot be overridden by deployment parameters.
+
 The Jobs do not mount S3/PVCs or install anything at startup. Archive their raw
 logs, complete Pod JSON, requested top-level image digest, and kubelet `imageID`.
 Do not submit the B200 Job while the warm p6 node is full unless provisioning a
