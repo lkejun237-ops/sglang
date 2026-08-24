@@ -2,6 +2,7 @@ import hashlib
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -36,6 +37,7 @@ def _last_option_value(command: list[str], option: str) -> str | None:
         ),
         (GPUInfo("NVIDIA H200", (9, 0), 143771), PROFILE_RESIDENT_SPEED),
         (GPUInfo("NVIDIA B200", (10, 0), 183359), PROFILE_RESIDENT_SPEED),
+        (GPUInfo("NVIDIA B300", (10, 3), 281000), PROFILE_RESIDENT_SPEED),
     ],
 )
 def test_auto_profile_selection(gpu, expected):
@@ -45,6 +47,11 @@ def test_auto_profile_selection(gpu, expected):
 def test_auto_profile_rejects_unvalidated_sm120_memory_size():
     with pytest.raises(ValueError, match="does not match a validated"):
         resolve_profile("auto", GPUInfo("Future SM120", (12, 0), 49152))
+
+
+def test_auto_profile_rejects_undersized_b300_partition():
+    with pytest.raises(ValueError, match="validated B300 profile"):
+        resolve_profile("auto", GPUInfo("NVIDIA B300", (10, 3), 200000))
 
 
 def test_explicit_sm120_profile_rejects_wrong_architecture():
@@ -140,6 +147,84 @@ def test_profile_rejects_managed_override():
             ],
             validate_artifacts=False,
         )
+
+
+def test_b300_multi_gpu_topology_can_override_parallelism():
+    contract = build_launch_contract(
+        requested_profile="auto",
+        gpu=GPUInfo("NVIDIA B300", (10, 3), 281000, visible_device_count=8),
+        taehv_path=Path("/models/taehv/taew2_2.pth"),
+        server_args=[
+            "--model-path",
+            "/models/minwm",
+            "--num-gpus",
+            "8",
+            "--sp-degree",
+            "8",
+            "--ulysses-degree",
+            "8",
+        ],
+        validate_artifacts=False,
+    )
+
+    assert contract["resolved_profile"] == PROFILE_RESIDENT_SPEED
+    assert contract["gpu"]["visible_device_count"] == 8
+    assert contract["command"].count("--num-gpus") == 1
+    assert contract["command"].count("--sp-degree") == 1
+    assert contract["command"].count("--ulysses-degree") == 1
+    assert contract["command"][-6:] == [
+        "--num-gpus",
+        "8",
+        "--sp-degree",
+        "8",
+        "--ulysses-degree",
+        "8",
+    ]
+
+
+def test_topology_rejects_more_gpus_than_are_visible():
+    with pytest.raises(ValueError, match="visible CUDA device count"):
+        build_launch_contract(
+            requested_profile="auto",
+            gpu=GPUInfo("GeForce RTX 5090", (12, 0), 32768),
+            taehv_path=Path("/models/taehv/taew2_2.pth"),
+            server_args=["--model-path", "/models/minwm", "--num-gpus", "2"],
+            validate_artifacts=False,
+        )
+
+
+def test_detect_gpu_accepts_homogeneous_multi_gpu(monkeypatch):
+    gib = 1024**3
+    fake_cuda = SimpleNamespace(
+        is_available=lambda: True,
+        device_count=lambda: 2,
+        get_device_capability=lambda index: (10, 3),
+        get_device_name=lambda index: "NVIDIA B300",
+        get_device_properties=lambda index: SimpleNamespace(total_memory=288 * gib),
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=fake_cuda))
+
+    assert launcher._detect_gpu() == GPUInfo(
+        "NVIDIA B300",
+        (10, 3),
+        288 * 1024,
+        visible_device_count=2,
+    )
+
+
+def test_detect_gpu_rejects_mixed_gpu_families(monkeypatch):
+    gib = 1024**3
+    fake_cuda = SimpleNamespace(
+        is_available=lambda: True,
+        device_count=lambda: 2,
+        get_device_capability=lambda index: ((10, 3), (12, 0))[index],
+        get_device_name=lambda index: ("NVIDIA B300", "GeForce RTX 5090")[index],
+        get_device_properties=lambda index: SimpleNamespace(total_memory=32 * gib),
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=fake_cuda))
+
+    with pytest.raises(ValueError, match="homogeneous visible CUDA GPUs"):
+        launcher._detect_gpu()
 
 
 def test_contract_validates_taehv_and_tianpeng_model(tmp_path, monkeypatch):

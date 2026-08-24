@@ -195,13 +195,18 @@ The explicit `sm120-32g-speed` policy may be selected on a larger SM120 GPU to
 qualify the exact low-memory policy; `auto` still chooses the high-memory policy
 on RTX PRO 6000.
 
-The topology defaults are intentionally conservative for one visible GPU.
-Deployments may still pass parallelism overrides after `--`, such as
-`--num-gpus 2 --sp-degree 2 --ulysses-degree 2`, while the profile keeps
-attention/backend/runtime policy and Tianpeng's `8/32` causal window fixed.
-For a 5090 worker that dedicates one GPU per denoiser, leave those overrides at
-`--num-gpus 1 --sp-degree 1 --ulysses-degree 1` and run one launcher per
-visible GPU.
+The image and build inputs are identical across GPU families. Hardware changes
+only the launch contract selected by `--profile auto`: RTX 5090 resolves to the
+32-GiB SM120 policy, while an SM103 B300 with at least 250,000 MiB per GPU
+resolves to the resident policy. Topology defaults remain conservative for one
+GPU. A Pod may expose multiple GPUs only when they have the same product name
+and compute capability. Topology flags such as `--num-gpus`, `--sp-degree`, and
+`--ulysses-degree` may be passed after `--`; the launcher verifies that the
+requested GPU count does not exceed the visible device count. A 5090 worker
+that dedicates one GPU per denoiser leaves these values at `1` and runs one
+launcher per visible GPU. All attention, offload, Tianpeng window, and
+cache-policy settings remain profile-owned and cannot be overridden by
+deployment parameters.
 
 The Jobs do not mount S3/PVCs or install anything at startup. Archive their raw
 logs, complete Pod JSON, requested top-level image digest, and kubelet `imageID`.

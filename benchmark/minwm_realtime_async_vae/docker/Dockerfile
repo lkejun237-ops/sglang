@@ -28,10 +28,15 @@ ENTRYPOINT ["python", "-m", "sglang.multimodal_gen.runtime.entrypoints.realtime_
 
 FROM ${GPU_IMAGE} AS gpu-runtime
 ARG TAEHV_REVISION=093b918971d59001a0bad6dfd6e0409b5e1752cf
+ARG SOURCE_REVISION
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/opt/sglang/python \
-    TAEHV_CHECKPOINT_PATH=/opt/taehv/taew2_2.pth
+    TAEHV_CHECKPOINT_PATH=/opt/taehv/taew2_2.pth \
+    SGLANG_BUILD_COMMIT=${SOURCE_REVISION} \
+    SGLANG_MINWM_REQUIRE_SM120_FA4=1 \
+    SGLANG_USE_SGL_FA3_KERNEL=0
+RUN python3 -c 'import os, re; revision = os.environ.get("SGLANG_BUILD_COMMIT", ""); assert re.fullmatch(r"[0-9a-f]{40}", revision), f"invalid SGLANG_BUILD_COMMIT: {revision!r}"'
 COPY . /opt/sglang
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 - <<'PY'
@@ -52,6 +57,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install -e '/opt/sglang/python[diffusion,tracing]' \
       --root-user-action=ignore && \
     python3 -m pip uninstall -y peft && \
+    python3 -m pip install --no-cache-dir --no-deps --force-reinstall \
+      "flash-attn-4==4.0.0b21" \
+      "nvidia-cutlass-dsl[cu13]==4.6.0.dev0" \
+      "nvidia-cutlass-dsl-libs-base==4.6.0.dev0" \
+      "nvidia-cutlass-dsl-libs-cu13==4.6.0.dev0" \
+      "quack-kernels==0.5.3" \
+      --root-user-action=ignore && \
     python3 -m pip install --no-cache-dir --no-deps \
       "taehv @ git+https://github.com/madebyollin/taehv.git@${TAEHV_REVISION}" \
       --root-user-action=ignore
@@ -69,10 +81,12 @@ ADD --checksum=sha256:d053e216ca50e2bb837bbcd79b85f0366bea00e5938025572382a773b7
 ADD --checksum=sha256:d26151e76cdc2c9424bef988de874b33d9a53f30ef3060cd556c429c469c797e \
     https://raw.githubusercontent.com/madebyollin/taehv/093b918971d59001a0bad6dfd6e0409b5e1752cf/taew2_1.pth \
     /opt/taehv/taew2_1.pth
+RUN python3 -m sglang.multimodal_gen.tools.minwm_dependency_check
 WORKDIR /opt/sglang
 
 FROM gpu-runtime AS denoiser
 LABEL org.opencontainers.image.title="minwm-realtime-denoiser"
+ENTRYPOINT ["python3", "-m", "sglang.multimodal_gen.tools.minwm_profile_launcher", "--profile", "auto", "--taehv-checkpoint-path", "/opt/taehv/taew2_2.pth", "--"]
 
 FROM gpu-runtime AS vae
 LABEL org.opencontainers.image.title="minwm-realtime-vae"
