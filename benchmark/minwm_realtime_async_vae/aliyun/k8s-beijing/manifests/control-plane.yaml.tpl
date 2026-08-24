@@ -26,7 +26,7 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: zing-realtime-node-reader
+  name: zing-realtime-node-reader-${NAMESPACE}
 subjects:
   - kind: ServiceAccount
     name: zing-realtime

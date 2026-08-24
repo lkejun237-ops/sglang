@@ -27,7 +27,7 @@ webui/proxy secrets, then applies:
   Five healthy workers provide 35 denoiser slots.
 - `zing-vae-5090-dual`: one DaemonSet Pod per 5090 worker node. The name is
   historical; the current pod runs one VAE container pinned to GPU 7 and
-  registers capacity 16.
+  registers capacity 7, matching the seven denoiser slots on GPUs 0-6.
 
 `manifests/nvidia-device-plugin.yaml.tpl` is available for clusters where GPU
 workers have registry egress or the plugin image is preloaded. The default

@@ -24,6 +24,7 @@ H264_LIVE_EDGE_SEEK_THRESHOLD_MS="${H264_LIVE_EDGE_SEEK_THRESHOLD_MS:-900}"
 UI_CONFIG_JSON="${UI_CONFIG_JSON:-{\"generationModes\":[\"i2v\"],\"defaultGenerationMode\":\"i2v\",\"modelSlots\":[\"minwm\"],\"lockModelSlots\":true,\"size\":\"${REALTIME_SIZE}\",\"targetFps\":${REALTIME_TARGET_FPS},\"sessionMaxLifetimeSeconds\":70,\"playbackAckEnabled\":false,\"h264WebSocketEnabled\":true,\"h264DirectGatewayEnabled\":true,\"h264WebSocketBaseUrl\":\"${PUBLIC_GATEWAY_BASE_URL}\",\"h264CompressedBitrateKbps\":3000,\"h264CompressedCrf\":20,\"h264CompressedPreset\":\"fast\",\"h264CompressedGopSeconds\":2,\"h264CompressedVbvBufferMs\":250,\"h264WebSocketLiveEdgeTargetMs\":${H264_LIVE_EDGE_TARGET_MS},\"h264WebSocketSeekThresholdMs\":${H264_LIVE_EDGE_SEEK_THRESHOLD_MS},\"singleExperience\":true,\"tabScopedUserIds\":true,\"smoothCatchupRateMax\":1.1,\"dualModels\":{\"minwm\":{\"label\":\"Zing\",\"size\":\"${REALTIME_SIZE}\",\"targetFps\":${REALTIME_TARGET_FPS},\"sinkSize\":8,\"windowFrames\":32,\"continuous\":true,\"h264StartupDropFrames\":0}}}}"
 DENOISER_CAPACITY_LIMIT="${DENOISER_CAPACITY_LIMIT:-35}"
 VAE_CAPACITY_LIMIT="${VAE_CAPACITY_LIMIT:-80}"
+VAE_WORKER_CAPACITY="${VAE_WORKER_CAPACITY:-7}"
 WEBUI_PROMPT_REWRITER_PATH="${WEBUI_PROMPT_REWRITER_PATH:-/data/zing-realtime/secrets/prompt-rewriter-vertex.json}"
 HTTPS_PROXY_SECRET_VALUE="${HTTPS_PROXY_SECRET_VALUE:-${https_proxy:-${HTTPS_PROXY:-}}}"
 HTTP_PROXY_SECRET_VALUE="${HTTP_PROXY_SECRET_VALUE:-${http_proxy:-${HTTP_PROXY:-${HTTPS_PROXY_SECRET_VALUE}}}}"
@@ -68,10 +69,11 @@ render_template() {
   REALTIME_SIZE="${REALTIME_SIZE}" \
   DENOISER_CAPACITY_LIMIT="${DENOISER_CAPACITY_LIMIT}" \
   VAE_CAPACITY_LIMIT="${VAE_CAPACITY_LIMIT}" \
+  VAE_WORKER_CAPACITY="${VAE_WORKER_CAPACITY}" \
   UI_CONFIG_JSON="${UI_CONFIG_JSON}" \
   H264_FFMPEG_BIN="${H264_FFMPEG_BIN}" \
   RUNTIME_SOURCE_PATCH_VERSION="${RUNTIME_SOURCE_PATCH_VERSION}" \
-  envsubst '${NAMESPACE} ${CONTROL_IMAGE} ${GPU_RUNTIME_IMAGE} ${WEBUI_IMAGE} ${NVIDIA_DEVICE_PLUGIN_IMAGE} ${REALTIME_TARGET_FPS} ${REALTIME_SIZE} ${DENOISER_CAPACITY_LIMIT} ${VAE_CAPACITY_LIMIT} ${UI_CONFIG_JSON} ${H264_FFMPEG_BIN} ${RUNTIME_SOURCE_PATCH_VERSION}' \
+  envsubst '${NAMESPACE} ${CONTROL_IMAGE} ${GPU_RUNTIME_IMAGE} ${WEBUI_IMAGE} ${NVIDIA_DEVICE_PLUGIN_IMAGE} ${REALTIME_TARGET_FPS} ${REALTIME_SIZE} ${DENOISER_CAPACITY_LIMIT} ${VAE_CAPACITY_LIMIT} ${VAE_WORKER_CAPACITY} ${UI_CONFIG_JSON} ${H264_FFMPEG_BIN} ${RUNTIME_SOURCE_PATCH_VERSION}' \
     <"${template}" >"${output}"
 }
 

@@ -1210,7 +1210,7 @@ spec:
               --endpoint=ws://$(POD_IP):18082/v1/realtime_vae/decode
               --reservation-endpoint=http://$(POD_IP):18082/v1/realtime_worker
               --node-name=$(NODE_NAME)
-              --capacity=16
+              --capacity=${VAE_WORKER_CAPACITY}
               --model-revision=all
               --vae-fingerprint=taew2_2-d053e216
               --interval-s=5
@@ -1239,7 +1239,7 @@ spec:
             - --checkpoint-path=/models/taehv/taew2_2.pth
             - --device=cuda
             - --dtype=bfloat16
-            - --max-sessions=16
+            - --max-sessions=${VAE_WORKER_CAPACITY}
             - --queue-depth-per-session=1
             - --encoded-frames-per-batch=1
             - --max-message-mb=64
