@@ -69,6 +69,10 @@ from sglang.multimodal_gen.runtime.realtime.world_platform import (
     WorldPlatformConfig,
     verify_session_token,
 )
+from sglang.multimodal_gen.runtime.realtime.world_recording import (
+    RecordingManager,
+    create_s3_recording_manager,
+)
 from sglang.multimodal_gen.runtime.utils.realtime_trace import (
     compact_client_trace_event,
     emit_realtime_trace_payload,
@@ -420,6 +424,7 @@ def create_app(
     ui_config: dict[str, Any] | None = None,
     trace_query=None,
     world_platform: WorldPlatformConfig | None = None,
+    recording_manager: RecordingManager | None = None,
     browser_send_timeout_s: float = 15.0,
     # Unauthenticated showcase routes, static pages, and trace queries. These are
     # registered by default.
@@ -443,6 +448,12 @@ def create_app(
     # World-platform callback client. Without it, the authorized path is disabled.
     enable_legacy_routes = not disable_legacy_routes
     world_callbacks = WorldCallbacks(world_platform) if world_platform else None
+    if world_platform is not None and recording_manager is None:
+        recording_manager = create_s3_recording_manager(
+            bucket=world_platform.recording_bucket,
+            region=world_platform.recording_region,
+            on_recorded=world_callbacks.recorded,
+        )
     # Session-payload unsealer. It uses the callback HMAC shared secret, with
     # HKDF deriving an independent sub-key.
     payload_sealer = (
@@ -464,14 +475,25 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        yield
-        closer = getattr(coordinator, "close", None)
-        if closer is not None:
-            await closer()
+        try:
+            yield
+        finally:
+            try:
+                if recording_manager is not None:
+                    await recording_manager.close()
+            finally:
+                try:
+                    if world_callbacks is not None:
+                        await world_callbacks.close()
+                finally:
+                    closer = getattr(coordinator, "close", None)
+                    if closer is not None:
+                        await closer()
 
     app = FastAPI(title="SGLang Realtime Gateway", lifespan=lifespan)
     app.state.output_registry = registry
     app.state.admission_gate = admission_gate
+    app.state.recording_manager = recording_manager
     last_coordinator_ready_at: float | None = None
 
     @app.get("/healthz")
@@ -653,6 +675,7 @@ def create_app(
         metric_model = infer_model_label(selected_model_revision)
         assignment = None
         route = None
+        recorder = None
         upstream = None
         tasks: set[asyncio.Task] = set()
         expected_last_chunk: int | None = None
@@ -722,11 +745,23 @@ def create_app(
                 denoiser_worker_id=assignment.denoiser.worker_id,
                 vae_worker_id=assignment.vae.worker_id,
             )
+            if principal is not None and principal.record_video:
+                # Recording is a bounded observer of output accepted by this
+                # route. It never sits between the VAE and browser.
+                if recording_manager is None:
+                    raise RuntimeError("world recording manager is not configured")
+                recorder = recording_manager.start(
+                    run_id=principal.run_id,
+                    session_id=session_id,
+                    generation_id=generation_id,
+                    trace_id=trace_id,
+                )
             route = await registry.register(
                 session_id,
                 generation_id,
                 token=output_token,
                 trace_id=trace_id,
+                recorder=recorder,
             )
             upstream_url = build_denoiser_url(
                 assignment.denoiser.endpoint,
@@ -1190,7 +1225,9 @@ def create_app(
                     **queue_fields,
                     **send_fields,
                 )
-                gateway_queue_messages = int(queue_fields.get("gateway_queue_messages") or 0)
+                gateway_queue_messages = int(
+                    queue_fields.get("gateway_queue_messages") or 0
+                )
                 gateway_queue_bytes = int(queue_fields.get("gateway_queue_bytes") or 0)
                 if (
                     browser_send_ms >= 100.0
@@ -1409,6 +1446,8 @@ def create_app(
             except Exception:
                 pass
         finally:
+            if recorder is not None:
+                recorder.session_closed()
             if directions is not None:
                 directions.close()  # cancel revert timer
             await _cancel_tasks(set(direction_tasks))
@@ -1609,6 +1648,14 @@ def _parse_args() -> argparse.Namespace:
         default=os.environ.get("WORLD_CALLBACK_HMAC_SECRET", ""),
     )
     parser.add_argument(
+        "--run-video-s3-bucket",
+        default=os.environ.get("RUN_VIDEO_S3_BUCKET", ""),
+    )
+    parser.add_argument(
+        "--run-video-s3-region",
+        default=os.environ.get("RUN_VIDEO_S3_REGION", ""),
+    )
+    parser.add_argument(
         "--disable-legacy-routes",
         action="store_true",
         help=(
@@ -1627,19 +1674,23 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _build_world_platform(args) -> WorldPlatformConfig | None:
-    """Enable world-platform routes only when all --world-* settings are present.
+    """Enable world-platform routes only when all required settings are present.
 
-    All three or none. A partial set used to silently skip route registration:
+    All five or none. A partial set used to silently skip route registration:
     authorized_generate then answers 404 and the operator debugs "route not
     found" instead of reading a config error. That 404 is also underdetermined
     (a proxy in front produces the same one), so the silent path wastes hours.
     Failing startup turns a misconfiguration into a ten-minute deploy failure
     that names the missing flag.
     """
+    recording_bucket = (args.run_video_s3_bucket or "").strip()
+    recording_region = (args.run_video_s3_region or "").strip()
     provided = {
         "--world-token-ed25519-pub": bool(args.world_token_ed25519_pub),
         "--world-callback-url": bool(args.world_callback_url),
         "--world-callback-hmac-secret": bool(args.world_callback_hmac_secret),
+        "--run-video-s3-bucket": bool(recording_bucket),
+        "--run-video-s3-region": bool(recording_region),
     }
     if not any(provided.values()):
         return None  # world platform intentionally disabled (showcase-only deploy)
@@ -1658,6 +1709,8 @@ def _build_world_platform(args) -> WorldPlatformConfig | None:
         callback_app_id="zing-gateway",
         callback_key_id="k1",
         callback_secret=args.world_callback_hmac_secret,
+        recording_bucket=recording_bucket,
+        recording_region=recording_region,
     )
 
 

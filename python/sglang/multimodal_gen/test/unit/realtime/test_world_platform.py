@@ -5,10 +5,12 @@ import base64
 import json
 import time
 
+import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from sglang.multimodal_gen.runtime.realtime.world_platform import (
     Principal,
+    TokenError,
     WorldCallbacks,
     load_public_key,
     verify_session_token,
@@ -41,7 +43,11 @@ def _claims(**extra) -> dict:
         "jti": "j1",
         "iat": now,
         "exp": now + 90,
-        "session": {"max_lifetime_s": 90, "allow_free_prompt": True},
+        "session": {
+            "max_lifetime_s": 90,
+            "allow_free_prompt": True,
+            "record_video": True,
+        },
     }
     base.update(extra)
     return base
@@ -72,9 +78,39 @@ def test_lease_key_falls_back_for_tokens_without_account():
 def test_lease_key_is_never_empty_for_a_valid_token():
     """An empty lease key would make the coordinator treat everyone as one user."""
     principal = Principal(
-        user_id="s_x", run_id="r", max_lifetime_s=1, allow_free_prompt=False
+        user_id="s_x",
+        run_id="r",
+        max_lifetime_s=1,
+        allow_free_prompt=False,
+        record_video=False,
     )
     assert principal.lease_key == "s_x"
+
+
+def test_recording_policy_is_read_from_the_verified_session_claim():
+    token, pub = _sign(_claims())
+
+    principal = verify_session_token(token, load_public_key(pub))
+
+    assert principal.record_video is True
+
+    claims = _claims()
+    claims["session"]["record_video"] = False
+    token, pub = _sign(claims)
+    assert verify_session_token(token, load_public_key(pub)).record_video is False
+
+
+@pytest.mark.parametrize("invalid_value", [None, "false", 0, 1])
+def test_recording_policy_is_required_and_must_be_a_boolean(invalid_value):
+    claims = _claims()
+    if invalid_value is None:
+        claims["session"].pop("record_video")
+    else:
+        claims["session"]["record_video"] = invalid_value
+    token, pub = _sign(claims)
+
+    with pytest.raises(TokenError, match="record_video must be boolean"):
+        verify_session_token(token, load_public_key(pub))
 
 
 def test_aborted_payload_carries_established_flag():
@@ -104,3 +140,29 @@ def test_aborted_payload_carries_established_flag():
     assert fired[0][0] == "/internal/v1/runs/aborted"
     assert fired[0][1]["established"] is False
     assert fired[1][1]["established"] is True
+
+
+def test_recorded_callback_carries_only_the_run_and_s3_uri():
+    fired = []
+    scheduled = object()
+
+    class _Stub(WorldCallbacks):
+        def __init__(self):
+            pass
+
+        def fire(self, path, payload):
+            fired.append((path, payload))
+            return scheduled
+
+    result = _Stub().recorded("run-1", "s3://videos/runs/run-1/video.mp4")
+
+    assert result is scheduled
+    assert fired == [
+        (
+            "/internal/v1/runs/recorded",
+            {
+                "run_id": "run-1",
+                "video_uri": "s3://videos/runs/run-1/video.mp4",
+            },
+        )
+    ]

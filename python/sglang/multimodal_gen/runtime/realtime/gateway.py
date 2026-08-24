@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import logging
 import time
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from typing import Any, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import msgspec.msgpack
@@ -18,6 +20,8 @@ from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import (
     ProtocolViolation,
     decode_message,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class OutputProtocolError(ProtocolViolation):
@@ -37,6 +41,12 @@ class AdmissionQueueFull(RuntimeError):
 
     def __init__(self) -> None:
         super().__init__(self.reason)
+
+
+class OutputRecorder(Protocol):
+    """Fail-open observer for output messages accepted by a route."""
+
+    def offer(self, message: dict[str, Any]) -> None: ...
 
 
 class BrowserPlaybackAckWindow:
@@ -263,6 +273,7 @@ class GatewayOutputRoute:
     max_queue_bytes: int
     max_queue_messages: int
     trace_id: str = ""
+    recorder: OutputRecorder | None = None
     _queue: deque[_QueuedOutput | None] = field(init=False)
     _queue_ready: asyncio.Event = field(init=False)
     _queue_drained: asyncio.Event = field(init=False)
@@ -333,6 +344,7 @@ class GatewayOutputRoute:
                     enqueued_at=time.monotonic(),
                 )
             )
+            self._offer_recording(message)
             return
         if message_type == "media_payload":
             sequence = int(message.get("sequence", -1))
@@ -352,6 +364,7 @@ class GatewayOutputRoute:
                     enqueued_at=time.monotonic(),
                 )
             )
+            self._offer_recording(message)
             return
         if message_type == "media_encode_timing":
             self._append_output(
@@ -362,6 +375,7 @@ class GatewayOutputRoute:
                     enqueued_at=time.monotonic(),
                 )
             )
+            self._offer_recording(message)
             return
 
         chunk_index = int(message.get("chunk_index", -1))
@@ -388,6 +402,7 @@ class GatewayOutputRoute:
                 )
             )
             completed.set()
+            self._offer_recording(message)
             return
 
         if message_type == "media_batch":
@@ -403,6 +418,7 @@ class GatewayOutputRoute:
                     enqueued_at=time.monotonic(),
                 )
             )
+            self._offer_recording(message)
             return
 
         frame_batch_index = int(message.get("frame_batch_index", -1))
@@ -431,6 +447,21 @@ class GatewayOutputRoute:
         self._seen_chunks.add(chunk_index)
         if message.get("is_final_frame_batch") is True:
             self._chunk_completed.setdefault(chunk_index, asyncio.Event()).set()
+        self._offer_recording(message)
+
+    def _offer_recording(self, message: dict[str, Any]) -> None:
+        if self.recorder is None:
+            return
+        try:
+            self.recorder.offer(message)
+        except Exception:
+            # The recorder is a best-effort observer. It can fail its own state,
+            # but it cannot reject or delay an already accepted browser output.
+            logger.exception(
+                "Gateway output recorder hook failed session_id=%s trace_id=%s",
+                self.session_id,
+                self.trace_id,
+            )
 
     def _put_media_latest(self, output: _QueuedOutput) -> None:
         # Never propagate browser/network backpressure into the VAE worker.
@@ -597,6 +628,7 @@ class GatewayOutputRegistry:
         *,
         token: str,
         trace_id: str = "",
+        recorder: OutputRecorder | None = None,
     ) -> GatewayOutputRoute:
         if not session_id or not generation_id or not token:
             raise OutputProtocolError("output route identity is required")
@@ -612,6 +644,7 @@ class GatewayOutputRegistry:
                 max_queue_bytes=self.max_queue_bytes,
                 max_queue_messages=self.max_queue_messages,
                 trace_id=trace_id,
+                recorder=recorder,
             )
             self._routes[session_id] = route
             return route

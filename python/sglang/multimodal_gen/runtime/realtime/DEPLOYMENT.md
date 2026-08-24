@@ -32,6 +32,60 @@ cluster and the `zing-denoiser-b200-*` and `zing-vae-b200-*` pods are Ready.
 During Spot `UnfulfillableCapacity`, the Kubernetes resources may exist but the
 actual serving capacity remains the B300 baseline.
 
+## Authorized World Run recording
+
+When the world-platform route is enabled, Gateway also requires:
+
+```text
+RUN_VIDEO_S3_BUCKET=<dedicated run-video bucket>
+RUN_VIDEO_S3_REGION=us-west-2
+```
+
+Gateway refuses to start when only part of the world-platform and recording
+configuration is present. The bucket must be in the Gateway region. Its IAM
+role needs only multipart create/upload/complete/abort access under
+`runs/*`; object reads belong to the CDN origin, not Gateway. Enable S3 Block
+Public Access, default server-side encryption, and a lifecycle rule that aborts
+incomplete multipart uploads after one day.
+
+Only a verified `authorized_generate` token with
+`session.record_video=true` creates a recorder. Legacy/showcase sessions and
+tokens with `record_video=false` do not record. Each complete Run is uploaded
+directly as:
+
+```text
+s3://<bucket>/runs/<run_id>/video.mp4
+```
+
+The recording path is a fail-open side tap after Gateway output validation. It
+does not proxy through world-service, re-encode media, or wait for S3 before
+forwarding to the browser. Per recording, an 8 MiB byte queue feeds sequential
+8 MiB multipart parts in a dedicated eight-thread S3 executor. The steady raw
+media ceiling is therefore about 16 MiB per active recording, excluding SDK,
+Python-object, and thread-stack overhead. If the queue fills or S3 fails, the
+multipart upload is aborted while realtime playback continues.
+
+Gateway completes an upload only after the final `media_chunk_complete` emitted
+after FFmpeg stdout EOF. It then sends the existing HMAC-authenticated
+`POST /internal/v1/runs/recorded` callback. Session cleanup does not wait for
+this finalization; process shutdown drains detached recorders for at most ten
+seconds before relying on the bucket lifecycle rule.
+
+Deploy in this order:
+
+1. Provision the bucket, CDN origin, IAM policy, encryption, and incomplete
+   multipart lifecycle rule.
+2. Apply world-service migration `0012_run_video_uri.sql` and deploy the
+   callback/history implementation.
+3. Deploy Gateway with both recording environment variables.
+4. Verify one recorded World Run reaches `CompleteMultipartUpload`, callback,
+   and CDN playback; verify one Showcase Run creates no multipart upload.
+
+At current 3000 kbps encoding, eight concurrent recordings add about 24 Mbps
+(3 MB/s) of same-region S3 upload traffic. Before raising admission above eight
+sessions, repeat an RSS and event-loop-lag load test; do not compensate for a
+slow S3 path by increasing the queue without new measurements.
+
 ## Consumed-reservation watchdog
 
 Realtime workers should not let consumed reservations leak forever. A stale

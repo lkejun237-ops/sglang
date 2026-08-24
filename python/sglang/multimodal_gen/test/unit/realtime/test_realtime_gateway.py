@@ -287,6 +287,48 @@ def test_gateway_output_route_passes_h264_without_dropping_muxed_payloads():
     asyncio.run(run())
 
 
+def test_gateway_output_route_keeps_forwarding_when_recording_hook_fails():
+    class BrokenRecorder:
+        def __init__(self):
+            self.types = []
+
+        def offer(self, message):
+            self.types.append(message["type"])
+            if message["type"] == "media_payload":
+                raise RuntimeError("injected recorder failure")
+
+    async def run():
+        recorder = BrokenRecorder()
+        registry = GatewayOutputRegistry(queue_depth=4)
+        route = await registry.register("s", "g", token="secret", recorder=recorder)
+        init = _h264_message("media_init", codec="h264", width=8, height=8)
+        payload = _h264_message(
+            "media_payload", sequence=0, codec="h264", payload=b"video"
+        )
+        completion = _h264_message(
+            "media_chunk_complete",
+            request_id="r0",
+            chunk_index=0,
+            num_frames=1,
+            media_transport="h264",
+            is_final_chunk=True,
+        )
+
+        for wire in (init, payload, completion):
+            await asyncio.wait_for(route.put(wire), timeout=0.05)
+
+        assert recorder.types == [
+            "media_init",
+            "media_payload",
+            "media_chunk_complete",
+        ]
+        for expected in (init, payload, completion):
+            assert await route.get() == expected
+            route.task_done()
+
+    asyncio.run(run())
+
+
 def test_gateway_output_route_closes_h264_slow_consumer_before_unbounded_growth():
     async def run():
         init = _h264_message("media_init", codec="h264", width=8, height=8)
