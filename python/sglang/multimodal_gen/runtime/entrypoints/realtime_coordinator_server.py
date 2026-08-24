@@ -68,6 +68,7 @@ def _assignment(payload: dict) -> SessionAssignment:
 
 def _raise_http(exc: CoordinatorRejected) -> None:
     status_code = {
+        "ATTEMPT_ALREADY_OWNED": status.HTTP_409_CONFLICT,
         "USER_SESSION_LIMIT": status.HTTP_409_CONFLICT,
         "CAPACITY_EXHAUSTED": status.HTTP_429_TOO_MANY_REQUESTS,
         "LEASE_LOST": status.HTTP_409_CONFLICT,
@@ -149,6 +150,23 @@ def create_app(coordinator: RealtimeCoordinator) -> FastAPI:
             vae_worker_id=assignment.vae.worker_id,
         )
         return asdict(assignment)
+
+    @app.post("/v1/attempts/claim", status_code=status.HTTP_204_NO_CONTENT)
+    async def claim_attempt(payload: dict):
+        try:
+            await coordinator.claim_attempt(
+                attempt_id=str(payload["attempt_id"]),
+                owner_id=str(payload["owner_id"]),
+                expires_at=float(payload["expires_at"]),
+            )
+        except (CoordinatorRejected, KeyError, TypeError, ValueError) as exc:
+            if isinstance(exc, CoordinatorRejected):
+                _raise_http(exc)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"reason": "INVALID_ATTEMPT_OWNER"},
+            ) from exc
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.post("/v1/sessions/renew")
     async def renew(payload: dict):

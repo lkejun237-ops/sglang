@@ -76,15 +76,17 @@ class RunVideoRecorder:
         self,
         *,
         run_id: str,
+        attempt_id: str,
         session_id: str,
         generation_id: str,
         trace_id: str,
         bucket: str,
         s3_client: Any,
         executor: ThreadPoolExecutor,
-        on_recorded: Callable[[str, str], Any],
+        on_recorded: Callable[[str, str, str], Any],
     ) -> None:
         self.run_id = run_id
+        self.attempt_id = attempt_id
         self.session_id = session_id
         self.generation_id = generation_id
         self.trace_id = trace_id
@@ -360,7 +362,7 @@ class RunVideoRecorder:
 
     def _fire_recorded_callback(self) -> None:
         try:
-            pending = self._on_recorded(self.run_id, self.video_uri)
+            pending = self._on_recorded(self.run_id, self.attempt_id, self.video_uri)
             if inspect.isawaitable(pending) and not isinstance(pending, asyncio.Task):
                 pending = asyncio.create_task(pending)
             if isinstance(pending, asyncio.Task):
@@ -403,7 +405,7 @@ class RecordingManager:
         *,
         bucket: str,
         s3_client: Any,
-        on_recorded: Callable[[str, str], Any],
+        on_recorded: Callable[[str, str, str], Any],
     ) -> None:
         self.bucket = bucket
         self._s3 = s3_client
@@ -419,6 +421,7 @@ class RecordingManager:
         self,
         *,
         run_id: str,
+        attempt_id: str,
         session_id: str,
         generation_id: str,
         trace_id: str,
@@ -431,6 +434,7 @@ class RecordingManager:
             current.fail("incomplete")
         recorder = RunVideoRecorder(
             run_id=run_id,
+            attempt_id=attempt_id,
             session_id=session_id,
             generation_id=generation_id,
             trace_id=trace_id,
@@ -484,7 +488,7 @@ def create_s3_recording_manager(
     *,
     bucket: str,
     region: str,
-    on_recorded: Callable[[str, str], Any],
+    on_recorded: Callable[[str, str, str], Any],
 ) -> RecordingManager:
     """Build the production S3 client with bounded SDK retries and timeouts."""
     try:

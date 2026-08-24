@@ -65,8 +65,8 @@ def _final():
 
 
 def _manager(s3, callbacks):
-    async def recorded(run_id, video_uri):
-        callbacks.append((run_id, video_uri))
+    async def recorded(run_id, attempt_id, video_uri):
+        callbacks.append((run_id, attempt_id, video_uri))
         return True
 
     return RecordingManager(
@@ -85,6 +85,7 @@ def test_recording_streams_ordered_parts_and_callbacks_only_after_complete(monke
         manager = _manager(s3, callbacks)
         recorder = manager.start(
             run_id="run-1",
+            attempt_id="attempt-1",
             session_id="session-1",
             generation_id="generation-1",
             trace_id="trace-1",
@@ -113,7 +114,13 @@ def test_recording_streams_ordered_parts_and_callbacks_only_after_complete(monke
         ]
         assert len(s3.completed) == 1
         assert not s3.aborted
-        assert callbacks == [("run-1", "s3://run-videos/runs/run-1/video.mp4")]
+        assert callbacks == [
+            (
+                "run-1",
+                "attempt-1",
+                "s3://run-videos/runs/run-1/video.mp4",
+            )
+        ]
         assert s3.completed[0]["MultipartUpload"] == {
             "Parts": [
                 {"ETag": "etag-1", "PartNumber": 1},
@@ -133,6 +140,7 @@ def test_recording_buffer_overflow_aborts_without_waiting_for_s3(monkeypatch):
         manager = _manager(s3, callbacks)
         recorder = manager.start(
             run_id="run-2",
+            attempt_id="attempt-2",
             session_id="session-2",
             generation_id="generation-2",
             trace_id="trace-2",
@@ -166,6 +174,7 @@ def test_recording_without_final_marker_is_incomplete_and_aborted(monkeypatch):
         manager = _manager(s3, callbacks)
         recorder = manager.start(
             run_id="run-3",
+            attempt_id="attempt-3",
             session_id="session-3",
             generation_id="generation-3",
             trace_id="trace-3",
@@ -195,6 +204,7 @@ def test_recording_upload_failure_is_isolated_and_aborted(monkeypatch):
         manager = _manager(s3, callbacks)
         recorder = manager.start(
             run_id="run-4",
+            attempt_id="attempt-4",
             session_id="session-4",
             generation_id="generation-4",
             trace_id="trace-4",
@@ -230,6 +240,7 @@ def test_recording_rejects_incomplete_media_without_publishing(messages):
         manager = _manager(s3, callbacks)
         recorder = manager.start(
             run_id="run-invalid",
+            attempt_id="attempt-invalid",
             session_id="session-invalid",
             generation_id="generation-invalid",
             trace_id="trace-invalid",

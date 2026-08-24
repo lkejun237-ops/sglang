@@ -68,7 +68,9 @@ DEPLOY_STRATEGY="${DEPLOY_STRATEGY:-rolling}"
 ROLLING_DRAIN_TIMEOUT_S="${ROLLING_DRAIN_TIMEOUT_S:-120}"
 ROLLING_IDLE_TIMEOUT_S="${ROLLING_IDLE_TIMEOUT_S:-180}"
 ROLLING_POLL_INTERVAL_S="${ROLLING_POLL_INTERVAL_S:-2}"
-ROLLING_RESTART_COORDINATOR="${ROLLING_RESTART_COORDINATOR:-false}"
+# Gateway 的 attempt owner 围栏依赖 Coordinator 新接口。默认先更新控制面，
+# 只有明确确认现有 Coordinator 已兼容时才应手工关闭这一项。
+ROLLING_RESTART_COORDINATOR="${ROLLING_RESTART_COORDINATOR:-true}"
 ROLLING_RESTART_VAE="${ROLLING_RESTART_VAE:-true}"
 ROLLING_RESTART_DENOISERS="${ROLLING_RESTART_DENOISERS:-true}"
 ROLLING_RESTART_GATEWAY="${ROLLING_RESTART_GATEWAY:-true}"
@@ -835,6 +837,53 @@ wait_container_http() {
   done
 }
 
+verify_coordinator_attempt_claim() {
+  log "verifying Coordinator attempt-claim capability"
+  if ! docker exec -i zing-coordinator python3 - <<'PY'
+import json
+import time
+import urllib.error
+import urllib.request
+import uuid
+
+attempt_id = str(uuid.uuid4())
+body = json.dumps(
+    {
+        "attempt_id": attempt_id,
+        "owner_id": f"deploy-probe:{attempt_id}",
+        "expires_at": time.time() + 30,
+    }
+).encode()
+request = urllib.request.Request(
+    "http://127.0.0.1:18081/v1/attempts/claim",
+    data=body,
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(request, timeout=5) as response:
+        response.read()
+        status = response.status
+except urllib.error.HTTPError as exc:
+    detail = exc.read().decode(errors="replace")[:500]
+    raise SystemExit(
+        f"Coordinator attempt-claim probe returned HTTP {exc.code}: {detail}"
+    ) from exc
+except OSError as exc:
+    raise SystemExit(f"Coordinator attempt-claim probe failed: {exc}") from exc
+if status != 204:
+    raise SystemExit(
+        f"Coordinator attempt-claim probe expected HTTP 204, got {status}"
+    )
+PY
+  then
+    echo "Coordinator is missing the required /v1/attempts/claim capability; refusing to update Gateway" >&2
+    docker logs --tail 120 zing-coordinator 2>&1 || true
+    return 1
+  fi
+  log "Coordinator attempt-claim capability is ready"
+}
+
 container_running() {
   local name="$1"
   [[ "$(docker inspect -f '{{.State.Running}}' "${name}" 2>/dev/null || true)" == "true" ]]
@@ -942,16 +991,18 @@ wait_all_workers_idle() {
 restart_coordinator_rolling() {
   if container_running zing-coordinator && [[ "${ROLLING_RESTART_COORDINATOR}" != "true" ]]; then
     log "keeping existing coordinator during rolling deploy"
-    return
+  else
+    if container_running zing-coordinator; then
+      log "waiting for workers to become idle before coordinator restart"
+      wait_all_workers_idle
+    fi
+    docker rm -f zing-coordinator >/dev/null 2>&1 || true
+    start_coordinator
   fi
-
-  if container_running zing-coordinator; then
-    log "waiting for workers to become idle before coordinator restart"
-    wait_all_workers_idle
-  fi
-  docker rm -f zing-coordinator >/dev/null 2>&1 || true
-  start_coordinator
   wait_container_http zing-coordinator http://127.0.0.1:18081/healthz
+  # 该门禁位于 Gateway 重启之前；即使运维显式保留旧 Coordinator，缺少
+  # claim 接口也会在新 Gateway 接流量前立即终止发布。
+  verify_coordinator_attempt_claim
 }
 
 restart_vae_rolling() {
@@ -1025,6 +1076,7 @@ replace_deploy() {
   if deploys_control_plane; then
     start_coordinator
     wait_container_http zing-coordinator http://127.0.0.1:18081/healthz
+    verify_coordinator_attempt_claim
   else
     log "skipping coordinator/gateway/webui startup because DEPLOY_ROLE=${DEPLOY_ROLE}"
   fi

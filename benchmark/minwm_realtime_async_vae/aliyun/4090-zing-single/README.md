@@ -54,6 +54,42 @@ The default Gateway URL published to the browser is
 `http://${PUBLIC_WEB_HOST}:18080`. Override it with `PUBLIC_GATEWAY_BASE_URL`
 when a domain or load balancer is used.
 
+## Control-plane rollout gate
+
+The authorized world route uses `POST /v1/attempts/claim` on the Coordinator to
+make a session token single-use across Gateway replicas. A Gateway containing
+that client must never be rolled out against an older Coordinator that does not
+provide the endpoint.
+
+For both `rolling` and `replace` deployments, the script follows this order:
+
+1. Start or restart the Coordinator. Rolling deployments default to
+   `ROLLING_RESTART_COORDINATOR=true`.
+2. Wait for `/healthz`, then send a unique, short-lived claim to
+   `/v1/attempts/claim` and require HTTP `204`.
+3. Only after that capability probe succeeds, update workers and the Gateway.
+
+The probe is a machine-enforced release gate, not an informational health
+check. A missing or incompatible claim endpoint stops the script before the
+Gateway is replaced. Operators may explicitly set
+`ROLLING_RESTART_COORDINATOR=false` only when the existing Coordinator is
+already compatible; the same probe still runs and blocks an incompatible
+deployment.
+
+This gate applies only to the deployment scripts in this directory. When
+`DEPLOY_ROLE=control` and workers run on other hosts, operators must stop
+external traffic and verify that all remote sessions have drained before
+restarting the in-memory Coordinator: `wait_all_workers_idle` can inspect only
+containers on the local host.
+
+Only a connection whose claim returns successfully is the attempt owner. Only
+that owner may start a Recorder or send `started`, `ended`, `aborted`, or
+`recorded` callbacks. Every failed claim, including a definite 4xx rejection,
+`ATTEMPT_ALREADY_OWNED`, a timeout, or a lost response, sends no lifecycle or
+recording callback. This prevents a non-owner connection from changing the
+real owner's business attempt; world-service's deadline fallback handles an
+attempt whose claim result is unknown.
+
 ## Public Endpoint
 
 After deployment, the WebUI is expected at:
