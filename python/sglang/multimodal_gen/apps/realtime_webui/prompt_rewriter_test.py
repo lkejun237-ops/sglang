@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -104,6 +105,35 @@ class PromptRewriterTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("RULE KIND: skill", models.calls[0]["contents"][0])
         self.assertIn("召唤飞船", models.calls[0]["contents"][0])
         self.assertEqual(len(models.calls), 1)
+
+    async def test_local_provider_expands_chinese_skill_into_visible_action(self):
+        result = await PromptRewriter(provider="local").complete_world_rule(
+            "喷火", "A rider explores a valley.", "skill"
+        )
+        self.assertEqual(result.name, "喷火")
+        self.assertEqual(result.change_type.value, "one_time")
+        self.assertIn("bright orange fire", result.prompt)
+        self.assertIn("sparks", result.prompt)
+        self.assertIn("A rider explores a valley.", result.prompt)
+
+    async def test_vertex_failure_can_fall_back_to_local_skill_prompt(self):
+        models = FakeModels([RuntimeError("vertex unavailable")])
+        client = SimpleNamespace(aio=SimpleNamespace(models=models))
+        previous = os.environ.get("VIDEO_PROMPT_REWRITE_FALLBACK_LOCAL")
+        os.environ["VIDEO_PROMPT_REWRITE_FALLBACK_LOCAL"] = "true"
+        try:
+            result = await PromptRewriter(
+                client=client,
+                provider="vertex",
+                request_timeout_seconds=1,
+            ).complete_world_rule("喷火", "A rider explores a valley.", "skill")
+        finally:
+            if previous is None:
+                os.environ.pop("VIDEO_PROMPT_REWRITE_FALLBACK_LOCAL", None)
+            else:
+                os.environ["VIDEO_PROMPT_REWRITE_FALLBACK_LOCAL"] = previous
+        self.assertEqual(result.change_type.value, "one_time")
+        self.assertIn("bright orange fire", result.prompt)
 
     def test_build_message_rejects_missing_state(self):
         with self.assertRaisesRegex(ValueError, "previous_prompt"):

@@ -24,6 +24,32 @@ DEFAULT_CREDENTIALS_PATH = (
 DEFAULT_MODEL = "gemini-3.1-flash-lite"
 DEFAULT_LOCATION = "global"
 VERTEX_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+LOCAL_PROVIDER = "local"
+
+_ONE_TIME_HINTS = (
+    "attack",
+    "cast",
+    "explode",
+    "explosion",
+    "fire",
+    "jump",
+    "release",
+    "shoot",
+    "summon",
+    "transform",
+    "攻击",
+    "爆炸",
+    "变身",
+    "发射",
+    "释放",
+    "喷火",
+    "吐火",
+    "火球",
+    "技能",
+    "闪电",
+    "跳",
+    "召唤",
+)
 
 
 class ChangeType(str, Enum):
@@ -171,6 +197,121 @@ def _validate_world_rule_output(payload: Any) -> WorldRuleCompletionOutput:
     return WorldRuleCompletionOutput.model_validate(payload)
 
 
+def _classify_local_change(instruction: str) -> ChangeType:
+    normalized = instruction.casefold()
+    return (
+        ChangeType.ONE_TIME
+        if any(hint in normalized for hint in _ONE_TIME_HINTS)
+        else ChangeType.PERSISTENT
+    )
+
+
+def _local_rule_name(rule_input: str) -> str:
+    compact = " ".join(rule_input.strip().split())
+    return compact[:28] or "Live update"
+
+
+def _local_skill_visual(rule_input: str) -> str:
+    """Translate common Chinese gameplay skills into visible English actions."""
+
+    compact = " ".join(rule_input.strip().split())
+    lowered = compact.casefold()
+    if any(token in lowered for token in ("喷火", "吐火", "fire breath", "flame")):
+        return (
+            "The rider raises the sword and a dramatic cone of bright orange fire "
+            "erupts forward across the scene, with sparks, rolling smoke, heat "
+            "shimmer, and warm firelight flashing across the horse, grass, mist, "
+            "and nearby ruins."
+        )
+    if any(token in lowered for token in ("火球", "fireball")):
+        return (
+            "A glowing fireball launches forward from the rider's raised hand, "
+            "leaving a comet-like trail of embers, smoke, and orange light before "
+            "bursting ahead of the horse."
+        )
+    if any(token in lowered for token in ("闪电", "雷", "lightning", "thunder")):
+        return (
+            "A branching bolt of blue-white lightning cracks down in front of the "
+            "rider, lighting the valley with sharp highlights and throwing small "
+            "sparks through the mist."
+        )
+    if any(token in lowered for token in ("结冰", "冰冻", "冰", "freeze", "ice")):
+        return (
+            "A wave of pale blue frost surges outward from the rider, glazing the "
+            "grass and stones with ice crystals while cold vapor curls around the "
+            "horse's legs."
+        )
+    if any(token in lowered for token in ("爆炸", "explosion", "explode")):
+        return (
+            "A compact explosion bursts ahead of the rider, throwing dust, sparks, "
+            "and glowing fragments outward while the horse and rider remain framed "
+            "in the same over-the-shoulder composition."
+        )
+    if any(token in lowered for token in ("召唤", "summon")):
+        return (
+            "A bright circular summoning sigil opens near the rider, spilling "
+            "colored light and floating particles as a magical shape begins to "
+            "materialize in the valley."
+        )
+    return (
+        "A clear magical skill effect visibly manifests around the rider: bright "
+        "energy trails, sparks, motion streaks, and a brief burst of colored light "
+        "make the triggered action obvious while preserving the same camera and "
+        "world layout."
+    )
+
+
+def _local_rewrite(instruction: str, previous_prompt: str) -> PromptRewriteOutput:
+    normalized_prompt = previous_prompt.strip()
+    normalized_instruction = instruction.strip()
+    if not normalized_prompt:
+        raise ValueError("previous_prompt must not be empty")
+    if not normalized_instruction:
+        raise ValueError("instruction must not be empty")
+    change_type = _classify_local_change(normalized_instruction)
+    visual_instruction = (
+        _local_skill_visual(normalized_instruction)
+        if change_type == ChangeType.ONE_TIME
+        else (
+            "Apply this latest live direction while preserving all unspecified "
+            "subjects, composition, lighting, and scene continuity: "
+            f"{normalized_instruction}"
+        )
+    )
+    return PromptRewriteOutput(
+        prompt=f"{normalized_prompt}\n\n{visual_instruction}",
+        change_type=change_type,
+    )
+
+
+def _local_world_rule(
+    rule_input: str, previous_prompt: str, kind: str
+) -> WorldRuleCompletionOutput:
+    normalized_kind = kind.strip().lower()
+    if normalized_kind == "skill":
+        return WorldRuleCompletionOutput(
+            name=_local_rule_name(rule_input),
+            prompt=f"{previous_prompt.strip()}\n\n{_local_skill_visual(rule_input)}",
+            change_type=ChangeType.ONE_TIME,
+        )
+    rewritten = _local_rewrite(rule_input, previous_prompt)
+    return WorldRuleCompletionOutput(
+        name=_local_rule_name(rule_input),
+        prompt=rewritten.prompt,
+        change_type=rewritten.change_type,
+    )
+
+
+def _env_flag(name: str, default: str = "") -> bool:
+    return os.environ.get(name, default).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "local",
+    }
+
+
 class PromptRewriter:
     """One warm Vertex Gemini client shared by all rewrite HTTP requests."""
 
@@ -184,7 +325,16 @@ class PromptRewriter:
         request_timeout_seconds: float | None = None,
         max_attempts: int = 2,
         client: Any | None = None,
+        provider: str | None = None,
     ) -> None:
+        self.provider = (
+            provider or os.environ.get("VIDEO_PROMPT_REWRITE_PROVIDER", "vertex")
+        ).strip().lower()
+        if self.provider not in {"vertex", LOCAL_PROVIDER}:
+            raise ValueError("VIDEO_PROMPT_REWRITE_PROVIDER must be vertex or local")
+        self.local_fallback_enabled = _env_flag(
+            "VIDEO_PROMPT_REWRITE_FALLBACK_LOCAL"
+        )
         self.model = model or os.environ.get(
             "VIDEO_PROMPT_REWRITE_MODEL", DEFAULT_MODEL
         )
@@ -210,9 +360,15 @@ class PromptRewriter:
 
     @property
     def configured(self) -> bool:
-        return self._client is not None or self.credentials_path.is_file()
+        return (
+            self.provider == LOCAL_PROVIDER
+            or self._client is not None
+            or self.credentials_path.is_file()
+        )
 
     async def _get_client(self) -> Any:
+        if self.provider == LOCAL_PROVIDER:
+            raise RuntimeError("Local prompt rewriter does not use a Gemini client")
         if self._client is not None:
             return self._client
         async with self._client_lock:
@@ -258,47 +414,55 @@ class PromptRewriter:
     ) -> PromptRewriteOutput:
         """Rewrite once, retrying only malformed structured model output."""
 
+        if self.provider == LOCAL_PROVIDER:
+            return _local_rewrite(instruction, previous_prompt)
+
         from google.genai import types
 
         client = await self._get_client()
         user_message = build_user_message(previous_prompt, instruction)
         attempt_message = user_message
-        for _attempt in range(1, self.max_attempts + 1):
-            # API failures and timeouts are latency-sensitive failures: surface them
-            # immediately instead of silently paying for another model call.
-            response = await asyncio.wait_for(
-                client.aio.models.generate_content(
-                    model=self.model,
-                    contents=[attempt_message],
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT,
-                        temperature=0.1,
-                        max_output_tokens=1024,
-                        response_mime_type="application/json",
-                        response_json_schema=PromptRewriteOutput.model_json_schema(),
-                        thinking_config=types.ThinkingConfig(
-                            thinking_budget=0,
-                            include_thoughts=False,
+        try:
+            for _attempt in range(1, self.max_attempts + 1):
+                # API failures and timeouts are latency-sensitive failures: surface them
+                # immediately instead of silently paying for another model call.
+                response = await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=self.model,
+                        contents=[attempt_message],
+                        config=types.GenerateContentConfig(
+                            system_instruction=SYSTEM_PROMPT,
+                            temperature=0.1,
+                            max_output_tokens=1024,
+                            response_mime_type="application/json",
+                            response_json_schema=PromptRewriteOutput.model_json_schema(),
+                            thinking_config=types.ThinkingConfig(
+                                thinking_budget=0,
+                                include_thoughts=False,
+                            ),
                         ),
                     ),
-                ),
-                timeout=self.request_timeout_seconds,
-            )
-            try:
-                return _validate_output(_extract_payload(response))
-            except (TypeError, ValueError) as exc:
-                if _attempt == self.max_attempts:
-                    raise RuntimeError(
-                        "Gemini returned invalid structured output after "
-                        f"{self.max_attempts} attempt(s)"
-                    ) from exc
-                attempt_message = (
-                    user_message
-                    + "\n\nSTRUCTURE CORRECTION FOR THE NEXT ATTEMPT:\n"
-                    + str(exc)
-                    + "\nReturn valid JSON with exactly prompt and change_type. "
-                    + "change_type must be persistent or one_time."
+                    timeout=self.request_timeout_seconds,
                 )
+                try:
+                    return _validate_output(_extract_payload(response))
+                except (TypeError, ValueError) as exc:
+                    if _attempt == self.max_attempts:
+                        raise RuntimeError(
+                            "Gemini returned invalid structured output after "
+                            f"{self.max_attempts} attempt(s)"
+                        ) from exc
+                    attempt_message = (
+                        user_message
+                        + "\n\nSTRUCTURE CORRECTION FOR THE NEXT ATTEMPT:\n"
+                        + str(exc)
+                        + "\nReturn valid JSON with exactly prompt and change_type. "
+                        + "change_type must be persistent or one_time."
+                    )
+        except Exception:
+            if self.local_fallback_enabled:
+                return _local_rewrite(instruction, previous_prompt)
+            raise
         raise AssertionError("unreachable")
 
     async def complete_world_rule(
@@ -306,45 +470,53 @@ class PromptRewriter:
     ) -> WorldRuleCompletionOutput:
         """Infer a rule label and prepared prompt in one latency-sensitive call."""
 
+        if self.provider == LOCAL_PROVIDER:
+            return _local_world_rule(rule_input, previous_prompt, kind)
+
         from google.genai import types
 
         client = await self._get_client()
         user_message = build_world_rule_message(previous_prompt, rule_input, kind)
         attempt_message = user_message
-        for attempt in range(1, self.max_attempts + 1):
-            response = await asyncio.wait_for(
-                client.aio.models.generate_content(
-                    model=self.model,
-                    contents=[attempt_message],
-                    config=types.GenerateContentConfig(
-                        system_instruction=WORLD_RULE_SYSTEM_PROMPT,
-                        temperature=0.1,
-                        max_output_tokens=1024,
-                        response_mime_type="application/json",
-                        response_json_schema=(
-                            WorldRuleCompletionOutput.model_json_schema()
-                        ),
-                        thinking_config=types.ThinkingConfig(
-                            thinking_budget=0,
-                            include_thoughts=False,
+        try:
+            for attempt in range(1, self.max_attempts + 1):
+                response = await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=self.model,
+                        contents=[attempt_message],
+                        config=types.GenerateContentConfig(
+                            system_instruction=WORLD_RULE_SYSTEM_PROMPT,
+                            temperature=0.1,
+                            max_output_tokens=1024,
+                            response_mime_type="application/json",
+                            response_json_schema=(
+                                WorldRuleCompletionOutput.model_json_schema()
+                            ),
+                            thinking_config=types.ThinkingConfig(
+                                thinking_budget=0,
+                                include_thoughts=False,
+                            ),
                         ),
                     ),
-                ),
-                timeout=self.request_timeout_seconds,
-            )
-            try:
-                return _validate_world_rule_output(_extract_payload(response))
-            except (TypeError, ValueError) as exc:
-                if attempt == self.max_attempts:
-                    raise RuntimeError(
-                        "Gemini returned invalid world rule output after "
-                        f"{self.max_attempts} attempt(s)"
-                    ) from exc
-                attempt_message = (
-                    user_message
-                    + "\n\nSTRUCTURE CORRECTION FOR THE NEXT ATTEMPT:\n"
-                    + str(exc)
-                    + "\nReturn valid JSON with exactly name, prompt, and "
-                    + "change_type. change_type must be persistent or one_time."
+                    timeout=self.request_timeout_seconds,
                 )
+                try:
+                    return _validate_world_rule_output(_extract_payload(response))
+                except (TypeError, ValueError) as exc:
+                    if attempt == self.max_attempts:
+                        raise RuntimeError(
+                            "Gemini returned invalid world rule output after "
+                            f"{self.max_attempts} attempt(s)"
+                        ) from exc
+                    attempt_message = (
+                        user_message
+                        + "\n\nSTRUCTURE CORRECTION FOR THE NEXT ATTEMPT:\n"
+                        + str(exc)
+                        + "\nReturn valid JSON with exactly name, prompt, and "
+                        + "change_type. change_type must be persistent or one_time."
+                    )
+        except Exception:
+            if self.local_fallback_enabled:
+                return _local_world_rule(rule_input, previous_prompt, kind)
+            raise
         raise AssertionError("unreachable")
