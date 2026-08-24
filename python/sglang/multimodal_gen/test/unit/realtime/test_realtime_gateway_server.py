@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import sys
 
+import httpx
 import pytest
 from fastapi import WebSocketDisconnect
 from fastapi.testclient import TestClient
@@ -164,6 +165,41 @@ def test_gateway_coordinator_release_treats_lost_lease_as_idempotent():
                 vae=slot,
             )
         )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_error"),
+    [
+        (404, CoordinatorRejected),
+        (408, httpx.HTTPStatusError),
+        (503, httpx.HTTPStatusError),
+    ],
+)
+def test_gateway_coordinator_claim_distinguishes_rejection_from_unknown_result(
+    status_code, expected_error
+):
+    async def handler(_request):
+        return httpx.Response(status_code)
+
+    async def run():
+        client = HTTPCoordinatorClient.__new__(HTTPCoordinatorClient)
+        client._client = httpx.AsyncClient(
+            base_url="http://coordinator.invalid",
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            with pytest.raises(expected_error) as raised:
+                await client.claim_attempt(
+                    attempt_id="11111111-1111-1111-1111-111111111111",
+                    owner_id="session:generation",
+                    expires_at=9999999999,
+                )
+            if status_code == 404:
+                assert raised.value.reason == "COORDINATOR_HTTP_404"
+        finally:
+            await client._client.aclose()
 
     asyncio.run(run())
 

@@ -2,6 +2,7 @@
 
 import logging
 import sys
+import time
 
 from fastapi.testclient import TestClient
 
@@ -54,6 +55,21 @@ def test_coordinator_http_session_lifecycle_and_structured_rejection(caplog):
     assert capacity.status_code == 200
     assert capacity.json()["roles"]["denoiser"]["free_slots"] == 1
     assert capacity.json()["roles"]["vae"]["free_slots"] == 1
+
+    attempt = {
+        "attempt_id": "22222222-2222-2222-2222-222222222222",
+        "owner_id": "gateway-a:connection-a",
+        "expires_at": time.time() + 300,
+    }
+    assert client.post("/v1/attempts/claim", json=attempt).status_code == 204
+    # owner 对响应不确定时重试仍成功；另一个 Gateway 连接稳定得到冲突。
+    assert client.post("/v1/attempts/claim", json=attempt).status_code == 204
+    duplicate = client.post(
+        "/v1/attempts/claim",
+        json={**attempt, "owner_id": "gateway-b:connection-b"},
+    )
+    assert duplicate.status_code == 409
+    assert duplicate.json()["detail"]["reason"] == "ATTEMPT_ALREADY_OWNED"
 
     request = {
         "user_id": "user-a",

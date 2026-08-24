@@ -27,8 +27,10 @@ import hmac as hmac_mod
 import json
 import logging
 import secrets
+import threading
 import time
 from dataclasses import dataclass
+from uuid import UUID
 
 import httpx
 from cryptography.exceptions import InvalidSignature
@@ -105,12 +107,21 @@ def verify_session_token(token: str, public_key: Ed25519PublicKey) -> Principal:
     max_lifetime = int(session.get("max_lifetime_s") or 0)
     if max_lifetime <= 0:
         raise TokenError("missing session lifetime")
+    raw_jti = claims.get("jti")
+    if not isinstance(raw_jti, str):
+        raise TokenError("jti must be a UUID")
+    try:
+        UUID(raw_jti)
+    except (ValueError, AttributeError) as exc:
+        raise TokenError("jti must be a UUID") from exc
     return Principal(
         user_id=str(claims.get("sub") or ""),
         run_id=str(claims.get("sid") or ""),
         max_lifetime_s=max_lifetime,
         allow_free_prompt=bool(session.get("allow_free_prompt", False)),
-        jti=str(claims.get("jti") or ""),
+        # Callback 必须原样回传 token jti；UUID 解析只负责验证，不能在这里
+        # 规范化后悄悄改变 attempt_id。
+        jti=raw_jti,
         exp=int(claims.get("exp") or 0),
         account_id=str(claims.get("uid") or ""),
     )
@@ -170,21 +181,26 @@ class TokenReplayGuard:
 
     def __init__(self) -> None:
         self._seen: dict[str, float] = {}  # jti -> eviction timestamp
+        # ASGI 通常只有一个事件循环，但测试或嵌入式服务器仍可能从不同线程进入。
+        # owner 必须只有一个；若“检查再写入”出现竞态，同一个 attempt 就会有
+        # 两条连接同时进入 Coordinator。
+        self._lock = threading.Lock()
 
     def consume(self, principal: Principal, now: float | None = None) -> bool:
         if not principal.jti:
-            return True  # Compatibility path for legacy issuers without jti.
-        now = time.time() if now is None else now
-        # Lazy cleanup: records past exp plus skew can no longer verify.
-        expired = [j for j, until in self._seen.items() if until <= now]
-        for j in expired:
-            del self._seen[j]
-        if principal.jti in self._seen:
             return False
-        # Keep until exp+60s and for at least five minutes, leaving room beyond
-        # the 30s verification skew so retention cannot be shorter than validity.
-        self._seen[principal.jti] = max(float(principal.exp) + 60.0, now + 300.0)
-        return True
+        now = time.time() if now is None else now
+        with self._lock:
+            # Lazy cleanup: records past exp plus skew can no longer verify.
+            expired = [j for j, until in self._seen.items() if until <= now]
+            for j in expired:
+                del self._seen[j]
+            if principal.jti in self._seen:
+                return False
+            # Keep until exp+60s and for at least five minutes, leaving room beyond
+            # the 30s verification skew so retention cannot be shorter than validity.
+            self._seen[principal.jti] = max(float(principal.exp) + 60.0, now + 300.0)
+            return True
 
 
 @dataclass
@@ -241,7 +257,7 @@ class WorldCallbacks:
             "X-Track-Signature-Version": "v1",
         }
 
-    async def _post(self, path: str, payload: dict) -> None:
+    async def _post(self, path: str, payload: dict) -> bool:
         body = json.dumps(payload).encode()
         url = self._cfg.callback_url.rstrip("/") + path
         for attempt in range(3):
@@ -250,10 +266,14 @@ class WorldCallbacks:
                     url, content=body, headers=self._sign("POST", path, body)
                 )
                 if resp.status_code < 300:
-                    return
+                    return True
                 logger.warning(
                     "world callback returned %s (%s)", resp.status_code, path
                 )
+                # 4xx 表示 callback 契约本身被拒绝，重试同一请求不会改变结果；
+                # 只有网络故障和 5xx 才进入下面的有界重试。
+                if resp.status_code < 500:
+                    return False
             except Exception as exc:  # noqa: BLE001 - callback failures are logged.
                 logger.warning(
                     "world callback failed (%s), attempt %d: %s",
@@ -262,8 +282,9 @@ class WorldCallbacks:
                     exc,
                 )
             await asyncio.sleep(0.5 * (attempt + 1))
+        return False
 
-    def fire(self, path: str, payload: dict) -> None:
+    def fire(self, path: str, payload: dict) -> asyncio.Task:
         """Dispatch asynchronously without blocking the session path.
 
         Keep a strong task reference as asyncio recommends, because the event
@@ -272,6 +293,7 @@ class WorldCallbacks:
         task = asyncio.get_running_loop().create_task(self._post(path, payload))
         self._pending.add(task)
         task.add_done_callback(self._pending.discard)
+        return task
 
     async def rewrite(self, run_id: str, instruction: str, baseline: str) -> dict:
         """Rewrite a player instruction synchronously for the interaction path.
@@ -295,22 +317,26 @@ class WorldCallbacks:
             raise ValueError("rewrite response missing prompt")
         return data
 
-    def started(self, run_id: str, trace_id: str, max_lifetime_s: int) -> None:
+    def started(
+        self, run_id: str, attempt_id: str, trace_id: str, max_lifetime_s: int
+    ) -> None:
         self.fire(
             "/internal/v1/runs/started",
             {
                 "run_id": run_id,
+                "attempt_id": attempt_id,
                 "trace_id": trace_id,
                 "admitted_at_ms": int(time.time() * 1000),
                 "max_lifetime_s": max_lifetime_s,
             },
         )
 
-    def ended(self, run_id: str, trace_id: str, reason: str) -> None:
+    def ended(self, run_id: str, attempt_id: str, trace_id: str, reason: str) -> None:
         self.fire(
             "/internal/v1/runs/ended",
             {
                 "run_id": run_id,
+                "attempt_id": attempt_id,
                 "trace_id": trace_id,
                 "ended_at_ms": int(time.time() * 1000),
                 "reason": reason,
@@ -318,7 +344,13 @@ class WorldCallbacks:
         )
 
     def aborted(
-        self, run_id: str, trace_id: str, fault: str, reason: str, established: bool
+        self,
+        run_id: str,
+        attempt_id: str,
+        trace_id: str,
+        fault: str,
+        reason: str,
+        established: bool,
     ) -> None:
         """Report session termination.
 
@@ -334,6 +366,7 @@ class WorldCallbacks:
             "/internal/v1/runs/aborted",
             {
                 "run_id": run_id,
+                "attempt_id": attempt_id,
                 "trace_id": trace_id,
                 "fault": fault,
                 "reason": reason,
