@@ -42,10 +42,12 @@ RUN_VIDEO_S3_REGION=us-west-2
 ```
 
 Gateway refuses to start when only part of the world-platform and recording
-configuration is present. The bucket must be in the Gateway region. Its IAM
-role needs only multipart create/upload/complete/abort access under
-`runs/*`; object reads belong to the CDN origin, not Gateway. Enable S3 Block
-Public Access, default server-side encryption, and a lifecycle rule that aborts
+configuration is present. `RUN_VIDEO_S3_REGION` is the bucket's AWS Region,
+currently `us-west-2`. Keep Gateway in that Region for AWS deployments; an
+Alibaba ACK deployment may upload cross-cloud as described below. The Gateway
+role needs only multipart create/upload/complete/abort access under `runs/*`;
+object reads belong to the CDN origin, not Gateway. Enable S3 Block Public
+Access, default server-side encryption, and a lifecycle rule that aborts
 incomplete multipart uploads after one day.
 
 Only a verified `authorized_generate` token with
@@ -82,9 +84,88 @@ Deploy in this order:
    and CDN playback; verify one Showcase Run creates no multipart upload.
 
 At current 3000 kbps encoding, eight concurrent recordings add about 24 Mbps
-(3 MB/s) of same-region S3 upload traffic. Before raising admission above eight
-sessions, repeat an RSS and event-loop-lag load test; do not compensate for a
-slow S3 path by increasing the queue without new measurements.
+(3 MB/s) of S3 upload traffic. Before raising admission above eight sessions,
+repeat an RSS and event-loop-lag load test; do not compensate for a slow S3
+path by increasing the queue without new measurements.
+
+## Alibaba ACK to AWS S3
+
+Keep S3 as the sole durable store when Gateway moves to Alibaba ACK. The media
+path remains a direct HTTPS multipart upload:
+
+```text
+ACK Gateway --HTTPS 443 / multipart--> S3 us-west-2
+ACK Gateway --HTTPS / recorded callback--> world-service
+Browser --GET / Range--> CloudFront --OAC--> S3
+```
+
+Do not proxy media through world-service and do not add OSS staging before a
+production-node benchmark proves it is necessary. Use AWS OIDC federation
+instead of long-lived AWS access keys:
+
+1. Enable ServiceAccount token projection on the ACK cluster and obtain its
+   public RRSA/cluster OIDC issuer.
+2. Register that issuer as an IAM OIDC provider in AWS account
+   `107014413969`, with client ID `sts.amazonaws.com`.
+3. Add a second trust statement to the existing Gateway upload role. Restrict
+   it to both `aud=sts.amazonaws.com` and the exact
+   `sub=system:serviceaccount:<namespace>:<service-account>`. The EKS IRSA and
+   ACK trust statements may coexist.
+4. Project a separate one-hour ServiceAccount token for AWS. Do not reuse an
+   RRSA token whose audience is `sts.aliyuncs.com`.
+5. Allow outbound HTTPS only to regional AWS STS and the S3 upload endpoint.
+
+The Pod fragment is intentionally explicit because the ACK admission webhook
+normally injects Alibaba STS settings, not AWS settings:
+
+```yaml
+spec:
+  serviceAccountName: minwm-zing-run-video-gateway
+  containers:
+    - name: gateway
+      env:
+        - name: AWS_ROLE_ARN
+          value: arn:aws:iam::107014413969:role/minwm-zing-run-video-gateway
+        - name: AWS_WEB_IDENTITY_TOKEN_FILE
+          value: /var/run/secrets/aws-web-identity/token
+        - name: AWS_DEFAULT_REGION
+          value: us-west-2
+        - name: AWS_STS_REGIONAL_ENDPOINTS
+          value: regional
+      volumeMounts:
+        - name: aws-web-identity
+          mountPath: /var/run/secrets/aws-web-identity
+          readOnly: true
+  volumes:
+    - name: aws-web-identity
+      projected:
+        sources:
+          - serviceAccountToken:
+              audience: sts.amazonaws.com
+              expirationSeconds: 3600
+              path: token
+```
+
+The recording client uses boto3's default credential chain, so it exchanges
+and refreshes this token without an ACK-specific code path. For an overseas ACK
+Region, start with the S3 regional endpoint. For mainland China, benchmark the
+regional endpoint against S3 Transfer Acceleration from the actual production
+nodes. Do not enable acceleration through hidden shared configuration; add an
+explicit, reviewed client option only if the benchmark selects it.
+
+The eight-session cross-cloud gate is:
+
+- at least 48 Mbps sustained aggregate upload capacity, twice the 24 Mbps media
+  rate;
+- 8 MiB `UploadPart` p99 below 10 seconds;
+- zero `buffer_full` and `upload_failed` results in three complete 70-second
+  rounds;
+- no more than 5% regression in browser first-frame and send-path p95.
+
+If both direct endpoints fail this gate, design a second-stage same-Region OSS
+temporary object and an independent S3 copy worker. Send the recorded callback
+and delete the temporary object only after S3 `CompleteMultipartUpload`
+succeeds. S3 remains the only published source of truth.
 
 ## Consumed-reservation watchdog
 
