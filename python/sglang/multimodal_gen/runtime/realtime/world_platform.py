@@ -10,8 +10,8 @@ works as follows:
     the browser to forward it. The gateway unseals it here. The browser never
     sees prompts, timelines, or skill instructions. GCM provides integrity, so a
     one-byte tamper fails without a separate hash binding.
-  - Callbacks: started, ended, and aborted callbacks use HMAC signing compatible
-    with the biz-core tracking ingest path.
+  - Callbacks: started, ended, aborted, and recorded callbacks use HMAC signing
+    compatible with the biz-core tracking ingest path.
 
 Legacy showcase routes do not reference this module. If world platform settings
 are absent, behavior is unchanged.
@@ -49,6 +49,7 @@ class Principal:
     run_id: str
     max_lifetime_s: int
     allow_free_prompt: bool
+    record_video: bool
     jti: str = ""  # one-time nonce to prevent two sessions from one token
     exp: int = 0  # expiry timestamp in seconds, used to age out replay cache
     # Account-level pseudonym: stable across runs for the same player, unlike
@@ -101,15 +102,26 @@ def verify_session_token(token: str, public_key: Ed25519PublicKey) -> Principal:
     exp = int(claims.get("exp") or 0)
     if exp and time.time() > exp + 30:  # 30s clock skew tolerance
         raise TokenError("token expired")
-    session = claims.get("session") or {}
-    max_lifetime = int(session.get("max_lifetime_s") or 0)
-    if max_lifetime <= 0:
+    session = claims.get("session")
+    if not isinstance(session, dict):
+        raise TokenError("session claim is required")
+    max_lifetime = session.get("max_lifetime_s")
+    allow_free_prompt = session.get("allow_free_prompt")
+    record_video = session.get("record_video")
+    # bool is a subclass of int in Python, so exact type checks are required.
+    # Coercion would turn strings such as "false" into an enabled policy.
+    if type(max_lifetime) is not int or max_lifetime <= 0:
         raise TokenError("missing session lifetime")
+    if type(allow_free_prompt) is not bool:
+        raise TokenError("allow_free_prompt must be boolean")
+    if type(record_video) is not bool:
+        raise TokenError("record_video must be boolean")
     return Principal(
         user_id=str(claims.get("sub") or ""),
         run_id=str(claims.get("sid") or ""),
         max_lifetime_s=max_lifetime,
-        allow_free_prompt=bool(session.get("allow_free_prompt", False)),
+        allow_free_prompt=allow_free_prompt,
+        record_video=record_video,
         jti=str(claims.get("jti") or ""),
         exp=int(claims.get("exp") or 0),
         account_id=str(claims.get("uid") or ""),
@@ -196,6 +208,8 @@ class WorldPlatformConfig:
     callback_app_id: str
     callback_key_id: str
     callback_secret: str
+    recording_bucket: str
+    recording_region: str
 
 
 class WorldCallbacks:
@@ -241,7 +255,7 @@ class WorldCallbacks:
             "X-Track-Signature-Version": "v1",
         }
 
-    async def _post(self, path: str, payload: dict) -> None:
+    async def _post(self, path: str, payload: dict) -> bool:
         body = json.dumps(payload).encode()
         url = self._cfg.callback_url.rstrip("/") + path
         for attempt in range(3):
@@ -250,7 +264,7 @@ class WorldCallbacks:
                     url, content=body, headers=self._sign("POST", path, body)
                 )
                 if resp.status_code < 300:
-                    return
+                    return True
                 logger.warning(
                     "world callback returned %s (%s)", resp.status_code, path
                 )
@@ -262,8 +276,9 @@ class WorldCallbacks:
                     exc,
                 )
             await asyncio.sleep(0.5 * (attempt + 1))
+        return False
 
-    def fire(self, path: str, payload: dict) -> None:
+    def fire(self, path: str, payload: dict) -> asyncio.Task:
         """Dispatch asynchronously without blocking the session path.
 
         Keep a strong task reference as asyncio recommends, because the event
@@ -272,6 +287,7 @@ class WorldCallbacks:
         task = asyncio.get_running_loop().create_task(self._post(path, payload))
         self._pending.add(task)
         task.add_done_callback(self._pending.discard)
+        return task
 
     async def rewrite(self, run_id: str, instruction: str, baseline: str) -> dict:
         """Rewrite a player instruction synchronously for the interaction path.
@@ -317,6 +333,12 @@ class WorldCallbacks:
             },
         )
 
+    def recorded(self, run_id: str, video_uri: str) -> asyncio.Task:
+        return self.fire(
+            "/internal/v1/runs/recorded",
+            {"run_id": run_id, "video_uri": video_uri},
+        )
+
     def aborted(
         self, run_id: str, trace_id: str, fault: str, reason: str, established: bool
     ) -> None:
@@ -340,3 +362,13 @@ class WorldCallbacks:
                 "established": established,
             },
         )
+
+    async def close(self) -> None:
+        if self._pending:
+            _, pending = await asyncio.wait(tuple(self._pending), timeout=5.0)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        await self._client.aclose()
+        await self._rewrite_client.aclose()

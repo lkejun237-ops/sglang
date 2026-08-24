@@ -21,6 +21,7 @@ dependencies = [
   "apache-tvm-ffi==0.1.11",
   "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "blobfile==3.0.0",
+  "boto3",
   "build",
   "compressed-tensors",
   "cryptography>=42.0",  # realtime 网关 world 凭证验签（Ed25519）；主文件顶层 import，必须显式声明

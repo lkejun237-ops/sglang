@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import base64
 import inspect
 import sys
 
@@ -385,7 +386,7 @@ def test_gateway_uses_retryable_close_semantics_for_capacity_only(
 
 
 def test_partial_world_config_refuses_to_start():
-    """All three --world-* flags or none.
+    """All world-platform and recording flags or none.
 
     A partial set used to silently skip registering authorized_generate; the
     resulting 404 is underdetermined (a fronting proxy yields the same one), so
@@ -396,6 +397,8 @@ def test_partial_world_config_refuses_to_start():
         world_token_ed25519_pub = ""
         world_callback_url = ""
         world_callback_hmac_secret = ""
+        run_video_s3_bucket = ""
+        run_video_s3_region = ""
 
     none_given = Args()
     assert _build_world_platform(none_given) is None  # showcase-only deploy stays valid
@@ -408,4 +411,20 @@ def test_partial_world_config_refuses_to_start():
     missing_part = message.split("Missing:")[1]
     assert "--world-token-ed25519-pub" in missing_part
     assert "--world-callback-hmac-secret" in missing_part
+    assert "--run-video-s3-bucket" in missing_part
+    assert "--run-video-s3-region" in missing_part
     assert "--world-callback-url" not in missing_part
+
+
+def test_complete_world_config_carries_recording_location():
+    class Args:
+        world_token_ed25519_pub = base64.b64encode(bytes(32)).decode()
+        world_callback_url = "https://world-service.example"
+        world_callback_hmac_secret = "secret"
+        run_video_s3_bucket = "run-videos"
+        run_video_s3_region = "us-west-2"
+
+    config = _build_world_platform(Args())
+
+    assert config.recording_bucket == "run-videos"
+    assert config.recording_region == "us-west-2"
