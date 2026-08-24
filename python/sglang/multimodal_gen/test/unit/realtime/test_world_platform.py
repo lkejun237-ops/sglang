@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Session token parsing: the account-level pseudonym and its fallback."""
 
+import asyncio
 import base64
+import concurrent.futures
 import json
 import time
+from types import SimpleNamespace
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -11,6 +14,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from sglang.multimodal_gen.runtime.realtime.world_platform import (
     Principal,
     TokenError,
+    TokenReplayGuard,
     WorldCallbacks,
     load_public_key,
     verify_session_token,
@@ -40,7 +44,7 @@ def _claims(**extra) -> dict:
         "aud": "world-session",
         "sub": "s_abc123",
         "sid": "11111111-1111-1111-1111-111111111111",
-        "jti": "j1",
+        "jti": "22222222-2222-2222-2222-222222222222",
         "iat": now,
         "exp": now + 90,
         "session": {
@@ -113,6 +117,45 @@ def test_recording_policy_is_required_and_must_be_a_boolean(invalid_value):
         verify_session_token(token, load_public_key(pub))
 
 
+def test_attempt_id_is_required_and_must_be_a_uuid():
+    for value in (None, "", "not-a-uuid"):
+        claims = _claims()
+        if value is None:
+            claims.pop("jti")
+        else:
+            claims["jti"] = value
+        token, pub = _sign(claims)
+
+        with pytest.raises(TokenError, match="jti must be a UUID"):
+            verify_session_token(token, load_public_key(pub))
+
+
+def test_attempt_id_is_returned_exactly_as_signed():
+    attempt_id = "22222222-2222-2222-2222-22222222222A"
+    token, pub = _sign(_claims(jti=attempt_id))
+
+    assert verify_session_token(token, load_public_key(pub)).jti == attempt_id
+
+
+def test_replay_guard_has_exactly_one_concurrent_attempt_owner():
+    guard = TokenReplayGuard()
+    principal = Principal(
+        user_id="s_x",
+        run_id="run-1",
+        max_lifetime_s=90,
+        allow_free_prompt=False,
+        record_video=False,
+        jti="22222222-2222-2222-2222-222222222222",
+        exp=int(time.time()) + 90,
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+        results = list(executor.map(lambda _: guard.consume(principal), range(64)))
+
+    assert results.count(True) == 1
+    assert results.count(False) == 63
+
+
 def test_aborted_payload_carries_established_flag():
     """Terminal callbacks must state whether the session ever came up.
 
@@ -133,16 +176,30 @@ def test_aborted_payload_carries_established_flag():
 
     stub = _Stub()
     stub.aborted(
-        "run-1", "t", fault="ours", reason="USER_SESSION_LIMIT", established=False
+        "run-1",
+        "attempt-1",
+        "t",
+        fault="ours",
+        reason="USER_SESSION_LIMIT",
+        established=False,
     )
-    stub.aborted("run-2", "t", fault="ours", reason="engine crashed", established=True)
+    stub.aborted(
+        "run-2",
+        "attempt-2",
+        "t",
+        fault="ours",
+        reason="engine crashed",
+        established=True,
+    )
 
     assert fired[0][0] == "/internal/v1/runs/aborted"
+    assert fired[0][1]["attempt_id"] == "attempt-1"
     assert fired[0][1]["established"] is False
+    assert fired[1][1]["attempt_id"] == "attempt-2"
     assert fired[1][1]["established"] is True
 
 
-def test_recorded_callback_carries_only_the_run_and_s3_uri():
+def test_lifecycle_callbacks_carry_the_token_attempt_id():
     fired = []
     scheduled = object()
 
@@ -154,15 +211,59 @@ def test_recorded_callback_carries_only_the_run_and_s3_uri():
             fired.append((path, payload))
             return scheduled
 
-    result = _Stub().recorded("run-1", "s3://videos/runs/run-1/video.mp4")
+    stub = _Stub()
+    stub.started("run-1", "attempt-1", "trace-1", 90)
+    stub.ended("run-1", "attempt-1", "trace-1", "completed")
+    result = stub.recorded("run-1", "attempt-1", "s3://videos/runs/run-1/video.mp4")
 
     assert result is scheduled
-    assert fired == [
-        (
-            "/internal/v1/runs/recorded",
-            {
-                "run_id": "run-1",
-                "video_uri": "s3://videos/runs/run-1/video.mp4",
-            },
-        )
+    assert [path for path, _ in fired] == [
+        "/internal/v1/runs/started",
+        "/internal/v1/runs/ended",
+        "/internal/v1/runs/recorded",
     ]
+    assert all(payload["attempt_id"] == "attempt-1" for _, payload in fired)
+    assert fired[2][1] == {
+        "run_id": "run-1",
+        "attempt_id": "attempt-1",
+        "video_uri": "s3://videos/runs/run-1/video.mp4",
+    }
+
+
+def test_callback_retries_5xx_but_treats_4xx_as_terminal(monkeypatch):
+    class Client:
+        def __init__(self, statuses):
+            self.statuses = iter(statuses)
+            self.calls = 0
+
+        async def post(self, *_args, **_kwargs):
+            self.calls += 1
+            return SimpleNamespace(status_code=next(self.statuses))
+
+    async def no_sleep(_delay):
+        pass
+
+    async def run():
+        callbacks = WorldCallbacks.__new__(WorldCallbacks)
+        callbacks._cfg = SimpleNamespace(
+            callback_url="http://world-service.invalid",
+            callback_app_id="gateway",
+            callback_key_id="k1",
+            callback_secret="secret",
+        )
+        monkeypatch.setattr(
+            "sglang.multimodal_gen.runtime.realtime.world_platform.asyncio.sleep",
+            no_sleep,
+        )
+
+        terminal = Client([409, 200])
+        callbacks._client = terminal
+        assert await callbacks._post("/callback", {"attempt_id": "a"}) is False
+        assert terminal.calls == 1
+
+        retryable = Client([503, 200])
+        callbacks._client = retryable
+        assert await callbacks._post("/callback", {"attempt_id": "a"}) is True
+        assert retryable.calls == 2
+
+    asyncio.run(run())

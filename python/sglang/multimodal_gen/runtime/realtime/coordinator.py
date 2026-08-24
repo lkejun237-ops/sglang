@@ -94,6 +94,10 @@ class SessionAssignment:
 class CoordinatorStore(Protocol):
     async def heartbeat(self, heartbeat: WorkerHeartbeat) -> None: ...
 
+    async def claim_attempt(
+        self, *, attempt_id: str, owner_id: str, expires_at: float
+    ) -> None: ...
+
     async def acquire(
         self,
         *,
@@ -226,6 +230,7 @@ class InMemoryCoordinatorStore:
         self._assignments_by_user: dict[str, SessionAssignment] = {}
         self._assignments_by_token: dict[str, SessionAssignment] = {}
         self._slot_tokens: dict[tuple[WorkerRole, str, int], str] = {}
+        self._attempt_owners: dict[str, tuple[str, float]] = {}
         self._waiting: set[str] = set()
         self._condition = asyncio.Condition()
 
@@ -358,6 +363,27 @@ class InMemoryCoordinatorStore:
                 updated_at=self._clock(),
             )
             self._condition.notify_all()
+
+    async def claim_attempt(
+        self, *, attempt_id: str, owner_id: str, expires_at: float
+    ) -> None:
+        if not attempt_id or not owner_id:
+            raise CoordinatorRejected("INVALID_ATTEMPT_OWNER")
+        async with self._condition:
+            now = self._wall_clock()
+            if expires_at <= now:
+                raise CoordinatorRejected("INVALID_ATTEMPT_OWNER")
+            # Attempt 围栏独立于 GPU lease：连接结束后仍要阻止 token 重放，
+            # 因此只按 token 有效窗口惰性清理，不能随 assignment.release 删除。
+            expired = [
+                key for key, (_, until) in self._attempt_owners.items() if until <= now
+            ]
+            for key in expired:
+                del self._attempt_owners[key]
+            current = self._attempt_owners.get(attempt_id)
+            if current is not None and current[0] != owner_id:
+                raise CoordinatorRejected("ATTEMPT_ALREADY_OWNED")
+            self._attempt_owners[attempt_id] = (owner_id, expires_at)
 
     async def waiting_started(self, waiter_id: str) -> None:
         async with self._condition:
@@ -569,6 +595,51 @@ class DynamoDBCoordinatorStore:
     @staticmethod
     def _slot_pk(role: WorkerRole, worker_id: str, slot_index: int) -> str:
         return f"SLOT#{role}#{worker_id}#{slot_index:04d}"
+
+    async def claim_attempt(
+        self, *, attempt_id: str, owner_id: str, expires_at: float
+    ) -> None:
+        await asyncio.to_thread(
+            self._claim_attempt_sync,
+            attempt_id=attempt_id,
+            owner_id=owner_id,
+            expires_at=expires_at,
+        )
+
+    def _claim_attempt_sync(
+        self, *, attempt_id: str, owner_id: str, expires_at: float
+    ) -> None:
+        if not attempt_id or not owner_id:
+            raise CoordinatorRejected("INVALID_ATTEMPT_OWNER")
+        now_epoch = int(self._wall_clock())
+        expires_epoch = int(expires_at)
+        if expires_epoch <= now_epoch:
+            raise CoordinatorRejected("INVALID_ATTEMPT_OWNER")
+        client = self._get_client()
+        try:
+            client.put_item(
+                TableName=self.table_name,
+                Item={
+                    "pk": {"S": f"ATTEMPT#{attempt_id}"},
+                    "sk": {"S": "OWNER"},
+                    "item_type": {"S": "attempt_owner"},
+                    "owner_id": {"S": owner_id},
+                    "owner_expires_at": {"N": str(expires_epoch)},
+                    "ttl": {"N": str(expires_epoch + 86400)},
+                },
+                # 同一个 owner 重试必须幂等；不同连接只有在旧 token 窗口
+                # 确实过期后才能覆盖，DynamoDB TTL 是否及时物理删除不影响正确性。
+                ConditionExpression=(
+                    "attribute_not_exists(owner_id) OR owner_expires_at <= :now OR "
+                    "owner_id = :owner"
+                ),
+                ExpressionAttributeValues={
+                    ":now": {"N": str(now_epoch)},
+                    ":owner": {"S": owner_id},
+                },
+            )
+        except client.exceptions.ConditionalCheckFailedException as exc:
+            raise CoordinatorRejected("ATTEMPT_ALREADY_OWNED") from exc
 
     @staticmethod
     def _read_s(item: dict, key: str) -> str:
@@ -1511,6 +1582,15 @@ class RealtimeCoordinator:
 
     async def heartbeat(self, heartbeat: WorkerHeartbeat) -> None:
         await self.store.heartbeat(heartbeat)
+
+    async def claim_attempt(
+        self, *, attempt_id: str, owner_id: str, expires_at: float
+    ) -> None:
+        await self.store.claim_attempt(
+            attempt_id=attempt_id,
+            owner_id=owner_id,
+            expires_at=expires_at,
+        )
 
     async def capacity_snapshot(self) -> dict[str, Any]:
         return await self.store.capacity_snapshot()

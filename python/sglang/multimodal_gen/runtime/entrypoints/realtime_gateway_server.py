@@ -251,6 +251,10 @@ def _worker_slot_from_payload(payload: dict[str, Any]) -> WorkerSlot:
 class CoordinatorClient(Protocol):
     async def health(self) -> dict[str, Any]: ...
 
+    async def claim_attempt(
+        self, *, attempt_id: str, owner_id: str, expires_at: float
+    ) -> None: ...
+
     async def admit(self, **request: Any) -> SessionAssignment: ...
 
     async def renew(self, assignment: SessionAssignment) -> SessionAssignment: ...
@@ -294,6 +298,28 @@ class HTTPCoordinatorClient:
         response = await self._client.post("/v1/sessions/admit", json=request)
         self._raise_rejection(response)
         return _assignment(response.json())
+
+    async def claim_attempt(
+        self, *, attempt_id: str, owner_id: str, expires_at: float
+    ) -> None:
+        response = await self._client.post(
+            "/v1/attempts/claim",
+            json={
+                "attempt_id": attempt_id,
+                "owner_id": owner_id,
+                "expires_at": expires_at,
+            },
+        )
+        # 只把 claim 契约定义的拒绝视为“条件写明确未取得 owner”。超时、限流、
+        # 重定向与 5xx 都可能发生在条件写已经提交之后，必须保留为结果不确定的
+        # HTTP 错误。这个分类只决定浏览器错误；两类失败都没有 callback 资格。
+        definitive_rejections = {400, 404, 405, 409, 422}
+        if (
+            not response.is_success
+            and response.status_code not in definitive_rejections
+        ):
+            response.raise_for_status()
+        self._raise_rejection(response)
 
     async def health(self) -> dict[str, Any]:
         response = await self._client.get("/healthz")
@@ -682,7 +708,10 @@ def create_app(
         playback_ack_window = BrowserPlaybackAckWindow()
         # Branch-local state for world sessions: init verification, deadline, and
         # rejection reason.
-        world_session: dict[str, Any] = {"init_verified": False}
+        world_session: dict[str, Any] = {
+            "init_verified": False,
+            "attempt_owner": principal is None,
+        }
         # Player-direction orchestrator created after init validation. Dynamic
         # tasks are tracked separately and canceled together in finally.
         directions: DirectionCoordinator | None = None
@@ -691,6 +720,19 @@ def create_app(
         try:
             admitted_at = time.perf_counter()
             _log_gateway_trace(trace_id, "gateway.ws_accepted", session_id=session_id)
+            if principal is not None:
+                # 本地 replay guard 负责同一 Gateway 进程；Coordinator 的条件写
+                # 才是跨 Gateway 副本的全局 owner 判定。围栏至少保留五分钟，
+                # 即使 owner 已结束也不能让同一张一次性 token 再次取得会话。
+                await coordinator.claim_attempt(
+                    attempt_id=principal.jti,
+                    owner_id=f"{session_id}:{generation_id}",
+                    expires_at=max(
+                        float(principal.exp) + 60.0,
+                        time.time() + 300.0,
+                    ),
+                )
+                world_session["attempt_owner"] = True
             try:
                 async with admission_gate.waiter():
                     assignment = await coordinator.admit(
@@ -745,13 +787,19 @@ def create_app(
                 denoiser_worker_id=assignment.denoiser.worker_id,
                 vae_worker_id=assignment.vae.worker_id,
             )
-            if principal is not None and principal.record_video:
+            if (
+                principal is not None
+                and principal.record_video
+                and world_session.get("attempt_owner")
+            ):
                 # Recording is a bounded observer of output accepted by this
-                # route. It never sits between the VAE and browser.
+                # route. It never sits between the VAE and browser. 只有完成
+                # Coordinator 条件写的 attempt owner 才能创建录像及最终回调。
                 if recording_manager is None:
                     raise RuntimeError("world recording manager is not configured")
                 recorder = recording_manager.start(
                     run_id=principal.run_id,
+                    attempt_id=principal.jti,
                     session_id=session_id,
                     generation_id=generation_id,
                     trace_id=trace_id,
@@ -1295,7 +1343,10 @@ def create_app(
                     # never established failed".
                     world_session["started_reported"] = True
                     world_callbacks.started(
-                        principal.run_id, trace_id, principal.max_lifetime_s
+                        principal.run_id,
+                        principal.jti,
+                        trace_id,
+                        principal.max_lifetime_s,
                     )
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
@@ -1343,6 +1394,14 @@ def create_app(
             except Exception:
                 pass
         except CoordinatorRejected as exc:
+            if principal is not None and exc.reason == "ATTEMPT_ALREADY_OWNED":
+                # 跨副本重放与本地重放保持同一既有关闭语义。它没有 owner
+                # 资格，因此不发送 error 消息，也不进入任何 callback/lease 清理。
+                try:
+                    await websocket.close(code=1008, reason="UNAUTHORIZED")
+                except Exception:
+                    pass
+                return
             if principal is not None:
                 code, content, close_code = _world_error(exc.reason)
                 world_session["admit_rejected"] = code
@@ -1471,7 +1530,13 @@ def create_app(
             )
             # D4: terminal session callback. It is fire-and-forget; world-service
             # has a deadline fallback for lost callbacks.
-            if principal is not None and world_callbacks is not None:
+            # 只有本连接成功完成全局原子 claim 才能修改业务侧 attempt。即使 4xx
+            # 明确拒绝了本连接，混合版本下也不能据此否定其它新版副本已经取得 owner。
+            if (
+                principal is not None
+                and world_callbacks is not None
+                and world_session.get("attempt_owner")
+            ):
                 # Whether this session ever came up. Rejected or invalid-payload
                 # attempts never did, and the business side uses that to refuse
                 # letting them terminate a run that is already live.
@@ -1479,6 +1544,7 @@ def create_app(
                 if world_session.get("admit_rejected"):
                     world_callbacks.aborted(
                         principal.run_id,
+                        principal.jti,
                         trace_id,
                         fault="ours",
                         reason=str(world_session["admit_rejected"]),
@@ -1487,6 +1553,7 @@ def create_app(
                 elif world_session.get("init_rejected"):
                     world_callbacks.aborted(
                         principal.run_id,
+                        principal.jti,
                         trace_id,
                         fault="client",
                         reason="SESSION_INVALID",
@@ -1495,27 +1562,44 @@ def create_app(
                 elif assignment is None:
                     world_callbacks.aborted(
                         principal.run_id,
+                        principal.jti,
                         trace_id,
                         fault="ours",
                         reason="SESSION_UNAVAILABLE",
                         established=established,
                     )
                 elif world_session.get("deadline_hit"):
-                    world_callbacks.ended(principal.run_id, trace_id, "completed")
+                    world_callbacks.ended(
+                        principal.run_id,
+                        principal.jti,
+                        trace_id,
+                        "completed",
+                    )
                 elif world_session.get("system_error"):
                     # Gateway or engine-side fault. Mark fault=ours so the
                     # business side can exempt the player from run consumption.
                     world_callbacks.aborted(
                         principal.run_id,
+                        principal.jti,
                         trace_id,
                         fault="ours",
                         reason=str(world_session["system_error"])[:200],
                         established=established,
                     )
                 elif world_session.get("worker_finished"):
-                    world_callbacks.ended(principal.run_id, trace_id, "completed")
+                    world_callbacks.ended(
+                        principal.run_id,
+                        principal.jti,
+                        trace_id,
+                        "completed",
+                    )
                 else:
-                    world_callbacks.ended(principal.run_id, trace_id, "user_left")
+                    world_callbacks.ended(
+                        principal.run_id,
+                        principal.jti,
+                        trace_id,
+                        "user_left",
+                    )
             # 只有"内容没跑完就被时长掐断"才算腰斩。worker 已经正常收尾（跑满
             # max_chunks）时哪怕 deadline 随后到点，也不能写这个理由 —— 业务侧
             # 靠它区分"内容播完"与"被硬顶截断"，写错会把一次完整生成误判成事故。
@@ -1575,7 +1659,9 @@ def create_app(
                 await websocket.close(code=1008, reason="UNAUTHORIZED")
                 return
             if not token_replay_guard.consume(principal):
-                # One-use credential by jti: reject the second session for a token.
+                # 只有原子消费 jti 的连接才是 attempt owner。重放连接不进入共享
+                # 会话生命周期，因此既不能取得或释放 owner 的 Coordinator 租约，
+                # 也不能发送生命周期或 recorded callback。
                 logger.warning("world token replayed run_id=%s", principal.run_id)
                 await websocket.accept()
                 await websocket.close(code=1008, reason="UNAUTHORIZED")

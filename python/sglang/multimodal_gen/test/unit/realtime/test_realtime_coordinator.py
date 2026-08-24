@@ -230,6 +230,121 @@ def test_coordinator_rejects_second_session_for_the_same_user():
     asyncio.run(run())
 
 
+def test_attempt_owner_is_global_idempotent_and_expires_without_release():
+    async def run():
+        now = [100.0]
+        store = InMemoryCoordinatorStore(
+            ttl_s=60,
+            worker_ttl_s=30,
+            wall_clock=lambda: now[0],
+        )
+        attempt_id = "22222222-2222-2222-2222-222222222222"
+
+        async def claim(owner_id):
+            try:
+                await store.claim_attempt(
+                    attempt_id=attempt_id,
+                    owner_id=owner_id,
+                    expires_at=400,
+                )
+                return owner_id
+            except CoordinatorRejected as exc:
+                assert exc.reason == "ATTEMPT_ALREADY_OWNED"
+                return None
+
+        owners = await asyncio.gather(*(claim(f"owner-{index}") for index in range(32)))
+        winner = next(owner for owner in owners if owner is not None)
+        assert owners.count(winner) == 1
+        assert owners.count(None) == 31
+
+        # 同一个 Gateway owner 在响应不明时可以安全重试；连接结束不释放围栏。
+        await store.claim_attempt(
+            attempt_id=attempt_id,
+            owner_id=winner,
+            expires_at=400,
+        )
+        with pytest.raises(CoordinatorRejected, match="ATTEMPT_ALREADY_OWNED"):
+            await store.claim_attempt(
+                attempt_id=attempt_id,
+                owner_id="late-replay",
+                expires_at=400,
+            )
+
+        # DynamoDB TTL 只负责物理清理；语义过期后，即使旧记录仍存在也可覆盖。
+        now[0] = 401
+        await store.claim_attempt(
+            attempt_id=attempt_id,
+            owner_id="new-owner-after-expiry",
+            expires_at=700,
+        )
+
+    asyncio.run(run())
+
+
+def test_dynamodb_attempt_owner_uses_an_atomic_expiring_fence():
+    class ConditionalCheckFailedException(Exception):
+        pass
+
+    class FakeClient:
+        class exceptions:
+            pass
+
+        exceptions.ConditionalCheckFailedException = ConditionalCheckFailedException
+
+        def __init__(self):
+            self.item = None
+            self.now = 100
+
+        def put_item(self, **request):
+            candidate = request["Item"]
+            if self.item is not None:
+                current_owner = self.item["owner_id"]["S"]
+                current_expiry = int(self.item["owner_expires_at"]["N"])
+                candidate_owner = candidate["owner_id"]["S"]
+                if current_expiry > self.now and current_owner != candidate_owner:
+                    raise ConditionalCheckFailedException
+            self.item = candidate
+
+    async def run():
+        client = FakeClient()
+        store = DynamoDBCoordinatorStore(
+            "coordinator",
+            ttl_s=60,
+            worker_ttl_s=30,
+            wall_clock=lambda: client.now,
+            client=client,
+        )
+        attempt_id = "22222222-2222-2222-2222-222222222222"
+        await store.claim_attempt(
+            attempt_id=attempt_id,
+            owner_id="gateway-a:connection-a",
+            expires_at=400,
+        )
+        await store.claim_attempt(
+            attempt_id=attempt_id,
+            owner_id="gateway-a:connection-a",
+            expires_at=400,
+        )
+        with pytest.raises(CoordinatorRejected, match="ATTEMPT_ALREADY_OWNED"):
+            await store.claim_attempt(
+                attempt_id=attempt_id,
+                owner_id="gateway-b:connection-b",
+                expires_at=400,
+            )
+
+        assert client.item["pk"]["S"] == f"ATTEMPT#{attempt_id}"
+        assert client.item["ttl"]["N"] == str(400 + 86400)
+        client.now = 401
+        await store.claim_attempt(
+            attempt_id=attempt_id,
+            owner_id="gateway-b:connection-b",
+            expires_at=700,
+        )
+        assert client.item["owner_id"]["S"] == "gateway-b:connection-b"
+
+    asyncio.run(run())
+
+
 def test_coordinator_does_not_leak_a_partial_worker_reservation():
     async def run():
         coordinator = RealtimeCoordinator(
