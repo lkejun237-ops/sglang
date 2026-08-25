@@ -1,0 +1,46 @@
+{
+  "schemaVersion": "loopit.world/v1",
+  "mode": "experience",
+  "id": "field-of-faces",
+  "version": "0.1.0",
+  "creationInput": "Let me wander through a field of stone faces and clocks, waking each forgotten expression with a touch.",
+  "presentation": {
+    "title": "Where the Faces Remember",
+    "introduction": "Wander through a field of stone faces and clocks, waking each forgotten expression with a touch."
+  },
+  "world": {
+    "initialSetup": {
+      "perspective": "third_person",
+      "startingFrame": {
+        "source": "upload",
+        "uri": "asset://pending"
+      },
+      "description": "A third-person trailing gameplay view keeps the clear external playable subject centered in the frame on the central vertical axis, seen from behind and facing the route ahead. The camera uses a third-person trailing follow perspective, positioned slightly above and behind the traveler, who is centered in the frame on the central vertical axis. The traveler is a lone figure of medium height, seen from behind, wearing a weathered, dark-colored long coat and sturdy boots, standing firmly on the cracked, dry earth. The traveler's right arm is extended, with their palm resting against the cheek of a massive, weathered stone face sculpture. This sculpture, occupying the midground, is currently in the process of awakening; its eyes have opened to gaze at the traveler, and a gentle, serene smile has formed on its lips. From the point of contact, intricate golden light and stone particles are spreading across the surface, causing segments of the face to break away into fragments. The environment is a vast, desolate grey wasteland extending to the horizon, characterized by parched, fissured ground littered with gravel and weathered rock. A clear, traversable path of cracked earth winds forward between the sculptures, leading the player toward the distant, hazy horizon, inviting exploration of this surreal, silent world. Scattered across this terrain are numerous other stone face sculptures of varying sizes, some partially buried, others standing upright, all currently dormant with closed eyes. Interspersed among the sculptures are antique golden pocket watches and clock faces, some half-submerged in the dust, providing rare warm highlights against the muted, monochromatic landscape. The sky is dominated by heavy, dark storm clouds, with dim, diffused light filtering through gaps to cast long, soft shadows. The atmosphere is quiet, mysterious, and melancholic, with a visual style that emphasizes texture and scale."
+    }
+  },
+  "execution": {
+    "durationSeconds": 60,
+    "allowFreePrompt": false,
+    "maxSnapshots": 3
+  },
+  "skills": [
+    {
+      "id": "awaken_face",
+      "name": "Awaken",
+      "prompt": "Touching a stone face makes it open its eyes and smile before crumbling into a pile of rock at the same location.",
+      "changeType": "one_time"
+    },
+    {
+      "id": "stone_prayer",
+      "name": "🙏 Prayer",
+      "prompt": "The traveler kneels in prayer and every stone face across the field opens its eyes at once.",
+      "changeType": "one_time"
+    },
+    {
+      "id": "rewind_clock",
+      "name": "⏪ Rewind Clock",
+      "prompt": "Every scattered clock spins backward as cracks close across the nearest stone face.",
+      "changeType": "one_time"
+    }
+  ]
+}

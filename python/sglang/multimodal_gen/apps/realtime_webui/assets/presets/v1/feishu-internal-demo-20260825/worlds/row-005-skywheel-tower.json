@@ -1,0 +1,46 @@
+{
+  "schemaVersion": "loopit.world/v1",
+  "mode": "experience",
+  "id": "skywheel-tower",
+  "version": "0.1.0",
+  "creationInput": "Let me cross an amber grassland and follow the old road to a colossal golden Sky-Wheel tower.",
+  "presentation": {
+    "title": "The Last Pilgrimage to the Sky-Wheel",
+    "introduction": "Beyond the amber plains, the ancient Sky-Wheel has begun to turn again. Follow the old road and find out why."
+  },
+  "world": {
+    "initialSetup": {
+      "perspective": "third_person",
+      "startingFrame": {
+        "source": "upload",
+        "uri": "asset://pending"
+      },
+      "description": "A third-person trailing gameplay view keeps the clear external playable subject centered in the frame on the central vertical axis, seen from behind and facing the route ahead. The camera uses a third-person trailing follow perspective, positioned approximately five meters behind the playable subject. The wind surveyor is centered in the frame, occupying about 25% of the vertical height, and is seen from behind as they walk forward along a clear, dirt-packed path. The subject is a slender figure wearing a weathered, dark-brown hooded cloak that drapes over their shoulders and reaches their mid-calves, paired with sturdy, dark leather boots. The character's silhouette is distinct against the bright, expansive horizon. The traversable route is a wide, flat, and unobstructed dirt trail that cuts through a vast, rolling amber-colored grassland, leading directly toward the base of the massive Sky-Wheel Giant Tower in the distance. The terrain is covered in dry, golden-hued grasses that sway gently in the breeze. The tower itself is a monumental structure composed of dark, craggy rock, featuring a glowing, concentric circular light core at its center and three large, semi-transparent golden moon-blades that rotate slowly around the upper spire. The atmosphere is clear and bright, with soft, warm sunlight casting long, gentle shadows across the plains. The sky is a deep, vibrant blue, populated by large, fluffy, sun-drenched cumulus clouds that frame the tower. The overall mood is one of epic discovery and serene exploration, with a color palette dominated by rich ambers, deep earth tones, and brilliant golden light, creating a sense of ancient mystery and vast, open space."
+    }
+  },
+  "execution": {
+    "durationSeconds": 60,
+    "allowFreePrompt": false,
+    "maxSnapshots": 3
+  },
+  "skills": [
+    {
+      "id": "wake_wheel",
+      "name": "Wake Wheel",
+      "prompt": "The Sky-Wheel's golden moon-blades accelerate and its concentric core ignites with warm radiant light.",
+      "changeType": "persistent"
+    },
+    {
+      "id": "windwave",
+      "name": "🌾 Windwave",
+      "prompt": "A powerful wave of wind travels across the amber grassland toward the tower, bending the grass in broad flowing patterns around the traveler.",
+      "changeType": "one_time"
+    },
+    {
+      "id": "light_path",
+      "name": "✨ Light Path",
+      "prompt": "Ancient golden symbols illuminate one after another along the dirt trail, forming a clear glowing route to the tower's base.",
+      "changeType": "persistent"
+    }
+  ]
+}

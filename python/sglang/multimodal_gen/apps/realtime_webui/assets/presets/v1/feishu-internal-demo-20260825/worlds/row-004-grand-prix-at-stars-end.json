@@ -1,0 +1,46 @@
+{
+  "schemaVersion": "loopit.world/v1",
+  "mode": "experience",
+  "id": "grand-prix-at-stars-end",
+  "version": "0.1.0",
+  "creationInput": "Let me race a red kart at full speed along a rainbow road spiraling through space.",
+  "presentation": {
+    "title": "Grand Prix at the End of the Stars",
+    "introduction": "The final rainbow circuit has opened beyond the stars. Take the red kart and race where gravity cannot follow."
+  },
+  "world": {
+    "initialSetup": {
+      "perspective": "third_person",
+      "startingFrame": {
+        "source": "upload",
+        "uri": "asset://pending"
+      },
+      "description": "A third-person trailing gameplay view keeps the clear external playable subject centered in the frame on the central vertical axis, seen from behind and facing the route ahead. The camera is set in a third-person perspective, positioned approximately five meters behind and slightly above the playable subject, who is centered in the frame on the central vertical axis. The subject is a recognizable plumber character wearing a signature red cap, blue overalls, and white gloves, seated within a compact, high-tech red racing kart. The kart features dual rear thrusters emitting bright orange flames, and the character is facing directly away from the camera, looking forward along the track. The primary traversal route is a wide, continuous, and vibrant rainbow-colored road that winds through a cosmic expanse. This track serves as the main path, extending from the foreground into the deep background, where it spirals upward into the starry void. The track is bordered by sleek, metallic guardrails that provide a clear, unobstructed path for forward movement. The environment is set in outer space, featuring a deep indigo nebula backdrop filled with glowing stars, distant planets, and streaks of colorful light from passing comets. Soft, pinkish-purple clouds drift near the track edges, adding depth to the midground. The lighting is dynamic and self-illuminated, emanating from the glowing rainbow surface of the track and the fiery exhaust of the kart, casting vivid, multi-colored reflections onto the metallic surfaces. The overall visual style is high-energy, colorful, and fantastical, emphasizing a sense of speed and wonder as the player navigates the celestial circuit."
+    }
+  },
+  "execution": {
+    "durationSeconds": 60,
+    "allowFreePrompt": false,
+    "maxSnapshots": 3
+  },
+  "skills": [
+    {
+      "id": "rocket_boost",
+      "name": "🚀 Rocket Boost",
+      "prompt": "The kart's rear thrusters flare blue-orange and launch it forward as stars and track lights stretch into vivid motion lines.",
+      "changeType": "one_time"
+    },
+    {
+      "id": "rainbow_drift",
+      "name": "🌈 Rainbow Drift",
+      "prompt": "The kart swings into a long controlled drift, painting a bright rainbow arc across the track before straightening out.",
+      "changeType": "one_time"
+    },
+    {
+      "id": "star_jump",
+      "name": "⭐ Star Jump",
+      "prompt": "A luminous section of track rises into a smooth ramp and launches the kart briefly into open space before it lands safely back on the rainbow road.",
+      "changeType": "one_time"
+    }
+  ]
+}

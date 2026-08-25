@@ -1,0 +1,46 @@
+{
+  "schemaVersion": "loopit.world/v1",
+  "mode": "experience",
+  "id": "pandora-banshee",
+  "version": "0.1.0",
+  "creationInput": "Let me ride a banshee through floating canyons and waterfalls beneath Pandora's giant sky eye.",
+  "presentation": {
+    "title": "Phantom Wings over Pandora",
+    "introduction": "The old flight paths have vanished among Pandora’s floating peaks. Mount a banshee and follow the waterfalls into the wilds beyond."
+  },
+  "world": {
+    "initialSetup": {
+      "perspective": "third_person",
+      "startingFrame": {
+        "source": "upload",
+        "uri": "asset://pending"
+      },
+      "description": "A third-person trailing gameplay view keeps the clear external playable subject centered in the frame on the central vertical axis, seen from behind and facing the route ahead. This third-person trailing gameplay view positions the camera four meters behind the playable subject, who is centered in the frame on the central vertical axis and occupies approximately 25% of the frame height. The subject is a slender Na'vi avatar with blue-toned skin, wearing minimal organic tribal gear and leather straps, mounted atop a large, iridescent blue mountain banshee with expansive, translucent wings that shimmer with bioluminescent patterns. The rider faces directly away from the camera, guiding the creature toward a vast, traversable canyon floor below. The environment features a continuous, winding river path that serves as a primary route through the lush, dense jungle floor, leading toward distant, mist-covered mountain passes. The terrain is characterized by towering, moss-covered floating rock formations that create a vertical, multi-layered landscape. Numerous waterfalls cascade from the edges of these floating islands into the valley, creating a constant, ethereal mist that catches the soft, ambient light. The atmosphere is saturated with glowing, bioluminescent particles and a soft, cyan-tinted light emanating from a massive, eye-like celestial anomaly in the sky. The color palette is dominated by deep teals, vibrant blues, and lush forest greens, creating a surreal, high-fantasy aesthetic. The lighting is diffuse and atmospheric, casting long, soft shadows across the dense canopy and the winding river below, emphasizing the immense scale of the floating cliffs and the depth of the valley. The scene is peaceful yet grand, inviting exploration of the hidden paths beneath the floating mountains."
+    }
+  },
+  "execution": {
+    "durationSeconds": 60,
+    "allowFreePrompt": false,
+    "maxSnapshots": 3
+  },
+  "skills": [
+    {
+      "id": "fire_breath",
+      "name": "🔥 Fire Breath",
+      "prompt": "The banshee exhales a long jet of vivid orange fire into the open air ahead; the flame lights the mist and fades without burning the rider or blocking the route.",
+      "changeType": "one_time"
+    },
+    {
+      "id": "wing_glow",
+      "name": "✨ Wing Glow",
+      "prompt": "Bioluminescent patterns brighten across the banshee's wings and body, casting vivid cyan light through the surrounding mist.",
+      "changeType": "persistent"
+    },
+    {
+      "id": "waterfall_dive",
+      "name": "🌊 Waterfall Dive",
+      "prompt": "The banshee dives beside a tall waterfall, skims through the spray, then climbs smoothly back into the open flight path.",
+      "changeType": "one_time"
+    }
+  ]
+}

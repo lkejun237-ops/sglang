@@ -33,12 +33,26 @@
     return seconds;
   }
 
+  function normalizePreparedDraftRule(rawRule) {
+    const preparedSource = rawRule?.prepared;
+    if (!preparedSource) return null;
+    const name = normalizedText(rawRule?.name) || normalizedText(preparedSource?.name);
+    if (!name) return null;
+    return {
+      name: name.slice(0, 28),
+      prepared: normalizePreparedResult({
+        prompt: preparedSource?.prompt,
+        change_type: preparedSource?.change_type ?? preparedSource?.changeType,
+      }),
+    };
+  }
+
   function normalizeGoal(rawGoal, index) {
     const goalInput = normalizedText(rawGoal?.input)
       || normalizedText(rawGoal?.instruction)
       || normalizedText(rawGoal?.name);
     if (!goalInput) return null;
-    return {
+    const normalizedGoal = {
       id: normalizedText(rawGoal?.id) || `goal-${index + 1}`,
       probability: normalizeProbability(rawGoal?.probability),
       min_play_seconds: normalizeMinPlaySeconds(
@@ -46,16 +60,22 @@
       ),
       input: goalInput,
     };
+    const prepared = normalizePreparedDraftRule(rawGoal);
+    return prepared ? { ...normalizedGoal, ...prepared } : normalizedGoal;
   }
 
   function normalizeWorldRulesDraft(draft = {}) {
     const skills = (Array.isArray(draft.skills) ? draft.skills : [])
-      .map((skill, index) => ({
-        id: normalizedText(skill?.id) || `skill-${index + 1}`,
-        input: normalizedText(skill?.input)
-          || normalizedText(skill?.instruction)
-          || normalizedText(skill?.name),
-      }))
+      .map((skill, index) => {
+        const normalizedSkill = {
+          id: normalizedText(skill?.id) || `skill-${index + 1}`,
+          input: normalizedText(skill?.input)
+            || normalizedText(skill?.instruction)
+            || normalizedText(skill?.name),
+        };
+        const prepared = normalizePreparedDraftRule(skill);
+        return prepared ? { ...normalizedSkill, ...prepared } : normalizedSkill;
+      })
       .filter((skill) => skill.input);
     if (skills.length > MAX_WORLD_SKILLS) {
       throw new Error(`最多可以配置 ${MAX_WORLD_SKILLS} 个技能`);
@@ -154,25 +174,31 @@
     async prepare(draft, previousPrompt) {
       const normalized = normalizeWorldRulesDraft(draft);
       const basePrompt = normalizedText(previousPrompt);
-      if ((normalized.skills.length || normalized.goals.length) && !basePrompt) {
+      const needsCompletion = normalized.skills.some((skill) => !(skill.name && skill.prepared))
+        || normalized.goals.some((goal) => !(goal.name && goal.prepared));
+      if (needsCompletion && !basePrompt) {
         throw new Error("世界描述为空，无法预先润色规则 Prompt");
       }
       const skillPromise = Promise.all(normalized.skills.map(async (skill) => ({
         ...skill,
-        ...normalizeCompletedRule(await this.completeRule({
-          kind: "skill",
-          input: skill.input,
-          previous_prompt: basePrompt,
-        })),
+        ...(skill.name && skill.prepared
+          ? { name: skill.name, prepared: skill.prepared }
+          : normalizeCompletedRule(await this.completeRule({
+            kind: "skill",
+            input: skill.input,
+            previous_prompt: basePrompt,
+          }))),
         instruction: skill.input,
       })));
       const goalPromise = Promise.all(normalized.goals.map(async (goal) => ({
         ...goal,
-        ...normalizeCompletedRule(await this.completeRule({
-          kind: "goal",
-          input: goal.input,
-          previous_prompt: basePrompt,
-        })),
+        ...(goal.name && goal.prepared
+          ? { name: goal.name, prepared: goal.prepared }
+          : normalizeCompletedRule(await this.completeRule({
+            kind: "goal",
+            input: goal.input,
+            previous_prompt: basePrompt,
+          }))),
         instruction: goal.input,
       })));
       const [skills, goals] = await Promise.all([skillPromise, goalPromise]);

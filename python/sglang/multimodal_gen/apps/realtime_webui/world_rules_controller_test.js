@@ -50,6 +50,52 @@ async function main() {
     ["goal-2", "goal-3", "goal-4"],
     "duplicate goal ids should advance monotonically instead of retrying the same candidate",
   );
+  const normalizedPreparedRules = normalizeWorldRulesDraft({
+    skills: [{
+      id: "fire",
+      input: "喷火",
+      name: "喷火",
+      prepared: { prompt: "喷出一束火焰", change_type: "one_time" },
+    }],
+    goals: [{
+      id: "crown",
+      input: "出现王冠",
+      name: "王冠",
+      prepared: { prompt: "天空落下一顶王冠", change_type: "persistent" },
+    }],
+  });
+  assert.equal(normalizedPreparedRules.skills[0].prepared.prompt, "喷出一束火焰");
+  assert.equal(normalizedPreparedRules.goals[0].prepared.change_type, "persistent");
+
+  const preparedBypassCalls = [];
+  const preparedBypassController = new WorldRulesController({
+    completeRule: async (request) => {
+      preparedBypassCalls.push(request);
+      return { name: "unused", prompt: "unused", change_type: "one_time" };
+    },
+    dispatchPrepared: async () => ({}),
+  });
+  const preparedBypass = await preparedBypassController.prepare({
+    skills: [{
+      id: "fire",
+      input: "喷火",
+      name: "喷火",
+      prepared: { prompt: "喷出一束火焰", change_type: "one_time" },
+    }],
+    goals: [{
+      id: "crown",
+      input: "出现王冠",
+      name: "王冠",
+      min_play_seconds: 2,
+      probability: 0.4,
+      prepared: { prompt: "天空落下一顶王冠", change_type: "persistent" },
+    }],
+  }, "");
+  assert.equal(preparedBypassCalls.length, 0, "prepared preset rules should not call the completion provider");
+  assert.equal(preparedBypass.skills[0].name, "喷火");
+  assert.equal(preparedBypass.skills[0].prepared.prompt, "喷出一束火焰");
+  assert.equal(preparedBypass.goals[0].min_play_seconds, 2);
+  assert.equal(preparedBypass.goals[0].prepared.change_type, "persistent");
 
   const completionCalls = [];
   const dispatches = [];

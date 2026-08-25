@@ -1,0 +1,46 @@
+{
+  "schemaVersion": "loopit.world/v1",
+  "mode": "experience",
+  "id": "queen-beneath-snow",
+  "version": "0.1.0",
+  "creationInput": "Let me cross a blizzard-swept basin toward a colossal goddess head buried in the ice.",
+  "presentation": {
+    "title": "The Queen Beneath the Snow",
+    "introduction": "An ancient face sleeps beneath the frozen mountains. Cross the white basin and discover what the storm has kept hidden."
+  },
+  "world": {
+    "initialSetup": {
+      "perspective": "third_person",
+      "startingFrame": {
+        "source": "upload",
+        "uri": "asset://pending"
+      },
+      "description": "Third-person trailing view. The player controls an arctic traveler positioned near the center of the frame, seen from behind, walking through a wide, level, continuous snow basin. The snowfield route passes low ice ridges and leads toward a colossal female statue head half-buried in the distant snow. Her face is carved from pale gray-white rock, while waterfall-like ice resembling long hair covers her forehead and both sides of her face; only the upper half of her face and silhouette emerge from the snow.\nSnow-covered mountain ridges and sparse rocks line both sides, while a blizzard continues to fall. The character, route, and statue head remain clearly visible at all times. Over approximately one minute, the traveler approaches the statue across the snowfield. Avoid additional characters, vehicles, weapons, modern buildings, narrow bridges, text, and UI elements."
+    }
+  },
+  "execution": {
+    "durationSeconds": 60,
+    "allowFreePrompt": false,
+    "maxSnapshots": 3
+  },
+  "skills": [
+    {
+      "id": "whiteout",
+      "name": "❄️ Whiteout",
+      "prompt": "The snowfall intensifies into a dense blizzard while the traveler and buried face remain readable.",
+      "changeType": "persistent"
+    },
+    {
+      "id": "open_eyes",
+      "name": "👁️ Open Eyes",
+      "prompt": "The colossal buried goddess slowly opens her eyes and releases a faint icy glow.",
+      "changeType": "one_time"
+    },
+    {
+      "id": "ice_breath",
+      "name": "🌬️ Ice Breath",
+      "prompt": "The goddess exhales a pale current that parts the blizzard and reveals a clear route across the basin.",
+      "changeType": "one_time"
+    }
+  ]
+}

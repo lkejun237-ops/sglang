@@ -1,0 +1,46 @@
+{
+  "schemaVersion": "loopit.world/v1",
+  "mode": "experience",
+  "id": "channel-zero-tunnel",
+  "version": "0.1.0",
+  "creationInput": "Let me explore an endless tunnel built from vintage televisions as a tiny mouse with a yellow backpack.",
+  "presentation": {
+    "title": "The Last Broadcast of Channel Zero",
+    "introduction": "Channel Zero is still transmitting from somewhere inside the endless television tunnel. A tiny traveler follows the signal."
+  },
+  "world": {
+    "initialSetup": {
+      "perspective": "third_person",
+      "startingFrame": {
+        "source": "upload",
+        "uri": "asset://pending"
+      },
+      "description": "A third-person trailing gameplay view keeps the clear external playable subject centered in the frame on the central vertical axis, seen from behind and facing the route ahead. The camera uses a third-person perspective, positioned low to the ground and trailing behind the subject to follow its forward movement through a vast, enclosed space. The playable subject, a small brown mouse, is centered in the frame on the central vertical axis, occupying approximately 25% of the frame height. The mouse is depicted from behind, showing its soft, textured fur, large rounded ears, and a long, slender tail that rests on the ground. It wears a small, worn yellow backpack with visible straps and buckles. The mouse stands on a dark, slightly damp floor that serves as a continuous, traversable path leading directly into the depths of a massive, infinite tunnel. The tunnel walls, ceiling, and floor are constructed from a dense, chaotic arrangement of stacked, vintage CRT television sets. These screens display a variety of original, abstract animations including rotating geometric planets, drifting clouds, blinking eyes, and shimmering starfields. The screens activate in a sequential wave from the foreground toward the vanishing point, casting vibrant, shifting pulses of cyan, magenta, and green light across the mouse's fur, the yellow backpack, and the reflective puddles on the ground. Thick, dark electrical cables snake across the floor like vines, adding to the industrial, surreal atmosphere. Dust motes dance in the flickering light beams, and the air is filled with a sense of mysterious, quiet wonder. The lighting is entirely provided by the glowing screens, creating deep shadows and high-contrast reflections on the glass surfaces of the monitors. The visual style is cinematic and highly detailed, emphasizing the contrast between the small, organic subject and the overwhelming, technological scale of the tunnel, where the stacked television sets act as solid, impassable walls."
+    }
+  },
+  "execution": {
+    "durationSeconds": 60,
+    "allowFreePrompt": false,
+    "maxSnapshots": 3
+  },
+  "skills": [
+    {
+      "id": "time_portal",
+      "name": "🌀 Time Portal",
+      "prompt": "A stable circular time portal opens between the CRT walls, showing a distinct reachable era while the mouse and tunnel remain unchanged.",
+      "changeType": "one_time"
+    },
+    {
+      "id": "channel_zero",
+      "name": "Channel Zero",
+      "prompt": "Every visible CRT snaps to the same luminous white eye as a wave of cyan static races down the tunnel, then the original broadcasts return.",
+      "changeType": "one_time"
+    },
+    {
+      "id": "channel_shuffle",
+      "name": "🎛️ Channel Shuffle",
+      "prompt": "The televisions rapidly cycle through planets, clouds, eyes, and starfields in synchronized bands moving toward the vanishing point.",
+      "changeType": "one_time"
+    }
+  ]
+}

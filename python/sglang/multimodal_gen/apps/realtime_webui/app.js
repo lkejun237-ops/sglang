@@ -581,6 +581,9 @@ const reactorPresets = [
 const examplePresets = [
   { name: "Dragon Dolly", tone: "green", size: "832x480", fps: DEFAULT_TARGET_FPS, prompt: "A stable first-person dolly from the same dragon-rider viewpoint, keeping the black dragon head, horns, wings, jungle canopy, and distant castle consistent; slow forward camera motion, natural parallax, no creature morphing, no scene replacement.", referenceUrl: `${PRESET_ASSET_BASE_URL}/lingbot-example-00-dragon-dolly.jpg`, source: "LingBot example 00" },
 ];
+const feishuInternalDemoPresets = Array.isArray(globalThis.FEISHU_INTERNAL_DEMO_PRESETS)
+  ? globalThis.FEISHU_INTERNAL_DEMO_PRESETS
+  : [];
 
 function presetKey(preset) {
   if (!preset) return "";
@@ -604,6 +607,7 @@ const FEATURED_PRESET_NAMES = [
 ];
 const featuredPresetNames = new Set(FEATURED_PRESET_NAMES);
 const presets = [
+  ...feishuInternalDemoPresets,
   ...FEATURED_PRESET_NAMES.map((name) =>
     reactorPresets.find((preset) => preset.name === name)
   ),
@@ -5506,6 +5510,45 @@ function setWorldRulesStatus(message, state = "") {
   else delete status.dataset.state;
 }
 
+function preparedRuleDraftMeta(rule = {}) {
+  const prepared = rule?.prepared || {};
+  const prompt = String(prepared?.prompt || "").trim();
+  const changeType = String(prepared?.change_type || prepared?.changeType || "").trim();
+  const name = String(rule?.name || prepared?.name || "").trim();
+  if (!name || !prompt || (changeType !== "one_time" && changeType !== "persistent")) {
+    return null;
+  }
+  return {
+    name: name.slice(0, 28),
+    prepared: { prompt, change_type: changeType },
+  };
+}
+
+function attachPreparedRuleDraft(item, rule = {}) {
+  const meta = preparedRuleDraftMeta(rule);
+  if (!meta) return null;
+  item.__preparedRule = meta.prepared;
+  item.dataset.ruleName = meta.name;
+  return meta;
+}
+
+function readPreparedRuleDraft(item) {
+  if (!item?.__preparedRule || !item.dataset.ruleName) return {};
+  return {
+    name: item.dataset.ruleName,
+    prepared: item.__preparedRule,
+  };
+}
+
+function clearPreparedRuleDraft(control) {
+  const item = control?.closest
+    ? control.closest(".skill-rule-item,.goal-rule-item")
+    : control;
+  if (!item) return;
+  delete item.__preparedRule;
+  delete item.dataset.ruleName;
+}
+
 function readWorldRulesDraft() {
   const goals = goalRuleElements().map((item) => {
     const goalInput = item.querySelector("[data-rule-field='input']").value;
@@ -5521,12 +5564,14 @@ function readWorldRulesDraft() {
       min_play_seconds: goalMinPlaySeconds,
       probability: item.querySelector("[data-rule-field='probability']").value,
       input: goalInput,
+      ...readPreparedRuleDraft(item),
     };
   });
   return {
     skills: skillRuleElements().map((item) => ({
       id: item.dataset.skillRuleId,
       input: item.querySelector("[data-rule-field='input']").value,
+      ...readPreparedRuleDraft(item),
     })),
     goals,
   };
@@ -5575,6 +5620,14 @@ function invalidatePreparedWorldRules() {
   worldRulesDraftGeneration += 1;
   skillRuleElements().forEach((item) => {
     const state = item.querySelector(".skill-rule-state");
+    const prepared = readPreparedRuleDraft(item);
+    if (prepared.prepared) {
+      state.textContent = prepared.prepared.change_type === "one_time"
+        ? `✓ ${prepared.name} · 一次性`
+        : `✓ ${prepared.name} · 持久`;
+      state.dataset.state = "ready";
+      return;
+    }
     state.textContent = item.querySelector("[data-rule-field='input']").value.trim()
       ? "待进入世界时由 AI 补全"
       : "填写技能标签或动作描述后启用";
@@ -5582,6 +5635,14 @@ function invalidatePreparedWorldRules() {
   });
   goalRuleElements().forEach((item) => {
     const state = item.querySelector(".goal-rule-state");
+    const prepared = readPreparedRuleDraft(item);
+    if (prepared.prepared) {
+      const minPlaySeconds = item.querySelector("[data-rule-field='min_play_seconds']").value.trim() || "10";
+      const probability = item.querySelector("[data-rule-field='probability']").value.trim() || "0.2";
+      state.textContent = `✓ ${prepared.name} · ≥${minPlaySeconds}s · p=${probability}`;
+      state.dataset.state = "ready";
+      return;
+    }
     state.textContent = item.querySelector("[data-rule-field='input']").value.trim()
       ? "待进入世界时由 AI 补全"
       : "填写奖励或触发效果后启用";
@@ -5631,7 +5692,8 @@ function updateWorldRulesDraftUi() {
   }
 }
 
-function handleWorldRulesDraftInput() {
+function handleWorldRulesDraftInput(event) {
+  if (event?.currentTarget) clearPreparedRuleDraft(event.currentTarget);
   invalidatePreparedWorldRules();
   updateWorldRulesDraftUi();
 }
@@ -5680,6 +5742,13 @@ function addSkillRule(skill = {}, { focus = true } = {}) {
   state.textContent = input.value.trim()
     ? "待进入世界时由 AI 补全"
     : "填写技能标签或动作描述后启用";
+  const preparedMeta = attachPreparedRuleDraft(item, skill);
+  if (preparedMeta) {
+    state.textContent = preparedMeta.prepared.change_type === "one_time"
+      ? `✓ ${preparedMeta.name} · 一次性`
+      : `✓ ${preparedMeta.name} · 持久`;
+    state.dataset.state = "ready";
+  }
   item.append(head, state);
   list.appendChild(item);
 
@@ -5780,6 +5849,13 @@ function addGoalRule(goal = {}, { focus = true } = {}) {
   state.textContent = input.value.trim()
     ? "待进入世界时由 AI 补全"
     : "填写奖励或触发效果后启用";
+  const preparedMeta = attachPreparedRuleDraft(item, goal);
+  if (preparedMeta) {
+    const minPlaySeconds = minPlay.value.trim() || "10";
+    const triggerProbability = probability.value.trim() || "0.2";
+    state.textContent = `✓ ${preparedMeta.name} · ≥${minPlaySeconds}s · p=${triggerProbability}`;
+    state.dataset.state = "ready";
+  }
   item.append(head, fields, state);
   list.appendChild(item);
 
