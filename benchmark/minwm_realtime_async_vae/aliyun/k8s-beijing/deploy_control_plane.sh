@@ -26,6 +26,11 @@ DENOISER_CAPACITY_LIMIT="${DENOISER_CAPACITY_LIMIT:-35}"
 VAE_CAPACITY_LIMIT="${VAE_CAPACITY_LIMIT:-80}"
 VAE_WORKER_CAPACITY="${VAE_WORKER_CAPACITY:-7}"
 WEBUI_PROMPT_REWRITER_PATH="${WEBUI_PROMPT_REWRITER_PATH:-/data/zing-realtime/secrets/prompt-rewriter-vertex.json}"
+WEBUI_DOUBAO_ARK_PATH="${WEBUI_DOUBAO_ARK_PATH:-/data/zing-realtime/secrets/doubao-ark.json}"
+VIDEO_PROMPT_REWRITE_PROVIDER="${VIDEO_PROMPT_REWRITE_PROVIDER:-doubao}"
+CREATE_WORLD_DESCRIPTION_PROVIDER="${CREATE_WORLD_DESCRIPTION_PROVIDER:-${VIDEO_PROMPT_REWRITE_PROVIDER}}"
+DOUBAO_ARK_CREDENTIALS="${DOUBAO_ARK_CREDENTIALS:-/run/secrets/realtime-webui/doubao-ark.json}"
+DOUBAO_REQUEST_TIMEOUT_SECONDS="${DOUBAO_REQUEST_TIMEOUT_SECONDS:-20}"
 HTTPS_PROXY_SECRET_VALUE="${HTTPS_PROXY_SECRET_VALUE:-${https_proxy:-${HTTPS_PROXY:-}}}"
 HTTP_PROXY_SECRET_VALUE="${HTTP_PROXY_SECRET_VALUE:-${http_proxy:-${HTTP_PROXY:-${HTTPS_PROXY_SECRET_VALUE}}}}"
 K3S_PAUSE_IMAGE="${K3S_PAUSE_IMAGE:-registry.cn-hangzhou.aliyuncs.com/google_containers/pause:3.10}"
@@ -70,10 +75,14 @@ render_template() {
   DENOISER_CAPACITY_LIMIT="${DENOISER_CAPACITY_LIMIT}" \
   VAE_CAPACITY_LIMIT="${VAE_CAPACITY_LIMIT}" \
   VAE_WORKER_CAPACITY="${VAE_WORKER_CAPACITY}" \
+  VIDEO_PROMPT_REWRITE_PROVIDER="${VIDEO_PROMPT_REWRITE_PROVIDER}" \
+  CREATE_WORLD_DESCRIPTION_PROVIDER="${CREATE_WORLD_DESCRIPTION_PROVIDER}" \
+  DOUBAO_ARK_CREDENTIALS="${DOUBAO_ARK_CREDENTIALS}" \
+  DOUBAO_REQUEST_TIMEOUT_SECONDS="${DOUBAO_REQUEST_TIMEOUT_SECONDS}" \
   UI_CONFIG_JSON="${UI_CONFIG_JSON}" \
   H264_FFMPEG_BIN="${H264_FFMPEG_BIN}" \
   RUNTIME_SOURCE_PATCH_VERSION="${RUNTIME_SOURCE_PATCH_VERSION}" \
-  envsubst '${NAMESPACE} ${CONTROL_IMAGE} ${GPU_RUNTIME_IMAGE} ${WEBUI_IMAGE} ${NVIDIA_DEVICE_PLUGIN_IMAGE} ${REALTIME_TARGET_FPS} ${REALTIME_SIZE} ${DENOISER_CAPACITY_LIMIT} ${VAE_CAPACITY_LIMIT} ${VAE_WORKER_CAPACITY} ${UI_CONFIG_JSON} ${H264_FFMPEG_BIN} ${RUNTIME_SOURCE_PATCH_VERSION}' \
+  envsubst '${NAMESPACE} ${CONTROL_IMAGE} ${GPU_RUNTIME_IMAGE} ${WEBUI_IMAGE} ${NVIDIA_DEVICE_PLUGIN_IMAGE} ${REALTIME_TARGET_FPS} ${REALTIME_SIZE} ${DENOISER_CAPACITY_LIMIT} ${VAE_CAPACITY_LIMIT} ${VAE_WORKER_CAPACITY} ${VIDEO_PROMPT_REWRITE_PROVIDER} ${CREATE_WORLD_DESCRIPTION_PROVIDER} ${DOUBAO_ARK_CREDENTIALS} ${DOUBAO_REQUEST_TIMEOUT_SECONDS} ${UI_CONFIG_JSON} ${H264_FFMPEG_BIN} ${RUNTIME_SOURCE_PATCH_VERSION}' \
     <"${template}" >"${output}"
 }
 
@@ -221,15 +230,29 @@ REMOTE
 create_optional_webui_secret() {
   log "creating/updating optional webui secret"
   ssh -o BatchMode=yes "${SSH_HOST}" \
-    "NAMESPACE='${NAMESPACE}' WEBUI_PROMPT_REWRITER_PATH='${WEBUI_PROMPT_REWRITER_PATH}' bash -s" <<'REMOTE'
+    "NAMESPACE='${NAMESPACE}' WEBUI_PROMPT_REWRITER_PATH='${WEBUI_PROMPT_REWRITER_PATH}' WEBUI_DOUBAO_ARK_PATH='${WEBUI_DOUBAO_ARK_PATH}' bash -s" <<'REMOTE'
 set -Eeuo pipefail
-if [[ -f "${WEBUI_PROMPT_REWRITER_PATH}" ]]; then
-  kubectl -n "${NAMESPACE}" create secret generic webui-secrets \
-    --from-file=prompt-rewriter-vertex.json="${WEBUI_PROMPT_REWRITER_PATH}" \
-    --dry-run=client -o yaml | kubectl apply -f -
-else
-  echo "prompt rewriter secret file not found; leaving optional webui secret absent"
+if [[ ! -f "${WEBUI_PROMPT_REWRITER_PATH}" && ! -f "${WEBUI_DOUBAO_ARK_PATH}" ]]; then
+  echo "no optional webui secret files found; leaving webui secret unchanged"
+  exit 0
 fi
+if ! kubectl -n "${NAMESPACE}" get secret webui-secrets >/dev/null 2>&1; then
+  kubectl -n "${NAMESPACE}" create secret generic webui-secrets
+fi
+patch_secret_file() {
+  local key="$1"
+  local path="$2"
+  local encoded
+  if [[ ! -f "${path}" ]]; then
+    return
+  fi
+  encoded="$(base64 -w0 "${path}" 2>/dev/null || base64 "${path}" | tr -d '\n')"
+  kubectl -n "${NAMESPACE}" patch secret webui-secrets \
+    --type merge \
+    -p "{\"data\":{\"${key}\":\"${encoded}\"}}"
+}
+patch_secret_file prompt-rewriter-vertex.json "${WEBUI_PROMPT_REWRITER_PATH}"
+patch_secret_file doubao-ark.json "${WEBUI_DOUBAO_ARK_PATH}"
 REMOTE
 }
 

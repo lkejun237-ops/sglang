@@ -284,8 +284,11 @@ spec:
             - {name: MINWM_UPSTREAM_WS, value: "ws://zing-gateway:18080/backends/minwm"}
             - {name: LINGBOT2_UPSTREAM_HTTP, value: ""}
             - {name: LINGBOT2_UPSTREAM_WS, value: ""}
-            - {name: VIDEO_PROMPT_REWRITE_PROVIDER, value: local}
+            - {name: VIDEO_PROMPT_REWRITE_PROVIDER, value: ${VIDEO_PROMPT_REWRITE_PROVIDER}}
+            - {name: CREATE_WORLD_DESCRIPTION_PROVIDER, value: ${CREATE_WORLD_DESCRIPTION_PROVIDER}}
             - {name: VIDEO_PROMPT_REWRITE_CREDENTIALS, value: /run/secrets/realtime-webui/prompt-rewriter-vertex.json}
+            - {name: DOUBAO_ARK_CREDENTIALS, value: ${DOUBAO_ARK_CREDENTIALS}}
+            - {name: DOUBAO_REQUEST_TIMEOUT_SECONDS, value: "${DOUBAO_REQUEST_TIMEOUT_SECONDS}"}
             - name: REALTIME_UI_CONFIG_JSON
               value: '${UI_CONFIG_JSON}'
             - name: HTTPS_PROXY

@@ -69,6 +69,22 @@
       "value": "/run/secrets/realtime-webui/prompt-rewriter-vertex.json"
     },
     {
+      "name": "VIDEO_PROMPT_REWRITE_PROVIDER",
+      "value": "doubao"
+    },
+    {
+      "name": "CREATE_WORLD_DESCRIPTION_PROVIDER",
+      "value": "doubao"
+    },
+    {
+      "name": "DOUBAO_ARK_CREDENTIALS",
+      "value": "/run/secrets/realtime-webui/doubao-ark.json"
+    },
+    {
+      "name": "DOUBAO_REQUEST_TIMEOUT_SECONDS",
+      "value": "20"
+    },
+    {
       "name": "CREATE_WORLD_IMAGE_CONFIG",
       "value": "/run/secrets/realtime-webui/world-image-model-config.json"
     }
@@ -232,6 +248,10 @@
           {
             "key": "prompt-rewriter-vertex.json",
             "path": "prompt-rewriter-vertex.json"
+          },
+          {
+            "key": "doubao-ark.json",
+            "path": "doubao-ark.json"
           },
           {
             "key": "world-image-model-config.json",

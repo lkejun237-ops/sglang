@@ -1036,6 +1036,13 @@ def _webui() -> dict[str, Any]:
                     "VIDEO_PROMPT_REWRITE_CREDENTIALS",
                     "/run/secrets/realtime-webui/prompt-rewriter-vertex.json",
                 ),
+                _env("VIDEO_PROMPT_REWRITE_PROVIDER", "doubao"),
+                _env("CREATE_WORLD_DESCRIPTION_PROVIDER", "doubao"),
+                _env(
+                    "DOUBAO_ARK_CREDENTIALS",
+                    "/run/secrets/realtime-webui/doubao-ark.json",
+                ),
+                _env("DOUBAO_REQUEST_TIMEOUT_SECONDS", "20"),
                 _env(
                     "CREATE_WORLD_IMAGE_CONFIG",
                     "/run/secrets/realtime-webui/world-image-model-config.json",
@@ -1059,6 +1066,10 @@ def _webui() -> dict[str, Any]:
                             {
                                 "key": "prompt-rewriter-vertex.json",
                                 "path": "prompt-rewriter-vertex.json",
+                            },
+                            {
+                                "key": "doubao-ark.json",
+                                "path": "doubao-ark.json",
                             },
                             {
                                 "key": "world-image-model-config.json",
@@ -1103,6 +1114,7 @@ def _webui() -> dict[str, Any]:
                 egress_to=["world-realtime-gateway"],
                 external=[
                     "llm-0jcmcer24vyvd7rr.cn-beijing.maas.aliyuncs.com",
+                    "ark.cn-beijing.volces.com",
                     "aiplatform.googleapis.com",
                 ],
             ),

@@ -178,7 +178,18 @@ def test_webui_keeps_external_secret_references_and_ephemeral_volumes():
     assert env["HAPPYOYSTER_PUBLIC_IMAGE_BASE_URL"]["value"] == (
         "https://open-world.loopit.me"
     )
+    assert env["VIDEO_PROMPT_REWRITE_PROVIDER"]["value"] == "doubao"
+    assert env["CREATE_WORLD_DESCRIPTION_PROVIDER"]["value"] == "doubao"
+    assert env["DOUBAO_ARK_CREDENTIALS"]["value"] == (
+        "/run/secrets/realtime-webui/doubao-ark.json"
+    )
+    assert env["DOUBAO_REQUEST_TIMEOUT_SECONDS"]["value"] == "20"
     assert volumes["runtime-secret"]["type"] == "secret"
+    secret_items = {
+        item["key"]: item["path"]
+        for item in volumes["runtime-secret"]["secret"]["items"]
+    }
+    assert secret_items["doubao-ark.json"] == "doubao-ark.json"
     assert volumes["generated-images"]["type"] == "emptyDir"
     assert volumes["tmp"]["type"] == "emptyDir"
 
