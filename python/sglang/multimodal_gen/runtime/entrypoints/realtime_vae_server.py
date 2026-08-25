@@ -7,6 +7,7 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import time
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -57,6 +58,11 @@ from sglang.multimodal_gen.runtime.utils.realtime_trace import (
 logger = logging.getLogger(__name__)
 _WARMUP_SIZE_RE = re.compile(r"^(?P<width>[1-9]\d*)x(?P<height>[1-9]\d*)$")
 
+try:
+    import imageio_ffmpeg as _imageio_ffmpeg
+except ImportError:  # pragma: no cover
+    _imageio_ffmpeg = None
+
 
 def _parse_warmup_size(size: str) -> tuple[int, int]:
     match = _WARMUP_SIZE_RE.fullmatch(size)
@@ -83,6 +89,33 @@ def _warmup_latent_shape(engine, size: str | None) -> tuple[int, int, int, int, 
         else 1
     )
     return (1, int(channels), temporal, height // 16, width // 16)
+
+
+def _resolve_h264_ffmpeg_bin(configured_bin: str) -> str:
+    if configured_bin:
+        if os.path.isabs(configured_bin):
+            if os.path.exists(configured_bin):
+                return configured_bin
+        else:
+            ffmpeg_on_path = shutil.which(configured_bin)
+            if ffmpeg_on_path:
+                return ffmpeg_on_path
+
+    if _imageio_ffmpeg is not None:
+        try:
+            bundled_bin = _imageio_ffmpeg.get_ffmpeg_exe()
+            if bundled_bin and os.path.exists(bundled_bin):
+                logger.warning(
+                    "Configured H.264 ffmpeg binary %r is unavailable; "
+                    "falling back to imageio-ffmpeg at %s",
+                    configured_bin,
+                    bundled_bin,
+                )
+                return bundled_bin
+        except Exception:
+            logger.exception("Failed to resolve bundled imageio-ffmpeg binary")
+
+    return configured_bin
 
 
 def _tensor_from_payload(header, payload: bytes) -> torch.Tensor:
@@ -816,6 +849,11 @@ def _run_worker(args, exact_server_args) -> None:
         capacity=max_sessions,
         max_consumed_age_s=args.max_consumed_age_s,
     )
+    h264_ffmpeg_bin = (
+        _resolve_h264_ffmpeg_bin(args.h264_ffmpeg_bin)
+        if args.direct_h264_output
+        else args.h264_ffmpeg_bin
+    )
     app = create_app(
         worker,
         max_message_bytes=args.max_message_mb * 1024 * 1024,
@@ -824,7 +862,7 @@ def _run_worker(args, exact_server_args) -> None:
         h264_config=H264PipelineConfig(
             enabled=args.direct_h264_output,
             trigger_output_format=args.direct_h264_trigger_output_format,
-            ffmpeg_bin=args.h264_ffmpeg_bin,
+            ffmpeg_bin=h264_ffmpeg_bin,
             fps=args.h264_fps,
             threads=args.h264_threads,
             preset=args.h264_preset,
