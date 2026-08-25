@@ -443,6 +443,10 @@ apply_webui_static_patch() {
     trace_topology.js
     trace_transport.js
     app.js
+    doubao_provider.py
+    prompt_rewriter.py
+    server.py
+    world_creator.py
   )
   local sources=()
   local file
@@ -490,6 +494,10 @@ files = [
     "trace_topology.js",
     "trace_transport.js",
     "app.js",
+    "doubao_provider.py",
+    "prompt_rewriter.py",
+    "server.py",
+    "world_creator.py",
 ]
 patch = {
     "spec": {
