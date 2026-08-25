@@ -3,6 +3,7 @@
 import base64
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -63,6 +64,15 @@ class FakeDoubaoProvider:
 
 
 class WorldCreatorTest(unittest.IsolatedAsyncioTestCase):
+    def test_default_description_provider_is_doubao(self):
+        previous = os.environ.pop("CREATE_WORLD_DESCRIPTION_PROVIDER", None)
+        try:
+            creator = WorldCreator(doubao_provider=FakeDoubaoProvider())
+        finally:
+            if previous is not None:
+                os.environ["CREATE_WORLD_DESCRIPTION_PROVIDER"] = previous
+        self.assertEqual(creator.description_provider, "doubao")
+
     async def test_doubao_describes_world_with_the_same_schema(self):
         provider = FakeDoubaoProvider()
         creator = WorldCreator(
@@ -96,6 +106,7 @@ class WorldCreatorTest(unittest.IsolatedAsyncioTestCase):
             image_client=self.images,
             image_config_path=self.config,
             generated_root=self.root / "generated",
+            description_provider="vertex",
         )
 
     async def _client(self):

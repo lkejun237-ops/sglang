@@ -61,6 +61,15 @@ class FakeDoubaoProvider:
 
 
 class PromptRewriterTest(unittest.IsolatedAsyncioTestCase):
+    def test_default_provider_is_doubao(self):
+        previous = os.environ.pop("VIDEO_PROMPT_REWRITE_PROVIDER", None)
+        try:
+            rewriter = PromptRewriter(doubao_provider=FakeDoubaoProvider())
+        finally:
+            if previous is not None:
+                os.environ["VIDEO_PROMPT_REWRITE_PROVIDER"] = previous
+        self.assertEqual(rewriter.provider, "doubao")
+
     async def test_doubao_provider_rewrites_and_completes_rules(self):
         provider = FakeDoubaoProvider()
         rewriter = PromptRewriter(
@@ -81,7 +90,9 @@ class PromptRewriterTest(unittest.IsolatedAsyncioTestCase):
     async def test_rewrite_returns_prompt_and_lifetime(self):
         models = FakeModels()
         client = SimpleNamespace(aio=SimpleNamespace(models=models))
-        rewriter = PromptRewriter(client=client, request_timeout_seconds=1)
+        rewriter = PromptRewriter(
+            client=client, provider="vertex", request_timeout_seconds=1
+        )
         result = await rewriter.rewrite("让世界下雪", "A dragon flies over a valley.")
         self.assertEqual(result.change_type.value, "persistent")
         self.assertIn("falling snow", result.prompt)
@@ -100,7 +111,7 @@ class PromptRewriterTest(unittest.IsolatedAsyncioTestCase):
             ]
         )
         client = SimpleNamespace(aio=SimpleNamespace(models=models))
-        result = await PromptRewriter(client=client).rewrite(
+        result = await PromptRewriter(client=client, provider="vertex").rewrite(
             "保持位置", "A dragon flies over a valley."
         )
         self.assertIn("original", result.prompt)
@@ -115,7 +126,7 @@ class PromptRewriterTest(unittest.IsolatedAsyncioTestCase):
             ]
         )
         client = SimpleNamespace(aio=SimpleNamespace(models=models))
-        result = await PromptRewriter(client=client).rewrite(
+        result = await PromptRewriter(client=client, provider="vertex").rewrite(
             "跳一下", "A dragon flies over a valley."
         )
         self.assertEqual(result.change_type.value, "one_time")
@@ -126,7 +137,7 @@ class PromptRewriterTest(unittest.IsolatedAsyncioTestCase):
         models = FakeModels([RuntimeError("vertex unavailable")])
         client = SimpleNamespace(aio=SimpleNamespace(models=models))
         with self.assertRaisesRegex(RuntimeError, "vertex unavailable"):
-            await PromptRewriter(client=client).rewrite(
+            await PromptRewriter(client=client, provider="vertex").rewrite(
                 "跳一下", "A dragon flies over a valley."
             )
         self.assertEqual(len(models.calls), 1)
@@ -142,7 +153,9 @@ class PromptRewriterTest(unittest.IsolatedAsyncioTestCase):
             ]
         )
         client = SimpleNamespace(aio=SimpleNamespace(models=models))
-        result = await PromptRewriter(client=client).complete_world_rule(
+        result = await PromptRewriter(
+            client=client, provider="vertex"
+        ).complete_world_rule(
             "召唤飞船", "A rider explores a valley.", "skill"
         )
         self.assertEqual(result.name, "召唤飞船")

@@ -213,7 +213,7 @@ class WorldCreator:
     ) -> None:
         self.description_provider = (
             description_provider
-            or os.environ.get("CREATE_WORLD_DESCRIPTION_PROVIDER", "vertex")
+            or os.environ.get("CREATE_WORLD_DESCRIPTION_PROVIDER", "doubao")
         ).strip().lower()
         if self.description_provider not in {"vertex", "doubao"}:
             raise ValueError(

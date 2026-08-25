@@ -331,7 +331,7 @@ class PromptRewriter:
         doubao_provider: DoubaoStructuredProvider | None = None,
     ) -> None:
         self.provider = (
-            provider or os.environ.get("VIDEO_PROMPT_REWRITE_PROVIDER", "vertex")
+            provider or os.environ.get("VIDEO_PROMPT_REWRITE_PROVIDER", "doubao")
         ).strip().lower()
         if self.provider not in {"vertex", "doubao", LOCAL_PROVIDER}:
             raise ValueError(
