@@ -14,6 +14,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.jit_kernel.diffusion.minwm_rotary import (
+    can_use_minwm_rotary,
+    can_use_minwm_rotary_out,
+    minwm_rotary,
+    minwm_rotary_out,
+)
 from sglang.multimodal_gen.configs.models.dits.minwm import MinWMVideoConfig
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
@@ -230,6 +236,9 @@ def apply_minwm_rotary_embedding(
     sin: torch.Tensor,
 ) -> torch.Tensor:
     """Apply minWM's explicit FP32 interleaved RoPE arithmetic."""
+    if can_use_minwm_rotary(hidden_states, cos, sin):
+        return minwm_rotary(hidden_states, cos, sin)
+
     sequence_length = hidden_states.shape[-3]
     half_head_dim = hidden_states.shape[-1] // 2
     broadcast_shape = (1,) * (hidden_states.dim() - 3) + (
@@ -249,6 +258,19 @@ def apply_minwm_rotary_embedding(
         .flatten(-2)
         .type_as(hidden_states)
     )
+
+
+def apply_minwm_rotary_embedding_out(
+    hidden_states: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Apply exact MinWM RoPE into a caller-owned cache tensor when supported."""
+    if can_use_minwm_rotary_out(hidden_states, cos, sin, output):
+        return minwm_rotary_out(hidden_states, cos, sin, output)
+    output.copy_(apply_minwm_rotary_embedding(hidden_states, cos, sin).type_as(output))
+    return output
 
 
 def _minwm_layer_norm(
@@ -669,12 +691,12 @@ class MinWMCausalSelfAttention(CausalWanSelfAttention):
             and cache_view.rotated_k_is_valid
             and cache_view.is_recompute
         ):
-            rotated_current_key = apply_minwm_rotary_embedding(
-                key, query_cos, query_sin
-            ).type_as(value)
-            cache_view.rotated_k[
+            rotated_current_key = cache_view.rotated_k[
                 :, cache_view.current_local_start : cache_view.current_local_end
-            ].copy_(rotated_current_key)
+            ]
+            apply_minwm_rotary_embedding_out(
+                key, query_cos, query_sin, rotated_current_key
+            )
             attention_key = cache_view.rotated_k
         else:
             if cache_view.key_cos is None or cache_view.key_sin is None:
@@ -683,12 +705,15 @@ class MinWMCausalSelfAttention(CausalWanSelfAttention):
                 )
             else:
                 key_cos, key_sin = cache_view.key_cos, cache_view.key_sin
-            attention_key = apply_minwm_rotary_embedding(
-                cache_view.k, key_cos, key_sin
-            ).type_as(value)
             if _MINWM_CACHE_ROTATED_K:
-                cache_view.rotated_k.copy_(attention_key)
+                attention_key = apply_minwm_rotary_embedding_out(
+                    cache_view.k, key_cos, key_sin, cache_view.rotated_k
+                )
                 kv_cache.rotated_k_is_valid = True
+            else:
+                attention_key = apply_minwm_rotary_embedding(
+                    cache_view.k, key_cos, key_sin
+                ).type_as(value)
         attention_value = cache_view.v
         parity_dump_dir = getattr(self, "_minwm_parity_dump_dir", None)
         parity_index = getattr(self, "_minwm_parity_forward_index", 0)

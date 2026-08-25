@@ -56,6 +56,7 @@ from sglang.multimodal_gen.runtime.models.dits.minwm import (
     _minwm_uniform_cu_seqlens,
     _minwm_uniform_frame_indices,
     apply_minwm_rotary_embedding,
+    apply_minwm_rotary_embedding_out,
 )
 from sglang.multimodal_gen.runtime.models.dits.minwm_action import (
     PrimitiveRoPETokenResidualActionEncoder,
@@ -3061,6 +3062,119 @@ def test_minwm_rotary_embedding_matches_main_explicit_formula():
     torch.testing.assert_close(
         apply_minwm_rotary_embedding(hidden, cos, sin), expected, rtol=0, atol=0
     )
+
+
+def test_minwm_rotary_embedding_dispatches_supported_hopper_inputs(monkeypatch):
+    import sglang.multimodal_gen.runtime.models.dits.minwm as minwm_module
+
+    hidden = torch.randn(1, 5, 3, 8, dtype=torch.bfloat16)
+    cos = torch.randn(5, 4)
+    sin = torch.randn(5, 4)
+    sentinel = torch.empty_like(hidden)
+
+    monkeypatch.setattr(minwm_module, "can_use_minwm_rotary", lambda *_: True)
+    monkeypatch.setattr(minwm_module, "minwm_rotary", lambda *_: sentinel)
+
+    assert apply_minwm_rotary_embedding(hidden, cos, sin) is sentinel
+
+
+def test_minwm_rotary_embedding_out_dispatches_supported_hopper_inputs(monkeypatch):
+    import sglang.multimodal_gen.runtime.models.dits.minwm as minwm_module
+
+    hidden = torch.randn(1, 5, 3, 8, dtype=torch.bfloat16)
+    cos = torch.randn(5, 4)
+    sin = torch.randn(5, 4)
+    output = torch.empty_like(hidden)
+
+    monkeypatch.setattr(minwm_module, "can_use_minwm_rotary_out", lambda *_: True)
+    monkeypatch.setattr(minwm_module, "minwm_rotary_out", lambda *args: args[-1])
+
+    assert apply_minwm_rotary_embedding_out(hidden, cos, sin, output) is output
+
+
+def test_minwm_rotary_embedding_out_fallback_writes_caller_tensor():
+    torch.manual_seed(10)
+    hidden = torch.randn(1, 5, 3, 8, dtype=torch.bfloat16)
+    angles = torch.randn(5, 4)
+    cos = angles.cos()
+    sin = angles.sin()
+    output = torch.empty_like(hidden)
+    expected = apply_minwm_rotary_embedding(hidden, cos, sin)
+
+    actual = apply_minwm_rotary_embedding_out(hidden, cos, sin, output)
+
+    assert actual is output
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_minwm_five_passes_rotate_q_five_times_and_full_k_once(monkeypatch):
+    import sglang.multimodal_gen.runtime.models.dits.minwm as minwm_module
+
+    cache = _make_minwm_test_cache(cache_size=6, sink_tokens=0)
+    _append_minwm_test_frames(cache, [0, 1], token_start=0)
+    cache.set_current_position_ids(
+        torch.tensor([[2, 0, 0], [3, 0, 0]], dtype=torch.long)
+    )
+
+    attention = MinWMCausalSelfAttention.__new__(MinWMCausalSelfAttention)
+    torch.nn.Module.__init__(attention)
+    attention.head_start = 0
+
+    class IdentityRotary:
+        @staticmethod
+        def forward_uncached(position_ids):
+            return torch.ones(position_ids.shape[0], 1), torch.zeros(
+                position_ids.shape[0], 1
+            )
+
+    attention._minwm_rotary_emb = IdentityRotary()
+    monkeypatch.setattr(
+        minwm_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(forward_batch=None),
+    )
+    monkeypatch.setattr(minwm_module, "get_ulysses_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(minwm_module, "_MINWM_ATTENTION_IMPL", "packed")
+    monkeypatch.setattr(minwm_module, "_MINWM_CACHE_ROTATED_K", True)
+    monkeypatch.setattr(
+        minwm_module,
+        "_minwm_packed_varlen_attention",
+        lambda query, _key, _value: query,
+    )
+
+    query_lengths = []
+    key_lengths = []
+
+    def record_query(hidden, _cos, _sin):
+        query_lengths.append(hidden.shape[-3])
+        return hidden.clone()
+
+    def record_key(hidden, _cos, _sin, output):
+        key_lengths.append(hidden.shape[-3])
+        output.copy_(hidden)
+        return output
+
+    monkeypatch.setattr(minwm_module, "apply_minwm_rotary_embedding", record_query)
+    monkeypatch.setattr(minwm_module, "apply_minwm_rotary_embedding_out", record_key)
+
+    query = torch.ones(1, 2, 1, 2)
+    key = torch.full_like(query, 2)
+    value = torch.full_like(query, 3)
+    for _ in range(5):
+        output = attention.forward(
+            query,
+            key,
+            value,
+            (torch.empty(0), torch.empty(0)),
+            block_mask=None,
+            kv_cache=cache,
+            current_start=2,
+        )
+        assert output.shape == query.shape
+
+    assert query_lengths == [2, 2, 2, 2, 2]
+    assert key_lengths == [4, 2, 2, 2, 2]
+    assert cache.rotated_k_is_valid
 
 
 def test_minwm_vae_pixel_and_latent_arithmetic_matches_main():

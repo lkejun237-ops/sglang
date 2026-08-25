@@ -18,6 +18,7 @@ set -euo pipefail
 : "${MINWM_HARNESS_REF_VERIFIED:?set whether the harness commit was verified}"
 : "${MINWM_REQUIRE_24FPS:?set whether 24 FPS is a completion gate}"
 : "${MINWM_REQUIRE_CANDIDATE_EVIDENCE:?set candidate evidence gate}"
+: "${MINWM_ROPE_AB_LABEL:=}"
 : "${MINWM_RUNNER_SHA256:?set the profiling runner SHA-256}"
 : "${MINWM_PROFILE_CLIENT_SHA256:?set the profiling client SHA-256}"
 : "${MINWM_COMMON_SHA256:?set the fixed common.py SHA-256}"
@@ -56,6 +57,12 @@ if [[ "${MINWM_PROFILE_MODE}" == "fa3-quality" ]]; then
   : "${MINWM_QUALITY_LONG_CASES_SHA256:?set the long cases SHA-256}"
   : "${MINWM_FA2_REFERENCE_PATCH_SHA256:?set the FA2 reference patch SHA-256}"
 fi
+if [[ -n "${MINWM_ROPE_AB_LABEL}" ]]; then
+  [[ "${MINWM_PROFILE_MODE}" == "baseline" ]]
+  [[ ",baseline,candidate," == *",${MINWM_ROPE_AB_LABEL},"* ]]
+  : "${MINWM_ROPE_AB_CLIENT_SHA256:?set the fixed rope A/B client SHA-256}"
+  : "${MINWM_ROPE_AB_CASES_SHA256:?set the fixed rope A/B cases SHA-256}"
+fi
 [[ ",B200,B300,H100,H200," == *",${MINWM_GPU_SKU},"* ]]
 [[ "${MINWM_RUN_ID}" =~ ^[a-z0-9][a-z0-9.-]+$ ]]
 [[ "${MINWM_RESULTS_ROOT}" == /s3-results/world-model/evals/minwm/performance/* ]]
@@ -87,6 +94,10 @@ if [[ "${MINWM_PROFILE_MODE}" == "fa3-quality" ]]; then
   [[ "${MINWM_QUALITY_LONG_CASES_SHA256}" =~ ^[0-9a-f]{64}$ ]]
   [[ "${MINWM_FA2_REFERENCE_PATCH_SHA256}" =~ ^[0-9a-f]{64}$ ]]
 fi
+if [[ -n "${MINWM_ROPE_AB_LABEL}" ]]; then
+  [[ "${MINWM_ROPE_AB_CLIENT_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+  [[ "${MINWM_ROPE_AB_CASES_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+fi
 [[ "${MINWM_CHECKPOINT_SHA256}" =~ ^[0-9a-f]{64}$ ]]
 [[ "${MINWM_FIRST_FRAME_SOURCE_SHA256}" =~ ^[0-9a-f]{64}$ ]]
 [[ "${TAEHV_CHECKPOINT_SHA256}" =~ ^[0-9a-f]{64}$ ]]
@@ -110,6 +121,7 @@ readonly PROFILE_CLIENT="${PROFILE_DIR}/benchmark_realtime_throughput.py"
 readonly PROFILE_COMMON="${PROFILE_DIR}/common.py"
 readonly PROFILE_RUNNER="${PROFILE_DIR}/run_single_gpu_taehv_24fps.sh"
 readonly QUALITY_CLIENT="${PROFILE_DIR}/run_sglang_api.py"
+readonly ROPE_AB_CASES="${PROFILE_DIR}/cases_rope_ab_3res.json"
 readonly QUALITY_ANALYZER="${PROFILE_DIR}/analyze_fa3_quality.py"
 readonly QUALITY_ACTION_CASES="${PROFILE_DIR}/cases_fa3_quality_actions_720p.json"
 readonly QUALITY_LONG_CASES="${PROFILE_DIR}/cases_fa3_quality_long_720p.json"
@@ -773,6 +785,16 @@ contract = {
             if os.environ["MINWM_PROFILE_MODE"] == "fa3-quality"
             else None
         ),
+        "rope_ab": (
+            {
+                "cases_sha256": os.environ["MINWM_ROPE_AB_CASES_SHA256"],
+                "client_sha256": os.environ["MINWM_ROPE_AB_CLIENT_SHA256"],
+                "label": os.environ["MINWM_ROPE_AB_LABEL"],
+                "timing_scope": "after formal 20+200 headline segment",
+            }
+            if os.environ["MINWM_ROPE_AB_LABEL"]
+            else None
+        ),
     },
     "request": {
         "action_source_sha256": hashlib.sha256(canonical_action_source).hexdigest(),
@@ -830,6 +852,16 @@ if [[ "${MINWM_PROFILE_MODE}" == "fa3-quality" ]]; then
     "${MINWM_QUALITY_ACTION_CASES_SHA256}:${QUALITY_ACTION_CASES}" \
     "${MINWM_QUALITY_LONG_CASES_SHA256}:${QUALITY_LONG_CASES}" \
     "${MINWM_FA2_REFERENCE_PATCH_SHA256}:${FA2_REFERENCE_PATCH}"; do
+    harness_sha="${harness_entry%%:*}"
+    harness_path="${harness_entry#*:}"
+    printf '%s  %s\n' "${harness_sha}" "${harness_path}" | sha256sum --check -
+    cp "${harness_path}" "${LOCAL_RESULTS}/harness/$(basename "${harness_path}")"
+  done
+fi
+if [[ -n "${MINWM_ROPE_AB_LABEL}" ]]; then
+  for harness_entry in \
+    "${MINWM_ROPE_AB_CLIENT_SHA256}:${QUALITY_CLIENT}" \
+    "${MINWM_ROPE_AB_CASES_SHA256}:${ROPE_AB_CASES}"; do
     harness_sha="${harness_entry%%:*}"
     harness_path="${harness_entry#*:}"
     printf '%s  %s\n' "${harness_sha}" "${harness_path}" | sha256sum --check -
@@ -1056,6 +1088,45 @@ if [[ "${MINWM_PROFILE_MODE}" == "baseline" ]]; then
     | tee "${baseline_dir}/client.log"
   assert_profile_result "${baseline_dir}/throughput.json" 20 200
   record_performance_gate "${baseline_dir}/throughput.json"
+  if [[ -n "${MINWM_ROPE_AB_LABEL}" ]]; then
+    rope_ab_dir="${baseline_dir}/rope-ab"
+    mkdir -p "${rope_ab_dir}"
+    python3 "${QUALITY_CLIENT}" \
+      --cases "${ROPE_AB_CASES}" \
+      --results "${rope_ab_dir}" \
+      --output-prefix "${MINWM_ROPE_AB_LABEL}" \
+      --engine-name "minwm-rope-${MINWM_ROPE_AB_LABEL}-same-h100-ab" \
+      --sink-size 8 \
+      --kv-cache-num-frames 32 \
+      --timeout 3600 \
+      | tee "${baseline_dir}/rope-ab-client.log"
+    python3 - "${rope_ab_dir}" "${MINWM_ROPE_AB_LABEL}" <<'PY'
+import json
+import pathlib
+import sys
+
+import numpy as np
+
+root = pathlib.Path(sys.argv[1])
+label = sys.argv[2]
+run = json.load(open(root / f"{label}_run.json"))
+expected = {
+    "00_forward_080_pottery_832x480": (129, 480, 832, 3),
+    "01_forward_080_pottery_1248x704": (129, 704, 1248, 3),
+    "02_forward_080_pottery_1280x704": (129, 704, 1280, 3),
+}
+assert {case["id"] for case in run["cases"]} == set(expected), run
+for case in run["cases"]:
+    case_dir = root / "cases" / case["id"]
+    assert tuple(case["contract"][key] for key in ("reference_pixel_frames",)) == (1,)
+    assert case["frames"] == expected[case["id"]][0], case
+    frames_path = case_dir / f"{label}.npy"
+    assert np.load(frames_path, mmap_mode="r").shape == expected[case["id"]]
+    assert frames_path.stat().st_size > 0
+    assert (case_dir / f"{label}.mp4").stat().st_size > 0
+print(json.dumps({"label": label, "validated_cases": sorted(expected)}, sort_keys=True))
+PY
+  fi
   stop_server
 elif [[ "${MINWM_PROFILE_MODE}" == "fa3-quality" ]]; then
   quality_dir="${LOCAL_RESULTS}/fa3-quality"
