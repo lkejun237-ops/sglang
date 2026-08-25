@@ -20,6 +20,7 @@ CLIENT = BENCHMARK_ROOT / "benchmark_realtime_throughput.py"
 COMMON = BENCHMARK_ROOT / "common.py"
 CASES = BENCHMARK_ROOT / "cases_720p_compile_smoke.json"
 QUALITY_CLIENT = BENCHMARK_ROOT / "run_sglang_api.py"
+ROPE_AB_CASES = BENCHMARK_ROOT / "cases_rope_ab_3res.json"
 QUALITY_ANALYZER = BENCHMARK_ROOT / "analyze_fa3_quality.py"
 QUALITY_ACTION_CASES = BENCHMARK_ROOT / "cases_fa3_quality_actions_720p.json"
 QUALITY_LONG_CASES = BENCHMARK_ROOT / "cases_fa3_quality_long_720p.json"
@@ -38,7 +39,15 @@ QUALITY_HARNESS_FILES = {
     "cases_fa3_quality_long_720p.json": QUALITY_LONG_CASES,
     "fa2_reference_hopper_validation.patch": FA2_REFERENCE_PATCH,
 }
-HARNESS_FILES = {**BASE_HARNESS_FILES, **QUALITY_HARNESS_FILES}
+ROPE_AB_HARNESS_FILES = {
+    "run_sglang_api.py": QUALITY_CLIENT,
+    "cases_rope_ab_3res.json": ROPE_AB_CASES,
+}
+HARNESS_FILES = {
+    **BASE_HARNESS_FILES,
+    **QUALITY_HARNESS_FILES,
+    **ROPE_AB_HARNESS_FILES,
+}
 
 DEFAULT_SGLANG_GIT_REF = "54bdfea9cd52ac1cd79896e1a7275e18a0257b79"
 MINWM_GIT_REF = "4220c8a2dc456b2d9c85ef6c0d9db7fb872d864c"
@@ -319,11 +328,14 @@ def render(
     harness_ref_verified: bool = True,
     require_24fps: bool = False,
     candidate_evidence: bool = False,
+    rope_ab_label: str | None = None,
     run_tag: str,
 ) -> tuple[dict, dict]:
     hardware = HARDWARE[sku]
     if mode == "fa3-quality" and sku not in {"h100", "h200"}:
         raise ValueError("fa3-quality mode requires Hopper H100 or H200")
+    if rope_ab_label is not None and mode != "baseline":
+        raise ValueError("rope A/B capture is only valid for baseline mode Jobs")
     storage_volumes, storage_mounts = storage_spec(hardware["storage"])
     candidate_evidence = candidate_evidence or require_24fps or mode == "fa3-quality"
     run_id = f"minwm-taehv24-{sku}-{mode}-{run_tag}"
@@ -373,6 +385,7 @@ def render(
             ],
             "seedleap.ai/require-24fps": str(require_24fps).lower(),
             "seedleap.ai/candidate-evidence": str(candidate_evidence).lower(),
+            "seedleap.ai/rope-ab-label": rope_ab_label or "disabled",
             "seedleap.ai/result-uri": (f"{RESULT_URI_ROOT}/{sku}/{mode}/{run_id}"),
         },
     }
@@ -427,6 +440,7 @@ def render(
         "MINWM_HARNESS_REF_VERIFIED": str(harness_ref_verified).lower(),
         "MINWM_REQUIRE_24FPS": str(require_24fps).lower(),
         "MINWM_REQUIRE_CANDIDATE_EVIDENCE": str(candidate_evidence).lower(),
+        "MINWM_ROPE_AB_LABEL": rope_ab_label or "",
         "MINWM_RUNNER_SHA256": sha256_file(RUNNER),
         "MINWM_PROFILE_CLIENT_SHA256": sha256_file(CLIENT),
         "MINWM_COMMON_SHA256": sha256_file(COMMON),
@@ -461,6 +475,14 @@ def render(
                 "MINWM_QUALITY_ACTION_CASES_SHA256": sha256_file(QUALITY_ACTION_CASES),
                 "MINWM_QUALITY_LONG_CASES_SHA256": sha256_file(QUALITY_LONG_CASES),
                 "MINWM_FA2_REFERENCE_PATCH_SHA256": sha256_file(FA2_REFERENCE_PATCH),
+            }
+        )
+    if rope_ab_label is not None:
+        harness_files.update(ROPE_AB_HARNESS_FILES)
+        env.update(
+            {
+                "MINWM_ROPE_AB_CLIENT_SHA256": sha256_file(QUALITY_CLIENT),
+                "MINWM_ROPE_AB_CASES_SHA256": sha256_file(ROPE_AB_CASES),
             }
         )
     container = {
@@ -564,6 +586,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--rope-ab-label",
+        choices=("baseline", "candidate"),
+        help=(
+            "After the formal 20+200 segment, capture lossless three-resolution "
+            "A/B frames and MP4s under this lane label."
+        ),
+    )
+    parser.add_argument(
         "--run-tag",
         required=True,
         help="Unique lowercase suffix included in the Job name and S3 result prefix.",
@@ -590,6 +620,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                 )
     if args.require_24fps and any(mode != "baseline" for mode in args.mode):
         parser.error("--require-24fps is only valid for baseline Jobs")
+    if args.rope_ab_label and any(mode != "baseline" for mode in args.mode):
+        parser.error("--rope-ab-label is only valid for baseline Jobs")
     if "fa3-quality" in args.mode:
         invalid_skus = sorted(set(args.sku) - {"h100", "h200"})
         if invalid_skus:
@@ -613,6 +645,7 @@ def main() -> None:
                 harness_ref_verified=args.harness_ref_verified,
                 require_24fps=args.require_24fps,
                 candidate_evidence=args.candidate_evidence,
+                rope_ab_label=args.rope_ab_label,
                 run_tag=args.run_tag,
             )
             output = args.output_dir / (

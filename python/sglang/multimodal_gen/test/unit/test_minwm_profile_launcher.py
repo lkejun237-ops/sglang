@@ -6,6 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from sglang.multimodal_gen.configs.minwm_resolution_buckets import (
+    normalize_minwm_resolution_buckets,
+)
 from sglang.multimodal_gen.tools import minwm_profile_launcher as launcher
 from sglang.multimodal_gen.tools.minwm_profile_launcher import (
     PROFILE_RESIDENT_SPEED,
@@ -42,6 +45,19 @@ def _last_option_value(command: list[str], option: str) -> str | None:
 )
 def test_auto_profile_selection(gpu, expected):
     assert resolve_profile("auto", gpu) == expected
+
+
+def test_resolution_bucket_aliases_normalize_to_exact_dimensions():
+    assert normalize_minwm_resolution_buckets("480p,720p,720p-wide") == (
+        "832x480",
+        "1248x704",
+        "1280x704",
+    )
+
+
+def test_resolution_bucket_alias_duplicates_are_rejected():
+    with pytest.raises(ValueError, match="duplicate canonical resolutions"):
+        normalize_minwm_resolution_buckets("720p,1248x704")
 
 
 def test_auto_profile_rejects_unvalidated_sm120_memory_size():
@@ -100,6 +116,47 @@ def test_32g_contract_offloads_only_text_encoder():
     assert contract["environment"]["MINWM_ATTENTION_IMPL"] == "packed"
     assert contract["environment"]["MINWM_PACKED_ATTENTION_DETERMINISTIC"] == "false"
     assert contract["environment"]["SGLANG_MINWM_REQUIRE_SM120_FA4"] == "1"
+    assert contract["realtime_kv_cache_pool_buckets"] == ["832x480"]
+    assert command[command.index("--realtime-causal-kv-cache-pool-size") + 1] == "1"
+    assert command[command.index("--realtime-max-sessions") + 1] == "1"
+    assert command[command.index("--realtime-max-sessions-per-worker") + 1] == "1"
+    assert (
+        command[command.index("--realtime-causal-kv-cache-pool-buckets") + 1]
+        == "832x480"
+    )
+    assert "1248x704" not in command
+    assert "1280x704" not in command
+
+
+@pytest.mark.parametrize(
+    "gpu",
+    [
+        GPUInfo("NVIDIA H100", (9, 0), 81559),
+        GPUInfo("NVIDIA H200", (9, 0), 143771),
+        GPUInfo("NVIDIA B200", (10, 0), 183359),
+        GPUInfo("NVIDIA B300", (10, 3), 281000),
+        GPUInfo("RTX PRO 6000 Blackwell Server Edition", (12, 0), 97887),
+    ],
+)
+def test_high_memory_profiles_enable_both_exact_720p_resolutions(gpu):
+    contract = build_launch_contract(
+        requested_profile="auto",
+        gpu=gpu,
+        taehv_path=Path("/models/taehv/taew2_2.pth"),
+        server_args=["--model-path", "/models/minwm"],
+        validate_artifacts=False,
+    )
+
+    assert contract["realtime_kv_cache_pool_buckets"] == [
+        "832x480",
+        "1248x704",
+        "1280x704",
+    ]
+    command = contract["command"]
+    assert (
+        command[command.index("--realtime-causal-kv-cache-pool-buckets") + 1]
+        == "832x480,1248x704,1280x704"
+    )
 
 
 def test_profile_allows_parallelism_overrides_for_sp2():
@@ -145,6 +202,24 @@ def test_profile_rejects_managed_override():
                 "--dit-layerwise-offload",
                 "true",
             ],
+            validate_artifacts=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "--realtime-causal-kv-cache-pool-size",
+        "--realtime-causal-kv-cache-pool-buckets",
+    ],
+)
+def test_profile_rejects_kv_pool_override(option):
+    with pytest.raises(ValueError, match="cannot be overridden"):
+        build_launch_contract(
+            requested_profile="auto",
+            gpu=GPUInfo("GeForce RTX 5090", (12, 0), 32768),
+            taehv_path=Path("/models/taehv/taew2_2.pth"),
+            server_args=["--model-path", "/models/minwm", option, "480p"],
             validate_artifacts=False,
         )
 

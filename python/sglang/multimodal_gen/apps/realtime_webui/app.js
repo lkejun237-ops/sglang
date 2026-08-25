@@ -1103,6 +1103,14 @@ function createH264ModelSession(key) {
     },
     onError: (error, details = {}) => {
       const message = details.message || error?.message || String(error || "unknown");
+      markClientTrace("client.h264_session_error", {
+        model_key: key,
+        phase: details.phase || error?.h264Phase || "unknown",
+        close_code: details.code ?? error?.h264CloseCode ?? 0,
+        close_reason: details.reason || error?.h264CloseReason || "",
+        recoverable: details.recoverable === true,
+        message,
+      });
       addHistory(`${modelLabel(key)} H.264 session failed · ${message}`);
       if (details.phase === "startup" || error?.h264Phase === "startup") return;
       scheduleH264RuntimeReconnect(key, message);

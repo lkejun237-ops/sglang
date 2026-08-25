@@ -665,6 +665,16 @@ def create_app(
     async def models():
         return {"object": "list", "data": [{"id": model_revision}]}
 
+    @app.get("/backends/minwm/v1/slots")
+    @app.get("/v1/slots")
+    async def slots():
+        try:
+            return _slot_capacity_summary(await coordinator.capacity())
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503, detail="coordinator capacity unavailable"
+            ) from exc
+
     @app.get("/backends/lingbot2/v1/models")
     async def lingbot2_models():
         return {"object": "list", "data": [{"id": lingbot2_model_revision}]}

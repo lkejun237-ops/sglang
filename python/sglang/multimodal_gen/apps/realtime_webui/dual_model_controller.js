@@ -209,12 +209,13 @@
         ? Number(this.reconnectCounts.get(key) || 0) + 1
         : 0;
       this.reconnectCounts.set(key, reconnectCount);
+      const traceSuffix = `${key}${reconnectCount ? `:retry${reconnectCount}` : ""}`;
       let init = {
         ...baseInit,
         model,
-        trace_id: key === "minwm"
+        trace_id: key === "minwm" && reconnectCount === 0
           ? traceBase
-          : `${traceBase}:${key}${reconnectCount ? `:retry${reconnectCount}` : ""}`,
+          : `${traceBase}:${traceSuffix}`,
       };
       if (typeof backend.transformInit === "function") {
         init = backend.transformInit(init, key);

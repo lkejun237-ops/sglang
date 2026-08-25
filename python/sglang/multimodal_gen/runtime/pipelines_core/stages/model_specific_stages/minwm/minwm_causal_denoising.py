@@ -5,12 +5,17 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.configs.minwm_resolution_buckets import (
+    MINWM_RESOLUTION_BUCKETS,
+    normalize_minwm_resolution_buckets,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.minwm import (
     MINWM_ACTION_LABELS_CONDITION,
     MINWM_ACTION_WEIGHTS_CONDITION,
@@ -60,7 +65,14 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.realtime.causal_kv_cache_pool import (
+    RealtimeKVCachePool,
+    RealtimeKVCachePoolLease,
+    RealtimeKVCachePoolSlot,
+    allocated_cache_bytes,
+)
 from sglang.multimodal_gen.runtime.realtime.states import (
+    RealtimeCausalDiTState,
     get_realtime_causal_dit_state,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -78,7 +90,6 @@ MINWM_T2V_FIRST_LATENT_CACHE = "minwm_t2v_first_latent"
 MINWM_ACTION_RESIDUAL_PREPARE_NVTX_RANGE = (
     "minwm_action_residual_prepare_once_per_chunk"
 )
-
 logger = init_logger(__name__)
 
 
@@ -417,6 +428,288 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         super().__init__(transformer, scheduler)
         self._minwm_cuda_graph_enabled = False
         self._minwm_cuda_graph_runner: _MinWMCudaGraphRunner | None = None
+        self._realtime_kv_cache_pool: RealtimeKVCachePool | None = None
+        self._realtime_kv_cache_pool_policies: dict[str, CausalDMDCachePolicy] = {}
+        self._realtime_kv_cache_pool_shapes: dict[str, tuple[int, int, int]] = {}
+        self._realtime_kv_cache_pool_bucket_by_shape: dict[
+            tuple[int, int, int], str
+        ] = {}
+        self._realtime_kv_cache_pool_dtype: torch.dtype | None = None
+
+    @property
+    def realtime_kv_cache_pool_enabled(self) -> bool:
+        return self._realtime_kv_cache_pool is not None
+
+    def _resolve_realtime_kv_cache_pool_config(
+        self, server_args: ServerArgs
+    ) -> tuple[int, tuple[str, ...]] | None:
+        """Validate the optional launch contract and return pool size and buckets."""
+        pipeline_config = server_args.pipeline_config
+        configured_pool_size = getattr(
+            pipeline_config, "realtime_causal_kv_cache_pool_size", None
+        )
+        configured_buckets = getattr(
+            pipeline_config, "realtime_causal_kv_cache_pool_buckets", None
+        )
+        if configured_pool_size is None:
+            if configured_buckets is not None:
+                raise ValueError(
+                    "realtime_causal_kv_cache_pool_buckets requires "
+                    "realtime_causal_kv_cache_pool_size"
+                )
+            return
+        if configured_buckets is None:
+            raise ValueError(
+                "MinWM realtime KV cache pool requires symbolic resolution "
+                "buckets selected by the launch profile"
+            )
+        bucket_names = normalize_minwm_resolution_buckets(str(configured_buckets))
+        pool_size = int(configured_pool_size)
+        if pool_size <= 0:
+            raise ValueError(
+                "realtime_causal_kv_cache_pool_size must be positive when set"
+            )
+        admitted_sessions = int(server_args.realtime_max_sessions_per_worker)
+        if pool_size < admitted_sessions:
+            raise ValueError(
+                "MinWM realtime KV cache pool must cover every admitted worker "
+                f"session: pool_size={pool_size} "
+                f"realtime_max_sessions_per_worker={admitted_sessions}"
+            )
+        return pool_size, bucket_names
+
+    def _configure_startup_pool_cache_contract(self, server_args: ServerArgs) -> None:
+        """Apply the bounded window/sink contract shared by every startup bucket."""
+        pipeline_config = server_args.pipeline_config
+        configured_window = getattr(
+            pipeline_config, "realtime_causal_kv_cache_num_frames", None
+        )
+        if configured_window is None and int(self.local_attn_size) == -1:
+            raise ValueError(
+                "MinWM realtime KV cache pool requires a bounded cache window. "
+                "Set realtime_causal_kv_cache_num_frames."
+            )
+
+        self._reset_causal_cache_config_defaults()
+        if configured_window is not None:
+            if int(configured_window) <= 0:
+                raise ValueError("realtime_causal_kv_cache_num_frames must be positive")
+            self.sliding_window_num_frames = int(configured_window)
+        configured_sink = getattr(pipeline_config, "realtime_causal_sink_size", None)
+        if configured_sink is not None:
+            if int(configured_sink) < 0:
+                raise ValueError("realtime_causal_sink_size must be non-negative")
+            self.sink_size = int(configured_sink)
+
+        self._minwm_unbounded_cache = False
+        self._minwm_cuda_graph_enabled = bool(
+            getattr(server_args, "enable_cuda_graph", False)
+        )
+
+    def _build_startup_pool_bucket_policies(
+        self,
+        server_args: ServerArgs,
+        bucket_names: tuple[str, ...],
+        *,
+        sequence_shard_enabled: bool,
+    ) -> tuple[
+        dict[str, CausalDMDCachePolicy],
+        dict[str, tuple[int, int, int]],
+        list[dict[str, Any]],
+    ]:
+        """Build and validate the logical cache policy for each exact resolution."""
+        pipeline_config = server_args.pipeline_config
+        spatial_factor = int(
+            pipeline_config.vae_config.arch_config.scale_factor_spatial
+        )
+        patch_height = int(self.transformer.config.arch_config.patch_size[-2])
+        patch_width = int(self.transformer.config.arch_config.patch_size[-1])
+        bucket_policies: dict[str, CausalDMDCachePolicy] = {}
+        bucket_shapes: dict[str, tuple[int, int, int]] = {}
+        bucket_log_details: list[dict[str, Any]] = []
+        for bucket_name in bucket_names:
+            output_width, output_height = MINWM_RESOLUTION_BUCKETS[bucket_name]
+            if output_height % spatial_factor or output_width % spatial_factor:
+                raise ValueError(
+                    "MinWM realtime KV cache pool resolution must be divisible by "
+                    f"VAE spatial factor {spatial_factor}: bucket={bucket_name} "
+                    f"height={output_height} width={output_width}"
+                )
+            latent_height = output_height // spatial_factor
+            latent_width = output_width // spatial_factor
+            if latent_height % patch_height or latent_width % patch_width:
+                raise ValueError(
+                    "MinWM realtime KV cache pool latent resolution must be "
+                    f"divisible by DiT patch size {patch_height}x{patch_width}: "
+                    f"bucket={bucket_name} latent_height={latent_height} "
+                    f"latent_width={latent_width}"
+                )
+
+            self._prepare_frame_seq_length(latent_height, latent_width)
+            policy = CausalDMDCachePolicy(
+                sequence_shard_enabled=sequence_shard_enabled,
+                num_attention_heads=self._num_causal_cache_attention_heads(
+                    sequence_shard_enabled=sequence_shard_enabled
+                ),
+                expected_cache_tokens=self._get_causal_kv_cache_size(
+                    sequence_shard_enabled=sequence_shard_enabled
+                ),
+                expected_sink_tokens=self._get_causal_sink_tokens(),
+                kv_cache_kwargs={},
+            )
+            policy.kv_cache_kwargs = self._causal_kv_cache_kwargs(policy)
+            shape = (1, latent_height, latent_width)
+            bucket_policies[bucket_name] = policy
+            bucket_shapes[bucket_name] = shape
+            bucket_log_details.append(
+                {
+                    "cache_tokens": policy.expected_cache_tokens,
+                    "latent_height": latent_height,
+                    "latent_width": latent_width,
+                    "name": bucket_name,
+                    "output_height": output_height,
+                    "output_width": output_width,
+                    "sink_tokens": policy.expected_sink_tokens,
+                }
+            )
+        return bucket_policies, bucket_shapes, bucket_log_details
+
+    def _allocate_startup_pool_slots(
+        self,
+        server_args: ServerArgs,
+        *,
+        pool_size: int,
+        max_policy: CausalDMDCachePolicy,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[list[RealtimeKVCachePoolSlot], int]:
+        """Allocate all physical slot tensors using the largest bucket policy."""
+        slots: list[RealtimeKVCachePoolSlot] = []
+        rotated_k_buffers = 0
+        for slot_id in range(pool_size):
+            kv_cache, crossattn_cache = self._initialize_causal_caches(
+                batch_size=1,
+                max_text_len=self._get_max_text_len(server_args),
+                dtype=dtype,
+                device=device,
+                kv_cache_kwargs=max_policy.kv_cache_kwargs,
+            )
+            for layer, cache_block in enumerate(kv_cache):
+                if not isinstance(cache_block, MinWMCausalSelfAttentionKVCache):
+                    raise TypeError(
+                        "MinWM startup KV cache pool created an unexpected cache "
+                        f"type at slot {slot_id}, layer {layer}: "
+                        f"{type(cache_block).__name__}"
+                    )
+                cache_block.rotated_k = torch.empty_like(cache_block.k)
+                rotated_k_buffers += 1
+            slots.append(
+                RealtimeKVCachePoolSlot(
+                    slot_id=slot_id,
+                    kv_cache=kv_cache,
+                    crossattn_cache=crossattn_cache,
+                )
+            )
+            self._clear_stage_causal_cache_refs()
+        return slots, rotated_k_buffers
+
+    def _log_startup_pool_ready(
+        self,
+        *,
+        initialization_started_at: float,
+        pool_size: int,
+        slots: list[RealtimeKVCachePoolSlot],
+        bucket_log_details: list[dict[str, Any]],
+        max_bucket_name: str,
+        max_policy: CausalDMDCachePolicy,
+        rotated_k_buffers: int,
+        sequence_shard_enabled: bool,
+    ) -> None:
+        """Emit the per-rank readiness record after every allocation is complete."""
+        max_output_width, max_output_height = MINWM_RESOLUTION_BUCKETS[max_bucket_name]
+        logger.info(
+            "MINWM_KV_CACHE_POOL_READY_JSON %s",
+            json.dumps(
+                {
+                    "allocated_bytes": allocated_cache_bytes(slots),
+                    "buckets": bucket_log_details,
+                    "cache_tokens": max_policy.expected_cache_tokens,
+                    "initialization_ms": round(
+                        (time.perf_counter() - initialization_started_at) * 1000,
+                        3,
+                    ),
+                    "max_bucket": max_bucket_name,
+                    "num_attention_heads_per_rank": max_policy.num_attention_heads,
+                    "output_height": max_output_height,
+                    "output_width": max_output_width,
+                    "rank": get_sp_parallel_rank(),
+                    "rotated_k_buffers": rotated_k_buffers,
+                    "rotated_k_preallocated": rotated_k_buffers
+                    == pool_size * self.num_transformer_blocks,
+                    "sequence_shard_enabled": sequence_shard_enabled,
+                    "sink_frames": self.sink_size,
+                    "slots": pool_size,
+                    "window_frames": self.sliding_window_num_frames,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
+    def initialize_realtime_kv_cache_pool(self, server_args: ServerArgs) -> None:
+        """Allocate every bounded realtime self-attention KV slot before readiness."""
+        pool_config = self._resolve_realtime_kv_cache_pool_config(server_args)
+        if pool_config is None:
+            return
+
+        initialization_started_at = time.perf_counter()
+        pool_size, bucket_names = pool_config
+        self._configure_startup_pool_cache_contract(server_args)
+        sequence_shard_enabled = get_ulysses_parallel_world_size() > 1
+        bucket_policies, bucket_shapes, bucket_log_details = (
+            self._build_startup_pool_bucket_policies(
+                server_args,
+                bucket_names,
+                sequence_shard_enabled=sequence_shard_enabled,
+            )
+        )
+        max_bucket_name = max(
+            bucket_names,
+            key=lambda name: bucket_policies[name].expected_cache_tokens,
+        )
+        max_policy = bucket_policies[max_bucket_name]
+        _, max_latent_height, max_latent_width = bucket_shapes[max_bucket_name]
+        self._prepare_frame_seq_length(max_latent_height, max_latent_width)
+
+        device = torch.device(get_local_torch_device())
+        dtype = self._target_dtype()
+        slots, rotated_k_buffers = self._allocate_startup_pool_slots(
+            server_args,
+            pool_size=pool_size,
+            max_policy=max_policy,
+            device=device,
+            dtype=dtype,
+        )
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        self._realtime_kv_cache_pool = RealtimeKVCachePool(slots)
+        self._realtime_kv_cache_pool_policies = bucket_policies
+        self._realtime_kv_cache_pool_shapes = bucket_shapes
+        self._realtime_kv_cache_pool_bucket_by_shape = {
+            shape: bucket_name for bucket_name, shape in bucket_shapes.items()
+        }
+        self._realtime_kv_cache_pool_dtype = dtype
+        self._log_startup_pool_ready(
+            initialization_started_at=initialization_started_at,
+            pool_size=pool_size,
+            slots=slots,
+            bucket_log_details=bucket_log_details,
+            max_bucket_name=max_bucket_name,
+            max_policy=max_policy,
+            rotated_k_buffers=rotated_k_buffers,
+            sequence_shard_enabled=sequence_shard_enabled,
+        )
 
     def _causal_sequence_shard_enabled(self, batch: Req) -> bool:
         return bool(
@@ -912,12 +1205,12 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             for tensor_name in ("k", "v"):
                 tensor = getattr(cache, tensor_name)
                 actual_capacity = int(tensor.shape[1])
-                if actual_capacity != expected_cache_tokens:
+                if actual_capacity < expected_cache_tokens:
                     violations.append(
                         {
                             "layer": layer,
                             "field": f"{tensor_name}_capacity_tokens",
-                            "expected": int(expected_cache_tokens),
+                            "expected": f">={expected_cache_tokens}",
                             "actual": actual_capacity,
                         }
                     )
@@ -994,13 +1287,192 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             )
         self._runtime_alignment_logged = True
 
+    @staticmethod
+    def _configure_startup_pool_cache_for_policy(
+        kv_cache: list[MinWMCausalSelfAttentionKVCache],
+        policy: CausalDMDCachePolicy,
+    ) -> None:
+        """Apply one bucket's logical bounds to a max-sized physical slot."""
+
+        if policy.kv_cache_kwargs.get("allow_growth", False):
+            raise ValueError("MinWM startup KV cache pool does not support growth")
+        for layer, cache_block in enumerate(kv_cache):
+            k_capacity = int(cache_block.k.shape[1])
+            v_capacity = int(cache_block.v.shape[1])
+            if (
+                k_capacity < policy.expected_cache_tokens
+                or v_capacity < policy.expected_cache_tokens
+            ):
+                raise RuntimeError(
+                    "MinWM startup KV cache pool slot is smaller than the selected "
+                    f"resolution bucket at layer {layer}: "
+                    f"required={policy.expected_cache_tokens} "
+                    f"k_capacity={k_capacity} v_capacity={v_capacity}"
+                )
+            cache_block.cache_size = policy.expected_cache_tokens
+            cache_block.attention_window_size = policy.expected_cache_tokens
+            cache_block.sink_tokens = policy.expected_sink_tokens
+            cache_block.allow_growth = False
+
+    def _validate_startup_pool_request_policy(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        ctx: CausalDMDForwardContext,
+    ) -> tuple[str, CausalDMDCachePolicy]:
+        """Resolve the exact bucket and reject any startup-contract mismatch."""
+        actual_shape = (ctx.batch_size, ctx.height, ctx.width)
+        bucket_name = self._realtime_kv_cache_pool_bucket_by_shape.get(actual_shape)
+        if bucket_name is None:
+            supported = [
+                {
+                    "bucket": name,
+                    "latent_shape": self._realtime_kv_cache_pool_shapes[name],
+                    "output_height": MINWM_RESOLUTION_BUCKETS[name][1],
+                    "output_width": MINWM_RESOLUTION_BUCKETS[name][0],
+                }
+                for name in self._realtime_kv_cache_pool_policies
+            ]
+            raise ValueError(
+                "MinWM request resolution is not enabled by the launch profile; "
+                f"actual_latent_shape={actual_shape} supported={supported}"
+            )
+
+        pool_policy = self._realtime_kv_cache_pool_policies[bucket_name]
+        policy = self._build_realtime_causal_cache_policy(batch, server_args)
+        mismatch_fields = []
+        if ctx.target_dtype != self._realtime_kv_cache_pool_dtype:
+            mismatch_fields.append(
+                "dtype expected="
+                f"{self._realtime_kv_cache_pool_dtype} actual={ctx.target_dtype}"
+            )
+        for field_name in (
+            "sequence_shard_enabled",
+            "num_attention_heads",
+            "expected_cache_tokens",
+            "expected_sink_tokens",
+            "kv_cache_kwargs",
+        ):
+            expected = getattr(pool_policy, field_name)
+            actual = getattr(policy, field_name)
+            if actual != expected:
+                mismatch_fields.append(
+                    f"{field_name} expected={expected!r} actual={actual!r}"
+                )
+        if mismatch_fields:
+            raise ValueError(
+                "MinWM request does not match the startup KV cache pool; "
+                "per-request allocation is disabled for pooled realtime "
+                "sessions: " + "; ".join(mismatch_fields)
+            )
+        return bucket_name, policy
+
+    def _get_or_acquire_startup_pool_lease(
+        self,
+        pool: RealtimeKVCachePool,
+        cache_state: RealtimeCausalDiTState,
+        *,
+        bucket_name: str,
+        policy: CausalDMDCachePolicy,
+    ) -> tuple[RealtimeKVCachePoolLease, bool]:
+        """Bind one slot to the session or validate its existing lease."""
+        lease = cache_state.kv_cache_pool_lease
+        acquired = lease is None
+        if acquired:
+            with maybe_nvtx_range(
+                "minwm_realtime_kv_cache_pool_acquire",
+                bool(getattr(self, "_current_use_nvtx", False)),
+            ):
+                lease = pool.acquire(bucket_key=bucket_name)
+            try:
+                self._configure_startup_pool_cache_for_policy(lease.kv_cache, policy)
+            except Exception:
+                lease.release()
+                raise
+            cache_state.kv_cache_pool_lease = lease
+            cache_state.kv_cache = lease.kv_cache
+            cache_state.crossattn_cache = lease.crossattn_cache
+        elif lease.bucket_key != bucket_name:
+            raise ValueError(
+                "MinWM resolution cannot change within a realtime session: "
+                f"initial_bucket={lease.bucket_key} requested_bucket={bucket_name}"
+            )
+
+        if (
+            cache_state.kv_cache is not lease.kv_cache
+            or cache_state.crossattn_cache is not lease.crossattn_cache
+        ):
+            raise RuntimeError(
+                "MinWM realtime session cache references do not match its "
+                "startup pool lease"
+            )
+        return lease, acquired
+
+    def _reset_startup_pool_session_cache(
+        self,
+        cache_state: RealtimeCausalDiTState,
+        lease: RealtimeKVCachePoolLease,
+    ) -> None:
+        """Reset logical cursors while preserving the slot's resident tensors."""
+        with maybe_nvtx_range(
+            "minwm_realtime_kv_cache_pool_reset",
+            bool(getattr(self, "_current_use_nvtx", False)),
+        ):
+            # Cursor reset makes stale K/V unreachable. The large backing
+            # tensors stay resident and are intentionally not zero-filled.
+            self._reset_causal_caches(
+                kv_cache=lease.kv_cache,
+                crossattn_cache=lease.crossattn_cache,
+            )
+        cache_state.current_chunk_start_frame = 0
+        cache_state.chunk_idx = 0
+
+    def _prepare_realtime_causal_caches_from_startup_pool(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        ctx: CausalDMDForwardContext,
+    ) -> CausalDMDRealtimeCacheContext:
+        pool = self._realtime_kv_cache_pool
+        if pool is None:
+            raise RuntimeError("MinWM realtime KV cache pool is not initialized")
+
+        bucket_name, policy = self._validate_startup_pool_request_policy(
+            batch, server_args, ctx
+        )
+        cache_state, persist_state = self._get_realtime_causal_cache_state(batch)
+        lease, acquired = self._get_or_acquire_startup_pool_lease(
+            pool,
+            cache_state,
+            bucket_name=bucket_name,
+            policy=policy,
+        )
+        if acquired or batch.block_idx == 0:
+            self._reset_startup_pool_session_cache(cache_state, lease)
+
+        return CausalDMDRealtimeCacheContext(
+            cache_state=cache_state,
+            persist_state=persist_state,
+            kv_cache=lease.kv_cache,
+            crossattn_cache=lease.crossattn_cache,
+            current_start_frame=cache_state.current_chunk_start_frame,
+            chunk_idx=cache_state.chunk_idx,
+        )
+
     def _prepare_realtime_causal_caches(
         self,
         batch: Req,
         server_args: ServerArgs,
         ctx: CausalDMDForwardContext,
     ) -> CausalDMDRealtimeCacheContext:
-        cache_ctx = super()._prepare_realtime_causal_caches(batch, server_args, ctx)
+        if self._realtime_kv_cache_pool is None or batch.session is None:
+            cache_ctx = super()._prepare_realtime_causal_caches(batch, server_args, ctx)
+        else:
+            cache_ctx = self._prepare_realtime_causal_caches_from_startup_pool(
+                batch,
+                server_args,
+                ctx,
+            )
         if batch.block_idx == 0:
             self._log_runtime_alignment_once(batch, cache_ctx)
         if (batch.condition_inputs or {}).get(MINWM_PROMPT_UPDATED_CONDITION):

@@ -784,6 +784,50 @@ def test_render_makes_candidate_names_and_result_prefixes_unique() -> None:
     )
 
 
+def test_render_h100_rope_ab_capture_runs_after_formal_segment() -> None:
+    configmap, job = render(
+        "h100",
+        "baseline",
+        sglang_git_ref=SGLANG_GIT_REF,
+        harness_git_ref=HARNESS_GIT_REF,
+        rope_ab_label="candidate",
+        run_tag="20260824-rope-candidate",
+    )
+    environment = _env(job["spec"]["template"]["spec"]["containers"][0])
+    assert environment["MINWM_ROPE_AB_LABEL"] == "candidate"
+    assert len(environment["MINWM_ROPE_AB_CLIENT_SHA256"]) == 64
+    assert len(environment["MINWM_ROPE_AB_CASES_SHA256"]) == 64
+    assert job["metadata"]["annotations"]["seedleap.ai/rope-ab-label"] == "candidate"
+    assert {"run_sglang_api.py", "cases_rope_ab_3res.json"} < set(configmap["data"])
+    cases = json.loads(configmap["data"]["cases_rope_ab_3res.json"])
+    assert cases["contract"]["case_count"] == 3
+    resolutions = {
+        (
+            case.get("contract", cases["contract"])["width"],
+            case.get("contract", cases["contract"])["height"],
+        )
+        for case in cases["cases"]
+    }
+    assert resolutions == {(832, 480), (1248, 704), (1280, 704)}
+    runner = configmap["data"]["run_single_gpu_taehv_24fps.sh"]
+    formal = 'assert_profile_result "${baseline_dir}/throughput.json" 20 200'
+    capture = 'python3 "${QUALITY_CLIENT}" \\'
+    assert runner.index(formal) < runner.index(capture, runner.index(formal))
+    assert 'np.load(frames_path, mmap_mode="r").shape' in runner
+
+
+def test_render_rejects_rope_ab_capture_outside_baseline_mode() -> None:
+    with pytest.raises(ValueError, match="baseline"):
+        render(
+            "h100",
+            "nsys",
+            sglang_git_ref=SGLANG_GIT_REF,
+            harness_git_ref=HARNESS_GIT_REF,
+            rope_ab_label="candidate",
+            run_tag="20260824-rope-invalid",
+        )
+
+
 @pytest.mark.parametrize(
     "extra_args",
     (

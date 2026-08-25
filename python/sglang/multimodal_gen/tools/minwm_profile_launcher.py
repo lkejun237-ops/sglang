@@ -10,6 +10,13 @@ import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from sglang.multimodal_gen.configs.minwm_resolution_buckets import (
+    MINWM_RESOLUTION_480P,
+    MINWM_RESOLUTION_720P,
+    MINWM_RESOLUTION_720P_WIDE,
+    normalize_minwm_resolution_buckets,
+)
+
 TAEHV_SHA256 = "d053e216ca50e2bb837bbcd79b85f0366bea00e5938025572382a773b74c559a"
 PROFILE_AUTO = "auto"
 PROFILE_SM120_32G_SPEED = "sm120-32g-speed"
@@ -48,6 +55,8 @@ COMMON_SERVER_ARGS = (
     ("--enable-torch-compile", "false"),
     ("--enable-cuda-graph", "false"),
     ("--warmup-mode", "off"),
+    ("--realtime-max-sessions", "1"),
+    ("--realtime-max-sessions-per-worker", "1"),
     ("--realtime-causal-sink-size", "8"),
     ("--realtime-causal-kv-cache-num-frames", "32"),
 )
@@ -70,18 +79,32 @@ PROFILE_SERVER_ARGS = {
         ("--dit-cpu-offload", "false"),
         ("--dit-layerwise-offload", "false"),
         ("--pin-cpu-memory", "true"),
+        ("--realtime-causal-kv-cache-pool-size", "1"),
+        ("--realtime-causal-kv-cache-pool-buckets", MINWM_RESOLUTION_480P),
     ),
     PROFILE_SM120_HIGHMEM_SPEED: (
         ("--text-encoder-cpu-offload", "false"),
         ("--vae-cpu-offload", "false"),
         ("--dit-cpu-offload", "false"),
         ("--dit-layerwise-offload", "false"),
+        ("--realtime-causal-kv-cache-pool-size", "1"),
+        (
+            "--realtime-causal-kv-cache-pool-buckets",
+            f"{MINWM_RESOLUTION_480P},{MINWM_RESOLUTION_720P},"
+            f"{MINWM_RESOLUTION_720P_WIDE}",
+        ),
     ),
     PROFILE_RESIDENT_SPEED: (
         ("--text-encoder-cpu-offload", "false"),
         ("--vae-cpu-offload", "false"),
         ("--dit-cpu-offload", "false"),
         ("--dit-layerwise-offload", "false"),
+        ("--realtime-causal-kv-cache-pool-size", "1"),
+        (
+            "--realtime-causal-kv-cache-pool-buckets",
+            f"{MINWM_RESOLUTION_480P},{MINWM_RESOLUTION_720P},"
+            f"{MINWM_RESOLUTION_720P_WIDE}",
+        ),
     ),
 }
 
@@ -277,12 +300,20 @@ def build_launch_contract(
     for option, value in PROFILE_SERVER_ARGS[resolved_profile]:
         command.extend((option, value))
     command.extend(server_args)
+    bucket_value = _option_value(command, "--realtime-causal-kv-cache-pool-buckets")
+    if bucket_value is None:
+        raise RuntimeError(
+            f"MinWM profile {resolved_profile} did not select KV cache buckets"
+        )
     return {
         "schema_version": "minwm-hardware-profile/v1",
         "requested_profile": requested_profile,
         "resolved_profile": resolved_profile,
         "gpu": asdict(gpu),
         "environment": dict(COMMON_ENV),
+        "realtime_kv_cache_pool_buckets": list(
+            normalize_minwm_resolution_buckets(bucket_value)
+        ),
         "command": command,
     }
 
@@ -291,7 +322,9 @@ def _detect_gpu() -> GPUInfo:
     import torch
 
     if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
-        raise ValueError("MinWM hardware profiles require at least one visible CUDA GPU")
+        raise ValueError(
+            "MinWM hardware profiles require at least one visible CUDA GPU"
+        )
     device_count = torch.cuda.device_count()
     capabilities = {
         tuple(torch.cuda.get_device_capability(index)) for index in range(device_count)

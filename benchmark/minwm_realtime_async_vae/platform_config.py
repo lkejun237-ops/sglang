@@ -823,7 +823,10 @@ def _denoiser(*, lingbot2: bool) -> dict[str, Any]:
             "--realtime-max-sessions-per-worker 1 --realtime-remote-vae-enabled "
             "--realtime-session-idle-timeout-s 60 --realtime-session-max-lifetime-s 90 "
             "--realtime-admission-wait-s 10 --realtime-causal-sink-size 8 "
-            "--realtime-causal-kv-cache-num-frames 32 --enable-trace "
+            "--realtime-causal-kv-cache-num-frames 32 "
+            "--realtime-causal-kv-cache-pool-size 1 "
+            "--realtime-causal-kv-cache-pool-buckets "
+            "832x480,1248x704,1280x704 --enable-trace "
             "--otlp-traces-endpoint ${OTEL_EXPORTER_OTLP_ENDPOINT} --host 0.0.0.0 --port 30000"
         )
         resources = {

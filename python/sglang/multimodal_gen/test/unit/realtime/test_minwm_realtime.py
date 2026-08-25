@@ -56,6 +56,7 @@ from sglang.multimodal_gen.runtime.models.dits.minwm import (
     _minwm_uniform_cu_seqlens,
     _minwm_uniform_frame_indices,
     apply_minwm_rotary_embedding,
+    apply_minwm_rotary_embedding_out,
 )
 from sglang.multimodal_gen.runtime.models.dits.minwm_action import (
     PrimitiveRoPETokenResidualActionEncoder,
@@ -808,6 +809,23 @@ def test_minwm_action_history_chunk_matches_full_sequence():
     assert token_residual.stride(-1) == 1
 
 
+@pytest.mark.parametrize(
+    "encoder_cls",
+    [PrimitiveTokenResidualActionEncoder, PrimitiveRoPETokenResidualActionEncoder],
+)
+def test_minwm_action_encoders_do_not_validate_device_weights(encoder_cls):
+    encoder = encoder_cls(dim=24, embed_dim=8, hidden_dim=16, kernel_size=3)
+    invalid_weights = torch.full((1, 4, 1, 8), 2.0)
+
+    residual = encoder.token_residual(
+        invalid_weights,
+        num_current_frames=4,
+        tokens_per_frame=6,
+        dtype=torch.float32,
+    )
+    assert residual.shape == (1, 24, 24)
+
+
 def test_minwm_legacy_action_condition_recomputes_for_all_five_forwards(monkeypatch):
     torch.manual_seed(19)
     model = MinWMCausalTransformer3DModel.__new__(MinWMCausalTransformer3DModel)
@@ -1459,6 +1477,64 @@ def test_minwm_cuda_graph_accepts_bounded_block_relative_cache():
     assert kwargs["rope_position_mode"] == "block_relative"
 
 
+def test_minwm_cuda_graph_key_separates_both_720p_shapes():
+    class FakeCudaTensor:
+        is_cuda = True
+        dtype = torch.bfloat16
+        device = torch.device("cuda")
+
+        def __init__(self, shape):
+            self.shape = shape
+
+        def stride(self):
+            stride = 1
+            strides = []
+            for dimension in reversed(self.shape):
+                strides.append(stride)
+                stride *= dimension
+            return tuple(reversed(strides))
+
+    stage = MinWMCausalDMDDenoisingStage.__new__(MinWMCausalDMDDenoisingStage)
+    stage._minwm_cuda_graph_enabled = True
+    cache = _make_minwm_test_cache(
+        cache_size=6,
+        rope_position_mode="block_relative",
+    )
+    _append_minwm_test_frames(cache, range(6), token_start=0)
+    cache.rotated_k = torch.empty_like(cache.k)
+    crossattn_cache = SimpleNamespace(
+        k=torch.zeros(1, 2, 1, 2),
+        v=torch.zeros(1, 2, 1, 2),
+        is_init=True,
+    )
+    common = {
+        "prompt_embeds": torch.zeros(1, 2, 3),
+        "timestep": torch.ones(1),
+        "kv_cache": [cache],
+        "crossattn_cache": [crossattn_cache],
+        "pos_cond_kwargs": {
+            "action": torch.zeros(1, 4, dtype=torch.long),
+            "action_token_residual": torch.zeros(1, 4, 3),
+        },
+        "image_kwargs": {},
+        "current_timestep": 1,
+        "attn_metadata": None,
+    }
+
+    key_1248 = stage._minwm_cuda_graph_key(
+        latent_model_input=FakeCudaTensor((1, 48, 4, 44, 78)),
+        **common,
+    )
+    key_1280 = stage._minwm_cuda_graph_key(
+        latent_model_input=FakeCudaTensor((1, 48, 4, 44, 80)),
+        **common,
+    )
+
+    assert key_1248 is not None
+    assert key_1280 is not None
+    assert key_1248 != key_1280
+
+
 def test_minwm_sequence_shard_forward_bypasses_cuda_graph(monkeypatch):
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minwm import (
         minwm_causal_denoising as denoising_module,
@@ -1468,7 +1544,6 @@ def test_minwm_sequence_shard_forward_bypasses_cuda_graph(monkeypatch):
         def __init__(self):
             self.action_in = SimpleNamespace(
                 prepare_label_table=lambda _device: None,
-                validate_runtime_action=True,
             )
             self.calls = []
 
@@ -2129,6 +2204,50 @@ def test_minwm_sp_request_enables_sequence_sharding(monkeypatch):
     params._adjust(SimpleNamespace(sp_degree=4))
     assert params.enable_sequence_shard is True
     assert params.adjust_frames is False
+
+
+@pytest.mark.parametrize("width", [1248, 1280])
+def test_minwm_sampling_accepts_both_720p_profile_resolutions(monkeypatch, width):
+    monkeypatch.setattr(
+        MinWMSamplingParams.__mro__[1],
+        "_adjust",
+        lambda _self, _server_args: None,
+    )
+    params = MinWMSamplingParams(width=width, height=704)
+    params._adjust(
+        SimpleNamespace(
+            sp_degree=1,
+            pipeline_config=SimpleNamespace(
+                realtime_causal_kv_cache_pool_buckets=("832x480,1248x704,1280x704")
+            ),
+        )
+    )
+
+    assert params.supported_resolutions == [
+        (832, 480),
+        (1248, 704),
+        (1280, 704),
+    ]
+
+
+@pytest.mark.parametrize("width", [1248, 1280])
+def test_minwm_5090_profile_rejects_720p_before_pipeline_work(monkeypatch, width):
+    monkeypatch.setattr(
+        MinWMSamplingParams.__mro__[1],
+        "_adjust",
+        lambda _self, _server_args: None,
+    )
+    params = MinWMSamplingParams(width=width, height=704)
+
+    with pytest.raises(ValueError, match="not enabled by the launch profile"):
+        params._adjust(
+            SimpleNamespace(
+                sp_degree=1,
+                pipeline_config=SimpleNamespace(
+                    realtime_causal_kv_cache_pool_buckets="832x480"
+                ),
+            )
+        )
 
 
 def test_minwm_sequence_shard_frame_indices_support_mid_frame_boundaries(monkeypatch):
@@ -2959,6 +3078,119 @@ def test_minwm_rotary_embedding_matches_main_explicit_formula():
     torch.testing.assert_close(
         apply_minwm_rotary_embedding(hidden, cos, sin), expected, rtol=0, atol=0
     )
+
+
+def test_minwm_rotary_embedding_dispatches_supported_hopper_inputs(monkeypatch):
+    import sglang.multimodal_gen.runtime.models.dits.minwm as minwm_module
+
+    hidden = torch.randn(1, 5, 3, 8, dtype=torch.bfloat16)
+    cos = torch.randn(5, 4)
+    sin = torch.randn(5, 4)
+    sentinel = torch.empty_like(hidden)
+
+    monkeypatch.setattr(minwm_module, "can_use_minwm_rotary", lambda *_: True)
+    monkeypatch.setattr(minwm_module, "minwm_rotary", lambda *_: sentinel)
+
+    assert apply_minwm_rotary_embedding(hidden, cos, sin) is sentinel
+
+
+def test_minwm_rotary_embedding_out_dispatches_supported_hopper_inputs(monkeypatch):
+    import sglang.multimodal_gen.runtime.models.dits.minwm as minwm_module
+
+    hidden = torch.randn(1, 5, 3, 8, dtype=torch.bfloat16)
+    cos = torch.randn(5, 4)
+    sin = torch.randn(5, 4)
+    output = torch.empty_like(hidden)
+
+    monkeypatch.setattr(minwm_module, "can_use_minwm_rotary_out", lambda *_: True)
+    monkeypatch.setattr(minwm_module, "minwm_rotary_out", lambda *args: args[-1])
+
+    assert apply_minwm_rotary_embedding_out(hidden, cos, sin, output) is output
+
+
+def test_minwm_rotary_embedding_out_fallback_writes_caller_tensor():
+    torch.manual_seed(10)
+    hidden = torch.randn(1, 5, 3, 8, dtype=torch.bfloat16)
+    angles = torch.randn(5, 4)
+    cos = angles.cos()
+    sin = angles.sin()
+    output = torch.empty_like(hidden)
+    expected = apply_minwm_rotary_embedding(hidden, cos, sin)
+
+    actual = apply_minwm_rotary_embedding_out(hidden, cos, sin, output)
+
+    assert actual is output
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_minwm_five_passes_rotate_q_five_times_and_full_k_once(monkeypatch):
+    import sglang.multimodal_gen.runtime.models.dits.minwm as minwm_module
+
+    cache = _make_minwm_test_cache(cache_size=6, sink_tokens=0)
+    _append_minwm_test_frames(cache, [0, 1], token_start=0)
+    cache.set_current_position_ids(
+        torch.tensor([[2, 0, 0], [3, 0, 0]], dtype=torch.long)
+    )
+
+    attention = MinWMCausalSelfAttention.__new__(MinWMCausalSelfAttention)
+    torch.nn.Module.__init__(attention)
+    attention.head_start = 0
+
+    class IdentityRotary:
+        @staticmethod
+        def forward_uncached(position_ids):
+            return torch.ones(position_ids.shape[0], 1), torch.zeros(
+                position_ids.shape[0], 1
+            )
+
+    attention._minwm_rotary_emb = IdentityRotary()
+    monkeypatch.setattr(
+        minwm_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(forward_batch=None),
+    )
+    monkeypatch.setattr(minwm_module, "get_ulysses_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(minwm_module, "_MINWM_ATTENTION_IMPL", "packed")
+    monkeypatch.setattr(minwm_module, "_MINWM_CACHE_ROTATED_K", True)
+    monkeypatch.setattr(
+        minwm_module,
+        "_minwm_packed_varlen_attention",
+        lambda query, _key, _value: query,
+    )
+
+    query_lengths = []
+    key_lengths = []
+
+    def record_query(hidden, _cos, _sin):
+        query_lengths.append(hidden.shape[-3])
+        return hidden.clone()
+
+    def record_key(hidden, _cos, _sin, output):
+        key_lengths.append(hidden.shape[-3])
+        output.copy_(hidden)
+        return output
+
+    monkeypatch.setattr(minwm_module, "apply_minwm_rotary_embedding", record_query)
+    monkeypatch.setattr(minwm_module, "apply_minwm_rotary_embedding_out", record_key)
+
+    query = torch.ones(1, 2, 1, 2)
+    key = torch.full_like(query, 2)
+    value = torch.full_like(query, 3)
+    for _ in range(5):
+        output = attention.forward(
+            query,
+            key,
+            value,
+            (torch.empty(0), torch.empty(0)),
+            block_mask=None,
+            kv_cache=cache,
+            current_start=2,
+        )
+        assert output.shape == query.shape
+
+    assert query_lengths == [2, 2, 2, 2, 2]
+    assert key_lengths == [4, 2, 2, 2, 2]
+    assert cache.rotated_k_is_valid
 
 
 def test_minwm_vae_pixel_and_latent_arithmetic_matches_main():

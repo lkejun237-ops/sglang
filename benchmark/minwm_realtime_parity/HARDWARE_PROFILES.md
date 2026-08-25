@@ -80,6 +80,46 @@ The request must set `realtime_causal_kv_cache_num_frames=32` and
 `MINWM_RUNTIME_ALIGNMENT` log rather than assuming the requested values took
 effect.
 
+## Realtime startup KV-cache resolution buckets
+
+Launch profiles own the supported-resolution contract. Requests cannot add a
+bucket or trigger an unplanned allocation after worker readiness.
+
+| Compatibility alias | Canonical bucket / exact output (width x height) | Latent resolution (width x height) | Patch tokens / frame | 32-frame cache tokens |
+| --- | --- | --- | --- | --- |
+| `480p` | `832x480` | `52x30` | 390 | 12,480 |
+| `720p` | `1248x704` | `78x44` | 858 | 27,456 |
+| `720p-wide` | `1280x704` | `80x44` | 880 | 28,160 |
+
+Canonical bucket names are the exact output dimensions: `832x480`,
+`1248x704`, and `1280x704`. The compatibility aliases in the first column are
+accepted at the CLI boundary, but startup logs, leases, and launch contracts use
+the canonical names. Existing `720p` continues to mean `1248x704`; it is not
+silently redefined when the wider variant is enabled.
+
+The image-bundled launcher selects the buckets as follows:
+
+| Launch profile / hardware | Startup buckets | Service behavior |
+| --- | --- | --- |
+| `sm120-32g-speed` / RTX 5090 32 GiB | `832x480` | Initialize and accept 480p only; reject both 720p shapes during request adjustment |
+| `resident-speed` / H100, H200, B200, B300 | `832x480,1248x704,1280x704` | Accept 480p and both exact 720p resolutions |
+| `sm120-highmem-speed` / SM120 >=64 GiB | `832x480,1248x704,1280x704` | Accept 480p and both exact 720p resolutions |
+
+Each pool slot owns one physical self-attention K/V/rotated-K allocation sized
+for the largest enabled bucket. Acquiring a slot applies the selected bucket's
+logical cache and sink bounds; releasing it resets cursors and makes the same
+backing allocation reusable by a later non-overlapping request. Do not allocate
+separate resident 480p and 720p buffers for one slot.
+
+For the current 30-layer, 24-head BF16 cache, increasing the largest bucket
+from `1248x704` to `1280x704` adds 704 cache tokens: approximately 371 MiB per
+SP1 slot or 186 MiB per rank at SP2. This is much smaller than allocating a
+second independent 720p slot.
+
+The current launcher fixes both global and per-worker realtime admission to one
+active session and allocates one slot per rank. Increasing admission requires an
+equal pool-size increase and therefore multiplies the resident cache memory.
+
 ## Hardware profiles
 
 ### `experimental-sm90-h100-no-offload` and `experimental-sm90-h200-no-offload`
@@ -166,6 +206,9 @@ managed arguments by hand. The launcher fixes the following residency policy:
 
 The DiT and TAEHV remain resident to preserve throughput. Promotion requires an
 832x480 same-digest run with client FPS >=24 and peak process memory <30,720 MiB.
+This profile passes
+`--realtime-causal-kv-cache-pool-buckets 832x480`; it intentionally does not
+initialize or serve the 720p bucket.
 
 Validation status:
 
@@ -251,10 +294,14 @@ memory/performance validation.
 For a 32 GiB production candidate:
 
 - physical process peak <= 30,720 MiB;
-- complete 1089 ordered frames at both 832x480 and 1248x704;
-- at least three repetitions per resolution with no OOM;
+- complete 1089 ordered frames at 832x480;
+- at least three repetitions with no OOM;
 - headline FPS CV <= 3%;
 - <= 5% throughput regression against the accepted baseline on the same GPU SKU
   and software environment.
+
+For H100/H200/B200/B300 and high-memory SM120 profiles, run the same stability
+gates at `832x480`, `1248x704`, and `1280x704` because all three buckets are
+exposed.
 
 Fit on a different SKU is evidence for memory feasibility only.
