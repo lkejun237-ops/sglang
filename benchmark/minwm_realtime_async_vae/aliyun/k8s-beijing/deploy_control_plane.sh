@@ -50,6 +50,7 @@ APPLY_GPU_WORKER_TEMPLATES="${APPLY_GPU_WORKER_TEMPLATES:-true}"
 APPLY_RUNTIME_SOURCE_PATCH="${APPLY_RUNTIME_SOURCE_PATCH:-true}"
 APPLY_WEBUI_STATIC_PATCH="${APPLY_WEBUI_STATIC_PATCH:-true}"
 WEBUI_STATIC_PATCH_NAME="${WEBUI_STATIC_PATCH_NAME:-zing-webui-static-patch}"
+WEBUI_ASSET_PATCH_NAME="${WEBUI_ASSET_PATCH_NAME:-zing-webui-preset-assets-patch}"
 WEBUI_STATIC_PATCH_VERSION="${WEBUI_STATIC_PATCH_VERSION:-single-zing-v10-feishu-demo-20260825}"
 WEBUI_STATIC_SOURCE_DIR="${WEBUI_STATIC_SOURCE_DIR:-${REPO_ROOT}/python/sglang/multimodal_gen/apps/realtime_webui}"
 RUNTIME_SOURCE_PATCH_VERSION="${RUNTIME_SOURCE_PATCH_VERSION:-runtime-v2-h264-20260822}"
@@ -452,14 +453,17 @@ apply_webui_static_patch() {
     server.py
     world_creator.py
   )
-  local asset_dir="assets/presets/v1/feishu-internal-demo-20260825"
-  if [[ -d "${WEBUI_STATIC_SOURCE_DIR}/${asset_dir}" ]]; then
+  local asset_root="assets/presets/v1/feishu-internal-demo-20260825"
+  local asset_files=()
+  if [[ -d "${WEBUI_STATIC_SOURCE_DIR}/${asset_root}" ]]; then
     while IFS= read -r asset_file; do
-      files+=("${asset_file}")
-    done < <(cd "${WEBUI_STATIC_SOURCE_DIR}" && find "${asset_dir}" -type f | sort)
+      asset_files+=("${asset_file}")
+    done < <(cd "${WEBUI_STATIC_SOURCE_DIR}" && find "${asset_root}" -type f | sort)
   fi
-  local local_patch_dir
-  local_patch_dir="$(mktemp -d)"
+  local local_static_patch_dir
+  local local_asset_patch_dir
+  local_static_patch_dir="$(mktemp -d)"
+  local_asset_patch_dir="$(mktemp -d)"
   local key
   local file
   for file in "${files[@]}"; do
@@ -468,10 +472,19 @@ apply_webui_static_patch() {
       return 1
     fi
     key="${file//\//__}"
-    cp "${WEBUI_STATIC_SOURCE_DIR}/${file}" "${local_patch_dir}/${key}"
+    cp "${WEBUI_STATIC_SOURCE_DIR}/${file}" "${local_static_patch_dir}/${key}"
   done
-  local mount_files_json
-  mount_files_json="$(python3 - "${files[@]}" <<'PY'
+  local asset_file
+  for asset_file in "${asset_files[@]}"; do
+    if [[ ! -f "${WEBUI_STATIC_SOURCE_DIR}/${asset_file}" ]]; then
+      printf 'missing webui static asset: %s\n' "${WEBUI_STATIC_SOURCE_DIR}/${asset_file}" >&2
+      return 1
+    fi
+    key="${asset_file//\//__}"
+    cp "${WEBUI_STATIC_SOURCE_DIR}/${asset_file}" "${local_asset_patch_dir}/${key}"
+  done
+  local static_files_json
+  static_files_json="$(python3 - "${files[@]}" <<'PY'
 import json
 import sys
 
@@ -480,22 +493,41 @@ files.insert(7, "happy_oyster_sdk.js")
 print(json.dumps(files, separators=(",", ":")))
 PY
 )"
+  local asset_files_json
+  asset_files_json="$(python3 - "${asset_files[@]}" <<'PY'
+import json
+import sys
 
-  ssh -o BatchMode=yes "${SSH_HOST}" "rm -rf '${remote_patch_dir}' && mkdir -p '${remote_patch_dir}'"
-  scp -q "${local_patch_dir}"/* "${SSH_HOST}:${remote_patch_dir}/"
-  rm -rf "${local_patch_dir}"
+print(json.dumps(sys.argv[1:], separators=(",", ":")))
+PY
+)"
+
+  ssh -o BatchMode=yes "${SSH_HOST}" "rm -rf '${remote_patch_dir}' && mkdir -p '${remote_patch_dir}/static' '${remote_patch_dir}/assets'"
+  scp -q "${local_static_patch_dir}"/* "${SSH_HOST}:${remote_patch_dir}/static/"
+  if ((${#asset_files[@]})); then
+    scp -q "${local_asset_patch_dir}"/* "${SSH_HOST}:${remote_patch_dir}/assets/"
+  fi
+  rm -rf "${local_static_patch_dir}" "${local_asset_patch_dir}"
   ssh -o BatchMode=yes "${SSH_HOST}" \
-    "NAMESPACE='${NAMESPACE}' REMOTE_PATCH_DIR='${remote_patch_dir}' PATCH_NAME='${WEBUI_STATIC_PATCH_NAME}' bash -s" <<'REMOTE'
+    "NAMESPACE='${NAMESPACE}' REMOTE_PATCH_DIR='${remote_patch_dir}' PATCH_NAME='${WEBUI_STATIC_PATCH_NAME}' ASSET_PATCH_NAME='${WEBUI_ASSET_PATCH_NAME}' ASSET_FILE_COUNT='${#asset_files[@]}' bash -s" <<'REMOTE'
 set -Eeuo pipefail
 printf '%s\n' 'globalThis.HappyOysterSDK = globalThis.HappyOysterSDK || {};' \
-  >"${REMOTE_PATCH_DIR}/happy_oyster_sdk.js"
+  >"${REMOTE_PATCH_DIR}/static/happy_oyster_sdk.js"
 kubectl -n "${NAMESPACE}" delete configmap "${PATCH_NAME}" --ignore-not-found=true
-kubectl -n "${NAMESPACE}" create configmap "${PATCH_NAME}" --from-file="${REMOTE_PATCH_DIR}"
+kubectl -n "${NAMESPACE}" create configmap "${PATCH_NAME}" --from-file="${REMOTE_PATCH_DIR}/static"
+if [[ "${ASSET_FILE_COUNT}" != "0" ]]; then
+  kubectl -n "${NAMESPACE}" delete configmap "${ASSET_PATCH_NAME}" --ignore-not-found=true
+  kubectl -n "${NAMESPACE}" create configmap "${ASSET_PATCH_NAME}" --from-file="${REMOTE_PATCH_DIR}/assets"
+else
+  kubectl -n "${NAMESPACE}" delete configmap "${ASSET_PATCH_NAME}" --ignore-not-found=true
+fi
 REMOTE
 
   WEBUI_STATIC_PATCH_NAME="${WEBUI_STATIC_PATCH_NAME}" \
+  WEBUI_ASSET_PATCH_NAME="${WEBUI_ASSET_PATCH_NAME}" \
   WEBUI_STATIC_PATCH_VERSION="${WEBUI_STATIC_PATCH_VERSION}" \
-  WEBUI_STATIC_FILES_JSON="${mount_files_json}" \
+  WEBUI_STATIC_FILES_JSON="${static_files_json}" \
+  WEBUI_ASSET_FILES_JSON="${asset_files_json}" \
   WEBUI_IMAGE="${WEBUI_IMAGE}" \
   python3 - <<'PY' | ssh -o BatchMode=yes "${SSH_HOST}" \
     "kubectl -n '${NAMESPACE}' patch deploy zing-webui --type=strategic --patch-file /dev/stdin"
@@ -503,7 +535,37 @@ import json
 import os
 
 base = "/opt/sglang/python/sglang/multimodal_gen/apps/realtime_webui"
-files = json.loads(os.environ["WEBUI_STATIC_FILES_JSON"])
+static_files = json.loads(os.environ["WEBUI_STATIC_FILES_JSON"])
+asset_files = json.loads(os.environ["WEBUI_ASSET_FILES_JSON"])
+volumes = [
+    {
+        "name": "webui-static-patch",
+        "configMap": {"name": os.environ["WEBUI_STATIC_PATCH_NAME"]},
+    }
+]
+volume_mounts = [
+    {
+        "name": "webui-static-patch",
+        "mountPath": f"{base}/{name}",
+        "subPath": name.replace("/", "__"),
+        "readOnly": True,
+    }
+    for name in static_files
+]
+if asset_files:
+    volumes.append({
+        "name": "webui-preset-assets-patch",
+        "configMap": {"name": os.environ["WEBUI_ASSET_PATCH_NAME"]},
+    })
+    volume_mounts.extend([
+        {
+            "name": "webui-preset-assets-patch",
+            "mountPath": f"{base}/{name}",
+            "subPath": name.replace("/", "__"),
+            "readOnly": True,
+        }
+        for name in asset_files
+    ])
 patch = {
     "spec": {
         "template": {
@@ -513,25 +575,12 @@ patch = {
                 }
             },
             "spec": {
-                "volumes": [
-                    {
-                        "name": "webui-static-patch",
-                        "configMap": {"name": os.environ["WEBUI_STATIC_PATCH_NAME"]},
-                    }
-                ],
+                "volumes": volumes,
                 "containers": [
                     {
                         "name": "webui",
                         "image": os.environ["WEBUI_IMAGE"],
-                        "volumeMounts": [
-                            {
-                                "name": "webui-static-patch",
-                                "mountPath": f"{base}/{name}",
-                                "subPath": name.replace("/", "__"),
-                                "readOnly": True,
-                            }
-                            for name in files
-                        ],
+                        "volumeMounts": volume_mounts,
                     }
                 ],
             },
