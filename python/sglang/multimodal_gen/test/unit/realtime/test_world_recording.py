@@ -258,6 +258,6 @@ def test_recording_rejects_incomplete_media_without_publishing(messages):
     asyncio.run(run())
 
 
-def test_production_recording_bounds_are_eight_mibibytes():
-    assert world_recording.PART_SIZE == 8 * 1024 * 1024
-    assert world_recording.QUEUE_MAX_BYTES == 8 * 1024 * 1024
+def test_production_recording_uses_minimum_s3_part_size():
+    assert world_recording.PART_SIZE == 5 * 1024 * 1024
+    assert world_recording.QUEUE_MAX_BYTES == 5 * 1024 * 1024

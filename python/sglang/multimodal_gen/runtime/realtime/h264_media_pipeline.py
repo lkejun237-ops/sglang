@@ -151,6 +151,7 @@ class H264MediaPipeline:
         self._queue_ready = asyncio.Event()
         self._queued_frames = 0
         self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
         self._runner = asyncio.create_task(
             self._run(), name=f"vae-h264-{session_id[:8]}"
         )
@@ -239,19 +240,42 @@ class H264MediaPipeline:
             )
         )
         self._queue_ready.set()
+        if header.is_final_chunk and self._close_task is None:
+            # 最终块已经排在全部尾帧之后。此时就主动复用 close 的完整性屏障，
+            # 不再等上游 WebSocket 拆除；否则录像收尾会被会话清理时机平白拖慢。
+            self._close_task = asyncio.create_task(
+                self._close_impl(), name=f"vae-h264-finalize-{self.session_id[:8]}"
+            )
 
     async def close(self) -> None:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                self._close_impl(), name=f"vae-h264-close-{self.session_id[:8]}"
+            )
+        # 自动收尾和会话 finally 可能同时等待同一个任务。shield 防止某个调用方
+        # 被取消时连带取消真正的媒体 EOF/最终标记流程。
+        await asyncio.shield(self._close_task)
+
+    async def _close_impl(self) -> None:
         if self._closed:
             return
+        finalize_started = time.perf_counter()
         failure: BaseException | None = None
+        queue_drain_ms = 0.0
+        ffmpeg_drain_ms = 0.0
+        completion_send_ms = 0.0
+        drain_started = time.perf_counter()
         try:
             await self._drain_pending()
         except BaseException as exc:
             failure = exc
+        finally:
+            queue_drain_ms = (time.perf_counter() - drain_started) * 1000.0
         self._closed = True
         self._queue_ready.set()
         self._runner.cancel()
         await asyncio.gather(self._runner, return_exceptions=True)
+        ffmpeg_started = time.perf_counter()
         try:
             await self._stop_ffmpeg()
         except BaseException as exc:
@@ -265,12 +289,27 @@ class H264MediaPipeline:
                     self.generation_id,
                     exc_info=exc,
                 )
+        finally:
+            ffmpeg_drain_ms = (time.perf_counter() - ffmpeg_started) * 1000.0
         try:
             # 只有 FIFO 队列、ffmpeg stdout 与进程退出都成功，final marker
             # 才能承担“媒体完整”的语义；任何失败都宁可让验收报红，不能伪绿。
             if failure is None and self._pending_final_completion is not None:
+                completion_started = time.perf_counter()
                 await self._send_completion(self._pending_final_completion)
+                completion_send_ms = (time.perf_counter() - completion_started) * 1000.0
                 self._pending_final_completion = None
+                logger.info(
+                    "VAE H.264 media finalized session_id=%s generation_id=%s "
+                    "queue_drain_ms=%.3f ffmpeg_drain_ms=%.3f "
+                    "completion_send_ms=%.3f total_ms=%.3f",
+                    self.session_id,
+                    self.generation_id,
+                    queue_drain_ms,
+                    ffmpeg_drain_ms,
+                    completion_send_ms,
+                    (time.perf_counter() - finalize_started) * 1000.0,
+                )
         finally:
             self._queue.clear()
             self._queued_frames = 0
@@ -280,13 +319,9 @@ class H264MediaPipeline:
     async def _drain_pending(self) -> None:
         """把队列里剩余的帧与完成标记发完再拆管线。
 
-        最后一块的 media_chunk_complete 就是在会话拆除的同一刻才入队的
-        （realtime_vae_server 收到 is_final_chunk 的解码结果后立即收摊）。
-        旧实现直接 cancel + clear，把尾帧和这个标记一起丢掉；而网关要等
-        chunk_index == max_chunks-1 的标记才认为输出收尾，等不到就空转到
-        --output-drain-timeout-s 超时 —— 线上实测一局白占 90 秒座位，
-        并且期间会话 deadline 到点，把一次正常跑完的生成误标成
-        "maximum session lifetime reached"。
+        最后一块的 media_chunk_complete 入队后会立刻主动触发 close；会话拆除
+        只需等待同一个幂等任务。队列哨兵仍保证尾帧先进入 ffmpeg，之后才能
+        关闭 stdin、等待 stdout EOF 并向网关发送最终完成标记。
         """
         if self._runner.done():
             self._raise_if_failed()

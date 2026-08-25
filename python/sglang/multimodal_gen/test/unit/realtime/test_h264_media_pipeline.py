@@ -230,14 +230,8 @@ def test_h264_pipeline_bounds_rgb_before_encoding_and_emits_fmp4(monkeypatch):
     asyncio.run(run())
 
 
-def test_h264_pipeline_drains_final_chunk_before_close(monkeypatch):
-    """收尾必须把最后一块的帧和 media_chunk_complete 发出去。
-
-    回归的是线上真事故：VAE 收到 is_final_chunk 后立刻拆会话 → close() 直接
-    cancel+clear → 最后一块的完成标记被丢 → 网关等 chunk_index==max_chunks-1
-    的标记等不到，空转到 --output-drain-timeout-s（线上 90s）才收摊，一局白占
-    90 秒座位，还把正常跑完的生成误标成 "maximum session lifetime reached"。
-    """
+def test_h264_pipeline_finalizes_final_chunk_before_session_close(monkeypatch):
+    """最终块本身必须触发完整收尾，不能依赖上游 WebSocket 拆除。"""
 
     async def run():
         process = _FlushOnCloseProcess()
@@ -265,11 +259,18 @@ def test_h264_pipeline_drains_final_chunk_before_close(monkeypatch):
             ),
         )
         frame = bytes([1, 2, 3]) * 4
-        # 入队后不给事件循环任何喘息就 close()：模拟"解码完最后一块立刻收摊"
         final_header = _header(is_final_chunk=True)
         pipeline.enqueue(final_header, _batch(frame, frame))
         pipeline.enqueue_completion(final_header, num_frames=2)
-        await pipeline.close()
+
+        # 不调用 close()。final completion 入队后应主动排空帧、关闭 ffmpeg，
+        # 等 stdout EOF 后把最终 marker 发给网关。
+        for _ in range(1000):
+            if any(
+                decode_message(wire)["type"] == "media_chunk_complete" for wire in wires
+            ):
+                break
+            await asyncio.sleep(0.001)
 
         messages = [decode_message(wire) for wire in wires]
         types = [message["type"] for message in messages]
@@ -284,6 +285,8 @@ def test_h264_pipeline_drains_final_chunk_before_close(monkeypatch):
         # rawvideo 管线不应启用 demuxer 的 nobuffer；真实 ffmpeg 会因此吞尾帧。
         assert len(ffmpeg_commands) == 1
         assert "nobuffer" not in ffmpeg_commands[0]
+        # 会话 finally 再次 close 只等待同一个已完成任务。
+        await pipeline.close()
 
     asyncio.run(run())
 
