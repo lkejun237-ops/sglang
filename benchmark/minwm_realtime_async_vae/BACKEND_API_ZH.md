@@ -9,6 +9,7 @@
 | `GET` | `/healthz` | Gateway 进程存活检查 |
 | `GET` | `/readyz` | Gateway 与 Coordinator 就绪检查 |
 | `GET` | `/v1/models` | 查询当前部署的模型 revision |
+| `GET` | `/v1/slots` | 查询当前端到端 session slot 使用量、剩余量与总量 |
 | `WS` | `/v1/realtime_video/generate` | 初始化会话、发送控制事件、接收视频帧与必要控制消息 |
 | `GET` | `/v1/realtime_video/traces/{trace_id}` | 按需查询最近 5 分钟 CloudWatch Trace 阶段聚合与增量事件 |
 | `POST` | `/v1/realtime_video/traces/{trace_id}/client-events` | 批量上报浏览器端 Trace 事件 |

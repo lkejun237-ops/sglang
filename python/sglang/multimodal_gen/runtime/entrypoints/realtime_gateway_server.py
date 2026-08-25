@@ -295,6 +295,8 @@ def _worker_slot_from_payload(payload: dict[str, Any]) -> WorkerSlot:
 class CoordinatorClient(Protocol):
     async def health(self) -> dict[str, Any]: ...
 
+    async def capacity(self) -> dict[str, Any]: ...
+
     async def claim_attempt(
         self, *, attempt_id: str, owner_id: str, expires_at: float
     ) -> None: ...
@@ -316,6 +318,48 @@ def _assignment(payload: dict[str, Any]) -> SessionAssignment:
         denoiser=_worker_slot_from_payload(payload["denoiser"]),
         vae=_worker_slot_from_payload(payload["vae"]),
     )
+
+
+def _nonnegative_int(value: Any) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _slot_capacity_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
+    role_summaries: dict[str, dict[str, int]] = {}
+    for role, values in sorted((snapshot.get("roles") or {}).items()):
+        if not isinstance(values, dict):
+            continue
+        used_slots = _nonnegative_int(values.get("active_sessions"))
+        free_slots = _nonnegative_int(values.get("free_slots"))
+        role_summaries[role] = {
+            "used_slots": used_slots,
+            "free_slots": free_slots,
+            "total_slots": used_slots + free_slots,
+            "waiting_sessions": _nonnegative_int(values.get("waiting_sessions")),
+            "queued_sessions": _nonnegative_int(values.get("queued_sessions")),
+            "draining_workers": _nonnegative_int(values.get("draining_workers")),
+        }
+
+    if role_summaries:
+        used_slots = max(role["used_slots"] for role in role_summaries.values())
+        free_slots = min(role["free_slots"] for role in role_summaries.values())
+        total_slots = min(role["total_slots"] for role in role_summaries.values())
+    else:
+        used_slots = 0
+        free_slots = 0
+        total_slots = 0
+
+    return {
+        "object": "realtime_slot_capacity",
+        "observed_at": snapshot.get("observed_at"),
+        "used_slots": used_slots,
+        "free_slots": free_slots,
+        "total_slots": total_slots,
+        "roles": role_summaries,
+    }
 
 
 class HTTPCoordinatorClient:
@@ -367,6 +411,11 @@ class HTTPCoordinatorClient:
 
     async def health(self) -> dict[str, Any]:
         response = await self._client.get("/healthz")
+        response.raise_for_status()
+        return response.json()
+
+    async def capacity(self) -> dict[str, Any]:
+        response = await self._client.get("/v1/capacity")
         response.raise_for_status()
         return response.json()
 
@@ -600,6 +649,16 @@ def create_app(
             ) from exc
         last_coordinator_ready_at = readiness_clock()
         return {"status": "ready", "coordinator": "ready"}
+
+    @app.get("/backends/minwm/v1/slots")
+    @app.get("/v1/slots")
+    async def slots():
+        try:
+            return _slot_capacity_summary(await coordinator.capacity())
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503, detail="coordinator capacity unavailable"
+            ) from exc
 
     @app.get("/backends/minwm/v1/models")
     @app.get("/v1/models")

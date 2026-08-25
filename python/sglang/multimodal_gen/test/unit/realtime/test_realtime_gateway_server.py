@@ -33,13 +33,37 @@ from sglang.multimodal_gen.runtime.realtime.coordinator import (
 
 
 class _Coordinator:
-    def __init__(self, *, ready=True):
+    def __init__(self, *, ready=True, capacity=None):
         self.ready = ready
+        self._capacity = capacity or {
+            "observed_at": 1.0,
+            "roles": {
+                "denoiser": {
+                    "waiting_sessions": 0,
+                    "active_sessions": 0,
+                    "queued_sessions": 0,
+                    "free_slots": 1,
+                    "draining_workers": 0,
+                },
+                "vae": {
+                    "waiting_sessions": 0,
+                    "active_sessions": 0,
+                    "queued_sessions": 0,
+                    "free_slots": 1,
+                    "draining_workers": 0,
+                },
+            },
+        }
 
     async def health(self):
         if not self.ready:
             raise RuntimeError("coordinator unavailable")
         return {"status": "ready"}
+
+    async def capacity(self):
+        if isinstance(self._capacity, Exception):
+            raise self._capacity
+        return self._capacity
 
 
 class _TraceQuery:
@@ -204,6 +228,119 @@ def test_gateway_coordinator_claim_distinguishes_rejection_from_unknown_result(
             await client._client.aclose()
 
     asyncio.run(run())
+
+
+def test_gateway_coordinator_capacity_client_fetches_snapshot():
+    snapshot = {
+        "observed_at": 42.0,
+        "roles": {
+            "denoiser": {
+                "waiting_sessions": 0,
+                "active_sessions": 2,
+                "queued_sessions": 0,
+                "free_slots": 5,
+                "draining_workers": 0,
+            },
+            "vae": {
+                "waiting_sessions": 0,
+                "active_sessions": 2,
+                "queued_sessions": 0,
+                "free_slots": 12,
+                "draining_workers": 0,
+            },
+        },
+    }
+
+    async def handler(request):
+        assert request.url.path == "/v1/capacity"
+        return httpx.Response(200, json=snapshot)
+
+    async def run():
+        client = HTTPCoordinatorClient.__new__(HTTPCoordinatorClient)
+        client._client = httpx.AsyncClient(
+            base_url="http://coordinator.invalid",
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            assert await client.capacity() == snapshot
+        finally:
+            await client._client.aclose()
+
+    asyncio.run(run())
+
+
+def test_gateway_exposes_slot_capacity_summary_from_coordinator():
+    app = create_app(
+        _Coordinator(
+            capacity={
+                "observed_at": 42.0,
+                "roles": {
+                    "denoiser": {
+                        "waiting_sessions": 1,
+                        "active_sessions": 3,
+                        "queued_sessions": 2,
+                        "free_slots": 4,
+                        "draining_workers": 0,
+                    },
+                    "vae": {
+                        "waiting_sessions": 1,
+                        "active_sessions": 3,
+                        "queued_sessions": 0,
+                        "free_slots": 11,
+                        "draining_workers": 1,
+                    },
+                },
+            }
+        ),
+        model_revision="minwm-r1",
+        vae_fingerprint="taew2_2",
+        internal_output_url="ws://gateway/v1/internal/realtime_output",
+    )
+    client = TestClient(app)
+
+    response = client.get("/v1/slots")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "object": "realtime_slot_capacity",
+        "observed_at": 42.0,
+        "used_slots": 3,
+        "free_slots": 4,
+        "total_slots": 7,
+        "roles": {
+            "denoiser": {
+                "used_slots": 3,
+                "free_slots": 4,
+                "total_slots": 7,
+                "waiting_sessions": 1,
+                "queued_sessions": 2,
+                "draining_workers": 0,
+            },
+            "vae": {
+                "used_slots": 3,
+                "free_slots": 11,
+                "total_slots": 14,
+                "waiting_sessions": 1,
+                "queued_sessions": 0,
+                "draining_workers": 1,
+            },
+        },
+    }
+    assert client.get("/backends/minwm/v1/slots").json() == response.json()
+
+
+def test_gateway_slot_capacity_returns_503_when_coordinator_is_unavailable():
+    app = create_app(
+        _Coordinator(capacity=RuntimeError("coordinator unavailable")),
+        model_revision="minwm-r1",
+        vae_fingerprint="taew2_2",
+        internal_output_url="ws://gateway/v1/internal/realtime_output",
+    )
+
+    response = TestClient(app).get("/v1/slots")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "coordinator capacity unavailable"
 
 
 def test_gateway_serves_trace_query_and_accepts_sanitized_client_metrics():
