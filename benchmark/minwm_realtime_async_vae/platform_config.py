@@ -1048,13 +1048,13 @@ def _webui() -> dict[str, Any]:
                     "NO_PROXY",
                     "localhost,127.0.0.1,::1,.svc,.svc.cluster.local,"
                     ".cluster.local,world-realtime-gateway,world-studio-webui,"
-                    "ark.cn-beijing.volces.com",
+                    "ark.cn-beijing.volces.com,.cognitiveservices.azure.com",
                 ),
                 _env(
                     "no_proxy",
                     "localhost,127.0.0.1,::1,.svc,.svc.cluster.local,"
                     ".cluster.local,world-realtime-gateway,world-studio-webui,"
-                    "ark.cn-beijing.volces.com",
+                    "ark.cn-beijing.volces.com,.cognitiveservices.azure.com",
                 ),
                 _env(
                     "CREATE_WORLD_IMAGE_CONFIG",

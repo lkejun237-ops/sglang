@@ -90,11 +90,11 @@
     },
     {
       "name": "NO_PROXY",
-      "value": "localhost,127.0.0.1,::1,.svc,.svc.cluster.local,.cluster.local,world-realtime-gateway,world-studio-webui,ark.cn-beijing.volces.com"
+      "value": "localhost,127.0.0.1,::1,.svc,.svc.cluster.local,.cluster.local,world-realtime-gateway,world-studio-webui,ark.cn-beijing.volces.com,.cognitiveservices.azure.com"
     },
     {
       "name": "no_proxy",
-      "value": "localhost,127.0.0.1,::1,.svc,.svc.cluster.local,.cluster.local,world-realtime-gateway,world-studio-webui,ark.cn-beijing.volces.com"
+      "value": "localhost,127.0.0.1,::1,.svc,.svc.cluster.local,.cluster.local,world-realtime-gateway,world-studio-webui,ark.cn-beijing.volces.com,.cognitiveservices.azure.com"
     },
     {
       "name": "CREATE_WORLD_IMAGE_CONFIG",

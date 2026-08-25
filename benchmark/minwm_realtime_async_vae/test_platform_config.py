@@ -187,6 +187,8 @@ def test_webui_keeps_external_secret_references_and_ephemeral_volumes():
     assert env["DOUBAO_REQUEST_TIMEOUT_SECONDS"]["value"] == "60"
     assert "ark.cn-beijing.volces.com" in env["NO_PROXY"]["value"]
     assert "ark.cn-beijing.volces.com" in env["no_proxy"]["value"]
+    assert ".cognitiveservices.azure.com" in env["NO_PROXY"]["value"]
+    assert ".cognitiveservices.azure.com" in env["no_proxy"]["value"]
     assert volumes["runtime-secret"]["type"] == "secret"
     secret_items = {
         item["key"]: item["path"]
