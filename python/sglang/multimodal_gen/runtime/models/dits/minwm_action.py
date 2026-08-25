@@ -129,12 +129,9 @@ def validate_action_weights(
 def action_labels_to_primitive_bits(
     labels: torch.Tensor,
     *,
-    validate: bool = True,
     label_to_bits: torch.Tensor | None = None,
 ) -> torch.Tensor:
     labels = labels.to(dtype=torch.long)
-    if validate and torch.any((labels < 0) | (labels >= NUM_ACTION_CLASSES)):
-        raise ValueError("MinWM action labels must be in [0, 80]")
     table = _LABEL_TO_BITS if label_to_bits is None else label_to_bits
     if table.device != labels.device:
         table = table.to(device=labels.device)
@@ -204,7 +201,6 @@ class PrimitiveTokenResidualActionEncoder(nn.Module):
         # Keep non-checkpoint buffers concrete while the model is initialized on
         # meta; the loader only materializes parameters present in the state dict.
         self.register_buffer("_label_to_bits", _LABEL_TO_BITS.clone(), persistent=False)
-        self.validate_runtime_action = True
 
     def prepare_label_table(self, device: torch.device) -> None:
         if self._label_to_bits.device != device:
@@ -223,17 +219,10 @@ class PrimitiveTokenResidualActionEncoder(nn.Module):
             self.prepare_label_table(action.device)
             weights = action_labels_to_primitive_bits(
                 action,
-                validate=self.validate_runtime_action,
                 label_to_bits=self._label_to_bits,
             )
         elif action.ndim == 4 and action.shape[-1] == PRIMITIVE_BIT_WIDTH:
             weights = action
-            if self.validate_runtime_action and not torch.isfinite(weights).all():
-                raise ValueError("MinWM action weights must be finite")
-            if self.validate_runtime_action and torch.any(
-                (weights < 0) | (weights > 1)
-            ):
-                raise ValueError("MinWM action weights must be in [0, 1]")
         else:
             raise ValueError(
                 "MinWM action must have shape [B, F] labels or [B, F, S, 8] weights"
@@ -314,7 +303,6 @@ class PrimitiveRoPETokenResidualActionEncoder(nn.Module):
         # Keep non-checkpoint buffers concrete while the model is initialized on
         # meta; the loader only materializes parameters present in the state dict.
         self.register_buffer("_label_to_bits", _LABEL_TO_BITS.clone(), persistent=False)
-        self.validate_runtime_action = True
 
     def prepare_label_table(self, device: torch.device) -> None:
         if self._label_to_bits.device != device:
@@ -325,17 +313,10 @@ class PrimitiveRoPETokenResidualActionEncoder(nn.Module):
             self.prepare_label_table(action.device)
             weights = action_labels_to_primitive_bits(
                 action,
-                validate=self.validate_runtime_action,
                 label_to_bits=self._label_to_bits,
             )
         elif action.ndim == 4 and action.shape[-1] == PRIMITIVE_BIT_WIDTH:
             weights = action
-            if self.validate_runtime_action and not torch.isfinite(weights).all():
-                raise ValueError("MinWM action weights must be finite")
-            if self.validate_runtime_action and torch.any(
-                (weights < 0) | (weights > 1)
-            ):
-                raise ValueError("MinWM action weights must be in [0, 1]")
         else:
             raise ValueError(
                 "MinWM primitive RoPE action must have shape [B, F] labels "

@@ -809,6 +809,23 @@ def test_minwm_action_history_chunk_matches_full_sequence():
     assert token_residual.stride(-1) == 1
 
 
+@pytest.mark.parametrize(
+    "encoder_cls",
+    [PrimitiveTokenResidualActionEncoder, PrimitiveRoPETokenResidualActionEncoder],
+)
+def test_minwm_action_encoders_do_not_validate_device_weights(encoder_cls):
+    encoder = encoder_cls(dim=24, embed_dim=8, hidden_dim=16, kernel_size=3)
+    invalid_weights = torch.full((1, 4, 1, 8), 2.0)
+
+    residual = encoder.token_residual(
+        invalid_weights,
+        num_current_frames=4,
+        tokens_per_frame=6,
+        dtype=torch.float32,
+    )
+    assert residual.shape == (1, 24, 24)
+
+
 def test_minwm_legacy_action_condition_recomputes_for_all_five_forwards(monkeypatch):
     torch.manual_seed(19)
     model = MinWMCausalTransformer3DModel.__new__(MinWMCausalTransformer3DModel)
@@ -1527,7 +1544,6 @@ def test_minwm_sequence_shard_forward_bypasses_cuda_graph(monkeypatch):
         def __init__(self):
             self.action_in = SimpleNamespace(
                 prepare_label_table=lambda _device: None,
-                validate_runtime_action=True,
             )
             self.calls = []
 
