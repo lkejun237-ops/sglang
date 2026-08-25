@@ -1037,12 +1037,25 @@ def _webui() -> dict[str, Any]:
                     "/run/secrets/realtime-webui/prompt-rewriter-vertex.json",
                 ),
                 _env("VIDEO_PROMPT_REWRITE_PROVIDER", "doubao"),
+                _env("VIDEO_PROMPT_REWRITE_TIMEOUT_SECONDS", "60"),
                 _env("CREATE_WORLD_DESCRIPTION_PROVIDER", "doubao"),
                 _env(
                     "DOUBAO_ARK_CREDENTIALS",
                     "/run/secrets/realtime-webui/doubao-ark.json",
                 ),
-                _env("DOUBAO_REQUEST_TIMEOUT_SECONDS", "20"),
+                _env("DOUBAO_REQUEST_TIMEOUT_SECONDS", "60"),
+                _env(
+                    "NO_PROXY",
+                    "localhost,127.0.0.1,::1,.svc,.svc.cluster.local,"
+                    ".cluster.local,world-realtime-gateway,world-studio-webui,"
+                    "ark.cn-beijing.volces.com",
+                ),
+                _env(
+                    "no_proxy",
+                    "localhost,127.0.0.1,::1,.svc,.svc.cluster.local,"
+                    ".cluster.local,world-realtime-gateway,world-studio-webui,"
+                    "ark.cn-beijing.volces.com",
+                ),
                 _env(
                     "CREATE_WORLD_IMAGE_CONFIG",
                     "/run/secrets/realtime-webui/world-image-model-config.json",

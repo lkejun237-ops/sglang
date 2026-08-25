@@ -180,10 +180,13 @@ def test_webui_keeps_external_secret_references_and_ephemeral_volumes():
     )
     assert env["VIDEO_PROMPT_REWRITE_PROVIDER"]["value"] == "doubao"
     assert env["CREATE_WORLD_DESCRIPTION_PROVIDER"]["value"] == "doubao"
+    assert env["VIDEO_PROMPT_REWRITE_TIMEOUT_SECONDS"]["value"] == "60"
     assert env["DOUBAO_ARK_CREDENTIALS"]["value"] == (
         "/run/secrets/realtime-webui/doubao-ark.json"
     )
-    assert env["DOUBAO_REQUEST_TIMEOUT_SECONDS"]["value"] == "20"
+    assert env["DOUBAO_REQUEST_TIMEOUT_SECONDS"]["value"] == "60"
+    assert "ark.cn-beijing.volces.com" in env["NO_PROXY"]["value"]
+    assert "ark.cn-beijing.volces.com" in env["no_proxy"]["value"]
     assert volumes["runtime-secret"]["type"] == "secret"
     secret_items = {
         item["key"]: item["path"]

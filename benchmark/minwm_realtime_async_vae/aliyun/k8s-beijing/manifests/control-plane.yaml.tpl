@@ -301,6 +301,7 @@ spec:
             - {name: LINGBOT2_UPSTREAM_HTTP, value: ""}
             - {name: LINGBOT2_UPSTREAM_WS, value: ""}
             - {name: VIDEO_PROMPT_REWRITE_PROVIDER, value: ${VIDEO_PROMPT_REWRITE_PROVIDER}}
+            - {name: VIDEO_PROMPT_REWRITE_TIMEOUT_SECONDS, value: "${VIDEO_PROMPT_REWRITE_TIMEOUT_SECONDS}"}
             - {name: CREATE_WORLD_DESCRIPTION_PROVIDER, value: ${CREATE_WORLD_DESCRIPTION_PROVIDER}}
             - {name: VIDEO_PROMPT_REWRITE_CREDENTIALS, value: /run/secrets/realtime-webui/prompt-rewriter-vertex.json}
             - {name: DOUBAO_ARK_CREDENTIALS, value: ${DOUBAO_ARK_CREDENTIALS}}
@@ -319,6 +320,8 @@ spec:
             - name: http_proxy
               valueFrom:
                 secretKeyRef: {name: zing-proxy-env, key: http_proxy, optional: true}
+            - {name: NO_PROXY, value: "${WEBUI_NO_PROXY}"}
+            - {name: no_proxy, value: "${WEBUI_NO_PROXY}"}
             - {name: WORLD_MODEL_METRIC_SERVICE, value: world-studio-webui}
             - {name: WORLD_MODEL_METRIC_LANE, value: aliyun-beijing}
           ports:

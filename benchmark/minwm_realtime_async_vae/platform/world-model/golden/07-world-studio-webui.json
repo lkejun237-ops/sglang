@@ -73,6 +73,10 @@
       "value": "doubao"
     },
     {
+      "name": "VIDEO_PROMPT_REWRITE_TIMEOUT_SECONDS",
+      "value": "60"
+    },
+    {
       "name": "CREATE_WORLD_DESCRIPTION_PROVIDER",
       "value": "doubao"
     },
@@ -82,7 +86,15 @@
     },
     {
       "name": "DOUBAO_REQUEST_TIMEOUT_SECONDS",
-      "value": "20"
+      "value": "60"
+    },
+    {
+      "name": "NO_PROXY",
+      "value": "localhost,127.0.0.1,::1,.svc,.svc.cluster.local,.cluster.local,world-realtime-gateway,world-studio-webui,ark.cn-beijing.volces.com"
+    },
+    {
+      "name": "no_proxy",
+      "value": "localhost,127.0.0.1,::1,.svc,.svc.cluster.local,.cluster.local,world-realtime-gateway,world-studio-webui,ark.cn-beijing.volces.com"
     },
     {
       "name": "CREATE_WORLD_IMAGE_CONFIG",
