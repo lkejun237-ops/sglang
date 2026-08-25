@@ -20,7 +20,7 @@ from uuid import uuid4
 import httpx
 import msgspec.msgpack
 import uvicorn
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from websockets.asyncio.client import connect
@@ -81,6 +81,34 @@ from sglang.multimodal_gen.runtime.utils.realtime_trace import (
 
 WEBUI_ROOT = Path(__file__).resolve().parents[2] / "apps" / "realtime_webui"
 logger = logging.getLogger(__name__)
+_PROXY_DROP_REQUEST_HEADERS = frozenset(
+    {
+        "connection",
+        "content-length",
+        "host",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
+_PROXY_DROP_RESPONSE_HEADERS = frozenset(
+    {
+        "connection",
+        "content-encoding",
+        "content-length",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
 _IDEMPOTENT_COORDINATOR_RELEASE_REASONS = frozenset(
     {
         "LEASE_LOST",
@@ -130,6 +158,22 @@ def _parse_ui_config(raw: str) -> dict[str, Any]:
     if not isinstance(config, dict):
         raise ValueError("UI config must be a JSON object")
     return config
+
+
+def _proxy_request_headers(request: Request) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in _PROXY_DROP_REQUEST_HEADERS
+    }
+
+
+def _proxy_response_headers(response: httpx.Response) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in response.headers.items()
+        if key.lower() not in _PROXY_DROP_RESPONSE_HEADERS
+    }
 
 
 def _log_gateway_trace(trace_id: str, event: str, **fields: Any) -> None:
@@ -452,6 +496,7 @@ def create_app(
     world_platform: WorldPlatformConfig | None = None,
     recording_manager: RecordingManager | None = None,
     browser_send_timeout_s: float = 15.0,
+    world_studio_webui_base_url: str | None = None,
     # Unauthenticated showcase routes, static pages, and trace queries. These are
     # registered by default.
     #
@@ -520,6 +565,7 @@ def create_app(
     app.state.output_registry = registry
     app.state.admission_gate = admission_gate
     app.state.recording_manager = recording_manager
+    webui_base_url = (world_studio_webui_base_url or "").strip().rstrip("/")
     last_coordinator_ready_at: float | None = None
 
     @app.get("/healthz")
@@ -619,6 +665,30 @@ def create_app(
             media_type="application/javascript",
             headers={"Cache-Control": "no-store"},
         )
+
+    if webui_base_url:
+
+        @app.api_route(
+            "/api/{path:path}",
+            methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        )
+        async def proxy_world_studio_api(path: str, request: Request):
+            target = f"{webui_base_url}/api/{path}"
+            if request.url.query:
+                target = f"{target}?{request.url.query}"
+            async with httpx.AsyncClient(timeout=90.0) as client:
+                upstream = await client.request(
+                    request.method,
+                    target,
+                    headers=_proxy_request_headers(request),
+                    content=await request.body(),
+                )
+            return Response(
+                content=upstream.content,
+                status_code=upstream.status_code,
+                headers=_proxy_response_headers(upstream),
+                media_type=upstream.headers.get("content-type"),
+            )
 
     @app.websocket("/v1/internal/realtime_output")
     async def realtime_output(websocket: WebSocket):
@@ -1756,6 +1826,15 @@ def _parse_args() -> argparse.Namespace:
         "--ui-config-json",
         default=os.environ.get("REALTIME_UI_CONFIG_JSON", "{}"),
     )
+    parser.add_argument(
+        "--world-studio-webui-base-url",
+        default=os.environ.get("WORLD_STUDIO_WEBUI_BASE_URL", ""),
+        help=(
+            "Optional internal WebUI base URL. When set, gateway forwards "
+            "/api/* to that WebUI so public domains can terminate on the "
+            "gateway while keeping prompt/world APIs available."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1845,6 +1924,7 @@ def main() -> None:
         world_platform=_build_world_platform(args),
         browser_send_timeout_s=args.browser_send_timeout_s,
         disable_legacy_routes=args.disable_legacy_routes,
+        world_studio_webui_base_url=args.world_studio_webui_base_url,
     )
     uvicorn.run(
         app,

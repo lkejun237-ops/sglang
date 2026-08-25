@@ -192,11 +192,13 @@ spec:
               --release-grace-s=0.5
               --max-admission-waiters=64
               --ui-config-json="$RUNTIME_UI_CONFIG_JSON"
+              --world-studio-webui-base-url="$WORLD_STUDIO_WEBUI_BASE_URL"
           env:
             - {name: PYTHONUNBUFFERED, value: "1"}
             - {name: PYTHONPATH, value: /opt/sglang/python}
             - {name: SGLANG_LIGHTWEIGHT_RUNTIME, value: "1"}
             - {name: OTEL_SERVICE_NAME, value: zing-gateway}
+            - {name: WORLD_STUDIO_WEBUI_BASE_URL, value: "${WORLD_STUDIO_WEBUI_BASE_URL}"}
             - name: POD_IP
               valueFrom:
                 fieldRef:
@@ -233,6 +235,20 @@ spec:
         - {name: runtime-utils-patch, configMap: {name: zing-runtime-utils-patch}}
         - {name: runtime-envs-patch, configMap: {name: zing-runtime-envs-patch}}
         - {name: runtime-dep-shims, configMap: {name: zing-runtime-dep-shims}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zing-webui
+  namespace: ${NAMESPACE}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: zing-webui
+  ports:
+    - name: http
+      port: 18080
+      targetPort: http
 ---
 apiVersion: apps/v1
 kind: Deployment
