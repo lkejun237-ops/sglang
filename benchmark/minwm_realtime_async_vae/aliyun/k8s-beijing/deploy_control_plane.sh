@@ -50,7 +50,7 @@ APPLY_GPU_WORKER_TEMPLATES="${APPLY_GPU_WORKER_TEMPLATES:-true}"
 APPLY_RUNTIME_SOURCE_PATCH="${APPLY_RUNTIME_SOURCE_PATCH:-true}"
 APPLY_WEBUI_STATIC_PATCH="${APPLY_WEBUI_STATIC_PATCH:-true}"
 WEBUI_STATIC_PATCH_NAME="${WEBUI_STATIC_PATCH_NAME:-zing-webui-static-patch}"
-WEBUI_STATIC_PATCH_VERSION="${WEBUI_STATIC_PATCH_VERSION:-single-zing-v9-20260822}"
+WEBUI_STATIC_PATCH_VERSION="${WEBUI_STATIC_PATCH_VERSION:-single-zing-v10-feishu-demo-20260825}"
 WEBUI_STATIC_SOURCE_DIR="${WEBUI_STATIC_SOURCE_DIR:-${REPO_ROOT}/python/sglang/multimodal_gen/apps/realtime_webui}"
 RUNTIME_SOURCE_PATCH_VERSION="${RUNTIME_SOURCE_PATCH_VERSION:-runtime-v2-h264-20260822}"
 RUNTIME_REALTIME_SOURCE_DIR="${RUNTIME_REALTIME_SOURCE_DIR:-${REPO_ROOT}/python/sglang/multimodal_gen/runtime/realtime}"
@@ -452,18 +452,38 @@ apply_webui_static_patch() {
     server.py
     world_creator.py
   )
-  local sources=()
+  local asset_dir="assets/presets/v1/feishu-internal-demo-20260825"
+  if [[ -d "${WEBUI_STATIC_SOURCE_DIR}/${asset_dir}" ]]; then
+    while IFS= read -r asset_file; do
+      files+=("${asset_file}")
+    done < <(cd "${WEBUI_STATIC_SOURCE_DIR}" && find "${asset_dir}" -type f | sort)
+  fi
+  local local_patch_dir
+  local_patch_dir="$(mktemp -d)"
+  local key
   local file
   for file in "${files[@]}"; do
     if [[ ! -f "${WEBUI_STATIC_SOURCE_DIR}/${file}" ]]; then
       printf 'missing webui static file: %s\n' "${WEBUI_STATIC_SOURCE_DIR}/${file}" >&2
       return 1
     fi
-    sources+=("${WEBUI_STATIC_SOURCE_DIR}/${file}")
+    key="${file//\//__}"
+    cp "${WEBUI_STATIC_SOURCE_DIR}/${file}" "${local_patch_dir}/${key}"
   done
+  local mount_files_json
+  mount_files_json="$(python3 - "${files[@]}" <<'PY'
+import json
+import sys
+
+files = sys.argv[1:]
+files.insert(7, "happy_oyster_sdk.js")
+print(json.dumps(files, separators=(",", ":")))
+PY
+)"
 
   ssh -o BatchMode=yes "${SSH_HOST}" "rm -rf '${remote_patch_dir}' && mkdir -p '${remote_patch_dir}'"
-  scp -q "${sources[@]}" "${SSH_HOST}:${remote_patch_dir}/"
+  scp -q "${local_patch_dir}"/* "${SSH_HOST}:${remote_patch_dir}/"
+  rm -rf "${local_patch_dir}"
   ssh -o BatchMode=yes "${SSH_HOST}" \
     "NAMESPACE='${NAMESPACE}' REMOTE_PATCH_DIR='${remote_patch_dir}' PATCH_NAME='${WEBUI_STATIC_PATCH_NAME}' bash -s" <<'REMOTE'
 set -Eeuo pipefail
@@ -475,6 +495,7 @@ REMOTE
 
   WEBUI_STATIC_PATCH_NAME="${WEBUI_STATIC_PATCH_NAME}" \
   WEBUI_STATIC_PATCH_VERSION="${WEBUI_STATIC_PATCH_VERSION}" \
+  WEBUI_STATIC_FILES_JSON="${mount_files_json}" \
   WEBUI_IMAGE="${WEBUI_IMAGE}" \
   python3 - <<'PY' | ssh -o BatchMode=yes "${SSH_HOST}" \
     "kubectl -n '${NAMESPACE}' patch deploy zing-webui --type=strategic --patch-file /dev/stdin"
@@ -482,27 +503,7 @@ import json
 import os
 
 base = "/opt/sglang/python/sglang/multimodal_gen/apps/realtime_webui"
-files = [
-    "index.html",
-    "styles.css",
-    "playback_controller.js",
-    "model_session.js",
-    "dual_model_controller.js",
-    "h264_websocket_session.js",
-    "happy_oyster_sdk.js",
-    "happy_oyster_session.js",
-    "session_lifetime.js",
-    "prompt_rewrite_controller.js",
-    "world_rules_controller.js",
-    "fullscreen_controller.js",
-    "trace_topology.js",
-    "trace_transport.js",
-    "app.js",
-    "doubao_provider.py",
-    "prompt_rewriter.py",
-    "server.py",
-    "world_creator.py",
-]
+files = json.loads(os.environ["WEBUI_STATIC_FILES_JSON"])
 patch = {
     "spec": {
         "template": {
@@ -526,7 +527,7 @@ patch = {
                             {
                                 "name": "webui-static-patch",
                                 "mountPath": f"{base}/{name}",
-                                "subPath": name,
+                                "subPath": name.replace("/", "__"),
                                 "readOnly": True,
                             }
                             for name in files

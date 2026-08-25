@@ -42,11 +42,11 @@ gateway-to-coordinator service discovery can fail even when both Pods are
 running.
 
 By default the script keeps the cached `webui-c7ae70a65a2d` image and then
-mounts the current source-tree WebUI static assets through the
-`zing-webui-static-patch` ConfigMap. This preserves the single-Zing
-Wulanchabu UI behavior without relying on the control ECS pulling another large
-WebUI image tag. Set `APPLY_WEBUI_STATIC_PATCH=false` only when the selected
-`WEBUI_IMAGE` already contains the desired static assets.
+mounts the current source-tree WebUI static assets, including packaged preset
+asset subdirectories, through the `zing-webui-static-patch` ConfigMap. This
+preserves the single-Zing Wulanchabu UI behavior without relying on the control
+ECS pulling another large WebUI image tag. Set `APPLY_WEBUI_STATIC_PATCH=false`
+only when the selected `WEBUI_IMAGE` already contains the desired static assets.
 The default Beijing UI config also sets `tabScopedUserIds=true`, so separate
 browser tabs or hard refreshes do not collide on the coordinator's
 one-session-per-user admission fence.
