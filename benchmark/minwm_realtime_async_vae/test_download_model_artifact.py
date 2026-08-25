@@ -3,10 +3,14 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from download_model_artifact import (
+    parse_args,
     preferred_transfer_client,
+    resolve_model_cache_paths,
     resolve_model_source,
     s3_addressing_config,
     stage_model,
@@ -149,6 +153,26 @@ class FakeManager:
         return FakeFuture(self, key, destination)
 
 
+class BlockingFakeFuture(FakeFuture):
+    def __init__(self, manager, key: str, destination, release_download):
+        super().__init__(manager, key, destination)
+        self.release_download = release_download
+
+    def result(self):
+        assert self.release_download.wait(timeout=5)
+        super().result()
+
+
+class BlockingFakeManager(FakeManager):
+    def __init__(self, objects: dict[str, bytes], release_download):
+        super().__init__(objects)
+        self.release_download = release_download
+
+    def download(self, bucket: str, key: str, destination: str):
+        self.submitted.append((bucket, key, destination))
+        return BlockingFakeFuture(self, key, destination, self.release_download)
+
+
 def test_stages_all_objects_before_waiting_and_then_hits_cache(tmp_path):
     objects, info_body, manifest_body, ready_body = _artifact()
     client = FakeClient(info_body, manifest_body, ready_body)
@@ -197,7 +221,9 @@ def test_stages_all_objects_before_waiting_and_then_hits_cache(tmp_path):
 
     cached = stage_model(**kwargs)
     assert cached["cache_hit"] is True
+    assert cached["backend"] == "node-cache"
     assert len(managers) == 1
+    assert len(client.requested_keys) == 3
 
     # A same-size payload corruption must not be accepted as a cache hit.
     (tmp_path / "model/model_index.json").write_bytes(b"[]")
@@ -205,6 +231,130 @@ def test_stages_all_objects_before_waiting_and_then_hits_cache(tmp_path):
     assert repaired["cache_hit"] is False
     assert len(managers) == 2
     assert (tmp_path / "model/model_index.json").read_bytes() == b"{}"
+
+
+def test_resolves_immutable_shared_cache_destination_and_lock(tmp_path):
+    destination, lock_path = resolve_model_cache_paths(
+        cache_root=tmp_path / "node-cache",
+        model_name=MODEL_NAME,
+        model_version=MODEL_VERSION,
+        model_release_id=RELEASE_ID,
+    )
+
+    assert destination == (
+        tmp_path
+        / "node-cache"
+        / "releases"
+        / MODEL_NAME
+        / MODEL_VERSION
+        / RELEASE_ID
+        / "model"
+    )
+    assert lock_path == (
+        tmp_path
+        / "node-cache"
+        / "locks"
+        / MODEL_NAME
+        / MODEL_VERSION
+        / f"{RELEASE_ID}.lock"
+    )
+
+    other_destination, other_lock = resolve_model_cache_paths(
+        cache_root=tmp_path / "node-cache",
+        model_name=MODEL_NAME,
+        model_version=MODEL_VERSION,
+        model_release_id="20260825T010203Z-deadbeef",
+    )
+    assert other_destination != destination
+    assert other_lock != lock_path
+
+
+def test_shared_release_lock_allows_only_one_download(tmp_path):
+    objects, info_body, manifest_body, ready_body = _artifact()
+    client = FakeClient(info_body, manifest_body, ready_body)
+    download_started = threading.Event()
+    release_download = threading.Event()
+    manager_count = 0
+
+    def factory(*_):
+        nonlocal manager_count
+        manager_count += 1
+        download_started.set()
+        return BlockingFakeManager(objects, release_download)
+
+    destination, lock_path = resolve_model_cache_paths(
+        cache_root=tmp_path / "node-cache",
+        model_name=MODEL_NAME,
+        model_version=MODEL_VERSION,
+        model_release_id=RELEASE_ID,
+    )
+    kwargs = {
+        "client": client,
+        "bucket": "model-bucket",
+        "prefix": PREFIX,
+        "destination": destination,
+        "lock_path": lock_path,
+        "expected_model_name": MODEL_NAME,
+        "expected_model_version": MODEL_VERSION,
+        "expected_release_id": RELEASE_ID,
+        "expected_revision": MODEL_VERSION,
+        "concurrency": 128,
+        "part_size": 16 * 1024 * 1024,
+        "manager_factory": factory,
+    }
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(stage_model, **kwargs)
+        assert download_started.wait(timeout=5)
+        second = executor.submit(stage_model, **kwargs)
+        release_download.set()
+        results = [first.result(timeout=5), second.result(timeout=5)]
+
+    assert manager_count == 1
+    assert sorted(result["cache_hit"] for result in results) == [False, True]
+    assert len(client.requested_keys) == 3
+
+
+def test_cache_root_cli_derives_lock_and_preserves_legacy_mode(tmp_path):
+    common = [
+        "--bucket",
+        "model-bucket",
+        "--model-name",
+        MODEL_NAME,
+        "--model-version",
+        MODEL_VERSION,
+        "--model-release-id",
+        RELEASE_ID,
+    ]
+    args = parse_args([*common, "--cache-root", str(tmp_path / "node-cache")])
+    assert args.cache_root == tmp_path / "node-cache"
+    assert args.destination is None
+    assert args.lock_path is None
+
+    args = parse_args(
+        [
+            *common,
+            "--destination",
+            str(tmp_path / "model"),
+            "--lock-path",
+            str(tmp_path / "model.lock"),
+        ]
+    )
+    assert args.destination == tmp_path / "model"
+    assert args.lock_path == tmp_path / "model.lock"
+
+    with pytest.raises(SystemExit):
+        parse_args([*common, "--destination", str(tmp_path / "model")])
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                *common,
+                "--cache-root",
+                str(tmp_path / "node-cache"),
+                "--lock-path",
+                str(tmp_path / "unexpected.lock"),
+            ]
+        )
 
 
 def test_rejects_manifest_path_traversal():

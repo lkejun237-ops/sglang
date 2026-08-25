@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage an immutable, parameterized model release with the AWS CRT client."""
+"""Stage an immutable, parameterized model release into a shared node cache."""
 
 from __future__ import annotations
 
@@ -90,6 +90,40 @@ def _safe_s3_prefix(prefix: str) -> str:
     ):
         raise ValueError("S3 prefix is not a safe object-key prefix")
     return normalized
+
+
+def resolve_model_cache_paths(
+    *,
+    cache_root: Path,
+    model_name: str,
+    model_version: str,
+    model_release_id: str,
+) -> tuple[Path, Path]:
+    """Return immutable release and per-release lock paths below a cache root."""
+    model_name = _safe_model_component("model-name", model_name)
+    model_version = _safe_model_component("model-version", model_version)
+    model_release_id = _safe_model_component("model-release-id", model_release_id)
+    cache_root = cache_root.resolve()
+    destination = (
+        cache_root
+        / "releases"
+        / model_name
+        / model_version
+        / model_release_id
+        / "model"
+    ).resolve()
+    lock_path = (
+        cache_root / "locks" / model_name / model_version / f"{model_release_id}.lock"
+    ).resolve()
+    for description, candidate in (
+        ("model destination", destination),
+        ("model lock", lock_path),
+    ):
+        try:
+            candidate.relative_to(cache_root)
+        except ValueError as exc:
+            raise ValueError(f"{description} escapes the cache root") from exc
+    return destination, lock_path
 
 
 def resolve_model_source(
@@ -330,6 +364,35 @@ def _cache_matches(
         return False
 
 
+def _validated_local_cache(
+    destination: Path,
+    *,
+    expected_model_name: str,
+    expected_model_version: str,
+    expected_release_id: str,
+    expected_revision: str | None,
+) -> tuple[dict[str, Any], int] | None:
+    """Validate a complete immutable cache entry without contacting S3."""
+    try:
+        info_body = (destination / "info.json").read_bytes()
+        manifest_body = (destination / "artifact-manifest.json").read_bytes()
+        ready_body = (destination / "_READY").read_bytes()
+        info, _, files = validate_release_controls(
+            info_body,
+            ready_body,
+            manifest_body,
+            expected_model_name=expected_model_name,
+            expected_model_version=expected_model_version,
+            expected_release_id=expected_release_id,
+            expected_revision=expected_revision,
+        )
+        if not _cache_matches(destination, info_body, ready_body, manifest_body, files):
+            return None
+        return info, sum(entry["size"] for entry in files)
+    except (OSError, TypeError, ValueError):
+        return None
+
+
 def create_crt_transfer_manager(client: Any, concurrency: int, part_size: int) -> Any:
     """Create a transfer manager and reject any non-CRT fallback."""
     from boto3.s3.transfer import TransferConfig, create_transfer_manager
@@ -359,7 +422,9 @@ def transfer_backend_name() -> str:
     return "awscrt" if preferred_transfer_client() == "crt" else "classic"
 
 
-def create_runtime_transfer_manager(client: Any, concurrency: int, part_size: int) -> Any:
+def create_runtime_transfer_manager(
+    client: Any, concurrency: int, part_size: int
+) -> Any:
     preferred = preferred_transfer_client()
     if preferred == "crt":
         return create_crt_transfer_manager(client, concurrency, part_size)
@@ -480,6 +545,26 @@ def stage_model(
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as lock_stream:
         fcntl.flock(lock_stream, fcntl.LOCK_EX)
+        cached = _validated_local_cache(
+            destination,
+            expected_model_name=expected_model_name,
+            expected_model_version=expected_model_version,
+            expected_release_id=expected_release_id,
+            expected_revision=expected_revision,
+        )
+        if cached is not None:
+            info, total_bytes = cached
+            return {
+                "backend": "node-cache",
+                "bytes": total_bytes,
+                "cache_hit": True,
+                "destination": str(destination),
+                "model_name": info["model_name"],
+                "model_version": info["model_version"],
+                "release_id": info["release_id"],
+                "revision": info["source_revision"],
+            }
+
         # Read immutable metadata and the manifest first. _READY is read last so
         # a partially published release can never authorize a download.
         info_body = _read_control_object(client, bucket, f"{prefix}/info.json")
@@ -487,7 +572,7 @@ def stage_model(
             client, bucket, f"{prefix}/artifact-manifest.json"
         )
         ready_body = _read_control_object(client, bucket, f"{prefix}/_READY")
-        info, manifest, files = validate_release_controls(
+        info, _, files = validate_release_controls(
             info_body,
             ready_body,
             manifest_body,
@@ -569,7 +654,7 @@ def stage_model(
         }
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bucket")
     parser.add_argument("--prefix")
@@ -577,13 +662,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--model-version", required=True)
     parser.add_argument("--model-release-id", required=True)
-    parser.add_argument("--destination", type=Path, required=True)
-    parser.add_argument("--lock-path", type=Path, required=True)
+    destination = parser.add_mutually_exclusive_group(required=True)
+    destination.add_argument("--destination", type=Path)
+    destination.add_argument("--cache-root", type=Path)
+    parser.add_argument("--lock-path", type=Path)
     parser.add_argument("--region", default=os.environ.get("AWS_REGION", "us-east-2"))
     parser.add_argument("--expected-revision")
     parser.add_argument("--concurrency", type=int, default=128)
     parser.add_argument("--part-size-mib", type=int, default=16)
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.destination is not None and args.lock_path is None:
+        parser.error("--lock-path is required with --destination")
+    if args.cache_root is not None and args.lock_path is not None:
+        parser.error("--lock-path is derived automatically with --cache-root")
+    return args
 
 
 def s3_addressing_config() -> dict[str, str]:
@@ -591,9 +683,7 @@ def s3_addressing_config() -> dict[str, str]:
     if not style:
         return {}
     if style not in {"auto", "virtual", "path"}:
-        raise ValueError(
-            "AWS_S3_ADDRESSING_STYLE must be one of: auto, virtual, path"
-        )
+        raise ValueError("AWS_S3_ADDRESSING_STYLE must be one of: auto, virtual, path")
     return {"addressing_style": style}
 
 
@@ -610,6 +700,15 @@ def main() -> None:
         model_version=args.model_version,
         model_release_id=args.model_release_id,
     )
+    if args.cache_root is not None:
+        destination, lock_path = resolve_model_cache_paths(
+            cache_root=args.cache_root,
+            model_name=args.model_name,
+            model_version=args.model_version,
+            model_release_id=expected_release_id,
+        )
+    else:
+        destination, lock_path = args.destination, args.lock_path
     config_kwargs = {"retries": {"mode": "adaptive", "max_attempts": 8}}
     if s3_config := s3_addressing_config():
         config_kwargs["s3"] = s3_config
@@ -622,8 +721,8 @@ def main() -> None:
         client=client,
         bucket=bucket,
         prefix=prefix,
-        destination=args.destination,
-        lock_path=args.lock_path,
+        destination=destination,
+        lock_path=lock_path,
         expected_model_name=args.model_name,
         expected_model_version=args.model_version,
         expected_release_id=expected_release_id,
