@@ -44,7 +44,36 @@ class FakeImageClient:
         return SimpleNamespace(data=[SimpleNamespace(b64_json=self.encoded)])
 
 
+class FakeDoubaoProvider:
+    configured = True
+
+    def __init__(self):
+        self.calls = []
+
+    async def generate_structured(self, **kwargs):
+        self.calls.append(kwargs)
+        return kwargs["schema"].model_validate(
+            {
+                "camera_mode": "first_person",
+                "source_image_has_clear_external_subject": False,
+                "visible_first_person_body_parts": [],
+                "world_description": "A first-person desert road remains open ahead.",
+            }
+        )
+
+
 class WorldCreatorTest(unittest.IsolatedAsyncioTestCase):
+    async def test_doubao_describes_world_with_the_same_schema(self):
+        provider = FakeDoubaoProvider()
+        creator = WorldCreator(
+            description_provider="doubao",
+            doubao_provider=provider,
+        )
+        result = await creator.describe("第一人称穿过沙漠")
+        self.assertEqual(result.camera_mode, "first_person")
+        self.assertEqual(provider.calls[0]["schema_name"], "world_description")
+        self.assertIn("world_seed", provider.calls[0]["user_content"])
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)

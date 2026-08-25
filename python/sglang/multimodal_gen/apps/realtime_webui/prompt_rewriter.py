@@ -15,6 +15,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from doubao_provider import DEFAULT_MODEL as DEFAULT_DOUBAO_MODEL
+from doubao_provider import DoubaoStructuredProvider
 from pydantic import BaseModel, ConfigDict, Field
 
 ROOT = Path(__file__).resolve().parent
@@ -326,17 +328,23 @@ class PromptRewriter:
         max_attempts: int = 2,
         client: Any | None = None,
         provider: str | None = None,
+        doubao_provider: DoubaoStructuredProvider | None = None,
     ) -> None:
         self.provider = (
             provider or os.environ.get("VIDEO_PROMPT_REWRITE_PROVIDER", "vertex")
         ).strip().lower()
-        if self.provider not in {"vertex", LOCAL_PROVIDER}:
-            raise ValueError("VIDEO_PROMPT_REWRITE_PROVIDER must be vertex or local")
+        if self.provider not in {"vertex", "doubao", LOCAL_PROVIDER}:
+            raise ValueError(
+                "VIDEO_PROMPT_REWRITE_PROVIDER must be vertex, doubao, or local"
+            )
         self.local_fallback_enabled = _env_flag(
             "VIDEO_PROMPT_REWRITE_FALLBACK_LOCAL"
         )
+        provider_default_model = (
+            DEFAULT_DOUBAO_MODEL if self.provider == "doubao" else DEFAULT_MODEL
+        )
         self.model = model or os.environ.get(
-            "VIDEO_PROMPT_REWRITE_MODEL", DEFAULT_MODEL
+            "VIDEO_PROMPT_REWRITE_MODEL", provider_default_model
         )
         self.location = location or os.environ.get(
             "VIDEO_PROMPT_REWRITE_VERTEX_LOCATION", DEFAULT_LOCATION
@@ -357,14 +365,29 @@ class PromptRewriter:
         self.max_attempts = max(1, int(max_attempts))
         self._client = client
         self._client_lock = asyncio.Lock()
+        self.doubao_provider = doubao_provider or DoubaoStructuredProvider(
+            model=self.model,
+            request_timeout_seconds=self.request_timeout_seconds,
+            max_attempts=self.max_attempts,
+        )
 
     @property
     def configured(self) -> bool:
+        if self.provider == "doubao":
+            return self.doubao_provider.configured
         return (
             self.provider == LOCAL_PROVIDER
             or self._client is not None
             or self.credentials_path.is_file()
         )
+
+    async def warmup(self) -> None:
+        if self.provider == LOCAL_PROVIDER:
+            return
+        if self.provider == "doubao":
+            await self.doubao_provider.warmup()
+            return
+        await self._get_client()
 
     async def _get_client(self) -> Any:
         if self.provider == LOCAL_PROVIDER:
@@ -416,6 +439,20 @@ class PromptRewriter:
 
         if self.provider == LOCAL_PROVIDER:
             return _local_rewrite(instruction, previous_prompt)
+
+        if self.provider == "doubao":
+            try:
+                return await self.doubao_provider.generate_structured(
+                    system_instruction=SYSTEM_PROMPT,
+                    user_content=build_user_message(previous_prompt, instruction),
+                    schema=PromptRewriteOutput,
+                    schema_name="prompt_rewrite",
+                    max_output_tokens=1024,
+                )
+            except Exception:
+                if self.local_fallback_enabled:
+                    return _local_rewrite(instruction, previous_prompt)
+                raise
 
         from google.genai import types
 
@@ -472,6 +509,22 @@ class PromptRewriter:
 
         if self.provider == LOCAL_PROVIDER:
             return _local_world_rule(rule_input, previous_prompt, kind)
+
+        if self.provider == "doubao":
+            try:
+                return await self.doubao_provider.generate_structured(
+                    system_instruction=WORLD_RULE_SYSTEM_PROMPT,
+                    user_content=build_world_rule_message(
+                        previous_prompt, rule_input, kind
+                    ),
+                    schema=WorldRuleCompletionOutput,
+                    schema_name="world_rule",
+                    max_output_tokens=1024,
+                )
+            except Exception:
+                if self.local_fallback_enabled:
+                    return _local_world_rule(rule_input, previous_prompt, kind)
+                raise
 
         from google.genai import types
 

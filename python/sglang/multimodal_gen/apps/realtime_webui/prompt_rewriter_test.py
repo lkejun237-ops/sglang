@@ -32,7 +32,52 @@ class FakeModels:
         return SimpleNamespace(parsed=response)
 
 
+class FakeDoubaoProvider:
+    configured = True
+
+    def __init__(self):
+        self.calls = []
+
+    async def warmup(self):
+        return None
+
+    async def generate_structured(self, **kwargs):
+        self.calls.append(kwargs)
+        schema = kwargs["schema"]
+        if kwargs["schema_name"] == "world_rule":
+            return schema.model_validate(
+                {
+                    "name": "召唤飞船",
+                    "prompt": "A glowing spacecraft descends beside the rider.",
+                    "change_type": "one_time",
+                }
+            )
+        return schema.model_validate(
+            {
+                "prompt": "Snow continuously covers the same valley.",
+                "change_type": "persistent",
+            }
+        )
+
+
 class PromptRewriterTest(unittest.IsolatedAsyncioTestCase):
+    async def test_doubao_provider_rewrites_and_completes_rules(self):
+        provider = FakeDoubaoProvider()
+        rewriter = PromptRewriter(
+            provider="doubao",
+            doubao_provider=provider,
+        )
+        rewrite = await rewriter.rewrite("持续下雪", "A rider explores a valley.")
+        rule = await rewriter.complete_world_rule(
+            "召唤飞船", "A rider explores a valley.", "skill"
+        )
+        self.assertEqual(rewrite.change_type.value, "persistent")
+        self.assertEqual(rule.change_type.value, "one_time")
+        self.assertEqual([call["schema_name"] for call in provider.calls], [
+            "prompt_rewrite",
+            "world_rule",
+        ])
+
     async def test_rewrite_returns_prompt_and_lifetime(self):
         models = FakeModels()
         client = SimpleNamespace(aio=SimpleNamespace(models=models))

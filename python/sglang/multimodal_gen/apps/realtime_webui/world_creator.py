@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
 from urllib.parse import urlsplit
 
+from doubao_provider import DEFAULT_MODEL as DEFAULT_DOUBAO_MODEL
+from doubao_provider import DoubaoStructuredProvider
 from prompt_rewriter import DEFAULT_CREDENTIALS_PATH, VERTEX_SCOPE
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -206,9 +208,24 @@ class WorldCreator:
         image_config_path: str | Path | None = None,
         generated_root: str | Path | None = None,
         request_timeout_seconds: float | None = None,
+        description_provider: str | None = None,
+        doubao_provider: DoubaoStructuredProvider | None = None,
     ) -> None:
+        self.description_provider = (
+            description_provider
+            or os.environ.get("CREATE_WORLD_DESCRIPTION_PROVIDER", "vertex")
+        ).strip().lower()
+        if self.description_provider not in {"vertex", "doubao"}:
+            raise ValueError(
+                "CREATE_WORLD_DESCRIPTION_PROVIDER must be vertex or doubao"
+            )
+        default_description_model = (
+            DEFAULT_DOUBAO_MODEL
+            if self.description_provider == "doubao"
+            else DESCRIPTION_MODEL
+        )
         self.description_model = os.environ.get(
-            "CREATE_WORLD_DESCRIPTION_MODEL", DESCRIPTION_MODEL
+            "CREATE_WORLD_DESCRIPTION_MODEL", default_description_model
         )
         self.vertex_location = os.environ.get(
             "CREATE_WORLD_VERTEX_LOCATION", DEFAULT_VERTEX_LOCATION
@@ -229,11 +246,17 @@ class WorldCreator:
         self._gemini_client_provider = gemini_client_provider
         self._gemini_client = None
         self._gemini_lock = asyncio.Lock()
+        self.doubao_provider = doubao_provider or DoubaoStructuredProvider(
+            model=self.description_model,
+            request_timeout_seconds=min(self.request_timeout_seconds, 30),
+        )
         self._image_client = image_client
         self._image_config: dict[str, Any] | None = None
 
     @property
     def description_configured(self) -> bool:
+        if self.description_provider == "doubao":
+            return self.doubao_provider.configured
         return (
             self._gemini_client_provider is not None or self.credentials_path.is_file()
         )
@@ -277,14 +300,12 @@ class WorldCreator:
         image_bytes: bytes | None = None,
         image_mime_type: str = "image/png",
     ) -> WorldDescriptionOutput:
-        from google.genai import types
-
         normalized_text = seed_text.strip()
         if not normalized_text and not image_bytes:
             raise ValueError("A world description or first frame is required")
-        contents: list[Any] = []
+        request_text = ""
         if normalized_text and image_bytes:
-            contents.append(
+            request_text = (
                 "First inspect the supplied first frame and decide whether it has "
                 "a clear external playable subject. Use third_person only when it "
                 "does; otherwise use first_person. For first_person, inventory only "
@@ -296,12 +317,12 @@ class WorldCreator:
                 f"<world_seed>\n{normalized_text}\n</world_seed>"
             )
         elif normalized_text:
-            contents.append(
+            request_text = (
                 "Create the complete visual world described by this text:\n"
                 f"<world_seed>\n{normalized_text}\n</world_seed>"
             )
         else:
-            contents.append(
+            request_text = (
                 "Inspect the supplied first frame before writing. Use third_person "
                 "only if it contains a clear external playable subject; otherwise "
                 "use first_person. In first_person, explicitly describe whether the "
@@ -310,30 +331,58 @@ class WorldCreator:
                 "frame. Describe the complete visible world as a standalone visual "
                 "state."
             )
-        if image_bytes:
-            contents.append(
-                types.Part.from_bytes(data=image_bytes, mime_type=image_mime_type)
+        if self.description_provider == "doubao":
+            user_content: str | list[dict[str, Any]] = request_text
+            if image_bytes:
+                encoded = base64.b64encode(image_bytes).decode("ascii")
+                user_content = [
+                    {"type": "text", "text": request_text},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{image_mime_type};base64,{encoded}"
+                        },
+                    },
+                ]
+            result = await self.doubao_provider.generate_structured(
+                system_instruction=WORLD_DESCRIPTION_SYSTEM_PROMPT,
+                user_content=user_content,
+                schema=WorldDescriptionOutput,
+                schema_name="world_description",
+                max_output_tokens=1024,
             )
-        client = await self._get_gemini_client()
-        response = await asyncio.wait_for(
-            client.aio.models.generate_content(
-                model=self.description_model,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=WORLD_DESCRIPTION_SYSTEM_PROMPT,
-                    temperature=0.2,
-                    max_output_tokens=1024,
-                    response_mime_type="application/json",
-                    response_json_schema=WorldDescriptionOutput.model_json_schema(),
-                    thinking_config=types.ThinkingConfig(
-                        thinking_budget=0,
-                        include_thoughts=False,
+        else:
+            from google.genai import types
+
+            contents: list[Any] = [request_text]
+            if image_bytes:
+                contents.append(
+                    types.Part.from_bytes(
+                        data=image_bytes, mime_type=image_mime_type
+                    ),
+                )
+            client = await self._get_gemini_client()
+            response = await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model=self.description_model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=WORLD_DESCRIPTION_SYSTEM_PROMPT,
+                        temperature=0.2,
+                        max_output_tokens=1024,
+                        response_mime_type="application/json",
+                        response_json_schema=(
+                            WorldDescriptionOutput.model_json_schema()
+                        ),
+                        thinking_config=types.ThinkingConfig(
+                            thinking_budget=0,
+                            include_thoughts=False,
+                        ),
                     ),
                 ),
-            ),
-            timeout=min(self.request_timeout_seconds, 30),
-        )
-        result = _parse_world_description(response)
+                timeout=min(self.request_timeout_seconds, 30),
+            )
+            result = _parse_world_description(response)
         if image_bytes:
             result = _enforce_uploaded_image_perspective(result)
         return result

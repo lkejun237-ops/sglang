@@ -1,4 +1,35 @@
-# Live Direction prompt rewriter secret
+# World Studio model-provider secrets
+
+The dual-model launcher uses Doubao by default for Live Direction rewriting,
+skill/goal completion, and world-description completion. Put the ignored local
+credential at:
+
+`doubao-ark.json`
+
+Its server-only shape is:
+
+```json
+{
+  "api_key": "...",
+  "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+  "model": "doubao-seed-2-0-mini-260428"
+}
+```
+
+Optional Doubao settings:
+
+- `DOUBAO_API_KEY`
+- `DOUBAO_ARK_BASE_URL`
+- `DOUBAO_ARK_CREDENTIALS`
+- `DOUBAO_MODEL`
+- `DOUBAO_REQUEST_TIMEOUT_SECONDS`
+- `VIDEO_PROMPT_REWRITE_PROVIDER=doubao`
+- `CREATE_WORLD_DESCRIPTION_PROVIDER=doubao`
+
+The secret directory is outside the WebUI static-file root. JSON files here are
+ignored by Git and are never served to the browser.
+
+## Gemini fallback
 
 The server reads a Vertex service-account credential from this project-local
 path by default:
@@ -12,6 +43,7 @@ deployment, mount the Kubernetes Secret at the same path, or set
 
 Optional server-side settings:
 
+- `VIDEO_PROMPT_REWRITE_PROVIDER=vertex`
 - `VIDEO_PROMPT_REWRITE_PROJECT_ID`
 - `VIDEO_PROMPT_REWRITE_MODEL` (default: `gemini-3.1-flash-lite`)
 - `VIDEO_PROMPT_REWRITE_VERTEX_LOCATION` (default: `global`)

@@ -834,7 +834,7 @@ async def _session_context(app):
     )
     if app[PROMPT_REWRITER].configured:
         try:
-            await app[PROMPT_REWRITER]._get_client()
+            await app[PROMPT_REWRITER].warmup()
         except Exception:
             logging.exception("Unable to initialize the Live Direction rewriter")
     yield
@@ -846,7 +846,24 @@ def create_app():
     prompt_rewriter = PromptRewriter()
     app[PROMPT_REWRITER] = prompt_rewriter
     app[WORLD_CREATOR] = WorldCreator(
-        gemini_client_provider=prompt_rewriter._get_client
+        gemini_client_provider=(
+            prompt_rewriter._get_client
+            if prompt_rewriter.provider == "vertex"
+            else None
+        ),
+        doubao_provider=(
+            prompt_rewriter.doubao_provider
+            if prompt_rewriter.provider == "doubao"
+            else None
+        ),
+        description_provider=os.environ.get(
+            "CREATE_WORLD_DESCRIPTION_PROVIDER",
+            (
+                prompt_rewriter.provider
+                if prompt_rewriter.provider in {"vertex", "doubao"}
+                else "vertex"
+            ),
+        ),
     )
     app[HAPPYOYSTER_WORLD_CACHE] = _load_happyoyster_prebuilt_worlds()
     app[HAPPYOYSTER_WORLD_BUILD_LOCKS] = {}
