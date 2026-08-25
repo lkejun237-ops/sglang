@@ -834,6 +834,18 @@ class PipelineConfig:
             default=None,
             help="Override the total frame capacity of realtime causal DiT KV cache for pipelines that support it.",
         )
+        parser.add_argument(
+            f"--{prefix_with_dot}realtime-causal-kv-cache-pool-size",
+            type=int,
+            default=None,
+            help="Number of fixed realtime causal DiT KV-cache slots to preallocate at worker startup.",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}realtime-causal-kv-cache-pool-buckets",
+            type=str,
+            default=None,
+            help="Comma-separated exact resolution buckets supported by each startup KV-cache slot.",
+        )
 
         # Add VAE configuration arguments
         from sglang.multimodal_gen.configs.models.vaes.base import VAEConfig

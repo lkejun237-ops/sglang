@@ -1459,6 +1459,64 @@ def test_minwm_cuda_graph_accepts_bounded_block_relative_cache():
     assert kwargs["rope_position_mode"] == "block_relative"
 
 
+def test_minwm_cuda_graph_key_separates_both_720p_shapes():
+    class FakeCudaTensor:
+        is_cuda = True
+        dtype = torch.bfloat16
+        device = torch.device("cuda")
+
+        def __init__(self, shape):
+            self.shape = shape
+
+        def stride(self):
+            stride = 1
+            strides = []
+            for dimension in reversed(self.shape):
+                strides.append(stride)
+                stride *= dimension
+            return tuple(reversed(strides))
+
+    stage = MinWMCausalDMDDenoisingStage.__new__(MinWMCausalDMDDenoisingStage)
+    stage._minwm_cuda_graph_enabled = True
+    cache = _make_minwm_test_cache(
+        cache_size=6,
+        rope_position_mode="block_relative",
+    )
+    _append_minwm_test_frames(cache, range(6), token_start=0)
+    cache.rotated_k = torch.empty_like(cache.k)
+    crossattn_cache = SimpleNamespace(
+        k=torch.zeros(1, 2, 1, 2),
+        v=torch.zeros(1, 2, 1, 2),
+        is_init=True,
+    )
+    common = {
+        "prompt_embeds": torch.zeros(1, 2, 3),
+        "timestep": torch.ones(1),
+        "kv_cache": [cache],
+        "crossattn_cache": [crossattn_cache],
+        "pos_cond_kwargs": {
+            "action": torch.zeros(1, 4, dtype=torch.long),
+            "action_token_residual": torch.zeros(1, 4, 3),
+        },
+        "image_kwargs": {},
+        "current_timestep": 1,
+        "attn_metadata": None,
+    }
+
+    key_1248 = stage._minwm_cuda_graph_key(
+        latent_model_input=FakeCudaTensor((1, 48, 4, 44, 78)),
+        **common,
+    )
+    key_1280 = stage._minwm_cuda_graph_key(
+        latent_model_input=FakeCudaTensor((1, 48, 4, 44, 80)),
+        **common,
+    )
+
+    assert key_1248 is not None
+    assert key_1280 is not None
+    assert key_1248 != key_1280
+
+
 def test_minwm_sequence_shard_forward_bypasses_cuda_graph(monkeypatch):
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minwm import (
         minwm_causal_denoising as denoising_module,
@@ -2129,6 +2187,50 @@ def test_minwm_sp_request_enables_sequence_sharding(monkeypatch):
     params._adjust(SimpleNamespace(sp_degree=4))
     assert params.enable_sequence_shard is True
     assert params.adjust_frames is False
+
+
+@pytest.mark.parametrize("width", [1248, 1280])
+def test_minwm_sampling_accepts_both_720p_profile_resolutions(monkeypatch, width):
+    monkeypatch.setattr(
+        MinWMSamplingParams.__mro__[1],
+        "_adjust",
+        lambda _self, _server_args: None,
+    )
+    params = MinWMSamplingParams(width=width, height=704)
+    params._adjust(
+        SimpleNamespace(
+            sp_degree=1,
+            pipeline_config=SimpleNamespace(
+                realtime_causal_kv_cache_pool_buckets=("832x480,1248x704,1280x704")
+            ),
+        )
+    )
+
+    assert params.supported_resolutions == [
+        (832, 480),
+        (1248, 704),
+        (1280, 704),
+    ]
+
+
+@pytest.mark.parametrize("width", [1248, 1280])
+def test_minwm_5090_profile_rejects_720p_before_pipeline_work(monkeypatch, width):
+    monkeypatch.setattr(
+        MinWMSamplingParams.__mro__[1],
+        "_adjust",
+        lambda _self, _server_args: None,
+    )
+    params = MinWMSamplingParams(width=width, height=704)
+
+    with pytest.raises(ValueError, match="not enabled by the launch profile"):
+        params._adjust(
+            SimpleNamespace(
+                sp_degree=1,
+                pipeline_config=SimpleNamespace(
+                    realtime_causal_kv_cache_pool_buckets="832x480"
+                ),
+            )
+        )
 
 
 def test_minwm_sequence_shard_frame_indices_support_mid_frame_boundaries(monkeypatch):

@@ -108,12 +108,12 @@ class MinWMCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(RealtimeImageVAEEncodingStage(vae=self.get_module("vae")))
         self.add_stage(DMDTimestepPreparationStage(self.get_module("scheduler")))
         self.add_stage(MinWMChunkLatentPreparationStage(self.get_module("transformer")))
-        self.add_stage(
-            MinWMCausalDMDDenoisingStage(
-                transformer=self.get_module("transformer"),
-                scheduler=self.get_module("scheduler"),
-            )
+        denoising_stage = MinWMCausalDMDDenoisingStage(
+            transformer=self.get_module("transformer"),
+            scheduler=self.get_module("scheduler"),
         )
+        denoising_stage.initialize_realtime_kv_cache_pool(server_args)
+        self.add_stage(denoising_stage)
         self._add_realtime_output_stage(server_args)
 
     def _add_realtime_output_stage(self, server_args: ServerArgs) -> None:
@@ -164,12 +164,12 @@ class MinWMCausalUniPCPipeline(MinWMCausalDMDPipeline):
             )
         )
         self.add_stage(MinWMChunkLatentPreparationStage(self.get_module("transformer")))
-        self.add_stage(
-            MinWMCausalUniPCDenoisingStage(
-                transformer=self.get_module("transformer"),
-                scheduler=self.get_module("scheduler"),
-            )
+        denoising_stage = MinWMCausalUniPCDenoisingStage(
+            transformer=self.get_module("transformer"),
+            scheduler=self.get_module("scheduler"),
         )
+        denoising_stage.initialize_realtime_kv_cache_pool(server_args)
+        self.add_stage(denoising_stage)
         self._add_realtime_output_stage(server_args)
 
 

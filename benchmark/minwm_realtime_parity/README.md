@@ -10,6 +10,9 @@ For hardware-specific jobs, use
 [`HARDWARE_PROFILES.md`](HARDWARE_PROFILES.md) and the sole committed generic
 Kubernetes template. Generated run manifests belong under the ignored
 `k8s/generated/` directory and must not be committed.
+The startup-time KV cache pool architecture, exact 480p/720p bucket contract,
+session lifecycle, memory model, assumptions, and acceptance matrix are in
+[`MINWM_STARTUP_KV_CACHE_POOL_DESIGN.zh-CN.md`](MINWM_STARTUP_KV_CACHE_POOL_DESIGN.zh-CN.md).
 
 For an architecture-first review of the implementation, numerical-parity
 decisions, sequence-parallel status, and the required comprehension quiz, read

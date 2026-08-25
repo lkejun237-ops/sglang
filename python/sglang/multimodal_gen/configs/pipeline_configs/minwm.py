@@ -230,6 +230,8 @@ class MinWMCausalDMDConfig(Wan2_2_TI2V_5B_Config):
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
     realtime_causal_sink_size: int | None = None
     realtime_causal_kv_cache_num_frames: int | None = None
+    realtime_causal_kv_cache_pool_size: int | None = None
+    realtime_causal_kv_cache_pool_buckets: str | None = None
 
     @staticmethod
     def _native_vae_stats(latents: torch.Tensor, vae):

@@ -160,7 +160,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             materializer.cancel_session(session_id)
         released = self._realtime_sessions.release(session_id)
         if released:
-            if torch.cuda.is_initialized():
+            has_persistent_pool = any(
+                bool(getattr(stage, "realtime_kv_cache_pool_enabled", False))
+                for stage in getattr(self.pipeline, "stages", ())
+            )
+            if torch.cuda.is_initialized() and not has_persistent_pool:
                 torch.cuda.empty_cache()
         return OutputBatch(output={"released": released, "session_id": session_id})
 
