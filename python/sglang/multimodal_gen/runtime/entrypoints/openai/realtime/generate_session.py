@@ -105,7 +105,9 @@ class GenerateSession:
     def set_request(self, request: RealtimeVideoGenerationsRequest):
         self.bind_trace(request)
         self.request = request
-        self.playback_ack_enabled = bool(request.playback_ack_enabled)
+        self.playback_ack_enabled = bool(
+            getattr(request, "playback_ack_enabled", False)
+        )
 
     def dispose(self):
         if self.adapter is not None:

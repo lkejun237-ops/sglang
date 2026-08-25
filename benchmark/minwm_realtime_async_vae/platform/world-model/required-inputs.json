@@ -139,9 +139,9 @@
     ],
     "networkPolicyPeers": [
       {
-        "destinationId": "dynamodb-us-east-2",
+        "destinationId": "world-model-realtime-redis",
         "direction": "egress",
-        "port": 443,
+        "port": 6379,
         "protocol": "TCP",
         "requiredTypedPeer": "podSelector+namespaceSelector or approved ipBlock",
         "serviceName": "world-realtime-coordinator",

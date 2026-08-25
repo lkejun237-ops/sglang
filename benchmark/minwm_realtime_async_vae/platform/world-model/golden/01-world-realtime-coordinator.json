@@ -7,7 +7,7 @@
   "appGroup": "world-studio",
   "appName": "World Realtime Coordinator",
   "args": [
-    "exec python -m sglang.multimodal_gen.runtime.entrypoints.realtime_coordinator_server --host=0.0.0.0 --port=18081 --backend=dynamodb --table-name=${COORDINATOR_TABLE} --region=${AWS_REGION} --ttl-s=30 --worker-ttl-s=15 --wait-timeout-s=10 --candidate-limit=64 --denoiser-capacity-limit=4 --vae-capacity-limit=16"
+    "exec python -m sglang.multimodal_gen.runtime.entrypoints.realtime_coordinator_server --host=0.0.0.0 --port=18081 --backend=redis --redis-host=${REDIS_HOST} --redis-port=${REDIS_PORT} --redis-username=${REDIS_USERNAME} --redis-password-env=REDIS_PASSWORD --redis-key-prefix=${REDIS_KEY_PREFIX} --redis-state-ttl-s=${REDIS_STATE_TTL_SECONDS} --ttl-s=30 --worker-ttl-s=15 --routing-revision-alias=${MODEL_ROUTING_REVISION}=${MODEL_REVISION} --routing-revision-alias=${LINGBOT2_MODEL_ROUTING_REVISION}=${LINGBOT2_MODEL_REVISION} --wait-timeout-s=10 --candidate-limit=64 --denoiser-capacity-limit=4 --vae-capacity-limit=16"
   ],
   "businessLineId": "world-model",
   "clusterId": "${WORLD_MODEL_CLUSTER_ID}",
@@ -18,12 +18,49 @@
   "deployType": "deployment",
   "env": [
     {
-      "name": "COORDINATOR_TABLE",
+      "name": "REDIS_HOST",
+      "value": "r-2ze358d0dce684b4.redis.rds.aliyuncs.com"
+    },
+    {
+      "name": "REDIS_PORT",
+      "value": "6379"
+    },
+    {
+      "name": "REDIS_USERNAME",
+      "value": "default"
+    },
+    {
+      "name": "REDIS_KEY_PREFIX",
       "value": "world-model-realtime"
     },
     {
-      "name": "AWS_REGION",
-      "value": "us-east-2"
+      "name": "REDIS_STATE_TTL_SECONDS",
+      "value": "86400"
+    },
+    {
+      "name": "MODEL_ROUTING_REVISION",
+      "value": "minwm"
+    },
+    {
+      "name": "MODEL_REVISION",
+      "value": "wan22-5b-stage3-dmd-47-0808-2fb2cfec2a2"
+    },
+    {
+      "name": "LINGBOT2_MODEL_ROUTING_REVISION",
+      "value": "lingbot2"
+    },
+    {
+      "name": "LINGBOT2_MODEL_REVISION",
+      "value": "robbyant/lingbot-world-v2-14b-causal-fast-diffusers"
+    },
+    {
+      "name": "REDIS_PASSWORD",
+      "valueFrom": {
+        "secretKeyRef": {
+          "key": "redis-password",
+          "name": "world-studio-runtime"
+        }
+      }
     },
     {
       "name": "OTEL_SERVICE_NAME",

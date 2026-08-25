@@ -62,7 +62,9 @@ class WorkerHeartbeatReporter:
         capacity: int,
         model_revision: str,
         vae_fingerprint: str,
+        routing_revision: str | None = None,
         worker_epoch_file: Path | None = None,
+        ready_file: Path | None = None,
     ) -> None:
         endpoint_parts = urlsplit(endpoint)
         if endpoint_parts.scheme not in ("ws", "wss") or not endpoint_parts.netloc:
@@ -87,6 +89,7 @@ class WorkerHeartbeatReporter:
         self.worker_epoch = (
             resolve_worker_epoch(worker_epoch) if worker_epoch is not None else None
         )
+        self.ready_file = ready_file
         self.payload = {
             "worker_id": worker_id,
             "role": role,
@@ -97,8 +100,12 @@ class WorkerHeartbeatReporter:
             "model_revision": model_revision,
             "vae_fingerprint": vae_fingerprint,
         }
+        if routing_revision:
+            self.payload["routing_revision"] = routing_revision
 
     async def heartbeat_once(self) -> bool:
+        if self.ready_file is not None and not self.ready_file.is_file():
+            return False
         health = await self.client.get(self.health_url)
         if not health.is_success:
             return False
@@ -184,6 +191,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--worker-id", required=True)
     parser.add_argument("--worker-epoch")
     parser.add_argument("--worker-epoch-file", type=Path)
+    parser.add_argument("--ready-file", type=Path)
     parser.add_argument("--role", choices=("denoiser", "vae"), required=True)
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--reservation-endpoint", required=True)
@@ -203,6 +211,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--capacity", type=int, required=True)
     parser.add_argument("--model-revision", required=True)
+    parser.add_argument("--routing-revision")
     parser.add_argument("--vae-fingerprint", required=True)
     parser.add_argument("--interval-s", type=float, default=5.0)
     return parser.parse_args()
@@ -229,12 +238,14 @@ async def _run(args: argparse.Namespace) -> None:
             worker_id=args.worker_id,
             worker_epoch=args.worker_epoch,
             worker_epoch_file=args.worker_epoch_file,
+            ready_file=args.ready_file,
             role=args.role,
             endpoint=args.endpoint,
             reservation_endpoint=args.reservation_endpoint,
             az=az,
             capacity=args.capacity,
             model_revision=args.model_revision,
+            routing_revision=args.routing_revision,
             vae_fingerprint=args.vae_fingerprint,
         )
         await reporter.run(interval_s=args.interval_s)

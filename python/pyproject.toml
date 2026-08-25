@@ -64,6 +64,7 @@ dependencies = [
   "python-multipart",
   "pyzmq>=25.1.2",
   "quack-kernels>=0.4.1",
+  "redis>=5.0.0,<6.0.0",
   "requests",
   "scipy",
   "sentencepiece",

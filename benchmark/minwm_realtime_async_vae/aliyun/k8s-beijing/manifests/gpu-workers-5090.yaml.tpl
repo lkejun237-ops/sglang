@@ -33,6 +33,12 @@ spec:
         - key: nvidia.com/gpu
           operator: Exists
           effect: NoSchedule
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoSchedule
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoSchedule
       initContainers:
         - name: denoiser-heartbeat-0
           image: ${GPU_RUNTIME_IMAGE}
@@ -47,12 +53,14 @@ spec:
               --state-url=http://127.0.0.1:30000/v1/realtime_worker/state
               --worker-id=$(NODE_NAME)-denoiser-0
               --worker-epoch-file=/var/run/minwm-worker/epoch
+              --ready-file=/var/run/minwm-worker/startup-warmup-ready
               --role=denoiser
               --endpoint=ws://$(POD_IP):30000/v1/realtime_video/generate
               --reservation-endpoint=http://$(POD_IP):30000/v1/realtime_worker
               --node-name=$(NODE_NAME)
               --capacity=1
-              --model-revision=wan22-5b-stage3-dmd-47-0808-2fb2cfec2a2
+              --model-revision=${MINWM_MODEL_REVISION}
+              --routing-revision=${MINWM_ROUTING_REVISION}
               --vae-fingerprint=taew2_2-d053e216
               --interval-s=5
           env:
@@ -68,6 +76,8 @@ spec:
             limits: {cpu: 200m, memory: 256Mi}
           volumeMounts:
             - {name: worker-epoch-denoiser-0, mountPath: /var/run/minwm-worker}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
         - name: denoiser-heartbeat-1
           image: ${GPU_RUNTIME_IMAGE}
           imagePullPolicy: IfNotPresent
@@ -81,12 +91,14 @@ spec:
               --state-url=http://127.0.0.1:30010/v1/realtime_worker/state
               --worker-id=$(NODE_NAME)-denoiser-1
               --worker-epoch-file=/var/run/minwm-worker/epoch
+              --ready-file=/var/run/minwm-worker/startup-warmup-ready
               --role=denoiser
               --endpoint=ws://$(POD_IP):30010/v1/realtime_video/generate
               --reservation-endpoint=http://$(POD_IP):30010/v1/realtime_worker
               --node-name=$(NODE_NAME)
               --capacity=1
-              --model-revision=wan22-5b-stage3-dmd-47-0808-2fb2cfec2a2
+              --model-revision=${MINWM_MODEL_REVISION}
+              --routing-revision=${MINWM_ROUTING_REVISION}
               --vae-fingerprint=taew2_2-d053e216
               --interval-s=5
           env:
@@ -102,6 +114,8 @@ spec:
             limits: {cpu: 200m, memory: 256Mi}
           volumeMounts:
             - {name: worker-epoch-denoiser-1, mountPath: /var/run/minwm-worker}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
         - name: denoiser-heartbeat-2
           image: ${GPU_RUNTIME_IMAGE}
           imagePullPolicy: IfNotPresent
@@ -115,12 +129,14 @@ spec:
               --state-url=http://127.0.0.1:30020/v1/realtime_worker/state
               --worker-id=$(NODE_NAME)-denoiser-2
               --worker-epoch-file=/var/run/minwm-worker/epoch
+              --ready-file=/var/run/minwm-worker/startup-warmup-ready
               --role=denoiser
               --endpoint=ws://$(POD_IP):30020/v1/realtime_video/generate
               --reservation-endpoint=http://$(POD_IP):30020/v1/realtime_worker
               --node-name=$(NODE_NAME)
               --capacity=1
-              --model-revision=wan22-5b-stage3-dmd-47-0808-2fb2cfec2a2
+              --model-revision=${MINWM_MODEL_REVISION}
+              --routing-revision=${MINWM_ROUTING_REVISION}
               --vae-fingerprint=taew2_2-d053e216
               --interval-s=5
           env:
@@ -136,6 +152,8 @@ spec:
             limits: {cpu: 200m, memory: 256Mi}
           volumeMounts:
             - {name: worker-epoch-denoiser-2, mountPath: /var/run/minwm-worker}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
         - name: denoiser-heartbeat-3
           image: ${GPU_RUNTIME_IMAGE}
           imagePullPolicy: IfNotPresent
@@ -149,12 +167,14 @@ spec:
               --state-url=http://127.0.0.1:30030/v1/realtime_worker/state
               --worker-id=$(NODE_NAME)-denoiser-3
               --worker-epoch-file=/var/run/minwm-worker/epoch
+              --ready-file=/var/run/minwm-worker/startup-warmup-ready
               --role=denoiser
               --endpoint=ws://$(POD_IP):30030/v1/realtime_video/generate
               --reservation-endpoint=http://$(POD_IP):30030/v1/realtime_worker
               --node-name=$(NODE_NAME)
               --capacity=1
-              --model-revision=wan22-5b-stage3-dmd-47-0808-2fb2cfec2a2
+              --model-revision=${MINWM_MODEL_REVISION}
+              --routing-revision=${MINWM_ROUTING_REVISION}
               --vae-fingerprint=taew2_2-d053e216
               --interval-s=5
           env:
@@ -170,6 +190,8 @@ spec:
             limits: {cpu: 200m, memory: 256Mi}
           volumeMounts:
             - {name: worker-epoch-denoiser-3, mountPath: /var/run/minwm-worker}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
         - name: denoiser-heartbeat-4
           image: ${GPU_RUNTIME_IMAGE}
           imagePullPolicy: IfNotPresent
@@ -183,12 +205,14 @@ spec:
               --state-url=http://127.0.0.1:30040/v1/realtime_worker/state
               --worker-id=$(NODE_NAME)-denoiser-4
               --worker-epoch-file=/var/run/minwm-worker/epoch
+              --ready-file=/var/run/minwm-worker/startup-warmup-ready
               --role=denoiser
               --endpoint=ws://$(POD_IP):30040/v1/realtime_video/generate
               --reservation-endpoint=http://$(POD_IP):30040/v1/realtime_worker
               --node-name=$(NODE_NAME)
               --capacity=1
-              --model-revision=wan22-5b-stage3-dmd-47-0808-2fb2cfec2a2
+              --model-revision=${MINWM_MODEL_REVISION}
+              --routing-revision=${MINWM_ROUTING_REVISION}
               --vae-fingerprint=taew2_2-d053e216
               --interval-s=5
           env:
@@ -204,6 +228,8 @@ spec:
             limits: {cpu: 200m, memory: 256Mi}
           volumeMounts:
             - {name: worker-epoch-denoiser-4, mountPath: /var/run/minwm-worker}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
         - name: denoiser-heartbeat-5
           image: ${GPU_RUNTIME_IMAGE}
           imagePullPolicy: IfNotPresent
@@ -217,12 +243,14 @@ spec:
               --state-url=http://127.0.0.1:30050/v1/realtime_worker/state
               --worker-id=$(NODE_NAME)-denoiser-5
               --worker-epoch-file=/var/run/minwm-worker/epoch
+              --ready-file=/var/run/minwm-worker/startup-warmup-ready
               --role=denoiser
               --endpoint=ws://$(POD_IP):30050/v1/realtime_video/generate
               --reservation-endpoint=http://$(POD_IP):30050/v1/realtime_worker
               --node-name=$(NODE_NAME)
               --capacity=1
-              --model-revision=wan22-5b-stage3-dmd-47-0808-2fb2cfec2a2
+              --model-revision=${MINWM_MODEL_REVISION}
+              --routing-revision=${MINWM_ROUTING_REVISION}
               --vae-fingerprint=taew2_2-d053e216
               --interval-s=5
           env:
@@ -238,6 +266,8 @@ spec:
             limits: {cpu: 200m, memory: 256Mi}
           volumeMounts:
             - {name: worker-epoch-denoiser-5, mountPath: /var/run/minwm-worker}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
         - name: denoiser-heartbeat-6
           image: ${GPU_RUNTIME_IMAGE}
           imagePullPolicy: IfNotPresent
@@ -251,12 +281,14 @@ spec:
               --state-url=http://127.0.0.1:30060/v1/realtime_worker/state
               --worker-id=$(NODE_NAME)-denoiser-6
               --worker-epoch-file=/var/run/minwm-worker/epoch
+              --ready-file=/var/run/minwm-worker/startup-warmup-ready
               --role=denoiser
               --endpoint=ws://$(POD_IP):30060/v1/realtime_video/generate
               --reservation-endpoint=http://$(POD_IP):30060/v1/realtime_worker
               --node-name=$(NODE_NAME)
               --capacity=1
-              --model-revision=wan22-5b-stage3-dmd-47-0808-2fb2cfec2a2
+              --model-revision=${MINWM_MODEL_REVISION}
+              --routing-revision=${MINWM_ROUTING_REVISION}
               --vae-fingerprint=taew2_2-d053e216
               --interval-s=5
           env:
@@ -272,6 +304,8 @@ spec:
             limits: {cpu: 200m, memory: 256Mi}
           volumeMounts:
             - {name: worker-epoch-denoiser-6, mountPath: /var/run/minwm-worker}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
       containers:
         - name: denoiser-0
           image: ${GPU_RUNTIME_IMAGE}
@@ -283,6 +317,7 @@ spec:
               set -euo pipefail
               exec 9>/var/run/minwm-startup-lock/denoiser.lock
               flock -x 9
+              rm -f /var/run/minwm-worker/startup-warmup-ready
               python3 -m sglang.multimodal_gen.tools.minwm_profile_launcher \
                 --profile auto \
                 --taehv-checkpoint-path /models/taehv/taew2_2.pth \
@@ -300,6 +335,7 @@ spec:
                 --realtime-max-sessions-per-worker 1 \
                 --realtime-vae-backend taehv_remote \
                 --realtime-vae-transport websocket \
+                --realtime-vae-worker-url ws://zing-vae-workers:18082/v1/realtime_vae/decode \
                 --realtime-session-idle-timeout-s 90 \
                 --realtime-session-max-lifetime-s 70 \
                 --realtime-admission-wait-s 10 \
@@ -322,6 +358,17 @@ spec:
                 fi
                 sleep 2
               done
+              if ! python3 -m sglang.multimodal_gen.runtime.realtime.startup_warmup \
+                --url ws://127.0.0.1:30000/v1/realtime_video/generate \
+                --model minwm \
+                --size "${STARTUP_WARMUP_SIZE}" \
+                --timeout-s "${STARTUP_WARMUP_TIMEOUT_SECONDS}" \
+                --ready-file /var/run/minwm-worker/startup-warmup-ready \
+                --allow-empty-complete; then
+                kill -TERM "${child}" 2>/dev/null || true
+                wait "${child}" || true
+                exit 1
+              fi
               flock -u 9
               wait "${child}"
           env:
@@ -352,6 +399,8 @@ spec:
             - {name: NCCL_PROTO, value: Simple}
             - {name: REALTIME_MAX_SESSIONS, value: "1"}
             - {name: REALTIME_UI_CONFIG_JSON, value: '{"targetFps":${REALTIME_TARGET_FPS},"size":"${REALTIME_SIZE}","dualModels":{"minwm":{"sinkSize":8,"windowFrames":32}}}'}
+            - {name: STARTUP_WARMUP_SIZE, value: "${STARTUP_WARMUP_SIZE}"}
+            - {name: STARTUP_WARMUP_TIMEOUT_SECONDS, value: "${STARTUP_WARMUP_TIMEOUT_SECONDS}"}
           ports:
             - {name: denoiser-0, containerPort: 30000}
           startupProbe:
@@ -378,6 +427,8 @@ spec:
               add: [SYS_ADMIN]
           volumeMounts:
             - {name: worker-epoch-denoiser-0, mountPath: /var/run/minwm-worker}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
             - {name: startup-lock, mountPath: /var/run/minwm-startup-lock}
             - {name: model, mountPath: /models/minwm-tianpeng-gap12, readOnly: true}
             - {name: taehv, mountPath: /models/taehv, readOnly: true}
@@ -386,7 +437,9 @@ spec:
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/generate_session.py, subPath: generate_session.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/startup_warmup.py, subPath: startup_warmup.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/startup_warmup.py, subPath: startup_warmup.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_client.py, subPath: async_vae_client.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
@@ -406,6 +459,7 @@ spec:
               set -euo pipefail
               exec 9>/var/run/minwm-startup-lock/denoiser.lock
               flock -x 9
+              rm -f /var/run/minwm-worker/startup-warmup-ready
               python3 -m sglang.multimodal_gen.tools.minwm_profile_launcher \
                 --profile auto \
                 --taehv-checkpoint-path /models/taehv/taew2_2.pth \
@@ -423,6 +477,7 @@ spec:
                 --realtime-max-sessions-per-worker 1 \
                 --realtime-vae-backend taehv_remote \
                 --realtime-vae-transport websocket \
+                --realtime-vae-worker-url ws://zing-vae-workers:18082/v1/realtime_vae/decode \
                 --realtime-session-idle-timeout-s 90 \
                 --realtime-session-max-lifetime-s 70 \
                 --realtime-admission-wait-s 10 \
@@ -445,6 +500,17 @@ spec:
                 fi
                 sleep 2
               done
+              if ! python3 -m sglang.multimodal_gen.runtime.realtime.startup_warmup \
+                --url ws://127.0.0.1:30010/v1/realtime_video/generate \
+                --model minwm \
+                --size "${STARTUP_WARMUP_SIZE}" \
+                --timeout-s "${STARTUP_WARMUP_TIMEOUT_SECONDS}" \
+                --ready-file /var/run/minwm-worker/startup-warmup-ready \
+                --allow-empty-complete; then
+                kill -TERM "${child}" 2>/dev/null || true
+                wait "${child}" || true
+                exit 1
+              fi
               flock -u 9
               wait "${child}"
           env:
@@ -475,6 +541,8 @@ spec:
             - {name: NCCL_PROTO, value: Simple}
             - {name: REALTIME_MAX_SESSIONS, value: "1"}
             - {name: REALTIME_UI_CONFIG_JSON, value: '{"targetFps":${REALTIME_TARGET_FPS},"size":"${REALTIME_SIZE}","dualModels":{"minwm":{"sinkSize":8,"windowFrames":32}}}'}
+            - {name: STARTUP_WARMUP_SIZE, value: "${STARTUP_WARMUP_SIZE}"}
+            - {name: STARTUP_WARMUP_TIMEOUT_SECONDS, value: "${STARTUP_WARMUP_TIMEOUT_SECONDS}"}
           ports:
             - {name: denoiser-1, containerPort: 30010}
           startupProbe:
@@ -501,6 +569,8 @@ spec:
               add: [SYS_ADMIN]
           volumeMounts:
             - {name: worker-epoch-denoiser-1, mountPath: /var/run/minwm-worker}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
             - {name: startup-lock, mountPath: /var/run/minwm-startup-lock}
             - {name: model, mountPath: /models/minwm-tianpeng-gap12, readOnly: true}
             - {name: taehv, mountPath: /models/taehv, readOnly: true}
@@ -509,7 +579,9 @@ spec:
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/generate_session.py, subPath: generate_session.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/startup_warmup.py, subPath: startup_warmup.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/startup_warmup.py, subPath: startup_warmup.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_client.py, subPath: async_vae_client.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
@@ -529,6 +601,7 @@ spec:
               set -euo pipefail
               exec 9>/var/run/minwm-startup-lock/denoiser.lock
               flock -x 9
+              rm -f /var/run/minwm-worker/startup-warmup-ready
               python3 -m sglang.multimodal_gen.tools.minwm_profile_launcher \
                 --profile auto \
                 --taehv-checkpoint-path /models/taehv/taew2_2.pth \
@@ -546,6 +619,7 @@ spec:
                 --realtime-max-sessions-per-worker 1 \
                 --realtime-vae-backend taehv_remote \
                 --realtime-vae-transport websocket \
+                --realtime-vae-worker-url ws://zing-vae-workers:18082/v1/realtime_vae/decode \
                 --realtime-session-idle-timeout-s 90 \
                 --realtime-session-max-lifetime-s 70 \
                 --realtime-admission-wait-s 10 \
@@ -568,6 +642,17 @@ spec:
                 fi
                 sleep 2
               done
+              if ! python3 -m sglang.multimodal_gen.runtime.realtime.startup_warmup \
+                --url ws://127.0.0.1:30020/v1/realtime_video/generate \
+                --model minwm \
+                --size "${STARTUP_WARMUP_SIZE}" \
+                --timeout-s "${STARTUP_WARMUP_TIMEOUT_SECONDS}" \
+                --ready-file /var/run/minwm-worker/startup-warmup-ready \
+                --allow-empty-complete; then
+                kill -TERM "${child}" 2>/dev/null || true
+                wait "${child}" || true
+                exit 1
+              fi
               flock -u 9
               wait "${child}"
           env:
@@ -598,6 +683,8 @@ spec:
             - {name: NCCL_PROTO, value: Simple}
             - {name: REALTIME_MAX_SESSIONS, value: "1"}
             - {name: REALTIME_UI_CONFIG_JSON, value: '{"targetFps":${REALTIME_TARGET_FPS},"size":"${REALTIME_SIZE}","dualModels":{"minwm":{"sinkSize":8,"windowFrames":32}}}'}
+            - {name: STARTUP_WARMUP_SIZE, value: "${STARTUP_WARMUP_SIZE}"}
+            - {name: STARTUP_WARMUP_TIMEOUT_SECONDS, value: "${STARTUP_WARMUP_TIMEOUT_SECONDS}"}
           ports:
             - {name: denoiser-2, containerPort: 30020}
           startupProbe:
@@ -624,6 +711,8 @@ spec:
               add: [SYS_ADMIN]
           volumeMounts:
             - {name: worker-epoch-denoiser-2, mountPath: /var/run/minwm-worker}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
             - {name: startup-lock, mountPath: /var/run/minwm-startup-lock}
             - {name: model, mountPath: /models/minwm-tianpeng-gap12, readOnly: true}
             - {name: taehv, mountPath: /models/taehv, readOnly: true}
@@ -632,7 +721,9 @@ spec:
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/generate_session.py, subPath: generate_session.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/startup_warmup.py, subPath: startup_warmup.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/startup_warmup.py, subPath: startup_warmup.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_client.py, subPath: async_vae_client.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
@@ -652,6 +743,7 @@ spec:
               set -euo pipefail
               exec 9>/var/run/minwm-startup-lock/denoiser.lock
               flock -x 9
+              rm -f /var/run/minwm-worker/startup-warmup-ready
               python3 -m sglang.multimodal_gen.tools.minwm_profile_launcher \
                 --profile auto \
                 --taehv-checkpoint-path /models/taehv/taew2_2.pth \
@@ -669,6 +761,7 @@ spec:
                 --realtime-max-sessions-per-worker 1 \
                 --realtime-vae-backend taehv_remote \
                 --realtime-vae-transport websocket \
+                --realtime-vae-worker-url ws://zing-vae-workers:18082/v1/realtime_vae/decode \
                 --realtime-session-idle-timeout-s 90 \
                 --realtime-session-max-lifetime-s 70 \
                 --realtime-admission-wait-s 10 \
@@ -691,6 +784,17 @@ spec:
                 fi
                 sleep 2
               done
+              if ! python3 -m sglang.multimodal_gen.runtime.realtime.startup_warmup \
+                --url ws://127.0.0.1:30030/v1/realtime_video/generate \
+                --model minwm \
+                --size "${STARTUP_WARMUP_SIZE}" \
+                --timeout-s "${STARTUP_WARMUP_TIMEOUT_SECONDS}" \
+                --ready-file /var/run/minwm-worker/startup-warmup-ready \
+                --allow-empty-complete; then
+                kill -TERM "${child}" 2>/dev/null || true
+                wait "${child}" || true
+                exit 1
+              fi
               flock -u 9
               wait "${child}"
           env:
@@ -721,6 +825,8 @@ spec:
             - {name: NCCL_PROTO, value: Simple}
             - {name: REALTIME_MAX_SESSIONS, value: "1"}
             - {name: REALTIME_UI_CONFIG_JSON, value: '{"targetFps":${REALTIME_TARGET_FPS},"size":"${REALTIME_SIZE}","dualModels":{"minwm":{"sinkSize":8,"windowFrames":32}}}'}
+            - {name: STARTUP_WARMUP_SIZE, value: "${STARTUP_WARMUP_SIZE}"}
+            - {name: STARTUP_WARMUP_TIMEOUT_SECONDS, value: "${STARTUP_WARMUP_TIMEOUT_SECONDS}"}
           ports:
             - {name: denoiser-3, containerPort: 30030}
           startupProbe:
@@ -747,6 +853,8 @@ spec:
               add: [SYS_ADMIN]
           volumeMounts:
             - {name: worker-epoch-denoiser-3, mountPath: /var/run/minwm-worker}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
             - {name: startup-lock, mountPath: /var/run/minwm-startup-lock}
             - {name: model, mountPath: /models/minwm-tianpeng-gap12, readOnly: true}
             - {name: taehv, mountPath: /models/taehv, readOnly: true}
@@ -755,7 +863,9 @@ spec:
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/generate_session.py, subPath: generate_session.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/startup_warmup.py, subPath: startup_warmup.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/startup_warmup.py, subPath: startup_warmup.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_client.py, subPath: async_vae_client.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
@@ -775,6 +885,7 @@ spec:
               set -euo pipefail
               exec 9>/var/run/minwm-startup-lock/denoiser.lock
               flock -x 9
+              rm -f /var/run/minwm-worker/startup-warmup-ready
               python3 -m sglang.multimodal_gen.tools.minwm_profile_launcher \
                 --profile auto \
                 --taehv-checkpoint-path /models/taehv/taew2_2.pth \
@@ -792,6 +903,7 @@ spec:
                 --realtime-max-sessions-per-worker 1 \
                 --realtime-vae-backend taehv_remote \
                 --realtime-vae-transport websocket \
+                --realtime-vae-worker-url ws://zing-vae-workers:18082/v1/realtime_vae/decode \
                 --realtime-session-idle-timeout-s 90 \
                 --realtime-session-max-lifetime-s 70 \
                 --realtime-admission-wait-s 10 \
@@ -814,6 +926,17 @@ spec:
                 fi
                 sleep 2
               done
+              if ! python3 -m sglang.multimodal_gen.runtime.realtime.startup_warmup \
+                --url ws://127.0.0.1:30040/v1/realtime_video/generate \
+                --model minwm \
+                --size "${STARTUP_WARMUP_SIZE}" \
+                --timeout-s "${STARTUP_WARMUP_TIMEOUT_SECONDS}" \
+                --ready-file /var/run/minwm-worker/startup-warmup-ready \
+                --allow-empty-complete; then
+                kill -TERM "${child}" 2>/dev/null || true
+                wait "${child}" || true
+                exit 1
+              fi
               flock -u 9
               wait "${child}"
           env:
@@ -844,6 +967,8 @@ spec:
             - {name: NCCL_PROTO, value: Simple}
             - {name: REALTIME_MAX_SESSIONS, value: "1"}
             - {name: REALTIME_UI_CONFIG_JSON, value: '{"targetFps":${REALTIME_TARGET_FPS},"size":"${REALTIME_SIZE}","dualModels":{"minwm":{"sinkSize":8,"windowFrames":32}}}'}
+            - {name: STARTUP_WARMUP_SIZE, value: "${STARTUP_WARMUP_SIZE}"}
+            - {name: STARTUP_WARMUP_TIMEOUT_SECONDS, value: "${STARTUP_WARMUP_TIMEOUT_SECONDS}"}
           ports:
             - {name: denoiser-4, containerPort: 30040}
           startupProbe:
@@ -870,6 +995,8 @@ spec:
               add: [SYS_ADMIN]
           volumeMounts:
             - {name: worker-epoch-denoiser-4, mountPath: /var/run/minwm-worker}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
             - {name: startup-lock, mountPath: /var/run/minwm-startup-lock}
             - {name: model, mountPath: /models/minwm-tianpeng-gap12, readOnly: true}
             - {name: taehv, mountPath: /models/taehv, readOnly: true}
@@ -878,7 +1005,9 @@ spec:
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/generate_session.py, subPath: generate_session.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/startup_warmup.py, subPath: startup_warmup.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/startup_warmup.py, subPath: startup_warmup.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_client.py, subPath: async_vae_client.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
@@ -898,6 +1027,7 @@ spec:
               set -euo pipefail
               exec 9>/var/run/minwm-startup-lock/denoiser.lock
               flock -x 9
+              rm -f /var/run/minwm-worker/startup-warmup-ready
               python3 -m sglang.multimodal_gen.tools.minwm_profile_launcher \
                 --profile auto \
                 --taehv-checkpoint-path /models/taehv/taew2_2.pth \
@@ -915,6 +1045,7 @@ spec:
                 --realtime-max-sessions-per-worker 1 \
                 --realtime-vae-backend taehv_remote \
                 --realtime-vae-transport websocket \
+                --realtime-vae-worker-url ws://zing-vae-workers:18082/v1/realtime_vae/decode \
                 --realtime-session-idle-timeout-s 90 \
                 --realtime-session-max-lifetime-s 70 \
                 --realtime-admission-wait-s 10 \
@@ -937,6 +1068,17 @@ spec:
                 fi
                 sleep 2
               done
+              if ! python3 -m sglang.multimodal_gen.runtime.realtime.startup_warmup \
+                --url ws://127.0.0.1:30050/v1/realtime_video/generate \
+                --model minwm \
+                --size "${STARTUP_WARMUP_SIZE}" \
+                --timeout-s "${STARTUP_WARMUP_TIMEOUT_SECONDS}" \
+                --ready-file /var/run/minwm-worker/startup-warmup-ready \
+                --allow-empty-complete; then
+                kill -TERM "${child}" 2>/dev/null || true
+                wait "${child}" || true
+                exit 1
+              fi
               flock -u 9
               wait "${child}"
           env:
@@ -967,6 +1109,8 @@ spec:
             - {name: NCCL_PROTO, value: Simple}
             - {name: REALTIME_MAX_SESSIONS, value: "1"}
             - {name: REALTIME_UI_CONFIG_JSON, value: '{"targetFps":${REALTIME_TARGET_FPS},"size":"${REALTIME_SIZE}","dualModels":{"minwm":{"sinkSize":8,"windowFrames":32}}}'}
+            - {name: STARTUP_WARMUP_SIZE, value: "${STARTUP_WARMUP_SIZE}"}
+            - {name: STARTUP_WARMUP_TIMEOUT_SECONDS, value: "${STARTUP_WARMUP_TIMEOUT_SECONDS}"}
           ports:
             - {name: denoiser-5, containerPort: 30050}
           startupProbe:
@@ -993,6 +1137,8 @@ spec:
               add: [SYS_ADMIN]
           volumeMounts:
             - {name: worker-epoch-denoiser-5, mountPath: /var/run/minwm-worker}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
             - {name: startup-lock, mountPath: /var/run/minwm-startup-lock}
             - {name: model, mountPath: /models/minwm-tianpeng-gap12, readOnly: true}
             - {name: taehv, mountPath: /models/taehv, readOnly: true}
@@ -1001,7 +1147,9 @@ spec:
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/generate_session.py, subPath: generate_session.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/startup_warmup.py, subPath: startup_warmup.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/startup_warmup.py, subPath: startup_warmup.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_client.py, subPath: async_vae_client.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
@@ -1021,6 +1169,7 @@ spec:
               set -euo pipefail
               exec 9>/var/run/minwm-startup-lock/denoiser.lock
               flock -x 9
+              rm -f /var/run/minwm-worker/startup-warmup-ready
               python3 -m sglang.multimodal_gen.tools.minwm_profile_launcher \
                 --profile auto \
                 --taehv-checkpoint-path /models/taehv/taew2_2.pth \
@@ -1038,6 +1187,7 @@ spec:
                 --realtime-max-sessions-per-worker 1 \
                 --realtime-vae-backend taehv_remote \
                 --realtime-vae-transport websocket \
+                --realtime-vae-worker-url ws://zing-vae-workers:18082/v1/realtime_vae/decode \
                 --realtime-session-idle-timeout-s 90 \
                 --realtime-session-max-lifetime-s 70 \
                 --realtime-admission-wait-s 10 \
@@ -1060,6 +1210,17 @@ spec:
                 fi
                 sleep 2
               done
+              if ! python3 -m sglang.multimodal_gen.runtime.realtime.startup_warmup \
+                --url ws://127.0.0.1:30060/v1/realtime_video/generate \
+                --model minwm \
+                --size "${STARTUP_WARMUP_SIZE}" \
+                --timeout-s "${STARTUP_WARMUP_TIMEOUT_SECONDS}" \
+                --ready-file /var/run/minwm-worker/startup-warmup-ready \
+                --allow-empty-complete; then
+                kill -TERM "${child}" 2>/dev/null || true
+                wait "${child}" || true
+                exit 1
+              fi
               flock -u 9
               wait "${child}"
           env:
@@ -1090,6 +1251,8 @@ spec:
             - {name: NCCL_PROTO, value: Simple}
             - {name: REALTIME_MAX_SESSIONS, value: "1"}
             - {name: REALTIME_UI_CONFIG_JSON, value: '{"targetFps":${REALTIME_TARGET_FPS},"size":"${REALTIME_SIZE}","dualModels":{"minwm":{"sinkSize":8,"windowFrames":32}}}'}
+            - {name: STARTUP_WARMUP_SIZE, value: "${STARTUP_WARMUP_SIZE}"}
+            - {name: STARTUP_WARMUP_TIMEOUT_SECONDS, value: "${STARTUP_WARMUP_TIMEOUT_SECONDS}"}
           ports:
             - {name: denoiser-6, containerPort: 30060}
           startupProbe:
@@ -1116,6 +1279,8 @@ spec:
               add: [SYS_ADMIN]
           volumeMounts:
             - {name: worker-epoch-denoiser-6, mountPath: /var/run/minwm-worker}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/worker_heartbeat.py, subPath: worker_heartbeat.py, readOnly: true}
             - {name: startup-lock, mountPath: /var/run/minwm-startup-lock}
             - {name: model, mountPath: /models/minwm-tianpeng-gap12, readOnly: true}
             - {name: taehv, mountPath: /models/taehv, readOnly: true}
@@ -1124,7 +1289,9 @@ spec:
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_video_api.py, subPath: realtime_video_api.py, readOnly: true}
             - {name: runtime-openai-realtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/generate_session.py, subPath: generate_session.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/startup_warmup.py, subPath: startup_warmup.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/critical_path_metrics.py, subPath: critical_path_metrics.py, readOnly: true}
+            - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/startup_warmup.py, subPath: startup_warmup.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_client.py, subPath: async_vae_client.py, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/realtime/async_vae_protocol.py, subPath: async_vae_protocol.py, readOnly: true}
@@ -1156,6 +1323,22 @@ spec:
           hostPath:
             path: /data/zing-realtime/taehv
             type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zing-vae-workers
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: zing-vae-workers
+    app.kubernetes.io/part-of: minwm-realtime
+spec:
+  selector:
+    app.kubernetes.io/name: zing-vae-5090-dual
+  ports:
+    - name: vae
+      port: 18082
+      targetPort: vae-0
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -1190,6 +1373,12 @@ spec:
         seedleap.ai/gpu-pool: aliyun-beijing-5090
       tolerations:
         - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoSchedule
+        - key: node.kubernetes.io/unreachable
           operator: Exists
           effect: NoSchedule
       initContainers:
@@ -1243,6 +1432,7 @@ spec:
             - --queue-depth-per-session=1
             - --encoded-frames-per-batch=1
             - --max-message-mb=64
+            - --warmup-size=${STARTUP_WARMUP_SIZE}
             - --host=0.0.0.0
             - --port=18082
             - --direct-h264-output
@@ -1262,6 +1452,7 @@ spec:
             - {name: NVIDIA_VISIBLE_DEVICES, value: "7"}
             - {name: NVIDIA_DRIVER_CAPABILITIES, value: "compute,utility"}
             - {name: WORKER_EPOCH_FILE, value: /var/run/minwm-worker/epoch}
+            - {name: STARTUP_WARMUP_SIZE, value: "${STARTUP_WARMUP_SIZE}"}
           ports:
             - {name: vae-0, containerPort: 18082}
           startupProbe:

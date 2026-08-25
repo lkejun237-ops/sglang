@@ -11,6 +11,7 @@ from sglang.multimodal_gen.runtime.realtime.coordinator import (
     HTTPWorkerReservationClient,
     InMemoryCoordinatorStore,
     RealtimeCoordinator,
+    RedisCoordinatorStore,
     SessionAssignment,
     WorkerHeartbeat,
     WorkerSlot,
@@ -24,6 +25,7 @@ def _heartbeat(
     capacity: int = 1,
     az: str = "us-east-2a",
     model_revision: str = "minwm-r1",
+    routing_revision: str = "",
     vae_fingerprint: str = "taew2_2",
     worker_epoch: str = "epoch-a",
     lifecycle: str = "ready",
@@ -39,6 +41,7 @@ def _heartbeat(
         az=az,
         capacity=capacity,
         model_revision=model_revision,
+        routing_revision=routing_revision,
         vae_fingerprint=vae_fingerprint,
         worker_epoch=worker_epoch,
         lifecycle=lifecycle,
@@ -50,6 +53,29 @@ def _heartbeat(
         reservation_endpoint=f"http://{worker_id}.cluster.local/v1/realtime_worker",
         drain_deadline=drain_deadline,
     )
+
+
+class FakeAsyncRedis:
+    def __init__(self):
+        self.values = {}
+
+    async def get(self, key):
+        return self.values.get(key)
+
+    async def set(self, key, value, *, nx=False, px=None, ex=None):
+        if nx and key in self.values:
+            return False
+        self.values[key] = value
+        return True
+
+    async def delete(self, key):
+        return 1 if self.values.pop(key, None) is not None else 0
+
+    async def eval(self, script, numkeys, key, token):
+        if self.values.get(key) == token:
+            self.values.pop(key, None)
+            return 1
+        return 0
 
 
 def test_coordinator_atomically_pairs_compatible_worker_slots():
@@ -77,6 +103,187 @@ def test_coordinator_atomically_pairs_compatible_worker_slots():
     coordinator, assignment = asyncio.run(run())
     assert coordinator is not None
     assert assignment.session_id == "session-a"
+
+
+def test_coordinator_routes_by_stable_revision_alias_while_preserving_artifact_revision():
+    async def run():
+        coordinator = RealtimeCoordinator(
+            InMemoryCoordinatorStore(ttl_s=60, worker_ttl_s=30),
+            wait_timeout_s=0,
+        )
+        await coordinator.heartbeat(
+            _heartbeat(
+                "denoiser-a",
+                "denoiser",
+                model_revision="checkpoint-20260825",
+                routing_revision="minwm",
+            )
+        )
+        await coordinator.heartbeat(_heartbeat("vae-a", "vae"))
+
+        assignment = await coordinator.admit(
+            user_id="user-a",
+            session_id="session-a",
+            generation_id="generation-a",
+            model_revision="minwm",
+            vae_fingerprint="taew2_2",
+        )
+
+        assert assignment.denoiser.model_revision == "checkpoint-20260825"
+        assert assignment.denoiser.routing_revision == "minwm"
+
+    asyncio.run(run())
+
+
+def test_coordinator_can_route_alias_to_legacy_worker_model_revision():
+    async def run():
+        coordinator = RealtimeCoordinator(
+            InMemoryCoordinatorStore(
+                ttl_s=60,
+                worker_ttl_s=30,
+                routing_revision_aliases={
+                    "minwm": ["checkpoint-20260825"],
+                },
+            ),
+            wait_timeout_s=0,
+        )
+        await coordinator.heartbeat(
+            _heartbeat(
+                "denoiser-a",
+                "denoiser",
+                model_revision="checkpoint-20260825",
+            )
+        )
+        await coordinator.heartbeat(_heartbeat("vae-a", "vae"))
+
+        assignment = await coordinator.admit(
+            user_id="user-a",
+            session_id="session-a",
+            generation_id="generation-a",
+            model_revision="minwm",
+            vae_fingerprint="taew2_2",
+        )
+
+        assert assignment.denoiser.model_revision == "checkpoint-20260825"
+        assert assignment.denoiser.routing_revision == "checkpoint-20260825"
+
+    asyncio.run(run())
+
+
+def test_redis_coordinator_can_route_alias_to_legacy_worker_model_revision():
+    async def run():
+        client = FakeAsyncRedis()
+        store = RedisCoordinatorStore(
+            client=client,
+            ttl_s=60,
+            worker_ttl_s=30,
+            routing_revision_aliases={"minwm": ["checkpoint-20260825"]},
+            clock=lambda: 10,
+            wall_clock=lambda: 100,
+        )
+        await store.heartbeat(
+            _heartbeat(
+                "denoiser-a",
+                "denoiser",
+                model_revision="checkpoint-20260825",
+            )
+        )
+        await store.heartbeat(_heartbeat("vae-a", "vae"))
+
+        assignment = await store.acquire(
+            user_id="user-a",
+            session_id="session-a",
+            generation_id="generation-a",
+            model_revision="minwm",
+            vae_fingerprint="taew2_2",
+        )
+
+        assert assignment.denoiser.model_revision == "checkpoint-20260825"
+
+    asyncio.run(run())
+
+
+def test_redis_coordinator_store_shares_session_state_across_instances():
+    async def run():
+        client = FakeAsyncRedis()
+        store_a = RedisCoordinatorStore(
+            client=client,
+            ttl_s=60,
+            worker_ttl_s=30,
+            clock=lambda: 10,
+            wall_clock=lambda: 100,
+        )
+        store_b = RedisCoordinatorStore(
+            client=client,
+            ttl_s=60,
+            worker_ttl_s=30,
+            clock=lambda: 10,
+            wall_clock=lambda: 100,
+        )
+        await store_a.heartbeat(_heartbeat("denoiser-a", "denoiser"))
+        await store_b.heartbeat(_heartbeat("vae-a", "vae"))
+
+        assignment = await store_b.acquire(
+            user_id="user-a",
+            session_id="session-a",
+            generation_id="generation-a",
+            model_revision="minwm-r1",
+            vae_fingerprint="taew2_2",
+        )
+
+        with pytest.raises(CoordinatorRejected, match="USER_SESSION_LIMIT"):
+            await store_a.acquire(
+                user_id="user-a",
+                session_id="session-b",
+                generation_id="generation-b",
+                model_revision="minwm-r1",
+                vae_fingerprint="taew2_2",
+            )
+
+        renewed = await store_a.renew(assignment)
+        assert renewed.token == assignment.token
+        await store_b.release(renewed)
+        snapshot = await store_a.capacity_snapshot()
+        assert snapshot["roles"]["denoiser"]["free_slots"] == 1
+        assert snapshot["roles"]["vae"]["free_slots"] == 1
+
+    asyncio.run(run())
+
+
+def test_redis_attempt_owner_is_shared_and_idempotent():
+    async def run():
+        client = FakeAsyncRedis()
+        store_a = RedisCoordinatorStore(
+            client=client,
+            ttl_s=60,
+            worker_ttl_s=30,
+            wall_clock=lambda: 100,
+        )
+        store_b = RedisCoordinatorStore(
+            client=client,
+            ttl_s=60,
+            worker_ttl_s=30,
+            wall_clock=lambda: 100,
+        )
+
+        await store_a.claim_attempt(
+            attempt_id="attempt-a",
+            owner_id="gateway-a",
+            expires_at=200,
+        )
+        await store_b.claim_attempt(
+            attempt_id="attempt-a",
+            owner_id="gateway-a",
+            expires_at=200,
+        )
+        with pytest.raises(CoordinatorRejected, match="ATTEMPT_ALREADY_OWNED"):
+            await store_b.claim_attempt(
+                attempt_id="attempt-a",
+                owner_id="gateway-b",
+                expires_at=200,
+            )
+
+    asyncio.run(run())
 
 
 def test_capacity_snapshot_combines_waiting_load_free_slots_and_drain_state():
@@ -1189,6 +1396,53 @@ def test_dynamodb_heartbeat_clamps_advertised_denoiser_capacity():
     assert client.slot_updates[0]["ExpressionAttributeValues"][":capacity"] == {
         "N": "1"
     }
+
+
+def test_dynamodb_heartbeat_indexes_slots_by_routing_revision_alias():
+    class TransactionConflictException(Exception):
+        pass
+
+    class FakeExceptions:
+        pass
+
+    FakeExceptions.TransactionConflictException = TransactionConflictException
+
+    class FakeClient:
+        exceptions = FakeExceptions()
+
+        def __init__(self):
+            self.worker_item = None
+            self.slot_updates = []
+
+        def put_item(self, *, Item, **_kwargs):
+            self.worker_item = Item
+
+        def update_item(self, **kwargs):
+            self.slot_updates.append(kwargs)
+
+    client = FakeClient()
+    store = DynamoDBCoordinatorStore(
+        "minwm-realtime-coordinator",
+        ttl_s=60,
+        worker_ttl_s=30,
+        client=client,
+    )
+
+    store._heartbeat_sync(
+        _heartbeat(
+            "denoiser-a",
+            "denoiser",
+            model_revision="checkpoint-20260825",
+            routing_revision="minwm",
+        )
+    )
+
+    assert client.worker_item["model_revision"] == {"S": "checkpoint-20260825"}
+    assert client.worker_item["routing_revision"] == {"S": "minwm"}
+    values = client.slot_updates[0]["ExpressionAttributeValues"]
+    assert values[":model_revision"] == {"S": "checkpoint-20260825"}
+    assert values[":routing_revision"] == {"S": "minwm"}
+    assert values[":allocation_key"] == {"S": "DENOISER#minwm"}
 
 
 def test_dynamodb_heartbeat_allows_four_sessions_per_denoiser_gpu():

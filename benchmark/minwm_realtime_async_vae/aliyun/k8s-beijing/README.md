@@ -9,16 +9,19 @@ instances as GPU worker nodes.
 ```bash
 SSH_HOST=root@39.105.87.6 \
 PUBLIC_WEB_HOST=39.105.87.6 \
-HTTPS_PROXY_SECRET_VALUE='http://proxy_user:***@aws-proxy.loopit.com.cn:5566' \
+REDIS_PASSWORD='***' \
+HTTPS_PROXY_SECRET_VALUE='http://<proxy-user>:<proxy-pass>@<proxy-host>:<proxy-port>' \
 bash benchmark/minwm_realtime_async_vae/aliyun/k8s-beijing/deploy_control_plane.sh
 ```
 
 The script installs k3s if needed, keeps k3s/containerd state on `/data/k3s`
 and kubelet state on `/data/kubelet`, creates image-pull and optional
-webui/proxy secrets, then applies:
+webui/proxy/Redis secrets, then applies:
 
-- `zing-coordinator`: in-memory coordinator, one replica for the isolated
-  pre-GPU Beijing control plane.
+- `zing-coordinator`: Redis-backed coordinator state using the private
+  `world-model-realtime-redis` service. The password is read from the
+  `REDIS_PASSWORD` deployment environment and stored in the `zing-redis`
+  Kubernetes Secret; it is not embedded in this repository.
 - `zing-gateway`: gateway on host port `18080`.
 - `zing-webui`: web UI on host port `80`.
 - `zing-denoiser-5090-sp2`: one DaemonSet Pod per 5090 worker node. The name is
@@ -92,6 +95,10 @@ The worker template preserves the current Zing constraints:
 - causal sink/window `8/32`
 - `--attention-backend fa`
 - `MINWM_ATTENTION_IMPL=packed`
+- stable routing revision `MINWM_ROUTING_REVISION=minwm`; denoisers report the
+  actual checkpoint through `MINWM_MODEL_REVISION` plus this routing alias, so
+  future model releases can roll the GPU workers without changing Gateway
+  config.
 - `minwm_profile_launcher --profile auto` with single-GPU `sp=1` overrides for
   5090 denoisers
 - fixed runtime images receive the launcher patch through `zing-runtime-tools-patch`

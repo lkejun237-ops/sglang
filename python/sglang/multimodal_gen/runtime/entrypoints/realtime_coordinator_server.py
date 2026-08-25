@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict, fields
@@ -20,6 +21,7 @@ from sglang.multimodal_gen.runtime.realtime.coordinator import (
     HTTPWorkerReservationClient,
     InMemoryCoordinatorStore,
     RealtimeCoordinator,
+    RedisCoordinatorStore,
     SessionAssignment,
     WorkerHeartbeat,
     WorkerSlot,
@@ -66,6 +68,24 @@ def _assignment(payload: dict) -> SessionAssignment:
     )
 
 
+def _parse_routing_revision_aliases(values: list[str] | None) -> dict[str, list[str]]:
+    aliases: dict[str, list[str]] = {}
+    for value in values or []:
+        if "=" not in value:
+            raise SystemExit(
+                "--routing-revision-alias must use alias=actual-revision"
+            )
+        alias, revision = value.split("=", 1)
+        alias = alias.strip()
+        revision = revision.strip()
+        if not alias or not revision:
+            raise SystemExit(
+                "--routing-revision-alias must use alias=actual-revision"
+            )
+        aliases.setdefault(alias, []).append(revision)
+    return aliases
+
+
 def _raise_http(exc: CoordinatorRejected) -> None:
     status_code = {
         "ATTEMPT_ALREADY_OWNED": status.HTTP_409_CONFLICT,
@@ -73,6 +93,7 @@ def _raise_http(exc: CoordinatorRejected) -> None:
         "CAPACITY_EXHAUSTED": status.HTTP_429_TOO_MANY_REQUESTS,
         "LEASE_LOST": status.HTTP_409_CONFLICT,
         "WORKER_LOST": status.HTTP_409_CONFLICT,
+        "COORDINATOR_STORE_BUSY": status.HTTP_503_SERVICE_UNAVAILABLE,
     }.get(exc.reason, status.HTTP_400_BAD_REQUEST)
     headers = None
     if exc.retry_after_s is not None:
@@ -199,11 +220,33 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=18081)
-    parser.add_argument("--backend", choices=("memory", "dynamodb"), default="dynamodb")
+    parser.add_argument(
+        "--backend", choices=("memory", "dynamodb", "redis"), default="dynamodb"
+    )
     parser.add_argument("--table-name")
     parser.add_argument("--region")
+    parser.add_argument("--redis-url")
+    parser.add_argument("--redis-host", default="localhost")
+    parser.add_argument("--redis-port", type=int, default=6379)
+    parser.add_argument("--redis-username")
+    parser.add_argument("--redis-password-env", default="REDIS_PASSWORD")
+    parser.add_argument("--redis-db", type=int, default=0)
+    parser.add_argument("--redis-ssl", action="store_true")
+    parser.add_argument("--redis-key-prefix", default="world-model-realtime")
+    parser.add_argument("--redis-state-ttl-s", type=int, default=86400)
+    parser.add_argument("--redis-lock-ttl-s", type=float, default=2.0)
+    parser.add_argument("--redis-lock-timeout-s", type=float, default=1.0)
     parser.add_argument("--ttl-s", type=float, default=30.0)
     parser.add_argument("--worker-ttl-s", type=float, default=15.0)
+    parser.add_argument(
+        "--routing-revision-alias",
+        action="append",
+        help=(
+            "Allow a stable routing revision to match an older worker that only "
+            "reports a concrete model revision, formatted as alias=actual-revision. "
+            "May be repeated."
+        ),
+    )
     parser.add_argument("--wait-timeout-s", type=float, default=10.0)
     parser.add_argument("--candidate-limit", type=int, default=64)
     parser.add_argument("--denoiser-capacity-limit", type=int)
@@ -214,6 +257,17 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    capacity_limits = {
+        role: limit
+        for role, limit in (
+            ("denoiser", args.denoiser_capacity_limit),
+            ("vae", args.vae_capacity_limit),
+        )
+        if limit is not None
+    }
+    routing_revision_aliases = _parse_routing_revision_aliases(
+        args.routing_revision_alias
+    )
     if args.backend == "dynamodb":
         if not args.table_name:
             raise SystemExit("--table-name is required for DynamoDB")
@@ -221,21 +275,38 @@ def main() -> None:
             args.table_name,
             ttl_s=args.ttl_s,
             worker_ttl_s=args.worker_ttl_s,
+            routing_revision_aliases=routing_revision_aliases,
             region_name=args.region,
             candidate_limit=args.candidate_limit,
-            capacity_limits={
-                role: limit
-                for role, limit in (
-                    ("denoiser", args.denoiser_capacity_limit),
-                    ("vae", args.vae_capacity_limit),
-                )
-                if limit is not None
-            },
+            capacity_limits=capacity_limits,
+        )
+    elif args.backend == "redis":
+        store = RedisCoordinatorStore(
+            redis_url=args.redis_url,
+            host=args.redis_host,
+            port=args.redis_port,
+            username=args.redis_username,
+            password=os.getenv(args.redis_password_env)
+            if args.redis_password_env
+            else None,
+            password_env=None,
+            db=args.redis_db,
+            ssl=args.redis_ssl,
+            key_prefix=args.redis_key_prefix,
+            state_ttl_s=args.redis_state_ttl_s,
+            lock_ttl_s=args.redis_lock_ttl_s,
+            lock_timeout_s=args.redis_lock_timeout_s,
+            ttl_s=args.ttl_s,
+            worker_ttl_s=args.worker_ttl_s,
+            routing_revision_aliases=routing_revision_aliases,
+            candidate_limit=args.candidate_limit,
+            capacity_limits=capacity_limits,
         )
     else:
         store = InMemoryCoordinatorStore(
             ttl_s=args.ttl_s,
             worker_ttl_s=args.worker_ttl_s,
+            routing_revision_aliases=routing_revision_aliases,
         )
     coordinator = RealtimeCoordinator(
         store,

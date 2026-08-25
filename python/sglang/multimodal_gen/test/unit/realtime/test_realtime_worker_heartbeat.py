@@ -100,6 +100,37 @@ async def _test_worker_registers_capacity_only_after_local_health_is_ready():
     ]
 
 
+def test_worker_registers_capacity_only_after_startup_warmup_ready(tmp_path):
+    async def run():
+        ready_file = tmp_path / "startup-warmup-ready"
+        client = _Client()
+        reporter = WorkerHeartbeatReporter(
+            client,
+            coordinator_url="http://coordinator:18081",
+            health_url="http://127.0.0.1:30000/health",
+            state_url="http://127.0.0.1:30000/v1/realtime_worker/state",
+            worker_id="pod-123",
+            worker_epoch="epoch-a",
+            ready_file=ready_file,
+            role="denoiser",
+            endpoint="ws://10.0.0.7:30000/v1/realtime_video/generate",
+            reservation_endpoint="http://10.0.0.7:30000/v1/realtime_worker",
+            az="us-east-2a",
+            capacity=4,
+            model_revision="model-sha",
+            vae_fingerprint="taew2_2",
+        )
+
+        assert await reporter.heartbeat_once() is False
+        assert client.posts == []
+
+        ready_file.write_text("ok\n")
+        assert await reporter.heartbeat_once() is True
+        assert client.posts[-1][1]["worker_id"] == "pod-123"
+
+    asyncio.run(run())
+
+
 def test_worker_heartbeat_includes_stale_consumed_reservation_metrics():
     async def run():
         client = _Client(
@@ -137,6 +168,34 @@ def test_worker_heartbeat_includes_stale_consumed_reservation_metrics():
         assert payload["oldest_consumed_age_s"] == 121.5
         assert payload["stale_consumed_reservations"] == 1
         assert payload["last_progress_age_s"] == 33.25
+
+    asyncio.run(run())
+
+
+def test_worker_heartbeat_can_register_stable_routing_revision_alias():
+    async def run():
+        client = _Client()
+        reporter = WorkerHeartbeatReporter(
+            client,
+            coordinator_url="http://coordinator:18081",
+            health_url="http://127.0.0.1:30000/health",
+            state_url="http://127.0.0.1:30000/v1/realtime_worker/state",
+            worker_id="pod-123",
+            worker_epoch="epoch-a",
+            role="denoiser",
+            endpoint="ws://10.0.0.7:30000/v1/realtime_video/generate",
+            reservation_endpoint="http://10.0.0.7:30000/v1/realtime_worker",
+            az="us-east-2a",
+            capacity=1,
+            model_revision="checkpoint-20260825",
+            routing_revision="minwm",
+            vae_fingerprint="taew2_2",
+        )
+
+        assert await reporter.heartbeat_once() is True
+        payload = client.posts[-1][1]
+        assert payload["model_revision"] == "checkpoint-20260825"
+        assert payload["routing_revision"] == "minwm"
 
     asyncio.run(run())
 

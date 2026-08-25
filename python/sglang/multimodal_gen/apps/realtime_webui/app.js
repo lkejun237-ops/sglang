@@ -6185,7 +6185,7 @@ async function completeWorldDraft() {
     if (seedText) form.append("world_description", seedText);
     const image = await worldCompletionImage();
     if (image) form.append("first_frame", image, image.name);
-    const response = await fetch("./api/world/complete", { method: "POST", body: form });
+    const response = await fetch("./backends/minwm/v1/studio-api/world/complete", { method: "POST", body: form });
     let result = null;
     try {
       result = await response.json();
@@ -7788,7 +7788,7 @@ function setPromptRewriteStatus(message, state = "") {
 }
 
 async function rewriteRuntimePrompt(payload) {
-  const response = await fetch("./api/prompt/rewrite", {
+  const response = await fetch("./backends/minwm/v1/studio-api/prompt/rewrite", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -7806,7 +7806,7 @@ async function rewriteRuntimePrompt(payload) {
 }
 
 async function completeWorldRule(payload) {
-  const response = await fetch("./api/world-rule/complete", {
+  const response = await fetch("./backends/minwm/v1/studio-api/world-rule/complete", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),

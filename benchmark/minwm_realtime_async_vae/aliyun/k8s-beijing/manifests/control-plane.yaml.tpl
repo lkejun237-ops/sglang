@@ -88,9 +88,17 @@ spec:
               exec python3 -m sglang.multimodal_gen.runtime.entrypoints.realtime_coordinator_server
               --host=0.0.0.0
               --port=18081
-              --backend=memory
+              --backend=redis
+              --redis-host=${REDIS_HOST}
+              --redis-port=${REDIS_PORT}
+              --redis-username=${REDIS_USERNAME}
+              --redis-password-env=REDIS_PASSWORD
+              --redis-key-prefix=${REDIS_KEY_PREFIX}
+              --redis-state-ttl-s=${REDIS_STATE_TTL_SECONDS}
+              --redis-lock-timeout-s=${REDIS_LOCK_TIMEOUT_SECONDS}
               --ttl-s=30
               --worker-ttl-s=15
+              --routing-revision-alias=${MINWM_ROUTING_REVISION}=${MINWM_MODEL_REVISION}
               --wait-timeout-s=10
               --candidate-limit=64
               --denoiser-capacity-limit=${DENOISER_CAPACITY_LIMIT}
@@ -100,6 +108,9 @@ spec:
             - {name: PYTHONPATH, value: /opt/sglang/python}
             - {name: SGLANG_LIGHTWEIGHT_RUNTIME, value: "1"}
             - {name: OTEL_SERVICE_NAME, value: zing-coordinator}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: zing-redis, key: password}
           ports:
             - {name: http, containerPort: 18081}
           startupProbe:
@@ -182,7 +193,7 @@ spec:
               --host=0.0.0.0
               --port=18080
               --coordinator-url=http://zing-coordinator:18081
-              --model-revision=wan22-5b-stage3-dmd-47-0808-2fb2cfec2a2
+              --model-revision=${MINWM_ROUTING_REVISION}
               --vae-fingerprint=taew2_2-d053e216
               --internal-output-url=ws://${POD_IP}:18080/v1/internal/realtime_output
               --output-queue-depth=64

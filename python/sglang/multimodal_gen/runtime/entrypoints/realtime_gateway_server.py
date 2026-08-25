@@ -668,11 +668,7 @@ def create_app(
 
     if webui_base_url:
 
-        @app.api_route(
-            "/api/{path:path}",
-            methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        )
-        async def proxy_world_studio_api(path: str, request: Request):
+        async def _proxy_world_studio_api(path: str, request: Request):
             target = f"{webui_base_url}/api/{path}"
             if request.url.query:
                 target = f"{target}?{request.url.query}"
@@ -689,6 +685,27 @@ def create_app(
                 headers=_proxy_response_headers(upstream),
                 media_type=upstream.headers.get("content-type"),
             )
+
+        @app.api_route(
+            "/api/{path:path}",
+            methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        )
+        async def proxy_world_studio_api(path: str, request: Request):
+            return await _proxy_world_studio_api(path, request)
+
+        @app.api_route(
+            "/studio-api/{path:path}",
+            methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        )
+        async def proxy_world_studio_api_alias(path: str, request: Request):
+            return await _proxy_world_studio_api(path, request)
+
+        @app.api_route(
+            "/backends/minwm/v1/studio-api/{path:path}",
+            methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        )
+        async def proxy_minwm_world_studio_api_alias(path: str, request: Request):
+            return await _proxy_world_studio_api(path, request)
 
     @app.websocket("/v1/internal/realtime_output")
     async def realtime_output(websocket: WebSocket):

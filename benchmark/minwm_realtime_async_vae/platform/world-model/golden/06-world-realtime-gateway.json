@@ -7,7 +7,7 @@
   "appGroup": "world-studio",
   "appName": "World Realtime Gateway",
   "args": [
-    "exec python -m sglang.multimodal_gen.runtime.entrypoints.realtime_gateway_server --host=0.0.0.0 --port=18080 --coordinator-url=http://world-realtime-coordinator:18081 --model-revision=${MODEL_REVISION} --lingbot2-model-revision=${LINGBOT2_MODEL_REVISION} --vae-fingerprint=${VAE_FINGERPRINT} --lingbot2-vae-fingerprint=${LINGBOT2_VAE_FINGERPRINT} --internal-output-url=ws://${POD_IP}:18080/v1/internal/realtime_output --output-queue-depth=64 --output-enqueue-timeout-s=0 --output-drain-timeout-s=90 --lease-renew-interval-s=10 --release-grace-s=0.5 --trace-log-group=${TRACE_LOG_GROUP}"
+    "exec python -m sglang.multimodal_gen.runtime.entrypoints.realtime_gateway_server --host=0.0.0.0 --port=18080 --coordinator-url=http://world-realtime-coordinator:18081 --model-revision=${MODEL_ROUTING_REVISION} --lingbot2-model-revision=${LINGBOT2_MODEL_ROUTING_REVISION} --vae-fingerprint=${VAE_FINGERPRINT} --lingbot2-vae-fingerprint=${LINGBOT2_VAE_FINGERPRINT} --internal-output-url=ws://${POD_IP}:18080/v1/internal/realtime_output --output-queue-depth=64 --output-enqueue-timeout-s=0 --output-drain-timeout-s=90 --lease-renew-interval-s=10 --release-grace-s=0.5 --trace-log-group=${TRACE_LOG_GROUP}"
   ],
   "businessLineId": "world-model",
   "clusterId": "${WORLD_MODEL_CLUSTER_ID}",
@@ -26,12 +26,20 @@
       }
     },
     {
+      "name": "MODEL_ROUTING_REVISION",
+      "value": "minwm"
+    },
+    {
       "name": "MODEL_REVISION",
       "value": "wan22-5b-stage3-dmd-47-0808-2fb2cfec2a2"
     },
     {
       "name": "VAE_FINGERPRINT",
       "value": "taew2_2-d053e216"
+    },
+    {
+      "name": "LINGBOT2_MODEL_ROUTING_REVISION",
+      "value": "lingbot2"
     },
     {
       "name": "LINGBOT2_MODEL_REVISION",

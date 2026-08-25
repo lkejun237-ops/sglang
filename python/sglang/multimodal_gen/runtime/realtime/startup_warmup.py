@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import time
 from io import BytesIO
 from pathlib import Path
@@ -15,12 +16,15 @@ import websockets
 from PIL import Image
 from websockets.exceptions import ConnectionClosedOK
 
+_SIZE_RE = re.compile(r"^(?P<width>[1-9]\d*)x(?P<height>[1-9]\d*)$")
+
 
 def build_warmup_request(
     *,
     model: str,
     first_frame: bytes,
     trace_id: str,
+    size: str,
 ) -> dict:
     return {
         "type": "init",
@@ -30,7 +34,7 @@ def build_warmup_request(
             "A stable forward camera view through a bright mountain valley, "
             "with consistent geometry and gentle motion."
         ),
-        "size": "1280x720",
+        "size": size,
         "fps": 24,
         "first_frame": first_frame,
         "seed": 42,
@@ -41,6 +45,7 @@ def build_warmup_request(
         "realtime_output_format": "webp",
         "realtime_preview_max_width": 320,
         "realtime_output_pacing": False,
+        "playback_ack_enabled": False,
         "output_compression": 45,
         "realtime_causal_sink_size": 3,
         "realtime_causal_kv_cache_num_frames": 12,
@@ -48,8 +53,15 @@ def build_warmup_request(
     }
 
 
-def create_reference_frame() -> bytes:
-    image = Image.new("RGB", (1280, 720), (82, 126, 91))
+def parse_size(size: str) -> tuple[int, int]:
+    match = _SIZE_RE.fullmatch(size)
+    if match is None:
+        raise ValueError(f"invalid warmup size: {size!r}; expected WIDTHxHEIGHT")
+    return int(match.group("width")), int(match.group("height"))
+
+
+def create_reference_frame(size: str) -> bytes:
+    image = Image.new("RGB", parse_size(size), (82, 126, 91))
     buffer = BytesIO()
     image.save(buffer, format="JPEG", quality=82)
     return buffer.getvalue()
@@ -98,12 +110,18 @@ async def wait_for_first_frame(
 
 
 async def warmup(
-    *, url: str, model: str, timeout_s: float, allow_empty_complete: bool = False
+    *,
+    url: str,
+    model: str,
+    size: str,
+    timeout_s: float,
+    allow_empty_complete: bool = False,
 ) -> dict:
     request = build_warmup_request(
         model=model,
-        first_frame=create_reference_frame(),
+        first_frame=create_reference_frame(size),
         trace_id=f"startup-warmup-{uuid4().hex}",
+        size=size,
     )
     async with websockets.connect(
         url,
@@ -127,6 +145,7 @@ def parse_args() -> argparse.Namespace:
         default="ws://127.0.0.1:30000/v1/realtime_video/generate",
     )
     parser.add_argument("--model", required=True)
+    parser.add_argument("--size", default="832x480")
     parser.add_argument("--timeout-s", type=float, default=120.0)
     parser.add_argument("--ready-file", type=Path, required=True)
     parser.add_argument(
@@ -148,6 +167,7 @@ def main() -> None:
         warmup(
             url=args.url,
             model=args.model,
+            size=args.size,
             timeout_s=args.timeout_s,
             allow_empty_complete=args.allow_empty_complete,
         )
@@ -162,7 +182,7 @@ def main() -> None:
     temporary.replace(args.ready_file)
     print(
         "realtime startup warmup completed: "
-        f"size=1280x720 chunk={int(result.get('chunk_index') or 0)} "
+        f"size={args.size} chunk={int(result.get('chunk_index') or 0)} "
         f"elapsed_s={elapsed_s:.3f}",
         flush=True,
     )

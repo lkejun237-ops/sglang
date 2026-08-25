@@ -122,7 +122,7 @@
     },
     {
       "args": [
-        "exec python3 -m sglang.multimodal_gen.runtime.entrypoints.realtime_worker_heartbeat --coordinator-url=http://world-realtime-coordinator:18081 --health-url=http://127.0.0.1:30000/health --state-url=http://127.0.0.1:30000/v1/realtime_worker/state --worker-id=${POD_UID} --worker-epoch-file=/var/run/minwm-worker/epoch --role=denoiser --endpoint=ws://${POD_IP}:30000/v1/realtime_video/generate --reservation-endpoint=http://${POD_IP}:30000/v1/realtime_worker --node-name=${NODE_NAME} --capacity=4 --model-revision=robbyant/lingbot-world-v2-14b-causal-fast-diffusers --vae-fingerprint=taew2_1-d26151e7 --interval-s=5"
+        "exec python3 -m sglang.multimodal_gen.runtime.entrypoints.realtime_worker_heartbeat --coordinator-url=http://world-realtime-coordinator:18081 --health-url=http://127.0.0.1:30000/health --state-url=http://127.0.0.1:30000/v1/realtime_worker/state --worker-id=${POD_UID} --worker-epoch-file=/var/run/minwm-worker/epoch --role=denoiser --endpoint=ws://${POD_IP}:30000/v1/realtime_video/generate --reservation-endpoint=http://${POD_IP}:30000/v1/realtime_worker --node-name=${NODE_NAME} --capacity=4 --model-revision=robbyant/lingbot-world-v2-14b-causal-fast-diffusers --routing-revision=lingbot2 --vae-fingerprint=taew2_1-d26151e7 --interval-s=5"
       ],
       "command": [
         "/bin/sh",

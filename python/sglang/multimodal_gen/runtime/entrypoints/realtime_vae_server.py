@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -54,6 +55,34 @@ from sglang.multimodal_gen.runtime.utils.realtime_trace import (
 )
 
 logger = logging.getLogger(__name__)
+_WARMUP_SIZE_RE = re.compile(r"^(?P<width>[1-9]\d*)x(?P<height>[1-9]\d*)$")
+
+
+def _parse_warmup_size(size: str) -> tuple[int, int]:
+    match = _WARMUP_SIZE_RE.fullmatch(size)
+    if match is None:
+        raise ValueError(f"invalid VAE warmup size: {size!r}; expected WIDTHxHEIGHT")
+    return int(match.group("width")), int(match.group("height"))
+
+
+def _warmup_latent_shape(engine, size: str | None) -> tuple[int, int, int, int, int] | None:
+    if not size:
+        return None
+    width, height = _parse_warmup_size(size)
+    if width % 16 or height % 16:
+        raise ValueError("VAE warmup size must be divisible by 16")
+    model = getattr(engine, "model", None)
+    channels = getattr(model, "latent_channels", None)
+    if channels is None:
+        default_shape = getattr(engine, "_DEFAULT_WARMUP_SHAPE", None)
+        channels = default_shape[1] if default_shape is not None else 48
+    temporal = (
+        5
+        if getattr(engine, "backend", None) == "exact"
+        and int(getattr(engine, "decode_parallel_size", 1) or 1) > 1
+        else 1
+    )
+    return (1, int(channels), temporal, height // 16, width // 16)
 
 
 def _tensor_from_payload(header, payload: bytes) -> torch.Tensor:
@@ -570,6 +599,7 @@ def _add_worker_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--encode-workers", type=int, default=4)
     parser.add_argument("--max-message-mb", type=int, default=64)
     parser.add_argument("--shared-memory-dir")
+    parser.add_argument("--warmup-size")
     parser.add_argument("--worker-epoch")
     parser.add_argument("--max-consumed-age-s", type=float, default=0.0)
     parser.add_argument("--direct-h264-output", action="store_true")
@@ -752,7 +782,11 @@ def _run_worker(args, exact_server_args) -> None:
     warmup_started = time.perf_counter()
     if parallel_controller is not None:
         torch.distributed.barrier()
-    engine.warmup()
+    warmup_shape = _warmup_latent_shape(engine, args.warmup_size)
+    if warmup_shape is None:
+        engine.warmup()
+    else:
+        engine.warmup(warmup_shape)
     if parallel_controller is not None:
         torch.distributed.barrier()
     logger.info(

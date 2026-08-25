@@ -114,3 +114,27 @@ def test_coordinator_cli_bounds_worker_reservation_calls(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["realtime_coordinator_server"])
 
     assert _parse_args().worker_reservation_timeout_s == 2.0
+
+
+def test_coordinator_cli_accepts_redis_backend_without_secret_on_args(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "realtime_coordinator_server",
+            "--backend=redis",
+            "--redis-host=redis.internal",
+            "--redis-port=6379",
+            "--redis-username=default",
+            "--redis-password-env=REDIS_PASSWORD",
+            "--redis-key-prefix=world-model-realtime",
+            "--routing-revision-alias=minwm=checkpoint-20260825",
+        ],
+    )
+
+    args = _parse_args()
+
+    assert args.backend == "redis"
+    assert args.redis_host == "redis.internal"
+    assert args.redis_password_env == "REDIS_PASSWORD"
+    assert args.routing_revision_alias == ["minwm=checkpoint-20260825"]

@@ -6,9 +6,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
+import os
 import time
-from dataclasses import dataclass, replace
+from contextlib import asynccontextmanager
+from dataclasses import asdict, dataclass, fields, replace
 from typing import Any, Callable, Literal, Mapping, Protocol
 from uuid import uuid4
 
@@ -45,6 +48,7 @@ class WorkerHeartbeat:
     capacity: int
     model_revision: str
     vae_fingerprint: str
+    routing_revision: str = ""
     worker_epoch: str = ""
     lifecycle: WorkerLifecycle = "ready"
     active_sessions: int = 0
@@ -68,6 +72,7 @@ class WorkerSlot:
     slot_index: int
     model_revision: str
     vae_fingerprint: str
+    routing_revision: str = ""
     worker_epoch: str = ""
     lifecycle: WorkerLifecycle = "ready"
     active_sessions: int = 0
@@ -202,6 +207,38 @@ class _WorkerState:
     updated_at: float
 
 
+def _routing_revision(worker: WorkerHeartbeat | WorkerSlot) -> str:
+    return worker.routing_revision or worker.model_revision
+
+
+def _normalize_routing_revision_aliases(
+    aliases: Mapping[str, object] | None,
+) -> dict[str, frozenset[str]]:
+    normalized: dict[str, frozenset[str]] = {}
+    for alias, revisions in (aliases or {}).items():
+        alias_key = str(alias).strip()
+        if not alias_key:
+            continue
+        if isinstance(revisions, str):
+            values = [revisions]
+        else:
+            values = [str(revision) for revision in revisions]  # type: ignore[arg-type]
+        normalized[alias_key] = frozenset(
+            revision.strip() for revision in values if revision.strip()
+        )
+    return normalized
+
+
+def _matches_model_revision(
+    worker: WorkerHeartbeat | WorkerSlot,
+    requested_revision: str,
+    aliases: Mapping[str, frozenset[str]],
+) -> bool:
+    if _routing_revision(worker) == requested_revision:
+        return True
+    return worker.model_revision in aliases.get(requested_revision, frozenset())
+
+
 class InMemoryCoordinatorStore:
     """Atomic reference store used by tests and single-process development.
 
@@ -215,6 +252,7 @@ class InMemoryCoordinatorStore:
         *,
         ttl_s: float,
         worker_ttl_s: float,
+        routing_revision_aliases: Mapping[str, object] | None = None,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
     ) -> None:
@@ -224,6 +262,9 @@ class InMemoryCoordinatorStore:
             raise ValueError("worker_ttl_s must be positive")
         self.ttl_s = ttl_s
         self.worker_ttl_s = worker_ttl_s
+        self.routing_revision_aliases = _normalize_routing_revision_aliases(
+            routing_revision_aliases
+        )
         self._clock = clock
         self._wall_clock = wall_clock
         self._workers: dict[str, _WorkerState] = {}
@@ -303,7 +344,11 @@ class InMemoryCoordinatorStore:
                 continue
             if heartbeat.lifecycle != "ready":
                 continue
-            if role == "denoiser" and heartbeat.model_revision != model_revision:
+            if role == "denoiser" and not _matches_model_revision(
+                heartbeat,
+                model_revision,
+                self.routing_revision_aliases,
+            ):
                 continue
             if role == "vae" and heartbeat.vae_fingerprint != vae_fingerprint:
                 continue
@@ -329,6 +374,7 @@ class InMemoryCoordinatorStore:
                         slot_index=slot_index,
                         model_revision=heartbeat.model_revision,
                         vae_fingerprint=heartbeat.vae_fingerprint,
+                        routing_revision=_routing_revision(heartbeat),
                         worker_epoch=heartbeat.worker_epoch,
                         lifecycle=heartbeat.lifecycle,
                         active_sessions=heartbeat.active_sessions,
@@ -550,6 +596,7 @@ class DynamoDBCoordinatorStore:
         *,
         ttl_s: float,
         worker_ttl_s: float,
+        routing_revision_aliases: Mapping[str, object] | None = None,
         region_name: str | None = None,
         endpoint_url: str | None = None,
         client: Any | None = None,
@@ -569,6 +616,9 @@ class DynamoDBCoordinatorStore:
         self.table_name = table_name
         self.ttl_s = ttl_s
         self.worker_ttl_s = worker_ttl_s
+        self.routing_revision_aliases = _normalize_routing_revision_aliases(
+            routing_revision_aliases
+        )
         self.region_name = region_name
         self.endpoint_url = endpoint_url
         self.candidate_limit = candidate_limit
@@ -678,6 +728,15 @@ class DynamoDBCoordinatorStore:
             return f"DENOISER#{model_revision}"
         return f"VAE#{vae_fingerprint}"
 
+    def _denoiser_query_revisions(self, model_revision: str) -> list[str]:
+        revisions = [model_revision]
+        revisions.extend(
+            revision
+            for revision in sorted(self.routing_revision_aliases.get(model_revision, ()))
+            if revision != model_revision
+        )
+        return revisions
+
     def _slot_from_item(self, item: dict) -> WorkerSlot:
         return WorkerSlot(
             worker_id=self._read_s(item, "worker_id"),
@@ -687,6 +746,11 @@ class DynamoDBCoordinatorStore:
             slot_index=self._read_n(item, "slot_index"),
             model_revision=self._read_s(item, "model_revision"),
             vae_fingerprint=self._read_s(item, "vae_fingerprint"),
+            routing_revision=self._read_optional_s(
+                item,
+                "routing_revision",
+                self._read_s(item, "model_revision"),
+            ),
             worker_epoch=self._read_optional_s(item, "worker_epoch"),
             lifecycle=self._read_optional_s(item, "lifecycle", "ready"),
             active_sessions=int(self._read_optional_n(item, "active_sessions")),
@@ -784,6 +848,7 @@ class DynamoDBCoordinatorStore:
                 "capacity": {"N": str(heartbeat.capacity)},
                 "model_revision": {"S": heartbeat.model_revision},
                 "vae_fingerprint": {"S": heartbeat.vae_fingerprint},
+                "routing_revision": {"S": _routing_revision(heartbeat)},
                 "worker_epoch": {"S": heartbeat.worker_epoch},
                 "lifecycle": {"S": heartbeat.lifecycle},
                 "active_sessions": {"N": str(heartbeat.active_sessions)},
@@ -810,7 +875,7 @@ class DynamoDBCoordinatorStore:
         )
         allocation_key = self._allocation_key(
             heartbeat.role,
-            model_revision=heartbeat.model_revision,
+            model_revision=_routing_revision(heartbeat),
             vae_fingerprint=heartbeat.vae_fingerprint,
         )
         for slot_index in range(heartbeat.capacity):
@@ -828,6 +893,7 @@ class DynamoDBCoordinatorStore:
                     "SET item_type = :item_type, #role = :role, "
                     "worker_id = :worker_id, endpoint = :endpoint, az = :az, "
                     "slot_index = :slot_index, model_revision = :model_revision, "
+                    "routing_revision = :routing_revision, "
                     "vae_fingerprint = :vae_fingerprint, "
                     "worker_epoch = :worker_epoch, lifecycle = :lifecycle, "
                     "#capacity = :capacity, active_sessions = :active_sessions, "
@@ -852,6 +918,7 @@ class DynamoDBCoordinatorStore:
                     ":az": {"S": heartbeat.az},
                     ":slot_index": {"N": str(slot_index)},
                     ":model_revision": {"S": heartbeat.model_revision},
+                    ":routing_revision": {"S": _routing_revision(heartbeat)},
                     ":vae_fingerprint": {"S": heartbeat.vae_fingerprint},
                     ":worker_epoch": {"S": heartbeat.worker_epoch},
                     ":lifecycle": {"S": heartbeat.lifecycle},
@@ -1016,6 +1083,31 @@ class DynamoDBCoordinatorStore:
             query["ExclusiveStartKey"] = last_evaluated_key
         return slots[: self.candidate_limit]
 
+    def _query_denoiser_slots_sync(
+        self,
+        *,
+        model_revision: str,
+        vae_fingerprint: str,
+        now_epoch: int,
+    ) -> list[WorkerSlot]:
+        slots: list[WorkerSlot] = []
+        seen: set[tuple[str, int]] = set()
+        for revision in self._denoiser_query_revisions(model_revision):
+            for slot in self._query_slots_sync(
+                "denoiser",
+                model_revision=revision,
+                vae_fingerprint=vae_fingerprint,
+                now_epoch=now_epoch,
+            ):
+                key = (slot.worker_id, slot.slot_index)
+                if key in seen:
+                    continue
+                seen.add(key)
+                slots.append(slot)
+                if len(slots) >= self.candidate_limit:
+                    return slots
+        return slots
+
     async def acquire(
         self,
         *,
@@ -1054,8 +1146,7 @@ class DynamoDBCoordinatorStore:
         for query_round in range(4):
             now_epoch = int(self._wall_clock())
             expires_epoch = now_epoch + max(1, int(self.ttl_s))
-            denoisers = self._query_slots_sync(
-                "denoiser",
+            denoisers = self._query_denoiser_slots_sync(
                 model_revision=model_revision,
                 vae_fingerprint=vae_fingerprint,
                 now_epoch=now_epoch,
@@ -1443,6 +1534,744 @@ class DynamoDBCoordinatorStore:
             return
 
 
+class _MinimalAsyncRedisClient:
+    """Small RESP2 client used when redis-py is unavailable in source patches."""
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int,
+        username: str | None,
+        password: str | None,
+        db: int,
+        ssl: bool,
+        timeout_s: float,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.db = db
+        self.ssl = ssl
+        self.timeout_s = timeout_s
+        self._reader: asyncio.StreamReader | None = None
+        self._writer: asyncio.StreamWriter | None = None
+        self._connection_lock = asyncio.Lock()
+
+    @staticmethod
+    def _encode_command(*parts: Any) -> bytes:
+        encoded = [f"*{len(parts)}\r\n".encode()]
+        for part in parts:
+            raw = str(part).encode()
+            encoded.append(f"${len(raw)}\r\n".encode())
+            encoded.append(raw)
+            encoded.append(b"\r\n")
+        return b"".join(encoded)
+
+    async def _read_line(self, reader: asyncio.StreamReader) -> bytes:
+        line = await reader.readline()
+        if not line.endswith(b"\r\n"):
+            raise RuntimeError("malformed Redis response")
+        return line[:-2]
+
+    async def _read_response(self, reader: asyncio.StreamReader) -> Any:
+        prefix = await reader.readexactly(1)
+        if prefix == b"+":
+            return (await self._read_line(reader)).decode()
+        if prefix == b"-":
+            message = (await self._read_line(reader)).decode()
+            raise RuntimeError(f"Redis error: {message}")
+        if prefix == b":":
+            return int(await self._read_line(reader))
+        if prefix == b"$":
+            length = int(await self._read_line(reader))
+            if length < 0:
+                return None
+            data = await reader.readexactly(length)
+            await reader.readexactly(2)
+            return data.decode()
+        if prefix == b"*":
+            length = int(await self._read_line(reader))
+            if length < 0:
+                return None
+            return [await self._read_response(reader) for _ in range(length)]
+        raise RuntimeError(f"unsupported Redis response prefix: {prefix!r}")
+
+    async def _connect(self) -> None:
+        self._reader, self._writer = await asyncio.wait_for(
+            asyncio.open_connection(self.host, self.port, ssl=self.ssl),
+            timeout=self.timeout_s,
+        )
+        if self.password:
+            if self.username:
+                await self._execute_unlocked("AUTH", self.username, self.password)
+            else:
+                await self._execute_unlocked("AUTH", self.password)
+        if self.db:
+            await self._execute_unlocked("SELECT", self.db)
+
+    async def _close_connection(self) -> None:
+        if self._writer is not None:
+            self._writer.close()
+            try:
+                await self._writer.wait_closed()
+            except Exception:
+                pass
+        self._reader = None
+        self._writer = None
+
+    async def _execute_unlocked(self, *parts: Any) -> Any:
+        if self._reader is None or self._writer is None:
+            await self._connect()
+        assert self._reader is not None and self._writer is not None
+        self._writer.write(self._encode_command(*parts))
+        await asyncio.wait_for(self._writer.drain(), timeout=self.timeout_s)
+        return await asyncio.wait_for(
+            self._read_response(self._reader),
+            timeout=self.timeout_s,
+        )
+
+    async def execute(self, *parts: Any) -> Any:
+        async with self._connection_lock:
+            try:
+                return await self._execute_unlocked(*parts)
+            except Exception:
+                await self._close_connection()
+                return await self._execute_unlocked(*parts)
+
+    async def get(self, key: str) -> str | None:
+        return await self.execute("GET", key)
+
+    async def set(
+        self,
+        key: str,
+        value: str,
+        *,
+        nx: bool = False,
+        px: int | None = None,
+        ex: int | None = None,
+    ) -> bool:
+        parts: list[Any] = ["SET", key, value]
+        if nx:
+            parts.append("NX")
+        if px is not None:
+            parts.extend(("PX", px))
+        if ex is not None:
+            parts.extend(("EX", ex))
+        return await self.execute(*parts) == "OK"
+
+    async def delete(self, key: str) -> int:
+        return int(await self.execute("DEL", key))
+
+    async def eval(self, script: str, numkeys: int, *args: Any) -> Any:
+        return await self.execute("EVAL", script, numkeys, *args)
+
+    async def aclose(self) -> None:
+        async with self._connection_lock:
+            await self._close_connection()
+
+
+class RedisCoordinatorStore:
+    """Multi-replica Coordinator state backed by a Redis-compatible service.
+
+    The state lives in one JSON key protected by one short-lived lock key. This
+    keeps all admission mutations single-slot on Redis Cluster/managed Redis
+    while preserving the same session/slot fencing semantics as the reference
+    in-memory store. The coordinator workload is tiny compared with model
+    traffic, so this favors correctness and easy operations over sharding state
+    across many Redis keys.
+    """
+
+    _RELEASE_LOCK_SCRIPT = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+  return redis.call("del", KEYS[1])
+end
+return 0
+"""
+
+    def __init__(
+        self,
+        *,
+        redis_url: str | None = None,
+        host: str = "localhost",
+        port: int = 6379,
+        username: str | None = None,
+        password: str | None = None,
+        password_env: str | None = "REDIS_PASSWORD",
+        db: int = 0,
+        ssl: bool = False,
+        key_prefix: str = "world-model-realtime",
+        state_ttl_s: int = 86400,
+        lock_ttl_s: float = 2.0,
+        lock_timeout_s: float = 1.0,
+        lock_retry_s: float = 0.02,
+        ttl_s: float,
+        worker_ttl_s: float,
+        routing_revision_aliases: Mapping[str, object] | None = None,
+        candidate_limit: int = 64,
+        capacity_limits: Mapping[WorkerRole, int] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
+        client: Any | None = None,
+    ) -> None:
+        if ttl_s <= 0 or worker_ttl_s <= 0:
+            raise ValueError("lease TTLs must be positive")
+        if state_ttl_s <= 0:
+            raise ValueError("state_ttl_s must be positive")
+        if lock_ttl_s <= 0 or lock_timeout_s <= 0 or lock_retry_s <= 0:
+            raise ValueError("Redis lock timings must be positive")
+        if candidate_limit < 1:
+            raise ValueError("candidate_limit must be positive")
+        if capacity_limits and any(limit < 1 for limit in capacity_limits.values()):
+            raise ValueError("worker capacity limits must be positive")
+        prefix = key_prefix.strip()
+        if not prefix:
+            raise ValueError("key_prefix is required")
+        hash_tag = prefix if prefix.startswith("{") and "}" in prefix else f"{{{prefix}}}"
+        self.redis_url = redis_url
+        self.host = host
+        self.port = int(port)
+        self.username = username
+        self.password = password if password is not None else (
+            os.getenv(password_env) if password_env else None
+        )
+        self.db = int(db)
+        self.ssl = bool(ssl)
+        self.state_key = f"{hash_tag}:coordinator:state"
+        self.lock_key = f"{hash_tag}:coordinator:lock"
+        self.state_ttl_s = int(state_ttl_s)
+        self.lock_ttl_s = float(lock_ttl_s)
+        self.lock_timeout_s = float(lock_timeout_s)
+        self.lock_retry_s = float(lock_retry_s)
+        self.ttl_s = float(ttl_s)
+        self.worker_ttl_s = float(worker_ttl_s)
+        self.routing_revision_aliases = _normalize_routing_revision_aliases(
+            routing_revision_aliases
+        )
+        self.candidate_limit = candidate_limit
+        self.capacity_limits = dict(capacity_limits or {})
+        self._clock = clock
+        self._wall_clock = wall_clock
+        self._client = client
+        self._owns_client = client is None
+
+    def _get_client(self):
+        if self._client is None:
+            try:
+                import redis.asyncio as redis
+            except ImportError:
+                logger.warning("redis-py is unavailable; using minimal Redis client")
+                self._client = _MinimalAsyncRedisClient(
+                    host=self.host,
+                    port=self.port,
+                    username=self.username,
+                    password=self.password,
+                    db=self.db,
+                    ssl=self.ssl,
+                    timeout_s=max(1.0, self.lock_timeout_s),
+                )
+                return self._client
+            kwargs = {
+                "decode_responses": True,
+                "socket_timeout": max(1.0, self.lock_timeout_s),
+                "socket_connect_timeout": max(1.0, self.lock_timeout_s),
+            }
+            if self.username:
+                kwargs["username"] = self.username
+            if self.password:
+                kwargs["password"] = self.password
+            if self.redis_url:
+                self._client = redis.from_url(self.redis_url, **kwargs)
+            else:
+                self._client = redis.Redis(
+                    host=self.host,
+                    port=self.port,
+                    db=self.db,
+                    ssl=self.ssl,
+                    **kwargs,
+                )
+        return self._client
+
+    @staticmethod
+    def _empty_state() -> dict[str, Any]:
+        return {
+            "schema": 1,
+            "workers": {},
+            "assignments_by_token": {},
+            "assignments_by_user": {},
+            "slot_tokens": {},
+            "attempt_owners": {},
+            "waiting": {},
+        }
+
+    async def _load_state(self, client: Any) -> dict[str, Any]:
+        payload = await client.get(self.state_key)
+        if not payload:
+            return self._empty_state()
+        if isinstance(payload, bytes):
+            payload = payload.decode()
+        state = json.loads(payload)
+        if not isinstance(state, dict):
+            raise RuntimeError("Redis Coordinator state is not a JSON object")
+        for key, value in self._empty_state().items():
+            state.setdefault(key, value.copy() if isinstance(value, dict) else value)
+        if state.get("schema") != 1:
+            raise RuntimeError(
+                f"unsupported Redis Coordinator state schema: {state.get('schema')}"
+            )
+        return state
+
+    async def _save_state(self, client: Any, state: dict[str, Any]) -> None:
+        await client.set(
+            self.state_key,
+            json.dumps(state, separators=(",", ":"), sort_keys=True),
+            ex=self.state_ttl_s,
+        )
+
+    async def _acquire_lock(self, client: Any) -> str:
+        token = uuid4().hex
+        deadline = time.monotonic() + self.lock_timeout_s
+        while True:
+            if await client.set(
+                self.lock_key,
+                token,
+                nx=True,
+                px=max(1, int(self.lock_ttl_s * 1000)),
+            ):
+                return token
+            if time.monotonic() >= deadline:
+                raise CoordinatorRejected("COORDINATOR_STORE_BUSY", retry_after_s=0.05)
+            await asyncio.sleep(self.lock_retry_s)
+
+    async def _release_lock(self, client: Any, token: str) -> None:
+        try:
+            await client.eval(self._RELEASE_LOCK_SCRIPT, 1, self.lock_key, token)
+        except Exception:
+            try:
+                current = await client.get(self.lock_key)
+                if current == token:
+                    await client.delete(self.lock_key)
+            except Exception:
+                logger.warning("failed to release Redis Coordinator lock", exc_info=True)
+
+    @asynccontextmanager
+    async def _locked_state(self):
+        client = self._get_client()
+        token = await self._acquire_lock(client)
+        try:
+            state = await self._load_state(client)
+            yield state
+            await self._save_state(client, state)
+        finally:
+            await self._release_lock(client, token)
+
+    @staticmethod
+    def _slot_key(role: WorkerRole, worker_id: str, slot_index: int) -> str:
+        return f"{role}|{worker_id}|{slot_index}"
+
+    @staticmethod
+    def _heartbeat_from_state(payload: dict[str, Any]) -> WorkerHeartbeat:
+        field_names = {field.name for field in fields(WorkerHeartbeat)}
+        return WorkerHeartbeat(
+            **{key: value for key, value in payload.items() if key in field_names}
+        )
+
+    @staticmethod
+    def _slot_from_state(payload: dict[str, Any]) -> WorkerSlot:
+        field_names = {field.name for field in fields(WorkerSlot)}
+        return WorkerSlot(
+            **{key: value for key, value in payload.items() if key in field_names}
+        )
+
+    def _assignment_from_state(self, payload: dict[str, Any]) -> SessionAssignment:
+        remaining_s = max(0.0, float(payload["expires_at"]) - self._wall_clock())
+        return SessionAssignment(
+            user_id=str(payload["user_id"]),
+            session_id=str(payload["session_id"]),
+            generation_id=str(payload["generation_id"]),
+            token=str(payload["token"]),
+            expires_at=self._clock() + remaining_s,
+            denoiser=self._slot_from_state(payload["denoiser"]),
+            vae=self._slot_from_state(payload["vae"]),
+        )
+
+    @staticmethod
+    def _assignment_identity_matches(
+        current: SessionAssignment,
+        requested: SessionAssignment,
+    ) -> bool:
+        if (
+            current.user_id,
+            current.session_id,
+            current.generation_id,
+            current.token,
+        ) != (
+            requested.user_id,
+            requested.session_id,
+            requested.generation_id,
+            requested.token,
+        ):
+            return False
+        for current_slot, requested_slot in (
+            (current.denoiser, requested.denoiser),
+            (current.vae, requested.vae),
+        ):
+            if (
+                current_slot.role,
+                current_slot.worker_id,
+                current_slot.slot_index,
+                current_slot.worker_epoch,
+            ) != (
+                requested_slot.role,
+                requested_slot.worker_id,
+                requested_slot.slot_index,
+                requested_slot.worker_epoch,
+            ):
+                return False
+        return True
+
+    def _release_token(self, state: dict[str, Any], token: str) -> None:
+        current = state["assignments_by_token"].pop(token, None)
+        if current is None:
+            return
+        user_id = str(current.get("user_id", ""))
+        if state["assignments_by_user"].get(user_id) == token:
+            state["assignments_by_user"].pop(user_id, None)
+        for slot_payload in (current.get("denoiser", {}), current.get("vae", {})):
+            key = self._slot_key(
+                slot_payload.get("role"),
+                str(slot_payload.get("worker_id")),
+                int(slot_payload.get("slot_index", -1)),
+            )
+            if state["slot_tokens"].get(key) == token:
+                state["slot_tokens"].pop(key, None)
+
+    def _expire_state(self, state: dict[str, Any], now_epoch: float) -> None:
+        expired_tokens = [
+            token
+            for token, assignment in state["assignments_by_token"].items()
+            if float(assignment.get("expires_at", 0)) <= now_epoch
+        ]
+        for token in expired_tokens:
+            self._release_token(state, token)
+        live_tokens = set(state["assignments_by_token"])
+        state["assignments_by_user"] = {
+            user_id: token
+            for user_id, token in state["assignments_by_user"].items()
+            if token in live_tokens
+        }
+        state["slot_tokens"] = {
+            key: token
+            for key, token in state["slot_tokens"].items()
+            if token in live_tokens
+        }
+        state["attempt_owners"] = {
+            attempt_id: owner
+            for attempt_id, owner in state["attempt_owners"].items()
+            if float(owner.get("expires_at", 0)) > now_epoch
+        }
+        state["waiting"] = {
+            waiter_id: waiter
+            for waiter_id, waiter in state["waiting"].items()
+            if float(waiter.get("expires_at", 0)) > now_epoch
+        }
+        stale_worker_after_s = max(60.0, self.worker_ttl_s * 4)
+        state["workers"] = {
+            worker_id: worker
+            for worker_id, worker in state["workers"].items()
+            if float(worker.get("updated_at", 0)) + stale_worker_after_s > now_epoch
+        }
+
+    def _active_workers(
+        self,
+        state: dict[str, Any],
+        *,
+        role: WorkerRole,
+        now_epoch: float,
+        model_revision: str,
+        vae_fingerprint: str,
+        excluded_workers: frozenset[tuple[WorkerRole, str]],
+    ) -> list[_WorkerState]:
+        workers: list[_WorkerState] = []
+        for worker in state["workers"].values():
+            heartbeat = self._heartbeat_from_state(worker["heartbeat"])
+            if heartbeat.role != role:
+                continue
+            if (heartbeat.role, heartbeat.worker_id) in excluded_workers:
+                continue
+            if float(worker.get("updated_at", 0)) + self.worker_ttl_s <= now_epoch:
+                continue
+            if heartbeat.lifecycle != "ready":
+                continue
+            if role == "denoiser" and not _matches_model_revision(
+                heartbeat,
+                model_revision,
+                self.routing_revision_aliases,
+            ):
+                continue
+            if role == "vae" and heartbeat.vae_fingerprint != vae_fingerprint:
+                continue
+            workers.append(
+                _WorkerState(
+                    heartbeat=heartbeat,
+                    updated_at=float(worker.get("updated_at", 0)),
+                )
+            )
+        return workers
+
+    def _free_slots(
+        self,
+        state: dict[str, Any],
+        workers: list[_WorkerState],
+        *,
+        identity: str,
+    ) -> list[WorkerSlot]:
+        slots: list[WorkerSlot] = []
+        slot_tokens = state["slot_tokens"]
+        for worker in workers:
+            heartbeat = worker.heartbeat
+            for slot_index in range(heartbeat.capacity):
+                key = self._slot_key(heartbeat.role, heartbeat.worker_id, slot_index)
+                if key in slot_tokens:
+                    continue
+                slots.append(
+                    WorkerSlot(
+                        worker_id=heartbeat.worker_id,
+                        role=heartbeat.role,
+                        endpoint=heartbeat.endpoint,
+                        az=heartbeat.az,
+                        slot_index=slot_index,
+                        model_revision=heartbeat.model_revision,
+                        vae_fingerprint=heartbeat.vae_fingerprint,
+                        routing_revision=_routing_revision(heartbeat),
+                        worker_epoch=heartbeat.worker_epoch,
+                        lifecycle=heartbeat.lifecycle,
+                        active_sessions=heartbeat.active_sessions,
+                        runnable_sessions=heartbeat.runnable_sessions,
+                        blocked_sessions=heartbeat.blocked_sessions,
+                        queue_depth=heartbeat.queue_depth,
+                        service_time_ms=heartbeat.service_time_ms,
+                        reservation_endpoint=heartbeat.reservation_endpoint,
+                        drain_deadline=heartbeat.drain_deadline,
+                        capacity=heartbeat.capacity,
+                    )
+                )
+        slots.sort(
+            key=lambda slot: (
+                slot.active_sessions / slot.capacity,
+                slot.queue_depth,
+                slot.service_time_ms,
+                hashlib.sha256(
+                    f"{identity}:{slot.role}:{slot.worker_id}".encode()
+                ).digest(),
+                slot.worker_id,
+                slot.slot_index,
+            )
+        )
+        return slots[: self.candidate_limit]
+
+    async def heartbeat(self, heartbeat: WorkerHeartbeat) -> None:
+        InMemoryCoordinatorStore._validate_heartbeat(heartbeat)
+        capacity_limit = self.capacity_limits.get(heartbeat.role)
+        if capacity_limit is not None and heartbeat.capacity > capacity_limit:
+            heartbeat = replace(heartbeat, capacity=capacity_limit)
+        async with self._locked_state() as state:
+            now_epoch = self._wall_clock()
+            self._expire_state(state, now_epoch)
+            state["workers"][heartbeat.worker_id] = {
+                "heartbeat": asdict(heartbeat),
+                "updated_at": now_epoch,
+            }
+
+    async def claim_attempt(
+        self, *, attempt_id: str, owner_id: str, expires_at: float
+    ) -> None:
+        if not attempt_id or not owner_id:
+            raise CoordinatorRejected("INVALID_ATTEMPT_OWNER")
+        async with self._locked_state() as state:
+            now_epoch = self._wall_clock()
+            if expires_at <= now_epoch:
+                raise CoordinatorRejected("INVALID_ATTEMPT_OWNER")
+            self._expire_state(state, now_epoch)
+            current = state["attempt_owners"].get(attempt_id)
+            if (
+                current is not None
+                and current.get("owner_id") != owner_id
+                and float(current.get("expires_at", 0)) > now_epoch
+            ):
+                raise CoordinatorRejected("ATTEMPT_ALREADY_OWNED")
+            state["attempt_owners"][attempt_id] = {
+                "owner_id": owner_id,
+                "expires_at": float(expires_at),
+            }
+
+    async def waiting_started(self, waiter_id: str) -> None:
+        if not waiter_id:
+            raise ValueError("waiter_id is required")
+        async with self._locked_state() as state:
+            now_epoch = self._wall_clock()
+            self._expire_state(state, now_epoch)
+            state["waiting"][waiter_id] = {
+                "expires_at": now_epoch + max(30.0, self.worker_ttl_s * 2),
+            }
+
+    async def waiting_finished(self, waiter_id: str) -> None:
+        async with self._locked_state() as state:
+            state["waiting"].pop(waiter_id, None)
+
+    async def capacity_snapshot(self) -> dict[str, Any]:
+        async with self._locked_state() as state:
+            now_epoch = self._wall_clock()
+            self._expire_state(state, now_epoch)
+            roles = {
+                role: {
+                    "waiting_sessions": len(state["waiting"]),
+                    "active_sessions": 0,
+                    "queued_sessions": 0,
+                    "free_slots": 0,
+                    "draining_workers": 0,
+                }
+                for role in ("denoiser", "vae")
+            }
+            for worker in state["workers"].values():
+                if float(worker.get("updated_at", 0)) + self.worker_ttl_s <= now_epoch:
+                    continue
+                heartbeat = self._heartbeat_from_state(worker["heartbeat"])
+                role_values = roles[heartbeat.role]
+                role_values["active_sessions"] += heartbeat.active_sessions
+                role_values["queued_sessions"] += heartbeat.queue_depth
+                if heartbeat.lifecycle == "draining":
+                    role_values["draining_workers"] += 1
+                elif heartbeat.lifecycle == "ready":
+                    role_values["free_slots"] += max(
+                        0, heartbeat.capacity - heartbeat.active_sessions
+                    )
+            return {"observed_at": now_epoch, "roles": roles}
+
+    async def acquire(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        generation_id: str,
+        model_revision: str,
+        vae_fingerprint: str,
+        excluded_workers: frozenset[tuple[WorkerRole, str]] = frozenset(),
+    ) -> SessionAssignment:
+        if not all(
+            (user_id, session_id, generation_id, model_revision, vae_fingerprint)
+        ):
+            raise CoordinatorRejected("INVALID_SESSION_IDENTITY")
+        async with self._locked_state() as state:
+            now_epoch = self._wall_clock()
+            self._expire_state(state, now_epoch)
+            user_token = state["assignments_by_user"].get(user_id)
+            if user_token in state["assignments_by_token"]:
+                raise CoordinatorRejected("USER_SESSION_LIMIT")
+
+            identity = f"{user_id}:{session_id}:{generation_id}"
+            denoisers = self._free_slots(
+                state,
+                self._active_workers(
+                    state,
+                    role="denoiser",
+                    now_epoch=now_epoch,
+                    model_revision=model_revision,
+                    vae_fingerprint=vae_fingerprint,
+                    excluded_workers=excluded_workers,
+                ),
+                identity=identity,
+            )
+            vaes = self._free_slots(
+                state,
+                self._active_workers(
+                    state,
+                    role="vae",
+                    now_epoch=now_epoch,
+                    model_revision=model_revision,
+                    vae_fingerprint=vae_fingerprint,
+                    excluded_workers=excluded_workers,
+                ),
+                identity=identity,
+            )
+            pairs = DynamoDBCoordinatorStore._candidate_pairs(
+                denoisers,
+                vaes,
+                identity=identity,
+            )
+            if not pairs:
+                raise CoordinatorRejected("CAPACITY_EXHAUSTED", retry_after_s=0.25)
+            denoiser, vae = pairs[0]
+            token = uuid4().hex
+            assignment_payload = {
+                "user_id": user_id,
+                "session_id": session_id,
+                "generation_id": generation_id,
+                "token": token,
+                "expires_at": now_epoch + self.ttl_s,
+                "denoiser": asdict(denoiser),
+                "vae": asdict(vae),
+            }
+            state["assignments_by_token"][token] = assignment_payload
+            state["assignments_by_user"][user_id] = token
+            for slot in (denoiser, vae):
+                state["slot_tokens"][
+                    self._slot_key(slot.role, slot.worker_id, slot.slot_index)
+                ] = token
+            return self._assignment_from_state(assignment_payload)
+
+    async def renew(self, assignment: SessionAssignment) -> SessionAssignment:
+        async with self._locked_state() as state:
+            now_epoch = self._wall_clock()
+            self._expire_state(state, now_epoch)
+            current_payload = state["assignments_by_token"].get(assignment.token)
+            if current_payload is None:
+                raise CoordinatorRejected("LEASE_LOST")
+            current = self._assignment_from_state(current_payload)
+            if not self._assignment_identity_matches(current, assignment):
+                raise CoordinatorRejected("LEASE_LOST")
+            for slot in (current.denoiser, current.vae):
+                worker = state["workers"].get(slot.worker_id)
+                if worker is None:
+                    raise CoordinatorRejected("WORKER_LOST")
+                heartbeat = self._heartbeat_from_state(worker["heartbeat"])
+                if (
+                    float(worker.get("updated_at", 0)) + self.worker_ttl_s <= now_epoch
+                    or heartbeat.worker_epoch != slot.worker_epoch
+                    or heartbeat.lifecycle == "failed"
+                    or (
+                        heartbeat.lifecycle == "draining"
+                        and heartbeat.drain_deadline is not None
+                        and heartbeat.drain_deadline <= now_epoch
+                    )
+                ):
+                    raise CoordinatorRejected("WORKER_LOST")
+            current_payload["expires_at"] = now_epoch + self.ttl_s
+            state["assignments_by_token"][assignment.token] = current_payload
+            state["assignments_by_user"][assignment.user_id] = assignment.token
+            return self._assignment_from_state(current_payload)
+
+    async def release(self, assignment: SessionAssignment) -> None:
+        async with self._locked_state() as state:
+            self._release_token(state, assignment.token)
+
+    async def wait_for_change(self, timeout_s: float) -> None:
+        await asyncio.sleep(timeout_s)
+
+    async def close(self) -> None:
+        if self._client is None or not self._owns_client:
+            return
+        closer = getattr(self._client, "aclose", None)
+        if closer is None:
+            closer = getattr(self._client, "close", None)
+        if closer is not None:
+            result = closer()
+            if asyncio.iscoroutine(result):
+                await result
+        self._client = None
+
+
 class RealtimeCoordinator:
     def __init__(
         self,
@@ -1745,6 +2574,7 @@ class RealtimeCoordinator:
     async def close(self) -> None:
         if self._late_cleanup_tasks:
             await asyncio.gather(*self._late_cleanup_tasks, return_exceptions=True)
-        closer = getattr(self.reservation_client, "close", None)
-        if closer is not None:
-            await closer()
+        for closeable in (self.reservation_client, self.store):
+            closer = getattr(closeable, "close", None)
+            if closer is not None:
+                await closer()

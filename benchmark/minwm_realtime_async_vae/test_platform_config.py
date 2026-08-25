@@ -136,7 +136,23 @@ def test_denoisers_use_crt_nvme_immutable_release_and_digest_images(
     assert config["resources"]["requests"]["nvidia.com/gpu"] == gpu_count
     assert config["resources"]["limits"]["nvidia.com/gpu"] == gpu_count
     assert heartbeat["restartPolicy"] == "Always"
+    heartbeat_command = " ".join(heartbeat["args"])
+    assert "--routing-revision=" in heartbeat_command
     assert config["startupProbe"]["failureThreshold"] == 270
+
+
+def test_gateway_uses_stable_routing_revisions_not_artifact_revisions():
+    gateway = _by_name("world-realtime-gateway")
+    command = " ".join(gateway["args"])
+    env = {item["name"]: item.get("value") for item in gateway["env"]}
+
+    assert "--model-revision=${MODEL_ROUTING_REVISION}" in command
+    assert "--lingbot2-model-revision=${LINGBOT2_MODEL_ROUTING_REVISION}" in command
+    assert "--model-revision=${MODEL_REVISION}" not in command
+    assert env["MODEL_ROUTING_REVISION"] == "minwm"
+    assert env["LINGBOT2_MODEL_ROUTING_REVISION"] == "lingbot2"
+    assert env["MODEL_REVISION"] != env["MODEL_ROUTING_REVISION"]
+    assert env["LINGBOT2_MODEL_REVISION"] != env["LINGBOT2_MODEL_ROUTING_REVISION"]
 
 
 def test_vae_workers_request_one_l4_each_and_are_anti_affined():
@@ -164,6 +180,44 @@ def test_cpu_control_plane_is_ha_and_spread_across_zones():
         assert config["topologySpreadConstraints"][0]["topologyKey"] == (
             "topology.kubernetes.io/zone"
         )
+
+
+def test_coordinator_uses_redis_shared_state_backend():
+    coordinator = _by_name("world-realtime-coordinator")
+    command = " ".join(coordinator["args"])
+    env = {item["name"]: item for item in coordinator["env"]}
+    network_peers = required_inputs_document()["requiredInputs"]["networkPolicyPeers"]
+
+    assert "--backend=redis" in command
+    assert "--redis-password-env=REDIS_PASSWORD" in command
+    assert (
+        "--routing-revision-alias=${MODEL_ROUTING_REVISION}=${MODEL_REVISION}"
+        in command
+    )
+    assert (
+        "--routing-revision-alias=${LINGBOT2_MODEL_ROUTING_REVISION}"
+        "=${LINGBOT2_MODEL_REVISION}"
+        in command
+    )
+    assert env["REDIS_HOST"]["value"] == (
+        "r-2ze358d0dce684b4.redis.rds.aliyuncs.com"
+    )
+    assert env["MODEL_ROUTING_REVISION"]["value"] == "minwm"
+    assert env["MODEL_REVISION"]["value"] != env["MODEL_ROUTING_REVISION"]["value"]
+    assert env["REDIS_PASSWORD"]["valueFrom"]["secretKeyRef"] == {
+        "name": "world-studio-runtime",
+        "key": "redis-password",
+    }
+    assert "dynamodb" not in json.dumps(coordinator).lower()
+    assert {
+        "serviceName": "world-realtime-coordinator",
+        "direction": "egress",
+        "destinationId": "world-model-realtime-redis",
+        "protocol": "TCP",
+        "port": 6379,
+        "state": "missing",
+        "requiredTypedPeer": "podSelector+namespaceSelector or approved ipBlock",
+    } in network_peers
 
 
 def test_webui_keeps_external_secret_references_and_ephemeral_volumes():

@@ -124,7 +124,7 @@ IMAGE_INPUT_SPECS = {
 IMAGE_PLACEHOLDERS = {spec["placeholder"] for spec in IMAGE_INPUT_SPECS.values()}
 NETWORK_REQUIRED_INPUTS = {
     "world-realtime-coordinator": [
-        ("egress", "dynamodb-us-east-2", "TCP", 443),
+        ("egress", "world-model-realtime-redis", "TCP", 6379),
         ("egress", "adot-collector-monitoring", "TCP", 4317),
     ],
     "minwm-vae": [("egress", "adot-collector-monitoring", "TCP", 4317)],
@@ -158,10 +158,12 @@ MINWM_MODEL_NAME = "minwm-async-denoiser-0"
 MINWM_MODEL_VERSION = "wan22-5b-stage3-dmd-47-0808-2fb2cfec2a2-gs3200-ema-student-v1"
 MINWM_SOURCE_REVISION = "gs3200-ema-student-v1"
 MINWM_RELEASE_ID = "20260810T042157Z-c302d572"
+MINWM_ROUTING_REVISION = "minwm"
 LINGBOT2_REVISION = "59cccf49f2d2dd27418ae7a04b82b10868d455c2"
 LINGBOT2_MODEL_NAME = "lingbot2-denoiser"
 LINGBOT2_MODEL_VERSION = "robbyant-lingbot-world-v2-14b-causal-fast-diffusers"
 LINGBOT2_RELEASE_ID = "20260814T054118Z-e0650875"
+LINGBOT2_ROUTING_REVISION = "lingbot2"
 S3_EXACT_BUNDLE_SHA256 = (
     "944d828d3eb4c3db52f761847046c2910b8243a23579553fe6bee2defa8b29c7"
 )
@@ -455,14 +457,34 @@ def _coordinator() -> dict[str, Any]:
             "args": [
                 "exec python -m sglang.multimodal_gen.runtime.entrypoints."
                 "realtime_coordinator_server --host=0.0.0.0 --port=18081 "
-                "--backend=dynamodb --table-name=${COORDINATOR_TABLE} "
-                "--region=${AWS_REGION} --ttl-s=30 --worker-ttl-s=15 "
+                "--backend=redis --redis-host=${REDIS_HOST} "
+                "--redis-port=${REDIS_PORT} --redis-username=${REDIS_USERNAME} "
+                "--redis-password-env=REDIS_PASSWORD "
+                "--redis-key-prefix=${REDIS_KEY_PREFIX} "
+                "--redis-state-ttl-s=${REDIS_STATE_TTL_SECONDS} "
+                "--ttl-s=30 --worker-ttl-s=15 "
+                "--routing-revision-alias=${MODEL_ROUTING_REVISION}=${MODEL_REVISION} "
+                "--routing-revision-alias=${LINGBOT2_MODEL_ROUTING_REVISION}=${LINGBOT2_MODEL_REVISION} "
                 "--wait-timeout-s=10 --candidate-limit=64 "
                 "--denoiser-capacity-limit=4 --vae-capacity-limit=16"
             ],
             "env": [
-                _env("COORDINATOR_TABLE", "world-model-realtime"),
-                _env("AWS_REGION", "us-east-2"),
+                _env(
+                    "REDIS_HOST",
+                    "r-2ze358d0dce684b4.redis.rds.aliyuncs.com",
+                ),
+                _env("REDIS_PORT", "6379"),
+                _env("REDIS_USERNAME", "default"),
+                _env("REDIS_KEY_PREFIX", "world-model-realtime"),
+                _env("REDIS_STATE_TTL_SECONDS", "86400"),
+                _env("MODEL_ROUTING_REVISION", MINWM_ROUTING_REVISION),
+                _env("MODEL_REVISION", "wan22-5b-stage3-dmd-47-0808-2fb2cfec2a2"),
+                _env("LINGBOT2_MODEL_ROUTING_REVISION", LINGBOT2_ROUTING_REVISION),
+                _env(
+                    "LINGBOT2_MODEL_REVISION",
+                    "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
+                ),
+                _secret_env("REDIS_PASSWORD", "redis-password"),
                 _env("OTEL_SERVICE_NAME", name),
                 _env(
                     "OTEL_EXPORTER_OTLP_ENDPOINT",
@@ -497,7 +519,7 @@ def _coordinator() -> dict[str, Any]:
                 ],
                 egress_to=[],
                 external=[
-                    "dynamodb.us-east-2.amazonaws.com",
+                    "world-model-realtime-redis",
                     "adot-collector.monitoring",
                 ],
             ),
@@ -530,6 +552,7 @@ def _vae(*, lingbot2: bool) -> dict[str, Any]:
                 "--encoded-frames-per-batch=1",
                 "--encode-workers=4",
                 "--max-message-mb=64",
+                "--warmup-size=${STARTUP_WARMUP_SIZE}",
                 "--host=0.0.0.0",
                 "--port=18081",
             ],
@@ -544,6 +567,7 @@ def _vae(*, lingbot2: bool) -> dict[str, Any]:
                     "OTEL_RESOURCE_ATTRIBUTES",
                     f"service.namespace=world-model,worker.role=vae,model.name={'lingbot2' if lingbot2 else 'minwm'}",
                 ),
+                _env("STARTUP_WARMUP_SIZE", "832x480"),
             ],
             "resources": {
                 "requests": {
@@ -693,6 +717,12 @@ def _denoiser_heartbeat(*, lingbot2: bool) -> dict[str, Any]:
         if lingbot2
         else "wan22-5b-stage3-dmd-47-0808-2fb2cfec2a2"
     )
+    routing_revision = LINGBOT2_ROUTING_REVISION if lingbot2 else MINWM_ROUTING_REVISION
+    ready_file_arg = (
+        ""
+        if lingbot2
+        else " --ready-file=/var/run/minwm-worker/startup-warmup-ready"
+    )
     return {
         "name": "denoiser-heartbeat",
         "image": _image_placeholder(service_name),
@@ -709,7 +739,8 @@ def _denoiser_heartbeat(*, lingbot2: bool) -> dict[str, Any]:
             "--role=denoiser --endpoint=ws://${POD_IP}:30000/v1/realtime_video/generate "
             "--reservation-endpoint=http://${POD_IP}:30000/v1/realtime_worker "
             f"--node-name=${{NODE_NAME}} --capacity={capacity} --model-revision={revision} "
-            f"--vae-fingerprint={fingerprint} --interval-s=5"
+            f"--routing-revision={routing_revision} "
+            f"--vae-fingerprint={fingerprint}{ready_file_arg} --interval-s=5"
         ],
         "env": [
             _env("SGLANG_LIGHTWEIGHT_RUNTIME", "1"),
@@ -811,13 +842,31 @@ def _denoiser(*, lingbot2: bool) -> dict[str, Any]:
         }
         cache_size = "80Gi"
         shm_size = "64Gi"
-    command = (
-        "set -euo pipefail; test -f ${MODEL_PATH}/_READY; "
-        "test -f ${MODEL_PATH}/model_index.json; test -d ${MODEL_PATH}/transformer; "
-        f"{launch} & child=$!; "
-        "terminate() { kill -TERM ${child} 2>/dev/null || true; wait ${child} || true; exit 143; }; "
-        "trap terminate TERM INT; wait ${child}"
-    )
+    if lingbot2:
+        command = (
+            "set -euo pipefail; test -f ${MODEL_PATH}/_READY; "
+            "test -f ${MODEL_PATH}/model_index.json; test -d ${MODEL_PATH}/transformer; "
+            f"{launch} & child=$!; "
+            "terminate() { kill -TERM ${child} 2>/dev/null || true; wait ${child} || true; exit 143; }; "
+            "trap terminate TERM INT; wait ${child}"
+        )
+    else:
+        command = (
+            "set -euo pipefail; test -f ${MODEL_PATH}/_READY; "
+            "test -f ${MODEL_PATH}/model_index.json; test -d ${MODEL_PATH}/transformer; "
+            "ready_file=/var/run/minwm-worker/startup-warmup-ready; rm -f ${ready_file}; "
+            f"{launch} & child=$!; "
+            "terminate() { kill -TERM ${child} 2>/dev/null || true; wait ${child} || true; exit 143; }; "
+            "trap terminate TERM INT; "
+            "until curl --fail --silent --max-time 2 http://127.0.0.1:30000/health >/dev/null; do "
+            "if ! kill -0 ${child} 2>/dev/null; then wait ${child}; exit $?; fi; sleep 2; done; "
+            "if ! python3 -m sglang.multimodal_gen.runtime.realtime.startup_warmup "
+            "--url ws://127.0.0.1:30000/v1/realtime_video/generate --model minwm "
+            "--size ${STARTUP_WARMUP_SIZE} --timeout-s ${STARTUP_WARMUP_TIMEOUT_SECONDS} "
+            "--ready-file ${ready_file} --allow-empty-complete; then "
+            "kill -TERM ${child} 2>/dev/null || true; wait ${child} || true; exit 1; fi; "
+            "wait ${child}"
+        )
     app.update(
         {
             "statefulSet": {
@@ -841,6 +890,14 @@ def _denoiser(*, lingbot2: bool) -> dict[str, Any]:
                 _env(
                     "OTEL_EXPORTER_OTLP_ENDPOINT",
                     "http://adot-collector.monitoring:4317",
+                ),
+                *(
+                    []
+                    if lingbot2
+                    else [
+                        _env("STARTUP_WARMUP_SIZE", "832x480"),
+                        _env("STARTUP_WARMUP_TIMEOUT_SECONDS", "300"),
+                    ]
                 ),
             ],
             "resources": resources,
@@ -920,8 +977,8 @@ def _gateway() -> dict[str, Any]:
                 "exec python -m sglang.multimodal_gen.runtime.entrypoints."
                 "realtime_gateway_server --host=0.0.0.0 --port=18080 "
                 "--coordinator-url=http://world-realtime-coordinator:18081 "
-                "--model-revision=${MODEL_REVISION} "
-                "--lingbot2-model-revision=${LINGBOT2_MODEL_REVISION} "
+                "--model-revision=${MODEL_ROUTING_REVISION} "
+                "--lingbot2-model-revision=${LINGBOT2_MODEL_ROUTING_REVISION} "
                 "--vae-fingerprint=${VAE_FINGERPRINT} "
                 "--lingbot2-vae-fingerprint=${LINGBOT2_VAE_FINGERPRINT} "
                 "--internal-output-url=ws://${POD_IP}:18080/v1/internal/realtime_output "
@@ -931,8 +988,10 @@ def _gateway() -> dict[str, Any]:
             ],
             "env": [
                 _field_env("POD_IP", "status.podIP"),
+                _env("MODEL_ROUTING_REVISION", MINWM_ROUTING_REVISION),
                 _env("MODEL_REVISION", "wan22-5b-stage3-dmd-47-0808-2fb2cfec2a2"),
                 _env("VAE_FINGERPRINT", "taew2_2-d053e216"),
+                _env("LINGBOT2_MODEL_ROUTING_REVISION", LINGBOT2_ROUTING_REVISION),
                 _env(
                     "LINGBOT2_MODEL_REVISION",
                     "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",

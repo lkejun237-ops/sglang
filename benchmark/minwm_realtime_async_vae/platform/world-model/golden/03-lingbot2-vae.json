@@ -28,6 +28,7 @@
     "--encoded-frames-per-batch=1",
     "--encode-workers=4",
     "--max-message-mb=64",
+    "--warmup-size=${STARTUP_WARMUP_SIZE}",
     "--host=0.0.0.0",
     "--port=18081"
   ],
@@ -51,6 +52,10 @@
     {
       "name": "OTEL_RESOURCE_ATTRIBUTES",
       "value": "service.namespace=world-model,worker.role=vae,model.name=lingbot2"
+    },
+    {
+      "name": "STARTUP_WARMUP_SIZE",
+      "value": "832x480"
     }
   ],
   "gitRepo": "git@github.com:seedleap/sglang.git",

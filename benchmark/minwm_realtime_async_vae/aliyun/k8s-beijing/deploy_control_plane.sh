@@ -20,12 +20,23 @@ WORLD_STUDIO_WEBUI_BASE_URL="${WORLD_STUDIO_WEBUI_BASE_URL:-http://zing-webui:18
 NVIDIA_DEVICE_PLUGIN_IMAGE="${NVIDIA_DEVICE_PLUGIN_IMAGE:-nvcr.io/nvidia/k8s-device-plugin:v0.17.1}"
 REALTIME_TARGET_FPS="${REALTIME_TARGET_FPS:-24}"
 REALTIME_SIZE="${REALTIME_SIZE:-832x480}"
+MINWM_ROUTING_REVISION="${MINWM_ROUTING_REVISION:-minwm}"
+MINWM_MODEL_REVISION="${MINWM_MODEL_REVISION:-wan22-5b-stage3-dmd-47-0808-2fb2cfec2a2}"
+STARTUP_WARMUP_SIZE="${STARTUP_WARMUP_SIZE:-${REALTIME_SIZE}}"
+STARTUP_WARMUP_TIMEOUT_SECONDS="${STARTUP_WARMUP_TIMEOUT_SECONDS:-300}"
 H264_LIVE_EDGE_TARGET_MS="${H264_LIVE_EDGE_TARGET_MS:-500}"
 H264_LIVE_EDGE_SEEK_THRESHOLD_MS="${H264_LIVE_EDGE_SEEK_THRESHOLD_MS:-900}"
 UI_CONFIG_JSON="${UI_CONFIG_JSON:-{\"generationModes\":[\"i2v\"],\"defaultGenerationMode\":\"i2v\",\"modelSlots\":[\"minwm\"],\"lockModelSlots\":true,\"size\":\"${REALTIME_SIZE}\",\"targetFps\":${REALTIME_TARGET_FPS},\"sessionMaxLifetimeSeconds\":70,\"playbackAckEnabled\":false,\"h264WebSocketEnabled\":true,\"h264DirectGatewayEnabled\":true,\"h264WebSocketBaseUrl\":\"${PUBLIC_GATEWAY_BASE_URL}\",\"h264CompressedBitrateKbps\":3000,\"h264CompressedCrf\":20,\"h264CompressedPreset\":\"fast\",\"h264CompressedGopSeconds\":2,\"h264CompressedVbvBufferMs\":250,\"h264WebSocketLiveEdgeTargetMs\":${H264_LIVE_EDGE_TARGET_MS},\"h264WebSocketSeekThresholdMs\":${H264_LIVE_EDGE_SEEK_THRESHOLD_MS},\"singleExperience\":true,\"tabScopedUserIds\":true,\"smoothCatchupRateMax\":1.1,\"dualModels\":{\"minwm\":{\"label\":\"Zing\",\"size\":\"${REALTIME_SIZE}\",\"targetFps\":${REALTIME_TARGET_FPS},\"sinkSize\":8,\"windowFrames\":32,\"continuous\":true,\"h264StartupDropFrames\":0}}}}"
 DENOISER_CAPACITY_LIMIT="${DENOISER_CAPACITY_LIMIT:-35}"
 VAE_CAPACITY_LIMIT="${VAE_CAPACITY_LIMIT:-80}"
 VAE_WORKER_CAPACITY="${VAE_WORKER_CAPACITY:-7}"
+REDIS_HOST="${REDIS_HOST:-r-2ze358d0dce684b4.redis.rds.aliyuncs.com}"
+REDIS_PORT="${REDIS_PORT:-6379}"
+REDIS_USERNAME="${REDIS_USERNAME:-default}"
+REDIS_KEY_PREFIX="${REDIS_KEY_PREFIX:-world-model-realtime}"
+REDIS_STATE_TTL_SECONDS="${REDIS_STATE_TTL_SECONDS:-86400}"
+REDIS_LOCK_TIMEOUT_SECONDS="${REDIS_LOCK_TIMEOUT_SECONDS:-1}"
+REDIS_PASSWORD_SECRET_VALUE="${REDIS_PASSWORD:-}"
 WEBUI_PROMPT_REWRITER_PATH="${WEBUI_PROMPT_REWRITER_PATH:-/data/zing-realtime/secrets/prompt-rewriter-vertex.json}"
 WEBUI_DOUBAO_ARK_PATH="${WEBUI_DOUBAO_ARK_PATH:-/data/zing-realtime/secrets/doubao-ark.json}"
 VIDEO_PROMPT_REWRITE_PROVIDER="${VIDEO_PROMPT_REWRITE_PROVIDER:-doubao}"
@@ -53,7 +64,7 @@ WEBUI_STATIC_PATCH_NAME="${WEBUI_STATIC_PATCH_NAME:-zing-webui-static-patch}"
 WEBUI_ASSET_PATCH_NAME="${WEBUI_ASSET_PATCH_NAME:-zing-webui-preset-assets-patch}"
 WEBUI_STATIC_PATCH_VERSION="${WEBUI_STATIC_PATCH_VERSION:-single-zing-v10-feishu-demo-20260825}"
 WEBUI_STATIC_SOURCE_DIR="${WEBUI_STATIC_SOURCE_DIR:-${REPO_ROOT}/python/sglang/multimodal_gen/apps/realtime_webui}"
-RUNTIME_SOURCE_PATCH_VERSION="${RUNTIME_SOURCE_PATCH_VERSION:-runtime-v2-h264-20260822}"
+RUNTIME_SOURCE_PATCH_VERSION="${RUNTIME_SOURCE_PATCH_VERSION:-runtime-v5-h264-warmup-vae-service-20260825}"
 RUNTIME_REALTIME_SOURCE_DIR="${RUNTIME_REALTIME_SOURCE_DIR:-${REPO_ROOT}/python/sglang/multimodal_gen/runtime/realtime}"
 RUNTIME_ENTRYPOINT_SOURCE_DIR="${RUNTIME_ENTRYPOINT_SOURCE_DIR:-${REPO_ROOT}/python/sglang/multimodal_gen/runtime/entrypoints}"
 RUNTIME_OPENAI_REALTIME_ENTRYPOINT_SOURCE_DIR="${RUNTIME_OPENAI_REALTIME_ENTRYPOINT_SOURCE_DIR:-${RUNTIME_ENTRYPOINT_SOURCE_DIR}/openai/realtime}"
@@ -77,9 +88,19 @@ render_template() {
   NVIDIA_DEVICE_PLUGIN_IMAGE="${NVIDIA_DEVICE_PLUGIN_IMAGE}" \
   REALTIME_TARGET_FPS="${REALTIME_TARGET_FPS}" \
   REALTIME_SIZE="${REALTIME_SIZE}" \
+  MINWM_ROUTING_REVISION="${MINWM_ROUTING_REVISION}" \
+  MINWM_MODEL_REVISION="${MINWM_MODEL_REVISION}" \
+  STARTUP_WARMUP_SIZE="${STARTUP_WARMUP_SIZE}" \
+  STARTUP_WARMUP_TIMEOUT_SECONDS="${STARTUP_WARMUP_TIMEOUT_SECONDS}" \
   DENOISER_CAPACITY_LIMIT="${DENOISER_CAPACITY_LIMIT}" \
   VAE_CAPACITY_LIMIT="${VAE_CAPACITY_LIMIT}" \
   VAE_WORKER_CAPACITY="${VAE_WORKER_CAPACITY}" \
+  REDIS_HOST="${REDIS_HOST}" \
+  REDIS_PORT="${REDIS_PORT}" \
+  REDIS_USERNAME="${REDIS_USERNAME}" \
+  REDIS_KEY_PREFIX="${REDIS_KEY_PREFIX}" \
+  REDIS_STATE_TTL_SECONDS="${REDIS_STATE_TTL_SECONDS}" \
+  REDIS_LOCK_TIMEOUT_SECONDS="${REDIS_LOCK_TIMEOUT_SECONDS}" \
   VIDEO_PROMPT_REWRITE_PROVIDER="${VIDEO_PROMPT_REWRITE_PROVIDER}" \
   VIDEO_PROMPT_REWRITE_TIMEOUT_SECONDS="${VIDEO_PROMPT_REWRITE_TIMEOUT_SECONDS}" \
   CREATE_WORLD_DESCRIPTION_PROVIDER="${CREATE_WORLD_DESCRIPTION_PROVIDER}" \
@@ -89,7 +110,7 @@ render_template() {
   UI_CONFIG_JSON="${UI_CONFIG_JSON}" \
   H264_FFMPEG_BIN="${H264_FFMPEG_BIN}" \
   RUNTIME_SOURCE_PATCH_VERSION="${RUNTIME_SOURCE_PATCH_VERSION}" \
-  envsubst '${NAMESPACE} ${CONTROL_IMAGE} ${GPU_RUNTIME_IMAGE} ${WEBUI_IMAGE} ${WORLD_STUDIO_WEBUI_BASE_URL} ${NVIDIA_DEVICE_PLUGIN_IMAGE} ${REALTIME_TARGET_FPS} ${REALTIME_SIZE} ${DENOISER_CAPACITY_LIMIT} ${VAE_CAPACITY_LIMIT} ${VAE_WORKER_CAPACITY} ${VIDEO_PROMPT_REWRITE_PROVIDER} ${VIDEO_PROMPT_REWRITE_TIMEOUT_SECONDS} ${CREATE_WORLD_DESCRIPTION_PROVIDER} ${DOUBAO_ARK_CREDENTIALS} ${DOUBAO_REQUEST_TIMEOUT_SECONDS} ${WEBUI_NO_PROXY} ${UI_CONFIG_JSON} ${H264_FFMPEG_BIN} ${RUNTIME_SOURCE_PATCH_VERSION}' \
+  envsubst '${NAMESPACE} ${CONTROL_IMAGE} ${GPU_RUNTIME_IMAGE} ${WEBUI_IMAGE} ${WORLD_STUDIO_WEBUI_BASE_URL} ${NVIDIA_DEVICE_PLUGIN_IMAGE} ${REALTIME_TARGET_FPS} ${REALTIME_SIZE} ${MINWM_ROUTING_REVISION} ${MINWM_MODEL_REVISION} ${STARTUP_WARMUP_SIZE} ${STARTUP_WARMUP_TIMEOUT_SECONDS} ${DENOISER_CAPACITY_LIMIT} ${VAE_CAPACITY_LIMIT} ${VAE_WORKER_CAPACITY} ${REDIS_HOST} ${REDIS_PORT} ${REDIS_USERNAME} ${REDIS_KEY_PREFIX} ${REDIS_STATE_TTL_SECONDS} ${REDIS_LOCK_TIMEOUT_SECONDS} ${VIDEO_PROMPT_REWRITE_PROVIDER} ${VIDEO_PROMPT_REWRITE_TIMEOUT_SECONDS} ${CREATE_WORLD_DESCRIPTION_PROVIDER} ${DOUBAO_ARK_CREDENTIALS} ${DOUBAO_REQUEST_TIMEOUT_SECONDS} ${WEBUI_NO_PROXY} ${UI_CONFIG_JSON} ${H264_FFMPEG_BIN} ${RUNTIME_SOURCE_PATCH_VERSION}' \
     <"${template}" >"${output}"
 }
 
@@ -287,6 +308,27 @@ rm -f "${REMOTE_DIR}/proxy.env"
 REMOTE
 }
 
+create_optional_redis_secret() {
+  if [[ -z "${REDIS_PASSWORD_SECRET_VALUE}" ]]; then
+    log "no Redis password configured; leaving Redis secret unchanged"
+    return
+  fi
+  log "creating/updating Redis coordinator secret"
+  local tmp
+  tmp="$(mktemp)"
+  printf 'password=%s\n' "${REDIS_PASSWORD_SECRET_VALUE}" >"${tmp}"
+  scp -q "${tmp}" "${SSH_HOST}:${REMOTE_DIR}/redis.env"
+  rm -f "${tmp}"
+  ssh -o BatchMode=yes "${SSH_HOST}" \
+    "NAMESPACE='${NAMESPACE}' REMOTE_DIR='${REMOTE_DIR}' bash -s" <<'REMOTE'
+set -Eeuo pipefail
+kubectl -n "${NAMESPACE}" create secret generic zing-redis \
+  --from-env-file="${REMOTE_DIR}/redis.env" \
+  --dry-run=client -o yaml | kubectl apply -f -
+rm -f "${REMOTE_DIR}/redis.env"
+REMOTE
+}
+
 apply_runtime_source_patch() {
   if [[ "${APPLY_RUNTIME_SOURCE_PATCH}" != "true" ]]; then
     log "runtime source patch disabled"
@@ -405,6 +447,13 @@ apply_manifests() {
   render_template "${SCRIPT_DIR}/manifests/control-plane.yaml.tpl" "${rendered}"
   scp -q "${rendered}" "${SSH_HOST}:${REMOTE_DIR}/control-plane.yaml"
   rm -f "${rendered}"
+  ssh -o BatchMode=yes "${SSH_HOST}" "NAMESPACE='${NAMESPACE}' bash -s" <<'REMOTE'
+set -Eeuo pipefail
+if kubectl -n "${NAMESPACE}" get deploy/zing-webui >/dev/null 2>&1; then
+  kubectl -n "${NAMESPACE}" set env deploy/zing-webui \
+    HTTPS_PROXY- HTTP_PROXY- https_proxy- http_proxy- >/dev/null
+fi
+REMOTE
   ssh -o BatchMode=yes "${SSH_HOST}" "kubectl apply -f '${REMOTE_DIR}/control-plane.yaml'"
   if [[ "${APPLY_NVIDIA_DEVICE_PLUGIN}" == "true" ]]; then
     log "rendering and applying NVIDIA device plugin"
@@ -621,6 +670,7 @@ main() {
   create_acr_secret
   create_optional_webui_secret
   create_optional_proxy_secret
+  create_optional_redis_secret
   apply_runtime_source_patch
   apply_manifests
   apply_webui_static_patch
