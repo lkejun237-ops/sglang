@@ -51,9 +51,10 @@ Access, default server-side encryption, and a lifecycle rule that aborts
 incomplete multipart uploads after one day.
 
 Only a verified `authorized_generate` token with
-`session.record_video=true` creates a recorder. Legacy/showcase sessions and
-tokens with `record_video=false` do not record. Each complete Run is uploaded
-directly as:
+`session.record_video=true` creates a recorder. Session type is not a separate
+recording gate, so Showcase sessions record when their signed policy enables
+it; tokens with `record_video=false` do not record. Each complete Run is
+uploaded directly as:
 
 ```text
 s3://<bucket>/runs/<run_id>/video.mp4
@@ -61,17 +62,19 @@ s3://<bucket>/runs/<run_id>/video.mp4
 
 The recording path is a fail-open side tap after Gateway output validation. It
 does not proxy through world-service, re-encode media, or wait for S3 before
-forwarding to the browser. Per recording, an 8 MiB byte queue feeds sequential
-8 MiB multipart parts in a dedicated eight-thread S3 executor. The steady raw
-media ceiling is therefore about 16 MiB per active recording, excluding SDK,
+forwarding to the browser. Per recording, a 5 MiB byte queue feeds sequential
+5 MiB multipart parts in a dedicated eight-thread S3 executor. The steady raw
+media ceiling is therefore about 10 MiB per active recording, excluding SDK,
 Python-object, and thread-stack overhead. If the queue fills or S3 fails, the
 multipart upload is aborted while realtime playback continues.
 
 Gateway completes an upload only after the final `media_chunk_complete` emitted
-after FFmpeg stdout EOF. It then sends the existing HMAC-authenticated
-`POST /internal/v1/runs/recorded` callback. Session cleanup does not wait for
-this finalization; process shutdown drains detached recorders for at most ten
-seconds before relying on the bucket lifecycle rule.
+after FFmpeg stdout EOF. The final decoded chunk starts that drain immediately;
+WebSocket teardown only waits for the same idempotent finalization task. Gateway
+then sends the existing HMAC-authenticated
+`POST /internal/v1/runs/recorded` callback. Gateway session cleanup does not
+wait for S3 upload or callback completion; process shutdown drains detached
+recorders for at most ten seconds before relying on the bucket lifecycle rule.
 
 Deploy in this order:
 
@@ -157,7 +160,7 @@ The eight-session cross-cloud gate is:
 
 - at least 48 Mbps sustained aggregate upload capacity, twice the 24 Mbps media
   rate;
-- 8 MiB `UploadPart` p99 below 10 seconds;
+- 5 MiB `UploadPart` p99 below 10 seconds;
 - zero `buffer_full` and `upload_failed` results in three complete 70-second
   rounds;
 - no more than 5% regression in browser first-frame and send-path p95.

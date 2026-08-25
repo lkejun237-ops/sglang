@@ -16,8 +16,10 @@ from prometheus_client import Counter, Gauge, Histogram
 
 logger = logging.getLogger(__name__)
 
-PART_SIZE = 8 * 1024 * 1024
-QUEUE_MAX_BYTES = 8 * 1024 * 1024
+# S3 要求除最后一片外每片至少 5 MiB。直接使用这个下限，让运行期间尽早
+# 上传更多完整 part，并减少收到最终标记后仍需同步上传的尾片。
+PART_SIZE = 5 * 1024 * 1024
+QUEUE_MAX_BYTES = 5 * 1024 * 1024
 S3_WORKER_THREADS = 8
 SHUTDOWN_DRAIN_SECONDS = 10.0
 
@@ -101,6 +103,7 @@ class RunVideoRecorder:
         self.result: str | None = None
         self.failure_reason = ""
         self.final_seen = False
+        self.final_seen_at: float | None = None
         self.payload_count = 0
         self.queued_bytes = 0
         self.peak_queued_bytes = 0
@@ -184,8 +187,18 @@ class RunVideoRecorder:
         # Seal input synchronously with acceptance of the final marker. Session
         # cleanup may now detach, but no later payload can enter this upload.
         self.final_seen = True
+        self.final_seen_at = time.perf_counter()
         self.state = "completing"
         self._wake.set()
+        logger.info(
+            "World recording final marker received run_id=%s session_id=%s "
+            "trace_id=%s queued_bytes=%d payload_count=%d",
+            self.run_id,
+            self.session_id,
+            self.trace_id,
+            self.queued_bytes,
+            self.payload_count,
+        )
 
     def session_closed(self) -> None:
         """Abort sessions that closed without the post-EOF final marker."""
@@ -301,15 +314,23 @@ class RunVideoRecorder:
                     return
                 if self.state == "completing":
                     finalize_started = time.perf_counter()
+                    final_part_bytes = 0
+                    final_part_upload_ms = 0.0
                     if part:
                         body = bytes(part)
                         part.clear()
+                        final_part_bytes = len(body)
+                        final_part_started = time.perf_counter()
                         parts.append(
                             await self._upload_part(upload_id, len(parts) + 1, body)
                         )
+                        final_part_upload_ms = (
+                            time.perf_counter() - final_part_started
+                        ) * 1000.0
                     if not parts:
                         self.fail("incomplete")
                         return
+                    complete_started = time.perf_counter()
                     await self._call_s3(
                         self._s3.complete_multipart_upload,
                         Bucket=self.bucket,
@@ -317,11 +338,31 @@ class RunVideoRecorder:
                         UploadId=upload_id,
                         MultipartUpload={"Parts": parts},
                     )
+                    complete_ms = (time.perf_counter() - complete_started) * 1000.0
                     RECORDING_FINALIZE_SECONDS.observe(
                         time.perf_counter() - finalize_started
                     )
                     self.state = "ready"
                     self.result = "ready"
+                    marker_to_ready_ms = (
+                        (time.perf_counter() - self.final_seen_at) * 1000.0
+                        if self.final_seen_at is not None
+                        else 0.0
+                    )
+                    logger.info(
+                        "World recording finalized run_id=%s session_id=%s "
+                        "trace_id=%s parts=%d final_part_bytes=%d "
+                        "final_part_upload_ms=%.3f complete_multipart_ms=%.3f "
+                        "final_marker_to_ready_ms=%.3f",
+                        self.run_id,
+                        self.session_id,
+                        self.trace_id,
+                        len(parts),
+                        final_part_bytes,
+                        final_part_upload_ms,
+                        complete_ms,
+                        marker_to_ready_ms,
+                    )
                     self._fire_recorded_callback()
                     return
                 await self._wait_for_work()
@@ -361,12 +402,18 @@ class RunVideoRecorder:
                 self.result = self.failure_reason or "upload_failed"
 
     def _fire_recorded_callback(self) -> None:
+        callback_started = time.perf_counter()
         try:
             pending = self._on_recorded(self.run_id, self.attempt_id, self.video_uri)
             if inspect.isawaitable(pending) and not isinstance(pending, asyncio.Task):
                 pending = asyncio.create_task(pending)
             if isinstance(pending, asyncio.Task):
-                pending.add_done_callback(self._record_callback_result)
+                pending.add_done_callback(
+                    partial(
+                        self._record_callback_result,
+                        callback_started=callback_started,
+                    )
+                )
         except Exception:
             RECORDING_CALLBACK_FAILURES_TOTAL.inc()
             logger.exception(
@@ -378,7 +425,9 @@ class RunVideoRecorder:
                 self.video_uri,
             )
 
-    def _record_callback_result(self, task: asyncio.Task) -> None:
+    def _record_callback_result(
+        self, task: asyncio.Task, *, callback_started: float
+    ) -> None:
         try:
             succeeded = task.result()
         except asyncio.CancelledError:
@@ -395,6 +444,15 @@ class RunVideoRecorder:
                 self.trace_id,
                 self.video_uri,
             )
+            return
+        logger.info(
+            "World recorded callback completed run_id=%s session_id=%s "
+            "trace_id=%s callback_ms=%.3f",
+            self.run_id,
+            self.session_id,
+            self.trace_id,
+            (time.perf_counter() - callback_started) * 1000.0,
+        )
 
 
 class RecordingManager:
