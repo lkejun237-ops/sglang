@@ -197,6 +197,15 @@ async def _complete_world_rule(request):
     return web.json_response(result.model_dump(mode="json"))
 
 
+def _generated_world_image_url(request, image_id):
+    backend = request.match_info.get("backend")
+    if backend:
+        return f"/backends/{backend}/v1/studio-api/world/images/{image_id}"
+    if request.path.startswith("/studio-api/"):
+        return f"/studio-api/world/images/{image_id}"
+    return f"/api/world/images/{image_id}"
+
+
 async def _complete_world(request):
     """Complete a world from text, an uploaded first frame, or both."""
 
@@ -278,7 +287,7 @@ async def _complete_world(request):
     image_url = None
     if completed.image_bytes:
         image_id = creator.save_generated_image(completed.image_bytes)
-        image_url = f"/api/world/images/{image_id}"
+        image_url = _generated_world_image_url(request, image_id)
     return web.json_response(
         {
             "world_description": completed.world_description,
@@ -878,6 +887,20 @@ def create_app():
     app.router.add_post("/studio-api/world-rule/complete", _complete_world_rule)
     app.router.add_post("/studio-api/world/complete", _complete_world)
     app.router.add_get("/studio-api/world/images/{image_id}", _generated_world_image)
+    app.router.add_post(
+        "/backends/{backend}/v1/studio-api/prompt/rewrite", _rewrite_prompt
+    )
+    app.router.add_post(
+        "/backends/{backend}/v1/studio-api/world-rule/complete",
+        _complete_world_rule,
+    )
+    app.router.add_post(
+        "/backends/{backend}/v1/studio-api/world/complete", _complete_world
+    )
+    app.router.add_get(
+        "/backends/{backend}/v1/studio-api/world/images/{image_id}",
+        _generated_world_image,
+    )
     app.router.add_get("/api/happyoyster/config", _happyoyster_config)
     app.router.add_post("/api/happyoyster/share-image", _happyoyster_share_image)
     app.router.add_post("/api/happyoyster/worlds/resolve", _happyoyster_resolve_world)
