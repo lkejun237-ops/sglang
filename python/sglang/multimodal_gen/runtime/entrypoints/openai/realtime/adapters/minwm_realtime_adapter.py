@@ -49,6 +49,44 @@ if TYPE_CHECKING:
 
 MINWM_DEFAULT_DMD_STEPS = 4
 MINWM_CAMERA_CONTROL_MIN_PULSE_ITEMS = 2
+_MINWM_STATE_ACTION_CANONICAL = {
+    "up": "i",
+    "left": "j",
+    "down": "k",
+    "right": "l",
+}
+_MINWM_STATE_ACTION_AXES = {
+    "w": "forward",
+    "s": "forward",
+    "a": "strafe",
+    "d": "strafe",
+    "i": "pitch",
+    "k": "pitch",
+    "j": "yaw",
+    "l": "yaw",
+}
+
+
+def _normalize_minwm_state_actions(actions: list[Any]) -> list[str]:
+    """Normalize held-key state to one action per MinWM primitive axis.
+
+    Browser keydown/keyup order can briefly report opposite keys as held at the
+    same time, e.g. A+D while switching strafe direction. The checkpoint has no
+    label for opposite directions on one axis, so keep the last item reported
+    for each axis before the state reaches the sampling queue.
+    """
+    selected_by_axis: dict[str, tuple[int, str]] = {}
+    for index, raw_action in enumerate(actions):
+        action = str(raw_action).lower().strip()
+        action = _MINWM_STATE_ACTION_CANONICAL.get(action, action)
+        axis = _MINWM_STATE_ACTION_AXES.get(action)
+        if axis is None:
+            key_state_to_action_label([action])
+            continue
+        selected_by_axis[axis] = (index, action)
+    normalized = [action for _index, action in sorted(selected_by_axis.values())]
+    key_state_to_action_label(normalized)
+    return normalized
 
 
 class MinWMRealtimeState(RealtimeCameraControlState):
@@ -61,6 +99,7 @@ class MinWMRealtimeState(RealtimeCameraControlState):
             min_pulse_items=MINWM_CAMERA_CONTROL_MIN_PULSE_ITEMS,
             script_maxlen=4096,
             max_transitions=512,
+            normalize_state_actions=_normalize_minwm_state_actions,
         )
         self.action_label_queue = ControlScriptQueue(
             "action_labels", max_events=4096, default_item=0

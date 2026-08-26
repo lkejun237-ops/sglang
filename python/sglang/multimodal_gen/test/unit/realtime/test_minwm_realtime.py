@@ -367,6 +367,50 @@ def test_minwm_realtime_state_preserves_single_key_direction(key, expected_label
     assert state.latest_sampled_event_id == 17
 
 
+@pytest.mark.parametrize(
+    ("actions", "expected_actions"),
+    [
+        (["a", "d", "w"], ["d", "w"]),
+        (["d", "a", "w"], ["a", "w"]),
+        (["s", "w"], ["w"]),
+        (["i", "k", "j", "l"], ["k", "l"]),
+        (["up", "down", "left", "right"], ["k", "l"]),
+    ],
+)
+def test_minwm_realtime_state_normalizes_opposite_state_actions(
+    actions, expected_actions
+):
+    state = MinWMRealtimeState()
+    state.receive_camera_state(actions, event_id=17)
+
+    expected_label = key_state_to_action_label(expected_actions)
+    assert state.sample_action_labels(4) == [expected_label] * 4
+    assert state.latest_sampled_event_id == 17
+
+
+def test_minwm_realtime_state_event_normalizes_before_queueing():
+    adapter = MinWMRealtimeAdapter()
+    session = GenerateSession()
+    session.set_adapter(adapter)
+    adapter.ingest_event(
+        session,
+        RealtimeEvent(
+            type="event",
+            kind="camera_actions",
+            event_id=23,
+            payload={
+                "mode": "state",
+                "transitions": [{"actions": ["a", "d", "w"], "client_ts_ms": 10}],
+            },
+        ),
+    )
+
+    state = adapter._state(session)
+    expected_label = key_state_to_action_label(["d", "w"])
+    assert state.sample_action_labels(4) == [expected_label] * 4
+    assert state.latest_sampled_event_id == 23
+
+
 def test_minwm_realtime_state_preserves_short_press_for_half_chunk():
     state = MinWMRealtimeState()
     state.receive_camera_state(["w"], event_id=17)
