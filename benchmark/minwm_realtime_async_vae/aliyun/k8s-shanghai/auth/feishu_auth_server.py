@@ -353,6 +353,15 @@ def _login_url(request: Request) -> str:
     return f"/auth/login?rd={rd}"
 
 
+def _header_value(value: Any) -> str:
+    text = str(value).replace("\r", " ").replace("\n", " ").strip()
+    try:
+        text.encode("ascii")
+    except UnicodeEncodeError:
+        return quote(text, safe="")
+    return text
+
+
 def _user_headers(session: dict[str, Any]) -> dict[str, str]:
     user = session.get("user") if isinstance(session.get("user"), dict) else {}
     headers = {}
@@ -365,7 +374,7 @@ def _user_headers(session: dict[str, Any]) -> dict[str, str]:
     }.items():
         value = user.get(source)
         if value:
-            headers[target] = str(value)
+            headers[target] = _header_value(value)
     return headers
 
 
