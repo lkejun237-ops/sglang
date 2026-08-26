@@ -239,6 +239,26 @@ def test_webui_keeps_external_secret_references_and_ephemeral_volumes():
         "/run/secrets/realtime-webui/doubao-ark.json"
     )
     assert env["DOUBAO_REQUEST_TIMEOUT_SECONDS"]["value"] == "60"
+    assert env["WEBUI_AUTH_ENABLED"]["value"] == "true"
+    assert env["AUTH_PROTECTED_HOSTS"]["value"] == "zing-model.loopit.com.cn"
+    assert env["AUTH_PUBLIC_BASE_URL"]["value"] == "https://zing-model.loopit.com.cn"
+    assert env["AUTH_REDIS_KEY_PREFIX"]["value"] == "zing:beijing:webui-auth"
+    assert env["AUTH_REDIS_PASSWORD"]["valueFrom"]["secretKeyRef"] == {
+        "name": "world-realtime-redis",
+        "key": "redis-password",
+    }
+    assert env["FEISHU_APP_ID"]["valueFrom"]["secretKeyRef"] == {
+        "name": "world-studio-runtime",
+        "key": "feishu-app-id",
+    }
+    assert env["FEISHU_APP_SECRET"]["valueFrom"]["secretKeyRef"] == {
+        "name": "world-studio-runtime",
+        "key": "feishu-app-secret",
+    }
+    assert env["AUTH_COOKIE_SECRET"]["valueFrom"]["secretKeyRef"] == {
+        "name": "world-studio-runtime",
+        "key": "auth-cookie-secret",
+    }
     assert "ark.cn-beijing.volces.com" in env["NO_PROXY"]["value"]
     assert "ark.cn-beijing.volces.com" in env["no_proxy"]["value"]
     assert ".cognitiveservices.azure.com" in env["NO_PROXY"]["value"]

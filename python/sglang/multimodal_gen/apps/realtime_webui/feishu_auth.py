@@ -66,6 +66,20 @@ def _safe_return_to(value: str | None) -> str:
     return value
 
 
+def _normalize_host(value: str | None) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if "," in text:
+        text = text.split(",", 1)[0].strip()
+    if text.startswith("["):
+        end = text.find("]")
+        return text[1:end] if end > 0 else text
+    if text.count(":") == 1:
+        return text.rsplit(":", 1)[0]
+    return text
+
+
 def _header_value(value: Any) -> str:
     text = str(value).replace("\r", " ").replace("\n", " ").strip()
     try:
@@ -323,6 +337,11 @@ class FeishuAuth:
             for item in os.getenv("AUTH_ALLOWED_USERS", "").split(",")
             if item.strip()
         }
+        self.protected_hosts = {
+            _normalize_host(item)
+            for item in os.getenv("AUTH_PROTECTED_HOSTS", "").split(",")
+            if _normalize_host(item)
+        }
         self.store = RedisStore(self.redis_url, self.redis_key_prefix)
 
     @classmethod
@@ -355,6 +374,8 @@ class FeishuAuth:
 
     @web.middleware
     async def middleware(self, request: web.Request, handler):
+        if not self._host_is_protected(request):
+            return await handler(request)
         if self._is_public_path(request.path):
             return await handler(request)
         session = await self.current_session(request)
@@ -376,6 +397,19 @@ class FeishuAuth:
             path in PUBLIC_PATHS
             or path.startswith("/auth/")
             or PUBLIC_BACKEND_PATH_RE.fullmatch(path) is not None
+        )
+
+    def _host_is_protected(self, request: web.Request) -> bool:
+        if not self.protected_hosts:
+            return True
+        return any(
+            host in self.protected_hosts
+            for host in (
+                _normalize_host(request.headers.get("x-forwarded-host")),
+                _normalize_host(request.headers.get("host")),
+                _normalize_host(request.host),
+            )
+            if host
         )
 
     @staticmethod

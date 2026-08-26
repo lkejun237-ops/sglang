@@ -89,6 +89,90 @@
       "value": "60"
     },
     {
+      "name": "WEBUI_AUTH_ENABLED",
+      "value": "true"
+    },
+    {
+      "name": "AUTH_PROTECTED_HOSTS",
+      "value": "zing-model.loopit.com.cn"
+    },
+    {
+      "name": "AUTH_PUBLIC_BASE_URL",
+      "value": "https://zing-model.loopit.com.cn"
+    },
+    {
+      "name": "AUTH_COOKIE_NAME",
+      "value": "zing_webui_session"
+    },
+    {
+      "name": "AUTH_REDIS_HOST",
+      "value": "r-2ze358d0dce684b4.redis.rds.aliyuncs.com"
+    },
+    {
+      "name": "AUTH_REDIS_PORT",
+      "value": "6379"
+    },
+    {
+      "name": "AUTH_REDIS_USERNAME",
+      "value": "default"
+    },
+    {
+      "name": "AUTH_REDIS_DB",
+      "value": "0"
+    },
+    {
+      "name": "AUTH_REDIS_SSL",
+      "value": "false"
+    },
+    {
+      "name": "AUTH_REDIS_PASSWORD_ENV",
+      "value": "AUTH_REDIS_PASSWORD"
+    },
+    {
+      "name": "AUTH_REDIS_PASSWORD",
+      "valueFrom": {
+        "secretKeyRef": {
+          "key": "redis-password",
+          "name": "world-realtime-redis"
+        }
+      }
+    },
+    {
+      "name": "AUTH_REDIS_KEY_PREFIX",
+      "value": "zing:beijing:webui-auth"
+    },
+    {
+      "name": "AUTH_SESSION_TTL_SECONDS",
+      "value": "86400"
+    },
+    {
+      "name": "FEISHU_APP_ID",
+      "valueFrom": {
+        "secretKeyRef": {
+          "key": "feishu-app-id",
+          "name": "world-studio-runtime"
+        }
+      }
+    },
+    {
+      "name": "FEISHU_APP_SECRET",
+      "valueFrom": {
+        "secretKeyRef": {
+          "key": "feishu-app-secret",
+          "name": "world-studio-runtime"
+        }
+      }
+    },
+    {
+      "name": "AUTH_COOKIE_SECRET",
+      "valueFrom": {
+        "secretKeyRef": {
+          "key": "auth-cookie-secret",
+          "name": "world-studio-runtime"
+        }
+      }
+    },
+    {
       "name": "NO_PROXY",
       "value": "localhost,127.0.0.1,::1,.svc,.svc.cluster.local,.cluster.local,world-realtime-gateway,world-studio-webui,ark.cn-beijing.volces.com,.cognitiveservices.azure.com"
     },

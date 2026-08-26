@@ -721,7 +721,9 @@ def _backend_upstream(backend, transport, path, query=""):
 def _named_backend_url(request, transport):
     backend = request.match_info["backend"]
     path = f"/v1/{request.match_info.get('path', '')}".rstrip("/")
-    if request.path.endswith("/generate"):
+    if request.path.endswith("/authorized_generate"):
+        path = "/v1/realtime_video/authorized_generate"
+    elif request.path.endswith("/generate"):
         path = "/v1/realtime_video/generate"
     query = f"?{request.query_string}" if request.query_string else ""
     try:
@@ -922,8 +924,16 @@ def create_app():
         "/backends/{backend}/v1/realtime_video/generate",
         _proxy_backend_websocket,
     )
+    app.router.add_get(
+        "/backends/{backend}/v1/realtime_video/authorized_generate",
+        _proxy_backend_websocket,
+    )
     app.router.add_route("*", "/backends/{backend}/v1/{path:.*}", _proxy_backend_http)
     app.router.add_get("/v1/realtime_video/generate", _proxy_websocket)
+    app.router.add_get(
+        "/v1/realtime_video/authorized_generate",
+        _proxy_websocket,
+    )
     app.router.add_route("*", "/v1/{path:.*}", _proxy_http)
     app.router.add_static("/", ROOT)
     return app

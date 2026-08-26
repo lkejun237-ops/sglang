@@ -1106,6 +1106,33 @@ def _webui() -> dict[str, Any]:
                     "/run/secrets/realtime-webui/doubao-ark.json",
                 ),
                 _env("DOUBAO_REQUEST_TIMEOUT_SECONDS", "60"),
+                _env("WEBUI_AUTH_ENABLED", "true"),
+                _env("AUTH_PROTECTED_HOSTS", "zing-model.loopit.com.cn"),
+                _env("AUTH_PUBLIC_BASE_URL", "https://zing-model.loopit.com.cn"),
+                _env("AUTH_COOKIE_NAME", "zing_webui_session"),
+                _env(
+                    "AUTH_REDIS_HOST",
+                    "r-2ze358d0dce684b4.redis.rds.aliyuncs.com",
+                ),
+                _env("AUTH_REDIS_PORT", "6379"),
+                _env("AUTH_REDIS_USERNAME", "default"),
+                _env("AUTH_REDIS_DB", "0"),
+                _env("AUTH_REDIS_SSL", "false"),
+                _env("AUTH_REDIS_PASSWORD_ENV", "AUTH_REDIS_PASSWORD"),
+                {
+                    "name": "AUTH_REDIS_PASSWORD",
+                    "valueFrom": {
+                        "secretKeyRef": {
+                            "name": "world-realtime-redis",
+                            "key": "redis-password",
+                        }
+                    },
+                },
+                _env("AUTH_REDIS_KEY_PREFIX", "zing:beijing:webui-auth"),
+                _env("AUTH_SESSION_TTL_SECONDS", "86400"),
+                _secret_env("FEISHU_APP_ID", "feishu-app-id"),
+                _secret_env("FEISHU_APP_SECRET", "feishu-app-secret"),
+                _secret_env("AUTH_COOKIE_SECRET", "auth-cookie-secret"),
                 _env(
                     "NO_PROXY",
                     "localhost,127.0.0.1,::1,.svc,.svc.cluster.local,"
