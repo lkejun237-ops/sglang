@@ -243,11 +243,11 @@ assert.match(html, /dual_model_controller\.js\?v=dual-model-v6/);
 assert.match(html, /h264_websocket_session\.js\?v=h264-live-edge-rate-v3/);
 assert.match(html, /prompt_rewrite_controller\.js\?v=prompt-rewrite-v3/);
 assert.match(html, /world_rules_controller\.js\?v=world-rules-v4/);
-assert.match(html, /styles\.css\?v=world-studio-single-zing-v3/);
+assert.match(html, /styles\.css\?v=world-studio-single-zing-v4/);
 assert.match(html, /feishu-internal-demo-20260825\/presets\.js\?v=20260825/);
-assert.match(html, /app\.js\?v=world-studio-single-zing-v13-internal-demo/);
+assert.match(html, /app\.js\?v=world-studio-single-zing-v14-internal-demo/);
 assert.ok(
-  html.indexOf("feishu-internal-demo-20260825/presets.js") < html.indexOf("app.js?v=world-studio-single-zing-v13-internal-demo"),
+  html.indexOf("feishu-internal-demo-20260825/presets.js") < html.indexOf("app.js?v=world-studio-single-zing-v14-internal-demo"),
   "internal demo presets must load before app.js reads preset globals",
 );
 assert.match(html, /id="minwmH264Viewport"/);
