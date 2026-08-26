@@ -42,9 +42,11 @@ COMMON_ENV = {
     "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": "false",
 }
 
+PROFILE_ATTENTION_BACKEND = os.environ.get("MINWM_PROFILE_ATTENTION_BACKEND", "fa")
+
 COMMON_SERVER_ARGS = (
     ("--pipeline-class-name", "MinWMCausalDMDPipeline"),
-    ("--attention-backend", "fa"),
+    ("--attention-backend", PROFILE_ATTENTION_BACKEND),
     ("--performance-mode", "speed"),
     ("--num-gpus", "1"),
     ("--tp-size", "1"),

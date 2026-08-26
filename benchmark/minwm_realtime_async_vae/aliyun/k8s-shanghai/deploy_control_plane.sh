@@ -36,6 +36,9 @@ WORLD_STUDIO_WEBUI_BASE_URL="${WORLD_STUDIO_WEBUI_BASE_URL:-http://zing-webui:18
 NVIDIA_DEVICE_PLUGIN_IMAGE="${NVIDIA_DEVICE_PLUGIN_IMAGE:-nvcr.io/nvidia/k8s-device-plugin:v0.17.1}"
 REALTIME_TARGET_FPS="${REALTIME_TARGET_FPS:-24}"
 REALTIME_SIZE="${REALTIME_SIZE:-1280x704}"
+MODEL_REVISION="${MODEL_REVISION:-wan22-5b-stage3-dmd-84-0824-495a0cdf1f-gs3000}"
+DENOISER_MODEL_HOST_PATH="${DENOISER_MODEL_HOST_PATH:-/mnt/zing-nvme/zing-realtime/model-cache/zing/model-wan22-5b-stage3-dmd-84-0824-495a0cdf1f-gs3000}"
+DENOISER_MODEL_CONTAINER_PATH="${DENOISER_MODEL_CONTAINER_PATH:-/models/minwm-tianpeng-gap12}"
 H264_LIVE_EDGE_TARGET_MS="${H264_LIVE_EDGE_TARGET_MS:-1000}"
 H264_LIVE_EDGE_SEEK_THRESHOLD_MS="${H264_LIVE_EDGE_SEEK_THRESHOLD_MS:-1800}"
 UI_CONFIG_JSON="${UI_CONFIG_JSON:-{\"generationModes\":[\"i2v\"],\"defaultGenerationMode\":\"i2v\",\"modelSlots\":[\"minwm\"],\"lockModelSlots\":true,\"size\":\"${REALTIME_SIZE}\",\"targetFps\":${REALTIME_TARGET_FPS},\"sessionMaxLifetimeSeconds\":70,\"playbackAckEnabled\":false,\"h264WebSocketEnabled\":true,\"h264DirectGatewayEnabled\":true,\"h264WebSocketBaseUrl\":\"${PUBLIC_GATEWAY_BASE_URL}\",\"h264CompressedBitrateKbps\":3000,\"h264CompressedCrf\":20,\"h264CompressedPreset\":\"fast\",\"h264CompressedGopSeconds\":2,\"h264CompressedVbvBufferMs\":250,\"h264WebSocketLiveEdgeTargetMs\":${H264_LIVE_EDGE_TARGET_MS},\"h264WebSocketSeekThresholdMs\":${H264_LIVE_EDGE_SEEK_THRESHOLD_MS},\"singleExperience\":true,\"tabScopedUserIds\":true,\"smoothCatchupRateMax\":1.1,\"dualModels\":{\"minwm\":{\"label\":\"Zing\",\"size\":\"${REALTIME_SIZE}\",\"targetFps\":${REALTIME_TARGET_FPS},\"sinkSize\":8,\"windowFrames\":32,\"continuous\":true,\"h264StartupDropFrames\":0}}}}"
@@ -133,8 +136,9 @@ fi
 if [[ -n "${SSH_GLOBAL_KNOWN_HOSTS_FILE:-}" ]]; then
   SSH_COMMON_ARGS+=(-o "GlobalKnownHostsFile=${SSH_GLOBAL_KNOWN_HOSTS_FILE}")
 fi
-if [[ "${SSH_STRICT_HOST_KEY_CHECKING:-accept-new}" != "" ]]; then
-  SSH_COMMON_ARGS+=(-o "StrictHostKeyChecking=${SSH_STRICT_HOST_KEY_CHECKING}")
+SSH_STRICT_HOST_KEY_CHECKING_VALUE="${SSH_STRICT_HOST_KEY_CHECKING:-accept-new}"
+if [[ "${SSH_STRICT_HOST_KEY_CHECKING_VALUE}" != "" ]]; then
+  SSH_COMMON_ARGS+=(-o "StrictHostKeyChecking=${SSH_STRICT_HOST_KEY_CHECKING_VALUE}")
 fi
 
 ssh_remote() {
@@ -171,6 +175,7 @@ render_template() {
   NVIDIA_DEVICE_PLUGIN_IMAGE="${NVIDIA_DEVICE_PLUGIN_IMAGE}" \
   REALTIME_TARGET_FPS="${REALTIME_TARGET_FPS}" \
   REALTIME_SIZE="${REALTIME_SIZE}" \
+  MODEL_REVISION="${MODEL_REVISION}" \
   DENOISER_CAPACITY_LIMIT="${DENOISER_CAPACITY_LIMIT}" \
   VAE_CAPACITY_LIMIT="${VAE_CAPACITY_LIMIT}" \
   VAE_WORKER_CAPACITY="${VAE_WORKER_CAPACITY}" \
@@ -206,7 +211,7 @@ render_template() {
   RUNTIME_SOURCE_PATCH_VERSION="${RUNTIME_SOURCE_PATCH_VERSION}" \
   AUTH_SOURCE_PATCH_VERSION="${AUTH_SOURCE_PATCH_VERSION}" \
   VAE_NVIDIA_VISIBLE_DEVICES="${VAE_NVIDIA_VISIBLE_DEVICES}" \
-  envsubst '${NAMESPACE} ${CONTROL_IMAGE} ${AUTH_IMAGE} ${GPU_RUNTIME_IMAGE} ${WEBUI_IMAGE} ${REDIS_IMAGE} ${REDIS_HOST} ${REDIS_PORT} ${REDIS_USERNAME} ${REDIS_DB} ${REDIS_SSL} ${REDIS_SSL_ARG} ${REDIS_KEY_PREFIX} ${REDIS_STATE_TTL_SECONDS} ${REDIS_LOCK_TIMEOUT_SECONDS} ${WORLD_STUDIO_WEBUI_BASE_URL} ${NVIDIA_DEVICE_PLUGIN_IMAGE} ${REALTIME_TARGET_FPS} ${REALTIME_SIZE} ${DENOISER_CAPACITY_LIMIT} ${VAE_CAPACITY_LIMIT} ${VAE_WORKER_CAPACITY} ${CONTROL_NODE_LABEL_KEY} ${CONTROL_NODE_LABEL_VALUE} ${CONTROL_PLANE_NODE_LABEL_KEY} ${CONTROL_PLANE_NODE_LABEL_VALUE} ${COORDINATOR_REPLICAS} ${GATEWAY_REPLICAS} ${AUTH_REPLICAS} ${WEBUI_AUTH_ENABLED} ${AUTH_PUBLIC_BASE_URL} ${AUTH_COOKIE_NAME} ${AUTH_REDIS_URL} ${AUTH_REDIS_HOST} ${AUTH_REDIS_PORT} ${AUTH_REDIS_USERNAME} ${AUTH_REDIS_DB} ${AUTH_REDIS_SSL} ${AUTH_REDIS_KEY_PREFIX} ${AUTH_SESSION_TTL_SECONDS} ${DENOISER_GPU_POOL} ${VAE_GPU_POOL} ${VAE_NVIDIA_VISIBLE_DEVICES} ${VIDEO_PROMPT_REWRITE_PROVIDER} ${VIDEO_PROMPT_REWRITE_TIMEOUT_SECONDS} ${CREATE_WORLD_DESCRIPTION_PROVIDER} ${CREATE_WORLD_IMAGE_CONFIG} ${DOUBAO_ARK_CREDENTIALS} ${DOUBAO_REQUEST_TIMEOUT_SECONDS} ${WEBUI_NO_PROXY} ${UI_CONFIG_JSON} ${H264_FFMPEG_BIN} ${RUNTIME_SOURCE_PATCH_VERSION} ${AUTH_SOURCE_PATCH_VERSION}' \
+  envsubst '${NAMESPACE} ${CONTROL_IMAGE} ${AUTH_IMAGE} ${GPU_RUNTIME_IMAGE} ${WEBUI_IMAGE} ${REDIS_IMAGE} ${REDIS_HOST} ${REDIS_PORT} ${REDIS_USERNAME} ${REDIS_DB} ${REDIS_SSL} ${REDIS_SSL_ARG} ${REDIS_KEY_PREFIX} ${REDIS_STATE_TTL_SECONDS} ${REDIS_LOCK_TIMEOUT_SECONDS} ${WORLD_STUDIO_WEBUI_BASE_URL} ${NVIDIA_DEVICE_PLUGIN_IMAGE} ${REALTIME_TARGET_FPS} ${REALTIME_SIZE} ${MODEL_REVISION} ${DENOISER_CAPACITY_LIMIT} ${VAE_CAPACITY_LIMIT} ${VAE_WORKER_CAPACITY} ${CONTROL_NODE_LABEL_KEY} ${CONTROL_NODE_LABEL_VALUE} ${CONTROL_PLANE_NODE_LABEL_KEY} ${CONTROL_PLANE_NODE_LABEL_VALUE} ${COORDINATOR_REPLICAS} ${GATEWAY_REPLICAS} ${AUTH_REPLICAS} ${WEBUI_AUTH_ENABLED} ${AUTH_PUBLIC_BASE_URL} ${AUTH_COOKIE_NAME} ${AUTH_REDIS_URL} ${AUTH_REDIS_HOST} ${AUTH_REDIS_PORT} ${AUTH_REDIS_USERNAME} ${AUTH_REDIS_DB} ${AUTH_REDIS_SSL} ${AUTH_REDIS_KEY_PREFIX} ${AUTH_SESSION_TTL_SECONDS} ${DENOISER_GPU_POOL} ${VAE_GPU_POOL} ${VAE_NVIDIA_VISIBLE_DEVICES} ${VIDEO_PROMPT_REWRITE_PROVIDER} ${VIDEO_PROMPT_REWRITE_TIMEOUT_SECONDS} ${CREATE_WORLD_DESCRIPTION_PROVIDER} ${CREATE_WORLD_IMAGE_CONFIG} ${DOUBAO_ARK_CREDENTIALS} ${DOUBAO_REQUEST_TIMEOUT_SECONDS} ${WEBUI_NO_PROXY} ${UI_CONFIG_JSON} ${H264_FFMPEG_BIN} ${RUNTIME_SOURCE_PATCH_VERSION} ${AUTH_SOURCE_PATCH_VERSION}' \
     <"${template}" >"${output}"
 }
 
@@ -814,6 +819,9 @@ render_denoiser_sp1x7_manifest() {
   DENOISER_GPU_POOL="${DENOISER_GPU_POOL}" \
   REALTIME_TARGET_FPS="${REALTIME_TARGET_FPS}" \
   REALTIME_SIZE="${REALTIME_SIZE}" \
+  MODEL_REVISION="${MODEL_REVISION}" \
+  DENOISER_MODEL_HOST_PATH="${DENOISER_MODEL_HOST_PATH}" \
+  DENOISER_MODEL_CONTAINER_PATH="${DENOISER_MODEL_CONTAINER_PATH}" \
   python3 - "${output}" <<'PY'
 import json
 import os
@@ -826,6 +834,9 @@ patch_version = os.environ["RUNTIME_SOURCE_PATCH_VERSION"]
 gpu_pool = os.environ["DENOISER_GPU_POOL"]
 target_fps = os.environ["REALTIME_TARGET_FPS"]
 size = os.environ["REALTIME_SIZE"]
+model_revision = os.environ["MODEL_REVISION"]
+model_host_path = os.environ["DENOISER_MODEL_HOST_PATH"]
+model_container_path = os.environ["DENOISER_MODEL_CONTAINER_PATH"]
 app_name = "zing-denoiser-sp1x7"
 worker_count = 7
 
@@ -981,16 +992,16 @@ def worker_command(index):
     master_port = 30200 + index * 10
     scheduler_port = 5615 + index * 10
     return f"""set -euo pipefail
-test -f /models/minwm-tianpeng-gap12/_READY
-test -f /models/minwm-tianpeng-gap12/model_index.json
-test -d /models/minwm-tianpeng-gap12/transformer
+test -f {model_container_path}/_READY
+test -f {model_container_path}/model_index.json
+test -d {model_container_path}/transformer
 exec 9>/var/run/minwm-startup-lock/denoiser.lock
 flock -x 9
 python3 -m sglang.multimodal_gen.tools.minwm_profile_launcher \\
   --profile auto \\
   --taehv-checkpoint-path /models/taehv/taew2_2.pth \\
   -- \\
-  --model-path /models/minwm-tianpeng-gap12 \\
+  --model-path {model_container_path} \\
   --num-gpus 1 \\
   --tp-size 1 \\
   --sp-degree 1 \\
@@ -1036,6 +1047,7 @@ def worker_env(index):
         env("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
         env("SGLANG_DISABLE_PDEATHSIG", "1"),
         env("SGLANG_USE_SGL_FA3_KERNEL", "1"),
+        env("MINWM_PROFILE_ATTENTION_BACKEND", "fa3"),
         env("OMP_NUM_THREADS", "4"),
         env("MKL_NUM_THREADS", "4"),
         env("OPENBLAS_NUM_THREADS", "4"),
@@ -1076,7 +1088,7 @@ def worker_mounts(index):
     mounts = [
         {"name": f"worker-epoch-denoiser-{index}", "mountPath": "/var/run/minwm-worker"},
         {"name": "startup-lock", "mountPath": "/var/run/minwm-startup-lock"},
-        {"name": "model", "mountPath": "/models/minwm-tianpeng-gap12", "readOnly": True},
+        {"name": "model", "mountPath": model_container_path, "readOnly": True},
         {"name": "taehv", "mountPath": "/models/taehv", "readOnly": True},
         {"name": "shm", "mountPath": "/dev/shm"},
     ]
@@ -1108,7 +1120,7 @@ for index in range(worker_count):
                 f"--reservation-endpoint=http://$(POD_IP):{port}/v1/realtime_worker "
                 "--node-name=$(NODE_NAME) "
                 "--capacity=1 "
-                "--model-revision=wan22-5b-stage3-dmd-47-0808-2fb2cfec2a2 "
+                f"--model-revision={model_revision} "
                 "--vae-fingerprint=taew2_2-d053e216 "
                 "--interval-s=5"
             ],
@@ -1186,7 +1198,7 @@ volumes.extend(
         {
             "name": "model",
             "hostPath": {
-                "path": "/data/zing-realtime/model-cache/zing/model",
+                "path": model_host_path,
                 "type": "Directory",
             },
         },

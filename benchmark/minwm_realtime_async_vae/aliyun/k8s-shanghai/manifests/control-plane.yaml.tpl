@@ -249,13 +249,14 @@ metadata:
   name: zing-gateway
   namespace: ${NAMESPACE}
 spec:
-  type: ClusterIP
+  type: NodePort
   selector:
     app.kubernetes.io/name: zing-gateway
   ports:
     - name: http
       port: 18080
       targetPort: http
+      nodePort: 30080
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -320,7 +321,7 @@ spec:
               --host=0.0.0.0
               --port=18080
               --coordinator-url=http://zing-coordinator:18081
-              --model-revision=wan22-5b-stage3-dmd-47-0808-2fb2cfec2a2
+              --model-revision=${MODEL_REVISION}
               --vae-fingerprint=taew2_2-d053e216
               --internal-output-url=ws://${POD_IP}:18080/v1/internal/realtime_output
               --output-queue-depth=64
