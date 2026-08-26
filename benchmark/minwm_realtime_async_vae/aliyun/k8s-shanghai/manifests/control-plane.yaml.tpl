@@ -140,10 +140,13 @@ metadata:
     app.kubernetes.io/name: zing-coordinator
     app.kubernetes.io/part-of: minwm-realtime
 spec:
-  replicas: 1
+  replicas: ${COORDINATOR_REPLICAS}
   revisionHistoryLimit: 3
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app.kubernetes.io/name: zing-coordinator
@@ -157,7 +160,14 @@ spec:
     spec:
       serviceAccountName: zing-realtime
       nodeSelector:
-        ${CONTROL_NODE_LABEL_KEY}: "${CONTROL_NODE_LABEL_VALUE}"
+        ${CONTROL_PLANE_NODE_LABEL_KEY}: "${CONTROL_PLANE_NODE_LABEL_VALUE}"
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: zing-coordinator
       terminationGracePeriodSeconds: 30
       containers:
         - name: coordinator
@@ -213,6 +223,17 @@ spec:
         - {name: runtime-envs-patch, configMap: {name: zing-runtime-envs-patch}}
         - {name: runtime-dep-shims, configMap: {name: zing-runtime-dep-shims}}
 ---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: zing-coordinator
+  namespace: ${NAMESPACE}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: zing-coordinator
+---
 apiVersion: v1
 kind: Service
 metadata:
@@ -236,10 +257,13 @@ metadata:
     app.kubernetes.io/name: zing-gateway
     app.kubernetes.io/part-of: minwm-realtime
 spec:
-  replicas: 1
+  replicas: ${GATEWAY_REPLICAS}
   revisionHistoryLimit: 3
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app.kubernetes.io/name: zing-gateway
@@ -253,7 +277,14 @@ spec:
     spec:
       serviceAccountName: zing-realtime
       nodeSelector:
-        ${CONTROL_NODE_LABEL_KEY}: "${CONTROL_NODE_LABEL_VALUE}"
+        ${CONTROL_PLANE_NODE_LABEL_KEY}: "${CONTROL_PLANE_NODE_LABEL_VALUE}"
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: zing-gateway
       terminationGracePeriodSeconds: 30
       containers:
         - name: gateway
@@ -292,7 +323,6 @@ spec:
           ports:
             - name: http
               containerPort: 18080
-              hostPort: 18080
           startupProbe:
             httpGet: {path: /healthz, port: http}
             periodSeconds: 2
@@ -319,6 +349,17 @@ spec:
         - {name: runtime-utils-patch, configMap: {name: zing-runtime-utils-patch}}
         - {name: runtime-envs-patch, configMap: {name: zing-runtime-envs-patch}}
         - {name: runtime-dep-shims, configMap: {name: zing-runtime-dep-shims}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: zing-gateway
+  namespace: ${NAMESPACE}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: zing-gateway
 ---
 apiVersion: v1
 kind: Service
