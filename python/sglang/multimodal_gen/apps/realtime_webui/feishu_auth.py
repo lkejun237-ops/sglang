@@ -16,7 +16,7 @@ import secrets
 import time
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import quote, unquote, urlencode, urlsplit
 
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
 
@@ -96,11 +96,41 @@ def _parse_redis_url(url: str) -> RedisAddress:
     return RedisAddress(
         host=parsed.hostname or "localhost",
         port=parsed.port or 6379,
-        username=parsed.username,
-        password=parsed.password,
+        username=unquote(parsed.username) if parsed.username is not None else None,
+        password=unquote(parsed.password) if parsed.password is not None else None,
         db=db,
         use_ssl=parsed.scheme == "rediss",
     )
+
+
+def _auth_redis_url_from_env() -> str:
+    url = os.getenv("AUTH_REDIS_URL") or os.getenv("REDIS_URL")
+    if url:
+        return url
+
+    host = os.getenv("AUTH_REDIS_HOST") or os.getenv("REDIS_HOST")
+    if not host:
+        raise RuntimeError(
+            "AUTH_REDIS_URL, REDIS_URL, AUTH_REDIS_HOST, or REDIS_HOST is required "
+            "when WEBUI_AUTH_ENABLED=true"
+        )
+    port = int(os.getenv("AUTH_REDIS_PORT", os.getenv("REDIS_PORT", "6379")))
+    db = int(os.getenv("AUTH_REDIS_DB", os.getenv("REDIS_DB", "0")))
+    username = os.getenv("AUTH_REDIS_USERNAME") or os.getenv("REDIS_USERNAME") or ""
+    password_env = os.getenv("AUTH_REDIS_PASSWORD_ENV", "AUTH_REDIS_PASSWORD")
+    password = os.getenv(password_env)
+    if password is None and password_env != "REDIS_PASSWORD":
+        password = os.getenv("REDIS_PASSWORD")
+    scheme = "rediss" if _truthy(
+        os.getenv("AUTH_REDIS_SSL", os.getenv("REDIS_SSL"))
+    ) else "redis"
+    auth = ""
+    if username or password:
+        userinfo = quote(username, safe="")
+        if password is not None:
+            userinfo += ":" + quote(password, safe="")
+        auth = userinfo + "@"
+    return f"{scheme}://{auth}{host}:{port}/{db}"
 
 
 class RedisStore:
@@ -251,7 +281,7 @@ class FeishuAuth:
         self.app_id = _required_env("FEISHU_APP_ID")
         self.app_secret = _required_env("FEISHU_APP_SECRET")
         self.cookie_secret = _required_env("AUTH_COOKIE_SECRET").encode("utf-8")
-        self.redis_url = os.getenv("AUTH_REDIS_URL") or _required_env("REDIS_URL")
+        self.redis_url = _auth_redis_url_from_env()
         self.public_base_url = _required_env("AUTH_PUBLIC_BASE_URL").rstrip("/")
         self.redirect_path = os.getenv("AUTH_REDIRECT_PATH", "/auth/callback")
         self.redirect_uri = os.getenv(

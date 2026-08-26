@@ -1,9 +1,20 @@
 import sys
 import types
+import importlib.util
+
+
+def _has_real_cryptography():
+    spec = importlib.util.find_spec("cryptography")
+    if spec is None:
+        return False
+    origin = spec.origin or ""
+    return "runtime-deps" in origin or "site-packages" in origin
 
 
 def _install_cryptography_shim():
     if "cryptography" in sys.modules:
+        return
+    if _has_real_cryptography():
         return
 
     crypto = types.ModuleType("cryptography")

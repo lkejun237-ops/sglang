@@ -180,8 +180,15 @@ spec:
               --host=0.0.0.0
               --port=18081
               --backend=redis
-              --redis-url="$REDIS_URL"
+              --redis-host=${REDIS_HOST}
+              --redis-port=${REDIS_PORT}
+              --redis-username=${REDIS_USERNAME}
+              --redis-password-env=REDIS_PASSWORD
+              --redis-db=${REDIS_DB}
               --redis-key-prefix="${REDIS_KEY_PREFIX}"
+              --redis-state-ttl-s=${REDIS_STATE_TTL_SECONDS}
+              --redis-lock-timeout-s=${REDIS_LOCK_TIMEOUT_SECONDS}
+              ${REDIS_SSL_ARG}
               --ttl-s=30
               --worker-ttl-s=15
               --wait-timeout-s=10
@@ -193,7 +200,9 @@ spec:
             - {name: PYTHONPATH, value: /opt/sglang/python}
             - {name: SGLANG_LIGHTWEIGHT_RUNTIME, value: "1"}
             - {name: OTEL_SERVICE_NAME, value: zing-coordinator}
-            - {name: REDIS_URL, value: "${REDIS_URL}"}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: zing-redis, key: password, optional: true}
           ports:
             - {name: http, containerPort: 18081}
           startupProbe:
@@ -286,6 +295,20 @@ spec:
             matchLabels:
               app.kubernetes.io/name: zing-gateway
       terminationGracePeriodSeconds: 30
+      initContainers:
+        - name: install-world-platform-dependencies
+          image: ${CONTROL_IMAGE}
+          imagePullPolicy: IfNotPresent
+          command: [python3, -m, pip, install]
+          args:
+            - --disable-pip-version-check
+            - --no-cache-dir
+            - "--only-binary=:all:"
+            - --index-url=https://mirrors.aliyun.com/pypi/simple/
+            - --target=/opt/sglang/runtime-deps
+            - cryptography==46.0.7
+          volumeMounts:
+            - {name: runtime-python-deps, mountPath: /opt/sglang/runtime-deps}
       containers:
         - name: gateway
           image: ${CONTROL_IMAGE}
@@ -310,7 +333,7 @@ spec:
               --world-studio-webui-base-url="$WORLD_STUDIO_WEBUI_BASE_URL"
           env:
             - {name: PYTHONUNBUFFERED, value: "1"}
-            - {name: PYTHONPATH, value: /opt/sglang/python}
+            - {name: PYTHONPATH, value: /opt/sglang/runtime-deps:/opt/sglang/python}
             - {name: SGLANG_LIGHTWEIGHT_RUNTIME, value: "1"}
             - {name: OTEL_SERVICE_NAME, value: zing-gateway}
             - {name: WORLD_STUDIO_WEBUI_BASE_URL, value: "${WORLD_STUDIO_WEBUI_BASE_URL}"}
@@ -337,6 +360,7 @@ spec:
             requests: {cpu: 500m, memory: 512Mi}
             limits: {cpu: "4", memory: 4Gi}
           volumeMounts:
+            - {name: runtime-python-deps, mountPath: /opt/sglang/runtime-deps, readOnly: true}
             - {name: runtime-realtime-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/realtime, readOnly: true}
             - {name: runtime-entrypoint-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/entrypoints/realtime_gateway_server.py, subPath: realtime_gateway_server.py, readOnly: true}
             - {name: runtime-utils-patch, mountPath: /opt/sglang/python/sglang/multimodal_gen/runtime/utils, readOnly: true}
@@ -344,6 +368,7 @@ spec:
             - {name: runtime-dep-shims, mountPath: /opt/sglang/python/prometheus_client.py, subPath: prometheus_client.py, readOnly: true}
             - {name: runtime-dep-shims, mountPath: /opt/sglang/python/sitecustomize.py, subPath: sitecustomize.py, readOnly: true}
       volumes:
+        - {name: runtime-python-deps, emptyDir: {sizeLimit: 64Mi}}
         - {name: runtime-realtime-patch, configMap: {name: zing-runtime-realtime-patch}}
         - {name: runtime-entrypoint-patch, configMap: {name: zing-runtime-entrypoint-patch}}
         - {name: runtime-utils-patch, configMap: {name: zing-runtime-utils-patch}}
@@ -440,6 +465,15 @@ spec:
             - {name: AUTH_PUBLIC_BASE_URL, value: "${AUTH_PUBLIC_BASE_URL}"}
             - {name: AUTH_COOKIE_NAME, value: "${AUTH_COOKIE_NAME}"}
             - {name: AUTH_REDIS_URL, value: "${AUTH_REDIS_URL}"}
+            - {name: AUTH_REDIS_HOST, value: "${AUTH_REDIS_HOST}"}
+            - {name: AUTH_REDIS_PORT, value: "${AUTH_REDIS_PORT}"}
+            - {name: AUTH_REDIS_USERNAME, value: "${AUTH_REDIS_USERNAME}"}
+            - {name: AUTH_REDIS_DB, value: "${AUTH_REDIS_DB}"}
+            - {name: AUTH_REDIS_SSL, value: "${AUTH_REDIS_SSL}"}
+            - {name: AUTH_REDIS_PASSWORD_ENV, value: AUTH_REDIS_PASSWORD}
+            - name: AUTH_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: zing-redis, key: password, optional: true}
             - {name: AUTH_REDIS_KEY_PREFIX, value: "${AUTH_REDIS_KEY_PREFIX}"}
             - {name: AUTH_SESSION_TTL_SECONDS, value: "${AUTH_SESSION_TTL_SECONDS}"}
             - name: REALTIME_UI_CONFIG_JSON
