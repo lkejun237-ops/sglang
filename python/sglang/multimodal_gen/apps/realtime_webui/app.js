@@ -721,7 +721,6 @@ let selectedReferenceMimeType = "";
 let selectedReferencePreviewReady = false;
 let worldCompletionPending = false;
 let skillRuleNextId = 1;
-let goalRuleNextId = 1;
 let preparedWorldRulesCache = null;
 let worldRulesDraftGeneration = 0;
 let sessionLifetimeExpired = false;
@@ -5507,10 +5506,6 @@ function skillRuleElements() {
   return Array.from(document.querySelectorAll(".skill-rule-item"));
 }
 
-function goalRuleElements() {
-  return Array.from(document.querySelectorAll(".goal-rule-item"));
-}
-
 function setWorldRulesStatus(message, state = "") {
   const status = $("worldRulesStatus");
   status.textContent = message;
@@ -5550,7 +5545,7 @@ function readPreparedRuleDraft(item) {
 
 function clearPreparedRuleDraft(control) {
   const item = control?.closest
-    ? control.closest(".skill-rule-item,.goal-rule-item")
+    ? control.closest(".skill-rule-item")
     : control;
   if (!item) return;
   delete item.__preparedRule;
@@ -5558,45 +5553,26 @@ function clearPreparedRuleDraft(control) {
 }
 
 function readWorldRulesDraft() {
-  const goals = goalRuleElements().map((item) => {
-    const goalInput = item.querySelector("[data-rule-field='input']").value;
-    const goalMinPlaySeconds = item.querySelector("[data-rule-field='min_play_seconds']").value;
-    if (goalInput.trim() && goalMinPlaySeconds !== "") {
-      const seconds = Number(goalMinPlaySeconds);
-      if (!Number.isFinite(seconds) || seconds < 0 || seconds > MAX_GOAL_MIN_PLAY_SECONDS) {
-        throw new Error(`目标至少游玩时间必须在 0–${MAX_GOAL_MIN_PLAY_SECONDS} 秒之间`);
-      }
-    }
-    return {
-      id: item.dataset.goalRuleId,
-      min_play_seconds: goalMinPlaySeconds,
-      probability: item.querySelector("[data-rule-field='probability']").value,
-      input: goalInput,
-      ...readPreparedRuleDraft(item),
-    };
-  });
   return {
     skills: skillRuleElements().map((item) => ({
       id: item.dataset.skillRuleId,
       input: item.querySelector("[data-rule-field='input']").value,
       ...readPreparedRuleDraft(item),
     })),
-    goals,
+    goals: [],
   };
 }
 
 function normalizedWorldRulesForStorage(draft = readWorldRulesDraft()) {
-  return normalizeWorldRulesDraft(draft);
-}
-
-function worldRulesGoalCount(normalized) {
-  if (Array.isArray(normalized?.goals)) return normalized.goals.length;
-  return normalized?.goal ? 1 : 0;
+  const normalized = normalizeWorldRulesDraft({
+    skills: Array.isArray(draft?.skills) ? draft.skills : [],
+    goals: [],
+  });
+  return { skills: normalized.skills, goals: [] };
 }
 
 function worldRulesRuleCount(normalized) {
-  return (Array.isArray(normalized?.skills) ? normalized.skills.length : 0)
-    + worldRulesGoalCount(normalized);
+  return Array.isArray(normalized?.skills) ? normalized.skills.length : 0;
 }
 
 function worldRulesStorageSignature(draft = readWorldRulesDraft()) {
@@ -5641,21 +5617,6 @@ function invalidatePreparedWorldRules() {
       : "填写技能标签或动作描述后启用";
     delete state.dataset.state;
   });
-  goalRuleElements().forEach((item) => {
-    const state = item.querySelector(".goal-rule-state");
-    const prepared = readPreparedRuleDraft(item);
-    if (prepared.prepared) {
-      const minPlaySeconds = item.querySelector("[data-rule-field='min_play_seconds']").value.trim() || "10";
-      const probability = item.querySelector("[data-rule-field='probability']").value.trim() || "0.2";
-      state.textContent = `✓ ${prepared.name} · ≥${minPlaySeconds}s · p=${probability}`;
-      state.dataset.state = "ready";
-      return;
-    }
-    state.textContent = item.querySelector("[data-rule-field='input']").value.trim()
-      ? "待进入世界时由 AI 补全"
-      : "填写奖励或触发效果后启用";
-    delete state.dataset.state;
-  });
 }
 
 function updateWorldRulesDraftUi() {
@@ -5665,27 +5626,11 @@ function updateWorldRulesDraftUi() {
   });
   $("skillRuleEmpty").hidden = items.length > 0;
   $("addSkillRuleBtn").disabled = items.length >= 9;
-  const goalItems = goalRuleElements();
-  goalItems.forEach((item, index) => {
-    item.querySelector(".goal-rule-key").textContent = String(index + 1);
-    item.querySelector(".goal-rule-title").textContent = `目标 ${index + 1}`;
-  });
-  $("goalRuleEmpty").hidden = goalItems.length > 0;
-  $("addGoalRuleBtn").disabled = goalItems.length >= 9;
   const skillCount = items.filter((item) => (
     item.querySelector("[data-rule-field='input']").value.trim()
   )).length;
-  const configuredGoalItems = goalItems.filter((item) => (
-    item.querySelector("[data-rule-field='input']").value.trim()
-  ));
   const parts = [];
   if (skillCount) parts.push(`${skillCount} 个技能`);
-  if (configuredGoalItems.length) {
-    const minPlaySecondsText = configuredGoalItems
-      .map((item) => item.querySelector("[data-rule-field='min_play_seconds']").value.trim() || "10")
-      .join("/");
-    parts.push(`${configuredGoalItems.length} 个目标 · ≥${minPlaySecondsText}s`);
-  }
   $("worldRulesSummary").textContent = parts.length ? parts.join(" · ") : "未配置";
 
   if (!parts.length) {
@@ -5694,7 +5639,7 @@ function updateWorldRulesDraftUi() {
   }
   try {
     normalizedWorldRulesForStorage();
-    setWorldRulesStatus("进入世界前 AI 会自动补全名称与完整 Prompt", "ready");
+    setWorldRulesStatus("进入世界前 AI 会自动补全技能名称与完整 Prompt", "ready");
   } catch (error) {
     setWorldRulesStatus(error.message || "规则配置不完整", "error");
   }
@@ -5770,122 +5715,10 @@ function addSkillRule(skill = {}, { focus = true } = {}) {
   return item;
 }
 
-function addGoalRule(goal = {}, { focus = true } = {}) {
-  const list = $("goalRuleList");
-  if (goalRuleElements().length >= 9) {
-    setWorldRulesStatus("最多可以配置 9 个目标", "error");
-    return null;
-  }
-  const item = document.createElement("article");
-  item.className = "goal-rule-item";
-  const existingIds = new Set(goalRuleElements().map((entry) => entry.dataset.goalRuleId));
-  let goalId = String(goal.id || "").trim();
-  if (!goalId || existingIds.has(goalId)) {
-    do {
-      goalId = `goal-${goalRuleNextId++}`;
-    } while (existingIds.has(goalId));
-  } else {
-    const numericId = /^goal-(\d+)$/.exec(goalId);
-    if (numericId) goalRuleNextId = Math.max(goalRuleNextId, Number(numericId[1]) + 1);
-  }
-  item.dataset.goalRuleId = goalId;
-
-  const head = document.createElement("div");
-  head.className = "goal-rule-item-head";
-  const key = document.createElement("span");
-  key.className = "goal-rule-key";
-  key.setAttribute("aria-hidden", "true");
-  const title = document.createElement("strong");
-  title.className = "goal-rule-title";
-  const remove = document.createElement("button");
-  remove.className = "goal-rule-remove";
-  remove.type = "button";
-  remove.setAttribute("aria-label", "删除目标");
-  remove.title = "删除目标";
-  remove.textContent = "×";
-  head.append(key, title, remove);
-
-  const fields = document.createElement("div");
-  fields.className = "goal-rule-fields";
-  const minLabel = document.createElement("label");
-  minLabel.className = "goal-min-play-field";
-  minLabel.innerHTML = "<span>至少游玩（秒）</span>";
-  const minPlay = document.createElement("input");
-  minPlay.type = "number";
-  minPlay.min = "0";
-  minPlay.max = String(MAX_GOAL_MIN_PLAY_SECONDS);
-  minPlay.step = "1";
-  minPlay.placeholder = "10";
-  minPlay.inputMode = "decimal";
-  minPlay.value = goal.min_play_seconds == null
-    ? (goal.minPlaySeconds == null ? "" : String(goal.minPlaySeconds))
-    : String(goal.min_play_seconds);
-  minPlay.dataset.ruleField = "min_play_seconds";
-  minPlay.setAttribute("aria-label", "目标至少游玩秒数");
-  minLabel.appendChild(minPlay);
-
-  const probabilityLabel = document.createElement("label");
-  probabilityLabel.className = "goal-probability-field";
-  probabilityLabel.innerHTML = "<span>触发概率</span>";
-  const probability = document.createElement("input");
-  probability.type = "number";
-  probability.min = "0";
-  probability.max = "1";
-  probability.step = "0.01";
-  probability.placeholder = "0.2";
-  probability.inputMode = "decimal";
-  probability.value = goal.probability == null ? "" : String(goal.probability);
-  probability.dataset.ruleField = "probability";
-  probability.setAttribute("aria-label", "目标触发概率");
-  probabilityLabel.appendChild(probability);
-
-  const inputLabel = document.createElement("label");
-  inputLabel.className = "goal-rule-input-field";
-  inputLabel.innerHTML = "<span>达成奖励或触发效果</span>";
-  const input = document.createElement("textarea");
-  input.rows = 3;
-  input.maxLength = 2000;
-  input.placeholder = "例如：星光徽章；或：天空落下一枚发光徽章，被主角稳稳接住……";
-  input.value = String(goal.input || goal.instruction || goal.name || "");
-  input.dataset.ruleField = "input";
-  input.setAttribute("aria-label", "目标达成奖励或触发效果");
-  inputLabel.appendChild(input);
-
-  fields.append(minLabel, probabilityLabel, inputLabel);
-  const state = document.createElement("span");
-  state.className = "goal-rule-state";
-  state.textContent = input.value.trim()
-    ? "待进入世界时由 AI 补全"
-    : "填写奖励或触发效果后启用";
-  const preparedMeta = attachPreparedRuleDraft(item, goal);
-  if (preparedMeta) {
-    const minPlaySeconds = minPlay.value.trim() || "10";
-    const triggerProbability = probability.value.trim() || "0.2";
-    state.textContent = `✓ ${preparedMeta.name} · ≥${minPlaySeconds}s · p=${triggerProbability}`;
-    state.dataset.state = "ready";
-  }
-  item.append(head, fields, state);
-  list.appendChild(item);
-
-  for (const control of [minPlay, probability, input]) {
-    control.addEventListener("input", handleWorldRulesDraftInput);
-  }
-  remove.onclick = () => {
-    item.remove();
-    handleWorldRulesDraftInput();
-  };
-  updateWorldRulesDraftUi();
-  if (focus) input.focus({ preventScroll: true });
-  return item;
-}
-
 function applyWorldRulesDraft(draft = null) {
   $("skillRuleList").innerHTML = "";
-  $("goalRuleList").innerHTML = "";
   const skills = Array.isArray(draft?.skills) ? draft.skills : [];
   skills.slice(0, 9).forEach((skill) => addSkillRule(skill, { focus: false }));
-  const goals = Array.isArray(draft?.goals) ? draft.goals : (draft?.goal ? [draft.goal] : []);
-  goals.slice(0, 9).forEach((goal) => addGoalRule(goal, { focus: false }));
   invalidatePreparedWorldRules();
   updateWorldRulesDraftUi();
 }
@@ -5896,7 +5729,6 @@ function setWorldRulesPreparing(pending) {
     control.disabled = pending;
   });
   $("addSkillRuleBtn").disabled = pending || skillRuleElements().length >= 9;
-  $("addGoalRuleBtn").disabled = pending || goalRuleElements().length >= 9;
 }
 
 async function prepareWorldRulesForEntry(description) {
@@ -5938,32 +5770,13 @@ async function prepareWorldRulesForEntry(description) {
         : `✓ ${skill.name} · 持久`;
       state.dataset.state = "ready";
     });
-    const preparedGoals = Array.isArray(prepared.goals) ? prepared.goals : (
-      prepared.goal ? [prepared.goal] : []
-    );
-    preparedGoals.forEach((goal) => {
-      const item = goalRuleElements().find((candidate) => (
-        candidate.dataset.goalRuleId === goal.id
-      ));
-      const state = item?.querySelector(".goal-rule-state");
-      if (!state) return;
-      state.textContent = `✓ ${goal.name} · ≥${goal.min_play_seconds}s · p=${goal.probability}`;
-      state.dataset.state = "ready";
-    });
     preparedWorldRulesCache = { signature, prepared };
-    setWorldRulesStatus(`${ruleCount} 条规则已补全；技能可立即使用，目标将按时间自动触发`, "ready");
+    setWorldRulesStatus(`${ruleCount} 条技能规则已补全，可立即使用`, "ready");
     return prepared;
   } catch (error) {
     $("worldRulesPanel").open = true;
     skillRuleElements().forEach((item) => {
       const state = item.querySelector(".skill-rule-state");
-      if (!state.dataset.state) {
-        state.textContent = "补全失败，请重试";
-        state.dataset.state = "error";
-      }
-    });
-    goalRuleElements().forEach((item) => {
-      const state = item.querySelector(".goal-rule-state");
       if (!state.dataset.state) {
         state.textContent = "补全失败，请重试";
         state.dataset.state = "error";
@@ -7775,11 +7588,6 @@ $("prompt").addEventListener("input", () => {
 $("addSkillRuleBtn").onclick = () => {
   $("worldRulesPanel").open = true;
   addSkillRule();
-  handleWorldRulesDraftInput();
-};
-$("addGoalRuleBtn").onclick = () => {
-  $("worldRulesPanel").open = true;
-  addGoalRule();
   handleWorldRulesDraftInput();
 };
 $("stopBtn").onclick = () => {
