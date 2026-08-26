@@ -69,6 +69,8 @@ PROFILE_OVERRIDABLE_SERVER_ARGS = frozenset(
         "--ulysses-degree",
         "--ring-degree",
         "--enable-cuda-graph",
+        "--realtime-max-sessions",
+        "--realtime-max-sessions-per-worker",
     }
 )
 

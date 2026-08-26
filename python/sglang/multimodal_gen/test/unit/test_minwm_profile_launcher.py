@@ -190,6 +190,29 @@ def test_profile_allows_parallelism_overrides_for_sp2():
     assert _last_option_value(command, "--enable-cuda-graph") == "true"
 
 
+def test_profile_allows_realtime_capacity_overrides():
+    contract = build_launch_contract(
+        requested_profile="auto",
+        gpu=GPUInfo("GeForce RTX 5090", (12, 0), 32768),
+        taehv_path=Path("/models/taehv/taew2_2.pth"),
+        server_args=[
+            "--model-path",
+            "/models/minwm",
+            "--realtime-max-sessions",
+            "1",
+            "--realtime-max-sessions-per-worker",
+            "1",
+        ],
+        validate_artifacts=False,
+    )
+
+    command = contract["command"]
+    assert command.count("--realtime-max-sessions") == 1
+    assert command.count("--realtime-max-sessions-per-worker") == 1
+    assert _last_option_value(command, "--realtime-max-sessions") == "1"
+    assert _last_option_value(command, "--realtime-max-sessions-per-worker") == "1"
+
+
 def test_profile_rejects_managed_override():
     with pytest.raises(ValueError, match="cannot be overridden"):
         build_launch_contract(
