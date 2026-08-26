@@ -84,10 +84,9 @@ stock exists, create:
   Defaults to dry-run.
 - `install_k3s_vae_agent.sh`: run on each VAE ECS node after k3s server token is
   available.
-- `auth/feishu_auth_server.py`: Feishu OAuth login gate used by Caddy for the
-  public WebUI domain.
-- `manifests/control-plane.yaml.tpl`: auth, coordinator, gateway, WebUI,
-  RuntimeClass.
+- `python/sglang/multimodal_gen/apps/realtime_webui/feishu_auth.py`: optional
+  Feishu OAuth login gate embedded in the WebUI backend.
+- `manifests/control-plane.yaml.tpl`: coordinator, gateway, WebUI, RuntimeClass.
 - `manifests/denoiser-sp2.yaml.tpl`: one DaemonSet Pod on the Lingjun 8-GPU
   node, with four SP2 denoiser containers pinned to GPU pairs.
 - `manifests/vae-workers-a10.yaml.tpl`: two VAE replicas spread one per A10 node.
@@ -142,9 +141,13 @@ bash benchmark/minwm_realtime_async_vae/aliyun/k8s-shanghai/deploy_control_plane
 
 ## Feishu WebUI Auth
 
-The Shanghai WebUI public domain is protected at the Caddy edge by
-`zing-auth`, a two-replica FastAPI service backed by Redis sessions. The
-machine-to-machine gateway API stays public for the expected integration paths:
+The Shanghai WebUI public domain is protected by optional Feishu OAuth inside
+the WebUI backend. Enable it per region with `WEBUI_AUTH_ENABLED=true`; keep it
+unset or `false` for regions that should remain unchanged. Sessions are stored
+in Redis, not local process memory.
+
+The machine-to-machine gateway API stays public for the expected integration
+paths:
 
 - `/v1/models`
 - `/v1/slots`
@@ -153,7 +156,8 @@ machine-to-machine gateway API stays public for the expected integration paths:
 - `/backends/<backend>/v1/slots`
 - `/backends/<backend>/v1/realtime_video/authorized_generate`
 
-Create the Kubernetes secret out of band; do not commit these values:
+Create the Kubernetes secret out of band; do not commit these values. The
+current Shanghai deployment reuses this secret from the WebUI pod:
 
 ```bash
 kubectl -n minwm-realtime create secret generic zing-auth-secrets \
@@ -178,9 +182,18 @@ AUTH_ALLOWED_EMAIL_DOMAINS=loopit.com.cn
 AUTH_ALLOWED_USERS=<open_id_or_user_id_or_union_id_or_email>,...
 ```
 
-The live Caddy entry keeps `authorized_generate`, `/v1/models`, and `/v1/slots`
-public, routes `/auth/*` to `zing-auth`, and applies `forward_auth` to the
-remaining WebUI routes.
+Use region-specific values for separate Beijing and Shanghai login states, for
+example:
+
+```text
+AUTH_PUBLIC_BASE_URL=https://zing-model-shanghai.loopit.com.cn
+AUTH_COOKIE_NAME=zing_webui_session
+AUTH_REDIS_KEY_PREFIX=zing:shanghai:webui-auth
+```
+
+The live Caddy entry for the WebUI domain simply proxies to `zing-webui`; the
+WebUI backend decides which paths are public and which require login. The
+standalone `zing-auth` deployment is no longer used.
 
 ## Required Host Paths
 

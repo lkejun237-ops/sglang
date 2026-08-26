@@ -19,6 +19,7 @@ from aiohttp import (
     WSMsgType,
     web,
 )
+from feishu_auth import FeishuAuth
 from prompt_rewriter import PromptRewriter
 from world_creator import WorldCreator
 
@@ -83,6 +84,10 @@ async def _index(_request):
         ROOT / "index.html",
         headers={"Cache-Control": "no-store"},
     )
+
+
+async def _healthz(_request):
+    return web.json_response({"status": "ok"})
 
 
 async def _runtime_config(_request):
@@ -852,6 +857,8 @@ async def _session_context(app):
 
 def create_app():
     app = web.Application(client_max_size=1024**3)
+    auth = FeishuAuth.from_env()
+    app.cleanup_ctx.append(auth.cleanup_context)
     prompt_rewriter = PromptRewriter()
     app[PROMPT_REWRITER] = prompt_rewriter
     app[WORLD_CREATOR] = WorldCreator(
@@ -877,6 +884,8 @@ def create_app():
     app[HAPPYOYSTER_WORLD_CACHE] = _load_happyoyster_prebuilt_worlds()
     app[HAPPYOYSTER_WORLD_BUILD_LOCKS] = {}
     app.cleanup_ctx.append(_session_context)
+    auth.register(app)
+    app.router.add_get("/healthz", _healthz)
     app.router.add_get("/", _index)
     app.router.add_get("/runtime-config.js", _runtime_config)
     app.router.add_post("/api/prompt/rewrite", _rewrite_prompt)
