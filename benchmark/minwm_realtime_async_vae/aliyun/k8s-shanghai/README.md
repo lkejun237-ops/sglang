@@ -188,6 +188,7 @@ example:
 ```text
 AUTH_PUBLIC_BASE_URL=https://zing-model-shanghai.loopit.com.cn
 AUTH_COOKIE_NAME=zing_webui_session
+AUTH_REDIS_URL=<same-redis-url-used-by-coordinator>
 AUTH_REDIS_KEY_PREFIX=zing:shanghai:webui-auth
 ```
 

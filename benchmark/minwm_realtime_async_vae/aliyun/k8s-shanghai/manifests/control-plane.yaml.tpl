@@ -439,7 +439,7 @@ spec:
             - {name: WEBUI_AUTH_ENABLED, value: "${WEBUI_AUTH_ENABLED}"}
             - {name: AUTH_PUBLIC_BASE_URL, value: "${AUTH_PUBLIC_BASE_URL}"}
             - {name: AUTH_COOKIE_NAME, value: "${AUTH_COOKIE_NAME}"}
-            - {name: AUTH_REDIS_URL, value: "${REDIS_URL}"}
+            - {name: AUTH_REDIS_URL, value: "${AUTH_REDIS_URL}"}
             - {name: AUTH_REDIS_KEY_PREFIX, value: "${AUTH_REDIS_KEY_PREFIX}"}
             - {name: AUTH_SESSION_TTL_SECONDS, value: "${AUTH_SESSION_TTL_SECONDS}"}
             - name: REALTIME_UI_CONFIG_JSON
