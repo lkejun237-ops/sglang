@@ -84,7 +84,10 @@ stock exists, create:
   Defaults to dry-run.
 - `install_k3s_vae_agent.sh`: run on each VAE ECS node after k3s server token is
   available.
-- `manifests/control-plane.yaml.tpl`: coordinator, gateway, WebUI, RuntimeClass.
+- `auth/feishu_auth_server.py`: Feishu OAuth login gate used by Caddy for the
+  public WebUI domain.
+- `manifests/control-plane.yaml.tpl`: auth, coordinator, gateway, WebUI,
+  RuntimeClass.
 - `manifests/denoiser-sp2.yaml.tpl`: one DaemonSet Pod on the Lingjun 8-GPU
   node, with four SP2 denoiser containers pinned to GPU pairs.
 - `manifests/vae-workers-a10.yaml.tpl`: two VAE replicas spread one per A10 node.
@@ -136,6 +139,48 @@ REDIS_URL=redis://10.0.1.21:6379/0 \
 DEPLOY_REDIS=false \
 bash benchmark/minwm_realtime_async_vae/aliyun/k8s-shanghai/deploy_control_plane.sh
 ```
+
+## Feishu WebUI Auth
+
+The Shanghai WebUI public domain is protected at the Caddy edge by
+`zing-auth`, a two-replica FastAPI service backed by Redis sessions. The
+machine-to-machine gateway API stays public for the expected integration paths:
+
+- `/v1/models`
+- `/v1/slots`
+- `/v1/realtime_video/authorized_generate`
+- `/backends/<backend>/v1/models`
+- `/backends/<backend>/v1/slots`
+- `/backends/<backend>/v1/realtime_video/authorized_generate`
+
+Create the Kubernetes secret out of band; do not commit these values:
+
+```bash
+kubectl -n minwm-realtime create secret generic zing-auth-secrets \
+  --from-literal=FEISHU_APP_ID='<feishu-app-id>' \
+  --from-literal=FEISHU_APP_SECRET='<feishu-app-secret>' \
+  --from-literal=AUTH_COOKIE_SECRET='<random-48-byte-url-safe-secret>' \
+  --from-literal=AUTH_REDIS_URL='<redis-url>' \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+The Feishu app must allow this redirect URI:
+
+```text
+https://zing-model-shanghai.loopit.com.cn/auth/callback
+```
+
+Optional allowlist controls are supported via secret/env values:
+
+```text
+AUTH_ALLOWED_TENANT_KEY=<tenant_key>
+AUTH_ALLOWED_EMAIL_DOMAINS=loopit.com.cn
+AUTH_ALLOWED_USERS=<open_id_or_user_id_or_union_id_or_email>,...
+```
+
+The live Caddy entry keeps `authorized_generate`, `/v1/models`, and `/v1/slots`
+public, routes `/auth/*` to `zing-auth`, and applies `forward_auth` to the
+remaining WebUI routes.
 
 ## Required Host Paths
 

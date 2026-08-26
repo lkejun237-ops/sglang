@@ -237,6 +237,107 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
+  name: zing-auth
+  namespace: ${NAMESPACE}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: zing-auth
+  ports:
+    - name: http
+      port: 18082
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zing-auth
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: zing-auth
+    app.kubernetes.io/part-of: minwm-realtime
+spec:
+  replicas: ${AUTH_REPLICAS}
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: zing-auth
+  template:
+    metadata:
+      annotations:
+        seedleap.ai/auth-source-patch: ${AUTH_SOURCE_PATCH_VERSION}
+      labels:
+        app.kubernetes.io/name: zing-auth
+        app.kubernetes.io/part-of: minwm-realtime
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        ${CONTROL_PLANE_NODE_LABEL_KEY}: "${CONTROL_PLANE_NODE_LABEL_VALUE}"
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: zing-auth
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: auth
+          image: ${AUTH_IMAGE}
+          imagePullPolicy: IfNotPresent
+          command: [python3]
+          args: [/opt/zing-auth/feishu_auth_server.py]
+          envFrom:
+            - secretRef:
+                name: zing-auth-secrets
+          env:
+            - {name: PYTHONUNBUFFERED, value: "1"}
+            - {name: PYTHONPATH, value: /opt/sglang/python:/opt/zing-auth}
+            - {name: SGLANG_LIGHTWEIGHT_RUNTIME, value: "1"}
+            - {name: OTEL_SERVICE_NAME, value: zing-auth}
+            - {name: AUTH_PUBLIC_BASE_URL, value: "${AUTH_PUBLIC_BASE_URL}"}
+            - {name: AUTH_COOKIE_NAME, value: "${AUTH_COOKIE_NAME}"}
+            - {name: AUTH_REDIS_KEY_PREFIX, value: "${AUTH_REDIS_KEY_PREFIX}"}
+            - {name: AUTH_SESSION_TTL_SECONDS, value: "${AUTH_SESSION_TTL_SECONDS}"}
+          ports:
+            - {name: http, containerPort: 18082}
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 15
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          volumeMounts:
+            - {name: auth-source, mountPath: /opt/zing-auth/feishu_auth_server.py, subPath: feishu_auth_server.py, readOnly: true}
+      volumes:
+        - {name: auth-source, configMap: {name: zing-auth-source}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: zing-auth
+  namespace: ${NAMESPACE}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: zing-auth
+---
+apiVersion: v1
+kind: Service
+metadata:
   name: zing-gateway
   namespace: ${NAMESPACE}
 spec:
