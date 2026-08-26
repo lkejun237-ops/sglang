@@ -104,6 +104,7 @@ RUNTIME_REALTIME_SOURCE_DIR="${RUNTIME_REALTIME_SOURCE_DIR:-${REPO_ROOT}/python/
 RUNTIME_REALTIME_STATES_SOURCE_DIR="${RUNTIME_REALTIME_STATES_SOURCE_DIR:-${RUNTIME_REALTIME_SOURCE_DIR}/states}"
 RUNTIME_ENTRYPOINT_SOURCE_DIR="${RUNTIME_ENTRYPOINT_SOURCE_DIR:-${REPO_ROOT}/python/sglang/multimodal_gen/runtime/entrypoints}"
 RUNTIME_OPENAI_REALTIME_ENTRYPOINT_SOURCE_DIR="${RUNTIME_OPENAI_REALTIME_ENTRYPOINT_SOURCE_DIR:-${RUNTIME_ENTRYPOINT_SOURCE_DIR}/openai/realtime}"
+RUNTIME_OPENAI_REALTIME_ADAPTER_SOURCE_DIR="${RUNTIME_OPENAI_REALTIME_ADAPTER_SOURCE_DIR:-${RUNTIME_OPENAI_REALTIME_ENTRYPOINT_SOURCE_DIR}/adapters}"
 RUNTIME_UTILS_SOURCE_DIR="${RUNTIME_UTILS_SOURCE_DIR:-${REPO_ROOT}/python/sglang/multimodal_gen/runtime/utils}"
 RUNTIME_MODELS_DITS_SOURCE_DIR="${RUNTIME_MODELS_DITS_SOURCE_DIR:-${REPO_ROOT}/python/sglang/multimodal_gen/runtime/models/dits}"
 RUNTIME_PIPELINES_SOURCE_DIR="${RUNTIME_PIPELINES_SOURCE_DIR:-${REPO_ROOT}/python/sglang/multimodal_gen/runtime/pipelines}"
@@ -474,6 +475,9 @@ apply_runtime_source_patch() {
     realtime_video_api.py
     generate_session.py
   )
+  local openai_realtime_adapter_files=(
+    minwm_realtime_adapter.py
+  )
   local utils_files=(
     logging_utils.py
     realtime_video.py
@@ -525,6 +529,12 @@ apply_runtime_source_patch() {
   for file in "${openai_realtime_entrypoint_files[@]}"; do
     if [[ ! -f "${RUNTIME_OPENAI_REALTIME_ENTRYPOINT_SOURCE_DIR}/${file}" ]]; then
       printf 'missing OpenAI realtime entrypoint file: %s\n' "${RUNTIME_OPENAI_REALTIME_ENTRYPOINT_SOURCE_DIR}/${file}" >&2
+      return 1
+    fi
+  done
+  for file in "${openai_realtime_adapter_files[@]}"; do
+    if [[ ! -f "${RUNTIME_OPENAI_REALTIME_ADAPTER_SOURCE_DIR}/${file}" ]]; then
+      printf 'missing OpenAI realtime adapter file: %s\n' "${RUNTIME_OPENAI_REALTIME_ADAPTER_SOURCE_DIR}/${file}" >&2
       return 1
     fi
   done
@@ -606,7 +616,7 @@ apply_runtime_source_patch() {
   done
 
   ssh_remote "${SSH_HOST}" \
-    "rm -rf '${remote_patch_dir}' && mkdir -p '${remote_patch_dir}/realtime' '${remote_patch_dir}/realtime-states' '${remote_patch_dir}/entrypoints' '${remote_patch_dir}/openai-realtime-entrypoints' '${remote_patch_dir}/utils' '${remote_patch_dir}/models-dits' '${remote_patch_dir}/pipelines' '${remote_patch_dir}/pipeline-minwm-stage' '${remote_patch_dir}/managers' '${remote_patch_dir}/configs' '${remote_patch_dir}/pipeline-configs' '${remote_patch_dir}/sample-configs' '${remote_patch_dir}/jit-diffusion' '${remote_patch_dir}/jit-csrc-diffusion' '${remote_patch_dir}/tools' '${remote_patch_dir}/shims'"
+    "rm -rf '${remote_patch_dir}' && mkdir -p '${remote_patch_dir}/realtime' '${remote_patch_dir}/realtime-states' '${remote_patch_dir}/entrypoints' '${remote_patch_dir}/openai-realtime-entrypoints' '${remote_patch_dir}/openai-realtime-adapters' '${remote_patch_dir}/utils' '${remote_patch_dir}/models-dits' '${remote_patch_dir}/pipelines' '${remote_patch_dir}/pipeline-minwm-stage' '${remote_patch_dir}/managers' '${remote_patch_dir}/configs' '${remote_patch_dir}/pipeline-configs' '${remote_patch_dir}/sample-configs' '${remote_patch_dir}/jit-diffusion' '${remote_patch_dir}/jit-csrc-diffusion' '${remote_patch_dir}/tools' '${remote_patch_dir}/shims'"
   scp_remote "${RUNTIME_REALTIME_SOURCE_DIR}"/*.py "${SSH_HOST}:${remote_patch_dir}/realtime/"
   local realtime_state_sources=()
   for file in "${realtime_state_files[@]}"; do
@@ -623,6 +633,11 @@ apply_runtime_source_patch() {
     openai_realtime_entrypoint_sources+=("${RUNTIME_OPENAI_REALTIME_ENTRYPOINT_SOURCE_DIR}/${file}")
   done
   scp_remote "${openai_realtime_entrypoint_sources[@]}" "${SSH_HOST}:${remote_patch_dir}/openai-realtime-entrypoints/"
+  local openai_realtime_adapter_sources=()
+  for file in "${openai_realtime_adapter_files[@]}"; do
+    openai_realtime_adapter_sources+=("${RUNTIME_OPENAI_REALTIME_ADAPTER_SOURCE_DIR}/${file}")
+  done
+  scp_remote "${openai_realtime_adapter_sources[@]}" "${SSH_HOST}:${remote_patch_dir}/openai-realtime-adapters/"
   local utils_sources=()
   for file in "${utils_files[@]}"; do
     utils_sources+=("${RUNTIME_UTILS_SOURCE_DIR}/${file}")
@@ -689,6 +704,7 @@ kubectl -n "${NAMESPACE}" delete configmap \
   zing-runtime-realtime-states-patch \
   zing-runtime-entrypoint-patch \
   zing-runtime-openai-realtime-entrypoint-patch \
+  zing-runtime-openai-realtime-adapter-patch \
   zing-runtime-utils-patch \
   zing-runtime-model-dits-patch \
   zing-runtime-pipelines-patch \
@@ -714,6 +730,8 @@ kubectl -n "${NAMESPACE}" create configmap zing-runtime-entrypoint-patch \
 kubectl -n "${NAMESPACE}" create configmap zing-runtime-openai-realtime-entrypoint-patch \
   --from-file="${REMOTE_PATCH_DIR}/openai-realtime-entrypoints/realtime_video_api.py" \
   --from-file="${REMOTE_PATCH_DIR}/openai-realtime-entrypoints/generate_session.py"
+kubectl -n "${NAMESPACE}" create configmap zing-runtime-openai-realtime-adapter-patch \
+  --from-file="${REMOTE_PATCH_DIR}/openai-realtime-adapters/minwm_realtime_adapter.py"
 kubectl -n "${NAMESPACE}" create configmap zing-runtime-utils-patch \
   --from-file="${REMOTE_PATCH_DIR}/utils"
 kubectl -n "${NAMESPACE}" create configmap zing-runtime-model-dits-patch \
@@ -844,6 +862,11 @@ def patch_mounts(prefix):
             "runtime-openai-realtime-entrypoint-patch",
             f"{base}/multimodal_gen/runtime/entrypoints/openai/realtime/generate_session.py",
             "generate_session.py",
+        ),
+        mount(
+            "runtime-openai-realtime-adapter-patch",
+            f"{base}/multimodal_gen/runtime/entrypoints/openai/realtime/adapters/minwm_realtime_adapter.py",
+            "minwm_realtime_adapter.py",
         ),
         mount(
             "runtime-realtime-patch",
@@ -1177,6 +1200,7 @@ for name in [
     "runtime-realtime-patch",
     "runtime-realtime-states-patch",
     "runtime-openai-realtime-entrypoint-patch",
+    "runtime-openai-realtime-adapter-patch",
     "runtime-utils-patch",
     "runtime-model-dits-patch",
     "runtime-pipelines-patch",
