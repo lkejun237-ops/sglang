@@ -258,6 +258,28 @@ def test_recording_rejects_incomplete_media_without_publishing(messages):
     asyncio.run(run())
 
 
-def test_production_recording_uses_minimum_s3_part_size():
+def test_production_recording_uses_configurable_queue_larger_than_s3_part_size(
+    monkeypatch,
+):
     assert world_recording.PART_SIZE == 5 * 1024 * 1024
-    assert world_recording.QUEUE_MAX_BYTES == 5 * 1024 * 1024
+    assert world_recording.QUEUE_MAX_BYTES == 16 * 1024 * 1024
+    monkeypatch.delenv(world_recording.QUEUE_MAX_BYTES_ENV, raising=False)
+    assert world_recording._load_recording_queue_max_bytes() == 16 * 1024 * 1024
+
+    monkeypatch.setenv(
+        world_recording.QUEUE_MAX_BYTES_ENV, str(24 * 1024 * 1024)
+    )
+    assert world_recording._load_recording_queue_max_bytes() == 24 * 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("not-bytes", "must be an integer number of bytes"),
+        (str(5 * 1024 * 1024 - 1), "must be at least"),
+    ],
+)
+def test_production_recording_rejects_invalid_queue_size(monkeypatch, value, message):
+    monkeypatch.setenv(world_recording.QUEUE_MAX_BYTES_ENV, value)
+    with pytest.raises(ValueError, match=message):
+        world_recording._load_recording_queue_max_bytes()
