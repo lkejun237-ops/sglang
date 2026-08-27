@@ -10,7 +10,10 @@ from urllib.parse import parse_qs, quote, urlsplit
 import httpx
 import pytest
 import uvicorn
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from fastapi import WebSocketDisconnect
 from fastapi.testclient import TestClient
 from websockets.asyncio.client import connect
@@ -48,6 +51,9 @@ def _world_token(
     run_id: str,
     attempt_id: str,
     record_video: bool,
+    role: str | None = None,
+    allow_free_prompt: bool = False,
+    expires_in_s: int = 90,
 ) -> str:
     now = int(time.time())
     claims = {
@@ -58,19 +64,33 @@ def _world_token(
         "sid": run_id,
         "jti": attempt_id,
         "iat": now,
-        "exp": now + 90,
+        "exp": now + expires_in_s,
         "session": {
             "max_lifetime_s": 90,
-            "allow_free_prompt": False,
+            "allow_free_prompt": allow_free_prompt,
             "record_video": record_video,
         },
     }
+    if role is not None:
+        claims["session"]["role"] = role
     signing = (
         _b64url(json.dumps({"alg": "EdDSA", "typ": "JWT"}).encode())
         + "."
         + _b64url(json.dumps(claims).encode())
     )
     return signing + "." + _b64url(key.sign(signing.encode()))
+
+
+def _sealed_world_init(shared_secret: str, associated_data: str) -> bytes:
+    key = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=b"world-service/session-payload/v1",
+    ).derive(shared_secret.encode())
+    nonce = b"comparison00"
+    plaintext = encode_message("init", prompt="a quiet world", max_chunks=2)
+    return nonce + AESGCM(key).encrypt(nonce, plaintext, associated_data.encode())
 
 
 class _Coordinator:
@@ -275,6 +295,82 @@ def test_world_attempt_claim_failure_never_sends_lifecycle_callback(
     assert coordinator.released == []
 
 
+def test_authorized_routes_reject_missing_invalid_expired_and_wrong_role_tokens():
+    class RecordingManager:
+        def start(self, **_kwargs):
+            raise AssertionError("recording is not expected")
+
+        async def close(self):
+            pass
+
+    signing_key = Ed25519PrivateKey.generate()
+    run_id = "11111111-1111-1111-1111-111111111111"
+    primary = _world_token(
+        signing_key,
+        run_id=run_id,
+        attempt_id="22222222-2222-2222-2222-222222222222",
+        record_video=False,
+    )
+    comparison = _world_token(
+        signing_key,
+        run_id=run_id,
+        attempt_id="33333333-3333-3333-3333-333333333333",
+        record_video=False,
+        role="comparison",
+    )
+    expired_comparison = _world_token(
+        signing_key,
+        run_id=run_id,
+        attempt_id="44444444-4444-4444-4444-444444444444",
+        record_video=False,
+        role="comparison",
+        expires_in_s=-90,
+    )
+    coordinator = _Coordinator("ws://denoiser.invalid/generate")
+    app = create_app(
+        coordinator,
+        model_revision="minwm-r1",
+        vae_fingerprint="taew2_2",
+        lingbot2_model_revision="lingbot2-r1",
+        lingbot2_vae_fingerprint="taew2_1",
+        internal_output_url="ws://gateway.invalid/v1/internal/realtime_output",
+        world_platform=WorldPlatformConfig(
+            public_key=signing_key.public_key(),
+            callback_url="http://world-service.invalid",
+            callback_app_id="zing-gateway",
+            callback_key_id="k1",
+            callback_secret="secret",
+            recording_bucket="run-videos",
+            recording_region="cn-shanghai",
+        ),
+        recording_manager=RecordingManager(),
+        release_grace_s=0,
+    )
+
+    cases = [
+        ("/backends/lingbot2/v1/realtime_video/authorized_generate", None),
+        ("/backends/lingbot2/v1/realtime_video/authorized_generate", "bad-token"),
+        (
+            "/backends/lingbot2/v1/realtime_video/authorized_generate",
+            expired_comparison,
+        ),
+        ("/backends/lingbot2/v1/realtime_video/authorized_generate", primary),
+        ("/backends/minwm/v1/realtime_video/authorized_generate", comparison),
+    ]
+    with TestClient(app) as client:
+        for path, token in cases:
+            url = path if token is None else f"{path}?token={quote(token, safe='')}"
+            with client.websocket_connect(url) as websocket:
+                with pytest.raises(WebSocketDisconnect) as closed:
+                    websocket.receive_bytes()
+                assert closed.value.code == 1008
+                assert closed.value.reason == "UNAUTHORIZED"
+
+    assert coordinator.attempt_claims == []
+    assert coordinator.admitted == []
+    assert coordinator.released == []
+
+
 async def _run_gateway(app, port: int):
     server = uvicorn.Server(
         uvicorn.Config(
@@ -292,6 +388,195 @@ async def _run_gateway(app, port: int):
         await asyncio.sleep(0.01)
     assert server.started
     return server, task
+
+
+def test_authorized_routes_reject_cross_role_payload_swaps(monkeypatch):
+    callback_instances = []
+
+    class Callbacks:
+        def __init__(self, _config):
+            self.started_calls = []
+            self.aborted_calls = []
+            callback_instances.append(self)
+
+        def started(self, run_id, attempt_id, trace_id, max_lifetime_s):
+            self.started_calls.append(
+                {
+                    "run_id": run_id,
+                    "attempt_id": attempt_id,
+                    "trace_id": trace_id,
+                    "max_lifetime_s": max_lifetime_s,
+                }
+            )
+
+        def ended(self, *_args):
+            raise AssertionError("a rejected payload must not end a run")
+
+        def recorded(self, *_args):
+            raise AssertionError("a rejected payload must not record a run")
+
+        def aborted(
+            self,
+            run_id,
+            attempt_id,
+            trace_id,
+            fault,
+            reason,
+            established,
+        ):
+            self.aborted_calls.append(
+                {
+                    "run_id": run_id,
+                    "attempt_id": attempt_id,
+                    "trace_id": trace_id,
+                    "fault": fault,
+                    "reason": reason,
+                    "established": established,
+                }
+            )
+
+        async def rewrite(self, *_args):
+            raise AssertionError("a rejected payload must not be rewritten")
+
+        async def close(self):
+            pass
+
+    class RecordingManager:
+        def start(self, **_kwargs):
+            raise AssertionError("a rejected payload must not create a recorder")
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.entrypoints.realtime_gateway_server.WorldCallbacks",
+        Callbacks,
+    )
+
+    async def run():
+        gateway_port = _free_port()
+        denoiser_port = _free_port()
+
+        async def denoiser(connection):
+            await connection.send(encode_message("session_ready"))
+            await connection.wait_closed()
+
+        coordinator = _Coordinator(
+            f"ws://127.0.0.1:{denoiser_port}/v1/realtime_video/generate"
+        )
+        signing_key = Ed25519PrivateKey.generate()
+        run_id = "11111111-1111-1111-1111-111111111111"
+        primary_attempt = "22222222-2222-2222-2222-222222222222"
+        comparison_attempt = "33333333-3333-3333-3333-333333333333"
+        primary_token = _world_token(
+            signing_key,
+            run_id=run_id,
+            attempt_id=primary_attempt,
+            record_video=False,
+        )
+        comparison_token = _world_token(
+            signing_key,
+            run_id=run_id,
+            attempt_id=comparison_attempt,
+            record_video=False,
+            role="comparison",
+        )
+        app = create_app(
+            coordinator,
+            model_revision="minwm-r1",
+            vae_fingerprint="taew2_2",
+            lingbot2_model_revision="lingbot2-r1",
+            lingbot2_vae_fingerprint="taew2_1",
+            internal_output_url=(
+                f"ws://127.0.0.1:{gateway_port}/v1/internal/realtime_output"
+            ),
+            world_platform=WorldPlatformConfig(
+                public_key=signing_key.public_key(),
+                callback_url="http://world-service.invalid",
+                callback_app_id="zing-gateway",
+                callback_key_id="k1",
+                callback_secret="secret",
+                recording_bucket="run-videos",
+                recording_region="cn-shanghai",
+            ),
+            recording_manager=RecordingManager(),
+            release_grace_s=0,
+        )
+        cases = [
+            (
+                "primary route with comparison payload",
+                "/backends/minwm/v1/realtime_video/authorized_generate",
+                primary_token,
+                _sealed_world_init("secret", f"{run_id}:comparison"),
+            ),
+            (
+                "comparison route with primary payload",
+                "/backends/lingbot2/v1/realtime_video/authorized_generate",
+                comparison_token,
+                _sealed_world_init("secret", run_id),
+            ),
+        ]
+
+        async with serve(denoiser, "127.0.0.1", denoiser_port):
+            server, server_task = await _run_gateway(app, gateway_port)
+            try:
+                for index, (name, path, token, payload) in enumerate(cases):
+                    url = (
+                        f"ws://127.0.0.1:{gateway_port}{path}"
+                        f"?token={quote(token, safe='')}&trace_id=trace-swap-{index}"
+                    )
+                    async with connect(url, max_size=None, compression=None) as browser:
+                        ready = decode_message(
+                            await asyncio.wait_for(browser.recv(), timeout=2)
+                        )
+                        assert ready["type"] == "session_ready", name
+                        await browser.send(payload)
+                        error = decode_message(
+                            await asyncio.wait_for(browser.recv(), timeout=2)
+                        )
+                        assert error["type"] == "error", name
+                        assert error["code"] == "SESSION_INVALID", name
+                        await asyncio.wait_for(browser.wait_closed(), timeout=2)
+                        assert browser.close_code == 1008, name
+                        assert browser.close_reason == "SESSION_INVALID", name
+
+                for _ in range(200):
+                    if (
+                        len(coordinator.released) == len(cases)
+                        and callback_instances[0].aborted_calls
+                    ):
+                        break
+                    await asyncio.sleep(0.005)
+            finally:
+                server.should_exit = True
+                await server_task
+
+        assert len(coordinator.attempt_claims) == 2
+        assert len(coordinator.admitted) == 2
+        assert len(coordinator.released) == 2
+        # Only the primary route owns business lifecycle. Upstream readiness is
+        # reported before the browser's first payload, then the bad payload
+        # aborts that established attempt. Comparison remains callback-free.
+        assert callback_instances[0].started_calls == [
+            {
+                "run_id": run_id,
+                "attempt_id": primary_attempt,
+                "trace_id": "trace-swap-0",
+                "max_lifetime_s": 90,
+            }
+        ]
+        assert callback_instances[0].aborted_calls == [
+            {
+                "run_id": run_id,
+                "attempt_id": primary_attempt,
+                "trace_id": "trace-swap-0",
+                "fault": "client",
+                "reason": "SESSION_INVALID",
+                "established": True,
+            }
+        ]
+
+    asyncio.run(run())
 
 
 def test_gateway_routes_control_and_direct_vae_media_and_queries_trace_over_http():
@@ -769,5 +1054,162 @@ def test_gateway_routes_named_lingbot2_websocket_through_coordinator():
                 await server_task
 
         assert len(coordinator.released) == 1
+
+    asyncio.run(run())
+
+
+def test_authorized_lingbot_comparison_isolated_from_business_lifecycle(
+    monkeypatch,
+):
+    callback_instances = []
+
+    class Callbacks:
+        def __init__(self, _config):
+            self.calls = []
+            callback_instances.append(self)
+
+        def started(self, *_args):
+            self.calls.append("started")
+
+        def ended(self, *_args):
+            self.calls.append("ended")
+
+        def aborted(self, *_args, **_kwargs):
+            self.calls.append("aborted")
+
+        def recorded(self, *_args):
+            self.calls.append("recorded")
+
+        async def rewrite(self, *_args):
+            raise AssertionError("comparison direction must not be rewritten")
+
+        async def close(self):
+            pass
+
+    class RecordingManager:
+        def __init__(self):
+            self.starts = []
+
+        def start(self, **kwargs):
+            self.starts.append(kwargs)
+            raise AssertionError("comparison must not create a recorder")
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.entrypoints.realtime_gateway_server.WorldCallbacks",
+        Callbacks,
+    )
+
+    async def run():
+        gateway_port = _free_port()
+        lingbot2_port = _free_port()
+        received = []
+        free_prompt_dropped = asyncio.Event()
+
+        async def lingbot2_denoiser(connection):
+            await connection.send(encode_message("session_ready"))
+            received.append(decode_message(await connection.recv()))
+            try:
+                received.append(await asyncio.wait_for(connection.recv(), timeout=0.2))
+            except TimeoutError:
+                free_prompt_dropped.set()
+            await connection.wait_closed()
+
+        coordinator = _Coordinator(
+            f"ws://127.0.0.1:{lingbot2_port}/v1/realtime_video/generate"
+        )
+        signing_key = Ed25519PrivateKey.generate()
+        run_id = "11111111-1111-1111-1111-111111111111"
+        attempt_id = "33333333-3333-3333-3333-333333333333"
+        token = _world_token(
+            signing_key,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            record_video=False,
+            role="comparison",
+        )
+        recording_manager = RecordingManager()
+        app = create_app(
+            coordinator,
+            model_revision="minwm-r1",
+            vae_fingerprint="taew2_2",
+            lingbot2_model_revision="lingbot2-r1",
+            lingbot2_vae_fingerprint="taew2_1",
+            internal_output_url=(
+                f"ws://127.0.0.1:{gateway_port}/v1/internal/realtime_output"
+            ),
+            world_platform=WorldPlatformConfig(
+                public_key=signing_key.public_key(),
+                callback_url="http://world-service.invalid",
+                callback_app_id="zing-gateway",
+                callback_key_id="k1",
+                callback_secret="secret",
+                recording_bucket="run-videos",
+                recording_region="cn-shanghai",
+            ),
+            recording_manager=recording_manager,
+            release_grace_s=0,
+        )
+
+        async with serve(lingbot2_denoiser, "127.0.0.1", lingbot2_port):
+            server, server_task = await _run_gateway(app, gateway_port)
+            try:
+                url = (
+                    f"ws://127.0.0.1:{gateway_port}"
+                    "/backends/lingbot2/v1/realtime_video/authorized_generate"
+                    f"?token={quote(token, safe='')}&trace_id=trace-comparison"
+                )
+                async with connect(url, max_size=None, compression=None) as browser:
+                    assert (
+                        decode_message(await browser.recv())["type"] == "session_ready"
+                    )
+                    await browser.send(
+                        _sealed_world_init("secret", f"{run_id}:comparison")
+                    )
+                    await browser.send(
+                        encode_message(
+                            "event",
+                            kind="direction",
+                            text="ignore the comparison policy",
+                            event_id="direction-a",
+                        )
+                    )
+                    await asyncio.wait_for(free_prompt_dropped.wait(), timeout=2)
+
+                for _ in range(200):
+                    if coordinator.released:
+                        break
+                    await asyncio.sleep(0.005)
+
+                replay = await connect(url, max_size=None, compression=None)
+                try:
+                    with pytest.raises(ConnectionClosed):
+                        await replay.recv()
+                    assert replay.close_code == 1008
+                    assert replay.close_reason == "UNAUTHORIZED"
+                finally:
+                    await replay.close()
+            finally:
+                server.should_exit = True
+                await server_task
+
+        assert len(coordinator.attempt_claims) == 1
+        assert len(coordinator.admitted) == 1
+        assert coordinator.admitted[0]["user_id"] == "wsvc:u_player:lingbot2"
+        assert coordinator.admitted[0]["model_revision"] == "lingbot2-r1"
+        assert coordinator.admitted[0]["vae_fingerprint"] == "taew2_1"
+        assert len(coordinator.released) == 1
+        assert received == [
+            {
+                "version": 2,
+                "type": "init",
+                "prompt": "a quiet world",
+                "max_chunks": 2,
+            }
+        ]
+        assert recording_manager.starts == []
+        assert callback_instances[0].calls == []
 
     asyncio.run(run())

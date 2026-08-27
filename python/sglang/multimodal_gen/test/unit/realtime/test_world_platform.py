@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.realtime.world_platform import (
     TokenReplayGuard,
     WorldCallbacks,
     load_public_key,
+    session_payload_aad,
     verify_session_token,
 )
 
@@ -102,6 +103,74 @@ def test_recording_policy_is_read_from_the_verified_session_claim():
     claims["session"]["record_video"] = False
     token, pub = _sign(claims)
     assert verify_session_token(token, load_public_key(pub)).record_video is False
+
+
+def test_missing_role_is_a_backwards_compatible_primary_session():
+    token, pub = _sign(_claims())
+
+    principal = verify_session_token(token, load_public_key(pub))
+
+    assert principal.role == "primary"
+
+
+def test_session_payload_aad_preserves_primary_and_separates_comparison():
+    run_id = "11111111-1111-1111-1111-111111111111"
+
+    assert session_payload_aad(run_id, "primary") == run_id
+    assert session_payload_aad(run_id, "comparison") == f"{run_id}:comparison"
+    with pytest.raises(ValueError, match="session role must be primary or comparison"):
+        session_payload_aad(run_id, "secondary")
+
+
+def test_comparison_role_requires_non_business_policies():
+    claims = _claims()
+    claims["session"].update(
+        {
+            "role": "comparison",
+            "allow_free_prompt": False,
+            "record_video": False,
+        }
+    )
+    token, pub = _sign(claims)
+
+    principal = verify_session_token(token, load_public_key(pub))
+
+    assert principal.role == "comparison"
+    assert principal.allow_free_prompt is False
+    assert principal.record_video is False
+
+
+@pytest.mark.parametrize("invalid_role", [None, "", "secondary", 1, True])
+def test_session_role_rejects_unknown_or_non_string_values(invalid_role):
+    claims = _claims()
+    claims["session"]["role"] = invalid_role
+    token, pub = _sign(claims)
+
+    with pytest.raises(TokenError, match="session role must be primary or comparison"):
+        verify_session_token(token, load_public_key(pub))
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("allow_free_prompt", "comparison sessions must disable free prompt"),
+        ("record_video", "comparison sessions must disable recording"),
+    ],
+)
+def test_comparison_role_rejects_enabled_business_policy(field, message):
+    claims = _claims()
+    claims["session"].update(
+        {
+            "role": "comparison",
+            "allow_free_prompt": False,
+            "record_video": False,
+        }
+    )
+    claims["session"][field] = True
+    token, pub = _sign(claims)
+
+    with pytest.raises(TokenError, match=message):
+        verify_session_token(token, load_public_key(pub))
 
 
 @pytest.mark.parametrize("invalid_value", [None, "false", 0, 1])

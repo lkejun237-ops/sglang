@@ -67,6 +67,7 @@ from sglang.multimodal_gen.runtime.realtime.world_platform import (
     TokenReplayGuard,
     WorldCallbacks,
     WorldPlatformConfig,
+    session_payload_aad,
     verify_session_token,
 )
 from sglang.multimodal_gen.runtime.realtime.world_recording import (
@@ -472,6 +473,19 @@ def _user_id(websocket: WebSocket) -> str:
     return f"client:{client}"
 
 
+def _world_coordinator_user_id(principal: Principal) -> str:
+    """Return the role-scoped lease key used by the Coordinator.
+
+    A comparison is allowed alongside the primary session for the same signed
+    account, while a second session of either role still hits the existing
+    one-lease-per-user fence.
+    """
+    user_id = f"wsvc:{principal.lease_key}"
+    if principal.role == "comparison":
+        return f"{user_id}:lingbot2"
+    return user_id
+
+
 async def _receive_browser(websocket: WebSocket) -> bytes | str:
     message = await websocket.receive()
     if message["type"] == "websocket.disconnect":
@@ -665,16 +679,6 @@ def create_app(
     async def models():
         return {"object": "list", "data": [{"id": model_revision}]}
 
-    @app.get("/backends/minwm/v1/slots")
-    @app.get("/v1/slots")
-    async def slots():
-        try:
-            return _slot_capacity_summary(await coordinator.capacity())
-        except Exception as exc:
-            raise HTTPException(
-                status_code=503, detail="coordinator capacity unavailable"
-            ) from exc
-
     @app.get("/backends/lingbot2/v1/models")
     async def lingbot2_models():
         return {"object": "list", "data": [{"id": lingbot2_model_revision}]}
@@ -843,10 +847,12 @@ def create_app(
         selected_vae_fingerprint: str,
         principal: Principal | None = None,
     ) -> None:
-        # principal set means an authorized world-platform session; D1-D4 apply
-        # only to this branch. principal unset means the legacy showcase route,
-        # whose behavior stays byte-for-byte compatible.
+        # principal set means an authorized world-platform session. Transport,
+        # admission, deadline, and cleanup apply to both roles; business
+        # callbacks and recording belong to primary only. principal unset means
+        # the legacy showcase route, whose behavior stays byte-for-byte compatible.
         await websocket.accept()
+        business_lifecycle_owner = principal is not None and principal.role == "primary"
         sender = _BrowserSender(websocket)
         session_id = uuid4().hex
         generation_id = uuid4().hex
@@ -904,7 +910,7 @@ def create_app(
                         # pseudonym, so behaviour is unchanged before the
                         # world-service rollout.
                         user_id=(
-                            f"wsvc:{principal.lease_key}"
+                            _world_coordinator_user_id(principal)
                             if principal is not None
                             else _user_id(websocket)
                         ),
@@ -944,7 +950,7 @@ def create_app(
                 vae_worker_id=assignment.vae.worker_id,
             )
             if (
-                principal is not None
+                business_lifecycle_owner
                 and principal.record_video
                 and world_session.get("attempt_owner")
             ):
@@ -1135,8 +1141,12 @@ def create_app(
 
                 if not world_session["init_verified"]:
                     # The first frame must be the sealed payload. Unseal failures,
-                    # including tampering or copying across runs, close the session.
-                    init_message = payload_sealer.open(payload, principal.run_id)
+                    # including tampering or copying across runs or roles, close
+                    # the session.
+                    init_message = payload_sealer.open(
+                        payload,
+                        session_payload_aad(principal.run_id, principal.role),
+                    )
                     skills = {}
                     ext = init_message.pop(WORLD_EXT_KEY, None)
                     if isinstance(ext, dict):
@@ -1231,7 +1241,10 @@ def create_app(
                 if kind == "direction":
                     # Raw player instruction. The independent rewrite task later
                     # dispatches kind:"prompt"; forward no bytes here.
-                    if not principal.allow_free_prompt:
+                    if (
+                        principal.role == "comparison"
+                        or not principal.allow_free_prompt
+                    ):
                         # Worlds with free input disabled silently drop instead of
                         # disconnecting. Malicious injection should fail, not help
                         # the attacker end someone else's session.
@@ -1492,7 +1505,7 @@ def create_app(
                 )
                 # D4: after admit and upstream readiness, notify the backend that
                 # the session has started.
-                if world_callbacks is not None:
+                if business_lifecycle_owner and world_callbacks is not None:
                     # Record that this session really came up. Terminal
                     # callbacks carry the flag so the business side can tell
                     # "a live session died" from "a connection attempt that
@@ -1689,7 +1702,7 @@ def create_app(
             # 只有本连接成功完成全局原子 claim 才能修改业务侧 attempt。即使 4xx
             # 明确拒绝了本连接，混合版本下也不能据此否定其它新版副本已经取得 owner。
             if (
-                principal is not None
+                business_lifecycle_owner
                 and world_callbacks is not None
                 and world_session.get("attempt_owner")
             ):
@@ -1795,14 +1808,9 @@ def create_app(
     if world_platform is not None:
         token_replay_guard = TokenReplayGuard()
 
-        @app.websocket("/backends/minwm/v1/realtime_video/authorized_generate")
-        async def authorized_generate(websocket: WebSocket):
-            """Authorized world-platform route.
-
-            It verifies the token, then reuses the shared session logic. Legacy
-            unauthenticated routes continue serving showcase; this route is the
-            only platform entrypoint.
-            """
+        async def _authorized_principal(
+            websocket: WebSocket, *, expected_role: str
+        ) -> Principal | None:
             token = websocket.query_params.get("token") or ""
             try:
                 principal = verify_session_token(token, world_platform.public_key)
@@ -1813,7 +1821,16 @@ def create_app(
                 logger.warning("world token rejected: %s", exc)
                 await websocket.accept()
                 await websocket.close(code=1008, reason="UNAUTHORIZED")
-                return
+                return None
+            if principal.role != expected_role:
+                logger.warning(
+                    "world token used on the wrong route run_id=%s role=%s",
+                    principal.run_id,
+                    principal.role,
+                )
+                await websocket.accept()
+                await websocket.close(code=1008, reason="UNAUTHORIZED")
+                return None
             if not token_replay_guard.consume(principal):
                 # 只有原子消费 jti 的连接才是 attempt owner。重放连接不进入共享
                 # 会话生命周期，因此既不能取得或释放 owner 的 Coordinator 租约，
@@ -1821,11 +1838,38 @@ def create_app(
                 logger.warning("world token replayed run_id=%s", principal.run_id)
                 await websocket.accept()
                 await websocket.close(code=1008, reason="UNAUTHORIZED")
+                return None
+            return principal
+
+        @app.websocket("/backends/minwm/v1/realtime_video/authorized_generate")
+        async def authorized_generate(websocket: WebSocket):
+            """Authorized world-platform route.
+
+            It verifies a primary token, then reuses the shared session logic.
+            Legacy unauthenticated routes continue serving showcase.
+            """
+            principal = await _authorized_principal(websocket, expected_role="primary")
+            if principal is None:
                 return
             await _generate_coordinator_session(
                 websocket,
                 selected_model_revision=model_revision,
                 selected_vae_fingerprint=vae_fingerprint,
+                principal=principal,
+            )
+
+        @app.websocket("/backends/lingbot2/v1/realtime_video/authorized_generate")
+        async def authorized_generate_lingbot2(websocket: WebSocket):
+            """Authorized comparison route using LingBot workers."""
+            principal = await _authorized_principal(
+                websocket, expected_role="comparison"
+            )
+            if principal is None:
+                return
+            await _generate_coordinator_session(
+                websocket,
+                selected_model_revision=lingbot2_model_revision,
+                selected_vae_fingerprint=(lingbot2_vae_fingerprint or vae_fingerprint),
                 principal=principal,
             )
 

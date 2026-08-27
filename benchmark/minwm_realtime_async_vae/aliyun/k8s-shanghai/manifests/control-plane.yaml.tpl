@@ -322,7 +322,9 @@ spec:
               --port=18080
               --coordinator-url=http://zing-coordinator:18081
               --model-revision=${MODEL_REVISION}
+              --lingbot2-model-revision=${LINGBOT2_MODEL_REVISION}
               --vae-fingerprint=taew2_2-d053e216
+              --lingbot2-vae-fingerprint=${LINGBOT2_VAE_FINGERPRINT}
               --internal-output-url=ws://${POD_IP}:18080/v1/internal/realtime_output
               --output-queue-depth=64
               --output-enqueue-timeout-s=0

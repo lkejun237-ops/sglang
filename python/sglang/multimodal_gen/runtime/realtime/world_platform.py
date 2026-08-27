@@ -62,11 +62,28 @@ class Principal:
     # same person can take a second seat while the old session still holds a
     # GPU. Older tokens do not carry this claim and fall back to user_id.
     account_id: str = ""
+    # Missing role is the backwards-compatible primary token shape. Comparison
+    # is explicit so a token cannot acquire the LingBot route by omission.
+    role: str = "primary"
 
     @property
     def lease_key(self) -> str:
         """Identity key for the coordinator lease."""
         return self.account_id or self.user_id
+
+
+def session_payload_aad(run_id: str, role: str) -> str:
+    """Return the role-scoped AES-GCM associated data for a session payload.
+
+    Primary keeps the original run-id-only AAD for backwards compatibility.
+    Comparison adds a fixed domain separator so the two opaque payloads issued
+    for one run cannot be swapped between the Zing and LingBot routes.
+    """
+    if role == "primary":
+        return run_id
+    if role == "comparison":
+        return f"{run_id}:comparison"
+    raise ValueError("session role must be primary or comparison")
 
 
 def _b64url_decode(segment: str) -> bytes:
@@ -110,6 +127,7 @@ def verify_session_token(token: str, public_key: Ed25519PublicKey) -> Principal:
     max_lifetime = session.get("max_lifetime_s")
     allow_free_prompt = session.get("allow_free_prompt")
     record_video = session.get("record_video")
+    role = session.get("role", "primary")
     # bool is a subclass of int in Python, so exact type checks are required.
     # Coercion would turn strings such as "false" into an enabled policy.
     if type(max_lifetime) is not int or max_lifetime <= 0:
@@ -118,6 +136,12 @@ def verify_session_token(token: str, public_key: Ed25519PublicKey) -> Principal:
         raise TokenError("allow_free_prompt must be boolean")
     if type(record_video) is not bool:
         raise TokenError("record_video must be boolean")
+    if type(role) is not str or role not in {"primary", "comparison"}:
+        raise TokenError("session role must be primary or comparison")
+    if role == "comparison" and allow_free_prompt:
+        raise TokenError("comparison sessions must disable free prompt")
+    if role == "comparison" and record_video:
+        raise TokenError("comparison sessions must disable recording")
     raw_jti = claims.get("jti")
     if not isinstance(raw_jti, str):
         raise TokenError("jti must be a UUID")
@@ -131,6 +155,7 @@ def verify_session_token(token: str, public_key: Ed25519PublicKey) -> Principal:
         max_lifetime_s=max_lifetime,
         allow_free_prompt=allow_free_prompt,
         record_video=record_video,
+        role=role,
         # Callback 必须原样回传 token jti；UUID 解析只负责验证，不能在这里
         # 规范化后悄悄改变 attempt_id。
         jti=raw_jti,
@@ -144,8 +169,9 @@ class SessionPayloadSealer:
 
     The AES-GCM key is derived from the service-to-service shared secret with
     HKDF-SHA256. The info label separates this key from HMAC callback signing.
-    The associated data is the run id, so ciphertext copied to another run fails
-    to unseal.
+    The associated data is supplied by the authorized route. Primary uses the
+    run id unchanged; comparison uses ``run_id + ':comparison'``. This binds a
+    payload to both its run and role, so cross-run and cross-route copies fail.
     """
 
     _HKDF_INFO = b"world-service/session-payload/v1"
@@ -158,7 +184,7 @@ class SessionPayloadSealer:
             algorithm=hashes.SHA256(), length=32, salt=None, info=self._HKDF_INFO
         ).derive(shared_secret.encode())
 
-    def open(self, sealed: bytes, run_id: str) -> dict:
+    def open(self, sealed: bytes, associated_data: str) -> dict:
         """Unseal and return the init message; failures raise TokenError."""
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -173,7 +199,7 @@ class SessionPayloadSealer:
             raise TokenError("invalid session payload format")
         try:
             plaintext = AESGCM(self._key).decrypt(
-                sealed[:nonce_size], sealed[nonce_size:], run_id.encode()
+                sealed[:nonce_size], sealed[nonce_size:], associated_data.encode()
             )
         except Exception as exc:  # Normalize InvalidTag and related failures.
             raise TokenError("session payload verification failed") from exc

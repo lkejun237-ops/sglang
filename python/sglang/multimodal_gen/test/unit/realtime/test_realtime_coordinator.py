@@ -4,7 +4,6 @@ import asyncio
 import time
 
 import pytest
-
 from sglang.multimodal_gen.runtime.realtime.coordinator import (
     CoordinatorRejected,
     DynamoDBCoordinatorStore,
@@ -432,6 +431,64 @@ def test_coordinator_rejects_second_session_for_the_same_user():
                 generation_id="generation-b",
                 model_revision="minwm-r1",
                 vae_fingerprint="taew2_2",
+            )
+
+    asyncio.run(run())
+
+
+def test_coordinator_allows_one_primary_and_one_comparison_sublease():
+    async def run():
+        coordinator = RealtimeCoordinator(
+            InMemoryCoordinatorStore(ttl_s=60, worker_ttl_s=30),
+            wait_timeout_s=0,
+        )
+        await coordinator.heartbeat(
+            _heartbeat(
+                "zing-denoiser",
+                "denoiser",
+                model_revision="minwm-r1",
+                vae_fingerprint="taew2_2",
+            )
+        )
+        await coordinator.heartbeat(
+            _heartbeat(
+                "lingbot-denoiser",
+                "denoiser",
+                model_revision="lingbot2-r1",
+                vae_fingerprint="taew2_1",
+            )
+        )
+        await coordinator.heartbeat(
+            _heartbeat("zing-vae", "vae", vae_fingerprint="taew2_2")
+        )
+        await coordinator.heartbeat(
+            _heartbeat("lingbot-vae", "vae", vae_fingerprint="taew2_1")
+        )
+
+        primary = await coordinator.admit(
+            user_id="wsvc:u_player",
+            session_id="session-primary",
+            generation_id="generation-primary",
+            model_revision="minwm-r1",
+            vae_fingerprint="taew2_2",
+        )
+        comparison = await coordinator.admit(
+            user_id="wsvc:u_player:lingbot2",
+            session_id="session-comparison",
+            generation_id="generation-comparison",
+            model_revision="lingbot2-r1",
+            vae_fingerprint="taew2_1",
+        )
+
+        assert primary.user_id == "wsvc:u_player"
+        assert comparison.user_id == "wsvc:u_player:lingbot2"
+        with pytest.raises(CoordinatorRejected, match="USER_SESSION_LIMIT"):
+            await coordinator.admit(
+                user_id="wsvc:u_player:lingbot2",
+                session_id="session-comparison-2",
+                generation_id="generation-comparison-2",
+                model_revision="lingbot2-r1",
+                vae_fingerprint="taew2_1",
             )
 
     asyncio.run(run())
