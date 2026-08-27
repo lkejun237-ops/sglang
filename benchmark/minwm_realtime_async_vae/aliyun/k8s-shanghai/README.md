@@ -37,6 +37,36 @@ The Beijing chain currently advertises `832x480`, H.264 WebSocket playback, and
 single-Zing mode. Shanghai keeps the same gateway/WebUI protocol and changes the
 runtime size to `1280x704`.
 
+## Zing + LingBot Comparison Preflight
+
+The committed control-plane template now gives the shared Gateway the verified
+LingBot routing identity:
+
+```text
+LINGBOT2_MODEL_REVISION=robbyant/lingbot-world-v2-14b-causal-fast-diffusers
+LINGBOT2_VAE_FINGERPRINT=taew2_1-d26151e7
+```
+
+This only makes the authenticated LingBot route routable after compatible
+workers register with the Coordinator. It does not claim that the current GPU
+layout can run both models. The current `zing-denoiser-sp1x7` plus
+`zing-vae-a10` layout consumes all eight GPUs (`0-6` plus `7`). Before enabling
+the world-service comparison switch, the deployment owner must choose and test
+an explicit GPU partition, then add:
+
+- a LingBot Denoiser using the already validated 720P parameters in
+  `benchmark/minwm_realtime_async_vae/k8s/lingbot2-h100-denoiser.yaml`;
+- a LingBot VAE registered with fingerprint `taew2_1-d26151e7`, using
+  `taew2_1.pth` as in `benchmark/minwm_realtime_async_vae/k8s/l4-vae.yaml`;
+- an authoritative person-level capacity source. The current Coordinator
+  exposes model-session counts only, so it cannot truthfully report one person
+  for a Zing + LingBot pair.
+
+Do not guess a GPU split or divide session counts by two. Keep the Admin switch
+off until both worker pools are Ready, a real dual WebSocket run produces
+`1280x704` Zing and exact `1280x720` LingBot output, and `/v1/slots.used_slots`
+increases by exactly one for that pair.
+
 ## Preflight Findings From 2026-08-25
 
 The Lingjun API reports the cluster as:
@@ -158,15 +188,13 @@ the WebUI backend. Enable it per region with `WEBUI_AUTH_ENABLED=true`; keep it
 unset or `false` for regions that should remain unchanged. Sessions are stored
 in Redis, not local process memory.
 
-The machine-to-machine gateway API stays public for the expected integration
-paths:
+The public Caddy route must send only these machine-to-machine paths directly to
+`zing-gateway`; do not use a `/backends/*` wildcard because legacy unauthenticated
+Demo routes remain registered inside the cluster:
 
-- `/v1/models`
+- `/backends/minwm/v1/realtime_video/authorized_generate`
+- `/backends/lingbot2/v1/realtime_video/authorized_generate`
 - `/v1/slots`
-- `/v1/realtime_video/authorized_generate`
-- `/backends/<backend>/v1/models`
-- `/backends/<backend>/v1/slots`
-- `/backends/<backend>/v1/realtime_video/authorized_generate`
 
 Create the Kubernetes secret out of band; do not commit these values. The
 current Shanghai deployment reuses this secret from the WebUI pod:

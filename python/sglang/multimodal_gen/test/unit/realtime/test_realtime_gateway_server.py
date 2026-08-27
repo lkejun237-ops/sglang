@@ -9,7 +9,6 @@ import httpx
 import pytest
 from fastapi import WebSocketDisconnect
 from fastapi.testclient import TestClient
-
 from sglang.multimodal_gen.runtime.entrypoints import realtime_gateway_server
 from sglang.multimodal_gen.runtime.entrypoints.realtime_gateway_server import (
     _WORLD_ERROR_MESSAGES,
@@ -18,6 +17,7 @@ from sglang.multimodal_gen.runtime.entrypoints.realtime_gateway_server import (
     _build_world_platform,
     _parse_args,
     _parse_ui_config,
+    _world_coordinator_user_id,
     _world_error,
     create_app,
 )
@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.realtime.coordinator import (
     SessionAssignment,
     WorkerSlot,
 )
+from sglang.multimodal_gen.runtime.realtime.world_platform import Principal
 
 
 class _Coordinator:
@@ -111,6 +112,23 @@ def test_gateway_exposes_named_minwm_and_lingbot2_backends():
     assert client.get("/backends/lingbot2/v1/models").json()["data"][0]["id"] == (
         "lingbot2-r1"
     )
+
+
+def test_world_sessions_use_independent_role_scoped_subleases():
+    common = {
+        "user_id": "s_per_run",
+        "account_id": "u_player",
+        "run_id": "run-a",
+        "max_lifetime_s": 90,
+        "allow_free_prompt": False,
+        "record_video": False,
+    }
+
+    primary = Principal(**common)
+    comparison = Principal(**common, role="comparison")
+
+    assert _world_coordinator_user_id(primary) == "wsvc:u_player"
+    assert _world_coordinator_user_id(comparison) == "wsvc:u_player:lingbot2"
 
 
 def test_gateway_trace_events_use_the_independent_otlp_log_plane():
@@ -297,6 +315,9 @@ def test_gateway_exposes_slot_capacity_summary_from_coordinator():
         internal_output_url="ws://gateway/v1/internal/realtime_output",
     )
     client = TestClient(app)
+
+    assert sum(route.path == "/v1/slots" for route in app.routes) == 1
+    assert sum(route.path == "/backends/minwm/v1/slots" for route in app.routes) == 1
 
     response = client.get("/v1/slots")
 
