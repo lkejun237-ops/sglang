@@ -50,6 +50,15 @@ object reads belong to the CDN origin, not Gateway. Enable S3 Block Public
 Access, default server-side encryption, and a lifecycle rule that aborts
 incomplete multipart uploads after one day.
 
+The recording queue can be overridden with:
+
+```text
+RUN_VIDEO_RECORDING_QUEUE_MAX_BYTES=16777216
+```
+
+`RUN_VIDEO_RECORDING_QUEUE_MAX_BYTES` is optional and defaults to 16777216
+bytes. It must be at least one S3 multipart part, currently 5242880 bytes.
+
 Only a verified `authorized_generate` token with
 `session.record_video=true` creates a recorder. Session type is not a separate
 recording gate, so Showcase sessions record when their signed policy enables
@@ -62,11 +71,12 @@ s3://<bucket>/runs/<run_id>/video.mp4
 
 The recording path is a fail-open side tap after Gateway output validation. It
 does not proxy through world-service, re-encode media, or wait for S3 before
-forwarding to the browser. Per recording, a 5 MiB byte queue feeds sequential
-5 MiB multipart parts in a dedicated eight-thread S3 executor. The steady raw
-media ceiling is therefore about 10 MiB per active recording, excluding SDK,
-Python-object, and thread-stack overhead. If the queue fills or S3 fails, the
-multipart upload is aborted while realtime playback continues.
+forwarding to the browser. Per recording, a configurable byte queue defaults to
+16 MiB and feeds sequential 5 MiB multipart parts in a dedicated eight-thread
+S3 executor. The default steady raw media ceiling is therefore about 21 MiB per
+active recording, excluding SDK, Python-object, and thread-stack overhead. If
+the queue fills or S3 fails, the multipart upload is aborted while realtime
+playback continues.
 
 Gateway completes an upload only after the final `media_chunk_complete` emitted
 after FFmpeg stdout EOF. The final decoded chunk starts that drain immediately;

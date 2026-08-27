@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import os
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -19,9 +20,28 @@ logger = logging.getLogger(__name__)
 # S3 要求除最后一片外每片至少 5 MiB。直接使用这个下限，让运行期间尽早
 # 上传更多完整 part，并减少收到最终标记后仍需同步上传的尾片。
 PART_SIZE = 5 * 1024 * 1024
-QUEUE_MAX_BYTES = 5 * 1024 * 1024
+DEFAULT_QUEUE_MAX_BYTES = 16 * 1024 * 1024
+QUEUE_MAX_BYTES_ENV = "RUN_VIDEO_RECORDING_QUEUE_MAX_BYTES"
 S3_WORKER_THREADS = 8
 SHUTDOWN_DRAIN_SECONDS = 10.0
+
+
+def _load_recording_queue_max_bytes() -> int:
+    raw = os.getenv(QUEUE_MAX_BYTES_ENV)
+    if raw is None or raw.strip() == "":
+        return DEFAULT_QUEUE_MAX_BYTES
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{QUEUE_MAX_BYTES_ENV} must be an integer number of bytes"
+        ) from exc
+    if value < PART_SIZE:
+        raise ValueError(f"{QUEUE_MAX_BYTES_ENV} must be at least {PART_SIZE} bytes")
+    return value
+
+
+QUEUE_MAX_BYTES = _load_recording_queue_max_bytes()
 
 RECORDING_SESSIONS_TOTAL = Counter(
     "world_recording_sessions_total",
@@ -46,6 +66,8 @@ RECORDING_SESSION_PEAK_BUFFER_BYTES = Histogram(
         2 * 1024 * 1024,
         4 * 1024 * 1024,
         8 * 1024 * 1024,
+        16 * 1024 * 1024,
+        32 * 1024 * 1024,
     ),
 )
 RECORDING_UPLOAD_BYTES_TOTAL = Counter(
