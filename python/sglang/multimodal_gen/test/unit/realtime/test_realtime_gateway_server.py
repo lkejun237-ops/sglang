@@ -350,6 +350,49 @@ def test_gateway_exposes_slot_capacity_summary_from_coordinator():
     assert client.get("/backends/minwm/v1/slots").json() == response.json()
 
 
+def test_gateway_slot_capacity_top_level_counts_online_users_for_dual_models():
+    app = create_app(
+        _Coordinator(
+            capacity={
+                "observed_at": 42.0,
+                "roles": {
+                    "denoiser": {
+                        "waiting_sessions": 0,
+                        "active_sessions": 2,
+                        "queued_sessions": 0,
+                        "free_slots": 2,
+                        "draining_workers": 0,
+                    },
+                    "vae": {
+                        "waiting_sessions": 0,
+                        "active_sessions": 2,
+                        "queued_sessions": 0,
+                        "free_slots": 2,
+                        "draining_workers": 0,
+                    },
+                },
+            }
+        ),
+        model_revision="minwm-r1",
+        vae_fingerprint="taew2_2",
+        internal_output_url="ws://gateway/v1/internal/realtime_output",
+        ui_config={"modelSlots": ["minwm", "lingbot2"]},
+    )
+    client = TestClient(app)
+
+    response = client.get("/v1/slots")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["used_slots"] == 1
+    assert body["free_slots"] == 1
+    assert body["total_slots"] == 2
+    assert body["roles"]["denoiser"]["used_slots"] == 1
+    assert body["roles"]["denoiser"]["free_slots"] == 1
+    assert body["roles"]["denoiser"]["total_slots"] == 2
+    assert client.get("/backends/minwm/v1/slots").json() == body
+
+
 def test_gateway_slot_capacity_returns_503_when_coordinator_is_unavailable():
     app = create_app(
         _Coordinator(capacity=RuntimeError("coordinator unavailable")),

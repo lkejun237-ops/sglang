@@ -328,7 +328,26 @@ def _nonnegative_int(value: Any) -> int:
         return 0
 
 
-def _slot_capacity_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
+def _ceil_div(value: int, divisor: int) -> int:
+    return (value + divisor - 1) // divisor
+
+
+def _online_slot_cost_from_ui_config(ui_config: dict[str, Any] | None) -> int:
+    if not isinstance(ui_config, dict):
+        return 1
+    model_slots = ui_config.get("modelSlots")
+    if not isinstance(model_slots, list):
+        return 1
+    configured_slots = {
+        str(slot).strip() for slot in model_slots if str(slot).strip()
+    }
+    return max(1, len(configured_slots))
+
+
+def _slot_capacity_summary(
+    snapshot: dict[str, Any], *, online_slot_cost: int = 1
+) -> dict[str, Any]:
+    online_slot_cost = max(1, int(online_slot_cost))
     role_summaries: dict[str, dict[str, int]] = {}
     for role, values in sorted((snapshot.get("roles") or {}).items()):
         if not isinstance(values, dict):
@@ -336,9 +355,9 @@ def _slot_capacity_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
         used_slots = _nonnegative_int(values.get("active_sessions"))
         free_slots = _nonnegative_int(values.get("free_slots"))
         role_summaries[role] = {
-            "used_slots": used_slots,
-            "free_slots": free_slots,
-            "total_slots": used_slots + free_slots,
+            "used_slots": _ceil_div(used_slots, online_slot_cost),
+            "free_slots": free_slots // online_slot_cost,
+            "total_slots": (used_slots + free_slots) // online_slot_cost,
             "waiting_sessions": _nonnegative_int(values.get("waiting_sessions")),
             "queued_sessions": _nonnegative_int(values.get("queued_sessions")),
             "draining_workers": _nonnegative_int(values.get("draining_workers")),
@@ -630,6 +649,7 @@ def create_app(
     app.state.recording_manager = recording_manager
     webui_base_url = (world_studio_webui_base_url or "").strip().rstrip("/")
     last_coordinator_ready_at: float | None = None
+    online_slot_cost = _online_slot_cost_from_ui_config(ui_config)
 
     @app.get("/healthz")
     async def healthz():
@@ -668,7 +688,9 @@ def create_app(
     @app.get("/v1/slots")
     async def slots():
         try:
-            return _slot_capacity_summary(await coordinator.capacity())
+            return _slot_capacity_summary(
+                await coordinator.capacity(), online_slot_cost=online_slot_cost
+            )
         except Exception as exc:
             raise HTTPException(
                 status_code=503, detail="coordinator capacity unavailable"

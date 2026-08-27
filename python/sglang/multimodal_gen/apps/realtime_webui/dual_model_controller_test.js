@@ -39,7 +39,6 @@ async function main() {
         wsUrl: "/backends/lingbot2/generate",
         transformInit: (init) => ({
           ...init,
-          size: init.size === "1280x704" ? "1280x720" : init.size,
           realtime_causal_sink_size: 3,
           realtime_causal_kv_cache_num_frames: 12,
         }),
@@ -63,7 +62,7 @@ async function main() {
   assert.equal(minwm.connectCalls[0].init.size, "1280x704");
   assert.equal(minwm.connectCalls[0].init.realtime_causal_sink_size, 9);
   assert.equal(minwm.connectCalls[0].init.realtime_causal_kv_cache_num_frames, 18);
-  assert.equal(lingbot2.connectCalls[0].init.size, "1280x720");
+  assert.equal(lingbot2.connectCalls[0].init.size, "1280x704");
   assert.equal(lingbot2.connectCalls[0].init.realtime_causal_sink_size, 3);
   assert.equal(lingbot2.connectCalls[0].init.realtime_causal_kv_cache_num_frames, 12);
   assert.equal(minwm.connectCalls[0].url, "/backends/minwm/generate");

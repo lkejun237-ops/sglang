@@ -1273,12 +1273,7 @@ const dualModelController = new DualModelController({
           ...modelParams,
           realtime_interactive_event_grace_ms: 1800,
         };
-        const is720p = interactiveInit.size === "1280x704" || interactiveInit.size === "1280x720";
-        if (!is720p) return interactiveInit;
-        return {
-          ...interactiveInit,
-          size: "1280x720",
-        };
+        return interactiveInit;
       },
       enabled: (init) => modelSelected("lingbot2") && init.generation_mode !== "t2v",
       unavailableReason: "T2V unavailable",
