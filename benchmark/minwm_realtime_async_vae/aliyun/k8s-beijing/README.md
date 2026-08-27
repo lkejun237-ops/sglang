@@ -92,6 +92,9 @@ The worker template preserves the current Zing constraints:
 
 - 480p UI (`832x480`)
 - default target FPS `24`
+- H.264 bitrate defaults to `3000` kbps for 480p and `6500` kbps for
+  `*x704`/`*x720` profiles; override `H264_BITRATE_KBPS` when a deployment needs
+  a different quality/bandwidth tradeoff.
 - causal sink/window `8/32`
 - `--attention-backend fa`
 - `MINWM_ATTENTION_IMPL=packed`

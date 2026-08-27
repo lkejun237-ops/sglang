@@ -1439,7 +1439,7 @@ spec:
             - --direct-h264-trigger-output-format=jpeg
             - --h264-ffmpeg-bin=${H264_FFMPEG_BIN}
             - --h264-fps=${REALTIME_TARGET_FPS}
-            - --h264-bitrate-kbps=3000
+            - --h264-bitrate-kbps=${H264_BITRATE_KBPS}
             - --h264-crf=20
             - --h264-preset=fast
             - --h264-gop-seconds=2
