@@ -8,6 +8,7 @@ import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.runtime.entrypoints import realtime_vae_server
 from sglang.multimodal_gen.runtime.entrypoints.http_server import (
     create_app as create_denoiser_app,
@@ -419,6 +420,7 @@ def test_vae_direct_output_sends_authoritative_media_completion(monkeypatch):
                     num_frames=1,
                     queue_wait_ms=1.0,
                     decode_ms=2.0,
+                    post_decode_ms=0.0,
                     encode_ms=3.0,
                 )
             )
@@ -528,7 +530,11 @@ def test_denoiser_gateway_open_consumes_matching_reservation():
 
 def test_denoiser_fastapi_exposes_worker_reservation_control_plane(monkeypatch):
     monkeypatch.setenv("WORKER_EPOCH", "denoiser-epoch")
-    app = create_denoiser_app(SimpleNamespace(realtime_max_sessions_per_worker=4))
+    app = create_denoiser_app(
+        SimpleNamespace(
+            realtime_max_sessions_per_worker=4, pipeline_config=PipelineConfig()
+        )
+    )
 
     paths = {route.path for route in app.routes if hasattr(route, "path")}
     assert {
@@ -547,21 +553,17 @@ def test_denoiser_health_returns_503_when_reservation_watchdog_failed():
         SimpleNamespace(
             realtime_max_sessions_per_worker=4,
             realtime_worker_max_consumed_age_s=0.0,
+            pipeline_config=PipelineConfig(),
         )
     )
     app.state.worker_reservations._lifecycle = "failed"
-    endpoint = next(
-        route.endpoint
-        for route in app.routes
-        if getattr(route, "path", None) == "/health"
-        and "GET" in getattr(route, "methods", set())
-    )
-    request = SimpleNamespace(app=SimpleNamespace(state=app.state))
-
-    with pytest.raises(HTTPException) as exc_info:
-        asyncio.run(endpoint(request))
-    assert exc_info.value.status_code == 503
-    assert exc_info.value.detail["status"] == "failed"
+    app.state.server_warmup_done = asyncio.Event()
+    app.state.server_warmup_done.set()
+    # Avoid starting the model-serving lifespan in this HTTP contract test.
+    client = TestClient(app)
+    response = client.get("/health")
+    assert response.status_code == 503
+    assert response.json()["detail"]["status"] == "failed"
 
 
 def test_vae_health_returns_503_when_reservation_watchdog_failed():
@@ -736,7 +738,11 @@ def test_worker_runtime_load_tracks_pending_blocked_runnable_and_service_time():
 
 def test_denoiser_registry_reports_real_session_load_instead_of_zero_defaults():
     async def run():
-        app = create_denoiser_app(SimpleNamespace(realtime_max_sessions_per_worker=2))
+        app = create_denoiser_app(
+            SimpleNamespace(
+                realtime_max_sessions_per_worker=2, pipeline_config=PipelineConfig()
+            )
+        )
         registry = app.state.worker_reservations
         await registry.reserve(
             "token-a",

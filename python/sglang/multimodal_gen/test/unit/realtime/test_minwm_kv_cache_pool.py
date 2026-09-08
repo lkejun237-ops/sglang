@@ -152,7 +152,7 @@ def test_minwm_pool_is_fully_allocated_during_stage_initialization(monkeypatch):
     )
     stage = MinWMCausalDMDDenoisingStage.__new__(MinWMCausalDMDDenoisingStage)
     stage.transformer = SimpleNamespace(
-        config=SimpleNamespace(arch_config=arch_config),
+        config=arch_config,
         num_attention_heads=4,
         attention_head_dim=8,
     )

@@ -16,6 +16,9 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
@@ -106,12 +109,15 @@ class RealtimeTextState(BaseRealtimeState):
 class RealtimeTextEncodingStage(TextEncodingStage):
     """Cache text encoder outputs across realtime chunks by prompt identity."""
 
-    def component_uses(self, server_args: ServerArgs, stage_name: str | None = None):
-        uses = super().component_uses(server_args, stage_name)
-        if getattr(server_args, "text_encoder_cpu_offload", False):
-            # Realtime sessions cache prompt embeddings. Keep the opt-in CPU
-            # residency effective after a cache miss instead of eagerly moving
-            # the encoder back for every subsequent cached chunk.
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        # Cached prompts do not enter the encoder component use site.
+        uses = [
+            replace(use, start_at_stage_entry=False)
+            for use in super().component_uses(server_args, stage_name)
+        ]
+        if server_args.text_encoder_cpu_offload:
             return [
                 replace(
                     use,

@@ -301,8 +301,7 @@ class MinWMChunkLatentPreparationStage(PipelineStage):
             return batch
         condition = batch.image_latent
         chunk_size = int(
-            batch.realtime_chunk_size
-            or self.transformer.config.arch_config.num_frames_per_block
+            batch.realtime_chunk_size or self.transformer.config.num_frames_per_block
         )
         generator = (
             batch.generator[0] if isinstance(batch.generator, list) else batch.generator
@@ -322,7 +321,7 @@ class MinWMChunkLatentPreparationStage(PipelineStage):
             latent_width = int(batch.width) // spatial_factor
             latent_dtype = batch.prompt_embeds[0].dtype
         shape_tail = (
-            self.transformer.config.arch_config.out_channels,
+            self.transformer.config.out_channels,
             latent_height,
             latent_width,
         )
@@ -356,12 +355,8 @@ class MinWMChunkLatentPreparationStage(PipelineStage):
                 if total_latent_frames is not None:
                     generated_frames = int(total_latent_frames)
                 elif condition is None:
-                    first_block = int(
-                        self.transformer.config.arch_config.num_frame_first_block
-                    )
-                    regular_block = int(
-                        self.transformer.config.arch_config.num_frames_per_block
-                    )
+                    first_block = int(self.transformer.config.num_frame_first_block)
+                    regular_block = int(self.transformer.config.num_frames_per_block)
                     generated_frames = first_block + regular_block * (
                         int(total_chunks or 1) - 1
                     )
@@ -522,8 +517,8 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         spatial_factor = int(
             pipeline_config.vae_config.arch_config.scale_factor_spatial
         )
-        patch_height = int(self.transformer.config.arch_config.patch_size[-2])
-        patch_width = int(self.transformer.config.arch_config.patch_size[-1])
+        patch_height = int(self.transformer.config.patch_size[-2])
+        patch_width = int(self.transformer.config.patch_size[-1])
         bucket_policies: dict[str, CausalDMDCachePolicy] = {}
         bucket_shapes: dict[str, tuple[int, int, int]] = {}
         bucket_log_details: list[dict[str, Any]] = []
@@ -757,7 +752,7 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                 None,
             )
         super()._apply_causal_cache_overrides(batch, server_args)
-        arch_config = self.transformer.config.arch_config
+        arch_config = self.transformer.config
         self._minwm_unbounded_cache = (
             explicit_window is None and int(arch_config.local_attn_size) == -1
         )
@@ -780,18 +775,14 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                     self.num_frames_per_block
                 )
             else:
-                first_block = int(
-                    self.transformer.config.arch_config.num_frame_first_block
-                )
+                first_block = int(self.transformer.config.num_frame_first_block)
                 self.sliding_window_num_frames = first_block + (
                     int(total_chunks) - 1
                 ) * int(self.num_frames_per_block)
 
     def _reset_causal_cache_config_defaults(self) -> None:
         """Prevent request-local sink/window overrides from leaking to the next session."""
-        arch_config = getattr(
-            getattr(self.transformer, "config", None), "arch_config", None
-        )
+        arch_config = getattr(self.transformer, "config", None)
         if arch_config is None:
             return
         if hasattr(arch_config, "sink_size"):
@@ -800,9 +791,7 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             self.sliding_window_num_frames = int(arch_config.sliding_window_num_frames)
 
     def _causal_kv_cache_kwargs(self, policy: CausalDMDCachePolicy) -> dict:
-        arch_config = getattr(
-            getattr(self.transformer, "config", None), "arch_config", None
-        )
+        arch_config = getattr(self.transformer, "config", None)
         cache_kwargs = {
             "sequence_shard_enabled": policy.sequence_shard_enabled,
             "kv_cache_size": policy.expected_cache_tokens,
@@ -1071,7 +1060,7 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         history = state.runtime_cache.get(MINWM_ACTION_HISTORY_CACHE)
         if history is None:
             raise ValueError("MinWM action history is missing for a continued session")
-        history_frames = int(self.transformer.config.arch_config.action_history_frames)
+        history_frames = int(self.transformer.config.action_history_frames)
 
         if weight_windows is not None:
             expected_frames = int(batch.latents.shape[2])
@@ -1125,7 +1114,7 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         if getattr(self, "_runtime_alignment_logged", False):
             return
 
-        arch_config = self.transformer.config.arch_config
+        arch_config = self.transformer.config
         caches = cache_ctx.kv_cache
         sequence_shard_enabled = self._causal_sequence_shard_enabled(batch)
         expected_cache_tokens = self._get_causal_kv_cache_size(
@@ -1536,7 +1525,7 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
     ) -> None:
         history = cache_ctx.cache_state.runtime_cache[MINWM_ACTION_HISTORY_CACHE]
         current = pos_cond_kwargs["action"][:, -num_frames:]
-        history_frames = int(self.transformer.config.arch_config.action_history_frames)
+        history_frames = int(self.transformer.config.action_history_frames)
         cache_ctx.cache_state.runtime_cache[MINWM_ACTION_HISTORY_CACHE] = torch.cat(
             [history, current], dim=1
         )[:, -history_frames:]

@@ -175,7 +175,7 @@ def test_software_validation_rejects_excluded_distribution(monkeypatch, unexpect
 
 
 def test_fa3_compat_omits_unsupported_default_keywords():
-    from sglang.jit_kernel.flash_attention_v3 import _call_fa3_kernel
+    from sglang.kernels.ops.attention.flash_attention_v3 import _call_fa3_kernel
 
     calls = []
 
@@ -188,7 +188,7 @@ def test_fa3_compat_omits_unsupported_default_keywords():
 
 
 def test_fa3_compat_forwards_supported_nondefault_only_qv():
-    from sglang.jit_kernel.flash_attention_v3 import _call_fa3_kernel
+    from sglang.kernels.ops.attention.flash_attention_v3 import _call_fa3_kernel
 
     def modern_kernel(*, only_qv=False):
         return only_qv
@@ -197,7 +197,7 @@ def test_fa3_compat_forwards_supported_nondefault_only_qv():
 
 
 def test_fa3_compat_rejects_unsupported_nondefault_only_qv():
-    from sglang.jit_kernel.flash_attention_v3 import _call_fa3_kernel
+    from sglang.kernels.ops.attention.flash_attention_v3 import _call_fa3_kernel
 
     def legacy_kernel():
         return None
@@ -207,7 +207,7 @@ def test_fa3_compat_rejects_unsupported_nondefault_only_qv():
 
 
 def test_fa3_locked_loader_uses_cached_snapshot(tmp_path, monkeypatch):
-    from sglang.jit_kernel.flash_attention_v3 import _load_locked_fa3_kernel
+    from sglang.kernels.ops.attention.flash_attention_v3 import _load_locked_fa3_kernel
 
     revision = "15c17db0bf9ce6599db795fa02a8f27467c92860"
     variant = "torch211-cxx11-cu130-x86_64-linux"
@@ -269,7 +269,7 @@ def test_fa3_locked_loader_uses_cached_snapshot(tmp_path, monkeypatch):
 
 
 def test_fa3_locked_loader_requires_cached_variant(tmp_path, monkeypatch):
-    from sglang.jit_kernel.flash_attention_v3 import _load_locked_fa3_kernel
+    from sglang.kernels.ops.attention.flash_attention_v3 import _load_locked_fa3_kernel
 
     lockfile = tmp_path / "kernels.lock"
     lockfile.write_text(

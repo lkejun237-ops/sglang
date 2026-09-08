@@ -16,6 +16,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
     LingBotWorldCausalDMDConfig,
     _actions_to_c2ws,
 )
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+    ReplaceQueuedRealtimeReq,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeEvent,
     RealtimeVideoGenerationsRequest,
@@ -41,9 +44,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_a
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
     get_realtime_model_adapter,
-)
-from sglang.multimodal_gen.runtime.entrypoints.utils import (
-    ReplaceQueuedRealtimeReq,
+    has_realtime_model_adapter,
 )
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
@@ -418,7 +419,7 @@ def test_scheduler_session_release_has_a_short_per_attempt_timeout(monkeypatch):
 def test_lingbot_realtime_state_uses_control_script_and_prompt_queues():
     state = lingbot_realtime.LingBotWorldRealtimeState()
 
-    assert state.sample_camera_actions(3) == [[], [], []]
+    assert state.sample_camera_actions(3) is None
     state.receive_camera_action_script([["w"], ["a"], ["s"], ["d"]])
     assert state.sample_camera_actions(3) == [["w"], ["a"], ["s"]]
     assert state.sample_camera_actions(3) == [["d"], [], []]
@@ -625,7 +626,7 @@ def test_lingbot_realtime_adapter_rejects_composite_input_atomically():
 
     state = adapter._state(session)
     assert not state.has_prompt()
-    assert state.sample_camera_actions(3) == [[], [], []]
+    assert state.sample_camera_actions(3) is None
 
 
 def test_lingbot_realtime_prompt_event_marks_crossattn_reset():
@@ -1976,6 +1977,7 @@ def test_realtime_input_validation_reuses_generator_across_chunks():
 def test_realtime_registry_resolves_lingbot_adapter():
     server_args = SimpleNamespace(pipeline_config=LingBotWorldCausalDMDConfig())
 
+    assert has_realtime_model_adapter(server_args)
     adapter = get_realtime_model_adapter(server_args)
 
     assert isinstance(adapter, lingbot_realtime.LingBotWorldRealtimeAdapter)
@@ -2008,9 +2010,7 @@ def test_realtime_chunk_latent_preparation_uses_chunk_spec():
     )
 
     transformer = SimpleNamespace(
-        config=SimpleNamespace(
-            arch_config=SimpleNamespace(out_channels=16, num_frames_per_block=3)
-        )
+        config=SimpleNamespace(out_channels=16, num_frames_per_block=3)
     )
     stage = RealtimeChunkLatentPreparationStage.__new__(
         RealtimeChunkLatentPreparationStage

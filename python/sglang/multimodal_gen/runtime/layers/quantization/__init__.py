@@ -8,6 +8,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 
 QuantizationMethods = Literal[
+    "auto-round",
     "fp8",
     "modelopt",
     "modelopt_fp8",
@@ -17,6 +18,7 @@ QuantizationMethods = Literal[
     "mxfp8",
     "mxfp4",
     "mxfp4_npu",
+    "kitchen_int8",
 ]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
@@ -25,6 +27,14 @@ QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 # unquantized diffusion model depend on unrelated SRT/LLM kernels and their
 # Transformers version.
 _BUILTIN_METHOD_TO_QUANT_CONFIG = {
+    "auto-round": (
+        "sglang.multimodal_gen.runtime.layers.quantization.auto_round",
+        "AutoRoundConfig",
+    ),
+    "kitchen_int8": (
+        "sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config",
+        "KitchenInt8Config",
+    ),
     "modelopt": (
         "sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8",
         "ModelOptFp8Config",
@@ -54,7 +64,7 @@ _BUILTIN_METHOD_TO_QUANT_CONFIG = {
         "Mxfp4Config",
     ),
     "mxfp8": (
-        "sglang.multimodal_gen.runtime.layers.quantization.mxfp8_npu",
+        "sglang.multimodal_gen.runtime.layers.quantization.mxfp8",
         "MXFP8Config",
     ),
     "mxfp4_npu": (
@@ -84,7 +94,7 @@ def register_quantization_config(quantization: str):
             )
         if not issubclass(quant_config_cls, QuantizationConfig):
             raise ValueError(
-                "The quantization config must be a subclass of " "`QuantizationConfig`."
+                "The quantization config must be a subclass of `QuantizationConfig`."
             )
         _CUSTOMIZED_METHOD_TO_QUANT_CONFIG[quantization] = quant_config_cls
         QUANTIZATION_METHODS.append(quantization)

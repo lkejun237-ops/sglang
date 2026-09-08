@@ -50,7 +50,7 @@ REQUIRED_MODULE_SPECS = (
     "flash_attn.cute",
     "kernels",
     "sgl_kernel.flash_attn",
-    "sglang.jit_kernel.flash_attention_v3",
+    "sglang.kernels.ops.attention.flash_attention_v3",
     "sglang.multimodal_gen.runtime.layers.quantization.fp8",
     "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant",
     "taehv",
@@ -518,7 +518,7 @@ def _run_ffn_kernel_smoke(family: str) -> list[dict[str, Any]]:
 def _fa3_provider_info() -> dict[str, Any]:
     from sgl_kernel.flash_attn import flash_attn_varlen_func as fallback_function
 
-    from sglang.jit_kernel.flash_attention_v3 import _load_fa3_kernels
+    from sglang.kernels.ops.attention.flash_attention_v3 import _load_fa3_kernels
 
     function = _load_fa3_kernels()["flash_attn_varlen_func"]
     fallback = function is fallback_function
@@ -601,7 +601,7 @@ def collect_contract(
         errors.append(f"SM12x device name {name!r} is not an RTX GPU")
 
     required_import = (
-        "sglang.jit_kernel.flash_attention_v3"
+        "sglang.kernels.ops.attention.flash_attention_v3"
         if family == "hopper"
         else "flash_attn.cute"
     )

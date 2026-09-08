@@ -46,6 +46,20 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import get_dit_gro
 _original_similarity = None
 
 
+def disable_cache_on_transformer(transformer: torch.nn.Module) -> torch.nn.Module:
+    """Remove Cache-DiT hooks so subsequent requests use the native forward."""
+
+    logger.info("Disabling cache-dit on %s", type(transformer).__name__)
+    target = getattr(transformer, "_sglang_cache_dit_adapter", transformer)
+    cache_dit.disable_cache(target)
+    if target is not transformer:
+        del transformer._sglang_cache_dit_adapter
+    for name in ("_is_parallelized", "_parallelism_config"):
+        if hasattr(transformer, name):
+            delattr(transformer, name)
+    return transformer
+
+
 def _patch_cache_dit_similarity():
     from cache_dit.caching.cache_contexts import cache_manager
 
@@ -71,7 +85,9 @@ def _patch_cache_dit_similarity():
         tp_sp_group = getattr(self, "_sglang_tp_sp_group", None)
         target_group = tp_sp_group or sp_group or tp_group
 
-        if target_group is None:
+        # Averaging over a one-rank group returns the input, so skip the
+        # collective rather than pay for a round trip that cannot change it.
+        if target_group is None or dist.get_world_size(target_group) == 1:
             return _original_similarity(
                 self,
                 t1,
@@ -186,6 +202,75 @@ def get_scm_mask(
     return mask
 
 
+# Keys accepted in SamplingParams.cache_dit_params; "secondary" nests the
+# DBCache knobs for the second transformer of dual-DiT models.
+CACHE_DIT_REQUEST_KNOB_KEYS = frozenset(
+    {
+        "Fn_compute_blocks",
+        "Bn_compute_blocks",
+        "max_warmup_steps",
+        "residual_diff_threshold",
+        "max_continuous_cached_steps",
+        "enable_taylorseer",
+        "taylorseer_order",
+    }
+)
+CACHE_DIT_REQUEST_SCM_KEYS = frozenset(
+    {
+        "scm_preset",
+        "scm_compute_bins",
+        "scm_cache_bins",
+        "scm_policy",
+    }
+)
+CACHE_DIT_REQUEST_PARAM_KEYS = (
+    CACHE_DIT_REQUEST_KNOB_KEYS | CACHE_DIT_REQUEST_SCM_KEYS | {"secondary"}
+)
+
+
+def resolve_cache_dit_request_overrides(raw: dict | None) -> dict:
+    """Validate cache_dit_params and return a copy; unknown keys fail the request."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"cache_dit_params must be a dict, got {type(raw).__name__}.")
+    unknown = set(raw) - CACHE_DIT_REQUEST_PARAM_KEYS
+    if unknown:
+        raise ValueError(
+            f"Unknown cache_dit_params keys: {sorted(unknown)}. "
+            f"Valid keys: {sorted(CACHE_DIT_REQUEST_PARAM_KEYS)}."
+        )
+    overrides = dict(raw)
+    secondary = overrides.get("secondary")
+    if secondary is not None:
+        if not isinstance(secondary, dict):
+            raise ValueError(
+                "cache_dit_params['secondary'] must be a dict, got "
+                f"{type(secondary).__name__}."
+            )
+        unknown = set(secondary) - CACHE_DIT_REQUEST_KNOB_KEYS
+        if unknown:
+            raise ValueError(
+                f"Unknown cache_dit_params['secondary'] keys: {sorted(unknown)}. "
+                f"Valid keys: {sorted(CACHE_DIT_REQUEST_KNOB_KEYS)}."
+            )
+        overrides["secondary"] = dict(secondary)
+    return overrides
+
+
+def cache_dit_overrides_key(overrides: dict) -> tuple:
+    """Hashable snapshot of request overrides, for mount-change detection."""
+
+    def _freeze(value):
+        if isinstance(value, dict):
+            return tuple(sorted((k, _freeze(v)) for k, v in value.items()))
+        if isinstance(value, (list, tuple)):
+            return tuple(_freeze(v) for v in value)
+        return value
+
+    return _freeze(overrides)
+
+
 @dataclass
 class CacheDitConfig:
     """Configuration for cache-dit integration.
@@ -230,16 +315,68 @@ class CacheDitConfig:
     steps_computation_policy: str = "dynamic"
 
 
-# Custom BlockAdapter for DiT models absent from cache-dit's BlockAdapterRegister.
-# Value: (blocks attr, forward_pattern). forward_pattern must
-# match the block's forward signature (see cache_dit.ForwardPattern; e.g., ERNIE
-# uses Pattern_3). has_separate_cfg follows the run (passed by
-# enable_cache_on_transformer); cache-dit auto-resolves the remaining
-# fields.
-_CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, tuple[str, ForwardPattern]] = (
+@dataclass(frozen=True)
+class DualTransformerBlockAdapterSpec:
+    """BlockAdapter metadata for dual-transformer DiT pipelines.
+
+    This describes the cache-dit-facing structure of a pair of transformers.
+    The denoising loop semantics live in DenoisingStage; this spec only covers
+    how cache-dit should find blocks and interpret each block's forward.
+    """
+
+    blocks_attr: tuple[str, str]
+    blocks_name: Optional[List[str]]
+    forward_pattern: List[ForwardPattern]
+    check_forward_pattern: bool
+    check_num_outputs: bool
+    has_separate_cfg: bool
+
+
+DUAL_TRANSFORMER_BLOCK_ADAPTER_SPECS: dict[str, DualTransformerBlockAdapterSpec] = (
     {
-        "ErnieImageTransformer2DModel": ("layers", ForwardPattern.Pattern_3),
-        "Krea2Transformer2DModel": ("transformer_blocks", ForwardPattern.Pattern_3),
+        "wan2.2": DualTransformerBlockAdapterSpec(
+            blocks_attr=("blocks", "blocks"),
+            blocks_name=None,
+            forward_pattern=[ForwardPattern.Pattern_2, ForwardPattern.Pattern_2],
+            check_forward_pattern=True,
+            check_num_outputs=False,
+            has_separate_cfg=True,
+        ),
+        "ideogram4": DualTransformerBlockAdapterSpec(
+            blocks_attr=("layers", "layers"),
+            blocks_name=["layers", "layers"],
+            forward_pattern=[ForwardPattern.Pattern_3, ForwardPattern.Pattern_3],
+            check_forward_pattern=False,
+            check_num_outputs=False,
+            has_separate_cfg=False,
+        ),
+    }
+    if _CACHE_DIT_ENABLED
+    else {}
+)
+
+
+@dataclass(frozen=True)
+class CustomBlockAdapterSpec:
+    blocks_attr: str
+    forward_pattern: ForwardPattern
+
+
+# Custom BlockAdapter metadata for models absent from cache-dit's registry.
+_CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, CustomBlockAdapterSpec] = (
+    {
+        "ErnieImageTransformer2DModel": CustomBlockAdapterSpec(
+            blocks_attr="layers",
+            forward_pattern=ForwardPattern.Pattern_3,
+        ),
+        "Krea2Transformer2DModel": CustomBlockAdapterSpec(
+            blocks_attr="transformer_blocks",
+            forward_pattern=ForwardPattern.Pattern_3,
+        ),
+        "MiniMaxH3DiTModel": CustomBlockAdapterSpec(
+            blocks_attr="blocks",
+            forward_pattern=ForwardPattern.Pattern_3,
+        ),
     }
     if _CACHE_DIT_ENABLED
     else {}
@@ -255,17 +392,16 @@ def _build_custom_block_adapter(
     spec = _CUSTOM_BLOCK_ADAPTER_SPECS.get(transformer.__class__.__name__)
     if spec is None:
         return None
-    blocks_attr, forward_pattern = spec
-    blocks = getattr(transformer, blocks_attr, None)
+    blocks = getattr(transformer, spec.blocks_attr, None)
     if blocks is None:
         raise ValueError(
             f"Transformer {transformer.__class__.__name__} has no attribute "
-            f"{blocks_attr!r} for cache-dit blocks."
+            f"{spec.blocks_attr!r} for cache-dit blocks."
         )
     return BlockAdapter(
         transformer=transformer,
         blocks=blocks,
-        forward_pattern=forward_pattern,
+        forward_pattern=spec.forward_pattern,
         has_separate_cfg=has_separate_cfg,
     )
 
@@ -387,6 +523,8 @@ def enable_cache_on_transformer(
         calibrator_config=calibrator_config,
         parallelism_config=None,
     )
+    if custom_adapter is not None:
+        transformer._sglang_cache_dit_adapter = custom_adapter
 
     if parallelism_config is not None:
         context_manager = getattr(transformer, "_context_manager", None)
@@ -416,9 +554,10 @@ def enable_cache_on_dual_transformer(
 ) -> tuple[torch.nn.Module, torch.nn.Module]:
     """Enable cache-dit on dual transformers using BlockAdapter.
 
-    For models with two transformers (high-noise expert and low-noise expert),
-    cache-dit requires enabling cache on both simultaneously via BlockAdapter.
-    This cannot be done by calling enable_cache separately on each transformer.
+    For models with two transformers, cache-dit requires enabling cache on both
+    simultaneously via BlockAdapter. The two transformers may be split by denoising
+    range, or run as paired conditional/unconditional branches. This cannot be done
+    by calling enable_cache separately on each transformer.
 
     Args:
         primary_config: CacheDitConfig for primary transformer.
@@ -426,14 +565,11 @@ def enable_cache_on_dual_transformer(
         sp_group: Sequence parallel process group (for Ulysses/Ring).
         tp_group: Tensor parallel process group.
     """
-    _supported_dual_transformer_models = [
-        "wan2.2",
-        "ideogram4",
-    ]
-    if model_name not in _supported_dual_transformer_models:
+    adapter_spec = DUAL_TRANSFORMER_BLOCK_ADAPTER_SPECS.get(model_name)
+    if adapter_spec is None:
         raise ValueError(
             f"Dual-transformer cache-dit is only supported for "
-            f"{_supported_dual_transformer_models}, got {model_name}."
+            f"{sorted(DUAL_TRANSFORMER_BLOCK_ADAPTER_SPECS)}, got {model_name}."
         )
 
     if not primary_config.enabled:
@@ -545,46 +681,28 @@ def enable_cache_on_dual_transformer(
         transformer_2, parallelism_config, sp_group, tp_group
     )
 
-    if model_name == "wan2.2":
-        transformer_blocks = getattr(transformer, "blocks", None)
-        transformer_2_blocks = getattr(transformer_2, "blocks", None)
-        blocks_name = None
-        forward_pattern = [ForwardPattern.Pattern_2, ForwardPattern.Pattern_2]
-        check_forward_pattern = True
-        check_num_outputs = False
-        has_separate_cfg = True
-    elif model_name == "ideogram4":
-        transformer_blocks = getattr(transformer, "layers", None)
-        transformer_2_blocks = getattr(transformer_2, "layers", None)
-        blocks_name = ["layers", "layers"]
-        forward_pattern = [ForwardPattern.Pattern_3, ForwardPattern.Pattern_3]
-        check_forward_pattern = False
-        check_num_outputs = False
-        has_separate_cfg = False
-    else:
-        raise ValueError(
-            f"Dual-transformer is not implemented for model {model_name} yet."
-        )
-
+    transformer_blocks_attr, transformer_2_blocks_attr = adapter_spec.blocks_attr
+    transformer_blocks = getattr(transformer, transformer_blocks_attr, None)
+    transformer_2_blocks = getattr(transformer_2, transformer_2_blocks_attr, None)
     if transformer_blocks is None or transformer_2_blocks is None:
-        expected_attr = "layers" if model_name == "ideogram4" else "blocks"
         raise ValueError(
-            f"Dual transformers for {model_name} must have '{expected_attr}' "
-            "attribute for cache-dit. "
-            f"transformer has {expected_attr}: {transformer_blocks is not None}, "
-            f"secondary transformer has {expected_attr}: {transformer_2_blocks is not None}"
+            f"Dual transformers for {model_name} must expose cache-dit block "
+            f"attributes {adapter_spec.blocks_attr}. "
+            f"transformer has {transformer_blocks_attr}: "
+            f"{transformer_blocks is not None}, secondary transformer has "
+            f"{transformer_2_blocks_attr}: {transformer_2_blocks is not None}"
         )
 
     cache_dit.enable_cache(
         BlockAdapter(
             transformer=[transformer, transformer_2],
             blocks=[transformer_blocks, transformer_2_blocks],
-            blocks_name=blocks_name,
-            forward_pattern=forward_pattern,
+            blocks_name=adapter_spec.blocks_name,
+            forward_pattern=adapter_spec.forward_pattern,
             params_modifiers=[primary_modifier, secondary_modifier],
-            check_forward_pattern=check_forward_pattern,
-            check_num_outputs=check_num_outputs,
-            has_separate_cfg=has_separate_cfg,
+            check_forward_pattern=adapter_spec.check_forward_pattern,
+            check_num_outputs=adapter_spec.check_num_outputs,
+            has_separate_cfg=adapter_spec.has_separate_cfg,
         ),
         parallelism_config=None,
     )

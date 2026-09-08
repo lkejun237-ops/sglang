@@ -17,12 +17,14 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
     ImageVAEEncodingStage,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.realtime.session import (
     BaseRealtimeState,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_context as precision_autocast_context,
+)
 from sglang.multimodal_gen.runtime.utils.realtime_trace import (
     log_realtime_trace_for_batch,
     realtime_trace_span,
@@ -358,9 +360,9 @@ class CausalVaeDecodingStage(DecodingStage):
                 latents = latents.to(vae_dtype)
             if decode_state is None:
                 decode_state = RealtimeVAEDecodeState()
-            with torch.autocast(
-                device_type=current_platform.device_type,
-                dtype=vae_dtype,
+            with precision_autocast_context(
+                vae_dtype,
+                disable_autocast=server_args.disable_autocast,
                 enabled=vae_autocast_enabled,
             ):
                 return self._decode_with_streaming_taehv(
@@ -377,9 +379,9 @@ class CausalVaeDecodingStage(DecodingStage):
             latents, server_args, vae=self.vae
         )
 
-        with torch.autocast(
-            device_type=current_platform.device_type,
+        with precision_autocast_context(
             dtype=vae_dtype,
+            disable_autocast=server_args.disable_autocast,
             enabled=vae_autocast_enabled,
         ):
             try:

@@ -95,7 +95,7 @@ def test_save_outputs_can_materialize_without_saving(tmp_path):
 
 def test_file_path_transport_clears_in_memory_outputs():
     worker = GPUWorker.__new__(GPUWorker)
-    worker.rank = 0
+    worker.is_output_rank = True
     output_batch = OutputBatch(
         output=[object()],
         audio=torch.zeros(1),
@@ -232,6 +232,7 @@ def test_async_quantization_helper_matches_existing_truncation_and_layout():
 def test_local_taehv_cpu_output_uses_synchronous_raw_frame_fallback():
     worker = GPUWorker.__new__(GPUWorker)
     worker.rank = 0
+    worker.is_output_rank = True
     worker.server_args = type(
         "ServerArgs",
         (),

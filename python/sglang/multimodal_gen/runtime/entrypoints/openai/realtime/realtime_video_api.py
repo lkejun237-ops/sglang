@@ -12,6 +12,10 @@ from uuid import uuid4
 import msgspec.msgpack
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+    ReleaseRealtimeSessionReq,
+    ReplaceQueuedRealtimeReq,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeEvent,
     RealtimeVideoGenerationsRequest,
@@ -32,10 +36,6 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.timer import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     process_generation_batch,
-)
-from sglang.multimodal_gen.runtime.entrypoints.utils import (
-    ReleaseRealtimeSessionReq,
-    ReplaceQueuedRealtimeReq,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.realtime.admission import (

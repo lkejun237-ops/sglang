@@ -87,6 +87,7 @@ def test_causal_vae_decoding_stage_keeps_wan_decoder_cache(monkeypatch):
     stage = CausalVaeDecodingStage.__new__(CausalVaeDecodingStage)
     stage.vae = vae
     server_args = SimpleNamespace(
+        component_precisions={},
         pipeline_config=_PipelineConfig(),
         disable_autocast=True,
     )
@@ -165,6 +166,7 @@ def test_causal_vae_decoding_stage_prefers_native_causal_decode(monkeypatch):
     stage = CausalVaeDecodingStage.__new__(CausalVaeDecodingStage)
     stage.vae = vae
     server_args = SimpleNamespace(
+        component_precisions={},
         pipeline_config=_PipelineConfig(),
         disable_autocast=True,
     )
@@ -258,6 +260,7 @@ def test_causal_vae_decoding_stage_uses_streaming_taehv_decoder(monkeypatch):
     stage = CausalVaeDecodingStage.__new__(CausalVaeDecodingStage)
     stage.vae = native_vae
     server_args = SimpleNamespace(
+        component_precisions={},
         pipeline_config=_PipelineConfig(),
         disable_autocast=True,
     )
@@ -283,10 +286,11 @@ def test_causal_vae_decoding_stage_uses_streaming_taehv_decoder(monkeypatch):
 
 def test_taehv_decode_does_not_declare_native_vae_residency():
     server_args = SimpleNamespace(
+        component_precisions={},
         pipeline_config=SimpleNamespace(
             vae_precision="fp32",
             vae_config=SimpleNamespace(taehv_checkpoint_path="/tmp/taehv.pth"),
-        )
+        ),
     )
     stage = CausalVaeDecodingStage.__new__(CausalVaeDecodingStage)
     stage.component_name = "vae"
@@ -300,6 +304,7 @@ def test_taehv_decode_does_not_declare_native_vae_residency():
 
 def test_taehv_image_encode_offload_marks_native_vae_as_large_no_prefetch():
     server_args = SimpleNamespace(
+        component_precisions={},
         vae_cpu_offload=True,
         pipeline_config=SimpleNamespace(
             vae_precision="fp32",
@@ -320,7 +325,11 @@ def test_taehv_image_encode_offload_marks_native_vae_as_large_no_prefetch():
 def test_realtime_text_offload_does_not_prefetch_cached_encoder():
     stage = RealtimeTextEncodingStage.__new__(RealtimeTextEncodingStage)
     stage.text_encoders = [object()]
-    server_args = SimpleNamespace(text_encoder_cpu_offload=True)
+    server_args = SimpleNamespace(
+        text_encoder_cpu_offload=True,
+        component_precisions={},
+        pipeline_config=SimpleNamespace(text_encoder_precisions=["fp32"]),
+    )
 
     uses = stage.component_uses(server_args, "text")
 
@@ -337,12 +346,13 @@ def test_causal_vae_decoding_stage_preloads_taehv_model(monkeypatch):
     )
 
     server_args = SimpleNamespace(
+        component_precisions={},
         pipeline_config=SimpleNamespace(
             vae_precision="fp32",
             vae_config=SimpleNamespace(
                 taehv_checkpoint_path="/opt/taehv/taew2_2.pth",
             ),
-        )
+        ),
     )
     load_calls = []
     taehv_model = object()
@@ -463,6 +473,7 @@ def test_causal_vae_decoding_stage_reads_parallel_decode_from_vae_config():
         metrics=None,
     )
     server_args = SimpleNamespace(
+        component_precisions={},
         pipeline_config=_PipelineConfig(),
         disable_autocast=True,
     )

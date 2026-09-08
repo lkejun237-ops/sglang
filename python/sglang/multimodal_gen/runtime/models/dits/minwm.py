@@ -14,14 +14,14 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.jit_kernel.diffusion.minwm_rmsnorm import (
+from sglang.kernels.ops.diffusion.norm.minwm_rmsnorm_jit import (
     can_use_minwm_rmsnorm,
     minwm_fused_qknorm,
     minwm_fused_qknorm_unchecked,
     minwm_rmsnorm,
     minwm_rmsnorm_unchecked,
 )
-from sglang.jit_kernel.diffusion.minwm_rotary import (
+from sglang.kernels.ops.diffusion.rope.minwm_rotary_jit import (
     can_use_minwm_rotary,
     can_use_minwm_rotary_out,
     minwm_rotary,
@@ -48,7 +48,7 @@ from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import tensor_parallel_rms_norm
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import NDRotaryEmbedding
 from sglang.multimodal_gen.runtime.layers.usp import (
-    _usp_input_all_to_all_qkv,
+    _usp_input_all_to_all_peer_first_qkv,
     _usp_input_all_to_all_varlen_qkv,
     _usp_output_all_to_all,
     _usp_output_all_to_all_varlen,
@@ -545,7 +545,9 @@ def _minwm_packed_varlen_attention(
             return_lse=False,
         )
     elif backend == "fa3":
-        from sglang.jit_kernel.flash_attention_v3 import flash_attn_varlen_func
+        from sglang.kernels.ops.attention.flash_attention_v3 import (
+            flash_attn_varlen_func,
+        )
 
         output = flash_attn_varlen_func(
             **common_kwargs,
@@ -588,7 +590,10 @@ def _minwm_packed_attention_backend(device: torch.device) -> str:
             "SGLANG_MINWM_REQUIRE_SM120_FA4=1 requires FlashAttention-4 on SM120"
         )
     if capability == 9:
-        if importlib.util.find_spec("sglang.jit_kernel.flash_attention_v3") is None:
+        if (
+            importlib.util.find_spec("sglang.kernels.ops.attention.flash_attention_v3")
+            is None
+        ):
             raise RuntimeError(
                 "minWM requires the bundled FlashAttention-3 backend on Hopper"
             )
@@ -694,7 +699,7 @@ class MinWMCausalSelfAttention(CausalWanSelfAttention):
                     packed_numel = 3 * query.numel()
                     input_buffer = workspace.get("qkv_send", query, packed_numel)
                     output_buffer = workspace.get("qkv_recv", query, packed_numel)
-                qkv = _usp_input_all_to_all_qkv(
+                qkv = _usp_input_all_to_all_peer_first_qkv(
                     query,
                     key,
                     value,
@@ -1024,9 +1029,6 @@ class MinWMCausalTransformerBlock(CausalWanTransformerBlock):
 class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
     transformer_block_cls = MinWMCausalTransformerBlock
     patch_embedding_cls = MinWMPatchEmbed
-    _fsdp_shard_conditions = MinWMVideoConfig()._fsdp_shard_conditions
-    _compile_conditions = MinWMVideoConfig()._compile_conditions
-    _supported_attention_backends = MinWMVideoConfig()._supported_attention_backends
     param_names_mapping = MinWMVideoConfig().param_names_mapping
     reverse_param_names_mapping = MinWMVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = MinWMVideoConfig().lora_param_names_mapping

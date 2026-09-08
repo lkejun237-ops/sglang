@@ -142,7 +142,7 @@ def _make_minwm_runtime_alignment_fixture():
     stage = MinWMCausalDMDDenoisingStage.__new__(MinWMCausalDMDDenoisingStage)
     stage.transformer = SimpleNamespace(
         num_attention_heads=attention_heads,
-        config=SimpleNamespace(arch_config=arch_config),
+        config=arch_config,
     )
     stage.num_transformer_blocks = layer_count
     stage.local_attn_size = arch_config.local_attn_size
@@ -1015,9 +1015,7 @@ def test_minwm_bounded_session_presamples_reference_and_full_horizon(monkeypatch
         stage_module, "get_local_torch_device", lambda: torch.device("cpu")
     )
     transformer = SimpleNamespace(
-        config=SimpleNamespace(
-            arch_config=SimpleNamespace(num_frames_per_block=4, out_channels=2)
-        )
+        config=SimpleNamespace(num_frames_per_block=4, out_channels=2)
     )
     stage = MinWMChunkLatentPreparationStage(transformer)
     session = RealtimeSession()
@@ -1092,11 +1090,9 @@ def test_minwm_t2v_presamples_exact_horizon_without_reference_slot(monkeypatch):
     )
     transformer = SimpleNamespace(
         config=SimpleNamespace(
-            arch_config=SimpleNamespace(
-                num_frame_first_block=1,
-                num_frames_per_block=4,
-                out_channels=2,
-            )
+            num_frame_first_block=1,
+            num_frames_per_block=4,
+            out_channels=2,
         )
     )
     stage = MinWMChunkLatentPreparationStage(transformer)
@@ -1154,9 +1150,7 @@ def test_minwm_director_chunk_seed_replays_prefix_rng_before_tail(monkeypatch):
         stage_module, "get_local_torch_device", lambda: torch.device("cpu")
     )
     transformer = SimpleNamespace(
-        config=SimpleNamespace(
-            arch_config=SimpleNamespace(num_frames_per_block=4, out_channels=2)
-        )
+        config=SimpleNamespace(num_frames_per_block=4, out_channels=2)
     )
     stage = MinWMChunkLatentPreparationStage(transformer)
     prefix_frames = 5
@@ -1204,11 +1198,9 @@ def test_minwm_default_kv_horizon_retains_complete_bounded_session():
     stage = MinWMCausalDMDDenoisingStage.__new__(MinWMCausalDMDDenoisingStage)
     stage.transformer = SimpleNamespace(
         config=SimpleNamespace(
-            arch_config=SimpleNamespace(
-                sink_size=0,
-                local_attn_size=-1,
-                sliding_window_num_frames=128,
-            )
+            sink_size=0,
+            local_attn_size=-1,
+            sliding_window_num_frames=128,
         )
     )
     stage.sink_size = 0
@@ -1225,14 +1217,22 @@ def test_minwm_default_kv_horizon_retains_complete_bounded_session():
         realtime_causal_kv_cache_num_frames=None,
     )
     stage._apply_causal_cache_overrides(
-        batch, SimpleNamespace(pipeline_config=pipeline_config)
+        batch,
+        SimpleNamespace(
+            pipeline_config=pipeline_config,
+            kv_cache_quant_config=SimpleNamespace(enabled=False),
+        ),
     )
     assert stage.sliding_window_num_frames == 33
     assert stage._minwm_unbounded_cache is True
 
     batch.realtime_causal_kv_cache_num_frames = 45
     stage._apply_causal_cache_overrides(
-        batch, SimpleNamespace(pipeline_config=pipeline_config)
+        batch,
+        SimpleNamespace(
+            pipeline_config=pipeline_config,
+            kv_cache_quant_config=SimpleNamespace(enabled=False),
+        ),
     )
     assert stage.sliding_window_num_frames == 45
     assert stage._minwm_unbounded_cache is False
@@ -1242,11 +1242,9 @@ def test_minwm_causal_cache_overrides_do_not_leak_between_requests():
     stage = MinWMCausalDMDDenoisingStage.__new__(MinWMCausalDMDDenoisingStage)
     stage.transformer = SimpleNamespace(
         config=SimpleNamespace(
-            arch_config=SimpleNamespace(
-                sink_size=0,
-                local_attn_size=-1,
-                sliding_window_num_frames=128,
-            )
+            sink_size=0,
+            local_attn_size=-1,
+            sliding_window_num_frames=128,
         )
     )
     stage.sink_size = 0
@@ -1256,7 +1254,10 @@ def test_minwm_causal_cache_overrides_do_not_leak_between_requests():
         realtime_causal_sink_size=None,
         realtime_causal_kv_cache_num_frames=None,
     )
-    server_args = SimpleNamespace(pipeline_config=pipeline_config)
+    server_args = SimpleNamespace(
+        pipeline_config=pipeline_config,
+        kv_cache_quant_config=SimpleNamespace(enabled=False),
+    )
 
     bounded_request = SimpleNamespace(
         realtime_causal_sink_size=9,
@@ -1285,12 +1286,10 @@ def test_minwm_t2v_default_kv_horizon_uses_exact_latent_count():
     stage = MinWMCausalDMDDenoisingStage.__new__(MinWMCausalDMDDenoisingStage)
     stage.transformer = SimpleNamespace(
         config=SimpleNamespace(
-            arch_config=SimpleNamespace(
-                sink_size=0,
-                local_attn_size=-1,
-                sliding_window_num_frames=128,
-                num_frame_first_block=1,
-            )
+            sink_size=0,
+            local_attn_size=-1,
+            sliding_window_num_frames=128,
+            num_frame_first_block=1,
         )
     )
     stage.sink_size = 0
@@ -1308,7 +1307,11 @@ def test_minwm_t2v_default_kv_horizon_uses_exact_latent_count():
     )
 
     stage._apply_causal_cache_overrides(
-        batch, SimpleNamespace(pipeline_config=pipeline_config)
+        batch,
+        SimpleNamespace(
+            pipeline_config=pipeline_config,
+            kv_cache_quant_config=SimpleNamespace(enabled=False),
+        ),
     )
 
     assert stage.sliding_window_num_frames == 182
@@ -1319,11 +1322,9 @@ def test_minwm_model_bounded_window_is_not_expanded_to_request_horizon():
     stage = MinWMCausalDMDDenoisingStage.__new__(MinWMCausalDMDDenoisingStage)
     stage.transformer = SimpleNamespace(
         config=SimpleNamespace(
-            arch_config=SimpleNamespace(
-                sink_size=8,
-                local_attn_size=32,
-                sliding_window_num_frames=32,
-            )
+            sink_size=8,
+            local_attn_size=32,
+            sliding_window_num_frames=32,
         )
     )
     stage.sink_size = 8
@@ -1340,7 +1341,11 @@ def test_minwm_model_bounded_window_is_not_expanded_to_request_horizon():
         realtime_causal_kv_cache_num_frames=None,
     )
     stage._apply_causal_cache_overrides(
-        batch, SimpleNamespace(pipeline_config=pipeline_config)
+        batch,
+        SimpleNamespace(
+            pipeline_config=pipeline_config,
+            kv_cache_quant_config=SimpleNamespace(enabled=False),
+        ),
     )
     assert stage.sliding_window_num_frames == 32
     assert stage.sink_size == 8
@@ -1452,13 +1457,11 @@ def _minwm_cuda_graph_cache_stage(*, allow_growth, rope_position_mode):
     stage._minwm_unbounded_cache = allow_growth
     stage.transformer = SimpleNamespace(
         config=SimpleNamespace(
-            arch_config=SimpleNamespace(
-                rope_position_mode=rope_position_mode,
-                rope_max_frame_gap=1,
-                prompt_first_frame_pin_enabled=False,
-                scene_cut_rope_offset=0,
-                scene_cut_sink_enabled=False,
-            )
+            rope_position_mode=rope_position_mode,
+            rope_max_frame_gap=1,
+            prompt_first_frame_pin_enabled=False,
+            scene_cut_rope_offset=0,
+            scene_cut_sink_enabled=False,
         )
     )
     return stage
@@ -1677,9 +1680,7 @@ def test_minwm_unipc_stage_steps_in_native_bfchw_layout():
 
 def test_minwm_t2v_starts_fractional_actions_without_reference_history():
     stage = MinWMCausalDMDDenoisingStage.__new__(MinWMCausalDMDDenoisingStage)
-    stage.transformer = SimpleNamespace(
-        config=SimpleNamespace(arch_config=SimpleNamespace(action_history_frames=4))
-    )
+    stage.transformer = SimpleNamespace(config=SimpleNamespace(action_history_frames=4))
     window = [[0.8, 0, 0, 0, 0, 0, 0, 0]] * 4
     batch = SimpleNamespace(
         session=RealtimeSession(),
@@ -1705,9 +1706,7 @@ def test_minwm_t2v_starts_fractional_actions_without_reference_history():
 
 def test_minwm_i2v_starts_fractional_actions_after_reference_history():
     stage = MinWMCausalDMDDenoisingStage.__new__(MinWMCausalDMDDenoisingStage)
-    stage.transformer = SimpleNamespace(
-        config=SimpleNamespace(arch_config=SimpleNamespace(action_history_frames=4))
-    )
+    stage.transformer = SimpleNamespace(config=SimpleNamespace(action_history_frames=4))
     window = [[0.8, 0, 0, 0, 0, 0, 0, 0]] * 4
     batch = SimpleNamespace(
         session=RealtimeSession(),
@@ -2425,13 +2424,11 @@ def test_minwm_causal_cache_uses_local_ulysses_heads(monkeypatch):
     stage.transformer = SimpleNamespace(
         num_attention_heads=24,
         config=SimpleNamespace(
-            arch_config=SimpleNamespace(
-                rope_position_mode="block_relative",
-                rope_max_frame_gap=12,
-                prompt_first_frame_pin_enabled=True,
-                scene_cut_rope_offset=0,
-                scene_cut_sink_enabled=False,
-            )
+            rope_position_mode="block_relative",
+            rope_max_frame_gap=12,
+            prompt_first_frame_pin_enabled=True,
+            scene_cut_rope_offset=0,
+            scene_cut_sink_enabled=False,
         ),
     )
     stage._minwm_unbounded_cache = True
@@ -2484,7 +2481,7 @@ def test_minwm_ulysses_qkv_cpu_fallback_uses_reusable_peer_first_buffers(
         return received
 
     monkeypatch.setattr(usp_module, "_usp_all_to_all_single", fake_exchange)
-    output = usp_module._usp_input_all_to_all_qkv(
+    output = usp_module._usp_input_all_to_all_peer_first_qkv(
         query,
         key,
         value,
@@ -2544,7 +2541,7 @@ def test_minwm_ulysses_qkv_peer_first_layout_round_trips_exactly(monkeypatch):
     for active_rank in range(world_size):
         qkv = qkv_by_rank[active_rank]
         query, key, value = qkv.chunk(3, dim=-1)
-        gathered = usp_module._usp_input_all_to_all_qkv(query, key, value)
+        gathered = usp_module._usp_input_all_to_all_peer_first_qkv(query, key, value)
         expected = torch.cat(
             [
                 source[
@@ -2569,7 +2566,7 @@ def test_minwm_ulysses_qkv_peer_first_layout_round_trips_exactly(monkeypatch):
         gathered.permute(1, 0, 2, 3).contiguous() for gathered in gathered_by_rank
     ]
 
-    def fake_output_exchange(packed, output_buffer=None):
+    def fake_output_exchange(packed, role=None, output_buffer=None):
         assert output_buffer is None
         assert torch.equal(packed, output_wire_by_rank[active_rank])
         chunks = [
@@ -2578,6 +2575,7 @@ def test_minwm_ulysses_qkv_peer_first_layout_round_trips_exactly(monkeypatch):
         ]
         return torch.cat(chunks).reshape_as(packed)
 
+    monkeypatch.setattr(usp_module, "_ipc_varlen_fast", lambda *_args: None)
     monkeypatch.setattr(usp_module, "_usp_all_to_all_single", fake_output_exchange)
     for active_rank in range(world_size):
         round_trip = usp_module._usp_output_all_to_all(
@@ -2632,7 +2630,9 @@ def test_minwm_causal_attention_packs_one_ulysses_collective(monkeypatch, seq_sp
         return torch.zeros(1, local_seq, 4, head_dim)
 
     if seq_splits[0] == seq_splits[1]:
-        monkeypatch.setattr(minwm_module, "_usp_input_all_to_all_qkv", fake_input)
+        monkeypatch.setattr(
+            minwm_module, "_usp_input_all_to_all_peer_first_qkv", fake_input
+        )
         monkeypatch.setattr(minwm_module, "_usp_output_all_to_all", fake_output)
     else:
         monkeypatch.setattr(
@@ -2723,7 +2723,7 @@ def test_minwm_causal_attention_packs_one_ulysses_collective(monkeypatch, seq_sp
     ("capability", "available", "expected"),
     [
         (10, {"flash_attn.cute", "flash_attn"}, "fa4"),
-        (9, {"sglang.jit_kernel.flash_attention_v3", "flash_attn"}, "fa3"),
+        (9, {"sglang.kernels.ops.attention.flash_attention_v3", "flash_attn"}, "fa3"),
         (8, {"flash_attn"}, "fa2"),
     ],
 )
@@ -2783,7 +2783,7 @@ def test_minwm_strict_sm120_requires_fa4(monkeypatch):
 
 
 def test_minwm_hopper_attention_uses_sglang_fa3_api(monkeypatch):
-    import sglang.jit_kernel.flash_attention_v3 as fa3_module
+    import sglang.kernels.ops.attention.flash_attention_v3 as fa3_module
     import sglang.multimodal_gen.runtime.models.dits.minwm as minwm_module
 
     class FakeCudaTensor:

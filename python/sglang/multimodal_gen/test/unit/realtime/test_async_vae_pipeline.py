@@ -91,7 +91,7 @@ def test_remote_frame_handlers_keep_first_frame_trace_scoped_to_their_chunk():
         async def fake_send(_ws, _session, batch, frame_batch, send_stats):
             sends.append((batch.name, frame_batch.chunk_index, send_stats))
 
-        session = SimpleNamespace()
+        session = realtime_video_api.GenerateSession()
         chunk_zero = SimpleNamespace(index=0, request_id="request-0")
         chunk_one = SimpleNamespace(index=1, request_id="request-1")
         batch_zero = SimpleNamespace(name="batch-0", realtime_event_id=10)
@@ -115,7 +115,11 @@ def test_remote_frame_handlers_keep_first_frame_trace_scoped_to_their_chunk():
             await handler_zero(frame_zero)
             await handler_one(frame_one)
 
-        first_frame_traces = [fields for _, fields in traces]
+        first_frame_traces = [
+            fields
+            for event, fields in traces
+            if event == "server.remote_first_frame_received"
+        ]
         assert [item["chunk_index"] for item in first_frame_traces] == [0, 1]
         assert [item["request_id"] for item in first_frame_traces] == [
             "request-0",
@@ -200,16 +204,12 @@ def test_async_vae_open_failure_still_closes_client(monkeypatch):
 
         monkeypatch.setattr(realtime_video_api, "RealtimeVAEClient", Client)
         monkeypatch.setattr(realtime_video_api, "write_error_msg", ignore_error)
-        session = SimpleNamespace(
-            adapter=object(),
-            request=SimpleNamespace(
-                realtime_output_format="webp",
-                output_compression=80,
-                realtime_preview_max_width=560,
-            ),
-            id="s",
-            generation_id="g",
-            vae_client=None,
+        session = realtime_video_api.GenerateSession(session_id="s", generation_id="g")
+        session.adapter = object()
+        session.request = SimpleNamespace(
+            realtime_output_format="webp",
+            output_compression=80,
+            realtime_preview_max_width=560,
         )
         server_args = SimpleNamespace(
             realtime_vae_backend="taehv_remote",
