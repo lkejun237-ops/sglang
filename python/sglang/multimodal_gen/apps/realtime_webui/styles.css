@@ -1970,6 +1970,55 @@ body.world-studio {
 .world-studio .prompt-update-heading { display: flex; align-items: end; justify-content: space-between; gap: 16px; margin-bottom: 7px; }
 .world-studio .prompt-update-heading h3 { margin: 3px 0 0; color: var(--ws-text); font-size: 15px; font-weight: 600; }
 .world-studio .prompt-update-heading small { color: var(--ws-muted); font-size: 10px; }
+.world-studio .prompt-rewrite-toggle {
+  display: inline-flex;
+  width: max-content;
+  align-items: center;
+  gap: 7px;
+  margin-top: 7px;
+  color: var(--ws-muted);
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+}
+.world-studio .prompt-rewrite-toggle input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.world-studio .prompt-rewrite-toggle-switch {
+  position: relative;
+  width: 34px;
+  height: 19px;
+  border: 1px solid var(--ws-line);
+  border-radius: 999px;
+  background: rgba(255,255,255,0.055);
+  transition: border-color 0.16s ease, background 0.16s ease;
+}
+.world-studio .prompt-rewrite-toggle-switch::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: rgba(185, 198, 194, 0.72);
+  transition: transform 0.16s ease, background 0.16s ease;
+}
+.world-studio .prompt-rewrite-toggle input:checked + .prompt-rewrite-toggle-switch {
+  border-color: rgba(121, 223, 189, 0.58);
+  background: rgba(121, 223, 189, 0.16);
+}
+.world-studio .prompt-rewrite-toggle input:checked + .prompt-rewrite-toggle-switch::after {
+  transform: translateX(15px);
+  background: var(--ws-accent);
+}
+.world-studio .prompt-rewrite-toggle:focus-within .prompt-rewrite-toggle-switch {
+  outline: 2px solid rgba(121, 223, 189, 0.22);
+  outline-offset: 2px;
+}
 .world-studio .prompt-composer { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; align-items: stretch; }
 .world-studio .prompt-composer textarea { min-height: 56px; resize: none; padding: 11px 13px; font-size: 12px; line-height: 1.45; }
 .world-studio .voice-button {
@@ -2009,6 +2058,7 @@ body.world-studio {
 .world-studio .prompt-helper[data-state="working"] { color: #a7cfc2; }
 .world-studio .prompt-helper[data-state="persistent"] { color: var(--ws-accent); }
 .world-studio .prompt-helper[data-state="one_time"] { color: #e7c58f; }
+.world-studio .prompt-helper[data-state="direct"] { color: #e7c58f; }
 .world-studio .prompt-helper[data-state="error"] { color: #f1aa9c; }
 .world-studio .prompt-log-panel {
   margin-top: 9px;

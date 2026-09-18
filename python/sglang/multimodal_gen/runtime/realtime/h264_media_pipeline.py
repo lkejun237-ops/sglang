@@ -60,6 +60,8 @@ class H264PipelineConfig:
     live_edge_frames: int = 6
     startup_drop_frames: int = 0
     raw_channel_order: str = "rgb"
+    gateway_backpressure: bool = False
+    drain_timeout_s: float | None = None
     service: str = "vae"
     model: str = "unknown"
 
@@ -93,6 +95,8 @@ class H264PipelineConfig:
             raise ValueError("H.264 queue must contain at least one frame")
         if self.max_frame_age_ms < 0:
             raise ValueError("H.264 maximum frame age must be non-negative")
+        if self.drain_timeout_s is not None and self.drain_timeout_s <= 0:
+            raise ValueError("H.264 drain timeout must be positive")
         if not 0 <= self.live_edge_frames <= self.max_queued_frames:
             raise ValueError("H.264 live edge must fit in the frame queue")
         if not 0 <= self.startup_drop_frames <= 120:
@@ -141,12 +145,14 @@ class H264MediaPipeline:
         generation_id: str,
         send: MediaSender,
         config: H264PipelineConfig,
+        wait_writable: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         config.validate()
         self.session_id = session_id
         self.generation_id = generation_id
         self.send = send
         self.config = config
+        self.wait_writable = wait_writable
         self._queue: deque[_QueuedFrame | _ChunkCompletion | _DrainMarker] = deque()
         self._queue_ready = asyncio.Event()
         self._queued_frames = 0
@@ -163,14 +169,16 @@ class H264MediaPipeline:
         self._sequence = 0
         self._frame_index = 0
         self._encoder_start_times: deque[float] = deque(maxlen=4096)
-        self._minimum_event_id = 0
         self._startup_drop_remaining = config.startup_drop_frames
         # final completion 是网关判断媒体已经收完的屏障，必须等 ffmpeg stdout
         # 真正到 EOF 后才能发送；否则网关可能先关浏览器连接，丢掉编码器尾帧。
         self._pending_final_completion: _ChunkCompletion | None = None
         self.dropped_frames = 0
+        self.queue_full_dropped_frames = 0
         self.latency_dropped_frames = 0
         self.startup_dropped_frames = 0
+        self._last_drop_log_s = 0.0
+        self._last_logged_drops = -1
 
     def enqueue(self, header: LatentChunkHeader, batch: EncodedFrameBatch) -> None:
         if self._closed:
@@ -180,10 +188,8 @@ class H264MediaPipeline:
             raise ProtocolViolation(
                 "VAE-side H.264 requires application/x-raw-rgb input"
             )
-        if header.event_id is not None and header.event_id > self._minimum_event_id:
-            self._minimum_event_id = int(header.event_id)
-            self._discard_queued_before(self._minimum_event_id)
-
+        # event_id identifies sampled input, not an invalidation boundary.
+        # Continuous input updates must not discard otherwise fresh frames.
         frames = list(batch.payloads)
         if self._startup_drop_remaining:
             if header.chunk_index > 0:
@@ -220,6 +226,8 @@ class H264MediaPipeline:
             self._queued_frames += 1
         if frames:
             self._queue_ready.set()
+        if self.dropped_frames:
+            self._log_drop_counts()
 
     def enqueue_completion(
         self,
@@ -311,6 +319,7 @@ class H264MediaPipeline:
                     (time.perf_counter() - finalize_started) * 1000.0,
                 )
         finally:
+            self._log_drop_counts(final=True)
             self._queue.clear()
             self._queued_frames = 0
         if failure is not None:
@@ -330,7 +339,10 @@ class H264MediaPipeline:
         self._queue.append(marker)
         self._queue_ready.set()
         try:
-            await asyncio.wait_for(marker.event.wait(), timeout=CLOSE_DRAIN_TIMEOUT_S)
+            await asyncio.wait_for(
+                marker.event.wait(),
+                timeout=self.config.drain_timeout_s or CLOSE_DRAIN_TIMEOUT_S,
+            )
         except TimeoutError:
             logger.warning(
                 "VAE H.264 pipeline drain timed out: session_id=%s "
@@ -351,6 +363,14 @@ class H264MediaPipeline:
     async def _next(self) -> _QueuedFrame | _ChunkCompletion | _DrainMarker | None:
         while not self._closed:
             if self._queue:
+                if (
+                    isinstance(self._queue[0], _QueuedFrame)
+                    and self.wait_writable is not None
+                ):
+                    await self.wait_writable()
+                    # Capacity trimming may have removed frames while waiting.
+                    if not self._queue:
+                        continue
                 item = self._queue.popleft()
                 if isinstance(item, _QueuedFrame):
                     self._queued_frames -= 1
@@ -385,11 +405,17 @@ class H264MediaPipeline:
                 if (
                     time.time() * 1000 - frame.queued_epoch_ms
                     > self.config.max_frame_age_ms
-                    and self._queued_frames > self.config.live_edge_frames
+                    and self._queued_frames
+                    > (
+                        0
+                        if self.config.gateway_backpressure
+                        else self.config.live_edge_frames
+                    )
                 ):
                     self.dropped_frames += 1
                     self.latency_dropped_frames += 1
                     self._observe_queue(frame, result="cancelled")
+                    self._log_drop_counts()
                     continue
                 await self._encode_frame(frame)
         except asyncio.CancelledError:
@@ -403,10 +429,6 @@ class H264MediaPipeline:
             raise
 
     async def _encode_frame(self, frame: _QueuedFrame) -> None:
-        if self._minimum_event_id and frame.event_id < self._minimum_event_id:
-            self.dropped_frames += 1
-            self._observe_queue(frame, result="cancelled")
-            return
         if self._ffmpeg is None:
             await self._start_ffmpeg(frame.width, frame.height)
         elif (frame.width, frame.height) != (self._width, self._height):
@@ -500,7 +522,7 @@ class H264MediaPipeline:
         channel_filter = ""
         if self.config.raw_channel_order == "gbr":
             channel_filter = (
-                "colorchannelmixer=" "rr=0:rg=0:rb=1:gr=1:gg=0:gb=0:br=0:bg=1:bb=0,"
+                "colorchannelmixer=rr=0:rg=0:rb=1:gr=1:gg=0:gb=0:br=0:bg=1:bb=0,"
             )
         command = [
             self.config.ffmpeg_bin,
@@ -666,18 +688,6 @@ class H264MediaPipeline:
                 line.decode("utf-8", "replace").rstrip(),
             )
 
-    def _discard_queued_before(self, event_id: int) -> None:
-        retained: deque[_QueuedFrame | _ChunkCompletion | _DrainMarker] = deque()
-        while self._queue:
-            item = self._queue.popleft()
-            if isinstance(item, _QueuedFrame) and item.event_id < event_id:
-                self._queued_frames -= 1
-                self.dropped_frames += 1
-                self._observe_queue(item, result="cancelled")
-            else:
-                retained.append(item)
-        self._queue = retained
-
     def _drop_oldest_frame(self, *, result: str) -> bool:
         for index, item in enumerate(self._queue):
             if not isinstance(item, _QueuedFrame):
@@ -685,9 +695,31 @@ class H264MediaPipeline:
             del self._queue[index]
             self._queued_frames -= 1
             self.dropped_frames += 1
+            self.queue_full_dropped_frames += 1
             self._observe_queue(item, result=result)
             return True
         return False
+
+    def _log_drop_counts(self, *, final: bool = False) -> None:
+        now = time.monotonic()
+        if not final and (
+            self.dropped_frames == self._last_logged_drops
+            or now - self._last_drop_log_s < 5.0
+        ):
+            return
+        self._last_drop_log_s = now
+        self._last_logged_drops = self.dropped_frames
+        logger.info(
+            "VAE H.264 drop counts session_id=%s generation_id=%s "
+            "total=%d queue_full=%d latency_expired=%d startup_trim=%d final=%s",
+            self.session_id,
+            self.generation_id,
+            self.dropped_frames,
+            self.queue_full_dropped_frames,
+            self.latency_dropped_frames,
+            self.startup_dropped_frames,
+            final,
+        )
 
     def _observe_queue(self, frame: _QueuedFrame, *, result: str) -> None:
         observe_stage_seconds(
@@ -725,7 +757,7 @@ class H264MediaPipeline:
                 if self._stdout_task is not None:
                     await asyncio.wait_for(
                         asyncio.shield(self._stdout_task),
-                        timeout=CLOSE_DRAIN_TIMEOUT_S,
+                        timeout=self.config.drain_timeout_s or CLOSE_DRAIN_TIMEOUT_S,
                     )
                 return_code = await asyncio.wait_for(
                     process.wait(), timeout=CLOSE_DRAIN_TIMEOUT_S

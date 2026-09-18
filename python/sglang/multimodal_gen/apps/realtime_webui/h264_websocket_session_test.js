@@ -132,6 +132,35 @@ session._maintainLiveEdge();
 assert.equal(Number(video.currentTime.toFixed(1)), 10.7);
 assert.equal(video.playbackRate, 1);
 
+const catchupVideo = {
+  ...video,
+  currentTime: 10,
+  playbackRate: 1,
+};
+const catchupSession = new H264WebSocketSession({
+  video: catchupVideo,
+  liveEdgeTargetMs: 500,
+  liveEdgeSeekThresholdMs: 1200,
+  livePlaybackRateMax: 1.65,
+  WebSocketImpl: FakeWebSocket,
+  MediaSourceImpl: FakeMediaSource,
+  packMessage: JSON.stringify,
+  unpackMessage: (value) => JSON.parse(Buffer.from(value).toString("utf8")),
+});
+catchupSession.sourceBuffer = {
+  updating: false,
+  buffered: {
+    length: 1,
+    start: () => 0,
+    end: () => 10.8,
+  },
+  remove() {},
+};
+catchupSession._maintainLiveEdge();
+assert.equal(catchupVideo.currentTime, 10);
+assert.equal(catchupVideo.playbackRate, 1.65);
+assert.equal(catchupSession.lastStats.playbackRate, 1.65);
+
 const normalCloseStates = [];
 const normalCloseErrors = [];
 const normalCloseSession = new H264WebSocketSession({

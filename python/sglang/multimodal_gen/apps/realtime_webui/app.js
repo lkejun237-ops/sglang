@@ -1059,6 +1059,11 @@ function createH264ModelSession(key) {
     unpackMessage: unpack,
     liveEdgeTargetMs: configuredNumber("h264WebSocketLiveEdgeTargetMs", 80),
     liveEdgeSeekThresholdMs: configuredNumber("h264WebSocketSeekThresholdMs", 420),
+    livePlaybackRateMax: configuredModelNumber(
+      key,
+      "h264PlaybackRateMax",
+      configuredNumber("h264WebSocketPlaybackRateMax", 1.08),
+    ),
     onState: (state, details = {}) => {
       setModelConnectionState(key, state);
       if (state === "live") resetH264RuntimeReconnect(key);
@@ -7636,6 +7641,19 @@ async function completeWorldRule(payload) {
 
 let runtimePromptRewritePending = false;
 
+function isRuntimePromptRewriteEnabled() {
+  return $("runtimeRewriteToggle")?.checked !== false;
+}
+
+function updateRuntimeRewriteToggleStatus() {
+  if (runtimePromptRewritePending) return;
+  if (isRuntimePromptRewriteEnabled()) {
+    setPromptRewriteStatus("支持文字或语音输入，AI 将判断为持久或一次性指令。");
+  } else {
+    setPromptRewriteStatus("已关闭 AI 改写，发送时将直传输入内容。", "direct");
+  }
+}
+
 async function sendRuntimePromptUpdate() {
   const input = $("runtimePrompt");
   const prompt = input.value.trim();
@@ -7644,26 +7662,41 @@ async function sendRuntimePromptUpdate() {
     return;
   }
   if (runtimePromptRewritePending) return;
+  const rewriteEnabled = isRuntimePromptRewriteEnabled();
   runtimePromptRewritePending = true;
   markRecordingPromptSubmitted(prompt);
   input.blur();
   canvas.focus({ preventScroll: true });
   $("sendPromptBtn").disabled = true;
-  setPromptRewriteStatus("正在理解并改写指令…", "working");
+  setPromptRewriteStatus(
+    rewriteEnabled ? "正在理解并改写指令…" : "正在发送原始指令…",
+    "working",
+  );
   try {
-    const result = await promptRewriteController.submit(prompt);
+    const result = rewriteEnabled
+      ? await promptRewriteController.submit(prompt)
+      : await promptRewriteController.submitPrepared(
+        { prompt, change_type: "persistent" },
+        prompt,
+        { phase: "direct", trigger: "user", bypassRewrite: true },
+      );
     if (result.ignored) return;
     input.value = "";
     updateRecordingPromptDraft("");
-    if (result.change_type === "one_time") {
+    if (!rewriteEnabled) {
+      setPromptRewriteStatus("已发送 · 未经 AI 改写", "direct");
+    } else if (result.change_type === "one_time") {
       setPromptRewriteStatus("已发送 · 一次性指令，画面应用后约 10 秒恢复持久状态", "one_time");
     } else {
       setPromptRewriteStatus("已发送 · 持久指令", "persistent");
     }
   } catch (error) {
     markRecordingPromptFailed(error.message || error);
-    setPromptRewriteStatus(error.message || "指令改写失败，请重试", "error");
-    addHistory(`prompt rewrite failed · ${error.message || error}`);
+    setPromptRewriteStatus(
+      error.message || (rewriteEnabled ? "指令改写失败，请重试" : "原始指令发送失败，请重试"),
+      "error",
+    );
+    addHistory(`prompt ${rewriteEnabled ? "rewrite" : "direct send"} failed · ${error.message || error}`);
     input.focus({ preventScroll: true });
   } finally {
     runtimePromptRewritePending = false;
@@ -7672,6 +7705,7 @@ async function sendRuntimePromptUpdate() {
 }
 
 $("sendPromptBtn").onclick = sendRuntimePromptUpdate;
+$("runtimeRewriteToggle")?.addEventListener("change", updateRuntimeRewriteToggleStatus);
 $("runtimePrompt").addEventListener("keydown", (event) => {
   if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
   event.preventDefault();

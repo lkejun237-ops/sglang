@@ -71,7 +71,9 @@ def _parse_warmup_size(size: str) -> tuple[int, int]:
     return int(match.group("width")), int(match.group("height"))
 
 
-def _warmup_latent_shape(engine, size: str | None) -> tuple[int, int, int, int, int] | None:
+def _warmup_latent_shape(
+    engine, size: str | None
+) -> tuple[int, int, int, int, int] | None:
     if not size:
         return None
     width, height = _parse_warmup_size(size)
@@ -281,26 +283,36 @@ def create_app(
                             "shared-memory responses cannot use a Gateway output route"
                         )
                     if opened.output_url is not None:
-                        output_client = GatewayOutputClient(
-                            opened.output_url,
-                            session_id=opened.session_id,
-                            generation_id=opened.generation_id,
-                            token=opened.output_token or "",
-                            max_message_bytes=max_message_bytes,
-                        )
-                        await output_client.open()
                         h264_requested = bool(
                             h264_config is not None
                             and h264_config.enabled
                             and opened.output_format.lower()
                             == h264_config.trigger_output_format
                         )
+                        output_client = GatewayOutputClient(
+                            opened.output_url,
+                            session_id=opened.session_id,
+                            generation_id=opened.generation_id,
+                            token=opened.output_token or "",
+                            max_message_bytes=max_message_bytes,
+                            **(
+                                {"media_delivery_ack": True}
+                                if (h264_requested and h264_config.gateway_backpressure)
+                                else {}
+                            ),
+                        )
+                        await output_client.open()
                         if h264_requested:
                             h264_pipeline = H264MediaPipeline(
                                 session_id=opened.session_id,
                                 generation_id=opened.generation_id,
                                 send=output_client.send,
                                 config=h264_config,
+                                wait_writable=(
+                                    output_client.wait_writable
+                                    if h264_config.gateway_backpressure
+                                    else None
+                                ),
                             )
                             # The legacy denoiser knows only raw/webp/jpeg.  A
                             # direct browser opts into VAE-side H.264 with the
@@ -654,6 +666,8 @@ def _add_worker_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--h264-max-frame-age-ms", type=int, default=250)
     parser.add_argument("--h264-live-edge-frames", type=int, default=6)
     parser.add_argument("--h264-startup-drop-frames", type=int, default=0)
+    parser.add_argument("--h264-gateway-backpressure", action="store_true")
+    parser.add_argument("--h264-drain-timeout-s", type=float)
     parser.add_argument(
         "--h264-raw-channel-order", choices=("rgb", "gbr"), default="rgb"
     )
@@ -876,6 +890,8 @@ def _run_worker(args, exact_server_args) -> None:
             live_edge_frames=args.h264_live_edge_frames,
             startup_drop_frames=args.h264_startup_drop_frames,
             raw_channel_order=args.h264_raw_channel_order,
+            gateway_backpressure=args.h264_gateway_backpressure,
+            drain_timeout_s=args.h264_drain_timeout_s,
             service=os.environ.get("WORLD_MODEL_METRIC_SERVICE", "vae"),
             model=os.environ.get("WORLD_MODEL_METRIC_MODEL", "unknown"),
         ),

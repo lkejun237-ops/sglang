@@ -821,11 +821,13 @@ def create_app(
                 generation_id,
                 token=output_token,
             )
+            media_delivery_ack = opened.get("media_delivery_ack") is True
             await websocket.send_bytes(
                 encode_message(
                     "session_output_accepted",
                     session_id=session_id,
                     generation_id=generation_id,
+                    **({"media_delivery_ack": True} if media_delivery_ack else {}),
                 )
             )
             while True:
@@ -850,6 +852,21 @@ def create_app(
                             generation_id=generation_id,
                             request_id=message.get("request_id"),
                             chunk_index=message.get("chunk_index"),
+                        )
+                    )
+                elif media_delivery_ack and message.get("type") == "media_payload":
+                    # The VAE serializes sends until this acknowledgement, so
+                    # join includes the current in-flight browser write as well
+                    # as queued metadata. Do not acknowledge on enqueue alone.
+                    await route.join()
+                    if route.closed:
+                        raise OutputRouteClosed("output route closed before delivery")
+                    await websocket.send_bytes(
+                        encode_message(
+                            "media_delivery_accepted",
+                            session_id=session_id,
+                            generation_id=generation_id,
+                            sequence=message.get("sequence"),
                         )
                     )
         except (WebSocketDisconnect, OutputRouteClosed):
@@ -2078,8 +2095,17 @@ def main() -> None:
         disable_legacy_routes=args.disable_legacy_routes,
         world_studio_webui_base_url=args.world_studio_webui_base_url,
     )
+    ws_protocol = "auto"
+    send_buffer_bytes = int(os.environ.get("SGLANG_GATEWAY_SOCKET_SNDBUF", "0"))
+    if send_buffer_bytes:
+        from sglang.multimodal_gen.runtime.realtime.gateway_transport import (
+            bounded_websocket_protocol,
+        )
+
+        ws_protocol = bounded_websocket_protocol(send_buffer_bytes)
     uvicorn.run(
         app,
+        ws=ws_protocol,
         host=args.host,
         port=args.port,
         log_level="info",

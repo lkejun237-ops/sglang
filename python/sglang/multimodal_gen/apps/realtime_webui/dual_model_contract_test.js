@@ -243,11 +243,11 @@ assert.match(html, /dual_model_controller\.js\?v=dual-model-v6/);
 assert.match(html, /h264_websocket_session\.js\?v=h264-live-edge-rate-v3/);
 assert.match(html, /prompt_rewrite_controller\.js\?v=prompt-rewrite-v3/);
 assert.match(html, /world_rules_controller\.js\?v=world-rules-v4/);
-assert.match(html, /styles\.css\?v=world-studio-single-zing-v4/);
+assert.match(html, /styles\.css\?v=world-studio-single-zing-v5/);
 assert.match(html, /feishu-internal-demo-20260825\/presets\.js\?v=20260825/);
-assert.match(html, /app\.js\?v=world-studio-single-zing-v14-internal-demo/);
+assert.match(html, /app\.js\?v=world-studio-single-zing-v16-internal-demo/);
 assert.ok(
-  html.indexOf("feishu-internal-demo-20260825/presets.js") < html.indexOf("app.js?v=world-studio-single-zing-v14-internal-demo"),
+  html.indexOf("feishu-internal-demo-20260825/presets.js") < html.indexOf("app.js?v=world-studio-single-zing-v16-internal-demo"),
   "internal demo presets must load before app.js reads preset globals",
 );
 assert.match(html, /id="minwmH264Viewport"/);
@@ -322,6 +322,11 @@ assert.match(
   "entering a world must require both a first frame and a world description",
 );
 assert.match(html, /id="voicePromptBtn"/, "runtime prompt composer should expose voice input");
+assert.match(
+  html,
+  /id="runtimeRewriteToggle"[^>]*type="checkbox"[^>]*checked/,
+  "runtime prompt rewrite should be user-toggleable and enabled by default",
+);
 assert.match(html, /id="recordBtn"[^>]*class="gameplay-record-button"/, "gameplay recording must be visible");
 assert.match(html, /id="recordDownloadBtn"[^>]*class="gameplay-download-button"/, "finished gameplay must be downloadable");
 assert.match(html, /下载录像/, "finished gameplay download should not assume a LingBot comparison recording");
@@ -368,6 +373,16 @@ assert.match(
   "gameplay recordings should default to a 16:9 high-resolution stage height",
 );
 assert.match(app, /function sendRuntimePromptUpdate\(\)/);
+assert.match(
+  app,
+  /isRuntimePromptRewriteEnabled\(\)[\s\S]*?runtimeRewriteToggle/,
+  "runtime prompt sending should read the rewrite toggle",
+);
+assert.match(
+  app,
+  /rewriteEnabled\s*\?[\s\S]*?promptRewriteController\.submit\(prompt\)[\s\S]*?:[\s\S]*?promptRewriteController\.submitPrepared\([\s\S]*?\{ prompt, change_type: "persistent" \}/,
+  "disabled runtime rewrite should send the raw prompt without calling the rewrite endpoint",
+);
 assert.match(
   app,
   /runtimePromptRewritePending = true;[\s\S]{0,120}?input\.blur\(\);\s*canvas\.focus\(\{ preventScroll: true \}\);/,

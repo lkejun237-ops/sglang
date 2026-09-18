@@ -230,6 +230,120 @@ def test_h264_pipeline_bounds_rgb_before_encoding_and_emits_fmp4(monkeypatch):
     asyncio.run(run())
 
 
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is unavailable")
+def test_h264_backpressure_drops_rgb_and_preserves_a_decodable_latest_frame():
+    from sglang.multimodal_gen.test.unit.realtime.test_gateway_media_backpressure import (
+        _connection,
+    )
+
+    async def run():
+        async with _connection(session_id="session") as (client, route, _):
+            blocked, release = asyncio.Event(), asyncio.Event()
+            wires = []
+
+            async def browser():
+                while True:
+                    output = await route.get_output()
+                    message = decode_message(output.wire)
+                    if message["type"] == "media_payload" and not blocked.is_set():
+                        blocked.set()
+                        await release.wait()
+                    wires.append(output.wire)
+                    route.task_done()
+                    if message["type"] == "media_chunk_complete" and message.get(
+                        "is_final_chunk"
+                    ):
+                        return
+
+            consumer = asyncio.create_task(browser())
+            pipeline = H264MediaPipeline(
+                session_id="session",
+                generation_id="g",
+                send=client.send,
+                wait_writable=client.wait_writable,
+                config=H264PipelineConfig(
+                    enabled=True,
+                    gateway_backpressure=True,
+                    ffmpeg_bin=shutil.which("ffmpeg"),
+                    threads=1,
+                    preset="ultrafast",
+                    max_queued_frames=4,
+                    max_frame_age_ms=30,
+                    live_edge_frames=0,
+                    drain_timeout_s=5,
+                ),
+            )
+
+            def frame(red, green):
+                return EncodedFrameBatch(
+                    payloads=(bytes([red, green, 0]) * (128 * 72),),
+                    content_type="application/x-raw-rgb",
+                    width=128,
+                    height=72,
+                    frame_batch_index=0,
+                    is_final=True,
+                    encode_ms=0,
+                    source_width=128,
+                    source_height=72,
+                    preview_width=128,
+                    preview_height=72,
+                )
+
+            from dataclasses import replace
+
+            header = replace(_header(), generation_id="g")
+            for _ in range(8):
+                pipeline.enqueue(header, frame(255, 0))
+                await asyncio.sleep(0.01)
+                if blocked.is_set():
+                    break
+            await asyncio.wait_for(blocked.wait(), 5)
+            for _ in range(40):
+                pipeline.enqueue(header, frame(255, 0))
+                assert pipeline._queued_frames <= 4
+                await asyncio.sleep(0.075)
+            pipeline.enqueue(header, frame(0, 255))
+            final = replace(header, is_final_chunk=True)
+            pipeline.enqueue_completion(final, num_frames=49)
+            assert pipeline.dropped_frames > 0
+            assert route.queue_metrics()["gateway_queue_bytes"] < 256 * 1024
+            release.set()
+            await pipeline.close()
+            await asyncio.wait_for(consumer, 5)
+            messages = [decode_message(wire) for wire in wires]
+            payloads = [m for m in messages if m["type"] == "media_payload"]
+            assert [m["sequence"] for m in payloads] == list(range(len(payloads)))
+            media = b"".join(m["payload"] for m in payloads)
+            boxes = _top_level_mp4_box_types(media)
+            encoded = sum(m["type"] == "media_batch" for m in messages)
+            assert 0 < encoded < 49
+            assert boxes.count(b"moof") == encoded
+            assert messages[-1]["type"] == "media_chunk_complete"
+            process = await asyncio.create_subprocess_exec(
+                shutil.which("ffmpeg"),
+                "-v",
+                "error",
+                "-i",
+                "pipe:0",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "pipe:1",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            decoded, error = await process.communicate(media)
+            assert process.returncode == 0, error.decode()
+            assert len(decoded) == encoded * 128 * 72 * 3
+            last = decoded[-128 * 72 * 3 :]
+            assert sum(last[1::3]) / (128 * 72) > 220
+            assert sum(last[0::3]) / (128 * 72) < 30
+
+    asyncio.run(run())
+
+
 def test_h264_pipeline_finalizes_final_chunk_before_session_close(monkeypatch):
     """最终块本身必须触发完整收尾，不能依赖上游 WebSocket 拆除。"""
 

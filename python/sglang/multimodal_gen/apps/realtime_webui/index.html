@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>World Studio · 实时模型对比</title>
-    <link rel="stylesheet" href="./styles.css?v=world-studio-single-zing-v4" />
+    <link rel="stylesheet" href="./styles.css?v=world-studio-single-zing-v5" />
   </head>
   <body class="world-studio">
     <header class="app-header">
@@ -289,6 +289,11 @@
                 <div>
                   <span>LIVE DIRECTION</span>
                   <h3>世界过程中的新指令</h3>
+                  <label class="prompt-rewrite-toggle" for="runtimeRewriteToggle">
+                    <input id="runtimeRewriteToggle" type="checkbox" checked />
+                    <span class="prompt-rewrite-toggle-switch" aria-hidden="true"></span>
+                    <span>AI 改写</span>
+                  </label>
                 </div>
                 <small>AI 改写后同时发送至 Zing 与 LingBot2</small>
               </div>
@@ -387,7 +392,7 @@
     <script src="./playback_controller.js?v=realtime-playback-v34"></script>
     <script src="./model_session.js?v=dual-h264-telemetry-v1"></script>
     <script src="./dual_model_controller.js?v=dual-model-v6"></script>
-    <script src="./h264_websocket_session.js?v=h264-live-edge-rate-v3"></script>
+    <script src="./h264_websocket_session.js?v=h264-live-edge-rate-v4"></script>
     <script src="./happy_oyster_sdk.js?v=happyoyster-sdk-0.1.0-ticket-only"></script>
     <script src="./happy_oyster_session.js?v=happyoyster-session-v5"></script>
     <script src="./session_lifetime.js?v=session-lifetime-v1"></script>
@@ -397,6 +402,6 @@
     <script src="./trace_topology.js?v=realtime-trace-topology-v6"></script>
     <script src="./trace_transport.js?v=realtime-trace-http-v2"></script>
     <script src="./assets/presets/v1/feishu-internal-demo-20260825/presets.js?v=20260825"></script>
-    <script src="./app.js?v=world-studio-single-zing-v15-internal-demo"></script>
+    <script src="./app.js?v=world-studio-single-zing-v17-internal-demo"></script>
   </body>
 </html>

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,8 @@ from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import (
     materialize_payload_from_shared_memory,
     store_payload_in_shared_memory,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class RemoteVAEError(RuntimeError):
@@ -86,6 +89,7 @@ class GatewayOutputClient:
         timeout_s: float = 5.0,
         max_message_bytes: int = 64 * 1024 * 1024,
         connect_factory=connect,
+        media_delivery_ack: bool = False,
     ) -> None:
         if not url or not session_id or not generation_id or not token:
             raise ValueError("Gateway output identity is required")
@@ -98,6 +102,8 @@ class GatewayOutputClient:
         self._connect_factory = connect_factory
         self._ws = None
         self._send_lock = asyncio.Lock()
+        self._request_media_delivery_ack = media_delivery_ack
+        self.media_delivery_ack_enabled = False
 
     async def open(self) -> None:
         if self._ws is not None:
@@ -117,6 +123,11 @@ class GatewayOutputClient:
                 session_id=self.session_id,
                 generation_id=self.generation_id,
                 token=self.token,
+                **(
+                    {"media_delivery_ack": True}
+                    if self._request_media_delivery_ack
+                    else {}
+                ),
             )
         )
         response = decode_message(
@@ -132,6 +143,22 @@ class GatewayOutputClient:
             or response.get("generation_id") != self.generation_id
         ):
             raise ProtocolViolation("Gateway output acceptance identity mismatch")
+        self.media_delivery_ack_enabled = (
+            self._request_media_delivery_ack
+            and response.get("media_delivery_ack") is True
+        )
+        if self._request_media_delivery_ack:
+            logger.info(
+                "Gateway media backpressure session_id=%s enabled=%s",
+                self.session_id,
+                self.media_delivery_ack_enabled,
+            )
+
+    async def wait_writable(self) -> None:
+        # Keep the next RGB frame in its droppable queue while a media write
+        # is waiting for the Gateway. This is not a playback acknowledgement.
+        async with self._send_lock:
+            pass
 
     async def send(self, wire: bytes) -> None:
         if self._ws is None:
@@ -153,6 +180,33 @@ class GatewayOutputClient:
             raise ProtocolViolation("Gateway output identity mismatch")
         async with self._send_lock:
             await self._ws.send(wire)
+            if (
+                self.media_delivery_ack_enabled
+                and message.get("type") == "media_payload"
+            ):
+                # The session and transport own liveness. Do not turn a short
+                # congestion episode into the ordinary 5-second RPC timeout.
+                started = time.perf_counter()
+                response = decode_message(
+                    await self._ws.recv(), max_message_bytes=self.max_message_bytes
+                )
+                if (
+                    response.get("type") != "media_delivery_accepted"
+                    or response.get("session_id") != self.session_id
+                    or response.get("generation_id") != self.generation_id
+                    or response.get("sequence") != message.get("sequence")
+                ):
+                    raise ProtocolViolation(
+                        "Gateway media delivery acknowledgement mismatch"
+                    )
+                waited_ms = (time.perf_counter() - started) * 1000
+                if waited_ms >= 100:
+                    logger.warning(
+                        "Gateway media backpressure wait session_id=%s sequence=%s wait_ms=%.3f",
+                        self.session_id,
+                        message.get("sequence"),
+                        waited_ms,
+                    )
             if message.get("type") == "media_chunk_complete":
                 response = decode_message(
                     await asyncio.wait_for(self._ws.recv(), self.timeout_s),

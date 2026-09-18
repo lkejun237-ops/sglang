@@ -80,6 +80,7 @@
       startupTimeoutMs = 30000,
       liveEdgeTargetMs = 80,
       liveEdgeSeekThresholdMs = 420,
+      livePlaybackRateMax = 1.08,
       onState = () => {},
       onPlayable = () => {},
       onPresentedFrame = () => {},
@@ -102,6 +103,11 @@
       this.liveEdgeSeekThresholdMs = Math.max(
         this.liveEdgeTargetMs,
         Number(liveEdgeSeekThresholdMs) || 420,
+      );
+      this.livePlaybackRateMax = clamp(
+        Number(livePlaybackRateMax) || 1.08,
+        1,
+        2.5,
       );
       this.onState = onState;
       this.onPlayable = onPlayable;
@@ -601,11 +607,11 @@
       } else if (ratio < 0.65) {
         desired = 0.95;
       } else if (ratio > 1.45) {
-        desired = 1.08;
+        desired = this.livePlaybackRateMax;
       } else if (ratio > 1.2) {
-        desired = 1.04;
+        desired = 1 + (this.livePlaybackRateMax - 1) / 2;
       }
-      desired = clamp(desired, 0.9, 1.08);
+      desired = clamp(desired, 0.9, this.livePlaybackRateMax);
       if (Math.abs(desired - this.lastPlaybackRate) < 0.01) return;
       try { this.video.playbackRate = desired; } catch {}
       this.lastPlaybackRate = desired;
