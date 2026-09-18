@@ -9,7 +9,6 @@ This package contains diffusion pipelines for generating videos and images.
 
 from typing import cast
 
-from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -66,6 +65,10 @@ def build_pipeline(
         )
     else:
         logger.info("No pipeline_class_name specified, using model_index.json")
+
+        # Import lazily so registry.py can import ComposedPipelineBase while its
+        # own module-level registry definitions are still being initialized.
+        from sglang.multimodal_gen.registry import get_model_info
 
         model_info = get_model_info(
             model_path,

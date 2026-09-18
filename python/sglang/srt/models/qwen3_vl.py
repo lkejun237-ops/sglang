@@ -61,12 +61,12 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.models.utils import (
     RotaryPosMixin,
     WeightsMapper,
     compute_cu_seqlens_from_grid_numpy,
+    default_weight_loader,
 )
 from sglang.srt.multimodal.mm_utils import (
     materialize_multimodal_features,

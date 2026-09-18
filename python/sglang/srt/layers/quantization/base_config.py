@@ -10,8 +10,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 import torch
 from torch import nn
 
-from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
-
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
     from sglang.srt.layers.moe.moe_runner.base import MoeQuantInfo
@@ -214,6 +212,10 @@ class QuantizationConfig(ABC):
 
         # If user specified generic "modelopt", auto-detect the specific method
         if user_quant == "modelopt":
+            from sglang.srt.layers.modelopt_utils import (
+                canonicalize_modelopt_quant_algo,
+            )
+
             canonical_method = canonicalize_modelopt_quant_algo(quant_algo)
             if canonical_method is not None:
                 return canonical_method

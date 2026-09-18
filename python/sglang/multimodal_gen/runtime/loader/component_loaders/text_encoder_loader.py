@@ -27,10 +27,6 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     LinearBase,
     UnquantizedLinearMethod,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import ComfyFp8Config
-from sglang.multimodal_gen.runtime.layers.quantization.comfy_nvfp4 import (
-    ComfyNvfp4Config,
-)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
@@ -47,7 +43,6 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.quanto_int8_confi
     QuantoInt8Config,
     inspect_quanto_int8_checkpoint,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.gguf import GGUFConfig
 from sglang.multimodal_gen.runtime.layers.quantization.quanto_int8 import (
     normalize_quanto_int8_weights,
 )
@@ -96,11 +91,6 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     resolve_comfy_checkpoint_quantization,
 )
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
-from sglang.srt.layers.linear import LinearBase as SrtLinearBase
-from sglang.srt.layers.quantization.fp8 import Fp8Config as SrtFp8Config
-from sglang.srt.layers.quantization.unquant import (
-    UnquantizedLinearMethod as SrtUnquantizedLinearMethod,
-)
 from sglang.srt.model_loader.checkpoint_quantization import (
     resolve_checkpoint_quant_spec,
 )
@@ -108,6 +98,16 @@ from sglang.srt.model_loader.checkpoint_quantization import (
 logger = init_logger(__name__)
 
 _ONLINE_ENCODER_QUANTIZATIONS = frozenset({"fp8", "kitchen_int8", "mxfp4"})
+
+
+def _is_gguf_config(config: object) -> bool:
+    config_type = type(config)
+    return (
+        config_type.__name__ == "GGUFConfig"
+        and config_type.__module__
+        == "sglang.multimodal_gen.runtime.layers.quantization.gguf"
+    )
+
 
 _TRANSFORMERS_ENCODER_ONLY_CLASSES = {
     "T5EncoderModel": transformers.T5EncoderModel,
@@ -145,7 +145,7 @@ def _delegate_quantized_checkpoint_to_transformers(
 def _get_srt_encoder_quant_config(
     component_config: dict,
     model_cls: type[EncoderTensorParallelMixin],
-) -> SrtFp8Config | None:
+) -> QuantizationConfig | None:
     quant_spec = resolve_checkpoint_quant_spec(component_config)
     if quant_spec is None:
         return None
@@ -157,6 +157,12 @@ def _get_srt_encoder_quant_config(
 
     config = dict(quant_spec.config)
     config["packed_modules_mapping"] = model_cls.packed_modules_mapping
+
+    # Importing the SRT FP8 backend eagerly also initializes compiled serving
+    # kernels.  Diffusion runtimes can load ordinary BF16 encoders without
+    # sgl-kernel, so keep that dependency inside the SRT-only quantized path.
+    from sglang.srt.layers.quantization.fp8 import Fp8Config as SrtFp8Config
+
     return SrtFp8Config.from_config(config)
 
 
@@ -202,6 +208,10 @@ def _get_encoder_quant_config(
                 return mapped_name.removesuffix(".weight")
 
     if names_gguf_checkpoint(component_weights_path):
+        # The GGUF backend imports optional compiled SRT kernels.  Ordinary
+        # BF16 encoder loading must remain usable when sgl-kernel is absent.
+        from sglang.multimodal_gen.runtime.layers.quantization.gguf import GGUFConfig
+
         if quant_config is not None:
             raise ValueError(
                 "A GGUF encoder checkpoint cannot be combined with a second "
@@ -379,13 +389,23 @@ def _require_quantized_encoder_layers(
     component_name: str,
     quant_config: QuantizationConfig | None = None,
 ) -> None:
-    has_quantized_layers = any(
-        isinstance(module, (LinearBase, SrtLinearBase))
-        and module.quant_method is not None
-        and not isinstance(
-            module.quant_method,
-            (UnquantizedLinearMethod, SrtUnquantizedLinearMethod),
+    linear_types: tuple[type, ...] = (LinearBase,)
+    unquantized_types: tuple[type, ...] = (UnquantizedLinearMethod,)
+    if type(quant_config).__module__.startswith("sglang.srt."):
+        # SRT layer classes require compiled serving kernels.  Only import them
+        # when the selected quantization config actually belongs to SRT.
+        from sglang.srt.layers.linear import LinearBase as SrtLinearBase
+        from sglang.srt.layers.quantization.unquant import (
+            UnquantizedLinearMethod as SrtUnquantizedLinearMethod,
         )
+
+        linear_types += (SrtLinearBase,)
+        unquantized_types += (SrtUnquantizedLinearMethod,)
+
+    has_quantized_layers = any(
+        isinstance(module, linear_types)
+        and module.quant_method is not None
+        and not isinstance(module.quant_method, unquantized_types)
         for module in model.modules()
     )
     if not has_quantized_layers:
@@ -393,6 +413,16 @@ def _require_quantized_encoder_layers(
             f"The native {type(model).__name__} implementation does not construct "
             f"quantized linear layers for {component_name!r}"
         )
+    # Comfy fp8/nvfp4 configs pull the SRT fp8 backend and its compiled kernels
+    # through the native fp8 subclass. Import them only on the quantized path so
+    # ordinary BF16 encoder loading stays usable without sgl-kernel.
+    from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import (
+        ComfyFp8Config,
+    )
+    from sglang.multimodal_gen.runtime.layers.quantization.comfy_nvfp4 import (
+        ComfyNvfp4Config,
+    )
+
     if isinstance(
         quant_config,
         (
@@ -408,7 +438,7 @@ def _require_quantized_encoder_layers(
     elif isinstance(quant_config, QuantoInt8Config):
         expected = quant_config.layer_prefixes
         selected = quant_config.selected
-    elif isinstance(quant_config, GGUFConfig):
+    elif _is_gguf_config(quant_config):
         expected = quant_config.quantized_prefixes
         selected = quant_config.selected
     else:
@@ -704,7 +734,7 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                 )
             model.bind_encoder_tp_group(encoder_tp_group)
 
-            if isinstance(quant_config, GGUFConfig):
+            if _is_gguf_config(quant_config):
                 quant_config.retain_tensor_meta(
                     model.should_materialize_checkpoint_weight
                 )
@@ -722,7 +752,7 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                 model._keep_checkpoint_mapping = True
 
             weights_to_load = {name for name, _ in model.named_parameters()}
-            if isinstance(quant_config, GGUFConfig):
+            if _is_gguf_config(quant_config):
                 checkpoint_weights = gguf_weights_iterator(
                     model_path,
                     quant_config.tensor_meta,
@@ -741,7 +771,11 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                 weights_to_load - loaded_weights, [], component_name
             )
 
-            if quant_config is not None and not isinstance(quant_config, GGUFConfig):
+            if quant_config is not None and not _is_gguf_config(quant_config):
+                from sglang.multimodal_gen.runtime.layers.quantization.comfy_nvfp4 import (
+                    ComfyNvfp4Config,
+                )
+
                 postprocess_device: torch.device | None = local_torch_device
                 if isinstance(quant_config, (ComfyNvfp4Config, QuantoInt8Config)) or (
                     isinstance(quant_config, KitchenInt8Config)

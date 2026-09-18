@@ -692,6 +692,17 @@ def get_model_info(
 
     # 2. Get pipeline class - check non-diffusers models first
     pipeline_class_name = get_non_diffusers_pipeline_name(model_path)
+    if pipeline_class_name and os.path.isfile(
+        os.path.join(model_path, "model_index.json")
+    ):
+        # Zing exports may retain an H3 directory name. Their explicit identity
+        # must win over the legacy H3 path alias; preserve other alias behavior.
+        try:
+            local_config = maybe_download_model_index(model_path)
+        except Exception:
+            local_config = {}
+        if local_config.get("_class_name") == "ZingH3CausalPipeline":
+            pipeline_class_name = "ZingH3CausalPipeline"
     if pipeline_class_name:
         # Known non-diffusers model, skip model_index.json download
         logger.debug(
@@ -739,7 +750,15 @@ def get_model_info(
             return None
 
     # 3. Get configuration classes (sampling, pipeline config)
-    config_info = _get_config_info(model_path, model_id=model_id)
+    if pipeline_class_name == "ZingH3CausalPipeline":
+        # Do not pair the four-modality pipeline with an H3 config selected by
+        # a partial path match or --model-id. Zing owns its config declaration.
+        config_info = ConfigInfo(
+            sampling_param_cls=pipeline_cls.sampling_params_cls,
+            pipeline_config_cls=pipeline_cls.pipeline_config_cls,
+        )
+    else:
+        config_info = _get_config_info(model_path, model_id=model_id)
     if not config_info:
         if backend == Backend.AUTO:
             logger.warning(
@@ -770,6 +789,18 @@ def get_model_info(
 
 # Registration of model configs
 def _register_configs():
+    from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
+        ZingH3CausalPipelineConfig,
+    )
+    from sglang.multimodal_gen.configs.sample.zing_h3 import ZingH3SamplingParams
+
+    # Only the explicit model_index identity selects Zing. There is no public
+    # release ID yet, and a broad H3/Zing path match could select the wrong model.
+    register_configs(
+        sampling_param_cls=ZingH3SamplingParams,
+        pipeline_config_cls=ZingH3CausalPipelineConfig,
+        model_detectors=[lambda name: name.lower() == "zingh3causalpipeline"],
+    )
     # Pi0.5 / OpenPI / LeRobot action policies.
     register_configs(
         sampling_param_cls=Pi05SamplingParams,

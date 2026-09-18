@@ -3,6 +3,7 @@ import json
 import os
 import re
 import struct
+import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -18,43 +19,44 @@ from sglang.multimodal_gen.runtime.layers.quantization import (
     QuantizationConfig,
     get_quantization_config,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import ComfyFp8Config
-from sglang.multimodal_gen.runtime.layers.quantization.comfy_nvfp4 import (
-    ComfyNvfp4Config,
-)
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-    KitchenInt8Config,
-)
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_config import (
-    KitchenW4A4Config,
-)
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_config import (
-    KitchenW4A8Config,
-)
-from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.layers.linear import LinearBase as SrtLinearBase
-from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
-from sglang.srt.layers.quantization.unquant import (
-    UnquantizedEmbeddingMethod as SrtUnquantizedEmbeddingMethod,
-)
-from sglang.srt.layers.quantization.unquant import (
-    UnquantizedLinearMethod as SrtUnquantizedLinearMethod,
-)
-from sglang.srt.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding as SrtVocabParallelEmbedding,
-)
 from sglang.srt.model_loader.checkpoint_quantization import (
     resolve_checkpoint_quant_spec,
 )
-from sglang.srt.model_loader.post_load import stage_module_for_post_load
-from sglang.srt.utils import is_npu
 
 logger = init_logger(__name__)
+
+
+def _srt_layer_types() -> tuple[tuple[type, ...], tuple[type, ...]]:
+    """Return SRT (linear/embedding, unquantized-method) classes if SRT layers exist.
+
+    A model can only contain SRT layers when ``sglang.srt.layers.linear`` has
+    already been imported, so resolve the classes from ``sys.modules`` at call
+    time. Importing them eagerly would initialize compiled serving kernels that
+    lightweight diffusion deployments may not ship; gating on an environment
+    variable instead would silently skip SRT encoder layers that do exist.
+    """
+    if "sglang.srt.layers.linear" not in sys.modules:
+        return (), ()
+    from sglang.srt.layers.linear import LinearBase as SrtLinearBase
+    from sglang.srt.layers.quantization.unquant import (
+        UnquantizedEmbeddingMethod as SrtUnquantizedEmbeddingMethod,
+    )
+    from sglang.srt.layers.quantization.unquant import (
+        UnquantizedLinearMethod as SrtUnquantizedLinearMethod,
+    )
+    from sglang.srt.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding as SrtVocabParallelEmbedding,
+    )
+
+    return (
+        (SrtLinearBase, SrtVocabParallelEmbedding),
+        (SrtUnquantizedLinearMethod, SrtUnquantizedEmbeddingMethod),
+    )
 
 
 def process_model_weights_after_loading(
@@ -64,15 +66,17 @@ def process_model_weights_after_loading(
     quantized_only: bool = False,
 ) -> int:
     """Process native and SRT layers once, optionally staging one layer at a time."""
+    from sglang.srt.utils import is_npu
+
+    srt_linear_types, srt_unquantized_method_types = _srt_layer_types()
     processed_layers = 0
     for module in model.modules():
         if not isinstance(
             module,
             (
                 LinearBase,
-                SrtLinearBase,
                 VocabParallelEmbedding,
-                SrtVocabParallelEmbedding,
+                *srt_linear_types,
             ),
         ):
             continue
@@ -83,9 +87,8 @@ def process_model_weights_after_loading(
             method,
             (
                 UnquantizedLinearMethod,
-                SrtUnquantizedLinearMethod,
                 UnquantizedEmbeddingMethod,
-                SrtUnquantizedEmbeddingMethod,
+                *srt_unquantized_method_types,
             ),
         )
         if quantized_only and unquantized:
@@ -95,6 +98,8 @@ def process_model_weights_after_loading(
         if process_device is None:
             method.process_weights_after_loading(module)
         else:
+            from sglang.srt.model_loader.post_load import stage_module_for_post_load
+
             with stage_module_for_post_load(module, process_device):
                 method.process_weights_after_loading(module)
         if is_npu():
@@ -395,20 +400,50 @@ def resolve_comfy_checkpoint_quantization(
         return None
     formats = sorted({str(marker.get("format")) for marker in layer_markers.values()})
     if formats == ["int8_tensorwise"]:
+        from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
+            KitchenInt8Config,
+        )
+
         return KitchenInt8Config(layer_markers=layer_markers)
     if formats == ["asym_w4a8_int8"]:
+        from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_config import (
+            KitchenW4A8Config,
+        )
+
         return KitchenW4A8Config(layer_markers)
     if formats == ["asym_w4a8_int8", "int8_tensorwise"]:
+        from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_config import (
+            KitchenW4A8Config,
+        )
+
         return KitchenW4A8Config(layer_markers)
     if formats == ["convrot_w4a4"]:
+        from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_config import (
+            KitchenW4A4Config,
+        )
+
         return KitchenW4A4Config(layer_markers)
     if formats == ["convrot_w4a4", "int8_tensorwise"]:
+        from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_config import (
+            KitchenW4A4Config,
+        )
+
         return KitchenW4A4Config(layer_markers)
     if formats == ["float8_e4m3fn"]:
+        from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import (
+            ComfyFp8Config,
+        )
+
         return ComfyFp8Config(layer_markers)
     if formats in (["nvfp4"], ["int8_tensorwise", "nvfp4"]):
+        from sglang.multimodal_gen.runtime.layers.quantization.comfy_nvfp4 import (
+            ComfyNvfp4Config,
+        )
+
         return ComfyNvfp4Config(layer_markers)
     if formats == ["mxfp8"]:
+        from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
+
         return MXFP8Config(
             is_checkpoint_fp8_serialized=True,
             layer_markers=layer_markers,
@@ -521,6 +556,8 @@ def _resolve_quant_method_name(quant_cfg: dict) -> str:
         raise ValueError(
             "ModelOpt mixed precision is not supported by the current SGLang diffusion runtime."
         )
+    from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
+
     canonical_method = canonicalize_modelopt_quant_algo(quant_algo)
     if (
         quant_method != "modelopt"

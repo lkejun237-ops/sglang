@@ -1,0 +1,123 @@
+# Zing1 causal 推理
+
+`ZingH3CausalPipeline` 接通四模态 DiT、pre-RoPE KV、AR Euler/CD re-noise、CFG、
+Qwen 条件编码和双 VAE。结构差异与 H3 模块复用见
+[ARCHITECTURE.md](ARCHITECTURE.md)。本 PR 提供单卡 dense baseline；FSDP、Ulysses SP、
+VSA 和 compile 等性能工作放在独立优化 PR 中。
+
+## 从训练 checkpoint 导出
+
+当前 Zing 训练 checkpoint 的源格式是 DCP。SGLang serving package 不直接读取训练 DCP，
+导出分两步完成：先在 Zing 训练仓库把选定 component 合并为 portable `model.pt`，再由本目录的
+导出器完成 H3 权重布局转换和 safetensors 分片。这样 DCP reshard、EMA 选择和训练模型构造仍由
+训练仓库负责，SGLang 不复制一套容易漂移的 DCP loader。
+
+训练时若希望每个 checkpoint 自动带推理权重，可设置：
+
+```yaml
+checkpoint_export_model_pt: generator  # 也可以是 ema 或 both
+```
+
+已有 DCP checkpoint 可离线导出：
+
+```bash
+cd /path/to/zing
+PYTHONPATH=src python src/scripts/export_model_pt.py \
+  --checkpoint /path/to/global_step_003500 \
+  --config /path/to/global_step_003500/effective_config.yaml \
+  --source generator
+```
+
+`--source` 必须按训练和发布约定显式选择 `generator` 或 `ema`，不能把 optimizer DCP 当模型权重。
+上一步默认生成 `/path/to/global_step_003500/generator/model.pt`。切换到 SGLang 仓库根目录，
+再生成 SGLang model package：
+
+```bash
+cd /path/to/sglang
+python benchmark/zing_h3_causal/export_checkpoint.py \
+  --checkpoint /path/to/global_step_003500/generator/model.pt \
+  --config /path/to/global_step_003500/effective_config.yaml \
+  --components /path/to/MiniMax-H3-Ref2VA-diffusers \
+  --video-vae-source /path/to/video_vae/source/model.safetensors \
+  --output /path/to/zing-ar-export
+```
+
+导出器校验 Zing 四模态 AdaLN、全部必需张量和形状，保留训练要求的 FP32 参数，其余按推理
+配置写入 BF16 safetensors。共享的 tokenizer、processor、Qwen、video VAE 和 audio VAE
+通过只读 symlink 引用；部署时需要一并保留这些目标目录。
+
+## 生成
+
+```python
+from sglang.multimodal_gen import DiffGenerator
+
+generator = DiffGenerator.from_pretrained(
+    model_path="/path/to/zing-ar-export",
+    num_gpus=1,
+    attention_backend="torch_sdpa",
+    performance_mode="memory",
+    dit_layerwise_offload=True,
+    layerwise_offload_components=["text_encoder", "dit"],
+    vae_cpu_offload=True,
+    pin_cpu_memory=False,
+    warmup_mode="off",
+)
+result = generator.generate(sampling_params_kwargs=dict(
+    prompt="A camera moves slowly through a sunlit garden",
+    height=512,
+    width=896,
+    num_frames=22,
+    num_inference_steps=50,
+    guidance_scale=1.0,
+    seed=42,
+    save_output=True,
+))
+```
+
+`num_inference_steps=50` 在 Euler 路径表示 50 个 sigma 点、每个 target block 49 次 denoise
+forward，随后用 clean latent 做一次 KV commit。video/audio shift 来自导出的训练配置。
+步数和 guidance 是推理选择；训练 YAML 没有给出可直接沿用的质量最优值。
+
+`image_path` 可传图片参考，`num_frames=1` 生成图片。更完整的编辑任务通过 `zing_request`
+传入 user/target 两消息协议。user 媒体按声明顺序进入 Qwen presentation；conditions 只选择
+VAE reference 轨道。source 归一到训练 FPS 后必须与目标帧数相同，空间尺寸必须满足训练桶
+和宽高比约束。CFG unconditional 分支只包含当前 target，不读取 source、reference 或历史 KV。
+
+只有取得匹配的蒸馏 checkpoint 后，才能选择 `zing_solver="few_step"` 并提供训练一致的
+`zing_denoising_step_list`。AR checkpoint 和 re-noise scheduler 本身不能证明四步生成质量。
+
+## 验证
+
+在 SGLang 仓库根目录运行以下单元测试：
+
+```bash
+SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu PYTHONPATH=python python -m pytest \
+  python/sglang/multimodal_gen/test/unit/test_zing_h3_model.py \
+  python/sglang/multimodal_gen/test/unit/test_zing_h3_causal_renoise.py \
+  python/sglang/multimodal_gen/test/unit/test_zing_h3_registration.py \
+  python/sglang/multimodal_gen/test/unit/test_zing_h3_media_contract.py \
+  python/sglang/multimodal_gen/test/unit/test_lightweight_quantization_import.py \
+  python/sglang/multimodal_gen/test/unit/test_minimax_h3_dit_contract.py -q
+```
+
+这些测试使用人工构造的数据，不加载真实训练 checkpoint 或真实视频数据集：
+
+- DiT、KV cache 和采样测试使用真实 `ZingH3DiTModel` 实现，但配置缩小为 2 层、hidden size
+  为 16、2 个 attention heads，权重随机初始化；context、source/target visual 和 audio latent
+  由随机张量构造。
+- generation stage 测试使用替身编码和解码函数，解码返回全零视频，用于检查调用衔接和输出
+  shape，不验证真实 Qwen 或 VAE 的编码、解码结果。
+- 导出测试按小模型的参数 shape 随机生成 `model.pt`，实际执行 safetensors 分片导出和 DiT
+  加载；共享媒体组件使用占位目录和文件，不加载真实组件权重。
+- scheduler、注册和 H3 contract 测试使用手工张量、随机张量、测试配置或替身对象检查公式、
+  参数约束和接口行为；需要 CUDA 的测试在无 CUDA 环境中会跳过。
+
+覆盖范围包括独立 pipeline 注册、H3/Zing 配置隔离、四模态 AdaLN、QKV/MLP 权重转换、
+source/audio/尾 block、Euler/CD、CFG、KV transaction 和合成权重的导出分片加载。
+Zing 模型测试的 reference 字典、`conditions` 和 `media` 均为空。新增媒体合约测试使用真实
+请求解析和几何归一化，覆盖单图、多参考图、125 帧视频及音视频，并检查源帧数和 Qwen 视频
+时间戳；媒体读取及模型编码使用 mock，因此仍不验证真实 VAE reference 编码效果。
+KV 数值对照比较的是同一 SGLang 模型的缓存增量路径与显式拼接历史路径，不是与 Zing 训练
+实现的跨实现对照，也不能据此判断真实模型的生成质量。真实 checkpoint 的三组生成结果、
+精确版本覆盖及尚未通过的质量/数值验收见 [验证与 review 交接](VALIDATION.md)。
+生成媒体、云作业和实验 harness 不随本 PR 提交；性能实验保持独立。

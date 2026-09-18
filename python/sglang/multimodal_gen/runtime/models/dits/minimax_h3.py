@@ -1347,7 +1347,7 @@ class MiniMaxH3DiTBlock(nn.Module):
                 quant_config,
                 prefix=f"{prefix}.adaln_proj",
                 expand_ratio=6,
-                modality_num=MINIMAX_H3_ADALN_MODALITY_NUM,
+                modality_num=arch.num_modalities,
             )
         )
         self.preserve_input_for_cache_dit = False
@@ -1366,6 +1366,8 @@ class MiniMaxH3DiTBlock(nn.Module):
         ulysses_active: bool = False,
         ring_active: bool = False,
         adaln_params: tuple[torch.Tensor, ...] | None = None,
+        execution_override: Callable[[MiniMaxH3DiTBlock, torch.Tensor], torch.Tensor]
+        | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; adaln_input: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -1374,6 +1376,11 @@ class MiniMaxH3DiTBlock(nn.Module):
         norm1 -> scale/shift -> attention -> gated residual, followed by
         norm2 -> scale/shift -> MLP -> gated residual.
         """
+        # Some H3 runtimes reuse this parameter module with a different
+        # attention contract. Keeping that execution behind Module.__call__
+        # preserves forward hooks, including layerwise weight streaming.
+        if execution_override is not None:
+            return execution_override(self, x)
         if adaln_params is None:
             if self.adaln_proj is None:
                 raise ValueError("MiniMax H3 AdaLN cache parameters are required")

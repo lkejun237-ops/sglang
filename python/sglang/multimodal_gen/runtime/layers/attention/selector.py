@@ -17,7 +17,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionRequirements,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import STR_BACKEND_ENV_VAR, resolve_obj_by_qualname
 
@@ -246,6 +245,10 @@ def get_attn_backend(
         selected_backend = get_component_forced_attn_backend()
         selection_is_explicit = selected_backend is not None
     if selected_backend is None:
+        # Importing ServerArgs at module load creates a cycle through pipeline
+        # configs, which import this selector to validate H3 attention.
+        from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
         server_args = get_global_server_args()
         if server_args.attention_backend is not None:
             try:
@@ -257,9 +260,10 @@ def get_attn_backend(
                     f"Invalid attention backend '{server_args.attention_backend}' specified via command line. "
                     f"Available options are: {[e.name.lower() for e in AttentionBackendEnum]}"
                 )
-            selection_is_explicit = isinstance(
-                server_args, ServerArgs
-            ) and server_args.is_arg_explicitly_set("attention_backend")
+            explicit_check = getattr(server_args, "is_arg_explicitly_set", None)
+            selection_is_explicit = callable(explicit_check) and explicit_check(
+                "attention_backend"
+            )
             selected_from_global_cli = selection_is_explicit
 
     if selected_backend is None:

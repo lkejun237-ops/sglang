@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import itertools
+import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -35,8 +36,6 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
-from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
@@ -49,6 +48,22 @@ _is_hip = is_hip()
 
 WeightsMapping = Mapping[str, Optional[str]]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""
+
+
+def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+    """Lightweight fallback used by AutoWeightsLoader.
+
+    Keep this local so importing model definitions does not initialize the
+    complete serving quantization registry through model_loader.weight_utils.
+    """
+    if param.numel() == 1 and loaded_weight.numel() == 1:
+        param.data.fill_(loaded_weight.item())
+        return
+    assert param.size() == loaded_weight.size(), (
+        f"Attempted to load weight ({loaded_weight.size()}) "
+        f"into parameter ({param.size()})"
+    )
+    param.data.copy_(loaded_weight)
 
 
 @dataclass
@@ -498,7 +513,17 @@ def apply_qk_norm(
         )
         return q, k
 
-    if alt_stream is not None and get_is_capture_mode():
+    if alt_stream is not None and os.environ.get("SGLANG_LIGHTWEIGHT_RUNTIME") != "1":
+        # The runner package initializes serving-only CUDA graph and MoE
+        # backends. Model definitions also use this helper during lightweight
+        # diffusion loading, where those optional backends may be absent.
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        capture_mode = get_is_capture_mode()
+    else:
+        capture_mode = False
+
+    if alt_stream is not None and capture_mode:
         current_stream = get_current_device_stream_fast()
         alt_stream.wait_stream(current_stream)
         q_by_head = _reshape_for_qk_norm(q, head_dim)

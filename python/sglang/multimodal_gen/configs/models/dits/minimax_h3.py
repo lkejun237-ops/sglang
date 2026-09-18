@@ -77,6 +77,9 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
         }
     )
 
+    # Native H3 remains three-modal. Zing overrides this to four so both models
+    # can reuse MiniMaxH3DiTBlock without changing H3's AdaLN tensor shape.
+    num_modalities: int = 3
     num_layers: int = 50
     token_refiner_num_layers: int = 2
     hidden_size: int = 5376

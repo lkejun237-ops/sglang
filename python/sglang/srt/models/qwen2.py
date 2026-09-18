@@ -45,10 +45,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    kv_cache_scales_loader,
-)
+from sglang.srt.models.utils import default_weight_loader
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import add_prefix, make_layers
@@ -448,6 +445,8 @@ class Qwen2Model(nn.Module):
     # factors (or else raise an exception). Thus, handled exceptions should
     # make sure to leave KV cache scale factors in a known good (dummy) state
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        from sglang.srt.model_loader.weight_utils import kv_cache_scales_loader
+
         tp_size = get_parallel().tp_size
         tp_rank = get_parallel().tp_rank
         for layer_idx, scaling_factor in kv_cache_scales_loader(
