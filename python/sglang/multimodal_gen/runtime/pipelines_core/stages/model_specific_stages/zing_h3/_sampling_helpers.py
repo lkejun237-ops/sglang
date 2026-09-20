@@ -3,6 +3,8 @@
 """Packed block selection adapted from seedleap/zing a0f45389."""
 
 import torch
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
+from sglang.multimodal_gen.runtime.utils.zing_diagnostics import current_diagnostic
 
 from .packing import H3RowRole
 
@@ -58,6 +60,14 @@ class ZingBlockSamplingHelpers:
     def _forward(
         self, packed: dict[str, torch.Tensor], cache, update: str | None
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        counts = getattr(self, "_forward_counts", None)
+        if counts is not None:
+            kind = {
+                None: "unconditional",
+                "active": "denoise",
+                "final": "commit",
+            }.get(update, update)
+            counts[kind] += 1
         names = (
             "x",
             "audio_x",
@@ -74,7 +84,21 @@ class ZingBlockSamplingHelpers:
             kwargs.update(cache=cache, self_cache_update=update)
         elif update is not None:
             raise ValueError("H3 cache update requires a cache")
-        return self.generator(**kwargs)
+        with maybe_record_function(f"Zing.forward.{update or 'unconditional'}"):
+            diagnostic = current_diagnostic()
+            if diagnostic:
+                diagnostic.record(
+                    "forward_input",
+                    update=update,
+                    packed={name: kwargs[name] for name in names},
+                )
+            result = self.generator(**kwargs)
+            if diagnostic:
+                diagnostic.record(
+                    "forward_output", update=update, video=result[0], audio=result[1]
+                )
+                diagnostic.cache(cache)
+            return result
 
     def _block_spans(
         self, layout: dict[str, torch.Tensor], visual_shape: tuple[int, int, int]

@@ -71,7 +71,9 @@ row role 与 AdaLN modality ID 是两个概念：
 
 每个 logical row 携带 `position_ids[S,3]`、`block_idx[S]`、`row_role[S]` 和 `t[S]`；video、
 audio、context 按各自 role 紧凑保存。K 在 QK norm 后、RoPE 前写入 cache，读取时根据绝对位置
-重新应用 RoPE。prefix 始终保留，source 与 target 作为一次 transaction 提交：
+重新应用 RoPE。SP1 保存 `[rows, all_heads, head_dim]`；Ulysses SP 保存
+`[all_rows, local_heads, head_dim]`，因此无需在 commit 后 gather K/V，且 SP4 每卡 KV 占用为
+SP1 的 1/4。prefix 始终保留，source 与 target 作为一次 transaction 提交：
 
 1. `prefix`：clean `t=1`，提交文本和 reference static KV。
 2. `source`：提交当前 clean source 到 pending transaction。

@@ -1,14 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-from contextlib import contextmanager
+import time
+from contextlib import contextmanager, nullcontext
 
 import torch
-
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
+from sglang.multimodal_gen.runtime.utils.zing_diagnostics import (
+    current_diagnostic,
+    diagnostic_request,
+)
 
 from .codecs import ZingH3Codecs
 from .packing import ZingH3Packer
@@ -147,14 +152,42 @@ class ZingH3GenerationStage(PipelineStage):
         )
 
     @torch.no_grad()
+    @diagnostic_request
     def forward(self, batch, server_args):
         params = batch.sampling_params
         self._validate_sampling_params(params)
         request = self._build_request(batch)
         sampler = self._build_sampler(params)
+        component_seconds = {}
+        diagnostic = current_diagnostic()
+
+        def synchronize():
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+        def finish_timing(name, started):
+            synchronize()
+            duration = time.perf_counter() - started
+            component_seconds[name] = duration
+            if batch.metrics is not None:
+                batch.metrics.record_stage(name, duration)
 
         with set_forward_context(current_timestep=0, attn_metadata=None):
-            inputs = self.codecs.prepare(request, self._use)
+            synchronize()
+            started = time.perf_counter()
+            with maybe_record_function("Zing.conditioning"):
+                inputs = self.codecs.prepare(request, self._use)
+            if diagnostic:
+                diagnostic.record(
+                    "conditioning",
+                    positive=inputs.positive,
+                    visual=inputs.visual,
+                    audio=inputs.audio,
+                    source_visual=inputs.source_visual,
+                    visual_shape=inputs.visual_shape,
+                    audio_shape=inputs.audio_shape,
+                )
+            finish_timing("ZingH3Conditioning", started)
             with self._use("transformer", "denoise") as transformer:
                 # The residency manager may return a replacement module.
                 sampler.generator = transformer
@@ -168,11 +201,15 @@ class ZingH3GenerationStage(PipelineStage):
                     if device.type == "cuda"
                     else []
                 )
+                synchronize()
+                started = time.perf_counter()
                 with torch.random.fork_rng(devices=devices):
                     seed = (
                         params.seed[0] if isinstance(params.seed, list) else params.seed
                     )
                     torch.manual_seed(int(seed))
+                    if diagnostic:
+                        diagnostic.record("seeded")
                     video = torch.randn(
                         (1, self.packer.visual_channels, *inputs.visual_shape),
                         device=device,
@@ -182,20 +219,39 @@ class ZingH3GenerationStage(PipelineStage):
                         if inputs.audio_shape is None
                         else torch.randn((1, *inputs.audio_shape), device=device)
                     )
-                    video, audio = sampler.sample(inputs, video, audio)
+                    if diagnostic:
+                        diagnostic.record("initial_noise", video=video, audio=audio)
+                    capture = (
+                        diagnostic.prefix_modules(transformer)
+                        if diagnostic
+                        else nullcontext()
+                    )
+                    with maybe_record_function("Zing.denoise"), capture:
+                        video, audio = sampler.sample(inputs, video, audio)
+                    if diagnostic:
+                        diagnostic.record("final_latents", video=video, audio=audio)
+                finish_timing("ZingH3Denoise", started)
             with self._use("video_vae", "decode") as vae:
+                synchronize()
+                started = time.perf_counter()
                 video = video.to(next(vae.parameters()).device)
-                frames = self.codecs.decode_visual(video, inputs.pixel_frame_count)
+                with maybe_record_function("Zing.video_decode"):
+                    frames = self.codecs.decode_visual(video, inputs.pixel_frame_count)
                 height, width = (
                     n * self.codecs.spatial_ratio for n in inputs.visual_shape[1:]
                 )
                 frames = frames[..., :height, :width].contiguous()
+                finish_timing("ZingH3VideoDecode", started)
             waveform = None
             if audio is not None:
                 with self._use("audio_vae", "decode") as vae:
-                    waveform = self.codecs.decode_audio(
-                        audio.to(next(vae.parameters()).device), inputs.sample_count
-                    )
+                    synchronize()
+                    started = time.perf_counter()
+                    with maybe_record_function("Zing.audio_decode"):
+                        waveform = self.codecs.decode_audio(
+                            audio.to(next(vae.parameters()).device), inputs.sample_count
+                        )
+                    finish_timing("ZingH3AudioDecode", started)
             params.num_frames, params.height, params.width = (
                 inputs.pixel_frame_count,
                 height,
@@ -212,4 +268,10 @@ class ZingH3GenerationStage(PipelineStage):
                     else None
                 ),
                 metrics=batch.metrics,
+                usage={
+                    "zing_h3": {
+                        **sampler.last_run_metrics,
+                        "component_seconds": component_seconds,
+                    }
+                },
             )

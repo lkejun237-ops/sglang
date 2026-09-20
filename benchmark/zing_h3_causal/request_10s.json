@@ -1,0 +1,28 @@
+{
+  "sample_id": "zing-ar-step3500-sp-10s",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "A cinematic tracking shot moves slowly through a sunlit botanical garden. Ferns and wildflowers sway in a gentle breeze, warm light passes through the leaves, and the camera motion remains smooth and coherent. Natural colors, realistic detail, no text, no watermark."
+        }
+      ]
+    },
+    {
+      "role": "target",
+      "content": [
+        {
+          "type": "video_audio",
+          "output": {
+            "frames": 240,
+            "height": 512,
+            "width": 896
+          }
+        }
+      ],
+      "conditions": []
+    }
+  ]
+}

@@ -5,6 +5,7 @@ import math
 from collections.abc import Sequence
 
 import torch
+from sglang.multimodal_gen.runtime.utils.zing_diagnostics import current_diagnostic
 
 
 class ZingH3CausalRenoiseSchedule:
@@ -67,11 +68,41 @@ class ZingH3CausalRenoiseSchedule:
         sigma = self.sigmas[step_index].to(compute_dtype)
         x0 = sample.to(compute_dtype) + sigma * model_output.to(compute_dtype)
         x0_model = x0.to(sample.dtype)
+        # Opt-in parity capture only: record the actual RNG draw below without
+        # drawing again. Disabled outside a diagnostic context; tensor copies
+        # in that context are intentionally excluded from performance runs.
+        diagnostic = current_diagnostic()
         if step_index + 1 == len(self.sigmas):
+            if diagnostic:
+                diagnostic.record(
+                    "scheduler." + getattr(self, "diagnostic_modality", "unknown"),
+                    step=step_index,
+                    sample=sample,
+                    prediction=model_output,
+                    x0=x0,
+                    x0_model=x0_model,
+                    sigma=sigma,
+                    next_sigma=None,
+                    noise=None,
+                    next_sample=x0_model,
+                )
             return x0_model, x0
         noise = torch.randn_like(x0_model)
         noise_dtype = torch.promote_types(torch.float32, sample.dtype)
         next_sigma = self.sigmas[step_index + 1].to(noise_dtype)
         next_sample = (1 - next_sigma) * x0_model.to(noise_dtype)
         next_sample = next_sample + next_sigma * noise.to(noise_dtype)
+        if diagnostic:
+            diagnostic.record(
+                "scheduler." + getattr(self, "diagnostic_modality", "unknown"),
+                step=step_index,
+                sample=sample,
+                prediction=model_output,
+                x0=x0,
+                x0_model=x0_model,
+                sigma=sigma,
+                next_sigma=next_sigma,
+                noise=noise,
+                next_sample=next_sample.to(sample.dtype),
+            )
         return next_sample.to(sample.dtype), x0

@@ -8,6 +8,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
     ZingH3DiTArchConfig,
     ZingH3DiTConfig,
 )
+from sglang.multimodal_gen.configs.sample.zing_h3 import ZingH3SamplingParams
 from sglang.multimodal_gen.runtime.models.dits.zing_h3 import ZingH3DiTModel
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.packing import (
@@ -70,6 +71,36 @@ def request(model, *, source=True, audio=True):
     visual = torch.randn(1, 2, 3, 2, 2)
     sound = torch.randn(1, 2, 20, 2) if audio else None
     return packer, inputs, visual, sound
+
+
+def test_zing_h3_sp_request_cannot_disable_sequence_sharding(monkeypatch):
+    monkeypatch.setattr(
+        ZingH3SamplingParams.__mro__[1],
+        "_adjust",
+        lambda _self, _server_args: None,
+    )
+    params = ZingH3SamplingParams(enable_sequence_shard=False)
+    with pytest.raises(ValueError, match="requires enable_sequence_shard=True"):
+        params._adjust(SimpleNamespace(sp_degree=4))
+
+
+@pytest.mark.parametrize("num_frames", [22, 240])
+@pytest.mark.parametrize("sp_degree", [1, 2, 4])
+def test_zing_h3_sp_request_preserves_requested_frame_count(
+    monkeypatch, num_frames, sp_degree
+):
+    monkeypatch.setattr(
+        ZingH3SamplingParams.__mro__[1],
+        "_adjust",
+        lambda _self, _server_args: None,
+    )
+    params = ZingH3SamplingParams(num_frames=num_frames)
+    params.fps = 30
+    params._adjust(SimpleNamespace(sp_degree=sp_degree))
+    assert params.num_frames == num_frames
+    assert params.fps == 30
+    assert params.enable_sequence_shard is True
+    assert params.adjust_frames is False
 
 
 @torch.no_grad()
@@ -179,6 +210,23 @@ def test_block_sampler_runs_cfg_and_tail(model, solver, with_audio):
     assert (sound is None) == (audio is None)
     if sound is not None:
         assert sound.shape == audio.shape and torch.isfinite(sound).all()
+    assert sampler.last_run_metrics == {
+        "block_spans": [
+            {"source_block": 1, "target_block": 2, "start": 0, "end": 2, "frames": 2},
+            {"source_block": 3, "target_block": 4, "start": 2, "end": 3, "frames": 1},
+        ],
+        "video_sigma_points": 3 if solver == "euler" else 2,
+        "video_denoise_steps_per_block": 2,
+        "guidance_forwards_per_step": 2,
+        "forward_counts": {
+            "prefix": 1,
+            "source": 2,
+            "denoise": 4,
+            "unconditional": 4,
+            "commit": 2,
+        },
+        "dit_forwards": 13,
+    }
 
 
 @torch.no_grad()
@@ -201,10 +249,28 @@ def test_cache_rejects_noisy_commit_and_duplicate_final(model):
 
 
 @torch.no_grad()
+def test_cache_rejects_head_shard_layout_changes():
+    cache = ZingH3KVCache(2)
+    prefix_positions = torch.zeros(2, 3, dtype=torch.long)
+    prefix_blocks = torch.zeros(2, dtype=torch.long)
+    prefix_layers = tuple(
+        (torch.zeros(2, 2, 8), torch.zeros(2, 2, 8)) for _ in range(2)
+    )
+    cache.update(prefix_positions, prefix_blocks, "prefix", 0, prefix_layers)
+
+    source_positions = torch.ones(3, 3, dtype=torch.long)
+    source_blocks = torch.ones(3, dtype=torch.long)
+    changed_layers = tuple(
+        (torch.zeros(3, 1, 8), torch.zeros(3, 1, 8)) for _ in range(2)
+    )
+    with pytest.raises(ValueError, match="head-shard layout changed"):
+        cache.update(source_positions, source_blocks, "source", 1, changed_layers)
+
+
+@torch.no_grad()
 def test_generation_stage_connects_prompt_dit_and_decoder(model):
     from contextlib import nullcontext
 
-    from sglang.multimodal_gen.configs.sample.zing_h3 import ZingH3SamplingParams
     from sglang.multimodal_gen.runtime.managers.forward_context import (
         set_forward_context,
     )
@@ -250,6 +316,11 @@ def test_generation_stage_connects_prompt_dit_and_decoder(model):
     assert output.output.shape == (1, 3, 5, 32, 32)
     assert output.trajectory_latents.shape == (1, 2, 3, 2, 2)
     assert output.audio is None
+    assert output.usage["zing_h3"]["dit_forwards"] == 7
+    assert output.usage["zing_h3"]["block_spans"] == [
+        {"source_block": 1, "target_block": 2, "start": 0, "end": 2, "frames": 2},
+        {"source_block": 3, "target_block": 4, "start": 2, "end": 3, "frames": 1},
+    ]
     assert params.num_frames == 5
 
 

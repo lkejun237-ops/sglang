@@ -18,8 +18,10 @@ class ZingH3KVCache:
     """Keep the prefix and complete source/target transactions.
 
     Active denoising forwards never persist K/V. Positions remain absolute and
-    keys remain normalized but unrotated. A failed request must call clear().
-    Window limits count target latent frames, never individual KV rows.
+    keys remain normalized but unrotated. Under Ulysses, every rank stores the
+    complete cached sequence for only its local attention-head shard. A failed
+    request must call clear(). Window limits count target latent frames, never
+    individual KV rows.
     """
 
     def __init__(self, num_layers: int, local_frames: int = -1, sink_frames: int = 0):
@@ -36,6 +38,7 @@ class ZingH3KVCache:
         self.committed = []
         self.active = None
         self.last_block = 0
+        self.layer_layouts = None
 
     def _history(self):
         chunks = self.committed
@@ -125,6 +128,7 @@ class ZingH3KVCache:
             return
         if layers is None or len(layers) != self.num_layers:
             raise ValueError("Zing KV commit requires every transformer layer")
+        layouts = []
         for k, v in layers:
             if (
                 k.ndim != 3
@@ -138,6 +142,11 @@ class ZingH3KVCache:
                 raise ValueError(
                     "Zing K/V must be matching detached [rows, heads, dim] tensors"
                 )
+            layouts.append((tuple(k.shape[1:]), k.dtype, k.device))
+        if self.layer_layouts is None:
+            self.layer_layouts = tuple(layouts)
+        elif tuple(layouts) != self.layer_layouts:
+            raise ValueError("Zing K/V head-shard layout changed within a request")
         chunk = ZingKVChunk(positions.detach().clone(), block, tuple(layers), frames)
         if phase == "prefix":
             self.prefix = chunk

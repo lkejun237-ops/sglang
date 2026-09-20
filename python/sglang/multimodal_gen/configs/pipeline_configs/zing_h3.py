@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Zing1 causal architecture and deployment contract."""
 
+import os
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
@@ -49,16 +50,46 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
         self.validate_server_args(server_args)
 
     def validate_server_args(self, server_args):
-        for name in ("tp_size", "sp_degree", "ulysses_degree", "ring_degree"):
-            if getattr(server_args, name, 1) not in (None, 1):
-                raise ValueError("Zing dense inference requires TP=1 and SP=1")
+        tp_size = getattr(server_args, "tp_size", 1) or 1
+        sp_degree = getattr(server_args, "sp_degree", 1) or 1
+        ulysses_degree = getattr(server_args, "ulysses_degree", 1) or 1
+        ring_degree = getattr(server_args, "ring_degree", 1) or 1
+        if tp_size != 1:
+            raise ValueError("Zing causal inference requires TP=1")
+        if ring_degree != 1:
+            raise ValueError("Zing causal inference supports Ulysses SP only")
+        if sp_degree != ulysses_degree:
+            raise ValueError(
+                "Zing causal inference requires --sp-degree == --ulysses-degree"
+            )
+        heads = self.dit_config.arch_config.num_attention_heads
+        if heads % ulysses_degree:
+            raise ValueError(
+                f"Zing attention heads ({heads}) must be divisible by "
+                f"ulysses_degree ({ulysses_degree})"
+            )
         for name in (
             "enable_cfg_parallel",
             "enable_torch_compile",
-            "use_fsdp_inference",
         ):
             if getattr(server_args, name, False):
                 raise ValueError(f"Zing dense inference does not support {name}")
+        if sp_degree > 1:
+            required = {
+                "SGLANG_ZING_EXPERIMENTAL_ATTENTION": "fa4",
+                "SGLANG_ZING_EXPERIMENTAL_STABLE_SHAPES": "1",
+                "SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN": "1",
+            }
+            missing = [
+                f"{name}={value}"
+                for name, value in required.items()
+                if os.environ.get(name) != value
+            ]
+            if missing:
+                raise ValueError(
+                    "Zing SP requires the numerically validated configuration: "
+                    + ", ".join(missing)
+                )
         selected = self.resolve_transformer_attention_backend(server_args)
         if (
             selected is not None

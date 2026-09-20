@@ -76,7 +76,7 @@ def test_zing_declares_four_modalities_and_reuses_codec_configs():
     ) == ["/model/video_vae/source/model.safetensors"]
 
 
-def test_zing_registers_executable_stages_and_rejects_unsupported_parallelism():
+def test_zing_registers_executable_stages_and_accepts_ulysses_sp4(monkeypatch):
     from types import SimpleNamespace
 
     from sglang.multimodal_gen.configs.sample.zing_h3 import ZingH3SamplingParams
@@ -87,21 +87,80 @@ def test_zing_registers_executable_stages_and_rejects_unsupported_parallelism():
     assert issubclass(ZingH3CausalPipeline, ComposedPipelineBase)
     assert ZingH3CausalPipeline.sampling_params_cls is ZingH3SamplingParams
     assert callable(ZingH3GenerationStage.forward)
-    with pytest.raises(ValueError, match="TP=1 and SP=1"):
+    with pytest.raises(ValueError, match="requires TP=1"):
         ZingH3CausalPipelineConfig().validate_server_args(SimpleNamespace(tp_size=2))
 
+    args = SimpleNamespace(
+        tp_size=1,
+        sp_degree=4,
+        ulysses_degree=4,
+        ring_degree=1,
+        enable_cfg_parallel=False,
+        enable_torch_compile=False,
+        use_fsdp_inference=False,
+        attention_backend=None,
+        resolve_component_attention_backend=lambda _name: (None, None),
+    )
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_ATTENTION", "fa4")
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_STABLE_SHAPES", "1")
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN", "1")
+    ZingH3CausalPipelineConfig().validate_server_args(args)
+    args.sp_degree = 2
+    with pytest.raises(ValueError, match="sp-degree == --ulysses-degree"):
+        ZingH3CausalPipelineConfig().validate_server_args(args)
 
-def test_zing_pins_output_fps_to_checkpoint_time_base():
+
+@pytest.mark.parametrize("fps", [24, 30])
+def test_zing_preserves_fps_and_validates_against_export(fps):
+    from types import SimpleNamespace
+
     from sglang.multimodal_gen.configs.sample.zing_h3 import ZingH3SamplingParams
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.stage import (
+        ZingH3GenerationStage,
+    )
 
-    with pytest.raises(TypeError):
-        ZingH3SamplingParams(prompt="clip", fps=30)
-    params = ZingH3SamplingParams(prompt="clip")
-    assert params.fps == 24
-    # CLI/API paths assign fields after construction; validation re-pins it.
-    params.fps = 30
+    params = ZingH3SamplingParams(prompt="clip", fps=fps)
     params.check_sampling_param()
-    assert params.fps == 24
+    assert params.fps == fps
+    stage = object.__new__(ZingH3GenerationStage)
+    stage.codecs = SimpleNamespace(target_fps=float(fps))
+    stage._validate_sampling_params(params)
+    params.fps = fps + 1
+    with pytest.raises(ValueError, match="requested fps"):
+        stage._validate_sampling_params(params)
+    assert params.fps == fps + 1  # Reject a mismatch; never silently rewrite it.
+
+
+@pytest.mark.parametrize("sp", [1, 2, 4])
+@pytest.mark.parametrize("attention", [None, "torch_sdpa", "fa4"])
+@pytest.mark.parametrize("stable", [None, "0", "1"])
+@pytest.mark.parametrize("compiled", [None, "0", "1"])
+def test_zing_sp_requires_validated_numerical_configuration(
+    monkeypatch, sp, attention, stable, compiled
+):
+    from types import SimpleNamespace
+
+    for name, value in (
+        ("SGLANG_ZING_EXPERIMENTAL_ATTENTION", attention),
+        ("SGLANG_ZING_EXPERIMENTAL_STABLE_SHAPES", stable),
+        ("SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN", compiled),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    args = SimpleNamespace(
+        sp_degree=sp,
+        ulysses_degree=sp,
+        attention_backend=None,
+        resolve_component_attention_backend=lambda _name: (None, None),
+    )
+    config = ZingH3CausalPipelineConfig()
+    if sp == 1 or (attention, stable, compiled) == ("fa4", "1", "1"):
+        config.validate_server_args(args)
+    else:
+        with pytest.raises(ValueError, match="numerically validated configuration"):
+            config.validate_server_args(args)
 
 
 @pytest.mark.parametrize(

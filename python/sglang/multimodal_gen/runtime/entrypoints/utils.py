@@ -198,6 +198,7 @@ class GenerationResult:
     generation_time: float = 0.0
     peak_memory_mb: float = 0.0
     metrics: dict = field(default_factory=dict)
+    usage: dict[str, Any] | None = None
     trajectory_latents: Any = None
     trajectory_timesteps: Any = None
     rollout_trajectory_data: Any = None

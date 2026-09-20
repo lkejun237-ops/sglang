@@ -6,6 +6,7 @@ Base class for all pipeline executors.
 """
 
 import contextlib
+import os
 import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Callable, List
@@ -302,4 +303,8 @@ class PipelineExecutor(ABC):
         try:
             yield
         finally:
-            profiler.stop(dump_rank=dump_rank)
+            profiler.stop(
+                dump_rank=None
+                if os.environ.get("SGLANG_DIFFUSION_PROFILE_ALL_RANKS") == "1"
+                else dump_rank
+            )

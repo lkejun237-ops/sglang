@@ -4,11 +4,12 @@
 import math
 
 import torch
-
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_zing_h3_causal_renoise import (
     ZingH3CausalRenoiseSchedule,
 )
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
+from sglang.multimodal_gen.runtime.utils.zing_diagnostics import current_diagnostic
 
 from ._sampling_helpers import ZingBlockSamplingHelpers
 
@@ -81,6 +82,7 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
 
     @torch.no_grad()
     def sample(self, inputs, visual, audio=None):
+        diagnostic = current_diagnostic()
         self.device = visual.device
         self.processor._validate_visual(visual)
         if audio is not None:
@@ -101,8 +103,37 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             self.video_scheduler.to(self.device),
             self.audio_scheduler.to(self.device),
         )
+        vs.diagnostic_modality, aus.diagnostic_modality = "video", "audio"
+        forward_counts = {
+            "prefix": 0,
+            "source": 0,
+            "denoise": 0,
+            "unconditional": 0,
+            "commit": 0,
+        }
+
+        self._forward_counts = forward_counts
+        self.last_run_metrics = {
+            "block_spans": [
+                {
+                    "source_block": source,
+                    "target_block": target,
+                    "start": start,
+                    "end": end,
+                    "frames": end - start,
+                }
+                for source, target, start, end in spans
+            ],
+            "video_sigma_points": int(vs.sigmas.numel()),
+            "video_denoise_steps_per_block": int(vs.timesteps.numel()),
+            "guidance_forwards_per_step": 2 if self.do_cfg else 1,
+            "forward_counts": forward_counts,
+            "dit_forwards": 0,
+        }
         cache = ZingH3KVCache(len(self.generator.blocks))
         try:
+            if diagnostic:
+                diagnostic.phase = "prefix"
             if bool((pos["block_idx"] == 0).any()):
                 self._forward(
                     self._select_block(pos, 0, phase="prefix", video_t=1, audio_t=1),
@@ -110,42 +141,65 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
                     "prefix",
                 )
             for source, target, start, end in spans:
-                video = visual[:, :, start:end]
-                audio_indices = self._audio_indices(pos, target)
-                sound = None if audio is None else audio[:, :, audio_indices]
-                if bool((pos["block_idx"] == source).any()):
-                    self._forward(
-                        self._select_block(
-                            pos, source, phase="source", video_t=1, audio_t=None
-                        ),
-                        cache,
-                        "source",
-                    )
-                for step in range(len(vs.timesteps)):
-                    vt = float(vs.timesteps[step])
-                    at = None if sound is None else float(aus.timesteps[step])
-                    self._set_block_latents(pos, target, video, sound)
-                    packed = self._select_block(
-                        pos, target, phase="target", video_t=vt, audio_t=at
-                    )
-                    vp, ap = self._predict(packed, video.shape[2:], cache, "active")
-                    if self.do_cfg:
-                        self._set_block_latents(neg, target, video, sound)
-                        uncond = self._select_block(
-                            neg, target, phase="target", video_t=vt, audio_t=at
+                history_rows = sum(
+                    chunk.positions.shape[0] for chunk in cache._history()
+                )
+                with maybe_record_function(
+                    f"Zing.causal_block{target}.latent{start}-{end}.history_rows{history_rows}"
+                ):
+                    video = visual[:, :, start:end]
+                    audio_indices = self._audio_indices(pos, target)
+                    sound = None if audio is None else audio[:, :, audio_indices]
+                    if diagnostic:
+                        diagnostic.phase = f"block{source}.source"
+                    if bool((pos["block_idx"] == source).any()):
+                        self._forward(
+                            self._select_block(
+                                pos, source, phase="source", video_t=1, audio_t=None
+                            ),
+                            cache,
+                            "source",
                         )
-                        vu, au = self._predict(uncond, video.shape[2:], None, None)
-                        vp = vu + self.guidance_scale * (vp - vu)
-                        if ap is not None:
-                            ap = au + self.guidance_scale * (ap - au)
-                    # Preserve video-then-audio RNG consumption for CD parity.
-                    video = vs.step(vp, video, step_index=step)[0]
-                    if sound is not None:
-                        sound = aus.step(ap, sound, step_index=step)[0]
-                visual[:, :, start:end] = video
-                if audio is not None:
-                    audio[:, :, audio_indices] = sound
-                self._commit(pos, target, video, sound, cache)
+                    for step in range(len(vs.timesteps)):
+                        if diagnostic:
+                            diagnostic.phase = f"block{target}.step{step}"
+                        with maybe_record_function(
+                            f"Zing.denoise_step.block{target}.step{step}"
+                        ):
+                            vt = float(vs.timesteps[step])
+                            at = None if sound is None else float(aus.timesteps[step])
+                            self._set_block_latents(pos, target, video, sound)
+                            packed = self._select_block(
+                                pos, target, phase="target", video_t=vt, audio_t=at
+                            )
+                            vp, ap = self._predict(
+                                packed, video.shape[2:], cache, "active"
+                            )
+                            if self.do_cfg:
+                                self._set_block_latents(neg, target, video, sound)
+                                uncond = self._select_block(
+                                    neg, target, phase="target", video_t=vt, audio_t=at
+                                )
+                                vu, au = self._predict(
+                                    uncond, video.shape[2:], None, None
+                                )
+                                vp = vu + self.guidance_scale * (vp - vu)
+                                if ap is not None:
+                                    ap = au + self.guidance_scale * (ap - au)
+                            # Preserve video-then-audio RNG consumption for CD parity.
+                            video = vs.step(vp, video, step_index=step)[0]
+                            if sound is not None:
+                                sound = aus.step(ap, sound, step_index=step)[0]
+                    visual[:, :, start:end] = video
+                    if audio is not None:
+                        audio[:, :, audio_indices] = sound
+                    if diagnostic:
+                        diagnostic.phase = f"block{target}.commit"
+                    self._commit(pos, target, video, sound, cache)
+                    if diagnostic:
+                        diagnostic.record("block_complete", video=visual, audio=audio)
             return visual, audio
         finally:
+            self.last_run_metrics["dit_forwards"] = sum(forward_counts.values())
+            del self._forward_counts
             cache.clear()

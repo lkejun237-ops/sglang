@@ -539,6 +539,7 @@ class DiffGenerator:
             generation_time=generation_time,
             peak_memory_mb=output_batch.peak_memory_mb,
             metrics=metrics.to_dict() if metrics else {},
+            usage=output_batch.usage,
             action=output_batch.action_pred,
             trajectory_latents=output_batch.trajectory_latents,
             trajectory_timesteps=output_batch.trajectory_timesteps,
