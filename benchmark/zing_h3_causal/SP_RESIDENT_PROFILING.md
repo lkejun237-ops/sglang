@@ -10,10 +10,8 @@ AR step 3500 权重用于验证执行速度，不代表 DMD 成片质量。
 ```bash
 export SGLANG_DIFFUSION_PROFILE_ALL_RANKS=1
 export SGLANG_DIFFUSION_STAGE_LOGGING=1
-# SP>1 启动前强制检查该已验证组合；SP1 对照也使用相同设置。
-export SGLANG_ZING_EXPERIMENTAL_ATTENTION=fa4
-export SGLANG_ZING_EXPERIMENTAL_STABLE_SHAPES=1
-export SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN=1
+# Runtime 和验证 CLI 默认启用 FA4 + stable shapes + compiled AdaLN。
+# SP>1 拒绝显式关闭该组合；环境需提供 flash_attn.cute。
 export SGLANG_DIFFUSION_TORCH_PROFILER_DIR="$OUTPUT/traces"
 python benchmark/zing_h3_causal/validate_real_checkpoint.py sglang \
   --sglang-root "$SGLANG_ROOT" --model "$EXPORTED_MODEL" \
@@ -22,8 +20,6 @@ python benchmark/zing_h3_causal/validate_real_checkpoint.py sglang \
   --no-vae-cpu-offload --no-text-encoder-offload \
   --solver few_step --denoising-step-list 1000 750 500 250 \
   --sigma-points 4 --guidance-scale 1 --seed 42 \
-  --experimental-attention fa4 --experimental-stable-shapes \
-  --experimental-compiled-adaln \
   --warmup-runs 1 --measured-runs 3 --profile-run
 python benchmark/zing_h3_causal/analyze_sp_profile.py "$OUTPUT/traces" \
   --output "$OUTPUT/profile-summary.json"
@@ -93,3 +89,37 @@ SDPA 选择了内置 Flash Attention，不能据此称为 FA4；efficient/math �
 分别表示其它 SDPA 实现。`Zing.FA4` 对应显式调用
 `flash_attn.cute.flash_attn_varlen_func`。最后用调用栈和 CUDA correlation
 核对 GPU kernel，不凭 kernel 名中有 flash 就断定版本。VAE 与 DiT 分别查看。
+
+## 默认数值路径
+
+SP1/SP2/SP4 默认启用 FA4、stable shapes 和 compiled AdaLN，无需设置三个
+`SGLANG_ZING_EXPERIMENTAL_*` 环境变量。旧名称保留兼容；SP1 可以显式覆盖
+以做消融实验，SP>1 仍拒绝关闭已验证组合。缺少 FA4 依赖时明确报错，不静默
+回落为 SDPA。验证 CLI 默认值与运行时一致，提供 `--no-sp-preserve-projection-shapes`
+和 `--no-compile-adaln` 供 SP1 对照。
+
+`--sp-preserve-projection-shapes` 保持的是关键投影的计算形状，不是视频分辨率、长度或 chunk 数：
+每个 rank 完整计算小 prefix，再只保存本 rank 的 KV heads；输出端先 gather
+hidden rows，再用完整行数执行 video/audio projection。这样避免 SP1/SP2/SP4
+的 BF16 GEMM 因行数变化而走不同的舍入路径。主干 target attention 仍使用
+Ulysses，历史 KV 仍按 heads 分片。代价是 prefix/output 的重复计算及输出
+hidden gather；这是已验证的数值一致性措施，不保证独立带来加速。
+
+## 启动参数与 checkpoint 的边界
+
+这三个选项都是启动时的执行策略，不从 checkpoint 权重或导出配置中读取：
+
+| CLI 参数 | 默认 | 用途 |
+| --- | --- | --- |
+| `--dit-attention-backend {fa4,torch_sdpa}` | `fa4` | 选择 Zing DiT attention 实现 |
+| `--sp-preserve-projection-shapes` / `--no-sp-preserve-projection-shapes` | 开启 | SP 下保留关键投影的单卡行数，避免形状导致的数值分歧 |
+| `--compile-adaln` / `--no-compile-adaln` | 开启 | 启用 native compiled RMSNorm + modulation 路径 |
+
+CLI 在创建 worker 前传入运行时，模型初始化时保存选择。FA4 是当前已验证
+组合的默认值，不是 checkpoint 对 attention 实现的规定；SP>1 的组合门禁
+是当前支持范围约束。这个 CLI 参数仅控制 Zing DiT，不是 VAE 的全局后端开关。
+
+旧的 `--experimental-attention`、`--experimental-stable-shapes`、
+`--experimental-compiled-adaln`（含两个布尔选项的 `--no-` 形式）仍作为兼容
+别名。worker 环境变量沿用旧名以兼容已有部署；新的结果 JSON 使用上述
+三个规范参数名对应的下划线字段。

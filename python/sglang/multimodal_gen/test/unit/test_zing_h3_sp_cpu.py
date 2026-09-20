@@ -16,7 +16,11 @@ from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCach
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.sampling import (
     ZingH3Sampler,
 )
-from sglang.multimodal_gen.test.unit.test_zing_h3_model import model, request  # noqa: F401
+from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
+    cpu_execution_options,
+    model,
+    request,
+)
 
 
 class _CPUCollectives:
@@ -56,7 +60,10 @@ class _CPUCollectives:
 @pytest.mark.parametrize("world", [2, 4])
 @pytest.mark.parametrize("reference_prefix", [False, True])
 def test_real_projections_rope_and_committed_kv_match_cpu_sp1(
-    model, monkeypatch, world, reference_prefix  # noqa: F811 (imported pytest fixture)
+    model,  # noqa: F811 (imported pytest fixture)
+    monkeypatch,
+    world,
+    reference_prefix,
 ):
     if world == 4:
         arch = replace(

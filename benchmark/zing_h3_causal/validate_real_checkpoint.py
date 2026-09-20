@@ -278,16 +278,22 @@ def run_reference(args):
         dist.barrier(group=sp_group)
 
 
-def run_sglang(args):
-    # Set before worker creation; each model snapshots these explicit experiment
-    # choices at initialization. The production defaults remain unchanged.
-    os.environ["SGLANG_ZING_EXPERIMENTAL_ATTENTION"] = args.experimental_attention
+def configure_execution(args):
+    """Apply launch options before workers start; never read them from weights.
+
+    Keep the legacy environment names for compatibility with deployed workers.
+    """
+    os.environ["SGLANG_ZING_EXPERIMENTAL_ATTENTION"] = args.dit_attention_backend
     os.environ["SGLANG_ZING_EXPERIMENTAL_STABLE_SHAPES"] = (
-        "1" if args.experimental_stable_shapes else "0"
+        "1" if args.sp_preserve_projection_shapes else "0"
     )
     os.environ["SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN"] = (
-        "1" if args.experimental_compiled_adaln else "0"
+        "1" if args.compile_adaln else "0"
     )
+
+
+def run_sglang(args):
+    configure_execution(args)
     from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
         DiffGenerator,
     )
@@ -409,9 +415,9 @@ def run_sglang(args):
                 "commit": _source_commit(args.sglang_root, "SGLANG_COMMIT"),
                 "hardware": _hardware(),
                 "sp_size": args.sp_size,
-                "experimental_attention": args.experimental_attention,
-                "experimental_stable_shapes": args.experimental_stable_shapes,
-                "experimental_compiled_adaln": args.experimental_compiled_adaln,
+                "dit_attention_backend": args.dit_attention_backend,
+                "sp_preserve_projection_shapes": args.sp_preserve_projection_shapes,
+                "compile_adaln": args.compile_adaln,
                 "dit_placement": args.dit_placement,
                 "encoder_parallel": args.encoder_parallel,
                 "vae_cpu_offload": args.vae_cpu_offload,
@@ -723,21 +729,32 @@ def parser():
         "--encoder-parallel", choices=("replicate", "auto", "fold"), default="replicate"
     )
     sglang.add_argument(
+        "--dit-attention-backend",
         "--experimental-attention",
+        dest="dit_attention_backend",
         choices=("torch_sdpa", "fa4"),
-        default="torch_sdpa",
-        help="Explicit Zing attention experiment; does not change production defaults",
+        default="fa4",
+        help="Launch-time Zing DiT backend, independent of checkpoint weights (default: fa4)",
     )
     sglang.add_argument(
+        "--sp-preserve-projection-shapes",
         "--experimental-stable-shapes",
-        action="store_true",
-        help="Experiment with replicated prefix and full-row output projections",
+        dest="sp_preserve_projection_shapes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Keep SP1 projection row counts across SP: replicate prefix and gather "
+            "hidden rows before output projection (default: enabled)"
+        ),
     )
     sglang.add_argument("--profile-run", action="store_true")
     sglang.add_argument(
+        "--compile-adaln",
         "--experimental-compiled-adaln",
-        action="store_true",
-        help="Experiment with native compiled RMSNorm and modulation rounding",
+        dest="compile_adaln",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Native compiled RMSNorm and modulation rounding (default: enabled)",
     )
     sglang.add_argument(
         "--save-all-raw",

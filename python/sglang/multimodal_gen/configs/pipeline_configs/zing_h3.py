@@ -83,7 +83,7 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
             missing = [
                 f"{name}={value}"
                 for name, value in required.items()
-                if os.environ.get(name) != value
+                if os.environ.get(name, value) != value
             ]
             if missing:
                 raise ValueError(

@@ -156,7 +156,8 @@ def test_zing_sp_requires_validated_numerical_configuration(
         resolve_component_attention_backend=lambda _name: (None, None),
     )
     config = ZingH3CausalPipelineConfig()
-    if sp == 1 or (attention, stable, compiled) == ("fa4", "1", "1"):
+    effective = (attention or "fa4", stable or "1", compiled or "1")
+    if sp == 1 or effective == ("fa4", "1", "1"):
         config.validate_server_args(args)
     else:
         with pytest.raises(ValueError, match="numerically validated configuration"):

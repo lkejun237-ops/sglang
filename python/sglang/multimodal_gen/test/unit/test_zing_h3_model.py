@@ -22,6 +22,14 @@ from sglang.multimodal_gen.test.unit.test_minimax_h3_dit_contract import (
 )
 
 
+@pytest.fixture(autouse=True)
+def cpu_execution_options(monkeypatch):
+    # These tests exercise layout/arithmetic on CPU, not the default CUDA path.
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_ATTENTION", "torch_sdpa")
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_STABLE_SHAPES", "0")
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN", "0")
+
+
 @pytest.fixture
 def model():
     _ensure_single_process_parallel_runtime()

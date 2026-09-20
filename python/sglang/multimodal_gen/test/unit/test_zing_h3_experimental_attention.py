@@ -13,6 +13,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
     ZingH3Sampler,
 )
 from sglang.multimodal_gen.test.unit.test_zing_h3_model import (
+    cpu_execution_options,  # noqa: F401
     model as model_fixture,
     request,
 )
@@ -64,14 +65,14 @@ def test_model_snapshots_experiments_and_routes_refiner_and_main(
     assert len(norm_calls) == (2 * len(model.blocks) if compiled == "1" else 0)
 
 
-def test_default_experiments_are_off(monkeypatch):
+def test_default_execution_uses_validated_combination(monkeypatch):
     monkeypatch.delenv("SGLANG_ZING_EXPERIMENTAL_ATTENTION", raising=False)
     monkeypatch.delenv("SGLANG_ZING_EXPERIMENTAL_STABLE_SHAPES", raising=False)
     monkeypatch.delenv("SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN", raising=False)
     model = model_fixture.__wrapped__()
-    assert model.experimental_attention_backend == "torch_sdpa"
-    assert model.experimental_stable_shapes is False
-    assert model.experimental_compiled_adaln is False
+    assert model.experimental_attention_backend == "fa4"
+    assert model.experimental_stable_shapes is True
+    assert model.experimental_compiled_adaln is True
 
 
 @pytest.mark.parametrize(

@@ -69,7 +69,7 @@ def _compiled_rms_norm_modulate(deterministic):
 
 
 def _native_compiled_adaln(hidden, norm, shift, scale):
-    """Opt-in native CUDA fusion, including its singleton batch dimension."""
+    """Native CUDA fusion, including its singleton batch dimension."""
     if not hidden.is_cuda:
         raise ValueError("Zing experimental compiled AdaLN requires CUDA tensors")
     return _compiled_rms_norm_modulate(torch.are_deterministic_algorithms_enabled())(
@@ -78,7 +78,7 @@ def _native_compiled_adaln(hidden, norm, shift, scale):
 
 
 def _fa4_attention(q, k, v, scale):
-    """Explicit experimental native FA4 route for one unmasked document."""
+    """Native FA4 route for one unmasked document."""
     if not q.is_cuda:
         raise ValueError("Zing experimental FA4 attention requires CUDA tensors")
     try:
@@ -218,16 +218,16 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
 
     def __init__(self, config, hf_config, quant_config=None, **kwargs):
         experimental_attention = os.environ.get(
-            "SGLANG_ZING_EXPERIMENTAL_ATTENTION", "torch_sdpa"
+            "SGLANG_ZING_EXPERIMENTAL_ATTENTION", "fa4"
         )
         if experimental_attention not in {"torch_sdpa", "fa4"}:
             raise ValueError(
                 "SGLANG_ZING_EXPERIMENTAL_ATTENTION must be torch_sdpa or fa4"
             )
-        stable_shapes = os.environ.get("SGLANG_ZING_EXPERIMENTAL_STABLE_SHAPES", "0")
+        stable_shapes = os.environ.get("SGLANG_ZING_EXPERIMENTAL_STABLE_SHAPES", "1")
         if stable_shapes not in {"0", "1"}:
             raise ValueError("SGLANG_ZING_EXPERIMENTAL_STABLE_SHAPES must be 0 or 1")
-        compiled_adaln = os.environ.get("SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN", "0")
+        compiled_adaln = os.environ.get("SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN", "1")
         if compiled_adaln not in {"0", "1"}:
             raise ValueError("SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN must be 0 or 1")
         arch = config.arch_config
