@@ -112,6 +112,7 @@ class H3InferenceInputs:
     pixel_frame_count: int
     sample_count: int | None
     sample_rate: int
+    condition_media: list[dict[str, Any]] | None = None
 
 
 class ZingH3Packer:

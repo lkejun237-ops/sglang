@@ -40,6 +40,10 @@ class ZingH3KVCache:
         self.last_block = 0
         self.layer_layouts = None
 
+    def rollback(self):
+        """Discard an unfinished source/target pair, preserving committed history."""
+        self.pending_source = self.active = None
+
     def _history(self):
         chunks = self.committed
         if self.local_frames >= 0:

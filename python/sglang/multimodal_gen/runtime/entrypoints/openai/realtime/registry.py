@@ -36,6 +36,9 @@ def _register_builtin_realtime_model_adapters() -> None:
     from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import (
         SanaWMRealtimeConfig,
     )
+    from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
+        ZingH3CausalPipelineConfig,
+    )
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.lingbot_world_realtime_adapter import (
         LingBotWorldRealtimeAdapter,
     )
@@ -45,7 +48,11 @@ def _register_builtin_realtime_model_adapters() -> None:
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.sana_wm_realtime_adapter import (
         SanaWMRealtimeAdapter,
     )
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.zing_h3_realtime_adapter import (
+        ZingH3RealtimeAdapter,
+    )
 
+    register_realtime_model_adapter(ZingH3CausalPipelineConfig, ZingH3RealtimeAdapter)
     register_realtime_model_adapter(
         LingBotWorldCausalDMDConfig,
         LingBotWorldRealtimeAdapter,

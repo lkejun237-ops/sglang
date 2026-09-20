@@ -21,6 +21,7 @@ class ZingH3SamplingParams(SamplingParams):
     zing_denoising_step_list: list[int] | None = None
     zing_generate_audio: bool = False
     zing_return_latents: bool = False
+    zing_realtime_decode_mode: str = "immediate"
 
     def _adjust(self, server_args):
         enable_sequence_shard = self.enable_sequence_shard
@@ -45,6 +46,7 @@ class ZingH3SamplingParams(SamplingParams):
                 "zing_denoising_step_list",
                 "zing_generate_audio",
                 "zing_return_latents",
+                "zing_realtime_decode_mode",
             }
         )
 

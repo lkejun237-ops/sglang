@@ -5,6 +5,7 @@ import io
 from contextlib import nullcontext
 from types import SimpleNamespace
 
+import pytest
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
@@ -66,11 +67,16 @@ def test_validate_positive_int_rejects_non_positive_sampling_fields():
         raise AssertionError("expected bad request")
 
 
-def test_process_generation_batch_accepts_async_raw_frame_reference(monkeypatch):
-    expected = OutputBatch(
-        raw_frame_shared_memory_ref={"kind": "raw_rgb24_frames", "version": 1}
-    )
-
+@pytest.mark.parametrize(
+    "expected",
+    [
+        OutputBatch(
+            raw_frame_shared_memory_ref={"kind": "raw_rgb24_frames", "version": 1}
+        ),
+        OutputBatch(raw_frame_batches=[]),
+    ],
+)
+def test_process_generation_batch_accepts_raw_frame_transport(monkeypatch, expected):
     class _SchedulerClient:
         async def forward(self, _batch):
             return expected

@@ -503,3 +503,326 @@ def test_export_and_native_loader_keep_all_tensors_and_precision(model, tmp_path
     with pytest.raises(ValueError, match="checkpoint keys"):
         export_module.export(checkpoint, yaml_path, components, tmp_path / "incomplete")
     assert not (tmp_path / "incomplete").exists()
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("solver", ["euler", "few_step"])
+def test_incremental_blocks_match_offline_sampler(model, solver):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.realtime import (
+        ZingH3RealtimeState,
+    )
+
+    packer, inputs, visual, audio = request(model)
+    kwargs = {"solver": solver, "sigma_points": 3}
+    if solver == "few_step":
+        kwargs["denoising_step_list"] = [1000, 500]
+    offline = ZingH3Sampler(model, packer, **kwargs)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(123)
+        expected_video, expected_audio = offline.sample(inputs, visual, audio)
+    sampler = ZingH3Sampler(model, packer, **kwargs)
+    state = sampler.initialize(inputs, visual, audio)
+    rng = ZingH3RealtimeState()
+    with rng.random_stream(torch.device("cpu"), 123):
+        assert sampler.step(state) == (0, 2)
+    assert state.cache.last_block == 2
+    assert len(state.cache.committed) == 1
+    assert state.cache.active is state.cache.pending_source is None
+    torch.testing.assert_close(state.visual[:, :, 2:], visual[:, :, 2:])
+    # An unrelated request must not perturb the second block's re-noise RNG.
+    torch.randn(99)
+    with rng.random_stream(torch.device("cpu"), 123):
+        assert sampler.step(state) == (2, 3)
+    assert state.cache.last_block == 4
+    assert len(state.cache.committed) == 2
+    torch.testing.assert_close(state.visual, expected_video, rtol=0, atol=0)
+    torch.testing.assert_close(state.audio, expected_audio, rtol=0, atol=0)
+    state.close()
+    assert state.cache.history(0) is None
+    assert state.visual is state.positive is None
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("incremental", [False, True])
+def test_sampler_preserves_diagnostics_across_realtime_split(
+    model, monkeypatch, incremental
+):
+    from contextlib import nullcontext
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        sampling,
+    )
+
+    completed, phases, regions = [], [], []
+    diagnostic = SimpleNamespace(phase=None)
+    diagnostic.record = lambda name, **values: completed.append(
+        (name, diagnostic.phase, values["video"].clone())
+    )
+    monkeypatch.setattr(sampling, "current_diagnostic", lambda: diagnostic)
+    monkeypatch.setattr(
+        sampling,
+        "maybe_record_function",
+        lambda name: (regions.append(name), nullcontext())[1],
+    )
+    packer, inputs, visual, audio = request(model)
+    sampler = ZingH3Sampler(model, packer, sigma_points=3)
+    original = sampler._forward
+
+    def forward(*args, **kwargs):
+        phases.append(diagnostic.phase)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(sampler, "_forward", forward)
+    if incremental:
+        state = sampler.initialize(inputs, visual, audio)
+        try:
+            while state.index < len(state.spans):
+                sampler.step(state)
+            actual = state.visual.clone()
+        finally:
+            state.close()
+    else:
+        actual, _ = sampler.sample(inputs, visual, audio)
+    assert phases == [
+        "prefix",
+        "block1.source",
+        "block2.step0",
+        "block2.step1",
+        "block2.commit",
+        "block3.source",
+        "block4.step0",
+        "block4.step1",
+        "block4.commit",
+    ]
+    assert [(name, phase) for name, phase, _ in completed] == [
+        ("block_complete", "block2.commit"),
+        ("block_complete", "block4.commit"),
+    ]
+    torch.testing.assert_close(completed[-1][2], actual, rtol=0, atol=0)
+    assert sum(name.startswith("Zing.causal_block") for name in regions) == 2
+    assert sum(name.startswith("Zing.denoise_step") for name in regions) == 4
+    assert sampler.video_scheduler.diagnostic_modality == "video"
+    assert sampler.audio_scheduler.diagnostic_modality == "audio"
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("failure_phase", ["active", "final"])
+def test_second_block_failure_rolls_back_source_and_keeps_history(
+    model, monkeypatch, failure_phase
+):
+    packer, inputs, visual, audio = request(model)
+    sampler = ZingH3Sampler(model, packer, sigma_points=3)
+    state = sampler.initialize(inputs, visual, audio)
+    sampler.step(state)
+    history = tuple(t.clone() for t in state.cache.history(0))
+    first = state.cache.committed[0]
+    original = sampler._forward
+
+    def failing(packed, cache, update):
+        if update == failure_phase:
+            assert cache.pending_source is not None
+            raise RuntimeError("cancelled block")
+        return original(packed, cache, update)
+
+    monkeypatch.setattr(sampler, "_forward", failing)
+    with pytest.raises(RuntimeError, match="cancelled"):
+        sampler.step(state)
+    assert state.index == 1 and state.cache.last_block == 2
+    assert state.cache.committed == [first]
+    assert state.cache.pending_source is state.cache.active is None
+    for actual, expected in zip(state.cache.history(0), history):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    monkeypatch.setattr(sampler, "_forward", original)
+    sampler.step(state)
+    assert state.index == 2 and state.cache.last_block == 4
+    state.close()
+
+
+@torch.no_grad()
+def test_prompt_updates_keep_absolute_video_positions_and_committed_kv(model):
+    packer, inputs, visual, _ = request(model, audio=False)
+    sampler = ZingH3Sampler(model, packer, sigma_points=2)
+    state = sampler.initialize(inputs, visual)
+    sampler.step(state)
+    committed = state.cache.committed[0]
+    positions = state.positive["position_ids"][state.positive["block_idx"] > 0].clone()
+    for length in (7, 2):
+        old_prefix = state.cache.prefix
+        inputs.positive = {
+            "context": torch.randn(length, 12).bfloat16(),
+            "row_role": torch.zeros(length, dtype=torch.long),
+        }
+        sampler.update_condition(state, inputs)
+        assert state.cache.prefix is not old_prefix
+        assert state.cache.committed[0] is committed
+        torch.testing.assert_close(
+            state.positive["position_ids"][state.positive["block_idx"] > 0],
+            positions,
+            rtol=0,
+            atol=0,
+        )
+    sampler.step(state)
+    assert state.cache.last_block == 4
+    state.close()
+
+
+@pytest.fixture
+def realtime_stage(model):
+    from contextlib import nullcontext
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.stage import (
+        ZingH3GenerationStage,
+    )
+
+    packer, inputs, _, _ = request(model, audio=False)
+    inputs.audio_shape, inputs.pixel_frame_count = None, 9
+    inputs.sample_rate, inputs.output_type = 32000, "video"
+    inputs.condition_media = []
+    stage = object.__new__(ZingH3GenerationStage)
+    stage.modules = {"transformer": model}
+    stage.packer = packer
+    stage.runtime = {
+        "timestep_shift": 5.0,
+        "audio_timestep_shift": 3.0,
+        "num_train_timestep": 1000,
+    }
+    seen = []
+
+    def prepare(raw, use, **kwargs):
+        seen.append(raw)
+        return inputs
+
+    def decode(latent, frames):
+        # Encode temporal index into pixels to catch repeated/skipped frame slices.
+        return (
+            torch.arange(frames)
+            .view(1, 1, frames, 1, 1)
+            .expand(1, 3, frames, 32, 32)
+            .float()
+        )
+
+    stage.codecs = SimpleNamespace(
+        prepare=prepare,
+        decode_visual_range=lambda latent, start, end: decode(latent, end)[
+            :, :, start:end
+        ],
+        spatial_ratio=16,
+        temporal_ratio=4,
+        target_fps=24.0,
+        vae_latents_per_chunk=5,
+        vae_frames_per_chunk=17,
+        _parse_inference_request=lambda raw: (
+            raw["messages"][0]["content"][0]["text"],
+        ),
+        encode_condition=lambda prompt, media: inputs.positive,
+    )
+    stage._use = lambda name, phase="encode": nullcontext(model)
+    return stage, seen
+
+
+def _realtime_batch(index, session):
+    return SimpleNamespace(
+        sampling_params=ZingH3SamplingParams(
+            prompt="A moving scene",
+            num_frames=9,
+            height=32,
+            width=32,
+            num_inference_steps=3,
+            seed=42,
+        ),
+        extra={},
+        metrics=None,
+        realtime_session_id="zing-session",
+        block_idx=index,
+        session=session,
+    )
+
+
+@torch.no_grad()
+def test_realtime_stage_returns_first_block_before_second_and_releases_final(
+    realtime_stage,
+):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.realtime import (
+        ZingH3RealtimeState,
+    )
+    from sglang.multimodal_gen.runtime.realtime.session import RealtimeSession
+
+    stage, seen = realtime_stage
+    session = RealtimeSession()
+    first = stage.forward(_realtime_batch(0, session), None)
+    state = session.get_state(ZingH3RealtimeState)
+    cache = state.sampling.cache
+    assert state.sampling.index == 1 and cache.last_block == 2
+    assert first.output.shape[2] == 5
+    second = stage.forward(_realtime_batch(1, session), None)
+    assert len(seen) == 1
+    joined = torch.cat((first.output, second.output), dim=2)
+    torch.testing.assert_close(joined[0, 0, :, 0, 0], torch.arange(9).float())
+    assert state.sampling is state.inputs is state.cpu_rng is None
+    assert cache.history(0) is None
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("end", ["disconnect", "decode_failure", "out_of_order"])
+def test_realtime_session_cleanup(realtime_stage, end):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.realtime import (
+        ZingH3RealtimeState,
+    )
+    from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
+
+    stage, _ = realtime_stage
+    sessions = RealtimeSessionCache()
+    first = _realtime_batch(0, None)
+    sessions.attach(first)
+    stage.forward(first, None)
+    state = first.session.get_state(ZingH3RealtimeState)
+    sampling = state.sampling
+    if end == "disconnect":
+        assert sessions.release(first.realtime_session_id)
+    elif end == "out_of_order":
+        with pytest.raises(ValueError, match="in order"):
+            stage.forward(_realtime_batch(3, first.session), None)
+    else:
+
+        def fail(*args):
+            raise RuntimeError("decoder failed")
+
+        stage.codecs.decode_visual_range = fail
+        with pytest.raises(RuntimeError, match="decoder failed"):
+            stage.forward(_realtime_batch(1, first.session), None)
+    assert sampling.closed and sampling.cache.history(0) is None
+    assert state.inputs is state.sampling is state.cpu_rng is state.cuda_rng is None
+
+
+@torch.no_grad()
+def test_stable_decode_waits_for_complete_windows_and_preserves_block_events(
+    realtime_stage,
+):
+    from sglang.multimodal_gen.runtime.realtime.session import RealtimeSession
+
+    stage, _ = realtime_stage
+    stage.packer.num_frame_per_block = 5
+    inputs = stage.codecs.prepare(None, None)
+    inputs.visual_shape = (12, 2, 2)
+    inputs.source_visual = torch.randn(1, 2, 12, 2, 2)
+    inputs.pixel_frame_count = 39
+    stage.codecs.va = SimpleNamespace(vae_token_drop=3)
+    session = RealtimeSession()
+    outputs, events = [], []
+    for index in range(3):
+        batch = _realtime_batch(index, session)
+        batch.sampling_params.zing_realtime_decode_mode = "stable"
+        batch.realtime_event_id = index + 1
+        batch.request_id = f"block-{index}"
+        result = stage.forward(batch, None)
+        if index == 0:
+            assert result.output is None
+            assert result.raw_frame_batches == []
+        else:
+            outputs.extend(result.output)
+            events.extend(result.usage["zing_realtime_blocks"])
+            assert len(result.output) == (1 if index == 1 else 2)
+    assert [x.shape[1] for x in outputs] == [17, 17, 5]
+    assert [x["event_id"] for x in events] == [1, 2, 3]
+    joined = torch.cat(outputs, dim=1)
+    torch.testing.assert_close(joined[0, :, 0, 0], torch.arange(39).float())

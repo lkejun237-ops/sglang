@@ -1378,13 +1378,14 @@ async def _send_output_and_log(
             result,
             batch,
         )
-        _mark_session_playable_from_server_output(
-            session,
-            source="output_batch_sent",
-            request_id=chunk.request_id,
-            chunk_index=batch.block_idx,
-            event_id=getattr(batch, "realtime_event_id", None),
-        )
+        if send_stats["num_frames"] > 0:
+            _mark_session_playable_from_server_output(
+                session,
+                source="output_batch_sent",
+                request_id=chunk.request_id,
+                chunk_index=batch.block_idx,
+                event_id=getattr(batch, "realtime_event_id", None),
+            )
         send_stats["pace_wait_ms"] = pace_wait_ms
         chunk_total_ms = (time.perf_counter() - chunk_started) * 1000
         _log_realtime_chunk_timing(

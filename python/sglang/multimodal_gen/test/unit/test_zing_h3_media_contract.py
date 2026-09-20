@@ -73,11 +73,21 @@ def make_request(kind, *, references=0, source=True):
         ("image", 0, True),
         ("image", 3, True),
         ("video", 0, True),
+        ("video", 3, True),
         ("video_audio", 0, True),
     ],
-    ids=["image-edit", "multi-reference-image", "video-edit", "video-audio-edit"],
+    ids=[
+        "image-edit",
+        "multi-reference-image",
+        "video-edit",
+        "reference-source-video",
+        "video-audio-edit",
+    ],
 )
-def test_prepare_routes_four_media_cases(codecs, monkeypatch, kind, references, source):
+@pytest.mark.parametrize("retain_media", [False, True])
+def test_prepare_routes_reference_and_source_media(
+    codecs, monkeypatch, kind, references, source, retain_media
+):
     loaded, decoded, encoded_media, audio_samples = [], [], [], []
 
     @contextmanager
@@ -112,8 +122,13 @@ def test_prepare_routes_four_media_cases(codecs, monkeypatch, kind, references, 
     )
     monkeypatch.setattr(codecs, "encode_audio", audio)
     result = codecs.prepare(
-        make_request(kind, references=references, source=source), use_component
+        make_request(kind, references=references, source=source),
+        use_component,
+        retain_condition_media=retain_media,
     )
+    assert (result.condition_media is not None) is retain_media
+    if retain_media:
+        assert [item["id"] for item in result.condition_media] == encoded_media
     assert result.output_type == kind
     assert result.pixel_frame_count == (1 if kind == "image" else 125)
     assert result.visual_shape == ((1 if kind == "image" else 38), 2, 2)
@@ -205,3 +220,119 @@ def test_condition_video_timestamps_follow_source_frames(
     )
     assert seen["video_block_timestamps"][0] == pytest.approx(expected)
     assert seen["frames"] == len(expected) * 2
+
+
+@pytest.fixture
+def temporal_codecs(codecs):
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.klvae import (
+        AutoencoderKL,
+    )
+
+    # Exercise the actual H3 temporal assembly/blending, replacing only the
+    # expensive learned per-window decoder with a context-sensitive CPU kernel.
+    vae = AutoencoderKL.__new__(AutoencoderKL)
+    torch.nn.Module.__init__(vae)
+    vae.register_parameter("anchor", torch.nn.Parameter(torch.zeros(())))
+    vae.vae_ratio_t = 4
+    vae.clip_length = 17
+    vae.token_drop = 3
+    vae.tokens_chunk_size = 5
+    vae.token_overlap = 2
+    vae.frame_pre_padding = 3
+    vae.frame_overlap = 5
+    vae.isolated_first_frame = vae.isolated_last_frame = False
+    vae.use_3d_conv = True
+    vae._blend_weight_cache = {}
+    vae.eval()
+    calls = []
+
+    def decode(z):
+        calls.append(z.detach().clone())
+        return z.repeat_interleave(4, dim=2) + z.mean(dim=2, keepdim=True)
+
+    vae._adaptive_decode = decode
+    codecs.modules = {"video_vae": vae}
+    codecs.va = SimpleNamespace(
+        vae_token_drop=3, latents_mean=[0, 0, 0], latents_std=[1, 1, 1]
+    )
+    return codecs, calls
+
+
+@pytest.mark.parametrize("stream_cat", ["0", "1"])
+@pytest.mark.parametrize("frames", [1, 2, 17, 18, 22, 34, 39, 243])
+def test_decode_range_matches_full_h3_temporal_assembly(
+    temporal_codecs, monkeypatch, stream_cat, frames
+):
+    import math
+
+    codecs, calls = temporal_codecs
+    monkeypatch.setenv("MINIMAX_H3_VAE_DECODER_STREAM_TEMPORAL_CAT", stream_cat)
+    full, tail = divmod(frames - 1, 17)
+    tokens = full * 5 + 1 + math.ceil(tail / 4)
+    latent = torch.linspace(-0.4, 0.4, tokens).view(1, 1, tokens, 1, 1)
+    latent = latent.expand(1, 3, tokens, 1, 1)
+    expected = codecs.decode_visual(latent, frames)
+    # Every start offset includes clip boundaries and the blended overlap.
+    for start in range(frames):
+        actual = codecs.decode_visual_range(latent, start, frames)
+        torch.testing.assert_close(actual, expected[:, :, start:], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("mode", ["immediate", "stable"])
+def test_streaming_ranges_match_previous_prefix_semantics_with_bounded_work(
+    temporal_codecs, mode
+):
+    codecs, calls = temporal_codecs
+    latent = torch.linspace(-0.4, 0.4, 72).view(1, 1, 72, 1, 1).expand(1, 3, 72, 1, 1)
+    emitted = 0
+    for end in [*range(5, 72, 5), 72]:
+        full, tail = divmod(end - 1, 5)
+        frame_end = min(243, full * 17 + 1 + tail * 4)
+        if mode == "stable" and end != 72:
+            frame_end = max(0, (end - 2) // 5) * 17
+        if frame_end <= emitted:
+            continue
+        expected = codecs.decode_visual(latent[:, :, :end], frame_end)[:, :, emitted:]
+        calls.clear()
+        actual = codecs.decode_visual_range(latent[:, :, :end], emitted, frame_end)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        # Work per output remains bounded even late in a 10-second sequence.
+        assert len(calls) <= 3
+        assert all(z.shape[2] <= 7 for z in calls)
+        emitted = frame_end
+    assert emitted == 243
+
+
+@pytest.mark.parametrize("height,width", [(31, 32), (32, 31), (0, 32), (64, 64)])
+def test_source_request_rejects_invalid_target_geometry_before_loading(
+    codecs, monkeypatch, height, width
+):
+    request = make_request("video")
+    request["messages"][1]["content"][0]["output"].update(height=height, width=width)
+    monkeypatch.setattr(
+        codecs,
+        "_decode_media",
+        lambda item, **kw: {
+            **item,
+            "frames": torch.zeros(3, 125, 32, 32, dtype=torch.uint8),
+            "fps": 24.0,
+        },
+    )
+    with pytest.raises(ValueError, match="geometry"):
+        codecs.prepare(request, lambda name: pytest.fail("No model should load"))
+
+
+def test_source_request_rejects_incompatible_aspect_before_loading(codecs, monkeypatch):
+    monkeypatch.setattr(
+        codecs,
+        "_decode_media",
+        lambda item, **kw: {
+            **item,
+            "frames": torch.zeros(3, 125, 32, 128, dtype=torch.uint8),
+            "fps": 24.0,
+        },
+    )
+    with pytest.raises(ValueError, match="aspect ratio"):
+        codecs.prepare(
+            make_request("video"), lambda name: pytest.fail("No model should load")
+        )

@@ -205,7 +205,8 @@ class ZingH3Codecs(ZingH3MediaInput):
         mean, std = self._stats(self.aa, latent, audio=True)
         return ((latent - mean) / std).half()
 
-    def prepare(self, request, use_component):
+    def prepare(self, request, use_component, *, retain_condition_media=False):
+        # Reuse decoded references for prompt refreshes; offline calls release them.
         if isinstance(request, dict) and "cache_uri" in request:
             raise ValueError(
                 "Zing runtime accepts media messages, not pickled request caches"
@@ -263,7 +264,34 @@ class ZingH3Codecs(ZingH3MediaInput):
             frames,
             samples,
             self.audio_sample_rate,
+            condition_media=media if retain_condition_media else None,
         )
+
+    def decode_visual_range(self, latent, frame_start, frame_end):
+        """Decode new pixels plus one preceding clip for H3 overlap blending.
+
+        Starting at a clip boundary preserves temporal padding. The preceding
+        clip supplies the blend into the first requested clip; earlier clips
+        cannot affect that range. Immediate mode may revisit the unfinished
+        boundary window, but neither mode re-decodes the growing full prefix.
+        Slice before copying to the VAE device to bound the transfer as well.
+        """
+        if not 0 <= frame_start < frame_end:
+            raise ValueError("Invalid Zing video decode range")
+        model = self.modules["video_vae"]
+        if getattr(model, "isolated_first_frame", False) or getattr(
+            model, "isolated_last_frame", False
+        ):
+            raise ValueError(
+                "Zing streaming decoding requires the standard H3 temporal layout"
+            )
+        clip = max(0, frame_start // self.vae_frames_per_chunk - 1)
+        offset = clip * self.vae_frames_per_chunk
+        window = latent[:, :, clip * self.vae_latents_per_chunk :].to(
+            next(model.parameters()).device
+        )
+        decoded = self.decode_visual(window, frame_end - offset)
+        return decoded[:, :, frame_start - offset : frame_end - offset]
 
     def decode_visual(self, latent, frames):
         model = self.modules["video_vae"]

@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.utils.zing_diagnostics import (
 
 from .codecs import ZingH3Codecs
 from .packing import ZingH3Packer
+from .realtime import ZingH3RealtimeState
 from .sampling import ZingH3Sampler
 
 
@@ -154,6 +155,8 @@ class ZingH3GenerationStage(PipelineStage):
     @torch.no_grad()
     @diagnostic_request
     def forward(self, batch, server_args):
+        if getattr(batch, "realtime_session_id", None):
+            return self._forward_realtime(batch, server_args)
         params = batch.sampling_params
         self._validate_sampling_params(params)
         request = self._build_request(batch)
@@ -275,3 +278,159 @@ class ZingH3GenerationStage(PipelineStage):
                     }
                 },
             )
+
+    def _forward_realtime(self, batch, server_args):
+        if batch.session is None:
+            raise ValueError("Zing realtime request is missing its worker session")
+        state = batch.session.get_or_create_state(ZingH3RealtimeState)
+        try:
+            with set_forward_context(current_timestep=0, attn_metadata=None):
+                return self._generate_realtime_block(batch, state)
+        except BaseException:
+            state.dispose()
+            raise
+
+    def _prepare_realtime_state(self, batch, state):
+        params = batch.sampling_params
+        self._validate_sampling_params(params)
+        if state.sampling is None:
+            if batch.block_idx != 0:
+                raise ValueError("Zing realtime session must start at block zero")
+            state.sampler = self._build_sampler(params)
+            request = self._build_request(batch)
+            state.inputs = self.codecs.prepare(
+                request, self._use, retain_condition_media=True
+            )
+            if state.inputs.audio_shape is not None:
+                raise ValueError("Audio streaming is not supported yet.")
+            state.prompt = self.codecs._parse_inference_request(request)[0]
+        elif batch.block_idx != state.sampling.index:
+            raise ValueError("Zing realtime blocks must be requested in order")
+        mode = getattr(params, "zing_realtime_decode_mode", "immediate")
+        if mode not in {"immediate", "stable"}:
+            raise ValueError("Invalid Zing realtime decode mode")
+        return mode
+
+    def _sample_realtime_block(self, batch, state):
+        params = batch.sampling_params
+        inputs, sampler = state.inputs, state.sampler
+        prompt_changed = params.prompt != state.prompt
+        if prompt_changed:
+            with self._use("text_encoder"):
+                inputs.positive = self.codecs.encode_condition(
+                    params.prompt, inputs.condition_media
+                )
+        with self._use("transformer", "denoise") as transformer:
+            sampler.generator = transformer
+            device = next(transformer.parameters()).device
+            seed = params.seed[0] if isinstance(params.seed, list) else params.seed
+            with state.random_stream(device, seed):
+                if state.sampling is None:
+                    visual = torch.randn(
+                        (1, self.packer.visual_channels, *inputs.visual_shape),
+                        device=device,
+                    )
+                    state.sampling = sampler.initialize(inputs, visual)
+                elif prompt_changed:
+                    sampler.update_condition(state.sampling, inputs)
+                _, end = sampler.step(state.sampling)
+            state.prompt = params.prompt
+        return end
+
+    def _queue_realtime_output(self, batch, state, end, mode, final):
+        inputs = state.inputs
+        full, tail = divmod(end - 1, self.codecs.vae_latents_per_chunk)
+        frame_end = min(
+            inputs.pixel_frame_count,
+            full * self.codecs.vae_frames_per_chunk
+            + 1
+            + tail * self.codecs.temporal_ratio,
+        )
+        if state.sampling.index == len(state.sampling.spans):
+            frame_end = inputs.pixel_frame_count
+        state.pending_blocks.append(
+            {
+                "block_idx": batch.block_idx,
+                "request_id": getattr(batch, "request_id", None),
+                "event_id": getattr(batch, "realtime_event_id", None),
+                "frame_end": frame_end,
+            }
+        )
+        # A full H3 temporal decode window needs chunk + overlap latent frames.
+        # Only its leading clip is final; its overlap can still be blended later.
+        chunk = self.codecs.vae_latents_per_chunk
+        overlap = (-self.codecs.va.vae_token_drop) % chunk if mode == "stable" else 0
+        stable_end = max(0, (end - overlap) // chunk) * self.codecs.vae_frames_per_chunk
+        ready = [
+            block
+            for block in state.pending_blocks
+            if mode == "immediate" or final or block["frame_end"] <= stable_end
+        ]
+        return ready
+
+    def _decode_realtime_output(self, state, end, ready):
+        inputs = state.inputs
+        first_frame = state.emitted_frames
+        with self._use("video_vae", "decode"):
+            latent = state.sampling.visual[:, :, :end]
+            decoded = self.codecs.decode_visual_range(
+                latent, first_frame, ready[-1]["frame_end"]
+            )
+            height, width = (
+                n * self.codecs.spatial_ratio for n in inputs.visual_shape[1:]
+            )
+            outputs = []
+            for block in ready:
+                frames = decoded[
+                    0,
+                    :,
+                    state.emitted_frames - first_frame : block["frame_end"]
+                    - first_frame,
+                    :height,
+                    :width,
+                ].contiguous()
+                if frames.shape[1] < 1:
+                    raise ValueError("Zing realtime block produced no video frames")
+                outputs.append(frames)
+                state.emitted_frames = block["frame_end"]
+        state.pending_blocks = state.pending_blocks[len(ready) :]
+        return outputs, height, width
+
+    def _generate_realtime_block(self, batch, state):
+        params = batch.sampling_params
+        mode = self._prepare_realtime_state(batch, state)
+        end = self._sample_realtime_block(batch, state)
+        final = state.sampling.index == len(state.sampling.spans) or batch.extra.get(
+            "realtime_is_final_chunk", False
+        )
+        ready = self._queue_realtime_output(batch, state, end, mode, final)
+        trajectory = (
+            state.sampling.visual[:, :, :end].detach().clone()
+            if getattr(params, "zing_return_latents", False)
+            else None
+        )
+        if not ready:
+            return OutputBatch(
+                # An explicit empty frame batch is a successful buffered step;
+                # an entirely absent output is reserved for scheduler failures.
+                raw_frame_batches=[],
+                metrics=batch.metrics,
+                trajectory_latents=trajectory,
+            )
+        outputs, height, width = self._decode_realtime_output(state, end, ready)
+        params.num_frames, params.height, params.width = (
+            sum(x.shape[1] for x in outputs),
+            height,
+            width,
+        )
+        params.fps = self.codecs.target_fps
+        # Immediate mode keeps its existing single-tensor transport contract.
+        result = OutputBatch(
+            output=outputs[0].unsqueeze(0) if mode == "immediate" else outputs,
+            metrics=batch.metrics,
+            trajectory_latents=trajectory,
+            usage={"zing_realtime_blocks": ready} if mode == "stable" else None,
+        )
+        if final:
+            state.dispose()
+        return result
