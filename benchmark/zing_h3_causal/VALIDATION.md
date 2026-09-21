@@ -13,6 +13,10 @@ previous review's numerical acceptance concern. Maintainers must explicitly deci
 whether the baseline can merge with that known limitation; no approval or waiver is
 claimed here.
 
+如需使用真实模型权重进行小规模基本测试，请参阅
+[白模源视频测试用例](WHITEBOX_VIDEO_SMOKE.md)。该用例复用训练样本中的
+120 帧白模源视频与五张合并三视图，无需运行完整的离线评测。
+
 ## Real-checkpoint experiment: e2e-threeway-r2
 
 [Internal three-way media report](https://review-cdn.loopit.com.cn/world-model/evals/zing-h3-causal/b300-baseline-20260916/layer1/e2e-threeway-r2/review/index.html)
