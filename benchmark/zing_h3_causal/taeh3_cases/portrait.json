@@ -1,0 +1,28 @@
+{
+  "sample_id": "taeh3-portrait",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "A close portrait of a woman in natural daylight speaking and turning her head slowly. Fine individual hairs move in a light breeze. Her eyes, teeth, skin texture and earrings remain clear and consistent. Smooth realistic motion, no watermark."
+        }
+      ]
+    },
+    {
+      "role": "target",
+      "content": [
+        {
+          "type": "video",
+          "output": {
+            "frames": 240,
+            "height": 480,
+            "width": 832
+          }
+        }
+      ],
+      "conditions": []
+    }
+  ]
+}

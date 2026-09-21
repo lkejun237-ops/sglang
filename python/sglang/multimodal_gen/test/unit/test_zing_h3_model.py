@@ -306,7 +306,11 @@ def test_generation_stage_connects_prompt_dit_and_decoder(model):
         return torch.zeros(1, 3, 5, 32, 32)
 
     stage.codecs = SimpleNamespace(
-        prepare=prepare, decode_visual=decode, spatial_ratio=16, target_fps=24.0
+        video_decoder_name="video_vae",
+        prepare=prepare,
+        decode_visual=decode,
+        spatial_ratio=16,
+        target_fps=24.0,
     )
     stage._use = lambda name, phase="encode": nullcontext(model)
     params = ZingH3SamplingParams(
@@ -697,6 +701,7 @@ def realtime_stage(model):
         )
 
     stage.codecs = SimpleNamespace(
+        video_decoder_name="video_vae",
         prepare=prepare,
         decode_visual_range=lambda latent, start, end: decode(latent, end)[
             :, :, start:end
@@ -821,3 +826,77 @@ def test_stable_decode_waits_for_complete_windows_and_preserves_block_events(
     assert [x["event_id"] for x in events] == [1, 2, 3]
     joined = torch.cat(outputs, dim=1)
     torch.testing.assert_close(joined[0, :, 0, 0], torch.arange(39).float())
+
+
+@pytest.mark.parametrize("pattern", [(5,), (1, 2, 2)])
+@pytest.mark.parametrize("latent_end,frames", [(1, 1), (3, 9), (7, 22), (12, 39)])
+def test_taeh3_stage_preserves_frames_and_block_provenance(pattern, latent_end, frames):
+    """Feed fixed latents on different AR boundaries, including early EOS."""
+    from contextlib import nullcontext
+
+    from sglang.multimodal_gen.runtime.models.vaes.taeh3 import TAEH3Decoder
+    from sglang.multimodal_gen.runtime.models.vaes.taeh3.upstream import TAEHV
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.realtime import (
+        ZingH3RealtimeState,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.stage import (
+        ZingH3GenerationStage,
+    )
+
+    threads = torch.get_num_threads()
+    torch.set_num_threads(2)
+    try:
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(9)
+            upstream = TAEHV(None, arch_name="taeh3").eval()
+            latent = torch.randn(1, 24, 12, 1, 2)
+        decoder = object.__new__(TAEH3Decoder)
+        torch.nn.Module.__init__(decoder)
+        decoder.decoder = upstream.decoder
+        stage = object.__new__(ZingH3GenerationStage)
+        stage.modules = {"taeh3_decoder": decoder}
+        stage._use = lambda *args: nullcontext(decoder)
+        stage.codecs = SimpleNamespace(
+            video_decoder_name="taeh3_decoder",
+            spatial_ratio=16,
+            temporal_ratio=4,
+            vae_latents_per_chunk=5,
+            vae_frames_per_chunk=17,
+            va=SimpleNamespace(vae_token_drop=3),
+        )
+        state = ZingH3RealtimeState()
+        state.inputs = SimpleNamespace(visual_shape=(12, 1, 2), pixel_frame_count=39)
+        state.sampling = SimpleNamespace(
+            visual=latent, index=0, spans=[None] * 100, close=lambda: None
+        )
+        pieces, events, cursor, index = [], [], 0, 0
+        while cursor < latent_end:
+            cursor = min(latent_end, cursor + pattern[index % len(pattern)])
+            state.sampling.index += 1
+            batch = SimpleNamespace(
+                block_idx=index, request_id=f"r{index}", realtime_event_id=index
+            )
+            final = cursor == latent_end
+            ready = stage._queue_realtime_output(batch, state, cursor, "stable", final)
+            if ready:
+                outputs, height, width = stage._decode_realtime_output(
+                    state, cursor, ready, final=final
+                )
+                assert (height, width) == (16, 32)
+                pieces.extend(outputs)
+                events.extend(ready)
+            index += 1
+        joined = torch.cat(pieces, dim=1).unsqueeze(0)
+        expected = decoder.decode(latent[:, :, :latent_end], frames)
+        torch.testing.assert_close(joined, expected, atol=0, rtol=0)
+        assert [event["block_idx"] for event in events] == list(range(index))
+        assert [event["event_id"] for event in events] == list(range(index))
+        assert [event["request_id"] for event in events] == [
+            f"r{i}" for i in range(index)
+        ]
+        assert events[-1]["frame_end"] == frames
+        assert state.emitted_frames == frames and not state.pending_blocks
+        state.dispose()
+        assert state.video_decoder is None and state.decoder_frames is None
+    finally:
+        torch.set_num_threads(threads)

@@ -6,8 +6,8 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
 @dataclass
 class ZingH3SamplingParams(SamplingParams):
-    height: int = 512
-    width: int = 896
+    height: int = 480
+    width: int = 832
     num_frames: int = 22
     adjust_frames: bool = False
     enable_sequence_shard: bool | None = True

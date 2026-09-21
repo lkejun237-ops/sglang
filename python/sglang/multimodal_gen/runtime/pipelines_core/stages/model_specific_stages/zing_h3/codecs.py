@@ -331,7 +331,13 @@ class ZingH3Codecs(ZingH3MediaInput):
         decoded = self.decode_visual(window, frame_end - offset)
         return decoded[:, :, frame_start - offset : frame_end - offset]
 
+    @property
+    def video_decoder_name(self):
+        return "taeh3_decoder" if "taeh3_decoder" in self.modules else "video_vae"
+
     def decode_visual(self, latent, frames):
+        if self.video_decoder_name == "taeh3_decoder":
+            return self.modules["taeh3_decoder"].decode(latent, frames)
         model = self.modules["video_vae"]
         single = frames == 1 and latent.shape[2] == 1
         chunk, drop = self.vae_latents_per_chunk, self.va.vae_token_drop

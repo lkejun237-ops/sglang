@@ -71,7 +71,7 @@ def test_registry_is_zing_specific():
 def test_init_sets_finite_block_count_and_model_geometry(initialized):
     _, session, _ = initialized
     assert session.request.max_chunks == 2
-    assert session.request.size == "896x512"
+    assert session.request.size == "832x480"
     assert session.request.fps == 24
     assert type(session.request.fps) is int
 

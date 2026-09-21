@@ -47,6 +47,23 @@ class ZingH3CausalPipeline(ComposedPipelineBase):
         return index
 
     def create_pipeline_stages(self, server_args):
+        config = server_args.pipeline_config
+        if config.video_decoder_backend == "taeh3":
+            import torch
+
+            from sglang.multimodal_gen.runtime.models.vaes.taeh3 import (
+                WEIGHTS_SHA256,
+                TAEH3Decoder,
+            )
+
+            dtype = {
+                "fp32": torch.float32,
+                "fp16": torch.float16,
+                "bf16": torch.bfloat16,
+            }[config.taeh3_decode_precision]
+            self.modules["taeh3_decoder"] = TAEH3Decoder(
+                config.taeh3_checkpoint_path, WEIGHTS_SHA256
+            ).to(dtype=dtype)
         self.add_stage(
             ZingH3GenerationStage(
                 self.modules, server_args.pipeline_config, self.zing_runtime

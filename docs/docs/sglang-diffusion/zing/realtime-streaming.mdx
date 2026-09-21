@@ -23,7 +23,7 @@ Zing causal pipeline 复用 `WS /v1/realtime_video/generate`。每次 scheduler
 {
   "type": "init",
   "prompt": "A camera moves through a forest",
-  "size": "896x512",
+  "size": "832x480",
   "num_frames": 22,
   "fps": 24,
   "seed": 42,
@@ -81,6 +81,23 @@ CPU 回归覆盖两块逐步采样与离线 latent 对齐、跨块 RNG 隔离、
 SP2 顺序执行；CPU 测试不能替代真实模型、VAE 和分布式通信验证。
 
 
+### 可选 TAEH3 解码器
+
+原生 H3 VAE 仍是默认解码器。部署时可通过 pipeline config 设置
+`video_decoder_backend="taeh3"`、`taeh3_checkpoint_path` 和
+`taeh3_decode_precision`（`fp32`、`fp16` 或 `bf16`）；权重必须匹配适配器固定的 SHA256。
+TAEH3 是有损替代解码器，启用前应比较实际输出画质。
+
+TAEH3 的实时入口要求 `zing_realtime_decode_mode="stable"`。每个会话独立保存
+解码层的时间缓存，按五个 latent 一组解码新增数据，并保留十二帧尾部缓冲。
+小于内部解码组的输入可能暂不出帧；结束时补齐并裁剪到请求帧数。
+输入 AR block、内部解码组和发送的视频块不是同一边界。
+取消、失败及自然结束时释放会话缓存。
+
+TAEH3 解码缓存有界不代表整个生成会话有界：DiT 仍保留完整历史。
+单独 decoder 耗时也不代表端到端实时性能；应分别测量首帧、稳态逐块延迟、
+媒体传输和持续播放情况。
+
 ### Reference / source 与模型选择
 
 Zing 加载专用 causal/AR checkpoint，不通过每次请求的 `fl2va/ref2va` 字符串切换
@@ -103,7 +120,7 @@ Zing 加载专用 causal/AR checkpoint，不通过每次请求的 `fl2va/ref2va`
         {"id": "character", "type": "image", "uri": "/media/character.png"}
       ]},
       {"role": "target", "content": [
-        {"type": "video", "output": {"frames": 243, "height": 512, "width": 896}}
+        {"type": "video", "output": {"frames": 243, "height": 480, "width": 832}}
       ], "conditions": [
         {"content_id": "character", "role": "reference", "latent_modalities": ["visual"]}
       ], "source": {"type": "video", "uri": "/media/game-243-frames.mp4"}}
@@ -114,7 +131,7 @@ Zing 加载专用 causal/AR checkpoint，不通过每次请求的 `fl2va/ref2va`
 
 这里 URI 是服务端可访问媒体，仍需初始化时提供完整 source，不能模拟持续 append。
 当前 realtime 只返回 video，ref2va 风格的 reference 条件不表示已实现音频流。
-896×512 是缺省值，不是唯一合法分辨率；显式 size/target.output 保留，worker 校验
+832×480（480p，按模型 32 像素对齐）是缺省值，不是唯一合法分辨率；显式 size/target.output 保留，worker 校验
 模型空间网格与容量约束。Source 经媒体预处理后检查帧数、FPS 归一化、宽高比及目标
 画布适配，不强制源文件原始尺寸逐像素等于输出尺寸。
 

@@ -33,6 +33,9 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
     dit_config: ZingH3DiTConfig = field(default_factory=ZingH3DiTConfig)
     should_use_guidance: bool = True
     vae_decode_precision: str = "fp32"
+    video_decoder_backend: str = "native"
+    taeh3_checkpoint_path: str | None = None
+    taeh3_decode_precision: str = "fp32"
 
     @property
     def requires_audio_output(self):
@@ -50,6 +53,13 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
         self.validate_server_args(server_args)
 
     def validate_server_args(self, server_args):
+        if self.video_decoder_backend not in {"native", "taeh3"}:
+            raise ValueError("Unknown Zing video decoder backend")
+        if self.video_decoder_backend == "taeh3":
+            if not self.taeh3_checkpoint_path:
+                raise ValueError("TAEH3 requires a local checkpoint path")
+            if self.taeh3_decode_precision not in {"fp32", "fp16", "bf16"}:
+                raise ValueError("Unsupported TAEH3 decode precision")
         tp_size = getattr(server_args, "tp_size", 1) or 1
         sp_degree = getattr(server_args, "sp_degree", 1) or 1
         ulysses_degree = getattr(server_args, "ulysses_degree", 1) or 1

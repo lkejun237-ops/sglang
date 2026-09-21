@@ -15,6 +15,8 @@ class ZingH3RealtimeState(BaseRealtimeState):
         self.cpu_rng = self.cuda_rng = None
         self.emitted_frames = 0
         self.pending_blocks = []
+        self.video_decoder = self.decoder_frames = None
+        self.decoded_latents = 0
 
     @contextmanager
     def random_stream(self, device, seed):
@@ -36,6 +38,8 @@ class ZingH3RealtimeState(BaseRealtimeState):
                 self.cuda_rng = torch.cuda.get_rng_state(devices[0])
 
     def dispose(self):
+        if self.video_decoder is not None:
+            self.video_decoder.close()
         if self.sampling is not None:
             self.sampling.close()
         self.sampler = self.sampling = self.inputs = None
@@ -43,3 +47,5 @@ class ZingH3RealtimeState(BaseRealtimeState):
         self.prompt = None
         self.emitted_frames = 0
         self.pending_blocks = []
+        self.video_decoder = self.decoder_frames = None
+        self.decoded_latents = 0

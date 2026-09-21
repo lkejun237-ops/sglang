@@ -45,7 +45,7 @@ class ZingH3GenerationStage(PipelineStage):
             ("video_vae", "encode"),
             ("audio_vae", "encode"),
             ("transformer", "denoise"),
-            ("video_vae", "decode"),
+            (self.codecs.video_decoder_name, "decode"),
             ("audio_vae", "decode"),
         ]
         return [
@@ -253,7 +253,7 @@ class ZingH3GenerationStage(PipelineStage):
                     if diagnostic:
                         diagnostic.record("final_latents", video=video, audio=audio)
                 finish_timing("ZingH3Denoise", started)
-            with self._use("video_vae", "decode") as vae:
+            with self._use(self.codecs.video_decoder_name, "decode") as vae:
                 synchronize()
                 started = time.perf_counter()
                 video = video.to(next(vae.parameters()).device)
@@ -328,6 +328,8 @@ class ZingH3GenerationStage(PipelineStage):
         mode = getattr(params, "zing_realtime_decode_mode", "immediate")
         if mode not in {"immediate", "stable"}:
             raise ValueError("Invalid Zing realtime decode mode")
+        if self.codecs.video_decoder_name == "taeh3_decoder" and mode != "stable":
+            raise ValueError("TAEH3 realtime decoding requires stable mode")
         return mode
 
     def _sample_realtime_block(self, batch, state):
@@ -382,6 +384,8 @@ class ZingH3GenerationStage(PipelineStage):
         chunk = self.codecs.vae_latents_per_chunk
         overlap = (-self.codecs.va.vae_token_drop) % chunk if mode == "stable" else 0
         stable_end = max(0, (end - overlap) // chunk) * self.codecs.vae_frames_per_chunk
+        if self.codecs.video_decoder_name == "taeh3_decoder":
+            stable_end = max(0, (end // 5) * 17 - 12)
         ready = [
             block
             for block in state.pending_blocks
@@ -389,14 +393,31 @@ class ZingH3GenerationStage(PipelineStage):
         ]
         return ready
 
-    def _decode_realtime_output(self, state, end, ready):
+    def _decode_realtime_output(self, state, end, ready, final=False):
         inputs = state.inputs
         first_frame = state.emitted_frames
-        with self._use("video_vae", "decode"):
+        with self._use(self.codecs.video_decoder_name, "decode"):
             latent = state.sampling.visual[:, :, :end]
-            decoded = self.codecs.decode_visual_range(
-                latent, first_frame, ready[-1]["frame_end"]
-            )
+            if self.codecs.video_decoder_name == "taeh3_decoder":
+                if state.video_decoder is None:
+                    state.video_decoder = self.modules["taeh3_decoder"].new_stream()
+                stream = state.video_decoder
+                parts = [stream.push(latent[:, :, state.decoded_latents : end])]
+                state.decoded_latents = end
+                if final:
+                    parts.append(stream.finish(ready[-1]["frame_end"]))
+                if state.decoder_frames is not None:
+                    parts.insert(0, state.decoder_frames)
+                available = torch.cat(parts, dim=2)
+                count = ready[-1]["frame_end"] - first_frame
+                if available.shape[2] < count:
+                    raise ValueError("TAEH3 output is not ready")
+                decoded = available[:, :, :count]
+                state.decoder_frames = available[:, :, count:].clone()
+            else:
+                decoded = self.codecs.decode_visual_range(
+                    latent, first_frame, ready[-1]["frame_end"]
+                )
             height, width = (
                 n * self.codecs.spatial_ratio for n in inputs.visual_shape[1:]
             )
@@ -438,7 +459,9 @@ class ZingH3GenerationStage(PipelineStage):
                 metrics=batch.metrics,
                 trajectory_latents=trajectory,
             )
-        outputs, height, width = self._decode_realtime_output(state, end, ready)
+        outputs, height, width = self._decode_realtime_output(
+            state, end, ready, final=final
+        )
         params.num_frames, params.height, params.width = (
             sum(x.shape[1] for x in outputs),
             height,

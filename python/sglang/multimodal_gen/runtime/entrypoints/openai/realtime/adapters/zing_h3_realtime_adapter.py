@@ -115,7 +115,7 @@ class ZingH3RealtimeAdapter(BaseRealtimeModelAdapter):
         blocks = state.chunk_plan.count(latent_frames)
         request.max_chunks = min(request.max_chunks or blocks, blocks)
         if custom is None and "size" not in request.model_fields_set:
-            request.size = "896x512"
+            request.size = "832x480"
         await save_realtime_first_frame(session, request)
 
     def ingest_event(self, session, event):

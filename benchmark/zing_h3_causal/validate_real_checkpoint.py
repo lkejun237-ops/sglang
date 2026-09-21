@@ -354,6 +354,11 @@ def run_sglang(args):
         pin_cpu_memory=False,
         vae_cpu_offload=args.vae_cpu_offload,
         warmup_mode="off",
+        pipeline_config={
+            "video_decoder_backend": args.video_decoder_backend,
+            "taeh3_checkpoint_path": args.taeh3_checkpoint_path,
+            "taeh3_decode_precision": args.taeh3_decode_precision,
+        },
     )
     load_seconds = time.perf_counter() - started
     try:
@@ -442,6 +447,9 @@ def run_sglang(args):
             destination / "sglang.json",
             {
                 "implementation": "sglang",
+                "video_decoder_backend": args.video_decoder_backend,
+                "taeh3_checkpoint_path": args.taeh3_checkpoint_path,
+                "taeh3_decode_precision": args.taeh3_decode_precision,
                 "commit": _source_commit(args.sglang_root, "SGLANG_COMMIT"),
                 "hardware": _hardware(),
                 "sp_size": args.sp_size,
@@ -743,6 +751,13 @@ def parser():
     sglang.add_argument("--sglang-root", required=True)
     sglang.add_argument("--model", required=True)
     sglang.add_argument("--sp-size", type=int, default=1)
+    sglang.add_argument(
+        "--video-decoder-backend", choices=("native", "taeh3"), default="native"
+    )
+    sglang.add_argument("--taeh3-checkpoint-path")
+    sglang.add_argument(
+        "--taeh3-decode-precision", choices=("fp32", "fp16", "bf16"), default="fp32"
+    )
     sglang.add_argument(
         "--dit-placement",
         choices=("layerwise", "resident", "fsdp"),

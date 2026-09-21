@@ -59,6 +59,9 @@ CPU 测试只验证合同和小模型逻辑，不代表 macOS/CPU 已支持真�
 
 ## 生成
 
+默认横屏画布为 832×480（480p，按模型 32 像素对齐）。显式请求的尺寸仍然保留；
+性能报告记录实际宽高，不将历史 896×512 测量与 480p 结果混为同规格对比。
+
 ```python
 from sglang.multimodal_gen import DiffGenerator
 
@@ -75,8 +78,8 @@ generator = DiffGenerator.from_pretrained(
 )
 result = generator.generate(sampling_params_kwargs=dict(
     prompt="A camera moves slowly through a sunlit garden",
-    height=512,
-    width=896,
+    height=480,
+    width=832,
     num_frames=22,
     num_inference_steps=50,
     guidance_scale=1.0,
