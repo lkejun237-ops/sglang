@@ -190,30 +190,35 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             prefix_cache.clear()
 
     @torch.no_grad()
-    def step(self, state):
-        """Denoise and commit exactly one block; failed transactions are rolled back."""
+    def step(self, state, *, inputs=None):
+        """Denoise one block; any execution failure closes the sampling state."""
         if state.closed or state.index >= len(state.spans):
             raise ValueError("Zing sampling state is closed or complete")
-        visual, audio, pos, neg, cache = (
-            state.visual,
-            state.audio,
-            state.positive,
-            state.negative,
-            state.cache,
-        )
+        visual, audio, cache = state.visual, state.audio, state.cache
         self.device = visual.device
-        vs, aus = self.video_scheduler, self.audio_scheduler
         source, target, start, end = state.spans[state.index]
         try:
-            history_rows = sum(chunk.positions.shape[0] for chunk in cache._history())
+            if inputs is not None:
+                self.update_condition(state, inputs)
+            history_rows = sum(c.positions.shape[0] for c in cache._history())
             with maybe_record_function(
                 f"Zing.causal_block{target}.latent{start}-{end}.history_rows{history_rows}"
             ):
                 self._sample_block(
-                    visual, audio, pos, neg, cache, vs, aus, source, target, start, end
+                    visual,
+                    audio,
+                    state.positive,
+                    state.negative,
+                    cache,
+                    self.video_scheduler,
+                    self.audio_scheduler,
+                    source,
+                    target,
+                    start,
+                    end,
                 )
         except BaseException:
-            cache.rollback()
+            state.close()
             raise
         finally:
             self.last_run_metrics["dit_forwards"] = sum(self._forward_counts.values())

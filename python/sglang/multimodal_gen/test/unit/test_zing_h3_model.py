@@ -607,15 +607,13 @@ def test_sampler_preserves_diagnostics_across_realtime_split(
 
 @torch.no_grad()
 @pytest.mark.parametrize("failure_phase", ["active", "final"])
-def test_second_block_failure_rolls_back_source_and_keeps_history(
+def test_second_block_failure_clears_history_and_closes_state(
     model, monkeypatch, failure_phase
 ):
     packer, inputs, visual, audio = request(model)
     sampler = ZingH3Sampler(model, packer, sigma_points=3)
     state = sampler.initialize(inputs, visual, audio)
     sampler.step(state)
-    history = tuple(t.clone() for t in state.cache.history(0))
-    first = state.cache.committed[0]
     original = sampler._forward
 
     def failing(packed, cache, update):
@@ -627,14 +625,11 @@ def test_second_block_failure_rolls_back_source_and_keeps_history(
     monkeypatch.setattr(sampler, "_forward", failing)
     with pytest.raises(RuntimeError, match="cancelled"):
         sampler.step(state)
-    assert state.index == 1 and state.cache.last_block == 2
-    assert state.cache.committed == [first]
+    assert state.closed
+    assert not state.cache.committed and state.cache.history(0) is None
     assert state.cache.pending_source is state.cache.active is None
-    for actual, expected in zip(state.cache.history(0), history):
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    monkeypatch.setattr(sampler, "_forward", original)
-    sampler.step(state)
-    assert state.index == 2 and state.cache.last_block == 4
+    with pytest.raises(ValueError, match="closed"):
+        sampler.step(state)
     state.close()
 
 

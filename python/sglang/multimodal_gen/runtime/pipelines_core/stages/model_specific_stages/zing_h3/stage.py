@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import time
 from contextlib import contextmanager, nullcontext
+from copy import copy
 
 import torch
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -316,6 +317,7 @@ class ZingH3GenerationStage(PipelineStage):
         inputs, sampler = state.inputs, state.sampler
         prompt_changed = params.prompt != state.prompt
         if prompt_changed:
+            inputs = copy(inputs)
             with self._use("text_encoder"):
                 inputs.positive = self.codecs.encode_condition(
                     params.prompt, inputs.condition_media
@@ -331,9 +333,10 @@ class ZingH3GenerationStage(PipelineStage):
                         device=device,
                     )
                     state.sampling = sampler.initialize(inputs, visual)
-                elif prompt_changed:
-                    sampler.update_condition(state.sampling, inputs)
-                _, end = sampler.step(state.sampling)
+                _, end = sampler.step(
+                    state.sampling, inputs=inputs if prompt_changed else None
+                )
+            state.inputs = inputs
             state.prompt = params.prompt
         return end
 

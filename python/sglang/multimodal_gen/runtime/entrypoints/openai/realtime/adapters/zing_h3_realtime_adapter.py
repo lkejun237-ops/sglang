@@ -4,7 +4,7 @@
 import json
 import math
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter import (
@@ -13,12 +13,14 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter 
     build_realtime_sampling_params,
     save_realtime_first_frame,
 )
+from sglang.multimodal_gen.runtime.realtime.zing_chunk_plan import ChunkPlan
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
 
 @dataclass
 class ZingH3RealtimeControlState:
-    block_size: int = 5
+    chunk_plan: ChunkPlan = field(default_factory=ChunkPlan)
+    latent_frames: int = 0
     pending_prompt: tuple[str, int | None] | None = None
     event_id: int | None = None
 
@@ -35,9 +37,14 @@ class ZingH3RealtimeAdapter(BaseRealtimeModelAdapter):
             raise ValueError("This model does not support remote video decoding yet.")
         runtime = json.loads((Path(args.model_path) / "zing_config.json").read_text())
         state = session.adapter_state
-        state.block_size = int(runtime["num_frame_per_block"])
-        if state.block_size < 1:
-            raise ValueError("The model has an invalid video block size.")
+        try:
+            state.chunk_plan = ChunkPlan(
+                runtime["num_frame_per_block"], runtime["split_first_latent"]
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "The model has an invalid video chunk configuration."
+            ) from exc
         if getattr(request, "zing_realtime_decode_mode", "immediate") not in {
             "immediate",
             "stable",
@@ -104,9 +111,8 @@ class ZingH3RealtimeAdapter(BaseRealtimeModelAdapter):
             + 1
             + math.ceil(tail / va.temporal_compression_ratio)
         )
-        blocks = math.ceil(latent_frames / state.block_size)
-        if runtime["split_first_latent"] and min(latent_frames, state.block_size) > 1:
-            blocks += 1
+        state.latent_frames = latent_frames
+        blocks = state.chunk_plan.count(latent_frames)
         request.max_chunks = min(request.max_chunks or blocks, blocks)
         if custom is None and "size" not in request.model_fields_set:
             request.size = "896x512"
@@ -121,7 +127,11 @@ class ZingH3RealtimeAdapter(BaseRealtimeModelAdapter):
         return f"kind=prompt, prompt_len={len(event.payload)}"
 
     def get_chunk_size(self, session, server_args, chunk):
-        return session.adapter_state.block_size
+        state = session.adapter_state
+        planned = state.chunk_plan.chunk(chunk.index, state.latent_frames)
+        if planned is None:
+            raise ValueError("The video session is complete.")
+        return planned.end - planned.start
 
     def sample_chunk_inputs(self, session, server_args, chunk, chunk_size):
         state = session.adapter_state

@@ -15,6 +15,10 @@ from typing import Any
 
 import numpy as np
 import torch
+from sglang.multimodal_gen.runtime.realtime.zing_chunk_plan import (
+    ChunkPlan,
+    TemporalChunk,
+)
 
 
 def _patchify_video_latents(
@@ -132,18 +136,23 @@ class ZingH3Packer:
             arch.latents_dim,
             arch.audio_latents_dim,
         )
+        ChunkPlan(num_frame_per_block, split_first_latent)
         self.num_frame_per_block = num_frame_per_block
         self.split_first_latent = split_first_latent
         self.rope_spatial_extent, self.rope_frame_scale = spatial_extent, frame_scale
         self.visual_token_frame_spans = tuple(visual_token_frame_spans)
         if (
             self.patch_size[0] != 1
-            or num_frame_per_block < 1
             or not self.visual_token_frame_spans
             or not all(math.isfinite(v) for v in (spatial_extent, frame_scale))
             or min(spatial_extent, frame_scale, *visual_token_frame_spans) <= 0
         ):
             raise ValueError("Invalid Zing block or RoPE geometry")
+
+    @property
+    def chunk_plan(self):
+        # Native actors can override the schedule between requests.
+        return ChunkPlan(self.num_frame_per_block, self.split_first_latent)
 
     def _spatial_grid(self, height: int, width: int) -> torch.Tensor:
         """生成面积归一的二维 RoPE 网格，使不同长宽比共享相近的坐标尺度。"""
@@ -241,6 +250,51 @@ class ZingH3Packer:
         }
         return self._pack_layout(inputs.conditions, inputs.media, encoded)
 
+    def pack_chunk(
+        self,
+        inputs,
+        condition,
+        visual_target,
+        audio_target,
+        *,
+        chunk: TemporalChunk,
+        audio_start=0,
+        media_origin=None,
+    ):
+        """Pack one already-ready chunk; codec/network batches are not chunks.
+
+        The caller supplies frozen initial noise and the audio interval selected
+        by the native video/audio mapping. No new online noise policy is inferred.
+        """
+        if visual_target.shape[2] != chunk.end - chunk.start:
+            raise ValueError("Ready visual data does not cover the planned chunk")
+        if type(audio_start) is not int or audio_start < 0:
+            raise ValueError("Audio offsets must be nonnegative integers")
+        context = inputs.positive["context"]
+        encoded = {
+            **(
+                condition
+                if condition is not None
+                else {
+                    "context": context.new_empty((0, context.shape[1])),
+                    "row_role": torch.empty(0, dtype=torch.long, device=context.device),
+                }
+            ),
+            "reference_visual": inputs.visual if condition is not None else {},
+            "reference_audio": inputs.audio if condition is not None else {},
+            "source_visual": inputs.source_visual if condition is not None else None,
+            "target_visual": visual_target,
+            "target_audio": audio_target,
+            "temporal_chunk": chunk,
+            "audio_start": audio_start,
+            "media_origin": media_origin if condition is not None else None,
+        }
+        return self._pack_layout(
+            inputs.conditions if condition is not None else [],
+            inputs.media if condition is not None else [],
+            encoded,
+        )
+
     def _pack_layout(
         self,
         conditions: list[dict[str, Any]],
@@ -300,6 +354,11 @@ class ZingH3Packer:
                 target_visual.shape[3:],
                 target_origin,
             )
+        if encoded.get("media_origin") is not None:
+            shift = encoded["media_origin"] - target_origin
+            for segment in segments:
+                segment["positions"][:, 0] += shift
+            target_origin = encoded["media_origin"]
         if source_visual is not None:
             self._validate_visual(source_visual)
             if source_visual.shape[2] != target_visual.shape[2]:
@@ -309,20 +368,19 @@ class ZingH3Packer:
         if self.causal:
             # condition/reference 共用 block0；生成区按 source 奇数、target 偶数交错推进。
             total_frames = int(target_visual.shape[2])
-            block_boundaries = list(
-                range(0, total_frames, self.num_frame_per_block)
-            ) + [total_frames]
-            if (
-                self.split_first_latent
-                and min(total_frames, self.num_frame_per_block) > 1
-            ):
-                block_boundaries.insert(
-                    1, 1
-                )  # 只拆原首块，保留后续边界；单帧或原块长为 1 时无需再拆
-            for block_number, (start, end) in enumerate(
-                zip(block_boundaries, block_boundaries[1:])
-            ):
-                source_block, target_block = 2 * block_number + 1, 2 * block_number + 2
+            ready_chunk = encoded.get("temporal_chunk")
+            chunks = (
+                (ready_chunk,)
+                if ready_chunk is not None
+                else self.chunk_plan.chunks(total_frames)
+            )
+            for chunk in chunks:
+                start, end = (
+                    (0, total_frames)
+                    if ready_chunk is not None
+                    else (chunk.start, chunk.end)
+                )
+                source_block, target_block = chunk.source_block, chunk.target_block
                 if source_visual is not None:
                     segments.append(
                         self._visual_segment(
@@ -330,13 +388,17 @@ class ZingH3Packer:
                             target_origin,
                             H3RowRole.SOURCE_VISUAL,
                             source_block,
-                            temporal_offset=start,
+                            temporal_offset=chunk.start,
                         )
                     )
                 if target_audio is not None:
                     # audio 与当前 visual 时间窗同块出现，尾块吸收所有剩余 audio latent。
-                    indices = self._audio_indices_for_video_span(
-                        target_audio.shape[2], start, end, total_frames
+                    indices = (
+                        list(range(target_audio.shape[2]))
+                        if ready_chunk is not None
+                        else self._audio_indices_for_video_span(
+                            target_audio.shape[2], start, end, total_frames
+                        )
                     )
                     if indices:
                         segments.append(
@@ -346,7 +408,7 @@ class ZingH3Packer:
                                 target_visual.shape[3:],
                                 H3RowRole.TARGET_AUDIO,
                                 target_block,
-                                time_offset=indices[0],
+                                time_offset=encoded.get("audio_start", 0) + indices[0],
                             )
                         )
                 segments.append(
@@ -355,7 +417,7 @@ class ZingH3Packer:
                         target_origin,
                         H3RowRole.TARGET_VISUAL,
                         target_block,
-                        temporal_offset=start,
+                        temporal_offset=chunk.start,
                     )
                 )
         else:

@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 
 from .media_input import ZingH3MediaInput
 from .packing import H3InferenceInputs
+from .visual_encoding import encode_clips
 
 
 @contextmanager
@@ -169,10 +170,11 @@ class ZingH3Codecs(ZingH3MediaInput):
             )
         with _visual_encode_policy():
             moments = torch.cat(
-                [
-                    model._adaptive_encode(clip)
-                    for clip in pixels.split(self.vae_frames_per_chunk, dim=2)
-                ],
+                encode_clips(
+                    model,
+                    list(pixels.split(self.vae_frames_per_chunk, dim=2)),
+                    self.runtime["vae_config"]["encode_tile_batch_size"],
+                ),
                 2,
             )
             chunks, tail = divmod(count - 1, self.vae_frames_per_chunk)

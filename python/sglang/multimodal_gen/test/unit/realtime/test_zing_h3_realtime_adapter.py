@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -335,3 +336,31 @@ def test_prompt_latest_wins_without_mutating_source_request(initialized):
     assert session.adapter_state.event_id == 9
     assert session.adapter_state.pending_prompt is None
     assert session.request.zing_request == source
+
+
+@pytest.mark.parametrize(
+    "lengths,split", [([1, 2, 2], False), (5, True), ([3, 2], True)]
+)
+def test_adapter_uses_checkpoint_cycle_for_exact_chunk_sizes(
+    initialized, lengths, split
+):
+    from sglang.multimodal_gen.runtime.realtime.zing_chunk_plan import ChunkPlan
+
+    adapter, session, args = initialized
+    config = Path(args.model_path) / "zing_config.json"
+    runtime = json.loads(config.read_text())
+    runtime.update(num_frame_per_block=lengths, split_first_latent=split)
+    config.write_text(json.dumps(runtime))
+    request = RealtimeVideoGenerationsRequest(
+        type="init", prompt="cycle", num_frames=39
+    )
+    asyncio.run(adapter.on_init(session, request))
+    plan = ChunkPlan(lengths, split)
+    assert request.max_chunks == plan.count(12)
+    sizes = [
+        adapter.get_chunk_size(session, args, SimpleNamespace(index=i))
+        for i in range(request.max_chunks)
+    ]
+    assert sizes == [c.end - c.start for c in plan.chunks(12)]
+    with pytest.raises(ValueError, match="complete"):
+        adapter.get_chunk_size(session, args, SimpleNamespace(index=request.max_chunks))

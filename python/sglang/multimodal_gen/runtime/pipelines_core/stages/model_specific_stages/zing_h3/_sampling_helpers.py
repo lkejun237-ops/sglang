@@ -132,7 +132,13 @@ class ZingBlockSamplingHelpers:
             raise ValueError(
                 "H3 processor target block ids do not cover the requested video"
             )
-        return spans
+        planned = [
+            (c.source_block, c.target_block, c.start, c.end)
+            for c in self.processor.chunk_plan.chunks(visual_shape[0])
+        ]
+        if spans != planned:
+            raise ValueError("H3 packed chunks do not match the checkpoint chunk plan")
+        return planned
 
     def _audio_indices(
         self, layout: dict[str, torch.Tensor], target_block: int
