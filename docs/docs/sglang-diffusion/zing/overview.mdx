@@ -1,15 +1,19 @@
-# Zing1 causal 推理
+---
+title: "Zing H3 推理"
+description: "Zing H3 checkpoint 导出、ref2va 请求与固定媒体输入。"
+---
 
 `ZingH3CausalPipeline` 接通四模态 DiT、pre-RoPE KV、AR Euler/CD re-noise、CFG、
 Qwen 条件编码和双 VAE。结构差异与 H3 模块复用见
-[ARCHITECTURE.md](ARCHITECTURE.md)。本 PR 提供单卡 dense baseline；FSDP、Ulysses SP、
-VSA 和 compile 等性能工作放在独立优化 PR 中。
+[架构与 H3 复用](/docs/sglang-diffusion/zing/architecture)。本页示例采用单卡配置；
+多卡与流式输出的演进见[架构说明](/docs/sglang-diffusion/zing/architecture)和
+[实时输出](/docs/sglang-diffusion/zing/realtime-streaming)。
 
 ## 从训练 checkpoint 导出
 
 当前 Zing 训练 checkpoint 的源格式是 DCP。SGLang serving package 不直接读取训练 DCP，
-导出分两步完成：先在 Zing 训练仓库把选定 component 合并为 portable `model.pt`，再由本目录的
-导出器完成 H3 权重布局转换和 safetensors 分片。这样 DCP reshard、EMA 选择和训练模型构造仍由
+导出分两步完成：先在 Zing 训练仓库把选定 component 合并为 portable `model.pt`，再由 SGLang 的
+`benchmark/zing_h3_causal/export_checkpoint.py` 完成 H3 权重布局转换和 safetensors 分片。这样 DCP reshard、EMA 选择和训练模型构造仍由
 训练仓库负责，SGLang 不复制一套容易漂移的 DCP loader。
 
 训练时若希望每个 checkpoint 自动带推理权重，可设置：
@@ -45,6 +49,13 @@ python benchmark/zing_h3_causal/export_checkpoint.py \
 导出器校验 Zing 四模态 AdaLN、全部必需张量和形状，保留训练要求的 FP32 参数，其余按推理
 配置写入 BF16 safetensors。共享的 tokenizer、processor、Qwen、video VAE 和 audio VAE
 通过只读 symlink 引用；部署时需要一并保留这些目标目录。
+
+## 运行环境
+
+生成入口面向 NVIDIA CUDA，需安装匹配的 SGLang diffusion 依赖和 sgl-kernel，
+并准备服务器可读取的导出模型目录。导出工具仍位于仓库的
+`benchmark/zing_h3_causal/export_checkpoint.py`。
+CPU 测试只验证合同和小模型逻辑，不代表 macOS/CPU 已支持真实模型生成。
 
 ## 生成
 
@@ -109,6 +120,31 @@ VAE reference 轨道。source 归一到训练 FPS 后必须与目标帧数相同
 只有取得匹配的蒸馏 checkpoint 后，才能选择 `zing_solver="few_step"` 并提供训练一致的
 `zing_denoising_step_list`。AR checkpoint 和 re-noise scheduler 本身不能证明四步生成质量。
 
+## 视频输入格式与持续输入边界
+
+MiniMax H3 通过 `conditions` 一次性声明本次请求的参考素材，例如：
+
+```json
+{"type": "video", "uri": "/media/reference.mp4", "role": "reference", "start_time_seconds": 0.0}
+```
+
+URI 指向服务端可读取的完整媒体对象，不是逐帧上传协议。H3 先解析、探测素材，
+再通过 ffmpeg 等读取选定片段；`video` reference 在 ref2va 下也会读取音轨。
+MP4、MOV、WebM 等是媒体容器，是否可读还取决于流内容与部署的解码支持。
+
+Zing 当前同样读取固定 URI。reference 使用 `conditions`，待渲染视频使用
+`source={"type":"video","uri":"/media/source.mp4"}`；旧 messages 格式将其放在
+`target.source`。Zing 使用 PyAV 解码，视频转换为 `[3,T,H,W] uint8` RGB tensor，
+音频按需转换为配置采样率（通常为 32 kHz）的双声道 waveform，再编码为 latent。
+HTTP/S3 对象先完整落到临时文件，读取完成后清理；这不是实时视频传输格式。
+
+**当前实时入口是固定输入、分块输出。** 初始化时提供完整 source；首块准备时
+读取、编码 reference/source，后续 block 复用它们，只接收 prompt 更新。
+没有接通 `source.append`，不能一边收到新 source 帧一边无限延长输入。
+[持续输入协议提案](https://github.com/seedleap/sglang/pull/104)描述的是后续目标；
+消息格式、消费确认及 EOS 必须整体实现后，才能宣称支持持续接入。
+当前可用的 WebSocket 格式见[实时输出文档](/docs/sglang-diffusion/zing/realtime-streaming)。
+
 ## 验证
 
 在 SGLang 仓库根目录运行以下单元测试：
@@ -142,5 +178,5 @@ Zing 模型测试的 reference 字典、`conditions` 和 `media` 均为空。新
 时间戳；媒体读取及模型编码使用 mock，因此仍不验证真实 VAE reference 编码效果。
 KV 数值对照比较的是同一 SGLang 模型的缓存增量路径与显式拼接历史路径，不是与 Zing 训练
 实现的跨实现对照，也不能据此判断真实模型的生成质量。真实 checkpoint 的三组生成结果、
-精确版本覆盖及尚未通过的质量/数值验收见 [验证与 review 交接](VALIDATION.md)。
+精确版本覆盖及尚未通过的质量/数值验收见 [验证与 review 交接](https://github.com/seedleap/sglang/blob/main/benchmark/zing_h3_causal/VALIDATION.md)。
 生成媒体、云作业和实验 harness 不随本 PR 提交；性能实验保持独立。

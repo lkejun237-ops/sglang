@@ -291,14 +291,15 @@ def _audio_resampler(source_rate: int):
     return torchaudio.transforms.Resample(source_rate, MINIMAX_H3_AUDIO_SAMPLE_RATE)
 
 
-@torch.inference_mode()
 def minimax_h3_encode_audio_mean(
     model: Any, waveform: torch.Tensor, sample_rate: int
 ) -> torch.Tensor:
     """Encode [channels,samples] on the model device; callers own execution policy.
 
-    Return raw FP32 posterior means. Normalization, precision and row packing
-    belong to each checkpoint's codec contract.
+    Share preprocess/encoder/optional pre_block/mean_proj between the H3
+    file-based entrypoint and Zing's already-decoded waveforms. Return raw
+    FP32 posterior means; callers own inference/determinism scopes, latent
+    normalization and row layout.
     """
     audio_data = model.preprocess(waveform.unsqueeze(1), sample_rate)
     z = model.encoder(audio_data)
@@ -311,6 +312,7 @@ def minimax_h3_encode_audio_mean(
     return model.mean_proj(z).float()
 
 
+@torch.inference_mode()
 def minimax_h3_encode_reference_audio_rows(
     audio_vae: Any,
     audio_path: str,

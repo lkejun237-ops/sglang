@@ -5,6 +5,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
@@ -101,7 +102,13 @@ def test_prompt_event_is_snapshotted_at_next_prepared_block(initialized, monkeyp
 
 
 @pytest.mark.parametrize(
-    "kind,payload", [("camera_actions", []), ("prompt", ""), ("prompt", 12)]
+    "kind,payload",
+    [
+        ("camera_actions", []),
+        ("source.append", {"uri": "/media/next.mp4"}),
+        ("prompt", ""),
+        ("prompt", 12),
+    ],
 )
 def test_invalid_events_do_not_change_pending_prompt(initialized, kind, payload):
     adapter, session, _ = initialized

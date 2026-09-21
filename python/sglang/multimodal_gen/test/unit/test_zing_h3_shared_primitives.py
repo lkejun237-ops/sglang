@@ -216,3 +216,48 @@ def test_zing_rejects_other_h3_tasks(task):
     params = ZingH3SamplingParams(task=task, prompt="A scene")
     with pytest.raises(ValueError, match="only supports task='ref2va'"):
         build_h3_request(params, {}, media_fps=24)
+
+
+@pytest.mark.parametrize("time_major", [False, True])
+def test_h3_audio_entrypoint_keeps_normalization_in_inference_mode(
+    monkeypatch, time_major
+):
+    from contextlib import nullcontext
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
+        reference_encoding,
+    )
+
+    waveform = torch.linspace(-1, 1, 14).reshape(2, 7).requires_grad_()
+    monkeypatch.setattr(
+        reference_encoding, "_load_waveform", lambda *a, **kw: (waveform, 32000)
+    )
+    monkeypatch.setattr(
+        reference_encoding, "set_forward_context", lambda **kw: nullcontext()
+    )
+    config = SimpleNamespace(
+        latent_channels=3, latents_mean=[0.1, 0.2, 0.3], latents_std=[0.7, 0.8, 0.9]
+    )
+
+    class LayoutAudioVAE(AudioVAE):
+        def mean_proj(self, x):
+            z = super().mean_proj(x)
+            return z.transpose(1, 2).contiguous() if time_major else z
+
+    with torch.enable_grad():
+        result = reference_encoding.minimax_h3_encode_reference_audio_rows(
+            LayoutAudioVAE(False), "unused.wav", config
+        )
+    expected = (
+        torch.stack((waveform, 2 * waveform, 3 * waveform), dim=1)
+        .bfloat16()
+        .float()
+        .permute(0, 2, 1)
+    )
+    expected = (
+        (expected - torch.tensor(config.latents_mean))
+        / torch.tensor(config.latents_std)
+    ).reshape(-1, 3)
+    assert torch.equal(result["rows"], expected)
+    assert not result["rows"].requires_grad
+    assert result["ref_audio_t"] == 7

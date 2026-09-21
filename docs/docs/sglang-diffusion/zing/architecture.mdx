@@ -1,12 +1,15 @@
-# Zing1 与 H3 的差异及 SGLang 接入设计
+---
+title: "Zing H3 架构与复用"
+description: "Zing 与 MiniMax H3 的结构差异、共享组件和因果 KV 合同。"
+---
 
-本 PR 将 Zing 作为独立 pipeline 接入，同时复用 H3 参数模块和媒体组件。Zing 只保留因
+Zing 作为独立 pipeline 接入，同时复用 H3 参数模块和媒体组件。Zing 只保留因
 四模态训练、block-causal attention、pre-RoPE KV transaction 和 AR 调度产生的差异。
 
 ## 证据边界
 
 - 训练实现参考 `seedleap/zing` 的 `a0f45389ae959c9ca6c1c2a710531a681c10c1a6`。
-- SGLang H3 基线为本分支 base `5936f69fe774c0f4755db70d38437f9a03d1149c`。
+- 最初接入时的 SGLang H3 基线为 `5936f69fe774c0f4755db70d38437f9a03d1149c`。
 - 张量结构曾用真实 AR 导出的 merged `generator/model.pt` 读取验证；当前训练源格式已经切换为
   DCP，发布前应由 Zing 仓库按明确的 generator/EMA component 导出 portable `model.pt`。
 - baseline 首先保证 dense eager 路径正确；SP、FSDP、稀疏 attention、量化和 compile 在独立
@@ -86,11 +89,12 @@ Zing DCP checkpoint 包含训练拓扑下的 sharded component 和 optimizer sid
 SGLang safetensors。DCP → merged `model.pt` 的模型构造、reshard 和 generator/EMA 选择由 Zing
 仓库的 `src/scripts/export_model_pt.py` 负责；SGLang 的 `export_checkpoint.py` 只负责 H3 serving
 布局转换和 model package 组装。两步边界可以避免 SGLang 依赖训练仓库，也避免 optimizer 或错误
-EMA component 被静默发布。完整命令见 [README.md](README.md)。
+EMA component 被静默发布。完整命令见[推理与导出说明](/docs/sglang-diffusion/zing/overview)。
 
-## 后续速度优化顺序
+## 历史优化规划与验证边界
 
-baseline 先使用 BF16 dense SDPA 建立正确性。可复用 H3 的优化按风险从低到高推进：
+以下是最初 baseline 的分阶段规划，不代表每项都尚未实现。当前分支已包含 Ulysses SP
+和有限会话流式输出；此处保留当时的顺序与证据边界。性能结论仍需匹配具体版本与硬件。
 
 1. 使用 H3 已有的 FSDP placement 与 Ulysses all-to-all，把大 DiT 分布到多卡，同时保持 Zing
    pre-RoPE history KV 语义；这是单卡 layerwise offload 的首要替代。
@@ -113,7 +117,8 @@ scaling；详情应在性能 PR 中评审，不作为本 baseline PR 的验收�
 - H3 与 Zing 共用媒体 `type`/`uri` 解析和非负有限时间校验；Zing 新增
   H3 风格的 `task/conditions/target` 入口，task 只支持 `ref2va`，旧
   `messages` 入口保留为兼容适配层，reference 和 source 走同一媒体描述校验。
-  source 的配对关系、实时 append 和 causal KV 生命周期属于 Zing。
+  source 的配对关系和 causal KV 生命周期属于 Zing；实时 source append 尚未接通，
+  当前只支持固定 source 的分块输出，见[实时输出边界](/docs/sglang-diffusion/zing/realtime-streaming)。
 - H3 按 `17n+5` 对齐输出帧数；Zing 新入口复用 H3 校验与空间尺寸解析，
   但按播放时间轴精确换算帧数，旧入口继续接受显式帧数。H3 reference image 按 2048 短边缩放（允许放大），
   Zing 采用训练配置指定的面积上限与不放大选桶。保留这些策略是为了不改变

@@ -92,5 +92,6 @@ existing PR plus the new test; isort 7.0.0 passed for the new test.
 - Do not bypass branch protection, fabricate approvals, or resolve reviewers'
   acceptance concerns merely by changing documentation.
 
-See the benchmark README for the reproducible CPU command. Runtime receipts,
+See the [Zing inference guide](../../docs/docs/sglang-diffusion/zing/overview.mdx)
+for the reproducible CPU command. Runtime receipts,
 cloud-specific scripts and generated assets remain outside this PR.
