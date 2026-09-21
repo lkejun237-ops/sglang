@@ -1,0 +1,456 @@
+---
+title: "Zing 1.0 H3 causal autoregressive（AR）双向实时 API 提案"
+sidebarTitle: "Zing 1.0 H3 causal AR（提案）"
+description: "Zing 1.0 H3 因果自回归模型的持续 source 输入、帧级对齐与可选 H.264 接口合约；尚未实现。"
+---
+
+本文针对 **Zing 1.0 H3 causal autoregressive（因果自回归，AR）模型**，不是原版 MiniMax H3 的整段生成 API。Causal/AR 指模型按时间块生成并复用历史状态；不意味着 VAE 无需时间窗口，也不表示持续输入协议已经实现。
+
+本文供游戏引擎与推理服务的同事评审接口：**客户端持续提交 source 帧，服务端持续返回渲染帧，默认不预设总长度。** 首版目标即包含持续输入，不以“先上传完整视频，再渐进返回”替代。
+
+这是接口提案，不是已上线接口。实现状态核对于 **2026-09-21，main `eb05bc8f0c`**：#103、#118、#120、#121、#126 已合入。生产 WebSocket 仍只支持有限长度生成、初始化 source 和动态 prompt；新增的共享类型、增量 codec 与分块调度基础模块不等于持续输入服务已接通。本文的 source 事件、版本确认及输出映射不能直接连到当前 main 验收。当前可运行入口见[有限流式使用说明](/docs/sglang-diffusion/zing/realtime-streaming)，已合入模块与后续接线范围见第 7 节。
+
+服务地址、鉴权、模型 checkpoint 由部署方提供。以下约定针对直连推理服务，不修改 world-platform gateway 的授权、错误码或关闭协议；接入 gateway 时需另行同步其 AsyncAPI 合约。
+
+## 1. 连接与初始化
+
+复用 `WS /v1/realtime_video/generate`（生产使用 `wss://`）。普通请求和响应均为 MessagePack 编码的 binary message，不是 JSON 文本或 SSE。下列 JSON 展示编码前对象；媒体 bytes 见 Python 示例。
+
+```json
+{
+  "type": "init",
+  "zing_realtime_api_version": 1,
+  "prompt": "保留游戏角色和运动，把场景渲染为写实雪山",
+  "size": "896x512",
+  "fps": 24,
+  "seed": 42,
+  "num_inference_steps": 4,
+  "zing_realtime_decode_mode": "stable",
+  "realtime_output_format": "raw",
+  "source_stream": {"format": "rgb24", "width": 896, "height": 512, "fps": 24}
+}
+```
+
+| 字段 | 首版目标约定 |
+| --- | --- |
+| `zing_realtime_api_version` | 新增，固定为 1；必须等待 `session.ready` 确认，不能把旧服务普通 ACK 当成成功协商 |
+| `prompt` | 非空文本指令；运行中可更新 |
+| `source_stream` | 新增，本模式必填；`format` 显式选择 `rgb24` 或 `h264`，无隐式回退；源尺寸与输出尺寸、FPS 相同；不做隐式丢帧或重采样。H.264 额外配置见第 2.1 节 |
+| `size` / `fps` | 示例为 896×512、24 FPS；部署需校验模型空间网格及支持的帧率，会话中不可修改 |
+| `num_frames` | 可省略或为 null，默认无总帧数上限；正整数仅用于有限测试，表示必须提交并输出的像素帧数，不是单次 source 批次大小 |
+| `max_chunks` | 公共协议已有，但本 source-stream 模式不接受非 null 值，避免 AR chunk 上限与像素帧上限冲突 |
+| `seed` | 初始种子；不承诺跨硬件、并行配置位级一致 |
+| `num_inference_steps` | 默认 4，首版仅接受 4；服务必须加载匹配的 four-step checkpoint 和采样配置，不满足则初始化失败 |
+| `zing_solver` / `zing_denoising_step_list` | 本模式由部署模型配置选择，不由调用方覆盖；不能把 Euler 的 sigma points 数改为 4 就当作 four-step 蒸馏模型 |
+| `zing_realtime_decode_mode` | 默认 `stable`，首版仅接受 `stable`；输出已稳定帧，不回改已发送画面；等待时间窗口不等于零延迟 |
+| `realtime_output_format` | 默认 `raw`，也可选 `webp`、`jpeg`；详见第 4 节 |
+| `references` | 新增，可选静态图片列表，每项包含唯一 `id`、`format="jpeg"` 或 `"webp"` 及 bytes `payload`；首版不支持运行中更新 |
+
+Reference 是外观、身份等静态参考，不要求逐帧对齐；source 是游戏引擎持续产生、与输出时间轴对齐的待渲染帧。两者不能混用。Reference 数量和总字节额度由部署校验并在 ready 中回显，不承诺无限数量。本文不用旧 `zing_request` 的 `target.output.frames` 或完整视频 URI；本模式禁止同时传 `zing_request`、`first_frame`、`video_path`、`video_url`，避免两套初始化语义冲突。
+
+[PR #126](https://github.com/seedleap/sglang/pull/126) 的 H3 风格 `task / conditions / target / source` 是已合入 main 的有限媒体 SamplingParams 入口，不是本协议，也不表示 WebSocket 已接通这些字段。目标 source-stream 初始化同样禁止混传这四个字段：静态图片只通过 `references`，持续 source 只通过 `source_stream` 与后续 `source.append` 提交，不做 URI、duration 或 reference 的隐式转换。有限入口仍可保留自身的兼容行为。
+
+本文固定 896×512 作为协议评审示例，不承诺它是未来部署默认值。#128 提议的 832×480 默认值尚未进入上述 main 基准；若统一示例尺寸，必须同时更新 source/output 尺寸、Python 字节计算与校验、协商示例和带宽数字。
+
+服务完成校验后返回新增的确认消息，例如：
+
+```json
+{
+  "type": "session.ready",
+  "zing_realtime_api_version": 1,
+  "session_id": "example-session",
+  "num_inference_steps": 4,
+  "realtime_output_format": "raw",
+  "source_stream": {"format": "rgb24", "width": 896, "height": 512, "fps": 24},
+  "max_source_batch_frames": 17,
+  "max_source_message_bytes": 33554432,
+  "max_pending_source_frames": 68,
+  "max_pending_source_bytes": 134217728,
+  "max_references": 4,
+  "max_reference_bytes": 8388608
+}
+```
+
+这里的批次、窗口和 reference 上限均为**示例协商值，不是已测得的模型限制**。ready 必须回显实际配置（包括完整 source_stream），客户端核对一致后才开始发送；不支持请求编码时初始化失败，不静默切换编码。未收到 ready 不得发送 source；旧服务不支持此版本时，客户端应失败退出，不回退到有限视频模式。版本 1 尚未发布，本 PR 内的补充不代表现有服务的兼容升级。
+
+## 2. 持续提交 source 与背压
+
+客户端沿用公共 `type="event"` 外壳，新增 `kind="source.append"`：
+
+```python
+message = {
+    "type": "event", "kind": "source.append", "event_id": 1,
+    "payload": {
+        "client_seq": 0, "source_frame_start": 0, "num_frames": 17,
+        "pts_us": 0,
+        "data": bytes(17 * 512 * 896 * 3),  # 示例黑帧；实际用引擎 RGB 数据
+    },
+}
+```
+
+- `client_seq` 从 0 递增，每批加 1；`event_id` 是所有客户端事件共用的递增关联号，不等于 `source_id`。
+- `source_frame_start` 从 0 开始，必须紧接上一批结尾；`num_frames` 是正整数，不超过 ready 上限。范围一律为左闭右开 `[start, end)`。
+- 固定 FPS 时间轴：`pts_us = floor(source_frame_start * 1_000_000 / fps)`。首版不支持可变帧率、空洞或乱序。
+- `rgb24` 的 `data` 是帧优先、行优先的 RGB uint8 bytes，长度必须为 `num_frames * height * width * 3`；`h264` 的 data 规则见第 2.1 节。一条 append 是一个完整 MessagePack 消息，不采用输入头/裸 payload 两消息协议。编码后的整条 MessagePack 消息长度不得超过 `max_source_message_bytes`（不含 WebSocket/TLS 开销）。
+- 网络批次不必等于 VAE clip 或 AR block；服务端按模型需要缓冲并拼接，不能把每批独立 padding 编码。
+
+验证、接收整批成功后，服务端返回：
+
+```json
+{"type":"source.accepted","event_id":1,"client_seq":0,"source_id":1,"source_frame_start":0,"source_frame_end":17}
+```
+
+`source_id` 由服务端按接收顺序分配，在会话内从 1 递增；与 `session_id` 一起标识这批输入。该 ACK 仅表示已接收，不表示已采样、已解码或已显示。首版不支持断线恢复或重发去重；序号重复、缺口或非法批次终止本次会话，不允许悄悄覆盖已有 source。
+
+服务端释放输入预算后发送累计水位：
+
+```json
+{"type":"source.consumed","source_frame_end":17,"source_bytes_end":23396352}
+```
+
+客户端发送前同时检查：`已提交帧数 - 已 consumed 帧数 <= max_pending_source_frames`，以及 `已提交 data 字节数 - source_bytes_end <= max_pending_source_bytes`。字节预算只计算 append 的 `len(data)`，不包括封装和 references。初始水位均为 0；consumed 只能在完整 append 边界累计推进，两个水位必须对应同一已 accepted 前缀，不能释放半个压缩包或尚未接收的输入。客户端保留未释放批次的帧/字节边界以校验，释放后回收记录。
+
+该消息表示可以复用输入预算，不是对应画面已经返回。服务端只有在下游有界状态能够接管这些帧时才释放预算，不能把数据转移到另一个无限队列。H.264 解码后的像素缓存及 decoder 参考画面另计入服务端资源预算；压缩字节预算不能替代解码内存限制。
+
+窗口必须覆盖 encoder、AR 和 stable decoder 的最小前视需求，部署需验证不会产生背压死锁。输入、推理中间态和输出队列都需有界；慢客户端会反向阻塞输入。source 暂停时等待新帧，不自动重复最后一帧，不使用 prompt 的 latest-wins 策略丢弃 source。
+
+### 2.1 H.264 低延迟输入（可选能力，待实现）
+
+H.264 只改变网络输入编码：引擎像素 → H.264 encoder → WebSocket → H.264 decoder → RGB → H3 VAE encoder → DiT。客户端仍按像素帧编号，不知道 latent。它不减少模型计算量，也不消除 VAE 的前视等待；无需因此重新训练 H3 VAE。
+
+初始化时可将 source_stream 替换为：
+
+```json
+{
+  "format": "h264",
+  "width": 896,
+  "height": 512,
+  "fps": 24,
+  "codec": "avc1.42E01F",
+  "bitstream_format": "annexb",
+  "color_space": {"primaries": "bt709", "transfer": "bt709", "matrix": "bt709", "range": "limited"}
+}
+```
+
+首版 H.264 子集约定如下：
+
+- 使用 8-bit YUV420、逐行扫描、Constrained Baseline；示例 codec 为 Level 3.1。服务端按 SPS 校验声明的 profile/level、尺寸、颜色与实际流一致，并校验设备能力；此 codec 字符串不是所有分辨率/FPS 的通用配置。
+- 只支持 Annex B，不接收 MP4 容器或 AVC 长度前缀格式。每条 append 必须是一个完整 access unit（AU），包含一张编码画面，可有多个 NAL；不能直接把任意网络分片、单个 NAL 或任意文件 read() 的结果当作一帧。
+- `num_frames=1`，ready 的 `max_source_batch_frames=1`；每个 AU 对应一个 source_id，但输出仍可跨多个 ID 重分批。客户端不为凑 VAE clip 而延迟发送。
+- 首个 AU 必须含 SPS、PPS 和 IDR，`keyframe=true`；后续普通 P 帧为 false。周期性 IDR 也携带相同 SPS/PPS。禁止 B 帧和画面重排序，解码顺序等于显示顺序；因此只需 PTS，不暴露 DTS。服务端检查码流，不能仅相信客户端 keyframe 标志。
+- 编码器关闭 lookahead，采用低延迟、小缓冲配置；不等待完整 GOP 才发送。码率、关键帧周期由客户端配置并用实测确定，不将 8 Mbps 等示例数值承诺为画质门槛。
+- 会话中禁止切换 profile/level、SPS/PPS、分辨率、FPS 或颜色配置；需要修改时重建会话。按声明的 BT.709 limited-range 转为模型 RGB，不能混用 full-range 或错误颜色矩阵。
+- 每会话独立维护 H.264 decoder 状态，包括参考画面；不能对每个 AU 创建一个新 decoder。无 B 帧也不能假设 decoder 的单次调用立即返回画面，必须通过 PTS/帧索引关联异步输出。
+
+客户端从真实编码器拿到完整 AU 后，可用以下函数构造消息（只做封装和大小检查，不是 H.264 encoder/parser）：
+
+```python
+def h264_source_message(au, frame_index, event_id, keyframe, ready):
+    import msgpack
+
+    if ready["source_stream"]["format"] != "h264":
+        raise ValueError("H.264 input was not negotiated")
+    if not isinstance(au, bytes) or not au or frame_index < 0 or event_id < 1:
+        raise ValueError("Invalid source access unit")
+    if not isinstance(keyframe, bool) or (frame_index == 0 and not keyframe):
+        raise ValueError("The first source frame must be a keyframe")
+    if len(au) > ready["max_pending_source_bytes"]:
+        raise ValueError("Source access unit exceeds the input budget")
+    message = {
+        "type": "event", "kind": "source.append", "event_id": event_id,
+        "payload": {
+            "client_seq": frame_index, "source_frame_start": frame_index,
+            "num_frames": 1,
+            "pts_us": frame_index * 1_000_000 // ready["source_stream"]["fps"],
+            "keyframe": keyframe, "data": au,
+        },
+    }
+    wire = msgpack.packb(message, use_bin_type=True)
+    if len(wire) > ready["max_source_message_bytes"]:
+        raise ValueError("Source message exceeds the size limit")
+    return wire
+```
+
+用法：对编码器每次输出的完整 AU 调用此函数；等待帧数和 data 字节预算后，发送返回的 wire，并累计一个像素帧及 `len(au)` 字节。不能使用第 5 节 raw 示例中的固定 RGB 字节公式计算 H.264 credit。编码器内部队列同样必须有界，背压不能只是把积压搬到编码器前面。单个 IDR 超过上限时不可分片伪装成多个帧或跳过；应终止会话并调整编码配置/服务额度后重建。
+
+accepted 只代表服务端完成消息/码流头校验并接收入队，不承诺解码最终成功；解码失败、缺参考帧、尺寸不符或解码输出帧数不符时终止会话，不返回假画面或静默跳帧。首版沿用可靠有序 WebSocket，不做丢包追帧和会话内解码恢复；发生故障重建会话，新流从 IDR 开始，也重置 VAE/AR 历史。仅恢复 H.264 decoder 不等于恢复模型历史。
+
+正常结束先 drain 客户端编码器并发送剩余 AU，再发送 source.end；服务端依次 drain H.264 decoder、flush VAE/AR 有效尾帧，核对输入/输出数后 completed。周期性 IDR 不重置模型历史。source.consumed 的推进不要求删除 H.264 参考画面，但其保留必须受独立有界解码资源预算约束。
+
+原始 RGB 示例约 `896 × 512 × 3 × 24 = 33,030,144 bytes/s`（264 Mbps）；H.264 的带宽、质量和编解码延迟需用游戏实景验证，不能只比较文件大小。仅启用输入压缩不会降低 raw 输出的下行带宽。本版保留 raw 作为内网/精度对照，不自动启用 H.264，也不新增 H.264 输出、WebRTC、JPEG/WebP 输入或客户端 VAE。
+
+封装与低延迟配置依据：[W3C AVC/WebCodecs 约定](https://www.w3.org/TR/webcodecs-avc-codec-registration/)、[NVIDIA NVENC 指南](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.0/nvenc-video-encoder-api-prog-guide/)。硬件编解码是优先评估项，不假设目标 GPU 或浏览器一定支持。
+
+## 3. source_id 如何与输出对齐
+
+对外以**像素帧索引与时间戳**为主；latent 的内部编号不能替代像素时间轴。首版不插帧、不超分、不改 FPS，输出第 N 帧在时间轴上对应 source 第 N 帧。
+
+每个非空输出帧批次在公共头字段之外，新增：
+
+```json
+{
+  "output_frame_start": 15,
+  "num_frames": 4,
+  "pts_us": 625000,
+  "source_alignment": [
+    {"source_id":1,"source_frame_start":15,"output_frame_start":15,"num_frames":2},
+    {"source_id":2,"source_frame_start":17,"output_frame_start":17,"num_frames":2}
+  ],
+  "source_dependency_end": 34
+}
+```
+
+此例假设 source 1 提交 `[0,17)`，source 2 提交 `[17,34)`：输出 `[15,19)` 跨两次输入，因此不能只标一个“最新 source_id”。`source_alignment` 必须连续、无重叠、完整覆盖本批输出；每段只映射该 ID 实际接收的帧范围。`source.accepted` 必须先于引用该 ID 的输出发送。
+
+`source_dependency_end` 是本批输出计算实际使用的 source 时间轴排他上界，包含编码、生成、解码上下文引入的依赖，不能拿“当前已接收水位”代替。它表示可能依赖此前的历史，不声称只依赖 alignment 中那几帧。H3 VAE 的时间窗口会让时间轴对齐帧使用相邻帧上下文；时间对应与计算依赖是两件事。
+
+工程上需让 source 帧范围及依赖水位随 H.264 decoder（若启用）→ VAE encoder → AR latent block → VAE decoder 流转，延迟输出不能读取全局 latest source_id。H3 clip 边界、首块和尾块的映射需显式维护，不能简单使用 `latent_index * 4`。网络重分批只拆分映射，不改变帧语义。
+
+## 4. 输出编码、控制与结束
+
+复用两种公共收帧形式：
+
+1. `frame_batch`：MessagePack 对象直接携带 bytes `payload`。
+2. `frame_batch_header`：MessagePack 头，下一条 binary message 是原始 payload，不能再次按 MessagePack 解码。服务端必须保证头与 payload 之间不插入其他消息。
+
+保留 `request_id`、`chunk_index`、`frame_batch_index`、`num_frame_batches`、`is_final_frame_batch`、`num_frames`、`total_size` 等字段，并添加第 3 节元数据。`is_final_frame_batch` 只标记一个 chunk 的最后一批，不是会话结束；AR block、网络 batch 与 source batch 不要求一一对应。
+
+| `realtime_output_format` | payload 与接入代价 |
+| --- | --- |
+| `raw` | RGB24 连续字节；`format="rgb24"`、`channels=3`，可 reshape 为 `[N,H,W,3]`；无需图像解码，但带宽高 |
+| `webp` | 逐帧 WebP 图片拼接；用 `payload_lengths` 分帧，再逐张解码 |
+| `jpeg` | 逐帧 JPEG 图片拼接；用 `payload_lengths` 分帧，再逐张解码；有损 |
+
+这些输出不是 MP4/H.264/WebRTC；输出压缩与输入 `source_stream.format` 是独立配置，H.264 输入不意味着输出也采用 H.264。压缩批次应校验长度数组项数等于帧数、长度之和等于 `total_size`。
+
+动态 prompt 沿用现有事件，下一次准备 AR block 时生效；待处理更新 latest-wins，不能回改已生成帧。输出 `event_id` 保持该 block 的 prompt 控制版本，不用 source append 的 event_id 覆盖；source 对齐使用独立字段。VAE 跨块上下文意味着这不是严格的像素级 prompt 切换边界。
+
+```json
+{"type":"event","kind":"prompt","payload":"把场景逐渐变成日落","event_id":3}
+```
+
+应用层 heartbeat 沿用 `{"type":"event","kind":"heartbeat"}`；周期需小于部署空闲超时，不能默认 WebSocket ping 等效。
+
+输入结束通过新增事件显式通知，而不是关闭连接：
+
+```json
+{"type":"event","kind":"source.end","event_id":4,"payload":{"source_frame_end":34}}
+```
+
+end 水位必须等于已提交帧数，之后不得再 append。服务端处理完已接收输入，只在 EOS 做尾部 padding/flush，不输出 padding 帧。至少提交一帧；若指定 `num_frames`，最终输入/输出帧数必须等于它，超额或不足均不是成功。即使达到有限上限也发送 end，以明确输入终止。
+
+新增 `{"type":"session.completed","output_frames":34}` 表示所有有效帧已经发送，此后正常关闭。客户端检查连续输出范围和总数；单独收到正常关闭但没有 completed 也视为不完整。连接关闭用于取消，不保证抢占正在执行的 GPU block；重连是新会话。
+
+沿用公共 `type="error"` 响应；用户可见 content 必须为友好英文，内部异常留在日志，客户端不得按 content 文本分支。本文不新增错误码或修改 gateway close reason。无预设总长度不是承诺无限资源、无限连接寿命或始终达到 24 FPS；运营时限需部署方另行披露。
+
+## 5. 最小双向客户端示例（目标接口，未联调）
+
+使用 Python 3.11+，安装 `msgpack`、`websockets`。示例用 34 帧黑帧模拟引擎（通常分两批，实际遵循协商上限），再主动结束；init 没有总长度。真实引擎可持续调用 `append_source`，直到用户退出。输入发送与输出接收并发运行，按 consumed 水位背压；`on_frames` 应快速交给有界播放队列。
+
+```python
+import asyncio
+
+import msgpack
+import websockets
+
+
+async def demo(url, on_frames):
+    async with websockets.connect(url, max_size=256 << 20) as ws:
+        async def send(message):
+            await ws.send(msgpack.packb(message, use_bin_type=True))
+
+        await send({
+            "type": "init", "zing_realtime_api_version": 1,
+            "prompt": "Render the game scene as snowy mountains",
+            "size": "896x512", "fps": 24, "seed": 42,
+            "num_inference_steps": 4, "zing_realtime_decode_mode": "stable",
+            "realtime_output_format": "raw",
+            "source_stream": {"format": "rgb24", "width": 896, "height": 512, "fps": 24},
+        })
+        # 此版本 ready 必须是初始化的第一条应用响应；超时不回退旧 API。
+        ready = msgpack.unpackb(await asyncio.wait_for(ws.recv(), 30), raw=False)
+        if ready.get("type") != "session.ready" or ready.get("zing_realtime_api_version") != 1:
+            raise RuntimeError("Streaming API negotiation failed")
+        if ready.get("num_inference_steps") != 4 or ready.get("realtime_output_format") != "raw":
+            raise RuntimeError("Unexpected rendering configuration")
+        if ready.get("source_stream") != {"format": "rgb24", "width": 896, "height": 512, "fps": 24}:
+            raise RuntimeError("Unexpected source configuration")
+        window = ready["max_pending_source_frames"]
+        batch_limit = ready["max_source_batch_frames"]
+        byte_window = ready["max_pending_source_bytes"]
+        message_limit = ready["max_source_message_bytes"]
+        frame_bytes = 512 * 896 * 3
+        if min(window, batch_limit) < 1 or byte_window < frame_bytes or message_limit < frame_bytes:
+            raise RuntimeError("Invalid source window")
+        credit = asyncio.Condition()
+        submitted = consumed = received = sequence = accepted_end = 0
+        end_sent = False
+        accepted = {}  # 仅示例 34 帧；长会话需随输出水位回收旧条目。
+
+        async def append_source(data, count):
+            nonlocal submitted, sequence
+            if not 0 < count <= batch_limit or len(data) != count * frame_bytes:
+                raise ValueError("Invalid source batch")
+            start = submitted
+            message = {
+                "type": "event", "kind": "source.append", "event_id": sequence + 1,
+                "payload": {"client_seq": sequence, "source_frame_start": start,
+                            "num_frames": count, "pts_us": start * 1_000_000 // 24,
+                            "data": data},
+            }
+            wire = msgpack.packb(message, use_bin_type=True)
+            if len(wire) > message_limit or len(data) > byte_window:
+                raise ValueError("Source batch exceeds the size limit")
+            async with credit:
+                await credit.wait_for(lambda: submitted + count - consumed <= window
+                                      and (submitted + count - consumed) * frame_bytes <= byte_window)
+                submitted += count
+            await ws.send(wire)
+            sequence += 1
+
+        async def produce():
+            nonlocal end_sent
+            while submitted < 34:  # 替换为真实引擎帧源；不要求预先知道总长度。
+                count = min(17, batch_limit, window, byte_window // frame_bytes, 34 - submitted)
+                await append_source(bytes(count * 512 * 896 * 3), count)
+            end_sent = True
+            await send({"type": "event", "kind": "source.end", "event_id": sequence + 1,
+                        "payload": {"source_frame_end": submitted}})
+
+        async def receive():
+            nonlocal consumed, received, accepted_end
+            async for wire in ws:
+                message = msgpack.unpackb(wire, raw=False)
+                kind = message.get("type")
+                if kind == "error":
+                    raise RuntimeError(message.get("content", "Generation failed"))
+                if kind == "source.accepted":
+                    if not (message["source_id"] == len(accepted) + 1
+                            and message["client_seq"] == len(accepted)
+                            and message["source_frame_start"] == accepted_end
+                            and accepted_end < message["source_frame_end"] <= submitted):
+                        raise RuntimeError("Invalid source acknowledgement")
+                    accepted[message["source_id"]] = message
+                    accepted_end = message["source_frame_end"]
+                elif kind == "source.consumed":
+                    async with credit:
+                        end = message["source_frame_end"]
+                        boundaries = {m["source_frame_end"] for m in accepted.values()} | {0}
+                        if (not consumed <= end <= accepted_end or end not in boundaries
+                                or message["source_bytes_end"] != end * frame_bytes):
+                            raise RuntimeError("Invalid source watermark")
+                        consumed = end
+                        credit.notify_all()
+                elif kind in {"frame_batch", "frame_batch_header"}:
+                    payload = await ws.recv() if kind == "frame_batch_header" else message["payload"]
+                    count = message["num_frames"]
+                    if len(payload) != message["total_size"] or len(payload) != count * 512 * 896 * 3:
+                        raise RuntimeError("Invalid frame payload")
+                    if count == 0:
+                        continue
+                    if (message.get("format"), message.get("channels"),
+                            message.get("width"), message.get("height")) != ("rgb24", 3, 896, 512):
+                        raise RuntimeError("Unexpected frame format")
+                    if message["output_frame_start"] != received:
+                        raise RuntimeError("Output frame discontinuity")
+                    cursor = received
+                    for span in message["source_alignment"]:
+                        source = accepted[span["source_id"]]
+                        length = span["num_frames"]
+                        if not (length > 0 and span["output_frame_start"] == cursor
+                                and span["source_frame_start"] == cursor
+                                and source["source_frame_start"] <= cursor
+                                and cursor + length <= source["source_frame_end"]):
+                            raise RuntimeError("Invalid source alignment")
+                        cursor += length
+                    if cursor != received + count:
+                        raise RuntimeError("Incomplete source alignment")
+                    received += count
+                    on_frames(payload, message)
+                elif kind == "session.completed":
+                    if not end_sent or received != submitted or message["output_frames"] != received:
+                        raise RuntimeError("Incomplete video")
+                    return
+            raise RuntimeError("Stream closed before completion")
+
+        async def heartbeat():
+            while True:
+                await asyncio.sleep(5)  # 按部署 idle timeout 调整。
+                await send({"type": "event", "kind": "heartbeat"})
+
+        # 任一任务异常都会取消另一个方向，避免发送方永远等不到 credit。
+        async with asyncio.TaskGroup() as tasks:  # Python 3.11+
+            heartbeat_task = tasks.create_task(heartbeat())
+            producer = tasks.create_task(produce())
+            receiver = tasks.create_task(receive())
+            await receiver
+            await producer
+            heartbeat_task.cancel()
+
+
+if __name__ == "__main__":
+    asyncio.run(demo(
+        "ws://127.0.0.1:30000/v1/realtime_video/generate",
+        lambda payload, meta: print(meta["output_frame_start"], meta["source_alignment"]),
+    ))
+```
+
+本示例用于接口评审，不是生产 SDK；未实现重连、鉴权或播放器。已用 Python 3.11 检查代码语法及全部 JSON，并通过内存 mock 验证小窗口/字节背压、跨 source_id 输出、两种帧封装、正常结束、拒绝旧版 ACK、服务端报错、错误映射及错误字节水位退出。第 2.1 节 H.264 helper 仅测试了消息封装、首帧标记和大小限制，使用合成 bytes，不是有效码流验证。Mock 不执行编解码或推理，也不是网络/GPU 联调，不能据此判断服务已可用。
+
+## 6. 与 MinWM / LingBot World 逐字段对照
+
+以下现状以本文开头的 main commit 为基准，指实际生产 adapter；共享 schema 或内部工具存在字段不代表服务已支持其语义。
+
+| 字段或行为 | MinWM | LingBot World | Zing 当前 main | Zing 目标 source-stream |
+| --- | --- | --- | --- | --- |
+| 路径 / MessagePack | 公共 realtime 接口 | 同左 | 同左 | 复用 |
+| `generation_mode` | i2v / t2v，按 first_frame 推断并校验 | 非 Zing source 轨道选择器 | 非 source 流选择器 | 不传；由 source_stream 明确模式 |
+| `first_frame` | i2v 要求，t2v 禁止 | 初始图像条件 | 静态 reference，不保证原样输出首帧 | 禁止；第 0 帧通过 append |
+| `prompt` / prompt event | 支持 | 支持 | 支持 | 复用 |
+| `num_frames` | t2v 显式设置时转换为 chunk 上限并校验 | 用于条件 horizon，不等同会话终止帧数 | 总长度，默认 22 | 可选像素帧上限，默认无上限 |
+| `max_chunks` | 可限长，t2v 与 num_frames 一致 | 可限长；省略不设该上限 | 被总长度推导值截断 | 本模式禁止非 null |
+| `num_inference_steps` | 强制 4 | 默认 4 | 沿用调用配置；有限示例使用匹配 schedule 的 four-step AR | 默认且要求 4，匹配模型 profile |
+| `size` / `fps` | 模型配置约束 | 模型配置约束 | 默认 896×512；FPS 校验配置 | 显式协商，source/output 一致 |
+| `seed` | 支持，还有 chunk seed 控制 | 公共 seed | 公共 seed | 复用初始 seed |
+| `guidance_scale` | adapter 归一为 0 | 传入采样配置 | 传入采样配置 | 由 four-step 模型 profile 固定，不提供调用方覆盖 |
+| `condition_inputs` / 动作 | action_labels、action_weights、camera_actions 等 | camera_actions | 拒绝非空输入 | 本模式不传；source 有独立事件 |
+| `zing_request` / source URI | 非该模型接口 | 非该模型接口 | 初始化完整 source | 不接受，用 source.append |
+| `task / conditions / target / source` | 非本文 Zing 入口 | 非本文 Zing 入口 | #126 已合入的有限媒体 SamplingParams 入口；不是已接通的持续输入协议 | 禁止混传；不隐式转换为 references/append |
+| `references` | 无本文新增字段 | 无本文新增字段 | 使用 zing_request references | 新增静态 bytes 列表 |
+| `source_id` / 输出 alignment | 无本文约定 | 无本文约定 | 无 | 新增 |
+| `source_stream.format` | 无本文新增字段 | 无本文新增字段 | 无 | rgb24 / 可选 h264；显式协商，均按像素帧编号 |
+| `realtime_output_format` | raw / webp / jpeg | 同左 | 同左 | 复用 |
+| `realtime_preview_max_width` | 公共输出配置 | 同左 | 同左 | 首版不传，保持声明尺寸 |
+| pacing / playback ACK / trace | 公共传输能力 | 同左 | 公共传输能力 | 不替代 source 背压；trace 可复用 |
+| KV / sink 配置 | adapter / pipeline 模型相关 | adapter / pipeline 模型相关 | 仅完整历史，拒绝有界 KV 设置 | 服务端有界策略，需验证，不向客户端承诺任意值 |
+| `zing_realtime_decode_mode` | 非该模型字段 | 非该模型字段 | immediate / stable，默认 immediate | 默认且要求 stable |
+| 结束 | chunk 限长或取消 | chunk 限长或取消 | 有限长度结束 | source.end → flush → completed |
+
+## 7. 实现状态与验收边界
+
+| 能力 | 当前 main 已有 | 后续工程工作 |
+| --- | --- | --- |
+| WebSocket、MessagePack、输出编码、prompt | 是 | 复用并保证输出头/payload 原子发送 |
+| 无预设长度 + 持续 source | 否 | 新协议校验、增量调度、输入预算与水位 |
+| source 确认与像素映射 | #118 提供共享 provenance / ID 类型；无生产 ACK / credit 账本 | 服务 owner 接通 encoder / AR / decoder 映射及 accepted/consumed |
+| H.264 source 输入 | 否 | AU 校验、每会话 decoder、颜色转换、PTS 对齐、帧/字节双预算；需确认硬件支持 |
+| 增量 VAE encode / decode | #103 已有范围 decode，不再重解码完整历史；#120 提供有界 source moments 缓冲、跨调用 stable decoder 与 EOS drain | 接通 codec→chunk→输出及有界交接；仍重算前一 clip 的 blending 上下文，不重新训练 H3 VAE |
+| 分块调度与随机数 | #121 提供 ChunkPlan、有限冻结输入的 SourceReadySession；失败关闭并释放，不支持原样重试；#120 提供显式 indexed-cpu-v1 工具 | 接通未知总长度的 source/target noise、生产调度及失败清理；不声称与 legacy native seed exact |
+| 有界长会话 | 否，当前完整历史 | 限制 KV、中间态及收发队列；滑动历史的生成质量需另行验证 |
+| 默认 four-step 服务 | 本文不提供可用 checkpoint 证据 | 确认 checkpoint、solver、noise schedule 后再承诺性能 |
+
+### 后续实现与合并边界
+
+本提案可独立作为文档合并；以下实现不构成文档合并前置条件，也不能仅凭合并状态宣告 API 可用。
+
+- [#114](https://github.com/seedleap/sglang/issues/114) 承接真实服务 caller：版本/profile 校验、source 事件、credit 所有权、有界下游交接、单 writer、EOS 和取消清理。#118 只提供共享数据类型，不含旧协议状态机原型。
+- 已合入的 [#120](https://github.com/seedleap/sglang/pull/120) 与 [#121](https://github.com/seedleap/sglang/pull/121) 仍需 codec→chunk 重分批、实际依赖映射及在线 noise 接线。codec 的局部内存平台期或有限请求数值对齐，不证明完整持续输入会话有界或成片质量通过。
+- [#125](https://github.com/seedleap/sglang/issues/125) / [#127](https://github.com/seedleap/sglang/pull/127) 承接窗口淘汰：已确认总窗口 21 个 temporal chunks = 3 sink + 17 recent + 1 current，同时间 source/target/audio 合计一个 chunk。#127 已合入冻结分支 `codex/zing-window-125-base`（`ae39c1ad14`），不是 main；full-history 仍是上述 main 的现状。其回滚重试与 main/#121 的失败关闭清理策略尚需统一，不能只凭 PR 的 merged 状态视为已完成 main 集成。窗口是部署内部策略，不是客户端 source 背压窗口、VAE clip 或像素帧数；不得把 `realtime_causal_kv_cache_num_frames` 偷换为 chunk 单位。
+- #126 已将 benchmark 下的使用说明与架构说明迁至[推理概览](/docs/sglang-diffusion/zing/overview)和[架构说明](/docs/sglang-diffusion/zing/architecture)。本提案路径不变；Zing H3 导航组统一保留 overview、architecture、realtime-streaming 与 API Proposals，不恢复旧 README 或创建重复导航。
+- [#117](https://github.com/seedleap/sglang/pull/117) 的 H3 VAE 加速与 [#128](https://github.com/seedleap/sglang/pull/128) 的可选 TAEH3 decoder 是独立候选，尚未进入上述 main 基准，不改变本提案的已实现状态。本文不把替代 decoder 的质量或性能作为 H3 VAE 已通过的证据。
+
+本文不要求重训 H3 VAE。长时 AR 截断历史是否保持质量、four-step checkpoint 是否就绪和实际端到端 FPS，都必须独立验收，不能由接口文档推断。
+
+后续实现至少测试：不同 source 网络分批得到相同时间轴；批次跨 source_id 的映射；stable 延迟不串 ID；暂停/慢消费者/窗口背压不丢帧或死锁；未知总长度、多 clip 和不整齐尾帧的 flush；有限上限超额/不足；异常与取消资源释放；长会话显存和主存平台期。本文仅做文档及示例检查，不宣称已通过这些 GPU 集成验收。
+
+H.264 额外验收：首帧缺 IDR/SPS/PPS、多 NAL 单 AU、错误地拆分 AU、含 B 帧或重排序、SPS/颜色/尺寸变更、超大 IDR、错误 PTS、异常码流、decoder drain、像素帧数一致、取消后 decoder 释放。码流解析需限制消息长度、解码尺寸和参考缓冲，不信任客户端声明。以相同游戏序列对比 raw/H.264 的码率、编码/传输/解码耗时、首帧与稳态端到端延迟、模型输入颜色及最终生成质量；硬件解码不可用时，不静默回退到未经性能验证的软件路径。

@@ -1640,7 +1640,13 @@
                     "pages": [
                       "docs/sglang-diffusion/zing/overview",
                       "docs/sglang-diffusion/zing/architecture",
-                      "docs/sglang-diffusion/zing/realtime-streaming"
+                      "docs/sglang-diffusion/zing/realtime-streaming",
+                      {
+                        "group": "API Proposals",
+                        "pages": [
+                          "docs/sglang-diffusion/zing/specs/causal-ar-realtime-api.zh-CN"
+                        ]
+                      }
                     ]
                   },
                   "docs/sglang-diffusion/models_with_ar",
