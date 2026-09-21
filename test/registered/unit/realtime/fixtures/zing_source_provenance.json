@@ -1,0 +1,25 @@
+{
+  "description": "CPU-only pixel provenance; no latent/chunk mapping is implied",
+  "accepted": [
+    {"source_id": 1, "source_frame_start": 0, "source_frame_end": 17},
+    {"source_id": 2, "source_frame_start": 17, "source_frame_end": 34}
+  ],
+  "output": {
+    "output_frame_start": 15,
+    "num_frames": 4,
+    "source_alignment": [
+      {"source_id": 1, "source_frame_start": 15, "output_frame_start": 15, "num_frames": 2},
+      {"source_id": 2, "source_frame_start": 17, "output_frame_start": 17, "num_frames": 2}
+    ],
+    "source_dependency_end": 34
+  },
+  "slice": {
+    "output_frame_start": 16,
+    "num_frames": 2,
+    "source_alignment": [
+      {"source_id": 1, "source_frame_start": 16, "output_frame_start": 16, "num_frames": 1},
+      {"source_id": 2, "source_frame_start": 17, "output_frame_start": 17, "num_frames": 1}
+    ],
+    "source_dependency_end": 34
+  }
+}
