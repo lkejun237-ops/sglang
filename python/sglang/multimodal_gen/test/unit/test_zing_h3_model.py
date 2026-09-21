@@ -219,6 +219,10 @@ def test_block_sampler_runs_cfg_and_tail(model, solver, with_audio):
     if sound is not None:
         assert sound.shape == audio.shape and torch.isfinite(sound).all()
     assert sampler.last_run_metrics == {
+        "window_chunks": 21,
+        "sink_chunks": 3,
+        "rope_position_mode": "block_relative",
+        "rope_max_frame_gap": 12,
         "block_spans": [
             {"source_block": 1, "target_block": 2, "start": 0, "end": 2, "frames": 2},
             {"source_block": 3, "target_block": 4, "start": 2, "end": 3, "frames": 1},

@@ -27,6 +27,10 @@ class ZingH3SamplingParams(SamplingParams):
     zing_generate_audio: bool = False
     zing_return_latents: bool = False
     zing_realtime_decode_mode: str = "immediate"
+    zing_window_chunks: int | None = 21
+    zing_sink_chunks: int = 3
+    zing_rope_position_mode: str = "block_relative"
+    zing_rope_max_frame_gap: int = 12
 
     def _adjust(self, server_args):
         enable_sequence_shard = self.enable_sequence_shard
@@ -56,6 +60,10 @@ class ZingH3SamplingParams(SamplingParams):
                 "zing_generate_audio",
                 "zing_return_latents",
                 "zing_realtime_decode_mode",
+                "zing_window_chunks",
+                "zing_sink_chunks",
+                "zing_rope_position_mode",
+                "zing_rope_max_frame_gap",
             }
         )
 
@@ -68,6 +76,12 @@ class ZingH3SamplingParams(SamplingParams):
 
     def _validate(self):
         super()._validate()
+        from sglang.multimodal_gen.runtime.realtime.zing_window import ZingWindowPolicy
+
+        ZingWindowPolicy(self.zing_window_chunks, self.zing_sink_chunks)
+        ZingWindowPolicy.validate_rope(
+            self.zing_rope_position_mode, self.zing_rope_max_frame_gap
+        )
         # Zing emits paired video/audio on the checkpoint time base. Frame
         # interpolation changes the frame count but not the audio length, and
         # the other post-processing switches have no Zing contract. Reject them

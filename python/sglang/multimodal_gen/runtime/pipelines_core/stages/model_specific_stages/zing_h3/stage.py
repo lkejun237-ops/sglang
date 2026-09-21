@@ -169,6 +169,12 @@ class ZingH3GenerationStage(PipelineStage):
             audio_shift=self.runtime["audio_timestep_shift"],
             num_train_timesteps=self.runtime["num_train_timestep"],
             guidance_scale=params.guidance_scale,
+            window_chunks=getattr(params, "zing_window_chunks", 21),
+            sink_chunks=getattr(params, "zing_sink_chunks", 3),
+            rope_position_mode=getattr(
+                params, "zing_rope_position_mode", "block_relative"
+            ),
+            rope_max_frame_gap=getattr(params, "zing_rope_max_frame_gap", 12),
         )
 
     @torch.no_grad()

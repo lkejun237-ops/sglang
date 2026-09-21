@@ -5,7 +5,6 @@ import math
 from dataclasses import dataclass
 
 import torch
-
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_minimax_h3_euler_ancestral import (
     _minimax_h3_euler_interpolate,
@@ -14,6 +13,7 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_minimax_h3_euler
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_zing_h3_causal_renoise import (
     ZingH3CausalRenoiseSchedule,
 )
+from sglang.multimodal_gen.runtime.realtime.zing_window import ZingWindowPolicy
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.multimodal_gen.runtime.utils.zing_diagnostics import current_diagnostic
 
@@ -58,6 +58,10 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         video_shift=5.0,
         audio_shift=3.0,
         guidance_scale=1.0,
+        window_chunks=21,
+        sink_chunks=3,
+        rope_position_mode="block_relative",
+        rope_max_frame_gap=12,
     ):
         if not math.isfinite(guidance_scale) or guidance_scale < 1:
             raise ValueError("Zing guidance_scale must be finite and at least one")
@@ -66,6 +70,10 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         if solver == "euler" and denoising_step_list is not None:
             raise ValueError("An explicit re-noise grid requires solver=few_step")
         self.generator, self.processor = transformer, packer
+        self.window_policy = ZingWindowPolicy(window_chunks, sink_chunks)
+        ZingWindowPolicy.validate_rope(rope_position_mode, rope_max_frame_gap)
+        self.rope_position_mode = rope_position_mode
+        self.rope_max_frame_gap = rope_max_frame_gap
         self.guidance_scale, self.do_cfg = guidance_scale, guidance_scale > 1
 
         def schedule(shift):
@@ -118,6 +126,10 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
 
         self._forward_counts = forward_counts
         self.last_run_metrics = {
+            "window_chunks": self.window_policy.window_chunks,
+            "sink_chunks": self.window_policy.sink_chunks,
+            "rope_position_mode": self.rope_position_mode,
+            "rope_max_frame_gap": self.rope_max_frame_gap,
             "block_spans": [
                 {
                     "source_block": source,
@@ -134,7 +146,12 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             "forward_counts": forward_counts,
             "dit_forwards": 0,
         }
-        cache = ZingH3KVCache(len(self.generator.blocks))
+        cache = ZingH3KVCache(
+            len(self.generator.blocks),
+            window_policy=self.window_policy,
+            rope_position_mode=self.rope_position_mode,
+            rope_max_frame_gap=self.rope_max_frame_gap,
+        )
         try:
             if diagnostic:
                 diagnostic.phase = "prefix"
@@ -203,6 +220,7 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         self.device = visual.device
         source, target, start, end = state.spans[state.index]
         try:
+            cache.prepare_chunk(target)
             if inputs is not None:
                 self.update_condition(state, inputs)
             history_rows = sum(c.positions.shape[0] for c in cache._history())

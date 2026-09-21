@@ -9,6 +9,7 @@ model loading, device placement, codecs and sampling belong to SGLang.
 from __future__ import annotations
 
 import math
+from itertools import accumulate, cycle, islice
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
@@ -162,18 +163,19 @@ class ZingH3Packer:
         self, length: int, origin: float, offset: int = 0
     ) -> torch.Tensor:
         # H3 的视觉帧并非恒定占一个时间单位；周期 span 来自 checkpoint rope_config。
-        spans = torch.tensor(
-            [
-                self.rope_frame_scale
-                * self.visual_token_frame_spans[
-                    index % len(self.visual_token_frame_spans)
-                ]
-                for index in range(offset + length)
-            ],
-            dtype=torch.float64,
+        # Preserve the checkpoint's sequential FP64 addition, but do not retain
+        # an offset-sized tensor/list on every incremental call. Arithmetic is
+        # still O(offset); switching to cycle multiplication changes rounding.
+        starts = accumulate(
+            (
+                self.rope_frame_scale * span
+                for span in cycle(self.visual_token_frame_spans)
+            ),
+            initial=0.0,
         )
-        starts = torch.cat((torch.zeros(1, dtype=torch.float64), spans.cumsum(0)))
-        return origin + starts[offset : offset + length]
+        return origin + torch.tensor(
+            list(islice(starts, offset, offset + length)), dtype=torch.float64
+        )
 
     def _video_t_span(self, length: int) -> float:
         return sum(

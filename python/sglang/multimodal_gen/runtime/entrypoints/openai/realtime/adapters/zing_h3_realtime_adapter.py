@@ -158,6 +158,10 @@ class ZingH3RealtimeAdapter(BaseRealtimeModelAdapter):
             "zing_denoising_step_list",
             "zing_request",
             "zing_realtime_decode_mode",
+            "zing_window_chunks",
+            "zing_sink_chunks",
+            "zing_rope_position_mode",
+            "zing_rope_max_frame_gap",
         ):
             value = getattr(request, name, None)
             if value is not None:

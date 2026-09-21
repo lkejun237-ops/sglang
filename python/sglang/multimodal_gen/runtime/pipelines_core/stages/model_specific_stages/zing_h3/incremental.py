@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fixture-driven, source-ready full-history execution; not a v1 service adapter.
+"""Fixture-driven, source-ready execution with optional temporal window; not a v1 service adapter.
 
 Initial noise must be supplied from a frozen native run. Generating it online
 would change channel-major RNG assignment and needs a separate model contract.
@@ -52,7 +52,7 @@ class ChunkResult:
 
 
 class SourceReadySession:
-    """One writer, bounded ready queue, absolute cursors, unbounded full-history KV.
+    """One writer, bounded ready queue, absolute cursors, optional bounded KV.
 
     append copies ready tensors into owned storage, so small views cannot retain
     whole codec clips. A failed step closes the session and releases its state.
@@ -69,11 +69,13 @@ class SourceReadySession:
         seed,
         max_pending_chunks,
         max_pending_bytes,
+        max_pending_spans=4096,
         total_latent_frames=None,
         initial_rng_state=None,
     ):
         if any(
-            type(n) is not int or n < 1 for n in (max_pending_chunks, max_pending_bytes)
+            type(n) is not int or n < 1
+            for n in (max_pending_chunks, max_pending_bytes, max_pending_spans)
         ):
             raise ValueError("Ready queue budgets must be positive integers")
         # Validate finite geometry without allocating a complete session layout.
@@ -92,9 +94,16 @@ class SourceReadySession:
         self.total_latent_frames = total_latent_frames
         self.pending = deque()
         self.pending_bytes = 0
+        self.pending_spans = 0
+        self.max_pending_spans = max_pending_spans
         self.next_chunk_id = self.next_latent = self.next_audio = self.next_pixel = 0
         self.committed_chunk_id = self.committed_latent = self.committed_pixel = 0
-        self.cache = ZingH3KVCache(len(sampler.generator.blocks))
+        self.cache = ZingH3KVCache(
+            len(sampler.generator.blocks),
+            window_policy=sampler.window_policy,
+            rope_position_mode=sampler.rope_position_mode,
+            rope_max_frame_gap=sampler.rope_max_frame_gap,
+        )
         self.rng = ZingH3RealtimeState()
         if initial_rng_state is not None:
             cpu_rng, cuda_rng = initial_rng_state
@@ -189,6 +198,8 @@ class SourceReadySession:
         if (
             len(self.pending) >= self.max_pending_chunks
             or self.pending_bytes + nbytes > self.max_pending_bytes
+            or self.pending_spans + len(provenance.source_alignment)
+            > self.max_pending_spans
         ):
             raise ValueError("The source-ready queue is full")
         owned = ReadyLatentChunk(
@@ -201,6 +212,7 @@ class SourceReadySession:
         )
         self.pending.append(owned)
         self.pending_bytes += nbytes
+        self.pending_spans += len(provenance.source_alignment)
         self.next_chunk_id += 1
         self.next_latent = chunk.end
         self.next_pixel = provenance.pixels.end
@@ -311,6 +323,7 @@ class SourceReadySession:
             result = ChunkResult(ready.chunk, visual, audio, provenance, prompt[1])
         self.pending.popleft()
         self.pending_bytes -= ready.nbytes
+        self.pending_spans -= len(ready.provenance.source_alignment)
         self.committed_chunk_id += 1
         self.committed_latent = ready.chunk.end
         self.committed_pixel = ready.provenance.pixels.end
@@ -324,7 +337,8 @@ class SourceReadySession:
         """Retained tensor storage only; excludes allocator/workspace/output owners.
 
         On-demand accounting, not a GPU peak measurement or admission guarantee.
-        KV growth is intentionally visible while full history remains selected.
+        Full-history KV grows; a temporal window bounds retained chunk count.
+        Prefix/reference size and caller-owned outputs are separate budgets.
         """
 
         def storage_bytes(tensors):
@@ -348,6 +362,7 @@ class SourceReadySession:
         return {
             "ready_bytes": self.pending_bytes,
             "ready_chunks": len(self.pending),
+            "ready_provenance_spans": self.pending_spans,
             "kv_storage_bytes": storage_bytes(kv),
             "kv_temporal_chunks": len(self.cache.committed),
             "static_storage_bytes": storage_bytes(static),
@@ -357,6 +372,7 @@ class SourceReadySession:
         self.cache.clear()
         self.pending.clear()
         self.pending_bytes = 0
+        self.pending_spans = 0
         self.rng.dispose()
         self.inputs = self.prompt = self.applied_prompt = self.sampler = None
         self.closed = True

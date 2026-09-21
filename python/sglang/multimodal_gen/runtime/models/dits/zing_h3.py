@@ -495,16 +495,22 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         modality = torch.zeros_like(row_role)
         modality[row_role == 0], modality[arows], modality[row_role == 7] = 1, 2, 3
         indices = (t_indices * 4 + modality)[row_start:row_stop]
+        attention_positions, history_positions = (
+            cache.attention_positions(
+                position_ids, prefix=self_cache_update == "prefix"
+            )
+            if cache is not None
+            else (position_ids, None)
+        )
         rope_positions = (
-            position_ids
+            attention_positions
             if sequence_splits is not None
-            else position_ids[row_start:row_stop]
+            else attention_positions[row_start:row_stop]
         )
         with maybe_record_function("Zing.build_RoPE_and_history_positions"):
             rope = _rope_cos_sin_cache(
                 self.rope(rope_positions[None]), dtype=hidden.dtype
             )
-            history_positions = cache.positions() if cache is not None else None
             history_rope = (
                 None
                 if history_positions is None

@@ -1,0 +1,6 @@
+{
+  "zing_window_chunks": 21,
+  "zing_sink_chunks": 3,
+  "zing_rope_position_mode": "block_relative",
+  "zing_rope_max_frame_gap": 12
+}

@@ -378,6 +378,10 @@ def run_sglang(args):
                         args.denoising_step_list if args.solver == "few_step" else None
                     ),
                     "zing_return_latents": True,
+                    "zing_window_chunks": args.window_chunks,
+                    "zing_sink_chunks": args.sink_chunks,
+                    "zing_rope_position_mode": args.rope_position_mode,
+                    "zing_rope_max_frame_gap": args.rope_max_frame_gap,
                     "num_inference_steps": args.sigma_points,
                     "guidance_scale": args.guidance_scale,
                     "seed": args.seed,
@@ -467,6 +471,10 @@ def run_sglang(args):
                     args.denoising_step_list if args.solver == "few_step" else None
                 ),
                 "guidance_scale": args.guidance_scale,
+                "window_chunks": args.window_chunks,
+                "sink_chunks": args.sink_chunks,
+                "rope_position_mode": args.rope_position_mode,
+                "rope_max_frame_gap": args.rope_max_frame_gap,
                 "load_seconds": load_seconds,
                 "generation_seconds": generation_seconds,
                 "generation_seconds_all": generation_seconds_all,
@@ -748,6 +756,17 @@ def parser():
         default="cpu",
     )
     sglang = sub.add_parser("sglang", parents=[common])
+    sglang.add_argument("--window-chunks", type=int, default=21)
+    sglang.add_argument(
+        "--full-history", action="store_const", const=None, dest="window_chunks"
+    )
+    sglang.add_argument("--sink-chunks", type=int, default=3)
+    sglang.add_argument(
+        "--rope-position-mode",
+        choices=("absolute", "block_relative"),
+        default="block_relative",
+    )
+    sglang.add_argument("--rope-max-frame-gap", type=int, default=12)
     sglang.add_argument("--sglang-root", required=True)
     sglang.add_argument("--model", required=True)
     sglang.add_argument("--sp-size", type=int, default=1)

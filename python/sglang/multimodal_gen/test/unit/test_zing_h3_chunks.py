@@ -94,7 +94,14 @@ def test_ready_chunks_match_full_history_frozen_noise(model, lengths, solver, gu
     inputs.media = [{"id": "ref", "type": "video"}]
     inputs.visual = {"ref": torch.randn(1, 2, 2, 2, 2)}
     inputs.audio = {"ref": torch.randn(1, 2, 3, 2)}
-    options = dict(solver=solver, sigma_points=3, guidance_scale=guidance)
+    options = dict(
+        solver=solver,
+        sigma_points=3,
+        guidance_scale=guidance,
+        window_chunks=None,
+        sink_chunks=0,
+        rope_position_mode="absolute",
+    )
     if solver == "few_step":
         options["denoising_step_list"] = [1000, 750, 500, 250]
     with torch.random.fork_rng(devices=[]):
@@ -258,9 +265,16 @@ def test_ready_queue_ownership_budget_prompt_eos(model):
 
 
 @torch.no_grad()
-def test_32_ready_chunks_pause_finite_eos_and_cancel(model):
+@pytest.mark.parametrize("window", [None, 21])
+def test_32_ready_chunks_pause_finite_eos_and_cancel(model, window):
     packer, inputs, noise, _ = _long_request(model, [1, 2, 2], frames=53)
-    sampler = ZingH3Sampler(model, packer, sigma_points=2)
+    sampler = ZingH3Sampler(
+        model,
+        packer,
+        sigma_points=2,
+        window_chunks=window,
+        sink_chunks=3 if window else 0,
+    )
     session = SourceReadySession(
         sampler,
         inputs,
@@ -285,12 +299,14 @@ def test_32_ready_chunks_pause_finite_eos_and_cancel(model):
         assert output.chunk == chunk
         assert session.committed_pixel == chunk.end
         assert session.pending_bytes == 0 and not session.pending
-        assert (
-            len(session.cache.committed) == chunk.chunk_id + 1
-        )  # Explicit full history, no eviction.
+        expected_chunks = (
+            chunk.chunk_id + 1 if window is None else min(window, chunk.chunk_id + 1)
+        )
+        assert len(session.cache.committed) == expected_chunks
         memory = session.memory_snapshot()
-        assert memory["kv_storage_bytes"] > previous_kv
-        assert memory["kv_temporal_chunks"] == chunk.chunk_id + 1
+        if window is None or chunk.chunk_id < window:
+            assert memory["kv_storage_bytes"] > previous_kv
+        assert memory["kv_temporal_chunks"] == expected_chunks
         assert memory["ready_bytes"] == 0
         previous_kv = memory["kv_storage_bytes"]
     assert session.committed_chunk_id == 32
@@ -299,7 +315,13 @@ def test_32_ready_chunks_pause_finite_eos_and_cancel(model):
     assert all(value == 0 for value in session.memory_snapshot().values())
 
     fresh = SourceReadySession(
-        ZingH3Sampler(model, packer, sigma_points=2),
+        ZingH3Sampler(
+            model,
+            packer,
+            sigma_points=2,
+            window_chunks=window,
+            sink_chunks=3 if window else 0,
+        ),
         inputs,
         seed=1,
         max_pending_chunks=1,
@@ -481,3 +503,214 @@ def test_ready_session_failure_releases_all_state_and_preserves_caller_rng(
             provenance=fixture_provenance(94, 20),
         )
     session.dispose()
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("lengths", [5, [1, 2, 2]])
+@pytest.mark.parametrize(
+    "failure_phase", [None, "source", "active", "final", "after_commit"]
+)
+@pytest.mark.parametrize("rope_mode", ["absolute", "block_relative"])
+def test_window_ready_matches_finite_or_closes_on_eviction_failure(
+    model, monkeypatch, lengths, failure_phase, rope_mode
+):
+    # Both paths use exactly the same policy, never compare different contexts.
+    frames = sum(
+        ChunkPlan(lengths).chunk(i).end - ChunkPlan(lengths).chunk(i).start
+        for i in range(32)
+    )
+    packer, inputs, noise, audio = _long_request(model, lengths, frames)
+    options = dict(
+        solver="few_step",
+        denoising_step_list=[1000, 500],
+        window_chunks=21,
+        sink_chunks=3,
+        rope_position_mode=rope_mode,
+    )
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(51)
+        rng = (torch.get_rng_state().clone(), None)
+        expected = ZingH3Sampler(model, packer, **options).sample(inputs, noise, audio)
+    sampler = ZingH3Sampler(model, packer, **options)
+    session = SourceReadySession(
+        sampler,
+        inputs,
+        seed=51,
+        max_pending_chunks=1,
+        max_pending_bytes=1000000,
+        initial_rng_state=rng,
+    )
+    outputs, sounds, audio_cursor = [], [], 0
+    for chunk in packer.chunk_plan.chunks(frames):
+        indices = packer._audio_indices_for_video_span(
+            audio.shape[2], chunk.start, chunk.end, frames
+        )
+        session.append(
+            inputs.source_visual[:, :, chunk.start : chunk.end],
+            noise[:, :, chunk.start : chunk.end],
+            audio=audio[:, :, indices],
+            audio_start=audio_cursor,
+            provenance=fixture_provenance(1, chunk.end, chunk.start, chunk.end),
+            final=chunk.end == frames,
+        )
+        audio_cursor += len(indices)
+        if chunk.chunk_id == 21 and failure_phase is not None:
+            caller_rng = torch.get_rng_state().clone()
+            original = sampler._forward
+
+            def fail(*args, **kwargs):
+                phase = args[2] if len(args) > 2 else kwargs.get("phase")
+                if phase == failure_phase:
+                    raise RuntimeError("window failure")
+                value = original(*args, **kwargs)
+                if phase == "final" and failure_phase == "after_commit":
+                    raise RuntimeError("window failure")
+                return value
+
+            monkeypatch.setattr(sampler, "_forward", fail)
+            with pytest.raises(RuntimeError, match="window failure"):
+                session.step()
+            assert session.closed and not session.complete
+            assert all(value == 0 for value in session.memory_snapshot().values())
+            assert session.rng.cpu_rng is session.rng.cuda_rng is None
+            assert session.inputs is session.sampler is session.prompt is None
+            assert torch.equal(caller_rng, torch.get_rng_state())
+            with pytest.raises(ValueError, match="closed"):
+                session.step()
+            return
+        result = session.step()
+        outputs.append(result.visual)
+        sounds.append(result.audio)
+        i = chunk.chunk_id
+        expected_ids = (
+            []
+            if session.complete
+            else [*range(min(i + 1, 3)), *range(max(3, i - 17), i + 1)]
+        )
+        assert [c.temporal_chunk_id for c in session.cache.committed] == expected_ids
+        assert session.pending_bytes == 0
+    torch.testing.assert_close(torch.cat(outputs, 2), expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(torch.cat(sounds, 2), expected[1], rtol=0, atol=0)
+    assert session.closed and session.memory_snapshot()["kv_storage_bytes"] == 0
+    assert session.rng.cpu_rng is None and not session.pending
+
+
+def test_incremental_rope_grid_preserves_checkpoint_rounding(model):
+    packer, _, _, _ = request(model)
+    for offset in (0, 1, 20, 150, 10000):
+        length = 7
+        spans = torch.tensor(
+            [
+                packer.rope_frame_scale
+                * packer.visual_token_frame_spans[
+                    i % len(packer.visual_token_frame_spans)
+                ]
+                for i in range(offset + length)
+            ],
+            dtype=torch.float64,
+        )
+        legacy = torch.cat((torch.zeros(1, dtype=torch.float64), spans.cumsum(0)))
+        torch.testing.assert_close(
+            packer._video_t_grid(length, 3.5, offset),
+            3.5 + legacy[offset : offset + length],
+            rtol=0,
+            atol=0,
+        )
+
+
+@torch.no_grad()
+def test_ready_metadata_budget_is_independent_of_tensor_budget(model):
+    packer, inputs, noise, _ = _long_request(model, 5, frames=5)
+    sampler = ZingH3Sampler(
+        model, packer, sigma_points=2, window_chunks=21, sink_chunks=3
+    )
+    session = SourceReadySession(
+        sampler,
+        inputs,
+        seed=1,
+        max_pending_chunks=1,
+        max_pending_bytes=100000,
+        max_pending_spans=1,
+    )
+    provenance = Provenance(
+        PixelRange(0, 2), (SourceSpan(1, 0, 0, 1), SourceSpan(2, 1, 1, 1)), 2
+    )
+    with pytest.raises(ValueError, match="queue is full"):
+        session.append(inputs.source_visual, noise, provenance=provenance)
+    assert session.pending_spans == session.pending_bytes == session.next_chunk_id == 0
+    session.append(
+        inputs.source_visual, noise, provenance=fixture_provenance(1, 2, 0, 2)
+    )
+    assert session.pending_spans == 1
+    session.dispose()
+    assert session.pending_spans == 0
+
+
+@torch.no_grad()
+def test_prompt_change_after_eviction_preserves_sinks_and_absolute_rope(model):
+    packer, inputs, noise, _ = _long_request(model, [1, 2, 2], frames=45)
+    sampler = ZingH3Sampler(
+        model, packer, sigma_points=2, window_chunks=21, sink_chunks=3
+    )
+    session = SourceReadySession(
+        sampler, inputs, seed=9, max_pending_chunks=1, max_pending_bytes=100000
+    )
+    sinks = None
+    origin = None
+    for i, chunk in enumerate(packer.chunk_plan.chunks(45)):
+        if i == 22:
+            sinks = session.cache.committed[:3]
+            origin = session.media_origin
+            condition = {
+                "context": torch.randn(5, 12).bfloat16(),
+                "row_role": torch.tensor([0, 1, 0, 0, 0]),
+            }
+            session.update_prompt(condition, 17)
+        session.append(
+            inputs.source_visual[:, :, chunk.start : chunk.end],
+            noise[:, :, chunk.start : chunk.end],
+            provenance=fixture_provenance(1, chunk.end, chunk.start, chunk.end),
+        )
+        result = session.step()
+        if i >= 22:
+            assert result.prompt_event_id == 17
+            assert session.media_origin == origin
+            assert all(a is b for a, b in zip(sinks, session.cache.committed[:3]))
+            # The temporal origin is anchored despite a different prefix length.
+            assert (
+                session.cache.committed[-1].positions[:, 0].min()
+                == packer._video_t_grid(1, origin, chunk.start)[0]
+            )
+    session.dispose()  # Cancellation after repeated eviction releases history.
+    assert all(value == 0 for value in session.memory_snapshot().values())
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("commit_first", [False, True])
+def test_window_cancelled_eos_is_not_successful_completion(model, commit_first):
+    packer, inputs, noise, _ = _long_request(model, [1, 2, 2], frames=3)
+    session = SourceReadySession(
+        ZingH3Sampler(model, packer, sigma_points=2, window_chunks=21, sink_chunks=3),
+        inputs,
+        seed=1,
+        max_pending_chunks=1,
+        max_pending_bytes=100000,
+    )
+    session.append(
+        inputs.source_visual[:, :, :1],
+        noise[:, :, :1],
+        provenance=fixture_provenance(1, 1),
+        final=not commit_first,
+    )
+    if commit_first:
+        session.step()
+        session.append(
+            inputs.source_visual[:, :, 1:3],
+            noise[:, :, 1:3],
+            provenance=fixture_provenance(1, 3, 1, 3),
+            final=True,
+        )
+    assert session.ended and not session.complete
+    session.dispose()
+    assert session.closed and not session.complete
+    assert all(value == 0 for value in session.memory_snapshot().values())
