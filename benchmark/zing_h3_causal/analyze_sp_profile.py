@@ -15,7 +15,6 @@ from concurrent.futures import ProcessPoolExecutor
 from itertools import repeat
 from pathlib import Path
 
-
 PATTERNS = {
     "collectives": r"nccl|all.?to.?all|all.?gather|reduce.?scatter|all.?reduce|ulysses|c10d",
     "gemm": r"gemm|cublas|aten::(?:mm|bmm|addmm|linear)$|nvjet",
@@ -32,6 +31,72 @@ REGION_PATTERN = re.compile(
     re.I,
 )
 BLOCK_PATTERN = re.compile(r"causal[ _:/-]*block|causal.*block_index", re.I)
+
+
+def region_block_evidence(events, block_events, region_events, limit, classify):
+    """Correlate kernels to individual region occurrences, then label CPU parents.
+
+    GPU timestamps need not fall inside host ranges. Ambiguous IDs retain the
+    same rejection semantics as the existing block/region summaries.
+    """
+    steps = [
+        e
+        for e in events
+        if classify(e) == "cpu_annotation"
+        and str(e.get("name", "")).startswith("Zing.denoise_step.")
+    ]
+    forwards = [
+        e
+        for e in events
+        if classify(e) == "cpu_annotation"
+        and str(e.get("name", "")).startswith("Zing.forward.")
+    ]
+
+    def parent(scope, candidates):
+        matches = [
+            e
+            for e in candidates
+            if (e.get("pid"), e.get("tid")) == (scope.get("pid"), scope.get("tid"))
+            and e["ts"] <= scope["ts"]
+            and scope["ts"] + scope["dur"] <= e["ts"] + e["dur"]
+        ]
+        if not matches:
+            return None
+        matches.sort(key=lambda e: e["dur"])
+        if len(matches) > 1 and matches[0]["dur"] == matches[1]["dur"]:
+            return None
+        return matches[0]
+
+    stats, status = correlate_blocks(events, region_events, limit, classify)
+    rows = []
+    for scope, evidence in zip(region_events, stats):
+        block = parent(scope, block_events)
+        step = parent(scope, steps)
+        forward = parent(scope, forwards)
+        name = block["name"] if block else None
+        history = re.search(r"history_rows(\d+)", name or "")
+        latent = re.search(r"\.latent(\d+)-(\d+)", name or "")
+        rows.append(
+            {
+                "region": scope["name"],
+                "block": name,
+                "block_start_us": block["ts"] if block else None,
+                "history_rows": int(history[1]) if history else None,
+                "latent_span": [int(latent[1]), int(latent[2])] if latent else None,
+                "step": step["name"] if step else None,
+                "forward": forward["name"] if forward else None,
+                "pid": scope.get("pid"),
+                "tid": scope.get("tid"),
+                "host_start_us": scope["ts"],
+                "host_duration_ms": scope["dur"] / 1000,
+                **evidence,
+            }
+        )
+    return {
+        "rows": rows,
+        "correlation_status": status,
+        "semantics": "Per region occurrence; block/step/forward are same-thread enclosing host scopes. Null parents remain unknown. GPU kernels use launch IDs, not timestamp clipping. Do not add these rows to the separate block or global region views.",
+    }
 
 
 def union_us(events):
@@ -373,6 +438,9 @@ def summarize(path, limit):
             for e in grouped["cuda_annotation"]
         ],
         "causal_block_spans": blocks,
+        "region_by_causal_block": region_block_evidence(
+            events, block_events, region_events, limit, classify
+        ),
         "causal_block_kernel_correlation_status": correlation_status,
         "named_region_cuda_evidence": {
             "selection_regex": REGION_PATTERN.pattern,

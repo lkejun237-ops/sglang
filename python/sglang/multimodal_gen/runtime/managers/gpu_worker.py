@@ -221,6 +221,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         self.init_device_and_model()
         load_snapshot = None if current_platform.is_cpu() else capture_memory_snapshot()
+        self._profile_load_snapshot = load_snapshot
         self._load_peak_reserved_mb = (
             load_snapshot.peak_reserved_mb if load_snapshot is not None else 0.0
         )
@@ -628,6 +629,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         output_batch = None
         forward_failed = False
+        collect_rank_memory = (
+            os.environ.get("SGLANG_DIFFUSION_COLLECT_RANK_MEMORY") == "1"
+            and current_platform.is_cuda()
+        )
         # Prewarm reqs (is_warmup=False) run a different offload layout and
         # must not contaminate the calibration records. Pipelines that cannot
         # apply a residency plan also skip the temporary per-layer hooks.
@@ -734,6 +739,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
                 self._materialize_output_transport(output_batch, req, save_output_paths)
             self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
+            if collect_rank_memory:
+                self._record_per_rank_memory(output_metrics)
 
             collect_perf = (
                 req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING
@@ -1168,6 +1175,28 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             )
         if self.is_output_rank:
             output_batch.peak_memory_mb = snapshot.peak_reserved_mb
+
+    def _record_per_rank_memory(self, output_metrics: list[Any]) -> None:
+        """Opt-in request peaks, preserved before replica MAX reduction.
+
+        The harness labels ordinary requests as warmup/measured/profile. Do not
+        infer that phase from req.is_warmup (which means server calibration).
+        CPU gathering adds measurement overhead but no GPU allocation.
+        """
+        from sglang.multimodal_gen.runtime.utils.rank_memory import gather_rank_memory
+
+        snapshot = capture_memory_snapshot()
+        records = gather_rank_memory(
+            torch.distributed,
+            get_replica_group().cpu_group,
+            self.rank,
+            self._profile_load_snapshot.to_dict(),
+            snapshot.to_dict(),
+        )
+        if self.is_output_rank:
+            for metrics in output_metrics:
+                for name, values in records.items():
+                    metrics.record_memory_snapshot(name, replace(snapshot, **values))
 
     def _record_replica_peak_memory(self, output_metrics: list[Any]) -> None:
         """Record replica-wide loading and runtime allocator peaks."""

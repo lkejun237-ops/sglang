@@ -292,8 +292,31 @@ def configure_execution(args):
     )
 
 
+def _require_rank_memory(metrics, sp_size):
+    snapshots = metrics.get("memory_snapshots", {})
+    for rank in range(sp_size):
+        for phase in ("load", "request"):
+            name = f"rank_{rank}_{phase}_peak"
+            value = snapshots.get(name, {})
+            for field in ("peak_allocated_mb", "peak_reserved_mb"):
+                peak = value.get(field)
+                if (
+                    not isinstance(peak, (int, float))
+                    or not np.isfinite(peak)
+                    or peak < 0
+                ):
+                    raise RuntimeError(
+                        f"Missing or invalid per-rank memory: {name}.{field}"
+                    )
+
+
 def run_sglang(args):
     configure_execution(args)
+    if args.collect_rank_memory:
+        os.environ["SGLANG_DIFFUSION_COLLECT_RANK_MEMORY"] = "1"
+        os.environ["SGLANG_DIFFUSION_STAGE_LOGGING"] = "1"
+    else:
+        os.environ.pop("SGLANG_DIFFUSION_COLLECT_RANK_MEMORY", None)
     from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
         DiffGenerator,
     )
@@ -336,7 +359,7 @@ def run_sglang(args):
     try:
 
         def generate(run_name, *, save_output, profile=False):
-            return generator.generate(
+            generated = generator.generate(
                 sampling_params_kwargs={
                     "prompt": prompt,
                     "num_frames": target_output["frames"],
@@ -360,11 +383,18 @@ def run_sglang(args):
                 }
             )
 
+            if args.collect_rank_memory:
+                _require_rank_memory(generated.metrics, args.sp_size)
+            return generated
+
         warmup_seconds = []
+        warmup_metrics = []
         for index in range(args.warmup_runs):
             started = time.perf_counter()
-            generate(f"sglang-warmup-{index}", save_output=False)
+            warmup_result = generate(f"sglang-warmup-{index}", save_output=False)
             warmup_seconds.append(time.perf_counter() - started)
+            warmup_metrics.append(warmup_result.metrics)
+            del warmup_result
         generation_seconds_all = []
         results = []
         for index in range(args.measured_runs):
@@ -452,6 +482,8 @@ def run_sglang(args):
                     else list(torch.as_tensor(result.audio).shape),
                 },
                 "warmup_seconds": warmup_seconds,
+                "warmup_metrics": warmup_metrics,
+                "collect_rank_memory": args.collect_rank_memory,
                 "peak_memory_mib": result.peak_memory_mb,
                 "metrics": result.metrics,
                 "measured_metrics": [item.metrics for item in results],
@@ -461,11 +493,12 @@ def run_sglang(args):
         )
         if args.profile_run:
             started = time.perf_counter()
-            generate("sglang-profile", save_output=True, profile=True)
+            profile_result = generate("sglang-profile", save_output=True, profile=True)
             profile_seconds = time.perf_counter() - started
             report_path = destination / "sglang.json"
             report = json.loads(report_path.read_text())
             report["profile_seconds_separate"] = profile_seconds
+            report["profile_metrics"] = profile_result.metrics
             _write_json(report_path, report)
     finally:
         generator.shutdown()
@@ -748,6 +781,11 @@ def parser():
         ),
     )
     sglang.add_argument("--profile-run", action="store_true")
+    sglang.add_argument(
+        "--collect-rank-memory",
+        action="store_true",
+        help="Preserve load/request peaks per rank; includes CPU gathering overhead",
+    )
     sglang.add_argument(
         "--compile-adaln",
         "--experimental-compiled-adaln",

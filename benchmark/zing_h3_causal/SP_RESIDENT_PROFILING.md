@@ -20,7 +20,7 @@ python benchmark/zing_h3_causal/validate_real_checkpoint.py sglang \
   --no-vae-cpu-offload --no-text-encoder-offload \
   --solver few_step --denoising-step-list 1000 750 500 250 \
   --sigma-points 4 --guidance-scale 1 --seed 42 \
-  --warmup-runs 1 --measured-runs 3 --profile-run
+  --warmup-runs 1 --measured-runs 3 --save-all-raw --collect-rank-memory --profile-run
 python benchmark/zing_h3_causal/analyze_sp_profile.py "$OUTPUT/traces" \
   --output "$OUTPUT/profile-summary.json"
 ```
@@ -123,3 +123,60 @@ CLI 在创建 worker 前传入运行时，模型初始化时保存选择。FA4 �
 `--experimental-compiled-adaln`（含两个布尔选项的 `--no-` 形式）仍作为兼容
 别名。worker 环境变量沿用旧名以兼容已有部署；新的结果 JSON 使用上述
 三个规范参数名对应的下划线字段。
+
+## Per-rank allocator evidence
+
+`--collect-rank-memory` is opt-in. It preserves load and request snapshots as
+`rank_N_load_peak` / `rank_N_request_peak` in each result's
+`memory_snapshots`, with both `peak_allocated_mb` and `peak_reserved_mb`.
+The load snapshot covers worker initialization; request peaks use the worker's
+existing allocator reset after warmup-pool release and include output transport.
+These values are allocator peaks in MiB, not physical device utilization.
+
+The harness retains `warmup_metrics`, `measured_metrics`, and `profile_metrics`
+separately. Harness warmups are ordinary requests, distinct from the server's
+calibration warmups. A missing/non-finite rank peak fails the harness.
+Snapshots are gathered through the replica CPU group, adding host collective
+overhead to API latency; use the same collection setting across configurations.
+The default runtime path does not add this collective.
+
+## Region-by-block analysis
+
+`profile-summary.json` now includes `region_by_causal_block` per trace. Each row
+is one CPU region occurrence, with enclosing block/history rows, latent span,
+denoising step and forward phase when available. Kernel attribution uses launch
+correlation / External IDs even when GPU execution occurs after the host scope;
+unknown or ambiguous attribution stays explicit. Do not add this view to global
+region or block totals: they describe the same kernels.
+
+`Zing.AdaLN` covers projection/indexing, not all normalization/modulation work.
+`Zing.build_RoPE_and_history_positions` combines current and historical RoPE;
+`Zing.RoPE_and_KV_append` is a joint scope. Kernel sums are work totals, not
+end-to-end wall-time savings.
+
+## Validate all measured raw outputs
+
+Freeze a JSON shape specification with `visual_latents` and `audio` shape arrays,
+derived from the verified model/request before examining the outputs. Then run:
+
+```bash
+python benchmark/zing_h3_causal/check_profile_outputs.py \
+  --run "1=$RESULT_ROOT/sp1" --run "2=$RESULT_ROOT/sp2" \
+  --run "4=$RESULT_ROOT/sp4" --expected-shapes "$EXPECTED_SHAPES" \
+  --measured-runs 3 --output "$RESULT_ROOT/raw-validation.json"
+```
+
+Every `sglang-N-raw.pt` must contain nonempty finite latent/audio tensors of the
+expected shapes. Invalid/missing files produce a JSON report and nonzero exit.
+The report compares each repetition against run 0 and each larger SP against SP1.
+`valid` checks supplied files; `matrix_complete` separately requires SP1/SP2/SP4.
+A valid partial matrix still exits zero. Numerical differences remain descriptive:
+no tolerance is inferred and strict parity is not certified. Media decoding,
+frame rate/resolution/audio-track checks remain separate. The profiler request
+has no raw archive and is not included in these raw comparisons.
+
+CPU regressions (PyTorch, NumPy and pytest; no checkpoint or CUDA required):
+
+```bash
+python -m pytest -q benchmark/zing_h3_causal/test_profile_tools.py
+```
