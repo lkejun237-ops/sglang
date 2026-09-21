@@ -11,11 +11,16 @@ class ZingH3SamplingParams(SamplingParams):
     num_frames: int = 22
     adjust_frames: bool = False
     enable_sequence_shard: bool | None = True
-    # Default export time base; the generation stage validates against media.fps.
+    # Media playback time base, never a cap on measured generation throughput.
     fps: int = 24
     num_inference_steps: int = 50  # Euler sigma points; 49 denoising forwards.
     guidance_scale: float = 1.0
     negative_prompt: str = ""
+    # Share H3 public request fields. source extends references with paired input.
+    task: str | None = None
+    conditions: list[dict] | None = None
+    target: dict | None = None
+    source: dict | None = None
     zing_request: dict | None = None
     zing_solver: str = "euler"
     zing_denoising_step_list: list[int] | None = None
@@ -41,6 +46,10 @@ class ZingH3SamplingParams(SamplingParams):
     def video_request_extra_fields(cls):
         return frozenset(
             {
+                "task",
+                "conditions",
+                "target",
+                "source",
                 "zing_request",
                 "zing_solver",
                 "zing_denoising_step_list",

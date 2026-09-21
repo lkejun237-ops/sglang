@@ -18,6 +18,11 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.media_request import (
+    optional_nonnegative_media_time,
+    parse_h3_media_descriptor,
+)
+
 
 @contextmanager
 def _local_media(uri: str, *, fs: Any | None = None):
@@ -79,15 +84,13 @@ def _clip_bounds(item: dict[str, Any]) -> tuple[float, float | None]:
         or set(clip) - {"start", "end"}
     ):
         raise ValueError("H3 media clip requires start and optional end")
-    if any(
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        for value in clip.values()
+    start = optional_nonnegative_media_time(clip["start"], "clip.start")
+    end = optional_nonnegative_media_time(clip.get("end"), "clip.end")
+    if (
+        start is None
+        or ("end" in clip and end is None)
+        or (end is not None and end < start)
     ):
-        raise ValueError("H3 media clip start and end must be finite numbers")
-    start, end = float(clip["start"]), None if "end" not in clip else float(clip["end"])
-    if start < 0 or (end is not None and end < start):
         raise ValueError("H3 media clip requires start >= 0 and end >= start")
     return start, end
 
@@ -341,21 +344,17 @@ class ZingH3MediaInput:
                 "H3 inference target must be a URI-free image, video or video_audio output descriptor"
             )
         self._inference_geometry(target)
-        media = [
-            dict(item)
-            for item in user_content
-            if isinstance(item, dict) and item.get("type") != "text"
-        ]
-        if any(
-            not isinstance(item.get("type"), str)
-            or item.get("type") not in {"image", "video", "video_audio", "audio"}
-            or not isinstance(item.get("id"), str)
-            or not isinstance(item.get("uri"), str)
-            for item in media
-        ):
-            raise ValueError(
-                "H3 inference media require id, uri and image/video/video_audio/audio type"
-            )
+        media = []
+        for index, item in enumerate(user_content):
+            if not isinstance(item, dict):
+                raise ValueError("H3 inference user content items must be objects")
+            if item.get("type") == "text":
+                continue
+            descriptor = parse_h3_media_descriptor(item, path=f"user.content[{index}]")
+            if not isinstance(item.get("id"), str) or not item["id"]:
+                raise ValueError("H3 inference media require a non-empty id")
+            _clip_bounds(item)
+            media.append({**item, **descriptor})
         media_by_id = {item["id"]: item for item in media}
         if len(media_by_id) != len(media):
             raise ValueError("H3 inference media ids must be unique")
@@ -382,16 +381,18 @@ class ZingH3MediaInput:
                 condition, media_by_id[condition["content_id"]]
             )
         source = target_message.get("source")
-        source_type = "image" if target["type"] == "image" else "video"
-        if source is not None and (
-            not isinstance(source, dict)
-            or set(source) - {"type", "uri", "clip"}
-            or source.get("type") != source_type
-            or not isinstance(source.get("uri"), str)
-        ):
-            raise ValueError(
-                f"H3 {target['type']} inference target.source must be a {source_type} URI descriptor"
-            )
+        if source is not None:
+            descriptor = parse_h3_media_descriptor(source, path="target.source")
+            source_type = "image" if target["type"] == "image" else "video"
+            if (
+                set(source) - {"type", "uri", "clip"}
+                or descriptor["type"] != source_type
+            ):
+                raise ValueError(
+                    f"H3 {target['type']} inference target.source must be a {source_type} URI descriptor"
+                )
+            _clip_bounds(source)
+            source = {**source, **descriptor}
         return (
             prompts[0],
             media,

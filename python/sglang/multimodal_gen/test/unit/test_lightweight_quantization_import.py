@@ -65,7 +65,12 @@ def test_text_encoder_loader_defers_srt_compiled_kernels():
             sys.executable,
             "-c",
             (
-                "import sys; "
+                # Lightweight init intentionally skips platform initialization. The
+                # import-only macOS test must install the existing platform stubs.
+                "import sys, platform; "
+                "from sglang._platform_stubs import install_platform_stubs; "
+                "install_platform_stubs() if sys.platform == 'darwin' "
+                "and platform.machine() == 'arm64' else None; "
                 "from sglang.multimodal_gen.runtime.loader.component_loaders."
                 "text_encoder_loader import TextEncoderLoader; "
                 "assert TextEncoderLoader is not None; "

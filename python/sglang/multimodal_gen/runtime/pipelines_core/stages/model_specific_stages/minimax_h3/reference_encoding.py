@@ -291,6 +291,27 @@ def _audio_resampler(source_rate: int):
     return torchaudio.transforms.Resample(source_rate, MINIMAX_H3_AUDIO_SAMPLE_RATE)
 
 
+def minimax_h3_encode_audio_mean(
+    model: Any, waveform: torch.Tensor, sample_rate: int
+) -> torch.Tensor:
+    """Encode [channels,samples] on the model device; callers own execution policy.
+
+    Share preprocess/encoder/optional pre_block/mean_proj between the H3
+    file-based entrypoint and Zing's already-decoded waveforms. Return raw
+    FP32 posterior means; callers own inference/determinism scopes, latent
+    normalization and row layout.
+    """
+    audio_data = model.preprocess(waveform.unsqueeze(1), sample_rate)
+    z = model.encoder(audio_data)
+    if bool(getattr(model, "attn_proj", False)):
+        z = model.pre_block(z.transpose(1, 2)).transpose(1, 2)
+    if not hasattr(model, "mean_proj"):
+        raise AttributeError(
+            "audio VAE model must expose mean_proj for deterministic mean encoding"
+        )
+    return model.mean_proj(z).float()
+
+
 @torch.inference_mode()
 def minimax_h3_encode_reference_audio_rows(
     audio_vae: Any,
@@ -326,17 +347,9 @@ def minimax_h3_encode_reference_audio_rows(
         _AudioVAEDeterminismContext(),
         set_forward_context(current_timestep=0, attn_metadata=None),
     ):
-        audio_data = model.preprocess(
-            waveform.unsqueeze(1), MINIMAX_H3_AUDIO_SAMPLE_RATE
+        latent = minimax_h3_encode_audio_mean(
+            model, waveform, MINIMAX_H3_AUDIO_SAMPLE_RATE
         )
-        z = model.encoder(audio_data)
-        if bool(getattr(model, "attn_proj", False)):
-            z = model.pre_block(z.transpose(1, 2)).transpose(1, 2)
-        if not hasattr(model, "mean_proj"):
-            raise AttributeError(
-                "audio VAE model must expose mean_proj for deterministic mean encoding"
-            )
-        latent = model.mean_proj(z).float()  # [2, 32, T] or [2, T, 32]
     if latent.ndim != 3:
         raise ValueError(f"expected 3D audio latent, got {list(latent.shape)}")
     latent_channels = arch_config.latent_channels

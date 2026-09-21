@@ -20,6 +20,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MINIMAX_H3_SUPPORTED_FPS,
     warn_unverified_short_edge,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.media_request import (
+    optional_nonnegative_media_time as _optional_nonnegative_finite_float,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.media_request import (
+    parse_h3_media_descriptor,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     MINIMAX_H3_CONDITION_ROLE_KEYFRAME,
     MINIMAX_H3_CONDITION_ROLE_REFERENCE,
@@ -63,17 +69,6 @@ def _optional_positive_finite_float(value: Any, path: str) -> float | None:
     normalized = float(value)
     if not math.isfinite(normalized) or normalized <= 0.0:
         raise ValueError(f"{path} must be a positive finite number")
-    return normalized
-
-
-def _optional_nonnegative_finite_float(value: Any, path: str) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{path} must be a number")
-    normalized = float(value)
-    if not math.isfinite(normalized) or normalized < 0.0:
-        raise ValueError(f"{path} must be a non-negative finite number")
     return normalized
 
 
@@ -198,14 +193,13 @@ def _validate_conditions(
             raise ValueError(
                 f"{cpath}.role must be keyframe or reference, got {role!r}"
             )
-        cond_type = _require_str(cond.get("type"), f"{cpath}.type")
+        media = parse_h3_media_descriptor(cond, path=cpath)
+        cond_type = media["type"]
         try:
             rule = profile.rule_for(role=role, condition_type=cond_type)
         except ValueError as exc:
             raise ValueError(f"{cpath}: {exc}") from exc
-        uri = _require_str(cond.get("uri"), f"{cpath}.uri")
-
-        entry: dict[str, Any] = {"type": cond_type, "uri": uri, "role": role}
+        entry: dict[str, Any] = {**media, "role": role}
         if rule.requires_frame_index:
             frame_index = _require_int(cond.get("frame_index"), f"{cpath}.frame_index")
             if aligned_frame_count is None:

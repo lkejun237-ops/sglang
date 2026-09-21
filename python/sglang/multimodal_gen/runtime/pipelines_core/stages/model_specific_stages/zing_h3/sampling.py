@@ -5,7 +5,12 @@ import math
 from dataclasses import dataclass
 
 import torch
+
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_minimax_h3_euler_ancestral import (
+    _minimax_h3_euler_interpolate,
+    _minimax_h3_rf_v_to_x0,
+)
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_zing_h3_causal_renoise import (
     ZingH3CausalRenoiseSchedule,
 )
@@ -31,11 +36,11 @@ class ZingH3EulerSchedule:
 
     def step(self, prediction, sample, *, step_index):
         sigma = self.sigmas[step_index]
-        denoised = (
-            sample.float() + (1 - self.timesteps[step_index]) * prediction.float()
+        denoised = _minimax_h3_rf_v_to_x0(
+            sample.float(), prediction.float(), self.timesteps[step_index]
         )
         ratio = self.sigmas[step_index + 1] / sigma
-        return (ratio * sample.float() + (1 - ratio) * denoised).to(
+        return _minimax_h3_euler_interpolate(sample.float(), denoised, ratio).to(
             sample.dtype
         ), denoised
 

@@ -36,6 +36,9 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_loader.weight_loading import (
+    default_weight_loader as default_weight_loader,
+)
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
@@ -48,22 +51,6 @@ _is_hip = is_hip()
 
 WeightsMapping = Mapping[str, Optional[str]]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""
-
-
-def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-    """Lightweight fallback used by AutoWeightsLoader.
-
-    Keep this local so importing model definitions does not initialize the
-    complete serving quantization registry through model_loader.weight_utils.
-    """
-    if param.numel() == 1 and loaded_weight.numel() == 1:
-        param.data.fill_(loaded_weight.item())
-        return
-    assert param.size() == loaded_weight.size(), (
-        f"Attempted to load weight ({loaded_weight.size()}) "
-        f"into parameter ({param.size()})"
-    )
-    param.data.copy_(loaded_weight)
 
 
 @dataclass

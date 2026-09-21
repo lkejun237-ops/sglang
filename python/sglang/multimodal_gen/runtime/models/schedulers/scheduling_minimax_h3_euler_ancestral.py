@@ -128,6 +128,16 @@ def _minimax_h3_euler_eta0_step(
         ratio = sigma_next_t / sigma_curr_t
     else:
         ratio = sigma_ratio.to(device=state.device, dtype=compute_dtype)
+    return _minimax_h3_euler_interpolate(state, denoised, ratio)
+
+
+def _minimax_h3_euler_interpolate(
+    state: torch.Tensor, denoised: torch.Tensor, ratio: torch.Tensor
+) -> torch.Tensor:
+    """Euler interpolation with a precomputed ratio (no device synchronization)."""
+    compute_dtype = (
+        torch.float32 if state.dtype in (torch.float16, torch.bfloat16) else state.dtype
+    )
     out = ratio * state.to(dtype=compute_dtype) + (1.0 - ratio) * denoised.to(
         dtype=compute_dtype
     )

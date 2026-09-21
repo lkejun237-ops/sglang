@@ -38,9 +38,7 @@ from sglang.srt.layers.attention.vision import (
     prepare_vision_attention_metadata,
 )
 from sglang.srt.layers.conv import Conv3dLayer
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -61,12 +59,12 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.weight_loading import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.models.utils import (
     RotaryPosMixin,
     WeightsMapper,
     compute_cu_seqlens_from_grid_numpy,
-    default_weight_loader,
 )
 from sglang.srt.multimodal.mm_utils import (
     materialize_multimodal_features,
@@ -74,13 +72,7 @@ from sglang.srt.multimodal.mm_utils import (
 )
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
-from sglang.srt.utils import (
-    add_prefix,
-    cpu_has_amx_support,
-    is_cpu,
-    is_npu,
-    round_up,
-)
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, is_npu, round_up
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 _is_npu = is_npu()

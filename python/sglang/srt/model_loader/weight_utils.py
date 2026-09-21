@@ -56,6 +56,9 @@ from sglang.srt.model_loader.ci_weight_validation import (
     ci_download_with_validation_and_retry,
     ci_validate_and_cleanup_local_snapshot,
 )
+from sglang.srt.model_loader.weight_loading import (
+    default_weight_loader as default_weight_loader,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     BAR_FORMAT,
@@ -1530,27 +1533,6 @@ def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
     if not isinstance(x, torch.Tensor):
         x = x[:]
     return x
-
-
-def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-    """Default weight loader."""
-    try:
-        if param.numel() == 1 and loaded_weight.numel() == 1:
-            # Sometimes scalar values aren't considered tensors with shapes
-            # so if both param and loaded_weight are a scalar,
-            # "broadcast" instead of copy
-            param.data.fill_(loaded_weight.item())
-        else:
-            assert param.size() == loaded_weight.size(), (
-                f"Attempted to load weight ({loaded_weight.size()}) "
-                f"into parameter ({param.size()})"
-            )
-
-            param.data.copy_(loaded_weight)
-    except Exception:
-        # NOTE: This exception is added for the purpose of setting breakpoint to
-        # debug weight loading issues.
-        raise
 
 
 def row_parallel_weight_loader(
