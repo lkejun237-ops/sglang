@@ -189,6 +189,45 @@ class ZingH3Codecs(ZingH3MediaInput):
         mean, std = self._stats(self.va, latent)
         return ((latent - mean) / std).half()
 
+    def encode_visual_moments(self, frames):
+        """Encode one complete native clip (or an EOS single image), without RNG.
+
+        Padding and posterior sampling belong to the stream owner. Do not use
+        this helper to independently pad arbitrary transport append batches.
+        """
+        if frames.shape[1] not in (1, self.vae_frames_per_chunk):
+            raise ValueError("H3 encoding requires one image or a complete clip")
+        model = self.modules["video_vae"]
+        device = next(model.parameters()).device
+        dtype = getattr(torch, self.runtime["vae_config"]["encode_dtype"])
+        model.encoder.to(dtype=dtype)
+        model.quant_conv.to(dtype=dtype)
+        pixels = frames[None].to(device=device, dtype=dtype).div(255)
+        mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
+        std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
+        with _visual_encode_policy():
+            return model._adaptive_encode((pixels - mean) / std)
+
+    def sample_streaming_visual_moments(self, moments, *, latent_start, noise_version):
+        """Opt-in streaming posterior; legacy encode_visual keeps its RNG mapping."""
+        from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+
+        from .streaming_noise import indexed_video_noise
+
+        posterior = DiagonalGaussianDistribution(moments)
+        noise = indexed_video_noise(
+            tuple(posterior.mean.shape),
+            seed=self.runtime["vae_config"]["posterior_seed"],
+            latent_start=latent_start,
+            purpose="source_posterior",
+            device=moments.device,
+            dtype=moments.dtype,
+            version=noise_version,
+        )
+        latent = (posterior.mean + posterior.std * noise).half().float()
+        mean, std = self._stats(self.va, latent)
+        return ((latent - mean) / std).half()
+
     def encode_audio(self, waveform):
         model = self.modules["audio_vae"]
         device = next(model.parameters()).device
