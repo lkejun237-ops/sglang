@@ -23,9 +23,7 @@ import torch.nn.functional as F
 from transformers import PretrainedConfig
 
 from sglang.kernels.fused_op import BaseFusedOp
-from sglang.srt.distributed import (
-    divide,
-)
+from sglang.srt.distributed import divide
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -57,28 +55,9 @@ _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
-    try:
-        from sgl_kernel import gelu_and_mul as _sgl_gelu_and_mul
-        from sgl_kernel import gelu_tanh_and_mul as _sgl_gelu_tanh_and_mul
-        from sgl_kernel import silu_and_mul as _sgl_silu_and_mul
-    except (ImportError, OSError):
-
-        def _native_and_mul(input, out, activation) -> None:
-            d = input.shape[-1] // 2
-            out.copy_(activation(input[..., :d]) * input[..., d:])
-
-        def _sgl_silu_and_mul(input, out) -> None:
-            _native_and_mul(input, out, F.silu)
-
-        def _sgl_gelu_and_mul(input, out) -> None:
-            _native_and_mul(input, out, F.gelu)
-
-        def _sgl_gelu_tanh_and_mul(input, out) -> None:
-            _native_and_mul(
-                input,
-                out,
-                lambda x: F.gelu(x, approximate="tanh"),
-            )
+    from sgl_kernel import gelu_and_mul as _sgl_gelu_and_mul
+    from sgl_kernel import gelu_tanh_and_mul as _sgl_gelu_tanh_and_mul
+    from sgl_kernel import silu_and_mul as _sgl_silu_and_mul
 
     from sglang.kernels.ops.activation.activation import (
         gelu_and_mul as _jit_gelu_and_mul,

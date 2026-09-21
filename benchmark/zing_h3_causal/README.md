@@ -78,6 +78,29 @@ result = generator.generate(sampling_params_kwargs=dict(
 forward，随后用 clean latent 做一次 KV commit。video/audio shift 来自导出的训练配置。
 步数和 guidance 是推理选择；训练 YAML 没有给出可直接沿用的质量最优值。
 
+推荐使用与 MiniMax H3 相同的 `task / conditions / target` 字段：
+
+```python
+sampling_params_kwargs = dict(
+    prompt="A camera moves slowly through a sunlit garden",
+    task="ref2va",  # Zing H3 唯一支持的 task
+    conditions=[{"type": "image", "uri": "/path/reference.png", "role": "reference"}],
+    target={"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0},
+    source={"type": "video", "uri": "/path/source.mp4"},  # 可选的 Zing 扩展
+    zing_generate_audio=False,
+)
+```
+
+该入口复用 H3 请求校验、reference 音视频路由和空间尺寸解析；Zing 按请求时长
+保留精确帧数（5 秒、24 FPS 为 120 帧），不强制 H3 的 `17n+5` 对齐。
+当前只支持 ref2va reference，要求显式 duration；不支持 target keyframe。
+普通 video reference 与 H3 一样也读取音轨，纯视觉 reference 可继续使用
+`zing_request` 的 `latent_modalities=["visual"]`。不要同时传两种请求格式。
+
+**播放 FPS 与生成吞吐不同**：`fps` / checkpoint media FPS 用于播放时间戳、
+source 重采样和音画对齐，不是实时限速。实时生成完成一个 block 就交付，实际 FPS
+由模型、硬件、采样步数和解码耗时决定，应以生成帧数 / 实际墙钟时间度量。
+
 `image_path` 可传图片参考，`num_frames=1` 生成图片。更完整的编辑任务通过 `zing_request`
 传入 user/target 两消息协议。user 媒体按声明顺序进入 Qwen presentation；conditions 只选择
 VAE reference 轨道。source 归一到训练 FPS 后必须与目标帧数相同，空间尺寸必须满足训练桶

@@ -22,10 +22,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from sglang.srt.distributed import (
-    get_pp_group,
-    get_pp_indices,
-)
+from sglang.srt.distributed import get_pp_group, get_pp_indices
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -45,7 +42,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.models.utils import default_weight_loader
+from sglang.srt.model_loader.weight_loading import default_weight_loader
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import add_prefix, make_layers

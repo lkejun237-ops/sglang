@@ -57,7 +57,6 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _flashinfer_layernorm_available = False
 _flashinfer_rmsnorm_quant_available = False
-_has_sgl_kernel_norm = False
 
 if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
@@ -100,17 +99,12 @@ if _is_cuda or _is_xpu or _is_musa:
         _flashinfer_layernorm_available = False
         _flashinfer_rmsnorm_quant_available = False
 
-    try:
-        from sgl_kernel import (
-            fused_add_rmsnorm,
-            gemma_fused_add_rmsnorm,
-            gemma_rmsnorm,
-            rmsnorm,
-        )
-    except (ImportError, OSError):
-        pass
-    else:
-        _has_sgl_kernel_norm = True
+    from sgl_kernel import (
+        fused_add_rmsnorm,
+        gemma_fused_add_rmsnorm,
+        gemma_rmsnorm,
+        rmsnorm,
+    )
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
 _has_rocm_triton_gemma_rms_norm = False
@@ -490,9 +484,7 @@ class RMSNorm(BaseFusedOp):
                 except ImportError:
                     self._fused_pad_kernel = None
             self._forward_method = self.forward_aiter
-        if force_native or (
-            (_is_cuda or _is_xpu or _is_musa) and not _has_sgl_kernel_norm
-        ):
+        if force_native:
             self._forward_method = self.forward_native
 
     def forward_cuda(

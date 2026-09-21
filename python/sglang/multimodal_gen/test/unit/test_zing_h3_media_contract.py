@@ -336,3 +336,46 @@ def test_source_request_rejects_incompatible_aspect_before_loading(codecs, monke
         codecs.prepare(
             make_request("video"), lambda name: pytest.fail("No model should load")
         )
+
+
+@pytest.mark.parametrize(
+    "uri", ["image.png", "https://example.test/ref.png", "s3://bucket/ref.png"]
+)
+def test_h3_and_zing_share_reference_descriptor_validation(codecs, uri):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.request_validation import (
+        minimax_h3_validate_canonical_request,
+    )
+
+    request = make_request("image", references=1, source=False)
+    request["messages"][0]["content"][1]["uri"] = uri
+    _, media, _, _, _ = codecs._parse_inference_request(request)
+    canonical = minimax_h3_validate_canonical_request(
+        task="ref2va",
+        prompt="Edit the scene",
+        conditions=[{"type": "image", "uri": uri, "role": "reference"}],
+        target={"short_edge": 768, "aspect_ratio": "auto", "duration_seconds": 5},
+    )
+    assert {key: media[0][key] for key in ("type", "uri")} == {
+        key: canonical["conditions"][0][key] for key in ("type", "uri")
+    }
+    request["messages"][0]["content"][1]["uri"] = ""
+    with pytest.raises(ValueError, match="uri must be a non-empty string"):
+        codecs._parse_inference_request(request)
+    with pytest.raises(ValueError, match="uri must be a non-empty string"):
+        minimax_h3_validate_canonical_request(
+            task="ref2va",
+            prompt="Edit the scene",
+            conditions=[{"type": "image", "uri": "", "role": "reference"}],
+            target={"short_edge": 768, "aspect_ratio": "auto", "duration_seconds": 5},
+        )
+
+
+@pytest.mark.parametrize(
+    "clip",
+    [{"start": -1}, {"start": True}, {"start": float("nan")}, {"start": 2, "end": 1}],
+)
+def test_source_clip_rejected_before_decoding(codecs, clip):
+    request = make_request("video")
+    request["messages"][1]["source"]["clip"] = clip
+    with pytest.raises(ValueError):
+        codecs._parse_inference_request(request)

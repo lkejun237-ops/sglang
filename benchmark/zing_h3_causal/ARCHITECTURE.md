@@ -106,3 +106,22 @@ baseline 先使用 BF16 dense SDPA 建立正确性。可复用 H3 的优化按�
 SP4 实测放在独立优化 PR：H100 上从单卡 layerwise 的 1253.28 秒降到四卡 FSDP + Ulysses4 的
 53.65 秒，观测 wall speedup 为 23.36×。这个比值包含 placement/offload 变化，不是纯 SP4
 scaling；详情应在性能 PR 中评审，不作为本 baseline PR 的验收结论。
+
+
+## H3 复用边界（#89 review 后续修复）
+
+- H3 与 Zing 共用媒体 `type`/`uri` 解析和非负有限时间校验；Zing 新增
+  H3 风格的 `task/conditions/target` 入口，task 只支持 `ref2va`，旧
+  `messages` 入口保留为兼容适配层，reference 和 source 走同一媒体描述校验。
+  source 的配对关系、实时 append 和 causal KV 生命周期属于 Zing。
+- H3 按 `17n+5` 对齐输出帧数；Zing 新入口复用 H3 校验与空间尺寸解析，
+  但按播放时间轴精确换算帧数，旧入口继续接受显式帧数。H3 reference image 按 2048 短边缩放（允许放大），
+  Zing 采用训练配置指定的面积上限与不放大选桶。保留这些策略是为了不改变
+  checkpoint 输入，不能据此推导出基础媒体解析不能共享。
+- Zing 的 patch-major rows 通过薄布局适配复用 H3 patchify/unpatchify；
+  Euler 复用 H3 的 FP32 插值；音频 codec 共用 posterior mean 编码核心。
+  visual posterior seed、FP16 舍入、单帧解码以及 source 对齐仍由 Zing 适配层持有。
+- SRT、Qwen 与 diffusion 使用同一个低依赖 `default_weight_loader`。
+  量化 backend 的延迟导入保留；它只隔离可选依赖，不代表 Zing 启用量化。
+  标准 GPU 路径仍要求可用的 sgl-kernel，缺失或 ABI 加载错误应立即报错，
+  不自动为所有 SRT 模型切换到 PyTorch fallback。

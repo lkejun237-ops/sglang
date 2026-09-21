@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.reference_encoding import (
     _AudioVAEDeterminismContext,
+    minimax_h3_encode_audio_mean,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.decoding import (
     _deterministic_audio_decode_context,
@@ -193,13 +194,9 @@ class ZingH3Codecs(ZingH3MediaInput):
         model = self.modules["audio_vae"]
         device = next(model.parameters()).device
         with _AudioVAEDeterminismContext():
-            x = model.preprocess(
-                waveform.to(device).reshape(2, 1, -1), self.audio_sample_rate
+            latent = minimax_h3_encode_audio_mean(
+                model, waveform.to(device).reshape(2, -1), self.audio_sample_rate
             )
-            x = model.encoder(x)
-            if model.attn_proj:
-                x = model.pre_block(x.transpose(1, 2)).transpose(1, 2)
-            latent = model.mean_proj(x).float()
         # Native audio mean_proj returns [stereo, channels, time].
         latent = latent.reshape(1, 2, self.aa.latent_channels, -1).permute(0, 1, 3, 2)
         mean, std = self._stats(self.aa, latent, audio=True)

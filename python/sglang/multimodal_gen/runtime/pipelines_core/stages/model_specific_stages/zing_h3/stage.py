@@ -3,6 +3,7 @@ import time
 from contextlib import contextmanager, nullcontext
 
 import torch
+
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -18,6 +19,7 @@ from sglang.multimodal_gen.runtime.utils.zing_diagnostics import (
 from .codecs import ZingH3Codecs
 from .packing import ZingH3Packer
 from .realtime import ZingH3RealtimeState
+from .request_adapter import build_h3_request
 from .sampling import ZingH3Sampler
 
 
@@ -77,6 +79,7 @@ class ZingH3GenerationStage(PipelineStage):
             )
         if params.quality != "lossless":
             raise ValueError("Zing currently implements only the dense quality path")
+        # Playback timestamps use params.fps; this never throttles inference.
         # The caller encodes the output file from params.fps; audio length is
         # computed from the export's fps, so the two must agree.
         if float(params.fps) != self.codecs.target_fps:
@@ -87,6 +90,11 @@ class ZingH3GenerationStage(PipelineStage):
 
     def _build_request(self, batch):
         params = batch.sampling_params
+        canonical = build_h3_request(
+            params, batch.extra, media_fps=self.codecs.target_fps
+        )
+        if canonical is not None:
+            return canonical
         request = batch.extra.get("zing_request")
         if request is None:
             request = getattr(params, "zing_request", None)
@@ -136,6 +144,16 @@ class ZingH3GenerationStage(PipelineStage):
                     },
                 ]
             }
+        source = batch.extra.get("source", getattr(params, "source", None))
+        if source is not None:
+            if (
+                getattr(params, "zing_request", None) is not None
+                or batch.extra.get("zing_request") is not None
+            ):
+                raise ValueError(
+                    "Specify source inside zing_request or use the shared H3 fields"
+                )
+            request["messages"][1]["source"] = source
         return request
 
     def _build_sampler(self, params):

@@ -16,35 +16,22 @@ from typing import Any
 import numpy as np
 import torch
 
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_tokens import (
+    minimax_h3_patchify_video_latent,
+    minimax_h3_unpatchify_video_tokens,
+)
+
 
 def _patchify_video_latents(
     latents: torch.Tensor, patch_size: tuple[int, int, int]
 ) -> torch.Tensor:
-    """按 T/H/W patch 展开 visual latent，空间遍历顺序与模型 patch embedding 保持一致。"""
-    if latents.ndim != 5:
-        raise ValueError(
-            f"video latents must be [B,C,T,H,W], got {list(latents.shape)}"
-        )
-    patch_t, patch_h, patch_w = patch_size
-    batch, channels, frames, height, width = latents.shape
-    if frames % patch_t or height % patch_h or width % patch_w:
-        raise ValueError(
-            f"video latents {list(latents.shape)} are not divisible by patch {patch_size}"
-        )
-    rows = latents.reshape(
-        batch,
-        channels,
-        frames // patch_t,
-        patch_t,
-        height // patch_h,
-        patch_h,
-        width // patch_w,
-        patch_w,
+    rows = minimax_h3_patchify_video_latent(latents, patch_size=patch_size)
+    # H3 flattens [C,P]; Zing keeps [P,C] for the shared input projection.
+    return (
+        rows.reshape(-1, latents.shape[1], math.prod(patch_size))
+        .transpose(1, 2)
+        .contiguous()
     )
-    rows = rows.permute(0, 2, 4, 6, 1, 3, 5, 7).reshape(
-        -1, channels, math.prod(patch_size)
-    )
-    return rows.permute(0, 2, 1).contiguous()
 
 
 def _unpatchify_video_rows(
@@ -53,7 +40,6 @@ def _unpatchify_video_rows(
     latent_shape: tuple[int, int, int],
     patch_size: tuple[int, int, int],
 ) -> torch.Tensor:
-    """严格逆转 ``_patchify_video_latents``，主要供推理阶段从生成 rows 恢复 VAE latent。"""
     if rows.ndim != 3 or rows.shape[1] != math.prod(patch_size):
         raise ValueError("H3 video rows must be [S,patch_volume,C]")
     frames, height, width = latent_shape
@@ -66,21 +52,16 @@ def _unpatchify_video_rows(
         or rows.shape[0] != expected
     ):
         raise ValueError("H3 video row count does not match latent shape")
-    channels = rows.shape[-1]
-    latents = rows.permute(0, 2, 1).reshape(
-        batch_size,
-        frames // patch_t,
-        height // patch_h,
-        width // patch_w,
-        channels,
-        patch_t,
-        patch_h,
-        patch_w,
-    )
-    return (
-        latents.permute(0, 4, 1, 5, 2, 6, 3, 7)
-        .reshape(batch_size, channels, frames, height, width)
-        .contiguous()
+    flat = rows.transpose(1, 2).reshape(rows.shape[0], -1)
+    return minimax_h3_unpatchify_video_tokens(
+        flat,
+        latent_shape=(
+            frames // patch_t,
+            height // patch_h,
+            width // patch_w,
+            rows.shape[-1],
+        ),
+        patch_size=patch_size,
     )
 
 
