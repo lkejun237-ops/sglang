@@ -9,6 +9,7 @@ time embedding, refiner, MLP and output heads as native H3.
 import functools
 import math
 import os
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -27,6 +28,8 @@ from sglang.multimodal_gen.runtime.layers.usp import (
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MiniMaxH3DiTModel,
     _apply_rope,
+    _apply_rope_into,
+    _apply_rope_kv_into,
     _diffusers_h3_checkpoint,
     _rope_cos_sin_cache,
 )
@@ -122,6 +125,11 @@ def _attention(
     capture=False,
     sequence_splits=None,
     attention_backend="torch_sdpa",
+    append_kv=None,
+    history_is_rotated=False,
+    capture_rotated=False,
+    append_unrotated=False,
+    capture_stored_values=False,
 ):
     if attention_backend not in {"torch_sdpa", "fa4"}:
         raise ValueError(
@@ -135,7 +143,8 @@ def _attention(
     q, k, v = (
         x.reshape(-1, module.num_heads, module.head_dim) for x in qkv.chunk(3, -1)
     )
-    q, k = module.q_norm(q), module.k_norm(k)
+    with maybe_record_function("Zing.QK_norm"):
+        q, k = module.q_norm(q), module.k_norm(k)
     if sequence_splits is not None:
         with maybe_record_function("Zing.Ulysses.input_all_to_all"):
             qkv = _usp_input_all_to_all_varlen_qkv(
@@ -148,15 +157,41 @@ def _attention(
         # Ulysses converts local sequence/all heads into complete sequence/local
         # heads. Cache that layout directly so every rank owns only its head
         # shard and no K/V all-gather is needed after a commit.
-        raw = (k[0].clone(), v[0].clone()) if capture else None
+        raw = (
+            (k[0].clone(), None if capture_stored_values else v[0].clone())
+            if capture and not capture_rotated
+            else None
+        )
         with maybe_record_function("Zing.RoPE_and_KV_append"):
             if rope is not None:
-                q, k = _apply_rope(q, rope), _apply_rope(k, rope)
-            if history is not None:
-                history_k = _apply_rope(history[0], history_rope)
-                history_v = history[1]
-                k = torch.cat((history_k[None], k), dim=1)
-                v = torch.cat((history_v[None], v), dim=1)
+                with maybe_record_function("Zing.current_QK_RoPE"):
+                    q = _apply_rope(q, rope)
+                    # The single store rotates K straight into its scratch tail.
+                    if not (capture_rotated or append_unrotated):
+                        k = _apply_rope(k, rope)
+            if append_kv is not None:
+                rows = k.shape[1]
+                with maybe_record_function("Zing.cached_KV_append"):
+                    k, v = append_kv(k[0], v[0])
+                    k, v = k[None], v[None]
+                # The store holds what this forward rotated, so the capture
+                # borrows those rows and the commit copies nothing.
+                if capture and capture_rotated:
+                    raw = (k[0, -rows:], v[0, -rows:])
+                    if v.shape[1] == rows:
+                        raw = (raw[0], raw[1].clone())  # no history: still a QKV view
+                elif capture and capture_stored_values:
+                    raw = (raw[0], v[0, -rows:])
+            elif history is not None:
+                with maybe_record_function("Zing.history_K_RoPE"):
+                    history_k = (
+                        history[0]
+                        if history_is_rotated
+                        else _apply_rope(history[0], history_rope)
+                    )
+                with maybe_record_function("Zing.history_current_KV_concat"):
+                    k = torch.cat((history_k[None], k), dim=1)
+                    v = torch.cat((history[1][None], v), dim=1)
         if attention_backend == "fa4":
             with maybe_record_function("Zing.FA4"):
                 result = _fa4_attention(q[0], k[0], v[0], module.softmax_scale)[None]
@@ -177,13 +212,37 @@ def _attention(
             ].reshape(hidden.shape[0], module.num_heads * module.head_dim)
         return module.out_proj(result)[0], raw
     # V is a view into fused QKV. Persist only V, not the entire projection.
-    raw = (k, v.clone()) if capture else None
+    raw = (
+        (k, None if capture_stored_values else v.clone())
+        if capture and not capture_rotated
+        else None
+    )
     with maybe_record_function("Zing.RoPE_and_KV_append"):
         if rope is not None:
-            q, k = _apply_rope(q, rope), _apply_rope(k, rope)
-        if history is not None:
-            k = torch.cat((_apply_rope(history[0], history_rope), k))
-            v = torch.cat((history[1], v))
+            with maybe_record_function("Zing.current_QK_RoPE"):
+                q = _apply_rope(q, rope)
+                if not (capture_rotated or append_unrotated):
+                    k = _apply_rope(k, rope)
+        if append_kv is not None:
+            rows = k.shape[0]
+            with maybe_record_function("Zing.cached_KV_append"):
+                k, v = append_kv(k, v)
+            if capture and capture_rotated:
+                raw = (k[-rows:], v[-rows:])
+                if v.shape[0] == rows:
+                    raw = (raw[0], raw[1].clone())  # no history: still a QKV view
+            elif capture and capture_stored_values:
+                raw = (raw[0], v[-rows:])
+        elif history is not None:
+            with maybe_record_function("Zing.history_K_RoPE"):
+                history_k = (
+                    history[0]
+                    if history_is_rotated
+                    else _apply_rope(history[0], history_rope)
+                )
+            with maybe_record_function("Zing.history_current_KV_concat"):
+                k = torch.cat((history_k, k))
+                v = torch.cat((history[1], v))
     if attention_backend == "fa4":
         with maybe_record_function("Zing.FA4"):
             result = _fa4_attention(q, k, v, module.softmax_scale).reshape(
@@ -230,6 +289,18 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         compiled_adaln = os.environ.get("SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN", "1")
         if compiled_adaln not in {"0", "1"}:
             raise ValueError("SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN must be 0 or 1")
+        for retired in (
+            "SGLANG_ZING_EXPERIMENTAL_CACHED_ROPE",
+            "SGLANG_ZING_EXPERIMENTAL_KV_APPEND",
+            "SGLANG_ZING_EXPERIMENTAL_KV_SINGLE_STORE",
+            "SGLANG_ZING_EXPERIMENTAL_FUSED_ROPE_KV_WRITE",
+        ):
+            if os.environ.get(retired) is not None:
+                warnings.warn(
+                    f"{retired} is ignored; Zing always uses the store-backed KV path",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
         arch = config.arch_config
         if arch.num_modalities != 4 or arch.adaln_out_features != 24 * arch.hidden_size:
             raise ValueError("Zing requires the trained four-modality AdaLN checkpoint")
@@ -247,6 +318,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         # hooks can stream them on memory-constrained GPUs.
         self.layer_names = ["blocks"]
         self.preprocess_loaded_state_dict = self._preprocess_checkpoint
+        self._cache_weight_generation = 0
 
     def _project_outputs(
         self, hidden, p, sequence_splits, local_vrows, local_arows, vrows, arows
@@ -306,6 +378,9 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             )
 
     def _preprocess_checkpoint(self, weights):
+        # Weight loaders may copy through .data without bumping Tensor._version.
+        # Invalidate live sessions as soon as a checkpoint load begins.
+        self._cache_weight_generation += 1
         for name, value in _diffusers_h3_checkpoint(
             (name.removeprefix("backbone."), value) for name, value in weights
         ):
@@ -507,16 +582,34 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             if sequence_splits is not None
             else attention_positions[row_start:row_stop]
         )
+        # A replicated SP prefix is captured before head sharding. Its raw store
+        # must be allocated by update() after that shard is selected below.
+        # Absolute full history still appends during that prefix.
+        use_cache = cache is not None
+        raw_attention = use_cache and cache.raw_store and not replicated_prefix
+        if use_cache:
+            # The timestep constant is initialized lazily by the first forward,
+            # often under inference_mode. Preserve its values while making its
+            # version observable to the same mutation guard as other buffers.
+            frequencies = self.time_embedder._frequency_cache
+            if frequencies is not None and torch.is_inference(frequencies):
+                with torch.inference_mode(False), torch.no_grad():
+                    self.time_embedder._frequency_cache = frequencies.clone()
+            # Parameter identity/version catches load_state_dict, device/dtype
+            # moves and normal in-place updates without GPU synchronization.
+            model_signature = tuple(
+                cache._tensor_signature(value)
+                for value in (*self.parameters(), *self.buffers())
+            )
+            if any(signature[1] is None for signature in model_signature):
+                raise ValueError(
+                    "Zing cached RoPE requires versioned model parameters and buffers"
+                )
+            cache.bind_model((self._cache_weight_generation, model_signature))
+            cache.bind_attention_positions(history_positions)
         with maybe_record_function("Zing.build_RoPE_and_history_positions"):
             rope = _rope_cos_sin_cache(
                 self.rope(rope_positions[None]), dtype=hidden.dtype
-            )
-            history_rope = (
-                None
-                if history_positions is None
-                else _rope_cos_sin_cache(
-                    self.rope(history_positions[None]), dtype=hidden.dtype
-                )
             )
         mask = None
         if cache is None and not (
@@ -528,37 +621,68 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         for index, block in enumerate(self.blocks):
             raw = None
 
-            def execute(current, value):
+            def execute(current, value, index=index):
                 nonlocal raw
                 with maybe_record_function("Zing.AdaLN"):
                     shift, scale, gate, ff_shift, ff_scale, ff_gate = (
                         v[indices] for v in current.adaln_proj(adaln_input)
                     )
-                normed = (
-                    _native_compiled_adaln(value, current.norm1, shift, scale)
-                    if self.experimental_compiled_adaln
-                    else current.norm1(value) * (1 + scale) + shift
-                )
-                with maybe_record_function("Zing.KV_history_concat"):
-                    history = None if cache is None else cache.history(index)
+                with maybe_record_function("Zing.norm_modulation.attention"):
+                    normed = (
+                        _native_compiled_adaln(value, current.norm1, shift, scale)
+                        if self.experimental_compiled_adaln
+                        else current.norm1(value) * (1 + scale) + shift
+                    )
+                def make_history_rope(positions):
+                    return _rope_cos_sin_cache(
+                        self.rope(positions[None]), dtype=value.dtype
+                    )
+
+                def write_current_kv(k, v, out_k, out_v):
+                    _apply_rope_kv_into(k, v, rope, out_k, out_v)
+
+                def append_current(k, v):
+                    if raw_attention:
+                        return cache.raw_attention_view(
+                            index,
+                            k,
+                            v,
+                            make_history_rope,
+                            _apply_rope_into,
+                            write_current_kv,
+                        )
+                    return cache.attention_view(index, k, v, write_current_kv)
+
                 attended, raw = _attention(
                     current.attn,
                     normed,
                     rope,
-                    history,
-                    history_rope,
+                    None,
+                    None,
                     mask,
                     capture=capture,
                     sequence_splits=sequence_splits,
                     attention_backend=self.experimental_attention_backend,
+                    append_kv=(
+                        append_current
+                        if use_cache and not (replicated_prefix and cache.raw_store)
+                        else None
+                    ),
+                    capture_rotated=use_cache and cache.single_store,
+                    append_unrotated=raw_attention,
+                    capture_stored_values=raw_attention,
                 )
-                value = value + gate * attended
-                ff_normed = (
-                    _native_compiled_adaln(value, current.norm2, ff_shift, ff_scale)
-                    if self.experimental_compiled_adaln
-                    else current.norm2(value) * (1 + ff_scale) + ff_shift
-                )
-                return value + ff_gate * current.mlp(ff_normed)
+                with maybe_record_function("Zing.gated_residual.attention"):
+                    value = value + gate * attended
+                with maybe_record_function("Zing.norm_modulation.mlp"):
+                    ff_normed = (
+                        _native_compiled_adaln(value, current.norm2, ff_shift, ff_scale)
+                        if self.experimental_compiled_adaln
+                        else current.norm2(value) * (1 + ff_scale) + ff_shift
+                    )
+                ff_output = current.mlp(ff_normed)
+                with maybe_record_function("Zing.gated_residual.mlp"):
+                    return value + ff_gate * ff_output
 
             hidden = block(
                 hidden,

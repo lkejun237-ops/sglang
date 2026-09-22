@@ -300,7 +300,12 @@ class SourceReadySession:
         )
         with self.rng.random_stream(sampler.device, self.seed):
             if prompt is not self.applied_prompt:
-                prefix_cache = ZingH3KVCache(len(sampler.generator.blocks))
+                prefix_cache = ZingH3KVCache(
+                    len(sampler.generator.blocks),
+                    window_policy=sampler.window_policy,
+                    rope_position_mode=sampler.rope_position_mode,
+                    rope_max_frame_gap=sampler.rope_max_frame_gap,
+                )
                 try:
                     if bool((positive["block_idx"] == 0).any()):
                         sampler._forward(
@@ -310,7 +315,7 @@ class SourceReadySession:
                             prefix_cache,
                             "prefix",
                         )
-                    self.cache.prefix = prefix_cache.prefix
+                    self.cache.replace_prefix(prefix_cache.prefix)
                 finally:
                     prefix_cache.clear()
             sampler.step(current)
@@ -348,10 +353,7 @@ class SourceReadySession:
                 storages[(tensor.device, storage.data_ptr())] = storage.nbytes()
             return sum(storages.values())
 
-        kv = []
-        for chunk in self.cache._history():
-            kv.append(chunk.positions)
-            kv.extend(t for layer in chunk.layers for t in layer)
+        kv = self.cache.owned_tensors()
         static = []
         if self.inputs is not None:
             static.extend(self.inputs.visual.values())

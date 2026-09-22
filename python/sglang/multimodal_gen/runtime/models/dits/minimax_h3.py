@@ -549,6 +549,97 @@ def _apply_rope(
     return _apply_rope_cos_sin(x, cos, sin)
 
 
+def _apply_rope_into(
+    x: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Write _apply_rope's result into `out`, skipping the concatenated copy.
+
+    Same products and the same accumulation order as _apply_rope, so the result
+    is bitwise identical; only the output buffer differs.
+    """
+    half = cos_sin_cache.shape[-1] // 2
+    cos_half, sin_half = cos_sin_cache.split(half, dim=-1)
+    cos = torch.cat((cos_half, cos_half), dim=-1).unsqueeze(1)
+    sin = torch.cat((sin_half, sin_half), dim=-1).unsqueeze(1)
+    rot_dim = cos.shape[-1]
+    x_rot = x[..., :rot_dim]
+    torch.add(x_rot * cos, _rotate_half(x_rot) * sin, out=out[..., :rot_dim])
+    out[..., rot_dim:].copy_(x[..., rot_dim:])
+    return out
+
+
+def _can_fuse_rope_kv_write(k, v, cos_sin_cache, out_k, out_v):
+    """Metadata-only guard for the measured Zing BF16 RoPE/write kernel."""
+    if (
+        torch.is_grad_enabled()
+        or not k.is_cuda
+        or torch.version.hip is not None
+        or cos_sin_cache is None
+        or k.ndim != 3
+        or cos_sin_cache.ndim != 2
+        or k.dtype != torch.bfloat16
+        or any(size == 0 for size in k.shape)
+        or k.numel() >= 2**31
+    ):
+        return False
+    rows, heads, dim = k.shape
+    rotary = cos_sin_cache.shape[-1]
+    if not (
+        0 < rotary <= dim
+        and rotary % 2 == 0
+        and cos_sin_cache.shape[0] == rows
+        and cos_sin_cache.is_contiguous()
+        and all(
+            t.device == k.device and t.dtype == k.dtype
+            for t in (v, cos_sin_cache, out_k, out_v)
+        )
+        and all(t.shape == k.shape for t in (v, out_k, out_v))
+        and all(
+            t.stride(-1) == 1
+            and t.stride(-2) == dim
+            and t.stride(0) >= heads * dim
+            and (rows - 1) * t.stride(0) + heads * dim < 2**31
+            for t in (k, v)
+        )
+        and out_k.is_contiguous()
+        and out_v.is_contiguous()
+    ):
+        return False
+    # A rotation reads a partner column: overlapping writes would race between
+    # Triton programs. The store normally owns entirely separate allocations.
+    return not (
+        torch._C._overlaps(out_k, out_v)
+        or any(
+            torch._C._overlaps(dst, src)
+            for dst in (out_k, out_v)
+            for src in (k, v, cos_sin_cache)
+        )
+    )
+
+
+def _apply_rope_kv_into(k, v, cos_sin_cache, out_k, out_v):
+    """Rotate K and copy V into cache scratch, fusing supported CUDA layouts.
+
+    CPU, other dtypes/devices/layouts, and absent RoPE retain the eager path.
+    Import the Triton backend only after the guard; CPU tests need no Triton.
+    Kernel failures propagate rather than silently hiding an invalid fast path.
+    """
+    if _can_fuse_rope_kv_write(k, v, cos_sin_cache, out_k, out_v):
+        from sglang.kernels.ops.diffusion.rope.zing_rope_kv_write import (
+            fused_zing_rope_kv_write,
+        )
+
+        fused_zing_rope_kv_write(k, v, cos_sin_cache, out_k, out_v)
+    else:
+        if cos_sin_cache is None:
+            out_k.copy_(k)
+        else:
+            _apply_rope_into(k, cos_sin_cache, out_k)
+        out_v.copy_(v)
+
+
 class MiniMaxH3TimeEmbedder(nn.Module):
     def __init__(
         self,

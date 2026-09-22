@@ -151,6 +151,7 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             window_policy=self.window_policy,
             rope_position_mode=self.rope_position_mode,
             rope_max_frame_gap=self.rope_max_frame_gap,
+            reserve_rows=int(pos["block_idx"].numel()),
         )
         try:
             if diagnostic:
@@ -198,7 +199,12 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             raise ValueError("Zing prompt update changed absolute target positions")
         # Reuse the original values exactly, including fractional frame positions.
         layout["position_ids"][new_target] = state.positive["position_ids"][old_target]
-        prefix_cache = ZingH3KVCache(len(self.generator.blocks))
+        prefix_cache = ZingH3KVCache(
+            len(self.generator.blocks),
+            window_policy=self.window_policy,
+            rope_position_mode=self.rope_position_mode,
+            rope_max_frame_gap=self.rope_max_frame_gap,
+        )
         try:
             if bool((layout["block_idx"] == 0).any()):
                 self._forward(
@@ -206,7 +212,7 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
                     prefix_cache,
                     "prefix",
                 )
-            state.cache.prefix = prefix_cache.prefix
+            state.cache.replace_prefix(prefix_cache.prefix)
             state.positive = layout
         finally:
             prefix_cache.clear()

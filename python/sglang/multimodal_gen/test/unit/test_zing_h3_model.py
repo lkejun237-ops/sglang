@@ -170,8 +170,13 @@ def test_incremental_kv_matches_explicit_clean_history(model):
         clean_parts.append(packed)
     assert cache.last_block == 4 and cache.active is None
     for chunk in [cache.prefix, *cache.committed]:
-        for k, v in chunk.layers:
-            assert v.untyped_storage().nbytes() == v.numel() * v.element_size()
+        for layer, (_k, v) in enumerate(chunk.layers):
+            # The store owns every committed row, so a chunk must alias it
+            # rather than retain a slice of the fused projection.
+            assert (
+                v.untyped_storage().data_ptr()
+                == cache._stores[layer][1].untyped_storage().data_ptr()
+            )
     cache.clear()
     assert cache.positions() is None
 
