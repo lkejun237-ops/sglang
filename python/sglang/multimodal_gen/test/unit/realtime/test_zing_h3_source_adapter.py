@@ -99,8 +99,44 @@ def test_reject_mixed_protocol_or_profile(configured, overrides):
         initialize(**overrides)
 
 
-def test_ready_preserves_unknown_total_and_accepted_precedes_dispatch(configured):
+def test_default_encoder_dispatches_first_frame(configured):
     adapter, session = initialize()
+    assert adapter.source_encoder["mode"] == "progressive"
+    assert adapter.source_encoder["factory"].endswith("progressive_encoder:create_session")
+    adapter.pending_frames = 1
+    asyncio.run(asyncio.wait_for(adapter.wait_for_next_chunk(session), 1))
+
+
+def test_explicit_clip17_waits_for_full_clip(configured):
+    from pathlib import Path
+
+    path = Path(configured.model_path) / "zing_realtime_profile.json"
+    profile = json.loads(path.read_text())
+    profile["source_encoder"] = {"mode": "clip17"}
+    path.write_text(json.dumps(profile))
+    adapter, session = initialize()
+    assert adapter.source_encoder == {"mode": "clip17"}
+
+    async def run():
+        adapter.pending_frames = 1
+        waiter = asyncio.create_task(adapter.wait_for_next_chunk(session))
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        adapter.pending_frames = 17
+        adapter.available.set()
+        await asyncio.wait_for(waiter, 1)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "mode,frames", [("clip17", 17)] + [("progressive", n) for n in [1, 2, 8, 17]]
+)
+def test_ready_preserves_unknown_total_and_accepted_precedes_dispatch(
+    configured, mode, frames
+):
+    adapter, session = initialize()
+    adapter.source_encoder = {"mode": mode}
     assert session.request.num_frames is None and session.request.max_chunks is None
     assert adapter.session_ready_message(session)["realtime_output_format"] == "raw"
 
@@ -119,9 +155,9 @@ def test_ready_preserves_unknown_total_and_accepted_precedes_dispatch(configured
         payload = dict(
             client_seq=0,
             source_frame_start=0,
-            num_frames=17,
+            num_frames=frames,
             pts_us=0,
-            data=bytes(17 * 32 * 32 * 3),
+            data=bytes(frames * 32 * 32 * 3),
         )
         await adapter.ingest_wire_event(
             Socket(),
@@ -192,6 +228,72 @@ def test_source_provenance_survives_transport_splitting(output_format):
         )
         cursor = end
     assert cursor == stats["num_frames"] == 17
+
+
+def test_explicit_prompt_video_preserves_reference_ids(
+    configured, monkeypatch
+):
+    import io
+    from PIL import Image
+
+    data = io.BytesIO()
+    Image.new("RGB", (32, 32)).save(data, format="JPEG")
+    refs = [
+        dict(id=f"<Picture {i + 1}>", format="jpeg", payload=data.getvalue())
+        for i in range(9)
+    ]
+    frame = io.BytesIO()
+    Image.new("RGB", (32, 32)).save(frame, format="PNG")
+    adapter, session = initialize(
+        references=refs,
+        prompt_video_frame=dict(id="<Video 1>", format="png", payload=frame.getvalue()),
+    )
+    assert adapter.ready["max_references"] == 9
+    assert adapter.ready["max_reference_bytes"] == 8 << 20
+    monkeypatch.setattr(
+        source, "build_realtime_sampling_params", lambda *a, **kw: SimpleNamespace()
+    )
+    params = adapter.build_sampling_params(
+        session,
+        None,
+        SimpleNamespace(request_id="test"),
+        SimpleNamespace(prompt="original prompt"),
+        17,
+    )
+    user, target = params.zing_request["messages"]
+    assert user["content"][0]["type"] == "video"
+    assert user["content"][0]["clip"] == dict(start=0, end=0)
+    assert [c["id"] for c in user["content"][1:-1]] == [r["id"] for r in refs]
+    assert user["content"][-1]["text"] == "original prompt"
+    assert [c["content_id"] for c in target["conditions"]] == [r["id"] for r in refs]
+    assert "source" not in target
+    # PyAV must decode the PNG as exactly one video frame for the prompt loader.
+    import av
+
+    with av.open(user["content"][0]["uri"]) as container:
+        assert len(list(container.decode(video=0))) == 1
+    adapter.clear_state(session)
+    assert not adapter.reference_items and adapter.prompt_video is None
+
+
+def test_reference_bytes_remain_bounded(configured):
+    with pytest.raises(ValueError, match="too large"):
+        initialize(
+            references=[dict(id="large", format="jpeg", payload=b"x" * ((8 << 20) + 1))]
+        )
+
+
+def test_prompt_video_frame_cannot_duplicate_reference_id(configured):
+    import io
+    from PIL import Image
+
+    data = io.BytesIO()
+    Image.new("RGB", (32, 32)).save(data, format="JPEG")
+    with pytest.raises(ValueError, match="uniquely named PNG"):
+        initialize(
+            references=[dict(id="same", format="jpeg", payload=data.getvalue())],
+            prompt_video_frame=dict(id="same", format="png", payload=b""),
+        )
 
 
 def test_nine_references_are_preserved_and_ten_rejected(configured):

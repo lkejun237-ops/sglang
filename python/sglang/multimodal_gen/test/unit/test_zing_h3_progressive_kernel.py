@@ -1,0 +1,251 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Real small CNN kernels on CPU; not trained-weight/GPU acceptance."""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch import nn
+
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vae_cnn import (
+    EncoderFCN3D,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.progressive_encoder import (
+    create_session,
+    expected_progressive_slices,
+)
+
+
+@pytest.fixture
+def codecs():
+    torch.manual_seed(7)
+    model = nn.Module()
+    model.encoder = (
+        EncoderFCN3D(
+            ch=32,
+            ch_mult=[1, 1, 1],
+            space_down=[1, 1, 1],
+            time_down=[1, 2, 2],
+            num_res_blocks=1,
+            in_channels=3,
+            z_channels=24,
+            double_z=True,
+            causal=True,
+            use_t_isolated_gn=True,
+        )
+        .double()
+        .eval()
+    )
+    model.quant_conv = nn.Conv3d(48, 48, 1).double().eval()
+    model.encoder_tiling = False
+    return SimpleNamespace(
+        modules={"video_vae": model},
+        vae_frames_per_chunk=17,
+        vae_latents_per_chunk=5,
+        temporal_ratio=4,
+        runtime={
+            "vae_config": {"encode_dtype": "float64", "encode_mode": "performance"}
+        },
+    )
+
+
+def full(codecs, pixels):
+    model = codecs.modules["video_vae"]
+    values = []
+    with torch.no_grad():
+        for start in range(0, pixels.shape[1], 17):
+            x = pixels[:, start : start + 17]
+            n = x.shape[1]
+            if n < 17 and pixels.shape[1] != 1:
+                x = torch.cat((x, x[:, -1:].expand(-1, 17 - n, -1, -1)), 1)
+            x = x[None].double() / 255
+            mean = x.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
+            std = x.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
+            values.append(
+                model.quant_conv(model.encoder((x - mean) / std))[
+                    :, :, : 1 + (n - 1 + 3) // 4
+                ]
+            )
+    return torch.cat(values, 2)
+
+
+@pytest.mark.parametrize("frames", range(1, 35))
+def test_real_cnn_causal_cache_and_eos(codecs, frames):
+    pixels = torch.randint(256, (3, frames, 8, 8), dtype=torch.uint8)
+    stream = create_session(codecs, capacity_frames=8)
+    values, indices = [], []
+    for i in range(frames):
+        stream.append(pixels[:, i : i + 1], frame_start=i)
+        while stream.ready:
+            item = stream.pop()
+            values.append(item.values)
+            indices.append((item.start, item.end, item.source_dependency_end))
+    stream.finish()
+    while stream.ready:
+        item = stream.pop()
+        values.append(item.values)
+        indices.append((item.start, item.end, item.source_dependency_end))
+    assert indices == expected_progressive_slices(frames)
+    # Float64 analytical test only. Production BF16 acceptance remains exact.
+    torch.testing.assert_close(
+        torch.cat(values, 2), full(codecs, pixels), atol=1e-12, rtol=1e-12
+    )
+    stream.dispose()
+    assert stream.state_usage().retained_bytes == 0
+
+
+def test_session_storage_failure_and_reset(codecs):
+    pixels = torch.randint(256, (3, 8, 8, 8), dtype=torch.uint8)
+    a = create_session(codecs, capacity_frames=8)
+    b = create_session(codecs, capacity_frames=8)
+    saved = pixels.clone()
+    a.append(pixels, frame_start=0)
+    pixels.zero_()
+    b.append(saved, frame_start=0)
+    torch.testing.assert_close(a.pop().values, b.pop().values, atol=0, rtol=0)
+    usage = a.state_usage()
+    with pytest.raises(ValueError):
+        a.append(saved, frame_start=8)
+    assert a.accepted_frames == 8 and a.state_usage() == usage
+    a.reset()
+    assert a.state_usage().retained_bytes == 0
+    a.append(saved[:, :1], frame_start=0)
+    a.pop()
+    a.finish()
+    assert a.state_usage().retained_bytes == 0
+    a.dispose()
+    a.dispose()
+    with pytest.raises(ValueError):
+        a.reset()
+
+
+def test_fixed_work_per_clip_and_bounded_storage(codecs):
+    stream = create_session(codecs, capacity_frames=17)
+    pixels = torch.randint(256, (3, 17, 8, 8), dtype=torch.uint8)
+    totals, peaks = [], []
+    first = None
+    for clip in range(4):
+        stream.append(pixels, frame_start=17 * clip)
+        peak = stream.state_usage().retained_bytes
+        while stream.ready:
+            item = stream.pop()
+            if first is None:
+                first = item.values.clone()
+                item.values.zero_()
+            peak = max(peak, stream.state_usage().retained_bytes)
+        totals.append(stream.state_usage().temporal_positions)
+        peaks.append(peak)
+        assert stream.state_usage().retained_bytes == 0
+    assert totals == [totals[0] * n for n in range(1, 5)]
+    assert len(set(peaks)) == 1
+
+
+def test_kernel_exception_keeps_state_retryable(codecs, monkeypatch):
+    stream = create_session(codecs, capacity_frames=17)
+    pixels = torch.randint(256, (3, 17, 8, 8), dtype=torch.uint8)
+    stream.append(pixels, frame_start=0)
+    stream.pop()
+    usage = stream.state_usage()
+    original = stream.cache.model.quant_conv.forward
+
+    def fail(x):
+        raise RuntimeError("injected kernel failure")
+
+    monkeypatch.setattr(stream.cache.model.quant_conv, "forward", fail)
+    with pytest.raises(RuntimeError, match="injected"):
+        stream.pop()
+    assert stream.emitted_latents == 1
+    assert stream.state_usage() == usage
+    monkeypatch.setattr(stream.cache.model.quant_conv, "forward", original)
+    assert stream.pop().end == 3
+
+
+@pytest.mark.parametrize("stack", [False, True])
+@pytest.mark.parametrize("padding", ["zeros", "reflect"])
+def test_native_tiling_and_packet_invariance(codecs, stack, padding):
+    from types import MethodType
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.klvae import (
+        AutoencoderKL,
+        AutoencoderKLLegacy,
+    )
+
+    model = codecs.modules["video_vae"]
+    model.encoder = (
+        EncoderFCN3D(
+            ch=32,
+            ch_mult=[1, 1, 1],
+            space_down=[1, 2, 2],
+            time_down=[1, 2, 2],
+            num_res_blocks=1,
+            in_channels=3,
+            z_channels=24,
+            double_z=True,
+            causal=True,
+            padding_mode=padding,
+            use_t_isolated_gn=True,
+        )
+        .double()
+        .eval()
+    )
+    model.encoder_tiling = True
+    model.parallel_tiling = False
+    model.stack_tiling = stack
+    model.tile_size = 16
+    model.tile_overlap_min = 8
+    model.vae_ratio = 4
+    model._blend_weight_cache = {}
+    for name in (
+        "split_tiles",
+        "blend",
+        "_assemble_tiles",
+        "_local_tile_indices",
+        "_run_tile_tasks",
+        "tiled_encode",
+    ):
+        setattr(model, name, MethodType(getattr(AutoencoderKL, name), model))
+    model.encode = MethodType(AutoencoderKLLegacy.encode, model)
+    pixels = torch.randint(256, (3, 17, 24, 24), dtype=torch.uint8)
+    x = pixels[None].double() / 255
+    x = (x - x.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)) / x.new_tensor(
+        (0.229, 0.224, 0.225)
+    ).view(1, 3, 1, 1, 1)
+    with torch.no_grad():
+        reference = model.tiled_encode(x)
+    results = []
+    for pattern in ([1], [17], [3, 2, 7, 5]):
+        stream = create_session(codecs, capacity_frames=17)
+        cursor = step = 0
+        values = []
+        while cursor < 17:
+            n = min(pattern[step % len(pattern)], 17 - cursor)
+            stream.append(pixels[:, cursor : cursor + n], frame_start=cursor)
+            cursor += n
+            step += 1
+            while stream.ready:
+                values.append(stream.pop().values)
+        stream.finish()
+        results.append(torch.cat(values, 2))
+        torch.testing.assert_close(results[-1], reference, atol=1e-12, rtol=1e-12)
+    for result in results[1:]:
+        torch.testing.assert_close(result, results[0], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("watermark,tokens", [(1, 1), (9, 3)])
+def test_cached_outputs_ignore_future_pixels(codecs, watermark, tokens):
+    source = torch.randint(256, (3, 17, 8, 8), dtype=torch.uint8)
+    changed = source.clone()
+    changed[:, watermark:] = 255 - changed[:, watermark:]
+    outputs = []
+    for pixels in (source, changed):
+        stream = create_session(codecs, capacity_frames=17)
+        values = []
+        for i in range(17):
+            stream.append(pixels[:, i : i + 1], frame_start=i)
+            while stream.ready:
+                values.append(stream.pop().values)
+        stream.finish()
+        outputs.append(torch.cat(values, 2))
+        stream.dispose()
+    torch.testing.assert_close(
+        outputs[0][:, :, :tokens], outputs[1][:, :, :tokens], atol=0, rtol=0
+    )

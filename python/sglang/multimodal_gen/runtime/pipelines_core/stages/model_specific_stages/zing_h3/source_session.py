@@ -5,7 +5,7 @@ import time
 import json
 import os
 from collections import deque
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import torch
 import psutil
@@ -18,12 +18,14 @@ from sglang.multimodal_gen.runtime.realtime.zing_contracts import PixelRange
 from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
     SourceLedger,
     SourceLimits,
+    default_source_encoder,
 )
 
 from .incremental import SourceReadySession
 from .source_bridge import SourceChunkBridge
 from .source_decoder import SourceTAEH3Decoder
-from .streaming_codecs import SourcePixelBuffer, StableVideoDecoder
+from .source_encoder import create_source_buffer
+from .streaming_codecs import StableVideoDecoder
 from .streaming_noise import STREAMING_NOISE_VERSION
 
 logger = init_logger(__name__)
@@ -68,7 +70,14 @@ class ZingSourceStreamState(BaseRealtimeState):
         max_chunk = max(stage.packer.chunk_plan.lengths)
         # One input dispatch is at most two codec clips. All capacities remain
         # independent of total duration, including single-frame network appends.
-        self.pixels = SourcePixelBuffer(stage.codecs, capacity_frames=3 * clip)
+        encoder = batch.extra["zing_source_command"].get(
+            "encoder", default_source_encoder()
+        )
+        self.policy["source_encoder"] = encoder
+        with self._encoder_use(stage):
+            self.pixels = create_source_buffer(
+                stage.codecs, encoder, capacity_frames=3 * clip
+            )
         self.bridge = SourceChunkBridge(
             stage.packer.chunk_plan,
             clip_frames=clip,
@@ -103,7 +112,9 @@ class ZingSourceStreamState(BaseRealtimeState):
             raise ValueError("Continuous source commands must be consecutive")
         self.session_id = batch.realtime_session_id
         command = batch.extra["zing_source_command"]
+        measure_cuda = command.get("measure_cuda", False)
         timings, outputs, metadata = {}, [], []
+        self.progress = []  # Per-dispatch, bounded by input/bridge capacities.
 
         @contextmanager
         def timed(name):
@@ -116,6 +127,8 @@ class ZingSourceStreamState(BaseRealtimeState):
                 )
 
         try:
+            if type(measure_cuda) is not bool:
+                raise ValueError("Source CUDA measurement flag must be boolean")
             if self.ledger is None:
                 config = dict(command["config"])
                 config["limits"] = SourceLimits(**config["limits"])
@@ -152,33 +165,69 @@ class ZingSourceStreamState(BaseRealtimeState):
                     )
                     pixels = pixels.reshape(
                         payload["num_frames"], self.ledger.height, self.ledger.width, 3
-                    )
+                    ).permute(3, 0, 1, 2)
+                # The shared factory may advance its cache in append/finish,
+                # not only pop. Keep the declared component active throughout.
+                with timed("encoder_host_ms"), self._encoder_use(stage):
                     self.pixels.append(
-                        pixels.permute(3, 0, 1, 2),
+                        pixels,
                         frame_start=payload["source_frame_start"],
                     )
             final = command.get("end")
             if final is not None:
                 self.ledger.finish(final["frame_end"], event_id=final["event_id"])
-                self.pixels.finish()
+                with timed("encoder_host_ms"), self._encoder_use(stage):
+                    self.pixels.finish()
             while self.pixels.ready:
                 with timed("encoder_host_ms"), stage._use("video_vae"):
                     encoded = self.pixels.pop()
+                    if (
+                        encoded is None
+                        or encoded.values.ndim != 5
+                        or encoded.start != self.bridge.accepted_latents
+                        or encoded.end != encoded.start + encoded.values.shape[2]
+                        or encoded.source_dependency_end > self.ledger.accepted_frames
+                    ):
+                        raise ValueError(
+                            "Source encoder returned an invalid stable slice"
+                        )
                     source = stage.codecs.sample_streaming_visual_moments(
                         encoded.values,
                         latent_start=encoded.start,
                         noise_version=STREAMING_NOISE_VERSION,
                     )
+                    if measure_cuda and torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                self._record_progress(
+                    "latent_ready" if measure_cuda else "latent_submitted",
+                    latent_start=encoded.start,
+                    latent_end=encoded.end,
+                    source_dependency_end=encoded.source_dependency_end,
+                )
                 with timed("bridge_host_ms"):
+                    clip_index, last_offset = divmod(
+                        encoded.end - 1, self.bridge.clip_latents
+                    )
+                    pixel_end = (
+                        clip_index * self.bridge.clip_frames
+                        + 1
+                        + last_offset * self.bridge.ratio
+                    )
+                    if final is not None:
+                        pixel_end = min(pixel_end, self.ledger.accepted_frames)
                     self.bridge.append(
                         source,
                         latent_start=encoded.start,
-                        pixel_end=encoded.source_dependency_end,
+                        pixel_end=pixel_end,
                         source_dependency_end=encoded.source_dependency_end,
                     )
                 self._generate_ready(stage, batch, outputs, metadata, timed)
+                # Release only source alignment already transferred downstream.
+                # Encoder lookahead/cache ownership never grants extra credit.
                 self.ledger.consume(self.bridge.accepted_pixels)
             if final is not None:
+                if self.bridge.accepted_pixels != self.ledger.accepted_frames:
+                    raise ValueError("Source encoder did not drain its input")
                 self.bridge.finish()
                 self._generate_ready(stage, batch, outputs, metadata, timed)
                 if not self.sampler.ended:
@@ -195,6 +244,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                 "zing_source_consumed_end": self.bridge.accepted_pixels,
                 "zing_source_complete": final is not None,
                 "zing_source_stage_host_ms": timings,
+                "zing_source_progress": self.progress,
                 "zing_source_memory": {
                     **self.sampler.memory_snapshot(),
                     "codec_pixel_frames": self.pixels.buffered_frames,
@@ -206,6 +256,8 @@ class ZingSourceStreamState(BaseRealtimeState):
                 },
             }
             memory = usage["zing_source_memory"]
+            if self.policy["source_encoder"]["mode"] == "progressive":
+                memory["encoder_state"] = vars(self.pixels.state_usage())
             memory["host_rss_bytes"] = psutil.Process().memory_info().rss
             if torch.cuda.is_available():
                 memory.update(
@@ -220,14 +272,22 @@ class ZingSourceStreamState(BaseRealtimeState):
                         "session_id": batch.realtime_session_id,
                         "request_id": batch.request_id,
                         "dispatch_index": batch.block_idx,
-                        "rank": torch.distributed.get_rank()
-                        if torch.distributed.is_initialized()
-                        else 0,
+                        "rank": (
+                            torch.distributed.get_rank()
+                            if torch.distributed.is_initialized()
+                            else 0
+                        ),
                         "pid": os.getpid(),
                         "source_frames": self.ledger.accepted_frames,
                         "output_frames": self.ledger.output_frames,
                         "ended": final is not None,
                         "stage_host_ms": timings,
+                        "progress": self.progress,
+                        "first_source_received_unix_ns": command.get(
+                            "first_source_received_unix_ns"
+                        ),
+                        "dispatch_unix_ns": command.get("dispatch_unix_ns"),
+                        "measure_cuda": measure_cuda,
                         "policy": self.policy,
                         "memory": memory,
                     }
@@ -249,6 +309,29 @@ class ZingSourceStreamState(BaseRealtimeState):
             self.dispose()
             raise
 
+    def _encoder_use(self, stage):
+        # The legacy buffer only copies raw CPU pixels on append/finish; do not
+        # introduce an extra weight activation into the frozen A/B baseline.
+        return (
+            stage._use("video_vae")
+            if self.policy["source_encoder"]["mode"] == "progressive"
+            else nullcontext()
+        )
+
+    def _record_progress(self, kind, **fields):
+        # Host submission timestamps intentionally do not claim CUDA completion.
+        # GPU-ready latency must come from separately synchronized benchmark
+        # measurements or CUDA events, with the measurement mode frozen first.
+        self.progress.append(
+            dict(
+                kind=kind,
+                host_unix_ns=time.time_ns(),
+                source_frames=self.ledger.accepted_frames,
+                consumed_frames=self.ledger.consumed_frames,
+                **fields,
+            )
+        )
+
     def _generate_ready(self, stage, batch, outputs, metadata, timed):
         while self.bridge.ready:
             with timed("bridge_host_ms"):
@@ -264,6 +347,13 @@ class ZingSourceStreamState(BaseRealtimeState):
                 stage._use("transformer", "denoise") as transformer,
             ):
                 self.sampler.sampler.generator = transformer
+                self._record_progress(
+                    "dit_started",
+                    chunk_id=chunk.chunk.chunk_id,
+                    latent_start=chunk.chunk.start,
+                    latent_end=chunk.chunk.end,
+                    source_dependency_end=chunk.provenance.source_dependency_end,
+                )
                 result = self.sampler.step()
             self.blocks.append(
                 {
@@ -325,10 +415,24 @@ class ZingSourceStreamState(BaseRealtimeState):
                 decoder_latents=self.decoder.buffered_latents if self.decoder else 0,
                 metadata_batches=len(self.ledger.records) if self.ledger else 0,
             )
+            if (
+                self.pixels is not None
+                and self.policy["source_encoder"]["mode"] == "progressive"
+            ):
+                memory["encoder_state"] = vars(self.pixels.state_usage())
             logger.info(
                 "zing_source_disposed %s",
                 json.dumps(
-                    dict(session_id=getattr(self, "session_id", None), memory=memory)
+                    dict(
+                        session_id=getattr(self, "session_id", None),
+                        rank=(
+                            torch.distributed.get_rank()
+                            if torch.distributed.is_initialized()
+                            else 0
+                        ),
+                        pid=os.getpid(),
+                        memory=memory,
+                    )
                 ),
                 main_process_only=False,
                 local_main_process_only=False,

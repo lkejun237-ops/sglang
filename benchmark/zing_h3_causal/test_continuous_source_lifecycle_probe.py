@@ -78,3 +78,52 @@ def test_keepalive_sends_protocol_heartbeats_and_stops_with_session():
                 assert received == [dict(type="event", kind="heartbeat")]
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("completed", [False, True])
+def test_inflight_witness_requires_matching_unfinished_scheduler_request(
+    tmp_path, completed
+):
+    import json
+    from continuous_source_lifecycle_probe import wait_for_scheduler_inflight
+
+    log = tmp_path / "server.log"
+    events = [
+        dict(
+            event="server.scheduler_forward_start",
+            session_id="other",
+            request_id="other",
+        ),
+        dict(
+            event="server.scheduler_forward_start",
+            session_id="target",
+            request_id="finished",
+        ),
+        dict(
+            event="server.scheduler_forward_done",
+            session_id="target",
+            request_id="finished",
+        ),
+        dict(
+            event="server.scheduler_forward_start",
+            session_id="target",
+            request_id="current",
+        ),
+    ]
+    if completed:
+        events.append(
+            dict(
+                event="server.scheduler_forward_done",
+                session_id="target",
+                request_id="current",
+            )
+        )
+    log.write_text(
+        "".join("realtime_trace " + json.dumps(event) + "\n" for event in events)
+    )
+    if completed:
+        with pytest.raises(TimeoutError, match="No in-flight"):
+            asyncio.run(wait_for_scheduler_inflight(log, "target", timeout=0.02))
+    else:
+        witness = asyncio.run(wait_for_scheduler_inflight(log, "target", timeout=0.1))
+        assert witness["request_id"] == "current"

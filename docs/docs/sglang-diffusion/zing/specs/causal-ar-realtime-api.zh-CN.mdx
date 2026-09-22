@@ -46,7 +46,7 @@ description: "Zing 1.0 H3 因果自回归模型的持续 source 输入、帧级�
 | `realtime_output_format` | 默认 `raw`，也可选 `webp`、`jpeg`；详见第 4 节 |
 | `references` | 新增，可选静态图片列表，每项包含唯一 `id`、`format="jpeg"`、`"webp"` 或 `"png"` 及 bytes `payload`，最多九张并保留输入顺序；首版不支持运行中更新 |
 
-Reference 是外观、身份等静态参考，不要求逐帧对齐；source 是游戏引擎持续产生、与输出时间轴对齐的待渲染帧。两者不能混用。Reference 数量和总字节额度由部署校验并在 ready 中回显，不承诺无限数量。本文不用旧 `zing_request` 的 `target.output.frames` 或完整视频 URI；本模式禁止同时传 `zing_request`、`first_frame`、`video_path`、`video_url`，避免两套初始化语义冲突。
+Reference 是外观、身份等静态参考，不要求逐帧对齐；source 是游戏引擎持续产生、与输出时间轴对齐的待渲染帧。两者不能混用。当前适配器最多接受9张 reference，并保留输入顺序；总字节额度由部署校验并在 ready 中回显，仍须满足媒体解码和请求资源约束。本文不用旧 `zing_request` 的 `target.output.frames` 或完整视频 URI；本模式禁止同时传 `zing_request`、`first_frame`、`video_path`、`video_url`，避免两套初始化语义冲突。
 
 [PR #126](https://github.com/seedleap/sglang/pull/126) 的 H3 风格 `task / conditions / target / source` 是已合入 main 的有限媒体 SamplingParams 入口，不是本协议，也不表示 WebSocket 已接通这些字段。目标 source-stream 初始化同样禁止混传这四个字段：静态图片只通过 `references`，持续 source 只通过 `source_stream` 与后续 `source.append` 提交，不做 URI、duration 或 reference 的隐式转换。有限入口仍可保留自身的兼容行为。
 
@@ -423,7 +423,7 @@ if __name__ == "__main__":
 | `realtime_preview_max_width` | 公共输出配置 | 同左 | 同左 | 首版不传，保持声明尺寸 |
 | pacing / playback ACK / trace | 公共传输能力 | 同左 | 公共传输能力 | 不替代 source 背压；trace 可复用 |
 | KV / sink 配置 | adapter / pipeline 模型相关 | adapter / pipeline 模型相关 | 仅完整历史，拒绝有界 KV 设置 | 服务端有界策略，需验证，不向客户端承诺任意值 |
-| `zing_realtime_decode_mode` | 非该模型字段 | 非该模型字段 | immediate / stable，默认 immediate | 默认且要求 stable |
+| `zing_realtime_decode_mode` | 非该模型字段 | 非该模型字段 | immediate / stable，默认 stable（TAEH3 要求 stable） | 默认且要求 stable |
 | 结束 | chunk 限长或取消 | chunk 限长或取消 | 有限长度结束 | source.end → flush → completed |
 
 ## 7. 实现状态与验收边界

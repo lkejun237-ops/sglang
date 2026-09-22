@@ -79,9 +79,11 @@ whitebox review webpage will be published.
 ## Final frozen runtime evidence
 
 Tested source: `74d19dde391717b5f57c8690a6027768e2cd3f6d`, including main
-`9a0a1b3641` and the applicable merged PR #149 / PR #151 fixes. Subsequent
-commits only record acceptance documentation; GPU runs are attributed to this
-exact frozen source, not relabeled as execution of a later documentation SHA.
+`9a0a1b3641` and the applicable merged PR #149 / PR #151 fixes. The initial follow-up commit only recorded acceptance documentation. Review
+subsequently changed the decoder defaults to TAEH3/stable (see the review
+addendum below). GPU runs are attributed to this exact frozen source, not
+relabeled as execution of the later defaults change. Those runs explicitly
+selected TAEH3/stable, so their effective decoder configuration is unchanged.
 
 Image: `zing-thailand-registry-vpc.ap-southeast-7.cr.aliyuncs.com/zing/sglang@sha256:4b9bca7dd61784cd84e43ac760db4c458c08a2d6bf22887e3740455fffe9e015`.
 Measured hardware: NVIDIA L20D, CC 10.3, 274113 MiB per GPU; Torch 2.13.0+cu130,
@@ -173,3 +175,30 @@ not counted as final-source GPU acceptance. The new final CPU adds the lease
 regression, reaching 1075. Complete subjective quality, native parity and
 24 FPS remain not executed/not passed in this functional run, tracked by
 issue #153 / issue #131. PR #148's progressive encoder/A-B is not duplicated.
+
+
+## Review addendum: decoder defaults
+
+Review requested TAEH3 as the default. Runtime commit
+`addbb2bbc6d3e00927dcd4941664e21e1a48ac61` sets the Zing pipeline default to
+TAEH3 and the sampling decode mode to stable. Deployments must still provide
+`taeh3_checkpoint_path`; missing paths fail validation rather than silently
+falling back. Explicit `video_decoder_backend="native"` remains supported.
+No checkpoint path tied to a particular cluster is built into the default.
+
+CPU job `dlc1o9m7t691toyn` Succeeded, exit 0: **1169 passed in 59.15 seconds**,
+including the original 1075-test set and the 94 registration/configuration cases.
+It verifies default backend/mode, missing weights, invalid precision, native
+opt-in and existing shared/source runtime contracts. Review overlay SHA256:
+`206a14263d84485db805ee68c61ede8235c1027ce5fda3baece3de17554b00c2`.
+Logs and exit receipt are under the same private OSS run prefix, `cpu-r5/`.
+The prior `cpu-r4` attempt (`dlcmj5frek5roslx`) had 1168 passes and one new test
+fixture failure (missing `attention_backend`); it is not counted as a pass.
+
+The earlier SP1/SP2 runs explicitly selected TAEH3/stable, so these default
+changes do not alter their effective decoder path; no additional GPU run was
+submitted. They are still attributed to `74d19dde...`, not the new commit.
+Immediate-mode GPU comparison and original MiniMax H3 GPU regression were not
+performed. Native immediate mode remains a finite-input compatibility option;
+TAEH3 has no separate immediate decoding path. Performance and subjective
+quality retain their separate follow-ups.

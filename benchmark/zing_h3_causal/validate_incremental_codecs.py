@@ -160,6 +160,29 @@ def codec_soak(c, frames, output):
     return result
 
 
+def load_codecs(root):
+    """Load the unchanged real-weight codec baseline for codec acceptance tools."""
+    config = MiniMaxH3VideoVAEConfig()
+    config.update_model_arch(json.loads((root / "video_vae/config.json").read_text()))
+    # H3 constructs non-persistent rotary buffers; a meta construction would
+    # leave those buffers unmaterialized after state-dict assignment.
+    model = MiniMaxH3VideoVAE(config)
+    weights = root / "video_vae/source/model.safetensors"
+    state = load_file(str(weights))
+    _consume_vae_checkpoint_arch_metadata(state, config, model.state_dict())
+    load_model_state_dict(model, state, assign=True, strict=True)
+    del state
+    model = model.cuda().eval()
+    c = object.__new__(ZingH3Codecs)
+    c.modules = {"video_vae": model}
+    c.va = config.arch_config
+    c.temporal_ratio = c.va.temporal_compression_ratio
+    c.vae_frames_per_chunk = c.va.vae_clip_length
+    c.vae_latents_per_chunk = math.ceil(c.vae_frames_per_chunk / c.temporal_ratio)
+    c.runtime = json.loads((root / "zing_config.json").read_text())
+    return c, weights
+
+
 @torch.inference_mode()
 def run(args):
     root, output = Path(args.model), Path(args.output)
@@ -190,24 +213,8 @@ def run(args):
             warmup_mode="off",
         )
     )
-    config = MiniMaxH3VideoVAEConfig()
-    config.update_model_arch(json.loads((root / "video_vae/config.json").read_text()))
-    # H3 constructs non-persistent rotary buffers; a meta construction would
-    # leave those buffers unmaterialized after state-dict assignment.
-    model = MiniMaxH3VideoVAE(config)
-    weights = root / "video_vae/source/model.safetensors"
-    state = load_file(str(weights))
-    _consume_vae_checkpoint_arch_metadata(state, config, model.state_dict())
-    load_model_state_dict(model, state, assign=True, strict=True)
-    del state
-    model = model.cuda().eval()
-    c = object.__new__(ZingH3Codecs)
-    c.modules = {"video_vae": model}
-    c.va = config.arch_config
-    c.temporal_ratio = c.va.temporal_compression_ratio
-    c.vae_frames_per_chunk = c.va.vae_clip_length
-    c.vae_latents_per_chunk = math.ceil(c.vae_frames_per_chunk / c.temporal_ratio)
-    c.runtime = json.loads((root / "zing_config.json").read_text())
+    c, weights = load_codecs(root)
+    model = c.modules["video_vae"]
     props = torch.cuda.get_device_properties(local_rank)
     report = dict(
         torch=torch.__version__,

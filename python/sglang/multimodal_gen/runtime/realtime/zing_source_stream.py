@@ -18,6 +18,18 @@ from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
 )
 
 
+def default_source_encoder():
+    """Return a fresh trusted profile for the built-in progressive encoder."""
+    return {
+        "mode": "progressive",
+        "contract_version": "h3-clip17-progressive-v1",
+        "factory": (
+            "sglang.multimodal_gen.runtime.pipelines_core.stages."
+            "model_specific_stages.zing_h3.progressive_encoder:create_session"
+        ),
+    }
+
+
 @dataclass(frozen=True)
 class SourceLimits:
     batch_frames: int

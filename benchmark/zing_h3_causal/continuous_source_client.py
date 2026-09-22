@@ -91,6 +91,12 @@ async def run(args):
                 )
                 refs.append(reference_payload(name, media_id))
             init["references"] = refs
+        if args.prompt_video_frame:
+            init["prompt_video_frame"] = dict(
+                id=args.prompt_video_id,
+                format="png",
+                payload=Path(args.prompt_video_frame).read_bytes(),
+            )
         await send(init)
         ready = msgpack.unpackb(
             await asyncio.wait_for(ws.recv(), args.timeout), raw=False
@@ -399,6 +405,10 @@ def main():
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--reference", action="append", default=[])
     parser.add_argument("--reference-id", action="append", default=[])
+    parser.add_argument(
+        "--prompt-video-frame", help="PNG snapshot used only by the prompt encoder"
+    )
+    parser.add_argument("--prompt-video-id", default="<Video 1>")
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--seed", type=int, default=42)

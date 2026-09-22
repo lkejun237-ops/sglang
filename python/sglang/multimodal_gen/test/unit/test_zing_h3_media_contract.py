@@ -510,3 +510,155 @@ def test_stream_prompt_preserves_reference_order_without_extra_video(
     assert encoded[0].eq(count - 1).all()
     assert result.source_visual is None
     assert result.condition_media == seen
+
+
+def test_startup_prepares_encoder_precision_without_reference_encoding(codecs):
+    encoder = torch.nn.Conv3d(3, 4, 1)
+    quant = torch.nn.Conv3d(4, 4, 1)
+    decoder = torch.nn.Conv3d(4, 3, 1)
+    codecs.modules = {
+        "video_vae": SimpleNamespace(encoder=encoder, quant_conv=quant, decoder=decoder)
+    }
+    codecs.runtime = {"vae_config": {"encode_dtype": "bfloat16"}}
+    codecs.prepare_visual_encoder_weights()
+    assert encoder.weight.dtype == quant.weight.dtype == torch.bfloat16
+    assert decoder.weight.dtype == torch.float32
+
+
+@pytest.mark.parametrize("temporal_patch", [1, 2, 4])
+@pytest.mark.parametrize(
+    "kinds", [("video",), ("image",), ("video", "image"), ("image", "video", "image")]
+)
+def test_explicit_single_frame_video_contract(codecs, temporal_patch, kinds):
+    """Frame count/list position must not determine modality (issue #167)."""
+    import numpy as np
+
+    seen = {"text": [], "video_calls": 0, "image_calls": 0}
+
+    class Tokenizer:
+        def __call__(self, text, *, add_special_tokens):
+            assert add_special_tokens is False
+            seen["text"].append(text)
+            return {"input_ids": [100 + len(seen["text"])]}
+
+        def convert_tokens_to_ids(self, token):
+            return {
+                "<|vision_start|>": 10,
+                "<|vision_end|>": 11,
+                "<|image_pad|>": 12,
+                "<|video_pad|>": 13,
+            }[token]
+
+    class VideoProcessor:
+        temporal_patch_size = temporal_patch
+
+        def __call__(self, *, videos, do_sample_frames, return_tensors):
+            seen["video_calls"] += 1
+            assert do_sample_frames is False
+            assert return_tensors == "pt"
+            for video in videos:
+                assert video.shape == (temporal_patch, 8, 8, 3)
+                for frame in video:
+                    np.testing.assert_array_equal(frame, pixels[:, 0].permute(1, 2, 0))
+            return {
+                "pixel_values_videos": torch.ones(len(videos), 3),
+                "video_grid_thw": torch.tensor([[1, 4, 4]] * len(videos)),
+            }
+
+    class ImageProcessor:
+        merge_size = 2
+
+        def __call__(self, *, images, return_tensors):
+            seen["image_calls"] += 1
+            assert len(images) == kinds.count("image")
+            assert all(image.shape == (8, 8, 3) for image in images)
+            return {
+                "pixel_values": torch.ones(len(images), 3),
+                "image_grid_thw": torch.tensor([[1, 4, 4]] * len(images)),
+            }
+
+    def encode(ids, **features):
+        seen["ids"], seen["features"] = ids, features
+        return torch.zeros(len(ids), 4, dtype=torch.bfloat16)
+
+    codecs.modules = {
+        "tokenizer": Tokenizer(),
+        "processor": SimpleNamespace(
+            video_processor=VideoProcessor(), image_processor=ImageProcessor()
+        ),
+        "text_encoder": SimpleNamespace(encode_ids=encode),
+    }
+    codecs.runtime = {"condition_encoder_config": {"video_sample_fps": 2.0}}
+    pixels = torch.arange(3 * 8 * 8, dtype=torch.uint8).reshape(3, 1, 8, 8)
+    media = [{"type": kind, "fps": 24.0, "frames": pixels.clone()} for kind in kinds]
+    result = codecs.encode_condition("Use Video 1 and Picture 1.", media)
+    expected_text, counts = [], {"video": 0, "image": 0}
+    for kind in kinds:
+        counts[kind] += 1
+        expected_text.append(
+            f"<{'Video' if kind == 'video' else 'Picture'} {counts[kind]}>: "
+        )
+        if kind == "video":
+            expected_text.append("<0.0 seconds>")
+    assert seen["text"] == [*expected_text, "Use Video 1 and Picture 1."]
+    assert seen["video_calls"] == int("video" in kinds)
+    assert seen["image_calls"] == int("image" in kinds)
+    assert (seen["ids"] == 13).sum() == 4 * kinds.count("video")
+    assert (seen["ids"] == 12).sum() == 4 * kinds.count("image")
+    assert (result["row_role"] == 1).sum() == 6 * len(kinds)
+    assert result["context"].dtype == torch.bfloat16
+    assert ("pixel_values_videos" in seen["features"]) == ("video" in kinds)
+    assert ("pixel_values" in seen["features"]) == ("image" in kinds)
+    # Qwen temporal padding is local and cannot modify incoming/source pixels.
+    assert all(torch.equal(item["frames"], pixels) for item in media)
+
+
+@pytest.mark.parametrize("preview_uri", ["source", "independent-target"])
+def test_explicit_preview_does_not_enter_source_or_reference_vae(
+    codecs, monkeypatch, preview_uri
+):
+    request = make_request("video", references=1)
+    request["messages"][0]["content"].insert(
+        0,
+        {
+            "id": "preview",
+            "type": "video",
+            "uri": preview_uri,
+            "clip": {"start": 0, "end": 0},
+        },
+    )
+    seen, vae = {}, []
+
+    def decode(item, **kwargs):
+        count = 1 if item.get("clip") or item["type"] == "image" else 125
+        value = 7 if item.get("clip") else 23
+        return {
+            **item,
+            "fps": 24.0,
+            "frames": torch.full((3, count, 32, 32), value, dtype=torch.uint8),
+        }
+
+    def condition(prompt, media):
+        seen["media"] = media
+        return {}
+
+    def visual(frames):
+        vae.append(frames.clone())
+        return torch.zeros(1, 2, 1, 2, 2)
+
+    monkeypatch.setattr(codecs, "_decode_media", decode)
+    monkeypatch.setattr(codecs, "encode_condition", condition)
+    monkeypatch.setattr(codecs, "encode_visual", visual)
+
+    @contextmanager
+    def use(name):
+        yield
+
+    result = codecs.prepare(request, use, retain_condition_media=True)
+    assert [item["id"] for item in seen["media"]] == ["preview", "ref-0"]
+    assert seen["media"][0]["type"] == "video"
+    assert seen["media"][0]["frames"].shape[1] == 1
+    assert len(vae) == 2 and [frames.shape[1] for frames in vae] == [1, 125]
+    assert all(torch.all(frames == 23) for frames in vae)
+    assert list(result.visual) == ["ref-0"]
+    assert [item["content_id"] for item in result.conditions] == ["ref-0"]

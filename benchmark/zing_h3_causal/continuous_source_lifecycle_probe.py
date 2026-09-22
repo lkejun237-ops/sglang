@@ -77,6 +77,34 @@ async def negotiate(ws, init, send, recv):
         return dict(type="error", content="USER_SESSION_LIMIT", close_code=1008)
 
 
+async def wait_for_scheduler_inflight(path, session_id, timeout=30):
+    """Observe a real pending scheduler RPC; this is not a CUDA-start event."""
+    deadline = time.monotonic() + timeout
+    pending = {}
+    with pathlib.Path(path).open() as stream:
+        while time.monotonic() < deadline:
+            while True:
+                offset = stream.tell()
+                line = stream.readline()
+                if not line or not line.endswith("\n"):
+                    stream.seek(offset)
+                    break
+                if "realtime_trace " not in line:
+                    continue
+                event = json.loads(line.split("realtime_trace ", 1)[1])
+                if event.get("session_id") != session_id:
+                    continue
+                request_id = event.get("request_id")
+                if event.get("event") == "server.scheduler_forward_start":
+                    pending[request_id] = event
+                elif event.get("event") == "server.scheduler_forward_done":
+                    pending.pop(request_id, None)
+            if pending:
+                return next(iter(pending.values()))
+            await asyncio.sleep(0.01)
+    raise TimeoutError("No in-flight scheduler request was observed for this session")
+
+
 async def main(args):
     pixels = pathlib.Path(args.rgb).read_bytes()
     stride = 832 * 480 * 3
@@ -132,9 +160,7 @@ async def main(args):
                 from urllib.parse import urlparse, unquote
 
                 init["references"] = [
-                    reference_payload(
-                        unquote(urlparse(item["uri"]).path), item["id"]
-                    )
+                    reference_payload(unquote(urlparse(item["uri"]).path), item["id"])
                     for item in case_content
                     if item["type"] == "image"
                 ]
@@ -186,6 +212,7 @@ async def main(args):
             assert item["type"] != "error", item
 
     async def run_case(name):
+        inflight_witness = None
         started = time.monotonic()
         ws, session = await connect(
             reference=name == "reference",
@@ -269,7 +296,13 @@ async def main(args):
                 )
                 if name == "cancel_end_race":
                     await finish(ws, 17, 2)
-                await asyncio.sleep(0.05)
+                if args.server_log:
+                    inflight_witness = await wait_for_scheduler_inflight(
+                        args.server_log, session
+                    )
+                else:
+                    # Compatibility only: this delay is not an in-flight witness.
+                    await asyncio.sleep(0.05)
                 # Closing the transport cancels this generation; no resume token exists.
             else:
                 if name == "concurrent_rejection":
@@ -349,6 +382,7 @@ async def main(args):
             dict(
                 case=name,
                 passed=True,
+                scheduler_inflight_witness=inflight_witness,
                 session_id=session,
                 elapsed_seconds=time.monotonic() - started,
                 messages=messages,
@@ -368,6 +402,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--rgb", required=True)
     parser.add_argument("--reference")
+    parser.add_argument(
+        "--server-log", help="Local server log required to prove in-flight cancellation"
+    )
     parser.add_argument("--case-request")
     parser.add_argument("--cases", nargs="+", choices=CASES, default=CASES)
     parser.add_argument("--output", required=True)

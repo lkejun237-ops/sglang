@@ -24,10 +24,10 @@ class SourceChunk:
 class SourceChunkBridge:
     """No model kernels or whole-video layouts; pop transfers one owned chunk.
 
-    ``append`` receives posterior samples, never moments. Pixel end positions
-    follow the codec's clip/ratio geometry and actual EOS count. Source IDs come
-    from the service ledger. A codec clip's dependency applies to every latent
-    in that clip, including first-latent chunks with only one aligned pixel.
+    ``append`` receives stable posterior samples, never moments, including
+    multiple contiguous slices within a codec clip. Pixel alignment follows
+    checkpoint clip geometry; dependency is the actual encoder watermark and
+    may include lookahead. Source IDs come from the service ledger.
     """
 
     def __init__(
@@ -69,6 +69,7 @@ class SourceChunkBridge:
             self.emitted_pixels
         ) = 0
         self.ended = self.closed = False
+        self.short_tail = False
 
     @property
     def buffered_latents(self):
@@ -88,22 +89,36 @@ class SourceChunkBridge:
         if source.ndim != 5 or not source.is_floating_point() or min(source.shape) < 1:
             raise ValueError("Source bridge requires sampled video latents")
         count = source.shape[2]
-        pixels = pixel_end - self.accepted_pixels
+        # Compute alignment from absolute latent positions, not the size of the
+        # latest network packet or the encoder's dependency/lookahead watermark.
+        clip_index, offset = divmod(self.accepted_latents, self.clip_latents)
+        clip_start = clip_index * self.clip_frames
+        nominal_ends = [
+            min(clip_start + self.clip_frames, clip_start + 1 + i * self.ratio)
+            for i in range(offset, offset + count)
+        ]
+        previous_end = (
+            clip_start
+            if offset + count == 1
+            else clip_start + 1 + (offset + count - 2) * self.ratio
+        )
         if (
             type(latent_start) is not int
             or latent_start != self.accepted_latents
             or type(pixel_end) is not int
-            or not 1 <= pixels <= self.clip_frames
-            or count != 1 + (pixels - 1 + self.ratio - 1) // self.ratio
+            or offset + count > self.clip_latents
+            or not max(self.accepted_pixels, previous_end)
+            < pixel_end
+            <= nominal_ends[-1]
             or type(source_dependency_end) is not int
             or source_dependency_end < pixel_end
         ):
             raise ValueError(
-                "Source codec clip has inconsistent geometry or dependency"
+                "Source codec slice has inconsistent geometry or dependency"
             )
         # Only a final codec clip may be short; accepting another would change
         # the absolute latent-to-pixel mapping and silently corrupt alignment.
-        if self.accepted_pixels % self.clip_frames:
+        if self.short_tail:
             raise ValueError("A partial source clip must be the final clip")
         signature = (*source.shape[:2], *source.shape[3:], source.device, source.dtype)
         if self.accepted_latents and signature != self.signature:
@@ -119,14 +134,12 @@ class SourceChunkBridge:
             if self.values is None
             else torch.cat((self.values, source.detach()), 2)
         )
-        self.pixel_ends.extend(
-            min(pixel_end, self.accepted_pixels + 1 + i * self.ratio)
-            for i in range(count)
-        )
+        self.pixel_ends.extend(min(pixel_end, end) for end in nominal_ends)
         self.dependencies.extend([source_dependency_end] * count)
         self.values, self.signature = owned, signature
         self.accepted_latents += count
         self.accepted_pixels = pixel_end
+        self.short_tail = pixel_end < nominal_ends[-1]
 
     def finish(self):
         if self.closed or self.ended or not self.accepted_pixels:

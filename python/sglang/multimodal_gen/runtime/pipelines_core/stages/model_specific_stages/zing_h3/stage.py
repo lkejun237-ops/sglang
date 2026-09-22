@@ -29,6 +29,9 @@ class ZingH3GenerationStage(PipelineStage):
         super().__init__()
         self.modules, self.config, self.runtime = modules, config, runtime
         self.codecs = ZingH3Codecs(modules, config, runtime)
+        # Prepare shared encoder weights before any session owns causal caches.
+        # A source-only request may never call encode_visual for a reference.
+        self.codecs.prepare_visual_encoder_weights()
         rope = runtime["rope_config"]
         self.packer = ZingH3Packer(
             config.dit_config.arch_config,

@@ -73,6 +73,13 @@ class ZingH3Codecs(ZingH3MediaInput):
         self.audio_sample_rate = self.aa.sample_rate
         self.remote_read_fs = None
 
+    def prepare_visual_encoder_weights(self):
+        """Prepare encoder precision at startup, before cached sessions exist."""
+        model = self.modules["video_vae"]
+        dtype = getattr(torch, self.runtime["vae_config"]["encode_dtype"])
+        model.encoder.to(dtype=dtype)
+        model.quant_conv.to(dtype=dtype)
+
     @staticmethod
     def _stats(config, latent, audio=False):
         shape = (1, 1, 1, -1) if audio else (1, -1, 1, 1, 1)

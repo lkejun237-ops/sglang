@@ -102,3 +102,111 @@ def test_target_noise_independent_of_ar_chunking():
                 chunks.append(b.pop().noise)
         results.append(torch.cat(chunks, 2))
     torch.testing.assert_close(*results, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("frames", range(1, 35))
+@pytest.mark.parametrize(
+    "plan", [ChunkPlan(5), ChunkPlan([1, 2, 2]), ChunkPlan(5, True)]
+)
+def test_progressive_slices_match_clip_baseline(frames, plan):
+    results = []
+    for progressive in [False, True]:
+        b, chunks = bridge(plan), []
+        for pixel_start in range(0, frames, 17):
+            pixels = min(17, frames - pixel_start)
+            count = 1 + (pixels - 1 + 3) // 4
+            sizes = [1, 2, 2] if progressive else [count]
+            offset = 0
+            for size in sizes:
+                size = min(size, count - offset)
+                if not size:
+                    break
+                end = min(
+                    pixel_start + pixels, pixel_start + 1 + (offset + size - 1) * 4
+                )
+                latent_start = b.accepted_latents
+                b.append(
+                    torch.arange(latent_start, latent_start + size)
+                    .reshape(1, 1, size, 1, 1)
+                    .float(),
+                    latent_start=latent_start,
+                    pixel_end=end,
+                    # Keep the same audited lookahead in both paths for this
+                    # alignment test; this is not an encoder latency claim.
+                    source_dependency_end=pixel_start + pixels,
+                )
+                offset += size
+                if end == frames:
+                    b.finish()
+                while b.ready:
+                    chunks.append(b.pop())
+        results.append(chunks)
+    assert len(results[0]) == len(results[1])
+    for baseline, progressive in zip(*results):
+        assert baseline.chunk == progressive.chunk
+        assert baseline.provenance == progressive.provenance
+        assert baseline.final == progressive.final
+        torch.testing.assert_close(baseline.source, progressive.source, rtol=0, atol=0)
+        torch.testing.assert_close(baseline.noise, progressive.noise, rtol=0, atol=0)
+
+
+def test_first_latent_and_dit_watermarks_are_independent():
+    for plan, first_ready in [(ChunkPlan(5), False), (ChunkPlan([1, 2, 2]), True)]:
+        b = bridge(plan)
+        b.append(
+            torch.ones(1, 1, 1, 1, 1),
+            latent_start=0,
+            pixel_end=1,
+            source_dependency_end=3,
+        )
+        assert b.accepted_latents == 1
+        assert b.ready is first_ready
+        if first_ready:
+            chunk = b.pop()
+            assert chunk.provenance.pixels.end == 1
+            assert chunk.provenance.source_dependency_end == 3
+        b.append(
+            torch.ones(1, 1, 2, 1, 1),
+            latent_start=1,
+            pixel_end=9,
+            source_dependency_end=11,
+        )
+        b.append(
+            torch.ones(1, 1, 2, 1, 1),
+            latent_start=3,
+            pixel_end=17,
+            source_dependency_end=17,
+        )
+        assert b.ready
+
+
+@pytest.mark.parametrize(
+    "start,end,dependency,count",
+    [(1, 1, 1, 1), (0, 2, 2, 1), (0, 9, 8, 3), (0, 17, 17, 6)],
+)
+def test_invalid_progressive_ranges_do_not_mutate(start, end, dependency, count):
+    b = bridge(ChunkPlan([1, 2, 2]))
+    with pytest.raises(ValueError):
+        b.append(
+            torch.zeros(1, 1, count, 1, 1),
+            latent_start=start,
+            pixel_end=end,
+            source_dependency_end=dependency,
+        )
+    assert b.accepted_latents == b.accepted_pixels == b.buffered_bytes == 0
+
+
+def test_short_eos_cannot_be_extended():
+    b = bridge(ChunkPlan([1, 2, 2]))
+    b.append(
+        torch.zeros(1, 1, 2, 1, 1), latent_start=0, pixel_end=3, source_dependency_end=3
+    )
+    with pytest.raises(ValueError, match="final clip"):
+        b.append(
+            torch.zeros(1, 1, 1, 1, 1),
+            latent_start=2,
+            pixel_end=9,
+            source_dependency_end=9,
+        )
+    b.finish()
+    assert [b.pop().provenance.pixels.end, b.pop().provenance.pixels.end] == [1, 3]

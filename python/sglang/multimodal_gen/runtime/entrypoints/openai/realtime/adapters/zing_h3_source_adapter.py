@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import tempfile
+import time
 from collections import deque
 from copy import copy
 from dataclasses import asdict
@@ -23,6 +24,7 @@ from sglang.multimodal_gen.runtime.realtime.zing_contracts import PixelRange, re
 from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
     SourceLedger,
     SourceLimits,
+    default_source_encoder,
 )
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
@@ -160,6 +162,41 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             path = Path(session.input_temp_dir) / f"reference-{i}.{ref['format']}"
             path.write_bytes(ref["payload"])
             reference_paths.append(str(path))
+        self.reference_items = [
+            dict(type="image", id=ref["id"], uri=path)
+            for ref, path in zip(references, reference_paths)
+        ]
+        # Prompt-only source snapshot: never an aligned source or a sixth
+        # visual reference. Video semantics preserve the original prompt IDs.
+        self.prompt_video = None
+        frame = getattr(request, "prompt_video_frame", None)
+        if frame is not None:
+            require(
+                isinstance(frame, dict)
+                and isinstance(frame.get("id"), str)
+                and frame["id"]
+                and frame["id"] not in seen
+                and frame.get("format") == "png"
+                and isinstance(frame.get("payload"), bytes),
+                "Please provide a uniquely named PNG prompt video frame.",
+            )
+            require(
+                reference_bytes + len(frame["payload"]) <= 8 << 20,
+                "The reference images are too large.",
+            )
+            with Image.open(io.BytesIO(frame["payload"])) as image:
+                require(
+                    image.format == "PNG" and image.width * image.height <= 16_777_216,
+                    "The reference image format or dimensions are not supported.",
+                )
+                image.verify()
+            if session.input_temp_dir is None:
+                session.input_temp_dir = tempfile.mkdtemp(prefix="sglang_zing_source_")
+            path = Path(session.input_temp_dir) / "prompt-video-frame.png"
+            path.write_bytes(frame["payload"])
+            self.prompt_video = dict(
+                type="video", id=frame["id"], uri=str(path), clip=dict(start=0, end=0)
+            )
         clip = int(args.pipeline_config.vae_config.arch_config.vae_clip_length)
         require(
             clip * width * height * 3 + 4096 <= 32 << 20,
@@ -184,6 +221,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         self.pending_frames, self.end, self.end_dispatched = 0, None, False
         self.clip, self.reference_paths, self.profile = clip, reference_paths, profile
         self.reference_ids = [ref["id"] for ref in references]
+        self.source_encoder = profile.get("source_encoder", default_source_encoder())
+        self.first_source_received_unix_ns = None
         self.pending_prompt = None
         self.prompt_event = None
         request.fps, request.num_inference_steps, request.guidance_scale = (
@@ -206,6 +245,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             "max_pending_source_bytes": limits.pending_bytes,
             "max_references": 9,
             "max_reference_bytes": 8 << 20,
+            "prompt_video_frame_format": "png",
         }
 
     def session_ready_message(self, session):
@@ -218,9 +258,12 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         require(data.get("type") == "event", "Please send a valid streaming event.")
         event_id, payload = data.get("event_id"), data.get("payload")
         if kind == "source.append":
+            received_ns = time.time_ns()
             record = self.ledger.accept(
                 payload, event_id=event_id, message_bytes=message_bytes
             )
+            if self.first_source_received_unix_ns is None:
+                self.first_source_received_unix_ns = received_ns
             # Only expose work after accepted is on the same serialized writer.
             await ws.send_bytes(msgspec.msgpack.encode(record.message()))
             self.pending.append(
@@ -261,7 +304,11 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         return True
 
     async def wait_for_next_chunk(self, session):
-        while self.pending_frames < self.clip and self.end is None:
+        # Progressive readiness belongs to the codec, never a transport packet
+        # size. Keep the original collection policy only for the explicit A/B
+        # baseline selected in the deployment profile.
+        minimum = 1 if self.source_encoder["mode"] == "progressive" else self.clip
+        while self.pending_frames < minimum and self.end is None:
             self.available.clear()
             await self.available.wait()
 
@@ -289,6 +336,38 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             chunk_size=chunk_size,
         )
         params.image_path = self.reference_paths
+        # Only locally validated files enter the internal canonical request.
+        # The wire API still rejects arbitrary zing_request/source objects.
+        content = ([self.prompt_video] if self.prompt_video else []) + list(
+            self.reference_items
+        )
+        content.append(dict(type="text", text=chunk_inputs.prompt))
+        params.zing_request = dict(
+            messages=[
+                dict(role="user", content=content),
+                dict(
+                    role="target",
+                    content=[
+                        dict(
+                            type="video",
+                            output=dict(
+                                frames=self.clip,
+                                width=self.config["width"],
+                                height=self.config["height"],
+                            ),
+                        )
+                    ],
+                    conditions=[
+                        dict(
+                            content_id=item["id"],
+                            role="reference",
+                            latent_modalities=["visual"],
+                        )
+                        for item in self.reference_items
+                    ],
+                ),
+            ]
+        )
         params.zing_solver = self.profile["solver"]
         params.zing_denoising_step_list = self.profile["denoising_step_list"]
         params.zing_realtime_decode_mode = "stable"
@@ -313,7 +392,13 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         self.end_dispatched = end is not None
         batch.extra["zing_reference_ids"] = self.reference_ids
         batch.extra["zing_source_command"] = dict(
-            config=self.config, appends=appends, end=end
+            config=self.config,
+            appends=appends,
+            end=end,
+            encoder=self.source_encoder,
+            first_source_received_unix_ns=self.first_source_received_unix_ns,
+            dispatch_unix_ns=time.time_ns(),
+            measure_cuda=self.profile.get("measure_source_cuda", False),
         )
         return batch
 
@@ -359,4 +444,6 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             self.available.set()
             self.pending_prompt = None
             self.reference_paths.clear()
+            self.reference_items.clear()
             self.reference_ids.clear()
+            self.prompt_video = None
