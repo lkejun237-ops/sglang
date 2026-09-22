@@ -6,6 +6,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -1057,7 +1058,7 @@ async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
                 event_id=getattr(batch, "realtime_event_id", None),
             )
             denoise_started = time.perf_counter()
-            _, result = await process_generation_batch(async_scheduler_client, batch)
+            _, result = await _process_realtime_generation_batch(batch)
             _sync_batch_realtime_metadata(batch, result)
             denoise_completed = time.perf_counter()
             session.denoise_intervals[chunk.index] = (
@@ -1173,6 +1174,25 @@ async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
         session.vae_decoder_backend = None
 
 
+async def _process_realtime_generation_batch(batch):
+    """Keep the worker RPC owned until its in-flight execution has finished.
+
+    Cancelling a socket wait cannot cancel GPU kernels. Cleanup must wait for
+    this response before releasing worker state, input files and admission.
+    """
+    task = asyncio.create_task(process_generation_batch(async_scheduler_client, batch))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            _, result = await task
+        except Exception:
+            logger.exception("In-flight realtime generation failed during cancellation")
+        else:
+            _cancel_unconsumed_output_ref(result=result)
+        raise
+
+
 async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
     adapter = session.adapter
     if adapter is None:
@@ -1267,7 +1287,7 @@ async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
                 ),
             )
 
-            _, result = await process_generation_batch(async_scheduler_client, batch)
+            _, result = await _process_realtime_generation_batch(batch)
             current_result = result
             _sync_batch_realtime_metadata(batch, result)
             scheduler_forward_ms = timer.mark_ms()
@@ -1330,7 +1350,12 @@ async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
             err_msg = str(e).splitlines()[0]
             logger.error("error during generate loop: %s", err_msg)
             try:
-                await write_error_msg(f"error during generate loop: {err_msg}", ws)
+                public_error = (
+                    "Video generation failed. Please start a new session."
+                    if adapter.session_ready_message(session) is not None
+                    else f"error during generate loop: {err_msg}"
+                )
+                await write_error_msg(public_error, ws)
             except Exception as send_error:
                 logger.error(
                     "error during sending complete msg: %s",
@@ -1617,6 +1642,10 @@ async def _listen_events(ws: WebSocket, session: GenerateSession):
             data = msgspec.msgpack.decode(message)
             if not isinstance(data, dict):
                 raise ValueError("realtime event must be a map")
+            if session.adapter is not None and await session.adapter.ingest_wire_event(
+                ws, session, data, len(message)
+            ):
+                continue
             if data.get("type") in {"client_metric", "client_metric_batch"}:
                 session.mark_client_activity()
                 continue
@@ -1695,6 +1724,12 @@ async def _listen_events(ws: WebSocket, session: GenerateSession):
         except Exception as e:
             event_kind = data.get("kind") if isinstance(data, dict) else None
             logger.warning("invalid event, kind=%s, error=%s", event_kind, e)
+            if (
+                session.adapter is not None
+                and session.adapter.session_ready_message(session) is not None
+            ):
+                await write_error_msg("Please send a valid streaming event.", ws)
+                return  # Invalid source order cannot be repaired within a session.
             await write_error_msg("invalid event", ws)
             continue
 
@@ -1728,6 +1763,7 @@ async def _listen_generate_request(
                 max_chunks=realtime_req.max_chunks,
             )
             adapter = get_realtime_model_adapter(get_global_server_args())
+            adapter = adapter.for_request(realtime_req)
             session.set_adapter(adapter)
             log_realtime_trace(
                 logger,
@@ -1745,6 +1781,9 @@ async def _listen_generate_request(
 
             # Keep session state update atomic with validated request.
             session.set_request(realtime_req)
+            ready = adapter.session_ready_message(session)
+            if ready is not None:
+                await ws.send_bytes(msgspec.msgpack.encode(ready))
             log_realtime_trace(
                 logger,
                 session,
@@ -1816,11 +1855,20 @@ async def _cleanup_realtime_session(
         if task is None:
             continue
         await _await_realtime_task(task)
-    await _release_scheduler_realtime_session(session.id)
+    scheduler_released = await _release_scheduler_realtime_session(session.id)
     if session.input_temp_dir is not None:
         shutil.rmtree(session.input_temp_dir, ignore_errors=True)
-    log_realtime_trace(logger, session, "server.session_cleanup_done")
+    input_files_removed = (
+        session.input_temp_dir is None or not Path(session.input_temp_dir).exists()
+    )
     session.dispose()
+    log_realtime_trace(
+        logger,
+        session,
+        "server.session_cleanup_done",
+        scheduler_released=scheduler_released,
+        input_files_removed=input_files_removed,
+    )
 
 
 async def _close_realtime_websocket(
@@ -1841,11 +1889,35 @@ async def _cleanup_realtime_session_then_close(
     generate_task: asyncio.Task | None,
     listen_task: asyncio.Task | None,
     close_after_cleanup: tuple[int, str] | None,
+    *,
+    controller=None,
+    lease=None,
+    lease_ttl_s=60.0,
 ) -> None:
-    await _cleanup_realtime_session(session, generate_task, listen_task)
-    if close_after_cleanup is not None:
-        code, reason = close_after_cleanup
-        await _close_realtime_websocket(websocket, code=code, reason=reason)
+    # The active-session watchdog has stopped, but an in-flight GPU block can
+    # outlive the lease TTL. Reuse its renewal while existing cleanup drains;
+    # this does not extend the client's idle or playable lifetime.
+    renewal = None
+    if controller is not None and lease is not None:
+        renewal = asyncio.create_task(
+            _session_watchdog(
+                session,
+                controller,
+                lease,
+                idle_timeout_s=0,
+                max_lifetime_s=0,
+                lease_ttl_s=lease_ttl_s,
+            )
+        )
+    try:
+        await _cleanup_realtime_session(session, generate_task, listen_task)
+        if close_after_cleanup is not None:
+            code, reason = close_after_cleanup
+            await _close_realtime_websocket(websocket, code=code, reason=reason)
+    finally:
+        if renewal is not None:
+            renewal.cancel()
+            await _await_realtime_task(renewal)
 
 
 async def _wait_for_server_warmup(websocket: WebSocket) -> None:
@@ -2092,6 +2164,9 @@ async def generate(websocket: WebSocket):
                 generate_task,
                 listen_task,
                 close_after_cleanup,
+                controller=controller,
+                lease=lease,
+                lease_ttl_s=server_args.realtime_session_lease_ttl_s,
             )
         finally:
             if lease is not None and controller is not None:

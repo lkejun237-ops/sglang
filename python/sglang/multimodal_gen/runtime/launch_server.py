@@ -542,6 +542,11 @@ def launch_http_server_only(server_args):
         host=server_args.host,
         port=server_args.port,
         reload=False,
+        # Use the same maintained protocol for production and acceptance runs.
+        # A 17-frame 832x480 RGB source append exceeds the 16 MiB default.
+        ws="websockets-sansio",
+        ws_max_size=32 << 20,
+        ws_max_queue=1,
         ws_per_message_deflate=False,
     )
 
@@ -826,6 +831,9 @@ def dispatch_launch(server_args: ServerArgs):
 
 
 if __name__ == "__main__":
+    # Argument/platform discovery can initialize CUDA before workers start.
+    # Match DiffGenerator's process isolation when launching this module directly.
+    mp.set_start_method("spawn", force=True)
     server_args = prepare_server_args(sys.argv[1:])
 
     try:

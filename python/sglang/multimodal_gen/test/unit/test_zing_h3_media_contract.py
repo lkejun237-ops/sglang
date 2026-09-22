@@ -463,3 +463,43 @@ def test_visual_encode_forwards_mode_and_preserves_seed(
     assert first.shape == (1, 2, expected_frames, 1, 1)
     assert first.dtype == torch.float16
     assert calls == [[1] if frames == 1 else [17] * ((frames + 16) // 17)] * 2
+
+
+def test_stream_prompt_first_frame_is_video_without_extra_vae_reference(
+    codecs, monkeypatch
+):
+    from contextlib import nullcontext
+
+    frame = torch.arange(3 * 32 * 32).remainder(256).byte().reshape(3, 1, 32, 32)
+    seen = []
+    monkeypatch.setattr(
+        codecs,
+        "_decode_media",
+        lambda item, **kw: {
+            **item,
+            "frames": torch.zeros(3, 1, 32, 32, dtype=torch.uint8),
+            "fps": 24,
+        },
+    )
+    monkeypatch.setattr(
+        codecs, "encode_condition", lambda prompt, media: seen.extend(media) or {}
+    )
+    encoded = []
+    monkeypatch.setattr(
+        codecs,
+        "encode_visual",
+        lambda pixels: encoded.append(pixels) or torch.zeros(1, 2, 1, 2, 2),
+    )
+    result = codecs.prepare(
+        make_request("video", references=5, source=False),
+        lambda name: nullcontext(),
+        retain_condition_media=True,
+        prompt_source_frame=frame,
+    )
+    assert seen[0]["type"] == "video" and seen[0]["fps"] == 24
+    assert torch.equal(seen[0]["frames"], frame)
+    frame.zero_()
+    assert seen[0]["frames"].count_nonzero() > 0
+    assert len(seen) == 6 and len(encoded) == len(result.visual) == 5
+    assert result.source_visual is None
+    assert result.condition_media == seen

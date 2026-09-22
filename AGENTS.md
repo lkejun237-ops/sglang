@@ -43,8 +43,6 @@ validation, world-service callbacks, and their tests and documentation:
 - stable error codes must use ASCII identifiers; do not use localized text as a
   code or branch on human-readable messages.
 
-When any of these values or close codes change, update
-`world-service/docs/asyncapi-gateway.yaml` in the frontend contract repository.
 Chinese comments and ordinary product content are not error information.
 
 ## MinWM hardware-specific jobs

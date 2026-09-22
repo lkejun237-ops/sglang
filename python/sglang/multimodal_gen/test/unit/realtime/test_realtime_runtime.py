@@ -1027,7 +1027,7 @@ async def _assert_event_listener_does_not_block_on_scheduler_refresh(monkeypatch
                 }
             )
 
-    class Adapter:
+    class Adapter(realtime_adapter.BaseRealtimeModelAdapter):
         def __init__(self):
             self.event_ids = []
 
@@ -1479,7 +1479,7 @@ def test_session_watchdog_enforces_lifetime_without_admission_controller():
 
 
 def test_playback_ack_marks_ack_aware_session_playable_without_model_ingest():
-    class RejectingAdapter:
+    class RejectingAdapter(realtime_adapter.BaseRealtimeModelAdapter):
         def ingest_event(self, *_args):
             raise AssertionError("playback transport ACK must not reach model adapter")
 
@@ -2101,3 +2101,107 @@ def test_lingbot_camera_condition_uses_condition_inputs_without_session():
     )
     assert tuple(condition["c2ws_plucker_emb"].shape) == expected_shape
     assert condition["c2ws_plucker_emb"].dtype == torch.float32
+
+
+@pytest.mark.parametrize("worker_error", [False, True])
+def test_cleanup_waits_for_inflight_worker_before_release(
+    monkeypatch, tmp_path, worker_error
+):
+    """A transport cancellation cannot grant another session the running slot."""
+
+    async def run():
+        entered, finish = asyncio.Event(), asyncio.Event()
+        events = []
+        session = GenerateSession()
+        directory = tmp_path / "inputs"
+        directory.mkdir()
+        (directory / "reference.jpg").write_bytes(b"reference")
+        session.input_temp_dir = str(directory)
+        result = OutputBatch(raw_frame_batches=[])
+
+        async def generate(_client, _batch):
+            entered.set()
+            await finish.wait()
+            assert directory.exists()
+            events.append("worker_finished")
+            if worker_error:
+                raise RuntimeError("worker failure")
+            return [], result
+
+        async def release(_request):
+            assert events[0] == "worker_finished"
+            assert directory.exists()
+            events.append("released")
+
+        monkeypatch.setattr(realtime_video_api, "process_generation_batch", generate)
+        monkeypatch.setattr(
+            realtime_video_api.async_scheduler_client, "forward", release
+        )
+        task = asyncio.create_task(
+            realtime_video_api._process_realtime_generation_batch(object())
+        )
+        await entered.wait()
+        cleanup = asyncio.create_task(
+            realtime_video_api._cleanup_realtime_session(session, task, None)
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not cleanup.done() and not events and directory.exists()
+        finish.set()
+        await cleanup
+        assert events == ["worker_finished", "released"]
+        assert not directory.exists()
+        assert task.cancelled()
+
+    asyncio.run(run())
+
+
+def test_cleanup_renews_admission_until_worker_finishes(monkeypatch):
+    async def run():
+        store = realtime_video_api.InMemorySessionLeaseStore(1, 0.3)
+        controller = realtime_video_api.RealtimeAdmissionController(store)
+        session = GenerateSession()
+        lease = await controller.admit("owner", session.id, session.generation_id)
+        entered, finish = asyncio.Event(), asyncio.Event()
+
+        async def generation(_client, _batch):
+            entered.set()
+            await finish.wait()
+            return [], OutputBatch(raw_frame_batches=[])
+
+        async def release(_request):
+            return None
+
+        monkeypatch.setattr(realtime_video_api, "process_generation_batch", generation)
+        monkeypatch.setattr(
+            realtime_video_api.async_scheduler_client, "forward", release
+        )
+        task = asyncio.create_task(
+            realtime_video_api._process_realtime_generation_batch(object())
+        )
+        await entered.wait()
+        cleanup = asyncio.create_task(
+            realtime_video_api._cleanup_realtime_session_then_close(
+                None,
+                session,
+                task,
+                None,
+                None,
+                controller=controller,
+                lease=lease,
+                lease_ttl_s=0.3,
+            )
+        )
+        try:
+            await asyncio.sleep(0.7)  # more than two original lease TTLs
+            with pytest.raises(realtime_video_api.AdmissionRejected):
+                await controller.admit("owner", "new-session", "new-generation")
+            assert not cleanup.done()
+        finally:
+            finish.set()
+            await cleanup
+            await controller.release(lease)
+        new_lease = await controller.admit("owner", "new-session", "new-generation")
+        await controller.release(new_lease)
+
+    asyncio.run(run())

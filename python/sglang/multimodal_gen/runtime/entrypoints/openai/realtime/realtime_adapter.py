@@ -135,6 +135,15 @@ class BaseRealtimeModelAdapter:
     def __init__(self):
         self.output_adapter = RawRGBRealtimeOutputAdapter()
 
+    def for_request(self, request):
+        return self
+
+    def session_ready_message(self, session):
+        return None
+
+    async def ingest_wire_event(self, ws, session, data, message_bytes):
+        return False
+
     async def on_init(
         self,
         session: GenerateSession,

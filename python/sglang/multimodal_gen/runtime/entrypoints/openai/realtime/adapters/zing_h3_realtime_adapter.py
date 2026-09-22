@@ -26,6 +26,16 @@ class ZingH3RealtimeControlState:
 
 
 class ZingH3RealtimeAdapter(BaseRealtimeModelAdapter):
+    def for_request(self, request):
+        if (
+            getattr(request, "zing_realtime_api_version", None) is not None
+            or getattr(request, "source_stream", None) is not None
+        ):
+            from .zing_h3_source_adapter import ZingH3SourceStreamAdapter
+
+            return ZingH3SourceStreamAdapter()
+        return self
+
     def create_state(self):
         return ZingH3RealtimeControlState()
 

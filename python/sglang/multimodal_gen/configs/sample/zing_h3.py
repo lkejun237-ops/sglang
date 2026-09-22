@@ -26,7 +26,7 @@ class ZingH3SamplingParams(SamplingParams):
     zing_denoising_step_list: list[int] | None = None
     zing_generate_audio: bool = False
     zing_return_latents: bool = False
-    zing_realtime_decode_mode: str = "immediate"
+    zing_realtime_decode_mode: str = "stable"
     zing_window_chunks: int | None = 21
     zing_sink_chunks: int = 3
     zing_rope_position_mode: str = "block_relative"

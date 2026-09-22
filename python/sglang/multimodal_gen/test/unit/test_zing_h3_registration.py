@@ -88,7 +88,9 @@ def test_zing_registers_executable_stages_and_accepts_ulysses_sp4(monkeypatch):
     assert ZingH3CausalPipeline.sampling_params_cls is ZingH3SamplingParams
     assert callable(ZingH3GenerationStage.forward)
     with pytest.raises(ValueError, match="requires TP=1"):
-        ZingH3CausalPipelineConfig().validate_server_args(SimpleNamespace(tp_size=2))
+        ZingH3CausalPipelineConfig(
+            taeh3_checkpoint_path="/model/taeh3.pth"
+        ).validate_server_args(SimpleNamespace(tp_size=2))
 
     args = SimpleNamespace(
         tp_size=1,
@@ -104,10 +106,14 @@ def test_zing_registers_executable_stages_and_accepts_ulysses_sp4(monkeypatch):
     monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_ATTENTION", "fa4")
     monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_STABLE_SHAPES", "1")
     monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN", "1")
-    ZingH3CausalPipelineConfig().validate_server_args(args)
+    ZingH3CausalPipelineConfig(
+        taeh3_checkpoint_path="/model/taeh3.pth"
+    ).validate_server_args(args)
     args.sp_degree = 2
     with pytest.raises(ValueError, match="sp-degree == --ulysses-degree"):
-        ZingH3CausalPipelineConfig().validate_server_args(args)
+        ZingH3CausalPipelineConfig(
+            taeh3_checkpoint_path="/model/taeh3.pth"
+        ).validate_server_args(args)
 
 
 @pytest.mark.parametrize("fps", [24, 30])
@@ -155,7 +161,7 @@ def test_zing_sp_requires_validated_numerical_configuration(
         attention_backend=None,
         resolve_component_attention_backend=lambda _name: (None, None),
     )
-    config = ZingH3CausalPipelineConfig()
+    config = ZingH3CausalPipelineConfig(taeh3_checkpoint_path="/model/taeh3.pth")
     effective = (attention or "fa4", stable or "1", compiled or "1")
     if sp == 1 or effective == ("fa4", "1", "1"):
         config.validate_server_args(args)
@@ -191,3 +197,27 @@ def test_zing_warmup_keeps_euler_endpoint():
     assert params.num_inference_steps == 2
     assert req.extra["zing_solver"] == "euler"
     assert req.extra["zing_return_latents"] is False
+
+
+def test_zing_defaults_to_taeh3_and_requires_explicit_weights():
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.configs.sample.zing_h3 import ZingH3SamplingParams
+
+    args = SimpleNamespace(
+        attention_backend=None,
+        resolve_component_attention_backend=lambda _name: (None, None)
+    )
+    config = ZingH3CausalPipelineConfig()
+    assert config.video_decoder_backend == "taeh3"
+    assert ZingH3SamplingParams().zing_realtime_decode_mode == "stable"
+    with pytest.raises(ValueError, match="TAEH3 requires a local checkpoint path"):
+        config.validate_server_args(args)
+    config.taeh3_checkpoint_path = "/model/taeh3.pth"
+    config.validate_server_args(args)
+    config.taeh3_decode_precision = "invalid"
+    with pytest.raises(ValueError, match="Unsupported TAEH3 decode precision"):
+        config.validate_server_args(args)
+    ZingH3CausalPipelineConfig(video_decoder_backend="native").validate_server_args(
+        args
+    )

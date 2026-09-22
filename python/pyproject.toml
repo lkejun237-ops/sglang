@@ -94,7 +94,7 @@ dependencies = [
   "torchvision",
   "tqdm",
   "transformers==5.12.1",
-  "uvicorn>=0.30.0,<0.40",  # 实时网关依赖 ws ping 行为，升大版本需回归
+  "uvicorn>=0.35.0,<0.40",  # Production realtime uses websockets-sansio.
   "uvloop",
   "watchfiles",
   "xgrammar==0.2.1",

@@ -249,7 +249,14 @@ class ZingH3Codecs(ZingH3MediaInput):
         mean, std = self._stats(self.aa, latent, audio=True)
         return ((latent - mean) / std).half()
 
-    def prepare(self, request, use_component, *, retain_condition_media=False):
+    def prepare(
+        self,
+        request,
+        use_component,
+        *,
+        retain_condition_media=False,
+        prompt_source_frame=None,
+    ):
         # Reuse decoded references for prompt refreshes; offline calls release them.
         if isinstance(request, dict) and "cache_uri" in request:
             raise ValueError(
@@ -273,6 +280,23 @@ class ZingH3Codecs(ZingH3MediaInput):
         refs, source, h, w, t, frames = self._normalize_inference_media(
             media, source, conditions, target, max_area_config=max_area_config
         )
+        if prompt_source_frame is not None:
+            if (
+                prompt_source_frame.dtype != torch.uint8
+                or prompt_source_frame.ndim != 4
+                or prompt_source_frame.shape[:2] != (3, 1)
+            ):
+                raise ValueError("Prompt source must contain exactly one RGB frame")
+            # Prompt-only video: never add this frame to reference VAE conditions.
+            media.insert(
+                0,
+                dict(
+                    id="source-first-frame",
+                    type="video",
+                    fps=self.target_fps,
+                    frames=prompt_source_frame.cpu().clone(),
+                ),
+            )
         with use_component("text_encoder"):
             positive = self.encode_condition(prompt, media)
         visual, audio = {}, {}

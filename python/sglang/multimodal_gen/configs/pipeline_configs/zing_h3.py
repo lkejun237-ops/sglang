@@ -33,7 +33,7 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
     dit_config: ZingH3DiTConfig = field(default_factory=ZingH3DiTConfig)
     should_use_guidance: bool = True
     vae_decode_precision: str = "fp32"
-    video_decoder_backend: str = "native"
+    video_decoder_backend: str = "taeh3"
     taeh3_checkpoint_path: str | None = None
     taeh3_decode_precision: str = "fp32"
 

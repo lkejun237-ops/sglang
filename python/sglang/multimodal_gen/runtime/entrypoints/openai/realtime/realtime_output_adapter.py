@@ -516,6 +516,8 @@ class RawRGBRealtimeOutputAdapter:
             output_format=output_format,
             transport_quality=getattr(batch, "output_compression", None),
             preview_max_width=preview_max_width,
+            source_blocks=getattr(batch, "extra", {}).get("zing_source_output_blocks"),
+            source_fps=getattr(batch, "fps", None),
         )
         stats["frame_shape"] = _frame_shape_from_metadata(frame_metadata)
         return stats
@@ -534,11 +536,25 @@ class RawRGBRealtimeOutputAdapter:
         output_format: str | None = None,
         transport_quality: int | None = None,
         preview_max_width: int | None = None,
+        source_blocks: list | None = None,
+        source_fps: int | None = None,
     ) -> RealtimeFrameSendStats:
         chunk_index = chunk_index_start
         metadata = frame_metadata or {}
         stats = empty_frame_send_stats(content_type)
-        for frames in frame_batches:
+        if source_blocks is not None and len(source_blocks) != len(frame_batches):
+            raise ValueError("Source output metadata does not match frame batches")
+        for index, frames in enumerate(frame_batches):
+            source_block = source_blocks[index] if source_blocks is not None else None
+            if source_block is not None:
+                if source_block["provenance"].pixels.count != len(frames):
+                    raise ValueError(
+                        "Source output metadata does not match frame count"
+                    )
+                chunk_index, request_id, event_id = (
+                    source_block[key] for key in ("block_idx", "request_id", "event_id")
+                )
+                source_offset = source_block["provenance"].pixels.start
             split_batches = (
                 _split_frame_batch(frames, ENCODED_PREVIEW_FRAMES_PER_WS_MESSAGE)
                 if _is_encoded_preview_transport(
@@ -611,6 +627,17 @@ class RawRGBRealtimeOutputAdapter:
                     header["trace_id"] = trace_id
                 header.update(transport_metadata)
                 header.update(transport_payload.metadata)
+                if source_block is not None:
+                    from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
+                        PixelRange,
+                    )
+
+                    pixels = PixelRange(
+                        source_offset, source_offset + len(transport_frames)
+                    )
+                    header.update(source_block["provenance"].slice(pixels).metadata())
+                    header["pts_us"] = source_offset * 1_000_000 // source_fps
+                    source_offset = pixels.end
 
                 if len(transport_payload.payload) >= FRAME_BATCH_PACK_OFFLOAD_BYTES:
                     header_payload = _pack_frame_batch_header(header)

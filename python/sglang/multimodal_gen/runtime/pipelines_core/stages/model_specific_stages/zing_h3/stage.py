@@ -110,7 +110,12 @@ class ZingH3GenerationStage(PipelineStage):
             if isinstance(images, str):
                 images = [images]
             for index, path in enumerate(images):
-                media_id = f"image-{index}"
+                reference_ids = batch.extra.get("zing_reference_ids")
+                media_id = (
+                    reference_ids[index]
+                    if reference_ids is not None
+                    else f"image-{index}"
+                )
                 content.append({"type": "image", "id": media_id, "uri": path})
                 conditions.append(
                     {
@@ -307,6 +312,13 @@ class ZingH3GenerationStage(PipelineStage):
     def _forward_realtime(self, batch, server_args):
         if batch.session is None:
             raise ValueError("Zing realtime request is missing its worker session")
+        if "zing_source_command" in batch.extra:
+            from .source_session import ZingSourceStreamState
+
+            with set_forward_context(current_timestep=0, attn_metadata=None):
+                return batch.session.get_or_create_state(ZingSourceStreamState).run(
+                    self, batch
+                )
         state = batch.session.get_or_create_state(ZingH3RealtimeState)
         try:
             with set_forward_context(current_timestep=0, attn_metadata=None):
