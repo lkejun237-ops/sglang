@@ -18,7 +18,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     _deterministic_audio_decode_context,
 )
 
-from .media_input import ZingH3MediaInput
+from .media_input import ZingH3MediaInput, _sample_max_area_config
 from .packing import H3InferenceInputs
 from .visual_encoding import encode_clips
 
@@ -255,6 +255,8 @@ class ZingH3Codecs(ZingH3MediaInput):
             raise ValueError(
                 "Zing runtime accepts media messages, not pickled request caches"
             )
+        # 请求可局部覆盖 source/reference 面积；必须在解码前失败，且不改常驻配置。
+        max_area_config = _sample_max_area_config(self.max_area_config, request)
         prompt, items, target, conditions, source = self._parse_inference_request(
             request
         )
@@ -269,7 +271,7 @@ class ZingH3Codecs(ZingH3MediaInput):
             None if source is None else self._decode_media(source, need_audio=False)
         )
         refs, source, h, w, t, frames = self._normalize_inference_media(
-            media, source, conditions, target, max_area_config=self.max_area_config
+            media, source, conditions, target, max_area_config=max_area_config
         )
         with use_component("text_encoder"):
             positive = self.encode_condition(prompt, media)

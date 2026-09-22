@@ -102,6 +102,23 @@ def _clip_indices(
     return round(start * rate), None if end is None else round(end * rate) + 1
 
 
+def _sample_max_area_config(
+    defaults: dict[str, int], sample: dict[str, Any]
+) -> dict[str, int]:
+    """用请求的非空局部字段覆盖 YAML 默认值，不修改常驻 max_area_config。"""
+    override = sample.get("h3_max_area_config") if isinstance(sample, dict) else None
+    if override is None:
+        return dict(defaults)
+    if not isinstance(override, dict) or not override:
+        raise ValueError("h3_max_area_config must be a non-empty object")
+    unknown = set(override) - set(defaults)
+    if unknown:
+        raise ValueError(f"h3_max_area_config has unknown fields: {sorted(unknown)}")
+    if any(type(value) is not int or value < 1 for value in override.values()):
+        raise ValueError("h3_max_area_config values must be positive integers")
+    return {**defaults, **override}
+
+
 def _select_h3_bucket(
     height: int, width: int, *, multiple: int, max_short_edge: int, max_area: int
 ) -> tuple[int, int]:
