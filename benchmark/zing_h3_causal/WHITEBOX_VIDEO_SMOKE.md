@@ -7,8 +7,9 @@
 | `zing-whitebox-video-five-triview-0001` | 5 秒白模游戏视频，1280×720、24 fps | 五张合并的白模／目标外观三视图 | 120 帧，832×480 |
 
 源素材是游戏引擎录制的低多边形海岸场景，人物在场景中行走。五张参考图分别定义人物、巡逻车、站点、灯塔和瞭望台的外观。
-用户消息通过 `clip.start=clip.end=0` 仅向 Prompt encoder 提供源视频第 0 帧；
-`target.source` 则向 Source encoder 提供完整的 120 帧视频。这体现了首帧建立场景语境、后续源像素帧提供运动信息的输入分工；当前请求仍一次传入完整视频。
+输入修订版 **r2**：用户消息的首个媒体是训练 **target** 视频第 0 帧，
+保留 `type="video"` 和 `clip.start=clip.end=0`，仅供多模态文本编码器按视频处理；
+`target.source` 则向 Source encoder 提供完整的 120 帧视频。它与首个 prompt 视频是两个不同素材。这体现了渲染首帧建立场景语境、白模源像素帧提供运动信息的输入分工；当前请求仍一次传入完整视频。
 
 ## 训练数据来源
 
@@ -29,6 +30,9 @@ d24cddb259eb7e22dc9b763648934394e98e0818c80a744f79b2fc947176cbed
 - 移除这张额外参考帧及提示词中对它的引用，保留五张合并三视图。
 - 将相对素材路径转换为完整的 S3 URI。
 - 将训练目标视频 URI 替换为明确的推理输出规格。
+
+r2 按测试需求将首个 prompt 视频改为训练 target 第 0 帧；这不是原始训练记录的原样复制，
+也不是恢复原始的额外全局风格图片。五张三视图及其编号保持不变。
 
 这些转换、素材字节数和 SHA256 均记录在 `whitebox_video_smoke_cases.jsonl` 的来源信息中。
 仓库仅保存请求与来源记录；媒体保留在现有的 `leap-worldmodel-thailand` 存储桶中。
@@ -68,11 +72,12 @@ python benchmark/zing_h3_causal/prepare_whitebox_video_smoke.py \
 准备工具按固定的字节数和 SHA256 核验每份素材，然后写出：
 
 - `request.json`：可直接运行的 Zing 双消息请求，素材 URI 改为本地 `file://` 路径。
-- `media/`：源视频与五张三视图各一份。
+- `media/`：白模 source、训练 target、五张三视图，以及从 target 提取的单帧无损视频 `training-target-frame0.mkv`。
+- 准备阶段需要 `ffmpeg`；单帧视频保留解码 RGB 像素，不包含 target 后续帧或音轨。推理请求仅引用该单帧视频，不引用完整 target。
 - `receipt.json`：源 URI、本地 URI、字节数、SHA256 和训练来源记录。
 
 使用 `--keep-remote-uris` 可保留远程 URI，仅写出请求与清单，不复制媒体。
-这种模式不执行媒体下载或校验，推理环境仍需具备对应存储桶的访问权限。
+这种模式不执行媒体下载、校验或首帧预提取；请求保留训练 target URI 和闭区间 `clip={"start":0,"end":0}`，由推理端解码选取第 0 帧。它与本地准备路径具有相同的媒体角色，但性能测量时必须记录不同的读取成本。
 
 ## 运行 SGLang
 
@@ -97,5 +102,41 @@ PYTHONPATH=python python benchmark/zing_h3_causal/validate_real_checkpoint.py \
 基本技术要求是请求执行完成，输出可正常解码为 120 帧、832×480 的视频。
 人工查看源相机和人物运动是否保留，并检查从首帧到片段结束，可见主体是否持续遵循对应的三视图参考。
 
-该用例验证完整源视频请求，采用与训练一致的 Prompt／Source 分工。
+该用例验证完整源视频请求，采用明确分离的 Prompt／Source 分工，输入版本为 r2。
 它不提供离线质量评分，也不验证增量 `source.append`：当前 Zing SGLang 接口在分块输出前仍需接收完整的源对象。
+
+## API 字段与 PR #140 接入注意事项
+
+不要使用 `first_frame`，也不要把这个首帧追加为第六张普通 image reference。
+这里“第一个参考输入”是 user.content 的第一个媒体，类型必须为 **video**：
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": [
+      {"id": "<Video 1>", "type": "video", "uri": "file:///data/media/training-target-frame0.mkv", "clip": {"start": 0, "end": 0}},
+      {"id": "<Picture 1>", "type": "image", "uri": "file:///data/media/ranger.jpg"}
+    ]},
+    {"role": "target", "source": {"type": "video", "uri": "file:///data/media/source.mp4"},
+     "content": [{"type": "video", "output": {"frames": 120, "height": 480, "width": 832}}],
+     "conditions": [{"content_id": "<Picture 1>", "role": "reference", "latent_modalities": ["visual"]}]}
+  ]
+}
+```
+
+上例仅展示字段位置，省略了 prompt 和另外四张三视图；实际运行使用准备工具生成的完整 `request.json`，放入 `zing_request`。
+`<Video 1>` 不进入 target.conditions，因此不会增加 VAE reference 数量。
+文本编码器按媒体 type 路由视频／图片；不是只改变列表顺序即可。
+当前 SGLang 的 `ZingH3Codecs.encode_condition` 使用 Qwen video processor；不要仅凭此请求格式声称已经使用 vLLM 后端。
+
+PR #140 的持续 source 接口当前会自动取首个 source RGB 帧作为 prompt 视频。
+这与 r2 的训练 target 首帧不同，不能原样复用该行为，也不能把渲染首帧塞进 source.append。
+该接口需另行接入独立的 prompt 视频首帧，并在五张普通 references 之前按 video 路径处理。
+本 PR 修正冻结输入和完整视频准备路径，不宣称 PR #140 已兼容或已通过 GPU 验收。
+
+r1 与 r2 输入不同，旧 request、receipt、性能基线及数值快照不能混用，需重新准备并记录 input_revision。
+
+## 内部素材预览
+
+[查看输入 r2 与首帧路由说明](https://review-cdn.loopit.com.cn/reports/zing-whitebox-video-case/20260922-r2/index.html)
+（仅办公网／公司 VPN）。页面展示训练素材，不是 SGLang 输出报告。

@@ -8,6 +8,7 @@ import copy
 import hashlib
 import json
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import urlsplit
@@ -168,12 +169,56 @@ def materialize_case(
                 rewrite(item)
 
     rewrite(request)
+    # 首个媒体保留 video 类型，只把训练 target 的第 0 帧交给文本编码器。
+    prompt_video = request["messages"][0]["content"][0]
+    if case.get("provenance", {}).get("input_revision") == 2:
+        video_path = Path(urlsplit(prompt_video["uri"]).path)
+        frame_path = media_dir / "training-target-frame0.mkv"
+        extract_prompt_video(video_path, frame_path)
+        prompt_video["uri"] = frame_path.resolve().as_uri()
+        derived = {
+            "source_uri": case["messages"][0]["content"][0]["uri"],
+            "frame_index": 0,
+            "local_uri": prompt_video["uri"],
+            "bytes": frame_path.stat().st_size,
+            "sha256": sha256_file(frame_path),
+            "encoding": "ffv1/bgr0; one RGB frame; no audio",
+            "routing": "prompt-only video",
+        }
+    else:
+        derived = None
     receipt = {
         "sample_id": case["sample_id"],
         "source_manifest": case.get("provenance", {}),
         "assets": assets,
+        "prompt_video": derived,
     }
     return request, receipt
+
+
+def extract_prompt_video(source: Path, destination: Path) -> None:
+    """将首个解码帧无损存成单帧视频，避免误走 image/reference 路径。"""
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-y",
+            "-i",
+            str(source),
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            "1",
+            "-an",
+            "-c:v",
+            "ffv1",
+            "-pix_fmt",
+            "bgr0",
+            str(destination),
+        ],
+        check=True,
+    )
 
 
 def write_json(path: Path, value: Any) -> None:
