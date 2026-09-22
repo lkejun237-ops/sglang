@@ -12,7 +12,7 @@ import pytest
 import prepare_whitebox_video_smoke as smoke
 
 
-CASE_ID = "zing-whitebox-video-five-triview-0001"
+CASE_ID = "zing-whitebox-video-target-frame0-five-triview-0001"
 
 
 def test_prompt_subject_reference_mapping():
@@ -45,7 +45,7 @@ def test_prompt_subject_reference_mapping():
 
 def test_frozen_case_matches_production_input_shape():
     cases = smoke.load_cases(smoke.DEFAULT_MANIFEST)
-    assert set(cases) == {CASE_ID}
+    assert set(cases) == {CASE_ID, smoke.DEFAULT_CASE}
 
     case = cases[CASE_ID]
     user_content = case["messages"][0]["content"]
@@ -187,3 +187,23 @@ def test_extract_prompt_video_preserves_only_first_rgb_frame(tmp_path):
         ]
     )
     assert decoded == first
+
+
+def test_default_preserves_six_reference_contract():
+    cases = smoke.load_cases(smoke.DEFAULT_MANIFEST)
+    case = cases[smoke.DEFAULT_CASE]
+    content = case["messages"][0]["content"]
+    target = case["messages"][1]
+    pictures = [item for item in content if item["type"] == "image"]
+    assert [p["id"] for p in pictures] == [f"<Picture {i}>" for i in range(1, 7)]
+    assert [c["content_id"] for c in target["conditions"]] == [
+        p["id"] for p in pictures
+    ]
+    assert (
+        smoke.expected_assets(case)[pictures[0]["uri"]]["sha256"]
+        == "03475dd7769de747f16b0d13709495cce426c310a62822b93eb38db6eb92fa05"
+    )
+    assert target["source"]["uri"] == content[0]["uri"]
+    assert case["sample_id"] != CASE_ID
+    assert case["provenance"].get("input_revision") != 2
+    assert len(smoke.media_uris(case)) == 7

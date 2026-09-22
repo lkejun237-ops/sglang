@@ -1,10 +1,12 @@
 # Zing H3 白模视频基本测试
 
-本目录固定一个贴近实际输入场景的请求，用于 Zing H3 的基本测试：
+本目录保留两个独立输入 case，不能仅凭 input_revision 区分或混用测试结果。
+默认 `zing-whitebox-video-five-triview-0001` 保留 PR #164 的六图契约：全局风格图为 Picture 1，五张三视图为 Picture 2–6，原 prompt 与 conditions 映射不变。
+本文件以下介绍显式选择的训练 target 首帧变体；它不覆盖默认六图 case。
 
 | 用例 | 源素材 | 参考图 | 输出规格 |
 | --- | --- | --- | --- |
-| `zing-whitebox-video-five-triview-0001` | 5 秒白模游戏视频，1280×720、24 fps | 五张合并的白模／目标外观三视图 | 120 帧，832×480 |
+| `zing-whitebox-video-target-frame0-five-triview-0001` | 5 秒白模游戏视频，1280×720、24 fps | 五张合并的白模／目标外观三视图 | 120 帧，832×480 |
 
 源素材是游戏引擎录制的低多边形海岸场景，人物在场景中行走。五张参考图分别定义人物、巡逻车、站点、灯塔和瞭望台的外观。
 输入修订版 **r2**：用户消息的首个媒体是训练 **target** 视频第 0 帧，
@@ -57,6 +59,7 @@ python benchmark/zing_h3_causal/prepare_whitebox_video_smoke.py --list
 
 ```bash
 python benchmark/zing_h3_causal/prepare_whitebox_video_smoke.py \
+  --case zing-whitebox-video-target-frame0-five-triview-0001 \
   --output-dir /data/zing-smoke/whitebox-video-five-triview
 ```
 
@@ -65,6 +68,7 @@ python benchmark/zing_h3_causal/prepare_whitebox_video_smoke.py \
 
 ```bash
 python benchmark/zing_h3_causal/prepare_whitebox_video_smoke.py \
+  --case zing-whitebox-video-target-frame0-five-triview-0001 \
   --media-root /mnt/leap-worldmodel-thailand \
   --output-dir /data/zing-smoke/whitebox-video-five-triview
 ```
@@ -134,7 +138,7 @@ PR #140 的持续 source 接口当前会自动取首个 source RGB 帧作为 pro
 该接口需另行接入独立的 prompt 视频首帧，并在五张普通 references 之前按 video 路径处理。
 本 PR 修正冻结输入和完整视频准备路径，不宣称 PR #140 已兼容或已通过 GPU 验收。
 
-r1 与 r2 输入不同，旧 request、receipt、性能基线及数值快照不能混用，需重新准备并记录 input_revision。
+两个 sample_id 的 request、receipt、性能基线及数值快照不得混用。#166 初版曾复用默认 ID；请重新准备，首帧变体必须记录独立 sample_id 与 input_revision=2。
 
 ## 内部素材预览
 
