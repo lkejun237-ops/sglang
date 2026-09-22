@@ -20,6 +20,8 @@ from pathlib import Path
 import msgpack
 import websockets
 
+from continuous_source_media import reference_payload
+
 
 async def run(args):
     output = Path(args.output)
@@ -84,10 +86,10 @@ async def run(args):
         if args.reference:
             refs = []
             for i, name in enumerate(args.reference):
-                p = Path(name)
-                data = p.read_bytes()
-                fmt = "jpeg" if p.suffix.lower() in (".jpg", ".jpeg") else "webp"
-                refs.append(dict(id=f"reference-{i}", format=fmt, payload=data))
+                media_id = (
+                    args.reference_id[i] if args.reference_id else f"reference-{i}"
+                )
+                refs.append(reference_payload(name, media_id))
             init["references"] = refs
         await send(init)
         ready = msgpack.unpackb(
@@ -396,6 +398,7 @@ def main():
     parser.add_argument("--output", required=True, help="New result directory")
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--reference", action="append", default=[])
+    parser.add_argument("--reference-id", action="append", default=[])
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--seed", type=int, default=42)
@@ -410,6 +413,8 @@ def main():
     parser.add_argument("--consumer-delay", type=float, default=0)
     parser.add_argument("--timeout", type=float, default=900)
     args = parser.parse_args()
+    if args.reference_id and len(args.reference_id) != len(args.reference):
+        parser.error("Provide one reference ID per reference image.")
     if (
         min(args.width, args.height, *args.batch_pattern) < 1
         or args.startup_buffer_seconds < 0

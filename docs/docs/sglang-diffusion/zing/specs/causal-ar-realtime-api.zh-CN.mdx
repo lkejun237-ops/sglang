@@ -44,7 +44,7 @@ description: "Zing 1.0 H3 因果自回归模型的持续 source 输入、帧级�
 | `zing_solver` / `zing_denoising_step_list` | 本模式由部署模型配置选择，不由调用方覆盖；不能把 Euler 的 sigma points 数改为 4 就当作 four-step 蒸馏模型 |
 | `zing_realtime_decode_mode` | 默认 `stable`，首版仅接受 `stable`；输出已稳定帧，不回改已发送画面；等待时间窗口不等于零延迟 |
 | `realtime_output_format` | 默认 `raw`，也可选 `webp`、`jpeg`；详见第 4 节 |
-| `references` | 新增，可选静态图片列表，每项包含唯一 `id`、`format="jpeg"` 或 `"webp"` 及 bytes `payload`；首版不支持运行中更新 |
+| `references` | 新增，可选静态图片列表，每项包含唯一 `id`、`format="jpeg"`、`"webp"` 或 `"png"` 及 bytes `payload`，最多九张并保留输入顺序；首版不支持运行中更新 |
 
 Reference 是外观、身份等静态参考，不要求逐帧对齐；source 是游戏引擎持续产生、与输出时间轴对齐的待渲染帧。两者不能混用。Reference 数量和总字节额度由部署校验并在 ready 中回显，不承诺无限数量。本文不用旧 `zing_request` 的 `target.output.frames` 或完整视频 URI；本模式禁止同时传 `zing_request`、`first_frame`、`video_path`、`video_url`，避免两套初始化语义冲突。
 
@@ -66,7 +66,7 @@ Reference 是外观、身份等静态参考，不要求逐帧对齐；source 是
   "max_source_message_bytes": 33554432,
   "max_pending_source_frames": 68,
   "max_pending_source_bytes": 134217728,
-  "max_references": 5,
+  "max_references": 9,
   "max_reference_bytes": 8388608
 }
 ```

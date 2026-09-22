@@ -1,3 +1,8 @@
+> Conditioning correction: the current contract accepts up to nine references,
+> preserves their supplied order, and never injects the first source RGB frame
+> into prompt media. Historical runs below that used this injection are not
+> evidence of the corrected conditioning or visual quality.
+
 # Current acceptance
 
 The earlier runs below are historical and retain their own SHAs. See
@@ -253,8 +258,8 @@ comparison page are in local Downloads directory
 
 The acceptance case is `zing-whitebox-video-five-triview-0001`: the original
 prompt and all five reference sheets, with 120 real source frames. Streaming
-supports five references under the unchanged total byte budget. The first RGB
-frame is retained as a prompt-only video condition; it is not a sixth VAE
+historically supported five references under the unchanged total byte budget.
+That run retained the first RGB frame as a prompt-only video condition; it was not a sixth VAE
 reference. Subsequent prompt updates reuse this first frame and the references.
 The source is resized to the negotiated 832x480 RGB canvas before transport;
 thus the prompt first frame is also 832x480, unlike the original file request's

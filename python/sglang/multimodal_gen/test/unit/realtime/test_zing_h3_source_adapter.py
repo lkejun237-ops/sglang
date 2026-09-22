@@ -194,27 +194,31 @@ def test_source_provenance_survives_transport_splitting(output_format):
     assert cursor == stats["num_frames"] == 17
 
 
-def test_five_references_are_preserved_and_six_rejected(configured):
+def test_nine_references_are_preserved_and_ten_rejected(configured):
     import io
     from pathlib import Path
     from PIL import Image
 
-    data = io.BytesIO()
-    Image.new("RGB", (32, 32)).save(data, format="JPEG")
-    refs = [
-        dict(id=f"picture-{i}", format="jpeg", payload=data.getvalue())
-        for i in range(6)
-    ]
-    adapter, session = initialize(references=refs[:5])
+    refs = []
+    for i in range(10):
+        data = io.BytesIO()
+        fmt = "PNG" if i == 0 else "JPEG"
+        Image.new("RGB", (32, 32), color=(i * 20, 0, 0)).save(data, format=fmt)
+        refs.append(
+            dict(id=f"picture-{9 - i}", format=fmt.lower(), payload=data.getvalue())
+        )
+    adapter, session = initialize(references=refs[:9])
     directory = Path(session.input_temp_dir)
-    assert adapter.session_ready_message(session)["max_references"] == 5
-    assert len(adapter.reference_paths) == 5
-    assert adapter.reference_ids == [ref["id"] for ref in refs[:5]]
-    assert all(Path(p).read_bytes() == data.getvalue() for p in adapter.reference_paths)
+    assert adapter.session_ready_message(session)["max_references"] == 9
+    assert len(adapter.reference_paths) == 9
+    assert adapter.reference_ids == [ref["id"] for ref in refs[:9]]
+    assert [Path(p).read_bytes() for p in adapter.reference_paths] == [
+        ref["payload"] for ref in refs[:9]
+    ]
     adapter.dispose(session)
     # Temp files are owned by the shared session cleanup.
     import shutil
 
     shutil.rmtree(directory)
-    with pytest.raises(ValueError, match="at most five"):
+    with pytest.raises(ValueError, match="at most nine"):
         initialize(references=refs)

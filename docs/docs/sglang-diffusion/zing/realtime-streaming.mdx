@@ -29,8 +29,11 @@ description: "Zing H3 continuous RGB input, finite streaming, decode modes, and 
 部署须在模型目录提供绑定 `zing_config.json` SHA256 的
 `zing_realtime_profile.json`，固定匹配 checkpoint 的四步 schedule、guidance 和
 `indexed-cpu-v1` 噪声语义。客户端不能覆盖采样语义。
-初始化可通过 `references` 提供至多五个唯一 ID 的 JPEG/WebP 二进制图片，
+初始化可通过 `references` 提供至多九个唯一 ID 的 JPEG/WebP/PNG 二进制图片，
 总大小至多 8 MiB；当前只支持视频、RGB24 source 和本地解码。
+测试用例保留原始全局风格图为 Picture 1，五张上下对照图为 Picture 2–6，共六张参考图。
+参考图严格保留客户端传入顺序，第一张图片就是第一张 reference；不得按 ID 排序或用 source 首帧替换。
+持续 RGB 只进入 source 编码路径，不会自动抽取首帧作为 prompt 视频上下文。
 
 等待 `session.ready` 后，按返回的单批帧数、单消息字节数和 pending 帧/字节预算发送：
 

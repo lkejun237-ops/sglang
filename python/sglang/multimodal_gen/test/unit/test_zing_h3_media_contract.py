@@ -465,19 +465,21 @@ def test_visual_encode_forwards_mode_and_preserves_seed(
     assert calls == [[1] if frames == 1 else [17] * ((frames + 16) // 17)] * 2
 
 
-def test_stream_prompt_first_frame_is_video_without_extra_vae_reference(
-    codecs, monkeypatch
+@pytest.mark.parametrize("count", [5, 9])
+def test_stream_prompt_preserves_reference_order_without_extra_video(
+    codecs, monkeypatch, count
 ):
     from contextlib import nullcontext
 
-    frame = torch.arange(3 * 32 * 32).remainder(256).byte().reshape(3, 1, 32, 32)
     seen = []
     monkeypatch.setattr(
         codecs,
         "_decode_media",
         lambda item, **kw: {
             **item,
-            "frames": torch.zeros(3, 1, 32, 32, dtype=torch.uint8),
+            "frames": torch.full(
+                (3, 1, 32, 32), int(item["id"].split("-")[1]), dtype=torch.uint8
+            ),
             "fps": 24,
         },
     )
@@ -490,16 +492,21 @@ def test_stream_prompt_first_frame_is_video_without_extra_vae_reference(
         "encode_visual",
         lambda pixels: encoded.append(pixels) or torch.zeros(1, 2, 1, 2, 2),
     )
+    request = make_request("video", references=count, source=False)
+    # Use deliberately non-sorted IDs and distinct pixels; preserve wire order.
+    request["messages"][0]["content"][1:] = reversed(
+        request["messages"][0]["content"][1:]
+    )
+    request["messages"][1]["conditions"].reverse()
     result = codecs.prepare(
-        make_request("video", references=5, source=False),
+        request,
         lambda name: nullcontext(),
         retain_condition_media=True,
-        prompt_source_frame=frame,
     )
-    assert seen[0]["type"] == "video" and seen[0]["fps"] == 24
-    assert torch.equal(seen[0]["frames"], frame)
-    frame.zero_()
-    assert seen[0]["frames"].count_nonzero() > 0
-    assert len(seen) == 6 and len(encoded) == len(result.visual) == 5
+    assert [item["id"] for item in seen] == [f"ref-{i}" for i in reversed(range(count))]
+    assert all(item["type"] == "image" for item in seen)
+    assert len(seen) == len(encoded) == len(result.visual) == count
+    assert seen[0]["frames"].eq(count - 1).all()
+    assert encoded[0].eq(count - 1).all()
     assert result.source_visual is None
     assert result.condition_media == seen

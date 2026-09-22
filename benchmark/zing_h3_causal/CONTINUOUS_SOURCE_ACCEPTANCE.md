@@ -33,8 +33,12 @@ until the active block actually finishes; it does not resume an old session.
 | Encoder pixels, bridge latents, decoder cache, source-to-output block mapping | ZingSourceStreamState in shared worker session registry | source.end drains encoder → bridge → sampler → decoder; exception/EOS/registry release invokes idempotent dispose |
 | DiT KV, prompt/static tensors and bounded ready chunk | SourceReadySession | existing dispose; window 21 / sink 3 and block-relative gap 12 |
 
-Reference IDs and order are preserved. Prompt video context remains the first
-actually appended RGB frame (832×480), not a separately pre-uploaded video.
+Reference IDs, pixels and order are preserved; the first supplied reference
+remains first in both prompt media and VAE conditions. The corrected contract
+accepts up to nine references and does not inject a source frame as prompt video.
+The GPU evidence below predates this correction and used the old injected
+prompt-only first frame. It remains historical accounting/lifecycle evidence,
+not validation of the corrected conditioning or its visual quality.
 The codec's dependency/lookahead watermark never independently grants credit:
 `bridge.accepted_pixels` is the consumed ownership watermark.
 

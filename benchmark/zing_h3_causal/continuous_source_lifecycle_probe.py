@@ -13,6 +13,8 @@ import msgpack
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from continuous_source_media import reference_payload
+
 
 CASES = [
     "invalid_sequence",
@@ -130,23 +132,15 @@ async def main(args):
                 from urllib.parse import urlparse, unquote
 
                 init["references"] = [
-                    dict(
-                        id=item["id"],
-                        format="jpeg",
-                        payload=pathlib.Path(
-                            unquote(urlparse(item["uri"]).path)
-                        ).read_bytes(),
+                    reference_payload(
+                        unquote(urlparse(item["uri"]).path), item["id"]
                     )
                     for item in case_content
                     if item["type"] == "image"
                 ]
             elif reference:
                 init["references"] = [
-                    dict(
-                        id="source-first-frame",
-                        format="jpeg",
-                        payload=pathlib.Path(args.reference).read_bytes(),
-                    )
+                    reference_payload(args.reference, "source-first-frame")
                 ]
             try:
                 item = await negotiate(ws, init, send, recv)

@@ -131,8 +131,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         )
         references = getattr(request, "references", []) or []
         require(
-            isinstance(references, list) and len(references) <= 5,
-            "Please provide at most five reference images.",
+            isinstance(references, list) and len(references) <= 9,
+            "Please provide at most nine reference images.",
         )
         seen, reference_paths, reference_bytes = set(), [], 0
         for i, ref in enumerate(references):
@@ -141,9 +141,9 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                 and isinstance(ref.get("id"), str)
                 and ref["id"]
                 and ref["id"] not in seen
-                and ref.get("format") in ("jpeg", "webp")
+                and ref.get("format") in ("jpeg", "webp", "png")
                 and isinstance(ref.get("payload"), bytes),
-                "Please provide uniquely named JPEG or WebP reference images.",
+                "Please provide uniquely named JPEG, WebP, or PNG reference images.",
             )
             seen.add(ref["id"])
             reference_bytes += len(ref["payload"])
@@ -204,7 +204,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             "max_source_message_bytes": limits.message_bytes,
             "max_pending_source_frames": limits.pending_frames,
             "max_pending_source_bytes": limits.pending_bytes,
-            "max_references": 5,
+            "max_references": 9,
             "max_reference_bytes": 8 << 20,
         }
 

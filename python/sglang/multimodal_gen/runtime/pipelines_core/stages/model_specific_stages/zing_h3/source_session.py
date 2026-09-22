@@ -52,23 +52,10 @@ class ZingSourceStreamState(BaseRealtimeState):
             "rope_max_frame_gap": sampler.rope_max_frame_gap,
             "video_decoder": stage.codecs.video_decoder_name,
         }
-        appends = batch.extra["zing_source_command"]["appends"]
-        prompt_frame = None
-        if appends:
-            first = appends[0]["payload"]
-            if first["source_frame_start"] != 0:
-                raise ValueError("The first source command must start at frame zero")
-            size = config["height"] * config["width"] * 3
-            prompt_frame = (
-                torch.frombuffer(bytearray(first["data"][:size]), dtype=torch.uint8)
-                .reshape(1, config["height"], config["width"], 3)
-                .permute(3, 0, 1, 2)
-            )
         self.inputs = stage.codecs.prepare(
             stage._build_request(batch),
             stage._use,
             retain_condition_media=True,
-            prompt_source_frame=prompt_frame,
         )
         if self.inputs.audio_shape is not None or self.inputs.source_visual is not None:
             raise ValueError("Continuous source requires a video-only static prefix")
