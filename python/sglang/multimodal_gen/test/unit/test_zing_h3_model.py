@@ -369,8 +369,11 @@ def test_request_failure_releases_session_kv(model, monkeypatch):
     )
 
 
+@pytest.mark.parametrize("encode_mode", ["deterministic", "performance"])
 @torch.no_grad()
-def test_export_and_native_loader_keep_all_tensors_and_precision(model, tmp_path):
+def test_export_and_native_loader_keep_all_tensors_and_precision(
+    model, tmp_path, encode_mode
+):
     import importlib.util
     import json
     from pathlib import Path
@@ -434,7 +437,7 @@ def test_export_and_native_loader_keep_all_tensors_and_precision(model, tmp_path
         audio_timestep_shift=3.0,
         h3_media_config={},
         condition_encoder_config=dict(output_hidden_layer=50),
-        vae_config=dict(encode_mode="deterministic"),
+        vae_config={"encode_mode": encode_mode},
     )
     yaml_path = tmp_path / "effective.yaml"
     yaml_path.write_text(yaml.safe_dump(cfg))
@@ -454,6 +457,18 @@ def test_export_and_native_loader_keep_all_tensors_and_precision(model, tmp_path
     result = export_module.export(
         checkpoint, yaml_path, components, destination, shard_bytes=4096
     )
+    assert (
+        json.loads((destination / "zing_config.json").read_text())["vae_config"][
+            "encode_mode"
+        ]
+        == encode_mode
+    )
+    invalid_cfg = {**cfg, "vae_config": {"encode_mode": "fast"}}
+    invalid_path = tmp_path / "invalid.yaml"
+    invalid_path.write_text(yaml.safe_dump(invalid_cfg))
+    with pytest.raises(ValueError, match="encode_mode"):
+        export_module.export(checkpoint, invalid_path, components, tmp_path / "invalid")
+    assert not (tmp_path / "invalid").exists()
     assert result["tensors"] == 12 * a.num_layers + 10 * a.token_refiner_num_layers + 18
     index = json.loads((destination / "model_index.json").read_text())
     assert index["video_vae"] == ["diffusers", "MiniMaxH3VideoVAE"]

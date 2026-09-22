@@ -94,8 +94,10 @@ def export(
         raise ValueError("Export requires absolute RoPE, unlimited history and no sink")
     if cfg["condition_encoder_config"]["output_hidden_layer"] != 50:
         raise ValueError("The shared H3 conditioner requires hidden_states[50]")
-    if cfg["vae_config"]["encode_mode"] != "deterministic":
-        raise ValueError("Zing dense export requires deterministic visual encoding")
+    if cfg["vae_config"]["encode_mode"] not in ("deterministic", "performance"):
+        raise ValueError(
+            "Unsupported Zing visual encode_mode; expected deterministic or performance"
+        )
     component_sources = {
         name: components / name
         for name in ("text_encoder", "tokenizer", "processor", "audio_vae")

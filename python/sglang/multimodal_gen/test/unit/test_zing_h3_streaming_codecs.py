@@ -176,14 +176,27 @@ def test_decoder_failure_dependency_and_ownership(temporal_codecs, monkeypatch):
         stream.append(z, latent_start=7, source_dependency_end=34)
 
 
-def test_source_moments_use_existing_normalization_and_precision(codecs):
+@pytest.mark.parametrize("encode_mode", ["deterministic", "performance"])
+def test_source_moments_use_existing_normalization_and_precision(codecs, encode_mode):
     model = torch.nn.Module()
     model.encoder = torch.nn.Linear(1, 1)
     model.quant_conv = torch.nn.Linear(1, 1)
     seen = []
-    model._adaptive_encode = lambda pixels: seen.append(pixels) or pixels[:, :, ::4]
+
+    def encode(pixels):
+        assert torch.backends.cudnn.benchmark == (encode_mode == "performance")
+        assert torch.backends.cudnn.deterministic == (encode_mode == "deterministic")
+        assert torch.are_deterministic_algorithms_enabled() == (
+            encode_mode == "deterministic"
+        )
+        seen.append(pixels)
+        return pixels[:, :, ::4]
+
+    model._adaptive_encode = encode
     codecs.modules = {"video_vae": model}
-    codecs.runtime = {"vae_config": {"encode_dtype": "float32"}}
+    codecs.runtime = {
+        "vae_config": {"encode_dtype": "float32", "encode_mode": encode_mode}
+    }
     pixels = torch.arange(51, dtype=torch.uint8).view(3, 17, 1, 1)
     result = codecs.encode_visual_moments(pixels)
     normalized = (

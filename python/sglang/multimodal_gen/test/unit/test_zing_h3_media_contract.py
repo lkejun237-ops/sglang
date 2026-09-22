@@ -379,3 +379,87 @@ def test_source_clip_rejected_before_decoding(codecs, clip):
     request["messages"][1]["source"]["clip"] = clip
     with pytest.raises(ValueError):
         codecs._parse_inference_request(request)
+
+
+@pytest.mark.parametrize("mode", ["deterministic", "performance"])
+@pytest.mark.parametrize("outer_deterministic", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_visual_encode_policy_restores_backend_state(mode, outer_deterministic, fail):
+    def state():
+        return (
+            torch.backends.cudnn.benchmark,
+            torch.backends.cudnn.deterministic,
+            torch.are_deterministic_algorithms_enabled(),
+            torch.is_deterministic_algorithms_warn_only_enabled(),
+        )
+
+    original = state()
+    try:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = outer_deterministic
+        torch.use_deterministic_algorithms(outer_deterministic, warn_only=True)
+        before = state()
+        try:
+            with codecs_module._visual_encode_policy(mode):
+                assert state()[:3] == (
+                    mode == "performance",
+                    mode == "deterministic",
+                    mode == "deterministic",
+                )
+                if fail:
+                    raise RuntimeError("encoder failed")
+        except RuntimeError as exc:
+            assert fail and str(exc) == "encoder failed"
+        assert state() == before
+        with (
+            pytest.raises(ValueError, match="encode_mode"),
+            codecs_module._visual_encode_policy("fast"),
+        ):
+            pytest.fail("invalid mode must not enter encoding")
+        assert state() == before
+    finally:
+        torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic = original[
+            :2
+        ]
+        torch.use_deterministic_algorithms(original[2], warn_only=original[3])
+
+
+@pytest.mark.parametrize("mode", ["deterministic", "performance"])
+@pytest.mark.parametrize("frames", [1, 17, 22])
+def test_visual_encode_forwards_mode_and_preserves_seed(
+    codecs, monkeypatch, mode, frames
+):
+    model = torch.nn.Module()
+    model.encoder = torch.nn.Linear(1, 1)
+    model.quant_conv = torch.nn.Linear(1, 1)
+    codecs.modules = {"video_vae": model}
+    codecs.runtime = {
+        "vae_config": {
+            "encode_mode": mode,
+            "encode_dtype": "float32",
+            "encode_tile_batch_size": 2,
+            "posterior_seed": 42,
+        }
+    }
+    codecs.va = SimpleNamespace(latents_mean=[0.0, 0.0], latents_std=[1.0, 1.0])
+    calls = []
+
+    def encode_clips(model, clips, batch_size):
+        assert torch.backends.cudnn.benchmark == (mode == "performance")
+        assert torch.backends.cudnn.deterministic == (mode == "deterministic")
+        assert torch.are_deterministic_algorithms_enabled() == (mode == "deterministic")
+        assert batch_size == 2
+        calls.append([clip.shape[2] for clip in clips])
+        return [
+            torch.zeros(1, 4, 1 if clip.shape[2] == 1 else 5, 1, 1) for clip in clips
+        ]
+
+    monkeypatch.setattr(codecs_module, "encode_clips", encode_clips)
+    pixels = torch.zeros(3, frames, 1, 1, dtype=torch.uint8)
+    first = codecs.encode_visual(pixels)
+    second = codecs.encode_visual(pixels)
+    assert torch.equal(first, second)
+    expected_frames = {1: 1, 17: 5, 22: 7}[frames]
+    assert first.shape == (1, 2, expected_frames, 1, 1)
+    assert first.dtype == torch.float16
+    assert calls == [[1] if frames == 1 else [17] * ((frames + 16) // 17)] * 2

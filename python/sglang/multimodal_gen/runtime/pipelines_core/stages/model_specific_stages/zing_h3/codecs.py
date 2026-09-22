@@ -24,15 +24,21 @@ from .visual_encoding import encode_clips
 
 
 @contextmanager
-def _visual_encode_policy():
+def _visual_encode_policy(mode):
+    if mode not in ("deterministic", "performance"):
+        raise ValueError(
+            "Unsupported Zing visual encode_mode; expected deterministic or performance"
+        )
+    deterministic = mode == "deterministic"
     saved = (
         torch.backends.cudnn.benchmark,
         torch.backends.cudnn.deterministic,
         torch.are_deterministic_algorithms_enabled(),
         torch.is_deterministic_algorithms_warn_only_enabled(),
     )
-    torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic = False, True
-    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = not deterministic
+    torch.backends.cudnn.deterministic = deterministic
+    torch.use_deterministic_algorithms(deterministic)
     try:
         yield
     finally:
@@ -169,7 +175,7 @@ class ZingH3Codecs(ZingH3MediaInput):
                 ),
                 2,
             )
-        with _visual_encode_policy():
+        with _visual_encode_policy(self.runtime["vae_config"]["encode_mode"]):
             moments = torch.cat(
                 encode_clips(
                     model,
@@ -208,7 +214,7 @@ class ZingH3Codecs(ZingH3MediaInput):
         pixels = frames[None].to(device=device, dtype=dtype).div(255)
         mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
         std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
-        with _visual_encode_policy():
+        with _visual_encode_policy(self.runtime["vae_config"]["encode_mode"]):
             return model._adaptive_encode((pixels - mean) / std)
 
     def sample_streaming_visual_moments(self, moments, *, latent_start, noise_version):
