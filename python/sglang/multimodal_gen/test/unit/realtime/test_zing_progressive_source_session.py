@@ -354,7 +354,7 @@ def test_progressive_append_and_finish_hold_declared_vae_component():
 
 
 @pytest.mark.parametrize("explicit_video", [False, True])
-def test_source_rgb_is_not_injected_into_prompt_context(explicit_video):
+def test_source_s0_uses_memory_unless_video_is_explicit(explicit_video):
     request = {
         "messages": [
             {
@@ -386,6 +386,7 @@ def test_source_rgb_is_not_injected_into_prompt_context(explicit_video):
         sampling_params=NS(),
         extra={
             "zing_source_command": {
+                "source_preview": not explicit_video,
                 "appends": [
                     {
                         "payload": {
@@ -393,14 +394,29 @@ def test_source_rgb_is_not_injected_into_prompt_context(explicit_video):
                             "data": bytes([17] * (32 * 32 * 3)),
                         }
                     }
-                ]
+                ],
             }
         },
     )
     with pytest.raises(RuntimeError, match="stop after prompt preparation"):
-        ZingSourceStreamState().initialize(stage, batch, {"width": 32, "height": 32})
+        ZingSourceStreamState().initialize(
+            stage, batch, {"width": 32, "height": 32, "fps": 24}
+        )
     assert seen["request"] is request
     assert "prompt_source_frame" not in seen
+    media = seen["source_preview"]
+    if explicit_video:
+        assert media is None
+    else:
+        assert media["type"] == "video" and media["id"] == "<Video 1>"
+        assert media["clip"] == {"start": 0, "end": 0} and media["fps"] == 24
+        assert "uri" not in media
+        assert media["frames"].shape == (3, 1, 32, 32)
+        assert media["frames"].dtype == torch.uint8
+        assert torch.all(media["frames"] == 17)
+        assert batch.extra["zing_source_command"]["appends"][0]["payload"][
+            "data"
+        ] == bytes([17] * 3072)
 
 
 @pytest.mark.parametrize("rank", [0, 1])

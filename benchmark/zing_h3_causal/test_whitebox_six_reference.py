@@ -5,10 +5,8 @@ import hashlib
 import json
 import re
 
-import pytest
-
 import prepare_whitebox_video_smoke as smoke
-
+import pytest
 
 CASE_ID = "zing-whitebox-video-five-triview-0001"
 
@@ -135,3 +133,23 @@ def test_keep_remote_request_is_valid_json(tmp_path):
     assert restored["messages"][1]["source"]["uri"].startswith(
         "s3://leap-worldmodel-thailand/"
     )
+
+
+def test_source_preview_profile_has_separate_identity_and_same_six_references():
+    baseline = smoke.load_cases(smoke.DEFAULT_MANIFEST)[CASE_ID]
+    profile_id = "zing-whitebox-video-source-first-frame-six-reference-0001"
+    manifest = smoke.DEFAULT_MANIFEST.with_name("source_preview_cases.jsonl")
+    profile = smoke.load_cases(manifest)[profile_id]
+    assert profile_id not in smoke.load_cases(smoke.DEFAULT_MANIFEST)
+    assert "source_preview" not in profile
+    assert "source_preview" not in baseline
+    assert [x["type"] for x in profile["messages"][0]["content"]] == ["image"] * 6 + [
+        "text"
+    ]
+    assert (
+        profile["messages"][0]["content"][-1] == baseline["messages"][0]["content"][-1]
+    )
+    assert profile["messages"][1]["conditions"] == baseline["messages"][1]["conditions"]
+    assert sorted(
+        a["sha256"] for a in smoke.expected_assets(profile).values()
+    ) == sorted(a["sha256"] for a in smoke.expected_assets(baseline).values())

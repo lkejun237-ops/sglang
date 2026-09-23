@@ -34,6 +34,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         return None  # Initialized atomically after negotiation validation.
 
     async def on_init(self, session, request):
+        self.init_started_ns = time.time_ns()
         args = get_global_server_args()
         require(
             getattr(args, "realtime_vae_backend", "local") == "local"
@@ -47,6 +48,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         )
         for name in (
             "zing_request",
+            "prompt_video_frame",
+            "source_preview",
             "first_frame",
             "video_path",
             "video_url",
@@ -102,7 +105,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             (Path(args.model_path) / "zing_realtime_profile.json").read_text()
         )
         require(
-            profile.get("model_config_sha256")
+            runtime.get("causal") is True
+            and profile.get("model_config_sha256")
             == hashlib.sha256(config_bytes).hexdigest()
             and profile.get("solver") == "few_step"
             and isinstance(profile.get("denoising_step_list"), list)
@@ -132,71 +136,97 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             "This session requires the full output dimensions.",
         )
         references = getattr(request, "references", []) or []
+        media = getattr(request, "user_media", None)
         require(
-            isinstance(references, list) and len(references) <= 9,
-            "Please provide at most nine reference images.",
+            media is None or not references,
+            "Please use either user media or reference images.",
         )
-        seen, reference_paths, reference_bytes = set(), [], 0
-        for i, ref in enumerate(references):
+        if media is None:
             require(
-                isinstance(ref, dict)
-                and isinstance(ref.get("id"), str)
-                and ref["id"]
-                and ref["id"] not in seen
-                and ref.get("format") in ("jpeg", "webp", "png")
-                and isinstance(ref.get("payload"), bytes),
-                "Please provide uniquely named JPEG, WebP, or PNG reference images.",
+                isinstance(references, list) and len(references) <= 9,
+                "Please provide at most nine reference images.",
             )
-            seen.add(ref["id"])
-            reference_bytes += len(ref["payload"])
-            require(reference_bytes <= 8 << 20, "The reference images are too large.")
-            with Image.open(io.BytesIO(ref["payload"])) as image:
+            media = [dict(ref, type="image", reference=True) for ref in references]
+        require(
+            isinstance(media, list) and len(media) <= 10,
+            "Please provide at most ten media items.",
+        )
+        # The causal source contract supplies Video 1 automatically. Explicit
+        # typed video media already defines presentation (including an independent
+        # preview), so preserve it instead of adding or replacing it.
+        self.auto_source_preview = not any(
+            isinstance(item, dict) and item.get("type") == "video" for item in media
+        )
+        require(
+            len(media) + int(self.auto_source_preview) <= 10,
+            "Please provide at most ten media items including source preview.",
+        )
+        seen, reference_paths, media_bytes = set(), [], 0
+        self.user_media, self.reference_items = [], []
+        for i, item in enumerate(media):
+            require(
+                isinstance(item, dict)
+                and not set(item)
+                - {"type", "id", "format", "payload", "clip", "fps", "reference"}
+                and item.get("type") in ("image", "video")
+                and isinstance(item.get("id"), str)
+                and item["id"]
+                and item["id"] not in seen
+                and item.get("format") in ("jpeg", "webp", "png")
+                and isinstance(item.get("payload"), bytes)
+                and type(item.get("reference", False)) is bool,
+                "Please provide uniquely named image or video media with supported image bytes.",
+            )
+            video = item["type"] == "video"
+            require(
+                not video
+                or (
+                    item.get("clip") == dict(start=0, end=0)
+                    and all(
+                        type(value) in (int, float) for value in item["clip"].values()
+                    )
+                    and type(item.get("fps")) in (int, float)
+                    and 0 < item["fps"] <= 240
+                    and not item.get("reference", False)
+                ),
+                "Please provide a single-frame video with its frame rate and zero-time clip.",
+            )
+            require(
+                video or not ({"clip", "fps"} & set(item)),
+                "Image media cannot have a video timeline.",
+            )
+            require(
+                not self.auto_source_preview or item["id"] != "<Video 1>",
+                "Please use a different name for this image.",
+            )
+            seen.add(item["id"])
+            media_bytes += len(item["payload"])
+            require(media_bytes <= 8 << 20, "The reference images are too large.")
+            with Image.open(io.BytesIO(item["payload"])) as image:
                 require(
-                    image.format.lower() == ref["format"]
+                    image.format.lower() == item["format"]
                     and image.width * image.height <= 16_777_216,
                     "The reference image format or dimensions are not supported.",
                 )
                 image.verify()
             if session.input_temp_dir is None:
                 session.input_temp_dir = tempfile.mkdtemp(prefix="sglang_zing_source_")
-            path = Path(session.input_temp_dir) / f"reference-{i}.{ref['format']}"
-            path.write_bytes(ref["payload"])
-            reference_paths.append(str(path))
-        self.reference_items = [
-            dict(type="image", id=ref["id"], uri=path)
-            for ref, path in zip(references, reference_paths)
-        ]
-        # Prompt-only source snapshot: never an aligned source or a sixth
-        # visual reference. Video semantics preserve the original prompt IDs.
-        self.prompt_video = None
-        frame = getattr(request, "prompt_video_frame", None)
-        if frame is not None:
-            require(
-                isinstance(frame, dict)
-                and isinstance(frame.get("id"), str)
-                and frame["id"]
-                and frame["id"] not in seen
-                and frame.get("format") == "png"
-                and isinstance(frame.get("payload"), bytes),
-                "Please provide a uniquely named PNG prompt video frame.",
-            )
-            require(
-                reference_bytes + len(frame["payload"]) <= 8 << 20,
-                "The reference images are too large.",
-            )
-            with Image.open(io.BytesIO(frame["payload"])) as image:
-                require(
-                    image.format == "PNG" and image.width * image.height <= 16_777_216,
-                    "The reference image format or dimensions are not supported.",
+            path = Path(session.input_temp_dir) / f"media-{i}.{item['format']}"
+            path.write_bytes(item["payload"])
+            descriptor = dict(type=item["type"], id=item["id"], uri=str(path))
+            if video:
+                descriptor.update(
+                    clip=dict(start=0, end=0), presentation_fps=item["fps"]
                 )
-                image.verify()
-            if session.input_temp_dir is None:
-                session.input_temp_dir = tempfile.mkdtemp(prefix="sglang_zing_source_")
-            path = Path(session.input_temp_dir) / "prompt-video-frame.png"
-            path.write_bytes(frame["payload"])
-            self.prompt_video = dict(
-                type="video", id=frame["id"], uri=str(path), clip=dict(start=0, end=0)
-            )
+            self.user_media.append(descriptor)
+            if item.get("reference", False):
+                self.reference_items.append(descriptor)
+                reference_paths.append(str(path))
+        require(
+            len(self.reference_items) <= 9,
+            "Please provide at most nine reference images.",
+        )
+        self.source_preview_sha256 = None
         clip = int(args.pipeline_config.vae_config.arch_config.vae_clip_length)
         require(
             clip * width * height * 3 + 4096 <= 32 << 20,
@@ -220,7 +250,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         self.pending, self.available = deque(), asyncio.Event()
         self.pending_frames, self.end, self.end_dispatched = 0, None, False
         self.clip, self.reference_paths, self.profile = clip, reference_paths, profile
-        self.reference_ids = [ref["id"] for ref in references]
+        self.reference_ids = [ref["id"] for ref in self.reference_items]
         self.source_encoder = profile.get("source_encoder", default_source_encoder())
         self.first_source_received_unix_ns = None
         self.pending_prompt = None
@@ -245,7 +275,9 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             "max_pending_source_bytes": limits.pending_bytes,
             "max_references": 9,
             "max_reference_bytes": 8 << 20,
-            "prompt_video_frame_format": "png",
+            "user_media_formats": ["jpeg", "webp", "png"],
+            "max_user_media": 10,
+            "user_media_video_clip": {"start": 0, "end": 0},
         }
 
     def session_ready_message(self, session):
@@ -264,6 +296,13 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             )
             if self.first_source_received_unix_ns is None:
                 self.first_source_received_unix_ns = received_ns
+                if self.auto_source_preview:
+                    # Observe S0 without encoding it or creating a second transport.
+                    # The worker reads it from the original accepted append bytes.
+                    frame_bytes = self.config["width"] * self.config["height"] * 3
+                    self.source_preview_sha256 = hashlib.sha256(
+                        payload["data"][:frame_bytes]
+                    ).hexdigest()
             # Only expose work after accepted is on the same serialized writer.
             await ws.send_bytes(msgspec.msgpack.encode(record.message()))
             self.pending.append(
@@ -307,8 +346,14 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         # Progressive readiness belongs to the codec, never a transport packet
         # size. Keep the original collection policy only for the explicit A/B
         # baseline selected in the deployment profile.
-        minimum = 1 if self.source_encoder["mode"] == "progressive" else self.clip
+        minimum = (
+            1
+            if self.auto_source_preview or self.source_encoder["mode"] == "progressive"
+            else self.clip
+        )
         while self.pending_frames < minimum and self.end is None:
+            if self.ledger.closed:
+                raise asyncio.CancelledError("Source session has closed")
             self.available.clear()
             await self.available.wait()
 
@@ -336,11 +381,9 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             chunk_size=chunk_size,
         )
         params.image_path = self.reference_paths
-        # Only locally validated files enter the internal canonical request.
+        # Only locally validated media enter the internal canonical request.
         # The wire API still rejects arbitrary zing_request/source objects.
-        content = ([self.prompt_video] if self.prompt_video else []) + list(
-            self.reference_items
-        )
+        content = list(self.user_media)
         content.append(dict(type="text", text=chunk_inputs.prompt))
         params.zing_request = dict(
             messages=[
@@ -397,6 +440,13 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             end=end,
             encoder=self.source_encoder,
             first_source_received_unix_ns=self.first_source_received_unix_ns,
+            source_preview=self.auto_source_preview,
+            source_preview_sha256=self.source_preview_sha256,
+            source_wait_host_ms=(
+                (self.first_source_received_unix_ns - self.init_started_ns) / 1e6
+                if self.first_source_received_unix_ns is not None
+                else None
+            ),
             dispatch_unix_ns=time.time_ns(),
             measure_cuda=self.profile.get("measure_source_cuda", False),
         )
@@ -446,4 +496,5 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             self.reference_paths.clear()
             self.reference_items.clear()
             self.reference_ids.clear()
-            self.prompt_video = None
+            self.source_preview_sha256 = None
+            self.user_media.clear()

@@ -361,6 +361,33 @@ class ZingH3MediaInput:
                 "H3 inference target must be a URI-free image, video or video_audio output descriptor"
             )
         self._inference_geometry(target)
+        if "source_preview" in request:
+            raise ValueError("Source presentation is derived automatically from source")
+        source_descriptor = target_message.get("source")
+        # Native canonical requests already declare their presentation media.
+        # For causal source-only requests, reproduce the training converter's
+        # source video + zero-time clip; never infer this role from an image.
+        if (
+            self.runtime.get("causal", False)
+            and target["type"] in {"video", "video_audio"}
+            and isinstance(source_descriptor, dict)
+            and source_descriptor.get("type") == "video"
+            and not any(
+                isinstance(item, dict) and item.get("type") in {"video", "video_audio"}
+                for item in user_content
+            )
+        ):
+            if source_descriptor.get("clip") is not None:
+                raise ValueError("Clipped source requires explicit video presentation")
+            user_content = [
+                dict(
+                    type="video",
+                    id="<Video 1>",
+                    uri=source_descriptor.get("uri"),
+                    clip=dict(start=0, end=0),
+                ),
+                *user_content,
+            ]
         media = []
         for index, item in enumerate(user_content):
             if not isinstance(item, dict):
@@ -558,6 +585,25 @@ class ZingH3MediaInput:
                         frame = next(container.decode(video=0)).to_rgb().to_ndarray()
                 frames, fps = frame[None], 1.0
             elif item["type"] in {"video", "video_audio"}:
+                if "presentation_fps" in item:
+                    rate = item["presentation_fps"]
+                    if (
+                        type(rate) not in (int, float)
+                        or not 0 < rate <= 240
+                        or (start, end) != (0, 0)
+                    ):
+                        raise ValueError(
+                            "Single-frame video requires a valid presentation rate and zero-time clip"
+                        )
+                    with Image.open(path) as image:
+                        frames = np.array(
+                            image.convert("RGB"), dtype=np.uint8, copy=True
+                        )[None]
+                    result["frames"] = torch.from_numpy(frames).permute(3, 0, 1, 2)
+                    result["fps"] = float(rate)
+                    if need_audio:
+                        raise ValueError("Single-frame video cannot provide audio")
+                    return result
                 with av.open(path) as container:
                     stream = container.streams.video[0]
                     fps = float(stream.average_rate or stream.base_rate)

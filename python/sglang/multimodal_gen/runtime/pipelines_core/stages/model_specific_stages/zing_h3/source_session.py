@@ -1,16 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Worker-owned continuous RGB session; reuse codec and source-ready kernels."""
 
-import time
 import json
 import os
+import time
 from collections import deque
 from contextlib import contextmanager, nullcontext
 
-import torch
 import psutil
-
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+import torch
 
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.realtime.session import BaseRealtimeState
@@ -20,6 +18,7 @@ from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
     SourceLimits,
     default_source_encoder,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 from .incremental import SourceReadySession
 from .source_bridge import SourceChunkBridge
@@ -54,10 +53,40 @@ class ZingSourceStreamState(BaseRealtimeState):
             "rope_max_frame_gap": sampler.rope_max_frame_gap,
             "video_decoder": stage.codecs.video_decoder_name,
         }
+        self.qwen_init_host_ms = None
+
+        @contextmanager
+        def prepare_use(name):
+            start = time.perf_counter()
+            with stage._use(name) as component:
+                yield component
+            if name == "text_encoder":
+                # Includes weight activation and condition encoding; host duration
+                # does not imply CUDA completion.
+                self.qwen_init_host_ms = (time.perf_counter() - start) * 1000
+
+        source_preview = None
+        command = batch.extra["zing_source_command"]
+        if command.get("source_preview", False):
+            # Read S0 from the same accepted bytes later fed to the source VAE.
+            # This bounded CPU tensor crosses neither a file nor a second IPC.
+            payload = command["appends"][0]["payload"]
+            width, height = config["width"], config["height"]
+            pixels = torch.frombuffer(
+                bytearray(payload["data"][: width * height * 3]), dtype=torch.uint8
+            ).reshape(height, width, 3)
+            source_preview = dict(
+                type="video",
+                id="<Video 1>",
+                clip=dict(start=0, end=0),
+                frames=pixels.permute(2, 0, 1).unsqueeze(1),
+                fps=float(config["fps"]),
+            )
         self.inputs = stage.codecs.prepare(
             stage._build_request(batch),
-            stage._use,
+            prepare_use,
             retain_condition_media=True,
+            source_preview=source_preview,
         )
         if self.inputs.audio_shape is not None or self.inputs.source_visual is not None:
             raise ValueError("Continuous source requires a video-only static prefix")
@@ -134,6 +163,8 @@ class ZingSourceStreamState(BaseRealtimeState):
                 config["limits"] = SourceLimits(**config["limits"])
                 with timed("prepare_host_ms"):
                     self.initialize(stage, batch, config)
+                if self.qwen_init_host_ms is not None:
+                    timings["qwen_init_host_ms"] = self.qwen_init_host_ms
             if (
                 batch.sampling_params.prompt != self.prompt
                 or batch.realtime_event_id != self.prompt_event
@@ -287,6 +318,12 @@ class ZingSourceStreamState(BaseRealtimeState):
                             "first_source_received_unix_ns"
                         ),
                         "dispatch_unix_ns": command.get("dispatch_unix_ns"),
+                        "source_preview": command.get("source_preview", False),
+                        "source_wait_host_ms": command.get("source_wait_host_ms"),
+                        "source_preview_rgb_sha256": command.get(
+                            "source_preview_sha256"
+                        ),
+                        "source_fps": self.ledger.fps,
                         "measure_cuda": measure_cuda,
                         "policy": self.policy,
                         "memory": memory,

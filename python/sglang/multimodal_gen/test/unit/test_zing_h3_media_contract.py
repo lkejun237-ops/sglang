@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
 @pytest.fixture
 def codecs():
     instance = object.__new__(codecs_module.ZingH3Codecs)
+    instance.runtime = {}
     instance.spatial_ratio = 16
     instance.patch_size = (1, 2, 2)
     instance.temporal_ratio = 4
@@ -613,20 +614,23 @@ def test_explicit_single_frame_video_contract(codecs, temporal_patch, kinds):
     assert all(torch.equal(item["frames"], pixels) for item in media)
 
 
-@pytest.mark.parametrize("preview_uri", ["source", "independent-target"])
+@pytest.mark.parametrize("preview_uri", ["source", "independent-target", "auto"])
 def test_explicit_preview_does_not_enter_source_or_reference_vae(
     codecs, monkeypatch, preview_uri
 ):
     request = make_request("video", references=1)
-    request["messages"][0]["content"].insert(
-        0,
-        {
-            "id": "preview",
-            "type": "video",
-            "uri": preview_uri,
-            "clip": {"start": 0, "end": 0},
-        },
-    )
+    if preview_uri == "auto":
+        codecs.runtime = {"causal": True}
+    else:
+        request["messages"][0]["content"].insert(
+            0,
+            {
+                "id": "preview",
+                "type": "video",
+                "uri": preview_uri,
+                "clip": {"start": 0, "end": 0},
+            },
+        )
     seen, vae = {}, []
 
     def decode(item, **kwargs):
@@ -655,10 +659,164 @@ def test_explicit_preview_does_not_enter_source_or_reference_vae(
         yield
 
     result = codecs.prepare(request, use, retain_condition_media=True)
-    assert [item["id"] for item in seen["media"]] == ["preview", "ref-0"]
+    preview_id = "<Video 1>" if preview_uri == "auto" else "preview"
+    assert [item["id"] for item in seen["media"]] == [preview_id, "ref-0"]
     assert seen["media"][0]["type"] == "video"
     assert seen["media"][0]["frames"].shape[1] == 1
     assert len(vae) == 2 and [frames.shape[1] for frames in vae] == [1, 125]
     assert all(torch.all(frames == 23) for frames in vae)
     assert list(result.visual) == ["ref-0"]
     assert [item["content_id"] for item in result.conditions] == ["ref-0"]
+
+
+def test_ar_source_preview_is_explicit_and_preserves_full_source(codecs):
+    codecs.runtime = {"causal": True}
+    request = make_request("video", references=6)
+    _, media, _, conditions, source = codecs._parse_inference_request(request)
+    assert media[0] == dict(
+        type="video", id="<Video 1>", uri="source", clip=dict(start=0, end=0)
+    )
+    assert len(media) == 7 and len(conditions) == 6
+    assert source == dict(type="video", uri="source")
+    assert len(request["messages"][0]["content"]) == 7  # caller unmodified
+    codecs.runtime["causal"] = False
+    assert len(codecs._parse_inference_request(request)[1]) == 6
+
+
+@pytest.mark.parametrize("variant", ["bidirectional", "image", "no_source", "explicit"])
+def test_automatic_presentation_preserves_other_request_contracts(codecs, variant):
+    codecs.runtime = {"causal": variant != "bidirectional"}
+    request = make_request(
+        "image" if variant == "image" else "video", source=variant != "no_source"
+    )
+    if variant == "explicit":
+        request["messages"][0]["content"].insert(
+            0, dict(type="video", id="v", uri="independent", clip=dict(start=0, end=0))
+        )
+    _, media, _, _, _ = codecs._parse_inference_request(request)
+    assert len(media) == int(variant == "explicit")
+    if media:
+        assert media[0]["id"] == "v" and media[0]["uri"] == "independent"
+
+
+def test_removed_preview_field_and_ambiguous_clipped_source_are_rejected(codecs):
+    codecs.runtime = {"causal": True}
+    request = make_request("video")
+    request["source_preview"] = "ar-first-frame"
+    with pytest.raises(ValueError, match="automatically"):
+        codecs._parse_inference_request(request)
+    request.pop("source_preview")
+    request["messages"][1]["source"]["clip"] = dict(start=0, end=1)
+    with pytest.raises(ValueError, match="explicit video"):
+        codecs._parse_inference_request(request)
+
+
+def test_still_video_preserves_declared_fps_and_pixels(codecs, tmp_path):
+    from PIL import Image
+
+    path = tmp_path / "frame.png"
+    Image.new("RGB", (32, 48), (17, 42, 91)).save(path)
+    codecs.remote_read_fs = None
+    item = codecs._decode_media(
+        dict(
+            type="video",
+            id="v",
+            uri=str(path),
+            clip=dict(start=0, end=0),
+            presentation_fps=23.976,
+        ),
+        need_audio=False,
+    )
+    assert item["fps"] == 23.976
+    assert tuple(item["frames"].shape) == (3, 1, 48, 32)
+    assert item["frames"][:, 0, 0, 0].tolist() == [17, 42, 91]
+
+
+def test_real_decode_explicit_auto_and_stream_snapshot_agree(codecs, tmp_path):
+    """Real lossless decode, not a learned-feature or real-processor claim."""
+    import av
+    import numpy as np
+    from PIL import Image
+
+    video = tmp_path / "source.mkv"
+    original = np.arange(32 * 32 * 3, dtype=np.uint8).reshape(32, 32, 3)
+    with av.open(str(video), "w") as container:
+        stream = container.add_stream("ffv1", rate=24)
+        stream.width, stream.height, stream.pix_fmt = 32, 32, "bgr0"
+        for rgb in (original, 255 - original, np.zeros_like(original)):
+            for packet in stream.encode(
+                av.VideoFrame.from_ndarray(rgb, format="rgb24")
+            ):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    codecs.remote_read_fs = None
+    codecs.runtime = {"causal": True}
+    request = make_request("video")
+    request["messages"][1]["source"]["uri"] = str(video)
+    _, automatic, _, _, source = codecs._parse_inference_request(request)
+    explicit = dict(
+        type="video", id="<Video 1>", uri=str(video), clip=dict(start=0, end=0)
+    )
+    auto = codecs._decode_media(automatic[0], need_audio=False)
+    native_descriptor = codecs._decode_media(explicit, need_audio=False)
+    full = codecs._decode_media(source, need_audio=False)
+    snapshot = tmp_path / "s0.png"
+    Image.fromarray(original).save(snapshot)
+    streamed = codecs._decode_media(
+        dict(explicit, uri=str(snapshot), presentation_fps=24), need_audio=False
+    )
+    assert full["frames"].shape[1] == 3
+    for candidate in (auto, native_descriptor, streamed):
+        assert candidate["fps"] == 24
+        assert candidate["type"] == "video"
+        assert candidate["clip"] == dict(start=0, end=0)
+        assert torch.equal(candidate["frames"], full["frames"][:, :1])
+
+
+@pytest.mark.parametrize("references", [0, 6])
+def test_in_memory_source_presentation_is_not_a_vae_reference(
+    codecs, monkeypatch, references
+):
+    request = make_request("video", references=references, source=False)
+    seen = {}
+    preview = dict(
+        type="video",
+        id="<Video 1>",
+        clip=dict(start=0, end=0),
+        frames=torch.full((3, 1, 32, 32), 17, dtype=torch.uint8),
+        fps=24.0,
+    )
+    monkeypatch.setattr(
+        codecs,
+        "_decode_media",
+        lambda item, **kw: dict(
+            item, frames=torch.full((3, 1, 32, 32), 23, dtype=torch.uint8), fps=1.0
+        ),
+    )
+
+    def condition(prompt, media):
+        seen["media"] = media
+        return {}
+
+    vae = []
+
+    def visual(frames):
+        vae.append(frames.clone())
+        return torch.zeros(1, 2, 1, 2, 2)
+
+    monkeypatch.setattr(codecs, "encode_condition", condition)
+    monkeypatch.setattr(codecs, "encode_visual", visual)
+
+    @contextmanager
+    def use(name):
+        yield
+
+    result = codecs.prepare(
+        request, use, source_preview=preview, retain_condition_media=True
+    )
+    assert seen["media"][0] is preview and result.condition_media[0] is preview
+    assert [x["type"] for x in seen["media"]] == ["video"] + ["image"] * references
+    assert len(vae) == references and all(torch.all(x == 23) for x in vae)
+    assert len(result.conditions) == references and result.source_visual is None
+    assert torch.all(preview["frames"] == 17) and preview["frames"].shape[1] == 1

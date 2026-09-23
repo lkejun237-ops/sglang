@@ -262,6 +262,7 @@ class ZingH3Codecs(ZingH3MediaInput):
         use_component,
         *,
         retain_condition_media=False,
+        source_preview=None,
     ):
         # Reuse decoded references for prompt refreshes; offline calls release them.
         if isinstance(request, dict) and "cache_uri" in request:
@@ -280,6 +281,14 @@ class ZingH3Codecs(ZingH3MediaInput):
             self._decode_media(item, need_audio=item["id"] in audio_ids)
             for item in items
         ]
+        if source_preview is not None:
+            # Internal decoded S0 from the accepted source command, never wire
+            # media or a URI. Keep it on the Qwen track, outside VAE conditions.
+            if any(item["type"] in {"video", "video_audio"} for item in items) or any(
+                item["id"] == source_preview["id"] for item in items
+            ):
+                raise ValueError("Source presentation conflicts with explicit media")
+            media.insert(0, source_preview)
         source = (
             None if source is None else self._decode_media(source, need_audio=False)
         )

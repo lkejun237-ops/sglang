@@ -29,7 +29,7 @@ from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
 
 @pytest.fixture
 def configured(tmp_path, monkeypatch):
-    raw = json.dumps({"h3_media_config": {"fps": 24}}).encode()
+    raw = json.dumps({"causal": True, "h3_media_config": {"fps": 24}}).encode()
     (tmp_path / "zing_config.json").write_bytes(raw)
     (tmp_path / "zing_realtime_profile.json").write_text(
         json.dumps(
@@ -102,12 +102,14 @@ def test_reject_mixed_protocol_or_profile(configured, overrides):
 def test_default_encoder_dispatches_first_frame(configured):
     adapter, session = initialize()
     assert adapter.source_encoder["mode"] == "progressive"
-    assert adapter.source_encoder["factory"].endswith("progressive_encoder:create_session")
+    assert adapter.source_encoder["factory"].endswith(
+        "progressive_encoder:create_session"
+    )
     adapter.pending_frames = 1
     asyncio.run(asyncio.wait_for(adapter.wait_for_next_chunk(session), 1))
 
 
-def test_explicit_clip17_waits_for_full_clip(configured):
+def test_source_presentation_dispatches_one_frame_even_with_clip17_encoder(configured):
     from pathlib import Path
 
     path = Path(configured.model_path) / "zing_realtime_profile.json"
@@ -121,9 +123,7 @@ def test_explicit_clip17_waits_for_full_clip(configured):
         adapter.pending_frames = 1
         waiter = asyncio.create_task(adapter.wait_for_next_chunk(session))
         await asyncio.sleep(0)
-        assert not waiter.done()
-        adapter.pending_frames = 17
-        adapter.available.set()
+        assert waiter.done()
         await asyncio.wait_for(waiter, 1)
 
     asyncio.run(run())
@@ -230,10 +230,9 @@ def test_source_provenance_survives_transport_splitting(output_format):
     assert cursor == stats["num_frames"] == 17
 
 
-def test_explicit_prompt_video_preserves_reference_ids(
-    configured, monkeypatch
-):
+def test_explicit_prompt_video_preserves_reference_ids(configured, monkeypatch):
     import io
+
     from PIL import Image
 
     data = io.BytesIO()
@@ -245,8 +244,17 @@ def test_explicit_prompt_video_preserves_reference_ids(
     frame = io.BytesIO()
     Image.new("RGB", (32, 32)).save(frame, format="PNG")
     adapter, session = initialize(
-        references=refs,
-        prompt_video_frame=dict(id="<Video 1>", format="png", payload=frame.getvalue()),
+        user_media=[
+            dict(
+                type="video",
+                id="<Video 1>",
+                format="png",
+                payload=frame.getvalue(),
+                fps=24,
+                clip=dict(start=0, end=0),
+            ),
+            *[dict(ref, type="image", reference=True) for ref in refs],
+        ],
     )
     assert adapter.ready["max_references"] == 9
     assert adapter.ready["max_reference_bytes"] == 8 << 20
@@ -273,7 +281,8 @@ def test_explicit_prompt_video_preserves_reference_ids(
     with av.open(user["content"][0]["uri"]) as container:
         assert len(list(container.decode(video=0))) == 1
     adapter.clear_state(session)
-    assert not adapter.reference_items and adapter.prompt_video is None
+    assert not adapter.reference_items and adapter.source_preview_sha256 is None
+    assert not adapter.auto_source_preview
 
 
 def test_reference_bytes_remain_bounded(configured):
@@ -283,22 +292,33 @@ def test_reference_bytes_remain_bounded(configured):
         )
 
 
-def test_prompt_video_frame_cannot_duplicate_reference_id(configured):
+def test_typed_media_cannot_duplicate_reference_id(configured):
     import io
+
     from PIL import Image
 
     data = io.BytesIO()
     Image.new("RGB", (32, 32)).save(data, format="JPEG")
-    with pytest.raises(ValueError, match="uniquely named PNG"):
+    with pytest.raises(ValueError, match="uniquely named"):
         initialize(
-            references=[dict(id="same", format="jpeg", payload=data.getvalue())],
-            prompt_video_frame=dict(id="same", format="png", payload=b""),
+            user_media=[
+                dict(type="image", id="same", format="jpeg", payload=data.getvalue()),
+                dict(
+                    type="video",
+                    id="same",
+                    format="png",
+                    payload=b"",
+                    fps=24,
+                    clip=dict(start=0, end=0),
+                ),
+            ],
         )
 
 
 def test_nine_references_are_preserved_and_ten_rejected(configured):
     import io
     from pathlib import Path
+
     from PIL import Image
 
     refs = []
@@ -324,3 +344,130 @@ def test_nine_references_are_preserved_and_ten_rejected(configured):
     shutil.rmtree(directory)
     with pytest.raises(ValueError, match="at most nine"):
         initialize(references=refs)
+
+
+@pytest.mark.parametrize("parts", [(1, 3), (3, 1), (2, 2)])
+def test_source_preview_uses_s0_once_without_consuming_credit(configured, parts):
+    adapter, session = initialize()
+    assert "source_preview" not in adapter.ready
+    assert adapter.auto_source_preview
+    assert adapter.source_preview_sha256 is None
+    assert "prompt_video_frame_format" not in adapter.ready
+
+    class Socket:
+        async def send_bytes(self, payload):
+            pass
+
+    async def run():
+        start = 0
+        preview = None
+        for seq, count in enumerate(parts):
+            payload = dict(
+                client_seq=seq,
+                source_frame_start=start,
+                num_frames=count,
+                pts_us=start * 1_000_000 // 24,
+                data=b"".join(
+                    bytes([i + 10]) * (32 * 32 * 3) for i in range(start, start + count)
+                ),
+            )
+            await adapter.ingest_wire_event(
+                Socket(),
+                session,
+                dict(
+                    type="event",
+                    kind="source.append",
+                    event_id=seq + 1,
+                    payload=payload,
+                ),
+                len(payload["data"]) + 200,
+            )
+            await asyncio.wait_for(adapter.wait_for_next_chunk(session), 1)
+            if preview is None:
+                preview = adapter.source_preview_sha256
+            assert adapter.source_preview_sha256 == preview
+            assert adapter.pending[-1]["payload"] is payload
+            start += count
+            await asyncio.sleep(0)  # paused producer resumes with the same S0
+        assert adapter.ledger.accepted_frames == sum(parts)
+        assert adapter.ledger.consumed_frames == 0
+        assert (
+            adapter.source_preview_sha256
+            == hashlib.sha256(bytes([10]) * 3072).hexdigest()
+        )
+        assert session.input_temp_dir is None  # S0 stays in the original append.
+        assert adapter.reference_items == []
+
+    asyncio.run(run())
+    adapter.dispose(session)
+    assert adapter.source_preview_sha256 is None
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"source_preview": "ar-first-frame"},
+        {"source_preview": "guess"},
+        {"prompt_video_frame": {}},
+        {"user_media": [{"type": "video", "id": "v", "uri": "/etc/passwd"}]},
+    ],
+)
+def test_removed_preview_options_and_unsafe_media_are_rejected(configured, kwargs):
+    with pytest.raises(ValueError):
+        initialize(**kwargs)
+
+
+def test_source_preview_reserves_video_id_for_automatic_media(configured):
+    with pytest.raises(ValueError, match="different name"):
+        initialize(references=[dict(id="<Video 1>", format="png", payload=b"")])
+
+
+def test_invalid_first_packet_and_empty_eos_do_not_create_preview(configured):
+    adapter, session = initialize()
+
+    class Socket:
+        async def send_bytes(self, payload):
+            raise AssertionError("Invalid input must not be acknowledged")
+
+    async def run():
+        for kind, payload in [
+            ("source.end", {"source_frame_end": 0}),
+            (
+                "source.append",
+                dict(
+                    client_seq=1,
+                    source_frame_start=0,
+                    num_frames=1,
+                    pts_us=0,
+                    data=bytes(3072),
+                ),
+            ),
+        ]:
+            with pytest.raises(ValueError):
+                await adapter.ingest_wire_event(
+                    Socket(),
+                    session,
+                    dict(type="event", kind=kind, event_id=1, payload=payload),
+                    3300,
+                )
+            assert adapter.source_preview_sha256 is None
+            assert adapter.ledger.accepted_frames == 0
+
+    asyncio.run(run())
+    adapter.dispose(session)
+
+
+def test_dispose_before_s0_wakes_waiter(configured):
+    adapter, session = initialize()
+
+    async def run():
+        waiter = asyncio.create_task(adapter.wait_for_next_chunk(session))
+        await asyncio.sleep(0)
+        adapter.dispose(session)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(waiter, 1)
+
+    asyncio.run(run())
+    replacement, new_session = initialize()
+    assert replacement.source_preview_sha256 is None
+    replacement.dispose(new_session)
