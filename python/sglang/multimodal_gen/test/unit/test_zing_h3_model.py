@@ -753,6 +753,7 @@ def _realtime_batch(index, session):
             width=32,
             num_inference_steps=3,
             seed=42,
+            zing_realtime_decode_mode="immediate",
         ),
         extra={},
         metrics=None,
