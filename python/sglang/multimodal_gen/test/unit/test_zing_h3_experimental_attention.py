@@ -70,10 +70,12 @@ def test_default_execution_uses_validated_combination(monkeypatch):
     monkeypatch.delenv("SGLANG_ZING_EXPERIMENTAL_ATTENTION", raising=False)
     monkeypatch.delenv("SGLANG_ZING_EXPERIMENTAL_STABLE_SHAPES", raising=False)
     monkeypatch.delenv("SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN", raising=False)
+    monkeypatch.delenv("SGLANG_ZING_EXPERIMENTAL_FA4_METADATA_REUSE", raising=False)
     model = model_fixture.__wrapped__()
     assert model.experimental_attention_backend == "fa4"
     assert model.experimental_stable_shapes is True
     assert model.experimental_compiled_adaln is True
+    assert model.experimental_fa4_metadata_reuse is True
 
 
 @pytest.mark.parametrize(
@@ -82,6 +84,7 @@ def test_default_execution_uses_validated_combination(monkeypatch):
         "SGLANG_ZING_EXPERIMENTAL_ATTENTION",
         "SGLANG_ZING_EXPERIMENTAL_STABLE_SHAPES",
         "SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN",
+        "SGLANG_ZING_EXPERIMENTAL_FA4_METADATA_REUSE",
     ],
 )
 def test_invalid_experiment_fails_at_construction(monkeypatch, variable):
@@ -140,6 +143,141 @@ def test_fa4_external_signature_and_single_document_lengths(monkeypatch, tuple_r
     assert call["causal"] is call["deterministic"] is call["return_lse"] is False
 
 
+def test_fa4_passes_reused_metadata_to_kernel(monkeypatch):
+    monkeypatch.setattr(zing_h3, "_fa4_current_stream", lambda device: "compute")
+    q = SimpleNamespace(is_cuda=True, shape=(3, 2, 8), device=torch.device("cpu"))
+    k = SimpleNamespace(shape=(7, 2, 8), device=torch.device("cpu"))
+    v = SimpleNamespace(shape=(7, 2, 8), device=torch.device("cpu"))
+    calls = []
+    fake = ModuleType("flash_attn.cute")
+
+    def flash(**kwargs):
+        calls.append(kwargs)
+        return torch.zeros(q.shape)
+
+    fake.flash_attn_varlen_func = flash
+    monkeypatch.setitem(sys.modules, "flash_attn.cute", fake)
+    metadata = zing_h3._FA4ForwardMetadata()
+    for _ in range(2):
+        zing_h3._fa4_attention(q, k, v, 0.125, metadata=metadata)
+    assert metadata.pairs_created == 1 and metadata.hits == 1
+    assert calls[0]["cu_seqlens_q"] is calls[1]["cu_seqlens_q"]
+    assert calls[0]["cu_seqlens_k"] is calls[1]["cu_seqlens_k"]
+    assert calls[0]["cu_seqlens_q"].tolist() == [0, 3]
+    assert calls[0]["cu_seqlens_k"].tolist() == [0, 7]
+    metadata.clear()
+    assert metadata.closed and metadata.keys() == ()
+
+
+def test_fa4_metadata_reuses_actual_lengths_and_rejects_cross_stream(monkeypatch):
+    stream = ["producer"]
+    monkeypatch.setattr(zing_h3, "_fa4_current_stream", lambda device: stream[0])
+    metadata = zing_h3._FA4ForwardMetadata()
+
+    def tensors(q_rows, k_rows):
+        return (
+            torch.empty(q_rows, 2, 8),
+            torch.empty(k_rows, 2, 8),
+            torch.empty(k_rows, 2, 8),
+        )
+
+    first = metadata.lengths(*tensors(3, 7))
+    assert [value.tolist() for value in first] == [[0, 3], [0, 7]]
+    assert all(
+        value.dtype == torch.int32 and value.device.type == "cpu" for value in first
+    )
+    assert metadata.lengths(*tensors(3, 7)) is first
+    second = metadata.lengths(*tensors(3, 8))
+    assert second is not first and second[1].tolist() == [0, 8]
+    assert (metadata.pairs_created, metadata.tensors_created, metadata.hits) == (
+        2,
+        4,
+        1,
+    )
+    stream[0] = "consumer"
+    with pytest.raises(RuntimeError, match="across compute streams"):
+        metadata.lengths(*tensors(3, 7))
+    assert metadata.pairs_created == 2 and metadata.hits == 1
+    metadata.clear()
+    assert metadata.closed and metadata.keys() == ()
+    with pytest.raises(RuntimeError, match="already released"):
+        metadata.lengths(*tensors(3, 7))
+
+
+@pytest.mark.parametrize("fail", [False, True])
+@torch.no_grad()
+def test_fa4_metadata_is_forward_local_and_cleared(monkeypatch, fail):
+    # CPU-backed FA4 substitute exercises the real forward's refiner and main
+    # call sites without claiming CUDA numerical acceptance.
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_ATTENTION", "fa4")
+    monkeypatch.delenv("SGLANG_ZING_EXPERIMENTAL_FA4_METADATA_REUSE", raising=False)
+    monkeypatch.setattr(zing_h3, "_fa4_current_stream", lambda device: "compute")
+    model = model_fixture.__wrapped__()
+    assert model.experimental_fa4_metadata_reuse
+    owners = []
+    original_metadata = zing_h3._FA4ForwardMetadata
+
+    def new_metadata():
+        owner = original_metadata()
+        owners.append(owner)
+        return owner
+
+    monkeypatch.setattr(zing_h3, "_FA4ForwardMetadata", new_metadata)
+    seen = []
+
+    def cpu_fa4(q, k, v, scale, *, metadata=None):
+        assert metadata is owners[-1]
+        pair = metadata.lengths(q, k, v)
+        seen.append((metadata, (q.shape[0], k.shape[0]), pair))
+        if fail:
+            raise RuntimeError("injected FA4 failure")
+        return torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(0, 1)[None],
+            k.transpose(0, 1)[None],
+            v.transpose(0, 1)[None],
+            dropout_p=0.0,
+            is_causal=False,
+            scale=scale,
+        )[0].transpose(0, 1)
+
+    monkeypatch.setattr(zing_h3, "_fa4_attention", cpu_fa4)
+    packer, inputs, visual, audio = request(model)
+    sampler = ZingH3Sampler(model, packer, sigma_points=3)
+    sampler.device = torch.device("cpu")
+    layout = packer.pack_inference_layout(inputs, inputs.positive, visual, audio)
+    prefix = sampler._select_block(layout, 0, phase="prefix", video_t=1, audio_t=1)
+    for _ in range(2):
+        if fail:
+            with pytest.raises(RuntimeError, match="injected FA4 failure"):
+                sampler._forward(prefix, ZingH3KVCache(len(model.blocks)), "prefix")
+        else:
+            sampler._forward(prefix, ZingH3KVCache(len(model.blocks)), "prefix")
+        owner = owners[-1]
+        calls = [call for call in seen if call[0] is owner]
+        assert calls
+        assert owner.closed and owner.keys() == ()
+        assert owner.pairs_created == len({shape for _, shape, _ in calls})
+        assert owner.hits == len(calls) - owner.pairs_created
+        for _, shape, pair in calls:
+            assert pair[0].tolist() == [0, shape[0]]
+            assert pair[1].tolist() == [0, shape[1]]
+    assert owners[0] is not owners[1]
+    if not fail:
+        assert len([call for call in seen if call[0] is owners[0]]) > 1
+        assert all(
+            first[2] is second[2]
+            for first in seen
+            for second in seen
+            if first[0] is second[0] and first[1] == second[1]
+        )
+        assert not any(
+            first[2] is second[2]
+            for first in seen
+            for second in seen
+            if first[0] is not second[0]
+        )
+
+
 @pytest.mark.parametrize("world", [2, 4])
 @pytest.mark.parametrize("reference_prefix", [False, True])
 def test_opt_in_stable_shapes_keep_sp_cache_and_outputs(
@@ -160,9 +298,10 @@ def test_fa4_routes_full_query_and_history_before_output_projection(monkeypatch,
     rope = torch.cat((torch.ones(4, 4), torch.zeros(4, 4)), dim=-1).bfloat16()
     reference, _ = zing_h3._attention(module, hidden, rope[:3], history, rope)
     calls = []
+    metadata = object()
 
-    def fake_fa4(q, k, v, scale):
-        calls.append((q.shape, k.shape, v.shape, scale))
+    def fake_fa4(q, k, v, scale, *, metadata=None):
+        calls.append((q.shape, k.shape, v.shape, scale, metadata))
         return torch.nn.functional.scaled_dot_product_attention(
             q.transpose(0, 1)[None],
             k.transpose(0, 1)[None],
@@ -193,6 +332,7 @@ def test_fa4_routes_full_query_and_history_before_output_projection(monkeypatch,
         capture=True,
         sequence_splits=[3] if sp else None,
         attention_backend="fa4",
+        fa4_metadata=metadata,
     )
     assert calls == [
         (
@@ -200,6 +340,7 @@ def test_fa4_routes_full_query_and_history_before_output_projection(monkeypatch,
             torch.Size([7, 2, 8]),
             torch.Size([7, 2, 8]),
             module.softmax_scale,
+            metadata,
         )
     ]
     torch.testing.assert_close(actual, reference, rtol=0, atol=0)
