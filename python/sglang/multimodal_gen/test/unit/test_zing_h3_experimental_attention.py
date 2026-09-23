@@ -6,8 +6,9 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
-from sglang.multimodal_gen.runtime.models.dits import zing_h3
+from sglang.multimodal_gen.runtime.models.dits import minimax_h3, zing_h3
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.sampling import (
     ZingH3Sampler,
@@ -213,3 +214,182 @@ def test_fa4_invalid_return_fails_without_fallback(monkeypatch, result):
     monkeypatch.setitem(sys.modules, "flash_attn.cute", fake)
     with pytest.raises(RuntimeError, match="Zing experimental FA4 returned"):
         zing_h3._fa4_attention(q, q, q, 0.125)
+
+
+# Fused in-place QK norm (#157). CPU replaces the CUDA kernel with an in-place
+# torch RMSNorm: this checks routing, aliasing and KV contracts, not numerics.
+
+
+def _torch_inplace_qknorm(q, k, q_weight, k_weight, eps, *, head_dim):
+    assert isinstance(eps, float)
+    for x, weight in ((q, q_weight), (k, k_weight)):
+        x.copy_(F.rms_norm(x, (head_dim,), weight, eps))
+
+
+def _fake_kernel(monkeypatch):
+    monkeypatch.setattr(zing_h3, "_fused_qk_norm_rejection", lambda *args: None)
+    monkeypatch.setattr(zing_h3, "fused_inplace_qknorm", _torch_inplace_qknorm)
+
+
+def _eager_only(monkeypatch):
+    monkeypatch.setattr(zing_h3, "_fused_qk_norm_rejection", lambda *args: "forced")
+
+
+class _CudaLike(torch.Tensor):
+    """A CPU tensor that passes the device check, so later gates are reached."""
+
+    @property
+    def is_cuda(self):
+        return True
+
+
+def _qk(dtype=torch.bfloat16, rows=3, heads=2, dim=8):
+    qkv = torch.randn(rows, 3 * heads * dim, dtype=dtype)
+    q, k, _ = (x.reshape(rows, heads, dim) for x in qkv.chunk(3, -1))
+    return q.as_subclass(_CudaLike), k.as_subclass(_CudaLike)
+
+
+def _norms(dim=8, eps=1e-5, dtype=torch.bfloat16):
+    return (
+        torch.nn.RMSNorm(dim, eps=eps, dtype=dtype),
+        torch.nn.RMSNorm(dim, eps=eps, dtype=dtype),
+    )
+
+
+def test_rejection_reasons(monkeypatch):
+    q, k = _qk()
+    qn, kn = _norms()
+    reject = minimax_h3._fused_qk_norm_rejection
+    assert reject(torch.zeros(1, 2, 8), torch.zeros(1, 2, 8), qn, kn, 8) == "not_cuda"
+    monkeypatch.setattr(minimax_h3.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(minimax_h3, "can_use_fused_inplace_qknorm", lambda *a: True)
+    with torch.no_grad():
+        assert reject(q, k, qn, kn, 8) is None
+        monkeypatch.setattr(torch.version, "hip", "6.0")
+        assert reject(q, k, qn, kn, 8) == "hip"
+        monkeypatch.setattr(torch.version, "hip", None)
+        assert reject(*_qk(torch.float16), *_norms(dtype=torch.float16), 8) == (
+            "unsupported_dtype"
+        )
+        assert reject(*_qk(torch.float32), qn, kn, 8) == "dtype_mismatch"
+        assert reject(*_qk(rows=0), qn, kn, 8) == "empty"
+        contiguous = torch.randn(3, 2, 16, dtype=torch.bfloat16)[..., :8]
+        assert reject(contiguous.as_subclass(_CudaLike), k, qn, kn, 8) == (
+            "unsupported_layout"
+        )
+        assert reject(q, q, qn, kn, 8) == "aliased_qk"
+        # The kernel stores in place in parallel: partially overlapping Q/K
+        # and rows overlapping within one tensor must be rejected, while the
+        # row-interleaved Q/K of one fused projection (above) are accepted.
+        base = torch.randn(3, 48, dtype=torch.bfloat16)
+        views = [base[:, a : a + 16].reshape(3, 2, 8) for a in (0, 8, 16)]
+        half, next_, disjoint = (v.as_subclass(_CudaLike) for v in views)
+        assert reject(half, next_, qn, kn, 8) == "aliased_qk"
+        assert reject(half, disjoint, qn, kn, 8) is None
+        # Unequal head counts: K rows wider than Q's reach into the next Q row.
+        store = torch.randn(160, dtype=torch.bfloat16)
+        narrow = store.as_strided((3, 1, 8), (48, 8, 1), 0).as_subclass(_CudaLike)
+        wide = store.as_strided((3, 2, 8), (48, 8, 1), 36).as_subclass(_CudaLike)
+        assert reject(narrow, wide, qn, kn, 8) == "aliased_qk"
+        fits = store.as_strided((3, 2, 8), (48, 8, 1), 24).as_subclass(_CudaLike)
+        assert reject(narrow, fits, qn, kn, 8) is None
+        flat = torch.randn(40, dtype=torch.bfloat16)
+        rows = flat.as_strided((3, 2, 8), (8, 8, 1)).as_subclass(_CudaLike)
+        assert reject(rows, k, qn, kn, 8) == "internal_overlap"
+        assert reject(q, k, *_norms(eps=None), 8) == "eps"
+        assert reject(q, k, qn, _norms(eps=1e-6)[1], 8) == "eps"
+        wide = torch.nn.RMSNorm((2, 8), eps=1e-5, dtype=torch.bfloat16)
+        assert reject(q, k, wide, kn, 8) == "weight_shape"
+        monkeypatch.setattr(
+            minimax_h3, "can_use_fused_inplace_qknorm", lambda *a: False
+        )
+        assert reject(q, k, qn, kn, 8) == "kernel_unavailable"
+    monkeypatch.setattr(minimax_h3, "can_use_fused_inplace_qknorm", lambda *a: True)
+    with torch.enable_grad():
+        assert reject(q, k, qn, kn, 8) == "grad"
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    assert reject(q, k, qn, kn, 8) == "compiling"
+
+
+@torch.no_grad()
+def test_cpu_falls_back_to_eager_and_records_reason():
+    zing_h3.FUSED_QK_NORM_ROUTES.clear()
+    model = model_fixture.__wrapped__()
+    packer, inputs, video, audio = request(model)
+    ZingH3Sampler(model, packer, sigma_points=3).sample(inputs, video, audio)
+    assert set(zing_h3.FUSED_QK_NORM_ROUTES) == {"not_cuda"}
+
+
+@pytest.mark.parametrize(
+    "cache_kwargs",
+    [
+        {},  # default window: raw K store, block-relative RoPE
+        {"window_chunks": 2, "sink_chunks": 0},
+        {"window_chunks": None, "sink_chunks": 0, "rope_position_mode": "absolute"},
+    ],
+)
+@torch.no_grad()
+def test_fused_route_matches_eager_and_captures_independent_k(
+    monkeypatch, cache_kwargs
+):
+    packer, inputs, video, audio = request(model_fixture.__wrapped__())
+    kwargs = dict(sigma_points=3, **cache_kwargs)
+    commits = {False: [], True: []}
+    original_update = ZingH3KVCache.update
+
+    def update(self, positions, block_idx, phase, frames, layers=None):
+        if layers is not None:
+            snapshot = [(k.clone(), v.clone()) for k, v in layers]
+            if enabled and self.raw_store:
+                # Staged raw K is the store's own scratch tail: the commit
+                # copies nothing and no QKV projection is kept alive.
+                for index, (k, _) in enumerate(layers):
+                    assert k.data_ptr() == (
+                        self._stores[index][0][self._length].data_ptr()
+                    )
+            commits[enabled].append((phase, snapshot))
+        return original_update(self, positions, block_idx, phase, frames, layers)
+
+    monkeypatch.setattr(ZingH3KVCache, "update", update)
+    outputs = {}
+    for enabled in (False, True):
+        (_fake_kernel if enabled else _eager_only)(monkeypatch)
+        sampler = ZingH3Sampler(model_fixture.__wrapped__(), packer, **kwargs)
+        outputs[enabled] = sampler.sample(inputs, video, audio)
+    assert all(torch.equal(a, b) for a, b in zip(outputs[True], outputs[False]))
+    assert len(commits[True]) == len(commits[False]) > 0
+    for (phase, layers), (expected_phase, expected) in zip(
+        commits[True], commits[False]
+    ):
+        assert phase == expected_phase
+        for (k, v), (ek, ev) in zip(layers, expected):
+            assert torch.equal(k, ek) and torch.equal(v, ev)
+
+
+@torch.no_grad()
+def test_uncached_capture_does_not_keep_qkv_alive(monkeypatch):
+    # The replicated SP prefix captures without a cache append; its K is
+    # held until the commit and must not borrow the fused QKV projection.
+    _fake_kernel(monkeypatch)
+    attn = model_fixture.__wrapped__().blocks[0].attn
+    hidden = torch.randn(5, 16, dtype=attn.qkv_proj.weight.dtype)
+    projections = []
+    original = attn.qkv_proj.forward
+
+    def spy(x):
+        result = original(x)
+        projections.append(result[0])
+        return result
+
+    monkeypatch.setattr(attn.qkv_proj, "forward", spy)
+    fused, raw = zing_h3._attention(attn, hidden, capture=True)
+    _eager_only(monkeypatch)
+    eager, expected = zing_h3._attention(attn, hidden, capture=True)
+    qkv = projections[0]
+    for tensor in raw:
+        assert tensor.untyped_storage().data_ptr() != (qkv.untyped_storage().data_ptr())
+    assert torch.equal(fused, eager)
+    assert all(torch.equal(a, b) for a, b in zip(raw, expected))
+    # V is untouched by the norm.
+    v = qkv.chunk(3, -1)[2].reshape_as(raw[1])
+    assert torch.equal(raw[1], v)

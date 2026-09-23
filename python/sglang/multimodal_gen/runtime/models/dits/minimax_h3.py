@@ -27,7 +27,10 @@ from sglang.kernels.ops.diffusion import (
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
 )
-from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
+from sglang.kernels.ops.layernorm.norm import (
+    can_use_fused_inplace_qknorm,
+    fused_inplace_qknorm,
+)
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
@@ -425,6 +428,83 @@ def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
     return nn.functional.silu(gate) * up
 
 
+def _rows_overlap(x: torch.Tensor) -> bool:
+    # Rows of [tokens, heads, head_dim] with unit inner strides overlap when the
+    # token stride is shorter than one row.
+    return x.shape[0] > 1 and x.stride(0) < x.shape[1] * x.shape[2]
+
+
+def _spans_overlap(a: torch.Tensor, b: torch.Tensor) -> bool:
+    # The kernel stores in parallel in place; Q and K must not share an element.
+    if a.untyped_storage().data_ptr() != b.untyped_storage().data_ptr():
+        return False
+    a_width, b_width = a.shape[1] * a.shape[2], b.shape[1] * b.shape[2]
+    a0, b0 = a.storage_offset(), b.storage_offset()
+    a1 = a0 + (a.shape[0] - 1) * a.stride(0) + a_width
+    b1 = b0 + (b.shape[0] - 1) * b.stride(0) + b_width
+    if a1 <= b0 or b1 <= a0:
+        return False
+    # Row-interleaved views of one projection (fused QKV) with a shared row
+    # stride are disjoint when each B row fits in the gap after an A row.
+    stride = a.stride(0)
+    if a.shape[0] > 1 and b.shape[0] > 1 and b.stride(0) == stride:
+        gap = (b0 - a0) % stride
+        return not a_width <= gap <= stride - b_width
+    return True
+
+
+def _fused_qk_norm_rejection(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: nn.RMSNorm,
+    k_norm: nn.RMSNorm,
+    head_dim: int,
+) -> str | None:
+    """Return why the in-place QK-norm kernel cannot run, or None if it can."""
+    if not (q.is_cuda and k.is_cuda) or not current_platform.is_cuda():
+        return "not_cuda"
+    if torch.version.hip is not None:
+        return "hip"
+    if torch.compiler.is_compiling():
+        return "compiling"
+    if not q.dtype == k.dtype == q_norm.weight.dtype == k_norm.weight.dtype:
+        return "dtype_mismatch"
+    if q.dtype != _BF16_DTYPE:
+        return "unsupported_dtype"
+    if q.ndim != 3 or k.ndim != 3 or q.shape[-1] != head_dim or k.shape[-1] != head_dim:
+        return "unsupported_shape"
+    if q.shape[0] != k.shape[0]:
+        return "token_count_mismatch"
+    if q.numel() == 0 or k.numel() == 0:
+        return "empty"
+    if not (
+        q.stride(-1) == k.stride(-1) == 1 and q.stride(-2) == k.stride(-2) == head_dim
+    ):
+        return "unsupported_layout"
+    if _rows_overlap(q) or _rows_overlap(k):
+        return "internal_overlap"
+    if _spans_overlap(q, k):
+        return "aliased_qk"
+    if q_norm.weight.shape != (head_dim,) or k_norm.weight.shape != (head_dim,):
+        return "weight_shape"
+    if q_norm.weight.device != q.device or k_norm.weight.device != q.device:
+        return "weight_device"
+    if not isinstance(q_norm.eps, float) or q_norm.eps != k_norm.eps:
+        # The kernel has its own eps default; never let it apply silently.
+        return "eps"
+    if torch.is_grad_enabled() and (
+        q.requires_grad
+        or k.requires_grad
+        or q_norm.weight.requires_grad
+        or k_norm.weight.requires_grad
+    ):
+        # The kernel writes in place outside autograd.
+        return "grad"
+    if not can_use_fused_inplace_qknorm(head_dim, q.dtype):
+        return "kernel_unavailable"
+    return None
+
+
 def _apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -432,16 +512,7 @@ def _apply_qk_norm(
     k_norm: nn.RMSNorm,
     head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if (
-        q.is_cuda
-        and q.dtype == _BF16_DTYPE
-        and q.dtype == k.dtype == q_norm.weight.dtype == k_norm.weight.dtype
-        and q.stride(-1) == k.stride(-1) == 1
-        and q.stride(-2) == k.stride(-2) == head_dim
-        and q_norm.eps == k_norm.eps
-        and not torch.compiler.is_compiling()
-        and current_platform.is_cuda()
-    ):
+    if _fused_qk_norm_rejection(q, k, q_norm, k_norm, head_dim) is None:
         fused_inplace_qknorm(
             q,
             k,
@@ -1457,8 +1528,9 @@ class MiniMaxH3DiTBlock(nn.Module):
         ulysses_active: bool = False,
         ring_active: bool = False,
         adaln_params: tuple[torch.Tensor, ...] | None = None,
-        execution_override: Callable[[MiniMaxH3DiTBlock, torch.Tensor], torch.Tensor]
-        | None = None,
+        execution_override: (
+            Callable[[MiniMaxH3DiTBlock, torch.Tensor], torch.Tensor] | None
+        ) = None,
     ) -> torch.Tensor:
         """x: [T, H]; adaln_input: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).

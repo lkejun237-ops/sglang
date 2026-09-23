@@ -6,6 +6,7 @@ loader converts these once; execution uses the same projections, RMSNorms,
 time embedding, refiner, MLP and output heads as native H3.
 """
 
+import collections
 import functools
 import math
 import os
@@ -13,6 +14,7 @@ import warnings
 
 import torch
 import torch.nn.functional as F
+from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_group,
     get_ulysses_ctx,
@@ -31,6 +33,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     _apply_rope_into,
     _apply_rope_kv_into,
     _diffusers_h3_checkpoint,
+    _fused_qk_norm_rejection,
     _rope_cos_sin_cache,
 )
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
@@ -78,6 +81,33 @@ def _native_compiled_adaln(hidden, norm, shift, scale):
     return _compiled_rms_norm_modulate(torch.are_deterministic_algorithms_enabled())(
         hidden.unsqueeze(0), norm.weight, shift, scale, float(norm.eps)
     ).squeeze(0)
+
+
+# Per-process fused QK-norm route counts: "fused" or the rejection reason.
+FUSED_QK_NORM_ROUTES = collections.Counter()
+
+
+def _qk_norm(module, q, k):
+    """Normalize Q/K; the fused route writes in place into the QKV views."""
+    reason = _fused_qk_norm_rejection(
+        q, k, module.q_norm, module.k_norm, module.head_dim
+    )
+    FUSED_QK_NORM_ROUTES[reason or "fused"] += 1
+    if reason is None:
+        fused_inplace_qknorm(
+            q,
+            k,
+            module.q_norm.weight,
+            module.k_norm.weight,
+            eps=module.q_norm.eps,
+            head_dim=module.head_dim,
+        )
+        return q, k
+    return module.q_norm(q), module.k_norm(k)
+
+
+def _shares_storage(a, b):
+    return a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr()
 
 
 def _fa4_attention(q, k, v, scale):
@@ -130,6 +160,7 @@ def _attention(
     capture_rotated=False,
     append_unrotated=False,
     capture_stored_values=False,
+    stage_raw_k=None,
 ):
     if attention_backend not in {"torch_sdpa", "fa4"}:
         raise ValueError(
@@ -144,7 +175,7 @@ def _attention(
         x.reshape(-1, module.num_heads, module.head_dim) for x in qkv.chunk(3, -1)
     )
     with maybe_record_function("Zing.QK_norm"):
-        q, k = module.q_norm(q), module.k_norm(k)
+        q, k = _qk_norm(module, q, k)
     if sequence_splits is not None:
         with maybe_record_function("Zing.Ulysses.input_all_to_all"):
             qkv = _usp_input_all_to_all_varlen_qkv(
@@ -232,7 +263,14 @@ def _attention(
                 if v.shape[0] == rows:
                     raw = (raw[0], raw[1].clone())  # no history: still a QKV view
             elif capture and capture_stored_values:
-                raw = (raw[0], v[-rows:])
+                raw = (
+                    (
+                        stage_raw_k(raw[0])
+                        if stage_raw_k is not None and _shares_storage(raw[0], qkv)
+                        else raw[0]
+                    ),
+                    v[-rows:],
+                )
         elif history is not None:
             with maybe_record_function("Zing.history_K_RoPE"):
                 history_k = (
@@ -243,6 +281,10 @@ def _attention(
             with maybe_record_function("Zing.history_current_KV_concat"):
                 k = torch.cat((history_k, k))
                 v = torch.cat((history[1], v))
+    if raw is not None and _shares_storage(raw[0], qkv):
+        # In-place QK norm leaves K as a QKV view; a capture held until the
+        # commit must not keep the whole projection alive.
+        raw = (raw[0].clone(), raw[1])
     if attention_backend == "fa4":
         with maybe_record_function("Zing.FA4"):
             result = _fa4_attention(q, k, v, module.softmax_scale).reshape(
@@ -633,6 +675,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                         if self.experimental_compiled_adaln
                         else current.norm1(value) * (1 + scale) + shift
                     )
+
                 def make_history_rope(positions):
                     return _rope_cos_sin_cache(
                         self.rope(positions[None]), dtype=value.dtype
@@ -671,6 +714,11 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                     capture_rotated=use_cache and cache.single_store,
                     append_unrotated=raw_attention,
                     capture_stored_values=raw_attention,
+                    stage_raw_k=(
+                        functools.partial(cache.stage_raw_k, index)
+                        if raw_attention
+                        else None
+                    ),
                 )
                 with maybe_record_function("Zing.gated_residual.attention"):
                     value = value + gate * attended

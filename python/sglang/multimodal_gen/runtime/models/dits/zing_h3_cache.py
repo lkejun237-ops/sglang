@@ -492,6 +492,24 @@ class ZingH3KVCache:
             [values[a:b] for a, b in runs] + [current_values]
         )
 
+    def stage_raw_k(self, layer, k):
+        """Copy a clean forward's raw K into this layer's raw store scratch tail.
+
+        Like the V tail written by raw_attention_view, the rows sit where the
+        commit places them, so _store_chunk skips the copy. Call only after
+        raw_attention_view reserved this layer for the current rows.
+        """
+        if not self.raw_store:
+            raise ValueError("Zing raw K staging requires a raw K/V store")
+        self._check_append_layout(layer, k, k)
+        rows = k.shape[0]
+        store = self._stores.get(layer)
+        if store is None or store[0].shape[0] < self._length + rows:
+            raise RuntimeError("Zing raw K staging requires a reserved store")
+        tail = store[0][self._length : self._length + rows]
+        tail.copy_(k)
+        return tail
+
     def replace_prefix(self, prefix):
         """Adopt a rebuilt prefix, keeping committed target rows and positions.
 
@@ -669,9 +687,7 @@ class ZingH3KVCache:
                 merged = ZingKVChunk(
                     combined_positions, block, (), frames, source.offset
                 )
-                merged.position_signature = self._tensor_signature(
-                    combined_positions
-                )
+                merged.position_signature = self._tensor_signature(combined_positions)
                 merged.layers = tuple(
                     (
                         self._stores[layer][0][source.offset : source.offset + rows],
