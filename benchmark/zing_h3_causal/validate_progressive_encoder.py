@@ -91,6 +91,7 @@ def run_stream(
         raise ValueError("Unsupported progressive encoder contract")
     cursor = index = 0
     rows, values = [], []
+    timing = None
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
@@ -122,6 +123,13 @@ def run_stream(
                     allocated_bytes=torch.cuda.memory_allocated(),
                     reserved_bytes=torch.cuda.memory_reserved(),
                     state=vars(stream.state_usage()) if progressive else None,
+                    tile_execution=(
+                        dict(stream.cache.last_execution)
+                        if progressive
+                        and getattr(stream, "cache", None)
+                        and stream.cache.last_execution is not None
+                        else None
+                    ),
                 )
             )
             # Snapshot before the next call, detecting state/output aliasing in
@@ -169,7 +177,7 @@ def run_stream(
                     )
         intervals = [b["seconds"] - a["seconds"] for a, b in zip(rows, rows[1:])]
         ordered = sorted(intervals)
-        return result, dict(
+        timing = dict(
             first_latent_seconds=rows[0]["seconds"],
             output_interval_p50=statistics.median(intervals) if intervals else None,
             output_interval_p95=ordered[math.ceil(0.95 * len(ordered)) - 1]
@@ -185,16 +193,40 @@ def run_stream(
             peak_allocated_bytes=torch.cuda.max_memory_allocated(),
             peak_reserved_bytes=torch.cuda.max_memory_reserved(),
         )
+        return result, timing
     finally:
         stream.dispose()
+        if progressive:
+            released = stream.state_usage().retained_bytes
+            if timing is not None:
+                timing["retained_bytes_after_dispose"] = released
+            if released:
+                raise ValueError("Dispose retained encoder-owned tensor storage")
 
 
 def lifecycle_checks(
-    codecs, pixels, factory, *, atol, rtol, output=None, report_numerical_only=False
+    codecs,
+    pixels,
+    factory,
+    *,
+    atol,
+    rtol,
+    output=None,
+    report_numerical_only=False,
+    reference_factory=None,
 ):
     """Exercise actual adapter caches; no synthetic encoder is installed here."""
     sources = [pixels[:, :34], 255 - pixels[:, :34]]
-    references = [run_stream(codecs, x, SourcePixelBuffer, [17])[0] for x in sources]
+    references = [
+        run_stream(
+            codecs,
+            x,
+            reference_factory or SourcePixelBuffer,
+            [17],
+            progressive=reference_factory is not None,
+        )[0]
+        for x in sources
+    ]
     independent = [
         run_stream(codecs, x, factory, [1], progressive=True)[0] for x in sources
     ]
@@ -371,6 +403,7 @@ def prefix_audit(codecs, pixels, output, atol, rtol):
 @torch.inference_mode()
 def run(args):
     from validate_incremental_codecs import digest, load_codecs
+
     from sglang.multimodal_gen.runtime.server_args import (
         ServerArgs,
         set_global_server_args,

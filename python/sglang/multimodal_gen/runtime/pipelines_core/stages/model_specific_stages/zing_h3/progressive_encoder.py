@@ -98,7 +98,13 @@ class H3ProgressiveEncoderSession:
             raise ValueError("Progressive encoding requires clip17 and ratio4")
         self.codecs = codecs
         self.capacity_frames = capacity_frames
-        self.cache = CausalEncoderCache(codecs.modules["video_vae"])
+        self.encode_mode = codecs.runtime["vae_config"]["encode_mode"]
+        self.encode_dtype = codecs.runtime["vae_config"]["encode_dtype"]
+        self.cache = CausalEncoderCache(
+            codecs.modules["video_vae"],
+            encode_mode=self.encode_mode,
+            encode_dtype=self.encode_dtype,
+        )
         self.disposed = False
         self.reset()
 
@@ -160,39 +166,83 @@ class H3ProgressiveEncoderSession:
         from .codecs import _visual_encode_policy
         from .streaming_codecs import CodecSlice
 
+        # EOS is independent of buffered length: a partial tail is ready only
+        # after finish(). Agree before any rank can return or enter encoding.
+        self.cache.agree(
+            (
+                "pop",
+                self.cache.session_sequence,
+                self.disposed,
+                self.ended,
+                self.accepted_frames,
+                self.emitted_latents,
+                self.buffered_frames,
+                self._clip_frames,
+            )
+        )
         self._open()
         if not self.ready:
             return None
-        needed = 1 if self._clip_frames == 0 else 8
-        count = min(needed, self.buffered_frames)
-        frames = self._pixels[:, :count]
-        if count < needed:
-            frames = torch.cat(
-                (frames, frames[:, -1:].expand(-1, needed - count, -1, -1)), 1
-            )
-        model = self.cache.model
-        parameter = next(model.encoder.parameters())
-        dtype = getattr(torch, self.codecs.runtime["vae_config"]["encode_dtype"])
-        if (
-            parameter.dtype != dtype
-            or next(model.quant_conv.parameters()).dtype != dtype
-        ):
-            raise ValueError("Encoder weights must be loaded in the configured dtype")
-        pixels = frames[None].to(device=parameter.device, dtype=dtype).div(255)
-        mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
-        std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
-        with _visual_encode_policy(self.codecs.runtime["vae_config"]["encode_mode"]):
+        # A local preparation failure must rendezvous with peers before their
+        # device collective; pending cache state is committed only at the end.
+        error = None
+        try:
+            needed = 1 if self._clip_frames == 0 else 8
+            count = min(needed, self.buffered_frames)
+            frames = self._pixels[:, :count]
+            if count < needed:
+                frames = torch.cat(
+                    (frames, frames[:, -1:].expand(-1, needed - count, -1, -1)), 1
+                )
+            model = self.cache.model
+            parameter = next(model.encoder.parameters())
+            config = self.codecs.runtime["vae_config"]
+            if (config["encode_mode"], config["encode_dtype"]) != (
+                self.encode_mode,
+                self.encode_dtype,
+            ):
+                raise ValueError(
+                    "Progressive encoder policy cannot change within a session"
+                )
+            dtype = getattr(torch, self.encode_dtype)
+            if (
+                parameter.dtype != dtype
+                or next(model.quant_conv.parameters()).dtype != dtype
+            ):
+                raise ValueError(
+                    "Encoder weights must be loaded in the configured dtype"
+                )
+            pixels = frames[None].to(device=parameter.device, dtype=dtype).div(255)
+            mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
+            std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
+        except Exception as exc:
+            error = exc
+        self.cache.agree("prepared", error=error)
+        with _visual_encode_policy(self.encode_mode):
             moments, states, work = self.cache.encode((pixels - mean) / std)
-        length = 1 if needed == 1 else (count + 3) // 4
-        values = moments[:, :, :length].clone()
-        remaining = (
-            self._pixels[:, count:].clone() if count < self.buffered_frames else None
-        )
-        result = CodecSlice(
-            values,
-            self.emitted_latents,
-            self.emitted_latents + length,
-            self._consumed + count,
+        error = None
+        try:
+            length = 1 if needed == 1 else (count + 3) // 4
+            values = moments[:, :, :length].clone()
+            remaining = (
+                self._pixels[:, count:].clone()
+                if count < self.buffered_frames
+                else None
+            )
+            result = CodecSlice(
+                values,
+                self.emitted_latents,
+                self.emitted_latents + length,
+                self._consumed + count,
+            )
+        except Exception as exc:
+            error = exc
+        self.cache.agree("slice_ready", error=error)
+        # Tensor-free evidence for dependency/index and actual sharding checks.
+        self.cache.last_execution.update(
+            source_dependency_end=self._consumed + count,
+            latent_start=self.emitted_latents,
+            latent_end=self.emitted_latents + length,
         )
         self.cache.commit(states, work)
         self._pixels = remaining

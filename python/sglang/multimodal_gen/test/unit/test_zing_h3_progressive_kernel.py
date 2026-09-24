@@ -18,6 +18,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
 
 @pytest.fixture
 def codecs():
+    return make_codecs()
+
+
+def make_codecs():
     torch.manual_seed(7)
     model = nn.Module()
     model.encoder = (
@@ -160,10 +164,9 @@ def test_kernel_exception_keeps_state_retryable(codecs, monkeypatch):
     assert stream.pop().end == 3
 
 
-@pytest.mark.parametrize("stack", [False, True])
-@pytest.mark.parametrize("padding", ["zeros", "reflect"])
-def test_native_tiling_and_packet_invariance(codecs, stack, padding):
+def configure_tiling(codecs, stack, padding="zeros"):
     from types import MethodType
+
     from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.klvae import (
         AutoencoderKL,
         AutoencoderKLLegacy,
@@ -204,6 +207,13 @@ def test_native_tiling_and_packet_invariance(codecs, stack, padding):
     ):
         setattr(model, name, MethodType(getattr(AutoencoderKL, name), model))
     model.encode = MethodType(AutoencoderKLLegacy.encode, model)
+    return model
+
+
+@pytest.mark.parametrize("stack", [False, True])
+@pytest.mark.parametrize("padding", ["zeros", "reflect"])
+def test_native_tiling_and_packet_invariance(codecs, stack, padding):
+    model = configure_tiling(codecs, stack, padding)
     pixels = torch.randint(256, (3, 17, 24, 24), dtype=torch.uint8)
     x = pixels[None].double() / 255
     x = (x - x.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)) / x.new_tensor(
@@ -249,3 +259,101 @@ def test_cached_outputs_ignore_future_pixels(codecs, watermark, tokens):
     torch.testing.assert_close(
         outputs[0][:, :, :tokens], outputs[1][:, :, :tokens], atol=0, rtol=0
     )
+
+
+def test_progressive_tile_mode_is_independent_and_frozen(codecs, monkeypatch):
+    monkeypatch.setenv("MINIMAX_H3_PROGRESSIVE_ENCODER_TILING", "parallel")
+    stream = create_session(codecs, capacity_frames=8)
+    monkeypatch.setenv("MINIMAX_H3_PROGRESSIVE_ENCODER_TILING", "replicated")
+    stream.append(torch.zeros(3, 1, 8, 8, dtype=torch.uint8), frame_start=0)
+    stream.pop()
+    receipt = stream.cache.last_execution
+    assert receipt["requested_mode"] == "parallel"
+    assert receipt["effective_mode"] == "replicated"
+    assert receipt["fallback_reason"] == "non_tiled_encoder"
+    assert receipt["gather_calls"] == 0
+    assert receipt["source_dependency_end"] == 1
+    stream.dispose()
+    assert stream.state_usage().retained_bytes == 0
+    monkeypatch.setenv("MINIMAX_H3_PROGRESSIVE_ENCODER_TILING", "typo")
+    with pytest.raises(ValueError, match="tiling"):
+        create_session(codecs, capacity_frames=8)
+
+
+def test_cached_tile_geometry_cannot_change(codecs):
+    model = configure_tiling(codecs, False)
+    stream = create_session(codecs, capacity_frames=17)
+    stream.append(torch.zeros(3, 17, 24, 24, dtype=torch.uint8), frame_start=0)
+    stream.pop()
+    usage = stream.state_usage()
+    model.stack_tiling = True
+    with pytest.raises(ValueError, match="layout"):
+        stream.pop()
+    assert stream.state_usage() == usage
+    stream.dispose()
+
+
+@pytest.mark.parametrize(
+    "size,mode,dtype,stack,expected_reason",
+    [
+        (2, "deterministic", "bfloat16", False, None),
+        (4, "deterministic", "bfloat16", False, None),
+        (1, "deterministic", "bfloat16", False, "single_rank_or_uninitialized_group"),
+        (8, "deterministic", "bfloat16", False, "unvalidated_group_size"),
+        (2, "performance", "bfloat16", False, "unvalidated_encode_mode"),
+        (2, "deterministic", "float32", False, "unvalidated_encode_dtype"),
+        (2, "deterministic", "bfloat16", True, "unvalidated_stack_tiling"),
+    ],
+)
+def test_default_tile_policy_requires_validated_configuration(
+    codecs, monkeypatch, size, mode, dtype, stack, expected_reason
+):
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import klvae
+
+    monkeypatch.delenv("MINIMAX_H3_PROGRESSIVE_ENCODER_TILING", raising=False)
+    group = SimpleNamespace(world_size=size)
+    monkeypatch.setattr(klvae, "get_tile_parallel_state", lambda: (0, size))
+    monkeypatch.setattr(klvae, "get_decode_parallel_group_coordinator", lambda: group)
+    configure_tiling(codecs, stack)
+    codecs.runtime["vae_config"].update(encode_mode=mode, encode_dtype=dtype)
+    stream = create_session(codecs, capacity_frames=8)
+    assert stream.cache.requested_mode == "auto"
+    assert stream.cache.tile_mode == (
+        "parallel" if expected_reason is None else "replicated"
+    )
+    assert stream.cache.default_fallback_reason == expected_reason
+    assert (stream.cache.group is group) == (expected_reason is None)
+    stream.dispose()
+
+
+@pytest.mark.parametrize(
+    "key,value", [("encode_mode", "deterministic"), ("encode_dtype", "float32")]
+)
+def test_session_rejects_changed_numerical_policy(codecs, key, value):
+    stream = create_session(codecs, capacity_frames=8)
+    stream.append(torch.zeros(3, 1, 8, 8, dtype=torch.uint8), frame_start=0)
+    codecs.runtime["vae_config"][key] = value
+    with pytest.raises(ValueError, match="policy cannot change"):
+        stream.pop()
+    assert stream.emitted_latents == 0
+    stream.dispose()
+
+
+def test_explicit_replicated_overrides_approved_default(codecs, monkeypatch):
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import klvae
+
+    monkeypatch.setenv("MINIMAX_H3_PROGRESSIVE_ENCODER_TILING", "replicated")
+    monkeypatch.setattr(klvae, "get_tile_parallel_state", lambda: (0, 2))
+    monkeypatch.setattr(
+        klvae,
+        "get_decode_parallel_group_coordinator",
+        lambda: SimpleNamespace(world_size=2),
+    )
+    configure_tiling(codecs, False)
+    codecs.runtime["vae_config"].update(
+        encode_mode="deterministic", encode_dtype="bfloat16"
+    )
+    stream = create_session(codecs, capacity_frames=8)
+    assert stream.cache.requested_mode == "replicated"
+    assert stream.cache.group is None
+    stream.dispose()
