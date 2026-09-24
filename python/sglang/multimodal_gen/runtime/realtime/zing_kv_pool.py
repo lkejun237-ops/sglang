@@ -62,13 +62,19 @@ def allocate_layer_stores(
     """Allocate one slot (or the prefix workspace) before readiness."""
     _positive_int("rows", rows)
     shape = (rows, local_heads, head_dim)
+    # Raw K must expose mutations to per-chunk RoPE cache signatures, even
+    # when startup allocation runs inside inference_mode. No request allocation.
+    with torch.inference_mode(False):
+        keys = [
+            torch.empty(shape, dtype=dtype, device=device) for _ in range(num_layers)
+        ]
     return [
         ZingLayerStore(
-            torch.empty(shape, dtype=dtype, device=device),
+            k,
             torch.empty(shape, dtype=dtype, device=device),
             torch.empty(shape, dtype=dtype, device=device),
         )
-        for _ in range(num_layers)
+        for k in keys
     ]
 
 

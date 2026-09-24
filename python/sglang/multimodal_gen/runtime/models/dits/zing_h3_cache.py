@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Request-owned KV transactions for Zing causal generation."""
 
-from dataclasses import dataclass
+import os
+from contextlib import nullcontext
+from dataclasses import dataclass, field
 
 import torch
 
@@ -22,6 +24,8 @@ class ZingKVChunk:
     # Only the absolute post-RoPE store pins a commit-time rotation signature.
     offset: int = -1
     position_signature: tuple | None = None
+    identity: object = field(default_factory=object, repr=False)
+    rope_parts: tuple = ()
 
     @property
     def temporal_chunk_id(self):
@@ -83,6 +87,8 @@ class ZingH3KVCache:
             and rope_position_mode == "absolute"
         )
         self.raw_store = not self.single_store
+        # Keep the established path until the independent long-window A/B gate.
+        self.chunk_rope_reuse = os.environ.get("SGLANG_ZING_CHUNK_ROPE_REUSE") == "1"
         # A finite request can be much longer than its live attention window.
         # Never reserve its full packed length for a window-bounded store.
         self.reserve_rows = (
@@ -123,18 +129,27 @@ class ZingH3KVCache:
         self._rope_coefficients = {}
         self._model_signature = None
         self._stores = {}
+        self._raw_store_versions = {}
+        self._raw_write_epochs = {}
         self._length = 0
         self._rotated_stores = {}
         self._rotated_store_signatures = {}
         self._effective_history_positions = None
         self._attention_rope_policy = None
         self._rope_epoch = 0
+        self._chunk_geometry = {}
+        self._chunk_plan = None
+        self.rope_reuse_stats = dict(rebuilt_rows=0, reused_rows=0, map_syncs=0)
+        self.last_rope_reuse = None
 
-    def _invalidate_rope(self):
+    def _invalidate_rope(self, *, preserve_chunks=False):
         """Drop publications and chunk references, retaining reusable K capacity."""
-        self._rope_coefficients.clear()
-        self._rotated_store_signatures.clear()
+        if not (self.chunk_rope_reuse and preserve_chunks):
+            self._rope_coefficients.clear()
+            self._rotated_store_signatures.clear()
+            self._chunk_geometry.clear()
         self._effective_history_positions = None
+        self._chunk_plan = None
         self._rope_epoch += 1
 
     def bind_attention_positions(self, history_positions):
@@ -154,6 +169,9 @@ class ZingH3KVCache:
         if policy != self._attention_rope_policy:
             self._invalidate_rope()
             self._attention_rope_policy = policy
+        if self.chunk_rope_reuse and self.raw_store:
+            self._bind_chunk_positions(history_positions)
+            return
         if self.rope_position_mode == "absolute":
             return
         before = self._effective_history_positions
@@ -170,6 +188,68 @@ class ZingH3KVCache:
         self._invalidate_rope()
         if history_positions is not None:
             self._effective_history_positions = history_positions.detach().clone()
+
+    @staticmethod
+    def _parts(chunk):
+        return chunk.rope_parts or ((chunk.identity, chunk.positions.shape[0]),)
+
+    def _bind_chunk_positions(self, positions):
+        """Publish one exact coordinate plan shared by all attention layers.
+
+        An unchanged effective (t, h, w) map preserves the coordinate token.
+        This is necessary but not sufficient for reuse: each layer also checks
+        part identity, raw K version/layout, and raw/rotated physical ranges.
+        Source/target parts keep their identities through transaction merging.
+        CPU layout guards reject incompatible snapshots; all remaining equality
+        flags share one host read, never one synchronization per part.
+        """
+        chunks = self._history()
+        rows = sum(c.positions.shape[0] for c in chunks)
+        if positions is None:
+            if rows:
+                raise ValueError("Zing RoPE requires the current attention map")
+            self._chunk_geometry.clear()
+            self._chunk_plan = []
+            self._effective_history_positions = None
+            return
+        if positions.shape != (rows, 3):
+            raise ValueError("Zing RoPE requires the current attention map")
+        candidates, comparisons, offset = [], [], 0
+        for chunk in chunks:
+            local = 0
+            for identity, count in self._parts(chunk):
+                end = offset + count
+                value = positions[offset:end]
+                old = self._chunk_geometry.get(identity)
+                comparable = (
+                    old is not None
+                    and old[1].shape == value.shape
+                    and old[1].dtype == value.dtype
+                    and old[1].device == value.device
+                )
+                index = len(comparisons) if comparable else None
+                if comparable:
+                    comparisons.append((old[1] == value).all())
+                candidates.append(
+                    (chunk, identity, local, local + count, value, old, index)
+                )
+                offset = end
+                local += count
+        equal = torch.stack(comparisons).tolist() if comparisons else []
+        if comparisons and positions.is_cuda:
+            self.rope_reuse_stats["map_syncs"] += 1
+        geometry, plan = {}, []
+        for chunk, identity, start, end, value, old, index in candidates:
+            entry = (
+                old
+                if index is not None and equal[index]
+                else (identity, value.detach().clone(), object())
+            )
+            geometry[identity] = entry
+            plan.append((chunk, identity, start, end, entry[1], entry[2]))
+        self._chunk_geometry = geometry
+        self._chunk_plan = plan
+        self._effective_history_positions = positions.detach().clone()
 
     def _history_geometry(self, chunks):
         """Return mapped positions and stable keys shared by every layer."""
@@ -203,6 +283,8 @@ class ZingH3KVCache:
         yield from self._rope_coefficients.values()
         if self._effective_history_positions is not None:
             yield self._effective_history_positions
+        for _, positions, _ in self._chunk_geometry.values():
+            yield positions
         if self.active is not None:
             yield self.active[1]
 
@@ -226,14 +308,15 @@ class ZingH3KVCache:
         ]
         if len(retained) != len(self.committed):
             self.committed = retained
-            self._invalidate_rope()
+            self._invalidate_rope(preserve_chunks=True)
             self._compact_store()
             self.stats["compactions"] += 1
 
     def _compact_store(self):
         """Move live raw K/V to the front, using at most one chunk temporarily."""
         chunks = self._stored_chunks()
-        for keys, values in self._stores.values():
+        for layer, (keys, values) in self._stores.items():
+            self._observe_raw_store(layer)
             destination = 0
             for chunk in chunks:
                 rows, source = chunk.positions.shape[0], chunk.offset
@@ -245,6 +328,7 @@ class ZingH3KVCache:
                             tensor[source : source + rows].clone()
                         )
                 destination += rows
+            self._mark_raw_store(layer)
         offset = 0
         for chunk in chunks:
             chunk.offset = offset
@@ -370,6 +454,7 @@ class ZingH3KVCache:
         costs one layer of transient storage rather than the whole cache.
         """
         store = self._stores.get(layer)
+        self._observe_raw_store(layer)
         if store is not None and store[0].shape[0] >= needed:
             return store
         if self.pooled:
@@ -378,15 +463,67 @@ class ZingH3KVCache:
         capacity = max(needed, self.reserve_rows)
         if store is not None and not self.reserve_rows:
             capacity = max(capacity, 2 * store[0].shape[0])
-        keys = k.new_empty((capacity, *k.shape[1:]))
+        # Version raw storage even when the caller uses inference_mode. This
+        # makes unaccounted content changes observable without reading the GPU.
+        with (
+            torch.inference_mode(False)
+            if self.chunk_rope_reuse and self.raw_store
+            else nullcontext()
+        ):
+            keys = k.new_empty((capacity, *k.shape[1:]))
         values = v.new_empty((capacity, *v.shape[1:]))
         if store is not None and self._length:
             keys[: self._length].copy_(store[0][: self._length])
             values[: self._length].copy_(store[1][: self._length])
         self._stores[layer] = (keys, values)
+        self._mark_raw_store(layer)
         # Views of the old buffer would keep it alive and read stale rows.
         self._rebind(layer)
         return self._stores[layer]
+
+    def _observe_raw_store(self, layer):
+        """Detect writes outside the cache before acknowledging owned writes.
+
+        Normal tensor views share their allocation's version counter. A legal
+        scratch-tail append must not invalidate every historical chunk, but an
+        unaccounted write must. Candidate raw allocations are versioned even
+        inside inference_mode, so this check also covers external in-place edits.
+        """
+        if not (self.chunk_rope_reuse and self.raw_store and layer in self._stores):
+            return
+        signature = self._tensor_signature(self._stores[layer][0])
+        before = self._raw_store_versions.get(layer)
+        if before is not None and before != signature:
+            self._raw_write_epochs[layer] = self._raw_write_epochs.get(layer, 0) + 1
+        self._raw_store_versions[layer] = signature
+
+    def _mark_raw_store(self, layer):
+        if self.chunk_rope_reuse and self.raw_store:
+            self._raw_store_versions[layer] = self._tensor_signature(
+                self._stores[layer][0]
+            )
+
+    def _raw_chunk_signature(self, layer, chunk, identity, start, end):
+        value = chunk.layers[layer][0]
+        store = self._stores[layer][0]
+        owned = value.untyped_storage().data_ptr() == store.untyped_storage().data_ptr()
+        # Cache-owned parts can acquire a new parent view when source/target are
+        # merged. Content epoch and physical range remain unchanged in that case.
+        version = (
+            self._raw_write_epochs.get(layer, 0)
+            if owned
+            else self._tensor_signature(value)
+        )
+        return (
+            identity,
+            version,
+            value.data_ptr() + start * value.stride(0) * value.element_size(),
+            end - start,
+            tuple(value.shape[1:]),
+            value.stride(),
+            value.dtype,
+            value.device,
+        )
 
     def _bind_slot(self, layer, needed, k):
         """Expose this layer's fixed slot as the store; never allocate or grow."""
@@ -399,6 +536,7 @@ class ZingH3KVCache:
             raise ValueError("Zing K/V head-shard layout does not match the pool slot")
         if layer not in self._stores:
             self._stores[layer] = (slot.k, slot.v)
+            self._mark_raw_store(layer)
             self._rebind(layer)
         return self._stores[layer]
 
@@ -413,6 +551,14 @@ class ZingH3KVCache:
                 if len(chunk.layers) == self.num_layers
                 else [None] * self.num_layers
             )
+            if self.chunk_rope_reuse and layers[layer] is not None:
+                old_k, old_v = layers[layer]
+                if (
+                    old_k.data_ptr() == store[0][start:stop].data_ptr()
+                    and old_v.data_ptr() == store[1][start:stop].data_ptr()
+                    and old_k.shape == store[0][start:stop].shape
+                ):
+                    continue
             layers[layer] = (store[0][start:stop], store[1][start:stop])
             chunk.layers = tuple(layers)
 
@@ -488,10 +634,24 @@ class ZingH3KVCache:
             raise RuntimeError("Zing attention buffers require torch.no_grad()")
         self._check_append_layout(layer, k, v)
         chunks = self._history()
-        geometry = self._history_geometry(chunks)
-        history_rows = sum(c.positions.shape[0] for c in chunks)
         rows = k.shape[0]
         _, values = self._reserve_store(layer, self._length + rows, k, v)
+        # Unpublish before writes; a failed rotation must never be reused.
+        previous = self._rotated_store_signatures.pop(layer, ())
+        if self.chunk_rope_reuse:
+            return self._raw_chunk_attention_view(
+                layer,
+                k,
+                v,
+                chunks,
+                previous,
+                values,
+                make_rope,
+                rotate_into,
+                write_current,
+            )
+        geometry = self._history_geometry(chunks)
+        history_rows = sum(c.positions.shape[0] for c in chunks)
         signatures = tuple(
             (
                 position_key,
@@ -500,8 +660,6 @@ class ZingH3KVCache:
             )
             for c, (_, position_key) in zip(chunks, geometry)
         )
-        # Unpublish before writes; a failed rotation must never be reused.
-        previous = self._rotated_store_signatures.pop(layer, ())
         common = 0
         for before, after in zip(previous, signatures):
             if before != after:
@@ -553,6 +711,125 @@ class ZingH3KVCache:
             [values[a:b] for a, b in runs] + [current_values]
         )
 
+    def _reserve_chunk_rotations(self, layer, k, capacity, ranges, reusable):
+        """Bind a pool slot or grow scratch, copying only still-valid ranges."""
+        keys = self._rotated_stores.get(layer)
+        if self.pooled and keys is None:
+            keys = self.storage[layer].rotated_k
+            self._rotated_stores[layer] = keys
+        elif keys is None or keys.shape[0] < capacity:
+            self.stats["rotated_allocations"] += 1
+            grown = k.new_empty((capacity, *k.shape[1:]))
+            if keys is not None:
+                for entry in ranges:
+                    if entry in reusable:
+                        start, end = entry[:2]
+                        grown[start:end].copy_(keys[start:end])
+            keys = grown
+            self._rotated_stores[layer] = keys
+        return keys
+
+    @staticmethod
+    def _chunk_rebuild_reasons(old, entry):
+        """Explain a cache miss without changing the exact reuse predicate."""
+        if old is None:
+            return ("new_or_unpublished",)
+        reasons = []
+        if old[3] != entry[3]:
+            reasons.append("coordinates")
+        if old[:3] != entry[:3] or old[4][2] != entry[4][2]:
+            reasons.append("storage_mapping")
+        if old[4][1] != entry[4][1] or old[4][3:] != entry[4][3:]:
+            reasons.append("raw_content_or_layout")
+        return reasons
+
+    def _raw_chunk_attention_view(
+        self,
+        layer,
+        k,
+        v,
+        chunks,
+        previous,
+        values,
+        make_rope,
+        rotate_into,
+        write_current,
+    ):
+        # Match physical output ranges as well as raw K and coordinate versions.
+        # A surviving chunk shifted by compact must not read an old scratch view.
+        if self._chunk_plan is None:
+            if self.rope_position_mode != "absolute":
+                raise ValueError(
+                    "Zing relative RoPE requires the current attention map"
+                )
+            self._bind_chunk_positions(self.positions())
+        plan = self._chunk_plan
+        ranges, offset = [], 0
+        for chunk, identity, start, end, _, key in plan:
+            signature = self._raw_chunk_signature(layer, chunk, identity, start, end)
+            count = end - start
+            ranges.append(
+                (offset, offset + count, chunk.offset + start, key, signature)
+            )
+            offset += count
+        reusable = set(previous)
+        previous_parts = {entry[4][0]: entry for entry in previous}
+        accounting = dict(
+            layer=layer, rebuilt_rows=0, reused_rows=0, coefficients_built=0, reasons={}
+        )
+        self.last_rope_reuse = accounting
+        keys = self._reserve_chunk_rotations(
+            layer, k, values.shape[0], ranges, reusable
+        )
+        live = {entry[5] for entry in plan}
+        self._rope_coefficients = {
+            key: value
+            for key, value in self._rope_coefficients.items()
+            if key[0] in live
+        }
+        for (chunk, _, local_start, local_end, positions, key), entry in zip(
+            plan, ranges
+        ):
+            start, end = entry[:2]
+            # Exact match of the last successfully published entry: output
+            # range, raw offset, coordinate token, and raw K part signature.
+            if entry in reusable:
+                self.rope_reuse_stats["reused_rows"] += end - start
+                accounting["reused_rows"] += end - start
+                continue
+            for reason in self._chunk_rebuild_reasons(
+                previous_parts.get(entry[4][0]), entry
+            ):
+                accounting["reasons"][reason] = (
+                    accounting["reasons"].get(reason, 0) + end - start
+                )
+            coefficient_key = (key, k.dtype)
+            if coefficient_key not in self._rope_coefficients:
+                self._rope_coefficients[coefficient_key] = make_rope(positions)
+                accounting["coefficients_built"] += 1
+            rotate_into(
+                chunk.layers[layer][0][local_start:local_end],
+                self._rope_coefficients[coefficient_key],
+                keys[start:end],
+            )
+            self.rope_reuse_stats["rebuilt_rows"] += end - start
+            accounting["rebuilt_rows"] += end - start
+        total = offset + k.shape[0]
+        current_values = values[self._length : self._length + k.shape[0]]
+        write_current(k, v, keys[offset:total], current_values)
+        # Publication follows every write, including the possibly failing tail.
+        self._rotated_store_signatures[layer] = tuple(ranges)
+        return keys[:total], self._chunk_value_view(chunks, values, current_values)
+
+    def _chunk_value_view(self, chunks, values, current_values):
+        """Use a contiguous V view; gather only legacy selections with gaps."""
+        runs = self._runs(chunks)
+        if not runs:
+            return current_values
+        if len(runs) == 1 and runs[0][1] == self._length:
+            return values[runs[0][0] : self._length + current_values.shape[0]]
+        return torch.cat([values[a:b] for a, b in runs] + [current_values])
+
     def stage_raw_k(self, layer, k):
         """Copy a clean forward's raw K into this layer's raw store scratch tail.
 
@@ -568,7 +845,9 @@ class ZingH3KVCache:
         if store is None or store[0].shape[0] < self._length + rows:
             raise RuntimeError("Zing raw K staging requires a reserved store")
         tail = store[0][self._length : self._length + rows]
+        self._observe_raw_store(layer)
         tail.copy_(k)
+        self._mark_raw_store(layer)
         return tail
 
     def stage_prefix_kv(self, layer, k, v, head_start, heads):
@@ -588,6 +867,7 @@ class ZingH3KVCache:
         out_v = values[self._length : self._length + rows]
         out_k.copy_(k)
         out_v.copy_(v)
+        self._mark_raw_store(layer)
         return out_k, out_v
 
     def _replace_prefix_in_place(self, prefix, old_rows, new_rows):
@@ -609,6 +889,7 @@ class ZingH3KVCache:
         if shift > 0:
             moving.reverse()
         for layer in range(self.num_layers):
+            self._observe_raw_store(layer)
             slot = self.storage[layer]
             if shift:
                 for chunk in moving:
@@ -625,6 +906,7 @@ class ZingH3KVCache:
                 slot.k[:new_rows].copy_(k)
                 slot.v[:new_rows].copy_(v)
             self._stores[layer] = (slot.k, slot.v)
+            self._mark_raw_store(layer)
         return total
 
     def replace_prefix(self, prefix):
@@ -634,7 +916,7 @@ class ZingH3KVCache:
         the donor cache to be cleared. Relative rotations must be rebuilt: a new
         prefix can change the temporal anchor even with identical raw positions.
         """
-        self._invalidate_rope()
+        self._invalidate_rope(preserve_chunks=True)
         if self.active is not None or self.pending_source is not None:
             raise ValueError("Zing prefix replacement requires a committed boundary")
         old_rows = 0 if self.prefix is None else self.prefix.positions.shape[0]
@@ -643,11 +925,13 @@ class ZingH3KVCache:
         total = new_rows + tail
         for layer in () if self.pooled else range(self.num_layers):
             store = self._stores.get(layer)
+            self._observe_raw_store(layer)
             source = None if prefix is None else prefix.layers[layer]
             if new_rows == old_rows and store is not None:
                 if source is not None:
                     store[0][:new_rows].copy_(source[0])
                     store[1][:new_rows].copy_(source[1])
+                self._mark_raw_store(layer)
                 continue
             if source is None and store is None:
                 continue
@@ -656,7 +940,12 @@ class ZingH3KVCache:
             capacity = max(total, self.reserve_rows)
             if store is not None:
                 capacity = max(capacity, store[0].shape[0])
-            keys = template[0].new_empty((capacity, *template[0].shape[1:]))
+            with (
+                torch.inference_mode(False)
+                if self.chunk_rope_reuse and self.raw_store
+                else nullcontext()
+            ):
+                keys = template[0].new_empty((capacity, *template[0].shape[1:]))
             values = template[1].new_empty((capacity, *template[1].shape[1:]))
             if source is not None:
                 keys[:new_rows].copy_(source[0])
@@ -665,6 +954,7 @@ class ZingH3KVCache:
                 keys[new_rows:total].copy_(store[0][old_rows : self._length])
                 values[new_rows:total].copy_(store[1][old_rows : self._length])
             self._stores[layer] = (keys, values)
+            self._mark_raw_store(layer)
         if self.pooled:
             total = self._replace_prefix_in_place(prefix, old_rows, new_rows)
         shift = new_rows - old_rows
@@ -746,7 +1036,9 @@ class ZingH3KVCache:
             ):
                 if source.data_ptr() != destination.data_ptr():
                     destination.copy_(source)
+            self._mark_raw_store(layer)
         self._length = offset + rows
+        self._chunk_plan = None
         chunk = ZingKVChunk(positions, block, (), frames, offset)
         chunk.position_signature = self._tensor_signature(positions)
         chunk.layers = tuple(
@@ -806,6 +1098,7 @@ class ZingH3KVCache:
                 merged = ZingKVChunk(
                     combined_positions, block, (), frames, source.offset
                 )
+                merged.rope_parts = self._parts(source) + self._parts(chunk)
                 merged.position_signature = self._tensor_signature(combined_positions)
                 merged.layers = tuple(
                     (
