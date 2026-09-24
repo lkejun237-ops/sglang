@@ -17,6 +17,7 @@ class ZingH3RealtimeState(BaseRealtimeState):
         self.pending_blocks = []
         self.video_decoder = self.decoder_frames = None
         self.decoded_latents = 0
+        self.kv_lease = None
 
     @contextmanager
     def random_stream(self, device, seed):
@@ -38,10 +39,18 @@ class ZingH3RealtimeState(BaseRealtimeState):
                 self.cuda_rng = torch.cuda.get_rng_state(devices[0])
 
     def dispose(self):
-        if self.video_decoder is not None:
-            self.video_decoder.close()
-        if self.sampling is not None:
-            self.sampling.close()
+        try:
+            if self.video_decoder is not None:
+                self.video_decoder.close()
+        finally:
+            try:
+                if self.sampling is not None:
+                    self.sampling.close()
+            finally:
+                # Return the slot only after the cache dropped its views.
+                if self.kv_lease is not None:
+                    self.kv_lease.release()
+                    self.kv_lease = None
         self.sampler = self.sampling = self.inputs = None
         self.cpu_rng = self.cuda_rng = None
         self.prompt = None

@@ -5,6 +5,10 @@ from dataclasses import dataclass
 
 import torch
 
+from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+    ZingKVCapacityError,
+    ZingLayerStore,
+)
 from sglang.multimodal_gen.runtime.realtime.zing_window import ZingWindowPolicy
 
 
@@ -35,6 +39,13 @@ class ZingH3KVCache:
     local attention-head shard. A failed request must call clear(). The temporal
     window counts whole source/target/audio transactions. Legacy local_frames
     selects history but does not bound storage.
+
+    With ``storage`` (one preallocated ``ZingLayerStore`` per layer, #171) the
+    raw store and rotated-K scratch are views of that fixed slot: nothing is
+    allocated or grown, a request that would exceed the slot raises
+    ``ZingKVCapacityError``, and clear() only drops logical state and views,
+    never the slot itself. The pool owns the slot; returning it is the
+    lease's job, not the cache's.
     """
 
     def __init__(
@@ -47,6 +58,7 @@ class ZingH3KVCache:
         window_policy: ZingWindowPolicy | None = None,
         rope_position_mode: str = "absolute",
         rope_max_frame_gap: int = 12,
+        storage: list[ZingLayerStore] | None = None,
     ):
         if num_layers < 1 or local_frames < -1 or sink_frames < 0:
             raise ValueError("Invalid Zing KV layer count or frame limits")
@@ -76,7 +88,30 @@ class ZingH3KVCache:
         self.reserve_rows = (
             reserve_rows if self.window_policy.window_chunks is None else 0
         )
+        if storage is not None:
+            if not self.raw_store or self.window_policy.window_chunks is None:
+                raise ValueError(
+                    "Zing pooled storage requires a finite-window raw store"
+                )
+            if len(storage) != num_layers:
+                raise ValueError("Zing pooled storage must provide every layer")
+        self.storage = storage
+        # Main-store allocations/growth and compactions, counted apart from
+        # derived RoPE/position metadata, which is never pooled.
+        self.stats = {
+            "store_allocations": 0,
+            "rotated_allocations": 0,
+            "compactions": 0,
+        }
         self.clear()
+
+    @property
+    def pooled(self):
+        return self.storage is not None
+
+    @property
+    def capacity(self):
+        return None if self.storage is None else self.storage[0].rows
 
     def clear(self):
         self.prefix = None
@@ -155,13 +190,16 @@ class ZingH3KVCache:
 
     def owned_tensors(self):
         """Include derived storage in session memory/release accounting."""
+        # A pooled slot outlives the session; count only session-owned storage.
         for chunk in self._stored_chunks():
             yield chunk.positions
-            for pair in chunk.layers:
+            if not self.pooled:
+                for pair in chunk.layers:
+                    yield from pair
+        if not self.pooled:
+            for pair in self._stores.values():
                 yield from pair
-        for pair in self._stores.values():
-            yield from pair
-        yield from self._rotated_stores.values()
+            yield from self._rotated_stores.values()
         yield from self._rope_coefficients.values()
         if self._effective_history_positions is not None:
             yield self._effective_history_positions
@@ -190,6 +228,7 @@ class ZingH3KVCache:
             self.committed = retained
             self._invalidate_rope()
             self._compact_store()
+            self.stats["compactions"] += 1
 
     def _compact_store(self):
         """Move live raw K/V to the front, using at most one chunk temporarily."""
@@ -295,6 +334,7 @@ class ZingH3KVCache:
                     "Zing model changed within a cached session; clear it first"
                 )
             self._invalidate_rope()
+            # Pooled views are rebound from the slot; the slot is kept.
             self._stores.clear()
             self._rotated_stores.clear()
             self._length = 0
@@ -332,6 +372,9 @@ class ZingH3KVCache:
         store = self._stores.get(layer)
         if store is not None and store[0].shape[0] >= needed:
             return store
+        if self.pooled:
+            return self._bind_slot(layer, needed, k)
+        self.stats["store_allocations"] += 1
         capacity = max(needed, self.reserve_rows)
         if store is not None and not self.reserve_rows:
             capacity = max(capacity, 2 * store[0].shape[0])
@@ -343,6 +386,20 @@ class ZingH3KVCache:
         self._stores[layer] = (keys, values)
         # Views of the old buffer would keep it alive and read stale rows.
         self._rebind(layer)
+        return self._stores[layer]
+
+    def _bind_slot(self, layer, needed, k):
+        """Expose this layer's fixed slot as the store; never allocate or grow."""
+        slot = self.storage[layer]
+        if needed > slot.rows:
+            raise ZingKVCapacityError(
+                f"Zing pooled KV needs {needed} rows but the slot holds {slot.rows}"
+            )
+        if (tuple(k.shape[1:]), k.dtype, k.device) != slot.layout:
+            raise ValueError("Zing K/V head-shard layout does not match the pool slot")
+        if layer not in self._stores:
+            self._stores[layer] = (slot.k, slot.v)
+            self._rebind(layer)
         return self._stores[layer]
 
     def _rebind(self, layer):
@@ -453,7 +510,11 @@ class ZingH3KVCache:
         retained = sum(c.positions.shape[0] for c in chunks[:common])
         keys = self._rotated_stores.get(layer)
         capacity = values.shape[0]
-        if keys is None or keys.shape[0] < capacity:
+        if self.pooled and keys is None:
+            keys = self.storage[layer].rotated_k
+            self._rotated_stores[layer] = keys
+        elif keys is None or keys.shape[0] < capacity:
+            self.stats["rotated_allocations"] += 1
             grown = k.new_empty((capacity, *k.shape[1:]))
             if keys is not None and retained:
                 grown[:retained].copy_(keys[:retained])
@@ -510,6 +571,62 @@ class ZingH3KVCache:
         tail.copy_(k)
         return tail
 
+    def stage_prefix_kv(self, layer, k, v, head_start, heads):
+        """Write one layer's local head shard of a replicated prefix in place.
+
+        A replicated SP prefix computes every head on every rank. Only this
+        rank's shard is written into the store tail, where the commit finds it
+        and copies nothing, so no full-head copy outlives the layer.
+        """
+        if not self.raw_store:
+            raise ValueError("Zing prefix staging requires a raw K/V store")
+        k = k[:, head_start : head_start + heads]
+        v = v[:, head_start : head_start + heads]
+        rows = k.shape[0]
+        keys, values = self._reserve_store(layer, self._length + rows, k, v)
+        out_k = keys[self._length : self._length + rows]
+        out_v = values[self._length : self._length + rows]
+        out_k.copy_(k)
+        out_v.copy_(v)
+        return out_k, out_v
+
+    def _replace_prefix_in_place(self, prefix, old_rows, new_rows):
+        """Shift committed rows within each fixed slot, then write the prefix.
+
+        Chunks move one at a time in the direction that never overwrites an
+        unread source. A chunk overlapping its destination is staged through
+        the slot's rotated-K buffer, which replace_prefix has just invalidated
+        and the next attention rebuilds from row 0, so the move allocates
+        nothing outside the slot.
+        """
+        total = new_rows + self._length - old_rows
+        if total > self.capacity:
+            raise ZingKVCapacityError(
+                f"Zing pooled KV needs {total} rows but the slot holds {self.capacity}"
+            )
+        shift = new_rows - old_rows
+        moving = [c for c in self._stored_chunks() if c is not self.prefix]
+        if shift > 0:
+            moving.reverse()
+        for layer in range(self.num_layers):
+            slot = self.storage[layer]
+            if shift:
+                for chunk in moving:
+                    rows, start = chunk.positions.shape[0], chunk.offset
+                    for tensor in (slot.k, slot.v):
+                        source = tensor[start : start + rows]
+                        if abs(shift) < rows:
+                            source = slot.rotated_k[:rows].copy_(source)
+                        tensor[start + shift : start + shift + rows].copy_(source)
+            if prefix is not None:
+                k, v = prefix.layers[layer]
+                if (tuple(k.shape[1:]), k.dtype, k.device) != slot.layout:
+                    raise ValueError("Zing prefix layout does not match the pool slot")
+                slot.k[:new_rows].copy_(k)
+                slot.v[:new_rows].copy_(v)
+            self._stores[layer] = (slot.k, slot.v)
+        return total
+
     def replace_prefix(self, prefix):
         """Adopt a rebuilt prefix, keeping committed target rows and positions.
 
@@ -524,7 +641,7 @@ class ZingH3KVCache:
         new_rows = 0 if prefix is None else prefix.positions.shape[0]
         tail = self._length - old_rows
         total = new_rows + tail
-        for layer in range(self.num_layers):
+        for layer in () if self.pooled else range(self.num_layers):
             store = self._stores.get(layer)
             source = None if prefix is None else prefix.layers[layer]
             if new_rows == old_rows and store is not None:
@@ -548,6 +665,8 @@ class ZingH3KVCache:
                 keys[new_rows:total].copy_(store[0][old_rows : self._length])
                 values[new_rows:total].copy_(store[1][old_rows : self._length])
             self._stores[layer] = (keys, values)
+        if self.pooled:
+            total = self._replace_prefix_in_place(prefix, old_rows, new_rows)
         shift = new_rows - old_rows
         for chunk in self._stored_chunks():
             if chunk is not self.prefix:

@@ -36,6 +36,15 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
     video_decoder_backend: str = "taeh3"
     taeh3_checkpoint_path: str | None = None
     taeh3_decode_precision: str = "fp32"
+    # Realtime KV pool (#171). None disables it and keeps per-session growth.
+    zing_kv_pool_size: int | None = None
+    zing_kv_pool_max_target_area: int | None = None
+    zing_kv_pool_max_target_long_edge: int | None = None
+    zing_kv_pool_max_prefix_rows: int | None = None
+    zing_kv_pool_window_chunks: int = 21
+    zing_kv_pool_sink_chunks: int = 3
+    zing_kv_pool_rope_position_mode: str = "block_relative"
+    zing_kv_pool_rope_max_frame_gap: int = 12
 
     @property
     def requires_audio_output(self):
@@ -100,6 +109,14 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
                     "Zing SP requires the numerically validated configuration: "
                     + ", ".join(missing)
                 )
+        from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+            ZingKVPoolConfig,
+        )
+
+        ZingKVPoolConfig.from_pipeline_config(
+            self,
+            max_sessions=getattr(server_args, "realtime_max_sessions_per_worker", 1),
+        )
         selected = self.resolve_transformer_attention_backend(server_args)
         if (
             selected is not None

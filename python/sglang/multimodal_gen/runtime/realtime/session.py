@@ -49,9 +49,22 @@ class RealtimeSession:
         return self._states.get(state_cls)
 
     def dispose(self) -> None:
-        for state in list(self._states.values()):
-            state.dispose()
-        self._states.clear()
+        """Dispose every state even if one fails, then return pooled leases."""
+        first_error = None
+        try:
+            for state in list(self._states.values()):
+                try:
+                    state.dispose()
+                except Exception as error:
+                    first_error = first_error or error
+            self._states.clear()
+        finally:
+            # States release their own lease; this only guards a failed dispose.
+            lease = getattr(self, "zing_kv_lease", None)
+            if lease is not None:
+                lease.release()
+        if first_error is not None:
+            raise first_error
 
 
 class RealtimeSessionCache:
@@ -95,6 +108,17 @@ class RealtimeSessionCache:
             released,
         )
         return released
+
+    def touch(self, req: Any) -> None:
+        """Mark a request's session active when its execution ends.
+
+        Staleness counts from the end of the last activity: a dispatch that
+        runs longer than the stale window (e.g. a cold first chunk) must not
+        make its own session look idle to the next dispatch.
+        """
+        session_id = RealtimeSession.resolve_session_id(req)
+        if session_id is not None and session_id in self._last_seen:
+            self._last_seen[session_id] = self._clock()
 
     def _prune_stale(self, now: float) -> None:
         if self.stale_after_s is None:

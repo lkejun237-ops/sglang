@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import json
 import time
 from contextlib import contextmanager, nullcontext
 from copy import copy
@@ -11,6 +12,14 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+    ZingKVGeometry,
+    ZingKVPool,
+    ZingKVPoolConfig,
+    ZingKVPoolPlan,
+    ZingKVRequest,
+)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.multimodal_gen.runtime.utils.zing_diagnostics import (
     current_diagnostic,
@@ -24,7 +33,13 @@ from .request_adapter import build_h3_request
 from .sampling import ZingH3Sampler
 
 
+logger = init_logger(__name__)
+
+
 class ZingH3GenerationStage(PipelineStage):
+    # Set by initialize_realtime_kv_cache_pool; None keeps per-session caches.
+    kv_pool = None
+
     def __init__(self, modules, config, runtime):
         super().__init__()
         self.modules, self.config, self.runtime = modules, config, runtime
@@ -40,6 +55,121 @@ class ZingH3GenerationStage(PipelineStage):
             spatial_extent=rope["spatial_extent"],
             frame_scale=rope["frame_scale"],
             visual_token_frame_spans=rope["visual_token_frame_spans"],
+        )
+
+    @property
+    def realtime_kv_cache_pool_enabled(self):
+        return self.kv_pool is not None
+
+    def initialize_realtime_kv_cache_pool(self, server_args):
+        """Allocate every realtime KV slot and the prefix workspace before readiness."""
+        config = ZingKVPoolConfig.from_pipeline_config(
+            server_args.pipeline_config,
+            max_sessions=server_args.realtime_max_sessions_per_worker,
+        )
+        if config is None:
+            return
+        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+            get_sp_parallel_rank,
+            get_ulysses_parallel_world_size,
+        )
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+        from sglang.multimodal_gen.runtime.utils.precision_types import (
+            PRECISION_TO_TYPE,
+        )
+
+        started = time.perf_counter()
+        geometry = ZingKVGeometry(
+            self.codecs.spatial_ratio,
+            tuple(self.codecs.patch_size),
+            self.codecs.max_short_edge,
+            self.packer.chunk_plan,
+            video_t_span=self.packer._video_t_span,
+            time_span_period=len(self.packer.visual_token_frame_spans),
+        )
+        plan = ZingKVPoolPlan.build(config, geometry)
+        arch = self.config.dit_config.arch_config
+        ulysses = get_ulysses_parallel_world_size()
+        layout = dict(
+            num_layers=arch.num_layers,
+            local_heads=arch.num_attention_heads // ulysses,
+            head_dim=arch.attention_head_dim,
+            dtype=PRECISION_TO_TYPE[self.config.dit_precision],
+            device=current_platform.get_local_torch_device(),
+        )
+        pool = ZingKVPool.allocate(plan, **layout)
+        if layout["device"].type == "cuda":
+            torch.cuda.synchronize(layout["device"])
+        slot_bytes, workspace_bytes = pool.allocated_bytes()
+        element = torch.empty((), dtype=layout["dtype"]).element_size()
+        budget = dict(
+            num_layers=arch.num_layers,
+            local_heads=layout["local_heads"],
+            head_dim=arch.attention_head_dim,
+            element_size=element,
+        )
+        logger.info(
+            "ZING_KV_CACHE_POOL_READY_JSON %s",
+            json.dumps(
+                {
+                    "rank": get_sp_parallel_rank(),
+                    "slots": pool.size,
+                    "slot_rows": plan.slot_rows,
+                    "slot_bytes": plan.slot_bytes(**budget),
+                    "pool_allocated_bytes": slot_bytes,
+                    "prefix_workspace_rows": config.max_prefix_rows,
+                    "prefix_workspace_bytes": workspace_bytes,
+                    "max_target_area": config.max_target_area,
+                    "max_target_long_edge": config.max_target_long_edge,
+                    "max_short_edge": geometry.max_short_edge,
+                    "max_prefix_rows": config.max_prefix_rows,
+                    "window_chunks": config.window_chunks,
+                    "sink_chunks": config.sink_chunks,
+                    "rope_position_mode": config.rope_position_mode,
+                    "rope_max_frame_gap": config.rope_max_frame_gap,
+                    "chunk_lengths": list(geometry.chunk_plan.lengths),
+                    "split_first_latent": geometry.chunk_plan.split_first_latent,
+                    "reserves_target_audio": True,
+                    "ulysses_degree": ulysses,
+                    "num_attention_heads_per_rank": layout["local_heads"],
+                    "dtype": str(layout["dtype"]),
+                    "tensors_per_row": "raw_k,v,rotated_k",
+                    "initialization_ms": round(
+                        (time.perf_counter() - started) * 1000, 3
+                    ),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+        self.kv_pool = pool
+
+    def kv_request(self, sampler, inputs, layout, *, source_shape, total_frames):
+        """Describe a realtime session for pool admission after packing."""
+        ratio = self.codecs.spatial_ratio
+        _, height, width = inputs.visual_shape
+        return ZingKVRequest(
+            target_height=height * ratio,
+            target_width=width * ratio,
+            source_shape=(
+                None
+                if source_shape is None
+                else tuple(int(n) * ratio for n in source_shape[-2:])
+            ),
+            prefix_rows=int((layout["block_idx"] == 0).sum()),
+            window_chunks=sampler.window_policy.window_chunks,
+            sink_chunks=sampler.window_policy.sink_chunks,
+            rope_position_mode=sampler.rope_position_mode,
+            rope_max_frame_gap=sampler.rope_max_frame_gap,
+            generates_audio=inputs.audio_shape is not None,
+            total_frames=total_frames,
+            # audio_shape is [stereo, time, channels]; a continuous session
+            # (total_frames=None) has no finite audio tail.
+            audio_length=(
+                None
+                if inputs.audio_shape is None or total_frames is None
+                else int(inputs.audio_shape[1])
+            ),
         )
 
     def component_uses(self, server_args, stage_name=None):
@@ -373,13 +503,37 @@ class ZingH3GenerationStage(PipelineStage):
                         (1, self.packer.visual_channels, *inputs.visual_shape),
                         device=device,
                     )
-                    state.sampling = sampler.initialize(inputs, visual)
+                    state.sampling = sampler.initialize(
+                        inputs,
+                        visual,
+                        acquire_storage=self._realtime_storage(batch, state, inputs),
+                    )
                 _, end = sampler.step(
                     state.sampling, inputs=inputs if prompt_changed else None
                 )
             state.inputs = inputs
             state.prompt = params.prompt
         return end
+
+    def _realtime_storage(self, batch, state, inputs):
+        """Lease a pooled slot for a block session once its prefix is packed."""
+        if self.kv_pool is None:
+            return None
+        state.sampler.prefix_workspace = self.kv_pool.workspace
+
+        def acquire(layout):
+            source = inputs.source_visual
+            request = self.kv_request(
+                state.sampler,
+                inputs,
+                layout,
+                source_shape=None if source is None else source.shape,
+                total_frames=inputs.visual_shape[0],
+            )
+            state.kv_lease = self.kv_pool.acquire(batch.session, request)
+            return state.kv_lease.kv_cache
+
+        return acquire
 
     def _queue_realtime_output(self, batch, state, end, mode, final):
         inputs = state.inputs

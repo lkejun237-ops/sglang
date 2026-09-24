@@ -39,6 +39,7 @@ class ZingSourceStreamState(BaseRealtimeState):
         self.command_index = 0
         self.prompt = self.prompt_event = None
         self.closed = False
+        self.kv_lease = None
 
     def initialize(self, stage, batch, config):
         params = batch.sampling_params
@@ -123,6 +124,7 @@ class ZingSourceStreamState(BaseRealtimeState):
             seed=self.bridge.seed,
             max_pending_chunks=1,
             max_pending_bytes=256 << 20,
+            acquire_storage=self._pooled_storage(stage, batch.session, sampler),
         )
         decoder_type = (
             SourceTAEH3Decoder
@@ -134,6 +136,25 @@ class ZingSourceStreamState(BaseRealtimeState):
             capacity_latents=2 * tokens + max_chunk + tokens,
             provenance_for=self.ledger.provenance_for,
         )
+
+    def _pooled_storage(self, stage, session, sampler):
+        """Lease a slot at the first step; the ready session never sees the pool."""
+        if stage.kv_pool is None:
+            return None
+        sampler.prefix_workspace = stage.kv_pool.workspace
+
+        def acquire(positive, ready):
+            request = stage.kv_request(
+                sampler,
+                self.inputs,
+                positive,
+                source_shape=ready.source.shape,
+                total_frames=None,
+            )
+            self.kv_lease = stage.kv_pool.acquire(session, request)
+            return self.kv_lease.kv_cache
+
+        return acquire
 
     @torch.no_grad()
     def run(self, stage, batch):
@@ -295,7 +316,14 @@ class ZingSourceStreamState(BaseRealtimeState):
                     gpu_allocated_bytes=torch.cuda.memory_allocated(),
                     gpu_reserved_bytes=torch.cuda.memory_reserved(),
                     gpu_peak_allocated_bytes=torch.cuda.max_memory_allocated(),
+                    gpu_peak_reserved_bytes=torch.cuda.max_memory_reserved(),
                 )
+            # Diagnostic only; synthetic samplers in tests have no KV cache.
+            counters = getattr(self.sampler, "kv_counters", None)
+            if counters is not None:
+                memory.update(counters())
+            if self.kv_lease is not None and not self.kv_lease.released:
+                memory["kv_slot_id"] = self.kv_lease.slot_id
             logger.info(
                 "zing_source_step %s",
                 json.dumps(
@@ -435,6 +463,15 @@ class ZingSourceStreamState(BaseRealtimeState):
                 start = end
 
     def dispose(self):
+        try:
+            self._dispose_states()
+        finally:
+            # Return the slot only after the ready session cleared its cache.
+            if self.kv_lease is not None:
+                self.kv_lease.release()
+                self.kv_lease = None
+
+    def _dispose_states(self):
         for state in (
             self.sampler,
             self.ledger,

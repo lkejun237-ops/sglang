@@ -40,9 +40,12 @@ class ZingH3EulerSchedule:
             sample.float(), prediction.float(), self.timesteps[step_index]
         )
         ratio = self.sigmas[step_index + 1] / sigma
-        return _minimax_h3_euler_interpolate(sample.float(), denoised, ratio).to(
-            sample.dtype
-        ), denoised
+        return (
+            _minimax_h3_euler_interpolate(sample.float(), denoised, ratio).to(
+                sample.dtype
+            ),
+            denoised,
+        )
 
 
 class ZingH3Sampler(ZingBlockSamplingHelpers):
@@ -93,9 +96,33 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             schedule(video_shift),
             schedule(audio_shift),
         )
+        # Preallocated donor storage for prompt updates of pooled sessions.
+        self.prefix_workspace = None
+
+    def prefix_donor_cache(self):
+        """Cache that computes a replacement prefix before replace_prefix.
+
+        Pooled sessions borrow the worker's prefix workspace, so a prompt
+        update never allocates K/V outside the pool budget. The donor is
+        cleared right after its prefix is copied into the session slot.
+        """
+        return ZingH3KVCache(
+            len(self.generator.blocks),
+            window_policy=self.window_policy,
+            rope_position_mode=self.rope_position_mode,
+            rope_max_frame_gap=self.rope_max_frame_gap,
+            storage=self.prefix_workspace,
+        )
 
     @torch.no_grad()
-    def initialize(self, inputs, visual, audio=None):
+    def initialize(
+        self, inputs, visual, audio=None, *, storage=None, acquire_storage=None
+    ):
+        """Pack the session and create its cache.
+
+        ``acquire_storage(layout)`` leases pooled storage once the packed
+        prefix size is known and before any forward writes K/V.
+        """
         diagnostic = current_diagnostic()
         self.device = visual.device
         self.processor._validate_visual(visual)
@@ -146,12 +173,15 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             "forward_counts": forward_counts,
             "dit_forwards": 0,
         }
+        if acquire_storage is not None:
+            storage = acquire_storage(pos)
         cache = ZingH3KVCache(
             len(self.generator.blocks),
             window_policy=self.window_policy,
             rope_position_mode=self.rope_position_mode,
             rope_max_frame_gap=self.rope_max_frame_gap,
             reserve_rows=int(pos["block_idx"].numel()),
+            storage=storage,
         )
         try:
             if diagnostic:
@@ -199,12 +229,7 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             raise ValueError("Zing prompt update changed absolute target positions")
         # Reuse the original values exactly, including fractional frame positions.
         layout["position_ids"][new_target] = state.positive["position_ids"][old_target]
-        prefix_cache = ZingH3KVCache(
-            len(self.generator.blocks),
-            window_policy=self.window_policy,
-            rope_position_mode=self.rope_position_mode,
-            rope_max_frame_gap=self.rope_max_frame_gap,
-        )
+        prefix_cache = self.prefix_donor_cache()
         try:
             if bool((layout["block_idx"] == 0).any()):
                 self._forward(

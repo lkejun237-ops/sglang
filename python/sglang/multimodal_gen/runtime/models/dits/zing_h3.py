@@ -233,6 +233,7 @@ def _attention(
     append_unrotated=False,
     capture_stored_values=False,
     stage_raw_k=None,
+    stage_prefix_kv=None,
     fa4_metadata=None,
 ):
     if attention_backend not in {"torch_sdpa", "fa4"}:
@@ -261,8 +262,16 @@ def _attention(
         # Ulysses converts local sequence/all heads into complete sequence/local
         # heads. Cache that layout directly so every rank owns only its head
         # shard and no K/V all-gather is needed after a commit.
+        # With a raw-store stager, the unrotated K is written into the store
+        # tail after append_kv reserved it, instead of a pool-external clone.
+        # all-to-all output never shares QKV storage, so stage unconditionally.
+        stage_k = capture and capture_stored_values and stage_raw_k is not None
+        current_k = k[0]
         raw = (
-            (k[0].clone(), None if capture_stored_values else v[0].clone())
+            (
+                None if stage_k else k[0].clone(),
+                None if capture_stored_values else v[0].clone(),
+            )
             if capture and not capture_rotated
             else None
         )
@@ -285,7 +294,10 @@ def _attention(
                     if v.shape[1] == rows:
                         raw = (raw[0], raw[1].clone())  # no history: still a QKV view
                 elif capture and capture_stored_values:
-                    raw = (raw[0], v[0, -rows:])
+                    raw = (
+                        stage_raw_k(current_k) if stage_k else raw[0],
+                        v[0, -rows:],
+                    )
             elif history is not None:
                 with maybe_record_function("Zing.history_K_RoPE"):
                     history_k = (
@@ -318,11 +330,16 @@ def _attention(
             ].reshape(hidden.shape[0], module.num_heads * module.head_dim)
         return module.out_proj(result)[0], raw
     # V is a view into fused QKV. Persist only V, not the entire projection.
-    raw = (
-        (k, None if capture_stored_values else v.clone())
-        if capture and not capture_rotated
-        else None
-    )
+    if capture and stage_prefix_kv is not None:
+        # Replicated SP prefix: keep only this rank's head shard, written
+        # straight into the store before RoPE touches K.
+        raw = stage_prefix_kv(k, v)
+    else:
+        raw = (
+            (k, None if capture_stored_values else v.clone())
+            if capture and not capture_rotated
+            else None
+        )
     with maybe_record_function("Zing.RoPE_and_KV_append"):
         if rope is not None:
             with maybe_record_function("Zing.current_QK_RoPE"):
@@ -724,6 +741,12 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             # Absolute full history still appends during that prefix.
             use_cache = cache is not None
             raw_attention = use_cache and cache.raw_store and not replicated_prefix
+            # A pooled cache cannot hold a full-head prefix outside its slot, so a
+            # replicated prefix writes each layer's head shard as it is produced.
+            staged_prefix = (
+                use_cache and replicated_prefix and cache.raw_store and cache.pooled
+            )
+            prefix_heads = self.arch.num_attention_heads // ulysses_size
             if use_cache:
                 # The timestep constant is initialized lazily by the first forward,
                 # often under inference_mode. Preserve its values while making its
@@ -814,6 +837,16 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                             if raw_attention
                             else None
                         ),
+                        stage_prefix_kv=(
+                            functools.partial(
+                                cache.stage_prefix_kv,
+                                index,
+                                head_start=ulysses_rank * prefix_heads,
+                                heads=prefix_heads,
+                            )
+                            if staged_prefix
+                            else None
+                        ),
                         fa4_metadata=metadata,
                     )
                     with maybe_record_function("Zing.gated_residual.attention"):
@@ -852,7 +885,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             # Commit after all model work succeeds, so a failed output head cannot
             # leave a partially advanced session.
             if cache is not None:
-                if replicated_prefix:
+                if replicated_prefix and not staged_prefix:
                     heads = self.arch.num_attention_heads // ulysses_size
                     start = ulysses_rank * heads
                     layers = [

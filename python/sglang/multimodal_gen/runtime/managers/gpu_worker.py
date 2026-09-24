@@ -717,6 +717,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 except Exception:
                     forward_failed = True
                     raise
+                finally:
+                    self._realtime_sessions.touch(req)
 
             # disagg roles return raw Req so callers can keep and transfer intermediate tensors
             # before converting it to OutputBatch

@@ -72,6 +72,7 @@ class SourceReadySession:
         max_pending_spans=4096,
         total_latent_frames=None,
         initial_rng_state=None,
+        acquire_storage=None,
     ):
         if any(
             type(n) is not int or n < 1
@@ -98,12 +99,10 @@ class SourceReadySession:
         self.max_pending_spans = max_pending_spans
         self.next_chunk_id = self.next_latent = self.next_audio = self.next_pixel = 0
         self.committed_chunk_id = self.committed_latent = self.committed_pixel = 0
-        self.cache = ZingH3KVCache(
-            len(sampler.generator.blocks),
-            window_policy=sampler.window_policy,
-            rope_position_mode=sampler.rope_position_mode,
-            rope_max_frame_gap=sampler.rope_max_frame_gap,
-        )
+        # A pooled session leases its slot at the first step, once the packed
+        # prefix size is known; until then it holds no cache.
+        self.acquire_storage = acquire_storage
+        self.cache = None if acquire_storage is not None else self._new_cache(None)
         self.rng = ZingH3RealtimeState()
         if initial_rng_state is not None:
             cpu_rng, cuda_rng = initial_rng_state
@@ -126,6 +125,16 @@ class SourceReadySession:
             "dit_forwards": 0,
             "forward_counts": sampler._forward_counts,
         }
+
+    def _new_cache(self, storage):
+        sampler = self.sampler
+        return ZingH3KVCache(
+            len(sampler.generator.blocks),
+            window_policy=sampler.window_policy,
+            rope_position_mode=sampler.rope_position_mode,
+            rope_max_frame_gap=sampler.rope_max_frame_gap,
+            storage=storage,
+        )
 
     @staticmethod
     def _snapshot(condition, event_id):
@@ -286,6 +295,8 @@ class SourceReadySession:
             if sampler.do_cfg
             else None
         )
+        if self.cache is None:
+            self.cache = self._new_cache(self.acquire_storage(positive, ready))
         origin = self.media_origin
         if origin is None:
             target = positive["row_role"] == int(H3RowRole.TARGET_VISUAL)
@@ -300,12 +311,7 @@ class SourceReadySession:
         )
         with self.rng.random_stream(sampler.device, self.seed):
             if prompt is not self.applied_prompt:
-                prefix_cache = ZingH3KVCache(
-                    len(sampler.generator.blocks),
-                    window_policy=sampler.window_policy,
-                    rope_position_mode=sampler.rope_position_mode,
-                    rope_max_frame_gap=sampler.rope_max_frame_gap,
-                )
+                prefix_cache = sampler.prefix_donor_cache()
                 try:
                     if bool((positive["block_idx"] == 0).any()):
                         sampler._forward(
@@ -353,7 +359,7 @@ class SourceReadySession:
                 storages[(tensor.device, storage.data_ptr())] = storage.nbytes()
             return sum(storages.values())
 
-        kv = self.cache.owned_tensors()
+        kv = () if self.cache is None else self.cache.owned_tensors()
         static = []
         if self.inputs is not None:
             static.extend(self.inputs.visual.values())
@@ -366,12 +372,34 @@ class SourceReadySession:
             "ready_chunks": len(self.pending),
             "ready_provenance_spans": self.pending_spans,
             "kv_storage_bytes": storage_bytes(kv),
-            "kv_temporal_chunks": len(self.cache.committed),
+            "kv_temporal_chunks": 0
+            if self.cache is None
+            else len(self.cache.committed),
             "static_storage_bytes": storage_bytes(static),
         }
 
+    def kv_counters(self):
+        """Pool evidence: logical rows, fixed capacity and main-store growth.
+
+        Lifetime counters, kept out of memory_snapshot(), which reports only
+        retained state and is all zero after dispose.
+        """
+        cache = self.cache
+        if cache is None:
+            return {"kv_pooled": self.acquire_storage is not None}
+        return {
+            "kv_pooled": cache.pooled,
+            "kv_capacity_rows": cache.capacity,
+            "kv_logical_rows": cache._length,
+            "kv_prefix_rows": (
+                0 if cache.prefix is None else int(cache.prefix.positions.shape[0])
+            ),
+            **{f"kv_{name}": value for name, value in cache.stats.items()},
+        }
+
     def dispose(self):
-        self.cache.clear()
+        if self.cache is not None:
+            self.cache.clear()
         self.pending.clear()
         self.pending_bytes = 0
         self.pending_spans = 0

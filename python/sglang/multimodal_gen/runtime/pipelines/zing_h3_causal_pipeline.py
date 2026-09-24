@@ -64,11 +64,12 @@ class ZingH3CausalPipeline(ComposedPipelineBase):
             self.modules["taeh3_decoder"] = TAEH3Decoder(
                 config.taeh3_checkpoint_path, WEIGHTS_SHA256
             ).to(dtype=dtype)
-        self.add_stage(
-            ZingH3GenerationStage(
-                self.modules, server_args.pipeline_config, self.zing_runtime
-            )
+        stage = ZingH3GenerationStage(
+            self.modules, server_args.pipeline_config, self.zing_runtime
         )
+        # Realtime KV slots are allocated here, before the worker is ready.
+        stage.initialize_realtime_kv_cache_pool(server_args)
+        self.add_stage(stage)
 
 
 EntryClass = ZingH3CausalPipeline

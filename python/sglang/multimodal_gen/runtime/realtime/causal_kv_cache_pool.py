@@ -36,6 +36,10 @@ class RealtimeKVCachePoolLease:
         self.bucket_key = bucket_key
 
     @property
+    def released(self) -> bool:
+        return self._slot is None
+
+    @property
     def slot_id(self) -> int:
         if self._slot is None:
             raise RuntimeError("Realtime KV cache pool lease has been released")

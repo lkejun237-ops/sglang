@@ -369,6 +369,31 @@ def test_realtime_session_cache_reclaims_only_expired_orphaned_state():
     assert replacement.session is not first.session
 
 
+def test_long_dispatch_does_not_make_its_own_session_stale():
+    """A cold first chunk longer than the stale window keeps its session."""
+    now = [100.0]
+    cache = RealtimeSessionCache(
+        max_sessions=1,
+        stale_after_s=120,
+        clock=lambda: now[0],
+    )
+    first = _Req(realtime_session_id="session-a", block_idx=0, session=None)
+    cache.attach(first)
+    state = first.session.get_or_create_state(_State)
+    now[0] = 274.0  # the first dispatch ran 174 s
+    cache.touch(first)
+    now[0] = 275.0
+    followup = _Req(realtime_session_id="session-a", block_idx=1, session=None)
+    cache.attach(followup)
+    assert followup.session is first.session and not state.disposed
+    # An unknown or released session is not resurrected by touch.
+    cache.touch(_Req(realtime_session_id="session-z", block_idx=0, session=None))
+    assert cache.release("session-a") and state.disposed
+    cache.touch(first)
+    with pytest.raises(ValueError, match="Missing realtime session state"):
+        cache.attach(_Req(realtime_session_id="session-a", block_idx=2, session=None))
+
+
 def test_scheduler_session_release_retries_transient_failures(monkeypatch):
     async def scenario():
         calls = []

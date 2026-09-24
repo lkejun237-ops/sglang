@@ -1,0 +1,337 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Pooled ZingH3KVCache storage: parity, reuse and no growth (#171, CPU only)."""
+
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import ZingH3DiTConfig
+from sglang.multimodal_gen.runtime.layers import usp
+from sglang.multimodal_gen.runtime.models.dits import zing_h3
+from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.packing import (
+    ZingH3Packer,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.sampling import (
+    ZingH3Sampler,
+)
+from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+    ZingKVCapacityError,
+    allocate_layer_stores,
+)
+from sglang.multimodal_gen.runtime.realtime.zing_window import ZingWindowPolicy
+from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
+    cpu_execution_options,
+    model,
+)
+from sglang.multimodal_gen.test.unit.test_zing_h3_sp_cpu import _CPUCollectives
+
+WINDOW = dict(window_chunks=3, sink_chunks=1)
+
+
+def _inputs(frames, size=2, context=3):
+    return SimpleNamespace(
+        positive={
+            "context": torch.randn(context, 12).bfloat16(),
+            "row_role": torch.tensor([0, 1, 0] * (context // 3) + [0] * (context % 3)),
+        },
+        visual={},
+        audio={},
+        source_visual=torch.randn(1, 2, frames, size, size),
+        conditions=[],
+        media=[],
+        visual_shape=(frames, size, size),
+    )
+
+
+def _sampler(model):
+    packer = ZingH3Packer(model.arch, num_frame_per_block=2)
+    sampler = ZingH3Sampler(model, packer, sigma_points=2, **WINDOW)
+    sampler.device = torch.device("cpu")
+    return sampler
+
+
+def _storage(model, rows, heads=None):
+    arch = model.arch
+    return allocate_layer_stores(
+        rows,
+        num_layers=len(model.blocks),
+        local_heads=heads or arch.num_attention_heads,
+        head_dim=arch.attention_head_dim,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+
+
+def _pointers(storage):
+    return [(s.k.data_ptr(), s.v.data_ptr(), s.rotated_k.data_ptr()) for s in storage]
+
+
+@torch.no_grad()
+def _generate(sampler, inputs, visual, storage=None, prompts=()):
+    state = sampler.initialize(inputs, visual.clone(), storage=storage)
+    prompts = list(prompts)
+    while state.index < len(state.spans):
+        sampler.step(state)
+        if prompts and state.index == 2:
+            inputs.positive = prompts.pop(0)
+            sampler.update_condition(state, inputs)
+    stats, cache = dict(state.cache.stats), state.cache
+    result = state.visual.clone()
+    state.close()
+    return result, stats, cache
+
+
+@torch.no_grad()
+def test_pooled_sampling_matches_growth_path_across_evictions(model):
+    sampler = _sampler(model)
+    torch.manual_seed(1)
+    inputs, visual = _inputs(9), torch.randn(1, 2, 9, 2, 2)
+    expected, grown, _ = _generate(sampler, inputs, visual)
+    # 9 latent frames in 2-frame chunks is five chunks: two evictions at 3/1.
+    assert grown["compactions"] >= 2 and grown["store_allocations"] > 0
+    storage = _storage(model, 64)
+    pointers = _pointers(storage)
+    actual, pooled, cache = _generate(sampler, inputs, visual, storage)
+    assert torch.equal(actual, expected)
+    assert pooled["store_allocations"] == pooled["rotated_allocations"] == 0
+    assert pooled["compactions"] == grown["compactions"]
+    assert _pointers(storage) == pointers
+    assert cache.prefix is None and not cache.committed and cache._length == 0
+
+
+@torch.no_grad()
+def test_slot_is_reused_by_larger_then_smaller_then_larger_sessions(model):
+    sampler = _sampler(model)
+    storage = _storage(model, 64)
+    pointers = _pointers(storage)
+    for size in (4, 2, 4):
+        torch.manual_seed(size)
+        inputs, visual = _inputs(5, size), torch.randn(1, 2, 5, size, size)
+        expected, _, _ = _generate(sampler, inputs, visual)
+        actual, stats, _ = _generate(sampler, inputs, visual, storage)
+        # A previous session's rows must not leak into this one.
+        assert torch.equal(actual, expected)
+        assert stats["store_allocations"] == stats["rotated_allocations"] == 0
+    assert _pointers(storage) == pointers
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("lengths", [(7, 2), (4, 2), (2, 9)])
+def test_prompt_update_shifts_history_inside_the_slot(model, lengths, monkeypatch):
+    # A prefix row-count change smaller than a chunk overlaps the move; it must
+    # be staged inside the slot, never through a request-time allocation.
+    replace_in_place = ZingH3KVCache._replace_prefix_in_place
+    shifts = []
+
+    def no_allocation(*args, **kwargs):
+        raise AssertionError("pooled prefix replacement allocated a tensor")
+
+    def guarded(self, prefix, old_rows, new_rows):
+        shifts.append(new_rows - old_rows)
+        with monkeypatch.context() as scope:
+            for name in ("clone", "new_empty", "new_zeros", "contiguous"):
+                scope.setattr(torch.Tensor, name, no_allocation)
+            for name in ("empty", "empty_like", "zeros", "zeros_like", "cat"):
+                scope.setattr(torch, name, no_allocation)
+            return replace_in_place(self, prefix, old_rows, new_rows)
+
+    monkeypatch.setattr(ZingH3KVCache, "_replace_prefix_in_place", guarded)
+    sampler = _sampler(model)
+    torch.manual_seed(3)
+    inputs, visual = _inputs(9), torch.randn(1, 2, 9, 2, 2)
+    prompts = [
+        {
+            "context": torch.randn(n, 12).bfloat16(),
+            "row_role": torch.zeros(n, dtype=torch.long),
+        }
+        for n in lengths
+    ]
+    original = inputs.positive
+    expected, _, _ = _generate(sampler, inputs, visual, prompts=prompts[:1])
+    inputs.positive = original
+    storage = _storage(model, 64)
+    pointers = _pointers(storage)
+    sampler.prefix_workspace = _storage(model, 16)
+    workspace = _pointers(sampler.prefix_workspace)
+    actual, stats, _ = _generate(sampler, inputs, visual, storage, prompts[:1])
+    assert torch.equal(actual, expected)
+    assert shifts == [lengths[0] - 3]  # +1 and -1 overlap their own chunk
+    assert stats["store_allocations"] == stats["rotated_allocations"] == 0
+    assert _pointers(storage) == pointers
+    assert _pointers(sampler.prefix_workspace) == workspace
+
+
+@torch.no_grad()
+def test_pooled_cache_rejects_growth_beyond_the_slot(model):
+    sampler = _sampler(model)
+    inputs, visual = _inputs(9), torch.randn(1, 2, 9, 2, 2)
+    storage = _storage(model, 8)
+    with pytest.raises(ZingKVCapacityError):
+        _generate(sampler, inputs, visual, storage)
+    # The failed session is closed; the slot serves the next session intact.
+    small = _inputs(3)
+    _generate(sampler, small, torch.randn(1, 2, 3, 2, 2), _storage(model, 64))
+
+
+def test_pooled_storage_requires_a_finite_raw_window(model):
+    storage = _storage(model, 8)
+    with pytest.raises(ValueError, match="finite-window"):
+        ZingH3KVCache(len(model.blocks), storage=storage)
+    with pytest.raises(ValueError, match="every layer"):
+        ZingH3KVCache(
+            len(model.blocks) + 1,
+            window_policy=ZingWindowPolicy(**WINDOW),
+            rope_position_mode="block_relative",
+            storage=storage,
+        )
+
+
+@torch.no_grad()
+def test_pooled_cache_rejects_a_mismatched_head_shard(model):
+    sampler = _sampler(model)
+    storage = _storage(model, 64, heads=1)
+    with pytest.raises(ValueError, match="does not match the pool slot"):
+        _generate(sampler, _inputs(3), torch.randn(1, 2, 3, 2, 2), storage)
+
+
+def _transactions(sampler, layout, blocks):
+    out = []
+    for block in range(blocks):
+        phase = "prefix" if block == 0 else ("target" if block % 2 == 0 else "source")
+        target = phase == "target"
+        out.append(
+            (
+                sampler._select_block(
+                    layout,
+                    block,
+                    phase=phase,
+                    video_t=0.25 if target else 1.0,
+                    audio_t=None,
+                ),
+                "active" if target else phase,
+            )
+        )
+        if target:
+            out.append(
+                (
+                    sampler._select_block(
+                        layout,
+                        block,
+                        phase="target",
+                        video_t=1,
+                        audio_t=None,
+                        final=True,
+                    ),
+                    "final",
+                )
+            )
+    return out
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("world", [2, 4])
+@pytest.mark.parametrize("stable_shapes", [False, True])
+def test_sp_pooled_raw_store_matches_unpooled(model, monkeypatch, world, stable_shapes):
+    """SP raw K and replicated-prefix shards are staged into the slot."""
+    if world == 4:
+        arch = replace(
+            model.arch,
+            num_attention_heads=4,
+            hidden_size=32,
+            adaln_out_features=768,
+            final_adaln_out_features=64,
+        )
+        model = zing_h3.ZingH3DiTModel(ZingH3DiTConfig(arch_config=arch), {}).eval()
+        torch.manual_seed(7)
+        for name, param in model.named_parameters():
+            if "norm" in name and name.endswith("weight"):
+                param.fill_(1)
+            else:
+                param.copy_(torch.randn(param.shape) * 0.08)
+        model.rope.inv_freq.fill_(1)
+    model.experimental_stable_shapes = stable_shapes
+    sampler = _sampler(model)
+    torch.manual_seed(5)
+    inputs, visual = _inputs(7), torch.randn(1, 2, 7, 2, 2)
+    layout = sampler.processor.pack_inference_layout(
+        inputs, inputs.positive, visual, None
+    )
+    transactions = _transactions(sampler, layout, 9)
+    communication = _CPUCollectives(world)
+    monkeypatch.setattr(
+        zing_h3, "get_ulysses_ctx", lambda: (world, communication.thread.rank)
+    )
+    monkeypatch.setattr(
+        zing_h3, "get_sp_group", lambda: SimpleNamespace(ulysses_group=None)
+    )
+    monkeypatch.setattr(zing_h3, "gather_sequence_varlen", communication.gather)
+    monkeypatch.setattr(usp, "get_ulysses_parallel_world_size", lambda: world)
+    monkeypatch.setattr(
+        usp, "get_ulysses_parallel_rank", lambda: communication.thread.rank
+    )
+    monkeypatch.setattr(usp, "_ipc_ready_group", lambda: None)
+    monkeypatch.setattr(usp, "_usp_all_to_all_single_varlen", communication.all_to_all)
+    heads = model.arch.num_attention_heads // world
+    staged = {"raw_k": 0, "prefix": 0}
+    for name, key in (("stage_raw_k", "raw_k"), ("stage_prefix_kv", "prefix")):
+        original = getattr(ZingH3KVCache, name)
+
+        def counted(self, *args, _original=original, _key=key, **kwargs):
+            if self.pooled:
+                staged[_key] += 1
+            return _original(self, *args, **kwargs)
+
+        monkeypatch.setattr(ZingH3KVCache, name, counted)
+
+    def cache(storage):
+        return ZingH3KVCache(
+            len(model.blocks),
+            window_policy=ZingWindowPolicy(**WINDOW),
+            rope_position_mode="block_relative",
+            storage=storage,
+        )
+
+    def run(pooled):
+        def rank_worker(rank):
+            communication.thread.rank = rank
+            with torch.no_grad():
+                storage = _storage(model, 64, heads) if pooled else None
+                target = cache(storage)
+                outputs = []
+                for packed, phase in transactions:
+                    if phase == "source":
+                        # Evict before the source, as ZingH3Sampler.step does.
+                        target.prepare_chunk(int(packed["block_idx"][0]) + 1)
+                    outputs.append(sampler._forward(packed, target, phase))
+                return outputs, target, storage
+
+        with ThreadPoolExecutor(max_workers=world) as executor:
+            return [
+                f.result()
+                for f in [executor.submit(rank_worker, r) for r in range(world)]
+            ]
+
+    unpooled, pooled_runs = run(False), run(True)
+    # Every SP commit stages raw K into the slot; a replicated prefix stages
+    # its head shard instead of keeping a full-head copy.
+    assert staged["raw_k"] > 0
+    assert (staged["prefix"] > 0) == stable_shapes
+    for (expected, reference, _), (actual, pooled, storage) in zip(
+        unpooled, pooled_runs
+    ):
+        for got, want in zip(actual, expected):
+            for value, ref in zip(got, want):
+                if ref is not None:
+                    assert torch.equal(value, ref)
+        assert pooled.stats["store_allocations"] == 0
+        assert pooled.stats["rotated_allocations"] == 0
+        for layer in range(len(model.blocks)):
+            for value, ref in zip(pooled.history(layer), reference.history(layer)):
+                assert torch.equal(value, ref)
+            # Committed rows are views of this rank's slot, not external copies.
+            assert pooled.history(layer)[0].shape[1] == heads
+            assert pooled._stores[layer][0].data_ptr() == storage[layer].k.data_ptr()
