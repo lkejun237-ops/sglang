@@ -14,6 +14,12 @@ from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
 from sglang.multimodal_gen.runtime.realtime.zing_window import ZingWindowPolicy
 
 
+def tensor_identity(value):
+    """Object identity plus in-place version, when the tensor tracks one."""
+    version = None if torch.is_inference(value) else value._version
+    return id(value), version
+
+
 @dataclass
 class ZingKVChunk:
     positions: torch.Tensor
@@ -26,6 +32,8 @@ class ZingKVChunk:
     position_signature: tuple | None = None
     identity: object = field(default_factory=object, repr=False)
     rope_parts: tuple = ()
+    # CPU copy of positions; lets coordinate maps run without device reads.
+    host_positions: torch.Tensor | None = None
 
     @property
     def temporal_chunk_id(self):
@@ -124,6 +132,9 @@ class ZingH3KVCache:
         self.pending_source = None
         self.committed = []
         self.active = None
+        self._active_reference = None
+        self._attention_positions_memo = None
+        self._effective_history_source = None
         self.last_block = 0
         self.layer_layouts = None
         self._rope_coefficients = {}
@@ -149,6 +160,7 @@ class ZingH3KVCache:
             self._rotated_store_signatures.clear()
             self._chunk_geometry.clear()
         self._effective_history_positions = None
+        self._effective_history_source = None
         self._chunk_plan = None
         self._rope_epoch += 1
 
@@ -177,6 +189,16 @@ class ZingH3KVCache:
         before = self._effective_history_positions
         if before is None and history_positions is None:
             return
+        # attention_positions() hands back the same tensors while its inputs are
+        # unchanged, so repeated denoising forwards skip the device comparison.
+        if (
+            before is not None
+            and history_positions is not None
+            and self._effective_history_source is not None
+            and self._effective_history_source[0] is history_positions
+            and self._effective_history_source[1] == tensor_identity(history_positions)
+        ):
+            return
         if (
             before is not None
             and history_positions is not None
@@ -184,10 +206,19 @@ class ZingH3KVCache:
             and before.dtype == history_positions.dtype
             and torch.equal(before, history_positions)
         ):
+            self._effective_history_source = (
+                history_positions,
+                tensor_identity(history_positions),
+            )
             return
         self._invalidate_rope()
         if history_positions is not None:
             self._effective_history_positions = history_positions.detach().clone()
+            # Hold the bound tensor so its identity cannot be reused.
+            self._effective_history_source = (
+                history_positions,
+                tensor_identity(history_positions),
+            )
 
     @staticmethod
     def _parts(chunk):
@@ -221,6 +252,7 @@ class ZingH3KVCache:
                 end = offset + count
                 value = positions[offset:end]
                 old = self._chunk_geometry.get(identity)
+                # Host and device entries never compare; a switch rebuilds.
                 comparable = (
                     old is not None
                     and old[1].shape == value.shape
@@ -273,6 +305,8 @@ class ZingH3KVCache:
         # A pooled slot outlives the session; count only session-owned storage.
         for chunk in self._stored_chunks():
             yield chunk.positions
+            if chunk.host_positions is not None:
+                yield chunk.host_positions
             if not self.pooled:
                 for pair in chunk.layers:
                     yield from pair
@@ -367,7 +401,7 @@ class ZingH3KVCache:
         chunks = self._history()
         return torch.cat([c.positions for c in chunks]) if chunks else None
 
-    def attention_positions(self, current, *, prefix=False):
+    def attention_positions(self, current, *, prefix=False, host_current=None):
         """Rebuild RoPE coordinates only; cached positions/provenance stay absolute.
 
         Unlike MinWM token order, Zing repeats time across source, target and
@@ -376,7 +410,45 @@ class ZingH3KVCache:
         Prefix/reference coordinates are unchanged. Gap units are checkpoint
         temporal coordinates (not pixels, latent frames or temporal chunk IDs).
         """
-        history = self.positions()
+        chunks = self._history()
+        # Map on host copies when every history chunk has one; no device read.
+        on_host = host_current is not None and all(
+            c.host_positions is not None for c in chunks
+        )
+        if on_host:
+            current = host_current
+        key = (
+            on_host,
+            tensor_identity(current),
+            prefix,
+            self.rope_position_mode,
+            self.rope_max_frame_gap,
+            self.prefix is not None,
+            tuple(
+                tensor_identity(c.host_positions if on_host else c.positions)
+                for c in chunks
+            ),
+        )
+        memo = self._attention_positions_memo
+        if memo is not None and memo[0] == key:
+            return memo[2]
+        history = self.host_positions() if on_host else self.positions()
+        result = self._map_attention_positions(current, prefix, history)
+        # Keep the keyed tensors alive so their identities cannot be reused.
+        self._attention_positions_memo = (
+            key,
+            (current, *(c.host_positions if on_host else c.positions for c in chunks)),
+            result,
+        )
+        return result
+
+    def host_positions(self):
+        chunks = self._history()
+        return torch.cat([c.host_positions for c in chunks]) if chunks else None
+
+    def _map_attention_positions(self, current, prefix, history=None):
+        if history is None:
+            history = self.positions()
         if self.rope_position_mode == "absolute" or prefix:
             return current, history
         prefix_rows = 0 if self.prefix is None else self.prefix.positions.shape[0]
@@ -965,11 +1037,25 @@ class ZingH3KVCache:
         if prefix is not None:
             with torch.inference_mode(False), torch.no_grad():
                 positions = prefix.positions.detach().clone()
+                host = (
+                    None
+                    if prefix.host_positions is None
+                    else prefix.host_positions.detach().clone()
+                )
             prefix = ZingKVChunk(positions, prefix.block, (), prefix.frames, 0)
             prefix.position_signature = self._tensor_signature(positions)
+            prefix.host_positions = host
         self.prefix = prefix
         for layer in range(self.num_layers):
             self._rebind(layer)
+
+    def _same_active_geometry(self, positions):
+        """Compare with the active snapshot held on the caller's device."""
+        reference = self._active_reference
+        if reference is None or reference.device != positions.device:
+            reference = self.active[1]
+            positions = positions.to(reference.device)
+        return torch.equal(reference, positions)
 
     def validate(self, positions, block_idx, phase, frames):
         if torch.is_grad_enabled():
@@ -1013,7 +1099,7 @@ class ZingH3KVCache:
             ):
                 raise ValueError("Zing target does not match its pending source")
             if self.active is not None and (
-                self.active[0] != block or not torch.equal(self.active[1], positions)
+                self.active[0] != block or not self._same_active_geometry(positions)
             ):
                 raise ValueError("Zing active target geometry changed before commit")
             if phase == "final" and self.active is None:
@@ -1050,12 +1136,21 @@ class ZingH3KVCache:
         )
         return chunk
 
-    def update(self, positions, block_idx, phase, frames, layers=None):
-        block = self.validate(positions, block_idx, phase, frames)
+    def update(self, positions, block_idx, phase, frames, layers=None, validation=None):
+        """Apply one transaction.
+
+        ``validation`` optionally supplies host copies ``(positions, block_idx)``
+        of the device tensors, so the phase checks never read the device.
+        """
+        checked = (positions, block_idx) if validation is None else validation
+        block = self.validate(*checked, phase, frames)
         if phase == "active":
             if layers is not None:
                 raise ValueError("Active Zing K/V must not be persisted")
             self.active = (block, positions.detach().clone())
+            self._active_reference = (
+                self.active[1] if validation is None else checked[0].detach().clone()
+            )
             return
         if layers is None or len(layers) != self.num_layers:
             raise ValueError("Zing KV commit requires every transformer layer")
@@ -1085,6 +1180,9 @@ class ZingH3KVCache:
         # Source rows already sit immediately before their target's, so the
         # merge below only has to widen this chunk's view over the store.
         chunk = self._store_chunk(saved_positions, block, frames, layers)
+        if validation is not None and checked[0].device.type == "cpu":
+            with torch.inference_mode(False), torch.no_grad():
+                chunk.host_positions = checked[0].detach().clone()
         if phase == "prefix":
             self.prefix = chunk
         elif phase == "source":
@@ -1100,6 +1198,14 @@ class ZingH3KVCache:
                 )
                 merged.rope_parts = self._parts(source) + self._parts(chunk)
                 merged.position_signature = self._tensor_signature(combined_positions)
+                if (
+                    source.host_positions is not None
+                    and chunk.host_positions is not None
+                ):
+                    with torch.inference_mode(False), torch.no_grad():
+                        merged.host_positions = torch.cat(
+                            (source.host_positions, chunk.host_positions)
+                        )
                 merged.layers = tuple(
                     (
                         self._stores[layer][0][source.offset : source.offset + rows],
@@ -1110,4 +1216,4 @@ class ZingH3KVCache:
                 chunk = merged
             self.committed.append(chunk)
             self.last_block = block
-            self.pending_source = self.active = None
+            self.pending_source = self.active = self._active_reference = None

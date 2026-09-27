@@ -11,9 +11,11 @@ import functools
 import math
 import os
 import warnings
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn.functional as F
+
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_group,
@@ -47,6 +49,62 @@ def storage_masks(roles):
         (roles == 4) | (roles == 7) | (roles == 10),
         (roles == 5) | (roles == 11),
     )
+
+
+def host_to_device(tensor, device):
+    """Copy a host-built tensor without a pageable-copy stream synchronization.
+
+    The pinned staging block comes from the caching host allocator, which keeps
+    it alive until the asynchronous copy has completed. An already pinned source
+    is not staged, so it must not be modified until the copy completes.
+    """
+    if tensor.device == device:
+        return tensor
+    if device.type != "cuda" or tensor.device.type != "cpu":
+        return tensor.to(device)
+    return tensor.pin_memory().to(device, non_blocking=True)
+
+
+@dataclass(eq=False)
+class ZingHostLayout:
+    """CPU copies of one packed selection's row metadata.
+
+    The sampler builds these once per selected block and passes the same
+    object for every forward over that block, together with the per-step CPU
+    ``t``. The forward validates and derives row indices from them on the
+    host, so repeated denoising forwards read no device metadata back.
+    The device tensors passed alongside must hold the same values.
+    """
+
+    seq_lens: torch.Tensor
+    clean_seq_lens: torch.Tensor
+    block_idx: torch.Tensor
+    position_ids: torch.Tensor
+    row_role: torch.Tensor
+    # Device row indices derived from this layout, keyed by SP/shape policy.
+    derived: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _RowLayout:
+    """One forward's row selections as index tensors on the compute device."""
+
+    sequence_splits: list | None
+    row_start: int
+    row_stop: int
+    # Positions within this rank's hidden rows.
+    local_crows: torch.Tensor
+    local_vrows: torch.Tensor
+    local_arows: torch.Tensor
+    # Compact storage rows feeding the local positions above.
+    context_source: torch.Tensor
+    video_source: torch.Tensor
+    audio_source: torch.Tensor
+    # Positions within the complete packed sequence.
+    vrows: torch.Tensor
+    arows: torch.Tensor
+    # Per-row AdaLN modality on the metadata device.
+    modality: torch.Tensor
 
 
 def causal_mask(blocks, clean_count):
@@ -162,10 +220,7 @@ class _FA4ForwardMetadata:
         if pair is not None:
             self.hits += 1
             return pair
-        pair = (
-            torch.tensor([0, q_rows], dtype=torch.int32, device=q.device),
-            torch.tensor([0, k_rows], dtype=torch.int32, device=k.device),
-        )
+        pair = _fa4_cu_seqlens(q_rows, k_rows, q.device, k.device)
         self._pairs[key] = pair
         self.pairs_created += 1
         self.tensors_created += 2
@@ -175,6 +230,13 @@ class _FA4ForwardMetadata:
         self._pairs.clear()
         self._streams.clear()
         self._closed = True
+
+
+def _fa4_cu_seqlens(q_rows, k_rows, q_device, k_device):
+    return (
+        host_to_device(torch.tensor([0, q_rows], dtype=torch.int32), q_device),
+        host_to_device(torch.tensor([0, k_rows], dtype=torch.int32), k_device),
+    )
 
 
 def _fa4_attention(q, k, v, scale, metadata=None):
@@ -189,8 +251,7 @@ def _fa4_attention(q, k, v, scale, metadata=None):
         ) from error
     q_rows, k_rows = q.shape[0], k.shape[0]
     if metadata is None:
-        cu_seqlens_q = torch.tensor([0, q_rows], dtype=torch.int32, device=q.device)
-        cu_seqlens_k = torch.tensor([0, k_rows], dtype=torch.int32, device=k.device)
+        cu_seqlens_q, cu_seqlens_k = _fa4_cu_seqlens(q_rows, k_rows, q.device, k.device)
     else:
         cu_seqlens_q, cu_seqlens_k = metadata.lengths(q, k, v)
     result = flash_attn_varlen_func(
@@ -464,46 +525,116 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         self.preprocess_loaded_state_dict = self._preprocess_checkpoint
         self._cache_weight_generation = 0
 
-    def _project_outputs(
-        self, hidden, p, sequence_splits, local_vrows, local_arows, vrows, arows
-    ):
+    def _project_outputs(self, hidden, p, layout):
         """Project video/audio rows and restore global packed order across SP.
 
         Stable shapes gather hidden rows before projection to match SP1 GEMM
         shapes. Otherwise, project local rows and gather packed logits once.
         """
+        sequence_splits = layout.sequence_splits
         replicated_output = (
             self.experimental_stable_shapes and sequence_splits is not None
         )
-        output_vrows, output_arows = local_vrows, local_arows
+        output_vrows, output_arows = layout.local_vrows, layout.local_arows
         if replicated_output:
             hidden = gather_sequence_varlen(
                 hidden, sequence_splits, get_sp_group().ulysses_group, dim=0
             )
-            output_vrows, output_arows = vrows, arows
+            output_vrows, output_arows = layout.vrows, layout.arows
         video = (
-            self.final_layer.video_out(hidden[output_vrows].float())[0]
+            self.final_layer.video_out(hidden.index_select(0, output_vrows).float())[0]
             .reshape(-1, self.arch.latents_dim, p)
             .permute(0, 2, 1)
         )
-        audio = self.final_layer.audio_out(hidden[output_arows].float())[0]
+        audio = self.final_layer.audio_out(
+            hidden.index_select(0, output_arows).float()
+        )[0]
         if sequence_splits is not None and not replicated_output:
             video_width = p * self.arch.latents_dim
             audio_width = self.arch.audio_latents_dim
             local_logits = hidden.new_zeros(
                 (hidden.shape[0], video_width + audio_width), dtype=video.dtype
             )
-            local_logits[local_vrows, :video_width] = video.reshape(-1, video_width)
-            local_logits[local_arows, video_width:] = audio
+            local_logits[:, :video_width].index_copy_(
+                0, layout.local_vrows, video.reshape(-1, video_width)
+            )
+            local_logits[:, video_width:].index_copy_(
+                0, layout.local_arows, audio.to(local_logits.dtype)
+            )
             logits = gather_sequence_varlen(
                 local_logits,
                 sequence_splits,
                 get_sp_group().ulysses_group,
                 dim=0,
             )
-            video = logits[vrows, :video_width].reshape(-1, p, self.arch.latents_dim)
-            audio = logits[arows, video_width:]
+            video = (
+                logits[:, :video_width]
+                .index_select(0, layout.vrows)
+                .reshape(-1, p, self.arch.latents_dim)
+            )
+            audio = logits[:, video_width:].index_select(0, layout.arows)
         return video, audio
+
+    @staticmethod
+    def _row_layout(
+        row_role,
+        host_layout,
+        rows,
+        ulysses_size,
+        ulysses_rank,
+        replicated_prefix,
+        device,
+    ):
+        """Row selections for this rank; host layouts cache their device copies."""
+        key = (ulysses_size, ulysses_rank, replicated_prefix, device)
+        if host_layout is not None and key in host_layout.derived:
+            return host_layout.derived[key]
+        sequence_splits = (
+            None
+            if ulysses_size == 1 or replicated_prefix
+            else compute_sequence_splits(rows, ulysses_size)
+        )
+        row_start = (
+            0 if sequence_splits is None else sum(sequence_splits[:ulysses_rank])
+        )
+        row_stop = (
+            rows
+            if sequence_splits is None
+            else row_start + sequence_splits[ulysses_rank]
+        )
+        crows, vrows, arows = storage_masks(row_role)
+        local_crows, local_vrows, local_arows = storage_masks(
+            row_role[row_start:row_stop]
+        )
+
+        def positions(mask):
+            return host_to_device(mask.nonzero().squeeze(1), device)
+
+        def compact(global_mask, local_mask):
+            compact_indices = global_mask.long().cumsum(0).sub_(1)
+            return host_to_device(
+                compact_indices[row_start:row_stop][local_mask], device
+            )
+
+        modality = torch.zeros_like(row_role)
+        modality[row_role == 0], modality[arows], modality[row_role == 7] = 1, 2, 3
+        layout = _RowLayout(
+            sequence_splits=sequence_splits,
+            row_start=row_start,
+            row_stop=row_stop,
+            local_crows=positions(local_crows),
+            local_vrows=positions(local_vrows),
+            local_arows=positions(local_arows),
+            context_source=compact(crows, local_crows),
+            video_source=compact(vrows, local_vrows),
+            audio_source=compact(arows, local_arows),
+            vrows=positions(vrows),
+            arows=positions(arows),
+            modality=modality,
+        )
+        if host_layout is not None:
+            host_layout.derived[key] = layout
+        return layout
 
     @staticmethod
     def _validate_tp_config(*, arch, tp_size):
@@ -550,7 +681,10 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         position_ids,
         row_role,
         audio_x,
+        *,
+        metadata_device=None,
     ):
+        """Validate packed rows; row metadata may be host copies of the inputs."""
         lengths = seq_lens[seq_lens > 0]
         if lengths.numel() != 1:
             raise ValueError("Zing inference accepts one document per request")
@@ -567,10 +701,10 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             or bool((clean_seq_lens > seq_lens).any())
         ):
             raise ValueError("Invalid Zing clean sequence lengths")
+        metadata_device = x.device if metadata_device is None else metadata_device
         if any(
-            v.device != x.device
-            for v in (t, context, block_idx, position_ids, row_role, audio_x)
-        ):
+            v.device != metadata_device for v in (t, block_idx, position_ids, row_role)
+        ) or any(v.device != x.device for v in (context, audio_x)):
             raise ValueError("Zing packed tensors must share one device")
         crows, vrows, arows = storage_masks(row_role)
         if not bool((crows | vrows | arows).all()):
@@ -632,25 +766,64 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         audio_x,
         cache: ZingH3KVCache | None = None,
         self_cache_update=None,
+        host_layout: ZingHostLayout | None = None,
+        host_t: torch.Tensor | None = None,
     ):
-        rows, clean, p, crows, vrows, arows = self._validate_packed_inputs(
+        """Run one packed Zing document.
+
+        ``host_layout``/``host_t`` are optional CPU copies of the row metadata.
+        With them, validation and row selection run on the host and reach the
+        device through asynchronous copies, so the forward reads nothing back.
+        """
+        if (host_layout is None) != (host_t is None):
+            raise ValueError("Zing host row metadata requires both layout and t")
+        if host_layout is None:
+            meta = (t, seq_lens, clean_seq_lens, block_idx, position_ids, row_role)
+            metadata_device = None
+        else:
+            meta = (
+                host_t,
+                host_layout.seq_lens,
+                host_layout.clean_seq_lens,
+                host_layout.block_idx,
+                host_layout.position_ids,
+                host_layout.row_role,
+            )
+            device_meta = (
+                t,
+                seq_lens,
+                clean_seq_lens,
+                block_idx,
+                position_ids,
+                row_role,
+            )
+            if any(h.shape != d.shape for h, d in zip(meta, device_meta)):
+                raise ValueError("Zing host row metadata does not match packed rows")
+            if any(
+                v.device != x.device for v in (t, block_idx, position_ids, row_role)
+            ):
+                raise ValueError("Zing packed tensors must share one device")
+            metadata_device = torch.device("cpu")
+        meta_t, meta_seq_lens, meta_clean, meta_block, meta_positions, meta_roles = meta
+        rows, clean, p, _, _, _ = self._validate_packed_inputs(
             x,
-            t,
+            meta_t,
             context,
-            seq_lens,
-            clean_seq_lens,
-            block_idx,
-            position_ids,
-            row_role,
+            meta_seq_lens,
+            meta_clean,
+            meta_block,
+            meta_positions,
+            meta_roles,
             audio_x,
+            metadata_device=metadata_device,
         )
         frames = self._validate_cache_inputs(
             rows=rows,
             clean=clean,
-            t=t,
-            block_idx=block_idx,
-            position_ids=position_ids,
-            row_role=row_role,
+            t=meta_t,
+            block_idx=meta_block,
+            position_ids=meta_positions,
+            row_role=meta_roles,
             cache=cache,
             self_cache_update=self_cache_update,
         )
@@ -670,39 +843,40 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 and self_cache_update == "prefix"
                 and ulysses_size > 1
             )
-            sequence_splits = (
-                None
-                if ulysses_size == 1 or replicated_prefix
-                else compute_sequence_splits(rows, ulysses_size)
+            layout = self._row_layout(
+                meta_roles,
+                host_layout,
+                rows,
+                ulysses_size,
+                ulysses_rank,
+                replicated_prefix,
+                x.device,
             )
-            row_start = (
-                0 if sequence_splits is None else sum(sequence_splits[:ulysses_rank])
-            )
-            row_stop = (
-                rows
-                if sequence_splits is None
-                else row_start + sequence_splits[ulysses_rank]
-            )
-            local_row_role = row_role[row_start:row_stop]
-            local_crows, local_vrows, local_arows = storage_masks(local_row_role)
-
-            def local_compact(values, global_mask, local_mask):
-                compact_indices = global_mask.long().cumsum(0).sub_(1)
-                compact_indices = compact_indices[row_start:row_stop][local_mask]
-                return values.index_select(0, compact_indices)
+            sequence_splits = layout.sequence_splits
+            row_start, row_stop = layout.row_start, layout.row_stop
 
             hidden = torch.zeros(
                 (row_stop - row_start, self.arch.hidden_size),
                 dtype=torch.bfloat16,
                 device=x.device,
             )
-            local_x = local_compact(x, vrows, local_vrows)
-            hidden[local_vrows] = self.video_patch_proj(
-                local_x.permute(0, 2, 1).reshape(-1, p * self.arch.latents_dim).float()
-            )[0].bfloat16()
-            hidden[local_arows] = self.audio_patch_proj(
-                local_compact(audio_x, arows, local_arows).float()
-            )[0].bfloat16()
+            local_x = x.index_select(0, layout.video_source)
+            hidden.index_copy_(
+                0,
+                layout.local_vrows,
+                self.video_patch_proj(
+                    local_x.permute(0, 2, 1)
+                    .reshape(-1, p * self.arch.latents_dim)
+                    .float()
+                )[0].bfloat16(),
+            )
+            hidden.index_copy_(
+                0,
+                layout.local_arows,
+                self.audio_patch_proj(
+                    audio_x.index_select(0, layout.audio_source).float()
+                )[0].bfloat16(),
+            )
             if context.shape[0]:
                 refined = self.condition_proj(context.bfloat16())[0]
                 for block in self.token_refiner.blocks:
@@ -716,17 +890,25 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                         )[0]
                     )
                     refined = refined + block.mlp(block.norm2(refined))
-                hidden[local_crows] = local_compact(
-                    self.token_refiner.final_norm(refined), crows, local_crows
+                hidden.index_copy_(
+                    0,
+                    layout.local_crows,
+                    self.token_refiner.final_norm(refined)
+                    .index_select(0, layout.context_source)
+                    .to(hidden.dtype),
                 )
-            unique_t, t_indices = torch.unique(t, sorted=True, return_inverse=True)
+            unique_t, t_indices = torch.unique(meta_t, sorted=True, return_inverse=True)
+            unique_t = host_to_device(unique_t, x.device)
             adaln_input = F.silu(self.time_embedder(unique_t.float())).bfloat16()
-            modality = torch.zeros_like(row_role)
-            modality[row_role == 0], modality[arows], modality[row_role == 7] = 1, 2, 3
-            indices = (t_indices * 4 + modality)[row_start:row_stop]
+            indices = host_to_device(
+                (t_indices * 4 + layout.modality)[row_start:row_stop], x.device
+            )
+            local_t_indices = host_to_device(t_indices[row_start:row_stop], x.device)
             attention_positions, history_positions = (
                 cache.attention_positions(
-                    position_ids, prefix=self_cache_update == "prefix"
+                    position_ids,
+                    prefix=self_cache_update == "prefix",
+                    host_current=None if host_layout is None else meta_positions,
                 )
                 if cache is not None
                 else (position_ids, None)
@@ -769,11 +951,12 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 cache.bind_attention_positions(history_positions)
             with maybe_record_function("Zing.build_RoPE_and_history_positions"):
                 rope = _rope_cos_sin_cache(
-                    self.rope(rope_positions[None]), dtype=hidden.dtype
+                    self.rope(host_to_device(rope_positions, x.device)[None]),
+                    dtype=hidden.dtype,
                 )
             mask = None
             if cache is None and not (
-                clean in (0, rows) and bool((block_idx == block_idx[0]).all())
+                clean in (0, rows) and bool((meta_block == meta_block[0]).all())
             ):
                 mask = causal_mask(block_idx, clean)
             capture = self_cache_update in {"prefix", "source", "final"}
@@ -796,7 +979,8 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
 
                     def make_history_rope(positions):
                         return _rope_cos_sin_cache(
-                            self.rope(positions[None]), dtype=value.dtype
+                            self.rope(host_to_device(positions, value.device)[None]),
+                            dtype=value.dtype,
                         )
 
                     def write_current_kv(k, v, out_k, out_v):
@@ -874,14 +1058,11 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 )
                 if capture:
                     layers.append(raw)
-            local_t_indices = t_indices[row_start:row_stop]
             shift, scale = (
                 v[local_t_indices] for v in self.final_layer.adaln_proj(adaln_input)
             )
             hidden = self.final_layer.norm(hidden) * (1 + scale) + shift
-            video, audio = self._project_outputs(
-                hidden, p, sequence_splits, local_vrows, local_arows, vrows, arows
-            )
+            video, audio = self._project_outputs(hidden, p, layout)
             # Commit after all model work succeeds, so a failed output head cannot
             # leave a partially advanced session.
             if cache is not None:
@@ -894,12 +1075,18 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                         )
                         for layer in layers
                     ]
+                validation = (
+                    {}
+                    if host_layout is None
+                    else {"validation": (meta_positions, meta_block)}
+                )
                 cache.update(
                     position_ids,
                     block_idx,
                     self_cache_update,
                     frames,
                     layers if self_cache_update != "active" else None,
+                    **validation,
                 )
             return video, audio
         finally:

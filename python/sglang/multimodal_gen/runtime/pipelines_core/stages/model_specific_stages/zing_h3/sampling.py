@@ -5,6 +5,7 @@ import math
 from dataclasses import dataclass
 
 import torch
+
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_minimax_h3_euler_ancestral import (
     _minimax_h3_euler_interpolate,
@@ -288,7 +289,7 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         sound = None if audio is None else audio[:, :, audio_indices]
         if diagnostic:
             diagnostic.phase = f"block{source}.source"
-        if bool((pos["block_idx"] == source).any()):
+        if self._has_block(pos, source):
             self._forward(
                 self._select_block(
                     pos, source, phase="source", video_t=1, audio_t=None
@@ -296,12 +297,14 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
                 cache,
                 "source",
             )
+        video_timesteps = self._host_list(vs.timesteps)
+        audio_timesteps = None if sound is None else self._host_list(aus.timesteps)
         for step in range(len(vs.timesteps)):
             if diagnostic:
                 diagnostic.phase = f"block{target}.step{step}"
             with maybe_record_function(f"Zing.denoise_step.block{target}.step{step}"):
-                vt = float(vs.timesteps[step])
-                at = None if sound is None else float(aus.timesteps[step])
+                vt = video_timesteps[step]
+                at = None if sound is None else audio_timesteps[step]
                 self._set_block_latents(pos, target, video, sound)
                 packed = self._select_block(
                     pos, target, phase="target", video_t=vt, audio_t=at

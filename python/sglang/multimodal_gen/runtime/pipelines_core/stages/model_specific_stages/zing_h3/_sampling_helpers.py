@@ -2,15 +2,144 @@
 # SPDX-License-Identifier: Apache-2.0
 """Packed block selection adapted from seedleap/zing a0f45389."""
 
+from dataclasses import dataclass, field
+
 import torch
+
+from sglang.multimodal_gen.runtime.models.dits.zing_h3 import (
+    ZingHostLayout,
+    host_to_device,
+)
+from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import tensor_identity
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.multimodal_gen.runtime.utils.zing_diagnostics import current_diagnostic
 
 from .packing import H3RowRole
 
+_LAYOUT_INDEX = "_zing_layout_index"
+_HOST_LAYOUT = "_zing_host_layout"
+_HOST_T = "_zing_host_t"
+_PREDICT_ROWS = "_zing_predict_rows"
+_HOST_GUARD = "_zing_host_guard"
+_GUARDED_ROWS = (
+    "t",
+    "seq_lens",
+    "clean_seq_lens",
+    "block_idx",
+    "position_ids",
+    "row_role",
+)
+_HOST_LAYOUT_KEYS = ("row_role", "block_idx", "position_ids", "seq_lens")
+
+
+def _host_metadata(packed):
+    """Host copies of a selection's rows, unless the caller changed its tensors.
+
+    A replaced or in-place edited metadata tensor makes the forward read the
+    device tensors instead. Inference tensors have no version counter, so only
+    their replacement is detected.
+    """
+    host_layout = packed.get(_HOST_LAYOUT)
+    if host_layout is None:
+        return None
+    for name, tensor, identity in packed[_HOST_GUARD]:
+        if packed.get(name) is not tensor or tensor_identity(tensor) != identity:
+            return None
+    return {"host_layout": host_layout, "host_t": packed[_HOST_T]}
+
+
+def _positions(mask, device):
+    return host_to_device(mask.nonzero().squeeze(1), device)
+
+
+def _visual_roles(roles):
+    return (
+        (roles == int(H3RowRole.REFERENCE_VISUAL))
+        | (roles == int(H3RowRole.SOURCE_VISUAL))
+        | (roles == int(H3RowRole.TARGET_VISUAL))
+    )
+
+
+def _audio_roles(roles):
+    return (roles == int(H3RowRole.REFERENCE_AUDIO)) | (
+        roles == int(H3RowRole.TARGET_AUDIO)
+    )
+
+
+@dataclass(eq=False)
+class _BlockSelection:
+    """One block phase's rows: host facts plus reusable device tensors."""
+
+    visual_source: torch.Tensor
+    audio_source: torch.Tensor
+    context_source: torch.Tensor
+    device_rows: dict
+    # Host masks that build each step's t.
+    visual_rows: torch.Tensor
+    audio_rows: torch.Tensor
+    target_rows: torch.Tensor
+    host_layouts: dict
+    # Host masks of target video/audio rows within the compact outputs.
+    predict_video: torch.Tensor
+    predict_audio: torch.Tensor | None
+    predict_rows: dict = field(default_factory=dict)
+
+    def prediction_rows(self, device):
+        """Device indices of the target rows, built once per output device."""
+        rows = self.predict_rows.get(device)
+        if rows is None:
+            rows = (
+                _positions(self.predict_video, device),
+                None
+                if self.predict_audio is None
+                else _positions(self.predict_audio, device),
+            )
+            self.predict_rows[device] = rows
+        return rows
+
+
+@dataclass(eq=False)
+class _LayoutIndex:
+    """Host copies and cached row selections of one packed layout.
+
+    Packing fixes a layout's rows; while blocks are sampled only its clean
+    latents change. One device-to-host copy per layout lets every block
+    selection, latent write and prediction split use host facts and cached
+    device index tensors, so a denoising step reads nothing back.
+    """
+
+    signature: tuple
+    host: dict
+    selections: dict = field(default_factory=dict)
+    latent_targets: dict = field(default_factory=dict)
+
 
 class ZingBlockSamplingHelpers:
     causal = True
+
+    def _layout_index(self, layout: dict) -> _LayoutIndex:
+        signature = tuple(tensor_identity(layout[key]) for key in _HOST_LAYOUT_KEYS)
+        index = layout.get(_LAYOUT_INDEX)
+        if index is None or index.signature != signature:
+            index = _LayoutIndex(
+                signature, {key: layout[key].cpu() for key in _HOST_LAYOUT_KEYS}
+            )
+            layout[_LAYOUT_INDEX] = index
+        return index
+
+    def _host_list(self, tensor: torch.Tensor) -> list:
+        """Host values of a small schedule tensor, read once per tensor object."""
+        cache = self.__dict__.setdefault("_host_lists", {})
+        entry = cache.get(id(tensor))
+        if (
+            entry is None
+            or entry[0] is not tensor
+            or entry[1] != tensor_identity(tensor)
+        ):
+            # The entry holds the tensor, so its id cannot be reused meanwhile.
+            entry = (tensor, tensor_identity(tensor), tensor.tolist())
+            cache[id(tensor)] = entry
+        return entry[2]
 
     def _predict(
         self,
@@ -20,15 +149,24 @@ class ZingBlockSamplingHelpers:
         update: str | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         video_rows, audio_rows = self._forward(packed, cache, update)
+        if _host_metadata(packed) is not None:
+            video_index, audio_index = packed[_PREDICT_ROWS].prediction_rows(
+                video_rows.device
+            )
+            video = self.processor.unpatchify_visual(
+                video_rows.index_select(0, video_index), 1, latent_shape
+            )
+            audio = (
+                None
+                if audio_index is None
+                else audio_rows.index_select(0, audio_index).reshape(
+                    1, 2, -1, self.processor.audio_channels
+                )
+            )
+            return video, audio
         roles = packed["row_role"]
-        visual_rows = (
-            (roles == int(H3RowRole.REFERENCE_VISUAL))
-            | (roles == int(H3RowRole.SOURCE_VISUAL))
-            | (roles == int(H3RowRole.TARGET_VISUAL))
-        )
-        audio_storage_rows = (roles == int(H3RowRole.REFERENCE_AUDIO)) | (
-            roles == int(H3RowRole.TARGET_AUDIO)
-        )
+        visual_rows = _visual_roles(roles)
+        audio_storage_rows = _audio_roles(roles)
         video_mask = (roles == int(H3RowRole.TARGET_VISUAL))[visual_rows].to(
             self.device
         )
@@ -79,11 +217,12 @@ class ZingBlockSamplingHelpers:
             "position_ids",
             "row_role",
         )
-        kwargs = {name: packed[name].to(self.device) for name in names}
+        kwargs = {name: host_to_device(packed[name], self.device) for name in names}
         if cache is not None:
             kwargs.update(cache=cache, self_cache_update=update)
         elif update is not None:
             raise ValueError("H3 cache update requires a cache")
+        kwargs.update(_host_metadata(packed) or {})
         with maybe_record_function(f"Zing.forward.{update or 'unconditional'}"):
             diagnostic = current_diagnostic()
             if diagnostic:
@@ -143,12 +282,13 @@ class ZingBlockSamplingHelpers:
     def _audio_indices(
         self, layout: dict[str, torch.Tensor], target_block: int
     ) -> list[int]:
-        target = layout["row_role"] == int(H3RowRole.TARGET_AUDIO)
+        host = self._layout_index(layout).host
+        target = host["row_role"] == int(H3RowRole.TARGET_AUDIO)
         if not bool(target.any()):
             return []  # video-only 输出仍可携带 audio reference，但没有待采样 audio latent
-        all_times = layout["position_ids"][target, 0]
-        block_times = layout["position_ids"][
-            target & (layout["block_idx"] == target_block), 0
+        all_times = host["position_ids"][target, 0]
+        block_times = host["position_ids"][
+            target & (host["block_idx"] == target_block), 0
         ]
         if not block_times.numel():
             raise ValueError("H3 video_audio target block has no aligned audio rows")
@@ -159,6 +299,11 @@ class ZingBlockSamplingHelpers:
             .tolist()
         )
 
+    def _has_block(self, layout: dict[str, torch.Tensor], block_number: int) -> bool:
+        return bool(
+            (self._layout_index(layout).host["block_idx"] == block_number).any()
+        )
+
     def _set_block_latents(
         self,
         layout: dict[str, torch.Tensor],
@@ -166,50 +311,52 @@ class ZingBlockSamplingHelpers:
         video: torch.Tensor,
         audio: torch.Tensor | None,
     ) -> None:
-        roles = layout["row_role"]
-        visual_rows = (
-            (roles == int(H3RowRole.REFERENCE_VISUAL))
-            | (roles == int(H3RowRole.SOURCE_VISUAL))
-            | (roles == int(H3RowRole.TARGET_VISUAL))
-        )
-        target = (
-            (roles == int(H3RowRole.TARGET_VISUAL))
-            & (layout["block_idx"] == target_block)
-        )[visual_rows]
+        index = self._layout_index(layout)
+        targets = index.latent_targets.get(target_block)
+        if targets is None:
+            roles, blocks = index.host["row_role"], index.host["block_idx"]
+            in_block = blocks == target_block
+            visual = ((roles == int(H3RowRole.TARGET_VISUAL)) & in_block)[
+                _visual_roles(roles)
+            ]
+            audio_rows = ((roles == int(H3RowRole.TARGET_AUDIO)) & in_block)[
+                _audio_roles(roles)
+            ]
+            targets = (
+                _positions(visual, layout["clean_visual"].device),
+                _positions(audio_rows, layout["clean_audio"].device),
+            )
+            index.latent_targets[target_block] = targets
+        visual_target, audio_target = targets
         video_rows = self.processor.patchify_visual(video).to(layout["clean_visual"])
-        if int(target.sum().item()) != video_rows.shape[0]:
+        if visual_target.numel() != video_rows.shape[0]:
             raise ValueError(
                 "H3 current video block does not match processor target rows"
             )
-        layout["clean_visual"][target.to(layout["clean_visual"].device)] = video_rows
+        layout["clean_visual"].index_copy_(0, visual_target, video_rows)
         if audio is None:
             return
-        audio_storage_rows = (roles == int(H3RowRole.REFERENCE_AUDIO)) | (
-            roles == int(H3RowRole.TARGET_AUDIO)
-        )
-        target = (
-            (roles == int(H3RowRole.TARGET_AUDIO))
-            & (layout["block_idx"] == target_block)
-        )[audio_storage_rows]
         audio_rows = audio[0].reshape(-1, audio.shape[-1]).to(layout["clean_audio"])
-        if int(target.sum().item()) != audio_rows.shape[0]:
+        if audio_target.numel() != audio_rows.shape[0]:
             raise ValueError(
                 "H3 current audio block does not match processor target rows"
             )
-        layout["clean_audio"][target.to(layout["clean_audio"].device)] = audio_rows
+        layout["clean_audio"].index_copy_(0, audio_target, audio_rows)
 
-    def _select_block(
-        self,
-        layout: dict[str, torch.Tensor],
-        block_number: int,
-        *,
-        phase: str,
-        video_t: float,
-        audio_t: float | None,
-        final: bool = False,
-    ) -> dict[str, torch.Tensor]:
-        rows = int(layout["seq_lens"].sum().item())
-        roles, blocks = layout["row_role"], layout["block_idx"]
+    def _block_selection(
+        self, layout: dict[str, torch.Tensor], block_number: int, phase: str
+    ) -> _BlockSelection:
+        index = self._layout_index(layout)
+        selection = index.selections.get((block_number, phase))
+        if selection is None:
+            selection = self._new_block_selection(layout, index, block_number, phase)
+            index.selections[(block_number, phase)] = selection
+        return selection
+
+    def _new_block_selection(self, layout, index, block_number, phase):
+        host = index.host
+        rows = int(host["seq_lens"].sum().item())
+        roles, blocks = host["row_role"], host["block_idx"]
         if roles.shape != (rows,) or blocks.shape != (rows,):
             raise ValueError(
                 "H3 inference layout row_role/block_idx must cover seq_lens"
@@ -220,7 +367,7 @@ class ZingBlockSamplingHelpers:
             roles == int(H3RowRole.TARGET_AUDIO)
         )
         if not self.causal:
-            keep = torch.ones(rows, dtype=torch.bool, device=blocks.device)
+            keep = torch.ones(rows, dtype=torch.bool)
         elif phase == "prefix":
             keep = blocks == 0
         elif phase == "source":
@@ -232,66 +379,110 @@ class ZingBlockSamplingHelpers:
         context_rows = (roles == int(H3RowRole.CONDITION_TEXT)) | (
             roles == int(H3RowRole.CONDITION_VISUAL)
         )
-        visual_rows = (
-            (roles == int(H3RowRole.REFERENCE_VISUAL))
-            | (roles == int(H3RowRole.SOURCE_VISUAL))
-            | (roles == int(H3RowRole.TARGET_VISUAL))
-        )
-        audio_rows = (roles == int(H3RowRole.REFERENCE_AUDIO)) | (
-            roles == int(H3RowRole.TARGET_AUDIO)
-        )
         selected_roles = roles[keep]
-        selected_context = keep[context_rows]
-        selected_visual = keep[visual_rows]
-        selected_audio = keep[audio_rows]
-        packed = {
-            "x": layout["clean_visual"][
-                selected_visual.to(layout["clean_visual"].device)
-            ],
-            "audio_x": layout["clean_audio"][
-                selected_audio.to(layout["clean_audio"].device)
-            ],
-            "context": layout["context"][selected_context.to(layout["context"].device)],
-            "position_ids": layout["position_ids"][keep],
-            "row_role": selected_roles,
-            "block_idx": blocks[keep],
-            "seq_lens": torch.tensor(
-                [int(keep.sum().item())], dtype=torch.long, device=keep.device
-            ),
+        metadata_device = layout["row_role"].device
+        kept = _positions(keep, metadata_device)
+        count = int(keep.sum().item())
+        seq_lens = torch.tensor([count], dtype=torch.long)
+        device_seq_lens = host_to_device(seq_lens, metadata_device)
+        device_rows = {
+            "position_ids": layout["position_ids"].index_select(0, kept),
+            "row_role": layout["row_role"].index_select(0, kept),
+            "block_idx": layout["block_idx"].index_select(0, kept),
+            "seq_lens": device_seq_lens,
         }
-        target_rows = (selected_roles == int(H3RowRole.TARGET_VISUAL)) | (
-            selected_roles == int(H3RowRole.TARGET_AUDIO)
+        host_rows = dict(
+            seq_lens=seq_lens,
+            block_idx=blocks[keep],
+            position_ids=host["position_ids"][keep],
+            row_role=selected_roles,
         )
-        update_rows = torch.zeros_like(target_rows) if final else target_rows
-        packed["clean_seq_lens"] = (
-            torch.zeros_like(packed["seq_lens"])
-            if self.causal and phase == "target" and not final
-            else packed["seq_lens"].clone()
+        clean_seq_lens = {}
+        host_layouts = {}
+        for final in (False, True):
+            unmarked = self.causal and phase == "target" and not final
+            clean_seq_lens[final] = (
+                torch.zeros_like(device_seq_lens)
+                if unmarked
+                else device_seq_lens.clone()
+            )
+            host_layouts[final] = ZingHostLayout(
+                clean_seq_lens=(
+                    torch.zeros_like(seq_lens) if unmarked else seq_lens.clone()
+                ),
+                **host_rows,
+            )
+        device_rows["clean_seq_lens"] = clean_seq_lens
+        target_video = selected_roles == int(H3RowRole.TARGET_VISUAL)
+        target_audio = selected_roles == int(H3RowRole.TARGET_AUDIO)
+        selected_visual_rows = _visual_roles(selected_roles)
+        selected_audio_rows = _audio_roles(selected_roles)
+        predict_audio = target_audio[selected_audio_rows]
+        return _BlockSelection(
+            visual_source=_positions(
+                keep[_visual_roles(roles)], layout["clean_visual"].device
+            ),
+            audio_source=_positions(
+                keep[_audio_roles(roles)], layout["clean_audio"].device
+            ),
+            context_source=_positions(keep[context_rows], layout["context"].device),
+            device_rows=device_rows,
+            visual_rows=selected_visual_rows,
+            audio_rows=selected_audio_rows,
+            target_rows=target_video | target_audio,
+            host_layouts=host_layouts,
+            predict_video=target_video[selected_visual_rows],
+            predict_audio=(predict_audio if bool(predict_audio.any()) else None),
         )
-        packed["t"] = torch.ones(
-            (int(keep.sum().item()),), dtype=torch.float32, device=keep.device
+
+    def _select_block(
+        self,
+        layout: dict[str, torch.Tensor],
+        block_number: int,
+        *,
+        phase: str,
+        video_t: float,
+        audio_t: float | None,
+        final: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        selection = self._block_selection(layout, block_number, phase)
+        device_rows = selection.device_rows
+        visual_rows, audio_rows = selection.visual_rows, selection.audio_rows
+        update_rows = (
+            torch.zeros_like(selection.target_rows) if final else selection.target_rows
         )
-        selected_visual_rows = (
-            (selected_roles == int(H3RowRole.REFERENCE_VISUAL))
-            | (selected_roles == int(H3RowRole.SOURCE_VISUAL))
-            | (selected_roles == int(H3RowRole.TARGET_VISUAL))
+        t = torch.ones((visual_rows.shape[0],), dtype=torch.float32)
+        t[visual_rows] = torch.where(
+            update_rows[visual_rows],
+            t.new_full((int(visual_rows.sum()),), float(video_t)),
+            t.new_ones((int(visual_rows.sum()),)),
         )
-        selected_audio_rows = (selected_roles == int(H3RowRole.REFERENCE_AUDIO)) | (
-            selected_roles == int(H3RowRole.TARGET_AUDIO)
-        )
-        packed["t"][selected_visual_rows] = torch.where(
-            update_rows[selected_visual_rows],
-            packed["t"].new_full((int(selected_visual_rows.sum()),), float(video_t)),
-            packed["t"].new_ones((int(selected_visual_rows.sum()),)),
-        )
-        if bool(selected_audio_rows.any()):
-            audio_values = packed["t"].new_full(
-                (int(selected_audio_rows.sum()),),
+        if bool(audio_rows.any()):
+            audio_values = t.new_full(
+                (int(audio_rows.sum()),),
                 1.0 if audio_t is None else float(audio_t),
             )
-            packed["t"][selected_audio_rows] = torch.where(
-                update_rows[selected_audio_rows],
+            t[audio_rows] = torch.where(
+                update_rows[audio_rows],
                 audio_values,
                 torch.ones_like(audio_values),
             )
+        packed = {
+            "x": layout["clean_visual"].index_select(0, selection.visual_source),
+            "audio_x": layout["clean_audio"].index_select(0, selection.audio_source),
+            "context": layout["context"].index_select(0, selection.context_source),
+            "position_ids": device_rows["position_ids"],
+            "row_role": device_rows["row_role"],
+            "block_idx": device_rows["block_idx"],
+            "seq_lens": device_rows["seq_lens"],
+            "clean_seq_lens": device_rows["clean_seq_lens"][final],
+            "t": host_to_device(t, device_rows["seq_lens"].device),
+            _HOST_LAYOUT: selection.host_layouts[final],
+            _HOST_T: t,
+            _PREDICT_ROWS: selection,
+        }
+        packed[_HOST_GUARD] = tuple(
+            (name, packed[name], tensor_identity(packed[name]))
+            for name in _GUARDED_ROWS
+        )
         return packed

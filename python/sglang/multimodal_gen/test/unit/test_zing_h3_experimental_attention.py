@@ -13,9 +13,11 @@ from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCach
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.sampling import (
     ZingH3Sampler,
 )
-from sglang.multimodal_gen.test.unit.test_zing_h3_model import (
-    cpu_execution_options,  # noqa: F401
-    model as model_fixture,
+from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
+    cpu_execution_options,
+)
+from sglang.multimodal_gen.test.unit.test_zing_h3_model import model as model_fixture
+from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
     request,
 )
 from sglang.multimodal_gen.test.unit.test_zing_h3_sp_cpu import (
@@ -478,7 +480,7 @@ def test_fused_route_matches_eager_and_captures_independent_k(
     commits = {False: [], True: []}
     original_update = ZingH3KVCache.update
 
-    def update(self, positions, block_idx, phase, frames, layers=None):
+    def update(self, positions, block_idx, phase, frames, layers=None, **kwargs):
         if layers is not None:
             snapshot = [(k.clone(), v.clone()) for k, v in layers]
             if enabled and self.raw_store:
@@ -489,7 +491,9 @@ def test_fused_route_matches_eager_and_captures_independent_k(
                         self._stores[index][0][self._length].data_ptr()
                     )
             commits[enabled].append((phase, snapshot))
-        return original_update(self, positions, block_idx, phase, frames, layers)
+        return original_update(
+            self, positions, block_idx, phase, frames, layers, **kwargs
+        )
 
     monkeypatch.setattr(ZingH3KVCache, "update", update)
     outputs = {}
