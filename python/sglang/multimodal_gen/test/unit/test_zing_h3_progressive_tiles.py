@@ -292,5 +292,5 @@ def test_bounded_batch_auto_shards_and_unequal_work(
         ),
         nprocs=size,
         join=True,
-        start_method="fork",
+        start_method="forkserver",
     )
