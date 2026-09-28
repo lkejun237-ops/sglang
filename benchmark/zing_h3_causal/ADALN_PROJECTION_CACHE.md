@@ -1,11 +1,11 @@
 # Zing AdaLN projection cache：实验与验收
 
-关联 #135。当前是默认关闭的实验实现，**仅通过单卡原权重组件检查，未完成业务 A/B 验收**，
-不能据此声称加速或达到持续 24 FPS。
+关联 #135。自 #207 起**默认开启**：单卡 60 s 白盒会话稳态 DiT 514.1 → 492.2 ms/chunk（−4.3%），
+同进程 GPU 逐位检查 12,954 次命中全部相等（见 #207）。不代表达到持续 24 FPS。
 
 ## 实现边界
 
-- `SGLANG_ZING_ADALN_PROJECTION_CACHE=0`（默认）走原投影；`1` 开启。
+- `SGLANG_ZING_ADALN_PROJECTION_CACHE=1`（默认）开启；`0` 走原投影。
 - `SGLANG_ZING_ADALN_PROJECTION_CACHE_BYTES=134217728`：每请求、每 rank
   上限 128 MiB，LRU 淘汰，单 entry 超预算直接原算，不减少 timestep / 模态。
 - 绑定 `ZingH3KVCache`；会话 clear/close 释放，模型计算阶段异常清空结果；输入校验失败仍由会话 owner 清理。
@@ -17,7 +17,7 @@
   设备/stream 和算术设置。实际 t 值体现 noise/schedule；prompt/source/reference 像素
   不进入 projection，所以不盲目把它们加入 key。不同批形状绝不共用结果。
 - 保留 timestep/SiLU、norm/modulation/gate；这不是 compiled AdaLN 融合。
-  每 forward 读回紧凑 timestep 建键，同步成本纳入无 profiler A/B。
+  有 host 行元数据时用 host 上的 unique-t 建键，不读回设备；否则读回紧凑 timestep。
 - 训练/autocast、无版本参数、runtime LoRA wrapper 回退原投影；LoRA wrapper
   即使 disabled/merged 也回退，避免 scalar strength/enable 状态漏入 key。
   checkpoint loader 与公共 tensor/disk 权重刷新回调均提升 generation；外部 `.data` 原地修改必须提升 generation

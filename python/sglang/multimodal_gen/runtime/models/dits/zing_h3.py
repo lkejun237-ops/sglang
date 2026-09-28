@@ -491,7 +491,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         compiled_adaln = os.environ.get("SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN", "1")
         if compiled_adaln not in {"0", "1"}:
             raise ValueError("SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN must be 0 or 1")
-        projection_cache = os.environ.get("SGLANG_ZING_ADALN_PROJECTION_CACHE", "0")
+        projection_cache = os.environ.get("SGLANG_ZING_ADALN_PROJECTION_CACHE", "1")
         if projection_cache not in {"0", "1"}:
             raise ValueError("SGLANG_ZING_ADALN_PROJECTION_CACHE must be 0 or 1")
         projection_cache_bytes = int(
@@ -923,6 +923,9 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                     .to(hidden.dtype),
                 )
             unique_t, t_indices = torch.unique(meta_t, sorted=True, return_inverse=True)
+            # With host row metadata this copy lets the AdaLN projection cache
+            # key the batch without reading the device tensor back.
+            key_unique_t = unique_t
             unique_t = host_to_device(unique_t, x.device)
             adaln_input = F.silu(self.time_embedder(unique_t.float())).bfloat16()
             indices = host_to_device(
@@ -987,7 +990,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                     cache.adaln_projection_cache = projection_cache
                 with maybe_record_function("Zing.AdaLN.cache_key"):
                     projection_key = projection_cache.begin(
-                        unique_t,
+                        key_unique_t,
                         adaln_input,
                         self.time_embedder,
                         self._cache_weight_generation,

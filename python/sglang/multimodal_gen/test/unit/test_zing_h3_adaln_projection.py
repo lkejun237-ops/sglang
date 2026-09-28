@@ -83,3 +83,14 @@ def test_tensor_weight_refresh_invalidates_live_session(model):  # noqa: F811
     with pytest.raises(ValueError, match="model changed"):
         sampler.step(state)
     assert state.cache.adaln_projection_cache is None
+
+
+@pytest.mark.parametrize(
+    ("value", "enabled"), [(None, True), ("1", True), ("0", False)]
+)
+def test_projection_cache_defaults_on(monkeypatch, value, enabled):
+    if value is None:
+        monkeypatch.delenv("SGLANG_ZING_ADALN_PROJECTION_CACHE", raising=False)
+    else:
+        monkeypatch.setenv("SGLANG_ZING_ADALN_PROJECTION_CACHE", value)
+    assert model.__wrapped__().adaln_projection_cache_enabled is enabled
