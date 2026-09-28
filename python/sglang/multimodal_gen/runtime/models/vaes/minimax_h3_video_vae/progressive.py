@@ -20,6 +20,7 @@ import torch.nn.functional as F
 
 from .conv import BaseConv3d
 from .norm import FusedGroupNorm3D, TemporalIsolatedGroupNorm
+from .spatial_padding import spatial_pad
 from .vae_cnn import EncoderFCN3D, norm_silu
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,12 @@ class CausalEncoderCache:
         self.requested_mode = tile_mode or os.environ.get(
             "MINIMAX_H3_PROGRESSIVE_ENCODER_TILING", "auto"
         )
+        self.spatial_padding = os.environ.get(
+            "MINIMAX_H3_PROGRESSIVE_SPATIAL_PADDING", "reflect2d"
+        )
+        if self.spatial_padding not in ("off", "reflect2d"):
+            raise ValueError("Progressive spatial padding must be off or reflect2d")
+        self._pad = spatial_pad if self.spatial_padding == "reflect2d" else F.pad
         if self.requested_mode not in ("auto", "replicated", "parallel"):
             raise ValueError(
                 "Progressive encoder tiling must be auto, replicated or parallel"
@@ -111,7 +118,7 @@ class CausalEncoderCache:
         offset = (-seen) % layer.stride[0]
         if offset >= x.shape[2]:
             raise ValueError("Incremental block produced no strided output")
-        padded = F.pad(
+        padded = self._pad(
             joined[:, :, offset:],
             (
                 layer.padding[2],
@@ -170,7 +177,7 @@ class CausalEncoderCache:
                     h = conv(layer, h, (i, "down"))
                 else:
                     if layer.space_stride == 2:
-                        h = F.pad(h, (0, 1, 0, 1, 0, 0), mode=layer.pad_mode)
+                        h = self._pad(h, (0, 1, 0, 1, 0, 0), mode=layer.pad_mode)
                     h = conv(layer.conv, h, (i, "down"))
         h = (
             encoder.norm_out(h, None)
@@ -347,6 +354,7 @@ class CausalEncoderCache:
         self.agree("assembled", error=error)
         self._layout = layout
         execution = dict(
+            spatial_padding=self.spatial_padding,
             requested_mode=self.requested_mode,
             effective_mode="parallel" if parallel else "replicated",
             fallback_reason=reason,

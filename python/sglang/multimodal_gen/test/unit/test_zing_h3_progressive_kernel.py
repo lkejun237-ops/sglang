@@ -357,3 +357,27 @@ def test_explicit_replicated_overrides_approved_default(codecs, monkeypatch):
     assert stream.cache.requested_mode == "replicated"
     assert stream.cache.group is None
     stream.dispose()
+
+
+@pytest.mark.parametrize("mode", [None, "off", "reflect2d"])
+def test_spatial_padding_default_override_and_session_snapshot(
+    codecs, monkeypatch, mode
+):
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.spatial_padding import (
+        spatial_pad,
+    )
+
+    key = "MINIMAX_H3_PROGRESSIVE_SPATIAL_PADDING"
+    if mode is None:
+        monkeypatch.delenv(key, raising=False)
+    else:
+        monkeypatch.setenv(key, mode)
+    stream = create_session(codecs, capacity_frames=8)
+    expected = mode or "reflect2d"
+    assert stream.cache.spatial_padding == expected
+    assert stream.cache._pad is (
+        spatial_pad if expected == "reflect2d" else torch.nn.functional.pad
+    )
+    monkeypatch.setenv(key, "off" if expected == "reflect2d" else "reflect2d")
+    assert stream.cache.spatial_padding == expected
+    stream.dispose()
