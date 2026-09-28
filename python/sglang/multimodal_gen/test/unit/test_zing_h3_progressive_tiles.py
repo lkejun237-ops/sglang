@@ -38,7 +38,16 @@ _FULL = pytest.mark.skipif(
 
 
 def _worker(
-    rank, size, path, stack, canvas, failure, mode="parallel", sp1_reference=None
+    rank,
+    size,
+    path,
+    stack,
+    canvas,
+    failure,
+    mode="parallel",
+    sp1_reference=None,
+    batch_size=None,
+    heterogeneous=False,
 ):
     torch.set_num_threads(1)
     codecs = make_codecs()
@@ -61,6 +70,12 @@ def _worker(
         klvae.get_tile_parallel_state = lambda: (rank, size)
         klvae.get_decode_parallel_group_coordinator = lambda: group
         model = configure_tiling(codecs, stack)
+        if heterogeneous:
+            model.split_tiles = lambda length, is_decoder=False: (
+                [0, 8, 20],
+                [16, 16, 12],
+                [8, 4],
+            )
         if mode == "auto":
             model.to(torch.bfloat16)
             codecs.runtime["vae_config"].update(
@@ -69,14 +84,19 @@ def _worker(
         torch.manual_seed(23)
         pixels = torch.randint(256, (3, 34, canvas, canvas), dtype=torch.uint8)
         os.environ["MINIMAX_H3_PROGRESSIVE_ENCODER_TILING"] = "replicated"
+        os.environ.pop("MINIMAX_H3_PROGRESSIVE_ENCODER_TILE_BATCH_SIZE", None)
         baseline = create_session(codecs, capacity_frames=34)
+        if batch_size is not None:
+            os.environ["MINIMAX_H3_PROGRESSIVE_ENCODER_TILE_BATCH_SIZE"] = str(
+                batch_size
+            )
         if mode == "auto":
             os.environ.pop("MINIMAX_H3_PROGRESSIVE_ENCODER_TILING", None)
         else:
             os.environ["MINIMAX_H3_PROGRESSIVE_ENCODER_TILING"] = "parallel"
         stream = create_session(codecs, capacity_frames=34)
         tile_count = len(model.split_tiles(canvas)[0]) ** 2
-        parallel = size > 1 and tile_count >= size
+        parallel = size > 1 and tile_count >= size and not heterogeneous
         ids = (
             list(range(rank, tile_count, size)) if parallel else list(range(tile_count))
         )
@@ -140,10 +160,16 @@ def _worker(
                 assert receipt["local_tile_ids"] == ids
                 assert receipt["gather_calls"] == int(parallel)
                 assert receipt["encoder_ranks"] == (size if parallel else 1)
+                if heterogeneous:
+                    assert receipt["fallback_reason"] == "heterogeneous_tile_shapes"
                 total_work += receipt["temporal_positions"]
                 if stream.cache.states:
                     cache_ids = {key[0] for key in stream.cache.states}
-                    assert cache_ids == ({tuple(ids)} if stack else set(ids))
+                    if batch_size is not None:
+                        assert cache_ids == {tuple(b) for b in receipt["tile_batches"]}
+                        assert max(map(len, receipt["tile_batches"])) <= batch_size
+                    else:
+                        assert cache_ids == ({tuple(ids)} if stack else set(ids))
         stream.finish()
         assert indices == expected_progressive_slices(34)
         assert stream.state_usage().retained_bytes == 0
@@ -232,3 +258,39 @@ def test_default_sp1_sp2_sp4_bitwise_moments(tmp_path):
             join=True,
             start_method="forkserver",
         )
+
+
+@pytest.mark.parametrize(
+    "size,batch_size,heterogeneous",
+    [
+        (1, 2, False),
+        (2, 2, False),
+        (2, 3, False),
+        (2, 6, False),
+        (2, 3, True),
+        (2, None, True),
+    ],
+)
+def test_bounded_batch_auto_shards_and_unequal_work(
+    tmp_path, size, batch_size, heterogeneous
+):
+    torch.set_num_threads(1)
+    if sys.platform == "darwin":
+        os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo0")
+    mp.start_processes(
+        _worker,
+        args=(
+            size,
+            str(tmp_path / "rendezvous"),
+            False,
+            32,
+            None,
+            "auto",
+            None,
+            batch_size,
+            heterogeneous,
+        ),
+        nprocs=size,
+        join=True,
+        start_method="fork",
+    )

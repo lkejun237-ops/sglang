@@ -54,6 +54,11 @@ class CausalEncoderCache:
                 not layer.causal or layer.pad_mode_t != "constant"
             ):
                 raise ValueError("Progressive encoding requires causal zero padding")
+        # Explicit finite tile batches are independent of legacy stack_tiling.
+        value = os.environ.get("MINIMAX_H3_PROGRESSIVE_ENCODER_TILE_BATCH_SIZE")
+        self.tile_batch_size = None if value is None else int(value)
+        if self.tile_batch_size is not None and self.tile_batch_size < 1:
+            raise ValueError("Progressive encoder tile batch size must be positive")
         self.requested_mode = tile_mode or os.environ.get(
             "MINIMAX_H3_PROGRESSIVE_ENCODER_TILING", "auto"
         )
@@ -91,7 +96,7 @@ class CausalEncoderCache:
                 self.default_fallback_reason = "unvalidated_encode_mode"
             elif encode_dtype != "bfloat16":
                 self.default_fallback_reason = "unvalidated_encode_dtype"
-            elif model.stack_tiling:
+            elif model.stack_tiling and self.tile_batch_size is None:
                 self.default_fallback_reason = "unvalidated_stack_tiling"
             self.tile_mode = (
                 "replicated" if self.default_fallback_reason else "parallel"
@@ -239,7 +244,11 @@ class CausalEncoderCache:
             reason = "non_tiled_encoder"
         elif size == 1:
             reason = "single_rank_or_uninitialized_group"
-        elif self.requested_mode == "auto" and model.stack_tiling:
+        elif (
+            self.requested_mode == "auto"
+            and model.stack_tiling
+            and self.tile_batch_size is None
+        ):
             reason = "unvalidated_stack_tiling"
         ys = xs = [0]
         yo = xo = []
@@ -265,13 +274,32 @@ class CausalEncoderCache:
                 tuple(tuple(tile.shape[-2:]) for tile in tiles),
                 getattr(model, "vae_ratio", None),
             )
+            # Fixed-size all_gather requires matching spatial output shapes.
+            # Replicate heterogeneous edges rather than padding moments or changing
+            # the existing tile geometry/assembly semantics.
+            if reason is None and len({tuple(t.shape[-2:]) for t in tiles}) > 1:
+                reason = "heterogeneous_tile_shapes"
             parallel = reason is None
             local_ids = (
                 model._local_tile_indices(len(tiles), rank, size)
                 if parallel
                 else list(range(len(tiles)))
             )
-            stack = model.encoder_tiling and model.stack_tiling
+            stack = (
+                model.encoder_tiling
+                and model.stack_tiling
+                and self.tile_batch_size is None
+            )
+            batches = []
+            if self.tile_batch_size is not None:
+                shape_groups = {}
+                for i in local_ids:
+                    shape_groups.setdefault(tuple(tiles[i].shape), []).append(i)
+                for ids in shape_groups.values():
+                    batches.extend(
+                        tuple(ids[start : start + self.tile_batch_size])
+                        for start in range(0, len(ids), self.tile_batch_size)
+                    )
             layout = (
                 tuple(x.shape[:2]),
                 tuple(x.shape[3:]),
@@ -279,6 +307,7 @@ class CausalEncoderCache:
                 geometry,
                 tuple(local_ids),
                 stack,
+                tuple(batches),
                 parallel,
             )
             if self._layout is not None and layout != self._layout:
@@ -293,12 +322,30 @@ class CausalEncoderCache:
                 geometry,
                 bool(model.encoder_tiling),
                 getattr(model, "stack_tiling", False),
+                self.tile_batch_size,
             ),
             error=error,
         )
         error = None
         try:
-            if stack:
+            if self.tile_batch_size is not None:
+                by_id = {}
+                for ids in batches:
+                    value = (
+                        tiles[ids[0]]
+                        if len(ids) == 1
+                        else torch.cat([tiles[i] for i in ids], 0)
+                    )
+                    with torch.profiler.record_function(
+                        f"H3ProgressiveTileBatch/{ids}"
+                    ):
+                        output, state, count = self.forward(value, ids)
+                    for i, item in zip(ids, output.split(x.shape[0], dim=0)):
+                        by_id[i] = item
+                    pending.update(state)
+                    work += count
+                outputs = [by_id[i] for i in local_ids]
+            elif stack:
                 # The tuple fixes the batch slot -> global tile mapping for history.
                 with torch.profiler.record_function(f"H3ProgressiveTiles/{local_ids}"):
                     output, pending, work = self.forward(
@@ -370,6 +417,9 @@ class CausalEncoderCache:
             tile_count=len(tiles),
             local_tile_ids=local_ids,
             stack_tiling=bool(stack),
+            tile_batch_size=self.tile_batch_size,
+            tile_batches=[list(ids) for ids in batches],
+            local_tile_shapes=[list(tiles[i].shape) for i in local_ids],
             input_shape=list(x.shape),
             output_shape=list(result.shape),
             dtype=str(result.dtype),

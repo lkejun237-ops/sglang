@@ -359,6 +359,109 @@ def test_explicit_replicated_overrides_approved_default(codecs, monkeypatch):
     stream.dispose()
 
 
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 6])
+@pytest.mark.parametrize("frames", [1, 8, 17, 19, 34])
+def test_bounded_tile_batches_preserve_history(codecs, monkeypatch, batch_size, frames):
+    configure_tiling(codecs, False)
+    name = "MINIMAX_H3_PROGRESSIVE_ENCODER_TILE_BATCH_SIZE"
+    monkeypatch.setenv(name, "1")
+    baseline = create_session(codecs, capacity_frames=frames + 8)
+    monkeypatch.setenv(name, str(batch_size))
+    candidate = create_session(codecs, capacity_frames=frames + 8)
+    pixels = torch.randint(256, (3, frames, 32, 32), dtype=torch.uint8)
+    for stream in (baseline, candidate):
+        stream.append(pixels, frame_start=0)
+        stream.finish()
+    while baseline.ready:
+        expected, actual = baseline.pop(), candidate.pop()
+        assert (actual.start, actual.end, actual.source_dependency_end) == (
+            expected.start,
+            expected.end,
+            expected.source_dependency_end,
+        )
+        torch.testing.assert_close(
+            actual.values, expected.values, atol=1e-12, rtol=1e-12
+        )
+        receipt = candidate.cache.last_execution
+        ids = [i for batch in receipt["tile_batches"] for i in batch]
+        assert sorted(ids) == receipt["local_tile_ids"]
+        assert max(map(len, receipt["tile_batches"])) <= batch_size
+        if candidate.cache.states:
+            assert {key[0] for key in candidate.cache.states} == {
+                tuple(batch) for batch in receipt["tile_batches"]
+            }
+    assert not candidate.ready
+    candidate.reset()
+    assert candidate.state_usage().retained_bytes == 0
+    candidate.dispose()
+    assert candidate.state_usage().retained_bytes == 0
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "2.5", "bad"])
+def test_tile_batch_rejects_invalid_size(codecs, monkeypatch, value):
+    monkeypatch.setenv("MINIMAX_H3_PROGRESSIVE_ENCODER_TILE_BATCH_SIZE", value)
+    with pytest.raises(ValueError):
+        create_session(codecs, capacity_frames=8)
+
+
+def test_bounded_batches_group_unequal_edges_and_restore_order(codecs, monkeypatch):
+    model = configure_tiling(codecs, True)
+    model.split_tiles = lambda length, is_decoder=False: (
+        [0, 8, 20],
+        [16, 16, 12],
+        [8, 4],
+    )
+    name = "MINIMAX_H3_PROGRESSIVE_ENCODER_TILE_BATCH_SIZE"
+    monkeypatch.setenv(name, "1")
+    baseline = create_session(codecs, capacity_frames=17)
+    monkeypatch.setenv(name, "3")
+    candidate = create_session(codecs, capacity_frames=17)
+    pixels = torch.randint(256, (3, 17, 32, 32), dtype=torch.uint8)
+    for stream in (baseline, candidate):
+        stream.append(pixels, frame_start=0)
+    while baseline.ready:
+        torch.testing.assert_close(
+            candidate.pop().values, baseline.pop().values, atol=1e-12, rtol=1e-12
+        )
+        receipt = candidate.cache.last_execution
+        assert receipt["tile_batches"] == [[0, 1, 3], [4], [2, 5], [6, 7], [8]]
+        assert not receipt["stack_tiling"]
+    candidate.finish()
+    baseline.finish()
+    assert candidate.state_usage().retained_bytes == 0
+
+
+def test_batched_failure_keeps_all_tile_histories_retryable(codecs, monkeypatch):
+    model = configure_tiling(codecs, False)
+    monkeypatch.setenv("MINIMAX_H3_PROGRESSIVE_ENCODER_TILE_BATCH_SIZE", "2")
+    candidate = create_session(codecs, capacity_frames=17)
+    candidate.append(
+        torch.randint(256, (3, 17, 32, 32), dtype=torch.uint8), frame_start=0
+    )
+    candidate.pop()
+    previous = dict(candidate.cache.states)
+    usage = candidate.state_usage()
+    original = model.quant_conv.forward
+    calls = 0
+
+    def fail_on_second_group(value):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("Injected batched tile failure")
+        return original(value)
+
+    monkeypatch.setattr(model.quant_conv, "forward", fail_on_second_group)
+    with pytest.raises(RuntimeError, match="Injected"):
+        candidate.pop()
+    assert candidate.state_usage() == usage
+    assert all(candidate.cache.states[k] is v for k, v in previous.items())
+    monkeypatch.setattr(model.quant_conv, "forward", original)
+    assert candidate.pop().start == 1
+    candidate.dispose()
+    assert candidate.state_usage().retained_bytes == 0
+
+
 @pytest.mark.parametrize("mode", [None, "off", "reflect2d"])
 def test_spatial_padding_default_override_and_session_snapshot(
     codecs, monkeypatch, mode
