@@ -968,7 +968,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             rotate_batch = None
             if raw_attention:
                 history_rope_mode = os.environ.get(
-                    "SGLANG_ZING_GROUPED_HISTORY_ROPE", "0"
+                    "SGLANG_ZING_GROUPED_HISTORY_ROPE", "1"
                 )
                 if history_rope_mode == "contiguous":
                     rotate_batch = apply_contiguous_history_rope_batch

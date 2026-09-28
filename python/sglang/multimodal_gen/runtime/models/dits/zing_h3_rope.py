@@ -52,10 +52,10 @@ def _history_rope_rejection(x, coefficients, out, *, alias_out=None):
 
 
 def apply_history_rope_into(x, coefficients, out):
-    # Opt-in until the long-window CUDA and end-to-end acceptance gates pass.
+    # Enabled by default; unsupported inputs retain the eager fallback.
     reason = (
         "disabled"
-        if os.environ.get("SGLANG_ZING_FUSED_HISTORY_ROPE", "0") != "1"
+        if os.environ.get("SGLANG_ZING_FUSED_HISTORY_ROPE", "1") != "1"
         else _history_rope_rejection(x, coefficients, out)
     )
     HISTORY_ROPE_ROUTES[reason or "fused"] += 1
@@ -87,7 +87,7 @@ def apply_history_rope_batch(xs, coefficients, out):
             rejection = "rotary_dimensions"
         reason = reason or rejection
         offset = end
-    if os.environ.get("SGLANG_ZING_FUSED_HISTORY_ROPE", "0") != "1":
+    if os.environ.get("SGLANG_ZING_FUSED_HISTORY_ROPE", "1") != "1":
         reason = "disabled"
     if reason is not None:
         HISTORY_ROPE_ROUTES["grouped_fallback_" + reason] += 1
@@ -115,7 +115,7 @@ def apply_contiguous_history_rope_batch(xs, coefficients, out):
         raise ValueError("History RoPE batch rows or coefficient count mismatch")
     if not xs:
         return out
-    supported = os.environ.get("SGLANG_ZING_FUSED_HISTORY_ROPE", "0") == "1"
+    supported = os.environ.get("SGLANG_ZING_FUSED_HISTORY_ROPE", "1") == "1"
     offset = 0
     first = xs[0]
     for x, table in zip(xs, coefficients):

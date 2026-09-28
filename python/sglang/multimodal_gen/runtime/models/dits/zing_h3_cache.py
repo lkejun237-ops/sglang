@@ -108,8 +108,8 @@ class ZingH3KVCache:
             and rope_position_mode == "absolute"
         )
         self.raw_store = not self.single_store
-        # Keep the established path until the independent long-window A/B gate.
-        self.chunk_rope_reuse = os.environ.get("SGLANG_ZING_CHUNK_ROPE_REUSE") == "1"
+        # Explicitly set the switch to 0 to restore whole-history invalidation.
+        self.chunk_rope_reuse = os.environ.get("SGLANG_ZING_CHUNK_ROPE_REUSE", "1") == "1"
         # A finite request can be much longer than its live attention window.
         # Never reserve its full packed length for a window-bounded store.
         self.reserve_rows = (
