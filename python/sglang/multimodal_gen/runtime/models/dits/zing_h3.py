@@ -37,6 +37,9 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     _fused_qk_norm_rejection,
     _rope_cos_sin_cache,
 )
+from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_cache import (
+    ZingH3AdalnCache,
+)
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_rope import (
     apply_contiguous_history_rope_batch,
@@ -488,6 +491,14 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         compiled_adaln = os.environ.get("SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN", "1")
         if compiled_adaln not in {"0", "1"}:
             raise ValueError("SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN must be 0 or 1")
+        projection_cache = os.environ.get("SGLANG_ZING_ADALN_PROJECTION_CACHE", "0")
+        if projection_cache not in {"0", "1"}:
+            raise ValueError("SGLANG_ZING_ADALN_PROJECTION_CACHE must be 0 or 1")
+        projection_cache_bytes = int(
+            os.environ.get("SGLANG_ZING_ADALN_PROJECTION_CACHE_BYTES", "134217728")
+        )
+        if projection_cache_bytes < 0:
+            raise ValueError("Zing AdaLN projection cache budget must be nonnegative")
         fa4_metadata_reuse = os.environ.get(
             "SGLANG_ZING_EXPERIMENTAL_FA4_METADATA_REUSE", "1"
         )
@@ -519,6 +530,8 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         self.experimental_attention_backend = experimental_attention
         self.experimental_stable_shapes = stable_shapes == "1"
         self.experimental_compiled_adaln = compiled_adaln == "1"
+        self.adaln_projection_cache_enabled = projection_cache == "1"
+        self.adaln_projection_cache_bytes = projection_cache_bytes
         self.experimental_fa4_metadata_reuse = (
             fa4_metadata_reuse == "1" and experimental_attention == "fa4"
         )
@@ -673,6 +686,13 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             "rope.inv_freq",
             1.0 / (10000.0 ** (torch.arange(n, dtype=torch.float32) / n)),
         )
+
+    def refresh_weight_derived_caches(self, *, weights_path: str | None) -> None:
+        # Tensor hot updates can write through .data without changing _version
+        # or invoking the disk checkpoint preprocessor. Invalidate sessions for
+        # that public weight-updater path as well.
+        self._cache_weight_generation += 1
+        super().refresh_weight_derived_caches(weights_path=weights_path)
 
     def _validate_packed_inputs(
         self,
@@ -833,6 +853,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         )
 
         metadata = None
+        projection_cache = None
         try:
             ulysses_size, ulysses_rank = get_ulysses_ctx()
             # Enabled for every SP size; same-SP real-device acceptance covers
@@ -953,6 +974,28 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                     )
                 cache.bind_model((self._cache_weight_generation, model_signature))
                 cache.bind_attention_positions(history_positions)
+            projection_key = None
+            if self.adaln_projection_cache_enabled and cache is not None:
+                projection_cache = cache.adaln_projection_cache
+                if (
+                    projection_cache is None
+                    or projection_cache.max_bytes != self.adaln_projection_cache_bytes
+                ):
+                    projection_cache = ZingH3AdalnCache(
+                        self.adaln_projection_cache_bytes
+                    )
+                    cache.adaln_projection_cache = projection_cache
+                with maybe_record_function("Zing.AdaLN.cache_key"):
+                    projection_key = projection_cache.begin(
+                        unique_t,
+                        adaln_input,
+                        self.time_embedder,
+                        self._cache_weight_generation,
+                    )
+            elif cache is not None and cache.adaln_projection_cache is not None:
+                cache.adaln_projection_cache.clear()
+                cache.adaln_projection_cache = None
+
             with maybe_record_function("Zing.build_RoPE_and_history_positions"):
                 rope = _rope_cos_sin_cache(
                     self.rope(host_to_device(rope_positions, x.device)[None]),
@@ -988,7 +1031,17 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                     nonlocal raw
                     with maybe_record_function("Zing.AdaLN"):
                         shift, scale, gate, ff_shift, ff_scale, ff_gate = (
-                            v[indices] for v in current.adaln_proj(adaln_input)
+                            v[indices]
+                            for v in (
+                                current.adaln_proj(adaln_input)
+                                if projection_cache is None
+                                else projection_cache.project(
+                                    index,
+                                    current.adaln_proj,
+                                    adaln_input,
+                                    projection_key,
+                                )
+                            )
                         )
                     with maybe_record_function("Zing.norm_modulation.attention"):
                         normed = (
@@ -1081,7 +1134,17 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 if capture:
                     layers.append(raw)
             shift, scale = (
-                v[local_t_indices] for v in self.final_layer.adaln_proj(adaln_input)
+                v[local_t_indices]
+                for v in (
+                    self.final_layer.adaln_proj(adaln_input)
+                    if projection_cache is None
+                    else projection_cache.project(
+                        "final",
+                        self.final_layer.adaln_proj,
+                        adaln_input,
+                        projection_key,
+                    )
+                )
             )
             hidden = self.final_layer.norm(hidden) * (1 + scale) + shift
             video, audio = self._project_outputs(hidden, p, layout)
@@ -1111,6 +1174,10 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                     **validation,
                 )
             return video, audio
+        except BaseException:
+            if cache is not None and cache.adaln_projection_cache is not None:
+                cache.adaln_projection_cache.clear()
+            raise
         finally:
             if metadata is not None:
                 metadata.clear()

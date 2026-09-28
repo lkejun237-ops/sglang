@@ -141,6 +141,10 @@ class ZingH3KVCache:
         return None if self.storage is None else self.storage[0].rows
 
     def clear(self):
+        projection_cache = getattr(self, "adaln_projection_cache", None)
+        if projection_cache is not None:
+            projection_cache.clear()
+        self.adaln_projection_cache = None
         self.prefix = None
         self.pending_source = None
         self.committed = []
