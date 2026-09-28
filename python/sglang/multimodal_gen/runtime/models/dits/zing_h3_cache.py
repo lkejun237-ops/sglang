@@ -40,6 +40,19 @@ class ZingKVChunk:
         return self.block // 2 - 1
 
 
+@dataclass(frozen=True)
+class ZingHistoryRoPEPlan:
+    """Layer-independent selection for one forward; never a validity decision."""
+
+    owner: object
+    state: tuple
+    chunks: tuple
+    geometry: tuple
+    position_signatures: tuple
+    rows: int
+    runs: tuple
+
+
 class ZingH3KVCache:
     """Keep the prefix and complete source/target transactions in one store.
 
@@ -299,6 +312,33 @@ class ZingH3KVCache:
             geometry.append((positions[offset:end], (self._rope_epoch, offset, end)))
             offset = end
         return geometry
+
+    def _history_plan_state(self):
+        return (
+            self._rope_epoch,
+            self._length,
+            self.last_block,
+            id(self.prefix),
+            id(self.pending_source),
+            self.rope_position_mode,
+            self.rope_max_frame_gap,
+            self.local_frames,
+            self.sink_frames,
+            self.window_policy,
+        )
+
+    def prepare_history_rope_plan(self):
+        """Build geometry once per forward, after binding effective positions."""
+        chunks = tuple(self._history())
+        return ZingHistoryRoPEPlan(
+            self,
+            self._history_plan_state(),
+            chunks,
+            tuple(self._history_geometry(chunks)),
+            tuple(self._tensor_signature(c.positions) for c in chunks),
+            sum(c.positions.shape[0] for c in chunks),
+            tuple(self._runs(chunks)),
+        )
 
     def owned_tensors(self):
         """Include derived storage in session memory/release accounting."""
@@ -692,7 +732,18 @@ class ZingH3KVCache:
             torch.cat([values[a:b] for a, b in runs]),
         )
 
-    def raw_attention_view(self, layer, k, v, make_rope, rotate_into, write_current):
+    def raw_attention_view(
+        self,
+        layer,
+        k,
+        v,
+        make_rope,
+        rotate_into,
+        write_current,
+        *,
+        rotate_batch=None,
+        history_plan=None,
+    ):
         """Attend from mapped K scratch plus the sole authoritative V store.
 
         Current K stays unrotated until write_current writes the attention tail.
@@ -705,7 +756,22 @@ class ZingH3KVCache:
         if torch.is_grad_enabled():
             raise RuntimeError("Zing attention buffers require torch.no_grad()")
         self._check_append_layout(layer, k, v)
-        chunks = self._history()
+        if history_plan is None:
+            chunks = self._history()
+        else:
+            if (
+                history_plan.owner is not self
+                or history_plan.state != self._history_plan_state()
+            ):
+                raise ValueError(
+                    "History RoPE plan belongs to another cache or forward state"
+                )
+            chunks = history_plan.chunks
+            if (
+                tuple(self._tensor_signature(c.positions) for c in chunks)
+                != history_plan.position_signatures
+            ):
+                raise ValueError("History RoPE plan positions changed during the forward")
         rows = k.shape[0]
         _, values = self._reserve_store(layer, self._length + rows, k, v)
         # Unpublish before writes; a failed rotation must never be reused.
@@ -722,8 +788,12 @@ class ZingH3KVCache:
                 rotate_into,
                 write_current,
             )
-        geometry = self._history_geometry(chunks)
-        history_rows = sum(c.positions.shape[0] for c in chunks)
+        if history_plan is None:
+            geometry = self._history_geometry(chunks)
+            history_rows = sum(c.positions.shape[0] for c in chunks)
+        else:
+            geometry = history_plan.geometry
+            history_rows = history_plan.rows
         signatures = tuple(
             (
                 position_key,
@@ -757,22 +827,30 @@ class ZingH3KVCache:
             if key[0] in live_positions
         }
         offset = retained
+        if rotate_batch is not None:
+            batch_inputs, batch_coefficients = [], []
         for chunk, (positions, position_key) in zip(chunks[common:], geometry[common:]):
             coefficient_key = (position_key, k.dtype)
             if coefficient_key not in self._rope_coefficients:
                 self._rope_coefficients[coefficient_key] = make_rope(positions)
             end = offset + chunk.positions.shape[0]
-            rotate_into(
-                chunk.layers[layer][0],
-                self._rope_coefficients[coefficient_key],
-                keys[offset:end],
-            )
+            if rotate_batch is None:
+                rotate_into(
+                    chunk.layers[layer][0],
+                    self._rope_coefficients[coefficient_key],
+                    keys[offset:end],
+                )
+            else:
+                batch_inputs.append(chunk.layers[layer][0])
+                batch_coefficients.append(self._rope_coefficients[coefficient_key])
             offset = end
+        if rotate_batch is not None and batch_inputs:
+            rotate_batch(batch_inputs, batch_coefficients, keys[retained:history_rows])
         total = history_rows + rows
         current_values = values[self._length : self._length + rows]
         write_current(k, v, keys[history_rows:total], current_values)
         self._rotated_store_signatures[layer] = signatures
-        runs = self._runs(chunks)
+        runs = self._runs(chunks) if history_plan is None else history_plan.runs
         if not runs:
             return keys[:total], current_values
         if len(runs) == 1 and runs[0][1] == self._length:

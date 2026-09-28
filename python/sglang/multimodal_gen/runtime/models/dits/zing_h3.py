@@ -32,13 +32,17 @@ from sglang.multimodal_gen.runtime.layers.usp import (
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MiniMaxH3DiTModel,
     _apply_rope,
-    _apply_rope_into,
     _apply_rope_kv_into,
     _diffusers_h3_checkpoint,
     _fused_qk_norm_rejection,
     _rope_cos_sin_cache,
 )
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
+from sglang.multimodal_gen.runtime.models.dits.zing_h3_rope import (
+    apply_contiguous_history_rope_batch,
+    apply_history_rope_batch,
+    apply_history_rope_into,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 
@@ -960,6 +964,22 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             ):
                 mask = causal_mask(block_idx, clean)
             capture = self_cache_update in {"prefix", "source", "final"}
+            history_plan = None
+            rotate_batch = None
+            if raw_attention:
+                history_rope_mode = os.environ.get(
+                    "SGLANG_ZING_GROUPED_HISTORY_ROPE", "0"
+                )
+                if history_rope_mode == "contiguous":
+                    rotate_batch = apply_contiguous_history_rope_batch
+                elif history_rope_mode == "1":
+                    rotate_batch = apply_history_rope_batch
+            if (
+                raw_attention
+                and os.environ.get("SGLANG_ZING_HISTORY_ROPE_PLAN", "0") == "1"
+            ):
+                with maybe_record_function("Zing.history_RoPE_plan"):
+                    history_plan = cache.prepare_history_rope_plan()
             layers = []
             for index, block in enumerate(self.blocks):
                 raw = None
@@ -993,8 +1013,10 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                                 k,
                                 v,
                                 make_history_rope,
-                                _apply_rope_into,
+                                apply_history_rope_into,
                                 write_current_kv,
+                                history_plan=history_plan,
+                                rotate_batch=rotate_batch,
                             )
                         return cache.attention_view(index, k, v, write_current_kv)
 
