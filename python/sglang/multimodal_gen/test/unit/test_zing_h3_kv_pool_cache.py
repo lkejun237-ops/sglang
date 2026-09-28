@@ -11,6 +11,7 @@ import torch
 from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import ZingH3DiTConfig
 from sglang.multimodal_gen.runtime.layers import usp
 from sglang.multimodal_gen.runtime.models.dits import zing_h3
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import _apply_rope
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.packing import (
     ZingH3Packer,
@@ -335,3 +336,24 @@ def test_sp_pooled_raw_store_matches_unpooled(model, monkeypatch, world, stable_
             # Committed rows are views of this rank's slot, not external copies.
             assert pooled.history(layer)[0].shape[1] == heads
             assert pooled._stores[layer][0].data_ptr() == storage[layer].k.data_ptr()
+
+
+@torch.no_grad()
+def test_model_routes_current_q_through_the_dispatch(model, monkeypatch):
+    calls = []
+    eager = _apply_rope
+
+    def spy(x, rope):
+        calls.append(tuple(x.shape))
+        return eager(x, rope)
+
+    monkeypatch.setattr(zing_h3, "apply_current_rope", spy, raising=False)
+    sampler = _sampler(model)
+    torch.manual_seed(3)
+    inputs, visual = _inputs(5), torch.randn(1, 2, 5, 2, 2)
+    expected, _, _ = _generate(sampler, inputs, visual)
+    assert calls, "current Q/K RoPE bypassed zing_h3.apply_current_rope"
+    monkeypatch.setattr(zing_h3, "apply_current_rope", eager, raising=False)
+    torch.manual_seed(3)
+    actual, _, _ = _generate(sampler, inputs, visual)
+    assert torch.equal(actual, expected)

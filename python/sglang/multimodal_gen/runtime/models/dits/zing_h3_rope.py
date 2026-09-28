@@ -6,20 +6,31 @@ import os
 
 import torch
 
-from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import _apply_rope_into
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+    _apply_rope,
+    _apply_rope_into,
+)
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 
 HISTORY_ROPE_ROUTES = collections.Counter()
+CURRENT_ROPE_ROUTES = collections.Counter()
 
 
 def _history_rope_rejection(x, coefficients, out, *, alias_out=None):
+    """Return why the fused kernel cannot run, or None.
+
+    ``out=None`` checks only the input; a fresh contiguous output of x's shape
+    always passes the output checks, so the caller allocates it afterwards.
+    """
     if torch.is_grad_enabled():
         return "autograd"
     if not x.is_cuda or torch.version.hip is not None:
         return "device"
     if x.dtype != torch.bfloat16:
         return "dtype"
-    if x.ndim != 3 or coefficients.ndim != 2 or out.shape != x.shape:
+    if x.ndim != 3 or coefficients.ndim != 2:
+        return "shape"
+    if out is not None and out.shape != x.shape:
         return "shape"
     rows, heads, dim = x.shape
     rotary = coefficients.shape[-1]
@@ -31,7 +42,9 @@ def _history_rope_rejection(x, coefficients, out, *, alias_out=None):
         and rotary % 2 == 0
         and coefficients.shape[0] == rows
         and all(
-            t.device == x.device and t.dtype == x.dtype for t in (coefficients, out)
+            t.device == x.device and t.dtype == x.dtype
+            for t in (coefficients, out)
+            if t is not None
         )
     ):
         return "shape_or_dtype"
@@ -42,13 +55,37 @@ def _history_rope_rejection(x, coefficients, out, *, alias_out=None):
         and (rows - 1) * x.stride(0) + heads * dim < 2**31
         and coefficients.numel() < 2**31
         and coefficients.is_contiguous()
-        and out.is_contiguous()
+        and (out is None or out.is_contiguous())
     ):
         return "layout"
+    if out is None:
+        return None
     alias_out = out if alias_out is None else alias_out
     if torch._C._overlaps(alias_out, x) or torch._C._overlaps(alias_out, coefficients):
         return "alias"
     return None
+
+
+def apply_current_rope(x, coefficients):
+    """Rotate the current block's Q or K into a new contiguous tensor.
+
+    Enabled by default. The history kernel reads the row-strided QKV view in
+    place of eager's cos/sin concatenations and output concatenation.
+    """
+    reason = "disabled"
+    if os.environ.get("SGLANG_ZING_FUSED_CURRENT_ROPE", "1") == "1":
+        # Check the input first so a rejected call allocates nothing extra.
+        reason = _history_rope_rejection(x, coefficients, None)
+    CURRENT_ROPE_ROUTES[reason or "fused"] += 1
+    if reason is not None:
+        return _apply_rope(x, coefficients)
+    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    from sglang.kernels.ops.diffusion.rope.zing_history_rope import (
+        fused_zing_history_rope,
+    )
+
+    fused_zing_history_rope(x, coefficients, out)
+    return out
 
 
 def apply_history_rope_into(x, coefficients, out):

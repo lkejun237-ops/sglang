@@ -4,10 +4,16 @@
 import pytest
 import torch
 
-from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import _apply_rope_into
+from sglang.multimodal_gen.runtime.models.dits import zing_h3_rope
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+    _apply_rope,
+    _apply_rope_into,
+)
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_rope import (
+    CURRENT_ROPE_ROUTES,
     HISTORY_ROPE_ROUTES,
     _history_rope_rejection,
+    apply_current_rope,
     apply_history_rope_into,
     apply_history_rope_batch,
 )
@@ -472,3 +478,116 @@ def test_grouped_unaligned_pointers_and_row_stride(heads, offset, monkeypatch):
     assert torch.equal(output[1:-1], expected)
     assert (output[0] == -11).all() and (output[-1] == -11).all()
     assert all(torch.equal(a, b) for a, b in zip(stores, before))
+
+
+def _qkv_view(device, rows, heads):
+    """Q as the fused projection hands it over: a row-strided QKV view."""
+    qkv = torch.randn(rows, 3 * heads * 128, device=device, dtype=torch.bfloat16)
+    return qkv, qkv[:, : heads * 128].view(rows, heads, 128)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("heads", [2, 28, 56])
+@pytest.mark.parametrize("rows", [1, 390, 780])
+@torch.no_grad()
+def test_current_rope_matches_eager_without_touching_qkv(
+    device, heads, rows, monkeypatch
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    monkeypatch.setenv("SGLANG_ZING_FUSED_CURRENT_ROPE", "1")
+    apply, routes = apply_current_rope, CURRENT_ROPE_ROUTES
+    torch.manual_seed(211)
+    qkv, q = _qkv_view(device, rows, heads)
+    original = qkv.clone()
+    rope = torch.randn(rows, 96, device=device, dtype=torch.bfloat16)
+    expected = _apply_rope(q, rope)
+    before = routes.copy()
+    out = apply(q, rope)
+    # The fused kernel keeps eager's BF16 product roundings, so it is exact.
+    assert torch.equal(out, expected)
+    assert out.is_contiguous() and out.shape == q.shape
+    assert torch.equal(qkv, original)
+    route = "fused" if device == "cuda" else "device"
+    assert routes[route] == before[route] + 1
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@torch.no_grad()
+def test_disabled_current_rope_is_eager(device, monkeypatch):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    monkeypatch.setenv("SGLANG_ZING_FUSED_CURRENT_ROPE", "0")
+    apply, routes = apply_current_rope, CURRENT_ROPE_ROUTES
+    _, q = _qkv_view(device, 17, 2)
+    rope = torch.randn(17, 96, device=device, dtype=torch.bfloat16)
+    before = routes["disabled"]
+    assert torch.equal(apply(q, rope), _apply_rope(q, rope))
+    assert routes["disabled"] == before + 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.no_grad()
+def test_unsupported_current_rope_layouts_fall_back(monkeypatch):
+    monkeypatch.setenv("SGLANG_ZING_FUSED_CURRENT_ROPE", "1")
+    apply, routes = apply_current_rope, CURRENT_ROPE_ROUTES
+    rope = torch.randn(17, 96, device="cuda", dtype=torch.bfloat16)
+    # Ulysses hands back [rows, heads, 3 * dim] chunks: heads are not packed.
+    qkv = torch.randn(17, 2, 3 * 128, device="cuda", dtype=torch.bfloat16)
+    q = qkv[..., :128]
+    before = routes["layout"]
+    assert torch.equal(apply(q, rope), _apply_rope(q, rope))
+    assert routes["layout"] == before + 1
+    for dtype in (torch.float32, torch.float16):
+        x, c = q.to(dtype), rope.to(dtype)
+        assert torch.equal(apply(x, c), _apply_rope(x, c))
+
+
+@torch.no_grad()
+def test_guard_never_checks_the_input_as_the_output(monkeypatch):
+    """The QKV view is never contiguous; checking it as the output rejects all."""
+    monkeypatch.setenv("SGLANG_ZING_FUSED_CURRENT_ROPE", "1")
+    seen = []
+    guard = zing_h3_rope._history_rope_rejection
+
+    def spy(x, coefficients, out, **kwargs):
+        seen.append((x, out))
+        return guard(x, coefficients, out, **kwargs)
+
+    monkeypatch.setattr(zing_h3_rope, "_history_rope_rejection", spy)
+    _, q = _qkv_view("cpu", 5, 2)
+    apply_current_rope(q, torch.randn(5, 96, dtype=torch.bfloat16))
+    assert len(seen) == 1
+    assert seen[0][0] is q and seen[0][1] is not q
+
+
+@pytest.mark.parametrize(
+    "shape,dtype",
+    [
+        ((5, 2, 128), torch.bfloat16),
+        ((1, 5, 2, 128), torch.bfloat16),
+        ((5, 2, 128), torch.float32),
+    ],
+)
+@torch.no_grad()
+def test_rejected_current_rope_allocates_no_candidate_output(
+    shape, dtype, monkeypatch
+):
+    """A rejected input (CPU, SP 4-D, non-BF16) must not reserve a fused output."""
+    monkeypatch.setenv("SGLANG_ZING_FUSED_CURRENT_ROPE", "1")
+    x = torch.randn(shape, dtype=dtype)
+    rope = torch.randn(5, 96, dtype=dtype)
+    expected = _apply_rope(x, rope)
+    allocations = []
+    empty = torch.empty
+
+    def counting_empty(*args, **kwargs):
+        allocations.append(args)
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(zing_h3_rope, "_apply_rope", lambda x, rope: expected)
+    monkeypatch.setattr(torch, "empty", counting_empty)
+    result = apply_current_rope(x, rope)
+    monkeypatch.undo()
+    assert result is expected
+    assert allocations == []

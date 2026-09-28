@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_cache import (
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_rope import (
     apply_contiguous_history_rope_batch,
+    apply_current_rope,
     apply_history_rope_batch,
     apply_history_rope_into,
 )
@@ -346,10 +347,10 @@ def _attention(
         with maybe_record_function("Zing.RoPE_and_KV_append"):
             if rope is not None:
                 with maybe_record_function("Zing.current_QK_RoPE"):
-                    q = _apply_rope(q, rope)
+                    q = apply_current_rope(q, rope)
                     # The single store rotates K straight into its scratch tail.
                     if not (capture_rotated or append_unrotated):
-                        k = _apply_rope(k, rope)
+                        k = apply_current_rope(k, rope)
             if append_kv is not None:
                 rows = k.shape[1]
                 with maybe_record_function("Zing.cached_KV_append"):
@@ -411,9 +412,9 @@ def _attention(
     with maybe_record_function("Zing.RoPE_and_KV_append"):
         if rope is not None:
             with maybe_record_function("Zing.current_QK_RoPE"):
-                q = _apply_rope(q, rope)
+                q = apply_current_rope(q, rope)
                 if not (capture_rotated or append_unrotated):
-                    k = _apply_rope(k, rope)
+                    k = apply_current_rope(k, rope)
         if append_kv is not None:
             rows = k.shape[0]
             with maybe_record_function("Zing.cached_KV_append"):
