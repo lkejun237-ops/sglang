@@ -34,6 +34,12 @@ benchmark。它们不改变 BF16 精度、权重或采样步数。当前 perform
 SP2/SP4 exact 失败，自动选择不会暗中修改此策略，也不会自动启用并行。
 SP1、SP8、stack-on、其他精度不继承 SP2/SP4 BF16 的验收结论。
 
+#195 提供默认关闭的独立实验开关
+`MINIMAX_H3_PROGRESSIVE_ENCODER_PERFORMANCE_AUTO=1`，允许 performance 在其余
+auto 条件成立时真实分片。它不改变 encode_mode，也不表示已通过数值或性能验收。
+开关在 session 创建时冻结；实验标准与复现入口见
+[performance 验收计划](PERFORMANCE_ENCODER_PLAN.md)。
+
 使用 runtime 的 `vae_decode` coordinator：device group 搬运 moments，Gloo
 CPU group 核对状态/错误。该组按 TP/SP/PP/CFG 组合，**不跨 DP replica**；
 只有 TP=PP=CFG=DP=1 时其 world size 才等于 DiT SP。实际 global ranks、

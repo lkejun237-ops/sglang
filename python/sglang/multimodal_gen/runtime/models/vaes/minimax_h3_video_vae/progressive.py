@@ -83,6 +83,13 @@ class CausalEncoderCache:
             else None
         )
         self.tile_mode = self.requested_mode
+        # Experimental until same-device numerical and service A/B gates pass.
+        # Snapshot at construction, just like the tiling policy itself.
+        self.performance_auto = (
+            os.environ.get("MINIMAX_H3_PROGRESSIVE_ENCODER_PERFORMANCE_AUTO", "0")
+            == "1"
+        )
+        self.encode_mode = encode_mode
         self.default_fallback_reason = None
         if self.requested_mode == "auto":
             # Promote only the numerical/stack/group policy validated in #177.
@@ -92,7 +99,9 @@ class CausalEncoderCache:
                 self.default_fallback_reason = "single_rank_or_uninitialized_group"
             elif self.available_group.world_size not in (2, 4):
                 self.default_fallback_reason = "unvalidated_group_size"
-            elif encode_mode != "deterministic":
+            elif encode_mode != "deterministic" and not (
+                encode_mode == "performance" and self.performance_auto
+            ):
                 self.default_fallback_reason = "unvalidated_encode_mode"
             elif encode_dtype != "bfloat16":
                 self.default_fallback_reason = "unvalidated_encode_dtype"
@@ -403,6 +412,8 @@ class CausalEncoderCache:
         execution = dict(
             spatial_padding=self.spatial_padding,
             requested_mode=self.requested_mode,
+            encode_mode=self.encode_mode,
+            performance_auto=self.performance_auto,
             effective_mode="parallel" if parallel else "replicated",
             fallback_reason=reason,
             group="vae_decode" if self.available_group is not None else None,
@@ -416,6 +427,11 @@ class CausalEncoderCache:
             replicated_copies=1 if parallel else size,
             tile_count=len(tiles),
             local_tile_ids=local_ids,
+            backend_policy=dict(
+                cudnn_benchmark=torch.backends.cudnn.benchmark,
+                cudnn_deterministic=torch.backends.cudnn.deterministic,
+                deterministic_algorithms=torch.are_deterministic_algorithms_enabled(),
+            ),
             stack_tiling=bool(stack),
             tile_batch_size=self.tile_batch_size,
             tile_batches=[list(ids) for ids in batches],

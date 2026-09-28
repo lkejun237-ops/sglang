@@ -326,6 +326,31 @@ def test_default_tile_policy_requires_validated_configuration(
     stream.dispose()
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("size", [1, 2, 4, 8])
+def test_performance_auto_opt_in_is_session_scoped(codecs, monkeypatch, enabled, size):
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import klvae
+
+    monkeypatch.delenv("MINIMAX_H3_PROGRESSIVE_ENCODER_TILING", raising=False)
+    name = "MINIMAX_H3_PROGRESSIVE_ENCODER_PERFORMANCE_AUTO"
+    monkeypatch.setenv(name, str(int(enabled)))
+    monkeypatch.setattr(klvae, "get_tile_parallel_state", lambda: (0, size))
+    group = SimpleNamespace(world_size=size)
+    monkeypatch.setattr(klvae, "get_decode_parallel_group_coordinator", lambda: group)
+    configure_tiling(codecs, False)
+    codecs.runtime["vae_config"].update(
+        encode_mode="performance", encode_dtype="bfloat16"
+    )
+    stream = create_session(codecs, capacity_frames=8)
+    expected = "parallel" if enabled and size in (2, 4) else "replicated"
+    assert stream.cache.tile_mode == expected
+    monkeypatch.setenv(name, str(int(not enabled)))
+    stream.reset()
+    assert stream.cache.tile_mode == expected
+    assert stream.cache.performance_auto is enabled
+    stream.dispose()
+
+
 @pytest.mark.parametrize(
     "key,value", [("encode_mode", "deterministic"), ("encode_dtype", "float32")]
 )

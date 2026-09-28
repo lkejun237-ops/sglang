@@ -18,7 +18,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
     expected_progressive_slices,
 )
 
-
 # Workers fork from a clean server process, not from the pytest process whose
 # shared model fixture leaves a default process group initialized; preloading
 # the heavy dependencies pays their import once instead of once per worker.
@@ -48,6 +47,7 @@ def _worker(
     sp1_reference=None,
     batch_size=None,
     heterogeneous=False,
+    encode_mode="deterministic",
 ):
     torch.set_num_threads(1)
     codecs = make_codecs()
@@ -79,8 +79,9 @@ def _worker(
         if mode == "auto":
             model.to(torch.bfloat16)
             codecs.runtime["vae_config"].update(
-                encode_mode="deterministic", encode_dtype="bfloat16"
+                encode_mode=encode_mode, encode_dtype="bfloat16"
             )
+            os.environ["MINIMAX_H3_PROGRESSIVE_ENCODER_PERFORMANCE_AUTO"] = "1"
         torch.manual_seed(23)
         pixels = torch.randint(256, (3, 34, canvas, canvas), dtype=torch.uint8)
         os.environ["MINIMAX_H3_PROGRESSIVE_ENCODER_TILING"] = "replicated"
@@ -158,6 +159,14 @@ def _worker(
                 receipt = stream.cache.last_execution
                 assert receipt["requested_mode"] == mode
                 assert receipt["local_tile_ids"] == ids
+                assert len(receipt["local_tile_shapes"]) == len(ids)
+                if mode == "auto":
+                    deterministic = encode_mode == "deterministic"
+                    assert receipt["backend_policy"] == dict(
+                        cudnn_benchmark=not deterministic,
+                        cudnn_deterministic=deterministic,
+                        deterministic_algorithms=deterministic,
+                    )
                 assert receipt["gather_calls"] == int(parallel)
                 assert receipt["encoder_ranks"] == (size if parallel else 1)
                 if heterogeneous:
@@ -261,6 +270,34 @@ def test_default_sp1_sp2_sp4_bitwise_moments(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "failure", [None, "kernel", "state", "ended", "dispose", "dtype"]
+)
+def test_performance_auto_distributed_lifecycle(tmp_path, failure):
+    # CPU/Gloo checks dispatch and lifecycle only; not cuDNN numerical acceptance.
+    torch.set_num_threads(1)
+    if sys.platform == "darwin":
+        os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo0")
+    mp.start_processes(
+        _worker,
+        args=(
+            2,
+            str(tmp_path / "rendezvous"),
+            False,
+            32,
+            failure,
+            "auto",
+            None,
+            None,
+            False,
+            "performance",
+        ),
+        nprocs=2,
+        join=True,
+        start_method="forkserver",
+    )
+
+
+@pytest.mark.parametrize(
     "size,batch_size,heterogeneous",
     [
         (1, 2, False),
@@ -271,8 +308,9 @@ def test_default_sp1_sp2_sp4_bitwise_moments(tmp_path):
         (2, None, True),
     ],
 )
+@pytest.mark.parametrize("encode_mode", ["deterministic", "performance"])
 def test_bounded_batch_auto_shards_and_unequal_work(
-    tmp_path, size, batch_size, heterogeneous
+    tmp_path, size, batch_size, heterogeneous, encode_mode
 ):
     torch.set_num_threads(1)
     if sys.platform == "darwin":
@@ -289,6 +327,7 @@ def test_bounded_batch_auto_shards_and_unequal_work(
             None,
             batch_size,
             heterogeneous,
+            encode_mode,
         ),
         nprocs=size,
         join=True,
