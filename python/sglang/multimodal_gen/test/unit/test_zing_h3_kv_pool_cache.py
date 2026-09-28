@@ -339,6 +339,153 @@ def test_sp_pooled_raw_store_matches_unpooled(model, monkeypatch, world, stable_
 
 
 @torch.no_grad()
+def test_compaction_moves_rows_without_cloning(model, monkeypatch):
+    clones, compacting = [], []
+    original = torch.Tensor.clone
+    compact = ZingH3KVCache._compact_store
+
+    def counting_clone(self, *args, **kwargs):
+        if compacting:
+            clones.append(self.numel())
+        return original(self, *args, **kwargs)
+
+    def tracked_compact(self):
+        compacting.append(True)
+        try:
+            return compact(self)
+        finally:
+            compacting.pop()
+
+    monkeypatch.setattr(ZingH3KVCache, "_compact_store", tracked_compact)
+    monkeypatch.setattr(torch.Tensor, "clone", counting_clone)
+    sampler = _sampler(model)
+    torch.manual_seed(1)
+    inputs, visual = _inputs(9), torch.randn(1, 2, 9, 2, 2)
+    _, stats, _ = _generate(sampler, inputs, visual, _storage(model, 64))
+    assert stats["compactions"] >= 2
+    assert clones == []
+
+
+@pytest.mark.parametrize(
+    "destination, source, rows",
+    [(0, 5, 5), (0, 7, 5), (0, 2, 7), (3, 4, 9), (1, 3, 2), (0, 1, 12), (2, 3, 16)],
+)
+def test_move_rows_matches_cloned_copy_for_overlapping_left_shifts(
+    destination, source, rows
+):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import (
+        _move_rows as move_rows,
+    )
+
+    tensor = torch.arange(20 * 3, dtype=torch.float32).view(20, 3)
+    expected = tensor.clone()
+    expected[destination : destination + rows] = tensor[source : source + rows].clone()
+    move_rows(tensor, destination, source, rows)
+    assert torch.equal(tensor, expected)
+
+
+@pytest.mark.parametrize(
+    "spans,runs",
+    [
+        # Eviction after the prefix: every later chunk shares one shift.
+        ([(0, 10), (30, 20), (50, 20)], [(10, 30, 40)]),
+        # Unequal shifts cannot share a run.
+        ([(0, 5), (10, 5), (20, 5)], [(5, 10, 5), (10, 20, 5)]),
+        # A gap between moved chunks with the same shift splits the run.
+        ([(0, 4), (8, 4), (20, 4)], [(4, 8, 4), (8, 20, 4)]),
+        ([(0, 4), (4, 6)], []),
+    ],
+)
+def test_compaction_runs_merge_adjacent_chunks_with_one_shift(spans, runs):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import (
+        _compaction_runs,
+    )
+
+    assert _compaction_runs(spans) == runs
+
+
+@torch.no_grad()
+def test_compaction_moves_every_layer_in_one_fused_call_per_run(model, monkeypatch):
+    from sglang.multimodal_gen.runtime.models.dits import zing_h3_cache
+
+    sampler = _sampler(model)
+    torch.manual_seed(1)
+    inputs, visual = _inputs(9), torch.randn(1, 2, 9, 2, 2)
+    expected, _, _ = _generate(sampler, inputs, visual, _storage(model, 64))
+    calls = []
+
+    def reference(tensors, runs):
+        calls.append((len(tensors), list(runs)))
+        for tensor in tensors:
+            for destination, source, rows in runs:
+                tensor[destination : destination + rows] = tensor[
+                    source : source + rows
+                ].clone()
+
+    monkeypatch.setattr(zing_h3_cache, "_fused_compaction_rejection", lambda *a: None)
+    monkeypatch.setattr(zing_h3_cache, "_fused_move_rows", reference)
+    actual, stats, _ = _generate(sampler, inputs, visual, _storage(model, 64))
+    assert torch.equal(actual, expected)
+    assert len(calls) == stats["compactions"] >= 2
+    assert all(count == 2 * len(model.blocks) and runs for count, runs in calls)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("shift", [16, 17, 390, 1170])
+@torch.no_grad()
+def test_fused_move_rows_matches_reference_for_overlapping_left_shifts(shift):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import (
+        _fused_compaction_rejection,
+        _fused_move_rows,
+    )
+
+    torch.manual_seed(5)
+    tensors = [
+        torch.randn(4000, 7, 128, device="cuda", dtype=torch.bfloat16) for _ in range(6)
+    ]
+    runs = [(100, 100 + shift, 2600)]
+    expected = [t.clone() for t in tensors]
+    for t in expected:
+        t[100:2700] = t[100 + shift : 2700 + shift].clone()
+    assert _fused_compaction_rejection(tensors, runs) is None
+    _fused_move_rows(tensors, runs)
+    for actual, reference in zip(tensors, expected):
+        assert torch.equal(actual, reference)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.no_grad()
+def test_fused_compaction_rejects_unsafe_or_unsupported_moves():
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import (
+        _fused_compaction_rejection,
+    )
+
+    t = torch.zeros(64, 2, 128, device="cuda", dtype=torch.bfloat16)
+    assert _fused_compaction_rejection([t], [(0, 4, 20)]) == "shift"
+    assert _fused_compaction_rejection([t.cpu()], [(0, 32, 20)]) == "device"
+    assert _fused_compaction_rejection([t[:, :1]], [(0, 32, 20)]) == "layout"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.no_grad()
+def test_fused_compaction_never_synchronizes_the_host():
+    """Fresh store addresses (a grown store) must not add a blocking H2D copy."""
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import (
+        _fused_move_rows,
+    )
+
+    tensors = [
+        torch.randn(256, 2, 128, device="cuda", dtype=torch.bfloat16) for _ in range(4)
+    ]
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        _fused_move_rows(tensors, [(0, 64, 128)])
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+
+@torch.no_grad()
 def test_model_routes_current_q_through_the_dispatch(model, monkeypatch):
     calls = []
     eager = _apply_rope

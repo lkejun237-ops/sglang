@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Request-owned KV transactions for Zing causal generation."""
 
+import functools
 import os
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -51,6 +52,96 @@ class ZingHistoryRoPEPlan:
     position_signatures: tuple
     rows: int
     runs: tuple
+
+
+_MAX_MOVE_PIECES = 8
+
+
+def _move_rows(tensor, destination, source, rows):
+    """Copy rows left in place without a temporary buffer.
+
+    Pieces no longer than the shift never overlap, and ascending order reads
+    every source row before a later piece overwrites it.
+    """
+    shift = source - destination
+    if shift <= 0:
+        raise ValueError("Zing KV compaction only moves rows left")
+    if rows > _MAX_MOVE_PIECES * shift:
+        # A tiny shift of a long run would launch many copies; one staged
+        # copy of this slice is cheaper.
+        tensor[destination : destination + rows].copy_(
+            tensor[source : source + rows].clone()
+        )
+        return
+    for start in range(0, rows, shift):
+        count = min(shift, rows - start)
+        tensor[destination + start : destination + start + count].copy_(
+            tensor[source + start : source + start + count]
+        )
+
+
+def _compaction_runs(spans):
+    """Merge per-chunk left moves into (destination, source, rows) runs.
+
+    ``spans`` are (offset, rows) in row order. Adjacent moved chunks with the
+    same shift form one run; unmoved chunks produce none.
+    """
+    runs, destination = [], 0
+    for offset, rows in spans:
+        if offset != destination:
+            last = runs[-1] if runs else None
+            if (
+                last is not None
+                and last[1] + last[2] == offset
+                and last[1] - last[0] == offset - destination
+            ):
+                runs[-1] = (last[0], last[1], last[2] + rows)
+            else:
+                runs.append((destination, offset, rows))
+        destination += rows
+    return runs
+
+
+def _fused_compaction_rejection(tensors, runs):
+    if os.environ.get("SGLANG_ZING_FUSED_KV_COMPACT", "1") != "1":
+        return "disabled"
+    first = tensors[0]
+    if torch.version.hip is not None or any(
+        not t.is_cuda or t.device != first.device for t in tensors
+    ):
+        return "device"
+    row_bytes = first[0].numel() * first.element_size()
+    if any(
+        not t.is_contiguous() or t[0].numel() * t.element_size() != row_bytes
+        for t in tensors
+    ):
+        return "layout"
+    from sglang.kernels.ops.diffusion.layout.zing_kv_compact_triton import TILE_ROWS
+
+    if any(source - destination < TILE_ROWS for destination, source, _ in runs):
+        return "shift"
+    return None
+
+
+@functools.lru_cache(maxsize=8)
+def _device_pointers(pointers, device):
+    # A pageable H2D copy would block the host; copy from pinned memory and
+    # keep that buffer alive with the result until the copy has run.
+    host = torch.tensor(pointers, dtype=torch.int64).pin_memory()
+    return host, host.to(device, non_blocking=True)
+
+
+def _fused_move_rows(tensors, runs):
+    """Apply every run to every tensor, one kernel launch per run."""
+    from sglang.kernels.ops.diffusion.layout.zing_kv_compact_triton import (
+        fused_zing_kv_compact,
+    )
+
+    first = tensors[0]
+    _, pointers = _device_pointers(tuple(t.data_ptr() for t in tensors), first.device)
+    row_bytes = first[0].numel() * first.element_size()
+    for destination, source, rows in runs:
+        fused_zing_kv_compact(pointers, row_bytes, destination, source, rows)
 
 
 class ZingH3KVCache:
@@ -393,19 +484,23 @@ class ZingH3KVCache:
     def _compact_store(self):
         """Move live raw K/V to the front, using at most one chunk temporarily."""
         chunks = self._stored_chunks()
-        for layer, (keys, values) in self._stores.items():
+        runs = _compaction_runs([(c.offset, c.positions.shape[0]) for c in chunks])
+        tensors = [tensor for pair in self._stores.values() for tensor in pair]
+        for layer in self._stores:
             self._observe_raw_store(layer)
-            destination = 0
-            for chunk in chunks:
-                rows, source = chunk.positions.shape[0], chunk.offset
-                if source != destination:
-                    # Left shifts may overlap within a chunk; clone only that
-                    # source slice, never the whole multi-layer cache.
-                    for tensor in (keys, values):
-                        tensor[destination : destination + rows].copy_(
-                            tensor[source : source + rows].clone()
-                        )
-                destination += rows
+        if runs and _fused_compaction_rejection(tensors, runs) is None:
+            _fused_move_rows(tensors, runs)
+        elif runs:
+            # Per chunk, a move is at most a few pieces of its shift.
+            for keys, values in self._stores.values():
+                destination = 0
+                for chunk in chunks:
+                    rows, source = chunk.positions.shape[0], chunk.offset
+                    if source != destination:
+                        for tensor in (keys, values):
+                            _move_rows(tensor, destination, source, rows)
+                    destination += rows
+        for layer in self._stores:
             self._mark_raw_store(layer)
         offset = 0
         for chunk in chunks:
