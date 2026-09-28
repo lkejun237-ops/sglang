@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Zing realtime KV pool contract, capacity and admission (#171, CPU only)."""
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -354,7 +355,9 @@ def test_finite_audio_tail_beyond_the_slot_is_rejected():
     packer = _packer()
     plan = ZingKVPoolPlan.build(_config(), _audio_geometry(packer))
     frames = 5 * 21 * 3
-    audio = int(packer._video_t_span(frames)) + 1
+    # The float span of the last frame lands just above an integer, so its
+    # ceil already covers one extra latent; the tail must exceed that.
+    audio = math.ceil(packer._video_t_span(frames)) + 2
     kwargs = dict(generates_audio=True, total_frames=frames, audio_length=audio)
     # Slots reserve continuous (v2v) audio; a smaller finite session has room
     # for its EOS audio remainder, one at the full bounds does not.

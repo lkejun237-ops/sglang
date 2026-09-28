@@ -19,6 +19,24 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
 )
 
 
+# Workers fork from a clean server process, not from the pytest process whose
+# shared model fixture leaves a default process group initialized; preloading
+# the heavy dependencies pays their import once instead of once per worker.
+mp.get_context("forkserver").set_forkserver_preload(
+    [
+        "sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.klvae",
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.progressive_encoder",
+    ]
+)
+
+
+# Representative cases run by default; the full matrix needs this opt-in.
+_FULL = pytest.mark.skipif(
+    os.environ.get("ZING_FULL_TILE_TESTS") != "1",
+    reason="set ZING_FULL_TILE_TESTS=1 for the full tile matrix",
+)
+
+
 def _worker(
     rank, size, path, stack, canvas, failure, mode="parallel", sp1_reference=None
 ):
@@ -139,9 +157,27 @@ def _worker(
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("size,canvas", [(1, 24), (2, 32), (4, 32), (8, 32), (8, 24)])
-@pytest.mark.parametrize("stack", [False, True])
-def test_distributed_tile_ownership_and_exact_moments(tmp_path, size, canvas, stack):
+@pytest.mark.parametrize(
+    "stack,size,canvas",
+    [
+        (False, 2, 32),
+        (True, 4, 32),
+        (False, 8, 24),
+        *(
+            pytest.param(*case, marks=_FULL)
+            for case in (
+                (False, 1, 24),
+                (False, 4, 32),
+                (False, 8, 32),
+                (True, 1, 24),
+                (True, 2, 32),
+                (True, 8, 24),
+                (True, 8, 32),
+            )
+        ),
+    ],
+)
+def test_distributed_tile_ownership_and_exact_moments(tmp_path, stack, size, canvas):
     torch.set_num_threads(1)
     if sys.platform == "darwin":
         os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo0")
@@ -150,11 +186,18 @@ def test_distributed_tile_ownership_and_exact_moments(tmp_path, size, canvas, st
         args=(size, str(tmp_path / "rendezvous"), stack, canvas, None),
         nprocs=size,
         join=True,
-        start_method="fork",
+        start_method="forkserver",
     )
 
 
-@pytest.mark.parametrize("failure", ["kernel", "state", "ended", "dispose", "dtype"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "kernel",
+        "state",
+        *(pytest.param(f, marks=_FULL) for f in ("ended", "dispose", "dtype")),
+    ],
+)
 def test_distributed_failure_is_consistent(tmp_path, failure):
     torch.set_num_threads(1)
     if sys.platform == "darwin":
@@ -164,7 +207,7 @@ def test_distributed_failure_is_consistent(tmp_path, failure):
         args=(2, str(tmp_path / "rendezvous"), False, 24, failure),
         nprocs=2,
         join=True,
-        start_method="fork",
+        start_method="forkserver",
     )
 
 
@@ -187,5 +230,5 @@ def test_default_sp1_sp2_sp4_bitwise_moments(tmp_path):
             ),
             nprocs=size,
             join=True,
-            start_method="fork",
+            start_method="forkserver",
         )
