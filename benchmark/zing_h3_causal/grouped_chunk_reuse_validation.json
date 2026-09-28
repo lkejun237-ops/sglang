@@ -1,0 +1,206 @@
+{
+  "base_commit": "04369a33f90b3d04673df426c0fe276cb58dc7fa",
+  "date": "2026-09-28",
+  "job_id": "dlc1c9bzeyua911y",
+  "job_status": "Succeeded",
+  "worker_exit_code": 0,
+  "resources": {
+    "gpu": 1,
+    "cpu": 8,
+    "memory_gib": 32,
+    "limit_minutes": 15
+  },
+  "image": "zing-thailand-registry-vpc.ap-southeast-7.cr.aliyuncs.com/zing/sglang@sha256:4b9bca7dd61784cd84e43ac760db4c458c08a2d6bf22887e3740455fffe9e015",
+  "source_bundle_sha256": "c6900e92197bf0310e9c616b0f8aa6f1c303eae38558b92b01c33d1b400924b9",
+  "overlay_sha256": "b84e9884a469ea19b9d4d3e69d6daa715d11e705e5c444883936591a5998c7ac",
+  "files": {
+    "python/sglang/multimodal_gen/runtime/models/dits/zing_h3_cache.py": "3dcdc18a11169ea3c1b25319a886a3e0e77c26870fc963a7f6c7b74895deaf86",
+    "benchmark/zing_h3_causal/test_chunk_rope_reuse.py": "fa5e52c110a977c485aed96004213555aecd030bc85998e8ad310113455d3de7",
+    "benchmark/zing_h3_causal/validate_grouped_chunk_reuse.py": "3f49279cc3d1aa35fdca1ec398f8a92021fb524a55f4987210aedc69045339ba",
+    "python/sglang/multimodal_gen/test/unit/test_zing_grouped_chunk_reuse.py": "f85a3012a7b2965144f2b1810a9f56185b4be1dbec33c39602ae4e7509211f28"
+  },
+  "nvidia_smi": {
+    "name": "NVIDIA L20D",
+    "memory_mib": 275040,
+    "compute_cap": "8.9"
+  },
+  "cuda_component": {
+    "device": "NVIDIA L20D",
+    "capability": [
+      10,
+      3
+    ],
+    "torch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "records": [
+      {
+        "sizes": [
+          17,
+          33,
+          65,
+          129
+        ],
+        "heads": 14,
+        "dim": 128,
+        "grouped": false,
+        "repeats": 20,
+        "warmup": 10,
+        "routes": {
+          "grouped": 0,
+          "grouped_chunks": 0,
+          "fused": 80
+        },
+        "wall_median_ms": 0.43032049999425226,
+        "cuda_event_median_ms": 0.4140799939632416
+      },
+      {
+        "sizes": [
+          17,
+          33,
+          65,
+          129
+        ],
+        "heads": 14,
+        "dim": 128,
+        "grouped": true,
+        "repeats": 20,
+        "warmup": 10,
+        "routes": {
+          "grouped": 20,
+          "grouped_chunks": 80,
+          "fused": 0
+        },
+        "wall_median_ms": 0.3413849999986951,
+        "cuda_event_median_ms": 0.32598400115966797
+      },
+      {
+        "sizes": [
+          390,
+          390,
+          390,
+          390
+        ],
+        "heads": 14,
+        "dim": 128,
+        "grouped": false,
+        "repeats": 20,
+        "warmup": 10,
+        "routes": {
+          "grouped": 0,
+          "grouped_chunks": 0,
+          "fused": 80
+        },
+        "wall_median_ms": 0.40679599999293714,
+        "cuda_event_median_ms": 0.3884640038013458
+      },
+      {
+        "sizes": [
+          390,
+          390,
+          390,
+          390
+        ],
+        "heads": 14,
+        "dim": 128,
+        "grouped": true,
+        "repeats": 20,
+        "warmup": 10,
+        "routes": {
+          "grouped": 20,
+          "grouped_chunks": 80,
+          "fused": 0
+        },
+        "wall_median_ms": 0.343100999998569,
+        "cuda_event_median_ms": 0.3274879902601242
+      }
+    ],
+    "result": "PASS"
+  },
+  "cpu_cache": {
+    "passed": 17,
+    "torch": "2.14.0",
+    "python": "3.12.12"
+  },
+  "cpu_model_and_history": {
+    "passed": 38,
+    "skipped": 12,
+    "deselected": 143,
+    "torch": "2.13.0",
+    "python": "3.11.13"
+  },
+  "gpu_cache": {
+    "passed": 17
+  },
+  "cuda_environment_fallback_tests": {
+    "passed": 13,
+    "deselected": 168
+  },
+  "prior_attempt": {
+    "job_id": "dlcg2n30q5wzmmn7",
+    "status": "Failed",
+    "reason": "Missing /workspace parent directory; no tests ran. Launcher repaired; same source and resources used."
+  },
+  "cuda_lifecycle": {
+    "job_id": "dlc6d9q16zbwc210",
+    "status": "Succeeded",
+    "worker_exit_code": 0,
+    "runner_sha256": "020d3fc98a4b249cc7874cbd0c814088608813dc51879eb44eeb44c5b80adb4f",
+    "oracle_sha256": "27c063353ff6d95609c9f693ba4dc548424dccd2c2577112d4990e155dcafefa",
+    "result": {
+      "result": "PASS",
+      "oracle": "test_cache_transactions_eviction_and_failure",
+      "device": "NVIDIA L20D",
+      "capability": [
+        10,
+        3
+      ],
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "window": 3,
+      "sink": 1,
+      "mode": "block_relative",
+      "planned": false,
+      "dtype": "bfloat16",
+      "heads": 14,
+      "dim": 128,
+      "transactions": 28,
+      "prefix_rows": [
+        5,
+        6
+      ],
+      "source_rows": 7,
+      "target_rows": 9,
+      "routes": {
+        "grouped": 56,
+        "grouped_chunks": 92,
+        "rows": 695
+      },
+      "cache_snapshots_before_clear": [
+        {
+          "stats": {
+            "store_allocations": 5,
+            "rotated_allocations": 5,
+            "compactions": 25
+          },
+          "reuse": {
+            "rebuilt_rows": 695,
+            "reused_rows": 2706,
+            "map_syncs": 83
+          }
+        },
+        {
+          "stats": {
+            "store_allocations": 5,
+            "rotated_allocations": 5,
+            "compactions": 25
+          },
+          "reuse": {
+            "rebuilt_rows": 695,
+            "reused_rows": 2706,
+            "map_syncs": 84
+          }
+        }
+      ]
+    }
+  }
+}

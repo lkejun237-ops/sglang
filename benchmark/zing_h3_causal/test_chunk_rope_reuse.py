@@ -40,7 +40,7 @@ def commit(cache, t, block, phase):
     )
 
 
-def view(cache, t, override=None, fail=False):
+def view(cache, t, override=None, fail=False, batches=None):
     current, history = cache.attention_positions(positions(t))
     if override is not None:
         history = override(history)
@@ -61,7 +61,17 @@ def view(cache, t, override=None, fail=False):
         if fail:
             raise RuntimeError("Injected tail failure")
 
-    keys, values = cache.raw_attention_view(0, k, v, coeff, rotate, write)
+    def batch(xs, coefficients, out):
+        if batches is not None:
+            batches.append([x.shape[0] for x in xs])
+        offset = 0
+        for x, r in zip(xs, coefficients):
+            rotate(x, r, out[offset : offset + x.shape[0]])
+            offset += x.shape[0]
+
+    keys, values = cache.raw_attention_view(
+        0, k, v, coeff, rotate, write, rotate_batch=batch
+    )
     hist = cache.history(0)
     if hist is not None:
         assert torch.equal(
@@ -273,3 +283,109 @@ def test_pooled_chunk_reuse_keeps_slot_and_tracks_writes(monkeypatch, mode):
     view(c, 91)
     assert not view(c, 91)
     assert c._rotated_stores[0].data_ptr() == storage[0].rotated_k.data_ptr()
+
+
+@torch.no_grad()
+def test_grouped_contiguous_misses_preserve_middle_hit(monkeypatch):
+    c = cache(monkeypatch, window=None)
+    c.reserve_rows = 64
+    for i in range(5):
+        commit(c, i * 10, i * 2, "prefix" if i == 0 else "final")
+    batches = []
+    assert sum(view(c, 60, batches=batches)) == 10
+    assert batches == [[2, 2, 2, 2, 2]]
+    batches.clear()
+    assert not view(c, 60, batches=batches)
+    assert not batches
+    middle = c._rotated_stores[0][4:6].clone()
+
+    def change(p):
+        p = p.clone()
+        p[:4, 0] += 1
+        p[6:, 0] += 1
+        return p
+
+    assert sum(view(c, 60, override=change, batches=batches)) == 8
+    assert batches == [[2, 2], [2, 2]]
+    assert torch.equal(c._rotated_stores[0][4:6], middle)
+
+
+@torch.no_grad()
+def test_grouped_failure_unpublishes_all_ranges(monkeypatch):
+    c = cache(monkeypatch)
+    commit(c, 0, 0, "prefix")
+    commit(c, 10, 2, "final")
+    current, history = c.attention_positions(positions(20))
+    c.bind_attention_positions(history)
+    k, v = kv(current)
+
+    def fail(xs, tables, out):
+        out.fill_(float("nan"))
+        raise RuntimeError("Injected grouped failure")
+
+    with pytest.raises(RuntimeError, match="Injected grouped"):
+        c.raw_attention_view(
+            0,
+            k,
+            v,
+            lambda p: p.sum(-1).float().reshape(-1, 1, 1),
+            None,
+            None,
+            rotate_batch=fail,
+        )
+    assert 0 not in c._rotated_store_signatures
+    batches = []
+    assert sum(view(c, 20, batches=batches)) == 4
+    assert batches == [[2, 2]]
+
+
+@torch.no_grad()
+def test_store_growth_rebuilds_changed_storage(monkeypatch):
+    c = cache(monkeypatch, window=None)
+    c.reserve_rows = 0
+    commit(c, 0, 0, "prefix")
+    commit(c, 10, 2, "final")
+    view(c, 20)
+    old = c._rotated_stores[0]
+    old_rows = old[:4].clone()
+    # A larger current tail reserves new raw storage and rebinds history.
+    k, v = kv(positions(20))
+    c._reserve_store(0, old.shape[0] + 64, k, v)
+    batches = []
+    view(c, 20, batches=batches)
+    assert c._rotated_stores[0].data_ptr() != old.data_ptr()
+    assert torch.equal(c._rotated_stores[0][:4], old_rows)
+    assert batches == [[2, 2]]
+
+
+@torch.no_grad()
+def test_later_grouped_failure_discards_previous_publication(monkeypatch):
+    c = cache(monkeypatch, window=None)
+    for i in range(3):
+        commit(c, i * 10, i * 2, "prefix" if i == 0 else "final")
+    view(c, 40)
+    current, history = c.attention_positions(positions(40))
+    changed = history.clone()
+    changed[:2, 0] += 1
+    changed[4:, 0] += 1
+    c.bind_attention_positions(changed)
+    k, v = kv(current)
+    calls = []
+
+    def coeff(p):
+        return p.sum(-1).float().reshape(-1, 1, 1)
+
+    def batch(xs, tables, out):
+        calls.append(len(xs))
+        out.copy_(xs[0] + tables[0])
+        if len(calls) == 2:
+            raise RuntimeError("Injected second batch failure")
+
+    with pytest.raises(RuntimeError, match="second batch"):
+        c.raw_attention_view(0, k, v, coeff, None, None, rotate_batch=batch)
+    assert calls == [1, 1]
+    assert 0 not in c._rotated_store_signatures
+    assert c.last_rope_reuse["rebuilt_rows"] == 2
+    batches = []
+    assert sum(view(c, 40, batches=batches)) == 6
+    assert batches == [[2, 2, 2]]

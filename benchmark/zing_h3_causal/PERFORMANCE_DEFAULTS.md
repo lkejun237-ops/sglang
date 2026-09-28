@@ -44,3 +44,22 @@ host sync 已直接集成，无需额外开关。已退休的 `EXPERIMENTAL_CACH
 本次默认值调整不代表完成三项优化组合的 GPU 端到端验收，也不叠乘独立 PR 收益。
 原验证范围及画质状态见 HISTORY_ROPE_GROUPED_PLAN.md 和 CHUNK_ROPE_REUSE.md。
 需要旧路径时显式设置前三项为 `0`；plan 保持 `0`。
+
+## grouped 与 chunk reuse 的组合（#211）
+
+默认 chunk reuse 路径现在将 `rotate_batch` 传入失效片段重建：每个连续失效区间
+调用一次 grouped，中间已命中的片段既不重算也不覆盖，全命中时不调用历史旋转。
+不为合批拼接整个历史 K；原始版本、坐标和物理输出范围的精确复用判定保持不变。
+所有历史写入和 current-tail 写入成功后才发布本层结果，异常后下一次完整重建。
+
+- `GROUPED_HISTORY_ROPE=0`：保留 chunk reuse，失效片段逐片段旋转。
+- `CHUNK_ROPE_REUSE=0`：恢复原先 common-prefix 重用及其 grouped 后缀路径。
+- `FUSED_HISTORY_ROPE=0`：grouped 分发仍可发生，计算回退 eager；不支持的设备、
+  dtype、布局和 alias 同样沿用已有回退。
+- `GROUPED_HISTORY_ROPE=contiguous`：仍为显式替代模式。仅在当前连续失效区间的
+  raw K 可作为邻接 view 时打包系数并调用 fused，否则走既有 grouped/fallback。
+- `HISTORY_ROPE_PLAN` 仍默认 `0`。启用后保留 owner/state/positions 校验和 history
+  selection；chunk reuse 的有效性与区间分组仍由已绑定的 chunk plan 决定，
+  不使用 history plan 的 common-prefix geometry 替代逐片段有效性判定。
+
+针对性复现命令和实际证据见 [GROUPED_CHUNK_REUSE.md](GROUPED_CHUNK_REUSE.md)。

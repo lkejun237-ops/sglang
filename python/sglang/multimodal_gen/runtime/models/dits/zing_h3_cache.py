@@ -791,6 +791,7 @@ class ZingH3KVCache:
                 make_rope,
                 rotate_into,
                 write_current,
+                rotate_batch,
             )
         if history_plan is None:
             geometry = self._history_geometry(chunks)
@@ -908,6 +909,7 @@ class ZingH3KVCache:
         make_rope,
         rotate_into,
         write_current,
+        rotate_batch=None,
     ):
         # Match physical output ranges as well as raw K and coordinate versions.
         # A surviving chunk shifted by compact must not read an old scratch view.
@@ -941,6 +943,17 @@ class ZingH3KVCache:
             for key, value in self._rope_coefficients.items()
             if key[0] in live
         }
+        batch_inputs, batch_coefficients = [], []
+        batch_start = 0
+
+        def flush_batch(end):
+            if batch_inputs:
+                rotate_batch(batch_inputs, batch_coefficients, keys[batch_start:end])
+                self.rope_reuse_stats["rebuilt_rows"] += end - batch_start
+                accounting["rebuilt_rows"] += end - batch_start
+                batch_inputs.clear()
+                batch_coefficients.clear()
+
         for (chunk, _, local_start, local_end, positions, key), entry in zip(
             plan, ranges
         ):
@@ -948,6 +961,7 @@ class ZingH3KVCache:
             # Exact match of the last successfully published entry: output
             # range, raw offset, coordinate token, and raw K part signature.
             if entry in reusable:
+                flush_batch(start)
                 self.rope_reuse_stats["reused_rows"] += end - start
                 accounting["reused_rows"] += end - start
                 continue
@@ -961,13 +975,20 @@ class ZingH3KVCache:
             if coefficient_key not in self._rope_coefficients:
                 self._rope_coefficients[coefficient_key] = make_rope(positions)
                 accounting["coefficients_built"] += 1
-            rotate_into(
-                chunk.layers[layer][0][local_start:local_end],
-                self._rope_coefficients[coefficient_key],
-                keys[start:end],
-            )
-            self.rope_reuse_stats["rebuilt_rows"] += end - start
-            accounting["rebuilt_rows"] += end - start
+            raw = chunk.layers[layer][0][local_start:local_end]
+            coefficients = self._rope_coefficients[coefficient_key]
+            if rotate_batch is None:
+                rotate_into(raw, coefficients, keys[start:end])
+                self.rope_reuse_stats["rebuilt_rows"] += end - start
+                accounting["rebuilt_rows"] += end - start
+            else:
+                # Group only adjacent misses: a valid middle span must never
+                # be recomputed or overwritten by a contiguous batch output.
+                if not batch_inputs:
+                    batch_start = start
+                batch_inputs.append(raw)
+                batch_coefficients.append(coefficients)
+        flush_batch(offset)
         total = offset + k.shape[0]
         current_values = values[self._length : self._length + k.shape[0]]
         write_current(k, v, keys[offset:total], current_values)
