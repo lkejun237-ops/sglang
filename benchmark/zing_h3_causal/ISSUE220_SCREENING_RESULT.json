@@ -1,0 +1,497 @@
+{
+  "scope": "SP2 screening only. No reverse-order confirmation, no profiler, no merge acceptance.",
+  "correctness": [
+    {
+      "size": "896x512",
+      "rank": 0,
+      "digest_equal": true,
+      "forward_counts": [
+        265,
+        265
+      ],
+      "routes": [
+        {
+          "prefix:attention:replicated_or_sp1:append=False": 52,
+          "prefix:fa4": 52,
+          "source:attention:ordinary_sp:append=True": 2200,
+          "source:writer:head_stride": 2200,
+          "source:fa4": 2200,
+          "active:attention:ordinary_sp:append=True": 8800,
+          "active:writer:head_stride": 8800,
+          "active:fa4": 8800,
+          "final:attention:ordinary_sp:append=True": 2200,
+          "final:writer:head_stride": 2200,
+          "final:fa4": 2200
+        },
+        {
+          "prefix:attention:replicated_or_sp1:append=False": 52,
+          "prefix:fa4": 52,
+          "source:attention:ordinary_sp:append=True": 2200,
+          "source:writer:fused": 2200,
+          "source:fa4": 2200,
+          "active:attention:ordinary_sp:append=True": 8800,
+          "active:writer:fused": 8800,
+          "active:fa4": 8800,
+          "final:attention:ordinary_sp:append=True": 2200,
+          "final:writer:fused": 2200,
+          "final:fa4": 2200
+        }
+      ],
+      "layouts": [
+        {
+          "{\"k\": {\"dtype\": \"torch.bfloat16\", \"shape\": [448, 28, 128], \"stride\": [10752, 384, 1]}, \"v\": {\"dtype\": \"torch.bfloat16\", \"shape\": [448, 28, 128], \"stride\": [10752, 384, 1]}}": 4800,
+          "{\"k\": {\"dtype\": \"torch.bfloat16\", \"shape\": [896, 28, 128], \"stride\": [10752, 384, 1]}, \"v\": {\"dtype\": \"torch.bfloat16\", \"shape\": [896, 28, 128], \"stride\": [10752, 384, 1]}}": 8400
+        },
+        {
+          "{\"k\": {\"dtype\": \"torch.bfloat16\", \"shape\": [448, 28, 128], \"stride\": [10752, 384, 1]}, \"v\": {\"dtype\": \"torch.bfloat16\", \"shape\": [448, 28, 128], \"stride\": [10752, 384, 1]}}": 4800,
+          "{\"k\": {\"dtype\": \"torch.bfloat16\", \"shape\": [896, 28, 128], \"stride\": [10752, 384, 1]}, \"v\": {\"dtype\": \"torch.bfloat16\", \"shape\": [896, 28, 128], \"stride\": [10752, 384, 1]}}": 8400
+        }
+      ]
+    },
+    {
+      "size": "896x512",
+      "rank": 1,
+      "digest_equal": true,
+      "forward_counts": [
+        265,
+        265
+      ],
+      "routes": [
+        {
+          "prefix:attention:replicated_or_sp1:append=False": 52,
+          "prefix:fa4": 52,
+          "source:attention:ordinary_sp:append=True": 2200,
+          "source:writer:head_stride": 2200,
+          "source:fa4": 2200,
+          "active:attention:ordinary_sp:append=True": 8800,
+          "active:writer:head_stride": 8800,
+          "active:fa4": 8800,
+          "final:attention:ordinary_sp:append=True": 2200,
+          "final:writer:head_stride": 2200,
+          "final:fa4": 2200
+        },
+        {
+          "prefix:attention:replicated_or_sp1:append=False": 52,
+          "prefix:fa4": 52,
+          "source:attention:ordinary_sp:append=True": 2200,
+          "source:writer:fused": 2200,
+          "source:fa4": 2200,
+          "active:attention:ordinary_sp:append=True": 8800,
+          "active:writer:fused": 8800,
+          "active:fa4": 8800,
+          "final:attention:ordinary_sp:append=True": 2200,
+          "final:writer:fused": 2200,
+          "final:fa4": 2200
+        }
+      ],
+      "layouts": [
+        {
+          "{\"k\": {\"dtype\": \"torch.bfloat16\", \"shape\": [448, 28, 128], \"stride\": [10752, 384, 1]}, \"v\": {\"dtype\": \"torch.bfloat16\", \"shape\": [448, 28, 128], \"stride\": [10752, 384, 1]}}": 4800,
+          "{\"k\": {\"dtype\": \"torch.bfloat16\", \"shape\": [896, 28, 128], \"stride\": [10752, 384, 1]}, \"v\": {\"dtype\": \"torch.bfloat16\", \"shape\": [896, 28, 128], \"stride\": [10752, 384, 1]}}": 8400
+        },
+        {
+          "{\"k\": {\"dtype\": \"torch.bfloat16\", \"shape\": [448, 28, 128], \"stride\": [10752, 384, 1]}, \"v\": {\"dtype\": \"torch.bfloat16\", \"shape\": [448, 28, 128], \"stride\": [10752, 384, 1]}}": 4800,
+          "{\"k\": {\"dtype\": \"torch.bfloat16\", \"shape\": [896, 28, 128], \"stride\": [10752, 384, 1]}, \"v\": {\"dtype\": \"torch.bfloat16\", \"shape\": [896, 28, 128], \"stride\": [10752, 384, 1]}}": 8400
+        }
+      ]
+    },
+    {
+      "size": "896x512",
+      "torch_equal_all_forwards": true,
+      "forward_pairs": 530,
+      "rgb_equal": true
+    }
+  ],
+  "performance": [
+    {
+      "size": "896x512",
+      "samples": {
+        "0": [
+          {
+            "name": "measured-0",
+            "api_seconds": 34.027092471999936,
+            "denoise_seconds": 24.943611358642578,
+            "dit_seconds": 24.06060129547119,
+            "denoise_host_seconds": 24.775962200000322,
+            "block_gpu_p50_ms_by_rank": [
+              571.0076599121094,
+              570.0415649414062
+            ],
+            "block_gpu_p95_ms_by_rank": [
+              629.5823150634766,
+              627.7105987548829
+            ],
+            "rank_allocated_peak": [
+              193860115456,
+              193342715904
+            ],
+            "rank_reserved_peak": [
+              194338881536,
+              193879605248
+            ],
+            "rank_allocated_after_dispose": [
+              137366319616,
+              137413112320
+            ],
+            "input_sha": "b72e48cbcace5744359e637a39e47663c2c56b4a3e3ad15d37d6eed639fc15f9",
+            "output_sha": "a1ff9dc42414e10a5326e56d94620d6c4513315e2ea3bbca3f751151cae1b91a"
+          },
+          {
+            "name": "measured-1",
+            "api_seconds": 33.74930399300001,
+            "denoise_seconds": 24.704744689941407,
+            "dit_seconds": 23.820672733306886,
+            "denoise_host_seconds": 24.47162006000019,
+            "block_gpu_p50_ms_by_rank": [
+              571.0691223144531,
+              571.7742614746094
+            ],
+            "block_gpu_p95_ms_by_rank": [
+              620.9891326904298,
+              621.6124633789063
+            ],
+            "rank_allocated_peak": [
+              193860115456,
+              193342715904
+            ],
+            "rank_reserved_peak": [
+              194338881536,
+              193879605248
+            ],
+            "rank_allocated_after_dispose": [
+              137366319616,
+              137413112320
+            ],
+            "input_sha": "b72e48cbcace5744359e637a39e47663c2c56b4a3e3ad15d37d6eed639fc15f9",
+            "output_sha": "a1ff9dc42414e10a5326e56d94620d6c4513315e2ea3bbca3f751151cae1b91a"
+          },
+          {
+            "name": "measured-2",
+            "api_seconds": 34.132725531999995,
+            "denoise_seconds": 25.08539535522461,
+            "dit_seconds": 24.199786235809327,
+            "denoise_host_seconds": 24.879197189000024,
+            "block_gpu_p50_ms_by_rank": [
+              572.7160949707031,
+              574.0209655761719
+            ],
+            "block_gpu_p95_ms_by_rank": [
+              624.991323852539,
+              626.3158752441407
+            ],
+            "rank_allocated_peak": [
+              193860115456,
+              193342715904
+            ],
+            "rank_reserved_peak": [
+              194338881536,
+              193879605248
+            ],
+            "rank_allocated_after_dispose": [
+              137366319616,
+              137413112320
+            ],
+            "input_sha": "b72e48cbcace5744359e637a39e47663c2c56b4a3e3ad15d37d6eed639fc15f9",
+            "output_sha": "a1ff9dc42414e10a5326e56d94620d6c4513315e2ea3bbca3f751151cae1b91a"
+          }
+        ],
+        "1": [
+          {
+            "name": "measured-0",
+            "api_seconds": 33.450473095999996,
+            "denoise_seconds": 24.4848212890625,
+            "dit_seconds": 23.619975036621092,
+            "denoise_host_seconds": 24.258113958000195,
+            "block_gpu_p50_ms_by_rank": [
+              566.7304382324219,
+              566.6720886230469
+            ],
+            "block_gpu_p95_ms_by_rank": [
+              594.0631866455078,
+              594.6872344970703
+            ],
+            "rank_allocated_peak": [
+              193860115456,
+              193342715904
+            ],
+            "rank_reserved_peak": [
+              194338881536,
+              193879605248
+            ],
+            "rank_allocated_after_dispose": [
+              137366319616,
+              137413112320
+            ],
+            "input_sha": "b72e48cbcace5744359e637a39e47663c2c56b4a3e3ad15d37d6eed639fc15f9",
+            "output_sha": "a1ff9dc42414e10a5326e56d94620d6c4513315e2ea3bbca3f751151cae1b91a"
+          },
+          {
+            "name": "measured-1",
+            "api_seconds": 33.59039002500003,
+            "denoise_seconds": 24.508887145996095,
+            "dit_seconds": 23.641302810668947,
+            "denoise_host_seconds": 24.34372796800085,
+            "block_gpu_p50_ms_by_rank": [
+              566.2312622070312,
+              567.0889282226562
+            ],
+            "block_gpu_p95_ms_by_rank": [
+              589.9655151367188,
+              589.0506561279296
+            ],
+            "rank_allocated_peak": [
+              193860115456,
+              193342715904
+            ],
+            "rank_reserved_peak": [
+              194338881536,
+              193879605248
+            ],
+            "rank_allocated_after_dispose": [
+              137366319616,
+              137413112320
+            ],
+            "input_sha": "b72e48cbcace5744359e637a39e47663c2c56b4a3e3ad15d37d6eed639fc15f9",
+            "output_sha": "a1ff9dc42414e10a5326e56d94620d6c4513315e2ea3bbca3f751151cae1b91a"
+          },
+          {
+            "name": "measured-2",
+            "api_seconds": 33.30683886099996,
+            "denoise_seconds": 24.37784228515625,
+            "dit_seconds": 23.49765544128418,
+            "denoise_host_seconds": 24.219797301000426,
+            "block_gpu_p50_ms_by_rank": [
+              561.1637268066406,
+              561.20166015625
+            ],
+            "block_gpu_p95_ms_by_rank": [
+              614.6391296386719,
+              615.4256591796875
+            ],
+            "rank_allocated_peak": [
+              193860115456,
+              193342715904
+            ],
+            "rank_reserved_peak": [
+              194338881536,
+              193879605248
+            ],
+            "rank_allocated_after_dispose": [
+              137366319616,
+              137413112320
+            ],
+            "input_sha": "b72e48cbcace5744359e637a39e47663c2c56b4a3e3ad15d37d6eed639fc15f9",
+            "output_sha": "a1ff9dc42414e10a5326e56d94620d6c4513315e2ea3bbca3f751151cae1b91a"
+          }
+        ]
+      },
+      "metrics": {
+        "api_seconds": {
+          "baseline": [
+            34.027092471999936,
+            33.74930399300001,
+            34.132725531999995
+          ],
+          "candidate": [
+            33.450473095999996,
+            33.59039002500003,
+            33.30683886099996
+          ],
+          "median": [
+            34.027092471999936,
+            33.450473095999996
+          ],
+          "gain": 0.016945890292402344,
+          "speedup": 1.017238003610445,
+          "spread": [
+            0.011268125224495478,
+            0.008476745999564958
+          ]
+        },
+        "denoise_seconds": {
+          "baseline": [
+            24.943611358642578,
+            24.704744689941407,
+            25.08539535522461
+          ],
+          "candidate": [
+            24.4848212890625,
+            24.508887145996095,
+            24.37784228515625
+          ],
+          "median": [
+            24.943611358642578,
+            24.4848212890625
+          ],
+          "gain": 0.018393089235697824,
+          "speedup": 1.018737734050157,
+          "spread": [
+            0.015260447246798224,
+            0.005352085657181479
+          ]
+        },
+        "dit_seconds": {
+          "baseline": [
+            24.06060129547119,
+            23.820672733306886,
+            24.199786235809327
+          ],
+          "candidate": [
+            23.619975036621092,
+            23.641302810668947,
+            23.49765544128418
+          ],
+          "median": [
+            24.06060129547119,
+            23.619975036621092
+          ],
+          "gain": 0.01831318566976281,
+          "speedup": 1.0186548147560248,
+          "spread": [
+            0.01575660964773147,
+            0.0060816054700333485
+          ]
+        },
+        "denoise_host_seconds": {
+          "baseline": [
+            24.775962200000322,
+            24.47162006000019,
+            24.879197189000024
+          ],
+          "candidate": [
+            24.258113958000195,
+            24.34372796800085,
+            24.219797301000426
+          ],
+          "median": [
+            24.775962200000322,
+            24.258113958000195
+          ],
+          "gain": 0.020901236360463926,
+          "speedup": 1.0213474239133642,
+          "spread": [
+            0.01645050657204456,
+            0.00510883357275807
+          ]
+        }
+      },
+      "followup_signal": false,
+      "formal_gate_passed": false
+    },
+    {
+      "size": "1280x736",
+      "samples": {
+        "0": [],
+        "1": []
+      },
+      "metrics": {},
+      "followup_signal": false,
+      "formal_gate_passed": false
+    }
+  ],
+  "media": [
+    {
+      "path": "/cpfs/world-model/sglang/evals/zing220-20260928-r2/sp2-screen-r1/896x512-correctness-writer0/correctness",
+      "raw_valid": true,
+      "width": 896,
+      "height": 512,
+      "frames": 240,
+      "fps": 24
+    },
+    {
+      "path": "/cpfs/world-model/sglang/evals/zing220-20260928-r2/sp2-screen-r1/896x512-correctness-writer1/correctness",
+      "raw_valid": true,
+      "width": 896,
+      "height": 512,
+      "frames": 240,
+      "fps": 24
+    },
+    {
+      "path": "/cpfs/world-model/sglang/evals/zing220-20260928-r2/sp2-screen-r1/896x512-performance-writer0/measured-0",
+      "raw_valid": true,
+      "width": 896,
+      "height": 512,
+      "frames": 240,
+      "fps": 24
+    },
+    {
+      "path": "/cpfs/world-model/sglang/evals/zing220-20260928-r2/sp2-screen-r1/896x512-performance-writer0/measured-1",
+      "raw_valid": true,
+      "width": 896,
+      "height": 512,
+      "frames": 240,
+      "fps": 24
+    },
+    {
+      "path": "/cpfs/world-model/sglang/evals/zing220-20260928-r2/sp2-screen-r1/896x512-performance-writer0/measured-2",
+      "raw_valid": true,
+      "width": 896,
+      "height": 512,
+      "frames": 240,
+      "fps": 24
+    },
+    {
+      "path": "/cpfs/world-model/sglang/evals/zing220-20260928-r2/sp2-screen-r1/896x512-performance-writer0/warmup",
+      "raw_valid": true,
+      "width": 896,
+      "height": 512,
+      "frames": 240,
+      "fps": 24
+    },
+    {
+      "path": "/cpfs/world-model/sglang/evals/zing220-20260928-r2/sp2-screen-r1/896x512-performance-writer1/measured-0",
+      "raw_valid": true,
+      "width": 896,
+      "height": 512,
+      "frames": 240,
+      "fps": 24
+    },
+    {
+      "path": "/cpfs/world-model/sglang/evals/zing220-20260928-r2/sp2-screen-r1/896x512-performance-writer1/measured-1",
+      "raw_valid": true,
+      "width": 896,
+      "height": 512,
+      "frames": 240,
+      "fps": 24
+    },
+    {
+      "path": "/cpfs/world-model/sglang/evals/zing220-20260928-r2/sp2-screen-r1/896x512-performance-writer1/measured-2",
+      "raw_valid": true,
+      "width": 896,
+      "height": 512,
+      "frames": 240,
+      "fps": 24
+    },
+    {
+      "path": "/cpfs/world-model/sglang/evals/zing220-20260928-r2/sp2-screen-r1/896x512-performance-writer1/warmup",
+      "raw_valid": true,
+      "width": 896,
+      "height": 512,
+      "frames": 240,
+      "fps": 24
+    }
+  ],
+  "failures": [
+    "1280x736 correctness incomplete",
+    "1280x736 timing incomplete"
+  ],
+  "job_exit_code": "1",
+  "archive": {
+    "bytes": 21363890,
+    "sha256": "3eee5e5a4f1804426adcf44ea8e9ce8d8466b1ee8b310114494b31b9d9186549",
+    "uri": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/zing220-20260928/r2/post-r1/post-r1.tar.gz"
+  },
+  "audit": {
+    "verified_archive_files": 115,
+    "all_512_requests": 10,
+    "unique_input_hashes": 1,
+    "unique_output_hashes": 1,
+    "raw_forward_pairs_expected": 530,
+    "raw_forward_pairs_checked": 530,
+    "gpu_job": "dlce7na4q9yfmooc",
+    "gpu_status": "Failed",
+    "cpu_post_job": "dlc3e7bwqee1er6e",
+    "cpu_post_status": "Succeeded",
+    "high_resolution_error": "The source dimensions exceed the supported streaming size."
+  }
+}

@@ -2,7 +2,7 @@
 """Write Zing's current BF16 K/V directly into the post-RoPE store.
 
 The caller checks the inference-only layout contract before importing this
-module. Inputs have contiguous heads/dimensions and may have a QKV row stride;
+module. Inputs have unit dimension stride and may have QKV row/head strides;
 outputs are disjoint contiguous slices of the preallocated cache. Coefficients
 are [rows, rotary_dim], with half-width cosine followed by half-width sine.
 """
@@ -27,6 +27,8 @@ def _zing_rope_kv_write_kernel(
     R: tl.constexpr,
     KS: tl.constexpr,
     VS: tl.constexpr,
+    KHS: tl.constexpr,
+    VHS: tl.constexpr,
     B: tl.constexpr,
 ):
     i = tl.program_id(0) * B + tl.arange(0, B)
@@ -34,9 +36,9 @@ def _zing_rope_kv_write_kernel(
     row = i // (H * D)
     head = (i // D) % H
     d = i % D
-    x = tl.load(K + row * KS + head * D + d, valid, 0).to(tl.float32)
+    x = tl.load(K + row * KS + head * KHS + d, valid, 0).to(tl.float32)
     partner = tl.where(d < R // 2, d + R // 2, d - R // 2)
-    other = tl.load(K + row * KS + head * D + partner, valid & (d < R), 0).to(
+    other = tl.load(K + row * KS + head * KHS + partner, valid & (d < R), 0).to(
         tl.float32
     )
     other = tl.where(d < R // 2, -other, other)
@@ -46,7 +48,7 @@ def _zing_rope_kv_write_kernel(
     a = (x * c).to(tl.bfloat16).to(tl.float32)
     b = (other * s).to(tl.bfloat16).to(tl.float32)
     result = tl.where(d < R, a + b, x)
-    value = tl.load(V + row * VS + head * D + d, valid, 0)
+    value = tl.load(V + row * VS + head * VHS + d, valid, 0)
     tl.store(OK + i, result, valid)
     tl.store(OV + i, value, valid)
 
@@ -74,6 +76,8 @@ def fused_zing_rope_kv_write(
             cos_sin_cache.shape[-1],
             k.stride(0),
             v.stride(0),
+            k.stride(1),
+            v.stride(1),
             512,
             num_warps=4,
             enable_fp_fusion=False,

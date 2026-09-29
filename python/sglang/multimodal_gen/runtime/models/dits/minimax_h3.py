@@ -641,6 +641,12 @@ def _apply_rope_into(
     return out
 
 
+# Keep the existing default until the separate end-to-end acceptance gates pass.
+_ZING_EXPERIMENTAL_STRIDED_KV_WRITE = (
+    os.environ.get("SGLANG_ZING_EXPERIMENTAL_STRIDED_KV_WRITE", "0") == "1"
+)
+
+
 def _can_fuse_rope_kv_write(k, v, cos_sin_cache, out_k, out_v):
     """Metadata-only guard for the measured Zing BF16 RoPE/write kernel."""
     if (
@@ -669,13 +675,22 @@ def _can_fuse_rope_kv_write(k, v, cos_sin_cache, out_k, out_v):
         and all(t.shape == k.shape for t in (v, out_k, out_v))
         and all(
             t.stride(-1) == 1
-            and t.stride(-2) == dim
-            and t.stride(0) >= heads * dim
-            and (rows - 1) * t.stride(0) + heads * dim < 2**31
+            and t.stride(-2) in (dim, 3 * dim)
+            and t.stride(0) >= (heads - 1) * t.stride(-2) + dim
+            and (rows - 1) * t.stride(0) + (heads - 1) * t.stride(-2) + dim < 2**31
             for t in (k, v)
         )
         and out_k.is_contiguous()
         and out_v.is_contiguous()
+    ):
+        return False
+    # The new Ulysses layout is validated only for H56 SP2/SP4 shards.
+    # Preserve the original contiguous-head eligibility for every other shape.
+    if any(t.stride(-2) != dim for t in (k, v)) and not (
+        _ZING_EXPERIMENTAL_STRIDED_KV_WRITE
+        and heads in (14, 28)
+        and dim == 128
+        and rotary == 96
     ):
         return False
     # A rotation reads a partner column: overlapping writes would race between
