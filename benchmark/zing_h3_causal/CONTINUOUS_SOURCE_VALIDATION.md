@@ -1,3 +1,7 @@
+> Current deployment and client size limits: [bounded source transport](SOURCE_TRANSPORT.md).
+> This contract explicitly rejects exact 1280x720 for the H3 32-pixel grid.
+> High-resolution results: [three-resolution source transport acceptance](SOURCE_TRANSPORT_ACCEPTANCE_20260928.md).
+
 > Conditioning correction: the current contract accepts up to nine references,
 > preserves their supplied order, and never injects the first source RGB frame
 > into prompt media. Historical runs below that used this injection are not

@@ -20,6 +20,13 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter 
     RealtimeChunkInputs,
     build_realtime_sampling_params,
 )
+from sglang.multimodal_gen.runtime.realtime.source_transport import (
+    PENDING_BATCHES,
+    REFERENCE_BYTES,
+    SourceTransportBudget,
+    check,
+    validate_source_dimensions,
+)
 from sglang.multimodal_gen.runtime.realtime.zing_contracts import PixelRange, require
 from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
     SourceLedger,
@@ -127,9 +134,31 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             and request.fps in (None, fps),
             "Please provide matching RGB source dimensions and frame rate.",
         )
-        require(
-            min(width, height) > 0 and width % 16 == height % 16 == 0,
-            "Please use video dimensions divisible by 16.",
+        validate_source_dimensions(width, height, args.pipeline_config)
+        transport = SourceTransportBudget.from_args(args)
+        transport.validate_sessions(
+            max(
+                getattr(args, "realtime_max_sessions", 8),
+                getattr(args, "realtime_max_sessions_per_worker", 8),
+            )
+        )
+        client_budget = getattr(request, "source_message_budget_bytes", None)
+        check(
+            client_budget is None
+            or (
+                type(client_budget) is int and client_budget == transport.message_bytes
+            ),
+            "source_transport_mismatch",
+            "The client and service streaming size limits do not match.",
+        )
+        clip = int(args.pipeline_config.vae_config.arch_config.vae_clip_length)
+        message_bytes = transport.source_message_bytes(width, height, clip)
+        limits = SourceLimits(
+            clip,
+            message_bytes,
+            PENDING_BATCHES * clip,
+            PENDING_BATCHES * clip * width * height * 3,
+            8 * clip,
         )
         require(
             request.realtime_preview_max_width in (None, width),
@@ -201,7 +230,9 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             )
             seen.add(item["id"])
             media_bytes += len(item["payload"])
-            require(media_bytes <= 8 << 20, "The reference images are too large.")
+            require(
+                media_bytes <= REFERENCE_BYTES, "The reference images are too large."
+            )
             with Image.open(io.BytesIO(item["payload"])) as image:
                 require(
                     image.format.lower() == item["format"]
@@ -227,18 +258,6 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             "Please provide at most nine reference images.",
         )
         self.source_preview_sha256 = None
-        clip = int(args.pipeline_config.vae_config.arch_config.vae_clip_length)
-        require(
-            clip * width * height * 3 + 4096 <= 32 << 20,
-            "The source dimensions exceed the supported streaming size.",
-        )
-        limits = SourceLimits(
-            clip,
-            (clip * width * height * 3) + 4096,
-            4 * clip,
-            4 * clip * width * height * 3,
-            8 * clip,
-        )
         self.config = dict(
             width=width,
             height=height,
@@ -269,12 +288,13 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             "num_inference_steps": 4,
             "realtime_output_format": request.realtime_output_format,
             "source_stream": source,
+            "max_message_bytes": transport.message_bytes,
             "max_source_batch_frames": limits.batch_frames,
             "max_source_message_bytes": limits.message_bytes,
             "max_pending_source_frames": limits.pending_frames,
             "max_pending_source_bytes": limits.pending_bytes,
             "max_references": 9,
-            "max_reference_bytes": 8 << 20,
+            "max_reference_bytes": REFERENCE_BYTES,
             "user_media_formats": ["jpeg", "webp", "png"],
             "max_user_media": 10,
             "user_media_video_clip": {"start": 0, "end": 0},

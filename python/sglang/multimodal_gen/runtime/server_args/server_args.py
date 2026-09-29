@@ -62,6 +62,11 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.realtime.source_transport import (
+    DEFAULT_HOST_BYTES,
+    DEFAULT_MESSAGE_BYTES,
+    SourceTransportBudget,
+)
 from sglang.multimodal_gen.runtime.realtime_vae_config import (
     LOCAL_VAE_BACKEND,
     REALTIME_VAE_BACKENDS,
@@ -428,6 +433,8 @@ class ServerArgs(DisaggServerArgsMixin):
     # Compilation
     enable_torch_compile: bool = False
     enable_cuda_graph: bool = False
+    realtime_max_message_bytes: int = DEFAULT_MESSAGE_BYTES
+    realtime_transport_host_bytes: int = DEFAULT_HOST_BYTES
     realtime_max_sessions: int = 8
     realtime_max_sessions_per_worker: int = 8
     realtime_session_lease_ttl_s: float = 60.0
@@ -2949,6 +2956,18 @@ class ServerArgs(DisaggServerArgsMixin):
             ),
         )
         parser.add_argument(
+            "--realtime-max-message-bytes",
+            type=int,
+            default=ServerArgs.realtime_max_message_bytes,
+            help="Bound on each complete realtime WebSocket message, in bytes.",
+        )
+        parser.add_argument(
+            "--realtime-transport-host-bytes",
+            type=int,
+            default=ServerArgs.realtime_transport_host_bytes,
+            help="Host buffer budget for admitted realtime transports; excludes model and KV memory.",
+        )
+        parser.add_argument(
             "--realtime-max-sessions",
             type=int,
             default=ServerArgs.realtime_max_sessions,
@@ -3867,6 +3886,9 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
 
+        SourceTransportBudget.from_args(self).validate_sessions(
+            max(self.realtime_max_sessions, self.realtime_max_sessions_per_worker)
+        )
         if self.realtime_max_sessions < 1:
             raise ValueError("realtime_max_sessions must be >= 1")
         if self.realtime_max_sessions_per_worker < 1:

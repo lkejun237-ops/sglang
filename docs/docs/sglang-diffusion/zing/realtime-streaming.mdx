@@ -35,6 +35,41 @@ description: "Zing H3 continuous RGB input, finite streaming, decode modes, and 
 参考图严格保留客户端传入顺序，第一张图片就是第一张 reference；不得按 ID 排序或用 source 首帧替换。
 持续 RGB 只进入 source 编码路径，不会自动抽取首帧作为 prompt 视频上下文。
 
+### 尺寸与传输预算
+
+source 入口按已加载模型的 `VAE spatial compression × DiT patch size` 校验宽高。
+当前 H3 两轴都要求 32 整除：832×480、896×512、1280×736 可通过网格校验；
+**精确 1280×720 不支持**，返回 `source_dimensions_unaligned`。服务不隐式缩放，
+1280×736 的结果不能替代 1280×720 验收。网格与传输准入通过仍不保证 KV 容量或生成质量。
+
+部署参数 `--realtime-max-message-bytes` 默认 `67108864`（64 MiB），统一限制完整
+MessagePack 消息与 source admission，不能设置无限大小。`--realtime-transport-host-bytes`
+默认 `8589934592`（8 GiB），启动时必须覆盖配置的并发会话传输预算；
+每会话保守预留 `14 × message_bytes + 9 MiB`，默认八会话共 7,240 MiB。
+这只计算传输缓冲，不包含模型、codec、KV、解释器或系统 socket 内存，也不是 RSS 上限。
+多服务进程部署需分别预留并合计 host 内存。
+
+服务使用可执行消息队列上限的 Uvicorn `websockets` 后端，接收队列固定为一条，关闭压缩。
+每条 append 既不能超过 `session.ready.max_source_message_bytes`，也不能超过
+`len(RGB payload) + 4096`；初始化（含参考图）限 `8 MiB + 4096`。
+source 的 pending 额度仍为四个 clip，并受帧数、字节数和元数据记录数共同限制。
+
+配套 `benchmark/zing_h3_causal/continuous_source_client.py` 的 `--max-message-bytes`
+必须与部署值相同，默认也是 64 MiB。客户端在 init 中发送 `source_message_budget_bytes`，
+服务在 `session.ready.max_message_bytes` 回显；不一致返回 `source_transport_mismatch`，
+在参考图解码和落盘之前拒绝。旧客户端可省略此字段，但仍须遵守服务协商出的限制；
+新配套客户端要求新版 ready 字段，应与服务一起升级。
+从源码运行客户端时设置 `PYTHONPATH=python SGLANG_LIGHTWEIGHT_RUNTIME=1`。
+
+直接接口错误采用英文 `content` 和稳定 `code`：`source_dimensions_unaligned`、
+`source_transport_mismatch`、`source_init_too_large`、`source_message_too_large`、
+`source_credit_exceeded`。超过 WebSocket 本身上限时，在解码前以 **1009** 关闭，
+此时不能保证应用层错误消息。world-platform `authorized_generate` 的外部错误和
+AsyncAPI 合约不在本次直接 source 接口变更范围内。完整配置与回归方法见仓库
+`benchmark/zing_h3_causal/SOURCE_TRANSPORT.md`。
+
+### 发送与确认
+
 等待 `session.ready` 后，按返回的单批帧数、单消息字节数和 pending 帧/字节预算发送：
 
 ```python

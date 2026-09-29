@@ -9,6 +9,10 @@ records only after both credit release and successful output delivery.
 from collections import deque
 from dataclasses import dataclass
 
+from sglang.multimodal_gen.runtime.realtime.source_transport import (
+    PROTOCOL_OVERHEAD_BYTES,
+    check,
+)
 from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
     PixelRange,
     Provenance,
@@ -93,7 +97,12 @@ class SourceLedger:
     def accept(self, payload, *, event_id, message_bytes):
         require(not self.closed and not self.ended, "The source stream has ended.")
         self.validate_event_id(event_id)
-        require(isinstance(payload, dict), "Please provide a source frame batch.")
+        require(
+            isinstance(payload, dict)
+            and set(payload)
+            == {"client_seq", "source_frame_start", "num_frames", "pts_us", "data"},
+            "Please provide a source frame batch with the supported fields.",
+        )
         seq, start, count, pts = (
             payload.get(key)
             for key in ("client_seq", "source_frame_start", "num_frames", "pts_us")
@@ -118,9 +127,11 @@ class SourceLedger:
             isinstance(data, bytes) and len(data) == count * self.frame_bytes,
             "The source frame data does not match its dimensions.",
         )
-        require(
+        check(
             integer(message_bytes, len(data))
-            and message_bytes <= self.limits.message_bytes,
+            and message_bytes
+            <= min(self.limits.message_bytes, len(data) + PROTOCOL_OVERHEAD_BYTES),
+            "source_message_too_large",
             "The source message is too large.",
         )
         end, bytes_end = start + count, self.accepted_bytes + len(data)
@@ -128,10 +139,11 @@ class SourceLedger:
             self.total_frames is None or end <= self.total_frames,
             "The source exceeds the requested frame count.",
         )
-        require(
+        check(
             end - self.consumed_frames <= self.limits.pending_frames
             and bytes_end - self.consumed_bytes <= self.limits.pending_bytes
             and len(self.records) < self.limits.metadata_batches,
+            "source_credit_exceeded",
             "Please wait for source credit before sending more frames.",
         )
         record = AcceptedSource(self.sequence + 1, event_id, seq, start, end, bytes_end)

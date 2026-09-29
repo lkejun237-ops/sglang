@@ -15,6 +15,9 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import ShutdownReq
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
 from sglang.multimodal_gen.runtime.managers.gpu_worker import run_scheduler_process
+from sglang.multimodal_gen.runtime.realtime.source_transport import (
+    SourceTransportBudget,
+)
 from sglang.multimodal_gen.runtime.scheduler_client import SchedulerClient
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
@@ -134,6 +137,9 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     Args:
         launch_http_server: False for offline local mode
     """
+    if launch_http_server:
+        # Reject incompatible transport dependencies before loading GPU workers.
+        SourceTransportBudget.from_args(server_args).websocket_options()
     configure_logger(server_args)
 
     # Start a new server with multiple worker processes
@@ -542,12 +548,7 @@ def launch_http_server_only(server_args):
         host=server_args.host,
         port=server_args.port,
         reload=False,
-        # Use the same maintained protocol for production and acceptance runs.
-        # A 17-frame 832x480 RGB source append exceeds the 16 MiB default.
-        ws="websockets-sansio",
-        ws_max_size=32 << 20,
-        ws_max_queue=1,
-        ws_per_message_deflate=False,
+        **SourceTransportBudget.from_args(server_args).websocket_options(),
     )
 
 

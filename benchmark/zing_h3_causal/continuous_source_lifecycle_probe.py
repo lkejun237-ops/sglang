@@ -11,10 +11,12 @@ from contextlib import asynccontextmanager, suppress
 
 import msgpack
 import websockets
+from continuous_source_media import reference_payload
 from websockets.exceptions import ConnectionClosed
 
-from continuous_source_media import reference_payload
-
+from sglang.multimodal_gen.runtime.realtime.source_transport import (
+    DEFAULT_MESSAGE_BYTES,
+)
 
 CASES = [
     "invalid_sequence",
@@ -140,13 +142,16 @@ async def main(args):
         while True:
             ws = await websockets.connect(
                 args.url + (f"?user_id={user}" if user else ""),
-                max_size=32 << 20,
+                max_size=getattr(args, "max_message_bytes", DEFAULT_MESSAGE_BYTES),
                 max_queue=1,
                 compression=None,
             )
             init = dict(
                 type="init",
                 zing_realtime_api_version=1,
+                source_message_budget_bytes=getattr(
+                    args, "max_message_bytes", DEFAULT_MESSAGE_BYTES
+                ),
                 prompt=case_prompt,
                 size="832x480",
                 fps=24,
@@ -157,7 +162,7 @@ async def main(args):
                 source_stream=dict(format="rgb24", width=832, height=480, fps=24),
             )
             if case_request:
-                from urllib.parse import urlparse, unquote
+                from urllib.parse import unquote, urlparse
 
                 init["references"] = [
                     reference_payload(unquote(urlparse(item["uri"]).path), item["id"])
@@ -175,6 +180,13 @@ async def main(args):
                 raise
             attempts.append(dict(elapsed=time.monotonic() - started, response=item))
             if item["type"] == "session.ready":
+                if item.get("max_message_bytes") != getattr(
+                    args, "max_message_bytes", DEFAULT_MESSAGE_BYTES
+                ):
+                    await ws.close()
+                    raise ValueError(
+                        "Client and service streaming size limits do not match"
+                    )
                 return ws, item["session_id"]
             await ws.close()
             assert item["type"] == "error" and "USER_SESSION_LIMIT" in item.get(
@@ -307,7 +319,12 @@ async def main(args):
             else:
                 if name == "concurrent_rejection":
                     async with websockets.connect(
-                        args.url, max_size=32 << 20, compression=None
+                        args.url,
+                        max_size=getattr(
+                            args, "max_message_bytes", DEFAULT_MESSAGE_BYTES
+                        ),
+                        max_queue=1,
+                        compression=None,
                     ) as other:
                         rejection = await recv(other)
                         assert rejection[
@@ -400,6 +417,7 @@ async def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--max-message-bytes", type=int, default=DEFAULT_MESSAGE_BYTES)
     parser.add_argument("--rgb", required=True)
     parser.add_argument("--reference")
     parser.add_argument(

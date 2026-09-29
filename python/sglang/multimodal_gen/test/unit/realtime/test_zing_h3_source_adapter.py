@@ -45,7 +45,14 @@ def configured(tmp_path, monkeypatch):
     args = SimpleNamespace(
         model_path=str(tmp_path),
         pipeline_config=SimpleNamespace(
-            vae_config=SimpleNamespace(arch_config=SimpleNamespace(vae_clip_length=17))
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(
+                    vae_clip_length=17, spatial_compression_ratio=16
+                )
+            ),
+            dit_config=SimpleNamespace(
+                arch_config=SimpleNamespace(patch_size=(1, 2, 2))
+            ),
         ),
     )
     monkeypatch.setattr(source, "get_global_server_args", lambda: args)
@@ -471,3 +478,113 @@ def test_dispose_before_s0_wakes_waiter(configured):
     replacement, new_session = initialize()
     assert replacement.source_preview_sha256 is None
     replacement.dispose(new_session)
+
+
+@pytest.mark.parametrize("width,height", [(832, 480), (896, 512), (1280, 736)])
+def test_high_resolution_ready(configured, width, height):
+    adapter, session = initialize(
+        size=f"{width}x{height}",
+        source_stream=dict(format="rgb24", width=width, height=height, fps=24),
+        source_message_budget_bytes=64 << 20,
+    )
+    ready = adapter.session_ready_message(session)
+    assert ready["max_message_bytes"] == 64 << 20
+    assert ready["max_source_message_bytes"] == 17 * width * height * 3 + 4096
+    assert ready["max_pending_source_bytes"] == 4 * 17 * width * height * 3
+
+
+@pytest.mark.parametrize(
+    "width,height,budget,code",
+    [
+        (1280, 720, 64 << 20, "source_dimensions_unaligned"),
+        (1920, 1088, 64 << 20, "source_message_too_large"),
+        (1280, 736, 32 << 20, "source_transport_mismatch"),
+    ],
+)
+def test_transport_rejected_before_media_allocation(
+    configured, monkeypatch, width, height, budget, code
+):
+    from sglang.multimodal_gen.runtime.realtime.source_transport import (
+        SourceTransportError,
+    )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Media allocation happened before transport validation")
+
+    monkeypatch.setattr(source.tempfile, "mkdtemp", forbidden)
+    monkeypatch.setattr(source.Image, "open", forbidden)
+    with pytest.raises(SourceTransportError) as error:
+        initialize(
+            size=f"{width}x{height}",
+            source_stream=dict(format="rgb24", width=width, height=height, fps=24),
+            source_message_budget_bytes=budget,
+            references=[dict(id="image", format="png", payload=b"image")],
+        )
+    assert error.value.code == code
+
+
+def test_dimension_error_has_stable_wire_code(configured, monkeypatch):
+    from fastapi import WebSocketDisconnect
+
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
+        realtime_video_api as api,
+    )
+
+    adapter = source.ZingH3SourceStreamAdapter()
+    monkeypatch.setattr(api, "get_global_server_args", lambda: configured)
+    monkeypatch.setattr(
+        api,
+        "get_realtime_model_adapter",
+        lambda args: SimpleNamespace(for_request=lambda req: adapter),
+    )
+
+    class Socket:
+        def __init__(self):
+            self.received = False
+            self.sent = []
+
+        async def receive_bytes(self):
+            if self.received:
+                raise WebSocketDisconnect()
+            self.received = True
+            return msgspec.msgpack.encode(
+                dict(
+                    type="init",
+                    prompt="Render snow",
+                    size="1280x720",
+                    zing_realtime_api_version=1,
+                    source_stream=dict(format="rgb24", width=1280, height=720, fps=24),
+                )
+            )
+
+        async def send_bytes(self, data):
+            self.sent.append(msgspec.msgpack.decode(data))
+
+    ws = Socket()
+    session = GenerateSession()
+    with pytest.raises(WebSocketDisconnect):
+        asyncio.run(api._listen_generate_request(ws, session))
+    assert len(ws.sent) == 1
+    assert ws.sent[0]["code"] == "source_dimensions_unaligned"
+    assert "divisible by 32" in ws.sent[0]["content"]
+    assert session.input_temp_dir is None
+    assert session.request is None
+
+
+def test_startup_rejects_insufficient_concurrent_transport_memory():
+    from sglang.multimodal_gen.runtime.realtime.source_transport import (
+        SourceTransportBudget,
+    )
+    from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+    args = SimpleNamespace(
+        batching_mode="dynamic",
+        batching_max_size=1,
+        batching_delay_ms=0,
+        realtime_max_sessions=8,
+        realtime_max_sessions_per_worker=8,
+        realtime_max_message_bytes=64 << 20,
+        realtime_transport_host_bytes=8 * SourceTransportBudget().session_bytes - 1,
+    )
+    with pytest.raises(ValueError, match="host budget"):
+        ServerArgs._validate_batching(args)

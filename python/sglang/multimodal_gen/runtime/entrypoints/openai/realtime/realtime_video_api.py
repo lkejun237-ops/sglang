@@ -56,6 +56,12 @@ from sglang.multimodal_gen.runtime.realtime.critical_path_metrics import (
     observe_stage_seconds,
     result_from_exception,
 )
+from sglang.multimodal_gen.runtime.realtime.source_transport import (
+    PROTOCOL_OVERHEAD_BYTES,
+    REFERENCE_BYTES,
+    SourceTransportError,
+    check,
+)
 from sglang.multimodal_gen.runtime.realtime.worker_reservation import (
     WorkerReservationRegistry,
     WorkerReservationRejected,
@@ -1728,7 +1734,19 @@ async def _listen_events(ws: WebSocket, session: GenerateSession):
                 session.adapter is not None
                 and session.adapter.session_ready_message(session) is not None
             ):
-                await write_error_msg("Please send a valid streaming event.", ws)
+                await write_error_msg(
+                    (
+                        str(e)
+                        if isinstance(e, SourceTransportError)
+                        else "Please send a valid streaming event."
+                    ),
+                    ws,
+                    code=(
+                        e.code
+                        if isinstance(e, SourceTransportError)
+                        else "invalid_source_event"
+                    ),
+                )
                 return  # Invalid source order cannot be repaired within a session.
             await write_error_msg("invalid event", ws)
             continue
@@ -1771,6 +1789,12 @@ async def _listen_generate_request(
                 "server.adapter_init_start",
                 adapter=adapter.__class__.__name__,
             )
+            if getattr(realtime_req, "source_stream", None) is not None:
+                check(
+                    len(raw_message) <= REFERENCE_BYTES + PROTOCOL_OVERHEAD_BYTES,
+                    "source_init_too_large",
+                    "The reference images or session settings are too large.",
+                )
             await adapter.on_init(session, realtime_req)
             log_realtime_trace(
                 logger,
@@ -1806,7 +1830,15 @@ async def _listen_generate_request(
                 session.id,
                 e,
             )
-            await write_error_msg("invalid generate request", ws)
+            await write_error_msg(
+                (
+                    str(e)
+                    if isinstance(e, SourceTransportError)
+                    else "invalid generate request"
+                ),
+                ws,
+                code=e.code if isinstance(e, SourceTransportError) else None,
+            )
             continue
 
 
@@ -2178,7 +2210,8 @@ async def generate(websocket: WebSocket):
             )
 
 
-async def write_error_msg(error_msg: str, websocket: WebSocket):
-    await websocket.send_bytes(
-        msgspec.msgpack.encode({"type": "error", "content": error_msg})
-    )
+async def write_error_msg(error_msg: str, websocket: WebSocket, *, code=None):
+    message = {"type": "error", "content": error_msg}
+    if code is not None:
+        message["code"] = code
+    await websocket.send_bytes(msgspec.msgpack.encode(message))

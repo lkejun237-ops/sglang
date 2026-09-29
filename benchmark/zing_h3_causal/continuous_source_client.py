@@ -21,8 +21,15 @@ import msgpack
 import websockets
 from continuous_source_media import reference_payload
 
+from sglang.multimodal_gen.runtime.realtime.source_transport import (
+    DEFAULT_MESSAGE_BYTES,
+    SourceTransportBudget,
+)
+
 
 async def run(args):
+    message_budget = getattr(args, "max_message_bytes", DEFAULT_MESSAGE_BYTES)
+    SourceTransportBudget(message_bytes=message_budget)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     frame_bytes = args.width * args.height * 3
@@ -59,11 +66,13 @@ async def run(args):
         trace.flush()
 
     async with websockets.connect(
-        args.url, max_size=32 << 20, max_queue=1, compression=None
+        args.url, max_size=message_budget, max_queue=1, compression=None
     ) as ws:
 
         async def send(message):
             wire = msgpack.packb(message, use_bin_type=True)
+            if len(wire) > message_budget:
+                raise ValueError("Message exceeds the configured transport size limit")
             async with writer:
                 await ws.send(wire)
             return len(wire)
@@ -79,6 +88,7 @@ async def run(args):
             zing_realtime_decode_mode="stable",
             realtime_output_format="raw",
             source_stream=source_format,
+            source_message_budget_bytes=message_budget,
         )
         if args.profile:
             init.update(profile=True, profile_all_stages=True)
@@ -105,6 +115,8 @@ async def run(args):
             or ready.get("source_stream") != source_format
             or ready.get("num_inference_steps") != 4
             or ready.get("realtime_output_format") != "raw"
+            or ready.get("max_message_bytes") != message_budget
+            or not 0 < ready.get("max_source_message_bytes", 0) <= message_budget
         ):
             raise ValueError("Continuous source negotiation failed")
         record("ready", message=ready)
@@ -113,9 +125,9 @@ async def run(args):
                 {
                     "args": vars(args),
                     "ready": ready,
-                    "source_mode": "live-pipe"
-                    if args.source_rgb == "-"
-                    else "raw-replay",
+                    "source_mode": (
+                        "live-pipe" if args.source_rgb == "-" else "raw-replay"
+                    ),
                     "scope": "client WebSocket delivery; not browser presentation",
                 },
                 indent=2,
@@ -198,11 +210,14 @@ async def run(args):
                     event_id=event_id,
                     available_seconds=available_at - started,
                     capture_seconds=capture_at - started,
-                    source_schedule_lag_seconds=max(
-                        0, available_at - (source_started + (start + count - 1) / 24)
-                    )
-                    if args.paced
-                    else None,
+                    source_schedule_lag_seconds=(
+                        max(
+                            0,
+                            available_at - (source_started + (start + count - 1) / 24),
+                        )
+                        if args.paced
+                        else None
+                    ),
                     credit_wait_seconds=time.monotonic() - available_at,
                 )
                 await send(message)
@@ -407,6 +422,7 @@ def main():
         "--user-media", help="JSON list of typed media with local path fields"
     )
 
+    parser.add_argument("--max-message-bytes", type=int, default=DEFAULT_MESSAGE_BYTES)
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--seed", type=int, default=42)
