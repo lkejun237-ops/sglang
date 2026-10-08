@@ -300,7 +300,8 @@ def test_cached_tile_geometry_cannot_change(codecs):
         (4, "deterministic", "bfloat16", False, None),
         (1, "deterministic", "bfloat16", False, "single_rank_or_uninitialized_group"),
         (8, "deterministic", "bfloat16", False, "unvalidated_group_size"),
-        (2, "performance", "bfloat16", False, "unvalidated_encode_mode"),
+        (2, "performance", "bfloat16", False, None),
+        (4, "performance", "bfloat16", False, None),
         (2, "deterministic", "float32", False, "unvalidated_encode_dtype"),
         (2, "deterministic", "bfloat16", True, "unvalidated_stack_tiling"),
     ],
@@ -311,6 +312,7 @@ def test_default_tile_policy_requires_validated_configuration(
     from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import klvae
 
     monkeypatch.delenv("MINIMAX_H3_PROGRESSIVE_ENCODER_TILING", raising=False)
+    monkeypatch.delenv("MINIMAX_H3_PROGRESSIVE_ENCODER_PERFORMANCE_AUTO", raising=False)
     group = SimpleNamespace(world_size=size)
     monkeypatch.setattr(klvae, "get_tile_parallel_state", lambda: (0, size))
     monkeypatch.setattr(klvae, "get_decode_parallel_group_coordinator", lambda: group)
@@ -328,7 +330,7 @@ def test_default_tile_policy_requires_validated_configuration(
 
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("size", [1, 2, 4, 8])
-def test_performance_auto_opt_in_is_session_scoped(codecs, monkeypatch, enabled, size):
+def test_performance_auto_override_is_session_scoped(codecs, monkeypatch, enabled, size):
     from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import klvae
 
     monkeypatch.delenv("MINIMAX_H3_PROGRESSIVE_ENCODER_TILING", raising=False)

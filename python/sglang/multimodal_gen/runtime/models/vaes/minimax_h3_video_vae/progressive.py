@@ -83,16 +83,16 @@ class CausalEncoderCache:
             else None
         )
         self.tile_mode = self.requested_mode
-        # Experimental until same-device numerical and service A/B gates pass.
+        # Prefer throughput; callers can explicitly disable performance-mode sharding.
         # Snapshot at construction, just like the tiling policy itself.
         self.performance_auto = (
-            os.environ.get("MINIMAX_H3_PROGRESSIVE_ENCODER_PERFORMANCE_AUTO", "0")
+            os.environ.get("MINIMAX_H3_PROGRESSIVE_ENCODER_PERFORMANCE_AUTO", "1")
             == "1"
         )
         self.encode_mode = encode_mode
         self.default_fallback_reason = None
         if self.requested_mode == "auto":
-            # Promote only the numerical/stack/group policy validated in #177.
+            # Retain the supported dtype, stack and group-size guards.
             if not model.encoder_tiling:
                 self.default_fallback_reason = "non_tiled_encoder"
             elif self.available_group is None:

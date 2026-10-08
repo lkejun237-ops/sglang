@@ -2,6 +2,7 @@
 """Native Zing1/H3 causal inference with shared H3 codecs."""
 
 import json
+import os
 from pathlib import Path
 
 from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
@@ -44,6 +45,13 @@ class ZingH3CausalPipeline(ComposedPipelineBase):
             raise ValueError(
                 "Zing dense runtime requires unlimited absolute-position history and sink_size=0"
             )
+        # Deployment policy is independent of the checkpoint's export policy.
+        encode_mode = os.environ.get("SGLANG_ZING_VISUAL_ENCODE_MODE", "performance")
+        if encode_mode not in {"performance", "deterministic"}:
+            raise ValueError(
+                "SGLANG_ZING_VISUAL_ENCODE_MODE must be performance or deterministic"
+            )
+        cfg["vae_config"]["encode_mode"] = encode_mode
         return index
 
     def create_pipeline_stages(self, server_args):

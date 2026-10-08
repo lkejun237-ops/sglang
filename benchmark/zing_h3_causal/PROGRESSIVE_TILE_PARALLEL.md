@@ -29,15 +29,22 @@ replicated/parallel 各一条 10 秒视频，由用户判断。
 `encode_dtype` 也在创建时冻结；中途修改会拒绝继续编码，防止已自动启用的
 session 被改回未验收的数值策略。改变配置须创建新 session。
 
-`deterministic` 关闭 cuDNN benchmark、启用确定性算法；`performance` 开启
-benchmark。它们不改变 BF16 精度、权重或采样步数。当前 performance 的
-SP2/SP4 exact 失败，自动选择不会暗中修改此策略，也不会自动启用并行。
-SP1、SP8、stack-on、其他精度不继承 SP2/SP4 BF16 的验收结论。
+Zing 服务现在默认采用吞吐优先的视觉编码策略：启动时将内存中的
+`vae_config.encode_mode` 设为 `performance`，开启 cuDNN benchmark。
+checkpoint 文件不变；需要确定性对照时显式设置
+`SGLANG_ZING_VISUAL_ENCODE_MODE=deterministic`，关闭 benchmark 并启用确定性算法。
+此部署覆盖独立于 checkpoint 导出时记录的策略，复现实验须记录该环境变量。
 
-#195 提供默认关闭的独立实验开关
-`MINIMAX_H3_PROGRESSIVE_ENCODER_PERFORMANCE_AUTO=1`，允许 performance 在其余
-auto 条件成立时真实分片。它不改变 encode_mode，也不表示已通过数值或性能验收。
-开关在 session 创建时冻结；实验标准与复现入口见
+`MINIMAX_H3_PROGRESSIVE_ENCODER_PERFORMANCE_AUTO` 默认 `1`：performance 在其余
+auto 条件成立时使用 SP2/SP4 BF16 多卡 tile 分片。设置为 `0` 可恢复 performance
+下的复制编码；`MINIMAX_H3_PROGRESSIVE_ENCODER_TILING=replicated` 可显式关闭分片。
+单卡、SP8、stack-on（未设置有限 tile batch）和其他精度保留原有回退条件。
+策略在 session 创建时冻结。
+
+渐进式编码及其逐层历史缓存已是实时 source 的默认路径；FA4、稳定形状、AdaLN
+投影缓存、RoPE/KV 优化沿用已有默认设置，不改变权重、精度和采样步数。
+原有 performance SP2/SP4 exact 对照失败的记录仍有效；吞吐优先不承诺逐位一致，
+本次默认策略调整没有新增 GPU 质量或性能验收结果。实验标准与复现入口见
 [performance 验收计划](PERFORMANCE_ENCODER_PLAN.md)。
 
 使用 runtime 的 `vae_decode` coordinator：device group 搬运 moments，Gloo
