@@ -42,6 +42,25 @@ def source_payload(pixels, stride, start, count, seq):
     )
 
 
+async def append_batches(send, ws, pixels, stride, start, count, seq, event, limit):
+    if type(limit) is not int or limit < 1:
+        raise ValueError("Invalid negotiated source batch limit")
+    end = start + count
+    while start < end:
+        size = min(limit, end - start)
+        await send(
+            ws,
+            dict(
+                type="event",
+                kind="source.append",
+                event_id=event,
+                payload=source_payload(pixels, stride, start, size, seq),
+            ),
+        )
+        start, seq, event = start + size, seq + 1, event + 1
+    return seq, event
+
+
 @asynccontextmanager
 async def keepalive(ws, interval=5):
     async def heartbeat():
@@ -109,7 +128,7 @@ async def wait_for_scheduler_inflight(path, session_id, timeout=30):
 
 async def main(args):
     pixels = pathlib.Path(args.rgb).read_bytes()
-    stride = 832 * 480 * 3
+    stride = args.width * args.height * 3
     assert len(pixels) >= 51 * stride
     out = pathlib.Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
@@ -125,6 +144,7 @@ async def main(args):
     )
     results = []
     attempts = []
+    counters = {}
 
     async def send(ws, obj):
         await ws.send(msgpack.packb(obj, use_bin_type=True))
@@ -153,13 +173,15 @@ async def main(args):
                     args, "max_message_bytes", DEFAULT_MESSAGE_BYTES
                 ),
                 prompt=case_prompt,
-                size="832x480",
+                size=f"{args.width}x{args.height}",
                 fps=24,
                 seed=42,
                 num_inference_steps=4,
                 zing_realtime_decode_mode="stable",
                 realtime_output_format="raw",
-                source_stream=dict(format="rgb24", width=832, height=480, fps=24),
+                source_stream=dict(
+                    format="rgb24", width=args.width, height=args.height, fps=24
+                ),
             )
             if case_request:
                 from urllib.parse import unquote, urlparse
@@ -180,6 +202,9 @@ async def main(args):
                 raise
             attempts.append(dict(elapsed=time.monotonic() - started, response=item))
             if item["type"] == "session.ready":
+                counters[ws] = dict(
+                    seq=0, event=1, limit=item["max_source_batch_frames"]
+                )
                 if item.get("max_message_bytes") != getattr(
                     args, "max_message_bytes", DEFAULT_MESSAGE_BYTES
                 ):
@@ -195,27 +220,33 @@ async def main(args):
             assert time.monotonic() - started < 30, attempts
             await asyncio.sleep(0.1)
 
-    async def append(ws, start=0, count=17, seq=0, event=1):
-        await send(
+    async def append(ws, start=0, count=17, *, bad_seq=False):
+        state = counters[ws]
+        seq, event = await append_batches(
+            send,
             ws,
-            dict(
-                type="event",
-                kind="source.append",
-                event_id=event,
-                payload=source_payload(pixels, stride, start, count, seq),
-            ),
+            pixels,
+            stride,
+            start,
+            count,
+            state["seq"] + (1 if bad_seq else 0),
+            state["event"],
+            state["limit"],
         )
+        state.update(seq=seq, event=event)
 
-    async def finish(ws, total, event):
+    async def finish(ws, total):
+        state = counters[ws]
         await send(
             ws,
             dict(
                 type="event",
                 kind="source.end",
-                event_id=event,
+                event_id=state["event"],
                 payload=dict(source_frame_end=total),
             ),
         )
+        state["event"] += 1
 
     async def collect(ws, messages, until):
         while not until(messages):
@@ -249,9 +280,9 @@ async def main(args):
                         other_messages,
                         lambda xs: any(x["type"] == "frame_batch_header" for x in xs),
                     )
-                    await append(other, start=17, count=17, seq=1, event=2)
-                    await finish(ws, 17, 2)
-                    await finish(other, 34, 3)
+                    await append(other, start=17, count=17)
+                    await finish(ws, 17)
+                    await finish(other, 34)
                     await collect(
                         ws,
                         messages,
@@ -284,7 +315,7 @@ async def main(args):
                     messages,
                     lambda xs: any(x["type"] == "frame_batch_header" for x in xs),
                 )
-                await append(ws, start=17, count=1, seq=3, event=2)
+                await append(ws, start=17, count=1, bad_seq=True)
                 while True:
                     item = await recv(ws)
                     messages.append(item)
@@ -292,7 +323,7 @@ async def main(args):
                         assert item["content"] == "Please send a valid streaming event."
                         break
             elif name == "invalid_sequence":
-                await append(ws, seq=1)
+                await append(ws, count=1, bad_seq=True)
                 item = await recv(ws)
                 messages.append(item)
                 assert (
@@ -307,7 +338,7 @@ async def main(args):
                     lambda xs: any(x["type"] == "source.accepted" for x in xs),
                 )
                 if name == "cancel_end_race":
-                    await finish(ws, 17, 2)
+                    await finish(ws, 17)
                 if args.server_log:
                     inflight_witness = await wait_for_scheduler_inflight(
                         args.server_log, session
@@ -359,12 +390,14 @@ async def main(args):
                     pending_read.cancel()
                     with suppress(asyncio.CancelledError):
                         await pending_read
+                    prompt_event = counters[ws]["event"]
+                    counters[ws]["event"] += 1
                     await send(
                         ws,
                         dict(
                             type="event",
                             kind="prompt",
-                            event_id=2,
+                            event_id=prompt_event,
                             payload=case_prompt + "\nUse slightly warmer colors.",
                         ),
                     )
@@ -372,18 +405,19 @@ async def main(args):
                         ws,
                         messages,
                         lambda xs: any(
-                            x["type"] == "control_ack" and x.get("event_id") == 2
+                            x["type"] == "control_ack"
+                            and x.get("event_id") == prompt_event
                             for x in xs
                         ),
                     )
-                    await append(ws, start=17, count=17, seq=1, event=3)
-                    await append(ws, start=34, count=17, seq=2, event=4)
-                    await finish(ws, 51, 5)
+                    await append(ws, start=17, count=17)
+                    await append(ws, start=34, count=17)
+                    await finish(ws, 51)
                     assert time.monotonic() - pause_started >= 2
                     total = 51
                 else:
                     total = 17
-                    await finish(ws, total, 2)
+                    await finish(ws, total)
                 await collect(
                     ws,
                     messages,
@@ -393,7 +427,9 @@ async def main(args):
                 assert sum(x["num_frames"] for x in headers) == total, messages
                 assert messages[-1]["output_frames"] == total, messages[-1]
                 if name == "pause_prompt_resume":
-                    assert any(x.get("event_id") == 2 for x in headers), headers
+                    assert any(
+                        x.get("event_id") == prompt_event for x in headers
+                    ), headers
                     assert headers[0].get("event_id") is None, headers[0]
         results.append(
             dict(
@@ -429,7 +465,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--url", default="ws://127.0.0.1:30000/v1/realtime_video/generate"
     )
+    parser.add_argument("--width", type=int, default=832)
+    parser.add_argument("--height", type=int, default=480)
     args = parser.parse_args()
+    if args.width < 1 or args.height < 1:
+        parser.error("width and height must be positive")
     if not args.reference and not args.case_request:
         parser.error("Provide --reference or --case-request")
     asyncio.run(main(args))

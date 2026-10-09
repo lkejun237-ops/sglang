@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Select a source codec from the trusted deployment profile, never the wire."""
+"""Select a source codec from the trusted deployment profile, never the wire.
+
+Here profile means deployment configuration. Remote trace capture is enabled
+only during an actual Torch profiler request; ordinary requests do not capture traces.
+"""
 
 import importlib
 
@@ -29,7 +33,16 @@ def create_source_buffer(codecs, profile, *, capacity_frames):
     if not separator or not module or not name:
         raise ValueError("A progressive source encoder factory is required")
     factory = getattr(importlib.import_module(module), name)
-    session = factory(codecs, capacity_frames=capacity_frames)
+    if "remote" in profile:
+        import torch
+        from .remote_encoder import create_session
+
+        config = dict(profile["remote"])
+        if not torch.autograd.profiler._is_profiler_enabled:
+            config.pop("profile_dir", None)
+        session = create_session(codecs, capacity_frames=capacity_frames, config=config)
+    else:
+        session = factory(codecs, capacity_frames=capacity_frames)
     try:
         if session.contract_version != PROGRESSIVE_ENCODER_VERSION:
             raise ValueError("Source encoder contract version does not match")

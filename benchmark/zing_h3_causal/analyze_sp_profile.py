@@ -163,7 +163,14 @@ def trace_id(event, field):
     return None
 
 
-def correlate_blocks(events, block_events, limit, kind=event_kind, group_by_name=False):
+def correlate_blocks(
+    events,
+    block_events,
+    limit,
+    kind=event_kind,
+    group_by_name=False,
+    include_intervals=False,
+):
     """Attribute launches by CPU nesting, then kernels by IDs, never GPU time."""
     by_thread = defaultdict(list)
     for index, block in enumerate(block_events):
@@ -293,6 +300,15 @@ def correlate_blocks(events, block_events, limit, kind=event_kind, group_by_name
                     **timing(collectives),
                     "top_names": top_names(collectives, limit),
                 },
+                **(
+                    {
+                        "kernel_intervals_us": [
+                            (e["ts"], e["ts"] + e["dur"]) for e in kernels
+                        ]
+                    }
+                    if include_intervals
+                    else {}
+                ),
             }
         )
     return results, {
@@ -406,12 +422,12 @@ def summarize(path, limit):
         devices.setdefault(device, []).append(e)
     return {
         "file": str(path.resolve()),
-        "distributed_info": trace.get("distributedInfo")
-        if isinstance(trace, dict)
-        else None,
-        "device_properties": trace.get("deviceProperties")
-        if isinstance(trace, dict)
-        else None,
+        "distributed_info": (
+            trace.get("distributedInfo") if isinstance(trace, dict) else None
+        ),
+        "device_properties": (
+            trace.get("deviceProperties") if isinstance(trace, dict) else None
+        ),
         "metadata": metadata,
         "complete_event_count": len(events),
         "unhandled_begin_end_event_count": sum(

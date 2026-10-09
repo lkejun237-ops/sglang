@@ -127,3 +127,36 @@ def test_inflight_witness_requires_matching_unfinished_scheduler_request(
     else:
         witness = asyncio.run(wait_for_scheduler_inflight(log, "target", timeout=0.1))
         assert witness["request_id"] == "current"
+
+
+def test_negotiated_packets_keep_global_offsets_sequence_and_events():
+    from continuous_source_lifecycle_probe import append_batches
+
+    packets = []
+
+    async def send(ws, message):
+        packets.append(message)
+
+    async def exercise():
+        seq, event = await append_batches(
+            send, None, bytes(range(153)), 3, 0, 17, 0, 1, 11
+        )
+        assert (seq, event) == (2, 3)
+        # A prompt consumes one event but never consumes a source sequence.
+        seq, event = await append_batches(
+            send, None, bytes(range(153)), 3, 17, 17, seq, event + 1, 11
+        )
+        assert (seq, event) == (4, 6)
+        assert [x["event_id"] for x in packets] == [1, 2, 4, 5]
+        assert [x["payload"]["client_seq"] for x in packets] == [0, 1, 2, 3]
+        assert [x["payload"]["source_frame_start"] for x in packets] == [0, 11, 17, 28]
+        assert [x["payload"]["num_frames"] for x in packets] == [11, 6, 11, 6]
+        assert b"".join(x["payload"]["data"] for x in packets) == bytes(range(102))
+        await append_batches(
+            send, None, bytes(range(153)), 3, 34, 1, seq + 1, event, 11
+        )
+        assert (
+            packets[-1]["payload"]["client_seq"] == 5
+        )  # expected 4: intentional bad sequence
+
+    asyncio.run(exercise())

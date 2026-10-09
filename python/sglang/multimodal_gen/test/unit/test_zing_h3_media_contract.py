@@ -820,3 +820,102 @@ def test_in_memory_source_presentation_is_not_a_vae_reference(
     assert len(vae) == references and all(torch.all(x == 23) for x in vae)
     assert len(result.conditions) == references and result.source_visual is None
     assert torch.all(preview["frames"] == 17) and preview["frames"].shape[1] == 1
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_explicit_encoder_benchmark_limit_applies_inside_scope_and_restores(
+    monkeypatch, fail
+):
+    backend = SimpleNamespace(benchmark=False, deterministic=False, benchmark_limit=10)
+    monkeypatch.setattr(torch.backends, "cudnn", backend)
+    original_deterministic = torch.are_deterministic_algorithms_enabled()
+    try:
+        with codecs_module._visual_encode_policy("performance", 1) as receipt:
+            assert backend.benchmark_limit == 1
+            assert receipt == dict(
+                encode_mode="performance",
+                cudnn_benchmark_limit=1,
+                cudnn_benchmark=True,
+                cudnn_deterministic=False,
+                deterministic_algorithms=False,
+            )
+            if fail:
+                raise RuntimeError("simulated encoder failure")
+    except RuntimeError as exc:
+        assert fail and str(exc) == "simulated encoder failure"
+    assert vars(backend) == dict(
+        benchmark=False, deterministic=False, benchmark_limit=10
+    )
+    assert torch.are_deterministic_algorithms_enabled() == original_deterministic
+
+
+def test_default_encoder_limit_and_nested_scope_preserve_existing_policy(monkeypatch):
+    backend = SimpleNamespace(benchmark=False, deterministic=False, benchmark_limit=10)
+    monkeypatch.setattr(torch.backends, "cudnn", backend)
+    with codecs_module._visual_encode_policy("performance") as receipt:
+        assert receipt["cudnn_benchmark_limit"] == 10
+        with codecs_module._visual_encode_policy("deterministic", 1) as nested:
+            assert nested["cudnn_benchmark_limit"] == 1
+            assert nested["deterministic_algorithms"] is True
+        assert backend.benchmark_limit == 10 and backend.benchmark
+    assert backend.benchmark_limit == 10 and not backend.benchmark
+
+
+@pytest.mark.parametrize("invalid", [True, False, 0, 2, "1", 1.0])
+def test_encoder_limit_only_admits_explicit_validated_candidate(invalid):
+    with pytest.raises(ValueError, match="null or 1"):
+        with codecs_module._visual_encode_policy("performance", invalid):
+            pytest.fail("Invalid policy must not enter encoding")
+
+
+def test_unsupported_explicit_limit_fails_before_mutating_flags(monkeypatch):
+    backend = SimpleNamespace(benchmark=False, deterministic=True, benchmark_limit=None)
+    monkeypatch.setattr(torch.backends, "cudnn", backend)
+    with pytest.raises(RuntimeError, match="does not support"):
+        with codecs_module._visual_encode_policy("performance", 1):
+            pytest.fail("Unsupported override must not enter encoding")
+    assert vars(backend) == dict(
+        benchmark=False, deterministic=True, benchmark_limit=None
+    )
+
+
+def test_visual_policy_contexts_are_serialized_across_encoder_threads(monkeypatch):
+    import threading
+
+    backend = SimpleNamespace(benchmark=False, deterministic=False, benchmark_limit=10)
+    monkeypatch.setattr(torch.backends, "cudnn", backend)
+    held, release, waiting, entered = (threading.Event() for _ in range(4))
+    failures = []
+    observed = []
+
+    def first():
+        try:
+            with codecs_module._visual_encode_policy("performance", 1):
+                held.set()
+                assert release.wait(5)
+        except BaseException as error:
+            failures.append(error)
+
+    def second():
+        try:
+            assert held.wait(5)
+            waiting.set()
+            with codecs_module._visual_encode_policy("performance") as receipt:
+                observed.append(receipt["cudnn_benchmark_limit"])
+                entered.set()
+        except BaseException as error:
+            failures.append(error)
+
+    a, b = threading.Thread(target=first), threading.Thread(target=second)
+    a.start()
+    b.start()
+    try:
+        assert waiting.wait(5)
+        assert not entered.wait(0.05)
+    finally:
+        release.set()
+        a.join(timeout=5)
+        b.join(timeout=5)
+    assert not a.is_alive() and not b.is_alive() and not failures
+    assert observed == [10]
+    assert backend.benchmark_limit == 10

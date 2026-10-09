@@ -83,7 +83,7 @@ class H3ProgressiveEncoderSession:
     contract_version = PROGRESSIVE_ENCODER_VERSION
     minimum_credit_frames = 8
 
-    def __init__(self, codecs, *, capacity_frames):
+    def __init__(self, codecs, *, capacity_frames, cache=None):
         from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.progressive import (
             CausalEncoderCache,
         )
@@ -100,10 +100,17 @@ class H3ProgressiveEncoderSession:
         self.capacity_frames = capacity_frames
         self.encode_mode = codecs.runtime["vae_config"]["encode_mode"]
         self.encode_dtype = codecs.runtime["vae_config"]["encode_dtype"]
-        self.cache = CausalEncoderCache(
-            codecs.modules["video_vae"],
-            encode_mode=self.encode_mode,
-            encode_dtype=self.encode_dtype,
+        self.cudnn_benchmark_limit = codecs.runtime["vae_config"].get(
+            "cudnn_benchmark_limit"
+        )
+        self.cache = (
+            cache
+            if cache is not None
+            else CausalEncoderCache(
+                codecs.modules["video_vae"],
+                encode_mode=self.encode_mode,
+                encode_dtype=self.encode_dtype,
+            )
         )
         self.disposed = False
         self.reset()
@@ -197,9 +204,14 @@ class H3ProgressiveEncoderSession:
             model = self.cache.model
             parameter = next(model.encoder.parameters())
             config = self.codecs.runtime["vae_config"]
-            if (config["encode_mode"], config["encode_dtype"]) != (
+            if (
+                config["encode_mode"],
+                config["encode_dtype"],
+                config.get("cudnn_benchmark_limit"),
+            ) != (
                 self.encode_mode,
                 self.encode_dtype,
+                self.cudnn_benchmark_limit,
             ):
                 raise ValueError(
                     "Progressive encoder policy cannot change within a session"
@@ -218,8 +230,13 @@ class H3ProgressiveEncoderSession:
         except Exception as exc:
             error = exc
         self.cache.agree("prepared", error=error)
-        with _visual_encode_policy(self.encode_mode):
+        with _visual_encode_policy(
+            self.encode_mode, self.cudnn_benchmark_limit
+        ) as encode_policy:
             moments, states, work = self.cache.encode((pixels - mean) / std)
+            self.cache.last_execution["encode_policy"] = dict(
+                encode_policy, encode_dtype=self.encode_dtype
+            )
         error = None
         try:
             length = 1 if needed == 1 else (count + 3) // 4

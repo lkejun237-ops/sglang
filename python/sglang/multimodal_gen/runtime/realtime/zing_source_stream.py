@@ -157,7 +157,11 @@ class SourceLedger:
         return record
 
     def consume(self, owned_frame_end):
-        """Release complete appends covered by the downstream ownership watermark."""
+        """Release complete appends covered by the downstream ownership watermark.
+
+        Downstream has taken ownership; this does not claim GPU completion or
+        that decoded frames have been delivered to the client.
+        """
         require(
             not self.closed
             and integer(owned_frame_end)

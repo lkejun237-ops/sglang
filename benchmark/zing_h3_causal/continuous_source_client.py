@@ -27,6 +27,16 @@ from sglang.multimodal_gen.runtime.realtime.source_transport import (
 )
 
 
+def websocket_options(*, profile, timeout, message_budget=DEFAULT_MESSAGE_BYTES):
+    return dict(
+        max_size=message_budget,
+        max_queue=1,
+        compression=None,
+        # Total request timeout remains bounded independently of keepalive.
+        ping_timeout=timeout if profile else 20,
+    )
+
+
 async def run(args):
     message_budget = getattr(args, "max_message_bytes", DEFAULT_MESSAGE_BYTES)
     SourceTransportBudget(message_bytes=message_budget)
@@ -54,8 +64,10 @@ async def run(args):
         next_playback=None,
         max_pending=0,
     )
-    boundaries, accepted, capture = deque(), deque(), deque()
+    boundaries, accepted, capture, sent = deque(), deque(), deque(), deque()
     latency_samples, delivery_times = [], []
+    dependency_latency_samples = []
+    block_capture_latency_samples = []
     credit, writer = asyncio.Condition(), asyncio.Lock()
 
     def record(kind, **fields):
@@ -66,7 +78,10 @@ async def run(args):
         trace.flush()
 
     async with websockets.connect(
-        args.url, max_size=message_budget, max_queue=1, compression=None
+        args.url,
+        **websocket_options(
+            profile=args.profile, timeout=args.timeout, message_budget=message_budget
+        ),
     ) as ws:
 
         async def send(message):
@@ -220,6 +235,7 @@ async def run(args):
                     ),
                     credit_wait_seconds=time.monotonic() - available_at,
                 )
+                sent.append((start, start + count, time.monotonic()))
                 await send(message)
             state["ended"] = True
             state["event_id"] += 1
@@ -316,6 +332,15 @@ async def run(args):
                         cursor += n
                     if cursor != start + count:
                         raise ValueError("Incomplete delivered source alignment")
+                    dependency = message["source_dependency_end"]
+                    owner = next(
+                        (entry for entry in sent if entry[0] < dependency <= entry[1]),
+                        None,
+                    )
+                    if owner is None:
+                        raise ValueError("Missing source dependency send timestamp")
+                    dependency_latency = now - owner[2]
+                    dependency_latency_samples.append(dependency_latency)
                     if state["first_output"] is None:
                         state["first_output"] = now
                         state["next_playback"] = now + args.startup_buffer_seconds
@@ -331,6 +356,8 @@ async def run(args):
                         if args.paced:
                             capture_time += (frame - capture[0][0]) / 24
                         latency_samples.append(now - capture_time)
+                    block_capture_latency = now - capture_time
+                    block_capture_latency_samples.append(block_capture_latency)
                     state["last_output"] = now
                     state["received"] += count
                     delivery_times.append((now - started, count))
@@ -341,7 +368,13 @@ async def run(args):
                         header=message,
                         received_seconds=now - started,
                         stall_seconds=stall,
+                        dependency_to_output_seconds=dependency_latency,
+                        block_capture_to_output_seconds=block_capture_latency,
                     )
+                    # Keep any packet covering the next frame; a lookahead
+                    # dependency may legitimately be reused by multiple outputs.
+                    while sent and sent[0][1] <= state["received"]:
+                        sent.popleft()
                     while accepted and accepted[0]["source_frame_end"] <= min(
                         state["received"], state["consumed"]
                     ):
@@ -378,6 +411,8 @@ async def run(args):
                     h.cancel()
             elapsed = time.monotonic() - started
             samples = sorted(latency_samples)
+            dependencies = sorted(dependency_latency_samples)
+            blocks = sorted(block_capture_latency_samples)
             summary = dict(
                 state,
                 elapsed_seconds=elapsed,
@@ -388,6 +423,14 @@ async def run(args):
                     min(len(samples) - 1, int(len(samples) * 0.95))
                 ],
                 source_to_output_max_seconds=max(samples),
+                dependency_to_output_p50_seconds=dependencies[len(dependencies) // 2],
+                dependency_to_output_p95_seconds=dependencies[
+                    min(len(dependencies) - 1, int(len(dependencies) * 0.95))
+                ],
+                block_capture_to_output_p50_seconds=blocks[len(blocks) // 2],
+                block_capture_to_output_p95_seconds=blocks[
+                    min(len(blocks) - 1, int(len(blocks) * 0.95))
+                ],
                 input_sha256=input_hash.hexdigest(),
                 output_sha256=output_hash.hexdigest(),
                 delivery_times=delivery_times,

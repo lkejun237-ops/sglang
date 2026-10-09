@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
     default_source_encoder,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 
 from .incremental import SourceReadySession
 from .source_bridge import SourceChunkBridge
@@ -39,6 +40,7 @@ class ZingSourceStreamState(BaseRealtimeState):
         self.command_index = 0
         self.prompt = self.prompt_event = None
         self.closed = False
+        self.component_capture = None
         self.kv_lease = None
 
     def initialize(self, stage, batch, config):
@@ -136,6 +138,20 @@ class ZingSourceStreamState(BaseRealtimeState):
             capacity_latents=2 * tokens + max_chunk + tokens,
             provenance_for=self.ledger.provenance_for,
         )
+        capture_dir = os.environ.get("SGLANG_ZING_COMPONENT_CAPTURE_DIR")
+        if capture_dir and (
+            not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        ):
+            from .component_capture import ComponentCapture
+
+            self.component_capture = ComponentCapture(
+                capture_dir,
+                stage,
+                self.inputs,
+                params,
+                self.bridge.seed,
+                batch.realtime_session_id,
+            )
 
     def _pooled_storage(self, stage, session, sampler):
         """Lease a slot at the first step; the ready session never sees the pool."""
@@ -218,6 +234,10 @@ class ZingSourceStreamState(BaseRealtimeState):
                     pixels = pixels.reshape(
                         payload["num_frames"], self.ledger.height, self.ledger.width, 3
                     ).permute(3, 0, 1, 2)
+                if self.component_capture is not None:
+                    self.component_capture.append_frames(
+                        "input", pixels, payload["source_frame_start"]
+                    )
                 # The shared factory may advance its cache in append/finish,
                 # not only pop. Keep the declared component active throughout.
                 with timed("encoder_host_ms"), self._encoder_use(stage):
@@ -231,7 +251,11 @@ class ZingSourceStreamState(BaseRealtimeState):
                 with timed("encoder_host_ms"), self._encoder_use(stage):
                     self.pixels.finish()
             while self.pixels.ready:
-                with timed("encoder_host_ms"), stage._use("video_vae"):
+                with (
+                    timed("encoder_host_ms"),
+                    stage._use("video_vae"),
+                    maybe_record_function("Zing.source_encode"),
+                ):
                     encoded = self.pixels.pop()
                     if (
                         encoded is None
@@ -250,6 +274,8 @@ class ZingSourceStreamState(BaseRealtimeState):
                     )
                     if measure_cuda and torch.cuda.is_available():
                         torch.cuda.synchronize()
+                if self.component_capture is not None:
+                    self.component_capture.append_source(encoded, source)
                 self._record_progress(
                     "latent_ready" if measure_cuda else "latent_submitted",
                     latent_start=encoded.start,
@@ -287,9 +313,11 @@ class ZingSourceStreamState(BaseRealtimeState):
                 if not self.sampler.complete:
                     raise ValueError("Continuous source sampling did not drain")
                 self.decoder.finish(total_frames=self.ledger.accepted_frames)
-                self._decode_ready(stage, outputs, metadata, timed)
+                self._decode_ready(stage, outputs, metadata, timed, eos=True)
                 self.ledger.consume(self.bridge.accepted_pixels)
                 self.ledger.completed()
+                if self.component_capture is not None:
+                    self.component_capture.finish()
             self.command_index += 1
             usage = {
                 "zing_realtime_blocks": metadata,
@@ -310,6 +338,8 @@ class ZingSourceStreamState(BaseRealtimeState):
             memory = usage["zing_source_memory"]
             if self.policy["source_encoder"]["mode"] == "progressive":
                 memory["encoder_state"] = vars(self.pixels.state_usage())
+                if hasattr(self.pixels, "queue_snapshot"):
+                    memory["encoder_queues"] = self.pixels.queue_snapshot()
             memory["host_rss_bytes"] = psutil.Process().memory_info().rss
             if torch.cuda.is_available():
                 memory.update(
@@ -410,7 +440,12 @@ class ZingSourceStreamState(BaseRealtimeState):
             with (
                 timed("dit_host_ms"),
                 stage._use("transformer", "denoise") as transformer,
+                maybe_record_function("Zing.source_dit"),
             ):
+                with maybe_record_function(
+                    f"Zing.clock_anchor.unix_ns{time.time_ns()}"
+                ):
+                    pass
                 self.sampler.sampler.generator = transformer
                 self._record_progress(
                     "dit_started",
@@ -420,6 +455,8 @@ class ZingSourceStreamState(BaseRealtimeState):
                     source_dependency_end=chunk.provenance.source_dependency_end,
                 )
                 result = self.sampler.step()
+            if self.component_capture is not None:
+                self.component_capture.append(chunk, result)
             self.blocks.append(
                 {
                     "block_idx": result.chunk.chunk_id,
@@ -435,13 +472,21 @@ class ZingSourceStreamState(BaseRealtimeState):
             )
             self._decode_ready(stage, outputs, metadata, timed)
 
-    def _decode_ready(self, stage, outputs, metadata, timed):
+    def _decode_ready(self, stage, outputs, metadata, timed, *, eos=False):
         while self.decoder.ready:
             with (
                 timed("decoder_host_ms"),
                 stage._use(stage.codecs.video_decoder_name, "decode"),
+                maybe_record_function("Zing.source_decode"),
             ):
-                decoded = self.decoder.pop()
+                with maybe_record_function(
+                    "Zing.source_decode.eos" if eos else "Zing.source_decode.chunk"
+                ):
+                    decoded = self.decoder.pop()
+            if self.component_capture is not None:
+                self.component_capture.append_frames(
+                    "decoder", decoded.values[0], decoded.start
+                )
             start = decoded.start
             while start < decoded.end:
                 block = self.blocks[0]

@@ -34,7 +34,9 @@ class CausalEncoderCache:
     tensors are never modified, so a failed layer leaves the session retryable.
     """
 
-    def __init__(self, model, *, tile_mode=None, encode_mode=None, encode_dtype=None):
+    def __init__(
+        self, model, *, tile_mode=None, encode_mode=None, encode_dtype=None, group=None
+    ):
         if not isinstance(model.encoder, EncoderFCN3D):
             raise ValueError("Progressive encoding requires EncoderFCN3D")
         for layer in model.encoder.modules():
@@ -78,10 +80,15 @@ class CausalEncoderCache:
         )
 
         self.available_group = (
-            get_decode_parallel_group_coordinator()
-            if get_tile_parallel_state()[1] > 1
-            else None
+            group
+            if group is not None
+            else (
+                get_decode_parallel_group_coordinator()
+                if get_tile_parallel_state()[1] > 1
+                else None
+            )
         )
+        self.group_name = "dedicated_encoder" if group is not None else "vae_decode"
         self.tile_mode = self.requested_mode
         # Prefer throughput; callers can explicitly disable performance-mode sharding.
         # Snapshot at construction, just like the tiling policy itself.
@@ -380,9 +387,11 @@ class CausalEncoderCache:
             error = exc
         # Include allocations in the failure rendezvous, before any rank gathers.
         self.agree(
-            ("computed", tuple(outputs[0].shape), str(outputs[0].dtype))
-            if error is None
-            else None,
+            (
+                ("computed", tuple(outputs[0].shape), str(outputs[0].dtype))
+                if error is None
+                else None
+            ),
             error=error,
         )
         payload = 0
@@ -416,10 +425,12 @@ class CausalEncoderCache:
             performance_auto=self.performance_auto,
             effective_mode="parallel" if parallel else "replicated",
             fallback_reason=reason,
-            group="vae_decode" if self.available_group is not None else None,
-            group_ranks=list(self.available_group.ranks)
-            if self.available_group is not None
-            else [],
+            group=self.group_name if self.available_group is not None else None,
+            group_ranks=(
+                list(self.available_group.ranks)
+                if self.available_group is not None
+                else []
+            ),
             rank=rank,
             world_size=size,
             encoder_ranks=size if parallel else 1,

@@ -2,6 +2,7 @@
 """Zing request preparation using SGLang's shared H3 Qwen and VAE modules."""
 
 import math
+import threading
 from contextlib import contextmanager
 
 import numpy as np
@@ -23,27 +24,61 @@ from .packing import H3InferenceInputs
 from .visual_encoding import encode_clips
 
 
+_VISUAL_ENCODE_POLICY_LOCK = threading.RLock()
+
+
+def _validate_encoder_benchmark_limit(value):
+    # Only the explicitly measured experimental candidate is admitted. Default
+    # None leaves cuDNN's existing candidate policy unchanged.
+    if value is not None and (type(value) is not int or value != 1):
+        raise ValueError("Encoder cudnn_benchmark_limit must be null or 1")
+    return value
+
+
 @contextmanager
-def _visual_encode_policy(mode):
+def _visual_encode_policy(mode, cudnn_benchmark_limit=None):
     if mode not in ("deterministic", "performance"):
         raise ValueError(
             "Unsupported Zing visual encode_mode; expected deterministic or performance"
         )
+    _validate_encoder_benchmark_limit(cudnn_benchmark_limit)
     deterministic = mode == "deterministic"
-    saved = (
-        torch.backends.cudnn.benchmark,
-        torch.backends.cudnn.deterministic,
-        torch.are_deterministic_algorithms_enabled(),
-        torch.is_deterministic_algorithms_warn_only_enabled(),
-    )
-    torch.backends.cudnn.benchmark = not deterministic
-    torch.backends.cudnn.deterministic = deterministic
-    torch.use_deterministic_algorithms(deterministic)
-    try:
-        yield
-    finally:
-        torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic = saved[:2]
-        torch.use_deterministic_algorithms(saved[2], warn_only=saved[3])
+    # PyTorch backend flags are process-wide. Serialize visual encoder contexts,
+    # including nested callers; dedicated overlap uses separate worker processes.
+    # The serving owner must not launch unrelated cuDNN work concurrently on a
+    # different host thread while this context is active.
+    with _VISUAL_ENCODE_POLICY_LOCK:
+        previous_limit = torch.backends.cudnn.benchmark_limit
+        if cudnn_benchmark_limit is not None and previous_limit is None:
+            raise RuntimeError(
+                "This runtime does not support Encoder cudnn_benchmark_limit"
+            )
+        saved = (
+            torch.backends.cudnn.benchmark,
+            torch.backends.cudnn.deterministic,
+            torch.are_deterministic_algorithms_enabled(),
+            torch.is_deterministic_algorithms_warn_only_enabled(),
+        )
+        try:
+            if cudnn_benchmark_limit is not None:
+                torch.backends.cudnn.benchmark_limit = cudnn_benchmark_limit
+            torch.backends.cudnn.benchmark = not deterministic
+            torch.backends.cudnn.deterministic = deterministic
+            torch.use_deterministic_algorithms(deterministic)
+            yield dict(
+                encode_mode=mode,
+                cudnn_benchmark_limit=torch.backends.cudnn.benchmark_limit,
+                cudnn_benchmark=torch.backends.cudnn.benchmark,
+                cudnn_deterministic=torch.backends.cudnn.deterministic,
+                deterministic_algorithms=torch.are_deterministic_algorithms_enabled(),
+            )
+        finally:
+            if cudnn_benchmark_limit is not None:
+                torch.backends.cudnn.benchmark_limit = previous_limit
+            torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic = saved[
+                :2
+            ]
+            torch.use_deterministic_algorithms(saved[2], warn_only=saved[3])
 
 
 class ZingH3Codecs(ZingH3MediaInput):
@@ -75,6 +110,9 @@ class ZingH3Codecs(ZingH3MediaInput):
 
     def prepare_visual_encoder_weights(self):
         """Prepare encoder precision at startup, before cached sessions exist."""
+        _validate_encoder_benchmark_limit(
+            self.runtime["vae_config"].get("cudnn_benchmark_limit")
+        )
         model = self.modules["video_vae"]
         dtype = getattr(torch, self.runtime["vae_config"]["encode_dtype"])
         model.encoder.to(dtype=dtype)
@@ -182,7 +220,10 @@ class ZingH3Codecs(ZingH3MediaInput):
                 ),
                 2,
             )
-        with _visual_encode_policy(self.runtime["vae_config"]["encode_mode"]):
+        with _visual_encode_policy(
+            self.runtime["vae_config"]["encode_mode"],
+            self.runtime["vae_config"].get("cudnn_benchmark_limit"),
+        ):
             moments = torch.cat(
                 encode_clips(
                     model,
@@ -221,7 +262,10 @@ class ZingH3Codecs(ZingH3MediaInput):
         pixels = frames[None].to(device=device, dtype=dtype).div(255)
         mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
         std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
-        with _visual_encode_policy(self.runtime["vae_config"]["encode_mode"]):
+        with _visual_encode_policy(
+            self.runtime["vae_config"]["encode_mode"],
+            self.runtime["vae_config"].get("cudnn_benchmark_limit"),
+        ):
             return model._adaptive_encode((pixels - mean) / std)
 
     def sample_streaming_visual_moments(self, moments, *, latent_start, noise_version):

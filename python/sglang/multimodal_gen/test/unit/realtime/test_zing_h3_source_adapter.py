@@ -90,20 +90,24 @@ def initialize(**overrides):
         {"guidance_scale": 2},
         {"realtime_preview_max_width": 16},
         {"condition_inputs": {}},
-        {
-            "size": "1920x1088",
-            "source_stream": {
-                "format": "rgb24",
-                "width": 1920,
-                "height": 1088,
-                "fps": 24,
-            },
-        },
     ],
 )
 def test_reject_mixed_protocol_or_profile(configured, overrides):
     with pytest.raises(ValueError):
         initialize(**overrides)
+
+
+def test_source_over_capacity_rejects_with_transport_error(configured):
+    from sglang.multimodal_gen.runtime.realtime.source_transport import (
+        SourceTransportError,
+    )
+
+    with pytest.raises(SourceTransportError) as error:
+        initialize(
+            size="4096x4096",
+            source_stream={"format": "rgb24", "width": 4096, "height": 4096, "fps": 24},
+        )
+    assert error.value.code == "source_message_too_large"
 
 
 def test_default_encoder_dispatches_first_frame(configured):
@@ -488,6 +492,9 @@ def test_high_resolution_ready(configured, width, height):
         source_message_budget_bytes=64 << 20,
     )
     ready = adapter.session_ready_message(session)
+    assert adapter.clip == 17
+    assert ready["max_source_batch_frames"] == 17
+    assert adapter.ledger.limits.pending_frames == 4 * 17
     assert ready["max_message_bytes"] == 64 << 20
     assert ready["max_source_message_bytes"] == 17 * width * height * 3 + 4096
     assert ready["max_pending_source_bytes"] == 4 * 17 * width * height * 3
