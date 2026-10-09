@@ -27,6 +27,7 @@ class ZingH3SamplingParams(SamplingParams):
     zing_generate_audio: bool = False
     zing_return_latents: bool = False
     zing_realtime_decode_mode: str = "stable"
+    zing_joint_forward: str = "cross_chunk"
     zing_window_chunks: int | None = 21
     zing_sink_chunks: int = 3
     zing_rope_position_mode: str = "block_relative"
@@ -60,6 +61,7 @@ class ZingH3SamplingParams(SamplingParams):
                 "zing_generate_audio",
                 "zing_return_latents",
                 "zing_realtime_decode_mode",
+                "zing_joint_forward",
                 "zing_window_chunks",
                 "zing_sink_chunks",
                 "zing_rope_position_mode",
@@ -78,6 +80,10 @@ class ZingH3SamplingParams(SamplingParams):
         super()._validate()
         from sglang.multimodal_gen.runtime.realtime.zing_window import ZingWindowPolicy
 
+        if self.zing_joint_forward not in {"off", "source_first", "cross_chunk"}:
+            raise ValueError(
+                "Zing joint_forward must be off, source_first, or cross_chunk"
+            )
         ZingWindowPolicy(self.zing_window_chunks, self.zing_sink_chunks)
         ZingWindowPolicy.validate_rope(
             self.zing_rope_position_mode, self.zing_rope_max_frame_gap

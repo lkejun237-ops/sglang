@@ -5,7 +5,7 @@ import json
 import os
 import time
 from collections import deque
-from contextlib import contextmanager, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 
 import psutil
 import torch
@@ -22,7 +22,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 
 from .incremental import SourceReadySession
-from .source_bridge import SourceChunkBridge
+from .source_bridge import SourceChunk, SourceChunkBridge
 from .source_decoder import SourceTAEH3Decoder
 from .source_encoder import create_source_buffer
 from .streaming_codecs import StableVideoDecoder
@@ -56,6 +56,8 @@ class ZingSourceStreamState(BaseRealtimeState):
             "rope_max_frame_gap": sampler.rope_max_frame_gap,
             "video_decoder": stage.codecs.video_decoder_name,
         }
+        if getattr(sampler, "joint_forward", "off") != "off":
+            self.policy["joint_forward"] = sampler.joint_forward
         self.qwen_init_host_ms = None
 
         @contextmanager
@@ -124,7 +126,9 @@ class ZingSourceStreamState(BaseRealtimeState):
             sampler,
             self.inputs,
             seed=self.bridge.seed,
-            max_pending_chunks=1,
+            max_pending_chunks=2
+            if getattr(sampler, "joint_forward", "off") == "cross_chunk"
+            else 1,
             max_pending_bytes=256 << 20,
             acquire_storage=self._pooled_storage(stage, batch.session, sampler),
         )
@@ -299,7 +303,9 @@ class ZingSourceStreamState(BaseRealtimeState):
                         pixel_end=pixel_end,
                         source_dependency_end=encoded.source_dependency_end,
                     )
-                self._generate_ready(stage, batch, outputs, metadata, timed)
+                self._generate_ready(
+                    stage, batch, outputs, metadata, timed, flush=not self.pixels.ready
+                )
                 # Release only source alignment already transferred downstream.
                 # Encoder lookahead/cache ownership never grants extra credit.
                 self.ledger.consume(self.bridge.accepted_pixels)
@@ -335,6 +341,9 @@ class ZingSourceStreamState(BaseRealtimeState):
                     "pending_blocks": len(self.blocks),
                 },
             }
+            if self.policy.get("joint_forward", "off") != "off":
+                usage["zing_h3"] = self.sampler.metrics
+                usage["zing_joint_wait"] = command.get("joint_wait")
             memory = usage["zing_source_memory"]
             if self.policy["source_encoder"]["mode"] == "progressive":
                 memory["encoder_state"] = vars(self.pixels.state_usage())
@@ -378,6 +387,8 @@ class ZingSourceStreamState(BaseRealtimeState):
                         "dispatch_unix_ns": command.get("dispatch_unix_ns"),
                         "source_preview": command.get("source_preview", False),
                         "source_wait_host_ms": command.get("source_wait_host_ms"),
+                        "joint_wait": command.get("joint_wait"),
+                        "joint": usage.get("zing_h3"),
                         "source_preview_rgb_sha256": command.get(
                             "source_preview_sha256"
                         ),
@@ -427,7 +438,11 @@ class ZingSourceStreamState(BaseRealtimeState):
             )
         )
 
-    def _generate_ready(self, stage, batch, outputs, metadata, timed):
+    def _generate_ready(self, stage, batch, outputs, metadata, timed, *, flush=True):
+        if getattr(self.sampler.sampler, "joint_forward", "off") == "cross_chunk":
+            return self._generate_joint_ready(
+                stage, batch, outputs, metadata, timed, flush=flush
+            )
         while self.bridge.ready:
             with timed("bridge_host_ms"):
                 chunk = self.bridge.pop()
@@ -471,6 +486,108 @@ class ZingSourceStreamState(BaseRealtimeState):
                 source_dependency_end=result.provenance.source_dependency_end,
             )
             self._decode_ready(stage, outputs, metadata, timed)
+
+    def _generate_joint_ready(
+        self, stage, batch, outputs, metadata, timed, *, flush=True
+    ):
+        while self.bridge.ready or self.sampler.pending:
+            while (
+                self.bridge.ready
+                and len(self.sampler.pending) < self.sampler.max_pending_chunks
+            ):
+                if self.sampler.pending:
+                    upcoming = self.bridge.plan.chunk(
+                        self.bridge.chunk_id,
+                        self.bridge.accepted_latents if self.bridge.ended else None,
+                    )
+                    values = self.bridge.values[:, :, : upcoming.end - upcoming.start]
+                    needed = values.numel() * (values.element_size() + 4)
+                    del values
+                    # One-chunk fallback before popping transfers any ownership.
+                    if (
+                        self.sampler.pending_bytes + needed
+                        > self.sampler.max_pending_bytes
+                    ):
+                        reasons = self.sampler.sampler.last_run_metrics[
+                            "joint_fallbacks"
+                        ]
+                        reasons["ready_queue_capacity"] = (
+                            reasons.get("ready_queue_capacity", 0) + 1
+                        )
+                        flush = True
+                        break
+                with timed("bridge_host_ms"):
+                    chunk = self.bridge.pop()
+                    self.sampler.append(
+                        chunk.source,
+                        chunk.noise,
+                        provenance=chunk.provenance,
+                        final=chunk.final,
+                    )
+                    del chunk
+            if (
+                not flush
+                and len(self.sampler.pending) < self.sampler.max_pending_chunks
+            ):
+                return
+            # The transformer lease ends before every decoder call. Closing on
+            # failure clears any prefetched next active target as well.
+            with closing(self.sampler.drain_ready()) as ready:
+                while True:
+                    capture_chunk = None
+                    with (
+                        timed("dit_host_ms"),
+                        stage._use("transformer", "denoise") as transformer,
+                        maybe_record_function("Zing.source_dit"),
+                    ):
+                        with maybe_record_function(
+                            f"Zing.clock_anchor.unix_ns{time.time_ns()}"
+                        ):
+                            pass
+                        if self.sampler.sampler is not None:
+                            self.sampler.sampler.generator = transformer
+                        if self.sampler.pending:
+                            chunk = self.sampler.pending[0]
+                            if self.component_capture is not None:
+                                capture_chunk = SourceChunk(
+                                    chunk=chunk.chunk,
+                                    source=chunk.source,
+                                    noise=chunk.noise,
+                                    provenance=chunk.provenance,
+                                    final=(
+                                        self.bridge.ended
+                                        and chunk.chunk.end
+                                        == self.bridge.accepted_latents
+                                    ),
+                                )
+                            self._record_progress(
+                                "dit_started",
+                                chunk_id=chunk.chunk.chunk_id,
+                                latent_start=chunk.chunk.start,
+                                latent_end=chunk.chunk.end,
+                                source_dependency_end=chunk.provenance.source_dependency_end,
+                            )
+                            del chunk
+                        result = next(ready, None)
+                    if result is None:
+                        break
+                    if self.component_capture is not None:
+                        self.component_capture.append(capture_chunk, result)
+                        del capture_chunk
+                    self.blocks.append(
+                        {
+                            "block_idx": result.chunk.chunk_id,
+                            "request_id": batch.request_id,
+                            "event_id": result.prompt_event_id,
+                            "frame_end": result.provenance.pixels.end,
+                        }
+                    )
+                    self.decoder.append(
+                        result.visual,
+                        latent_start=result.chunk.start,
+                        source_dependency_end=result.provenance.source_dependency_end,
+                    )
+                    self._decode_ready(stage, outputs, metadata, timed)
 
     def _decode_ready(self, stage, outputs, metadata, timed, *, eos=False):
         while self.decoder.ready:

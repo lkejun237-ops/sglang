@@ -449,3 +449,83 @@ def test_dispose_receipt_identifies_worker_and_is_emitted_once(monkeypatch, rank
     assert receipt["memory"]["encoder_state"]["retained_bytes"] == 0
     assert receipt["memory"]["codec_pixel_frames"] == 0
     assert state.closed and state.sampler is None
+
+
+@pytest.mark.parametrize("queue_bytes", [1024, 16])
+@pytest.mark.parametrize("capture", [False, True])
+def test_joint_ready_worker_batches_without_crossing_command_boundary(
+    queue_bytes, capture
+):
+    from collections import deque
+
+    class JointSampler(SyntheticSampler):
+        def __init__(self, plan):
+            super().__init__(plan)
+            self.sampler.joint_forward = "cross_chunk"
+            self.sampler.last_run_metrics = {"joint_fallbacks": {}}
+            self.pending = deque()
+            self.max_pending_chunks = 2
+            self.max_pending_bytes = queue_bytes
+            self.pending_bytes = 0
+            self.batches = []
+
+        def append(self, source, noise, *, provenance, final):
+            chunk = self.plan.chunk(self.index + len(self.pending))
+            self.pending.append(
+                NS(
+                    source=source,
+                    noise=noise,
+                    provenance=provenance,
+                    final=final,
+                    chunk=chunk,
+                )
+            )
+            self.pending_bytes += source.numel() * 8
+
+        def drain_ready(self):
+            self.batches.append(len(self.pending))
+            while self.pending:
+                value = self.pending.popleft()
+                self.pending_bytes -= value.source.numel() * 8
+                super().append(
+                    value.source,
+                    value.noise,
+                    provenance=value.provenance,
+                    final=value.final,
+                )
+                yield self.step()
+
+    state, stage = session(ChunkPlan([1, 2, 2]))
+    state.sampler = sampler = JointSampler(state.bridge.plan)
+    captured = []
+    if capture:
+        state.component_capture = NS(
+            append=lambda chunk, result: captured.append(
+                (chunk.chunk, result.chunk, chunk.final)
+            ),
+            append_source=lambda *args: None,
+            append_frames=lambda *args: None,
+            finish=lambda: None,
+        )
+    # Multiple codec slices are ready in this command; a small byte budget
+    # must fall back before popping the next bridge chunk.
+    result = state.run(stage, batch(state, 0, 17, 0, final=True))
+    assert sum(x.shape[1] for x in result.output) == 17
+    assert not sampler.pending
+    assert state.closed
+    assert max(sampler.batches) == (2 if queue_bytes == 1024 else 1)
+    if capture:
+        assert len(captured) == 3
+        assert all(
+            (a.chunk_id, a.start, a.end) == (b.chunk_id, b.start, b.end)
+            for a, b, _ in captured
+        )
+        # Full chunks drain before bridge.finish(); EOS is handled separately.
+        assert [final for _, _, final in captured] == [False, False, False]
+    else:
+        assert not captured
+    if queue_bytes == 16:
+        assert (
+            sampler.sampler.last_run_metrics["joint_fallbacks"]["ready_queue_capacity"]
+            > 0
+        )

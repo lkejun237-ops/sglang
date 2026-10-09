@@ -66,6 +66,7 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         sink_chunks=3,
         rope_position_mode="block_relative",
         rope_max_frame_gap=12,
+        joint_forward="off",
         ar_condition_timestep=1.0,
         reference_visual_timestep=1.0,
     ):
@@ -75,6 +76,11 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             raise ValueError("Zing solver must be euler or few_step")
         if solver == "euler" and denoising_step_list is not None:
             raise ValueError("An explicit re-noise grid requires solver=few_step")
+        if joint_forward not in {"off", "source_first", "cross_chunk"}:
+            raise ValueError(
+                "Zing joint_forward must be off, source_first, or cross_chunk"
+            )
+        self.joint_forward = joint_forward
         for value in (ar_condition_timestep, reference_visual_timestep):
             if (
                 type(value) not in (int, float)
@@ -165,6 +171,8 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             "commit": 0,
         }
 
+        if self.joint_forward != "off":
+            forward_counts.update(source_first=0, cross_chunk=0)
         self._forward_counts = forward_counts
         self.last_run_metrics = {
             "window_chunks": self.window_policy.window_chunks,
@@ -187,6 +195,10 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             "forward_counts": forward_counts,
             "dit_forwards": 0,
         }
+        if self.joint_forward != "off":
+            self.last_run_metrics.update(
+                joint_forward=self.joint_forward, joint_fallbacks={}
+            )
         if acquire_storage is not None:
             storage = acquire_storage(pos)
         cache = ZingH3KVCache(
@@ -261,6 +273,9 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         """Denoise one block; any execution failure closes the sampling state."""
         if state.closed or state.index >= len(state.spans):
             raise ValueError("Zing sampling state is closed or complete")
+        if self.joint_forward == "cross_chunk":
+            reasons = self.last_run_metrics["joint_fallbacks"]
+            reasons["streaming_boundary"] = reasons.get("streaming_boundary", 0) + 1
         visual, audio, cache = state.visual, state.audio, state.cache
         self.device = visual.device
         source, target, start, end = state.spans[state.index]
@@ -294,7 +309,21 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         return start, end
 
     def _sample_block(
-        self, visual, audio, pos, neg, cache, vs, aus, source, target, start, end
+        self,
+        visual,
+        audio,
+        pos,
+        neg,
+        cache,
+        vs,
+        aus,
+        source,
+        target,
+        start,
+        end,
+        *,
+        first_prediction=None,
+        defer_final=False,
     ):
         diagnostic = current_diagnostic()
         video = visual[:, :, start:end]
@@ -302,7 +331,14 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         sound = None if audio is None else audio[:, :, audio_indices]
         if diagnostic:
             diagnostic.phase = f"block{source}.source"
-        if self._has_block(pos, source):
+        joint_source = first_prediction is None and self._joint_eligible(
+            pos, cache, source, target, audio
+        )
+        if (
+            first_prediction is None
+            and not joint_source
+            and self._has_block(pos, source)
+        ):
             self._forward(
                 self._select_block(
                     pos, source, phase="source", video_t=1, audio_t=None
@@ -322,7 +358,26 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
                 packed = self._select_block(
                     pos, target, phase="target", video_t=vt, audio_t=at
                 )
-                vp, ap = self._predict(packed, video.shape[2:], cache, "active")
+                if step == 0 and first_prediction is not None:
+                    vp, ap = first_prediction
+                elif step == 0 and joint_source:
+                    source_packed = self._select_block(
+                        pos, source, phase="source", video_t=1, audio_t=None
+                    )
+                    prediction = self._predict_joint(
+                        [source_packed, packed],
+                        ("source", "active"),
+                        video.shape[2:],
+                        cache,
+                    )
+                    if prediction is None:
+                        self._forward(source_packed, cache, "source")
+                        prediction = self._predict(
+                            packed, video.shape[2:], cache, "active"
+                        )
+                    vp, ap = prediction
+                else:
+                    vp, ap = self._predict(packed, video.shape[2:], cache, "active")
                 if self.do_cfg:
                     self._set_block_latents(neg, target, video, sound)
                     uncond = self._select_block(
@@ -338,19 +393,173 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
                     sound = aus.step(ap, sound, step_index=step)[0]
         if diagnostic:
             diagnostic.phase = f"block{target}.commit"
-        self._commit(pos, target, video, sound, cache)
+        if not defer_final:
+            self._commit(pos, target, video, sound, cache)
         visual[:, :, start:end] = video
         if audio is not None:
             audio[:, :, audio_indices] = sound
         if diagnostic:
             diagnostic.record("block_complete", video=visual, audio=audio)
+        return video, sound
+
+    def _joint_eligible(self, pos, cache, source, target, audio, *, cross=False):
+        if self.joint_forward == "off":
+            return False
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3 import get_ulysses_ctx
+
+        reason = None
+        roles = self._layout_index(pos).host["row_role"]
+        if get_ulysses_ctx()[0] not in (1, 2):
+            reason = "sp_size"
+        elif self.do_cfg:
+            reason = "cfg"
+        elif audio is not None or bool(((roles == 5) | (roles == 11)).any()):
+            reason = "audio"
+        elif not self._has_block(pos, source):
+            reason = "source_not_ready"
+        elif not cache.raw_store or cache.local_frames != -1:
+            reason = "cache_layout"
+        elif cross and not all(
+            cache.window_policy.retains(i, target // 2 - 1)
+            for i in [c.temporal_chunk_id for c in cache.committed] + [target // 2 - 2]
+        ):
+            reason = "window_eviction"
+        elif cache.pooled:
+            blocks = self._layout_index(pos).host["block_idx"]
+            selected = (blocks == source) | (blocks == target)
+            if cross:
+                selected = selected | (blocks == target - 2)
+            if cache._length + int(selected.sum()) > cache.capacity:
+                reason = "pooled_scratch_capacity"
+        if reason is not None:
+            counts = self.last_run_metrics["joint_fallbacks"]
+            counts[reason] = counts.get(reason, 0) + 1
+        return reason is None
+
+    def _ready_cross_prediction(self, previous, current):
+        """Join two separately packed ready chunks without moving RNG draws."""
+        source, target, start, end = current.spans[0]
+        old_target = previous.spans[0][1]
+        cache, pos = current.cache, current.positive
+        if not self._joint_eligible(
+            pos, cache, source, target, current.audio, cross=True
+        ):
+            return None
+        self._set_block_latents(
+            previous.positive, old_target, previous.visual, previous.audio
+        )
+        self._set_block_latents(pos, target, current.visual, current.audio)
+        packs = [
+            self._select_block(
+                previous.positive,
+                old_target,
+                phase="target",
+                video_t=1,
+                audio_t=None,
+                final=True,
+            ),
+            self._select_block(pos, source, phase="source", video_t=1, audio_t=None),
+            self._select_block(
+                pos,
+                target,
+                phase="target",
+                video_t=self._host_list(self.video_scheduler.timesteps)[0],
+                audio_t=None,
+            ),
+        ]
+        # The previous final is absent from current's separate packed layout.
+        if (
+            cache.pooled
+            and cache._length + sum(p["x"].shape[0] for p in packs) > cache.capacity
+        ):
+            reasons = self.last_run_metrics["joint_fallbacks"]
+            reasons["pooled_scratch_capacity"] = (
+                reasons.get("pooled_scratch_capacity", 0) + 1
+            )
+            return None
+        return self._predict_joint(
+            packs, ("final", "source", "active"), current.visual.shape[2:], cache
+        )
+
+    def _sample_cross_chunk(self, state):
+        """Offline-only lookahead: all source/noise inputs are already available.
+
+        Streaming step() still commits before returning each block. This loop
+        does not prepare noise early or change scheduler/RNG consumption.
+        """
+        previous = None
+        for source, target, start, end in state.spans:
+            pos, cache = state.positive, state.cache
+            first = None
+            if previous is not None:
+                old_target, video, sound = previous
+                if self._joint_eligible(
+                    pos, cache, source, target, state.audio, cross=True
+                ):
+                    self._set_block_latents(pos, old_target, video, sound)
+                    self._set_block_latents(
+                        pos, target, state.visual[:, :, start:end], None
+                    )
+                    packs = [
+                        self._select_block(
+                            pos,
+                            old_target,
+                            phase="target",
+                            video_t=1,
+                            audio_t=None,
+                            final=True,
+                        ),
+                        self._select_block(
+                            pos, source, phase="source", video_t=1, audio_t=None
+                        ),
+                        self._select_block(
+                            pos,
+                            target,
+                            phase="target",
+                            video_t=self._host_list(self.video_scheduler.timesteps)[0],
+                            audio_t=None,
+                        ),
+                    ]
+                    first = self._predict_joint(
+                        packs,
+                        ("final", "source", "active"),
+                        state.visual[:, :, start:end].shape[2:],
+                        cache,
+                    )
+                if first is None:
+                    self._commit(pos, old_target, video, sound, cache)
+            if first is None:
+                cache.prepare_chunk(target)
+            video, sound = self._sample_block(
+                state.visual,
+                state.audio,
+                pos,
+                state.negative,
+                cache,
+                self.video_scheduler,
+                self.audio_scheduler,
+                source,
+                target,
+                start,
+                end,
+                first_prediction=first,
+                defer_final=True,
+            )
+            previous = (target, video, sound)
+            state.index += 1
+        if previous is not None:
+            self._commit(state.positive, *previous, state.cache)
+        self.last_run_metrics["dit_forwards"] = sum(self._forward_counts.values())
 
     @torch.no_grad()
     def sample(self, inputs, visual, audio=None):
         state = self.initialize(inputs, visual, audio)
         try:
-            while state.index < len(state.spans):
-                self.step(state)
+            if self.joint_forward == "cross_chunk":
+                self._sample_cross_chunk(state)
+            else:
+                while state.index < len(state.spans):
+                    self.step(state)
             return state.visual, state.audio
         finally:
             state.close()

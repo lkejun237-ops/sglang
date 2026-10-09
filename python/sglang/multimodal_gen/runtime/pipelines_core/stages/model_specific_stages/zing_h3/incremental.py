@@ -116,6 +116,8 @@ class SourceReadySession:
         self.source_dependency_end = 0
         self.media_origin = None
         self.ended = self.closed = False
+        self.draining = False
+        self._drain_tensors = []
         self.audio_enabled = None
         self.device = None
         sampler._forward_counts = dict.fromkeys(
@@ -125,6 +127,14 @@ class SourceReadySession:
             "dit_forwards": 0,
             "forward_counts": sampler._forward_counts,
         }
+
+        if sampler.joint_forward != "off":
+            sampler._forward_counts.update(source_first=0, cross_chunk=0)
+            sampler.last_run_metrics.update(
+                joint_forward=sampler.joint_forward, joint_fallbacks={}
+            )
+
+        self.metrics = sampler.last_run_metrics
 
     def _new_cache(self, storage):
         sampler = self.sampler
@@ -141,14 +151,14 @@ class SourceReadySession:
         return ({k: v.detach().clone() for k, v in condition.items()}, event_id)
 
     def update_prompt(self, condition, event_id):
-        if self.closed:
-            raise ValueError("The source-ready session is closed")
+        if self.closed or self.draining:
+            raise ValueError("The source-ready session is closed or draining")
         self.prompt = self._snapshot(condition, event_id)
 
     def append(
         self, source, noise, *, provenance, audio=None, audio_start=0, final=False
     ):
-        if self.closed or self.ended:
+        if self.closed or self.ended or self.draining:
             raise ValueError("The source-ready session no longer accepts chunks")
         packer = self.sampler.processor
         if packer.chunk_plan != self.plan:
@@ -233,7 +243,7 @@ class SourceReadySession:
             self.ended = True
 
     def finish(self):
-        if self.closed or self.ended:
+        if self.closed or self.ended or self.draining:
             raise ValueError("The source-ready session has already ended")
         if (
             self.total_latent_frames is not None
@@ -255,8 +265,8 @@ class SourceReadySession:
 
     @torch.no_grad()
     def step(self):
-        if self.closed:
-            raise ValueError("The source-ready session is closed")
+        if self.closed or self.draining:
+            raise ValueError("The source-ready session is closed or draining")
         if not self.pending:
             return None  # Wait for source. Never repeat frames or advance RNG.
         try:
@@ -265,8 +275,7 @@ class SourceReadySession:
             self.dispose()
             raise
 
-    def _step(self):
-        ready = self.pending[0]
+    def _prepare(self, ready, prompt, media_origin):
         sampler, packer = self.sampler, self.sampler.processor
         if packer.chunk_plan != self.plan:
             raise ValueError("The checkpoint chunk plan changed within the session")
@@ -279,7 +288,6 @@ class SourceReadySession:
         sampler.device = ready.noise.device
         sampler.video_scheduler.to(sampler.device)
         sampler.audio_scheduler.to(sampler.device)
-        prompt = self.prompt
         inputs = copy(self.inputs)
         inputs.positive, inputs.source_visual = prompt[0], ready.source
         visual = ready.noise.float().clone()
@@ -287,7 +295,7 @@ class SourceReadySession:
         kwargs = dict(
             chunk=ready.chunk,
             audio_start=ready.audio_start,
-            media_origin=self.media_origin,
+            media_origin=media_origin,
         )
         positive = packer.pack_chunk(inputs, prompt[0], visual, audio, **kwargs)
         negative = (
@@ -297,7 +305,7 @@ class SourceReadySession:
         )
         if self.cache is None:
             self.cache = self._new_cache(self.acquire_storage(positive, ready))
-        origin = self.media_origin
+        origin = media_origin
         if origin is None:
             target = positive["row_role"] == int(H3RowRole.TARGET_VISUAL)
             origin = float(positive["position_ids"][target][0, 0])
@@ -309,29 +317,35 @@ class SourceReadySession:
             [(ready.chunk.source_block, ready.chunk.target_block, 0, visual.shape[2])],
             self.cache,
         )
-        with self.rng.random_stream(sampler.device, self.seed):
-            if prompt is not self.applied_prompt:
-                prefix_cache = sampler.prefix_donor_cache()
-                try:
-                    if bool((positive["block_idx"] == 0).any()):
-                        sampler._forward(
-                            sampler._select_block(
-                                positive, 0, phase="prefix", video_t=1, audio_t=1
-                            ),
-                            prefix_cache,
-                            "prefix",
-                        )
-                    self.cache.replace_prefix(prefix_cache.prefix)
-                finally:
-                    prefix_cache.clear()
-            sampler.step(current)
-            dependency = max(
-                self.source_dependency_end, ready.provenance.source_dependency_end
-            )
-            provenance = Provenance(
-                ready.provenance.pixels, ready.provenance.source_alignment, dependency
-            )
-            result = ChunkResult(ready.chunk, visual, audio, provenance, prompt[1])
+        return current, origin
+
+    def _apply_prefix(self, current, prompt):
+        sampler, positive = self.sampler, current.positive
+        if prompt is not self.applied_prompt:
+            prefix_cache = sampler.prefix_donor_cache()
+            try:
+                if bool((positive["block_idx"] == 0).any()):
+                    sampler._forward(
+                        sampler._select_block(
+                            positive, 0, phase="prefix", video_t=1, audio_t=1
+                        ),
+                        prefix_cache,
+                        "prefix",
+                    )
+                self.cache.replace_prefix(prefix_cache.prefix)
+            finally:
+                prefix_cache.clear()
+
+    def _finish(self, ready, current, prompt, origin):
+        dependency = max(
+            self.source_dependency_end, ready.provenance.source_dependency_end
+        )
+        provenance = Provenance(
+            ready.provenance.pixels, ready.provenance.source_alignment, dependency
+        )
+        result = ChunkResult(
+            ready.chunk, current.visual, current.audio, provenance, prompt[1]
+        )
         self.pending.popleft()
         self.pending_bytes -= ready.nbytes
         self.pending_spans -= len(ready.provenance.source_alignment)
@@ -343,6 +357,105 @@ class SourceReadySession:
         if self.complete:
             self.dispose()
         return result
+
+    def _step(self):
+        ready, prompt = self.pending[0], self.prompt
+        current, origin = self._prepare(ready, prompt, self.media_origin)
+        with self.rng.random_stream(self.sampler.device, self.seed):
+            self._apply_prefix(current, prompt)
+            self.sampler.step(current)
+        return self._finish(ready, current, prompt, origin)
+
+    @torch.no_grad()
+    def drain_ready(self):
+        """Drain a finite ready batch, committing each result before yielding.
+
+        Lookahead never survives this synchronous iterator. The caller must
+        close it on decoder failure/cancellation; abandoned work closes the
+        session, including a next target whose step0 may already be active.
+        """
+        if self.closed or self.draining:
+            raise ValueError("The source-ready session is closed or draining")
+        self.draining = True
+        finished = False
+        try:
+            if not self.pending:
+                finished = True
+                return
+            prompt = self.prompt
+            current, origin = self._prepare(self.pending[0], prompt, self.media_origin)
+            sampler = self.sampler
+            first = None
+            while self.pending:
+                ready = self.pending[0]
+                next_state = next_first = None
+                with self.rng.random_stream(sampler.device, self.seed):
+                    self._apply_prefix(current, prompt)
+                    source, target, start, end = current.spans[0]
+                    if first is None:
+                        self.cache.prepare_chunk(target)
+                    lookahead = (
+                        sampler.joint_forward == "cross_chunk" and len(self.pending) > 1
+                    )
+                    video, sound = sampler._sample_block(
+                        current.visual,
+                        current.audio,
+                        current.positive,
+                        current.negative,
+                        self.cache,
+                        sampler.video_scheduler,
+                        sampler.audio_scheduler,
+                        source,
+                        target,
+                        start,
+                        end,
+                        first_prediction=first,
+                        defer_final=lookahead,
+                    )
+                    if lookahead:
+                        next_state, _ = self._prepare(self.pending[1], prompt, origin)
+                        next_first = sampler._ready_cross_prediction(
+                            current, next_state
+                        )
+                        if next_first is None:
+                            sampler._commit(
+                                current.positive, target, video, sound, self.cache
+                            )
+                    elif sampler.joint_forward == "cross_chunk":
+                        reasons = sampler.last_run_metrics["joint_fallbacks"]
+                        reason = "eos" if self.ended else "source_not_ready"
+                        reasons[reason] = reasons.get(reason, 0) + 1
+                    sampler.last_run_metrics["dit_forwards"] = sum(
+                        sampler._forward_counts.values()
+                    )
+                result = self._finish(ready, current, prompt, origin)
+                # Drop the completed chunk's packed inputs and scheduler
+                # temporaries before yielding; only lookahead survives decode.
+                current, first = next_state, next_first
+                ready = video = sound = None
+                self._drain_tensors = []
+                if current is not None:
+                    for layout in (current.positive, current.negative):
+                        if layout is not None:
+                            self._drain_tensors.extend(
+                                v
+                                for v in layout.values()
+                                if isinstance(v, torch.Tensor)
+                            )
+                    self._drain_tensors.extend(
+                        v for v in (current.visual, current.audio) if v is not None
+                    )
+                    if first is not None:
+                        self._drain_tensors.extend(v for v in first if v is not None)
+                yield result
+                if self.pending and current is None:
+                    current, _ = self._prepare(self.pending[0], prompt, origin)
+            finished = True
+        finally:
+            self.draining = False
+            self._drain_tensors = []
+            if not finished:
+                self.dispose()
 
     def memory_snapshot(self):
         """Retained tensor storage only; excludes allocator/workspace/output owners.
@@ -376,6 +489,7 @@ class SourceReadySession:
             if self.cache is None
             else len(self.cache.committed),
             "static_storage_bytes": storage_bytes(static),
+            "execution_storage_bytes": storage_bytes(self._drain_tensors),
         }
 
     def kv_counters(self):
@@ -400,6 +514,7 @@ class SourceReadySession:
     def dispose(self):
         if self.cache is not None:
             self.cache.clear()
+        self._drain_tensors = []
         self.pending.clear()
         self.pending_bytes = 0
         self.pending_spans = 0

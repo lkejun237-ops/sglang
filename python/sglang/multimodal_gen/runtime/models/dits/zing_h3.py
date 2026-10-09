@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCach
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
     ZingDenoiseGraphs,
 )
+from sglang.multimodal_gen.runtime.models.dits.zing_h3_joint import ZingJointTransaction
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_rope import (
     apply_contiguous_history_rope_batch,
     apply_current_rope,
@@ -147,6 +148,8 @@ class _BlockOptions(msgspec.Struct, frozen=True, kw_only=True):
     rotate_batch: object
     projection_cache: object
     projection_key: object
+    joint_ends: tuple | None = None
+    branch_projection_keys: object = None
 
 
 class _BodyInputs(msgspec.Struct, frozen=True, kw_only=True):
@@ -439,6 +442,36 @@ def _fa4_attention(q, k, v, scale, metadata=None):
     return result
 
 
+def _joint_attention(q, k, v, ends, scale, backend, metadata):
+    """Block-bidirectional branch attention; no token-level causal mask."""
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_joint_attention import (
+        fused_joint_attention,
+    )
+
+    fused = fused_joint_attention(q, k, v, ends, scale, backend)
+    if fused is not None:
+        return fused
+    history_rows = k.shape[0] - ends[-1]
+    result, start = [], 0
+    for stop in ends:
+        qs, ks, vs = q[start:stop], k[: history_rows + stop], v[: history_rows + stop]
+        with maybe_record_function("Zing.FA4" if backend == "fa4" else "Zing.SDPA"):
+            if backend == "fa4":
+                value = _fa4_attention(qs, ks, vs, scale, metadata=metadata)
+            else:
+                value = F.scaled_dot_product_attention(
+                    qs.transpose(0, 1)[None],
+                    ks.transpose(0, 1)[None],
+                    vs.transpose(0, 1)[None],
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=scale,
+                )[0].transpose(0, 1)
+        result.append(value)
+        start = stop
+    return torch.cat(result)
+
+
 def _attention(
     module,
     hidden,
@@ -458,6 +491,7 @@ def _attention(
     stage_raw_k=None,
     stage_prefix_kv=None,
     fa4_metadata=None,
+    joint_ends=None,
 ):
     if attention_backend not in {"torch_sdpa", "fa4"}:
         raise ValueError(
@@ -531,7 +565,17 @@ def _attention(
                 with maybe_record_function("Zing.history_current_KV_concat"):
                     k = torch.cat((history_k[None], k), dim=1)
                     v = torch.cat((history[1][None], v), dim=1)
-        if attention_backend == "fa4":
+        if joint_ends is not None:
+            result = _joint_attention(
+                q[0],
+                k[0],
+                v[0],
+                joint_ends,
+                module.softmax_scale,
+                attention_backend,
+                fa4_metadata,
+            )[None]
+        elif attention_backend == "fa4":
             with maybe_record_function("Zing.FA4"):
                 result = _fa4_attention(
                     q[0], k[0], v[0], module.softmax_scale, metadata=fa4_metadata
@@ -600,7 +644,11 @@ def _attention(
         # In-place QK norm leaves K as a QKV view; a capture held until the
         # commit must not keep the whole projection alive.
         raw = (raw[0].clone(), raw[1])
-    if attention_backend == "fa4":
+    if joint_ends is not None:
+        result = _joint_attention(
+            q, k, v, joint_ends, module.softmax_scale, attention_backend, fa4_metadata
+        ).reshape(hidden.shape[0], -1)
+    elif attention_backend == "fa4":
         with maybe_record_function("Zing.FA4"):
             result = _fa4_attention(
                 q, k, v, module.softmax_scale, metadata=fa4_metadata
@@ -731,7 +779,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             else None
         )
 
-    def _project_outputs(self, hidden, p, layout):
+    def _project_outputs(self, hidden, p, layout, *, joint_ends=None):
         """Project video/audio rows and restore global packed order across SP.
 
         Stable shapes gather hidden rows before projection to match SP1 GEMM
@@ -747,11 +795,28 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 hidden, sequence_splits, get_sp_group().ulysses_group, dim=0
             )
             output_vrows, output_arows = layout.vrows, layout.arows
-        video = (
-            self.final_layer.video_out(hidden.index_select(0, output_vrows).float())[0]
-            .reshape(-1, self.arch.latents_dim, p)
-            .permute(0, 2, 1)
-        )
+        video_hidden = hidden.index_select(0, output_vrows).float()
+        if joint_ends is None:
+            video_logits = self.final_layer.video_out(video_hidden)[0]
+        else:
+            # FP32 output-head GEMMs can change rounding with M. Tiny step0
+            # differences feed subsequent BF16 denoising steps, so preserve
+            # each sequential branch's projection shape. Joint transactions
+            # contain only video rows; the transformer body remains joint.
+            ends = joint_ends
+            if sequence_splits is not None and not replicated_output:
+                ends = tuple(
+                    max(0, min(stop - layout.row_start, hidden.shape[0]))
+                    for stop in ends
+                )
+            starts = (0, *ends[:-1])
+            video_logits = torch.cat(
+                [
+                    self.final_layer.video_out(video_hidden[start:stop])[0]
+                    for start, stop in zip(starts, ends)
+                ]
+            )
+        video = video_logits.reshape(-1, self.arch.latents_dim, p).permute(0, 2, 1)
         audio = self.final_layer.audio_out(
             hidden.index_select(0, output_arows).float()
         )[0]
@@ -1000,6 +1065,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         self_cache_update=None,
         host_layout: ZingHostLayout | None = None,
         host_t: torch.Tensor | None = None,
+        joint_phases: tuple[str, ...] | None = None,
     ):
         """Run one packed Zing document.
 
@@ -1049,16 +1115,31 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             audio_x,
             metadata_device=metadata_device,
         )
-        frames = self._validate_cache_inputs(
-            rows=rows,
-            clean=clean,
-            t=meta_t,
-            block_idx=meta_block,
-            position_ids=meta_positions,
-            row_role=meta_roles,
-            cache=cache,
-            self_cache_update=self_cache_update,
-        )
+        joint = None
+        if joint_phases is not None:
+            if cache is None or self_cache_update != "joint":
+                raise ValueError("Zing joint phases require a joint cache transaction")
+            joint = ZingJointTransaction(
+                cache,
+                joint_phases,
+                meta_positions,
+                meta_block,
+                meta_roles,
+                meta_t,
+                clean,
+            )
+            frames = 0
+        else:
+            frames = self._validate_cache_inputs(
+                rows=rows,
+                clean=clean,
+                t=meta_t,
+                block_idx=meta_block,
+                position_ids=meta_positions,
+                row_role=meta_roles,
+                cache=cache,
+                self_cache_update=self_cache_update,
+            )
 
         metadata = None
         projection_cache = None
@@ -1091,7 +1172,19 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             # key the batch without reading the device tensor back.
             key_unique_t = unique_t
             unique_t = host_to_device(unique_t, x.device)
-            adaln_input = F.silu(self.time_embedder(unique_t.float())).bfloat16()
+            # Sequential clean/active forwards embed one timestep at a time.
+            # Preserve those small projection batch shapes even when the main
+            # token projections share a joint traversal.
+            adaln_input = (
+                F.silu(self.time_embedder(unique_t.float())).bfloat16()
+                if joint is None
+                else torch.cat(
+                    [
+                        F.silu(self.time_embedder(t.float())).bfloat16()
+                        for t in unique_t.split(1)
+                    ]
+                )
+            )
             indices = host_to_device(
                 (t_indices * self.arch.num_modalities + layout.modality)[
                     row_start:row_stop
@@ -1148,6 +1241,18 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 cache.adaln_projection_cache.clear()
                 cache.adaln_projection_cache = None
 
+            branch_projection_keys = None
+            if joint is not None and projection_cache is not None:
+                branch_projection_keys = [
+                    projection_cache.begin(
+                        key_unique_t[i : i + 1],
+                        adaln_input[i : i + 1],
+                        self.time_embedder,
+                        self._cache_weight_generation,
+                    )
+                    for i in range(adaln_input.shape[0])
+                ]
+
             with maybe_record_function("Zing.build_RoPE_and_history_positions"):
                 rope = _rope_cos_sin_cache(
                     self.rope(host_to_device(rope_positions, x.device)[None]),
@@ -1175,7 +1280,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 with maybe_record_function("Zing.history_RoPE_plan"):
                     history_plan = cache.prepare_history_rope_plan()
             options = _BlockOptions(
-                capture=self_cache_update in {"prefix", "source", "final"},
+                capture=self_cache_update in {"prefix", "source", "final", "joint"},
                 use_cache=use_cache,
                 raw_attention=raw_attention,
                 replicated_prefix=replicated_prefix,
@@ -1186,6 +1291,8 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 rotate_batch=rotate_batch,
                 projection_cache=projection_cache,
                 projection_key=projection_key,
+                joint_ends=None if joint is None else joint.ends,
+                branch_projection_keys=branch_projection_keys,
             )
             inputs = _BodyInputs(
                 x=x,
@@ -1240,16 +1347,29 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                     if host_layout is None
                     else {"validation": (meta_positions, meta_block)}
                 )
-                cache.update(
-                    position_ids,
-                    block_idx,
-                    self_cache_update,
-                    frames,
-                    layers if self_cache_update != "active" else None,
-                    **validation,
-                )
+                if joint is not None:
+                    joint.commit(
+                        cache,
+                        position_ids,
+                        block_idx,
+                        layers,
+                        validation=None
+                        if host_layout is None
+                        else (meta_positions, meta_block),
+                    )
+                else:
+                    cache.update(
+                        position_ids,
+                        block_idx,
+                        self_cache_update,
+                        frames,
+                        layers if self_cache_update != "active" else None,
+                        **validation,
+                    )
             return video, audio
         except BaseException:
+            if joint is not None:
+                cache.clear()
             if cache is not None and cache.adaln_projection_cache is not None:
                 cache.adaln_projection_cache.clear()
             raise
@@ -1329,6 +1449,17 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         """One AdaLN projection: pre-resolved, cached, or computed in place."""
         if projections is not None:
             return projections[-1 if slot == "final" else slot]
+        if options.joint_ends is not None:
+            # Preserve sequential timestep projection shapes in the joint body.
+            parts = [
+                module(value)
+                if options.projection_cache is None
+                else options.projection_cache.project(
+                    slot, module, value, options.branch_projection_keys[i]
+                )
+                for i, value in enumerate(inputs.adaln_input.split(1))
+            ]
+            return tuple(torch.cat(values) for values in zip(*parts))
         if options.projection_cache is None:
             return module(inputs.adaln_input)
         return options.projection_cache.project(
@@ -1409,6 +1540,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 else None
             ),
             fa4_metadata=fa4_metadata,
+            joint_ends=options.joint_ends,
         )
 
     def _block_forward(
@@ -1504,7 +1636,9 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             )
         )
         hidden = self.final_layer.norm(hidden) * (1 + scale) + shift
-        video, audio = self._project_outputs(hidden, p, layout)
+        video, audio = self._project_outputs(
+            hidden, p, layout, joint_ends=options.joint_ends
+        )
         return video, audio, layers
 
     def _denoise_graph_rejection(

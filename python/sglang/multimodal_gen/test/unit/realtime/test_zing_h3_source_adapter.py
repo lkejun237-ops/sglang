@@ -595,3 +595,79 @@ def test_startup_rejects_insufficient_concurrent_transport_memory():
     )
     with pytest.raises(ValueError, match="host budget"):
         ServerArgs._validate_batching(args)
+
+
+@pytest.mark.parametrize("reason", ["ready", "timeout", "prompt", "eos", "cancelled"])
+def test_joint_wait_is_bounded_and_interruptible(configured, reason):
+    adapter, session = initialize()
+    adapter.profile.update(joint_forward="cross_chunk", joint_wait_ms=30)
+    adapter.pending_frames = 1
+    adapter.source_encoder = {"mode": "progressive"}
+
+    async def run():
+        task = asyncio.create_task(adapter.wait_for_next_chunk(session))
+        await asyncio.sleep(0.002)
+        if reason == "ready":
+            adapter.pending_frames = adapter.clip
+        elif reason == "prompt":
+            adapter.pending_prompt = ("New prompt", 2)
+        elif reason == "eos":
+            adapter.end = {"frame_end": 1}
+        elif reason == "cancelled":
+            task.cancel()
+        adapter.available.set()
+        if reason == "cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            await asyncio.wait_for(task, 0.5)
+
+    asyncio.run(run())
+    assert adapter.joint_wait["reason"] == reason
+    assert 0 <= adapter.joint_wait["actual_ms"] < 500
+    if reason == "timeout":
+        assert adapter.joint_wait["actual_ms"] >= 25
+
+
+@pytest.mark.parametrize("value", [0, -1, 1001, True, "20", float("inf"), float("nan")])
+def test_joint_wait_rejects_invalid_deployment_budget(configured, value):
+    path = (
+        __import__("pathlib").Path(configured.model_path) / "zing_realtime_profile.json"
+    )
+    profile = json.loads(path.read_text())
+    profile.update(joint_forward="cross_chunk", joint_wait_ms=value)
+    path.write_text(json.dumps(profile))
+    with pytest.raises(ValueError, match="streaming settings"):
+        initialize()
+
+
+@pytest.mark.parametrize(
+    "lengths,split,dispatched,pending,target,missing",
+    [
+        ([1, 2, 2], False, 0, 1, 9, 8),
+        ([1, 2, 2], False, 1, 1, 16, 15),
+        ([3, 2], True, 0, 1, 9, 8),
+        ([3, 2], True, 9, 1, 17, 16),
+        ([1, 2, 2], False, 0, 9, 9, 0),
+    ],
+)
+def test_auto_wait_uses_checkpoint_chunks_and_codec_watermarks(
+    configured, lengths, split, dispatched, pending, target, missing
+):
+    adapter, _ = initialize()
+    adapter.source_encoder = {"mode": "progressive"}
+    adapter.joint_plan = source.ChunkPlan(lengths, split)
+    adapter.dispatched_source_frames = dispatched
+    adapter.pending_frames = pending
+    frames, budget = adapter._joint_wait_target()
+    assert frames == target
+    assert budget == pytest.approx(missing * 1000 / 24)
+
+
+def test_joint_defaults_need_no_user_tuning(configured):
+    from sglang.multimodal_gen.configs.sample.zing_h3 import ZingH3SamplingParams
+
+    adapter, _ = initialize()
+    assert adapter.profile.get("joint_forward", "cross_chunk") == "cross_chunk"
+    assert adapter.profile.get("joint_wait_ms", "auto") == "auto"
+    assert ZingH3SamplingParams().zing_joint_forward == "cross_chunk"

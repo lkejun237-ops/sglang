@@ -183,6 +183,78 @@ class ZingBlockSamplingHelpers:
         )
         return video, audio
 
+    def _predict_joint(self, packs, phases, latent_shape, cache):
+        """Concatenate packed storage while keeping branch timesteps/modalities."""
+        names = (
+            "x",
+            "audio_x",
+            "context",
+            "t",
+            "block_idx",
+            "position_ids",
+            "row_role",
+        )
+        packed = {name: torch.cat([p[name] for p in packs]) for name in names}
+        packed["seq_lens"] = sum(p["seq_lens"] for p in packs)
+        packed["clean_seq_lens"] = sum(p["clean_seq_lens"] for p in packs)
+        metadata = [_host_metadata(p) for p in packs]
+        if all(m is not None for m in metadata):
+            packed[_HOST_LAYOUT] = ZingHostLayout(
+                **{
+                    name: (
+                        sum(getattr(m["host_layout"], name) for m in metadata)
+                        if name in {"seq_lens", "clean_seq_lens"}
+                        else torch.cat(
+                            [getattr(m["host_layout"], name) for m in metadata]
+                        )
+                    )
+                    for name in (
+                        "seq_lens",
+                        "clean_seq_lens",
+                        "block_idx",
+                        "position_ids",
+                        "row_role",
+                    )
+                }
+            )
+            packed[_HOST_T] = torch.cat([m["host_t"] for m in metadata])
+            packed[_HOST_GUARD] = tuple(
+                (name, packed[name], tensor_identity(packed[name]))
+                for name in _GUARDED_ROWS
+            )
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3_joint import (
+            ZingJointTransaction,
+            ZingJointUnsupported,
+        )
+
+        host = _host_metadata(packed)
+        layout = packed if host is None else vars(host["host_layout"])
+        try:
+            ZingJointTransaction(
+                cache,
+                phases,
+                layout["position_ids"],
+                layout["block_idx"],
+                layout["row_role"],
+                packed["t"] if host is None else host["host_t"],
+                int(layout["clean_seq_lens"].sum()),
+            )
+        except ZingJointUnsupported as error:
+            reasons = self.last_run_metrics["joint_fallbacks"]
+            reasons[str(error)] = reasons.get(str(error), 0) + 1
+            return None
+        packed["_zing_joint_phases"] = phases
+        video, _ = self._forward(packed, cache, "joint")
+        kind = "source_first" if len(phases) == 2 else "cross_chunk"
+        shapes = self.last_run_metrics.setdefault("joint_row_shapes", {}).setdefault(
+            kind, {}
+        )
+        shape = "+".join(str(p["x"].shape[0]) for p in packs)
+        shapes[shape] = shapes.get(shape, 0) + 1
+        return self.processor.unpatchify_visual(
+            video[-packs[-1]["x"].shape[0] :], 1, latent_shape
+        ), None
+
     def _commit(self, layout, block_number, video, audio, cache) -> None:
         self._set_block_latents(layout, block_number, video, audio)
         packed = self._select_block(
@@ -205,6 +277,12 @@ class ZingBlockSamplingHelpers:
                 "active": "denoise",
                 "final": "commit",
             }.get(update, update)
+            if update == "joint":
+                kind = (
+                    "source_first"
+                    if len(packed["_zing_joint_phases"]) == 2
+                    else "cross_chunk"
+                )
             counts[kind] += 1
         names = (
             "x",
@@ -223,6 +301,8 @@ class ZingBlockSamplingHelpers:
         elif update is not None:
             raise ValueError("H3 cache update requires a cache")
         kwargs.update(_host_metadata(packed) or {})
+        if update == "joint":
+            kwargs["joint_phases"] = packed["_zing_joint_phases"]
         with maybe_record_function(f"Zing.forward.{update or 'unconditional'}"):
             diagnostic = current_diagnostic()
             if diagnostic:

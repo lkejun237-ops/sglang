@@ -310,6 +310,7 @@ class ZingH3GenerationStage(PipelineStage):
                 "reference_visual_timestep", 1.0
             ),
             guidance_scale=params.guidance_scale,
+            joint_forward=getattr(params, "zing_joint_forward", "cross_chunk"),
             window_chunks=getattr(params, "zing_window_chunks", 21),
             sink_chunks=getattr(params, "zing_sink_chunks", 3),
             rope_position_mode=getattr(

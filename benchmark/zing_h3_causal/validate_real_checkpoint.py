@@ -329,6 +329,12 @@ def run_sglang(args):
     )
     destination = Path(args.output)
     destination.mkdir(parents=True, exist_ok=True)
+    if args.profile_run:
+        # The profiler's request id is shared across invocations. Keep each
+        # experiment's traces with its own report so A/B arms cannot overwrite.
+        os.environ["SGLANG_DIFFUSION_TORCH_PROFILER_DIR"] = str(
+            (destination / "traces").resolve()
+        )
     started = time.perf_counter()
     use_fsdp = args.dit_placement == "fsdp"
     use_layerwise_offload = args.dit_placement == "layerwise"
@@ -378,6 +384,7 @@ def run_sglang(args):
                         args.denoising_step_list if args.solver == "few_step" else None
                     ),
                     "zing_return_latents": True,
+                    "zing_joint_forward": args.joint_forward,
                     "zing_window_chunks": args.window_chunks,
                     "zing_sink_chunks": args.sink_chunks,
                     "zing_rope_position_mode": args.rope_position_mode,
@@ -471,6 +478,7 @@ def run_sglang(args):
                     args.denoising_step_list if args.solver == "few_step" else None
                 ),
                 "guidance_scale": args.guidance_scale,
+                "joint_forward": args.joint_forward,
                 "window_chunks": args.window_chunks,
                 "sink_chunks": args.sink_chunks,
                 "rope_position_mode": args.rope_position_mode,
@@ -502,6 +510,7 @@ def run_sglang(args):
                 "collect_rank_memory": args.collect_rank_memory,
                 "peak_memory_mib": result.peak_memory_mb,
                 "metrics": result.metrics,
+                "usage_all": [item.usage for item in results],
                 "measured_metrics": [item.metrics for item in results],
                 "usage": getattr(result, "usage", None),
                 "media": result.output_file_path,
@@ -756,6 +765,9 @@ def parser():
         default="cpu",
     )
     sglang = sub.add_parser("sglang", parents=[common])
+    sglang.add_argument(
+        "--joint-forward", choices=("off", "source_first", "cross_chunk"), default="off"
+    )
     sglang.add_argument("--window-chunks", type=int, default=21)
     sglang.add_argument(
         "--full-history", action="store_const", const=None, dest="window_chunks"

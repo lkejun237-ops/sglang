@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import io
 import json
+import math
 import tempfile
 import time
 from collections import deque
@@ -27,6 +28,7 @@ from sglang.multimodal_gen.runtime.realtime.source_transport import (
     check,
     validate_source_dimensions,
 )
+from sglang.multimodal_gen.runtime.realtime.zing_chunk_plan import ChunkPlan
 from sglang.multimodal_gen.runtime.realtime.zing_contracts import PixelRange, require
 from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
     SourceLedger,
@@ -121,6 +123,28 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             and profile.get("noise_version") == "indexed-cpu-v1",
             "The deployed model is not configured for four-step streaming.",
         )
+        joint_mode = profile.get("joint_forward", "cross_chunk")
+        wait_ms = profile.get("joint_wait_ms", "auto")
+        require(
+            joint_mode in ("off", "source_first", "cross_chunk")
+            and (
+                wait_ms == "auto"
+                or (
+                    type(wait_ms) in (int, float)
+                    and math.isfinite(wait_ms)
+                    and 0 < wait_ms <= 1000
+                    and joint_mode == "cross_chunk"
+                )
+            ),
+            "The deployed streaming settings are invalid.",
+        )
+        self.joint_wait = None
+        self.joint_plan = ChunkPlan(
+            runtime.get("num_frame_per_block", 5),
+            runtime.get("split_first_latent", False),
+        )
+        self.dispatched_source_frames = 0
+        self.joint_chunk_id = 0
         require(
             "guidance_scale" not in request.model_fields_set
             or request.guidance_scale == profile["guidance_scale"],
@@ -345,6 +369,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             )
             self.ledger.event_id = event_id
             self.pending_prompt = payload, event_id
+            self.available.set()
             await ws.send_bytes(
                 msgspec.msgpack.encode(
                     dict(
@@ -376,6 +401,81 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                 raise asyncio.CancelledError("Source session has closed")
             self.available.clear()
             await self.available.wait()
+
+        target, automatic_budget = self._joint_wait_target()
+        configured_budget = self.profile.get("joint_wait_ms", "auto")
+        budget = automatic_budget if configured_budget == "auto" else configured_budget
+        started = time.monotonic()
+        deadline = started + budget / 1000
+        reason = "disabled"
+        try:
+            while self.profile.get("joint_forward", "cross_chunk") == "cross_chunk":
+                if self.ledger.closed:
+                    reason = "cancelled"
+                    raise asyncio.CancelledError("Source session has closed")
+                if self.pending_prompt is not None:
+                    reason = "prompt"
+                    break
+                if self.end is not None:
+                    reason = "eos"
+                    break
+                if self.pending_frames >= target:
+                    reason = "ready"
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    reason = "timeout" if budget else "disabled"
+                    break
+                self.available.clear()
+                try:
+                    await asyncio.wait_for(self.available.wait(), remaining)
+                except asyncio.TimeoutError:
+                    reason = "timeout"
+                    break
+        except asyncio.CancelledError:
+            reason = "cancelled"
+            raise
+        finally:
+            self.joint_wait = dict(
+                budget_ms=budget,
+                target_frames=target,
+                policy="auto" if configured_budget == "auto" else "fixed",
+                actual_ms=(time.monotonic() - started) * 1000,
+                reason=reason,
+            )
+
+    def _joint_wait_target(self):
+        if self.source_encoder["mode"] != "progressive":
+            # Preserve first-pixel presentation while condition preparation runs.
+            target = (
+                1
+                if self.auto_source_preview and not self.dispatched_source_frames
+                else self.clip
+            )
+            return target, min(
+                1000.0,
+                max(0, target - self.pending_frames) * 1000.0 / self.config["fps"],
+            )
+
+        # The progressive clip17 codec emits at pixel watermarks 1/9/17,
+        # yielding latent ends 1/3/5. AR chunks are a separate checkpoint plan.
+        def dependency(end):
+            clips, last = divmod(end - 1, 5)
+            return clips * 17 + (1 if last == 0 else 9 if last < 3 else 17)
+
+        while (
+            dependency(self.joint_plan.chunk(self.joint_chunk_id).end)
+            <= self.dispatched_source_frames
+        ):
+            self.joint_chunk_id += 1
+        following = self.joint_plan.chunk(self.joint_chunk_id + 1)
+        target = min(
+            self.clip, dependency(following.end) - self.dispatched_source_frames
+        )
+        # Wait only for the missing source at its declared frame rate, with a
+        # hard deadline. Interrupts and the dispatch/credit limits still win.
+        missing = max(0, target - self.pending_frames)
+        return target, min(1000.0, missing * 1000.0 / self.config["fps"])
 
     def get_chunk_size(self, session, server_args, chunk):
         return self.clip
@@ -431,6 +531,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                 ),
             ]
         )
+        params.zing_joint_forward = self.profile.get("joint_forward", "cross_chunk")
         params.zing_solver = self.profile["solver"]
         params.zing_denoising_step_list = self.profile["denoising_step_list"]
         params.zing_realtime_decode_mode = "stable"
@@ -449,6 +550,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             count += item["payload"]["num_frames"]
             appends.append(item)
         self.pending_frames -= count
+        self.dispatched_source_frames += count
         end = self.end if not self.pending else None
         if self.end_dispatched:
             raise ValueError("Source end was already dispatched")
@@ -467,6 +569,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                 if self.first_source_received_unix_ns is not None
                 else None
             ),
+            joint_wait=self.joint_wait,
             dispatch_unix_ns=time.time_ns(),
             measure_cuda=self.profile.get("measure_source_cuda", False),
         )
