@@ -1006,23 +1006,8 @@ class ZingH3KVCache:
         write_current,
         rotate_batch=None,
     ):
-        # Match physical output ranges as well as raw K and coordinate versions.
-        # A surviving chunk shifted by compact must not read an old scratch view.
-        if self._chunk_plan is None:
-            if self.rope_position_mode != "absolute":
-                raise ValueError(
-                    "Zing relative RoPE requires the current attention map"
-                )
-            self._bind_chunk_positions(self.positions())
+        ranges, offset = self._chunk_ranges(layer)
         plan = self._chunk_plan
-        ranges, offset = [], 0
-        for chunk, identity, start, end, _, key in plan:
-            signature = self._raw_chunk_signature(layer, chunk, identity, start, end)
-            count = end - start
-            ranges.append(
-                (offset, offset + count, chunk.offset + start, key, signature)
-            )
-            offset += count
         reusable = set(previous)
         previous_parts = {entry[4][0]: entry for entry in previous}
         accounting = dict(
@@ -1090,6 +1075,94 @@ class ZingH3KVCache:
         # Publication follows every write, including the possibly failing tail.
         self._rotated_store_signatures[layer] = tuple(ranges)
         return keys[:total], self._chunk_value_view(chunks, values, current_values)
+
+    def _chunk_ranges(self, layer):
+        """Published-rotation entries of every history part, and their row total."""
+        # Match physical output ranges as well as raw K and coordinate versions.
+        # A surviving chunk shifted by compact must not read an old scratch view.
+        if self._chunk_plan is None:
+            if self.rope_position_mode != "absolute":
+                raise ValueError(
+                    "Zing relative RoPE requires the current attention map"
+                )
+            self._bind_chunk_positions(self.positions())
+        ranges, offset = [], 0
+        for chunk, identity, start, end, _, key in self._chunk_plan:
+            signature = self._raw_chunk_signature(layer, chunk, identity, start, end)
+            count = end - start
+            ranges.append(
+                (offset, offset + count, chunk.offset + start, key, signature)
+            )
+            offset += count
+        return ranges, offset
+
+    def reused_history_rows(self, rows):
+        """History rows if every layer attends from published rotations alone.
+
+        None when any layer would rotate history, or when the store layout
+        differs from what a pooled, chunk-reusing raw store keeps fixed. Reads
+        only host state; the raw-store observation it shares with
+        raw_attention_view is idempotent.
+        """
+        if not (
+            self.raw_store
+            and self.pooled
+            and self.chunk_rope_reuse
+            and self._chunk_plan is not None
+            and self._length + rows <= self.capacity
+        ):
+            return None
+        history = None
+        for layer in range(self.num_layers):
+            if layer not in self._stores or layer not in self._rotated_stores:
+                return None
+            self._observe_raw_store(layer)
+            ranges, offset = self._chunk_ranges(layer)
+            previous = set(self._rotated_store_signatures.get(layer, ()))
+            if any(entry not in previous for entry in ranges):
+                return None
+            history = offset
+        return history
+
+    def store_layout_signature(self):
+        """Live rows, history row runs and pooled slot addresses a captured
+        attention reads; only meaningful for a pooled store."""
+        return (
+            self._length,
+            tuple(tuple(run) for run in self._runs(self._history())),
+            tuple(
+                (t.data_ptr(), tuple(t.shape), t.stride(), t.dtype, t.device)
+                for store in self.storage
+                for t in (store.k, store.v, store.rotated_k)
+            ),
+        )
+
+    def replay_reused_attention(self):
+        """Host effects of one raw_attention_view per layer that rotated nothing.
+
+        A replayed denoise graph skips the Python of raw_attention_view, so
+        publications, coefficient pruning and reuse accounting are applied
+        here exactly as that call would for a fully reused history.
+        """
+        live = {entry[5] for entry in self._chunk_plan}
+        for layer in range(self.num_layers):
+            self._observe_raw_store(layer)
+            self._rotated_store_signatures.pop(layer, None)
+            ranges, offset = self._chunk_ranges(layer)
+            self._rope_coefficients = {
+                key: value
+                for key, value in self._rope_coefficients.items()
+                if key[0] in live
+            }
+            self.rope_reuse_stats["reused_rows"] += offset
+            self.last_rope_reuse = dict(
+                layer=layer,
+                rebuilt_rows=0,
+                reused_rows=offset,
+                coefficients_built=0,
+                reasons={},
+            )
+            self._rotated_store_signatures[layer] = tuple(ranges)
 
     def _chunk_value_view(self, chunks, values, current_values):
         """Use a contiguous V view; gather only legacy selections with gaps."""

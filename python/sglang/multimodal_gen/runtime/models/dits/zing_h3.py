@@ -7,12 +7,14 @@ time embedding, refiner, MLP and output heads as native H3.
 """
 
 import collections
+import dataclasses
 import functools
 import math
 import os
 import warnings
 from dataclasses import dataclass, field
 
+import msgspec
 import torch
 import torch.nn.functional as F
 
@@ -41,6 +43,9 @@ from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_cache import (
     ZingH3AdalnCache,
 )
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
+from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+    ZingDenoiseGraphs,
+)
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_rope import (
     apply_contiguous_history_rope_batch,
     apply_current_rope,
@@ -113,6 +118,152 @@ class _RowLayout:
     arows: torch.Tensor
     # Per-row AdaLN modality on the metadata device.
     modality: torch.Tensor
+
+
+class _DeviceFA4Metadata:
+    """FA4 lengths built by device kernels, so a graph capture copies nothing in."""
+
+    def lengths(self, q, k, v):
+        return (
+            torch.arange(2, dtype=torch.int32, device=q.device) * q.shape[0],
+            torch.arange(2, dtype=torch.int32, device=k.device) * k.shape[0],
+        )
+
+
+class _BlockOptions(msgspec.Struct, frozen=True, kw_only=True):
+    """Host decisions one forward's kernels follow."""
+
+    capture: bool
+    use_cache: bool
+    raw_attention: bool
+    replicated_prefix: bool
+    staged_prefix: bool
+    ulysses_rank: int
+    prefix_heads: int
+    history_plan: object
+    rotate_batch: object
+    projection_cache: object
+    projection_key: object
+
+
+class _BodyInputs(msgspec.Struct, frozen=True, kw_only=True):
+    """Device tensors one forward's kernels read, plus their row metadata."""
+
+    x: torch.Tensor
+    audio_x: torch.Tensor
+    context: torch.Tensor
+    layout: _RowLayout
+    adaln_input: torch.Tensor
+    indices: torch.Tensor
+    local_t_indices: torch.Tensor
+    rope: torch.Tensor
+    seq_lens: torch.Tensor
+    rows: int
+
+
+# Inputs a denoise graph reads by address; refreshed before every replay.
+_GRAPH_INPUTS = ("x", "audio_x", "context", "indices", "local_t_indices", "rope")
+_GRAPH_LAYOUT_INPUTS = (
+    "local_crows",
+    "local_vrows",
+    "local_arows",
+    "context_source",
+    "video_source",
+    "audio_source",
+    "vrows",
+    "arows",
+)
+# Kernel routes chosen from the environment at call time, frozen by a capture.
+_GRAPH_ROUTE_ENVS = (
+    "SGLANG_ZING_FUSED_CURRENT_ROPE",
+    "SGLANG_ZING_FUSED_HISTORY_ROPE",
+    "SGLANG_ZING_GROUPED_HISTORY_ROPE",
+)
+
+
+def _projection_block(projection):
+    """The dense [rows, parts * width] span its 2-D parts tile in order, or None."""
+    first = projection[0]
+    if first.dim() != 2:
+        return None
+    width = first.shape[1]
+    stride = (len(projection) * width, 1)
+    storage = first.untyped_storage().data_ptr()
+    for part, value in enumerate(projection):
+        if (
+            value.shape != first.shape
+            or value.stride() != stride
+            or value.dtype != first.dtype
+            or value.storage_offset() != first.storage_offset() + part * width
+            or value.untyped_storage().data_ptr() != storage
+        ):
+            return None
+    return first.as_strided((first.shape[0], stride[0]), stride)
+
+
+def _graph_tensors(inputs, projections):
+    tensors = {name: getattr(inputs, name) for name in _GRAPH_INPUTS}
+    for name in _GRAPH_LAYOUT_INPUTS:
+        tensors["layout." + name] = getattr(inputs.layout, name)
+    # AdaLN projections are copied by value: every denoise step of a chunk
+    # shares one graph although its projections live at other addresses.
+    for slot, projection in enumerate(projections):
+        block = _projection_block(projection)
+        if block is not None:
+            tensors[f"projection.{slot}"] = block
+            continue
+        for part, value in enumerate(projection):
+            tensors[f"projection.{slot}.{part}"] = value
+    return tensors
+
+
+def _static_projections(static, projections):
+    """Static parts with the strides and offsets of the live projections."""
+    result = []
+    for slot, projection in enumerate(projections):
+        block = static.get(f"projection.{slot}")
+        if block is None:
+            parts = (static[f"projection.{slot}.{p}"] for p in range(len(projection)))
+        else:
+            width = block.shape[1] // len(projection)
+            parts = (
+                block[:, p * width : (p + 1) * width] for p in range(len(projection))
+            )
+        result.append(tuple(parts))
+    return result
+
+
+def _static_inputs(inputs, static):
+    layout = dataclasses.replace(
+        inputs.layout,
+        **{name: static["layout." + name] for name in _GRAPH_LAYOUT_INPUTS},
+    )
+    return msgspec.structs.replace(
+        inputs, layout=layout, **{name: static[name] for name in _GRAPH_INPUTS}
+    )
+
+
+def _tensor_layout(tensor):
+    return tuple(tensor.shape), tensor.stride(), tensor.dtype, tensor.device
+
+
+def _numerics_mode():
+    """Global switches that change which kernels a capture records."""
+    matmul = torch.backends.cuda.matmul
+    return (
+        matmul.allow_tf32,
+        matmul.allow_fp16_reduced_precision_reduction,
+        matmul.allow_bf16_reduced_precision_reduction,
+        torch.are_deterministic_algorithms_enabled(),
+    )
+
+
+def _has_forward_hooks(model):
+    """Hooks run Python a replay skips, e.g. layerwise offload swapping weights."""
+    module = torch.nn.modules.module
+    if module._global_forward_pre_hooks or module._global_forward_hooks:
+        return True
+    return any(m._forward_pre_hooks or m._forward_hooks for m in model.modules())
 
 
 def causal_mask(blocks, clean_count):
@@ -507,6 +658,21 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             raise ValueError(
                 "SGLANG_ZING_EXPERIMENTAL_FA4_METADATA_REUSE must be 0 or 1"
             )
+        denoise_graph = os.environ.get("SGLANG_ZING_DENOISE_CUDA_GRAPH", "1")
+        if denoise_graph not in {"0", "1"}:
+            raise ValueError("SGLANG_ZING_DENOISE_CUDA_GRAPH must be 0 or 1")
+        denoise_graph_budget = os.environ.get(
+            "SGLANG_ZING_DENOISE_CUDA_GRAPH_MAX", "32"
+        )
+        try:
+            denoise_graph_budget = int(denoise_graph_budget)
+        except ValueError:
+            raise ValueError(
+                "SGLANG_ZING_DENOISE_CUDA_GRAPH_MAX must be an integer, "
+                f"got {denoise_graph_budget!r}"
+            ) from None
+        if denoise_graph_budget < 1:
+            raise ValueError("SGLANG_ZING_DENOISE_CUDA_GRAPH_MAX must be positive")
         for retired in (
             "SGLANG_ZING_EXPERIMENTAL_CACHED_ROPE",
             "SGLANG_ZING_EXPERIMENTAL_KV_APPEND",
@@ -542,6 +708,11 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         self.layer_names = ["blocks"]
         self.preprocess_loaded_state_dict = self._preprocess_checkpoint
         self._cache_weight_generation = 0
+        self.denoise_graphs = (
+            ZingDenoiseGraphs(max_graphs=denoise_graph_budget)
+            if denoise_graph == "1"
+            else None
+        )
 
     def _project_outputs(self, hidden, p, layout):
         """Project video/audio rows and restore global packed order across SP.
@@ -878,51 +1049,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 replicated_prefix,
                 x.device,
             )
-            sequence_splits = layout.sequence_splits
             row_start, row_stop = layout.row_start, layout.row_stop
-
-            hidden = torch.zeros(
-                (row_stop - row_start, self.arch.hidden_size),
-                dtype=torch.bfloat16,
-                device=x.device,
-            )
-            local_x = x.index_select(0, layout.video_source)
-            hidden.index_copy_(
-                0,
-                layout.local_vrows,
-                self.video_patch_proj(
-                    local_x.permute(0, 2, 1)
-                    .reshape(-1, p * self.arch.latents_dim)
-                    .float()
-                )[0].bfloat16(),
-            )
-            hidden.index_copy_(
-                0,
-                layout.local_arows,
-                self.audio_patch_proj(
-                    audio_x.index_select(0, layout.audio_source).float()
-                )[0].bfloat16(),
-            )
-            if context.shape[0]:
-                refined = self.condition_proj(context.bfloat16())[0]
-                for block in self.token_refiner.blocks:
-                    refined = (
-                        refined
-                        + _attention(
-                            block.attn,
-                            block.norm1(refined),
-                            attention_backend=self.experimental_attention_backend,
-                            fa4_metadata=metadata,
-                        )[0]
-                    )
-                    refined = refined + block.mlp(block.norm2(refined))
-                hidden.index_copy_(
-                    0,
-                    layout.local_crows,
-                    self.token_refiner.final_norm(refined)
-                    .index_select(0, layout.context_source)
-                    .to(hidden.dtype),
-                )
             unique_t, t_indices = torch.unique(meta_t, sorted=True, return_inverse=True)
             # With host row metadata this copy lets the AdaLN projection cache
             # key the batch without reading the device tensor back.
@@ -944,7 +1071,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             )
             rope_positions = (
                 attention_positions
-                if sequence_splits is not None
+                if layout.sequence_splits is not None
                 else attention_positions[row_start:row_stop]
             )
             # A replicated SP prefix is captured before head sharding. Its raw store
@@ -957,27 +1084,9 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             staged_prefix = (
                 use_cache and replicated_prefix and cache.raw_store and cache.pooled
             )
-            prefix_heads = self.arch.num_attention_heads // ulysses_size
+            weight_addresses = None
             if use_cache:
-                # The timestep constant is initialized lazily by the first forward,
-                # often under inference_mode. Preserve its values while making its
-                # version observable to the same mutation guard as other buffers.
-                frequencies = self.time_embedder._frequency_cache
-                if frequencies is not None and torch.is_inference(frequencies):
-                    with torch.inference_mode(False), torch.no_grad():
-                        self.time_embedder._frequency_cache = frequencies.clone()
-                # Parameter identity/version catches load_state_dict, device/dtype
-                # moves and normal in-place updates without GPU synchronization.
-                model_signature = tuple(
-                    cache._tensor_signature(value)
-                    for value in (*self.parameters(), *self.buffers())
-                )
-                if any(signature[1] is None for signature in model_signature):
-                    raise ValueError(
-                        "Zing cached RoPE requires versioned model parameters and buffers"
-                    )
-                cache.bind_model((self._cache_weight_generation, model_signature))
-                cache.bind_attention_positions(history_positions)
+                weight_addresses = self._bind_cache(cache, history_positions)
             projection_key = None
             if self.adaln_projection_cache_enabled and cache is not None:
                 projection_cache = cache.adaln_projection_cache
@@ -1003,14 +1112,13 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             with maybe_record_function("Zing.build_RoPE_and_history_positions"):
                 rope = _rope_cos_sin_cache(
                     self.rope(host_to_device(rope_positions, x.device)[None]),
-                    dtype=hidden.dtype,
+                    dtype=torch.bfloat16,
                 )
             mask = None
             if cache is None and not (
                 clean in (0, rows) and bool((meta_block == meta_block[0]).all())
             ):
                 mask = causal_mask(block_idx, clean)
-            capture = self_cache_update in {"prefix", "source", "final"}
             history_plan = None
             rotate_batch = None
             if raw_attention:
@@ -1027,131 +1135,55 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             ):
                 with maybe_record_function("Zing.history_RoPE_plan"):
                     history_plan = cache.prepare_history_rope_plan()
-            layers = []
-            for index, block in enumerate(self.blocks):
-                raw = None
-
-                def execute(current, value, index=index):
-                    nonlocal raw
-                    with maybe_record_function("Zing.AdaLN"):
-                        shift, scale, gate, ff_shift, ff_scale, ff_gate = (
-                            v[indices]
-                            for v in (
-                                current.adaln_proj(adaln_input)
-                                if projection_cache is None
-                                else projection_cache.project(
-                                    index,
-                                    current.adaln_proj,
-                                    adaln_input,
-                                    projection_key,
-                                )
-                            )
-                        )
-                    with maybe_record_function("Zing.norm_modulation.attention"):
-                        normed = (
-                            _native_compiled_adaln(value, current.norm1, shift, scale)
-                            if self.experimental_compiled_adaln
-                            else current.norm1(value) * (1 + scale) + shift
-                        )
-
-                    def make_history_rope(positions):
-                        return _rope_cos_sin_cache(
-                            self.rope(host_to_device(positions, value.device)[None]),
-                            dtype=value.dtype,
-                        )
-
-                    def write_current_kv(k, v, out_k, out_v):
-                        _apply_rope_kv_into(k, v, rope, out_k, out_v)
-
-                    def append_current(k, v):
-                        if raw_attention:
-                            return cache.raw_attention_view(
-                                index,
-                                k,
-                                v,
-                                make_history_rope,
-                                apply_history_rope_into,
-                                write_current_kv,
-                                history_plan=history_plan,
-                                rotate_batch=rotate_batch,
-                            )
-                        return cache.attention_view(index, k, v, write_current_kv)
-
-                    attended, raw = _attention(
-                        current.attn,
-                        normed,
-                        rope,
-                        None,
-                        None,
-                        mask,
-                        capture=capture,
-                        sequence_splits=sequence_splits,
-                        attention_backend=self.experimental_attention_backend,
-                        append_kv=(
-                            append_current
-                            if use_cache and not (replicated_prefix and cache.raw_store)
-                            else None
-                        ),
-                        capture_rotated=use_cache and cache.single_store,
-                        append_unrotated=raw_attention,
-                        capture_stored_values=raw_attention,
-                        stage_raw_k=(
-                            functools.partial(cache.stage_raw_k, index)
-                            if raw_attention
-                            else None
-                        ),
-                        stage_prefix_kv=(
-                            functools.partial(
-                                cache.stage_prefix_kv,
-                                index,
-                                head_start=ulysses_rank * prefix_heads,
-                                heads=prefix_heads,
-                            )
-                            if staged_prefix
-                            else None
-                        ),
-                        fa4_metadata=metadata,
-                    )
-                    with maybe_record_function("Zing.gated_residual.attention"):
-                        value = value + gate * attended
-                    with maybe_record_function("Zing.norm_modulation.mlp"):
-                        ff_normed = (
-                            _native_compiled_adaln(
-                                value, current.norm2, ff_shift, ff_scale
-                            )
-                            if self.experimental_compiled_adaln
-                            else current.norm2(value) * (1 + ff_scale) + ff_shift
-                        )
-                    ff_output = current.mlp(ff_normed)
-                    with maybe_record_function("Zing.gated_residual.mlp"):
-                        return value + ff_gate * ff_output
-
-                hidden = block(
-                    hidden,
-                    adaln_input=adaln_input,
-                    combined_indices=indices,
-                    rope_cache=rope,
-                    cu_seqlens=seq_lens,
-                    max_seqlen=rows,
-                    execution_override=execute,
-                )
-                if capture:
-                    layers.append(raw)
-            shift, scale = (
-                v[local_t_indices]
-                for v in (
-                    self.final_layer.adaln_proj(adaln_input)
-                    if projection_cache is None
-                    else projection_cache.project(
-                        "final",
-                        self.final_layer.adaln_proj,
-                        adaln_input,
-                        projection_key,
-                    )
-                )
+            options = _BlockOptions(
+                capture=self_cache_update in {"prefix", "source", "final"},
+                use_cache=use_cache,
+                raw_attention=raw_attention,
+                replicated_prefix=replicated_prefix,
+                staged_prefix=staged_prefix,
+                ulysses_rank=ulysses_rank,
+                prefix_heads=self.arch.num_attention_heads // ulysses_size,
+                history_plan=history_plan,
+                rotate_batch=rotate_batch,
+                projection_cache=projection_cache,
+                projection_key=projection_key,
             )
-            hidden = self.final_layer.norm(hidden) * (1 + scale) + shift
-            video, audio = self._project_outputs(hidden, p, layout)
+            inputs = _BodyInputs(
+                x=x,
+                audio_x=audio_x,
+                context=context,
+                layout=layout,
+                adaln_input=adaln_input,
+                indices=indices,
+                local_t_indices=local_t_indices,
+                rope=rope,
+                seq_lens=seq_lens,
+                rows=rows,
+            )
+            replayed, projections = None, None
+            if self_cache_update == "active" and self.denoise_graphs is not None:
+                replayed, projections = self._denoise_graph(
+                    inputs,
+                    options=options,
+                    cache=cache,
+                    host_layout=host_layout,
+                    ulysses_size=ulysses_size,
+                    mask=mask,
+                    p=p,
+                    weight_addresses=weight_addresses,
+                )
+            if replayed is None:
+                video, audio, layers = self._forward_body(
+                    inputs,
+                    options=options,
+                    cache=cache,
+                    mask=mask,
+                    p=p,
+                    projections=projections,
+                    fa4_metadata=metadata,
+                )
+            else:
+                (video, audio), layers = replayed, []
             # Commit after all model work succeeds, so a failed output head cannot
             # leave a partially advanced session.
             if cache is not None:
@@ -1185,6 +1217,374 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         finally:
             if metadata is not None:
                 metadata.clear()
+
+    def _bind_cache(self, cache, history_positions):
+        # The timestep constant is initialized lazily by the first forward,
+        # often under inference_mode. Preserve its values while making its
+        # version observable to the same mutation guard as other buffers.
+        frequencies = self.time_embedder._frequency_cache
+        if frequencies is not None and torch.is_inference(frequencies):
+            with torch.inference_mode(False), torch.no_grad():
+                self.time_embedder._frequency_cache = frequencies.clone()
+        # Parameter identity/version catches load_state_dict, device/dtype
+        # moves and normal in-place updates without GPU synchronization.
+        values = (*self.parameters(), *self.buffers())
+        model_signature = tuple(cache._tensor_signature(value) for value in values)
+        if any(signature[1] is None for signature in model_signature):
+            raise ValueError(
+                "Zing cached RoPE requires versioned model parameters and buffers"
+            )
+        cache.bind_model((self._cache_weight_generation, model_signature))
+        cache.bind_attention_positions(history_positions)
+        if self.denoise_graphs is None:
+            return None
+        # A .data swap keeps identity and version; a captured graph reads addresses.
+        return tuple(value.data_ptr() for value in values)
+
+    def _embed_inputs(self, inputs, p, fa4_metadata):
+        layout = inputs.layout
+        x, context = inputs.x, inputs.context
+        hidden = torch.zeros(
+            (layout.row_stop - layout.row_start, self.arch.hidden_size),
+            dtype=torch.bfloat16,
+            device=x.device,
+        )
+        local_x = x.index_select(0, layout.video_source)
+        hidden.index_copy_(
+            0,
+            layout.local_vrows,
+            self.video_patch_proj(
+                local_x.permute(0, 2, 1).reshape(-1, p * self.arch.latents_dim).float()
+            )[0].bfloat16(),
+        )
+        hidden.index_copy_(
+            0,
+            layout.local_arows,
+            self.audio_patch_proj(
+                inputs.audio_x.index_select(0, layout.audio_source).float()
+            )[0].bfloat16(),
+        )
+        if context.shape[0]:
+            refined = self.condition_proj(context.bfloat16())[0]
+            for block in self.token_refiner.blocks:
+                refined = (
+                    refined
+                    + _attention(
+                        block.attn,
+                        block.norm1(refined),
+                        attention_backend=self.experimental_attention_backend,
+                        fa4_metadata=fa4_metadata,
+                    )[0]
+                )
+                refined = refined + block.mlp(block.norm2(refined))
+            hidden.index_copy_(
+                0,
+                layout.local_crows,
+                self.token_refiner.final_norm(refined)
+                .index_select(0, layout.context_source)
+                .to(hidden.dtype),
+            )
+        return hidden
+
+    def _projection(self, slot, module, inputs, options, projections):
+        """One AdaLN projection: pre-resolved, cached, or computed in place."""
+        if projections is not None:
+            return projections[-1 if slot == "final" else slot]
+        if options.projection_cache is None:
+            return module(inputs.adaln_input)
+        return options.projection_cache.project(
+            slot, module, inputs.adaln_input, options.projection_key
+        )
+
+    def _block_attention(
+        self,
+        current,
+        value,
+        normed,
+        *,
+        index,
+        inputs,
+        options,
+        cache,
+        mask,
+        fa4_metadata,
+    ):
+        """One block's self-attention; returns the output and its raw capture."""
+        rope = inputs.rope
+
+        def make_history_rope(positions):
+            return _rope_cos_sin_cache(
+                self.rope(host_to_device(positions, value.device)[None]),
+                dtype=value.dtype,
+            )
+
+        def write_current_kv(k, v, out_k, out_v):
+            _apply_rope_kv_into(k, v, rope, out_k, out_v)
+
+        def append_current(k, v):
+            if options.raw_attention:
+                return cache.raw_attention_view(
+                    index,
+                    k,
+                    v,
+                    make_history_rope,
+                    apply_history_rope_into,
+                    write_current_kv,
+                    history_plan=options.history_plan,
+                    rotate_batch=options.rotate_batch,
+                )
+            return cache.attention_view(index, k, v, write_current_kv)
+
+        return _attention(
+            current.attn,
+            normed,
+            rope,
+            None,
+            None,
+            mask,
+            capture=options.capture,
+            sequence_splits=inputs.layout.sequence_splits,
+            attention_backend=self.experimental_attention_backend,
+            append_kv=(
+                append_current
+                if options.use_cache
+                and not (options.replicated_prefix and cache.raw_store)
+                else None
+            ),
+            capture_rotated=options.use_cache and cache.single_store,
+            append_unrotated=options.raw_attention,
+            capture_stored_values=options.raw_attention,
+            stage_raw_k=(
+                functools.partial(cache.stage_raw_k, index)
+                if options.raw_attention
+                else None
+            ),
+            stage_prefix_kv=(
+                functools.partial(
+                    cache.stage_prefix_kv,
+                    index,
+                    head_start=options.ulysses_rank * options.prefix_heads,
+                    heads=options.prefix_heads,
+                )
+                if options.staged_prefix
+                else None
+            ),
+            fa4_metadata=fa4_metadata,
+        )
+
+    def _block_forward(
+        self,
+        current,
+        value,
+        *,
+        index,
+        inputs,
+        options,
+        cache,
+        mask,
+        projections,
+        fa4_metadata,
+    ):
+        """One main block: modulated attention and MLP; returns output and capture."""
+        with maybe_record_function("Zing.AdaLN"):
+            shift, scale, gate, ff_shift, ff_scale, ff_gate = (
+                v[inputs.indices]
+                for v in self._projection(
+                    index, current.adaln_proj, inputs, options, projections
+                )
+            )
+        with maybe_record_function("Zing.norm_modulation.attention"):
+            normed = (
+                _native_compiled_adaln(value, current.norm1, shift, scale)
+                if self.experimental_compiled_adaln
+                else current.norm1(value) * (1 + scale) + shift
+            )
+        attended, raw = self._block_attention(
+            current,
+            value,
+            normed,
+            index=index,
+            inputs=inputs,
+            options=options,
+            cache=cache,
+            mask=mask,
+            fa4_metadata=fa4_metadata,
+        )
+        with maybe_record_function("Zing.gated_residual.attention"):
+            value = value + gate * attended
+        with maybe_record_function("Zing.norm_modulation.mlp"):
+            ff_normed = (
+                _native_compiled_adaln(value, current.norm2, ff_shift, ff_scale)
+                if self.experimental_compiled_adaln
+                else current.norm2(value) * (1 + ff_scale) + ff_shift
+            )
+        ff_output = current.mlp(ff_normed)
+        with maybe_record_function("Zing.gated_residual.mlp"):
+            return value + ff_gate * ff_output, raw
+
+    def _forward_body(
+        self, inputs, *, options, cache, mask, p, projections, fa4_metadata
+    ):
+        """Every kernel after host preparation; returns video, audio and captures."""
+        layout, rope = inputs.layout, inputs.rope
+        hidden = self._embed_inputs(inputs, p, fa4_metadata)
+        layers = []
+        for index, block in enumerate(self.blocks):
+            raw = None
+
+            def execute(current, value, index=index):
+                nonlocal raw
+                value, raw = self._block_forward(
+                    current,
+                    value,
+                    index=index,
+                    inputs=inputs,
+                    options=options,
+                    cache=cache,
+                    mask=mask,
+                    projections=projections,
+                    fa4_metadata=fa4_metadata,
+                )
+                return value
+
+            hidden = block(
+                hidden,
+                adaln_input=inputs.adaln_input,
+                combined_indices=inputs.indices,
+                rope_cache=rope,
+                cu_seqlens=inputs.seq_lens,
+                max_seqlen=inputs.rows,
+                execution_override=execute,
+            )
+            if options.capture:
+                layers.append(raw)
+        shift, scale = (
+            v[inputs.local_t_indices]
+            for v in self._projection(
+                "final", self.final_layer.adaln_proj, inputs, options, projections
+            )
+        )
+        hidden = self.final_layer.norm(hidden) * (1 + scale) + shift
+        video, audio = self._project_outputs(hidden, p, layout)
+        return video, audio, layers
+
+    def _denoise_graph_rejection(
+        self, inputs, *, options, cache, host_layout, ulysses_size, mask
+    ):
+        """Why this denoise forward cannot use a graph, or None."""
+        if self.denoise_graphs.disabled:
+            return "graphs_disabled"
+        if not self.denoise_graphs.backend.supports(inputs.x.device):
+            return "device"
+        if ulysses_size != 1:
+            return "sequence_parallel"
+        if host_layout is None:
+            return "device_metadata"
+        if _has_forward_hooks(self):
+            return "module_hooks"
+        if not (cache.pooled and options.raw_attention):
+            return "unpooled"
+        if options.projection_cache is None or options.projection_key is None:
+            return "adaln_cache"
+        if options.history_plan is not None:
+            return "history_rope_plan"
+        if not cache.chunk_rope_reuse:
+            return "chunk_rope_reuse_off"
+        if inputs.context.shape[0] or mask is not None:
+            return "context"
+        return None
+
+    def _denoise_graph(
+        self,
+        inputs,
+        *,
+        options,
+        cache,
+        host_layout,
+        ulysses_size,
+        mask,
+        p,
+        weight_addresses,
+    ):
+        """Replay or capture a denoise forward; returns (outputs or None, projections).
+
+        Projections resolved here are passed to an eager fallback too, so the
+        AdaLN cache sees exactly one lookup per slot either way.
+        """
+        graphs = self.denoise_graphs
+        reason = self._denoise_graph_rejection(
+            inputs,
+            options=options,
+            cache=cache,
+            host_layout=host_layout,
+            ulysses_size=ulysses_size,
+            mask=mask,
+        )
+        if reason is not None:
+            graphs.count(reason)
+            return None, None
+        projections = [
+            self._projection(index, block.adaln_proj, inputs, options, None)
+            for index, block in enumerate(self.blocks)
+        ]
+        projections.append(
+            self._projection(
+                "final", self.final_layer.adaln_proj, inputs, options, None
+            )
+        )
+        rows = inputs.layout.row_stop - inputs.layout.row_start
+        history = cache.reused_history_rows(rows)
+        if history is None:
+            graphs.count("rope_rebuild")
+            return None, projections
+        tensors = _graph_tensors(inputs, projections)
+        key = self._denoise_graph_key(
+            tensors=tensors,
+            cache=cache,
+            history=history,
+            rows=rows,
+            weight_addresses=weight_addresses,
+        )
+        stats = dict(cache.rope_reuse_stats)
+
+        def capture(static):
+            # A backend may warm up before capturing; account one forward only.
+            cache.rope_reuse_stats.update(stats)
+            video, audio, _ = self._forward_body(
+                _static_inputs(inputs, static),
+                options=options,
+                cache=cache,
+                mask=None,
+                p=p,
+                projections=_static_projections(static, projections),
+                fa4_metadata=_DeviceFA4Metadata(),
+            )
+            return video, audio
+
+        outputs = graphs.run(
+            key,
+            tensors=tensors,
+            capture=capture,
+            replay_host=cache.replay_reused_attention,
+        )
+        if outputs is None:
+            # A failed warm-up may have run part of the forward's Python.
+            cache.rope_reuse_stats.update(stats)
+        return outputs, projections
+
+    def _denoise_graph_key(self, *, tensors, cache, history, rows, weight_addresses):
+        """Everything a captured forward reads by address or decides on the host."""
+        return (
+            self._cache_weight_generation,
+            weight_addresses,
+            tuple((name, _tensor_layout(t)) for name, t in tensors.items()),
+            cache.store_layout_signature(),
+            (history, rows),
+            tuple(os.environ.get(name) for name in _GRAPH_ROUTE_ENVS),
+            _numerics_mode(),
+            self.experimental_compiled_adaln,
+            self.experimental_attention_backend,
+        )
 
 
 EntryClass = ZingH3DiTModel

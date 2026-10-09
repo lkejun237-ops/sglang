@@ -14,6 +14,8 @@
 | `EXPERIMENTAL_STABLE_SHAPES` | `1` | 已开启稳定形状 |
 | `EXPERIMENTAL_COMPILED_ADALN` | `1` | 已开启编译 AdaLN |
 | `EXPERIMENTAL_FA4_METADATA_REUSE` | `1` | 已开启 forward 内 FA4 长度元数据复用 |
+| `DENOISE_CUDA_GRAPH` | `1`（本次开启） | 用 CUDA graph 回放历史 RoPE 全部复用的 denoise forward，与 eager 逐位一致；仅 SP1 + KV 池，其他场景自动走 eager；预热失败回退 eager；捕获失败会停用 graph 并报错，建议重启进程 |
+| `DENOISE_CUDA_GRAPH_MAX` | `32` | 每个模型保留的 denoise graph 上限（LRU）；多会话时 key 含各自的 KV 槽地址 |
 | `MINIMAX_H3_PROGRESSIVE_ENCODER_TILING`（完整名称） | `auto` | 渐进 source 编码按已有条件自动选择 tile 并行 |
 
 Q/K fused RMSNorm、store-backed KV / fused KV write、移除 DiT / sampler

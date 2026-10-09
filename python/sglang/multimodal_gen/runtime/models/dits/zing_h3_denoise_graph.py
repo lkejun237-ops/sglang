@@ -1,0 +1,194 @@
+# SPDX-License-Identifier: Apache-2.0
+"""CUDA graph replay of Zing denoise forwards whose history rotations are all reused.
+
+The model decides eligibility and builds the key: everything a captured
+forward reads by address or decides on the host. This module owns warm-up,
+capture, replay and the bounded graph set. Static input tensors are allocated
+outside the graph pool and refreshed before every replay.
+"""
+
+import collections
+
+import torch
+
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
+# Arbitrary; often enough to read a hit rate from a benchmark log.
+_ROUTE_LOG_INTERVAL = 256
+
+
+class GraphWarmupError(RuntimeError):
+    """The eager warm-up before a capture failed; nothing was captured."""
+
+
+class CudaGraphBackend:
+    """Captures torch.cuda.CUDAGraph objects into one shared memory pool.
+
+    Graphs never run concurrently and every output is cloned right after its
+    replay, so a later capture may reuse memory an earlier graph freed.
+    """
+
+    def __init__(self):
+        self.capturing = False
+        self._pool = None
+        # One side stream for every capture: graphs bake in per-stream state
+        # such as the cuBLAS workspace, and pooled streams would scatter it.
+        self._stream = None
+
+    def supports(self, device):
+        return device.type == "cuda" and torch.version.hip is None
+
+    def capture(self, fn):
+        current = torch.cuda.current_stream()
+        if self._stream is None:
+            self._stream = torch.cuda.Stream()
+        stream = self._stream
+        stream.wait_stream(current)
+        try:
+            # Lazy initialization (cuBLAS workspaces, Triton and FA4 compilation)
+            # must happen on the capture stream before capturing.
+            try:
+                with torch.cuda.stream(stream):
+                    fn()
+            except Exception as error:
+                raise GraphWarmupError("Zing denoise graph warm-up failed") from error
+            current.wait_stream(stream)
+            if self._pool is None:
+                self._pool = torch.cuda.graph_pool_handle()
+            graph = torch.cuda.CUDAGraph()
+            self.capturing = True
+            # Other threads (decoders, encoders) keep using CUDA meanwhile.
+            with torch.cuda.graph(
+                graph,
+                pool=self._pool,
+                stream=stream,
+                capture_error_mode="thread_local",
+            ):
+                outputs = fn()
+        finally:
+            self.capturing = False
+            # torch.cuda.graph.__exit__ leaves the capture stream current when
+            # capture_end raises on an invalidated capture.
+            torch.cuda.set_stream(current)
+            current.wait_stream(stream)
+        return graph, outputs
+
+    def replay(self, graph):
+        graph.replay()
+
+
+class _Entry:
+    def __init__(self, graph, static, outputs):
+        self.graph = graph
+        self.static = static
+        self.outputs = outputs
+        # _foreach_copy_ takes its fused path only within one dtype.
+        names = collections.defaultdict(list)
+        for name, tensor in static.items():
+            names[tensor.dtype].append(name)
+        self.copies = tuple(
+            (group, [static[name] for name in group]) for group in names.values()
+        )
+
+    def refresh(self, tensors):
+        for names, static in self.copies:
+            torch._foreach_copy_(static, [tensors[name] for name in names])
+
+
+class ZingDenoiseGraphs:
+    """Model-owned graphs keyed by everything a captured denoise forward reads.
+
+    A key is captured on its second sighting, so the first forward of every
+    new shape runs eager and warms its kernels. ``routes`` counts one outcome
+    per denoise forward: an ineligibility reason, warmup, capture, replay,
+    warmup_failed, capture_failed or graphs_disabled. A failed warm-up runs
+    eager and keeps graphs enabled. A capture failure disables graphs for
+    this model and propagates: a failed CUDA capture can leave RNG and allocator
+    state unusable, so that forward cannot fall back to eager.
+    """
+
+    def __init__(self, *, backend=None, max_graphs=32):
+        if max_graphs < 1:
+            raise ValueError("Zing denoise graph budget must be positive")
+        self.backend = CudaGraphBackend() if backend is None else backend
+        self.max_graphs = max_graphs
+        self.routes = collections.Counter()
+        self.graphs = collections.OrderedDict()
+        self._seen = collections.OrderedDict()
+        self.disabled = False
+        self._routed = 0
+
+    def count(self, route):
+        self.routes[route] += 1
+        self._routed += 1
+        if self._routed % _ROUTE_LOG_INTERVAL == 0:
+            logger.info("Zing denoise graph routes: %s", dict(self.routes))
+
+    def run(self, key, *, tensors, capture, replay_host):
+        """Outputs of this forward, or None when it must run eager.
+
+        ``capture(static)`` runs the forward on the static copies of
+        ``tensors``. ``replay_host()`` applies the host effects that a replay
+        skips; a capture applies them by running the forward's Python.
+        """
+        if self.disabled:
+            self.count("graphs_disabled")
+            return None
+        entry = self.graphs.get(key)
+        first_sighting = key not in self._seen
+        self._remember(key)
+        if entry is None:
+            if first_sighting:
+                self.count("warmup")
+                return None
+            entry = self._capture(key, tensors, capture)
+            if entry is None:
+                return None
+            self.count("capture")
+        else:
+            self.graphs.move_to_end(key)
+            entry.refresh(tensors)
+            replay_host()
+            self.count("replay")
+        self.backend.replay(entry.graph)
+        return tuple(output.clone() for output in entry.outputs)
+
+    def _disable(self):
+        self.disabled = True
+        self.graphs.clear()
+        self._seen.clear()
+        self.count("capture_failed")
+        logger.error(
+            "Zing denoise graph capture failed; denoise graphs are disabled for "
+            "this model. The process CUDA state may be unusable; a restart is "
+            "recommended",
+            exc_info=True,
+        )
+
+    def _remember(self, key):
+        self._seen[key] = None
+        self._seen.move_to_end(key)
+        while len(self._seen) > 4 * self.max_graphs:
+            self._seen.popitem(last=False)
+
+    def _capture(self, key, tensors, capture):
+        static = {name: tensor.clone() for name, tensor in tensors.items()}
+        try:
+            graph, outputs = self.backend.capture(lambda: capture(static))
+        except GraphWarmupError:
+            # No capture began, so CUDA state is intact: run this forward eager
+            # and warm the key up again before the next attempt.
+            self._seen.pop(key, None)
+            self.count("warmup_failed")
+            logger.warning("Zing denoise graph warm-up failed", exc_info=True)
+            return None
+        except Exception:
+            self._disable()
+            raise
+        entry = _Entry(graph, static, outputs)
+        self.graphs[key] = entry
+        while len(self.graphs) > self.max_graphs:
+            self.graphs.popitem(last=False)
+        return entry
