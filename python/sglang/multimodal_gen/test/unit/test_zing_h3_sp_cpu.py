@@ -57,6 +57,7 @@ class _CPUCollectives:
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("count", [4, 5])
 @pytest.mark.parametrize("world", [2, 4])
 @pytest.mark.parametrize("reference_prefix", [False, True])
 def test_real_projections_rope_and_committed_kv_match_cpu_sp1(
@@ -64,13 +65,32 @@ def test_real_projections_rope_and_committed_kv_match_cpu_sp1(
     monkeypatch,
     world,
     reference_prefix,
+    count,
 ):
+    if count == 5:
+        arch = replace(
+            model.arch,
+            num_modalities=5,
+            adaln_out_features=6 * 5 * model.arch.hidden_size,
+            modality_tags=dict(
+                video=4, text=0, audio=3, source_visual=1, condition_visual=2
+            ),
+        )
+        model = zing_h3.ZingH3DiTModel(ZingH3DiTConfig(arch_config=arch), {}).eval()
+        torch.manual_seed(7)
+        for name, param in model.named_parameters():
+            param.copy_(
+                torch.ones_like(param)
+                if "norm" in name and name.endswith("weight")
+                else torch.randn_like(param) * 0.08
+            )
+        model.rope.inv_freq.fill_(1)
     if world == 4:
         arch = replace(
             model.arch,
             num_attention_heads=4,
             hidden_size=32,
-            adaln_out_features=768,
+            adaln_out_features=6 * count * 32,
             final_adaln_out_features=64,
         )
         model = zing_h3.ZingH3DiTModel(ZingH3DiTConfig(arch_config=arch), {}).eval()

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Zing's four-modality causal execution over the shared H3 parameter modules.
+"""Zing's four/five-modality causal execution over the shared H3 parameter modules.
 
 The checkpoint has separate Q/K/V and value|gate SwiGLU matrices. The H3
 loader converts these once; execution uses the same projections, RMSNorms,
@@ -19,6 +19,9 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
+from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
+    resolve_zing_modality_tags,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_group,
     get_ulysses_ctx,
@@ -686,8 +689,22 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                     stacklevel=2,
                 )
         arch = config.arch_config
-        if arch.num_modalities != 4 or arch.adaln_out_features != 24 * arch.hidden_size:
-            raise ValueError("Zing requires the trained four-modality AdaLN checkpoint")
+        self.modality_tags = resolve_zing_modality_tags(
+            arch.num_modalities, arch.modality_tags
+        )
+        if arch.adaln_out_features != 6 * arch.num_modalities * arch.hidden_size:
+            raise ValueError("Zing AdaLN width must match the trained modality count")
+        if arch.final_adaln_out_features != 2 * arch.hidden_size:
+            raise ValueError("Zing final AdaLN width must be 2 * hidden_size")
+        for value in (arch.ar_condition_timestep, arch.reference_visual_timestep):
+            if (
+                type(value) not in (int, float)
+                or not math.isfinite(value)
+                or not 0 <= value <= 1
+            ):
+                raise ValueError(
+                    "Zing condition timesteps must be finite and within [0, 1]"
+                )
         if quant_config is not None or arch.adaln_curve_grid is not None or kwargs:
             raise ValueError(
                 "Zing dense inference requires unquantized full AdaLN weights"
@@ -764,8 +781,8 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             audio = logits[:, video_width:].index_select(0, layout.arows)
         return video, audio
 
-    @staticmethod
     def _row_layout(
+        self,
         row_role,
         host_layout,
         rows,
@@ -775,7 +792,13 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         device,
     ):
         """Row selections for this rank; host layouts cache their device copies."""
-        key = (ulysses_size, ulysses_rank, replicated_prefix, device)
+        key = (
+            ulysses_size,
+            ulysses_rank,
+            replicated_prefix,
+            device,
+            tuple(sorted(self.modality_tags.items())),
+        )
         if host_layout is not None and key in host_layout.derived:
             return host_layout.derived[key]
         sequence_splits = (
@@ -805,8 +828,12 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 compact_indices[row_start:row_stop][local_mask], device
             )
 
-        modality = torch.zeros_like(row_role)
-        modality[row_role == 0], modality[arows], modality[row_role == 7] = 1, 2, 3
+        tags = self.modality_tags
+        modality = torch.full_like(row_role, tags["video"])
+        modality[row_role == 0] = tags["text"]
+        modality[arows] = tags["audio"]
+        modality[row_role == 7] = tags["source_visual"]
+        modality[row_role == 1] = tags["condition_visual"]
         layout = _RowLayout(
             sequence_splits=sequence_splits,
             row_start=row_start,
@@ -943,8 +970,17 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         if cache is not None:
             if clean != (0 if self_cache_update == "active" else rows):
                 raise ValueError("Zing clean row count does not match the KV phase")
-            if self_cache_update != "active" and not bool((t == 1).all()):
-                raise ValueError("Only clean t=1 states may enter the Zing KV cache")
+            if self_cache_update != "active":
+                expected_t = torch.ones_like(t)
+                if self_cache_update == "prefix":
+                    expected_t[(row_role == 0) | (row_role == 1)] = (
+                        self.arch.ar_condition_timestep
+                    )
+                    expected_t[row_role == 4] = self.arch.reference_visual_timestep
+                if not torch.equal(t, expected_t):
+                    raise ValueError(
+                        "Only clean t=1 states or checkpoint-defined prefix timesteps may enter the Zing KV cache"
+                    )
             cache.validate(position_ids, block_idx, self_cache_update, frames)
         return frames
 
@@ -1057,7 +1093,10 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             unique_t = host_to_device(unique_t, x.device)
             adaln_input = F.silu(self.time_embedder(unique_t.float())).bfloat16()
             indices = host_to_device(
-                (t_indices * 4 + layout.modality)[row_start:row_stop], x.device
+                (t_indices * self.arch.num_modalities + layout.modality)[
+                    row_start:row_stop
+                ],
+                x.device,
             )
             local_t_indices = host_to_device(t_indices[row_start:row_stop], x.device)
             attention_positions, history_positions = (

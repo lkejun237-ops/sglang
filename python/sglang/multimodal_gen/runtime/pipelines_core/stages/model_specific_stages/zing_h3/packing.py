@@ -9,21 +9,22 @@ model loading, device placement, codecs and sampling belong to SGLang.
 from __future__ import annotations
 
 import math
-from itertools import accumulate, cycle, islice
 from dataclasses import dataclass
 from enum import IntEnum
+from fractions import Fraction
+from itertools import accumulate, cycle, islice
 from typing import Any
 
 import numpy as np
 import torch
-from sglang.multimodal_gen.runtime.realtime.zing_chunk_plan import (
-    ChunkPlan,
-    TemporalChunk,
-)
 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_tokens import (
     minimax_h3_patchify_video_latent,
     minimax_h3_unpatchify_video_tokens,
+)
+from sglang.multimodal_gen.runtime.realtime.zing_chunk_plan import (
+    ChunkPlan,
+    TemporalChunk,
 )
 
 
@@ -121,6 +122,13 @@ class ZingH3Packer:
         ChunkPlan(num_frame_per_block, split_first_latent)
         self.num_frame_per_block = num_frame_per_block
         self.split_first_latent = split_first_latent
+        # Native DMD configs retain exact rational strings such as "5/3".
+        # Match the native parser, then preserve the existing FP64 grid arithmetic.
+        try:
+            spatial_extent = float(spatial_extent)
+            frame_scale = float(Fraction(frame_scale))
+        except (TypeError, ValueError, ZeroDivisionError, OverflowError) as exc:
+            raise ValueError("Invalid Zing block or RoPE geometry") from exc
         self.rope_spatial_extent, self.rope_frame_scale = spatial_extent, frame_scale
         self.visual_token_frame_spans = tuple(visual_token_frame_spans)
         if (

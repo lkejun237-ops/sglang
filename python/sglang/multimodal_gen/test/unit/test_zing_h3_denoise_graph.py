@@ -13,12 +13,14 @@ import os
 import pathlib
 import subprocess
 import sys
+from dataclasses import replace
 
 import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 import sglang
+from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import ZingH3DiTConfig
 from sglang.multimodal_gen.runtime.models.dits import zing_h3
 from sglang.multimodal_gen.runtime.models.dits.zing_h3 import ZingH3DiTModel
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
@@ -370,9 +372,29 @@ def _weight_swap(model):
         "one_graph",
     ],
 )
-def test_graph_replay_matches_eager_bitwise(model, monkeypatch, case):
+@pytest.mark.parametrize("count", [4, 5])
+def test_graph_replay_matches_eager_bitwise(model, monkeypatch, case, count):
     """Replays must refresh every input that changes under one key, and a key
     must change whenever a captured address (weights, projections) moves."""
+    if count == 5:
+        arch = replace(
+            model.arch,
+            num_modalities=5,
+            adaln_out_features=6 * 5 * model.arch.hidden_size,
+            modality_tags=dict(
+                video=4, text=0, audio=3, source_visual=1, condition_visual=2
+            ),
+        )
+        model = ZingH3DiTModel(ZingH3DiTConfig(arch_config=arch), {}).eval()
+        torch.manual_seed(7)
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                param.copy_(
+                    torch.ones_like(param)
+                    if "norm" in name and name.endswith("weight")
+                    else torch.randn_like(param) * 0.08
+                )
+            model.rope.inv_freq.fill_(1)
     perturb = {"history_k_write": _write_history_k, "weight_swap": _weight_swap(model)}
     perturb = perturb.get(case)
     session = {"rope_position_mode": "absolute"} if case == "absolute_rope" else {}

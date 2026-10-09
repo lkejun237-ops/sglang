@@ -925,3 +925,135 @@ def test_taeh3_stage_preserves_frames_and_block_provenance(pattern, latent_end, 
         assert state.video_decoder is None and state.decoder_frames is None
     finally:
         torch.set_num_threads(threads)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("count", [4, 5])
+def test_permuted_modality_routing_preserves_forward_and_committed_kv(model, count):
+    from dataclasses import replace
+
+    roles = ["video", "text", "audio", "source_visual"]
+    if count == 5:
+        roles.append("condition_visual")
+    canonical = dict(zip(roles, range(count)))
+    permuted = (
+        dict(video=2, text=0, audio=3, source_visual=1, condition_visual=2)
+        if count == 4
+        else dict(video=4, text=0, audio=3, source_visual=1, condition_visual=2)
+    )
+    arch = replace(
+        model.arch,
+        num_modalities=count,
+        adaln_out_features=6 * count * model.arch.hidden_size,
+        modality_tags=canonical,
+        ar_condition_timestep=0.875,
+        reference_visual_timestep=0.999,
+    )
+    reference = ZingH3DiTModel(ZingH3DiTConfig(arch_config=arch), {}).eval()
+    # Initialize every parameter, including the independent fifth branch.
+    torch.manual_seed(7)
+    for name, param in reference.named_parameters():
+        param.copy_(
+            torch.ones_like(param)
+            if "norm" in name and name.endswith("weight")
+            else torch.randn_like(param) * 0.08
+        )
+    reference.rope.inv_freq.fill_(1)
+    candidate = ZingH3DiTModel(
+        ZingH3DiTConfig(arch_config=replace(arch, modality_tags=permuted)), {}
+    ).eval()
+    weights = {key: value.clone() for key, value in reference.state_dict().items()}
+    for layer in range(arch.num_layers):
+        prefix = f"blocks.{layer}.adaln_proj.linear."
+        for suffix in ("weight", "bias"):
+            parts = weights[prefix + suffix].chunk(count, dim=0)
+            weights[prefix + suffix] = torch.cat(
+                [
+                    parts[canonical[role]]
+                    for role in sorted(roles, key=permuted.__getitem__)
+                ],
+                dim=0,
+            )
+    candidate.load_state_dict(weights)
+    packer, inputs, visual, audio = request(reference)
+    inputs.visual = {"ref": torch.randn(1, 2, 1, 2, 2)}
+    inputs.media = [{"id": "ref", "type": "image"}]
+    inputs.conditions = [{"content_id": "ref", "role": "reference"}]
+    layout = packer.pack_inference_layout(inputs, inputs.positive, visual, audio)
+    samplers = [
+        ZingH3Sampler(
+            current,
+            packer,
+            sigma_points=3,
+            ar_condition_timestep=0.875,
+            reference_visual_timestep=0.999,
+        )
+        for current in (reference, candidate)
+    ]
+    for sampler in samplers:
+        sampler.device = torch.device("cpu")
+    caches = [ZingH3KVCache(arch.num_layers) for _ in samplers]
+    # Reuse one host layout across both models to catch derived-cache tag aliasing.
+    for block, phase in [(0, "prefix"), (1, "source"), (2, "active"), (2, "final")]:
+        packed = samplers[0]._select_block(
+            layout,
+            block,
+            phase="target" if phase in ("active", "final") else phase,
+            video_t=0.25,
+            audio_t=0.4,
+            final=phase == "final",
+        )
+        outputs = [
+            sampler._forward(packed, cache, phase)
+            for sampler, cache in zip(samplers, caches)
+        ]
+        for actual, expected in zip(outputs[1], outputs[0]):
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        if phase != "active":
+            for layer in range(arch.num_layers):
+                actual, expected = caches[1].history(layer), caches[0].history(layer)
+                for got, want in zip(actual, expected):
+                    torch.testing.assert_close(got, want, atol=0, rtol=0)
+        if phase == "prefix":
+            roles_tensor = packed["row_role"]
+            assert bool(((roles_tensor == 0) | (roles_tensor == 1)).any())
+            assert bool((roles_tensor == 4).any())
+            assert bool(
+                (packed["t"][(roles_tensor == 0) | (roles_tensor == 1)] == 0.875).all()
+            )
+            assert bool((packed["t"][roles_tensor == 4] == 0.999).all())
+            bad = dict(packed, t=torch.ones_like(packed["t"]))
+            with pytest.raises(ValueError, match="checkpoint-defined prefix"):
+                samplers[0]._forward(bad, ZingH3KVCache(arch.num_layers), "prefix")
+
+
+@pytest.mark.parametrize(
+    "count,tags",
+    [
+        (3, None),
+        (4, {}),
+        (4, dict(video=0, text=1, audio=2, source_visual=3, condition_visual=4)),
+        (5, dict(video=0, text=1, audio=2, source_visual=3, condition_visual=0)),
+        (4, dict(video=False, text=1, audio=2, source_visual=3)),
+    ],
+)
+def test_invalid_modality_routing_rejected_by_model(model, count, tags):
+    from dataclasses import replace
+
+    with pytest.raises(ValueError):
+        ZingH3DiTModel(
+            ZingH3DiTConfig(
+                arch_config=replace(
+                    model.arch, num_modalities=count, modality_tags=tags
+                )
+            ),
+            {},
+        )
+
+
+def test_rational_rope_scale_matches_numeric_geometry(model):
+    rational = ZingH3Packer(model.arch, frame_scale="5/3")
+    numeric = ZingH3Packer(model.arch, frame_scale=5 / 3)
+    assert rational.rope_frame_scale == numeric.rope_frame_scale
+    with pytest.raises(ValueError, match="geometry"):
+        ZingH3Packer(model.arch, frame_scale="5/0")

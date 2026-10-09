@@ -66,6 +66,8 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         sink_chunks=3,
         rope_position_mode="block_relative",
         rope_max_frame_gap=12,
+        ar_condition_timestep=1.0,
+        reference_visual_timestep=1.0,
     ):
         if not math.isfinite(guidance_scale) or guidance_scale < 1:
             raise ValueError("Zing guidance_scale must be finite and at least one")
@@ -73,6 +75,17 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             raise ValueError("Zing solver must be euler or few_step")
         if solver == "euler" and denoising_step_list is not None:
             raise ValueError("An explicit re-noise grid requires solver=few_step")
+        for value in (ar_condition_timestep, reference_visual_timestep):
+            if (
+                type(value) not in (int, float)
+                or not math.isfinite(value)
+                or not 0 <= value <= 1
+            ):
+                raise ValueError(
+                    "Zing condition timesteps must be finite and within [0, 1]"
+                )
+        self.ar_condition_timestep = ar_condition_timestep
+        self.reference_visual_timestep = reference_visual_timestep
         self.generator, self.processor = transformer, packer
         self.window_policy = ZingWindowPolicy(window_chunks, sink_chunks)
         ZingWindowPolicy.validate_rope(rope_position_mode, rope_max_frame_gap)

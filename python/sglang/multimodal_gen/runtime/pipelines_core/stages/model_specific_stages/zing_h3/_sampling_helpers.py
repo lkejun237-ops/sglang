@@ -467,6 +467,9 @@ class ZingBlockSamplingHelpers:
                 audio_values,
                 torch.ones_like(audio_values),
             )
+        roles = selection.host_layouts[final].row_role
+        t[(roles == 0) | (roles == 1)] = self.ar_condition_timestep
+        t[roles == 4] = self.reference_visual_timestep
         packed = {
             "x": layout["clean_visual"].index_select(0, selection.visual_source),
             "audio_x": layout["clean_audio"].index_select(0, selection.audio_source),

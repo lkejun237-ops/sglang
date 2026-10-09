@@ -16,11 +16,44 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 )
 
 
+def resolve_zing_modality_tags(num_modalities, tags=None):
+    """Resolve legacy canonical tags or validate native four/five-branch routing."""
+    roles = ("video", "text", "audio", "source_visual")
+    if type(num_modalities) is not int or num_modalities not in (4, 5):
+        raise ValueError("Zing requires four or five AdaLN modalities")
+    if tags is None:
+        tags = dict(zip(roles, range(4)))
+        if num_modalities == 5:
+            tags["condition_visual"] = 4
+    required = set(roles)
+    if (
+        not isinstance(tags, dict)
+        or not required <= tags.keys() <= required | {"condition_visual"}
+        or any(type(value) is not int for value in tags.values())
+    ):
+        raise ValueError("Unsupported Zing modality routing")
+    tags = dict(tags)
+    tags.setdefault("condition_visual", tags["video"])
+    if tags["condition_visual"] != tags["video"]:
+        roles += ("condition_visual",)
+    if len(roles) != num_modalities or sorted(tags[role] for role in roles) != list(
+        range(num_modalities)
+    ):
+        raise ValueError(
+            "Zing projection tags must match the contiguous modality count"
+        )
+    return tags
+
+
 @dataclass
 class ZingH3DiTArchConfig(MiniMaxH3DiTArchConfig):
     num_modalities: int = 4
     adaln_out_features: int = 24 * 5376
     checkpoint_uses_diffusers_layout: bool = True
+    # None preserves canonical routing for existing version-1 exports.
+    modality_tags: dict[str, int] | None = None
+    ar_condition_timestep: float = 1.0
+    reference_visual_timestep: float = 1.0
 
 
 @dataclass

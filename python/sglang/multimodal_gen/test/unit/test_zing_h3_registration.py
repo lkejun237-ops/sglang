@@ -206,7 +206,7 @@ def test_zing_defaults_to_taeh3_and_requires_explicit_weights():
 
     args = SimpleNamespace(
         attention_backend=None,
-        resolve_component_attention_backend=lambda _name: (None, None)
+        resolve_component_attention_backend=lambda _name: (None, None),
     )
     config = ZingH3CausalPipelineConfig()
     assert config.video_decoder_backend == "taeh3"
@@ -221,3 +221,71 @@ def test_zing_defaults_to_taeh3_and_requires_explicit_weights():
     ZingH3CausalPipelineConfig(video_decoder_backend="native").validate_server_args(
         args
     )
+
+
+@pytest.mark.parametrize(
+    "version,tags",
+    [
+        (1, None),
+        (2, None),
+        (2, dict(video=2, text=0, audio=3, source_visual=1, condition_visual=2)),
+        (2, dict(video=4, text=0, audio=3, source_visual=1, condition_visual=2)),
+    ],
+)
+def test_causal_export_versions_validate_routing_and_timesteps(
+    tmp_path, monkeypatch, version, tags
+):
+    cfg = dict(
+        format_version=version,
+        causal=True,
+        local_attn_size=-1,
+        sink_size=0,
+        vae_config={},
+    )
+    roles = ["video", "text", "audio", "source_visual"]
+    count = 4
+    if tags is not None and tags["condition_visual"] != tags["video"]:
+        roles.append("condition_visual")
+        count = 5
+    arch = dict(
+        num_modalities=count,
+        modality_tags=tags,
+        ar_condition_timestep=0.875,
+        reference_visual_timestep=0.999,
+    )
+    if version == 2:
+        cfg.update(
+            conversion_version="split-adaln-concat-v1",
+            input_adaln_layout="split",
+            runtime_adaln_layout="single",
+            adaln_modality_order=sorted(roles, key=tags.__getitem__) if tags else roles,
+            ar_condition_timestep=0.875,
+            reference_visual_timestep=0.999,
+        )
+    (tmp_path / "transformer").mkdir()
+    (tmp_path / "transformer/config.json").write_text(json.dumps(arch))
+    monkeypatch.setattr(
+        ComposedPipelineBase, "_load_config", lambda self: {"index": True}
+    )
+    pipeline = object.__new__(ZingH3CausalPipeline)
+    pipeline.model_path = str(tmp_path)
+
+    def load(config):
+        (tmp_path / "zing_config.json").write_text(json.dumps(config))
+        return pipeline._load_config()
+
+    assert load(cfg) == {"index": True}
+    assert pipeline.zing_runtime["vae_config"]["encode_mode"] == "performance"
+    with pytest.raises(ValueError, match="causal export"):
+        load(dict(cfg, format_version=True))
+    if version == 2:
+        for key, value in [
+            ("conversion_version", "other"),
+            ("input_adaln_layout", "mixed"),
+            ("runtime_adaln_layout", "split"),
+            ("adaln_modality_order", ["video"]),
+            ("ar_condition_timestep", 1),
+            ("reference_visual_timestep", float("nan")),
+        ]:
+            with pytest.raises(ValueError):
+                load(dict(cfg, **{key: value}))

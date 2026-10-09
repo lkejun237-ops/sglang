@@ -32,7 +32,6 @@ from .realtime import ZingH3RealtimeState
 from .request_adapter import build_h3_request
 from .sampling import ZingH3Sampler
 
-
 logger = init_logger(__name__)
 
 
@@ -306,6 +305,10 @@ class ZingH3GenerationStage(PipelineStage):
             video_shift=self.runtime["timestep_shift"],
             audio_shift=self.runtime["audio_timestep_shift"],
             num_train_timesteps=self.runtime["num_train_timestep"],
+            ar_condition_timestep=self.runtime.get("ar_condition_timestep", 1.0),
+            reference_visual_timestep=self.runtime.get(
+                "reference_visual_timestep", 1.0
+            ),
             guidance_scale=params.guidance_scale,
             window_chunks=getattr(params, "zing_window_chunks", 21),
             sink_chunks=getattr(params, "zing_sink_chunks", 3),
