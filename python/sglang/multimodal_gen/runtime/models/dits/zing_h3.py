@@ -45,6 +45,10 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_cache import (
     ZingH3AdalnCache,
 )
+from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_table import (
+    ZingAdalnTable,
+    layout_contract,
+)
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
     ZingDenoiseGraphs,
@@ -680,7 +684,9 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
     _compile_conditions = []
     _supported_attention_backends = {AttentionBackendEnum.TORCH_SDPA}
 
-    def __init__(self, config, hf_config, quant_config=None, **kwargs):
+    def __init__(
+        self, config, hf_config, quant_config=None, *, adaln_table=None, **kwargs
+    ):
         experimental_attention = os.environ.get(
             "SGLANG_ZING_EXPERIMENTAL_ATTENTION", "fa4"
         )
@@ -753,12 +759,31 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 raise ValueError(
                     "Zing condition timesteps must be finite and within [0, 1]"
                 )
-        if quant_config is not None or arch.adaln_curve_grid is not None or kwargs:
+        if (
+            quant_config is not None
+            or arch.adaln_curve_grid is not None
+            or arch.adaln_affine_input_dim is not None
+            or kwargs
+        ):
             raise ValueError(
-                "Zing dense inference requires unquantized full AdaLN weights"
+                "Zing inference requires unquantized non-curve weights and supported constructor arguments"
+            )
+        if adaln_table is not None and (
+            not isinstance(adaln_table, ZingAdalnTable)
+            or adaln_table.manifest["layout"]
+            != layout_contract(arch, self.modality_tags)
+        ):
+            raise ValueError(
+                "Zing AdaLN table does not match the worker projection layout"
             )
         arch.checkpoint_uses_diffusers_layout = True
-        super().__init__(config, hf_config, quant_config=None)
+        super().__init__(
+            config,
+            hf_config,
+            quant_config=None,
+            omit_adaln_projections=adaln_table is not None,
+        )
+        self.adaln_table = adaln_table
         self.experimental_attention_backend = experimental_attention
         self.experimental_stable_shapes = stable_shapes == "1"
         self.experimental_compiled_adaln = compiled_adaln == "1"
@@ -933,9 +958,69 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 f"Ulysses size {ulysses_size}"
             )
 
+    def initialize_adaln_table(self):
+        if self.adaln_table is None:
+            return
+        table = self.adaln_table
+        batches = [
+            torch.frombuffer(
+                bytearray.fromhex(v["raw_hex"]), dtype=torch.float32
+            ).clone()
+            for v in table.manifest["batches"]
+        ]
+        lease = table.prepare(
+            batches,
+            device=next(self.time_embedder.parameters()).device,
+            schedule=table.manifest["schedule"],
+            embedder=self.time_embedder,
+        )
+        lease.close()
+
+    def adaln_deployment_receipt(self):
+        parameters = {
+            name: value
+            for name, value in self.named_parameters()
+            if ".adaln_proj." in name
+        }
+        storages = {
+            v.untyped_storage().data_ptr(): v.untyped_storage()
+            for v in parameters.values()
+        }
+        return dict(
+            mode="weights_free" if self.adaln_table is not None else "resident",
+            projection_parameters=list(parameters),
+            projection_storage_bytes=sum(v.nbytes() for v in storages.values()),
+            table=None if self.adaln_table is None else self.adaln_table.stats(),
+        )
+
+    def validate_weight_update_source(self, *, weights_path):
+        if self.adaln_table is not None:
+            raise ValueError(
+                "Zing weights-free updates require offline rebuild and redeployment"
+            )
+        return super().validate_weight_update_source(weights_path=weights_path)
+
+    def prepare_lora_adapter(self, adapter):
+        if self.adaln_table is not None:
+            raise ValueError(
+                "Zing weights-free LoRA requires offline merge and redeployment"
+            )
+        return super().prepare_lora_adapter(adapter)
+
+    def validate_lora_layers(self, layer_names):
+        if self.adaln_table is not None:
+            raise ValueError(
+                "Zing weights-free LoRA requires offline merge and redeployment"
+            )
+        return super().validate_lora_layers(layer_names)
+
     def _preprocess_checkpoint(self, weights):
         # Weight loaders may copy through .data without bumping Tensor._version.
         # Invalidate live sessions as soon as a checkpoint load begins.
+        if self.adaln_table is not None and self._cache_weight_generation:
+            raise ValueError(
+                "Zing weights-free checkpoint updates require offline rebuild and redeployment"
+            )
         self._cache_weight_generation += 1
         for name, value in _diffusers_h3_checkpoint(
             (name.removeprefix("backbone."), value) for name, value in weights
@@ -955,6 +1040,10 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         # Tensor hot updates can write through .data without changing _version
         # or invoking the disk checkpoint preprocessor. Invalidate sessions for
         # that public weight-updater path as well.
+        if self.adaln_table is not None:
+            raise ValueError(
+                "Zing weights-free updates require offline rebuild and redeployment"
+            )
         self._cache_weight_generation += 1
         super().refresh_weight_derived_caches(weights_path=weights_path)
 
@@ -1220,7 +1309,14 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             if use_cache:
                 weight_addresses = self._bind_cache(cache, history_positions)
             projection_key = None
-            if self.adaln_projection_cache_enabled and cache is not None:
+            if self.adaln_table is not None:
+                if audio_x.shape[0]:
+                    raise ValueError(
+                        "Zing weights-free AdaLN supports video requests only"
+                    )
+                projection_cache = self.adaln_table
+                projection_key = projection_cache.lookup(key_unique_t)
+            elif self.adaln_projection_cache_enabled and cache is not None:
                 projection_cache = cache.adaln_projection_cache
                 if (
                     projection_cache is None

@@ -364,6 +364,8 @@ def run_sglang(args):
             "video_decoder_backend": args.video_decoder_backend,
             "taeh3_checkpoint_path": args.taeh3_checkpoint_path,
             "taeh3_decode_precision": args.taeh3_decode_precision,
+            "zing_adaln_table_path": args.adaln_table,
+            "zing_adaln_table_max_bytes": args.adaln_table_max_bytes,
         },
     )
     load_seconds = time.perf_counter() - started
@@ -467,6 +469,8 @@ def run_sglang(args):
                 "dit_attention_backend": args.dit_attention_backend,
                 "sp_preserve_projection_shapes": args.sp_preserve_projection_shapes,
                 "compile_adaln": args.compile_adaln,
+                "adaln_table_path": args.adaln_table,
+                "adaln_table_max_bytes": args.adaln_table_max_bytes,
                 "dit_placement": args.dit_placement,
                 "encoder_parallel": args.encoder_parallel,
                 "vae_cpu_offload": args.vae_cpu_offload,
@@ -826,6 +830,11 @@ def parser():
             "hidden rows before output projection (default: enabled)"
         ),
     )
+    sglang.add_argument(
+        "--adaln-table",
+        help="Fixed-version offline table; omitted selects resident AdaLN",
+    )
+    sglang.add_argument("--adaln-table-max-bytes", type=int, default=536870912)
     sglang.add_argument("--profile-run", action="store_true")
     sglang.add_argument(
         "--collect-rank-memory",

@@ -116,6 +116,25 @@ def test_zing_registers_executable_stages_and_accepts_ulysses_sp4(monkeypatch):
         ).validate_server_args(args)
 
 
+def test_adaln_table_is_limited_to_sp1():
+    from types import SimpleNamespace
+
+    def args(sp):
+        return SimpleNamespace(
+            sp_degree=sp,
+            ulysses_degree=sp,
+            attention_backend=None,
+            resolve_component_attention_backend=lambda _name: (None, None),
+        )
+
+    config = ZingH3CausalPipelineConfig(
+        taeh3_checkpoint_path="/model/taeh3.pth", zing_adaln_table_path="/table"
+    )
+    config.validate_server_args(args(1))
+    with pytest.raises(ValueError, match="SP1 only"):
+        config.validate_server_args(args(2))
+
+
 @pytest.mark.parametrize("fps", [24, 30])
 def test_zing_preserves_fps_and_validates_against_export(fps):
     from types import SimpleNamespace

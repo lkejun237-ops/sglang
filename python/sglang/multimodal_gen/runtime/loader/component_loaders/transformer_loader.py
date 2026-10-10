@@ -2,6 +2,7 @@ import copy
 import logging
 from collections.abc import Callable
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -404,6 +405,44 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
         checkpoint_key_filter: Callable[[str], bool] | None = (
             comfy_quant_key_filter if quant_spec.uses_comfy_layer_markers else None
         )
+        zing_table_path = getattr(
+            server_args.pipeline_config, "zing_adaln_table_path", None
+        )
+        if zing_table_path is not None:
+            from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
+                resolve_zing_modality_tags,
+            )
+            from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_table import (
+                ZingAdalnTable,
+                keep_zing_weight,
+            )
+
+            if (
+                model_cls.__name__ != "ZingH3DiTModel"
+                or quant_spec.runtime_quant_config is not None
+                or gguf_file is not None
+                or use_fsdp
+                or component_starts_on_cpu
+            ):
+                raise ValueError(
+                    "Zing AdaLN tables require unquantized resident Zing TP=1/SP1 without FSDP"
+                )
+            arch = dit_config.arch_config
+            table = ZingAdalnTable(
+                zing_table_path,
+                arch=arch,
+                tags=resolve_zing_modality_tags(
+                    arch.num_modalities, arch.modality_tags
+                ),
+                max_bytes=server_args.pipeline_config.zing_adaln_table_max_bytes,
+            )
+            table.validate_checkpoint(
+                safetensors_list,
+                transformer_override_config_path
+                or str(Path(component_model_path) / "config.json"),
+            )
+            init_params["adaln_table"] = table
+            checkpoint_key_filter = keep_zing_weight
         adaln_cache_path = component_server_args.minimax_h3_adaln_cache_path
         if adaln_cache_path is not None:
             if not is_minimax_h3:
@@ -548,6 +587,13 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
         # post-hooks (e.g., patch scales (nunchaku))
         for post_load_hook in quant_spec.post_load_hooks:
             post_load_hook(model)
+
+        if zing_table_path is not None:
+            model.initialize_adaln_table()
+            logger.info(
+                "Zing weights-free AdaLN startup receipt: %s",
+                model.adaln_deployment_receipt(),
+            )
 
         _warn_if_expected_param_dtype_missing(model, quant_spec.param_dtype)
 

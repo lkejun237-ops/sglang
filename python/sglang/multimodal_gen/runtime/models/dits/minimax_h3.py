@@ -1988,6 +1988,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         adaln_max_plans: int = 64,
         adaln_host_cache_bytes: int = 0,
         adaln_precision: str = "match",
+        omit_adaln_projections: bool = False,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
         arch = self.config
@@ -2004,7 +2005,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 "MiniMax H3 pruned curve checkpoints cannot use a separate AdaLN cache"
             )
         self._adaln_precomputed = (
-            adaln_cache_path is not None or adaln_weight_files is not None
+            adaln_cache_path is not None
+            or adaln_weight_files is not None
+            or omit_adaln_projections
         )
         self.arch = arch
         if arch.checkpoint_uses_diffusers_layout:
@@ -2125,7 +2128,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 host_cache_bytes=adaln_host_cache_bytes,
                 precision=adaln_precision,
             )
-            if self._adaln_precomputed
+            if adaln_cache_path is not None or adaln_weight_files is not None
             else None
         )
         # Component overrides disappear when the loader context exits. Preserve

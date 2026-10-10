@@ -527,29 +527,8 @@ class ZingBlockSamplingHelpers:
     ) -> dict[str, torch.Tensor]:
         selection = self._block_selection(layout, block_number, phase)
         device_rows = selection.device_rows
-        visual_rows, audio_rows = selection.visual_rows, selection.audio_rows
-        update_rows = (
-            torch.zeros_like(selection.target_rows) if final else selection.target_rows
-        )
-        t = torch.ones((visual_rows.shape[0],), dtype=torch.float32)
-        t[visual_rows] = torch.where(
-            update_rows[visual_rows],
-            t.new_full((int(visual_rows.sum()),), float(video_t)),
-            t.new_ones((int(visual_rows.sum()),)),
-        )
-        if bool(audio_rows.any()):
-            audio_values = t.new_full(
-                (int(audio_rows.sum()),),
-                1.0 if audio_t is None else float(audio_t),
-            )
-            t[audio_rows] = torch.where(
-                update_rows[audio_rows],
-                audio_values,
-                torch.ones_like(audio_values),
-            )
         roles = selection.host_layouts[final].row_role
-        t[(roles == 0) | (roles == 1)] = self.ar_condition_timestep
-        t[roles == 4] = self.reference_visual_timestep
+        t = self._block_timesteps(roles, video_t=video_t, audio_t=audio_t, final=final)
         packed = {
             "x": layout["clean_visual"].index_select(0, selection.visual_source),
             "audio_x": layout["clean_audio"].index_select(0, selection.audio_source),
@@ -569,3 +548,15 @@ class ZingBlockSamplingHelpers:
             for name in _GUARDED_ROWS
         )
         return packed
+
+    def _block_timesteps(self, roles, *, video_t, audio_t=None, final=False):
+        # One implementation for request admission and actual packed forwards.
+        t = torch.ones(roles.shape, dtype=torch.float32)
+        if not final:
+            t[roles == int(H3RowRole.TARGET_VISUAL)] = float(video_t)
+            t[roles == int(H3RowRole.TARGET_AUDIO)] = (
+                1.0 if audio_t is None else float(audio_t)
+            )
+        t[(roles == 0) | (roles == 1)] = self.ar_condition_timestep
+        t[roles == 4] = self.reference_visual_timestep
+        return t

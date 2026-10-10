@@ -1057,3 +1057,326 @@ def test_rational_rope_scale_matches_numeric_geometry(model):
     assert rational.rope_frame_scale == numeric.rope_frame_scale
     with pytest.raises(ValueError, match="geometry"):
         ZingH3Packer(model.arch, frame_scale="5/0")
+
+
+def verify_synthetic_table(table, directory):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_table import (
+        checkpoint_identity,
+    )
+
+    shard, config = directory / "synthetic.safetensors", directory / "config.json"
+    shard.write_bytes(b"synthetic shard")
+    config.write_text("{}")
+    table.manifest["identity"] = checkpoint_identity([shard], config)
+    table.validate_checkpoint([shard], config)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    "count,tags",
+    [
+        (4, None),
+        (4, dict(video=2, text=0, audio=3, source_visual=1, condition_visual=2)),
+        (5, dict(video=4, text=0, audio=3, source_visual=1, condition_visual=2)),
+    ],
+)
+@pytest.mark.parametrize("solver", ["euler", "few_step"])
+def test_weights_free_table_matches_resident_latents_and_kv(
+    model, tmp_path, count, tags, solver
+):
+    from dataclasses import replace
+
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_table import (
+        ZingAdalnTable,
+        video_plan,
+        write_table,
+    )
+
+    arch = replace(
+        model.arch,
+        num_modalities=count,
+        modality_tags=tags,
+        adaln_out_features=6 * count * model.arch.hidden_size,
+        ar_condition_timestep=0,
+        reference_visual_timestep=0.999,
+    )
+    resident = ZingH3DiTModel(ZingH3DiTConfig(arch_config=arch), {}).eval()
+    torch.manual_seed(257)
+    for name, p in resident.named_parameters():
+        p.copy_(
+            torch.ones_like(p)
+            if "norm" in name and name.endswith("weight")
+            else torch.randn_like(p) * 0.08
+        )
+    resident.rope.inv_freq.fill_(1)
+    packer, inputs, noise, _ = request(resident, audio=False)
+    inputs.visual = {f"ref{i}": torch.randn(1, 2, 1, 2, 2) for i in range(6)}
+    inputs.media = [{"id": key, "type": "image"} for key in inputs.visual]
+    inputs.conditions = [
+        {"content_id": key, "role": "reference"} for key in inputs.visual
+    ]
+    options = dict(
+        solver=solver,
+        sigma_points=3,
+        denoising_step_list=[1000, 500] if solver == "few_step" else None,
+        ar_condition_timestep=0,
+        reference_visual_timestep=0.999,
+        guidance_scale=2,
+    )
+    baseline = ZingH3Sampler(resident, packer, **options)
+    plan = video_plan(
+        solver,
+        baseline.video_scheduler.timesteps,
+        0,
+        0.999,
+        sigmas=baseline.video_scheduler.sigmas,
+    )
+    path = tmp_path / "adaln"
+    write_table(
+        path,
+        arch=arch,
+        tags=resident.modality_tags,
+        embedder=resident.time_embedder,
+        projections=[
+            *((i, b.adaln_proj) for i, b in enumerate(resident.blocks)),
+            ("final", resident.final_layer.adaln_proj),
+        ],
+        plan=plan,
+        identity={"synthetic": True},
+        provenance={"fixture": True},
+    )
+    table = ZingAdalnTable(
+        path, arch=arch, tags=resident.modality_tags, max_bytes=1 << 20
+    )
+    verify_synthetic_table(table, tmp_path)
+    # Meta construction proves omitted parameters are absent before loading.
+    with torch.device("meta"):
+        candidate = ZingH3DiTModel(
+            ZingH3DiTConfig(arch_config=replace(arch)), {}, adaln_table=table
+        )
+    assert not any("adaln_proj" in name for name, _ in candidate.named_parameters())
+    assert all(block.adaln_proj is None for block in candidate.blocks)
+    assert candidate.final_layer.adaln_proj is None and candidate.adaln_cache is None
+    candidate.to_empty(device="cpu").eval()
+    candidate.load_state_dict(
+        {k: v for k, v in resident.state_dict().items() if "adaln_proj" not in k}
+    )
+    sampler = ZingH3Sampler(candidate, packer, **options)
+    states = [s.initialize(inputs, noise) for s in (baseline, sampler)]
+    assert table.active_plans == 1
+    try:
+        for i in range(len(states[0].spans)):
+            # Pair identical CD re-noise RNG draws in both modes.
+            torch.manual_seed(100 + i)
+            baseline.step(states[0])
+            torch.manual_seed(100 + i)
+            sampler.step(states[1])
+            assert torch.equal(states[0].visual, states[1].visual)
+            assert torch.isfinite(states[1].visual).all()
+            for layer in range(arch.num_layers):
+                for a, b in zip(
+                    states[0].cache.history(layer), states[1].cache.history(layer)
+                ):
+                    assert torch.equal(a, b)
+        sampler.update_condition(states[1], inputs)
+        assert table.active_plans == 1
+    finally:
+        for state in states:
+            state.close()
+    assert table.active_plans == 0 and table.hits > 0
+    with pytest.raises(ValueError, match="offline"):
+        candidate.refresh_weight_derived_caches(weights_path=None)
+    with pytest.raises(ValueError, match="offline"):
+        candidate.prepare_lora_adapter({})
+    for source in [None, "unused-checkpoint-path"]:
+        with pytest.raises(ValueError, match="offline"):
+            candidate.validate_weight_update_source(weights_path=source)
+    # A missing plan must reject before pool acquisition or prefix work.
+    bad = ZingH3Sampler(
+        candidate,
+        packer,
+        sigma_points=4,
+        ar_condition_timestep=0,
+        reference_visual_timestep=0.999,
+    )
+
+    def forbidden_acquire(_):
+        pytest.fail("incompatible AdaLN plan acquired KV storage")
+
+    with pytest.raises(ValueError, match="schedule|timestep batch"):
+        bad.initialize(inputs, noise, acquire_storage=forbidden_acquire)
+    assert table.active_plans == 0
+
+    def failed_acquire(_):
+        raise RuntimeError("synthetic KV pool exhaustion")
+
+    with pytest.raises(RuntimeError, match="pool exhaustion"):
+        sampler.initialize(inputs, noise, acquire_storage=failed_acquire)
+    assert table.active_plans == 0
+
+
+@torch.no_grad()
+def test_offline_adaln_builder_streams_exported_projection_keys(
+    model, tmp_path, monkeypatch
+):
+    import importlib.util
+    import json
+    from dataclasses import asdict
+    from pathlib import Path
+
+    from safetensors.torch import save_file
+
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_table import (
+        ZingAdalnTable,
+        video_plan,
+    )
+
+    spec = importlib.util.spec_from_file_location(
+        "zing_builder",
+        Path(__file__).resolve().parents[5]
+        / "benchmark/zing_h3_causal/build_adaln_table.py",
+    )
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    import weakref
+
+    observed = []
+
+    class AuditedProjection(builder.MiniMaxH3AdalnProj):
+        def __init__(self, *args, **kwargs):
+            assert all(value() is None for value in observed), (
+                "previous layer retained projection storage"
+            )
+            super().__init__(*args, **kwargs)
+
+        def forward(self, embedding):
+            observed.extend(weakref.ref(p) for p in self.parameters())
+            return super().forward(embedding)
+
+    monkeypatch.setattr(builder, "MiniMaxH3AdalnProj", AuditedProjection)
+    root = tmp_path / "export"
+    transformer = root / "transformer"
+    transformer.mkdir(parents=True)
+    (transformer / "config.json").write_text(
+        json.dumps(asdict(model.arch) | {"_class_name": "ZingH3DiTModel"})
+    )
+    (root / "zing_config.json").write_text(
+        json.dumps(
+            dict(
+                checkpoint_sha256="0" * 64,
+                provenance=dict(
+                    native_sha="0" * 40,
+                    checkpoint_source="generator",
+                    component_versions={"fixture": "cpu"},
+                ),
+            )
+        )
+    )
+    weights = {}
+    for i, target in [(1, "in"), (2, "out")]:
+        for part in ["weight", "bias"]:
+            weights[f"backbone.time_embedder.linear_{i}.{part}"] = model.state_dict()[
+                f"time_embedder.proj_{target}.{part}"
+            ]
+    for i, block in enumerate(model.blocks):
+        for part in ["weight", "bias"]:
+            weights[f"backbone.transformer_blocks.{i}.adaln_proj.linear.{part}"] = (
+                block.adaln_proj.state_dict()[f"linear.{part}"]
+            )
+    for part in ["weight", "bias"]:
+        weights[f"backbone.norm_out.linear.{part}"] = (
+            model.final_layer.adaln_proj.state_dict()[f"linear.{part}"]
+        )
+    save_file(weights, str(transformer / "weights.safetensors"))
+    plan = video_plan(
+        "euler", torch.tensor([0, 0.5]), sigmas=torch.tensor([1.0, 0.5, 0.0])
+    )
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan))
+    builder.build(root, plan_path, tmp_path / "table", "cpu")
+    assert observed and all(value() is None for value in observed)
+    assert not (tmp_path / "bad-table").exists()
+    wrong_plan = dict(plan, schedule=dict(plan["schedule"], condition=0.1))
+    (tmp_path / "wrong-plan.json").write_text(json.dumps(wrong_plan))
+    with pytest.raises(ValueError, match="prefix timesteps"):
+        builder.build(root, tmp_path / "wrong-plan.json", tmp_path / "bad-table", "cpu")
+    assert not (tmp_path / "bad-table").exists()
+    table = ZingAdalnTable(
+        tmp_path / "table", arch=model.arch, tags=model.modality_tags, max_bytes=1 << 20
+    )
+    table.validate_checkpoint(
+        [transformer / "weights.safetensors"], transformer / "config.json"
+    )
+    lease = table.prepare(
+        [torch.tensor([0.0])],
+        device="cpu",
+        schedule=plan["schedule"],
+        embedder=model.time_embedder,
+    )
+    t = torch.tensor([0.0])
+    embedding = torch.nn.functional.silu(model.time_embedder(t)).bfloat16()
+    for i, block in enumerate(model.blocks):
+        for actual, expected in zip(
+            table.project(i, None, embedding, table.lookup(t)),
+            block.adaln_proj(embedding),
+        ):
+            assert torch.equal(actual, expected)
+    lease.close()
+
+
+@torch.no_grad()
+def test_weights_free_reader_never_materializes_projection_tensors(
+    model, tmp_path, monkeypatch
+):
+    from safetensors.torch import save_file
+
+    from sglang.multimodal_gen.runtime.loader.weight_readers import safetensors_mmap
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_table import (
+        keep_zing_weight,
+    )
+
+    path = tmp_path / "weights.safetensors"
+    retained = {
+        "backbone.time_embedder.linear_1.weight": torch.randn(8, 8),
+        "backbone.norm_out.norm.weight": torch.randn(16),
+    }
+    excluded = {
+        "backbone.transformer_blocks.0.adaln_proj.linear.weight": torch.randn(384, 8),
+        "backbone.norm_out.linear.bias": torch.randn(32),
+    }
+    save_file(retained | excluded, str(path))
+    real_open = safetensors_mmap.safe_open
+    read_keys = []
+
+    class AuditedFile:
+        def __init__(self, *args, **kwargs):
+            self.handle = real_open(*args, **kwargs)
+
+        def __enter__(self):
+            self.handle.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.handle.__exit__(*args)
+
+        def keys(self):
+            return self.handle.keys()
+
+        def get_tensor(self, key):
+            read_keys.append(key)
+            return self.handle.get_tensor(key)
+
+    monkeypatch.setattr(safetensors_mmap, "safe_open", AuditedFile)
+    loaded = dict(
+        safetensors_mmap.SafetensorsMmapReader().iter_weights(
+            [str(path)],
+            device="cpu",
+            to_cpu=True,
+            key_filter=keep_zing_weight,
+            show_progress=False,
+        )
+    )
+    assert set(read_keys) == set(loaded) == set(retained)
+    assert not set(read_keys) & set(excluded)
+    for name in retained:
+        assert torch.equal(loaded[name], retained[name])

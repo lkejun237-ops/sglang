@@ -69,6 +69,9 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
     video_decoder_backend: str = "taeh3"
     taeh3_checkpoint_path: str | None = None
     taeh3_decode_precision: str = "fp32"
+    # Immutable offline table; None keeps the explicit resident baseline.
+    zing_adaln_table_path: str | None = None
+    zing_adaln_table_max_bytes: int = 536870912
     # Realtime KV pool (#171). None disables it and keeps per-session growth.
     zing_kv_pool_size: int | None = None
     zing_kv_pool_max_target_area: int | None = None
@@ -95,6 +98,20 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
         self.validate_server_args(server_args)
 
     def validate_server_args(self, server_args):
+        if self.zing_adaln_table_path is not None:
+            if (
+                type(self.zing_adaln_table_max_bytes) is not int
+                or self.zing_adaln_table_max_bytes <= 0
+            ):
+                raise ValueError("Zing AdaLN table budget must be positive")
+            if getattr(server_args, "lora_path", None):
+                raise ValueError(
+                    "Zing AdaLN tables require offline-merged LoRA weights"
+                )
+            if (getattr(server_args, "sp_degree", 1) or 1) != 1:
+                raise ValueError(
+                    "Zing AdaLN tables currently support SP1 only; SP2 exactness is unverified"
+                )
         if self.video_decoder_backend not in {"native", "taeh3"}:
             raise ValueError("Unknown Zing video decoder backend")
         if self.video_decoder_backend == "taeh3":

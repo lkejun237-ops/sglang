@@ -90,6 +90,7 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
                 raise ValueError(
                     "Zing condition timesteps must be finite and within [0, 1]"
                 )
+        self.solver = solver
         self.ar_condition_timestep = ar_condition_timestep
         self.reference_visual_timestep = reference_visual_timestep
         self.generator, self.processor = transformer, packer
@@ -118,6 +119,64 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         )
         # Preallocated donor storage for prompt updates of pooled sessions.
         self.prefix_workspace = None
+
+    def _admit_adaln(self, positive, negative, spans, audio):
+        table = getattr(self.generator, "adaln_table", None)
+        if table is None:
+            return None
+        if audio is not None:
+            raise ValueError("Zing weights-free AdaLN supports video requests only")
+        if self.joint_forward != "off":
+            raise ValueError("Zing weights-free AdaLN does not support joint forwards")
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_table import (
+            schedule_contract,
+        )
+
+        batches = []
+
+        def add(roles, *, video_t=1, final=False):
+            if roles.numel():
+                batches.append(
+                    torch.unique(
+                        self._block_timesteps(roles, video_t=video_t, final=final),
+                        sorted=True,
+                    )
+                )
+
+        timesteps = self._host_list(self.video_scheduler.timesteps)
+        for layout in [positive, negative]:
+            if layout is None:
+                continue
+            host = self._layout_index(layout).host
+            roles, blocks = host["row_role"], host["block_idx"]
+            if bool(((roles == 5) | (roles == 11)).any()):
+                raise ValueError(
+                    "Zing weights-free AdaLN does not support audio row roles"
+                )
+            if not bool(torch.isin(roles, torch.tensor([0, 1, 4, 7, 10])).all()):
+                raise ValueError(
+                    "Zing weights-free AdaLN received unsupported row roles"
+                )
+            add(roles[blocks == 0])
+            for source, target, _, _ in spans:
+                add(roles[(blocks == source) & (roles == 7)])
+                target_roles = roles[(blocks == target) & (roles == 10)]
+                for t in timesteps:
+                    add(target_roles, video_t=t)
+                add(target_roles, final=True)
+        schedule = schedule_contract(
+            self.solver,
+            self.video_scheduler.timesteps.cpu(),
+            self.ar_condition_timestep,
+            self.reference_visual_timestep,
+            sigmas=self.video_scheduler.sigmas.cpu(),
+        )
+        return table.prepare(
+            batches,
+            device=self.device,
+            schedule=schedule,
+            embedder=self.generator.time_embedder,
+        )
 
     def prefix_donor_cache(self):
         """Cache that computes a replacement prefix before replace_prefix.
@@ -199,17 +258,23 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             self.last_run_metrics.update(
                 joint_forward=self.joint_forward, joint_fallbacks={}
             )
-        if acquire_storage is not None:
-            storage = acquire_storage(pos)
-        cache = ZingH3KVCache(
-            len(self.generator.blocks),
-            window_policy=self.window_policy,
-            rope_position_mode=self.rope_position_mode,
-            rope_max_frame_gap=self.rope_max_frame_gap,
-            reserve_rows=int(pos["block_idx"].numel()),
-            storage=storage,
-        )
+        adaln_lease = self._admit_adaln(pos, neg, spans, audio)
+        if getattr(self.generator, "adaln_table", None) is not None:
+            self.last_run_metrics["adaln_deployment"] = (
+                self.generator.adaln_deployment_receipt()
+            )
+        cache = None
         try:
+            if acquire_storage is not None:
+                storage = acquire_storage(pos)
+            cache = ZingH3KVCache(
+                len(self.generator.blocks),
+                window_policy=self.window_policy,
+                rope_position_mode=self.rope_position_mode,
+                rope_max_frame_gap=self.rope_max_frame_gap,
+                reserve_rows=int(pos["block_idx"].numel()),
+                storage=storage,
+            )
             if diagnostic:
                 diagnostic.phase = "prefix"
             if bool((pos["block_idx"] == 0).any()):
@@ -219,9 +284,14 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
                     "prefix",
                 )
         except BaseException:
-            cache.clear()
+            if cache is not None:
+                cache.clear()
+            if adaln_lease is not None:
+                adaln_lease.close()
             raise
-        return ZingH3SamplingState(visual, audio, pos, neg, spans, cache)
+        return ZingH3SamplingState(
+            visual, audio, pos, neg, spans, cache, adaln_lease=adaln_lease
+        )
 
     @torch.no_grad()
     def update_condition(self, state, inputs):
@@ -255,8 +325,12 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             raise ValueError("Zing prompt update changed absolute target positions")
         # Reuse the original values exactly, including fractional frame positions.
         layout["position_ids"][new_target] = state.positive["position_ids"][old_target]
-        prefix_cache = self.prefix_donor_cache()
+        adaln_lease = self._admit_adaln(
+            layout, state.negative, state.spans, state.audio
+        )
+        prefix_cache = None
         try:
+            prefix_cache = self.prefix_donor_cache()
             if bool((layout["block_idx"] == 0).any()):
                 self._forward(
                     self._select_block(layout, 0, phase="prefix", video_t=1, audio_t=1),
@@ -266,7 +340,10 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             state.cache.replace_prefix(prefix_cache.prefix)
             state.positive = layout
         finally:
-            prefix_cache.clear()
+            if prefix_cache is not None:
+                prefix_cache.clear()
+            if adaln_lease is not None:
+                adaln_lease.close()
 
     @torch.no_grad()
     def step(self, state, *, inputs=None):
@@ -576,9 +653,13 @@ class ZingH3SamplingState:
     cache: ZingH3KVCache
     index: int = 0
     closed: bool = False
+    adaln_lease: object = None
 
     def close(self):
         self.cache.clear()
+        if self.adaln_lease is not None:
+            self.adaln_lease.close()
+            self.adaln_lease = None
         self.visual = self.audio = self.positive = self.negative = None
         self.spans = []
         self.closed = True

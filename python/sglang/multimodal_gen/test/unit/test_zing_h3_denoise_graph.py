@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import allocate_layer_s
 from sglang.multimodal_gen.test.unit.test_zing_h3_kv_pool_cache import _inputs
 from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
     cpu_execution_options,
+    verify_synthetic_table,
 )
 from sglang.multimodal_gen.test.unit.test_zing_h3_model import model as model_fixture
 
@@ -677,3 +678,73 @@ def _cuda_model():
                 param.copy_(torch.randn(param.shape) * 0.08)
         model.rope.inv_freq.fill_(1)
     return model.cuda()
+
+
+@torch.no_grad()
+def test_weights_free_table_replays_interleaved_sessions_exactly(
+    model, tmp_path, monkeypatch
+):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_table import (
+        ZingAdalnTable,
+        video_plan,
+        write_table,
+    )
+    from sglang.multimodal_gen.runtime.models.schedulers.scheduling_zing_h3_causal_renoise import (
+        ZingH3CausalRenoiseSchedule,
+    )
+
+    seeds = (11, 12)
+    expected = _run_sessions(
+        model, monkeypatch, storages=[_storage(model), _storage(model)], seeds=seeds
+    )
+    schedule = ZingH3CausalRenoiseSchedule(STEPS, num_train_timesteps=1000, shift=5.0)
+    plan = video_plan("few_step", schedule.timesteps, sigmas=schedule.sigmas)
+    path = tmp_path / "table"
+    write_table(
+        path,
+        arch=model.arch,
+        tags=model.modality_tags,
+        embedder=model.time_embedder,
+        projections=[
+            *((i, b.adaln_proj) for i, b in enumerate(model.blocks)),
+            ("final", model.final_layer.adaln_proj),
+        ],
+        plan=plan,
+        identity={"fixture": True},
+        provenance={"synthetic": True},
+    )
+    table = ZingAdalnTable(
+        path, arch=model.arch, tags=model.modality_tags, max_bytes=1 << 20
+    )
+    verify_synthetic_table(table, tmp_path)
+    candidate = ZingH3DiTModel(
+        ZingH3DiTConfig(arch_config=replace(model.arch)), {}, adaln_table=table
+    ).eval()
+    candidate.load_state_dict(
+        {k: v for k, v in model.state_dict().items() if "adaln_proj" not in k}
+    )
+    candidate.initialize_adaln_table()
+    receipt = candidate.adaln_deployment_receipt()
+    assert (
+        receipt["projection_parameters"] == []
+        and receipt["projection_storage_bytes"] == 0
+    )
+    backend = RecordingGraphBackend()
+    _graph_mode(candidate, monkeypatch, backend)
+    actual = _run_sessions(
+        candidate,
+        monkeypatch,
+        storages=[_storage(candidate), _storage(candidate)],
+        seeds=seeds,
+    )
+    routes = collections.Counter()
+    for got, want in zip(actual, expected):
+        for entry in want[1]:
+            if entry["cache"] is not None:
+                entry["cache"]["adaln"] = (
+                    None  # Resident LRU counters differ by design.
+                )
+        _assert_same(got, want)
+        routes += _active_routes(got[1])
+    assert routes["capture"] > 0 and routes["replay"] > 0
+    assert table.active_plans == 0 and table.stats()["fallback"] == 0
