@@ -25,6 +25,11 @@ from sglang.multimodal_gen.runtime.utils.zing_diagnostics import (
     current_diagnostic,
     diagnostic_request,
 )
+from sglang.multimodal_gen.runtime.utils.zing_stage_timing import (
+    handoff,
+    stage_span,
+    trace_for_batch,
+)
 
 from .codecs import ZingH3Codecs
 from .packing import ZingH3Packer
@@ -464,7 +469,7 @@ class ZingH3GenerationStage(PipelineStage):
             state.dispose()
             raise
 
-    def _prepare_realtime_state(self, batch, state):
+    def _prepare_realtime_state(self, batch, state, trace=None):
         params = batch.sampling_params
         self._validate_sampling_params(params)
         if state.sampling is None:
@@ -472,8 +477,28 @@ class ZingH3GenerationStage(PipelineStage):
                 raise ValueError("Zing realtime session must start at block zero")
             state.sampler = self._build_sampler(params)
             request = self._build_request(batch)
-            state.inputs = self.codecs.prepare(
-                request, self._use, retain_condition_media=True
+            with stage_span(
+                trace,
+                "Conditioning",
+                scope="includes_IO_preprocessing_and_nested_Encoder",
+                input_ids=[f"{batch.realtime_session_id}:payload"],
+                output_ids=[f"{batch.realtime_session_id}:conditioning"],
+            ) as span:
+                state.inputs = self.codecs.prepare(
+                    request, self._use, retain_condition_media=True, stage_trace=trace
+                )
+            handoff(
+                span,
+                input_ids=[f"{batch.realtime_session_id}:positive"]
+                + [
+                    f"{batch.realtime_session_id}:reference:{key}"
+                    for key in state.inputs.visual
+                ]
+                + (
+                    [f"{batch.realtime_session_id}:source_latents"]
+                    if state.inputs.source_visual is not None
+                    else []
+                ),
             )
             if state.inputs.audio_shape is not None:
                 raise ValueError("Audio streaming is not supported yet.")
@@ -619,8 +644,30 @@ class ZingH3GenerationStage(PipelineStage):
 
     def _generate_realtime_block(self, batch, state):
         params = batch.sampling_params
-        mode = self._prepare_realtime_state(batch, state)
-        end = self._sample_realtime_block(batch, state)
+        trace = trace_for_batch(batch)
+        request_id = batch.realtime_session_id
+        measure_cuda = trace is not None and trace.measure_cuda
+        mode = self._prepare_realtime_state(batch, state, trace)
+        previous_end = (
+            0
+            if state.sampling is None
+            else state.sampling.spans[state.sampling.index - 1][3]
+        )
+        with stage_span(
+            trace,
+            "DiT",
+            cuda=measure_cuda,
+            input_ids=[f"{request_id}:conditioning"]
+            + ([f"{request_id}:latent:0:{previous_end}"] if previous_end else []),
+            block_index=batch.block_idx,
+            scope="noise_initialization_prefix_KV_and_all_denoising_steps",
+        ) as span:
+            end = self._sample_realtime_block(batch, state)
+        handoff(
+            span,
+            output_ids=[f"{request_id}:latent:0:{end}"],
+            latent_range=[previous_end, end],
+        )
         final = state.sampling.index == len(state.sampling.spans) or batch.extra.get(
             "realtime_is_final_chunk", False
         )
@@ -638,9 +685,29 @@ class ZingH3GenerationStage(PipelineStage):
                 metrics=batch.metrics,
                 trajectory_latents=trajectory,
             )
-        outputs, height, width = self._decode_realtime_output(
-            state, end, ready, final=final
-        )
+        first_frame = state.emitted_frames
+        with stage_span(
+            trace,
+            "Decoder",
+            cuda=measure_cuda,
+            input_ids=[f"{request_id}:latent:0:{end}"],
+            output_ids=[f"{request_id}:frames:{first_frame}:{ready[-1]['frame_end']}"],
+            output_frame_range=[first_frame, ready[-1]["frame_end"]],
+            output_blocks=[
+                dict(
+                    block_index=b["block_idx"],
+                    dispatch_id=b["request_id"],
+                    frame_end=b["frame_end"],
+                )
+                for b in ready
+            ],
+            final=bool(final),
+            scope="decode_overlap_crop_and_block_tensor_splitting",
+        ) as span:
+            outputs, height, width = self._decode_realtime_output(
+                state, end, ready, final=final
+            )
+        handoff(span)
         params.num_frames, params.height, params.width = (
             sum(x.shape[1] for x in outputs),
             height,

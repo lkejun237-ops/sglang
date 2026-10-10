@@ -9,6 +9,7 @@ on:
       - python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/zing_h3/**
       - python/sglang/multimodal_gen/configs/pipeline_configs/zing_h3.py
       - benchmark/zing_h3_causal/**
+      - python/sglang/multimodal_gen/runtime/utils/zing_stage_timing.py
   workflow_dispatch:
 
 permissions:
@@ -38,3 +39,11 @@ jobs:
           # These model-only tests do not need the CUDA runtime conftest.
           cp python/sglang/multimodal_gen/test/unit/test_zing_h3_taeh3.py "$RUNNER_TEMP/test_zing_h3_taeh3.py"
           python -m pytest -q "$RUNNER_TEMP/test_zing_h3_taeh3.py"
+      - name: Check fixed-payload client and stage timing contracts
+        run: |
+          python -m pytest -q \
+            benchmark/zing_h3_causal/tests/test_bench_client.py \
+            benchmark/zing_h3_causal/tests/test_stage_timing.py \
+            benchmark/zing_h3_causal/tests/test_analyze_stage_timing.py \
+            benchmark/zing_h3_causal/test_whitebox_video_smoke.py \
+            benchmark/zing_h3_causal/test_whitebox_six_reference.py

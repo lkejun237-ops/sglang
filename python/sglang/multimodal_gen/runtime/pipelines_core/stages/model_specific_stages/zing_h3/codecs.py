@@ -18,11 +18,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.decoding import (
     _deterministic_audio_decode_context,
 )
+from sglang.multimodal_gen.runtime.utils.zing_stage_timing import handoff, stage_span
 
 from .media_input import ZingH3MediaInput, _sample_max_area_config
 from .packing import H3InferenceInputs
 from .visual_encoding import encode_clips
-
 
 _VISUAL_ENCODE_POLICY_LOCK = threading.RLock()
 
@@ -307,6 +307,7 @@ class ZingH3Codecs(ZingH3MediaInput):
         *,
         retain_condition_media=False,
         source_preview=None,
+        stage_trace=None,
     ):
         # Reuse decoded references for prompt refreshes; offline calls release them.
         if isinstance(request, dict) and "cache_uri" in request:
@@ -339,8 +340,19 @@ class ZingH3Codecs(ZingH3MediaInput):
         refs, source, h, w, t, frames = self._normalize_inference_media(
             media, source, conditions, target, max_area_config=max_area_config
         )
-        with use_component("text_encoder"):
-            positive = self.encode_condition(prompt, media)
+        request_id = stage_trace.identity["request_id"] if stage_trace else None
+        measure_cuda = stage_trace is not None and stage_trace.measure_cuda
+        with stage_span(
+            stage_trace,
+            "Encoder",
+            component="qwen",
+            cuda=measure_cuda,
+            input_ids=[f"{request_id}:payload"],
+            output_ids=[f"{request_id}:positive"],
+        ) as span:
+            with use_component("text_encoder"):
+                positive = self.encode_condition(prompt, media)
+        handoff(span)
         visual, audio = {}, {}
         modes = {c["content_id"]: c["latent_modalities"] for c in conditions}
         visual_refs = [item for item in refs if "visual" in modes.get(item["id"], [])]
@@ -348,9 +360,29 @@ class ZingH3Codecs(ZingH3MediaInput):
         if visual_refs or source is not None:
             with use_component("video_vae"):
                 for item in visual_refs:
-                    visual[item["id"]] = self.encode_visual(item["frames"])
+                    with stage_span(
+                        stage_trace,
+                        "Encoder",
+                        component="reference_vae",
+                        cuda=measure_cuda,
+                        media_id=item["id"],
+                        input_ids=[f"{request_id}:media:{item['id']}"],
+                        output_ids=[f"{request_id}:reference:{item['id']}"],
+                    ) as span:
+                        visual[item["id"]] = self.encode_visual(item["frames"])
+                    handoff(span)
                 if source is not None:
-                    source_latent = self.encode_visual(source["frames"])
+                    with stage_span(
+                        stage_trace,
+                        "Encoder",
+                        component="source_vae",
+                        cuda=measure_cuda,
+                        input_ids=[f"{request_id}:source_pixels"],
+                        output_ids=[f"{request_id}:source_latents"],
+                        source_frame_range=[0, int(source["frames"].shape[1])],
+                    ) as span:
+                        source_latent = self.encode_visual(source["frames"])
+                    handoff(span)
         audio_refs = [item for item in refs if "audio" in modes.get(item["id"], [])]
         generate_audio = target["type"] == "video_audio"
         samples, audio_shape = None, None
