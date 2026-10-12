@@ -164,7 +164,7 @@ def test_kernel_exception_keeps_state_retryable(codecs, monkeypatch):
     assert stream.pop().end == 3
 
 
-def configure_tiling(codecs, stack, padding="zeros"):
+def configure_tiling(codecs, stack, padding="zeros", *, num_res_blocks=1):
     from types import MethodType
 
     from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.klvae import (
@@ -179,7 +179,7 @@ def configure_tiling(codecs, stack, padding="zeros"):
             ch_mult=[1, 1, 1],
             space_down=[1, 2, 2],
             time_down=[1, 2, 2],
-            num_res_blocks=1,
+            num_res_blocks=num_res_blocks,
             in_channels=3,
             z_channels=24,
             double_z=True,
@@ -330,7 +330,9 @@ def test_default_tile_policy_requires_validated_configuration(
 
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("size", [1, 2, 4, 8])
-def test_performance_auto_override_is_session_scoped(codecs, monkeypatch, enabled, size):
+def test_performance_auto_override_is_session_scoped(
+    codecs, monkeypatch, enabled, size
+):
     from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import klvae
 
     monkeypatch.delenv("MINIMAX_H3_PROGRESSIVE_ENCODER_TILING", raising=False)

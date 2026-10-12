@@ -282,12 +282,13 @@ def test_fa4_metadata_is_forward_local_and_cleared(monkeypatch, fail):
 
 @pytest.mark.parametrize("world", [2, 4])
 @pytest.mark.parametrize("reference_prefix", [False, True])
+@pytest.mark.parametrize("count", [4, 5])
 def test_opt_in_stable_shapes_keep_sp_cache_and_outputs(
-    monkeypatch, world, reference_prefix
+    monkeypatch, world, reference_prefix, count
 ):
     monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_STABLE_SHAPES", "1")
     model = model_fixture.__wrapped__()
-    check_sp_layout(model, monkeypatch, world, reference_prefix)
+    check_sp_layout(model, monkeypatch, world, reference_prefix, count)
 
 
 @pytest.mark.parametrize("sp", [False, True])

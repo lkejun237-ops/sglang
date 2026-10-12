@@ -2,7 +2,6 @@
 """Deployment policy must override export policy without rewriting checkpoints."""
 
 import json
-from types import SimpleNamespace
 
 import pytest
 
@@ -35,7 +34,9 @@ def test_visual_deployment_policy(tmp_path, monkeypatch, export_mode, override):
         monkeypatch.setenv("SGLANG_ZING_VISUAL_ENCODE_MODE", override)
     index = {"sentinel": True}
     monkeypatch.setattr(ComposedPipelineBase, "_load_config", lambda self: index)
-    pipeline = SimpleNamespace(model_path=tmp_path)
+    pipeline = object.__new__(ZingH3CausalPipeline)
+    pipeline.model_path = tmp_path
+    pipeline.conditioning_mode = "local"
     assert ZingH3CausalPipeline._load_config(pipeline) is index
     assert pipeline.zing_runtime["vae_config"] == dict(
         encode_mode=override or "performance", encode_dtype="bfloat16"
@@ -57,5 +58,8 @@ def test_invalid_visual_deployment_policy(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("SGLANG_ZING_VISUAL_ENCODE_MODE", "fast")
     monkeypatch.setattr(ComposedPipelineBase, "_load_config", lambda self: {})
+    pipeline = object.__new__(ZingH3CausalPipeline)
+    pipeline.model_path = tmp_path
+    pipeline.conditioning_mode = "local"
     with pytest.raises(ValueError, match="SGLANG_ZING_VISUAL_ENCODE_MODE"):
-        ZingH3CausalPipeline._load_config(SimpleNamespace(model_path=tmp_path))
+        ZingH3CausalPipeline._load_config(pipeline)

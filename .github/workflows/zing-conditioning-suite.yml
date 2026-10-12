@@ -1,0 +1,59 @@
+name: Zing reusable conditioning suite
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  SGLANG_LIGHTWEIGHT_RUNTIME: '1'
+  ZING_FULL_TILE_TESTS: '1'
+  HF_HUB_OFFLINE: '1'
+  PYTHONPATH: ${{ github.workspace }}/python
+  OMP_NUM_THREADS: '1'
+  MKL_NUM_THREADS: '1'
+  OPENBLAS_NUM_THREADS: '1'
+
+jobs:
+  conditioning-suite:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Verify the conditioning baseline from the full-depth checkout
+        run: |
+          # checkout fetched full history before removing its credentials.
+          # A missing object is a checkout failure, not permission to fetch.
+          git cat-file -e b1899c0bd538a342056a39893e8ce048b17afa32^{commit}
+          git rev-parse --verify b1899c0bd538a342056a39893e8ce048b17afa32^{commit}
+      - name: Install the independent conditioning CPU lock
+        run: |
+          python - <<'PYTHON'
+          import json
+          from pathlib import Path
+          deps = json.loads(Path('benchmark/zing_h3_causal/ISSUE_256_CPU_ENVIRONMENT.json').read_text())['dependencies']
+          Path('torch.txt').write_text(''.join(f'{name}=={deps[name]}+cpu\n' for name in ('torch', 'torchvision')))
+          Path('deps.txt').write_text(''.join(f'{name}=={version}\n' for name, version in deps.items() if name not in ('torch', 'torchvision')))
+          PYTHON
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu -r torch.txt
+          python -m pip install -r deps.txt triton==3.8.0
+      - name: Prepare media tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+          ffmpeg -version
+      - name: Execute approved CPU contracts with receipt and timeout checks
+        run: python scripts/ci/zing/run_cpu_tests.py --manifest scripts/ci/zing/cpu_test_manifest.json --suite conditioning-contracts --trials 2 --output-dir artifacts/conditioning-contracts
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: zing-conditioning-contracts-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: artifacts/conditioning-contracts
+          if-no-files-found: error

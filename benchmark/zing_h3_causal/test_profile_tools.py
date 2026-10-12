@@ -193,6 +193,7 @@ def test_harness_preserves_warmup_and_profile_metrics(tmp_path, monkeypatch):
                 trajectory_latents=torch.ones(1, 2, 3),
                 audio=torch.ones(1, 8),
                 peak_memory_mb=40,
+                usage=None,
                 metrics={
                     "memory_snapshots": {
                         "rank_0_load_peak": {

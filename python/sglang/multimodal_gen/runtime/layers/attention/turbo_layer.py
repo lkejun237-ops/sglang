@@ -18,7 +18,6 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
 )
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import get_compute_dtype
 
@@ -284,6 +283,8 @@ class MinimalA2AAttnOp(DistributedAttention):
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
     ):
+        from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
         dtype = get_compute_dtype()
         try:
             requested_attention_backend = get_global_server_args().attention_backend

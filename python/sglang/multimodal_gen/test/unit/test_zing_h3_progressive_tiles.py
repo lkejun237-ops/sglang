@@ -29,6 +29,8 @@ mp.get_context("forkserver").set_forkserver_preload(
 )
 
 
+# All workers are local to this test host. Explicit loopback selection below
+# avoids depending on runner hostname resolution or its external interfaces.
 # Representative cases run by default; the full matrix needs this opt-in.
 _FULL = pytest.mark.skipif(
     os.environ.get("ZING_FULL_TILE_TESTS") != "1",
@@ -69,7 +71,12 @@ def _worker(
         )
         klvae.get_tile_parallel_state = lambda: (rank, size)
         klvae.get_decode_parallel_group_coordinator = lambda: group
-        model = configure_tiling(codecs, stack)
+        # This matrix exercises distributed ownership, lifecycle and exactness.
+        # Keep a real residual block at the lowest spatial resolution, plus all
+        # temporal/spatial downsampling and BF16 paths, so CPUs without native
+        # BF16 acceleration can run it. Full-depth kernel coverage stays in
+        # test_zing_h3_progressive_kernel.py with the default fixture.
+        model = configure_tiling(codecs, stack, num_res_blocks=[0, 0, 1])
         if heterogeneous:
             model.split_tiles = lambda length, is_decoder=False: (
                 [0, 8, 20],
@@ -214,8 +221,9 @@ def _worker(
 )
 def test_distributed_tile_ownership_and_exact_moments(tmp_path, stack, size, canvas):
     torch.set_num_threads(1)
-    if sys.platform == "darwin":
-        os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo0")
+    os.environ.setdefault(
+        "GLOO_SOCKET_IFNAME", "lo0" if sys.platform == "darwin" else "lo"
+    )
     mp.start_processes(
         _worker,
         args=(size, str(tmp_path / "rendezvous"), stack, canvas, None),
@@ -235,8 +243,9 @@ def test_distributed_tile_ownership_and_exact_moments(tmp_path, stack, size, can
 )
 def test_distributed_failure_is_consistent(tmp_path, failure):
     torch.set_num_threads(1)
-    if sys.platform == "darwin":
-        os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo0")
+    os.environ.setdefault(
+        "GLOO_SOCKET_IFNAME", "lo0" if sys.platform == "darwin" else "lo"
+    )
     mp.start_processes(
         _worker,
         args=(2, str(tmp_path / "rendezvous"), False, 24, failure),
@@ -248,8 +257,9 @@ def test_distributed_failure_is_consistent(tmp_path, failure):
 
 def test_default_sp1_sp2_sp4_bitwise_moments(tmp_path):
     torch.set_num_threads(1)
-    if sys.platform == "darwin":
-        os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo0")
+    os.environ.setdefault(
+        "GLOO_SOCKET_IFNAME", "lo0" if sys.platform == "darwin" else "lo"
+    )
     reference = str(tmp_path / "sp1.pt")
     for size in (1, 2, 4):
         mp.start_processes(
@@ -275,8 +285,9 @@ def test_default_sp1_sp2_sp4_bitwise_moments(tmp_path):
 def test_performance_auto_distributed_lifecycle(tmp_path, failure):
     # CPU/Gloo checks dispatch and lifecycle only; not cuDNN numerical acceptance.
     torch.set_num_threads(1)
-    if sys.platform == "darwin":
-        os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo0")
+    os.environ.setdefault(
+        "GLOO_SOCKET_IFNAME", "lo0" if sys.platform == "darwin" else "lo"
+    )
     mp.start_processes(
         _worker,
         args=(
@@ -313,8 +324,9 @@ def test_bounded_batch_auto_shards_and_unequal_work(
     tmp_path, size, batch_size, heterogeneous, encode_mode
 ):
     torch.set_num_threads(1)
-    if sys.platform == "darwin":
-        os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo0")
+    os.environ.setdefault(
+        "GLOO_SOCKET_IFNAME", "lo0" if sys.platform == "darwin" else "lo"
+    )
     mp.start_processes(
         _worker,
         args=(

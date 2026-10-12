@@ -288,6 +288,7 @@ def test_causal_export_versions_validate_routing_and_timesteps(
     )
     pipeline = object.__new__(ZingH3CausalPipeline)
     pipeline.model_path = str(tmp_path)
+    pipeline.conditioning_mode = "local"
 
     def load(config):
         (tmp_path / "zing_config.json").write_text(json.dumps(config))

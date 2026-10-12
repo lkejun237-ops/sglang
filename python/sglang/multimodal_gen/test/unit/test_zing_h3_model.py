@@ -306,7 +306,7 @@ def test_generation_stage_connects_prompt_dit_and_decoder(model):
     )
     seen = []
 
-    def prepare(raw, use):
+    def prepare(raw, use, *, conditioning=None):
         seen.append(raw)
         return inputs
 
@@ -758,6 +758,7 @@ def _realtime_batch(index, session):
         extra={},
         metrics=None,
         realtime_session_id="zing-session",
+        realtime_event_id=None,
         block_idx=index,
         session=session,
     )
@@ -901,6 +902,8 @@ def test_taeh3_stage_preserves_frames_and_block_provenance(pattern, latent_end, 
             batch = SimpleNamespace(
                 block_idx=index, request_id=f"r{index}", realtime_event_id=index
             )
+            # The normal sampling entry point snapshots the effective prompt.
+            state.prompt_event = batch.realtime_event_id
             final = cursor == latent_end
             ready = stage._queue_realtime_output(batch, state, cursor, "stable", final)
             if ready:
