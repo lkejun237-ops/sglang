@@ -7,13 +7,17 @@ import json
 import math
 import tempfile
 import time
+import uuid
 from collections import deque
 from copy import copy
 from dataclasses import asdict
 from pathlib import Path
 
 import msgspec.msgpack
+import zmq
+import zmq.asyncio
 from PIL import Image  # noqa: F401 - preserve the existing CPU validation seam
+
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter import (
     BaseRealtimeModelAdapter,
     RealtimeChunkInputs,
@@ -117,6 +121,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         profile = json.loads(
             (Path(args.model_path) / "zing_realtime_profile.json").read_text()
         )
+        # require raises ContractError explicitly and is unaffected by python -O.
+        # Four steps are the source API deployment contract, not an overlap algorithm limit.
         require(
             runtime.get("causal") is True
             and profile.get("model_config_sha256")
@@ -154,6 +160,20 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             or request.guidance_scale == profile["guidance_scale"],
             "The requested guidance does not match this model.",
         )
+        # Only the server deployment profile selects the window; clients cannot override 21/3.
+        window = profile.get(
+            "source_attention_window", {"window_chunks": 21, "sink_chunks": 3}
+        )
+        require(
+            isinstance(window, dict)
+            and set(window) == {"window_chunks", "sink_chunks"}
+            and type(window["window_chunks"]) is int
+            and type(window["sink_chunks"]) is int
+            and 1 <= window["window_chunks"] <= 21
+            and 0 <= window["sink_chunks"] < window["window_chunks"],
+            "The deployed model is not configured for four-step streaming.",
+        )
+        self.source_attention_window = dict(window)
         source = getattr(request, "source_stream", None)
         width, height = map(int, request.size.split("x"))
         fps = int(runtime["h3_media_config"]["fps"])
@@ -270,8 +290,12 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
 
             await verify_presentation_upload(session, item["payload"], item["format"])
             reserve_media_storage(session, len(item["payload"]))
+            # Workers read reference media from the session's private directory.
+
             if session.input_temp_dir is None:
-                session.input_temp_dir = tempfile.mkdtemp(prefix="sglang_zing_source_")
+                session.input_temp_dir = tempfile.mkdtemp(
+                    prefix="sglang_zing_source_", dir="/tmp"
+                )
             path = Path(session.input_temp_dir) / f"media-{i}.{item['format']}"
             path.write_bytes(item["payload"])
             descriptor = dict(type=item["type"], id=item["id"], uri=str(path))
@@ -299,9 +323,16 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         self._source_reservations, self._inflight_reservations = {}, []
         self._s0_reservation = None
         self.pending_frames, self.end, self.end_dispatched = 0, None, False
+        from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
+            source_work_quantum,
+        )
+
+        self.source_work_quantum = source_work_quantum()
+        self.more_work = False
         self.clip, self.reference_paths, self.profile = clip, reference_paths, profile
         self.reference_ids = [ref["id"] for ref in self.reference_items]
         self.source_encoder = profile.get("source_encoder", default_source_encoder())
+        self._initialize_source_admission(session, limits)
         self.first_source_received_unix_ns = None
         self.pending_prompt = None
         self.prompt_event = None
@@ -331,8 +362,58 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             "user_media_video_clip": {"start": 0, "end": 0},
         }
 
+    def _initialize_source_admission(self, session, limits):
+        """Initialize private source prefetch; ledger and Encoder still enforce capacity."""
+        self.admission_socket = self.admission_context = None
+        remote = self.source_encoder.get("remote", {})
+        if remote.get("cross_dispatch_prefetch", False):
+            require(
+                remote.get("mode") == "overlap",
+                "Source prefetch requires an overlap deployment.",
+            )
+            if session.input_temp_dir is None:
+                session.input_temp_dir = tempfile.mkdtemp(
+                    prefix="sglang_zing_source_", dir="/tmp"
+                )
+            endpoint = "ipc://" + str(
+                Path(session.input_temp_dir) / (uuid.uuid4().hex + ".sock")
+            )
+            self.source_encoder = {
+                **self.source_encoder,
+                "remote": {**remote, "admission_endpoint": endpoint},
+            }
+            self.admission_context = zmq.asyncio.Context()
+            self.admission_socket = self.admission_context.socket(zmq.PUSH)
+            self.admission_socket.setsockopt(zmq.LINGER, 0)
+            self.admission_socket.setsockopt(zmq.SNDHWM, limits.pending_frames + 1)
+            try:
+                # PUSH/PULL sends accepted inputs one way; LINGER=0 avoids waiting on shutdown.
+                # SNDHWM bounds messages, not the separately validated frame or byte budgets.
+                self.admission_socket.bind(endpoint)
+            except BaseException:
+                self.admission_socket.close()
+                self.admission_context.term()
+                self.admission_socket = self.admission_context = None
+                raise
+
     def session_ready_message(self, session):
         return self.ready
+
+    async def _admit_source(self, op, payload):
+        if self.admission_socket is None:
+            return
+        # append carries frame start/count/shape and a separate RGB part; finish carries EOS.
+        # Headers validate order, capacity and EOS separately from open/pop/close RPCs.
+        header = {
+            "op": op,
+            "width": self.config["width"],
+            "height": self.config["height"],
+            **{key: value for key, value in payload.items() if key != "data"},
+        }
+        parts = [json.dumps(header).encode()]
+        if op == "append":
+            parts.append(payload["data"])
+        await asyncio.wait_for(self.admission_socket.send_multipart(parts), timeout=120)
 
     async def ingest_wire_event(self, ws, session, data, message_bytes):
         kind = data.get("kind")
@@ -377,11 +458,18 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             )
             self.pending_frames += payload["num_frames"]
             self.available.set()
+            # The first dispatch creates the admission receiver. Publish accepted
+            # work before awaiting its connection; the producer still validates
+            # admission identity before encoding, in either arrival order.
+            await self._admit_source("append", payload)
         elif kind == "source.end":
             require(
                 isinstance(payload, dict), "Please provide the final source position."
             )
             self.ledger.finish(payload.get("source_frame_end"), event_id=event_id)
+            await self._admit_source(
+                "finish", {"source_frame_end": self.ledger.accepted_frames}
+            )
             self.end = dict(frame_end=self.ledger.accepted_frames, event_id=event_id)
             self.available.set()
         elif kind == "prompt":
@@ -422,12 +510,18 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             if self.auto_source_preview or self.source_encoder["mode"] == "progressive"
             else self.clip
         )
-        while self.pending_frames < minimum and self.end is None:
+        while (
+            not self.more_work
+            and self.pending_frames < minimum
+            and (self.end is None or self.end_dispatched)
+        ):
             if self.ledger.closed:
                 raise asyncio.CancelledError("Source session has closed")
             self.available.clear()
             await self.available.wait()
 
+        if self.more_work:
+            return
         target, automatic_budget = self._joint_wait_target()
         configured_budget = self.profile.get("joint_wait_ms", "auto")
         budget = automatic_budget if configured_budget == "auto" else configured_budget
@@ -573,7 +667,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         params.zing_solver = self.profile["solver"]
         params.zing_denoising_step_list = self.profile["denoising_step_list"]
         params.zing_realtime_decode_mode = "stable"
-        params.zing_window_chunks, params.zing_sink_chunks = 21, 3
+        params.zing_window_chunks = self.source_attention_window["window_chunks"]
+        params.zing_sink_chunks = self.source_attention_window["sink_chunks"]
         params.zing_rope_position_mode, params.zing_rope_max_frame_gap = (
             "block_relative",
             12,
@@ -583,7 +678,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
     def prepare_next_request(self, session, server_args, chunk):
         batch = super().prepare_next_request(session, server_args, chunk)
         appends, count = [], 0
-        while self.pending and count < self.clip:
+        while not self.more_work and self.pending and count < self.clip:
             item = self.pending.popleft()
             reservation = self._source_reservations.pop(
                 item["payload"]["client_seq"], None
@@ -594,13 +689,14 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             appends.append(item)
         self.pending_frames -= count
         self.dispatched_source_frames += count
-        end = self.end if not self.pending else None
-        if self.end_dispatched:
+        end = self.end if not self.pending and not self.end_dispatched else None
+        if self.end_dispatched and not self.more_work:
             raise ValueError("Source end was already dispatched")
-        self.end_dispatched = end is not None
+        self.end_dispatched = self.end_dispatched or end is not None
         batch.extra["zing_reference_ids"] = self.reference_ids
         batch.extra["zing_source_command"] = dict(
             config=self.config,
+            async_output=self.profile.get("async_source_output", False),
             appends=appends,
             end=end,
             encoder=self.source_encoder,
@@ -620,6 +716,9 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
 
     def on_chunk_complete(self, session, result):
         super().on_chunk_complete(session, result)
+        more_work = (result.usage or {}).get("zing_source_more_work", False)
+        require(type(more_work) is bool, "Invalid source continuation state.")
+        self.more_work = bool(self.source_work_quantum and more_work)
         for reservation in self._inflight_reservations:
             reservation.release()
         self._inflight_reservations.clear()
@@ -657,6 +756,10 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         return total
 
     def clear_state(self, session):
+        if getattr(self, "admission_socket", None) is not None:
+            self.admission_socket.close()
+            self.admission_context.term()
+            self.admission_socket = self.admission_context = None
         if hasattr(self, "ledger"):
             self.ledger.dispose()
             self.pending.clear()

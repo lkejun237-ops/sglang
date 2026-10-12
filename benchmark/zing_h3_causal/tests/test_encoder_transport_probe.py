@@ -24,9 +24,11 @@ def test_disposal_requires_producer_close_ack_even_after_local_state_is_released
     session.disposed = False
     session.failure = None
     session.accepted_frames = 34
+    session.prefetched_frames = 34
     session._consumed = 0
     session.signature = (480, 832)
     session.remote_usage = {"retained_bytes": 4096, "temporal_positions": 2}
+    session.admission_digests = {}
     session.commands = queue.Queue()
     session.results = queue.Queue()
     session.commands.put(("finish", None, None))
@@ -64,6 +66,7 @@ def test_reset_cannot_erase_the_old_producer_close_failure(close_fails):
                 config,
             )
             self.disposed = False
+            self.admission_endpoint = None
             self.failure = None
             self.generation = getattr(self, "generation", 0) + 1
 

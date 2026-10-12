@@ -251,6 +251,7 @@ def test_worker_rejects_invalid_encoder_output_and_releases_all_state():
 def test_explicit_factory_selection_and_version_guard(monkeypatch):
     import sys
     from types import ModuleType
+
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.progressive_encoder import (
         PROGRESSIVE_ENCODER_VERSION,
     )
@@ -424,6 +425,7 @@ def test_source_s0_uses_memory_unless_video_is_explicit(explicit_video):
 def test_dispose_receipt_identifies_worker_and_is_emitted_once(monkeypatch, rank):
     import json
     import os
+
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
         source_session,
     )
@@ -452,11 +454,105 @@ def test_dispose_receipt_identifies_worker_and_is_emitted_once(monkeypatch, rank
     assert state.closed and state.sampler is None
 
 
+@pytest.mark.parametrize("frames", range(1, 35))
+def test_quantum_one_drains_eos_by_continuation_without_new_input(monkeypatch, frames):
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", "1")
+    state, stage = session(ChunkPlan([1, 2, 2]))
+    sampler = state.sampler
+    # The existing synthetic Decoder intentionally holds all RGB until EOS:
+    # zero-output continuations must still advance rather than waiting for input.
+    cursor = sequence = 0
+    results = []
+    while cursor < frames:
+        count = min(17, frames - cursor)
+        result = state.run(stage, batch(state, cursor, count, sequence))
+        cursor += count
+        sequence += 1
+        results.append(result)
+        while result.usage["zing_source_more_work"]:
+            before = len(sampler.calls)
+            result = state.run(stage, batch(state, cursor, 0, sequence))
+            results.append(result)
+            assert len(sampler.calls) - before <= 1
+    result = state.run(stage, batch(state, cursor, 0, sequence, final=True))
+    results.append(result)
+    for _ in range(20):
+        if result.usage["zing_source_complete"]:
+            break
+        assert result.usage["zing_source_more_work"]
+        result = state.run(stage, batch(state, cursor, 0, sequence))
+        results.append(result)
+    assert result.usage["zing_source_complete"] and state.closed
+    assert all(r.usage["zing_source_dispatch_steps"] <= 1 for r in results)
+    assert (
+        sum(b["num_frames"] for r in results for b in r.usage["zing_realtime_blocks"])
+        == frames
+    )
+
+
+def test_quantum_yields_ready_rgb_before_next_dit_step(monkeypatch):
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", "1")
+    state, stage = session(ChunkPlan([1, 2, 2]))
+
+    class StepDecoder:
+        buffered_latents = 0
+        ready = False
+        emitted = latents = 0
+        closed = False
+
+        def append(self, latent, **kwargs):
+            self.latents += latent.shape[2]
+            self.end = 1 + (self.latents - 1) * 4
+            self.dependency = kwargs["source_dependency_end"]
+            self.ready = True
+
+        def pop(self):
+            self.ready = False
+            start = self.emitted
+            self.emitted = self.end
+            return NS(
+                start=start,
+                end=self.end,
+                values=torch.zeros(1, 3, self.end - start, 1, 1),
+                provenance=state.ledger.provenance_for(
+                    PixelRange(start, self.end), self.dependency
+                ),
+            )
+
+        def finish(self, **kwargs):
+            pass
+
+        def dispose(self):
+            self.closed = True
+
+    state.decoder = StepDecoder()
+    sampler = state.sampler
+    result = state.run(stage, batch(state, 0, 17, 0))
+    assert (
+        len(sampler.calls) == 1
+        and result.usage["zing_realtime_blocks"][0]["num_frames"] == 1
+    )
+    assert result.usage["zing_source_more_work"]
+    stale = batch(state, 17, 0, 1)
+    result = state.run(stage, stale)
+    assert (
+        len(sampler.calls) == 2
+        and result.usage["zing_realtime_blocks"][0]["num_frames"] == 8
+    )
+    with pytest.raises(ValueError, match="consecutive"):
+        state.run(stage, stale)
+    state.dispose()
+    with pytest.raises(ValueError, match="consecutive"):
+        state.run(stage, batch(state, 17, 0, 1))
+
+
+@pytest.mark.parametrize("quantum", [0, 1])
 @pytest.mark.parametrize("queue_bytes", [1024, 16])
 @pytest.mark.parametrize("capture", [False, True])
 def test_joint_ready_worker_batches_without_crossing_command_boundary(
-    queue_bytes, capture
+    monkeypatch, queue_bytes, capture, quantum
 ):
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", str(quantum))
     from collections import deque
 
     class JointSampler(SyntheticSampler):
@@ -511,10 +607,19 @@ def test_joint_ready_worker_batches_without_crossing_command_boundary(
     # Multiple codec slices are ready in this command; a small byte budget
     # must fall back before popping the next bridge chunk.
     result = state.run(stage, batch(state, 0, 17, 0, final=True))
-    assert sum(x.shape[1] for x in result.output) == 17
+    results = [result]
+    for _ in range(20):
+        if result.usage["zing_source_complete"]:
+            break
+        assert result.usage["zing_source_more_work"]
+        result = state.run(stage, batch(state, 17, 0, 1))
+        results.append(result)
+    assert sum(x.shape[1] for r in results for x in (r.output or [])) == 17
+    if quantum:
+        assert all(r.usage["zing_source_dispatch_steps"] <= quantum for r in results)
     assert not sampler.pending
     assert state.closed
-    assert max(sampler.batches) == (2 if queue_bytes == 1024 else 1)
+    assert max(sampler.batches) == (2 if queue_bytes == 1024 and not quantum else 1)
     if capture:
         assert len(captured) == 3
         assert all(
@@ -525,7 +630,7 @@ def test_joint_ready_worker_batches_without_crossing_command_boundary(
         assert [final for _, _, final in captured] == [False, False, False]
     else:
         assert not captured
-    if queue_bytes == 16:
+    if queue_bytes == 16 and not quantum:
         assert (
             sampler.sampler.last_run_metrics["joint_fallbacks"]["ready_queue_capacity"]
             > 0

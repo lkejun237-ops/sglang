@@ -298,6 +298,10 @@ def validate_serial_overlap(root, spec, config=None, *, require_parity=True):
                 "encoder_tile_mode",
                 "progressive_decode",
                 "source_batch_pattern",
+                "source_chunk_plan",
+                "source_attention_window",
+                "cross_dispatch_prefetch",
+                "async_source_output",
                 "width",
                 "height",
             )
@@ -348,6 +352,10 @@ def validate_correctness(root, specs, config):
             "encoder_tile_mode",
             "progressive_decode",
             "source_batch_pattern",
+            "source_chunk_plan",
+            "source_attention_window",
+            "cross_dispatch_prefetch",
+            "async_source_output",
             "width",
             "height",
         )

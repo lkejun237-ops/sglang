@@ -1,5 +1,11 @@
 # Repository instructions
 
+## 部署会话模型
+
+- 用户于 2026-10-10 明确确认：后续部署统一采用单活跃会话模型，一个部署实例同时只服务一个用户，不支持并发活跃会话。
+- 设计、实现、审查和验收均按此约束执行；不预先增加多会话容量配置、多 owner 状态或并发调度。已有活跃会话时拒绝第二个会话，且不得影响当前会话。
+- 保留 session/generation 身份校验，以及断连、取消、故障、EOS 后释放资源和下一会话可用性的测试；这些是单活跃会话生命周期保障。
+
 ## 项目级 Infra Skills
 
 本项目直接使用 [seedleap/infra-skills](https://github.com/seedleap/infra-skills)

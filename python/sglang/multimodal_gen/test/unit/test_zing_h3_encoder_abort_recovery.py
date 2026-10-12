@@ -1,15 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Actual private-control helper tests; no GPU/NCCL recovery claim."""
 
+import importlib.util
 import threading
 import time
+from pathlib import Path
 
 import pytest
 import zmq
 
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
-    encoder_recovery as recovery,
+_spec = importlib.util.spec_from_file_location(
+    "zing_encoder_recovery_cpu",
+    Path(__file__).resolve().parents[2]
+    / "runtime/pipelines_core/stages/model_specific_stages/zing_h3/encoder_recovery.py",
 )
+recovery = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(recovery)
 
 
 def test_fresh_socket_after_open_acknowledged_append_timeout():
@@ -150,14 +156,15 @@ def test_blocked_worker_is_unconfirmed_not_released():
 def test_actual_producer_recovers_unknown_ack_and_marks_data_failure(
     monkeypatch, failure_at
 ):
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
-        remote_encoder,
-    )
     import contextlib
     import json
     import queue
     from datetime import timedelta
     from types import SimpleNamespace
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        remote_encoder,
+    )
 
     sent, recovered, closed = [], [], []
 
@@ -229,6 +236,8 @@ def test_actual_producer_recovers_unknown_ack_and_marks_data_failure(
         device=0,
         profile_dir=None,
         remote_usage={},
+        admission_endpoint=None,
+        accepted_frames=1,
         capacity_frames=51,
         capacity_bytes=1024,
         failure=None,

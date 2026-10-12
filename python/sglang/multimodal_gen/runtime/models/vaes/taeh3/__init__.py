@@ -50,8 +50,8 @@ class TAEH3Decoder(nn.Module):
         self.requires_grad_(False)
         self.eval()
 
-    def new_stream(self):
-        return TAEH3Stream(self)
+    def new_stream(self, *, progressive=False):
+        return TAEH3Stream(self, progressive=progressive)
 
     @torch.no_grad()
     def decode(self, latent, frames):
@@ -76,14 +76,19 @@ class TAEH3Stream:
     memory. Never distribute time chunks to independent decoder instances.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, *, progressive=False):
+        if type(progressive) is not bool:
+            raise ValueError("TAEH3 progressive flag must be boolean")
         self.model = model
+        self.progressive = progressive
         self.reset()
 
     def reset(self):
         self.memory = [None] * len(self.model.decoder)
         self.pending = self.tail = self.last_latent = None
         self.latents_seen = self.raw_frames = self.frames_emitted = 0
+        self.raw_frame_shape = None
+        self.decoded_latents = 0
         self.closed = False
 
     def close(self):
@@ -102,7 +107,12 @@ class TAEH3Stream:
             decoder_precision(latent.dtype),
             torch.autocast(device_type=latent.device.type, enabled=False),
         ):
-            return self._decode_layers(latent)
+            start = self.decoded_latents
+            end = start + latent.shape[2]
+            with torch.profiler.record_function(f"Zing.TAEH3.decode.latents_{start}_{end}"):
+                result = self._decode_layers(latent)
+            self.decoded_latents = end
+            return result
 
     def _decode_layers(self, latent):
         x = latent.transpose(1, 2).contiguous()
@@ -125,6 +135,7 @@ class TAEH3Stream:
         return x.reshape(n, -1, *x.shape[1:])
 
     def _accept_raw(self, raw):
+        self.raw_frame_shape = (raw.shape[0], *raw.shape[2:])
         # Prefix trim is per five-latent group, not just at stream startup.
         positions = torch.arange(raw.shape[1], device=raw.device) + self.raw_frames
         self.raw_frames += raw.shape[1]
@@ -156,8 +167,9 @@ class TAEH3Stream:
             latent if self.pending is None else torch.cat((self.pending, latent), dim=2)
         )
         outputs = []
-        while self.pending.shape[2] >= 5:
-            chunk, self.pending = self.pending[:, :, :5], self.pending[:, :, 5:]
+        while self.pending.shape[2] >= (1 if self.progressive else 5):
+            count = min(2, self.pending.shape[2]) if self.progressive else 5
+            chunk, self.pending = self.pending[:, :, :count], self.pending[:, :, count:]
             outputs.append(self._accept_raw(self._decode(chunk)))
         self.pending = self.pending.clone()
         return torch.cat(outputs, dim=2) if outputs else self._empty(latent)
@@ -184,6 +196,17 @@ class TAEH3Stream:
             raw = self._decode(self.pending)
             raw = torch.nn.functional.pad(
                 raw, (0, 0, 0, 0, 0, 0, 0, -raw.shape[1] % 20)
+            )
+            outputs.append(self._accept_raw(raw))
+        elif self.progressive and self.raw_frames % 20:
+            # Small pushes already decoded the final latent. Preserve upstream
+            # RAW-pixel zero padding before per-group trim and the 12-frame tail.
+            raw = self.last_latent.new_zeros(
+                (
+                    self.raw_frame_shape[0],
+                    (-self.raw_frames) % 20,
+                    *self.raw_frame_shape[1:],
+                )
             )
             outputs.append(self._accept_raw(raw))
         result = torch.cat(outputs, dim=2) if outputs else self._empty(self.last_latent)

@@ -1211,6 +1211,14 @@ async def _process_realtime_generation_batch(batch):
         raise
 
 
+async def _wait_for_source_chunk_output(adapter, pending_send_task):
+    if getattr(adapter, "source_work_quantum", 0) and pending_send_task is not None:
+        # Prior RGB/provenance must be sent before more experimental GPU work.
+        await pending_send_task
+        return None
+    return pending_send_task
+
+
 async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
     adapter = session.adapter
     if adapter is None:
@@ -1221,6 +1229,9 @@ async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
     while not session.reached_max_chunks():
         current_result: OutputBatch | None = None
         try:
+            pending_send_task = await _wait_for_source_chunk_output(
+                adapter, pending_send_task
+            )
             pending_send_task = await _wait_for_realtime_interactive_event_window(
                 session,
                 pending_send_task,

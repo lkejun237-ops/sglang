@@ -59,6 +59,22 @@ def trace_intervals(path, scope_name):
         for e in events
         if event_kind(e) == "cpu_annotation" and e.get("name") == scope_name
     ]
+    if scope_name == "Zing.encoder_cross_dispatch":
+        scopes = []
+        pattern = re.compile(
+            r"^Zing\.encoder_prefetch\.latent_start_(\d+)\.source_end_(\d+)\.dispatch_end_(\d+)$"
+        )
+        for event in events:
+            match = pattern.match(str(event.get("name", "")))
+            if event_kind(event) != "cpu_annotation" or match is None:
+                continue
+            latent, source, dispatched = map(int, match.groups())
+            phase = latent % 5
+            if phase not in (0, 1, 3):
+                continue
+            dependency = min(source, latent // 5 * 17 + {0: 1, 1: 9, 3: 17}[phase])
+            if dependency > dispatched:
+                scopes.append(event)
     # #178 exposes per-tile compute scopes. Gather is deliberately excluded.
     if not scopes and scope_name == "Zing.encoder_tiles":
         scopes = [
@@ -69,9 +85,11 @@ def trace_intervals(path, scope_name):
                 ("H3ProgressiveTile/", "H3ProgressiveTiles/")
             )
         ]
-    if scope_name in ("Zing.encoder_tiles", "Zing.source_dit") or scope_name.startswith(
-        "Zing.source_decode"
-    ):
+    if scope_name in (
+        "Zing.encoder_tiles",
+        "Zing.encoder_cross_dispatch",
+        "Zing.source_dit",
+    ) or scope_name.startswith("Zing.source_decode"):
         collective = re.compile(PATTERNS["collectives"], re.I)
         events = [
             e
@@ -133,9 +151,37 @@ def overlap_evidence(cell, sp, enc):
                 )
             streams[kind].extend(intervals)
     duration = intersection_us(streams["encoder"], streams["dit"]) / 1000
+    future_intervals, decoder_intervals, future_evidence = [], [], []
+    future_verified = decoder_verified = True
+    for path in encoder:
+        intervals, status = trace_intervals(path, "Zing.encoder_cross_dispatch")
+        future_evidence.append(dict(path=str(path), status=status))
+        if intervals is None:
+            future_verified = False
+        else:
+            future_intervals.extend(intervals)
+    for path in dit:
+        intervals, status = trace_intervals(path, "Zing.source_decode")
+        if intervals is None:
+            decoder_verified = False
+        else:
+            decoder_intervals.extend(intervals)
+    cross_dispatch_dit_ms = (
+        intersection_us(future_intervals, streams["dit"]) / 1000
+        if future_verified
+        else None
+    )
+    cross_dispatch_decoder_ms = (
+        intersection_us(future_intervals, decoder_intervals) / 1000
+        if future_verified and decoder_verified
+        else None
+    )
     return dict(
         status="aligned_kernel_evidence",
         observed_overlap_ms=duration,
+        cross_dispatch_dit_overlap_ms=cross_dispatch_dit_ms,
+        cross_dispatch_decoder_overlap_ms=cross_dispatch_decoder_ms,
+        cross_dispatch_evidence=future_evidence,
         evidence=evidence,
         semantics="Union across ranks on one node; communication and decoder kernels excluded; profiler run only",
     )
@@ -243,12 +289,26 @@ def soak_evidence(root):
     events = [json.loads(line) for line in events_path.read_text().splitlines()]
     sid = next(e["message"]["session_id"] for e in events if e["kind"] == "ready")
     deliveries = [e for e in events if e["kind"] == "frames"]
-    steps = []
+    steps, output_snapshots = [], {}
     for line in (cell / "server.log").read_text().splitlines():
         if "zing_source_step " in line:
             row = json.loads(line.split("zing_source_step ", 1)[1])
             if row["session_id"] == sid:
                 steps.append(row)
+        elif "zing_source_output " in line:
+            row = json.loads(line.split("zing_source_output ", 1)[1])
+            if row["session_id"] == sid:
+                output_snapshots[row["request_id"]] = row["memory"]
+    for row in steps:
+        if row.get("request_id") in output_snapshots:
+            row["memory"]["output_transport"] = output_snapshots[row["request_id"]]
+            row["memory"].update(
+                {
+                    key: value
+                    for key, value in output_snapshots[row["request_id"]].items()
+                    if key.startswith("gpu_")
+                }
+            )
     windows = []
     for start in (0, 30, 60, 90):
         latency = sorted(
@@ -273,6 +333,8 @@ def soak_evidence(root):
                 for k in (
                     "gpu_allocated_bytes",
                     "gpu_reserved_bytes",
+                    "gpu_peak_allocated_bytes",
+                    "gpu_peak_reserved_bytes",
                     "codec_pixel_frames",
                     "bridge_bytes",
                     "pending_blocks",
@@ -280,6 +342,15 @@ def soak_evidence(root):
                 if samples and all(k in s for s in samples)
             }
             queues = [s["encoder_queues"] for s in samples if "encoder_queues" in s]
+            output_queues = [
+                sample["output_transport"]
+                for sample in samples
+                if "output_transport" in sample
+            ]
+            if output_queues:
+                ranks[rank]["output_transport_maxima"] = {
+                    key: max(q[key] for q in output_queues) for key in output_queues[0]
+                }
             if queues:
                 ranks[rank]["encoder_queue_maxima"] = {
                     k: max(q[k] for q in queues) for k in queues[0]

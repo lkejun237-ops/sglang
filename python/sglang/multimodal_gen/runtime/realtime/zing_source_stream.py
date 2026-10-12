@@ -238,3 +238,13 @@ class SourceLedger:
     def dispose(self):
         self.records.clear()
         self.closed = True
+
+
+def source_work_quantum():
+    """Trusted experimental deployment policy, never a client request field."""
+    import os
+
+    value = os.environ.get("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", "0")
+    if value not in ("0", "1"):
+        raise ValueError("Source work quantum must be 0 or 1")
+    return int(value)

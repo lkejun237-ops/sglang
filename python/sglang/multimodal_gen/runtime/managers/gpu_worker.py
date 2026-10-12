@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import gc
+import json
 import logging
 import multiprocessing as mp
 import os
@@ -945,6 +946,40 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     post_process_sample,
                 )
                 output_batch.output = None
+                if getattr(req, "extra", {}).get("zing_source_command"):
+                    memory = dict(
+                        mode="sync",
+                        payload_bytes=sum(
+                            len(frame)
+                            for video in output_batch.raw_frame_batches
+                            for frame in video
+                        ),
+                        gpu_allocated_bytes=torch.cuda.memory_allocated(),
+                        gpu_reserved_bytes=torch.cuda.memory_reserved(),
+                        gpu_peak_allocated_bytes=torch.cuda.max_memory_allocated(),
+                        gpu_peak_reserved_bytes=torch.cuda.max_memory_reserved(),
+                    )
+                    output_batch.usage.setdefault("zing_source_memory", {}).update(
+                        {
+                            key: value
+                            for key, value in memory.items()
+                            if key.startswith("gpu_")
+                        }
+                    )
+                    # Serialize per-dispatch acceptance logs only when DEBUG is enabled.
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "zing_source_output %s",
+                            json.dumps(
+                                dict(
+                                    session_id=req.realtime_session_id,
+                                    request_id=req.request_id,
+                                    dispatch_index=req.block_idx,
+                                    rank=self.rank,
+                                    memory=memory,
+                                )
+                            ),
+                        )
         output_batch.audio = None
         output_batch.audio_sample_rate = None
 
@@ -955,6 +990,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> bool:
         """Use the local single-GPU TAEHV asynchronous RGB24 transport when safe."""
         output = output_batch.output
+        source_async = (
+            getattr(req, "extra", {})
+            .get("zing_source_command", {})
+            .get("async_output", False)
+        )
+        if type(source_async) is not bool:
+            raise ValueError("Source async output flag must be boolean")
+        if source_async and isinstance(output, list):
+            output = [value.unsqueeze(0) for value in output]
+        segments = output if isinstance(output, list) else [output]
         vae_config = getattr(self.server_args.pipeline_config, "vae_config", None)
         if not (
             self.rank == 0
@@ -962,19 +1007,38 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             and getattr(self.server_args, "realtime_vae_backend", None)
             == LOCAL_VAE_BACKEND
             and is_local_endpoint(getattr(self.server_args, "scheduler_endpoint", ""))
-            and getattr(vae_config, "taehv_checkpoint_path", None)
+            and (
+                getattr(vae_config, "taehv_checkpoint_path", None)
+                or (
+                    source_async
+                    and getattr(
+                        self.server_args.pipeline_config, "video_decoder_backend", None
+                    )
+                    == "taeh3"
+                )
+            )
             and not getattr(req, "is_warmup", False)
             and bool(getattr(req, "realtime_session_id", None))
             and bool(getattr(req, "realtime_generation_id", None))
             and not req.enable_frame_interpolation
             and not req.enable_upscaling
-            and isinstance(output, torch.Tensor)
-            and output.device.type == "cuda"
-            and output.dim() == 5
-            and int(output.shape[1]) == 3
+            and bool(segments)
+            and all(
+                isinstance(value, torch.Tensor)
+                and value.device.type == "cuda"
+                and value.dim() == 5
+                and int(value.shape[1]) == 3
+                for value in segments
+            )
         ):
+            if source_async:
+                raise ValueError(
+                    "Source async RGB requires a local single-GPU TAEH3 deployment"
+                )
             return False
 
+        # The two-slot materializer owns RGB conversion, async D2H, shared memory and cancellation.
+        # CUDA events guard reads; full slots apply backpressure to source output.
         materializer = getattr(self, "_async_raw_frame_materializer", None)
         if materializer is None:
             materializer = AsyncRawRGBFrameMaterializer()
@@ -987,14 +1051,44 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 chunk_index=req.block_idx,
                 session_id=req.realtime_session_id,
                 generation_id=req.realtime_generation_id,
+                wait_for_slot=source_async,
             )
         except Exception:
+            if source_async:
+                raise
             logger.warning(
                 "async raw RGB transport unavailable; using synchronous fallback",
                 exc_info=True,
             )
             return False
 
+        if source_async:
+            # usage travels with internal worker results, not directly as client frame metadata.
+            snapshot = materializer.snapshot()
+            cuda_memory = dict(
+                gpu_allocated_bytes=torch.cuda.memory_allocated(),
+                gpu_reserved_bytes=torch.cuda.memory_reserved(),
+                gpu_peak_allocated_bytes=torch.cuda.max_memory_allocated(),
+                gpu_peak_reserved_bytes=torch.cuda.max_memory_reserved(),
+            )
+            output_batch.usage.setdefault("zing_source_memory", {})[
+                "output_transport"
+            ] = snapshot
+            output_batch.usage["zing_source_memory"].update(cuda_memory)
+            # Serialize per-dispatch acceptance logs only when DEBUG is enabled.
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "zing_source_output %s",
+                    json.dumps(
+                        dict(
+                            session_id=req.realtime_session_id,
+                            request_id=req.request_id,
+                            dispatch_index=req.block_idx,
+                            rank=self.rank,
+                            memory={**snapshot, **cuda_memory},
+                        )
+                    ),
+                )
         output_batch.raw_frame_shared_memory_ref = reference
         output_batch.raw_frame_metadata = metadata
         output_batch.output = None

@@ -120,6 +120,55 @@ def test_default_encoder_dispatches_first_frame(configured):
     asyncio.run(asyncio.wait_for(adapter.wait_for_next_chunk(session), 1))
 
 
+@pytest.mark.parametrize("window", [None, {"window_chunks": 6, "sink_chunks": 3}])
+def test_window_is_frozen_from_deployment_only(configured, monkeypatch, window):
+    from pathlib import Path
+
+    path = Path(configured.model_path) / "zing_realtime_profile.json"
+    profile = json.loads(path.read_text())
+    if window is not None:
+        profile["source_attention_window"] = window
+        path.write_text(json.dumps(profile))
+    adapter, session = initialize()
+    monkeypatch.setattr(
+        source, "build_realtime_sampling_params", lambda *a, **kw: SimpleNamespace()
+    )
+    params = adapter.build_sampling_params(
+        session,
+        None,
+        SimpleNamespace(request_id="test"),
+        SimpleNamespace(prompt="original prompt"),
+        17,
+    )
+    expected = window or {"window_chunks": 21, "sink_chunks": 3}
+    assert params.zing_window_chunks == expected["window_chunks"]
+    assert params.zing_sink_chunks == expected["sink_chunks"]
+    with pytest.raises(ValueError):
+        initialize(zing_window_chunks=6)
+
+
+@pytest.mark.parametrize(
+    "window",
+    [
+        None,
+        {},
+        {"window_chunks": True, "sink_chunks": 0},
+        {"window_chunks": 22, "sink_chunks": 3},
+        {"window_chunks": 3, "sink_chunks": 3},
+        {"window_chunks": 6, "sink_chunks": -1},
+    ],
+)
+def test_invalid_deployment_window_fails_before_session(configured, window):
+    from pathlib import Path
+
+    path = Path(configured.model_path) / "zing_realtime_profile.json"
+    profile = json.loads(path.read_text())
+    profile["source_attention_window"] = window
+    path.write_text(json.dumps(profile))
+    with pytest.raises(ValueError, match="deployed model"):
+        initialize()
+
+
 def test_source_presentation_dispatches_one_frame_even_with_clip17_encoder(configured):
     from pathlib import Path
 
@@ -183,6 +232,66 @@ def test_ready_preserves_unknown_total_and_accepted_precedes_dispatch(
     asyncio.run(run())
     adapter.dispose(session)
     assert not adapter.pending and adapter.ledger.closed
+
+
+def test_admission_receiver_can_start_after_first_dispatch(configured, tmp_path):
+    adapter, session = initialize()
+    adapter.source_encoder = {"mode": "progressive"}
+
+    async def run():
+        context = source.zmq.asyncio.Context()
+        adapter.admission_context = context
+        adapter.admission_socket = context.socket(source.zmq.PUSH)
+        adapter.admission_socket.setsockopt(source.zmq.LINGER, 0)
+        endpoint = "ipc://" + str(tmp_path / "bootstrap.sock")
+        adapter.admission_socket.bind(endpoint)
+
+        class Socket:
+            async def send_bytes(self, wire):
+                assert not adapter.pending
+                assert msgspec.msgpack.decode(wire)["type"] == "source.accepted"
+
+        async def start_receiver():
+            await adapter.wait_for_next_chunk(session)
+            receiver = context.socket(source.zmq.PULL)
+            receiver.setsockopt(source.zmq.LINGER, 0)
+            receiver.connect(endpoint)
+            try:
+                header, pixels = await receiver.recv_multipart()
+                assert json.loads(header)["source_frame_start"] == 0
+                assert pixels == bytes(32 * 32 * 3)
+            finally:
+                receiver.close()
+
+        receiver = asyncio.create_task(start_receiver())
+        try:
+            await asyncio.wait_for(
+                adapter.ingest_wire_event(
+                    Socket(),
+                    session,
+                    dict(
+                        type="event",
+                        kind="source.append",
+                        event_id=1,
+                        payload=dict(
+                            client_seq=0,
+                            source_frame_start=0,
+                            num_frames=1,
+                            pts_us=0,
+                            data=bytes(32 * 32 * 3),
+                        ),
+                    ),
+                    32 * 32 * 3 + 200,
+                ),
+                2,
+            )
+            await asyncio.wait_for(receiver, 2)
+        finally:
+            receiver.cancel()
+            await asyncio.gather(receiver, return_exceptions=True)
+            adapter.clear_state(session)
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("output_format", ["raw", "jpeg", "webp"])
@@ -585,6 +694,7 @@ def test_startup_rejects_insufficient_concurrent_transport_memory():
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
     args = SimpleNamespace(
+        pipeline_config=None,  # This test covers the generic transport budget.
         batching_mode="dynamic",
         batching_max_size=1,
         batching_delay_ms=0,

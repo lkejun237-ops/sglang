@@ -313,21 +313,40 @@ def test_soak_reports_growth_without_inventing_a_pass(tmp_path):
     rows = [
         dict(
             session_id="measured",
+            request_id=f"dispatch-{n}",
             rank=0,
             source_frames=n * 720 + 1,
             memory=dict(
-                gpu_allocated_bytes=100 + n * 10, encoder_queues=dict(pending_results=2)
+                gpu_allocated_bytes=100 + n * 10,
+                gpu_peak_reserved_bytes=200,
+                encoder_queues=dict(pending_results=2),
             ),
         )
         for n in range(4)
     ]
     (cell / "server.log").write_text(
-        "\n".join("zing_source_step " + json.dumps(r) for r in rows)
+        "\n".join(
+            "zing_source_step "
+            + json.dumps(r)
+            + "\nzing_source_output "
+            + json.dumps(
+                dict(
+                    session_id="measured",
+                    request_id=r["request_id"],
+                    memory=dict(
+                        gpu_peak_reserved_bytes=240 + n * 20,
+                        pending_results=2,
+                    ),
+                )
+            )
+            for n, r in enumerate(rows)
+        )
     )
     result = soak_evidence(tmp_path)
     assert result["status"] == "collected_requires_growth_review"
     assert result["windows"][3]["p95_seconds"] == 0.4
     assert result["windows"][3]["ranks"][0]["gpu_allocated_bytes"]["last"] == 130
+    assert result["windows"][3]["ranks"][0]["gpu_peak_reserved_bytes"]["maximum"] == 300
 
 
 @pytest.mark.parametrize("enc,sp", [(1, 1), (2, 2), (2, 4), (4, 4)])
@@ -550,6 +569,14 @@ def test_correctness_gate_requires_exact_capture_and_full_wire_rgb(tmp_path):
     validate_correctness(tmp_path, specs, config)
     with pytest.raises(ValueError, match="inputs differ"):
         validate_correctness(tmp_path, specs, dict(config, cudnn_benchmark_limit=1))
+    with pytest.raises(ValueError, match="inputs differ"):
+        validate_correctness(
+            tmp_path,
+            specs,
+            dict(
+                config, source_attention_window={"window_chunks": 6, "sink_chunks": 3}
+            ),
+        )
     row["wire_rgb"] = "not_requested"
     path.write_text(json.dumps(row))
     with pytest.raises(RuntimeError, match="gate failed"):
@@ -803,7 +830,7 @@ def test_endpoint_completion_requires_full_profile_after_five_runs(
     monkeypatch.setattr(runner, "process", process)
     monkeypatch.setattr(runner, "wait_server", lambda server: None)
     monkeypatch.setattr(runner, "server_command", lambda *a, **kw: [])
-    monkeypatch.setattr(runner, "overlay", lambda model, out, *a: model)
+    monkeypatch.setattr(runner, "overlay", lambda model, out, *a, **kw: model)
     monkeypatch.setattr(runner, "client_command", lambda config, path, **kw: [path])
 
     def run(command, log, env):
@@ -895,7 +922,7 @@ def test_lifecycle_failure_isolated_from_formal_measurements(
     monkeypatch.setattr(runner, "wait_server", lambda child: None)
     monkeypatch.setattr(runner, "wait_encoder", lambda child, port: None)
     monkeypatch.setattr(runner, "server_command", lambda *a, **kw: [])
-    monkeypatch.setattr(runner, "overlay", lambda model, out, *a: model)
+    monkeypatch.setattr(runner, "overlay", lambda model, out, *a, **kw: model)
     monkeypatch.setattr(runner, "client_command", lambda config, path, **kw: [path])
     monkeypatch.setattr(
         runner,
@@ -1056,7 +1083,7 @@ def test_split_collection_preserves_complete_phase_and_no_combined_receipt(
     monkeypatch.setattr(runner, "process", process)
     monkeypatch.setattr(runner, "wait_server", lambda child: None)
     monkeypatch.setattr(runner, "server_command", lambda *a, **kw: [])
-    monkeypatch.setattr(runner, "overlay", lambda model, *a: model)
+    monkeypatch.setattr(runner, "overlay", lambda model, *a, **kw: model)
     monkeypatch.setattr(runner, "client_command", lambda config, path, **kw: [path])
 
     def run(cmd, log, env):

@@ -3944,6 +3944,15 @@ class ServerArgs(DisaggServerArgsMixin):
             )
 
     def _validate_batching(self):
+        from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
+            ZingH3CausalPipelineConfig,
+        )
+
+        if isinstance(self.pipeline_config, ZingH3CausalPipelineConfig):
+            # Zing deployments serve one active session, including shared-encoder mode.
+            self.realtime_max_sessions = 1
+            self.realtime_max_sessions_per_worker = 1
+
         if self.batching_mode != "dynamic":
             raise ValueError("batching_mode must be one of: dynamic")
         if self.batching_max_size < 1:

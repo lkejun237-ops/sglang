@@ -12,13 +12,15 @@ Add these arguments to the existing Zing server command:
 ```bash
 --realtime-max-message-bytes 67108864 \
 --realtime-transport-host-bytes 8589934592 \
---realtime-max-sessions 8 \
---realtime-max-sessions-per-worker 8
+--realtime-max-sessions 1 \
+--realtime-max-sessions-per-worker 1
 ```
 
 The defaults are 64 MiB per complete message and 8 GiB for transport buffers.
 Neither accepts zero, negative values, or an unlimited setting. The host budget
-must cover the larger configured session limit. It is a conservative admission
+must cover the admitted session limit. Zing deployments enforce one active
+session at both API and GPU worker admission; higher session settings are
+normalized to one. It is a conservative admission
 reservation for transport-owned buffers, **not a cap on process RSS**: model,
 codec tensors, KV cache, interpreter, socket/OS buffers and other endpoints need
 additional deployment memory. Each serving process needs its own reservation;
@@ -28,7 +30,7 @@ Per session the reservation is `14 * max_message_bytes + 9 MiB`: four pending
 source batches, one queued incoming message, two receive assembly/prefetch buffers, current encoded/decoded input,
 two dispatch/IPC copies, three output staging/encoding/send buffers, 8 MiB
 reference payloads and 1 MiB metadata allowance. At defaults this is 905 MiB,
-or 7,240 MiB for eight admitted sessions. Increasing the message or session
+for the single admitted Zing session. Increasing the message
 limit without sufficient host budget fails startup. GPU/KV capacity must still
 be checked independently.
 

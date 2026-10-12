@@ -41,9 +41,11 @@ from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import allocate_layer_s
 from sglang.multimodal_gen.test.unit.test_zing_h3_kv_pool_cache import _inputs
 from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
     cpu_execution_options,
-    verify_synthetic_table,
 )
 from sglang.multimodal_gen.test.unit.test_zing_h3_model import model as model_fixture
+from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
+    verify_synthetic_table,
+)
 
 # 17 latent frames in 2-frame chunks: enough chunks after the window
 # saturates for every steady key to warm up, capture and replay.

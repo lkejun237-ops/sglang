@@ -6,6 +6,7 @@ completed moments to DiT ranks before the unchanged posterior sampler runs.
 The producer never calls a DiT collective or changes its model/backend flags.
 """
 
+import hashlib
 import json
 import math
 import queue
@@ -47,6 +48,24 @@ class RemoteEncoderSession:
         self.capacity_frames = capacity_frames
         self.capacity_bytes = config.get("capacity_bytes", 256 << 20)
         self.timeout = config.get("timeout_seconds", 120)
+        self.admission_endpoint = config.get("admission_endpoint")
+        if type(config.get("cross_dispatch_prefetch", False)) is not bool:
+            raise ValueError("Cross-dispatch source prefetch flag must be boolean")
+        if self.admission_endpoint is not None and not config.get(
+            "cross_dispatch_prefetch", False
+        ):
+            raise ValueError("Source admission requires an enabled prefetch deployment")
+        if config.get("cross_dispatch_prefetch", False) and (
+            config.get("mode") != "overlap"
+            or not isinstance(self.admission_endpoint, str)
+            or not self.admission_endpoint.startswith("ipc:///")
+        ):
+            raise ValueError(
+                "Cross-dispatch prefetch requires a private local admission endpoint"
+            )
+        self.admission_lock = threading.Lock()
+        self.admission_digests = {}
+        self.prefetched_frames = 0
         self.port = config["port"]
         self.mode = config["mode"]
         if self.mode not in ("serial", "overlap"):
@@ -126,7 +145,13 @@ class RemoteEncoderSession:
             or retained > self.capacity_bytes
         ):
             raise ValueError("Remote encoder input capacity exceeded")
-        if self.leader:
+        if self.leader and self.admission_endpoint:
+            self._check_admission(
+                frame_start,
+                pixels.permute(1, 2, 3, 0).contiguous().numpy().tobytes(),
+                "dispatch",
+            )
+        elif self.leader:
             # One bounded copy owns the input until the encoder accepts it.
             self.commands.put(
                 ("append", pixels.cpu().contiguous().clone(), frame_start),
@@ -139,9 +164,21 @@ class RemoteEncoderSession:
         self._open()
         if self.ended or self.accepted_frames == 0:
             raise ValueError("Remote encoder requires a nonempty unfinished stream")
-        if self.leader:
+        if self.leader and not self.admission_endpoint:
             self.commands.put(("finish", None, None), timeout=self.timeout)
         self.ended = True
+
+    def _check_admission(self, start, data, owner):
+        digest = hashlib.sha256(data).hexdigest()
+        with self.admission_lock:
+            previous = self.admission_digests.pop(start, None)
+            if previous is not None:
+                if previous[0] == owner or previous[1] != digest:
+                    raise ValueError(
+                        "Source admission identity does not match the dispatch"
+                    )
+            else:
+                self.admission_digests[start] = (owner, digest)
 
     def _produce(self):
         context = zmq.Context()
@@ -150,18 +187,28 @@ class RemoteEncoderSession:
         socket.setsockopt(zmq.RCVTIMEO, self.timeout * 1000)
         socket.setsockopt(zmq.SNDTIMEO, self.timeout * 1000)
         socket.connect(f"tcp://127.0.0.1:{self.port}")
+        admission = None
+        if self.admission_endpoint:
+            admission = context.socket(zmq.PULL)
+            admission.setsockopt(zmq.LINGER, 0)
+            admission.setsockopt(zmq.RCVHWM, self.capacity_frames + 1)
+            admission.connect(self.admission_endpoint)
         opened = open_attempted = False
         data_operation_active = False
+        rpc_in_flight = False
 
         def rpc(op, payload=None, **fields):
+            nonlocal rpc_in_flight
             request = dict(
                 op=op, session=self.token, profile_dir=self.profile_dir, **fields
             )
             parts = [json.dumps(request).encode()]
             if payload is not None:
                 parts.append(payload)
+            rpc_in_flight = True
             socket.send_multipart(parts)
             reply = socket.recv_json()
+            rpc_in_flight = False
             if not reply.get("ok"):
                 raise RuntimeError("Encoder service rejected the operation")
             self.remote_usage = reply.get("state", self.remote_usage)
@@ -187,7 +234,53 @@ class RemoteEncoderSession:
             with torch.cuda.stream(stream):
                 while not self.stop.is_set():
                     try:
-                        op, pixels, start = self.commands.get(timeout=0.1)
+                        if admission is None:
+                            op, pixels, start = self.commands.get(timeout=0.1)
+                        else:
+                            if not admission.poll(100):
+                                continue
+                            parts = admission.recv_multipart()
+                            header = json.loads(parts[0])
+                            op = header["op"]
+                            pixels = start = None
+                            if op == "append":
+                                start, count = (
+                                    header["source_frame_start"],
+                                    header["num_frames"],
+                                )
+                                width, height = header["width"], header["height"]
+                                if (
+                                    start != self.prefetched_frames
+                                    or not 1 <= count <= 17
+                                    or len(parts) != 2
+                                    or len(parts[1]) != count * width * height * 3
+                                    or len(parts[1]) > self.capacity_bytes
+                                    or (self.prefetched_frames - self._consumed + count)
+                                    * width
+                                    * height
+                                    * 3
+                                    > self.capacity_bytes
+                                    or self.prefetched_frames - self._consumed + count
+                                    > self.capacity_frames
+                                ):
+                                    raise ValueError(
+                                        "Invalid or over-capacity source admission"
+                                    )
+                                self._check_admission(start, parts[1], "producer")
+                                pixels = (
+                                    torch.frombuffer(
+                                        bytearray(parts[1]), dtype=torch.uint8
+                                    )
+                                    .reshape(count, height, width, 3)
+                                    .permute(3, 0, 1, 2)
+                                    .contiguous()
+                                )
+                                self.prefetched_frames += count
+                            elif (
+                                op != "finish"
+                                or header["source_frame_end"] != self.prefetched_frames
+                            ):
+                                raise ValueError("Invalid source admission end")
                     except queue.Empty:
                         continue
                     if op == "append":
@@ -197,6 +290,8 @@ class RemoteEncoderSession:
                             shape=list(pixels.shape),
                             frame_start=start,
                             capacity_bytes=self.capacity_bytes,
+                            dispatch_accepted_frames=self.accepted_frames,
+                            cross_dispatch_prefetch=admission is not None,
                         )
                     else:
                         reply = rpc(op)
@@ -207,7 +302,11 @@ class RemoteEncoderSession:
                         if self.stop.is_set():
                             break
                         data_operation_active = True
-                        reply = rpc("pop")
+                        reply = rpc(
+                            "pop",
+                            dispatch_accepted_frames=self.accepted_frames,
+                            prefetched_frames=self.prefetched_frames,
+                        )
                         with torch.profiler.record_function("Zing.encoder_receive"):
                             value = receive_moments(
                                 bridge,
@@ -222,11 +321,14 @@ class RemoteEncoderSession:
         except BaseException as error:
             self.failure = error
         finally:
-            if opened and self.failure is None:
+            if opened and self.failure is None and not rpc_in_flight:
                 try:
                     rpc("close")
                 except BaseException as error:
-                    self.failure = error
+                    if self.failure is None:
+                        self.failure = error
+            if admission is not None:
+                admission.close()
             socket.close()
             context.term()
             if open_attempted and self.failure is not None:
@@ -296,7 +398,10 @@ class RemoteEncoderSession:
         return CodecSlice(value, reply["start"], reply["end"], reply["dependency"])
 
     def state_usage(self):
-        raw = self.buffered_frames * 3 * math.prod(self.signature or (0, 0))
+        retained_frames = max(
+            self.buffered_frames, self.prefetched_frames - self._consumed
+        )
+        raw = retained_frames * 3 * math.prod(self.signature or (0, 0))
         # Remote layer caches plus the two completed moments slots. The raw
         # budget conservatively includes inputs already transferred remotely.
         with self.results.mutex:
@@ -313,6 +418,17 @@ class RemoteEncoderSession:
                 v.numel() * v.element_size() for _, v in self.results.queue
             )
         return dict(
+            prefetch_retained_input_frames=max(
+                0, self.prefetched_frames - self._consumed
+            ),
+            prefetch_retained_input_bytes=max(
+                0, self.prefetched_frames - self._consumed
+            )
+            * 3
+            * math.prod(self.signature or (0, 0)),
+            prefetched_frames=self.prefetched_frames,
+            dispatch_accepted_frames=self.accepted_frames,
+            admission_pending_identities=len(self.admission_digests),
             pending_results=pending,
             result_bytes=result_bytes,
             pending_commands=self.commands.qsize(),
@@ -324,6 +440,11 @@ class RemoteEncoderSession:
 
     def reset(self):
         self._open()
+        if self.admission_endpoint:
+            self.dispose()
+            raise ValueError(
+                "Source prefetch reset requires a new session admission generation"
+            )
         self.dispose()
         # dispose preserves an active caller exception, but reset must never
         # erase a failed close even when called from an exception handler.
@@ -352,6 +473,7 @@ class RemoteEncoderSession:
                     q.get_nowait()
                 except queue.Empty:
                     break
+        self.admission_digests.clear()
         self._consumed = self.accepted_frames
         self.remote_usage = {"retained_bytes": 0, "temporal_positions": 0}
         self.disposed = True

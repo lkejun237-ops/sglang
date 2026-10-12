@@ -76,31 +76,53 @@ class AsyncRawRGBFrameMaterializer:
 
     def enqueue(
         self,
-        output: torch.Tensor,
+        output: torch.Tensor | Sequence[torch.Tensor],
         *,
         request_id: str,
         chunk_index: int,
         session_id: str,
         generation_id: str,
+        wait_for_slot: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Enqueue exact RGB24 conversion and D2H; return a serializable handle."""
-        if output.device.type != "cuda" or output.dim() != 5:
-            raise ValueError("async raw RGB output must be a 5D CUDA tensor")
-        if int(output.shape[1]) != RAW_RGB_CHANNELS:
-            raise ValueError("async raw RGB output must contain exactly three channels")
+        segments = [output] if isinstance(output, torch.Tensor) else list(output)
+        if not segments:
+            raise ValueError("async raw RGB output must be nonempty")
+        if not all(
+            value.device.type == "cuda"
+            and value.dim() == 5
+            and int(value.shape[1]) == RAW_RGB_CHANNELS
+            for value in segments
+        ):
+            raise ValueError("async raw RGB output must contain 5D CUDA RGB tensors")
+        first = segments[0]
+        if any(
+            value.device != first.device
+            or value.shape[0] != first.shape[0]
+            or value.shape[3:] != first.shape[3:]
+            for value in segments
+        ):
+            raise ValueError(
+                "async raw RGB segments must have matching devices and dimensions"
+            )
+        if len(segments) > 1 and first.shape[0] != 1:
+            raise ValueError("segmented raw RGB output requires one video")
         if self._closed:
             raise RuntimeError("async raw RGB materializer is closed")
 
-        if not self._slots.acquire(timeout=_ASYNC_RAW_RGB_SLOT_WAIT_S):
+        if not self._slots.acquire(
+            timeout=120 if wait_for_slot else _ASYNC_RAW_RGB_SLOT_WAIT_S
+        ):
             raise RuntimeError("async raw RGB staging slots are full")
         host_frames: torch.Tensor | None = None
         reference: dict[str, Any] | None = None
         copy_done: torch.cuda.Event | None = None
         try:
             # Preserve the existing truncating conversion and B/C/T/H/W -> B/T/H/W/C.
-            device_frames = _tensor_batch_to_rgb24_tensor(output)
+            with torch.profiler.record_function("Zing.output.rgb24"):
+                device_frames, batch_num_frames = _stage_rgb24_segments(segments)
             shape = tuple(int(dim) for dim in device_frames.shape)
-            batch_size, num_frames, height, width, channels = shape
+            _batch_size, _num_frames, height, width, channels = shape
             num_bytes = device_frames.numel() * device_frames.element_size()
             host_frames = self._acquire_host_buffer(shape)
             reference = reserve_async_shared_memory_payload(
@@ -115,23 +137,26 @@ class AsyncRawRGBFrameMaterializer:
                     "chunk_index": int(chunk_index),
                     "session_id": session_id,
                     "generation_id": generation_id,
-                    "batch_num_frames": [num_frames] * batch_size,
+                    "batch_num_frames": batch_num_frames,
                     "width": width,
                     "height": height,
                     "channels": channels,
                 }
             )
 
-            device_index = output.device.index
+            device_index = first.device.index
             if device_index is None:
                 device_index = torch.cuda.current_device()
             copy_stream = self._copy_streams.get(device_index)
             if copy_stream is None:
-                copy_stream = torch.cuda.Stream(device=output.device)
+                copy_stream = torch.cuda.Stream(device=first.device)
                 self._copy_streams[device_index] = copy_stream
-            producer_stream = torch.cuda.current_stream(output.device)
+            producer_stream = torch.cuda.current_stream(first.device)
             copy_done = torch.cuda.Event()
-            with torch.cuda.stream(copy_stream):
+            with (
+                torch.profiler.record_function("Zing.output.d2h"),
+                torch.cuda.stream(copy_stream),
+            ):
                 copy_stream.wait_stream(producer_stream)
                 host_frames.copy_(device_frames, non_blocking=True)
                 copy_done.record(copy_stream)
@@ -235,6 +260,24 @@ class AsyncRawRGBFrameMaterializer:
                 with self._outstanding_lock:
                     self._outstanding_refs.pop(reference["path"], None)
                 self._slots.release()
+
+    def snapshot(self) -> dict[str, int]:
+        with self._outstanding_lock:
+            pending = len(self._outstanding_refs)
+            payload_bytes = sum(
+                reference["num_bytes"] for reference in self._outstanding_refs.values()
+            )
+        with self._pool_lock:
+            cached_bytes = sum(
+                value.numel() * value.element_size() for value in self._host_pool
+            )
+        return {
+            "pending_results": pending,
+            "payload_bytes": payload_bytes,
+            "cached_pinned_bytes": cached_bytes,
+            "max_results": self._max_cached_buffers,
+            "max_payload_bytes_per_result": 128 << 20,
+        }
 
     def cancel_session(
         self,
@@ -521,6 +564,25 @@ def _tensor_sample_to_rgb24_array(sample: torch.Tensor) -> np.ndarray:
     if sample.dim() == 3:
         sample = sample.unsqueeze(1)
     return _tensor_batch_to_rgb24_tensor(sample.unsqueeze(0))[0].cpu().numpy()
+
+
+def _stage_rgb24_segments(segments: Sequence[torch.Tensor]):
+    """Keep source provenance batches after one bounded uint8 D2H staging copy."""
+    first = segments[0]
+    num_bytes = sum(
+        value.shape[0] * value.shape[2] * value.shape[3] * value.shape[4] * 3
+        for value in segments
+    )
+    if num_bytes > 128 << 20:
+        raise ValueError("Async RGB output exceeds its 128 MiB payload capacity")
+    converted = [_tensor_batch_to_rgb24_tensor(value) for value in segments]
+    values = converted[0] if len(converted) == 1 else torch.cat(converted, dim=1)
+    counts = (
+        [int(first.shape[2])] * int(first.shape[0])
+        if len(segments) == 1
+        else [int(value.shape[2]) for value in segments]
+    )
+    return values, counts
 
 
 def _tensor_batch_to_rgb24_tensor(output: torch.Tensor) -> torch.Tensor:

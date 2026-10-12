@@ -128,3 +128,79 @@ def test_explicit_precision_restores_caller_flags(models):
         torch.backends.cudnn.deterministic,
         torch.backends.cudnn.allow_tf32,
     )
+
+
+@pytest.mark.parametrize("frames", [1, 2, 5, 16, 17, 18, 33, 34, 35, 51, 60])
+@pytest.mark.parametrize("partition", [[1, 2, 2], [1], [3, 7, 2]])
+def test_experimental_progressive_preserves_native_contract(models, frames, partition):
+    upstream, adapter = models
+    latent = torch.randn(1, 24, latent_count(frames), 1, 2)
+    stream = adapter.new_stream(progressive=True)
+    pieces, calls, cursor, index = [], [], 0, 0
+    decode = stream._decode
+
+    def observe(chunk):
+        calls.append(chunk.shape[2])
+        return decode(chunk)
+
+    stream._decode = observe
+    while cursor < latent.shape[2]:
+        end = min(cursor + partition[index % len(partition)], latent.shape[2])
+        before = sum(calls)
+        pieces.append(stream.push(latent[:, :, cursor:end]))
+        assert sum(calls) - before == end - cursor
+        assert stream.pending.shape[2] == 0
+        assert stream.tail.shape[2] <= 12
+        cursor, index = end, index + 1
+    pieces.append(stream.finish(frames))
+    assert all(n in (1, 2) for n in calls)
+    actual = torch.cat(pieces, 2)
+    assert actual.shape[2] == frames
+    # Existing CPU FP32 convolution tolerance; not GPU exact acceptance.
+    torch.testing.assert_close(
+        actual, reference(upstream, latent, frames), atol=2e-6, rtol=2e-5
+    )
+    assert stream.closed and not stream.memory
+
+
+def test_progressive_executes_before_rgb_tail_is_releasable(models):
+    stream = models[1].new_stream(progressive=True)
+    latent = torch.randn(1, 24, 5, 1, 2)
+    assert stream.push(latent[:, :, :1]).shape[2] == 0
+    assert stream.raw_frames == 4
+    assert stream.push(latent[:, :, 1:3]).shape[2] == 0
+    assert stream.raw_frames == 12
+    assert stream.push(latent[:, :, 3:]).shape[2] == 5
+    assert stream.raw_frames == 20
+    stream.close()
+    stream.reset()
+    assert stream.progressive and stream.raw_frames == 0
+
+
+@pytest.mark.parametrize("frames", [1, 2, 17, 18, 34, 51, 60])
+def test_progressive_raw_trim_and_eos_exact_without_convolution(models, frames):
+    latent = (
+        torch.arange(latent_count(frames), dtype=torch.float32)
+        .reshape(1, 1, -1, 1, 1)
+        .expand(1, 24, -1, 1, 1)
+        / 100
+    )
+    results = []
+    for progressive in (False, True):
+        stream = models[1].new_stream(progressive=progressive)
+
+        # Four raw frames per latent; identical arithmetic for every partition.
+        def raw_decode(x):
+            return (
+                x[:, :1]
+                .transpose(1, 2)
+                .repeat_interleave(4, dim=1)
+                .expand(-1, -1, 12, 8, 8)
+                .clone()
+            )
+
+        stream._decode = raw_decode
+        chunks = [stream.push(x) for x in latent.split(1, dim=2)]
+        chunks.append(stream.finish(frames))
+        results.append(torch.cat(chunks, dim=2))
+    torch.testing.assert_close(results[0], results[1], atol=0, rtol=0)

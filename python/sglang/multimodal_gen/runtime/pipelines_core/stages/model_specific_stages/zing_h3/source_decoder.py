@@ -2,6 +2,7 @@
 """Bounded source provenance around the existing session-owned TAEH3 stream."""
 
 import math
+import os
 
 import torch
 
@@ -12,7 +13,17 @@ from .streaming_codecs import DecodedVideoSlice
 
 class SourceTAEH3Decoder:
     def __init__(self, codecs, *, capacity_latents, provenance_for):
-        self.stream = codecs.modules["taeh3_decoder"].new_stream()
+        progressive = os.environ.get("SGLANG_ZING_EXPERIMENTAL_PROGRESSIVE_DECODE", "0")
+        if progressive not in ("0", "1"):
+            raise ValueError(
+                "SGLANG_ZING_EXPERIMENTAL_PROGRESSIVE_DECODE must be 0 or 1"
+            )
+        decoder = codecs.modules["taeh3_decoder"]
+        self.stream = (
+            decoder.new_stream(progressive=True)
+            if progressive == "1"
+            else decoder.new_stream()
+        )
         self.capacity_latents = capacity_latents
         self.provenance_for = provenance_for
         self.pending = None

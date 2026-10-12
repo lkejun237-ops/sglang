@@ -6,7 +6,7 @@ import json
 import sys
 from datetime import timedelta
 from pathlib import Path
-from types import SimpleNamespace, ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -24,17 +24,22 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
     main = next(
         x for x in tree.body if isinstance(x, ast.FunctionDef) and x.name == "main"
     )
-    commands = iter(
-        [
-            dict(op="open", session="owner", bridge_port=1001, capacity_frames=51),
-            dict(op="open", session="intruder", bridge_port=1002, capacity_frames=51),
-            dict(op="ping"),
-            dict(op=close_op, session="owner"),
-            dict(op="open", session="intruder", bridge_port=1002, capacity_frames=51),
-            dict(op=close_op, session="intruder"),
-            dict(op="ping"),
+    command_rows = [
+        dict(op="open", session="owner", bridge_port=1001, capacity_frames=51),
+        dict(op="open", session="intruder", bridge_port=1002, capacity_frames=51),
+        dict(op="abort", session="intruder"),
+        dict(op="ping"),
+        dict(op="close", session="owner"),
+        dict(op="open", session="intruder", bridge_port=1002, capacity_frames=51),
+        dict(op="close", session="intruder"),
+        dict(op="ping"),
+    ]
+    if close_op == "abort":
+        command_rows = [
+            dict(row, op="abort") if row["op"] == "close" else row
+            for row in command_rows
         ]
-    )
+    commands = iter(command_rows)
 
     if close_op == "quarantine":
         commands = iter(
@@ -104,7 +109,11 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
             pass
 
         def parse_args(self):
-            return SimpleNamespace(model=Path("model"), port=31001, timeout_seconds=120)
+            return SimpleNamespace(
+                model=Path("model"),
+                port=31001,
+                timeout_seconds=120,
+            )
 
     dist = SimpleNamespace(
         init_process_group=lambda *a, **kw: None,
@@ -136,6 +145,8 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
                 set_device=lambda n: None,
                 memory_allocated=lambda: 0,
                 memory_reserved=lambda: 0,
+                max_memory_allocated=lambda: 0,
+                max_memory_reserved=lambda: 0,
             )
         ),
         os=SimpleNamespace(environ={"LOCAL_RANK": str(rank)}),
@@ -177,7 +188,67 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
             code="ENCODER_BUSY",
             error="The encoder is busy. Please try again later.",
         )
-        assert replies[2]["busy"] is True and replies[-1]["busy"] is False
-        assert replies[3]["ok"] and replies[4]["ok"] and replies[5]["ok"]
+        assert replies[2]["current_owner_unchanged"] and not replies[2]["released"]
+        assert replies[3]["busy"] is True and replies[-1]["busy"] is False
+        assert replies[4]["ok"] and replies[5]["ok"] and replies[6]["ok"]
     else:
         assert not ports and not replies
+
+
+@pytest.mark.parametrize("zing", [True, False])
+def test_deployment_admission_capacity_is_single_session_for_zing(monkeypatch, zing):
+    path = Path(__file__).resolve().parents[2] / "runtime/server_args/server_args.py"
+    cls = next(
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.ClassDef) and n.name == "ServerArgs"
+    )
+    method = next(
+        n for n in cls.body if getattr(n, "name", None) == "_validate_batching"
+    )
+    module_name = "sglang.multimodal_gen.configs.pipeline_configs.zing_h3"
+    module = ModuleType(module_name)
+
+    class ZingConfig:
+        pass
+
+    module.ZingH3CausalPipelineConfig = ZingConfig
+    monkeypatch.setitem(sys.modules, module_name, module)
+    capacities = []
+    namespace = dict(
+        SourceTransportBudget=SimpleNamespace(
+            from_args=lambda args: SimpleNamespace(validate_sessions=capacities.append)
+        ),
+        REALTIME_VAE_BACKENDS=("local",),
+        REALTIME_VAE_TRANSPORTS=("auto",),
+        uses_remote_vae=lambda backend: False,
+    )
+    exec(
+        compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"),
+        namespace,
+    )
+    args = SimpleNamespace(
+        pipeline_config=ZingConfig() if zing else object(),
+        batching_mode="dynamic",
+        batching_max_size=1,
+        batching_delay_ms=0,
+        realtime_max_sessions=8,
+        realtime_max_sessions_per_worker=8,
+        realtime_session_lease_ttl_s=120,
+        realtime_session_idle_timeout_s=0,
+        realtime_session_max_lifetime_s=0,
+        realtime_worker_max_consumed_age_s=0,
+        realtime_admission_wait_s=0,
+        realtime_vae_backend="local",
+        realtime_vae_transport="auto",
+        realtime_vae_worker_url=None,
+        realtime_vae_shared_memory_dir=None,
+        realtime_vae_timeout_s=120,
+        realtime_vae_max_message_mb=128,
+    )
+    namespace[method.name](args)
+    expected = 1 if zing else 8
+    assert (
+        args.realtime_max_sessions == args.realtime_max_sessions_per_worker == expected
+    )
+    assert capacities == [expected]

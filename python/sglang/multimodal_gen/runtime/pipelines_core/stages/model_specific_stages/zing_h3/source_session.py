@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
     SourceLedger,
     SourceLimits,
     default_source_encoder,
+    source_work_quantum,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
@@ -44,6 +45,9 @@ class ZingSourceStreamState(BaseRealtimeState):
         self.closed = False
         self.component_capture = None
         self.kv_lease = None
+        self.work_quantum = source_work_quantum()
+        self.end_received = self.bridge_finished = False
+        self.dispatch_steps = 0
 
     def initialize(self, stage, batch, config):
         params = batch.sampling_params
@@ -57,6 +61,7 @@ class ZingSourceStreamState(BaseRealtimeState):
             "rope_position_mode": sampler.rope_position_mode,
             "rope_max_frame_gap": sampler.rope_max_frame_gap,
             "video_decoder": stage.codecs.video_decoder_name,
+            "source_work_quantum": self.work_quantum,
         }
         if getattr(sampler, "joint_forward", "off") != "off":
             self.policy["joint_forward"] = sampler.joint_forward
@@ -194,6 +199,7 @@ class ZingSourceStreamState(BaseRealtimeState):
         measure_cuda = command.get("measure_cuda", False)
         timings, outputs, metadata = {}, [], []
         self.progress = []  # Per-dispatch, bounded by input/bridge capacities.
+        self.dispatch_steps = 0
 
         @contextmanager
         def timed(name):
@@ -270,10 +276,14 @@ class ZingSourceStreamState(BaseRealtimeState):
                     )
             final = command.get("end")
             if final is not None:
+                if self.end_received:
+                    raise ValueError("Source end was already accepted")
+                self.end_received = True
                 self.ledger.finish(final["frame_end"], event_id=final["event_id"])
                 with timed("encoder_host_ms"), self._encoder_use(stage):
                     self.pixels.finish()
-            while self.pixels.ready:
+            self._generate_ready(stage, batch, outputs, metadata, timed)
+            while self.pixels.ready and self._within_work_budget():
                 with (
                     timed("encoder_host_ms"),
                     stage._use("video_vae"),
@@ -314,7 +324,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                         + 1
                         + last_offset * self.bridge.ratio
                     )
-                    if final is not None:
+                    if self.end_received:
                         pixel_end = min(pixel_end, self.ledger.accepted_frames)
                     self.bridge.append(
                         source,
@@ -328,26 +338,34 @@ class ZingSourceStreamState(BaseRealtimeState):
                 # Release only source alignment already transferred downstream.
                 # Encoder lookahead/cache ownership never grants extra credit.
                 self.ledger.consume(self.bridge.accepted_pixels)
-            if final is not None:
+            completed = False
+            if self.end_received and not self.pixels.ready:
                 if self.bridge.accepted_pixels != self.ledger.accepted_frames:
                     raise ValueError("Source encoder did not drain its input")
-                self.bridge.finish()
+                if not self.bridge_finished:
+                    self.bridge.finish()
+                    self.bridge_finished = True
                 self._generate_ready(stage, batch, outputs, metadata, timed)
-                if not self.sampler.ended:
-                    self.sampler.finish()
-                if not self.sampler.complete:
-                    raise ValueError("Continuous source sampling did not drain")
-                self.decoder.finish(total_frames=self.ledger.accepted_frames)
-                self._decode_ready(stage, outputs, metadata, timed, eos=True)
-                self.ledger.consume(self.bridge.accepted_pixels)
-                self.ledger.completed()
-                if self.component_capture is not None:
-                    self.component_capture.finish()
+                if not self.bridge.ready:
+                    if not self.sampler.ended:
+                        self.sampler.finish()
+                    if not self.sampler.complete:
+                        raise ValueError("Continuous source sampling did not drain")
+                    self.decoder.finish(total_frames=self.ledger.accepted_frames)
+                    self._decode_ready(stage, outputs, metadata, timed, eos=True)
+                    self.ledger.consume(self.bridge.accepted_pixels)
+                    self.ledger.completed()
+                    if self.component_capture is not None:
+                        self.component_capture.finish()
+                    completed = True
+            more_work = not completed and (self.pixels.ready or self.bridge.ready)
             self.command_index += 1
             usage = {
                 "zing_realtime_blocks": metadata,
                 "zing_source_consumed_end": self.bridge.accepted_pixels,
-                "zing_source_complete": final is not None,
+                "zing_source_complete": completed,
+                "zing_source_more_work": bool(more_work),
+                "zing_source_dispatch_steps": self.dispatch_steps,
                 "zing_source_stage_host_ms": timings,
                 "zing_source_progress": self.progress,
                 "zing_source_memory": {
@@ -397,7 +415,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                         "pid": os.getpid(),
                         "source_frames": self.ledger.accepted_frames,
                         "output_frames": self.ledger.output_frames,
-                        "ended": final is not None,
+                        "ended": completed,
                         "stage_host_ms": timings,
                         "progress": self.progress,
                         "first_source_received_unix_ns": command.get(
@@ -435,7 +453,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                     usage=usage,
                     conditioning_notice=notice,
                 )
-            if final is not None:
+            if completed:
                 self.dispose()
             return result
         except BaseException:
@@ -465,12 +483,15 @@ class ZingSourceStreamState(BaseRealtimeState):
             )
         )
 
+    def _within_work_budget(self):
+        return not self.work_quantum or self.dispatch_steps < self.work_quantum
+
     def _generate_ready(self, stage, batch, outputs, metadata, timed, *, flush=True):
         if getattr(self.sampler.sampler, "joint_forward", "off") == "cross_chunk":
             return self._generate_joint_ready(
                 stage, batch, outputs, metadata, timed, flush=flush
             )
-        while self.bridge.ready:
+        while self.bridge.ready and self._within_work_budget():
             with timed("bridge_host_ms"):
                 chunk = self.bridge.pop()
                 self.sampler.append(
@@ -497,6 +518,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                     source_dependency_end=chunk.provenance.source_dependency_end,
                 )
                 result = self.sampler.step()
+                self.dispatch_steps += 1
             if self.component_capture is not None:
                 self.component_capture.append(chunk, result)
             self.blocks.append(
@@ -518,11 +540,13 @@ class ZingSourceStreamState(BaseRealtimeState):
     def _generate_joint_ready(
         self, stage, batch, outputs, metadata, timed, *, flush=True
     ):
-        while self.bridge.ready or self.sampler.pending:
-            while (
-                self.bridge.ready
-                and len(self.sampler.pending) < self.sampler.max_pending_chunks
-            ):
+        while (
+            self.bridge.ready or self.sampler.pending
+        ) and self._within_work_budget():
+            capacity = self.sampler.max_pending_chunks
+            if self.work_quantum:
+                capacity = min(capacity, self.work_quantum - self.dispatch_steps)
+            while self.bridge.ready and len(self.sampler.pending) < capacity:
                 if self.sampler.pending:
                     upcoming = self.bridge.plan.chunk(
                         self.bridge.chunk_id,
@@ -553,10 +577,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                         final=chunk.final,
                     )
                     del chunk
-            if (
-                not flush
-                and len(self.sampler.pending) < self.sampler.max_pending_chunks
-            ):
+            if not flush and len(self.sampler.pending) < capacity:
                 return
             # The transformer lease ends before every decoder call. Closing on
             # failure clears any prefetched next active target as well.
@@ -599,6 +620,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                         result = next(ready, None)
                     if result is None:
                         break
+                    self.dispatch_steps += 1
                     if self.component_capture is not None:
                         self.component_capture.append(capture_chunk, result)
                         del capture_chunk

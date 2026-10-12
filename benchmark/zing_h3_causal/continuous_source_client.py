@@ -413,8 +413,17 @@ async def run(args):
             samples = sorted(latency_samples)
             dependencies = sorted(dependency_latency_samples)
             blocks = sorted(block_capture_latency_samples)
+            gaps = sorted(
+                b[0] - a[0] for a, b in zip(delivery_times, delivery_times[1:])
+            )
             summary = dict(
                 state,
+                output_batch_interval_p95_seconds=gaps[
+                    min(len(gaps) - 1, int(len(gaps) * 0.95))
+                ]
+                if gaps
+                else None,
+                output_batch_interval_max_seconds=max(gaps) if gaps else None,
                 elapsed_seconds=elapsed,
                 effective_delivery_fps=state["received"] / elapsed,
                 ttff_seconds=state["first_output"] - started,

@@ -314,13 +314,19 @@ def test_staleness_names_each_cause_that_requires_a_rebuild(artifact, tmp_path):
     manifest["identity"] = table_api.checkpoint_identity([shard], config)
     (path / "manifest.json").write_text(json.dumps(manifest))
     stale = lambda **kw: table_api.table_staleness(
-        path, [shard], config, kw.get("deployment", {"fixture": True}), kw.get("schedule")
+        path,
+        [shard],
+        config,
+        kw.get("deployment", {"fixture": True}),
+        kw.get("schedule"),
     )
     assert stale(schedule=plan["schedule"]) == []
     assert stale(deployment={"lora_merged": False}) == [
         "effective checkpoint or LoRA provenance changed"
     ]
-    assert stale(schedule={**plan["schedule"], "condition": 1.0}) == ["schedule changed"]
+    assert stale(schedule={**plan["schedule"], "condition": 1.0}) == [
+        "schedule changed"
+    ]
     shard.write_bytes(b"merged lora")
     assert stale() == ["checkpoint shards changed: weights.safetensors"]
     config.write_text('{"x":1}')

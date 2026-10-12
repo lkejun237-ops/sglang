@@ -8,6 +8,7 @@ Outputs are append-only; existing cells are never silently reused.
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import signal
@@ -47,12 +48,11 @@ def role_environment(config, role, devices, base=None):
     mode = config.get("encoder_tile_mode", "parallel")
     if mode not in ("auto", "parallel"):
         raise ValueError("encoder_tile_mode must be auto or parallel")
-    if config.get("progressive_decode", False):
-        raise ValueError(
-            "Incremental Decoder requires the separate chunk-streaming feature"
-        )
+    progressive = config.get("progressive_decode", False)
+    if type(progressive) is not bool:
+        raise ValueError("progressive_decode must be boolean")
     env = dict(os.environ if base is None else base)
-    env[_DECODE_ENV] = "0"
+    env[_DECODE_ENV] = "1" if progressive and role != "encoder" else "0"
     # A shell-wide experimental override must never alter the shared baseline.
     env[_TILE_ENV] = mode if role == "encoder" else "auto"
     env["CUDA_VISIBLE_DEVICES"] = devices
@@ -262,17 +262,51 @@ def wait_encoder(child, port):
         context.term()
 
 
-def overlay(base, out, remote, cudnn_benchmark_limit=None):
+def overlay(
+    base,
+    out,
+    remote,
+    cudnn_benchmark_limit=None,
+    *,
+    chunk_plan=None,
+    async_output=False,
+    attention_window=None,
+):
     if cudnn_benchmark_limit is not None and (
         type(cudnn_benchmark_limit) is not int or cudnn_benchmark_limit != 1
     ):
         raise ValueError("cudnn_benchmark_limit must be 1 or null")
+    if type(async_output) is not bool:
+        raise ValueError("async_output must be boolean")
+    if attention_window is not None and not (
+        isinstance(attention_window, dict)
+        and set(attention_window) == {"window_chunks", "sink_chunks"}
+        and type(attention_window["window_chunks"]) is int
+        and type(attention_window["sink_chunks"]) is int
+        and 1 <= attention_window["window_chunks"] <= 21
+        and 0 <= attention_window["sink_chunks"] < attention_window["window_chunks"]
+    ):
+        raise ValueError("Invalid source_attention_window deployment experiment")
+    if chunk_plan is not None and chunk_plan != {
+        "num_frame_per_block": [3, 2],
+        "split_first_latent": True,
+    }:
+        raise ValueError(
+            "This pipeline experiment requires [3,2] with split_first_latent=true"
+        )
     model = out / "model"
     model.mkdir()
     for p in base.iterdir():
         if p.name not in ("zing_realtime_profile.json", "zing_config.json"):
             (model / p.name).symlink_to(p.resolve())
     runtime = json.loads((base / "zing_config.json").read_text())
+    original_chunk_plan = {
+        key: runtime[key]
+        for key in ("num_frame_per_block", "split_first_latent")
+        if key in runtime
+    }
+    if chunk_plan is not None:
+        runtime.update(chunk_plan)
     original_limit = runtime["vae_config"].get("cudnn_benchmark_limit")
     if cudnn_benchmark_limit is not None:
         runtime["vae_config"]["cudnn_benchmark_limit"] = cudnn_benchmark_limit
@@ -280,6 +314,8 @@ def overlay(base, out, remote, cudnn_benchmark_limit=None):
     write_json(
         out / "encoder-policy.json",
         dict(
+            original_chunk_plan=original_chunk_plan,
+            effective_chunk_plan={key: runtime[key] for key in original_chunk_plan},
             original_model_config_sha256=digest(base / "zing_config.json"),
             effective_model_config_sha256=digest(model / "zing_config.json"),
             original_cudnn_benchmark_limit=original_limit,
@@ -296,6 +332,9 @@ def overlay(base, out, remote, cudnn_benchmark_limit=None):
     profile["source_encoder"].pop("remote", None)
     if remote:
         profile["source_encoder"]["remote"] = remote
+    profile["async_source_output"] = async_output
+    if attention_window is not None:
+        profile["source_attention_window"] = dict(attention_window)
     profile["measure_source_cuda"] = False
     write_json(model / "zing_realtime_profile.json", profile)
     return model
@@ -346,6 +385,10 @@ def server_command(model, config, sp, *, profile_monitoring=False):
         "false",
         "--use-fsdp-inference",
         "false",
+        "--realtime-max-sessions",
+        "1",
+        "--realtime-max-sessions-per-worker",
+        "1",
         "--host",
         "127.0.0.1",
         "--port",
@@ -457,10 +500,15 @@ def endpoint_cell(
     )
     if capture:
         env["SGLANG_ZING_COMPONENT_CAPTURE_DIR"] = str(out / "capture")
+    for key in ("cross_dispatch_prefetch", "async_source_output"):
+        if type(config.get(key, False)) is not bool:
+            raise ValueError(f"{key} must be boolean")
     remote = (
         dict(
             port=31001,
             mode=mode,
+            cross_dispatch_prefetch=config.get("cross_dispatch_prefetch", False)
+            and mode == "overlap",
             capacity_bytes=256 << 20,
             profile_dir=str(out / "encoder-traces"),
         )
@@ -468,7 +516,13 @@ def endpoint_cell(
         else None
     )
     model = overlay(
-        Path(config["model"]), out, remote, config.get("cudnn_benchmark_limit")
+        Path(config["model"]),
+        out,
+        remote,
+        config.get("cudnn_benchmark_limit"),
+        chunk_plan=config.get("source_chunk_plan"),
+        async_output=config.get("async_source_output", False) and mode == "overlap",
+        attention_window=config.get("source_attention_window"),
     )
     decoder_config = out / "decoder.json"
     write_json(
@@ -729,6 +783,165 @@ def endpoint_matrix(root, config, specs, *, collection_phase="all"):
         profile()
 
 
+def endpoint_binding(config):
+    """Exact frozen configuration and source identity for split collections."""
+    source = BENCH.parents[1]
+    sha = hashlib.sha256()
+    paths = sorted((source / "python" / "sglang").rglob("*.py")) + sorted(
+        BENCH.glob("*.py")
+    )
+    for path in paths:
+        sha.update(str(path.relative_to(source)).encode())
+        sha.update(bytes.fromhex(digest(path)))
+    return dict(
+        config=config,
+        source_sha256=sha.hexdigest(),
+        source_files=len(paths),
+        request_sha256=digest(Path(config["request"])),
+        source_rgb_sha256=digest(Path(config["source_rgb"])),
+        model_config_sha256=digest(Path(config["model"]) / "zing_config.json"),
+        realtime_profile_sha256=digest(
+            Path(config["model"]) / "zing_realtime_profile.json"
+        ),
+    )
+
+
+def validate_profile_binding(root, config, specs, binding):
+    path = root / "endpoint-binding.json"
+    if not path.is_file() or json.loads(path.read_text()) != binding:
+        raise ValueError("Profile inputs or source differ from the formal collection")
+    for spec in specs:
+        for pace in ("unpaced", "paced"):
+            cell = root / f"{spec[0]}-{pace}"
+            receipt = json.loads((cell / "FORMAL_COMPLETE.json").read_text())
+            expected = ["warmup"] + [f"measured-{i}" for i in range(5)]
+            if receipt.get("phases") != expected or not receipt.get(
+                "measurement_completed"
+            ):
+                raise ValueError("Profile requires all five formal runs and warmup")
+            for phase in expected:
+                row = json.loads((cell / phase / "summary.json").read_text())
+                if row.get("ended") is not True or any(
+                    row.get(k) != 720
+                    for k in ("submitted", "accepted", "consumed", "received")
+                ):
+                    raise ValueError("Profile cannot bind incomplete formal output")
+
+
+def validate_serial_overlap(root, spec, config=None, *, require_parity=True):
+    """Require five complete paired runs before scheduling a separate soak."""
+    name, sp, enc, mode = spec
+    if not enc or mode != "overlap":
+        raise ValueError(
+            "Soak requires an explicitly selected dedicated overlap layout"
+        )
+    if config is not None:
+        input_path = root / "input.json"
+        if not input_path.is_file():
+            raise RuntimeError("Paired performance input receipt is missing")
+        previous = json.loads(input_path.read_text())
+        # Paths refer to the immutable prepared assets/model overlay, never a rebuilt request.
+        if any(
+            previous.get(key) != config.get(key)
+            for key in (
+                "model",
+                "request",
+                "source_rgb",
+                "soak_rgb",
+                "taeh3_weights",
+                "cudnn_benchmark_limit",
+                "encoder_tile_mode",
+                "progressive_decode",
+                "source_batch_pattern",
+                "source_chunk_plan",
+                "source_attention_window",
+                "cross_dispatch_prefetch",
+                "async_source_output",
+                "width",
+                "height",
+            )
+        ):
+            raise RuntimeError("Soak inputs differ from the paired performance receipt")
+    rows = []
+    for execution in ("serial", "overlap"):
+        directory = root / f"enc{enc}-sp{sp}-{execution}-paced"
+        for i in range(5):
+            path = directory / f"measured-{i}" / "summary.json"
+            if not path.is_file():
+                raise RuntimeError(
+                    "Five paired performance runs are required before soak"
+                )
+            row = json.loads(path.read_text())
+            if not row.get("ended") or any(
+                row.get(key) != 720
+                for key in ("submitted", "accepted", "consumed", "received")
+            ):
+                raise RuntimeError("Incomplete paired performance output")
+            rows.append(row)
+    if any(not row.get("output_sha256") for row in rows):
+        raise RuntimeError("Paired performance output hash evidence is missing")
+    if require_parity:
+        validate_serial_overlap_parity(rows)
+    return rows
+
+
+def validate_serial_overlap_parity(rows):
+    """Only numerical equality is an optional exploratory gate."""
+    if len({row["output_sha256"] for row in rows}) != 1:
+        raise RuntimeError("Serial/overlap output parity failed before soak")
+
+
+def validate_correctness(root, specs, config):
+    receipt = root / "input.json"
+    if not receipt.is_file():
+        raise RuntimeError("Correctness input receipt is missing")
+    previous = json.loads(receipt.read_text())
+    if any(
+        previous.get(key) != config.get(key)
+        for key in (
+            "model",
+            "request",
+            "source_rgb",
+            "taeh3_weights",
+            "cudnn_benchmark_limit",
+            "encoder_tile_mode",
+            "progressive_decode",
+            "source_batch_pattern",
+            "source_chunk_plan",
+            "source_attention_window",
+            "cross_dispatch_prefetch",
+            "async_source_output",
+            "width",
+            "height",
+        )
+    ):
+        raise ValueError("Correctness inputs differ from the performance configuration")
+    for name, _, enc, _ in specs:
+        if not enc:
+            continue
+        path = root / f"correctness-{name}.json"
+        if not path.is_file():
+            raise RuntimeError(
+                "Shared-versus-dedicated correctness evidence is missing"
+            )
+        row = json.loads(path.read_text())
+        if (
+            row.get("status") != "passed"
+            or row.get("tolerance") != dict(atol=0, rtol=0)
+            or not isinstance(row.get("wire_rgb"), dict)
+            or row["wire_rgb"].get("bytes")
+            != 720 * input_geometry(config)[0] * input_geometry(config)[1] * 3
+        ):
+            raise RuntimeError("Shared-versus-dedicated strict correctness gate failed")
+
+
+def capture_session(cell):
+    paths = list((cell / "capture").glob("*/COMPLETE.json"))
+    if len(paths) != 1:
+        raise RuntimeError("Expected one complete capture session")
+    return paths[0].parent
+
+
 def correctness_cells(root, config, specs):
     commands = []
     baselines = {}
@@ -849,6 +1062,7 @@ def main():
             "transport",
             "encoder",
             "dit",
+            "decoder",
             "components",
             "overlap",
             "soak",
@@ -997,7 +1211,7 @@ def main():
                 root / f"encoder-{enc}.log",
                 env,
             )
-    if args.stage in ("capture", "dit", "components", "all"):
+    if args.stage in ("capture", "dit", "decoder", "components", "all"):
         capture = args.capture_root
         if capture is None:
             capture_root = endpoint_cell(
@@ -1033,6 +1247,26 @@ def main():
                     root / f"dit-sp{sp}.log",
                     env,
                 )
+        if args.stage in ("decoder", "components", "all"):
+            command_run(
+                [
+                    sys.executable,
+                    str(BENCH / "benchmark_taeh3_replay.py"),
+                    "--capture",
+                    str(capture),
+                    "--weights",
+                    config["taeh3_weights"],
+                    "--output",
+                    str(root / "decoder"),
+                    *(
+                        ["--progressive"]
+                        if config.get("progressive_decode", False)
+                        else []
+                    ),
+                ],
+                root / "decoder.log",
+                role_environment(config, "server", "0"),
+            )
     if args.stage in ("correctness", "overlap", "soak", "all"):
         gates = Path(config.get("encoder_acceptance_root", root))
         sizes = sorted({enc for _, _, enc, _ in specs if enc})

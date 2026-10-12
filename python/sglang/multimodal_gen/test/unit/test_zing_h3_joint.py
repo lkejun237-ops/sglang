@@ -5,13 +5,13 @@
 import pytest
 import torch
 
-from sglang.multimodal_gen.test.unit.test_zing_h3_model import (
-    cpu_execution_options,  # noqa: F401
-    model,  # noqa: F401
-    request,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.sampling import (
     ZingH3Sampler,
+)
+from sglang.multimodal_gen.test.unit.test_zing_h3_model import model  # noqa: F401
+from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
+    cpu_execution_options,
+    request,
 )
 
 
@@ -67,8 +67,9 @@ def test_joint_option_rejects_typo(model):
 
 @pytest.mark.parametrize("ends", [(2, 5), (1, 3, 5)])
 def test_branch_attention_is_block_bidirectional(ends):
-    from sglang.multimodal_gen.runtime.models.dits.zing_h3 import _joint_attention
     import torch.nn.functional as F
+
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3 import _joint_attention
 
     torch.manual_seed(12)
     q = torch.randn(5, 2, 8)
@@ -207,8 +208,9 @@ def test_cross_chunk_streaming_commits_before_delivery(model):
 def test_joint_sp2_layout(model, monkeypatch, mode, source_hw):
     from concurrent.futures import ThreadPoolExecutor
     from types import SimpleNamespace
-    from sglang.multimodal_gen.runtime.models.dits import zing_h3
+
     from sglang.multimodal_gen.runtime.layers import usp
+    from sglang.multimodal_gen.runtime.models.dits import zing_h3
     from sglang.multimodal_gen.test.unit.test_zing_h3_sp_cpu import _CPUCollectives
 
     packer, inputs, visual, _ = request(model, audio=False)
@@ -509,6 +511,7 @@ def test_joint_preserves_checkpoint_condition_timesteps_and_five_modalities(
 ):
     """The joint body must retain main's checkpoint-driven modality routing."""
     from dataclasses import replace
+
     from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import ZingH3DiTConfig
     from sglang.multimodal_gen.runtime.models.dits.zing_h3 import ZingH3DiTModel
 

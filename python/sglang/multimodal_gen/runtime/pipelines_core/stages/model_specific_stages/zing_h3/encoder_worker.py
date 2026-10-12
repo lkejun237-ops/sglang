@@ -40,14 +40,16 @@ def initialize_runtime_imports():
 
 def load_encoder(root):
     from safetensors.torch import load_file
+
     from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
         MiniMaxH3VideoVAEConfig,
     )
-    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3 import MiniMaxH3VideoVAE
     from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import (
         _consume_vae_checkpoint_arch_metadata,
     )
     from sglang.multimodal_gen.runtime.loader.utils import load_model_state_dict
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3 import MiniMaxH3VideoVAE
+
     from .codecs import ZingH3Codecs
 
     config = MiniMaxH3VideoVAEConfig()
@@ -187,6 +189,7 @@ def main():
                         )
                     continue
                 token = command["session"]
+                profiler = None
                 cache = create_encoder_cache(
                     codecs.modules["video_vae"],
                     dist.group.WORLD,
@@ -243,7 +246,10 @@ def main():
                         "Zing.encoder_input_distribution"
                     ):
                         dist.broadcast(pixels, src=0)
-                    session.append(pixels, frame_start=command["frame_start"])
+                    with torch.profiler.record_function(
+                        f"Zing.encoder_admission.source_{command['frame_start']}_{command['frame_start'] + shape[1]}.dispatch_end_{command.get('dispatch_accepted_frames', -1)}"
+                    ):
+                        session.append(pixels, frame_start=command["frame_start"])
                 elif op == "finish":
                     session.finish()
                 elif op == "pop":
@@ -251,7 +257,10 @@ def main():
                         f"Zing.clock_anchor.unix_ns{time.time_ns()}"
                     ):
                         pass
-                    value = session.pop()
+                    with torch.profiler.record_function(
+                        f"Zing.encoder_prefetch.latent_start_{session.emitted_latents}.source_end_{command.get('prefetched_frames', -1)}.dispatch_end_{command.get('dispatch_accepted_frames', -1)}"
+                    ):
+                        value = session.pop()
                     if value is None:
                         raise ValueError("Encoder is not ready")
                 elif op == "close":
@@ -267,6 +276,10 @@ def main():
                 )
                 if value is not None:
                     reply.update(
+                        dispatch_accepted_frames=command.get(
+                            "dispatch_accepted_frames"
+                        ),
+                        prefetched_frames=command.get("prefetched_frames"),
                         shape=list(value.values.shape),
                         dtype=str(value.values.dtype).split(".")[-1],
                         start=value.start,
@@ -302,6 +315,8 @@ def main():
                             host_end_ns=time.time_ns(),
                             gpu_allocated_bytes=torch.cuda.memory_allocated(),
                             gpu_reserved_bytes=torch.cuda.memory_reserved(),
+                            gpu_peak_allocated_bytes=torch.cuda.max_memory_allocated(),
+                            gpu_peak_reserved_bytes=torch.cuda.max_memory_reserved(),
                             **reply,
                         )
                     ),
