@@ -1,0 +1,3040 @@
+{
+  "case": "zing-whitebox-video-five-triview-0001",
+  "source_video": true,
+  "reference_count": 6,
+  "frames": 120,
+  "resolution": [
+    832,
+    480
+  ],
+  "input_fps": 24,
+  "seed": 42,
+  "steps": 4,
+  "audio": false,
+  "scope": "Untimed diagnostics, not performance or native semantic acceptance",
+  "historical": {
+    "source_commit": "1224489aea6923b47a5ab01a74b87f65f3fad04b",
+    "joint_wait_ms": 0,
+    "attention": "fa4",
+    "provenance": {
+      "r2": {
+        "job": "dlclttxjftbf0tus",
+        "status": "Failed",
+        "accepted_arms": [
+          "frozen-off-a",
+          "frozen-off-b",
+          "frozen-source",
+          "frozen-cross",
+          "raw-perf-a",
+          "raw-perf-b",
+          "raw-det-a",
+          "raw-det-b"
+        ],
+        "excluded_failed_arm": "raw-nobench-a",
+        "failure": "Diagnostic receipt interface mismatch; None policy yield"
+      },
+      "r3": {
+        "job": "dlc1l2plor3c17ky",
+        "status": "Succeeded",
+        "accepted_arms": [
+          "raw-perf-r3-a",
+          "raw-perf-r3-b",
+          "raw-nobench-a",
+          "raw-nobench-b",
+          "raw-replicate-a",
+          "raw-replicate-b"
+        ]
+      },
+      "scope": "Composite of individually completed requests; not a claim that r2 job succeeded. Same-job r3 controls isolate benchmark and tile variables."
+    },
+    "cpu_post_job": "dlc1lwwt8rdm8xh1",
+    "post_status": "Succeeded",
+    "archive_receipt": {
+      "sha256": "39a48cf668daaa5f136f6d84bb31e7d83395059a4479719aa12627792698b778",
+      "bytes": 91758389
+    },
+    "download_receipt_verified": true,
+    "complete_requests": 28,
+    "mp4_full_decodes": 28,
+    "pairs": [
+      {
+        "left": "frozen-off-a",
+        "right": "frozen-off-b",
+        "rgb_exact": true,
+        "rgb_mae": 0.0,
+        "rgb_relative_l2": 0.0,
+        "rgb_max_abs": 0,
+        "ssim_mean": 1.0,
+        "ssim_quarters": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "psnr_min_db": null,
+        "psnr_max_db": null,
+        "target_first_chunk": {
+          "start": 0,
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_l2": 0.0
+        },
+        "target_max_relative_l2": 0.0
+      },
+      {
+        "left": "frozen-off-a",
+        "right": "frozen-source",
+        "rgb_exact": true,
+        "rgb_mae": 0.0,
+        "rgb_relative_l2": 0.0,
+        "rgb_max_abs": 0,
+        "ssim_mean": 1.0,
+        "ssim_quarters": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "psnr_min_db": null,
+        "psnr_max_db": null,
+        "target_first_chunk": {
+          "start": 0,
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_l2": 0.0
+        },
+        "target_max_relative_l2": 0.0
+      },
+      {
+        "left": "frozen-off-a",
+        "right": "frozen-cross",
+        "rgb_exact": true,
+        "rgb_mae": 0.0,
+        "rgb_relative_l2": 0.0,
+        "rgb_max_abs": 0,
+        "ssim_mean": 1.0,
+        "ssim_quarters": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "psnr_min_db": null,
+        "psnr_max_db": null,
+        "target_first_chunk": {
+          "start": 0,
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_l2": 0.0
+        },
+        "target_max_relative_l2": 0.0
+      },
+      {
+        "left": "raw-perf-a",
+        "right": "raw-perf-b",
+        "rgb_exact": false,
+        "rgb_mae": 18.541994094848633,
+        "rgb_relative_l2": 0.17458508908748627,
+        "rgb_max_abs": 236,
+        "ssim_mean": 0.4702541249999999,
+        "ssim_quarters": [
+          0.6173873666666668,
+          0.47035499999999997,
+          0.39582553333333337,
+          0.39744859999999993
+        ],
+        "psnr_min_db": 16.460331232112452,
+        "psnr_max_db": 28.223707731726503,
+        "target_first_chunk": {
+          "start": 0,
+          "exact": false,
+          "max_abs": 1.0931059122085571,
+          "relative_l2": 0.098416768014431
+        },
+        "target_max_relative_l2": 0.650141179561615
+      },
+      {
+        "left": "raw-det-a",
+        "right": "raw-det-b",
+        "rgb_exact": true,
+        "rgb_mae": 0.0,
+        "rgb_relative_l2": 0.0,
+        "rgb_max_abs": 0,
+        "ssim_mean": 1.0,
+        "ssim_quarters": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "psnr_min_db": null,
+        "psnr_max_db": null,
+        "target_first_chunk": {
+          "start": 0,
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_l2": 0.0
+        },
+        "target_max_relative_l2": 0.0
+      },
+      {
+        "left": "raw-nobench-a",
+        "right": "raw-nobench-b",
+        "rgb_exact": true,
+        "rgb_mae": 0.0,
+        "rgb_relative_l2": 0.0,
+        "rgb_max_abs": 0,
+        "ssim_mean": 1.0,
+        "ssim_quarters": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "psnr_min_db": null,
+        "psnr_max_db": null,
+        "target_first_chunk": {
+          "start": 0,
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_l2": 0.0
+        },
+        "target_max_relative_l2": 0.0
+      },
+      {
+        "left": "raw-replicate-a",
+        "right": "raw-replicate-b",
+        "rgb_exact": false,
+        "rgb_mae": 20.724700927734375,
+        "rgb_relative_l2": 0.19285708665847778,
+        "rgb_max_abs": 235,
+        "ssim_mean": 0.45653560833333334,
+        "ssim_quarters": [
+          0.6318506666666667,
+          0.42127386666666666,
+          0.3868169,
+          0.3862009999999999
+        ],
+        "psnr_min_db": 15.865987081693,
+        "psnr_max_db": 30.55804714528041,
+        "target_first_chunk": {
+          "start": 0,
+          "exact": false,
+          "max_abs": 1.3991217613220215,
+          "relative_l2": 0.08005578070878983
+        },
+        "target_max_relative_l2": 0.6570412516593933
+      },
+      {
+        "left": "raw-perf-r3-a",
+        "right": "raw-perf-r3-b",
+        "rgb_exact": false,
+        "rgb_mae": 19.035423278808594,
+        "rgb_relative_l2": 0.17662371695041656,
+        "rgb_max_abs": 225,
+        "ssim_mean": 0.46578814999999996,
+        "ssim_quarters": [
+          0.6449666000000002,
+          0.4294505,
+          0.3934738,
+          0.3952617
+        ],
+        "psnr_min_db": 16.382155366753917,
+        "psnr_max_db": 28.006355818484145,
+        "target_first_chunk": {
+          "start": 0,
+          "exact": false,
+          "max_abs": 1.185044288635254,
+          "relative_l2": 0.09688591957092285
+        },
+        "target_max_relative_l2": 0.6026834845542908
+      },
+      {
+        "left": "raw-perf-r3-a",
+        "right": "raw-nobench-a",
+        "rgb_exact": false,
+        "rgb_mae": 15.390294075012207,
+        "rgb_relative_l2": 0.15192557871341705,
+        "rgb_max_abs": 229,
+        "ssim_mean": 0.5093351916666664,
+        "ssim_quarters": [
+          0.6605632333333334,
+          0.5105391333333333,
+          0.43190613333333333,
+          0.43433226666666674
+        ],
+        "psnr_min_db": 17.40421219285616,
+        "psnr_max_db": 28.07768294722702,
+        "target_first_chunk": {
+          "start": 0,
+          "exact": false,
+          "max_abs": 0.9847123622894287,
+          "relative_l2": 0.10531394928693771
+        },
+        "target_max_relative_l2": 0.5545206069946289
+      },
+      {
+        "left": "raw-perf-r3-a",
+        "right": "raw-replicate-a",
+        "rgb_exact": false,
+        "rgb_mae": 20.549327850341797,
+        "rgb_relative_l2": 0.19618424773216248,
+        "rgb_max_abs": 230,
+        "ssim_mean": 0.47119676666666666,
+        "ssim_quarters": [
+          0.6477998333333332,
+          0.42412983333333343,
+          0.40229269999999995,
+          0.41056469999999995
+        ],
+        "psnr_min_db": 15.957989148451885,
+        "psnr_max_db": 31.217007444931216,
+        "target_first_chunk": {
+          "start": 0,
+          "exact": false,
+          "max_abs": 1.3064427375793457,
+          "relative_l2": 0.07171662896871567
+        },
+        "target_max_relative_l2": 0.6945821046829224
+      }
+    ],
+    "session_rgb_sha256": {
+      "frozen-off-a": [
+        "ba15079ed9623420dd556f70636ed28147853bf2ab44985c1691164239b5db5a",
+        "ba15079ed9623420dd556f70636ed28147853bf2ab44985c1691164239b5db5a"
+      ],
+      "frozen-off-b": [
+        "ba15079ed9623420dd556f70636ed28147853bf2ab44985c1691164239b5db5a",
+        "ba15079ed9623420dd556f70636ed28147853bf2ab44985c1691164239b5db5a"
+      ],
+      "frozen-source": [
+        "ba15079ed9623420dd556f70636ed28147853bf2ab44985c1691164239b5db5a",
+        "ba15079ed9623420dd556f70636ed28147853bf2ab44985c1691164239b5db5a"
+      ],
+      "frozen-cross": [
+        "ba15079ed9623420dd556f70636ed28147853bf2ab44985c1691164239b5db5a",
+        "ba15079ed9623420dd556f70636ed28147853bf2ab44985c1691164239b5db5a"
+      ],
+      "raw-perf-a": [
+        "966133d49834b8c2083d26e13957cd8e54a895e1e2849914730b6717110beba5",
+        "966133d49834b8c2083d26e13957cd8e54a895e1e2849914730b6717110beba5"
+      ],
+      "raw-perf-b": [
+        "81a74d36173ad4eecab02ad7da1c29f8c5316f884bd4fa9fdf991c73a8260126",
+        "81a74d36173ad4eecab02ad7da1c29f8c5316f884bd4fa9fdf991c73a8260126"
+      ],
+      "raw-det-a": [
+        "b01f9c0a76709ac71bf9de3fe44a22859a661a489f7343b43ea7dcce3e7d0f30",
+        "b01f9c0a76709ac71bf9de3fe44a22859a661a489f7343b43ea7dcce3e7d0f30"
+      ],
+      "raw-det-b": [
+        "b01f9c0a76709ac71bf9de3fe44a22859a661a489f7343b43ea7dcce3e7d0f30",
+        "b01f9c0a76709ac71bf9de3fe44a22859a661a489f7343b43ea7dcce3e7d0f30"
+      ],
+      "raw-perf-r3-a": [
+        "bb129b040012ae2a887dfb6668c6dd5acf8d6c3f8eaad508c5aa6cce1484a5f1",
+        "bb129b040012ae2a887dfb6668c6dd5acf8d6c3f8eaad508c5aa6cce1484a5f1"
+      ],
+      "raw-perf-r3-b": [
+        "bc3ce156cc7a5a2b05fb2e5d5191a7aa6555fe7c5e68d38522a36e486ef5d533",
+        "bc3ce156cc7a5a2b05fb2e5d5191a7aa6555fe7c5e68d38522a36e486ef5d533"
+      ],
+      "raw-nobench-a": [
+        "b01f9c0a76709ac71bf9de3fe44a22859a661a489f7343b43ea7dcce3e7d0f30",
+        "b01f9c0a76709ac71bf9de3fe44a22859a661a489f7343b43ea7dcce3e7d0f30"
+      ],
+      "raw-nobench-b": [
+        "b01f9c0a76709ac71bf9de3fe44a22859a661a489f7343b43ea7dcce3e7d0f30",
+        "b01f9c0a76709ac71bf9de3fe44a22859a661a489f7343b43ea7dcce3e7d0f30"
+      ],
+      "raw-replicate-a": [
+        "af020545df1b412234f42ef0e9297d738ea5e4ee22fd195bc6da46bdf7a93bfe",
+        "af020545df1b412234f42ef0e9297d738ea5e4ee22fd195bc6da46bdf7a93bfe"
+      ],
+      "raw-replicate-b": [
+        "a2edd303efd1ca3ebfece324fa8b837cf2804efdc4d3e836d1a3fc6b74ab39eb",
+        "a2edd303efd1ca3ebfece324fa8b837cf2804efdc4d3e836d1a3fc6b74ab39eb"
+      ]
+    },
+    "rank_comparison": {
+      "frozen-cross": {
+        "encode_condition": {
+          "counts": [
+            1,
+            1
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "encode_visual": {
+          "counts": [
+            6,
+            6
+          ],
+          "mismatch_indices": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "field_mismatch_indices": {
+            "observed": [
+              1,
+              2,
+              3,
+              4,
+              5
+            ],
+            "used": []
+          }
+        },
+        "source_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        },
+        "sample_streaming_visual_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "dit_inputs": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "source": [],
+            "noise": []
+          }
+        },
+        "target_latent": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        }
+      },
+      "frozen-off-a": {
+        "encode_condition": {
+          "counts": [
+            1,
+            1
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "encode_visual": {
+          "counts": [
+            6,
+            6
+          ],
+          "mismatch_indices": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "field_mismatch_indices": {
+            "observed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5
+            ],
+            "used": []
+          }
+        },
+        "source_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        },
+        "sample_streaming_visual_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "dit_inputs": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "source": [],
+            "noise": []
+          }
+        },
+        "target_latent": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        }
+      },
+      "frozen-off-b": {
+        "encode_condition": {
+          "counts": [
+            1,
+            1
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "encode_visual": {
+          "counts": [
+            6,
+            6
+          ],
+          "mismatch_indices": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "field_mismatch_indices": {
+            "observed": [
+              1,
+              2,
+              3,
+              4,
+              5
+            ],
+            "used": []
+          }
+        },
+        "source_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        },
+        "sample_streaming_visual_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "dit_inputs": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "source": [],
+            "noise": []
+          }
+        },
+        "target_latent": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        }
+      },
+      "frozen-source": {
+        "encode_condition": {
+          "counts": [
+            1,
+            1
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "encode_visual": {
+          "counts": [
+            6,
+            6
+          ],
+          "mismatch_indices": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "field_mismatch_indices": {
+            "observed": [
+              1,
+              2,
+              3,
+              4,
+              5
+            ],
+            "used": []
+          }
+        },
+        "source_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        },
+        "sample_streaming_visual_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "dit_inputs": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "source": [],
+            "noise": []
+          }
+        },
+        "target_latent": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        }
+      },
+      "raw-det-a": {
+        "encode_condition": {
+          "counts": [
+            1,
+            1
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "encode_visual": {
+          "counts": [
+            6,
+            6
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "source_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        },
+        "sample_streaming_visual_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "dit_inputs": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "source": [],
+            "noise": []
+          }
+        },
+        "target_latent": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        }
+      },
+      "raw-det-b": {
+        "encode_condition": {
+          "counts": [
+            1,
+            1
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "encode_visual": {
+          "counts": [
+            6,
+            6
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "source_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        },
+        "sample_streaming_visual_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "dit_inputs": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "source": [],
+            "noise": []
+          }
+        },
+        "target_latent": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        }
+      },
+      "raw-nobench-a": {
+        "encode_condition": {
+          "counts": [
+            1,
+            1
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "encode_visual": {
+          "counts": [
+            6,
+            6
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "source_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        },
+        "sample_streaming_visual_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "dit_inputs": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "source": [],
+            "noise": []
+          }
+        },
+        "target_latent": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        }
+      },
+      "raw-nobench-b": {
+        "encode_condition": {
+          "counts": [
+            1,
+            1
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "encode_visual": {
+          "counts": [
+            6,
+            6
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "source_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        },
+        "sample_streaming_visual_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "dit_inputs": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "source": [],
+            "noise": []
+          }
+        },
+        "target_latent": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        }
+      },
+      "raw-perf-a": {
+        "encode_condition": {
+          "counts": [
+            1,
+            1
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "encode_visual": {
+          "counts": [
+            6,
+            6
+          ],
+          "mismatch_indices": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "field_mismatch_indices": {
+            "observed": [
+              1,
+              2,
+              3,
+              4,
+              5
+            ],
+            "used": [
+              1,
+              2,
+              3,
+              4,
+              5
+            ]
+          }
+        },
+        "source_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        },
+        "sample_streaming_visual_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "dit_inputs": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "source": [],
+            "noise": []
+          }
+        },
+        "target_latent": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        }
+      },
+      "raw-perf-b": {
+        "encode_condition": {
+          "counts": [
+            1,
+            1
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "encode_visual": {
+          "counts": [
+            6,
+            6
+          ],
+          "mismatch_indices": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "field_mismatch_indices": {
+            "observed": [
+              1,
+              2,
+              3,
+              4,
+              5
+            ],
+            "used": [
+              1,
+              2,
+              3,
+              4,
+              5
+            ]
+          }
+        },
+        "source_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        },
+        "sample_streaming_visual_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "dit_inputs": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "source": [],
+            "noise": []
+          }
+        },
+        "target_latent": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        }
+      },
+      "raw-perf-r3-a": {
+        "encode_condition": {
+          "counts": [
+            1,
+            1
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "encode_visual": {
+          "counts": [
+            6,
+            6
+          ],
+          "mismatch_indices": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "field_mismatch_indices": {
+            "observed": [
+              1,
+              2,
+              3,
+              4,
+              5
+            ],
+            "used": [
+              1,
+              2,
+              3,
+              4,
+              5
+            ]
+          }
+        },
+        "source_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        },
+        "sample_streaming_visual_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "dit_inputs": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "source": [],
+            "noise": []
+          }
+        },
+        "target_latent": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        }
+      },
+      "raw-perf-r3-b": {
+        "encode_condition": {
+          "counts": [
+            1,
+            1
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "encode_visual": {
+          "counts": [
+            6,
+            6
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "source_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        },
+        "sample_streaming_visual_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "dit_inputs": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "source": [],
+            "noise": []
+          }
+        },
+        "target_latent": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        }
+      },
+      "raw-replicate-a": {
+        "encode_condition": {
+          "counts": [
+            1,
+            1
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "encode_visual": {
+          "counts": [
+            6,
+            6
+          ],
+          "mismatch_indices": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "field_mismatch_indices": {
+            "observed": [
+              1,
+              2,
+              3,
+              4,
+              5
+            ],
+            "used": [
+              1,
+              2,
+              3,
+              4,
+              5
+            ]
+          }
+        },
+        "source_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21
+          ],
+          "field_mismatch_indices": {
+            "value": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21
+            ]
+          }
+        },
+        "sample_streaming_visual_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21
+          ],
+          "field_mismatch_indices": {
+            "observed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21
+            ],
+            "used": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21
+            ]
+          }
+        },
+        "dit_inputs": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21
+          ],
+          "field_mismatch_indices": {
+            "source": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21
+            ],
+            "noise": []
+          }
+        },
+        "target_latent": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        }
+      },
+      "raw-replicate-b": {
+        "encode_condition": {
+          "counts": [
+            1,
+            1
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "observed": [],
+            "used": []
+          }
+        },
+        "encode_visual": {
+          "counts": [
+            6,
+            6
+          ],
+          "mismatch_indices": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "field_mismatch_indices": {
+            "observed": [
+              1,
+              2,
+              3,
+              4,
+              5
+            ],
+            "used": [
+              1,
+              2,
+              3,
+              4,
+              5
+            ]
+          }
+        },
+        "source_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21
+          ],
+          "field_mismatch_indices": {
+            "value": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21
+            ]
+          }
+        },
+        "sample_streaming_visual_moments": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21
+          ],
+          "field_mismatch_indices": {
+            "observed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21
+            ],
+            "used": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21
+            ]
+          }
+        },
+        "dit_inputs": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21
+          ],
+          "field_mismatch_indices": {
+            "source": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21
+            ],
+            "noise": []
+          }
+        },
+        "target_latent": {
+          "counts": [
+            22,
+            22
+          ],
+          "mismatch_indices": [],
+          "field_mismatch_indices": {
+            "value": []
+          }
+        }
+      }
+    },
+    "cross_process_comparison": {
+      "raw-perf-r3-a vs raw-perf-r3-b": {
+        "encode_condition": {
+          "count": 1,
+          "first_difference": null,
+          "different_count": 0
+        },
+        "encode_visual": {
+          "count": 6,
+          "first_difference": 1,
+          "different_count": 5
+        },
+        "source_moments": {
+          "count": 22,
+          "first_difference": 0,
+          "different_count": 22
+        },
+        "sample_streaming_visual_moments": {
+          "count": 22,
+          "first_difference": 0,
+          "different_count": 22
+        },
+        "dit_inputs": {
+          "count": 22,
+          "first_difference": null,
+          "different_count": 0
+        },
+        "target_latent": {
+          "count": 22,
+          "first_difference": 0,
+          "different_count": 22
+        }
+      },
+      "raw-nobench-a vs raw-nobench-b": {
+        "encode_condition": {
+          "count": 1,
+          "first_difference": null,
+          "different_count": 0
+        },
+        "encode_visual": {
+          "count": 6,
+          "first_difference": null,
+          "different_count": 0
+        },
+        "source_moments": {
+          "count": 22,
+          "first_difference": null,
+          "different_count": 0
+        },
+        "sample_streaming_visual_moments": {
+          "count": 22,
+          "first_difference": null,
+          "different_count": 0
+        },
+        "dit_inputs": {
+          "count": 22,
+          "first_difference": null,
+          "different_count": 0
+        },
+        "target_latent": {
+          "count": 22,
+          "first_difference": null,
+          "different_count": 0
+        }
+      },
+      "raw-det-a vs raw-nobench-a": {
+        "encode_condition": {
+          "count": 1,
+          "first_difference": null,
+          "different_count": 0
+        },
+        "encode_visual": {
+          "count": 6,
+          "first_difference": null,
+          "different_count": 0
+        },
+        "source_moments": {
+          "count": 22,
+          "first_difference": null,
+          "different_count": 0
+        },
+        "sample_streaming_visual_moments": {
+          "count": 22,
+          "first_difference": null,
+          "different_count": 0
+        },
+        "dit_inputs": {
+          "count": 22,
+          "first_difference": null,
+          "different_count": 0
+        },
+        "target_latent": {
+          "count": 22,
+          "first_difference": null,
+          "different_count": 0
+        }
+      },
+      "raw-replicate-a vs raw-replicate-b": {
+        "encode_condition": {
+          "count": 1,
+          "first_difference": null,
+          "different_count": 0
+        },
+        "encode_visual": {
+          "count": 6,
+          "first_difference": 1,
+          "different_count": 5
+        },
+        "source_moments": {
+          "count": 22,
+          "first_difference": 1,
+          "different_count": 14
+        },
+        "sample_streaming_visual_moments": {
+          "count": 22,
+          "first_difference": 1,
+          "different_count": 14
+        },
+        "dit_inputs": {
+          "count": 22,
+          "first_difference": null,
+          "different_count": 0
+        },
+        "target_latent": {
+          "count": 22,
+          "first_difference": 0,
+          "different_count": 22
+        }
+      }
+    }
+  },
+  "current": {
+    "source_commit": "9c19d3b4f6a69c509894a35edfb12093eed9ec8b",
+    "source_sha256": "9e0442afe069f1119af62cc7edc72b34b684fcdfe6502244bcf02deb851508cd",
+    "tools_sha256": "7e940a8a83e2ca1a2f9587c14e39de31fa58d5e39bafc84deb19835ffd9abbc9",
+    "rebased_runtime_commit": "de1510a484",
+    "gpu_job": "dlc8szhmzep7j5yg",
+    "cpu_post_job": "dlc1e5i0i3z75xid",
+    "gpu_status": "Succeeded",
+    "cpu_status": "Succeeded",
+    "archive_receipt": {
+      "sha256": "eaccf7ac88fe7389aa0e336770a56a34e4315678261dc321dac71cf4e19279a1",
+      "bytes": 33687893
+    },
+    "download_receipt_verified": true,
+    "complete_requests": 10,
+    "mp4_full_decodes": 10,
+    "joint_wait": "auto",
+    "attention": "auto (actual FA4 fallback)",
+    "arms": {
+      "det-off": {
+        "session_rgb_sha256": [
+          "b01f9c0a76709ac71bf9de3fe44a22859a661a489f7343b43ea7dcce3e7d0f30",
+          "b01f9c0a76709ac71bf9de3fe44a22859a661a489f7343b43ea7dcce3e7d0f30"
+        ],
+        "rank_checks": [
+          {
+            "encode_condition": {
+              "count": 1,
+              "rank_different_indices": []
+            },
+            "encode_visual": {
+              "count": 6,
+              "rank_different_indices": []
+            },
+            "source_moments": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "sample_streaming_visual_moments": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "dit_inputs": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "target_latent": {
+              "count": 22,
+              "rank_different_indices": []
+            }
+          },
+          {
+            "encode_condition": {
+              "count": 1,
+              "rank_different_indices": []
+            },
+            "encode_visual": {
+              "count": 6,
+              "rank_different_indices": []
+            },
+            "source_moments": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "sample_streaming_visual_moments": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "dit_inputs": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "target_latent": {
+              "count": 22,
+              "rank_different_indices": []
+            }
+          }
+        ],
+        "repeated_codec_noise_and_target_exact": true,
+        "attention": {
+          "recorded_geometries": 0,
+          "configured": [],
+          "fused_returns": [],
+          "backend": [],
+          "q_lengths": []
+        },
+        "dispatches": [
+          {
+            "final_joint": null,
+            "wait_policy": [
+              "auto"
+            ],
+            "max_wait_ms": 0.0009710000199447677,
+            "max_budget_ms": 333.3333333333333
+          },
+          {
+            "final_joint": null,
+            "wait_policy": [
+              "auto"
+            ],
+            "max_wait_ms": 0.0011829999948531622,
+            "max_budget_ms": 333.3333333333333
+          }
+        ]
+      },
+      "det-source": {
+        "session_rgb_sha256": [
+          "b01f9c0a76709ac71bf9de3fe44a22859a661a489f7343b43ea7dcce3e7d0f30",
+          "b01f9c0a76709ac71bf9de3fe44a22859a661a489f7343b43ea7dcce3e7d0f30"
+        ],
+        "rank_checks": [
+          {
+            "encode_condition": {
+              "count": 1,
+              "rank_different_indices": []
+            },
+            "encode_visual": {
+              "count": 6,
+              "rank_different_indices": []
+            },
+            "source_moments": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "sample_streaming_visual_moments": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "dit_inputs": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "target_latent": {
+              "count": 22,
+              "rank_different_indices": []
+            }
+          },
+          {
+            "encode_condition": {
+              "count": 1,
+              "rank_different_indices": []
+            },
+            "encode_visual": {
+              "count": 6,
+              "rank_different_indices": []
+            },
+            "source_moments": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "sample_streaming_visual_moments": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "dit_inputs": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "target_latent": {
+              "count": 22,
+              "rank_different_indices": []
+            }
+          }
+        ],
+        "repeated_codec_noise_and_target_exact": true,
+        "attention": {
+          "recorded_geometries": 22,
+          "configured": [
+            "auto"
+          ],
+          "fused_returns": [
+            false
+          ],
+          "backend": [
+            "fa4"
+          ],
+          "q_lengths": [
+            780,
+            1560
+          ]
+        },
+        "dispatches": [
+          {
+            "final_joint": {
+              "dit_forwards": 111,
+              "forward_counts": {
+                "prefix": 1,
+                "source": 0,
+                "denoise": 66,
+                "unconditional": 0,
+                "commit": 22,
+                "source_first": 22,
+                "cross_chunk": 0
+              },
+              "joint_forward": "source_first",
+              "joint_fallbacks": {},
+              "joint_row_shapes": {
+                "source_first": {
+                  "390+390": 8,
+                  "780+780": 14
+                }
+              }
+            },
+            "wait_policy": [
+              "auto"
+            ],
+            "max_wait_ms": 0.0014519999922413263,
+            "max_budget_ms": 333.3333333333333
+          },
+          {
+            "final_joint": {
+              "dit_forwards": 111,
+              "forward_counts": {
+                "prefix": 1,
+                "source": 0,
+                "denoise": 66,
+                "unconditional": 0,
+                "commit": 22,
+                "source_first": 22,
+                "cross_chunk": 0
+              },
+              "joint_forward": "source_first",
+              "joint_fallbacks": {},
+              "joint_row_shapes": {
+                "source_first": {
+                  "390+390": 8,
+                  "780+780": 14
+                }
+              }
+            },
+            "wait_policy": [
+              "auto"
+            ],
+            "max_wait_ms": 0.0008039999102038564,
+            "max_budget_ms": 333.3333333333333
+          }
+        ]
+      },
+      "det-cross": {
+        "session_rgb_sha256": [
+          "b01f9c0a76709ac71bf9de3fe44a22859a661a489f7343b43ea7dcce3e7d0f30",
+          "b01f9c0a76709ac71bf9de3fe44a22859a661a489f7343b43ea7dcce3e7d0f30"
+        ],
+        "rank_checks": [
+          {
+            "encode_condition": {
+              "count": 1,
+              "rank_different_indices": []
+            },
+            "encode_visual": {
+              "count": 6,
+              "rank_different_indices": []
+            },
+            "source_moments": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "sample_streaming_visual_moments": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "dit_inputs": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "target_latent": {
+              "count": 22,
+              "rank_different_indices": []
+            }
+          },
+          {
+            "encode_condition": {
+              "count": 1,
+              "rank_different_indices": []
+            },
+            "encode_visual": {
+              "count": 6,
+              "rank_different_indices": []
+            },
+            "source_moments": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "sample_streaming_visual_moments": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "dit_inputs": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "target_latent": {
+              "count": 22,
+              "rank_different_indices": []
+            }
+          }
+        ],
+        "repeated_codec_noise_and_target_exact": true,
+        "attention": {
+          "recorded_geometries": 22,
+          "configured": [
+            "auto"
+          ],
+          "fused_returns": [
+            false
+          ],
+          "backend": [
+            "fa4"
+          ],
+          "q_lengths": [
+            780,
+            1560,
+            1950
+          ]
+        },
+        "dispatches": [
+          {
+            "final_joint": {
+              "dit_forwards": 104,
+              "forward_counts": {
+                "prefix": 1,
+                "source": 0,
+                "denoise": 66,
+                "unconditional": 0,
+                "commit": 15,
+                "source_first": 15,
+                "cross_chunk": 7
+              },
+              "joint_forward": "cross_chunk",
+              "joint_fallbacks": {
+                "source_not_ready": 14,
+                "window_eviction": 1
+              },
+              "joint_row_shapes": {
+                "source_first": {
+                  "390+390": 2,
+                  "780+780": 13
+                },
+                "cross_chunk": {
+                  "390+780+780": 1,
+                  "780+390+390": 6
+                }
+              }
+            },
+            "wait_policy": [
+              "auto"
+            ],
+            "max_wait_ms": 330.6528379999918,
+            "max_budget_ms": 333.3333333333333
+          },
+          {
+            "final_joint": {
+              "dit_forwards": 104,
+              "forward_counts": {
+                "prefix": 1,
+                "source": 0,
+                "denoise": 66,
+                "unconditional": 0,
+                "commit": 15,
+                "source_first": 15,
+                "cross_chunk": 7
+              },
+              "joint_forward": "cross_chunk",
+              "joint_fallbacks": {
+                "source_not_ready": 14,
+                "window_eviction": 1
+              },
+              "joint_row_shapes": {
+                "source_first": {
+                  "390+390": 2,
+                  "780+780": 13
+                },
+                "cross_chunk": {
+                  "390+780+780": 1,
+                  "780+390+390": 6
+                }
+              }
+            },
+            "wait_policy": [
+              "auto"
+            ],
+            "max_wait_ms": 330.56647099999736,
+            "max_budget_ms": 333.3333333333333
+          }
+        ]
+      },
+      "perf-cross": {
+        "session_rgb_sha256": [
+          "0e68d5def2373760d18f4abf84047aeaa017aa2eefc99744505783f9b73f9c51",
+          "0e68d5def2373760d18f4abf84047aeaa017aa2eefc99744505783f9b73f9c51"
+        ],
+        "rank_checks": [
+          {
+            "encode_condition": {
+              "count": 1,
+              "rank_different_indices": []
+            },
+            "encode_visual": {
+              "count": 6,
+              "rank_different_indices": []
+            },
+            "source_moments": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "sample_streaming_visual_moments": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "dit_inputs": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "target_latent": {
+              "count": 22,
+              "rank_different_indices": []
+            }
+          },
+          {
+            "encode_condition": {
+              "count": 1,
+              "rank_different_indices": []
+            },
+            "encode_visual": {
+              "count": 6,
+              "rank_different_indices": []
+            },
+            "source_moments": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "sample_streaming_visual_moments": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "dit_inputs": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "target_latent": {
+              "count": 22,
+              "rank_different_indices": []
+            }
+          }
+        ],
+        "repeated_codec_noise_and_target_exact": true,
+        "attention": {
+          "recorded_geometries": 22,
+          "configured": [
+            "auto"
+          ],
+          "fused_returns": [
+            false
+          ],
+          "backend": [
+            "fa4"
+          ],
+          "q_lengths": [
+            780,
+            1560,
+            1950
+          ]
+        },
+        "dispatches": [
+          {
+            "final_joint": {
+              "dit_forwards": 104,
+              "forward_counts": {
+                "prefix": 1,
+                "source": 0,
+                "denoise": 66,
+                "unconditional": 0,
+                "commit": 15,
+                "source_first": 15,
+                "cross_chunk": 7
+              },
+              "joint_forward": "cross_chunk",
+              "joint_fallbacks": {
+                "source_not_ready": 14,
+                "window_eviction": 1
+              },
+              "joint_row_shapes": {
+                "source_first": {
+                  "390+390": 2,
+                  "780+780": 13
+                },
+                "cross_chunk": {
+                  "390+780+780": 1,
+                  "780+390+390": 6
+                }
+              }
+            },
+            "wait_policy": [
+              "auto"
+            ],
+            "max_wait_ms": 330.3750149999587,
+            "max_budget_ms": 333.3333333333333
+          },
+          {
+            "final_joint": {
+              "dit_forwards": 104,
+              "forward_counts": {
+                "prefix": 1,
+                "source": 0,
+                "denoise": 66,
+                "unconditional": 0,
+                "commit": 15,
+                "source_first": 15,
+                "cross_chunk": 7
+              },
+              "joint_forward": "cross_chunk",
+              "joint_fallbacks": {
+                "source_not_ready": 14,
+                "window_eviction": 1
+              },
+              "joint_row_shapes": {
+                "source_first": {
+                  "390+390": 2,
+                  "780+780": 13
+                },
+                "cross_chunk": {
+                  "390+780+780": 1,
+                  "780+390+390": 6
+                }
+              }
+            },
+            "wait_policy": [
+              "auto"
+            ],
+            "max_wait_ms": 330.5230340001799,
+            "max_budget_ms": 333.3333333333333
+          }
+        ]
+      },
+      "perf-replicate": {
+        "session_rgb_sha256": [
+          "ee682c5050b33ff44a5359523d855fc8ece0425640152c73204a9a0caa3a5297",
+          "ee682c5050b33ff44a5359523d855fc8ece0425640152c73204a9a0caa3a5297"
+        ],
+        "rank_checks": [
+          {
+            "encode_condition": {
+              "count": 1,
+              "rank_different_indices": []
+            },
+            "encode_visual": {
+              "count": 6,
+              "rank_different_indices": []
+            },
+            "source_moments": {
+              "count": 22,
+              "rank_different_indices": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21
+              ]
+            },
+            "sample_streaming_visual_moments": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "dit_inputs": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "target_latent": {
+              "count": 22,
+              "rank_different_indices": []
+            }
+          },
+          {
+            "encode_condition": {
+              "count": 1,
+              "rank_different_indices": []
+            },
+            "encode_visual": {
+              "count": 6,
+              "rank_different_indices": []
+            },
+            "source_moments": {
+              "count": 22,
+              "rank_different_indices": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21
+              ]
+            },
+            "sample_streaming_visual_moments": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "dit_inputs": {
+              "count": 22,
+              "rank_different_indices": []
+            },
+            "target_latent": {
+              "count": 22,
+              "rank_different_indices": []
+            }
+          }
+        ],
+        "repeated_codec_noise_and_target_exact": true,
+        "attention": {
+          "recorded_geometries": 22,
+          "configured": [
+            "auto"
+          ],
+          "fused_returns": [
+            false
+          ],
+          "backend": [
+            "fa4"
+          ],
+          "q_lengths": [
+            780,
+            1560,
+            1950
+          ]
+        },
+        "dispatches": [
+          {
+            "final_joint": {
+              "dit_forwards": 104,
+              "forward_counts": {
+                "prefix": 1,
+                "source": 0,
+                "denoise": 66,
+                "unconditional": 0,
+                "commit": 15,
+                "source_first": 15,
+                "cross_chunk": 7
+              },
+              "joint_forward": "cross_chunk",
+              "joint_fallbacks": {
+                "source_not_ready": 14,
+                "window_eviction": 1
+              },
+              "joint_row_shapes": {
+                "source_first": {
+                  "390+390": 2,
+                  "780+780": 13
+                },
+                "cross_chunk": {
+                  "390+780+780": 1,
+                  "780+390+390": 6
+                }
+              }
+            },
+            "wait_policy": [
+              "auto"
+            ],
+            "max_wait_ms": 330.2745429998595,
+            "max_budget_ms": 333.3333333333333
+          },
+          {
+            "final_joint": {
+              "dit_forwards": 104,
+              "forward_counts": {
+                "prefix": 1,
+                "source": 0,
+                "denoise": 66,
+                "unconditional": 0,
+                "commit": 15,
+                "source_first": 15,
+                "cross_chunk": 7
+              },
+              "joint_forward": "cross_chunk",
+              "joint_fallbacks": {
+                "source_not_ready": 14,
+                "window_eviction": 1
+              },
+              "joint_row_shapes": {
+                "source_first": {
+                  "390+390": 2,
+                  "780+780": 13
+                },
+                "cross_chunk": {
+                  "390+780+780": 1,
+                  "780+390+390": 6
+                }
+              }
+            },
+            "wait_policy": [
+              "auto"
+            ],
+            "max_wait_ms": 330.3704719999132,
+            "max_budget_ms": 333.3333333333333
+          }
+        ]
+      }
+    },
+    "paired_comparisons": [
+      {
+        "left": "det-off",
+        "right": "det-source",
+        "rgb_exact": true,
+        "rgb_mae": 0.0,
+        "rgb_relative_l2": 0.0,
+        "rgb_max_abs": 0,
+        "target_first_chunk": {
+          "start": 0,
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_l2": 0.0
+        },
+        "target_max_relative_l2": 0.0
+      },
+      {
+        "left": "det-off",
+        "right": "det-cross",
+        "rgb_exact": true,
+        "rgb_mae": 0.0,
+        "rgb_relative_l2": 0.0,
+        "rgb_max_abs": 0,
+        "target_first_chunk": {
+          "start": 0,
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_l2": 0.0
+        },
+        "target_max_relative_l2": 0.0
+      },
+      {
+        "left": "det-off",
+        "right": "perf-cross",
+        "rgb_exact": false,
+        "rgb_mae": 16.979856491088867,
+        "rgb_relative_l2": 0.15904343128204346,
+        "rgb_max_abs": 221,
+        "target_first_chunk": {
+          "start": 0,
+          "exact": false,
+          "max_abs": 0.6854026913642883,
+          "relative_l2": 0.06810478866100311
+        },
+        "target_max_relative_l2": 0.5642842650413513
+      },
+      {
+        "left": "perf-cross",
+        "right": "perf-replicate",
+        "rgb_exact": false,
+        "rgb_mae": 20.333284378051758,
+        "rgb_relative_l2": 0.1886904239654541,
+        "rgb_max_abs": 231,
+        "target_first_chunk": {
+          "start": 0,
+          "exact": false,
+          "max_abs": 1.1652288436889648,
+          "relative_l2": 0.04604341462254524
+        },
+        "target_max_relative_l2": 0.6804159283638
+      }
+    ],
+    "conv_diagnostics": {
+      "det-off": {
+        "first_rank_difference": null,
+        "first_five": [
+          {
+            "call": 0,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          {
+            "call": 1,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          {
+            "call": 2,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          {
+            "call": 3,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          {
+            "call": 4,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          }
+        ],
+        "rows_per_rank": {
+          "0": 87,
+          "1": 87
+        }
+      },
+      "det-source": {
+        "first_rank_difference": null,
+        "first_five": [
+          {
+            "call": 0,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          {
+            "call": 1,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          {
+            "call": 2,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          {
+            "call": 3,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          {
+            "call": 4,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          }
+        ],
+        "rows_per_rank": {
+          "0": 87,
+          "1": 87
+        }
+      },
+      "det-cross": {
+        "first_rank_difference": null,
+        "first_five": [
+          {
+            "call": 0,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          {
+            "call": 1,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          {
+            "call": 2,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          {
+            "call": 3,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          {
+            "call": 4,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          }
+        ],
+        "rows_per_rank": {
+          "0": 87,
+          "1": 87
+        }
+      },
+      "perf-cross": {
+        "first_rank_difference": {
+          "rank0": {
+            "reference": 1,
+            "call": 41,
+            "input": {
+              "shape": [
+                13,
+                256,
+                3,
+                130,
+                130
+              ],
+              "dtype": "torch.bfloat16",
+              "sha256": "488ff9ff50ee843c8009bcbe8d3477535f37bf676d2e6670bf8d32508e803e35"
+            },
+            "weight": {
+              "shape": [
+                256,
+                256,
+                3,
+                3,
+                3
+              ],
+              "dtype": "torch.bfloat16",
+              "sha256": "750b7ca291a627e7ee90372d63c01c1f6277938b5426dff379cb9c7862a8097d"
+            },
+            "bias": {
+              "shape": [
+                256
+              ],
+              "dtype": "torch.bfloat16",
+              "sha256": "7091510f5fcdbd282ca02e10c5b55528902f71f9f0652c33c151aa4d41055751"
+            },
+            "output": {
+              "shape": [
+                13,
+                256,
+                1,
+                128,
+                128
+              ],
+              "dtype": "torch.bfloat16",
+              "sha256": "7e017e5c473b83c4456469290a923bb9fc20525f68f901af5b0d46dfe5377102"
+            },
+            "args": [],
+            "kwargs": {
+              "stride": [
+                1,
+                1,
+                1
+              ],
+              "padding": 0,
+              "dilation": [
+                1,
+                1,
+                1
+              ]
+            },
+            "benchmark": true,
+            "deterministic": false
+          },
+          "rank1": {
+            "reference": 1,
+            "call": 41,
+            "input": {
+              "shape": [
+                13,
+                256,
+                3,
+                130,
+                130
+              ],
+              "dtype": "torch.bfloat16",
+              "sha256": "488ff9ff50ee843c8009bcbe8d3477535f37bf676d2e6670bf8d32508e803e35"
+            },
+            "weight": {
+              "shape": [
+                256,
+                256,
+                3,
+                3,
+                3
+              ],
+              "dtype": "torch.bfloat16",
+              "sha256": "750b7ca291a627e7ee90372d63c01c1f6277938b5426dff379cb9c7862a8097d"
+            },
+            "bias": {
+              "shape": [
+                256
+              ],
+              "dtype": "torch.bfloat16",
+              "sha256": "7091510f5fcdbd282ca02e10c5b55528902f71f9f0652c33c151aa4d41055751"
+            },
+            "output": {
+              "shape": [
+                13,
+                256,
+                1,
+                128,
+                128
+              ],
+              "dtype": "torch.bfloat16",
+              "sha256": "ef6aa82552b02b6031f8886d0cdc28407389bbe9b22ac7bbb67ee7f78c4ee178"
+            },
+            "args": [],
+            "kwargs": {
+              "stride": [
+                1,
+                1,
+                1
+              ],
+              "padding": 0,
+              "dilation": [
+                1,
+                1,
+                1
+              ]
+            },
+            "benchmark": true,
+            "deterministic": false
+          },
+          "input_equal": true,
+          "weights_equal": true
+        },
+        "first_five": [
+          {
+            "call": 0,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          {
+            "call": 1,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          {
+            "call": 2,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          {
+            "call": 3,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          {
+            "call": 4,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          }
+        ],
+        "rows_per_rank": {
+          "0": 87,
+          "1": 87
+        }
+      },
+      "perf-replicate": {
+        "first_rank_difference": null,
+        "first_five": [
+          {
+            "call": 0,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          {
+            "call": 1,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          {
+            "call": 2,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          {
+            "call": 3,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          },
+          {
+            "call": 4,
+            "input_equal": true,
+            "weights_equal": true,
+            "output_equal": true,
+            "max_abs": 0.0,
+            "relative_l2": 0.0
+          }
+        ],
+        "rows_per_rank": {
+          "0": 87,
+          "1": 87
+        }
+      }
+    }
+  }
+}

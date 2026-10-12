@@ -14,7 +14,10 @@
 
 历史验收：真实 SP1/SP2 的完整 latent 与媒体对照通过。**只有 SP1 window3/sink1 那轮没有端到端净收益；SP2 在线有正收益**，旧确定性配置全程 -5.79%，新 performance 配置 -6.10%（有数值限制）。
 真实 SP2 流式五档、逐层 KV/step0 与媒体对照通过；独立双 rank profiler 归因已完成。
-默认策略已按用户要求调整；历史 GPU 结果未覆盖新的自动等待策略，不能当作新默认的 GPU 验收。SP4 和音视频仍不声明联合支持。
+默认策略已按用户要求调整；下文历史 GPU 结果不作为新自动等待策略的验收。
+2026-10-09 的 [#269 诊断与修复](issue269/README.md) 已单独验证新默认等待与
+attention auto：deterministic 三档完整 latent/RGB 一致，performance 输入跨
+rank 同步通过，但不声明其跨进程无损。SP4 和音视频仍不声明联合支持。
 下方失败记录保留当时的源码和结果，不能覆盖后续通过结果，也不能从离线通过推断流式通过。
 
 - `source_first` 将同块 source 和 target step0 的 QKV、output projection、

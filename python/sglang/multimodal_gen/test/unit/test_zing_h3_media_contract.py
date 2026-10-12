@@ -919,3 +919,72 @@ def test_visual_policy_contexts_are_serialized_across_encoder_threads(monkeypatc
     assert not a.is_alive() and not b.is_alive() and not failures
     assert observed == [10]
     assert backend.benchmark_limit == 10
+
+
+@pytest.mark.parametrize("mode", ["deterministic", "performance"])
+def test_replicated_visual_latent_preserves_non_distributed_result(monkeypatch, mode):
+    latent = torch.randn(1, 24, 1, 2, 2)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    assert codecs_module._replicated_visual_latent(latent, mode) is latent
+
+
+@pytest.mark.parametrize("entrypoint", ["reference", "streaming_source"])
+def test_performance_encoding_uses_sp_leader_latent(codecs, monkeypatch, entrypoint):
+    """Different encoder results must not become different replicated SP inputs."""
+    from sglang.multimodal_gen.runtime import distributed
+
+    leader, calls = None, []
+
+    def broadcast(value, src):
+        nonlocal leader
+        assert src == 0
+        calls.append(value.clone())
+        if leader is None:
+            leader = value.clone()
+        return leader.clone()
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        distributed, "get_sp_group", lambda: SimpleNamespace(broadcast=broadcast)
+    )
+    codecs.runtime = {
+        "vae_config": {
+            "encode_mode": "performance",
+            "encode_dtype": "float32",
+            "encode_tile_batch_size": 1,
+            "posterior_seed": 42,
+        }
+    }
+    codecs.va = SimpleNamespace(latents_mean=[0.0] * 24, latents_std=[1.0] * 24)
+    anchor = torch.nn.Parameter(torch.zeros(()))
+    codecs.modules = {
+        "video_vae": SimpleNamespace(
+            encoder=torch.nn.Identity(),
+            quant_conv=torch.nn.Identity(),
+            parameters=lambda: iter([anchor]),
+        )
+    }
+    offset = 0
+
+    def moments(*args):
+        nonlocal offset
+        offset += 1
+        value = torch.zeros(1, 48, 1, 2, 2)
+        value[:, :24] = offset
+        return [value]
+
+    monkeypatch.setattr(codecs_module, "encode_clips", moments)
+    if entrypoint == "reference":
+        pixels = torch.zeros(3, 1, 32, 32, dtype=torch.uint8)
+        first = codecs.encode_visual(pixels)
+        second = codecs.encode_visual(pixels)
+    else:
+
+        def sample():
+            return codecs.sample_streaming_visual_moments(
+                moments()[0], latent_start=0, noise_version="indexed-cpu-v1"
+            )
+
+        first, second = sample(), sample()
+    assert len(calls) == 2 and not torch.equal(calls[0], calls[1])
+    assert torch.equal(first, second)

@@ -344,13 +344,16 @@ def test_long_decoder_releases_storage_and_autograd_history(temporal_codecs):
     assert previous() is None
 
 
-def test_streaming_posterior_sampling_preserves_partition_and_normalization(codecs):
+@pytest.mark.parametrize("encode_mode", ["deterministic", "performance"])
+def test_streaming_posterior_sampling_preserves_partition_and_normalization(
+    codecs, encode_mode
+):
     from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.streaming_noise import (
         indexed_video_noise,
     )
 
-    codecs.runtime = {"vae_config": {"posterior_seed": 23}}
+    codecs.runtime = {"vae_config": {"posterior_seed": 23, "encode_mode": encode_mode}}
     codecs.va = SimpleNamespace(latents_mean=[0.2, -0.3], latents_std=[0.5, 2.0])
     moments = torch.linspace(-2, 2, 4 * 13).reshape(1, 4, 13, 1, 1)
     kwargs = dict(noise_version="indexed-cpu-v1")

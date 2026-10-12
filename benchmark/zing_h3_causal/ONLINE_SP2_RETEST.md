@@ -1,5 +1,11 @@
 # SP2 在线 source 编码与联合 DiT 补测
 
+2026-10-09 的 #269 后续隔离与修复见 [诊断报告](issue269/README.md)：
+冻结编码输入后 joint 完整输出一致；performance 的 VAE 卷积与复制输入存在
+跨进程/跨 rank 差异。修复后最新 auto wait / attention auto 的 deterministic
+三档完整 latent/RGB 一致，performance 仍不声明跨进程无损。下文保留历史配置
+和原始数值，不能直接推广为最新默认配置的验收。
+
 ## 为什么要补测
 
 2026-10-08 用户再次明确：后续业务性能与验收默认走在线模式。此前 VAE encoder

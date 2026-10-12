@@ -81,6 +81,21 @@ def _visual_encode_policy(mode, cudnn_benchmark_limit=None):
             torch.use_deterministic_algorithms(saved[2], warn_only=saved[3])
 
 
+def _replicated_visual_latent(latent, encode_mode):
+    """Keep replicated SP inputs identical when encoder algorithms can differ.
+
+    Benchmark-selected convolutions need not agree between rank processes.
+    Broadcasting the sampled, normalized latent preserves the posterior RNG
+    mapping. This does not make performance encoding reproducible across runs;
+    use deterministic encoding for that requirement.
+    """
+    if encode_mode != "performance" or not torch.distributed.is_initialized():
+        return latent
+    from sglang.multimodal_gen.runtime.distributed import get_sp_group
+
+    return get_sp_group().broadcast(latent, src=0)
+
+
 class ZingH3Codecs(ZingH3MediaInput):
     def __init__(self, modules, pipeline_config, runtime):
         self.modules, self.pipeline_config, self.runtime = (
@@ -186,7 +201,10 @@ class ZingH3Codecs(ZingH3MediaInput):
             )
             latent = posterior.sample(generator=generator).half().float()
         mean, std = self._stats(self.va, latent)
-        return ((latent - mean) / std).half()
+        normalized = ((latent - mean) / std).half()
+        return _replicated_visual_latent(
+            normalized, self.runtime["vae_config"]["encode_mode"]
+        )
 
     def encode_visual_moments(self, frames):
         """Encode one complete native clip (or an EOS single image), without RNG.
@@ -228,7 +246,10 @@ class ZingH3Codecs(ZingH3MediaInput):
         )
         latent = (posterior.mean + posterior.std * noise).half().float()
         mean, std = self._stats(self.va, latent)
-        return ((latent - mean) / std).half()
+        normalized = ((latent - mean) / std).half()
+        return _replicated_visual_latent(
+            normalized, self.runtime["vae_config"]["encode_mode"]
+        )
 
     def encode_audio(self, waveform):
         model = self.modules["audio_vae"]
