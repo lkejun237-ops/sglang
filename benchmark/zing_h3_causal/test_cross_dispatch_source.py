@@ -218,11 +218,36 @@ def test_state_usage_includes_input_prefetched_ahead_of_dispatch():
     ns["EncoderStateUsage"] = lambda retained, positions: (retained, positions)
     session = ns["RemoteEncoderSession"].__new__(ns["RemoteEncoderSession"])
     session.accepted_frames, session.prefetched_frames, session._consumed = 3, 5, 1
+    session.disposed = False
     session.signature = (2, 2)
     session.results = queue.Queue(2)
     session.results.put((0, torch.zeros(4, dtype=torch.float32)))
     session.remote_usage = {"retained_bytes": 100, "temporal_positions": 2}
     assert session.state_usage() == (164, 2)
+
+
+def test_dispose_clears_retention_when_prefetch_is_ahead_of_dispatch():
+    ns = production_class()
+    ns["EncoderStateUsage"] = lambda retained, positions: (retained, positions)
+    session = ns["RemoteEncoderSession"].__new__(ns["RemoteEncoderSession"])
+    session.accepted_frames, session.prefetched_frames, session._consumed = 3, 5, 1
+    session.disposed = False
+    session.signature = (2, 2)
+    session.results, session.commands = queue.Queue(2), queue.Queue()
+    session.results.put((0, torch.zeros(4, dtype=torch.float32)))
+    session.commands.put(object())
+    session.remote_usage = {"retained_bytes": 100, "temporal_positions": 2}
+    session.stop, session.permits = threading.Event(), threading.Semaphore(0)
+    session.thread = None
+    session.admission_digests = {0: b"pending"}
+    session.failure = None
+    session.dispose()
+    assert session.state_usage() == (0, 0)
+    snapshot = session.queue_snapshot()
+    assert snapshot["prefetched_frames"] == 5
+    assert snapshot["dispatch_accepted_frames"] == 3
+    for key in snapshot.keys() - {"prefetched_frames", "dispatch_accepted_frames"}:
+        assert snapshot[key] == 0, key
 
 
 def test_segmented_staging_preserves_quantization_and_provenance_boundaries():

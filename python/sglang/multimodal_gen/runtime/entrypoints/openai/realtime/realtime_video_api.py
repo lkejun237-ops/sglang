@@ -1903,19 +1903,29 @@ async def _release_scheduler_realtime_session(
     *,
     attempts: int = 3,
     retry_delay_s: float = 0.05,
-    timeout_s: float = 2.0,
+    timeout_s: float = 900.0,
 ) -> bool:
+    # Release drains the remote Encoder producer as well as local state. Its
+    # default RPC budget is 120 s and dispose permits six such operations.
+    # A short socket timeout abandons the ACK while cleanup is still running.
+    deadline = asyncio.get_running_loop().time() + max(0.001, timeout_s)
     for attempt in range(max(1, attempts)):
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return False
         try:
             await asyncio.wait_for(
                 async_scheduler_client.forward(
                     ReleaseRealtimeSessionReq(session_id=session_id)
                 ),
-                timeout=max(0.001, timeout_s),
+                timeout=remaining,
             )
             return True
         except Exception as exc:
-            if attempt + 1 >= max(1, attempts):
+            if (
+                attempt + 1 >= max(1, attempts)
+                or asyncio.get_running_loop().time() >= deadline
+            ):
                 logger.warning(
                     "failed to release realtime session on scheduler after %d "
                     "attempts, session_id=%s, error=%s",
@@ -2028,6 +2038,25 @@ async def _cleanup_realtime_session_then_close(
         if renewal is not None:
             renewal.cancel()
             await _await_realtime_task(renewal)
+
+
+async def _drain_realtime_cleanup(cleanup) -> None:
+    """Keep cleanup and its lease alive through repeated handler cancellation.
+
+    Socket cancellation cannot stop worker kernels or the Encoder producer.
+    The endpoint must not return admission or unlink inputs before cleanup
+    finishes, even if shutdown cancels it a second time.
+    """
+    task = asyncio.create_task(cleanup, name="realtime-session-cleanup")
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    await task
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 async def _wait_for_server_warmup(websocket: WebSocket) -> None:
@@ -2261,31 +2290,35 @@ async def generate(websocket: WebSocket):
         log_realtime_trace(logger, session, "server.client_disconnected")
         logger.info("client disconnected, session_id=%s", session.id)
     finally:
-        try:
-            if watchdog_task is not None:
-                watchdog_task.cancel()
-                await _await_realtime_task(watchdog_task)
-            if initialization_task is not None and not initialization_task.done():
-                initialization_task.cancel()
-                await _await_realtime_task(initialization_task)
-            await _cleanup_realtime_session_then_close(
-                ws,
-                session,
-                generate_task,
-                listen_task,
-                close_after_cleanup,
-                controller=controller,
-                lease=lease,
-                lease_ttl_s=server_args.realtime_session_lease_ttl_s,
-            )
-        finally:
-            if lease is not None and controller is not None:
-                await controller.release(lease)
-            await _release_gateway_reservation(
-                worker_reservations,
-                gateway_config,
-                owner_id=worker_reservation_owner,
-            )
+
+        async def cleanup_session():
+            try:
+                if watchdog_task is not None:
+                    watchdog_task.cancel()
+                    await _await_realtime_task(watchdog_task)
+                if initialization_task is not None and not initialization_task.done():
+                    initialization_task.cancel()
+                    await _await_realtime_task(initialization_task)
+                await _cleanup_realtime_session_then_close(
+                    ws,
+                    session,
+                    generate_task,
+                    listen_task,
+                    close_after_cleanup,
+                    controller=controller,
+                    lease=lease,
+                    lease_ttl_s=server_args.realtime_session_lease_ttl_s,
+                )
+            finally:
+                if lease is not None and controller is not None:
+                    await controller.release(lease)
+                await _release_gateway_reservation(
+                    worker_reservations,
+                    gateway_config,
+                    owner_id=worker_reservation_owner,
+                )
+
+        await _drain_realtime_cleanup(cleanup_session())
 
 
 async def _write_conditioning_notice(websocket: WebSocket, result: OutputBatch):

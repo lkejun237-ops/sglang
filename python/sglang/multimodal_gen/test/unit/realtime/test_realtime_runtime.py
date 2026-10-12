@@ -441,6 +441,61 @@ def test_scheduler_session_release_has_a_short_per_attempt_timeout(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_scheduler_release_waits_for_encoder_cleanup_ack(monkeypatch):
+    async def scenario():
+        calls = []
+
+        async def forward(_request):
+            calls.append(True)
+            # Remote producer disposal can outlive the old two-second wait.
+            await asyncio.sleep(2.1)
+            return OutputBatch(output={"released": True})
+
+        monkeypatch.setattr(
+            realtime_video_api.async_scheduler_client, "forward", forward
+        )
+        assert await realtime_video_api._release_scheduler_realtime_session("slow")
+        assert len(calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_repeated_handler_cancellation_drains_cleanup_before_admission_release():
+    async def scenario():
+        started, finish = asyncio.Event(), asyncio.Event()
+        release_started, release_finished = asyncio.Event(), asyncio.Event()
+        events = []
+
+        async def cleanup():
+            started.set()
+            await finish.wait()
+            events.append("worker_released")
+            release_started.set()
+            await release_finished.wait()
+            events.append("admission_released")
+
+        async def handler():
+            await realtime_video_api._drain_realtime_cleanup(cleanup())
+
+        task = asyncio.create_task(handler())
+        await started.wait()
+        for _ in range(3):
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done() and not events
+        finish.set()
+        await release_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done() and events == ["worker_released"]
+        release_finished.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert events == ["worker_released", "admission_released"]
+
+    asyncio.run(scenario())
+
+
 def test_lingbot_realtime_state_uses_control_script_and_prompt_queues():
     state = lingbot_realtime.LingBotWorldRealtimeState()
 

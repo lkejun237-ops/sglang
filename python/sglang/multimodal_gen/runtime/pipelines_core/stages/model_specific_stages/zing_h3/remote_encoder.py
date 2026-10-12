@@ -398,6 +398,8 @@ class RemoteEncoderSession:
         return CodecSlice(value, reply["start"], reply["end"], reply["dependency"])
 
     def state_usage(self):
+        if self.disposed:
+            return EncoderStateUsage(0, 0)
         retained_frames = max(
             self.buffered_frames, self.prefetched_frames - self._consumed
         )
@@ -412,18 +414,17 @@ class RemoteEncoderSession:
         )
 
     def queue_snapshot(self):
+        prefetched_retained = (
+            0 if self.disposed else max(0, self.prefetched_frames - self._consumed)
+        )
         with self.results.mutex:
             pending = len(self.results.queue)
             result_bytes = sum(
                 v.numel() * v.element_size() for _, v in self.results.queue
             )
         return dict(
-            prefetch_retained_input_frames=max(
-                0, self.prefetched_frames - self._consumed
-            ),
-            prefetch_retained_input_bytes=max(
-                0, self.prefetched_frames - self._consumed
-            )
+            prefetch_retained_input_frames=prefetched_retained,
+            prefetch_retained_input_bytes=prefetched_retained
             * 3
             * math.prod(self.signature or (0, 0)),
             prefetched_frames=self.prefetched_frames,
