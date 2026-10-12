@@ -5,9 +5,9 @@ import math
 import threading
 from contextlib import contextmanager
 
-import numpy as np
 import torch
-
+from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+from sglang.multimodal_gen.runtime.conditioning.encoder import encode_condition
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.presentation import (
     minimax_h3_ref2va_video_presentation,
 )
@@ -126,75 +126,17 @@ class ZingH3Codecs(ZingH3MediaInput):
         return mean, std
 
     def encode_condition(self, prompt, media):
-        tokenizer, processor = self.modules["tokenizer"], self.modules["processor"]
-        features, labels, images, videos, timestamps = {}, [], [], [], []
-        counts = {"image": 0, "video": 0, "audio": 0}
-        for item in media:
-            kind = item["type"]
-            if kind in {"audio", "video_audio"}:
-                counts["audio"] += 1
-                labels.append(("audio", counts["audio"]))
-            if kind == "image":
-                counts["image"] += 1
-                labels.append(("image", counts["image"]))
-                images.append(item["frames"][:, 0].permute(1, 2, 0).numpy())
-            elif kind in {"video", "video_audio"}:
-                counts["video"] += 1
-                labels.append(("video", counts["video"]))
-                fps = self.runtime["condition_encoder_config"]["video_sample_fps"]
-                source_fps = float(item["fps"])
-                cursor, indices = 0.0, []
-                while round(cursor) < item["frames"].shape[1]:
-                    if not indices or round(cursor) > indices[-1]:
-                        indices.append(round(cursor))
-                    cursor += source_fps / fps
-                frames = [
-                    item["frames"][:, i].permute(1, 2, 0).numpy() for i in indices
-                ]
-                # Rounding and deduplication can change the effective sample rate.
-                ts = [i / source_fps for i in indices]
-                temporal_patch = processor.video_processor.temporal_patch_size
-                frames += [frames[-1]] * (-len(frames) % temporal_patch)
-                ts += [ts[-1]] * (-len(ts) % temporal_patch)
-                videos.append(np.stack(frames))
-                timestamps.append(
-                    [
-                        (ts[i] + ts[i + temporal_patch - 1]) / 2
-                        for i in range(0, len(ts), temporal_patch)
-                    ]
-                )
-        image_counts, video_counts = [], []
-        merge = processor.image_processor.merge_size**2
-        if images:
-            f = processor.image_processor(images=images, return_tensors="pt")
-            features.update(
-                pixel_values=f["pixel_values"], image_grid_thw=f["image_grid_thw"]
+        if getattr(self, "conditioning_mode", "local") != "local":
+            raise ConditionError(
+                "CONDITION_INVALID", "External conditioning cannot use a local encoder"
             )
-            image_counts = [int(g.prod()) // merge for g in f["image_grid_thw"]]
-        if videos:
-            f = processor.video_processor(
-                videos=videos, do_sample_frames=False, return_tensors="pt"
-            )
-            features.update(
-                pixel_values_videos=f["pixel_values_videos"],
-                video_grid_thw=f["video_grid_thw"],
-            )
-            for grid, ts in zip(f["video_grid_thw"], timestamps):
-                if int(grid[0]) != len(ts):
-                    raise ValueError(
-                        "Zing Qwen video timestamps do not match processor tokens"
-                    )
-                video_counts.append([int(grid[1] * grid[2]) // merge] * len(ts))
-        ids, tags = minimax_h3_ref2va_video_presentation(
-            tokenizer,
-            prompt=prompt,
-            condition_labels=labels,
-            image_token_count=image_counts,
-            video_block_token_counts=video_counts,
-            video_block_timestamps=timestamps,
+        return encode_condition(
+            self.modules,
+            self.runtime,
+            prompt,
+            media,
+            presentation_fn=minimax_h3_ref2va_video_presentation,
         )
-        context = self.modules["text_encoder"].encode_ids(ids, **features)
-        return {"context": context, "row_role": (tags == 0).long().to(context.device)}
 
     def encode_visual(self, frames):
         from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
@@ -307,6 +249,7 @@ class ZingH3Codecs(ZingH3MediaInput):
         *,
         retain_condition_media=False,
         source_preview=None,
+        conditioning=None,
         stage_trace=None,
     ):
         # Reuse decoded references for prompt refreshes; offline calls release them.
@@ -337,22 +280,43 @@ class ZingH3Codecs(ZingH3MediaInput):
         source = (
             None if source is None else self._decode_media(source, need_audio=False)
         )
+        if conditioning is not None:
+            if not callable(conditioning):
+                raise ConditionError(
+                    "CONDITION_INVALID",
+                    "External conditioning requires a trusted worker consumer",
+                )
+            # The consumer validates original presentation RGB and completes the
+            # SP CPU consensus before any VAE or DiT collective can be entered.
+            positive = conditioning(prompt, media)
+            if positive is None:
+                raise ConditionError(
+                    "CONDITION_INVALID",
+                    "The external conditioning provider returned no condition",
+                )
+        elif getattr(self, "conditioning_mode", "local") != "local":
+            raise ConditionError(
+                "CONDITION_INVALID", "External conditioning descriptor is missing"
+            )
+        else:
+            positive = None
         refs, source, h, w, t, frames = self._normalize_inference_media(
             media, source, conditions, target, max_area_config=max_area_config
         )
         request_id = stage_trace.identity["request_id"] if stage_trace else None
         measure_cuda = stage_trace is not None and stage_trace.measure_cuda
-        with stage_span(
-            stage_trace,
-            "Encoder",
-            component="qwen",
-            cuda=measure_cuda,
-            input_ids=[f"{request_id}:payload"],
-            output_ids=[f"{request_id}:positive"],
-        ) as span:
-            with use_component("text_encoder"):
-                positive = self.encode_condition(prompt, media)
-        handoff(span)
+        if positive is None:
+            with stage_span(
+                stage_trace,
+                "Encoder",
+                component="qwen",
+                cuda=measure_cuda,
+                input_ids=[f"{request_id}:payload"],
+                output_ids=[f"{request_id}:positive"],
+            ) as span:
+                with use_component("text_encoder"):
+                    positive = self.encode_condition(prompt, media)
+            handoff(span)
         visual, audio = {}, {}
         modes = {c["content_id"]: c["latent_modalities"] for c in conditions}
         visual_refs = [item for item in refs if "visual" in modes.get(item["id"], [])]

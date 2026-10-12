@@ -379,6 +379,7 @@ def test_source_s0_uses_memory_unless_video_is_explicit(explicit_video):
             rope_max_frame_gap=12,
         ),
         _build_request=lambda batch: request,
+        _conditioning_consumer=lambda batch: None,
         _use=lambda *args: nullcontext(),
         codecs=NS(video_decoder_name="taeh3_decoder", prepare=prepare),
     )

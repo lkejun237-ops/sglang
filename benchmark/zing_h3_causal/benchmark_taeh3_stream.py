@@ -29,7 +29,21 @@ def main():
         "--transport", choices=("scheduler", "websocket"), default="scheduler"
     )
     parser.add_argument("--dtype", choices=("fp32", "fp16", "bf16"), default="fp32")
+    parser.add_argument(
+        "--conditioning-mode", choices=("local", "remote"), default="local"
+    )
+    parser.add_argument("--conditioning-service-url")
+    parser.add_argument("--conditioning-profile")
+    parser.add_argument("--conditioning-config")
     args = parser.parse_args()
+    conditioning = {}
+    if args.conditioning_mode != "local":
+        conditioning = dict(
+            zing_conditioning_mode=args.conditioning_mode,
+            conditioning_service_url=args.conditioning_service_url,
+            conditioning_expected_profile=args.conditioning_profile,
+            conditioning_config=args.conditioning_config,
+        )
     os.environ.setdefault("SGLANG_ZING_EXPERIMENTAL_ATTENTION", "fa4")
     os.environ.setdefault("SGLANG_ZING_EXPERIMENTAL_STABLE_SHAPES", "1")
     os.environ.setdefault("SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN", "1")
@@ -79,6 +93,7 @@ def main():
             "taeh3_checkpoint_path": args.weights,
             "taeh3_decode_precision": args.dtype,
         },
+        **conditioning,
     )
     report = {
         "load_seconds": time.perf_counter() - started,
@@ -86,6 +101,7 @@ def main():
         "fps": 24,
         "frames": args.frames,
         "dtype": args.dtype,
+        "conditioning_mode": args.conditioning_mode,
         "scope": __doc__,
         "runs": [],
     }

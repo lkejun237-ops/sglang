@@ -3,7 +3,6 @@
 
 import asyncio
 import hashlib
-import io
 import json
 import math
 import tempfile
@@ -14,8 +13,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import msgspec.msgpack
-from PIL import Image
-
+from PIL import Image  # noqa: F401 - preserve the existing CPU validation seam
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter import (
     BaseRealtimeModelAdapter,
     RealtimeChunkInputs,
@@ -44,7 +42,13 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
 
     async def on_init(self, session, request):
         self.init_started_ns = time.time_ns()
+        self._source_reservations, self._inflight_reservations = {}, []
+        self._s0_reservation = None
         args = get_global_server_args()
+        from ..conditioning import get_api_resources, validate_remote_request
+
+        validate_remote_request(request, args)
+        get_api_resources(session, args)
         require(
             getattr(args, "realtime_vae_backend", "local") == "local"
             and not session.vae_worker_url,
@@ -234,15 +238,20 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             require(
                 not video
                 or (
-                    item.get("clip") == dict(start=0, end=0)
+                    isinstance(item.get("clip"), dict)
+                    and set(item["clip"]) == {"start", "end"}
+                    and item["clip"]["start"] == item["clip"]["end"]
                     and all(
-                        type(value) in (int, float) for value in item["clip"].values()
+                        type(value) in (int, float)
+                        and math.isfinite(value)
+                        and value >= 0
+                        for value in item["clip"].values()
                     )
                     and type(item.get("fps")) in (int, float)
                     and 0 < item["fps"] <= 240
                     and not item.get("reference", False)
                 ),
-                "Please provide a single-frame video with its frame rate and zero-time clip.",
+                "Please provide a single-frame video with its frame rate and matching clip times.",
             )
             require(
                 video or not ({"clip", "fps"} & set(item)),
@@ -257,22 +266,17 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             require(
                 media_bytes <= REFERENCE_BYTES, "The reference images are too large."
             )
-            with Image.open(io.BytesIO(item["payload"])) as image:
-                require(
-                    image.format.lower() == item["format"]
-                    and image.width * image.height <= 16_777_216,
-                    "The reference image format or dimensions are not supported.",
-                )
-                image.verify()
+            from ..conditioning import reserve_media_storage, verify_presentation_upload
+
+            await verify_presentation_upload(session, item["payload"], item["format"])
+            reserve_media_storage(session, len(item["payload"]))
             if session.input_temp_dir is None:
                 session.input_temp_dir = tempfile.mkdtemp(prefix="sglang_zing_source_")
             path = Path(session.input_temp_dir) / f"media-{i}.{item['format']}"
             path.write_bytes(item["payload"])
             descriptor = dict(type=item["type"], id=item["id"], uri=str(path))
             if video:
-                descriptor.update(
-                    clip=dict(start=0, end=0), presentation_fps=item["fps"]
-                )
+                descriptor.update(clip=dict(item["clip"]), presentation_fps=item["fps"])
             self.user_media.append(descriptor)
             if item.get("reference", False):
                 self.reference_items.append(descriptor)
@@ -282,6 +286,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             "Please provide at most nine reference images.",
         )
         self.source_preview_sha256 = None
+        self.source_preview_bytes = None
         self.config = dict(
             width=width,
             height=height,
@@ -291,6 +296,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         )
         self.ledger = SourceLedger(**{**self.config, "limits": limits})
         self.pending, self.available = deque(), asyncio.Event()
+        self._source_reservations, self._inflight_reservations = {}, []
+        self._s0_reservation = None
         self.pending_frames, self.end, self.end_dispatched = 0, None, False
         self.clip, self.reference_paths, self.profile = clip, reference_paths, profile
         self.reference_ids = [ref["id"] for ref in self.reference_items]
@@ -344,11 +351,27 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                     # Observe S0 without encoding it or creating a second transport.
                     # The worker reads it from the original accepted append bytes.
                     frame_bytes = self.config["width"] * self.config["height"] * 3
+                    from ..conditioning import get_api_resources
+
+                    resources = get_api_resources(session)
+                    self._s0_reservation = resources.ledger.reserve(
+                        resources.tenant, ram=frame_bytes, inflight=frame_bytes
+                    )
+                    self.source_preview_bytes = payload["data"][:frame_bytes]
                     self.source_preview_sha256 = hashlib.sha256(
                         payload["data"][:frame_bytes]
                     ).hexdigest()
             # Only expose work after accepted is on the same serialized writer.
             await ws.send_bytes(msgspec.msgpack.encode(record.message()))
+            from ..conditioning import take_message_reservation
+
+            reservation = take_message_reservation(session)
+            if reservation is not None:
+                charges = dict(reservation.charges)
+                reduced = {key: 0 for key in charges}
+                reduced.update(ram=2 * message_bytes, inflight=2 * message_bytes)
+                reservation.reduce(**reduced)
+                self._source_reservations[payload["client_seq"]] = reservation
             self.pending.append(
                 dict(payload=payload, event_id=event_id, message_bytes=message_bytes)
             )
@@ -362,6 +385,9 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             self.end = dict(frame_end=self.ledger.accepted_frames, event_id=event_id)
             self.available.set()
         elif kind == "prompt":
+            from ..conditioning import validate_remote_request
+
+            validate_remote_request(session.request, get_global_server_args())
             self.ledger.validate_event_id(event_id)
             require(
                 isinstance(payload, str) and payload.strip(),
@@ -477,6 +503,18 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         missing = max(0, target - self.pending_frames)
         return target, min(1000.0, missing * 1000.0 / self.config["fps"])
 
+    async def close_conditioning(self, session):
+        for reservation in (
+            *self._source_reservations.values(),
+            *self._inflight_reservations,
+        ):
+            reservation.release()
+        self._source_reservations.clear()
+        self._inflight_reservations.clear()
+        if self._s0_reservation is not None:
+            self._s0_reservation.release()
+            self._s0_reservation = None
+
     def get_chunk_size(self, session, server_args, chunk):
         return self.clip
 
@@ -547,6 +585,11 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         appends, count = [], 0
         while self.pending and count < self.clip:
             item = self.pending.popleft()
+            reservation = self._source_reservations.pop(
+                item["payload"]["client_seq"], None
+            )
+            if reservation is not None:
+                self._inflight_reservations.append(reservation)
             count += item["payload"]["num_frames"]
             appends.append(item)
         self.pending_frames -= count
@@ -577,6 +620,9 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
 
     def on_chunk_complete(self, session, result):
         super().on_chunk_complete(session, result)
+        for reservation in self._inflight_reservations:
+            reservation.release()
+        self._inflight_reservations.clear()
         if (result.usage or {}).get("zing_source_complete"):
             session.request.max_chunks = session.generate_chunk_cnt
 
@@ -620,4 +666,5 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             self.reference_items.clear()
             self.reference_ids.clear()
             self.source_preview_sha256 = None
+            self.source_preview_bytes = None
             self.user_media.clear()

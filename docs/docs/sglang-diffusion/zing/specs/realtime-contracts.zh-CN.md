@@ -39,3 +39,30 @@
 共享 fixture：`test/registered/unit/realtime/fixtures/zing_source_provenance.json`，输出 `[15,19)` 跨两个 source_id，实际依赖上界 34；切片保留依赖。测试通过文件路径加载实际模块，绕过 GPU package 初始化。
 
 旧版本的 103 项协议原型测试及其 GPU 联合 harness 不再作为当前精简版本的验收数量或生产证据。真实服务协议与网络/codec/GPU 联调由 #114 连同调用方交付；本 PR 仅验收共享数据契约。
+
+## #256 conditioning RPC 的实时错误与版本字段
+
+本节描述 #256 RPC v6 本地实现增加的字段，前文 #111/#118 的范围说明是历史共享数据类型交接。CPU 契约验证不能证明在线 GPU 服务或前端已经完成部署验收；本轮不修改前端代码。
+
+`remote` 的条件媒体只允许图片、自动 source S0 和合法单帧 video presentation（`clip.start == clip.end`，可以是非零时间）。多帧 video、audio、video_audio 在初始化或 prompt 更新的元数据预检中拒绝。`session.ready` 原有 `{start:0,end:0}` 是默认单帧位置提示，不能解释为只支持零时间。local 保留原生输入域。
+
+实时错误通过既有 MessagePack 消息发送，`type:"error"`、`content` 保留，追加 `code` 和 `fatal`：
+
+| code | content（公开英文信息） |
+| --- | --- |
+| `CONDITION_INVALID` | `We could not prepare this request. Please try again.` |
+| `CONDITION_UNAUTHORIZED` | `We could not prepare this request. Please try again.` |
+| `CONDITION_PROFILE_MISMATCH` | `We could not prepare this request. Please try again.` |
+| `CONDITION_BUSY` | `The service is busy. Please try again shortly.` |
+| `CONDITION_TIMEOUT` | `Preparing your request took too long. Please try again.` |
+| `CONDITION_UNAVAILABLE` | `The service is unavailable. Please try again shortly.` |
+
+首次 conditioning 失败时发送 `fatal:true` 并结束会话。中途 prompt 更新失败时发送 `fatal:false` 和该失败更新的 `event_id`，继续使用旧 conditioning 出帧；同一 `(prompt,event_id)` 只通知一次，新事件可再次尝试。内部异常文本只写服务日志，不放入公开 content。
+
+```json
+{"type":"error","code":"CONDITION_BUSY","content":"The service is busy. Please try again shortly.","fatal":false,"event_id":11}
+```
+
+帧 header 的 `event_id`、`prompt_version` 表示该 block 实际使用的 prompt。失败更新不会推进它们；延迟输出的旧 block 也保留其旧版本。有限/block 输出逐项使用 `usage.zing_realtime_blocks` 的快照；source 输出优先使用原 `source_blocks` 的事件与 provenance，并追加实际 prompt_version。source_alignment、source_dependency_end 与 accepted/consumed 水位的原含义不变。
+
+worker IPC 的 `OutputBatch.error_code` 传递稳定错误码，`conditioning_notice` 传递非致命通知，`realtime_effective_prompt` 传递 block 的生效版本；这些字段不是供浏览器提交的输入。有限 HTTP 请求的失败按公开码映射为 400/503，消息仍使用上述公共英文文案。完整 frontend AsyncAPI 不在本仓库，未同步或发布。

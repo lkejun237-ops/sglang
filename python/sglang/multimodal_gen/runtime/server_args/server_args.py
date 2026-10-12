@@ -433,6 +433,11 @@ class ServerArgs(DisaggServerArgsMixin):
     # Compilation
     enable_torch_compile: bool = False
     enable_cuda_graph: bool = False
+    zing_conditioning_mode: str = "local"
+    conditioning_expected_profile: str | None = None
+    zing_conditioning_local_cache_bytes: int = 256 << 20
+    conditioning_service_url: str | None = None
+    conditioning_config: str | None = field(default=None, repr=False)
     realtime_max_message_bytes: int = DEFAULT_MESSAGE_BYTES
     realtime_transport_host_bytes: int = DEFAULT_HOST_BYTES
     realtime_max_sessions: int = 8
@@ -646,6 +651,36 @@ class ServerArgs(DisaggServerArgsMixin):
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
         self._validate_scheduler_rpc_timeout()
+        if self.zing_conditioning_mode not in {"local", "remote"}:
+            raise ValueError("Unsupported Zing conditioning mode")
+        if self.zing_conditioning_mode != "local" and any(
+            not value
+            for value in (
+                self.conditioning_expected_profile,
+                self.conditioning_config,
+            )
+        ):
+            raise ValueError(
+                "External Zing conditioning requires an expected profile and client configuration"
+            )
+        if (
+            self.zing_conditioning_mode == "remote"
+            and not self.conditioning_service_url
+        ):
+            raise ValueError("Remote Zing conditioning requires a service URL")
+        if self.zing_conditioning_mode == "remote":
+            from sglang.multimodal_gen.runtime.conditioning.client import (
+                validate_service_url,
+            )
+
+            validate_service_url(self.conditioning_service_url)
+        if (
+            type(self.zing_conditioning_local_cache_bytes) is not int
+            or self.zing_conditioning_local_cache_bytes < 0
+        ):
+            raise ValueError(
+                "Local Zing conditioning cache bytes must be a nonnegative integer"
+            )
         self._validate_pipeline()
         self._validate_offload()
         self._validate_direct_gpu_weight_loading()
@@ -1963,6 +1998,36 @@ class ServerArgs(DisaggServerArgsMixin):
 
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
+        parser.add_argument(
+            "--zing-conditioning-mode",
+            choices=("local", "remote"),
+            default=ServerArgs.zing_conditioning_mode,
+            help="Select local encoding or trusted external conditioning for Zing.",
+        )
+        parser.add_argument(
+            "--conditioning-expected-profile",
+            type=str,
+            default=None,
+            help="Administrator deployment profile JSON for external conditioning.",
+        )
+        parser.add_argument(
+            "--zing-conditioning-local-cache-bytes",
+            type=int,
+            default=ServerArgs.zing_conditioning_local_cache_bytes,
+            help="CPU byte capacity for local Zing conditioning cache; 0 disables it.",
+        )
+        parser.add_argument(
+            "--conditioning-service-url",
+            type=str,
+            default=None,
+            help="Administrator HTTPS conditioning service endpoint.",
+        )
+        parser.add_argument(
+            "--conditioning-config",
+            type=str,
+            default=None,
+            help="Administrator conditioning authentication and limits JSON.",
+        )
         # Model and path configuration
         parser.add_argument(
             "--model-path",

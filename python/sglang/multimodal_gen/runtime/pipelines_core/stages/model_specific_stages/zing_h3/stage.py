@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
+import hashlib
 import json
 import time
 from contextlib import contextmanager, nullcontext
 from copy import copy
 
 import torch
-
+from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+from sglang.multimodal_gen.runtime.conditioning.worker import (
+    LocalConditioner,
+    WorkerConditioningState,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -44,10 +49,30 @@ class ZingH3GenerationStage(PipelineStage):
     # Set by initialize_realtime_kv_cache_pool; None keeps per-session caches.
     kv_pool = None
 
-    def __init__(self, modules, config, runtime):
+    def __init__(
+        self,
+        modules,
+        config,
+        runtime,
+        *,
+        conditioning_mode="local",
+        conditioning_provider=None,
+        local_cache_bytes=256 << 20,
+    ):
         super().__init__()
         self.modules, self.config, self.runtime = modules, config, runtime
+        self.conditioning_mode, self.conditioning_provider = (
+            conditioning_mode,
+            conditioning_provider,
+        )
         self.codecs = ZingH3Codecs(modules, config, runtime)
+        self.codecs.conditioning_mode = conditioning_mode
+        if conditioning_mode == "local":
+            self.local_conditioner = LocalConditioner(
+                self._encode_local_condition,
+                hashlib.sha256(str(id(self.codecs)).encode()).hexdigest(),
+                cache_bytes=local_cache_bytes,
+            )
         # Prepare shared encoder weights before any session owns causal caches.
         # A source-only request may never call encode_visual for a reference.
         self.codecs.prepare_visual_encoder_weights()
@@ -60,6 +85,43 @@ class ZingH3GenerationStage(PipelineStage):
             frame_scale=rope["frame_scale"],
             visual_token_frame_spans=rope["visual_token_frame_spans"],
         )
+
+    def _encode_local_condition(self, prompt, media):
+        with self._use("text_encoder"):
+            return self.codecs.encode_condition(prompt, media)
+
+    def conditioner(self, batch, prompt, media):
+        session = getattr(batch, "session", None)
+        state = (
+            session.get_or_create_state(WorkerConditioningState)
+            if session is not None
+            else WorkerConditioningState()
+        )
+        if self.conditioning_mode == "local":
+            return self.local_conditioner(prompt, media, state=state)
+        if self.conditioning_provider is None:
+            raise ConditionError(
+                "CONDITION_UNAVAILABLE", "The remote conditioner is unavailable"
+            )
+        device = next(self.modules["transformer"].parameters()).device
+        return self.conditioning_provider(prompt, media, device=device, state=state)
+
+    def _conditioning_consumer(self, batch):
+        return lambda prompt, media: self.conditioner(batch, prompt, media)
+
+    def encode_condition_for_batch(self, batch, prompt, media):
+        return self.conditioner(batch, prompt, media)
+
+    def conditioning_memory_receipt(self, phase, *, rank=0, categories=None):
+        from sglang.multimodal_gen.runtime.conditioning.memory import memory_receipt
+
+        owners = dict(self.modules)
+        owners.update(categories or {})
+        if self.kv_pool is not None:
+            owners["kv_pool"] = self.kv_pool
+        record = memory_receipt(owners, phase=phase, rank=rank)
+        record["loader"] = getattr(self, "conditioning_loader_receipt", {})
+        return record
 
     @property
     def realtime_kv_cache_pool_enabled(self):
@@ -185,6 +247,15 @@ class ZingH3GenerationStage(PipelineStage):
             (self.codecs.video_decoder_name, "decode"),
             ("audio_vae", "decode"),
         ]
+        if (
+            getattr(
+                self,
+                "conditioning_mode",
+                getattr(server_args, "zing_conditioning_mode", "local"),
+            )
+            != "local"
+        ):
+            uses = [(name, phase) for name, phase in uses if name != "text_encoder"]
         return [
             ComponentUse(
                 stage_name or self.__class__.__name__,
@@ -351,7 +422,9 @@ class ZingH3GenerationStage(PipelineStage):
             synchronize()
             started = time.perf_counter()
             with maybe_record_function("Zing.conditioning"):
-                inputs = self.codecs.prepare(request, self._use)
+                inputs = self.codecs.prepare(
+                    request, self._use, conditioning=self._conditioning_consumer(batch)
+                )
             if diagnostic:
                 diagnostic.record(
                     "conditioning",
@@ -485,7 +558,11 @@ class ZingH3GenerationStage(PipelineStage):
                 output_ids=[f"{batch.realtime_session_id}:conditioning"],
             ) as span:
                 state.inputs = self.codecs.prepare(
-                    request, self._use, retain_condition_media=True, stage_trace=trace
+                    request,
+                    self._use,
+                    retain_condition_media=True,
+                    conditioning=self._conditioning_consumer(batch),
+                    stage_trace=trace,
                 )
             handoff(
                 span,
@@ -503,6 +580,10 @@ class ZingH3GenerationStage(PipelineStage):
             if state.inputs.audio_shape is not None:
                 raise ValueError("Audio streaming is not supported yet.")
             state.prompt = self.codecs._parse_inference_request(request)[0]
+            state.prompt_event = batch.realtime_event_id
+            state.effective_prompt_version = getattr(
+                batch, "realtime_prompt_version", None
+            )
         elif batch.block_idx != state.sampling.index:
             raise ValueError("Zing realtime blocks must be requested in order")
         mode = getattr(params, "zing_realtime_decode_mode", "immediate")
@@ -515,13 +596,27 @@ class ZingH3GenerationStage(PipelineStage):
     def _sample_realtime_block(self, batch, state):
         params = batch.sampling_params
         inputs, sampler = state.inputs, state.sampler
-        prompt_changed = params.prompt != state.prompt
+        update = (params.prompt, batch.realtime_event_id)
+        blocked_update = update == getattr(state, "failed_update", None)
+        prompt_changed = params.prompt != state.prompt and not blocked_update
+        state.conditioning_notice = None
         if prompt_changed:
-            inputs = copy(inputs)
-            with self._use("text_encoder"):
-                inputs.positive = self.codecs.encode_condition(
-                    params.prompt, inputs.condition_media
+            candidate = copy(inputs)
+            try:
+                candidate.positive = self.encode_condition_for_batch(
+                    batch, params.prompt, inputs.condition_media
                 )
+            except ConditionError as exc:
+                state.failed_update = update
+                state.conditioning_notice = {
+                    "code": exc.code,
+                    "event_id": batch.realtime_event_id,
+                }
+                prompt_changed = False
+                blocked_update = True
+            else:
+                inputs = candidate
+                state.failed_update = None
         with self._use("transformer", "denoise") as transformer:
             sampler.generator = transformer
             device = next(transformer.parameters()).device
@@ -541,7 +636,12 @@ class ZingH3GenerationStage(PipelineStage):
                     state.sampling, inputs=inputs if prompt_changed else None
                 )
             state.inputs = inputs
-            state.prompt = params.prompt
+            if not blocked_update:
+                state.prompt = params.prompt
+                state.prompt_event = batch.realtime_event_id
+                state.effective_prompt_version = getattr(
+                    batch, "realtime_prompt_version", None
+                )
         return end
 
     def _realtime_storage(self, batch, state, inputs):
@@ -579,7 +679,8 @@ class ZingH3GenerationStage(PipelineStage):
             {
                 "block_idx": batch.block_idx,
                 "request_id": getattr(batch, "request_id", None),
-                "event_id": getattr(batch, "realtime_event_id", None),
+                "event_id": state.prompt_event,
+                "prompt_version": state.effective_prompt_version,
                 "frame_end": frame_end,
             }
         )
@@ -684,6 +785,11 @@ class ZingH3GenerationStage(PipelineStage):
                 raw_frame_batches=[],
                 metrics=batch.metrics,
                 trajectory_latents=trajectory,
+                conditioning_notice=state.conditioning_notice,
+                realtime_effective_prompt={
+                    "event_id": state.prompt_event,
+                    "prompt_version": state.effective_prompt_version,
+                },
             )
         first_frame = state.emitted_frames
         with stage_span(
@@ -720,6 +826,11 @@ class ZingH3GenerationStage(PipelineStage):
             metrics=batch.metrics,
             trajectory_latents=trajectory,
             usage={"zing_realtime_blocks": ready} if mode == "stable" else None,
+            conditioning_notice=state.conditioning_notice,
+            realtime_effective_prompt={
+                "event_id": ready[0]["event_id"],
+                "prompt_version": ready[0]["prompt_version"],
+            },
         )
         if final:
             state.dispose()

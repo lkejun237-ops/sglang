@@ -11,7 +11,9 @@ from sglang.multimodal_gen.runtime.realtime.session import BaseRealtimeState
 class ZingH3RealtimeState(BaseRealtimeState):
     def __init__(self):
         self.sampler = self.sampling = self.inputs = None
-        self.prompt = None
+        self.prompt = self.prompt_event = None
+        self.failed_update = self.conditioning_notice = None
+        self.effective_prompt_version = None
         self.cpu_rng = self.cuda_rng = None
         self.emitted_frames = 0
         self.pending_blocks = []
@@ -53,7 +55,9 @@ class ZingH3RealtimeState(BaseRealtimeState):
                     self.kv_lease = None
         self.sampler = self.sampling = self.inputs = None
         self.cpu_rng = self.cuda_rng = None
-        self.prompt = None
+        self.prompt = self.prompt_event = None
+        self.failed_update = self.conditioning_notice = None
+        self.effective_prompt_version = None
         self.emitted_frames = 0
         self.pending_blocks = []
         self.video_decoder = self.decoder_frames = None

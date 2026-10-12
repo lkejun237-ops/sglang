@@ -15,6 +15,7 @@ import numpy as np
 import torch
 from setproctitle import setproctitle
 
+from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
 from sglang.multimodal_gen.runtime.warmup_request_builder import lighten_warmup_req
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import (  # isort: skip
@@ -798,6 +799,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing {error_context}: {e}"
+            if isinstance(e, ConditionError):
+                output_batch.error_code = e.code
             self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
             # clean cache if OOM
             if not current_platform.is_cpu():
@@ -1395,6 +1398,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             rollout_trajectory_data=getattr(result, "rollout_trajectory_data", None),
             noise_pred=getattr(result, "noise_pred", None),
             trajectory_decoded=getattr(result, "trajectory_decoded", None),
+            error=getattr(result, "error", None),
+            error_code=getattr(result, "error_code", None),
+            conditioning_notice=getattr(result, "conditioning_notice", None),
+            realtime_effective_prompt=getattr(
+                result, "realtime_effective_prompt", None
+            ),
         )
 
     @staticmethod
@@ -1423,6 +1432,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> None:
         if output_batch.error is not None and merged.error is None:
             merged.error = output_batch.error
+        for name in ("error_code", "conditioning_notice", "realtime_effective_prompt"):
+            if (
+                getattr(merged, name) is None
+                and getattr(output_batch, name) is not None
+            ):
+                setattr(merged, name, getattr(output_batch, name))
         merged.peak_memory_mb = max(merged.peak_memory_mb, output_batch.peak_memory_mb)
         if output_batch.usage is not None:
             if merged.usage is None:

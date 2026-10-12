@@ -17,7 +17,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.media_request import (
     optional_nonnegative_media_time,
     parse_h3_media_descriptor,
@@ -388,6 +387,8 @@ class ZingH3MediaInput:
                 ),
                 *user_content,
             ]
+            if getattr(self, "conditioning_mode", "local") != "local":
+                user_content[0]["origin"] = "source_s0"
         media = []
         for index, item in enumerate(user_content):
             if not isinstance(item, dict):
@@ -565,7 +566,9 @@ class ZingH3MediaInput:
         from PIL import Image, UnidentifiedImageError
 
         result = {
-            key: item[key] for key in ("id", "type", "uri", "clip") if key in item
+            key: item[key]
+            for key in ("id", "type", "uri", "clip", "origin")
+            if key in item
         }
         start, end = _clip_bounds(item)
         with _local_media(str(item["uri"]), fs=self.remote_read_fs) as (
@@ -582,7 +585,8 @@ class ZingH3MediaInput:
                         )
                 except (UnidentifiedImageError, OSError):
                     with av.open(path) as container:
-                        frame = next(container.decode(video=0)).to_rgb().to_ndarray()
+                        decoded_frame = next(container.decode(video=0))
+                        frame = decoded_frame.to_rgb().to_ndarray()
                 frames, fps = frame[None], 1.0
             elif item["type"] in {"video", "video_audio"}:
                 if "presentation_fps" in item:
@@ -590,10 +594,11 @@ class ZingH3MediaInput:
                     if (
                         type(rate) not in (int, float)
                         or not 0 < rate <= 240
-                        or (start, end) != (0, 0)
+                        or end is None
+                        or start != end
                     ):
                         raise ValueError(
-                            "Single-frame video requires a valid presentation rate and zero-time clip"
+                            "Single-frame video requires a valid presentation rate and matching clip times"
                         )
                     with Image.open(path) as image:
                         frames = np.array(
@@ -609,7 +614,8 @@ class ZingH3MediaInput:
                     fps = float(stream.average_rate or stream.base_rate)
                     first, last = _clip_indices(start, end, fps)
                     selected = []
-                    for index, frame in enumerate(container.decode(stream)):
+                    decoded_frames = container.decode(stream)
+                    for index, frame in enumerate(decoded_frames):
                         if last is not None and index >= last:
                             break
                         if index >= first:

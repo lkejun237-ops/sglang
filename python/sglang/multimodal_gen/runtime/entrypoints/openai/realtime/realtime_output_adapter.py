@@ -52,6 +52,7 @@ class RealtimeFrameBatchHeader(TypedDict, total=False):
     trace_id: str
     payload_lengths: list[int]
     event_id: int
+    prompt_version: int
     frame_batch_index: int
     num_frame_batches: int
     is_final_frame_batch: bool
@@ -510,6 +511,7 @@ class RawRGBRealtimeOutputAdapter:
             chunk_index_start=batch.block_idx,
             request_id=batch.request_id,
             event_id=getattr(batch, "realtime_event_id", None),
+            prompt_version=getattr(batch, "realtime_prompt_version", None),
             trace_id=getattr(batch, "realtime_trace_id", None)
             or getattr(session, "trace_id", None),
             frame_metadata=frame_metadata,
@@ -518,6 +520,7 @@ class RawRGBRealtimeOutputAdapter:
             preview_max_width=preview_max_width,
             source_blocks=getattr(batch, "extra", {}).get("zing_source_output_blocks"),
             source_fps=getattr(batch, "fps", None),
+            output_blocks=(result.usage or {}).get("zing_realtime_blocks"),
         )
         stats["frame_shape"] = _frame_shape_from_metadata(frame_metadata)
         return stats
@@ -531,6 +534,7 @@ class RawRGBRealtimeOutputAdapter:
         chunk_index_start: int,
         request_id: str,
         event_id: int | None = None,
+        prompt_version: int | None = None,
         trace_id: str | None = None,
         frame_metadata: dict[str, int | str] | None = None,
         output_format: str | None = None,
@@ -538,14 +542,22 @@ class RawRGBRealtimeOutputAdapter:
         preview_max_width: int | None = None,
         source_blocks: list | None = None,
         source_fps: int | None = None,
+        output_blocks: list | None = None,
     ) -> RealtimeFrameSendStats:
         chunk_index = chunk_index_start
         metadata = frame_metadata or {}
         stats = empty_frame_send_stats(content_type)
         if source_blocks is not None and len(source_blocks) != len(frame_batches):
             raise ValueError("Source output metadata does not match frame batches")
+        if (
+            source_blocks is None
+            and output_blocks is not None
+            and len(output_blocks) != len(frame_batches)
+        ):
+            raise ValueError("Realtime output metadata does not match frame batches")
         for index, frames in enumerate(frame_batches):
             source_block = source_blocks[index] if source_blocks is not None else None
+            block_prompt_version = prompt_version
             if source_block is not None:
                 if source_block["provenance"].pixels.count != len(frames):
                     raise ValueError(
@@ -555,6 +567,15 @@ class RawRGBRealtimeOutputAdapter:
                     source_block[key] for key in ("block_idx", "request_id", "event_id")
                 )
                 source_offset = source_block["provenance"].pixels.start
+                block_prompt_version = source_block.get(
+                    "prompt_version", prompt_version
+                )
+            elif output_blocks is not None:
+                block = output_blocks[index]
+                chunk_index = block["block_idx"]
+                request_id = block.get("request_id") or request_id
+                event_id = block["event_id"]
+                block_prompt_version = block.get("prompt_version", prompt_version)
             split_batches = (
                 _split_frame_batch(frames, ENCODED_PREVIEW_FRAMES_PER_WS_MESSAGE)
                 if _is_encoded_preview_transport(
@@ -623,6 +644,8 @@ class RawRGBRealtimeOutputAdapter:
                 }
                 if event_id is not None:
                     header["event_id"] = event_id
+                if block_prompt_version is not None:
+                    header["prompt_version"] = block_prompt_version
                 if trace_id:
                     header["trace_id"] = trace_id
                 header.update(transport_metadata)

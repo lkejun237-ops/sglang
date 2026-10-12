@@ -67,6 +67,7 @@ def run_websocket_benchmark(generator, request, output, frames):
         }
         rows, emitted, first, play_until, stalls = [], 0, None, None, 0.0
         prompt_sent = False
+        prompt_sent_at = None
         started = time.perf_counter()
         async with websockets.connect(
             f"ws://127.0.0.1:{port}/v1/realtime_video/generate",
@@ -141,6 +142,7 @@ def run_websocket_benchmark(generator, request, output, frames):
                             )
                         )
                         prompt_sent = True
+                        prompt_sent_at = time.perf_counter() - started
                     if cancel:
                         break
             finally:
@@ -149,6 +151,17 @@ def run_websocket_benchmark(generator, request, output, frames):
                     await keepalive
                 (output / f"websocket-{label}-batches.json").write_text(
                     json.dumps(rows, indent=2)
+                )
+                print(
+                    "BATCHES",
+                    label,
+                    json.dumps(
+                        [
+                            [r["chunk_index"], r["event_id"], round(r["arrival_seconds"], 3)]
+                            for r in rows
+                        ]
+                    ),
+                    flush=True,
                 )
         if not cancel:
             assert emitted == count, (emitted, count)
@@ -167,6 +180,7 @@ def run_websocket_benchmark(generator, request, output, frames):
                 "total_seconds": duration,
                 "fps": emitted / duration,
                 "playback_stall_seconds": stalls,
+                "prompt_sent_seconds": prompt_sent_at,
             }
         )
         (output / "websocket-report.json").write_text(json.dumps(report, indent=2))

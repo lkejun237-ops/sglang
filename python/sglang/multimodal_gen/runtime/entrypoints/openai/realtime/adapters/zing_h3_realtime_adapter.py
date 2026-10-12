@@ -41,6 +41,9 @@ class ZingH3RealtimeAdapter(BaseRealtimeModelAdapter):
 
     async def on_init(self, session, request):
         args = get_global_server_args()
+        from ..conditioning import validate_remote_request
+
+        validate_remote_request(request, args)
         if getattr(args, "realtime_vae_backend", "local") != "local" or getattr(
             session, "vae_worker_url", None
         ):
@@ -126,6 +129,19 @@ class ZingH3RealtimeAdapter(BaseRealtimeModelAdapter):
         request.max_chunks = min(request.max_chunks or blocks, blocks)
         if custom is None and "size" not in request.model_fields_set:
             request.size = "832x480"
+        if (
+            getattr(args, "zing_conditioning_mode", "local") == "remote"
+            and isinstance(request.first_frame, str)
+            and request.first_frame.lower().startswith(("http://", "https://"))
+        ):
+            from sglang.multimodal_gen.runtime.conditioning.contract import (
+                ConditionError,
+            )
+
+            raise ConditionError(
+                "CONDITION_INVALID",
+                "Remote conditioning requires owned first-frame input",
+            )
         await save_realtime_first_frame(session, request)
 
     def ingest_event(self, session, event):
@@ -133,6 +149,9 @@ class ZingH3RealtimeAdapter(BaseRealtimeModelAdapter):
             raise ValueError("This model supports prompt updates only.")
         if not isinstance(event.payload, str) or not event.payload:
             raise ValueError("Please provide a non-empty prompt.")
+        from ..conditioning import validate_remote_request
+
+        validate_remote_request(session.request, get_global_server_args())
         session.adapter_state.pending_prompt = (event.payload, event.event_id)
         return f"kind=prompt, prompt_len={len(event.payload)}"
 
@@ -200,7 +219,11 @@ class ZingH3RealtimeAdapter(BaseRealtimeModelAdapter):
             block_batch.block_idx = metadata["block_idx"]
             block_batch.request_id = metadata["request_id"]
             block_batch.realtime_event_id = metadata["event_id"]
+            block_batch.realtime_prompt_version = metadata.get(
+                "prompt_version", batch.realtime_prompt_version
+            )
             block_result.raw_frame_batches = [frames]
+            block_result.usage = {**result.usage, "zing_realtime_blocks": [metadata]}
             stats = await super().send_output(ws, session, block_result, block_batch)
             if total is None:
                 total = stats

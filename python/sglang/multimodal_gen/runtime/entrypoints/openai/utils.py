@@ -464,6 +464,13 @@ async def process_generation_batch(
             and result.realtime_latents is None
         ):
             error_msg = result.error or "Unknown error"
+            from sglang.multimodal_gen.runtime.conditioning.contract import (
+                ConditionError,
+                _PUBLIC,
+            )
+
+            if getattr(result, "error_code", None) in _PUBLIC:
+                raise ConditionError(result.error_code)
             raise RuntimeError(
                 f"Model generation returned no output. Error from scheduler: {error_msg}"
             )

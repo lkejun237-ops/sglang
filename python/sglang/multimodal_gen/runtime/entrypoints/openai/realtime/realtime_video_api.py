@@ -12,7 +12,6 @@ from uuid import uuid4
 
 import msgspec.msgpack
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ReleaseRealtimeSessionReq,
     ReplaceQueuedRealtimeReq,
@@ -1019,6 +1018,7 @@ async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
 
             wait_started = time.perf_counter()
             await adapter.wait_for_next_chunk(session)
+            await adapter.prepare_conditioning(session, server_args)
             wait_ms = (time.perf_counter() - wait_started) * 1000.0
             log_realtime_trace(
                 logger,
@@ -1066,6 +1066,7 @@ async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
             denoise_started = time.perf_counter()
             _, result = await _process_realtime_generation_batch(batch)
             _sync_batch_realtime_metadata(batch, result)
+            await _write_conditioning_notice(ws, result)
             denoise_completed = time.perf_counter()
             session.denoise_intervals[chunk.index] = (
                 denoise_started,
@@ -1171,7 +1172,18 @@ async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
         )
         logger.error("error during async VAE generate loop: %s", err_msg)
         try:
-            await write_error_msg(f"error during generate loop: {err_msg}", ws)
+            from sglang.multimodal_gen.runtime.conditioning.contract import (
+                ConditionError,
+            )
+
+            await write_error_msg(
+                exc.public_message
+                if isinstance(exc, ConditionError)
+                else "Video generation failed. Please start a new session.",
+                ws,
+                code=exc.code if isinstance(exc, ConditionError) else None,
+                fatal=True if isinstance(exc, ConditionError) else None,
+            )
         except Exception:
             pass
     finally:
@@ -1225,6 +1237,7 @@ async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
 
             wait_started = time.perf_counter()
             await adapter.wait_for_next_chunk(session)
+            await adapter.prepare_conditioning(session, server_args)
             wait_for_next_chunk_ms = (time.perf_counter() - wait_started) * 1000
             log_realtime_trace(
                 logger,
@@ -1296,6 +1309,7 @@ async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
             _, result = await _process_realtime_generation_batch(batch)
             current_result = result
             _sync_batch_realtime_metadata(batch, result)
+            await _write_conditioning_notice(ws, result)
             scheduler_forward_ms = timer.mark_ms()
             log_realtime_trace(
                 logger,
@@ -1361,7 +1375,16 @@ async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
                     if adapter.session_ready_message(session) is not None
                     else f"error during generate loop: {err_msg}"
                 )
-                await write_error_msg(public_error, ws)
+                from sglang.multimodal_gen.runtime.conditioning.contract import (
+                    ConditionError,
+                )
+
+                await write_error_msg(
+                    e.public_message if isinstance(e, ConditionError) else public_error,
+                    ws,
+                    code=e.code if isinstance(e, ConditionError) else None,
+                    fatal=True if isinstance(e, ConditionError) else None,
+                )
             except Exception as send_error:
                 logger.error(
                     "error during sending complete msg: %s",
@@ -1642,7 +1665,11 @@ def _schedule_queued_control_refresh(
 
 async def _listen_events(ws: WebSocket, session: GenerateSession):
     """listen for user events: usually condition inputs"""
-    async for message in ws.iter_bytes():
+    from .conditioning import iter_conditioning_messages
+
+    async for message in iter_conditioning_messages(
+        ws, session, get_global_server_args()
+    ):
         data = None
         try:
             data = msgspec.msgpack.decode(message)
@@ -1759,7 +1786,11 @@ async def _listen_generate_request(
     while True:
         try:
             receive_started = time.perf_counter()
-            raw_message = await ws.receive_bytes()
+            from .conditioning import receive_conditioning_message
+
+            raw_message = await receive_conditioning_message(
+                ws, session, get_global_server_args()
+            )
             session.mark_client_activity()
             receive_wait_ms = (time.perf_counter() - receive_started) * 1000
             data = msgspec.msgpack.decode(raw_message)
@@ -1796,6 +1827,9 @@ async def _listen_generate_request(
                     "The reference images or session settings are too large.",
                 )
             await adapter.on_init(session, realtime_req)
+            from .conditioning import take_message_reservation
+
+            session._conditioning_init_reservation = take_message_reservation(session)
             log_realtime_trace(
                 logger,
                 session,
@@ -1818,6 +1852,17 @@ async def _listen_generate_request(
         except WebSocketDisconnect:
             raise
         except Exception as e:
+            from sglang.multimodal_gen.runtime.conditioning.contract import (
+                ConditionError,
+            )
+
+            if isinstance(e, ConditionError):
+                logger.exception("Conditioning initialization failed")
+                await write_error_msg(e.public_message, ws, code=e.code)
+                await _close_realtime_websocket(
+                    ws, code=1011, reason="Request preparation failed."
+                )
+                raise WebSocketDisconnect(code=1011)
             log_realtime_trace(
                 logger,
                 session,
@@ -1888,12 +1933,34 @@ async def _cleanup_realtime_session(
             continue
         await _await_realtime_task(task)
     scheduler_released = await _release_scheduler_realtime_session(session.id)
+    if session.adapter is not None:
+        await session.adapter.close_conditioning(session)
     if session.input_temp_dir is not None:
         shutil.rmtree(session.input_temp_dir, ignore_errors=True)
     input_files_removed = (
         session.input_temp_dir is None or not Path(session.input_temp_dir).exists()
     )
+    if input_files_removed:
+        from .conditioning import release_api_media
+
+        release_api_media(session)
+    else:
+        # A failed filesystem removal cannot free the still-owned disk budget.
+        # Preserve the path and leases for another cleanup attempt.
+        logger.warning(
+            "Conditioning input files remain charged after cleanup: %s",
+            session.input_temp_dir,
+        )
+    from .conditioning import release_message_reservation
+
+    release_message_reservation(session)
+    init_reservation = getattr(session, "_conditioning_init_reservation", None)
+    if init_reservation is not None:
+        init_reservation.release()
+    retained_input_dir = session.input_temp_dir if not input_files_removed else None
     session.dispose()
+    if retained_input_dir is not None:
+        session.input_temp_dir = retained_input_dir
     log_realtime_trace(
         logger,
         session,
@@ -2210,8 +2277,28 @@ async def generate(websocket: WebSocket):
             )
 
 
-async def write_error_msg(error_msg: str, websocket: WebSocket, *, code=None):
+async def _write_conditioning_notice(websocket: WebSocket, result: OutputBatch):
+    from sglang.multimodal_gen.runtime.conditioning.contract import _PUBLIC
+
+    notice = result.conditioning_notice
+    if isinstance(notice, dict) and notice.get("code") in _PUBLIC:
+        await write_error_msg(
+            _PUBLIC[notice["code"]],
+            websocket,
+            code=notice["code"],
+            fatal=False,
+            event_id=notice.get("event_id"),
+        )
+
+
+async def write_error_msg(
+    error_msg: str, websocket: WebSocket, *, code=None, fatal=None, event_id=None
+):
     message = {"type": "error", "content": error_msg}
     if code is not None:
         message["code"] = code
+    if fatal is not None:
+        message["fatal"] = fatal
+    if event_id is not None:
+        message["event_id"] = event_id
     await websocket.send_bytes(msgspec.msgpack.encode(message))

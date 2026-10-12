@@ -12,6 +12,7 @@ from typing import Any, Iterator, List
 
 import zmq
 
+from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
@@ -460,6 +461,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             "action_version": request.realtime_action_version,
             "prompt_version": request.realtime_prompt_version,
         }
+        if output.realtime_effective_prompt is not None:
+            for name in ("event_id", "prompt_version"):
+                if name in output.realtime_effective_prompt:
+                    output.realtime_request_metadata[name] = (
+                        output.realtime_effective_prompt[name]
+                    )
 
     def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
         """Handle update_weights_from_disk request for RL workflows."""
@@ -550,7 +557,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     )
                     return self._build_dynamic_batch_error_outputs(
                         reqs=reqs,
-                        error_msg=output_batch.error,
+                        error_msg=output_batch,
                     )
 
                 split_outputs = self._split_batched_output(output_batch, reqs)
@@ -578,7 +585,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 )
                 return self._build_dynamic_batch_error_outputs(
                     reqs=reqs,
-                    error_msg=f"Dynamic batching failed: {e}",
+                    error_msg=e
+                    if isinstance(e, ConditionError)
+                    else f"Dynamic batching failed: {e}",
                 )
 
     def _execute_generation_grouped(
@@ -599,7 +608,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 )
                 return self._build_dynamic_batch_error_outputs(
                     reqs=reqs,
-                    error_msg=output_batch.error,
+                    error_msg=output_batch,
                 )
 
             split_outputs = self._split_batched_output(output_batch, reqs)
@@ -627,7 +636,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             )
             return self._build_dynamic_batch_error_outputs(
                 reqs=reqs,
-                error_msg=f"Native grouped execution failed: {e}",
+                error_msg=e
+                if isinstance(e, ConditionError)
+                else f"Native grouped execution failed: {e}",
             )
 
     def _iter_grouped_outputs_sequentially(
@@ -932,8 +943,25 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     def _build_dynamic_batch_error_outputs(
         self,
         reqs: List[Req],
-        error_msg: str,
+        error_msg: str | ConditionError | OutputBatch,
     ) -> List[OutputBatch]:
+        if isinstance(error_msg, OutputBatch):
+            return [
+                OutputBatch(
+                    error=error_msg.error,
+                    error_code=error_msg.error_code,
+                    conditioning_notice=deepcopy(error_msg.conditioning_notice),
+                    realtime_effective_prompt=deepcopy(
+                        error_msg.realtime_effective_prompt
+                    ),
+                )
+                for _ in reqs
+            ]
+        if isinstance(error_msg, ConditionError):
+            return [
+                OutputBatch(error=str(error_msg), error_code=error_msg.code)
+                for _ in reqs
+            ]
         return [OutputBatch(error=error_msg) for _ in reqs]
 
     def _should_return_lightweight_warmup_result(self, processed_req: Any) -> bool:
@@ -1209,6 +1237,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     output_batch.trajectory_decoded, start, end, total_items
                 ),
                 error=output_batch.error,
+                error_code=output_batch.error_code,
+                conditioning_notice=deepcopy(output_batch.conditioning_notice),
+                realtime_effective_prompt=deepcopy(
+                    output_batch.realtime_effective_prompt
+                ),
                 output_file_paths=self._slice_batched_value(
                     output_batch.output_file_paths, start, end, total_items
                 ),

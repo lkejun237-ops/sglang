@@ -9,7 +9,7 @@ from contextlib import closing, contextmanager, nullcontext
 
 import psutil
 import torch
-
+from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.realtime.session import BaseRealtimeState
 from sglang.multimodal_gen.runtime.realtime.zing_contracts import PixelRange
@@ -39,6 +39,8 @@ class ZingSourceStreamState(BaseRealtimeState):
         self.blocks = deque()
         self.command_index = 0
         self.prompt = self.prompt_event = None
+        self.failed_update = None
+        self.effective_prompt_version = None
         self.closed = False
         self.component_capture = None
         self.kv_lease = None
@@ -86,16 +88,20 @@ class ZingSourceStreamState(BaseRealtimeState):
                 clip=dict(start=0, end=0),
                 frames=pixels.permute(2, 0, 1).unsqueeze(1),
                 fps=float(config["fps"]),
+                origin="source_s0",
             )
         self.inputs = stage.codecs.prepare(
             stage._build_request(batch),
             prepare_use,
             retain_condition_media=True,
             source_preview=source_preview,
+            conditioning=stage._conditioning_consumer(batch),
         )
         if self.inputs.audio_shape is not None or self.inputs.source_visual is not None:
             raise ValueError("Continuous source requires a video-only static prefix")
         self.prompt = params.prompt
+        self.prompt_event = batch.realtime_event_id
+        self.effective_prompt_version = getattr(batch, "realtime_prompt_version", None)
         self.ledger = SourceLedger(**config)
         clip, tokens = (
             stage.codecs.vae_frames_per_chunk,
@@ -132,6 +138,9 @@ class ZingSourceStreamState(BaseRealtimeState):
             max_pending_bytes=256 << 20,
             acquire_storage=self._pooled_storage(stage, batch.session, sampler),
         )
+        # Bind the initial condition to the accepted control event without a
+        # second encode or a KV/RNG reset.
+        self.sampler.prompt = (self.sampler.prompt[0], batch.realtime_event_id)
         decoder_type = (
             SourceTAEH3Decoder
             if stage.codecs.video_decoder_name == "taeh3_decoder"
@@ -206,19 +215,29 @@ class ZingSourceStreamState(BaseRealtimeState):
                     self.initialize(stage, batch, config)
                 if self.qwen_init_host_ms is not None:
                     timings["qwen_init_host_ms"] = self.qwen_init_host_ms
-            if (
-                batch.sampling_params.prompt != self.prompt
-                or batch.realtime_event_id != self.prompt_event
+            notice = None
+            update = (batch.sampling_params.prompt, batch.realtime_event_id)
+            if update != getattr(self, "failed_update", None) and update != (
+                self.prompt,
+                self.prompt_event,
             ):
-                with timed("prompt_host_ms"), stage._use("text_encoder"):
-                    positive = stage.codecs.encode_condition(
-                        batch.sampling_params.prompt, self.inputs.condition_media
-                    )
+                try:
+                    with timed("prompt_host_ms"):
+                        positive = stage.encode_condition_for_batch(
+                            batch,
+                            batch.sampling_params.prompt,
+                            self.inputs.condition_media,
+                        )
+                except ConditionError as exc:
+                    self.failed_update = update
+                    notice = {"code": exc.code, "event_id": batch.realtime_event_id}
+                else:
                     self.sampler.update_prompt(positive, batch.realtime_event_id)
-                self.prompt, self.prompt_event = (
-                    batch.sampling_params.prompt,
-                    batch.realtime_event_id,
-                )
+                    self.prompt, self.prompt_event = update
+                    self.effective_prompt_version = getattr(
+                        batch, "realtime_prompt_version", None
+                    )
+                    self.failed_update = None
             count = sum(x["payload"]["num_frames"] for x in command["appends"])
             if count > 2 * stage.codecs.vae_frames_per_chunk:
                 raise ValueError(
@@ -403,10 +422,18 @@ class ZingSourceStreamState(BaseRealtimeState):
             )
             if outputs:
                 batch.sampling_params.num_frames = sum(x.shape[1] for x in outputs)
-                result = OutputBatch(output=outputs, metrics=batch.metrics, usage=usage)
+                result = OutputBatch(
+                    output=outputs,
+                    metrics=batch.metrics,
+                    usage=usage,
+                    conditioning_notice=notice,
+                )
             else:
                 result = OutputBatch(
-                    raw_frame_batches=[], metrics=batch.metrics, usage=usage
+                    raw_frame_batches=[],
+                    metrics=batch.metrics,
+                    usage=usage,
+                    conditioning_notice=notice,
                 )
             if final is not None:
                 self.dispose()
@@ -477,6 +504,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                     "block_idx": result.chunk.chunk_id,
                     "request_id": batch.request_id,
                     "event_id": result.prompt_event_id,
+                    "prompt_version": self.effective_prompt_version,
                     "frame_end": result.provenance.pixels.end,
                 }
             )
@@ -579,6 +607,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                             "block_idx": result.chunk.chunk_id,
                             "request_id": batch.request_id,
                             "event_id": result.prompt_event_id,
+                            "prompt_version": self.effective_prompt_version,
                             "frame_end": result.provenance.pixels.end,
                         }
                     )
@@ -678,4 +707,6 @@ class ZingSourceStreamState(BaseRealtimeState):
         ) = None
         self.blocks.clear()
         self.prompt = self.prompt_event = None
+        self.failed_update = None
+        self.effective_prompt_version = None
         self.closed = True

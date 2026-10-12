@@ -433,11 +433,25 @@ async def _dispatch_job_async(
         await VIDEO_STORE.update_fields(job_id, update_fields)
     except Exception as e:
         logger.exception("Video job %s failed", job_id)
+        from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+
+        error = (
+            {
+                "code": e.code,
+                "message": e.public_message,
+                "status_code": 503
+                if e.code
+                in {"CONDITION_BUSY", "CONDITION_TIMEOUT", "CONDITION_UNAVAILABLE"}
+                else 400,
+            }
+            if isinstance(e, ConditionError)
+            else {"message": str(e)}
+        )
         await VIDEO_STORE.update_fields(
             job_id,
             {
                 "status": "failed",
-                "error": {"message": str(e)},
+                "error": error,
                 "url": None,
                 "file_path": None,
                 "file_paths": None,
@@ -779,6 +793,18 @@ async def create_video(
                 )
         for td in temp_dirs:
             shutil.rmtree(td, ignore_errors=True)
+        from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+
+        if isinstance(e, ConditionError):
+            status = (
+                503
+                if e.code
+                in {"CONDITION_BUSY", "CONDITION_TIMEOUT", "CONDITION_UNAVAILABLE"}
+                else 400
+            )
+            raise HTTPException(
+                status_code=status, detail={"code": e.code, "message": e.public_message}
+            ) from e
         if isinstance(e, (TypeError, ValueError)):
             raise HTTPException(status_code=400, detail=str(e)) from e
         raise

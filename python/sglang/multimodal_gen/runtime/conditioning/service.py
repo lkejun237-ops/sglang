@@ -1,0 +1,672 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Authenticated, bounded, session-free conditioning RPC service."""
+
+from __future__ import annotations
+
+import asyncio
+import concurrent.futures
+import logging
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from types import SimpleNamespace
+
+from .cache import ConditioningCache, tensor_bytes
+from .contract import ConditionError, _tensor_spec, canonical_json
+from .resources import AdmissionLedger, BoundedExecutor, ResourceLimits
+from .wire import decode_request, pack_message
+
+logger = logging.getLogger(__name__)
+PREFIX = "/v1/conditioning"
+
+
+class _Disconnected(Exception):
+    pass
+
+
+@dataclass
+class _Flight:
+    key: tuple
+    value: object
+    future: object
+    enqueued_at: float
+    waiters: int = 1
+    state: str = "queued"
+    encode_ms: float = 0
+    queue_ms: float = 0
+    retained_reservations: list = field(default_factory=list)
+
+
+class EncodeQueue:
+    """FIFO queue whose last queued waiter can leave without submitting work."""
+
+    def __init__(
+        self, encoder, cache, limits, flights, on_encoded, clock=time.monotonic
+    ):
+        self.encoder, self.cache, self.limits = encoder, cache, limits
+        self.flights, self.on_encoded, self.clock = flights, on_encoded, clock
+        self.pending = deque()
+        self.wake = asyncio.Event()
+        self.pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="conditioning-encoder"
+        )
+        self.runner = None
+        self.closed = False
+
+    @property
+    def depth(self):
+        return sum(f.state == "queued" and f.waiters > 0 for f in self.pending)
+
+    def enqueue(self, key, value):
+        if self.closed:
+            raise ConditionError("CONDITION_UNAVAILABLE")
+        if self.depth >= self.limits.max_queued_encodes:
+            raise ConditionError("CONDITION_BUSY")
+        future = asyncio.get_running_loop().create_future()
+        # A running encode can finish after its last waiter has disconnected.
+        # Consume otherwise-unobserved exceptions without changing await behavior.
+        future.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
+        flight = _Flight(key, value, future, self.clock())
+        self.flights[key] = flight
+        self.pending.append(flight)
+        self.wake.set()
+        if self.runner is None:
+            self.runner = asyncio.create_task(self._run())
+        return flight
+
+    def leave(self, flight):
+        flight.waiters -= 1
+        if flight.waiters == 0 and flight.state == "queued":
+            flight.state = "discarded"
+            if self.flights.get(flight.key) is flight:
+                del self.flights[flight.key]
+            flight.future.cancel()
+            # Remove immediately so abandoned payloads do not occupy an unbounded
+            # deque while an uninterruptible native forward is running.
+            try:
+                self.pending.remove(flight)
+            except ValueError:
+                pass
+
+    def _forward(self, value, key):
+        import torch
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            set_forward_context,
+        )
+
+        with (
+            torch.inference_mode(),
+            set_forward_context(current_timestep=0, attn_metadata=None),
+        ):
+            condition = self.encoder(value)
+            condition = {
+                name: tensor.detach().to("cpu").contiguous()
+                for name, tensor in condition.items()
+            }
+            _tensor_spec(condition, self.limits.max_condition_rows)
+            if tensor_bytes(condition) > self.limits.max_condition_bytes:
+                raise ConditionError(
+                    "CONDITION_INVALID", "Condition exceeds the output byte budget"
+                )
+            self.cache.put(key, condition)
+            return condition
+
+    async def _run(self):
+        while True:
+            if not self.pending:
+                if self.closed:
+                    return
+                self.wake.clear()
+                await self.wake.wait()
+                continue
+            flight = self.pending.popleft()
+            if flight.state != "queued" or flight.waiters == 0:
+                continue
+            flight.state = "running"
+            started = self.clock()
+            flight.queue_ms = max(0, (started - flight.enqueued_at) * 1000)
+            future = asyncio.get_running_loop().run_in_executor(
+                self.pool, self._forward, flight.value, flight.key
+            )
+            try:
+                condition = await asyncio.shield(future)
+                flight.encode_ms = max(0, (self.clock() - started) * 1000)
+                self.on_encoded(flight)
+                flight.future.set_result(condition)
+            except Exception as error:
+                if not isinstance(error, ConditionError):
+                    logger.exception("Conditioning encoder failed")
+                    error = ConditionError("CONDITION_UNAVAILABLE")
+                flight.future.set_exception(error)
+            finally:
+                flight.state = "done"
+                flight.value = None
+                for reservation in flight.retained_reservations:
+                    reservation.release()
+                flight.retained_reservations.clear()
+                if self.flights.get(flight.key) is flight:
+                    del self.flights[flight.key]
+
+    async def close(self):
+        self.closed = True
+        for flight in list(self.pending):
+            flight.state = "discarded"
+            if not flight.future.done():
+                flight.future.set_exception(ConditionError("CONDITION_UNAVAILABLE"))
+            self.flights.pop(flight.key, None)
+        self.pending.clear()
+        self.wake.set()
+        if self.runner:
+            # Do not cancel a running encoder. Native GPU work must drain before
+            # its request buffers and this executor can be released.
+            while not self.runner.done():
+                try:
+                    await asyncio.shield(self.runner)
+                except asyncio.CancelledError:
+                    continue
+            self.runner.result()
+        self.pool.shutdown(wait=True, cancel_futures=False)
+
+
+class ConditioningService:
+    def __init__(
+        self,
+        *,
+        profile,
+        encoder,
+        credentials=None,
+        tokens=None,
+        limits=None,
+        clock=time.monotonic,
+    ):
+        if credentials is not None and tokens is not None:
+            raise ValueError("Configure conditioning tokens only once")
+        self.profile, self.encoder = profile, encoder
+        self.credentials = dict(tokens if tokens is not None else credentials or {})
+        if not self.credentials:
+            raise ValueError("Conditioning service credentials are required")
+        for token, principal in self.credentials.items():
+            if (
+                type(token) is not str
+                or not token
+                or not token.isascii()
+                or type(principal) is not dict
+                or type(principal.get("tenant")) is not str
+                or not principal["tenant"]
+                or type(principal.get("admin", False)) is not bool
+            ):
+                raise ValueError("Invalid conditioning token principal")
+        self.limits, self.clock = limits or ResourceLimits(), clock
+        self.ledger = AdmissionLedger(self.limits.budgets())
+        self.cpu = BoundedExecutor(
+            self.limits.cpu_executor_active, self.limits.cpu_executor_waiting
+        )
+        self._cpu_gate = asyncio.Semaphore(self.cpu.capacity)
+        self.cache = ConditioningCache(
+            self.limits.cache_bytes, per_tenant_bytes=self.limits.cache_bytes_per_tenant
+        )
+        self.flights = {}
+        self._stats = defaultdict(self._new_stats)
+        self.queue = EncodeQueue(
+            encoder, self.cache, self.limits, self.flights, self._encoded, clock
+        )
+        self._closed = False
+        self._requests = set()
+        self._close_task = None
+
+    @staticmethod
+    def _new_stats():
+        return dict(
+            hit=0,
+            miss=0,
+            joined=0,
+            admission_rejected=0,
+            response_bytes=0,
+            encode_ms=deque(maxlen=1024),
+            queue_ms=deque(maxlen=1024),
+        )
+
+    def _encoded(self, flight):
+        stats = self._stats[flight.key[0]]
+        stats["encode_ms"].append(flight.encode_ms)
+        stats["queue_ms"].append(flight.queue_ms)
+
+    def _authenticate(self, headers):
+        if sum(len(k) + len(v) + 4 for k, v in headers) > self.limits.max_header_bytes:
+            raise ConditionError()
+        values = {}
+        for key, value in headers:
+            key = key.lower()
+            if key in values:
+                raise ConditionError()
+            values[key] = value
+        authorization = values.get(b"authorization", b"")
+        if not authorization.startswith(b"Bearer "):
+            raise ConditionError("CONDITION_UNAUTHORIZED")
+        try:
+            token = authorization[7:].decode("ascii")
+        except UnicodeError:
+            raise ConditionError("CONDITION_UNAUTHORIZED") from None
+        principal = self.credentials.get(token)
+        if not principal:
+            raise ConditionError("CONDITION_UNAUTHORIZED")
+        return principal, values
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "lifespan":
+            while True:
+                message = await receive()
+                if message["type"] == "lifespan.startup":
+                    await send({"type": "lifespan.startup.complete"})
+                elif message["type"] == "lifespan.shutdown":
+                    await self.close()
+                    await send({"type": "lifespan.shutdown.complete"})
+                    return
+        if scope["type"] != "http":
+            return
+        principal = None
+        response_started = False
+        raw_send = send
+
+        async def tracked_send(message):
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await raw_send(message)
+
+        send = tracked_send
+        task = asyncio.current_task()
+        try:
+            principal, headers = self._authenticate(scope.get("headers", []))
+            if self._closed:
+                raise ConditionError("CONDITION_UNAVAILABLE")
+            path, method = scope["path"], scope["method"]
+            if path == PREFIX + "/profile" and method == "GET":
+                return await self._json(
+                    send,
+                    200,
+                    dict(
+                        schema_version=1,
+                        profile_id=self.profile.profile_id,
+                        preprocess_version=self.profile.document["preprocess_version"],
+                        tensor_contract={
+                            "context_dtype": "BF16",
+                            "width": 5120,
+                            "row_role_dtype": "I64",
+                        },
+                    ),
+                )
+            if path == PREFIX + "/stats" and method == "GET":
+                return await self._json(send, 200, self._stats_snapshot(principal))
+            if path != PREFIX + "/encode" or method != "POST":
+                raise ConditionError("CONDITION_INVALID", 404)
+            self._requests.add(task)
+            await self._encode(principal["tenant"], headers, receive, send)
+        except _Disconnected:
+            return
+        except ConditionError as error:
+            if response_started:
+                raise
+            if error.code == "CONDITION_BUSY" and principal:
+                self._stats[principal["tenant"]]["admission_rejected"] += 1
+            await self._json(
+                send,
+                error.status,
+                {"code": error.code, "message": error.public_message},
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if response_started:
+                raise
+            logger.exception("Conditioning RPC failed")
+            error = ConditionError("CONDITION_UNAVAILABLE")
+            await self._json(
+                send,
+                error.status,
+                {"code": error.code, "message": error.public_message},
+            )
+        finally:
+            self._requests.discard(task)
+
+    async def _cpu_run(self, function, *args):
+        # Requests waiting outside the executor remain bounded by request slots.
+        # This avoids spurious BUSY responses for a legal singleflight burst.
+        async with self._cpu_gate:
+            return await self.cpu.run(function, *args)
+
+    def _body_length(self, headers):
+        value = headers.get(b"content-length")
+        if (
+            b"transfer-encoding" in headers
+            or value is None
+            or not value
+            or not value.isdigit()
+        ):
+            raise ConditionError()
+        if (
+            headers.get(b"content-type", b"").split(b";", 1)[0].strip().lower()
+            != b"application/octet-stream"
+        ):
+            raise ConditionError()
+        try:
+            size = int(value)
+        except ValueError:
+            raise ConditionError() from None
+        if size > min(
+            self.limits.max_request_bytes,
+            self.limits.max_input_bytes + self.limits.max_header_bytes + 1024,
+        ):
+            raise ConditionError("CONDITION_INVALID", 413)
+        if size < 4:
+            raise ConditionError()
+        return size
+
+    async def _read_body(self, receive, expected, tenant, reservations):
+        body, actual = bytearray(), 0
+        charge = self.ledger.reserve(tenant, inflight=0)
+        reservations.append(charge)
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                raise _Disconnected()
+            if message["type"] != "http.request":
+                raise ConditionError()
+            chunk = message.get("body", b"")
+            if type(chunk) is not bytes:
+                raise ConditionError()
+            actual += len(chunk)
+            if actual > expected:
+                raise ConditionError()
+            if chunk:
+                charge.grow(inflight=len(chunk))
+                body.extend(chunk)
+            if not message.get("more_body", False):
+                if actual != expected:
+                    raise ConditionError()
+                return bytes(body)
+
+    @staticmethod
+    async def _disconnect(receive):
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            # ASGI forbids extra request chunks after more_body=False. Treat
+            # extra transport data as an invalid request, without busy looping.
+            raise ConditionError("CONDITION_INVALID", "Unexpected ASGI request event")
+
+    async def _encode(self, tenant, headers, receive, send):
+        expected = self._body_length(headers)
+        reservations, flight, watcher = [], None, None
+        left_flight = False
+        begun = self.clock()
+        try:
+            reservations.append(self.ledger.reserve(tenant, slots=1))
+            try:
+                body = await asyncio.wait_for(
+                    self._read_body(receive, expected, tenant, reservations),
+                    self.limits.request_timeout_s,
+                )
+                header, media = await asyncio.wait_for(
+                    self._cpu_run(decode_request, body, self.profile, self.limits),
+                    max(0.001, self.limits.request_timeout_s - (self.clock() - begun)),
+                )
+            except asyncio.TimeoutError:
+                raise ConditionError("CONDITION_TIMEOUT") from None
+            budget = self.limits.request_timeout_s
+            # Compare whole seconds before true division: huge positive JSON
+            # integers must clamp without float conversion, and multiplying an
+            # otherwise finite configured timeout by 1000 could also overflow.
+            if header["deadline_ms"] // 1000 < budget:
+                budget = min(budget, header["deadline_ms"] / 1000)
+            deadline = begun + budget
+            if self.clock() >= deadline:
+                raise ConditionError("CONDITION_TIMEOUT")
+            key = (tenant, header["input_digest"])
+            cached_size = self.cache.entry_size(key)
+            status, encode_ms, queue_ms = "hit", 0, 0
+            output_charge = (
+                cached_size
+                if cached_size is not None
+                else self.limits.output_reservation_bytes
+            )
+            output_reservation = self.ledger.reserve(tenant, inflight=output_charge)
+            reservations.append(output_reservation)
+            condition = (
+                await self._cpu_run(self.cache.get, key)
+                if cached_size is not None
+                else None
+            )
+            # CPU lookup may outlive the budget, including an LRU eviction while
+            # it waits. Stop before funding a miss or joining/starting native work.
+            if self.clock() >= deadline:
+                raise ConditionError("CONDITION_TIMEOUT")
+            if (
+                condition is None
+                and output_charge < self.limits.output_reservation_bytes
+            ):
+                # The LRU may evict the entry while this request waits for a CPU
+                # thread. Reserve the miss bound before enqueueing any work.
+                output_reservation.grow(
+                    inflight=self.limits.output_reservation_bytes - output_charge
+                )
+            watcher = asyncio.create_task(self._disconnect(receive))
+            if condition is None:
+                flight = self.flights.get(key)
+                if flight is None:
+                    status = "miss"
+                    flight = self.queue.enqueue(
+                        key, SimpleNamespace(prompt=header["prompt"], media=media)
+                    )
+                else:
+                    status = "joined"
+                    flight.waiters += 1
+                self._stats[tenant][status] += 1
+                waiting = asyncio.shield(flight.future)
+                try:
+                    done, _ = await asyncio.wait(
+                        [waiting, watcher],
+                        timeout=max(0, deadline - self.clock()),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if watcher in done:
+                        watcher.result()
+                        raise _Disconnected()
+                    if waiting not in done:
+                        raise ConditionError("CONDITION_TIMEOUT")
+                    condition = waiting.result()
+                finally:
+                    waiting.cancel()
+                    # Encoding ownership ends when waiting ends, including before
+                    # an error response whose transport may stall. Response
+                    # reservations still belong to this request until send ends.
+                    self.queue.leave(flight)
+                    left_flight = True
+                encode_ms, queue_ms = flight.encode_ms, flight.queue_ms
+                output_reservation.reduce(inflight=tensor_bytes(condition))
+            else:
+                self._stats[tenant]["hit"] += 1
+            response = await self._cpu_run(
+                pack_message,
+                dict(
+                    schema_version=1,
+                    profile_id=self.profile.profile_id,
+                    input_digest=header["input_digest"],
+                    cache=status,
+                    encode_ms=encode_ms,
+                    queue_ms=queue_ms,
+                    tensors=["context", "row_role"],
+                ),
+                condition,
+            )
+            if self.clock() >= deadline:
+                raise ConditionError("CONDITION_TIMEOUT")
+            if len(response) > self.limits.max_response_bytes:
+                raise ConditionError(
+                    "CONDITION_INVALID", "RPC response exceeds the byte budget"
+                )
+            if watcher.done():
+                watcher.result()
+                raise _Disconnected()
+            # Keep both slot and body/result bytes charged until the last send
+            # completes. Headers/framing are covered by the bounded CPU executor.
+            await self._send_response(send, response, watcher, deadline)
+            self._stats[tenant]["response_bytes"] += len(response)
+        except ConditionError as error:
+            if error.code == "CONDITION_BUSY":
+                self._stats[tenant]["admission_rejected"] += 1
+            # Error responses retain the same request slot/body ownership until
+            # their final send. A short transmission grace allows an expired
+            # deadline to report TIMEOUT, without an indefinitely blocked sender.
+            data = canonical_json({"code": error.code, "message": error.public_message})
+            await self._send_response(
+                send,
+                data,
+                watcher,
+                self.clock() + min(1.0, self.limits.request_timeout_s),
+                status=error.status,
+                content_type=b"application/json",
+            )
+        finally:
+            if flight is not None:
+                if flight.state == "running" and flight.waiters == (
+                    0 if left_flight else 1
+                ):
+                    # The last request may stop waiting, but native work still
+                    # owns its input and worst-case result buffers. Transfer the
+                    # existing byte charge without growing or double-charging it.
+                    for reservation in reservations:
+                        size = reservation.charges.get("inflight", 0)
+                        if size:
+                            flight.retained_reservations.append(
+                                reservation.split(inflight=size)
+                            )
+                if not left_flight:
+                    self.queue.leave(flight)
+            try:
+                if watcher:
+                    await self._cancel_and_drain(watcher)
+            finally:
+                # Repeated cancellation of cleanup must never skip ledger release.
+                for reservation in reversed(reservations):
+                    reservation.release()
+
+    async def _send_response(
+        self,
+        send,
+        response,
+        watcher,
+        deadline,
+        *,
+        status=200,
+        content_type=b"application/octet-stream",
+    ):
+        if status == 200 and self.clock() >= deadline:
+            raise ConditionError("CONDITION_TIMEOUT")
+        sender = asyncio.create_task(
+            self._response(send, status, response, content_type)
+        )
+        try:
+            done, _ = await asyncio.wait(
+                ([sender, watcher] if watcher is not None else [sender]),
+                timeout=max(0, deadline - self.clock()),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if sender in done:
+                return sender.result()
+            if watcher is not None and watcher in done:
+                watcher.result()
+            # Once response headers are sent a JSON error cannot replace them.
+            # Cancel the transport send and end ownership when it disconnects or
+            # stalls beyond the same overall request deadline.
+            raise _Disconnected()
+        finally:
+            await self._cancel_and_drain(sender)
+
+    @staticmethod
+    async def _cancel_and_drain(task):
+        if not task.done():
+            task.cancel()
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # Cancellation of the owner must not abandon a live transport
+                # send or its buffers. The first cancellation still propagates
+                # through the calling finally after this terminal cleanup.
+                continue
+            except Exception:
+                break
+        if not task.cancelled():
+            task.exception()
+
+    def _stats_snapshot(self, principal):
+        selected = (
+            list(self._stats.values())
+            if principal.get("admin")
+            else [self._stats[principal["tenant"]]]
+        )
+        result = {
+            name: sum(stats[name] for stats in selected)
+            for name in (
+                "hit",
+                "miss",
+                "joined",
+                "admission_rejected",
+                "response_bytes",
+            )
+        }
+        # Tenant stats reveal only that tenant's queued work.
+        tenant = None if principal.get("admin") else principal["tenant"]
+        result["queue_depth"] = sum(
+            f.state == "queued"
+            and f.waiters > 0
+            and (tenant is None or f.key[0] == tenant)
+            for f in self.queue.pending
+        )
+        for name in ("encode_ms", "queue_ms"):
+            values = sorted(v for stats in selected for v in stats[name])
+            result[name] = {
+                label: values[min(len(values) - 1, int((len(values) - 1) * fraction))]
+                if values
+                else 0
+                for label, fraction in (("p50", 0.5), ("p95", 0.95), ("p99", 0.99))
+            }
+        return result
+
+    @staticmethod
+    async def _response(send, status, body, content_type):
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [
+                    (b"content-type", content_type),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    async def _json(self, send, status, value):
+        await self._response(send, status, canonical_json(value), b"application/json")
+
+    async def _close(self):
+        requests = list(self._requests)
+        for task in requests:
+            task.cancel()
+        await asyncio.gather(*requests, return_exceptions=True)
+        await self.queue.close()
+        await self.cpu.close()
+
+    async def close(self):
+        self._closed = True
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close())
+        while not self._close_task.done():
+            try:
+                await asyncio.shield(self._close_task)
+            except asyncio.CancelledError:
+                continue
+        self._close_task.result()

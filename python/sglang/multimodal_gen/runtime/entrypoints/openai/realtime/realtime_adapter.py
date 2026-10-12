@@ -9,7 +9,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from fastapi import WebSocket
-
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeEvent,
     RealtimeVideoGenerationsRequest,
@@ -291,6 +290,12 @@ class BaseRealtimeModelAdapter:
     def on_chunk_complete(self, session: GenerateSession, result: OutputBatch) -> None:
         del result
         session.generate_chunk_completed()
+
+    async def prepare_conditioning(self, session, server_args):
+        """Finish API preparation before creating a chunk or consuming input."""
+
+    async def close_conditioning(self, session):
+        """Release API staging after all dispatched worker RPCs drain."""
 
     def clear_state(self, session: GenerateSession) -> None:
         del session
