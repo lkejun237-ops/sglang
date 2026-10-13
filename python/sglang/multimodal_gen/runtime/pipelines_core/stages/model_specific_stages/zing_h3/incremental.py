@@ -19,7 +19,7 @@ from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
 
 from .packing import H3RowRole
 from .realtime import ZingH3RealtimeState
-from .sampling import ZingH3SamplingState
+from .realtime_sampling import ZingH3RealtimeSampler, ZingH3RealtimeSamplingState
 
 
 def _bytes(tensor):
@@ -286,8 +286,11 @@ class SourceReadySession:
         ):
             raise ValueError("Frozen CUDA sampling requires the initial CUDA RNG state")
         sampler.device = ready.noise.device
-        sampler.video_scheduler.to(sampler.device)
-        sampler.audio_scheduler.to(sampler.device)
+        if isinstance(sampler, ZingH3RealtimeSampler):
+            sampler.prepare_schedules(sampler.device)
+        else:
+            sampler.video_scheduler.to(sampler.device)
+            sampler.audio_scheduler.to(sampler.device)
         inputs = copy(self.inputs)
         inputs.positive, inputs.source_visual = prompt[0], ready.source
         visual = ready.noise.float().clone()
@@ -309,13 +312,14 @@ class SourceReadySession:
         if origin is None:
             target = positive["row_role"] == int(H3RowRole.TARGET_VISUAL)
             origin = float(positive["position_ids"][target][0, 0])
-        current = ZingH3SamplingState(
+        current = ZingH3RealtimeSamplingState(
             visual,
             audio,
             positive,
             negative,
             [(ready.chunk.source_block, ready.chunk.target_block, 0, visual.shape[2])],
             self.cache,
+            generation_block_index=int(ready.chunk.chunk_id),
         )
         return current, origin
 
@@ -394,6 +398,11 @@ class SourceReadySession:
                     source, target, start, end = current.spans[0]
                     if first is None:
                         self.cache.prepare_chunk(target)
+                    vs, aus = (
+                        sampler.schedules_for(current)
+                        if isinstance(sampler, ZingH3RealtimeSampler)
+                        else (sampler.video_scheduler, sampler.audio_scheduler)
+                    )
                     lookahead = (
                         sampler.joint_forward == "cross_chunk" and len(self.pending) > 1
                     )
@@ -403,8 +412,8 @@ class SourceReadySession:
                         current.positive,
                         current.negative,
                         self.cache,
-                        sampler.video_scheduler,
-                        sampler.audio_scheduler,
+                        vs,
+                        aus,
                         source,
                         target,
                         start,

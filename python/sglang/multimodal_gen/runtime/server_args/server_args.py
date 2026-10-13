@@ -371,6 +371,11 @@ class ServerArgs(DisaggServerArgsMixin):
     # the 24.2 GiB checkpoint. Expert knobs (GPU slot count, fp32 rebuild)
     # live in envs.py as SGLANG_DIFFUSION_MINIMAX_H3_ADALN_*.
     minimax_h3_adaln_host_cache_gb: float = 8.0
+    # Deployment-owned Zing schedules; None preserves request-level defaults.
+    zing_solver: str | None = None
+    zing_denoising_step_list: list[int] | None = None
+    zing_initial_denoising_step_list: list[int] | None = None
+    zing_initial_block_count: int = 0
     # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
     # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
@@ -692,7 +697,37 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_batching()
         self._validate_breakable_cuda_graph()
         self._validate_minimax_h3_adaln()
+        self._validate_zing_sampling()
         self.pipeline_config.validate_server_args(self)
+
+    def _validate_zing_sampling(self):
+        from sglang.multimodal_gen.configs.zing_sampling import (
+            parse_noise_grid,
+            validate_initial_blocks,
+        )
+
+        self.zing_denoising_step_list = parse_noise_grid(self.zing_denoising_step_list)
+        self.zing_initial_denoising_step_list = parse_noise_grid(
+            self.zing_initial_denoising_step_list
+        )
+        if self.zing_solver not in (None, "euler", "few_step"):
+            raise ValueError("Zing solver must be euler or few_step")
+        if self.zing_denoising_step_list is not None and self.zing_solver != "few_step":
+            raise ValueError("A deployment noise grid requires --zing-solver few_step")
+        if self.zing_solver == "few_step" and self.zing_denoising_step_list is None:
+            raise ValueError("Zing few_step requires an explicit deployment noise grid")
+        validate_initial_blocks(
+            self.zing_solver,
+            self.zing_denoising_step_list,
+            self.zing_initial_denoising_step_list,
+            self.zing_initial_block_count,
+        )
+        if self.zing_initial_block_count and getattr(
+            self.pipeline_config, "zing_adaln_table_path", None
+        ):
+            raise ValueError(
+                "Zing mixed schedules require resident AdaLN projections; offline single-schedule tables are unsupported"
+            )
 
     def _validate_minimax_h3_adaln(self) -> None:
         # Warn, not raise: config-file and from_kwargs construction mark every
@@ -1998,6 +2033,20 @@ class ServerArgs(DisaggServerArgsMixin):
 
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
+        from sglang.multimodal_gen.configs.zing_sampling import parse_noise_grid
+
+        parser.add_argument(
+            "--zing-solver", choices=["euler", "few_step"], default=None
+        )
+        parser.add_argument(
+            "--zing-denoising-step-list", type=parse_noise_grid, default=None
+        )
+        parser.add_argument(
+            "--zing-initial-denoising-step-list", type=parse_noise_grid, default=None
+        )
+        parser.add_argument(
+            "--zing-initial-block-count", type=int, choices=[0, 3], default=0
+        )
         parser.add_argument(
             "--zing-conditioning-mode",
             choices=("local", "remote"),

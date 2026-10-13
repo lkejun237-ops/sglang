@@ -374,7 +374,7 @@ def test_source_s0_uses_memory_unless_video_is_explicit(explicit_video):
 
     stage = NS(
         _validate_sampling_params=lambda params: None,
-        _build_sampler=lambda params: NS(
+        _build_realtime_sampler=lambda params: NS(
             window_policy=NS(window_chunks=21, sink_chunks=3),
             rope_position_mode="block_relative",
             rope_max_frame_gap=12,

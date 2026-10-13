@@ -396,6 +396,42 @@ class ZingH3GenerationStage(PipelineStage):
             rope_max_frame_gap=getattr(params, "zing_rope_max_frame_gap", 12),
         )
 
+    def _build_realtime_sampler(self, params):
+        from .realtime_sampling import ZingH3RealtimeSampler
+
+        # Validate sampling settings before encoding inputs or loading the DiT.
+        deployment = getattr(self, "deployment_sampling", {})
+        solver = deployment.get("solver") or getattr(params, "zing_solver", "euler")
+        grid = (
+            deployment.get("denoising_step_list")
+            if deployment.get("solver") is not None
+            else getattr(params, "zing_denoising_step_list", None)
+        )
+        return ZingH3RealtimeSampler(
+            self.modules["transformer"],
+            self.packer,
+            solver=solver,
+            sigma_points=params.num_inference_steps,
+            denoising_step_list=grid,
+            initial_denoising_step_list=deployment.get("initial_denoising_step_list"),
+            initial_block_count=deployment.get("initial_block_count", 0),
+            video_shift=self.runtime["timestep_shift"],
+            audio_shift=self.runtime["audio_timestep_shift"],
+            num_train_timesteps=self.runtime["num_train_timestep"],
+            ar_condition_timestep=self.runtime.get("ar_condition_timestep", 1.0),
+            reference_visual_timestep=self.runtime.get(
+                "reference_visual_timestep", 1.0
+            ),
+            guidance_scale=params.guidance_scale,
+            joint_forward=getattr(params, "zing_joint_forward", "cross_chunk"),
+            window_chunks=getattr(params, "zing_window_chunks", 21),
+            sink_chunks=getattr(params, "zing_sink_chunks", 3),
+            rope_position_mode=getattr(
+                params, "zing_rope_position_mode", "block_relative"
+            ),
+            rope_max_frame_gap=getattr(params, "zing_rope_max_frame_gap", 12),
+        )
+
     @torch.no_grad()
     @diagnostic_request
     def forward(self, batch, server_args):
@@ -549,7 +585,7 @@ class ZingH3GenerationStage(PipelineStage):
         if state.sampling is None:
             if batch.block_idx != 0:
                 raise ValueError("Zing realtime session must start at block zero")
-            state.sampler = self._build_sampler(params)
+            state.sampler = self._build_realtime_sampler(params)
             request = self._build_request(batch)
             with stage_span(
                 trace,

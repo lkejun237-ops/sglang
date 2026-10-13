@@ -9,6 +9,7 @@ from contextlib import closing, contextmanager, nullcontext
 
 import psutil
 import torch
+
 from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.realtime.session import BaseRealtimeState
@@ -52,7 +53,7 @@ class ZingSourceStreamState(BaseRealtimeState):
     def initialize(self, stage, batch, config):
         params = batch.sampling_params
         stage._validate_sampling_params(params)
-        sampler = stage._build_sampler(params)
+        sampler = stage._build_realtime_sampler(params)
         if sampler.window_policy.window_chunks is None:
             raise ValueError("Continuous source requires a bounded attention window")
         self.policy = {

@@ -228,6 +228,7 @@ class ZingH3CausalPipeline(ComposedPipelineBase):
         config = server_args.pipeline_config
         if config.video_decoder_backend == "taeh3":
             import torch
+
             from sglang.multimodal_gen.runtime.models.vaes.taeh3 import (
                 WEIGHTS_SHA256,
                 TAEH3Decoder,
@@ -255,6 +256,14 @@ class ZingH3CausalPipeline(ComposedPipelineBase):
             local_cache_bytes=server_args.zing_conditioning_local_cache_bytes,
         )
         stage.conditioning_loader_receipt = self.conditioning_loader_receipt
+        stage.deployment_sampling = {
+            "solver": server_args.zing_solver,
+            "denoising_step_list": server_args.zing_denoising_step_list,
+            "initial_denoising_step_list": server_args.zing_initial_denoising_step_list,
+            "initial_block_count": server_args.zing_initial_block_count,
+        }
+        # Materialize and validate both grids before accepting generations.
+        stage._build_realtime_sampler(ZingH3SamplingParams())
         # Realtime KV slots are allocated here, before the worker is ready.
         stage.initialize_realtime_kv_cache_pool(server_args)
         self.add_stage(stage)
