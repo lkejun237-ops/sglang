@@ -6,6 +6,7 @@ from contextlib import contextmanager, nullcontext
 from copy import copy
 
 import torch
+
 from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
 from sglang.multimodal_gen.runtime.conditioning.worker import (
     LocalConditioner,
@@ -744,8 +745,15 @@ class ZingH3GenerationStage(PipelineStage):
         return outputs, height, width
 
     def _generate_realtime_block(self, batch, state):
-        params = batch.sampling_params
         trace = trace_for_batch(batch)
+        try:
+            return self._generate_realtime_block_traced(batch, state, trace)
+        finally:
+            if trace is not None:
+                trace.finish()
+
+    def _generate_realtime_block_traced(self, batch, state, trace):
+        params = batch.sampling_params
         request_id = batch.realtime_session_id
         measure_cuda = trace is not None and trace.measure_cuda
         mode = self._prepare_realtime_state(batch, state, trace)

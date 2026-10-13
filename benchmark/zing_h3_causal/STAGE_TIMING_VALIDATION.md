@@ -11,8 +11,10 @@ SP2 GPU 内完成全部编码、DiT 与解码。三个模式各自启动常驻�
 | cuda | 3/3 | 11.6264 | 21.2319 | 5.6519 | 0.4572 |
 
 所有 12 次请求（包含 3 次预热）均输出 120 帧、22 个客户端 frame batch。
-host/cuda 分别保留 312 条阶段记录：每请求、每 rank 各有 8 个 Encoder、15 个
-DiT、15 个 Decoder 和 1 个整体 Conditioning 区间。货号、连续 latent/frame
+host/cuda 分别保留 312 条阶段记录：每请求、每 rank 各有 8 个 Encoder、22 个
+DiT、8 个 Decoder 和 1 个整体 Conditioning 区间。2026-10-12 对照原始 JSONL
+及当时的 stage-validation.json 更正了此前误写的 15/15；312 总数和计时数值不变。
+货号、连续 latent/frame
 范围、每个 Decoder 输出 block 与客户端帧范围均核验通过；CUDA 区间完整。
 九个正式输出的原始 RGB SHA 相同，转换后的九个 MP4 均为 832×480 / 24 FPS，
 通过 120 帧计数及完整解码检查。这是技术完整性证据，人工画质验收待观看。

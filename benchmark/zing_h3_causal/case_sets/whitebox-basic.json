@@ -1,0 +1,21 @@
+{
+  "name": "whitebox-basic",
+  "cases": [
+    {
+      "manifest": "benchmark/zing_h3_causal/whitebox_video_smoke_cases.jsonl",
+      "case_id": "zing-whitebox-video-five-triview-0001"
+    },
+    {
+      "manifest": "benchmark/zing_h3_causal/whitebox_video_long_cases.jsonl",
+      "case_id": "zing-whitebox-video-30s-six-triview-0001"
+    },
+    {
+      "manifest": "benchmark/zing_h3_causal/whitebox_video_long_cases.jsonl",
+      "case_id": "zing-whitebox-video-30s-six-triview-0002"
+    },
+    {
+      "manifest": "benchmark/zing_h3_causal/whitebox_video_long_cases.jsonl",
+      "case_id": "zing-whitebox-video-30s-two-triview-0001"
+    }
+  ]
+}

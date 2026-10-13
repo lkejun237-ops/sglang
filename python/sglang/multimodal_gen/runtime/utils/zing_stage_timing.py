@@ -5,11 +5,13 @@ Host return and GPU tensor handoff do not imply device completion. CUDA events
 cover only the current device/stream and are never mapped onto the host clock.
 """
 
+import asyncio
 import json
 import os
 import queue
 import threading
 import time
+from collections import Counter
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
@@ -105,6 +107,7 @@ class Span:
     def emit(self):
         if not self.sent:
             self.sent = True
+            self.trace.emitted += 1
             self.trace.submit((self.row, self.start, self.end))
 
 
@@ -127,7 +130,20 @@ class StageTrace:
         }
         self.submit, self.clock, self.event_factory = submit, clock, event_factory
         self.measure_cuda = measure_cuda
-        self.sequence = 0
+        self.sequence = self.emitted = 0
+
+    def finish(self):
+        self.submit(
+            (
+                {
+                    **self.identity,
+                    "kind": "dispatch_complete",
+                    "span_count": self.emitted,
+                },
+                None,
+                None,
+            )
+        )
 
     @contextmanager
     def span(self, stage, *, cuda=False, **fields):
@@ -166,12 +182,27 @@ class Writer:
 
     def run(self):
         pending = []
+        profile = None
         try:
             with self.path.open("a", encoding="utf-8") as file:
                 while not self.stop.is_set() or pending or not self.queue.empty():
                     if len(pending) < self.capacity:
                         try:
                             item = self.queue.get(timeout=0.01)
+                            row = item[0]
+                            if row.get("request_id") is not None and (
+                                profile is None
+                                or profile["request_id"] != row["request_id"]
+                                or profile.get("generation_id")
+                                != row.get("generation_id")
+                            ):
+                                profile = {
+                                    "request_id": row["request_id"],
+                                    "generation_id": row.get("generation_id"),
+                                    "rank": row.get("rank"),
+                                    "pid": os.getpid(),
+                                    "dispatches": {},
+                                }
                             pending.append((time.monotonic(), item))
                         except queue.Empty:
                             pass
@@ -179,6 +210,25 @@ class Writer:
                         self.stop.wait(0.01)
                     retained = []
                     for added, (row, start, end) in pending:
+                        if row.get("kind") == "dispatch_complete":
+                            # A marker is publishable only after earlier spans from
+                            # this dispatch have resolved, including CUDA events.
+                            if any(
+                                r.get("request_id") == row["request_id"]
+                                and r.get("dispatch_id") == row["dispatch_id"]
+                                for _, (r, _, _) in retained
+                            ):
+                                retained.append((added, (row, start, end)))
+                            elif (
+                                profile
+                                and profile["request_id"] == row["request_id"]
+                                and profile.get("generation_id")
+                                == row.get("generation_id")
+                            ):
+                                profile["dispatches"][row["dispatch_id"]] = row[
+                                    "span_count"
+                                ]
+                            continue
                         if not resolve_cuda(row, start, end):
                             if time.monotonic() - added < self.event_timeout:
                                 retained.append((added, (row, start, end)))
@@ -196,6 +246,7 @@ class Writer:
                             "pending": len(pending),
                             "queued": self.queue.qsize(),
                             "error": None,
+                            "profile": profile,
                         },
                     )
         except Exception as exc:
@@ -231,6 +282,7 @@ def trace_for_batch(batch):
     identity = {
         "pid": os.getpid(),
         "rank": rank,
+        "generation_id": getattr(batch, "realtime_generation_id", None),
         "device": torch.cuda.current_device() if torch.cuda.is_available() else None,
         "host": os.uname().nodename,
         "clock_domain": f"CLOCK_MONOTONIC:{boot.read_text().strip() if boot.exists() else 'unknown'}",
@@ -255,3 +307,106 @@ def stage_span(trace, stage, **fields):
 def handoff(span, **fields):
     if span is not None:
         span.handoff(**fields)
+
+
+def _profile_snapshots(directory, request_id, generation_id):
+    snapshots = {}
+    for path in Path(directory).glob("stage-timing-pid*-health.json"):
+        value = json.loads(path.read_text()).get("profile")
+        if (
+            value
+            and value["request_id"] == request_id
+            and (generation_id is None or value.get("generation_id") == generation_id)
+        ):
+            snapshots[value["rank"]] = value
+    return snapshots
+
+
+async def collect_profile(
+    directory, request_id, ranks, dispatch_count, *, generation_id=None, timeout=35
+):
+    """Read this session after each rank's asynchronous writer has drained it."""
+    started = time.monotonic()
+    snapshots = {}
+    error = None
+    while True:
+        try:
+            snapshots = await asyncio.to_thread(
+                _profile_snapshots, directory, request_id, generation_id
+            )
+        except (OSError, ValueError):
+            error = "Stage collector snapshots could not be read."
+        complete = all(
+            rank in snapshots and len(snapshots[rank]["dispatches"]) == dispatch_count
+            for rank in ranks
+        )
+        if complete or time.monotonic() - started >= timeout:
+            break
+        await asyncio.sleep(0.05)
+    stages = []
+    try:
+        for path in Path(directory).glob("stage-timing-pid*.jsonl"):
+            with path.open() as source:
+                for line in source:
+                    row = json.loads(line)
+                    if (
+                        row.get("request_id") == request_id
+                        and row.get("rank") in ranks
+                        and (
+                            generation_id is None
+                            or row.get("generation_id") == generation_id
+                        )
+                    ):
+                        stages.append(row)
+    except (OSError, ValueError):
+        error = "Stage records could not be read."
+    counts = Counter((row["rank"], row["dispatch_id"]) for row in stages)
+    health = []
+    dispatch_sets = []
+    for rank in ranks:
+        snapshot = snapshots.get(rank, {})
+        dispatches = snapshot.get("dispatches", {})
+        dispatch_sets.append(set(dispatches))
+        missing = sum(
+            max(0, expected - counts[rank, dispatch])
+            for dispatch, expected in dispatches.items()
+        )
+        complete = (
+            complete
+            and not missing
+            and all(
+                counts[rank, dispatch] == expected
+                for dispatch, expected in dispatches.items()
+            )
+        )
+        health.append(
+            {
+                "rank": rank,
+                "pid": snapshot.get("pid"),
+                "request_id": request_id,
+                "written": sum(n for (r, _), n in counts.items() if r == rank),
+                "dropped": missing,
+                "pending": max(0, dispatch_count - len(dispatches)),
+                "queued": 0,
+                "error": error,
+            }
+        )
+    complete = (
+        complete and all(s == dispatch_sets[0] for s in dispatch_sets) and not error
+    )
+    complete = complete and all(
+        row.get("cuda_status") not in {"pending", "error", "timeout"}
+        and row.get("status", "ok") == "ok"
+        for row in stages
+    )
+    return {
+        "type": "profile_result",
+        "session_id": request_id,
+        "generation_id": generation_id,
+        "status": "complete" if complete else "incomplete",
+        "expected_ranks": ranks,
+        "missing_ranks": [r for r in ranks if r not in snapshots],
+        "stages": stages,
+        "health": health,
+        "wait_seconds": time.monotonic() - started,
+    }

@@ -19,6 +19,7 @@ import threading
 import time
 from pathlib import Path
 
+from case_sets import load_case_set
 from prepare_whitebox_video_smoke import (
     expected_assets,
     load_cases,
@@ -29,8 +30,70 @@ from prepare_whitebox_video_smoke import (
 HERE = Path(__file__).resolve().parent
 CASES = {
     "5s": ("zing-whitebox-video-five-triview-0001", 120),
+    "30s-wasteland": ("zing-whitebox-video-30s-six-triview-0001", 720),
+    "30s-town": ("zing-whitebox-video-30s-six-triview-0002", 720),
+    "30s-indoor": ("zing-whitebox-video-30s-two-triview-0001", 720),
     "30s": ("zing-whitebox-video-30s-six-reference-0001", 720),
 }
+DEFAULT_CASES = ("5s", "30s-wasteland", "30s-town", "30s-indoor")
+REFERENCE_COUNTS = {
+    "5s": 6,
+    "30s-wasteland": 7,
+    "30s-town": 7,
+    "30s-indoor": 3,
+    "30s": 6,
+}
+
+
+def default_manifest(label):
+    return HERE / (
+        "whitebox_video_smoke_cases.jsonl"
+        if label == "5s"
+        else "whitebox_video_30s_cases.jsonl"
+        if label == "30s"
+        else "whitebox_video_long_cases.jsonl"
+    )
+
+
+def select_cases(args):
+    if args.case != "all":
+        label = args.case
+        manifest = getattr(
+            args,
+            "manifest_long" if label in DEFAULT_CASES[1:] else f"manifest_{label}",
+            default_manifest(label),
+        )
+        return None, [(label, manifest, CASES[label][0])]
+    collection = load_case_set(args.case_set or "whitebox-basic")
+    aliases = {case_id: label for label, (case_id, _) in CASES.items()}
+    selected = [
+        (
+            aliases.get(member["case_id"], f"case-{index + 1}"),
+            member["manifest"],
+            member["case_id"],
+        )
+        for index, member in enumerate(collection["members"])
+    ]
+    if not args.case_set:
+        selected = [
+            (
+                label,
+                getattr(
+                    args,
+                    "manifest_long"
+                    if label in DEFAULT_CASES[1:]
+                    else f"manifest_{label}",
+                    manifest,
+                ),
+                case_id,
+            )
+            for label, manifest, case_id in selected
+        ]
+    return {
+        key: value for key, value in collection.items() if key != "members"
+    }, selected
+
+
 SAMPLING_FIELDS = {
     "seed",
     "num_inference_steps",
@@ -91,6 +154,8 @@ class Delivery:
         self.block, self.part, self.parts = 0, 0, None
         self.block_request_id = None
         self.chunks = []
+        self.profile = None
+        self.profile_wait_seconds = None
 
     def accept(self, header, payload, arrival):
         count = header.get("num_frames")
@@ -166,9 +231,9 @@ class Delivery:
             raise ValueError("Generation ended with missing frames or split batches")
 
 
-def prepare_case(label, manifest, media_root, sampling):
+def prepare_case(label, manifest, media_root, sampling, case_id=None):
     """Prepare once outside timing; preserve the canonical request's semantics."""
-    case_id, frames = CASES[label]
+    case_id = case_id or CASES[label][0]
     if not manifest.is_file():
         raise ValueError(f"Fixed {label} manifest is unavailable: {manifest}")
     cases = load_cases(manifest)
@@ -178,6 +243,8 @@ def prepare_case(label, manifest, media_root, sampling):
     user, target = case["messages"]
     conditions = target.get("conditions", [])
     content = target.get("content", [])
+    frames = CASES[label][1] if label in CASES else content[0]["output"]["frames"]
+    references = REFERENCE_COUNTS[label] if label in CASES else len(conditions)
     if (
         user.get("role") != "user"
         or target.get("role") != "target"
@@ -185,24 +252,24 @@ def prepare_case(label, manifest, media_root, sampling):
         or content[0].get("type") != "video"
         or content[0].get("output", {}).get("frames") != frames
         or target.get("source", {}).get("type") != "video"
-        or len(conditions) != 6
+        or len(conditions) != references
         or any(c.get("latent_modalities") != ["visual"] for c in conditions)
-        or len({c.get("content_id") for c in conditions}) != 6
+        or len({c.get("content_id") for c in conditions}) != references
     ):
-        raise ValueError(f"Fixed {label} source/six-reference contract does not match")
+        reference_name = {6: "six", 7: "seven"}.get(references, str(references))
+        raise ValueError(
+            f"Fixed {label} source/{reference_name}-reference contract does not match"
+        )
     media = {c.get("id"): c for c in user.get("content", []) if "id" in c}
     if any(
         media.get(c.get("content_id"), {}).get("type") != "image" for c in conditions
     ):
-        raise ValueError("Reference conditions do not map to six images")
+        raise ValueError("Reference conditions do not map to the expected images")
     contract = case.get("metadata", {}).get("smoke_contract", {})
-    if contract.get("target", {}).get("fps") != 24:
+    if contract and contract.get("target", {}).get("fps") != 24:
         raise ValueError("Fixed payload must declare 24 FPS")
-    if (
-        label == "5s"
-        and case != load_cases(HERE / "whitebox_video_smoke_cases.jsonl")[case_id]
-    ):
-        raise ValueError("Fixed 5s payload differs from the repository case")
+    if label in DEFAULT_CASES and case != load_cases(default_manifest(label))[case_id]:
+        raise ValueError(f"Fixed {label} payload differs from the repository case")
     request = copy.deepcopy(case)
     replacements, receipts = {}, []
     for uri, asset in expected_assets(case).items():
@@ -245,6 +312,7 @@ def prepare_case(label, manifest, media_root, sampling):
     return {
         "label": label,
         "case_id": case_id,
+        "reference_count": references,
         "input_revision": case.get("provenance", {}).get("input_revision"),
         "manifest": str(manifest.resolve()),
         "manifest_sha256": sha256_file(manifest),
@@ -318,6 +386,29 @@ async def receive(ws, delivery, started, clock=time.perf_counter, sink=None):
         kind = message.get("type")
         if kind == "error":
             raise RuntimeError(message.get("content", "Generation failed"))
+        if kind == "profile_result":
+            delivery.complete()
+            session_id = message.get("session_id")
+            dispatches = {row["server_request_id"] for row in delivery.chunks}
+            if (
+                delivery.profile is not None
+                or not isinstance(session_id, str)
+                or not session_id
+                or any(
+                    not dispatch.startswith(session_id + "_") for dispatch in dispatches
+                )
+                or any(
+                    row.get("request_id") != session_id
+                    or row.get("dispatch_id") not in dispatches
+                    for row in message.get("stages", [])
+                )
+            ):
+                raise ValueError("Stage profile does not match the completed session")
+            delivery.profile = message
+            delivery.profile_wait_seconds = (
+                received - started - delivery.chunks[-1]["arrival_seconds"]
+            )
+            continue
         if kind == "frame_batch_header":
             payload = await ws.recv()
             received = clock()
@@ -337,7 +428,10 @@ async def run_request(case, args, phase, index):
     request_id = f"{case['label']}-{phase}-{index:03d}"
     delivery = Delivery(case["frames"], case["width"], case["height"])
     # Serialization and connection setup are outside request timing.
-    payload = msgpack.packb(case["init"], use_bin_type=True)
+    init = dict(case["init"])
+    if getattr(args, "receive_stage_timing", False):
+        init["return_stage_timing"] = True
+    payload = msgpack.packb(init, use_bin_type=True)
     sink = MediaSink(args.output_dir / f"{request_id}.rgb") if args.save_media else None
     result = {
         "request_id": request_id,
@@ -387,6 +481,18 @@ async def run_request(case, args, phase, index):
             except Exception as exc:
                 result["success"] = False
                 result["error"] = f"{type(exc).__name__}: {exc}"
+    if delivery.profile is not None:
+        profiles = args.output_dir / "profiles"
+        profiles.mkdir(exist_ok=True)
+        write_json(profiles / f"{request_id}.json", delivery.profile)
+    result["profile_status"] = (
+        delivery.profile["status"]
+        if delivery.profile is not None
+        else "missing"
+        if getattr(args, "receive_stage_timing", False)
+        else "not_requested"
+    )
+    result["profile_wait_seconds"] = delivery.profile_wait_seconds
     result["output_frames"] = delivery.frames
     result["chunk_count"] = len(delivery.chunks)
     result["metrics"] = calculate_metrics(delivery.chunks)
@@ -478,12 +584,19 @@ def parser():
     result.add_argument(
         "--url", default="ws://127.0.0.1:30000/v1/realtime_video/generate"
     )
-    result.add_argument("--case", choices=["all", *CASES], default="all")
+    selection = result.add_mutually_exclusive_group()
+    selection.add_argument("--case", choices=["all", *CASES], default="all")
+    selection.add_argument(
+        "--case-set", help="Collection name or JSON file; default: whitebox-basic"
+    )
     result.add_argument(
         "--manifest-5s", type=Path, default=HERE / "whitebox_video_smoke_cases.jsonl"
     )
     result.add_argument(
         "--manifest-30s", type=Path, default=HERE / "whitebox_video_30s_cases.jsonl"
+    )
+    result.add_argument(
+        "--manifest-long", type=Path, default=HERE / "whitebox_video_long_cases.jsonl"
     )
     result.add_argument("--media-root", required=True, type=Path)
     result.add_argument("--sampling-params", required=True, type=Path)
@@ -505,12 +618,17 @@ def parser():
         action="store_true",
         help="Save RGB through a bounded background writer",
     )
+    result.add_argument(
+        "--receive-stage-timing",
+        action="store_true",
+        help="Receive this session's server stage profile before normal close",
+    )
     result.add_argument("--preflight-only", action="store_true")
     return result
 
 
-def main():
-    args = parser().parse_args()
+def main(argv=None):
+    args = parser().parse_args(argv)
     if (
         args.warmup_runs < 1
         or args.measured_runs < 1
@@ -529,18 +647,10 @@ def main():
             raise ValueError(
                 "Provide explicit seed/num_inference_steps and supported sampling fields only"
             )
-        labels = list(CASES) if args.case == "all" else [args.case]
-        # Missing contracts fail before network/GPU use, including absent 30s.
-        for label in labels:
-            if not getattr(args, f"manifest_{label}").is_file():
-                raise ValueError(
-                    f"Fixed {label} manifest is unavailable; no substitute is permitted"
-                )
+        collection, selected = select_cases(args)
         cases = [
-            prepare_case(
-                label, getattr(args, f"manifest_{label}"), args.media_root, sampling
-            )
-            for label in labels
+            prepare_case(label, manifest, args.media_root, sampling, case_id)
+            for label, manifest, case_id in selected
         ]
         deployment = json.loads(args.deployment.read_text())
         if not isinstance(deployment, dict) or not deployment:
@@ -570,6 +680,8 @@ def main():
             "input_mode": "complete_source_via_server_readable_local_URIs; not_source_append",
             "ifl": "not_measured_no_individual_frame_timestamps",
             "cases": cases,
+            "case_set": collection,
+            "receive_stage_timing": args.receive_stage_timing,
         }
         write_json(args.output_dir / "config.json", config)
         if not args.preflight_only and not asyncio.run(benchmark(cases, args)):

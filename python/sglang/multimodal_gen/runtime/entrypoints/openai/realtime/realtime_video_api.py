@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import os
 import shutil
 import time
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from uuid import uuid4
 
 import msgspec.msgpack
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ReleaseRealtimeSessionReq,
     ReplaceQueuedRealtimeReq,
@@ -2003,6 +2005,41 @@ async def _close_realtime_websocket(
         pass
 
 
+async def _send_stage_profile(
+    websocket, session_id, dispatch_count, generation_id=None
+):
+    from sglang.multimodal_gen.runtime.utils.zing_stage_timing import collect_profile
+
+    directory = os.environ.get("SGLANG_ZING_STAGE_TIMING_DIR")
+    if os.environ.get("SGLANG_ZING_STAGE_TIMING", "off") == "off" or not directory:
+        profile = {
+            "type": "profile_result",
+            "session_id": session_id,
+            "status": "disabled",
+            "stages": [],
+            "health": [],
+        }
+    else:
+        try:
+            profile = await collect_profile(
+                directory,
+                session_id,
+                list(range(get_global_server_args().num_gpus)),
+                dispatch_count,
+                generation_id=generation_id,
+            )
+        except Exception:
+            logger.exception("Failed to collect session stage profile")
+            profile = {
+                "type": "profile_result",
+                "session_id": session_id,
+                "status": "error",
+                "stages": [],
+                "health": [{"error": "Stage timing could not be collected."}],
+            }
+    await websocket.send_bytes(msgspec.msgpack.encode(profile))
+
+
 async def _cleanup_realtime_session_then_close(
     websocket: WebSocket,
     session: GenerateSession,
@@ -2017,6 +2054,15 @@ async def _cleanup_realtime_session_then_close(
     # The active-session watchdog has stopped, but an in-flight GPU block can
     # outlive the lease TTL. Reuse its renewal while existing cleanup drains;
     # this does not extend the client's idle or playable lifetime.
+    request = getattr(session, "request", None)
+    profile_args = (
+        (session.id, session.next_chunk_index, getattr(session, "generation_id", None))
+        if (
+            close_after_cleanup == (1000, "generation complete")
+            and getattr(request, "return_stage_timing", False)
+        )
+        else None
+    )
     renewal = None
     if controller is not None and lease is not None:
         renewal = asyncio.create_task(
@@ -2033,7 +2079,13 @@ async def _cleanup_realtime_session_then_close(
         await _cleanup_realtime_session(session, generate_task, listen_task)
         if close_after_cleanup is not None:
             code, reason = close_after_cleanup
-            await _close_realtime_websocket(websocket, code=code, reason=reason)
+            try:
+                if profile_args is not None:
+                    await _send_stage_profile(websocket, *profile_args)
+            except (WebSocketDisconnect, RuntimeError, OSError):
+                logger.info("Client disconnected before stage profile delivery")
+            finally:
+                await _close_realtime_websocket(websocket, code=code, reason=reason)
     finally:
         if renewal is not None:
             renewal.cancel()

@@ -1,3 +1,21 @@
+## 2026-10-12 三 case 扩展
+
+当前默认矩阵是海岸 5s（六图）、废土和地中海小镇 30s（七图），身份见
+[客户端说明](CLIENT_BENCHMARK.md)。以下旧版 5s 采集说明保留作历史语义参考。
+main 的 conditioner 回调路径在本地执行 Qwen，但不产生独立 Qwen Encoder span；
+整体 Conditioning host 区间仍包括该回调。本轮 VAE Encoder（参考 + source）、
+DiT、Decoder 独立验收，Qwen 时间标为未测，不伪造 CUDA 结果。
+
+```bash
+python3 benchmark/zing_h3_causal/analyze_stage_timing.py \
+  /path/to/run/gpu/30s-wasteland --case 30s-wasteland \
+  --qwen-scope conditioner-unmeasured --output /path/to/stage-validation.json
+```
+
+这不是静默放宽：分析器明确要求 Qwen span 为零并记录未测口径；所有 VAE 条件数、
+帧/latent 连续性、货号、rank、CUDA 和 health 约束继续严格核验。
+旧版实际采集到一个本地 Qwen span 的工件使用 `--qwen-scope local-span`。
+
 # 固定 5s 模型阶段计时
 
 第一轮只覆盖有限视频接口。请求、source、六项参考条件、采样和 Decoder 均保持
@@ -12,6 +30,14 @@
 描述需要更正为有限接口、本地编码、DiT SP2；原客户端接收指标仍有效。
 本轮不启动闲置 Encoder 服务。资源池采用四卡规格，实际模型阶段运行在两张
 SP2 卡上，另外两卡空闲。
+
+## 阶段数据回传
+
+客户端可通过 `--receive-stage-timing` 请求本次会话的阶段记录；checkpoint 入口开启
+`--stage-timing host|cuda` 时自动启用。服务器在正常清理后、关闭 WebSocket 前发送
+`profile_result`，包含各 rank 的原始 spans、采集状态与完整性信息。
+客户端保存在 `profiles/`，报告构建器优先使用这些回传数据，无需服务端文件权限。
+结果网页的 JSON 格式与布局保持不变，详见 [客户端用法](CLIENT_BENCHMARK.md)。
 
 ## 采集和事件语义
 

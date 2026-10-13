@@ -180,6 +180,7 @@ class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
     guidance_scale: Optional[float] = 1.0
     size: Optional[str] = "832x480"
     profile: Optional[bool] = False
+    return_stage_timing: bool = False
     num_profiled_timesteps: Optional[int] = None
     profile_all_stages: Optional[bool] = False
     realtime_output_format: Optional[Literal["raw", "webp", "jpeg"]] = None

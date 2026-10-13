@@ -113,3 +113,78 @@ def test_incomplete_or_misattributed_evidence_cannot_pass(ledger, fault):
     path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     with pytest.raises(ValueError):
         analyze(directory)
+
+
+def test_long_seven_reference_ledger_uses_exact_contract(ledger):
+    directory, path, rows = ledger
+    chunk = json.loads((directory / "client/chunks.jsonl").read_text())
+    chunk["num_frames"] = 720
+    (directory / "client/chunks.jsonl").write_text(json.dumps(chunk) + "\n")
+    for rank in (0, 1):
+        extra = next(
+            r
+            for r in rows
+            if r["rank"] == rank and r.get("component") == "reference_vae"
+        ).copy()
+        extra["span_id"] = f"{rank}:encoder:seventh"
+        rows.append(extra)
+    for row in rows:
+        if row["stage"] == "Decoder":
+            row["output_frame_range"] = [0, 720]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    assert analyze(directory, expected_frames=720, expected_references=7)["valid"]
+    with pytest.raises(ValueError, match="incomplete"):
+        analyze(directory)
+
+
+def test_conditioner_without_qwen_span_requires_explicit_unmeasured_scope(ledger):
+    directory, path, rows = ledger
+    rows = [r for r in rows if r.get("component") != "qwen"]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    with pytest.raises(ValueError, match="Encoder coverage"):
+        analyze(directory)
+    report = analyze(directory, expected_qwen=0)
+    assert report["valid"]
+    assert report["qwen_scope"] == "not_measured_conditioner_callback"
+    assert report["requests"][0]["stages"]["Encoder"]["count"] == 7
+
+
+def test_indoor_three_reference_case_is_supported_by_analysis_cli(ledger):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    directory, path, rows = ledger
+    chunk_path = directory / "client/chunks.jsonl"
+    chunk = json.loads(chunk_path.read_text())
+    chunk["num_frames"] = 720
+    chunk_path.write_text(json.dumps(chunk) + "\n")
+    rows = [
+        r
+        for r in rows
+        if r.get("component") != "qwen"
+        and not (
+            r.get("component") == "reference_vae"
+            and int(r["span_id"].rsplit(":", 1)[1]) > 3
+        )
+    ]
+    for row in rows:
+        if row["stage"] == "Decoder":
+            row["output_frame_range"] = [0, 720]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    output = directory / "analysis.json"
+    subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve().parents[1] / "analyze_stage_timing.py"),
+            str(directory),
+            "--case",
+            "30s-indoor",
+            "--output",
+            str(output),
+        ],
+        check=True,
+    )
+    report = json.loads(output.read_text())
+    assert report["valid"]
+    assert report["requests"][0]["stages"]["Encoder"]["count"] == 4

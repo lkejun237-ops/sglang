@@ -3,7 +3,7 @@
   "metadata": {
     "integration_sha": "3c070f06ba3d25775f27dcde3b4e1258787cfd57",
     "historical_pr272_reference_sha": "25a540d2836435b28df9c6b307af528f97153805",
-    "scope": "96 approved Linux CPU candidates: 71 ordinary and complete 25-file conditioning. Latest main lifecycle tests included; GPU smoke deferred."
+    "scope": "98 approved Linux CPU candidates: 73 ordinary and complete 25-file conditioning. PR #283 client, timing, report and checkpoint-entry tests included; GPU smoke deferred."
   },
   "tests": [
     {
@@ -1155,37 +1155,37 @@
       "sources": [
         "main"
       ],
-      "reason": "Two fresh Alibaba Linux CPU process trials passed after main integration.",
+      "reason": "Two fresh local Linux Python 3.11 CPU process trials passed against the pinned suite recipe after PR #283 main integration.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "849db385c9e688bdf9db5c64b1b7b69900f840087d8c220943e9ad247f2d5a7b",
-        "receipt": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/taeh3-contracts-0/receipt.json",
-        "receipt_sha256": "a56a2257f966ceb2256865c3b6f1343ce1d6d8fe959ef199a5f2639a99f05c23",
+        "source_sha256": "0e811757fb7039016405233b03b6f3631e0f262b3c0fb42cae57cc3f8eebaf3f",
+        "receipt": "/home/ss80194/work/sglang-zing/exports/issue283-ci-main-20261012/taeh3-contracts/receipt.json",
+        "receipt_sha256": "156501bb36870e90df5027a32ef6fd74758b305c23f3a0de969bcea237c8df98",
         "trials": [
           {
             "trial": 1,
-            "passed": 5,
-            "collected": 5,
+            "passed": 7,
+            "collected": 7,
             "skipped": 0,
-            "duration_seconds": 0.8101197450887412,
+            "duration_seconds": 0.614207623002585,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/taeh3-contracts-0/cpu-2-trial-1.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/taeh3-contracts-0/cpu-2-trial-1.xml"
+            "log_path": "/home/ss80194/work/sglang-zing/exports/issue283-ci-main-20261012/taeh3-contracts/cpu-0-trial-1.log",
+            "junit_path": "/home/ss80194/work/sglang-zing/exports/issue283-ci-main-20261012/taeh3-contracts/cpu-0-trial-1.xml"
           },
           {
             "trial": 2,
-            "passed": 5,
-            "collected": 5,
+            "passed": 7,
+            "collected": 7,
             "skipped": 0,
-            "duration_seconds": 0.9139075709972531,
+            "duration_seconds": 0.24620023999887053,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/taeh3-contracts-0/cpu-2-trial-2.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/taeh3-contracts-0/cpu-2-trial-2.xml"
+            "log_path": "/home/ss80194/work/sglang-zing/exports/issue283-ci-main-20261012/taeh3-contracts/cpu-0-trial-2.log",
+            "junit_path": "/home/ss80194/work/sglang-zing/exports/issue283-ci-main-20261012/taeh3-contracts/cpu-0-trial-2.xml"
           }
         ],
         "environment": {
-          "python": "3.11.12",
-          "platform": "Linux-6.6.102-001.8.100.kangaroo.al8.x86_64-x86_64-with-glibc2.39"
+          "python": "3.11.15",
+          "platform": "Linux-6.6.114.1-microsoft-standard-WSL2-x86_64-with-glibc2.35"
         },
         "environment_recipe": {
           "python_version": "3.11",
@@ -1194,16 +1194,17 @@
             "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
           }
         },
-        "manifest_sha256": "4abd3c0a8465905e4340d8303ec04f1ae88cb15e6885b98d93f6b919731b44cf",
+        "manifest_sha256": "89858e7187820a69ead6ce5e881b40da3982ae76733653a283288c3c87dc8a0c",
         "tooling_sha256": {
           "check_python.py": "a22e6bde47103b7e2ffa065b137441794a64c9b622822e7301aa8d938e32cada",
-          "common.py": "2edda6b9e4e6f372d70851a47d065dd99eaf436fcc6d8714b9609b72aa13311f",
+          "common.py": "91033550acb81ced696837a02f40cad5620ac2601d8109cb831c29d9eeb39978",
           "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
           "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
           "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
           "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
           "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
-        }
+        },
+        "candidate_fingerprint": "6d341dd83a38f78010d4ca0371cc74f23b75b835829bb2d780bebd568c553305"
       }
     },
     {
@@ -1215,37 +1216,37 @@
       "sources": [
         "main"
       ],
-      "reason": "Two fresh Alibaba Linux CPU process trials passed after main integration.",
+      "reason": "Two fresh local Linux Python 3.11 CPU process trials passed against the pinned suite recipe after PR #283 session profile relay integration with the supported CPU platform override.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "8f4d12372ab6ab100d10fcd426cdb07224e860b17b2b7bb0e4ca224dca4970bf",
-        "receipt": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/taeh3-contracts-0/receipt.json",
-        "receipt_sha256": "a56a2257f966ceb2256865c3b6f1343ce1d6d8fe959ef199a5f2639a99f05c23",
+        "source_sha256": "4084e45272f24c1da42bff01b9a5cf473d2dddbff8ced4d7dcb95f673f9e8cb3",
+        "receipt": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/taeh3-contracts/receipt.json",
+        "receipt_sha256": "a0eebfbcd5efa6a1ac39f084b54507dc706397ed7592fbc76b303d911a24e43b",
         "trials": [
           {
             "trial": 1,
-            "passed": 13,
-            "collected": 13,
+            "passed": 24,
+            "collected": 24,
             "skipped": 0,
-            "duration_seconds": 0.7864528670907021,
+            "duration_seconds": 0.38975877400662284,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/taeh3-contracts-0/cpu-3-trial-1.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/taeh3-contracts-0/cpu-3-trial-1.xml"
+            "log_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/taeh3-contracts/cpu-0-trial-1.log",
+            "junit_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/taeh3-contracts/cpu-0-trial-1.xml"
           },
           {
             "trial": 2,
-            "passed": 13,
-            "collected": 13,
+            "passed": 24,
+            "collected": 24,
             "skipped": 0,
-            "duration_seconds": 0.7769740619696677,
+            "duration_seconds": 0.35203892199206166,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/taeh3-contracts-0/cpu-3-trial-2.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/taeh3-contracts-0/cpu-3-trial-2.xml"
+            "log_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/taeh3-contracts/cpu-0-trial-2.log",
+            "junit_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/taeh3-contracts/cpu-0-trial-2.xml"
           }
         ],
         "environment": {
-          "python": "3.11.12",
-          "platform": "Linux-6.6.102-001.8.100.kangaroo.al8.x86_64-x86_64-with-glibc2.39"
+          "python": "3.11.15",
+          "platform": "Linux-6.6.114.1-microsoft-standard-WSL2-x86_64-with-glibc2.35"
         },
         "environment_recipe": {
           "python_version": "3.11",
@@ -1254,16 +1255,78 @@
             "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
           }
         },
-        "manifest_sha256": "4abd3c0a8465905e4340d8303ec04f1ae88cb15e6885b98d93f6b919731b44cf",
+        "manifest_sha256": "683dc16f6843087df50c8f457fb286686bbb0a071e19758b2843a92f8438dcef",
         "tooling_sha256": {
           "check_python.py": "a22e6bde47103b7e2ffa065b137441794a64c9b622822e7301aa8d938e32cada",
-          "common.py": "2edda6b9e4e6f372d70851a47d065dd99eaf436fcc6d8714b9609b72aa13311f",
+          "common.py": "91033550acb81ced696837a02f40cad5620ac2601d8109cb831c29d9eeb39978",
           "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
           "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
           "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
           "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
           "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
-        }
+        },
+        "candidate_fingerprint": "8c67a5aacff8e2ff948ff54cf5d067a6907dece145928cd81dc35c8596e9a994"
+      }
+    },
+    {
+      "path": "benchmark/zing_h3_causal/tests/test_benchmark_report.py",
+      "suite": "benchmark-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two fresh local Linux Python 3.11 CPU process trials passed against the pinned suite recipe after PR #283 session profile relay integration with the supported CPU platform override.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "adac4ea2d71cde7212119142ca0690c8ca6a0ab925dfdc0d52bc3622dc19d145",
+        "receipt": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/benchmark-contracts/receipt.json",
+        "receipt_sha256": "9440f27e8d8c91b029d4c77a4ca1f049e3fa012211b446cc2d4221d35ae11f75",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 9,
+            "collected": 9,
+            "skipped": 0,
+            "duration_seconds": 0.35530462600581814,
+            "exit_code": 0,
+            "log_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/benchmark-contracts/cpu-0-trial-1.log",
+            "junit_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/benchmark-contracts/cpu-0-trial-1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 9,
+            "collected": 9,
+            "skipped": 0,
+            "duration_seconds": 0.3218019180058036,
+            "exit_code": 0,
+            "log_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/benchmark-contracts/cpu-0-trial-2.log",
+            "junit_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/benchmark-contracts/cpu-0-trial-2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.15",
+          "platform": "Linux-6.6.114.1-microsoft-standard-WSL2-x86_64-with-glibc2.35"
+        },
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          }
+        },
+        "manifest_sha256": "683dc16f6843087df50c8f457fb286686bbb0a071e19758b2843a92f8438dcef",
+        "tooling_sha256": {
+          "check_python.py": "a22e6bde47103b7e2ffa065b137441794a64c9b622822e7301aa8d938e32cada",
+          "common.py": "91033550acb81ced696837a02f40cad5620ac2601d8109cb831c29d9eeb39978",
+          "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
+          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
+          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
+          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
+          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
+        },
+        "candidate_fingerprint": "8c67a5aacff8e2ff948ff54cf5d067a6907dece145928cd81dc35c8596e9a994"
       }
     },
     {
@@ -1687,6 +1750,67 @@
       }
     },
     {
+      "path": "benchmark/zing_h3_causal/tests/test_run_benchmark.py",
+      "suite": "benchmark-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two fresh local Linux Python 3.11 CPU process trials passed against the pinned suite recipe after PR #283 session profile relay integration with the supported CPU platform override.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "eba13154411d83be4a40a46d7f6847f4f7fb8a6138e3d1b1c8d826392f3b4656",
+        "receipt": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/benchmark-contracts/receipt.json",
+        "receipt_sha256": "9440f27e8d8c91b029d4c77a4ca1f049e3fa012211b446cc2d4221d35ae11f75",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 9,
+            "collected": 9,
+            "skipped": 0,
+            "duration_seconds": 0.46086880899383686,
+            "exit_code": 0,
+            "log_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/benchmark-contracts/cpu-1-trial-1.log",
+            "junit_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/benchmark-contracts/cpu-1-trial-1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 9,
+            "collected": 9,
+            "skipped": 0,
+            "duration_seconds": 0.36846126400632784,
+            "exit_code": 0,
+            "log_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/benchmark-contracts/cpu-1-trial-2.log",
+            "junit_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/benchmark-contracts/cpu-1-trial-2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.15",
+          "platform": "Linux-6.6.114.1-microsoft-standard-WSL2-x86_64-with-glibc2.35"
+        },
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          }
+        },
+        "manifest_sha256": "683dc16f6843087df50c8f457fb286686bbb0a071e19758b2843a92f8438dcef",
+        "tooling_sha256": {
+          "check_python.py": "a22e6bde47103b7e2ffa065b137441794a64c9b622822e7301aa8d938e32cada",
+          "common.py": "91033550acb81ced696837a02f40cad5620ac2601d8109cb831c29d9eeb39978",
+          "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
+          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
+          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
+          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
+          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
+        },
+        "candidate_fingerprint": "8c67a5aacff8e2ff948ff54cf5d067a6907dece145928cd81dc35c8596e9a994"
+      }
+    },
+    {
       "path": "benchmark/zing_h3_causal/tests/test_slow_consumer_keepalive.py",
       "suite": "benchmark-contracts",
       "status": "CPU_PASS",
@@ -1818,37 +1942,37 @@
       "sources": [
         "main"
       ],
-      "reason": "Two fresh Alibaba Linux CPU process trials passed after main integration.",
+      "reason": "Two fresh local Linux Python 3.11 CPU process trials passed against the pinned suite recipe after PR #283 session profile relay integration with the supported CPU platform override.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "498043deb6607c8abd20845d89620a7e7280f4d459e03875774dc3669bdb7c52",
-        "receipt": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/taeh3-contracts-0/receipt.json",
-        "receipt_sha256": "a56a2257f966ceb2256865c3b6f1343ce1d6d8fe959ef199a5f2639a99f05c23",
+        "source_sha256": "2bbfc1c5f9bae81c54870534f3b0a55bafeb9d33059c0f643051c126790a7dbb",
+        "receipt": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/taeh3-contracts/receipt.json",
+        "receipt_sha256": "a0eebfbcd5efa6a1ac39f084b54507dc706397ed7592fbc76b303d911a24e43b",
         "trials": [
           {
             "trial": 1,
-            "passed": 9,
-            "collected": 9,
+            "passed": 12,
+            "collected": 12,
             "skipped": 0,
-            "duration_seconds": 2.7132136849686503,
+            "duration_seconds": 2.1634346340142656,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/taeh3-contracts-0/cpu-4-trial-1.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/taeh3-contracts-0/cpu-4-trial-1.xml"
+            "log_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/taeh3-contracts/cpu-1-trial-1.log",
+            "junit_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/taeh3-contracts/cpu-1-trial-1.xml"
           },
           {
             "trial": 2,
-            "passed": 9,
-            "collected": 9,
+            "passed": 12,
+            "collected": 12,
             "skipped": 0,
-            "duration_seconds": 2.6534409869927913,
+            "duration_seconds": 1.8061274140054593,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/taeh3-contracts-0/cpu-4-trial-2.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/taeh3-contracts-0/cpu-4-trial-2.xml"
+            "log_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/taeh3-contracts/cpu-1-trial-2.log",
+            "junit_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/taeh3-contracts/cpu-1-trial-2.xml"
           }
         ],
         "environment": {
-          "python": "3.11.12",
-          "platform": "Linux-6.6.102-001.8.100.kangaroo.al8.x86_64-x86_64-with-glibc2.39"
+          "python": "3.11.15",
+          "platform": "Linux-6.6.114.1-microsoft-standard-WSL2-x86_64-with-glibc2.35"
         },
         "environment_recipe": {
           "python_version": "3.11",
@@ -1857,16 +1981,17 @@
             "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
           }
         },
-        "manifest_sha256": "4abd3c0a8465905e4340d8303ec04f1ae88cb15e6885b98d93f6b919731b44cf",
+        "manifest_sha256": "683dc16f6843087df50c8f457fb286686bbb0a071e19758b2843a92f8438dcef",
         "tooling_sha256": {
           "check_python.py": "a22e6bde47103b7e2ffa065b137441794a64c9b622822e7301aa8d938e32cada",
-          "common.py": "2edda6b9e4e6f372d70851a47d065dd99eaf436fcc6d8714b9609b72aa13311f",
+          "common.py": "91033550acb81ced696837a02f40cad5620ac2601d8109cb831c29d9eeb39978",
           "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
           "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
           "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
           "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
           "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
-        }
+        },
+        "candidate_fingerprint": "8c67a5aacff8e2ff948ff54cf5d067a6907dece145928cd81dc35c8596e9a994"
       }
     },
     {
@@ -6138,40 +6263,40 @@
       "sources": [
         "main"
       ],
-      "reason": "Two fresh Alibaba Linux CPU process trials passed after main integration.",
+      "reason": "Two fresh local Linux Python 3.11 CPU process trials passed against the pinned suite recipe after PR #283 session profile relay integration with the supported CPU platform override.",
       "dependencies": [
         "requirements-cpu.txt",
         "requirements-torch.txt"
       ],
       "trial_evidence": {
-        "source_sha256": "dddbd96a2e8412eb80ff39947394b055f8e0783f549caf74dbbd6c64248a18f4",
-        "receipt": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/realtime-contracts-0/receipt.json",
-        "receipt_sha256": "a696ae8aa9f74bcb45b96778d066cbceab5e20c67c93118fe705ae06bf363e36",
+        "source_sha256": "e793fc999df00e6f04d49cf8a7158eb34ef11ae5fb7a9769a33c1f7aaedff027",
+        "receipt": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/realtime-contracts/receipt.json",
+        "receipt_sha256": "686c88ed1ed89cbf81ec6eb93e3732a08ca885753359f19e99d00a2431971684",
         "trials": [
           {
             "trial": 1,
-            "passed": 1,
-            "collected": 1,
+            "passed": 3,
+            "collected": 3,
             "skipped": 0,
-            "duration_seconds": 6.766723968088627,
+            "duration_seconds": 13.978849104998517,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/realtime-contracts-0/cpu-4-trial-1.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/realtime-contracts-0/cpu-4-trial-1.xml"
+            "log_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/realtime-contracts/cpu-0-trial-1.log",
+            "junit_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/realtime-contracts/cpu-0-trial-1.xml"
           },
           {
             "trial": 2,
-            "passed": 1,
-            "collected": 1,
+            "passed": 3,
+            "collected": 3,
             "skipped": 0,
-            "duration_seconds": 6.5461788608226925,
+            "duration_seconds": 14.798938406995148,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/realtime-contracts-0/cpu-4-trial-2.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/realtime-contracts-0/cpu-4-trial-2.xml"
+            "log_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/realtime-contracts/cpu-0-trial-2.log",
+            "junit_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/realtime-contracts/cpu-0-trial-2.xml"
           }
         ],
         "environment": {
-          "python": "3.11.12",
-          "platform": "Linux-6.6.102-001.8.100.kangaroo.al8.x86_64-x86_64-with-glibc2.39"
+          "python": "3.11.15",
+          "platform": "Linux-6.6.114.1-microsoft-standard-WSL2-x86_64-with-glibc2.35"
         },
         "environment_recipe": {
           "python_version": "3.11",
@@ -6180,16 +6305,17 @@
             "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
           }
         },
-        "manifest_sha256": "4abd3c0a8465905e4340d8303ec04f1ae88cb15e6885b98d93f6b919731b44cf",
+        "manifest_sha256": "7ec804a7c5d1f48cf1b626c9f0099d089c16663ff8d28bdb7fbcc07aebec1a6d",
         "tooling_sha256": {
           "check_python.py": "a22e6bde47103b7e2ffa065b137441794a64c9b622822e7301aa8d938e32cada",
-          "common.py": "2edda6b9e4e6f372d70851a47d065dd99eaf436fcc6d8714b9609b72aa13311f",
+          "common.py": "91033550acb81ced696837a02f40cad5620ac2601d8109cb831c29d9eeb39978",
           "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
           "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
           "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
           "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
           "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
-        }
+        },
+        "candidate_fingerprint": "f4e77ce3817e37819a30ffc5d774dc1b5d4ed8267ac5cef4cc8a2e7364bfd8bd"
       }
     }
   ],

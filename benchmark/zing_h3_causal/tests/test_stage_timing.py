@@ -187,3 +187,109 @@ def test_writer_overflow_is_visible_and_completed_events_are_drained(tmp_path):
     health = json.loads(writer.health_path.read_text())
     assert health["dropped"] == 1
     assert health["pending"] == health["queued"] == 0
+
+
+def test_profile_waits_for_cuda_and_collects_only_its_session(tmp_path):
+    import asyncio
+
+    writer = timing.Writer(tmp_path)
+    end = Event(False)
+    trace = timing.StageTrace(
+        "current",
+        "current_d",
+        writer.submit,
+        measure_cuda=True,
+        event_factory=lambda: (Event(), end),
+        identity={"rank": 0, "pid": 1},
+    )
+    with trace.span("DiT", cuda=True) as span:
+        pass
+    span.handoff()
+    trace.finish()
+
+    async def collect():
+        task = asyncio.create_task(
+            timing.collect_profile(tmp_path, "current", [0], 1, timeout=1)
+        )
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        end.ready = True
+        return await task
+
+    try:
+        profile = asyncio.run(collect())
+        assert profile["status"] == "complete"
+        assert len(profile["stages"]) == 1
+        assert profile["stages"][0]["cuda_stream_ms"] == 12.5
+        other = asyncio.run(
+            timing.collect_profile(tmp_path, "previous", [0], 1, timeout=0)
+        )
+        assert other["status"] == "incomplete"
+        assert other["stages"] == []
+    finally:
+        end.ready = True
+        writer.stop.set()
+        writer.thread.join(2)
+
+
+def test_profile_requires_matching_dispatches_from_every_rank(tmp_path):
+    import asyncio
+
+    for rank in (0, 1):
+        rows = [
+            {
+                "request_id": "s",
+                "generation_id": "current",
+                "dispatch_id": "s_d",
+                "rank": rank,
+                "stage": "DiT",
+                "cuda_status": "not_requested",
+            }
+        ]
+        (tmp_path / f"stage-timing-pid{rank}.jsonl").write_text(
+            json.dumps({**rows[0], "generation_id": "previous", "dispatch_id": "s_old"})
+            + "\n"
+            + json.dumps(rows[0])
+            + "\n"
+        )
+        timing.publish_health(
+            tmp_path / f"stage-timing-pid{rank}-health.json",
+            {
+                "profile": {
+                    "request_id": "s",
+                    "generation_id": "current",
+                    "rank": rank,
+                    "pid": rank,
+                    "dispatches": {"s_d": 1},
+                }
+            },
+        )
+    profile = asyncio.run(
+        timing.collect_profile(
+            tmp_path, "s", [0, 1], 1, generation_id="current", timeout=0
+        )
+    )
+    assert profile["status"] == "complete"
+    assert len(profile["stages"]) == 2
+    assert {r["rank"] for r in profile["stages"]} == {0, 1}
+    (tmp_path / "stage-timing-pid1-health.json").unlink()
+    profile = asyncio.run(
+        timing.collect_profile(
+            tmp_path, "s", [0, 1], 1, generation_id="current", timeout=0
+        )
+    )
+    assert profile["status"] == "incomplete"
+    assert profile["missing_ranks"] == [1]
+
+
+def test_profile_does_not_accept_a_finished_marker_with_missing_spans(tmp_path):
+    import asyncio
+
+    (tmp_path / "stage-timing-pid0.jsonl").write_text("")
+    timing.publish_health(
+        tmp_path / "stage-timing-pid0-health.json",
+        {"profile": {"request_id": "s", "rank": 0, "pid": 0, "dispatches": {"s_d": 1}}},
+    )
+    profile = asyncio.run(timing.collect_profile(tmp_path, "s", [0], 1, timeout=0))
+    assert profile["status"] == "incomplete"
+    assert profile["health"][0]["dropped"] == 1
