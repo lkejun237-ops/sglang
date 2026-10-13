@@ -4,8 +4,9 @@
 默认 `zing-whitebox-video-five-triview-0001` 保留 PR #164 的六图契约：全局风格图为 Picture 1，五张三视图为 Picture 2–6，原 prompt 与 conditions 映射不变。
 本文件以下介绍显式选择的训练 target 首帧变体；它不覆盖默认六图 case。
 
-另有两条独立的 [30 秒白模输入](WHITEBOX_VIDEO_LONG.md)，使用
-`whitebox_video_long_cases.jsonl` 和显式 `--case` 选择，完整保留全局图 + 六张三视图的七图契约。
+另有独立的 [30 秒白模输入](WHITEBOX_VIDEO_LONG.md)，使用
+`whitebox_video_long_cases.jsonl` 和显式 `--case` 选择：两条 UniEdit 输入保留全局图 + 六张三视图，
+潇潇提供的 WTP 效果检查输入保留全局图 + 主角／林姐两张三视图。
 
 | 用例 | 源素材 | 参考图 | 输出规格 |
 | --- | --- | --- | --- |

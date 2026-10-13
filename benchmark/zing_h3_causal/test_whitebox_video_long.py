@@ -68,3 +68,69 @@ def test_prepare_keeps_all_seven_references_and_deduplicates_source(tmp_path, ca
         == request["messages"][1]["source"]["uri"]
     )
     assert all(uri.startswith("file://") for uri in smoke.media_uris(request))
+
+
+def test_wtp_case_preserves_clip_and_three_reference_mapping():
+    case = smoke.load_cases(MANIFEST)["zing-whitebox-video-30s-two-triview-0001"]
+    user, target = case["messages"]
+    video = user["content"][0]
+    assert video["type"] == "video"
+    assert video["clip"] == {"start": 0, "end": 0}
+    assert video["uri"].endswith(
+        "19b458b45cf2baafb2352e27fc8f7da6b203f588bcbd1f5f3776afd45f1fd182.mp4"
+    )
+    assert target["source"] == {"type": "video", "uri": video["uri"]}
+    pictures = [item for item in user["content"] if item["type"] == "image"]
+    ids = [f"<Picture {i}>" for i in range(1, 4)]
+    assert [item["id"] for item in pictures] == ids
+    assert [item["uri"].rsplit("/", 1)[-1] for item in pictures] == [
+        "6af5c6f890d0bdaeb7c1dc03e622b2ad10ada221e0649e4d59cc5d82e36a797e.png",
+        "d31f804a6ee3c3ecca187d756e95c28cb21e39463a8c8484729233cdf8d7e207.png",
+        "175d259b8f7310a3b3eabc0fb2cab489575b13cc01d635ecb2929f12cb5327fa.png",
+    ]
+    assert target["conditions"] == [
+        {"content_id": i, "role": "reference", "latent_modalities": ["visual"]}
+        for i in ids
+    ]
+    assert target["content"] == [
+        {"type": "video", "output": {"frames": 720, "height": 480, "width": 832}}
+    ]
+    assert len(smoke.expected_assets(case)) == len(smoke.media_uris(case)) == 4
+    assert all(
+        uri.startswith("s3://leap-worldmodel-beijing-single-az/")
+        for uri in smoke.media_uris(case)
+    )
+
+
+def test_wtp_prompt_and_replay_provenance_are_frozen():
+    case = smoke.load_cases(MANIFEST)["zing-whitebox-video-30s-two-triview-0001"]
+    prompt = next(
+        item["text"]
+        for item in case["messages"][0]["content"]
+        if item["type"] == "text"
+    )
+    assert set(re.findall(r"<Picture \d+>", prompt)) == {
+        "<Picture 1>",
+        "<Picture 2>",
+        "<Picture 3>",
+    }
+    assert "<Picture 2> 是主角的三视图参考" in prompt
+    assert "<Picture 3> 是林姐的三视图参考" in prompt
+    original = re.sub(r"<Video (\d+)>", r"@视频\1", prompt)
+    original = re.sub(r"<Picture (\d+)>", r"@图片\1", original)
+    assert hashlib.sha256(original.encode()).hexdigest() == (
+        "4243f0ffa7ef01a35bb0697f160df0af89fb7310038634c509c8882cce9669e1"
+    )
+    provenance = case["provenance"]
+    assert provenance["world_id"] == "world-ec2bb6fa4c7c3c6d1312f7d601bbedca"
+    assert provenance["wtp_run_id"] == "run-muu2ogwl-2e6159c1dc696d4a"
+    assert provenance["replay_status"] == "evidence-complete-not-reexecuted"
+    assert provenance["recorder_seed"]["status"] == "unavailable"
+    assert provenance["recorder_seed"]["value"] is None
+    evidence = {item["role"]: item for item in provenance["evidence"]}
+    assert (
+        evidence["source_prompt"]["sha256"]
+        == hashlib.sha256(original.encode()).hexdigest()
+    )
+    assert evidence["source_clip"]["uri"] == case["messages"][1]["source"]["uri"]
+    assert evidence["original_recording"]["uri"] not in smoke.media_uris(case)
