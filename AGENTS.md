@@ -6,6 +6,10 @@
 - 设计、实现、审查和验收均按此约束执行；不预先增加多会话容量配置、多 owner 状态或并发调度。已有活跃会话时拒绝第二个会话，且不得影响当前会话。
 - 保留 session/generation 身份校验，以及断连、取消、故障、EOS 后释放资源和下一会话可用性的测试；这些是单活跃会话生命周期保障。
 
+## 项目自有 Skills
+
+SGLang 专用的 `sglang-pr-review` 在本仓库 `.agents/skills/sglang-pr-review/` 维护并提交，作为项目自有技能。跨项目复用的基础设施技能仍由 infra-skills 维护；下面的本地安装与 exclude 规则仅适用于从该仓库安装的副本。
+
 ## 项目级 Infra Skills
 
 本项目直接使用 [seedleap/infra-skills](https://github.com/seedleap/infra-skills)
