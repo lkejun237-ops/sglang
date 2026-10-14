@@ -176,6 +176,7 @@ benchmark/llava_bench/mme_pack
 *.jsonl
 !tools/sglang-simulator/examples/replay/trace.jsonl
 !benchmark/zing_h3_causal/whitebox_video_smoke_cases.jsonl
+!benchmark/zing_h3_causal/prompt_switch_cases.jsonl
 tmp*.txt
 /tmp/
 
