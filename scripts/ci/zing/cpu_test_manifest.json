@@ -3071,6 +3071,66 @@
       }
     },
     {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_h3_decoder_config.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two fixed-environment Linux CPU process trials passed (PR #298; re-run after the Lynn default).",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "6f21d6cf755d346f9780c8b27e0b8c4317f9b333251373556c8a131fd0fb62d5",
+        "receipt": "oss://leap-worldmodel-thailand-single-az/world-model/evals/zing-h3-causal/pr298-lynn-gpu/ci-evidence/dit-triage-20261014-r2/receipt.json",
+        "receipt_sha256": "30d6bfc5aa45d3760d6656cff4ec2c0e8d860904cc314da440d18b7989ddbce9",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 29,
+            "collected": 29,
+            "skipped": 0,
+            "duration_seconds": 2.788043052998546,
+            "exit_code": 0,
+            "log_path": "oss://leap-worldmodel-thailand-single-az/world-model/evals/zing-h3-causal/pr298-lynn-gpu/ci-evidence/dit-triage-20261014-r2/cpu-0-trial-1.log",
+            "junit_path": "oss://leap-worldmodel-thailand-single-az/world-model/evals/zing-h3-causal/pr298-lynn-gpu/ci-evidence/dit-triage-20261014-r2/cpu-0-trial-1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 29,
+            "collected": 29,
+            "skipped": 0,
+            "duration_seconds": 2.8085833830009506,
+            "exit_code": 0,
+            "log_path": "oss://leap-worldmodel-thailand-single-az/world-model/evals/zing-h3-causal/pr298-lynn-gpu/ci-evidence/dit-triage-20261014-r2/cpu-0-trial-2.log",
+            "junit_path": "oss://leap-worldmodel-thailand-single-az/world-model/evals/zing-h3-causal/pr298-lynn-gpu/ci-evidence/dit-triage-20261014-r2/cpu-0-trial-2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.17",
+          "platform": "Linux-6.12.94+-x86_64-with-glibc2.39"
+        },
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          }
+        },
+        "manifest_sha256": "d9c5195c253bef773cb2f6f531fac159dd23da377898e735076438bf0b7e04e2",
+        "tooling_sha256": {
+          "check_python.py": "a22e6bde47103b7e2ffa065b137441794a64c9b622822e7301aa8d938e32cada",
+          "common.py": "91033550acb81ced696837a02f40cad5620ac2601d8109cb831c29d9eeb39978",
+          "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
+          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
+          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
+          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
+          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
+        }
+      }
+    },
+    {
       "path": "python/sglang/multimodal_gen/test/unit/test_zing_h3_denoise_graph.py",
       "suite": "dit-pipeline-contracts",
       "status": "MIXED",
@@ -4012,37 +4072,37 @@
       "sources": [
         "main"
       ],
-      "reason": "Two fresh Alibaba Linux CPU process trials passed after main integration.",
+      "reason": "Two fixed-environment Linux CPU process trials passed (re-run in PR #298 after the Lynn default).",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "57c02a71b7aa1b240ffecea6030075a31cf1a95f477b8662d1b4c6a0c1bd0f0a",
-        "receipt": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-3/receipt.json",
-        "receipt_sha256": "9c0f83ac9e6f256b716cc1f9d6cd63683401a9e3f70421edd97fd353076640ec",
+        "source_sha256": "3695a612dc1d50b3bda7757afb3d7655e9df9fb12bd5d008e625c9494d14e342",
+        "receipt": "oss://leap-worldmodel-thailand-single-az/world-model/evals/zing-h3-causal/pr298-lynn-gpu/ci-evidence/dit-triage-20261014-r3/receipt.json",
+        "receipt_sha256": "dc12a54e3e96322918480e3691958afe9c813e3c428f0f8f451cd912c4199ed8",
         "trials": [
           {
             "trial": 1,
             "passed": 99,
             "collected": 99,
             "skipped": 0,
-            "duration_seconds": 21.408497798023745,
+            "duration_seconds": 8.828071115000057,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-3/cpu-4-trial-1.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-3/cpu-4-trial-1.xml"
+            "log_path": "oss://leap-worldmodel-thailand-single-az/world-model/evals/zing-h3-causal/pr298-lynn-gpu/ci-evidence/dit-triage-20261014-r3/cpu-0-trial-1.log",
+            "junit_path": "oss://leap-worldmodel-thailand-single-az/world-model/evals/zing-h3-causal/pr298-lynn-gpu/ci-evidence/dit-triage-20261014-r3/cpu-0-trial-1.xml"
           },
           {
             "trial": 2,
             "passed": 99,
             "collected": 99,
             "skipped": 0,
-            "duration_seconds": 20.82857552380301,
+            "duration_seconds": 8.662069744998007,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-3/cpu-4-trial-2.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-3/cpu-4-trial-2.xml"
+            "log_path": "oss://leap-worldmodel-thailand-single-az/world-model/evals/zing-h3-causal/pr298-lynn-gpu/ci-evidence/dit-triage-20261014-r3/cpu-0-trial-2.log",
+            "junit_path": "oss://leap-worldmodel-thailand-single-az/world-model/evals/zing-h3-causal/pr298-lynn-gpu/ci-evidence/dit-triage-20261014-r3/cpu-0-trial-2.xml"
           }
         ],
         "environment": {
-          "python": "3.11.12",
-          "platform": "Linux-6.6.102-001.8.100.kangaroo.al8.x86_64-x86_64-with-glibc2.39"
+          "python": "3.11.17",
+          "platform": "Linux-6.12.94+-x86_64-with-glibc2.39"
         },
         "environment_recipe": {
           "python_version": "3.11",
@@ -4051,10 +4111,10 @@
             "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
           }
         },
-        "manifest_sha256": "4abd3c0a8465905e4340d8303ec04f1ae88cb15e6885b98d93f6b919731b44cf",
+        "manifest_sha256": "c46b8e60023094f10e41ec9bee11c4d3891f43561819e2dcd8a6220ca1607e80",
         "tooling_sha256": {
           "check_python.py": "a22e6bde47103b7e2ffa065b137441794a64c9b622822e7301aa8d938e32cada",
-          "common.py": "2edda6b9e4e6f372d70851a47d065dd99eaf436fcc6d8714b9609b72aa13311f",
+          "common.py": "91033550acb81ced696837a02f40cad5620ac2601d8109cb831c29d9eeb39978",
           "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
           "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
           "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
@@ -5504,6 +5564,126 @@
         "tooling_sha256": {
           "check_python.py": "a22e6bde47103b7e2ffa065b137441794a64c9b622822e7301aa8d938e32cada",
           "common.py": "2edda6b9e4e6f372d70851a47d065dd99eaf436fcc6d8714b9609b72aa13311f",
+          "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
+          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
+          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
+          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
+          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
+        }
+      }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_lynn_stream.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two fixed-environment Linux CPU process trials passed (PR #298).",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "578d8f6051ae0450c7d7a859d7359a55f02d501902b0ef233f9f9d53e71ed689",
+        "receipt": "oss://leap-worldmodel-thailand-single-az/world-model/evals/zing-h3-causal/pr298-lynn-gpu/ci-evidence/dit-triage-20261014-r1/receipt.json",
+        "receipt_sha256": "0d6cd8441bcec8049bb255935fc3c00c70ece16b34a2e9d8e7f241614de51aef",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 42,
+            "collected": 42,
+            "skipped": 0,
+            "duration_seconds": 9.936594744001923,
+            "exit_code": 0,
+            "log_path": "oss://leap-worldmodel-thailand-single-az/world-model/evals/zing-h3-causal/pr298-lynn-gpu/ci-evidence/dit-triage-20261014-r1/cpu-1-trial-1.log",
+            "junit_path": "oss://leap-worldmodel-thailand-single-az/world-model/evals/zing-h3-causal/pr298-lynn-gpu/ci-evidence/dit-triage-20261014-r1/cpu-1-trial-1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 42,
+            "collected": 42,
+            "skipped": 0,
+            "duration_seconds": 9.517518305001431,
+            "exit_code": 0,
+            "log_path": "oss://leap-worldmodel-thailand-single-az/world-model/evals/zing-h3-causal/pr298-lynn-gpu/ci-evidence/dit-triage-20261014-r1/cpu-1-trial-2.log",
+            "junit_path": "oss://leap-worldmodel-thailand-single-az/world-model/evals/zing-h3-causal/pr298-lynn-gpu/ci-evidence/dit-triage-20261014-r1/cpu-1-trial-2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.17",
+          "platform": "Linux-6.12.94+-x86_64-with-glibc2.39"
+        },
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          }
+        },
+        "manifest_sha256": "614791ba5c35e5f0a1a00e2d7710e2db2c7d503e7af0b38d63f12b09e7e624e4",
+        "tooling_sha256": {
+          "check_python.py": "a22e6bde47103b7e2ffa065b137441794a64c9b622822e7301aa8d938e32cada",
+          "common.py": "91033550acb81ced696837a02f40cad5620ac2601d8109cb831c29d9eeb39978",
+          "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
+          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
+          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
+          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
+          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
+        }
+      }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_lynn_streaming_protocol.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two fixed-environment Linux CPU process trials passed (PR #298).",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "fd90d024557f87c6ac23a746dd408b3b21436f59f1c810fad941573664bc2fef",
+        "receipt": "oss://leap-worldmodel-thailand-single-az/world-model/evals/zing-h3-causal/pr298-lynn-gpu/ci-evidence/dit-triage-20261014-r1/receipt.json",
+        "receipt_sha256": "0d6cd8441bcec8049bb255935fc3c00c70ece16b34a2e9d8e7f241614de51aef",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 8,
+            "collected": 8,
+            "skipped": 0,
+            "duration_seconds": 2.794074740999349,
+            "exit_code": 0,
+            "log_path": "oss://leap-worldmodel-thailand-single-az/world-model/evals/zing-h3-causal/pr298-lynn-gpu/ci-evidence/dit-triage-20261014-r1/cpu-2-trial-1.log",
+            "junit_path": "oss://leap-worldmodel-thailand-single-az/world-model/evals/zing-h3-causal/pr298-lynn-gpu/ci-evidence/dit-triage-20261014-r1/cpu-2-trial-1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 8,
+            "collected": 8,
+            "skipped": 0,
+            "duration_seconds": 2.801751784001681,
+            "exit_code": 0,
+            "log_path": "oss://leap-worldmodel-thailand-single-az/world-model/evals/zing-h3-causal/pr298-lynn-gpu/ci-evidence/dit-triage-20261014-r1/cpu-2-trial-2.log",
+            "junit_path": "oss://leap-worldmodel-thailand-single-az/world-model/evals/zing-h3-causal/pr298-lynn-gpu/ci-evidence/dit-triage-20261014-r1/cpu-2-trial-2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.17",
+          "platform": "Linux-6.12.94+-x86_64-with-glibc2.39"
+        },
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          }
+        },
+        "manifest_sha256": "614791ba5c35e5f0a1a00e2d7710e2db2c7d503e7af0b38d63f12b09e7e624e4",
+        "tooling_sha256": {
+          "check_python.py": "a22e6bde47103b7e2ffa065b137441794a64c9b622822e7301aa8d938e32cada",
+          "common.py": "91033550acb81ced696837a02f40cad5620ac2601d8109cb831c29d9eeb39978",
           "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
           "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
           "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",

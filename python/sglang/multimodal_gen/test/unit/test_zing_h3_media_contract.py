@@ -10,12 +10,16 @@ import torch
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
     codecs as codecs_module,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.decoder import (
+    DECODERS,
+)
 
 
 @pytest.fixture
 def codecs():
     instance = object.__new__(codecs_module.ZingH3Codecs)
     instance.runtime = {}
+    instance.decoder = DECODERS["official_h3"]
     instance.spatial_ratio = 16
     instance.patch_size = (1, 2, 2)
     instance.temporal_ratio = 4

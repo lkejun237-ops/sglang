@@ -18,6 +18,9 @@ from sglang.multimodal_gen.runtime.conditioning.worker import (
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.decoder import (
+    build_decoder_modules,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.stage import (
     ZingH3GenerationStage,
 )
@@ -226,22 +229,7 @@ class ZingH3CausalPipeline(ComposedPipelineBase):
 
     def create_pipeline_stages(self, server_args):
         config = server_args.pipeline_config
-        if config.video_decoder_backend == "taeh3":
-            import torch
-
-            from sglang.multimodal_gen.runtime.models.vaes.taeh3 import (
-                WEIGHTS_SHA256,
-                TAEH3Decoder,
-            )
-
-            dtype = {
-                "fp32": torch.float32,
-                "fp16": torch.float16,
-                "bf16": torch.bfloat16,
-            }[config.taeh3_decode_precision]
-            self.modules["taeh3_decoder"] = TAEH3Decoder(
-                config.taeh3_checkpoint_path, WEIGHTS_SHA256
-            ).to(dtype=dtype)
+        self.modules.update(build_decoder_modules(config.resolve_decoder_spec()))
         provider = (
             None
             if self.conditioning_mode == "local"

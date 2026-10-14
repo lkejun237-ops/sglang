@@ -11,6 +11,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
 from sglang.multimodal_gen.configs.sample.zing_h3 import ZingH3SamplingParams
 from sglang.multimodal_gen.runtime.models.dits.zing_h3 import ZingH3DiTModel
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.decoder import (
+    DECODERS,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.packing import (
     ZingH3Packer,
 )
@@ -315,6 +318,7 @@ def test_generation_stage_connects_prompt_dit_and_decoder(model):
         return torch.zeros(1, 3, 5, 32, 32)
 
     stage.codecs = SimpleNamespace(
+        decoder=DECODERS["official_h3"],
         video_decoder_name="video_vae",
         prepare=prepare,
         decode_visual=decode,
@@ -725,6 +729,7 @@ def realtime_stage(model):
         )
 
     stage.codecs = SimpleNamespace(
+        decoder=DECODERS["official_h3"],
         video_decoder_name="video_vae",
         prepare=prepare,
         decode_visual_range=lambda latent, start, end: decode(latent, end)[
@@ -883,6 +888,7 @@ def test_taeh3_stage_preserves_frames_and_block_provenance(pattern, latent_end, 
         stage.modules = {"taeh3_decoder": decoder}
         stage._use = lambda *args: nullcontext(decoder)
         stage.codecs = SimpleNamespace(
+            decoder=DECODERS["taeh3"],
             video_decoder_name="taeh3_decoder",
             spatial_ratio=16,
             temporal_ratio=4,

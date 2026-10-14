@@ -626,8 +626,10 @@ class ZingH3GenerationStage(PipelineStage):
         mode = getattr(params, "zing_realtime_decode_mode", "immediate")
         if mode not in {"immediate", "stable"}:
             raise ValueError("Invalid Zing realtime decode mode")
-        if self.codecs.video_decoder_name == "taeh3_decoder" and mode != "stable":
-            raise ValueError("TAEH3 realtime decoding requires stable mode")
+        if mode not in self.codecs.decoder.realtime_modes:
+            raise ValueError(
+                "The selected video decoder requires stable realtime decoding"
+            )
         return mode
 
     def _sample_realtime_block(self, batch, state):
@@ -726,8 +728,9 @@ class ZingH3GenerationStage(PipelineStage):
         chunk = self.codecs.vae_latents_per_chunk
         overlap = (-self.codecs.va.vae_token_drop) % chunk if mode == "stable" else 0
         stable_end = max(0, (end - overlap) // chunk) * self.codecs.vae_frames_per_chunk
-        if self.codecs.video_decoder_name == "taeh3_decoder":
-            stable_end = max(0, (end // 5) * 17 - 12)
+        decoder = self.codecs.decoder
+        if decoder.stateful:
+            stable_end = decoder.stable_frames(self.modules[decoder.module_key], end)
         ready = [
             block
             for block in state.pending_blocks
@@ -738,11 +741,15 @@ class ZingH3GenerationStage(PipelineStage):
     def _decode_realtime_output(self, state, end, ready, final=False):
         inputs = state.inputs
         first_frame = state.emitted_frames
-        with self._use(self.codecs.video_decoder_name, "decode"):
+        decoder = self.codecs.decoder
+        with self._use(decoder.module_key, "decode"):
             latent = state.sampling.visual[:, :, :end]
-            if self.codecs.video_decoder_name == "taeh3_decoder":
+            if decoder.stateful:
                 if state.video_decoder is None:
-                    state.video_decoder = self.modules["taeh3_decoder"].new_stream()
+                    state.video_decoder = decoder.new_stream(
+                        self.modules[decoder.module_key],
+                        frame_limit=inputs.pixel_frame_count,
+                    )
                 stream = state.video_decoder
                 parts = [stream.push(latent[:, :, state.decoded_latents : end])]
                 state.decoded_latents = end
@@ -753,7 +760,7 @@ class ZingH3GenerationStage(PipelineStage):
                 available = torch.cat(parts, dim=2)
                 count = ready[-1]["frame_end"] - first_frame
                 if available.shape[2] < count:
-                    raise ValueError("TAEH3 output is not ready")
+                    raise ValueError("Video decoder output is not ready")
                 decoded = available[:, :, :count]
                 state.decoder_frames = available[:, :, count:].clone()
             else:

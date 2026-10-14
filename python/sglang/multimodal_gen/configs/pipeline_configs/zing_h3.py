@@ -14,6 +14,11 @@ from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.zing_h3_decoder import (
+    LEGACY_DECODER_FIELDS,
+    DecoderSpec,
+    normalize_decoder_spec,
+)
 
 
 def resolve_zing_modality_tags(num_modalities, tags=None):
@@ -66,9 +71,12 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
     dit_config: ZingH3DiTConfig = field(default_factory=ZingH3DiTConfig)
     should_use_guidance: bool = True
     vae_decode_precision: str = "fp32"
-    video_decoder_backend: str = "taeh3"
+    # Flat legacy selection; None means "not chosen", so an explicit taeh3 stays visible.
+    video_decoder_backend: str | None = None
     taeh3_checkpoint_path: str | None = None
-    taeh3_decode_precision: str = "fp32"
+    taeh3_decode_precision: str | None = None
+    # Nested decoder selection; with neither this nor a legacy choice the default is Lynn.
+    decoder_config: dict | None = None
     # Immutable offline table; None keeps the explicit resident baseline.
     zing_adaln_table_path: str | None = None
     zing_adaln_table_max_bytes: int = 536870912
@@ -81,6 +89,45 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
     zing_kv_pool_sink_chunks: int = 3
     zing_kv_pool_rope_position_mode: str = "block_relative"
     zing_kv_pool_rope_max_frame_gap: int = 12
+
+    # Legacy decoder fields the caller supplied; a default must not look like a choice.
+    _explicit_decoder_fields = frozenset()
+
+    def update_config_from_dict(self, args, prefix: str = "") -> None:
+        dotted = f"{prefix}." if prefix.strip() else ""
+        self._explicit_decoder_fields = frozenset(
+            name
+            for name in LEGACY_DECODER_FIELDS
+            if args.get(dotted + name) is not None
+        )
+        super().update_config_from_dict(args, prefix)
+
+    def update_pipeline_config(self, source_pipeline_dict) -> None:
+        self._explicit_decoder_fields = frozenset(
+            name
+            for name in LEGACY_DECODER_FIELDS
+            if source_pipeline_dict.get(name) is not None
+        )
+        super().update_pipeline_config(source_pipeline_dict)
+
+    def resolve_decoder_spec(self) -> DecoderSpec:
+        explicit = self._explicit_decoder_fields or frozenset(
+            name
+            for name in LEGACY_DECODER_FIELDS
+            if getattr(self, name) != type(self).__dataclass_fields__[name].default
+        )
+        return normalize_decoder_spec(
+            self.decoder_config,
+            video_decoder_backend=self.video_decoder_backend,
+            taeh3_checkpoint_path=self.taeh3_checkpoint_path,
+            taeh3_decode_precision=self.taeh3_decode_precision,
+            vae_decode_precision=self.vae_decode_precision,
+            explicit_legacy=explicit,
+        )
+
+    @property
+    def decoder_type(self) -> str:
+        return self.resolve_decoder_spec().type
 
     @property
     def requires_audio_output(self):
@@ -112,13 +159,13 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
                 raise ValueError(
                     "Zing AdaLN tables currently support SP1 only; SP2 exactness is unverified"
                 )
-        if self.video_decoder_backend not in {"native", "taeh3"}:
-            raise ValueError("Unknown Zing video decoder backend")
-        if self.video_decoder_backend == "taeh3":
-            if not self.taeh3_checkpoint_path:
-                raise ValueError("TAEH3 requires a local checkpoint path")
-            if self.taeh3_decode_precision not in {"fp32", "fp16", "bf16"}:
-                raise ValueError("Unsupported TAEH3 decode precision")
+        decoder = self.resolve_decoder_spec()
+        if decoder.type == "lynn_streaming":
+            # Offload of the mixed BF16/FP32 decoder is unvalidated; keep it resident.
+            residency = getattr(server_args, "explicit_residency_mode", None)
+            mode = residency("lynn_decoder") if residency is not None else None
+            if mode not in (None, "resident"):
+                raise ValueError("lynn_streaming requires a resident decoder")
         tp_size = getattr(server_args, "tp_size", 1) or 1
         sp_degree = getattr(server_args, "sp_degree", 1) or 1
         ulysses_degree = getattr(server_args, "ulysses_degree", 1) or 1

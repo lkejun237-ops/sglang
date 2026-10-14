@@ -6,6 +6,7 @@ import threading
 from contextlib import contextmanager
 
 import torch
+
 from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
 from sglang.multimodal_gen.runtime.conditioning.encoder import encode_condition
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.presentation import (
@@ -20,6 +21,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 )
 from sglang.multimodal_gen.runtime.utils.zing_stage_timing import handoff, stage_span
 
+from .decoder import decoder_adapter
 from .media_input import ZingH3MediaInput, _sample_max_area_config
 from .packing import H3InferenceInputs
 from .visual_encoding import encode_clips
@@ -122,6 +124,7 @@ class ZingH3Codecs(ZingH3MediaInput):
         )
         self.audio_sample_rate = self.aa.sample_rate
         self.remote_read_fs = None
+        self.decoder = decoder_adapter(pipeline_config.resolve_decoder_spec())
 
     def prepare_visual_encoder_weights(self):
         """Prepare encoder precision at startup, before cached sessions exist."""
@@ -424,11 +427,11 @@ class ZingH3Codecs(ZingH3MediaInput):
 
     @property
     def video_decoder_name(self):
-        return "taeh3_decoder" if "taeh3_decoder" in self.modules else "video_vae"
+        return self.decoder.module_key
 
     def decode_visual(self, latent, frames):
-        if self.video_decoder_name == "taeh3_decoder":
-            return self.modules["taeh3_decoder"].decode(latent, frames)
+        if self.decoder.stateful:
+            return self.modules[self.decoder.module_key].decode(latent, frames)
         model = self.modules["video_vae"]
         single = frames == 1 and latent.shape[2] == 1
         chunk, drop = self.vae_latents_per_chunk, self.va.vae_token_drop

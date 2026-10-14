@@ -438,7 +438,7 @@ def test_production_worker_selects_taeh3_async_and_propagates_failure(failure):
             realtime_vae_backend="local",
             scheduler_endpoint="ipc:///private",
             pipeline_config=SimpleNamespace(
-                video_decoder_backend="taeh3", vae_config=SimpleNamespace()
+                decoder_type="taeh3", vae_config=SimpleNamespace()
             ),
         ),
         _async_raw_frame_materializer=None,

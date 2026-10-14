@@ -1011,9 +1011,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 getattr(vae_config, "taehv_checkpoint_path", None)
                 or (
                     source_async
-                    and getattr(
-                        self.server_args.pipeline_config, "video_decoder_backend", None
-                    )
+                    and getattr(self.server_args.pipeline_config, "decoder_type", None)
                     == "taeh3"
                 )
             )

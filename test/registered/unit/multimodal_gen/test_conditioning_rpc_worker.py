@@ -27,6 +27,7 @@ from types import SimpleNamespace as NS
 from unittest.mock import patch
 
 import torch
+
 from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -281,9 +282,9 @@ class TestConditioningRPCWorker(CustomTestCase):
                         rank, receipt
                     ),
                     allocate=allocate,
-                    broadcast_tensor=lambda tensor,
-                    name,
-                    rank=rank: bus.tensor_broadcast(rank, tensor, name),
+                    broadcast_tensor=lambda tensor, name, rank=rank: (
+                        bus.tensor_broadcast(rank, tensor, name)
+                    ),
                 )
             )
 
@@ -379,8 +380,9 @@ class TestConditioningRPCWorker(CustomTestCase):
         calls = []
         provider = cls(
             NS(
-                encode=lambda *a, **k: calls.append(k["input_digest"])
-                or condition(len(calls))
+                encode=lambda *a, **k: (
+                    calls.append(k["input_digest"]) or condition(len(calls))
+                )
             ),
             PROFILE,
         )
@@ -511,9 +513,9 @@ class TestConditioningRPCWorker(CustomTestCase):
                     1,
                     1,
                 )
-                stage.codecs.encode_condition = lambda p, m: encoded.append(
-                    "bypass"
-                ) or condition(99)
+                stage.codecs.encode_condition = lambda p, m: (
+                    encoded.append("bypass") or condition(99)
+                )
                 stage._use = lambda *a: nullcontext()
                 batch = NS(extra={}, session=None)
                 first = stage.codecs.prepare(
@@ -705,6 +707,9 @@ class TestConditioningRPCWorker(CustomTestCase):
         stage.conditioning_mode = "remote"
         stage._validate_sampling_params = lambda params: None
         stage.codecs = NS(
+            decoder=importlib.import_module(STAGES + ".decoder").DECODERS[
+                "official_h3"
+            ],
             video_decoder_name="video_vae",
             vae_latents_per_chunk=1,
             vae_frames_per_chunk=1,

@@ -25,9 +25,7 @@ from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 
 from .incremental import SourceReadySession
 from .source_bridge import SourceChunk, SourceChunkBridge
-from .source_decoder import SourceTAEH3Decoder
 from .source_encoder import create_source_buffer
-from .streaming_codecs import StableVideoDecoder
 from .streaming_noise import STREAMING_NOISE_VERSION
 
 logger = init_logger(__name__)
@@ -147,12 +145,7 @@ class ZingSourceStreamState(BaseRealtimeState):
         # Bind the initial condition to the accepted control event without a
         # second encode or a KV/RNG reset.
         self.sampler.prompt = (self.sampler.prompt[0], batch.realtime_event_id)
-        decoder_type = (
-            SourceTAEH3Decoder
-            if stage.codecs.video_decoder_name == "taeh3_decoder"
-            else StableVideoDecoder
-        )
-        self.decoder = decoder_type(
+        self.decoder = stage.codecs.decoder.source_decoder(
             stage.codecs,
             capacity_latents=2 * tokens + max_chunk + tokens,
             provenance_for=self.ledger.provenance_for,

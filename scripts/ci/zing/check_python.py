@@ -24,6 +24,42 @@ CONFIG_NAMES = {
 }
 
 
+# pyproject.toml also carries packaging metadata; only these keys can change what the
+# pinned hooks do (Ruff infers its target version from requires-python).
+PYPROJECT_LINT_KEYS = (
+    ("tool", "ruff"),
+    ("tool", "isort"),
+    ("tool", "black"),
+    ("project", "requires-python"),
+)
+
+
+def pyproject_lint_view(data):
+    config = tomllib.loads(data.decode("utf-8"))
+    view = {}
+    for keys in PYPROJECT_LINT_KEYS:
+        node = config
+        for key in keys:
+            node = node.get(key) if isinstance(node, dict) else None
+        view[".".join(keys)] = node
+    return view
+
+
+def lint_neutral_pyproject(repo, path, base, head):
+    """True only if base, head and worktree all parse and agree on every lint key."""
+    if Path(path).name != "pyproject.toml":
+        return False
+    try:
+        views = [
+            pyproject_lint_view(git(repo, "show", f"{ref}:{path}"))
+            for ref in (base, head)
+        ]
+        views.append(pyproject_lint_view((repo / path).read_bytes()))
+    except Exception:
+        return False
+    return views[0] == views[1] == views[2]
+
+
 def configuration_inputs(repo, ref=None):
     """Collect config dependencies without judging tool configuration validity.
 
@@ -212,9 +248,18 @@ def main():
             inputs.update(dependencies)
             uncertain |= ambiguous
         result["configuration_inputs"] = sorted(inputs)
+        neutral = {
+            path
+            for path in change["changed_paths"]
+            if lint_neutral_pyproject(
+                repo, path, change["merge_base_sha"], change["head_sha"]
+            )
+        }
+        result["lint_neutral_configs"] = sorted(neutral)
+        relevant = set(change["changed_paths"]) - neutral
         full = bool(
-            set(change["changed_paths"]) & inputs
-            or any(Path(path).name in CONFIG_NAMES for path in change["changed_paths"])
+            relevant & inputs
+            or any(Path(path).name in CONFIG_NAMES for path in relevant)
             or (uncertain and change["changed_paths"])
         )
         result["mode"] = "full" if full else "changed"

@@ -218,7 +218,7 @@ def test_zing_warmup_keeps_euler_endpoint():
     assert req.extra["zing_return_latents"] is False
 
 
-def test_zing_defaults_to_taeh3_and_requires_explicit_weights():
+def test_zing_defaults_to_lynn_and_requires_explicit_weights():
     from types import SimpleNamespace
 
     from sglang.multimodal_gen.configs.sample.zing_h3 import ZingH3SamplingParams
@@ -228,15 +228,25 @@ def test_zing_defaults_to_taeh3_and_requires_explicit_weights():
         resolve_component_attention_backend=lambda _name: (None, None),
     )
     config = ZingH3CausalPipelineConfig()
-    assert config.video_decoder_backend == "taeh3"
+    assert config.video_decoder_backend is None
     assert ZingH3SamplingParams().zing_realtime_decode_mode == "stable"
-    with pytest.raises(ValueError, match="TAEH3 requires a local checkpoint path"):
+    with pytest.raises(ValueError, match="lynn_streaming \\(the default decoder\\)"):
         config.validate_server_args(args)
-    config.taeh3_checkpoint_path = "/model/taeh3.pth"
+    config.decoder_config = {
+        "checkpoint_path": "/model/lynn.pt",
+        "model_dir": "/model/lynn",
+    }
     config.validate_server_args(args)
-    config.taeh3_decode_precision = "invalid"
+    assert config.decoder_type == "lynn_streaming"
+
+    taeh3 = ZingH3CausalPipelineConfig(video_decoder_backend="taeh3")
+    with pytest.raises(ValueError, match="TAEH3 requires a local checkpoint path"):
+        taeh3.validate_server_args(args)
+    taeh3.taeh3_checkpoint_path = "/model/taeh3.pth"
+    taeh3.validate_server_args(args)
+    taeh3.taeh3_decode_precision = "invalid"
     with pytest.raises(ValueError, match="Unsupported TAEH3 decode precision"):
-        config.validate_server_args(args)
+        taeh3.validate_server_args(args)
     ZingH3CausalPipelineConfig(video_decoder_backend="native").validate_server_args(
         args
     )

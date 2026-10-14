@@ -693,5 +693,81 @@ def test_rename_only_checks_existing_new_python_path(tmp_path):
     assert result_json(output)["eligible_files"] == [new]
 
 
+def test_packaging_only_pyproject_change_keeps_changed_mode(tmp_path):
+    repo = make_repo(tmp_path)
+    unrelated = write(repo, "test/unrelated.py", "value=  [1,2,3]\n")
+    project = (
+        '[project]\nname = "demo"\nrequires-python = ">=3.10"\ndependencies = [{}]\n'
+    )
+    write(repo, "python/pyproject.toml", project.format('"a==1"'))
+    base = commit(repo)
+    write(repo, "python/pyproject.toml", project.format('"a==1", "b==2"'))
+    head = commit(repo)
+    process, output = lint(repo, base, head)
+    receipt = result_json(output)
+    assert process.returncode == 0, receipt
+    assert receipt["mode"] == "changed"
+    assert receipt["lint_neutral_configs"] == ["python/pyproject.toml"]
+    assert "test/unrelated.py" not in receipt["eligible_files"]
+    assert unrelated.read_text() == "value=  [1,2,3]\n"
+
+
+def test_unchanged_ruff_table_stays_neutral_when_dependencies_change(tmp_path):
+    repo = make_repo(tmp_path)
+    write(repo, "test/unrelated.py", "value=  [1,2,3]\n")
+    project = (
+        '[project]\nname = "demo"\nrequires-python = ">=3.10"\n'
+        "dependencies = [{}]\n\n[tool.ruff]\nline-length = 100\n"
+    )
+    write(repo, "python/pyproject.toml", project.format('"a==1"'))
+    base = commit(repo)
+    write(repo, "python/pyproject.toml", project.format('"b==2"'))
+    head = commit(repo)
+    process, output = lint(repo, base, head)
+    receipt = result_json(output)
+    assert process.returncode == 0, receipt
+    assert receipt["mode"] == "changed"
+    assert receipt["lint_neutral_configs"] == ["python/pyproject.toml"]
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ('requires-python = ">=3.10"\n', 'requires-python = ">=3.12"\n'),
+        ("", "[tool.ruff]\nline-length = 120\n"),
+        ("", '[tool.isort]\nprofile = "black"\n'),
+        ("", "[tool.black]\nline-length = 100\n"),
+    ],
+    ids=["requires-python", "tool-ruff", "tool-isort", "tool-black"],
+)
+def test_lint_relevant_pyproject_change_checks_full_tree(tmp_path, before, after):
+    repo = make_repo(tmp_path)
+    write(repo, "test/unrelated.py", "value=  [1,2,3]\n")
+    write(repo, "python/pyproject.toml", '[project]\nname = "demo"\n' + before)
+    base = commit(repo)
+    write(repo, "python/pyproject.toml", '[project]\nname = "demo"\n' + after)
+    head = commit(repo)
+    process, output = lint(repo, base, head)
+    receipt = result_json(output)
+    assert receipt["mode"] == "full"
+    assert receipt["lint_neutral_configs"] == []
+    assert "test/unrelated.py" in receipt["eligible_files"]
+    assert process.returncode != 0
+
+
+def test_unparseable_pyproject_checks_full_tree(tmp_path):
+    repo = make_repo(tmp_path)
+    write(repo, "test/unrelated.py", "value=  [1,2,3]\n")
+    write(repo, "python/pyproject.toml", '[project]\nname = "demo"\n')
+    base = commit(repo)
+    write(repo, "python/pyproject.toml", "[\n")
+    head = commit(repo)
+    process, output = lint(repo, base, head)
+    receipt = result_json(output)
+    assert receipt["mode"] == "full"
+    assert receipt["lint_neutral_configs"] == []
+    assert process.returncode != 0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
