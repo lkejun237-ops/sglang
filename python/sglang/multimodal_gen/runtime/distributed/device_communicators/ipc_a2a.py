@@ -13,6 +13,7 @@ after an intervening spin_wait, which orders the rewrite after the peer's
 read of that slot.
 """
 
+import contextlib
 import logging
 import os
 import socket
@@ -135,6 +136,9 @@ class IpcA2AState:
         self.group = None
         self.failed = False
         self.inited = False
+        # Set while a caller captures a CUDA graph: replay would otherwise reuse
+        # a baked staging address and slot, neither of which stays valid.
+        self.nccl_in_capture = False
 
     def reset(self) -> None:
         """Drop mappings that belong to a model-parallel group being replaced."""
@@ -326,6 +330,8 @@ def ipc_a2a_ready(group) -> bool:
         IPC_A2A.reset()
     if IPC_A2A.failed:
         return False
+    if IPC_A2A.nccl_in_capture and torch.cuda.is_current_stream_capturing():
+        return False
     # CUDA-IPC is only implemented for TP1 two-rank Ulysses groups. The
     # initializer resolves the actual local device ordinals of both members,
     # so CFG replicas can use independent GPU pairs on the same host.
@@ -347,3 +353,14 @@ def ipc_a2a_ready(group) -> bool:
         logger.warning("IPC all-to-all unavailable (%s); using NCCL", e)
         IPC_A2A.failed = True
         return False
+
+
+@contextlib.contextmanager
+def nccl_during_capture():
+    """Route all-to-alls recorded by a CUDA graph capture through NCCL."""
+    previous = IPC_A2A.nccl_in_capture
+    IPC_A2A.nccl_in_capture = True
+    try:
+        yield
+    finally:
+        IPC_A2A.nccl_in_capture = previous

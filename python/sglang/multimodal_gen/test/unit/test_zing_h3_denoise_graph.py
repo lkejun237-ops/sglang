@@ -14,6 +14,7 @@ import pathlib
 import subprocess
 import sys
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -24,6 +25,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import ZingH3DiTConf
 from sglang.multimodal_gen.runtime.models.dits import zing_h3
 from sglang.multimodal_gen.runtime.models.dits.zing_h3 import ZingH3DiTModel
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+    ROUTE_CAPTURE,
+    ROUTE_INELIGIBLE,
+    ROUTE_REPLAY,
+    ROUTE_WARMUP,
     CudaGraphBackend,
     GraphWarmupError,
     ZingDenoiseGraphs,
@@ -338,6 +343,17 @@ def test_denoise_graph_env_switch(monkeypatch):
     monkeypatch.setenv("SGLANG_ZING_DENOISE_CUDA_GRAPH_MAX", "3")
     monkeypatch.setenv("SGLANG_ZING_DENOISE_CUDA_GRAPH", "yes")
     with pytest.raises(ValueError):
+        model_fixture.__wrapped__()
+
+
+def test_denoise_graph_sp_env_switch(monkeypatch):
+    """Sequence-parallel graphs are on by default; invalid values are rejected."""
+    monkeypatch.delenv("SGLANG_ZING_DENOISE_CUDA_GRAPH_SP", raising=False)
+    assert model_fixture.__wrapped__().denoise_graph_sp is True
+    monkeypatch.setenv("SGLANG_ZING_DENOISE_CUDA_GRAPH_SP", "0")
+    assert model_fixture.__wrapped__().denoise_graph_sp is False
+    monkeypatch.setenv("SGLANG_ZING_DENOISE_CUDA_GRAPH_SP", "yes")
+    with pytest.raises(ValueError, match="SGLANG_ZING_DENOISE_CUDA_GRAPH_SP"):
         model_fixture.__wrapped__()
 
 
@@ -750,3 +766,251 @@ def test_weights_free_table_replays_interleaved_sessions_exactly(
         routes += _active_routes(got[1])
     assert routes["capture"] > 0 and routes["replay"] > 0
     assert table.active_plans == 0 and table.stats()["fallback"] == 0
+
+
+# Sequence-parallel coordination: a scripted coordinator stands in for the peer
+# rank, recording every vote, so each rank's side of the protocol is checked
+# without a process group.
+
+
+class _ScriptedBackend:
+    """Follows the real backend's order: warm-up, warm-up vote, then capture."""
+
+    def __init__(self, fail=None, warmup_fail=None):
+        self.fail = fail
+        self.warmup_fail = warmup_fail
+        self.captures = 0
+        self.replays = 0
+        self.events = []
+
+    def supports(self, device):
+        return True
+
+    def capture(self, fn, warmed=None):
+        self.events.append("warmup")
+        agreed = True if warmed is None else warmed(self.warmup_fail is None)
+        if self.warmup_fail is not None:
+            raise GraphWarmupError("warm-up failed") from self.warmup_fail
+        if not agreed:
+            raise GraphWarmupError("warm-up failed on a peer rank")
+        self.captures += 1
+        self.events.append("capture")
+        if self.fail is not None:
+            raise self.fail
+        return object(), fn()
+
+    def replay(self, graph):
+        self.replays += 1
+
+
+class _ScriptedCoordinator:
+    def __init__(self, agree=True, peers_ok=True):
+        self.verdict = agree
+        self.peers_ok = peers_ok
+        self.routes = []
+        self.oks = []
+        self.fail_vote = None  # 1-based index of the all_ok vote a peer fails
+
+    def agree(self, route):
+        self.routes.append(route)
+        return self.verdict
+
+    def all_ok(self, ok):
+        self.oks.append(ok)
+        if self.fail_vote == len(self.oks):
+            return False
+        return ok and self.peers_ok
+
+
+def _sp_graphs(coordinator, backend=None):
+    graphs = ZingDenoiseGraphs(backend=backend or _ScriptedBackend())
+    graphs.coordinator = coordinator
+    return graphs
+
+
+def _sp_run(graphs, key="k"):
+    tensors = {"x": torch.ones(2)}
+    return graphs.run(
+        key,
+        tensors=tensors,
+        capture=lambda static: (static["x"] * 2,),
+        replay_host=lambda: None,
+    )
+
+
+def test_every_forward_votes_its_route_once():
+    coordinator = _ScriptedCoordinator()
+    graphs = _sp_graphs(coordinator)
+    assert _sp_run(graphs) is None
+    assert _sp_run(graphs) is not None
+    assert _sp_run(graphs) is not None
+    assert coordinator.routes == [ROUTE_WARMUP, ROUTE_CAPTURE, ROUTE_REPLAY]
+    # One vote after the warm-up, one after the capture.
+    assert coordinator.oks == [True, True]
+    assert graphs.backend.captures == 1 and graphs.backend.replays == 2
+
+
+def test_ineligible_forward_votes_without_a_key():
+    coordinator = _ScriptedCoordinator()
+    _sp_graphs(coordinator).vote_eager()
+    assert coordinator.routes == [ROUTE_INELIGIBLE]
+
+
+def test_vote_eager_is_free_without_a_coordinator():
+    _sp_graphs(None).vote_eager()
+
+
+def test_disagreement_runs_eager_and_forgets_the_key():
+    coordinator = _ScriptedCoordinator()
+    graphs = _sp_graphs(coordinator)
+    _sp_run(graphs)
+    _sp_run(graphs)
+    coordinator.verdict = False
+    assert _sp_run(graphs) is None
+    assert graphs.routes["route_mismatch"] == 1
+    assert not graphs.graphs and "k" not in graphs._seen
+    coordinator.verdict = True
+    assert _sp_run(graphs) is None  # warms up again, together with its peers
+    assert coordinator.routes[-1] == ROUTE_WARMUP
+
+
+def test_capture_failure_is_reported_to_peers_before_raising():
+    coordinator = _ScriptedCoordinator()
+    graphs = _sp_graphs(coordinator, _ScriptedBackend(fail=RuntimeError("boom")))
+    _sp_run(graphs)
+    with pytest.raises(RuntimeError, match="boom"):
+        _sp_run(graphs)
+    assert coordinator.oks == [True, False] and graphs.disabled
+
+
+def test_peer_capture_failure_fails_this_rank_too():
+    coordinator = _ScriptedCoordinator()
+    graphs = _sp_graphs(coordinator)
+    _sp_run(graphs)
+    coordinator.fail_vote = 2  # the peer's capture failed: the second vote
+    with pytest.raises(RuntimeError, match="peer rank"):
+        _sp_run(graphs)
+    assert graphs.disabled and graphs.backend.replays == 0
+
+
+def test_warmup_failure_is_voted_before_any_capture():
+    coordinator = _ScriptedCoordinator()
+    graphs = _sp_graphs(coordinator, _ScriptedBackend(warmup_fail=RuntimeError("oom")))
+    _sp_run(graphs)
+    with pytest.raises(GraphWarmupError):
+        _sp_run(graphs)
+    # Exactly one vote (the peers match it) and no capture collective follows it.
+    assert coordinator.oks == [False] and graphs.disabled
+    assert graphs.backend.events == ["warmup"] and graphs.backend.captures == 0
+
+
+def test_peer_warmup_failure_stops_this_rank_before_any_capture():
+    coordinator = _ScriptedCoordinator(peers_ok=False)
+    graphs = _sp_graphs(coordinator)
+    _sp_run(graphs)
+    with pytest.raises(GraphWarmupError, match="peer rank"):
+        _sp_run(graphs)
+    # This rank warmed up fine, yet it must not enter a capture its peer skips.
+    assert coordinator.oks == [True] and graphs.disabled
+    assert graphs.backend.events == ["warmup"] and graphs.backend.captures == 0
+    assert graphs.backend.replays == 0
+
+
+@pytest.mark.parametrize(
+    "enabled, size, ring, tp, rows, reason",
+    [
+        (False, 2, 1, 1, 8, "sequence_parallel"),
+        (True, 4, 2, 1, 8, "sp_topology"),
+        (True, 2, 2, 1, 8, "sp_topology"),
+        (True, 2, 1, 2, 8, "sp_topology"),
+        (True, 2, 1, 1, 9, None),
+        (True, 2, 1, 1, 8, None),
+        (True, 4, 1, 1, 8, None),
+        (True, 4, 1, 1, 10, None),
+        (True, 8, 1, 1, 8, None),
+        (True, 4, 1, 1, 1345, None),
+        (True, 8, 1, 1, 1345, None),
+    ],
+)
+def test_sequence_parallel_admission(
+    monkeypatch, enabled, size, ring, tp, rows, reason
+):
+    monkeypatch.setattr(
+        zing_h3, "get_sp_group", lambda: SimpleNamespace(ring_world_size=ring)
+    )
+    monkeypatch.setattr(zing_h3, "get_tp_world_size", lambda: tp)
+    model = SimpleNamespace(denoise_graph_sp=enabled)
+    actual = ZingH3DiTModel._sequence_parallel_graph_rejection(
+        model, SimpleNamespace(rows=rows), size
+    )
+    assert actual == reason
+
+
+@pytest.mark.parametrize(
+    "enabled, size, ring, tp, coordinated",
+    [
+        (True, 2, 1, 1, True),
+        (True, 1, 1, 1, False),
+        (True, 4, 1, 1, True),
+        (True, 4, 2, 1, False),
+        (True, 8, 1, 1, True),
+        (True, 2, 2, 1, False),
+        (True, 2, 1, 2, False),
+        (False, 2, 1, 1, False),
+    ],
+)
+def test_only_topologies_that_can_use_graphs_vote_on_routes(
+    monkeypatch, enabled, size, ring, tp, coordinated
+):
+    """A topology that always runs eager must not pay a CPU/Gloo vote on every
+    denoise forward; one that can use graphs keeps voting when a forward falls
+    back (RoPE rebuild, cache eligibility), because its peers may not."""
+    cpu_group = object()
+    monkeypatch.setattr(
+        zing_h3,
+        "get_sp_group",
+        lambda: SimpleNamespace(ring_world_size=ring, cpu_group=cpu_group),
+    )
+    monkeypatch.setattr(zing_h3, "get_tp_world_size", lambda: tp)
+    model = SimpleNamespace(denoise_graph_sp=enabled)
+    graphs = ZingDenoiseGraphs(backend=_ScriptedBackend())
+    ZingH3DiTModel._coordinate_sequence_parallel_routes(
+        model, graphs, device=torch.device("cpu"), ulysses_size=size
+    )
+    assert (graphs.coordinator is not None) is coordinated
+    if coordinated:
+        assert graphs.coordinator.group is cpu_group
+
+
+def test_sp_graph_key_distinguishes_global_splits_with_same_local_shape():
+    """Rank 0 owns three rows for both 10 and 11 global rows at SP4.
+
+    The all-to-all split lists differ, so the two forwards must not share a
+    captured graph even though this rank's input tensor layout is identical.
+    """
+    from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+        compute_sequence_splits,
+    )
+
+    assert compute_sequence_splits(10, 4) == [3, 3, 2, 2]
+    assert compute_sequence_splits(11, 4) == [3, 3, 3, 2]
+    model = SimpleNamespace(
+        _cache_weight_generation=0,
+        experimental_compiled_adaln=False,
+        experimental_attention_backend="torch_sdpa",
+    )
+    cache = SimpleNamespace(store_layout_signature=lambda: ())
+    tensors = {"x": torch.ones(3, 4)}
+    keys = [
+        ZingH3DiTModel._denoise_graph_key(
+            model,
+            tensors=tensors,
+            cache=cache,
+            history=20,
+            rows=rows,
+            weight_addresses=(),
+            ulysses_size=4,
+        )
+        for rows in (10, 11)
+    ]
+    assert keys[0] != keys[1]

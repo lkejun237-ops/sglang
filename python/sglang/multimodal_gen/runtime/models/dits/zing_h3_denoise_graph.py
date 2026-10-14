@@ -10,7 +10,11 @@ outside the graph pool and refreshed before every replay.
 import collections
 
 import torch
+import torch.distributed as dist
 
+from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+    nccl_during_capture,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -21,6 +25,35 @@ _ROUTE_LOG_INTERVAL = 256
 
 class GraphWarmupError(RuntimeError):
     """The eager warm-up before a capture failed; nothing was captured."""
+
+
+# Route intentions a rank votes on before a sequence-parallel denoise forward.
+ROUTE_INELIGIBLE = 0
+ROUTE_WARMUP = 1
+ROUTE_CAPTURE = 2
+ROUTE_REPLAY = 3
+
+
+class RouteCoordinator:
+    """Agrees a route across a sequence-parallel group over its CPU group.
+
+    Warm-up and capture issue different collectives than a replay, so ranks that
+    pick different routes would deadlock; every denoise forward votes exactly once.
+    """
+
+    def __init__(self, group):
+        self.group = group
+
+    def agree(self, route):
+        """True when every rank intends the same route."""
+        votes = torch.tensor([route, -route], dtype=torch.int64)
+        dist.all_reduce(votes, op=dist.ReduceOp.MAX, group=self.group)
+        return votes[0].item() == -votes[1].item()
+
+    def all_ok(self, ok):
+        flag = torch.tensor([int(ok)], dtype=torch.int64)
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=self.group)
+        return bool(flag.item())
 
 
 class CudaGraphBackend:
@@ -40,7 +73,13 @@ class CudaGraphBackend:
     def supports(self, device):
         return device.type == "cuda" and torch.version.hip is None
 
-    def capture(self, fn):
+    def capture(self, fn, warmed=None):
+        """Warm up ``fn`` eagerly, then capture it.
+
+        ``warmed(ok)`` runs once the local warm-up ended and before anything is
+        captured. It returns whether every peer rank warmed up too; a capture
+        issues collectives, so no rank may start one while a peer failed.
+        """
         current = torch.cuda.current_stream()
         if self._stream is None:
             self._stream = torch.cuda.Stream()
@@ -49,22 +88,33 @@ class CudaGraphBackend:
         try:
             # Lazy initialization (cuBLAS workspaces, Triton and FA4 compilation)
             # must happen on the capture stream before capturing.
+            warmup_error = None
             try:
                 with torch.cuda.stream(stream):
                     fn()
             except Exception as error:
-                raise GraphWarmupError("Zing denoise graph warm-up failed") from error
+                warmup_error = error
+            warmed_everywhere = warmed(warmup_error is None) if warmed else True
+            if warmup_error is not None or not warmed_everywhere:
+                raise GraphWarmupError(
+                    "Zing denoise graph warm-up failed"
+                    if warmup_error is not None
+                    else "Zing denoise graph warm-up failed on a peer rank"
+                ) from warmup_error
             current.wait_stream(stream)
             if self._pool is None:
                 self._pool = torch.cuda.graph_pool_handle()
             graph = torch.cuda.CUDAGraph()
             self.capturing = True
             # Other threads (decoders, encoders) keep using CUDA meanwhile.
-            with torch.cuda.graph(
-                graph,
-                pool=self._pool,
-                stream=stream,
-                capture_error_mode="thread_local",
+            with (
+                nccl_during_capture(),
+                torch.cuda.graph(
+                    graph,
+                    pool=self._pool,
+                    stream=stream,
+                    capture_error_mode="thread_local",
+                ),
             ):
                 outputs = fn()
         finally:
@@ -107,6 +157,11 @@ class ZingDenoiseGraphs:
     eager and keeps graphs enabled. A capture failure disables graphs for
     this model and propagates: a failed CUDA capture can leave RNG and allocator
     state unusable, so that forward cannot fall back to eager.
+
+    With a ``coordinator`` (sequence parallel) every denoise forward votes once
+    through ``vote_eager`` or ``run``; a disagreement runs eager on all ranks and
+    forgets the key. A failed warm-up on any rank fails all of them before any
+    capture collective is issued; a failed capture fails all of them too.
     """
 
     def __init__(self, *, backend=None, max_graphs=32):
@@ -118,6 +173,7 @@ class ZingDenoiseGraphs:
         self.graphs = collections.OrderedDict()
         self._seen = collections.OrderedDict()
         self.disabled = False
+        self.coordinator = None
         self._routed = 0
 
     def count(self, route):
@@ -125,6 +181,11 @@ class ZingDenoiseGraphs:
         self._routed += 1
         if self._routed % _ROUTE_LOG_INTERVAL == 0:
             logger.info("Zing denoise graph routes: %s", dict(self.routes))
+
+    def vote_eager(self):
+        """Tell the other ranks this forward cannot use a graph."""
+        if self.coordinator is not None:
+            self.coordinator.agree(ROUTE_INELIGIBLE)
 
     def run(self, key, *, tensors, capture, replay_host):
         """Outputs of this forward, or None when it must run eager.
@@ -138,6 +199,17 @@ class ZingDenoiseGraphs:
             return None
         entry = self.graphs.get(key)
         first_sighting = key not in self._seen
+        if self.coordinator is not None:
+            if entry is not None:
+                route = ROUTE_REPLAY
+            else:
+                route = ROUTE_WARMUP if first_sighting else ROUTE_CAPTURE
+            if not self.coordinator.agree(route):
+                # Forgetting the key makes every rank warm it up together next time.
+                self.graphs.pop(key, None)
+                self._seen.pop(key, None)
+                self.count("route_mismatch")
+                return None
         self._remember(key)
         if entry is None:
             if first_sighting:
@@ -167,6 +239,10 @@ class ZingDenoiseGraphs:
             exc_info=True,
         )
 
+    def _fail_together(self):
+        if self.coordinator is not None:
+            self.coordinator.all_ok(False)
+
     def _remember(self, key):
         self._seen[key] = None
         self._seen.move_to_end(key)
@@ -175,9 +251,18 @@ class ZingDenoiseGraphs:
 
     def _capture(self, key, tensors, capture):
         static = {name: tensor.clone() for name, tensor in tensors.items()}
+        # Under sequence parallel the backend votes on the warm-up outcome before
+        # any capture collective, so every rank leaves together on a failure.
+        votes = {} if self.coordinator is None else {"warmed": self.coordinator.all_ok}
         try:
-            graph, outputs = self.backend.capture(lambda: capture(static))
+            graph, outputs = self.backend.capture(lambda: capture(static), **votes)
         except GraphWarmupError:
+            if self.coordinator is not None:
+                # Every rank raised from the same vote and none began a capture;
+                # a warm-up that failed part-way may have skipped collectives, so
+                # graphs stay off rather than retrying the key.
+                self._disable()
+                raise
             # No capture began, so CUDA state is intact: run this forward eager
             # and warm the key up again before the next attempt.
             self._seen.pop(key, None)
@@ -185,8 +270,12 @@ class ZingDenoiseGraphs:
             logger.warning("Zing denoise graph warm-up failed", exc_info=True)
             return None
         except Exception:
+            self._fail_together()
             self._disable()
             raise
+        if self.coordinator is not None and not self.coordinator.all_ok(True):
+            self._disable()
+            raise RuntimeError("Zing denoise graph capture failed on a peer rank")
         entry = _Entry(graph, static, outputs)
         self.graphs[key] = entry
         while len(self.graphs) > self.max_graphs:

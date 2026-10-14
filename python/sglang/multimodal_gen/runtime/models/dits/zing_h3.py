@@ -24,6 +24,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_group,
+    get_tp_world_size,
     get_ulysses_ctx,
 )
 from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
@@ -51,6 +52,7 @@ from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_table import (
 )
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+    RouteCoordinator,
     ZingDenoiseGraphs,
 )
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_joint import ZingJointTransaction
@@ -266,6 +268,20 @@ def _numerics_mode():
         matmul.allow_bf16_reduced_precision_reduction,
         torch.are_deterministic_algorithms_enabled(),
     )
+
+
+def _sequence_parallel_topology_rejection(*, enabled):
+    """Why a sequence-parallel topology can never use denoise graphs, or None.
+
+    The answer depends only on process-wide configuration, so every rank agrees.
+    """
+    if not enabled:
+        return "sequence_parallel"
+    if get_sp_group().ring_world_size != 1:
+        return "sp_topology"
+    if get_tp_world_size() != 1:
+        return "sp_topology"
+    return None
 
 
 def _has_forward_hooks(model):
@@ -718,6 +734,9 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         denoise_graph = os.environ.get("SGLANG_ZING_DENOISE_CUDA_GRAPH", "1")
         if denoise_graph not in {"0", "1"}:
             raise ValueError("SGLANG_ZING_DENOISE_CUDA_GRAPH must be 0 or 1")
+        denoise_graph_sp = os.environ.get("SGLANG_ZING_DENOISE_CUDA_GRAPH_SP", "1")
+        if denoise_graph_sp not in {"0", "1"}:
+            raise ValueError("SGLANG_ZING_DENOISE_CUDA_GRAPH_SP must be 0 or 1")
         denoise_graph_budget = os.environ.get(
             "SGLANG_ZING_DENOISE_CUDA_GRAPH_MAX", "32"
         )
@@ -803,6 +822,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             if denoise_graph == "1"
             else None
         )
+        self.denoise_graph_sp = denoise_graph_sp == "1"
 
     def _project_outputs(self, hidden, p, layout, *, joint_ends=None):
         """Project video/audio rows and restore global packed order across SP.
@@ -1746,7 +1766,9 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         if not self.denoise_graphs.backend.supports(inputs.x.device):
             return "device"
         if ulysses_size != 1:
-            return "sequence_parallel"
+            reason = self._sequence_parallel_graph_rejection(inputs, ulysses_size)
+            if reason is not None:
+                return reason
         if host_layout is None:
             return "device_metadata"
         if _has_forward_hooks(self):
@@ -1762,6 +1784,33 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         if inputs.context.shape[0] or mask is not None:
             return "context"
         return None
+
+    def _sequence_parallel_graph_rejection(self, inputs, ulysses_size):
+        """Why a sequence-parallel denoise forward cannot use a graph, or None.
+
+        Only a pure Ulysses group (no ring, no tensor parallelism) is supported.
+        Variable-length all-to-all handles uneven row splits; global rows and
+        local tensor layouts distinguish their captured graphs.
+        """
+        reason = _sequence_parallel_topology_rejection(enabled=self.denoise_graph_sp)
+        if reason is not None:
+            return reason
+        return None
+
+    def _coordinate_sequence_parallel_routes(self, graphs, *, device, ulysses_size):
+        """Give a graph set a route coordinator when its topology can use graphs.
+
+        A topology that never uses graphs gets none, so its denoise forwards pay
+        no cross-rank vote.
+        """
+        if ulysses_size == 1 or graphs.coordinator is not None:
+            return
+        # Devices without graph support never reach the topology check.
+        if not graphs.backend.supports(device):
+            return
+        if _sequence_parallel_topology_rejection(enabled=self.denoise_graph_sp):
+            return
+        graphs.coordinator = RouteCoordinator(get_sp_group().cpu_group)
 
     def _denoise_graph(
         self,
@@ -1781,6 +1830,9 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         AdaLN cache sees exactly one lookup per slot either way.
         """
         graphs = self.denoise_graphs
+        self._coordinate_sequence_parallel_routes(
+            graphs, device=inputs.x.device, ulysses_size=ulysses_size
+        )
         reason = self._denoise_graph_rejection(
             inputs,
             options=options,
@@ -1791,6 +1843,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         )
         if reason is not None:
             graphs.count(reason)
+            graphs.vote_eager()
             return None, None
         projections = [
             self._projection(index, block.adaln_proj, inputs, options, None)
@@ -1801,10 +1854,12 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 "final", self.final_layer.adaln_proj, inputs, options, None
             )
         )
-        rows = inputs.layout.row_stop - inputs.layout.row_start
+        # Global rows: under sequence parallel the cache holds the whole sequence.
+        rows = inputs.rows
         history = cache.reused_history_rows(rows)
         if history is None:
             graphs.count("rope_rebuild")
+            graphs.vote_eager()
             return None, projections
         tensors = _graph_tensors(inputs, projections)
         key = self._denoise_graph_key(
@@ -1813,6 +1868,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             history=history,
             rows=rows,
             weight_addresses=weight_addresses,
+            ulysses_size=ulysses_size,
         )
         stats = dict(cache.rope_reuse_stats)
 
@@ -1841,9 +1897,12 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             cache.rope_reuse_stats.update(stats)
         return outputs, projections
 
-    def _denoise_graph_key(self, *, tensors, cache, history, rows, weight_addresses):
+    def _denoise_graph_key(
+        self, *, tensors, cache, history, rows, weight_addresses, ulysses_size
+    ):
         """Everything a captured forward reads by address or decides on the host."""
         return (
+            ulysses_size,
             self._cache_weight_generation,
             weight_addresses,
             tuple((name, _tensor_layout(t)) for name, t in tensors.items()),
