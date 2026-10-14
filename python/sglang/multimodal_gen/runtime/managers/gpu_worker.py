@@ -988,7 +988,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         output_batch: OutputBatch,
         req: Req,
     ) -> bool:
-        """Use the local single-GPU TAEHV asynchronous RGB24 transport when safe."""
+        """Use the local asynchronous RGB24 transport on the output rank."""
         output = output_batch.output
         source_async = (
             getattr(req, "extra", {})
@@ -1003,7 +1003,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         vae_config = getattr(self.server_args.pipeline_config, "vae_config", None)
         if not (
             self.rank == 0
-            and getattr(self.server_args, "num_gpus", 1) == 1
             and getattr(self.server_args, "realtime_vae_backend", None)
             == LOCAL_VAE_BACKEND
             and is_local_endpoint(getattr(self.server_args, "scheduler_endpoint", ""))
@@ -1031,7 +1030,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         ):
             if source_async:
                 raise ValueError(
-                    "Source async RGB requires a local single-GPU TAEH3 deployment"
+                    "Source async RGB requires a local TAEH3 output-rank deployment"
                 )
             return False
 
