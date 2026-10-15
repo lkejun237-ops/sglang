@@ -15,7 +15,7 @@ from diffusers.models.autoencoders.autoencoder_kl_minimax_h3 import (
 from torch import nn
 
 from .attention import ATTENTION_BACKENDS, streaming_block
-from .geometry import split_tiles
+from .geometry import split_tiles, tile_shard
 from .stream import LynnStream
 from .temporal import TemporalProtocol
 
@@ -35,6 +35,9 @@ class LynnDecoderConfig(msgspec.Struct, frozen=True):
 class StreamState(msgspec.Struct):
     latent_index: int = 0
     geometry: tuple | None = None
+    # Request-private, flat FP32 storage sized for the largest temporal phase.
+    pixel_send: torch.Tensor | None = None
+    pixel_recv: torch.Tensor | None = None
     # tile id -> per-layer (K before RoPE, V), each [B, history spatial tokens, heads, head_dim]
     tiles: dict = {}
 
@@ -99,11 +102,11 @@ class StreamingDecoder(nn.Module):
     def init_stream(self):
         return StreamState()
 
-    def new_stream(self, *, frame_limit=None):
-        return LynnStream(self, frame_limit=frame_limit)
+    def new_stream(self, *, frame_limit=None, group=None):
+        return LynnStream(self, frame_limit=frame_limit, group=group)
 
-    def decode(self, latent, frames):
-        return self.new_stream(frame_limit=frames).decode(latent, frames)
+    def decode(self, latent, frames, *, group=None):
+        return self.new_stream(frame_limit=frames, group=group).decode(latent, frames)
 
     def _project_pixels(self, hidden, grid, start):
         b, frames = hidden.shape[:2]
@@ -174,9 +177,12 @@ class StreamingDecoder(nn.Module):
         xs, ws, ox = split_tiles(z_t.shape[-1] * ratio, **kwargs)
         return ys, hs, oy, xs, ws, ox
 
-    def decode_step(self, z_t, state):
+    def decode_step(self, z_t, state, group=None):
         """Consume one normalized latent [B, C, 1, H, W]; returns (RGB frames, state).
 
+        With an SP `group` (world size > 1) each rank decodes and keeps K/V only
+        for its contiguous tile range, then all ranks gather every tile and
+        stitch the full frame locally. Every rank must call this in lockstep.
         Not retryable: a failure part-way leaves `state` half-updated.
         """
         if (
@@ -185,7 +191,10 @@ class StreamingDecoder(nn.Module):
             or z_t.shape[1] != self.architecture["latent_channels"]
         ):
             raise ValueError("decode_step expects normalized [B,24,1,H,W]")
-        cfg, decoder, ratio = self.config, self.decoder, self.spatial_ratio
+        cfg = self.config
+        rank, world_size = (
+            (0, 1) if group is None else (group.rank_in_group, group.world_size)
+        )
         geometry = (
             tuple(z_t.shape),
             z_t.device,
@@ -193,6 +202,8 @@ class StreamingDecoder(nn.Module):
             cfg.tile_size,
             cfg.tile_overlap,
             cfg.temporal_window,
+            rank,
+            world_size,
         )
         if state.geometry is not None and state.geometry != geometry:
             raise ValueError(
@@ -204,7 +215,115 @@ class StreamingDecoder(nn.Module):
         z_t = z_t.float() * self.latent_std + self.latent_mean
         ys, hs, oy, xs, ws, ox = self._tile_layout(z_t)
         tile_ids = [(y, x, hp, wp) for y, hp in zip(ys, hs) for x, wp in zip(xs, ws)]
-        batch_size = cfg.tile_batch_size or len(tile_ids)
+        if world_size == 1:
+            decoded = self._decode_tiles(z_t, tile_ids, state, phase)
+        else:
+            # Allocate before tile decoding, while activation memory is still free.
+            max_shape = (
+                z_t.shape[0],
+                self.decoder.out_channels,
+                self.protocol.ratio,
+                hs[0],
+                ws[0],
+            )
+            self._init_pixel_workspace(
+                state, group, len(tile_ids), max_shape, z_t.device
+            )
+            start, end = tile_shard(len(tile_ids), rank, world_size)
+            try:
+                decoded, error = (
+                    self._decode_tiles(z_t, tile_ids[start:end], state, phase),
+                    None,
+                )
+            except Exception as exc:
+                # Still join the gather so peers fail instead of hanging in it.
+                decoded, error = {}, exc
+            # Tiles on one axis share a size; phase 0 drops the pre-padding frames.
+            count = self.protocol.ratio - (
+                self.protocol.pre_padding if phase == 0 else 0
+            )
+            shape = (z_t.shape[0], self.decoder.out_channels, count, hs[0], ws[0])
+            decoded = self._gather_tiles(group, tile_ids, decoded, error, shape, state)
+        rows = [
+            [decoded[y, x, hp, wp] for x, wp in zip(xs, ws)] for y, hp in zip(ys, hs)
+        ]
+        frames = self._stitch_tiles(rows, oy, ox)
+        state.latent_index += 1
+        return frames, state
+
+    @staticmethod
+    def _init_pixel_workspace(state, group, tile_count, shape, device):
+        """Agree on allocation success before any rank enters the pixel collective.
+
+        This guards synchronous workspace allocation errors, not arbitrary
+        asynchronous CUDA failures or a process that has already exited.
+        """
+        if state.pixel_send is not None:
+            return
+        # Keep the control flag on CPU so reporting a GPU allocation failure
+        # does not itself require a new GPU allocation.
+        failed = torch.zeros(1, dtype=torch.int32, device="cpu")
+        width = ((tile_count + group.world_size - 1) // group.world_size) * math.prod(
+            shape
+        ) + 1
+        reason = None
+        try:
+            state.pixel_send = torch.empty(width, dtype=torch.float32, device=device)
+            state.pixel_recv = torch.empty(
+                group.world_size * width, dtype=torch.float32, device=device
+            )
+        except Exception as exc:
+            # Do not keep an exception/traceback that owns partially allocated
+            # tensors alive while peers wait for the allocation consensus.
+            reason = str(exc)
+            state.pixel_send = state.pixel_recv = None
+            failed.fill_(1)
+        torch.distributed.all_reduce(
+            failed, op=torch.distributed.ReduceOp.MAX, group=group.cpu_group
+        )
+        if failed.item():
+            state.pixel_send = state.pixel_recv = None
+            detail = f": {reason}" if reason is not None else " on an SP peer"
+            raise RuntimeError(f"Lynn pixel workspace initialization failed{detail}")
+
+    @staticmethod
+    def _gather_tiles(group, tile_ids, decoded, error, shape, state):
+        """Pack directly into reusable storage and gather only the current phase."""
+        world_size, numel = group.world_size, math.prod(shape)
+        bounds = [tile_shard(len(tile_ids), r, world_size) for r in range(world_size)]
+        width = max(end - start for start, end in bounds) * numel
+        local = state.pixel_send[: width + 1]
+        local.zero_()
+        start, end = bounds[group.rank_in_group]
+        if error is not None:
+            local[-1] = 1
+        else:
+            for index, tile in enumerate(tile_ids[start:end]):
+                local[index * numel : (index + 1) * numel].view(shape).copy_(
+                    decoded[tile]
+                )
+        # The whole flat prefix is contiguous; slicing each maximal-phase row
+        # separately would leave gaps between rows during a shorter phase.
+        received = state.pixel_recv[: world_size * (width + 1)]
+        group.all_gather_into(received, local)
+        gathered = received.view(world_size, width + 1)
+        failed = gathered[:, -1].nonzero().flatten().tolist()
+        if error is not None:
+            local = received = gathered = None
+            raise error
+        if failed:
+            local = received = gathered = None
+            raise RuntimeError(f"Lynn tile decode failed on SP rank(s) {failed}")
+        result = {}
+        for rank, (start, end) in enumerate(bounds):
+            tiles = gathered[rank, : (end - start) * numel].view(end - start, *shape)
+            result.update(zip(tile_ids[start:end], tiles))
+        return result
+
+    def _decode_tiles(self, z_t, tile_ids, state, phase):
+        """Decode `tile_ids` of the de-normalized latent; updates their K/V in `state`."""
+        cfg, decoder, ratio = self.config, self.decoder, self.spatial_ratio
+        batch_size = cfg.tile_batch_size or max(1, len(tile_ids))
         video_batch, decoded = z_t.shape[0], {}
         window = self.protocol.teacher_window
         keep_frames = cfg.temporal_window - 1
@@ -316,9 +435,4 @@ class StreamingDecoder(nn.Module):
                 state.tiles[tile] = [(k[lo:hi], v[lo:hi]) for k, v in updated]
             pixels = self._project_pixels(hidden[:, None], (h, w), state.latent_index)
             decoded.update(zip(batch_tiles, pixels.split(video_batch)))
-        rows = [
-            [decoded[y, x, hp, wp] for x, wp in zip(xs, ws)] for y, hp in zip(ys, hs)
-        ]
-        frames = self._stitch_tiles(rows, oy, ox)
-        state.latent_index += 1
-        return frames, state
+        return decoded

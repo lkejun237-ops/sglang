@@ -417,6 +417,31 @@ class GroupCoordinator:
                 )
         return input_
 
+    def all_gather_into(
+        self, output: torch.Tensor, input_: torch.Tensor
+    ) -> torch.Tensor:
+        """Gather flat contiguous input into caller-owned contiguous storage.
+
+        The output has exactly ``world_size * input_.numel()`` elements with
+        the same dtype/device. This blocking operation keeps rank order and
+        avoids the allocation and reshaping policy of ``all_gather``.
+        """
+        if input_.ndim != 1 or output.ndim != 1:
+            raise ValueError("all_gather_into requires flat tensors")
+        if not input_.is_contiguous() or not output.is_contiguous():
+            raise ValueError("all_gather_into requires contiguous tensors")
+        if output.numel() != self.world_size * input_.numel():
+            raise ValueError("all_gather_into output has the wrong element count")
+        if output.dtype != input_.dtype or output.device != input_.device:
+            raise ValueError(
+                "all_gather_into input and output must match dtype and device"
+            )
+        if self.world_size == 1:
+            output.copy_(input_)
+        else:
+            all_gather_single(output, input_, group=self.device_group)
+        return output
+
     def all_gather(
         self, input_: torch.Tensor, dim: int = 0, separate_tensors: bool = False
     ) -> Union[torch.Tensor, List[torch.Tensor]]:

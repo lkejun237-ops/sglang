@@ -18,3 +18,10 @@ def split_tiles(length, *, size, overlap, ratio):
     for value in overlaps:
         starts.append(starts[-1] + size - value)
     return starts, [size] * count, overlaps
+
+
+def tile_shard(count, rank, world_size):
+    """Return the [start, end) tile range of `rank`: contiguous, remainder to leading ranks."""
+    base, extra = divmod(count, world_size)
+    start = rank * base + min(rank, extra)
+    return start, start + base + (rank < extra)

@@ -121,7 +121,7 @@ class SourceLynnDecoder:
 
     def __init__(self, codecs, *, capacity_latents, provenance_for):
         module = codecs.modules[codecs.decoder.module_key]
-        self.stream = module.new_stream()
+        self.stream = codecs.decoder.new_stream(module, frame_limit=None)
         self.protocol = module.protocol
         self.capacity_latents = capacity_latents
         self.provenance_for = provenance_for

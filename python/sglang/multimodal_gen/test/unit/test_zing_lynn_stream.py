@@ -197,11 +197,11 @@ def test_failed_push_closes_the_stream(model, monkeypatch):
     stream.push(_latent(1))
     decode_step, calls = model.decode_step, []
 
-    def fail_on_second(z_t, state):
+    def fail_on_second(z_t, state, group):
         calls.append(None)
         if len(calls) == 2:
             raise RuntimeError("boom")
-        return decode_step(z_t, state)
+        return decode_step(z_t, state, group)
 
     monkeypatch.setattr(model, "decode_step", fail_on_second)
     with pytest.raises(RuntimeError, match="boom"):
@@ -288,7 +288,7 @@ def test_source_decoder_closes_after_a_failed_decode(model, monkeypatch):
     decoder = _source_decoder(model)
     decoder.append(_latent(2), latent_start=0, source_dependency_end=5)
 
-    def fail(z_t, state):
+    def fail(z_t, state, group):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(model, "decode_step", fail)

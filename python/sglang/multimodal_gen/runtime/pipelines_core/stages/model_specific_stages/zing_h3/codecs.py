@@ -431,7 +431,9 @@ class ZingH3Codecs(ZingH3MediaInput):
 
     def decode_visual(self, latent, frames):
         if self.decoder.stateful:
-            return self.modules[self.decoder.module_key].decode(latent, frames)
+            return self.decoder.decode(
+                self.modules[self.decoder.module_key], latent, frames
+            )
         model = self.modules["video_vae"]
         single = frames == 1 and latent.shape[2] == 1
         chunk, drop = self.vae_latents_per_chunk, self.va.vae_token_drop

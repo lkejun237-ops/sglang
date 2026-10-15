@@ -19,6 +19,19 @@ _TAEH3_DTYPES = {
 }
 
 
+def sp_tile_group():
+    """SP group whose ranks split Lynn tiles; None without distributed SP>1."""
+    from sglang.multimodal_gen.runtime.distributed import (
+        get_sp_group,
+        model_parallel_is_initialized,
+    )
+
+    if not torch.distributed.is_initialized() or not model_parallel_is_initialized():
+        return None
+    group = get_sp_group()
+    return group if group.world_size > 1 else None
+
+
 class OfficialH3Adapter:
     """Exported H3 video_vae; overlap-window decode in immediate or stable mode."""
 
@@ -53,6 +66,9 @@ class TAEH3Adapter:
     def new_stream(self, module, *, frame_limit):
         return module.new_stream()
 
+    def decode(self, module, latent, frames):
+        return module.decode(latent, frames)
+
     source_decoder = SourceTAEH3Decoder
 
 
@@ -74,7 +90,10 @@ class LynnStreamingAdapter:
         return module.protocol.frame_count(latent_count)
 
     def new_stream(self, module, *, frame_limit):
-        return module.new_stream(frame_limit=frame_limit)
+        return module.new_stream(frame_limit=frame_limit, group=sp_tile_group())
+
+    def decode(self, module, latent, frames):
+        return module.decode(latent, frames, group=sp_tile_group())
 
     source_decoder = SourceLynnDecoder
 
