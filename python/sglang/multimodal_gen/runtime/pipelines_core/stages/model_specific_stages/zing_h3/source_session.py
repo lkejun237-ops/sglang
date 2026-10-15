@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.realtime.session import BaseRealtimeState
 from sglang.multimodal_gen.runtime.realtime.zing_contracts import PixelRange
+from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import ZingKVPoolAdmissionError
 from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
     SourceLedger,
     SourceLimits,
@@ -40,7 +41,6 @@ class ZingSourceStreamState(BaseRealtimeState):
         self.command_index = 0
         self.prompt = self.prompt_event = None
         self.failed_update = None
-        self.effective_prompt_version = None
         self.closed = False
         self.component_capture = None
         self.kv_lease = None
@@ -105,7 +105,6 @@ class ZingSourceStreamState(BaseRealtimeState):
             raise ValueError("Continuous source requires a video-only static prefix")
         self.prompt = params.prompt
         self.prompt_event = batch.realtime_event_id
-        self.effective_prompt_version = getattr(batch, "realtime_prompt_version", None)
         self.ledger = SourceLedger(**config)
         clip, tokens = (
             stage.codecs.vae_frames_per_chunk,
@@ -141,10 +140,12 @@ class ZingSourceStreamState(BaseRealtimeState):
             else 1,
             max_pending_bytes=256 << 20,
             acquire_storage=self._pooled_storage(stage, batch.session, sampler),
+            prompt_switch_prefix_latent_frames=(
+                stage.prompt_switch_prefix_latent_frames
+            ),
+            initial_prompt_event_id=batch.realtime_event_id,
+            initial_prompt_version=getattr(batch, "realtime_prompt_version", None),
         )
-        # Bind the initial condition to the accepted control event without a
-        # second encode or a KV/RNG reset.
-        self.sampler.prompt = (self.sampler.prompt[0], batch.realtime_event_id)
         self.decoder = stage.codecs.decoder.source_decoder(
             stage.codecs,
             capacity_latents=2 * tokens + max_chunk + tokens,
@@ -184,6 +185,58 @@ class ZingSourceStreamState(BaseRealtimeState):
 
         return acquire
 
+    def _admit_prompt_update(self, stage, condition):
+        """Check the new condition before it can replace active or pending KV."""
+        if getattr(stage, "kv_pool", None) is None:
+            return
+        # Pack one placeholder target to reuse the authoritative reference-row
+        # accounting. No model forward, random draw, lease or KV write occurs.
+        packer = stage.packer
+        _, height, width = self.inputs.visual_shape
+        visual = condition["context"].new_zeros(
+            (1, packer.visual_channels, 1, height, width)
+        )
+        layout = packer.pack_inference_layout(self.inputs, condition, visual, None)
+        request = stage.kv_request(
+            self.sampler.sampler,
+            self.inputs,
+            layout,
+            source_shape=(height, width),
+            total_frames=None,
+        )
+        try:
+            stage.kv_pool.plan.admit(request)
+        except ZingKVPoolAdmissionError as exc:
+            logger.warning("Prompt update rejected by KV pool: %s", exc.detail)
+            raise ConditionError("CONDITION_INVALID", exc.detail) from exc
+
+    def _update_prompt(self, stage, batch):
+        """Reject invalid candidates without disturbing the active generation."""
+        notice = None
+        update = (batch.sampling_params.prompt, batch.realtime_event_id)
+        discard = getattr(self.sampler, "discard_pending_prompt", None)
+        if discard is not None:
+            discard()
+        try:
+            positive = stage.encode_condition_for_batch(
+                batch,
+                batch.sampling_params.prompt,
+                self.inputs.condition_media,
+            )
+            self._admit_prompt_update(stage, positive)
+        except ConditionError as exc:
+            self.failed_update = update
+            notice = {"code": exc.code, "event_id": batch.realtime_event_id}
+        else:
+            self.sampler.update_prompt(
+                positive,
+                batch.realtime_event_id,
+                getattr(batch, "realtime_prompt_version", None),
+            )
+            self.prompt, self.prompt_event = update
+            self.failed_update = None
+        return notice
+
     @torch.no_grad()
     def run(self, stage, batch):
         if self.closed or batch.block_idx != self.command_index:
@@ -221,23 +274,8 @@ class ZingSourceStreamState(BaseRealtimeState):
                 self.prompt,
                 self.prompt_event,
             ):
-                try:
-                    with timed("prompt_host_ms"):
-                        positive = stage.encode_condition_for_batch(
-                            batch,
-                            batch.sampling_params.prompt,
-                            self.inputs.condition_media,
-                        )
-                except ConditionError as exc:
-                    self.failed_update = update
-                    notice = {"code": exc.code, "event_id": batch.realtime_event_id}
-                else:
-                    self.sampler.update_prompt(positive, batch.realtime_event_id)
-                    self.prompt, self.prompt_event = update
-                    self.effective_prompt_version = getattr(
-                        batch, "realtime_prompt_version", None
-                    )
-                    self.failed_update = None
+                with timed("prompt_host_ms"):
+                    notice = self._update_prompt(stage, batch)
             count = sum(x["payload"]["num_frames"] for x in command["appends"])
             if count > 2 * stage.codecs.vae_frames_per_chunk:
                 raise ValueError(
@@ -340,7 +378,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                     self.bridge.finish()
                     self.bridge_finished = True
                 self._generate_ready(stage, batch, outputs, metadata, timed)
-                if not self.bridge.ready:
+                if not self._bridge_ready() and not self._pending_chunks():
                     if not self.sampler.ended:
                         self.sampler.finish()
                     if not self.sampler.complete:
@@ -352,7 +390,9 @@ class ZingSourceStreamState(BaseRealtimeState):
                     if self.component_capture is not None:
                         self.component_capture.finish()
                     completed = True
-            more_work = not completed and (self.pixels.ready or self.bridge.ready)
+            more_work = not completed and (
+                self.pixels.ready or self._bridge_ready() or self._pending_chunks()
+            )
             self.command_index += 1
             usage = {
                 "zing_realtime_blocks": metadata,
@@ -480,14 +520,34 @@ class ZingSourceStreamState(BaseRealtimeState):
     def _within_work_budget(self):
         return not self.work_quantum or self.dispatch_steps < self.work_quantum
 
+    def _pending_chunks(self):
+        return getattr(self.sampler, "pending", ())
+
+    def _next_bridge_count(self):
+        if hasattr(self.sampler, "next_chunk_size"):
+            return self.sampler.next_chunk_size
+        upcoming = self.bridge.plan.chunk(
+            self.bridge.chunk_id,
+            self.bridge.accepted_latents if self.bridge.ended else None,
+        )
+        return None if upcoming is None else upcoming.end - upcoming.start
+
+    def _bridge_ready(self):
+        count = self._next_bridge_count()
+        return count is not None and self.bridge.ready_for(count)
+
+    def _pop_bridge(self):
+        count = self._next_bridge_count()
+        return None if count is None else self.bridge.pop(count)
+
     def _generate_ready(self, stage, batch, outputs, metadata, timed, *, flush=True):
         if getattr(self.sampler.sampler, "joint_forward", "off") == "cross_chunk":
             return self._generate_joint_ready(
                 stage, batch, outputs, metadata, timed, flush=flush
             )
-        while self.bridge.ready and self._within_work_budget():
+        while self._bridge_ready() and self._within_work_budget():
             with timed("bridge_host_ms"):
-                chunk = self.bridge.pop()
+                chunk = self._pop_bridge()
                 self.sampler.append(
                     chunk.source,
                     chunk.noise,
@@ -520,7 +580,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                     "block_idx": result.chunk.chunk_id,
                     "request_id": batch.request_id,
                     "event_id": result.prompt_event_id,
-                    "prompt_version": self.effective_prompt_version,
+                    "prompt_version": result.prompt_version,
                     "frame_end": result.provenance.pixels.end,
                 }
             )
@@ -535,18 +595,15 @@ class ZingSourceStreamState(BaseRealtimeState):
         self, stage, batch, outputs, metadata, timed, *, flush=True
     ):
         while (
-            self.bridge.ready or self.sampler.pending
+            self._bridge_ready() or self.sampler.pending
         ) and self._within_work_budget():
             capacity = self.sampler.max_pending_chunks
             if self.work_quantum:
                 capacity = min(capacity, self.work_quantum - self.dispatch_steps)
-            while self.bridge.ready and len(self.sampler.pending) < capacity:
+            while self._bridge_ready() and len(self.sampler.pending) < capacity:
                 if self.sampler.pending:
-                    upcoming = self.bridge.plan.chunk(
-                        self.bridge.chunk_id,
-                        self.bridge.accepted_latents if self.bridge.ended else None,
-                    )
-                    values = self.bridge.values[:, :, : upcoming.end - upcoming.start]
+                    count = self._next_bridge_count()
+                    values = self.bridge.values[:, :, :count]
                     needed = values.numel() * (values.element_size() + 4)
                     del values
                     # One-chunk fallback before popping transfers any ownership.
@@ -563,7 +620,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                         flush = True
                         break
                 with timed("bridge_host_ms"):
-                    chunk = self.bridge.pop()
+                    chunk = self._pop_bridge()
                     self.sampler.append(
                         chunk.source,
                         chunk.noise,
@@ -623,7 +680,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                             "block_idx": result.chunk.chunk_id,
                             "request_id": batch.request_id,
                             "event_id": result.prompt_event_id,
-                            "prompt_version": self.effective_prompt_version,
+                            "prompt_version": result.prompt_version,
                             "frame_end": result.provenance.pixels.end,
                         }
                     )
@@ -724,5 +781,4 @@ class ZingSourceStreamState(BaseRealtimeState):
         self.blocks.clear()
         self.prompt = self.prompt_event = None
         self.failed_update = None
-        self.effective_prompt_version = None
         self.closed = True

@@ -303,6 +303,8 @@ def _source_stream(model, storage=None, workspace=None):
     )
 
     sampler = _sampler(model)
+    sampler.processor.num_frame_per_block = [3, 2]
+    sampler.processor.split_first_latent = True
     sampler.prefix_workspace = workspace
     torch.manual_seed(11)
     inputs = _inputs(12)
@@ -325,6 +327,9 @@ def _source_stream(model, storage=None, workspace=None):
         max_pending_chunks=1,
         max_pending_bytes=1 << 20,
         acquire_storage=acquire if storage is not None else None,
+        prompt_switch_prefix_latent_frames=5,
+        initial_prompt_event_id=0,
+        initial_prompt_version=0,
     )
     assert (session.cache is None) == (storage is not None)
     outputs = []
@@ -362,6 +367,108 @@ def _storage_for(model, rows):
     from sglang.multimodal_gen.test.unit.test_zing_h3_kv_pool_cache import _storage
 
     return _storage(model, rows)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("with_reference", [False, True])
+def test_prompt_budget_rejection_preserves_live_pool_and_recovers(
+    model, with_reference
+):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.incremental import (
+        SourceReadySession,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.source_session import (
+        ZingSourceStreamState,
+    )
+    from sglang.multimodal_gen.test.unit.test_zing_h3_chunks import fixture_provenance
+
+    sampler = _sampler(model)
+    sampler.processor.num_frame_per_block = [3, 2]
+    sampler.processor.split_first_latent = True
+    plan = ZingKVPoolPlan.build(
+        _plan(1).config,
+        ZingKVGeometry(16, (1, 2, 2), 64, ChunkPlan([3, 2], True)),
+    )
+    pool = ZingKVPool.allocate(plan, **LAYOUT)
+    inputs = _inputs(80)
+    source, noise = inputs.source_visual, torch.randn_like(inputs.source_visual)
+    inputs.source_visual = inputs.audio_shape = None
+    inputs.condition_media = []
+    if with_reference:
+        inputs.conditions = [dict(content_id="ref", role="reference")]
+        inputs.media = [dict(id="ref", type="image")]
+        inputs.visual = {"ref": torch.zeros(1, 2, 1, 2, 2)}
+    stage = object.__new__(ZingH3GenerationStage)
+    stage.kv_pool, stage.packer = pool, sampler.processor
+    stage.codecs = SimpleNamespace(spatial_ratio=16)
+    candidate = {}
+    stage.encode_condition_for_batch = lambda *args: candidate
+    state = ZingSourceStreamState()
+    state.inputs = inputs
+    owner = RealtimeSession()
+    session = state.sampler = SourceReadySession(
+        sampler,
+        inputs,
+        seed=5,
+        max_pending_chunks=1,
+        max_pending_bytes=1 << 20,
+        acquire_storage=state._pooled_storage(stage, owner, sampler),
+        prompt_switch_prefix_latent_frames=5,
+        initial_prompt_event_id=0,
+    )
+    state.prompt, state.prompt_event = "old", 0
+
+    def step():
+        start = session.next_latent
+        end = start + session.next_chunk_size
+        session.append(
+            source[:, :, start:end],
+            noise[:, :, start:end],
+            provenance=fixture_provenance(1, end, start, end),
+        )
+        return session.step()
+
+    def update(rows, event_id):
+        candidate.update(
+            context=torch.ones(rows, 12).bfloat16(),
+            row_role=torch.zeros(rows, dtype=torch.long),
+        )
+        return state._update_prompt(
+            stage,
+            SimpleNamespace(
+                sampling_params=SimpleNamespace(prompt=str(event_id)),
+                realtime_event_id=event_id,
+                realtime_prompt_version=event_id,
+            ),
+        )
+
+    for _ in range(3):
+        assert step().prompt_event_id == 0
+    pointers = _pointers(state.kv_lease.kv_cache)
+    history = session.cache.history(0)
+    active, applied = session.prompt, session.applied_prompt
+    rng = session.rng.cpu_rng.clone()
+    # A valid pending update must be superseded even when the newer one fails.
+    assert update(7, 1) is None and session.pending_prompt.event_id == 1
+    assert update(40, 2) == {"code": "CONDITION_INVALID", "event_id": 2}
+    assert session.pending_prompt is None
+    assert session.prompt is active and session.applied_prompt is applied
+    assert state.prompt_event == 1  # Last accepted candidate, not rejected event 2.
+    assert torch.equal(rng, session.rng.cpu_rng)
+    assert all(torch.equal(a, b) for a, b in zip(history, session.cache.history(0)))
+    assert _pointers(state.kv_lease.kv_cache) == pointers and pool.available == 0
+    # Continue beyond the late-overflow reproduction's eighteenth output block.
+    for _ in range(18):
+        assert step().prompt_event_id == 0
+    # The inclusive limit counts reference rows as well as text context rows.
+    if with_reference:
+        assert update(16, 3) == {"code": "CONDITION_INVALID", "event_id": 3}
+    assert update(16 - int(with_reference), 4) is None
+    assert step().prompt_event_id == 4
+    assert _pointers(state.kv_lease.kv_cache) == pointers
+    session.dispose()
+    state.kv_lease.release()
+    assert pool.available == 1
 
 
 @torch.no_grad()

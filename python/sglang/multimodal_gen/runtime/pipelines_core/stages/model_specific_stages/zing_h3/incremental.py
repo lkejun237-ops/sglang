@@ -8,6 +8,7 @@ would change channel-major RNG assignment and needs a separate model contract.
 from collections import deque
 from copy import copy
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 
@@ -29,6 +30,7 @@ def _bytes(tensor):
 @dataclass(frozen=True)
 class ReadyLatentChunk:
     chunk: TemporalChunk
+    model_chunk: TemporalChunk
     source: torch.Tensor
     noise: torch.Tensor
     audio: torch.Tensor | None
@@ -48,7 +50,14 @@ class ChunkResult:
     visual: torch.Tensor
     audio: torch.Tensor | None
     provenance: Provenance
-    prompt_event_id: int | None
+    prompt_event_id: int | str | None
+    prompt_version: int | None = None
+
+
+class PromptSnapshot(NamedTuple):
+    condition: dict[str, torch.Tensor]
+    event_id: int | str | None
+    prompt_version: int | None
 
 
 class SourceReadySession:
@@ -73,6 +82,9 @@ class SourceReadySession:
         total_latent_frames=None,
         initial_rng_state=None,
         acquire_storage=None,
+        prompt_switch_prefix_latent_frames=None,
+        initial_prompt_event_id=None,
+        initial_prompt_version=None,
     ):
         if any(
             type(n) is not int or n < 1
@@ -81,6 +93,15 @@ class SourceReadySession:
             raise ValueError("Ready queue budgets must be positive integers")
         # Validate finite geometry without allocating a complete session layout.
         sampler.processor.chunk_plan.chunk(0, total_latent_frames)
+        if prompt_switch_prefix_latent_frames is not None:
+            if (
+                type(prompt_switch_prefix_latent_frames) is not int
+                or prompt_switch_prefix_latent_frames != 5
+            ):
+                raise ValueError(
+                    "prompt_switch_prefix_latent_frames currently only supports 5"
+                )
+            sampler.processor.prompt_switch_prefix_chunks()
         self.sampler = sampler
         self.plan = sampler.processor.chunk_plan
         self.inputs = copy(inputs)
@@ -111,8 +132,14 @@ class SourceReadySession:
             torch.Generator(device="cpu").set_state(cpu_rng)
             self.rng.cpu_rng = cpu_rng.clone()
             self.rng.cuda_rng = None if cuda_rng is None else cuda_rng.clone()
-        self.prompt = self._snapshot(inputs.positive, None)
+        self.prompt_switch_prefix_latent_frames = prompt_switch_prefix_latent_frames
+        self.prompt = self._snapshot(
+            inputs.positive, initial_prompt_event_id, initial_prompt_version
+        )
+        self.pending_prompt = None
         self.applied_prompt = None
+        self.recent_visual = None
+        self.model_chunk_id = 0
         self.source_dependency_end = 0
         self.media_origin = None
         self.ended = self.closed = False
@@ -147,13 +174,94 @@ class SourceReadySession:
         )
 
     @staticmethod
-    def _snapshot(condition, event_id):
-        return ({k: v.detach().clone() for k, v in condition.items()}, event_id)
+    def _snapshot(condition, event_id, prompt_version=None):
+        return PromptSnapshot(
+            {k: v.detach().clone() for k, v in condition.items()},
+            event_id,
+            prompt_version,
+        )
 
-    def update_prompt(self, condition, event_id):
+    def update_prompt(self, condition, event_id, prompt_version=None):
         if self.closed or self.draining:
             raise ValueError("The source-ready session is closed or draining")
-        self.prompt = self._snapshot(condition, event_id)
+        candidate = self._snapshot(condition, event_id, prompt_version)
+        if self.prompt_switch_prefix_latent_frames is None:
+            self.prompt = candidate
+        else:
+            self.pending_prompt = candidate
+
+    def discard_pending_prompt(self):
+        """Drop an encoded candidate superseded by a newer control event."""
+        if self.closed or self.draining:
+            raise ValueError("The source-ready session is closed or draining")
+        self.pending_prompt = None
+
+    @property
+    def prompt_switch_ready(self):
+        return (
+            self.prompt_switch_prefix_latent_frames is not None
+            and self.recent_visual is not None
+            and self.recent_visual.shape[2] == self.prompt_switch_prefix_latent_frames
+        )
+
+    def _next_model_chunk(self):
+        if self.prompt_switch_prefix_latent_frames is None:
+            return self.plan.chunk(self.next_chunk_id, self.total_latent_frames)
+        if self.pending:
+            if self.pending_prompt is not None and self.prompt_switch_ready:
+                return None
+            previous = self.pending[-1].model_chunk
+            return self.plan.chunk(previous.chunk_id + 1)
+        if self.pending_prompt is not None and self.prompt_switch_ready:
+            return self.plan.chunk(3)
+        return self.plan.chunk(self.model_chunk_id)
+
+    @property
+    def next_chunk_size(self):
+        """Latents required for the next native-phase model block.
+
+        A ready chunk already owned by this session must be consumed before a
+        prompt update can reset the phase.  This keeps cross-chunk lookahead
+        from mixing a pre-switch boundary with the new local epoch.
+        """
+        chunk = self._next_model_chunk()
+        if chunk is None:
+            return None
+        size = chunk.end - chunk.start
+        if self.total_latent_frames is not None:
+            size = min(size, self.total_latent_frames - self.next_latent)
+        return size if size > 0 else None
+
+    def _activate_pending_prompt(self, ready):
+        if (
+            self.pending_prompt is None
+            or not self.prompt_switch_ready
+            or ready.model_chunk.chunk_id != 3
+            or ready.model_chunk.start != 5
+        ):
+            return
+        if self.audio_enabled:
+            raise ValueError("Prompt switching currently supports video-only sessions")
+        candidate = self.pending_prompt
+        origin, latent_end = self.sampler.rebuild_prompt_prefix(
+            self.inputs, candidate.condition, self.recent_visual, self.cache
+        )
+        self.prompt = self.applied_prompt = candidate
+        if self.pending_prompt is candidate:
+            self.pending_prompt = None
+        self.media_origin = origin
+        if latent_end != ready.model_chunk.start:
+            raise ValueError("Prompt-switch prefix does not meet the next model block")
+        self.model_chunk_id = ready.model_chunk.chunk_id
+
+    def _remember_visual(self, visual):
+        limit = self.prompt_switch_prefix_latent_frames
+        if limit is None:
+            return
+        value = visual.detach()
+        if self.recent_visual is not None:
+            value = torch.cat((self.recent_visual, value), dim=2)
+        self.recent_visual = value[:, :, -limit:].clone()
 
     def append(
         self, source, noise, *, provenance, audio=None, audio_start=0, final=False
@@ -193,9 +301,19 @@ class SourceReadySession:
             if total is not None and end != total:
                 raise ValueError("Final chunk does not cover the finite latent target")
             total = end
-        chunk = self.plan.chunk(self.next_chunk_id, total)
-        if chunk is None or noise.shape[2] != chunk.end - chunk.start:
+        model_chunk = self._next_model_chunk()
+        if model_chunk is None:
+            raise ValueError("Ready data cannot cross a pending prompt phase boundary")
+        expected = model_chunk.end - model_chunk.start
+        count = noise.shape[2]
+        if count != expected and not (final and 0 < count < expected):
             raise ValueError("Ready data does not cover the next checkpoint chunk")
+        chunk = TemporalChunk(
+            self.next_chunk_id, self.next_latent, self.next_latent + count
+        )
+        model_chunk = TemporalChunk(
+            model_chunk.chunk_id, model_chunk.start, model_chunk.start + count
+        )
         if audio is not None:
             packer._validate_audio(audio)
             if audio.device != noise.device:
@@ -223,6 +341,7 @@ class SourceReadySession:
             raise ValueError("The source-ready queue is full")
         owned = ReadyLatentChunk(
             chunk,
+            model_chunk,
             source.detach().clone(),
             noise.detach().clone(),
             None if audio is None else audio.detach().clone(),
@@ -292,15 +411,16 @@ class SourceReadySession:
             sampler.video_scheduler.to(sampler.device)
             sampler.audio_scheduler.to(sampler.device)
         inputs = copy(self.inputs)
-        inputs.positive, inputs.source_visual = prompt[0], ready.source
+        inputs.positive, inputs.source_visual = prompt.condition, ready.source
         visual = ready.noise.float().clone()
         audio = None if ready.audio is None else ready.audio.float().clone()
+        model_chunk = ready.model_chunk
         kwargs = dict(
-            chunk=ready.chunk,
+            chunk=model_chunk,
             audio_start=ready.audio_start,
             media_origin=media_origin,
         )
-        positive = packer.pack_chunk(inputs, prompt[0], visual, audio, **kwargs)
+        positive = packer.pack_chunk(inputs, prompt.condition, visual, audio, **kwargs)
         negative = (
             packer.pack_chunk(inputs, None, visual, audio, **kwargs)
             if sampler.do_cfg
@@ -317,7 +437,7 @@ class SourceReadySession:
             audio,
             positive,
             negative,
-            [(ready.chunk.source_block, ready.chunk.target_block, 0, visual.shape[2])],
+            [(model_chunk.source_block, model_chunk.target_block, 0, visual.shape[2])],
             self.cache,
             generation_block_index=int(ready.chunk.chunk_id),
         )
@@ -348,8 +468,14 @@ class SourceReadySession:
             ready.provenance.pixels, ready.provenance.source_alignment, dependency
         )
         result = ChunkResult(
-            ready.chunk, current.visual, current.audio, provenance, prompt[1]
+            ready.chunk,
+            current.visual,
+            current.audio,
+            provenance,
+            prompt.event_id,
+            prompt.prompt_version,
         )
+        self._remember_visual(current.visual)
         self.pending.popleft()
         self.pending_bytes -= ready.nbytes
         self.pending_spans -= len(ready.provenance.source_alignment)
@@ -357,13 +483,17 @@ class SourceReadySession:
         self.committed_latent = ready.chunk.end
         self.committed_pixel = ready.provenance.pixels.end
         self.media_origin, self.applied_prompt = origin, prompt
+        if self.prompt_switch_prefix_latent_frames is not None:
+            self.model_chunk_id += 1
         self.source_dependency_end = dependency
         if self.complete:
             self.dispose()
         return result
 
     def _step(self):
-        ready, prompt = self.pending[0], self.prompt
+        ready = self.pending[0]
+        self._activate_pending_prompt(ready)
+        prompt = self.prompt
         current, origin = self._prepare(ready, prompt, self.media_origin)
         with self.rng.random_stream(self.sampler.device, self.seed):
             self._apply_prefix(current, prompt)
@@ -386,6 +516,7 @@ class SourceReadySession:
             if not self.pending:
                 finished = True
                 return
+            self._activate_pending_prompt(self.pending[0])
             prompt = self.prompt
             current, origin = self._prepare(self.pending[0], prompt, self.media_origin)
             sampler = self.sampler
@@ -404,7 +535,9 @@ class SourceReadySession:
                         else (sampler.video_scheduler, sampler.audio_scheduler)
                     )
                     lookahead = (
-                        sampler.joint_forward == "cross_chunk" and len(self.pending) > 1
+                        sampler.joint_forward == "cross_chunk"
+                        and len(self.pending) > 1
+                        and self.pending_prompt is None
                     )
                     video, sound = sampler._sample_block(
                         current.visual,
@@ -458,6 +591,8 @@ class SourceReadySession:
                         self._drain_tensors.extend(v for v in first if v is not None)
                 yield result
                 if self.pending and current is None:
+                    self._activate_pending_prompt(self.pending[0])
+                    prompt, origin = self.prompt, self.media_origin
                     current, _ = self._prepare(self.pending[0], prompt, origin)
             finished = True
         finally:
@@ -486,9 +621,11 @@ class SourceReadySession:
         if self.inputs is not None:
             static.extend(self.inputs.visual.values())
             static.extend(self.inputs.audio.values())
-        for prompt in (self.prompt, self.applied_prompt):
+        for prompt in (self.prompt, self.pending_prompt, self.applied_prompt):
             if prompt is not None:
-                static.extend(prompt[0].values())
+                static.extend(prompt.condition.values())
+        if self.recent_visual is not None:
+            static.append(self.recent_visual)
         return {
             "ready_bytes": self.pending_bytes,
             "ready_chunks": len(self.pending),
@@ -528,5 +665,6 @@ class SourceReadySession:
         self.pending_bytes = 0
         self.pending_spans = 0
         self.rng.dispose()
-        self.inputs = self.prompt = self.applied_prompt = self.sampler = None
+        self.inputs = self.prompt = self.pending_prompt = self.applied_prompt = None
+        self.recent_visual = self.sampler = None
         self.closed = True

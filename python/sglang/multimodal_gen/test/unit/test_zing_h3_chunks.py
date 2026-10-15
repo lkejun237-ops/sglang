@@ -6,23 +6,25 @@ from copy import copy
 import pytest
 import torch
 
-from sglang.multimodal_gen.runtime.realtime.zing_chunk_plan import ChunkPlan
-from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
-    PixelRange,
-    SourceSpan,
-    Provenance,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.incremental import (
     SourceReadySession,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.sampling import (
     ZingH3Sampler,
 )
-from sglang.multimodal_gen.test.unit.test_zing_h3_model import (
-    cpu_execution_options,  # noqa: F401
-    model as model_fixture,
+from sglang.multimodal_gen.runtime.realtime.zing_chunk_plan import ChunkPlan
+from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
+    PixelRange,
+    Provenance,
+    SourceSpan,
 )
-from sglang.multimodal_gen.test.unit.test_zing_h3_model import request
+from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
+    cpu_execution_options,
+)
+from sglang.multimodal_gen.test.unit.test_zing_h3_model import model as model_fixture
+from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
+    request,
+)
 
 
 @pytest.fixture
@@ -235,7 +237,7 @@ def test_ready_queue_ownership_budget_prompt_eos(model):
         context=torch.randn(5, 12).bfloat16(), row_role=torch.zeros(5, dtype=torch.long)
     )
     session.update_prompt(context, 42)
-    frozen = session.prompt[0]["context"].clone()
+    frozen = session.prompt.condition["context"].clone()
     context["context"].zero_()
     result = session.step()
     assert result.prompt_event_id == 42
@@ -243,7 +245,7 @@ def test_ready_queue_ownership_budget_prompt_eos(model):
     assert (
         result.provenance.source_dependency_end == 20
     )  # Prior full-history dependency.
-    assert torch.equal(session.applied_prompt[0]["context"], frozen)
+    assert torch.equal(session.applied_prompt.condition["context"], frozen)
     assert result.chunk.chunk_id == 1 and result.chunk.start == 1
     session.update_prompt(context, 99)
     session.append(
@@ -262,6 +264,137 @@ def test_ready_queue_ownership_budget_prompt_eos(model):
     session.dispose()
     with pytest.raises(ValueError, match="closed"):
         session.step()
+
+
+@torch.no_grad()
+def test_prompt_switch_waits_for_five_latents_then_rebuilds_latest_epoch(
+    model, monkeypatch
+):
+    packer, inputs, noise, _ = _long_request(model, [3, 2], frames=13)
+    packer.split_first_latent = True
+    sampler = ZingH3Sampler(
+        model,
+        packer,
+        solver="few_step",
+        denoising_step_list=[1000, 500],
+        window_chunks=21,
+        sink_chunks=3,
+    )
+    session = SourceReadySession(
+        sampler,
+        inputs,
+        seed=7,
+        max_pending_chunks=1,
+        max_pending_bytes=1024,
+        prompt_switch_prefix_latent_frames=5,
+        initial_prompt_event_id=10,
+        initial_prompt_version=1,
+    )
+    rng_checks = []
+    rebuild = sampler.rebuild_prompt_prefix
+
+    def checked_rebuild(*args):
+        before = session.rng.cpu_rng.clone()
+        result = rebuild(*args)
+        rng_checks.append(torch.equal(before, session.rng.cpu_rng))
+        return result
+
+    monkeypatch.setattr(sampler, "rebuild_prompt_prefix", checked_rebuild)
+    results = []
+    offset = 0
+    for index in range(6):
+        if index == 1:
+            for event in (11, 12, 13):
+                condition = {
+                    "context": torch.full((3, 12), event, dtype=torch.bfloat16),
+                    "row_role": torch.zeros(3, dtype=torch.long),
+                }
+                session.update_prompt(condition, event, event - 9)
+        if index == 4:
+            session.update_prompt(inputs.positive, 14, 5)
+        count = session.next_chunk_size
+        end = offset + count
+        session.append(
+            inputs.source_visual[:, :, offset:end],
+            noise[:, :, offset:end],
+            provenance=fixture_provenance(100 + index, 200 + end, offset, end),
+        )
+        result = session.step()
+        results.append(result)
+        offset = end
+        expected_recent = torch.cat([item.visual for item in results], dim=2)[:, :, -5:]
+        torch.testing.assert_close(session.recent_visual, expected_recent)
+
+    assert offset == 13
+    assert [result.chunk.end - result.chunk.start for result in results] == [
+        1,
+        2,
+        2,
+        3,
+        3,
+        2,
+    ]
+    assert [result.prompt_event_id for result in results] == [10, 10, 10, 13, 14, 14]
+    assert [result.prompt_version for result in results] == [1, 1, 1, 4, 5, 5]
+    assert rng_checks == [True, True]
+    assert session.pending_prompt is None
+    # The second switch restarts the native 3,2 phase while global output IDs
+    # continue: local target block 10 versus external target block 12.
+    assert session.cache.last_block == 10
+    assert results[-1].chunk.target_block == 12
+    assert session.recent_visual.shape[2] == 5
+    session.dispose()
+    assert session.recent_visual is session.pending_prompt is None
+
+
+def test_prompt_switch_rejects_unsupported_prefix_geometry(model):
+    packer, inputs, _, _ = _long_request(model, 5, frames=5)
+    sampler = ZingH3Sampler(model, packer, sigma_points=2)
+    disabled = SourceReadySession(
+        sampler,
+        inputs,
+        seed=1,
+        max_pending_chunks=1,
+        max_pending_bytes=1024,
+    )
+    disabled.dispose()
+    with pytest.raises(ValueError, match="only supports 5"):
+        SourceReadySession(
+            sampler,
+            inputs,
+            seed=1,
+            max_pending_chunks=1,
+            max_pending_bytes=1024,
+            prompt_switch_prefix_latent_frames=4,
+        )
+    with pytest.raises(ValueError, match="chunk plan of 1,2,2"):
+        SourceReadySession(
+            sampler,
+            inputs,
+            seed=1,
+            max_pending_chunks=1,
+            max_pending_bytes=1024,
+            prompt_switch_prefix_latent_frames=5,
+        )
+
+
+@pytest.mark.parametrize(
+    "lengths,split",
+    [([3, 7], True), ([1, 2, 7], False), ([1, 2, 2], False), ([3, 2], False)],
+)
+def test_prompt_switch_rejects_clipped_or_wrong_phase_plans(model, lengths, split):
+    packer, inputs, _, _ = _long_request(model, lengths, frames=10)
+    packer.split_first_latent = split
+    sampler = ZingH3Sampler(model, packer, sigma_points=2)
+    with pytest.raises(ValueError, match=r"num_frame_per_block=\[3,2\]"):
+        SourceReadySession(
+            sampler,
+            inputs,
+            seed=1,
+            max_pending_chunks=1,
+            max_pending_bytes=1 << 20,
+            prompt_switch_prefix_latent_frames=5,
+        )
 
 
 @torch.no_grad()

@@ -853,7 +853,9 @@ class TestConditioningRPCWorker(CustomTestCase):
         state, stage = helper.session(plan)
         state.inputs = NS(condition_media=[], positive=condition(1))
         state.prompt, state.prompt_event = "old", "old-event"
-        state.effective_prompt_version = 1
+        state.sampler.prompt = NS(
+            condition=state.inputs.positive, event_id="old-event", prompt_version=1
+        )
         calls, updates = [], []
 
         def encode(batch, prompt, items):
@@ -863,12 +865,22 @@ class TestConditioningRPCWorker(CustomTestCase):
             return condition(2)
 
         stage.encode_condition_for_batch = encode
-        state.sampler.update_prompt = lambda positive, event: updates.append(event)
+
+        def update_prompt(positive, event, version=None):
+            updates.append(event)
+            state.sampler.prompt = NS(
+                condition=positive, event_id=event, prompt_version=version
+            )
+
+        state.sampler.update_prompt = update_prompt
         original_step = state.sampler.step
 
         def step():
+            # Output metadata belongs to the sampler's generation-time snapshot.
+            prompt = state.sampler.prompt
             result = original_step()
-            result.prompt_event_id = state.prompt_event
+            result.prompt_event_id = prompt.event_id
+            result.prompt_version = prompt.prompt_version
             return result
 
         state.sampler.step = step
@@ -939,6 +951,34 @@ class TestConditioningRPCWorker(CustomTestCase):
             )
         )
 
+    def test_t24_source_failed_newer_event_supersedes_pending_prompt(self):
+        state, stage, helper, calls, updates = self.source_fixture()
+        state.sampler.pending_prompt = ("encoded-prompt", "pending-event")
+        discarded = []
+
+        def discard_pending_prompt():
+            discarded.append(state.sampler.pending_prompt)
+            state.sampler.pending_prompt = None
+
+        state.sampler.discard_pending_prompt = discard_pending_prompt
+        value = helper.batch(state, 0, 17, 0)
+        (
+            value.sampling_params.prompt,
+            value.realtime_event_id,
+            value.realtime_prompt_version,
+        ) = "new", "failed-event", 2
+
+        output = state.run(stage, value)
+
+        self.assertIsNone(state.sampler.pending_prompt)
+        self.assertEqual(discarded, [("encoded-prompt", "pending-event")])
+        self.assertEqual(calls, [("new", "failed-event")])
+        self.assertEqual(updates, [])
+        self.assertEqual(
+            output.conditioning_notice,
+            {"code": "CONDITION_TIMEOUT", "event_id": "failed-event"},
+        )
+
     def test_t24_source_block_metadata_preserves_old_version_then_switches_on_success(
         self,
     ):
@@ -957,4 +997,4 @@ class TestConditioningRPCWorker(CustomTestCase):
             self.assertTrue(
                 all(item.get("prompt_version") == expected for item in metadata)
             )
-            self.assertEqual(state.effective_prompt_version, expected)
+            self.assertEqual(state.sampler.prompt.prompt_version, expected)

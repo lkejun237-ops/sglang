@@ -104,6 +104,38 @@ def test_target_noise_independent_of_ar_chunking():
     torch.testing.assert_close(*results, rtol=0, atol=0)
 
 
+def test_requested_chunk_length_rephases_without_resetting_global_ranges():
+    b = bridge(ChunkPlan([3, 2], split_first_latent=True))
+    for start, pixel_end in ((0, 17), (5, 34)):
+        b.append(
+            torch.arange(start, start + 5).reshape(1, 1, 5, 1, 1).float(),
+            latent_start=start,
+            pixel_end=pixel_end,
+            source_dependency_end=pixel_end,
+        )
+    lengths = [1, 2, 2, 3, 2]
+    first = [b.pop(length) for length in lengths[:4]]
+    assert [(item.chunk.start, item.chunk.end) for item in first] == [
+        (0, 1),
+        (1, 3),
+        (3, 5),
+        (5, 8),
+    ]
+    # A prompt epoch can request another local chunk-3 length here.  The wire
+    # chunk id and absolute latent range continue instead of restarting.
+    assert not b.ready_for(3)
+    b.append(
+        torch.arange(10, 13).reshape(1, 1, 3, 1, 1).float(),
+        latent_start=10,
+        pixel_end=43,
+        source_dependency_end=43,
+    )
+    switched = b.pop(3)
+    assert switched.chunk.chunk_id == 4
+    assert (switched.chunk.start, switched.chunk.end) == (8, 11)
+    assert switched.source.flatten().tolist() == [8, 9, 10]
+
+
 @pytest.mark.parametrize("frames", range(1, 35))
 @pytest.mark.parametrize(
     "plan", [ChunkPlan(5), ChunkPlan([1, 2, 2]), ChunkPlan(5, True)]

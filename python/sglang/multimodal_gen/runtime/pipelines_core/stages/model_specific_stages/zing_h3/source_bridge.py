@@ -155,12 +155,29 @@ class SourceChunkBridge:
         )
         return chunk is not None and chunk.end <= self.accepted_latents
 
-    def pop(self):
-        if not self.ready:
+    def ready_for(self, count):
+        """Whether ``count`` model-phase latents, or a final tail, can transfer."""
+        if type(count) is not int or count < 1:
+            raise ValueError("Requested source chunk length must be a positive integer")
+        if self.closed or not self.buffered_latents:
+            return False
+        return self.buffered_latents >= count or self.ended
+
+    def pop(self, count=None):
+        if count is None:
+            if not self.ready:
+                return None
+            chunk = self.plan.chunk(
+                self.chunk_id, self.accepted_latents if self.ended else None
+            )
+        else:
+            if not self.ready_for(count):
+                return None
+            count = min(count, self.buffered_latents)
+            start = self.accepted_latents - self.buffered_latents
+            chunk = TemporalChunk(self.chunk_id, start, start + count)
+        if chunk is None:
             return None
-        chunk = self.plan.chunk(
-            self.chunk_id, self.accepted_latents if self.ended else None
-        )
         count = chunk.end - chunk.start
         pixel_end = self.pixel_ends[count - 1]
         dependency = max(self.dependencies[i] for i in range(count))

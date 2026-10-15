@@ -103,6 +103,8 @@ class H3InferenceInputs:
 
 
 class ZingH3Packer:
+    PROMPT_SWITCH_PREFIX_LENGTHS = (1, 2, 2)
+
     def __init__(
         self,
         arch,
@@ -240,6 +242,45 @@ class ZingH3Packer:
             "target_audio": audio_target,
         }
         return self._pack_layout(inputs.conditions, inputs.media, encoded)
+
+    def prompt_switch_prefix_chunks(self) -> tuple[TemporalChunk, ...]:
+        """Return the only prompt-switch prefix geometry supported today."""
+        plan = self.chunk_plan
+        if plan.lengths != (3, 2) or not plan.split_first_latent:
+            raise ValueError(
+                "Prompt switching requires an initial Zing chunk plan of 1,2,2 "
+                "from num_frame_per_block=[3,2] and split_first_latent=True"
+            )
+        return tuple(plan.chunk(i) for i in range(3))
+
+    def pack_prompt_switch_prefix(
+        self,
+        inputs: H3InferenceInputs,
+        condition: dict[str, torch.Tensor],
+        visual_prefix: torch.Tensor,
+    ) -> tuple[dict[str, torch.Tensor], tuple[TemporalChunk, ...]]:
+        """Pack five clean target latents as a fresh local ``1+2+2`` epoch."""
+        chunks = self.prompt_switch_prefix_chunks()
+        expected = sum(self.PROMPT_SWITCH_PREFIX_LENGTHS)
+        self._validate_visual(visual_prefix)
+        if visual_prefix.shape[2] != expected:
+            raise ValueError(
+                f"Prompt switching requires exactly {expected} visual latents"
+            )
+        if inputs.source_visual is not None:
+            raise ValueError(
+                "Prompt-switch prefix packing must not include source rows"
+            )
+        layout = self.pack_inference_layout(inputs, condition, visual_prefix, None)
+        target_blocks = layout["block_idx"][
+            layout["row_role"] == int(H3RowRole.TARGET_VISUAL)
+        ].unique(sorted=True)
+        expected_blocks = torch.tensor(
+            [chunk.target_block for chunk in chunks], dtype=target_blocks.dtype
+        )
+        if not torch.equal(target_blocks.cpu(), expected_blocks):
+            raise ValueError("Prompt-switch prefix target blocks are not consecutive")
+        return layout, chunks
 
     def pack_chunk(
         self,

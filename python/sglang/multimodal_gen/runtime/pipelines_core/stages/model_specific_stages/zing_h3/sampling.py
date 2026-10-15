@@ -2,6 +2,7 @@
 """AR Euler and CD re-noise block generation with isolated positive KV."""
 
 import math
+from copy import copy
 from dataclasses import dataclass
 
 import torch
@@ -19,6 +20,7 @@ from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.multimodal_gen.runtime.utils.zing_diagnostics import current_diagnostic
 
 from ._sampling_helpers import ZingBlockSamplingHelpers
+from .packing import H3RowRole
 
 
 class ZingH3EulerSchedule:
@@ -192,6 +194,31 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             rope_max_frame_gap=self.rope_max_frame_gap,
             storage=self.prefix_workspace,
         )
+
+    def rebuild_prompt_prefix(self, inputs, condition, visual_prefix, cache):
+        """Replace all logical KV with a new condition and clean latent prefix."""
+        prefix_inputs = copy(inputs)
+        prefix_inputs.positive = condition
+        prefix_inputs.source_visual = None
+        layout, chunks = self.processor.pack_prompt_switch_prefix(
+            prefix_inputs, condition, visual_prefix
+        )
+        cache.clear()
+        if bool((layout["block_idx"] == 0).any()):
+            self._forward(
+                self._select_block(layout, 0, phase="prefix", video_t=1.0, audio_t=1.0),
+                cache,
+                "prefix",
+            )
+        for chunk in chunks:
+            self._commit_clean_prefix(
+                layout,
+                chunk.target_block,
+                visual_prefix[:, :, chunk.start : chunk.end],
+                cache,
+            )
+        target = layout["row_role"] == int(H3RowRole.TARGET_VISUAL)
+        return float(layout["position_ids"][target][0, 0]), chunks[-1].end
 
     @torch.no_grad()
     def initialize(

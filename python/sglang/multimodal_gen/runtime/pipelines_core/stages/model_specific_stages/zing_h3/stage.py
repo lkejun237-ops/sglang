@@ -86,6 +86,9 @@ class ZingH3GenerationStage(PipelineStage):
             frame_scale=rope["frame_scale"],
             visual_token_frame_spans=rope["visual_token_frame_spans"],
         )
+        self.prompt_switch_prefix_latent_frames = (
+            config.prompt_switch_prefix_latent_frames
+        )
 
     def _encode_local_condition(self, prompt, media):
         with self._use("text_encoder"):

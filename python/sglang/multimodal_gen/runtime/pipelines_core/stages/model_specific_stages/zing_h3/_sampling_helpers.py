@@ -267,6 +267,35 @@ class ZingBlockSamplingHelpers:
         )
         self._forward(packed, cache, "final")
 
+    def _commit_clean_prefix(self, layout, block_number, video, cache) -> None:
+        """Commit an already-clean target without running a denoising forward."""
+        self._set_block_latents(layout, block_number, video, None)
+        packed = self._select_block(
+            layout,
+            block_number,
+            phase="target",
+            video_t=1.0,
+            audio_t=None,
+            final=True,
+        )
+        metadata = _host_metadata(packed)
+        validation = (
+            None
+            if metadata is None
+            else (
+                metadata["host_layout"].position_ids,
+                metadata["host_layout"].block_idx,
+            )
+        )
+        cache.update(
+            packed["position_ids"],
+            packed["block_idx"],
+            "active",
+            video.shape[2],
+            validation=validation,
+        )
+        self._forward(packed, cache, "final")
+
     def _forward(
         self, packed: dict[str, torch.Tensor], cache, update: str | None
     ) -> tuple[torch.Tensor, torch.Tensor]:

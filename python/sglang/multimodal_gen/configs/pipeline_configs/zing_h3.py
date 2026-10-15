@@ -89,6 +89,9 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
     zing_kv_pool_sink_chunks: int = 3
     zing_kv_pool_rope_position_mode: str = "block_relative"
     zing_kv_pool_rope_max_frame_gap: int = 12
+    # Runtime-owned rolling target history used when a WebSocket prompt changes.
+    # None keeps the existing prompt-update path for exports without 1,2,2 geometry.
+    prompt_switch_prefix_latent_frames: int | None = None
 
     # Legacy decoder fields the caller supplied; a default must not look like a choice.
     _explicit_decoder_fields = frozenset()
@@ -145,6 +148,13 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
         self.validate_server_args(server_args)
 
     def validate_server_args(self, server_args):
+        if self.prompt_switch_prefix_latent_frames is not None and (
+            type(self.prompt_switch_prefix_latent_frames) is not int
+            or self.prompt_switch_prefix_latent_frames != 5
+        ):
+            raise ValueError(
+                "prompt_switch_prefix_latent_frames currently only supports 5"
+            )
         if self.zing_adaln_table_path is not None:
             if (
                 type(self.zing_adaln_table_max_bytes) is not int

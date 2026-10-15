@@ -69,6 +69,7 @@ def test_zing_declares_four_modalities_and_reuses_codec_configs():
     assert type(zing.text_encoder_configs[0]) is type(h3.text_encoder_configs[0])
     assert zing.should_use_guidance
     assert not zing.requires_audio_output
+    assert zing.prompt_switch_prefix_latent_frames is None
     assert zing.get_model_deployment_config().dit_layerwise_offload_modes == ("memory",)
     files = ["diffusion_pytorch_model-00001-of-00003.safetensors"]
     assert zing.select_vae_weight_files(
@@ -92,6 +93,10 @@ def test_zing_registers_executable_stages_and_accepts_ulysses_sp4(monkeypatch):
             taeh3_checkpoint_path="/model/taeh3.pth"
         ).validate_server_args(SimpleNamespace(tp_size=2))
 
+    with pytest.raises(ValueError, match="only supports 5"):
+        ZingH3CausalPipelineConfig(
+            prompt_switch_prefix_latent_frames=4
+        ).validate_server_args(SimpleNamespace())
     args = SimpleNamespace(
         tp_size=1,
         sp_degree=4,
@@ -107,7 +112,8 @@ def test_zing_registers_executable_stages_and_accepts_ulysses_sp4(monkeypatch):
     monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_STABLE_SHAPES", "1")
     monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN", "1")
     ZingH3CausalPipelineConfig(
-        taeh3_checkpoint_path="/model/taeh3.pth"
+        taeh3_checkpoint_path="/model/taeh3.pth",
+        prompt_switch_prefix_latent_frames=5,
     ).validate_server_args(args)
     args.sp_degree = 2
     with pytest.raises(ValueError, match="sp-degree == --ulysses-degree"):

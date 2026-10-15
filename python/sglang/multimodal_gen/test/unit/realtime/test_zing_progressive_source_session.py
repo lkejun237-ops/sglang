@@ -97,6 +97,7 @@ class SyntheticSampler:
             visual=self.value,
             provenance=self.provenance,
             prompt_event_id=None,
+            prompt_version=None,
         )
         self.calls.append(result)
         self.index += 1
