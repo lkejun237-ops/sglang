@@ -249,6 +249,32 @@ def test_worker_rejects_invalid_encoder_output_and_releases_all_state():
     assert not sampler.calls
 
 
+def test_continuous_source_path_emits_dit_and_decoder_stage_spans(monkeypatch):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        source_session,
+    )
+    from sglang.multimodal_gen.runtime.utils.zing_stage_timing import StageTrace
+
+    rows = []
+    monkeypatch.setattr(
+        source_session,
+        "trace_for_batch",
+        lambda request: StageTrace(
+            request.realtime_session_id,
+            request.request_id,
+            lambda item: rows.append(item[0]),
+        ),
+    )
+    state, stage = session(ChunkPlan(1))
+    result = state.run(stage, batch(state, 0, 1, 0, final=True))
+    assert result.usage["zing_source_complete"]
+    assert [row["stage"] for row in rows] == ["DiT", "Decoder", "Request"]
+    assert rows[0]["output_latent_range"] == [0, 1]
+    assert rows[1]["output_frame_range"] == [0, 1]
+    assert rows[2]["component"] == "continuous_source_complete"
+    assert all(row["request_id"] == "synthetic" for row in rows)
+
+
 def test_explicit_factory_selection_and_version_guard(monkeypatch):
     import sys
     from types import ModuleType
@@ -556,6 +582,22 @@ def test_joint_ready_worker_batches_without_crossing_command_boundary(
     monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", str(quantum))
     from collections import deque
 
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        source_session,
+    )
+    from sglang.multimodal_gen.runtime.utils.zing_stage_timing import StageTrace
+
+    timing_rows = []
+    monkeypatch.setattr(
+        source_session,
+        "trace_for_batch",
+        lambda request: StageTrace(
+            request.realtime_session_id,
+            request.request_id,
+            lambda item: timing_rows.append(item[0]),
+        ),
+    )
+
     class JointSampler(SyntheticSampler):
         def __init__(self, plan):
             super().__init__(plan)
@@ -620,6 +662,9 @@ def test_joint_ready_worker_batches_without_crossing_command_boundary(
         assert all(r.usage["zing_source_dispatch_steps"] <= quantum for r in results)
     assert not sampler.pending
     assert state.closed
+    assert any(row["stage"] == "DiT" for row in timing_rows)
+    assert any(row["stage"] == "DiT" and row.get("no_output") for row in timing_rows)
+    assert timing_rows[-1]["component"] == "continuous_source_complete"
     assert max(sampler.batches) == (2 if queue_bytes == 1024 and not quantum else 1)
     if capture:
         assert len(captured) == 3

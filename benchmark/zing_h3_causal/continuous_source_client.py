@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Replay an RGB pipe progressively over the production MessagePack API.
+"""Send video or an RGB pipe progressively over the production MessagePack API.
 
 No total length is sent. EOF causes source.end, never a successful bare close.
 Use a live engine pipe, or a documented, non-looping raw export of real media.
@@ -12,17 +12,19 @@ import argparse
 import asyncio
 import hashlib
 import json
-import sys
 import time
 from collections import deque
 from pathlib import Path
 
 import msgpack
 import websockets
+from bench_client import calculate_metrics, distribution
+from continuous_source_input import open_source
 from continuous_source_media import reference_payload
 
 from sglang.multimodal_gen.runtime.realtime.source_transport import (
     DEFAULT_MESSAGE_BYTES,
+    PROTOCOL_OVERHEAD_BYTES,
     SourceTransportBudget,
 )
 
@@ -38,17 +40,28 @@ def websocket_options(*, profile, timeout, message_budget=DEFAULT_MESSAGE_BYTES)
 
 
 async def run(args):
-    message_budget = getattr(args, "max_message_bytes", DEFAULT_MESSAGE_BYTES)
-    SourceTransportBudget(message_bytes=message_budget)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
+    started = time.monotonic()
+    async with asyncio.timeout(args.timeout):
+        with (
+            (output / "output.rgb").open("wb") as received_file,
+            (output / "events.jsonl").open("w") as trace,
+        ):
+            async with open_source(
+                args, args.width * args.height * 3, output / "source-decode.log"
+            ) as read_source:
+                return await exchange(
+                    args, output, started, read_source, received_file, trace
+                )
+
+
+async def exchange(args, output, started, read_source, received_file, trace):
+    message_budget = getattr(args, "max_message_bytes", DEFAULT_MESSAGE_BYTES)
+    SourceTransportBudget(message_bytes=message_budget)
     frame_bytes = args.width * args.height * 3
     source_format = dict(format="rgb24", width=args.width, height=args.height, fps=24)
-    source = sys.stdin.buffer if args.source_rgb == "-" else open(args.source_rgb, "rb")
-    received_file = (output / "output.rgb").open("wb")
-    trace = (output / "events.jsonl").open("w")
     input_hash, output_hash = hashlib.sha256(), hashlib.sha256()
-    started = time.monotonic()
     state = dict(
         submitted=0,
         accepted=0,
@@ -58,11 +71,16 @@ async def run(args):
         sequence=0,
         event_id=0,
         ended=False,
+        completed=False,
         first_output=None,
         last_output=None,
         stall_seconds=0.0,
         next_playback=None,
         max_pending=0,
+        first_source_send=None,
+        last_source_send=None,
+        source_end_send=None,
+        credit_wait_seconds=0.0,
     )
     boundaries, accepted, capture, sent = deque(), deque(), deque(), deque()
     latency_samples, delivery_times = [], []
@@ -105,6 +123,8 @@ async def run(args):
             source_stream=source_format,
             source_message_budget_bytes=message_budget,
         )
+        if getattr(args, "receive_stage_timing", False):
+            init["return_stage_timing"] = True
         if args.profile:
             init.update(profile=True, profile_all_stages=True)
         if args.reference:
@@ -141,23 +161,37 @@ async def run(args):
                     "args": vars(args),
                     "ready": ready,
                     "source_mode": (
-                        "live-pipe" if args.source_rgb == "-" else "raw-replay"
+                        "video-decode"
+                        if getattr(args, "source_video", None)
+                        else "live-pipe"
+                        if args.source_rgb == "-"
+                        else "raw-replay"
                     ),
                     "scope": "client WebSocket delivery; not browser presentation",
                 },
                 indent=2,
             )
         )
-        if max(args.batch_pattern) > ready["max_source_batch_frames"]:
-            raise ValueError("Batch pattern exceeds negotiated size")
+        packet_frames = min(
+            ready["max_source_batch_frames"],
+            ready["max_pending_source_frames"],
+            ready["max_pending_source_bytes"] // frame_bytes,
+            (ready["max_source_message_bytes"] - PROTOCOL_OVERHEAD_BYTES)
+            // frame_bytes,
+        )
+        if packet_frames < 1:
+            raise ValueError("Negotiated source budget cannot hold one RGB frame")
 
         async def produce():
             source_started = time.monotonic()
             pattern_index = 0
             while True:
-                count = args.batch_pattern[pattern_index % len(args.batch_pattern)]
+                count = min(
+                    packet_frames,
+                    args.batch_pattern[pattern_index % len(args.batch_pattern)],
+                )
                 pattern_index += 1
-                data = await asyncio.to_thread(source.read, count * frame_bytes)
+                data = await read_source(count * frame_bytes)
                 if not data:
                     break
                 if len(data) % frame_bytes:
@@ -186,6 +220,8 @@ async def run(args):
                             <= ready["max_pending_source_bytes"]
                         )
                     )
+                    credit_wait = time.monotonic() - available_at
+                    state["credit_wait_seconds"] += credit_wait
                     state["event_id"] += 1
                     event_id = state["event_id"]
                     payload = dict(
@@ -218,6 +254,10 @@ async def run(args):
                         state["max_pending"], state["submitted"] - state["consumed"]
                     )
                 input_hash.update(data)
+                send_started = time.monotonic()
+                if state["first_source_send"] is None:
+                    state["first_source_send"] = send_started
+                state["last_source_send"] = send_started
                 record(
                     "source_send",
                     start=start,
@@ -233,11 +273,17 @@ async def run(args):
                         if args.paced
                         else None
                     ),
-                    credit_wait_seconds=time.monotonic() - available_at,
+                    credit_wait_seconds=credit_wait,
                 )
-                sent.append((start, start + count, time.monotonic()))
+                sent.append((start, start + count, send_started))
                 await send(message)
+            expected = getattr(args, "expected_frames", None)
+            if state["submitted"] == 0 or (
+                expected is not None and state["submitted"] != expected
+            ):
+                raise ValueError("Source frame count does not match the requested case")
             state["ended"] = True
+            state["source_end_send"] = time.monotonic()
             state["event_id"] += 1
             await send(
                 dict(
@@ -251,6 +297,7 @@ async def run(args):
 
         async def receive():
             next_source_id = 1
+            profile_received = False
             async for wire in ws:
                 message = msgpack.unpackb(wire, raw=False)
                 kind = message.get("type")
@@ -381,17 +428,47 @@ async def run(args):
                         accepted.popleft()
                     if args.consumer_delay:
                         await asyncio.sleep(args.consumer_delay)
+                elif kind == "profile_result":
+                    if (
+                        message.get("session_id") != ready["session_id"]
+                        or not state["completed"]
+                        or profile_received
+                        or any(
+                            row.get("request_id") != ready["session_id"]
+                            for row in message.get("stages", [])
+                        )
+                    ):
+                        raise ValueError(
+                            "Stage profile does not match the completed session"
+                        )
+                    await asyncio.to_thread(
+                        (output / "profile.json").write_text, json.dumps(message)
+                    )
+                    await send(dict(type="profile_ack", session_id=ready["session_id"]))
+                    profile_received = True
+                    record(
+                        kind,
+                        session_id=ready["session_id"],
+                        status=message.get("status"),
+                        stage_count=len(message.get("stages", [])),
+                    )
+                    continue
                 elif kind == "session.completed":
                     if (
                         not state["ended"]
-                        or state["received"] != state["submitted"]
+                        or any(
+                            state[key] != state["submitted"]
+                            for key in ("accepted", "consumed", "received")
+                        )
                         or message["output_frames"] != state["received"]
                     ):
                         raise ValueError("The completed session is missing frames")
-                    record(kind, message=message)
-                    return
+                    state["completed"] = True
                 record(kind, message=message)
-            raise RuntimeError("Connection closed before session.completed")
+            if not state["completed"]:
+                raise RuntimeError("Connection closed before session.completed")
+            # A normal server close follows scheduler cleanup. Wait for it before
+            # the next serial request; receipt of all RGB alone is not release.
 
         async def heartbeat():
             while True:
@@ -399,72 +476,90 @@ async def run(args):
                 await send(dict(type="event", kind="heartbeat"))
 
         try:
-            async with asyncio.timeout(args.timeout):
-                async with asyncio.TaskGroup() as group:
-                    h = group.create_task(heartbeat())
-                    producer, receiver = (
-                        group.create_task(produce()),
-                        group.create_task(receive()),
-                    )
-                    await receiver
-                    await producer
-                    h.cancel()
-            elapsed = time.monotonic() - started
-            samples = sorted(latency_samples)
-            dependencies = sorted(dependency_latency_samples)
-            blocks = sorted(block_capture_latency_samples)
-            gaps = sorted(
-                b[0] - a[0] for a, b in zip(delivery_times, delivery_times[1:])
+            async with asyncio.TaskGroup() as group:
+                h = group.create_task(heartbeat())
+                producer = group.create_task(produce())
+                receiver = group.create_task(receive())
+                await receiver
+                await producer
+                h.cancel()
+        except BaseException:
+            # The cancelled receiver no longer drains the bounded incoming queue.
+            # Abort a failed session rather than wait for a close handshake whose
+            # reads may be paused; preserve the original error or cancellation.
+            ws.transport.abort()
+            raise
+        elapsed = time.monotonic() - started
+        source_latency = distribution(latency_samples)
+        dependency_latency = distribution(dependency_latency_samples)
+        block_latency = distribution(block_capture_latency_samples)
+        metrics = calculate_metrics(
+            [
+                {"arrival_seconds": at, "num_frames": count}
+                for at, count in delivery_times
+            ]
+        )
+        boot = Path("/proc/sys/kernel/random/boot_id")
+        summary = dict(
+            state,
+            schema_version=2,
+            session_id=ready["session_id"],
+            client_clock_domain=(
+                f"CLOCK_MONOTONIC:{boot.read_text().strip()}" if boot.exists() else None
+            ),
+            output_batch_interval_p95_seconds=metrics["icl_seconds"]["p95"],
+            output_batch_interval_max_seconds=metrics["icl_seconds"]["max"],
+            elapsed_seconds=elapsed,
+            effective_delivery_fps=state["received"] / elapsed,
+            **metrics,
+            timing_origin="client_start_before_connect_and_source_decode",
+            input_mode="paced" if args.paced else "unpaced",
+            source_to_first_output_seconds=state["first_output"]
+            - state["first_source_send"],
+            tail_drain_seconds=state["last_output"] - state["last_source_send"],
+            first_output_before_source_end=state["first_output"]
+            < state["source_end_send"],
+            dependency_to_output_seconds=dependency_latency,
+            source_to_output_seconds=source_latency,
+            ifl_seconds=None,
+            ifl_status="not_measured_no_individual_frame_delivery_timestamps",
+            source_to_output_p50_seconds=source_latency["median"],
+            source_to_output_p95_seconds=source_latency["p95"],
+            source_to_output_max_seconds=source_latency["max"],
+            dependency_to_output_p50_seconds=dependency_latency["median"],
+            dependency_to_output_p95_seconds=dependency_latency["p95"],
+            block_capture_to_output_p50_seconds=block_latency["median"],
+            block_capture_to_output_p95_seconds=block_latency["p95"],
+            input_sha256=input_hash.hexdigest(),
+            output_sha256=output_hash.hexdigest(),
+            delivery_times=delivery_times,
+        )
+        (output / "summary.json").write_text(json.dumps(summary, indent=2))
+        print(
+            json.dumps(
+                {k: v for k, v in summary.items() if k != "delivery_times"},
+                indent=2,
             )
-            summary = dict(
-                state,
-                output_batch_interval_p95_seconds=gaps[
-                    min(len(gaps) - 1, int(len(gaps) * 0.95))
-                ]
-                if gaps
-                else None,
-                output_batch_interval_max_seconds=max(gaps) if gaps else None,
-                elapsed_seconds=elapsed,
-                effective_delivery_fps=state["received"] / elapsed,
-                ttff_seconds=state["first_output"] - started,
-                source_to_output_p50_seconds=samples[len(samples) // 2],
-                source_to_output_p95_seconds=samples[
-                    min(len(samples) - 1, int(len(samples) * 0.95))
-                ],
-                source_to_output_max_seconds=max(samples),
-                dependency_to_output_p50_seconds=dependencies[len(dependencies) // 2],
-                dependency_to_output_p95_seconds=dependencies[
-                    min(len(dependencies) - 1, int(len(dependencies) * 0.95))
-                ],
-                block_capture_to_output_p50_seconds=blocks[len(blocks) // 2],
-                block_capture_to_output_p95_seconds=blocks[
-                    min(len(blocks) - 1, int(len(blocks) * 0.95))
-                ],
-                input_sha256=input_hash.hexdigest(),
-                output_sha256=output_hash.hexdigest(),
-                delivery_times=delivery_times,
-            )
-            (output / "summary.json").write_text(json.dumps(summary, indent=2))
-            print(
-                json.dumps(
-                    {k: v for k, v in summary.items() if k != "delivery_times"},
-                    indent=2,
-                )
-            )
-        finally:
-            if source is not sys.stdin.buffer:
-                source.close()
-            received_file.close()
-            trace.close()
+        )
+        return summary
 
 
-def main():
+def parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--url", default="ws://127.0.0.1:30000/v1/realtime_video/generate"
     )
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--source-rgb", help="RGB24 file or - for an engine pipe")
+    source.add_argument(
+        "--source-video",
+        help="24 FPS video decoded incrementally; no looping or FPS conversion",
+    )
     parser.add_argument(
-        "--source-rgb", required=True, help="RGB24 file or - for an engine pipe"
+        "--ffmpeg", default="ffmpeg", help="FFmpeg executable for --source-video"
+    )
+    parser.add_argument(
+        "--expected-frames", type=int, help="Reject incomplete or extra source frames"
     )
     parser.add_argument("--output", required=True, help="New result directory")
     parser.add_argument("--prompt", required=True)
@@ -479,6 +574,7 @@ def main():
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--paced", action="store_true")
+    parser.add_argument("--receive-stage-timing", action="store_true")
     parser.add_argument(
         "--profile",
         action="store_true",
@@ -488,16 +584,21 @@ def main():
     parser.add_argument("--startup-buffer-seconds", type=float, default=0.5)
     parser.add_argument("--consumer-delay", type=float, default=0)
     parser.add_argument("--timeout", type=float, default=900)
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    cli = parser()
+    args = cli.parse_args()
     if args.user_media and args.reference:
-        parser.error("Use either --user-media or --reference.")
+        cli.error("Use either --user-media or --reference.")
     if args.reference_id and len(args.reference_id) != len(args.reference):
-        parser.error("Provide one reference ID per reference image.")
+        cli.error("Provide one reference ID per reference image.")
     if (
         min(args.width, args.height, *args.batch_pattern) < 1
         or args.startup_buffer_seconds < 0
     ):
-        parser.error("Dimensions, batch lengths and startup buffering must be valid")
+        cli.error("Dimensions, batch lengths and startup buffering must be valid")
     asyncio.run(run(args))
 
 

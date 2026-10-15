@@ -886,7 +886,7 @@ class TestConditioningRPCWorker(CustomTestCase):
         state.sampler.step = step
 
         # Decode is a GPU boundary. Consume real queued block metadata as RGB frames.
-        def decode(stage, outputs, metadata, timed, **kwargs):
+        def decode(stage, outputs, metadata, timed, trace=None, **kwargs):
             while state.blocks:
                 block = state.blocks.popleft()
                 outputs.append(torch.zeros(3, 1, 1, 1))

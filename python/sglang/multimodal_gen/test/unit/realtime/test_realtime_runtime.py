@@ -1255,6 +1255,12 @@ def test_generate_loop_overlaps_send_with_next_generation(monkeypatch):
         async def wait_for_next_chunk(self, session):
             del session
 
+        async def prepare_conditioning(self, session, server_args):
+            pass
+
+        def session_ready_message(self, session):
+            return {}
+
         def prepare_next_request(self, session, server_args, chunk):
             del session, server_args
             return SimpleNamespace(
@@ -1279,7 +1285,7 @@ def test_generate_loop_overlaps_send_with_next_generation(monkeypatch):
         events.append(f"generate_start_{batch.block_idx}")
         await asyncio.sleep(0.01)
         events.append(f"generate_end_{batch.block_idx}")
-        return None, SimpleNamespace()
+        return None, OutputBatch()
 
     monkeypatch.setattr(
         realtime_video_api,

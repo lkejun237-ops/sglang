@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exercise an unregistered bridge group and bounded remote control on CPU."""
 
-from types import SimpleNamespace
 import queue
 import time
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -14,12 +14,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
     bridge_group,
     receive_moments,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.progressive_encoder import (
+    expected_progressive_slices,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.remote_encoder import (
     RemoteEncoderSession,
     available_latents,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.progressive_encoder import (
-    expected_progressive_slices,
 )
 
 
@@ -128,6 +128,34 @@ def test_remote_queue_eos_and_disposal(monkeypatch, mode):
     session.dispose()
     assert not session.thread.is_alive()
     assert session.state_usage().retained_bytes == 0
+    session.dispose()
+
+
+def test_remote_worker_token_can_use_client_session_identity(monkeypatch):
+    from sglang.multimodal_gen.runtime.distributed import parallel_state
+
+    monkeypatch.setattr(
+        parallel_state,
+        "get_world_group",
+        lambda: SimpleNamespace(
+            rank_in_group=0, ranks=[0], cpu_group=None, device_group=None
+        ),
+    )
+    monkeypatch.setattr(RemoteEncoderSession, "_produce", lambda self: None)
+    codecs = SimpleNamespace(
+        modules={"video_vae": SimpleNamespace(encoder=torch.nn.Linear(1, 1))}
+    )
+    session = RemoteEncoderSession(
+        codecs,
+        capacity_frames=34,
+        config=dict(
+            port=31001,
+            mode="serial",
+            timeout_seconds=1,
+            session_id="client-session",
+        ),
+    )
+    assert session.token == "client-session"
     session.dispose()
 
 

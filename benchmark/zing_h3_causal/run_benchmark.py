@@ -189,9 +189,7 @@ def parser():
     result.add_argument("--port", type=int, default=30000)
     result.add_argument("--warmup-runs", type=int, default=1)
     result.add_argument("--measured-runs", type=int, default=3)
-    result.add_argument(
-        "--stage-timing", choices=("off", "host", "cuda"), default="off"
-    )
+    result.add_argument("--stage-timing", choices=("off", "host"), default="host")
     result.add_argument("--startup-timeout", type=float, default=900)
     result.add_argument("--timeout", type=float, default=900)
     result.add_argument("--preflight-only", action="store_true")
@@ -312,6 +310,8 @@ def main(argv=None):
     ]
     if args.stage_timing != "off":
         client.append("--receive-stage-timing")
+    else:
+        client.append("--no-stage-timing")
     if args.case_set:
         # Resolve before server startup; the client consumes the same collection file.
         client[client.index("--case") : client.index("--case") + 2] = [
@@ -326,11 +326,7 @@ def main(argv=None):
     # Refuse an occupied endpoint instead of benchmarking an unrelated service.
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", args.port))
-    env = dict(
-        os.environ,
-        SGLANG_ZING_STAGE_TIMING=args.stage_timing,
-        SGLANG_ZING_STAGE_TIMING_DIR=str(output / "timing"),
-    )
+    env = dict(os.environ)
     with (output / "server.log").open("w") as log:
         process = subprocess.Popen(
             command,

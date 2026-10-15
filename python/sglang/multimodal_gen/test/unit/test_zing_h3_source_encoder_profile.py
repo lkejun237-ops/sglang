@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
     remote_encoder,
     source_encoder,
@@ -15,7 +16,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
 
 
 @pytest.mark.parametrize("profiling", [False, True])
-def test_remote_trace_directory_is_used_only_during_profile(monkeypatch, profiling):
+@pytest.mark.parametrize("stage_timing", [False, True])
+def test_remote_trace_directory_is_used_only_during_profile(
+    monkeypatch, profiling, stage_timing
+):
     seen = []
 
     def create_session(codecs, *, capacity_frames, config):
@@ -40,7 +44,15 @@ def test_remote_trace_directory_is_used_only_during_profile(monkeypatch, profili
     )
 
     def create():
-        source_encoder.create_source_buffer(codecs, profile, capacity_frames=51)
+        source_encoder.create_source_buffer(
+            codecs,
+            profile,
+            capacity_frames=51,
+            session_id="client-session",
+            stage_trace=SimpleNamespace(directory="/temporary/shared")
+            if stage_timing
+            else None,
+        )
 
     if profiling:
         with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]):
@@ -48,4 +60,8 @@ def test_remote_trace_directory_is_used_only_during_profile(monkeypatch, profili
     else:
         create()
     assert ("profile_dir" in seen[0]) is profiling
+    assert seen[0]["session_id"] == "client-session"
+    assert seen[0].get("stage_timing_dir") == (
+        "/temporary/shared" if stage_timing else None
+    )
     assert profile["remote"]["profile_dir"] == "/traces"

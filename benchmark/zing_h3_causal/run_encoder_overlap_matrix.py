@@ -8,6 +8,7 @@ Outputs are append-only; existing cells are never silently reused.
 
 import argparse
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -20,14 +21,8 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from encoder_execution_evidence import (
-    capture_session,
-    endpoint_binding,
     input_geometry,
-    validate_correctness,
     validate_encoder_acceptance,
-    validate_profile_binding,
-    validate_serial_overlap,
-    validate_serial_overlap_parity,
 )
 from encoder_overlap_config import layouts, selected_layouts
 from prepare_encoder_overlap import digest
@@ -38,6 +33,17 @@ WORKER = "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_sta
 
 def write_json(path, value):
     path.write_text(json.dumps(value, indent=2))
+
+
+def read_text_retry(path, *, attempts=5, delay=0.1):
+    """Retry only transient shared-filesystem reads; never relax parsing."""
+    for attempt in range(attempts):
+        try:
+            return path.read_text()
+        except OSError as exc:
+            if exc.errno not in {errno.EIO, errno.ESTALE} or attempt + 1 == attempts:
+                raise
+            time.sleep(delay * (attempt + 1))
 
 
 _TILE_ENV = "MINIMAX_H3_PROGRESSIVE_ENCODER_TILING"
@@ -97,6 +103,127 @@ def command_run(cmd, output, env=None, timeout=14400):
             check=True,
             timeout=timeout,
         )
+
+
+def read_stage_timing_rows(directory):
+    rows = []
+    for path in directory.rglob("stage-timing-pid*.jsonl"):
+        try:
+            lines = read_text_retry(path).splitlines()
+        except FileNotFoundError:
+            continue
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                # The writer may be between write() and flush() while polled.
+                continue
+    if not rows:
+        for path in directory.parent.rglob("profile.json"):
+            rows.extend(json.loads(read_text_retry(path)).get("stages", []))
+    return rows
+
+
+def read_stage_timing_health(directory):
+    health = {}
+    for path in directory.rglob("*-health.json"):
+        pid = int(path.name.split("pid", 1)[1].split("-", 1)[0])
+        health[pid] = json.loads(read_text_retry(path))
+    if not health:
+        for path in directory.parent.rglob("profile.json"):
+            for row in json.loads(read_text_retry(path)).get("health", []):
+                pid = row.get("pid") or (row.get("profile") or {}).get("pid")
+                if pid is not None and row.get("written", 0) >= health.get(pid, {}).get(
+                    "written", 0
+                ):
+                    health[pid] = row
+    return health
+
+
+def _ranges_cover(rows, field, expected_end):
+    ranges = [row.get(field) for row in rows if not row.get("no_output")]
+    if not ranges:
+        return False
+    if any(
+        not isinstance(value, list)
+        or len(value) != 2
+        or any(type(item) is not int for item in value)
+        for value in ranges
+    ):
+        return False
+    ranges.sort()
+    cursor = 0
+    for value in ranges:
+        if value[0] != cursor or value[1] <= value[0]:
+            return False
+        cursor = value[1]
+    return cursor == expected_end
+
+
+def _timing_rows_complete(rows, timing_mode):
+    if timing_mode == "cuda":
+        return bool(rows) and all(
+            row.get("status") == "ok"
+            and row.get("cuda_status") == "complete"
+            and isinstance(row.get("cuda_stream_ms"), (int, float))
+            and not isinstance(row.get("cuda_stream_ms"), bool)
+            for row in rows
+        )
+    return bool(rows) and all(
+        row.get("status") == "ok" and row.get("cuda_status") == "not_requested"
+        for row in rows
+    )
+
+
+def session_timing_ready(
+    rows, session_id, sp, expected_frames, *, enc=1, timing_mode="cuda"
+):
+    current = [row for row in rows if row.get("request_id") == session_id]
+    encoder = [
+        row
+        for row in current
+        if row.get("stage") == "Encoder"
+        and row.get("component") == "source_vae"
+        and row.get("worker_role") == "dedicated_source_encoder"
+    ]
+    clips, tail = divmod(expected_frames - 1, 17)
+    latent_end = clips * 5 + 1 + (tail + 3) // 4
+    for rank in range(enc):
+        rank_encoder = [row for row in encoder if row.get("rank") == rank]
+        if not _timing_rows_complete(rank_encoder, timing_mode) or not _ranges_cover(
+            rank_encoder, "latent_range", latent_end
+        ):
+            return False
+    server = [row for row in current if row.get("worker_role") is None]
+    for rank in range(sp):
+        dit = [
+            row
+            for row in server
+            if row.get("stage") == "DiT" and row.get("rank") == rank
+        ]
+        decoder = [
+            row
+            for row in server
+            if row.get("stage") == "Decoder" and row.get("rank") == rank
+        ]
+        complete = [
+            row
+            for row in server
+            if row.get("stage") == "Request"
+            and row.get("component") == "continuous_source_complete"
+            and row.get("rank") == rank
+        ]
+        if (
+            not _timing_rows_complete(dit, timing_mode)
+            or not _timing_rows_complete(decoder, timing_mode)
+            or not _timing_rows_complete(complete, timing_mode)
+            or not _ranges_cover(dit, "output_latent_range", latent_end)
+            or not _ranges_cover(decoder, "output_frame_range", expected_frames)
+        ):
+            return False
+    return True
 
 
 def lifecycle_gate(cmd, out, env, *, exploratory):
@@ -299,7 +426,7 @@ def overlay(
     for p in base.iterdir():
         if p.name not in ("zing_realtime_profile.json", "zing_config.json"):
             (model / p.name).symlink_to(p.resolve())
-    runtime = json.loads((base / "zing_config.json").read_text())
+    runtime = json.loads(read_text_retry(base / "zing_config.json"))
     original_chunk_plan = {
         key: runtime[key]
         for key in ("num_frame_per_block", "split_first_latent")
@@ -326,7 +453,7 @@ def overlay(
             baseline="Shared/reference and dedicated Encoder use this same frozen policy; no comparison to old-policy output or timing is implied",
         ),
     )
-    profile = json.loads((base / "zing_realtime_profile.json").read_text())
+    profile = json.loads(read_text_retry(base / "zing_realtime_profile.json"))
     profile["model_config_sha256"] = digest(model / "zing_config.json")
     assert profile["source_encoder"]["mode"] == "progressive"
     profile["source_encoder"].pop("remote", None)
@@ -407,13 +534,12 @@ def client_command(config, out, *, paced, profile=False, soak=False):
         raise ValueError(
             "source_batch_pattern must be a nonempty list of positive integers"
         )
-    request = json.loads(Path(config["request"]).read_text())
+    request = json.loads(read_text_retry(Path(config["request"])))
     content = request["messages"][0]["content"]
     prompt = "\n".join(item["text"] for item in content if item["type"] == "text")
     references = [item for item in content if item["type"] == "image"]
-    if len(references) != 6:
-        raise ValueError("The default case requires all six reference images")
-    if [r["id"] for r in references] != [f"<Picture {i}>" for i in range(1, 7)]:
+    reference_ids = config.get("reference_ids", [f"<Picture {i}>" for i in range(1, 7)])
+    if [r["id"] for r in references] != reference_ids:
         raise ValueError("Reference image order differs from the frozen case")
     if (
         not Path(config["prompt_video_frame"]).is_file()
@@ -438,6 +564,8 @@ def client_command(config, out, *, paced, profile=False, soak=False):
         "--timeout",
         "3600",
     ]
+    if config.get("stage_timing", "off") != "off":
+        cmd += ["--receive-stage-timing"]
     for ref in references:
         path = unquote(urlparse(ref["uri"]).path)
         if not Path(path).is_file():
@@ -461,6 +589,13 @@ def endpoint_phase_groups(*, capture=False, soak=False):
         (False, ["warmup"] + [f"measured-{i}" for i in range(5)]),
         (True, ["profile-warmup", "profile"]),
     ]
+
+
+def formal_phases(config):
+    runs = config.get("measured_runs", 5)
+    if type(runs) is not int or runs < 1:
+        raise ValueError("measured_runs must be a positive integer")
+    return ["warmup"] + [f"measured-{i}" for i in range(runs)]
 
 
 def endpoint_cell(
@@ -498,6 +633,11 @@ def endpoint_cell(
         SGLANG_DIFFUSION_COLLECT_RANK_MEMORY="1",
         SGLANG_DIFFUSION_TORCH_PROFILER_DIR=str(out / "traces"),
     )
+    timing_mode = config.get("stage_timing", "off")
+    if timing_mode not in ("off", "host"):
+        raise ValueError("stage_timing must be off or host")
+    if timing_mode != "off":
+        env["SGLANG_ZING_STAGE_TIMING_DIR"] = str(out / "timing")
     if capture:
         env["SGLANG_ZING_COMPONENT_CAPTURE_DIR"] = str(out / "capture")
     for key in ("cross_dispatch_prefetch", "async_source_output"):
@@ -621,8 +761,12 @@ def endpoint_cell(
                         out / f"{phase}.log",
                         env,
                     )
-                    summary = json.loads((out / phase / "summary.json").read_text())
-                    frames = 2880 if soak else 720
+                    summary = json.loads(read_text_retry(out / phase / "summary.json"))
+                    frames = (
+                        config.get("soak_frames", 2880)
+                        if soak
+                        else config.get("expected_frames", 720)
+                    )
                     if not summary["ended"] or any(
                         summary[k] != frames
                         for k in ("submitted", "accepted", "consumed", "received")
@@ -631,9 +775,9 @@ def endpoint_cell(
                     # Cleanup acknowledgement prevents the next session racing the old encoder.
                     events = [
                         json.loads(line)
-                        for line in (out / phase / "events.jsonl")
-                        .read_text()
-                        .splitlines()
+                        for line in read_text_retry(
+                            out / phase / "events.jsonl"
+                        ).splitlines()
                     ]
                     sid = next(
                         e["message"]["session_id"]
@@ -643,7 +787,7 @@ def endpoint_cell(
                     for _ in range(600):
                         if any(
                             "server.session_cleanup_done" in line and sid in line
-                            for line in (server_log).read_text().splitlines()
+                            for line in read_text_retry(server_log).splitlines()
                         ):
                             break
                         if server.poll() is not None:
@@ -651,6 +795,42 @@ def endpoint_cell(
                         time.sleep(0.1)
                     else:
                         raise TimeoutError("Session cleanup acknowledgement is missing")
+                    if timing_mode != "off":
+                        deadline = time.monotonic() + 30
+                        expected_writers = sp + enc
+                        while True:
+                            health = read_stage_timing_health(out / "timing")
+                            rows = read_stage_timing_rows(out / "timing")
+                            rows_by_pid = {
+                                pid: sum(row.get("pid") == pid for row in rows)
+                                for pid in health
+                            }
+                            if (
+                                len(health) == expected_writers
+                                and session_timing_ready(
+                                    rows,
+                                    sid,
+                                    sp,
+                                    frames,
+                                    enc=enc,
+                                    timing_mode=timing_mode,
+                                )
+                                and all(
+                                    row.get("written", 0) > 0
+                                    and row.get("written") == rows_by_pid[pid]
+                                    and not row.get("dropped")
+                                    and not row.get("pending")
+                                    and not row.get("queued")
+                                    and not row.get("error")
+                                    for pid, row in health.items()
+                                )
+                            ):
+                                break
+                            if time.monotonic() >= deadline:
+                                raise RuntimeError(
+                                    "Stage timing collectors did not settle"
+                                )
+                            time.sleep(0.1)
                     write_json(out / "progress.json", dict(phase=phase, completed=True))
                 if (
                     enc
@@ -658,6 +838,7 @@ def endpoint_cell(
                     and not capture
                     and not soak
                     and not profile_monitoring
+                    and config.get("run_lifecycle_probe", True)
                 ):
                     owned = snapshot_process_groups([server, worker])
                     lifecycle = lifecycle_gate(
@@ -746,6 +927,11 @@ def endpoint_cell(
         return out
 
     groups = endpoint_phase_groups(capture=capture, soak=soak)
+    if not capture and not soak:
+        groups = [
+            (profile, formal_phases(config) if not profile else phases)
+            for profile, phases in groups
+        ]
     if collection_phase != "all":
         run_groups(groups[:1] if collection_phase == "formal" else groups[1:])
         return out  # Only phase receipt; never claim both collections finished.
@@ -1167,7 +1353,10 @@ def main():
     )
     with (root / "topology.txt").open("w") as f:
         subprocess.run(["nvidia-smi", "topo", "-m"], stdout=f, check=True)
-    for key, count in (("source_rgb", 720), ("soak_rgb", 2880)):
+    sources = [("source_rgb", config.get("expected_frames", 720))]
+    if args.stage == "soak":
+        sources.append(("soak_rgb", config.get("soak_frames", 2880)))
+    for key, count in sources:
         assert Path(config[key]).stat().st_size == count * width * height * 3
     if args.stage == "transport":
         for enc in args.encoder_gpus:

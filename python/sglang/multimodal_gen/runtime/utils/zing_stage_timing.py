@@ -6,9 +6,12 @@ cover only the current device/stream and are never mapped onto the host clock.
 """
 
 import asyncio
+import atexit
+import hashlib
 import json
 import os
 import queue
+import tempfile
 import threading
 import time
 from collections import Counter
@@ -17,6 +20,8 @@ from pathlib import Path
 
 _WRITER = None
 _LOCK = threading.Lock()
+_LOCAL_DIRECTORY = None
+_DEPLOYMENT_ACTIVE = False
 
 
 def new_events():
@@ -157,6 +162,17 @@ class StageTrace:
             span.finish()
 
 
+def session_file_tag(request_id):
+    return hashlib.sha256(str(request_id).encode()).hexdigest()
+
+
+def remove_profile_files(directory, request_id):
+    """Remove only this completed request; worker health files stay bounded."""
+    tag = session_file_tag(request_id)
+    for path in Path(directory).glob(f"stage-timing-pid*-session{tag}.jsonl"):
+        path.unlink(missing_ok=True)
+
+
 class Writer:
     """Bounded nonblocking producer, bounded delayed events, append-only output."""
 
@@ -174,6 +190,10 @@ class Writer:
         )
         self.thread.start()
 
+    def close(self):
+        self.stop.set()
+        self.thread.join(timeout=2)
+
     def submit(self, item):
         try:
             self.queue.put_nowait(item)
@@ -184,71 +204,76 @@ class Writer:
         pending = []
         profile = None
         try:
-            with self.path.open("a", encoding="utf-8") as file:
-                while not self.stop.is_set() or pending or not self.queue.empty():
-                    if len(pending) < self.capacity:
-                        try:
-                            item = self.queue.get(timeout=0.01)
-                            row = item[0]
-                            if row.get("request_id") is not None and (
-                                profile is None
-                                or profile["request_id"] != row["request_id"]
-                                or profile.get("generation_id")
-                                != row.get("generation_id")
-                            ):
-                                profile = {
-                                    "request_id": row["request_id"],
-                                    "generation_id": row.get("generation_id"),
-                                    "rank": row.get("rank"),
-                                    "pid": os.getpid(),
-                                    "dispatches": {},
-                                }
-                            pending.append((time.monotonic(), item))
-                        except queue.Empty:
-                            pass
-                    else:
-                        self.stop.wait(0.01)
-                    retained = []
-                    for added, (row, start, end) in pending:
-                        if row.get("kind") == "dispatch_complete":
-                            # A marker is publishable only after earlier spans from
-                            # this dispatch have resolved, including CUDA events.
-                            if any(
-                                r.get("request_id") == row["request_id"]
-                                and r.get("dispatch_id") == row["dispatch_id"]
-                                for _, (r, _, _) in retained
-                            ):
-                                retained.append((added, (row, start, end)))
-                            elif (
-                                profile
-                                and profile["request_id"] == row["request_id"]
-                                and profile.get("generation_id")
-                                == row.get("generation_id")
-                            ):
-                                profile["dispatches"][row["dispatch_id"]] = row[
-                                    "span_count"
-                                ]
+            while not self.stop.is_set() or pending or not self.queue.empty():
+                if len(pending) < self.capacity:
+                    try:
+                        item = self.queue.get(timeout=0.01)
+                        row = item[0]
+                        if row.get("request_id") is not None and (
+                            profile is None
+                            or profile["request_id"] != row["request_id"]
+                            or profile.get("generation_id") != row.get("generation_id")
+                        ):
+                            profile = {
+                                "request_id": row["request_id"],
+                                "generation_id": row.get("generation_id"),
+                                "rank": row.get("rank"),
+                                "pid": os.getpid(),
+                                "worker_role": row.get("worker_role"),
+                                "dispatches": {},
+                            }
+                        pending.append((time.monotonic(), item))
+                    except queue.Empty:
+                        if not pending:
                             continue
-                        if not resolve_cuda(row, start, end):
-                            if time.monotonic() - added < self.event_timeout:
-                                retained.append((added, (row, start, end)))
-                                continue
-                            row.update(cuda_status="timeout", cuda_stream_ms=None)
+                else:
+                    self.stop.wait(0.01)
+                retained = []
+                for added, (row, start, end) in pending:
+                    if row.get("kind") == "dispatch_complete":
+                        # A marker is publishable only after earlier spans from
+                        # this dispatch have resolved, including CUDA events.
+                        if any(
+                            r.get("request_id") == row["request_id"]
+                            and r.get("dispatch_id") == row["dispatch_id"]
+                            for _, (r, _, _) in retained
+                        ):
+                            retained.append((added, (row, start, end)))
+                        elif (
+                            profile
+                            and profile["request_id"] == row["request_id"]
+                            and profile.get("generation_id") == row.get("generation_id")
+                        ):
+                            profile["dispatches"][row["dispatch_id"]] = row[
+                                "span_count"
+                            ]
+                        continue
+                    if not resolve_cuda(row, start, end):
+                        if time.monotonic() - added < self.event_timeout:
+                            retained.append((added, (row, start, end)))
+                            continue
+                        row.update(cuda_status="timeout", cuda_stream_ms=None)
+                    path = self.path
+                    if row.get("request_id") is not None:
+                        tag = session_file_tag(row["request_id"])
+                        path = self.path.with_name(
+                            f"{self.path.stem}-session{tag}.jsonl"
+                        )
+                    with path.open("a", encoding="utf-8") as file:
                         file.write(json.dumps(row, allow_nan=False) + "\n")
-                        self.written += 1
-                    pending = retained
-                    file.flush()
-                    publish_health(
-                        self.health_path,
-                        {
-                            "written": self.written,
-                            "dropped": self.dropped,
-                            "pending": len(pending),
-                            "queued": self.queue.qsize(),
-                            "error": None,
-                            "profile": profile,
-                        },
-                    )
+                    self.written += 1
+                pending = retained
+                publish_health(
+                    self.health_path,
+                    {
+                        "written": self.written,
+                        "dropped": self.dropped,
+                        "pending": len(pending),
+                        "queued": self.queue.qsize(),
+                        "error": None,
+                        "profile": profile,
+                    },
+                )
         except Exception as exc:
             self.error = type(exc).__name__
             # Collection failure must be visible without replacing model output.
@@ -260,43 +285,96 @@ class Writer:
 def get_writer(directory):
     global _WRITER
     with _LOCK:
+        directory = Path(directory).resolve()
+        if _WRITER is not None and _WRITER.path.parent != directory:
+            _WRITER.close()
+            _WRITER = None
         if _WRITER is None:
-            _WRITER = Writer(Path(directory))
+            _WRITER = Writer(directory)
         return _WRITER
 
 
-def trace_for_batch(batch):
-    mode = os.environ.get("SGLANG_ZING_STAGE_TIMING", "off")
-    if mode == "off":
-        return None
-    if mode not in {"host", "cuda"}:
-        raise ValueError("Zing stage timing mode must be off, host, or cuda")
+@contextmanager
+def deployment_timing_directory():
+    """One directory per deployment, inherited by spawned SP workers."""
+    global _DEPLOYMENT_ACTIVE
+    if _DEPLOYMENT_ACTIVE:
+        yield timing_directory()
+        return
+    previous = os.environ.get("SGLANG_ZING_STAGE_TIMING_DIR")
+    base = Path(previous).resolve() if previous else None
+    if base:
+        base.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="zing-stage-timing-", dir=base
+    ) as directory:
+        _DEPLOYMENT_ACTIVE = True
+        os.environ["SGLANG_ZING_STAGE_TIMING_DIR"] = directory
+        try:
+            yield Path(directory)
+        finally:
+            _DEPLOYMENT_ACTIVE = False
+            global _WRITER
+            if _WRITER is not None and _WRITER.path.parent == Path(directory):
+                _WRITER.close()
+                _WRITER = None
+            if previous is None:
+                os.environ.pop("SGLANG_ZING_STAGE_TIMING_DIR", None)
+            else:
+                os.environ["SGLANG_ZING_STAGE_TIMING_DIR"] = previous
+
+
+def timing_directory():
+    """Lazy fallback for programmatic callers outside the serving launcher."""
+    global _LOCAL_DIRECTORY
     directory = os.environ.get("SGLANG_ZING_STAGE_TIMING_DIR")
-    if not directory:
-        raise ValueError("Zing stage timing requires an output directory")
+    if directory:
+        return Path(directory).resolve()
+    if _LOCAL_DIRECTORY is None:
+        _LOCAL_DIRECTORY = tempfile.TemporaryDirectory(prefix="zing-stage-timing-")
+        atexit.register(_LOCAL_DIRECTORY.cleanup)
+    return Path(_LOCAL_DIRECTORY.name)
+
+
+def trace_for_ids(
+    request_id, dispatch_id, *, enabled=False, directory=None, identity=None
+):
+    """Request-scoped Host trace, also usable by the dedicated Encoder."""
+    if not enabled:
+        return None
+    directory = (
+        Path(directory).resolve() if directory is not None else timing_directory()
+    )
+    writer = get_writer(directory)
     import torch
     import torch.distributed as dist
 
     rank = dist.get_rank() if dist.is_initialized() else 0
     boot = Path("/proc/sys/kernel/random/boot_id")
-    identity = {
+    trace_identity = {
         "pid": os.getpid(),
         "rank": rank,
-        "generation_id": getattr(batch, "realtime_generation_id", None),
+        "generation_id": None,
         "device": torch.cuda.current_device() if torch.cuda.is_available() else None,
         "host": os.uname().nodename,
         "clock_domain": f"CLOCK_MONOTONIC:{boot.read_text().strip() if boot.exists() else 'unknown'}",
-        "mode": mode,
-        "dispatch_id_status": "present"
-        if getattr(batch, "request_id", None)
-        else "missing",
+        "mode": "host",
+        "dispatch_id_status": "present" if dispatch_id else "missing",
+        **(identity or {}),
     }
-    return StageTrace(
-        batch.realtime_session_id,
+    trace = StageTrace(request_id, dispatch_id, writer.submit, identity=trace_identity)
+    trace.directory = str(directory)
+    return trace
+
+
+def trace_for_batch(batch):
+    return trace_for_ids(
+        getattr(batch, "realtime_session_id", None),
         getattr(batch, "request_id", None),
-        get_writer(directory).submit,
-        measure_cuda=mode == "cuda",
-        identity=identity,
+        enabled=bool(
+            (getattr(batch, "extra", None) or {}).get("return_stage_timing", False)
+        ),
+        identity={"generation_id": getattr(batch, "realtime_generation_id", None)},
     )
 
 
@@ -315,6 +393,7 @@ def _profile_snapshots(directory, request_id, generation_id):
         value = json.loads(path.read_text()).get("profile")
         if (
             value
+            and value.get("worker_role") != "dedicated_source_encoder"
             and value["request_id"] == request_id
             and (generation_id is None or value.get("generation_id") == generation_id)
         ):
@@ -410,3 +489,76 @@ async def collect_profile(
         "health": health,
         "wait_seconds": time.monotonic() - started,
     }
+
+
+async def collect_continuous_profile(directory, request_id, ranks, *, timeout=35):
+    """Read the completed single-active source session, including its Encoder."""
+    started = time.monotonic()
+    tag = session_file_tag(request_id)
+    stages, health = [], []
+    while True:
+        stages, health = [], []
+        readable = True
+        try:
+            for path in Path(directory).glob(f"stage-timing-pid*-session{tag}.jsonl"):
+                stages.extend(
+                    json.loads(line) for line in path.read_text().splitlines()
+                )
+                stem = path.name.split("-session", 1)[0]
+                health.append(
+                    {
+                        "file": stem + "-health.json",
+                        **json.loads(path.with_name(stem + "-health.json").read_text()),
+                    }
+                )
+        except (OSError, ValueError):
+            readable = False
+            stages, health = [], []
+        completed = {
+            row["rank"]
+            for row in stages
+            if row.get("component") == "continuous_source_complete"
+        }
+        complete = (
+            readable
+            and set(ranks) <= completed
+            and all(
+                not any(h.get(k) for k in ("pending", "queued", "error"))
+                for h in health
+            )
+            and all(row.get("status") == "ok" for row in stages)
+        )
+        if complete or time.monotonic() - started >= timeout:
+            break
+        await asyncio.sleep(0.05)
+    return {
+        "type": "profile_result",
+        "session_id": request_id,
+        "status": "complete" if complete else "incomplete",
+        "expected_ranks": ranks,
+        "stages": stages,
+        "health": health,
+        "wait_seconds": time.monotonic() - started,
+    }
+
+
+async def discard_profile(directory, request_id, *, timeout=2):
+    """Best-effort cleanup after workers released an aborted session."""
+    deadline = time.monotonic() + timeout
+    tag = session_file_tag(request_id)
+    previous = None
+    while True:
+        files = list(Path(directory).glob(f"stage-timing-pid*-session{tag}.jsonl"))
+        state = [(str(p), p.stat().st_size) for p in files]
+        healthy = True
+        for path in Path(directory).glob("*-health.json"):
+            try:
+                h = json.loads(path.read_text())
+                healthy = healthy and not h.get("pending") and not h.get("queued")
+            except (OSError, ValueError):
+                healthy = False
+        if (healthy and previous == state) or time.monotonic() >= deadline:
+            break
+        previous = state
+        await asyncio.sleep(0.05)
+    remove_profile_files(directory, request_id)

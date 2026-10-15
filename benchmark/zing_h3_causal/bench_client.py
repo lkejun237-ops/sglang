@@ -404,7 +404,16 @@ async def receive(ws, delivery, started, clock=time.perf_counter, sink=None):
                 )
             ):
                 raise ValueError("Stage profile does not match the completed session")
+            profile_path = getattr(delivery, "profile_path", None)
+            if profile_path is not None:
+                profile_path.parent.mkdir(parents=True, exist_ok=True)
+                await asyncio.to_thread(write_json, profile_path, message)
             delivery.profile = message
+            await ws.send(
+                msgpack.packb(
+                    {"type": "profile_ack", "session_id": session_id}, use_bin_type=True
+                )
+            )
             delivery.profile_wait_seconds = (
                 received - started - delivery.chunks[-1]["arrival_seconds"]
             )
@@ -427,6 +436,7 @@ async def run_request(case, args, phase, index):
 
     request_id = f"{case['label']}-{phase}-{index:03d}"
     delivery = Delivery(case["frames"], case["width"], case["height"])
+    delivery.profile_path = args.output_dir / "profiles" / f"{request_id}.json"
     # Serialization and connection setup are outside request timing.
     init = dict(case["init"])
     if getattr(args, "receive_stage_timing", False):
@@ -481,10 +491,6 @@ async def run_request(case, args, phase, index):
             except Exception as exc:
                 result["success"] = False
                 result["error"] = f"{type(exc).__name__}: {exc}"
-    if delivery.profile is not None:
-        profiles = args.output_dir / "profiles"
-        profiles.mkdir(exist_ok=True)
-        write_json(profiles / f"{request_id}.json", delivery.profile)
     result["profile_status"] = (
         delivery.profile["status"]
         if delivery.profile is not None
@@ -621,7 +627,11 @@ def parser():
     result.add_argument(
         "--receive-stage-timing",
         action="store_true",
+        default=True,
         help="Receive this session's server stage profile before normal close",
+    )
+    result.add_argument(
+        "--no-stage-timing", dest="receive_stage_timing", action="store_false"
     )
     result.add_argument("--preflight-only", action="store_true")
     return result

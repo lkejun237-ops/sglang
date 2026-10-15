@@ -2,7 +2,6 @@
 
 import asyncio
 import hashlib
-import os
 import shutil
 import time
 from dataclasses import dataclass
@@ -2006,38 +2005,64 @@ async def _close_realtime_websocket(
 
 
 async def _send_stage_profile(
-    websocket, session_id, dispatch_count, generation_id=None
+    websocket, session_id, dispatch_count, generation_id=None, continuous=False
 ):
-    from sglang.multimodal_gen.runtime.utils.zing_stage_timing import collect_profile
+    from sglang.multimodal_gen.runtime.utils.zing_stage_timing import (
+        collect_continuous_profile,
+        collect_profile,
+        remove_profile_files,
+        timing_directory,
+    )
 
-    directory = os.environ.get("SGLANG_ZING_STAGE_TIMING_DIR")
-    if os.environ.get("SGLANG_ZING_STAGE_TIMING", "off") == "off" or not directory:
-        profile = {
-            "type": "profile_result",
-            "session_id": session_id,
-            "status": "disabled",
-            "stages": [],
-            "health": [],
-        }
-    else:
-        try:
+    directory = timing_directory()
+    try:
+        ranks = list(range(get_global_server_args().num_gpus))
+        if continuous:
+            profile = await collect_continuous_profile(directory, session_id, ranks)
+        else:
             profile = await collect_profile(
                 directory,
                 session_id,
-                list(range(get_global_server_args().num_gpus)),
+                ranks,
                 dispatch_count,
                 generation_id=generation_id,
             )
-        except Exception:
-            logger.exception("Failed to collect session stage profile")
-            profile = {
-                "type": "profile_result",
-                "session_id": session_id,
-                "status": "error",
-                "stages": [],
-                "health": [{"error": "Stage timing could not be collected."}],
-            }
-    await websocket.send_bytes(msgspec.msgpack.encode(profile))
+    except Exception:
+        logger.exception("Failed to collect session stage profile")
+        profile = {
+            "type": "profile_result",
+            "session_id": session_id,
+            "status": "error",
+            "stages": [],
+            "health": [{"error": "Stage timing could not be collected."}],
+        }
+    try:
+        await websocket.send_bytes(msgspec.msgpack.encode(profile))
+        # One ACK, no retries. Missing ACK does not retain expendable telemetry.
+        deadline = asyncio.get_running_loop().time() + 5
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            wire = await asyncio.wait_for(websocket.receive_bytes(), remaining)
+            ack = msgspec.msgpack.decode(wire)
+            if (
+                isinstance(ack, dict)
+                and ack.get("type") == "profile_ack"
+                and ack.get("session_id") == session_id
+            ):
+                break
+    except (
+        asyncio.TimeoutError,
+        WebSocketDisconnect,
+        RuntimeError,
+        OSError,
+        msgspec.DecodeError,
+    ):
+        logger.info(
+            "Stage profile acknowledgement unavailable, session_id=%s", session_id
+        )
+    finally:
+        if directory:
+            await asyncio.to_thread(remove_profile_files, directory, session_id)
 
 
 async def _cleanup_realtime_session_then_close(
@@ -2056,7 +2081,12 @@ async def _cleanup_realtime_session_then_close(
     # this does not extend the client's idle or playable lifetime.
     request = getattr(session, "request", None)
     profile_args = (
-        (session.id, session.next_chunk_index, getattr(session, "generation_id", None))
+        (
+            session.id,
+            session.next_chunk_index,
+            getattr(session, "generation_id", None),
+            getattr(request, "source_stream", None) is not None,
+        )
         if (
             close_after_cleanup == (1000, "generation complete")
             and getattr(request, "return_stage_timing", False)
@@ -2077,6 +2107,13 @@ async def _cleanup_realtime_session_then_close(
         )
     try:
         await _cleanup_realtime_session(session, generate_task, listen_task)
+        if profile_args is None and getattr(request, "return_stage_timing", False):
+            from sglang.multimodal_gen.runtime.utils.zing_stage_timing import (
+                discard_profile,
+                timing_directory,
+            )
+
+            await discard_profile(timing_directory(), session.id)
         if close_after_cleanup is not None:
             code, reason = close_after_cleanup
             try:

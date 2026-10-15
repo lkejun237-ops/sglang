@@ -36,7 +36,7 @@ const {pathToFileURL} = require('node:url');
       }
     });
     await page.goto(pathToFileURL(report).href);
-    // A missing CUDA measurement must not depend on the request order.
+    // Legacy CUDA fields do not hide Host measurements, regardless of request order.
     const mixed = JSON.parse(JSON.stringify(bundle.data));
     const mixedName = Object.keys(mixed.modes)[0], mode = mixed.modes[mixedName];
     assert(mode.requests.length >= 2 && mode.spans.some(s => s.stage === 'DiT'));
@@ -56,8 +56,8 @@ const {pathToFileURL} = require('node:url');
       await page.waitForFunction(n => document.querySelectorAll('#result-file option').length === n + 1, count);
       await page.selectOption('#result-file', String(count));
       const value = await page.evaluate(() => [...document.querySelectorAll('#stage-table tr')]
-        .find(row => row.children[1].textContent === '0' && row.children[2].textContent === 'DiT').children[4].textContent);
-      assert.equal(value, '未测');
+        .find(row => row.children[1].textContent === '0' && row.children[2].textContent === 'DiT').children[3].textContent);
+      assert(Number.isFinite(Number(value)) && Number(value) >= 0);
     }
     const before = await page.locator('#result-file option').count();
     await page.locator('#open-results').setInputFiles(file);
@@ -69,7 +69,7 @@ const {pathToFileURL} = require('node:url');
     assert.equal(await page.evaluate(() => window.__reportImportInjected), undefined);
     assert.deepEqual(errors, []);
     assert.deepEqual(unexpectedRequests, []);
-    console.log('PASS: mixed CUDA groups remain unmeasured in both request orders; imported markup stays literal with no resource requests');
+    console.log('PASS: legacy CUDA availability does not affect Host results in either request order; imported markup stays literal with no resource requests');
   } finally {
     await browser.close();
     fs.rmSync(temporary, {recursive: true});

@@ -10,7 +10,9 @@ import importlib
 from .streaming_codecs import SourcePixelBuffer
 
 
-def create_source_buffer(codecs, profile, *, capacity_frames):
+def create_source_buffer(
+    codecs, profile, *, capacity_frames, session_id=None, stage_trace=None
+):
     if profile == {"mode": "clip17"}:
         return SourcePixelBuffer(codecs, capacity_frames=capacity_frames)
     # #142 owns the shared contract and encoder implementation. Import only
@@ -35,9 +37,15 @@ def create_source_buffer(codecs, profile, *, capacity_frames):
     factory = getattr(importlib.import_module(module), name)
     if "remote" in profile:
         import torch
+
         from .remote_encoder import create_session
 
         config = dict(profile["remote"])
+        config.pop("stage_timing_dir", None)
+        if stage_trace is not None:
+            config["stage_timing_dir"] = stage_trace.directory
+        if session_id is not None:
+            config["session_id"] = session_id
         if not torch.autograd.profiler._is_profiler_enabled:
             config.pop("profile_dir", None)
         session = create_session(codecs, capacity_frames=capacity_frames, config=config)

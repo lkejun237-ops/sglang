@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, stage="base-a", runner_config="cpu")
@@ -39,7 +41,9 @@ def test_public_server_args_import_in_fresh_process():
     )
 
 
-def test_session_stage_profile_is_relayed_after_cleanup_before_close(monkeypatch):
+def test_session_stage_profile_is_relayed_after_cleanup_before_close(
+    monkeypatch, tmp_path
+):
     import asyncio
     from types import SimpleNamespace
 
@@ -77,11 +81,20 @@ def test_session_stage_profile_is_relayed_after_cleanup_before_close(monkeypatch
         assert msgspec.msgpack.decode(payload)["status"] == "complete"
         events.append("profile")
 
+    async def receive():
+        events.append("ack")
+        return msgspec.msgpack.encode(dict(type="profile_ack", session_id="s"))
+
+    def remove(directory, session_id):
+        assert Path(directory) == tmp_path and session_id == "s"
+        events.append("remove")
+
     async def close(*args, **kwargs):
         events.append("close")
 
-    monkeypatch.setenv("SGLANG_ZING_STAGE_TIMING", "cuda")
-    monkeypatch.setenv("SGLANG_ZING_STAGE_TIMING_DIR", "/unused")
+    monkeypatch.delenv("SGLANG_ZING_STAGE_TIMING", raising=False)
+    monkeypatch.setenv("SGLANG_ZING_STAGE_TIMING_DIR", str(tmp_path))
+    monkeypatch.setattr(zing_stage_timing, "remove_profile_files", remove)
     monkeypatch.setattr(zing_stage_timing, "collect_profile", collect)
     monkeypatch.setattr(
         realtime_video_api,
@@ -92,43 +105,62 @@ def test_session_stage_profile_is_relayed_after_cleanup_before_close(monkeypatch
     monkeypatch.setattr(realtime_video_api, "_close_realtime_websocket", close)
     asyncio.run(
         realtime_video_api._cleanup_realtime_session_then_close(
-            SimpleNamespace(send_bytes=send),
+            SimpleNamespace(send_bytes=send, receive_bytes=receive),
             session,
             None,
             None,
             (1000, "generation complete"),
         )
     )
-    assert events == ["cleanup", "collect", "profile", "close"]
+    assert events == ["cleanup", "collect", "profile", "ack", "remove", "close"]
 
 
-def test_stage_profile_reports_disabled_collection_without_loading_workers(monkeypatch):
+@pytest.mark.parametrize("legacy_mode", [None, "off", "host", "cuda"])
+def test_unrequested_stage_profile_skips_collection(monkeypatch, legacy_mode):
     import asyncio
     from types import SimpleNamespace
-
-    import msgspec.msgpack
-    import pytest
 
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
         realtime_video_api,
     )
 
-    packets = []
+    events = []
 
-    async def send(payload):
-        packets.append(msgspec.msgpack.decode(payload))
+    async def cleanup(*args):
+        events.append("cleanup")
 
-    monkeypatch.setenv("SGLANG_ZING_STAGE_TIMING", "off")
+    async def close(*args, **kwargs):
+        events.append("close")
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("Unrequested stage profile attempted delivery")
+
+    if legacy_mode is None:
+        monkeypatch.delenv("SGLANG_ZING_STAGE_TIMING", raising=False)
+    else:
+        monkeypatch.setenv("SGLANG_ZING_STAGE_TIMING", legacy_mode)
     monkeypatch.setattr(
         realtime_video_api,
         "get_global_server_args",
-        lambda: pytest.fail("Loaded worker topology while disabled"),
+        lambda: pytest.fail("Loaded worker topology without a timing request"),
     )
+    monkeypatch.setattr(realtime_video_api, "_cleanup_realtime_session", cleanup)
+    monkeypatch.setattr(realtime_video_api, "_close_realtime_websocket", close)
+    monkeypatch.setattr(realtime_video_api, "_send_stage_profile", forbidden)
     asyncio.run(
-        realtime_video_api._send_stage_profile(SimpleNamespace(send_bytes=send), "s", 1)
+        realtime_video_api._cleanup_realtime_session_then_close(
+            SimpleNamespace(send_bytes=forbidden),
+            SimpleNamespace(
+                id="s",
+                next_chunk_index=1,
+                request=SimpleNamespace(return_stage_timing=False),
+            ),
+            None,
+            None,
+            (1000, "generation complete"),
+        )
     )
-    assert packets[0]["status"] == "disabled"
-    assert packets[0]["session_id"] == "s"
+    assert events == ["cleanup", "close"]
 
 
 if __name__ == "__main__":

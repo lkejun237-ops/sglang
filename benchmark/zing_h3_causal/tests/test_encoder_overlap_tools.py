@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import errno
 import json
 
 import pytest
@@ -14,12 +15,157 @@ from analyze_encoder_overlap import (
 )
 from run_encoder_overlap_matrix import (
     client_command,
+    formal_phases,
     layouts,
+    read_text_retry,
     required_gpus,
     selected_layouts,
+    session_timing_ready,
     validate_encoder_acceptance,
     validate_serial_overlap,
 )
+from run_issue253_split_baseline import validate_session_timing
+
+
+def test_issue253_formal_collection_is_one_warmup_and_three_measured():
+    assert formal_phases({"measured_runs": 3}) == [
+        "warmup",
+        "measured-0",
+        "measured-1",
+        "measured-2",
+    ]
+
+
+def test_shared_filesystem_read_retries_only_transient_errors(monkeypatch, tmp_path):
+    path = tmp_path / "health.json"
+    path.write_text('{"written": 1}')
+    original = type(path).read_text
+    attempts = []
+
+    def transient(self, *args, **kwargs):
+        attempts.append(self)
+        if len(attempts) == 1:
+            raise OSError(errno.EIO, "transient shared filesystem read")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(path), "read_text", transient)
+    assert json.loads(read_text_retry(path, delay=0))["written"] == 1
+    assert len(attempts) == 2
+
+    def permanent(self, *args, **kwargs):
+        raise OSError(errno.EACCES, "permanent")
+
+    monkeypatch.setattr(type(path), "read_text", permanent)
+    with pytest.raises(OSError, match="permanent"):
+        read_text_retry(path, delay=0)
+
+
+def timing_row(session, stage, rank, **fields):
+    return dict(
+        request_id=session,
+        dispatch_id=f"{session}:dispatch",
+        dispatch_id_status="present",
+        stage=stage,
+        rank=rank,
+        status="ok",
+        cuda_status="complete",
+        cuda_stream_ms=1.25,
+        **fields,
+    )
+
+
+@pytest.mark.parametrize("enc", [1, 2, 4])
+def test_split_timing_is_validated_per_session_rank_and_range(enc):
+    session = "client-session"
+    rows = [
+        timing_row(
+            session,
+            "Encoder",
+            0,
+            component="source_vae",
+            worker_role="dedicated_source_encoder",
+            latent_range=[0, 1],
+        ),
+        timing_row(
+            session,
+            "Encoder",
+            0,
+            component="source_vae",
+            worker_role="dedicated_source_encoder",
+            latent_range=[1, 2],
+        ),
+    ]
+    encoder_rows = list(rows)
+    for rank in range(1, enc):
+        rows.extend({**row, "rank": rank} for row in encoder_rows)
+    for rank in range(2):
+        rows.extend(
+            [
+                timing_row(session, "DiT", rank, output_latent_range=[0, 1]),
+                timing_row(session, "DiT", rank, output_latent_range=[1, 2]),
+                timing_row(session, "Decoder", rank, output_frame_range=[0, 3]),
+                timing_row(session, "Decoder", rank, output_frame_range=[3, 5]),
+                timing_row(
+                    session,
+                    "Request",
+                    rank,
+                    component="continuous_source_complete",
+                ),
+            ]
+        )
+    assert session_timing_ready(rows, session, 2, 5, enc=enc)
+    if enc == 1:
+        assert validate_session_timing(rows, session, 5)["encoder_rows"] == 2
+    missing_encoder_rank = [
+        row
+        for row in rows
+        if not (row["stage"] == "Encoder" and row["rank"] == enc - 1)
+    ]
+    assert not session_timing_ready(missing_encoder_rank, session, 2, 5, enc=enc)
+
+    stale_only = [{**row, "request_id": "warmup"} for row in rows]
+    assert not session_timing_ready(stale_only, session, 2, 5, enc=enc)
+    with pytest.raises(RuntimeError, match="missing"):
+        validate_session_timing(stale_only, session, 5)
+
+    incomplete = [dict(row) for row in rows]
+    incomplete[-1]["cuda_status"] = "timeout"
+    incomplete[-1]["cuda_stream_ms"] = None
+    assert not session_timing_ready(incomplete, session, 2, 5, enc=enc)
+    if enc == 1:
+        with pytest.raises(RuntimeError, match="incomplete CUDA"):
+            validate_session_timing(incomplete, session, 5)
+
+
+def test_host_timing_without_dedicated_encoder_uses_server_completion():
+    session = "local-source"
+    rows = []
+    for rank in range(2):
+        rows.extend(
+            [
+                {
+                    **timing_row(session, "DiT", rank, output_latent_range=[0, 2]),
+                    "cuda_status": "not_requested",
+                    "cuda_stream_ms": None,
+                },
+                {
+                    **timing_row(session, "Decoder", rank, output_frame_range=[0, 5]),
+                    "cuda_status": "not_requested",
+                    "cuda_stream_ms": None,
+                },
+                {
+                    **timing_row(
+                        session,
+                        "Request",
+                        rank,
+                        component="continuous_source_complete",
+                    ),
+                    "cuda_status": "not_requested",
+                    "cuda_stream_ms": None,
+                },
+            ]
+        )
+    assert session_timing_ready(rows, session, 2, 5, enc=0, timing_mode="host")
 
 
 def test_matrix_never_exceeds_eight_cards_and_does_not_invent_sp6():
@@ -290,6 +436,29 @@ def test_client_keeps_six_references_and_original_prompt_video(tmp_path):
     frame.unlink()
     with pytest.raises(ValueError, match="original source prompt frame"):
         client_command(config, tmp_path / "out", paced=True)
+
+
+def test_client_accepts_frozen_seven_reference_case(tmp_path):
+    frame = tmp_path / "frame.png"
+    frame.touch()
+    refs = []
+    for index in range(1, 8):
+        path = tmp_path / f"ref{index}.png"
+        path.touch()
+        refs.append(dict(type="image", id=f"<Picture {index}>", uri=path.as_uri()))
+    request = tmp_path / "request.json"
+    request.write_text(
+        json.dumps(dict(messages=[dict(content=[dict(type="text", text="p"), *refs])]))
+    )
+    config = dict(
+        request=str(request),
+        prompt_video_frame=str(frame),
+        prompt_video_id="<Video 1>",
+        source_rgb="source.rgb",
+        reference_ids=[f"<Picture {index}>" for index in range(1, 8)],
+    )
+    command = client_command(config, tmp_path / "out", paced=False)
+    assert command.count("--reference") == 7
 
 
 def test_soak_reports_growth_without_inventing_a_pass(tmp_path):
@@ -1150,3 +1319,34 @@ def test_profile_binding_requires_same_snapshot_and_six_complete_runs(tmp_path):
     )
     with pytest.raises(ValueError, match="incomplete"):
         runner.validate_profile_binding(tmp_path, {}, specs, binding)
+
+
+def test_stage_gate_reads_client_profiles_after_server_files_are_removed(tmp_path):
+    from run_encoder_overlap_matrix import (
+        read_stage_timing_health,
+        read_stage_timing_rows,
+    )
+
+    for index in range(2):
+        cell = tmp_path / f"measured-{index}"
+        cell.mkdir()
+        (cell / "profile.json").write_text(
+            json.dumps(
+                {
+                    "stages": [
+                        {"pid": 5, "request_id": f"session-{index}", "host_call_ms": 1}
+                    ],
+                    "health": [
+                        {
+                            "profile": {"pid": 5},
+                            "written": index + 1,
+                            "pending": 0,
+                            "queued": 0,
+                        }
+                    ],
+                }
+            )
+        )
+    rows = read_stage_timing_rows(tmp_path / "timing")
+    assert {row["request_id"] for row in rows} == {"session-0", "session-1"}
+    assert read_stage_timing_health(tmp_path / "timing")[5]["written"] == 2

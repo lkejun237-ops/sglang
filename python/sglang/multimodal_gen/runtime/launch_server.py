@@ -132,7 +132,7 @@ def shutdown_scheduler_processes(
     _kill_alive_processes(alive, _WORKER_KILL_TIMEOUT_S)
 
 
-def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
+def _launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     """
     Args:
         launch_http_server: False for offline local mode
@@ -815,7 +815,18 @@ def launch_disagg_role(server_args: ServerArgs):
         shutdown_scheduler_processes(role_args, processes, request_shutdown=False)
 
 
-def dispatch_launch(server_args: ServerArgs):
+def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
+    if not launch_http_server:
+        return _launch_server(server_args, launch_http_server=False)
+    from sglang.multimodal_gen.runtime.utils.zing_stage_timing import (
+        deployment_timing_directory,
+    )
+
+    with deployment_timing_directory():
+        return _launch_server(server_args)
+
+
+def _dispatch_launch(server_args: ServerArgs):
     """Route to the correct launch function based on --disagg-role."""
     if "NCCL_NVLS_ENABLE" not in os.environ or server_args.enable_nccl_nvls:
         os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
@@ -829,6 +840,15 @@ def dispatch_launch(server_args: ServerArgs):
         launch_disagg_role(server_args)
     else:
         raise ValueError(f"Unknown disagg_role: {role}")
+
+
+def dispatch_launch(server_args: ServerArgs):
+    from sglang.multimodal_gen.runtime.utils.zing_stage_timing import (
+        deployment_timing_directory,
+    )
+
+    with deployment_timing_directory():
+        _dispatch_launch(server_args)
 
 
 if __name__ == "__main__":

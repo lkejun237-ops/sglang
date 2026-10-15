@@ -23,6 +23,11 @@ from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
+from sglang.multimodal_gen.runtime.utils.zing_stage_timing import (
+    handoff,
+    stage_span,
+    trace_for_batch,
+)
 
 from .incremental import SourceReadySession
 from .source_bridge import SourceChunk, SourceChunkBridge
@@ -48,7 +53,7 @@ class ZingSourceStreamState(BaseRealtimeState):
         self.end_received = self.bridge_finished = False
         self.dispatch_steps = 0
 
-    def initialize(self, stage, batch, config):
+    def initialize(self, stage, batch, config, trace=None):
         params = batch.sampling_params
         stage._validate_sampling_params(params)
         sampler = stage._build_realtime_sampler(params)
@@ -100,6 +105,7 @@ class ZingSourceStreamState(BaseRealtimeState):
             retain_condition_media=True,
             source_preview=source_preview,
             conditioning=stage._conditioning_consumer(batch),
+            stage_trace=trace,
         )
         if self.inputs.audio_shape is not None or self.inputs.source_visual is not None:
             raise ValueError("Continuous source requires a video-only static prefix")
@@ -119,7 +125,11 @@ class ZingSourceStreamState(BaseRealtimeState):
         self.policy["source_encoder"] = encoder
         with self._encoder_use(stage):
             self.pixels = create_source_buffer(
-                stage.codecs, encoder, capacity_frames=3 * clip
+                stage.codecs,
+                encoder,
+                capacity_frames=3 * clip,
+                session_id=batch.realtime_session_id,
+                stage_trace=trace_for_batch(batch),
             )
         self.bridge = SourceChunkBridge(
             stage.packer.chunk_plan,
@@ -244,6 +254,7 @@ class ZingSourceStreamState(BaseRealtimeState):
         self.session_id = batch.realtime_session_id
         command = batch.extra["zing_source_command"]
         measure_cuda = command.get("measure_cuda", False)
+        trace = trace_for_batch(batch)
         timings, outputs, metadata = {}, [], []
         self.progress = []  # Per-dispatch, bounded by input/bridge capacities.
         self.dispatch_steps = 0
@@ -265,7 +276,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                 config = dict(command["config"])
                 config["limits"] = SourceLimits(**config["limits"])
                 with timed("prepare_host_ms"):
-                    self.initialize(stage, batch, config)
+                    self.initialize(stage, batch, config, trace)
                 if self.qwen_init_host_ms is not None:
                     timings["qwen_init_host_ms"] = self.qwen_init_host_ms
             notice = None
@@ -314,7 +325,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                 self.ledger.finish(final["frame_end"], event_id=final["event_id"])
                 with timed("encoder_host_ms"), self._encoder_use(stage):
                     self.pixels.finish()
-            self._generate_ready(stage, batch, outputs, metadata, timed)
+            self._generate_ready(stage, batch, outputs, metadata, timed, trace)
             while self.pixels.ready and self._within_work_budget():
                 with (
                     timed("encoder_host_ms"),
@@ -365,7 +376,13 @@ class ZingSourceStreamState(BaseRealtimeState):
                         source_dependency_end=encoded.source_dependency_end,
                     )
                 self._generate_ready(
-                    stage, batch, outputs, metadata, timed, flush=not self.pixels.ready
+                    stage,
+                    batch,
+                    outputs,
+                    metadata,
+                    timed,
+                    trace,
+                    flush=not self.pixels.ready,
                 )
                 # Release only source alignment already transferred downstream.
                 # Encoder lookahead/cache ownership never grants extra credit.
@@ -377,19 +394,38 @@ class ZingSourceStreamState(BaseRealtimeState):
                 if not self.bridge_finished:
                     self.bridge.finish()
                     self.bridge_finished = True
-                self._generate_ready(stage, batch, outputs, metadata, timed)
+                self._generate_ready(stage, batch, outputs, metadata, timed, trace)
                 if not self._bridge_ready() and not self._pending_chunks():
                     if not self.sampler.ended:
                         self.sampler.finish()
                     if not self.sampler.complete:
                         raise ValueError("Continuous source sampling did not drain")
                     self.decoder.finish(total_frames=self.ledger.accepted_frames)
-                    self._decode_ready(stage, outputs, metadata, timed, eos=True)
+                    self._decode_ready(stage, outputs, metadata, timed, trace, eos=True)
                     self.ledger.consume(self.bridge.accepted_pixels)
                     self.ledger.completed()
                     if self.component_capture is not None:
                         self.component_capture.finish()
                     completed = True
+                    # Record this rank's Host completion after its final decode.
+                    # The collector drains queued records before result delivery.
+                    with stage_span(
+                        trace,
+                        "Request",
+                        cuda=trace is not None and trace.measure_cuda,
+                        component="continuous_source_complete",
+                        source_encoder_role=(
+                            "dedicated"
+                            if "remote" in self.policy["source_encoder"]
+                            else "local"
+                        ),
+                    ) as span:
+                        pass
+                    handoff(
+                        span,
+                        complete=True,
+                        output_frame_range=[0, self.ledger.accepted_frames],
+                    )
             more_work = not completed and (
                 self.pixels.ready or self._bridge_ready() or self._pending_chunks()
             )
@@ -540,10 +576,12 @@ class ZingSourceStreamState(BaseRealtimeState):
         count = self._next_bridge_count()
         return None if count is None else self.bridge.pop(count)
 
-    def _generate_ready(self, stage, batch, outputs, metadata, timed, *, flush=True):
+    def _generate_ready(
+        self, stage, batch, outputs, metadata, timed, trace=None, *, flush=True
+    ):
         if getattr(self.sampler.sampler, "joint_forward", "off") == "cross_chunk":
             return self._generate_joint_ready(
-                stage, batch, outputs, metadata, timed, flush=flush
+                stage, batch, outputs, metadata, timed, trace, flush=flush
             )
         while self._bridge_ready() and self._within_work_budget():
             with timed("bridge_host_ms"):
@@ -554,25 +592,43 @@ class ZingSourceStreamState(BaseRealtimeState):
                     provenance=chunk.provenance,
                     final=chunk.final,
                 )
-            with (
-                timed("dit_host_ms"),
-                stage._use("transformer", "denoise") as transformer,
-                maybe_record_function("Zing.source_dit"),
-            ):
-                with maybe_record_function(
-                    f"Zing.clock_anchor.unix_ns{time.time_ns()}"
+            with stage_span(
+                trace,
+                "DiT",
+                cuda=trace is not None and trace.measure_cuda,
+                input_ids=[
+                    f"{batch.realtime_session_id}:latent:{chunk.chunk.start}:{chunk.chunk.end}"
+                ],
+                latent_range=[chunk.chunk.start, chunk.chunk.end],
+                source_dependency_end=chunk.provenance.source_dependency_end,
+                block_index=chunk.chunk.chunk_id,
+            ) as span:
+                with (
+                    timed("dit_host_ms"),
+                    stage._use("transformer", "denoise") as transformer,
+                    maybe_record_function("Zing.source_dit"),
                 ):
-                    pass
-                self.sampler.sampler.generator = transformer
-                self._record_progress(
-                    "dit_started",
-                    chunk_id=chunk.chunk.chunk_id,
-                    latent_start=chunk.chunk.start,
-                    latent_end=chunk.chunk.end,
-                    source_dependency_end=chunk.provenance.source_dependency_end,
-                )
-                result = self.sampler.step()
-                self.dispatch_steps += 1
+                    with maybe_record_function(
+                        f"Zing.clock_anchor.unix_ns{time.time_ns()}"
+                    ):
+                        pass
+                    self.sampler.sampler.generator = transformer
+                    self._record_progress(
+                        "dit_started",
+                        chunk_id=chunk.chunk.chunk_id,
+                        latent_start=chunk.chunk.start,
+                        latent_end=chunk.chunk.end,
+                        source_dependency_end=chunk.provenance.source_dependency_end,
+                    )
+                    result = self.sampler.step()
+                    self.dispatch_steps += 1
+            handoff(
+                span,
+                output_ids=[
+                    f"{batch.realtime_session_id}:generated-latent:{result.chunk.start}:{result.chunk.end}"
+                ],
+                output_latent_range=[result.chunk.start, result.chunk.end],
+            )
             if self.component_capture is not None:
                 self.component_capture.append(chunk, result)
             self.blocks.append(
@@ -589,10 +645,10 @@ class ZingSourceStreamState(BaseRealtimeState):
                 latent_start=result.chunk.start,
                 source_dependency_end=result.provenance.source_dependency_end,
             )
-            self._decode_ready(stage, outputs, metadata, timed)
+            self._decode_ready(stage, outputs, metadata, timed, trace)
 
     def _generate_joint_ready(
-        self, stage, batch, outputs, metadata, timed, *, flush=True
+        self, stage, batch, outputs, metadata, timed, trace=None, *, flush=True
     ):
         while (
             self._bridge_ready() or self.sampler.pending
@@ -635,7 +691,32 @@ class ZingSourceStreamState(BaseRealtimeState):
             with closing(self.sampler.drain_ready()) as ready:
                 while True:
                     capture_chunk = None
+                    dit_fields = {}
+                    if self.sampler.pending:
+                        pending = self.sampler.pending[0]
+                        dit_fields = {
+                            "input_ids": [
+                                f"{batch.realtime_session_id}:latent:{pending.chunk.start}:{pending.chunk.end}"
+                            ],
+                            "latent_range": [
+                                pending.chunk.start,
+                                pending.chunk.end,
+                            ],
+                            "source_dependency_end": (
+                                pending.provenance.source_dependency_end
+                            ),
+                            "block_index": pending.chunk.chunk_id,
+                        }
+                        # Do not retain the ReadySourceChunk's source/noise GPU
+                        # tensors across drain_ready() and Decoder execution.
+                        del pending
                     with (
+                        stage_span(
+                            trace,
+                            "DiT",
+                            cuda=trace is not None and trace.measure_cuda,
+                            **dit_fields,
+                        ) as span,
                         timed("dit_host_ms"),
                         stage._use("transformer", "denoise") as transformer,
                         maybe_record_function("Zing.source_dit"),
@@ -670,7 +751,15 @@ class ZingSourceStreamState(BaseRealtimeState):
                             del chunk
                         result = next(ready, None)
                     if result is None:
+                        handoff(span, output_ids=[], no_output=True)
                         break
+                    handoff(
+                        span,
+                        output_ids=[
+                            f"{batch.realtime_session_id}:generated-latent:{result.chunk.start}:{result.chunk.end}"
+                        ],
+                        output_latent_range=[result.chunk.start, result.chunk.end],
+                    )
                     self.dispatch_steps += 1
                     if self.component_capture is not None:
                         self.component_capture.append(capture_chunk, result)
@@ -689,19 +778,42 @@ class ZingSourceStreamState(BaseRealtimeState):
                         latent_start=result.chunk.start,
                         source_dependency_end=result.provenance.source_dependency_end,
                     )
-                    self._decode_ready(stage, outputs, metadata, timed)
+                    self._decode_ready(stage, outputs, metadata, timed, trace)
 
-    def _decode_ready(self, stage, outputs, metadata, timed, *, eos=False):
+    def _decode_ready(self, stage, outputs, metadata, timed, trace=None, *, eos=False):
         while self.decoder.ready:
-            with (
-                timed("decoder_host_ms"),
-                stage._use(stage.codecs.video_decoder_name, "decode"),
-                maybe_record_function("Zing.source_decode"),
-            ):
-                with maybe_record_function(
-                    "Zing.source_decode.eos" if eos else "Zing.source_decode.chunk"
+            latent_end = getattr(self.decoder, "accepted_latents", None)
+            span_fields = {"final": bool(eos)}
+            if latent_end is not None:
+                span_fields.update(
+                    input_ids=[f"{self.session_id}:generated-latent:0:{latent_end}"],
+                    input_latent_range=[0, latent_end],
+                )
+            with stage_span(
+                trace,
+                "Decoder",
+                cuda=trace is not None and trace.measure_cuda,
+                **span_fields,
+            ) as span:
+                with (
+                    timed("decoder_host_ms"),
+                    stage._use(stage.codecs.video_decoder_name, "decode"),
+                    maybe_record_function("Zing.source_decode"),
                 ):
-                    decoded = self.decoder.pop()
+                    with maybe_record_function(
+                        "Zing.source_decode.eos" if eos else "Zing.source_decode.chunk"
+                    ):
+                        decoded = self.decoder.pop()
+            if decoded.end > decoded.start:
+                handoff(
+                    span,
+                    output_ids=[
+                        f"{self.session_id}:frames:{decoded.start}:{decoded.end}"
+                    ],
+                    output_frame_range=[decoded.start, decoded.end],
+                )
+            else:
+                handoff(span, output_ids=[], no_output=True)
             if self.component_capture is not None:
                 self.component_capture.append_frames(
                     "decoder", decoded.values[0], decoded.start

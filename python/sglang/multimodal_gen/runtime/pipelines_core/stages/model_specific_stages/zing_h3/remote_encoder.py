@@ -75,7 +75,12 @@ class RemoteEncoderSession:
         if not 1 <= self.capacity_bytes <= 256 << 20 or not 1 <= self.timeout <= 600:
             raise ValueError("Invalid encoder queue capacity or timeout")
         self.profile_dir = config.get("profile_dir")
-        self.token = uuid.uuid4().hex
+        self.stage_timing_dir = config.get("stage_timing_dir")
+        self.token = config.get("session_id") or uuid.uuid4().hex
+        if not isinstance(self.token, str) or not self.token:
+            raise ValueError(
+                "Remote encoder session identity must be a nonempty string"
+            )
         self.accepted_frames = self.emitted_latents = self._consumed = 0
         self.ended = self.disposed = False
         self.signature = None
@@ -226,7 +231,12 @@ class RemoteEncoderSession:
                 wait_for_workers=False,
             )
             open_attempted = True
-            rpc("open", bridge_port=store.port, capacity_frames=self.capacity_frames)
+            rpc(
+                "open",
+                bridge_port=store.port,
+                capacity_frames=self.capacity_frames,
+                stage_timing_dir=self.stage_timing_dir,
+            )
             opened = True
             data_operation_active = True
             bridge = bridge_group(store, 0, timeout_seconds=self.timeout)

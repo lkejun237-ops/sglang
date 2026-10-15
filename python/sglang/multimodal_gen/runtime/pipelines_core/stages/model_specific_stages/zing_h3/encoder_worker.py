@@ -17,6 +17,12 @@ import torch
 import torch.distributed as dist
 import zmq
 
+from sglang.multimodal_gen.runtime.utils.zing_stage_timing import (
+    handoff,
+    stage_span,
+    trace_for_ids,
+)
+
 from .encoder_recovery import abort_owner
 from .encoder_transport import bridge_group
 from .progressive_encoder import H3ProgressiveEncoderSession
@@ -120,6 +126,7 @@ def main():
         flush=True,
     )
     session = bridge = token = profiler = None
+    stage_timing_dir = None
     last_released = None
     quarantined = False
     try:
@@ -189,6 +196,7 @@ def main():
                         )
                     continue
                 token = command["session"]
+                stage_timing_dir = command.get("stage_timing_dir")
                 profiler = None
                 cache = create_encoder_cache(
                     codecs.modules["video_vae"],
@@ -257,12 +265,44 @@ def main():
                         f"Zing.clock_anchor.unix_ns{time.time_ns()}"
                     ):
                         pass
-                    with torch.profiler.record_function(
-                        f"Zing.encoder_prefetch.latent_start_{session.emitted_latents}.source_end_{command.get('prefetched_frames', -1)}.dispatch_end_{command.get('dispatch_accepted_frames', -1)}"
-                    ):
-                        value = session.pop()
-                    if value is None:
-                        raise ValueError("Encoder is not ready")
+                    latent_start = session.emitted_latents
+                    trace = trace_for_ids(
+                        token,
+                        f"{token}:source:{latent_start}",
+                        enabled=stage_timing_dir is not None,
+                        directory=stage_timing_dir,
+                        identity={
+                            "worker_role": "dedicated_source_encoder",
+                            "component_group": "encoder",
+                        },
+                    )
+                    with stage_span(
+                        trace,
+                        "Encoder",
+                        cuda=trace is not None and trace.measure_cuda,
+                        component="source_vae",
+                        input_ids=[
+                            f"{token}:source:0:{command.get('prefetched_frames', -1)}"
+                        ],
+                        latent_start=latent_start,
+                        dispatch_accepted_frames=command.get(
+                            "dispatch_accepted_frames"
+                        ),
+                        prefetched_frames=command.get("prefetched_frames"),
+                        scope="dedicated_source_VAE_encode_and_streaming_cache_update",
+                    ) as span:
+                        with torch.profiler.record_function(
+                            f"Zing.encoder_prefetch.latent_start_{latent_start}.source_end_{command.get('prefetched_frames', -1)}.dispatch_end_{command.get('dispatch_accepted_frames', -1)}"
+                        ):
+                            value = session.pop()
+                        if value is None:
+                            raise ValueError("Encoder is not ready")
+                    handoff(
+                        span,
+                        output_ids=[f"{token}:latent:{value.start}:{value.end}"],
+                        latent_range=[value.start, value.end],
+                        source_dependency_end=value.source_dependency_end,
+                    )
                 elif op == "close":
                     session.dispose()
                 else:

@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from fastapi import WebSocket
+
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeEvent,
     RealtimeVideoGenerationsRequest,
@@ -254,6 +255,10 @@ class BaseRealtimeModelAdapter:
     ) -> None:
         batch.realtime_session_id = session.id
         batch.realtime_generation_id = session.generation_id
+        batch.extra = dict(getattr(batch, "extra", None) or {})
+        batch.extra["return_stage_timing"] = bool(
+            getattr(session.request, "return_stage_timing", False)
+        )
         batch.realtime_trace_id = session.trace_id
         batch.realtime_trace_started_at = session.trace_started_at
         batch.return_raw_frames = True

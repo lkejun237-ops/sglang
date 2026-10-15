@@ -19,8 +19,7 @@ python3 benchmark/zing_h3_causal/analyze_stage_timing.py \
 # 固定 5s 模型阶段计时
 
 第一轮只覆盖有限视频接口。请求、source、六项参考条件、采样和 Decoder 均保持
-客户端基线的定义，30s 暂不运行。连续 source.append 以及远端 progressive Encoder
-路径尚未接入本采集器。
+客户端基线的定义，30s 暂不运行。当前连续 source.append 与独立 progressive Encoder 已接入；新的用法见下文。
 
 ## 部署口径更正
 
@@ -34,15 +33,17 @@ SP2 卡上，另外两卡空闲。
 ## 阶段数据回传
 
 客户端可通过 `--receive-stage-timing` 请求本次会话的阶段记录；checkpoint 入口开启
-`--stage-timing host|cuda` 时自动启用。服务器在正常清理后、关闭 WebSocket 前发送
+`--stage-timing host` 时自动启用。服务器在正常清理后、关闭 WebSocket 前发送
 `profile_result`，包含各 rank 的原始 spans、采集状态与完整性信息。
 客户端保存在 `profiles/`，报告构建器优先使用这些回传数据，无需服务端文件权限。
 结果网页的 JSON 格式与布局保持不变，详见 [客户端用法](CLIENT_BENCHMARK.md)。
 
 ## 采集和事件语义
 
-默认关闭。设置 `SGLANG_ZING_STAGE_TIMING=host|cuda` 和
-`SGLANG_ZING_STAGE_TIMING_DIR=/path/to/new-run/timing` 后，每个 worker 写独立 JSONL。
+普通请求默认不采集；`return_stage_timing=true` 开启本请求 Host 采集和回传。
+benchmark 默认开启，无需配置计时环境变量。服务自动创建部署临时目录；
+`SGLANG_ZING_STAGE_TIMING_DIR` 仅可选指定父目录，服务只删除其独立子目录。
+ACK 后删除本请求文件，失败/取消及部署退出也清理。
 
 | stage | 边界 |
 |---|---|
@@ -65,7 +66,7 @@ host_enter_ns、host_return_ns、host_handoff_ns 使用同节点 CLOCK_MONOTONIC
 已完成**。未观察实际入队边界，enqueue_ns 保持 null。本轮没有 D2H 完成、
 WebSocket send 或浏览器显示打点，也不从跨客户端/服务端的时钟相减推导网络延迟。
 
-CUDA 模式在当前 device/current stream 上放置计时 event；有界后台采集器用
+以下为历史 CUDA 数据的口径，当前请求只采集 Host。旧 CUDA 模式在当前 device/current stream 上放置计时 event；有界后台采集器用
 query 检查完成后取 elapsed_time，不新增 synchronize，不修改依赖或调度。
 cuda_stream_ms 是该 stream 两个 event 间的经过时间，可能包含等待、空隙和通信；
 不能叫纯 kernel 时间，不保证覆盖所有旁路 stream。它不映射为 host 绝对时间戳。

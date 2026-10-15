@@ -173,14 +173,7 @@ def evidence(runs, output):
                 Path(run["directory"]) / "chunks.jsonl", output.parent
             ),
         }
-    chosen = next(
-        (
-            m
-            for m in modes.values()
-            if any(s.get("cuda_status") == "complete" for s in m["spans"])
-        ),
-        None,
-    )
+    chosen = next((m for m in modes.values() if m["spans"]), None)
     for component in ("qwen", "reference_vae", "source_vae"):
         values = []
         if chosen:
@@ -200,11 +193,9 @@ def evidence(runs, output):
                     and s.get("component") == component
                 ]
                 if selected and all(
-                    s.get("cuda_status") == "complete"
-                    and s.get("cuda_stream_ms") is not None
-                    for s in selected
+                    s.get("host_call_ms") is not None for s in selected
                 ):
-                    values.append(sum(s["cuda_stream_ms"] for s in selected) / 1000)
+                    values.append(sum(s["host_call_ms"] for s in selected) / 1000)
         components[component] = statistics.median(values) if values else None
     return {
         "modes": modes,
@@ -225,6 +216,47 @@ def export_results(data, path):
         + "\n",
         encoding="utf-8",
     )
+
+
+def write_report_page(data, output, *, template=None):
+    """Shared offline page shell for finite and continuous-source evidence."""
+    payload = json.dumps(data, ensure_ascii=False, allow_nan=False)
+    for char, escape in [
+        ("&", "\\u0026"),
+        ("<", "\\u003c"),
+        (">", "\\u003e"),
+        ("\u2028", "\\u2028"),
+        ("\u2029", "\\u2029"),
+    ]:
+        payload = payload.replace(char, escape)
+    template = template or Path(__file__).with_name("benchmark_report.html").read_text()
+    script = Path(__file__).with_name("streaming_report.js").read_text()
+    # Finite builders fill these fields; streaming metadata is rendered from data.
+    for key in (
+        "CASE",
+        "IDENTITY",
+        "INPUT",
+        "RUN_COUNTS",
+        "MODES",
+        "PLACEMENT",
+        "HARDWARE",
+        "ENCODER_COUNT",
+        "DIT_COUNT",
+        "DECODER_COUNT",
+        "OUTCOME",
+        "VERSION",
+        "ISSUES",
+        "SOURCE_LINKS",
+        "MODE_OPTIONS",
+    ):
+        template = template.replace(
+            "@@" + key + "@@", "Benchmark" if key == "CASE" else ""
+        )
+    template = template.replace("@@STREAM_SCRIPT@@", script).replace(
+        "@@DATA@@", payload
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(template, encoding="utf-8")
 
 
 def build_report(runs, output, json_output=None):
@@ -254,19 +286,7 @@ def build_report(runs, output, json_output=None):
             selected_runs.append(selected)
         datasets.append(evidence(selected_runs, output))
     data = datasets[0]
-    payload = json.dumps(
-        {"datasets": datasets} if len(datasets) > 1 else data,
-        ensure_ascii=False,
-        allow_nan=False,
-    )
-    for char, escape in [
-        ("&", "\\u0026"),
-        ("<", "\\u003c"),
-        (">", "\\u003e"),
-        ("\u2028", "\\u2028"),
-        ("\u2029", "\\u2029"),
-    ]:
-        payload = payload.replace(char, escape)
+    payload = {"datasets": datasets} if len(datasets) > 1 else data
     template = Path(__file__).with_name("benchmark_report.html").read_text()
     runs = data["runs"]
     case = runs[0]["config"]["cases"][0]
@@ -340,7 +360,7 @@ def build_report(runs, output, json_output=None):
         "@@MODE_OPTIONS@@", mode_options
     )
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(template.replace("@@DATA@@", payload), encoding="utf-8")
+    write_report_page(payload, output, template=template)
     json_path = json_output or output.with_suffix(".json")
     export_results(data, json_path)
     if len(datasets) > 1:

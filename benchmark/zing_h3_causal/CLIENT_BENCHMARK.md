@@ -51,16 +51,19 @@ python3 benchmark/zing_h3_causal/run_benchmark.py --model-path /path/to/sglang-c
 
 ## 从远程服务接收阶段数据
 
-远程服务启动时设置 `SGLANG_ZING_STAGE_TIMING=host|cuda` 和
-`SGLANG_ZING_STAGE_TIMING_DIR`；客户端在已有 benchmark 命令上增加 `--receive-stage-timing`。
-服务器正常完成有限视频请求后，复用 session/generation/dispatch 身份，收齐本次各 rank
-记录，通过原 WebSocket 回传。当前使用同一服务可读的采集目录，适用于本机 SP1/SP2 部署。
+benchmark 默认请求 Host 阶段数据；无需设置计时环境变量。普通生成请求用
+`return_stage_timing=true` 同时开启采集和回传，不传则不采集。
+`--receive-stage-timing` 保留为显式开启参数；`--no-stage-timing` 关闭 benchmark 采集。
 
-每个 dispatch 的结束标记在 CUDA event 解析、记录写完后才发布；入口最多等待 35 秒。
-未收齐、采集关闭或采集出错会在结果中明确标识，已有视频指标照常保留。
-`profile_wait_seconds` 是客户端末帧到 profile 到达的间隔，包含清理、采集等待和传输；
-TTFF、E2E、FPS 的计算边界保持不变。运行结束后，现有报告构建器直接读取客户端结果目录，
-导出相同版本的网页结果 JSON，各 rank 数据保持独立。
+服务启动时自动创建部署独立的临时目录，各 SP worker 共用该目录；独立 Encoder
+通过内部 RPC 收到相同目录。`SGLANG_ZING_STAGE_TIMING_DIR` 可选指定父目录，
+服务只清理自己创建的子目录。
+
+生成与清理完成后，服务端发送 `profile_result`。客户端先保存到 `profiles/`，
+再发送一次 `profile_ack`；服务端删除本请求计时文件。断连、ACK 超时、失败或
+取消也做清理，服务退出时删除整个自动目录。回传与确认等待不计入 TTFF/E2E。
+已有 `profile=true` 保持 Torch profiler 含义，不用于开启这份 Host 计时。
+报告生成器读取客户端结果，各 rank 数据保持独立。
 
 ## 选择用例集合
 

@@ -89,6 +89,7 @@ def test_real_ipc_prefetches_next_dispatch_and_credit_bounds(
     port = service.bind_to_random_port("tcp://127.0.0.1")
     service.setsockopt(zmq.RCVTIMEO, 2000)
     writer = context.socket(zmq.PUSH)
+    writer.setsockopt(zmq.SNDTIMEO, 2000)
     ipc_dir = tempfile.TemporaryDirectory(prefix="zing249-", dir="/tmp")
     endpoint = "ipc://" + str(Path(ipc_dir.name) / "source.sock")
     writer.bind(endpoint)
@@ -143,6 +144,7 @@ def test_real_ipc_prefetches_next_dispatch_and_credit_bounds(
     session.device, session.port, session.timeout = "cpu", port, 2
     session.admission_endpoint = endpoint
     session.profile_dir, session.token = None, "private-generation"
+    session.stage_timing_dir = None
     session.capacity_frames, session.capacity_bytes = 51, capacity_bytes
     session.admission_lock, session.admission_digests = threading.Lock(), {}
     session.prefetched_frames, session.accepted_frames, session._consumed = 0, 1, 0

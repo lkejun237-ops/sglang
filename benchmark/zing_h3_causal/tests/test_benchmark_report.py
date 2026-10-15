@@ -204,3 +204,159 @@ def test_received_profiles_build_portable_report_without_server_files(tmp_path):
     profile["status"] = "incomplete"
     (profiles / "ok.json").write_text(json.dumps(profile))
     assert any("incomplete" in issue for issue in load_run("cuda", directory)["issues"])
+
+
+def test_streaming_report_uses_shared_page_and_portable_envelope(tmp_path):
+    from build_streaming_report import build_report as build_streaming
+
+    measurement = {
+        "config": {
+            "transport": "continuous_source",
+            "prompt": "literal @@CASE@@ and @@DATA@@",
+            "cases": [
+                {"label": "new-scene", "case_id": "scene-identity", "frames": 120}
+            ],
+        },
+        "requests": [],
+        "summary": {},
+    }
+    page, exported = tmp_path / "report.html", tmp_path / "report.json"
+    build_streaming([measurement], page, json_output=exported)
+    bundle = json.loads(exported.read_text())
+    assert bundle["format"] == "zing-benchmark-results"
+    assert bundle["version"] == 1
+    assert bundle["data"]["kind"] == "continuous_source"
+    assert bundle["data"]["streaming"] == measurement
+    assert 'id="result-file"' in page.read_text()
+    assert 'id="finite-view"' in page.read_text()
+    assert 'id="streaming-view"' in page.read_text()
+
+    embedded = (
+        page.read_text()
+        .split('<script id="evidence" type="application/json">', 1)[1]
+        .split("</script>", 1)[0]
+    )
+    assert json.loads(embedded)["streaming"] == measurement
+
+
+def test_received_continuous_host_profile_needs_no_server_files_or_cuda(tmp_path):
+    from build_streaming_report import load_received_profiles
+
+    base = dict(
+        request_id="s", host_call_ms=1, status="ok", clock_domain="CLOCK_MONOTONIC:test"
+    )
+    spans = [
+        dict(
+            base,
+            rank=0,
+            stage="Encoder",
+            component="source_vae",
+            worker_role="dedicated_source_encoder",
+            latent_range=[0, 1],
+        )
+    ]
+    for rank in (0, 1):
+        spans.extend(
+            [
+                dict(base, rank=rank, stage="DiT", output_latent_range=[0, 1]),
+                dict(base, rank=rank, stage="Decoder", output_frame_range=[0, 1]),
+                dict(
+                    base,
+                    rank=rank,
+                    stage="Request",
+                    component="continuous_source_complete",
+                ),
+            ]
+        )
+    cell = tmp_path / "case/measured-0"
+    cell.mkdir(parents=True)
+    (cell / "profile.json").write_text(
+        json.dumps(
+            dict(
+                session_id="s",
+                status="complete",
+                expected_ranks=[0, 1],
+                stages=spans,
+                health=[],
+            )
+        )
+    )
+    (cell / "summary.json").write_text(
+        json.dumps(dict(session_id="s", client_clock_domain="CLOCK_MONOTONIC:test"))
+    )
+    bundle = dict(
+        config=dict(cases=[dict(label="case", frames=1)]),
+        requests=[
+            dict(
+                request_id="client",
+                label="case",
+                phase="measured",
+                index=0,
+                success=True,
+            )
+        ],
+    )
+    server = load_received_profiles(tmp_path, bundle)
+    assert server["validation"]["sessions"]["s"]["complete"]
+    assert server["spans"] == spans
+    assert server["clients"]["s"]["client_clock_domain"] == "CLOCK_MONOTONIC:test"
+    assert not (tmp_path / "timing").exists()
+
+
+@pytest.mark.parametrize("rank_count", [1, 2])
+def test_received_profile_supports_local_encoder_and_still_requires_remote_encoder(
+    tmp_path, rank_count
+):
+    from build_streaming_report import load_received_profiles
+
+    base = dict(
+        request_id="s", host_call_ms=1, status="ok", clock_domain="CLOCK_MONOTONIC:test"
+    )
+    spans = []
+    for rank in range(rank_count):
+        spans.extend(
+            [
+                dict(base, rank=rank, stage="DiT", output_latent_range=[0, 1]),
+                dict(base, rank=rank, stage="Decoder", output_frame_range=[0, 1]),
+                dict(
+                    base,
+                    rank=rank,
+                    stage="Request",
+                    component="continuous_source_complete",
+                    source_encoder_role="local",
+                ),
+            ]
+        )
+    cell = tmp_path / "case/measured-0"
+    cell.mkdir(parents=True)
+    profile = dict(
+        session_id="s",
+        status="complete",
+        expected_ranks=list(range(rank_count)),
+        stages=spans,
+        health=[],
+    )
+    (cell / "summary.json").write_text(json.dumps(dict(session_id="s")))
+    bundle = dict(
+        config=dict(cases=[dict(label="case", frames=1)]),
+        requests=[
+            dict(
+                request_id="client",
+                label="case",
+                phase="measured",
+                index=0,
+                success=True,
+            )
+        ],
+    )
+    (cell / "profile.json").write_text(json.dumps(profile))
+    assert load_received_profiles(tmp_path, bundle)["validation"]["sessions"]["s"][
+        "complete"
+    ]
+    for row in spans:
+        if row["stage"] == "Request":
+            row["source_encoder_role"] = "dedicated"
+    (cell / "profile.json").write_text(json.dumps(profile))
+    assert not load_received_profiles(tmp_path, bundle)["validation"]["sessions"]["s"][
+        "complete"
+    ]

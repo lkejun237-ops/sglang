@@ -259,8 +259,9 @@ def test_checkpoint_entry_forwards_custom_collection(model, tmp_path, monkeypatc
     assert "--case" not in calls[0]
 
 
+@pytest.mark.parametrize("mode", [None, "host", "off"])
 def test_checkpoint_stage_timing_preflight_enables_client_receipt(
-    model, tmp_path, monkeypatch
+    model, tmp_path, monkeypatch, mode
 ):
     monkeypatch.setattr(runner.bench_client, "expected_assets", lambda case: {})
     output = tmp_path / "run"
@@ -268,15 +269,14 @@ def test_checkpoint_stage_timing_preflight_enables_client_receipt(
         [
             "--model-path",
             str(model),
-            "--stage-timing",
-            "cuda",
+            *([] if mode is None else ["--stage-timing", mode]),
             "--output-dir",
             str(output),
             "--preflight-only",
         ]
     )
     config = json.loads((output / "client/config.json").read_text())
-    assert config["receive_stage_timing"] is True
+    assert config["receive_stage_timing"] is (mode != "off")
     assert [case["frames"] for case in config["cases"]] == [120, 720, 720, 720]
     receipt = json.loads((output / "media_preparation.json").read_text())
     assert config["deployment"]["media_preparation"] == receipt

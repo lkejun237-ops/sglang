@@ -71,6 +71,117 @@ limited to `8 MiB + 4096` complete encoded bytes. Each append is limited to both
 its negotiated maximum and `len(RGB) + 4096`; unsupported payload fields are
 rejected so small batches cannot retain large hidden metadata.
 
+## Incremental video benchmark
+
+`bench_streaming_source.py` runs the frozen `5s`, `30s-wasteland` and `30s-town`
+cases against an already-running resident service. Use Python 3.11+, the client
+dependencies, and FFmpeg on PATH (or pass `--ffmpeg /path/to/ffmpeg`). The media
+root must contain the paths expected by the frozen case manifests; preflight
+checks asset sizes and SHA-256 before measurement.
+
+```bash
+PYTHONPATH=python SGLANG_LIGHTWEIGHT_RUNTIME=1 \
+python benchmark/zing_h3_causal/bench_streaming_source.py \
+  --url ws://HOST:30000/v1/realtime_video/generate \
+  --case 5s --media-root /path/to/media --output-dir /path/to/new-result \
+  --warmup-runs 1 --measured-runs 3
+```
+
+Select `--case all` for all three cases. Requests are strictly serial. Each case
+gets its own warmup, excluded from statistics. The next request waits for normal
+server closure after session cleanup; any failure stops the run and preserves a
+failed receipt. Model loading is outside this benchmark: keep the service alive
+throughout the run.
+
+FFmpeg decodes incrementally into a bounded pipe and scales to the case's target
+dimensions. It does not first decode the complete video. Source is sent as
+`source.append` batches within negotiated frame/byte credits; EOF sends
+`source.end`. Source length is checked locally, not announced in init. The
+canonical videos are 24 FPS; arbitrary inputs must also be 24 FPS because this
+client does not resample FPS. The low-level client also accepts `--source-video`,
+or `--source-rgb -` for a live RGB24 producer.
+
+Default replay sends as quickly as credits allow. Add `--paced` to simulate a
+24 FPS capture clock; credit stalls do not reset this clock. Paced and unpaced
+runs are different workloads and should not be pooled. Paced replay is lossless
+and backpressured: it may take longer than the video duration to send and is not
+an unthrottled camera/ingress test. References retain the
+canonical IDs and order, but continuous-source conditioning uses the first
+accepted source frame, not the offline prompt-video preview. This is a separate
+baseline from whole-video input; equal seeds do not establish identical output.
+
+The result directory contains `config.json`, `requests.jsonl`, `chunks.jsonl`,
+`summary.json`, a self-contained `results.json` bundle and an offline
+`results.html` report. Per-request directories
+retain the negotiated request, event trace, RGB output, hashes and decoder log.
+Successful request rows retain the server session ID and input/output hashes
+for correlation with stage logs; failed rows retain the underlying exception
+traceback. `stall_seconds` and unavailable `ifl_seconds` are preserved per request.
+Open `results.html` directly in a browser. The light report compares cases,
+shows formal repetitions and warmups separately, and visualizes batch intervals
+and source backpressure. Use **打开结果 JSON** to append multiple result files;
+select a file to inspect it, or export the selected bundle. All reading happens
+locally, without a server or network request. Runs from separate files are not
+pooled into one performance statistic.
+
+To rebuild a page from existing streaming results:
+
+```bash
+python benchmark/zing_h3_causal/build_streaming_report.py \
+  --results RUN/results.json --output RUN/results.html
+```
+
+For historical raw CUDA archives, add `--server-results GPU_RESULT_DIRECTORY`.
+That archive contains `timing/`, `hardware.json` and the per-request client
+summaries. New benchmarks already include received Host profiles in their
+results JSON; do not point this option at a live temporary timing directory. The report checks collector health and per-session/rank latent/frame
+coverage, then shows component Host totals and a single-request Host
+timeline. Timeline alignment requires the client clock domain to match the
+server, or recorded evidence that both ran in the same worker. Newly collected
+client summaries include the local boot-based clock domain. Host totals remain
+separate from the aligned Host timeline. Exporting
+the current JSON from the page retains the server evidence as well.
+
+Finite-input and continuous-source reports now share `benchmark_report.html`,
+the file selector and the `zing-benchmark-results` version 1 envelope. Streaming
+report data has `data.kind="continuous_source"` and retains its measurement
+bundle under `data.streaming`; the existing finite report representation is
+unchanged. The common page opens both, including old #275/#283 JSON reports.
+Raw `bench_streaming_source.py` result bundles are also accepted as an input
+format. To save the shared report envelope directly, use `--json-output FILE`.
+Scene names come from case metadata; request selectors include scene, input
+mode, measured repetition and session ID. The selected request also shows its
+full client request ID, server session ID, source and prompt.
+Warmups and failures are excluded from timing distributions.
+
+All intervals use the client's monotonic clock:
+
+| Field | Meaning |
+| --- | --- |
+| `ttff_seconds` | Client start, before connection and decoder startup, to first complete RGB batch |
+| `e2e_seconds` / `fps` | Client start to last RGB batch / delivered frames divided by that duration |
+| `tpoc_seconds` / `icl_seconds` | Mean / distribution of intervals between complete delivered RGB batches |
+| `source_to_first_output_seconds` | First source send start to first complete output batch |
+| `dependency_to_output_seconds` | Send start of the batch containing each output's last source dependency to output receipt |
+| `source_send_span_seconds` (result bundle) | First source send start to last source send start |
+| `tail_drain_seconds` | Last source send start to last output receipt |
+| `credit_wait_seconds` | Total time waiting for source credit after a batch is ready |
+| `source_to_output_seconds` | Per-frame simulated capture-to-batch-delivery in paced mode; decoded batch availability-to-delivery in unpaced mode |
+
+`stall_seconds` estimates accumulated lateness against a 24 FPS playback clock
+with a 0.5-second startup buffer; it is not observed browser playback.
+`IFL` stays unmeasured: a batch arrival supplies no individual frame presentation
+timestamps. `first_output_before_source_end` records whether output arrived
+before sending EOS; it is useful evidence, not a universal pass condition for
+very short inputs. These metrics include client decoding, transport and output
+handling; dependency latency is not isolated Encoder RPC time or CUDA time.
+
+CPU tests in `tests/test_bench_client.py` exercise real FFmpeg decoding and a local
+WebSocket protocol peer, including early output, credit backpressure, EOF,
+frame-count failure, disconnect cleanup, warmup exclusion and frozen case
+preflight. They do not run the model or establish TTFF improvement, visual
+quality, or GPU Encoder/DiT overlap. Those require a real resident service run.
+
 ## Dimensions and credits
 
 Admission uses the loaded model's VAE spatial compression and DiT patch size
@@ -133,3 +244,39 @@ source. Transport acceptance alone does not establish KV capacity or quality.
 The [2026-09-28 high-resolution acceptance report](SOURCE_TRANSPORT_ACCEPTANCE_20260928.md)
 records three real-source, six-reference repeats at each aligned resolution,
 including timing, per-rank memory and frozen-source/media checksums.
+
+### First-stage profiling and result retention
+
+The first-stage report uses `host_call_ms` and Host timestamps. No timing
+environment variables are required. Ordinary generation does not collect
+stage data; `return_stage_timing=true` enables Host collection and delivery
+for that request, including the dedicated Encoder. CUDA events are not
+created on this path. The existing `profile=true` still means Torch profiler.
+
+The serving launcher creates one temporary `zing-stage-timing-*` directory
+for each deployment. SP workers inherit it, and the Source Encoder receives
+the same absolute path through its internal open-session RPC.
+`SGLANG_ZING_STAGE_TIMING_DIR` is an optional parent-directory override;
+the launcher creates and owns a unique child, preserving other files in the
+parent. The old `SGLANG_ZING_STAGE_TIMING` mode variable is no longer needed.
+
+Both clients request results with `return_stage_timing=true`
+(`--receive-stage-timing`). Both finite and continuous-source benchmarks request this by
+default; `--no-stage-timing` skips it. After generation and session cleanup,
+the server sends `profile_result`, including dedicated Encoder records for
+continuous source. The client saves the result, sends one
+`{type: "profile_ack", session_id: ...}`, and waits for normal close. This
+wait is outside TTFF/E2E. No acknowledgement retries or transaction log.
+
+Worker timing rows are stored in separate files per session. An ACK deletes
+only that session's files. A disconnect, malformed ACK, or a five-second ACK
+timeout also removes the delivered session's expendable timing files.
+Aborted sessions are cleaned after worker release; deployment shutdown
+removes the automatically created directory, including health snapshots.
+Per-worker health snapshots are overwritten in place rather than appended.
+Client profiles (`profiles/<request_id>.json` for finite input,
+`<case>/<phase>-<index>/profile.json` for continuous source) and exported
+result JSON remain available for reopening the report. The continuous
+benchmark assembles its server view from these client files; it no longer
+requires recovery of the server timing directory. The split baseline checks client-owned profiles after server cleanup.
+Historical raw worker files remain readable by offline analysis tools.

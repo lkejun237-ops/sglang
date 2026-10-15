@@ -235,6 +235,7 @@ def test_actual_producer_recovers_unknown_ack_and_marks_data_failure(
         token="old",
         device=0,
         profile_dir=None,
+        stage_timing_dir=None,
         remote_usage={},
         admission_endpoint=None,
         accepted_frames=1,
