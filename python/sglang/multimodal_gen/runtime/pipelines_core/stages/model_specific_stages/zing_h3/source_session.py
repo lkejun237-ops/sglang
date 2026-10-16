@@ -56,7 +56,13 @@ class ZingSourceStreamState(BaseRealtimeState):
     def initialize(self, stage, batch, config, trace=None):
         params = batch.sampling_params
         stage._validate_sampling_params(params)
-        sampler = stage._build_realtime_sampler(params)
+        command = batch.extra["zing_source_command"]
+        sampling_options = (
+            {"source_sampling_schedule": command["sampling_schedule"]}
+            if "sampling_schedule" in command
+            else {}
+        )
+        sampler = stage._build_realtime_sampler(params, **sampling_options)
         if sampler.window_policy.window_chunks is None:
             raise ValueError("Continuous source requires a bounded attention window")
         self.policy = {
@@ -85,7 +91,6 @@ class ZingSourceStreamState(BaseRealtimeState):
                 self.qwen_init_host_ms = (time.perf_counter() - start) * 1000
 
         source_preview = None
-        command = batch.extra["zing_source_command"]
         if command.get("source_preview", False):
             # Read S0 from the same accepted bytes later fed to the source VAE.
             # This bounded CPU tensor crosses neither a file nor a second IPC.

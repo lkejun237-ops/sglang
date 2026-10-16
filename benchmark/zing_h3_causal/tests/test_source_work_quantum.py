@@ -13,7 +13,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[3] / "python/sglang/multimodal_gen/runtime"
 
 
-def methods():
+def methods(sampling_schedule=None):
     path = ROOT / "entrypoints/openai/realtime/adapters/zing_h3_source_adapter.py"
     cls = next(
         n
@@ -61,6 +61,16 @@ def methods():
         available=asyncio.Event(),
         ledger=NS(closed=False),
         config={},
+        sampling_schedule=(
+            sampling_schedule
+            if sampling_schedule is not None
+            else dict(
+                solver="few_step",
+                denoising_step_list=[1000, 750, 500, 250],
+                initial_block_count=0,
+                initial_denoising_step_list=None,
+            )
+        ),
         reference_ids=[],
         first_source_received_unix_ns=None,
         source_preview_sha256=None,
@@ -70,8 +80,31 @@ def methods():
     return adapter
 
 
-def test_continuation_keeps_new_source_queued_and_never_repeats_eos():
-    adapter = methods()
+@pytest.mark.parametrize(
+    "sampling_schedule",
+    [
+        pytest.param(
+            dict(
+                solver="few_step",
+                denoising_step_list=[1000, 750, 500, 250],
+                initial_block_count=0,
+                initial_denoising_step_list=None,
+            ),
+            id="four-step",
+        ),
+        pytest.param(
+            dict(
+                solver="few_step",
+                denoising_step_list=[1000, 750],
+                initial_block_count=3,
+                initial_denoising_step_list=[1000, 750, 500, 250],
+            ),
+            id="mixed-four-then-two",
+        ),
+    ],
+)
+def test_continuation_keeps_new_source_queued_and_never_repeats_eos(sampling_schedule):
+    adapter = methods(sampling_schedule)
     adapter.more_work = True
     adapter.end = {"frame_end": 17, "event_id": 8}
     adapter.end_dispatched = True
@@ -81,6 +114,7 @@ def test_continuation_keeps_new_source_queued_and_never_repeats_eos():
     batch = adapter.prepare_next_request(None, None, None)
     assert batch.extra["zing_source_command"]["appends"] == []
     assert batch.extra["zing_source_command"]["end"] is None
+    assert batch.extra["zing_source_command"]["sampling_schedule"] == sampling_schedule
     assert list(adapter.pending) == [row] and adapter.pending_frames == 1
 
 

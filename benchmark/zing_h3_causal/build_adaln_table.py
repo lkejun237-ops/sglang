@@ -15,6 +15,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
     ZingH3DiTArchConfig,
     resolve_zing_modality_tags,
 )
+from sglang.multimodal_gen.configs.zing_sampling import validate_initial_blocks
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
 )
@@ -25,6 +26,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_table import (
     arithmetic_contract,
     checkpoint_identity,
+    initial_blocks_plan,
     table_key,
     table_staleness,
     video_plan,
@@ -39,6 +41,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
 
 
 def make_plan(args):
+    count = getattr(args, "initial_block_count", 0)
+    initial_grid = getattr(args, "initial_denoising_step_list", None)
+    validate_initial_blocks(args.solver, args.denoising_step_list, initial_grid, count)
     if args.solver == "euler":
         schedule = ZingH3EulerSchedule(args.sigma_points, args.video_shift)
     else:
@@ -56,6 +61,23 @@ def make_plan(args):
         args.reference,
         sigmas=schedule.sigmas,
     )
+    if count:
+        initial = ZingH3CausalRenoiseSchedule(
+            initial_grid,
+            num_train_timesteps=args.num_train_timesteps,
+            shift=args.video_shift,
+        )
+        plan = initial_blocks_plan(
+            plan,
+            video_plan(
+                args.solver,
+                initial.timesteps,
+                args.condition,
+                args.reference,
+                sigmas=initial.sigmas,
+            ),
+            count,
+        )
     Path(args.output).write_text(json.dumps(plan, indent=2) + "\n")
 
 
@@ -254,6 +276,8 @@ def main():
     plan.add_argument("--sigma-points", type=int, default=50)
     plan.add_argument("--video-shift", type=float, default=5.0)
     plan.add_argument("--denoising-step-list", type=int, nargs="+")
+    plan.add_argument("--initial-block-count", type=int, default=0, choices=[0, 3])
+    plan.add_argument("--initial-denoising-step-list", type=int, nargs="+")
     plan.add_argument("--num-train-timesteps", type=int, default=1000)
     plan.add_argument("--condition", type=float, default=1.0)
     plan.add_argument("--reference", type=float, default=1.0)
@@ -279,8 +303,12 @@ def main():
     args = parser.parse_args()
     if args.command == "check":
         reasons = check(args.model_path, args.table, args.plan)
-        print(json.dumps({"status": "rebuild_required" if reasons else "ok",
-                          "reasons": reasons}, indent=2))
+        print(
+            json.dumps(
+                {"status": "rebuild_required" if reasons else "ok", "reasons": reasons},
+                indent=2,
+            )
+        )
         sys.exit(2 if reasons else 0)
     elif args.command == "ensure":
         table, status = ensure(args.model_path, args.plan, args.table, args.device)

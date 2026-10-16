@@ -371,11 +371,11 @@ class ServerArgs(DisaggServerArgsMixin):
     # the 24.2 GiB checkpoint. Expert knobs (GPU slot count, fp32 rebuild)
     # live in envs.py as SGLANG_DIFFUSION_MINIMAX_H3_ADALN_*.
     minimax_h3_adaln_host_cache_gb: float = 8.0
-    # Deployment-owned Zing schedules; None preserves request-level defaults.
+    # Deployment-owned realtime Zing schedules; 0 restores request defaults.
     zing_solver: str | None = None
     zing_denoising_step_list: list[int] | None = None
     zing_initial_denoising_step_list: list[int] | None = None
-    zing_initial_block_count: int = 0
+    zing_initial_block_count: int = 3
     # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
     # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
@@ -706,6 +706,15 @@ class ServerArgs(DisaggServerArgsMixin):
             validate_initial_blocks,
         )
 
+        # Only ON owns a fixed deployment policy; OFF keeps request defaults.
+        if self.zing_initial_block_count == 3:
+            if self.zing_solver is None:
+                self.zing_solver = "few_step"
+            if self.zing_denoising_step_list is None:
+                self.zing_denoising_step_list = [1000, 750]
+            if self.zing_initial_denoising_step_list is None:
+                self.zing_initial_denoising_step_list = [1000, 750, 500, 250]
+
         self.zing_denoising_step_list = parse_noise_grid(self.zing_denoising_step_list)
         self.zing_initial_denoising_step_list = parse_noise_grid(
             self.zing_initial_denoising_step_list
@@ -722,12 +731,6 @@ class ServerArgs(DisaggServerArgsMixin):
             self.zing_initial_denoising_step_list,
             self.zing_initial_block_count,
         )
-        if self.zing_initial_block_count and getattr(
-            self.pipeline_config, "zing_adaln_table_path", None
-        ):
-            raise ValueError(
-                "Zing mixed schedules require resident AdaLN projections; offline single-schedule tables are unsupported"
-            )
 
     def _validate_minimax_h3_adaln(self) -> None:
         # Warn, not raise: config-file and from_kwargs construction mark every
@@ -2045,7 +2048,17 @@ class ServerArgs(DisaggServerArgsMixin):
             "--zing-initial-denoising-step-list", type=parse_noise_grid, default=None
         )
         parser.add_argument(
-            "--zing-initial-block-count", type=int, choices=[0, 3], default=0
+            "--zing-initial-block-count",
+            type=int,
+            choices=[0, 3],
+            default=3,
+            help=(
+                "Default: four steps for the first three realtime target blocks, "
+                "then two steps. Set 0 to disable the initial stage. "
+                "With 3, omitted Zing solver/regular/initial grids default to "
+                "few_step, 1000,750 and 1000,750,500,250. "
+                "With 0, preserve request-level sampling defaults."
+            ),
         )
         parser.add_argument(
             "--zing-conditioning-mode",

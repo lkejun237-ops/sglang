@@ -74,6 +74,10 @@ PYTHONPATH=python torchrun --standalone --nproc-per-node=1 \
 
 ### Keeping table and export in sync
 
+Realtime initial-block mixed sampling uses a separate composite plan; see the
+[design and migration guide](../../docs/docs/sglang-diffusion/zing/specs/initial-block-static-adaln.md).
+An existing single-schedule table is not admitted as a mixed plan.
+
 The table is bound to the export, so rebuild whenever weights, merged LoRA or schedule change. Two subcommands automate that decision:
 
 ```bash

@@ -19,7 +19,6 @@ description: "Zing H3 continuous RGB input, finite streaming, decode modes, and 
   "size": "832x480",
   "fps": 24,
   "seed": 42,
-  "num_inference_steps": 4,
   "zing_realtime_decode_mode": "stable",
   "realtime_output_format": "raw",
   "source_stream": {"format": "rgb24", "width": 832, "height": 480, "fps": 24}
@@ -27,8 +26,33 @@ description: "Zing H3 continuous RGB input, finite streaming, decode modes, and 
 ```
 
 部署须在模型目录提供绑定 `zing_config.json` SHA256 的
-`zing_realtime_profile.json`，固定匹配 checkpoint 的四步 schedule、guidance 和
-`indexed-cpu-v1` 噪声语义。客户端不能覆盖采样语义。
+`zing_realtime_profile.json`，声明匹配 checkpoint 的两步或四步 schedule、guidance 和
+`indexed-cpu-v1` 噪声语义。默认前三块四步、之后两步，无需附加采样 CLI，
+profile 未声明 initial 阶段时也采用此默认。也可显式写出完整计划，
+保留 checkpoint hash、guidance、noise 等其他字段：
+
+```json
+{
+  "solver": "few_step",
+  "denoising_step_list": [1000, 750],
+  "initial_block_count": 3,
+  "initial_denoising_step_list": [1000, 750, 500, 250]
+}
+```
+
+不传采样 CLI 覆盖时，入口和 worker 使用 profile 明确声明的完整计划。
+显式启动参数的 solver/grid 或 `--zing-initial-block-count 3` 选择 CLI 的整套计划；
+因此旧四步 profile 也可通过 CLI 开启混合采样。
+仅显式传 `--zing-initial-block-count 0` 会保留 profile 的常规 grid 并关闭初始阶段。
+旧 profile 不含 initial 字段时，改用默认混合计划；要保持全程原 grid，
+在 profile 显式设置 `initial_block_count=0`，或传上述关闭 CLI。
+profile 和最终有效计划均须合法。迁移边界见[默认混合采样设计](/docs/sglang-diffusion/zing/specs/default-mixed-sampling)。
+客户端不能覆盖采样计划，建议省略 `num_inference_steps`；显式填写时须等于有效计划的
+常规阶段步数（混合计划为2，全程四步为4）。`session.ready.num_inference_steps` 回显该值，
+`session.ready.sampling_schedule` 返回 solver、`denoising_step_list`、`initial_block_count`
+和 `initial_denoising_step_list`。入口冻结完整计划，通过内部 source 命令交给 worker。
+混合部署的旧客户端若写死4或只接受四步 ready，须与服务一同升级。
+静态表还必须覆盖实际生效的完整计划，见[混合采样静态 AdaLN 设计](specs/initial-block-static-adaln.md)。
 初始化可通过 `references` 提供至多九个唯一 ID 的 JPEG/WebP/PNG 二进制图片，
 总大小至多 8 MiB；当前只支持视频、RGB24 source 和本地解码。
 测试用例保留原始全局风格图为 Picture 1，五张上下对照图为 Picture 2–6，共六张参考图。

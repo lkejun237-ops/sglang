@@ -18,6 +18,9 @@ import zmq
 import zmq.asyncio
 from PIL import Image  # noqa: F401 - preserve the existing CPU validation seam
 
+from sglang.multimodal_gen.configs.zing_sampling import (
+    normalize_source_sampling_schedule,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter import (
     BaseRealtimeModelAdapter,
     RealtimeChunkInputs,
@@ -38,6 +41,54 @@ from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
     default_source_encoder,
 )
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+
+def _source_sampling_schedule(args, profile):
+    """Freeze a whole deployment plan, with explicit CLI settings taking precedence."""
+    profile_has_initial = "initial_block_count" in profile
+    profile = normalize_source_sampling_schedule(profile)
+    solver = getattr(args, "zing_solver", None)
+    count = getattr(args, "zing_initial_block_count", 0)
+    is_explicit = getattr(args, "is_arg_explicitly_set", None)
+    explicit_cli = (
+        any(
+            is_explicit(name)
+            for name in (
+                "zing_solver",
+                "zing_denoising_step_list",
+                "zing_initial_block_count",
+                "zing_initial_denoising_step_list",
+            )
+        )
+        if is_explicit is not None
+        else solver is not None or count == 3
+    )
+    if not explicit_cli:
+        if profile_has_initial:
+            return profile
+        # Legacy profiles name only the regular grid. An explicit count=0 is
+        # now required to retain a single-stage deployment.
+        return dict(
+            solver="few_step",
+            denoising_step_list=[1000, 750],
+            initial_block_count=3,
+            initial_denoising_step_list=[1000, 750, 500, 250],
+        )
+    grid = (
+        getattr(args, "zing_denoising_step_list", None)
+        if solver is not None
+        else profile["denoising_step_list"]
+    )
+    return normalize_source_sampling_schedule(
+        dict(
+            solver=solver or profile["solver"],
+            denoising_step_list=grid,
+            initial_block_count=count,
+            initial_denoising_step_list=getattr(
+                args, "zing_initial_denoising_step_list", None
+            ),
+        )
+    )
 
 
 class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
@@ -84,6 +135,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             "zing_window_eviction_timing",
             "zing_solver",
             "zing_denoising_step_list",
+            "zing_initial_block_count",
+            "zing_initial_denoising_step_list",
             "realtime_causal_sink_size",
             "realtime_causal_kv_cache_num_frames",
             "negative_prompt",
@@ -100,9 +153,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             "Please request one video with a prompt.",
         )
         require(
-            request.num_inference_steps in (None, 4)
-            and getattr(request, "zing_realtime_decode_mode", "stable") == "stable",
-            "This session requires stable four-step rendering.",
+            getattr(request, "zing_realtime_decode_mode", "stable") == "stable",
+            "This session requires stable rendering.",
         )
         require(
             not any(
@@ -123,16 +175,22 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             (Path(args.model_path) / "zing_realtime_profile.json").read_text()
         )
         # require raises ContractError explicitly and is unaffected by python -O.
-        # Four steps are the source API deployment contract, not an overlap algorithm limit.
         require(
             runtime.get("causal") is True
             and profile.get("model_config_sha256")
             == hashlib.sha256(config_bytes).hexdigest()
             and profile.get("solver") == "few_step"
             and isinstance(profile.get("denoising_step_list"), list)
-            and len(profile["denoising_step_list"]) == 4
+            and len(profile["denoising_step_list"]) in (2, 4)
             and profile.get("noise_version") == "indexed-cpu-v1",
-            "The deployed model is not configured for four-step streaming.",
+            "The deployed model is not configured for streaming.",
+        )
+        self.sampling_schedule = _source_sampling_schedule(args, profile)
+        regular_steps = len(self.sampling_schedule["denoising_step_list"])
+        require(
+            request.num_inference_steps in (None, regular_steps),
+            "The requested step count does not match this deployment. "
+            "Omit it to use the server settings.",
         )
         require(
             profile.get("window_eviction_timing", "after_step0")
@@ -177,7 +235,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             and type(window["sink_chunks"]) is int
             and 1 <= window["window_chunks"] <= 21
             and 0 <= window["sink_chunks"] < window["window_chunks"],
-            "The deployed model is not configured for four-step streaming.",
+            "The deployed model is not configured for streaming.",
         )
         self.source_attention_window = dict(window)
         source = getattr(request, "source_stream", None)
@@ -344,7 +402,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         self.prompt_event = None
         request.fps, request.num_inference_steps, request.guidance_scale = (
             fps,
-            4,
+            regular_steps,
             profile["guidance_scale"],
         )
         request.realtime_output_format = request.realtime_output_format or "raw"
@@ -353,7 +411,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             "type": "session.ready",
             "zing_realtime_api_version": 1,
             "session_id": session.id,
-            "num_inference_steps": 4,
+            "num_inference_steps": regular_steps,
+            "sampling_schedule": self.sampling_schedule,
             "realtime_output_format": request.realtime_output_format,
             "source_stream": source,
             "max_message_bytes": transport.message_bytes,
@@ -635,7 +694,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             request=session.request,
             chunk_inputs=chunk_inputs,
             num_frames=self.clip,
-            num_inference_steps=4,
+            num_inference_steps=len(self.sampling_schedule["denoising_step_list"]),
             chunk_size=chunk_size,
         )
         params.image_path = self.reference_paths
@@ -673,8 +732,10 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         params.zing_window_eviction_timing = self.profile.get(
             "window_eviction_timing", "after_step0"
         )
-        params.zing_solver = self.profile["solver"]
-        params.zing_denoising_step_list = self.profile["denoising_step_list"]
+        params.zing_solver = self.sampling_schedule["solver"]
+        params.zing_denoising_step_list = list(
+            self.sampling_schedule["denoising_step_list"]
+        )
         params.zing_realtime_decode_mode = "stable"
         params.zing_window_chunks = self.source_attention_window["window_chunks"]
         params.zing_sink_chunks = self.source_attention_window["sink_chunks"]
@@ -705,6 +766,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         batch.extra["zing_reference_ids"] = self.reference_ids
         batch.extra["zing_source_command"] = dict(
             config=self.config,
+            sampling_schedule=self.sampling_schedule,
             async_output=self.profile.get("async_source_output", False),
             appends=appends,
             end=end,

@@ -176,7 +176,6 @@ async def main(args):
                 size=f"{args.width}x{args.height}",
                 fps=24,
                 seed=42,
-                num_inference_steps=4,
                 zing_realtime_decode_mode="stable",
                 realtime_output_format="raw",
                 source_stream=dict(
@@ -427,9 +426,9 @@ async def main(args):
                 assert sum(x["num_frames"] for x in headers) == total, messages
                 assert messages[-1]["output_frames"] == total, messages[-1]
                 if name == "pause_prompt_resume":
-                    assert any(
-                        x.get("event_id") == prompt_event for x in headers
-                    ), headers
+                    assert any(x.get("event_id") == prompt_event for x in headers), (
+                        headers
+                    )
                     assert headers[0].get("event_id") is None, headers[0]
         results.append(
             dict(

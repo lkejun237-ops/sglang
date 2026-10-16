@@ -132,6 +132,32 @@ def video_plan(solver, timesteps, condition=1.0, reference=1.0, *, sigmas):
     )
 
 
+def initial_blocks_plan(regular, initial, count):
+    """One weights-free table, with exact admission for both realtime schedules.
+
+    Keep the ordinary schedule fields intact. Old single-schedule manifests
+    remain valid for ordinary sampling and fail closed for mixed sampling.
+    Deduplicate complete batches, never synthesize a GEMM from singleton rows.
+    """
+    if type(count) is not int or count != 3:
+        raise ValueError("Zing AdaLN initial blocks require count=3")
+    for field in ("solver", "condition", "reference", "mode"):
+        if regular["schedule"][field] != initial["schedule"][field]:
+            raise ValueError(f"Zing AdaLN initial schedule differs in {field}")
+    if regular["schedule"]["solver"] != "few_step":
+        raise ValueError("Zing AdaLN initial blocks require few_step")
+    batches = {}
+    for plan in (regular, initial):
+        for values in plan["batches"]:
+            batch = torch.tensor(values, dtype=torch.float32)
+            batches[batch_key(batch)] = values
+    return dict(
+        schedule=regular["schedule"]
+        | {"initial_blocks": {"count": count, "schedule": initial["schedule"]}},
+        batches=list(batches.values()),
+    )
+
+
 def checkpoint_identity(files, config_path):
     names = [Path(f).name for f in files]
     if len(set(names)) != len(names):

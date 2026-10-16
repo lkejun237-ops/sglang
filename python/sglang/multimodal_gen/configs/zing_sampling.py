@@ -45,3 +45,20 @@ def validate_initial_blocks(solver, regular, initial, count):
             "Zing initial blocks require few_step, regular grid 1000,750 "
             "and initial grid 1000,750,500,250"
         )
+
+
+def normalize_source_sampling_schedule(plan):
+    """Validate a complete source deployment plan at admission and worker entry."""
+    solver = plan.get("solver")
+    regular = parse_noise_grid(plan.get("denoising_step_list"))
+    initial = parse_noise_grid(plan.get("initial_denoising_step_list"))
+    count = plan.get("initial_block_count", 0)
+    if solver != "few_step" or regular is None or len(regular) not in (2, 4):
+        raise ValueError("The deployed model requires two-step or four-step streaming.")
+    validate_initial_blocks(solver, regular, initial, count)
+    return dict(
+        solver=solver,
+        denoising_step_list=regular,
+        initial_block_count=count,
+        initial_denoising_step_list=initial,
+    )

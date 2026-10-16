@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import argparse
 import asyncio
 import hashlib
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import msgspec.msgpack
@@ -37,6 +39,7 @@ def configured(tmp_path, monkeypatch):
                 model_config_sha256=hashlib.sha256(raw).hexdigest(),
                 solver="few_step",
                 denoising_step_list=[1000, 750, 500, 250],
+                initial_block_count=0,
                 guidance_scale=1,
                 noise_version="indexed-cpu-v1",
             )
@@ -78,12 +81,232 @@ def initialize(**overrides):
 
 
 @pytest.mark.parametrize(
+    "profile_steps,profile_count,cli_steps,count",
+    [
+        (4, 0, None, 0),
+        (2, 0, None, 0),
+        (4, 0, 2, 0),
+        (2, 0, 4, 0),
+        (4, 0, 2, 3),
+        (2, 0, 2, 3),
+        (2, 3, None, 0),
+        (2, 3, 2, 0),
+        (2, 3, 4, 0),
+    ],
+)
+@pytest.mark.parametrize("explicit_steps", [False, True])
+def test_effective_sampling_is_reported_and_dispatched(
+    configured,
+    monkeypatch,
+    profile_steps,
+    profile_count,
+    cli_steps,
+    count,
+    explicit_steps,
+):
+    path = Path(configured.model_path) / "zing_realtime_profile.json"
+    profile = json.loads(path.read_text())
+    profile["denoising_step_list"] = [1000, 750, 500, 250][:profile_steps]
+    if profile_count:
+        profile.update(
+            initial_block_count=profile_count,
+            initial_denoising_step_list=[1000, 750, 500, 250],
+        )
+    path.write_text(json.dumps(profile))
+    configured.zing_solver = "few_step" if cli_steps else None
+    configured.zing_denoising_step_list = (
+        [1000, 750, 500, 250][:cli_steps] if cli_steps else None
+    )
+    configured.zing_initial_block_count = count
+    configured.zing_initial_denoising_step_list = (
+        [1000, 750, 500, 250] if count else None
+    )
+    expected_steps = cli_steps or profile_steps
+    expected_count = count if cli_steps is not None else profile_count
+    adapter, session = initialize(
+        num_inference_steps=expected_steps if explicit_steps else None
+    )
+    ready = adapter.session_ready_message(session)
+    expected = dict(
+        solver="few_step",
+        denoising_step_list=[1000, 750, 500, 250][:expected_steps],
+        initial_block_count=expected_count,
+        initial_denoising_step_list=[1000, 750, 500, 250] if expected_count else None,
+    )
+    assert (
+        ready["num_inference_steps"]
+        == session.request.num_inference_steps
+        == expected_steps
+    )
+    assert ready["sampling_schedule"] == expected
+    # Isolate the generic API factory; exercise the source adapter's real assembly.
+    monkeypatch.setattr(
+        source, "build_realtime_sampling_params", lambda *a, **kw: SimpleNamespace(**kw)
+    )
+    params = adapter.build_sampling_params(
+        session,
+        configured,
+        SimpleNamespace(request_id="test"),
+        SimpleNamespace(prompt="snow"),
+        17,
+    )
+    assert params.num_inference_steps == expected_steps
+    assert params.zing_solver == expected["solver"]
+    assert params.zing_denoising_step_list == expected["denoising_step_list"]
+    monkeypatch.setattr(
+        source.BaseRealtimeModelAdapter,
+        "prepare_next_request",
+        lambda *a: SimpleNamespace(extra={}),
+    )
+    batch = adapter.prepare_next_request(session, configured, None)
+    wire = msgspec.msgpack.decode(msgspec.msgpack.encode(batch.extra))
+    assert wire["zing_source_command"]["sampling_schedule"] == expected
+    params.zing_denoising_step_list.append(125)
+    assert ready["sampling_schedule"] == expected
+    assert adapter.profile == profile
+    adapter.dispose(session)
+    with pytest.raises(ValueError, match="requested step count"):
+        initialize(num_inference_steps=4 if expected_steps == 2 else 2)
+
+
+@pytest.mark.parametrize(
+    "grid", [[1000, 750, 500], [1000, 1000], [750, 500], [1000, 0], [1000, True]]
+)
+def test_invalid_profile_grid_is_not_hidden_by_cli(configured, grid):
+    path = Path(configured.model_path) / "zing_realtime_profile.json"
+    profile = json.loads(path.read_text())
+    profile["denoising_step_list"] = grid
+    path.write_text(json.dumps(profile))
+    configured.zing_solver = "few_step"
+    configured.zing_denoising_step_list = [1000, 750]
+    with pytest.raises(ValueError):
+        initialize()
+
+
+def test_cli_euler_rejected_before_source_session(configured):
+    configured.zing_solver = "euler"
+    configured.zing_denoising_step_list = None
+    with pytest.raises(ValueError, match="deployed model"):
+        initialize()
+
+
+def test_explicit_zero_disables_profile_initial_schedule(configured):
+    from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+    path = Path(configured.model_path) / "zing_realtime_profile.json"
+    profile = json.loads(path.read_text())
+    profile.update(
+        denoising_step_list=[1000, 750],
+        initial_block_count=3,
+        initial_denoising_step_list=[1000, 750, 500, 250],
+    )
+    path.write_text(json.dumps(profile))
+    configured._explicit_arg_names = {"zing_initial_block_count"}
+    configured.is_arg_explicitly_set = lambda name: ServerArgs.is_arg_explicitly_set(
+        configured, name
+    )
+    configured.zing_initial_block_count = 0
+    adapter, session = initialize()
+    assert adapter.ready["sampling_schedule"] == dict(
+        solver="few_step",
+        denoising_step_list=[1000, 750],
+        initial_block_count=0,
+        initial_denoising_step_list=None,
+    )
+    adapter.dispose(session)
+
+
+@pytest.mark.parametrize("profile_count", [None, 0, 3])
+@pytest.mark.parametrize("cli_count", [None, 0, 3])
+def test_default_mixed_schedule_and_explicit_overrides(
+    configured, profile_count, cli_count
+):
+    from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+    path = Path(configured.model_path) / "zing_realtime_profile.json"
+    profile = json.loads(path.read_text())
+    profile.pop("initial_block_count")
+    if profile_count is not None:
+        profile["initial_block_count"] = profile_count
+    if profile_count == 3:
+        profile.update(
+            denoising_step_list=[1000, 750],
+            initial_denoising_step_list=[1000, 750, 500, 250],
+        )
+    path.write_text(json.dumps(profile))
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    argv = ["--model-path", str(configured.model_path)]
+    if cli_count is not None:
+        argv += ["--zing-initial-block-count", str(cli_count)]
+    parsed = parser.parse_args(argv)
+    ServerArgs._validate_zing_sampling(parsed)
+    for name in (
+        "zing_solver",
+        "zing_denoising_step_list",
+        "zing_initial_block_count",
+        "zing_initial_denoising_step_list",
+    ):
+        setattr(configured, name, getattr(parsed, name))
+    configured.is_arg_explicitly_set = lambda name: (
+        cli_count is not None and name == "zing_initial_block_count"
+    )
+    adapter, session = initialize()
+    count = (
+        cli_count
+        if cli_count is not None
+        else (profile_count if profile_count is not None else 3)
+    )
+    grid = [1000, 750] if count else profile["denoising_step_list"]
+    assert adapter.ready["num_inference_steps"] == len(grid)
+    assert adapter.ready["sampling_schedule"] == dict(
+        solver="few_step",
+        denoising_step_list=grid,
+        initial_block_count=count,
+        initial_denoising_step_list=[1000, 750, 500, 250] if count else None,
+    )
+    adapter.dispose(session)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"initial_block_count": 3},
+        {"initial_block_count": True},
+        {"initial_block_count": 1},
+        {
+            "initial_block_count": 0,
+            "initial_denoising_step_list": [1000, 750, 500, 250],
+        },
+        {"initial_block_count": 3, "initial_denoising_step_list": [1000, 750]},
+        {
+            "initial_block_count": 3,
+            "initial_denoising_step_list": [1000, 750, 500, 250],
+            "denoising_step_list": [1000, 750, 500, 250],
+        },
+    ],
+)
+def test_bad_profile_initial_schedule_is_not_hidden_by_cli(configured, fields):
+    path = Path(configured.model_path) / "zing_realtime_profile.json"
+    profile = json.loads(path.read_text())
+    profile.update(denoising_step_list=[1000, 750])
+    profile.update(fields)
+    path.write_text(json.dumps(profile))
+    configured.zing_solver = "few_step"
+    configured.zing_denoising_step_list = [1000, 750]
+    with pytest.raises(ValueError):
+        initialize()
+
+
+@pytest.mark.parametrize(
     "overrides",
     [
         {"zing_realtime_api_version": 2},
         {"zing_request": {}},
         {"num_inference_steps": 50},
         {"zing_solver": "euler"},
+        {"zing_initial_block_count": 3},
+        {"zing_initial_denoising_step_list": [1000, 750, 500, 250]},
         {"max_chunks": 3},
         {"zing_window_chunks": 100},
         {"zing_rope_position_mode": "absolute"},

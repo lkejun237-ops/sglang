@@ -1390,7 +1390,10 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                         "Zing weights-free AdaLN supports video requests only"
                     )
                 projection_cache = self.adaln_table
-                projection_key = projection_cache.lookup(key_unique_t)
+                # Joint forwards project singleton timesteps below, not the
+                # combined unique-t batch. Only require entries actually used.
+                if joint is None:
+                    projection_key = projection_cache.lookup(key_unique_t)
             elif self.adaln_projection_cache_enabled and cache is not None:
                 projection_cache = cache.adaln_projection_cache
                 if (
@@ -1414,8 +1417,13 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
 
             branch_projection_keys = None
             if joint is not None and projection_cache is not None:
+                # Keys follow unique timesteps, not token branches: the clean
+                # final and source branches share t=1. Static tables already
+                # contain these exact singleton GEMMs; they never compute misses.
                 branch_projection_keys = [
-                    projection_cache.begin(
+                    projection_cache.lookup(key_unique_t[i : i + 1])
+                    if self.adaln_table is not None
+                    else projection_cache.begin(
                         key_unique_t[i : i + 1],
                         adaln_input[i : i + 1],
                         self.time_embedder,

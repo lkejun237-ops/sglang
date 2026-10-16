@@ -138,6 +138,7 @@ class SourceReadySession:
         # A pooled session leases its slot at the first step, once the packed
         # prefix size is known; until then it holds no cache.
         self.acquire_storage = acquire_storage
+        self.adaln_lease = None
         self.cache = None if acquire_storage is not None else self._new_cache(None)
         self.rng = ZingH3RealtimeState()
         if initial_rng_state is not None:
@@ -497,6 +498,15 @@ class SourceReadySession:
         else:
             sampler.video_scheduler.to(sampler.device)
             sampler.audio_scheduler.to(sampler.device)
+        spans = [
+            (model_chunk.source_block, model_chunk.target_block, 0, visual.shape[2])
+        ]
+        lease = sampler._admit_adaln(positive, negative, spans, audio)
+        if self.adaln_lease is not None:
+            self.adaln_lease.close()
+        # This session owns the lease, just as it owns the shared KV cache.
+        # Outer step/drain cleanup releases it if pool acquisition or prefix fails.
+        self.adaln_lease = lease
         if self.cache is None:
             self.cache = self._new_cache(self.acquire_storage(positive, ready))
         origin = media_origin
@@ -508,7 +518,7 @@ class SourceReadySession:
             audio,
             positive,
             negative,
-            [(model_chunk.source_block, model_chunk.target_block, 0, visual.shape[2])],
+            spans,
             self.cache,
             generation_block_index=int(ready.chunk.chunk_id),
         )
@@ -783,6 +793,9 @@ class SourceReadySession:
     def dispose(self):
         if self.cache is not None:
             self.cache.clear()
+        if self.adaln_lease is not None:
+            self.adaln_lease.close()
+            self.adaln_lease = None
         self._drain_tensors = []
         self.pending.clear()
         self.pending_bytes = 0

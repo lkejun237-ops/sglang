@@ -404,11 +404,18 @@ class ZingH3GenerationStage(PipelineStage):
             rope_max_frame_gap=getattr(params, "zing_rope_max_frame_gap", 12),
         )
 
-    def _build_realtime_sampler(self, params):
+    def _build_realtime_sampler(self, params, *, source_sampling_schedule=None):
         from .realtime_sampling import ZingH3RealtimeSampler
 
         # Validate sampling settings before encoding inputs or loading the DiT.
         deployment = getattr(self, "deployment_sampling", {})
+        if source_sampling_schedule is not None:
+            from sglang.multimodal_gen.configs.zing_sampling import (
+                normalize_source_sampling_schedule,
+            )
+
+            # Source admission already resolved CLI/profile precedence for this session.
+            deployment = normalize_source_sampling_schedule(source_sampling_schedule)
         solver = deployment.get("solver") or getattr(params, "zing_solver", "euler")
         grid = (
             deployment.get("denoising_step_list")
