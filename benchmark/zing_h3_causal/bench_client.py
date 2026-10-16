@@ -105,6 +105,7 @@ SAMPLING_FIELDS = {
     "zing_sink_chunks",
     "zing_rope_position_mode",
     "zing_rope_max_frame_gap",
+    "zing_window_eviction_timing",
 }
 METRIC_NAMES = ("ttff_seconds", "e2e_seconds", "fps", "tpoc_seconds")
 

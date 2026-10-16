@@ -194,6 +194,7 @@ class ZingH3GenerationStage(PipelineStage):
                     "max_short_edge": geometry.max_short_edge,
                     "max_prefix_rows": config.max_prefix_rows,
                     "window_chunks": config.window_chunks,
+                    "window_eviction_timing": config.window_eviction_timing,
                     "sink_chunks": config.sink_chunks,
                     "rope_position_mode": config.rope_position_mode,
                     "rope_max_frame_gap": config.rope_max_frame_gap,
@@ -231,6 +232,7 @@ class ZingH3GenerationStage(PipelineStage):
             sink_chunks=sampler.window_policy.sink_chunks,
             rope_position_mode=sampler.rope_position_mode,
             rope_max_frame_gap=sampler.rope_max_frame_gap,
+            window_eviction_timing=sampler.window_eviction_timing,
             generates_audio=inputs.audio_shape is not None,
             total_frames=total_frames,
             # audio_shape is [stereo, time, channels]; a continuous session
@@ -391,6 +393,9 @@ class ZingH3GenerationStage(PipelineStage):
             ),
             guidance_scale=params.guidance_scale,
             joint_forward=getattr(params, "zing_joint_forward", "cross_chunk"),
+            window_eviction_timing=getattr(
+                params, "zing_window_eviction_timing", "after_step0"
+            ),
             window_chunks=getattr(params, "zing_window_chunks", 21),
             sink_chunks=getattr(params, "zing_sink_chunks", 3),
             rope_position_mode=getattr(
@@ -427,6 +432,9 @@ class ZingH3GenerationStage(PipelineStage):
             ),
             guidance_scale=params.guidance_scale,
             joint_forward=getattr(params, "zing_joint_forward", "cross_chunk"),
+            window_eviction_timing=getattr(
+                params, "zing_window_eviction_timing", "after_step0"
+            ),
             window_chunks=getattr(params, "zing_window_chunks", 21),
             sink_chunks=getattr(params, "zing_sink_chunks", 3),
             rope_position_mode=getattr(

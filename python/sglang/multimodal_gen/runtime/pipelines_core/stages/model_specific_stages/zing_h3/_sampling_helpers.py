@@ -229,6 +229,7 @@ class ZingBlockSamplingHelpers:
 
         host = _host_metadata(packed)
         layout = packed if host is None else vars(host["host_layout"])
+        unsupported = error = None
         try:
             ZingJointTransaction(
                 cache,
@@ -239,9 +240,29 @@ class ZingBlockSamplingHelpers:
                 packed["t"] if host is None else host["host_t"],
                 int(layout["clean_seq_lens"].sum()),
             )
-        except ZingJointUnsupported as error:
+        except ZingJointUnsupported as failure:
+            unsupported = str(failure)
+        except (ValueError, RuntimeError) as failure:
+            error = failure
+        eligible = self._agree_sp_boundary(
+            cache,
+            int(layout["block_idx"][-1]),
+            phase="joint_precheck",
+            cross=len(phases) == 3,
+            joint_eligible=unsupported is None and error is None,
+            required_rows=int(layout["block_idx"].numel()),
+            precheck_error=error is not None,
+            local_error=error,
+            layout_signature=self._collective_layout_signature(
+                packed, int(layout["block_idx"][-1]) - 1, int(layout["block_idx"][-1])
+            ),
+        )
+        if error is not None:
+            raise error
+        if not eligible:
             reasons = self.last_run_metrics["joint_fallbacks"]
-            reasons[str(error)] = reasons.get(str(error), 0) + 1
+            reason = unsupported or "peer_joint_precheck"
+            reasons[reason] = reasons.get(reason, 0) + 1
             return None
         packed["_zing_joint_phases"] = phases
         video, _ = self._forward(packed, cache, "joint")

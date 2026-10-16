@@ -259,6 +259,7 @@ def _initialize(model, *, storage, seed, device, rope_position_mode):
         denoising_step_list=STEPS,
         window_chunks=3,
         sink_chunks=1,
+        window_eviction_timing="before_source",
         rope_position_mode=rope_position_mode,
     )
     torch.manual_seed(seed)
@@ -1014,3 +1015,1004 @@ def test_sp_graph_key_distinguishes_global_splits_with_same_local_shape():
         for rows in (10, 11)
     ]
     assert keys[0] != keys[1]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fixed_kv_workspace_records_dynamic_history_without_python(dtype):
+    """One graph must select live rows, ignore padding and scatter clean KV.
+
+    The fixed workspace is the execution primitive used by chunk graphs, not
+    a second cache: its authoritative K/V tensors are the supplied pool store.
+    Replay changes device metadata while keeping every storage address fixed.
+    """
+    from sglang.multimodal_gen.runtime.models.dits import zing_h3_cache
+
+    workspace_type = getattr(zing_h3_cache, "ZingFixedKVWorkspace", None)
+    assert workspace_type is not None, "whole-chunk graphs require fixed KV workspace"
+    torch.manual_seed(37)
+    capacity, current_rows, heads, dim = 16, 3, 2, 8
+    k = torch.randn(capacity, heads, dim).to(dtype)
+    v = torch.randn_like(k)
+    workspace = workspace_type(k, v, current_rows=current_rows)
+    q = torch.randn(current_rows, heads, dim).to(dtype)
+    current_k, current_v = torch.randn_like(q), torch.randn_like(q)
+    identities = tuple(t.data_ptr() for t in workspace.owned_tensors())
+    backend = RecordingGraphBackend()
+    python_calls = []
+
+    def execute():
+        python_calls.append(True)
+        keys, values, mask = workspace.attention_view(current_k, current_v)
+        result = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(0, 1)[None],
+            keys.transpose(0, 1)[None],
+            values.transpose(0, 1)[None],
+            attn_mask=mask[None, None, None],
+            dropout_p=0.0,
+        )[0].transpose(0, 1)
+        workspace.commit(current_k, current_v)
+        return result
+
+    for trial, history in enumerate(([0, 1], [0, 1, 4, 5, 6], [0, 1, 8, 9], [])):
+        # Duplicate sink/history positions, window filling and eviction all
+        # use the same static graph. Unselected rows contain adversarial data.
+        k.copy_(torch.randn_like(k))
+        v.copy_(torch.randn_like(v))
+        q.copy_(torch.randn_like(q))
+        current_k.copy_(torch.randn_like(q))
+        current_v.copy_(torch.randn_like(q))
+        before_k, before_v = k.clone(), v.clone()
+        destinations = [11, 12, 13]
+        workspace.prepare(history, destinations)
+        ref_k = torch.cat((before_k[history], current_k))
+        ref_v = torch.cat((before_v[history], current_v))
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(0, 1)[None],
+            ref_k.transpose(0, 1)[None],
+            ref_v.transpose(0, 1)[None],
+            dropout_p=0.0,
+        )[0].transpose(0, 1)
+        if trial == 0:
+            graph, result = backend.capture(execute)
+        else:
+            backend.replay(graph)
+        torch.testing.assert_close(
+            result,
+            expected,
+            rtol=2e-5 if dtype == torch.float32 else 0.02,
+            atol=2e-6 if dtype == torch.float32 else 0.02,
+        )
+        padded_k = torch.zeros(capacity + current_rows, heads, dim, dtype=dtype)
+        padded_v = torch.zeros_like(padded_k)
+        padded_k[: len(history)] = before_k[history]
+        padded_v[: len(history)] = before_v[history]
+        padded_k[len(history) : len(history) + current_rows] = current_k
+        padded_v[len(history) : len(history) + current_rows] = current_v
+        valid = torch.arange(capacity + current_rows) < len(history) + current_rows
+        fixed_expected = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(0, 1)[None],
+            padded_k.transpose(0, 1)[None],
+            padded_v.transpose(0, 1)[None],
+            attn_mask=valid[None, None, None],
+            dropout_p=0.0,
+        )[0].transpose(0, 1)
+        assert torch.equal(result, fixed_expected)
+        before_k[destinations] = current_k
+        before_v[destinations] = current_v
+        assert torch.equal(k, before_k) and torch.equal(v, before_v)
+        assert tuple(t.data_ptr() for t in workspace.owned_tensors()) == identities
+        assert int(workspace.cu_seqlens_k[-1]) == len(history) + current_rows
+    assert len(python_calls) == 1 and backend.captures == 1
+
+
+def test_fixed_kv_workspace_refuses_invalid_plan_without_writes():
+    from sglang.multimodal_gen.runtime.models.dits import zing_h3_cache
+
+    workspace_type = getattr(zing_h3_cache, "ZingFixedKVWorkspace", None)
+    assert workspace_type is not None, "whole-chunk graphs require fixed KV workspace"
+    k, v = torch.randn(8, 2, 8), torch.randn(8, 2, 8)
+    workspace = workspace_type(k, v, current_rows=2)
+    workspace.prepare([0, 1], [5, 6])
+    before = [t.clone() for t in workspace.owned_tensors()]
+    for history, writes in (([8], [5, 6]), ([0], [5]), ([0], [5, 5]), ([0], [-1, 6])):
+        with pytest.raises(ValueError):
+            workspace.prepare(history, writes)
+        assert all(
+            torch.equal(t, old) for t, old in zip(workspace.owned_tensors(), before)
+        )
+
+
+@torch.no_grad()
+def _run_ready_chunks(
+    model,
+    monkeypatch,
+    *,
+    backend=None,
+    batches=(4, 4, 4, 5),
+    graph_owner=None,
+    storage=None,
+    input_seed=83,
+    initial_steps=None,
+    prompt_updates=None,
+    yield_hook=None,
+    allow_cancel=False,
+):
+    """Exercise the production streaming iterator, including source pauses."""
+    from sglang.multimodal_gen.runtime.models.dits import zing_h3_denoise_graph
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.incremental import (
+        SourceReadySession,
+    )
+    from sglang.multimodal_gen.test.unit.test_zing_h3_chunks import fixture_provenance
+
+    frames = 1 + 2 * (sum(batches) - 1)
+    torch.manual_seed(input_seed)
+    inputs, noise = _inputs(frames), torch.randn(1, 2, frames, 2, 2)
+    packer = ZingH3Packer(model.arch, num_frame_per_block=2)
+    extra = {}
+    sampler_type = ZingH3Sampler
+    if initial_steps is not None:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.realtime_sampling import (
+            ZingH3RealtimeSampler,
+        )
+
+        sampler_type = ZingH3RealtimeSampler
+        extra = dict(initial_denoising_step_list=initial_steps, initial_block_count=3)
+    sampler = sampler_type(
+        model,
+        packer,
+        solver="few_step",
+        denoising_step_list=[1000, 750] if initial_steps is not None else STEPS,
+        window_chunks=3,
+        sink_chunks=1,
+        window_eviction_timing="after_step0",
+        rope_position_mode="block_relative",
+        joint_forward="cross_chunk",
+        **extra,
+    )
+    storage = _storage(model) if storage is None else storage
+    graphs = None
+    if backend is not None or graph_owner is not None:
+        graph_type = getattr(zing_h3_denoise_graph, "ZingChunkGraphs", None)
+        assert graph_type is not None, (
+            "SourceReadySession requires whole-chunk graph execution"
+        )
+        graphs = graph_owner or graph_type(
+            backend=None if backend == "eager" else backend,
+            max_graphs=16,
+            capture_enabled=backend != "eager",
+        )
+        model.chunk_graphs = graphs
+    else:
+        model.chunk_graphs = None
+    session = SourceReadySession(
+        sampler,
+        inputs,
+        seed=97,
+        max_pending_chunks=max(batches),
+        max_pending_bytes=1000000,
+        total_latent_frames=frames,
+        acquire_storage=lambda *_: storage,
+    )
+    outputs, snapshots, rng_states, boundary = [], [], [], []
+    cursor = 0
+    cancelled = False
+    events = []
+    try:
+        for batch_index, count in enumerate(batches):
+            if prompt_updates and batch_index in prompt_updates:
+                size = prompt_updates[batch_index]
+                session.update_prompt(
+                    {
+                        "context": torch.randn(size, 12).bfloat16(),
+                        "row_role": torch.tensor([0, 1, 0] * (size // 3)),
+                    },
+                    100 + batch_index,
+                )
+            for _ in range(count):
+                chunk = packer.chunk_plan.chunk(cursor, frames)
+                session.append(
+                    inputs.source_visual[:, :, chunk.start : chunk.end],
+                    noise[:, :, chunk.start : chunk.end],
+                    provenance=fixture_provenance(1, chunk.end, chunk.start, chunk.end),
+                    final=chunk.end == frames,
+                )
+                cursor += 1
+            drain = session.drain_ready()
+            for result in drain:
+                outputs.append(result.visual.clone())
+                events.append(result.prompt_event_id)
+                cache = session.cache
+                live = cache._length
+                snapshots.append(
+                    (
+                        live,
+                        tuple(
+                            (c.block, c.offset, c.positions.clone())
+                            for c in cache.committed
+                        ),
+                        tuple(
+                            (s.k[:live].clone(), s.v[:live].clone()) for s in storage
+                        ),
+                    )
+                )
+                rng_states.append(
+                    None if session.rng.cpu_rng is None else session.rng.cpu_rng.clone()
+                )
+                # A lookahead prediction is raw: its boundary is still open
+                # and its scheduler0 eviction belongs to the next iteration.
+                boundary.append(
+                    (
+                        cache.eviction_target_block,
+                        None if cache.active is None else cache.active[0],
+                    )
+                )
+                if yield_hook is not None:
+                    yield_hook(session, drain, len(outputs))
+                if session.closed and not session.complete:
+                    cancelled = True
+                    break
+            if cancelled:
+                break
+            assert not session.pending
+        assert (session.complete or (allow_cancel and cancelled)) and session.closed
+        assert all(value == 0 for value in session.memory_snapshot().values())
+    finally:
+        session.dispose()
+    return torch.cat(outputs, 2), snapshots, rng_states, boundary, graphs, events
+
+
+def test_source_ready_whole_chunk_three_routes_replay_and_match_eager(
+    model, monkeypatch
+):
+    original = _run_ready_chunks(model, monkeypatch)
+    expected = _run_ready_chunks(model, monkeypatch, backend="eager")
+    torch.testing.assert_close(expected[0], original[0], rtol=0.02, atol=0.02)
+    for fixed, reference in zip(expected[1], original[1], strict=True):
+        assert fixed[0] == reference[0]
+        for (fk, fv), (rk, rv) in zip(fixed[2], reference[2], strict=True):
+            torch.testing.assert_close(fk, rk, rtol=0.02, atol=0.02)
+            torch.testing.assert_close(fv, rv, rtol=0.02, atol=0.02)
+    backend = RecordingGraphBackend()
+    actual = _run_ready_chunks(model, monkeypatch, backend=backend)
+    assert torch.equal(actual[0], expected[0])
+    assert actual[3] == expected[3]
+    for got, want in zip(actual[1], expected[1], strict=True):
+        assert got[0] == want[0]
+        assert [(c[0], c[1]) for c in got[1]] == [(c[0], c[1]) for c in want[1]]
+        for gc, wc in zip(got[1], want[1], strict=True):
+            assert torch.equal(gc[2], wc[2])
+        for (gk, gv), (wk, wv) in zip(got[2], want[2], strict=True):
+            assert torch.equal(gk, wk) and torch.equal(gv, wv)
+    for got, want in zip(actual[2], expected[2], strict=True):
+        assert (got is None and want is None) or torch.equal(got, want)
+    graphs = actual[4]
+    assert backend.captures > 0
+    for kind in ("steady", "finish", "recovery"):
+        assert graphs.routes[(kind, "replay")] > 0, (kind, graphs.routes)
+    assert len(graphs.graphs) <= 16
+    assert not graphs.routes[("steady", "capture_failed")]
+    assert not graphs.routes[("steady", "unsupported")]
+
+
+@pytest.mark.parametrize("backend", ["eager", "recording"])
+def test_whole_chunk_execution_unpublishes_rotated_k_and_shares_rotations(
+    model, monkeypatch, backend
+):
+    """Executions rewrite the rotated-K scratch, so reuse is never published.
+
+    Within one execution only the first forward that sees a history rotates it.
+    """
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+        ZingChunkGraphs,
+    )
+
+    rotations = []
+    original = ZingChunkGraphs._forward_plan
+
+    def spy(sampler, shadow, packed, phase, after=None):
+        plan = original(sampler, shadow, packed, phase, after=after)
+        rotations.append((phase, plan.kv_plan.rotates_history))
+        return plan
+
+    monkeypatch.setattr(ZingChunkGraphs, "_forward_plan", staticmethod(spy))
+    published = []
+
+    def hook(session, drain, count):
+        published.append(dict(session.cache._rotated_store_signatures))
+
+    _run_ready_chunks(
+        model,
+        monkeypatch,
+        backend="eager" if backend == "eager" else RecordingGraphBackend(),
+        yield_hook=hook,
+    )
+    assert published and not any(published)
+    active = [rotated for phase, rotated in rotations if phase == "active"]
+    # Each steady chunk runs steps - 1 active forwards over one history.
+    assert True in active and False in active
+    assert active.count(True) * (len(STEPS) - 2) <= active.count(False)
+
+
+def test_discarding_rotated_k_covers_failed_and_published_executions():
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+        ZingChunkGraphs,
+    )
+
+    cache = ZingH3KVCache(2, rope_position_mode="block_relative")
+    cache._rotated_store_signatures[0] = ("published",)
+    shadow = cache.planning_copy()
+    shadow._rotated_store_signatures[1] = ("planned",)
+    ZingChunkGraphs._discard_rotated(cache, shadow)
+    assert not cache._rotated_store_signatures
+    cache.publish_plan(shadow)
+    assert not cache._rotated_store_signatures
+
+
+class WarmupRecordingGraphBackend(RecordingGraphBackend):
+    """Match the production backend's eager warmup before operator capture."""
+
+    def __init__(self):
+        super().__init__()
+        self.warmups = 0
+
+    def capture(self, fn, warmed=None):
+        error = None
+        try:
+            fn()
+            self.warmups += 1
+        except Exception as failure:
+            error = failure
+        all_ok = warmed(error is None) if warmed is not None else error is None
+        if error is not None or not all_ok:
+            raise GraphWarmupError("recording warmup failed") from error
+        return super().capture(fn)
+
+
+def test_source_ready_whole_chunk_warmup_capture_do_not_double_apply(
+    model, monkeypatch
+):
+    expected = _run_ready_chunks(model, monkeypatch, backend="eager")
+    backend = WarmupRecordingGraphBackend()
+    actual = _run_ready_chunks(model, monkeypatch, backend=backend)
+    assert backend.warmups == backend.captures and backend.captures > 0
+    assert torch.equal(actual[0], expected[0])
+    assert actual[3] == expected[3]
+    for got, want in zip(actual[2], expected[2], strict=True):
+        assert (got is None and want is None) or torch.equal(got, want)
+    for got, want in zip(actual[1], expected[1], strict=True):
+        assert got[0] == want[0]
+        for (gk, gv), (wk, wv) in zip(got[2], want[2], strict=True):
+            assert torch.equal(gk, wk) and torch.equal(gv, wv)
+
+
+@pytest.mark.parametrize("failed_phase", ["warmup", "capture"])
+def test_chunk_capture_peer_failure_votes_once_and_restores_store(failed_phase):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+        ZingChunkGraphs,
+    )
+
+    class PeerFailure:
+        def __init__(self):
+            self.flags = []
+
+        def agree(self, route):
+            return True
+
+        def all_ok(self, flag):
+            self.flags.append(flag)
+            return failed_phase == "capture" and len(self.flags) == 1
+
+    backend = WarmupRecordingGraphBackend()
+    graphs = ZingChunkGraphs(backend=backend)
+    k, v = torch.zeros(3, 2, 8), torch.zeros(3, 2, 8)
+    plans = [SimpleNamespace(signature=("test",))]
+    tensors = {"delta": torch.tensor(1.0)}
+
+    def execute(static):
+        k.add_(static["delta"])
+        v.add_(static["delta"])
+        return (k.clone(),)
+
+    graphs._run("steady", plans, tensors, execute, [(k, v)])
+    before = k.clone(), v.clone()
+    peer = PeerFailure()
+    graphs.coordinator = peer
+    expected_error = GraphWarmupError if failed_phase == "warmup" else RuntimeError
+    with pytest.raises(expected_error):
+        graphs._run("steady", plans, tensors, execute, [(k, v)])
+    # A rank that receives a failed postcapture vote must leave directly;
+    # voting again would block forever after the failing peer already left.
+    assert peer.flags == ([True] if failed_phase == "warmup" else [True, True])
+    assert torch.equal(k, before[0]) and torch.equal(v, before[1])
+    assert graphs.disabled and not graphs.graphs
+
+
+def test_source_ready_init_replays_prefix_and_isolates_reused_session_slot(
+    model, monkeypatch
+):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+        ZingChunkGraphs,
+    )
+
+    eager_owner = ZingChunkGraphs(capture_enabled=False)
+    backend = WarmupRecordingGraphBackend()
+    graph_owner = ZingChunkGraphs(backend=backend)
+    eager_storage, graph_storage = _storage(model), _storage(model)
+    prefixes = []
+    forward = model.forward
+    for seed in (41, 42, 43, 44):
+        expected = _run_ready_chunks(
+            model,
+            monkeypatch,
+            batches=(3,),
+            graph_owner=eager_owner,
+            storage=eager_storage,
+            input_seed=seed,
+        )
+        called = []
+
+        def observe(*args, **kwargs):
+            if kwargs.get("self_cache_update") == "prefix":
+                called.append(True)
+            return forward(*args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(model, "forward", observe)
+            actual = _run_ready_chunks(
+                model,
+                monkeypatch,
+                batches=(3,),
+                graph_owner=graph_owner,
+                storage=graph_storage,
+                input_seed=seed,
+            )
+        prefixes.append(len(called))
+        assert torch.equal(actual[0], expected[0])
+        assert actual[3] == expected[3]
+        for got, want in zip(actual[2], expected[2], strict=True):
+            assert (got is None and want is None) or torch.equal(got, want)
+        for got, want in zip(actual[1], expected[1], strict=True):
+            assert got[0] == want[0]
+            for (gk, gv), (wk, wv) in zip(got[2], want[2], strict=True):
+                assert torch.equal(gk, wk) and torch.equal(gv, wv)
+    assert graph_owner.routes[("init", "replay")] > 0, graph_owner.routes
+    assert prefixes[-1] == 0, "init replay must include prefix model work"
+    assert len(graph_owner.graphs) <= 16
+
+
+def test_source_ready_graph_eligibility_is_agreed_before_execution(model, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from copy import copy
+    from threading import Barrier
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        sampling,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.incremental import (
+        SourceReadySession,
+    )
+    from sglang.multimodal_gen.test.unit.test_zing_h3_chunks import fixture_provenance
+    from sglang.multimodal_gen.test.unit.test_zing_h3_sp_cpu import _CPUCollectives
+
+    comm = _CPUCollectives(4)
+    comm.barrier = Barrier(4, timeout=3)
+    monkeypatch.setattr(zing_h3, "get_ulysses_ctx", lambda: (4, comm.thread.rank))
+    monkeypatch.setattr(
+        zing_h3, "get_sp_group", lambda: SimpleNamespace(cpu_group=object())
+    )
+
+    def gather_objects(output, value, group=None):
+        output[:] = comm.exchange(value, lambda values, _: list(values))
+
+    monkeypatch.setattr(sampling.dist, "all_gather_object", gather_objects)
+    # Prefix model kernels are outside this routing contract. No model body
+    # may run before the four CPU ranks resolve graph eligibility.
+    monkeypatch.setattr(SourceReadySession, "_apply_prefix", lambda *_: None)
+    inputs, noise = _inputs(3), torch.randn(1, 2, 3, 2, 2)
+    entered = []
+
+    class GraphTrap:
+        def eligible(self, *args):
+            return True
+
+        def recovery(self, *args):
+            entered.append(comm.thread.rank)
+            raise AssertionError("graph executed before unanimous eligibility")
+
+    rank_models = [copy(model) for _ in range(4)]
+    for rank, rank_model in enumerate(rank_models):
+        rank_model.chunk_graphs = None if rank == 3 else GraphTrap()
+
+    def worker(rank):
+        comm.thread.rank = rank
+        rank_model = rank_models[rank]
+        packer = ZingH3Packer(rank_model.arch, num_frame_per_block=2)
+        sampler = ZingH3Sampler(
+            rank_model,
+            packer,
+            solver="few_step",
+            denoising_step_list=STEPS,
+            window_chunks=3,
+            sink_chunks=1,
+            joint_forward="cross_chunk",
+            window_eviction_timing="after_step0",
+        )
+        session = SourceReadySession(
+            sampler,
+            inputs,
+            seed=5,
+            max_pending_chunks=1,
+            max_pending_bytes=1000000,
+            total_latent_frames=3,
+            acquire_storage=lambda *_: _storage(rank_model),
+        )
+        chunk = packer.chunk_plan.chunk(0, 3)
+        session.append(
+            inputs.source_visual[:, :, chunk.start : chunk.end],
+            noise[:, :, chunk.start : chunk.end],
+            provenance=fixture_provenance(1, chunk.end, chunk.start, chunk.end),
+        )
+        try:
+            list(session.drain_ready())
+        except Exception as error:
+            return type(error).__name__, str(error), session.closed
+        finally:
+            session.dispose()
+        return "NO_ERROR", "", False
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(worker, range(4)))
+    assert all(
+        kind == "ValueError" and "mismatch" in message and closed
+        for kind, message, closed in results
+    ), results
+    assert len({message for _, message, _ in results}) == 1
+    assert not entered, entered
+
+
+def test_chunk_local_capture_failure_and_peer_leave_cpu_barrier(model, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+        ZingChunkGraphs,
+    )
+    from sglang.multimodal_gen.test.unit.test_zing_h3_sp_cpu import _CPUCollectives
+
+    comm = _CPUCollectives(2)
+    comm.barrier = Barrier(2, timeout=3)
+
+    class Coordinator:
+        def __init__(self):
+            self.flags = []
+
+        def agree(self, route):
+            return comm.exchange(route, lambda values, _: len(set(values)) == 1)
+
+        def all_ok(self, flag):
+            self.flags.append(flag)
+            return comm.exchange(flag, lambda values, _: all(values))
+
+    class InjectedBackend(WarmupRecordingGraphBackend):
+        def capture(self, fn, warmed=None):
+            result = super().capture(fn, warmed=warmed)
+            if comm.thread.rank == 0:
+                raise RuntimeError("injected local capture failure")
+            return result
+
+    def worker(rank):
+        comm.thread.rank = rank
+        graphs = ZingChunkGraphs(backend=InjectedBackend())
+        coordinator = Coordinator()
+        graphs.coordinator = coordinator
+        k, v = torch.zeros(3, 2, 8), torch.zeros(3, 2, 8)
+        plans, tensors = (
+            [SimpleNamespace(signature=("barrier",))],
+            {"delta": torch.tensor(1.0)},
+        )
+
+        def execute(static):
+            k.add_(static["delta"])
+            v.add_(static["delta"])
+            return (k.clone(),)
+
+        graphs._run("steady", plans, tensors, execute, [(k, v)])
+        before = k.clone(), v.clone()
+        try:
+            graphs._run("steady", plans, tensors, execute, [(k, v)])
+        except Exception as error:
+            return (
+                type(error).__name__,
+                str(error),
+                coordinator.flags,
+                graphs.disabled,
+                torch.equal(k, before[0]) and torch.equal(v, before[1]),
+            )
+        return "NO_ERROR", "", coordinator.flags, graphs.disabled, False
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(worker, rank) for rank in range(2)]
+        results = [future.result(timeout=10) for future in futures]
+    assert all(
+        kind == "RuntimeError" and disabled and restored
+        for kind, _, _, disabled, restored in results
+    ), results
+    assert all(len(flags) == 2 for _, _, flags, _, _ in results), results
+    assert "local capture failure" in results[0][1] and "peer rank" in results[1][1]
+
+
+def test_low_level_kv_cache_defaults_to_after_step0():
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
+
+    assert ZingH3KVCache(1).window_eviction_timing == "after_step0"
+
+
+def test_init_prefix_prepare_failure_agrees_before_next_collective(model, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from copy import copy
+    from threading import Barrier
+
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+        ZingChunkGraphs,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        sampling,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.incremental import (
+        SourceReadySession,
+    )
+    from sglang.multimodal_gen.test.unit.test_zing_h3_chunks import fixture_provenance
+    from sglang.multimodal_gen.test.unit.test_zing_h3_sp_cpu import _CPUCollectives
+
+    comm = _CPUCollectives(2)
+    comm.barrier = Barrier(2, timeout=3)
+    monkeypatch.setattr(zing_h3, "get_ulysses_ctx", lambda: (2, comm.thread.rank))
+    monkeypatch.setattr(
+        zing_h3,
+        "get_sp_group",
+        lambda: SimpleNamespace(cpu_group=object(), ring_world_size=1),
+    )
+
+    def gather_objects(output, value, group=None):
+        output[:] = comm.exchange(value, lambda values, _: list(values))
+
+    monkeypatch.setattr(sampling.dist, "all_gather_object", gather_objects)
+    original = ZingH3DiTModel.prepare_fixed_forward
+
+    def fail_prefix(self, **kwargs):
+        if comm.thread.rank == 0 and kwargs["phase"] == "prefix":
+            raise RuntimeError("injected prefix plan failure")
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(ZingH3DiTModel, "prepare_fixed_forward", fail_prefix)
+
+    class Coordinator:
+        def all_ok(self, flag):
+            return comm.exchange(flag, lambda values, _: all(values))
+
+    inputs, noise = _inputs(5), torch.randn(1, 2, 5, 2, 2)
+    rank_models = [copy(model), copy(model)]
+    # This fault injection exercises admitted SP graphs, independent of env defaults.
+    for rank_model in rank_models:
+        rank_model.denoise_graph_sp = True
+    monkeypatch.setattr(zing_h3, "get_tp_world_size", lambda: 1)
+
+    @torch.no_grad()
+    def worker(rank):
+        comm.thread.rank = rank
+        backend = RecordingGraphBackend()
+        graphs = ZingChunkGraphs(backend=backend)
+        graphs.coordinator = Coordinator()
+        rank_models[rank].chunk_graphs = graphs
+        packer = ZingH3Packer(model.arch, num_frame_per_block=2)
+        sampler = ZingH3Sampler(
+            rank_models[rank],
+            packer,
+            solver="few_step",
+            denoising_step_list=STEPS,
+            window_chunks=3,
+            sink_chunks=1,
+            joint_forward="cross_chunk",
+            window_eviction_timing="after_step0",
+        )
+        storage = _storage(model)
+        for store in storage:
+            store.k.fill_(2)
+            store.v.fill_(3)
+        before = [(s.k.clone(), s.v.clone()) for s in storage]
+        session = SourceReadySession(
+            sampler,
+            inputs,
+            seed=5,
+            max_pending_chunks=1,
+            max_pending_bytes=1000000,
+            total_latent_frames=5,
+            acquire_storage=lambda *_: storage,
+        )
+        chunk = packer.chunk_plan.chunk(0, 5)
+        session.append(
+            inputs.source_visual[:, :, chunk.start : chunk.end],
+            noise[:, :, chunk.start : chunk.end],
+            provenance=fixture_provenance(1, chunk.end, chunk.start, chunk.end),
+        )
+        try:
+            current, _ = session._prepare(session.pending[0], session.prompt, None)
+            graphs.initialization(sampler, current)
+        except Exception as error:
+            session.dispose()
+            restored = all(
+                torch.equal(s.k, k) and torch.equal(s.v, v)
+                for s, (k, v) in zip(storage, before)
+            )
+            return (
+                type(error).__name__,
+                str(error),
+                session.closed,
+                restored,
+                backend.captures,
+            )
+        finally:
+            session.dispose()
+        return "NO_ERROR", "", False, False, backend.captures
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(worker, rank) for rank in range(2)]
+        results = [future.result(timeout=10) for future in futures]
+    assert results[0][:2] == ("RuntimeError", "injected prefix plan failure"), results
+    assert results[1][0] == "ValueError" and "peer rank" in results[1][1], results
+    assert all(
+        closed and restored and captures == 0
+        for _, _, closed, restored, captures in results
+    ), results
+
+
+def test_chunk_session_rejects_live_weight_mutation(model, monkeypatch):
+    observed = []
+
+    def mutate(session, drain, count):
+        if count == 1:
+            observed.append((session, torch.get_rng_state().clone()))
+            with torch.no_grad():
+                model.blocks[0].mlp.fc2.weight.add_(0.25)
+
+    with pytest.raises(ValueError, match="model changed"):
+        _run_ready_chunks(
+            model, monkeypatch, backend=WarmupRecordingGraphBackend(), yield_hook=mutate
+        )
+    session, caller_rng = observed[0]
+    assert session.closed and not session.pending
+    assert all(value == 0 for value in session.memory_snapshot().values())
+    assert torch.equal(torch.get_rng_state(), caller_rng)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [{"initial_steps": [1000, 750, 500, 250]}, {"prompt_updates": {1: 6, 2: 3, 3: 9}}],
+)
+def test_chunk_replay_schedule_and_prompt_transitions(model, monkeypatch, options):
+    original = _run_ready_chunks(model, monkeypatch, **options)
+    expected = _run_ready_chunks(model, monkeypatch, backend="eager", **options)
+    torch.testing.assert_close(expected[0], original[0], rtol=0.02, atol=0.02)
+    actual = _run_ready_chunks(
+        model, monkeypatch, backend=WarmupRecordingGraphBackend(), **options
+    )
+    assert torch.equal(actual[0], expected[0])
+    assert actual[3] == expected[3] and actual[5] == expected[5]
+    for got, want in zip(actual[2], expected[2], strict=True):
+        assert (got is None and want is None) or torch.equal(got, want)
+    for got, want in zip(actual[1], expected[1], strict=True):
+        assert got[0] == want[0]
+        for (gk, gv), (wk, wv) in zip(got[2], want[2], strict=True):
+            assert torch.equal(gk, wk) and torch.equal(gv, wv)
+    assert len(actual[4].graphs) <= 16
+    assert actual[4].routes[("steady", "replay")] > 0
+    if "prompt_updates" in options:
+        assert set(actual[5]) == {None, 101, 102, 103}
+
+
+def test_chunk_cancellation_releases_state_and_next_session_reuses_slot(
+    model, monkeypatch
+):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+        ZingChunkGraphs,
+    )
+
+    eager = ZingChunkGraphs(capture_enabled=False)
+    recorded = ZingChunkGraphs(backend=WarmupRecordingGraphBackend())
+    eager_store, recorded_store = _storage(model), _storage(model)
+    closed = []
+
+    def cancel(session, drain, count):
+        if count == 2:
+            drain.close()
+            closed.append(session)
+
+    expected = _run_ready_chunks(
+        model,
+        monkeypatch,
+        graph_owner=eager,
+        storage=eager_store,
+        yield_hook=cancel,
+        allow_cancel=True,
+    )
+    actual = _run_ready_chunks(
+        model,
+        monkeypatch,
+        graph_owner=recorded,
+        storage=recorded_store,
+        yield_hook=cancel,
+        allow_cancel=True,
+    )
+    assert torch.equal(actual[0], expected[0])
+    assert actual[3] == expected[3]
+    assert all(
+        s.closed
+        and not s.complete
+        and not s.pending
+        and all(v == 0 for v in s.memory_snapshot().values())
+        for s in closed
+    )
+    expected = _run_ready_chunks(
+        model, monkeypatch, graph_owner=eager, storage=eager_store, input_seed=104
+    )
+    actual = _run_ready_chunks(
+        model, monkeypatch, graph_owner=recorded, storage=recorded_store, input_seed=104
+    )
+    assert torch.equal(actual[0], expected[0])
+    for got, want in zip(actual[1], expected[1], strict=True):
+        for (gk, gv), (wk, wv) in zip(got[2], want[2], strict=True):
+            assert torch.equal(gk, wk) and torch.equal(gv, wv)
+    assert len(recorded.graphs) <= 16
+
+
+def test_whole_chunk_forward_hooks_keep_streaming_eager(model, monkeypatch):
+    calls = []
+
+    def change_output(module, args, output):
+        calls.append(None)
+        return output + 0.125
+
+    handle = model.blocks[0].mlp.register_forward_hook(change_output)
+    try:
+        expected = _run_ready_chunks(model, monkeypatch)
+        expected_calls = len(calls)
+        calls.clear()
+        backend = RecordingGraphBackend()
+        actual = _run_ready_chunks(model, monkeypatch, backend=backend)
+        assert backend.captures == 0, actual[4].routes
+        assert not actual[4].graphs
+        assert not any(route == "replay" for _, route in actual[4].routes)
+        assert len(calls) == expected_calls > 0
+        assert torch.equal(actual[0], expected[0])
+        assert actual[3] == expected[3]
+        for got, want in zip(actual[1], expected[1], strict=True):
+            assert got[0] == want[0]
+            for (gk, gv), (wk, wv) in zip(got[2], want[2], strict=True):
+                assert torch.equal(gk, wk) and torch.equal(gv, wv)
+    finally:
+        handle.remove()
+
+
+@pytest.mark.parametrize("world", [2, 4])
+@pytest.mark.parametrize("enabled,ring,tp", [(False, 1, 1), (True, 2, 1), (True, 1, 2)])
+def test_whole_chunk_respects_sp_graph_topology(
+    model, monkeypatch, world, enabled, ring, tp
+):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+        ZingChunkGraphs,
+    )
+
+    model.denoise_graph_sp = enabled
+    monkeypatch.setattr(zing_h3, "get_ulysses_ctx", lambda: (world, 0))
+    monkeypatch.setattr(
+        zing_h3,
+        "get_sp_group",
+        lambda: SimpleNamespace(cpu_group=object(), ring_world_size=ring),
+    )
+    monkeypatch.setattr(zing_h3, "get_tp_world_size", lambda: tp)
+    sampler = SimpleNamespace(
+        generator=model,
+        window_eviction_timing="after_step0",
+        joint_forward="cross_chunk",
+        solver="few_step",
+        do_cfg=False,
+        window_policy=SimpleNamespace(window_chunks=3),
+    )
+    cache = SimpleNamespace(pooled=True, raw_store=True)
+    current = SimpleNamespace(audio=None, visual=torch.zeros(1))
+    backend = RecordingGraphBackend()
+    graphs = ZingChunkGraphs(backend=backend)
+    for _ in range(4):
+        assert not graphs.eligible(sampler, cache, current)
+    assert backend.captures == 0 and not graphs.graphs and not graphs.routes
+
+
+@pytest.mark.parametrize("world", [2, 4])
+def test_whole_chunk_sp_opt_out_streaming_never_captures(model, monkeypatch, world):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from sglang.multimodal_gen.runtime.layers import usp
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        sampling,
+    )
+    from sglang.multimodal_gen.test.unit.test_zing_h3_sp_cpu import _CPUCollectives
+
+    arch = replace(
+        model.arch,
+        num_attention_heads=4,
+        hidden_size=32,
+        adaln_out_features=6 * model.arch.num_modalities * 32,
+        final_adaln_out_features=64,
+    )
+    rank_models = [
+        ZingH3DiTModel(ZingH3DiTConfig(arch_config=arch), {}).eval()
+        for _ in range(world)
+    ]
+    for rank_model in rank_models:
+        rank_model.denoise_graph_sp = False
+        with torch.no_grad():
+            for name, value in rank_model.named_parameters():
+                value.copy_(
+                    torch.ones_like(value)
+                    if "norm" in name and name.endswith("weight")
+                    else torch.randn_like(value) * 0.08
+                )
+            rank_model.rope.inv_freq.fill_(1)
+    comm = _CPUCollectives(world)
+    monkeypatch.setattr(zing_h3, "get_ulysses_ctx", lambda: (world, comm.thread.rank))
+    monkeypatch.setattr(
+        zing_h3,
+        "get_sp_group",
+        lambda: SimpleNamespace(ulysses_group=None, cpu_group=comm, ring_world_size=1),
+    )
+    monkeypatch.setattr(zing_h3, "get_tp_world_size", lambda: 1)
+    monkeypatch.setattr(zing_h3, "gather_sequence_varlen", comm.gather)
+    monkeypatch.setattr(usp, "get_ulysses_parallel_world_size", lambda: world)
+    monkeypatch.setattr(usp, "get_ulysses_parallel_rank", lambda: comm.thread.rank)
+    monkeypatch.setattr(usp, "_ipc_ready_group", lambda: None)
+    monkeypatch.setattr(usp, "_usp_all_to_all_single_varlen", comm.all_to_all)
+    monkeypatch.setattr(sampling.dist, "all_gather_object", comm.gather_objects)
+
+    def all_reduce(value, op, group=None):
+        reduced = comm.exchange(
+            value.clone(),
+            lambda values, _: (
+                torch.stack(values).amin(0)
+                if op == sampling.dist.ReduceOp.MIN
+                else torch.stack(values).amax(0)
+            ),
+        )
+        value.copy_(reduced)
+
+    monkeypatch.setattr(sampling.dist, "all_reduce", all_reduce)
+
+    @torch.no_grad()
+    def worker(rank):
+        comm.thread.rank = rank
+        backend = WarmupRecordingGraphBackend()
+        storage = allocate_layer_stores(
+            256,
+            num_layers=len(model.blocks),
+            local_heads=arch.num_attention_heads // world,
+            head_dim=arch.attention_head_dim,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+        )
+        actual = _run_ready_chunks(
+            rank_models[rank],
+            monkeypatch,
+            backend=backend,
+            storage=storage,
+            batches=(4, 4, 4, 5),
+        )
+        assert torch.isfinite(actual[0]).all()
+        assert backend.captures == 0, actual[4].routes
+        assert not actual[4].graphs
+        assert not any(route == "replay" for _, route in actual[4].routes)
+        assert actual[0].shape[2] == 33
+
+    with ThreadPoolExecutor(max_workers=world) as executor:
+        futures = [executor.submit(worker, rank) for rank in range(world)]
+        for future in futures:
+            future.result(timeout=60)

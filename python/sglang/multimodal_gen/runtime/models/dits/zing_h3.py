@@ -156,6 +156,9 @@ class _BlockOptions(msgspec.Struct, frozen=True, kw_only=True):
     projection_key: object
     joint_ends: tuple | None = None
     branch_projection_keys: object = None
+    fixed_kv: object = None
+    fixed_tensors: object = None
+    full_rope: object = None
 
 
 class _BodyInputs(msgspec.Struct, frozen=True, kw_only=True):
@@ -424,6 +427,36 @@ def _fa4_cu_seqlens(q_rows, k_rows, q_device, k_device):
     )
 
 
+@torch.library.custom_op(
+    "sglang::zing_cpu_varlen_attention", mutates_args=(), device_types="cpu"
+)
+def _cpu_varlen_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """CPU reference for FA4's device-length contract and fixed output shape.
+
+    The recording backend replays this as one operation, reading the current
+    length on every invocation, just as a CUDA varlen kernel does internally.
+    Masked padding in CPU SDPA changes its reduction/rounding path.
+    """
+    length = int(cu_seqlens_k[-1])
+    return F.scaled_dot_product_attention(
+        q.transpose(0, 1)[None],
+        k[:length].transpose(0, 1)[None],
+        v[:length].transpose(0, 1)[None],
+        scale=scale,
+    )[0].transpose(0, 1)
+
+
+@_cpu_varlen_attention.register_fake
+def _cpu_varlen_attention_fake(q, k, v, cu_seqlens_k, scale):
+    return torch.empty_like(q)
+
+
 def _fa4_attention(q, k, v, scale, metadata=None):
     """Native FA4 route for one unmasked document."""
     if not q.is_cuda:
@@ -689,6 +722,28 @@ def _attention(
                 .reshape(hidden.shape[0], -1)
             )
     return module.out_proj(result)[0], raw
+
+
+@dataclass
+class FixedForwardPlan:
+    """Host-frozen routes and replaceable device inputs for a complete DiT call."""
+
+    tensors: dict
+    signature: tuple
+    kv_plan: object
+    _execute: object
+
+    @torch.no_grad()
+    def execute(self, tensors=None):
+        return self._execute(self.tensors if tensors is None else tensors)
+
+
+class _FixedFA4Metadata:
+    def __init__(self, tensors, branch):
+        self.tensors, self.branch = tensors, branch
+
+    def lengths(self, q, k, v):
+        return self.tensors[f"cu_q.{self.branch}"], self.tensors[f"cu_k.{self.branch}"]
 
 
 class ZingH3DiTModel(MiniMaxH3DiTModel):
@@ -1493,6 +1548,244 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             if metadata is not None:
                 metadata.clear()
 
+    @torch.no_grad()
+    def prepare_fixed_forward(self, *, packed, kv_plan, phase):
+        """Validate/pack on the host; execution contains only device arithmetic.
+
+        The cache owner prepares effective RoPE coordinates and each branch's
+        validity/length buffers before replay. History length is never a route.
+        """
+        if phase not in {"active", "source", "final", "prefix", "joint"}:
+            raise ValueError("Unsupported fixed Zing transaction phase")
+        device = packed["x"].device
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3._sampling_helpers import (
+            _host_metadata,
+        )
+
+        guarded = _host_metadata(packed) if "_zing_host_guard" in packed else None
+        host = None if guarded is None else guarded["host_layout"]
+        host_t = None if guarded is None else guarded["host_t"]
+        if host is None:
+            host = ZingHostLayout(
+                **{
+                    name: packed[name].detach().cpu()
+                    for name in (
+                        "seq_lens",
+                        "clean_seq_lens",
+                        "block_idx",
+                        "position_ids",
+                        "row_role",
+                    )
+                }
+            )
+            host_t = packed["t"].detach().cpu()
+        if host_t is None:
+            raise ValueError("Fixed Zing forward requires host timestep metadata")
+        rows, clean, patch, _, _, _ = self._validate_packed_inputs(
+            packed["x"],
+            host_t,
+            packed["context"],
+            host.seq_lens,
+            host.clean_seq_lens,
+            host.block_idx,
+            host.position_ids,
+            host.row_role,
+            packed["audio_x"],
+            metadata_device=torch.device("cpu"),
+        )
+        if rows != kv_plan.rows or clean != kv_plan.clean_rows:
+            raise ValueError("Fixed Zing KV plan does not match clean/current rows")
+        ends = tuple(kv_plan.ends)
+        if (
+            not ends
+            or ends[-1] != rows
+            or any(a >= b for a, b in zip((0, *ends[:-1]), ends))
+        ):
+            raise ValueError("Fixed Zing branch boundaries do not cover packed rows")
+        joint = phase == "joint"
+        if joint != (len(ends) > 1):
+            raise ValueError("Fixed Zing joint phase does not match branch boundaries")
+        if joint and packed["audio_x"].shape[0]:
+            raise ValueError("Fixed Zing joint forward does not support audio")
+        if phase == "active" and clean != 0:
+            raise ValueError("Fixed Zing active rows cannot enter persistent KV")
+        if phase not in {"active", "joint"} and clean != rows:
+            raise ValueError("Fixed Zing clean phase requires every row to be clean")
+        if phase not in {"active", "joint"}:
+            expected_t = torch.ones_like(host_t)
+            if phase == "prefix":
+                expected_t[(host.row_role == 0) | (host.row_role == 1)] = (
+                    self.arch.ar_condition_timestep
+                )
+                expected_t[host.row_role == 4] = self.arch.reference_visual_timestep
+            if not torch.equal(host_t, expected_t):
+                raise ValueError(
+                    "Only clean t=1 states or checkpoint-defined prefix timesteps may enter the Zing KV cache"
+                )
+        size, rank = get_ulysses_ctx()
+        if size not in {1, 2, 4}:
+            raise ValueError(
+                "Fixed Zing forward supports sequence parallel sizes 1, 2, 4"
+            )
+        # Preserve the eager stable-prefix GEMM/attention shapes. Prefix length
+        # is already fixed by the request; only its stored head shard is local.
+        replicated_prefix = (
+            self.experimental_stable_shapes and phase == "prefix" and size > 1
+        )
+        layout = self._row_layout(
+            host.row_role, host, rows, size, rank, replicated_prefix, device
+        )
+        unique_t, t_indices = torch.unique(host_t, sorted=True, return_inverse=True)
+        tensors = {
+            name: host_to_device(packed[name], device)
+            for name in ("x", "audio_x", "context", "seq_lens")
+        }
+        tensors["unique_t"] = host_to_device(unique_t, device)
+        tensors["indices"] = host_to_device(
+            (t_indices * self.arch.num_modalities + layout.modality)[
+                layout.row_start : layout.row_stop
+            ],
+            device,
+        )
+        tensors["local_t_indices"] = host_to_device(
+            t_indices[layout.row_start : layout.row_stop], device
+        )
+        for name in _GRAPH_LAYOUT_INPUTS:
+            tensors["layout." + name] = getattr(layout, name)
+        tensors.update({"kv." + name: value for name, value in kv_plan.tensors.items()})
+        # Initialize the embedder's immutable frequency buffer outside capture.
+        self.time_embedder(tensors["unique_t"].float())
+        table_key = None
+        if self.adaln_table is not None:
+            if packed["audio_x"].shape[0]:
+                raise ValueError("Zing weights-free AdaLN supports video requests only")
+            table_key = self.adaln_table.lookup(unique_t)
+            adaln = F.silu(self.time_embedder(tensors["unique_t"].float())).bfloat16()
+            for slot, module in [
+                *((i, b.adaln_proj) for i, b in enumerate(self.blocks)),
+                ("final", self.final_layer.adaln_proj),
+            ]:
+                values = self.adaln_table.project(slot, module, adaln, table_key)
+                for i, value in enumerate(values):
+                    tensors[f"projection.{slot}.{i}"] = value
+        options = _BlockOptions(
+            capture=False,
+            use_cache=False,
+            raw_attention=False,
+            replicated_prefix=replicated_prefix,
+            staged_prefix=False,
+            ulysses_rank=rank,
+            prefix_heads=self.arch.num_attention_heads // size,
+            history_plan=None,
+            rotate_batch=None,
+            projection_cache=None,
+            projection_key=None,
+            joint_ends=ends if joint else None,
+            fixed_kv=kv_plan,
+        )
+
+        def execute(static):
+            kv_tensors = {name: static["kv." + name] for name in kv_plan.tensors}
+            device_layout = dataclasses.replace(
+                layout,
+                **{name: static["layout." + name] for name in _GRAPH_LAYOUT_INPUTS},
+            )
+            # Both current Q and raw pooled K are rotated from effective device
+            # coordinates inside the graph, including after window movement.
+            rope = _rope_cos_sin_cache(
+                self.rope(kv_tensors["current_positions"][None]), dtype=torch.bfloat16
+            )
+            full_rope = (
+                _rope_cos_sin_cache(
+                    self.rope(kv_tensors["positions"][None]), dtype=torch.bfloat16
+                )
+                if kv_plan.rotates_history
+                else None
+            )
+            times = static["unique_t"]
+            adaln = (
+                torch.cat(
+                    [
+                        F.silu(self.time_embedder(t.float())).bfloat16()
+                        for t in times.split(1)
+                    ]
+                )
+                if joint
+                else F.silu(self.time_embedder(times.float())).bfloat16()
+            )
+            inputs = _BodyInputs(
+                x=static["x"],
+                audio_x=static["audio_x"],
+                context=static["context"],
+                layout=device_layout,
+                adaln_input=adaln,
+                indices=static["indices"],
+                local_t_indices=static["local_t_indices"],
+                rope=rope,
+                seq_lens=static["seq_lens"],
+                rows=rows,
+            )
+            fixed_options = msgspec.structs.replace(
+                options, fixed_tensors=kv_tensors, full_rope=full_rope
+            )
+            projections = None
+            if table_key is not None:
+                projections = [
+                    tuple(
+                        static[f"projection.{slot}.{i}"]
+                        for i in range(2 if slot == "final" else 6)
+                    )
+                    for slot in (*range(len(self.blocks)), "final")
+                ]
+            video, audio, _ = self._forward_body(
+                inputs,
+                options=fixed_options,
+                cache=None,
+                mask=None,
+                p=patch,
+                projections=projections,
+                fa4_metadata=_DeviceFA4Metadata(),
+            )
+            return video, audio
+
+        signature = (
+            self._cache_weight_generation,
+            tuple(
+                (
+                    id(value),
+                    value.data_ptr(),
+                    None if torch.is_inference(value) else value._version,
+                    _tensor_layout(value),
+                )
+                for value in (*self.parameters(), *self.buffers())
+            ),
+            _numerics_mode(),
+            tuple((name, os.environ.get(name)) for name in _GRAPH_ROUTE_ENVS),
+            phase,
+            ends,
+            clean,
+            kv_plan.capacity,
+            size,
+            rank,
+            self.experimental_attention_backend,
+            self.experimental_stable_shapes,
+            self.experimental_compiled_adaln,
+            table_key is not None,
+            tuple(
+                (name, tuple(value.shape), value.dtype, value.device)
+                for name, value in sorted(tensors.items())
+            ),
+            kv_plan.rotates_history,
+            tuple(
+                (value.data_ptr(), _tensor_layout(value))
+                for value in (
+                    *(value for pair in kv_plan.stores for value in pair),
+                    *kv_plan.rotated,
+                )
+            ),
+        )
+        return FixedForwardPlan(tensors, signature, kv_plan, execute)
+
     def _bind_cache(self, cache, history_positions):
         # The timestep constant is initialized lazily by the first forward,
         # often under inference_mode. Preserve its values while making its
@@ -1597,6 +1890,8 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
     ):
         """One block's self-attention; returns the output and its raw capture."""
         rope = inputs.rope
+        if options.fixed_kv is not None:
+            return self._fixed_block_attention(current, normed, index, inputs, options)
 
         def make_history_rope(positions):
             return _rope_cos_sin_cache(
@@ -1657,6 +1952,101 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             ),
             fa4_metadata=fa4_metadata,
             joint_ends=options.joint_ends,
+        )
+
+    def _fixed_block_attention(self, current, hidden, index, inputs, options):
+        if options.replicated_prefix:
+            start = options.ulysses_rank * options.prefix_heads
+            stop = start + options.prefix_heads
+
+            def persist_prefix(k, v):
+                options.fixed_kv.persist(
+                    index,
+                    k[:, start:stop],
+                    v[:, start:stop],
+                    tensors=options.fixed_tensors,
+                )
+
+            return _attention(
+                current.attn,
+                hidden,
+                inputs.rope,
+                capture=True,
+                attention_backend=self.experimental_attention_backend,
+                stage_prefix_kv=persist_prefix,
+                fa4_metadata=_DeviceFA4Metadata(),
+            )
+        module = current.attn
+        qkv = module.qkv_proj(hidden)[0]
+        q, k, v = (
+            value.reshape(-1, module.num_heads, module.head_dim)
+            for value in qkv.chunk(3, -1)
+        )
+        q, k = _qk_norm(module, q, k)
+        splits = inputs.layout.sequence_splits
+        if splits is not None:
+            exchanged = _usp_input_all_to_all_varlen_qkv(
+                q[None].contiguous(), k[None].contiguous(), v[None].contiguous(), splits
+            )
+            q, k, v = (value[0] for value in exchanged.chunk(3, dim=-1))
+        raw_k, raw_v = k, v
+        q = _apply_rope(q, inputs.rope)
+        fixed = options.fixed_kv
+        if fixed.rotates_history:
+            # One rotation of the whole fixed-shape raw K serves every forward
+            # sharing this history; rows past the live length are never read.
+            apply_history_rope_into(
+                fixed.stores[index][0], options.full_rope, fixed.rotated[index]
+            )
+        fixed.write_current(
+            index,
+            _apply_rope(raw_k, inputs.rope),
+            raw_k,
+            raw_v,
+            tensors=options.fixed_tensors,
+        )
+        keys, values = fixed.rotated[index], fixed.stores[index][1]
+        results, start = [], 0
+        for branch, stop in enumerate(options.fixed_kv.ends):
+            query = q[start:stop]
+            if self.experimental_attention_backend == "fa4":
+                result = _fa4_attention(
+                    query,
+                    keys,
+                    values,
+                    module.softmax_scale,
+                    metadata=_FixedFA4Metadata(options.fixed_tensors, branch),
+                )
+            elif query.device.type == "cpu":
+                result = _cpu_varlen_attention(
+                    query,
+                    keys,
+                    values,
+                    options.fixed_tensors[f"cu_k.{branch}"],
+                    module.softmax_scale,
+                )
+            else:
+                valid = (
+                    torch.arange(keys.shape[0], device=keys.device)
+                    < options.fixed_tensors[f"cu_k.{branch}"][1]
+                )
+                result = F.scaled_dot_product_attention(
+                    query.transpose(0, 1)[None],
+                    keys.transpose(0, 1)[None],
+                    values.transpose(0, 1)[None],
+                    attn_mask=valid[None, None, None],
+                    scale=module.softmax_scale,
+                )[0].transpose(0, 1)
+            results.append(result)
+            start = stop
+        result = torch.cat(results)
+        if splits is not None:
+            result = _usp_output_all_to_all_varlen(result[None], splits, head_dim=2)[0]
+        return (
+            module.out_proj(
+                result.reshape(hidden.shape[0], module.num_heads * module.head_dim)
+            )[0],
+            None,
         )
 
     def _block_forward(
@@ -1761,6 +2151,8 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         self, inputs, *, options, cache, host_layout, ulysses_size, mask
     ):
         """Why this denoise forward cannot use a graph, or None."""
+        if cache.window_eviction_timing == "after_step0":
+            return "window_eviction_timing"
         if self.denoise_graphs.disabled:
             return "graphs_disabled"
         if not self.denoise_graphs.backend.supports(inputs.x.device):

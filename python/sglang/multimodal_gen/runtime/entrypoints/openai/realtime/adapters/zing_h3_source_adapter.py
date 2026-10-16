@@ -81,6 +81,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             "zing_sink_chunks",
             "zing_rope_position_mode",
             "zing_rope_max_frame_gap",
+            "zing_window_eviction_timing",
             "zing_solver",
             "zing_denoising_step_list",
             "realtime_causal_sink_size",
@@ -132,6 +133,11 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             and len(profile["denoising_step_list"]) == 4
             and profile.get("noise_version") == "indexed-cpu-v1",
             "The deployed model is not configured for four-step streaming.",
+        )
+        require(
+            profile.get("window_eviction_timing", "after_step0")
+            in ("before_source", "after_step0"),
+            "The deployed streaming eviction settings are invalid.",
         )
         joint_mode = profile.get("joint_forward", "cross_chunk")
         wait_ms = profile.get("joint_wait_ms", "auto")
@@ -664,6 +670,9 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             ]
         )
         params.zing_joint_forward = self.profile.get("joint_forward", "cross_chunk")
+        params.zing_window_eviction_timing = self.profile.get(
+            "window_eviction_timing", "after_step0"
+        )
         params.zing_solver = self.profile["solver"]
         params.zing_denoising_step_list = self.profile["denoising_step_list"]
         params.zing_realtime_decode_mode = "stable"

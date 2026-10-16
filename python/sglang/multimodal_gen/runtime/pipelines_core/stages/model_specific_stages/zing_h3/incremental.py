@@ -93,6 +93,7 @@ class SourceReadySession:
             raise ValueError("Ready queue budgets must be positive integers")
         # Validate finite geometry without allocating a complete session layout.
         sampler.processor.chunk_plan.chunk(0, total_latent_frames)
+        sampler._agree_sp_policy()
         if prompt_switch_prefix_latent_frames is not None:
             if (
                 type(prompt_switch_prefix_latent_frames) is not int
@@ -103,6 +104,20 @@ class SourceReadySession:
                 )
             sampler.processor.prompt_switch_prefix_chunks()
         self.sampler = sampler
+        # Reuse the deployment's graph owner; explicit test/eager overrides are
+        # respected, and the existing graph environment switch controls startup.
+        model = sampler.generator
+        if not hasattr(model, "chunk_graphs"):
+            from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+                ZingChunkGraphs,
+            )
+
+            denoise_graphs = getattr(model, "denoise_graphs", None)
+            model.chunk_graphs = (
+                ZingChunkGraphs(max_graphs=denoise_graphs.max_graphs)
+                if denoise_graphs is not None
+                else None
+            )
         self.plan = sampler.processor.chunk_plan
         self.inputs = copy(inputs)
         self.inputs.source_visual = self.inputs.positive = None
@@ -168,6 +183,7 @@ class SourceReadySession:
         return ZingH3KVCache(
             len(sampler.generator.blocks),
             window_policy=sampler.window_policy,
+            window_eviction_timing=sampler.window_eviction_timing,
             rope_position_mode=sampler.rope_position_mode,
             rope_max_frame_gap=sampler.rope_max_frame_gap,
             storage=storage,
@@ -382,50 +398,105 @@ class SourceReadySession:
             and self.committed_chunk_id == self.next_chunk_id
         )
 
+    def _agree_ready_route(self, entry, *, first_prediction=False):
+        # An empty valid caller must participate before its peers prepare or
+        # enter a model. Use the committed cursor, never an optional queue head.
+        self.sampler._agree_sp_boundary(
+            self.cache,
+            2 * (self.committed_chunk_id + 1),
+            phase="source_ready_route",
+            ready_route=(
+                entry,
+                bool(self.pending),
+                len(self.pending) > 1,
+                first_prediction,
+                self.ended,
+                self.total_latent_frames,
+            ),
+        )
+
     @torch.no_grad()
     def step(self):
         if self.closed or self.draining:
             raise ValueError("The source-ready session is closed or draining")
-        if not self.pending:
-            return None  # Wait for source. Never repeat frames or advance RNG.
         try:
+            self._agree_ready_route("step")
+            if not self.pending:
+                return None  # Wait for source. Never repeat frames or advance RNG.
             return self._step()
         except BaseException:
             self.dispose()
             raise
 
-    def _prepare(self, ready, prompt, media_origin):
+    def _prepare(self, ready, prompt, media_origin, previous=None):
         sampler, packer = self.sampler, self.sampler.processor
-        if packer.chunk_plan != self.plan:
-            raise ValueError("The checkpoint chunk plan changed within the session")
-        if (
-            ready.noise.is_cuda
-            and self.rng.cpu_rng is not None
-            and self.rng.cuda_rng is None
-        ):
-            raise ValueError("Frozen CUDA sampling requires the initial CUDA RNG state")
         sampler.device = ready.noise.device
+        model_chunk = ready.model_chunk
+        positive = negative = visual = audio = None
+        prepare_error = None
+        try:
+            if packer.chunk_plan != self.plan:
+                raise ValueError("The checkpoint chunk plan changed within the session")
+            if (
+                ready.noise.is_cuda
+                and self.rng.cpu_rng is not None
+                and self.rng.cuda_rng is None
+            ):
+                raise ValueError(
+                    "Frozen CUDA sampling requires the initial CUDA RNG state"
+                )
+            inputs = copy(self.inputs)
+            inputs.positive, inputs.source_visual = prompt.condition, ready.source
+            visual = ready.noise.float().clone()
+            audio = None if ready.audio is None else ready.audio.float().clone()
+            kwargs = dict(
+                chunk=model_chunk,
+                audio_start=ready.audio_start,
+                media_origin=media_origin,
+            )
+            positive = packer.pack_chunk(
+                inputs, prompt.condition, visual, audio, **kwargs
+            )
+            negative = (
+                packer.pack_chunk(inputs, None, visual, audio, **kwargs)
+                if sampler.do_cfg
+                else None
+            )
+        except BaseException as error:
+            # Validate and pack only a candidate; no prefix/model or slot has
+            # been touched. Peers must still join its prepare-status vote.
+            prepare_error = error
+        if sampler._delayed_policy_requires_agreement:
+            previous_layout = (
+                None
+                if previous is None
+                else sampler._collective_layout_signature(
+                    previous.positive, *previous.spans[0][:2]
+                )
+            )
+            sampler._agree_sp_boundary(
+                self.cache,
+                model_chunk.target_block,
+                phase="source_ready_prepare",
+                needs_prefix_update=prompt is not self.applied_prompt,
+                precheck_error=prepare_error is not None,
+                local_error=prepare_error,
+                layout_signature=(
+                    "source_ready_prepare",
+                    ready.model_chunk.chunk_id,
+                    ready.model_chunk.start,
+                    ready.model_chunk.end,
+                    ready.audio_start,
+                    previous_layout,
+                ),
+            )
+        if prepare_error is not None:
+            raise prepare_error
         if isinstance(sampler, ZingH3RealtimeSampler):
             sampler.prepare_schedules(sampler.device)
         else:
             sampler.video_scheduler.to(sampler.device)
             sampler.audio_scheduler.to(sampler.device)
-        inputs = copy(self.inputs)
-        inputs.positive, inputs.source_visual = prompt.condition, ready.source
-        visual = ready.noise.float().clone()
-        audio = None if ready.audio is None else ready.audio.float().clone()
-        model_chunk = ready.model_chunk
-        kwargs = dict(
-            chunk=model_chunk,
-            audio_start=ready.audio_start,
-            media_origin=media_origin,
-        )
-        positive = packer.pack_chunk(inputs, prompt.condition, visual, audio, **kwargs)
-        negative = (
-            packer.pack_chunk(inputs, None, visual, audio, **kwargs)
-            if sampler.do_cfg
-            else None
-        )
         if self.cache is None:
             self.cache = self._new_cache(self.acquire_storage(positive, ready))
         origin = media_origin
@@ -446,6 +517,8 @@ class SourceReadySession:
     def _apply_prefix(self, current, prompt):
         sampler, positive = self.sampler, current.positive
         if prompt is not self.applied_prompt:
+            source, target, _, _ = current.spans[0]
+            sampler._precheck_replacement_prefix(self.cache, positive, source, target)
             prefix_cache = sampler.prefix_donor_cache()
             try:
                 if bool((positive["block_idx"] == 0).any()):
@@ -513,6 +586,7 @@ class SourceReadySession:
         self.draining = True
         finished = False
         try:
+            self._agree_ready_route("drain_entry")
             if not self.pending:
                 finished = True
                 return
@@ -521,52 +595,103 @@ class SourceReadySession:
             current, origin = self._prepare(self.pending[0], prompt, self.media_origin)
             sampler = self.sampler
             first = None
-            while self.pending:
+            while True:
+                # This vote also covers a warm prediction and sequential modes.
+                # A drained peer cannot return while another prepares next ready.
+                self._agree_ready_route(
+                    "drain_iteration", first_prediction=first is not None
+                )
+                if not self.pending:
+                    break
+                if current is None:
+                    self._activate_pending_prompt(self.pending[0])
+                    prompt, origin = self.prompt, self.media_origin
+                    current, _ = self._prepare(self.pending[0], prompt, origin)
                 ready = self.pending[0]
                 next_state = next_first = None
                 with self.rng.random_stream(sampler.device, self.seed):
-                    self._apply_prefix(current, prompt)
                     source, target, start, end = current.spans[0]
-                    if first is None:
-                        self.cache.prepare_chunk(target)
-                    vs, aus = (
-                        sampler.schedules_for(current)
-                        if isinstance(sampler, ZingH3RealtimeSampler)
-                        else (sampler.video_scheduler, sampler.audio_scheduler)
+                    graphs = getattr(sampler.generator, "chunk_graphs", None)
+                    graph_eligible = graphs is not None and graphs.eligible(
+                        sampler, self.cache, current
                     )
-                    lookahead = (
-                        sampler.joint_forward == "cross_chunk"
-                        and len(self.pending) > 1
-                        and self.pending_prompt is None
+                    cold_init = (
+                        graph_eligible
+                        and prompt is not self.applied_prompt
+                        and self.cache.prefix is None
+                        and self.cache.last_block == 0
+                        and self.cache.active is None
                     )
-                    video, sound = sampler._sample_block(
-                        current.visual,
-                        current.audio,
-                        current.positive,
-                        current.negative,
+                    sampler._agree_sp_boundary(
                         self.cache,
-                        vs,
-                        aus,
-                        source,
                         target,
-                        start,
-                        end,
-                        first_prediction=first,
-                        defer_final=lookahead,
+                        phase="source_ready_graph_route",
+                        ready_route=(graph_eligible, first is not None, cold_init),
+                        needs_prefix_update=prompt is not self.applied_prompt,
+                        layout_signature=sampler._collective_layout_signature(
+                            current.positive, source, target
+                        ),
                     )
-                    if lookahead:
-                        next_state, _ = self._prepare(self.pending[1], prompt, origin)
-                        next_first = sampler._ready_cross_prediction(
-                            current, next_state
-                        )
-                        if next_first is None:
-                            sampler._commit(
-                                current.positive, target, video, sound, self.cache
+                    if cold_init:
+                        first = graphs.initialization(sampler, current)
+                    else:
+                        self._apply_prefix(current, prompt)
+                    if graph_eligible:
+                        if first is None:
+                            first = graphs.recovery(sampler, current)
+                        if len(self.pending) > 1 and self.pending_prompt is None:
+                            next_state, _ = self._prepare(
+                                self.pending[1], prompt, origin, previous=current
                             )
-                    elif sampler.joint_forward == "cross_chunk":
-                        reasons = sampler.last_run_metrics["joint_fallbacks"]
-                        reason = "eos" if self.ended else "source_not_ready"
-                        reasons[reason] = reasons.get(reason, 0) + 1
+                        video, next_first = graphs.chunk(
+                            sampler, current, first, next_state
+                        )
+                        sound = None
+                    else:
+                        if first is None:
+                            sampler._begin_chunk(
+                                self.cache, current.positive, source, target
+                            )
+                        vs, aus = (
+                            sampler.schedules_for(current)
+                            if isinstance(sampler, ZingH3RealtimeSampler)
+                            else (sampler.video_scheduler, sampler.audio_scheduler)
+                        )
+                        lookahead = (
+                            sampler.joint_forward == "cross_chunk"
+                            and len(self.pending) > 1
+                            and self.pending_prompt is None
+                        )
+                        video, sound = sampler._sample_block(
+                            current.visual,
+                            current.audio,
+                            current.positive,
+                            current.negative,
+                            self.cache,
+                            vs,
+                            aus,
+                            source,
+                            target,
+                            start,
+                            end,
+                            first_prediction=first,
+                            defer_final=lookahead,
+                        )
+                        if lookahead:
+                            next_state, _ = self._prepare(
+                                self.pending[1], prompt, origin, previous=current
+                            )
+                            next_first = sampler._ready_cross_prediction(
+                                current, next_state
+                            )
+                            if next_first is None:
+                                sampler._commit(
+                                    current.positive, target, video, sound, self.cache
+                                )
+                        elif sampler.joint_forward == "cross_chunk":
+                            reasons = sampler.last_run_metrics["joint_fallbacks"]
+                            reason = "eos" if self.ended else "source_not_ready"
+                            reasons[reason] = reasons.get(reason, 0) + 1
                     sampler.last_run_metrics["dit_forwards"] = sum(
                         sampler._forward_counts.values()
                     )
@@ -590,10 +715,8 @@ class SourceReadySession:
                     if first is not None:
                         self._drain_tensors.extend(v for v in first if v is not None)
                 yield result
-                if self.pending and current is None:
-                    self._activate_pending_prompt(self.pending[0])
-                    prompt, origin = self.prompt, self.media_origin
-                    current, _ = self._prepare(self.pending[0], prompt, origin)
+                if self.closed:
+                    break
             finished = True
         finally:
             self.draining = False

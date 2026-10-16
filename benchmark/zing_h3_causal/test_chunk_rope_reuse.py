@@ -32,6 +32,8 @@ def commit(cache, t, block, phase):
     p = positions(t)
     if phase == "final":
         cache.update(p, torch.full((2,), block, device=DEVICE), "active", 1)
+        if cache.eviction_target_block is not None:
+            cache.complete_step0_and_evict(block)
     cache.update(
         p,
         torch.full((2,), block, device=DEVICE),
@@ -82,7 +84,7 @@ def view(cache, t, override=None, fail=False, batches=None):
     return rebuilt
 
 
-def cache(monkeypatch, window=4, mode="block_relative"):
+def cache(monkeypatch, window=4, mode="block_relative", timing="after_step0"):
     monkeypatch.setenv("SGLANG_ZING_CHUNK_ROPE_REUSE", "1")
     return ZingH3KVCache(
         1,
@@ -90,6 +92,7 @@ def cache(monkeypatch, window=4, mode="block_relative"):
             window_chunks=window, sink_chunks=0 if window is None else 1
         ),
         rope_position_mode=mode,
+        window_eviction_timing=timing,
     )
 
 
@@ -118,13 +121,14 @@ def test_append_same_length_coordinate_change_and_failure(monkeypatch):
     assert not list(c.owned_tensors())
 
 
+@pytest.mark.parametrize("timing", ["before_source", "after_step0"])
 @pytest.mark.parametrize("mode", ["absolute", "block_relative"])
 @torch.inference_mode()
-def test_window_repeated_eviction_and_prefix_replace(monkeypatch, mode):
-    c = cache(monkeypatch, mode=mode)
+def test_window_repeated_eviction_and_prefix_replace(monkeypatch, mode, timing):
+    c = cache(monkeypatch, mode=mode, timing=timing)
     commit(c, 0, 0, "prefix")
     for i in range(1, 12):
-        c.prepare_chunk(2 * i)
+        c.begin_chunk(2 * i)
         view(c, 100 * i)
         commit(c, 100 * i, 2 * i - 1, "source")
         view(c, 100 * i)
@@ -243,9 +247,10 @@ def test_source_identity_survives_target_merge_without_grow(monkeypatch):
     assert not view(c, 20)
 
 
+@pytest.mark.parametrize("timing", ["before_source", "after_step0"])
 @pytest.mark.parametrize("mode", ["absolute", "block_relative"])
 @torch.inference_mode()
-def test_pooled_chunk_reuse_keeps_slot_and_tracks_writes(monkeypatch, mode):
+def test_pooled_chunk_reuse_keeps_slot_and_tracks_writes(monkeypatch, mode, timing):
     monkeypatch.setenv("SGLANG_ZING_CHUNK_ROPE_REUSE", "1")
     storage = allocate_layer_stores(
         32,
@@ -259,11 +264,12 @@ def test_pooled_chunk_reuse_keeps_slot_and_tracks_writes(monkeypatch, mode):
         1,
         window_policy=ZingWindowPolicy(window_chunks=4, sink_chunks=1),
         rope_position_mode=mode,
+        window_eviction_timing=timing,
         storage=storage,
     )
     commit(c, 0, 0, "prefix")
     for i in range(1, 10):
-        c.prepare_chunk(2 * i)
+        c.begin_chunk(2 * i)
         commit(c, 10 * i, 2 * i, "final")
         view(c, 10 * i + 1)
         assert not view(c, 10 * i + 1)

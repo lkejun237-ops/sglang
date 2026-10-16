@@ -89,6 +89,7 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
     zing_kv_pool_sink_chunks: int = 3
     zing_kv_pool_rope_position_mode: str = "block_relative"
     zing_kv_pool_rope_max_frame_gap: int = 12
+    zing_kv_pool_window_eviction_timing: str = "after_step0"
     # Runtime-owned rolling target history used when a WebSocket prompt changes.
     # None keeps the existing prompt-update path for exports without 1,2,2 geometry.
     prompt_switch_prefix_latent_frames: int | None = None

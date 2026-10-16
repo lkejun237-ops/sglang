@@ -45,15 +45,15 @@ def main():
         init_distributed_environment,
         initialize_model_parallel,
     )
-    from sglang.multimodal_gen.runtime.server_args import (
-        ServerArgs,
-        set_global_server_args,
-    )
     from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
         TransformerLoader,
     )
     from sglang.multimodal_gen.runtime.managers.forward_context import (
         set_forward_context,
+    )
+    from sglang.multimodal_gen.runtime.server_args import (
+        ServerArgs,
+        set_global_server_args,
     )
 
     init_distributed_environment(world_size=world, rank=rank, local_rank=local)
@@ -124,6 +124,7 @@ def main():
             sink_chunks=params.zing_sink_chunks,
             rope_position_mode=params.zing_rope_position_mode,
             rope_max_frame_gap=params.zing_rope_max_frame_gap,
+            window_eviction_timing=params.zing_window_eviction_timing,
         )
 
     @torch.no_grad()
@@ -132,8 +133,9 @@ def main():
         forward_events = []
 
         def pre(module, inputs):
-            a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-                enable_timing=True
+            a, b = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
             )
             a.record()
             forward_events.append((a, b))
@@ -159,8 +161,9 @@ def main():
             with set_forward_context(current_timestep=0, attn_metadata=None):
                 for entry in frozen:
                     chunk = entry["chunk"]
-                    a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-                        enable_timing=True
+                    a, b = (
+                        torch.cuda.Event(enable_timing=True),
+                        torch.cuda.Event(enable_timing=True),
                     )
                     a.record()
                     state.append(

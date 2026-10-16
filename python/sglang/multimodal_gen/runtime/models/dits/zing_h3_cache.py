@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Request-owned KV transactions for Zing causal generation."""
 
+import copy
 import functools
 import os
 from contextlib import nullcontext
@@ -13,6 +14,194 @@ from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
     ZingLayerStore,
 )
 from sglang.multimodal_gen.runtime.realtime.zing_window import ZingWindowPolicy
+
+
+class ZingFixedKVWorkspace:
+    """Device execution metadata over one authoritative pooled K/V store.
+
+    A plan is validated on the host and copied into stable buffers before
+    execution. Attention gathers a contiguous live prefix followed by current
+    rows and explicitly zeros the padded tail. Commit only scatters current
+    clean rows; it never writes padding. No device scalar is read by execution.
+    """
+
+    def __init__(self, k, v, *, current_rows):
+        if (
+            k.ndim != 3
+            or k.shape != v.shape
+            or k.dtype != v.dtype
+            or k.device != v.device
+        ):
+            raise ValueError(
+                "Fixed Zing KV requires matching [rows, heads, dim] stores"
+            )
+        if type(current_rows) is not int or not 0 < current_rows <= k.shape[0]:
+            raise ValueError("Fixed Zing KV current row count must fit its store")
+        self.k, self.v = k, v
+        self.capacity, self.current_rows = k.shape[0], current_rows
+        device = k.device
+        self.gather_rows = torch.zeros(
+            self.capacity + current_rows, dtype=torch.long, device=device
+        )
+        self.valid = torch.zeros(
+            self.capacity + current_rows, dtype=torch.bool, device=device
+        )
+        self.write_rows = torch.zeros(current_rows, dtype=torch.long, device=device)
+        self.cu_seqlens_k = torch.zeros(2, dtype=torch.int32, device=device)
+
+    def owned_tensors(self):
+        return (
+            self.k,
+            self.v,
+            self.gather_rows,
+            self.valid,
+            self.write_rows,
+            self.cu_seqlens_k,
+        )
+
+    def prepare(self, history, destinations):
+        history, destinations = tuple(history), tuple(destinations)
+        if (
+            len(history) > self.capacity
+            or len(destinations) != self.current_rows
+            or len(set(destinations)) != len(destinations)
+            or any(
+                type(i) is not int or not 0 <= i < self.capacity
+                for i in (*history, *destinations)
+            )
+        ):
+            raise ValueError(
+                "Fixed Zing KV plan contains invalid history or write rows"
+            )
+        live = len(history) + self.current_rows
+        rows = (*history, *range(self.capacity, self.capacity + self.current_rows))
+        rows = (*rows, *((0,) * (self.capacity + self.current_rows - live)))
+        self.gather_rows.copy_(
+            torch.tensor(rows, dtype=torch.long, device=self.k.device)
+        )
+        self.valid.copy_(torch.arange(self.valid.numel(), device=self.k.device) < live)
+        self.write_rows.copy_(
+            torch.tensor(destinations, dtype=torch.long, device=self.k.device)
+        )
+        self.cu_seqlens_k.copy_(
+            torch.tensor([0, live], dtype=torch.int32, device=self.k.device)
+        )
+
+    def attention_view(self, current_k, current_v):
+        keys = torch.cat((self.k, current_k)).index_select(0, self.gather_rows)
+        values = torch.cat((self.v, current_v)).index_select(0, self.gather_rows)
+        return (
+            torch.where(self.valid[:, None, None], keys, 0),
+            torch.where(self.valid[:, None, None], values, 0),
+            self.valid,
+        )
+
+    def commit(self, current_k, current_v):
+        self.k.index_copy_(0, self.write_rows, current_k)
+        self.v.index_copy_(0, self.write_rows, current_v)
+
+
+class ZingFixedForwardKVPlan:
+    """Host-prepared fixed-shape device plan, without session bookkeeping.
+
+    The pooled slot is the attention workspace: history is always rows
+    ``[0, L)`` (live rows are compacted to the front), the forward's rows are
+    written at ``[L, L + rows)``, and attention reads fixed-shape views of the
+    slot bounded by ``cu_k``. Nothing is concatenated, gathered or zeroed.
+    Rows past the live length are stale but finite (the pool is zero-filled
+    and every write is finite), so a kernel that reads past ``cu_k`` is safe.
+
+    The rotated-K scratch of the slot holds one RoPE rotation of raw K. A plan
+    rotates the whole fixed-shape raw K itself (``rotates_history``) unless the
+    plan executed right before it in the same graph already did so for equal
+    history coordinates: the rows ``[0, L)`` are not written in between, so the
+    rotation is still exact.
+    """
+
+    def __init__(
+        self, cache, current_positions, *, ends, clean_rows, prefix=False, after=None
+    ):
+        self.stores = tuple((s.k, s.v) for s in cache.storage)
+        # Addressed separately from ``stores``: graph keys and signatures need
+        # its address, while restore snapshots and chunk layers do not.
+        self.rotated = tuple(s.rotated_k for s in cache.storage)
+        self.capacity = cache.capacity
+        self.rows = current_positions.shape[0]
+        self.clean_rows, self.ends = clean_rows, tuple(ends)
+        if not self.ends or self.ends[-1] != self.rows:
+            raise ValueError("Fixed Zing KV branches must cover all current rows")
+        if not 0 <= clean_rows <= self.rows:
+            raise ValueError("Fixed Zing KV clean rows are invalid")
+        history = 0
+        for chunk in cache._history():
+            if chunk.offset != history:
+                raise ValueError("Fixed Zing KV history must be the live front rows")
+            history += chunk.positions.shape[0]
+        if history != cache._length:
+            raise ValueError("Fixed Zing KV history must cover every live row")
+        # Every row of this forward is written into the slot, clean or not.
+        if cache._length + self.rows > self.capacity:
+            raise ZingKVCapacityError("Fixed Zing KV plan exceeds slot capacity")
+        mapped, historical = cache.attention_positions(
+            current_positions, prefix=prefix, host_current=current_positions
+        )
+        self.history_positions = historical
+        reusable = (
+            historical is not None
+            and after is not None
+            and after.rotated_positions is not None
+            and torch.equal(after.rotated_positions, historical)
+        )
+        self.rotates_history = historical is not None and not reusable
+        # Without history nothing is rotated and nothing carries over.
+        self.rotated_positions = (
+            None
+            if historical is None
+            else historical
+            if self.rotates_history
+            else after.rotated_positions
+        )
+        device = self.stores[0][0].device
+        tensors = dict(
+            current_positions=mapped.to(device),
+            write_rows=torch.arange(
+                cache._length, cache._length + self.rows, device=device
+            ),
+        )
+        if self.rotates_history:
+            pad_rows = self.capacity - history
+            tensors["positions"] = torch.cat(
+                (historical, historical.new_zeros(pad_rows, 3))
+            ).to(device)
+        previous = 0
+        for branch, stop in enumerate(self.ends):
+            tensors[f"cu_k.{branch}"] = torch.tensor(
+                [0, history + stop], dtype=torch.int32, device=device
+            )
+            tensors[f"cu_q.{branch}"] = torch.tensor(
+                [0, stop - previous], dtype=torch.int32, device=device
+            )
+            previous = stop
+        self.tensors = tensors
+
+    def write_current(self, layer, rotated_k, k, v, tensors=None):
+        """Write this forward's rows at ``[L, L + rows)``; clean raw K persists."""
+        tensors = self.tensors if tensors is None else tensors
+        keys, values = self.stores[layer]
+        rows = tensors["write_rows"]
+        self.rotated[layer].index_copy_(0, rows, rotated_k)
+        values.index_copy_(0, rows, v)
+        if self.clean_rows:
+            keys.index_copy_(0, rows[: self.clean_rows], k[: self.clean_rows])
+
+    def persist(self, layer, k, v, tensors=None):
+        """Persist clean rows only; the replicated SP prefix never attends here."""
+        tensors = self.tensors if tensors is None else tensors
+        if self.clean_rows:
+            keys, values = self.stores[layer]
+            rows = tensors["write_rows"][: self.clean_rows]
+            keys.index_copy_(0, rows, k[: self.clean_rows])
+            values.index_copy_(0, rows, v[: self.clean_rows])
 
 
 def tensor_identity(value):
@@ -172,6 +361,7 @@ class ZingH3KVCache:
         *,
         reserve_rows: int = 0,
         window_policy: ZingWindowPolicy | None = None,
+        window_eviction_timing: str = "after_step0",
         rope_position_mode: str = "absolute",
         rope_max_frame_gap: int = 12,
         storage: list[ZingLayerStore] | None = None,
@@ -180,6 +370,9 @@ class ZingH3KVCache:
             raise ValueError("Invalid Zing KV layer count or frame limits")
         if reserve_rows < 0:
             raise ValueError("Invalid Zing KV reserved row count")
+        if window_eviction_timing not in ("before_source", "after_step0"):
+            raise ValueError("Invalid Zing window eviction timing")
+        self._window_eviction_timing = window_eviction_timing
         self.num_layers = num_layers
         self.local_frames = local_frames
         self.sink_frames = sink_frames
@@ -200,7 +393,9 @@ class ZingH3KVCache:
         )
         self.raw_store = not self.single_store
         # Explicitly set the switch to 0 to restore whole-history invalidation.
-        self.chunk_rope_reuse = os.environ.get("SGLANG_ZING_CHUNK_ROPE_REUSE", "1") == "1"
+        self.chunk_rope_reuse = (
+            os.environ.get("SGLANG_ZING_CHUNK_ROPE_REUSE", "1") == "1"
+        )
         # A finite request can be much longer than its live attention window.
         # Never reserve its full packed length for a window-bounded store.
         self.reserve_rows = (
@@ -224,6 +419,11 @@ class ZingH3KVCache:
         self.clear()
 
     @property
+    def window_eviction_timing(self):
+        """A session's window policy cannot change after construction."""
+        return self._window_eviction_timing
+
+    @property
     def pooled(self):
         return self.storage is not None
 
@@ -236,6 +436,7 @@ class ZingH3KVCache:
         if projection_cache is not None:
             projection_cache.clear()
         self.adaln_projection_cache = None
+        self.eviction_target_block = None
         self.prefix = None
         self.pending_source = None
         self.committed = []
@@ -457,18 +658,65 @@ class ZingH3KVCache:
         if self.active is not None:
             yield self.active[1]
 
-    def prepare_chunk(self, target_block):
-        """Evict history before source execution; the caller closes on failure.
+    def planning_copy(self):
+        """Private host transaction; all authoritative tensors keep their addresses."""
+        shadow = copy.copy(self)
+        shadow.__dict__ = self.__dict__.copy()
+        for name, value in self.__dict__.items():
+            if isinstance(value, dict):
+                shadow.__dict__[name] = value.copy()
+            elif isinstance(value, list):
+                shadow.__dict__[name] = value.copy()
+        shadow.prefix = None if self.prefix is None else copy.copy(self.prefix)
+        shadow.committed = [copy.copy(chunk) for chunk in self.committed]
+        shadow.pending_source = (
+            None if self.pending_source is None else copy.copy(self.pending_source)
+        )
+        shadow._bookkeeping_only = True
+        shadow._attention_positions_memo = None
+        return shadow
 
-        One committed entry owns source + target/audio. Keep pre-RoPE K and
-        absolute checkpoint positions: eviction never renumbers a retained key.
-        Eviction invalidates derived maps and releases removed chunk references.
-        A raw store compacts retained rows and reuses the freed tail capacity.
-        """
+    def publish_plan(self, shadow):
+        """Publish successful device execution's host effects exactly once."""
+        if not getattr(shadow, "_bookkeeping_only", False):
+            raise ValueError("Zing KV host publication requires a planning transaction")
+        self.__dict__.update(shadow.__dict__)
+        self._bookkeeping_only = False
+
+    def begin_chunk(self, target_block):
+        """Open a target boundary without changing delayed-policy history."""
+        if self.eviction_target_block is not None:
+            raise ValueError("Zing window selection has an unfinished boundary")
         if self.active is not None or self.pending_source is not None:
             raise ValueError("Zing window selection requires a completed boundary")
         if target_block != self.last_block + 2:
             raise ValueError("Zing window selection requires the next target block")
+        self.eviction_target_block = target_block
+        if self.window_eviction_timing == "before_source":
+            self._evict_committed(target_block)
+
+    def complete_step0_and_evict(self, target_block):
+        """Close step zero only after both scheduler updates have succeeded."""
+        if self.eviction_target_block != target_block:
+            raise ValueError("Zing step-zero completion requires its open boundary")
+        if self.active is None or self.active[0] != target_block:
+            raise ValueError("Zing step-zero completion requires the active target")
+        if (
+            self.pending_source is not None
+            and self.pending_source.block != target_block - 1
+        ):
+            raise ValueError("Zing step-zero completion has a mismatched source")
+        if self.window_eviction_timing == "after_step0":
+            self._evict_committed(target_block)
+        self.eviction_target_block = None
+
+    def prepare_chunk(self, target_block):
+        """Compatibility boundary for callers using the original window API."""
+        self.begin_chunk(target_block)
+        if self.window_eviction_timing == "before_source":
+            self.eviction_target_block = None
+
+    def _evict_committed(self, target_block):
         current_id = target_block // 2 - 1
         retained = [
             chunk
@@ -481,25 +729,35 @@ class ZingH3KVCache:
             self._compact_store()
             self.stats["compactions"] += 1
 
+    def move_store_rows(self, spans):
+        """Move live raw K/V rows left; ``spans`` are (offset, rows) in row order.
+
+        Device rows only: chunk offsets, length and rope bookkeeping stay with
+        the caller (a planning transaction publishes them later).
+        """
+        runs = _compaction_runs(spans)
+        if not runs:
+            return
+        tensors = [tensor for pair in self._stores.values() for tensor in pair]
+        if _fused_compaction_rejection(tensors, runs) is None:
+            _fused_move_rows(tensors, runs)
+            return
+        # Per chunk, a move is at most a few pieces of its shift.
+        for keys, values in self._stores.values():
+            destination = 0
+            for source, rows in spans:
+                if source != destination:
+                    for tensor in (keys, values):
+                        _move_rows(tensor, destination, source, rows)
+                destination += rows
+
     def _compact_store(self):
         """Move live raw K/V to the front, using at most one chunk temporarily."""
         chunks = self._stored_chunks()
-        runs = _compaction_runs([(c.offset, c.positions.shape[0]) for c in chunks])
-        tensors = [tensor for pair in self._stores.values() for tensor in pair]
         for layer in self._stores:
             self._observe_raw_store(layer)
-        if runs and _fused_compaction_rejection(tensors, runs) is None:
-            _fused_move_rows(tensors, runs)
-        elif runs:
-            # Per chunk, a move is at most a few pieces of its shift.
-            for keys, values in self._stores.values():
-                destination = 0
-                for chunk in chunks:
-                    rows, source = chunk.positions.shape[0], chunk.offset
-                    if source != destination:
-                        for tensor in (keys, values):
-                            _move_rows(tensor, destination, source, rows)
-                    destination += rows
+        if not getattr(self, "_bookkeeping_only", False):
+            self.move_store_rows([(c.offset, c.positions.shape[0]) for c in chunks])
         for layer in self._stores:
             self._mark_raw_store(layer)
         offset = 0
@@ -870,7 +1128,9 @@ class ZingH3KVCache:
                 tuple(self._tensor_signature(c.positions) for c in chunks)
                 != history_plan.position_signatures
             ):
-                raise ValueError("History RoPE plan positions changed during the forward")
+                raise ValueError(
+                    "History RoPE plan positions changed during the forward"
+                )
         rows = k.shape[0]
         _, values = self._reserve_store(layer, self._length + rows, k, v)
         # Unpublish before writes; a failed rotation must never be reused.
@@ -1391,7 +1651,10 @@ class ZingH3KVCache:
                 (k, keys[offset : offset + rows]),
                 (v, values[offset : offset + rows]),
             ):
-                if source.data_ptr() != destination.data_ptr():
+                if (
+                    not getattr(self, "_bookkeeping_only", False)
+                    and source.data_ptr() != destination.data_ptr()
+                ):
                     destination.copy_(source)
             self._mark_raw_store(layer)
         self._length = offset + rows

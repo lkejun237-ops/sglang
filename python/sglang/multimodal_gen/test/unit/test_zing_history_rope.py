@@ -14,8 +14,8 @@ from sglang.multimodal_gen.runtime.models.dits.zing_h3_rope import (
     HISTORY_ROPE_ROUTES,
     _history_rope_rejection,
     apply_current_rope,
-    apply_history_rope_into,
     apply_history_rope_batch,
+    apply_history_rope_into,
 )
 
 
@@ -79,6 +79,7 @@ def test_rejected_alias_dtype_and_layout(monkeypatch):
     assert torch.equal(apply_history_rope_into(y, c, torch.empty_like(x)), expected)
 
 
+@pytest.mark.parametrize("timing", ["before_source", "after_step0"])
 @pytest.mark.parametrize("planned", [False, True])
 @pytest.mark.parametrize("grouped", [False, True])
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -93,7 +94,7 @@ def test_rejected_alias_dtype_and_layout(monkeypatch):
 )
 @torch.no_grad()
 def test_cache_transactions_eviction_and_failure(
-    device, window, sink, mode, grouped, planned, monkeypatch
+    device, window, sink, mode, grouped, planned, timing, monkeypatch
 ):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -103,7 +104,10 @@ def test_cache_transactions_eviction_and_failure(
     monkeypatch.setenv("SGLANG_ZING_FUSED_HISTORY_ROPE", "1")
     caches = [
         ZingH3KVCache(
-            1, window_policy=ZingWindowPolicy(window, sink), rope_position_mode=mode
+            1,
+            window_policy=ZingWindowPolicy(window, sink),
+            rope_position_mode=mode,
+            window_eviction_timing=timing,
         )
         for _ in range(2)
     ]
@@ -193,9 +197,11 @@ def test_cache_transactions_eviction_and_failure(
                 )
         target = 2 * (chunk + 1)
         for cache in caches:
-            cache.prepare_chunk(target)
+            cache.begin_chunk(target)
         execute(positions(7, chunk * 2 + 2), target - 1, "source")
         execute(positions(9, chunk * 2 + 2), target, "active")
+        for cache in caches:
+            cache.complete_step0_and_evict(target)
         execute(positions(9, chunk * 2 + 2), target, "final")
     cache = caches[1]
     if cache.raw_store:
@@ -328,7 +334,9 @@ def test_grouped_alias_and_dtype_fallback(device, dtype, monkeypatch):
 
 @pytest.mark.parametrize("chunk_reuse", [False, True])
 @torch.no_grad()
-def test_history_plan_is_session_owned_and_rejects_stale_state(chunk_reuse, monkeypatch):
+def test_history_plan_is_session_owned_and_rejects_stale_state(
+    chunk_reuse, monkeypatch
+):
     monkeypatch.setenv("SGLANG_ZING_CHUNK_ROPE_REUSE", "1" if chunk_reuse else "0")
     from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
 
@@ -570,9 +578,7 @@ def test_guard_never_checks_the_input_as_the_output(monkeypatch):
     ],
 )
 @torch.no_grad()
-def test_rejected_current_rope_allocates_no_candidate_output(
-    shape, dtype, monkeypatch
-):
+def test_rejected_current_rope_allocates_no_candidate_output(shape, dtype, monkeypatch):
     """A rejected input (CPU, SP 4-D, non-BF16) must not reserve a fused output."""
     monkeypatch.setenv("SGLANG_ZING_FUSED_CURRENT_ROPE", "1")
     x = torch.randn(shape, dtype=dtype)

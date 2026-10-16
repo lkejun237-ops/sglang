@@ -6,6 +6,7 @@ from copy import copy
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_minimax_h3_euler_ancestral import (
@@ -15,6 +16,7 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_minimax_h3_euler
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_zing_h3_causal_renoise import (
     ZingH3CausalRenoiseSchedule,
 )
+from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import ZingKVCapacityError
 from sglang.multimodal_gen.runtime.realtime.zing_window import ZingWindowPolicy
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.multimodal_gen.runtime.utils.zing_diagnostics import current_diagnostic
@@ -65,6 +67,7 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         audio_shift=3.0,
         guidance_scale=1.0,
         window_chunks=21,
+        window_eviction_timing="after_step0",
         sink_chunks=3,
         rope_position_mode="block_relative",
         rope_max_frame_gap=12,
@@ -82,6 +85,12 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             raise ValueError(
                 "Zing joint_forward must be off, source_first, or cross_chunk"
             )
+        if window_eviction_timing not in ("before_source", "after_step0"):
+            raise ValueError("Invalid Zing window eviction timing")
+        self._window_eviction_timing = window_eviction_timing
+        self._delayed_policy_requires_agreement = (
+            window_eviction_timing == "after_step0"
+        )
         self.joint_forward = joint_forward
         for value in (ar_condition_timestep, reference_visual_timestep):
             if (
@@ -121,6 +130,11 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         )
         # Preallocated donor storage for prompt updates of pooled sessions.
         self.prefix_workspace = None
+
+    @property
+    def window_eviction_timing(self):
+        """A session's window policy cannot change after construction."""
+        return self._window_eviction_timing
 
     def _admit_adaln(self, positive, negative, spans, audio):
         table = getattr(self.generator, "adaln_table", None)
@@ -190,6 +204,7 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         return ZingH3KVCache(
             len(self.generator.blocks),
             window_policy=self.window_policy,
+            window_eviction_timing=self.window_eviction_timing,
             rope_position_mode=self.rope_position_mode,
             rope_max_frame_gap=self.rope_max_frame_gap,
             storage=self.prefix_workspace,
@@ -229,6 +244,7 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         ``acquire_storage(layout)`` leases pooled storage once the packed
         prefix size is known and before any forward writes K/V.
         """
+        self._agree_sp_policy()
         diagnostic = current_diagnostic()
         self.device = visual.device
         self.processor._validate_visual(visual)
@@ -297,10 +313,23 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             cache = ZingH3KVCache(
                 len(self.generator.blocks),
                 window_policy=self.window_policy,
+                window_eviction_timing=self.window_eviction_timing,
                 rope_position_mode=self.rope_position_mode,
                 rope_max_frame_gap=self.rope_max_frame_gap,
                 reserve_rows=int(pos["block_idx"].numel()),
                 storage=storage,
+            )
+            first_source, first_target, _, _ = spans[0]
+            self._agree_sp_boundary(
+                cache,
+                first_target,
+                phase="initial_prefix",
+                required_rows=int(
+                    (self._layout_index(pos).host["block_idx"] == 0).sum()
+                ),
+                layout_signature=self._collective_layout_signature(
+                    pos, first_source, first_target
+                ),
             )
             if diagnostic:
                 diagnostic.phase = "prefix"
@@ -322,7 +351,14 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
 
     @torch.no_grad()
     def update_condition(self, state, inputs):
-        """Replace prefix conditioning at a block boundary, retaining target history."""
+        """Replace prefix at a boundary; any failure closes the sampling state."""
+        try:
+            self._update_condition(state, inputs)
+        except BaseException:
+            state.close()
+            raise
+
+    def _prepare_condition_layout(self, state, inputs):
         if (
             state.closed
             or state.cache.active is not None
@@ -352,6 +388,36 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             raise ValueError("Zing prompt update changed absolute target positions")
         # Reuse the original values exactly, including fractional frame positions.
         layout["position_ids"][new_target] = state.positive["position_ids"][old_target]
+        return layout
+
+    def _update_condition(self, state, inputs):
+        if state.index < len(state.spans):
+            source, target, _, _ = state.spans[state.index]
+        else:
+            # A completed session may still replace conditioning, but has no
+            # next source/target rows requiring scratch capacity.
+            source, target = -1, state.cache.last_block + 2
+        layout, prepare_error = None, None
+        try:
+            layout = self._prepare_condition_layout(state, inputs)
+        except BaseException as error:
+            prepare_error = error
+        if self._delayed_policy_requires_agreement:
+            # Successful and failed preparation must join the same first vote.
+            # Its layout comes from the unchanged state, never a partial donor.
+            self._agree_sp_boundary(
+                state.cache,
+                target,
+                phase="condition_prepare",
+                precheck_error=prepare_error is not None,
+                local_error=prepare_error,
+                layout_signature=self._collective_layout_signature(
+                    state.positive, source, target
+                ),
+            )
+        if prepare_error is not None:
+            raise prepare_error
+        self._precheck_replacement_prefix(state.cache, layout, source, target)
         adaln_lease = self._admit_adaln(
             layout, state.negative, state.spans, state.audio
         )
@@ -384,8 +450,10 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         self.device = visual.device
         source, target, start, end = state.spans[state.index]
         try:
-            cache.prepare_chunk(target)
-            if inputs is not None:
+            if inputs is not None and self._delayed_policy_requires_agreement:
+                self.update_condition(state, inputs)
+            self._begin_chunk(cache, state.positive, source, target)
+            if inputs is not None and not self._delayed_policy_requires_agreement:
                 self.update_condition(state, inputs)
             history_rows = sum(c.positions.shape[0] for c in cache._history())
             with maybe_record_function(
@@ -429,6 +497,8 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         first_prediction=None,
         defer_final=False,
     ):
+        if not len(vs.timesteps):
+            raise ValueError("Zing denoising requires at least one scheduler step")
         diagnostic = current_diagnostic()
         video = visual[:, :, start:end]
         audio_indices = self._audio_indices(pos, target)
@@ -495,6 +565,8 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
                 video = vs.step(vp, video, step_index=step)[0]
                 if sound is not None:
                     sound = aus.step(ap, sound, step_index=step)[0]
+                if step == 0:
+                    cache.complete_step0_and_evict(target)
         if diagnostic:
             diagnostic.phase = f"block{target}.commit"
         if not defer_final:
@@ -506,6 +578,241 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             diagnostic.record("block_complete", video=visual, audio=audio)
         return video, sound
 
+    def _collective_config(self):
+        return {
+            "guidance": (self.guidance_scale, self.do_cfg),
+            "schedule": (
+                self.solver,
+                tuple(self._host_list(self.video_scheduler.timesteps)),
+                tuple(self._host_list(self.video_scheduler.sigmas)),
+                tuple(self._host_list(self.audio_scheduler.timesteps)),
+                tuple(self._host_list(self.audio_scheduler.sigmas)),
+            ),
+            "condition_timesteps": (
+                self.ar_condition_timestep,
+                self.reference_visual_timestep,
+            ),
+        }
+
+    def _collective_layout_signature(self, pos, source, target):
+        """Host geometry that determines modality and collective row shapes.
+
+        Absolute coordinate values may produce a joint RoPE fallback; they do
+        not change communication shapes, so preserve that supported fallback.
+        """
+        host = self._layout_index(pos).host
+        blocks, roles, positions = (
+            host[k] for k in ("block_idx", "row_role", "position_ids")
+        )
+        selected = (blocks == 0) | (blocks == source) | (blocks == target)
+        geometry = []
+        for block in (0, source, target):
+            current = positions[blocks == block]
+            geometry.append(
+                (
+                    block,
+                    current.shape[0],
+                    tuple(int(current[:, axis].unique().numel()) for axis in range(3)),
+                )
+            )
+        return (
+            tuple(blocks[selected].tolist()),
+            tuple(roles[selected].tolist()),
+            tuple(geometry),
+            tuple(
+                (name, tuple(pos[name].shape))
+                for name in (
+                    "clean_visual",
+                    "clean_audio",
+                    "visual",
+                    "audio",
+                    "x",
+                    "audio_x",
+                    "context",
+                )
+                if name in pos
+            ),
+        )
+
+    def _agree_sp_policy(self):
+        """Every real SP rank agrees the policy before any policy-specific votes."""
+        from sglang.multimodal_gen.runtime.models.dits import zing_h3
+
+        world, _ = zing_h3.get_ulysses_ctx()
+        if world == 1:
+            return
+        group = getattr(zing_h3.get_sp_group(), "cpu_group", None)
+        if group is None:
+            if self.window_eviction_timing == "after_step0":
+                raise ValueError(
+                    "Zing delayed window rank agreement requires a CPU group"
+                )
+            return
+        votes = [None] * world
+        config = {"policy": self.window_eviction_timing, **self._collective_config()}
+        dist.all_gather_object(votes, config, group=group)
+        if any(vote != config for vote in votes):
+            raise ValueError("Zing window policy differs across ranks")
+
+    def _agree_sp_boundary(
+        self,
+        cache,
+        target,
+        *,
+        cross=False,
+        joint_eligible=None,
+        required_rows=0,
+        precheck_error=False,
+        local_error=None,
+        layout_signature=None,
+        phase=None,
+        needs_prefix_update=None,
+        ready_route=None,
+    ):
+        """Vote on logical state and capacity before entering model collectives."""
+        from sglang.multimodal_gen.runtime.models.dits import zing_h3
+
+        world, _ = zing_h3.get_ulysses_ctx()
+        if not self._delayed_policy_requires_agreement:
+            return joint_eligible
+        payload = {
+            **self._collective_config(),
+            "phase": phase,
+            "needs_prefix_update": needs_prefix_update,
+            "ready_route": ready_route,
+            "layout_signature": layout_signature,
+            "required_rows": required_rows,
+            "cache_ready": cache is not None,
+            "active_geometry": None
+            if cache is None or cache.active is None
+            else tuple(cache.active[1].shape),
+            "policy": self.window_eviction_timing
+            if cache is None
+            else cache.window_eviction_timing,
+            "sampler_policy": self.window_eviction_timing,
+            "joint_mode": self.joint_forward,
+            "window": (
+                self.window_policy.window_chunks
+                if cache is None
+                else cache.window_policy.window_chunks,
+                self.window_policy.sink_chunks
+                if cache is None
+                else cache.window_policy.sink_chunks,
+            ),
+            "rope": (self.rope_position_mode, self.rope_max_frame_gap)
+            if cache is None
+            else (cache.rope_position_mode, cache.rope_max_frame_gap),
+            "steps": len(self.video_scheduler.timesteps),
+            "stored": tuple(
+                (c.block, c.offset, c.positions.shape[0])
+                for c in (() if cache is None else cache._stored_chunks())
+            ),
+            "target": target,
+            "last_block": None if cache is None else cache.last_block,
+            "eviction_target": None if cache is None else cache.eviction_target_block,
+            "pending": None
+            if cache is None or cache.pending_source is None
+            else cache.pending_source.block,
+            "active": None
+            if cache is None or cache.active is None
+            else cache.active[0],
+            "committed": tuple(
+                c.temporal_chunk_id for c in (() if cache is None else cache.committed)
+            ),
+            "retained": tuple(
+                c.temporal_chunk_id
+                for c in (() if cache is None else cache.committed)
+                if cache.window_policy.retains(c.temporal_chunk_id, target // 2 - 1)
+            ),
+            "capacity_ok": cache is None
+            or cache.window_eviction_timing == "before_source"
+            or not cache.pooled
+            or cache._length + required_rows <= cache.capacity,
+            "joint_eligible": joint_eligible,
+            "precheck_error": precheck_error,
+        }
+        if world == 1:
+            # Preserve typed local failures. Only multi-rank runs need a shared
+            # mismatch error; the prepare caller still owns its original error.
+            if local_error is not None:
+                raise local_error
+            if not payload["capacity_ok"]:
+                raise ZingKVCapacityError("Zing fixed KV slot capacity exceeded")
+            if precheck_error:
+                raise ValueError(
+                    "Zing prefix workspace capacity is insufficient for the replacement"
+                )
+            return joint_eligible
+        votes = [payload]
+        if world > 1:
+            group = getattr(zing_h3.get_sp_group(), "cpu_group", None)
+            if group is None:
+                if cache is not None:
+                    cache.clear()
+                raise ValueError(
+                    "Zing delayed window rank agreement requires a CPU group"
+                )
+            votes = [None] * world
+            dist.all_gather_object(votes, payload, group=group)
+        logical = {
+            k: v
+            for k, v in payload.items()
+            if k not in {"capacity_ok", "joint_eligible", "precheck_error"}
+        }
+        if (
+            any(
+                {k: v for k, v in vote.items() if k in logical} != logical
+                for vote in votes
+            )
+            or not all(vote["capacity_ok"] for vote in votes)
+            or any(vote["precheck_error"] for vote in votes)
+        ):
+            if cache is not None:
+                cache.clear()
+            raise ValueError("Zing delayed window rank state or capacity mismatch")
+        return (
+            None
+            if joint_eligible is None
+            else all(vote["joint_eligible"] for vote in votes)
+        )
+
+    def _precheck_replacement_prefix(self, cache, pos, source, target):
+        """Agree donor layout and the replacement-plus-step peak before forward.
+
+        Existing stored rows already include the old prefix. Its signed delta
+        replaces that occupancy; current source/target rows add step0 scratch.
+        The donor uses an independent workspace and must fit on every rank.
+        """
+        blocks = self._layout_index(pos).host["block_idx"]
+        prefix_rows = int((blocks == 0).sum())
+        old_prefix_rows = 0 if cache.prefix is None else cache.prefix.positions.shape[0]
+        scratch_rows = int(((blocks == source) | (blocks == target)).sum())
+        workspace = self.prefix_workspace
+        workspace_ok = workspace is None or (
+            len(workspace) == len(self.generator.blocks)
+            and all(layer.rows >= prefix_rows for layer in workspace)
+        )
+        self._agree_sp_boundary(
+            cache,
+            target,
+            phase="prefix_replace",
+            required_rows=max(prefix_rows - old_prefix_rows + scratch_rows, 0),
+            precheck_error=not workspace_ok,
+            layout_signature=self._collective_layout_signature(pos, source, target),
+        )
+
+    def _begin_chunk(self, cache, pos, source, target):
+        blocks = self._layout_index(pos).host["block_idx"]
+        rows = int(((blocks == source) | (blocks == target)).sum())
+        self._agree_sp_boundary(
+            cache,
+            target,
+            phase="chunk_begin",
+            required_rows=rows,
+            layout_signature=self._collective_layout_signature(pos, source, target),
+        )
+        cache.begin_chunk(target)
+
     def _joint_eligible(self, pos, cache, source, target, audio, *, cross=False):
         if self.joint_forward == "off":
             return False
@@ -513,7 +820,7 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
 
         reason = None
         roles = self._layout_index(pos).host["row_role"]
-        if get_ulysses_ctx()[0] not in (1, 2):
+        if get_ulysses_ctx()[0] not in (1, 2, 4):
             reason = "sp_size"
         elif self.do_cfg:
             reason = "cfg"
@@ -523,9 +830,14 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             reason = "source_not_ready"
         elif not cache.raw_store or cache.local_frames != -1:
             reason = "cache_layout"
-        elif cross and not all(
-            cache.window_policy.retains(i, target // 2 - 1)
-            for i in [c.temporal_chunk_id for c in cache.committed] + [target // 2 - 2]
+        elif (
+            cross
+            and cache.window_eviction_timing == "before_source"
+            and not all(
+                cache.window_policy.retains(i, target // 2 - 1)
+                for i in [c.temporal_chunk_id for c in cache.committed]
+                + [target // 2 - 2]
+            )
         ):
             reason = "window_eviction"
         elif cache.pooled:
@@ -538,7 +850,19 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         if reason is not None:
             counts = self.last_run_metrics["joint_fallbacks"]
             counts[reason] = counts.get(reason, 0) + 1
-        return reason is None
+        blocks = self._layout_index(pos).host["block_idx"]
+        selected = (blocks == source) | (blocks == target)
+        if cross:
+            selected = selected | (blocks == target - 2)
+        return self._agree_sp_boundary(
+            cache,
+            target,
+            phase="joint_eligibility",
+            cross=cross,
+            joint_eligible=reason is None,
+            required_rows=int(selected.sum()),
+            layout_signature=self._collective_layout_signature(pos, source, target),
+        )
 
     def _ready_cross_prediction(self, previous, current):
         """Join two separately packed ready chunks without moving RNG draws."""
@@ -572,10 +896,18 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             ),
         ]
         # The previous final is absent from current's separate packed layout.
-        if (
-            cache.pooled
-            and cache._length + sum(p["x"].shape[0] for p in packs) > cache.capacity
-        ):
+        rows = sum(p["x"].shape[0] for p in packs)
+        capacity_ok = not cache.pooled or cache._length + rows <= cache.capacity
+        eligible = self._agree_sp_boundary(
+            cache,
+            target,
+            phase="ready_cross_capacity",
+            cross=True,
+            joint_eligible=capacity_ok,
+            required_rows=rows,
+            layout_signature=self._collective_layout_signature(pos, source, target),
+        )
+        if not eligible:
             reasons = self.last_run_metrics["joint_fallbacks"]
             reasons["pooled_scratch_capacity"] = (
                 reasons.get("pooled_scratch_capacity", 0) + 1
@@ -633,7 +965,7 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
                 if first is None:
                     self._commit(pos, old_target, video, sound, cache)
             if first is None:
-                cache.prepare_chunk(target)
+                self._begin_chunk(cache, pos, source, target)
             video, sound = self._sample_block(
                 state.visual,
                 state.audio,

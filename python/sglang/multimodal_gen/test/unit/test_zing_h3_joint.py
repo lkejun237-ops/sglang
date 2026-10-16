@@ -5,6 +5,9 @@
 import pytest
 import torch
 
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+    sampling,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.sampling import (
     ZingH3Sampler,
 )
@@ -13,6 +16,11 @@ from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
     cpu_execution_options,
     request,
 )
+
+
+def _replicated_eligibility_votes(output, value, group=None):
+    """Single-lane eligibility seams assume matching peer state, without model work."""
+    output[:] = [value] * len(output)
 
 
 @pytest.mark.parametrize("mode", ["source_first", "cross_chunk"])
@@ -220,13 +228,16 @@ def test_joint_sp2_layout(model, monkeypatch, mode, source_hw):
     comm = _CPUCollectives(2)
     monkeypatch.setattr(zing_h3, "get_ulysses_ctx", lambda: (2, comm.thread.rank))
     monkeypatch.setattr(
-        zing_h3, "get_sp_group", lambda: SimpleNamespace(ulysses_group=None)
+        zing_h3,
+        "get_sp_group",
+        lambda: SimpleNamespace(ulysses_group=None, cpu_group=comm),
     )
     monkeypatch.setattr(zing_h3, "gather_sequence_varlen", comm.gather)
     monkeypatch.setattr(usp, "get_ulysses_parallel_world_size", lambda: 2)
     monkeypatch.setattr(usp, "get_ulysses_parallel_rank", lambda: comm.thread.rank)
     monkeypatch.setattr(usp, "_ipc_ready_group", lambda: None)
     monkeypatch.setattr(usp, "_usp_all_to_all_single_varlen", comm.all_to_all)
+    monkeypatch.setattr(sampling.dist, "all_gather_object", comm.gather_objects)
 
     @torch.no_grad()
     def worker(rank):
@@ -289,7 +300,17 @@ def test_unvalidated_sp_size_is_observable_fallback(model, monkeypatch):
     sampler = ZingH3Sampler(model, packer, sigma_points=3, joint_forward="source_first")
     state = sampler.initialize(inputs, visual)
     try:
-        monkeypatch.setattr(zing_h3, "get_ulysses_ctx", lambda: (4, 0))
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(
+            zing_h3, "get_sp_group", lambda: SimpleNamespace(cpu_group=object())
+        )
+        monkeypatch.setattr(
+            sampling.dist,
+            "all_gather_object",
+            _replicated_eligibility_votes,
+        )
+        monkeypatch.setattr(zing_h3, "get_ulysses_ctx", lambda: (8, 0))
         assert not sampler._joint_eligible(state.positive, state.cache, 1, 2, None)
         assert sampler.last_run_metrics["joint_fallbacks"]["sp_size"] == 1
     finally:
@@ -589,3 +610,276 @@ def test_joint_kernel_explicit_separate_and_cpu_fallback(monkeypatch):
     monkeypatch.setenv("SGLANG_ZING_JOINT_ATTENTION", "typo")
     with pytest.raises(ValueError, match="auto or separate"):
         fused_joint_attention(q, q, q, (2, 4), 128**-0.5, "fa4")
+
+
+@pytest.fixture
+def four_head_model(model):
+    from dataclasses import replace
+
+    from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import ZingH3DiTConfig
+    from sglang.multimodal_gen.runtime.models.dits import zing_h3
+
+    arch = replace(
+        model.arch,
+        num_attention_heads=4,
+        hidden_size=32,
+        adaln_out_features=6 * model.arch.num_modalities * 32,
+        final_adaln_out_features=64,
+    )
+    result = zing_h3.ZingH3DiTModel(ZingH3DiTConfig(arch_config=arch), {}).eval()
+    torch.manual_seed(7)
+    with torch.no_grad():
+        for name, param in result.named_parameters():
+            if "norm" in name and name.endswith("weight"):
+                param.fill_(1)
+            else:
+                param.copy_(torch.randn(param.shape) * 0.08)
+        result.rope.inv_freq.fill_(1)
+    return result
+
+
+def _joint_cache_snapshot(cache, phase, blocks, positions, layers):
+    source = cache.pending_source
+    active = cache.active
+    metadata = (
+        phase,
+        cache.last_block,
+        tuple((c.block, c.frames) for c in cache.committed),
+        None if source is None else (source.block, source.frames),
+        None if active is None else active[0],
+    )
+    tensors = [blocks.clone(), positions.clone()]
+    if active is not None:
+        tensors.append(active[1].clone())
+    for chunk in cache._history():
+        tensors.append(chunk.positions.clone())
+        tensors.extend(value.clone() for pair in chunk.layers for value in pair)
+    if layers is not None:
+        tensors.extend(value.clone() for pair in layers for value in pair)
+    return metadata, tensors
+
+
+@pytest.mark.parametrize("mode", ["source_first", "cross_chunk"])
+@pytest.mark.parametrize("world", [1, 2, 4])
+@pytest.mark.parametrize("source_hw", [(2, 2), (2, 4)])
+@pytest.mark.parametrize("pooled", [False, True])
+@pytest.mark.parametrize("rope_mode", ["absolute", "block_relative"])
+def test_joint_sp_matches_same_sp_sequential_cache_and_outputs(
+    four_head_model, monkeypatch, mode, world, source_hw, pooled, rope_mode
+):
+    """SP4 must fuse real branches, including split boundaries and empty local heads."""
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import ZingH3DiTConfig
+    from sglang.multimodal_gen.runtime.layers import usp
+    from sglang.multimodal_gen.runtime.models.dits import zing_h3
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
+    from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+        allocate_layer_stores,
+    )
+    from sglang.multimodal_gen.test.unit.test_zing_h3_sp_cpu import _CPUCollectives
+
+    model = four_head_model
+    packer, inputs, _, _ = request(model, audio=False)
+    packer = type(packer)(model.arch, num_frame_per_block=[3, 2])
+    inputs.visual_shape = (15, 2, 2)
+    inputs.source_visual = torch.randn(1, 2, 15, *source_hw)
+    visual = torch.randn(1, 2, 15, 2, 2)
+    comm = _CPUCollectives(world)
+    monkeypatch.setattr(zing_h3, "get_ulysses_ctx", lambda: (world, comm.thread.rank))
+    monkeypatch.setattr(
+        zing_h3,
+        "get_sp_group",
+        lambda: SimpleNamespace(ulysses_group=None, cpu_group=comm),
+    )
+    monkeypatch.setattr(zing_h3, "gather_sequence_varlen", comm.gather)
+    monkeypatch.setattr(usp, "get_ulysses_parallel_world_size", lambda: world)
+    monkeypatch.setattr(usp, "get_ulysses_parallel_rank", lambda: comm.thread.rank)
+    monkeypatch.setattr(usp, "_ipc_ready_group", lambda: None)
+    monkeypatch.setattr(usp, "_usp_all_to_all_single_varlen", comm.all_to_all)
+    monkeypatch.setattr(sampling.dist, "all_gather_object", comm.gather_objects)
+    original_update = ZingH3KVCache.update
+    original_forward = ZingH3Sampler._forward
+    original_project = zing_h3.ZingH3DiTModel._project_outputs
+    # Real SP ranks own independent models, including mutable derived buffers.
+    rank_models = [
+        zing_h3.ZingH3DiTModel(ZingH3DiTConfig(arch_config=model.arch), {}).eval()
+        for _ in range(world)
+    ]
+    for rank_model in rank_models:
+        rank_model.load_state_dict(model.state_dict())
+
+    def update(cache, positions, blocks, phase, frames, layers=None, validation=None):
+        original_update(cache, positions, blocks, phase, frames, layers, validation)
+        assert cache.raw_store
+        comm.thread.snapshots.append(
+            _joint_cache_snapshot(cache, phase, blocks, positions, layers)
+        )
+
+    def forward(sampler, packed, cache, update):
+        result = original_forward(sampler, packed, cache, update)
+        if update in ("active", "joint"):
+            rows = int((packed["block_idx"] == packed["block_idx"][-1]).sum())
+            comm.thread.targets.append(result[0][-rows:].clone())
+        if update == "joint":
+            comm.thread.phases.append(packed["_zing_joint_phases"])
+        return result
+
+    def project(self, hidden, p, layout, *, joint_ends=None):
+        if joint_ends is not None:
+            comm.thread.layouts.append(
+                (joint_ends, layout.row_start, hidden.shape[0], layout.sequence_splits)
+            )
+        return original_project(self, hidden, p, layout, joint_ends=joint_ends)
+
+    monkeypatch.setattr(ZingH3KVCache, "update", update)
+    monkeypatch.setattr(ZingH3Sampler, "_forward", forward)
+    monkeypatch.setattr(zing_h3.ZingH3DiTModel, "_project_outputs", project)
+
+    @torch.no_grad()
+    def worker(rank, selected):
+        comm.thread.rank = rank
+        comm.thread.snapshots, comm.thread.targets = [], []
+        comm.thread.phases, comm.thread.layouts = [], []
+        sampler = ZingH3Sampler(
+            rank_models[rank],
+            packer,
+            sigma_points=3,
+            joint_forward=selected,
+            window_chunks=3,
+            sink_chunks=1,
+            rope_position_mode=rope_mode,
+        )
+        storage = (
+            allocate_layer_stores(
+                128,
+                num_layers=len(model.blocks),
+                local_heads=model.arch.num_attention_heads // world,
+                head_dim=model.arch.attention_head_dim,
+                dtype=torch.bfloat16,
+                device=torch.device("cpu"),
+            )
+            if pooled
+            else None
+        )
+        state = sampler.initialize(inputs, visual.clone(), storage=storage)
+        try:
+            if selected == "cross_chunk":
+                sampler._sample_cross_chunk(state)
+            else:
+                while state.index < len(state.spans):
+                    sampler.step(state)
+            assert state.cache.last_block == 12
+            assert state.cache.active is state.cache.pending_source is None
+            assert state.cache.stats["compactions"] >= 3
+            if pooled:
+                assert state.cache.stats["store_allocations"] == 0
+                assert state.cache.stats["rotated_allocations"] == 0
+            return (
+                state.visual.clone(),
+                list(comm.thread.snapshots),
+                list(comm.thread.targets),
+                dict(sampler.last_run_metrics),
+                list(comm.thread.phases),
+                list(comm.thread.layouts),
+            )
+        finally:
+            state.close()
+            assert state.cache.positions() is None
+            assert state.cache.active is state.cache.pending_source is None
+
+    runs = []
+    for selected in ("off", mode):
+        with ThreadPoolExecutor(max_workers=world) as executor:
+            futures = [executor.submit(worker, rank, selected) for rank in range(world)]
+            runs.append([future.result() for future in futures])
+    for expected, actual in zip(*runs):
+        torch.testing.assert_close(actual[0], expected[0], atol=0.008, rtol=0.008)
+        assert len(actual[1]) == len(expected[1])
+        for (am, at), (em, et) in zip(actual[1], expected[1]):
+            assert am == em
+            assert len(at) == len(et)
+            for value, reference in zip(at, et):
+                torch.testing.assert_close(value, reference, atol=0.008, rtol=0.008)
+        assert len(actual[2]) == len(expected[2])
+        for value, reference in zip(actual[2], expected[2]):
+            torch.testing.assert_close(value, reference, atol=0.008, rtol=0.008)
+        counts = actual[3]["forward_counts"]
+        assert counts[mode] > 0
+        assert actual[3]["dit_forwards"] < expected[3]["dit_forwards"]
+        phases = (
+            ("source", "active")
+            if mode == "source_first"
+            else ("final", "source", "active")
+        )
+        assert phases in actual[4]
+        assert actual[4].count(phases) == counts[mode]
+        assert "sp_size" not in actual[3]["joint_fallbacks"]
+    if world == 4:
+        layouts = [layout for result in runs[1] for layout in result[5]]
+        assert any(
+            start < stop < start + rows
+            for ends, start, rows, _ in layouts
+            for stop in ends[:-1]
+        )
+        assert any(
+            stop <= start or begin >= start + rows
+            for ends, start, rows, _ in layouts
+            for begin, stop in zip((0, *ends[:-1]), ends)
+        )
+        assert any(len(set(splits)) > 1 for _, _, _, splits in layouts)
+
+
+@pytest.mark.parametrize("mode", ["source_first", "cross_chunk"])
+@pytest.mark.parametrize("world,reason", [(4, "different_rope_views"), (8, "sp_size")])
+def test_joint_sp_rope_conflict_and_unsupported_size_fall_back_before_joint_work(
+    four_head_model, monkeypatch, mode, world, reason
+):
+    from sglang.multimodal_gen.runtime.models.dits import zing_h3
+
+    model = four_head_model
+    packer, inputs, visual, _ = request(model, audio=False)
+    # Only the admission/transaction seam needs SP here; eager work stays SP1.
+    original_ctx = zing_h3.get_ulysses_ctx
+    original_joint = ZingH3Sampler._joint_eligible
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        zing_h3, "get_sp_group", lambda: SimpleNamespace(cpu_group=object())
+    )
+    monkeypatch.setattr(
+        sampling.dist,
+        "all_gather_object",
+        _replicated_eligibility_votes,
+    )
+
+    def eligible(sampler, *args):
+        monkeypatch.setattr(zing_h3, "get_ulysses_ctx", lambda: (world, 0))
+        try:
+            return original_joint(sampler, *args)
+        finally:
+            monkeypatch.setattr(zing_h3, "get_ulysses_ctx", original_ctx)
+
+    monkeypatch.setattr(ZingH3Sampler, "_joint_eligible", eligible)
+    outputs = []
+    for selected in ("off", mode):
+        sampler = ZingH3Sampler(model, packer, sigma_points=3, joint_forward=selected)
+        state = sampler.initialize(inputs, visual.clone())
+        try:
+            pos = state.positive
+            if reason == "different_rope_views":
+                pos["position_ids"][pos["block_idx"] == 1, 0] += 100
+            sampler.step(state)
+            outputs.append(state.visual.clone())
+            if selected != "off":
+                assert sampler.last_run_metrics["joint_fallbacks"].get(reason, 0) == 1
+                assert sampler.last_run_metrics["forward_counts"]["source_first"] == 0
+                assert sampler.last_run_metrics["forward_counts"]["cross_chunk"] == 0
+                assert state.cache.last_block == 2
+                assert state.cache.active is state.cache.pending_source is None
+                if world == 4:
+                    assert "sp_size" not in sampler.last_run_metrics["joint_fallbacks"]
+        finally:
+            state.close()
+    torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)

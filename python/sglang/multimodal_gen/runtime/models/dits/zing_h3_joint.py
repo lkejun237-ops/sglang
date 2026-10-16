@@ -53,7 +53,9 @@ class ZingJointTransaction:
             elif phase == "final":
                 next_id = block // 2
                 ids = [c.temporal_chunk_id for c in cache.committed] + [next_id - 1]
-                if not all(cache.window_policy.retains(i, next_id) for i in ids):
+                if cache.window_eviction_timing == "before_source" and not all(
+                    cache.window_policy.retains(i, next_id) for i in ids
+                ):
                     raise ValueError(
                         "Zing cross-chunk transaction requires window eviction"
                     )
@@ -99,6 +101,15 @@ class ZingJointTransaction:
         try:
             for branch in self.branches:
                 selection = slice(branch.start, branch.stop)
+                if branch.phase == "source" and self.branches[0].phase == "final":
+                    cache.begin_chunk(
+                        int(
+                            (blocks if validation is None else validation[1])[
+                                selection
+                            ][0]
+                        )
+                        + 1
+                    )
                 cache.update(
                     positions[selection],
                     blocks[selection],

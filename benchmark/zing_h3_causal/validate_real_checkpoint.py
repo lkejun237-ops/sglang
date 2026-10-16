@@ -387,6 +387,7 @@ def run_sglang(args):
                     ),
                     "zing_return_latents": True,
                     "zing_joint_forward": args.joint_forward,
+                    "zing_window_eviction_timing": args.window_eviction_timing,
                     "zing_window_chunks": args.window_chunks,
                     "zing_sink_chunks": args.sink_chunks,
                     "zing_rope_position_mode": args.rope_position_mode,
@@ -483,6 +484,7 @@ def run_sglang(args):
                 ),
                 "guidance_scale": args.guidance_scale,
                 "joint_forward": args.joint_forward,
+                "window_eviction_timing": args.window_eviction_timing,
                 "window_chunks": args.window_chunks,
                 "sink_chunks": args.sink_chunks,
                 "rope_position_mode": args.rope_position_mode,
@@ -771,6 +773,11 @@ def parser():
     sglang = sub.add_parser("sglang", parents=[common])
     sglang.add_argument(
         "--joint-forward", choices=("off", "source_first", "cross_chunk"), default="off"
+    )
+    sglang.add_argument(
+        "--window-eviction-timing",
+        choices=("before_source", "after_step0"),
+        default="after_step0",
     )
     sglang.add_argument("--window-chunks", type=int, default=21)
     sglang.add_argument(

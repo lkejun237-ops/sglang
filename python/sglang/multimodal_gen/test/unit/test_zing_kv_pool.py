@@ -2,6 +2,7 @@
 """Zing realtime KV pool contract, capacity and admission (#171, CPU only)."""
 
 import math
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,9 @@ from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
 )
 from sglang.multimodal_gen.runtime.realtime.zing_window import ZingWindowPolicy
 
+# Historical capacity oracle explicitly exercises before-source eviction.
+peak_rows = partial(peak_rows, window_eviction_timing="before_source")
+
 
 def _geometry(lengths=5, split=False, short_edge=720):
     return ZingKVGeometry(16, (1, 2, 2), short_edge, ChunkPlan(lengths, split))
@@ -27,6 +31,7 @@ def _geometry(lengths=5, split=False, short_edge=720):
 def _config(**overrides):
     values = dict(
         pool_size=2,
+        window_eviction_timing="before_source",
         max_target_area=1280 * 704,
         max_target_long_edge=1280,
         max_prefix_rows=4096,
@@ -38,6 +43,7 @@ def _config(**overrides):
 def _request(h=480, w=832, *, source=True, prefix=1000, **overrides):
     values = dict(
         target_height=h,
+        window_eviction_timing="before_source",
         target_width=w,
         source_shape=(h, w) if source else None,
         prefix_rows=prefix,
@@ -55,7 +61,12 @@ def _simulated_peak(
     plan, window, *, prefix_rows, per_frame, has_source, chunks, audio_rows=None
 ):
     """Drive the real cache and record rows held at each denoise step."""
-    cache = ZingH3KVCache(1, window_policy=window, rope_position_mode="block_relative")
+    cache = ZingH3KVCache(
+        1,
+        window_policy=window,
+        rope_position_mode="block_relative",
+        window_eviction_timing="before_source",
+    )
 
     def layers(rows):
         return ((torch.zeros(rows, 1, 1), torch.zeros(rows, 1, 1)),)
@@ -204,6 +215,7 @@ def _pipeline(**values):
         "max_prefix_rows",
     )
     config = {f"zing_kv_pool_{n}": None for n in names}
+    config["zing_kv_pool_window_eviction_timing"] = "before_source"
     config.update({f"zing_kv_pool_{k}": v for k, v in values.items()})
     return SimpleNamespace(**config)
 

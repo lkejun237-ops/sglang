@@ -28,6 +28,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       run_cpu: ${{ steps.select.outputs.run_cpu }}
+      selection_artifact_id: ${{ steps.selection-artifact.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -40,7 +41,8 @@ jobs:
         name: Select from verified base/head Git history
         run: |
           python scripts/ci/zing/select_changes.py --base "$BASE_SHA" --head "$HEAD_SHA"             --event "$GITHUB_EVENT_NAME" --output artifacts/selection.json --github-output "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - id: selection-artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
           name: zing-selection-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
@@ -156,7 +158,8 @@ jobs:
           python-version: '3.11'
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: zing-selection-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          artifact-ids: ${{ needs.zing-changes.outputs.selection_artifact_id }}
+          merge-multiple: true
           path: artifacts
       - name: Require detector, lint, tooling and all selected business outcomes
         if: always()

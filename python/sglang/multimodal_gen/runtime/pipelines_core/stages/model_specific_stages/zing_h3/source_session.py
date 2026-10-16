@@ -61,6 +61,9 @@ class ZingSourceStreamState(BaseRealtimeState):
             raise ValueError("Continuous source requires a bounded attention window")
         self.policy = {
             "window_chunks": sampler.window_policy.window_chunks,
+            "window_eviction_timing": getattr(
+                sampler, "window_eviction_timing", "after_step0"
+            ),
             "sink_chunks": sampler.window_policy.sink_chunks,
             "rope_position_mode": sampler.rope_position_mode,
             "rope_max_frame_gap": sampler.rope_max_frame_gap,

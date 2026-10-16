@@ -51,6 +51,10 @@ class _CPUCollectives:
 
         return self.exchange((value, input_splits), receive)
 
+    def gather_objects(self, output, value, group=None):
+        """Model rank agreement with real per-thread payloads and barriers."""
+        output[:] = self.exchange(value, lambda values, rank: list(values))
+
     def gather(self, value, splits, group, *, dim):
         assert value.shape[dim] == splits[self.thread.rank]
         return self.exchange(value, lambda values, rank: torch.cat(values, dim=dim))

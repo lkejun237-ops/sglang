@@ -20,7 +20,7 @@ def test_invalid_window(window, sink):
         ZingWindowPolicy(window, sink)
 
 
-def _commit(cache, chunk):
+def _commit(cache, chunk, *, delayed=False):
     n = chunk.end - chunk.start
     # Fractional visual positions and interleaved audio rows remain absolute.
     pos = torch.tensor(
@@ -28,9 +28,14 @@ def _commit(cache, chunk):
         dtype=torch.float64,
     )
     layers = ((torch.ones(2, 1, 2) * chunk.chunk_id, torch.zeros(2, 1, 2)),)
-    cache.prepare_chunk(chunk.target_block)
+    if delayed:
+        cache.begin_chunk(chunk.target_block)
+    else:
+        cache.prepare_chunk(chunk.target_block)
     cache.update(pos, torch.full((2,), chunk.source_block), "source", n, layers)
     cache.update(pos, torch.full((2,), chunk.target_block), "active", n)
+    if delayed:
+        cache.complete_step0_and_evict(chunk.target_block)
     cache.update(pos, torch.full((2,), chunk.target_block), "final", n, layers)
 
 
@@ -38,7 +43,11 @@ def _commit(cache, chunk):
 @pytest.mark.parametrize("lengths", [5, [1, 2, 2]])
 @pytest.mark.parametrize("window,sink", [(21, 3), (1, 0), (4, 3)])
 def test_temporal_selection_and_storage_release(lengths, window, sink):
-    cache = ZingH3KVCache(1, window_policy=ZingWindowPolicy(window, sink))
+    cache = ZingH3KVCache(
+        1,
+        window_policy=ZingWindowPolicy(window, sink),
+        window_eviction_timing="before_source",
+    )
     plan = ChunkPlan(lengths)
     for i in range(65):
         old = {c.temporal_chunk_id: weakref.ref(c) for c in cache.committed}
@@ -60,8 +69,10 @@ def test_temporal_selection_and_storage_release(lengths, window, sink):
 
 @torch.no_grad()
 def test_full_history_and_session_isolation():
-    full = ZingH3KVCache(1)
-    bounded = ZingH3KVCache(1, window_policy=ZingWindowPolicy(21, 3))
+    full = ZingH3KVCache(1, window_eviction_timing="before_source")
+    bounded = ZingH3KVCache(
+        1, window_policy=ZingWindowPolicy(21, 3), window_eviction_timing="before_source"
+    )
     for i in range(35):
         for cache in (full, bounded):
             _commit(cache, ChunkPlan(5).chunk(i))
@@ -150,3 +161,32 @@ def test_relative_sink_to_recent_gap_stays_bounded_after_long_eviction():
         assert q[0, 0] == 15
         assert cache.committed[1].layers[0][0] is key
         assert cache.committed[1].positions is recent
+
+
+@torch.no_grad()
+def test_default_delayed_cache_completes_manual_step0_before_final():
+    cache = ZingH3KVCache(1, window_policy=ZingWindowPolicy(2, 0))
+    assert cache.window_eviction_timing == "after_step0"
+    plan = ChunkPlan(1)
+    for index in range(5):
+        previous = [chunk.temporal_chunk_id for chunk in cache.committed]
+        chunk = plan.chunk(index)
+        cache.begin_chunk(chunk.target_block)
+        assert [entry.temporal_chunk_id for entry in cache.committed] == previous
+        pos = torch.tensor([[index, 0, 0]], dtype=torch.float64)
+        layers = ((torch.full((1, 1, 2), float(index)), torch.zeros(1, 1, 2)),)
+        cache.update(pos, torch.tensor([chunk.source_block]), "source", 1, layers)
+        cache.update(pos, torch.tensor([chunk.target_block]), "active", 1)
+        assert [entry.temporal_chunk_id for entry in cache.committed] == previous
+        cache.complete_step0_and_evict(chunk.target_block)
+        assert cache.eviction_target_block is None
+        assert [entry.temporal_chunk_id for entry in cache.committed] == list(
+            range(max(0, index - 1), index)
+        )
+        cache.update(pos, torch.tensor([chunk.target_block]), "final", 1, layers)
+        assert [entry.temporal_chunk_id for entry in cache.committed] == list(
+            range(max(0, index - 1), index + 1)
+        )
+        assert cache.pending_source is cache.active is None
+    cache.clear()
+    assert cache.history(0) is None

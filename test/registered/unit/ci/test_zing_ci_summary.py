@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -25,6 +26,62 @@ from zing_ci_fixtures import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=40, stage="base-a", runner_config="cpu")
+
+
+@pytest.mark.parametrize("producer_attempt,summary_attempt", [(1, 1), (1, 2), (2, 3)])
+def test_summary_downloads_the_successful_detector_artifact_on_partial_rerun(
+    producer_attempt, summary_attempt
+):
+    jobs = yaml.safe_load((ROOT / ".github/workflows/zing-ci.yml").read_text())["jobs"]
+    detector = jobs["zing-changes"]
+    upload = next(
+        step for step in detector["steps"] if "upload-artifact@" in step.get("uses", "")
+    )
+    download = next(
+        step
+        for step in jobs["zing-ci"]["steps"]
+        if "download-artifact@" in step.get("uses", "")
+    )
+    sha, run_id, artifact_id = "current-merge-sha", "42", "1001"
+
+    def resolve(value, context):
+        return re.sub(r"\$\{\{\s*(.*?)\s*\}\}", lambda match: context[match[1]], value)
+
+    producer = {
+        "github.run_id": run_id,
+        "github.run_attempt": str(producer_attempt),
+        "github.sha": sha,
+    }
+    artifact_name = resolve(upload["with"]["name"], producer)
+    # The upload action returns an immutable ID. GitHub preserves outputs of
+    # successful prerequisites when only failed downstream jobs are rerun.
+    producer[f"steps.{upload.get('id')}.outputs.artifact-id"] = artifact_id
+    consumer = {
+        "github.run_id": run_id,
+        "github.run_attempt": str(summary_attempt),
+        "github.sha": sha,
+    }
+    consumer.update(
+        {
+            f"needs.zing-changes.outputs.{key}": resolve(value, producer)
+            for key, value in detector["outputs"].items()
+            if key != "run_cpu"
+        }
+    )
+    artifacts = {artifact_name: {"id": artifact_id, "sha": sha}}
+    # Include an unrelated artifact: matching a prefix or selecting the newest
+    # artifact must never silently accept evidence for a different commit.
+    artifacts["zing-selection-42-99-other-sha"] = {"id": "9999", "sha": "other-sha"}
+    inputs = download["with"]
+    if "artifact-ids" in inputs:
+        requested = resolve(inputs["artifact-ids"], consumer)
+        matches = [item for item in artifacts.values() if item["id"] == requested]
+        assert inputs.get("merge-multiple") is True
+    else:
+        requested = resolve(inputs["name"], consumer)
+        matches = [artifacts[requested]] if requested in artifacts else []
+    assert matches == [{"id": artifact_id, "sha": sha}], requested
+    assert "pattern" not in inputs and "run-id" not in inputs
 
 
 @pytest.mark.parametrize(

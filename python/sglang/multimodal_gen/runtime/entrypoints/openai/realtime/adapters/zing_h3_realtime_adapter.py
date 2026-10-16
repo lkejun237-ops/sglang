@@ -191,6 +191,7 @@ class ZingH3RealtimeAdapter(BaseRealtimeModelAdapter):
             "zing_sink_chunks",
             "zing_rope_position_mode",
             "zing_rope_max_frame_gap",
+            "zing_window_eviction_timing",
         ):
             value = getattr(request, name, None)
             if value is not None:

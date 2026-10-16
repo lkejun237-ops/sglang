@@ -10,10 +10,11 @@ audio latents that packing assigns to its time span. Slots always reserve that
 target audio. Reference audio lives in the block-zero prefix and is covered by
 ``max_prefix_rows``.
 
-Peak occupancy is reached while a target block is being denoised: eviction has
-already run (``ZingH3KVCache.prepare_chunk`` precedes the source forward), the
-current source is committed as pending, and the target occupies the scratch
-tail. Unconditional CFG forwards run without a cache and are not counted.
+Peak occupancy is enumerated through source and target stages. With
+``before_source`` the retained window is selected before source; with
+``after_step0`` the previous live window survives source and target step zero.
+The target occupies the scratch tail until final commits it. Unconditional
+CFG forwards run without a cache and are not counted.
 """
 
 import logging
@@ -62,17 +63,19 @@ def allocate_layer_stores(
     """Allocate one slot (or the prefix workspace) before readiness."""
     _positive_int("rows", rows)
     shape = (rows, local_heads, head_dim)
+    # Zero-filled once at startup: fixed-shape attention may read rows past the
+    # live length, so every unwritten row must be finite (0 * NaN V is NaN).
     # Raw K must expose mutations to per-chunk RoPE cache signatures, even
     # when startup allocation runs inside inference_mode. No request allocation.
     with torch.inference_mode(False):
         keys = [
-            torch.empty(shape, dtype=dtype, device=device) for _ in range(num_layers)
+            torch.zeros(shape, dtype=dtype, device=device) for _ in range(num_layers)
         ]
     return [
         ZingLayerStore(
             k,
-            torch.empty(shape, dtype=dtype, device=device),
-            torch.empty(shape, dtype=dtype, device=device),
+            torch.zeros(shape, dtype=dtype, device=device),
+            torch.zeros(shape, dtype=dtype, device=device),
         )
         for k in keys
     ]
@@ -171,6 +174,7 @@ class ZingKVPoolConfig:
     sink_chunks: int = 3
     rope_position_mode: str = "block_relative"
     rope_max_frame_gap: int = 12
+    window_eviction_timing: str = "after_step0"
 
     def __post_init__(self):
         for name in (
@@ -182,6 +186,10 @@ class ZingKVPoolConfig:
             _positive_int(name, getattr(self, name))
         if self.window_chunks is None:
             raise ValueError("Zing KV pool requires a finite attention window")
+        if self.window_eviction_timing not in ("before_source", "after_step0"):
+            raise ValueError(
+                "Zing window eviction timing must be before_source or after_step0"
+            )
         ZingWindowPolicy(self.window_chunks, self.sink_chunks)
         ZingWindowPolicy.validate_rope(self.rope_position_mode, self.rope_max_frame_gap)
 
@@ -201,6 +209,7 @@ class ZingKVPoolConfig:
             "sink_chunks",
             "rope_position_mode",
             "rope_max_frame_gap",
+            "window_eviction_timing",
         )
         size = getattr(pipeline_config, prefix + "size", None)
         values = {n: getattr(pipeline_config, prefix + n, None) for n in names}
@@ -237,6 +246,7 @@ def peak_rows(
     total_frames: int | None = None,
     has_audio: bool = False,
     audio_length: int | None = None,
+    window_eviction_timing: str = "after_step0",
 ) -> int:
     """Maximum rows held by one session at any denoising step.
 
@@ -250,11 +260,16 @@ def peak_rows(
     """
     if window.window_chunks is None:
         raise ValueError("Zing KV pool capacity requires a finite window")
+    if window_eviction_timing not in ("before_source", "after_step0"):
+        raise ValueError(
+            "Zing window eviction timing must be before_source or after_step0"
+        )
+    committed = {}
     plan = geometry.chunk_plan
     per_frame = rows_per_frame * (2 if has_source else 1)
     split = int(plan.split_first_latent and plan.lengths[0] > 1)
     steady = window.window_chunks + 2 + split
-    rows, best, seen, stop, current = [], 0, {}, None, 0
+    best, seen, stop, current = 0, {}, None, 0
     while True:
         chunk = plan.chunk(current, total_frames)
         if chunk is None:
@@ -266,9 +281,17 @@ def peak_rows(
             count += 2 * geometry.audio_frames(
                 chunk.start, chunk.end, tail=tail, audio_length=audio_length
             )
-        rows.append(count)
-        live = sum(rows[i] for i in range(current) if window.retains(i, current))
-        best = max(best, live + rows[current])
+        retained = {i: n for i, n in committed.items() if window.retains(i, current)}
+        old = (
+            sum(committed.values())
+            if window_eviction_timing == "after_step0"
+            else sum(retained.values())
+        )
+        # Source rows are persistent, target rows occupy the tail until final.
+        # Cross-chunk previous-final replaces previous-target scratch, so the
+        # union tail reaches this same old-history + source + target peak.
+        best = max(best, old + count)
+        committed = {**retained, current: count}
         # A finite session is enumerated to its end: its last chunk is
         # truncated and absorbs the remaining audio, so it breaks the period.
         if total_frames is None and stop is None and current >= steady:
@@ -307,6 +330,7 @@ class ZingKVRequest:
     # Audio latent length of a finite session; None for a continuous one.
     audio_length: int | None = None
     total_frames: int | None = None
+    window_eviction_timing: str = "after_step0"
 
 
 @dataclass(frozen=True)
@@ -330,6 +354,7 @@ class ZingKVPoolPlan:
             prefix_rows=config.max_prefix_rows,
             rows_per_frame=max_rows_per_frame,
             has_source=True,
+            window_eviction_timing=config.window_eviction_timing,
             # Reserve target audio for every session; it is a small fraction
             # of the visual rows and avoids a second slot class.
             has_audio=geometry.video_t_span is not None,
@@ -372,12 +397,14 @@ class ZingKVPoolPlan:
             request.sink_chunks,
             request.rope_position_mode,
             request.rope_max_frame_gap,
+            request.window_eviction_timing,
         )
         expected = (
             c.window_chunks,
             c.sink_chunks,
             c.rope_position_mode,
             c.rope_max_frame_gap,
+            c.window_eviction_timing,
         )
         if policy != expected:
             raise _unsupported(
@@ -420,6 +447,7 @@ class ZingKVPoolPlan:
             rows_per_frame=g.rows_per_frame(h, w),
             has_source=request.source_shape is not None,
             total_frames=request.total_frames,
+            window_eviction_timing=request.window_eviction_timing,
             has_audio=request.generates_audio,
             audio_length=request.audio_length if request.generates_audio else None,
         )

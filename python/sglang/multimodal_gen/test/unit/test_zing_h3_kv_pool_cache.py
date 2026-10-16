@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pooled ZingH3KVCache storage: parity, reuse and no growth (#171, CPU only)."""
 
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from types import SimpleNamespace
@@ -236,7 +237,10 @@ def _transactions(sampler, layout, blocks):
 @torch.no_grad()
 @pytest.mark.parametrize("world", [2, 4])
 @pytest.mark.parametrize("stable_shapes", [False, True])
-def test_sp_pooled_raw_store_matches_unpooled(model, monkeypatch, world, stable_shapes):
+@pytest.mark.parametrize("timing", ["before_source", "after_step0"])
+def test_sp_pooled_raw_store_matches_unpooled(
+    model, monkeypatch, world, stable_shapes, timing
+):
     """SP raw K and replicated-prefix shards are staged into the slot."""
     if world == 4:
         arch = replace(
@@ -289,12 +293,17 @@ def test_sp_pooled_raw_store_matches_unpooled(model, monkeypatch, world, stable_
         monkeypatch.setattr(ZingH3KVCache, name, counted)
 
     def cache(storage):
-        return ZingH3KVCache(
+        # Keep the historical prepare_chunk oracle explicit; delayed mode uses the default.
+        policy = {"window_eviction_timing": timing} if timing == "before_source" else {}
+        result = ZingH3KVCache(
             len(model.blocks),
             window_policy=ZingWindowPolicy(**WINDOW),
             rope_position_mode="block_relative",
             storage=storage,
+            **policy,
         )
+        assert result.window_eviction_timing == timing
+        return result
 
     def run(pooled):
         def rank_worker(rank):
@@ -305,16 +314,36 @@ def test_sp_pooled_raw_store_matches_unpooled(model, monkeypatch, world, stable_
                 outputs = []
                 for packed, phase in transactions:
                     if phase == "source":
-                        # Evict before the source, as ZingH3Sampler.step does.
-                        target.prepare_chunk(int(packed["block_idx"][0]) + 1)
+                        block = int(packed["block_idx"][0]) + 1
+                        if timing == "before_source":
+                            target.prepare_chunk(block)
+                        else:
+                            target.begin_chunk(block)
                     outputs.append(sampler._forward(packed, target, phase))
+                    if timing == "after_step0" and phase == "active":
+                        target.complete_step0_and_evict(int(packed["block_idx"][0]))
                 return outputs, target, storage
 
         with ThreadPoolExecutor(max_workers=world) as executor:
-            return [
-                f.result()
-                for f in [executor.submit(rank_worker, r) for r in range(world)]
-            ]
+            futures = [executor.submit(rank_worker, rank) for rank in range(world)]
+            results, errors = [], []
+            for rank, future in enumerate(futures):
+                try:
+                    results.append(future.result())
+                except Exception as error:
+                    errors.append((rank, error))
+            if errors:
+                details = "\n".join(
+                    f"CPU SP rank {rank}, pooled={pooled}, timing={timing}:\n"
+                    + "".join(
+                        traceback.format_exception(
+                            type(error), error, error.__traceback__
+                        )
+                    )
+                    for rank, error in errors
+                )
+                raise RuntimeError(details) from errors[0][1]
+            return results
 
     unpooled, pooled_runs = run(False), run(True)
     # Every SP commit stages raw K into the slot; a replicated prefix stages
@@ -382,6 +411,40 @@ def test_move_rows_matches_cloned_copy_for_overlapping_left_shifts(
     expected[destination : destination + rows] = tensor[source : source + rows].clone()
     move_rows(tensor, destination, source, rows)
     assert torch.equal(tensor, expected)
+
+
+@pytest.mark.parametrize(
+    "spans",
+    [
+        [],
+        [(0, 4), (4, 6)],
+        [(0, 3), (7, 5), (14, 2)],
+        [(5, 4), (12, 6)],
+        [(0, 2), (3, 1), (9, 8)],
+    ],
+)
+def test_move_store_rows_moves_only_the_listed_rows_left(spans):
+    cache = ZingH3KVCache.__new__(ZingH3KVCache)
+    cache._stores = {
+        layer: (
+            torch.randn(24, 2, 4, generator=torch.Generator().manual_seed(layer)),
+            torch.randn(24, 2, 4, generator=torch.Generator().manual_seed(9 + layer)),
+        )
+        for layer in range(3)
+    }
+    before = {
+        layer: tuple(tensor.clone() for tensor in pair)
+        for layer, pair in cache._stores.items()
+    }
+    cache.move_store_rows(spans)
+    live = sum(rows for _, rows in spans)
+    for layer, pair in cache._stores.items():
+        for tensor, original in zip(pair, before[layer]):
+            pieces = [original[o : o + r] for o, r in spans] or [original[:0]]
+            expected = torch.cat(pieces)
+            assert torch.equal(tensor[:live], expected)
+            # Rows past the live length are never read and stay untouched.
+            assert torch.equal(tensor[live:], original[live:])
 
 
 @pytest.mark.parametrize(

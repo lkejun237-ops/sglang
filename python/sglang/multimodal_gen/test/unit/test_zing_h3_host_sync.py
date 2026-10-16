@@ -145,8 +145,9 @@ def _chunk_rows(start, frames, width=2):
     return torch.tensor(rows)
 
 
+@pytest.mark.parametrize("timing", ["before_source", "after_step0"])
 @torch.no_grad()
-def test_host_mapping_matches_device_mapping_across_eviction():
+def test_host_mapping_matches_device_mapping_across_eviction(timing):
     """Host and device coordinate maps are equal through growth, merge and compaction."""
     from sglang.multimodal_gen.runtime.realtime.zing_window import ZingWindowPolicy
 
@@ -154,6 +155,7 @@ def test_host_mapping_matches_device_mapping_across_eviction():
         cache = ZingH3KVCache(
             1,
             window_policy=ZingWindowPolicy(2, 1),
+            window_eviction_timing=timing,
             rope_position_mode="block_relative",
             rope_max_frame_gap=2,
         )
@@ -172,7 +174,7 @@ def test_host_mapping_matches_device_mapping_across_eviction():
         )
         time = 3
         for block, frames in zip(range(2, 12, 2), (1, 2, 2, 1, 2)):
-            cache.prepare_chunk(block)
+            cache.begin_chunk(block)
             source = _chunk_rows(time, frames)
             target = _chunk_rows(time + 20, frames)
             for phase, rows, number in (
@@ -195,6 +197,8 @@ def test_host_mapping_matches_device_mapping_across_eviction():
                     None if phase == "active" else layer(rows.shape[0]),
                     validation=(rows.clone(), ids.clone()) if host else None,
                 )
+                if phase == "active":
+                    cache.complete_step0_and_evict(block)
                 for chunk in cache._stored_chunks():
                     if host:
                         device = chunk.positions.as_subclass(torch.Tensor)
