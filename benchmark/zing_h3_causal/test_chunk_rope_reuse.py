@@ -4,13 +4,14 @@
 A temporal chunk groups source + target/audio for one latent time interval.
 RoPE reuse tracks source and target parts separately, even after their commit
 merges them. These fixtures use two token rows per part, not checkpoint sizes;
-see CHUNK_ROPE_REUSE.md for the real [1, 2, 2] latent-frame cycle.
+see docs/docs/sglang-diffusion/zing/specs/CHUNK_ROPE_REUSE.md for the real [1, 2, 2] latent-frame cycle.
 """
 
 import os
 
 import pytest
 import torch
+
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
 from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import allocate_layer_stores
 from sglang.multimodal_gen.runtime.realtime.zing_window import ZingWindowPolicy

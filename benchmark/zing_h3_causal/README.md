@@ -1,5 +1,8 @@
 # Zing H3 benchmark 工具范围
 
+设计、接口契约与实现方案见 [Zing 设计文档](../../docs/docs/sglang-diffusion/zing/README.md)。
+本目录的文档范围遵守 [benchmark 目录约定](../README.md)。
+
 本目录是开发和验收工具，不由推理运行时导入。TAEH3 新增文件的保留理由是让正确性、
 持续吞吐和画质结果可复现；启动服务只需要运行时代码、pipeline 配置与模型权重。
 现有非 TAEH3 工具不因本 PR 删除。

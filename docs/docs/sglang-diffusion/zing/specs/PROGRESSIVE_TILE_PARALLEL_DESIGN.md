@@ -1,7 +1,7 @@
 # Progressive encoder tile 并行设计
 
 本文解释 PR #178 的行为、与既有 MiniMax H3 encoder SP 的关系，以及数值与故障处理边界。
-配置、测量和验收入口见 [运行与验收说明](PROGRESSIVE_TILE_PARALLEL.md)。
+配置、测量和验收入口见 [运行与验收说明](../../../../../benchmark/zing_h3_causal/PROGRESSIVE_TILE_PARALLEL.md)。
 
 ## 三个容易混淆的开关
 

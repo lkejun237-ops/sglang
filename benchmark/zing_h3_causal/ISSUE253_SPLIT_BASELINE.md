@@ -2,7 +2,7 @@
 
 This checkpoint makes the existing same-node Encoder service measurable for
 Issue #253. It reuses the continuous-source transport and Encoder overlap
-implementation described in [ENCODER_OVERLAP.md](ENCODER_OVERLAP.md):
+implementation described in [ENCODER_OVERLAP.md](../../docs/docs/sglang-diffusion/zing/specs/ENCODER_OVERLAP.md):
 
 - one dedicated source VAE Encoder GPU;
 - an SP2 DiT group whose two GPUs also host the TAEH3 Decoder;
@@ -60,7 +60,7 @@ Encoder RPC latency or DiT's blocking wait for the next latent.
 ## Run
 
 Use a deployment manifest containing `realtime_profile` and `taeh3_sha256`, as
-described in [ENCODER_OVERLAP.md](ENCODER_OVERLAP.md#prepare-inputs-without-a-gpu).
+described in [ENCODER_OVERLAP.md](../../docs/docs/sglang-diffusion/zing/specs/ENCODER_OVERLAP.md#prepare-inputs-without-a-gpu).
 The profile binds the checkpoint's `zing_config.json` hash and must select a
 four-step progressive streaming deployment. Model and TAEH3 weights must already
 be available; preparation does not convert checkpoints.
@@ -126,7 +126,7 @@ video review.
 For an already-running service, `bench_streaming_source.py` decodes video through
 a bounded FFmpeg pipe instead of requiring a full RGB export. It supports the
 same three cases, lossless paced/unpaced input and JSON export. See
-[SOURCE_TRANSPORT.md](SOURCE_TRANSPORT.md#incremental-video-benchmark) for commands
+[SOURCE_TRANSPORT.md](../../docs/docs/sglang-diffusion/zing/specs/SOURCE_TRANSPORT.md#incremental-video-benchmark) for commands
 and metric definitions. This entrypoint checks client delivery and waits for
 normal server closure, but does not own the server processes or inspect timing
 files. The paired runner above additionally waits for stage timing completeness.

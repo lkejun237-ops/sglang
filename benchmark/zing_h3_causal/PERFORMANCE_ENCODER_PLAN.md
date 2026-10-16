@@ -5,7 +5,7 @@
 ## 历史依据与范围
 
 #178 合并提交 `5b1b93db8cb7cf6bd3008adc3de1830d8e524bc4` 的
-`PROGRESSIVE_TILE_PARALLEL_DESIGN.md` 明确记载 performance replicated 本身跨卡
+[PROGRESSIVE_TILE_PARALLEL_DESIGN.md](../../docs/docs/sglang-diffusion/zing/specs/PROGRESSIVE_TILE_PARALLEL_DESIGN.md) 明确记载 performance replicated 本身跨卡
 存在差异。原验收零容差失败保留：SP2 moments max abs 0.125，relative L2
 0.002116739（`PROGRESSIVE_SOURCE_SP_RESULTS.md`）。这说明原 auto gate 限制已验证
 数值范围，不是 tile 算法不可分片。

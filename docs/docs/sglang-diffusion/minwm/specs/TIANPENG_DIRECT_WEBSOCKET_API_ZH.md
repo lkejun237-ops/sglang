@@ -162,7 +162,7 @@ socket.send(encode({
 - `1011`：Gateway/Worker 内部错误，使用新的 `trace_id` 重连并保留原 trace 供排障。
 - 直连接口没有 45 秒限制；45 秒单人体验限制只属于 WebUI 的 Zing/LingBot2 固定体验用户。
 
-完整字段、Trace HTTP API 和二进制拆包约定也收录在同目录的 `BACKEND_API_ZH.md`，本文件已包含产品直连所需的最小完整协议。
+完整字段、Trace HTTP API 和二进制拆包约定也收录在同目录的 [BACKEND_API_ZH.md](BACKEND_API_ZH.md)，本文件已包含产品直连所需的最小完整协议。
 
 ## 7. 当前部署与验证记录
 

@@ -1,6 +1,6 @@
 # Issue #257：AdaLN weights-free 首版代码分析
 
-本文保留 2026-10-09 在 b1899c0 基线上的初始分析，以下缺口描述是历史快照。#264 已合入，当前实现、CPU 验证与 GPU 待验收状态见 [ADALN_TABLE.md](ADALN_TABLE.md) 和 [ISSUE_257_EXPERIMENT_PLAN.md](ISSUE_257_EXPERIMENT_PLAN.md)。
+本文保留 2026-10-09 在 b1899c0 基线上的初始分析，以下缺口描述是历史快照。#264 已合入，当前实现、CPU 验证与 GPU 待验收状态见 [ADALN_TABLE.md](../specs/ADALN_TABLE.md) 和 [ISSUE_257_EXPERIMENT_PLAN.md](../../../../../benchmark/zing_h3_causal/ISSUE_257_EXPERIMENT_PLAN.md)。
 
 - Issue：[seedleap/sglang#257](https://github.com/seedleap/sglang/issues/257)，读取到的最后更新时间为 2026-10-09 04:59:36 UTC。
 - Worktree：`/Users/yiwencai/.codex/worktrees/issue-257-adaln-table/sglang`。
@@ -19,9 +19,9 @@
 
 ### 1. main 仍限制四分支及固定角色路由
 
-- [zing_h3.py](../../python/sglang/multimodal_gen/runtime/models/dits/zing_h3.py) 构造函数要求 `num_modalities == 4` 与 `adaln_out_features == 24 * hidden_size`；拒绝额外构造参数，并要求完整 resident AdaLN 权重。
+- [zing_h3.py](../../../../../python/sglang/multimodal_gen/runtime/models/dits/zing_h3.py) 构造函数要求 `num_modalities == 4` 与 `adaln_out_features == 24 * hidden_size`；拒绝额外构造参数，并要求完整 resident AdaLN 权重。
 - `_row_layout` 把 text/audio/source 固定到 tag 1/2/3，其余默认 tag 0。forward 使用 `t_indices * 4 + modality`。
-- [export_checkpoint.py](export_checkpoint.py) 只接受四分支和固定 `modality_tags`；输出配置也写死四分支。
+- [export_checkpoint.py](../../../../../benchmark/zing_h3_causal/export_checkpoint.py) 只接受四分支和固定 `modality_tags`；输出配置也写死四分支。
 - issue 指定 native 的 `src/h3/modules/backbone.py` 按配置决定四/五支，按实际 tag 排序 `projection_names`；`src/h3/modeling.py` 明确把 CONDITION_VISUAL 路由到 condition tag，把 VAE reference/target 路由到 video tag。
 - native final AdaLN 是独立的 `2 * hidden_size` 投影，不按主层分支数展开。
 
@@ -29,17 +29,17 @@
 
 ### 2. 现有 resident 缓存不能在删除投影参数后继续工作
 
-[zing_h3_adaln_cache.py](../../python/sglang/multimodal_gen/runtime/models/dits/zing_h3_adaln_cache.py) 的 `_signature` 包含参数对象身份、版本、storage 指针、shape/stride/dtype/device。`project` 每次先取 module signature，miss/bypass 直接执行原 module。缓存由每个 `ZingH3KVCache` 持有，会话清理时释放。
+[zing_h3_adaln_cache.py](../../../../../python/sglang/multimodal_gen/runtime/models/dits/zing_h3_adaln_cache.py) 的 `_signature` 包含参数对象身份、版本、storage 指针、shape/stride/dtype/device。`project` 每次先取 module signature，miss/bypass 直接执行原 module。缓存由每个 `ZingH3KVCache` 持有，会话清理时释放。
 
 所以仅预热后设 `adaln_proj = None` 或删除参数会破坏该接口，缓存身份也不能作为持久工件身份。新表应使用内容与版本身份；resident LRU 保留原语义。weights-free 消费路径不能依赖参数签名、请求 KV 是否存在，或调用已经不存在的投影模块。尤其要覆盖 CFG/unconditional 的 `cache=None` 路径。
 
 ### 3. loader 有可复用的过滤机制，但现有 H3 sidecar 不能直接接到 Zing
 
-- [transformer_loader.py](../../python/sglang/multimodal_gen/runtime/loader/component_loaders/transformer_loader.py) 的 `checkpoint_key_filter` 会在权重 iterator 读取 tensor 前过滤；已有 H3 路径可跳过 `.adaln_proj.linear.`。
-- [fsdp_load.py](../../python/sglang/multimodal_gen/runtime/loader/fsdp_load.py) 先在 meta device 构造模型，再传递该 filter 加载权重。
-- [minimax_h3.py](../../python/sglang/multimodal_gen/runtime/models/dits/minimax_h3.py) 的 block/final 已支持 `use_adaln_cache=True` 时不构造投影模块，但模型级开关同时绑定普通 `MiniMaxH3AdalnCache`。
+- [transformer_loader.py](../../../../../python/sglang/multimodal_gen/runtime/loader/component_loaders/transformer_loader.py) 的 `checkpoint_key_filter` 会在权重 iterator 读取 tensor 前过滤；已有 H3 路径可跳过 `.adaln_proj.linear.`。
+- [fsdp_load.py](../../../../../python/sglang/multimodal_gen/runtime/loader/fsdp_load.py) 先在 meta device 构造模型，再传递该 filter 加载权重。
+- [minimax_h3.py](../../../../../python/sglang/multimodal_gen/runtime/models/dits/minimax_h3.py) 的 block/final 已支持 `use_adaln_cache=True` 时不构造投影模块，但模型级开关同时绑定普通 `MiniMaxH3AdalnCache`。
 - 当前 server 参数入口仅接受类名 `MiniMaxH3DiTModel`；Zing 子类还显式拒绝相关 kwargs。
-- 普通 [minimax_h3_adaln_cache.py](../../python/sglang/multimodal_gen/runtime/models/dits/minimax_h3_adaln_cache.py) 使用 H3 专属布局、model variant、计划格式和加载/更新契约，不能据此宣称 Zing 四/五支精确性已经通过。
+- 普通 [minimax_h3_adaln_cache.py](../../../../../python/sglang/multimodal_gen/runtime/models/dits/minimax_h3_adaln_cache.py) 使用 H3 专属布局、model variant、计划格式和加载/更新契约，不能据此宣称 Zing 四/五支精确性已经通过。
 
 可以复用“构造时跳过投影”和“读取前过滤”的底层机制，单独接入 Zing 工件与模型校验。filter 必须按实际加载格式生成，并覆盖主层和 final；仅在加载后删除模块不能满足启动峰值要求。其他模型行为不能随之改变。
 
@@ -53,7 +53,7 @@
 
 ### 5. 完整 unique-t 批次必须从实际请求计划枚举
 
-当前 [sampling.py](../../python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/zing_h3/sampling.py) 在 initialize 中执行 prefix；每个 chunk 包含 source、若干 active 和 clean final。[_sampling_helpers.py](../../python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/zing_h3/_sampling_helpers.py) 生成逐 row 的 FP32 timestep，模型再做原有 `torch.unique(sorted=True)`。
+当前 [sampling.py](../../../../../python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/zing_h3/sampling.py) 在 initialize 中执行 prefix；每个 chunk 包含 source、若干 active 和 clean final。[_sampling_helpers.py](../../../../../python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/zing_h3/_sampling_helpers.py) 生成逐 row 的 FP32 timestep，模型再做原有 `torch.unique(sorted=True)`。
 
 #242 又增加 `ar_condition_timestep` 和 `reference_visual_timestep`，实际批次可能混合这些值、当前 denoise t 与 clean t。不能只构建“4 个 denoise timestep + 1 个 clean”或沿用 #207 的 5 批统计。尾块、条件更新、新 prefix、无 source、CFG 和可进入的 overlap 路径均需由同一计划枚举逻辑覆盖；不支持的请求在任何 forward/KV 写入之前拒绝。
 

@@ -213,7 +213,7 @@ class CausalEncoderCache:
 
         This exchanges control metadata, not shared cache tensors. ``value`` is
         a stage-tagged invariant; only the failure flag, not exception text,
-        crosses ranks. See PROGRESSIVE_TILE_PARALLEL_DESIGN.md for each stage.
+        crosses ranks. See docs/docs/sglang-diffusion/zing/specs/PROGRESSIVE_TILE_PARALLEL_DESIGN.md for each stage.
 
         All participants must call sessions in the same order. A missing/cancelled
         worker fails the monitored barrier rather than stranding peers in NCCL.

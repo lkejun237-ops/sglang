@@ -1,7 +1,7 @@
 # PR #230 评审入口
 
 2026-10-09 更新：用户入口默认 cross_chunk、等待默认 auto、attention 默认有条件 auto；
-配置迁移与支持范围见 [当前策略](JOINT_FORWARD.md)。本页固定 SHA 和复现命令保留旧实验语义。
+配置迁移与支持范围见 [当前策略](../../docs/docs/sglang-diffusion/zing/specs/JOINT_FORWARD.md)。本页固定 SHA 和复现命令保留旧实验语义。
 
 这次请评审两件事：现有 joint forward 的在线语义是否可靠，以及专用 attention
 kernel 是否还值得投入。联合主干已支持在线；专用 attention kernel 仍是离线形状

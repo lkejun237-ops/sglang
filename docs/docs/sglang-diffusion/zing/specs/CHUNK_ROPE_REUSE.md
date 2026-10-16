@@ -4,7 +4,7 @@ The experimental `SGLANG_ZING_CHUNK_ROPE_REUSE=1` switch preserves independent
 historical rotation publications. It does not change the history RoPE operator,
 relative position mapping, current KV writer, QK norm, or eviction copy operator.
 The switch now defaults to `1`; set it to `0` to restore the established path.
-See PERFORMANCE_DEFAULTS.md for the combined-default validation boundary.
+See [PERFORMANCE_DEFAULTS.md](PERFORMANCE_DEFAULTS.md) for the combined-default validation boundary.
 
 ## Chunk meaning and size
 

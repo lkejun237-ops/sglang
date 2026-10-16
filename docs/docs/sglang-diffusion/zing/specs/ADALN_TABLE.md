@@ -1,10 +1,10 @@
 # Zing fixed-version AdaLN tables
 
-This implements [issue #257](https://github.com/seedleap/sglang/issues/257), based on `f43a7f97e0a68a09dcb6956f08b4e275b5120df8` (#264). It supports normalized four/five-branch serving exports, shared or independent condition tags, and valid tag permutations. CPU synthetic acceptance is recorded in [ISSUE_257_EXPERIMENT_PLAN.md](ISSUE_257_EXPERIMENT_PLAN.md). Real-checkpoint SP1 GPU acceptance is done (see Status); SP2 GPU exactness and a stable speedup conclusion are not.
+This implements [issue #257](https://github.com/seedleap/sglang/issues/257), based on `f43a7f97e0a68a09dcb6956f08b4e275b5120df8` (#264). It supports normalized four/five-branch serving exports, shared or independent condition tags, and valid tag permutations. CPU synthetic acceptance is recorded in [ISSUE_257_EXPERIMENT_PLAN.md](../../../../../benchmark/zing_h3_causal/ISSUE_257_EXPERIMENT_PLAN.md). Real-checkpoint SP1 GPU acceptance is done (see Status); SP2 GPU exactness and a stable speedup conclusion are not.
 
 ## Deployment contract
 
-The offline builder consumes the effective generator/EMA checkpoint exported by [export_checkpoint.py](export_checkpoint.py). Any LoRA must already be merged and its provenance explicit. It streams one main/final projection module at a time, executes each complete ordered unique-t batch with the serving module's original GEMM, and writes compact BF16 shift/scale/gate values. It does not combine singleton outputs to simulate a different batch shape.
+The offline builder consumes the effective generator/EMA checkpoint exported by [export_checkpoint.py](../../../../../benchmark/zing_h3_causal/export_checkpoint.py). Any LoRA must already be merged and its provenance explicit. It streams one main/final projection module at a time, executes each complete ordered unique-t batch with the serving module's original GEMM, and writes compact BF16 shift/scale/gate values. It does not combine singleton outputs to simulate a different batch shape.
 
 The worker selects `weights_free` by setting `zing_adaln_table_path`; omitting the path selects the existing resident deployment. The loader verifies the export config and every selected shard's SHA256, skips main/final projection keys before `get_tensor`, and constructs these modules as `None` even on meta. Other weights, including TimeMLP and token refiner, remain resident. The table is copied to each rank's device at startup and fenced with a CUDA event. No builder runs inside a worker, and lookup adds no collective.
 
@@ -107,4 +107,4 @@ The startup log records `adaln_deployment_receipt`: weights-free mode must have 
 
 The dedicated `zing-adaln-cpu.yml` workflow checks exporter and standalone table integrity/admission contracts with CPU-only dependencies. Full-model tests additionally exercise meta construction, actual streaming builder keys, strict loading of remaining parameters, exact per-chunk latent/KV equality for Euler and few-step with six synthetic references/CFG, reader filtering, prompt updates and exception cleanup. A CPU recording graph backend verifies capture/replay and interleaved session isolation; this does not claim actual CUDA graph acceptance.
 
-The initial source analysis is retained as a historical snapshot in [ISSUE_257_ANALYSIS.md](ISSUE_257_ANALYSIS.md). GPU submissions require separate authorization and the project-mandated read-only submission review.
+The initial source analysis is retained as a historical snapshot in [ISSUE_257_ANALYSIS.md](../plans/ISSUE_257_ANALYSIS.md). GPU submissions require separate authorization and the project-mandated read-only submission review.

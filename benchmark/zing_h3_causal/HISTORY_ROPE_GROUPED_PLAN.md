@@ -1,6 +1,6 @@
 # History RoPE grouped runtime：实现与验证记录
 
-> 后续默认配置变更：fused/grouped 已默认开启，plan 保持关闭。下文保留原实验时的默认状态；当前配置见 [性能默认配置](PERFORMANCE_DEFAULTS.md)。
+> 后续默认配置变更：fused/grouped 已默认开启，plan 保持关闭。下文保留原实验时的默认状态；当前配置见 [性能默认配置](../../docs/docs/sglang-diffusion/zing/specs/PERFORMANCE_DEFAULTS.md)。
 
 此文记录实现范围与独立验证：严格数值、180 个正式样本和 21 份 trace 技术验收已完成；
 画质仍待人工验收，原 performance encoder 的重复性问题不由确定性结果覆盖。比较基线为 PR #182 的

@@ -3,7 +3,7 @@
 
 A factory receives ``codecs, capacity_frames=...`` and returns a session. Shared
 read-only weights are allowed; caches, stride phase and cursors are session-owned.
-See benchmark/zing_h3_causal/PROGRESSIVE_ENCODER.md for the acceptance contract.
+See docs/docs/sglang-diffusion/zing/specs/PROGRESSIVE_ENCODER.md for the acceptance contract.
 """
 
 from __future__ import annotations

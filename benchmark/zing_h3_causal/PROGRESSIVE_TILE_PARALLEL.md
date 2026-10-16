@@ -14,7 +14,7 @@ replicated/parallel 各一条 10 秒视频，由用户判断。
 旧 #148 的 clip17 差异及性能结果不用于放行本改动。
 
 设计、数学关系、旧 H3 SP 对照和 `agree`/错误汇合/执行记录的用途见
-[设计文档](PROGRESSIVE_TILE_PARALLEL_DESIGN.md)。
+[设计文档](../../docs/docs/sglang-diffusion/zing/specs/PROGRESSIVE_TILE_PARALLEL_DESIGN.md)。
 
 ## 配置与实际分工
 

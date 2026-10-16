@@ -1,6 +1,6 @@
 # Issue #257 主实验准备
 
-> **Update 2026-10-10:** the SP1 real-checkpoint GPU comparison has since been run (exact parity, about 41 GiB less memory); results and current scope are in [ADALN_TABLE.md](ADALN_TABLE.md#status-and-support-scope). The "not yet run" statements below describe the state at handoff.
+> **Update 2026-10-10:** the SP1 real-checkpoint GPU comparison has since been run (exact parity, about 41 GiB less memory); results and current scope are in [ADALN_TABLE.md](../../docs/docs/sglang-diffusion/zing/specs/ADALN_TABLE.md#status-and-support-scope). The "not yet run" statements below describe the state at handoff.
 
 日期：2026-10-09。分支：`codex/zing-adaln-persistent-table`；worktree：`/Users/yiwencai/.codex/worktrees/issue-257-adaln-table/sglang`。main 基线：`f43a7f97e0a68a09dcb6956f08b4e275b5120df8`，已包含 #264 与 #258。candidate 由本分支实际 Git HEAD 标识，不能用 main 基线 SHA 代替；执行前必须冻结该 HEAD 的完整 patch/bundle 及 SHA256。交接时远端 main 已推进到 `c5764eb01cb629088bd9a43f161d032c7c6279f8`（#176），本分支尚未集成该提交。
 
@@ -20,7 +20,7 @@
 - eager 与原 graph provider 共用取表路径；启动 storage 回执、请求 metrics 与现有真实 checkpoint harness 参数。
 - CPU 小模型覆盖四/五支、condition 共享/独立、重排 tag、Euler/few-step、source+六张合成 reference、CFG、尾块、prompt 更新和双 session graph replay。
 
-用法与 schema 见 [ADALN_TABLE.md](ADALN_TABLE.md)。CPU 的数值一致不替代真实 CUDA；真实五分支 asset 未核验前不能宣称完整部署通过。
+用法与 schema 见 [ADALN_TABLE.md](../../docs/docs/sglang-diffusion/zing/specs/ADALN_TABLE.md)。CPU 的数值一致不替代真实 CUDA；真实五分支 asset 未核验前不能宣称完整部署通过。
 
 ## 冻结资产与对照
 

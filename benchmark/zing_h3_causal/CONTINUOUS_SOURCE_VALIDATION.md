@@ -1,4 +1,4 @@
-> Current deployment and client size limits: [bounded source transport](SOURCE_TRANSPORT.md).
+> Current deployment and client size limits: [bounded source transport](../../docs/docs/sglang-diffusion/zing/specs/SOURCE_TRANSPORT.md).
 > This contract explicitly rejects exact 1280x720 for the H3 32-pixel grid.
 > High-resolution results: [three-resolution source transport acceptance](SOURCE_TRANSPORT_ACCEPTANCE_20260928.md).
 

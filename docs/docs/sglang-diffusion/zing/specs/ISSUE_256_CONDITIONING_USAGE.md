@@ -76,6 +76,6 @@ images 顺序必须与真实会话一致；可省略 images/s0_image。s0_image 
 
 ## 错误与验证
 
-公共错误为英文 `{code,message}`；码为 CONDITION_INVALID、CONDITION_UNAUTHORIZED、CONDITION_PROFILE_MISMATCH、CONDITION_BUSY、CONDITION_TIMEOUT、CONDITION_UNAVAILABLE。初次编码失败 fatal:true；中途更新失败 fatal:false，继续旧 conditioning，相同失败事件只通知一次。逐 block 输出 event_id/prompt_version 表示实际生效版本，source provenance 不变。具体网络字段见 [实时契约](../../docs/docs/sglang-diffusion/zing/specs/realtime-contracts.zh-CN.md)。
+公共错误为英文 `{code,message}`；码为 CONDITION_INVALID、CONDITION_UNAUTHORIZED、CONDITION_PROFILE_MISMATCH、CONDITION_BUSY、CONDITION_TIMEOUT、CONDITION_UNAVAILABLE。初次编码失败 fatal:true；中途更新失败 fatal:false，继续旧 conditioning，相同失败事件只通知一次。逐 block 输出 event_id/prompt_version 表示实际生效版本，source provenance 不变。具体网络字段见 [实时契约](realtime-contracts.zh-CN.md)。
 
 CPU 验证：`python benchmark/zing_h3_causal/run_conditioning_cpu_tests.py`；依赖版本见 ISSUE_256_CPU_ENVIRONMENT.json。harness 运行真实 conditioning/ASGI/safetensors 和 fake native/SP 边界，不初始化 NVIDIA registry。CPU 通过不证明 CUDA/SP collectives、Qwen 数值、质量、worker 显存或在线延迟。GPU 辅助脚本已更新为 local/remote/encode，尚未执行；launch_bench.sh 与 launch_e2e.sh 默认 SERVICE_GPU=0、WORKER_GPU=1，使用前须实际检测 GPU 与用户授权。

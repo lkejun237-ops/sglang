@@ -14,7 +14,7 @@
 
 旧 SP2 在线测试测得 joint off / cross0 全程中位数 32.9279 / 31.0218 秒
 （下降 5.79%）；它不是独立 DiT GPU 计时，也没有覆盖新专用 kernel。
-历史证据见 [JOINT_FORWARD.md](JOINT_FORWARD.md)。
+历史证据见 [JOINT_FORWARD.md](../../docs/docs/sglang-diffusion/zing/specs/JOINT_FORWARD.md)。
 
 ## 在线和离线的差别
 

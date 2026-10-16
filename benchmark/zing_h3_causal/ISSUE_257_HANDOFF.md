@@ -1,6 +1,6 @@
 # Issue #257 HANDOFF：离线 AdaLN 表与 weights-free worker
 
-> **Update 2026-10-10:** the SP1 real-checkpoint GPU comparison has since been run (exact parity, about 41 GiB less memory); results and current scope are in [ADALN_TABLE.md](ADALN_TABLE.md#status-and-support-scope). The "not yet run" statements below describe the state at handoff.
+> **Update 2026-10-10:** the SP1 real-checkpoint GPU comparison has since been run (exact parity, about 41 GiB less memory); results and current scope are in [ADALN_TABLE.md](../../docs/docs/sglang-diffusion/zing/specs/ADALN_TABLE.md#status-and-support-scope). The "not yet run" statements below describe the state at handoff.
 
 交接日期：2026-10-09。Issue：[seedleap/sglang#257](https://github.com/seedleap/sglang/issues/257)。
 
@@ -25,9 +25,9 @@
 | [minimax_h3.py](../../python/sglang/multimodal_gen/runtime/models/dits/minimax_h3.py)、[zing_h3.py](../../python/sglang/multimodal_gen/runtime/models/dits/zing_h3.py) | meta 构造阶段就不创建主层/final 投影；统一 eager/graph provider；TimeMLP/refiner 与其余权重保留；在线权重/LoRA 更新在写入前拒绝 |
 | [sampling.py](../../python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/zing_h3/sampling.py) | 在 KV 申请或 prefix 写入前，枚举实际 prefix/source/active/final、尾块及 CFG 的完整计划；异常、prompt 更新、close 释放 lease；未知计划/audio 拒绝，无 miss fallback |
 | [validate_real_checkpoint.py](validate_real_checkpoint.py) | `sglang` 子命令增加 `--adaln-table` 和预算参数，沿用现有真实 checkpoint 请求、结果与 metrics 路径 |
-| [.github/workflows/zing-adaln-cpu.yml](../../.github/workflows/zing-adaln-cpu.yml) | 最小 CPU 依赖执行 exporter 与持久表完整性/接入合同测试 |
+| [.github/workflows/zing-adaln-cpu.yml（历史版本）](https://github.com/seedleap/sglang/blob/171e22b68e/.github/workflows/zing-adaln-cpu.yml) | 最小 CPU 依赖执行 exporter 与持久表完整性/接入合同测试 |
 
-部署参数、schema、builder 用法见 [ADALN_TABLE.md](ADALN_TABLE.md)。首版限定固定有效权重、video、未量化、TP1/SP1 或 SP2、无 DiT FSDP/CPU 或逐层 offload。SP2 沿用基线 eager，SP1 可进入原有 graph 路径。默认完整表预算 512 MiB；每个完整批次都保留独立形状，没有在线构建、补表或 eviction。
+部署参数、schema、builder 用法见 [ADALN_TABLE.md](../../docs/docs/sglang-diffusion/zing/specs/ADALN_TABLE.md)。首版限定固定有效权重、video、未量化、TP1/SP1 或 SP2、无 DiT FSDP/CPU 或逐层 offload。SP2 沿用基线 eager，SP1 可进入原有 graph 路径。默认完整表预算 512 MiB；每个完整批次都保留独立形状，没有在线构建、补表或 eviction。
 
 ## 验证结果与证据边界
 
@@ -96,4 +96,4 @@ PYTHONPATH=python /tmp/zing-foundation-venv/bin/python \
 - 当前根会话 `01a11f8a-9589-74e1-bb45-7cd0ddefce19` 的 Dev Mode 为 disabled；不自动开启。接续时按 AGENTS 恢复检查当前会话状态。
 - 项目全部 7 个 Infra Skills 固定来源 `5e5879e4480a9f76be02e68b3d308b57f05bdf51`；本轮 33 个文件 Git blob hash 一致，安装目录仅本地 exclude，不提交。
 - 用户本次授权生成 HANDOFF 和推送本地分支。该授权不包含 GPU 申请、云提交、报告发布、主实验 PR 创建或合并。
-- [ISSUE_257_ANALYSIS.md](ISSUE_257_ANALYSIS.md) 是 b1899c0 上的初始历史分析；其“未实现”缺口不是当前状态。
+- [ISSUE_257_ANALYSIS.md](../../docs/docs/sglang-diffusion/zing/plans/ISSUE_257_ANALYSIS.md) 是 b1899c0 上的初始历史分析；其“未实现”缺口不是当前状态。

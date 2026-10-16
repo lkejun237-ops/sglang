@@ -3,12 +3,12 @@
 这份报告面向代码评审者和后续维护者。它解释这次变更为什么存在、实现背后的直觉、
 哪些地方为了数值一致性没有采用 SGLang 的常规快速路径，以及应该按什么顺序阅读代码。
 更完整的运行命令、逐项决策日志和实验记录见
-[`MinWM-Realtime.zh-CN.mdx`](../../docs_new/cookbook/diffusion/MinWM/MinWM-Realtime.zh-CN.mdx)。
+[`MinWM-Realtime.zh-CN.mdx`](../../../../cookbook/diffusion/MinWM/MinWM-Realtime.zh-CN.mdx)。
 0724 checkpoint 的 WASD/视角键验证过程单独记录在
-[`ACTION_CONTROL_INVESTIGATION.zh-CN.md`](./ACTION_CONTROL_INVESTIGATION.zh-CN.md)。
+[`ACTION_CONTROL_INVESTIGATION.zh-CN.md`](../../../../../benchmark/minwm_realtime_parity/ACTION_CONTROL_INVESTIGATION.zh-CN.md)。
 2026-07-29 天鹏 detailmix 模型的 block-relative RoPE、prompt pin、逐 block
 seed 与 1089 帧对齐记录见
-[`TIANPENG_GAP12_ALIGNMENT.zh-CN.md`](./TIANPENG_GAP12_ALIGNMENT.zh-CN.md)。
+[`TIANPENG_GAP12_ALIGNMENT.zh-CN.md`](../../../../../benchmark/minwm_realtime_parity/TIANPENG_GAP12_ALIGNMENT.zh-CN.md)。
 
 ## 1. 一句话结论
 

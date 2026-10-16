@@ -18,7 +18,7 @@ The change replaces the fixed 32 MiB admission limit with a shared, configurable
 64 MiB default, retaining bounded queues, source credit and concurrent host-buffer
 reservations. It rejects unsupported dimensions before media allocation and
 checks transport dependency compatibility before loading GPU workers.
-See [bounded source transport](SOURCE_TRANSPORT.md) for deployment, client
+See [bounded source transport](../../docs/docs/sglang-diffusion/zing/specs/SOURCE_TRANSPORT.md) for deployment, client
 negotiation, memory accounting and direct-endpoint error codes.
 
 ## Final validation

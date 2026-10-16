@@ -26,7 +26,7 @@ source credit 只记一次。首帧等待不设新的 17 帧门槛。Qwen video 
 因果请求自动带 source Video 1；历史无 preview 结果仅属于其冻结提交。
 独立 target 首帧 case 继续显式选择。source-first-frame case 保留独立 ID
 `zing-whitebox-video-source-first-frame-six-reference-0001` 便于追踪，无额外开关。
-迁移与调用示例见 [SOURCE_REFERENCE_INPUTS.md](SOURCE_REFERENCE_INPUTS.md)。
+迁移与调用示例见 [SOURCE_REFERENCE_INPUTS.md](../../docs/docs/sglang-diffusion/zing/specs/SOURCE_REFERENCE_INPUTS.md)。
 
 ## 冻结及验收方法
 

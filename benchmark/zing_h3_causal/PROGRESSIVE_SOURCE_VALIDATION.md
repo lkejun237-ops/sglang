@@ -12,7 +12,7 @@
 渐进路径按 1/8/8 个新像素帧输出 1/2/2 个 latent，首帧即可提供首段稳定结果。
 每层保留有限卷积历史及 stride 相位，每 17 帧重置，保持 checkpoint clip 语义。
 它减少等待输入的时间，不保证提高总吞吐；BF16 小 shape 卷积与旧路径可存在数值差异。
-详细接口及算法约束见 [PROGRESSIVE_ENCODER.md](PROGRESSIVE_ENCODER.md)。
+详细接口及算法约束见 [PROGRESSIVE_ENCODER.md](../../docs/docs/sglang-diffusion/zing/specs/PROGRESSIVE_ENCODER.md)。
 
 ## 哪些文件需要保留
 
@@ -25,7 +25,7 @@
 | `continuous_source_client.py` | 可复用 MessagePack 客户端、paced 分包及输出指标采集 |
 | `continuous_source_lifecycle_probe.py` | 真实服务取消、重连、暂停、慢消费者等探针 |
 | `continuous_source_media.py`、对应测试 | 按真实图片字节识别 MIME，保持原始素材与 reference ID |
-| `SOURCE_REFERENCE_INPUTS.md`、`WHITEBOX_VIDEO_SMOKE.md` | 固定输入顺序、校验和与准备方法 |
+| [SOURCE_REFERENCE_INPUTS.md](../../docs/docs/sglang-diffusion/zing/specs/SOURCE_REFERENCE_INPUTS.md)、`WHITEBOX_VIDEO_SMOKE.md` | 固定输入顺序、校验和与准备方法 |
 | `PROGRESSIVE_SOURCE_SP_RESULTS.md` | 原冻结版本的简明性能结果与适用边界 |
 
 这些 Python 工具是复现实验和防止回归所需，不由生产服务导入。

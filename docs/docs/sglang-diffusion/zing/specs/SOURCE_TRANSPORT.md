@@ -241,7 +241,7 @@ sizes. GPU evidence, source/material SHA-256, repeats, audio status, actual
 frames/dimensions and per-rank memory must be reported with the exact frozen
 source. Transport acceptance alone does not establish KV capacity or quality.
 
-The [2026-09-28 high-resolution acceptance report](SOURCE_TRANSPORT_ACCEPTANCE_20260928.md)
+The [2026-09-28 high-resolution acceptance report](../../../../../benchmark/zing_h3_causal/SOURCE_TRANSPORT_ACCEPTANCE_20260928.md)
 records three real-source, six-reference repeats at each aligned resolution,
 including timing, per-rank memory and frozen-source/media checksums.
 

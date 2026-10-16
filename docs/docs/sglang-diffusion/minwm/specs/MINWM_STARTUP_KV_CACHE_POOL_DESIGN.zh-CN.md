@@ -80,7 +80,7 @@ launch profile 是唯一的 bucket 所有者：
 
 profile 同时固定 `pool_size=1`、全局/每 worker admission 为 1，并写入天鹏
 window/sink。硬件选择仍以实测 compute capability 和可见显存为准，不能仅根据商品名
-推断；完整门槛见 [`HARDWARE_PROFILES.md`](HARDWARE_PROFILES.md)。
+推断；完整门槛见 [`HARDWARE_PROFILES.md`](../../../../../benchmark/minwm_realtime_parity/HARDWARE_PROFILES.md)。
 
 ## 4. 总体架构
 
@@ -465,4 +465,4 @@ policy。建议监控至少包括：
 - 请求分辨率早拒绝：
   `python/sglang/multimodal_gen/configs/sample/minwm.py`
 - 硬件门槛与稳定 profile：
-  [`HARDWARE_PROFILES.md`](HARDWARE_PROFILES.md)
+  [`HARDWARE_PROFILES.md`](../../../../../benchmark/minwm_realtime_parity/HARDWARE_PROFILES.md)
