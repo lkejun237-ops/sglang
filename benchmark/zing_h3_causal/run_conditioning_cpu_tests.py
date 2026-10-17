@@ -149,4 +149,5 @@ arguments = sys.argv[1:] or [
     "-q",
     "--disable-warnings",
 ]
-raise SystemExit(pytest.main(arguments))
+if __name__ == "__main__":
+    raise SystemExit(pytest.main(arguments))

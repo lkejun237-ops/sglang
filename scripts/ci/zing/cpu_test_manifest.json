@@ -7407,6 +7407,53 @@
         },
         "candidate_fingerprint": "f4e77ce3817e37819a30ffc5d774dc1b5d4ed8267ac5cef4cc8a2e7364bfd8bd"
       }
+    },
+    {
+      "path": "test/registered/unit/multimodal_gen/test_h3_encoder_command_sync.py",
+      "suite": "conditioning-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two fresh DSW Linux CPU conditioning-runner trials passed all nine cases after fixture bootstrap synchronization; exact pinned CI environment remains GitHub validation.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "6371154549a4eb552d6f93f8e097c4ab47d1d6629f2e3b79e1509e51154f5d83",
+        "receipt": "/cpfs/world-model/sglang/evals/h3-encoder-ci-333-startup-20261016/receipt.json",
+        "receipt_sha256": "0d81f5c1adbc5805b6fed86ae8c7f51eac1acf16200f7ee9b84c58f1a93b3278",
+        "trials": [
+          {
+            "trial": 1,
+            "exit_code": 0,
+            "tests": 9,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0,
+            "duration_seconds": 93.93381189089268,
+            "log_path": "/cpfs/world-model/sglang/evals/h3-encoder-ci-333-startup-20261016/green-2.log",
+            "junit_path": "/cpfs/world-model/sglang/evals/h3-encoder-ci-333-startup-20261016/green-2.xml"
+          },
+          {
+            "trial": 2,
+            "exit_code": 0,
+            "tests": 9,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0,
+            "duration_seconds": 93.9247104730457,
+            "log_path": "/cpfs/world-model/sglang/evals/h3-encoder-ci-333-startup-20261016/green-3.log",
+            "junit_path": "/cpfs/world-model/sglang/evals/h3-encoder-ci-333-startup-20261016/green-3.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.12.3 (main, Jul 15 2026, 23:46:41) [GCC 13.3.0]",
+          "torch": "2.14.1+cpu",
+          "pytest": "9.1.1"
+        },
+        "recipe_deviation": "DSW conditioning runner with CI flags; initial full suite attempts stopped at missing av (14 passed, 1 failed each); complete dependency lock not asserted; GitHub CI validates exact recipe"
+      }
     }
   ],
   "recipes": {

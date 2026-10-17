@@ -2,7 +2,9 @@
 """Exercise the actual service loop with CPU control/bridge fault injection."""
 
 import ast
+import importlib.util
 import json
+import logging
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -40,6 +42,7 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
             for row in command_rows
         ]
     commands = iter(command_rows)
+    sequence = 0
 
     if close_op == "quarantine":
         commands = iter(
@@ -70,6 +73,7 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
     socket = SimpleNamespace(
         setsockopt=lambda *a: None,
         bind=lambda *a: None,
+        poll=lambda *_: True,
         recv_multipart=lambda: [json.dumps(take()).encode()],
         send_json=lambda value: replies.append(value),
         close=lambda: None,
@@ -97,9 +101,26 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
     fake.create_encoder_cache = lambda *a, **kw: SimpleNamespace(last_execution={})
     monkeypatch.setitem(sys.modules, module_name, fake)
 
-    def broadcast(values, src):
+    def broadcast(values, src, **kwargs):
+        nonlocal sequence
         if rank:
-            values[0] = take()
+            sequence += 1
+            values[0] = ("COMMAND", sequence, take())
+
+    def gather(output, value, **kwargs):
+        # Count lifecycle gates after actual cleanup, matching the old close
+        # barrier. A quarantined rejection also completes a control command,
+        # but must not count as session cleanup or alter the active owner.
+        if (
+            isinstance(value, tuple)
+            and len(value) == 3
+            and (
+                value[0] == "startup"
+                or (value[0] == "close_complete" and sessions and sessions[-1].closed)
+            )
+        ):
+            barriers.append(True)
+        output[:] = [value, value]
 
     class Parser:
         def __init__(self, **kw):
@@ -113,6 +134,7 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
                 model=Path("model"),
                 port=31001,
                 timeout_seconds=120,
+                startup_timeout_seconds=600,
             )
 
     dist = SimpleNamespace(
@@ -121,17 +143,23 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
         new_group=lambda **kw: object(),
         barrier=lambda: barriers.append(True),
         broadcast_object_list=broadcast,
-        get_world_size=lambda: 2,
-        all_gather_object=lambda output, value, **kw: output.__setitem__(
-            slice(None), [value, value]
-        ),
+        get_world_size=lambda *a: 2,
+        all_gather_object=gather,
         group=SimpleNamespace(WORLD=object()),
         destroy_process_group=lambda: None,
         TCPStore=lambda host, port, *a, **kw: ports.append(port),
     )
     from test_zing_h3_encoder_abort_recovery import recovery
 
+    control_spec = importlib.util.spec_from_file_location(
+        "zing_encoder_control_cpu", path.with_name("encoder_control.py")
+    )
+    control = importlib.util.module_from_spec(control_spec)
+    control_spec.loader.exec_module(control)
     namespace = dict(
+        EncoderCommandControl=control.EncoderCommandControl,
+        EncoderControlError=control.EncoderControlError,
+        logging=logging,
         abort_owner=recovery.abort_owner,
         __doc__="test",
         argparse=SimpleNamespace(ArgumentParser=Parser),
@@ -158,7 +186,7 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
                 "vae_config": {"encode_mode": "performance", "encode_dtype": "bfloat16"}
             },
         ),
-        zmq=SimpleNamespace(Context=lambda: context, REP=1, LINGER=2),
+        zmq=SimpleNamespace(Context=lambda: context, REP=1, LINGER=2, SNDTIMEO=3),
         json=json,
         time=SimpleNamespace(time_ns=lambda: 0),
         H3ProgressiveEncoderSession=Session,
