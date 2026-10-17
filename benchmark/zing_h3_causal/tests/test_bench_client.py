@@ -401,7 +401,7 @@ def test_request_saves_received_profile_beside_client_results(tmp_path):
     asyncio.run(run())
 
 
-async def streaming_peer(ws, observations, *, disconnect=False):
+async def streaming_peer(ws, observations, *, disconnect=False, steps=4):
     """Protocol peer: echo bytes, with bounded credit; it is not a model."""
     import asyncio
 
@@ -419,7 +419,7 @@ async def streaming_peer(ws, observations, *, disconnect=False):
             type="session.ready",
             session_id="test-session",
             zing_realtime_api_version=1,
-            num_inference_steps=4,
+            num_inference_steps=steps,
             realtime_output_format="raw",
             source_stream=init["source_stream"],
             max_message_bytes=init["source_message_budget_bytes"],
@@ -511,8 +511,9 @@ async def streaming_peer(ws, observations, *, disconnect=False):
 
 @pytest.mark.parametrize("paced", [False, True])
 @pytest.mark.parametrize("source_format", ["rgb", "video"])
+@pytest.mark.parametrize("steps", [1, 2, 3, 4, 5])
 def test_streaming_client_delivers_before_eos_and_obeys_credit(
-    tmp_path, paced, source_format
+    tmp_path, paced, source_format, steps
 ):
     import asyncio
 
@@ -558,7 +559,7 @@ def test_streaming_client_delivers_before_eos_and_obeys_credit(
 
     async def exercise():
         async with websockets.serve(
-            lambda ws: streaming_peer(ws, observations), "127.0.0.1", 0
+            lambda ws: streaming_peer(ws, observations, steps=steps), "127.0.0.1", 0
         ) as server:
             port = server.sockets[0].getsockname()[1]
             args = parser().parse_args(
@@ -597,6 +598,44 @@ def test_streaming_client_delivers_before_eos_and_obeys_credit(
     assert (tmp_path / "result/output.rgb").read_bytes() == raw
     assert "num_frames" not in observations[0]["source_stream"]
     assert observations[-1]["kind"] == "source.end"
+
+
+@pytest.mark.parametrize("steps", [0, -1, True, None, 1.5, "1"])
+def test_streaming_client_rejects_invalid_step_count(tmp_path, steps):
+    import asyncio
+
+    import websockets
+    from continuous_source_client import parser, run
+
+    source = tmp_path / "source.rgb"
+    source.write_bytes(bytes(12))
+    observations = []
+
+    async def exercise():
+        async with websockets.serve(
+            lambda ws: streaming_peer(ws, observations, steps=steps), "127.0.0.1", 0
+        ) as server:
+            args = parser().parse_args(
+                [
+                    "--url",
+                    f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
+                    "--source-rgb",
+                    str(source),
+                    "--width",
+                    "2",
+                    "--height",
+                    "2",
+                    "--prompt",
+                    "test",
+                    "--output",
+                    str(tmp_path / "result"),
+                ]
+            )
+            with pytest.raises(ValueError, match="negotiation failed"):
+                await run(args)
+
+    asyncio.run(exercise())
+    assert len(observations) == 1  # Reject before sending any source frames.
 
 
 def test_streaming_pipe_reassembles_short_reads_and_preserves_eof():

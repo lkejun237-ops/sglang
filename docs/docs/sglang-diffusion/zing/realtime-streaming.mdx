@@ -48,7 +48,7 @@ profile 未声明 initial 阶段时也采用此默认。也可显式写出完整
 在 profile 显式设置 `initial_block_count=0`，或传上述关闭 CLI。
 profile 和最终有效计划均须合法。迁移边界见[默认混合采样设计](/docs/sglang-diffusion/zing/specs/default-mixed-sampling)。
 客户端不能覆盖采样计划，建议省略 `num_inference_steps`；显式填写时须等于有效计划的
-常规阶段步数（混合计划为2，全程四步为4）。`session.ready.num_inference_steps` 回显该值，
+常规阶段列表长度（默认混合计划为2；自定义列表取实际长度）。`session.ready.num_inference_steps` 回显该值，
 `session.ready.sampling_schedule` 返回 solver、`denoising_step_list`、`initial_block_count`
 和 `initial_denoising_step_list`。入口冻结完整计划，通过内部 source 命令交给 worker。
 混合部署的旧客户端若写死4或只接受四步 ready，须与服务一同升级。

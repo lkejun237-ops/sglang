@@ -147,7 +147,8 @@ async def exchange(args, output, started, read_source, received_file, trace):
             ready.get("type") != "session.ready"
             or ready.get("zing_realtime_api_version") != 1
             or ready.get("source_stream") != source_format
-            or ready.get("num_inference_steps") not in (2, 4)
+            or type(ready.get("num_inference_steps")) is not int
+            or ready["num_inference_steps"] < 1
             or ready.get("realtime_output_format") != "raw"
             or ready.get("max_message_bytes") != message_budget
             or not 0 < ready.get("max_source_message_bytes", 0) <= message_budget

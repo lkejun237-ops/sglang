@@ -2042,10 +2042,16 @@ class ServerArgs(DisaggServerArgsMixin):
             "--zing-solver", choices=["euler", "few_step"], default=None
         )
         parser.add_argument(
-            "--zing-denoising-step-list", type=parse_noise_grid, default=None
+            "--zing-denoising-step-list",
+            type=parse_noise_grid,
+            default=None,
+            help="Regular few_step noise grid: comma-separated integers descending from 1000, excluding zero.",
         )
         parser.add_argument(
-            "--zing-initial-denoising-step-list", type=parse_noise_grid, default=None
+            "--zing-initial-denoising-step-list",
+            type=parse_noise_grid,
+            default=None,
+            help="Initial few_step noise grid: same format as the regular grid; requires initial block count 3.",
         )
         parser.add_argument(
             "--zing-initial-block-count",
@@ -2057,6 +2063,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "then two steps. Set 0 to disable the initial stage. "
                 "With 3, omitted Zing solver/regular/initial grids default to "
                 "few_step, 1000,750 and 1000,750,500,250. "
+                "Explicit grids override these defaults independently. "
                 "With 0, preserve request-level sampling defaults."
             ),
         )

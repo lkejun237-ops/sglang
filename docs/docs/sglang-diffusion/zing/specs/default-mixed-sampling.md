@@ -23,7 +23,7 @@ sglang serve --model-path /path/to/model
 sglang serve --model-path /path/to/model --zing-initial-block-count 0
 ```
 
-有限实时入口此时恢复请求的 solver/grid；连续 source 此时保留 profile 原有 regular grid。要明确全程两步，关闭时再传 `--zing-solver few_step --zing-denoising-step-list 1000,750`；全程四步则传 `1000,750,500,250`。显式 Euler 或其他 grid 必须配合 count=0；默认 ON 不会悄悄改写冲突参数。
+有限实时入口此时恢复请求的 solver/grid；连续 source 此时保留 profile 原有 regular grid。要明确全程两步，关闭时再传 `--zing-solver few_step --zing-denoising-step-list 1000,750`；全程四步则传 `1000,750,500,250`。显式 Euler 必须配合 count=0，且连续 source 仍要求 few_step。两套 grid 均可显式覆盖默认值，见[自定义去噪列表](/docs/sglang-diffusion/zing/specs/configurable-step-lists)；未传入的 grid 才补默认值。
 
 连续 source 仍需有效的 checkpoint profile，但不需要为开启混合采样添加字段：
 

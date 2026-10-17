@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The two #297 deployments, checked against real small-model sampling."""
+"""Realtime deployment plans, checked against real small-model sampling."""
 
 import argparse
 import asyncio
@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import msgspec.msgpack
 import pytest
 import torch
 
@@ -252,6 +253,23 @@ def test_deployment_cli(count):
             ("few_step", [1000, 750], [1000, 750, 500, 250]),
         ),
         (
+            ["--zing-denoising-step-list", "1000,500"],
+            ("few_step", [1000, 500], [1000, 750, 500, 250]),
+        ),
+        (
+            ["--zing-initial-denoising-step-list", "1000,800,600"],
+            ("few_step", [1000, 750], [1000, 800, 600]),
+        ),
+        (
+            [
+                "--zing-denoising-step-list",
+                "1000",
+                "--zing-initial-denoising-step-list",
+                "1000,800,600",
+            ],
+            ("few_step", [1000], [1000, 800, 600]),
+        ),
+        (
             [
                 "--zing-initial-block-count",
                 "3",
@@ -281,8 +299,8 @@ def test_deployment_cli_defaults(options, expected):
     "override",
     [
         {"zing_solver": "euler"},
-        {"zing_denoising_step_list": [1000, 500]},
-        {"zing_initial_denoising_step_list": [1000, 750]},
+        {"zing_denoising_step_list": [1000, 500, 500]},
+        {"zing_initial_denoising_step_list": [750, 500]},
         {"zing_denoising_step_list": []},
         {"zing_initial_denoising_step_list": []},
     ],
@@ -508,7 +526,12 @@ def test_realtime_step_restores_schedulers_on_failure(model, monkeypatch):  # no
 
 
 @pytest.fixture
-def static_mixed(model, tmp_path):  # noqa: F811
+def mixed_grids(request):
+    return getattr(request, "param", ([1000, 750], [1000, 750, 500, 250]))
+
+
+@pytest.fixture
+def static_mixed(model, tmp_path, mixed_grids):  # noqa: F811
     from dataclasses import replace
 
     from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import ZingH3DiTConfig
@@ -537,8 +560,8 @@ def static_mixed(model, tmp_path):  # noqa: F811
     noise = torch.randn_like(inputs.source_visual)
     options = dict(
         solver="few_step",
-        denoising_step_list=[1000, 750],
-        initial_denoising_step_list=[1000, 750, 500, 250],
+        denoising_step_list=mixed_grids[0],
+        initial_denoising_step_list=mixed_grids[1],
         initial_block_count=3,
         guidance_scale=2,
         ar_condition_timestep=0,
@@ -551,8 +574,10 @@ def static_mixed(model, tmp_path):  # noqa: F811
         for s in (baseline.video_scheduler, baseline.initial_schedulers[0])
     ]
     plan = initial_blocks_plan(*plans, 3)
-    # The regular grid is a subset; a second copy of projection values is needless.
-    assert len(plan["batches"]) == len(plans[1]["batches"])
+    # Deduplicate overlap, including when neither grid is a subset of the other.
+    expected_batches = {tuple(batch) for part in plans for batch in part["batches"]}
+    assert {tuple(batch) for batch in plan["batches"]} == expected_batches
+    assert len(plan["batches"]) == len(expected_batches)
     path = tmp_path / "table"
     write_table(
         path,
@@ -591,12 +616,25 @@ def assert_same_kv(first, second, layers):
 
 
 @pytest.mark.parametrize("joint", ["source_first", "cross_chunk"])
+@pytest.mark.parametrize("configuration", ["profile", "cli"])
+@pytest.mark.parametrize(
+    "mixed_grids",
+    [
+        pytest.param(([1000, 750], [1000, 750, 500, 250]), id="default-4-to-2"),
+        pytest.param(([1000, 500], [1000, 800, 600, 200]), id="custom-4-to-2"),
+        pytest.param(([1000], [1000, 800, 600]), id="3-to-1"),
+        pytest.param(([1000, 600, 200], [1000]), id="1-to-3"),
+    ],
+    indirect=True,
+)
 @torch.no_grad()
-def test_profile_only_static_plan_matches_resident(
+def test_source_custom_plan_matches_dynamic_cache(
     configured,  # noqa: F811
     monkeypatch,
     static_mixed,
     joint,
+    configuration,
+    mixed_grids,
 ):
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters import (
         zing_h3_source_adapter as source,
@@ -604,20 +642,47 @@ def test_profile_only_static_plan_matches_resident(
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.stage import (
         ZingH3GenerationStage,
     )
+    from sglang.multimodal_gen.runtime.server_args import ServerArgs
     from sglang.multimodal_gen.test.unit.realtime.test_zing_h3_source_adapter import (
         initialize,
     )
 
+    regular, initial = mixed_grids
+    expected = dict(
+        solver="few_step",
+        denoising_step_list=regular,
+        initial_block_count=3,
+        initial_denoising_step_list=initial,
+    )
     path = Path(configured.model_path) / "zing_realtime_profile.json"
     profile = json.loads(path.read_text())
-    profile.update(
-        denoising_step_list=[1000, 750],
-        initial_block_count=3,
-        initial_denoising_step_list=[1000, 750, 500, 250],
-        joint_forward=joint,
-    )
+    profile["joint_forward"] = joint
+    if configuration == "profile":
+        profile.update(expected)
+    else:
+        # CLI must replace the fixture's explicit single-stage four-step profile.
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parsed = parser.parse_args(
+            [
+                "--model-path",
+                configured.model_path,
+                "--zing-denoising-step-list",
+                ",".join(map(str, regular)),
+                "--zing-initial-denoising-step-list",
+                ",".join(map(str, initial)),
+            ]
+        )
+        ServerArgs._validate_zing_sampling(parsed)
+        for field in expected:
+            setattr(configured, "zing_" + field, getattr(parsed, "zing_" + field))
+        configured.is_arg_explicitly_set = lambda name: (
+            name in {"zing_denoising_step_list", "zing_initial_denoising_step_list"}
+        )
     path.write_text(json.dumps(profile))
     adapter, api_session = initialize()
+    assert adapter.ready["sampling_schedule"] == expected
+    assert adapter.ready["num_inference_steps"] == len(regular)
     monkeypatch.setattr(
         source,
         "build_realtime_sampling_params",
@@ -631,6 +696,18 @@ def test_profile_only_static_plan_matches_resident(
         17,
     )
     baseline, original, inputs, noise, table = static_mixed
+    baseline.generator.adaln_projection_cache_enabled = True
+    # Exercise the same internal command that is serialized to the worker.
+    monkeypatch.setattr(
+        source.BaseRealtimeModelAdapter,
+        "prepare_next_request",
+        lambda *a: SimpleNamespace(extra={}),
+    )
+    batch = adapter.prepare_next_request(api_session, configured, None)
+    command = msgspec.msgpack.decode(msgspec.msgpack.encode(batch.extra))[
+        "zing_source_command"
+    ]
+    assert command["sampling_schedule"] == expected
     stage = SimpleNamespace(
         modules={"transformer": original.generator},
         packer=original.processor,
@@ -643,20 +720,25 @@ def test_profile_only_static_plan_matches_resident(
         ),
     )
     sampler = ZingH3GenerationStage._build_realtime_sampler(
-        stage, params, source_sampling_schedule=adapter.sampling_schedule
+        stage, params, source_sampling_schedule=command["sampling_schedule"]
     )
     baseline.guidance_scale, baseline.do_cfg, baseline.joint_forward = 1, False, joint
     sessions = [ready_session(s, inputs, noise) for s in (baseline, sampler)]
     iterators = [s.drain_ready() for s in sessions]
     steps = []
     try:
-        for _ in range(5):
+        for index in range(5):
             results = [next(it) for it in iterators]
             assert torch.equal(results[0].visual, results[1].visual)
+            assert_same_kv(sessions[0].cache, sessions[1].cache, 2)
+            assert torch.equal(sessions[0].rng.cpu_rng, sessions[1].rng.cpu_rng)
+            receipt = sampler.last_run_metrics["last_block_schedule"]
+            assert receipt["noise_grid"] == (initial if index < 3 else regular)
             steps.append(
                 sampler.last_run_metrics["last_block_schedule"]["denoise_steps"]
             )
-        assert steps == [4, 4, 4, 2, 2]
+        assert steps == [len(initial)] * 3 + [len(regular)] * 2
+        assert sessions[0].cache.adaln_projection_cache.hits > 0
         for it in iterators:
             with pytest.raises(StopIteration):
                 next(it)
@@ -677,6 +759,14 @@ def test_profile_only_static_plan_matches_resident(
     }
     mismatched = ZingH3GenerationStage._build_realtime_sampler(
         stage, params, source_sampling_schedule=single
+    )
+    with pytest.raises(ValueError, match="schedule"):
+        mismatched.initialize(inputs, noise)
+    assert table.active_plans == 0
+    # Even a different valid schedule with no new timestep must be rejected.
+    changed = {**expected, "initial_denoising_step_list": regular}
+    mismatched = ZingH3GenerationStage._build_realtime_sampler(
+        stage, params, source_sampling_schedule=changed
     )
     with pytest.raises(ValueError, match="schedule"):
         mismatched.initialize(inputs, noise)
@@ -876,7 +966,14 @@ def test_static_ready_cancel_releases_plan(static_mixed, joint):
 
 
 @pytest.mark.parametrize("count", [0, 3])
-def test_table_builder_cli_plan(static_mixed, tmp_path, monkeypatch, count):
+@pytest.mark.parametrize(
+    "mixed_grids",
+    [([1000, 750], [1000, 750, 500, 250]), ([1000, 600, 200], [1000])],
+    indirect=True,
+)
+def test_table_builder_cli_plan(
+    static_mixed, tmp_path, monkeypatch, count, mixed_grids
+):
     import importlib.util
     import json
     from pathlib import Path
@@ -896,8 +993,7 @@ def test_table_builder_cli_plan(static_mixed, tmp_path, monkeypatch, count):
         "--solver",
         "few_step",
         "--denoising-step-list",
-        "1000",
-        "750",
+        *map(str, mixed_grids[0]),
         "--condition",
         "0",
         "--reference",
@@ -910,10 +1006,7 @@ def test_table_builder_cli_plan(static_mixed, tmp_path, monkeypatch, count):
             "--initial-block-count",
             "3",
             "--initial-denoising-step-list",
-            "1000",
-            "750",
-            "500",
-            "250",
+            *map(str, mixed_grids[1]),
         ]
     monkeypatch.setattr("sys.argv", argv)
     builder.main()

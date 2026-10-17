@@ -85,6 +85,10 @@ def initialize(**overrides):
     [
         (4, 0, None, 0),
         (2, 0, None, 0),
+        (3, 0, None, 0),
+        (1, 0, None, 0),
+        (5, 0, None, 0),
+        (2, 0, 5, 3),
         (4, 0, 2, 0),
         (2, 0, 4, 0),
         (4, 0, 2, 3),
@@ -106,7 +110,7 @@ def test_effective_sampling_is_reported_and_dispatched(
 ):
     path = Path(configured.model_path) / "zing_realtime_profile.json"
     profile = json.loads(path.read_text())
-    profile["denoising_step_list"] = [1000, 750, 500, 250][:profile_steps]
+    profile["denoising_step_list"] = [1000, 750, 500, 250, 125][:profile_steps]
     if profile_count:
         profile.update(
             initial_block_count=profile_count,
@@ -115,7 +119,7 @@ def test_effective_sampling_is_reported_and_dispatched(
     path.write_text(json.dumps(profile))
     configured.zing_solver = "few_step" if cli_steps else None
     configured.zing_denoising_step_list = (
-        [1000, 750, 500, 250][:cli_steps] if cli_steps else None
+        [1000, 750, 500, 250, 125][:cli_steps] if cli_steps else None
     )
     configured.zing_initial_block_count = count
     configured.zing_initial_denoising_step_list = (
@@ -129,7 +133,7 @@ def test_effective_sampling_is_reported_and_dispatched(
     ready = adapter.session_ready_message(session)
     expected = dict(
         solver="few_step",
-        denoising_step_list=[1000, 750, 500, 250][:expected_steps],
+        denoising_step_list=[1000, 750, 500, 250, 125][:expected_steps],
         initial_block_count=expected_count,
         initial_denoising_step_list=[1000, 750, 500, 250] if expected_count else None,
     )
@@ -170,7 +174,7 @@ def test_effective_sampling_is_reported_and_dispatched(
 
 
 @pytest.mark.parametrize(
-    "grid", [[1000, 750, 500], [1000, 1000], [750, 500], [1000, 0], [1000, True]]
+    "grid", [[], [1000, 1000], [750, 500], [1000, 0], [1000, True]]
 )
 def test_invalid_profile_grid_is_not_hidden_by_cli(configured, grid):
     path = Path(configured.model_path) / "zing_realtime_profile.json"
@@ -278,11 +282,11 @@ def test_default_mixed_schedule_and_explicit_overrides(
             "initial_block_count": 0,
             "initial_denoising_step_list": [1000, 750, 500, 250],
         },
-        {"initial_block_count": 3, "initial_denoising_step_list": [1000, 750]},
+        {"initial_block_count": 3, "initial_denoising_step_list": [1000, 0]},
         {
             "initial_block_count": 3,
             "initial_denoising_step_list": [1000, 750, 500, 250],
-            "denoising_step_list": [1000, 750, 500, 250],
+            "denoising_step_list": [1000, 750, 800],
         },
     ],
 )

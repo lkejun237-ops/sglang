@@ -181,7 +181,6 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             == hashlib.sha256(config_bytes).hexdigest()
             and profile.get("solver") == "few_step"
             and isinstance(profile.get("denoising_step_list"), list)
-            and len(profile["denoising_step_list"]) in (2, 4)
             and profile.get("noise_version") == "indexed-cpu-v1",
             "The deployed model is not configured for streaming.",
         )
