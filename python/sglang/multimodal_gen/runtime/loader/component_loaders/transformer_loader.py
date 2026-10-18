@@ -425,7 +425,7 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                 or component_starts_on_cpu
             ):
                 raise ValueError(
-                    "Zing AdaLN tables require unquantized resident Zing TP=1/SP1 without FSDP"
+                    "Zing AdaLN tables require unquantized resident Zing TP=1/SP1 or SP2 without FSDP"
                 )
             arch = dit_config.arch_config
             table = ZingAdalnTable(

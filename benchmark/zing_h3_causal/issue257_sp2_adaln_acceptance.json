@@ -1,0 +1,258 @@
+{
+  "date": "2026-10-17",
+  "passed": true,
+  "tested_pr_commit": "773c9811d24ec07a2a26cbd042433f38683462cd",
+  "runtime_base_commit": "0dafc687b02cc6e63c1078d91116fc89e04fad7d",
+  "runtime_candidate_ast_verified": true,
+  "image": "zing-thailand-registry-vpc.ap-southeast-7.cr.aliyuncs.com/zing/sglang@sha256:4b9bca7dd61784cd84e43ac760db4c458c08a2d6bf22887e3740455fffe9e015",
+  "hardware": [
+    {
+      "index": 0,
+      "name": "NVIDIA L20D",
+      "cc": [
+        10,
+        3
+      ],
+      "memory_MiB": 274113
+    },
+    {
+      "index": 1,
+      "name": "NVIDIA L20D",
+      "cc": [
+        10,
+        3
+      ],
+      "memory_MiB": 274113
+    }
+  ],
+  "request": {
+    "tp": 1,
+    "sp": 2,
+    "width": 832,
+    "height": 480,
+    "frames": 120,
+    "reference_images": 6,
+    "source_video": true,
+    "video_only": true,
+    "steps": [
+      1000,
+      750,
+      500,
+      250
+    ],
+    "seed": 42,
+    "joint_forward": "off",
+    "conditioning": "same saved snapshot",
+    "rng": "same saved CPU and rank-local CUDA RNG states"
+  },
+  "eager": {
+    "available": true,
+    "expected": {
+      "shape": [
+        1,
+        24,
+        36,
+        30,
+        52
+      ],
+      "dtype": "torch.float32",
+      "finite": true,
+      "sha256": "9522caa7d97c5f5aaab28a1d14d317c204014d0392b28cc39ae26b9b49c4e429"
+    },
+    "actual": {
+      "shape": [
+        1,
+        24,
+        36,
+        30,
+        52
+      ],
+      "dtype": "torch.float32",
+      "finite": true,
+      "sha256": "9522caa7d97c5f5aaab28a1d14d317c204014d0392b28cc39ae26b9b49c4e429"
+    },
+    "equal": true,
+    "max_abs": 0.0,
+    "mismatched_elements": 0,
+    "rmse": 0.0,
+    "window_eviction_timing": "after_step0",
+    "new_gpu_inference": false
+  },
+  "graph": {
+    "window_eviction_timing": "before_source",
+    "pooled_kv": true,
+    "chunk_graph": false,
+    "comparison": "SHA256 of full tensor bytes plus dtype/shape/stride/finite, and request RNG, for every recorded event; torch.equal of saved final FP32 visual_latents",
+    "no_kv_tensor_scan": true,
+    "ranks": [
+      {
+        "rank": 0,
+        "equal": true,
+        "resident_events": 7164,
+        "table_events": 7164,
+        "counts": {
+          "request_start": 1,
+          "conditioning": 1,
+          "seeded": 1,
+          "initial_noise": 1,
+          "forward_input": 133,
+          "projection": 6783,
+          "forward_output": 133,
+          "scheduler.video": 88,
+          "block_complete": 22,
+          "final_latents": 1
+        },
+        "no_cache_events": true,
+        "final_present": true,
+        "deployments": [
+          {
+            "arm": "resident-graph",
+            "graph_routes": {
+              "rope_rebuild": 22,
+              "warmup": 7,
+              "capture": 7,
+              "replay": 52
+            },
+            "pool_available_after_request": 1,
+            "projection_storage_bytes": 34752377856,
+            "projection_parameters_empty": false,
+            "table": null
+          },
+          {
+            "arm": "table-graph",
+            "graph_routes": {
+              "rope_rebuild": 22,
+              "warmup": 7,
+              "capture": 7,
+              "replay": 52
+            },
+            "pool_available_after_request": 1,
+            "projection_storage_bytes": 0,
+            "projection_parameters_empty": true,
+            "table": {
+              "bytes": 64619520,
+              "entries": 5,
+              "active_plans": 0,
+              "hits": 6783,
+              "misses": 0,
+              "fallback": 0,
+              "checkpoint_verified": true
+            }
+          }
+        ]
+      },
+      {
+        "rank": 1,
+        "equal": true,
+        "resident_events": 7164,
+        "table_events": 7164,
+        "counts": {
+          "request_start": 1,
+          "conditioning": 1,
+          "seeded": 1,
+          "initial_noise": 1,
+          "forward_input": 133,
+          "projection": 6783,
+          "forward_output": 133,
+          "scheduler.video": 88,
+          "block_complete": 22,
+          "final_latents": 1
+        },
+        "no_cache_events": true,
+        "final_present": true,
+        "deployments": [
+          {
+            "arm": "resident-graph",
+            "graph_routes": {
+              "rope_rebuild": 22,
+              "warmup": 7,
+              "capture": 7,
+              "replay": 52
+            },
+            "pool_available_after_request": 1,
+            "projection_storage_bytes": 34752377856,
+            "projection_parameters_empty": false,
+            "table": null
+          },
+          {
+            "arm": "table-graph",
+            "graph_routes": {
+              "rope_rebuild": 22,
+              "warmup": 7,
+              "capture": 7,
+              "replay": 52
+            },
+            "pool_available_after_request": 1,
+            "projection_storage_bytes": 0,
+            "projection_parameters_empty": true,
+            "table": {
+              "bytes": 64619520,
+              "entries": 5,
+              "active_plans": 0,
+              "hits": 6783,
+              "misses": 0,
+              "fallback": 0,
+              "checkpoint_verified": true
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "ready_memory_eager": {
+    "phase": "generation stage entry before conditioning/DiT; no pooled KV",
+    "per_rank": [
+      {
+        "rank": 0,
+        "resident_allocated_bytes": 137334236672,
+        "table_allocated_bytes": 102630443008,
+        "saved_allocated_bytes": 34703793664,
+        "resident_reserved_bytes": 137745137664,
+        "table_reserved_bytes": 103125352448,
+        "omitted_projection_storage_bytes": 34752377856,
+        "table_storage_bytes": 64619520
+      },
+      {
+        "rank": 1,
+        "resident_allocated_bytes": 137334236672,
+        "table_allocated_bytes": 102630443008,
+        "saved_allocated_bytes": 34703793664,
+        "resident_reserved_bytes": 137745137664,
+        "table_reserved_bytes": 103125352448,
+        "omitted_projection_storage_bytes": 34752377856,
+        "table_storage_bytes": 64619520
+      }
+    ]
+  },
+  "jobs": {
+    "memory_gpu": "dlc12t4utn02yq2z",
+    "cpu_reuse_preflight": "dlc115zdvv9m6cl5",
+    "graph_gpu": "dlc1u0vytnd3n26t",
+    "cpu_readback": "dlc1x2ri179cfzbg"
+  },
+  "artifacts": [
+    {
+      "uri": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/issue257-sp2-20261017-r3/evidence.tar.gz",
+      "sha256": "1c3c21303d8620f3e2aea550e13766e821975c71d26fd93ef54fa276cd779579",
+      "bytes": 326675
+    },
+    {
+      "uri": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/issue257-sp2-20261017-r5/evidence.tar.gz",
+      "sha256": "cd7c7093da06771eb89c12b926f7c46968fa7c2218cdf16d902f9e1125afca2b",
+      "bytes": 8041517
+    }
+  ],
+  "not_covered": [
+    "chunk CUDA Graph",
+    "after_step0 Graph",
+    "SP4/SP8",
+    "mixed steps",
+    "joint forward",
+    "streaming ingress",
+    "prompt update",
+    "H200",
+    "five-branch checkpoint",
+    "human video quality"
+  ],
+  "performance_evidence": false
+}

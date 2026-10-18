@@ -122,7 +122,7 @@ def test_zing_registers_executable_stages_and_accepts_ulysses_sp4(monkeypatch):
         ).validate_server_args(args)
 
 
-def test_adaln_table_is_limited_to_sp1():
+def test_adaln_table_is_limited_to_sp1_sp2():
     from types import SimpleNamespace
 
     def args(sp):
@@ -137,8 +137,10 @@ def test_adaln_table_is_limited_to_sp1():
         taeh3_checkpoint_path="/model/taeh3.pth", zing_adaln_table_path="/table"
     )
     config.validate_server_args(args(1))
-    with pytest.raises(ValueError, match="SP1 only"):
-        config.validate_server_args(args(2))
+    config.validate_server_args(args(2))
+    for sp in (4, 8):
+        with pytest.raises(ValueError, match="SP1 and SP2 only"):
+            config.validate_server_args(args(sp))
 
 
 @pytest.mark.parametrize("fps", [24, 30])
