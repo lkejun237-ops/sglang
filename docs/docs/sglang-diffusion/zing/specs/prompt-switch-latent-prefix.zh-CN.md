@@ -6,8 +6,9 @@ source-ready 视频会话、packing、sampling 和 KV cache 边界，不依赖�
 本文核对的代码基线是 `origin/main@47c41dc43bf70431bd82cf161a42e2c1d3cfd3ef`。
 
 最终行为是：每个会话常态维护一个最近 target latent 的滚动窗口，容量由
-`prompt_switch_prefix_latent_frames` 控制。配置默认为 `None`，保持既有 prompt 更新行为；
-显式设为本期唯一支持值 `5` 后启用滚动 prefix。新 prompt 只有在已经积累满这段固定长度
+`prompt_switch_prefix_latent_frames` 控制。配置默认为 `5`，无需额外配置即可启用滚动
+prefix；显式设为 `None`（配置 JSON 中为 `null`）可保持旧的 prompt 更新行为。
+新 prompt 只有在已经积累满这段固定长度
 历史后，才会在完整 block 边界生效，并使用它做 clean prefix prefill；输出块用既有
 `event_id` 标明实际使用的 prompt 版本。
 
@@ -20,7 +21,7 @@ source-ready 视频会话、packing、sampling 和 KV cache 边界，不依赖�
 只改变天气、光照、材质等渲染表现；角色转向和运动仍由游戏引擎/source 控制。服务不能
 中断当前去噪块，也不能要求客户端把已经播放的视频重新上传。
 
-服务启动时配置固定的滚动 prefix 长度：
+服务启动时默认使用以下固定的滚动 prefix 长度，无需重复配置：
 
 ```text
 prompt_switch_prefix_latent_frames=5
@@ -30,6 +31,12 @@ prompt_switch_prefix_latent_frames=5
 虽然配置名沿用 `latent_frames`，这里的一个单位指一个 latent，不指一帧解码后的视频。
 它是部署级、会话内不可变配置，因为它参与 session 显存预算、KV pool 容量和 prefix
 block 几何。
+
+如果已有模型导出不满足下文的 `[3,2]` + `split_first_latent=True` 分块要求，或需要
+保留旧的“只替换条件 KV、保留 target 历史 KV”行为，在服务的 pipeline 配置 JSON 中
+显式设置 `"prompt_switch_prefix_latent_frames": null`。已有配置文件中的显式 `null`
+仍然优先于新默认值；省略该字段才采用默认 `5`。此默认值变更不代表已验证 H100/L20Z
+上的切换显存峰值或解决 OOM，需要在对应部署配置下复测。
 
 客户端沿用现有 WebSocket prompt update 协议，发送 prompt 和单调递增的 `event_id`。
 本文不新增第二套控制协议。示意消息如下，准确 envelope 以现有 realtime 协议为准：
@@ -209,8 +216,8 @@ prompt 可以先进入 pending，但不能生效；旧 prompt 继续生成并补
 截断成 `1,2,2`，掩盖下一块实际从 latent 10 开始的相位错误。不匹配时
 直接拒绝启用 prompt-switch prefix，不能静默使用另一种切法。本期不扩展到其他 chunk
 计划。启用值 `5` 同时是滚动窗口上限和 prompt 生效所需的**固定历史长度**，不允许用
-1 个或 3 个 latent 提前切换。默认关闭避免不支持 `1+2+2` 的既有 export 在 stage 启动时
-被这个 source-only 功能拒绝；几何校验只在启用功能并创建 source session 时执行。
+1 个或 3 个 latent 提前切换。默认启用后，不支持该几何的既有 export 需要显式设置
+`null` 才能沿用旧路径；几何校验仍只在启用功能并创建 source session 时执行。
 
 会话开头接纳新 prompt 时，需要继续用旧 prompt 生成，直到严格凑齐 5 个 latent。下表
 使用本期支持的入口 block 长度 `1,2,2` 说明模型会话内的等待过程；假设候选已经进入模型
@@ -316,7 +323,7 @@ KV lease 和 RNG 都属于当前会话；不新增多 owner 状态或并发会�
 | `_sampling_helpers.py` | `_commit_clean_prefix` 以 active/final 两阶段提交已知干净 latent | 不决定切换时机或保存历史 |
 | `packing.py` | 把固定 5 个 latent 按 `1+2+2` 打包成新 epoch 的合法 prefix rows/position，并校验 `ChunkPlan` | 不拥有 session 生命周期 |
 | `zing_h3_cache.py` | 沿用 KV pool、prefix/target commit 和清理事务 | 不知道 prompt 文本或 latent 保存策略 |
-| `stage.py` / Zing pipeline config | 声明可选配置；`None` 保持兼容，显式 `5` 交给 source session 启用 | 不在全局 stage 构造时限制既有 chunk plan，不在 WebSocket 事件中动态修改 |
+| `stage.py` / Zing pipeline config | 默认 `5` 交给 source session 启用；显式 `None` 保持旧路径 | 不在全局 stage 构造时限制既有 chunk plan，不在 WebSocket 事件中动态修改 |
 
 依赖方向保持：
 
@@ -403,7 +410,7 @@ SP1/SP2 数值对照、分阶段性能及更多连续切换仍待验证；计划
 | 不重复输出 | 检查对外 `TemporalChunk` 与内部局部 epoch | 对外 chunk ID 和绝对 latent 范围连续；第二次切换后内部仍从 target block 8 继续 | CPU 已覆盖；三例单次切换完整解码通过，真实连续两次切换待测 |
 | epoch 几何正确 | 检查固定 5 个 latent 的 row/block/position 及后续长度 | prefix 形成完整 `1+2+2`，下一 target 为 3 latent，随后为 2 latent | CPU 已通过（见 12.2） |
 | bridge 相位切换 | 已缓存 source latent 时请求连续 `...,3,3` 两块 | 第二个 3-latent 块跨旧边界取值，但绝对 latent、像素和 provenance 无重叠或丢失 | CPU 已通过（见 12.2） |
-| chunk 配置不匹配 | 使用 `[3,7]+split`、`[1,2,7]`、`[1,2,2]` 或未 split 的 `[3,2]` 创建会话 | 未启用时普通会话可创建；显式启用时明确拒绝 | CPU 已覆盖 |
+| chunk 配置不匹配 | 使用 `[3,7]+split`、`[1,2,7]`、`[1,2,2]` 或未 split 的 `[3,2]` 创建会话 | 显式关闭时普通会话可创建；启用时（包括默认值）明确拒绝 | CPU 已覆盖 |
 | prefix 长度不匹配 | 配置 `prompt_switch_prefix_latent_frames` 为非 5 值启动 | config/session 初始化明确拒绝 | CPU 已覆盖 |
 | prompt 超过 pool 预算 | 16-row pool 收到 40-row 更新；另测文本+reference 的总计边界 | 拒绝新事件且 KV/RNG/storage 不变；继续超过第 18 块；恰好 16 rows 的后续候选可生效 | 本次新增 CPU 回归，执行结果见下文 |
 | condition 失败可恢复 | 注入 condition worker 错误 | 返回非 fatal notice，已有输出仍携带原 event/version | 既有 RPC contract 已覆盖 |
@@ -491,7 +498,7 @@ prefix clean commit。计划在固定 checkpoint、分辨率、seed、source 和
 | 6 | `sampling.py`：`rebuild_prompt_prefix` | 是否只重建新 condition 和 5-latent prefix，并保留 pooled storage |
 | 7 | `_sampling_helpers.py`：`_commit_clean_prefix` | 已知 latent 是否走合法 active/final cache 事务，不经过 denoise/scheduler |
 | 8 | `zing_h3_cache.py`：`ZingH3KVCache.clear`、`prepare_chunk`、`update` | pooled storage 是否复用，事务顺序和 window 是否仍合法 |
-| 9 | `server_args.py` 与 Zing pipeline config | 默认 `None` 是否保持兼容、显式值是否只接受 5，并正确计入 session/KV 预算 |
+| 9 | `server_args.py` 与 Zing pipeline config | 默认是否为 5、显式 `null` 是否保留旧路径、其他数值是否拒绝，并正确计入 session/KV 预算 |
 | 10 | realtime admission 与 session cleanup 路径 | 第二会话拒绝、断连/取消/故障/EOS 释放是否保持单活跃会话契约 |
 | 11 | 对应 unit/integration/GPU 测试 | event、RNG、latent、显存和失败路径是否有真实证据 |
 

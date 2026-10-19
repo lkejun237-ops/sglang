@@ -91,8 +91,8 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
     zing_kv_pool_rope_max_frame_gap: int = 12
     zing_kv_pool_window_eviction_timing: str = "after_step0"
     # Runtime-owned rolling target history used when a WebSocket prompt changes.
-    # None keeps the existing prompt-update path for exports without 1,2,2 geometry.
-    prompt_switch_prefix_latent_frames: int | None = None
+    # Explicit None keeps the legacy path for exports without 1,2,2 geometry.
+    prompt_switch_prefix_latent_frames: int | None = 5
 
     # Legacy decoder fields the caller supplied; a default must not look like a choice.
     _explicit_decoder_fields = frozenset()

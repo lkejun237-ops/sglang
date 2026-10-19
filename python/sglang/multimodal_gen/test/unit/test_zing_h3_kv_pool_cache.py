@@ -259,6 +259,10 @@ def test_sp_pooled_raw_store_matches_unpooled(
                 param.copy_(torch.randn(param.shape) * 0.08)
         model.rope.inv_freq.fill_(1)
     model.experimental_stable_shapes = stable_shapes
+    # CPU ranks share one model, unlike production's process-local SP models.
+    # Initialize the lazy timestep buffer before threads can replace it after
+    # another rank has bound its cache to the model's buffer identities.
+    model.time_embedder(torch.zeros(1))
     sampler = _sampler(model)
     torch.manual_seed(5)
     inputs, visual = _inputs(7), torch.randn(1, 2, 7, 2, 2)

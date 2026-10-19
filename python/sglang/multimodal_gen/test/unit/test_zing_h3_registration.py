@@ -69,12 +69,22 @@ def test_zing_declares_four_modalities_and_reuses_codec_configs():
     assert type(zing.text_encoder_configs[0]) is type(h3.text_encoder_configs[0])
     assert zing.should_use_guidance
     assert not zing.requires_audio_output
-    assert zing.prompt_switch_prefix_latent_frames is None
+    assert zing.prompt_switch_prefix_latent_frames == 5
     assert zing.get_model_deployment_config().dit_layerwise_offload_modes == ("memory",)
     files = ["diffusion_pytorch_model-00001-of-00003.safetensors"]
     assert zing.select_vae_weight_files(
         files, "/model/video_vae", "video_vae", "fp32"
     ) == ["/model/video_vae/source/model.safetensors"]
+
+
+@pytest.mark.parametrize(
+    "overrides, expected",
+    [({}, 5), ({"prompt_switch_prefix_latent_frames": None}, None)],
+)
+def test_zing_pipeline_config_preserves_prompt_switch_opt_out(overrides, expected):
+    config = ZingH3CausalPipelineConfig()
+    config.update_pipeline_config(json.loads(json.dumps(overrides)))
+    assert config.prompt_switch_prefix_latent_frames == expected
 
 
 def test_zing_registers_executable_stages_and_accepts_ulysses_sp4(monkeypatch):
