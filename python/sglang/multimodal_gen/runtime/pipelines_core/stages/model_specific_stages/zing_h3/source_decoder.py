@@ -11,10 +11,9 @@ from .streaming_codecs import DecodedVideoSlice
 class SourceLynnDecoder:
     """Bounded source provenance around a session-owned Lynn stream.
 
-    Every pop runs decode_step on all pending latents. Until EOS the last
-    latent may still cover padded source frames, so its at most four frames
-    are held back; only frames proven valid by a later latent or by
-    finish(total_frames) are delivered, never emitted and withdrawn.
+    Each append declares the actual output pixel boundary independently of
+    source dependencies. Lynn has no lookahead: pop emits every valid frame,
+    discards only short-tail padding, and retains no RGB waiting for EOS.
     """
 
     def __init__(self, codecs, *, capacity_latents, provenance_for):
@@ -26,6 +25,7 @@ class SourceLynnDecoder:
         self.pending = self.held = None
         self.accepted_latents = self.emitted_frames = self.dependency = 0
         self.total_frames = None
+        self.valid_frame_end = 0
         self.closed = self.drained = False
 
     @property
@@ -34,9 +34,7 @@ class SourceLynnDecoder:
 
     @property
     def valid_frames(self):
-        if self.total_frames is not None:
-            return self.total_frames
-        return self.protocol.frame_count(max(0, self.accepted_latents - 1))
+        return self.valid_frame_end
 
     @property
     def ready(self):
@@ -46,7 +44,7 @@ class SourceLynnDecoder:
             or (self.total_frames is not None and not self.drained)
         )
 
-    def append(self, latent, *, latent_start, source_dependency_end):
+    def append(self, latent, *, latent_start, source_dependency_end, valid_frame_end):
         if self.closed or self.total_frames is not None:
             raise ValueError("Decoder stream is closed")
         if latent_start != self.accepted_latents:
@@ -55,6 +53,18 @@ class SourceLynnDecoder:
             raise ValueError("Lynn expects nonempty N24THW latents")
         if type(source_dependency_end) is not int or source_dependency_end < 0:
             raise ValueError("Source dependency must be a nonnegative pixel watermark")
+        if self.valid_frame_end < self.protocol.frame_count(self.accepted_latents):
+            raise ValueError("Decoder cannot append after a partial final latent")
+        count = self.accepted_latents + latent.shape[2]
+        if (
+            type(valid_frame_end) is not int
+            or not self.protocol.frame_count(count - 1)
+            < valid_frame_end
+            <= self.protocol.frame_count(count)
+            or valid_frame_end <= self.valid_frame_end
+            or valid_frame_end > source_dependency_end
+        ):
+            raise ValueError("Invalid valid output frame boundary")
         if self.buffered_latents + latent.shape[2] > self.capacity_latents:
             raise ValueError("Decoder latent capacity exceeded")
         self.pending = (
@@ -62,7 +72,8 @@ class SourceLynnDecoder:
             if self.pending is None
             else torch.cat((self.pending, latent.detach()), dim=2)
         )
-        self.accepted_latents += latent.shape[2]
+        self.accepted_latents = count
+        self.valid_frame_end = valid_frame_end
         # Attention history chains through every earlier latent, so keep the
         # cumulative high watermark rather than inferring a W-latent bound.
         self.dependency = max(self.dependency, source_dependency_end)
@@ -97,7 +108,9 @@ class SourceLynnDecoder:
         if self.held is None or self.held.shape[2] < count:
             raise ValueError("Lynn decoded fewer frames than the source provides")
         values = self.held[:, :, :count]
-        self.held = self.held[:, :, count:].clone()
+        # Empty shape metadata supports an EOS pop after the last RGB was
+        # already delivered; clone avoids retaining the decoded allocation.
+        self.held = self.held[:, :, :0].clone()
         if self.total_frames is not None:
             self.stream.finish(self.total_frames)
             self.held, self.drained = None, True
@@ -112,10 +125,7 @@ class SourceLynnDecoder:
             raise ValueError("Decoder stream is already closed")
         if type(total_frames) is not int or total_frames < max(1, self.emitted_frames):
             raise ValueError("Invalid final video frame count")
-        count = self.accepted_latents
-        if not count or not self.protocol.frame_count(
-            count - 1
-        ) < total_frames <= self.protocol.frame_count(count):
+        if not self.accepted_latents or total_frames != self.valid_frame_end:
             raise ValueError("Final video frame count does not match latent count")
         self.total_frames = total_frames
 

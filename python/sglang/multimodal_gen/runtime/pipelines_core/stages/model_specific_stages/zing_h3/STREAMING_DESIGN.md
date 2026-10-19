@@ -5,8 +5,10 @@
 产品目标是已就绪的每个 latent 独立推进 Decoder，后续自研 Decoder 尽可能在一个 latent 内逐 frame 交付。DiT 的分块计划与 Decoder 的解码粒度独立：当前只采用启动 `1,2,2`、随后循环 `3,2`（`num_frame_per_block=[3,2]`、`split_first_latent=true`），不把五 latent 一组作为后续 Decoder 的目标默认。
 
 当前使用 Lynn streaming decoder。`SourceLynnDecoder` 独立管理每个会话的解码状态、
-有界 latent 缓冲和 source provenance；解码器逐 latent 执行，source 尚未确认有效的末尾
-帧暂留到后续 latent 或 EOF。`finish(total_frames)` 校验实际帧数并释放流状态。
+有界 latent 缓冲和 source provenance。每次 append 通过 `valid_frame_end` 声明实际
+有效像素边界，与计算依赖水位分开；解码器逐 latent 执行，pop 立即输出全部有效帧，
+只裁剪短尾 padding，不等待下一 chunk 或 EOF。短尾后禁止继续追加 latent；
+`finish(total_frames)` 校验已声明的实际帧数，随后 pop 关闭流，不重复输出已发送帧。
 TAEH3 专用的五 latent 分组、十二帧暂留和 progressive decode 环境开关已移除。
 
 Decoder 粒度、分次调度和独立 Encoder 部署是不同配置。CPU 测试不代替真实权重、

@@ -19,7 +19,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from msgspec.structs import replace
-from test_zing_lynn_stream import ARCHITECTURE, CONFIG, _provenance
+from test_zing_lynn_stream import ARCHITECTURE, CONFIG, _append_valid, _provenance
 
 from sglang.multimodal_gen.runtime.models.vaes.lynn_streaming.geometry import (
     split_tiles,
@@ -242,7 +242,7 @@ def _exact_worker(rank, world_size, path, tiles, tile_batch_size):
         stream.finish(frames)
         _assert_equal(torch.cat(outputs, dim=2), baseline, f"rank {rank} finite")
 
-        # Continuous source: irregular appends, held tail until EOS proves it valid.
+        # Continuous source: every valid frame leaves before the next append.
         codecs = SimpleNamespace(modules={ADAPTER.module_key: model}, decoder=ADAPTER)
         source = SourceLynnDecoder(
             codecs, capacity_latents=20, provenance_for=_provenance
@@ -251,14 +251,17 @@ def _exact_worker(rank, world_size, path, tiles, tile_batch_size):
         slices, cursor = [], 0
         for size in (1, 3, 1, 4, 3):
             dependency = min(frames, model.protocol.frame_count(cursor + size))
-            source.append(
+            _append_valid(
+                source,
                 latent[:, :, cursor : cursor + size],
                 latent_start=cursor,
-                source_dependency_end=dependency,
+                valid_frame_end=dependency,
             )
             cursor += size
             while source.ready:
                 slices.append(source.pop())
+            assert slices[-1].end == dependency
+            assert source.pop() is None
         source.finish(total_frames=frames)
         while source.ready:
             slices.append(source.pop())

@@ -192,7 +192,9 @@ class StableVideoDecoder:
         stable = max(0, (self.accepted_latents - lookahead) // self.tokens) * self.clip
         return self.emitted_frames < stable
 
-    def append(self, latent, *, latent_start, source_dependency_end):
+    def append(
+        self, latent, *, latent_start, source_dependency_end, valid_frame_end=None
+    ):
         if self.disposed or self.total_frames is not None:
             raise ValueError("Decoder stream is closed")
         if latent.ndim != 5 or latent.shape[2] < 1:

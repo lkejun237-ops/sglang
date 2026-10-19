@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+import importlib.util
+import inspect
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -90,6 +93,99 @@ def _source_decoder(model, *, capacity_latents=20, provenance_for=_provenance):
     return SourceLynnDecoder(
         codecs, capacity_latents=capacity_latents, provenance_for=provenance_for
     )
+
+
+def _append_valid(decoder, latent, *, latent_start, valid_frame_end, dependency=None):
+    # Keep the regression executable on the old interface: fail on observable
+    # output, rather than an unexpected-keyword TypeError.
+    kwargs = dict(
+        latent_start=latent_start,
+        source_dependency_end=(valid_frame_end if dependency is None else dependency),
+    )
+    if "valid_frame_end" in inspect.signature(decoder.append).parameters:
+        kwargs["valid_frame_end"] = valid_frame_end
+    decoder.append(latent, **kwargs)
+
+
+@pytest.mark.parametrize("frames", [1, 14])
+def test_sp_acceptance_harness_source_path_cpu(model, monkeypatch, tmp_path, frames):
+    """Exercise the acceptance caller with real Lynn streams and padded EOS."""
+    import sglang.multimodal_gen.runtime.distributed as distributed
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        decoder as decoder_module,
+    )
+
+    benchmark_dir = Path(__file__).resolve().parents[5] / "benchmark" / "zing_h3_causal"
+    monkeypatch.syspath_prepend(str(benchmark_dir))
+    spec = importlib.util.spec_from_file_location(
+        "lynn_sp_acceptance_cpu_smoke", benchmark_dir / "validate_lynn_sp_tiles.py"
+    )
+    harness = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(harness)
+
+    rows = []
+
+    class MemoryRecorder:
+        def __init__(self, args, rank, world_size):
+            self.env = {}
+
+        def write(self, **row):
+            rows.append(row)
+
+        def save_env(self):
+            pass
+
+        def abort(self, reason):
+            pytest.fail(reason)
+
+    sample = SimpleNamespace(
+        id=f"tiny-{frames}",
+        latent=_latent(_latents_for(model, frames)),
+        frames=frames,
+        media_type="image" if frames == 1 else "video",
+    )
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setattr(
+        distributed,
+        "maybe_init_distributed_environment_and_model_parallel",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        distributed,
+        "get_sp_group",
+        lambda: SimpleNamespace(rank_in_group=0, device=torch.device("cpu")),
+    )
+    monkeypatch.setattr(decoder_module, "sp_tile_group", lambda: None)
+    monkeypatch.setattr(ADAPTER, "build", lambda spec: {ADAPTER.module_key: model})
+    monkeypatch.setattr(harness, "Recorder", MemoryRecorder)
+    monkeypatch.setattr(harness, "load_inputs", lambda run: [sample])
+    monkeypatch.setattr(harness, "save_frames", lambda path, values: None)
+
+    harness.run_decode(
+        SimpleNamespace(
+            output=str(tmp_path),
+            inputs=str(tmp_path),
+            checkpoint="tiny-fixture.pt",
+            checkpoint_sha256=None,
+            model_dir=str(tmp_path),
+            reference_output=None,
+            lifecycle_sample=sample.id,
+        )
+    )
+
+    path_rows = {row["variant"]: row for row in rows if row["gate"] == "paths"}
+    assert set(path_rows) == {
+        "offline-vs-preclamp",
+        "finite-vs-offline",
+        "source-vs-offline",
+    }
+    for row in path_rows.values():
+        assert row["actual_shape"] == row["expected_shape"] == [1, 3, frames, 12, 12]
+        assert row["equal"] and row["finite"]
+        assert row["max_abs"] == 0 and row["mismatched"] == 0
+    # This is computed by the real harness from the real source pop intervals:
+    # starts at zero, no gap/overlap, ends exactly at the unpadded frame count.
+    assert path_rows["source-vs-offline"]["intervals_ok"] is True
 
 
 def test_chunked_stream_matches_offline_decode_bitwise(model):
@@ -228,9 +324,9 @@ def test_adapter_declares_stable_only_stream_with_no_lookahead(model):
     assert stream.frame_limit == 7 and stream.model is model
 
 
-@pytest.mark.parametrize("frames", [1, 2, 5, 6, 16, 17, 18, 34])
-@pytest.mark.parametrize("partition", [[1, 2, 2], [5], [3, 7, 2]])
-def test_source_decoder_holds_back_unproven_frames_and_matches_offline(
+@pytest.mark.parametrize("frames", list(range(1, 35)))
+@pytest.mark.parametrize("partition", [[1, 2, 2], [3, 2], [5], [3, 7, 2]])
+def test_source_decoder_releases_all_valid_frames_and_matches_offline(
     model, frames, partition
 ):
     protocol = model.protocol
@@ -240,20 +336,23 @@ def test_source_decoder_holds_back_unproven_frames_and_matches_offline(
     while cursor < latent.shape[2]:
         end = min(cursor + partition[index % len(partition)], latent.shape[2])
         dependency = min(frames, protocol.frame_count(end))
-        decoder.append(
+        _append_valid(
+            decoder,
             latent[:, :, cursor:end],
             latent_start=cursor,
-            source_dependency_end=dependency,
+            valid_frame_end=dependency,
         )
         result = decoder.pop()
-        # Only frames proven valid by a later latent leave before EOS.
-        assert (result.start, result.end) == (emitted, protocol.frame_count(end - 1))
+        # Every known valid frame leaves in this chunk, including the first frame.
+        assert (result.start, result.end) == (emitted, dependency)
         assert result.values.shape[2] == result.end - result.start
         if result.end > result.start:
             assert result.provenance.source_dependency_end == dependency
         else:
             assert result.provenance is None
-        assert 1 <= decoder.held.shape[2] <= protocol.ratio
+        assert decoder.held is None or decoder.held.shape[2] == 0
+        assert decoder.emitted_frames == dependency
+        assert decoder.pop() is None
         assert not decoder.ready and decoder.buffered_latents == 0
         outputs.append(result.values)
         emitted, cursor, index = result.end, end, index + 1
@@ -262,7 +361,7 @@ def test_source_decoder_holds_back_unproven_frames_and_matches_offline(
     result = decoder.pop()
     outputs.append(result.values)
     assert (result.start, result.end) == (emitted, frames)
-    assert result.provenance.pixels.end == frames
+    assert result.provenance is None  # EOS only closes; all valid RGB already left.
     assert not decoder.ready and decoder.held is None and decoder.stream.closed
     torch.testing.assert_close(
         torch.cat(outputs, dim=2), model.decode(latent, frames), atol=0, rtol=0
@@ -276,7 +375,7 @@ def test_source_decoder_checks_provenance_before_the_irreversible_decode(model):
         return _provenance(pixels, dependency + 1)
 
     decoder = _source_decoder(model, provenance_for=stale)
-    decoder.append(_latent(2), latent_start=0, source_dependency_end=5)
+    _append_valid(decoder, _latent(2), latent_start=0, valid_frame_end=5)
     with pytest.raises(ValueError, match="Provenance must match"):
         decoder.pop()
     # Nothing was decoded, so the generation is still recoverable.
@@ -286,7 +385,7 @@ def test_source_decoder_checks_provenance_before_the_irreversible_decode(model):
 
 def test_source_decoder_closes_after_a_failed_decode(model, monkeypatch):
     decoder = _source_decoder(model)
-    decoder.append(_latent(2), latent_start=0, source_dependency_end=5)
+    _append_valid(decoder, _latent(2), latent_start=0, valid_frame_end=5)
 
     def fail(z_t, state, group):
         raise RuntimeError("boom")
@@ -297,7 +396,7 @@ def test_source_decoder_closes_after_a_failed_decode(model, monkeypatch):
     assert decoder.closed and decoder.stream.closed and not decoder.ready
     assert decoder.pop() is None
     with pytest.raises(ValueError, match="closed"):
-        decoder.append(_latent(1), latent_start=2, source_dependency_end=9)
+        _append_valid(decoder, _latent(1), latent_start=2, valid_frame_end=9)
 
 
 def test_source_decoder_capacity_bad_eos_and_dispose(model):
@@ -305,22 +404,27 @@ def test_source_decoder_capacity_bad_eos_and_dispose(model):
     assert not decoder.ready and decoder.pop() is None
     with pytest.raises(ValueError, match="does not match latent count"):
         decoder.finish(total_frames=1)
-    decoder.append(_latent(2), latent_start=0, source_dependency_end=5)
+    _append_valid(decoder, _latent(2), latent_start=0, valid_frame_end=5)
     with pytest.raises(ValueError, match="contiguous"):
-        decoder.append(_latent(1), latent_start=3, source_dependency_end=9)
+        _append_valid(decoder, _latent(1), latent_start=3, valid_frame_end=9)
     with pytest.raises(ValueError, match="N24THW"):
-        decoder.append(
-            torch.zeros(1, 23, 1, 3, 3), latent_start=2, source_dependency_end=9
+        _append_valid(
+            decoder,
+            torch.zeros(1, 23, 1, 3, 3),
+            latent_start=2,
+            valid_frame_end=9,
         )
     with pytest.raises(ValueError, match="pixel watermark"):
-        decoder.append(_latent(1), latent_start=2, source_dependency_end=-1)
+        _append_valid(
+            decoder, _latent(1), latent_start=2, valid_frame_end=9, dependency=-1
+        )
     with pytest.raises(ValueError, match="capacity exceeded"):
-        decoder.append(_latent(2), latent_start=2, source_dependency_end=13)
+        _append_valid(decoder, _latent(2), latent_start=2, valid_frame_end=13)
     assert decoder.accepted_latents == 2 and decoder.buffered_latents == 2
     # Popping frees the bound: decoded latents are not retained.
-    assert decoder.pop().end == 1
-    decoder.append(_latent(3), latent_start=2, source_dependency_end=17)
-    assert decoder.pop().end == 13
+    assert decoder.pop().end == 5
+    _append_valid(decoder, _latent(3), latent_start=2, valid_frame_end=14)
+    assert decoder.pop().end == 14
     # Five latents cover frames 14..17.
     for bad in (13, 18, True, 14.0):
         with pytest.raises(ValueError, match="final video frame count|latent count"):
@@ -329,11 +433,73 @@ def test_source_decoder_capacity_bad_eos_and_dispose(model):
     with pytest.raises(ValueError, match="already closed"):
         decoder.finish(total_frames=14)
     with pytest.raises(ValueError, match="closed"):
-        decoder.append(_latent(1), latent_start=5, source_dependency_end=17)
+        _append_valid(decoder, _latent(1), latent_start=5, valid_frame_end=18)
     result = decoder.pop()
-    assert (result.start, result.end, result.values.shape[2]) == (13, 14, 1)
+    assert (result.start, result.end, result.values.shape[2]) == (14, 14, 0)
     assert decoder.pop() is None
     decoder.dispose()
     assert decoder.closed and decoder.stream.closed
     assert decoder.pending is None and decoder.held is None
     assert decoder.provenance_for is None
+
+
+@pytest.mark.parametrize("bad", [-1, 0, 1, 6, True, 5.0])
+def test_source_decoder_rejects_invalid_output_boundary_before_decode(model, bad):
+    decoder = _source_decoder(model)
+    with pytest.raises(ValueError):
+        _append_valid(
+            decoder, _latent(2), latent_start=0, valid_frame_end=bad, dependency=9
+        )
+    assert decoder.accepted_latents == decoder.stream.latents_seen == 0
+    assert decoder.pending is None and not decoder.stream.closed
+
+
+def test_source_decoder_partial_tail_cannot_regress_grow_or_accept_more(model):
+    decoder = _source_decoder(model)
+    _append_valid(decoder, _latent(3), latent_start=0, valid_frame_end=9, dependency=17)
+    first = decoder.pop()
+    assert (first.start, first.end) == (0, 9)
+    _append_valid(
+        decoder, _latent(2), latent_start=3, valid_frame_end=14, dependency=17
+    )
+    tail = decoder.pop()
+    assert (tail.start, tail.end) == (9, 14)
+    assert tail.provenance.source_dependency_end == 17
+    assert decoder.pop() is None
+    for total in (13, 15, 17):
+        with pytest.raises(ValueError):
+            decoder.finish(total_frames=total)
+    with pytest.raises(ValueError):
+        _append_valid(
+            decoder, _latent(1), latent_start=5, valid_frame_end=18, dependency=18
+        )
+    assert decoder.stream.latents_seen == decoder.accepted_latents == 5
+    decoder.finish(total_frames=14)
+    assert decoder.pop().values.shape[2] == 0
+    assert decoder.pop() is None
+    decoder.dispose()
+
+
+@pytest.mark.parametrize("bad", [8, 9, 14])
+def test_source_decoder_rejects_nonadvancing_or_excess_boundary_atomically(model, bad):
+    decoder = _source_decoder(model)
+    _append_valid(decoder, _latent(3), latent_start=0, valid_frame_end=9)
+    assert decoder.pop().end == 9
+    with pytest.raises(ValueError):
+        _append_valid(
+            decoder, _latent(1), latent_start=3, valid_frame_end=bad, dependency=17
+        )
+    assert decoder.accepted_latents == decoder.stream.latents_seen == 3
+    assert decoder.emitted_frames == 9 and decoder.pending is None
+    assert decoder.pop() is None
+    decoder.dispose()
+
+
+def test_source_decoder_requires_explicit_pixel_validity(model):
+    decoder = _source_decoder(model)
+    # A dependency watermark cannot prove how many output pixels are valid.
+    with pytest.raises((TypeError, ValueError)):
+        decoder.append(_latent(2), latent_start=0, source_dependency_end=9)
+    assert decoder.accepted_latents == decoder.stream.latents_seen == 0
+    assert decoder.pending is None
+    decoder.dispose()

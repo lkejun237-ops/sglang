@@ -463,6 +463,7 @@ def run_decode(args):
                 source.append(
                     chunk,
                     latent_start=start,
+                    valid_frame_end=min(frames, protocol.frame_count(end)),
                     source_dependency_end=min(frames, protocol.frame_count(end)),
                 )
                 start = end

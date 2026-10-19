@@ -117,10 +117,11 @@ class SyntheticSampler:
 class SyntheticDecoder:
     def __init__(self, ledger):
         self.ledger, self.buffered_latents = ledger, 0
+        self.appends = []
         self.ready = self.closed = False
 
     def append(self, latent, **kwargs):
-        pass
+        self.appends.append(kwargs)
 
     def finish(self, *, total_frames):
         self.total = total_frames
@@ -233,6 +234,9 @@ def test_worker_drains_partial_groups_and_releases_ownership(
     assert result.usage["zing_source_complete"]
     assert sum(x["num_frames"] for x in result.usage["zing_realtime_blocks"]) == frames
     assert sampler.calls[-1].provenance.pixels.end == frames
+    assert [item.get("valid_frame_end") for item in decoder.appends] == [
+        item.provenance.pixels.end for item in sampler.calls
+    ]
     assert state.closed and encoder.disposed and sampler.closed and decoder.closed
     assert state.pixels is state.bridge is state.ledger is None
 
@@ -345,6 +349,9 @@ def test_lookahead_does_not_grant_pixel_alignment_or_input_credit():
     assert state.ledger.consumed_frames == 0
     assert state.sampler.calls[0].provenance.pixels == PixelRange(0, 1)
     assert state.sampler.calls[0].provenance.source_dependency_end == 3
+    # Pixel validity is 1 even though the encoder depends on source pixel 3.
+    assert state.decoder.appends[0].get("valid_frame_end") == 1
+    assert state.decoder.appends[0]["source_dependency_end"] == 3
     state.dispose()
 
 
@@ -637,6 +644,7 @@ def test_joint_ready_worker_batches_without_crossing_command_boundary(
 
     state, stage = session(ChunkPlan([1, 2, 2]))
     state.sampler = sampler = JointSampler(state.bridge.plan)
+    decoder = state.decoder
     captured = []
     if capture:
         state.component_capture = NS(
@@ -661,6 +669,10 @@ def test_joint_ready_worker_batches_without_crossing_command_boundary(
     if quantum:
         assert all(r.usage["zing_source_dispatch_steps"] <= quantum for r in results)
     assert not sampler.pending
+    assert len(decoder.appends) == len(sampler.calls)
+    assert [item.get("valid_frame_end") for item in decoder.appends] == [
+        item.provenance.pixels.end for item in sampler.calls
+    ]
     assert state.closed
     assert any(row["stage"] == "DiT" for row in timing_rows)
     assert any(row["stage"] == "DiT" and row.get("no_output") for row in timing_rows)

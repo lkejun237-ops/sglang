@@ -652,6 +652,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                 result.visual,
                 latent_start=result.chunk.start,
                 source_dependency_end=result.provenance.source_dependency_end,
+                valid_frame_end=result.provenance.pixels.end,
             )
             self._decode_ready(stage, outputs, metadata, timed, trace)
 
@@ -785,6 +786,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                         result.visual,
                         latent_start=result.chunk.start,
                         source_dependency_end=result.provenance.source_dependency_end,
+                        valid_frame_end=result.provenance.pixels.end,
                     )
                     self._decode_ready(stage, outputs, metadata, timed, trace)
 
