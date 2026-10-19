@@ -6,6 +6,24 @@
 的常驻服务、预热、重复请求及逐请求记录方式；协议差异使此入口独立于文本
 benchmark，不将 token 指标或视频任务轮询直接套到 Zing。
 
+## PR 性能测试要求
+
+后续 PR 与测试使用这套英伦维护的工具，分别覆盖 **480、736 两档**，记录实际
+宽×高与 case 身份；默认 case 集合不自动代表已经覆盖两档。不得将 704/720 当作
+736，也不得静默修改冻结 case 的输出尺寸。需要另一档输入时使用显式 manifest /
+case-set，保留来源和尺寸差异；入口或部署不支持时如实记录未验证及原因。
+
+对性能影响大的 feature，在相同硬件、checkpoint、输入、采样及部署配置下对比
+baseline 与改动版本，同时提供端到端 TTFF、E2E、FPS（全程与首包后分别标注）、
+TPOC、ICL 中位数/P95 与样本量，以及受影响的 DiT、Encoder、Decoder 等组件耗时。
+组件数据遵循 [阶段计时说明](STAGE_TIMING.md)，注明逐 rank、Host/CUDA 边界与
+采集开销；重叠阶段不相加成 E2E，microbenchmark 不能替代端到端结论。
+
+连续 source 使用 `bench_streaming_source.py` 及 `build_streaming_report.py`，补充
+source-to-output 延迟、tail drain、credit wait、播放停顿等适用指标。有限输入与
+连续 source 分开比较。保存命令、源码 SHA、配置、预热/正式次数、失败与未执行数、
+原始 JSON 和报告；未采到的指标标为未测。
+
 ## 从 checkpoint 一次运行
 
 在已安装 SGLang 的 NVIDIA 环境中运行：

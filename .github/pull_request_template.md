@@ -16,6 +16,18 @@
 
 <!-- If this pull request impacts inference speed, provide benchmarking and profiling results. -->
 
+<!-- Zing: use YingLun's benchmark (benchmark/zing_h3_causal/CLIENT_BENCHMARK.md).
+Report 480 and 736 resolution results separately, with exact width x height.
+For features with substantial performance impact, compare baseline vs. change for
+both E2E metrics (TTFF, E2E, full-run/post-first-batch FPS, TPOC, ICL median/P95
+and sample counts) and affected components (e.g. DiT, Encoder, Decoder).
+For continuous source, include the applicable source-to-output, tail-drain,
+credit-wait and playback-stall metrics. State missing/unsupported measurements.
+Keep hardware, checkpoint, cases, sampling and deployment settings comparable;
+include source SHAs, commands, warmup/repeat counts, failures and raw JSON/report
+links. Identify Host/CUDA timing and collection overhead. See AGENTS.md for the
+full contract; microbenchmarks alone do not establish E2E improvement. -->
+
 ## Checklist
 
 - [ ] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).

@@ -15,6 +15,25 @@
 - 设计、实现、审查和验收均按此约束执行；不预先增加多会话容量配置、多 owner 状态或并发调度。已有活跃会话时拒绝第二个会话，且不得影响当前会话。
 - 保留 session/generation 身份校验，以及断连、取消、故障、EOS 后释放资源和下一会话可用性的测试；这些是单活跃会话生命周期保障。
 
+## Zing PR 性能验证
+
+- 后续 Zing / SGLang 相关 PR 与测试优先使用英伦维护的 benchmark，入口和指标口径见
+  `benchmark/zing_h3_causal/CLIENT_BENCHMARK.md`；有限输入使用 `run_benchmark.py`
+  / `bench_client.py`，连续 source 使用 `bench_streaming_source.py`，报告沿用配套生成器。
+- 性能测试必须分别覆盖 480 和 736 两档分辨率，记录实际宽×高、case 与输入身份，
+  不混合统计，也不以 704、720 或其他档位代替 736。工具或部署尚不支持某档时，
+  明确列为未验证及说明原因，不得用另一档外推为通过。
+- 对性能影响大的 feature，PR 必须提供同条件 baseline 与改动后的端到端指标，
+  以及实际受影响组件（如 DiT、Encoder、Decoder）的阶段耗时与变化；
+  kernel/microbenchmark 只作归因补充，不能替代端到端测试。
+- 重点报告 TTFF、E2E、FPS、TPOC、ICL（含中位数/P95 与样本量）；FPS 区分全程与
+  首包后口径。连续 source 另关注 source-to-output 延迟、tail drain、credit wait
+  和播放停顿等工具已有指标，按实际接口与采集能力报告，缺失项标为未测。
+- 固定硬件、checkpoint、输入、采样、并行布局、精度、编译/offload 与计时方式，
+  保留预热、重复次数、失败/未执行数、源码 SHA、命令与原始 JSON/报告。
+  阶段计时遵循 `benchmark/zing_h3_causal/STAGE_TIMING.md`，明确 Host/CUDA 边界、
+  逐 rank 数据和采集开销；嵌套或重叠阶段不得相加当作 E2E。
+
 ## 项目自有 Skills
 
 SGLang 专用的 `sglang-pr-review` 在本仓库 `.agents/skills/sglang-pr-review/` 维护并提交，作为项目自有技能。跨项目复用的基础设施技能仍由 infra-skills 维护；下面的本地安装与 exclude 规则仅适用于从该仓库安装的副本。
