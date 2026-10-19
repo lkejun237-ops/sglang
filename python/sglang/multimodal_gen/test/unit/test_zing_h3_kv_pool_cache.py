@@ -567,3 +567,138 @@ def test_model_routes_current_q_through_the_dispatch(model, monkeypatch):
     torch.manual_seed(3)
     actual, _, _ = _generate(sampler, inputs, visual)
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("offset,rows", [(0, 3), (2, 3), (10, 5), (12, 0)])
+def test_unchanged_rebind_allocates_no_probe_views(monkeypatch, strided, offset, rows):
+    cache = ZingH3KVCache(1)
+    keys, values = (torch.randn(24 if strided else 12, 2, 4) for _ in range(2))
+    if strided:
+        keys, values = keys[::2], values[::2]
+    cache._stores[0] = (keys, values)
+    old = ((keys[offset : offset + rows], values[offset : offset + rows]),)
+    cache.prefix = SimpleNamespace(
+        offset=offset, positions=torch.zeros(rows, 3), layers=old
+    )
+    sliced = []
+    original = torch.Tensor.__getitem__
+
+    def tracked(tensor, index):
+        if tensor is keys or tensor is values:
+            sliced.append(index)
+        return original(tensor, index)
+
+    monkeypatch.setattr(torch.Tensor, "__getitem__", tracked)
+    cache._rebind(0)
+    assert not sliced
+    assert cache.prefix.layers is old
+
+    if rows == 0:
+        return
+
+    # A moved chunk must receive fresh views; a planning shadow must leave the
+    # original tuple and its Tensor offsets untouched until publication.
+    cache.prefix.offset = 1
+    cache._rebind(0)
+    assert len(sliced) == 2
+    assert cache.prefix.layers is not old
+    assert torch.equal(cache.prefix.layers[0][0], keys[1 : 1 + rows])
+    assert old[0][0].storage_offset() == keys[offset : offset + rows].storage_offset()
+
+
+@pytest.mark.parametrize("strided", [False, True])
+def test_pooled_layer_ranges_materialize_stable_views_on_demand(monkeypatch, strided):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import _StoreLayerViews
+
+    stores = tuple((torch.randn(24, 2, 4), torch.randn(24, 2, 4)) for _ in range(2))
+    if strided:
+        stores = tuple((k[::2], v[::2]) for k, v in stores)
+    expected = tuple((k[2:5], v[2:5]) for k, v in stores)
+    identities = {id(t) for pair in stores for t in pair}
+    original = torch.Tensor.__getitem__
+    slices = []
+
+    def tracked(tensor, index):
+        if id(tensor) in identities:
+            slices.append(index)
+        return original(tensor, index)
+
+    monkeypatch.setattr(torch.Tensor, "__getitem__", tracked)
+    layers = _StoreLayerViews(stores, 2, 5)
+    assert len(layers) == 2 and not slices
+    assert layers[0] is layers[0]
+    assert len(slices) == 2
+    assert layers[-1] is layers[1]
+    assert tuple(layers) == layers[:]
+    assert len(slices) == 4
+    for actual, reference in zip(layers, expected):
+        for a, b in zip(actual, reference):
+            assert torch.equal(a, b)
+            assert a.data_ptr() == b.data_ptr() and a.stride() == b.stride()
+    for invalid in (2, -3):
+        with pytest.raises(IndexError):
+            layers[invalid]
+
+
+@torch.no_grad()
+def test_pooled_planning_compaction_keeps_layer_views_lazy_and_old_ranges_intact(
+    monkeypatch,
+):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import (
+        ZingKVChunk,
+        _StoreLayerViews,
+    )
+
+    layers = 50
+    storage = allocate_layer_stores(
+        16,
+        num_layers=layers,
+        local_heads=1,
+        head_dim=2,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+    cache = ZingH3KVCache(
+        layers,
+        storage=storage,
+        window_policy=ZingWindowPolicy(window_chunks=3, sink_chunks=1),
+    )
+    cache._stores = {i: (slot.k, slot.v) for i, slot in enumerate(storage)}
+    cache.prefix = ZingKVChunk(
+        torch.zeros(3, 3), 0, cache._chunk_layers(0, 3), offset=0
+    )
+    cache.committed = [
+        ZingKVChunk(torch.zeros(3, 3), 2, cache._chunk_layers(5, 3), offset=5)
+    ]
+    cache._length = 8
+    old_layers = cache.committed[0].layers
+    old_view = old_layers[0][0]
+    old_pointer = old_view.data_ptr()
+    identities = {id(t) for pair in cache._stores.values() for t in pair}
+    original = torch.Tensor.__getitem__
+    slices = []
+
+    def tracked(tensor, index):
+        if id(tensor) in identities:
+            slices.append(index)
+        return original(tensor, index)
+
+    monkeypatch.setattr(torch.Tensor, "__getitem__", tracked)
+    shadow = cache.planning_copy()
+    shadow._compact_store()
+    assert not slices
+    assert shadow.committed[0].offset == 3
+    assert isinstance(shadow.committed[0].layers, _StoreLayerViews)
+    assert all(not c.layers._views for c in shadow._stored_chunks())
+    assert cache.committed[0].offset == 5
+    assert cache.committed[0].layers is old_layers
+    assert old_layers[0][0] is old_view and old_view.data_ptr() == old_pointer
+    assert not slices
+    cache.publish_plan(shadow)
+    current = cache.committed[0].layers[0][0]
+    assert len(slices) == 2
+    assert (
+        current.data_ptr() == storage[0].k.data_ptr() + 3 * storage[0].k.stride(0) * 2
+    )
+    assert old_view.data_ptr() == old_pointer

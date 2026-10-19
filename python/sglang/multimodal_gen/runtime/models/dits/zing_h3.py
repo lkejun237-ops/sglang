@@ -56,11 +56,16 @@ from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
     ZingDenoiseGraphs,
 )
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_joint import ZingJointTransaction
+from sglang.multimodal_gen.runtime.models.dits.zing_h3_model_signature import (
+    model_signatures,
+)
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_rope import (
     apply_contiguous_history_rope_batch,
     apply_current_rope,
+    apply_current_rope_kv,
     apply_history_rope_batch,
     apply_history_rope_into,
+    validated_fixed_480p,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
@@ -159,6 +164,7 @@ class _BlockOptions(msgspec.Struct, frozen=True, kw_only=True):
     fixed_kv: object = None
     fixed_tensors: object = None
     full_rope: object = None
+    optimized_fixed_480p: bool = False
 
 
 class _BodyInputs(msgspec.Struct, frozen=True, kw_only=True):
@@ -191,6 +197,8 @@ _GRAPH_LAYOUT_INPUTS = (
 # Kernel routes chosen from the environment at call time, frozen by a capture.
 _GRAPH_ROUTE_ENVS = (
     "SGLANG_ZING_FUSED_CURRENT_ROPE",
+    "SGLANG_ZING_FUSED_CURRENT_ROPE_KV",
+    "SGLANG_ZING_FA4_FIXED",
     "SGLANG_ZING_FUSED_HISTORY_ROPE",
     "SGLANG_ZING_GROUPED_HISTORY_ROPE",
 )
@@ -493,6 +501,35 @@ def _fa4_attention(q, k, v, scale, metadata=None):
     if not isinstance(result, torch.Tensor) or result.shape != q.shape:
         raise RuntimeError("Zing experimental FA4 returned an invalid output shape")
     return result
+
+
+def _fixed_fa4_attention(q, k, v, scale, metadata, *, optimized):
+    """Keep Q1170 varlen; measured Q390/780 use fixed Q with device KV bounds.
+
+    The slot capacity is not its live length. Pass cu_seqlens_k unchanged so
+    source/step0 cannot read future branches or stale slot rows on replay.
+    """
+    if (
+        optimized
+        and os.environ.get("SGLANG_ZING_FA4_FIXED", "1") == "1"
+        and q.shape[0] in (390, 780)
+        and q.dtype == k.dtype == v.dtype == torch.bfloat16
+        and all(x.is_contiguous() for x in (q, k, v))
+    ):
+        from flash_attn.cute.interface import _flash_attn_fwd
+
+        result = _flash_attn_fwd(
+            q[None],
+            k,
+            v,
+            cu_seqlens_k=metadata.lengths(q, k, v)[1],
+            max_seqlen_k=k.shape[0],
+            softmax_scale=scale,
+            causal=False,
+            num_splits=1,
+        )[0]
+        return result.squeeze(0)
+    return _fa4_attention(q, k, v, scale, metadata=metadata)
 
 
 def _joint_attention(q, k, v, ends, scale, backend, metadata):
@@ -1557,7 +1594,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 metadata.clear()
 
     @torch.no_grad()
-    def prepare_fixed_forward(self, *, packed, kv_plan, phase):
+    def prepare_fixed_forward(self, *, packed, kv_plan, phase, _model_state=None):
         """Validate/pack on the host; execution contains only device arithmetic.
 
         The cache owner prepares effective RoPE coordinates and each branch's
@@ -1676,7 +1713,17 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 values = self.adaln_table.project(slot, module, adaln, table_key)
                 for i, value in enumerate(values):
                     tensors[f"projection.{slot}.{i}"] = value
+        optimized_fixed_480p = validated_fixed_480p(
+            host,
+            device,
+            sp_size=size,
+            heads=self.arch.num_attention_heads,
+            head_dim=self.arch.attention_head_dim,
+            backend=self.experimental_attention_backend,
+            audio=bool(packed["audio_x"].shape[0]),
+        )
         options = _BlockOptions(
+            optimized_fixed_480p=optimized_fixed_480p,
             capture=False,
             use_cache=False,
             raw_attention=False,
@@ -1758,15 +1805,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
 
         signature = (
             self._cache_weight_generation,
-            tuple(
-                (
-                    id(value),
-                    value.data_ptr(),
-                    None if torch.is_inference(value) else value._version,
-                    _tensor_layout(value),
-                )
-                for value in (*self.parameters(), *self.buffers())
-            ),
+            (model_signatures(self) if _model_state is None else _model_state).graph,
             _numerics_mode(),
             tuple((name, os.environ.get(name)) for name in _GRAPH_ROUTE_ENVS),
             phase,
@@ -1784,6 +1823,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 for name, value in sorted(tensors.items())
             ),
             kv_plan.rotates_history,
+            optimized_fixed_480p,
             tuple(
                 (value.data_ptr(), _tensor_layout(value))
                 for value in (
@@ -1804,18 +1844,17 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 self.time_embedder._frequency_cache = frequencies.clone()
         # Parameter identity/version catches load_state_dict, device/dtype
         # moves and normal in-place updates without GPU synchronization.
-        values = (*self.parameters(), *self.buffers())
-        model_signature = tuple(cache._tensor_signature(value) for value in values)
-        if any(signature[1] is None for signature in model_signature):
+        signatures = model_signatures(self)
+        if not signatures.versioned:
             raise ValueError(
                 "Zing cached RoPE requires versioned model parameters and buffers"
             )
-        cache.bind_model((self._cache_weight_generation, model_signature))
+        cache.bind_model((self._cache_weight_generation, signatures.cache))
         cache.bind_attention_positions(history_positions)
         if self.denoise_graphs is None:
             return None
         # A .data swap keeps identity and version; a captured graph reads addresses.
-        return tuple(value.data_ptr() for value in values)
+        return signatures.addresses
 
     def _embed_inputs(self, inputs, p, fa4_metadata):
         layout = inputs.layout
@@ -1998,7 +2037,6 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             )
             q, k, v = (value[0] for value in exchanged.chunk(3, dim=-1))
         raw_k, raw_v = k, v
-        q = _apply_rope(q, inputs.rope)
         fixed = options.fixed_kv
         if fixed.rotates_history:
             # One rotation of the whole fixed-shape raw K serves every forward
@@ -2006,24 +2044,39 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             apply_history_rope_into(
                 fixed.stores[index][0], options.full_rope, fixed.rotated[index]
             )
-        fixed.write_current(
-            index,
-            _apply_rope(raw_k, inputs.rope),
+        fused_q = apply_current_rope_kv(
+            q,
             raw_k,
             raw_v,
-            tensors=options.fixed_tensors,
+            inputs.rope,
+            fixed,
+            index,
+            options.fixed_tensors,
+            default=options.optimized_fixed_480p,
         )
+        if fused_q is None:
+            q = _apply_rope(q, inputs.rope)
+            fixed.write_current(
+                index,
+                _apply_rope(raw_k, inputs.rope),
+                raw_k,
+                raw_v,
+                tensors=options.fixed_tensors,
+            )
+        else:
+            q = fused_q
         keys, values = fixed.rotated[index], fixed.stores[index][1]
         results, start = [], 0
         for branch, stop in enumerate(options.fixed_kv.ends):
             query = q[start:stop]
             if self.experimental_attention_backend == "fa4":
-                result = _fa4_attention(
+                result = _fixed_fa4_attention(
                     query,
                     keys,
                     values,
                     module.softmax_scale,
-                    metadata=_FixedFA4Metadata(options.fixed_tensors, branch),
+                    _FixedFA4Metadata(options.fixed_tensors, branch),
+                    optimized=options.optimized_fixed_480p,
                 )
             elif query.device.type == "cpu":
                 result = _cpu_varlen_attention(

@@ -4440,32 +4440,32 @@
       "sources": [
         "main"
       ],
-      "reason": "Two fresh Alibaba Linux CPU process trials passed after main integration.",
+      "reason": "Two canonical Linux CPU process trials passed; reviewed CUDA-only skips are validated separately on GPU.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "4f94316a0ebd4da593d6793ffa87ebdb573671268da08493dcf0942e71ca5a50",
-        "receipt": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-2/receipt.json",
-        "receipt_sha256": "ca9d11bba78a4a4f10b2ec59adc8916a60e16b99880f1ae3b4018d5660e2ce90",
+        "source_sha256": "b43a3df00b8f6de3a166d594b55994ff150c4a7815ed04c5dab374903de84ca7",
+        "receipt": "/cpfs/world-model/sglang/evals/zing480-rope-kv-default-20261019-r3-ci-r1/trials/receipt.json",
+        "receipt_sha256": "8ce1b67bd5a68c2f322e2b020a3b997a9a99d1538b0e47013ca56361c2db9477",
         "trials": [
           {
             "trial": 1,
-            "passed": 26,
-            "collected": 32,
+            "passed": 46,
+            "collected": 52,
             "skipped": 6,
-            "duration_seconds": 22.696033213986084,
+            "duration_seconds": 76.385037345,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-2/cpu-3-trial-1.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-2/cpu-3-trial-1.xml"
+            "log_path": "/cpfs/world-model/sglang/evals/zing480-rope-kv-default-20261019-r3-ci-r1/trials/cpu-0-trial-1.log",
+            "junit_path": "/cpfs/world-model/sglang/evals/zing480-rope-kv-default-20261019-r3-ci-r1/trials/cpu-0-trial-1.xml"
           },
           {
             "trial": 2,
-            "passed": 26,
-            "collected": 32,
+            "passed": 46,
+            "collected": 52,
             "skipped": 6,
-            "duration_seconds": 22.591938333120197,
+            "duration_seconds": 26.217034671999954,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-2/cpu-3-trial-2.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-2/cpu-3-trial-2.xml"
+            "log_path": "/cpfs/world-model/sglang/evals/zing480-rope-kv-default-20261019-r3-ci-r1/trials/cpu-0-trial-2.log",
+            "junit_path": "/cpfs/world-model/sglang/evals/zing480-rope-kv-default-20261019-r3-ci-r1/trials/cpu-0-trial-2.xml"
           }
         ],
         "environment": {
@@ -4479,10 +4479,10 @@
             "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
           }
         },
-        "manifest_sha256": "4abd3c0a8465905e4340d8303ec04f1ae88cb15e6885b98d93f6b919731b44cf",
+        "manifest_sha256": "6c0eb49c51af3b9f778bee2639d9dd5b5c81ba73ee310d6df33f4862c0a7cc2f",
         "tooling_sha256": {
-          "check_python.py": "a22e6bde47103b7e2ffa065b137441794a64c9b622822e7301aa8d938e32cada",
-          "common.py": "2edda6b9e4e6f372d70851a47d065dd99eaf436fcc6d8714b9609b72aa13311f",
+          "check_python.py": "edced74edc439191f8ff97373e71fbb50d1469cff016c7163f0cb80d93ede73b",
+          "common.py": "91033550acb81ced696837a02f40cad5620ac2601d8109cb831c29d9eeb39978",
           "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
           "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
           "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
@@ -7453,6 +7453,235 @@
           "pytest": "9.1.1"
         },
         "recipe_deviation": "DSW conditioning runner with CI flags; initial full suite attempts stopped at missing av (14 passed, 1 failed each); complete dependency lock not asserted; GitHub CI validates exact recipe"
+      }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_model_signature.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two canonical Linux CPU process trials passed; reviewed CUDA-only skips are validated separately on GPU.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "efca62cd3c2ddfb8c7742eedb0731ba6105a750fbcd68cd1962b06644709ce1c",
+        "receipt": "/cpfs/world-model/sglang/evals/zing480-rope-kv-default-20261019-r3-ci-r1/trials/receipt.json",
+        "receipt_sha256": "8ce1b67bd5a68c2f322e2b020a3b997a9a99d1538b0e47013ca56361c2db9477",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 15,
+            "collected": 15,
+            "skipped": 0,
+            "duration_seconds": 8.568430080999974,
+            "exit_code": 0,
+            "log_path": "/cpfs/world-model/sglang/evals/zing480-rope-kv-default-20261019-r3-ci-r1/trials/cpu-1-trial-1.log",
+            "junit_path": "/cpfs/world-model/sglang/evals/zing480-rope-kv-default-20261019-r3-ci-r1/trials/cpu-1-trial-1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 15,
+            "collected": 15,
+            "skipped": 0,
+            "duration_seconds": 5.947696866000001,
+            "exit_code": 0,
+            "log_path": "/cpfs/world-model/sglang/evals/zing480-rope-kv-default-20261019-r3-ci-r1/trials/cpu-1-trial-2.log",
+            "junit_path": "/cpfs/world-model/sglang/evals/zing480-rope-kv-default-20261019-r3-ci-r1/trials/cpu-1-trial-2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.12",
+          "platform": "Linux-6.6.102-001.8.100.kangaroo.al8.x86_64-x86_64-with-glibc2.39"
+        },
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          }
+        },
+        "manifest_sha256": "6c0eb49c51af3b9f778bee2639d9dd5b5c81ba73ee310d6df33f4862c0a7cc2f",
+        "tooling_sha256": {
+          "check_python.py": "edced74edc439191f8ff97373e71fbb50d1469cff016c7163f0cb80d93ede73b",
+          "common.py": "91033550acb81ced696837a02f40cad5620ac2601d8109cb831c29d9eeb39978",
+          "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
+          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
+          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
+          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
+          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
+        }
+      }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_fixed_480p_defaults.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two canonical Linux CPU process trials passed; reviewed CUDA-only skips are validated separately on GPU.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "5f7926aaf403224e5651d9810ce2678d1c2a8cfbb41a291b21cb3ab52bba8134",
+        "receipt": "/cpfs/world-model/sglang/evals/zing480-rope-kv-default-20261019-r3-ci-r1/trials/receipt.json",
+        "receipt_sha256": "8ce1b67bd5a68c2f322e2b020a3b997a9a99d1538b0e47013ca56361c2db9477",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 11,
+            "collected": 11,
+            "skipped": 0,
+            "duration_seconds": 5.9228982029999315,
+            "exit_code": 0,
+            "log_path": "/cpfs/world-model/sglang/evals/zing480-rope-kv-default-20261019-r3-ci-r1/trials/cpu-2-trial-1.log",
+            "junit_path": "/cpfs/world-model/sglang/evals/zing480-rope-kv-default-20261019-r3-ci-r1/trials/cpu-2-trial-1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 11,
+            "collected": 11,
+            "skipped": 0,
+            "duration_seconds": 6.10281760099997,
+            "exit_code": 0,
+            "log_path": "/cpfs/world-model/sglang/evals/zing480-rope-kv-default-20261019-r3-ci-r1/trials/cpu-2-trial-2.log",
+            "junit_path": "/cpfs/world-model/sglang/evals/zing480-rope-kv-default-20261019-r3-ci-r1/trials/cpu-2-trial-2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.12",
+          "platform": "Linux-6.6.102-001.8.100.kangaroo.al8.x86_64-x86_64-with-glibc2.39"
+        },
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          }
+        },
+        "manifest_sha256": "6c0eb49c51af3b9f778bee2639d9dd5b5c81ba73ee310d6df33f4862c0a7cc2f",
+        "tooling_sha256": {
+          "check_python.py": "edced74edc439191f8ff97373e71fbb50d1469cff016c7163f0cb80d93ede73b",
+          "common.py": "91033550acb81ced696837a02f40cad5620ac2601d8109cb831c29d9eeb39978",
+          "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
+          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
+          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
+          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
+          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
+        }
+      }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_current_rope_kv.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "MIXED",
+      "approved": true,
+      "allowed_skips": [
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_current_rope_kv.py::test_rope_kv_slot_and_graph[False-64-0]",
+          "reason": "CUDA required"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_current_rope_kv.py::test_rope_kv_slot_and_graph[False-64-3]",
+          "reason": "CUDA required"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_current_rope_kv.py::test_rope_kv_slot_and_graph[False-64-7]",
+          "reason": "CUDA required"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_current_rope_kv.py::test_rope_kv_slot_and_graph[False-128-0]",
+          "reason": "CUDA required"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_current_rope_kv.py::test_rope_kv_slot_and_graph[False-128-3]",
+          "reason": "CUDA required"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_current_rope_kv.py::test_rope_kv_slot_and_graph[False-128-7]",
+          "reason": "CUDA required"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_current_rope_kv.py::test_rope_kv_slot_and_graph[True-64-0]",
+          "reason": "CUDA required"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_current_rope_kv.py::test_rope_kv_slot_and_graph[True-64-3]",
+          "reason": "CUDA required"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_current_rope_kv.py::test_rope_kv_slot_and_graph[True-64-7]",
+          "reason": "CUDA required"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_current_rope_kv.py::test_rope_kv_slot_and_graph[True-128-0]",
+          "reason": "CUDA required"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_current_rope_kv.py::test_rope_kv_slot_and_graph[True-128-3]",
+          "reason": "CUDA required"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_current_rope_kv.py::test_rope_kv_slot_and_graph[True-128-7]",
+          "reason": "CUDA required"
+        }
+      ],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two canonical Linux CPU process trials passed; reviewed CUDA-only skips are validated separately on GPU.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "a3f3a35b00ca269c085ae2173a101d5b4786e1827cdc3cdf8ed23f9913341836",
+        "receipt": "/cpfs/world-model/sglang/evals/zing480-rope-kv-default-20261019-r3-ci-r1/trials/receipt.json",
+        "receipt_sha256": "8ce1b67bd5a68c2f322e2b020a3b997a9a99d1538b0e47013ca56361c2db9477",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 1,
+            "collected": 13,
+            "skipped": 12,
+            "duration_seconds": 5.8928625260000445,
+            "exit_code": 0,
+            "log_path": "/cpfs/world-model/sglang/evals/zing480-rope-kv-default-20261019-r3-ci-r1/trials/cpu-3-trial-1.log",
+            "junit_path": "/cpfs/world-model/sglang/evals/zing480-rope-kv-default-20261019-r3-ci-r1/trials/cpu-3-trial-1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 1,
+            "collected": 13,
+            "skipped": 12,
+            "duration_seconds": 6.033418956999981,
+            "exit_code": 0,
+            "log_path": "/cpfs/world-model/sglang/evals/zing480-rope-kv-default-20261019-r3-ci-r1/trials/cpu-3-trial-2.log",
+            "junit_path": "/cpfs/world-model/sglang/evals/zing480-rope-kv-default-20261019-r3-ci-r1/trials/cpu-3-trial-2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.12",
+          "platform": "Linux-6.6.102-001.8.100.kangaroo.al8.x86_64-x86_64-with-glibc2.39"
+        },
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          }
+        },
+        "manifest_sha256": "6c0eb49c51af3b9f778bee2639d9dd5b5c81ba73ee310d6df33f4862c0a7cc2f",
+        "tooling_sha256": {
+          "check_python.py": "edced74edc439191f8ff97373e71fbb50d1469cff016c7163f0cb80d93ede73b",
+          "common.py": "91033550acb81ced696837a02f40cad5620ac2601d8109cb831c29d9eeb39978",
+          "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
+          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
+          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
+          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
+          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
+        }
       }
     }
   ],

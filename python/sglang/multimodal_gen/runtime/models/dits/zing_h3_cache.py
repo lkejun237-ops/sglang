@@ -3,7 +3,9 @@
 
 import copy
 import functools
+import operator
 import os
+from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 
@@ -210,11 +212,45 @@ def tensor_identity(value):
     return id(value), version
 
 
+class _StoreLayerViews(Sequence):
+    """Immutable pooled range; materialize stable per-layer views only on use.
+
+    Fixed Graph planning consumes pool addresses and row ranges directly. Eager
+    attention and snapshots can still index/iterate layers with stable Tensor
+    identities, while a planning shadow replaces the range without editing the
+    live transaction's existing views.
+    """
+
+    __slots__ = ("_stores", "_start", "_stop", "_views")
+
+    def __init__(self, stores, start, stop):
+        self._stores, self._start, self._stop = stores, start, stop
+        self._views = {}
+
+    def __len__(self):
+        return len(self._stores)
+
+    def __getitem__(self, layer):
+        if isinstance(layer, slice):
+            return tuple(self[i] for i in range(*layer.indices(len(self))))
+        layer = operator.index(layer)
+        if layer < 0:
+            layer += len(self)
+        if not 0 <= layer < len(self):
+            raise IndexError("Zing KV layer index out of range")
+        views = self._views.get(layer)
+        if views is None:
+            keys, values = self._stores[layer]
+            views = (keys[self._start : self._stop], values[self._start : self._stop])
+            self._views[layer] = views
+        return views
+
+
 @dataclass
 class ZingKVChunk:
     positions: torch.Tensor
     block: int
-    layers: tuple[tuple[torch.Tensor, torch.Tensor], ...]
+    layers: Sequence[tuple[torch.Tensor, torch.Tensor]]
     frames: int = 0
     # Store-backed chunks borrow raw or post-RoPE K and the sole persistent V.
     # Only the absolute post-RoPE store pins a commit-time rotation signature.
@@ -765,8 +801,15 @@ class ZingH3KVCache:
             chunk.offset = offset
             offset += chunk.positions.shape[0]
         self._length = offset
-        for layer in self._stores:
-            self._rebind(layer)
+        if self.pooled and len(self._stores) == self.num_layers:
+            stores = tuple(self._stores[i] for i in range(self.num_layers))
+            for chunk in chunks:
+                chunk.layers = _StoreLayerViews(
+                    stores, chunk.offset, chunk.offset + chunk.positions.shape[0]
+                )
+        else:
+            for layer in self._stores:
+                self._rebind(layer)
 
     def _history(self):
         chunks = self.committed
@@ -1013,22 +1056,31 @@ class ZingH3KVCache:
         store = self._stores.get(layer)
         if store is None:
             return
+        # A view's address/shape can be checked without constructing a probe
+        # Tensor. Compaction calls this for every layer and retained chunk;
+        # unchanged sink/prefix views must not allocate lists or slice wrappers.
+        keys, values = store
+        key_address, value_address = keys.data_ptr(), values.data_ptr()
+        key_step = keys.stride(0) * keys.element_size()
+        value_step = values.stride(0) * values.element_size()
+        capacity, tail_shape = keys.shape[0], tuple(keys.shape[1:])
         for chunk in self._stored_chunks():
             start, stop = chunk.offset, chunk.offset + chunk.positions.shape[0]
-            layers = (
-                list(chunk.layers)
-                if len(chunk.layers) == self.num_layers
-                else [None] * self.num_layers
-            )
-            if self.chunk_rope_reuse and layers[layer] is not None:
-                old_k, old_v = layers[layer]
+            complete = len(chunk.layers) == self.num_layers
+            old = chunk.layers[layer] if complete else None
+            if self.chunk_rope_reuse and old is not None:
+                old_k, old_v = old
+                begin, end, _ = slice(start, stop).indices(capacity)
+                rows = max(0, end - begin)
                 if (
-                    old_k.data_ptr() == store[0][start:stop].data_ptr()
-                    and old_v.data_ptr() == store[1][start:stop].data_ptr()
-                    and old_k.shape == store[0][start:stop].shape
+                    old_k.data_ptr() == (key_address + begin * key_step if rows else 0)
+                    and old_v.data_ptr()
+                    == (value_address + begin * value_step if rows else 0)
+                    and old_k.shape == (rows, *tail_shape)
                 ):
                     continue
-            layers[layer] = (store[0][start:stop], store[1][start:stop])
+            layers = list(chunk.layers) if complete else [None] * self.num_layers
+            layers[layer] = (keys[start:stop], values[start:stop])
             chunk.layers = tuple(layers)
 
     def _verify_committed_positions(self, chunks):
@@ -1637,6 +1689,14 @@ class ZingH3KVCache:
                 raise ValueError("Zing final commit requires an active target")
         return block
 
+    def _chunk_layers(self, offset, rows):
+        stores = tuple(self._stores[i] for i in range(self.num_layers))
+        if self.pooled:
+            return _StoreLayerViews(stores, offset, offset + rows)
+        return tuple(
+            (k[offset : offset + rows], v[offset : offset + rows]) for k, v in stores
+        )
+
     def _store_chunk(self, positions, block, frames, layers):
         """Commit raw or post-RoPE K, reusing V already written into scratch."""
         offset = self._length
@@ -1661,13 +1721,7 @@ class ZingH3KVCache:
         self._chunk_plan = None
         chunk = ZingKVChunk(positions, block, (), frames, offset)
         chunk.position_signature = self._tensor_signature(positions)
-        chunk.layers = tuple(
-            (
-                self._stores[layer][0][offset : offset + rows],
-                self._stores[layer][1][offset : offset + rows],
-            )
-            for layer in range(self.num_layers)
-        )
+        chunk.layers = self._chunk_layers(offset, rows)
         return chunk
 
     def update(self, positions, block_idx, phase, frames, layers=None, validation=None):
@@ -1740,13 +1794,7 @@ class ZingH3KVCache:
                         merged.host_positions = torch.cat(
                             (source.host_positions, chunk.host_positions)
                         )
-                merged.layers = tuple(
-                    (
-                        self._stores[layer][0][source.offset : source.offset + rows],
-                        self._stores[layer][1][source.offset : source.offset + rows],
-                    )
-                    for layer in range(self.num_layers)
-                )
+                merged.layers = self._chunk_layers(source.offset, rows)
                 chunk = merged
             self.committed.append(chunk)
             self.last_block = block

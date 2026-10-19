@@ -7,6 +7,8 @@
 | --- | --- | --- |
 | `FUSED_HISTORY_ROPE` | `1`（本次开启） | 融合历史 K RoPE；不支持的设备和布局仍回退 |
 | `FUSED_CURRENT_ROPE` | `1` | 当前块 Q/K RoPE 复用融合历史 RoPE kernel，与 eager 逐位一致；不支持的设备和布局（含 SP）回退 |
+| `FUSED_CURRENT_ROPE_KV` | 已验证 480p 固定槽路径为 `1`；其余为 `0` | A2A 后融合当前 Q/K RoPE 与 KV 写入；`0` 回退原 Q/K RoPE + index_copy，`1` 显式尝试受支持布局 |
+| `FA4_FIXED` | 已验证 480p 固定槽路径为 `1` | 最佳分段 FA：Q390/780 使用 fixed Q + GPU KV 有效长度；Q1170 保留 varlen；`0` 回退全 varlen |
 | `GROUPED_HISTORY_ROPE` | `1`（本次开启） | 多片段 grouped 处理；`contiguous` 是替代模式 |
 | `CHUNK_ROPE_REUSE` | `1`（本次开启） | 按 chunk 复用未失效的历史 RoPE |
 | `HISTORY_ROPE_PLAN` | `0` | 跨层复用 forward metadata；现有实测无稳定额外收益 |
@@ -65,3 +67,22 @@ host sync 已直接集成，无需额外开关。已退休的 `EXPERIMENTAL_CACH
   不使用 history plan 的 common-prefix geometry 替代逐片段有效性判定。
 
 针对性复现命令和实际证据见 [GROUPED_CHUNK_REUSE.md](../../../../../benchmark/zing_h3_causal/GROUPED_CHUNK_REUSE.md)。
+
+## 480p 固定槽路径
+
+默认优化只覆盖 video-only、SP2、56 attention heads / head_dim128、CPU 元数据
+确认的 15×26 空间网格（832×480 的 checkpoint patch 网格）、已测 query 行数，
+以及 FA4 `4.0.0b19`、CUDA CC10.3 / 148 SM。前缀、其他网格、硬件与后端保留
+原路径；显式开启 RoPE/KV 融合仍受 dtype、布局和索引范围检查约束。
+单独设置 `SGLANG_ZING_FUSED_CURRENT_ROPE_KV=0` 可关闭当前融合而保留最佳分段 FA。
+另设 `SGLANG_ZING_FA4_FIXED=0` 可对照原 varlen 路由；开关参与 Graph key，
+不会误用不同路由捕获的 Graph。此路径不采用联合 sparse/flex attention。
+
+融合保持 BF16 乘法后舍入再相加的顺序。当前旋转 K/V 写入槽尾用于本次
+attention，只有 clean rows 的 raw K 持久化；历史坐标、窗口淘汰和提交规则不变。
+GPU KV 有效长度仍直接传给 FA，不把固定容量当成历史长度，不在 replay 时读回 CPU。
+
+模型签名仍逐次检查参数及 buffer 的 identity、地址、版本、shape、stride、dtype
+和 device；只复用未变的不可变签名及其 hash。共享 KV chunk 的层视图按需创建，
+避免计划重建时生成完整逐层 Tensor 视图。GC 策略不变。单次性能数据和验收记录见 PR，
+不将某轮 TTFF 中位数下降视为已证明稳定改善。

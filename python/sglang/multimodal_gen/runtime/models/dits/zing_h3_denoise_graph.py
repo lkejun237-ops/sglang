@@ -539,7 +539,15 @@ class ZingChunkGraphs:
                     torch.zeros(1, dtype=torch.float32, device=packed["x"].device)
                 )
         model._bind_cache(shadow, kv.history_positions)
-        plan = model.prepare_fixed_forward(packed=packed, kv_plan=kv, phase=phase)
+        # _bind_cache just validated the live model (including lazy constants).
+        # Reuse that snapshot within this host preparation transaction instead
+        # of rescanning every parameter for the same forward plan.
+        plan = model.prepare_fixed_forward(
+            packed=packed,
+            kv_plan=kv,
+            phase=phase,
+            _model_state=model._zing_model_signatures,
+        )
         layers = [(k[:rows], v[:rows]) for k, v in kv.stores]
         if transaction is not None:
             transaction.commit(
