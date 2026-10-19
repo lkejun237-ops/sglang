@@ -423,7 +423,7 @@ if __name__ == "__main__":
 | `realtime_preview_max_width` | 公共输出配置 | 同左 | 同左 | 首版不传，保持声明尺寸 |
 | pacing / playback ACK / trace | 公共传输能力 | 同左 | 公共传输能力 | 不替代 source 背压；trace 可复用 |
 | KV / sink 配置 | adapter / pipeline 模型相关 | adapter / pipeline 模型相关 | 仅完整历史，拒绝有界 KV 设置 | 服务端有界策略，需验证，不向客户端承诺任意值 |
-| `zing_realtime_decode_mode` | 非该模型字段 | 非该模型字段 | immediate / stable，默认 stable（TAEH3 要求 stable） | 默认且要求 stable |
+| `zing_realtime_decode_mode` | 非该模型字段 | 非该模型字段 | immediate / stable，默认 stable（Lynn 要求 stable） | 默认且要求 stable |
 | 结束 | chunk 限长或取消 | chunk 限长或取消 | 有限长度结束 | source.end → flush → completed |
 
 ## 7. 实现状态与验收边界

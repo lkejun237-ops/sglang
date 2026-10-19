@@ -51,6 +51,7 @@ class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
             causal_encoder=True,
             causal_decoder=False,
             use_vit_decoder=True,
+            load_decoder=config.load_decoder,
             vit_decoder_kwargs={
                 "dim_head": 64,
                 "ffn_activation_fn": "silu",
@@ -86,6 +87,8 @@ class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
         self.parallel_decode_mode = parallel_decode_mode
 
     def prepare_decoder_autocast_weights(self, dtype) -> int:
+        if not self.sglang_config.load_decoder:
+            return 0
         return self.decoder.prepare_autocast_linear_weights(dtype)
 
 

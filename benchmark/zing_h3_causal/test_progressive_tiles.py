@@ -32,7 +32,6 @@ def test_encoder_probe_does_not_require_decoder_checkpoint(tmp_path):
     (tmp_path / "video_vae").mkdir()
     args = encoder_server_args(str(tmp_path))
     assert args.pipeline_config.video_decoder_backend == "native"
-    assert args.pipeline_config.taeh3_checkpoint_path is None
     args.pipeline_config.validate_server_args(args)
 
 

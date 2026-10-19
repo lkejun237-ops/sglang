@@ -5,7 +5,6 @@ import ast
 import importlib.metadata
 import json
 import re
-import shutil
 import sys
 from pathlib import Path
 
@@ -384,15 +383,6 @@ def main():
                         repo / UNIT,
                         repo / (UNIT + "/realtime"),
                     ]
-                    if item.get("recipe") == "taeh3-isolated":
-                        copied = (
-                            args.output_dir.resolve()
-                            / f"taeh3-isolated-trial-{trial}"
-                            / Path(path).name
-                        )
-                        copied.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copyfile(repo / path, copied)
-                        roots = [copied]
                     record = execute_pytest(
                         repo,
                         path,

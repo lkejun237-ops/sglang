@@ -722,7 +722,7 @@ def test_correctness_gate_requires_exact_capture_and_full_wire_rgb(tmp_path):
         model="frozen/model",
         request="frozen/request",
         source_rgb="frozen/source",
-        taeh3_weights="frozen/tae",
+        decoder_config={"checkpoint_path": "frozen/lynn.pt", "model_dir": "/m"},
     )
     (tmp_path / "input.json").write_text(json.dumps(config))
     with pytest.raises(RuntimeError, match="evidence is missing"):
@@ -1018,7 +1018,10 @@ def test_endpoint_completion_requires_full_profile_after_five_runs(
         )
 
     monkeypatch.setattr(runner, "command_run", run)
-    config = dict(model=str(tmp_path), taeh3_weights="weights")
+    config = dict(
+        model=str(tmp_path),
+        decoder_config={"checkpoint_path": "weights", "model_dir": "/m"},
+    )
     result = runner.endpoint_cell(
         tmp_path, config, ("shared-sp1", 1, 0, "shared"), False, defer_profile=defer
     )
@@ -1120,7 +1123,7 @@ def test_lifecycle_failure_isolated_from_formal_measurements(
     monkeypatch.setattr(runner, "snapshot_process_groups", lambda children: children)
     config = dict(
         model=str(tmp_path),
-        taeh3_weights="weights",
+        decoder_config={"checkpoint_path": "weights", "model_dir": "/m"},
         source_rgb="rgb",
         request="request",
         exploratory=exploratory,
@@ -1271,7 +1274,10 @@ def test_split_collection_preserves_complete_phase_and_no_combined_receipt(
         )
 
     monkeypatch.setattr(runner, "command_run", run)
-    config = dict(model=str(tmp_path), taeh3_weights="weights")
+    config = dict(
+        model=str(tmp_path),
+        decoder_config={"checkpoint_path": "weights", "model_dir": "/m"},
+    )
     runner.endpoint_matrix(
         tmp_path, config, [("shared-sp1", 1, 0, "shared")], collection_phase=phase
     )

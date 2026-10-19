@@ -4,17 +4,14 @@
 
 产品目标是已就绪的每个 latent 独立推进 Decoder，后续自研 Decoder 尽可能在一个 latent 内逐 frame 交付。DiT 的分块计划与 Decoder 的解码粒度独立：当前只采用启动 `1,2,2`、随后循环 `3,2`（`num_frame_per_block=[3,2]`、`split_first_latent=true`），不把五 latent 一组作为后续 Decoder 的目标默认。
 
-当前实现仍有差距：`SourceTAEH3Decoder.__init__` 在环境变量未开启时调用 `decoder.new_stream()`，使用旧五 latent 计算分组；这是现状和历史验收条件，不是推荐的长期策略。启用增量模式也不等于每个 latent 都可交付 RGB，下面说明 TAEH3 的裁剪与暂留限制。修改默认或接入自研 Decoder 必须另做真实权重、EOS、画面边界和清理验收，不能仅切换开关后声称目标完成。
+当前使用 Lynn streaming decoder。`SourceLynnDecoder` 独立管理每个会话的解码状态、
+有界 latent 缓冲和 source provenance；解码器逐 latent 执行，source 尚未确认有效的末尾
+帧暂留到后续 latent 或 EOF。`finish(total_frames)` 校验实际帧数并释放流状态。
+TAEH3 专用的五 latent 分组、十二帧暂留和 progressive decode 环境开关已移除。
 
-这两个可选功能与独立 Encoder 部署分别配置，当前未启用工作量上限时不限制每次 dispatch 的工作量。这里的增量解码指保留时间状态、分小块解码，不代表一种名为 progressive 的标准流式协议。
-
-## 增量 Decoder
-
-`SGLANG_ZING_EXPERIMENTAL_PROGRESSIVE_DECODE=1` 让 TAEH3 处理已就绪的一到两个 latent，不必等待完整五 latent 组。环境变量的历史名称保留以兼容实验。时间层缓存、每二十个原始帧的裁剪、十二帧暂留和 EOS 填充仍遵守原有输出契约。
-
-完成解码计算不等于可以交付 RGB：累计一个或三个 latent 时可能已完成计算，但没有可释放的画面；累计五个 latent 后才能释放五帧。因此不能声称首个 latent 立即产生首帧 RGB。
-
-benchmark 输入 JSON 需冻结 `"progressive_decode": true`。它作用于 server/consumer，不作用于 Encoder。`--stage decoder` 使用真实权重重放实际捕获的 latent，以零容差比较原路径，包含不规则尾部和 EOS；回执保存为 `progressive-acceptance.json`。CPU 分块卷积测试不代表真实权重的 GPU exact 或画质验收通过。
+Decoder 粒度、分次调度和独立 Encoder 部署是不同配置。CPU 测试不代替真实权重、
+EOS、画面边界、分布式清理和端到端性能验收。Lynn 的 SP tile 验证入口为
+`benchmark/zing_h3_causal/validate_lynn_sp_tiles.py`。
 
 ## 分次调度
 
@@ -32,7 +29,7 @@ API 和 worker 必须使用相同的可信部署环境。客户端请求不增�
 
 更改任一选项都必须重新冻结源码、配置和输入。对照保持输入和后端策略一致，保留严格的 source、水位、RNG 和 RGB 检查，再采集独立预热、五轮正式耗时、单独 profile 与120秒稳定性结果。默认关闭的实验不能证明默认开启后的性能，历史耗时只属于原冻结版本。
 
-`test_encoder_overlap_tools.py` 验证验收工具的容量、完整输出、统计和资源证据契约；它已接入 `zing-taeh3-cpu.yml`，不是 GPU 推理验收。
+`test_encoder_overlap_tools.py` 验证验收工具的容量、完整输出、统计和资源证据契约；它已接入统一 `zing-ci.yml`，不是 GPU 推理验收。
 
 `zing_source_output` 记录输出缓冲和显存阶段观测，仅在 DEBUG 日志开启时打印。`OutputBatch.usage` 内的资源字段用于内部结果与日志分析，不直接成为客户端帧 metadata；异步 materializer 管理两槽 RGB 转换、D2H、共享内存、背压和取消。
 

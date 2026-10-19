@@ -362,8 +362,6 @@ def run_sglang(args):
         warmup_mode="off",
         pipeline_config={
             "video_decoder_backend": args.video_decoder_backend,
-            "taeh3_checkpoint_path": args.taeh3_checkpoint_path,
-            "taeh3_decode_precision": args.taeh3_decode_precision,
             "zing_adaln_table_path": args.adaln_table,
             "zing_adaln_table_max_bytes": args.adaln_table_max_bytes,
         },
@@ -462,8 +460,6 @@ def run_sglang(args):
             {
                 "implementation": "sglang",
                 "video_decoder_backend": args.video_decoder_backend,
-                "taeh3_checkpoint_path": args.taeh3_checkpoint_path,
-                "taeh3_decode_precision": args.taeh3_decode_precision,
                 "commit": _source_commit(args.sglang_root, "SGLANG_COMMIT"),
                 "hardware": _hardware(),
                 "sp_size": args.sp_size,
@@ -794,11 +790,7 @@ def parser():
     sglang.add_argument("--model", required=True)
     sglang.add_argument("--sp-size", type=int, default=1)
     sglang.add_argument(
-        "--video-decoder-backend", choices=("native", "taeh3"), default="native"
-    )
-    sglang.add_argument("--taeh3-checkpoint-path")
-    sglang.add_argument(
-        "--taeh3-decode-precision", choices=("fp32", "fp16", "bf16"), default="fp32"
+        "--video-decoder-backend", choices=("native",), default="native"
     )
     sglang.add_argument(
         "--dit-placement",

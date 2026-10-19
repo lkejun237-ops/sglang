@@ -1011,7 +1011,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 or (
                     source_async
                     and getattr(self.server_args.pipeline_config, "decoder_type", None)
-                    == "taeh3"
+                    == "lynn_streaming"
                 )
             )
             and not getattr(req, "is_warmup", False)
@@ -1030,7 +1030,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         ):
             if source_async:
                 raise ValueError(
-                    "Source async RGB requires a local TAEH3 output-rank deployment"
+                    "Source async RGB requires a local Lynn output-rank deployment"
                 )
             return False
 

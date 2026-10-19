@@ -195,7 +195,11 @@ def test_workflow_dit_matrix_executes_all_four_unique_shards(tmp_path):
     strategy = job.get("strategy", {})
     assert strategy.get("matrix", {}).get("shard") == [0, 1, 2, 3]
     assert strategy.get("fail-fast") is False
-    for name in ("taeh3-contracts", "adaln-export-contracts", "conditioning-contracts"):
+    for name in (
+        "decoder-contracts",
+        "adaln-export-contracts",
+        "conditioning-contracts",
+    ):
         assert "matrix" not in workflow["jobs"][name].get("strategy", {})
     callee = yaml.safe_load((ROOT / job["uses"]).read_text())["jobs"]["cpu-suite"]
     run = next(

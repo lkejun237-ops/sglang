@@ -76,13 +76,16 @@ def test_single_checkpoint_preflight_creates_configs_without_launch(
 def test_bundled_decoder_config_resolves_checkpoint_relative_path(
     model, tmp_path, monkeypatch
 ):
-    decoder = model / "taeh3.pth"
+    decoder = model / "lynn.pt"
     decoder.write_bytes(b"checkpoint")
     (model / "pipeline_config.json").write_text(
         json.dumps(
             {
-                "video_decoder_backend": "taeh3",
-                "taeh3_checkpoint_path": "taeh3.pth",
+                "decoder_config": {
+                    "type": "lynn_streaming",
+                    "checkpoint_path": "lynn.pt",
+                    "model_dir": ".",
+                },
             }
         )
     )
@@ -94,7 +97,8 @@ def test_bundled_decoder_config_resolves_checkpoint_relative_path(
         ["--model-path", str(model), "--output-dir", str(out), "--preflight-only"]
     )
     pipeline = json.loads((out / "pipeline.json").read_text())
-    assert pipeline["taeh3_checkpoint_path"] == str(decoder)
+    assert pipeline["decoder_config"]["checkpoint_path"] == str(decoder)
+    assert pipeline["decoder_config"]["model_dir"] == str(model)
 
 
 def test_verified_media_is_downloaded_once_and_reused(tmp_path, monkeypatch):

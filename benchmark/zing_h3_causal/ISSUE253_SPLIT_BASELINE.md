@@ -5,7 +5,7 @@ Issue #253. It reuses the continuous-source transport and Encoder overlap
 implementation described in [ENCODER_OVERLAP.md](../../docs/docs/sglang-diffusion/zing/specs/ENCODER_OVERLAP.md):
 
 - one dedicated source VAE Encoder GPU;
-- an SP2 DiT group whose two GPUs also host the TAEH3 Decoder;
+- an SP2 DiT group whose two GPUs also host the Lynn Decoder;
 - concurrency one, sequential requests, resident processes within each cell;
 - the frozen 5s coast case and the two frozen 30s cases from PR #261;
 - paired `serial` and `overlap` source Encoder modes.
@@ -59,10 +59,10 @@ Encoder RPC latency or DiT's blocking wait for the next latent.
 
 ## Run
 
-Use a deployment manifest containing `realtime_profile` and `taeh3_sha256`, as
+Use a deployment manifest containing `realtime_profile`, `decoder_config`, `decoder_checkpoint_sha256` and `decoder_architecture_sha256`, as
 described in [ENCODER_OVERLAP.md](../../docs/docs/sglang-diffusion/zing/specs/ENCODER_OVERLAP.md#prepare-inputs-without-a-gpu).
 The profile binds the checkpoint's `zing_config.json` hash and must select a
-four-step progressive streaming deployment. Model and TAEH3 weights must already
+four-step progressive streaming deployment. Model and Lynn weights must already
 be available; preparation does not convert checkpoints.
 
 Prepare each case without GPUs:
@@ -72,7 +72,7 @@ python benchmark/zing_h3_causal/prepare_issue253_split_case.py \
   --deployment-manifest deployment.json \
   --case-manifest benchmark/zing_h3_causal/whitebox_video_smoke_cases.jsonl \
   --case zing-whitebox-video-five-triview-0001 \
-  --model MODEL --media-root MEDIA --taeh3-weights TAEH3 \
+  --model MODEL --media-root MEDIA --decoder-checkpoint LYNN_CHECKPOINT \
   --output PREPARED/5s
 ```
 

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Run a prepared, at-most-eight-GPU experiment serially on one node.
 
-Input JSON: model, request, source_rgb, soak_rgb, taeh3_weights. Prepare RGB and
+Input JSON: model, request, source_rgb, soak_rgb, decoder_config. Prepare RGB and
 local reference URIs in a zero-GPU CPU preparation job first. No cloud submission is performed.
 Outputs are append-only; existing cells are never silently reused.
 """
@@ -47,18 +47,13 @@ def read_text_retry(path, *, attempts=5, delay=0.1):
 
 
 _TILE_ENV = "MINIMAX_H3_PROGRESSIVE_ENCODER_TILING"
-_DECODE_ENV = "SGLANG_ZING_EXPERIMENTAL_PROGRESSIVE_DECODE"
 
 
 def role_environment(config, role, devices, base=None):
     mode = config.get("encoder_tile_mode", "parallel")
     if mode not in ("auto", "parallel"):
         raise ValueError("encoder_tile_mode must be auto or parallel")
-    progressive = config.get("progressive_decode", False)
-    if type(progressive) is not bool:
-        raise ValueError("progressive_decode must be boolean")
     env = dict(os.environ if base is None else base)
-    env[_DECODE_ENV] = "1" if progressive and role != "encoder" else "0"
     # A shell-wide experimental override must never alter the shared baseline.
     env[_TILE_ENV] = mode if role == "encoder" else "auto"
     env["CUDA_VISIBLE_DEVICES"] = devices
@@ -69,10 +64,7 @@ def record_role_environment(path, **roles):
     write_json(
         path,
         {
-            role: {
-                key: env[key]
-                for key in (_TILE_ENV, _DECODE_ENV, "CUDA_VISIBLE_DEVICES")
-            }
+            role: {key: env[key] for key in (_TILE_ENV, "CUDA_VISIBLE_DEVICES")}
             for role, env in roles.items()
         },
     )
@@ -667,11 +659,7 @@ def endpoint_cell(
     decoder_config = out / "decoder.json"
     write_json(
         decoder_config,
-        dict(
-            video_decoder_backend="taeh3",
-            taeh3_checkpoint_path=config["taeh3_weights"],
-            taeh3_decode_precision="fp16",
-        ),
+        {"decoder_config": config["decoder_config"]},
     )
     roles = {"server": env}
     if enc:
@@ -1034,10 +1022,9 @@ def validate_serial_overlap(root, spec, config=None, *, require_parity=True):
                 "request",
                 "source_rgb",
                 "soak_rgb",
-                "taeh3_weights",
+                "decoder_config",
                 "cudnn_benchmark_limit",
                 "encoder_tile_mode",
-                "progressive_decode",
                 "source_batch_pattern",
                 "source_chunk_plan",
                 "source_attention_window",
@@ -1088,10 +1075,9 @@ def validate_correctness(root, specs, config):
             "model",
             "request",
             "source_rgb",
-            "taeh3_weights",
+            "decoder_config",
             "cudnn_benchmark_limit",
             "encoder_tile_mode",
-            "progressive_decode",
             "source_batch_pattern",
             "source_chunk_plan",
             "source_attention_window",
@@ -1437,21 +1423,17 @@ def main():
                     env,
                 )
         if args.stage in ("decoder", "components", "all"):
+            write_json(root / "decoder-config.json", config["decoder_config"])
             command_run(
                 [
                     sys.executable,
-                    str(BENCH / "benchmark_taeh3_replay.py"),
+                    str(BENCH / "benchmark_lynn_replay.py"),
                     "--capture",
                     str(capture),
-                    "--weights",
-                    config["taeh3_weights"],
+                    "--decoder-config",
+                    str(root / "decoder-config.json"),
                     "--output",
                     str(root / "decoder"),
-                    *(
-                        ["--progressive"]
-                        if config.get("progressive_decode", False)
-                        else []
-                    ),
                 ],
                 root / "decoder.log",
                 role_environment(config, "server", "0"),

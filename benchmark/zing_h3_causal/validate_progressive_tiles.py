@@ -80,7 +80,7 @@ def encoder_server_args(model_path):
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
     # This probe loads the source VAE, never a video decoder. Runtime's default
-    # TAEH3 backend requires a checkpoint unrelated to encoder validation.
+    # Native reference selection avoids an unrelated Lynn decoder checkpoint.
     return ServerArgs.from_kwargs(
         model_path=model_path,
         pipeline_config=ZingH3CausalPipelineConfig(video_decoder_backend="native"),

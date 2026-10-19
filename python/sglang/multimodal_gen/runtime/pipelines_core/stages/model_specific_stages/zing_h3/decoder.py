@@ -9,14 +9,8 @@ import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.zing_h3_decoder import DecoderSpec
 
-from .source_decoder import SourceLynnDecoder, SourceTAEH3Decoder
+from .source_decoder import SourceLynnDecoder
 from .streaming_codecs import StableVideoDecoder
-
-_TAEH3_DTYPES = {
-    "fp32": torch.float32,
-    "fp16": torch.float16,
-    "bf16": torch.bfloat16,
-}
 
 
 def sp_tile_group():
@@ -43,33 +37,6 @@ class OfficialH3Adapter:
     def build(self, spec: DecoderSpec) -> dict:
         # The generic component loader already owns the exported video_vae.
         return {}
-
-
-class TAEH3Adapter:
-    module_key = "taeh3_decoder"
-    stateful = True
-    realtime_modes = ("stable",)
-
-    def build(self, spec: DecoderSpec) -> dict:
-        from sglang.multimodal_gen.runtime.models.vaes.taeh3 import (
-            WEIGHTS_SHA256,
-            TAEH3Decoder,
-        )
-
-        decoder = TAEH3Decoder(spec.checkpoint_path, WEIGHTS_SHA256)
-        return {self.module_key: decoder.to(dtype=_TAEH3_DTYPES[spec.precision])}
-
-    def stable_frames(self, module, latent_count):
-        # Five-latent decode groups minus the upstream twelve-frame tail.
-        return max(0, (latent_count // 5) * 17 - 12)
-
-    def new_stream(self, module, *, frame_limit):
-        return module.new_stream()
-
-    def decode(self, module, latent, frames):
-        return module.decode(latent, frames)
-
-    source_decoder = SourceTAEH3Decoder
 
 
 class LynnStreamingAdapter:
@@ -100,7 +67,6 @@ class LynnStreamingAdapter:
 
 DECODERS = {
     "official_h3": OfficialH3Adapter(),
-    "taeh3": TAEH3Adapter(),
     "lynn_streaming": LynnStreamingAdapter(),
 }
 

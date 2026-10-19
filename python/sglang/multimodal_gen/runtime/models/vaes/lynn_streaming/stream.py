@@ -7,7 +7,7 @@ import torch
 
 
 class LynnStream:
-    """Same push/finish/close shape as TAEH3Stream.
+    """Session-owned push/finish/close streaming interface.
 
     `frame_limit` is the known valid length of a finite request, so frames past
     it are never emitted. A failed push leaves the KV half-written; the stream

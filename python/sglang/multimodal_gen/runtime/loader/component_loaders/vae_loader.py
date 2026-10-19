@@ -10,6 +10,9 @@ from safetensors.torch import save_file as safetensors_save_file
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.vaes.base import VAEConfig
+from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
+    MiniMaxH3VideoVAEConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
@@ -320,6 +323,14 @@ def _consume_vae_checkpoint_arch_metadata(
     return tuple(consumed)
 
 
+def _vae_checkpoint_key_filter(vae_config: VAEConfig):
+    # Only the H3 encoder-only construction intentionally omits these tensors.
+    # Keep all other names so strict loading still detects checkpoint mistakes.
+    if isinstance(vae_config, MiniMaxH3VideoVAEConfig) and not vae_config.load_decoder:
+        return lambda name: not name.startswith(("decoder.", "post_quant_conv."))
+    return None
+
+
 def _vae_checkpoint_tensor_names(weight_files: list[str]) -> set[str]:
     names: set[str] = set()
     for path in weight_files:
@@ -403,7 +414,9 @@ def _assign_direct_gpu_vae_state(
     metadata: dict[str, torch.Tensor] = {}
     with torch.no_grad():
         for raw_name, tensor in safetensors_weights_iterator(
-            weight_files, to_cpu=device.type == "cpu"
+            weight_files,
+            to_cpu=device.type == "cpu",
+            key_filter=_vae_checkpoint_key_filter(vae_config),
         ):
             name = raw_name
             if name in metadata_names:
@@ -670,8 +683,16 @@ class VAELoader(WeightOverrideComponentLoader):
             return current_platform.optimize_vae(vae)
 
         loaded = {}
-        for sf_path in safetensors_list:
-            loaded.update(safetensors_load_file(sf_path))
+        key_filter = _vae_checkpoint_key_filter(vae_config)
+        if key_filter is not None:
+            loaded.update(
+                safetensors_weights_iterator(
+                    safetensors_list, to_cpu=True, key_filter=key_filter
+                )
+            )
+        else:
+            for sf_path in safetensors_list:
+                loaded.update(safetensors_load_file(sf_path))
         _backfill_ltx2_audio_vae_latent_stats(loaded, component_type)
         num_deparameterized = adopt_plain_weight_norm_state(vae, loaded)
         target_state = vae.state_dict()

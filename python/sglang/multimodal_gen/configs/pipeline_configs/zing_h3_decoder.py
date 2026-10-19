@@ -5,17 +5,15 @@ from collections.abc import Mapping
 
 import msgspec
 
-DECODER_TYPES = ("official_h3", "taeh3", "lynn_streaming")
+DECODER_TYPES = ("official_h3", "lynn_streaming")
 DEFAULT_DECODER_TYPE = "lynn_streaming"
 LEGACY_DECODER_FIELDS = frozenset(
     {
         "video_decoder_backend",
-        "taeh3_checkpoint_path",
-        "taeh3_decode_precision",
         "vae_decode_precision",
     }
 )
-_LEGACY_BACKEND_TYPES = {"native": "official_h3", "taeh3": "taeh3"}
+_LEGACY_BACKEND_TYPES = {"native": "official_h3"}
 _LEAF_FIELDS = frozenset(
     {"type", "checkpoint_path", "model_dir", "weights", "precision", "options"}
 )
@@ -48,8 +46,6 @@ def normalize_decoder_spec(
     decoder_config: Mapping | None,
     *,
     video_decoder_backend: str | None,
-    taeh3_checkpoint_path: str | None,
-    taeh3_decode_precision: str | None,
     vae_decode_precision: str,
     explicit_legacy: frozenset[str] = frozenset(),
 ) -> DecoderSpec:
@@ -62,17 +58,8 @@ def normalize_decoder_spec(
     if video_decoder_backend is not None and legacy_type is None:
         raise ValueError("Unknown Zing video decoder backend")
     if decoder_config is None:
-        # A flat TAEH3 path/precision still selects TAEH3; with no choice at all the
-        # default is Lynn, whose missing checkpoint fails instead of falling back.
-        if legacy_type is None and (taeh3_checkpoint_path or taeh3_decode_precision):
-            legacy_type = "taeh3"
         spec = (
-            _legacy_spec(
-                legacy_type,
-                taeh3_checkpoint_path,
-                taeh3_decode_precision,
-                vae_decode_precision,
-            )
+            DecoderSpec(type=legacy_type, precision=vae_decode_precision)
             if legacy_type is not None
             else DecoderSpec(type=DEFAULT_DECODER_TYPE, precision="bf16")
         )
@@ -80,8 +67,6 @@ def normalize_decoder_spec(
         spec = _nested_spec(
             decoder_config,
             legacy_type=legacy_type,
-            taeh3_checkpoint_path=taeh3_checkpoint_path,
-            taeh3_decode_precision=taeh3_decode_precision,
             vae_decode_precision=vae_decode_precision,
             explicit_legacy=explicit_legacy,
         )
@@ -89,22 +74,10 @@ def normalize_decoder_spec(
     return spec
 
 
-def _legacy_spec(decoder_type, taeh3_path, taeh3_precision, vae_precision):
-    if decoder_type == "taeh3":
-        return DecoderSpec(
-            type="taeh3",
-            checkpoint_path=taeh3_path,
-            precision=taeh3_precision or "fp32",
-        )
-    return DecoderSpec(type="official_h3", precision=vae_precision)
-
-
 def _nested_spec(
     decoder_config,
     *,
     legacy_type,
-    taeh3_checkpoint_path,
-    taeh3_decode_precision,
     vae_decode_precision,
     explicit_legacy,
 ) -> DecoderSpec:
@@ -127,39 +100,16 @@ def _nested_spec(
         and legacy_type != decoder_type
     ):
         raise _conflict("video_decoder_backend", "type")
-    legacy_path = legacy_precision = None
-    if decoder_type == "taeh3":
-        legacy_path, legacy_precision = (
-            taeh3_checkpoint_path,
-            taeh3_decode_precision or "fp32",
-        )
-        _reject_conflict(
-            decoder_config,
-            "checkpoint_path",
-            legacy_path,
-            "taeh3_checkpoint_path",
-            explicit,
-        )
+    legacy_precision = None
+    if decoder_type == "official_h3":
+        legacy_precision = vae_decode_precision
         _reject_conflict(
             decoder_config,
             "precision",
             legacy_precision,
-            "taeh3_decode_precision",
+            "vae_decode_precision",
             explicit,
         )
-    else:
-        for name in ("taeh3_checkpoint_path", "taeh3_decode_precision"):
-            if name in explicit:
-                raise _conflict(name, "type")
-        if decoder_type == "official_h3":
-            legacy_precision = vae_decode_precision
-            _reject_conflict(
-                decoder_config,
-                "precision",
-                legacy_precision,
-                "vae_decode_precision",
-                explicit,
-            )
     precision = decoder_config.get("precision")
     if precision is None:
         precision = legacy_precision or (
@@ -167,7 +117,7 @@ def _nested_spec(
         )
     return DecoderSpec(
         type=decoder_type,
-        checkpoint_path=decoder_config.get("checkpoint_path") or legacy_path,
+        checkpoint_path=decoder_config.get("checkpoint_path"),
         model_dir=decoder_config.get("model_dir"),
         weights=decoder_config.get("weights"),
         precision=precision,
@@ -191,13 +141,7 @@ def _conflict(legacy_name, leaf):
 
 
 def _validate_spec(spec: DecoderSpec) -> None:
-    if spec.type == "taeh3":
-        if not spec.checkpoint_path:
-            raise ValueError("TAEH3 requires a local checkpoint path")
-        if spec.precision not in _PRECISIONS:
-            raise ValueError("Unsupported TAEH3 decode precision")
-        _require_unset(spec, "model_dir", "weights", "options")
-    elif spec.type == "official_h3":
+    if spec.type == "official_h3":
         if spec.precision not in _PRECISIONS:
             raise ValueError("Unsupported official_h3 decode precision")
         if spec.checkpoint_path:

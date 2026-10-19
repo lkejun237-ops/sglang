@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[5]
 SUITES = [
-    "taeh3-contracts",
+    "decoder-contracts",
     "adaln-export-contracts",
     "dit-pipeline-contracts",
     "benchmark-contracts",

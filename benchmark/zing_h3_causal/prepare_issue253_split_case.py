@@ -59,7 +59,7 @@ def first_rgb(path):
 def prepare(args):
     manifest = json.loads(args.deployment_manifest.read_text())
     profile = validate_deployment_manifest(
-        manifest, args.model.resolve(), args.taeh3_weights.resolve()
+        manifest, args.model.resolve(), args.decoder_checkpoint.resolve()
     )
     case = load_cases(args.case_manifest)[args.case]
     user, target = case["messages"]
@@ -170,7 +170,11 @@ def prepare(args):
         "model": str(model),
         "request": str(root / "request.json"),
         "source_rgb": str(rgb),
-        "taeh3_weights": str(args.taeh3_weights.resolve()),
+        "decoder_config": {
+            **manifest["decoder_config"],
+            "checkpoint_path": str(args.decoder_checkpoint.resolve()),
+            "model_dir": str(Path(manifest["decoder_config"]["model_dir"]).resolve()),
+        },
         "prompt_video_frame": str(prompt_frame),
         "prompt_video_id": "<Video 1>",
         "layouts": ["enc1-sp2-serial", "enc1-sp2-overlap"],
@@ -206,7 +210,7 @@ def main():
     parser.add_argument("--case", required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--media-root", type=Path, required=True)
-    parser.add_argument("--taeh3-weights", type=Path, required=True)
+    parser.add_argument("--decoder-checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     prepare(parser.parse_args())
 

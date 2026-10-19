@@ -3,7 +3,7 @@
 ## Deployment contract
 
 This is an experimental same-node source Encoder service. Encoder weights are
-resident on a dedicated GPU group; DiT and the existing TAEH3 Decoder share
+resident on a dedicated GPU group; DiT and the Lynn Decoder share
 another group. It is not integrated with the generic `runtime/disaggregation`
 orchestrator; integration is tracked in #267. Independent instances and request routing are separate concerns;
 do not treat this private service as an Omni deployment API.
@@ -51,7 +51,7 @@ Preparation uses the existing whitebox case manifest and asset verifier. The
 default case contains a real source video and six ordered references. Choose a
 different case explicitly; do not substitute an older five-image case.
 
-Provide a deployment manifest with the full realtime profile and expected TAEH3
+Provide a deployment manifest with the full realtime profile and expected Lynn checkpoint
 SHA256. The profile's `model_config_sha256` binds `zing_config.json`:
 
 ```json
@@ -63,7 +63,10 @@ SHA256. The profile's `model_config_sha256` binds `zing_config.json`:
     "mode": "progressive", "contract_version": "h3-clip17-progressive-v1",
     "factory": "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.progressive_encoder:create_session"
   }
-}, "taeh3_sha256": "<expected checkpoint SHA256>"}
+}, "decoder_checkpoint_sha256": "<expected checkpoint SHA256>",
+ "decoder_architecture_sha256": "<model_dir/config.json SHA256>",
+ "decoder_config": {"type": "lynn_streaming", "checkpoint_path": "/models/lynn.pt",
+                    "model_dir": "/models/lynn", "precision": "bf16"}}
 ```
 
 These values are experiment inputs, not hashes hardcoded into the tool:
@@ -71,14 +74,14 @@ These values are experiment inputs, not hashes hardcoded into the tool:
 ```bash
 python benchmark/zing_h3_causal/prepare_encoder_overlap.py \
   --deployment-manifest deployment.json --model CHECKPOINT --media-root MEDIA \
-  --taeh3-weights TAE_WEIGHTS --width 832 --height 480 --output NEW_PREP_DIR
+  --decoder-checkpoint LYNN_WEIGHTS --width 832 --height 480 --output NEW_PREP_DIR
 ```
 
 Use `--case-manifest` and `--case` for another validated six-reference case.
 Preparation emits an existing-checkpoint deployment copy, request JSON, RGB
 streams and integrity receipts; it does not convert or train checkpoint weights.
 The same preparation applies to shared and dedicated baselines.
-Preparation checks manifest media identities, model/TAE identity, source frames
+Preparation checks manifest media identities, model/Lynn identity, source frames
 and FPS, and records geometry and the preparation tool hash. Git commit identity
 is recorded when preparation runs in a checkout; source archives must retain their
 separate frozen-source manifest. Long inputs loop

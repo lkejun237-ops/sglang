@@ -33,13 +33,19 @@ def set_request_resolution(request, width, height):
     request["metadata"]["smoke_contract"]["target"].update(width=width, height=height)
 
 
-def validate_deployment_manifest(manifest, model, taeh3_weights):
+def validate_deployment_manifest(manifest, model, decoder_checkpoint):
     """Reject changed weights/configuration before creating prepared outputs."""
     profile = dict(manifest["realtime_profile"])
+    if manifest["decoder_config"]["type"] != "lynn_streaming":
+        raise ValueError("Deployment manifest must select the Lynn decoder")
     if profile.get("model_config_sha256") != digest(model / "zing_config.json"):
         raise ValueError("Model configuration differs from the deployment manifest")
-    if manifest.get("taeh3_sha256") != digest(taeh3_weights):
-        raise ValueError("TAEH3 checkpoint differs from the deployment manifest")
+    if manifest.get("decoder_checkpoint_sha256") != digest(decoder_checkpoint):
+        raise ValueError("Lynn checkpoint differs from the deployment manifest")
+    if manifest["decoder_architecture_sha256"] != digest(
+        Path(manifest["decoder_config"]["model_dir"]) / "config.json"
+    ):
+        raise ValueError("Lynn architecture differs from the deployment manifest")
     if (
         profile.get("solver") != "few_step"
         or len(profile.get("denoising_step_list", [])) != 4
@@ -59,7 +65,7 @@ def main():
     p.add_argument("--case", default=DEFAULT_CASE)
     p.add_argument("--model", type=Path, required=True)
     p.add_argument("--media-root", type=Path, required=True)
-    p.add_argument("--taeh3-weights", type=Path, required=True)
+    p.add_argument("--decoder-checkpoint", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--width", type=int, default=832)
     p.add_argument("--height", type=int, default=480)
@@ -68,7 +74,7 @@ def main():
         p.error("Width must be a positive multiple of 32 and height of 32")
     manifest = json.loads(args.deployment_manifest.read_text())
     profile = validate_deployment_manifest(
-        manifest, args.model.resolve(), args.taeh3_weights
+        manifest, args.model.resolve(), args.decoder_checkpoint
     )
     case = load_cases(args.case_manifest)[args.case]
     root = args.output.resolve()
@@ -212,7 +218,11 @@ def main():
         request=str(root / "request.json"),
         source_rgb=str(root / "source.rgb"),
         soak_rgb=str(root / "soak.rgb"),
-        taeh3_weights=str(args.taeh3_weights.resolve()),
+        decoder_config={
+            **manifest["decoder_config"],
+            "checkpoint_path": str(args.decoder_checkpoint.resolve()),
+            "model_dir": str(Path(manifest["decoder_config"]["model_dir"]).resolve()),
+        },
         prompt_video_frame=str(prompt_frame),
         prompt_video_id="<Video 1>",
     )

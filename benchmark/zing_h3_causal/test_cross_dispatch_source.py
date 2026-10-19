@@ -378,7 +378,7 @@ def test_overlay_rejects_invalid_window_without_creating_model(tmp_path, window)
 
 
 @pytest.mark.parametrize("failure", [False, True])
-def test_production_worker_selects_taeh3_async_and_propagates_failure(failure):
+def test_production_worker_selects_lynn_async_and_propagates_failure(failure):
     path = ROOT / "managers/gpu_worker.py"
     tree = ast.parse(path.read_text())
     cls = next(
@@ -440,7 +440,7 @@ def test_production_worker_selects_taeh3_async_and_propagates_failure(failure):
             realtime_vae_backend="local",
             scheduler_endpoint="ipc:///private",
             pipeline_config=SimpleNamespace(
-                decoder_type="taeh3", vae_config=SimpleNamespace()
+                decoder_type="lynn_streaming", vae_config=SimpleNamespace()
             ),
         ),
         _async_raw_frame_materializer=None,

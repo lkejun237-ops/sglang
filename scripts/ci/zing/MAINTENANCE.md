@@ -52,7 +52,7 @@ conditioning 保留独立配方、固定历史对象、完整默认测试根及�
 
 ## 检查名与产物
 
-可复用 workflow 的 GitHub 检查显示名包含调用方和内部 job，例如 `taeh3-contracts / cpu-suite`；DiT 还包含 matrix 值。逻辑 ID 保留不等于旧的 required check 名称自动保持。新增、删除或重命名后以实际 PR Checks/API 返回的名称为准，核对保护规则；统一最终检查 `zing-ci` 保持稳定。
+可复用 workflow 的 GitHub 检查显示名包含调用方和内部 job，例如 `decoder-contracts / cpu-suite`；DiT 还包含 matrix 值。逻辑 ID 保留不等于旧的 required check 名称自动保持。新增、删除或重命名后以实际 PR Checks/API 返回的名称为准，核对保护规则；统一最终检查 `zing-ci` 保持稳定。
 
 普通套件的产物名包含 suite、shard、run ID、attempt 与 SHA；输出目录在各自独立 runner 内固定为 `artifacts/cpu-suite`。conditioning 保留单独产物。不要删除 `if: always()` 上传步骤或用 `continue-on-error` 掩盖失败。
 

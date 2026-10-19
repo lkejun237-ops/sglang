@@ -123,7 +123,7 @@ def test_workflow_cpu_environment_runs_full_tiles_without_hub_network(filename):
 
 
 def test_migrated_business_checks_have_one_owner_in_the_new_workflow():
-    required = {"taeh3-contracts", "adaln-export-contracts", "conditioning-contracts"}
+    required = {"decoder-contracts", "adaln-export-contracts", "conditioning-contracts"}
     owners = {name: [] for name in required}
     for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
         workflow = yaml.safe_load(path.read_text())

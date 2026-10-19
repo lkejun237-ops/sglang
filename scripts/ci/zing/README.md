@@ -27,7 +27,7 @@ export HF_HUB_OFFLINE=1 ZING_FULL_TILE_TESTS=1
 python scripts/ci/zing/run_cpu_tests.py --suite benchmark-contracts --trials 2 --output-dir /tmp/zing-benchmark
 ```
 
-普通套件还有 `taeh3-contracts`、`adaln-export-contracts`、`dit-pipeline-contracts`、`realtime-contracts`。DiT 正式 CI 按完整文件分四片；分别传入 `--shard-index 0` 至 `3`、`--shard-count 4` 和不同输出目录。执行前检查整个套件的批准状态，不能借分片隐藏未批准文件。
+普通套件还有 `decoder-contracts`、`adaln-export-contracts`、`dit-pipeline-contracts`、`realtime-contracts`。DiT 正式 CI 按完整文件分四片；分别传入 `--shard-index 0` 至 `3`、`--shard-count 4` 和不同输出目录。执行前检查整个套件的批准状态，不能借分片隐藏未批准文件。
 
 分布式 progressive tiles 测试保留完整 34 项矩阵、真实 BF16/float64 运算和零容差比较；其 CNN 仅在最低空间分辨率保留一个残差块，降低无 BF16 加速 CPU 的执行成本。独立 progressive kernel 测试继续使用各层一个残差块的完整夹具。普通 workflow 记录 `lscpu`，排查超时时需区分慢计算和进程停滞。
 

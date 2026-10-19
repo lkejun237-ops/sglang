@@ -71,10 +71,8 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
     dit_config: ZingH3DiTConfig = field(default_factory=ZingH3DiTConfig)
     should_use_guidance: bool = True
     vae_decode_precision: str = "fp32"
-    # Flat legacy selection; None means "not chosen", so an explicit taeh3 stays visible.
+    # Flat native selection remains available for reference comparisons.
     video_decoder_backend: str | None = None
-    taeh3_checkpoint_path: str | None = None
-    taeh3_decode_precision: str | None = None
     # Nested decoder selection; with neither this nor a legacy choice the default is Lynn.
     decoder_config: dict | None = None
     # Immutable offline table; None keeps the explicit resident baseline.
@@ -123,8 +121,6 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
         return normalize_decoder_spec(
             self.decoder_config,
             video_decoder_backend=self.video_decoder_backend,
-            taeh3_checkpoint_path=self.taeh3_checkpoint_path,
-            taeh3_decode_precision=self.taeh3_decode_precision,
             vae_decode_precision=self.vae_decode_precision,
             explicit_legacy=explicit,
         )
@@ -170,11 +166,15 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
                 raise ValueError("Zing AdaLN tables currently support SP1 and SP2 only")
         decoder = self.resolve_decoder_spec()
         if decoder.type == "lynn_streaming":
+            # Lynn owns decoding; the exported H3 VAE is only used for encoding.
+            self.vae_config.load_decoder = False
             # Offload of the mixed BF16/FP32 decoder is unvalidated; keep it resident.
             residency = getattr(server_args, "explicit_residency_mode", None)
             mode = residency("lynn_decoder") if residency is not None else None
             if mode not in (None, "resident"):
                 raise ValueError("lynn_streaming requires a resident decoder")
+        elif not self.vae_config.load_decoder:
+            raise ValueError("Omitting the native H3 decoder requires the Lynn backend")
         tp_size = getattr(server_args, "tp_size", 1) or 1
         sp_degree = getattr(server_args, "sp_degree", 1) or 1
         ulysses_degree = getattr(server_args, "ulysses_degree", 1) or 1

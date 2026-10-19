@@ -1213,6 +1213,7 @@ class AutoencoderKLLegacy(AutoencoderKL):
         causal_decoder=True,
         use_vit_decoder=False,
         vit_decoder_kwargs=None,
+        load_decoder=True,
         # stats
         shift_factor=0.0,
         scaling_factor=1.0,
@@ -1265,7 +1266,8 @@ class AutoencoderKLLegacy(AutoencoderKL):
 
         # init pointwise quant/post_quant conv
         self.quant_conv = nn.Conv3d(z_channels * 2, 2 * embed_dim, 1)
-        self.post_quant_conv = nn.Conv3d(embed_dim, z_channels, 1)
+        if load_decoder:
+            self.post_quant_conv = nn.Conv3d(embed_dim, z_channels, 1)
 
         self.use_vit_decoder = use_vit_decoder
 
@@ -1278,7 +1280,8 @@ class AutoencoderKLLegacy(AutoencoderKL):
         }
         vit_kwargs.setdefault("patch_size_t", self.vae_ratio_t)
         vit_kwargs.setdefault("t_causal", causal_decoder)
-        self.decoder = ViT3DDecoder(**vit_kwargs)
+        if load_decoder:
+            self.decoder = ViT3DDecoder(**vit_kwargs)
 
     @torch.no_grad()
     def encode(self, x):

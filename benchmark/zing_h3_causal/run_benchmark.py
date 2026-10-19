@@ -220,11 +220,14 @@ def main(argv=None):
     )
     if not isinstance(overrides, dict):
         raise ValueError("Pipeline configuration must be a JSON object")
-    if overrides.get("taeh3_checkpoint_path"):
-        decoder = Path(overrides["taeh3_checkpoint_path"])
-        overrides["taeh3_checkpoint_path"] = str(
-            (decoder if decoder.is_absolute() else model / decoder).resolve(strict=True)
-        )
+    decoder_config = overrides.get("decoder_config")
+    if decoder_config is not None:
+        for key in ("checkpoint_path", "model_dir"):
+            if decoder_config.get(key):
+                path = Path(decoder_config[key])
+                decoder_config[key] = str(
+                    (path if path.is_absolute() else model / path).resolve(strict=True)
+                )
     collection, selected = bench_client.select_cases(args)
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=False)

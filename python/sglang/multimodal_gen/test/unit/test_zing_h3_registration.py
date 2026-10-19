@@ -100,7 +100,10 @@ def test_zing_registers_executable_stages_and_accepts_ulysses_sp4(monkeypatch):
     assert callable(ZingH3GenerationStage.forward)
     with pytest.raises(ValueError, match="requires TP=1"):
         ZingH3CausalPipelineConfig(
-            taeh3_checkpoint_path="/model/taeh3.pth"
+            decoder_config={
+                "checkpoint_path": "/model/lynn.pt",
+                "model_dir": "/model/lynn",
+            }
         ).validate_server_args(SimpleNamespace(tp_size=2))
 
     with pytest.raises(ValueError, match="only supports 5"):
@@ -122,13 +125,19 @@ def test_zing_registers_executable_stages_and_accepts_ulysses_sp4(monkeypatch):
     monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_STABLE_SHAPES", "1")
     monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN", "1")
     ZingH3CausalPipelineConfig(
-        taeh3_checkpoint_path="/model/taeh3.pth",
+        decoder_config={
+            "checkpoint_path": "/model/lynn.pt",
+            "model_dir": "/model/lynn",
+        },
         prompt_switch_prefix_latent_frames=5,
     ).validate_server_args(args)
     args.sp_degree = 2
     with pytest.raises(ValueError, match="sp-degree == --ulysses-degree"):
         ZingH3CausalPipelineConfig(
-            taeh3_checkpoint_path="/model/taeh3.pth"
+            decoder_config={
+                "checkpoint_path": "/model/lynn.pt",
+                "model_dir": "/model/lynn",
+            }
         ).validate_server_args(args)
 
 
@@ -144,7 +153,11 @@ def test_adaln_table_is_limited_to_sp1_sp2():
         )
 
     config = ZingH3CausalPipelineConfig(
-        taeh3_checkpoint_path="/model/taeh3.pth", zing_adaln_table_path="/table"
+        decoder_config={
+            "checkpoint_path": "/model/lynn.pt",
+            "model_dir": "/model/lynn",
+        },
+        zing_adaln_table_path="/table",
     )
     config.validate_server_args(args(1))
     config.validate_server_args(args(2))
@@ -198,7 +211,9 @@ def test_zing_sp_requires_validated_numerical_configuration(
         attention_backend=None,
         resolve_component_attention_backend=lambda _name: (None, None),
     )
-    config = ZingH3CausalPipelineConfig(taeh3_checkpoint_path="/model/taeh3.pth")
+    config = ZingH3CausalPipelineConfig(
+        decoder_config={"checkpoint_path": "/model/lynn.pt", "model_dir": "/model/lynn"}
+    )
     effective = (attention or "fa4", stable or "1", compiled or "1")
     if sp == 1 or effective == ("fa4", "1", "1"):
         config.validate_server_args(args)
@@ -257,14 +272,6 @@ def test_zing_defaults_to_lynn_and_requires_explicit_weights():
     config.validate_server_args(args)
     assert config.decoder_type == "lynn_streaming"
 
-    taeh3 = ZingH3CausalPipelineConfig(video_decoder_backend="taeh3")
-    with pytest.raises(ValueError, match="TAEH3 requires a local checkpoint path"):
-        taeh3.validate_server_args(args)
-    taeh3.taeh3_checkpoint_path = "/model/taeh3.pth"
-    taeh3.validate_server_args(args)
-    taeh3.taeh3_decode_precision = "invalid"
-    with pytest.raises(ValueError, match="Unsupported TAEH3 decode precision"):
-        taeh3.validate_server_args(args)
     ZingH3CausalPipelineConfig(video_decoder_backend="native").validate_server_args(
         args
     )

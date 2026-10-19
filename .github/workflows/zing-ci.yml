@@ -103,12 +103,12 @@ jobs:
           name: zing-lint-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
           path: artifacts/lint.json
           if-no-files-found: error
-  taeh3-contracts:
+  decoder-contracts:
     needs: [zing-changes]
     if: needs.zing-changes.outputs.run_cpu == 'true'
     uses: ./.github/workflows/zing-cpu-suite.yml
     with:
-      suite: taeh3-contracts
+      suite: decoder-contracts
   adaln-export-contracts:
     needs: [zing-changes]
     if: needs.zing-changes.outputs.run_cpu == 'true'
@@ -145,7 +145,7 @@ jobs:
     uses: ./.github/workflows/zing-conditioning-suite.yml
   zing-ci:
     if: always()
-    needs: [zing-changes, zing-lint, ci-tooling-contracts, taeh3-contracts, adaln-export-contracts, dit-pipeline-contracts, benchmark-contracts, realtime-contracts, conditioning-contracts]
+    needs: [zing-changes, zing-lint, ci-tooling-contracts, decoder-contracts, adaln-export-contracts, dit-pipeline-contracts, benchmark-contracts, realtime-contracts, conditioning-contracts]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

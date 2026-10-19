@@ -60,11 +60,12 @@ def test_invalid_resolution_rejected_without_mutation(width, height):
     assert value == original
 
 
-@pytest.mark.parametrize("changed", [None, "model", "weights", "steps"])
+@pytest.mark.parametrize("changed", [None, "model", "weights", "architecture", "steps"])
 def test_preparation_uses_manifest_identity_not_one_checkpoint(tmp_path, changed):
     (tmp_path / "zing_config.json").write_text('{"checkpoint": "another-valid-model"}')
-    weights = tmp_path / "tae.pt"
+    weights = tmp_path / "lynn.pt"
     weights.write_bytes(b"another-checkpoint")
+    (tmp_path / "config.json").write_text("{}")
     profile = dict(
         model_config_sha256=digest(tmp_path / "zing_config.json"),
         solver="few_step",
@@ -72,12 +73,19 @@ def test_preparation_uses_manifest_identity_not_one_checkpoint(tmp_path, changed
         noise_version="indexed-cpu-v1",
         source_encoder={"mode": "progressive"},
     )
-    manifest = dict(realtime_profile=profile, taeh3_sha256=digest(weights))
+    manifest = dict(
+        realtime_profile=profile,
+        decoder_checkpoint_sha256=digest(weights),
+        decoder_config={"type": "lynn_streaming", "model_dir": str(tmp_path)},
+        decoder_architecture_sha256=digest(tmp_path / "config.json"),
+    )
     original = copy.deepcopy(manifest)
     if changed == "model":
         (tmp_path / "zing_config.json").write_text("changed")
     elif changed == "weights":
         weights.write_bytes(b"changed")
+    elif changed == "architecture":
+        (tmp_path / "config.json").write_text("changed")
     elif changed == "steps":
         profile["denoising_step_list"] = [900]
     if changed:

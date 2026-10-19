@@ -13,7 +13,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path, PurePosixPath
 
 SUITES = [
-    "taeh3-contracts",
+    "decoder-contracts",
     "adaln-export-contracts",
     "dit-pipeline-contracts",
     "benchmark-contracts",

@@ -147,12 +147,15 @@ source 对齐区间与计算依赖水位不同：codec lookahead 可使依赖超
 非法 source 顺序会终止该会话。错误内容使用简明英文，内部异常只写服务日志。
 
 当前持续路径使用有界 window=21/sink=3、block_relative RoPE、最大帧间隔 12；
-默认解码器为 TAEH3，部署必须提供 `taeh3_checkpoint_path`；需使用原生解码器时显式设置
-`video_decoder_backend="native"`。TAEH3 为每个会话保留独立时间缓存和 12 帧输出尾部，
-EOF 后释放最终帧。持续输入接口只接受 `stable`；TAEH3 没有额外的 immediate 解码路径，
-这个字段仅为兼容协议保留，不是 TAEH3 的性能开关。
+默认解码器为 Lynn，部署通过 `decoder_config.checkpoint_path` 和
+`decoder_config.model_dir` 指定权重与架构目录。每个会话独立持有时间缓存，按 latent
+推进解码；source 末尾未确认有效的帧暂留到后续输入或 EOF。持续输入只接受 `stable`。
+显式 `video_decoder_backend="native"` 仍可用于原生 decoder 对照。
 
-基础验收已覆盖 SP1/SP2、五参考图、结束排空、取消清理、慢消费者、并发隔离和有界内存。
+
+以下基础 source 验收属于链接所列冻结版本（主要为历史 TAEH3），不代表本次 Lynn 与
+原生 decoder 省略组合的 GPU 验收。历史验收覆盖 SP1/SP2、五参考图、结束排空、
+取消清理、慢消费者、并发隔离和有界内存。
 10/60 秒长会话使用同一 5 秒用例的技术性拼接，不能作为自然长视频画质结论。
 可运行 RGB pipe 客户端见仓库 `benchmark/zing_h3_causal/CONTINUOUS_SOURCE_VALIDATION.md`，
 完整证据见 `benchmark/zing_h3_causal/CONTINUOUS_SOURCE_ACCEPTANCE.md`。
@@ -231,24 +234,34 @@ CPU 回归覆盖两块逐步采样与离线 latent 对齐、跨块 RNG 隔离、
 SP2 顺序执行；CPU 测试不能替代真实模型、VAE 和分布式通信验证。
 
 
-### 默认 TAEH3 解码器
+### 默认 Lynn 解码器
 
-TAEH3 是默认解码器。部署时必须通过 pipeline config 提供本地
-`taeh3_checkpoint_path`，可设置
-`taeh3_decode_precision`（`fp32`、`fp16` 或 `bf16`）；权重必须匹配适配器固定的 SHA256。
-TAEH3 是有损替代解码器，其画质应独立比较。缺少权重路径时启动会明确报错，
-不会静默回退；旧部署若继续使用原生解码器，须显式设置 `video_decoder_backend="native"`。
+部署配置示例：
 
-TAEH3 的实时入口要求 `zing_realtime_decode_mode="stable"`。每个会话独立保存
-解码层的时间缓存，按五个 latent 一组解码新增数据，并保留十二帧尾部缓冲。
-小于内部解码组的输入可能暂不出帧；结束时补齐并裁剪到请求帧数。
-输入 AR block、内部解码组和发送的视频块不是同一边界。
-取消、失败及自然结束时释放会话缓存。
+```json
+{
+  "decoder_config": {
+    "type": "lynn_streaming",
+    "checkpoint_path": "/models/lynn.pt",
+    "model_dir": "/models/lynn",
+    "precision": "bf16"
+  }
+}
+```
 
-有限长度入口的 TAEH3 解码缓存有界不代表整个生成会话有界：该入口 DiT 仍保留完整历史。
-持续 source 入口另有上述 window/sink 限制。
-单独 decoder 耗时也不代表端到端实时性能；应分别测量首帧、稳态逐块延迟、
-媒体传输和持续播放情况。
+选择 Lynn 后，配置验证自动禁用导出 H3 VAE 中闲置的原生 decoder，构造和 checkpoint
+读取都跳过 `decoder` / `post_quant_conv`；无需显式配置 `load_decoder=false`。
+原生 encoder、latent statistics 和 posterior sampling 保留，ref 与 Qwen 仍在 DiT。
+原生对照路径仍加载完整 decoder。此处的加载优化尚无 Lynn 组合版本的真实 GPU
+显存/TTFF/prompt 切换 A/B 数据；历史 TAEH3 实验不能替代该验收。
+
+缺少 checkpoint 或架构目录时启动报错；不回退到其他 decoder。
+Lynn 要求 `zing_realtime_decode_mode="stable"`，每个会话独立持有缓存，
+每个新 latent 推进一次 decode_step；EOS 校验实际帧数，不做旧五 latent 分组或十二帧尾部补齐。
+取消、失败和自然结束时释放缓存。TAEH3 后端和对应配置已移除。
+
+有限长度入口的 decoder 缓存与 DiT 历史是不同的内存来源；持续 source 入口另有 window/sink 限制。
+单独 decoder 耗时不代表端到端实时性能，应分别测量首帧、逐块延迟、媒体传输和持续播放。
 
 ### Reference / source 与模型选择
 
