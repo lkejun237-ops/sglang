@@ -3,6 +3,7 @@
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MiniMaxH3DiTArchConfig,
@@ -75,7 +76,9 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
     video_decoder_backend: str | None = None
     # Nested decoder selection; with neither this nor a legacy choice the default is Lynn.
     decoder_config: dict | None = None
-    # Immutable offline table; None keeps the explicit resident baseline.
+    # Offline tables are the default; resident projections require an opt-out.
+    zing_adaln_mode: str = "weights_free"
+    # None selects <local serving export>/adaln-table; explicit paths are unchanged.
     zing_adaln_table_path: str | None = None
     zing_adaln_table_max_bytes: int = 536870912
     # Realtime KV pool (#171). None disables it and keeps per-session growth.
@@ -144,6 +147,27 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
     def validate_quality_deployment(self, server_args):
         self.validate_server_args(server_args)
 
+    def resolve_adaln_table_path(self, model_path: str = ".") -> str | None:
+        if self.zing_adaln_mode not in ("weights_free", "resident"):
+            raise ValueError("zing_adaln_mode must be weights_free or resident")
+        if self.zing_adaln_mode == "resident":
+            if self.zing_adaln_table_path is not None:
+                raise ValueError(
+                    "zing_adaln_table_path conflicts with zing_adaln_mode=resident"
+                )
+            return None
+        if self.zing_adaln_table_path is None:
+            return str(Path(model_path) / "adaln-table")
+        if (
+            not isinstance(self.zing_adaln_table_path, str)
+            or not self.zing_adaln_table_path.strip()
+        ):
+            raise ValueError(
+                "zing_adaln_table_path must be a nonempty string or None "
+                "to use the model's default adaln-table directory"
+            )
+        return self.zing_adaln_table_path
+
     def validate_server_args(self, server_args):
         if self.prompt_switch_prefix_latent_frames is not None and (
             type(self.prompt_switch_prefix_latent_frames) is not int
@@ -152,7 +176,7 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
             raise ValueError(
                 "prompt_switch_prefix_latent_frames currently only supports 5"
             )
-        if self.zing_adaln_table_path is not None:
+        if self.resolve_adaln_table_path() is not None:
             if (
                 type(self.zing_adaln_table_max_bytes) is not int
                 or self.zing_adaln_table_max_bytes <= 0

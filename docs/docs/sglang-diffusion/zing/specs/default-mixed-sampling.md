@@ -9,10 +9,10 @@ description: "默认前三块四步、后续两步，显式关闭与部署迁移
 
 ## 使用与迁移
 
-已有可运行的 Zing 模型、设备与外围组件配置保持原样；启动命令不再需要附加采样参数：
+已有可运行的 Zing 模型、设备与外围组件配置保持原样；默认离线 AdaLN 模式从本地模型目录的 `adaln-table/` 加载匹配表，省略表路径即可使用。可在 pipeline JSON 中设置 `zing_adaln_table_path` 覆盖路径，或显式 `zing_adaln_mode="resident"` 选择常驻投影。表须在部署前生成，缺失或不匹配时仍会报错。采样默认值无需附加采样参数：
 
 ```bash
-sglang serve --model-path /path/to/model
+sglang serve --model-path /path/to/model --pipeline-config-path /path/to/pipeline.json
 ```
 
 实时有效计划是 `few_step`，initial grid `[1000,750,500,250]`，initial block count `3`，regular grid `[1000,750]`。块的边界与 generation 重置规则沿用原实现。
@@ -20,7 +20,7 @@ sglang serve --model-path /path/to/model
 关闭初始阶段：
 
 ```bash
-sglang serve --model-path /path/to/model --zing-initial-block-count 0
+sglang serve --model-path /path/to/model --pipeline-config-path /path/to/pipeline.json --zing-initial-block-count 0
 ```
 
 有限实时入口此时恢复请求的 solver/grid；连续 source 此时保留 profile 原有 regular grid。要明确全程两步，关闭时再传 `--zing-solver few_step --zing-denoising-step-list 1000,750`；全程四步则传 `1000,750,500,250`。显式 Euler 必须配合 count=0，且连续 source 仍要求 few_step。两套 grid 均可显式覆盖默认值，见[自定义去噪列表](/docs/sglang-diffusion/zing/specs/configurable-step-lists)；未传入的 grid 才补默认值。

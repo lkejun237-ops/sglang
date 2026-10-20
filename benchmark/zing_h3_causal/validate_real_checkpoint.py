@@ -362,6 +362,7 @@ def run_sglang(args):
         warmup_mode="off",
         pipeline_config={
             "video_decoder_backend": args.video_decoder_backend,
+            "zing_adaln_mode": "weights_free" if args.adaln_table else "resident",
             "zing_adaln_table_path": args.adaln_table,
             "zing_adaln_table_max_bytes": args.adaln_table_max_bytes,
         },

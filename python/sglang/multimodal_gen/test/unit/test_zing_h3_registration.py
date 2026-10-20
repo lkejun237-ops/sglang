@@ -100,15 +100,16 @@ def test_zing_registers_executable_stages_and_accepts_ulysses_sp4(monkeypatch):
     assert callable(ZingH3GenerationStage.forward)
     with pytest.raises(ValueError, match="requires TP=1"):
         ZingH3CausalPipelineConfig(
+            zing_adaln_mode="resident",
             decoder_config={
                 "checkpoint_path": "/model/lynn.pt",
                 "model_dir": "/model/lynn",
-            }
+            },
         ).validate_server_args(SimpleNamespace(tp_size=2))
 
     with pytest.raises(ValueError, match="only supports 5"):
         ZingH3CausalPipelineConfig(
-            prompt_switch_prefix_latent_frames=4
+            zing_adaln_mode="resident", prompt_switch_prefix_latent_frames=4
         ).validate_server_args(SimpleNamespace())
     args = SimpleNamespace(
         tp_size=1,
@@ -125,6 +126,7 @@ def test_zing_registers_executable_stages_and_accepts_ulysses_sp4(monkeypatch):
     monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_STABLE_SHAPES", "1")
     monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_COMPILED_ADALN", "1")
     ZingH3CausalPipelineConfig(
+        zing_adaln_mode="resident",
         decoder_config={
             "checkpoint_path": "/model/lynn.pt",
             "model_dir": "/model/lynn",
@@ -134,11 +136,109 @@ def test_zing_registers_executable_stages_and_accepts_ulysses_sp4(monkeypatch):
     args.sp_degree = 2
     with pytest.raises(ValueError, match="sp-degree == --ulysses-degree"):
         ZingH3CausalPipelineConfig(
+            zing_adaln_mode="resident",
             decoder_config={
                 "checkpoint_path": "/model/lynn.pt",
                 "model_dir": "/model/lynn",
-            }
+            },
         ).validate_server_args(args)
+
+
+def test_adaln_default_uses_the_serving_model_directory(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    args = SimpleNamespace(
+        attention_backend=None,
+        resolve_component_attention_backend=lambda _name: (None, None),
+    )
+    config = ZingH3CausalPipelineConfig(video_decoder_backend="native")
+    assert config.zing_adaln_mode == "weights_free"
+    model_path = tmp_path / "serving"
+    other_cwd = tmp_path / "unrelated"
+    other_cwd.mkdir()
+    monkeypatch.chdir(other_cwd)
+    assert config.resolve_adaln_table_path(str(model_path)) == str(
+        model_path / "adaln-table"
+    )
+    assert config.zing_adaln_table_path is None
+    config.validate_server_args(args)
+
+
+@pytest.mark.parametrize("source", ["json", "kwargs"])
+def test_adaln_explicit_table_path_overrides_the_model_default(source):
+    config = ZingH3CausalPipelineConfig()
+    fields = json.loads(json.dumps({"zing_adaln_table_path": "/custom/table"}))
+    if source == "json":
+        config.update_pipeline_config(fields)
+    else:
+        config.update_config_from_dict(fields)
+    assert config.resolve_adaln_table_path("/model") == "/custom/table"
+
+
+def test_adaln_explicit_relative_path_keeps_its_existing_meaning():
+    config = ZingH3CausalPipelineConfig(zing_adaln_table_path="custom/table")
+    assert config.resolve_adaln_table_path("/model") == "custom/table"
+
+
+def test_adaln_missing_default_table_fails_without_creating_it(tmp_path):
+    from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
+        resolve_zing_modality_tags,
+    )
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_table import (
+        ZingAdalnTable,
+    )
+
+    config = ZingH3CausalPipelineConfig()
+    path = config.resolve_adaln_table_path(str(tmp_path))
+    arch = config.dit_config.arch_config
+    with pytest.raises(FileNotFoundError, match="adaln-table"):
+        ZingAdalnTable(
+            path,
+            arch=arch,
+            tags=resolve_zing_modality_tags(arch.num_modalities),
+            max_bytes=config.zing_adaln_table_max_bytes,
+        )
+    assert not (tmp_path / "adaln-table").exists()
+
+
+@pytest.mark.parametrize("source", ["json", "kwargs"])
+def test_adaln_resident_opt_out_survives_pipeline_configuration(source):
+    from types import SimpleNamespace
+
+    args = SimpleNamespace(
+        attention_backend=None,
+        resolve_component_attention_backend=lambda _name: (None, None),
+    )
+    config = ZingH3CausalPipelineConfig(video_decoder_backend="native")
+    fields = json.loads(json.dumps({"zing_adaln_mode": "resident"}))
+    if source == "json":
+        config.update_pipeline_config(fields)
+    else:
+        config.update_config_from_dict(fields)
+    assert config.resolve_adaln_table_path() is None
+    config.validate_server_args(args)
+
+
+@pytest.mark.parametrize("mode", [None, "auto", "off", False, {}])
+def test_adaln_unknown_mode_rejects_instead_of_using_resident(mode):
+    config = ZingH3CausalPipelineConfig(zing_adaln_mode=mode)
+    with pytest.raises(ValueError, match="zing_adaln_mode must be"):
+        config.resolve_adaln_table_path()
+
+
+@pytest.mark.parametrize("path", ["", "  ", 123, False])
+def test_adaln_invalid_table_path_never_selects_the_default_or_resident(path):
+    config = ZingH3CausalPipelineConfig(zing_adaln_table_path=path)
+    with pytest.raises(ValueError, match="must be a nonempty string or None"):
+        config.resolve_adaln_table_path()
+
+
+def test_adaln_resident_rejects_a_conflicting_table_path():
+    config = ZingH3CausalPipelineConfig(
+        zing_adaln_mode="resident", zing_adaln_table_path="/model/table"
+    )
+    with pytest.raises(ValueError, match="conflicts with"):
+        config.resolve_adaln_table_path()
 
 
 def test_adaln_table_is_limited_to_sp1_sp2():
@@ -212,7 +312,11 @@ def test_zing_sp_requires_validated_numerical_configuration(
         resolve_component_attention_backend=lambda _name: (None, None),
     )
     config = ZingH3CausalPipelineConfig(
-        decoder_config={"checkpoint_path": "/model/lynn.pt", "model_dir": "/model/lynn"}
+        zing_adaln_mode="resident",
+        decoder_config={
+            "checkpoint_path": "/model/lynn.pt",
+            "model_dir": "/model/lynn",
+        },
     )
     effective = (attention or "fa4", stable or "1", compiled or "1")
     if sp == 1 or effective == ("fa4", "1", "1"):
@@ -260,7 +364,7 @@ def test_zing_defaults_to_lynn_and_requires_explicit_weights():
         attention_backend=None,
         resolve_component_attention_backend=lambda _name: (None, None),
     )
-    config = ZingH3CausalPipelineConfig()
+    config = ZingH3CausalPipelineConfig(zing_adaln_mode="resident")
     assert config.video_decoder_backend is None
     assert ZingH3SamplingParams().zing_realtime_decode_mode == "stable"
     with pytest.raises(ValueError, match="lynn_streaming \\(the default decoder\\)"):
@@ -272,9 +376,9 @@ def test_zing_defaults_to_lynn_and_requires_explicit_weights():
     config.validate_server_args(args)
     assert config.decoder_type == "lynn_streaming"
 
-    ZingH3CausalPipelineConfig(video_decoder_backend="native").validate_server_args(
-        args
-    )
+    ZingH3CausalPipelineConfig(
+        video_decoder_backend="native", zing_adaln_mode="resident"
+    ).validate_server_args(args)
 
 
 @pytest.mark.parametrize(

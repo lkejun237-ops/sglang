@@ -408,6 +408,11 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
         zing_table_path = getattr(
             server_args.pipeline_config, "zing_adaln_table_path", None
         )
+        if model_cls.__name__ == "ZingH3DiTModel":
+            # Enforce the deployment mode even for direct component loading.
+            zing_table_path = server_args.pipeline_config.resolve_adaln_table_path(
+                str(Path(component_model_path).parent)
+            )
         if zing_table_path is not None:
             from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
                 resolve_zing_modality_tags,

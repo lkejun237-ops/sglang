@@ -1225,7 +1225,12 @@ def test_offline_adaln_builder_streams_exported_projection_keys(
     )
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(json.dumps(plan))
-    builder.build(root, plan_path, tmp_path / "table", "cpu")
+    from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
+        ZingH3CausalPipelineConfig,
+    )
+
+    table_path = ZingH3CausalPipelineConfig().resolve_adaln_table_path(str(root))
+    builder.build(root, plan_path, table_path, "cpu")
     assert observed and all(value() is None for value in observed)
     assert not (tmp_path / "bad-table").exists()
     wrong_plan = dict(plan, schedule=dict(plan["schedule"], condition=0.1))
@@ -1234,7 +1239,7 @@ def test_offline_adaln_builder_streams_exported_projection_keys(
         builder.build(root, tmp_path / "wrong-plan.json", tmp_path / "bad-table", "cpu")
     assert not (tmp_path / "bad-table").exists()
     table = ZingAdalnTable(
-        tmp_path / "table", arch=model.arch, tags=model.modality_tags, max_bytes=1 << 20
+        table_path, arch=model.arch, tags=model.modality_tags, max_bytes=1 << 20
     )
     table.validate_checkpoint(
         [transformer / "weights.safetensors"], transformer / "config.json"

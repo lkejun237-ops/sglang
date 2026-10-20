@@ -6,7 +6,7 @@ This implements [issue #257](https://github.com/seedleap/sglang/issues/257), bas
 
 The offline builder consumes the effective generator/EMA checkpoint exported by [export_checkpoint.py](../../../../../benchmark/zing_h3_causal/export_checkpoint.py). Any LoRA must already be merged and its provenance explicit. It streams one main/final projection module at a time, executes each complete ordered unique-t batch with the serving module's original GEMM, and writes compact BF16 shift/scale/gate values. It does not combine singleton outputs to simulate a different batch shape.
 
-The worker selects `weights_free` by setting `zing_adaln_table_path`; omitting the path selects the existing resident deployment. The loader verifies the export config and every selected shard's SHA256, skips main/final projection keys before `get_tensor`, and constructs these modules as `None` even on meta. Other weights, including TimeMLP and token refiner, remain resident. The table is copied to each rank's device at startup and fenced with a CUDA event. No builder runs inside a worker, and lookup adds no collective.
+The worker defaults to `zing_adaln_mode="weights_free"`. With `zing_adaln_table_path` omitted or `null`, it loads `<model-path>/adaln-table` from the resolved local serving-export directory, beside `transformer/`. Set `zing_adaln_table_path` to override this location; explicit absolute or relative paths keep their existing meaning (relative to the working directory). A missing or mismatched table fails loading or admission; the worker does not build a table or select resident projections. Explicit `zing_adaln_mode="resident"` with no table path selects the resident baseline. A resident mode combined with an explicit table path is rejected as conflicting configuration. The loader verifies the export config and every selected shard's SHA256, skips main/final projection keys before `get_tensor`, and constructs these modules as `None` even on meta. Other weights, including TimeMLP and token refiner, remain resident. The table is copied to each rank's device at startup and fenced with a CUDA event. No builder runs inside a worker, and lookup adds no collective.
 
 The first deployment is fixed-version, video-only, TP1 with SP1 or SP2, unquantized, and without DiT FSDP or layerwise/CPU offload. Changing weights, LoRA or schedule requires an offline rebuild and redeployment. Weight update and LoRA hooks reject before writes. No table miss invokes a deleted projection or switches to resident mode.
 
@@ -32,9 +32,9 @@ A table is only valid for one exact combination. Rebuild it (do not reuse the ol
 1. `plan`: write `plan.json` from the effective inference configuration of the release (solver, step list, shift, condition and reference timesteps). Do not infer these from the bare checkpoint or training config.
 2. `build` (or `ensure`): run on one GPU of the target hardware and software, writing a new directory.
 3. `check --model-path ... --table ... --plan ...`: must exit 0.
-4. Merge `zing_adaln_table_path` into the `--pipeline-config-path` JSON (see below) and start the server.
+4. Place the matching table at `<model-path>/adaln-table`, or set `zing_adaln_table_path` in the `--pipeline-config-path` JSON to use another location, and start the server. Existing explicit table paths keep working. Deployments without a table must prepare one or explicitly set `zing_adaln_mode="resident"`.
 5. Confirm the startup log `adaln_deployment_receipt`: `mode` weights-free, empty `projection_parameters`, zero `projection_storage_bytes`, `checkpoint_verified=true`. Request metrics should show zero misses.
-6. Roll back by removing `zing_adaln_table_path` from the config and restarting; the worker then loads the resident projections from the same export. A wrong or stale table fails startup or admission and never falls back silently.
+6. Roll back by setting `zing_adaln_mode="resident"`, removing `zing_adaln_table_path` from the config and restarting; the worker then loads the resident projections from the same export. A wrong or stale table fails startup or admission and never falls back silently.
 
 ## Artifact schema
 
@@ -70,7 +70,7 @@ PYTHONPATH=python python benchmark/zing_h3_causal/build_adaln_table.py plan \
 PYTHONPATH=python torchrun --standalone --nproc-per-node=1 \
   benchmark/zing_h3_causal/build_adaln_table.py build \
   --model-path /path/to/serving-export --plan /path/to/run/plan.json \
-  --output /path/to/run/adaln-table --device cuda
+  --output /path/to/serving-export/adaln-table --device cuda
 ```
 
 `plan` covers active singleton batches, source/final clean batches, and complete nonempty combinations of condition/reference/clean prefix timesteps. Request admission additionally enumerates the actual packed prefix, source, active and final rows for every chunk, including tails and CFG. Unsupported audio roles and missing batches reject before KV acquisition. Overlap and arbitrary solvers remain unsupported by this first version.
@@ -90,25 +90,35 @@ python benchmark/zing_h3_causal/build_adaln_table.py check \
 
 # Run after every export: keeps a current table, otherwise builds a fresh one (needs one GPU).
 torchrun --standalone --nproc-per-node=1 benchmark/zing_h3_causal/build_adaln_table.py ensure \
-  --model-path /path/to/serving-export --plan /path/to/plan.json --device cuda
+  --model-path /path/to/serving-export --plan /path/to/plan.json \
+  --table /path/to/serving-export/adaln-table --device cuda
 ```
 
-`check` compares the manifest with the export's config and shard hashes, the effective provenance in `zing_config.json` (including merged-LoRA evidence) and, with `--plan`, the schedule. It names each cause. `ensure` defaults the table to `<export>/adaln-table-<key>`, where the key hashes the checkpoint identity, provenance, schedule and the build device's arithmetic contract (GPU, PyTorch/CUDA, matmul flags), so any change gives a new directory and a repeated `ensure` reuses it instead of rebuilding. An existing table that no longer matches is never overwritten; `ensure` fails and asks for removal or a new `--table`. The worker still validates identity and arithmetic at startup, so a skipped preflight fails closed.
+`check` compares the manifest with the export's config and shard hashes, the effective provenance in `zing_config.json` (including merged-LoRA evidence) and, with `--plan`, the schedule. It names each cause. Without `--table`, the builder's `ensure` command still writes `<export>/adaln-table-<key>`, where the key hashes the checkpoint identity, provenance, schedule and the build device's arithmetic contract (GPU, PyTorch/CUDA, matmul flags). For that versioned output, set `zing_adaln_table_path` to the selected directory or make `<export>/adaln-table` a link to it. The explicit `--table` above builds directly at the worker's default location. An existing table that no longer matches is never overwritten; `ensure` fails and asks for removal or a new `--table`. The worker still validates identity and arithmetic at startup, so a skipped preflight fails closed.
 
-For the programmatic worker API, add these fields to the existing pipeline configuration:
+To override the default location through the programmatic worker API, add these fields to the existing pipeline configuration:
 
 ```python
 pipeline_config = {
-    "video_decoder_backend": "taeh3",
-    "taeh3_checkpoint_path": "/path/to/taeh3-checkpoint",
     "zing_adaln_table_path": "/path/to/run/adaln-table",
     "zing_adaln_table_max_bytes": 536870912,
 }
 ```
 
-For a server, merge those fields into the existing JSON passed to `--pipeline-config-path`. Preserve checkpoint, codec, KV pool, SP and other deployment settings. The existing real-checkpoint harness now accepts `--adaln-table PATH --adaln-table-max-bytes N` on its `sglang` subcommand; omitting `--adaln-table` runs the resident control. Read its `--help` and use the frozen request/options from the experiment manifest.
+For a server, merge those fields into the existing JSON passed to `--pipeline-config-path`. Preserve checkpoint, codec, KV pool, SP and other deployment settings. The existing real-checkpoint harness accepts `--adaln-table PATH --adaln-table-max-bytes N` on its `sglang` subcommand; omitting `--adaln-table` explicitly selects `zing_adaln_mode="resident"` for the comparison control. This harness opt-out does not change the production default. Read its `--help` and use the frozen request/options from the experiment manifest.
 
 The startup log records `adaln_deployment_receipt`: weights-free mode must have an empty `projection_parameters` list, zero `projection_storage_bytes`, and `checkpoint_verified=true`. Request metrics also contain `adaln_deployment`. Reader auditing and model parameter inspection are separate evidence from CUDA `allocated`/`reserved`; never use `empty_cache` as the proof that projection weights were omitted.
+
+For a single-GPU loading and projection smoke on the target CUDA environment:
+
+```bash
+PYTHONPATH=python torchrun --standalone --nproc-per-node=1 \
+  benchmark/zing_h3_causal/smoke_adaln_table.py \
+  --model-path /path/to/serving-export --plan /path/to/plan.json \
+  --table /path/to/new-or-matching-table --output /path/to/smoke-result.json
+```
+
+This uses the default mode through the production DiT loader, checks zero projection parameters/storage, and compares every complete table batch and layer with independent checkpoint `F.linear` outputs using `torch.equal`. It loads the full DiT and requires enough device and host memory. It does not validate end-to-end video quality, performance, or multiple GPUs.
 
 ## Local verification
 

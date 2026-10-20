@@ -112,7 +112,9 @@ class TestH3EncoderOnlyLoading(unittest.TestCase):
             ZingH3CausalPipelineConfig,
         )
 
-        config = ZingH3CausalPipelineConfig(video_decoder_backend="native")
+        config = ZingH3CausalPipelineConfig(
+            video_decoder_backend="native", zing_adaln_mode="resident"
+        )
         config.vae_config.load_decoder = False
         with self.assertRaisesRegex(ValueError, "requires the Lynn"):
             config.validate_server_args(SimpleNamespace())
@@ -124,7 +126,7 @@ class TestH3EncoderOnlyLoading(unittest.TestCase):
             ZingH3CausalPipelineConfig,
         )
 
-        config = ZingH3CausalPipelineConfig()
+        config = ZingH3CausalPipelineConfig(zing_adaln_mode="resident")
         config.update_pipeline_config(
             {"decoder_config": {"checkpoint_path": "/test/lynn.pt", "model_dir": "/m"}}
         )
@@ -145,7 +147,9 @@ class TestH3EncoderOnlyLoading(unittest.TestCase):
             ZingH3CausalPipelineConfig,
         )
 
-        config = ZingH3CausalPipelineConfig(video_decoder_backend="native")
+        config = ZingH3CausalPipelineConfig(
+            video_decoder_backend="native", zing_adaln_mode="resident"
+        )
         config.validate_server_args(
             SimpleNamespace(
                 attention_backend=None,

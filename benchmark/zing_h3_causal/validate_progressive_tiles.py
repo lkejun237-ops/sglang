@@ -83,7 +83,9 @@ def encoder_server_args(model_path):
     # Native reference selection avoids an unrelated Lynn decoder checkpoint.
     return ServerArgs.from_kwargs(
         model_path=model_path,
-        pipeline_config=ZingH3CausalPipelineConfig(video_decoder_backend="native"),
+        pipeline_config=ZingH3CausalPipelineConfig(
+            video_decoder_backend="native", zing_adaln_mode="resident"
+        ),
         num_gpus=1,
         attention_backend="torch_sdpa",
         warmup_mode="off",
