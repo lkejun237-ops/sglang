@@ -101,6 +101,8 @@ def test_sp4_ready_route_divergence_rejects_and_cleans(
 
     monkeypatch.setattr(ZingH3Sampler, "_forward", forward)
     packer, inputs, visual, _ = request(four_head_model, audio=False)
+    packer.num_frame_per_block = [3, 2]
+    packer.split_first_latent = True
     if case == "warm":
         inputs.visual_shape = (5, 2, 2)
         inputs.source_visual = torch.cat(
@@ -156,14 +158,6 @@ def test_sp4_ready_route_divergence_rejects_and_cleans(
             window_eviction_timing="after_step0",
             sigma_points=2,
             joint_forward=joint,
-        )
-        sampler.prefix_workspace = allocate_layer_stores(
-            128,
-            num_layers=len(four_head_model.blocks),
-            local_heads=1,
-            head_dim=8,
-            dtype=torch.bfloat16,
-            device=torch.device("cpu"),
         )
         storage = allocate_layer_stores(
             128,
@@ -286,7 +280,7 @@ def test_sp4_ready_route_divergence_rejects_and_cleans(
     )
     assert all(lease.released for lease in leases)
     # Refusal before allocation needs no artificial cache. Every cache that
-    # was actually initialized (session or donor) must have been cleared.
+    # was actually initialized must have been cleared.
     unique = {id(cache): cache for cache in created_caches}
     assert set(unique) <= {id(cache) for cache in caches}
     for cache in unique.values():

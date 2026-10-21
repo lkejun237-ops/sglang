@@ -86,6 +86,8 @@ def test_sp4_ready_prepare_failure_is_agreed(four_head_model, monkeypatch, entry
 
     monkeypatch.setattr(ZingH3Sampler, "_forward", forward)
     packer, inputs, visual, _ = request(four_head_model, audio=False)
+    packer.num_frame_per_block = [3, 2]
+    packer.split_first_latent = True
     original_pack_chunk = packer.pack_chunk
 
     def pack_chunk(inputs, prompt, visual, audio, **kwargs):
@@ -126,14 +128,6 @@ def test_sp4_ready_prepare_failure_is_agreed(four_head_model, monkeypatch, entry
             window_eviction_timing="after_step0",
             sigma_points=2,
             joint_forward="cross_chunk",
-        )
-        sampler.prefix_workspace = allocate_layer_stores(
-            128,
-            num_layers=len(four_head_model.blocks),
-            local_heads=1,
-            head_dim=8,
-            dtype=torch.bfloat16,
-            device=torch.device("cpu"),
         )
         storage = allocate_layer_stores(
             128,
@@ -189,7 +183,8 @@ def test_sp4_ready_prepare_failure_is_agreed(four_head_model, monkeypatch, entry
         condition = {k: v.clone() for k, v in inputs.positive.items()}
         if rank == 1 and entry != "lookahead":
             condition["row_role"][0] = 4
-        session.update_prompt(condition, "changed")
+        # Inject malformed initial conditioning at the prepare boundary.
+        session.prompt = session._snapshot(condition, "changed")
         try:
             if entry == "step":
                 session.step()
@@ -312,6 +307,8 @@ def test_sp4_ready_pure_prepare_errors_are_agreed(
 
     monkeypatch.setattr(ZingH3Sampler, "_forward", forward)
     packer, inputs, visual, _ = request(four_head_model, audio=False)
+    packer.num_frame_per_block = [3, 2]
+    packer.split_first_latent = True
     original_pack_chunk = packer.pack_chunk
 
     def pack_chunk(inputs, prompt, visual, audio, **kwargs):
@@ -347,6 +344,8 @@ def test_sp4_ready_pure_prepare_errors_are_agreed(
     def worker(rank):
         comm.thread.rank = rank
         packer, inputs, visual, _ = request(four_head_model, audio=False)
+        packer.num_frame_per_block = [3, 2]
+        packer.split_first_latent = True
         original_pack = packer.pack_chunk
 
         def observe_pack(*args, **kwargs):
@@ -364,14 +363,6 @@ def test_sp4_ready_pure_prepare_errors_are_agreed(
             window_eviction_timing="after_step0",
             sigma_points=2,
             joint_forward="cross_chunk",
-        )
-        sampler.prefix_workspace = allocate_layer_stores(
-            128,
-            num_layers=len(four_head_model.blocks),
-            local_heads=1,
-            head_dim=8,
-            dtype=torch.bfloat16,
-            device=torch.device("cpu"),
         )
         storage = allocate_layer_stores(
             128,
@@ -432,7 +423,8 @@ def test_sp4_ready_pure_prepare_errors_are_agreed(
                 # Real tensor-device validation fails inside production packing,
                 # before any model or CUDA operation is involved.
                 condition["row_role"] = condition["row_role"].to("meta")
-        session.update_prompt(condition, "changed")
+        # Inject malformed initial conditioning at the prepare boundary.
+        session.prompt = session._snapshot(condition, "changed")
         try:
             if entry == "step":
                 session.step()

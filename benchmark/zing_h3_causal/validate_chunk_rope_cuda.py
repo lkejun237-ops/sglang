@@ -345,24 +345,23 @@ def validate_boundaries(
         compare("initial")
         assert compare("repeat-denoise")[1][2] == 0
         for label, time, rows in [
-            ("same-anchor-prefix", 0, 19),
-            ("different-anchor-prefix", 100, 19),
-            ("larger-prefix", 100, 23),
-            ("smaller-prefix", 100, 7),
+            ("same-anchor-rebuild", 0, 19),
+            ("different-anchor-rebuild", 100, 19),
+            ("larger-prefix-rebuild", 100, 23),
+            ("smaller-prefix-rebuild", 100, 7),
         ]:
-            for cls, flag, c in zip((baseline_cls, candidate_cls), ("0", "1"), caches):
-                donor = new(cls, flag, mode)
-                commit(donor, positions(time, rows), 0, "prefix", kv(rows, 200 + rows))
-                c.replace_prefix(donor.prefix)
-                donor.clear()
-                assert not list(donor.owned_tensors())
+            for c in caches:
+                c.clear()
+                assert not list(c.owned_tensors())
+                commit(c, positions(time, rows), 0, "prefix", kv(rows, 200 + rows))
+                commit(c, positions(20), 2, "final", kv(19, 103))
             views = compare(label)
-            if label == "same-anchor-prefix":
-                assert views[1][2] == rows
+            assert views[1][2] == rows + 19
             assert compare(label + "-repeat")[1][2] == 0
         for c in caches:
-            c.replace_prefix(None)
-        compare("remove-prefix")
+            c.clear()
+            commit(c, positions(20), 2, "final", kv(19, 103))
+        compare("reset-without-prefix")
         for c in caches:
             old = c._stores[0][0].data_ptr()
             c._reserve_store(0, c._stores[0][0].shape[0] + 1, *pair)
@@ -408,7 +407,8 @@ def validate_boundaries(
         c.committed[0].layers[0][0].add_(0.25)
         assert c._stores[0][0]._version > before
         assert attention(c, current, pair)[2] > 0
-        c.replace_prefix(None)  # This allocation path must also stay versioned.
+        c.clear()
+        commit(c, positions(20), 2, "final", kv(19, 302))
         attention(c, current, pair)
         assert not torch.is_inference(c._stores[0][0])
         c.committed[0].layers[0][0].add_(0.25)
@@ -417,7 +417,7 @@ def validate_boundaries(
         assert not list(c.owned_tensors())
         evidence.append(
             dict(
-                boundary="inference-raw-inplace-and-prefix-resize",
+                boundary="inference-raw-inplace-and-cache-rebuild",
                 mode=mode,
                 rank=rank,
                 head_shard=heads,

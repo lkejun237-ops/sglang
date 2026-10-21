@@ -205,7 +205,7 @@ def test_cross_chunk_streaming_commits_before_delivery(model):
         assert state.cache.last_block == 2
         assert state.cache.active is state.cache.pending_source is None
         assert sampler.last_run_metrics["joint_fallbacks"]["streaming_boundary"] == 1
-        sampler.step(state, inputs=inputs)
+        sampler.step(state)
         assert state.cache.last_block == 4
     finally:
         state.close()
@@ -430,9 +430,11 @@ def test_ready_lookahead_matches_streaming_and_preserves_rng(
     from sglang.multimodal_gen.test.unit.test_zing_h3_chunks import fixture_provenance
 
     packer, inputs, _, _ = request(model, audio=False)
-    packer = type(packer)(model.arch, num_frame_per_block=[1, 2, 2])
-    inputs.visual_shape = (12, 2, 2)
-    inputs.source_visual = torch.randn(1, 2, 12, 2, 2)
+    packer = type(packer)(
+        model.arch, num_frame_per_block=[3, 2], split_first_latent=True
+    )
+    inputs.visual_shape = (10, 2, 2)
+    inputs.source_visual = torch.randn(1, 2, 10, 2, 2)
     noise = torch.randn_like(inputs.source_visual)
     runs, outputs, rngs = [], [], []
     for mode in ("off", "cross_chunk"):
@@ -455,7 +457,7 @@ def test_ready_lookahead_matches_streaming_and_preserves_rng(
             total_latent_frames=noise.shape[2],
         )
         parts = []
-        for chunk in packer.chunk_plan.chunks(12):
+        for chunk in packer.chunk_plan.chunks(10):
             session.append(
                 inputs.source_visual[:, :, chunk.start : chunk.end],
                 noise[:, :, chunk.start : chunk.end],
@@ -463,7 +465,7 @@ def test_ready_lookahead_matches_streaming_and_preserves_rng(
                     chunk.chunk_id + 1, 20, chunk.start, chunk.end
                 ),
             )
-            if len(session.pending) < batch_size and chunk.end != 12:
+            if len(session.pending) < batch_size and chunk.end != 10:
                 continue
             iterator = (
                 session.drain_ready()
@@ -495,6 +497,8 @@ def test_ready_lookahead_close_releases_prefetched_state(model):
     from sglang.multimodal_gen.test.unit.test_zing_h3_chunks import fixture_provenance
 
     packer, inputs, noise, _ = request(model, audio=False)
+    packer.num_frame_per_block = [3, 2]
+    packer.split_first_latent = True
     sampler = ZingH3Sampler(model, packer, joint_forward="cross_chunk", sigma_points=3)
     session = SourceReadySession(
         sampler,

@@ -180,22 +180,10 @@ def test_cache_transactions_eviction_and_failure(
     execute(positions(5, 0), 0, "prefix")
     for chunk in range(28):
         if chunk == 13:
-            from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import (
-                ZingKVChunk,
-            )
-
-            prefix_positions = positions(6, 0)
-            prefix_k = torch.randn(6, 14, 128, device=device, dtype=torch.bfloat16)
-            prefix_v = torch.randn_like(prefix_k)
-            if not caches[0].raw_store:
-                prefix_k = _apply_rope_into(
-                    prefix_k, coefficients(prefix_positions), torch.empty_like(prefix_k)
-                )
             for cache in caches:
-                cache.replace_prefix(
-                    ZingKVChunk(prefix_positions.clone(), 0, ((prefix_k, prefix_v),))
-                )
-        target = 2 * (chunk + 1)
+                cache.clear()
+            execute(positions(6, 0), 0, "prefix")
+        target = caches[0].last_block + 2
         for cache in caches:
             cache.begin_chunk(target)
         execute(positions(7, chunk * 2 + 2), target - 1, "source")
@@ -371,7 +359,6 @@ def test_history_plan_shared_across_layers_with_store_growth(
         pytest.skip("CUDA required")
     from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import (
         ZingH3KVCache,
-        ZingKVChunk,
     )
 
     monkeypatch.setenv("SGLANG_ZING_FUSED_HISTORY_ROPE", "1")
@@ -386,7 +373,13 @@ def test_history_plan_shared_across_layers_with_store_growth(
         for _ in range(2)
     )
     for cache in caches:
-        cache.replace_prefix(ZingKVChunk(positions.clone(), 0, pairs))
+        cache.update(
+            positions.clone(),
+            torch.zeros(5, dtype=torch.long, device=device),
+            "prefix",
+            0,
+            pairs,
+        )
     current_positions = torch.ones(7, 3, device=device, dtype=torch.float64)
     for cache in caches:
         _, history = cache.attention_positions(current_positions)

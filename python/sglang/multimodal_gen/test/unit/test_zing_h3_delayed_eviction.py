@@ -17,7 +17,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
     ZingH3Sampler,
 )
 from sglang.multimodal_gen.runtime.realtime.zing_chunk_plan import ChunkPlan
-from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import allocate_layer_stores
+from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+    ZingKVCapacityError,
+    allocate_layer_stores,
+)
 from sglang.multimodal_gen.runtime.realtime.zing_window import ZingWindowPolicy
 from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
     cpu_execution_options,
@@ -648,15 +651,17 @@ def test_initial_prefix_capacity_is_voted_before_model(model, monkeypatch):
 
 
 @torch.no_grad()
-def test_ready_prefix_workspace_capacity_refuses_before_forward(model, monkeypatch):
+def test_ready_prefix_slot_capacity_refuses_before_forward(model, monkeypatch):
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.incremental import (
         SourceReadySession,
     )
     from sglang.multimodal_gen.test.unit.test_zing_h3_chunks import fixture_provenance
 
     packer, inputs, visual, _ = request(model, audio=False)
+    packer.num_frame_per_block = [3, 2]
+    packer.split_first_latent = True
     sampler = _sampler(model, packer, sigma_points=2, window_chunks=1, sink_chunks=0)
-    sampler.prefix_workspace = allocate_layer_stores(
+    storage = allocate_layer_stores(
         1,
         num_layers=len(model.blocks),
         local_heads=model.arch.num_attention_heads,
@@ -671,6 +676,7 @@ def test_ready_prefix_workspace_capacity_refuses_before_forward(model, monkeypat
         max_pending_chunks=4,
         max_pending_bytes=1000000,
         total_latent_frames=visual.shape[2],
+        acquire_storage=lambda *args: storage,
     )
     chunk = packer.chunk_plan.chunk(0, visual.shape[2])
     session.append(
@@ -686,7 +692,7 @@ def test_ready_prefix_workspace_capacity_refuses_before_forward(model, monkeypat
         return original(*args, **kwargs)
 
     monkeypatch.setattr(model, "forward", forward)
-    with pytest.raises(ValueError, match="(?i)(capacity|rank|pooled)"):
+    with pytest.raises(ZingKVCapacityError, match="capacity"):
         session.step()
     assert session.closed and not session.cache.committed
     assert (
@@ -695,7 +701,7 @@ def test_ready_prefix_workspace_capacity_refuses_before_forward(model, monkeypat
         is session.cache.pending_source
         is None
     )
-    assert not forwards, "undersized donor must be refused before entering model work"
+    assert not forwards, "undersized slot must be refused before entering model work"
 
 
 if __name__ == "__main__":

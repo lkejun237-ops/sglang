@@ -153,12 +153,6 @@ def test_slot_capacity_and_budget():
         num_layers=50, local_heads=56, head_dim=128, element_size=2
     )
     assert bytes_ == 3 * plan.slot_rows * 50 * 56 * 128 * 2
-    assert (
-        plan.prefix_workspace_bytes(
-            num_layers=50, local_heads=14, head_dim=128, element_size=2
-        )
-        == 3 * 4096 * 50 * 14 * 128 * 2
-    )
 
 
 @pytest.mark.parametrize("h,w", [(480, 832), (704, 1248), (704, 1280), (832, 480)])

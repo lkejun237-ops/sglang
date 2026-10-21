@@ -76,6 +76,42 @@ def _request(size=64, **overrides):
     return ZingKVRequest(**values)
 
 
+def test_pool_allocates_only_session_slots(monkeypatch):
+    from sglang.multimodal_gen.runtime.realtime import zing_kv_pool
+
+    allocated_rows = []
+    allocate = zing_kv_pool.allocate_layer_stores
+
+    def track(rows, **layout):
+        allocated_rows.append(rows)
+        return allocate(rows, **layout)
+
+    monkeypatch.setattr(zing_kv_pool, "allocate_layer_stores", track)
+    plan = _plan()
+    pool = ZingKVPool.allocate(plan, **LAYOUT)
+    assert allocated_rows == [plan.slot_rows] * plan.config.pool_size
+    assert pool.allocated_bytes() == plan.config.pool_size * plan.slot_bytes(
+        num_layers=2, local_heads=2, head_dim=8, element_size=2
+    )
+
+
+@torch.no_grad()
+def test_source_initialization_and_rolling_switch_do_not_use_a_donor(
+    model, monkeypatch
+):
+
+    def forbidden(*args):
+        raise AssertionError("initialization/rolling switch allocated a donor")
+
+    from sglang.multimodal_gen.runtime.realtime import zing_kv_pool
+
+    storage = _storage_for(model, 64)
+    monkeypatch.setattr(zing_kv_pool, "allocate_layer_stores", forbidden)
+    actual, _, acquired = _source_stream(model, storage)
+    assert torch.isfinite(actual).all()
+    assert acquired == [3]
+
+
 def test_sessions_hold_exclusive_slots_until_release():
     pool = ZingKVPool.allocate(_plan(), **LAYOUT)
     first, second, third = RealtimeSession(), RealtimeSession(), RealtimeSession()
@@ -198,13 +234,11 @@ def test_block_state_leases_on_initialize_and_releases_on_dispose(model):
     torch.manual_seed(2)
     visual = torch.randn(1, 2, 5, 2, 2)
     expected, _, _ = _generate(sampler, inputs, visual)
-    sampler.prefix_workspace = None
     state.sampling = sampler.initialize(
         inputs,
         visual.clone(),
         acquire_storage=stage._realtime_storage(batch, state, inputs),
     )
-    assert sampler.prefix_workspace is pool.workspace
     assert state.kv_lease is session.zing_kv_lease and pool.available == 0
     assert state.sampling.cache.pooled
     while state.sampling.index < len(state.sampling.spans):
@@ -282,7 +316,7 @@ def test_stage_allocates_the_pool_and_logs_readiness(monkeypatch, caplog):
     assert ready["reserves_target_audio"]
     assert ready["slot_rows"] == stage.kv_pool.plan.slot_rows
     assert ready["pool_allocated_bytes"] == 2 * ready["slot_bytes"]
-    assert stage.kv_pool.workspace[0].k.shape == (16, 2, 8)
+    assert stage.kv_pool.allocated_bytes() == ready["pool_allocated_bytes"]
 
     disabled = object.__new__(ZingH3GenerationStage)
     disabled.kv_pool = None
@@ -294,7 +328,7 @@ def test_stage_allocates_the_pool_and_logs_readiness(monkeypatch, caplog):
     assert not disabled.realtime_kv_cache_pool_enabled
 
 
-def _source_stream(model, storage=None, workspace=None):
+def _source_stream(model, storage=None):
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.incremental import (
         SourceReadySession,
     )
@@ -305,7 +339,6 @@ def _source_stream(model, storage=None, workspace=None):
     sampler = _sampler(model)
     sampler.processor.num_frame_per_block = [3, 2]
     sampler.processor.split_first_latent = True
-    sampler.prefix_workspace = workspace
     torch.manual_seed(11)
     inputs = _inputs(12)
     inputs.audio_shape = None
@@ -354,9 +387,9 @@ def _source_stream(model, storage=None, workspace=None):
 def test_source_stream_leases_at_first_step_and_matches_growth_path(model):
     expected, grown, _ = _source_stream(model)
     assert grown["compactions"] >= 2
-    storage, workspace = _storage_for(model, 64), _storage_for(model, 16)
+    storage = _storage_for(model, 64)
     pointers = _pointers(storage)
-    actual, pooled, acquired = _source_stream(model, storage, workspace)
+    actual, pooled, acquired = _source_stream(model, storage)
     assert torch.equal(actual, expected)
     assert acquired == [3]  # once, with the packed prefix size
     assert pooled["store_allocations"] == pooled["rotated_allocations"] == 0
@@ -508,11 +541,11 @@ def test_source_stream_parity_survives_in_place_qk_norm_and_dirty_memory(
     monkeypatch.setattr(torch.Tensor, "new_empty", dirty_new_empty)
 
     expected, _, _ = _source_stream(model)
-    storage, workspace = _storage_for(model, 64), _storage_for(model, 16)
-    for store in (*storage, *workspace):
+    storage = _storage_for(model, 64)
+    for store in storage:
         for tensor in (store.k, store.v, store.rotated_k):
             tensor.fill_(float("nan"))
-    actual, _, _ = _source_stream(model, storage, workspace)
+    actual, _, _ = _source_stream(model, storage)
     assert staged
     assert torch.isfinite(expected).all()
     assert torch.equal(actual, expected)

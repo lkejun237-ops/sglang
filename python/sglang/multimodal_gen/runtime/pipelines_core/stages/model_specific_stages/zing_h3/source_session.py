@@ -188,7 +188,6 @@ class ZingSourceStreamState(BaseRealtimeState):
         """Lease a slot at the first step; the ready session never sees the pool."""
         if stage.kv_pool is None:
             return None
-        sampler.prefix_workspace = stage.kv_pool.workspace
 
         def acquire(positive, ready):
             request = stage.kv_request(

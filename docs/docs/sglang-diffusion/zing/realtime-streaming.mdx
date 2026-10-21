@@ -320,7 +320,7 @@ sequenceDiagram
         W->>W: _forward_realtime → _generate_realtime_block
         W->>W: _prepare_realtime_state
         Note over W,V: 首块 prepare(retain_condition_media=True)，只编码一次 source/ref
-        W->>S: _sample_realtime_block → initialize/update_condition → step
+        W->>S: _sample_realtime_block → ZingH3BlockSession → SourceReadySession.step
         S-->>W: 提交一个 clean KV block，返回 latent end
         W->>W: _queue_realtime_output（stable 等窗口）
         W->>V: _decode_realtime_output → decode_visual_range

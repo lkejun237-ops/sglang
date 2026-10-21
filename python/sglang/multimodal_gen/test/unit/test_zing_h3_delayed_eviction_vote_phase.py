@@ -85,6 +85,8 @@ def test_sp4_rank_local_prompt_transition_rejects_before_model(
 
     monkeypatch.setattr(ZingH3Sampler, "_forward", forward)
     packer, inputs, visual, _ = request(four_head_model, audio=False)
+    packer.num_frame_per_block = [3, 2]
+    packer.split_first_latent = True
     original_pack_chunk = packer.pack_chunk
 
     def pack_chunk(inputs, prompt, visual, audio, **kwargs):
@@ -125,14 +127,6 @@ def test_sp4_rank_local_prompt_transition_rejects_before_model(
             window_eviction_timing="after_step0",
             sigma_points=2,
             joint_forward="cross_chunk",
-        )
-        sampler.prefix_workspace = allocate_layer_stores(
-            128,
-            num_layers=len(four_head_model.blocks),
-            local_heads=1,
-            head_dim=8,
-            dtype=torch.bfloat16,
-            device=torch.device("cpu"),
         )
         storage = allocate_layer_stores(
             128,
@@ -195,7 +189,8 @@ def test_sp4_rank_local_prompt_transition_rejects_before_model(
         )
         if rank == 1:
             condition = {k: v.clone() for k, v in inputs.positive.items()}
-            session.update_prompt(condition, "changed")
+            # Inject a divergent applied snapshot, bypassing normal pending gating.
+            session.prompt = session._snapshot(condition, "changed")
         try:
             if entry == "step":
                 session.step()
@@ -256,7 +251,11 @@ def test_sp4_distinct_boundary_purposes_cannot_match_host_vote(model, monkeypatc
     pairs = []
     for _ in range(4):
         sampler = ZingH3Sampler(
-            model, packer, sigma_points=2, window_eviction_timing="after_step0"
+            model,
+            packer,
+            sigma_points=2,
+            window_eviction_timing="after_step0",
+            joint_forward="source_first",
         )
         state = sampler.initialize(inputs, visual)
         pairs.append((sampler, state))
@@ -279,8 +278,8 @@ def test_sp4_distinct_boundary_purposes_cannot_match_host_vote(model, monkeypatc
         source, target, _, _ = state.spans[0]
         try:
             if rank == 1:
-                sampler._precheck_replacement_prefix(
-                    state.cache, state.positive, source, target
+                sampler._joint_eligible(
+                    state.positive, state.cache, source, target, None
                 )
             else:
                 sampler._begin_chunk(state.cache, state.positive, source, target)

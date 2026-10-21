@@ -113,7 +113,7 @@ generation_block_index = int(ready.chunk.chunk_id)
 
 它是这次 generation 内的全局 chunk 游标。`schedules_for` 优先使用它，确保第四块起切到两步。source 编码、参考条件预填充、clean KV commit 都不增加这个生成块计数。
 
-同一 generation 的 `update_condition` 保留 state/index 和已有 target 历史，只按既有规则替换 prefix conditioning。因此 prompt 更新不会重新触发前三块四步。结束后创建新 generation 才重置。执行异常仍通过既有 state.close 清理缓存和 lease；本功能不增加全局可变计数器。
+同一 generation 的 prompt 更新统一按最近 5 个已生成 target latent 重建 KV，清除旧条件和旧历史 KV，但保留全局 generation block index。因此 clean KV 重建不会重新触发前三块四步；后续去噪仍按全局块号选择调度。结束后创建新 generation 才重置。执行异常沿用会话 dispose 清理缓存和 lease，不增加全局可变计数器。
 
 仓库部署模型是单活跃会话。本次未扩展并发会话能力；sampler 上既有的 last_run_metrics/device 等可变字段不应被解释为已经支持共享 sampler 的并发生成。
 

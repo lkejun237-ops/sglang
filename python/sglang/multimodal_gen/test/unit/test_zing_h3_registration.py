@@ -79,9 +79,9 @@ def test_zing_declares_four_modalities_and_reuses_codec_configs():
 
 @pytest.mark.parametrize(
     "overrides, expected",
-    [({}, 5), ({"prompt_switch_prefix_latent_frames": None}, None)],
+    [({}, 5), ({"prompt_switch_prefix_latent_frames": 5}, 5)],
 )
-def test_zing_pipeline_config_preserves_prompt_switch_opt_out(overrides, expected):
+def test_zing_pipeline_config_uses_fixed_prompt_switch_prefix(overrides, expected):
     config = ZingH3CausalPipelineConfig()
     config.update_pipeline_config(json.loads(json.dumps(overrides)))
     assert config.prompt_switch_prefix_latent_frames == expected
@@ -448,3 +448,11 @@ def test_causal_export_versions_validate_routing_and_timesteps(
         ]:
             with pytest.raises(ValueError):
                 load(dict(cfg, **{key: value}))
+
+
+@pytest.mark.parametrize("value", [None, 4, True])
+def test_zing_pipeline_config_rejects_prompt_switch_opt_out(value):
+    config = ZingH3CausalPipelineConfig()
+    config.update_pipeline_config({"prompt_switch_prefix_latent_frames": value})
+    with pytest.raises(ValueError, match="only supports 5"):
+        config.validate_server_args(None)

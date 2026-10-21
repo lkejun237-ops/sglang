@@ -737,15 +737,35 @@ class TestConditioningRPCWorker(CustomTestCase):
             visual=torch.zeros(1, 3, 50, 1, 1),
             close=lambda: None,
         )
+        state.requested_prompt = state.prompt
         updates = []
+        pending = []
 
-        def step(sampling, *, inputs=None):
-            if inputs is not None:
-                updates.append(inputs.positive)
-            sampling.index += 1
-            return None, sampling.index
+        def update_prompt(value, event_id, version):
+            updates.append(value)
+            pending[:] = [(event_id, version)]
 
-        state.sampler = NS(step=step)
+        def step():
+            state.sampling.prompt_updated = bool(pending)
+            state.sampling.index += 1
+            event, version = (
+                pending.pop()
+                if pending
+                else (state.prompt_event, state.effective_prompt_version)
+            )
+            return NS(
+                chunk=NS(end=state.sampling.index),
+                prompt_event_id=event,
+                prompt_version=version,
+            )
+
+        state.sampling.step = step
+        state.sampling.update_prompt = update_prompt
+        state.sampling.discard_pending_prompt = pending.clear
+        state.sampling.retag_pending_prompt = lambda event, version: (
+            pending.__setitem__(slice(None), [(event, version)])
+        )
+        state.sampler = NS()
         stage.codecs.decode_visual_range = lambda latent, start, end: torch.zeros(
             1, 3, end - start, 1, 1
         )
@@ -791,7 +811,7 @@ class TestConditioningRPCWorker(CustomTestCase):
         self.assertEqual(
             updates,
             [],
-            "Failed updates must not reach sampler.update_condition through step(inputs=...)",
+            "Failed updates must not enter the rolling-prefix pending queue",
         )
         self.assertEqual(
             (state.prompt, state.prompt_event, state.effective_prompt_version),

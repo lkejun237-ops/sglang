@@ -1,328 +1,273 @@
 # SPDX-License-Identifier: Apache-2.0
-# ruff: noqa: F401, F811
-"""Ordinary prompt replacement must refuse before model work on every rank."""
+"""Both realtime entries use the fixed-five rolling prompt contract (CPU CI)."""
 
-from concurrent.futures import ThreadPoolExecutor
 from copy import copy
-from types import SimpleNamespace
 
 import pytest
 import torch
 
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
-    sampling,
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.incremental import (
+    SourceReadySession,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.realtime import (
+    ZingH3BlockSession,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.sampling import (
     ZingH3Sampler,
 )
-from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import allocate_layer_stores
-from sglang.multimodal_gen.test.unit.test_zing_h3_joint import four_head_model
-from sglang.multimodal_gen.test.unit.test_zing_h3_model import (
+from sglang.multimodal_gen.test.unit.test_zing_h3_chunks import (
+    _long_request,
+    fixture_provenance,
+)
+from sglang.multimodal_gen.test.unit.test_zing_h3_kv_pool_cache import (
+    _pointers,
+    _storage,
+)
+from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
     cpu_execution_options,
     model,
-    request,
 )
-from sglang.multimodal_gen.test.unit.test_zing_h3_sp_cpu import _CPUCollectives
+
+
+def _sampler(model, packer):
+    return ZingH3Sampler(
+        model,
+        packer,
+        solver="few_step",
+        denoising_step_list=[1000, 500],
+        window_chunks=6,
+        sink_chunks=3,
+    )
 
 
 @torch.no_grad()
-def test_ordinary_prompt_donor_rejected_before_model(model, monkeypatch):
-    packer, inputs, visual, _ = request(model, audio=False)
-    sampler = ZingH3Sampler(
-        model, packer, sigma_points=2, window_eviction_timing="after_step0"
+@pytest.mark.parametrize("source", [False, True])
+@pytest.mark.parametrize("pooled", [False, True])
+def test_block_without_updates_matches_frozen_full_request(model, source, pooled):
+    packer, inputs, noise, _ = _long_request(model, [3, 2], frames=13)
+    if not source:
+        inputs.source_visual = None
+    initial = torch.get_rng_state().clone()
+    sampler = _sampler(model, packer)
+    with torch.random.fork_rng(devices=[]):
+        torch.set_rng_state(initial)
+        expected = sampler.sample(inputs, noise)[0]
+    storage = _storage(model, 256) if pooled else None
+    block = ZingH3BlockSession(
+        _sampler(model, packer),
+        inputs,
+        noise.clone(),
+        seed=7,
+        initial_rng_state=(initial, None),
+        acquire_storage=(lambda _: storage) if pooled else None,
     )
-    state = sampler.initialize(inputs, visual)
-    sampler.step(state)
-    sampler.prefix_workspace = allocate_layer_stores(
-        1,
-        num_layers=len(model.blocks),
-        local_heads=model.arch.num_attention_heads,
-        head_dim=model.arch.attention_head_dim,
-        dtype=torch.bfloat16,
-        device="cpu",
-    )
-    forwards = []
-    original = model.forward
-
-    def forward(*args, **kwargs):
-        forwards.append(1)
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(model, "forward", forward)
-    with pytest.raises((ValueError, RuntimeError), match="(?i)(capacity|rank|pooled)"):
-        sampler.step(state, inputs=inputs)
-    assert state.closed
-    assert not forwards, "undersized ordinary prompt donor entered model before refusal"
+    try:
+        while not block.ready.complete:
+            result = block.step()
+            assert result.provenance is None
+            assert block.spans[block.index - 1][3] == result.chunk.end
+        torch.testing.assert_close(block.visual, expected, rtol=0, atol=0)
+    finally:
+        block.close()
 
 
 @torch.no_grad()
-def test_ordinary_prompt_layout_is_voted(model, monkeypatch):
-    packer, inputs, visual, _ = request(model, audio=False)
-    sampler = ZingH3Sampler(
-        model, packer, sigma_points=2, window_eviction_timing="after_step0"
-    )
-    state = sampler.initialize(inputs, visual)
-    sampler.step(state)
-    votes = []
-    original = sampler._agree_sp_boundary
-
-    def agree(*args, **kwargs):
-        votes.append(kwargs)
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(sampler, "_agree_sp_boundary", agree)
-    inputs.positive = {
-        "context": torch.randn(7, 12).bfloat16(),
-        "row_role": torch.zeros(7, dtype=torch.long),
+@pytest.mark.parametrize("pooled", [False, True])
+def test_block_and_source_ready_share_latest_wins_and_repeated_rebuilds(model, pooled):
+    packer, inputs, noise, _ = _long_request(model, [3, 2], frames=18)
+    initial = torch.get_rng_state().clone()
+    conditions = {
+        event: {
+            "context": torch.full((3, 12), event, dtype=torch.bfloat16),
+            "row_role": torch.zeros(3, dtype=torch.long),
+        }
+        for event in (11, 12, 13)
     }
+
+    def run(block_entry):
+        sampler = _sampler(model, packer)
+        storage = _storage(model, 256) if pooled else None
+        pointers = _pointers(storage) if pooled else None
+        switches = []
+        rebuild = sampler.rebuild_prompt_prefix
+
+        def observe(*args):
+            before = torch.get_rng_state().clone()
+            out = rebuild(*args)
+            assert torch.equal(before, torch.get_rng_state())
+            switches.append(args[1]["context"][0, 0].item())
+            return out
+
+        sampler.rebuild_prompt_prefix = observe
+        if block_entry:
+            owner = ZingH3BlockSession(
+                sampler,
+                inputs,
+                noise.clone(),
+                seed=7,
+                initial_rng_state=(initial, None),
+                acquire_storage=(lambda _: storage) if pooled else None,
+                prompt_event_id=10,
+                prompt_version=1,
+            )
+            ready = owner.ready
+        else:
+            ready = SourceReadySession(
+                sampler,
+                inputs,
+                seed=7,
+                max_pending_chunks=1,
+                max_pending_bytes=1 << 20,
+                total_latent_frames=18,
+                initial_rng_state=(initial, None),
+                acquire_storage=(lambda *_: storage) if pooled else None,
+                initial_prompt_event_id=10,
+                initial_prompt_version=1,
+            )
+        outputs, events, spans = [], [], []
+        try:
+            while not ready.complete:
+                index = ready.committed_chunk_id
+                if index in (1, 2, 4):
+                    event = {1: 11, 2: 12, 4: 13}[index]
+                    ready.update_prompt(conditions[event], event, event - 9)
+                start = ready.next_latent
+                if block_entry:
+                    result = owner.step()
+                    assert owner.index == len(outputs) + 1
+                else:
+                    end = start + ready.next_chunk_size
+                    ready.append(
+                        inputs.source_visual[:, :, start:end],
+                        noise[:, :, start:end],
+                        provenance=fixture_provenance(1, end, start, end),
+                        final=end == 18,
+                    )
+                    result = ready.step()
+                outputs.append(result.visual.clone())
+                events.append((result.prompt_event_id, result.prompt_version))
+                spans.append((result.chunk.start, result.chunk.end))
+                if len(outputs) <= 3:
+                    assert not switches and result.prompt_event_id == 10
+                if pooled:
+                    assert _pointers(storage) == pointers
+            assert switches == [12, 13]
+            assert events[3] == (12, 3) and events[4] == (13, 4)
+            assert spans[0][0] == 0 and spans[-1][1] == 18
+            assert all(left[1] == right[0] for left, right in zip(spans, spans[1:]))
+            return torch.cat(outputs, dim=2), events, spans
+        finally:
+            (owner.close() if block_entry else ready.dispose())
+
+    block, source = run(True), run(False)
+    assert torch.equal(block[0], source[0])
+    assert block[1:] == source[1:]
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("source", [False, True])
+def test_block_rebuild_failure_closes_ready_cache(model, monkeypatch, source):
+    packer, inputs, noise, _ = _long_request(model, [3, 2], frames=10)
+    inputs = copy(inputs)
+    if not source:
+        inputs.source_visual = None
+    sampler = _sampler(model, packer)
+    storage = _storage(model, 256)
+    block = ZingH3BlockSession(
+        sampler,
+        inputs,
+        noise,
+        seed=7,
+        initial_rng_state=(torch.get_rng_state().clone(), None),
+        acquire_storage=lambda _: storage,
+    )
+    for _ in range(3):
+        block.step()
+    block.update_prompt(inputs.positive, 1, 1)
+
+    def fail(*args):
+        raise RuntimeError("injected rebuild failure")
+
+    monkeypatch.setattr(sampler, "rebuild_prompt_prefix", fail)
     try:
-        sampler.update_condition(state, inputs)
-        assert votes, "ordinary replacement prefix runs with no boundary vote"
+        with pytest.raises(RuntimeError, match="rebuild failure"):
+            block.step()
+        assert block.ready.closed and block.ready.cache.prefix is None
     finally:
-        state.close()
+        block.close()
+    assert block.visual is block.source is None
 
 
-@pytest.mark.parametrize("entry", ["step", "update_condition"])
-@pytest.mark.parametrize("fault", ["donor", "layout", "session_peak"])
-def test_sp4_ordinary_prompt_rejects_before_model(
-    four_head_model, monkeypatch, entry, fault
+@torch.no_grad()
+@pytest.mark.parametrize("anonymous", [False, True])
+def test_block_stage_reports_only_applied_prompt_and_drops_superseded_candidates(
+    model, anonymous
 ):
-    from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import ZingH3DiTConfig
-    from sglang.multimodal_gen.runtime.layers import usp
-    from sglang.multimodal_gen.runtime.models.dits import zing_h3
+    from contextlib import nullcontext
+    from types import SimpleNamespace
 
-    comm = _CPUCollectives(4)
-    monkeypatch.setattr(zing_h3, "get_ulysses_ctx", lambda: (4, comm.thread.rank))
-    monkeypatch.setattr(
-        zing_h3,
-        "get_sp_group",
-        lambda: SimpleNamespace(cpu_group=object(), ulysses_group=None),
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.realtime import (
+        ZingH3RealtimeState,
     )
-    monkeypatch.setattr(zing_h3, "gather_sequence_varlen", comm.gather)
-    monkeypatch.setattr(usp, "get_ulysses_parallel_world_size", lambda: 4)
-    monkeypatch.setattr(usp, "get_ulysses_parallel_rank", lambda: comm.thread.rank)
-    monkeypatch.setattr(usp, "_ipc_ready_group", lambda: None)
-    monkeypatch.setattr(usp, "_usp_all_to_all_single_varlen", comm.all_to_all)
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.stage import (
+        ZingH3GenerationStage,
+    )
 
-    def gather_objects(output, value, group=None):
-        output[:] = comm.exchange(value, lambda values, rank: list(values))
+    packer, inputs, _, _ = _long_request(model, [3, 2], frames=23)
+    inputs.condition_media = []
+    stage = object.__new__(ZingH3GenerationStage)
+    stage.packer, stage.kv_pool = packer, None
+    stage._use = lambda *_: nullcontext(model)
+    calls = []
 
-    monkeypatch.setattr(sampling.dist, "all_gather_object", gather_objects)
-    rank_models = [
-        zing_h3.ZingH3DiTModel(
-            ZingH3DiTConfig(arch_config=four_head_model.arch), {}
-        ).eval()
-        for _ in range(4)
-    ]
-    for rank_model in rank_models:
-        rank_model.load_state_dict(four_head_model.state_dict())
-    packer, inputs, visual, _ = request(four_head_model, audio=False)
-    observed = []
-    original_forward = ZingH3Sampler._forward
+    def encode(batch, text, media):
+        calls.append(text)
+        if text == "bad":
+            raise ConditionError("CONDITION_BUSY")
+        return inputs.positive
 
-    def forward(*args, **kwargs):
-        if getattr(comm.thread, "reject_phase", False):
-            observed.append(comm.thread.rank)
-            # All ranks stop at the observable model boundary so a faulty
-            # implementation cannot strand peers in a real model collective.
-            raise ValueError("capacity probe reached model before refusal")
-        return original_forward(*args, **kwargs)
+    stage.encode_condition_for_batch = encode
+    state = ZingH3RealtimeState()
+    state.inputs, state.sampler = inputs, _sampler(model, packer)
+    state.prompt = state.requested_prompt = "old"
+    state.prompt_event, state.effective_prompt_version = (
+        (None, None) if anonymous else (10, 1)
+    )
+    tag = lambda event: None if anonymous else event
 
-    monkeypatch.setattr(ZingH3Sampler, "_forward", forward)
-    states = []
-
-    def stores(rows):
-        return allocate_layer_stores(
-            rows,
-            num_layers=len(four_head_model.blocks),
-            local_heads=1,
-            head_dim=8,
-            dtype=torch.bfloat16,
-            device="cpu",
+    def step(text, event):
+        batch = SimpleNamespace(
+            sampling_params=SimpleNamespace(prompt=text, seed=7),
+            realtime_event_id=tag(event),
+            realtime_prompt_version=None if anonymous else event - 9,
         )
-
-    def worker(rank):
-        comm.thread.rank = rank
-        with torch.no_grad():
-            sampler = ZingH3Sampler(
-                rank_models[rank],
-                packer,
-                sigma_points=2,
-                window_eviction_timing="after_step0",
-            )
-            state = sampler.initialize(inputs, visual.clone(), storage=stores(128))
-            states.append(state)
-            sampler.step(state)
-            changed = copy(inputs)
-            prompt_rows = 9 if fault == "layout" and rank == 1 else 7
-            changed.positive = {
-                "context": torch.ones(prompt_rows, 12).bfloat16(),
-                "row_role": torch.zeros(prompt_rows, dtype=torch.long),
-            }
-            layout = packer.pack_inference_layout(
-                changed, changed.positive, state.visual, None
-            )
-            prefix_rows = int((layout["block_idx"] == 0).sum())
-            old_rows = state.cache.prefix.positions.shape[0]
-            sampler.prefix_workspace = stores(
-                prefix_rows - 1 if fault == "donor" and rank == 1 else 128
-            )
-            if fault == "session_peak":
-                # Replacement alone fits, but adding current source/target does
-                # not. The original old-prefix boundary still fits this slot.
-                source, target, _, _ = state.spans[state.index]
-                scratch = int(
-                    (
-                        (layout["block_idx"] == source)
-                        | (layout["block_idx"] == target)
-                    ).sum()
-                )
-                capacity = max(
-                    state.cache._length + prefix_rows - old_rows,
-                    state.cache._length + scratch,
-                )
-                assert state.cache._length + prefix_rows - old_rows <= capacity
-                assert state.cache._length + prefix_rows - old_rows + scratch > capacity
-                state.cache.storage = stores(capacity if rank == 1 else 128)
-            comm.thread.reject_phase = True
-            try:
-                with pytest.raises(ValueError, match="(?i)(capacity|rank|mismatch)"):
-                    if entry == "step":
-                        sampler.step(state, inputs=changed)
-                    else:
-                        sampler.update_condition(state, changed)
-                assert state.closed, (
-                    "public prompt update failures must close sampling state"
-                )
-                assert state.cache.positions() is None
-                assert state.cache.active is state.cache.pending_source is None
-                assert state.cache.eviction_target_block is None
-                assert state.cache._stores == {}
-            finally:
-                state.close()
-            return True
+        rng = torch.get_rng_state().clone()
+        end = stage._sample_realtime_block(batch, state)
+        assert torch.equal(rng, torch.get_rng_state())
+        return end, state.prompt_event
 
     try:
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = [executor.submit(worker, rank) for rank in range(4)]
-            assert all(f.result(timeout=30) for f in futures)
-        assert observed == [], (
-            "ordinary prompt rejection must precede every rank model forward"
-        )
+        assert step("old", 10) == (1, tag(10))
+        assert step("new", 11) == (3, tag(10))
+        # The same candidate is retagged without a second conditioning RPC.
+        assert step("new", 12) == (5, tag(10))
+        assert step("new", 12) == (8, tag(12))
+        assert state.prompt == "new"
+        assert calls == ["new"]
+        # A newer failed event drops the old pending candidate.
+        state.sampling.update_prompt(inputs.positive, 13, 4)
+        state.requested_prompt = "pending"
+        assert step("bad", 14)[1] == tag(12)
+        assert state.sampling.ready.pending_prompt is None
+        assert state.conditioning_notice == {
+            "code": "CONDITION_BUSY",
+            "event_id": tag(14),
+        }
+        assert step("new", 15)[1] == tag(15)
+        assert calls == ["new", "bad"]
+        step("old", 16)
+        assert state.prompt == "old"
+        assert calls == ["new", "bad", "old"]
     finally:
-        for state in states:
-            state.close()
-
-
-def test_sp4_ordinary_prompt_prepare_failure_is_agreed(four_head_model, monkeypatch):
-    """A failed pack must join the same status vote as successful peers."""
-    from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import ZingH3DiTConfig
-    from sglang.multimodal_gen.runtime.layers import usp
-    from sglang.multimodal_gen.runtime.models.dits import zing_h3
-
-    comm = _CPUCollectives(4)
-    status_votes = []
-    monkeypatch.setattr(zing_h3, "get_ulysses_ctx", lambda: (4, comm.thread.rank))
-    monkeypatch.setattr(
-        zing_h3,
-        "get_sp_group",
-        lambda: SimpleNamespace(cpu_group=object(), ulysses_group=None),
-    )
-    monkeypatch.setattr(zing_h3, "gather_sequence_varlen", comm.gather)
-    monkeypatch.setattr(usp, "get_ulysses_parallel_world_size", lambda: 4)
-    monkeypatch.setattr(usp, "get_ulysses_parallel_rank", lambda: comm.thread.rank)
-    monkeypatch.setattr(usp, "_ipc_ready_group", lambda: None)
-    monkeypatch.setattr(usp, "_usp_all_to_all_single_varlen", comm.all_to_all)
-
-    def gather_objects(output, value, group=None):
-        if getattr(comm.thread, "reject_phase", False):
-            status_votes.append((comm.thread.rank, value))
-        output[:] = comm.exchange(value, lambda values, rank: list(values))
-
-    monkeypatch.setattr(sampling.dist, "all_gather_object", gather_objects)
-    rank_models = [
-        zing_h3.ZingH3DiTModel(
-            ZingH3DiTConfig(arch_config=four_head_model.arch), {}
-        ).eval()
-        for _ in range(4)
-    ]
-    for rank_model in rank_models:
-        rank_model.load_state_dict(four_head_model.state_dict())
-    packer, inputs, visual, _ = request(four_head_model, audio=False)
-    observed = []
-    original_forward = ZingH3Sampler._forward
-
-    def forward(*args, **kwargs):
-        if getattr(comm.thread, "reject_phase", False):
-            observed.append(comm.thread.rank)
-            # All ranks stop at the observable model boundary so a faulty
-            # implementation cannot strand peers in a real model collective.
-            raise ValueError("capacity probe reached model before refusal")
-        return original_forward(*args, **kwargs)
-
-    monkeypatch.setattr(ZingH3Sampler, "_forward", forward)
-    states = []
-
-    def stores(rows):
-        return allocate_layer_stores(
-            rows,
-            num_layers=len(four_head_model.blocks),
-            local_heads=1,
-            head_dim=8,
-            dtype=torch.bfloat16,
-            device="cpu",
-        )
-
-    def worker(rank):
-        comm.thread.rank = rank
-        with torch.no_grad():
-            sampler = ZingH3Sampler(
-                rank_models[rank],
-                packer,
-                sigma_points=2,
-                window_eviction_timing="after_step0",
-            )
-            state = sampler.initialize(inputs, visual.clone(), storage=stores(128))
-            states.append(state)
-            sampler.step(state)
-            changed = copy(inputs)
-            changed.positive = {
-                "context": torch.ones(7, 12).bfloat16(),
-                "row_role": torch.zeros(7, dtype=torch.long),
-            }
-            if rank == 1:
-                # Actual production pack validation rejects a target role in
-                # context; no model or packing behavior is mocked.
-                changed.positive["row_role"][0] = 4
-            comm.thread.reject_phase = True
-            try:
-                sampler.update_condition(state, changed)
-            except BaseException as error:
-                return error, state.closed
-            finally:
-                state.close()
-            return None, state.closed
-
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [executor.submit(worker, rank) for rank in range(4)]
-        results = [f.result(timeout=30) for f in futures]
-    assert all(isinstance(error, ValueError) and closed for error, closed in results), (
-        "A local prompt prepare failure must produce coordinated ValueError on all ranks, without a broken collective",
-        results,
-    )
-    assert sorted(rank for rank, _ in status_votes) == list(range(4)), (
-        "all ranks must join one prepare-status vote"
-    )
-    assert any(rank == 1 and vote["precheck_error"] for rank, vote in status_votes)
-    assert not observed, "prepare failure must refuse before donor/model execution"
-    for state in states:
-        assert state.cache.positions() is None
-        assert state.cache.active is state.cache.pending_source is None
-        assert state.cache.eviction_target_block is None
-        assert state.cache._stores == {}
-
-
-if __name__ == "__main__":
-    import sys
-
-    sys.exit(pytest.main([__file__]))
+        state.dispose()

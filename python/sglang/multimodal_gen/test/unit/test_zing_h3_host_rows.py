@@ -34,7 +34,7 @@ def model():
 
 
 def _run_session(model, window, guidance):
-    packer, inputs, noise, audio = _long_request(model, [1, 2, 2])
+    packer, inputs, noise, audio = _long_request(model, [3, 2])
     inputs.conditions = [{"content_id": "ref", "role": "reference"}]
     inputs.media = [{"id": "ref", "type": "video"}]
     inputs.visual = {"ref": torch.randn(1, 2, 2, 2, 2)}

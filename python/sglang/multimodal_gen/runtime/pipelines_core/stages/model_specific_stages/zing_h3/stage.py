@@ -3,7 +3,6 @@ import hashlib
 import json
 import time
 from contextlib import contextmanager, nullcontext
-from copy import copy
 
 import torch
 
@@ -39,7 +38,7 @@ from sglang.multimodal_gen.runtime.utils.zing_stage_timing import (
 
 from .codecs import ZingH3Codecs
 from .packing import ZingH3Packer
-from .realtime import ZingH3RealtimeState
+from .realtime import ZingH3BlockSession, ZingH3RealtimeState
 from .request_adapter import build_h3_request
 from .sampling import ZingH3Sampler
 
@@ -132,7 +131,7 @@ class ZingH3GenerationStage(PipelineStage):
         return self.kv_pool is not None
 
     def initialize_realtime_kv_cache_pool(self, server_args):
-        """Allocate every realtime KV slot and the prefix workspace before readiness."""
+        """Allocate every realtime KV session slot before readiness."""
         config = ZingKVPoolConfig.from_pipeline_config(
             server_args.pipeline_config,
             max_sessions=server_args.realtime_max_sessions_per_worker,
@@ -170,7 +169,7 @@ class ZingH3GenerationStage(PipelineStage):
         pool = ZingKVPool.allocate(plan, **layout)
         if layout["device"].type == "cuda":
             torch.cuda.synchronize(layout["device"])
-        slot_bytes, workspace_bytes = pool.allocated_bytes()
+        slot_bytes = pool.allocated_bytes()
         element = torch.empty((), dtype=layout["dtype"]).element_size()
         budget = dict(
             num_layers=arch.num_layers,
@@ -187,8 +186,6 @@ class ZingH3GenerationStage(PipelineStage):
                     "slot_rows": plan.slot_rows,
                     "slot_bytes": plan.slot_bytes(**budget),
                     "pool_allocated_bytes": slot_bytes,
-                    "prefix_workspace_rows": config.max_prefix_rows,
-                    "prefix_workspace_bytes": workspace_bytes,
                     "max_target_area": config.max_target_area,
                     "max_target_long_edge": config.max_target_long_edge,
                     "max_short_edge": geometry.max_short_edge,
@@ -604,6 +601,7 @@ class ZingH3GenerationStage(PipelineStage):
             if batch.block_idx != 0:
                 raise ValueError("Zing realtime session must start at block zero")
             state.sampler = self._build_realtime_sampler(params)
+            state.sampler.processor.prompt_switch_prefix_chunks()
             request = self._build_request(batch)
             with stage_span(
                 trace,
@@ -635,6 +633,7 @@ class ZingH3GenerationStage(PipelineStage):
             if state.inputs.audio_shape is not None:
                 raise ValueError("Audio streaming is not supported yet.")
             state.prompt = self.codecs._parse_inference_request(request)[0]
+            state.requested_prompt = state.prompt
             state.prompt_event = batch.realtime_event_id
             state.effective_prompt_version = getattr(
                 batch, "realtime_prompt_version", None
@@ -654,13 +653,17 @@ class ZingH3GenerationStage(PipelineStage):
         params = batch.sampling_params
         inputs, sampler = state.inputs, state.sampler
         update = (params.prompt, batch.realtime_event_id)
-        blocked_update = update == getattr(state, "failed_update", None)
-        prompt_changed = params.prompt != state.prompt and not blocked_update
+        blocked_update = update == state.failed_update
+        requested = state.requested_prompt
+        if params.prompt == state.prompt and requested != state.prompt:
+            state.sampling.discard_pending_prompt()
+            state.requested_prompt = requested = state.prompt
+        prompt_changed = params.prompt != requested and not blocked_update
         state.conditioning_notice = None
+        candidate = None
         if prompt_changed:
-            candidate = copy(inputs)
             try:
-                candidate.positive = self.encode_condition_for_batch(
+                candidate = self.encode_condition_for_batch(
                     batch, params.prompt, inputs.condition_media
                 )
             except ConditionError as exc:
@@ -669,43 +672,71 @@ class ZingH3GenerationStage(PipelineStage):
                     "code": exc.code,
                     "event_id": batch.realtime_event_id,
                 }
-                prompt_changed = False
                 blocked_update = True
+                if state.sampling is not None:
+                    state.sampling.discard_pending_prompt()
+                state.requested_prompt = state.prompt
             else:
-                inputs = candidate
                 state.failed_update = None
         with self._use("transformer", "denoise") as transformer:
             sampler.generator = transformer
             device = next(transformer.parameters()).device
             seed = params.seed[0] if isinstance(params.seed, list) else params.seed
-            with state.random_stream(device, seed):
-                if state.sampling is None:
+            if state.sampling is None:
+                with state.random_stream(device, seed):
                     visual = torch.randn(
                         (1, self.packer.visual_channels, *inputs.visual_shape),
                         device=device,
                     )
-                    state.sampling = sampler.initialize(
-                        inputs,
-                        visual,
-                        acquire_storage=self._realtime_storage(batch, state, inputs),
+                    initial_rng_state = (
+                        torch.get_rng_state().clone(),
+                        torch.cuda.get_rng_state(device).clone()
+                        if device.type == "cuda"
+                        else None,
                     )
-                _, end = sampler.step(
-                    state.sampling, inputs=inputs if prompt_changed else None
+                state.sampling = ZingH3BlockSession(
+                    sampler,
+                    inputs,
+                    visual,
+                    seed=seed,
+                    initial_rng_state=initial_rng_state,
+                    acquire_storage=self._realtime_storage(batch, state, inputs),
+                    prompt_event_id=state.prompt_event,
+                    prompt_version=state.effective_prompt_version,
                 )
-            state.inputs = inputs
-            if not blocked_update:
-                state.prompt = params.prompt
+            if candidate is not None:
+                state.sampling.update_prompt(
+                    candidate,
+                    batch.realtime_event_id,
+                    getattr(batch, "realtime_prompt_version", None),
+                )
+                state.requested_prompt = params.prompt
+            elif not blocked_update and state.requested_prompt != state.prompt:
+                state.sampling.retag_pending_prompt(
+                    batch.realtime_event_id,
+                    getattr(batch, "realtime_prompt_version", None),
+                )
+            result = state.sampling.step()
+            if state.sampling.prompt_updated:
+                state.prompt = state.requested_prompt
+                state.prompt_event = result.prompt_event_id
+                state.effective_prompt_version = result.prompt_version
+            # A same-text event can advance metadata only after that condition
+            # is active. Pending candidates must not label old-condition output.
+            if (
+                not blocked_update
+                and state.requested_prompt == state.prompt == params.prompt
+            ):
                 state.prompt_event = batch.realtime_event_id
                 state.effective_prompt_version = getattr(
                     batch, "realtime_prompt_version", None
                 )
-        return end
+        return result.chunk.end
 
     def _realtime_storage(self, batch, state, inputs):
         """Lease a pooled slot for a block session once its prefix is packed."""
         if self.kv_pool is None:
             return None
-        state.sampler.prefix_workspace = self.kv_pool.workspace
 
         def acquire(layout):
             source = inputs.source_visual
@@ -841,6 +872,15 @@ class ZingH3GenerationStage(PipelineStage):
         final = state.sampling.index == len(state.sampling.spans) or batch.extra.get(
             "realtime_is_final_chunk", False
         )
+        progress = {
+            "complete": bool(final),
+            "next_chunk_size": None
+            if final
+            else (
+                state.sampling.spans[state.sampling.index][3]
+                - state.sampling.spans[state.sampling.index][2]
+            ),
+        }
         ready = self._queue_realtime_output(batch, state, end, mode, final)
         trajectory = (
             state.sampling.visual[:, :, :end].detach().clone()
@@ -852,6 +892,7 @@ class ZingH3GenerationStage(PipelineStage):
                 # An explicit empty frame batch is a successful buffered step;
                 # an entirely absent output is reserved for scheduler failures.
                 raw_frame_batches=[],
+                usage={"zing_realtime_state": progress},
                 metrics=batch.metrics,
                 trajectory_latents=trajectory,
                 conditioning_notice=state.conditioning_notice,
@@ -894,7 +935,10 @@ class ZingH3GenerationStage(PipelineStage):
             output=outputs[0].unsqueeze(0) if mode == "immediate" else outputs,
             metrics=batch.metrics,
             trajectory_latents=trajectory,
-            usage={"zing_realtime_blocks": ready} if mode == "stable" else None,
+            usage={
+                "zing_realtime_state": progress,
+                **({"zing_realtime_blocks": ready} if mode == "stable" else {}),
+            },
             conditioning_notice=state.conditioning_notice,
             realtime_effective_prompt={
                 "event_id": ready[0]["event_id"],

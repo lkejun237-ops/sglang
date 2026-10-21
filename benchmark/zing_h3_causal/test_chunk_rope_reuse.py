@@ -124,7 +124,7 @@ def test_append_same_length_coordinate_change_and_failure(monkeypatch):
 @pytest.mark.parametrize("timing", ["before_source", "after_step0"])
 @pytest.mark.parametrize("mode", ["absolute", "block_relative"])
 @torch.inference_mode()
-def test_window_repeated_eviction_and_prefix_replace(monkeypatch, mode, timing):
+def test_window_repeated_eviction_and_prefix_rebuild(monkeypatch, mode, timing):
     c = cache(monkeypatch, mode=mode, timing=timing)
     commit(c, 0, 0, "prefix")
     for i in range(1, 12):
@@ -136,11 +136,12 @@ def test_window_repeated_eviction_and_prefix_replace(monkeypatch, mode, timing):
         commit(c, 100 * i, 2 * i, "final")
         view(c, 100 * i + 1)
         assert not view(c, 100 * i + 1)
-    donor = cache(monkeypatch, mode=mode)
-    commit(donor, 7, 0, "prefix")
-    c.replace_prefix(donor.prefix)
-    donor.clear()
-    view(c, 1200)
+    c.clear()
+    assert c.positions() is None and not c._chunk_geometry
+    commit(c, 7, 0, "prefix")
+    for block, time in [(2, 8), (4, 10), (6, 12)]:
+        commit(c, time, block, "final")
+    assert sum(view(c, 1200)) == 8
     assert not view(c, 1200)
 
 
@@ -158,17 +159,17 @@ def test_raw_replacement_and_geometry_mutation(monkeypatch):
 
 
 @torch.inference_mode()
-def test_same_anchor_prefix_replace_rebuilds_only_prefix(monkeypatch):
+def test_same_anchor_reset_does_not_reuse_old_rotations(monkeypatch):
     c = cache(monkeypatch)
     commit(c, 0, 0, "prefix")
     commit(c, 10, 2, "final")
     view(c, 20)
-    donor = cache(monkeypatch)
-    commit(donor, 0, 0, "prefix")
-    donor.prefix.layers[0][0].add_(1)
-    c.replace_prefix(donor.prefix)
-    donor.clear()
+    c.clear()
+    commit(c, 0, 0, "prefix")
+    c.prefix.layers[0][0].add_(1)
+    assert not c.committed
     assert sum(view(c, 20)) == 2
+    assert not view(c, 20)
 
 
 @torch.no_grad()
@@ -283,11 +284,14 @@ def test_pooled_chunk_reuse_keeps_slot_and_tracks_writes(monkeypatch, mode, timi
     k, v = kv(positions(100))
     c.stage_prefix_kv(0, k, v, 0, 1)
     assert not view(c, 91)
-    donor = cache(monkeypatch, mode=mode)
-    commit(donor, 7, 0, "prefix")
     c.committed[0].layers[0][0].add_(2)
-    c.replace_prefix(donor.prefix)
-    view(c, 91)
+    assert view(c, 91)
+    c.clear()
+    assert c.storage is storage and c.positions() is None
+    commit(c, 7, 0, "prefix")
+    for block, time in [(2, 8), (4, 10), (6, 12)]:
+        commit(c, time, block, "final")
+    assert sum(view(c, 91)) == 8
     assert not view(c, 91)
     assert c._rotated_stores[0].data_ptr() == storage[0].rotated_k.data_ptr()
 

@@ -1,13 +1,13 @@
 # Zing WebSocket prompt 切换的滚动 latent prefix 设计
 
-本文描述 Zing H3 realtime 会话如何在 WebSocket prompt 切换时，使用会话常态保留的
+本文描述 Zing H3 source-ready 与普通 block realtime 会话如何在 WebSocket prompt 切换时，使用会话常态保留的
 最近 target latent，在新 prompt 下重建连续的历史 KV。设计直接基于当前 `main` 的
 source-ready 视频会话、packing、sampling 和 KV cache 边界，不依赖其他功能分支。
 本文核对的代码基线是 `origin/main@47c41dc43bf70431bd82cf161a42e2c1d3cfd3ef`。
 
 最终行为是：每个会话常态维护一个最近 target latent 的滚动窗口，容量由
-`prompt_switch_prefix_latent_frames` 控制。配置默认为 `5`，无需额外配置即可启用滚动
-prefix；显式设为 `None`（配置 JSON 中为 `null`）可保持旧的 prompt 更新行为。
+`prompt_switch_prefix_latent_frames` 控制。配置固定为 `5`，无需额外配置即可启用滚动
+prefix；不再接受 `None`（配置 JSON 中的 `null`）或其他长度。
 新 prompt 只有在已经积累满这段固定长度
 历史后，才会在完整 block 边界生效，并使用它做 clean prefix prefill；输出块用既有
 `event_id` 标明实际使用的 prompt 版本。
@@ -32,11 +32,10 @@ prompt_switch_prefix_latent_frames=5
 它是部署级、会话内不可变配置，因为它参与 session 显存预算、KV pool 容量和 prefix
 block 几何。
 
-如果已有模型导出不满足下文的 `[3,2]` + `split_first_latent=True` 分块要求，或需要
-保留旧的“只替换条件 KV、保留 target 历史 KV”行为，在服务的 pipeline 配置 JSON 中
-显式设置 `"prompt_switch_prefix_latent_frames": null`。已有配置文件中的显式 `null`
-仍然优先于新默认值；省略该字段才采用默认 `5`。此默认值变更不代表已验证 H100/L20Z
-上的切换显存峰值或解决 OOM，需要在对应部署配置下复测。
+模型导出必须满足下文的 `[3,2]` + `split_first_latent=True` 分块要求。不再提供
+“只替换条件 KV、保留 target 历史 KV”的部署选项；已有配置文件须移除显式的
+`"prompt_switch_prefix_latent_frames": null`，或将其改为 `5`，否则启动校验失败。
+切换时使用最近 5 个 target latent 在同一会话槽中重建 KV，无须临时 donor。
 
 客户端沿用现有 WebSocket prompt update 协议，发送 prompt 和单调递增的 `event_id`。
 本文不新增第二套控制协议。示意消息如下，准确 envelope 以现有 realtime 协议为准：
@@ -210,14 +209,13 @@ prompt 可以先进入 pending，但不能生效；旧 prompt 继续生成并补
 ```
 
 这里的“切分”不改变 latent 的顺序或数值，只决定三次 clean commit 的 block 边界。服务
-启用功能的 source session 初始化时必须严格核验原始配置为
+启用功能的 realtime 会话初始化时必须严格核验原始配置为
 `num_frame_per_block=[3,2]` 且 `split_first_latent=True`，再读取未截断的入口三块
 `1,2,2`。不能用 `chunks(5)` 验证：它会把 `[3,7]` 的实际入口 `1,2,7`
 截断成 `1,2,2`，掩盖下一块实际从 latent 10 开始的相位错误。不匹配时
 直接拒绝启用 prompt-switch prefix，不能静默使用另一种切法。本期不扩展到其他 chunk
 计划。启用值 `5` 同时是滚动窗口上限和 prompt 生效所需的**固定历史长度**，不允许用
-1 个或 3 个 latent 提前切换。默认启用后，不支持该几何的既有 export 需要显式设置
-`null` 才能沿用旧路径；几何校验仍只在启用功能并创建 source session 时执行。
+1 个或 3 个 latent 提前切换。不支持该几何的 export 在 realtime 会话初始化时明确拒绝，不能再用 `null` 绕过。
 
 会话开头接纳新 prompt 时，需要继续用旧 prompt 生成，直到严格凑齐 5 个 latent。下表
 使用本期支持的入口 block 长度 `1,2,2` 说明模型会话内的等待过程；假设候选已经进入模型
@@ -282,10 +280,10 @@ decoder，已输出帧不会重复，decoder overlap 和全局 PTS 继续前进�
 ### 5.7 配置属于 runtime，不属于 WebSocket 事件
 
 `prompt_switch_prefix_latent_frames` 影响每 session tensor 常驻量、KV pool reserve rows 和
-prefix forward 数，因此在部署启动时确定。本期关闭值为 `None`，唯一启用值为 `5`；其他
+prefix forward 数，因此在部署启动时确定。本期固定值为 `5`；`None` 和其他
 值在部署配置校验阶段明确拒绝，不能暗示任意长度都能按合法 block 几何重建。`1+2+2`
-几何在启用功能的 source session 初始化时校验，因此普通 Zing stage 和未启用该功能的
-既有 export 不受限制。底层 sampler 接收已经校验的整数，不依赖 HTTP/WebSocket 配置
+几何在 realtime 会话初始化时校验；普通 block realtime 也复用同一个 ready-session
+执行器，已经编码的 source 可为空，但不再提供保留旧 KV 的条件更新接口。底层 sampler 接收已经校验的整数，不依赖 HTTP/WebSocket 配置
 对象，也不在热循环重复做 host/device 同步校验。
 
 ### 5.8 状态只属于单个活跃会话
@@ -323,7 +321,7 @@ KV lease 和 RNG 都属于当前会话；不新增多 owner 状态或并发会�
 | `_sampling_helpers.py` | `_commit_clean_prefix` 以 active/final 两阶段提交已知干净 latent | 不决定切换时机或保存历史 |
 | `packing.py` | 把固定 5 个 latent 按 `1+2+2` 打包成新 epoch 的合法 prefix rows/position，并校验 `ChunkPlan` | 不拥有 session 生命周期 |
 | `zing_h3_cache.py` | 沿用 KV pool、prefix/target commit 和清理事务 | 不知道 prompt 文本或 latent 保存策略 |
-| `stage.py` / Zing pipeline config | 默认 `5` 交给 source session 启用；显式 `None` 保持旧路径 | 不在全局 stage 构造时限制既有 chunk plan，不在 WebSocket 事件中动态修改 |
+| `stage.py` / Zing pipeline config | 固定 `5` 交给 source session；拒绝显式 `None` | 不在全局 stage 构造时限制既有 chunk plan，不在 WebSocket 事件中动态修改 |
 
 依赖方向保持：
 
@@ -410,7 +408,7 @@ SP1/SP2 数值对照、分阶段性能及更多连续切换仍待验证；计划
 | 不重复输出 | 检查对外 `TemporalChunk` 与内部局部 epoch | 对外 chunk ID 和绝对 latent 范围连续；第二次切换后内部仍从 target block 8 继续 | CPU 已覆盖；三例单次切换完整解码通过，真实连续两次切换待测 |
 | epoch 几何正确 | 检查固定 5 个 latent 的 row/block/position 及后续长度 | prefix 形成完整 `1+2+2`，下一 target 为 3 latent，随后为 2 latent | CPU 已通过（见 12.2） |
 | bridge 相位切换 | 已缓存 source latent 时请求连续 `...,3,3` 两块 | 第二个 3-latent 块跨旧边界取值，但绝对 latent、像素和 provenance 无重叠或丢失 | CPU 已通过（见 12.2） |
-| chunk 配置不匹配 | 使用 `[3,7]+split`、`[1,2,7]`、`[1,2,2]` 或未 split 的 `[3,2]` 创建会话 | 显式关闭时普通会话可创建；启用时（包括默认值）明确拒绝 | CPU 已覆盖 |
+| chunk 配置不匹配 | 使用 `[3,7]+split`、`[1,2,7]`、`[1,2,2]` 或未 split 的 `[3,2]` 创建会话 | realtime 会话初始化明确拒绝 | CPU 已覆盖 |
 | prefix 长度不匹配 | 配置 `prompt_switch_prefix_latent_frames` 为非 5 值启动 | config/session 初始化明确拒绝 | CPU 已覆盖 |
 | prompt 超过 pool 预算 | 16-row pool 收到 40-row 更新；另测文本+reference 的总计边界 | 拒绝新事件且 KV/RNG/storage 不变；继续超过第 18 块；恰好 16 rows 的后续候选可生效 | 本次新增 CPU 回归，执行结果见下文 |
 | condition 失败可恢复 | 注入 condition worker 错误 | 返回非 fatal notice，已有输出仍携带原 event/version | 既有 RPC contract 已覆盖 |
@@ -498,7 +496,7 @@ prefix clean commit。计划在固定 checkpoint、分辨率、seed、source 和
 | 6 | `sampling.py`：`rebuild_prompt_prefix` | 是否只重建新 condition 和 5-latent prefix，并保留 pooled storage |
 | 7 | `_sampling_helpers.py`：`_commit_clean_prefix` | 已知 latent 是否走合法 active/final cache 事务，不经过 denoise/scheduler |
 | 8 | `zing_h3_cache.py`：`ZingH3KVCache.clear`、`prepare_chunk`、`update` | pooled storage 是否复用，事务顺序和 window 是否仍合法 |
-| 9 | `server_args.py` 与 Zing pipeline config | 默认是否为 5、显式 `null` 是否保留旧路径、其他数值是否拒绝，并正确计入 session/KV 预算 |
+| 9 | `server_args.py` 与 Zing pipeline config | 默认是否为 5、显式 `null` 和其他数值是否拒绝，并正确计入 session/KV 预算 |
 | 10 | realtime admission 与 session cleanup 路径 | 第二会话拒绝、断连/取消/故障/EOS 释放是否保持单活跃会话契约 |
 | 11 | 对应 unit/integration/GPU 测试 | event、RNG、latent、显存和失败路径是否有真实证据 |
 
@@ -582,3 +580,26 @@ prefix clean commit。计划在固定 checkpoint、分辨率、seed、source 和
   和 `status.json`；源代码为 `4e24d76e` 加本次补丁。
 - 本地 Python 语法、仓库选择的 Ruff 规则、Ruff format、isort 和 `git diff --check` 通过。
   本次未新增 GPU 推理或性能测试，不以 CPU 回归替代画质及分布式验收。
+
+
+## 普通 block realtime 的统一执行方式
+
+普通 block realtime 保留首次请求一次性生成的整段初始噪声，以及解码所需的全局输出
+latent 张量。`ZingH3BlockSession` 按共享会话的 `next_chunk_size` 取下一段已有噪声和
+可选的已编码 source，交给 `SourceReadySession` 执行，再把结果写回原输出位置。它不
+重新抽取每块噪声，也不把局部 epoch 的 latent 位置当成全局输出位置。
+
+两种 realtime 入口均保留首次条件/参考 token 的 prefill。后续 prompt 先进入 pending，
+满 5 个已生成 target latent 后重建；重建不重新去噪这 5 个 latent，也不重复解码输出。
+普通 block 入口只发布实际生效的 prompt event/version；相同候选更新事件号不重复编码，
+较新候选失败或用户退回当前 prompt 时丢弃过时 pending。模型执行失败可以终止会话。
+
+已删除临时 donor、保留旧 KV 的 `update_condition` / `replace_prefix`、donor 专用分配
+投票和释放逻辑。首次 prefill、通用 SP 边界共识、会话槽 lease 与槽容量规划继续保留。
+block 入口没有 source transport 消费回执，不伪造 pixel provenance；只有实际 source
+入口提交经过校验的 source/provenance，沿用原有 consumed/输出依赖记录。
+
+普通 block 的实际块数可能因重复切换而少于初始 chunk plan 的块数。worker 在结果
+`usage.zing_realtime_state` 中返回实际完成标志与下一块大小，API adapter 据此结束调度，
+不能在正式会话已释放后继续按旧 `max_chunks` 再发一块。用户主动设置的较小块数上限
+仍然保留。

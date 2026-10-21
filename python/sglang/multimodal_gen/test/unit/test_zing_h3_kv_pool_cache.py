@@ -56,14 +56,14 @@ def _sampler(model):
     return sampler
 
 
-def _storage(model, rows, heads=None):
+def _storage(model, rows, heads=None, dtype=torch.bfloat16):
     arch = model.arch
     return allocate_layer_stores(
         rows,
         num_layers=len(model.blocks),
         local_heads=heads or arch.num_attention_heads,
         head_dim=arch.attention_head_dim,
-        dtype=torch.bfloat16,
+        dtype=dtype,
         device=torch.device("cpu"),
     )
 
@@ -73,14 +73,10 @@ def _pointers(storage):
 
 
 @torch.no_grad()
-def _generate(sampler, inputs, visual, storage=None, prompts=()):
+def _generate(sampler, inputs, visual, storage=None):
     state = sampler.initialize(inputs, visual.clone(), storage=storage)
-    prompts = list(prompts)
     while state.index < len(state.spans):
         sampler.step(state)
-        if prompts and state.index == 2:
-            inputs.positive = prompts.pop(0)
-            sampler.update_condition(state, inputs)
     stats, cache = dict(state.cache.stats), state.cache
     result = state.visual.clone()
     state.close()
@@ -119,52 +115,6 @@ def test_slot_is_reused_by_larger_then_smaller_then_larger_sessions(model):
         assert torch.equal(actual, expected)
         assert stats["store_allocations"] == stats["rotated_allocations"] == 0
     assert _pointers(storage) == pointers
-
-
-@torch.no_grad()
-@pytest.mark.parametrize("lengths", [(7, 2), (4, 2), (2, 9)])
-def test_prompt_update_shifts_history_inside_the_slot(model, lengths, monkeypatch):
-    # A prefix row-count change smaller than a chunk overlaps the move; it must
-    # be staged inside the slot, never through a request-time allocation.
-    replace_in_place = ZingH3KVCache._replace_prefix_in_place
-    shifts = []
-
-    def no_allocation(*args, **kwargs):
-        raise AssertionError("pooled prefix replacement allocated a tensor")
-
-    def guarded(self, prefix, old_rows, new_rows):
-        shifts.append(new_rows - old_rows)
-        with monkeypatch.context() as scope:
-            for name in ("clone", "new_empty", "new_zeros", "contiguous"):
-                scope.setattr(torch.Tensor, name, no_allocation)
-            for name in ("empty", "empty_like", "zeros", "zeros_like", "cat"):
-                scope.setattr(torch, name, no_allocation)
-            return replace_in_place(self, prefix, old_rows, new_rows)
-
-    monkeypatch.setattr(ZingH3KVCache, "_replace_prefix_in_place", guarded)
-    sampler = _sampler(model)
-    torch.manual_seed(3)
-    inputs, visual = _inputs(9), torch.randn(1, 2, 9, 2, 2)
-    prompts = [
-        {
-            "context": torch.randn(n, 12).bfloat16(),
-            "row_role": torch.zeros(n, dtype=torch.long),
-        }
-        for n in lengths
-    ]
-    original = inputs.positive
-    expected, _, _ = _generate(sampler, inputs, visual, prompts=prompts[:1])
-    inputs.positive = original
-    storage = _storage(model, 64)
-    pointers = _pointers(storage)
-    sampler.prefix_workspace = _storage(model, 16)
-    workspace = _pointers(sampler.prefix_workspace)
-    actual, stats, _ = _generate(sampler, inputs, visual, storage, prompts[:1])
-    assert torch.equal(actual, expected)
-    assert shifts == [lengths[0] - 3]  # +1 and -1 overlap their own chunk
-    assert stats["store_allocations"] == stats["rotated_allocations"] == 0
-    assert _pointers(storage) == pointers
-    assert _pointers(sampler.prefix_workspace) == workspace
 
 
 @torch.no_grad()

@@ -23,6 +23,8 @@ class ZingH3RealtimeControlState:
     latent_frames: int = 0
     pending_prompt: tuple[str, int | None] | None = None
     event_id: int | None = None
+    complete: bool = False
+    next_chunk_size: int | None = None
 
 
 class ZingH3RealtimeAdapter(BaseRealtimeModelAdapter):
@@ -157,6 +159,10 @@ class ZingH3RealtimeAdapter(BaseRealtimeModelAdapter):
 
     def get_chunk_size(self, session, server_args, chunk):
         state = session.adapter_state
+        if state.complete:
+            raise ValueError("The video session is complete.")
+        if state.next_chunk_size is not None:
+            return state.next_chunk_size
         planned = state.chunk_plan.chunk(chunk.index, state.latent_frames)
         if planned is None:
             raise ValueError("The video session is complete.")
@@ -201,7 +207,24 @@ class ZingH3RealtimeAdapter(BaseRealtimeModelAdapter):
     def get_realtime_event_id(self, session):
         return session.adapter_state.event_id
 
+    def on_chunk_complete(self, session, result):
+        super().on_chunk_complete(session, result)
+        progress = (result.usage or {}).get("zing_realtime_state")
+        if progress is not None:
+            state = session.adapter_state
+            state.complete = progress["complete"]
+            state.next_chunk_size = progress["next_chunk_size"]
+            if state.complete:
+                # Rolling epochs can finish in fewer blocks than the initial
+                # checkpoint plan. Stop before dispatching into a closed worker.
+                session.request.max_chunks = min(
+                    session.request.max_chunks or session.generate_chunk_cnt,
+                    session.generate_chunk_cnt,
+                )
+
     def clear_state(self, session):
+        session.adapter_state.complete = False
+        session.adapter_state.next_chunk_size = None
         session.adapter_state.pending_prompt = None
         session.adapter_state.event_id = None
 

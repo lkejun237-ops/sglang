@@ -16,7 +16,9 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_minimax_h3_euler
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_zing_h3_causal_renoise import (
     ZingH3CausalRenoiseSchedule,
 )
-from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import ZingKVCapacityError
+from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+    ZingKVCapacityError,
+)
 from sglang.multimodal_gen.runtime.realtime.zing_window import ZingWindowPolicy
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.multimodal_gen.runtime.utils.zing_diagnostics import current_diagnostic
@@ -128,8 +130,6 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             schedule(video_shift),
             schedule(audio_shift),
         )
-        # Preallocated donor storage for prompt updates of pooled sessions.
-        self.prefix_workspace = None
 
     @property
     def window_eviction_timing(self):
@@ -192,22 +192,6 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             device=self.device,
             schedule=schedule,
             embedder=self.generator.time_embedder,
-        )
-
-    def prefix_donor_cache(self):
-        """Cache that computes a replacement prefix before replace_prefix.
-
-        Pooled sessions borrow the worker's prefix workspace, so a prompt
-        update never allocates K/V outside the pool budget. The donor is
-        cleared right after its prefix is copied into the session slot.
-        """
-        return ZingH3KVCache(
-            len(self.generator.blocks),
-            window_policy=self.window_policy,
-            window_eviction_timing=self.window_eviction_timing,
-            rope_position_mode=self.rope_position_mode,
-            rope_max_frame_gap=self.rope_max_frame_gap,
-            storage=self.prefix_workspace,
         )
 
     def rebuild_prompt_prefix(self, inputs, condition, visual_prefix, cache):
@@ -350,96 +334,7 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         )
 
     @torch.no_grad()
-    def update_condition(self, state, inputs):
-        """Replace prefix at a boundary; any failure closes the sampling state."""
-        try:
-            self._update_condition(state, inputs)
-        except BaseException:
-            state.close()
-            raise
-
-    def _prepare_condition_layout(self, state, inputs):
-        if (
-            state.closed
-            or state.cache.active is not None
-            or state.cache.pending_source is not None
-        ):
-            raise ValueError("Zing conditioning requires a completed block boundary")
-        layout = self.processor.pack_inference_layout(
-            inputs, inputs.positive, state.visual, state.audio
-        )
-        if self._block_spans(layout, inputs.visual_shape) != state.spans:
-            raise ValueError("Zing prompt update changed target geometry")
-        # Anchor the end of the new prompt to the original media origin so
-        # absolute positions of committed and future video rows never move.
-        old_target = state.positive["block_idx"] > 0
-        new_target = layout["block_idx"] > 0
-        shift = (
-            state.positive["position_ids"][old_target][0, 0]
-            - layout["position_ids"][new_target][0, 0]
-        )
-        layout["position_ids"][:, 0] += shift
-        if not torch.allclose(
-            layout["position_ids"][new_target],
-            state.positive["position_ids"][old_target],
-            rtol=0,
-            atol=1e-10,
-        ):
-            raise ValueError("Zing prompt update changed absolute target positions")
-        # Reuse the original values exactly, including fractional frame positions.
-        layout["position_ids"][new_target] = state.positive["position_ids"][old_target]
-        return layout
-
-    def _update_condition(self, state, inputs):
-        if state.index < len(state.spans):
-            source, target, _, _ = state.spans[state.index]
-        else:
-            # A completed session may still replace conditioning, but has no
-            # next source/target rows requiring scratch capacity.
-            source, target = -1, state.cache.last_block + 2
-        layout, prepare_error = None, None
-        try:
-            layout = self._prepare_condition_layout(state, inputs)
-        except BaseException as error:
-            prepare_error = error
-        if self._delayed_policy_requires_agreement:
-            # Successful and failed preparation must join the same first vote.
-            # Its layout comes from the unchanged state, never a partial donor.
-            self._agree_sp_boundary(
-                state.cache,
-                target,
-                phase="condition_prepare",
-                precheck_error=prepare_error is not None,
-                local_error=prepare_error,
-                layout_signature=self._collective_layout_signature(
-                    state.positive, source, target
-                ),
-            )
-        if prepare_error is not None:
-            raise prepare_error
-        self._precheck_replacement_prefix(state.cache, layout, source, target)
-        adaln_lease = self._admit_adaln(
-            layout, state.negative, state.spans, state.audio
-        )
-        prefix_cache = None
-        try:
-            prefix_cache = self.prefix_donor_cache()
-            if bool((layout["block_idx"] == 0).any()):
-                self._forward(
-                    self._select_block(layout, 0, phase="prefix", video_t=1, audio_t=1),
-                    prefix_cache,
-                    "prefix",
-                )
-            state.cache.replace_prefix(prefix_cache.prefix)
-            state.positive = layout
-        finally:
-            if prefix_cache is not None:
-                prefix_cache.clear()
-            if adaln_lease is not None:
-                adaln_lease.close()
-
-    @torch.no_grad()
-    def step(self, state, *, inputs=None):
+    def step(self, state):
         """Denoise one block; any execution failure closes the sampling state."""
         if state.closed or state.index >= len(state.spans):
             raise ValueError("Zing sampling state is closed or complete")
@@ -450,11 +345,7 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         self.device = visual.device
         source, target, start, end = state.spans[state.index]
         try:
-            if inputs is not None and self._delayed_policy_requires_agreement:
-                self.update_condition(state, inputs)
             self._begin_chunk(cache, state.positive, source, target)
-            if inputs is not None and not self._delayed_policy_requires_agreement:
-                self.update_condition(state, inputs)
             history_rows = sum(c.positions.shape[0] for c in cache._history())
             with maybe_record_function(
                 f"Zing.causal_block{target}.latent{start}-{end}.history_rows{history_rows}"
@@ -739,9 +630,7 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             if not payload["capacity_ok"]:
                 raise ZingKVCapacityError("Zing fixed KV slot capacity exceeded")
             if precheck_error:
-                raise ValueError(
-                    "Zing prefix workspace capacity is insufficient for the replacement"
-                )
+                raise ValueError("Zing boundary preparation failed")
             return joint_eligible
         votes = [payload]
         if world > 1:
@@ -776,28 +665,15 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             else all(vote["joint_eligible"] for vote in votes)
         )
 
-    def _precheck_replacement_prefix(self, cache, pos, source, target):
-        """Agree donor layout and the replacement-plus-step peak before forward.
-
-        Existing stored rows already include the old prefix. Its signed delta
-        replaces that occupancy; current source/target rows add step0 scratch.
-        The donor uses an independent workspace and must fit on every rank.
-        """
+    def _precheck_initial_prefix(self, cache, pos, source, target):
+        """Agree empty-cache prefix and first-step capacity before prefill."""
         blocks = self._layout_index(pos).host["block_idx"]
-        prefix_rows = int((blocks == 0).sum())
-        old_prefix_rows = 0 if cache.prefix is None else cache.prefix.positions.shape[0]
-        scratch_rows = int(((blocks == source) | (blocks == target)).sum())
-        workspace = self.prefix_workspace
-        workspace_ok = workspace is None or (
-            len(workspace) == len(self.generator.blocks)
-            and all(layer.rows >= prefix_rows for layer in workspace)
-        )
+        rows = int(((blocks == 0) | (blocks == source) | (blocks == target)).sum())
         self._agree_sp_boundary(
             cache,
             target,
-            phase="prefix_replace",
-            required_rows=max(prefix_rows - old_prefix_rows + scratch_rows, 0),
-            precheck_error=not workspace_ok,
+            phase="prefix_initialize",
+            required_rows=rows,
             layout_signature=self._collective_layout_signature(pos, source, target),
         )
 

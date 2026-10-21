@@ -5,8 +5,8 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import statistics
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -94,39 +94,24 @@ def validate_transactions(core, k, v):
         run("prefix", 0, 3)
         evictions = 0
         for chunk in range(70):
+            target = caches[0].last_block + 2
             for cache in caches:
                 before = len(cache.committed)
-                cache.prepare_chunk(2 * (chunk + 1))
+                cache.prepare_chunk(target)
                 if len(cache.committed) < before:
                     evictions += 1
-            run("source", 2 * chunk + 1, 7)
-            run("active", 2 * chunk + 2, 5 if chunk == 69 else 7)
-            run("active", 2 * chunk + 2, 5 if chunk == 69 else 7)
-            run("final", 2 * chunk + 2, 5 if chunk == 69 else 7)
+            run("source", target - 1, 7)
+            run("active", target, 5 if chunk == 69 else 7)
+            run("active", target, 5 if chunk == 69 else 7)
+            run("final", target, 5 if chunk == 69 else 7)
             if chunk == 30:
                 for cache in caches:
-                    donor = ZingH3KVCache(
-                        1,
-                        window_policy=ZingWindowPolicy(window, sink),
-                        rope_position_mode=mode,
-                    )
-                    pos = torch.zeros(4, 3, device=k.device)
-                    pos[:, 1] = torch.arange(4, device=k.device)
-                    keys = k[:4].clone()
-                    if donor.single_store:
-                        keys = core._apply_rope(keys, coefficients(pos))
-                    donor.update(
-                        pos,
-                        torch.zeros(4, device=k.device, dtype=torch.long),
-                        "prefix",
-                        0,
-                        ((keys, v[:4].clone()),),
-                    )
-                    cache.replace_prefix(donor.prefix)
-                    donor.clear()
+                    cache.clear()
+                    assert cache.positions() is None and not list(cache.owned_tensors())
+                run("prefix", 0, 4)
         assert window is None or evictions // 2 >= 3
         for cache in caches:
-            cache.prepare_chunk(142)
+            cache.prepare_chunk(cache.last_block + 2)
             pos = torch.zeros(7, 3, device=k.device)
 
             def fail(*args):
@@ -152,10 +137,10 @@ def validate_transactions(core, k, v):
                 window=window,
                 sink=sink,
                 mode=mode,
-                transactions=281,
+                transactions=282,
                 evictions_per_variant=evictions // 2,
                 bitwise=True,
-                prefix_replaced=True,
+                prefix_rebuilt=True,
                 failure_cleanup=True,
             )
         )
@@ -183,11 +168,11 @@ def main():
     initialize_model_parallel(
         sequence_parallel_degree=world, ulysses_degree=world, ring_degree=1
     )
+    from sglang.kernels.ops.diffusion.rope import zing_rope_kv_write as kernel
     from sglang.multimodal_gen.runtime.layers.usp import (
         _usp_input_all_to_all_varlen_qkv,
     )
     from sglang.multimodal_gen.runtime.models.dits import minimax_h3 as m
-    from sglang.kernels.ops.diffusion.rope import zing_rope_kv_write as kernel
 
     args.output.mkdir(parents=True, exist_ok=True)
     result = dict(

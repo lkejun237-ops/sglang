@@ -78,6 +78,7 @@ def test_plan_rejects_invalid_metadata(value):
 def _long_request(model, lengths, frames=12):
     packer, inputs, _, _ = request(model)
     packer.num_frame_per_block = lengths
+    packer.split_first_latent = packer.num_frame_per_block == [3, 2]
     inputs.visual_shape = (frames, 2, 2)
     inputs.source_visual = torch.randn(1, 2, frames, 2, 2)
     noise = torch.randn_like(inputs.source_visual)
@@ -87,11 +88,10 @@ def _long_request(model, lengths, frames=12):
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("lengths", [5, [1, 2, 2]])
 @pytest.mark.parametrize("solver", ["euler", "few_step"])
 @pytest.mark.parametrize("guidance", [1, 2])
-def test_ready_chunks_match_full_history_frozen_noise(model, lengths, solver, guidance):
-    packer, inputs, noise, audio = _long_request(model, lengths)
+def test_ready_chunks_match_full_history_frozen_noise(model, solver, guidance):
+    packer, inputs, noise, audio = _long_request(model, [3, 2])
     inputs.conditions = [{"content_id": "ref", "role": "reference"}]
     inputs.media = [{"id": "ref", "type": "video"}]
     inputs.visual = {"ref": torch.randn(1, 2, 2, 2, 2)}
@@ -195,7 +195,7 @@ def test_sampling_failure_closes_state_and_rejects_retry(model, monkeypatch, pha
 
         monkeypatch.setattr(sampler, "_sample_block", fail_after)
     with pytest.raises(RuntimeError, match="Injected"):
-        sampler.step(state, inputs=changed)
+        sampler.step(state)
     assert state.closed
     assert state.visual is state.audio is state.positive is state.negative is None
     assert state.cache.history(0) is None
@@ -208,7 +208,7 @@ def test_sampling_failure_closes_state_and_rejects_retry(model, monkeypatch, pha
 
 @torch.no_grad()
 def test_ready_queue_ownership_budget_prompt_eos(model):
-    packer, inputs, noise, _ = _long_request(model, [1, 2, 2], frames=4)
+    packer, inputs, noise, _ = _long_request(model, [3, 2], frames=4)
     sampler = ZingH3Sampler(
         model, packer, solver="few_step", denoising_step_list=[1000, 500]
     )
@@ -237,15 +237,15 @@ def test_ready_queue_ownership_budget_prompt_eos(model):
         context=torch.randn(5, 12).bfloat16(), row_role=torch.zeros(5, dtype=torch.long)
     )
     session.update_prompt(context, 42)
-    frozen = session.prompt.condition["context"].clone()
+    frozen = session.pending_prompt.condition["context"].clone()
     context["context"].zero_()
     result = session.step()
-    assert result.prompt_event_id == 42
+    assert result.prompt_event_id is None
     assert result.provenance.pixels == second_provenance.pixels
     assert (
         result.provenance.source_dependency_end == 20
     )  # Prior full-history dependency.
-    assert torch.equal(session.applied_prompt.condition["context"], frozen)
+    assert torch.equal(session.pending_prompt.condition["context"], frozen)
     assert result.chunk.chunk_id == 1 and result.chunk.start == 1
     session.update_prompt(context, 99)
     session.append(
@@ -255,7 +255,7 @@ def test_ready_queue_ownership_budget_prompt_eos(model):
         final=True,
     )
     final = session.step()
-    assert final.chunk.end == 4 and final.prompt_event_id == 99
+    assert final.chunk.end == 4 and final.prompt_event_id is None
     assert session.closed and session.cache.history(0) is None
     assert session.complete
     with pytest.raises(ValueError):
@@ -350,23 +350,16 @@ def test_prompt_switch_waits_for_five_latents_then_rebuilds_latest_epoch(
 def test_prompt_switch_rejects_unsupported_prefix_geometry(model):
     packer, inputs, _, _ = _long_request(model, 5, frames=5)
     sampler = ZingH3Sampler(model, packer, sigma_points=2)
-    disabled = SourceReadySession(
-        sampler,
-        inputs,
-        seed=1,
-        max_pending_chunks=1,
-        max_pending_bytes=1024,
-    )
-    disabled.dispose()
-    with pytest.raises(ValueError, match="only supports 5"):
-        SourceReadySession(
-            sampler,
-            inputs,
-            seed=1,
-            max_pending_chunks=1,
-            max_pending_bytes=1024,
-            prompt_switch_prefix_latent_frames=4,
-        )
+    for value in (None, 4, True):
+        with pytest.raises(ValueError, match="only supports 5"):
+            SourceReadySession(
+                sampler,
+                inputs,
+                seed=1,
+                max_pending_chunks=1,
+                max_pending_bytes=1024,
+                prompt_switch_prefix_latent_frames=value,
+            )
     with pytest.raises(ValueError, match="chunk plan of 1,2,2"):
         SourceReadySession(
             sampler,
@@ -400,7 +393,8 @@ def test_prompt_switch_rejects_clipped_or_wrong_phase_plans(model, lengths, spli
 @torch.no_grad()
 @pytest.mark.parametrize("window", [None, 21])
 def test_32_ready_chunks_pause_finite_eos_and_cancel(model, window):
-    packer, inputs, noise, _ = _long_request(model, [1, 2, 2], frames=53)
+    total = ChunkPlan([3, 2], True).chunk(31).end
+    packer, inputs, noise, _ = _long_request(model, [3, 2], frames=total)
     sampler = ZingH3Sampler(
         model,
         packer,
@@ -413,8 +407,8 @@ def test_32_ready_chunks_pause_finite_eos_and_cancel(model, window):
         inputs,
         seed=1,
         max_pending_chunks=1,
-        max_pending_bytes=128,
-        total_latent_frames=53,
+        max_pending_bytes=192,
+        total_latent_frames=total,
     )
     before = torch.get_rng_state().clone()
     assert session.step() is None and session.rng.cpu_rng is None
@@ -422,11 +416,11 @@ def test_32_ready_chunks_pause_finite_eos_and_cancel(model, window):
     with pytest.raises(ValueError, match="before"):
         session.finish()
     previous_kv = 0
-    for chunk in packer.chunk_plan.chunks(53):
+    for chunk in packer.chunk_plan.chunks(total):
         session.append(
             inputs.source_visual[:, :, chunk.start : chunk.end],
             noise[:, :, chunk.start : chunk.end],
-            provenance=fixture_provenance(7, 60, chunk.start, chunk.end),
+            provenance=fixture_provenance(7, total + 7, chunk.start, chunk.end),
         )
         output = session.step()
         assert output.chunk == chunk
@@ -458,7 +452,7 @@ def test_32_ready_chunks_pause_finite_eos_and_cancel(model, window):
         inputs,
         seed=1,
         max_pending_chunks=1,
-        max_pending_bytes=128,
+        max_pending_bytes=192,
     )
     fresh.append(
         inputs.source_visual[:, :, :1],
@@ -471,19 +465,19 @@ def test_32_ready_chunks_pause_finite_eos_and_cancel(model, window):
 
 @torch.no_grad()
 def test_ready_queue_rejects_byte_overflow_and_invalid_tail_without_mutation(model):
-    packer, inputs, noise, _ = _long_request(model, 5, frames=6)
+    packer, inputs, noise, _ = _long_request(model, [3, 2], frames=6)
     session = SourceReadySession(
         ZingH3Sampler(model, packer, sigma_points=2),
         inputs,
         seed=1,
         max_pending_chunks=2,
-        max_pending_bytes=64,
+        max_pending_bytes=32,
         total_latent_frames=6,
     )
     with pytest.raises(ValueError, match="next checkpoint chunk"):
         session.append(
-            inputs.source_visual[:, :, :1],
-            noise[:, :, :1],
+            inputs.source_visual[:, :, :2],
+            noise[:, :, :2],
             provenance=fixture_provenance(1, 6),
         )
     with pytest.raises(ValueError, match="finite latent target"):
@@ -495,9 +489,9 @@ def test_ready_queue_rejects_byte_overflow_and_invalid_tail_without_mutation(mod
         )
     with pytest.raises(ValueError, match="full"):
         session.append(
-            inputs.source_visual[:, :, :5],
-            noise[:, :, :5],
-            provenance=fixture_provenance(1, 6, 0, 5),
+            inputs.source_visual[:, :, :1],
+            noise[:, :, :1],
+            provenance=fixture_provenance(1, 6, 0, 1),
         )
     assert (
         session.next_latent
@@ -519,7 +513,7 @@ def test_unknown_duration_cannot_be_enumerated_as_a_finite_plan():
 def test_interleaved_sessions_preserve_post_noise_rng(model):
     sessions, expected, outputs = [], [], [[], []]
     for seed in (43, 97):
-        packer, inputs, noise, _ = _long_request(model, [1, 2, 2], frames=6)
+        packer, inputs, noise, _ = _long_request(model, [3, 2], frames=6)
         options = dict(solver="few_step", denoising_step_list=[1000, 750, 500, 250])
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(seed)
@@ -569,7 +563,7 @@ def test_interleaved_sessions_preserve_post_noise_rng(model):
 def test_ready_session_failure_releases_all_state_and_preserves_caller_rng(
     model, monkeypatch, phase
 ):
-    packer, inputs, noise, _ = _long_request(model, [1, 2, 2], frames=4)
+    packer, inputs, noise, _ = _long_request(model, [3, 2], frames=4)
     sampler = ZingH3Sampler(
         model, packer, solver="few_step", denoising_step_list=[1000, 500]
     )
@@ -581,18 +575,20 @@ def test_ready_session_failure_releases_all_state_and_preserves_caller_rng(
         noise[:, :, :1],
         provenance=fixture_provenance(91, 20),
     )
-    session.step()
+    if phase != "prefix":
+        session.step()
     session.append(
         inputs.source_visual[:, :, 1:3],
         noise[:, :, 1:3],
         provenance=fixture_provenance(92, 20, 1, 3),
     )
-    session.append(
-        inputs.source_visual[:, :, 3:4],
-        noise[:, :, 3:4],
-        provenance=fixture_provenance(93, 21, 3, 4),
-        final=True,
-    )
+    if phase != "prefix":
+        session.append(
+            inputs.source_visual[:, :, 3:4],
+            noise[:, :, 3:4],
+            provenance=fixture_provenance(93, 21, 3, 4),
+            final=True,
+        )
     session.update_prompt(inputs.positive, 42)
     original = sampler._forward
 
@@ -639,20 +635,16 @@ def test_ready_session_failure_releases_all_state_and_preserves_caller_rng(
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("lengths", [5, [1, 2, 2]])
 @pytest.mark.parametrize(
     "failure_phase", [None, "source", "active", "final", "after_commit"]
 )
 @pytest.mark.parametrize("rope_mode", ["absolute", "block_relative"])
 def test_window_ready_matches_finite_or_closes_on_eviction_failure(
-    model, monkeypatch, lengths, failure_phase, rope_mode
+    model, monkeypatch, failure_phase, rope_mode
 ):
     # Both paths use exactly the same policy, never compare different contexts.
-    frames = sum(
-        ChunkPlan(lengths).chunk(i).end - ChunkPlan(lengths).chunk(i).start
-        for i in range(32)
-    )
-    packer, inputs, noise, audio = _long_request(model, lengths, frames)
+    frames = ChunkPlan([3, 2], True).chunk(31).end
+    packer, inputs, noise, audio = _long_request(model, [3, 2], frames)
     options = dict(
         solver="few_step",
         denoising_step_list=[1000, 500],
@@ -753,7 +745,7 @@ def test_incremental_rope_grid_preserves_checkpoint_rounding(model):
 
 @torch.no_grad()
 def test_ready_metadata_budget_is_independent_of_tensor_budget(model):
-    packer, inputs, noise, _ = _long_request(model, 5, frames=5)
+    packer, inputs, noise, _ = _long_request(model, [3, 2], frames=1)
     sampler = ZingH3Sampler(
         model, packer, sigma_points=2, window_chunks=21, sink_chunks=3
     )
@@ -780,48 +772,9 @@ def test_ready_metadata_budget_is_independent_of_tensor_budget(model):
 
 
 @torch.no_grad()
-def test_prompt_change_after_eviction_preserves_sinks_and_absolute_rope(model):
-    packer, inputs, noise, _ = _long_request(model, [1, 2, 2], frames=45)
-    sampler = ZingH3Sampler(
-        model, packer, sigma_points=2, window_chunks=21, sink_chunks=3
-    )
-    session = SourceReadySession(
-        sampler, inputs, seed=9, max_pending_chunks=1, max_pending_bytes=100000
-    )
-    sinks = None
-    origin = None
-    for i, chunk in enumerate(packer.chunk_plan.chunks(45)):
-        if i == 22:
-            sinks = session.cache.committed[:3]
-            origin = session.media_origin
-            condition = {
-                "context": torch.randn(5, 12).bfloat16(),
-                "row_role": torch.tensor([0, 1, 0, 0, 0]),
-            }
-            session.update_prompt(condition, 17)
-        session.append(
-            inputs.source_visual[:, :, chunk.start : chunk.end],
-            noise[:, :, chunk.start : chunk.end],
-            provenance=fixture_provenance(1, chunk.end, chunk.start, chunk.end),
-        )
-        result = session.step()
-        if i >= 22:
-            assert result.prompt_event_id == 17
-            assert session.media_origin == origin
-            assert all(a is b for a, b in zip(sinks, session.cache.committed[:3]))
-            # The temporal origin is anchored despite a different prefix length.
-            assert (
-                session.cache.committed[-1].positions[:, 0].min()
-                == packer._video_t_grid(1, origin, chunk.start)[0]
-            )
-    session.dispose()  # Cancellation after repeated eviction releases history.
-    assert all(value == 0 for value in session.memory_snapshot().values())
-
-
-@torch.no_grad()
 @pytest.mark.parametrize("commit_first", [False, True])
 def test_window_cancelled_eos_is_not_successful_completion(model, commit_first):
-    packer, inputs, noise, _ = _long_request(model, [1, 2, 2], frames=3)
+    packer, inputs, noise, _ = _long_request(model, [3, 2], frames=3)
     session = SourceReadySession(
         ZingH3Sampler(model, packer, sigma_points=2, window_chunks=21, sink_chunks=3),
         inputs,

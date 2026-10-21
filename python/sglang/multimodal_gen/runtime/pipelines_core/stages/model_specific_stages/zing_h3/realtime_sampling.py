@@ -164,14 +164,14 @@ class ZingH3RealtimeSampler(ZingH3Sampler):
         self.last_run_metrics["block_schedules"] = []
         return state
 
-    def step(self, state, *, inputs=None):
+    def step(self, state):
         # The existing step owns cache/condition/error handling. Bind schedules only
         # for this synchronous block, then restore even on cancellation or failure.
         # A sampler belongs to the deployment's single active generation.
         regular = self.video_scheduler, self.audio_scheduler
         self.video_scheduler, self.audio_scheduler = self.schedules_for(state)
         try:
-            return super().step(state, inputs=inputs)
+            return super().step(state)
         finally:
             self.video_scheduler, self.audio_scheduler = regular
 

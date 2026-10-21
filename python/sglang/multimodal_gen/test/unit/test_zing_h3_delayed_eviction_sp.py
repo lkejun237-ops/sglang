@@ -688,7 +688,7 @@ def test_sp4_initialize_rejects_one_rank_prefix_capacity_before_model(
         assert cache._stores == {}
 
 
-def test_sp4_ready_rejects_one_rank_prefix_donor_capacity_before_model(
+def test_sp4_ready_rejects_one_rank_prefix_slot_capacity_before_model(
     four_head_model, monkeypatch
 ):
     from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import ZingH3DiTConfig
@@ -736,6 +736,8 @@ def test_sp4_ready_rejects_one_rank_prefix_donor_capacity_before_model(
 
     monkeypatch.setattr(ZingH3Sampler, "_forward", forward)
     packer, inputs, visual, _ = request(four_head_model, audio=False)
+    packer.num_frame_per_block = [3, 2]
+    packer.split_first_latent = True
     layout = packer.pack_inference_layout(inputs, inputs.positive, visual, None)
     prefix_rows = int((layout["block_idx"] == 0).sum())
     assert prefix_rows > 1
@@ -753,16 +755,8 @@ def test_sp4_ready_rejects_one_rank_prefix_donor_capacity_before_model(
         sampler = ZingH3Sampler(
             rank_models[rank], packer, window_eviction_timing="after_step0"
         )
-        sampler.prefix_workspace = allocate_layer_stores(
-            prefix_rows - 1 if rank == 1 else 128,
-            num_layers=len(four_head_model.blocks),
-            local_heads=1,
-            head_dim=8,
-            dtype=torch.bfloat16,
-            device=torch.device("cpu"),
-        )
         storage = allocate_layer_stores(
-            128,
+            prefix_rows - 1 if rank == 1 else 128,
             num_layers=len(four_head_model.blocks),
             local_heads=1,
             head_dim=8,

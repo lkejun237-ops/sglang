@@ -380,8 +380,6 @@ def test_actual_target_steps_and_new_generation(model, count):  # noqa: F811
         cache = state.cache
         try:
             while state.index < len(state.spans):
-                if state.index == 2:
-                    sampler.update_condition(state, inputs)
                 sampler.step(state)
                 assert state.cache is cache
             assert [
@@ -404,6 +402,8 @@ def test_ready_chunks_use_generation_index(model, count):  # noqa: F811
     from sglang.multimodal_gen.test.unit.test_zing_h3_chunks import fixture_provenance
 
     packer, inputs, _, _ = request(model, audio=False)
+    packer.num_frame_per_block = [3, 2]
+    packer.split_first_latent = True
     packer.num_frame_per_block = [3, 2]
     packer.split_first_latent = True
     inputs.visual_shape = (10, 2, 2)
@@ -788,7 +788,7 @@ def test_static_mixed_matches_resident_and_resets_generation(static_mixed, joint
                 for s, state in zip((baseline, sampler), states):
                     torch.manual_seed(100 + index)
                     # This goes through step's temporary initial-scheduler binding.
-                    s.step(state, inputs=inputs if index == 1 else None)
+                    s.step(state)
                 assert torch.equal(states[0].visual, states[1].visual)
                 assert torch.isfinite(states[1].visual).all()
                 assert_same_kv(states[0].cache, states[1].cache, 2)

@@ -604,7 +604,7 @@ class ZingChunkGraphs:
         # whose prefix plan fails must meet the others at the status vote, never
         # a different chunk-begin collective.
         if prefix:
-            sampler._precheck_replacement_prefix(
+            sampler._precheck_initial_prefix(
                 current.cache, current.positive, source, target
             )
         else:

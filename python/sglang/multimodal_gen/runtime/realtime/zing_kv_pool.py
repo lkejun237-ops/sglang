@@ -60,13 +60,13 @@ class ZingLayerStore:
 def allocate_layer_stores(
     rows, *, num_layers, local_heads, head_dim, dtype, device
 ) -> list[ZingLayerStore]:
-    """Allocate one slot (or the prefix workspace) before readiness."""
+    """Allocate storage for a realtime session slot."""
     _positive_int("rows", rows)
     shape = (rows, local_heads, head_dim)
-    # Zero-filled once at startup: fixed-shape attention may read rows past the
+    # Fixed-shape attention may read rows past the
     # live length, so every unwritten row must be finite (0 * NaN V is NaN).
     # Raw K must expose mutations to per-chunk RoPE cache signatures, even
-    # when startup allocation runs inside inference_mode. No request allocation.
+    # when allocation runs inside inference_mode.
     with torch.inference_mode(False):
         keys = [
             torch.zeros(shape, dtype=dtype, device=device) for _ in range(num_layers)
@@ -371,20 +371,6 @@ class ZingKVPoolPlan:
             * element_size
         )
 
-    def prefix_workspace_bytes(
-        self, *, num_layers, local_heads, head_dim, element_size
-    ):
-        # A prompt update runs the new prefix into a donor cache before the
-        # in-place replacement; that donor needs raw K, V and rotated K.
-        return (
-            ZING_KV_POOL_TENSORS_PER_ROW
-            * self.config.max_prefix_rows
-            * num_layers
-            * local_heads
-            * head_dim
-            * element_size
-        )
-
     def admit(self, request: ZingKVRequest) -> int:
         """Validate a request against the contract and return its peak rows.
 
@@ -485,14 +471,9 @@ def _sp_agree(ok: bool) -> bool:
 
 
 class ZingKVPool:
-    """Startup-allocated realtime slots plus one prompt-update prefix workspace.
+    """Startup-allocated realtime session slots, without a resident donor."""
 
-    The worker executes sessions on one serialized compute stream, so one
-    workspace serves every prompt update; it is borrowed only for the donor
-    prefix forward and cleared before the next session step.
-    """
-
-    def __init__(self, plan, slots, workspace, *, agree=_sp_agree):
+    def __init__(self, plan, slots, *, agree=_sp_agree):
         self.plan = plan
         self._pool = RealtimeKVCachePool(
             [
@@ -500,7 +481,6 @@ class ZingKVPool:
                 for i, stores in enumerate(slots)
             ]
         )
-        self.workspace = workspace
         self._agree = agree
 
     @classmethod
@@ -518,8 +498,7 @@ class ZingKVPool:
             allocate_layer_stores(plan.slot_rows, **layout)
             for _ in range(plan.config.pool_size)
         ]
-        workspace = allocate_layer_stores(plan.config.max_prefix_rows, **layout)
-        return cls(plan, slots, workspace, **kwargs)
+        return cls(plan, slots, **kwargs)
 
     @property
     def size(self):
@@ -530,9 +509,7 @@ class ZingKVPool:
         return self._pool.available
 
     def allocated_bytes(self):
-        slots = list(self._pool._slots)
-        workspace = RealtimeKVCachePoolSlot(-1, self.workspace, [])
-        return allocated_cache_bytes(slots), allocated_cache_bytes([workspace])
+        return allocated_cache_bytes(list(self._pool._slots))
 
     def acquire(self, session, request):
         """Admit ``request`` and lease one slot to ``session`` on every rank.

@@ -1144,10 +1144,19 @@ def _run_ready_chunks(
     )
     from sglang.multimodal_gen.test.unit.test_zing_h3_chunks import fixture_provenance
 
-    frames = 1 + 2 * (sum(batches) - 1)
+    packer = ZingH3Packer(
+        model.arch, num_frame_per_block=[3, 2], split_first_latent=True
+    )
+    frames, model_index = 0, 0
+    for batch_index, count in enumerate(batches):
+        if prompt_updates and batch_index in prompt_updates:
+            model_index = 3
+        for _ in range(count):
+            chunk = packer.chunk_plan.chunk(model_index)
+            frames += chunk.end - chunk.start
+            model_index += 1
     torch.manual_seed(input_seed)
     inputs, noise = _inputs(frames), torch.randn(1, 2, frames, 2, 2)
-    packer = ZingH3Packer(model.arch, num_frame_per_block=2)
     extra = {}
     sampler_type = ZingH3Sampler
     if initial_steps is not None:
@@ -1208,48 +1217,61 @@ def _run_ready_chunks(
                     },
                     100 + batch_index,
                 )
-            for _ in range(count):
-                chunk = packer.chunk_plan.chunk(cursor, frames)
-                session.append(
-                    inputs.source_visual[:, :, chunk.start : chunk.end],
-                    noise[:, :, chunk.start : chunk.end],
-                    provenance=fixture_provenance(1, chunk.end, chunk.start, chunk.end),
-                    final=chunk.end == frames,
-                )
-                cursor += 1
-            drain = session.drain_ready()
-            for result in drain:
-                outputs.append(result.visual.clone())
-                events.append(result.prompt_event_id)
-                cache = session.cache
-                live = cache._length
-                snapshots.append(
-                    (
-                        live,
-                        tuple(
-                            (c.block, c.offset, c.positions.clone())
-                            for c in cache.committed
-                        ),
-                        tuple(
-                            (s.k[:live].clone(), s.v[:live].clone()) for s in storage
-                        ),
+            # The first post-update chunk activates the new epoch before lookahead.
+            groups = (
+                (1, count - 1)
+                if prompt_updates and batch_index in prompt_updates
+                else (count,)
+            )
+            for count in groups:
+                for _ in range(count):
+                    start = session.next_latent
+                    end = min(frames, start + session.next_chunk_size)
+                    session.append(
+                        inputs.source_visual[:, :, start:end],
+                        noise[:, :, start:end],
+                        provenance=fixture_provenance(1, end, start, end),
+                        final=end == frames,
                     )
-                )
-                rng_states.append(
-                    None if session.rng.cpu_rng is None else session.rng.cpu_rng.clone()
-                )
-                # A lookahead prediction is raw: its boundary is still open
-                # and its scheduler0 eviction belongs to the next iteration.
-                boundary.append(
-                    (
-                        cache.eviction_target_block,
-                        None if cache.active is None else cache.active[0],
+                    cursor += 1
+                drain = session.drain_ready()
+                for result in drain:
+                    outputs.append(result.visual.clone())
+                    events.append(result.prompt_event_id)
+                    cache = session.cache
+                    live = cache._length
+                    snapshots.append(
+                        (
+                            live,
+                            tuple(
+                                (c.block, c.offset, c.positions.clone())
+                                for c in cache.committed
+                            ),
+                            tuple(
+                                (s.k[:live].clone(), s.v[:live].clone())
+                                for s in storage
+                            ),
+                        )
                     )
-                )
-                if yield_hook is not None:
-                    yield_hook(session, drain, len(outputs))
-                if session.closed and not session.complete:
-                    cancelled = True
+                    rng_states.append(
+                        None
+                        if session.rng.cpu_rng is None
+                        else session.rng.cpu_rng.clone()
+                    )
+                    # A lookahead prediction is raw: its boundary is still open
+                    # and its scheduler0 eviction belongs to the next iteration.
+                    boundary.append(
+                        (
+                            cache.eviction_target_block,
+                            None if cache.active is None else cache.active[0],
+                        )
+                    )
+                    if yield_hook is not None:
+                        yield_hook(session, drain, len(outputs))
+                    if session.closed and not session.complete:
+                        cancelled = True
+                        break
+                if cancelled:
                     break
             if cancelled:
                 break
@@ -1528,6 +1550,8 @@ def test_source_ready_graph_eligibility_is_agreed_before_execution(model, monkey
         comm.thread.rank = rank
         rank_model = rank_models[rank]
         packer = ZingH3Packer(rank_model.arch, num_frame_per_block=2)
+        packer.num_frame_per_block = [3, 2]
+        packer.split_first_latent = True
         sampler = ZingH3Sampler(
             rank_model,
             packer,
@@ -1706,6 +1730,8 @@ def test_init_prefix_prepare_failure_agrees_before_next_collective(model, monkey
         graphs.coordinator = Coordinator()
         rank_models[rank].chunk_graphs = graphs
         packer = ZingH3Packer(model.arch, num_frame_per_block=2)
+        packer.num_frame_per_block = [3, 2]
+        packer.split_first_latent = True
         sampler = ZingH3Sampler(
             rank_models[rank],
             packer,
@@ -2010,7 +2036,7 @@ def test_whole_chunk_sp_opt_out_streaming_never_captures(model, monkeypatch, wor
         assert backend.captures == 0, actual[4].routes
         assert not actual[4].graphs
         assert not any(route == "replay" for _, route in actual[4].routes)
-        assert actual[0].shape[2] == 33
+        assert actual[0].shape[2] == 40  # Seventeen native 1,2,2,3,2,... chunks.
 
     with ThreadPoolExecutor(max_workers=world) as executor:
         futures = [executor.submit(worker, rank) for rank in range(world)]

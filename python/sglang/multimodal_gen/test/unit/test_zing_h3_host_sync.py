@@ -285,21 +285,6 @@ def _prefixed_cache(rope_position_mode="block_relative"):
 
 
 @torch.no_grad()
-def test_replaced_prefix_keeps_its_host_copy():
-    """A prefix adopted from the prefix workspace must not force the device path."""
-    donor = _prefixed_cache()
-    session = ZingH3KVCache(1, rope_position_mode="block_relative")
-    session.replace_prefix(donor.prefix)
-    assert torch.equal(session.prefix.host_positions, donor.prefix.host_positions)
-    assert session.prefix.host_positions is not donor.prefix.host_positions
-    current = torch.tensor([[9.0, 0, 0]])
-    mapped, history = session.attention_positions(
-        device_only(current), host_current=current.clone()
-    )
-    assert type(mapped) is torch.Tensor and type(history) is torch.Tensor
-
-
-@torch.no_grad()
 def test_owned_tensors_include_host_position_copies():
     cache = _prefixed_cache()
     owned = [id(t) for t in cache.owned_tensors()]

@@ -57,7 +57,7 @@ result = session.step()  # 没有就绪输入时返回 None，不消耗 RNG，�
 - `step` 执行异常后关闭会话，释放全部 KV、ready 队列、prompt 和会话 RNG，禁止重试或继续该会话；包括打包、prefix、source、denoise、final commit 后异常。没有为原样重试保存 latent/layout/KV/RNG 快照。正常执行仍隔离各会话随机流，避免影响其他请求。外部协议 ACK/decoder append 仍由 #114 协调。
 - 输出依赖水位取已提交历史与当前 source 实际依赖的最大值，不能使用 latest accepted。像素区间完全由 #111/#112 bridge 提供，worker 不做 `latent_index * 4` 推算。
 - 正常 EOS 排空后自动释放 session 引用；取消/终止性错误调用幂等 `dispose()`。调用方持有的结果和原始 fixture 不属于 session，不会被它释放。
-- legacy `sampler.step(state, inputs=updated_inputs)` 执行 prefix 更新与下一块采样，执行失败即关闭 sampling state。原来单独的 `update_condition` 保留供边界操作使用。
+- 普通 block realtime 通过 `ZingH3BlockSession` 复用 `SourceReadySession`：prompt 等待满 5 个已生成 latent 后重建条件及 clean KV，不保留旧生成历史 KV。旧的 `step(inputs=...)` 和 `update_condition` 接口已删除；执行失败关闭会话。
 
 增量路径尚需明确两项 RNG 合约：原生 source VAE 在完整 `[B,C,T,H,W]` moments 上分配 posterior noise；
 原生 target 初始噪声同样一次按全 T 张量生成。改成每 clip/chunk 随机生成会改变 channel-major 对应关系。
