@@ -27,17 +27,19 @@ def validate_prompt(prompt, max_prompt_bytes=65536):
 def validate_condition_media(
     media,
     *,
-    max_media=16,
-    max_side=8192,
-    max_input_bytes=512 << 20,
-    max_decoded_pixels=178956970,
+    max_media=None,
+    max_side=None,
+    max_input_bytes=None,
+    max_decoded_pixels=None,
 ):
+    # Resource admission belongs to the API/RPC owner. Identity calculation
+    # validates structure without imposing a second, hidden 512 MiB budget.
     if any(
-        type(n) is not int or n <= 0
+        n is not None and (type(n) is not int or n <= 0)
         for n in (max_media, max_side, max_input_bytes, max_decoded_pixels)
     ):
         _invalid("Media limits must be positive integers")
-    if type(media) is not list or len(media) > min(16, max_media):
+    if type(media) is not list or (max_media is not None and len(media) > max_media):
         _invalid("Media count exceeds the input budget")
     normalized, size, pixels = [], 0, 0
     for item in media:
@@ -58,11 +60,13 @@ def validate_condition_media(
         ):
             _invalid("Conditioning requires CPU uint8 single-frame CTHW RGB")
         h, w = frames.shape[2:]
-        if not 0 < h <= max_side or not 0 < w <= max_side:
+        if min(h, w) <= 0 or (max_side is not None and max(h, w) > max_side):
             _invalid("Media dimensions exceed the input budget")
         size += frames.numel()
         pixels += h * w
-        if size > max_input_bytes or pixels > max_decoded_pixels:
+        if (max_input_bytes is not None and size > max_input_bytes) or (
+            max_decoded_pixels is not None and pixels > max_decoded_pixels
+        ):
             _invalid("Decoded media exceeds the byte or pixel budget")
         fps = item.get("fps", 1.0 if kind == "image" else None)
         if (

@@ -129,7 +129,7 @@ def test_source_ready_schedule_matches_worker_execution(
     monkeypatch.setattr(
         source.BaseRealtimeModelAdapter,
         "prepare_next_request",
-        lambda *a: SimpleNamespace(extra={}),
+        lambda *a: SimpleNamespace(extra={}, block_idx=0),
     )
 
     # A worker's first source command always follows an accepted source append.
@@ -701,7 +701,7 @@ def test_source_custom_plan_matches_dynamic_cache(
     monkeypatch.setattr(
         source.BaseRealtimeModelAdapter,
         "prepare_next_request",
-        lambda *a: SimpleNamespace(extra={}),
+        lambda *a: SimpleNamespace(extra={}, block_idx=0),
     )
     batch = adapter.prepare_next_request(api_session, configured, None)
     command = msgspec.msgpack.decode(msgspec.msgpack.encode(batch.extra))[

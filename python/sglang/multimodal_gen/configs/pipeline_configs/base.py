@@ -809,6 +809,13 @@ class PipelineConfig:
             default=None,
             help="Override the selected pipeline config's resolution setting. Only applies to pipelines that define a resolution field.",
         )
+        parser.add_argument(
+            f"--{prefix_with_dot}zing-reference-max-images",
+            type=int,
+            dest=f"{prefix_with_dot.replace('-', '_')}zing_reference_max_images",
+            default=None,
+            help="Zing: maximum reference images (default 21; 0 disables references). Overrides the pipeline JSON value and derives input/transport capacities.",
+        )
 
         # SANA-WM streaming knobs. default=None so they only apply to pipeline
         # configs that define these fields (e.g. SanaWMPipelineConfig); other

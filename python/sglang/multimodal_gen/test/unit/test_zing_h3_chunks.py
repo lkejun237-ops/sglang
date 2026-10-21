@@ -371,6 +371,91 @@ def test_prompt_switch_rejects_unsupported_prefix_geometry(model):
         )
 
 
+@torch.no_grad()
+@pytest.mark.parametrize("ids", [[], ["old"], ["new", "old"]])
+def test_reference_switch_rebuild_matches_fresh_cache(model, monkeypatch, ids):
+    packer, inputs, noise, _ = _long_request(model, [3, 2], frames=16)
+    packer.split_first_latent = True
+    inputs.conditions = [
+        dict(content_id="old", role="reference", latent_modalities=["visual"])
+    ]
+    inputs.media = [dict(id="old", type="image")]
+    inputs.visual = {"old": torch.zeros(1, 2, 1, 2, 2)}
+    inputs.condition_media = []
+    sampler = ZingH3Sampler(
+        model,
+        packer,
+        solver="few_step",
+        denoising_step_list=[1000, 500],
+        window_chunks=21,
+        sink_chunks=3,
+    )
+    session = SourceReadySession(
+        sampler,
+        inputs,
+        seed=7,
+        max_pending_chunks=1,
+        max_pending_bytes=1024,
+        prompt_switch_prefix_latent_frames=5,
+        initial_prompt_event_id=0,
+    )
+
+    def step():
+        start = session.next_latent
+        end = start + session.next_chunk_size
+        session.append(
+            inputs.source_visual[:, :, start:end],
+            noise[:, :, start:end],
+            provenance=fixture_provenance(1, end, start, end),
+        )
+        return session.step()
+
+    for _ in range(3):
+        assert step().prompt_event_id == 0
+    candidate = copy(inputs)
+    candidate.conditions = [
+        dict(content_id=name, role="reference", latent_modalities=["visual"])
+        for name in ids
+    ]
+    candidate.media = [dict(id=name, type="image") for name in ids]
+    candidate.visual = {name: torch.full((1, 2, 1, 2, 2), 0.75) for name in ids}
+    candidate.source_visual = None
+    rebuild = sampler.rebuild_prompt_prefix
+    checks = []
+
+    def checked(actual_inputs, condition, history, cache):
+        assert actual_inputs is candidate
+        assert session.inputs.visual is inputs.visual  # Publish only after rebuild.
+        before = session.rng.cpu_rng.clone()
+        fresh = session._new_cache(None)
+        expected = rebuild(candidate, condition, history, fresh)
+        actual = rebuild(actual_inputs, condition, history, cache)
+        assert actual == expected
+        for layer in range(len(model.blocks)):
+            for left, right in zip(cache.history(layer), fresh.history(layer)):
+                torch.testing.assert_close(left, right, rtol=0, atol=0)
+        assert torch.equal(before, session.rng.cpu_rng)
+        checks.append(True)
+        fresh.clear()
+        return actual
+
+    monkeypatch.setattr(sampler, "rebuild_prompt_prefix", checked)
+    session.update_prompt(candidate.positive, 1, inputs=candidate)
+    result = step()
+    assert result.prompt_event_id == 1 and result.chunk.start == 5
+    assert checks == [True]
+    assert session.inputs.visual is candidate.visual
+    assert session.inputs.conditions == candidate.conditions
+    assert session.applied_prompt.inputs is candidate
+    assert session.inputs.condition_media is None
+    # A later text-only update keeps the newly committed reference snapshot.
+    monkeypatch.setattr(sampler, "rebuild_prompt_prefix", rebuild)
+    session.update_prompt(inputs.positive, 2)
+    assert step().prompt_event_id == 2
+    assert session.inputs.visual is candidate.visual
+    session.dispose()
+
+
 @pytest.mark.parametrize(
     "lengths,split",
     [([3, 7], True), ([1, 2, 7], False), ([1, 2, 2], False), ([3, 2], False)],

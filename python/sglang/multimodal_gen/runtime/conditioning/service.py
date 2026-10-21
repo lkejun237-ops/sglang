@@ -90,6 +90,7 @@ class EncodeQueue:
 
     def _forward(self, value, key):
         import torch
+
         from sglang.multimodal_gen.runtime.managers.forward_context import (
             set_forward_context,
         )
@@ -355,7 +356,7 @@ class ConditioningService:
             raise ConditionError() from None
         if size > min(
             self.limits.max_request_bytes,
-            self.limits.max_input_bytes + self.limits.max_header_bytes + 1024,
+            self.limits.max_input_body_bytes,
         ):
             raise ConditionError("CONDITION_INVALID", 413)
         if size < 4:

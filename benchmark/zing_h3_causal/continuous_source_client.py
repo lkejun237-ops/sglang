@@ -20,12 +20,15 @@ import msgpack
 import websockets
 from bench_client import calculate_metrics, distribution
 from continuous_source_input import open_source
-from continuous_source_media import reference_payload
+from continuous_source_media import load_prompt_updates, reference_payload
 
 from sglang.multimodal_gen.runtime.realtime.source_transport import (
     DEFAULT_MESSAGE_BYTES,
     PROTOCOL_OVERHEAD_BYTES,
     SourceTransportBudget,
+)
+from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
+    DEFAULT_MAX_REFERENCE_IMAGES,
 )
 
 
@@ -57,6 +60,7 @@ async def run(args):
 
 
 async def exchange(args, output, started, read_source, received_file, trace):
+    prompt_updates = deque(load_prompt_updates(args.prompt_updates))
     message_budget = getattr(args, "max_message_bytes", DEFAULT_MESSAGE_BYTES)
     SourceTransportBudget(message_bytes=message_budget)
     frame_bytes = args.width * args.height * 3
@@ -82,6 +86,7 @@ async def exchange(args, output, started, read_source, received_file, trace):
         source_end_send=None,
         credit_wait_seconds=0.0,
     )
+    prompt_results = {}
     boundaries, accepted, capture, sent = deque(), deque(), deque(), deque()
     latency_samples, delivery_times = [], []
     dependency_latency_samples = []
@@ -154,7 +159,23 @@ async def exchange(args, output, started, read_source, received_file, trace):
             or not 0 < ready.get("max_source_message_bytes", 0) <= message_budget
         ):
             raise ValueError("Continuous source negotiation failed")
+        max_references = ready.get("max_references", DEFAULT_MAX_REFERENCE_IMAGES)
+        if type(max_references) is not int or max_references < 0:
+            raise ValueError("The service advertised an invalid reference count limit")
+        for update in prompt_updates:
+            if "references" in update and len(update["references"]) > max_references:
+                raise ValueError(
+                    f"The service accepts at most {max_references} reference images"
+                )
         record("ready", message=ready)
+        needs_reference_updates = any(
+            "references" in update for update in prompt_updates
+        )
+        # Includes [] (clear). Missing capability means unsupported, not an
+        # activation status. The server requires prefix5 / [3,2] / split_first_latent.
+        supports_reference_updates = ready.get("prompt_reference_updates", False)
+        if needs_reference_updates and not supports_reference_updates:
+            raise ValueError("The service did not advertise prompt reference updates")
         (output / "request.json").write_text(
             json.dumps(
                 {
@@ -186,10 +207,68 @@ async def exchange(args, output, started, read_source, received_file, trace):
             source_started = time.monotonic()
             pattern_index = 0
             while True:
+                if (
+                    prompt_updates
+                    and prompt_updates[0]["source_frame_start"] == state["submitted"]
+                ):
+                    update = prompt_updates.popleft()
+                    state["event_id"] += 1
+                    event = dict(
+                        type="event",
+                        kind="prompt",
+                        event_id=state["event_id"],
+                        payload=update["prompt"],
+                    )
+                    if "references" in update:
+                        event["references"] = [
+                            reference_payload(item["path"], item["id"])
+                            for item in update["references"]
+                        ]
+                    reference_assets = (
+                        [
+                            dict(
+                                id=item["id"],
+                                format=item["format"],
+                                bytes=len(item["payload"]),
+                                sha256=hashlib.sha256(item["payload"]).hexdigest(),
+                            )
+                            for item in event.get("references", [])
+                        ]
+                        if "references" in event
+                        else None
+                    )
+                    # Register before awaiting send: includes serialization,
+                    # writer waiting and upload, not local image-file reads.
+                    submitted = time.monotonic() - started
+                    prompt_results[event["event_id"]] = dict(
+                        event_id=event["event_id"],
+                        status="pending",
+                        source_frame_start=state["submitted"],
+                        submitted_seconds=submitted,
+                        received_seconds=None,
+                        latency_ms=None,
+                        output_frame_start=None,
+                        pts_us=None,
+                    )
+                    record(
+                        "prompt_send",
+                        submitted_seconds=submitted,
+                        event_id=event["event_id"],
+                        source_frame_start=state["submitted"],
+                        prompt=update["prompt"],
+                        references=update.get("references"),
+                        reference_assets=reference_assets,
+                    )
+                    await send(event)
                 count = min(
                     packet_frames,
                     args.batch_pattern[pattern_index % len(args.batch_pattern)],
                 )
+                if prompt_updates:
+                    count = min(
+                        count,
+                        prompt_updates[0]["source_frame_start"] - state["submitted"],
+                    )
                 pattern_index += 1
                 data = await read_source(count * frame_bytes)
                 if not data:
@@ -278,6 +357,8 @@ async def exchange(args, output, started, read_source, received_file, trace):
                 sent.append((start, start + count, send_started))
                 await send(message)
             expected = getattr(args, "expected_frames", None)
+            if prompt_updates:
+                raise ValueError("Source ended before all scheduled prompt updates")
             if state["submitted"] == 0 or (
                 expected is not None and state["submitted"] != expected
             ):
@@ -302,6 +383,14 @@ async def exchange(args, output, started, read_source, received_file, trace):
                 message = msgpack.unpackb(wire, raw=False)
                 kind = message.get("type")
                 if kind == "error":
+                    if message.get("fatal") is False:
+                        update = prompt_results.get(message.get("event_id"))
+                        if update is not None and update["status"] == "pending":
+                            update.update(
+                                status="rejected", error_code=message.get("code")
+                            )
+                        record("error", message=message)
+                        continue
                     raise RuntimeError(message.get("content", "Generation failed"))
                 if kind == "source.accepted":
                     end = message["source_frame_end"]
@@ -406,6 +495,25 @@ async def exchange(args, output, started, read_source, received_file, trace):
                     block_capture_latency = now - capture_time
                     block_capture_latency_samples.append(block_capture_latency)
                     state["last_output"] = now
+                    update = prompt_results.get(message.get("event_id"))
+                    if update is not None and update["status"] == "pending":
+                        received = now - started
+                        update.update(
+                            status="applied",
+                            received_seconds=received,
+                            latency_ms=(received - update["submitted_seconds"]) * 1000,
+                            output_frame_start=start,
+                            pts_us=message["pts_us"],
+                        )
+                        # Only observed output of a newer epoch proves an older
+                        # pending event was superseded; submission/ACK cannot.
+                        for older in prompt_results.values():
+                            if (
+                                older["event_id"] < update["event_id"]
+                                and older["status"] == "pending"
+                            ):
+                                older["status"] = "superseded"
+                        record("prompt_applied", **update)
                     state["received"] += count
                     delivery_times.append((now - started, count))
                     output_hash.update(payload)
@@ -489,6 +597,33 @@ async def exchange(args, output, started, read_source, received_file, trace):
             # reads may be paused; preserve the original error or cancellation.
             ws.transport.abort()
             raise
+        finally:
+            for update in prompt_results.values():
+                if update["status"] == "pending":
+                    update["status"] = (
+                        "not_observed" if state["completed"] else "interrupted"
+                    )
+            updates = list(prompt_results.values())
+            prompt_metrics = dict(
+                prompt_updates=updates,
+                prompt_update_latency_ms=distribution(
+                    [row["latency_ms"] for row in updates if row["status"] == "applied"]
+                ),
+                prompt_update_status_counts={
+                    status: sum(row["status"] == status for row in updates)
+                    for status in (
+                        "applied",
+                        "rejected",
+                        "superseded",
+                        "not_observed",
+                        "interrupted",
+                    )
+                },
+                prompt_update_timing_scope="client before send to complete first matching frame payload; excludes image-file reads and browser rendering",
+            )
+            (output / "prompt-updates.json").write_text(
+                json.dumps(prompt_metrics, indent=2)
+            )
         elapsed = time.monotonic() - started
         source_latency = distribution(latency_samples)
         dependency_latency = distribution(dependency_latency_samples)
@@ -502,6 +637,7 @@ async def exchange(args, output, started, read_source, received_file, trace):
         boot = Path("/proc/sys/kernel/random/boot_id")
         summary = dict(
             state,
+            **prompt_metrics,
             schema_version=2,
             session_id=ready["session_id"],
             client_clock_domain=(
@@ -565,6 +701,10 @@ def parser():
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--reference", action="append", default=[])
     parser.add_argument("--reference-id", action="append", default=[])
+    parser.add_argument(
+        "--prompt-updates",
+        help="JSON list of prompt updates at source frame positions, with optional complete reference lists",
+    )
     parser.add_argument(
         "--user-media", help="JSON list of typed media with local path fields"
     )

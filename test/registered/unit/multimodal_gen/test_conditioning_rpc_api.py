@@ -29,6 +29,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import msgspec.msgpack
+import pytest
+
 from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
     ZingH3CausalPipelineConfig,
 )
@@ -53,6 +55,23 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 def _forbidden_gpu(*args, **kwargs):
     raise AssertionError("CPU contract tests must not construct GPU pipelines")
+
+
+def test_remote_metadata_accepts_21_references_and_source_preview():
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.conditioning import (
+        validate_remote_media_metadata,
+    )
+
+    media = [dict(type="video", clip=dict(start=0, end=0))] + [
+        dict(type="image") for _ in range(21)
+    ]
+    validate_remote_media_metadata(media)
+    try:
+        validate_remote_media_metadata([*media, dict(type="image")])
+    except ConditionError as error:
+        assert error.code == "CONDITION_INVALID"
+    else:
+        raise AssertionError("Excess conditioning media must be rejected")
 
 
 def _managers():
@@ -278,6 +297,7 @@ class TestConditioningRPCInputPreflight(CustomTestCase):
 
     def test_t2_source_nonzero_single_frame_video_preserves_clip(self):
         from PIL import Image
+
         from sglang.multimodal_gen.runtime.conditioning.resources import (
             AdmissionLedger,
             BoundedExecutor,
@@ -830,3 +850,24 @@ class TestConditioningRPCFiniteErrors(CustomTestCase):
                 self.assertEqual(
                     raised.exception.detail, {"code": code, "message": _PUBLIC[code]}
                 )
+
+
+@pytest.mark.parametrize("limit", [0, 2, 32])
+def test_remote_metadata_uses_pipeline_media_count(limit):
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.conditioning import (
+        validate_remote_request,
+    )
+
+    configured = SimpleNamespace(
+        zing_conditioning_mode="remote",
+        pipeline_config=SimpleNamespace(zing_reference_max_images=limit),
+    )
+    media = [dict(type="video", clip=dict(start=0, end=0))] + [
+        dict(type="image") for _ in range(limit)
+    ]
+    request = SimpleNamespace(user_media=media)
+    validate_remote_request(request, configured)
+    with pytest.raises(ConditionError):
+        validate_remote_request(
+            SimpleNamespace(user_media=[*media, dict(type="image")]), configured
+        )

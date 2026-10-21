@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shared Zing pixel provenance and identifiers for codecs and chunk planning.
+"""Shared Zing media counts, pixel provenance and identifiers.
 
 No wire negotiation, credit ownership, session lifecycle or transport state.
 The service integration owns those responsibilities and supplies actual source
@@ -8,6 +8,48 @@ alignment/dependencies rather than deriving them from the latest accepted batch.
 
 from dataclasses import asdict, dataclass
 from typing import NewType
+
+# Default deployment budgets; callers may configure a different image count.
+# The presentation budget includes the source-preview video.
+DEFAULT_MAX_REFERENCE_IMAGES = 21
+DEFAULT_MAX_MEDIA_ITEMS = DEFAULT_MAX_REFERENCE_IMAGES + 1
+MAX_REFERENCE_IMAGE_PIXELS = 16_777_216
+# The old whole-upload cap also bounded any one encoded image. Preserve that
+# single-image maximum when deriving a larger deployment's complete snapshot.
+MAX_REFERENCE_IMAGE_BYTES = 64 << 20
+
+
+@dataclass(frozen=True)
+class ReferenceLimits:
+    """Count-derived ingress budgets; no tensor allocation or token estimates."""
+
+    max_images: int = DEFAULT_MAX_REFERENCE_IMAGES
+
+    def __post_init__(self):
+        if type(self.max_images) is not int or self.max_images < 0:
+            raise ValueError("zing_reference_max_images must be a nonnegative integer")
+
+    @property
+    def max_media(self):
+        return self.max_images + 1
+
+    @property
+    def reference_bytes(self):
+        return self.max_images * MAX_REFERENCE_IMAGE_BYTES
+
+    @property
+    def decoded_reference_bytes(self):
+        return self.max_images * MAX_REFERENCE_IMAGE_PIXELS * 3
+
+    @property
+    def media_bytes(self):
+        # Explicit source-preview uploads also need a media slot and byte budget.
+        return self.max_media * MAX_REFERENCE_IMAGE_BYTES
+
+    @property
+    def decoded_media_bytes(self):
+        return self.max_media * MAX_REFERENCE_IMAGE_PIXELS * 3
+
 
 TemporalChunkId = NewType("TemporalChunkId", int)
 PackedRoleId = NewType("PackedRoleId", int)

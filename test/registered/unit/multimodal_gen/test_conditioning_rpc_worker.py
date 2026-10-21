@@ -26,6 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
@@ -1018,3 +1019,130 @@ class TestConditioningRPCWorker(CustomTestCase):
                 all(item.get("prompt_version") == expected for item in metadata)
             )
             self.assertEqual(state.sampler.prompt.prompt_version, expected)
+
+
+@pytest.mark.parametrize("case", ["count", "side", "rgb", "pixels", "request"])
+def test_remote_client_rejects_metadata_before_copy_or_network(monkeypatch, case):
+    from sglang.multimodal_gen.runtime.conditioning.client import ConditioningClient
+
+    options = dict(max_media=2, max_side=8, max_input_bytes=100, max_decoded_pixels=32)
+    items = media()
+    request_bytes = 1 << 20
+    if case == "count":
+        items = items * 3
+    elif case == "side":
+        items = [dict(type="image", frames=torch.zeros(3, 1, 1, 9, dtype=torch.uint8))]
+    elif case == "rgb":
+        options["max_input_bytes"] = 11
+    elif case == "pixels":
+        options["max_decoded_pixels"] = 3
+    else:
+        frames = torch.zeros((), dtype=torch.uint8).expand(3, 1, 4096, 4096)
+        items = [dict(type="image", frames=frames) for _ in range(11)]
+        options = {}
+        request_bytes = 512 << 20
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Rejected metadata must not hash, copy, serialize or send tensors")
+
+    monkeypatch.setattr(BASE + ".wire.pack_message", forbidden)
+    client = ConditioningClient(
+        "http://localhost",
+        "probe",
+        PROFILE,
+        max_request_bytes=request_bytes,
+        media_limits=options,
+        transport=forbidden,
+    )
+    with pytest.raises(ConditionError) as error:
+        client.encode("prompt", items, input_digest=DIGEST)
+    assert error.value.code == "CONDITION_INVALID"
+
+
+def test_startup_resource_limits_reject_before_hash_and_preserve_active(
+    tmp_path, monkeypatch
+):
+    import json
+
+    from test_conditioning_rpc_core import profile
+
+    from sglang.multimodal_gen.runtime.conditioning.client import ConditioningClient
+    from sglang.multimodal_gen.runtime.conditioning.worker import (
+        RemoteConditioner,
+        WorkerConditioningState,
+    )
+
+    deployed = profile()
+    (tmp_path / "profile.json").write_text(json.dumps(deployed.document))
+    (tmp_path / "client.json").write_text(
+        json.dumps(
+            dict(bearer_token="probe", limits=dict(max_media=2, max_input_bytes=11))
+        )
+    )
+    options = NS(
+        conditioning_expected_profile=str(tmp_path / "profile.json"),
+        conditioning_config=str(tmp_path / "client.json"),
+        conditioning_service_url="http://localhost",
+        pipeline_config=NS(zing_reference_max_images=32),
+    )
+    monkeypatch.setattr(ConditioningClient, "handshake", lambda self: None)
+    monkeypatch.setattr(BASE + ".worker._sp_group", lambda: None)
+    provider = RemoteConditioner.from_server_args(options)
+    state = WorkerConditioningState()
+    state.identity, state.positive = DIGEST, condition(7)
+    positive = state.positive
+
+    def forbidden(*args, **kwargs):
+        pytest.fail(
+            "Metadata rejection must precede hashing, serialization and device work"
+        )
+
+    monkeypatch.setattr(BASE + ".worker.hash_frame", forbidden)
+    monkeypatch.setattr(BASE + ".wire.pack_message", forbidden)
+    monkeypatch.setattr(provider.client, "_request", forbidden)
+    with pytest.raises(ConditionError) as error:
+        provider("prompt", media(), device="cpu", state=state)
+    assert error.value.code == "CONDITION_INVALID"
+    assert state.identity == DIGEST and state.positive is positive
+
+
+def test_any_rank_input_limit_failure_prevents_rpc_and_device_work(monkeypatch):
+    from sglang.multimodal_gen.runtime.conditioning.client import ConditioningClient
+    from sglang.multimodal_gen.runtime.conditioning.worker import RemoteConditioner
+
+    bus = ReceiptBus()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("A failed rank's input admission must stop RPC and device work")
+
+    providers = []
+    for rank in range(2):
+        client = ConditioningClient(
+            "http://localhost",
+            "probe",
+            PROFILE,
+            media_limits=dict(max_input_bytes=12 if rank == 0 else 11),
+            transport=forbidden,
+        )
+        providers.append(
+            RemoteConditioner(
+                client,
+                PROFILE,
+                rank=rank,
+                validate_input=client.validate_input,
+                coordinate=lambda receipt, rank=rank: bus.gather(rank, receipt),
+                broadcast_receipt=forbidden,
+                allocate=forbidden,
+                broadcast_tensor=forbidden,
+            )
+        )
+    monkeypatch.setattr(BASE + ".wire.pack_message", forbidden)
+
+    def run(rank):
+        try:
+            providers[rank]("prompt", media(), device="cpu")
+        except ConditionError as exc:
+            return exc.code
+
+    with ThreadPoolExecutor(2) as pool:
+        assert list(pool.map(run, range(2))) == ["CONDITION_INVALID"] * 2

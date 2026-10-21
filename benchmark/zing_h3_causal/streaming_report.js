@@ -319,6 +319,24 @@
           "</td></tr>",
       )
       .join("");
+    const promptRows = g.rows.filter((r) => r.phase === "measured").flatMap(
+      (r) => (r.streaming?.prompt_updates ?? []).map((u) => ({ ...u, run: r.index + 1, successful_run: r.success })),
+    );
+    const promptLatencies = promptRows.filter((u) => u.successful_run && u.status === "applied")
+      .map((u) => u.latency_ms).filter(Number.isFinite).sort((a, b) => a - b);
+    const position = (promptLatencies.length - 1) * .95;
+    const low = Math.floor(position), high = Math.ceil(position);
+    const p95 = promptLatencies.length
+      ? promptLatencies[low] + (promptLatencies[high] - promptLatencies[low]) * (position - low)
+      : null;
+    $("prompt-updates").innerHTML = promptRows.length
+      ? "<p>applied 样本 " + promptLatencies.length + "；中位数 " + fmt(median(promptLatencies))
+        + " ms；P95 " + fmt(p95) + " ms</p>" + cellTable(
+          promptRows.map((u) => [u.run, u.event_id, u.status, fmt(u.submitted_seconds, 4),
+            u.output_frame_start ?? "—", u.pts_us ?? "—", fmt(u.received_seconds, 4), fmt(u.latency_ms)]),
+          ["轮次", "event_id", "状态", "提交 / s", "首帧序号", "视频PTS / µs", "收到 / s", "延迟 / ms"],
+        )
+      : "<p class='muted'>未记录 prompt 更新，不计为零延迟。</p>";
     $("warmups").innerHTML = cellTable(
       g.warm.map((r) => [
         "预热 " + (r.index + 1),
@@ -364,7 +382,7 @@
         ["ICL · P95", fmt(median(gaps.map((v) => v?.p95)), 3) + " s"],
         ["ICL · 最大间隔", fmt(median(gaps.map((v) => v?.max)), 3) + " s"],
       ],
-      ["三次请求的中位数", "值"],
+      ["正式成功请求的中位数", "值"],
     );
     $("source-intro").textContent =
       g.mode === "paced"
@@ -391,7 +409,7 @@
         ),
       ) + " s",
     ]);
-    $("source-metrics").innerHTML = cellTable(vals, ["三次请求的中位数", "值"]);
+    $("source-metrics").innerHTML = cellTable(vals, ["正式成功请求的中位数", "值"]);
     serverDetail(g);
   }
   const stageColor = {

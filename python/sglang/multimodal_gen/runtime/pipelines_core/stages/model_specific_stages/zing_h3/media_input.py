@@ -10,6 +10,7 @@ import shutil
 import tempfile
 import time
 from contextlib import contextmanager
+from io import BytesIO
 from typing import Any
 
 import fsspec
@@ -17,6 +18,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.media_request import (
     optional_nonnegative_media_time,
     parse_h3_media_descriptor,
@@ -68,6 +70,21 @@ def _local_media(uri: str, *, fs: Any | None = None):
     finally:
         if temp_path is not None and os.path.exists(temp_path):
             os.unlink(temp_path)
+
+
+def _parse_media_descriptor(item, *, path):
+    if "payload" not in item:
+        return parse_h3_media_descriptor(item, path=path)
+    if (
+        "uri" in item
+        or item.get("type") not in {"image", "video"}
+        or not isinstance(item["payload"], bytes)
+        or not item["payload"]
+        or item.get("format") not in {"jpeg", "png", "webp"}
+        or (item["type"] == "video" and "presentation_fps" not in item)
+    ):
+        raise ValueError(f"{path} requires encoded image bytes or a URI")
+    return {key: item[key] for key in ("type", "format", "payload")}
 
 
 def _clip_bounds(item: dict[str, Any]) -> tuple[float, float | None]:
@@ -395,7 +412,7 @@ class ZingH3MediaInput:
                 raise ValueError("H3 inference user content items must be objects")
             if item.get("type") == "text":
                 continue
-            descriptor = parse_h3_media_descriptor(item, path=f"user.content[{index}]")
+            descriptor = _parse_media_descriptor(item, path=f"user.content[{index}]")
             if not isinstance(item.get("id"), str) or not item["id"]:
                 raise ValueError("H3 inference media require a non-empty id")
             _clip_bounds(item)
@@ -561,7 +578,7 @@ class ZingH3MediaInput:
     def _decode_media(
         self, item: dict[str, Any], *, need_audio: bool
     ) -> dict[str, Any]:
-        """按 URI 解码一个媒体描述；仅在 condition/target 真正需要时读取音轨。"""
+        """Decode URI media or inline presentation/reference file bytes."""
         import av
         from PIL import Image, UnidentifiedImageError
 
@@ -571,6 +588,35 @@ class ZingH3MediaInput:
             if key in item
         }
         start, end = _clip_bounds(item)
+        if "payload" in item:
+            # Both init and complete reference replacement enter this branch.
+            # The encoded bytes are already charged/verified by ingress; keep
+            # the same format/pixel checks at this worker boundary as well.
+            _parse_media_descriptor(item, path="media")
+            if need_audio:
+                raise ValueError("Encoded presentation images cannot provide audio")
+            fps = item.get("presentation_fps", 1.0)
+            if item["type"] == "video" and (
+                type(fps) not in (int, float)
+                or not 0 < fps <= 240
+                or end is None
+                or start != end
+            ):
+                raise ValueError(
+                    "Single-frame video requires matching clip times and frame rate"
+                )
+            with Image.open(BytesIO(item["payload"])) as image:
+                if (
+                    image.format.lower() != item["format"]
+                    or image.width * image.height > 16_777_216
+                ):
+                    raise ValueError(
+                        "Encoded image format or dimensions are not supported"
+                    )
+                frame = np.array(image.convert("RGB"), dtype=np.uint8, copy=True)
+            result["frames"] = torch.from_numpy(frame).permute(2, 0, 1).unsqueeze(1)
+            result["fps"] = float(fps)
+            return result
         with _local_media(str(item["uri"]), fs=self.remote_read_fs) as (
             path,
             remote_read_fs,

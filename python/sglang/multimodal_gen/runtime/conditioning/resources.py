@@ -9,35 +9,51 @@ import math
 import threading
 from dataclasses import dataclass, fields
 
-from .contract import ConditionError
+from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
+    DEFAULT_MAX_MEDIA_ITEMS,
+    MAX_REFERENCE_IMAGE_PIXELS,
+)
+
+from .contract import ConditionError, rgb_request_framing_bytes
 
 
 @dataclass(frozen=True)
 class ResourceLimits:
     max_active_requests: int = 32
     max_active_requests_per_tenant: int = 16
-    max_inflight_bytes: int = 8 << 30
-    max_inflight_bytes_per_tenant: int = 2 << 30
+    max_inflight_bytes: int | None = None
+    max_inflight_bytes_per_tenant: int | None = None
     cache_bytes: int = 256 << 20
     cache_bytes_per_tenant: int = 256 << 20
-    max_request_bytes: int = 512 << 20
-    max_response_bytes: int = 256 << 20
-    max_input_bytes: int = 512 << 20
-    max_condition_bytes: int = 256 << 20
+    max_request_bytes: int | None = None
+    max_response_bytes: int | None = None
+    max_input_bytes: int | None = None
+    max_condition_bytes: int | None = None
     max_condition_rows: int = 16384
     max_header_bytes: int = 65536
     max_prompt_bytes: int = 65536
-    max_media: int = 16
+    max_media: int = DEFAULT_MAX_MEDIA_ITEMS
     max_side: int = 8192
-    max_decoded_pixels: int = 178956970
+    max_decoded_pixels: int | None = None
     max_queued_encodes: int = 16
     request_timeout_s: float = 10.0
     cpu_executor_active: int = 2
     cpu_executor_waiting: int = 4
 
     def __post_init__(self):
+        automatic = {
+            "max_input_bytes",
+            "max_request_bytes",
+            "max_decoded_pixels",
+            "max_inflight_bytes",
+            "max_inflight_bytes_per_tenant",
+            "max_condition_bytes",
+            "max_response_bytes",
+        }
         for field in fields(self):
             value = getattr(self, field.name)
+            if value is None and field.name in automatic:
+                continue
             if (
                 isinstance(value, bool)
                 or not isinstance(value, (int, float))
@@ -47,8 +63,44 @@ class ResourceLimits:
                 raise ValueError("Conditioning limits must be finite and positive")
             if field.name != "request_timeout_s" and type(value) is not int:
                 raise ValueError("Conditioning capacities must be integers")
-        if self.max_header_bytes > 65536 or self.max_media > 16:
-            raise ValueError("Conditioning header or media limit exceeds the protocol")
+        # HTTP admission uses the same RGB + bounded JSON/safetensors formula.
+        derived = {
+            "max_input_bytes": self.max_media * MAX_REFERENCE_IMAGE_PIXELS * 3,
+            "max_decoded_pixels": self.max_media * MAX_REFERENCE_IMAGE_PIXELS,
+        }
+        for name, value in derived.items():
+            if getattr(self, name) is None:
+                object.__setattr__(self, name, value)
+        if self.max_request_bytes is None:
+            object.__setattr__(
+                self,
+                "max_request_bytes",
+                self.max_input_body_bytes,
+            )
+        if self.max_condition_bytes is None:
+            object.__setattr__(
+                self, "max_condition_bytes", self.output_reservation_bytes
+            )
+        if self.max_response_bytes is None:
+            object.__setattr__(
+                self,
+                "max_response_bytes",
+                self.max_condition_bytes + self.max_header_bytes + 1024,
+            )
+        if self.max_inflight_bytes_per_tenant is None:
+            object.__setattr__(
+                self,
+                "max_inflight_bytes_per_tenant",
+                max(2 << 30, self.max_request_bytes + self.output_reservation_bytes),
+            )
+        if self.max_inflight_bytes is None:
+            object.__setattr__(
+                self,
+                "max_inflight_bytes",
+                max(8 << 30, 4 * self.max_inflight_bytes_per_tenant),
+            )
+        if self.max_header_bytes > 65536:
+            raise ValueError("Conditioning header limit exceeds the protocol")
         for total, tenant in self.budgets().values():
             if tenant > total:
                 raise ValueError("Tenant conditioning budget exceeds global budget")
@@ -58,6 +110,16 @@ class ResourceLimits:
             "slots": (self.max_active_requests, self.max_active_requests_per_tenant),
             "inflight": (self.max_inflight_bytes, self.max_inflight_bytes_per_tenant),
         }
+
+    @property
+    def max_input_body_bytes(self):
+        return (
+            self.max_input_bytes
+            + self.max_header_bytes
+            + rgb_request_framing_bytes(
+                self.max_media, self.max_side, self.max_input_bytes
+            )
+        )
 
     @property
     def output_reservation_bytes(self):

@@ -103,6 +103,27 @@ def canonical_json(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+def rgb_request_framing_bytes(max_media, max_side, max_input_bytes):
+    """Bound framing for CTHW uint8 media without serializing tensor data.
+
+    Safetensors stores a JSON entry per tensor, padded to eight bytes. Use the
+    longest generated name, dimensions and offsets for every entry; ordering
+    and smaller actual values can only shorten that header.
+    """
+    entry = canonical_json(
+        {
+            f"media_{max(0, max_media - 1)}": dict(
+                dtype="U8",
+                shape=[3, 1, max_side, max_side],
+                data_offsets=[max_input_bytes, max_input_bytes],
+            )
+        }
+    )
+    header_bytes = 2 + max_media * (len(entry) - 2) + max(0, max_media - 1)
+    # Four-byte RPC JSON length, eight-byte safetensors header length, padding.
+    return 12 + (header_bytes + 7) // 8 * 8
+
+
 def safe_json(data: bytes, *, max_bytes: int = MAX_MANIFEST_BYTES) -> Any:
     if type(data) is not bytes or len(data) > max_bytes:
         _invalid("JSON size exceeds the contract limit")
@@ -232,7 +253,7 @@ class DeploymentProfile:
         return copy.deepcopy(self._document)
 
     @classmethod
-    def load(cls, path: str | Path) -> "DeploymentProfile":
+    def load(cls, path: str | Path) -> DeploymentProfile:
         return cls(safe_json(_read_regular(Path(path), MAX_MANIFEST_BYTES)))
 
 

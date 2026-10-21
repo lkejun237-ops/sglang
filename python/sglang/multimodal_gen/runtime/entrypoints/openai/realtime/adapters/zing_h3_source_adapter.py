@@ -21,6 +21,7 @@ from PIL import Image  # noqa: F401 - preserve the existing CPU validation seam
 from sglang.multimodal_gen.configs.zing_sampling import (
     normalize_source_sampling_schedule,
 )
+from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter import (
     BaseRealtimeModelAdapter,
     RealtimeChunkInputs,
@@ -28,19 +29,26 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter 
 )
 from sglang.multimodal_gen.runtime.realtime.source_transport import (
     PENDING_BATCHES,
-    REFERENCE_BYTES,
     SourceTransportBudget,
     check,
     validate_source_dimensions,
 )
 from sglang.multimodal_gen.runtime.realtime.zing_chunk_plan import ChunkPlan
-from sglang.multimodal_gen.runtime.realtime.zing_contracts import PixelRange, require
+from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
+    DEFAULT_MAX_REFERENCE_IMAGES,
+    MAX_REFERENCE_IMAGE_BYTES,
+    PixelRange,
+    ReferenceLimits,
+    require,
+)
 from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
     SourceLedger,
     SourceLimits,
     default_source_encoder,
 )
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+from .zing_reference_upload import prepare_reference_upload
 
 
 def _source_sampling_schedule(args, profile):
@@ -99,6 +107,10 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         self.init_started_ns = time.time_ns()
         self._source_reservations, self._inflight_reservations = {}, []
         self._s0_reservation = None
+        self._pending_reference_upload = None
+        self._inflight_reference_uploads = []
+        self._pending_prompt_command = self._selected_prompt_command = None
+        self.initial_prompt = request.prompt
         args = get_global_server_args()
         from ..conditioning import get_api_resources, validate_remote_request
 
@@ -253,15 +265,10 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                 getattr(args, "realtime_max_sessions_per_worker", 8),
             )
         )
-        client_budget = getattr(request, "source_message_budget_bytes", None)
-        check(
-            client_budget is None
-            or (
-                type(client_budget) is int and client_budget == transport.message_bytes
-            ),
-            "source_transport_mismatch",
-            "The client and service streaming size limits do not match.",
+        transport = transport.negotiate(
+            getattr(request, "source_message_budget_bytes", None)
         )
+        self.max_message_bytes = transport.message_bytes
         clip = int(args.pipeline_config.vae_config.arch_config.vae_clip_length)
         message_bytes = transport.source_message_bytes(width, height, clip)
         limits = SourceLimits(
@@ -275,6 +282,13 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             request.realtime_preview_max_width in (None, width),
             "This session requires the full output dimensions.",
         )
+        self.max_references = getattr(
+            args.pipeline_config,
+            "zing_reference_max_images",
+            DEFAULT_MAX_REFERENCE_IMAGES,
+        )
+        reference_limits = ReferenceLimits(self.max_references)
+        self.max_media_items = reference_limits.max_media
         references = getattr(request, "references", []) or []
         media = getattr(request, "user_media", None)
         require(
@@ -283,13 +297,13 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         )
         if media is None:
             require(
-                isinstance(references, list) and len(references) <= 9,
-                "Please provide at most nine reference images.",
+                isinstance(references, list) and len(references) <= self.max_references,
+                f"Please provide at most {self.max_references} reference images.",
             )
             media = [dict(ref, type="image", reference=True) for ref in references]
         require(
-            isinstance(media, list) and len(media) <= 10,
-            "Please provide at most ten media items.",
+            isinstance(media, list) and len(media) <= self.max_media_items,
+            f"Please provide at most {self.max_media_items} media items.",
         )
         # The causal source contract supplies Video 1 automatically. Explicit
         # typed video media already defines presentation (including an independent
@@ -298,10 +312,16 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             isinstance(item, dict) and item.get("type") == "video" for item in media
         )
         require(
-            len(media) + int(self.auto_source_preview) <= 10,
-            "Please provide at most ten media items including source preview.",
+            len(media) + int(self.auto_source_preview) <= self.max_media_items,
+            f"Please provide at most {self.max_media_items} media items including source preview.",
         )
-        seen, reference_paths, media_bytes = set(), [], 0
+        self.reference_max_decoded_bytes = getattr(
+            args.pipeline_config, "zing_reference_max_decoded_bytes", None
+        )
+        if self.reference_max_decoded_bytes is None:
+            self.reference_max_decoded_bytes = reference_limits.decoded_reference_bytes
+        reference_decoded_bytes = 0
+        seen, media_bytes = set(), 0
         self.user_media, self.reference_items = [], []
         for i, item in enumerate(media):
             require(
@@ -345,32 +365,46 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                 "Please use a different name for this image.",
             )
             seen.add(item["id"])
+            require(
+                len(item["payload"]) <= MAX_REFERENCE_IMAGE_BYTES,
+                "The reference image is too large.",
+            )
             media_bytes += len(item["payload"])
             require(
-                media_bytes <= REFERENCE_BYTES, "The reference images are too large."
+                media_bytes <= reference_limits.media_bytes,
+                "The reference images are too large.",
             )
-            from ..conditioning import reserve_media_storage, verify_presentation_upload
+            from ..conditioning import reserve_media_memory, verify_presentation_upload
 
-            await verify_presentation_upload(session, item["payload"], item["format"])
-            reserve_media_storage(session, len(item["payload"]))
-            # Workers read reference media from the session's private directory.
-
-            if session.input_temp_dir is None:
-                session.input_temp_dir = tempfile.mkdtemp(
-                    prefix="sglang_zing_source_", dir="/tmp"
+            decoded_bytes = await verify_presentation_upload(
+                session, item["payload"], item["format"]
+            )
+            if (
+                item.get("reference", False)
+                and self.reference_max_decoded_bytes is not None
+            ):
+                reference_decoded_bytes += decoded_bytes
+                require(
+                    reference_decoded_bytes <= self.reference_max_decoded_bytes,
+                    "The reference images exceed the configured decoded size limit.",
                 )
-            path = Path(session.input_temp_dir) / f"media-{i}.{item['format']}"
-            path.write_bytes(item["payload"])
-            descriptor = dict(type=item["type"], id=item["id"], uri=str(path))
+            reserve_media_memory(session, len(item["payload"]))
+            # Keep caller-supplied encoded bytes; init and updates share the
+            # worker's in-memory image decoder. No temporary media files.
+            descriptor = dict(
+                type=item["type"],
+                id=item["id"],
+                format=item["format"],
+                payload=item["payload"],
+            )
             if video:
                 descriptor.update(clip=dict(item["clip"]), presentation_fps=item["fps"])
             self.user_media.append(descriptor)
             if item.get("reference", False):
                 self.reference_items.append(descriptor)
-                reference_paths.append(str(path))
         require(
-            len(self.reference_items) <= 9,
-            "Please provide at most nine reference images.",
+            len(self.reference_items) <= self.max_references,
+            f"Please provide at most {self.max_references} reference images.",
         )
         self.source_preview_sha256 = None
         self.source_preview_bytes = None
@@ -392,12 +426,27 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
 
         self.source_work_quantum = source_work_quantum()
         self.more_work = False
-        self.clip, self.reference_paths, self.profile = clip, reference_paths, profile
+        self.clip, self.profile = clip, profile
         self.reference_ids = [ref["id"] for ref in self.reference_items]
+        self.fixed_media_ids = {
+            item["id"]
+            for item in self.user_media
+            if item["id"] not in self.reference_ids
+        }
+        if self.auto_source_preview:
+            self.fixed_media_ids.add("<Video 1>")
+        self.fixed_media_bytes = sum(
+            len(item["payload"]) for item in media if not item.get("reference", False)
+        )
+        self.reference_updates = (
+            getattr(args.pipeline_config, "prompt_switch_prefix_latent_frames", None)
+            == 5
+            and self.joint_plan.lengths == (3, 2)
+            and self.joint_plan.split_first_latent
+        )
         self.source_encoder = profile.get("source_encoder", default_source_encoder())
         self._initialize_source_admission(session, limits)
         self.first_source_received_unix_ns = None
-        self.pending_prompt = None
         self.prompt_event = None
         request.fps, request.num_inference_steps, request.guidance_scale = (
             fps,
@@ -419,10 +468,14 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             "max_source_message_bytes": limits.message_bytes,
             "max_pending_source_frames": limits.pending_frames,
             "max_pending_source_bytes": limits.pending_bytes,
-            "max_references": 9,
-            "max_reference_bytes": REFERENCE_BYTES,
+            "max_references": self.max_references,
+            "prompt_reference_updates": self.reference_updates,
+            "max_reference_bytes": reference_limits.reference_bytes,
+            "max_reference_image_bytes": MAX_REFERENCE_IMAGE_BYTES,
+            "max_reference_decoded_bytes": self.reference_max_decoded_bytes,
+            "max_user_media_bytes": reference_limits.media_bytes,
             "user_media_formats": ["jpeg", "webp", "png"],
-            "max_user_media": 10,
+            "max_user_media": self.max_media_items,
             "user_media_video_clip": {"start": 0, "end": 0},
         }
 
@@ -480,6 +533,11 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         await asyncio.wait_for(self.admission_socket.send_multipart(parts), timeout=120)
 
     async def ingest_wire_event(self, ws, session, data, message_bytes):
+        check(
+            message_bytes <= self.max_message_bytes,
+            "source_message_too_large",
+            "The message exceeds this session's streaming size limit.",
+        )
         kind = data.get("kind")
         if kind == "heartbeat":
             return False
@@ -537,17 +595,77 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             self.end = dict(frame_end=self.ledger.accepted_frames, event_id=event_id)
             self.available.set()
         elif kind == "prompt":
-            from ..conditioning import validate_remote_request
-
-            validate_remote_request(session.request, get_global_server_args())
-            self.ledger.validate_event_id(event_id)
-            require(
-                isinstance(payload, str) and payload.strip(),
-                "Please provide a non-empty prompt.",
+            await self._ingest_prompt_event(ws, session, data, event_id, payload)
+        else:
+            raise ValueError(
+                "This session supports source frames and prompt updates only."
             )
-            self.ledger.event_id = event_id
-            self.pending_prompt = payload, event_id
-            self.available.set()
+        session.mark_client_activity()
+        return True
+
+    async def _ingest_prompt_event(self, ws, session, data, event_id, payload):
+        """Supersede pending work, prepare one candidate, then reject or ACK."""
+        from ..conditioning import validate_remote_request
+
+        validate_remote_request(session.request, get_global_server_args())
+        self.ledger.validate_event_id(event_id)
+        require(
+            isinstance(payload, str) and payload.strip(),
+            "Please provide a non-empty prompt.",
+        )
+        self.ledger.event_id = event_id
+        self._pending_prompt_command = None
+        if self._pending_reference_upload is not None:
+            self._pending_reference_upload.release(session)
+            self._pending_reference_upload = None
+        command = dict(prompt=payload, event_id=event_id)
+        if "references" in data:
+            try:
+                require(
+                    self.reference_updates,
+                    "This session does not support reference updates.",
+                )
+                self._pending_reference_upload = await prepare_reference_upload(
+                    session,
+                    data["references"],
+                    fixed_ids=self.fixed_media_ids,
+                    fixed_bytes=self.fixed_media_bytes,
+                    max_references=self.max_references,
+                    max_decoded_bytes=self.reference_max_decoded_bytes,
+                )
+                command["references"] = self._pending_reference_upload.items
+            except (
+                ValueError,
+                OSError,
+                SyntaxError,
+                Image.DecompressionBombError,
+                ConditionError,
+            ) as exc:
+                # Still dispatch the rejection: a newer event supersedes any
+                # older candidate already waiting at the worker boundary.
+                command["rejected"] = True
+                await ws.send_bytes(
+                    msgspec.msgpack.encode(
+                        dict(
+                            type="error",
+                            code=exc.code
+                            if isinstance(exc, ConditionError)
+                            else "CONDITION_INVALID",
+                            fatal=False,
+                            event_id=event_id,
+                            content=(
+                                exc.public_message
+                                if isinstance(exc, ConditionError)
+                                else "This session does not support reference updates."
+                                if not self.reference_updates
+                                else "The prompt update could not be prepared. Please check the reference images and try again."
+                            ),
+                        )
+                    )
+                )
+        self._pending_prompt_command = command
+        self.available.set()
+        if not command.get("rejected"):
             await ws.send_bytes(
                 msgspec.msgpack.encode(
                     dict(
@@ -558,12 +676,6 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                     )
                 )
             )
-        else:
-            raise ValueError(
-                "This session supports source frames and prompt updates only."
-            )
-        session.mark_client_activity()
-        return True
 
     async def wait_for_next_chunk(self, session):
         # Progressive readiness belongs to the codec, never a transport packet
@@ -597,7 +709,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                 if self.ledger.closed:
                     reason = "cancelled"
                     raise asyncio.CancelledError("Source session has closed")
-                if self.pending_prompt is not None:
+                if self._pending_prompt_command is not None:
                     reason = "prompt"
                     break
                 if self.end is not None:
@@ -662,6 +774,12 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         return target, min(1000.0, missing * 1000.0 / self.config["fps"])
 
     async def close_conditioning(self, session):
+        if self._pending_reference_upload is not None:
+            self._pending_reference_upload.release(session)
+            self._pending_reference_upload = None
+        for upload in self._inflight_reference_uploads:
+            upload.release(session)
+        self._inflight_reference_uploads.clear()
         for reservation in (
             *self._source_reservations.values(),
             *self._inflight_reservations,
@@ -677,9 +795,15 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         return self.clip
 
     def sample_chunk_inputs(self, session, server_args, chunk, chunk_size):
-        if self.pending_prompt is not None:
-            session.request.prompt, self.prompt_event = self.pending_prompt
-            self.pending_prompt = None
+        if self._pending_prompt_command is not None:
+            command = self._pending_prompt_command
+            session.request.prompt = command["prompt"]
+            self.prompt_event = command["event_id"]
+            self._selected_prompt_command = command
+            self._pending_prompt_command = None
+            if self._pending_reference_upload is not None:
+                self._inflight_reference_uploads.append(self._pending_reference_upload)
+                self._pending_reference_upload = None
         return RealtimeChunkInputs(prompt=session.request.prompt)
 
     def get_realtime_event_id(self, session):
@@ -696,10 +820,13 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             num_inference_steps=len(self.sampling_schedule["denoising_step_list"]),
             chunk_size=chunk_size,
         )
-        params.image_path = self.reference_paths
         # Only locally validated media enter the internal canonical request.
         # The wire API still rejects arbitrary zing_request/source objects.
-        content = list(self.user_media)
+        # Worker inputs persist after the first dispatch. Do not pickle the
+        # initial encoded images again on every chunk; replacements travel only
+        # in zing_prompt_update and the worker owns the active media snapshot.
+        initial_media = self.user_media if session.generate_chunk_cnt == 0 else []
+        content = list(initial_media)
         content.append(dict(type="text", text=chunk_inputs.prompt))
         params.zing_request = dict(
             messages=[
@@ -723,6 +850,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                             latent_modalities=["visual"],
                         )
                         for item in self.reference_items
+                        if initial_media
                     ],
                 ),
             ]
@@ -746,6 +874,18 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
 
     def prepare_next_request(self, session, server_args, chunk):
         batch = super().prepare_next_request(session, server_args, chunk)
+        if self._selected_prompt_command is not None:
+            batch.extra["zing_prompt_update"] = self._selected_prompt_command
+            self._selected_prompt_command = None
+        update = batch.extra.get("zing_prompt_update", {})
+        if batch.block_idx == 0 and ("references" in update or update.get("rejected")):
+            # Initialize the original epoch before applying a queued update;
+            # an early invalid reference must not change its prompt or identity.
+            batch.sampling_params.prompt = self.initial_prompt
+            batch.sampling_params.zing_request["messages"][0]["content"][-1]["text"] = (
+                self.initial_prompt
+            )
+            batch.realtime_event_id = None
         appends, count = [], 0
         while not self.more_work and self.pending and count < self.clip:
             item = self.pending.popleft()
@@ -786,6 +926,9 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
 
     def on_chunk_complete(self, session, result):
         super().on_chunk_complete(session, result)
+        for upload in self._inflight_reference_uploads:
+            upload.release(session)
+        self._inflight_reference_uploads.clear()
         more_work = (result.usage or {}).get("zing_source_more_work", False)
         require(type(more_work) is bool, "Invalid source continuation state.")
         self.more_work = bool(self.source_work_quantum and more_work)
@@ -834,8 +977,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             self.ledger.dispose()
             self.pending.clear()
             self.available.set()
-            self.pending_prompt = None
-            self.reference_paths.clear()
+            self._pending_prompt_command = self._selected_prompt_command = None
             self.reference_items.clear()
             self.reference_ids.clear()
             self.source_preview_sha256 = None

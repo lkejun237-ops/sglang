@@ -5,7 +5,11 @@ import logging
 from pathlib import Path
 
 import torch
+
 from sglang.multimodal_gen.runtime.realtime.session import BaseRealtimeState
+from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
+    DEFAULT_MAX_REFERENCE_IMAGES,
+)
 
 from .contract import ConditionError, DeploymentProfile, safe_json
 from .inputs import (
@@ -144,6 +148,7 @@ class RemoteConditioner:
         allocate=_allocate,
         broadcast_tensor=_broadcast_tensor,
         preprocess_version=PREPROCESS_VERSION,
+        validate_input=None,
     ):
         group = _sp_group() if rank is None else None
         self.rank = (
@@ -153,10 +158,12 @@ class RemoteConditioner:
         self.coordinate, self.broadcast_receipt = coordinate, broadcast_receipt
         self.allocate, self.broadcast_tensor = allocate, broadcast_tensor
         self.preprocess_version = preprocess_version
+        self.validate_input = validate_input
 
     @classmethod
     def from_server_args(cls, args):
         from .client import ConditioningClient
+        from .resources import ResourceLimits
 
         group = _sp_group()
         rank = 0 if group is None else group.rank_in_group
@@ -170,16 +177,32 @@ class RemoteConditioner:
                 )
             config = safe_json(path.read_bytes())
             profile = DeploymentProfile.load(args.conditioning_expected_profile)
-            limits = config.get("limits", {})
+            max_media = (
+                getattr(
+                    getattr(args, "pipeline_config", None),
+                    "zing_reference_max_images",
+                    DEFAULT_MAX_REFERENCE_IMAGES,
+                )
+                + 1
+            )
+            limits = ResourceLimits(
+                **{"max_media": max_media, **config.get("limits", {})}
+            )
             client = ConditioningClient(
                 args.conditioning_service_url,
                 config.get("bearer_token", config.get("token")),
                 profile.profile_id,
                 timeout_s=config.get("conditioning_timeout_s", 10),
                 sp_timeout_s=_cpu_timeout(group),
-                max_rows=limits.get("max_condition_rows", 16384),
-                max_request_bytes=limits.get("max_request_bytes", 536870912),
-                max_bytes=limits.get("max_response_bytes", 268435456),
+                max_rows=limits.max_condition_rows,
+                max_request_bytes=limits.max_request_bytes,
+                max_bytes=limits.max_response_bytes,
+                media_limits=dict(
+                    max_media=limits.max_media,
+                    max_side=limits.max_side,
+                    max_input_bytes=limits.max_input_bytes,
+                    max_decoded_pixels=limits.max_decoded_pixels,
+                ),
                 retry_initial_s=config.get("retry_initial_s", 0.05),
                 retry_max_s=config.get("retry_max_s", 0.5),
             )
@@ -217,11 +240,14 @@ class RemoteConditioner:
             profile.profile_id,
             rank=rank,
             preprocess_version=profile.document["preprocess_version"],
+            validate_input=client.validate_input,
         )
 
     def __call__(self, prompt, media, *, device, state=None):
         state = state if state is not None else WorkerConditioningState()
         try:
+            if self.validate_input is not None:
+                self.validate_input(prompt, media)
             digest = _identity(
                 prompt, media, self.profile_id, state, self.preprocess_version
             )

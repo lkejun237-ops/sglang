@@ -4,6 +4,7 @@
 import math
 import threading
 from contextlib import contextmanager
+from copy import copy
 
 import torch
 
@@ -398,6 +399,86 @@ class ZingH3Codecs(ZingH3MediaInput):
             self.audio_sample_rate,
             condition_media=media if retain_condition_media else None,
         )
+
+    def prepare_reference_update(
+        self, active, references, prompt, use_component, *, conditioning
+    ):
+        """Build a complete candidate without changing active media or stream state.
+
+        CPU decode/geometry failures must agree across SP ranks before any Qwen
+        or VAE collective. GPU/runtime failures propagate and close the session.
+        """
+        from sglang.multimodal_gen.runtime.conditioning.worker import (
+            coordinate_validation,
+        )
+
+        error = None
+        try:
+            old_ids = {item["content_id"] for item in active.conditions}
+            media = [
+                item for item in active.condition_media if item["id"] not in old_ids
+            ]
+            ids = [item["id"] for item in media + references]
+            if len(ids) != len(set(ids)) or any(
+                item["type"] != "image" for item in references
+            ):
+                raise ValueError(
+                    "Reference IDs must not conflict with retained presentation"
+                )
+            media = media + [
+                self._decode_media(item, need_audio=False) for item in references
+            ]
+            conditions = [
+                dict(
+                    content_id=item["id"],
+                    role="reference",
+                    latent_modalities=["visual"],
+                )
+                for item in references
+            ]
+            target = dict(
+                type=active.output_type,
+                output=dict(
+                    frames=active.pixel_frame_count,
+                    height=active.visual_shape[1] * self.spatial_ratio,
+                    width=active.visual_shape[2] * self.spatial_ratio,
+                ),
+            )
+            normalized, _, h, w, t, _ = self._normalize_inference_media(
+                media, None, conditions, target, max_area_config=self.max_area_config
+            )
+            if (
+                t,
+                h // self.spatial_ratio,
+                w // self.spatial_ratio,
+            ) != active.visual_shape:
+                raise ValueError("Reference updates cannot change output geometry")
+        except (ValueError, OSError) as exc:
+            error = exc
+        if not all(coordinate_validation(error is None)):
+            raise ConditionError(
+                "CONDITION_INVALID", "Reference media preparation failed"
+            ) from error
+        # Preserve original RGB for Qwen; normalized copies belong to the VAE.
+        positive = conditioning(prompt, media)
+        candidate = copy(active)
+        candidate.conditions = conditions
+        candidate.condition_media = media
+        candidate.media = [
+            {"id": item["id"], "type": item["type"]} for item in normalized
+        ]
+        candidate.positive = positive
+        candidate.visual, candidate.audio = {}, {}
+        candidate.source_visual = None
+        reference_ids = {item["id"] for item in references}
+        if reference_ids:
+            with use_component("video_vae"):
+                for item in normalized:
+                    if item["id"] in reference_ids:
+                        candidate.visual[item["id"]] = self.encode_visual(
+                            item["frames"]
+                        )
+        return candidate
 
     def decode_visual_range(self, latent, frame_start, frame_end):
         """Decode new pixels plus one preceding clip for H3 overlap blending.

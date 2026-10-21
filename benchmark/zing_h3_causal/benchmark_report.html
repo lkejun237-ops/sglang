@@ -55,6 +55,7 @@
 <details><summary>指标怎么算</summary><dl><div class="metric-def"><dt>TTFF</dt><dd>客户端启动（连接和解码前）到首个完整 RGB 输出批次。</dd></div><div class="metric-def"><dt>E2E</dt><dd>同一起点到最后一个完整 RGB 批次。服务端会话清理不计入 E2E。</dd></div><div class="metric-def"><dt>FPS</dt><dd>完整输出帧数 ÷ E2E，包括首批等待。视频规格为 24 FPS，实测交付速度另行计算。</dd></div></dl></details>
 </section>
 <section><div class="controls"><h2 style="margin:0">逐次结果</h2><select id="stream-case-select" aria-label="选择场景"></select></div><p id="stream-case-context" class="muted"></p><div id="stream-metrics" class="metrics"></div><div class="table-wrap"><table><thead><tr><th>正式请求</th><th class="num">TTFF / s</th><th class="num">E2E / s</th><th class="num">FPS</th><th class="num">批次间隔 P95 / s</th><th>输入结束前出画面</th></tr></thead><tbody id="stream-individual"></tbody></table></div>
+<details open><summary>Prompt 更新：提交到首个对应完整帧到达</summary><div id="stream-prompt-updates"></div><p class="tiny muted">同一客户端 monotonic 时钟；含发送等待及上传，不含图片文件读取和浏览器渲染。event_id 表示条件采用，不代表语义编辑成功；只有正式成功会话的 applied 样本计入延迟；失败会话保留逐事件记录。</p></details>
 <details><summary>预热记录</summary><div id="stream-warmups"></div><p class="tiny muted">预热请求不进入上面的中位数。模型保持常驻，首次请求仍可能包含运行时初始化。</p></details>
 </section>
 <section id="stream-server-section"><h2>服务端：Encoder、DiT 与 Decoder</h2><p id="stream-server-status"></p><p id="stream-server-issues" class="tiny muted"></p>

@@ -22,6 +22,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session 
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_adapter import (
     RawRGBRealtimeOutputAdapter,
 )
+from sglang.multimodal_gen.runtime.realtime.source_transport import (
+    DEFAULT_MESSAGE_BYTES,
+)
 from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
     PixelRange,
     Provenance,
@@ -78,6 +81,312 @@ def initialize(**overrides):
     asyncio.run(adapter.on_init(session, request))
     session.set_request(request)
     return adapter, session
+
+
+def _enable_reference_updates(args):
+    from pathlib import Path
+
+    root = Path(args.model_path)
+    runtime = json.loads((root / "zing_config.json").read_text())
+    runtime.update(num_frame_per_block=[3, 2], split_first_latent=True)
+    raw = json.dumps(runtime).encode()
+    (root / "zing_config.json").write_bytes(raw)
+    profile = json.loads((root / "zing_realtime_profile.json").read_text())
+    profile["model_config_sha256"] = hashlib.sha256(raw).hexdigest()
+    (root / "zing_realtime_profile.json").write_text(json.dumps(profile))
+    args.pipeline_config.prompt_switch_prefix_latent_frames = 5
+
+
+def _reference(name="<Picture 1>", color="red"):
+    import io
+
+    from PIL import Image
+
+    output = io.BytesIO()
+    Image.new("RGB", (32, 32), color).save(output, format="PNG")
+    return dict(id=name, format="png", payload=output.getvalue())
+
+
+class PromptSocket:
+    def __init__(self):
+        self.messages = []
+
+    async def send_bytes(self, raw):
+        self.messages.append(msgspec.msgpack.decode(raw))
+
+
+def test_reference_capability_requires_supported_deployment(configured):
+    adapter, _ = initialize()
+    assert adapter.ready["prompt_reference_updates"] is False
+    _enable_reference_updates(configured)
+    adapter, _ = initialize()
+    assert adapter.ready["prompt_reference_updates"] is True
+
+
+@pytest.mark.parametrize(
+    "references",
+    [
+        None,
+        {},
+        [_reference(str(i)) for i in range(22)],
+        [_reference(), _reference()],
+        [_reference("<Video 1>")],
+        [dict(id="bad", format="png", payload=b"not an image")],
+    ],
+)
+def test_invalid_reference_event_is_nonfatal_and_supersedes_pending(
+    configured, references
+):
+    _enable_reference_updates(configured)
+    adapter, session = initialize()
+    ws = PromptSocket()
+
+    async def run():
+        await adapter.ingest_wire_event(
+            ws,
+            session,
+            dict(
+                type="event",
+                kind="prompt",
+                event_id=1,
+                payload="same",
+                references=[_reference()],
+            ),
+            100,
+        )
+        upload = adapter._pending_reference_upload
+        leases = list(upload.reservations)
+        await adapter.ingest_wire_event(
+            ws,
+            session,
+            dict(
+                type="event",
+                kind="prompt",
+                event_id=2,
+                payload="same",
+                references=references,
+            ),
+            100,
+        )
+        assert upload.items == [] and all(lease.released for lease in leases)
+        assert adapter._pending_prompt_command == dict(
+            prompt="same", event_id=2, rejected=True
+        )
+        assert ws.messages[-1]["fatal"] is False
+        assert ws.messages[-1]["event_id"] == 2
+        assert session.request.prompt == "Render snow"
+        await adapter.ingest_wire_event(
+            ws,
+            session,
+            dict(type="event", kind="prompt", event_id=3, payload="valid"),
+            100,
+        )
+        assert ws.messages[-1]["type"] == "control_ack"
+        assert "references" not in adapter._pending_prompt_command
+        await adapter.close_conditioning(session)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("count", [1, 21])
+def test_reference_upload_lifetime_and_empty_snapshot(configured, count):
+    _enable_reference_updates(configured)
+    adapter, session = initialize()
+    ws = PromptSocket()
+
+    async def run():
+        await adapter.ingest_wire_event(
+            ws,
+            session,
+            dict(
+                type="event",
+                kind="prompt",
+                event_id=1,
+                payload="same",
+                references=[_reference(f"<Picture {i + 1}>") for i in range(count)],
+            ),
+            100,
+        )
+        upload = adapter._pending_reference_upload
+        assert [item["id"] for item in upload.items] == [
+            f"<Picture {i + 1}>" for i in range(count)
+        ]
+        adapter.sample_chunk_inputs(session, configured, None, 17)
+        assert adapter._selected_prompt_command["references"] == upload.items
+        await adapter.ingest_wire_event(
+            ws,
+            session,
+            dict(
+                type="event", kind="prompt", event_id=2, payload="same", references=[]
+            ),
+            100,
+        )
+        assert upload.items and all(not lease.released for lease in upload.reservations)
+        assert adapter._pending_prompt_command["references"] == []
+        await adapter.close_conditioning(session)
+        assert upload.items == [] and upload.reservations == []
+        assert session._api_media_reservations == []
+
+    asyncio.run(run())
+
+
+def test_reference_memory_cleanup_releases_initial_pending_and_inflight(
+    configured, monkeypatch
+):
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
+        realtime_video_api,
+    )
+
+    _enable_reference_updates(configured)
+    # Failing all media writes proves neither init nor update spools images.
+    monkeypatch.setattr(
+        Path, "write_bytes", lambda *a, **k: pytest.fail("Media must stay in memory")
+    )
+    adapter, session = initialize(references=[_reference("initial")])
+    ws = PromptSocket()
+
+    async def run():
+        for event_id in (1, 2):
+            await adapter.ingest_wire_event(
+                ws,
+                session,
+                dict(
+                    type="event",
+                    kind="prompt",
+                    event_id=event_id,
+                    payload="same",
+                    references=[_reference()],
+                ),
+                100,
+            )
+            if event_id == 1:
+                adapter.sample_chunk_inputs(session, configured, None, 17)
+        leases = list(session._api_media_reservations)
+        assert len(leases) == 3 and session.input_temp_dir is None
+
+        async def release(_):
+            return True
+
+        monkeypatch.setattr(
+            realtime_video_api, "_release_scheduler_realtime_session", release
+        )
+        await realtime_video_api._cleanup_realtime_session(session, None, None)
+        assert all(lease.released for lease in leases)
+        assert session._api_media_reservations == []
+        assert adapter._pending_reference_upload is None
+        assert adapter._inflight_reference_uploads == []
+        assert session.conditioning_resources.ledger.snapshot()["global"]["ram"] == 0
+
+    asyncio.run(run())
+
+
+def test_cancelled_reference_verification_returns_ram_credit(configured, monkeypatch):
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters import (
+        zing_reference_upload as uploads,
+    )
+
+    adapter, session = initialize(references=[_reference("initial")])
+    initial = list(session._api_media_reservations)
+
+    async def run():
+        entered = asyncio.Event()
+
+        async def blocked(*_):
+            entered.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(uploads, "verify_presentation_upload", blocked)
+        task = asyncio.create_task(
+            uploads.prepare_reference_upload(
+                session,
+                [_reference()],
+                fixed_ids={"<Video 1>"},
+                fixed_bytes=0,
+            )
+        )
+        await entered.wait()
+        candidate = session._api_media_reservations[-1]
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert candidate.released and session._api_media_reservations == initial
+        assert not initial[0].released
+        from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.conditioning import (
+            release_api_media,
+        )
+
+        release_api_media(session)
+        await adapter.close_conditioning(session)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", ["image", "clear", "invalid", "text"])
+def test_early_reference_event_dispatch_preserves_initial_epoch(
+    configured, monkeypatch, mode
+):
+    _enable_reference_updates(configured)
+    adapter, session = initialize()
+    ws = PromptSocket()
+
+    def prepare(self, session, args, chunk):
+        inputs = self.sample_chunk_inputs(session, args, chunk, 17)
+        return SimpleNamespace(
+            block_idx=0,
+            extra={},
+            realtime_event_id=self.prompt_event,
+            sampling_params=SimpleNamespace(
+                prompt=inputs.prompt,
+                zing_request={
+                    "messages": [{"content": [{"type": "text", "text": inputs.prompt}]}]
+                },
+            ),
+        )
+
+    monkeypatch.setattr(
+        source.BaseRealtimeModelAdapter, "prepare_next_request", prepare
+    )
+    monkeypatch.setattr(
+        source.BaseRealtimeModelAdapter, "on_chunk_complete", lambda *args: None
+    )
+
+    async def run():
+        fields = (
+            {}
+            if mode == "text"
+            else {
+                "references": None
+                if mode == "invalid"
+                else []
+                if mode == "clear"
+                else [_reference()]
+            }
+        )
+        await adapter.ingest_wire_event(
+            ws,
+            session,
+            dict(type="event", kind="prompt", event_id=1, payload="new", **fields),
+            100,
+        )
+        upload = adapter._pending_reference_upload
+        batch = adapter.prepare_next_request(session, configured, None)
+        expected = "new" if mode == "text" else "Render snow"
+        assert batch.sampling_params.prompt == expected
+        assert (
+            batch.sampling_params.zing_request["messages"][0]["content"][-1]["text"]
+            == expected
+        )
+        assert batch.realtime_event_id == (1 if mode == "text" else None)
+        assert batch.extra["zing_prompt_update"]["event_id"] == 1
+        assert batch.extra["zing_prompt_update"]["prompt"] == "new"
+        if upload is not None:
+            assert all(not lease.released for lease in upload.reservations)
+        adapter.on_chunk_complete(session, SimpleNamespace(usage={}))
+        if upload is not None:
+            assert upload.items == [] and upload.reservations == []
+        await adapter.close_conditioning(session)
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize(
@@ -160,7 +469,7 @@ def test_effective_sampling_is_reported_and_dispatched(
     monkeypatch.setattr(
         source.BaseRealtimeModelAdapter,
         "prepare_next_request",
-        lambda *a: SimpleNamespace(extra={}),
+        lambda *a: SimpleNamespace(extra={}, block_idx=0),
     )
     batch = adapter.prepare_next_request(session, configured, None)
     wire = msgspec.msgpack.decode(msgspec.msgpack.encode(batch.extra))
@@ -586,7 +895,7 @@ def test_explicit_prompt_video_preserves_reference_ids(configured, monkeypatch):
     Image.new("RGB", (32, 32)).save(data, format="JPEG")
     refs = [
         dict(id=f"<Picture {i + 1}>", format="jpeg", payload=data.getvalue())
-        for i in range(9)
+        for i in range(21)
     ]
     frame = io.BytesIO()
     Image.new("RGB", (32, 32)).save(frame, format="PNG")
@@ -603,8 +912,8 @@ def test_explicit_prompt_video_preserves_reference_ids(configured, monkeypatch):
             *[dict(ref, type="image", reference=True) for ref in refs],
         ],
     )
-    assert adapter.ready["max_references"] == 9
-    assert adapter.ready["max_reference_bytes"] == 8 << 20
+    assert adapter.ready["max_references"] == 21
+    assert adapter.ready["max_reference_bytes"] == 21 * (64 << 20)
     monkeypatch.setattr(
         source, "build_realtime_sampling_params", lambda *a, **kw: SimpleNamespace()
     )
@@ -622,10 +931,22 @@ def test_explicit_prompt_video_preserves_reference_ids(configured, monkeypatch):
     assert user["content"][-1]["text"] == "original prompt"
     assert [c["content_id"] for c in target["conditions"]] == [r["id"] for r in refs]
     assert "source" not in target
+    session.generate_chunk_cnt = 1
+    later = adapter.build_sampling_params(
+        session,
+        None,
+        SimpleNamespace(request_id="next"),
+        SimpleNamespace(prompt="next prompt"),
+        17,
+    )
+    assert later.zing_request["messages"][0]["content"] == [
+        dict(type="text", text="next prompt")
+    ]
+    assert later.zing_request["messages"][1]["conditions"] == []
     # PyAV must decode the PNG as exactly one video frame for the prompt loader.
     import av
 
-    with av.open(user["content"][0]["uri"]) as container:
+    with av.open(io.BytesIO(user["content"][0]["payload"])) as container:
         assert len(list(container.decode(video=0))) == 1
     adapter.clear_state(session)
     assert not adapter.reference_items and adapter.source_preview_sha256 is None
@@ -635,8 +956,95 @@ def test_explicit_prompt_video_preserves_reference_ids(configured, monkeypatch):
 def test_reference_bytes_remain_bounded(configured):
     with pytest.raises(ValueError, match="too large"):
         initialize(
-            references=[dict(id="large", format="jpeg", payload=b"x" * ((8 << 20) + 1))]
+            references=[
+                dict(id="large", format="jpeg", payload=b"x" * ((64 << 20) + 1))
+            ]
         )
+
+
+@pytest.mark.parametrize("extra_bytes", [0, 1])
+def test_reference_snapshot_byte_budget_includes_retained_media(
+    configured, extra_bytes
+):
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.zing_reference_upload import (
+        prepare_reference_upload,
+    )
+
+    fixed = _reference("fixed")
+    fixed_media = dict(fixed, type="image", reference=False)
+    ref = _reference()
+    # Valid PNG with trailing bytes exercises the compressed upload budget
+    # without allocating a correspondingly large decoded image.
+    size = (64 << 20) + extra_bytes
+    ref["payload"] += bytes(size - len(ref["payload"]))
+    if extra_bytes:
+        with pytest.raises(ValueError, match="too large"):
+            initialize(
+                user_media=[fixed_media, dict(ref, type="image", reference=True)]
+            )
+        adapter, session = initialize(user_media=[fixed_media])
+    else:
+        adapter, session = initialize(
+            user_media=[fixed_media, dict(ref, type="image", reference=True)]
+        )
+        from sglang.multimodal_gen.runtime.realtime.source_transport import (
+            SourceTransportBudget,
+        )
+
+        wire = msgspec.msgpack.encode(
+            dict(
+                type="init",
+                user_media=[fixed_media, dict(ref, type="image", reference=True)],
+            )
+        )
+        # The 64 MiB media boundary must also fit the complete WS envelope.
+        assert 64 << 20 < len(wire) <= SourceTransportBudget().message_bytes
+
+    async def run():
+        try:
+            args = dict(
+                fixed_ids={"fixed", "<Video 1>"}, fixed_bytes=len(fixed["payload"])
+            )
+            if extra_bytes:
+                with pytest.raises(ValueError, match="too large"):
+                    await prepare_reference_upload(session, [ref], **args)
+            else:
+                upload = await prepare_reference_upload(session, [ref], **args)
+                assert len(upload.items[0]["payload"]) == size
+                assert "uri" not in upload.items[0]
+                upload.release(session)
+        finally:
+            await adapter.close_conditioning(session)
+
+    asyncio.run(run())
+
+
+def test_media_count_includes_source_preview_and_nonreference_images(configured):
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.zing_reference_upload import (
+        prepare_reference_upload,
+    )
+
+    fixed = dict(_reference("fixed"), type="image", reference=False)
+    refs = [_reference(f"<Picture {i + 1}>") for i in range(21)]
+    # Source preview consumes one slot even before its first frame is available.
+    with pytest.raises(ValueError, match="at most 22 media"):
+        initialize(
+            user_media=[fixed, *[dict(r, type="image", reference=True) for r in refs]]
+        )
+    adapter, session = initialize(user_media=[fixed])
+
+    async def run():
+        args = dict(fixed_ids={"fixed", "<Video 1>"}, fixed_bytes=len(fixed["payload"]))
+        try:
+            upload = await prepare_reference_upload(session, refs[:20], **args)
+            assert len(upload.items) == 20
+            upload.release(session)
+            with pytest.raises(ValueError, match="at most 22 media"):
+                await prepare_reference_upload(session, refs, **args)
+        finally:
+            await adapter.close_conditioning(session)
+
+    asyncio.run(run())
 
 
 def test_typed_media_cannot_duplicate_reference_id(configured):
@@ -662,34 +1070,34 @@ def test_typed_media_cannot_duplicate_reference_id(configured):
         )
 
 
-def test_nine_references_are_preserved_and_ten_rejected(configured):
+def test_21_references_are_preserved_and_22_rejected(configured):
     import io
-    from pathlib import Path
 
     from PIL import Image
 
     refs = []
-    for i in range(10):
+    for i in range(22):
         data = io.BytesIO()
         fmt = "PNG" if i == 0 else "JPEG"
-        Image.new("RGB", (32, 32), color=(i * 20, 0, 0)).save(data, format=fmt)
+        Image.new("RGB", (32, 32), color=(i * 10, 0, 0)).save(data, format=fmt)
         refs.append(
-            dict(id=f"picture-{9 - i}", format=fmt.lower(), payload=data.getvalue())
+            dict(id=f"picture-{21 - i}", format=fmt.lower(), payload=data.getvalue())
         )
-    adapter, session = initialize(references=refs[:9])
-    directory = Path(session.input_temp_dir)
-    assert adapter.session_ready_message(session)["max_references"] == 9
-    assert len(adapter.reference_paths) == 9
-    assert adapter.reference_ids == [ref["id"] for ref in refs[:9]]
-    assert [Path(p).read_bytes() for p in adapter.reference_paths] == [
-        ref["payload"] for ref in refs[:9]
+    adapter, session = initialize(references=refs[:21])
+    assert session.input_temp_dir is None
+    assert adapter.session_ready_message(session)["max_references"] == 21
+    assert len(adapter.reference_items) == 21
+    assert adapter.reference_ids == [ref["id"] for ref in refs[:21]]
+    assert [item["payload"] for item in adapter.reference_items] == [
+        ref["payload"] for ref in refs[:21]
     ]
     adapter.dispose(session)
-    # Temp files are owned by the shared session cleanup.
-    import shutil
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.conditioning import (
+        release_api_media,
+    )
 
-    shutil.rmtree(directory)
-    with pytest.raises(ValueError, match="at most nine"):
+    release_api_media(session)
+    with pytest.raises(ValueError, match="at most 21"):
         initialize(references=refs)
 
 
@@ -825,13 +1233,13 @@ def test_high_resolution_ready(configured, width, height):
     adapter, session = initialize(
         size=f"{width}x{height}",
         source_stream=dict(format="rgb24", width=width, height=height, fps=24),
-        source_message_budget_bytes=64 << 20,
+        source_message_budget_bytes=DEFAULT_MESSAGE_BYTES,
     )
     ready = adapter.session_ready_message(session)
     assert adapter.clip == 17
     assert ready["max_source_batch_frames"] == 17
     assert adapter.ledger.limits.pending_frames == 4 * 17
-    assert ready["max_message_bytes"] == 64 << 20
+    assert ready["max_message_bytes"] == DEFAULT_MESSAGE_BYTES
     assert ready["max_source_message_bytes"] == 17 * width * height * 3 + 4096
     assert ready["max_pending_source_bytes"] == 4 * 17 * width * height * 3
 
@@ -839,9 +1247,9 @@ def test_high_resolution_ready(configured, width, height):
 @pytest.mark.parametrize(
     "width,height,budget,code",
     [
-        (1280, 720, 64 << 20, "source_dimensions_unaligned"),
-        (1920, 1088, 64 << 20, "source_message_too_large"),
-        (1280, 736, 32 << 20, "source_transport_mismatch"),
+        (1280, 720, DEFAULT_MESSAGE_BYTES, "source_dimensions_unaligned"),
+        (1920, 1088, DEFAULT_MESSAGE_BYTES, "source_message_too_large"),
+        (1280, 736, 2 * DEFAULT_MESSAGE_BYTES, "source_transport_mismatch"),
     ],
 )
 def test_transport_rejected_before_media_allocation(
@@ -866,13 +1274,36 @@ def test_transport_rejected_before_media_allocation(
     assert error.value.code == code
 
 
-def test_dimension_error_has_stable_wire_code(configured, monkeypatch):
+@pytest.mark.parametrize("oversized_init", [False, True])
+def test_init_errors_have_stable_wire_codes(configured, monkeypatch, oversized_init):
     from fastapi import WebSocketDisconnect
 
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
         realtime_video_api as api,
     )
 
+    initial = dict(
+        type="init",
+        prompt="Render snow",
+        size="1280x720",
+        zing_realtime_api_version=1,
+        source_stream=dict(format="rgb24", width=1280, height=720, fps=24),
+    )
+    if oversized_init:
+        configured.pipeline_config.zing_reference_max_images = 2
+        initial.update(
+            size="32x32",
+            source_stream=dict(format="rgb24", width=32, height=32, fps=24),
+            source_message_budget_bytes=65536,
+            references=[dict(id="ref", format="png", payload=bytes(80 << 10))],
+        )
+        monkeypatch.setattr(
+            source.Image,
+            "open",
+            lambda *a, **kw: pytest.fail(
+                "An oversized init must be rejected before image verification"
+            ),
+        )
     adapter = source.ZingH3SourceStreamAdapter()
     monkeypatch.setattr(api, "get_global_server_args", lambda: configured)
     monkeypatch.setattr(
@@ -890,15 +1321,7 @@ def test_dimension_error_has_stable_wire_code(configured, monkeypatch):
             if self.received:
                 raise WebSocketDisconnect()
             self.received = True
-            return msgspec.msgpack.encode(
-                dict(
-                    type="init",
-                    prompt="Render snow",
-                    size="1280x720",
-                    zing_realtime_api_version=1,
-                    source_stream=dict(format="rgb24", width=1280, height=720, fps=24),
-                )
-            )
+            return msgspec.msgpack.encode(initial)
 
         async def send_bytes(self, data):
             self.sent.append(msgspec.msgpack.decode(data))
@@ -908,8 +1331,11 @@ def test_dimension_error_has_stable_wire_code(configured, monkeypatch):
     with pytest.raises(WebSocketDisconnect):
         asyncio.run(api._listen_generate_request(ws, session))
     assert len(ws.sent) == 1
-    assert ws.sent[0]["code"] == "source_dimensions_unaligned"
-    assert "divisible by 32" in ws.sent[0]["content"]
+    assert ws.sent[0]["code"] == (
+        "source_init_too_large" if oversized_init else "source_dimensions_unaligned"
+    )
+    if not oversized_init:
+        assert "divisible by 32" in ws.sent[0]["content"]
     assert session.input_temp_dir is None
     assert session.request is None
 
@@ -927,7 +1353,7 @@ def test_startup_rejects_insufficient_concurrent_transport_memory():
         batching_delay_ms=0,
         realtime_max_sessions=8,
         realtime_max_sessions_per_worker=8,
-        realtime_max_message_bytes=64 << 20,
+        realtime_max_message_bytes=SourceTransportBudget().message_bytes,
         realtime_transport_host_bytes=8 * SourceTransportBudget().session_bytes - 1,
     )
     with pytest.raises(ValueError, match="host budget"):
@@ -947,7 +1373,7 @@ def test_joint_wait_is_bounded_and_interruptible(configured, reason):
         if reason == "ready":
             adapter.pending_frames = adapter.clip
         elif reason == "prompt":
-            adapter.pending_prompt = ("New prompt", 2)
+            adapter._pending_prompt_command = dict(prompt="New prompt", event_id=2)
         elif reason == "eos":
             adapter.end = {"frame_end": 1}
         elif reason == "cancelled":
@@ -1008,3 +1434,572 @@ def test_joint_defaults_need_no_user_tuning(configured):
     assert adapter.profile.get("joint_forward", "cross_chunk") == "cross_chunk"
     assert adapter.profile.get("joint_wait_ms", "auto") == "auto"
     assert ZingH3SamplingParams().zing_joint_forward == "cross_chunk"
+
+
+@pytest.mark.parametrize("typed", [False, True])
+@pytest.mark.parametrize("limit", [None, 6143, 6144, 6145])
+def test_initial_reference_decoded_budget_is_aggregate_and_header_only(
+    configured, monkeypatch, typed, limit
+):
+    from PIL import Image
+
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.conditioning import (
+        release_api_media,
+    )
+
+    configured.pipeline_config.zing_reference_max_decoded_bytes = limit
+    refs = [_reference("one"), _reference("two")]
+    # A reference always decodes to RGB, independently of its compressed size.
+    assert sum(len(ref["payload"]) for ref in refs) < 6143
+    monkeypatch.setattr(
+        Image.Image,
+        "convert",
+        lambda *a, **k: pytest.fail("Admission must precede RGB decode"),
+    )
+    kwargs = dict(references=refs)
+    if typed:
+        kwargs = dict(
+            user_media=[
+                dict(_reference("display"), type="image", reference=False),
+                *[dict(ref, type="image", reference=True) for ref in refs],
+            ]
+        )
+    request = RealtimeVideoGenerationsRequest(
+        type="init",
+        prompt="Render snow",
+        zing_realtime_api_version=1,
+        source_stream=dict(format="rgb24", width=32, height=32, fps=24),
+        size="32x32",
+        **kwargs,
+    )
+    adapter, session = source.ZingH3SourceStreamAdapter(), GenerateSession()
+    session.set_adapter(adapter)
+
+    async def run():
+        try:
+            if limit == 6143:
+                with pytest.raises(ValueError, match="configured decoded size limit"):
+                    await adapter.on_init(session, request)
+            else:
+                await adapter.on_init(session, request)
+                assert len(adapter.reference_items) == 2
+        finally:
+            await adapter.close_conditioning(session)
+            release_api_media(session)
+        assert (
+            session.conditioning_resources.ledger.snapshot()["tenants"]
+            .get(session.id, {})
+            .get("ram", 0)
+            == 0
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("limit", [6143, 6144, 6145, None])
+def test_reference_event_decoded_budget_rejects_without_decode_and_recovers(
+    configured, monkeypatch, limit
+):
+    from PIL import Image
+
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.conditioning import (
+        release_api_media,
+    )
+
+    _enable_reference_updates(configured)
+    configured.pipeline_config.zing_reference_max_decoded_bytes = limit
+    adapter, session = initialize(references=[_reference("old")])
+    active = list(adapter.reference_items)
+    initial_ram = (
+        session.conditioning_resources.ledger.snapshot()["tenants"]
+        .get(session.id, {})
+        .get("ram", 0)
+    )
+    ws = PromptSocket()
+    refs = [_reference("new-1"), _reference("new-2")]
+    monkeypatch.setattr(
+        Image.Image,
+        "convert",
+        lambda *a, **k: pytest.fail("Admission must precede RGB decode"),
+    )
+
+    async def run():
+        try:
+            await adapter.ingest_wire_event(
+                ws,
+                session,
+                dict(
+                    type="event",
+                    kind="prompt",
+                    event_id=1,
+                    payload="new",
+                    references=refs,
+                ),
+                100,
+            )
+            if limit == 6143:
+                assert ws.messages[-1]["type"] == "error"
+                assert ws.messages[-1]["fatal"] is False
+                assert adapter._pending_prompt_command["rejected"] is True
+                assert adapter._pending_reference_upload is None
+                assert (
+                    session.conditioning_resources.ledger.snapshot()["tenants"]
+                    .get(session.id, {})
+                    .get("ram", 0)
+                    == initial_ram
+                )
+            else:
+                assert ws.messages[-1]["type"] == "control_ack"
+                assert len(adapter._pending_reference_upload.items) == 2
+            assert adapter.reference_items == active
+            assert session.request.prompt == "Render snow"
+            # Both a smaller valid set and clearing the set remain possible.
+            for event_id, references in [(2, refs[:1]), (3, [])]:
+                await adapter.ingest_wire_event(
+                    ws,
+                    session,
+                    dict(
+                        type="event",
+                        kind="prompt",
+                        event_id=event_id,
+                        payload="valid",
+                        references=references,
+                    ),
+                    100,
+                )
+                assert ws.messages[-1]["type"] == "control_ack"
+                assert len(adapter._pending_reference_upload.items) == len(references)
+        finally:
+            await adapter.close_conditioning(session)
+            release_api_media(session)
+        assert (
+            session.conditioning_resources.ledger.snapshot()["tenants"]
+            .get(session.id, {})
+            .get("ram", 0)
+            == 0
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("invalid", [0, -1, True, False, 1.5, "1024"])
+def test_reference_decoded_budget_requires_positive_integer_or_null(invalid):
+    from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
+        ZingH3CausalPipelineConfig,
+    )
+
+    config = ZingH3CausalPipelineConfig(zing_reference_max_decoded_bytes=invalid)
+    with pytest.raises(ValueError, match="zing_reference_max_decoded_bytes"):
+        config.validate_server_args(SimpleNamespace())
+
+
+@pytest.mark.parametrize("limit", [None, 1, 1073741824])
+def test_reference_decoded_budget_pipeline_override(limit):
+    from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
+        ZingH3CausalPipelineConfig,
+    )
+
+    config = ZingH3CausalPipelineConfig()
+    assert config.zing_reference_max_decoded_bytes is None
+    config.update_pipeline_config(dict(zing_reference_max_decoded_bytes=limit))
+    assert config.zing_reference_max_decoded_bytes == limit
+
+
+@pytest.mark.parametrize("limit", [0, 2, 32])
+def test_configured_reference_count_init_update_and_ready(configured, limit):
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.conditioning import (
+        release_api_media,
+    )
+
+    configured.pipeline_config.zing_reference_max_images = limit
+    _enable_reference_updates(configured)
+    refs = [_reference(f"picture-{i}") for i in range(limit + 1)]
+    adapter, session = initialize(references=refs[:limit])
+    assert adapter.ready["max_references"] == limit
+    assert adapter.ready["max_user_media"] == limit + 1
+    assert adapter.ready["max_reference_bytes"] == limit * (64 << 20)
+    assert adapter.ready["max_reference_decoded_bytes"] == limit * (48 << 20)
+    assert adapter.ready["max_user_media_bytes"] == (limit + 1) * (64 << 20)
+    assert len(adapter.reference_items) == limit
+    ws = PromptSocket()
+
+    async def run():
+        try:
+            await adapter.ingest_wire_event(
+                ws,
+                session,
+                dict(
+                    type="event",
+                    kind="prompt",
+                    event_id=1,
+                    payload="new",
+                    references=refs[:limit],
+                ),
+                100,
+            )
+            assert ws.messages[-1]["type"] == "control_ack"
+            assert len(adapter._pending_reference_upload.items) == limit
+            await adapter.ingest_wire_event(
+                ws,
+                session,
+                dict(
+                    type="event",
+                    kind="prompt",
+                    event_id=2,
+                    payload="invalid",
+                    references=refs,
+                ),
+                100,
+            )
+            assert ws.messages[-1]["type"] == "error" and not ws.messages[-1]["fatal"]
+            assert session.request.prompt == "Render snow"
+            assert len(adapter.reference_items) == limit
+            await adapter.ingest_wire_event(
+                ws,
+                session,
+                dict(
+                    type="event",
+                    kind="prompt",
+                    event_id=3,
+                    payload="recover",
+                    references=[],
+                ),
+                100,
+            )
+            assert ws.messages[-1]["type"] == "control_ack"
+        finally:
+            await adapter.close_conditioning(session)
+            release_api_media(session)
+
+    asyncio.run(run())
+    with pytest.raises(ValueError, match=f"at most {limit}"):
+        initialize(references=refs)
+
+
+@pytest.mark.parametrize("limit", [2, 32])
+def test_configured_typed_media_budget_includes_fixed_items(configured, limit):
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.conditioning import (
+        release_api_media,
+    )
+
+    configured.pipeline_config.zing_reference_max_images = limit
+    _enable_reference_updates(configured)
+    fixed = dict(_reference("fixed"), type="image", reference=False)
+    refs = [_reference(f"picture-{i}") for i in range(limit)]
+    adapter, session = initialize(
+        user_media=[fixed, *[dict(r, type="image", reference=True) for r in refs[:-1]]]
+    )
+    ws = PromptSocket()
+
+    async def run():
+        try:
+            await adapter.ingest_wire_event(
+                ws,
+                session,
+                dict(
+                    type="event",
+                    kind="prompt",
+                    event_id=1,
+                    payload="new",
+                    references=refs[:-1],
+                ),
+                100,
+            )
+            assert ws.messages[-1]["type"] == "control_ack"
+            await adapter.ingest_wire_event(
+                ws,
+                session,
+                dict(
+                    type="event",
+                    kind="prompt",
+                    event_id=2,
+                    payload="new",
+                    references=refs,
+                ),
+                100,
+            )
+            assert ws.messages[-1]["type"] == "error" and not ws.messages[-1]["fatal"]
+        finally:
+            await adapter.close_conditioning(session)
+            release_api_media(session)
+
+    asyncio.run(run())
+    with pytest.raises(ValueError, match=f"at most {limit + 1} media"):
+        initialize(
+            user_media=[fixed, *[dict(r, type="image", reference=True) for r in refs]]
+        )
+
+
+@pytest.mark.parametrize("invalid", [-1, True, False, 1.5, "32", None])
+def test_reference_count_requires_nonnegative_integer(invalid):
+    from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
+        ZingH3CausalPipelineConfig,
+    )
+
+    config = ZingH3CausalPipelineConfig(zing_reference_max_images=invalid)
+    with pytest.raises(ValueError, match="zing_reference_max_images"):
+        config.validate_server_args(SimpleNamespace())
+
+
+@pytest.mark.parametrize("limit", [0, 2, 32])
+def test_reference_count_pipeline_override(limit):
+    from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
+        ZingH3CausalPipelineConfig,
+    )
+
+    config = ZingH3CausalPipelineConfig(decoder_config=dict(type="official_h3"))
+    assert config.zing_reference_max_images == 21
+    config.update_pipeline_config(dict(zing_reference_max_images=limit))
+    assert config.zing_reference_max_images == limit
+
+
+@pytest.mark.parametrize("count", [0, 9, 21, 32])
+def test_reference_capacity_derives_worst_case_bytes_and_transport(count):
+    from sglang.multimodal_gen.runtime.realtime.source_transport import (
+        SourceTransportBudget,
+    )
+    from sglang.multimodal_gen.runtime.realtime.zing_contracts import ReferenceLimits
+
+    limits = ReferenceLimits(count)
+    assert limits.reference_bytes == count * (64 << 20)
+    assert limits.decoded_reference_bytes == count * (48 << 20)
+    args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(zing_reference_max_images=count),
+        realtime_max_sessions=1,
+        realtime_max_sessions_per_worker=1,
+    )
+    transport = SourceTransportBudget.from_args(args)
+    assert transport.message_bytes == (count + 1) * (64 << 20) + 4096
+    assert transport.reference_bytes == (count + 1) * (64 << 20)
+    assert (
+        transport.session_bytes
+        == 14 * transport.message_bytes + transport.reference_bytes + (1 << 20)
+    )
+    transport.validate_sessions(1)
+    # Explicitly smaller resource budgets must not silently grow.
+    args.realtime_transport_host_bytes = 1 << 20
+    with pytest.raises(ValueError, match="host budget is too small"):
+        SourceTransportBudget.from_args(args).validate_sessions(1)
+
+
+def test_client_can_negotiate_smaller_message_budget(configured):
+    configured.pipeline_config.zing_reference_max_images = 32
+    adapter, session = initialize(source_message_budget_bytes=DEFAULT_MESSAGE_BYTES)
+    assert adapter.ready["max_message_bytes"] == DEFAULT_MESSAGE_BYTES
+    assert adapter.ready["max_references"] == 32
+    assert adapter.ready["max_reference_decoded_bytes"] == 32 * (48 << 20)
+    ws = PromptSocket()
+    from sglang.multimodal_gen.runtime.realtime.source_transport import (
+        SourceTransportError,
+    )
+
+    with pytest.raises(SourceTransportError, match="exceeds"):
+        asyncio.run(
+            adapter.ingest_wire_event(
+                ws,
+                session,
+                dict(type="event", kind="heartbeat"),
+                DEFAULT_MESSAGE_BYTES + 1,
+            )
+        )
+
+
+def test_worst_case_budget_allows_over_legacy_64m_on_real_websocket(configured):
+    import websockets
+
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.conditioning import (
+        release_api_media,
+    )
+    from sglang.multimodal_gen.runtime.realtime.source_transport import (
+        SourceTransportBudget,
+    )
+
+    configured.pipeline_config.zing_reference_max_images = 2
+    _enable_reference_updates(configured)
+    ref = _reference("picture-1")
+    ref["payload"] += bytes((32 << 20) + 8192 - len(ref["payload"]))
+    refs = [ref, dict(ref, id="picture-2")]
+    initial = dict(
+        type="init",
+        prompt="old",
+        zing_realtime_api_version=1,
+        source_stream=dict(format="rgb24", width=32, height=32, fps=24),
+        size="32x32",
+        references=refs,
+    )
+    wire = msgspec.msgpack.encode(initial)
+    assert len(wire) > DEFAULT_MESSAGE_BYTES
+    budget = SourceTransportBudget.from_args(configured)
+    assert len(wire) < budget.message_bytes
+    receipts = []
+
+    async def exercise():
+        async def peer(ws):
+            session = GenerateSession()
+            adapter = source.ZingH3SourceStreamAdapter()
+            session.set_adapter(adapter)
+            try:
+                raw = await ws.recv()
+                request = RealtimeVideoGenerationsRequest.model_validate(
+                    msgspec.msgpack.decode(raw)
+                )
+                await adapter.on_init(session, request)
+                session.set_request(request)
+                await ws.send(msgspec.msgpack.encode(adapter.ready))
+                raw = await ws.recv()
+
+                class Writer:
+                    async def send_bytes(self, value):
+                        await ws.send(value)
+
+                await adapter.ingest_wire_event(
+                    Writer(), session, msgspec.msgpack.decode(raw), len(raw)
+                )
+                receipts.append(len(adapter._pending_reference_upload.items))
+            finally:
+                await adapter.close_conditioning(session)
+                release_api_media(session)
+
+        async with websockets.serve(
+            peer, "127.0.0.1", 0, max_size=budget.message_bytes, compression=None
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            async with websockets.connect(
+                f"ws://127.0.0.1:{port}",
+                max_size=budget.message_bytes,
+                compression=None,
+            ) as ws:
+                await ws.send(wire)
+                ready = msgspec.msgpack.decode(await ws.recv())
+                assert ready["max_references"] == 2
+                assert ready["max_message_bytes"] == budget.message_bytes
+                await ws.send(
+                    msgspec.msgpack.encode(
+                        dict(
+                            type="event",
+                            kind="prompt",
+                            event_id=1,
+                            payload="new",
+                            references=refs,
+                        )
+                    )
+                )
+                ack = msgspec.msgpack.decode(await ws.recv())
+                assert ack["type"] == "control_ack"
+        assert receipts == [2]
+
+    asyncio.run(exercise())
+
+
+def test_reference_capacity_rejects_unaddressable_transport():
+    from sglang.multimodal_gen.runtime.realtime.source_transport import (
+        SourceTransportBudget,
+    )
+
+    args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(zing_reference_max_images=2**64)
+    )
+    with pytest.raises(ValueError, match="addressable"):
+        SourceTransportBudget.from_args(args)
+
+
+@pytest.mark.parametrize(
+    "json_count,cli_count,expected",
+    [(None, None, 21), (2, None, 2), (None, 32, 32), (2, 32, 32), (32, 0, 0)],
+)
+def test_reference_count_cli_overrides_json_and_drives_transport(
+    tmp_path, monkeypatch, json_count, cli_count, expected
+):
+    import sys
+
+    import sglang.multimodal_gen.registry as registry
+    from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
+        ZingH3CausalPipelineConfig,
+    )
+    from sglang.multimodal_gen.runtime.realtime.zing_contracts import ReferenceLimits
+    from sglang.multimodal_gen.runtime.server_args.server_args import (
+        ServerArgs,
+        prepare_server_args,
+    )
+
+    # Resolve a CPU-only config without loading model files or unrelated GPU setup.
+    monkeypatch.setattr(
+        registry,
+        "get_model_info",
+        lambda *a, **k: SimpleNamespace(pipeline_config_cls=ZingH3CausalPipelineConfig),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ServerArgs, "__post_init__", lambda self: self._validate_batching()
+    )
+    argv = ["--model-path", str(tmp_path)]
+    if json_count is not None:
+        path = tmp_path / "pipeline.json"
+        path.write_text(json.dumps(dict(zing_reference_max_images=json_count)))
+        argv += ["--pipeline-config-path", str(path)]
+    if cli_count is not None:
+        if json_count is None:
+            argv += [f"--zing-reference-max-images={cli_count}"]
+        else:
+            argv += ["--zing-reference-max-images", str(cli_count)]
+    monkeypatch.setattr(sys, "argv", ["sglang", *argv])
+    args = prepare_server_args(argv)
+    assert args.pipeline_config.zing_reference_max_images == expected
+    assert (
+        args.realtime_max_message_bytes == ReferenceLimits(expected).media_bytes + 4096
+    )
+    assert args.is_arg_explicitly_set("zing_reference_max_images") == (
+        cli_count is not None
+    )
+
+
+@pytest.mark.parametrize("value", ["1.5", "abc", None])
+def test_reference_count_cli_rejects_non_integer_or_missing_value(value):
+    from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    argv = ["--model-path", "unused", "--zing-reference-max-images"]
+    if value is not None:
+        argv.append(value)
+    with pytest.raises(SystemExit) as error:
+        parser.parse_args(argv)
+    assert error.value.code == 2
+
+
+def test_reference_count_cli_negative_rejected_by_startup(monkeypatch, tmp_path):
+    import sys
+
+    import sglang.multimodal_gen.registry as registry
+    from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
+        ZingH3CausalPipelineConfig,
+    )
+    from sglang.multimodal_gen.runtime.server_args.server_args import (
+        ServerArgs,
+        prepare_server_args,
+    )
+
+    monkeypatch.setattr(
+        registry,
+        "get_model_info",
+        lambda *a, **k: SimpleNamespace(pipeline_config_cls=ZingH3CausalPipelineConfig),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ServerArgs, "__post_init__", lambda self: self._validate_batching()
+    )
+    argv = ["--model-path", str(tmp_path), "--zing-reference-max-images", "-1"]
+    monkeypatch.setattr(sys, "argv", ["sglang", *argv])
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        prepare_server_args(argv)
+
+
+def test_reference_count_cli_does_not_add_setting_to_other_models():
+    from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+
+    parser = argparse.ArgumentParser()
+    PipelineConfig.add_cli_args(parser)
+    parsed = parser.parse_args(["--zing-reference-max-images", "32"])
+    config = PipelineConfig()
+    config.update_config_from_dict(vars(parsed))
+    assert not hasattr(config, "zing_reference_max_images")

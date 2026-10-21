@@ -32,6 +32,29 @@ def image(value=1, **kw):
     )
 
 
+def test_21_images_and_source_preview_identity_preserves_full_snapshot(api):
+    from sglang.multimodal_gen.runtime.conditioning.inputs import (
+        content_identity,
+        validate_condition_media,
+    )
+    from sglang.multimodal_gen.runtime.conditioning.resources import ResourceLimits
+
+    media = [dict(image(), type="video")] + [image(i) for i in range(1, 22)]
+    profile = "a" * 64
+    original = content_identity("prompt", media, profile)
+    changed = [*media[:-1], image(99)]
+    assert original != content_identity("prompt", changed, profile)
+    assert original != content_identity("prompt", media[::-1], profile)
+    with pytest.raises(api.ConditionError, match="Media count"):
+        validate_condition_media([*media, image()], max_media=22)
+    with pytest.raises(api.ConditionError, match="Media count"):
+        validate_condition_media(media, max_media=21)
+    with pytest.raises(api.ConditionError, match="Decoded media"):
+        validate_condition_media(media, max_input_bytes=media[0]["frames"].numel())
+    assert ResourceLimits().max_media == 22
+    assert ResourceLimits(max_media=33).max_media == 33
+
+
 def _cpu_encoder(monkeypatch):
     # Isolate the existing CPU presentation module from pipelines_core's CUDA
     # package initializer; execute its real source, rather than a test double.
@@ -202,3 +225,68 @@ def test_encoder_presentation_dependency_is_per_call(api, monkeypatch):
     result = encode_condition(modules, {}, " p ", [], presentation_fn=presentation)
     assert calls[0]["prompt"] == " p "
     assert result["row_role"].tolist() == [0, 1]
+
+
+@pytest.mark.parametrize("count", [1, 10, 22, 33])
+def test_media_rgb_limits_derive_from_count_without_large_allocations(api, count):
+    from sglang.multimodal_gen.runtime.conditioning.inputs import (
+        content_identity,
+        validate_condition_media,
+    )
+    from sglang.multimodal_gen.runtime.conditioning.resources import ResourceLimits
+
+    limits = ResourceLimits(max_media=count)
+    assert limits.max_input_bytes == count * (48 << 20)
+    assert limits.max_decoded_pixels == count * 16_777_216
+    assert limits.max_request_bytes == limits.max_input_body_bytes
+    assert limits.max_condition_bytes == limits.output_reservation_bytes
+    assert (
+        limits.max_response_bytes
+        == limits.max_condition_bytes + limits.max_header_bytes + 1024
+    )
+    assert (
+        limits.max_inflight_bytes_per_tenant
+        >= limits.max_request_bytes + limits.output_reservation_bytes
+    )
+    # Stride-zero views represent maximum-sized RGB images without allocating
+    # count * 48 MiB; these checks read metadata only, not tensor content.
+    frames = torch.zeros((), dtype=torch.uint8).expand(3, 1, 4096, 4096)
+    media = [dict(type="image", frames=frames) for _ in range(count)]
+    assert (
+        len(
+            validate_condition_media(
+                media,
+                max_media=count,
+                max_side=limits.max_side,
+                max_input_bytes=limits.max_input_bytes,
+                max_decoded_pixels=limits.max_decoded_pixels,
+            )
+        )
+        == count
+    )
+    with pytest.raises(api.ConditionError, match="Decoded media"):
+        validate_condition_media(media, max_input_bytes=limits.max_input_bytes - 1)
+    # Callers that already hashed frames must not meet another hidden 512MiB cap.
+    assert content_identity("prompt", media, "a" * 64, item_hashes=["b" * 64] * count)
+
+
+def test_local_cache_keeps_all_32_references_and_source(api):
+    from sglang.multimodal_gen.runtime.conditioning.worker import LocalConditioner
+
+    calls = []
+
+    def encode(prompt, media):
+        calls.append(len(media))
+        return dict(
+            context=torch.zeros(2, 5120, dtype=torch.bfloat16),
+            row_role=torch.zeros(2, dtype=torch.int64),
+        )
+
+    conditioner = LocalConditioner(encode, "a" * 64, cache_bytes=1 << 20)
+    media = [dict(image(), type="video")] + [image(i) for i in range(32)]
+    conditioner("prompt", media)
+    conditioner("prompt", media)
+    assert calls == [33]
+    media[-1]["frames"].add_(1)
+    conditioner("prompt", media)
+    assert calls == [33, 33]

@@ -20,6 +20,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.zing_h3_decoder import (
     DecoderSpec,
     normalize_decoder_spec,
 )
+from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
+    DEFAULT_MAX_REFERENCE_IMAGES,
+    ReferenceLimits,
+)
 
 
 def resolve_zing_modality_tags(num_modalities, tags=None):
@@ -93,6 +97,11 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
     zing_kv_pool_window_eviction_timing: str = "after_step0"
     # Runtime-owned rolling target history used when a WebSocket prompt changes.
     prompt_switch_prefix_latent_frames: int = 5
+    # Count admission only; the source/presentation budget is this count plus one.
+    zing_reference_max_images: int = DEFAULT_MAX_REFERENCE_IMAGES
+    # Optional limit on one uploaded reference set, measured as decoded RGB bytes.
+    # None derives N * 48 MiB from the image pixel maximum. Not total process RSS.
+    zing_reference_max_decoded_bytes: int | None = None
 
     # Legacy decoder fields the caller supplied; a default must not look like a choice.
     _explicit_decoder_fields = frozenset()
@@ -168,6 +177,14 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
         return self.zing_adaln_table_path
 
     def validate_server_args(self, server_args):
+        ReferenceLimits(self.zing_reference_max_images)
+        if self.zing_reference_max_decoded_bytes is not None and (
+            type(self.zing_reference_max_decoded_bytes) is not int
+            or self.zing_reference_max_decoded_bytes <= 0
+        ):
+            raise ValueError(
+                "zing_reference_max_decoded_bytes must be a positive integer or null"
+            )
         if (
             type(self.prompt_switch_prefix_latent_frames) is not int
             or self.prompt_switch_prefix_latent_frames != 5

@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Real CPU collectives and CNNs; CUDA/BF16 acceptance remains separate."""
 
+import faulthandler
+import gc
+import os
+import sys
+import weakref
 from datetime import timedelta
 from types import MethodType, SimpleNamespace
-
-import os
 
 import pytest
 import torch
@@ -12,6 +15,9 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
 
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.klvae import (
+    AutoencoderKL,
+)
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.parallel_encoder import (
     create_encoder_cache,
 )
@@ -20,9 +26,6 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.progressive 
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vae_cnn import (
     EncoderFCN3D,
-)
-from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.klvae import (
-    AutoencoderKL,
 )
 
 
@@ -56,7 +59,21 @@ def _model(stack):
 
 
 def _worker(rank, world, rendezvous, stack):
+    faulthandler.enable(all_threads=True)
+
+    def stage(name):
+        print(
+            f"[parallel-encoder rank={rank}/{world} stack={stack}] {name}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    stage("initializing")
     torch.set_num_threads(1)
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import klvae
+
+    original_state = klvae.get_tile_parallel_state
+    original_group = klvae.get_decode_parallel_group_coordinator
     dist.init_process_group(
         "gloo",
         init_method=rendezvous,
@@ -64,13 +81,11 @@ def _worker(rank, world, rendezvous, stack):
         world_size=world,
         timeout=timedelta(seconds=90),
     )
+    group_ref = weakref.ref(dist.group.WORLD)
+    stage("initialized")
     try:
         model = _model(stack)
         # Force a conflicting serving group; explicit worker injection must win.
-        from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import klvae
-
-        original_state = klvae.get_tile_parallel_state
-        original_group = klvae.get_decode_parallel_group_coordinator
         klvae.get_tile_parallel_state = lambda: (0, 1)
         klvae.get_decode_parallel_group_coordinator = lambda: (_ for _ in ()).throw(
             AssertionError("Serving group must not be consulted")
@@ -114,6 +129,7 @@ def _worker(rank, world, rendezvous, stack):
                 ref.clear()
                 candidate.clear()
                 assert not candidate.states
+        stage("cache checks complete")
         # Exercise the merged session contract, including policy validation,
         # rank agreement, execution metadata, EOS and cache commit/clear.
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.progressive_encoder import (
@@ -160,12 +176,28 @@ def _worker(rank, world, rendezvous, stack):
             assert session.cache.last_execution["latent_end"] == actual.end
             assert actual.source_dependency_end == expected.source_dependency_end
         assert not session.ready
+        stage("session checks complete")
         reference.dispose()
         session.dispose()
+        stage("sessions disposed")
+        # dispose()/clear() release tensors, but caches still own Gloo group
+        # references. Drop every owner (including the loop alias) while Python
+        # is alive, before destroying the group and exiting the spawned worker.
+        del item, reference, session, ref, candidate, codecs, model
+        gc.collect()
+        dist.monitored_barrier(timeout=timedelta(seconds=30), wait_all_ranks=True)
+        stage("fixtures released; ranks synchronized")
     finally:
         klvae.get_tile_parallel_state = original_state
         klvae.get_decode_parallel_group_coordinator = original_group
+        stage("destroying process group")
         dist.destroy_process_group()
+        stage("process group destroyed")
+    # Keep this outside finally so an original assertion/encoding failure is
+    # never replaced by the success-path lifecycle check.
+    gc.collect()
+    assert group_ref() is None, "Encoder fixtures retained the process group"
+    stage("worker complete")
 
 
 @pytest.mark.parametrize("world,stack", [(1, True), (2, False), (2, True), (4, True)])
@@ -176,3 +208,13 @@ def test_distributed_tiles_match_unmodified_cnn(tmp_path, world, stack):
         nprocs=world,
         join=True,
     )
+
+
+def test_worker_preserves_model_setup_error(tmp_path, monkeypatch):
+    def fail_model(stack):
+        raise RuntimeError("Injected model setup failure")
+
+    monkeypatch.setattr(sys.modules[__name__], "_model", fail_model)
+    with pytest.raises(RuntimeError, match="Injected model setup failure"):
+        _worker(0, 1, "file://" + str(tmp_path / "rdzv"), True)
+    assert not dist.is_initialized()

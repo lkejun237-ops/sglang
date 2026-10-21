@@ -401,7 +401,9 @@ def test_request_saves_received_profile_beside_client_results(tmp_path):
     asyncio.run(run())
 
 
-async def streaming_peer(ws, observations, *, disconnect=False, steps=4):
+async def streaming_peer(
+    ws, observations, *, disconnect=False, steps=4, prompt_modes=None, max_references=21
+):
     """Protocol peer: echo bytes, with bounded credit; it is not a model."""
     import asyncio
 
@@ -427,9 +429,12 @@ async def streaming_peer(ws, observations, *, disconnect=False, steps=4):
             max_source_batch_frames=2,
             max_pending_source_frames=2,
             max_pending_source_bytes=2 * stride,
+            prompt_reference_updates=True,
+            max_references=max_references,
+            max_user_media=max_references + 1,
         )
     )
-    frames = 0
+    frames, active_prompt = 0, None
     async for wire in ws:
         message = msgpack.unpackb(wire, raw=False)
         observations.append(message)
@@ -454,6 +459,23 @@ async def streaming_peer(ws, observations, *, disconnect=False, steps=4):
                         observations.append(ack)
                         break
             return
+        if message["kind"] == "prompt":
+            mode = (prompt_modes or {}).get(message["payload"], "apply")
+            if mode == "apply":
+                active_prompt = message["event_id"]
+            elif mode == "reject":
+                await send(
+                    dict(
+                        type="error",
+                        fatal=False,
+                        event_id=message["event_id"],
+                        code="CONDITION_INVALID",
+                    )
+                )
+            await send(
+                dict(type="control_ack", kind="prompt", event_id=message["event_id"])
+            )
+            continue
         if message["kind"] != "source.append":
             continue
         packet = message["payload"]
@@ -486,6 +508,7 @@ async def streaming_peer(ws, observations, *, disconnect=False, steps=4):
         await send(
             dict(
                 type="frame_batch_header",
+                event_id=active_prompt,
                 output_frame_start=start,
                 num_frames=count,
                 total_size=count * stride,
@@ -511,9 +534,10 @@ async def streaming_peer(ws, observations, *, disconnect=False, steps=4):
 
 @pytest.mark.parametrize("paced", [False, True])
 @pytest.mark.parametrize("source_format", ["rgb", "video"])
+@pytest.mark.parametrize("updates", [False, True])
 @pytest.mark.parametrize("steps", [1, 2, 3, 4, 5])
 def test_streaming_client_delivers_before_eos_and_obeys_credit(
-    tmp_path, paced, source_format, steps
+    tmp_path, paced, source_format, updates, steps
 ):
     import asyncio
 
@@ -524,6 +548,29 @@ def test_streaming_client_delivers_before_eos_and_obeys_credit(
     source = tmp_path / "source.rgb"
     source.write_bytes(raw)
     observations = []
+    update_args = []
+    if updates:
+        from PIL import Image
+
+        Image.new("RGB", (2, 2), "red").save(tmp_path / "reference.png")
+        path = tmp_path / "updates.json"
+        path.write_text(
+            json.dumps(
+                [
+                    dict(
+                        source_frame_start=1,
+                        prompt="replace",
+                        references=[
+                            dict(id=f"<Picture {i + 1}>", path="reference.png")
+                            for i in range(21)
+                        ],
+                    ),
+                    dict(source_frame_start=3, prompt="keep"),
+                    dict(source_frame_start=5, prompt="clear", references=[]),
+                ]
+            )
+        )
+        update_args = ["--prompt-updates", str(path)]
     if source_format == "video":
         import shutil
         import subprocess
@@ -580,6 +627,7 @@ def test_streaming_client_delivers_before_eos_and_obeys_credit(
                     "--expected-frames",
                     "6",
                     *(["--paced"] if paced else []),
+                    *update_args,
                 ]
             )
             return await run(args)
@@ -593,11 +641,239 @@ def test_streaming_client_delivers_before_eos_and_obeys_credit(
     assert result["source_to_first_output_seconds"] < result["ttff_seconds"]
     assert result["input_sha256"] == result["output_sha256"]
     assert result["ifl_seconds"] is None
-    assert result["icl_seconds"]["count"] == 2
+    assert result["icl_seconds"]["count"] == (3 if updates else 2)
     assert result["input_mode"] == ("paced" if paced else "unpaced")
     assert (tmp_path / "result/output.rgb").read_bytes() == raw
     assert "num_frames" not in observations[0]["source_stream"]
     assert observations[-1]["kind"] == "source.end"
+    if updates:
+        events = [item for item in observations if item.get("kind") == "prompt"]
+        assert [item["payload"] for item in events] == ["replace", "keep", "clear"]
+        assert [ref["id"] for ref in events[0]["references"]] == [
+            f"<Picture {i + 1}>" for i in range(21)
+        ]
+        assert all(
+            ref["payload"] == (tmp_path / "reference.png").read_bytes()
+            for ref in events[0]["references"]
+        )
+        assert "references" not in events[1] and events[2]["references"] == []
+        outcomes = result["prompt_updates"]
+        assert [row["status"] for row in outcomes] == ["applied"] * 3
+        assert [row["output_frame_start"] for row in outcomes] == [1, 3, 5]
+        assert all(
+            row["latency_ms"] > 0
+            and row["pts_us"] == row["output_frame_start"] * 1_000_000 // 24
+            for row in outcomes
+        )
+        assert result["prompt_update_latency_ms"]["count"] == 3
+        source_position = 0
+        positions = []
+        event_ids = []
+        for item in observations[1:]:
+            event_ids.append(item["event_id"])
+            if item["kind"] == "source.append":
+                source_position += item["payload"]["num_frames"]
+            if item["kind"] == "prompt":
+                positions.append(source_position)
+        assert positions == [1, 3, 5]
+        assert event_ids == sorted(set(event_ids))
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {},
+        [dict(source_frame_start=-1, prompt="bad")],
+        [dict(source_frame_start=0, prompt="bad", references=None)],
+        [
+            dict(source_frame_start=2, prompt="first"),
+            dict(source_frame_start=1, prompt="second"),
+        ],
+        [
+            dict(
+                source_frame_start=0,
+                prompt="bad",
+                references=[
+                    dict(id="same", path="a.png"),
+                    dict(id="same", path="b.png"),
+                ],
+            )
+        ],
+    ],
+)
+def test_prompt_update_manifest_rejects_invalid_schedule(tmp_path, updates):
+    from continuous_source_media import load_prompt_updates
+
+    manifest = tmp_path / "updates.json"
+    manifest.write_text(json.dumps(updates))
+    with pytest.raises(ValueError):
+        load_prompt_updates(manifest)
+
+
+@pytest.mark.parametrize("count", [21, 22, 32])
+def test_prompt_update_manifest_reference_count_boundary(tmp_path, count):
+    from continuous_source_media import load_prompt_updates
+
+    references = [
+        dict(id=f"<Picture {i + 1}>", path=f"ref-{i}.png") for i in range(count)
+    ]
+    manifest = tmp_path / "updates.json"
+    manifest.write_text(
+        json.dumps([dict(source_frame_start=17, prompt="new", references=references)])
+    )
+    result = load_prompt_updates(manifest)[0]["references"]
+    assert [r["id"] for r in result] == [r["id"] for r in references]
+    assert [r["path"] for r in result] == [
+        str(tmp_path / r["path"]) for r in references
+    ]
+
+
+def test_prompt_delivery_outcomes_exclude_rejected_superseded_and_unobserved(tmp_path):
+    import asyncio
+
+    import websockets
+    from continuous_source_client import parser, run
+
+    source = tmp_path / "source.rgb"
+    source.write_bytes(bytes(72))
+    manifest = tmp_path / "updates.json"
+    manifest.write_text(
+        json.dumps(
+            [
+                dict(source_frame_start=pos, prompt=prompt)
+                for pos, prompt in [
+                    (0, "skip-first"),
+                    (1, "apply"),
+                    (2, "reject"),
+                    (3, "apply-again"),
+                    (5, "skip-last"),
+                ]
+            ]
+        )
+    )
+
+    async def exercise():
+        modes = {"skip-first": "skip", "reject": "reject", "skip-last": "skip"}
+        async with websockets.serve(
+            lambda ws: streaming_peer(ws, [], prompt_modes=modes), "127.0.0.1", 0
+        ) as server:
+            args = parser().parse_args(
+                [
+                    "--url",
+                    f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
+                    "--source-rgb",
+                    str(source),
+                    "--output",
+                    str(tmp_path / "result"),
+                    "--width",
+                    "2",
+                    "--height",
+                    "2",
+                    "--prompt",
+                    "initial",
+                    "--prompt-updates",
+                    str(manifest),
+                ]
+            )
+            return await run(args)
+
+    result = asyncio.run(exercise())
+    rows = result["prompt_updates"]
+    assert [row["status"] for row in rows] == [
+        "superseded",
+        "applied",
+        "rejected",
+        "applied",
+        "not_observed",
+    ]
+    assert result["prompt_update_latency_ms"]["count"] == 2
+    assert all(row["latency_ms"] is None for row in rows if row["status"] != "applied")
+    assert result["prompt_update_status_counts"]["rejected"] == 1
+    assert (
+        json.loads((tmp_path / "result/prompt-updates.json").read_text())[
+            "prompt_updates"
+        ]
+        == rows
+    )
+
+
+@pytest.mark.parametrize("disconnect", [False, True])
+def test_prompt_latency_includes_send_wait_and_retains_interrupted_outcome(
+    tmp_path, monkeypatch, disconnect
+):
+    import asyncio
+    from builtins import ExceptionGroup
+    from contextlib import asynccontextmanager
+
+    import msgpack
+    import websockets
+    from continuous_source_client import parser, run
+
+    source = tmp_path / "source.rgb"
+    source.write_bytes(bytes(24))
+    manifest = tmp_path / "updates.json"
+    manifest.write_text(json.dumps([dict(source_frame_start=0, prompt="update")]))
+    original_connect = websockets.connect
+
+    @asynccontextmanager
+    async def delayed_connect(*args, **kwargs):
+        async with original_connect(*args, **kwargs) as ws:
+            original_send = ws.send
+
+            async def send(wire):
+                if msgpack.unpackb(wire, raw=False).get("kind") == "prompt":
+                    await asyncio.sleep(0.04)
+                await original_send(wire)
+
+            monkeypatch.setattr(ws, "send", send)
+            yield ws
+
+    monkeypatch.setattr(websockets, "connect", delayed_connect)
+
+    async def exercise():
+        async with websockets.serve(
+            lambda ws: streaming_peer(
+                ws,
+                [],
+                disconnect=disconnect,
+                prompt_modes={"update": "skip"} if disconnect else None,
+            ),
+            "127.0.0.1",
+            0,
+        ) as server:
+            args = parser().parse_args(
+                [
+                    "--url",
+                    f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
+                    "--source-rgb",
+                    str(source),
+                    "--output",
+                    str(tmp_path / "result"),
+                    "--width",
+                    "2",
+                    "--height",
+                    "2",
+                    "--prompt",
+                    "initial",
+                    "--prompt-updates",
+                    str(manifest),
+                ]
+            )
+            if disconnect:
+                with pytest.raises(ExceptionGroup):
+                    await run(args)
+            else:
+                result = await run(args)
+                assert result["prompt_updates"][0]["latency_ms"] >= 40
+
+    asyncio.run(exercise())
+    report = json.loads((tmp_path / "result/prompt-updates.json").read_text())
+    assert report["prompt_updates"][0]["status"] == (
+        "interrupted" if disconnect else "applied"
+    )
+    assert report["prompt_update_latency_ms"]["count"] == (0 if disconnect else 1)
+    if disconnect:
+        assert report["prompt_updates"][0]["latency_ms"] is None
 
 
 @pytest.mark.parametrize("steps", [0, -1, True, None, 1.5, "1"])
@@ -828,6 +1104,19 @@ def test_streaming_benchmark_keeps_warmup_out_of_summary_and_exports(
             first_output_before_source_end=True,
             dependency_to_output_seconds={},
             source_to_output_seconds={},
+            prompt_updates=[
+                dict(
+                    event_id=1,
+                    status="applied",
+                    submitted_seconds=1,
+                    received_seconds=2,
+                    latency_ms=1000,
+                    output_frame_start=0,
+                    pts_us=0,
+                )
+            ],
+            prompt_update_latency_ms=dict(count=1, median=1000, p95=1000),
+            prompt_update_status_counts=dict(applied=1),
         )
 
     monkeypatch.setattr(streaming, "run", observe)
@@ -852,6 +1141,7 @@ def test_streaming_benchmark_keeps_warmup_out_of_summary_and_exports(
         timeout=10,
         ffmpeg="ffmpeg",
         batch_pattern=[1],
+        prompt_updates=None,
     )
     summary = asyncio.run(streaming.benchmark([case], args))
     assert seen == ["warmup-0", "measured-0", "measured-1", "measured-2"]
@@ -864,6 +1154,12 @@ def test_streaming_benchmark_keeps_warmup_out_of_summary_and_exports(
     assert exported["requests"][1]["metrics"]["stall_seconds"] == 0.5
     assert exported["requests"][1]["metrics"]["ifl_seconds"] is None
     assert exported["requests"][1]["streaming"]["source_send_span_seconds"] == 3
+    assert (
+        exported["requests"][1]["streaming"]["prompt_updates"][0]["latency_ms"] == 1000
+    )
+    assert (
+        exported["requests"][1]["streaming"]["prompt_update_latency_ms"]["count"] == 1
+    )
     assert (tmp_path / "results.html").is_file()
 
 
@@ -951,6 +1247,7 @@ def test_streaming_benchmark_stops_after_failed_warmup_and_keeps_receipt(
         timeout=10,
         ffmpeg="ffmpeg",
         batch_pattern=[1],
+        prompt_updates=None,
     )
     with pytest.raises(RuntimeError, match="source tasks failed"):
         asyncio.run(streaming.benchmark([case], args))
@@ -1060,3 +1357,71 @@ def test_benchmark_defaults_to_host_request_and_can_opt_out():
     assert (
         not parser().parse_args([*required, "--no-stage-timing"]).receive_stage_timing
     )
+
+
+@pytest.mark.parametrize("limit,count", [(0, 0), (2, 2), (32, 32), (2, 3)])
+def test_streaming_client_uses_advertised_reference_limit(tmp_path, limit, count):
+    import asyncio
+
+    import websockets
+    from continuous_source_client import parser, run
+    from PIL import Image
+
+    (tmp_path / "source.rgb").write_bytes(bytes(range(72)))
+    Image.new("RGB", (2, 2), "red").save(tmp_path / "ref.png")
+    (tmp_path / "updates.json").write_text(
+        json.dumps(
+            [
+                dict(
+                    source_frame_start=1,
+                    prompt="new",
+                    references=[
+                        dict(id=f"picture-{i}", path="ref.png") for i in range(count)
+                    ],
+                )
+            ]
+        )
+    )
+    observations = []
+
+    async def exercise():
+        async with websockets.serve(
+            lambda ws: streaming_peer(ws, observations, max_references=limit),
+            "127.0.0.1",
+            0,
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            args = parser().parse_args(
+                [
+                    "--url",
+                    f"ws://127.0.0.1:{port}",
+                    "--source-rgb",
+                    str(tmp_path / "source.rgb"),
+                    "--output",
+                    str(tmp_path / "result"),
+                    "--width",
+                    "2",
+                    "--height",
+                    "2",
+                    "--expected-frames",
+                    "6",
+                    "--prompt",
+                    "base",
+                    "--prompt-updates",
+                    str(tmp_path / "updates.json"),
+                    "--batch-pattern",
+                    "1",
+                    "2",
+                ]
+            )
+            if count > limit:
+                with pytest.raises(ValueError, match=f"at most {limit}"):
+                    await run(args)
+                assert len(observations) == 1  # Only init; no oversized event was sent.
+            else:
+                result = await run(args)
+                assert result["completed"] and result["received"] == 6
+                event = next(r for r in observations if r.get("kind") == "prompt")
+                assert len(event["references"]) == count
+
+    asyncio.run(exercise())

@@ -18,7 +18,7 @@ from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
     Provenance,
 )
 
-from .packing import H3RowRole
+from .packing import H3InferenceInputs, H3RowRole
 from .realtime import ZingH3RealtimeState
 from .realtime_sampling import ZingH3RealtimeSampler, ZingH3RealtimeSamplingState
 
@@ -58,6 +58,7 @@ class PromptSnapshot(NamedTuple):
     condition: dict[str, torch.Tensor]
     event_id: int | str | None
     prompt_version: int | None
+    inputs: H3InferenceInputs | None = None
 
 
 class SourceReadySession:
@@ -190,17 +191,18 @@ class SourceReadySession:
         )
 
     @staticmethod
-    def _snapshot(condition, event_id, prompt_version=None):
+    def _snapshot(condition, event_id, prompt_version=None, inputs=None):
         return PromptSnapshot(
             {k: v.detach().clone() for k, v in condition.items()},
             event_id,
             prompt_version,
+            inputs,
         )
 
-    def update_prompt(self, condition, event_id, prompt_version=None):
+    def update_prompt(self, condition, event_id, prompt_version=None, *, inputs=None):
         if self.closed or self.draining:
             raise ValueError("The source-ready session is closed or draining")
-        candidate = self._snapshot(condition, event_id, prompt_version)
+        candidate = self._snapshot(condition, event_id, prompt_version, inputs)
         self.pending_prompt = candidate
 
     def discard_pending_prompt(self):
@@ -253,15 +255,20 @@ class SourceReadySession:
         if self.audio_enabled:
             raise ValueError("Prompt switching currently supports video-only sessions")
         candidate = self.pending_prompt
+        inputs = self.inputs if candidate.inputs is None else candidate.inputs
         origin, latent_end = self.sampler.rebuild_prompt_prefix(
-            self.inputs, candidate.condition, self.recent_visual, self.cache
+            inputs, candidate.condition, self.recent_visual, self.cache
         )
+        if latent_end != ready.model_chunk.start:
+            raise ValueError("Prompt-switch prefix does not meet the next model block")
+        if candidate.inputs is not None:
+            self.inputs = copy(candidate.inputs)
+            self.inputs.source_visual = self.inputs.positive = None
+            self.inputs.condition_media = None
         self.prompt = self.applied_prompt = candidate
         if self.pending_prompt is candidate:
             self.pending_prompt = None
         self.media_origin = origin
-        if latent_end != ready.model_chunk.start:
-            raise ValueError("Prompt-switch prefix does not meet the next model block")
         self.model_chunk_id = ready.model_chunk.chunk_id
 
     def _remember_visual(self, visual):
@@ -771,6 +778,15 @@ class SourceReadySession:
         for prompt in (self.prompt, self.pending_prompt, self.applied_prompt):
             if prompt is not None:
                 static.extend(prompt.condition.values())
+                if prompt.inputs is not None:
+                    static.extend(prompt.inputs.positive.values())
+                    static.extend(prompt.inputs.visual.values())
+                    static.extend(prompt.inputs.audio.values())
+                    static.extend(
+                        item["frames"]
+                        for item in prompt.inputs.condition_media or []
+                        if "frames" in item
+                    )
         if self.recent_visual is not None:
             static.append(self.recent_visual)
         return {

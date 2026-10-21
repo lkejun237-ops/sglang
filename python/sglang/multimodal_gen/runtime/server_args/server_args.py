@@ -3093,13 +3093,13 @@ class ServerArgs(DisaggServerArgsMixin):
             "--realtime-max-message-bytes",
             type=int,
             default=ServerArgs.realtime_max_message_bytes,
-            help="Bound on each complete realtime WebSocket message, in bytes.",
+            help="Bound on each complete realtime WebSocket message, in bytes. Zing derives its default from the configured reference count; explicit values override it.",
         )
         parser.add_argument(
             "--realtime-transport-host-bytes",
             type=int,
             default=ServerArgs.realtime_transport_host_bytes,
-            help="Host buffer budget for admitted realtime transports; excludes model and KV memory.",
+            help="Host buffer budget for admitted realtime transports; excludes model and KV memory. Zing derives its default from reference/message capacities; explicit values override it.",
         )
         parser.add_argument(
             "--realtime-max-sessions",
@@ -4029,9 +4029,12 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
 
-        SourceTransportBudget.from_args(self).validate_sessions(
+        transport = SourceTransportBudget.from_args(self)
+        transport.validate_sessions(
             max(self.realtime_max_sessions, self.realtime_max_sessions_per_worker)
         )
+        self.realtime_max_message_bytes = transport.message_bytes
+        self.realtime_transport_host_bytes = transport.host_bytes
         if self.realtime_max_sessions < 1:
             raise ValueError("realtime_max_sessions must be >= 1")
         if self.realtime_max_sessions_per_worker < 1:

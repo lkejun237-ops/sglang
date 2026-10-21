@@ -88,3 +88,42 @@ def test_profile_requires_frozen_numeric_environment(api, profile, missing):
     del document["numerical_environment"][missing]
     with pytest.raises(api.ConditionError):
         api.DeploymentProfile(document)
+
+
+@pytest.mark.parametrize("max_media", [1, 3, 33])
+def test_rpc_media_capacity_is_configurable_not_capped_at_22(api, profile, max_media):
+    import torch
+
+    from sglang.multimodal_gen.runtime.conditioning.inputs import content_identity
+    from sglang.multimodal_gen.runtime.conditioning.resources import ResourceLimits
+    from sglang.multimodal_gen.runtime.conditioning.wire import (
+        decode_request,
+        encode_request,
+    )
+
+    media = [
+        dict(
+            type="video" if i == 0 else "image",
+            fps=24 if i == 0 else 1,
+            frames=torch.full((3, 1, 2, 4), i, dtype=torch.uint8),
+        )
+        for i in range(max_media)
+    ]
+    body = encode_request("prompt", media, profile.profile_id)
+    header, decoded = decode_request(body, profile, ResourceLimits(max_media=max_media))
+    assert len(decoded) == max_media
+    assert header["input_digest"] == content_identity(
+        "prompt", media, profile.profile_id
+    )
+    assert torch.equal(decoded[-1]["frames"], media[-1]["frames"])
+    extra = encode_request("prompt", [*media, media[-1]], profile.profile_id)
+    with pytest.raises(api.ConditionError, match="media list"):
+        decode_request(extra, profile, ResourceLimits(max_media=max_media))
+    if max_media > 22:
+        with pytest.raises(api.ConditionError, match="media list"):
+            decode_request(body, profile, ResourceLimits())
+        changed = [*media[:-1], dict(media[-1], frames=media[-1]["frames"] + 1)]
+        assert (
+            content_identity("prompt", changed, profile.profile_id)
+            != header["input_digest"]
+        )

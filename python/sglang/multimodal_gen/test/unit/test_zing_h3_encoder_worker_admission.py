@@ -242,10 +242,19 @@ def test_deployment_admission_capacity_is_single_session_for_zing(monkeypatch, z
 
     module.ZingH3CausalPipelineConfig = ZingConfig
     monkeypatch.setitem(sys.modules, module_name, module)
+    from sglang.multimodal_gen.runtime.realtime.source_transport import (
+        SourceTransportBudget,
+    )
+
+    budget = SourceTransportBudget()
     capacities = []
     namespace = dict(
         SourceTransportBudget=SimpleNamespace(
-            from_args=lambda args: SimpleNamespace(validate_sessions=capacities.append)
+            from_args=lambda args: SimpleNamespace(
+                validate_sessions=capacities.append,
+                message_bytes=budget.message_bytes,
+                host_bytes=budget.host_bytes,
+            )
         ),
         REALTIME_VAE_BACKENDS=("local",),
         REALTIME_VAE_TRANSPORTS=("auto",),

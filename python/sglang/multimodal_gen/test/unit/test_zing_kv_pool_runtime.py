@@ -403,6 +403,39 @@ def _storage_for(model, rows):
 
 
 @torch.no_grad()
+def test_reference_admission_counts_candidate_rows(model):
+    from copy import copy
+
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.source_session import (
+        ZingSourceStreamState,
+    )
+
+    sampler = _sampler(model)
+    stage = object.__new__(ZingH3GenerationStage)
+    stage.kv_pool = SimpleNamespace(plan=_plan(1))
+    stage.packer, stage.codecs = sampler.processor, SimpleNamespace(spatial_ratio=16)
+    state = ZingSourceStreamState()
+    state.inputs = _inputs(8)
+    state.inputs.source_visual = state.inputs.audio_shape = None
+    state.sampler = SimpleNamespace(sampler=sampler)
+    condition = dict(
+        context=torch.zeros(16, 12).bfloat16(),
+        row_role=torch.zeros(16, dtype=torch.long),
+    )
+    state._admit_prompt_update(stage, condition)  # 16 text rows fit exactly.
+    candidate = copy(state.inputs)
+    candidate.conditions = [
+        dict(content_id="new", role="reference", latent_modalities=["visual"])
+    ]
+    candidate.media = [dict(id="new", type="image")]
+    candidate.visual = {"new": torch.ones(1, 2, 1, 2, 2)}
+    with pytest.raises(ConditionError):
+        state._admit_prompt_update(stage, condition, candidate)
+    assert state.inputs.visual == {}
+
+
+@torch.no_grad()
 @pytest.mark.parametrize("with_reference", [False, True])
 def test_prompt_budget_rejection_preserves_live_pool_and_recovers(
     model, with_reference

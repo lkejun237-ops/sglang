@@ -58,7 +58,7 @@ from sglang.multimodal_gen.runtime.realtime.critical_path_metrics import (
 )
 from sglang.multimodal_gen.runtime.realtime.source_transport import (
     PROTOCOL_OVERHEAD_BYTES,
-    REFERENCE_BYTES,
+    SourceTransportBudget,
     SourceTransportError,
     check,
 )
@@ -1833,8 +1833,15 @@ async def _listen_generate_request(
                 adapter=adapter.__class__.__name__,
             )
             if getattr(realtime_req, "source_stream", None) is not None:
+                transport = SourceTransportBudget.from_args(
+                    get_global_server_args()
+                ).negotiate(getattr(realtime_req, "source_message_budget_bytes", None))
                 check(
-                    len(raw_message) <= REFERENCE_BYTES + PROTOCOL_OVERHEAD_BYTES,
+                    len(raw_message)
+                    <= min(
+                        transport.message_bytes,
+                        transport.reference_bytes + PROTOCOL_OVERHEAD_BYTES,
+                    ),
                     "source_init_too_large",
                     "The reference images or session settings are too large.",
                 )
@@ -1962,15 +1969,13 @@ async def _cleanup_realtime_session(
     input_files_removed = (
         session.input_temp_dir is None or not Path(session.input_temp_dir).exists()
     )
-    if input_files_removed:
-        from .conditioning import release_api_media
+    from .conditioning import release_api_media
 
-        release_api_media(session)
-    else:
-        # A failed filesystem removal cannot free the still-owned disk budget.
-        # Preserve the path and leases for another cleanup attempt.
+    release_api_media(session)
+    if not input_files_removed:
+        # Retain unrelated session files for another cleanup attempt.
         logger.warning(
-            "Conditioning input files remain charged after cleanup: %s",
+            "Session input files remain after cleanup: %s",
             session.input_temp_dir,
         )
     from .conditioning import release_message_reservation

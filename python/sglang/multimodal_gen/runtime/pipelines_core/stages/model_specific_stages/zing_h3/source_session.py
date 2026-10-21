@@ -202,21 +202,22 @@ class ZingSourceStreamState(BaseRealtimeState):
 
         return acquire
 
-    def _admit_prompt_update(self, stage, condition):
+    def _admit_prompt_update(self, stage, condition, inputs=None):
         """Check the new condition before it can replace active or pending KV."""
         if getattr(stage, "kv_pool", None) is None:
             return
         # Pack one placeholder target to reuse the authoritative reference-row
         # accounting. No model forward, random draw, lease or KV write occurs.
         packer = stage.packer
-        _, height, width = self.inputs.visual_shape
+        inputs = self.inputs if inputs is None else inputs
+        _, height, width = inputs.visual_shape
         visual = condition["context"].new_zeros(
             (1, packer.visual_channels, 1, height, width)
         )
-        layout = packer.pack_inference_layout(self.inputs, condition, visual, None)
+        layout = packer.pack_inference_layout(inputs, condition, visual, None)
         request = stage.kv_request(
             self.sampler.sampler,
-            self.inputs,
+            inputs,
             layout,
             source_shape=(height, width),
             total_frames=None,
@@ -230,25 +231,63 @@ class ZingSourceStreamState(BaseRealtimeState):
     def _update_prompt(self, stage, batch):
         """Reject invalid candidates without disturbing the active generation."""
         notice = None
-        update = (batch.sampling_params.prompt, batch.realtime_event_id)
+        command = getattr(batch, "extra", {}).get("zing_prompt_update", {})
+        update = (
+            command.get("prompt", batch.sampling_params.prompt),
+            command.get("event_id", batch.realtime_event_id),
+        )
         discard = getattr(self.sampler, "discard_pending_prompt", None)
         if discard is not None:
             discard()
+        if command.get("rejected"):
+            self.failed_update = update
+            return None  # API already sent the nonfatal error for this event.
+        candidate = None
         try:
-            positive = stage.encode_condition_for_batch(
-                batch,
-                batch.sampling_params.prompt,
-                self.inputs.condition_media,
+            if "references" in command:
+                if getattr(stage, "prompt_switch_prefix_latent_frames", None) != 5:
+                    raise ConditionError(
+                        "CONDITION_INVALID",
+                        "Reference updates require prompt prefix rebuilding",
+                    )
+                candidate = stage.codecs.prepare_reference_update(
+                    self.inputs,
+                    command["references"],
+                    update[0],
+                    stage._use,
+                    conditioning=lambda prompt, media: stage.encode_condition_for_batch(
+                        batch, prompt, media
+                    ),
+                )
+                positive = candidate.positive
+            else:
+                positive = stage.encode_condition_for_batch(
+                    batch, update[0], self.inputs.condition_media
+                )
+            # All ranks agree on capacity before any cache is changed.
+            from sglang.multimodal_gen.runtime.conditioning.worker import (
+                coordinate_validation,
             )
-            self._admit_prompt_update(stage, positive)
+
+            admission_error = None
+            try:
+                self._admit_prompt_update(stage, positive, candidate)
+            except ConditionError as exc:
+                admission_error = exc
+            if not all(coordinate_validation(admission_error is None)):
+                raise ConditionError(
+                    "CONDITION_INVALID", "Reference update exceeds KV capacity"
+                ) from admission_error
         except ConditionError as exc:
             self.failed_update = update
-            notice = {"code": exc.code, "event_id": batch.realtime_event_id}
+            notice = {"code": exc.code, "event_id": update[1]}
         else:
+            kwargs = {} if candidate is None else {"inputs": candidate}
             self.sampler.update_prompt(
                 positive,
-                batch.realtime_event_id,
+                update[1],
                 getattr(batch, "realtime_prompt_version", None),
+                **kwargs,
             )
             self.prompt, self.prompt_event = update
             self.failed_update = None
@@ -287,7 +326,14 @@ class ZingSourceStreamState(BaseRealtimeState):
                 if self.qwen_init_host_ms is not None:
                     timings["qwen_init_host_ms"] = self.qwen_init_host_ms
             notice = None
-            update = (batch.sampling_params.prompt, batch.realtime_event_id)
+            applied = getattr(self.sampler, "applied_prompt", None)
+            if applied is not None and applied.inputs is not None:
+                self.inputs = applied.inputs
+            prompt_command = batch.extra.get("zing_prompt_update", {})
+            update = (
+                prompt_command.get("prompt", batch.sampling_params.prompt),
+                prompt_command.get("event_id", batch.realtime_event_id),
+            )
             if update != getattr(self, "failed_update", None) and update != (
                 self.prompt,
                 self.prompt_event,

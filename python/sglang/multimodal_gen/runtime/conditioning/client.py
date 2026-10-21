@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from .contract import ConditionError, canonical_json, safe_json
+from .inputs import validate_condition_media, validate_prompt
 
 
 def _is_loopback_host(host):
@@ -164,6 +165,7 @@ class ConditioningClient:
         max_rows=16384,
         max_request_bytes=536870912,
         max_bytes=268435456,
+        media_limits=None,
         retry_initial_s=0.05,
         retry_max_s=0.5,
         transport=None,
@@ -204,6 +206,8 @@ class ConditioningClient:
         self.url, self.token, self.profile_id = url, token, profile_id
         self.timeout_s, self.max_rows, self.max_bytes = timeout_s, max_rows, max_bytes
         self.max_request_bytes = max_request_bytes
+        self.media_limits = dict(media_limits or {})
+        validate_condition_media([], **self.media_limits)
         self.retry_initial_s, self.retry_max_s = retry_initial_s, retry_max_s
         self.clock, self.sleep, self.jitter = clock, sleep, jitter
         self.transport = transport or self._transport
@@ -343,10 +347,22 @@ class ConditioningClient:
                 "CONDITION_PROFILE_MISMATCH", "Conditioning deployment profile differs"
             )
 
+    def validate_input(self, prompt, media):
+        """Check metadata before hashing, cloning tensors or serializing RGB."""
+        validate_prompt(prompt)
+        items = validate_condition_media(media, **self.media_limits)
+        # Even without either JSON header, raw RGB plus the two length prefixes
+        # cannot fit a smaller body. The actual serialized body is checked too.
+        if sum(item["frames"].numel() for item in items) + 12 > self.max_request_bytes:
+            raise ConditionError(
+                "CONDITION_INVALID", "Conditioning request exceeds the byte limit"
+            )
+
     def encode(self, prompt, media, *, input_digest):
         from .wire import decode_response, encode_request
 
         deadline = self.clock() + self.timeout_s
+        self.validate_input(prompt, media)
         body = encode_request(
             prompt,
             media,

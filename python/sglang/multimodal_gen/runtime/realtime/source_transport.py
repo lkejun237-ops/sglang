@@ -5,17 +5,22 @@ This reserves transport buffers, not model/codec/KV memory or total process RSS.
 All byte limits apply to the complete encoded MessagePack message.
 """
 
+import sys
 from dataclasses import dataclass
 from importlib.metadata import version
 
 from packaging.specifiers import SpecifierSet
 
-from sglang.multimodal_gen.runtime.realtime.zing_contracts import ContractError
+from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
+    ContractError,
+    ReferenceLimits,
+)
 
-DEFAULT_MESSAGE_BYTES = 64 << 20
-DEFAULT_HOST_BYTES = 8 << 30
 PROTOCOL_OVERHEAD_BYTES = 4096
-REFERENCE_BYTES = 8 << 20
+REFERENCE_BYTES = 64 << 20
+# A maximum-sized media upload still needs its MessagePack/prompt envelope.
+DEFAULT_MESSAGE_BYTES = REFERENCE_BYTES + PROTOCOL_OVERHEAD_BYTES
+DEFAULT_HOST_BYTES = 8 << 30
 RECEIVE_QUEUE_MESSAGES = 1
 RECEIVE_ASSEMBLY_MESSAGES = 2
 PENDING_BATCHES = 4
@@ -38,11 +43,12 @@ def check(condition, code, message):
 class SourceTransportBudget:
     message_bytes: int = DEFAULT_MESSAGE_BYTES
     host_bytes: int = DEFAULT_HOST_BYTES
+    reference_bytes: int = REFERENCE_BYTES
 
     def __post_init__(self):
         for name, value in vars(self).items():
-            if type(value) is not int or value <= 0:
-                raise ValueError(f"{name} must be a positive integer")
+            if type(value) is not int or not 0 < value <= sys.maxsize:
+                raise ValueError(f"{name} must be a positive addressable integer")
         if self.message_bytes <= PROTOCOL_OVERHEAD_BYTES:
             raise ValueError("message_bytes must exceed the protocol overhead")
 
@@ -78,7 +84,7 @@ class SourceTransportBudget:
         return (
             (PENDING_BATCHES + RECEIVE_QUEUE_MESSAGES + RECEIVE_ASSEMBLY_MESSAGES + 7)
             * self.message_bytes
-            + REFERENCE_BYTES
+            + self.reference_bytes
             + (1 << 20)
         )
 
@@ -102,12 +108,51 @@ class SourceTransportBudget:
         )
         return size
 
+    def negotiate(self, client_bytes):
+        """Preserve smaller clients without admitting bodies above their limit."""
+        if client_bytes is None:
+            return self
+        check(
+            type(client_bytes) is int
+            and PROTOCOL_OVERHEAD_BYTES < client_bytes <= self.message_bytes,
+            "source_transport_mismatch",
+            "The client and service streaming size limits do not match.",
+        )
+        return type(self)(client_bytes, self.host_bytes, self.reference_bytes)
+
     @classmethod
     def from_args(cls, args):
-        return cls(
-            getattr(args, "realtime_max_message_bytes", DEFAULT_MESSAGE_BYTES),
-            getattr(args, "realtime_transport_host_bytes", DEFAULT_HOST_BYTES),
+        message = getattr(args, "realtime_max_message_bytes", DEFAULT_MESSAGE_BYTES)
+        host = getattr(args, "realtime_transport_host_bytes", DEFAULT_HOST_BYTES)
+        count = getattr(
+            getattr(args, "pipeline_config", None), "zing_reference_max_images", None
         )
+        if count is None:
+            return cls(message, host)
+        limits = ReferenceLimits(count)
+        explicit = getattr(args, "is_arg_explicitly_set", None)
+        message_explicit = (
+            explicit("realtime_max_message_bytes")
+            if explicit
+            else message != DEFAULT_MESSAGE_BYTES
+        )
+        host_explicit = (
+            explicit("realtime_transport_host_bytes")
+            if explicit
+            else host != DEFAULT_HOST_BYTES
+        )
+        if not message_explicit:
+            message = limits.media_bytes + PROTOCOL_OVERHEAD_BYTES
+        budget = cls(message, host, limits.media_bytes)
+        if not host_explicit:
+            sessions = max(
+                getattr(args, "realtime_max_sessions", 8),
+                getattr(args, "realtime_max_sessions_per_worker", 8),
+            )
+            budget = cls(
+                message, max(host, sessions * budget.session_bytes), limits.media_bytes
+            )
+        return budget
 
 
 def validate_source_dimensions(width, height, pipeline_config):

@@ -6,6 +6,10 @@ from continuous_source_client import websocket_options
 from encoder_overlap_profile_server import configure_monitoring
 from run_encoder_overlap_matrix import endpoint_phase_groups, server_command
 
+from sglang.multimodal_gen.runtime.realtime.source_transport import (
+    DEFAULT_MESSAGE_BYTES,
+)
+
 
 def test_profile_uses_separate_warmed_server_without_changing_five_samples():
     assert endpoint_phase_groups() == [
@@ -68,4 +72,7 @@ def test_client_profile_options_preserve_negotiated_transport_budget():
         assert options["max_size"] == 48 << 20
         assert options["max_queue"] == 1
         assert options["compression"] is None
-    assert websocket_options(profile=False, timeout=600)["max_size"] == 64 << 20
+    assert (
+        websocket_options(profile=False, timeout=600)["max_size"]
+        == DEFAULT_MESSAGE_BYTES
+    )

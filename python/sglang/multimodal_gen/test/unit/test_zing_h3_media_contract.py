@@ -72,6 +72,236 @@ def make_request(kind, *, references=0, source=True):
     }
 
 
+@pytest.mark.parametrize("format_name", ["PNG", "JPEG", "WEBP"])
+def test_init_and_reference_update_decode_file_bytes_in_memory(
+    codecs, monkeypatch, format_name
+):
+    from contextlib import nullcontext
+    from io import BytesIO
+
+    from PIL import Image
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        media_input,
+    )
+
+    def item(color):
+        output = BytesIO()
+        Image.new("RGB", (32, 32), color).save(output, format=format_name)
+        return dict(
+            type="image",
+            id="ref-0",
+            format=format_name.lower(),
+            payload=output.getvalue(),
+        )
+
+    monkeypatch.setattr(
+        media_input,
+        "_local_media",
+        lambda *a, **k: pytest.fail("Inline images must not access a URI"),
+    )
+    monkeypatch.setattr(
+        codecs,
+        "encode_visual",
+        lambda frames: frames.float().mean().reshape(1, 1, 1, 1, 1),
+    )
+
+    def condition(prompt, media):
+        return dict(context=torch.ones(1, 4), row_role=torch.zeros(1, dtype=torch.long))
+
+    monkeypatch.setattr(codecs, "encode_condition", condition)
+    request = make_request("video", references=1, source=False)
+    request["messages"][0]["content"][1] = item("red")
+    active = codecs.prepare(
+        request, lambda _: nullcontext(), retain_condition_media=True
+    )
+    candidate = codecs.prepare_reference_update(
+        active, [item("blue")], "new", lambda _: nullcontext(), conditioning=condition
+    )
+    before, after = (
+        active.condition_media[0]["frames"],
+        candidate.condition_media[0]["frames"],
+    )
+    assert before.dtype == after.dtype == torch.uint8
+    assert before.shape == after.shape == (3, 1, 32, 32)
+    assert before[0].float().mean() > before[2].float().mean()
+    assert after[2].float().mean() > after[0].float().mean()
+    assert (
+        "payload" not in candidate.condition_media[0]
+        and "uri" not in candidate.condition_media[0]
+    )
+    assert candidate.conditions == active.conditions
+
+
+@pytest.mark.parametrize("reference_ids", [[], ["ref-0"], ["new", "ref-0"]])
+def test_reference_snapshot_recomputes_all_and_preserves_nonreferences(
+    codecs, monkeypatch, reference_ids
+):
+    from contextlib import nullcontext
+
+    encoded, presentations = [], []
+
+    def decode(item, **kwargs):
+        return {
+            **item,
+            "frames": torch.full((3, 1, 32, 32), 7, dtype=torch.uint8),
+            "fps": 24.0,
+        }
+
+    def encode(frames):
+        encoded.append(frames.clone())
+        return torch.full((1, 2, 1, 2, 2), float(frames.float().mean()))
+
+    def condition(prompt, media):
+        presentations.append((prompt, [item["id"] for item in media]))
+        return dict(context=torch.ones(1, 4), row_role=torch.zeros(1, dtype=torch.long))
+
+    monkeypatch.setattr(codecs, "_decode_media", decode)
+    monkeypatch.setattr(codecs, "encode_visual", encode)
+    monkeypatch.setattr(codecs, "encode_condition", condition)
+    active = codecs.prepare(
+        make_request("video", references=1, source=False),
+        lambda _: nullcontext(),
+        retain_condition_media=True,
+    )
+    s0 = dict(
+        id="<Video 1>",
+        type="video",
+        frames=torch.zeros(3, 1, 32, 32, dtype=torch.uint8),
+        fps=24.0,
+    )
+    display = dict(
+        id="display", type="image", frames=torch.zeros(3, 1, 32, 32, dtype=torch.uint8)
+    )
+    active.condition_media = [s0, *active.condition_media, display]
+    active.visual["ref-0"].zero_()
+    encoded.clear()
+    references = [
+        dict(id=name, type="image", uri=f"{name}.png") for name in reference_ids
+    ]
+    candidate = codecs.prepare_reference_update(
+        active,
+        references,
+        "same prompt",
+        lambda _: nullcontext(),
+        conditioning=condition,
+    )
+    assert presentations[-1] == (
+        "same prompt",
+        ["<Video 1>", "display", *reference_ids],
+    )
+    assert len(encoded) == len(reference_ids)
+    assert list(candidate.visual) == reference_ids
+    assert [item["content_id"] for item in candidate.conditions] == reference_ids
+    assert (
+        candidate.condition_media[0] is s0 and candidate.condition_media[1] is display
+    )
+    assert all(tensor.sum() > 0 for tensor in candidate.visual.values())
+    assert list(active.visual) == ["ref-0"] and active.visual["ref-0"].sum() == 0
+    assert candidate.visual_shape == active.visual_shape
+
+
+@pytest.mark.parametrize("remote_failure", [False, True])
+def test_reference_decode_failure_consensus_precedes_encoders(
+    codecs, monkeypatch, remote_failure
+):
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.runtime.conditioning import worker
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+
+    def decode(*args, **kwargs):
+        if not remote_failure:
+            raise OSError("missing upload")
+        return dict(
+            id="new", type="image", frames=torch.zeros(3, 1, 32, 32, dtype=torch.uint8)
+        )
+
+    monkeypatch.setattr(codecs, "_decode_media", decode)
+    receipts = []
+    monkeypatch.setattr(
+        worker, "coordinate_validation", lambda ok: receipts.append(ok) or [ok, False]
+    )
+    active = SimpleNamespace(
+        conditions=[],
+        condition_media=[],
+        output_type="video",
+        pixel_frame_count=17,
+        visual_shape=(5, 2, 2),
+    )
+    with pytest.raises(ConditionError):
+        codecs.prepare_reference_update(
+            active,
+            [dict(id="new", type="image", uri="missing")],
+            "prompt",
+            lambda _: pytest.fail("VAE must not run"),
+            conditioning=lambda *args: pytest.fail("Qwen must not run"),
+        )
+    assert receipts == [remote_failure]
+
+
+@pytest.mark.parametrize("mode", ["keep", "clear", "api_rejected", "encode_failed"])
+def test_worker_newest_update_uses_active_media_and_discards_pending(mode):
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.source_session import (
+        ZingSourceStreamState,
+    )
+
+    state = ZingSourceStreamState()
+    state.inputs = SimpleNamespace(condition_media=[dict(id="active")])
+    seen = []
+    pending = ["older candidate"]
+
+    def encode(batch, prompt, media):
+        assert not pending
+        seen.append(media)
+        if mode == "encode_failed":
+            raise ConditionError("CONDITION_INVALID", "injected failure")
+        return {"context": torch.ones(1, 4)}
+
+    def prepare(active, references, prompt, use, *, conditioning):
+        assert active is state.inputs and references == []
+        return SimpleNamespace(positive=conditioning(prompt, []), condition_media=[])
+
+    def update(condition, event_id, version, **kwargs):
+        pending.append((event_id, kwargs.get("inputs")))
+
+    state.sampler = SimpleNamespace(
+        discard_pending_prompt=pending.clear, update_prompt=update
+    )
+    stage = SimpleNamespace(
+        encode_condition_for_batch=encode,
+        kv_pool=None,
+        prompt_switch_prefix_latent_frames=5,
+        _use=None,
+        codecs=SimpleNamespace(prepare_reference_update=prepare),
+    )
+    command = dict(prompt="same prompt", event_id=2)
+    if mode == "clear":
+        command["references"] = []
+    if mode == "api_rejected":
+        command["rejected"] = True
+    batch = SimpleNamespace(
+        extra={"zing_prompt_update": command},
+        sampling_params=SimpleNamespace(prompt="initial"),
+        realtime_event_id=None,
+    )
+    notice = state._update_prompt(stage, batch)
+    if mode in ("api_rejected", "encode_failed"):
+        assert not pending and state.failed_update == ("same prompt", 2)
+        assert state.prompt_event is None
+        assert notice == (
+            {"code": "CONDITION_INVALID", "event_id": 2}
+            if mode == "encode_failed"
+            else None
+        )
+    else:
+        assert pending[0][0] == 2
+        assert seen == ([[]] if mode == "clear" else [state.inputs.condition_media])
+        assert (pending[0][1] is not None) == (mode == "clear")
+    assert state.inputs.condition_media == [dict(id="active")]
+
+
 @pytest.mark.parametrize(
     "kind,references,source",
     [

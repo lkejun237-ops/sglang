@@ -29,6 +29,7 @@ import numpy as np
 import pytest
 import torch
 from safetensors.torch import load, save
+
 from sglang.multimodal_gen.runtime.conditioning import cli, inputs
 from sglang.multimodal_gen.runtime.conditioning.contract import DeploymentProfile
 from sglang.multimodal_gen.runtime.conditioning.encoder import encode_condition
@@ -310,6 +311,88 @@ def assert_idle(app):
     assert snapshot["slots"] == snapshot["inflight"] == 0
 
 
+@pytest.mark.parametrize("count", [0, 1, 10, 22, 33, 100])
+def test_rgb_framing_budget_bounds_real_safetensors(count):
+    from sglang.multimodal_gen.runtime.conditioning.contract import (
+        rgb_request_framing_bytes,
+    )
+    from sglang.multimodal_gen.runtime.conditioning.wire import encode_request
+
+    items = [
+        dict(
+            type="image",
+            frames=torch.zeros((3, 1, 1 + i % 3, 1 + i % 7), dtype=torch.uint8),
+        )
+        for i in range(count)
+    ]
+    body = encode_request("prompt", items, "a" * 64)
+    header_size = struct.unpack(">I", body[:4])[0]
+    rgb = sum(item["frames"].numel() for item in items)
+    assert len(body) - header_size - rgb <= rgb_request_framing_bytes(
+        count, 7, max(1, rgb)
+    )
+
+
+def test_full_rpc_header_and_rgb_budget_reach_real_asgi_encode():
+    from sglang.multimodal_gen.runtime.conditioning.wire import encode_request
+
+    async def run():
+        calls = []
+
+        def encoder(value):
+            calls.append(value.prompt)
+            return dict(
+                context=torch.zeros(1, 5120, dtype=torch.bfloat16),
+                row_role=torch.zeros(1, dtype=torch.int64),
+            )
+
+        p, app, client, _ = components(
+            encoder=encoder,
+            configured_limits=limits(
+                max_media=22,
+                max_input_bytes=66,
+                max_decoded_pixels=22,
+                max_side=1,
+                max_request_bytes=None,
+            ),
+        )
+        items = [
+            dict(type="image", frames=torch.zeros(3, 1, 1, 1, dtype=torch.uint8))
+            for _ in range(22)
+        ]
+        first = encode_request("x", items, p.profile_id)
+        prompt = "x" * (65536 - struct.unpack(">I", first[:4])[0] + 1)
+        body = encode_request(prompt, items, p.profile_id)
+        assert struct.unpack(">I", body[:4])[0] == 65536
+        assert len(body) > 66 + 65536 + 1024
+        assert len(body) <= app.limits.max_request_bytes
+        try:
+            # Actual wire size equal to an explicit request limit is legal.
+            app.limits = replace(app.limits, max_request_bytes=len(body))
+            response = await client.post(
+                PREFIX + "/encode",
+                content=body,
+                headers={"Content-Type": "application/octet-stream"},
+            )
+            assert_ok(response)
+            assert calls == [prompt]
+            assert_idle(app)
+            app.limits = replace(app.limits, max_request_bytes=len(body) - 1)
+            response = await client.post(
+                PREFIX + "/encode",
+                content=body,
+                headers={"Content-Type": "application/octet-stream"},
+            )
+            assert response.status_code == 413
+            assert calls == [prompt]
+            assert_idle(app)
+        finally:
+            await client.aclose()
+            await app.close()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize(
     "items",
     [
@@ -318,6 +401,7 @@ def assert_idle(app):
         [media(0, "video", origin="source_s0")] + [media(i) for i in range(1, 7)],
         [media(0, "video", origin="explicit", clip={"start": 3, "end": 3})]
         + [media(i) for i in range(1, 7)],
+        [media(0, "video", origin="source_s0")] + [media(i) for i in range(1, 22)],
     ],
 )
 def test_t1_real_encode_route_matches_complete_local_forward(items):
@@ -456,7 +540,7 @@ def test_t3b_bad_media_never_reaches_encode_ids(change):
             item["frames"] = torch.zeros(3, 1, 8193, 1, dtype=torch.uint8)
         elif change == "empty_side":
             item["frames"] = torch.zeros(3, 1, 0, 4, dtype=torch.uint8)
-        items = [item] * 17 if change == "too_many" else [item]
+        items = [item] * 23 if change == "too_many" else [item]
         try:
             response = await encode(
                 client, p, items, allow_nonfinite=change in {"nan_fps", "inf_fps"}

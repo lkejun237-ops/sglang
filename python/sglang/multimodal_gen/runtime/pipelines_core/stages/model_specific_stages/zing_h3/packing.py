@@ -85,7 +85,7 @@ class H3RowRole(IntEnum):
 
 @dataclass
 class H3InferenceInputs:
-    """一次生成会话中固定不变的 condition、几何和 clean source。"""
+    """一个 prompt epoch 的 condition/reference 快照，以及生成几何和 clean source。"""
 
     output_type: str
     conditions: list[dict[str, Any]]

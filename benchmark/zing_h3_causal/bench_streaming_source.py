@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import hashlib
 import json
 import traceback
 import uuid
@@ -98,6 +99,16 @@ async def benchmark(cases, args):
         "timeout_seconds": args.timeout,
         "url": args.url,
         "cases": cases,
+        "prompt_updates_manifest": (
+            dict(
+                path=str(args.prompt_updates),
+                sha256=hashlib.sha256(
+                    Path(args.prompt_updates).read_bytes()
+                ).hexdigest(),
+            )
+            if args.prompt_updates
+            else None
+        ),
     }
     write_json(args.output_dir / "config.json", config)
     try:
@@ -143,6 +154,9 @@ async def benchmark(cases, args):
                         command.append("--receive-stage-timing")
                     if args.paced:
                         command.append("--paced")
+                    prompt_updates = args.prompt_updates
+                    if prompt_updates:
+                        command.extend(["--prompt-updates", str(prompt_updates)])
                     result = {
                         "request_id": request_id,
                         "label": case["label"],
@@ -186,6 +200,9 @@ async def benchmark(cases, args):
                                     "first_output_before_source_end",
                                     "dependency_to_output_seconds",
                                     "source_to_output_seconds",
+                                    "prompt_updates",
+                                    "prompt_update_latency_ms",
+                                    "prompt_update_status_counts",
                                 )
                             },
                         )
@@ -197,6 +214,11 @@ async def benchmark(cases, args):
                         result["error"] = f"{type(exc).__name__}: {exc}"
                         result["error_traceback"] = "".join(
                             traceback.format_exception(exc)
+                        )
+                    prompt_evidence = output / "prompt-updates.json"
+                    if prompt_evidence.is_file():
+                        result.setdefault("streaming", {}).update(
+                            json.loads(prompt_evidence.read_text())
                         )
                     chunks = []
                     events = output / "events.jsonl"
@@ -269,6 +291,11 @@ def main():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--paced", action="store_true")
     parser.add_argument("--no-stage-timing", action="store_true")
+    parser.add_argument(
+        "--prompt-updates",
+        type=Path,
+        help="Prompt update manifest for each serial request",
+    )
     parser.add_argument("--batch-pattern", type=int, nargs="+", default=[1])
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--measured-runs", type=int, default=3)

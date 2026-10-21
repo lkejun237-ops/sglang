@@ -26,7 +26,7 @@ def methods(sampling_schedule=None):
 
     class Base:
         def prepare_next_request(self, *a):
-            return NS(extra={})
+            return NS(extra={}, block_idx=1)
 
         def on_chunk_complete(self, *a):
             pass
@@ -50,6 +50,8 @@ def methods(sampling_schedule=None):
         pending_frames=0,
         _source_reservations={},
         _inflight_reservations=[],
+        _selected_prompt_command=None,
+        _inflight_reference_uploads=[],
         dispatched_source_frames=0,
         end=None,
         end_dispatched=False,
