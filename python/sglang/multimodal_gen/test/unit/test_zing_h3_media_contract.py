@@ -848,7 +848,7 @@ def test_explicit_single_frame_video_contract(codecs, temporal_patch, kinds):
     assert all(torch.equal(item["frames"], pixels) for item in media)
 
 
-@pytest.mark.parametrize("preview_uri", ["source", "independent-target", "auto"])
+@pytest.mark.parametrize("preview_uri", ["source", "auto"])
 def test_explicit_preview_does_not_enter_source_or_reference_vae(
     codecs, monkeypatch, preview_uri
 ):
@@ -1049,7 +1049,8 @@ def test_in_memory_source_presentation_is_not_a_vae_reference(
     result = codecs.prepare(
         request, use, source_preview=preview, retain_condition_media=True
     )
-    assert seen["media"][0] is preview and result.condition_media[0] is preview
+    assert seen["media"] is result.condition_media
+    assert torch.equal(result.condition_media[0]["frames"], preview["frames"])
     assert [x["type"] for x in seen["media"]] == ["video"] + ["image"] * references
     assert len(vae) == references and all(torch.all(x == 23) for x in vae)
     assert len(result.conditions) == references and result.source_visual is None
@@ -1222,3 +1223,190 @@ def test_performance_encoding_uses_sp_leader_latent(codecs, monkeypatch, entrypo
         first, second = sample(), sample()
     assert len(calls) == 2 and not torch.equal(calls[0], calls[1])
     assert torch.equal(first, second)
+
+
+@pytest.mark.parametrize("external", [False, True])
+@pytest.mark.parametrize("reference_kind", ["image", "video"])
+def test_qwen_and_vae_share_normalized_reference_and_source_bucket(
+    codecs, monkeypatch, external, reference_kind
+):
+    from contextlib import nullcontext
+
+    codecs.runtime = {"causal": True}
+    codecs.max_short_edge = 128
+    request = make_request("video", references=1)
+    request["h3_max_area_config"] = dict(reference_image=4096, reference_video=4096)
+    request["messages"][0]["content"][1]["type"] = reference_kind
+    if reference_kind == "video":
+        # An explicit reference video suppresses automatic source presentation.
+        request["messages"][0]["content"].insert(
+            0,
+            dict(type="video", id="<Video 1>", uri="source", clip=dict(start=0, end=0)),
+        )
+    raw, qwen, vae = {}, [], []
+
+    def decode(item, **kwargs):
+        count = 1 if item.get("clip") or item["type"] == "image" else 125
+        decoded = dict(
+            item,
+            frames=torch.arange(3 * count * 128 * 128, dtype=torch.int64)
+            .remainder(256)
+            .to(torch.uint8)
+            .reshape(3, count, 128, 128),
+            fps=24.0,
+        )
+        raw[item.get("id", "source")] = decoded
+        return decoded
+
+    def condition(prompt, media):
+        qwen.append((prompt, media))
+        return {}
+
+    monkeypatch.setattr(codecs, "_decode_media", decode)
+    monkeypatch.setattr(codecs, "encode_condition", condition)
+    monkeypatch.setattr(
+        codecs,
+        "encode_visual",
+        lambda frames: vae.append(frames) or torch.zeros(1, 2, 1, 2, 2),
+    )
+    active = codecs.prepare(
+        request,
+        lambda _: nullcontext(),
+        retain_condition_media=True,
+        conditioning=condition if external else None,
+    )
+    media = qwen[0][1]
+    assert media is active.condition_media
+    assert media[0]["frames"].shape == (3, 1, 32, 32)
+    assert media[0]["fps"] == 24.0
+    assert media[1]["frames"].shape[-2:] == (64, 64)
+    assert media[1]["frames"] is vae[0]
+    assert vae[1].shape == (3, 125, 32, 32)
+    assert torch.equal(media[0]["frames"], vae[1][:, :1])
+    assert all(item["frames"].shape[-2:] == (128, 128) for item in raw.values())
+
+    # Prompt refresh consumes the exact same normalized tensors, no preparation.
+    monkeypatch.setattr(codecs, "_decode_media", lambda *a, **kw: pytest.fail("decode"))
+    monkeypatch.setattr(
+        codecs, "_normalize_inference_media", lambda *a, **kw: pytest.fail("normalize")
+    )
+    codecs.encode_condition("new prompt", active.condition_media)
+    assert qwen[-1][1] is media and len(vae) == 2
+
+
+def test_stream_preview_and_reference_replacement_reuse_normalized_media(
+    codecs, monkeypatch
+):
+    from contextlib import nullcontext
+
+    codecs.max_short_edge = 128
+    request = make_request("video", references=1, source=False)
+    request["h3_max_area_config"] = dict(reference_image=4096, source=4096)
+    preview = dict(
+        id="<Video 1>",
+        type="video",
+        origin="source_s0",
+        frames=torch.full((3, 1, 128, 128), 17, dtype=torch.uint8),
+        fps=23.976,
+    )
+    qwen, vae = [], []
+    monkeypatch.setattr(
+        codecs,
+        "_decode_media",
+        lambda item, **kw: dict(
+            item, frames=torch.full((3, 1, 128, 128), 23, dtype=torch.uint8), fps=1.0
+        ),
+    )
+    monkeypatch.setattr(codecs, "encode_condition", lambda p, m: qwen.append(m) or {})
+    monkeypatch.setattr(
+        codecs, "encode_visual", lambda f: vae.append(f) or torch.zeros(1, 2, 1, 2, 2)
+    )
+    active = codecs.prepare(
+        request,
+        lambda _: nullcontext(),
+        source_preview=preview,
+        retain_condition_media=True,
+    )
+    normalized_preview = active.condition_media[0]
+    assert normalized_preview["frames"].shape == (3, 1, 64, 64)
+    assert normalized_preview["fps"] == 23.976
+    assert preview["frames"].shape == (3, 1, 128, 128)
+    assert len(vae) == 1 and active.source_visual is None
+    candidate = codecs.prepare_reference_update(
+        active,
+        [dict(id="replacement", type="image", uri="new.png")],
+        "new prompt",
+        lambda _: nullcontext(),
+        conditioning=codecs.encode_condition,
+    )
+    assert candidate.condition_media[0] is normalized_preview
+    assert candidate.condition_media[1]["frames"].shape == (3, 1, 64, 64)
+    assert qwen[-1] is candidate.condition_media
+    assert candidate.condition_media[1]["frames"] is vae[-1]
+    assert candidate.max_area_config == active.max_area_config
+    assert codecs.max_area_config["reference_image"] == 1024
+    assert len(vae) == 2 and candidate.source_visual is None
+
+
+def test_initial_normalization_failure_agrees_before_qwen(codecs, monkeypatch):
+    from sglang.multimodal_gen.runtime.conditioning import worker
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+
+    monkeypatch.setattr(
+        codecs,
+        "_normalize_inference_media",
+        lambda *a, **kw: (_ for _ in ()).throw(ValueError("bad geometry")),
+    )
+    receipts = []
+    monkeypatch.setattr(
+        worker, "coordinate_validation", lambda ok: receipts.append(ok) or [ok, False]
+    )
+    with pytest.raises(ConditionError, match="Media normalization failed"):
+        codecs.prepare(
+            make_request("video", source=False),
+            lambda _: pytest.fail("No model may run"),
+            conditioning=lambda *a: pytest.fail("Qwen must not run"),
+        )
+    assert receipts == [False]
+
+
+@pytest.mark.parametrize("kind", ["image", "video", "video_audio"])
+@pytest.mark.parametrize("external", [False, True])
+def test_unassigned_visual_media_rejected_before_qwen_or_vae(
+    codecs, monkeypatch, kind, external
+):
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+
+    request = make_request("video", source=False)
+    request["messages"][0]["content"].append(
+        dict(id="unassigned", type=kind, uri="other")
+    )
+    monkeypatch.setattr(
+        codecs,
+        "_decode_media",
+        lambda item, **kw: dict(
+            item,
+            frames=torch.zeros(3, 1, 32, 32, dtype=torch.uint8),
+            fps=24.0,
+        ),
+    )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Invalid media must fail before any model call")
+
+    monkeypatch.setattr(codecs, "encode_condition", forbidden)
+    with pytest.raises(
+        ConditionError if external else ValueError,
+        match="Media normalization failed"
+        if external
+        else "target reference or source presentation",
+    ):
+        codecs.prepare(request, forbidden, conditioning=forbidden if external else None)
+
+
+@pytest.mark.parametrize("origin", ["source_s0", None, "reference"])
+def test_request_cannot_claim_internal_source_origin(codecs, origin):
+    request = make_request("video", references=1, source=False)
+    request["messages"][0]["content"][1]["origin"] = origin
+    with pytest.raises(ValueError, match="reserved for internal source presentation"):
+        codecs._parse_inference_request(request)

@@ -58,7 +58,6 @@ def methods(sampling_schedule=None):
         more_work=False,
         source_work_quantum=1,
         clip=17,
-        auto_source_preview=False,
         source_encoder={"mode": "progressive"},
         available=asyncio.Event(),
         ledger=NS(closed=False),

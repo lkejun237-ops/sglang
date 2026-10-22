@@ -39,24 +39,17 @@ async def prepare_reference_upload(
     session,
     references,
     *,
-    fixed_ids,
-    fixed_bytes,
     max_references=DEFAULT_MAX_REFERENCE_IMAGES,
     max_decoded_bytes=None,
 ):
     limits = ReferenceLimits(max_references)
-    max_media_items = limits.max_media
     if max_decoded_bytes is None:
         max_decoded_bytes = limits.decoded_reference_bytes
     require(
         isinstance(references, list) and len(references) <= max_references,
         f"Please provide a complete list of at most {max_references} reference images.",
     )
-    require(
-        len(references) + len(fixed_ids) <= max_media_items,
-        f"Please provide at most {max_media_items} media items including source preview.",
-    )
-    seen, size = set(fixed_ids), fixed_bytes
+    seen, size = {"<Video 1>"}, 0
     for item in references:
         require(
             isinstance(item, dict)
@@ -74,13 +67,11 @@ async def prepare_reference_upload(
             "The reference image is too large.",
         )
         size += len(item["payload"])
-    require(size <= limits.media_bytes, "The reference images are too large.")
+    require(size <= limits.reference_bytes, "The reference images are too large.")
     upload = ReferenceUpload()
     try:
         if references:
-            upload.reservations.append(
-                reserve_media_memory(session, size - fixed_bytes)
-            )
+            upload.reservations.append(reserve_media_memory(session, size))
         decoded_bytes = 0
         for item in references:
             item_bytes = await verify_presentation_upload(

@@ -89,7 +89,7 @@ class H3InferenceInputs:
 
     output_type: str
     conditions: list[dict[str, Any]]
-    media: list[dict[str, Any]]  # 独立归一后的 VAE reference 轨道
+    media: list[dict[str, Any]]  # 媒体 id/type 元信息，不保留像素
     positive: dict[str, torch.Tensor]
     visual: dict[str, torch.Tensor]  # reference ID -> visual latent
     audio: dict[str, torch.Tensor]  # reference ID -> audio latent
@@ -99,7 +99,8 @@ class H3InferenceInputs:
     pixel_frame_count: int
     sample_count: int | None
     sample_rate: int
-    condition_media: list[dict[str, Any]] | None = None
+    condition_media: list[dict[str, Any]] | None = None  # 归一后的 Qwen 媒体
+    max_area_config: dict[str, int] | None = None
 
 
 class ZingH3Packer:

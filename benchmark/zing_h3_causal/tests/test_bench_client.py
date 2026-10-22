@@ -431,7 +431,6 @@ async def streaming_peer(
             max_pending_source_bytes=2 * stride,
             prompt_reference_updates=True,
             max_references=max_references,
-            max_user_media=max_references + 1,
         )
     )
     frames, active_prompt = 0, None
@@ -1425,3 +1424,23 @@ def test_streaming_client_uses_advertised_reference_limit(tmp_path, limit, count
                 assert len(event["references"]) == count
 
     asyncio.run(exercise())
+
+
+def test_streaming_client_rejects_removed_user_media_option(capsys):
+    from continuous_source_client import parser
+
+    with pytest.raises(SystemExit) as error:
+        parser().parse_args(
+            [
+                "--source-rgb",
+                "-",
+                "--output",
+                "unused",
+                "--prompt",
+                "scene",
+                "--user-media",
+                "old-media.json",
+            ]
+        )
+    assert error.value.code == 2
+    assert "unrecognized arguments: --user-media" in capsys.readouterr().err

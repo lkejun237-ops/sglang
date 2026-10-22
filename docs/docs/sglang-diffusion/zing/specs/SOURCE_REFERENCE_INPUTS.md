@@ -16,34 +16,19 @@ The full packet still enters source VAE once. Qwen uses the declared source FPS;
 it cannot recover pixels or metadata already lost on the client. Later packets
 do not change S0. Prompt updates reuse retained media at the existing chunk boundary.
 
-For independent presentation, use ordered `user_media` instead of `references`:
+The public streaming media inputs are `source_stream` plus `references`, with
+`prompt` describing their use. Reference entries contain exactly `id`, `format`
+and `payload`; every image becomes a VAE reference. `<Video 1>` is reserved for
+the internally derived source presentation. There is no caller-provided video
+preview or presentation-only image. The removed `user_media` field is rejected,
+even when null or empty, and the client no longer offers `--user-media`.
 
-```python
-user_media = [
-    {"type": "video", "id": "<Video 1>", "format": "png", "payload": png_bytes,
-     "fps": 24, "clip": {"start": 0, "end": 0}},
-    {"type": "image", "id": "<Picture 1>", "format": "jpeg",
-     "payload": jpeg_bytes, "reference": True},
-]
-```
-
-The streaming subset accepts image bytes and single-frame video presentation,
-not arbitrary paths/URLs or encoded video uploads. Video FPS is required, finite,
-positive and at most 240; its clip is zero-time. `reference: true` selects image
-media for VAE conditions. Other media are presentation-only. Image/video numbering
-is independent and follows declaration order. For a configured count N, at most N+1 media (including derived
-S0) and N references share the count-derived upload budgets. Explicit video supplies
-the presentation instead of automatic S0, retaining its type, clip and order.
-An image cannot claim `<Video 1>` when S0 is automatic. `references` remains
-shorthand for ordered image references and cannot be mixed with `user_media`.
-
-`session.ready` advertises `user_media_formats`, `max_user_media`, and the
-single-frame `user_media_video_clip` contract. The old `prompt_video_frame` field
-and CLI flags are removed. The proposed `source_preview` request field and
-`--source-preview` flag are also removed, rather than introducing a new caller
-switch. Requests using these removed fields fail validation. Use source alone
-for its own first frame, or `--user-media manifest.json` for independent explicit
-media (each item uses a local `path` in place of `payload`). There is no alias.
+`session.ready` advertises reference count, image/upload/decoded-byte limits and
+source transport limits. It does not advertise the removed independent-media
+capabilities. `prompt_video_frame`, `source_preview` and their former client flags
+remain rejected. Source preview always comes from the first accepted RGB frame;
+changing prompt reuses that preview, while `references` replaces the reference
+image list when supplied in a prompt event.
 
 For complete video inference, supply the full video as `target.source`. With the
 model's existing `causal=true` configuration, a request without explicit video
@@ -51,7 +36,8 @@ presentation automatically prepends native `type=video, clip={start:0,end:0}`
 using that source URI. Native itself has no `ar-first-frame` mode: the training
 converter constructs this ordinary video descriptor and native inference consumes
 it. SGLang request preparation supplies that descriptor for convenience.
-Canonical explicit video media (including independent target preview) is retained.
+Canonical explicit video presentation must match the source URI or be selected
+as a reference condition; unrelated visual media is rejected before Qwen/VAE.
 Image targets and noncausal configurations do not acquire a source first-frame
 preview. Clipped sources need an explicit presentation descriptor. Neither full
 source VAE input nor reference conditions are rewritten.
@@ -191,7 +177,7 @@ existing diagnostic timings and CPU checks do not constitute that acceptance.
 
 ### 可选的 reference 解码大小限制
 
-部署可在 `--pipeline-config-path` 对应 JSON 中设置 `zing_reference_max_decoded_bytes`（正整数，单位字节）。默认 `null` 按 `zing_reference_max_images × 48 MiB` 自动计算；显式值覆盖。实时 API 在 RGB 解码及模型编码前，从图片头按 `sum(width * height * 3)` 检查每组 reference；初始化和后续完整集合更新共用该口径，等于上限允许，超过则拒绝。`user_media` 只有 `reference: true` 的图片计入；source 展示、非 reference 图片和旧 active 集合不计入。超限更新为非 fatal 错误，旧状态保留，后续合法更新可以继续。
+部署可在 `--pipeline-config-path` 对应 JSON 中设置 `zing_reference_max_decoded_bytes`（正整数，单位字节）。默认 `null` 按 `zing_reference_max_images × 48 MiB` 自动计算；显式值覆盖。实时 API 在 RGB 解码及模型编码前，从图片头按 `sum(width * height * 3)` 检查每组 reference；初始化和后续完整集合更新共用该口径，等于上限允许，超过则拒绝。初始化的全部 `references` 图片计入；内部 source 展示和旧 active 集合不计入。超限更新为非 fatal 错误，旧状态保留，后续合法更新可以继续。
 
 这不是压缩上传大小、整个 worker 的峰值内存或 KV/显存容量限制；单图64 MiB压缩上限、按数量推导的完整上传预算及现有模型容量检查仍独立生效。该配置不覆盖直接调用原生 URI/offline worker 的接口。完整边界见[设计方案 §8.7](prompt-reference-switch.zh-CN.md#87-显式配置-reference-解码大小上限)。
 

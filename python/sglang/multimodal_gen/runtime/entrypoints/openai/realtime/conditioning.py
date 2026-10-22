@@ -98,6 +98,10 @@ def validate_remote_media_metadata(media, *, max_media=DEFAULT_MAX_MEDIA_ITEMS):
 
 
 def validate_remote_request(request, server_args):
+    if hasattr(request, "user_media"):
+        raise ConditionError(
+            "CONDITION_INVALID", "Please use source_stream, references and prompt."
+        )
     if getattr(server_args, "zing_conditioning_mode", "local") != "remote":
         return
     max_media = (
@@ -130,9 +134,6 @@ def validate_remote_request(request, server_args):
                     )
                 media.extend(item for item in content if item.get("type") != "text")
         validate_remote_media_metadata(media, max_media=max_media)
-    user_media = getattr(request, "user_media", None)
-    if user_media is not None:
-        validate_remote_media_metadata(user_media, max_media=max_media)
 
 
 def take_message_reservation(session):

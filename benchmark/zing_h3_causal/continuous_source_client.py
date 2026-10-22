@@ -139,11 +139,6 @@ async def exchange(args, output, started, read_source, received_file, trace):
                 )
                 refs.append(reference_payload(name, media_id))
             init["references"] = refs
-        if args.user_media:
-            media = json.loads(Path(args.user_media).read_text())
-            for item in media:
-                item["payload"] = Path(item.pop("path")).read_bytes()
-            init["user_media"] = media
         await send(init)
         ready = msgpack.unpackb(
             await asyncio.wait_for(ws.recv(), args.timeout), raw=False
@@ -705,9 +700,6 @@ def parser():
         "--prompt-updates",
         help="JSON list of prompt updates at source frame positions, with optional complete reference lists",
     )
-    parser.add_argument(
-        "--user-media", help="JSON list of typed media with local path fields"
-    )
 
     parser.add_argument("--max-message-bytes", type=int, default=DEFAULT_MESSAGE_BYTES)
     parser.add_argument("--width", type=int, default=832)
@@ -730,8 +722,6 @@ def parser():
 def main():
     cli = parser()
     args = cli.parse_args()
-    if args.user_media and args.reference:
-        cli.error("Use either --user-media or --reference.")
     if args.reference_id and len(args.reference_id) != len(args.reference):
         cli.error("Provide one reference ID per reference image.")
     if (

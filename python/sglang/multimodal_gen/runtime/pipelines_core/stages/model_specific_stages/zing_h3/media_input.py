@@ -379,6 +379,10 @@ class ZingH3MediaInput:
         self._inference_geometry(target)
         if "source_preview" in request:
             raise ValueError("Source presentation is derived automatically from source")
+        if any(isinstance(item, dict) and "origin" in item for item in user_content):
+            raise ValueError(
+                "Media origin is reserved for internal source presentation"
+            )
         source_descriptor = target_message.get("source")
         # Native canonical requests already declare their presentation media.
         # For causal source-only requests, reproduce the training converter's
@@ -573,6 +577,30 @@ class ZingH3MediaInput:
             source["frames"] = _resize_frames(
                 source["frames"], source_height, source_width
             )
+        # Source presentation shares the source spatial bucket, while keeping
+        # its decoded frame count/fps (in particular the causal single frame).
+        condition_ids = {condition["content_id"] for condition in conditions}
+        for item in media:
+            if item["id"] in condition_ids or item["type"] not in {
+                "image",
+                "video",
+                "video_audio",
+            }:
+                continue
+            if item.get("origin") != "source_s0" and not (
+                source is not None and item.get("uri") == source.get("uri")
+            ):
+                raise ValueError(
+                    "Visual media must be a target reference or source presentation"
+                )
+            height, width = _select_h3_bucket(
+                item["frames"].shape[-2],
+                item["frames"].shape[-1],
+                multiple=self.canvas_multiple,
+                max_short_edge=self.max_short_edge,
+                max_area=max_area_config["source"],
+            )
+            item["frames"] = _resize_frames(item["frames"], height, width)
         return media, source, target_height, target_width, num_frames, pixel_frames
 
     def _decode_media(

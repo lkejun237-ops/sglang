@@ -16,11 +16,8 @@ if __name__ == "__main__":
 
 
 import asyncio
-import hashlib
 import importlib
-import io
 import json
-import shutil
 import tempfile
 import time
 from contextlib import ExitStack
@@ -295,78 +292,27 @@ class TestConditioningRPCInputPreflight(CustomTestCase):
         )
         self.assertEqual(session.adapter_state.pending_prompt, ("next", 9))
 
-    def test_t2_source_nonzero_single_frame_video_preserves_clip(self):
-        from PIL import Image
-
-        from sglang.multimodal_gen.runtime.conditioning.resources import (
-            AdmissionLedger,
-            BoundedExecutor,
-        )
+    def test_t2_source_rejects_removed_user_media(self):
         from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters import (
             zing_h3_source_adapter as source,
         )
 
-        config = json.dumps({"causal": True, "h3_media_config": {"fps": 24}}).encode()
-        Path(self.directory.name, "zing_config.json").write_bytes(config)
-        Path(self.directory.name, "zing_realtime_profile.json").write_text(
-            json.dumps(
-                {
-                    "model_config_sha256": hashlib.sha256(config).hexdigest(),
-                    "solver": "few_step",
-                    "denoising_step_list": [1000, 750, 500, 250],
-                    "guidance_scale": 1,
-                    "noise_version": "indexed-cpu-v1",
-                }
-            )
-        )
-        raw = io.BytesIO()
-        Image.new("RGB", (32, 32), (4, 5, 6)).save(raw, format="PNG")
-        clip = {"start": 2.5, "end": 2.5}
         request = RealtimeVideoGenerationsRequest(
             type="init",
             prompt="scene",
             zing_realtime_api_version=1,
             source_stream={"format": "rgb24", "width": 32, "height": 32, "fps": 24},
             size="32x32",
-            user_media=[
-                {
-                    "type": "video",
-                    "id": "v",
-                    "format": "png",
-                    "payload": raw.getvalue(),
-                    "clip": clip,
-                    "fps": 24,
-                }
-            ],
+            user_media=[],
         )
         session = GenerateSession()
         adapter = source.ZingH3SourceStreamAdapter()
         session.set_adapter(adapter)
-        ledger = AdmissionLedger(
-            {name: (1 << 24, 1 << 24) for name in ("ram", "inflight", "disk")}
-        )
-        cpu = BoundedExecutor(active=1, waiting=1)
-        from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.conditioning import (
-            ApiConditioningResources,
-            release_api_media,
-        )
-
-        session.conditioning_resources = ApiConditioningResources(
-            ledger, cpu, "t", workspace_bytes=1 << 20
-        )
-
-        async def run():
-            try:
-                await adapter.on_init(session, request)
-                self.assertEqual(adapter.user_media[0]["clip"], clip)
-            finally:
-                if session.input_temp_dir:
-                    shutil.rmtree(session.input_temp_dir, ignore_errors=True)
-                release_api_media(session)
-                await cpu.close()
-
-        with patch.object(source, "get_global_server_args", return_value=self.args):
-            asyncio.run(run())
+        with (
+            patch.object(source, "get_global_server_args", return_value=self.args),
+            self.assertRaises(ConditionError),
+        ):
+            asyncio.run(adapter.on_init(session, request))
 
 
 class TestConditioningRPCBrowserErrors(CustomTestCase):
@@ -843,9 +789,9 @@ class TestConditioningRPCFiniteErrors(CustomTestCase):
                     patch.object(
                         api, "prepare_request", return_value=SimpleNamespace(extra={})
                     ),
+                    self.assertRaises(HTTPException) as raised,
                 ):
-                    with self.assertRaises(HTTPException) as raised:
-                        asyncio.run(api.create_video(request))
+                    asyncio.run(api.create_video(request))
                 self.assertEqual(raised.exception.status_code, expected_status)
                 self.assertEqual(
                     raised.exception.detail, {"code": code, "message": _PUBLIC[code]}
@@ -865,9 +811,10 @@ def test_remote_metadata_uses_pipeline_media_count(limit):
     media = [dict(type="video", clip=dict(start=0, end=0))] + [
         dict(type="image") for _ in range(limit)
     ]
-    request = SimpleNamespace(user_media=media)
+    request = SimpleNamespace(zing_request=_custom_request(media))
     validate_remote_request(request, configured)
     with pytest.raises(ConditionError):
         validate_remote_request(
-            SimpleNamespace(user_media=[*media, dict(type="image")]), configured
+            SimpleNamespace(zing_request=_custom_request([*media, dict(type="image")])),
+            configured,
         )

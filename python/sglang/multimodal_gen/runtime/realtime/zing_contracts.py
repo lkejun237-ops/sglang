@@ -43,7 +43,7 @@ class ReferenceLimits:
 
     @property
     def media_bytes(self):
-        # Explicit source-preview uploads also need a media slot and byte budget.
+        # Qwen/RPC also carries the internally derived source-preview frame.
         return self.max_media * MAX_REFERENCE_IMAGE_BYTES
 
     @property

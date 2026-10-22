@@ -14,7 +14,7 @@
 
 | 位置 | 已有行为 | 本次变化 |
 | --- | --- | --- |
-| 初始化 `init` | 同一消息接收 prompt 与 `references` 或 `user_media`；图片为字节 | 保持兼容；更新入口复用既有图片校验与存储预算 |
+| 初始化 `init` | 同一消息接收 prompt 与 `references`；source 由 `source_stream` 描述；图片为字节 | `user_media` 已移除并拒绝；更新入口复用图片校验与存储预算 |
 | 后续 prompt event | `payload` 为完整 prompt 文本；复用初始媒体 | 可附带完整 `references`；缺省仍是文本更新 |
 | 模型输入 | 保存媒体、conditions、Qwen 条件、reference latent | 准备一份候选输入，避免提前修改 active 输入 |
 | #303 KV 切换 | 新 condition + 旧 reference + 最近 5 个 target latent | 新 condition + 新 reference + 最近 5 个 target latent |
@@ -76,7 +76,7 @@ await ws.send(msgpack.packb(event, use_bin_type=True))
 
 初始化和动态完整替换共用启动配置 `zing_reference_max_images=N`，默认21；总媒体名额自动为 `N+1`，Source展示和保留的非reference媒体也占名额。每图仍最多16,777,216像素。当前完整预算与启动方式见[§9](#9-启动时配置-reference-张数与容量2026-10-21)，下文§8保留各轮历史固定容量测试的真实配置。
 
-`session.ready`声明实际 `max_references`、`max_user_media`、`max_reference_image_bytes`、`max_reference_bytes`、`max_reference_decoded_bytes`、`max_user_media_bytes` 及协商后的 `max_message_bytes`。Reference单图压缩上限64MiB；N张reference合计最多 `N×64MiB`，原图RGB默认最多 `N×48MiB`。完整媒体上传及消息另为Source展示预留一个名额。显式设置较小的RGB、WS或RPC预算时，该限制仍会拒绝超限请求；数量不代表任意尺寸、prompt和KV都能运行。
+`session.ready`声明实际 `max_references`、`max_reference_image_bytes`、`max_reference_bytes`、`max_reference_decoded_bytes` 及协商后的 `max_message_bytes`。Reference单图压缩上限64MiB；N张reference合计最多 `N×64MiB`，原图RGB默认最多 `N×48MiB`。内部Qwen/RPC预算另为自动Source展示预留一个名额，不开放独立媒体上传。显式设置较小的RGB、WS或RPC预算时，该限制仍会拒绝超限请求；数量不代表任意尺寸、prompt和KV都能运行。
 
 数量默认值和无I/O的 `ReferenceLimits` 复用既有轻量 `realtime/zing_contracts.py`；消息和transport host预算仍由 `source_transport.py` 负责。API不落盘、不上传OSS、不额外缩放reference。模型编码后真实token和KV池准入保持独立，不根据原图RGB字节数自动分配显存。
 
@@ -118,7 +118,7 @@ await ws.send(msgpack.packb(event, use_bin_type=True))
 
 API 只用 `_pending_prompt_command` 保存待派发的 prompt/event_id、reference 描述或拒绝标记；调度等待和派发都读取同一对象，避免与独立 tuple 重复维护身份。选中后转交 `_selected_prompt_command`，随后进入 batch；不改变 latest-wins 或首次 source 前更新的既有时序。
 
-API 保存的“最新收到请求”不等于模型 active。worker 是实际生效 reference 的权威来源。API 不得因为收到候选就修改共享 `user_media/reference_paths`，使正在排队的旧 dispatch 偷看到新图片。后续 dispatch 也不能用初始化图片反向覆盖 worker 已生效的新集合。
+API 保存的“最新收到请求”不等于模型 active。worker 是实际生效 reference 的权威来源。API 不得因为收到候选就修改共享 reference 媒体快照，使正在排队的旧 dispatch 偷看到新图片。后续 dispatch 也不能用初始化图片反向覆盖 worker 已生效的新集合。
 
 ## 4. 从接收到生效
 
@@ -339,7 +339,7 @@ SP 多 rank 在进入 VAE/DiT collective 前必须对候选、媒体准备结果
 
 在启动命令的 `--pipeline-config-path` JSON 中可添加 `"zing_reference_max_decoded_bytes": 1073741824`，表示每组 reference 展开为 RGB 后最多 1 GiB；这里只是配置示例，不是默认值或推荐容量。计算公式为该组全部 reference 的 `sum(width * height * 3)`，恰好等于上限允许，超过则拒绝。只读取图片头及执行原有格式验证，不先展开 RGB、调用 Qwen 或 VAE。
 
-初始化的 `references` 和 `user_media` 中标记 `reference: true` 的图片均参与累计；后续更新检查新请求提供的完整 reference 集合。旧 active reference、source 展示及其他非 reference 媒体不计入这个单组上限。它不是 RSS/峰值内存或显存保证，不涵盖新旧集合共存、预处理副本、IPC/SP 副本或模型工作区。压缩上传 64 MiB、单图像素及现有 KV 准入各自保持独立。
+初始化的全部 `references` 图片均参与累计；后续更新检查新请求提供的完整 reference 集合。旧 active reference 与内部 source 展示不计入这个单组上限。它不是 RSS/峰值内存或显存保证，不涵盖新旧集合共存、预处理副本、IPC/SP 副本或模型工作区。压缩上传 64 MiB、单图像素及现有 KV 准入各自保持独立。
 
 超限初始化失败；超限更新沿用已有非 fatal 拒绝流程，不替换 active prompt/reference/KV，上传 RAM lease 被释放，后续合法更新仍可接收。检查位于实时 API 的共享上传验证路径，直接调用原生 URI/offline worker 接口不受此上传配置限制。
 
@@ -515,7 +515,7 @@ SHA256: 57ebd7aaac0e3909a394725890e5d35e2d1f16f73530276472f549ab3e7ced64
 {"zing_reference_max_images": 32}
 ```
 
-默认21；必须是非负整数，0表示不接受reference但保留Source展示。init的 `references`、`user_media` 内标记reference的图片和后续完整替换共用该上限。`session.ready.max_references=32`、`max_user_media=33`。Source及其他展示媒体占用总名额，额外非reference图片会减少可用reference数量。超限更新仍非fatal，active状态保留；不增加请求级覆盖启动上限的能力。
+默认21；必须是非负整数，0表示不接受reference但保留Source展示。init的 `references` 和后续完整替换共用该上限。`session.ready.max_references=32`；内部Qwen/RPC最多容纳32张reference加1张自动Source展示。公开接口不接受其他展示媒体。超限更新仍非fatal，active状态保留；不增加请求级覆盖启动上限的能力。
 
 ### 9.2 按单图最大值自动计算
 
@@ -564,7 +564,7 @@ Reviewer推荐路线：本节→ `configs/pipeline_configs/zing_h3.py`／`Refere
 
 ### 9.4 验证
 
-最终相关CPU回归542项通过（27.40秒，Python3.11／Torch2.8 CPU，仓库CPU harness），覆盖默认21、较小上限、32和0，init/user_media/动态替换和恢复、Source/非reference名额、客户端真实WS协商、可配置RPC encode/decode、LocalConditioner完整33项缓存身份、压缩/RGB边界、显式transport限制及旧协议回归。用stride-zero tensor视图与已计算摘要验证33张最大像素输入的元数据预算，不实际分配1.5GiB RGB；不把它称为大图编码或推理验收。新增“完整消息超过旧64MiB”的真实WS＋真实adapter初始化／动态替换通过（两张各32MiB+8192字节合法PNG）；生产API入口也覆盖init超过客户端声明预算时在图片验证前拒绝。不存在按图数实际预分配大数组的测试。
+历史验证（移除公开 `user_media` 入口之前）：相关CPU回归542项通过（27.40秒，Python3.11／Torch2.8 CPU，仓库CPU harness），覆盖默认21、较小上限、32和0，init/user_media/动态替换和恢复、Source/非reference名额、客户端真实WS协商、可配置RPC encode/decode、LocalConditioner完整33项缓存身份、压缩/RGB边界、显式transport限制及旧协议回归。用stride-zero tensor视图与已计算摘要验证33张最大像素输入的元数据预算，不实际分配1.5GiB RGB；不把它称为大图编码或推理验收。新增“完整消息超过旧64MiB”的真实WS＋真实adapter初始化／动态替换通过（两张各32MiB+8192字节合法PNG）；生产API入口也覆盖init超过客户端声明预算时在图片验证前拒绝。不存在按图数实际预分配大数组的测试。
 
 没有新增云资源或GPU推理；没有验证最大N×最大文件经生产WebSocket主循环、真实Qwen/VAE、IPC/SP广播和KV池完整运行，也没有480/736性能结论。历史9/21图实测不代替本次最大输入验证。最终结果、命令和JUnit在 `D:/sglang317-reference-count-config-20261021-r5/`。合入远端CI测试修复5cb14d341d后，本变更涉及的Python文件与r5受测快照逐字节一致；远端只额外修改未包含在本轮列表的parallel_encoder测试和历史文档。r1新增夹具7失败、r2参数编辑错误117失败的日志均保留，修复后r3/r4/r5依次510/511/542通过。
 

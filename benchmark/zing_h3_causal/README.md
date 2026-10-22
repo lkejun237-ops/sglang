@@ -129,8 +129,8 @@ python benchmark/zing_h3_causal/prepare_whitebox_video_smoke.py \
   初始化/reference 字段，将白膜解码后通过 source 流协议持续送入同一会话，再发送
   prompt 事件；有限请求能解析成功不等于已经覆盖 #303。三例均可使用 source 首帧 S0
   作为 prompt 视频提示；按流式协议将 source 对齐到 832×480、24 fps，保持 720 帧。
-  不传显式视频提示时由首个 source packet 自动提供 S0，参考图保留原 ID 与顺序；
-  若显式使用 `user_media`，video 项也只能上传该单帧图像字节并携带相同的 clip/FPS。
+  首个 source packet 自动提供 S0，参考图通过 `references` 保留原 ID 与顺序。
+  连续接口不接受独立媒体上传；旧 `user_media` 字段和 `--user-media` 开关已删除。
 - `target_pixel_frame=360` 只表达测试希望发生变化的位置。服务不会按该字段排程；
   当前 block 使用旧 prompt 完成，已有最近 **5 个 target latent** 后才在完整边界
   激活新 prompt，历史不足则保持 pending。5 是 latent 数量，不是像素帧数。

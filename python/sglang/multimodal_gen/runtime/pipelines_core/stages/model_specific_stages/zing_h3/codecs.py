@@ -301,33 +301,49 @@ class ZingH3Codecs(ZingH3MediaInput):
                 item["id"] == source_preview["id"] for item in items
             ):
                 raise ValueError("Source presentation conflicts with explicit media")
-            media.insert(0, source_preview)
+            media.insert(0, dict(source_preview, origin="source_s0"))
         source = (
             None if source is None else self._decode_media(source, need_audio=False)
         )
+        if conditioning is not None and not callable(conditioning):
+            raise ConditionError(
+                "CONDITION_INVALID",
+                "External conditioning requires a trusted worker consumer",
+            )
+        if (
+            conditioning is None
+            and getattr(self, "conditioning_mode", "local") != "local"
+        ):
+            raise ConditionError(
+                "CONDITION_INVALID", "External conditioning descriptor is missing"
+            )
+        error = None
+        try:
+            normalized_media, source, h, w, t, frames = self._normalize_inference_media(
+                media, source, conditions, target, max_area_config=max_area_config
+            )
+        except (ValueError, OSError) as exc:
+            if conditioning is None:
+                raise
+            error = exc
         if conditioning is not None:
-            if not callable(conditioning):
+            from sglang.multimodal_gen.runtime.conditioning.worker import (
+                coordinate_validation,
+            )
+
+            # Agree on CPU preparation before any rank enters Qwen/VAE collectives.
+            if not all(coordinate_validation(error is None)):
                 raise ConditionError(
-                    "CONDITION_INVALID",
-                    "External conditioning requires a trusted worker consumer",
-                )
-            # The consumer validates original presentation RGB and completes the
-            # SP CPU consensus before any VAE or DiT collective can be entered.
-            positive = conditioning(prompt, media)
+                    "CONDITION_INVALID", "Media normalization failed"
+                ) from error
+            positive = conditioning(prompt, normalized_media)
             if positive is None:
                 raise ConditionError(
                     "CONDITION_INVALID",
                     "The external conditioning provider returned no condition",
                 )
-        elif getattr(self, "conditioning_mode", "local") != "local":
-            raise ConditionError(
-                "CONDITION_INVALID", "External conditioning descriptor is missing"
-            )
         else:
             positive = None
-        refs, source, h, w, t, frames = self._normalize_inference_media(
-            media, source, conditions, target, max_area_config=max_area_config
-        )
         request_id = stage_trace.identity["request_id"] if stage_trace else None
         measure_cuda = stage_trace is not None and stage_trace.measure_cuda
         if positive is None:
@@ -340,11 +356,13 @@ class ZingH3Codecs(ZingH3MediaInput):
                 output_ids=[f"{request_id}:positive"],
             ) as span:
                 with use_component("text_encoder"):
-                    positive = self.encode_condition(prompt, media)
+                    positive = self.encode_condition(prompt, normalized_media)
             handoff(span)
         visual, audio = {}, {}
         modes = {c["content_id"]: c["latent_modalities"] for c in conditions}
-        visual_refs = [item for item in refs if "visual" in modes.get(item["id"], [])]
+        visual_refs = [
+            item for item in normalized_media if "visual" in modes.get(item["id"], [])
+        ]
         source_latent = None
         if visual_refs or source is not None:
             with use_component("video_vae"):
@@ -372,7 +390,9 @@ class ZingH3Codecs(ZingH3MediaInput):
                     ) as span:
                         source_latent = self.encode_visual(source["frames"])
                     handoff(span)
-        audio_refs = [item for item in refs if "audio" in modes.get(item["id"], [])]
+        audio_refs = [
+            item for item in normalized_media if "audio" in modes.get(item["id"], [])
+        ]
         generate_audio = target["type"] == "video_audio"
         samples, audio_shape = None, None
         if audio_refs or generate_audio:
@@ -387,7 +407,7 @@ class ZingH3Codecs(ZingH3MediaInput):
         return H3InferenceInputs(
             target["type"],
             conditions,
-            [{"id": item["id"], "type": item["type"]} for item in refs],
+            [{"id": item["id"], "type": item["type"]} for item in normalized_media],
             positive,
             visual,
             audio,
@@ -397,7 +417,8 @@ class ZingH3Codecs(ZingH3MediaInput):
             frames,
             samples,
             self.audio_sample_rate,
-            condition_media=media if retain_condition_media else None,
+            condition_media=normalized_media if retain_condition_media else None,
+            max_area_config=max_area_config,
         )
 
     def prepare_reference_update(
@@ -425,7 +446,7 @@ class ZingH3Codecs(ZingH3MediaInput):
                 raise ValueError(
                     "Reference IDs must not conflict with retained presentation"
                 )
-            media = media + [
+            decoded_references = [
                 self._decode_media(item, need_audio=False) for item in references
             ]
             conditions = [
@@ -445,7 +466,12 @@ class ZingH3Codecs(ZingH3MediaInput):
                 ),
             )
             normalized, _, h, w, t, _ = self._normalize_inference_media(
-                media, None, conditions, target, max_area_config=self.max_area_config
+                decoded_references,
+                None,
+                conditions,
+                target,
+                max_area_config=getattr(active, "max_area_config", None)
+                or self.max_area_config,
             )
             if (
                 t,
@@ -459,14 +485,13 @@ class ZingH3Codecs(ZingH3MediaInput):
             raise ConditionError(
                 "CONDITION_INVALID", "Reference media preparation failed"
             ) from error
-        # Preserve original RGB for Qwen; normalized copies belong to the VAE.
+        # Retained presentation is already normalized; only new references change.
+        media = media + normalized
         positive = conditioning(prompt, media)
         candidate = copy(active)
         candidate.conditions = conditions
         candidate.condition_media = media
-        candidate.media = [
-            {"id": item["id"], "type": item["type"]} for item in normalized
-        ]
+        candidate.media = [{"id": item["id"], "type": item["type"]} for item in media]
         candidate.positive = positive
         candidate.visual, candidate.audio = {}, {}
         candidate.source_visual = None

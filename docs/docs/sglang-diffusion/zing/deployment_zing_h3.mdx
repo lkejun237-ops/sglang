@@ -51,6 +51,30 @@ L20Z/L20X/L20D 标识，不把它们改写成已核验的商业 SKU。CUDA 可�
 [PR #369](https://github.com/seedleap/sglang/pull/369) 提供低显存 launcher，但目前仍为 Draft，
 launcher/head 尚无真实 GPU 验收，不能作为已合入的一键部署命令。
 
+## Qwen 媒体预处理
+
+Qwen 使用按角色归一化后的媒体：reference 图片/视频分别沿用
+`reference_image` / `reference_video` 面积预算，source presentation（含连续 source
+首帧）按 `source` 面积预算做空间缩放并保留 presentation 帧数和 fps。
+Prompt 切换复用已归一化媒体；reference 替换仅处理新 reference，沿用初始请求的有效面积配置。
+连续 source 后续 RGB 到 VAE 的路径保持原有行为；本改动不保证任意输入流与 Qwen 首帧的尺寸相同。
+连续 source 的公开媒体输入收敛为 `source_stream + references + prompt`：
+服务始终从首批接受的 RGB 提取 Qwen source 首帧，不接受独立 video preview 或展示图片。
+旧 `user_media` 字段（含 null/空列表）明确拒绝，客户端 `--user-media` 与 ready 中的相关能力声明已删除。
+有限输入 `zing_request` 保留；其中未选作 reference、也无法归属 source 的视觉媒体在编码前拒绝，调用者不得伪造内部 `origin`。
+此 API 收敛版本的 480/736 端到端性能、效果及 Encoder/DiT/Decoder 显存 A/B 尚未验证；
+下述组件结果仍限于原预处理版本，不作为本次 API 改动的完整验收证据。
+
+2026-10-22，基于 `a0abf1c85b` 的预处理改动通过上海单卡 H200（实际 L20X / SM90）
+组件验证：原始 source 分别为 832×480、1280×736，各取 17 帧并配六张真实参考图；
+显式将 `reference_image` / `source` 面积预算设为 65,536，source 归一为 320×192，
+验证初始 Qwen/VAE 输入、连续 source 首帧、prompt 更新及 reference 替换。
+8 次真实 Qwen、38 次真实 VAE 编码通过，reference 输入尺寸和像素哈希一致。
+CPU 作业 `dlcouce8bl26f472`（826 项及 24 个子用例通过），GPU 作业 `dlc910xzfb0tkvqm`；
+回查 `oss://leap-world-shanghai/world-model/sglang/evals/pr507-20261022-r1/`。
+这不是 480/736 输出性能或完整 DiT/视频效果验收；远端 RPC 网络与流式 VAE append 未做 GPU 验收。
+下列历史性能数据保留原版本边界。
+
 ## 固定 workload 与 baseline
 
 后续 PR 的固定输入基线使用英伦 benchmark 的 `whitebox-basic` 集合
