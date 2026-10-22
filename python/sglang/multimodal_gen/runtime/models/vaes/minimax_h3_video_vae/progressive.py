@@ -20,8 +20,9 @@ import torch.nn.functional as F
 
 from .conv import BaseConv3d
 from .norm import FusedGroupNorm3D, TemporalIsolatedGroupNorm
+from .progressive_layout import make_encoder_layout
 from .spatial_padding import spatial_pad
-from .vae_cnn import EncoderFCN3D, norm_silu
+from .vae_cnn import EncoderFCN3D
 
 logger = logging.getLogger(__name__)
 _SESSION_IDS = count()
@@ -122,15 +123,34 @@ class CausalEncoderCache:
         self.last_execution = None
         self.layer_work = {}
         self._layout = None
+        layouts = getattr(model, "_progressive_encoder_layouts", None)
+        self._native_layout = layouts[0] if layouts else make_encoder_layout(model)
+        use_channels_last = (
+            os.environ.get("MINIMAX_H3_PROGRESSIVE_CHANNELS_LAST", "1") == "1"
+            and encode_mode == "performance"
+            and encode_dtype == "bfloat16"
+            and model.encoder.conv_in.weight.is_cuda
+            and layouts is not None
+        )
+        self._multi_frame_layout = (
+            layouts[1] if use_channels_last else self._native_layout
+        )
         self.model = model
         self.states = {}
         self.temporal_positions = 0
 
-    def conv(self, layer, x, states, key):
+    @property
+    def channels_last(self):
+        return self._multi_frame_layout.channels_last
+
+    def conv(self, layer, x, states, key, layout):
+        x = layout.input(x)
         history = layer.dilation[0] * (layer.kernel_size[0] - 1)
         previous, seen = self.states.get(key, (None, 0))
         if previous is None:
-            previous = x.new_zeros((*x.shape[:2], history, *x.shape[3:]))
+            shape = (*x.shape[:2], history, *x.shape[3:])
+            previous = layout.zeros(x, shape)
+        previous = layout.history(previous)
         joined = torch.cat((previous, x), 2) if history else x
         states[key] = (
             joined[:, :, -history:].clone() if history else None,
@@ -151,17 +171,21 @@ class CausalEncoderCache:
             ),
             mode=layer.pad_mode,
         )
-        return F.conv3d(
+        out = F.conv3d(
             padded,
-            layer.weight,
+            layout.weight,
             layer.bias,
             layer.stride,
             0,
             layer.dilation,
             layer.groups,
         )
+        return layout.output(out)
 
     def forward(self, x, key):
+        # Singleton startup blocks retain their original layout and arithmetic.
+        layout = self._multi_frame_layout if x.shape[2] > 1 else self._native_layout
+        x = layout.input(x)
         states = {}
         encoder = self.model.encoder
         work = 0
@@ -171,23 +195,15 @@ class CausalEncoderCache:
             positions = value.shape[0] * value.shape[2]
             work += positions
             self.layer_work[str(name)] = self.layer_work.get(str(name), 0) + positions
-            return self.conv(layer, value, states, (key, name))
+            return self.conv(layer, value, states, (key, name), layout.convs[layer])
 
         h = conv(encoder.conv_in, x, "in")
         for i, down in enumerate(encoder.down):
             for j, block in enumerate(down.block):
                 residual = h
-                h = (
-                    block.norm1(h, None)
-                    if block.use_fused_norm
-                    else norm_silu(h, block.norm1)
-                )
+                h = layout.norm(block.norm1, h, block.use_fused_norm)
                 h = conv(block.conv1, h, (i, j, 1))
-                h = (
-                    block.norm2(h, None)
-                    if block.use_fused_norm
-                    else norm_silu(h, block.norm2)
-                )
+                h = layout.norm(block.norm2, h, block.use_fused_norm)
                 h = conv(block.conv2, h, (i, j, 2))
                 if block.in_channels != block.out_channels:
                     residual = conv(block.nin_shortcut, residual, (i, j, "shortcut"))
@@ -200,12 +216,9 @@ class CausalEncoderCache:
                     if layer.space_stride == 2:
                         h = self._pad(h, (0, 1, 0, 1, 0, 0), mode=layer.pad_mode)
                     h = conv(layer.conv, h, (i, "down"))
-        h = (
-            encoder.norm_out(h, None)
-            if encoder.use_fused_norm
-            else norm_silu(h, encoder.norm_out)
-        )
+        h = layout.norm(encoder.norm_out, h, encoder.use_fused_norm)
         h = conv(encoder.conv_out, h, "out")
+        h = layout.output(h)
         return self.model.quant_conv(h), states, work
 
     def agree(self, value, *, error=None):
@@ -414,11 +427,15 @@ class CausalEncoderCache:
                 )
             else:
                 result = outputs[0]
+            if self.channels_last:
+                # Restore the public moments layout once, after low-resolution assembly.
+                result = result.contiguous()
         except Exception as exc:
             error = exc
         self.agree("assembled", error=error)
         self._layout = layout
         execution = dict(
+            channels_last_3d=self.channels_last,
             spatial_padding=self.spatial_padding,
             requested_mode=self.requested_mode,
             encode_mode=self.encode_mode,

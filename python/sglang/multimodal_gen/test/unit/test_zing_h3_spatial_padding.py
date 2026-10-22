@@ -27,6 +27,7 @@ DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
         "channel_stride",
         "temporal_slice",
         "channels_last",
+        "channels_last_temporal_slice",
     ],
 )
 def test_bitwise(device, dtype, time, padding, layout):
@@ -37,6 +38,8 @@ def test_bitwise(device, dtype, time, padding, layout):
         x = x[:, ::2]
     elif layout == "temporal_slice":
         x = x[:, :, 2:]
+    elif layout == "channels_last_temporal_slice":
+        x = x.contiguous(memory_format=torch.channels_last_3d)[:, :, 1:-1]
     elif layout == "channels_last":
         x = x.contiguous(memory_format=torch.channels_last_3d)
     else:
@@ -81,3 +84,15 @@ def test_fast_path_is_used(monkeypatch):
     monkeypatch.setattr(F, "pad", record)
     spatial_pad(torch.randn(2, 4, 8, 5, 6), (1, 1, 1, 1, 0, 0), "reflect")
     assert calls == [(3, (1, 1, 1, 1))]
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_channels_last_autograd_uses_native_path(device):
+    source = torch.randn(2, 4, 3, 8, 12, device=device, requires_grad=True)
+    x = source.contiguous(memory_format=torch.channels_last_3d)
+    padding = (1, 1, 2, 1, 0, 0)
+    actual = torch.autograd.grad(
+        spatial_pad(x, padding, "reflect").sum(), source, retain_graph=True
+    )[0]
+    expected = torch.autograd.grad(F.pad(x, padding, "reflect").sum(), source)[0]
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)

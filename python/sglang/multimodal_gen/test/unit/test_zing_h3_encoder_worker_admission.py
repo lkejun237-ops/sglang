@@ -13,7 +13,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 
-@pytest.mark.parametrize("close_op", ["close", "abort", "quarantine"])
+@pytest.mark.parametrize("close_op", ["close", "abort", "quarantine", "warmup_failure"])
 @pytest.mark.parametrize("rank", [0, 1])
 def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, close_op):
     # Extract the actual main loop, avoiding unrelated CUDA platform imports on
@@ -70,9 +70,23 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
             raise StopLoop
 
     replies, ports, sessions, barriers = [], [], [], []
+    startup = []
+
+    def warmup():
+        startup.append("warmup")
+        if close_op == "warmup_failure":
+            raise RuntimeError("Injected encoder warmup failure")
+
+    def bind(address):
+        assert startup == ["warmup"]
+
+    def emit(value, **kwargs):
+        if json.loads(value).get("encoder_service_ready"):
+            startup.append("ready")
+
     socket = SimpleNamespace(
         setsockopt=lambda *a: None,
-        bind=lambda *a: None,
+        bind=bind,
         poll=lambda *_: True,
         recv_multipart=lambda: [json.dumps(take()).encode()],
         send_json=lambda value: replies.append(value),
@@ -182,6 +196,7 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
         timedelta=timedelta,
         load_encoder=lambda root: SimpleNamespace(
             modules={"video_vae": object()},
+            warmup_encoder=warmup,
             runtime={
                 "vae_config": {"encode_mode": "performance", "encode_dtype": "bfloat16"}
             },
@@ -191,12 +206,23 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
         time=SimpleNamespace(time_ns=lambda: 0),
         H3ProgressiveEncoderSession=Session,
         bridge_group=lambda *a, **kw: object(),
+        print=emit,
     )
     exec(
         compile(ast.Module(body=[main], type_ignores=[]), str(path), "exec"), namespace
     )
+    if close_op == "warmup_failure":
+        with pytest.raises(
+            control.EncoderControlError, match="participating rank"
+        ) as err:
+            namespace["main"]()
+        assert str(err.value.__cause__) == "Injected encoder warmup failure"
+        assert startup == ["warmup"]
+        assert not replies and not ports and not sessions
+        return
     with pytest.raises(StopLoop):
         namespace["main"]()
+    assert startup == ["warmup", "ready"]
     if close_op == "quarantine":
         assert len(sessions) == 1 and sessions[0].closed
         assert len(barriers) == 1

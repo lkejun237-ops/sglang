@@ -2,6 +2,7 @@
 """Zing request preparation using SGLang's shared H3 Qwen and VAE modules."""
 
 import math
+import os
 import threading
 from contextlib import contextmanager
 from copy import copy
@@ -128,7 +129,14 @@ class ZingH3Codecs(ZingH3MediaInput):
         self.decoder = decoder_adapter(pipeline_config.resolve_decoder_spec())
 
     def prepare_visual_encoder_weights(self):
-        """Prepare encoder precision at startup, before cached sessions exist."""
+        """Prepare shared precision, weights and layout strategies without inference."""
+        from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.progressive_layout import (
+            make_encoder_layout,
+        )
+        from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vae_cnn import (
+            EncoderFCN3D,
+        )
+
         _validate_encoder_benchmark_limit(
             self.runtime["vae_config"].get("cudnn_benchmark_limit")
         )
@@ -136,6 +144,65 @@ class ZingH3Codecs(ZingH3MediaInput):
         dtype = getattr(torch, self.runtime["vae_config"]["encode_dtype"])
         model.encoder.to(dtype=dtype)
         model.quant_conv.to(dtype=dtype)
+        # Sessions share prepared strategies; singleton startup keeps native arithmetic.
+        native = make_encoder_layout(model)
+        model._progressive_encoder_layouts = (native, native)
+        if (
+            os.environ.get("MINIMAX_H3_PROGRESSIVE_CHANNELS_LAST", "1") == "1"
+            and self.runtime["vae_config"].get("encode_mode") == "performance"
+            and dtype == torch.bfloat16
+            and isinstance(model.encoder, EncoderFCN3D)
+            and model.encoder_tiling
+            and next(model.encoder.parameters()).is_cuda
+            and torch.version.cuda is not None
+        ):
+            # Keep whole-clip/reference encoding on its original weights/layout.
+            # These immutable serving copies are shared by progressive sessions.
+            model._progressive_encoder_weights = {
+                layer: layer.weight.detach().clone(memory_format=torch.channels_last_3d)
+                for layer in model.encoder.modules()
+                if isinstance(layer, torch.nn.Conv3d) and layer.kernel_size != (1, 1, 1)
+            }
+            model._progressive_encoder_layouts = (
+                native,
+                make_encoder_layout(model, weights=model._progressive_encoder_weights),
+            )
+        else:
+            model._progressive_encoder_weights = {}
+
+    def warmup_encoder(self):
+        """Warm prepared source tile kernels before the caller advertises ready."""
+        model = self.modules["video_vae"]
+        layouts = getattr(model, "_progressive_encoder_layouts", None)
+        if layouts is None or not layouts[1].channels_last:
+            return
+        from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.progressive import (
+            CausalEncoderCache,
+        )
+
+        # This temporary replicated cache joins no collectives or real session IDs.
+        with (
+            torch.no_grad(),
+            _visual_encode_policy(
+                "performance", self.runtime["vae_config"].get("cudnn_benchmark_limit")
+            ),
+        ):
+            warmup = CausalEncoderCache(
+                model,
+                tile_mode="replicated",
+                encode_mode="performance",
+                encode_dtype="bfloat16",
+            )
+            try:
+                for frames in (1, 8):
+                    pixels = next(model.encoder.parameters()).new_zeros(
+                        (1, 3, frames, model.tile_size, model.tile_size)
+                    )
+                    _, pending, work = warmup.forward(pixels, "startup")
+                    warmup.commit(pending, work)
+            finally:
+                warmup.clear()
+            torch.cuda.synchronize(next(model.encoder.parameters()).device)
 
     @staticmethod
     def _stats(config, latent, audio=False):

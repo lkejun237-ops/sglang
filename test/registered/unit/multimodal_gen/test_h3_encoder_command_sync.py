@@ -251,6 +251,7 @@ def _worker(
             )
             worker.load_encoder = lambda *_: SimpleNamespace(
                 modules={"video_vae": object()},
+                warmup_encoder=lambda: None,
                 runtime={
                     "vae_config": {
                         "encode_mode": "performance",

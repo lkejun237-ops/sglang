@@ -19,6 +19,7 @@
 | `DENOISE_CUDA_GRAPH` | `1`（本次开启） | 用 CUDA graph 回放历史 RoPE 全部复用的 denoise forward，与 eager 逐位一致；仅 SP1 + KV 池，其他场景自动走 eager；预热失败回退 eager；捕获失败会停用 graph 并报错，建议重启进程 |
 | `DENOISE_CUDA_GRAPH_MAX` | `32` | 每个模型保留的 denoise graph 上限（LRU）；多会话时 key 含各自的 KV 槽地址 |
 | `MINIMAX_H3_PROGRESSIVE_ENCODER_TILING`（完整名称） | `auto` | 渐进 source 编码按已有条件自动选择 tile 并行 |
+| `MINIMAX_H3_PROGRESSIVE_CHANNELS_LAST`（完整名称） | `1` | CUDA/BF16/performance/tiled source Encoder 采用局部 channels-last 布局；`0` 恢复原布局，其他准入条件保持不变 |
 
 Q/K fused RMSNorm、store-backed KV / fused KV write、移除 DiT / sampler
 host sync 已直接集成，无需额外开关。已退休的 `EXPERIMENTAL_CACHED_ROPE`、

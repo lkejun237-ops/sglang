@@ -3850,36 +3850,36 @@
       "sources": [
         "main"
       ],
-      "reason": "Two fresh Alibaba Linux CPU process trials passed after main integration.",
+      "reason": "Layout strategies and explicit warmup-before-ready admission tests passed two fresh Linux Python 3.11 / pinned CPU-recipe trials; source hashes, complete case identities and JUnit checked; no skips.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "dab30289371a6a37bd43e18de69bac66ddfca817a3dc71fe764a4a039161b346",
-        "receipt": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-1/receipt.json",
-        "receipt_sha256": "8713fedd8775a1b331f93351ad592908a13b8f4ab7d23fef0a47bfc033765639",
+        "source_sha256": "c3ca2f27b7097a7b25ee8840b1156bffae08f669c3f4bd427dd1a2a8c9dadca9",
+        "receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/encoder-warmup-strategy-20261022-r1/readback/triage/receipt.json",
+        "receipt_sha256": "824979d9eaae66042432fb1853570d4923d0642388bde4cf72f2c5e3cbbe8aa9",
         "trials": [
           {
             "trial": 1,
-            "passed": 8,
-            "collected": 8,
+            "passed": 10,
+            "collected": 10,
             "skipped": 0,
-            "duration_seconds": 7.106126470025629,
+            "duration_seconds": 13.791853188999994,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-1/cpu-2-trial-1.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-1/cpu-2-trial-1.xml"
+            "log_path": "/mnt/oss/world-model/sglang/evals/encoder-warmup-strategy-20261022-r1/readback/triage/cpu-0-trial-1.log",
+            "junit_path": "/mnt/oss/world-model/sglang/evals/encoder-warmup-strategy-20261022-r1/readback/triage/cpu-0-trial-1.xml"
           },
           {
             "trial": 2,
-            "passed": 8,
-            "collected": 8,
+            "passed": 10,
+            "collected": 10,
             "skipped": 0,
-            "duration_seconds": 6.395074850181118,
+            "duration_seconds": 6.522227923000003,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-1/cpu-2-trial-2.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-1/cpu-2-trial-2.xml"
+            "log_path": "/mnt/oss/world-model/sglang/evals/encoder-warmup-strategy-20261022-r1/readback/triage/cpu-0-trial-2.log",
+            "junit_path": "/mnt/oss/world-model/sglang/evals/encoder-warmup-strategy-20261022-r1/readback/triage/cpu-0-trial-2.xml"
           }
         ],
         "environment": {
-          "python": "3.11.12",
+          "python": "3.11.16",
           "platform": "Linux-6.6.102-001.8.100.kangaroo.al8.x86_64-x86_64-with-glibc2.39"
         },
         "environment_recipe": {
@@ -3889,16 +3889,21 @@
             "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
           }
         },
-        "manifest_sha256": "4abd3c0a8465905e4340d8303ec04f1ae88cb15e6885b98d93f6b919731b44cf",
+        "manifest_sha256": "411747a2acadccca5a215472bd20f951165a572b42fb7d2dd334c84f76d6eb00",
         "tooling_sha256": {
-          "check_python.py": "a22e6bde47103b7e2ffa065b137441794a64c9b622822e7301aa8d938e32cada",
-          "common.py": "2edda6b9e4e6f372d70851a47d065dd99eaf436fcc6d8714b9609b72aa13311f",
-          "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
+          "check_python.py": "edced74edc439191f8ff97373e71fbb50d1469cff016c7163f0cb80d93ede73b",
+          "common.py": "52128fc66405da6918eecb98a73d76f322aa3fbe6fec9b55c0a3ff9924cb8f4b",
+          "run_cpu_tests.py": "a06607bb9ba3734c605194d274c9dc35b2b52555470b912b9af69bc18ccdb60d",
           "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
           "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
           "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
           "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
-        }
+        },
+        "job_id": "dlc19njci3xefe2v",
+        "source_snapshot_sha": "e109c3b5141d36a8efbf5f7a45a3db3af3949f93",
+        "checkout_sha": "3366e96b3669152d0e39f5163c7168fe912fe1cd",
+        "candidate_fingerprint": "6a469b99488d8a2cc7f43fce3d31be306037e0285b9fa73cdea91ca66a7b9f43",
+        "checkout_note": "Synthetic local Git snapshot of the frozen base archive; candidate overlays are identified by SOURCE.json and the receipt fingerprint."
       }
     },
     {
@@ -4946,36 +4951,36 @@
       "sources": [
         "main"
       ],
-      "reason": "Two fresh Alibaba Linux CPU process trials passed after main integration.",
+      "reason": "FR349 final test source passed two fresh Linux Python 3.11 / pinned CPU-recipe processes; source hashes, complete case identities and JUnit checked; no skips.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "f2fd39a18482a0017e73562215ff81850b4910223c85106b08d6962a2faee2fc",
-        "receipt": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-2/receipt.json",
-        "receipt_sha256": "ca9d11bba78a4a4f10b2ec59adc8916a60e16b99880f1ae3b4018d5660e2ce90",
+        "source_sha256": "91a4360187c951720f6cc60b5990edb5204c23fd3e6df18c55a1d13026b48bb8",
+        "receipt": "/cpfs/world-model/sglang/evals/encoder-layout-20261018-r15/triage/receipt.json",
+        "receipt_sha256": "25a0f4faef7aca9dba65fee923c099267e97605d2dc01c6a9c102194376d20d4",
         "trials": [
           {
             "trial": 1,
-            "passed": 366,
-            "collected": 366,
+            "passed": 439,
+            "collected": 439,
             "skipped": 0,
-            "duration_seconds": 16.525824469979852,
+            "duration_seconds": 27.506091998000016,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-2/cpu-5-trial-1.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-2/cpu-5-trial-1.xml"
+            "log_path": "/cpfs/world-model/sglang/evals/encoder-layout-20261018-r15/triage/cpu-0-trial-1.log",
+            "junit_path": "/cpfs/world-model/sglang/evals/encoder-layout-20261018-r15/triage/cpu-0-trial-1.xml"
           },
           {
             "trial": 2,
-            "passed": 366,
-            "collected": 366,
+            "passed": 439,
+            "collected": 439,
             "skipped": 0,
-            "duration_seconds": 13.08584669791162,
+            "duration_seconds": 11.74450644000001,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-2/cpu-5-trial-2.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-2/cpu-5-trial-2.xml"
+            "log_path": "/cpfs/world-model/sglang/evals/encoder-layout-20261018-r15/triage/cpu-0-trial-2.log",
+            "junit_path": "/cpfs/world-model/sglang/evals/encoder-layout-20261018-r15/triage/cpu-0-trial-2.xml"
           }
         ],
         "environment": {
-          "python": "3.11.12",
+          "python": "3.11.16",
           "platform": "Linux-6.6.102-001.8.100.kangaroo.al8.x86_64-x86_64-with-glibc2.39"
         },
         "environment_recipe": {
@@ -4985,16 +4990,17 @@
             "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
           }
         },
-        "manifest_sha256": "4abd3c0a8465905e4340d8303ec04f1ae88cb15e6885b98d93f6b919731b44cf",
+        "manifest_sha256": "e5c0aa4bdecad897e3d9f23348bc593f98d18d05778f779669e425b4a7e9aef7",
         "tooling_sha256": {
-          "check_python.py": "a22e6bde47103b7e2ffa065b137441794a64c9b622822e7301aa8d938e32cada",
-          "common.py": "2edda6b9e4e6f372d70851a47d065dd99eaf436fcc6d8714b9609b72aa13311f",
+          "check_python.py": "edced74edc439191f8ff97373e71fbb50d1469cff016c7163f0cb80d93ede73b",
+          "common.py": "91033550acb81ced696837a02f40cad5620ac2601d8109cb831c29d9eeb39978",
           "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
           "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
           "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
           "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
           "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
-        }
+        },
+        "job_id": "dlclitvkbkzjzv2e"
       }
     },
     {
@@ -7724,6 +7730,73 @@
       ],
       "reason": "Passed in frozen Alibaba Linux CPU regression dlceuld6z750siwa (candidate 1584 passed / 28 skipped); source hashes retained in kv-memory-r4/READY.json.",
       "dependencies": []
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_h3_encoder_layout.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Layout strategies and explicit warmup-before-ready admission tests passed two fresh Linux Python 3.11 / pinned CPU-recipe trials; source hashes, complete case identities and JUnit checked; no skips.",
+      "dependencies": [
+        "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_kernel.py"
+      ],
+      "trial_evidence": {
+        "source_sha256": "207d0d7ff22729363fa72d68d520e48a09d7438dfab86257acc763af76b32e55",
+        "receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/encoder-warmup-strategy-20261022-r1/readback/triage/receipt.json",
+        "receipt_sha256": "824979d9eaae66042432fb1853570d4923d0642388bde4cf72f2c5e3cbbe8aa9",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 67,
+            "collected": 67,
+            "skipped": 0,
+            "duration_seconds": 32.986101538000014,
+            "exit_code": 0,
+            "log_path": "/mnt/oss/world-model/sglang/evals/encoder-warmup-strategy-20261022-r1/readback/triage/cpu-1-trial-1.log",
+            "junit_path": "/mnt/oss/world-model/sglang/evals/encoder-warmup-strategy-20261022-r1/readback/triage/cpu-1-trial-1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 67,
+            "collected": 67,
+            "skipped": 0,
+            "duration_seconds": 23.664497998,
+            "exit_code": 0,
+            "log_path": "/mnt/oss/world-model/sglang/evals/encoder-warmup-strategy-20261022-r1/readback/triage/cpu-1-trial-2.log",
+            "junit_path": "/mnt/oss/world-model/sglang/evals/encoder-warmup-strategy-20261022-r1/readback/triage/cpu-1-trial-2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.16",
+          "platform": "Linux-6.6.102-001.8.100.kangaroo.al8.x86_64-x86_64-with-glibc2.39"
+        },
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          }
+        },
+        "manifest_sha256": "411747a2acadccca5a215472bd20f951165a572b42fb7d2dd334c84f76d6eb00",
+        "tooling_sha256": {
+          "check_python.py": "edced74edc439191f8ff97373e71fbb50d1469cff016c7163f0cb80d93ede73b",
+          "common.py": "52128fc66405da6918eecb98a73d76f322aa3fbe6fec9b55c0a3ff9924cb8f4b",
+          "run_cpu_tests.py": "a06607bb9ba3734c605194d274c9dc35b2b52555470b912b9af69bc18ccdb60d",
+          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
+          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
+          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
+          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
+        },
+        "job_id": "dlc19njci3xefe2v",
+        "source_snapshot_sha": "e109c3b5141d36a8efbf5f7a45a3db3af3949f93",
+        "checkout_sha": "3366e96b3669152d0e39f5163c7168fe912fe1cd",
+        "candidate_fingerprint": "6a469b99488d8a2cc7f43fce3d31be306037e0285b9fa73cdea91ca66a7b9f43",
+        "checkout_note": "Synthetic local Git snapshot of the frozen base archive; candidate overlays are identified by SOURCE.json and the receipt fingerprint."
+      }
     }
   ],
   "recipes": {

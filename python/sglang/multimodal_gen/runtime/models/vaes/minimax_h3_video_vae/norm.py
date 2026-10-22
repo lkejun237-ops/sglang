@@ -36,13 +36,13 @@ def _merge_time_to_batch(x):
     )
 
 
-def _split_time_from_batch(x, batch):
+def _split_time_from_batch(x, batch, memory_format=torch.contiguous_format):
     batch_depth, channels, _, height, width = x.shape
     depth = batch_depth // batch
     return (
         x.view(batch, depth, channels, height, width)
         .permute(0, 2, 1, 3, 4)
-        .contiguous()
+        .contiguous(memory_format=memory_format)
     )
 
 
@@ -281,3 +281,22 @@ def get_group_norm_3d(num_channels, use_t_isolated_gn=False):
 
     norm_cls = TemporalIsolatedGroupNorm if use_t_isolated_gn else nn.GroupNorm
     return norm_cls(num_groups=32, num_channels=num_channels, eps=1e-6, affine=True)
+
+
+def progressive_norm_silu(x, norm):
+    """Source-only layout path; ordinary norm forwards keep their legacy layout.
+
+    Retain the original contiguous per-(N,T,group) reduction. Apply the
+    pointwise activation before the one output copy back to NDHWC.
+    """
+    batch = x.shape[0]
+    merged = _merge_time_to_batch(x)
+    out = F.group_norm(
+        merged, norm.num_groups, weight=norm.weight, bias=norm.bias, eps=norm.eps
+    )
+    out = (
+        _apply_activation(out, norm.activation)
+        if isinstance(norm, FusedGroupNorm3D)
+        else F.silu(out, inplace=True)
+    )
+    return _split_time_from_batch(out, batch, torch.channels_last_3d)

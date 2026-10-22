@@ -171,3 +171,23 @@ python benchmark/zing_h3_causal/prepare_whitebox_video_smoke.py \
 全片 Qwen 条件结果混用；前两例的 Qwen 条件范围已改变。通过条件为新外观清晰且持续，同时 source 运动与
 镜头没有漂移。当前数据分支仅覆盖数据与准备契约；PR #303 有独立回放夹具和实验记录，
 不等同于这里已接入通用 runner。本次三条 events 后缀数据尚未完成逐例 GPU 效果验收。
+
+## Encoder layout 组件对照
+
+`benchmark_encoder_layout.py` 使用严格加载的 trained source Encoder，对同一输入切换
+`MINIMAX_H3_PROGRESSIVE_CHANNELS_LAST=0/1`。它独立预热各布局，记录三次正式调用、
+可选的单独 profile、输出逐值门槛、原参数 storage/stride 和缓存释放。输出目录必须不存在。
+
+```bash
+python benchmark/zing_h3_causal/benchmark_encoder_layout.py \
+  --model /path/to/serving-model --source-rgb /path/to/source.rgb \
+  --width 832 --height 480 --frames 34 --output /path/to/new-480-output --profile
+# 736 档使用其自身的 packed THWC RGB 输入，显式指定 --width 1312 --height 736。
+# SP2 将 python 替换为 torchrun --standalone --nproc-per-node=2。
+```
+
+保留 `scope.json`、`timing.json`、`numerics.json`、`COMPLETE.json` 与实际源码 SHA；
+两档分别保存，不混合统计。组件计时每次 pop 同步 CUDA，包含 GPU 执行与等待；
+不代表无插桩服务耗时。完整服务与阶段计时遵循 [CLIENT_BENCHMARK.md](CLIENT_BENCHMARK.md)
+和 [STAGE_TIMING.md](STAGE_TIMING.md)。单次结果、失败和原始产物索引维护在
+[PR #355](https://github.com/seedleap/sglang/pull/355)，历史结果不覆盖后续 main 默认值变更。

@@ -135,6 +135,7 @@ def main():
                 )
             )
             codecs = load_encoder(args.model)
+            codecs.warmup_encoder()
             if rank == 0:
                 context = zmq.Context()
                 socket = context.socket(zmq.REP)
