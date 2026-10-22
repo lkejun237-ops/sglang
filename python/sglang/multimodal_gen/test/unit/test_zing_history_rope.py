@@ -481,25 +481,29 @@ def test_grouped_unaligned_pointers_and_row_stride(heads, offset, monkeypatch):
     assert all(torch.equal(a, b) for a, b in zip(stores, before))
 
 
-def _qkv_view(device, rows, heads):
+def _qkv_view(device, rows, heads, strided_heads=False):
     """Q as the fused projection hands it over: a row-strided QKV view."""
+    if strided_heads:
+        qkv = torch.randn(rows, heads, 3 * 128, device=device, dtype=torch.bfloat16)
+        return qkv, qkv.chunk(3, dim=-1)[0]
     qkv = torch.randn(rows, 3 * heads * 128, device=device, dtype=torch.bfloat16)
     return qkv, qkv[:, : heads * 128].view(rows, heads, 128)
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-@pytest.mark.parametrize("heads", [2, 28, 56])
+@pytest.mark.parametrize("heads", [2, 14, 28, 56])
 @pytest.mark.parametrize("rows", [1, 390, 780])
+@pytest.mark.parametrize("strided_heads", [False, True])
 @torch.no_grad()
 def test_current_rope_matches_eager_without_touching_qkv(
-    device, heads, rows, monkeypatch
+    device, heads, rows, strided_heads, monkeypatch
 ):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA required")
     monkeypatch.setenv("SGLANG_ZING_FUSED_CURRENT_ROPE", "1")
     apply, routes = apply_current_rope, CURRENT_ROPE_ROUTES
     torch.manual_seed(211)
-    qkv, q = _qkv_view(device, rows, heads)
+    qkv, q = _qkv_view(device, rows, heads, strided_heads)
     original = qkv.clone()
     rope = torch.randn(rows, 96, device=device, dtype=torch.bfloat16)
     expected = _apply_rope(q, rope)
@@ -511,6 +515,39 @@ def test_current_rope_matches_eager_without_touching_qkv(
     assert torch.equal(qkv, original)
     route = "fused" if device == "cuda" else "device"
     assert routes[route] == before[route] + 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("rows", [390, 943, 1886])
+@pytest.mark.parametrize("enabled", ["0", "1"])
+@torch.no_grad()
+def test_current_qk_rope_graph_replay_preserves_values(rows, enabled, monkeypatch):
+    monkeypatch.setenv("SGLANG_ZING_FUSED_CURRENT_ROPE", enabled)
+    torch.manual_seed(219)
+    qkv, _ = _qkv_view("cuda", rows, 14, strided_heads=True)
+    q, k, v = (part.view(rows, 14, 128) for part in qkv.chunk(3, -1))
+    rope = torch.randn(rows, 96, device="cuda", dtype=torch.bfloat16)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            apply_current_rope(q, rope)
+            apply_current_rope(k, rope)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        rotated_q = apply_current_rope(q, rope)
+        rotated_k = apply_current_rope(k, rope)
+    for _ in range(2):
+        qkv.normal_()
+        rope.normal_()
+        original = qkv.clone()
+        expected_q, expected_k = _apply_rope(q, rope), _apply_rope(k, rope)
+        graph.replay()
+        assert torch.equal(rotated_q, expected_q)
+        assert torch.equal(rotated_k, expected_k)
+        assert torch.equal(qkv, original)
+        assert torch.equal(v, original.chunk(3, -1)[2].view_as(v))
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -533,9 +570,9 @@ def test_unsupported_current_rope_layouts_fall_back(monkeypatch):
     monkeypatch.setenv("SGLANG_ZING_FUSED_CURRENT_ROPE", "1")
     apply, routes = apply_current_rope, CURRENT_ROPE_ROUTES
     rope = torch.randn(17, 96, device="cuda", dtype=torch.bfloat16)
-    # Ulysses hands back [rows, heads, 3 * dim] chunks: heads are not packed.
-    qkv = torch.randn(17, 2, 3 * 128, device="cuda", dtype=torch.bfloat16)
-    q = qkv[..., :128]
+    # Non-unit feature strides still require the eager fallback.
+    qkv = torch.randn(17, 2, 2 * 128, device="cuda", dtype=torch.bfloat16)
+    q = qkv[..., ::2]
     before = routes["layout"]
     assert torch.equal(apply(q, rope), _apply_rope(q, rope))
     assert routes["layout"] == before + 1

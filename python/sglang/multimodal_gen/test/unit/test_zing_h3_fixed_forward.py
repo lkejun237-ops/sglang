@@ -839,3 +839,42 @@ def test_pool_slots_start_finite():
     ):
         for tensor in (store.k, store.v, store.rotated_k):
             assert not tensor.any()
+
+
+@pytest.mark.parametrize("fused_kv", [False, True])
+@torch.no_grad()
+def test_fixed_forward_rotates_current_qk_once_across_kv_routes(
+    model, monkeypatch, fused_kv
+):
+    from sglang.multimodal_gen.runtime.models.dits import zing_h3
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import _apply_rope
+
+    packer, inputs, visual, _ = request(model, audio=False)
+    sampler = ZingH3Sampler(model, packer, sigma_points=3)
+    sampler.device = torch.device("cpu")
+    layout = packer.pack_inference_layout(inputs, inputs.positive, visual, None)
+    packed = sampler._select_block(layout, 1, phase="source", video_t=1.0, audio_t=1.0)
+    expected = sampler._forward(packed, None, None)
+    calls = []
+
+    def current(x, rope):
+        calls.append("current")
+        return _apply_rope(x, rope)
+
+    def current_kv(q, k, v, rope, plan, layer, tensors, *, default=False):
+        calls.append("kv")
+        if not fused_kv:
+            return None
+        plan.write_current(layer, _apply_rope(k, rope), k, v, tensors=tensors)
+        return _apply_rope(q, rope)
+
+    monkeypatch.setattr(zing_h3, "apply_current_rope", current)
+    monkeypatch.setattr(zing_h3, "apply_current_rope_kv", current_kv)
+    kv = _workspace(model, packed, clean=True)
+    actual = model.prepare_fixed_forward(
+        packed=packed, kv_plan=kv, phase="source"
+    ).execute()
+    for value, reference in zip(actual, expected):
+        torch.testing.assert_close(value, reference, atol=0.008, rtol=0.008)
+    assert calls.count("kv") == len(model.blocks)
+    assert calls.count("current") == (0 if fused_kv else 2 * len(model.blocks))

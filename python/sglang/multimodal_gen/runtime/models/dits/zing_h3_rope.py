@@ -18,7 +18,9 @@ HISTORY_ROPE_ROUTES = collections.Counter()
 CURRENT_ROPE_ROUTES = collections.Counter()
 
 
-def _history_rope_rejection(x, coefficients, out, *, alias_out=None):
+def _history_rope_rejection(
+    x, coefficients, out, *, alias_out=None, strided_heads=False
+):
     """Return why the fused kernel cannot run, or None.
 
     ``out=None`` checks only the input; a fresh contiguous output of x's shape
@@ -52,9 +54,9 @@ def _history_rope_rejection(x, coefficients, out, *, alias_out=None):
         return "shape_or_dtype"
     if not (
         x.stride(-1) == 1
-        and x.stride(-2) == dim
-        and x.stride(0) >= heads * dim
-        and (rows - 1) * x.stride(0) + heads * dim < 2**31
+        and (x.stride(-2) == dim or (strided_heads and x.stride(-2) >= dim))
+        and x.stride(0) >= (heads - 1) * x.stride(-2) + dim
+        and (rows - 1) * x.stride(0) + (heads - 1) * x.stride(-2) + dim < 2**31
         and coefficients.numel() < 2**31
         and coefficients.is_contiguous()
         and (out is None or out.is_contiguous())
@@ -72,12 +74,13 @@ def apply_current_rope(x, coefficients):
     """Rotate the current block's Q or K into a new contiguous tensor.
 
     Enabled by default. The history kernel reads the row-strided QKV view in
-    place of eager's cos/sin concatenations and output concatenation.
+    place of eager's cos/sin concatenations and output concatenation, including
+    the interleaved head stride of the post-Ulysses Q/K views.
     """
     reason = "disabled"
     if os.environ.get("SGLANG_ZING_FUSED_CURRENT_ROPE", "1") == "1":
         # Check the input first so a rejected call allocates nothing extra.
-        reason = _history_rope_rejection(x, coefficients, None)
+        reason = _history_rope_rejection(x, coefficients, None, strided_heads=True)
     CURRENT_ROPE_ROUTES[reason or "fused"] += 1
     if reason is not None:
         return _apply_rope(x, coefficients)

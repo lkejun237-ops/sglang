@@ -18,6 +18,7 @@ def _history_rope_kernel(
     D: tl.constexpr,
     R: tl.constexpr,
     S: tl.constexpr,
+    HS: tl.constexpr,
     B: tl.constexpr,
 ):
     i = tl.program_id(0) * B + tl.arange(0, B)
@@ -25,10 +26,12 @@ def _history_rope_kernel(
     row = i // (H * D)
     head = (i // D) % H
     d = i % D
-    raw = tl.load(X + row * S + head * D + d, valid, 0)
+    raw = tl.load(X + row * S + head * HS + d, valid, 0)
     x = raw.to(tl.float32)
     partner = tl.where(d < R // 2, d + R // 2, d - R // 2)
-    other = tl.load(X + row * S + head * D + partner, valid & (d < R), 0).to(tl.float32)
+    other = tl.load(X + row * S + head * HS + partner, valid & (d < R), 0).to(
+        tl.float32
+    )
     other = tl.where(d < R // 2, -other, other)
     c = tl.load(C + row * R + d % (R // 2), valid & (d < R), 0).to(tl.float32)
     s = tl.load(C + row * R + R // 2 + d % (R // 2), valid & (d < R), 0).to(tl.float32)
@@ -53,6 +56,7 @@ def fused_zing_history_rope(
             dim,
             coefficients.shape[-1],
             x.stride(0),
+            x.stride(1),
             512,
             num_warps=4,
             enable_fp_fusion=False,

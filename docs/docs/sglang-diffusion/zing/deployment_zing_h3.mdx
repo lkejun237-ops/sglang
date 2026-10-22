@@ -128,3 +128,35 @@ Encoder 分项注明 Qwen、参考图 VAE、source VAE；共享进程/整卡显�
 [PR 三部分报告格式](https://github.com/seedleap/sglang/blob/main/benchmark/zing_h3_causal/CLIENT_BENCHMARK.md#pr-三部分报告格式)。
 重新部署前验证请求完成、取消/断连/EOS 后资源释放及下一会话可用；通过容量或协议测试
 不等于通过视觉质量验收。
+
+
+## PR #367：SP4 当前 Q/K RoPE 的验证边界
+
+#367 已普通合入 2026-10-22 获取的 main `ca939c4b264c351f00535e0176b8b39e9021abfc`；
+运行时基线 `39f066d375e04fd07f7a9bc7c6c94e45529107d4` 与该 main 的运行时、benchmark 和测试内容一致。该实验不依赖 #355 的 Encoder 布局。两侧保持相同主线 Encoder、FA4、checkpoint、七图输入、
+window=21、sink=3、after_step0、BF16，以及前三块四步 `[1000,750,500,250]`、
+之后两步 `[1000,750]`；目标为完整 50 层、720 帧，分别覆盖 **864×480 与 1312×736**。
+这两档使用显式派生 case，保留标准七图长片的原始素材和 prompt。832×480 有限输入会触发
+原视频与目标的 2% 长宽比限制，因此本轮 480 档改为 864×480，旧 832×480 结果不作 A/B。
+736 档的目标输出是 1312×736，原始 1280×720 source 经官方预处理为 1280×704；输入与输出尺寸分别记录。
+
+当前 main 的 weights-free AdaLN 仅准入 SP1/SP2；该 SP4 实验显式使用 `zing_adaln_mode=resident`，
+不通过放宽白名单替代表的兼容性验证。需要 KV pool、单活跃会话和足够预热显存；
+按历史约 250 GiB/卡的预热需求选择 CC10.3、CUDA 可见至少 260 GiB/卡的四卡目标，
+实际设备与峰值仍以本轮回执为准。历史 R27/R28 的 +1.71%–2.46% 不代表当前 main 的收益。
+
+Lynn 依赖必须匹配原生 Zing 的完整 Diffusers 包：提交
+`d5baa4fb548294f47dbca49890abd4b291204c60`（版本标识 `0.40.0.dev0`），其中包含
+`diffusers.models.autoencoders.autoencoder_kl_minimax_h3`。本轮固定镜像原带的 0.37 缺少该类，
+不能仅凭版本导入成功当作可部署；已用上述完整包严格加载真实训练 checkpoint，双方使用相同依赖。
+
+本轮完整模型 A/B 使用官方 `bench_streaming_source.py` 连续 source 接口。标准有限输入
+在 864×480 的实测 prefix 为 25,568 行，超过本配方的 16,384 行池容量；1312×736 另因
+归一化后 source 1280×704 与 target 不等，被原有池契约拒绝。这些有限接口配置**未通过**，
+不以连续 source 的性能替代其兼容性验收，也不在本 RoPE PR 中扩大池容量或改变媒体语义。
+
+最新 main 的端到端 A/B 与独立阶段诊断正在执行，暂不提供新 FPS 或推荐将该实验配方作为部署默认。
+正式轮关闭诊断；Encoder（Qwen/reference/source）、DiT、Lynn Decoder 的 Host/CUDA 区间和
+显存另采。有限输入的本地条件编码支持完整多帧视频，不能套用远程单帧条件服务的校验器；
+Qwen 实际编码与连续 source 的缓存命中分列。模型张量存储按物理 storage 去重，共享进程区间峰值与组件独占显存区分报告，
+阶段重叠不相加作为 E2E。[PR #367](https://github.com/seedleap/sglang/pull/367) 维护最终结果与复现回执。

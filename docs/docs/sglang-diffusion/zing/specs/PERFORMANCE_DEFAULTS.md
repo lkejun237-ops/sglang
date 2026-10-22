@@ -6,8 +6,8 @@
 | 字段 | 默认值 | 用途 |
 | --- | --- | --- |
 | `FUSED_HISTORY_ROPE` | `1`（本次开启） | 融合历史 K RoPE；不支持的设备和布局仍回退 |
-| `FUSED_CURRENT_ROPE` | `1` | 当前块 Q/K RoPE 复用融合历史 RoPE kernel，与 eager 逐位一致；不支持的设备和布局（含 SP）回退 |
-| `FUSED_CURRENT_ROPE_KV` | 已验证 480p 固定槽路径为 `1`；其余为 `0` | A2A 后融合当前 Q/K RoPE 与 KV 写入；`0` 回退原 Q/K RoPE + index_copy，`1` 显式尝试受支持布局 |
+| `FUSED_CURRENT_ROPE` | `1` | 当前块 Q/K RoPE 复用融合历史 RoPE kernel，支持 A2A 后交错 head stride；固定槽优先走 RoPE/KV 融合，其余走此入口；不支持的设备和布局回退 |
+| `FUSED_CURRENT_ROPE_KV` | 已验证 480p 固定槽路径为 `1`；其余为 `0` | A2A 后融合当前 Q/K RoPE 与 KV 写入；`0` 回退当前 Q/K RoPE 分发 + index_copy，`1` 显式尝试受支持布局 |
 | `FA4_FIXED` | 已验证 480p 固定槽路径为 `1` | 最佳分段 FA：Q390/780 使用 fixed Q + GPU KV 有效长度；Q1170 保留 varlen；`0` 回退全 varlen |
 | `GROUPED_HISTORY_ROPE` | `1`（本次开启） | 多片段 grouped 处理；`contiguous` 是替代模式 |
 | `CHUNK_ROPE_REUSE` | `1`（本次开启） | 按 chunk 复用未失效的历史 RoPE |

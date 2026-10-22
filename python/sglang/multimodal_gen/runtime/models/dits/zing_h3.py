@@ -2055,10 +2055,10 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             default=options.optimized_fixed_480p,
         )
         if fused_q is None:
-            q = _apply_rope(q, inputs.rope)
+            q = apply_current_rope(q, inputs.rope)
             fixed.write_current(
                 index,
-                _apply_rope(raw_k, inputs.rope),
+                apply_current_rope(raw_k, inputs.rope),
                 raw_k,
                 raw_v,
                 tensors=options.fixed_tensors,
