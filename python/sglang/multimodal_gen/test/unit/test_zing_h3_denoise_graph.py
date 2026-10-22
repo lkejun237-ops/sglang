@@ -1427,13 +1427,18 @@ def test_chunk_capture_peer_failure_votes_once_and_restores_store(failed_phase):
 
     backend = WarmupRecordingGraphBackend()
     graphs = ZingChunkGraphs(backend=backend)
-    k, v = torch.zeros(3, 2, 8), torch.zeros(3, 2, 8)
-    plans = [SimpleNamespace(signature=("test",))]
+    k, v = torch.zeros(1024, 2, 8), torch.zeros(1024, 2, 8)
+    plans = [
+        SimpleNamespace(
+            signature=("test",),
+            kv_plan=SimpleNamespace(write_start=100, rows=3, clean_rows=3),
+        )
+    ]
     tensors = {"delta": torch.tensor(1.0)}
 
     def execute(static):
-        k.add_(static["delta"])
-        v.add_(static["delta"])
+        k[100:103].add_(static["delta"])
+        v[100:103].add_(static["delta"])
         return (k.clone(),)
 
     graphs._run("steady", plans, tensors, execute, [(k, v)])
@@ -1448,6 +1453,62 @@ def test_chunk_capture_peer_failure_votes_once_and_restores_store(failed_phase):
     assert peer.flags == ([True] if failed_phase == "warmup" else [True, True])
     assert torch.equal(k, before[0]) and torch.equal(v, before[1])
     assert graphs.disabled and not graphs.graphs
+
+
+@pytest.mark.parametrize("clean", [False, True])
+def test_chunk_capture_snapshot_is_bounded_by_writes_not_pool_capacity(clean):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+        ZingChunkGraphs,
+    )
+
+    stores = [(torch.zeros(1024, 2, 8), torch.zeros(1024, 2, 8)) for _ in range(2)]
+    plans = [
+        SimpleNamespace(
+            kv_plan=SimpleNamespace(write_start=start, rows=rows, clean_rows=count)
+        )
+        for start, rows, count in ((100, 5, 2 if clean else 0), (107, 4, int(clean)))
+    ]
+    views = ZingChunkGraphs._capture_store_views(plans, stores)
+    expected = ([pair[0][100:108] for pair in stores] if clean else []) + [
+        pair[1][100:111] for pair in stores
+    ]
+    assert len(views) == len(expected)
+    for got, want in zip(views, expected, strict=True):
+        assert got.data_ptr() == want.data_ptr() and got.shape == want.shape
+    assert sum(view.numel() for view in views) == (38 if clean else 22) * 2 * 8
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_chunk_cuda_capture_restores_write_spans_and_preserves_history():
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+        ZingChunkGraphs,
+    )
+
+    k = torch.zeros(1024, 2, 8, device="cuda", dtype=torch.bfloat16)
+    v = torch.zeros_like(k)
+    plans = [
+        SimpleNamespace(
+            signature=("bounded",),
+            kv_plan=SimpleNamespace(write_start=100, rows=3, clean_rows=2),
+        )
+    ]
+    graphs = ZingChunkGraphs()
+    tensors = {"delta": torch.ones((), device="cuda", dtype=k.dtype)}
+
+    def execute(static):
+        k[100:102].add_(static["delta"])
+        v[100:103].add_(static["delta"])
+        return (k[100:102] + v[100:102],)
+
+    for step in range(1, 4):  # eager warm-up, capture, replay
+        (result,) = graphs._run("steady", plans, tensors, execute, [(k, v)])
+        expected_k, expected_v = torch.zeros_like(k), torch.zeros_like(v)
+        expected_k[100:102] = step
+        expected_v[100:103] = step
+        assert torch.equal(k, expected_k) and torch.equal(v, expected_v)
+        assert torch.equal(result, torch.full_like(result, 2 * step))
+    assert graphs.routes["steady", "capture"] == 1
+    assert graphs.routes["steady", "replay"] == 1
 
 
 def test_source_ready_init_replays_prefix_and_isolates_reused_session_slot(
@@ -1632,7 +1693,12 @@ def test_chunk_local_capture_failure_and_peer_leave_cpu_barrier(model, monkeypat
         graphs.coordinator = coordinator
         k, v = torch.zeros(3, 2, 8), torch.zeros(3, 2, 8)
         plans, tensors = (
-            [SimpleNamespace(signature=("barrier",))],
+            [
+                SimpleNamespace(
+                    signature=("barrier",),
+                    kv_plan=SimpleNamespace(write_start=0, rows=3, clean_rows=3),
+                )
+            ],
             {"delta": torch.tensor(1.0)},
         )
 

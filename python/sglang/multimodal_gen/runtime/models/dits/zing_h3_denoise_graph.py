@@ -8,6 +8,7 @@ outside the graph pool and refreshed before every replay.
 """
 
 import collections
+import json
 
 import torch
 import torch.distributed as dist
@@ -332,6 +333,27 @@ class ZingChunkGraphs:
             )
         )
 
+    @staticmethod
+    def _capture_store_views(plans, stores):
+        """Only snapshot the K/V spans the capture warm-up can overwrite.
+
+        Clean rows persist raw K; every current row writes V. History outside
+        these spans is read-only, and rotated K is rebuilt before being read.
+        Bounds come from host plans, without reading device index tensors.
+        """
+        views = []
+        for column, count in enumerate(("clean_rows", "rows")):
+            ranges = [
+                (plan.kv_plan.write_start, plan.kv_plan.write_start + rows)
+                for plan in plans
+                if (rows := getattr(plan.kv_plan, count))
+            ]
+            if ranges:
+                start = min(begin for begin, _ in ranges)
+                stop = max(end for _, end in ranges)
+                views.extend(pair[column][start:stop] for pair in stores)
+        return tuple(views)
+
     def _run(self, kind, plans, tensors, execute, stores, rotated=()):
         signatures = tuple(plan.signature for plan in plans)
         # ``rotated`` is addressed but never snapshotted: it is rewritten by
@@ -367,7 +389,23 @@ class ZingChunkGraphs:
             return execute(tensors)
         if entry is None:
             static = {name: tensor.clone() for name, tensor in tensors.items()}
-            flat = tuple(value for pair in stores for value in pair)
+            flat = self._capture_store_views(plans, stores)
+            logger.info(
+                "ZING_CHUNK_GRAPH_SNAPSHOT_JSON %s",
+                json.dumps(
+                    {
+                        "kind": kind,
+                        "snapshot_bytes": sum(
+                            t.numel() * t.element_size() for t in flat
+                        ),
+                        "store_bytes": sum(
+                            t.numel() * t.element_size()
+                            for pair in stores
+                            for t in pair
+                        ),
+                    }
+                ),
+            )
             saved = tuple(value.clone() for value in flat)
 
             def restore():

@@ -141,6 +141,8 @@ class ZingFixedForwardKVPlan:
             history += chunk.positions.shape[0]
         if history != cache._length:
             raise ValueError("Fixed Zing KV history must cover every live row")
+        # Host-known write bounds for capture rollback; historical K/V are read-only.
+        self.write_start = history
         # Every row of this forward is written into the slot, clean or not.
         if cache._length + self.rows > self.capacity:
             raise ZingKVCapacityError("Fixed Zing KV plan exceeds slot capacity")

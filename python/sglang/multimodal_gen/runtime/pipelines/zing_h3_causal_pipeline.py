@@ -2,8 +2,10 @@
 """Native Zing1/H3 causal inference with shared H3 codecs."""
 
 import json
+import logging
 import math
 import os
+import time
 from pathlib import Path
 
 from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
@@ -252,6 +254,19 @@ class ZingH3CausalPipeline(ComposedPipelineBase):
         }
         # Materialize and validate both grids before accepting generations.
         stage._build_realtime_sampler(ZingH3SamplingParams())
+        # Compile Lynn preparation before KV allocation and worker readiness.
+        if "lynn_decoder" in self.modules:
+            from sglang.multimodal_gen.runtime.platforms import current_platform
+
+            started = time.perf_counter()
+            shapes = self.modules["lynn_decoder"].warmup_preparation(
+                current_platform.get_local_torch_device()
+            )
+            logging.getLogger(__name__).info(
+                "Lynn preparation startup warmup: %d shapes in %.3f seconds",
+                shapes,
+                time.perf_counter() - started,
+            )
         # Realtime KV slots are allocated here, before the worker is ready.
         stage.initialize_realtime_kv_cache_pool(server_args)
         self.add_stage(stage)

@@ -3601,6 +3601,10 @@
         {
           "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_denoise_graph.py::test_invalidated_cuda_capture_restores_the_callers_stream",
           "reason": "CUDA required"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_denoise_graph.py::test_chunk_cuda_capture_restores_write_spans_and_preserves_history",
+          "reason": "CUDA required"
         }
       ],
       "sources": [
@@ -7684,6 +7688,42 @@
           "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
         }
       }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_lynn_fused_preparation.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "GPU_REQUIRED",
+      "approved": false,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "GPU-only exact arithmetic, cache ownership and startup precompilation on SM90/SM103. Historical 19-test result covers only the old SM103/148-SM version; current H100/H200 and B300 hardware validation is pending.",
+      "dependencies": []
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_lynn_rope_reuse.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Passed in frozen Alibaba Linux CPU regression dlceuld6z750siwa (candidate 1584 passed / 28 skipped); source hashes retained in kv-memory-r4/READY.json.",
+      "dependencies": []
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_lynn_startup_warmup.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Passed in frozen Alibaba Linux CPU regression dlceuld6z750siwa (candidate 1584 passed / 28 skipped); source hashes retained in kv-memory-r4/READY.json.",
+      "dependencies": []
     }
   ],
   "recipes": {

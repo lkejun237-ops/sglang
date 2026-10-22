@@ -87,6 +87,50 @@ class StreamingDecoder(nn.Module):
             )
         self.attention = ATTENTION_BACKENDS[config.attention_backend]()
 
+    @torch.no_grad()
+    def warmup_preparation(self, device):
+        """Compile supported preparation shapes before the worker accepts users."""
+        device = torch.device(device)
+        a = self.architecture
+        if (
+            device.type != "cuda"
+            or self.compute_dtype != torch.bfloat16
+            or self.config.temporal_window != 3
+            or self.config.tile_size // self.spatial_ratio != 16
+            or a["decoder_num_attention_heads"] != 32
+            or a["decoder_attention_head_dim"] != 64
+            or a["decoder_num_register_tokens"] != 4
+            or a["decoder_rope_dim_ratio"] != 0.75
+        ):
+            return 0
+        from .attention import _supports_preparation_device
+
+        if not _supports_preparation_device(device):
+            return 0
+        from .fused_preparation import prepare
+
+        # Use the model's real RoPE layout, even while its weights reside on CPU.
+        rope_device = self.phase_embedding.device
+        count = 0
+        for batch in (6, 14, 30):
+            q = torch.zeros(batch, 261, 32, 64, device=device, dtype=torch.bfloat16)
+            for history in (0, 256, 512):
+                past = q.new_zeros(batch, history, 32, 64)
+                for dtype in (torch.float32, torch.bfloat16):
+                    ropes = [
+                        tuple(
+                            t.to(device=device, dtype=dtype)
+                            for t in self.decoder.rope(
+                                torch.zeros(batch, length, 3, device=rope_device)
+                            )
+                        )
+                        for length in (261, history + 261)
+                    ]
+                    prepare(q, q, q, past, past, *ropes, 256, 512)
+                    count += 1
+        torch.cuda.synchronize(device)
+        return count
+
     def to_compute(self, device, dtype):
         # Autocast dtype for decode_step; residency must move devices only, never recast.
         self.compute_dtype = dtype
@@ -383,6 +427,9 @@ class StreamingDecoder(nn.Module):
                 dim=1,
             )
             query_rope = decoder.rope(torch.cat([positions, suffix], dim=1))
+            # Every layer has the same history geometry. Reuse RoPE within this
+            # tile batch only; relative times must age again on the next latent.
+            key_ropes = {0: query_rope}
             updated = []
             for block, history in zip(blocks, layers):
                 if history is None:
@@ -401,14 +448,16 @@ class StreamingDecoder(nn.Module):
                 else:
                     history_k, history_v = history
                 history_frames = history_k.shape[1] // spatial_tokens
-                past_positions = []
-                for distance in range(history_frames, 0, -1):
-                    past = positions.clone()
-                    past[..., 0] = 2 * -distance / window
-                    past_positions.append(past)
-                key_rope = decoder.rope(
-                    torch.cat([*past_positions, positions, suffix], dim=1)
-                )
+                if history_frames not in key_ropes:
+                    past_positions = []
+                    for distance in range(history_frames, 0, -1):
+                        past = positions.clone()
+                        past[..., 0] = 2 * -distance / window
+                        past_positions.append(past)
+                    key_ropes[history_frames] = decoder.rope(
+                        torch.cat([*past_positions, positions, suffix], dim=1)
+                    )
+                key_rope = key_ropes[history_frames]
                 hidden, k, v = streaming_block(
                     block,
                     hidden,
@@ -417,19 +466,10 @@ class StreamingDecoder(nn.Module):
                     query_rope=query_rope,
                     key_rope=key_rope,
                     spatial_tokens=spatial_tokens,
+                    cache_tokens=keep_frames * spatial_tokens,
                     attention=self.attention,
                 )
-                keep = keep_frames * spatial_tokens
-                k, v = (
-                    torch.cat([history_k, k], dim=1),
-                    torch.cat([history_v, v], dim=1),
-                )
-                updated.append(
-                    (
-                        k[:, -keep:] if keep else k[:, :0],
-                        v[:, -keep:] if keep else v[:, :0],
-                    )
-                )
+                updated.append((k, v))
             for index, tile in enumerate(batch_tiles):
                 lo, hi = index * video_batch, (index + 1) * video_batch
                 state.tiles[tile] = [(k[lo:hi], v[lo:hi]) for k, v in updated]
