@@ -94,6 +94,120 @@ aliyun eflo-controller DescribeInvocations --profile shengdong --region cn-shang
 既有服务容器只暴露它获配的卡，在容器内修改 `CUDA_VISIBLE_DEVICES` 不能访问未暴露的卡。
 不要把历史空闲卡号当作当前可用卡，也不要修改既有服务的 GPU 可见范围。
 
+### 从本地执行节点脚本
+
+完整路径是 **本机 Aliyun CLI → Eflo → 节点内 kubectl → 隔离测试 Pod**，
+不是本机 kubectl 直连，也不是 PAI-DLC。不要在本机当前的 AWS kube context 上执行下面的 kubectl。
+将节点上要执行的命令保存为本地 `h100-node.sh`，通过同一个通道发送：
+
+```sh
+H100_SCRIPT=h100-node.sh
+aliyun eflo-controller RunCommand --profile shengdong --region cn-shanghai \
+  --NodeIdList '["e01-cn-2zd4xi8m505"]' \
+  --Name h100-node-script --RepeatMode Once --Timeout 60 \
+  --ContentEncoding PlainText --CommandContent "$(cat "$H100_SCRIPT")"
+```
+
+使用返回的 `InvokeId` 按上节 `DescribeInvocations` 读回。`RunCommand` 受理成功不等于
+脚本执行成功；同时检查 invocation 状态和 `InvokeNodes.InvokeNode[].ExitCode/Output`。
+脚本与输出有大小限制，大文件和长日志应留在节点或产物存储，分段读取。
+宿主机历史 Python 为 3.6，调用 subprocess 时使用 `universal_newlines=True`，
+不使用 Python 3.7 才支持的 `text=True`；PyTorch 测试在镜像内执行。
+
+### 在空闲卡上创建隔离测试 Pod
+
+仅在当前任务已授权 GPU 测试时执行。先通过上述节点脚本查询：
+
+```sh
+# 这些命令在节点内执行；只读发现 namespace、runtime 和现有镜像。
+kubectl get node world-model-b27mys7b-0000
+kubectl get runtimeclass nvidia
+kubectl -n minwm-realtime get pods \
+  -o custom-columns='NAME:.metadata.name,STATUS:.status.phase,IMAGE:.spec.containers[*].image'
+crictl images
+nvidia-smi --query-gpu=index,uuid,memory.used --format=csv
+nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv
+```
+
+选择已获准且显存为零、没有 compute process 的 GPU UUID，并与其他测试使用者协调，
+避免同时选中同一张卡。该节点没有设备插件的 GPU 分配保护，检查与创建之间也不是原子操作。
+从节点已有镜像中选择带 PyTorch/CUDA 的固定 digest，不把历史镜像当作永久可拉取入口。
+下面是 `h100-node.sh` 的单卡最小示例，替换 UUID 和缓存镜像后发送；
+`imagePullPolicy: Never` 使缓存缺失明确失败，不隐式拉取镜像。
+
+```sh
+set -eu
+GPU_UUID=REPLACE_WITH_IDLE_GPU_UUID
+IMAGE=REPLACE_WITH_CACHED_IMAGE_AT_SHA256
+POD_NAME=h100-torch-smoke-$(date +%s)
+
+# 创建前再次确认目标卡；不只看 utilization=0。
+test "$(nvidia-smi --id="$GPU_UUID" --query-gpu=memory.used --format=csv,noheader,nounits)" -eq 0
+COMPUTE_UUIDS=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader)
+if printf '%s\n' "$COMPUTE_UUIDS" | grep -Fqx "$GPU_UUID"; then
+  echo 'Selected GPU has a compute process' >&2
+  exit 1
+fi
+cat > "/tmp/$POD_NAME.yaml" <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $POD_NAME
+  namespace: minwm-realtime
+spec:
+  nodeName: world-model-b27mys7b-0000
+  runtimeClassName: nvidia
+  restartPolicy: Never
+  activeDeadlineSeconds: 90
+  containers:
+    - name: smoke
+      image: $IMAGE
+      imagePullPolicy: Never
+      env:
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "$GPU_UUID"
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: compute,utility
+        - name: OMP_NUM_THREADS
+          value: "1"
+      resources:
+        requests: {cpu: "1", memory: 1Gi}
+        limits: {cpu: "2", memory: 4Gi}
+      command: [python3, -u, -c]
+      args:
+        - |
+          import torch
+          assert torch.cuda.is_available() and torch.cuda.device_count() == 1
+          print(torch.__version__, torch.version.cuda, torch.cuda.get_device_properties(0), flush=True)
+          a = torch.arange(256 * 256, dtype=torch.float32).reshape(256, 256) / 65536
+          x = a.cuda()
+          torch.testing.assert_close((x @ x.T).cpu(), a @ a.T, rtol=1e-4, atol=1e-4)
+          y = torch.randn(1024, 1024, device='cuda', dtype=torch.float16)
+          assert torch.isfinite(y @ y.T).all().item()
+          torch.cuda.synchronize()
+          print('TORCH_SMOKE_PASS', flush=True)
+EOF
+kubectl create --dry-run=client -f "/tmp/$POD_NAME.yaml"
+kubectl create -f "/tmp/$POD_NAME.yaml"
+echo "POD_NAME=$POD_NAME GPU_UUID=$GPU_UUID"
+```
+
+将返回的 Pod 名和 GPU UUID 保存到本次交接。后续仍通过 Eflo 发送节点脚本，读取
+`kubectl -n minwm-realtime get pod "$POD_NAME" -o json` 和
+`kubectl -n minwm-realtime logs "$POD_NAME"`。只有 Pod 为 `Succeeded`、
+容器退出码为 0 且日志有 `TORCH_SMOKE_PASS` 才算通过；Pending/Running 不是通过。
+失败时读取该 Pod 的 `describe` 和日志，不反复创建新 Pod。
+取回日志后仅删除本次 Pod（`kubectl -n minwm-realtime delete pod "$POD_NAME"`）及
+`/tmp/$POD_NAME.yaml`，再核对目标 UUID 显存/进程释放和既有服务状态。
+90 秒 deadline 是兜底，不代替失败后的清理。
+
+上述访问流程来源于 2026-10-16 的四卡测试：先在既有 `denoiser-0` 容器中设置
+`CUDA_VISIBLE_DEVICES`，得到 CUDA 不可用；改用独立 Pod、`runtimeClassName: nvidia`
+与 `NVIDIA_VISIBLE_DEVICES` 后，四卡 FP32 CPU 对齐和 FP16 matmul 全部通过，
+Pod 清理后显存释放。该历史运行使用 PyTorch `2.11.0+cu130` / CUDA `13.0`，
+实测 CC 9.0，纠正了早期 `nvidia-smi` 的 CC 8.9 读数。
+本节将其收敛为单卡复现示例；该示例本次只做静态检查，不冒称重新跑过 GPU。
+
 ## 泰国 B300：后备测试入口
 
 沿用上面的 PAI 查询与终端流程，将 region 改为 `ap-southeast-7`、workspace 改为 `384`，
