@@ -121,6 +121,10 @@ OSS/CPFS 地址是内部证据位置，需已有权限，不是公开下载链�
 
 每次更新只需：**日期/短 SHA、实际硬件与尺寸、关键配置差异、主要结果、一个 PR/报告/产物入口**。
 优先替换相关行，不逐轮追加日志；完整 benchmark 明细放 PR 或已有报告，不在 recipe 重复存档。
-性能验证仍按仓库要求分别报告 480 与 736、同条件 E2E 和受影响组件，缺项明确标未测。
+每个影响速度或显存的 PR 均需分别报告 480 与 736、同条件整体 benchmark，以及
+Encoder、DiT、Decoder 三部分各自的耗时与常驻/峰值显存、baseline/candidate 变化。
+Encoder 分项注明 Qwen、参考图 VAE、source VAE；共享进程/整卡显存不可冒称组件独占，
+缺项明确标未测、原因及补测计划。表格口径见
+[PR 三部分报告格式](https://github.com/seedleap/sglang/blob/main/benchmark/zing_h3_causal/CLIENT_BENCHMARK.md#pr-三部分报告格式)。
 重新部署前验证请求完成、取消/断连/EOS 后资源释放及下一会话可用；通过容量或协议测试
 不等于通过视觉质量验收。

@@ -37,8 +37,13 @@
 - 性能测试必须分别覆盖 480 和 736 两档分辨率，记录实际宽×高、case 与输入身份，
   不混合统计，也不以 704、720 或其他档位代替 736。工具或部署尚不支持某档时，
   明确列为未验证及说明原因，不得用另一档外推为通过。
-- 对性能影响大的 feature，PR 必须提供同条件 baseline 与改动后的端到端指标，
-  以及实际受影响组件（如 DiT、Encoder、Decoder）的阶段耗时与变化；
+- 每个对 Zing H3 速度或显存有影响的 PR，都必须提供同条件 baseline 与改动后的
+  整体 benchmark 指标，并分别报告 Encoder、DiT、Decoder 三部分的性能和显存，
+  不能只报告直接修改的组件。每部分给出耗时中位数/P95、样本量及变化；显存给出
+  常驻占用、请求峰值及变化，注明 allocated/reserved 或 driver 口径、阶段和逐 rank 数据。
+  Encoder 中 Qwen、参考图 VAE、source VAE 分项标注；共进程/共卡无法独立归因时，
+  明确报告共享进程或整卡范围，不将其冒称组件独占显存。缺项写明未测原因与补测计划，
+  不用 0、估算或其他硬件结果代替；完整报告格式见 `benchmark/zing_h3_causal/CLIENT_BENCHMARK.md`。
   kernel/microbenchmark 只作归因补充，不能替代端到端测试。
 - 重点报告 TTFF、E2E、FPS、TPOC、ICL（含中位数/P95 与样本量）；FPS 区分全程与
   首包后口径。连续 source 另关注 source-to-output 延迟、tail drain、credit wait

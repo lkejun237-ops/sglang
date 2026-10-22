@@ -22,9 +22,16 @@ For Zing H3 performance or memory changes, update
 docs/docs/sglang-diffusion/zing/deployment_zing_h3.mdx in this PR: affected
 strategy/results or an explicit unverified status. Keep recipe evidence concise
 (date/short SHA, hardware/shape, key settings, result and one traceable link).
-For features with substantial performance impact, compare baseline vs. change for
-both E2E metrics (TTFF, E2E, full-run/post-first-batch FPS, TPOC, ICL median/P95
-and sample counts) and affected components (e.g. DiT, Encoder, Decoder).
+For every Zing H3 PR affecting speed or GPU memory, compare baseline vs. change
+for both E2E metrics (TTFF, E2E, full-run/post-first-batch FPS, TPOC, ICL
+median/P95 and sample counts) and ALL THREE components: Encoder, DiT, Decoder.
+For each component, report latency median/P95, sample count, resident and
+request-peak GPU memory, plus before/after deltas. Break Encoder into Qwen,
+reference VAE and source VAE. Identify per-rank scope, allocated/reserved vs.
+driver memory, warmup/load/request boundaries and shared-process/device limits.
+Do not label shared memory as component-exclusive or sum independent peaks.
+State missing measurements, reasons and follow-up plans; unchanged code alone
+is not measurement evidence. See CLIENT_BENCHMARK.md for the report table.
 For continuous source, include the applicable source-to-output, tail-drain,
 credit-wait and playback-stall metrics. State missing/unsupported measurements.
 Keep hardware, checkpoint, cases, sampling and deployment settings comparable;
@@ -34,6 +41,7 @@ full contract; microbenchmarks alone do not establish E2E improvement. -->
 
 ## Checklist
 
+- [ ] For Zing H3 speed/memory changes, report baseline/candidate latency and resident/peak memory for Encoder, DiT and Decoder; identify missing data and shared-memory attribution limits.
 - [ ] For Zing H3 performance/memory changes, update the [deployment recipe](https://github.com/seedleap/sglang/blob/main/docs/docs/sglang-diffusion/zing/deployment_zing_h3.mdx), including unverified hardware/configurations.
 - [ ] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).
 - [ ] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).

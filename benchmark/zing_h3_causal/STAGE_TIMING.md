@@ -93,3 +93,17 @@ python3 benchmark/zing_h3_causal/analyze_stage_timing.py \
 常驻 SP2 服务，完整预热一次，正式三次，串行运行；每次保存原始 chunk、stage
 事件和 RGB。对比接收指标与媒体完整性，记录采集开销及输出差异；三个样本不能
 证明长期无扰动，不设置未经校准的百分比性能门槛。
+
+## 三部分显存与性能的归因边界
+
+涉及速度或显存的 Zing H3 PR，必须按 [PR 三部分报告格式](CLIENT_BENCHMARK.md#pr-三部分报告格式)
+同时报告 Encoder、DiT、Decoder 的耗时与显存，逐 case、分辨率及 rank 对比 baseline/candidate。
+Encoder 分开标注 Qwen、reference VAE、source VAE；远程服务的计时须来自对应服务，
+不能将 RPC 等待当作远端纯 GPU 耗时。当前工具未采集的部分写明未测、原因及补测计划。
+
+阶段 Host span 可以包含等待，CUDA event 区间也可包含等待/通信；二者分列，
+不能互相替代或相加成 E2E。显存统计独立于 span：共享进程的 allocated/reserved
+或共享设备的 driver 占用，只证明该进程/设备的占用，不能自动归因到某个组件。
+现有 `memory_snapshots` 的采集与限制见 [resident profiling](SP_RESIDENT_PROFILING.md)。
+报告必须区分暖机后常驻快照、重置统计后的请求峰值、加载峰值和 lifetime peak；
+无法隔离时保留共享范围，不捏造组件独占值，也不将独立峰值相加为整卡峰值。

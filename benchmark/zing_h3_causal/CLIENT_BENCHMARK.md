@@ -13,9 +13,10 @@ benchmark，不将 token 指标或视频任务轮询直接套到 Zing。
 736，也不得静默修改冻结 case 的输出尺寸。需要另一档输入时使用显式 manifest /
 case-set，保留来源和尺寸差异；入口或部署不支持时如实记录未验证及原因。
 
-对性能影响大的 feature，在相同硬件、checkpoint、输入、采样及部署配置下对比
-baseline 与改动版本，同时提供端到端 TTFF、E2E、FPS（全程与首包后分别标注）、
-TPOC、ICL 中位数/P95 与样本量，以及受影响的 DiT、Encoder、Decoder 等组件耗时。
+每个对 Zing H3 速度或显存有影响的 PR，在相同硬件、checkpoint、输入、采样及部署配置下
+对比 baseline 与改动版本，同时提供端到端 TTFF、E2E、FPS（全程与首包后分别标注）、
+TPOC、ICL 中位数/P95 与样本量，以及 **Encoder、DiT、Decoder 三部分各自的性能与显存**。
+即使只修改其中一部分，也报告另外两部分，以识别成本转移。
 组件数据遵循 [阶段计时说明](STAGE_TIMING.md)，注明逐 rank、Host/CUDA 边界与
 采集开销；重叠阶段不相加成 E2E，microbenchmark 不能替代端到端结论。
 
@@ -23,6 +24,34 @@ TPOC、ICL 中位数/P95 与样本量，以及受影响的 DiT、Encoder、Decod
 source-to-output 延迟、tail drain、credit wait、播放停顿等适用指标。有限输入与
 连续 source 分开比较。保存命令、源码 SHA、配置、预热/正式次数、失败与未执行数、
 原始 JSON 和报告；未采到的指标标为未测。
+
+## PR 三部分报告格式
+
+480 和 736 的每个 case 各填一组下表，baseline / candidate 使用相同计时与显存口径。
+耗时至少报告每请求累计阶段耗时的中位数/P95、请求样本量及相对变化；若报告每次
+调用或每 chunk 的分布，单列其边界和样本量，不能混作请求样本。多卡逐 rank 列出，
+可在摘要中取最慢 rank，但不能把 rank 当成独立请求或将其耗时相加为延迟。
+
+| 部分 | 耗时 baseline → candidate（中位数/P95、n、变化） | 常驻显存 baseline → candidate（GiB、变化） | 请求峰值 baseline → candidate（GiB、变化） | 口径 / 未测原因及补测计划 |
+| --- | --- | --- | --- | --- |
+| Encoder（Qwen / reference VAE / source VAE 分项） | 待填写 | 待填写 | 待填写 | Host 或 CUDA；进程/设备/rank 与测量阶段 |
+| DiT | 待填写 | 待填写 | 待填写 | 包含 KV、AdaLN、Graph 等常驻分配的实际范围 |
+| Decoder（注明实际后端，如 Lynn） | 待填写 | 待填写 | 待填写 | 明确是否含输出搬运/等待 |
+
+显存的常驻值取模型加载、配置的 KV/Graph 预热完成后、请求开始前的快照；请求峰值
+明确是否在该请求开始前重置峰值统计。只能取得进程 lifetime peak 时按原名标注，
+不能当作请求峰值。allocated/reserved 分列，不相加；driver 整卡采样需注明采样周期，
+其采样最大值也不等于瞬时峰值。加载峰值影响能否启动时另列，不用暖机后快照替代。
+
+组件共进程时，allocator 统计属于进程，不能直接据其峰值声称组件独占；Qwen 与
+Encoder 共卡时，driver 数据属于整卡。保留这类共享范围并标明“组件独立显存未测”，
+不能简单相减或把三部分的峰值相加。工具尚无独立组件显存或远程 Qwen 计时能力时，
+如实写明缺项、原因和补测计划；“未改动”不能代替实测，也不据此声明三部分验收通过。
+
+整体 E2E 使用关闭诊断采集的正式轮；阶段耗时/显存诊断可另采同配置请求，注明
+采集开销及覆盖范围。复用已有报告和原始 JSON 的一个入口即可，不重复归档日志。
+现有阶段回传与 rank memory snapshots 不自动证明三部分均可独立归因；边界详见
+[阶段计时与显存](STAGE_TIMING.md#三部分显存与性能的归因边界)。
 
 ## 从 checkpoint 一次运行
 
