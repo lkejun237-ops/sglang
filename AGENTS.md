@@ -17,6 +17,11 @@
 
 ## Zing PR 性能验证
 
+- Codex 与部署同学以 `docs/docs/sglang-diffusion/zing/deployment_zing_h3.mdx` 作为
+  H100/H200/B300 部署决策入口。对 Zing H3 性能或显存有影响的 PR，必须在同一 PR
+  更新该文档受影响的策略、结果或验证状态；未实测时明确标为当前版本未验证，旧证据保留版本边界。
+  Recipe 只保留日期/短 SHA、关键配置、主要结果与一个可回查入口，不重复归档完整实验材料。
+
 - 后续 Zing / SGLang 相关 PR 与测试优先使用英伦维护的 benchmark，入口和指标口径见
   `benchmark/zing_h3_causal/CLIENT_BENCHMARK.md`；有限输入使用 `run_benchmark.py`
   / `bench_client.py`，连续 source 使用 `bench_streaming_source.py`，报告沿用配套生成器。

@@ -18,6 +18,10 @@
 
 <!-- Zing: use YingLun's benchmark (benchmark/zing_h3_causal/CLIENT_BENCHMARK.md).
 Report 480 and 736 resolution results separately, with exact width x height.
+For Zing H3 performance or memory changes, update
+docs/docs/sglang-diffusion/zing/deployment_zing_h3.mdx in this PR: affected
+strategy/results or an explicit unverified status. Keep recipe evidence concise
+(date/short SHA, hardware/shape, key settings, result and one traceable link).
 For features with substantial performance impact, compare baseline vs. change for
 both E2E metrics (TTFF, E2E, full-run/post-first-batch FPS, TPOC, ICL median/P95
 and sample counts) and affected components (e.g. DiT, Encoder, Decoder).
@@ -30,6 +34,7 @@ full contract; microbenchmarks alone do not establish E2E improvement. -->
 
 ## Checklist
 
+- [ ] For Zing H3 performance/memory changes, update the [deployment recipe](https://github.com/seedleap/sglang/blob/main/docs/docs/sglang-diffusion/zing/deployment_zing_h3.mdx), including unverified hardware/configurations.
 - [ ] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).
 - [ ] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).
 - [ ] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations).

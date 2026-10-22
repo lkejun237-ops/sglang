@@ -1,0 +1,126 @@
+---
+title: "Zing H3 部署 recipe"
+description: "供 Codex 与部署同学使用的 H100/H200/B300 部署决策、显存实测与验证边界。"
+---
+
+本页供 Codex 和部署同学（克君）选配置、判断显存余量。最近整理：2026-10-22；
+核对主线 `18d7e0cd9295`。下面是已有部署经验，只有对应版本、输入和配置的实测结论；
+实验补丁、显存快照、未验收画质均单独标注。新部署先选择一行，再沿证据入口取得原配置。
+
+## 部署决策矩阵
+
+`E2 + SP2` 表示两张 source Encoder 卡、两张 DiT/Lynn Decoder 卡；
+Qwen 是独立进程，可与一张 Encoder 共卡。所有方案都是**单活跃会话**，
+不按多用户并发规划 KV 或调度。以下均为 NVIDIA CUDA、完整 50 层 BF16 视频模型；
+未经说明，不启用 CPU/layerwise offload、FSDP 或量化。
+
+| 目标硬件 / 实际设备 | 部署选择 | 已有显存观察（每卡） | 验证状态与选择依据 |
+| --- | --- | --- | --- |
+| H100 目标 / 上海 L20Z，SM90，81,559 MiB（79.65 GiB） | 480 档优先复现 E1 + SP2 低显存组合：remote Qwen、weights-free AdaLN、Lynn、W6/sink3、四步、prompt prefix=5；无 KV pool、无 Graph | DiT driver 采样峰值普通生成 74.52 GiB、一次早期 prompt 切换 74.66 GiB；Qwen/E1 卡约 61 GiB | **历史组合通过 832×480、720 帧**；736、连续/晚期切换与新 launcher/head 未验证。余量小，不据此增加输入或缓存容量。[证据 A](#证据入口) |
+| H200 目标 / 上海 L20X，SM90，143,771 MiB（140.40 GiB，driver） | 控制卡数时从 E2 + SP2 开始；先按目标质量固定窗口和步数，再决定是否采用 Graph 实验配方 | 旧 W6 四步 eager：DiT 进程 lifetime peak allocated 最大约 109.56 GiB；最新 W5、先四步后一步 Graph：测速后 DiT 整卡驻留约 120.12 / 120.02 GiB；Encoder+Qwen 63.22 GiB、另一 Encoder 10.49 GiB | 两档 832×480 / 1280×736 都有实测。**最新值是驻留快照，运行峰值未测**；W5/单步改变生成语义，视觉质量未验收。Graph 使用运行时补丁，不能当作主线默认。[证据 B](#证据入口) |
+| 同一 H200 目标 | E2 + SP4 用于比较四步吞吐或分摊 DiT 显存，须使用已冻结的实验补丁 | W6 四步：Graph lifetime peak allocated 最大 74.50 GiB（480）、75.72 GiB（736）；reserved 最大 80.69 / 81.32 GiB | 480 的 Graph 吞吐比同条件 eager 高约 21–23%；736 未见收益。**整段 RGB 不等价、画质未验收**。当前主线 weights-free 仍只准入 SP1/SP2，SP4 属实验方案。[证据 C](#证据入口) |
+| B300 目标 / 泰国 L20D，CUDA CC10.3，274,113 MiB（267.69 GiB，CUDA 可见） | 优先用 E1 + SP2、remote Qwen、weights-free AdaLN、Lynn；固定需要的窗口和 prefix 容量，再比较 E2 + SP2 / Graph | 最近固定五 latent 重建验证：W6、四步、832×480/120 帧，source 路径 allocated 峰值 90.940 / 91.016 GiB；普通 block 路径 95.230 GiB/rank | **该版本与对应短请求通过数值及生命周期检查**；source 有真实 Graph replay，普通 block 在 after_step0 下走 eager。不能把此显存数外推到 736 或长流。商业 B300 SKU 身份未独立确认。[证据 D](#证据入口) |
+
+设备容量以进程内查询为准。云配额中的 H100/H200/B300 是测试目标名，保留实际
+L20Z/L20X/L20D 标识，不把它们改写成已核验的商业 SKU。CUDA 可见容量与 driver 总量
+可能不同，不混作同一读数。单卡余量按角色检查，不能用所有卡总显存判断能否部署。
+
+## 配置时先检查什么
+
+1. **把 Qwen 移出 DiT rank。** 当前主线仍需显式选择
+   `--zing-conditioning-mode remote` 并提供服务 URL、expected profile 和 client config。
+   独立 Qwen 与 source Encoder 可共卡，但需要把两进程的整卡占用一起考虑。
+   [PR #331](https://github.com/seedleap/sglang/pull/331) 的 remote 默认值修改尚未合入，
+   不要因文档里的推荐而省略参数。
+2. **准备匹配的离线 AdaLN 表。** 主线 #374 已默认 weights-free，部署前按
+   [AdaLN 表契约](/docs/sglang-diffusion/zing/specs/ADALN_TABLE)准备目标设备、权重和完整
+   schedule 对应的表，检查零 projection storage、零 miss/fallback。
+   SP2 历史四分支模型 ready allocated 从 127.90 降到 95.58 GiB/rank，
+   节省约 32.32 GiB；这是加载阶段的对照，不能再次从矩阵峰值里扣除，也不代表所有 checkpoint
+   都省同样多。更换硬件、权重或采样计划需重建表；Hopper 的表不能直接复用泰国表。
+3. **使用 Lynn，避免加载闲置的原生 Decoder。** 主线 #325 已自动跳过该闲置权重；
+   旧 TAEH3 已删除，其历史显存只能作历史证据。参考图 VAE 等剩余模块不会因此自动外迁。
+4. **先确定输入与 KV 容量，再开 Graph。** 核对实际宽高、window/sink、prefix 上限及
+   pool size=1；prompt 切换按主线固定 5 latent 重建。减少 window 或步数会改变模型行为，
+   不能作为等价显存优化。Graph 需要额外 reserved 显存；开启环境变量不等于实际 replay。
+   通用 `--enable-cuda-graph` 与 Zing 模型专用 Graph 路径也不能混同。
+
+通用开关见[性能默认配置](https://github.com/seedleap/sglang/blob/main/docs/docs/sglang-diffusion/zing/specs/PERFORMANCE_DEFAULTS.md)，
+实时请求与尺寸约束见[实时流式接口](/docs/sglang-diffusion/zing/realtime-streaming)。
+主线能力优先于历史文档中的默认值；SP4 表准入、Hopper Graph 补丁等必须随对应版本复现。
+[PR #369](https://github.com/seedleap/sglang/pull/369) 提供低显存 launcher，但目前仍为 Draft，
+launcher/head 尚无真实 GPU 验收，不能作为已合入的一键部署命令。
+
+## 固定 workload 与 baseline
+
+后续 PR 的固定输入基线使用英伦 benchmark 的 `whitebox-basic` 集合
+（`benchmark/zing_h3_causal/case_sets/whitebox-basic.json`），保留 manifest 原始
+source、prompt、参考图及条件映射：
+
+| case | 固定 case ID | 帧数 / 输入帧率 | 参考图 |
+| --- | --- | --- | --- |
+| `5s` 海岸 | `zing-whitebox-video-five-triview-0001` | 120 / 24 FPS | 6 张 |
+| `30s-wasteland` 废土 | `zing-whitebox-video-30s-six-triview-0001` | 720 / 24 FPS | 7 张 |
+| `30s-town` 地中海小镇 | `zing-whitebox-video-30s-six-triview-0002` | 720 / 24 FPS | 7 张 |
+| `30s-indoor` 室内 | `zing-whitebox-video-30s-two-triview-0001` | 720 / 24 FPS | 3 张 |
+
+标准集合用于完整 source 的有限输入测量；continuous-source 的 `source.append` 测量单独统计。
+480 与 736 分别使用显式声明实际尺寸的 manifest/case-set（部署目标为 832×480、1280×736），
+不静默改写原 manifest，也不认为默认集合已覆盖两档。具体入口与素材身份见
+[固定输入客户端基线](https://github.com/seedleap/sglang/blob/main/benchmark/zing_h3_causal/CLIENT_BENCHMARK.md)。
+
+**性能 baseline 是本 PR 改动前的明确提交在目标硬件上的同配置结果**，不是固定使用某个历史
+FPS 或 SHA。两侧固定完整 checkpoint、BF16、角色布局/SP、Lynn、有效采样列表、window/sink、
+prefix/KV 容量和 Graph/offload/compile；只改变本 PR 要测试的因素。常规测量每 case
+1 次完整预热、3 次正式；本页历史 H200 对照使用 2 次预热、3 次正式，复现时沿用该次数。
+正式 E2E 关闭阶段采集，组件计时另采；不混合有限输入和 continuous-source 的结果。
+若要对照本页 H200 Graph 收益，baseline 明确选证据 C 的同配置 eager；W5 单步方案与
+泰国两步方案都不能用它计算改动收益。历史 H200 六图长片也不是当前标准七图长片的结果。
+
+## 已有速度观测
+
+这些数字用于选实验起点，不构成跨硬件排名；各组采样、窗口和版本不同。
+H200 两组均采用英伦 continuous-source benchmark、真实 source＋六张参考图、
+不按实时速度限流，含 5s / 30s-wasteland / 30s-town 三个 case。
+每个 case 2 次预热、3 次正式；表内是**全程 FPS 中位数**，不是首包后 FPS。
+
+| 配方 | 实际尺寸 | 5s | 30s wasteland | 30s town | 边界 |
+| --- | --- | ---: | ---: | ---: | --- |
+| H200 E2 + SP4，W6，全程四步，eager | 832×480 | 9.18 | 11.84 | 11.95 | 与下一行同条件对照 |
+| 同上，Graph | 832×480 | 11.34 | 14.33 | 14.47 | RGB 与 eager 存在可见差异，准确性未验收 |
+| H200 E2 + SP4，W6，全程四步，eager | 1280×736 | 6.74 | 7.75 | 7.71 | 与下一行同条件对照 |
+| 同上，Graph | 1280×736 | 6.68 | 7.67 | 7.67 | 不推荐为该档吞吐收益开启 Graph |
+| H200 E2 + SP2，W5，前三 chunk 四步、随后单步 `[1000]`，Graph | 832×480 | 12.35 | 17.31 | 17.08 | 18 次正式请求零失败；单步视觉质量未验证 |
+| 同上 | 1280×736 | 6.59 | 8.06 | 8.02 | 与四步/W6 不能归因比较 |
+
+泰国 B300 目标这组约 20 FPS 的结果明确为 **832×480（480p）**，不是 720p/736p。
+`720` 是帧数（24 FPS 输入的 30 秒视频），不是高度。配方为 E2 + SP2、W6、
+前三个 chunk 四步、随后两步 `[1000,750]`，decode quantum=1。全程有效交付约
+19.74 FPS；第 240–600 输出帧区间的稳态斜率约 20.94 FPS（n=3），**后者不是首包后 FPS**。它使用 `3ffda81b9454` 和
+另一份输入/采样配置，不是上述 H200 四步方案的同条件 baseline；736 尚无该配方的匹配结果。
+见[证据 E](#证据入口)。H100 低显存组合在本页只引用容量证据，不推算 FPS。
+
+## 证据入口
+
+只保留关键条件、结论和一个可回查入口；原始日志、媒体与完整复现材料留在原产物目录。
+OSS/CPFS 地址是内部证据位置，需已有权限，不是公开下载链接。
+
+| 编号 | 版本与来源 | 回查入口 |
+| --- | --- | --- |
+| A | 低显存历史组合 `fe0961873d72`，完整 step2500、五分支、真实 source＋六图；普通生成及一次早期 prompt 切换各完成 720 帧 | [PR #369 显存与限制](https://github.com/seedleap/sglang/pull/369)；其 launcher/head 的验收状态单独看待 |
+| B | 2026-10-22，`d37f82078411` + Graph 运行时补丁，step2500、W5/sink3、先四步后一步；作业 `dlcygldsb95kcehh` | `oss://leap-world-shanghai/world-model/sglang/deploy/sh-h200-20261022-sp2-w5-4to1/r2/`；原配置 `ready-r2.tar.gz`、原始记录 `results/`。旧 W6/SP2 allocated 来自 10-21 的 r7，同上海部署前缀 `sh-h200-20261021/r7/` |
+| C | 2026-10-21，`d37f82078411` + SP4 AdaLN 准入 + PR #356 运行时补丁，step2500、W6/sink3、prefix=15360、单 slot；作业 `dlckxssgbktxu8mx` | `oss://leap-world-shanghai/world-model/sglang/deploy/sh-h200-20261021/r18/`；`ready-r18.tar.gz` 与 `results/`。实验中设置 `NCCL_GRAPH_REGISTER=0` 后通信回放门槛通过；不泛化为所有环境必设 |
+| D | 2026-10-21，`f0e2d8bfd0e8`，step2500、SP2、W6/sink3、四步；作业 `dlct60zyjq9hf282` | [PR #373 完整结论](https://github.com/seedleap/sglang/pull/373)；`/cpfs/world-model/sglang/evals/issue312-fixed-five-gpu-20261021-r3` |
+| E | 2026-10-19，`3ffda81b9454`，step2500、832×480、720 帧、六图、W6、先四步后两步 `[1000,750]`；作业 `dlcklgwejjsl7xvw` | `oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/zing-quantum-ab-20261019-r2/` |
+
+## 后续 PR 如何维护
+
+对 Zing H3 性能或显存有影响的 PR，必须在同一 PR 更新本页受影响的决策、数字或验证状态。
+范围包括权重常驻、Qwen/Encoder/Decoder 布局、KV、attention、Graph、精度、编译与采样默认值。
+即使尚未跑 GPU，也要写明受影响行“当前版本未验证”，保留旧数字对应的版本，不能直接沿用为新结论。
+
+每次更新只需：**日期/短 SHA、实际硬件与尺寸、关键配置差异、主要结果、一个 PR/报告/产物入口**。
+优先替换相关行，不逐轮追加日志；完整 benchmark 明细放 PR 或已有报告，不在 recipe 重复存档。
+性能验证仍按仓库要求分别报告 480 与 736、同条件 E2E 和受影响组件，缺项明确标未测。
+重新部署前验证请求完成、取消/断连/EOS 后资源释放及下一会话可用；通过容量或协议测试
+不等于通过视觉质量验收。
