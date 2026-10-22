@@ -12,6 +12,33 @@ TAEH3 运行时、专用脚本和测试已移除；历史验收记录仅对应�
 - `benchmark_lynn_replay.py`：按捕获的 chunk 重放 Lynn decoder，检查重复输出并独立计时。
 - `validate_lynn_sp_tiles.py`：Lynn 空间 tile 的 SP 正确性与生命周期验证。
 
+## 综合 benchmark 入口
+
+`benchmark.py` 只是现有工具的命令索引，参数直接传给对应脚本，不引入调度框架。
+完整请求、组件测速、算子 profile 和显存诊断分轮执行，结果汇入同一个离线报告。
+
+| 命令 | 回答什么 | 实现与说明 |
+|---|---|---|
+| `request` | 完整请求的 TTFF、E2E、TTFF 后 FPS | `run_benchmark.py`，[客户端说明](CLIENT_BENCHMARK.md) |
+| `source` | 连续 source 的交付、输入节奏和 prompt 更新 | `bench_streaming_source.py`，[连续 source](CONTINUOUS_SOURCE_VALIDATION.md) |
+| `dit` | 3/2 phase、source、四步 denoise、clean commit、算子成本 | `bench_dit_phases.py`，[计时说明](STAGE_TIMING.md) |
+| `capture` | worker 显存历史、检查点和整卡采样 | `profile_worker.py`，[显存操作](MEMORY_PROFILING.md) |
+| `memory` | 新增分配、待释放字节、峰值调用栈与阶段时间轴 | `analyze_memory.py`，[显存操作](MEMORY_PROFILING.md) |
+| `report` | 合并比较、切换历史数据、导入/导出 JSON | `build_benchmark_report.py`，[报告格式](STAGE_TIMING.md#离线展示网页) |
+
+```bash
+python3 benchmark/zing_h3_causal/benchmark.py request --model-path /path/to/checkpoint
+python3 benchmark/zing_h3_causal/benchmark.py dit --help
+python3 benchmark/zing_h3_causal/benchmark.py report \
+  --include-results '全链路=benchmark/zing_h3_causal/results/issue334-full-chain-20261019.json' \
+  --memory-run 'H200=/path/to/replayed-memory' --output report.html
+```
+
+连续 source 除原始 `results.json` 外，另存标准 `report.json`，可直接用于 `--include-results`。
+不开启诊断时，原有命令、默认测量和结果版本保持不变。算子 profile 和分配历史影响运行节奏，
+不参与无采集测速的统计。运行时优化由相应优化 PR 提供，本目录只负责测量与分析。
+PR275/283 的历史交付与旧 TAEH3 数据已移至 [BENCHMARK_HISTORY.md](BENCHMARK_HISTORY.md)。
+
 统一 CPU CI 见 `scripts/ci/zing/README.md`。CPU 契约、真实权重 GPU 数值、媒体质量和
 端到端性能是分别验证的项目；工具能运行不代表这些验收已经通过。
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Build an offline HTML report from new bench_client records (no GPU required)."""
+"""Build an offline HTML report from client or DiT phase records (no GPU required)."""
 
 import argparse
 import copy
@@ -11,6 +11,8 @@ import statistics
 from pathlib import Path
 
 from bench_client import calculate_metrics, summarize
+from dit_phase_timing import summarize as summarize_phases
+from memory_results import load_memory_run
 
 
 def read_jsonl(path):
@@ -21,6 +23,8 @@ def read_jsonl(path):
 
 def load_run(name, directory, timing=None):
     config = json.loads((directory / "config.json").read_text())
+    if "chunk_plan" in config:
+        return load_phase_run(name, directory, config)
     requests = read_jsonl(directory / "requests.jsonl")
     chunks = read_jsonl(directory / "chunks.jsonl")
     identities = [r["request_id"] for r in requests]
@@ -111,6 +115,84 @@ def load_run(name, directory, timing=None):
         "issues": issues,
         "sources": sources,
     }
+
+
+def load_phase_run(name, directory, config):
+    """Recompute phase statistics from raw calls, never a cached summary."""
+    samples = read_jsonl(directory / "samples.jsonl")
+    runs = json.loads((directory / "runs.json").read_text())
+    if not samples or not runs or not any(r["run_kind"] == "measured" for r in samples):
+        raise ValueError("Phase report requires raw samples and measured runs")
+    if (
+        not all(r["finite"] is True for r in runs)
+        or len({r["output_sha256"] for r in runs}) != 1
+    ):
+        raise ValueError("Phase runs must have finite, identical outputs")
+    summary = summarize_phases(samples)
+    options = config.get("options", {})
+    comparison = dict(
+        source=config.get("source_archive_sha256"),
+        conditioning=config.get("conditioning_sha256"),
+        configs=[
+            config.get(k)
+            for k in (
+                "model_config_sha256",
+                "runtime_config_sha256",
+                "vae_config_sha256",
+            )
+        ],
+        weights=config.get("selected_weights"),
+        layers=config.get("layer_ids"),
+        sp=config.get("sp"),
+        backend=config.get("effective_backend"),
+        graph=config.get("graph"),
+        routes=config.get("kernel_route_envs"),
+        sampling={
+            k: options.get(k)
+            for k in ("seed", "window_chunks", "sink_chunks", "denoising_step_list")
+        },
+        geometry=[
+            {
+                k: group[k]
+                for k in (
+                    "mode",
+                    "kind",
+                    "chunk",
+                    "latent_frames",
+                    "step",
+                    "q_rows",
+                    "prefix_rows",
+                    "history_rows",
+                    "kv_rows",
+                )
+            }
+            for group in summary["groups"]
+        ],
+    )
+    profile_path = directory / "profile.json"
+    return dict(
+        kind="dit_phases",
+        name=name,
+        config=config,
+        runs=runs,
+        samples=samples,
+        summary=summary,
+        comparison_key=hashlib.sha256(
+            json.dumps(comparison, sort_keys=True).encode()
+        ).hexdigest()
+        if comparison["source"]
+        else None,
+        profile=json.loads(profile_path.read_text()) if profile_path.exists() else None,
+        sources={
+            filename: hashlib.sha256((directory / filename).read_bytes()).hexdigest()
+            for filename in (
+                "config.json",
+                "runs.json",
+                "samples.jsonl",
+                *(["profile.json"] if profile_path.exists() else []),
+            )
+        },
+    )
 
 
 def evidence(runs, output):
@@ -252,6 +334,12 @@ def write_report_page(data, output, *, template=None):
         template = template.replace(
             "@@" + key + "@@", "Benchmark" if key == "CASE" else ""
         )
+    template = template.replace(
+        "@@PHASE_SCRIPT@@", Path(__file__).with_name("phase_report.js").read_text()
+    )
+    template = template.replace(
+        "@@MEMORY_SCRIPT@@", Path(__file__).with_name("memory_report.js").read_text()
+    )
     template = template.replace("@@STREAM_SCRIPT@@", script).replace(
         "@@DATA@@", payload
     )
@@ -259,7 +347,48 @@ def write_report_page(data, output, *, template=None):
     output.write_text(template, encoding="utf-8")
 
 
-def build_report(runs, output, json_output=None):
+def save_report(datasets, output, json_output, included, template=None, memory_runs=()):
+    """Keep every saved result available in one offline page and JSON bundle."""
+    for label, path in included:
+        bundle = json.loads(path.read_text())
+        if (
+            bundle.get("format") != "zing-benchmark-results"
+            or bundle.get("version") != 1
+        ):
+            raise ValueError("Expected a version 1 benchmark results JSON")
+        results = bundle.get("results", [bundle.get("data")])
+        if (
+            not isinstance(results, list)
+            or not results
+            or not all(isinstance(r, dict) for r in results)
+        ):
+            raise ValueError("Saved report has no result datasets")
+        datasets.extend(dict(result, report_label=label) for result in results)
+    datasets.extend(load_memory_run(name, path) for name, path in memory_runs)
+    payload = {"datasets": datasets} if len(datasets) > 1 else datasets[0]
+    write_report_page(payload, output, template=template)
+    path = json_output or output.with_suffix(".json")
+    export_results(datasets[0], path)
+    if len(datasets) > 1:
+        bundle = json.loads(path.read_text())
+        bundle["results"] = datasets
+        path.write_text(
+            json.dumps(bundle, ensure_ascii=False, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+
+
+def build_report(runs, output, json_output=None, include_results=(), memory_runs=()):
+    if any(run.get("kind") == "dit_phases" for run in runs):
+        if not all(run.get("kind") == "dit_phases" for run in runs):
+            raise ValueError(
+                "Build phase and client reports separately, then open both JSON files in the page"
+            )
+        data = dict(kind="dit_phases", phase_runs=runs)
+        save_report(
+            [data], output, json_output, include_results, memory_runs=memory_runs
+        )
+        return
     case_ids = list(
         dict.fromkeys(c["case_id"] for run in runs for c in run["config"]["cases"])
     )
@@ -286,7 +415,6 @@ def build_report(runs, output, json_output=None):
             selected_runs.append(selected)
         datasets.append(evidence(selected_runs, output))
     data = datasets[0]
-    payload = {"datasets": datasets} if len(datasets) > 1 else data
     template = Path(__file__).with_name("benchmark_report.html").read_text()
     runs = data["runs"]
     case = runs[0]["config"]["cases"][0]
@@ -360,16 +488,14 @@ def build_report(runs, output, json_output=None):
         "@@MODE_OPTIONS@@", mode_options
     )
     output.parent.mkdir(parents=True, exist_ok=True)
-    write_report_page(payload, output, template=template)
-    json_path = json_output or output.with_suffix(".json")
-    export_results(data, json_path)
-    if len(datasets) > 1:
-        bundle = json.loads(json_path.read_text())
-        bundle["results"] = datasets
-        json_path.write_text(
-            json.dumps(bundle, ensure_ascii=False, allow_nan=False) + "\n",
-            encoding="utf-8",
-        )
+    save_report(
+        datasets,
+        output,
+        json_output,
+        include_results,
+        template=template,
+        memory_runs=memory_runs,
+    )
 
 
 def named_path(value):
@@ -381,20 +507,49 @@ def named_path(value):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run", type=named_path, action="append", required=True)
+    parser.add_argument("--run", type=named_path, action="append", default=[])
+    parser.add_argument(
+        "--memory-run",
+        type=named_path,
+        action="append",
+        default=[],
+        metavar="NAME=DIRECTORY",
+        help="Import an already-replayed memory profile; no pickle loading",
+    )
     parser.add_argument("--timing", type=named_path, action="append", default=[])
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--json-output", type=Path)
+    parser.add_argument(
+        "--include-results",
+        type=named_path,
+        action="append",
+        default=[],
+        metavar="NAME=JSON",
+        help="Embed an existing saved report alongside the new results",
+    )
     args = parser.parse_args()
+    if not args.run and not args.include_results and not args.memory_run:
+        parser.error("Provide --run, --memory-run or --include-results")
     names = [name for name, _ in args.run]
     if len(set(names)) != len(names):
         parser.error("Run names must be unique")
     timings = dict(args.timing)
     if any(name not in names for name in timings):
         parser.error("Timing names must match run names")
-    build_report(
-        [load_run(name, path, timings.get(name)) for name, path in args.run],
-        args.output,
-        args.json_output,
-    )
+    if args.run:
+        build_report(
+            [load_run(name, path, timings.get(name)) for name, path in args.run],
+            args.output,
+            args.json_output,
+            args.include_results,
+            args.memory_run,
+        )
+    else:
+        save_report(
+            [],
+            args.output,
+            args.json_output,
+            args.include_results,
+            memory_runs=args.memory_run,
+        )
     print(args.output.resolve())

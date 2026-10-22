@@ -338,3 +338,211 @@ def test_two_cpu_processes_gather_distinct_rank_records(tmp_path):
     assert records[0] == records[1]
     assert records[0]["rank_0_load_peak"]["peak_allocated_mb"] == 10
     assert records[0]["rank_1_load_peak"]["peak_allocated_mb"] == 11
+
+
+def allocator_snapshot(events, blocks):
+    return dict(device_traces=[events], segments=[dict(device=0, blocks=blocks)])
+
+
+def allocation(action, addr, size, time):
+    return dict(
+        action=action,
+        addr=addr,
+        size=size,
+        time_us=time,
+        frames=[dict(filename="model.py", line=9, name="forward")],
+    )
+
+
+def live_block(addr, size):
+    return dict(
+        address=addr,
+        size=size,
+        requested_size=size,
+        state="active_allocated",
+        frames=[],
+    )
+
+
+def test_allocation_replay_separates_pending_free_and_old_resident_bytes():
+    from allocation_replay import final_live, replay, stack_groups
+
+    events = [
+        allocation("alloc", 2, 30, 1),
+        allocation("free_requested", 2, 30, 2),
+        allocation("alloc", 3, 40, 3),
+        allocation("free_completed", 2, 30, 4),
+        allocation("free_requested", 1, 100, 5),
+        allocation("free_completed", 1, 100, 6),
+    ]
+    snapshot = allocator_snapshot(events, [live_block(3, 40)])
+    result = replay(events, final_live(snapshot, 0), 0, buckets=1)
+    assert result["closure"] and result["baseline_bytes"] == 100
+    assert result["new_peak_bytes"] == 40
+    assert result["new_active_peak_bytes"] == 70
+    assert result["net_peak_bytes"] == 40
+    assert result["end_allocated_bytes"] == 40
+    assert sum(g["bytes"] for g in stack_groups(result["peak_live"])) == 40
+    assert max(p[1] + p[2] for p in result["points"]) == 70
+    assert min(p[3] for p in result["points"]) == -60
+
+
+def test_allocation_replay_address_reuse_creates_a_new_allocation():
+    from allocation_replay import final_live, replay
+
+    events = [
+        allocation("alloc", 2, 40, 1),
+        allocation("free_requested", 2, 40, 2),
+        allocation("free_completed", 2, 40, 3),
+        allocation("alloc", 2, 80, 5),
+    ]
+    result = replay(
+        events, final_live(allocator_snapshot(events, [live_block(2, 80)]), 0), 4
+    )
+    assert result["baseline_bytes"] == 0 and result["new_peak_bytes"] == 80
+    assert result["peak_live"][0][1][2] == 3
+
+
+def test_allocation_replay_rejects_inconsistent_final_snapshot():
+    from allocation_replay import final_live, replay
+
+    events = [allocation("alloc", 2, 40, 1)]
+    with pytest.raises(ValueError, match="mismatch"):
+        replay(
+            events, final_live(allocator_snapshot(events, [live_block(2, 80)]), 0), 0
+        )
+
+
+def test_partial_history_keeps_the_actual_retained_start():
+    from analyze_memory import analyze
+
+    events = [allocation("alloc", 2, 40, 8)]
+    row = analyze(
+        allocator_snapshot(events, [live_block(2, 40)]),
+        dict(
+            device=0,
+            start_us=2,
+            history_may_be_truncated=True,
+            case="capture",
+            pid=7,
+            role="server",
+        ),
+    )
+    assert row["partial"] and row["recorded_start_seconds"] == 6e-6
+    assert row["points"][0][0] == 6e-6 and row["closure"]
+
+
+def test_memory_probe_preserves_peak_resets_and_stops_sampling_when_disabled(
+    tmp_path, monkeypatch
+):
+    import importlib
+    import sys
+    from types import SimpleNamespace
+
+    import memory_probe
+
+    probe = importlib.reload(memory_probe)
+    state = dict(peak=100, reserved=150)
+
+    def reset(device=None):
+        state.update(peak=20, reserved=30)
+
+    cuda = SimpleNamespace(
+        set_device=lambda _: None,
+        current_device=lambda: 0,
+        memory_allocated=lambda _: 20,
+        memory_reserved=lambda _: 30,
+        max_memory_allocated=lambda _: state["peak"],
+        max_memory_reserved=lambda _: state["reserved"],
+        reset_peak_memory_stats=reset,
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda))
+    monkeypatch.setenv("ZING_BENCHMARK_ROLE", "server")
+    monkeypatch.setenv("ZING_BENCHMARK_MEMORY_DIR", str(tmp_path))
+    probe.install()
+    cuda.reset_peak_memory_stats(0)
+    assert probe.INTERVAL_PEAKS[0] == dict(allocated=100, reserved=150)
+    probe.ENABLED = False
+    state["peak"] = 90
+    cuda.reset_peak_memory_stats(0)
+    assert state["peak"] == 20 and probe.INTERVAL_PEAKS[0]["allocated"] == 100
+    rows = [
+        json.loads(line)
+        for p in (tmp_path / "memory").glob("samples-*.jsonl")
+        for line in p.read_text().splitlines()
+    ]
+    assert [v["kind"] for v in rows] == ["peak_reset_observed"]
+    importlib.reload(probe)
+
+
+def test_memory_probe_repeated_labels_keep_distinct_snapshots(tmp_path, monkeypatch):
+    import importlib
+    import sys
+    from types import SimpleNamespace
+
+    import memory_probe
+
+    probe = importlib.reload(memory_probe)
+    monkeypatch.setenv("ZING_BENCHMARK_ROLE", "server")
+    monkeypatch.setenv("ZING_BENCHMARK_MEMORY_DIR", str(tmp_path))
+    control = tmp_path / "memory-control.json"
+    snapshots = []
+    histories = []
+
+    def write_command(sequence, operation="snapshot"):
+        control.write_text(
+            json.dumps(
+                dict(sequence=sequence, label="after-request", operation=operation)
+            )
+        )
+
+    def dump(path):
+        from pathlib import Path
+
+        snapshots.append(path)
+        Path(path).write_text(str(len(snapshots)))
+
+    cuda = SimpleNamespace(
+        set_device=lambda _: None,
+        current_device=lambda: 0,
+        get_device_name=lambda _: "mock GPU",
+        synchronize=lambda _: None,
+        memory_allocated=lambda _: 20,
+        memory_reserved=lambda _: 30,
+        max_memory_allocated=lambda _: 40,
+        max_memory_reserved=lambda _: 50,
+        reset_peak_memory_stats=lambda _: None,
+        memory=SimpleNamespace(
+            _record_memory_history=lambda **kw: histories.append(kw),
+            _dump_snapshot=dump,
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules, "torch", SimpleNamespace(cuda=cuda, __version__="mock")
+    )
+    monkeypatch.setattr(
+        probe.threading, "Thread", lambda target, **kw: SimpleNamespace(start=target)
+    )
+
+    def next_command(_):
+        sequence = json.loads(control.read_text())["sequence"] + 1
+        assert sequence <= 3, "Observer did not stop after disable"
+        write_command(sequence, "disable" if sequence == 3 else "snapshot")
+
+    monkeypatch.setattr(probe.time, "sleep", next_command)
+    write_command(1)
+    probe.start()
+    assert len(set(snapshots)) == 2
+    from pathlib import Path
+
+    assert [Path(p).read_text() for p in snapshots] == ["1", "2"]
+    acks = [
+        json.loads(p.read_text())
+        for p in sorted((tmp_path / "memory").glob("ack-*.json"))
+    ]
+    assert len(acks) == 3 and all(a["passed"] for a in acks)
+    assert acks[0]["snapshot"] != acks[1]["snapshot"]
+    assert acks[2]["snapshot"] is None and not probe.ENABLED
+    assert histories[-1] == dict(enabled=None, clear_history=True)
+    assert not list((tmp_path / "memory").glob("ERROR-*.txt"))
+    importlib.reload(probe)

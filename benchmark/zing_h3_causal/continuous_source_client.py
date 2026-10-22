@@ -14,6 +14,7 @@ import hashlib
 import json
 import time
 from collections import deque
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import msgpack
@@ -30,6 +31,33 @@ from sglang.multimodal_gen.runtime.realtime.source_transport import (
 from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
     DEFAULT_MAX_REFERENCE_IMAGES,
 )
+
+CLIENT_TIMING = {
+    "clock": "CLOCK_MONOTONIC",
+    "origin": "client_start_before_connect_and_source_decode",
+    "init_origin": "serialized_init_immediately_before_websocket_send",
+    "arrival": "complete_rgb_payload_received_after_message_unpack",
+    "wire_arrival": "complete_rgb_wire_received_before_message_unpack",
+    "e2e_end": "last_valid_rgb_batch_received",
+    "elapsed_end": "receiver_and_source_tasks_finished_after_server_close",
+    "scope": "client_websocket_delivery_with_rgb_file_backpressure",
+}
+
+
+@asynccontextmanager
+async def connection_preserving_error(connector):
+    """Legacy WebSockets may raise again while closing an aborted transport."""
+    ws = await connector.__aenter__()
+    try:
+        yield ws
+    except BaseException as exc:
+        try:
+            await connector.__aexit__(type(exc), exc, exc.__traceback__)
+        except Exception as close_error:
+            exc.add_note(f"Connection cleanup failed: {type(close_error).__name__}")
+        raise
+    else:
+        await connector.__aexit__(None, None, None)
 
 
 def websocket_options(*, profile, timeout, message_budget=DEFAULT_MESSAGE_BYTES):
@@ -84,11 +112,12 @@ async def exchange(args, output, started, read_source, received_file, trace):
         first_source_send=None,
         last_source_send=None,
         source_end_send=None,
+        sink_confirmed_bytes=0,
         credit_wait_seconds=0.0,
     )
     prompt_results = {}
     boundaries, accepted, capture, sent = deque(), deque(), deque(), deque()
-    latency_samples, delivery_times = [], []
+    latency_samples, delivery_times, wire_delivery_times = [], [], []
     dependency_latency_samples = []
     block_capture_latency_samples = []
     credit, writer = asyncio.Condition(), asyncio.Lock()
@@ -100,11 +129,15 @@ async def exchange(args, output, started, read_source, received_file, trace):
         )
         trace.flush()
 
-    async with websockets.connect(
-        args.url,
-        **websocket_options(
-            profile=args.profile, timeout=args.timeout, message_budget=message_budget
-        ),
+    async with connection_preserving_error(
+        websockets.connect(
+            args.url,
+            **websocket_options(
+                profile=args.profile,
+                timeout=args.timeout,
+                message_budget=message_budget,
+            ),
+        )
     ) as ws:
 
         async def send(message):
@@ -112,6 +145,8 @@ async def exchange(args, output, started, read_source, received_file, trace):
             if len(wire) > message_budget:
                 raise ValueError("Message exceeds the configured transport size limit")
             async with writer:
+                if message.get("type") == "init":
+                    state["init_send"] = time.monotonic()
                 await ws.send(wire)
             return len(wire)
 
@@ -140,6 +175,19 @@ async def exchange(args, output, started, read_source, received_file, trace):
                 refs.append(reference_payload(name, media_id))
             init["references"] = refs
         await send(init)
+        record("init_sent", init_send_seconds=state["init_send"] - started)
+        (output / "client-timing.json").write_text(
+            json.dumps(
+                {
+                    **CLIENT_TIMING,
+                    "init_send_seconds": state["init_send"] - started,
+                    "client_sha256": hashlib.sha256(
+                        Path(__file__).read_bytes()
+                    ).hexdigest(),
+                },
+                indent=2,
+            )
+        )
         ready = msgpack.unpackb(
             await asyncio.wait_for(ws.recv(), args.timeout), raw=False
         )
@@ -375,6 +423,7 @@ async def exchange(args, output, started, read_source, received_file, trace):
             next_source_id = 1
             profile_received = False
             async for wire in ws:
+                wire_received = time.monotonic()
                 message = msgpack.unpackb(wire, raw=False)
                 kind = message.get("type")
                 if kind == "error":
@@ -422,6 +471,8 @@ async def exchange(args, output, started, read_source, received_file, trace):
                         if kind == "frame_batch_header"
                         else message.pop("payload")
                     )
+                    if kind == "frame_batch_header":
+                        wire_received = time.monotonic()
                     now = time.monotonic()
                     start, count = message["output_frame_start"], message["num_frames"]
                     if (
@@ -511,16 +562,24 @@ async def exchange(args, output, started, read_source, received_file, trace):
                         record("prompt_applied", **update)
                     state["received"] += count
                     delivery_times.append((now - started, count))
+                    wire_delivery_times.append(
+                        (wire_received - state["init_send"], count)
+                    )
                     output_hash.update(payload)
-                    await asyncio.to_thread(received_file.write, payload)
                     record(
                         "frames",
                         header=message,
+                        wire_received_seconds=wire_received - started,
+                        init_wire_received_seconds=wire_received - state["init_send"],
                         received_seconds=now - started,
                         stall_seconds=stall,
                         dependency_to_output_seconds=dependency_latency,
                         block_capture_to_output_seconds=block_capture_latency,
                     )
+                    written = await asyncio.to_thread(received_file.write, payload)
+                    if written != len(payload):
+                        raise OSError("Incomplete RGB output write")
+                    state["sink_confirmed_bytes"] += written
                     # Keep any packet covering the next frame; a lookahead
                     # dependency may legitimately be reused by multiple outputs.
                     while sent and sent[0][1] <= state["received"]:
@@ -586,11 +645,35 @@ async def exchange(args, output, started, read_source, received_file, trace):
                 await receiver
                 await producer
                 h.cancel()
-        except BaseException:
+        except BaseException as exc:
             # The cancelled receiver no longer drains the bounded incoming queue.
             # Abort a failed session rather than wait for a close handshake whose
             # reads may be paused; preserve the original error or cancellation.
-            ws.transport.abort()
+            try:
+                ws.transport.abort()
+            except Exception as abort_error:
+                exc.add_note(f"Transport abort failed: {type(abort_error).__name__}")
+            try:
+                (output / "failure-summary.json").write_text(
+                    json.dumps(
+                        {
+                            **state,
+                            "success": False,
+                            "session_id": ready["session_id"],
+                            "elapsed_seconds": time.monotonic() - started,
+                            "timing_boundaries": CLIENT_TIMING,
+                            "input_sha256": input_hash.hexdigest(),
+                            "output_sha256": output_hash.hexdigest(),
+                            "delivery_times": delivery_times,
+                            "init_wire_delivery_times": wire_delivery_times,
+                        },
+                        indent=2,
+                    )
+                )
+            except OSError as receipt_error:
+                exc.add_note(
+                    f"Failure receipt write failed: {type(receipt_error).__name__}"
+                )
             raise
         finally:
             for update in prompt_results.values():
@@ -629,6 +712,12 @@ async def exchange(args, output, started, read_source, received_file, trace):
                 for at, count in delivery_times
             ]
         )
+        init_metrics = calculate_metrics(
+            [
+                {"arrival_seconds": at, "num_frames": count}
+                for at, count in wire_delivery_times
+            ]
+        )
         boot = Path("/proc/sys/kernel/random/boot_id")
         summary = dict(
             state,
@@ -642,6 +731,10 @@ async def exchange(args, output, started, read_source, received_file, trace):
             output_batch_interval_max_seconds=metrics["icl_seconds"]["max"],
             elapsed_seconds=elapsed,
             effective_delivery_fps=state["received"] / elapsed,
+            completion_overhead_seconds=elapsed - metrics["e2e_seconds"],
+            init_send_to_rgb=init_metrics,
+            timing_boundaries=CLIENT_TIMING,
+            client_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             **metrics,
             timing_origin="client_start_before_connect_and_source_decode",
             input_mode="paced" if args.paced else "unpaced",
@@ -664,6 +757,7 @@ async def exchange(args, output, started, read_source, received_file, trace):
             input_sha256=input_hash.hexdigest(),
             output_sha256=output_hash.hexdigest(),
             delivery_times=delivery_times,
+            init_wire_delivery_times=wire_delivery_times,
         )
         (output / "summary.json").write_text(json.dumps(summary, indent=2))
         print(

@@ -33,6 +33,8 @@ def test_known_unequal_chunks_use_frames_and_exclude_completion():
     assert metrics["ttff_seconds"] == 2
     assert metrics["e2e_seconds"] == 9
     assert metrics["fps"] == pytest.approx(10 / 9)
+    assert metrics["post_ttff_fps"] == pytest.approx(8 / 7)
+    assert metrics["first_batch_frames"] == 2
     assert metrics["tpoc_seconds"] == 3.5
     assert [row["icl_seconds"] for row in delivery.chunks] == [None, 3, 4]
     assert metrics["icl_seconds"]["median"] == 3.5
@@ -44,6 +46,7 @@ def test_empty_and_single_chunk_do_not_invent_intervals():
     assert calculate_metrics([])["icl_seconds"]["count"] == 0
     metrics = calculate_metrics([{"arrival_seconds": 2, "num_frames": 10}])
     assert metrics["fps"] == 5
+    assert metrics["post_ttff_fps"] is None
     assert metrics["tpoc_seconds"] is None
     assert metrics["icl_seconds"]["median"] is None
 
@@ -402,7 +405,14 @@ def test_request_saves_received_profile_beside_client_results(tmp_path):
 
 
 async def streaming_peer(
-    ws, observations, *, disconnect=False, steps=4, prompt_modes=None, max_references=21
+    ws,
+    observations,
+    *,
+    disconnect=False,
+    steps=4,
+    missing_completion=False,
+    prompt_modes=None,
+    max_references=21,
 ):
     """Protocol peer: echo bytes, with bounded credit; it is not a model."""
     import asyncio
@@ -439,6 +449,8 @@ async def streaming_peer(
         observations.append(message)
         if message["kind"] == "source.end":
             assert message["payload"]["source_frame_end"] == frames
+            if missing_completion:
+                return
             await send(dict(type="session.completed", output_frames=frames))
             if init.get("return_stage_timing"):
                 await asyncio.sleep(0.03)
@@ -642,6 +654,31 @@ def test_streaming_client_delivers_before_eos_and_obeys_credit(
     assert result["ifl_seconds"] is None
     assert result["icl_seconds"]["count"] == (3 if updates else 2)
     assert result["input_mode"] == ("paced" if paced else "unpaced")
+    timing = json.loads((tmp_path / "result/client-timing.json").read_text())
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "result/events.jsonl").read_text().splitlines()
+    ]
+    frames = [e for e in events if e["kind"] == "frames"]
+    assert (
+        result["init_send_to_rgb"]["ttff_seconds"]
+        == frames[0]["init_wire_received_seconds"]
+    )
+    assert (
+        result["init_send_to_rgb"]["e2e_seconds"]
+        == frames[-1]["init_wire_received_seconds"]
+    )
+    assert result["init_send_to_rgb"]["fps"] == pytest.approx(
+        6 / frames[-1]["init_wire_received_seconds"]
+    )
+    assert (
+        result["ttff_seconds"]
+        >= result["init_send_to_rgb"]["ttff_seconds"] + timing["init_send_seconds"]
+    )
+    assert all(e["wire_received_seconds"] <= e["received_seconds"] for e in frames)
+    assert result["completion_overhead_seconds"] == pytest.approx(
+        result["elapsed_seconds"] - result["e2e_seconds"]
+    )
     assert (tmp_path / "result/output.rgb").read_bytes() == raw
     assert "num_frames" not in observations[0]["source_stream"]
     assert observations[-1]["kind"] == "source.end"
@@ -1103,6 +1140,10 @@ def test_streaming_benchmark_keeps_warmup_out_of_summary_and_exports(
             first_output_before_source_end=True,
             dependency_to_output_seconds={},
             source_to_output_seconds={},
+            elapsed_seconds=4.5,
+            effective_delivery_fps=6 / 4.5,
+            ifl_status="not_measured",
+            client_clock_domain="CLOCK_MONOTONIC:test",
             prompt_updates=[
                 dict(
                     event_id=1,
@@ -1153,6 +1194,13 @@ def test_streaming_benchmark_keeps_warmup_out_of_summary_and_exports(
     assert exported["requests"][1]["metrics"]["stall_seconds"] == 0.5
     assert exported["requests"][1]["metrics"]["ifl_seconds"] is None
     assert exported["requests"][1]["streaming"]["source_send_span_seconds"] == 3
+    assert exported["requests"][1]["client_observation"]["elapsed_seconds"] == 4.5
+    assert (
+        exported["requests"][1]["client_observation"]["client_clock_domain"]
+        == "CLOCK_MONOTONIC:test"
+    )
+    assert exported["requests"][1]["delivery_complete"]
+    assert exported["requests"][1]["delivery_metrics"]["e2e_seconds"] == 4
     assert (
         exported["requests"][1]["streaming"]["prompt_updates"][0]["latency_ms"] == 1000
     )
@@ -1160,6 +1208,10 @@ def test_streaming_benchmark_keeps_warmup_out_of_summary_and_exports(
         exported["requests"][1]["streaming"]["prompt_update_latency_ms"]["count"] == 1
     )
     assert (tmp_path / "results.html").is_file()
+    assert (
+        json.loads((tmp_path / "report.json").read_text())["data"]["kind"]
+        == "continuous_source"
+    )
 
 
 def test_streaming_client_waits_for_server_cleanup_before_return(tmp_path):
@@ -1256,6 +1308,98 @@ def test_streaming_benchmark_stops_after_failed_warmup_and_keeps_receipt(
     assert result["summary"]["5s"]["warmup_failed"] == 1
     assert result["summary"]["5s"]["not_run_measured"] == 3
     assert result["summary"]["5s"]["metrics"]["ttff_seconds"]["median"] is None
+
+
+@pytest.mark.parametrize("failure", ["eos", "sink", "trace"])
+def test_streaming_benchmark_retains_delivery_after_failure(
+    tmp_path, monkeypatch, failure
+):
+    import asyncio
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    import bench_streaming_source as streaming
+    import websockets
+
+    native_run = streaming.run
+    source = tmp_path / "source.rgb"
+    source.write_bytes(bytes(72))
+
+    async def raw_request(args):
+        args.source_video, args.source_rgb = None, str(source)
+        try:
+            return await native_run(args)
+        finally:
+            if failure == "trace":
+                with (Path(args.output) / "events.jsonl").open("a") as f:
+                    f.write('{"kind":')
+
+    monkeypatch.setattr(streaming, "run", raw_request)
+    native_to_thread = asyncio.to_thread
+    sink_calls = 0
+
+    async def failing_sink(func, *args, **kwargs):
+        nonlocal sink_calls
+        if getattr(getattr(func, "__self__", None), "name", "").endswith("output.rgb"):
+            sink_calls += 1
+            if failure == "sink" and sink_calls == 6:
+                raise OSError("Injected sink failure after final RGB receive")
+        return await native_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", failing_sink)
+    case = dict(
+        label="5s",
+        case_id="fixture",
+        frames=6,
+        width=2,
+        height=2,
+        source_video="fixture",
+        prompt="p",
+        references=[],
+        reference_ids=[],
+    )
+
+    async def exercise():
+        async with websockets.serve(
+            lambda ws: streaming_peer(
+                ws, [], missing_completion=failure in ("eos", "trace")
+            ),
+            "127.0.0.1",
+            0,
+        ) as server:
+            args = SimpleNamespace(
+                output_dir=tmp_path,
+                paced=False,
+                warmup_runs=1,
+                measured_runs=3,
+                seed=123,
+                url=f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
+                timeout=5,
+                ffmpeg="ffmpeg",
+                batch_pattern=[1],
+                no_stage_timing=True,
+                prompt_updates=None,
+            )
+            with pytest.raises(RuntimeError, match="source tasks failed|TaskGroup"):
+                await streaming.benchmark([case], args)
+
+    asyncio.run(exercise())
+    bundle = json.loads((tmp_path / "results.json").read_text())
+    row = bundle["requests"][0]
+    assert row["delivery_complete"] and not row["success"]
+    assert row["output_frames"] == 6 and row["output_rgb_bytes"] == 72
+    assert row["delivery_metrics"]["e2e_seconds"] > 0
+    assert row["init_send_to_rgb"]["e2e_seconds"] > 0
+    assert row["client_observation"]["received"] == 6
+    assert len(row["client_observation"]["output_sha256"]) == 64
+    assert row["client_observation"]["sink_confirmed_bytes"] == (
+        60 if failure == "sink" else 72
+    )
+    if failure == "trace":
+        assert row["receipt_error"] == "events: JSONDecodeError"
+        assert "source tasks failed" in row["error"] or "TaskGroup" in row["error"]
+    assert bundle["summary"]["5s"]["warmup_failed"] == 1
+    assert bundle["summary"]["5s"]["metrics"]["e2e_seconds"]["count"] == 0
 
 
 @pytest.mark.parametrize(
@@ -1356,6 +1500,16 @@ def test_benchmark_defaults_to_host_request_and_can_opt_out():
     assert (
         not parser().parse_args([*required, "--no-stage-timing"]).receive_stage_timing
     )
+
+
+def test_simultaneous_output_batches_have_no_post_ttff_rate():
+    metrics = calculate_metrics(
+        [
+            {"arrival_seconds": 2, "num_frames": 2},
+            {"arrival_seconds": 2, "num_frames": 5},
+        ]
+    )
+    assert metrics["post_ttff_fps"] is None
 
 
 @pytest.mark.parametrize("limit,count", [(0, 0), (2, 2), (32, 32), (2, 3)])

@@ -362,3 +362,32 @@ def test_refresh_entry_records_failed_preparation_without_launch(
         json.loads((output / "media_preparation.json").read_text())["status"]
         == "failed"
     )
+
+
+def test_comprehensive_entry_forwards_existing_tool_arguments():
+    import benchmark
+
+    value = benchmark.command(["dit", "--layers", "2", "--profile-cycle"])
+    assert value[-3:] == ["--layers", "2", "--profile-cycle"]
+    assert value[1].endswith("/bench_dit_phases.py")
+    assert benchmark.command(["report", "--help"])[-1] == "--help"
+
+
+def test_memory_checkpoint_waits_for_the_exact_worker_count(tmp_path):
+    import profile_worker
+
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    for pid in [2, 3]:
+        (memory / f"process-{pid}.json").write_text(json.dumps(dict(pid=pid)))
+        (memory / f"ack-1-{pid}.json").write_text(
+            json.dumps(dict(pid=pid, passed=True, label="after-request"))
+        )
+    values = profile_worker.checkpoint(tmp_path, "after-request", "snapshot", 2, 0.1)
+    assert {v["pid"] for v in values} == {2, 3}
+    assert (
+        json.loads((tmp_path / "memory-control.json").read_text())["operation"]
+        == "snapshot"
+    )
+    with pytest.raises(ValueError, match="alphanumeric"):
+        profile_worker.checkpoint(tmp_path, "../unsafe", "snapshot", 2, 0.1)

@@ -107,7 +107,7 @@ SAMPLING_FIELDS = {
     "zing_rope_max_frame_gap",
     "zing_window_eviction_timing",
 }
-METRIC_NAMES = ("ttff_seconds", "e2e_seconds", "fps", "tpoc_seconds")
+METRIC_NAMES = ("ttff_seconds", "e2e_seconds", "fps", "post_ttff_fps", "tpoc_seconds")
 
 
 def distribution(values):
@@ -140,6 +140,12 @@ def calculate_metrics(chunks):
         "ttff_seconds": arrivals[0],
         "e2e_seconds": arrivals[-1],
         "fps": frames / arrivals[-1] if arrivals[-1] > 0 else None,
+        "first_batch_frames": chunks[0]["num_frames"],
+        "post_ttff_fps": (
+            (frames - chunks[0]["num_frames"]) / (arrivals[-1] - arrivals[0])
+            if arrivals[-1] > arrivals[0]
+            else None
+        ),
         "tpoc_seconds": statistics.mean(intervals) if intervals else None,
         "icl_seconds": distribution(intervals),
     }
@@ -539,9 +545,9 @@ def summarize(results, cases, measured_runs):
             "metrics": {
                 name: distribution(
                     [
-                        r["metrics"][name]
+                        r["metrics"].get(name)
                         for r in passed
-                        if r["metrics"][name] is not None
+                        if r["metrics"].get(name) is not None
                     ]
                 )
                 for name in METRIC_NAMES

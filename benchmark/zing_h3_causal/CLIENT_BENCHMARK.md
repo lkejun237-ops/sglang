@@ -215,7 +215,8 @@ block/batch 编号重建帧范围，并明确标记 `frame_start_origin`。
 |---|---|
 | TTFF | 首个有效 batch 到达时间 − t0 |
 | E2E | 最后有效 batch 到达时间 − t0 |
-| FPS | 实际有效帧数 / E2E，包含首次等待 |
+| `fps`（原始全程口径） | 实际有效帧数 / E2E，包含首次等待 |
+| `post_ttff_fps`（网页 FPS） | (总帧数 − 首批帧数) / (E2E − TTFF)，不足有效时间区间为 null |
 | ICL | 相邻 batch 到达间隔；记录原始值、样本量、中位数/P95 |
 | TPOC | 首 batch 后平均 ICL；不足两个 batch 为 null |
 | IFL | null；没有独立逐帧到达时间，不插值伪造 |
@@ -287,3 +288,21 @@ python3 -m pytest -q benchmark/zing_h3_causal/tests/test_bench_client.py
 
 本阶段的实际运行、验收状态和工件身份见
 [阶段性验收记录](CLIENT_BENCHMARK_VALIDATION.md)。
+
+
+## 连续 source 的客户端起点与失败回执
+
+`bench_streaming_source.py` / `continuous_source_client.py` 使用真实 source 流传输。
+其 `timing_origin=client_start_before_connect_and_source_decode` 包括建连和 source
+解码启动等待，与上述有限请求 init-send 起点分开记录。`timing_boundaries` 明确
+每个时间点；`init_send_to_rgb` 另外保留 init-send → 解包前完整 RGB 的兼容指标。
+双方都按首个和最后一个有效 batch 计算 TTFF/E2E，不把 EOS、profile 回传或收尾
+时间算进媒体 E2E。`elapsed_seconds`、`completion_overhead_seconds` 单独记录收尾。
+
+接收记录在 RGB 校验后、写盘前保存，`sink_confirmed_bytes` 另计写盘成功字节。
+收到全部 RGB 后若 EOS 丢失、sink 写入失败或收据损坏，请求仍失败并排除正式汇总，
+但保留 `client_observation`、完整/部分交付记录和原始异常，便于区分生成与收尾问题。
+旧结果没有新字段时显示缺测，原始 `fps` 的语义保持兼容。
+
+全50层三目标的场景、运行版本、phase 与算子口径，以及离线报告重建命令见
+[完整链路实测](STAGE_TIMING.md#全50层完整链路实测2026-10-19)。

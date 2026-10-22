@@ -101,6 +101,12 @@ prefix/KV 容量和 Graph/offload/compile；只改变本 PR 要测试的因素�
 若要对照本页 H200 Graph 收益，baseline 明确选证据 C 的同配置 eager；W5 单步方案与
 泰国两步方案都不能用它计算改动收益。历史 H200 六图长片也不是当前标准七图长片的结果。
 
+综合测速与诊断入口为 `benchmark/zing_h3_causal/benchmark.py`，见
+[benchmark 使用说明](https://github.com/seedleap/sglang/blob/main/benchmark/zing_h3_causal/README.md)。
+`request/source/dit` 复用原测量工具；`capture/memory` 显式采集和重放运行时分配，
+通过 `report --memory-run` 与已有结果合并查看。采集轮与关闭采集后的正式计时分开。
+这次整理未补跑 GPU，也未改变部署配方；历史冻结数据不证明新 worker launcher 已通过 GPU 验收。
+
 ## 已有速度观测
 
 这些数字用于选实验起点，不构成跨硬件排名；各组采样、窗口和版本不同。

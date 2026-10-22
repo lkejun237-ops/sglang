@@ -9,8 +9,15 @@ import traceback
 import uuid
 from pathlib import Path
 
-from bench_client import append_jsonl, distribution, summarize, write_json
+from bench_client import (
+    append_jsonl,
+    calculate_metrics,
+    distribution,
+    summarize,
+    write_json,
+)
 from build_streaming_report import build_report, load_received_profiles
+from continuous_source_client import CLIENT_TIMING
 from continuous_source_client import parser as client_parser
 from continuous_source_client import run
 from prepare_whitebox_video_smoke import (
@@ -91,6 +98,7 @@ async def benchmark(cases, args):
         "transport": "continuous_source",
         "input_mode": "paced" if args.paced else "unpaced",
         "timing_origin": "client_start_before_connect_and_source_decode",
+        "timing_boundaries": CLIENT_TIMING,
         "concurrency": 1,
         "warmup_runs": args.warmup_runs,
         "measured_runs": args.measured_runs,
@@ -172,11 +180,14 @@ async def benchmark(cases, args):
                         "media_path": str(output / "output.rgb"),
                         "input_mode": config["input_mode"],
                         "timing_origin": config["timing_origin"],
+                        "expected_frames": case["frames"],
+                        "client_observation": None,
                     }
                     try:
                         observation = await run(client_parser().parse_args(command))
                         result.update(
                             success=True,
+                            client_observation=observation,
                             server_session_id=observation["session_id"],
                             input_sha256=observation["input_sha256"],
                             output_sha256=observation["output_sha256"],
@@ -215,6 +226,14 @@ async def benchmark(cases, args):
                         result["error_traceback"] = "".join(
                             traceback.format_exception(exc)
                         )
+                        failure = output / "failure-summary.json"
+                        if failure.exists():
+                            try:
+                                result["client_observation"] = json.loads(
+                                    failure.read_text()
+                                )
+                            except (OSError, ValueError) as receipt_error:
+                                result["receipt_error"] = type(receipt_error).__name__
                     prompt_evidence = output / "prompt-updates.json"
                     if prompt_evidence.is_file():
                         result.setdefault("streaming", {}).update(
@@ -222,31 +241,80 @@ async def benchmark(cases, args):
                         )
                     chunks = []
                     events = output / "events.jsonl"
-                    if events.exists():
-                        for line in events.read_text().splitlines():
-                            event = json.loads(line)
-                            if event["kind"] != "frames":
-                                continue
-                            header = event["header"]
-                            chunks.append(
-                                {
-                                    "request_id": request_id,
-                                    "label": case["label"],
-                                    "case_id": case["case_id"],
-                                    "phase": phase,
-                                    "server_request_id": header.get("request_id"),
-                                    "arrival_seconds": event["received_seconds"],
-                                    "num_frames": header["num_frames"],
-                                    "output_frame_start": header["output_frame_start"],
-                                    "source_dependency_end": header[
-                                        "source_dependency_end"
-                                    ],
-                                }
-                            )
+                    try:
+                        if events.exists():
+                            for line in events.read_text().splitlines():
+                                event = json.loads(line)
+                                if event["kind"] != "frames":
+                                    continue
+                                header = event["header"]
+                                chunks.append(
+                                    {
+                                        "request_id": request_id,
+                                        "label": case["label"],
+                                        "case_id": case["case_id"],
+                                        "phase": phase,
+                                        "server_request_id": header.get("request_id"),
+                                        "arrival_seconds": event["received_seconds"],
+                                        "num_frames": header["num_frames"],
+                                        "output_frame_start": header[
+                                            "output_frame_start"
+                                        ],
+                                        "source_dependency_end": header[
+                                            "source_dependency_end"
+                                        ],
+                                        "wire_arrival_seconds": event.get(
+                                            "wire_received_seconds"
+                                        ),
+                                        "init_wire_arrival_seconds": event.get(
+                                            "init_wire_received_seconds"
+                                        ),
+                                        "total_size": header.get("total_size"),
+                                    }
+                                )
+                    except (OSError, ValueError, KeyError, TypeError) as receipt_error:
+                        result["success"] = False
+                        result["error"] = (
+                            result.get("error") or "Invalid media event receipt"
+                        )
+                        previous = result.get("receipt_error")
+                        result["receipt_error"] = (
+                            (previous + "; " if previous else "")
+                            + "events: "
+                            + type(receipt_error).__name__
+                        )
                     result["chunk_count"] = len(chunks)
                     result["output_frames"] = sum(
                         chunk["num_frames"] for chunk in chunks
                     )
+                    result["delivery_complete"] = result["output_frames"] == case[
+                        "frames"
+                    ] and [c["output_frame_start"] for c in chunks] == [
+                        sum(p["num_frames"] for p in chunks[:i])
+                        for i in range(len(chunks))
+                    ]
+                    result["delivery_metrics"] = calculate_metrics(chunks)
+                    if result.get("metrics"):
+                        result["metrics"].update(
+                            {
+                                key: result["delivery_metrics"].get(key)
+                                for key in ("post_ttff_fps", "first_batch_frames")
+                            }
+                        )
+                    result["output_rgb_bytes"] = (
+                        result["output_frames"] * case["width"] * case["height"] * 3
+                    )
+                    if chunks and all(
+                        c["init_wire_arrival_seconds"] is not None for c in chunks
+                    ):
+                        result["init_send_to_rgb"] = calculate_metrics(
+                            [
+                                {**c, "arrival_seconds": c["init_wire_arrival_seconds"]}
+                                for c in chunks
+                            ]
+                        )
+                    if result["success"] and not result["delivery_complete"]:
+                        result.update(success=False, error="Incomplete RGB delivery")
                     result["icl_values_seconds"] = [
                         b["arrival_seconds"] - a["arrival_seconds"]
                         for a, b in zip(chunks, chunks[1:])
@@ -272,12 +340,26 @@ async def benchmark(cases, args):
                 key: distribution([row["streaming"][key] for row in passed])
                 for key in STREAM_METRICS
             }
+            summary[case["label"]]["init_send_to_rgb"] = {
+                key: distribution(
+                    [
+                        row["init_send_to_rgb"][key]
+                        for row in passed
+                        if row.get("init_send_to_rgb", {}).get(key) is not None
+                    ]
+                )
+                for key in ("ttff_seconds", "e2e_seconds", "fps")
+            }
         write_json(args.output_dir / "summary.json", summary)
         bundle = {"config": config, "requests": results, "summary": summary}
         if not getattr(args, "no_stage_timing", False):
             bundle["server"] = load_received_profiles(args.output_dir, bundle)
         write_json(args.output_dir / "results.json", bundle)
-        build_report([bundle], args.output_dir / "results.html")
+        build_report(
+            [bundle],
+            args.output_dir / "results.html",
+            json_output=args.output_dir / "report.json",
+        )
     return summary
 
 

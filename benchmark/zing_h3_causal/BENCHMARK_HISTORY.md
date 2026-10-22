@@ -1,4 +1,7 @@
-# Benchmark相关PR（275+283）
+# PR275 / PR283：客户端与阶段 benchmark 历史交付
+
+本文保留当时的部署、指标和验收结果。当前综合工具入口见 [README](README.md)，
+现行计时与报告使用见 [STAGE_TIMING](STAGE_TIMING.md)。历史 TAEH3/CUDA 模式不代表当前部署默认值。
 
 ## PR #275
 
@@ -88,7 +91,7 @@ python3 benchmark/zing_h3_causal/run_benchmark.py --model-path /path/to/sglang-c
 
 当前实测页：
 `exports/issue253-three-cases-20261012-r1/view/benchmark-report.html`（运行工件目录）。
-数据与验证说明见 [三 case 验收记录](benchmark/zing_h3_causal/THREE_CASE_BENCHMARK_VALIDATION.md)。
+数据与验证说明见 [三 case 验收记录](THREE_CASE_BENCHMARK_VALIDATION.md)。
 
 ### 测试用例
 
@@ -115,7 +118,7 @@ python3 benchmark/zing_h3_causal/run_benchmark.py --model-path /path/to/sglang-c
 
 9 次正式生成全部完成，视频规格与完整解码通过。Qwen 没有独立 span，阶段分析
 明确标为未测；旧 Qwen 门禁失败及修正后的复核记录保留在运行目录。详细数据在网页
-与 [验收记录](benchmark/zing_h3_causal/THREE_CASE_BENCHMARK_VALIDATION.md) 中查看。
+与 [验收记录](THREE_CASE_BENCHMARK_VALIDATION.md) 中查看。
 新 checkpoint 入口也已通过阿里云实测：GPU 作业 `dlcpofbijm0f7fe4`，同一个常驻
 SP2 服务完成全部 12 次请求，自动生成 HTML/JSON；9 个正式视频完整解码通过。
 本轮阶段采集关闭，使用已有素材缓存与 checkpoint 附带的 TAEH3 配置，正式中位数如下：

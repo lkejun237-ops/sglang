@@ -148,7 +148,7 @@
       .join("");
     const passed = gs.flatMap((g) => g.formal),
       tt = passed.map((r) => r.metrics.ttff_seconds),
-      fp = passed.map((r) => r.metrics.fps).filter(Number.isFinite);
+      fp = passed.map((r) => r.metrics.post_ttff_fps).filter(Number.isFinite);
     $("overview").textContent = passed.length
       ? "本批 " +
         passed.length +
@@ -158,7 +158,7 @@
         fmt(Math.max(...tt)) +
         " 秒" +
         (fp.length
-          ? "，端到端交付 " +
+          ? "，首批后生成 " +
             fmt(Math.min(...fp)) +
             "–" +
             fmt(Math.max(...fp)) +
@@ -206,7 +206,7 @@
           " · 失败 " +
           g.failed.length +
           "</span></td>" +
-          ["ttff_seconds", "e2e_seconds", "fps"]
+          ["ttff_seconds", "e2e_seconds", "post_ttff_fps"]
             .map((k) => '<td class="num">' + fmt(stat(g, k)) + "</td>")
             .join("") +
           "</tr>",
@@ -279,7 +279,7 @@
     $("metrics").innerHTML = [
       ["首批等待", "ttff_seconds", "s"],
       ["全部收齐", "e2e_seconds", "s"],
-      ["端到端交付", "fps", "FPS"],
+      ["首批后生成", "post_ttff_fps", "FPS"],
     ]
       .map(([title, k, u]) => {
         const a = g.formal.map((r) => r.metrics[k]).filter(Number.isFinite);
@@ -307,7 +307,7 @@
           " 次" +
           (r.success ? "" : " · 失败") +
           "</td>" +
-          ["ttff_seconds", "e2e_seconds", "fps"]
+          ["ttff_seconds", "e2e_seconds", "post_ttff_fps"]
             .map((k) => '<td class="num">' + fmt(r.metrics?.[k]) + "</td>")
             .join("") +
           '<td class="num">' +
@@ -345,6 +345,35 @@
         r.success ? "成功" : (r.error ?? "失败"),
       ]),
       ["请求", "TTFF / s", "E2E / s", "状态"],
+    );
+    const boundaryRows = g.rows.filter(
+      (r) =>
+        r.phase === "measured" && (r.init_send_to_rgb || r.client_observation),
+    );
+    $("boundaries-section").hidden = !boundaryRows.length;
+    $("client-boundaries").innerHTML = cellTable(
+      boundaryRows.map((r) => [
+        "第 " + (r.index + 1) + " 次" + (r.success ? "" : " · 失败"),
+        fmt(r.init_send_to_rgb?.ttff_seconds),
+        fmt(r.init_send_to_rgb?.e2e_seconds),
+        fmt(r.init_send_to_rgb?.fps),
+        fmt(r.client_observation?.elapsed_seconds),
+        fmt(r.client_observation?.completion_overhead_seconds),
+        r.delivery_complete == null
+          ? "未记录"
+          : r.delivery_complete
+            ? "完整"
+            : "不完整",
+      ]),
+      [
+        "请求",
+        "发送起点 TTFF / s",
+        "发送起点 E2E / s",
+        "发送起点 FPS",
+        "客户端结束或失败 / s",
+        "末批后结束开销 / s",
+        "RGB 接收",
+      ],
     );
     const gaps = g.formal.map((r) => r.metrics.icl_seconds),
       upper = Math.max(0.1, ...gaps.map((v) => v?.max).filter(Number.isFinite)),
@@ -723,4 +752,469 @@
       refresh();
     },
   };
+})();
+
+// Full-depth live-chain comparison, sharing the offline dataset selector.
+const FullChainReport = (() => {
+  const esc = (v) =>
+    String(v ?? "").replace(
+      /[&<>"']/g,
+      (c) =>
+        ({
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;",
+        })[c],
+    );
+  const f = (v, n = 2) => (Number.isFinite(v) ? v.toFixed(n) : "缺测");
+  const distribution = (values) => {
+    const a = values.filter(Number.isFinite).sort((x, y) => x - y),
+      n = a.length;
+    return n
+      ? {
+          n,
+          median: n % 2 ? a[n >> 1] : (a[n / 2 - 1] + a[n / 2]) / 2,
+          min: a[0],
+          max: a[n - 1],
+        }
+      : null;
+  };
+  const colors = ["#287866", "#436db0", "#b16c35"];
+  const stageColors = ["#8b65b5", "#d69c36", "#459da4", "#436db0", "#c96c58"];
+  function componentPie(target) {
+    const parts = target.parts.map((p, i) => ({
+      name: p.name,
+      ms: p.value?.median ?? 0,
+      color: stageColors[i],
+    }));
+    const total = parts.reduce((sum, p) => sum + p.ms, 0);
+    if (!total) return '<p class="muted">此场景未运行，暂无阶段占比。</p>';
+    let angle = -Math.PI / 2;
+    const wedges = parts
+      .map((p) => {
+        if (!p.ms) return "";
+        const fraction = p.ms / total,
+          end = angle + fraction * 2 * Math.PI;
+        const startX = 160 + 140 * Math.cos(angle),
+          startY = 160 + 140 * Math.sin(angle);
+        const endX = 160 + 140 * Math.cos(end),
+          endY = 160 + 140 * Math.sin(end);
+        const title = esc(
+          `${p.name} · ${f(fraction * 100, 1)}% · ${f(p.ms / 1000, 3)} s`,
+        );
+        let shape =
+          fraction >= 1
+            ? `<circle cx="160" cy="160" r="140" fill="${p.color}"><title>${title}</title></circle>`
+            : `<path d="M160 160 L${startX} ${startY} A140 140 0 ${fraction > 0.5 ? 1 : 0} 1 ${endX} ${endY} Z" fill="${p.color}" stroke="var(--bg)" stroke-width="1.5"><title>${title}</title></path>`;
+        if (fraction >= 0.06) {
+          const middle = (angle + end) / 2;
+          shape += `<text x="${160 + 95 * Math.cos(middle)}" y="${160 + 95 * Math.sin(middle)}" text-anchor="middle" dominant-baseline="middle" style="fill:white;font-size:17px;font-weight:650">${f(fraction * 100, 1)}%</text>`;
+        }
+        angle = end;
+        return shape;
+      })
+      .join("");
+    return `<figure class="component-pie" style="margin:12px 0 24px"><svg viewBox="0 0 320 320" role="img" aria-label="${esc(target.name)}各阶段累计CUDA耗时占比" style="max-width:360px;margin:0 auto">${wedges}</svg><figcaption>${parts.map((p) => `<div style="display:flex;align-items:center;gap:8px;margin:5px 0;font-size:14px"><i style="width:12px;height:12px;flex-shrink:0;background:${p.color}"></i><span style="flex:1">${esc(p.name)}</span><strong>${f((p.ms / total) * 100, 1)}%</strong><span style="min-width:68px;text-align:right">${f(p.ms / 1000, 3)} s</span></div>`).join("")}</figcaption></figure>`;
+  }
+  function figureData(data) {
+    return data.targets.map((t) => ({
+      name: t.name,
+      phase: t.phase_summary,
+      operator: t.operator_profile
+        ? {
+            categories: t.operator_profile.categories,
+            total_kernel_ms: t.operator_profile.total_kernel_ms,
+            kernel_count: t.operator_profile.kernel_count,
+          }
+        : null,
+    }));
+  }
+  function validate(data) {
+    const fail = (message) => {
+      throw Error("Invalid full-chain result: " + message);
+    };
+    const number = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
+    const close = (a, b) =>
+      Math.abs(a - b) <= 1e-8 * Math.max(1, Math.abs(a), Math.abs(b));
+    if (!Array.isArray(data.targets) || !data.targets.length)
+      fail("no targets");
+    for (const t of data.targets) {
+      if (
+        typeof t.name !== "string" ||
+        !Array.isArray(t.cases) ||
+        !t.cases.length
+      )
+        fail("missing target cases");
+      for (const c of t.cases) {
+        if (!Array.isArray(c.requests) || !c.requests.length)
+          fail("no measured requests");
+        for (const r of c.requests) {
+          const m = r.metrics;
+          if (
+            !Number.isInteger(r.frames) ||
+            r.frames <= 0 ||
+            !m ||
+            !["ttff_seconds", "e2e_seconds", "fps"].every((k) =>
+              number(m[k]),
+            ) ||
+            m.ttff_seconds <= 0 ||
+            m.e2e_seconds < m.ttff_seconds ||
+            !close(m.fps, r.frames / m.e2e_seconds)
+          )
+            fail("inconsistent client metrics");
+          if (m.first_batch_frames != null) {
+            if (
+              !Number.isInteger(m.first_batch_frames) ||
+              m.first_batch_frames < 1 ||
+              m.first_batch_frames > r.frames
+            )
+              fail("invalid first batch frame count");
+            m.post_ttff_fps =
+              m.e2e_seconds > m.ttff_seconds
+                ? (r.frames - m.first_batch_frames) /
+                  (m.e2e_seconds - m.ttff_seconds)
+                : null;
+          } else m.post_ttff_fps = null;
+          if (
+            !number(r.qwen_cuda_ms) ||
+            !Array.isArray(r.stage_cuda_ms) ||
+            r.stage_cuda_ms.some((s) => !number(s.ms))
+          )
+            fail("missing component timing");
+          for (const rank of [0, 1])
+            for (const stage of ["Conditioning", "Encoder", "DiT", "Decoder"])
+              if (
+                !r.stage_cuda_ms.some(
+                  (s) =>
+                    s.rank === rank &&
+                    s.stage === stage &&
+                    s.worker_role !== "dedicated_source_encoder",
+                )
+              )
+                fail("missing main-worker stage");
+          if (
+            !r.stage_cuda_ms.some(
+              (s) =>
+                s.stage === "Encoder" &&
+                s.worker_role === "dedicated_source_encoder",
+            )
+          )
+            fail("missing source encoder");
+          if (!Array.isArray(r.phase)) fail("missing phase availability");
+          if (r.phase.length) {
+            if (r.phase.length !== 2) fail("incomplete cycle");
+            for (const [i, p] of r.phase.entries()) {
+              if (
+                p.chunk !== 9 + i ||
+                p.latents !== [3, 2][i] ||
+                !number(p.chunk_cuda_ms) ||
+                !Array.isArray(p.calls) ||
+                p.calls.length !== 6
+              )
+                fail("invalid phase chunk");
+              for (const [j, call] of p.calls.entries())
+                if (
+                  call.phase !==
+                    [
+                      "source",
+                      "denoise",
+                      "denoise",
+                      "denoise",
+                      "denoise",
+                      "clean_commit",
+                    ][j] ||
+                  !number(call.cuda_ms) ||
+                  (j > 0 && j < 5 && call.step !== j - 1)
+                )
+                  fail("incomplete phase calls");
+            }
+          }
+        }
+        c.client = Object.fromEntries(
+          ["ttff_seconds", "e2e_seconds", "fps", "post_ttff_fps"].map((k) => [
+            k,
+            distribution(c.requests.map((r) => r.metrics[k])),
+          ]),
+        );
+      }
+      const requests = t.cases.find((c) => c.label === "5s")?.requests ?? [];
+      const measured = requests.filter((r) => r.phase.length);
+      if (measured.length && measured.length !== requests.length)
+        fail("partial phase repetitions");
+      t.phase_summary = measured.length
+        ? {
+            "3_latent": distribution(
+              measured.map((r) => r.phase[0].chunk_cuda_ms),
+            ),
+            "2_latent": distribution(
+              measured.map((r) => r.phase[1].chunk_cuda_ms),
+            ),
+            "3_plus_2": distribution(
+              measured.map(
+                (r) => r.phase[0].chunk_cuda_ms + r.phase[1].chunk_cuda_ms,
+              ),
+            ),
+            parts: Object.fromEntries(
+              [3, 2].map((n, i) => [
+                String(n),
+                Object.fromEntries(
+                  [
+                    "source",
+                    "denoise0",
+                    "denoise1",
+                    "denoise2",
+                    "denoise3",
+                    "clean_commit",
+                  ].map((k, j) => [
+                    k,
+                    distribution(
+                      measured.map((r) => r.phase[i].calls[j].cuda_ms),
+                    ),
+                  ]),
+                ),
+              ]),
+            ),
+          }
+        : null;
+      const p = t.operator_profile;
+      if (p) {
+        const categories = ["GEMM", "Attention", "KV/RoPE", "Other"];
+        if (
+          !p.categories ||
+          categories.some(
+            (k) =>
+              !p.categories[k] ||
+              !number(p.categories[k].cuda_ms) ||
+              !Number.isInteger(p.categories[k].kernels) ||
+              p.categories[k].kernels < 0,
+          ) ||
+          !number(p.total_kernel_ms) ||
+          p.total_kernel_ms <= 0 ||
+          !Number.isInteger(p.kernel_count) ||
+          p.kernel_count <= 0
+        )
+          fail("invalid operator costs");
+        if (
+          !close(
+            categories.reduce((s, k) => s + p.categories[k].cuda_ms, 0),
+            p.total_kernel_ms,
+          ) ||
+          categories.reduce((s, k) => s + p.categories[k].kernels, 0) !==
+            p.kernel_count
+        )
+          fail("operator costs do not conserve total");
+        if (
+          !["attributed_time_fraction", "attributed_kernel_fraction"].every(
+            (k) => number(p[k]) && p[k] >= 0.95 && p[k] <= 1,
+          )
+        )
+          fail("insufficient kernel attribution");
+      }
+    }
+    // Published images are bound to their numeric inputs. Recomputed or edited
+    // inputs remain viewable in live tables/bars without stale static figures.
+    if (
+      data.figures &&
+      JSON.stringify(data.figure_data) !== JSON.stringify(figureData(data))
+    )
+      delete data.figures;
+  }
+  function bars(rows, value, unit) {
+    const max = Math.max(1, ...rows.map((r) => value(r)?.max ?? 0));
+    return rows
+      .map((r, i) => {
+        const v = value(r);
+        return `<div class="bar-row"><div class="bar-label"><b>${esc(r.name)}</b><span>${v ? `${f(v.median)} ${unit} · ${f(v.min)}–${f(v.max)} · n=${v.n}` : "此项暂无数据"}</span></div><div class="track"><div class="bar" style="width:${v ? (v.median / max) * 100 : 0}%;background:${colors[i % 3]}"></div></div></div>`;
+      })
+      .join("");
+  }
+  function render(data) {
+    validate(data);
+    document.getElementById("report-title").textContent =
+      "全 50 层实测：客户端与分阶段耗时";
+    document.getElementById("identity").textContent =
+      "ISSUE 334 · 真实输入 → Condition / Encoder → DiT → Decoder → RGB";
+    document.getElementById("input-description").textContent =
+      "同一原始视频与参考图，在线 Qwen 条件编码；SP2 DiT + 第三张卡运行 Qwen / Source Encoder。正式请求串行测量，旧结果仍可在上方切换。";
+    const root = document.getElementById("phase-view");
+    const labels = [
+      ...new Set(data.targets.flatMap((t) => t.cases.map((c) => c.label))),
+    ];
+    root.innerHTML = `<div class="controls"><label>输入场景<select id="full-case">${labels.map((c) => `<option>${esc(c)}</option>`).join("")}</select></label></div><div id="full-content"></div>`;
+    function update() {
+      const label = document.getElementById("full-case").value;
+      const rows = data.targets.map((t) => ({
+        ...t,
+        selected: t.cases.find((c) => c.label === label),
+      }));
+      const measured = rows.filter((t) => t.selected);
+      const best = Math.min(
+        ...measured.map((t) => t.selected.client.e2e_seconds.median),
+      );
+      const components = ["Conditioning", "Encoder", "DiT", "Decoder"];
+      let html = `<div class="metrics">${rows.map((t, i) => `<article><small>${esc(t.name)}</small><strong>${f(t.selected?.client.e2e_seconds.median)} s</strong><span>客户端 E2E${t.selected ? ` · ${f(t.selected.client.e2e_seconds.median / best)}× 最快耗时` : ""}</span></article>`).join("")}</div><section><h2>首帧与完整输出</h2><p class="muted">FPS =（总输出帧数 − 首批帧数）/（末批到达时间 − 首批到达时间），不含 TTFF；仅一批输出时不计算。</p><div class="grid"><div><h3>TTFF / 秒</h3>${bars(rows, (r) => r.selected?.client.ttff_seconds, "s")}</div><div><h3>客户端 E2E / 秒</h3>${bars(rows, (r) => r.selected?.client.e2e_seconds, "s")}</div></div><div class="table-wrap"><table><thead><tr><th>实际硬件</th><th>输出帧</th><th>TTFF 中位数</th><th>E2E 中位数 [min, max]</th><th>FPS · TTFF 后</th><th>init-send → RGB E2E</th></tr></thead><tbody>${rows
+        .map((t) => {
+          const c = t.selected,
+            s = c?.client.e2e_seconds;
+          return `<tr><td>${esc(t.name)}</td><td>${c ? c.requests[0].frames : "未运行"}</td><td>${f(c?.client.ttff_seconds.median)} s</td><td>${s ? `${f(s.median)} [${f(s.min)}, ${f(s.max)}] s` : "未运行"}</td><td>${f(c?.client.post_ttff_fps?.median)}</td><td>${f(c ? distribution(c.requests.map((r) => r.init_send_to_rgb?.e2e_seconds))?.median : null)} s</td></tr>`;
+        })
+        .join(
+          "",
+        )}</tbody></table></div><p class="tiny muted">客户端从建立连接 / 启动解码前计时，到最后 RGB batch；init-send 起点另列，便于对照旧链路。同机回环 WebSocket；不含用户显示设备延迟。</p></section>`;
+      const componentDefinitions = [
+        ["Condition · Qwen", (r) => r.qwen_cuda_ms],
+        [
+          "Reference VAE",
+          (r) =>
+            r.stage_cuda_ms
+              .filter(
+                (s) =>
+                  s.rank === 0 &&
+                  s.stage === "Encoder" &&
+                  s.worker_role !== "dedicated_source_encoder",
+              )
+              .reduce((a, s) => a + s.ms, 0),
+        ],
+        [
+          "Source Encoder",
+          (r) =>
+            r.stage_cuda_ms
+              .filter(
+                (s) =>
+                  s.rank === 0 &&
+                  s.stage === "Encoder" &&
+                  s.worker_role === "dedicated_source_encoder",
+              )
+              .reduce((a, s) => a + s.ms, 0),
+        ],
+        [
+          "DiT",
+          (r) =>
+            r.stage_cuda_ms
+              .filter((s) => s.rank === 0 && s.stage === "DiT")
+              .reduce((a, s) => a + s.ms, 0),
+        ],
+        [
+          "Decoder",
+          (r) =>
+            r.stage_cuda_ms
+              .filter((s) => s.rank === 0 && s.stage === "Decoder")
+              .reduce((a, s) => a + s.ms, 0),
+        ],
+      ];
+      const componentRows = rows.map((t) => ({
+        ...t,
+        parts: componentDefinitions.map(([name, value]) => ({
+          name,
+          value: distribution((t.selected?.requests ?? []).map(value)),
+        })),
+      }));
+      const componentMax = Math.max(
+        1,
+        ...componentRows.flatMap((t) => t.parts.map((p) => p.value?.max ?? 0)),
+      );
+      html += `<section><h2>全链路：时间花在哪里？</h2><p class="muted">每张卡的占比按下列五项累计 CUDA 耗时的中位数之和计算。</p><div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(280px,1fr))">${componentRows.map((t) => `<div><h3>${esc(t.name)}</h3>${componentPie(t)}${t.parts.map((p, j) => `<div class="bar-row"><div class="bar-label"><span>${p.name}</span><span>${f(p.value?.median / 1000, 3)} s</span></div><div class="track"><div class="bar" style="width:${((p.value?.median ?? 0) / componentMax) * 100}%;background:${stageColors[j]}"></div></div></div>`).join("")}</div>`).join("")}</div><p class="tiny muted">Qwen 为真实在线调用；Reference VAE / DiT / Decoder 展示 rank 0，Source Encoder 在第三张卡。每项是单次请求内调用的累计 CUDA 时间，再取三次请求中位数；饼图表示所列组件的累计耗时构成，跨卡并行阶段不能相加当成 E2E。</p><details><summary>查看 Conditioning 外层与各 rank 的逐组件累计值</summary><div class="table-wrap"><table><thead><tr><th>硬件</th><th>组件 / worker</th><th>rank</th><th>累计 CUDA stream 时间 / s</th></tr></thead><tbody>${rows
+        .flatMap((t) => {
+          const rs = t.selected?.requests ?? [];
+          const keys = new Map(
+            rs
+              .flatMap((r) => r.stage_cuda_ms)
+              .map((s) => [
+                JSON.stringify([s.worker_role, s.rank, s.stage, s.component]),
+                s,
+              ]),
+          );
+          return [...keys].map(([key, s]) => {
+            const v = distribution(
+              rs
+                .map(
+                  (r) =>
+                    r.stage_cuda_ms.find(
+                      (x) =>
+                        JSON.stringify([
+                          x.worker_role,
+                          x.rank,
+                          x.stage,
+                          x.component,
+                        ]) === key,
+                    )?.ms,
+                )
+                .filter(Number.isFinite),
+            );
+            return `<tr><td>${esc(t.name)}</td><td>${esc(s.stage)} / ${esc(s.component || s.worker_role)}</td><td>${s.rank}</td><td>${f(v?.median / 1000, 3)}</td></tr>`;
+          });
+        })
+        .join(
+          "",
+        )}</tbody></table></div><p>Conditioning 外层包括 Qwen RPC、参考图处理等准备工作；CUDA stream 区间中也可能有 CPU 等待。上方 Qwen 单列为服务端实际 GPU 调用。</p></details></section>`;
+      if (label === "5s" && rows.some((t) => t.phase_summary)) {
+        html += `<section><h2>稳定 3+2 cycle：分卡耗时对比</h2><p>取每次正式请求的 chunk 9（3 latent）与 chunk 10（2 latent），展示三次请求的中位数与 min/max。</p><div class="grid">${[
+          ["3_latent", "3 latent"],
+          ["2_latent", "2 latent"],
+          ["3_plus_2", "3+2 cycle"],
+        ]
+          .map(
+            ([key, title]) =>
+              `<div><h3>${title}</h3>${bars(rows, (r) => r.phase_summary?.[key], "ms")}</div>`,
+          )
+          .join(
+            "",
+          )}</div>${data.figures?.cycle ? `<figure><img style="width:100%" src="${esc(data.figures.cycle)}" alt="三卡3 latent、2 latent和3+2 cycle CUDA耗时及min/max"></figure>` : ""}<p class="tiny muted">Rank 0 的独立 step CUDA stream 区间；cycle 为两个区间之和，两个 chunk 之间的 Decoder 不计入该 cycle。客户端 E2E 在上方单独展示。</p></section>`;
+        html += `<section><h2>Phase 分项：Source、四步 Denoise、Clean commit</h2>${data.figures?.phases ? `<figure><img style="width:100%" src="${esc(data.figures.phases)}" alt="3与2 latent的六个调用独立CUDA耗时"></figure>` : ""}<div class="table-wrap"><table><thead><tr><th>硬件</th><th>latent</th>${["source", "denoise0", "denoise1", "denoise2", "denoise3", "clean_commit"].map((k) => `<th>${k} / ms</th>`).join("")}</tr></thead><tbody>${rows.flatMap((t) => [3, 2].map((n) => `<tr><td>${esc(t.name)}</td><td>${n}</td>${["source", "denoise0", "denoise1", "denoise2", "denoise3", "clean_commit"].map((k) => `<td>${f(t.phase_summary?.parts[n]?.[k]?.median)}</td>`).join("")}</tr>`)).join("")}</tbody></table></div></section>`;
+        html += `<section><h2>算子构成与绝对成本</h2><p><strong>已有 profile：${
+          rows
+            .filter((t) => t.operator_profile)
+            .map((t) => esc(t.name))
+            .join("、") || "暂无"
+        }</strong>${
+          rows.some((t) => !t.operator_profile)
+            ? `；${rows
+                .filter((t) => !t.operator_profile)
+                .map((t) => esc(t.name))
+                .join("、")} 的算子 profile 待补测。`
+            : ""
+        }</p>${data.figures?.operators ? `<figure><img style="width:100%" src="${esc(data.figures.operators)}" alt="每卡GEMM Attention KV/RoPE Other饼图及绝对毫秒对比"></figure>` : ""}<div class="table-wrap"><table><thead><tr><th>算子类别</th>${rows.map((t) => `<th>${esc(t.name)}</th>`).join("")}</tr></thead><tbody>${[
+          "GEMM",
+          "Attention",
+          "KV/RoPE",
+          "Other",
+        ]
+          .map(
+            (k) =>
+              `<tr><td>${k}</td>${rows
+                .map((t) => {
+                  const p = t.operator_profile,
+                    v = p?.categories[k]?.cuda_ms;
+                  return `<td>${f(v)} ms${p ? ` · ${f((v / p.total_kernel_ms) * 100, 1)}%` : ""}</td>`;
+                })
+                .join("")}</tr>`,
+          )
+          .join(
+            "",
+          )}</tbody></table></div><p class="tiny muted">Rank 0 的一次独立诊断，区间覆盖 chunk 9、10 及中间 Decoder。类别按 kernel launch 关联互斥归属；绝对值是 kernel-work ms，饼图不是端到端墙钟占比；第三卡 Qwen / Encoder 见上方完整链路表。</p></section>`;
+      }
+      if (label === "5s" && !rows.some((t) => t.phase_summary))
+        html += `<section><h2>Phase 与算子计时</h2><p>生产 step 路由的计时补测已通过预检，等待当前长视频采样完成后执行。客户端与完整链路数据已先展示，分项结果回收后在本页补齐。</p></section>`;
+      html += `<details><summary>实验配置、缺测项与原始证据</summary><p>全50层 BF16，SP2，window6 / sink3，4步 denoise，clean commit，joint_forward=off；在线 Qwen、原始 reference/source VAE、Lynn Decoder；未使用预制 conditioning。每场景1次预热、3次正式请求；profile 单独运行，不计入正式时延。</p><p>${esc(data.notes ?? "")}</p><pre style="white-space:pre-wrap">${esc(
+        JSON.stringify(
+          data.targets.map((t) => ({
+            name: t.name,
+            status: t.status,
+            evidence_root: t.evidence_root,
+            phase_present: !!t.phase_summary,
+            profile_present: !!t.operator_profile,
+            offline_operator_validation: t.offline_operator_validation,
+          })),
+          null,
+          2,
+        ),
+      )}</pre></details>`;
+      document.getElementById("full-content").innerHTML = html;
+    }
+    document.getElementById("full-case").onchange = update;
+    update();
+  }
+  return { validate, render };
 })();
