@@ -581,41 +581,6 @@ def test_joint_preserves_checkpoint_condition_timesteps_and_five_modalities(
     torch.testing.assert_close(outputs[1], outputs[0], atol=0.008, rtol=0.008)
 
 
-@pytest.mark.parametrize(
-    "lengths,history,heads,cc,eligible",
-    [
-        ((780, 1760, 780), 20000, 28, (10, 3), True),
-        ((780, 1760, 780), 0, 28, (10, 3), False),
-        ((780, 780, 780), 20000, 28, (10, 3), False),
-        ((780, 1760, 780), 60000, 28, (10, 3), False),
-        ((780, 1760, 780), 20000, 56, (10, 3), False),
-        ((780, 1760, 780), 20000, 28, (9, 0), False),
-    ],
-)
-def test_joint_kernel_auto_uses_only_measured_geometry(
-    lengths, history, heads, cc, eligible
-):
-    from sglang.multimodal_gen.runtime.models.dits.zing_h3_joint_attention import (
-        eligible_geometry,
-    )
-
-    assert eligible_geometry(lengths, history, heads, 128, cc) is eligible
-
-
-def test_joint_kernel_explicit_separate_and_cpu_fallback(monkeypatch):
-    from sglang.multimodal_gen.runtime.models.dits.zing_h3_joint_attention import (
-        fused_joint_attention,
-    )
-
-    q = torch.zeros(4, 28, 128, dtype=torch.bfloat16)
-    for mode in ("auto", "separate"):
-        monkeypatch.setenv("SGLANG_ZING_JOINT_ATTENTION", mode)
-        assert fused_joint_attention(q, q, q, (2, 4), 128**-0.5, "fa4") is None
-    monkeypatch.setenv("SGLANG_ZING_JOINT_ATTENTION", "typo")
-    with pytest.raises(ValueError, match="auto or separate"):
-        fused_joint_attention(q, q, q, (2, 4), 128**-0.5, "fa4")
-
-
 @pytest.fixture
 def four_head_model(model):
     from dataclasses import replace

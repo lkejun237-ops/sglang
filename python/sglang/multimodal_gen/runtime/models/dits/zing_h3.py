@@ -534,13 +534,6 @@ def _fixed_fa4_attention(q, k, v, scale, metadata, *, optimized):
 
 def _joint_attention(q, k, v, ends, scale, backend, metadata):
     """Block-bidirectional branch attention; no token-level causal mask."""
-    from sglang.multimodal_gen.runtime.models.dits.zing_h3_joint_attention import (
-        fused_joint_attention,
-    )
-
-    fused = fused_joint_attention(q, k, v, ends, scale, backend)
-    if fused is not None:
-        return fused
     history_rows = k.shape[0] - ends[-1]
     result, start = [], 0
     for stop in ends:

@@ -51,6 +51,18 @@ L20Z/L20X/L20D 标识，不把它们改写成已核验的商业 SKU。CUDA 可�
 [PR #369](https://github.com/seedleap/sglang/pull/369) 提供低显存 launcher，但目前仍为 Draft，
 launcher/head 尚无真实 GPU 验收，不能作为已合入的一键部署命令。
 
+旧的通用 joint attention 融合 dispatcher/kernel 已移除；`source_first` /
+`cross_chunk` 联合执行保留。fixed KV 路径继续逐分支调用 FA4，本次清理未修改
+其 attention、Graph 或 KV 生命周期。旧的 `SGLANG_ZING_JOINT_ATTENTION`
+环境变量不再控制执行路径，部署时应移除。此次未重跑 480/736 GPU 性能与显存
+对照，表中历史结果保留原源码和配置边界。
+
+2026-10-22 / `45f9fd53ba`：上海 H100（L20Z / SM90），BF16、SP2 local 28 heads、
+D128；按正式 ledger 的 832×480 / 1280×736 启动两分支和稳定三分支 shape，
+四组 fixed attention 组件对照及 Graph replay 通过，删除前后最大误差为 0。
+测试提取原实现的 attention 分支循环并调用真实 FA4，使用随机 QKV；不包含全模型、
+SP 通信、RGB 或 E2E 性能验收。[范围与原始结果](https://github.com/seedleap/sglang/pull/389)。
+
 ## Qwen 媒体预处理
 
 Qwen 使用按角色归一化后的媒体：reference 图片/视频分别沿用

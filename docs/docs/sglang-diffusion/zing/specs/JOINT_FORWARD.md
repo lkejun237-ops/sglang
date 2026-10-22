@@ -401,15 +401,17 @@ reference/target overlap 未取得联合验收结论，不应配置启用本开�
 推理优化，生产默认变更需要单独决策与目标延迟标准。
 
 
-## 2026-10-09 attention 默认选择与评审问答
+## Attention 执行路径
 
-`SGLANG_ZING_JOINT_ATTENTION=auto|separate`，缺省 `auto`。`auto` 在 SM103、
-BF16、D128、28 heads、历史 12246–55426 和已验证离线分支长度家族内，使用
-FA4/CuTe 分段 mask + full/partial/empty 跳块；其余保留逐分支 FA4。未知架构、
-在线形状、短历史或可选 sparse 接口缺失均不强行融合。`separate` 用于 A/B 或回滚。
-新 runtime 直接接入已测 kernel，不再需要实验 sitecustomize；最多缓存 64 组元数据，
-按 CUDA stream 隔离，捕获期间不创建特化。kernel 执行失败直接上报，不吞掉 CUDA 错误。
-当前在线 `(390,390)/(780,780)/(780,780,780)` 尚无专用融合 GPU 证据，不能称其最优。
+`source_first` / `cross_chunk` 继续联合执行主干，FA4 后端按分支分别调用
+FA4，SDPA 后端同样按分支执行，并保持各分支的历史可见范围。fixed KV 路径保留设备端
+有效 KV 长度、Graph 和缓存生命周期语义。
+
+旧的 FA4/CuTe joint attention 融合 dispatcher、专用 kernel 和
+`SGLANG_ZING_JOINT_ATTENTION` 开关已移除。此前 #230 的有条件融合仅覆盖
+通用 attention 路径，不覆盖当前 fixed KV 路径；本次清理不取消 joint forward，
+也不改变 `zing_joint_forward` 的调度与回退规则。上文专用 kernel 实验仍是原版本
+的历史证据，不代表当前执行路径或性能。
 
 保留分支 timestep 并不意味着三者始终不同：clean final/source 为 1，step0 使用
 checkpoint 的采样时间，四步网格首项归一化后也可能为 1。必须按各自语义传值，
