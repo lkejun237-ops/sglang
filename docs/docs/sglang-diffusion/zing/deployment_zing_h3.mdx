@@ -16,14 +16,48 @@ Qwen 是独立进程，可与一张 Encoder 共卡。所有方案都是**单活�
 
 | 目标硬件 / 实际设备 | 部署选择 | 已有显存观察（每卡） | 验证状态与选择依据 |
 | --- | --- | --- | --- |
-| H100 目标 / 上海 L20Z，SM90，81,559 MiB（79.65 GiB） | 480 档优先复现 E1 + SP2 低显存组合：remote Qwen、weights-free AdaLN、Lynn、W6/sink3、四步、prompt prefix=5；无 KV pool、无 Graph | DiT driver 采样峰值普通生成 74.52 GiB、一次早期 prompt 切换 74.66 GiB；Qwen/E1 卡约 61 GiB | **历史组合通过 832×480、720 帧**；736、连续/晚期切换与新 launcher/head 未验证。余量小，不据此增加输入或缓存容量。[证据 A](#证据入口) |
-| H200 目标 / 上海 L20X，SM90，143,771 MiB（140.40 GiB，driver） | 控制卡数时从 E2 + SP2 开始；先按目标质量固定窗口和步数，再决定是否采用 Graph 实验配方 | 旧 W6 四步 eager：DiT 进程 lifetime peak allocated 最大约 109.56 GiB；最新 W5、先四步后一步 Graph：测速后 DiT 整卡驻留约 120.12 / 120.02 GiB；Encoder+Qwen 63.22 GiB、另一 Encoder 10.49 GiB | 两档 832×480 / 1280×736 都有实测。**最新值是驻留快照，运行峰值未测**；W5/单步改变生成语义，视觉质量未验收。Graph 使用运行时补丁，不能当作主线默认。[证据 B](#证据入口) |
+| H100 目标 / 上海 L20Z，SM90，81,559 MiB（79.65 GiB） | 480 档优先复现 E1 + SP2 低显存组合：remote Qwen、weights-free AdaLN、Lynn、W6/sink3、四步、prompt prefix=5；无 KV pool、无 Graph | DiT driver 采样峰值普通生成 74.52 GiB、一次早期 prompt 切换 74.66 GiB；Qwen/E1 卡约 61 GiB | **历史完整服务组合通过 832×480、720 帧**；完整服务的 736、连续/晚期切换与新 launcher/head 未验证。[证据 A](#证据入口)。另有 PR #356 的 **480/736 Decoder 组件验证通过**，见下节；不能据此增加完整服务输入或缓存容量。 |
+| H200 目标 / 上海 L20X，SM90，143,771 MiB（140.40 GiB，driver） | 控制卡数时从 E2 + SP2 开始；先按目标质量固定窗口和步数，再决定是否采用 Graph 实验配方 | 旧 W6 四步 eager：DiT 进程 lifetime peak allocated 最大约 109.56 GiB；最新 W5、先四步后一步 Graph：测速后 DiT 整卡驻留约 120.12 / 120.02 GiB；Encoder+Qwen 63.22 GiB、另一 Encoder 10.49 GiB | 两档 832×480 / 1280×736 都有实测。**最新值是驻留快照，运行峰值未测**；W5/单步改变生成语义，视觉质量未验收。Graph 使用运行时补丁，不能当作主线默认。[证据 B](#证据入口)。另有 PR #356 的 **480/736 Decoder 组件验证通过**，见下节。 |
 | 同一 H200 目标 | E2 + SP4 用于比较四步吞吐或分摊 DiT 显存，须使用已冻结的实验补丁 | W6 四步：Graph lifetime peak allocated 最大 74.50 GiB（480）、75.72 GiB（736）；reserved 最大 80.69 / 81.32 GiB | 480 的 Graph 吞吐比同条件 eager 高约 21–23%；736 未见收益。**整段 RGB 不等价、画质未验收**。当前主线 weights-free 仍只准入 SP1/SP2，SP4 属实验方案。[证据 C](#证据入口) |
 | B300 目标 / 泰国 L20D，CUDA CC10.3，274,113 MiB（267.69 GiB，CUDA 可见） | 优先用 E1 + SP2、remote Qwen、weights-free AdaLN、Lynn；固定需要的窗口和 prefix 容量，再比较 E2 + SP2 / Graph | 最近固定五 latent 重建验证：W6、四步、832×480/120 帧，source 路径 allocated 峰值 90.940 / 91.016 GiB；普通 block 路径 95.230 GiB/rank | **该版本与对应短请求通过数值及生命周期检查**；source 有真实 Graph replay，普通 block 在 after_step0 下走 eager。不能把此显存数外推到 736 或长流。商业 B300 SKU 身份未独立确认。[证据 D](#证据入口) |
 
 设备容量以进程内查询为准。云配额中的 H100/H200/B300 是测试目标名，保留实际
 L20Z/L20X/L20D 标识，不把它们改写成已核验的商业 SKU。CUDA 可见容量与 driver 总量
 可能不同，不混作同一读数。单卡余量按角色检查，不能用所有卡总显存判断能否部署。
+
+## H100/H200 Decoder 已验证范围
+
+2026-10-22，[PR #356](https://github.com/seedleap/sglang/pull/356) 的生产源码
+`c3cc5714eb25` 已在 H100/H200 目标上通过 **完整 26 层 Lynn Decoder 的 SP2/TP1、
+BF16 组件验证**；对照 baseline 为 `f74dde991573`。这是该 PR 的验证证据，
+不表示当前 main 已包含该融合实现或通过相同验收。
+
+| 目标 / 实际设备 | 实际尺寸 | baseline → 融合 Decoder RGB FPS | 逐组配对增幅中位数 |
+| --- | --- | ---: | ---: |
+| H100 / L20Z，CC9.0、132 SM | 832×480 | 114.21 → 161.18 | +40.93% |
+| 同上 | 1312×736 | 54.31 → 74.84 | +37.83% |
+| H200 / L20X，CC9.0、132 SM | 832×480 | 118.92 → 166.88 | +40.33% |
+| 同上 | 1312×736 | 56.81 → 78.60 | +38.35% |
+
+两类设备各通过 20 项 GPU 测试和真实启动预编译的 18 组合；每档各 3 个独立双 rank
+进程组、每组 3 轮配对。所有 15 个真实 latent 的输出均 finite、与 baseline 逐位相等；
+组件级 EOS、取消、断连、注入 rank0 故障清理及下一 stream 检查通过。
+两臂固定同一镜像、`step-00002000.pt` 的 EMA 权重、输入、预热与计时，均为 Decoder
+回放；FPS 按 latent5–14 的 34 帧除以逐步较慢 rank wall time 总和计算，先取组内、再取
+组间中位数。配对增幅逐组计算，与汇总 FPS 的直接比值可有差异。
+
+**本轮 736 实际为 1312×736，与上方完整服务的 1280×736 分开统计。** 736 的冻结
+latent 来自历史 10 层 DiT 诊断，Decoder 本身仍为完整 26 层。上述结果不验收完整
+50 层 DiT 的生成准确性、默认 offline-AdaLN、完整服务 Graph 回滚/单活跃会话释放复用，
+也不提供 TTFF、E2E、Encoder/DiT 阶段或组件常驻/峰值显存结论；这些仍待补测。
+时延分位数、原始记录、精确源码和计时边界见[证据 F](#证据入口)。
+
+同一批冻结 latent 已在 H200 上导出 baseline、融合版和并排视频，每档 51 帧、24 FPS，
+不循环补帧；转为 RGB8 和编码 MP4 前的浮点输出逐位相等，最大绝对差和 RMSE 均为 0。
+视频用于观察 Decoder 改动的一致性，导出过程不重新运行 DiT，也不计入上表 FPS。
+736 诊断输入解码后为噪声，两版一致，仅作数值对照，不作为正常画质样例。
+同一 H200 作业另通过 3 项真实 CUDA Graph 组件测试，覆盖 eager/replay 逐位比较、
+写区间恢复与历史保持、失败后的调用者 stream 恢复；这些组件检查不扩大为完整服务验收。
 
 ## 配置时先检查什么
 
@@ -154,6 +188,7 @@ OSS/CPFS 地址是内部证据位置，需已有权限，不是公开下载链�
 | C | 2026-10-21，`d37f82078411` + SP4 AdaLN 准入 + PR #356 运行时补丁，step2500、W6/sink3、prefix=15360、单 slot；作业 `dlckxssgbktxu8mx` | `oss://leap-world-shanghai/world-model/sglang/deploy/sh-h200-20261021/r18/`；`ready-r18.tar.gz` 与 `results/`。实验中设置 `NCCL_GRAPH_REGISTER=0` 后通信回放门槛通过；不泛化为所有环境必设 |
 | D | 2026-10-21，`f0e2d8bfd0e8`，step2500、SP2、W6/sink3、四步；作业 `dlct60zyjq9hf282` | [PR #373 完整结论](https://github.com/seedleap/sglang/pull/373)；`/cpfs/world-model/sglang/evals/issue312-fixed-five-gpu-20261021-r3` |
 | E | 2026-10-19，`3ffda81b9454`，step2500、832×480、720 帧、六图、W6、先四步后两步 `[1000,750]`；作业 `dlcklgwejjsl7xvw` | `oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/zing-quantum-ab-20261019-r2/` |
+| F | 2026-10-22，PR #356 生产源码 `c3cc5714eb25` 对 baseline `f74dde991573`；H100/H200，完整 26 层 Lynn、SP2/TP1、BF16、window3；独立 Decoder 回放 | [PR #356 的 H100/H200 验证与限制](https://github.com/seedleap/sglang/pull/356)；`oss://leap-world-shanghai/world-model/sglang/evals/pr356-hopper-20261022-r1/` 下 `h100-verified/`、`h200-post-verified/` 与各自 `READY`/control 归档；对比视频与 Graph 组件测试另见同一 `evals/` 下 `pr356-decoder-videos-20261022-r1/` 的 `VIDEO_REPORT.json`、`media/` 和 `gpu/` |
 
 ## 后续 PR 如何维护
 
