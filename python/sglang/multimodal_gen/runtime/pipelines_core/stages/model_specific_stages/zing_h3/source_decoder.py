@@ -8,6 +8,42 @@ from sglang.multimodal_gen.runtime.realtime.zing_contracts import PixelRange
 from .streaming_codecs import DecodedVideoSlice
 
 
+def check_latent_append(
+    *,
+    latent,
+    latent_start,
+    source_dependency_end,
+    valid_frame_end,
+    accepted_latents,
+    valid_frame_end_so_far,
+    protocol,
+    capacity_latents,
+    buffered_latents,
+):
+    """Validate one append against the decoder boundary contract; return the new count."""
+    if latent_start != accepted_latents:
+        raise ValueError("Video latents must be contiguous")
+    if latent.ndim != 5 or latent.shape[1] != 24 or latent.shape[2] < 1:
+        raise ValueError("Lynn expects nonempty N24THW latents")
+    if type(source_dependency_end) is not int or source_dependency_end < 0:
+        raise ValueError("Source dependency must be a nonnegative pixel watermark")
+    if valid_frame_end_so_far < protocol.frame_count(accepted_latents):
+        raise ValueError("Decoder cannot append after a partial final latent")
+    count = accepted_latents + latent.shape[2]
+    if (
+        type(valid_frame_end) is not int
+        or not protocol.frame_count(count - 1)
+        < valid_frame_end
+        <= protocol.frame_count(count)
+        or valid_frame_end <= valid_frame_end_so_far
+        or valid_frame_end > source_dependency_end
+    ):
+        raise ValueError("Invalid valid output frame boundary")
+    if buffered_latents + latent.shape[2] > capacity_latents:
+        raise ValueError("Decoder latent capacity exceeded")
+    return count
+
+
 class SourceLynnDecoder:
     """Bounded source provenance around a session-owned Lynn stream.
 
@@ -47,26 +83,17 @@ class SourceLynnDecoder:
     def append(self, latent, *, latent_start, source_dependency_end, valid_frame_end):
         if self.closed or self.total_frames is not None:
             raise ValueError("Decoder stream is closed")
-        if latent_start != self.accepted_latents:
-            raise ValueError("Video latents must be contiguous")
-        if latent.ndim != 5 or latent.shape[1] != 24 or latent.shape[2] < 1:
-            raise ValueError("Lynn expects nonempty N24THW latents")
-        if type(source_dependency_end) is not int or source_dependency_end < 0:
-            raise ValueError("Source dependency must be a nonnegative pixel watermark")
-        if self.valid_frame_end < self.protocol.frame_count(self.accepted_latents):
-            raise ValueError("Decoder cannot append after a partial final latent")
-        count = self.accepted_latents + latent.shape[2]
-        if (
-            type(valid_frame_end) is not int
-            or not self.protocol.frame_count(count - 1)
-            < valid_frame_end
-            <= self.protocol.frame_count(count)
-            or valid_frame_end <= self.valid_frame_end
-            or valid_frame_end > source_dependency_end
-        ):
-            raise ValueError("Invalid valid output frame boundary")
-        if self.buffered_latents + latent.shape[2] > self.capacity_latents:
-            raise ValueError("Decoder latent capacity exceeded")
+        count = check_latent_append(
+            latent=latent,
+            latent_start=latent_start,
+            source_dependency_end=source_dependency_end,
+            valid_frame_end=valid_frame_end,
+            accepted_latents=self.accepted_latents,
+            valid_frame_end_so_far=self.valid_frame_end,
+            protocol=self.protocol,
+            capacity_latents=self.capacity_latents,
+            buffered_latents=self.buffered_latents,
+        )
         self.pending = (
             latent.detach().clone()
             if self.pending is None

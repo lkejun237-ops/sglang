@@ -120,7 +120,7 @@ class AsyncRawRGBFrameMaterializer:
         try:
             # Preserve the existing truncating conversion and B/C/T/H/W -> B/T/H/W/C.
             with torch.profiler.record_function("Zing.output.rgb24"):
-                device_frames, batch_num_frames = _stage_rgb24_segments(segments)
+                device_frames, batch_num_frames = stage_rgb24_segments(segments)
             shape = tuple(int(dim) for dim in device_frames.shape)
             _batch_size, _num_frames, height, width, channels = shape
             num_bytes = device_frames.numel() * device_frames.element_size()
@@ -566,7 +566,7 @@ def _tensor_sample_to_rgb24_array(sample: torch.Tensor) -> np.ndarray:
     return _tensor_batch_to_rgb24_tensor(sample.unsqueeze(0))[0].cpu().numpy()
 
 
-def _stage_rgb24_segments(segments: Sequence[torch.Tensor]):
+def stage_rgb24_segments(segments: Sequence[torch.Tensor]):
     """Keep source provenance batches after one bounded uint8 D2H staging copy."""
     first = segments[0]
     num_bytes = sum(

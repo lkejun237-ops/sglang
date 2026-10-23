@@ -49,9 +49,13 @@ jobs:
         run: lscpu
       - name: Prepare media tooling
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes ffmpeg
-          ffmpeg -version
+          # imageio-ffmpeg is pinned in requirements-cpu.txt and ships a static
+          # ffmpeg; apt-get update is the slow path on these runners.
+          ffmpeg_bin="$(python -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')"
+          mkdir -p "$RUNNER_TEMP/bin"
+          ln -sf "$ffmpeg_bin" "$RUNNER_TEMP/bin/ffmpeg"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/ffmpeg" -version | head -1
       - name: Execute approved CPU contracts with receipt and timeout checks
         run: python scripts/ci/zing/run_cpu_tests.py --manifest scripts/ci/zing/cpu_test_manifest.json --suite "$CPU_SUITE" --trials 2 --shard-index "$SHARD_INDEX" --shard-count "$SHARD_COUNT" --output-dir artifacts/cpu-suite
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

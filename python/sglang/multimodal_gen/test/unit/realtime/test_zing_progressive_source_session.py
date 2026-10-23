@@ -693,3 +693,87 @@ def test_joint_ready_worker_batches_without_crossing_command_boundary(
             sampler.sampler.last_run_metrics["joint_fallbacks"]["ready_queue_capacity"]
             > 0
         )
+
+
+class SyntheticRemoteDecoder(SyntheticDecoder):
+    """Publishes pixels elsewhere; the DiT only receives one reference."""
+
+    def __init__(self, ledger):
+        super().__init__(ledger)
+        self.accepted_frames = self.emitted_frames = 0
+        self.pops = 0
+        self.dispatch = None
+
+    def bind_dispatch(self, **identity):
+        self.dispatch = identity
+
+    def append(self, latent, **kwargs):
+        super().append(latent, **kwargs)
+        self.accepted_frames = kwargs["valid_frame_end"]
+        self.ready = True
+
+    def finish(self, *, total_frames):
+        self.total = total_frames
+
+    def pop(self):
+        self.pops += 1
+        self.ready = False
+        start, end = self.emitted_frames, self.accepted_frames
+        self.emitted_frames = end
+        return NS(
+            start=start,
+            end=end,
+            values=None,
+            frames=end - start,
+            reference={"frames": end - start} if end > start else None,
+            transport_metadata={"format": "rgb24"},
+            provenance=self.ledger.provenance_for(PixelRange(start, end), end),
+        )
+
+
+@pytest.mark.parametrize("final", [False, True])
+@pytest.mark.parametrize("first_dispatch", [False, True])
+def test_remote_decoder_returns_one_reference_per_dispatch(
+    final, first_dispatch, monkeypatch
+):
+    """The first and later dispatches bind identity after decoder initialization."""
+    state, stage = session(ChunkPlan(1))
+    ledger = state.ledger
+    decoder = state.decoder = SyntheticRemoteDecoder(ledger)
+    state.remote_decoder = True
+    request = batch(state, 0, 17, 0, final=final)
+    request.realtime_generation_id = "generation"
+    if first_dispatch:
+        state.ledger = state.decoder = None
+        state.remote_decoder = False
+        request.extra["zing_source_command"]["config"] = dict(
+            limits=dict(
+                batch_frames=17,
+                message_bytes=4096,
+                pending_frames=68,
+                pending_bytes=4096,
+                metadata_batches=136,
+            )
+        )
+
+        def initialize(*args):
+            state.ledger, state.decoder = ledger, decoder
+            state.remote_decoder = True
+            state.qwen_init_host_ms = None
+
+        monkeypatch.setattr(state, "initialize", initialize)
+    result = state.run(stage, request)
+    assert result.usage["zing_source_complete"] is final
+
+    assert len(decoder.appends) > 1
+    assert decoder.pops == 1
+    assert decoder.dispatch == dict(
+        request_id="synthetic", chunk_index=0, generation_id="generation"
+    )
+    assert result.output is None
+    assert result.raw_frame_shared_memory_ref == {"frames": decoder.emitted_frames}
+    assert sum(x["num_frames"] for x in result.usage["zing_realtime_blocks"]) == (
+        decoder.emitted_frames
+    )
+    if not final:
+        state.dispose()

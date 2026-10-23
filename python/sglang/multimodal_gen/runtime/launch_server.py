@@ -15,6 +15,13 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import ShutdownReq
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
 from sglang.multimodal_gen.runtime.managers.gpu_worker import run_scheduler_process
+from sglang.multimodal_gen.runtime.managers.zing_source_decoder import (
+    assign_dit_visible_devices,
+    resolve_role_devices,
+)
+from sglang.multimodal_gen.runtime.managers.zing_source_decoder import (
+    start as start_source_decoder,
+)
 from sglang.multimodal_gen.runtime.realtime.source_transport import (
     SourceTransportBudget,
 )
@@ -141,6 +148,20 @@ def _launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         # Reject incompatible transport dependencies before loading GPU workers.
         SourceTransportBudget.from_args(server_args).websocket_options()
     configure_logger(server_args)
+
+    # Translate both role lists from one snapshot of the caller's devices before
+    # narrowing this process, so the decoder and DiT never depend on order.
+    if server_args.zing_decoder_gpus:
+        dit_devices, decoder_devices = resolve_role_devices(
+            server_args, caller=os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        )
+        assign_dit_visible_devices(server_args, dit_devices)
+    else:
+        decoder_devices = None
+
+    # The decoder owns its own GPUs and must be healthy before the DiT ranks
+    # accept sessions; readiness failure aborts the launch.
+    start_source_decoder(server_args, decoder_devices)
 
     # Start a new server with multiple worker processes
     logger.info("Starting server...")

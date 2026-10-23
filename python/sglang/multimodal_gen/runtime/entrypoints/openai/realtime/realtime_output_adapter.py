@@ -547,6 +547,20 @@ class RawRGBRealtimeOutputAdapter:
         chunk_index = chunk_index_start
         metadata = frame_metadata or {}
         stats = empty_frame_send_stats(content_type)
+        if (
+            source_blocks is not None
+            and len(frame_batches) == 1
+            and len(source_blocks) > 1
+        ):
+            # Only a dedicated decoder publishes one RGB batch for several blocks.
+            frames, offset = frame_batches[0], 0
+            frame_batches = []
+            for source_block in source_blocks:
+                count = source_block["provenance"].pixels.count
+                frame_batches.append(frames[offset : offset + count])
+                offset += count
+            if offset != len(frames):
+                raise ValueError("Source output metadata does not match frame count")
         if source_blocks is not None and len(source_blocks) != len(frame_batches):
             raise ValueError("Source output metadata does not match frame batches")
         if (

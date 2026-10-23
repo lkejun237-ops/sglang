@@ -50,6 +50,7 @@ def configured(tmp_path, monkeypatch):
     )
     args = SimpleNamespace(
         model_path=str(tmp_path),
+        zing_source_decoder_port=None,
         pipeline_config=SimpleNamespace(
             vae_config=SimpleNamespace(
                 arch_config=SimpleNamespace(
@@ -882,6 +883,64 @@ def test_source_provenance_survives_transport_splitting(output_format):
         )
         cursor = end
     assert cursor == stats["num_frames"] == 17
+
+
+def test_one_decoded_batch_is_split_across_its_source_blocks():
+    """A dedicated decoder returns one RGB batch per dispatch; every source block
+    must still reach the client as its own ordered frame batch."""
+    whole = Provenance(
+        PixelRange(0, 17), (SourceSpan(1, 0, 0, 10), SourceSpan(2, 10, 10, 7)), 34
+    )
+    blocks = [
+        dict(
+            block_idx=7 + index,
+            request_id="origin",
+            event_id=91,
+            provenance=whole.slice(PixelRange(start, end)),
+        )
+        for index, (start, end) in enumerate(((0, 10), (10, 17)))
+    ]
+    sent = []
+
+    class Socket:
+        async def send_bytes(self, payload):
+            sent.append(payload)
+
+    frames = [bytes([index]) * (2 * 2 * 3) for index in range(17)]
+
+    stats = asyncio.run(
+        RawRGBRealtimeOutputAdapter()._send_frame_batches(
+            Socket(),
+            [frames],
+            content_type="application/x-raw-rgb",
+            chunk_index_start=0,
+            request_id="dispatch",
+            output_format="raw",
+            frame_metadata={
+                "format": "rgb24",
+                "width": 2,
+                "height": 2,
+                "channels": 3,
+                "bytes_per_frame": 2 * 2 * 3,
+            },
+            source_blocks=blocks,
+            source_fps=24,
+        )
+    )
+
+    headers = []
+    wires = iter(sent)
+    for wire in wires:
+        header = msgspec.msgpack.decode(wire)
+        payload = (
+            next(wires) if header["type"] == "frame_batch_header" else header["payload"]
+        )
+        headers.append((header, payload))
+    assert [header["chunk_index"] for header, _ in headers] == [7, 8]
+    assert [header["output_frame_start"] for header, _ in headers] == [0, 10]
+    assert [header["num_frames"] for header, _ in headers] == [10, 7]
+    assert b"".join(payload for _, payload in headers) == b"".join(frames)
+    assert stats["num_frames"] == 17
 
 
 def test_reference_only_init_preserves_ids_and_dispatches_bytes_once(

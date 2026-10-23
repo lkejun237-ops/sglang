@@ -205,6 +205,7 @@ class TestConditioningRPCInputPreflight(CustomTestCase):
             model_path=self.directory.name,
             pipeline_config=ZingH3CausalPipelineConfig(),
             zing_conditioning_mode="remote",
+            zing_source_decoder_port=None,
         )
         self.args_patch = patch.object(
             zing, "get_global_server_args", return_value=self.args

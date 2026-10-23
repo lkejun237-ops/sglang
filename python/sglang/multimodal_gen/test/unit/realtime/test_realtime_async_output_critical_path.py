@@ -45,6 +45,14 @@ def test_critical_path_observer_failure_cancels_unconsumed_async_output(
             return None
 
         @staticmethod
+        async def prepare_conditioning(_session, _server_args):
+            return None
+
+        @staticmethod
+        def session_ready_message(_session):
+            return None
+
+        @staticmethod
         def prepare_next_request(_session, _server_args, chunk):
             return SimpleNamespace(
                 block_idx=chunk.index,

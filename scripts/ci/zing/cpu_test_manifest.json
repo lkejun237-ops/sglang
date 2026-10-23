@@ -7797,6 +7797,128 @@
         "candidate_fingerprint": "6a469b99488d8a2cc7f43fce3d31be306037e0285b9fa73cdea91ca66a7b9f43",
         "checkout_note": "Synthetic local Git snapshot of the frozen base archive; candidate overlays are identified by SOURCE.json and the receipt fingerprint."
       }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_h3_remote_decoder.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two fixed-environment DSW CPU trials on main 91da72b1af passed all 10 dedicated-decoder contracts as part of the composed 115-file Zing regression (5199 passed, 0 failed, 169 reviewed CUDA-only skips). The earlier pre-fix run failed only the successful-operation acknowledgement contract. GPU and distributed execution remain unverified.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "9302de28338cafd487272a7f9e3dc480f60e4fef503b40fb49959133340fdb32",
+        "worker_sha256": "480f8d1380bc03af6907244c46b4ad32266538cebfdcd0573be635f300186639",
+        "receipt": "/cpfs/world-model/sglang/decoder-split/20261022-cpu-main91da72b1af/runs/final-round-2.json",
+        "receipt_sha256": "53c1bdb178f02ca3b4b9a25dd3b85f7d67dd5e3cb1882f0b99ee7bf26d378eda",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 10,
+            "collected": 10,
+            "skipped": 0,
+            "duration_seconds": 20.903,
+            "exit_code": 0,
+            "log_path": "/cpfs/world-model/sglang/decoder-split/20261022-cpu-main91da72b1af/runs/isolated-round-1/logs/dit-pipeline-contracts__python__sglang__multimodal_gen__test__unit__test_zing_h3_remote_decoder.log",
+            "junit_path": "/cpfs/world-model/sglang/decoder-split/20261022-cpu-main91da72b1af/runs/isolated-round-1/junit/dit-pipeline-contracts__python__sglang__multimodal_gen__test__unit__test_zing_h3_remote_decoder.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 10,
+            "collected": 10,
+            "skipped": 0,
+            "duration_seconds": 24.387,
+            "exit_code": 0,
+            "log_path": "/cpfs/world-model/sglang/decoder-split/20261022-cpu-main91da72b1af/runs/ordinary-round-2/logs/dit-pipeline-contracts__python__sglang__multimodal_gen__test__unit__test_zing_h3_remote_decoder.log",
+            "junit_path": "/cpfs/world-model/sglang/decoder-split/20261022-cpu-main91da72b1af/runs/ordinary-round-2/junit/dit-pipeline-contracts__python__sglang__multimodal_gen__test__unit__test_zing_h3_remote_decoder.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.12",
+          "torch": "2.8.0+cpu",
+          "extra_pythonpath": [
+            "/root/py311-extra",
+            "/root/py311-av"
+          ]
+        },
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          }
+        }
+      }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/realtime/test_zing_source_decoder_launcher.py",
+      "suite": "realtime-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two DSW CPU trials on the dedicated-decoder branch passed 906/906 across the six affected Zing files (this file 8/8 each round). Pins the single-controller contract: device split, port publication, readiness failure aborting the launch, and cleanup.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "87285bd8bccef1e72c93722d7bd9e7e8a83656402ad6f4d061cd5860ae03fb94",
+        "receipt": "/cpfs/world-model/sglang/decoder-split/20261022-cpu-launcher/evidence/receipt.json",
+        "receipt_sha256": "097dd51668cdf5c0fea3746856d1b4617c203021c6ea3a75d7ee1ca433dcd6b0",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 8,
+            "collected": 8,
+            "skipped": 0,
+            "duration_seconds": 0.023,
+            "exit_code": 0,
+            "log_path": "/cpfs/world-model/sglang/decoder-split/20261022-cpu-launcher/evidence/round1.log",
+            "junit_path": "/cpfs/world-model/sglang/decoder-split/20261022-cpu-launcher/evidence/round1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 8,
+            "collected": 8,
+            "skipped": 0,
+            "duration_seconds": 0.022,
+            "exit_code": 0,
+            "log_path": "/cpfs/world-model/sglang/decoder-split/20261022-cpu-launcher/evidence/round2.log",
+            "junit_path": "/cpfs/world-model/sglang/decoder-split/20261022-cpu-launcher/evidence/round2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.12",
+          "torch": "2.8.0+cpu",
+          "extra_pythonpath": [
+            "tree/python",
+            "/root/py311-extra",
+            "/root/py311-av"
+          ]
+        },
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          }
+        }
+      }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_gpu_roles.py",
+      "suite": "realtime-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Explicit Zing GPU role parsing and layout checks for --zing-dit-gpus/--zing-decoder-gpus; 8 DSW CPU cases passed.",
+      "dependencies": []
     }
   ],
   "recipes": {

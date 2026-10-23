@@ -51,6 +51,13 @@ from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from .zing_reference_upload import prepare_reference_upload
 
 
+def _with_source_decoder_policy(profile, port):
+    """Overlay the launcher-assigned decoder port on the attested export."""
+    if port is None:
+        return profile
+    return {**profile, "source_decoder": {"remote": {"port": port}}}
+
+
 def _source_sampling_schedule(args, profile):
     """Freeze a whole deployment plan, with explicit CLI settings taking precedence."""
     profile_has_initial = "initial_block_count" in profile
@@ -186,6 +193,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         profile = json.loads(
             (Path(args.model_path) / "zing_realtime_profile.json").read_text()
         )
+        profile = _with_source_decoder_policy(profile, args.zing_source_decoder_port)
         # require raises ContractError explicitly and is unaffected by python -O.
         require(
             runtime.get("causal") is True
@@ -825,6 +833,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             appends=appends,
             end=end,
             encoder=self.source_encoder,
+            decoder=self.profile.get("source_decoder"),
             first_source_received_unix_ns=self.first_source_received_unix_ns,
             source_preview=True,
             source_preview_sha256=self.source_preview_sha256,

@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.utils.zing_stage_timing import (
 )
 
 from .incremental import SourceReadySession
+from .remote_decoder import create_decoder
 from .source_bridge import SourceChunk, SourceChunkBridge
 from .source_encoder import create_source_buffer
 from .streaming_noise import STREAMING_NOISE_VERSION
@@ -49,6 +50,8 @@ class ZingSourceStreamState(BaseRealtimeState):
         self.closed = False
         self.component_capture = None
         self.kv_lease = None
+        self.pending_output = None
+        self.remote_decoder = False
         self.work_quantum = source_work_quantum()
         self.end_received = self.bridge_finished = False
         self.dispatch_steps = 0
@@ -164,12 +167,21 @@ class ZingSourceStreamState(BaseRealtimeState):
             initial_prompt_event_id=batch.realtime_event_id,
             initial_prompt_version=getattr(batch, "realtime_prompt_version", None),
         )
-        self.decoder = stage.codecs.decoder.source_decoder(
+        capture_dir = os.environ.get("SGLANG_ZING_COMPONENT_CAPTURE_DIR")
+        decoder_policy = batch.extra["zing_source_command"].get("decoder")
+        if capture_dir and decoder_policy and "remote" in decoder_policy:
+            raise ValueError("Component capture requires the local decoder")
+        self.decoder = create_decoder(
             stage.codecs,
+            policy=decoder_policy,
             capacity_latents=2 * tokens + max_chunk + tokens,
             provenance_for=self.ledger.provenance_for,
+            session_id=batch.realtime_session_id,
         )
-        capture_dir = os.environ.get("SGLANG_ZING_COMPONENT_CAPTURE_DIR")
+        self.remote_decoder = bool(decoder_policy and "remote" in decoder_policy)
+        self.policy["video_decoder_role"] = (
+            "dedicated" if self.remote_decoder else "dit"
+        )
         if capture_dir and (
             not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
         ):
@@ -304,6 +316,7 @@ class ZingSourceStreamState(BaseRealtimeState):
         timings, outputs, metadata = {}, [], []
         self.progress = []  # Per-dispatch, bounded by input/bridge capacities.
         self.dispatch_steps = 0
+        self.pending_output = None
 
         @contextmanager
         def timed(name):
@@ -325,6 +338,12 @@ class ZingSourceStreamState(BaseRealtimeState):
                     self.initialize(stage, batch, config, trace)
                 if self.qwen_init_host_ms is not None:
                     timings["qwen_init_host_ms"] = self.qwen_init_host_ms
+            if self.remote_decoder:
+                self.decoder.bind_dispatch(
+                    request_id=batch.request_id,
+                    chunk_index=batch.block_idx,
+                    generation_id=batch.realtime_generation_id,
+                )
             notice = None
             applied = getattr(self.sampler, "applied_prompt", None)
             if applied is not None and applied.inputs is not None:
@@ -483,6 +502,10 @@ class ZingSourceStreamState(BaseRealtimeState):
                 self.pixels.ready or self._bridge_ready() or self._pending_chunks()
             )
             self.command_index += 1
+            if self.remote_decoder and not completed:
+                # One reference per dispatch: the decoder host publishes while
+                # the DiT proceeds to its next dispatch. EOS already drained.
+                self._decode_ready(stage, outputs, metadata, timed, trace)
             usage = {
                 "zing_realtime_blocks": metadata,
                 "zing_source_consumed_end": self.bridge.accepted_pixels,
@@ -561,7 +584,25 @@ class ZingSourceStreamState(BaseRealtimeState):
                 main_process_only=False,
                 local_main_process_only=False,
             )
-            if outputs:
+            if self.pending_output is not None:
+                output = self.pending_output
+                if output.reference is not None:
+                    batch.sampling_params.num_frames = output.frames
+                    result = OutputBatch(
+                        raw_frame_shared_memory_ref=output.reference,
+                        raw_frame_metadata=output.transport_metadata,
+                        metrics=batch.metrics,
+                        usage=usage,
+                        conditioning_notice=notice,
+                    )
+                else:
+                    result = OutputBatch(
+                        raw_frame_batches=[],
+                        metrics=batch.metrics,
+                        usage=usage,
+                        conditioning_notice=notice,
+                    )
+            elif outputs:
                 batch.sampling_params.num_frames = sum(x.shape[1] for x in outputs)
                 result = OutputBatch(
                     output=outputs,
@@ -699,7 +740,8 @@ class ZingSourceStreamState(BaseRealtimeState):
                 source_dependency_end=result.provenance.source_dependency_end,
                 valid_frame_end=result.provenance.pixels.end,
             )
-            self._decode_ready(stage, outputs, metadata, timed, trace)
+            if not self.remote_decoder:
+                self._decode_ready(stage, outputs, metadata, timed, trace)
 
     def _generate_joint_ready(
         self, stage, batch, outputs, metadata, timed, trace=None, *, flush=True
@@ -833,7 +875,8 @@ class ZingSourceStreamState(BaseRealtimeState):
                         source_dependency_end=result.provenance.source_dependency_end,
                         valid_frame_end=result.provenance.pixels.end,
                     )
-                    self._decode_ready(stage, outputs, metadata, timed, trace)
+                    if not self.remote_decoder:
+                        self._decode_ready(stage, outputs, metadata, timed, trace)
 
     def _decode_ready(self, stage, outputs, metadata, timed, trace=None, *, eos=False):
         while self.decoder.ready:
@@ -844,6 +887,8 @@ class ZingSourceStreamState(BaseRealtimeState):
                     input_ids=[f"{self.session_id}:generated-latent:0:{latent_end}"],
                     input_latent_range=[0, latent_end],
                 )
+            if self.remote_decoder:
+                span_fields["decoder_role"] = "dedicated"
             with stage_span(
                 trace,
                 "Decoder",
@@ -852,7 +897,11 @@ class ZingSourceStreamState(BaseRealtimeState):
             ) as span:
                 with (
                     timed("decoder_host_ms"),
-                    stage._use(stage.codecs.video_decoder_name, "decode"),
+                    (
+                        nullcontext()
+                        if self.remote_decoder
+                        else stage._use(stage.codecs.video_decoder_name, "decode")
+                    ),
                     maybe_record_function("Zing.source_decode"),
                 ):
                     with maybe_record_function(
@@ -869,7 +918,11 @@ class ZingSourceStreamState(BaseRealtimeState):
                 )
             else:
                 handoff(span, output_ids=[], no_output=True)
-            if self.component_capture is not None:
+            if decoded.values is None:
+                # The decoder host publishes the pixels; only the reference
+                # and the per-block metadata cross back to the DiT.
+                self.pending_output = decoded
+            elif self.component_capture is not None:
                 self.component_capture.append_frames(
                     "decoder", decoded.values[0], decoded.start
                 )
@@ -880,11 +933,12 @@ class ZingSourceStreamState(BaseRealtimeState):
                 if end <= start:
                     raise ValueError("Output control provenance is not continuous")
                 pixels = PixelRange(start, end)
-                outputs.append(
-                    decoded.values[
-                        0, :, start - decoded.start : end - decoded.start
-                    ].contiguous()
-                )
+                if decoded.values is not None:
+                    outputs.append(
+                        decoded.values[
+                            0, :, start - decoded.start : end - decoded.start
+                        ].contiguous()
+                    )
                 metadata.append(
                     {**block, **decoded.provenance.slice(pixels).metadata()}
                 )

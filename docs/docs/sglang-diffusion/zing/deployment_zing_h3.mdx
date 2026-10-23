@@ -25,6 +25,51 @@ Qwen 是独立进程，可与一张 Encoder 共卡。所有方案都是**单活�
 L20Z/L20X/L20D 标识，不把它们改写成已核验的商业 SKU。CUDA 可见容量与 driver 总量
 可能不同，不混作同一读数。单卡余量按角色检查，不能用所有卡总显存判断能否部署。
 
+### Decoder 拆分（实验布局，未合入默认）
+
+把 Lynn source decoder 放到独立 GPU 进程后，DiT 只收共享内存引用，不再解码也不再
+持有像素。2026-10-21/22 在泰国 L20D（CC10.3，274,113 MiB）实测，E1 + SP2、
+Qwen 仍在 DiT 进程内、resident AdaLN、W6/sink3、queue2、Graph、720 帧技术负载
+（120 帧真实 source 重复六次）、客户端整帧 RGB：
+
+| 布局 | 832×480 稳态 / 全程 FPS | 1280×736 稳态 / 全程 FPS | DiT 每 rank allocated |
+| --- | --- | --- | --- |
+| E1 + SP2（Lynn 在 DiT 卡） | 20.42 / 19.33 | 8.97 / 8.73 | 178.1 / 197.8 GiB |
+| E1 + SP2 + D1 | 25.92 / 23.78 | 11.46 / 10.99 | 172.2 / 188.3 GiB |
+| E1 + SP2 + D2 | 26.25 / 24.00 | 11.69 / 11.22 | 172.2 / 188.3 GiB |
+
+D2 相对 D1 只有 +1.3% / +2.0%，落在跨运行方差量级内；收益主要来自把 Lynn 移出
+DiT 卡（稳态 +28.5% / +30.4%）。TTFF 增加 0.20–0.33 s，来自 decoder 服务握手。
+E1 的 Encoder 走 `unvalidated_group_size` 复制回退，不等同于已验证的 E2 分组。
+D1 的下一次 latent 传输不等待前一个 decode job，但共享内存 publisher 容量耗尽时仍有背压。
+D2 为避免 tile collective 与 bridge transfer 交叠，下一次 append 在接收 latent 前等待
+上一 decode job 完成，因此会阻塞 DiT 的同步发送。该 worker 等待受 `--timeout-seconds`
+限制（默认 120 秒），不代表端到端延迟上界；尚未采集 D2 的独立背压耗时。
+2026-10-22 在 `e1170da2e3` 上做了三布局 × 两档 × 每次 120 帧、每格两次会话的 smoke：
+全部完成，SIGTERM 后 decoder 不残留，decoder 进程落在预期卡上（D1 一张、D2 两张）。
+同一布局两次会话逐位一致；但三种布局**彼此不是同一画面**，480p 相对本地解码平均绝对差
+2.59–2.74/255（PSNR 33.3–33.9 dB，SSIM 0.941–0.945），720p 为 2.00–2.23
+（PSNR 34.1–35.3 dB，SSIM 0.962–0.967），无时间偏移、差异随帧序缓慢增长；
+D1 与 D2 之间同样是 2.30/255 量级。差异来源尚未定位，不能把该布局当作与本地解码
+逐位等价。未验证：L20X/L20Z、组件级 stage timing、差异根因、当前 mainline 上的确认运行。
+上海 L20X（140.40 GiB）要套用该布局，需先把 Qwen 移到独立进程并使用 weights-free
+AdaLN，否则 DiT 峰值超出单卡容量。证据：`/cpfs/world-model/sglang/decoder-split/20261021-gpu-r6`
+、`20261022-gpu-d2-th` 与 `20261022-gpu-smoke-ec4230cc7d`。
+
+角色边界：部署方用 `--zing-dit-gpus` 与 `--zing-decoder-gpus` 显式指定每个角色的物理卡，
+两者都是调用方 `CUDA_VISIBLE_DEVICES` 中的**序号**（不是 `nvidia-smi` 编号），例如：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 sglang serve --model-path MODEL_PATH \
+  --num-gpus 2 --sp-degree 2 \
+  --zing-dit-gpus 0,1 --zing-decoder-gpus 2
+```
+
+launcher 只做翻译与校验，不替用户分配：DiT 卡数必须等于 `--num-gpus`，两个角色不得共用同一张卡，
+并且 decoder 只能在单节点上使用。Decoder 不配置时保持与 DiT 同卡。编码、解码能力及各自的进程入口彼此独立；
+会话协议不假设“一个角色一个进程”。共用 GPU 不等于合并进程，只有显式配置才会合并。
+把 Encoder、DiT、Decoder 统一交给 `launch_pool_disagg_server()` 声明与调度是后续 TODO，本版尚未接入。
+
 ## H100/H200 Decoder 已验证范围
 
 2026-10-22，[PR #356](https://github.com/seedleap/sglang/pull/356) 的生产源码

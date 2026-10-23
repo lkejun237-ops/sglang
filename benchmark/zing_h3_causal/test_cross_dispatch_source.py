@@ -255,7 +255,7 @@ def test_dispose_clears_retention_when_prefetch_is_ahead_of_dispatch():
 def test_segmented_staging_preserves_quantization_and_provenance_boundaries():
     path = ROOT / "utils/realtime_video.py"
     tree = ast.parse(path.read_text())
-    names = {"_stage_rgb24_segments", "_tensor_batch_to_rgb24_tensor"}
+    names = {"stage_rgb24_segments", "_tensor_batch_to_rgb24_tensor"}
     nodes = [
         node
         for node in tree.body
@@ -267,7 +267,7 @@ def test_segmented_staging_preserves_quantization_and_provenance_boundaries():
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
     first = torch.tensor([-0.1, 0.5, 1.1]).reshape(1, 3, 1, 1, 1)
     second = torch.tensor([0.25, 0.75, 1.0, 0.0, 0.1, 0.9]).reshape(1, 3, 2, 1, 1)
-    pixels, counts = namespace["_stage_rgb24_segments"]([first, second])
+    pixels, counts = namespace["stage_rgb24_segments"]([first, second])
     assert counts == [1, 2]
     expected = torch.cat(
         [
@@ -281,7 +281,7 @@ def test_segmented_staging_preserves_quantization_and_provenance_boundaries():
     # Reject byte overflow before conversion/allocation, even with virtual tensors.
     enormous = torch.empty(1, 3, 1000, 1024, 1024, device="meta")
     with pytest.raises(ValueError, match="capacity"):
-        namespace["_stage_rgb24_segments"]([enormous])
+        namespace["stage_rgb24_segments"]([enormous])
 
 
 def test_new_chunk_plan_splits_only_initial_three_latents():
