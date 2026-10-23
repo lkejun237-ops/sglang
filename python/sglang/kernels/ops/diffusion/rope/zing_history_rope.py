@@ -13,6 +13,7 @@ def _history_rope_kernel(
     X,
     C,
     OUT,
+    LIVE,
     N: tl.constexpr,
     H: tl.constexpr,
     D: tl.constexpr,
@@ -20,10 +21,17 @@ def _history_rope_kernel(
     S: tl.constexpr,
     HS: tl.constexpr,
     B: tl.constexpr,
+    HAS_LIVE: tl.constexpr,
 ):
+    if HAS_LIVE:
+        live = tl.load(LIVE)
+        if tl.program_id(0) * B >= live * H * D:
+            return
     i = tl.program_id(0) * B + tl.arange(0, B)
     valid = i < N * H * D
     row = i // (H * D)
+    if HAS_LIVE:
+        valid = valid & (row < live)
     head = (i // D) % H
     d = i % D
     raw = tl.load(X + row * S + head * HS + d, valid, 0)
@@ -43,7 +51,10 @@ def _history_rope_kernel(
 
 @register_custom_op(mutates_args=["out"])
 def fused_zing_history_rope(
-    x: torch.Tensor, coefficients: torch.Tensor, out: torch.Tensor
+    x: torch.Tensor,
+    coefficients: torch.Tensor,
+    out: torch.Tensor,
+    live_rows: torch.Tensor | None = None,
 ) -> None:
     rows, heads, dim = x.shape
     with torch.cuda.device(x.device):
@@ -51,6 +62,7 @@ def fused_zing_history_rope(
             x,
             coefficients,
             out,
+            live_rows,
             rows,
             heads,
             dim,
@@ -58,6 +70,7 @@ def fused_zing_history_rope(
             x.stride(0),
             x.stride(1),
             512,
+            live_rows is not None,
             num_warps=4,
             enable_fp_fusion=False,
         )

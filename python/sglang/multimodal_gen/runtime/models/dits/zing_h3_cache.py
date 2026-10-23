@@ -173,6 +173,10 @@ class ZingFixedForwardKVPlan:
             ),
         )
         if self.rotates_history:
+            if os.environ.get("SGLANG_ZING_HISTORY_ROPE_LIVE_ROWS", "1") == "1":
+                tensors["history_live_rows"] = torch.tensor(
+                    [history], dtype=torch.int32, device=device
+                )
             pad_rows = self.capacity - history
             tensors["positions"] = torch.cat(
                 (historical, historical.new_zeros(pad_rows, 3))

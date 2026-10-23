@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU layout regression; this does not validate CUDA kernels or real weights."""
+"""Layout regressions with CPU collectives and optional CUDA packing checks."""
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from threading import Barrier, local
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -21,6 +22,53 @@ from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
     model,
     request,
 )
+
+_USP = "sglang.multimodal_gen.runtime.layers.usp"
+
+
+@pytest.mark.parametrize("lengths", [(5, 3), (3, 0, 5, 2)])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_varlen_destination_major_preserves_tokens_and_aliases_receive(
+    lengths, device, monkeypatch
+):
+    monkeypatch.delenv("SGLANG_ZING_SP_DESTINATION_MAJOR", raising=False)
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    world, heads, dim = len(lengths), 8, 16
+    # Projection slices have a 3*H*D row stride, as in the fixed Zing path.
+    projection = torch.randn(sum(lengths), 3 * heads * dim, device=device)
+    full = tuple(x.reshape(1, -1, heads, dim) for x in projection.chunk(3, -1))
+    shards = [
+        tuple(x.split(lengths, dim=1)[rank] for x in full) for rank in range(world)
+    ]
+    sends, receives = [], []
+    recording = True
+
+    def collective(packed, output_sizes, input_sizes):
+        assert output_sizes == [n * (heads // world) * 3 * dim for n in lengths]
+        if recording:
+            sends.append(packed.flatten().split(input_sizes))
+            return packed.new_empty(sum(output_sizes))
+        return receives.pop(0)
+
+    with (
+        patch(f"{_USP}.get_ulysses_parallel_world_size", return_value=world),
+        patch(f"{_USP}._usp_all_to_all_single_varlen", collective),
+    ):
+        for rank in range(world):
+            with patch(f"{_USP}.get_ulysses_parallel_rank", return_value=rank):
+                zing_h3._exchange_qkv(*(x[0] for x in shards[rank]), list(lengths))
+        receives = [torch.cat([send[rank] for send in sends]) for rank in range(world)]
+        recording = False
+        for rank in range(world):
+            received = receives[0]
+            with patch(f"{_USP}.get_ulysses_parallel_rank", return_value=rank):
+                actual = zing_h3._exchange_qkv(
+                    *(x[0] for x in shards[rank]), list(lengths)
+                )
+            expected = torch.cat([x.chunk(world, dim=2)[rank] for x in full], dim=-1)
+            assert torch.equal(actual, expected)
+            assert actual.data_ptr() == received.data_ptr()
 
 
 class _CPUCollectives:

@@ -64,10 +64,12 @@ from sglang.multimodal_gen.runtime.models.dits.zing_h3_model_signature import (
 )
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_rope import (
     apply_contiguous_history_rope_batch,
+    apply_current_qknorm_rope_kv,
     apply_current_rope,
     apply_current_rope_kv,
     apply_history_rope_batch,
     apply_history_rope_into,
+    use_current_qknorm_rope_kv,
     validated_fixed_480p,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -201,6 +203,9 @@ _GRAPH_LAYOUT_INPUTS = (
 )
 # Kernel routes chosen from the environment at call time, frozen by a capture.
 _GRAPH_ROUTE_ENVS = (
+    "SGLANG_ZING_SP_DESTINATION_MAJOR",
+    "SGLANG_ZING_FUSED_QKNORM_ROPE_KV",
+    "SGLANG_ZING_HISTORY_ROPE_LIVE_ROWS",
     "SGLANG_ZING_FUSED_CURRENT_ROPE",
     "SGLANG_ZING_FUSED_CURRENT_ROPE_KV",
     "SGLANG_ZING_FA4_FIXED",
@@ -367,6 +372,17 @@ def _qk_norm(module, q, k):
 
 def _shares_storage(a, b):
     return a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr()
+
+
+def _exchange_qkv(q, k, v, splits):
+    """Use the same input SP layout in eager and fixed Graph attention."""
+    if os.environ.get("SGLANG_ZING_SP_DESTINATION_MAJOR", "1") == "1":
+        return _usp_input_all_to_all_varlen_qkv(
+            q[None], k[None], v[None], splits, destination_major=True
+        )
+    return _usp_input_all_to_all_varlen_qkv(
+        q[None].contiguous(), k[None].contiguous(), v[None].contiguous(), splits
+    )
 
 
 def _fa4_current_stream(device):
@@ -597,12 +613,7 @@ def _attention(
         q, k = _qk_norm(module, q, k)
     if sequence_splits is not None:
         with maybe_record_function("Zing.Ulysses.input_all_to_all"):
-            qkv = _usp_input_all_to_all_varlen_qkv(
-                q[None].contiguous(),
-                k[None].contiguous(),
-                v[None].contiguous(),
-                sequence_splits,
-            )
+            qkv = _exchange_qkv(q, k, v, sequence_splits)
         q, k, v = qkv.chunk(3, dim=-1)
         # Ulysses converts local sequence/all heads into complete sequence/local
         # heads. Cache that layout directly so every rank owns only its head
@@ -2095,31 +2106,46 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             value.reshape(-1, module.num_heads, module.head_dim)
             for value in qkv.chunk(3, -1)
         )
-        q, k = _qk_norm(module, q, k)
+        fused_norm = use_current_qknorm_rope_kv(module, q, inputs.rope)
+        if not fused_norm:
+            q, k = _qk_norm(module, q, k)
         splits = inputs.layout.sequence_splits
         if splits is not None:
-            exchanged = _usp_input_all_to_all_varlen_qkv(
-                q[None].contiguous(), k[None].contiguous(), v[None].contiguous(), splits
-            )
+            exchanged = _exchange_qkv(q, k, v, splits)
             q, k, v = (value[0] for value in exchanged.chunk(3, dim=-1))
         raw_k, raw_v = k, v
         fixed = options.fixed_kv
         if fixed.rotates_history:
-            # One rotation of the whole fixed-shape raw K serves every forward
-            # sharing this history; rows past the live length are never read.
+            # One rotation serves every forward sharing these history positions.
+            # The optional live length skips unused fixed-capacity rows.
             apply_history_rope_into(
-                fixed.stores[index][0], options.full_rope, fixed.rotated[index]
+                fixed.stores[index][0],
+                options.full_rope,
+                fixed.rotated[index],
+                live_rows=options.fixed_tensors.get("history_live_rows"),
             )
-        fused_q = apply_current_rope_kv(
-            q,
-            raw_k,
-            raw_v,
-            inputs.rope,
-            fixed,
-            index,
-            options.fixed_tensors,
-            default=options.optimized_fixed_480p,
-        )
+        if fused_norm:
+            fused_q = apply_current_qknorm_rope_kv(
+                module,
+                q,
+                raw_k,
+                raw_v,
+                inputs.rope,
+                fixed,
+                index,
+                options.fixed_tensors,
+            )
+        else:
+            fused_q = apply_current_rope_kv(
+                q,
+                raw_k,
+                raw_v,
+                inputs.rope,
+                fixed,
+                index,
+                options.fixed_tensors,
+                default=options.optimized_fixed_480p,
+            )
         if fused_q is None:
             q = apply_current_rope(q, inputs.rope)
             fixed.write_current(

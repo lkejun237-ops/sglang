@@ -19,6 +19,30 @@ from sglang.multimodal_gen.runtime.models.dits.zing_h3_rope import (
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.no_grad()
+def test_history_live_rows_refresh_during_graph_replay(monkeypatch):
+    monkeypatch.setenv("SGLANG_ZING_FUSED_HISTORY_ROPE", "1")
+    x = torch.randn(131, 3, 128, device="cuda", dtype=torch.bfloat16)
+    coefficients = torch.randn(131, 96, device="cuda", dtype=x.dtype)
+    out = torch.full_like(x, 37)
+    live = torch.tensor([17], device="cuda", dtype=torch.int32)
+    apply_history_rope_into(x, coefficients, out, live_rows=live)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        apply_history_rope_into(x, coefficients, out, live_rows=live)
+    # Partial tiles, growth, shrinkage and an empty live history share a graph.
+    for rows in (19, 131, 2, 0, 73):
+        live.fill_(rows)
+        x.add_(0.125)
+        coefficients.add_(0.25)
+        out.fill_(37)
+        graph.replay()
+        expected = _apply_rope(x[:rows], coefficients[:rows])
+        assert torch.equal(out[:rows], expected)
+        assert torch.all(out[rows:] == 37)
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("heads", [6, 12, 24, 14, 28, 56])
 @pytest.mark.parametrize("rows", [1, 17, 390, 832])

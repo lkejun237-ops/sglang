@@ -180,3 +180,79 @@ CPU regressions (PyTorch, NumPy and pytest; no checkpoint or CUDA required):
 ```bash
 python -m pytest -q benchmark/zing_h3_causal/test_profile_tools.py
 ```
+
+## Current RoPE and fixed-KV writer A/B
+
+Run the existing writer's off/on comparison on a CUDA worker:
+
+```bash
+SGLANG_LIGHTWEIGHT_RUNTIME=1 python benchmark/zing_h3_causal/benchmark_current_rope_kv.py \
+  --source-revision "$SOURCE_SHA" --output-dir "$RESULT_ROOT/current-rope-kv" --trace
+```
+
+The default cases cover two-, three- and five-latent current inputs at 832×480
+and 1280×736, with 28 local heads (SP2), head dimension 128 and rotary dimension
+96. Both variants consume the same strided Ulysses output. The tool checks Q,
+rotated K, V and clean raw K exactly, then records independent eager and warmed
+Graph timings. Traces are separate from timing samples. `results.json` retains
+all samples, hardware/software identity, kernel names and the fused route count.
+
+For the full client benchmark, use separate server processes with
+`SGLANG_ZING_FUSED_CURRENT_ROPE_KV=0` and `=1`, keeping the fixed-KV route and other
+settings equal. Capture and warm each Graph configuration before measuring;
+compare DiT stage timing and uninstrumented E2E as well as the component result.
+
+## Fixed Zing input layout A/B
+
+`SGLANG_ZING_SP_DESTINATION_MAJOR=1` enables destination-major packing for the
+Zing batch-one input all-to-all in eager and fixed Graph attention. The pack
+kernel reads projection Q/K/V views directly; the collective receive buffer is
+the final attention view. This switch defaults to `1`.
+`0` retains the original layout for an A/B comparison. Use the same setting on
+every SP rank. The switch participates in the CUDA Graph cache key.
+
+## Fixed Zing Norm + RoPE + KV fusion
+
+`SGLANG_ZING_FUSED_QKNORM_ROPE_KV=1` defers QK RMSNorm until after input SP
+and runs it with current Q/K RoPE and fixed KV writes in one CUDA kernel.
+It supports H3 BF16 heads of width 128 with 96 rotary dimensions. The kernel
+uses the existing QK norm warp reduction and preserves the BF16 norm and
+RoPE product rounding boundaries. It persists normalized raw K only for the
+clean prefix. The switch defaults to `0` and is part of the Graph cache key.
+Combine it with `SGLANG_ZING_SP_DESTINATION_MAJOR=1` to measure the cumulative
+change; compare to the existing writer enabled via
+`SGLANG_ZING_FUSED_CURRENT_ROPE_KV=1` for the incremental fusion benefit.
+
+## Fixed history RoPE live-row A/B
+
+`SGLANG_ZING_HISTORY_ROPE_LIVE_ROWS=1` limits history RoPE reads and writes to
+`[0, history_live_rows)`. The captured grid still covers the pool capacity;
+blocks outside the live range return before loading or storing history. The
+scalar is refreshed with the other Graph device metadata, so changing history
+length does not change captured tensor shapes. Block scheduling overhead
+remains. This does not introduce cross-Graph history reuse or change cache
+eviction. It defaults to `1`; set it to `0` to measure the full-capacity
+baseline. Disabling fused history RoPE retains the original full-capacity
+fallback.
+
+## Attention preparation ablation
+
+Run the cumulative comparison with real NCCL communication on two CUDA devices:
+
+```bash
+SGLANG_LIGHTWEIGHT_RUNTIME=1 torchrun --standalone --nproc-per-node=2 \
+  benchmark/zing_h3_causal/benchmark_attention_neighborhood.py \
+  --source-revision "$SOURCE_SHA" --output-dir "$RESULT_ROOT/neighborhood" --trace
+```
+
+The five variants are the original path, existing current writer, destination
+layout, post-SP Norm fusion, and live history rows. Each checks valid Q/K/V
+against the original path before measuring eager and warmed Graph execution.
+The defaults cover 832×480 and 1280×736, windows 6/12/21, and uneven or empty
+sequence shards. Four-device runs use `--nproc-per-node=4`.
+
+Timings include a common projection-buffer clone to refresh in-place Norm
+inputs; QKV projection GEMM and Attention are outside this scope. Synthetic
+history uses a 4096-row prefix and records the separate pool capacity. Traces
+and per-rank samples are retained. Use the client benchmark for actual prefix
+occupancy, model-stage latency, memory and E2E changes.

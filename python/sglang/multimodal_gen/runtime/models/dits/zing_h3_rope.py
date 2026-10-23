@@ -93,7 +93,7 @@ def apply_current_rope(x, coefficients):
     return out
 
 
-def apply_history_rope_into(x, coefficients, out):
+def apply_history_rope_into(x, coefficients, out, *, live_rows=None):
     # Enabled by default; unsupported inputs retain the eager fallback.
     reason = (
         "disabled"
@@ -109,7 +109,7 @@ def apply_history_rope_into(x, coefficients, out):
             fused_zing_history_rope,
         )
 
-        fused_zing_history_rope(x, coefficients, out)
+        fused_zing_history_rope(x, coefficients, out, live_rows=live_rows)
         return out
 
 
@@ -182,6 +182,57 @@ def apply_contiguous_history_rope_batch(xs, coefficients, out):
 
 
 CURRENT_KV_ROUTES = collections.Counter()
+
+
+def use_current_qknorm_rope_kv(module, q, coefficients):
+    """Choose before SP, without depending on a rank's local token count."""
+    return (
+        os.environ.get("SGLANG_ZING_FUSED_QKNORM_ROPE_KV", "0") == "1"
+        and not torch.is_grad_enabled()
+        and not torch.compiler.is_compiling()
+        and q.is_cuda
+        and torch.version.hip is None
+        and q.dtype == coefficients.dtype == torch.bfloat16
+        and module.head_dim == 128
+        and coefficients.shape[-1] == 96
+        and all(
+            isinstance(norm, torch.nn.RMSNorm)
+            and norm.weight.shape == (128,)
+            and norm.weight.dtype == q.dtype
+            and norm.weight.device == q.device
+            and norm.weight.is_contiguous()
+            for norm in (module.q_norm, module.k_norm)
+        )
+        and isinstance(module.q_norm.eps, float)
+        and module.q_norm.eps == module.k_norm.eps
+    )
+
+
+def apply_current_qknorm_rope_kv(module, q, k, v, coefficients, plan, layer, tensors):
+    """The norm route was selected before SP; inputs still contain raw Q/K."""
+    from sglang.kernels.ops.diffusion.rope.zing_qknorm_rope_kv import (
+        fused_zing_qknorm_rope_kv,
+    )
+
+    out_q = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    raw_k, out_v = plan.stores[layer]
+    fused_zing_qknorm_rope_kv(
+        q,
+        k,
+        v,
+        module.q_norm.weight,
+        module.k_norm.weight,
+        coefficients,
+        tensors["write_rows"],
+        out_q,
+        raw_k,
+        plan.rotated[layer],
+        out_v,
+        plan.clean_rows,
+        module.q_norm.eps,
+    )
+    CURRENT_KV_ROUTES["qknorm_fused"] += 1
+    return out_q
 
 
 def apply_current_rope_kv(

@@ -318,6 +318,45 @@ OSS/CPFS 地址是内部证据位置，需已有权限，不是公开下载链�
 | E | 2026-10-19，`3ffda81b9454`，step2500、832×480、720 帧、六图、W6、先四步后两步 `[1000,750]`；作业 `dlcklgwejjsl7xvw` | `oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/zing-quantum-ab-20261019-r2/` |
 | F | 2026-10-22，PR #356 生产源码 `c3cc5714eb25` 对 baseline `f74dde991573`；H100/H200，完整 26 层 Lynn、SP2/TP1、BF16、window3；独立 Decoder 回放 | [PR #356 的 H100/H200 验证与限制](https://github.com/seedleap/sglang/pull/356)；`oss://leap-world-shanghai/world-model/sglang/evals/pr356-hopper-20261022-r1/` 下 `h100-verified/`、`h200-post-verified/` 与各自 `READY`/control 归档；对比视频与 Graph 组件测试另见同一 `evals/` 下 `pr356-decoder-videos-20261022-r1/` 的 `VIDEO_REPORT.json`、`media/` 和 `gpu/` |
 
+## Ulysses 与 fixed KV 准备链路
+
+以下开关用于同配置逐项 A/B，每个 SP rank 必须保持一致。它们进入 Graph cache key；
+更换设置后使用新的服务进程并完成预热。SP 拷贝消除与 history 有效行裁剪默认开启，
+显式设为 `0` 可回到各自的原路径；Norm 融合保持默认关闭。
+
+| 开关 | 默认值 | 行为与适用路径 |
+| --- | --- | --- |
+| `SGLANG_ZING_FUSED_CURRENT_ROPE_KV` | 沿用原门控 | 已有的 current Q/K RoPE 与 KV 写入融合；固定 KV 路径。显式设为 `0` 可测独立 RoPE 与写入的对照 |
+| `SGLANG_ZING_SP_DESTINATION_MAJOR` | `1` | QKV 直接打包为 Ulysses 目标布局，接收结果直接作为 attention 输入；Zing batch-one 的 eager 与 fixed 路径 |
+| `SGLANG_ZING_FUSED_QKNORM_ROPE_KV` | `0` | fixed 路径中将 QK Norm 移到 SP 后，与 current RoPE、KV 写入合为一个 kernel；BF16、head=128、rotary=96 |
+| `SGLANG_ZING_HISTORY_ROPE_LIVE_ROWS` | `1` | fixed history RoPE 只读写有效历史行，跳过池内空余容量；Graph replay 刷新设备上的有效行数 |
+
+Norm 顺序调整用于减少中间访存和 kernel 数量。history kernel 仍按池容量启动 grid，
+空余行对应的 block 提前返回；它不引入跨 Graph 的历史旋转结果复用。
+生产 `Graph=0` 的通用 eager 路径不经过新增 Norm/KV 和 live-history 融合，需与 fixed
+链路的 eager microbenchmark 分别解读。复现命令和组件测量范围见
+[SP resident profiling](https://github.com/seedleap/sglang/blob/main/benchmark/zing_h3_causal/SP_RESIDENT_PROFILING.md#attention-preparation-ablation)。
+
+2026-10-23：上海 H200 目标（实机 NVIDIA L20X、SM90），源码
+`4ffd2dcf06b49543dc5b23c9faca71df431fce7c` 加公共 bounded KV capture rollback 补丁，
+完成 SP2、四步、W6/sink3、FA4、Lynn、remote Qwen 的 720 帧 Graph 对照，每配置预热两次、正式三次。
+在已有 writer 上，SP 拷贝消除使 480p / 736p FPS 新增 **3.72% / 3.25%**；继续融合 Norm
+为 **−0.70% / +0.40%**，再加 history live rows 为 **+1.54% / 约零**。
+四项全开为 **10.964 / 4.787 FPS**，较已有 writer 新增 **4.58% / 3.67%**。
+优先推进 SP，Norm 保留实验开关：局部 Norm＋writer kernel 时间降低约 29% / 33%，
+但按实际调用量折算仅约占 E2E 的 0.3%。history 收益同时受空余行数和空 block 调度开销影响；
+本配方两档池容量均按 736p 预算。
+`dlc134sw7ff3bs8w` 中的 Graph 门槛完成 480 次完整模型输出/raw KV 逐位比较；
+真实 SP2 组件还覆盖不均匀/空分片和 Graph 输入刷新。
+同配方的生产 Eager 路径中，SP 使 480p / 736p FPS 新增 **2.23% / 3.02%**，
+E2E 从 **69.198 / 155.479 秒**降至 **67.688 / 150.922 秒**。
+480p Eager 使用同一作业，736p 基线与 SP 对照成对续跑于 `dlcohqozvpi9lkfo`，同样预热两次、正式三次。
+结果及完整回执保存在
+`oss://leap-world-shanghai/world-model/sglang/evals/ulysses-fusion-h200-20261022-r1/`。
+发布分支已同步 `b913437ad1a2` 的 Encoder/Lynn/source decoder 等更新；上述数字对应已测源码，
+同步后的整模型 GPU 性能尚未重测。当前默认的 SP/history 开启、Norm 关闭组合
+尚未单独测量整模型 E2E；上面的逐项消融和全开数字保留各自的配置边界。
+
 ## 后续 PR 如何维护
 
 对 Zing H3 性能或显存有影响的 PR，必须在同一 PR 更新本页受影响的决策、数字或验证状态。

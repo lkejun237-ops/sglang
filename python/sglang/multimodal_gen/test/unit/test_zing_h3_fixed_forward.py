@@ -163,11 +163,25 @@ def test_fixed_forward_matches_eager_and_does_not_prepare_commit(model, phase):
 
 
 @torch.no_grad()
-def test_fixed_forward_replays_changed_history_with_one_signature(model):
+@pytest.mark.parametrize("live_only", [False, True])
+def test_fixed_forward_replays_changed_history_with_one_signature(
+    model, monkeypatch, live_only
+):
+    from sglang.multimodal_gen.runtime.models.dits import zing_h3
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import _Entry
     from sglang.multimodal_gen.test.unit.test_zing_h3_denoise_graph import (
         RecordingGraphBackend,
     )
 
+    monkeypatch.setenv("SGLANG_ZING_HISTORY_ROPE_LIVE_ROWS", str(int(live_only)))
+    observed = []
+    rotate = zing_h3.apply_history_rope_into
+
+    def record_live_rows(*args, live_rows=None):
+        observed.append(live_rows)
+        return rotate(*args, live_rows=live_rows)
+
+    monkeypatch.setattr(zing_h3, "apply_history_rope_into", record_live_rows)
     packer, inputs, visual, _ = request(model, audio=False)
     sampler = ZingH3Sampler(model, packer, sigma_points=3)
     sampler.device = torch.device("cpu")
@@ -177,24 +191,36 @@ def test_fixed_forward_replays_changed_history_with_one_signature(model):
         "fixed device forward preparation is missing"
     )
     kv = _workspace(model, packed, history=3)
+    if live_only:
+        kv.tensors["history_live_rows"] = torch.tensor([3], dtype=torch.int32)
     plan = model.prepare_fixed_forward(packed=packed, kv_plan=kv, phase="active")
     backend = RecordingGraphBackend()
-    graph, output = backend.capture(plan.execute)
+    static = {name: value.clone() for name, value in plan.tensors.items()}
+    graph, output = backend.capture(lambda: plan.execute(static))
+    captured_lengths = tuple(observed)
+    entry = _Entry(graph, static, output)
     for history in (1, 7, 3):
         changed = _workspace(model, packed, history=history)
+        if live_only:
+            changed.tensors["history_live_rows"] = torch.tensor(
+                [history], dtype=torch.int32
+            )
         # The graph owns the stores; only device metadata and history differ.
         for (k, v), (new_k, new_v) in zip(kv.stores, changed.stores):
             k.copy_(new_k)
             v.copy_(new_v)
-        for name, value in changed.tensors.items():
-            plan.tensors["kv." + name].copy_(value)
-        reference = tuple(v.clone() for v in plan.execute())
-        backend.replay(graph)
-        for actual, expected in zip(output, reference):
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         other = model.prepare_fixed_forward(
             packed=packed, kv_plan=changed, phase="active"
         )
+        entry.refresh(other.tensors)
+        reference = tuple(v.clone() for v in plan.execute(other.tensors))
+        backend.replay(graph)
+        assert captured_lengths
+        assert {
+            None if value is None else value.item() for value in captured_lengths
+        } == {history if live_only else None}
+        for actual, expected in zip(output, reference):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         # Store addresses are deliberately a separate identity component.
         assert plan.signature[:-1] == other.signature[:-1]
     assert backend.captures == 1
@@ -755,7 +781,8 @@ def _fake_cache(model_layers, capacity, chunk_rows):
     )
 
 
-def test_plan_writes_front_rows_and_shares_one_rotation_per_history():
+def test_plan_writes_front_rows_and_shares_one_rotation_per_history(monkeypatch):
+    monkeypatch.setenv("SGLANG_ZING_HISTORY_ROPE_LIVE_ROWS", "0")
     current = torch.arange(12).reshape(4, 3)
 
     def plan(cache, *, after=None, clean=0):
@@ -800,6 +827,19 @@ def test_plan_writes_front_rows_and_shares_one_rotation_per_history():
     empty = plan(_fake_cache(2, 32, ()), after=longer)
     assert not empty.rotates_history and empty.rotated_positions is None
     assert plan(cache, after=empty).rotates_history
+
+
+def test_history_live_length_has_stable_device_metadata_shape(monkeypatch):
+    monkeypatch.delenv("SGLANG_ZING_HISTORY_ROPE_LIVE_ROWS", raising=False)
+    current = torch.arange(12).reshape(4, 3)
+    for chunks in ((3,), (3, 4), (2,)):
+        plan = ZingFixedForwardKVPlan(
+            _fake_cache(1, 32, chunks), current, ends=(4,), clean_rows=0
+        )
+        live = plan.tensors["history_live_rows"]
+        assert live.dtype == torch.int32 and live.shape == (1,)
+        assert live.item() == sum(chunks)
+        assert live.device == plan.stores[0][0].device
 
 
 def test_plan_admission_covers_every_row_written_into_the_slot():

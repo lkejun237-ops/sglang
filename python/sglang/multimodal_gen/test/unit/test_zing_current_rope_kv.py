@@ -10,7 +10,7 @@ from sglang.multimodal_gen.runtime.models.dits.zing_h3_rope import apply_current
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("clean_rows", [0, 3, 7])
-@pytest.mark.parametrize("rotary", [64, 128])
+@pytest.mark.parametrize("rotary", [64, 96, 128])
 @pytest.mark.parametrize("strided", [False, True])
 def test_rope_kv_slot_and_graph(monkeypatch, clean_rows, rotary, strided):
     monkeypatch.setenv("SGLANG_ZING_FUSED_CURRENT_ROPE_KV", "1")

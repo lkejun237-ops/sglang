@@ -319,7 +319,9 @@ def test_fa4_routes_full_query_and_history_before_output_projection(monkeypatch,
         monkeypatch.setattr(
             zing_h3,
             "_usp_input_all_to_all_varlen_qkv",
-            lambda q, k, v, splits: torch.cat((q, k, v), dim=-1),
+            lambda q, k, v, splits, *, destination_major=False: torch.cat(
+                (q, k, v), dim=-1
+            ),
         )
         monkeypatch.setattr(
             zing_h3,

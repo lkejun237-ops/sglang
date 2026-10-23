@@ -218,6 +218,8 @@ def _usp_input_all_to_all_varlen_qkv(
     key: torch.Tensor,
     value: torch.Tensor,
     seq_lens: list[int],
+    *,
+    destination_major: bool = False,
 ) -> torch.Tensor:
     """Varlen counterpart of :func:`_usp_input_all_to_all_peer_first_qkv`."""
     world_size = get_ulysses_parallel_world_size()
@@ -240,6 +242,25 @@ def _usp_input_all_to_all_varlen_qkv(
         )
 
     h_local = h_global // world_size
+    if destination_major and b == 1:
+        # Send each head shard in sequence order. All-to-all concatenates the
+        # source ranks in that same order, so its receive buffer is already the
+        # attention layout, including when source sequence lengths differ.
+        if query.is_cuda and all(t.stride(-1) == 1 for t in (query, key, value)):
+            from sglang.kernels.ops.diffusion.layout.ulysses_qkv_triton import (
+                pack_qkv_destination_major,
+            )
+
+            packed = pack_qkv_destination_major(query[0], key[0], value[0], world_size)
+        else:
+            packed = _usp_pack_peer_first_qkv(query, key, value, world_size, None)
+        exchanged = _usp_all_to_all_single_varlen(
+            packed,
+            [seq_len * h_local * 3 * d for seq_len in seq_lens],
+            [s_local * h_local * 3 * d] * world_size,
+        )
+        return exchanged.view(1, sum(seq_lens), h_local, 3 * d)
+
     packed = torch.cat(
         (
             query.permute(2, 0, 1, 3),
