@@ -44,11 +44,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
 )
 from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import allocate_layer_stores
 from sglang.multimodal_gen.test.unit.test_zing_h3_kv_pool_cache import _inputs
-from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
+from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401  # noqa: F401
     cpu_execution_options,
 )
 from sglang.multimodal_gen.test.unit.test_zing_h3_model import model as model_fixture
-from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
+from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401  # noqa: F401
     verify_synthetic_table,
 )
 
@@ -1133,9 +1133,14 @@ def _run_ready_chunks(
     storage=None,
     input_seed=83,
     initial_steps=None,
+    steps=None,
     prompt_updates=None,
     yield_hook=None,
     allow_cancel=False,
+    defer_final=False,
+    known_eos=True,
+    prompt_joint=False,
+    joint_forward="cross_chunk",
 ):
     """Exercise the production streaming iterator, including source pauses."""
     from sglang.multimodal_gen.runtime.models.dits import zing_h3_denoise_graph
@@ -1170,12 +1175,18 @@ def _run_ready_chunks(
         model,
         packer,
         solver="few_step",
-        denoising_step_list=[1000, 500] if initial_steps is not None else STEPS,
+        denoising_step_list=(
+            steps
+            if steps is not None
+            else [1000, 500]
+            if initial_steps is not None
+            else STEPS
+        ),
         window_chunks=3,
         sink_chunks=1,
         window_eviction_timing="after_step0",
         rope_position_mode="block_relative",
-        joint_forward="cross_chunk",
+        joint_forward=joint_forward,
         **extra,
     )
     storage = _storage(model) if storage is None else storage
@@ -1201,6 +1212,8 @@ def _run_ready_chunks(
         max_pending_bytes=1000000,
         total_latent_frames=frames,
         acquire_storage=lambda *_: storage,
+        defer_final=defer_final,
+        prompt_joint=prompt_joint,
     )
     outputs, snapshots, rng_states, boundary = [], [], [], []
     cursor = 0
@@ -1231,7 +1244,7 @@ def _run_ready_chunks(
                         inputs.source_visual[:, :, start:end],
                         noise[:, :, start:end],
                         provenance=fixture_provenance(1, end, start, end),
-                        final=end == frames,
+                        final=known_eos and end == frames,
                     )
                     cursor += 1
                 drain = session.drain_ready()
@@ -1276,6 +1289,8 @@ def _run_ready_chunks(
             if cancelled:
                 break
             assert not session.pending
+        if not cancelled and not session.ended:
+            session.finish()
         assert (session.complete or (allow_cancel and cancelled)) and session.closed
         assert all(value == 0 for value in session.memory_snapshot().values())
     finally:
@@ -1314,6 +1329,157 @@ def test_source_ready_whole_chunk_three_routes_replay_and_match_eager(
     assert len(graphs.graphs) <= 16
     assert not graphs.routes[("steady", "capture_failed")]
     assert not graphs.routes[("steady", "unsupported")]
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta", "cuda"])
+def test_deferred_final_matches_layout_devices(model, device):
+    """GPU payloads do not imply GPU metadata at the joint packing boundary."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA device required for the production device layout")
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+        ZingChunkGraphs,
+    )
+
+    packer = ZingH3Packer(model.arch, num_frame_per_block=2)
+    sampler = ZingH3Sampler(model, packer, solver="few_step", denoising_step_list=STEPS)
+    inputs = _inputs(3)
+    layout = packer.pack_inference_layout(
+        inputs, inputs.positive, torch.zeros(1, 2, 3, 2, 2), None
+    )
+    for name in ("clean_visual", "clean_audio", "context"):
+        layout[name] = layout[name].to(device)
+    ordinary = sampler._select_block(
+        layout, 2, phase="target", video_t=1.0, audio_t=None, final=True
+    )
+    host = ordinary["_zing_host_layout"]
+    cache = SimpleNamespace(
+        active=(2, ordinary["position_ids"]), _active_reference=host.position_ids
+    )
+    frames = int(host.position_ids[:, 0].unique().numel())
+    final = sampler._deferred_final(
+        cache, torch.zeros(1, 2, frames, 2, 2, device=device), layout
+    )
+    for name in ("x", "audio_x", "context", *_sampling_helpers._GUARDED_ROWS):
+        assert final[name].device == ordinary[name].device, name
+    # Exercise the failing downstream concatenation, not just helper output.
+    joined = ZingChunkGraphs._joint_packed([final, ordinary], ("final", "active"))
+    assert joined["x"].device.type == device
+    assert joined["t"].device.type == "cpu"
+
+
+@pytest.mark.parametrize("switch", [False, True])
+def test_deferred_final_across_single_chunk_dispatches(model, monkeypatch, switch):
+    options = dict(
+        batches=(1,) * 24,
+        initial_steps=STEPS,
+        prompt_updates={13: 9} if switch else None,
+    )
+    baseline = _run_ready_chunks(model, monkeypatch, **options)
+    eager = _run_ready_chunks(model, monkeypatch, defer_final=True, **options)
+    fixed = _run_ready_chunks(
+        model, monkeypatch, defer_final=True, backend="eager", **options
+    )
+    backend = RecordingGraphBackend()
+    replay = _run_ready_chunks(
+        model, monkeypatch, defer_final=True, backend=backend, **options
+    )
+    for result in (eager, fixed, replay):
+        torch.testing.assert_close(result[0], baseline[0], rtol=0.02, atol=0.02)
+        assert result[5] == baseline[5]
+        for actual, expected in zip(result[2], baseline[2], strict=True):
+            assert (actual is None and expected is None) or torch.equal(
+                actual, expected
+            )
+    assert torch.equal(replay[0], fixed[0])
+    for actual, expected in zip(replay[1], fixed[1], strict=True):
+        assert actual[0] == expected[0]
+        for (ak, av), (ek, ev) in zip(actual[2], expected[2], strict=True):
+            assert torch.equal(ak, ek) and torch.equal(av, ev)
+    for kind in ("resume", "deferred"):
+        assert replay[4].routes[(kind, "replay")] > 0
+    # Output was delivered while the last generated block remained active;
+    # final EOS clears it, and a prompt rebuild restarts the local block phase.
+    assert all(active is not None for _, active in replay[3][:-1])
+    assert replay[3][-1] == (None, None)
+    if switch:
+        assert replay[5][13:] == [113] * 11
+
+
+def test_single_step_deferred_final_captures_without_kv_writes(model, monkeypatch):
+    options = dict(batches=(1,) * 12, steps=[1000], defer_final=True)
+    fixed = _run_ready_chunks(model, monkeypatch, backend="eager", **options)
+    replay = _run_ready_chunks(
+        model, monkeypatch, backend=WarmupRecordingGraphBackend(), **options
+    )
+    assert torch.equal(replay[0], fixed[0])
+    assert replay[5] == fixed[5]
+    assert replay[4].routes[("deferred", "capture")] > 0
+    assert replay[4].routes[("deferred", "replay")] > 0
+    assert not replay[4].disabled
+
+
+@pytest.mark.parametrize("local_failure", [False, True])
+def test_deferred_prepare_failure_votes_before_joint_and_releases_session(
+    model, monkeypatch, local_failure
+):
+    original = ZingH3Sampler._agree_sp_boundary
+    sessions, votes = [], []
+
+    def boundary(sampler, *args, **kwargs):
+        if kwargs.get("phase") == "source_deferred_prepare":
+            votes.append(kwargs["precheck_error"])
+            if not local_failure:
+                raise ValueError("injected peer preparation failure")
+        return original(sampler, *args, **kwargs)
+
+    def fail(*args):
+        raise ValueError("injected local preparation failure")
+
+    def unexpected_joint(*args):
+        pytest.fail("Joint eligibility must not run after a failed prepare vote")
+
+    monkeypatch.setattr(ZingH3Sampler, "_agree_sp_boundary", boundary)
+    monkeypatch.setattr(ZingH3Sampler, "_resume_cross_packs", unexpected_joint)
+    if local_failure:
+        monkeypatch.setattr(ZingH3Sampler, "_deferred_final", fail)
+    with pytest.raises(ValueError, match="preparation failure"):
+        _run_ready_chunks(
+            model,
+            monkeypatch,
+            batches=(1,) * 8,
+            defer_final=True,
+            yield_hook=lambda session, *_: sessions.append(session),
+        )
+    assert votes == [local_failure]
+    assert sessions and all(s.closed and s.recent_visual is None for s in sessions)
+
+
+def test_deferred_final_cancel_releases_history_and_cache(model, monkeypatch):
+    def cancel(session, drain, count):
+        if count == 3:
+            drain.close()
+            assert session.closed and not session.pending
+            assert session.recent_visual is None
+
+    _run_ready_chunks(
+        model,
+        monkeypatch,
+        batches=(1,) * 8,
+        defer_final=True,
+        backend=RecordingGraphBackend(),
+        yield_hook=cancel,
+        allow_cancel=True,
+    )
+
+
+def test_deferred_final_separate_eos_and_sequential_fallback(model, monkeypatch):
+    options = dict(batches=(1,) * 8, known_eos=False)
+    baseline = _run_ready_chunks(model, monkeypatch, **options)
+    monkeypatch.setattr(ZingH3Sampler, "_resume_cross_packs", lambda *_: None)
+    actual = _run_ready_chunks(model, monkeypatch, defer_final=True, **options)
+    assert torch.equal(actual[0], baseline[0])
+    # finish() releases this last active block without an unnecessary forward.
+    assert actual[3][-1][1] is not None
 
 
 @pytest.mark.parametrize("backend", ["eager", "recording"])
@@ -2108,3 +2274,101 @@ def test_whole_chunk_sp_opt_out_streaming_never_captures(model, monkeypatch, wor
         futures = [executor.submit(worker, rank) for rank in range(world)]
         for future in futures:
             future.result(timeout=60)
+
+
+@pytest.mark.parametrize("defer_final", [False, True])
+def test_online_prompt_joint_matches_serial_and_replays(
+    model, monkeypatch, defer_final
+):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_prefix_graph import (
+        PrefixJointGraphs,
+    )
+
+    options = dict(
+        batches=(1,) * 16,
+        initial_steps=STEPS,
+        prompt_updates={4: 9, 7: 9, 10: 9, 13: 9},
+        defer_final=defer_final,
+    )
+    baseline = _run_ready_chunks(model, monkeypatch, **options)
+    eager = _run_ready_chunks(model, monkeypatch, prompt_joint=True, **options)
+    model.prefix_graphs = PrefixJointGraphs(capture_enabled=False)
+    fixed = _run_ready_chunks(
+        model, monkeypatch, prompt_joint=True, backend="eager", **options
+    )
+    prefix_backend = WarmupRecordingGraphBackend()
+    model.prefix_graphs = PrefixJointGraphs(backend=prefix_backend)
+    replay = _run_ready_chunks(
+        model,
+        monkeypatch,
+        prompt_joint=True,
+        backend=WarmupRecordingGraphBackend(),
+        **options,
+    )
+    for actual in (eager, fixed, replay):
+        torch.testing.assert_close(actual[0], baseline[0], atol=0.02, rtol=0.02)
+        assert actual[5] == baseline[5]
+        for got, want in zip(actual[2], baseline[2]):
+            assert (got is None and want is None) or torch.equal(got, want)
+    assert torch.equal(fixed[0], replay[0])
+    assert model.prefix_graphs.routes[("prefix_separate", "replay")] == 2
+    assert replay[5][4:7] == [104] * 3
+    assert replay[5][13:] == [113] * 3
+    for actual, expected in zip(replay[1], fixed[1]):
+        assert actual[0] == expected[0]
+        for (ak, av), (ek, ev) in zip(actual[2], expected[2]):
+            assert torch.equal(ak, ek) and torch.equal(av, ev)
+
+
+def test_online_prompt_joint_failure_releases_session_and_reuses_slot(
+    model, monkeypatch
+):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_prefix_graph import (
+        PrefixJointGraphs,
+    )
+
+    storage = _storage(model)
+    options = dict(
+        batches=(1,) * 10,
+        prompt_updates={4: 9},
+        defer_final=True,
+        prompt_joint=True,
+        storage=storage,
+        backend="eager",
+    )
+    model.prefix_graphs = PrefixJointGraphs(capture_enabled=False)
+    owned = []
+
+    def inject(session, drain, count):
+        if count == 4:
+            owned.append(session)
+
+            def fail(*args):
+                raise RuntimeError("injected prefix failure")
+
+            monkeypatch.setattr(model.prefix_graphs, "run", fail)
+
+    with pytest.raises(RuntimeError, match="injected prefix failure"):
+        _run_ready_chunks(model, monkeypatch, yield_hook=inject, **options)
+    assert owned[0].closed and owned[0]._pending_prefix is None
+    assert all(v == 0 for v in owned[0].memory_snapshot().values())
+    model.prefix_graphs = PrefixJointGraphs(capture_enabled=False)
+    result = _run_ready_chunks(model, monkeypatch, **options)
+    assert result[5][4:] == [104] * 6
+
+
+def test_online_prompt_joint_unsupported_route_keeps_serial_result(model, monkeypatch):
+    options = dict(batches=(1,) * 9, prompt_updates={4: 9}, joint_forward="off")
+    baseline = _run_ready_chunks(model, monkeypatch, **options)
+    metrics = []
+    actual = _run_ready_chunks(
+        model,
+        monkeypatch,
+        prompt_joint=True,
+        yield_hook=lambda session, drain, count: metrics.append(session.metrics),
+        **options,
+    )
+    assert torch.equal(actual[0], baseline[0])
+    assert actual[5] == baseline[5]
+    assert metrics[-1]["prompt_joint_fallbacks"] == {"unsupported_layout": 1}
+    assert metrics[-1]["forward_counts"].get("prompt_joint", 0) == 0

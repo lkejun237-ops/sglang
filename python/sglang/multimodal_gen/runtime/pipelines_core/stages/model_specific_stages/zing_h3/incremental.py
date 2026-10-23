@@ -86,6 +86,8 @@ class SourceReadySession:
         prompt_switch_prefix_latent_frames=5,
         initial_prompt_event_id=None,
         initial_prompt_version=None,
+        defer_final=False,
+        prompt_joint=False,
     ):
         if any(
             type(n) is not int or n < 1
@@ -103,6 +105,18 @@ class SourceReadySession:
                 "prompt_switch_prefix_latent_frames currently only supports 5"
             )
         sampler.processor.prompt_switch_prefix_chunks()
+        if defer_final and (
+            prompt_switch_prefix_latent_frames != 5
+            or sampler.joint_forward != "cross_chunk"
+            or sampler.do_cfg
+            or sampler.window_eviction_timing != "after_step0"
+        ):
+            raise ValueError(
+                "Deferred final requires cross-chunk, five-frame history, no CFG and after-step0 eviction"
+            )
+        self.prompt_joint = prompt_joint
+        self._pending_prefix = None
+        self.defer_final = defer_final
         self.sampler = sampler
         # Reuse the deployment's graph owner; explicit test/eager overrides are
         # respected, and the existing graph environment switch controls startup.
@@ -244,7 +258,7 @@ class SourceReadySession:
             size = min(size, self.total_latent_frames - self.next_latent)
         return size if size > 0 else None
 
-    def _activate_pending_prompt(self, ready):
+    def _activate_pending_prompt(self, ready, *, defer_prefix=False):
         if (
             self.pending_prompt is None
             or not self.prompt_switch_ready
@@ -256,9 +270,29 @@ class SourceReadySession:
             raise ValueError("Prompt switching currently supports video-only sessions")
         candidate = self.pending_prompt
         inputs = self.inputs if candidate.inputs is None else candidate.inputs
-        origin, latent_end = self.sampler.rebuild_prompt_prefix(
-            inputs, candidate.condition, self.recent_visual, self.cache
-        )
+        if defer_prefix and self.prompt_joint:
+            prepared, error = None, None
+            try:
+                prepared = self.sampler.pack_prompt_prefix(
+                    inputs, candidate.condition, self.recent_visual
+                )
+            except Exception as exc:
+                error = exc
+            self.sampler._agree_sp_boundary(
+                self.cache,
+                8,
+                phase="prompt_prefix_prepare",
+                precheck_error=error is not None,
+                local_error=error,
+            )
+            if error is not None:
+                raise error
+            self._pending_prefix, origin, latent_end = prepared
+            self.cache.clear()
+        else:
+            origin, latent_end = self.sampler.rebuild_prompt_prefix(
+                inputs, candidate.condition, self.recent_visual, self.cache
+            )
         if latent_end != ready.model_chunk.start:
             raise ValueError("Prompt-switch prefix does not meet the next model block")
         if candidate.inputs is not None:
@@ -270,6 +304,114 @@ class SourceReadySession:
             self.pending_prompt = None
         self.media_origin = origin
         self.model_chunk_id = ready.model_chunk.chunk_id
+
+    def _prefix_prediction(self, current, graph_eligible):
+        """Consume the session-owned prefix at the first target of the new epoch."""
+        if self._pending_prefix is None:
+            return None
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3 import get_ulysses_ctx
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+            ZingChunkGraphs,
+        )
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3_joint import (
+            PREFIX_PHASES,
+        )
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3_prefix_graph import (
+            PrefixJointGraphs,
+        )
+
+        sampler, model, cache = self.sampler, self.sampler.generator, self.cache
+        size, _ = get_ulysses_ctx()
+        supported = (
+            cache.raw_store
+            and cache.local_frames == -1
+            and sampler.joint_forward == "cross_chunk"
+            and not sampler.do_cfg
+            and sampler.solver == "few_step"
+            and size in (1, 2, 4)
+            and sampler.window_eviction_timing == "after_step0"
+            and current.audio is None
+            and current.spans[0][:2] == (7, 8)
+            and model.adaln_table is None
+            and (size == 1 or model.experimental_stable_shapes)
+        )
+        sampler._agree_sp_boundary(
+            cache,
+            8,
+            phase="prompt_prefix_route",
+            ready_route=(supported, graph_eligible),
+        )
+        packs, self._pending_prefix = self._pending_prefix, None
+        if not supported:
+            # The same packed tensors feed the established serial cache contract.
+            sampler._forward(packs[0], cache, "prefix")
+            for packed in packs[1:]:
+                host = sampler._layout_index(packed).host
+                cache.update(
+                    packed["position_ids"],
+                    packed["block_idx"],
+                    "active",
+                    int(host["position_ids"][:, 0].unique().numel()),
+                    validation=(host["position_ids"], host["block_idx"]),
+                )
+                sampler._forward(packed, cache, "final")
+            reasons = self.metrics.setdefault("prompt_joint_fallbacks", {})
+            reasons["unsupported_layout"] = reasons.get("unsupported_layout", 0) + 1
+            return None
+        error = None
+        try:
+            source, target, *_ = current.spans[0]
+            vs, _ = ZingChunkGraphs._schedules(sampler, current)
+            packs += [
+                sampler._select_block(
+                    current.positive, source, phase="source", video_t=1, audio_t=None
+                ),
+                sampler._select_block(
+                    current.positive,
+                    target,
+                    phase="target",
+                    video_t=sampler._host_list(vs.timesteps)[0],
+                    audio_t=None,
+                ),
+            ]
+        except Exception as exc:
+            error = exc
+        sampler._agree_sp_boundary(
+            cache,
+            8,
+            phase="prompt_joint_prepare",
+            precheck_error=error is not None,
+            local_error=error,
+        )
+        if error is not None:
+            raise error
+        if graph_eligible:
+            graphs = getattr(model, "prefix_graphs", None)
+            if graphs is None:
+                graphs = model.prefix_graphs = PrefixJointGraphs(
+                    capture_enabled=model.chunk_graphs.capture_enabled
+                )
+            before = graphs.routes.copy()
+            video, audio = graphs.run(sampler, packs, cache)
+            routes = self.metrics.setdefault("prompt_joint_graph_routes", {})
+            for (kind, route), count in (graphs.routes - before).items():
+                key = f"{kind}.{route}"
+                routes[key] = routes.get(key, 0) + count
+            sampler._forward_counts["prompt_joint"] = (
+                sampler._forward_counts.get("prompt_joint", 0) + 1
+            )
+        else:
+            prediction = sampler._predict_joint(
+                packs, PREFIX_PHASES, current.visual.shape[2:], cache
+            )
+            if prediction is None:
+                raise RuntimeError(
+                    "Prompt joint ranks rejected the prepared transaction"
+                )
+            return prediction
+        return sampler.processor.unpatchify_visual(
+            video, 1, current.visual.shape[2:]
+        ), None
 
     def _remember_visual(self, visual):
         limit = self.prompt_switch_prefix_latent_frames
@@ -305,6 +447,10 @@ class SourceReadySession:
         if packer.chunk_plan != self.plan:
             raise ValueError("The checkpoint chunk plan changed within the session")
         packer._validate_visual(noise)
+        if self.defer_final and (audio is not None or noise.shape[2] > 5):
+            raise ValueError(
+                "Deferred final requires video-only chunks fitting five-frame history"
+            )
         if not noise.is_floating_point():
             raise ValueError("Ready noise must be floating-point latents")
         if source is not None:
@@ -431,6 +577,8 @@ class SourceReadySession:
                 first_prediction,
                 self.ended,
                 self.total_latent_frames,
+                self.defer_final,
+                self.cache is not None and self.cache.active is not None,
             ),
         )
 
@@ -438,6 +586,8 @@ class SourceReadySession:
     def step(self):
         if self.closed or self.draining:
             raise ValueError("The source-ready session is closed or draining")
+        if self.defer_final:
+            raise ValueError("Deferred final requires drain_ready execution")
         try:
             self._agree_ready_route("step")
             if not self.pending:
@@ -621,7 +771,7 @@ class SourceReadySession:
             if not self.pending:
                 finished = True
                 return
-            self._activate_pending_prompt(self.pending[0])
+            self._activate_pending_prompt(self.pending[0], defer_prefix=True)
             prompt = self.prompt
             current, origin = self._prepare(self.pending[0], prompt, self.media_origin)
             sampler = self.sampler
@@ -635,7 +785,7 @@ class SourceReadySession:
                 if not self.pending:
                     break
                 if current is None:
-                    self._activate_pending_prompt(self.pending[0])
+                    self._activate_pending_prompt(self.pending[0], defer_prefix=True)
                     prompt, origin = self.prompt, self.media_origin
                     current, _ = self._prepare(self.pending[0], prompt, origin)
                 ready = self.pending[0]
@@ -663,10 +813,54 @@ class SourceReadySession:
                             current.positive, source, target
                         ),
                     )
+                    if self._pending_prefix is not None:
+                        first = self._prefix_prediction(current, graph_eligible)
                     if cold_init:
                         first = graphs.initialization(sampler, current)
                     else:
                         self._apply_prefix(current, prompt)
+                    # A prompt rebuild has already cleared the old active block.
+                    # Otherwise its values are the tail of the existing history.
+                    if (
+                        self.defer_final
+                        and first is None
+                        and self.cache.active is not None
+                    ):
+                        final = None
+                        prepare_error = None
+                        try:
+                            final = sampler._deferred_final(
+                                self.cache, self.recent_visual, current.positive
+                            )
+                        except Exception as exc:
+                            prepare_error = exc
+                        sampler._agree_sp_boundary(
+                            self.cache,
+                            target,
+                            phase="source_deferred_prepare",
+                            precheck_error=prepare_error is not None,
+                            local_error=prepare_error,
+                        )
+                        if prepare_error is not None:
+                            raise prepare_error
+                        packs = sampler._resume_cross_packs(final, current)
+                        if packs is None:
+                            sampler._forward(final, self.cache, "final")
+                        elif graph_eligible:
+                            first = graphs.resume(sampler, current, packs)
+                        else:
+                            first = sampler._predict_joint(
+                                packs,
+                                ("final", "source", "active"),
+                                current.visual.shape[2:],
+                                self.cache,
+                            )
+                            if first is None:
+                                sampler._forward(final, self.cache, "final")
+                        final = packs = None
+                    defer_final = (
+                        self.defer_final and not self.ended and len(self.pending) == 1
+                    )
                     if graph_eligible:
                         if first is None:
                             first = graphs.recovery(sampler, current)
@@ -675,7 +869,7 @@ class SourceReadySession:
                                 self.pending[1], prompt, origin, previous=current
                             )
                         video, next_first = graphs.chunk(
-                            sampler, current, first, next_state
+                            sampler, current, first, next_state, defer_final=defer_final
                         )
                         sound = None
                     else:
@@ -706,7 +900,7 @@ class SourceReadySession:
                             start,
                             end,
                             first_prediction=first,
-                            defer_final=lookahead,
+                            defer_final=lookahead or defer_final,
                         )
                         if lookahead:
                             next_state, _ = self._prepare(
@@ -719,7 +913,7 @@ class SourceReadySession:
                                 sampler._commit(
                                     current.positive, target, video, sound, self.cache
                                 )
-                        elif sampler.joint_forward == "cross_chunk":
+                        elif sampler.joint_forward == "cross_chunk" and not defer_final:
                             reasons = sampler.last_run_metrics["joint_fallbacks"]
                             reason = "eos" if self.ended else "source_not_ready"
                             reasons[reason] = reasons.get(reason, 0) + 1
@@ -827,6 +1021,7 @@ class SourceReadySession:
             self.adaln_lease.close()
             self.adaln_lease = None
         self._drain_tensors = []
+        self._pending_prefix = None
         self.pending.clear()
         self.pending_bytes = 0
         self.pending_spans = 0

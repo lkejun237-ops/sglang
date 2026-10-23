@@ -1,0 +1,520 @@
+{
+  "status": "historical GPU evidence; current PR main port is not GPU validated",
+  "base_commit": "82fd85da3eeb8d586c85c1a8c75f870b59f6035b",
+  "pr_base": "b913437ad1a237a1af9dbf1fcfd5cce11e22ec5b",
+  "experiments": [
+    {
+      "name": "sglang317-combined-joint-full-20261023-r4",
+      "local_root": "D:\\sglang317-combined-joint-full-20261023-r4",
+      "summary_sha256": "774fa8789ec74771c5fe52aa188faa18c32c6ce2a2ef74f4cb3c8e99f013f527",
+      "summary": [
+        {
+          "case": "hiker-clay-01-yellow-raincoat",
+          "title": "红衣变亮黄雨衣",
+          "arms": {
+            "0": {
+              "output_fps_after_first_batch": 15.987227239662154,
+              "ttff_seconds": 2.0071238300001824,
+              "send_to_new_rgb_seconds": 2.127863363,
+              "pre_prompt_output_fps": 16.816103876360597,
+              "post_event_output_fps": 16.852758403226822,
+              "max_batch_gap_seconds": 1.724622135,
+              "source_credit_wait_seconds": 5.0006506349971005,
+              "first_to_last_seconds": 22.455426111,
+              "p95": {
+                "output_fps_after_first_batch": 16.049036898551087,
+                "ttff_seconds": 2.0072467745000493,
+                "send_to_new_rgb_seconds": 2.1555586022,
+                "pre_prompt_output_fps": 16.952853451201477,
+                "post_event_output_fps": 16.876172068197477,
+                "max_batch_gap_seconds": 1.7567058444000003,
+                "source_credit_wait_seconds": 5.039091493501542,
+                "first_to_last_seconds": 22.5553159482
+              },
+              "n": 3,
+              "hot_n": 3,
+              "hot_fps": 15.987227239662154,
+              "peak_allocated_gib": 172.43663454055786,
+              "captures": 0,
+              "replays": 528,
+              "warmups": 0
+            },
+            "1": {
+              "output_fps_after_first_batch": 16.612389666087335,
+              "ttff_seconds": 1.9699345400000539,
+              "send_to_new_rgb_seconds": 1.792024355,
+              "pre_prompt_output_fps": 17.266327947038658,
+              "post_event_output_fps": 17.258961066576816,
+              "max_batch_gap_seconds": 1.39454917,
+              "source_credit_wait_seconds": 4.216960231998769,
+              "first_to_last_seconds": 21.610376786,
+              "p95": {
+                "output_fps_after_first_batch": 16.646535396534475,
+                "ttff_seconds": 2.0126991227000417,
+                "send_to_new_rgb_seconds": 1.7978224151,
+                "pre_prompt_output_fps": 17.327483459708407,
+                "post_event_output_fps": 17.29358208179037,
+                "max_batch_gap_seconds": 1.4028945576999998,
+                "source_credit_wait_seconds": 4.221416050999835,
+                "first_to_last_seconds": 21.625957871300002
+              },
+              "n": 3,
+              "hot_n": 3,
+              "hot_fps": 16.612389666087335,
+              "peak_allocated_gib": 173.23907089233398,
+              "captures": 0,
+              "replays": 528,
+              "warmups": 0
+            }
+          }
+        },
+        {
+          "case": "garden-glasshouse-01-stained-glass",
+          "title": "透明温室变彩色玻璃",
+          "arms": {
+            "0": {
+              "output_fps_after_first_batch": 15.701240860213005,
+              "ttff_seconds": 2.3025879599999826,
+              "send_to_new_rgb_seconds": 2.331605356,
+              "pre_prompt_output_fps": 16.564950591888824,
+              "post_event_output_fps": 16.676952991880253,
+              "max_batch_gap_seconds": 1.924598159,
+              "source_credit_wait_seconds": 5.646066516999554,
+              "first_to_last_seconds": 22.864434932,
+              "p95": {
+                "output_fps_after_first_batch": 15.701311357204553,
+                "ttff_seconds": 2.358246575400017,
+                "send_to_new_rgb_seconds": 2.3512971409,
+                "pre_prompt_output_fps": 16.68464700829417,
+                "post_event_output_fps": 16.802279666937775,
+                "max_batch_gap_seconds": 1.9399835735,
+                "source_credit_wait_seconds": 5.713818530498611,
+                "first_to_last_seconds": 22.8938608802
+              },
+              "n": 3,
+              "hot_n": 3,
+              "hot_fps": 15.701240860213005,
+              "peak_allocated_gib": 172.4622449874878,
+              "captures": 0,
+              "replays": 528,
+              "warmups": 0
+            },
+            "1": {
+              "output_fps_after_first_batch": 16.298050718554045,
+              "ttff_seconds": 2.31033778799997,
+              "send_to_new_rgb_seconds": 1.99564331,
+              "pre_prompt_output_fps": 17.092744114228605,
+              "post_event_output_fps": 17.070656077276922,
+              "max_batch_gap_seconds": 1.595207403,
+              "source_credit_wait_seconds": 4.835535516003347,
+              "first_to_last_seconds": 22.027174059,
+              "p95": {
+                "output_fps_after_first_batch": 16.314968658011015,
+                "ttff_seconds": 2.476131135900141,
+                "send_to_new_rgb_seconds": 2.0062178492,
+                "pre_prompt_output_fps": 17.10131044173426,
+                "post_event_output_fps": 17.09063842581139,
+                "max_batch_gap_seconds": 1.6015297275,
+                "source_credit_wait_seconds": 4.942197508501385,
+                "first_to_last_seconds": 22.167081307199997
+              },
+              "n": 3,
+              "hot_n": 3,
+              "hot_fps": 16.298050718554045,
+              "peak_allocated_gib": 173.26386880874634,
+              "captures": 0,
+              "replays": 528,
+              "warmups": 0
+            }
+          }
+        },
+        {
+          "case": "forest-deck-01-cyan-glowing-trees",
+          "title": "松树变青蓝发光树",
+          "arms": {
+            "0": {
+              "output_fps_after_first_batch": 15.630914348577273,
+              "ttff_seconds": 2.388415211000165,
+              "send_to_new_rgb_seconds": 2.390913225,
+              "pre_prompt_output_fps": 16.560242969360388,
+              "post_event_output_fps": 16.6123338139503,
+              "max_batch_gap_seconds": 1.976979417,
+              "source_credit_wait_seconds": 5.7680938649994005,
+              "first_to_last_seconds": 22.967306454,
+              "p95": {
+                "output_fps_after_first_batch": 15.673332190843245,
+                "ttff_seconds": 2.4106994602999974,
+                "send_to_new_rgb_seconds": 2.4223696758,
+                "pre_prompt_output_fps": 16.737419960910255,
+                "post_event_output_fps": 16.660837093027727,
+                "max_batch_gap_seconds": 2.0122645092,
+                "source_credit_wait_seconds": 5.7767066291997935,
+                "first_to_last_seconds": 23.054492611199997
+              },
+              "n": 3,
+              "hot_n": 3,
+              "hot_fps": 15.630914348577273,
+              "peak_allocated_gib": 172.461989402771,
+              "captures": 0,
+              "replays": 528,
+              "warmups": 0
+            },
+            "1": {
+              "output_fps_after_first_batch": 16.29057345841133,
+              "ttff_seconds": 2.2639607109999815,
+              "send_to_new_rgb_seconds": 2.000116279,
+              "pre_prompt_output_fps": 17.041613329061526,
+              "post_event_output_fps": 17.06135039821514,
+              "max_batch_gap_seconds": 1.59646418,
+              "source_credit_wait_seconds": 4.86560184900236,
+              "first_to_last_seconds": 22.037284379,
+              "p95": {
+                "output_fps_after_first_batch": 16.295978331742738,
+                "ttff_seconds": 2.2988295532000733,
+                "send_to_new_rgb_seconds": 2.0163137221,
+                "pre_prompt_output_fps": 17.106611753778594,
+                "post_event_output_fps": 17.08016958909547,
+                "max_batch_gap_seconds": 1.6113620699,
+                "source_credit_wait_seconds": 5.064964765799584,
+                "first_to_last_seconds": 22.2719356703
+              },
+              "n": 3,
+              "hot_n": 3,
+              "hot_fps": 16.29057345841133,
+              "peak_allocated_gib": 173.27232885360718,
+              "captures": 0,
+              "replays": 528,
+              "warmups": 0
+            }
+          }
+        }
+      ],
+      "overlay": {
+        "benchmark/zing_h3_causal/prefix_joint.py": "37fd02cb872e6bc1dfe4febb0c66fd270366761b1d3b219eb972469d02d55241",
+        "python/sglang/multimodal_gen/runtime/models/dits/zing_h3.py": "b8d39dac5a14488c3d61e2e1082f13789f761aa9c39843583a8cf8bad7c6d88c",
+        "python/sglang/multimodal_gen/runtime/models/dits/zing_h3_cache.py": "12205df1e134ee8d5c4c73c51409a7ca2ca3f5779fb791abebcc0f41b00bfb1a",
+        "python/sglang/multimodal_gen/runtime/models/dits/zing_h3_joint_attention.py": "3b71557106aaca2249449099d17161848f6af413b3cd37664ebcdafbbc138318",
+        "python/sglang/multimodal_gen/runtime/models/dits/zing_h3_joint_kernel.py": "2bc449252c7f27aabb23a76102f7f6b6fa6caf475e5d55f28f10f4a24ee2010f",
+        "python/sglang/multimodal_gen/test/unit/test_zing_h3_prefix_joint.py": "1f0bf12233867b046b6f0949f36517ced9af17de751958847ca0eaa434d13884",
+        "python/sglang/multimodal_gen/test/unit/test_zing_h3_fixed_joint_attention.py": "3c920d110d033cc2c8608b38e19c3228e6eae208c3c53218a3980af80cf071ee",
+        "benchmark/zing_h3_causal/prefix_joint_graph.py": "5739658c36fd7e5a59786d2786ca6c889a24852e3f07c3a04e1fab8857bdeba1",
+        "python/sglang/multimodal_gen/test/unit/test_zing_h3_prefix_joint_graph.py": "ef353c0ab1682eaabc6986cd82768447a552a5ec0a78441756d13cccd0e8855b"
+      }
+    },
+    {
+      "name": "sglang317-resume-kernel-full-20261023-r1",
+      "local_root": "D:\\sglang317-resume-kernel-full-20261023-r1",
+      "summary_sha256": "aa3bc6a2e7d0967510e9a4cc6827f8e0f362973e02c25efc6d50f80842d20269",
+      "summary": [
+        {
+          "case": "hiker-clay-01-yellow-raincoat",
+          "title": "红衣变亮黄雨衣",
+          "arms": {
+            "0": {
+              "output_fps_after_first_batch": 16.12621408731742,
+              "ttff_seconds": 2.189524535999908,
+              "send_to_new_rgb_seconds": 2.130364048,
+              "pre_prompt_output_fps": 16.88014584159975,
+              "post_event_output_fps": 17.027408283926587,
+              "max_batch_gap_seconds": 1.732909773,
+              "source_credit_wait_seconds": 4.869474240001523,
+              "n": 3,
+              "peak_allocated_gib": 172.4373803138733,
+              "captures": 2,
+              "replays": 526,
+              "warmups": 0,
+              "selected_plans": 0,
+              "first_event_frames": [
+                136,
+                136,
+                136
+              ],
+              "sent_frames": [
+                128,
+                128,
+                128
+              ],
+              "hot_n": 2
+            },
+            "1": {
+              "output_fps_after_first_batch": 15.947083103484466,
+              "ttff_seconds": 2.0259643749998304,
+              "send_to_new_rgb_seconds": 2.114225202,
+              "pre_prompt_output_fps": 16.681892597830466,
+              "post_event_output_fps": 16.827618098565985,
+              "max_batch_gap_seconds": 1.711896984,
+              "source_credit_wait_seconds": 5.050427081001317,
+              "n": 3,
+              "peak_allocated_gib": 172.43666696548462,
+              "captures": 2,
+              "replays": 526,
+              "warmups": 0,
+              "selected_plans": 132,
+              "first_event_frames": [
+                136,
+                136,
+                136
+              ],
+              "sent_frames": [
+                128,
+                128,
+                128
+              ],
+              "hot_n": 2
+            }
+          }
+        },
+        {
+          "case": "garden-glasshouse-01-stained-glass",
+          "title": "透明温室变彩色玻璃",
+          "arms": {
+            "0": {
+              "output_fps_after_first_batch": 15.665051308349735,
+              "ttff_seconds": 2.3304923620000864,
+              "send_to_new_rgb_seconds": 2.362748423,
+              "pre_prompt_output_fps": 16.58049445776913,
+              "post_event_output_fps": 16.626216714378614,
+              "max_batch_gap_seconds": 1.955919585,
+              "source_credit_wait_seconds": 5.736897815999555,
+              "n": 3,
+              "peak_allocated_gib": 172.4596929550171,
+              "captures": 2,
+              "replays": 526,
+              "warmups": 0,
+              "selected_plans": 0,
+              "first_event_frames": [
+                136,
+                136,
+                136
+              ],
+              "sent_frames": [
+                128,
+                128,
+                128
+              ],
+              "hot_n": 2
+            },
+            "1": {
+              "output_fps_after_first_batch": 15.615462800364005,
+              "ttff_seconds": 2.307043761999921,
+              "send_to_new_rgb_seconds": 2.349003512,
+              "pre_prompt_output_fps": 16.54965382485749,
+              "post_event_output_fps": 16.61714651634054,
+              "max_batch_gap_seconds": 1.93885864,
+              "source_credit_wait_seconds": 5.711374952000597,
+              "n": 3,
+              "peak_allocated_gib": 172.46227741241455,
+              "captures": 2,
+              "replays": 526,
+              "warmups": 0,
+              "selected_plans": 132,
+              "first_event_frames": [
+                136,
+                136,
+                136
+              ],
+              "sent_frames": [
+                128,
+                128,
+                128
+              ],
+              "hot_n": 2
+            }
+          }
+        },
+        {
+          "case": "forest-deck-01-cyan-glowing-trees",
+          "title": "松树变青蓝发光树",
+          "arms": {
+            "0": {
+              "output_fps_after_first_batch": 15.776192607135785,
+              "ttff_seconds": 2.3333327340000096,
+              "send_to_new_rgb_seconds": 2.35398486,
+              "pre_prompt_output_fps": 16.64852688621942,
+              "post_event_output_fps": 16.8320198076278,
+              "max_batch_gap_seconds": 1.944047091,
+              "source_credit_wait_seconds": 5.739622519000136,
+              "n": 3,
+              "peak_allocated_gib": 172.4621024131775,
+              "captures": 2,
+              "replays": 526,
+              "warmups": 0,
+              "selected_plans": 0,
+              "first_event_frames": [
+                136,
+                136,
+                136
+              ],
+              "sent_frames": [
+                128,
+                128,
+                128
+              ],
+              "hot_n": 2
+            },
+            "1": {
+              "output_fps_after_first_batch": 15.592624059312268,
+              "ttff_seconds": 2.324716895999927,
+              "send_to_new_rgb_seconds": 2.351060824,
+              "pre_prompt_output_fps": 16.50880946951634,
+              "post_event_output_fps": 16.52522580503768,
+              "max_batch_gap_seconds": 1.943009541,
+              "source_credit_wait_seconds": 5.770848138002975,
+              "n": 3,
+              "peak_allocated_gib": 172.4694447517395,
+              "captures": 2,
+              "replays": 526,
+              "warmups": 0,
+              "selected_plans": 132,
+              "first_event_frames": [
+                136,
+                136,
+                136
+              ],
+              "sent_frames": [
+                128,
+                128,
+                128
+              ],
+              "hot_n": 2
+            }
+          }
+        }
+      ],
+      "overlay": {
+        "benchmark/zing_h3_causal/prefix_joint.py": "37fd02cb872e6bc1dfe4febb0c66fd270366761b1d3b219eb972469d02d55241",
+        "python/sglang/multimodal_gen/runtime/models/dits/zing_h3.py": "b8d39dac5a14488c3d61e2e1082f13789f761aa9c39843583a8cf8bad7c6d88c",
+        "python/sglang/multimodal_gen/runtime/models/dits/zing_h3_cache.py": "12205df1e134ee8d5c4c73c51409a7ca2ca3f5779fb791abebcc0f41b00bfb1a",
+        "python/sglang/multimodal_gen/runtime/models/dits/zing_h3_joint_attention.py": "3b71557106aaca2249449099d17161848f6af413b3cd37664ebcdafbbc138318",
+        "python/sglang/multimodal_gen/runtime/models/dits/zing_h3_joint_kernel.py": "2bc449252c7f27aabb23a76102f7f6b6fa6caf475e5d55f28f10f4a24ee2010f",
+        "python/sglang/multimodal_gen/test/unit/test_zing_h3_prefix_joint.py": "1f0bf12233867b046b6f0949f36517ced9af17de751958847ca0eaa434d13884",
+        "python/sglang/multimodal_gen/test/unit/test_zing_h3_fixed_joint_attention.py": "3c920d110d033cc2c8608b38e19c3228e6eae208c3c53218a3980af80cf071ee",
+        "benchmark/zing_h3_causal/prefix_joint_graph.py": "5739658c36fd7e5a59786d2786ca6c889a24852e3f07c3a04e1fab8857bdeba1",
+        "python/sglang/multimodal_gen/test/unit/test_zing_h3_prefix_joint_graph.py": "ef353c0ab1682eaabc6986cd82768447a552a5ec0a78441756d13cccd0e8855b"
+      }
+    }
+  ],
+  "local_pr_validation": {
+    "code_commit": "1ecc90987bce421abfec7a545d036c69aa731cce",
+    "platform": "WSL Python3.11 CPU",
+    "runs": [
+      {
+        "scope": "9 model/cache/graph/chunk files before import-scope cleanup",
+        "passed": 353,
+        "skipped": 14,
+        "seconds": 305.71,
+        "log_sha256": "92606aabe44efdafcb02e3480b7714d5f3b0fe03548c29bbfab39034746ef830"
+      },
+      {
+        "scope": "final graph/kernel/components + source adapter/lifecycle/work quantum",
+        "passed": 348,
+        "skipped": 8,
+        "seconds": 120.6,
+        "log_sha256": "5cbec3da0e51047b767d921acca63be56b76a5a3c3aaa22d88a78c33644071f8"
+      },
+      {
+        "scope": "single-step deferred and local/peer prepare failure regressions",
+        "passed": 3,
+        "deselected": 94,
+        "seconds": 41.56,
+        "log_sha256": "c49dd1cb650b295db96e94e4e43611c3e7ebc9b095ff8df2ffc1acf2b28cd2a4"
+      }
+    ],
+    "checks": [
+      "isort7.0.0",
+      "ruff0.15.1 format and F401/F821/UP037",
+      "git diff --check"
+    ],
+    "limitations": [
+      "full pre-commit unavailable",
+      "optional torch-c-dlpack JIT warning",
+      "CUDA/NCCL current-head validation and736 not run"
+    ],
+    "failed_attempt": "combined benchmark/runtime test collection initially shadowed benchmark namespace; moved benchmark-specific tests into benchmark/tests and used flat imports; combined rerun passed",
+    "independent_review": "two P2 issues fixed: empty snapshot and SP prepare error vote; focused rereview found no new blocker"
+  },
+  "rgb_comparison": {
+    "scope": "Stored raw RGB SHA256 only; no per-step latent comparison or pixel error magnitude",
+    "cases": [
+      {
+        "case": "forest-deck-01-cyan-glowing-trees",
+        "pairs": [
+          {
+            "run": "repeat0-forest-deck-01-cyan-glowing-trees",
+            "exact_raw_rgb": false
+          },
+          {
+            "run": "repeat1-forest-deck-01-cyan-glowing-trees",
+            "exact_raw_rgb": false
+          },
+          {
+            "run": "repeat2-forest-deck-01-cyan-glowing-trees",
+            "exact_raw_rgb": false
+          }
+        ],
+        "unique_raw_rgb_per_arm": {
+          "0": 1,
+          "1": 1
+        }
+      },
+      {
+        "case": "garden-glasshouse-01-stained-glass",
+        "pairs": [
+          {
+            "run": "repeat0-garden-glasshouse-01-stained-glass",
+            "exact_raw_rgb": false
+          },
+          {
+            "run": "repeat1-garden-glasshouse-01-stained-glass",
+            "exact_raw_rgb": false
+          },
+          {
+            "run": "repeat2-garden-glasshouse-01-stained-glass",
+            "exact_raw_rgb": false
+          }
+        ],
+        "unique_raw_rgb_per_arm": {
+          "0": 1,
+          "1": 1
+        }
+      },
+      {
+        "case": "hiker-clay-01-yellow-raincoat",
+        "pairs": [
+          {
+            "run": "repeat0-hiker-clay-01-yellow-raincoat",
+            "exact_raw_rgb": false
+          },
+          {
+            "run": "repeat1-hiker-clay-01-yellow-raincoat",
+            "exact_raw_rgb": false
+          },
+          {
+            "run": "repeat2-hiker-clay-01-yellow-raincoat",
+            "exact_raw_rgb": false
+          }
+        ],
+        "unique_raw_rgb_per_arm": {
+          "0": 1,
+          "1": 1
+        }
+      }
+    ]
+  },
+  "archives": {
+    "combined_r4": "c630c62aa0119abccc71e99288fb05c13147e82860fac0824e81fe530d0b4637",
+    "resume_full_r1": "2bf04c5d46eb732488c454d0d8c776f2b512bd9946d9496358c924008145a936",
+    "six_branch_graph_r5": "4ba6d96ed3447e78034b95f5951fc8b8dc74871b3e71edc882667c5bff41e21d",
+    "six_branch_eager_r1": "3b33cf1071c6bfe64b8fee9ac9c79e82461d339f7d54040f520e7610fa599e9c"
+  },
+  "kernel_removal": {
+    "decision": "Remove fused joint kernel and dispatch/options; retain segmented joint forward and six-branch Graph. Historical fused measurements remain evidence only.",
+    "cpu_validation": {
+      "passed": 335,
+      "skipped": 5,
+      "seconds": 109.97,
+      "log_sha256": "e11d6a39760becf8f7cabfcfc7431af87bade6717b3972129289638dda7ada08"
+    },
+    "gpu_validation": "not rerun"
+  }
+}

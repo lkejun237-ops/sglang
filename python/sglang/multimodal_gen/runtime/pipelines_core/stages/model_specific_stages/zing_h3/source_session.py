@@ -66,6 +66,10 @@ class ZingSourceStreamState(BaseRealtimeState):
             else {}
         )
         sampler = stage._build_realtime_sampler(params, **sampling_options)
+        defer_final = os.environ.get("SGLANG_ZING_SOURCE_DEFER_FINAL", "0") == "1"
+        prompt_joint = os.environ.get("SGLANG_ZING_SOURCE_PROMPT_JOINT", "0") == "1"
+        if defer_final and self.work_quantum != 1:
+            raise ValueError("Deferred source final currently requires work quantum 1")
         if sampler.window_policy.window_chunks is None:
             raise ValueError("Continuous source requires a bounded attention window")
         self.policy = {
@@ -78,6 +82,8 @@ class ZingSourceStreamState(BaseRealtimeState):
             "rope_max_frame_gap": sampler.rope_max_frame_gap,
             "video_decoder": stage.codecs.video_decoder_name,
             "source_work_quantum": self.work_quantum,
+            "source_defer_final": defer_final,
+            "source_prompt_joint": prompt_joint,
         }
         if getattr(sampler, "joint_forward", "off") != "off":
             self.policy["joint_forward"] = sampler.joint_forward
@@ -166,6 +172,8 @@ class ZingSourceStreamState(BaseRealtimeState):
             ),
             initial_prompt_event_id=batch.realtime_event_id,
             initial_prompt_version=getattr(batch, "realtime_prompt_version", None),
+            defer_final=defer_final,
+            prompt_joint=prompt_joint,
         )
         capture_dir = os.environ.get("SGLANG_ZING_COMPONENT_CAPTURE_DIR")
         decoder_policy = batch.extra["zing_source_command"].get("decoder")
@@ -524,7 +532,9 @@ class ZingSourceStreamState(BaseRealtimeState):
                     "pending_blocks": len(self.blocks),
                 },
             }
-            if self.policy.get("joint_forward", "off") != "off":
+            if self.policy.get("joint_forward", "off") != "off" or self.policy.get(
+                "source_prompt_joint", False
+            ):
                 usage["zing_h3"] = self.sampler.metrics
                 usage["zing_joint_wait"] = command.get("joint_wait")
             memory = usage["zing_source_memory"]

@@ -427,3 +427,8 @@ payload 未随 launch 次数同比减少。低精度或省略 clean head 属于�
 
 本次修改的 CPU/选择策略回归单列；2026-10-08 的性能表和数值差异仍对应原冻结
 源码，未将自动等待或新 runtime dispatch 冒充已跑过的 GPU 结果。
+
+
+## 五 latent prompt 切换联合（可选）
+
+`SGLANG_ZING_SOURCE_PROMPT_JOINT=1` 在 continuous source 的 `drain_ready` 边界启用六分支：conditions、history 1/2/2、source、target 首步。默认关闭；与 `SOURCE_DEFER_FINAL` 独立控制。使用原生模型接口和分段 attention，不安装 benchmark hook。Graph 可用时首见预热、第二次捕获、之后回放；否则走 eager 六分支；不支持的布局走串行 prefix。细节、适用条件和当前验证边界见 [六分支设计](../plans/PROMPT_PREFIX_JOINT_PROBE.md)。

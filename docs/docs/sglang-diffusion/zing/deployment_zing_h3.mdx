@@ -153,6 +153,22 @@ D128；按正式 ledger 的 832×480 / 1280×736 启动两分支和稳定三分�
 测试提取原实现的 attention 分支循环并调用真实 FA4，使用随机 QKV；不包含全模型、
 SP 通信、RGB 或 E2E 性能验收。[范围与原始结果](https://github.com/seedleap/sglang/pull/389)。
 
+## 单块续推与 prompt 六分支实验（默认关闭）
+
+2026-10-23：新增 `SGLANG_ZING_SOURCE_DEFER_FINAL=1` 实验入口，要求 q1、
+cross_chunk、固定五 latent history、video-only 与 after_step0；复用历史末块做
+final+source+target 首步联合。融合 joint kernel 及其开关已删除，二/三/六分支
+均使用分段 attention；旧 `SGLANG_ZING_JOINT_ATTENTION` 不恢复。六分支
+切换已接入 source 在线代码，设置 `SGLANG_ZING_SOURCE_PROMPT_JOINT=1` 启用（默认 0），支持原生 eager/Graph，benchmark 复用同一实现；历史组件中分段 Graph 比融合快约 5%。
+
+历史 `82fd85da3e` + overlay、L20D/CC10.3、832×480、w6s3/q1/SP2：续推
+joint FPS 约 +1.5%–1.6%，三分支 kernel 无端到端收益；六分支外部桥接的
+热态 prompt→RGB 约省 0.34–0.39 s，峰值 allocated 从约 172.462 增至
+173.272 GiB/card。历史在线 RGB 两组不同：后续独立实验已复现 VAE performance 跨进程差异，deterministic 相同；固定输入的 KV 抽样一致。当前原生在线实现尚无新 GPU 验收，历史首见形状约 10 s。
+当前合入 `1dbe50bf4d` 后的移植、736、H100/H200 及 Encoder/DiT/Decoder
+完整阶段性能和独立显存尚未验收，不能作为默认部署建议。
+范围、测试及原始证据入口见[联合优化设计](/docs/sglang-diffusion/zing/plans/SOURCE_DEFERRED_FINAL)。
+
 ## Qwen 媒体预处理
 
 Qwen 使用按角色归一化后的媒体：reference 图片/视频分别沿用
@@ -293,3 +309,10 @@ Lynn 依赖必须匹配原生 Zing 的完整 Diffusers 包：提交
 显存另采。有限输入的本地条件编码支持完整多帧视频，不能套用远程单帧条件服务的校验器；
 Qwen 实际编码与连续 source 的缓存命中分列。模型张量存储按物理 storage 去重，共享进程区间峰值与组件独占显存区分报告，
 阶段重叠不相加作为 E2E。[PR #367](https://github.com/seedleap/sglang/pull/367) 维护最终结果与复现回执。
+
+
+### 六分支在线接入验证边界（2026-10-23，PR #403）
+
+`SOURCE_PROMPT_JOINT=1` 将新 conditions、5 latent history、source 与 target 首步联合；继续使用分段 FA4，无新增融合 attention kernel。单活跃 source 会话持有本次待提交 prefix，模型持有有界 Graph，取消/异常释放会话状态。unsupported 布局回退串行；metrics 的 `forward_counts.prompt_joint` 与 `prompt_joint_graph_routes` 分别记录实际联合调用、warmup/capture/replay，不能用开关值代替实际命中。
+
+本次原生实现仅完成本地 CPU/recording-backend 验证，480 与 736 的当前提交 GPU E2E、TTFF/FPS/TPOC/ICL、Encoder（Qwen/reference/source）、DiT、Decoder 的阶段中位数/P95及 allocated/reserved 常驻与峰值均未重新采集；旧 overlay 数值不作为当前版本性能结论。未启动或替换生产服务。详见 [PR 设计与验证记录](plans/SOURCE_DEFERRED_FINAL.md)。

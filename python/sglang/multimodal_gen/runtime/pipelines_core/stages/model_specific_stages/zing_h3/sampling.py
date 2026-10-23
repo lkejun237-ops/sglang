@@ -194,6 +194,35 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             embedder=self.generator.time_embedder,
         )
 
+    def pack_prompt_prefix(self, inputs, condition, visual_prefix):
+        """Prepare condition + 1/2/2 history without changing the live KV cache."""
+        prefix_inputs = copy(inputs)
+        prefix_inputs.positive, prefix_inputs.source_visual = condition, None
+        layout, chunks = self.processor.pack_prompt_switch_prefix(
+            prefix_inputs, condition, visual_prefix
+        )
+        packs = [self._select_block(layout, 0, phase="prefix", video_t=1, audio_t=1)]
+        for chunk in chunks:
+            self._set_block_latents(
+                layout,
+                chunk.target_block,
+                visual_prefix[:, :, chunk.start : chunk.end],
+                None,
+            )
+            packs.append(
+                self._select_block(
+                    layout,
+                    chunk.target_block,
+                    phase="target",
+                    video_t=1,
+                    audio_t=None,
+                    final=True,
+                )
+            )
+        host = self._layout_index(layout).host
+        target = host["row_role"] == int(H3RowRole.TARGET_VISUAL)
+        return packs, float(host["position_ids"][target][0, 0]), chunks[-1].end
+
     def rebuild_prompt_prefix(self, inputs, condition, visual_prefix, cache):
         """Replace all logical KV with a new condition and clean latent prefix."""
         prefix_inputs = copy(inputs)
@@ -742,32 +771,38 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
 
     def _ready_cross_prediction(self, previous, current):
         """Join two separately packed ready chunks without moving RNG draws."""
-        source, target, start, end = current.spans[0]
         old_target = previous.spans[0][1]
+        self._set_block_latents(
+            previous.positive, old_target, previous.visual, previous.audio
+        )
+        final = self._select_block(
+            previous.positive,
+            old_target,
+            phase="target",
+            video_t=1,
+            audio_t=None,
+            final=True,
+        )
+        return self._resume_cross_prediction(final, current)
+
+    def _resume_cross_packs(self, final, current):
+        source, target, _, _ = current.spans[0]
         cache, pos = current.cache, current.positive
         if not self._joint_eligible(
             pos, cache, source, target, current.audio, cross=True
         ):
             return None
-        self._set_block_latents(
-            previous.positive, old_target, previous.visual, previous.audio
-        )
         self._set_block_latents(pos, target, current.visual, current.audio)
+        schedules = getattr(self, "schedules_for", None)
+        vs = schedules(current)[0] if schedules is not None else self.video_scheduler
         packs = [
-            self._select_block(
-                previous.positive,
-                old_target,
-                phase="target",
-                video_t=1,
-                audio_t=None,
-                final=True,
-            ),
+            final,
             self._select_block(pos, source, phase="source", video_t=1, audio_t=None),
             self._select_block(
                 pos,
                 target,
                 phase="target",
-                video_t=self._host_list(self.video_scheduler.timesteps)[0],
+                video_t=self._host_list(vs.timesteps)[0],
                 audio_t=None,
             ),
         ]
@@ -789,8 +824,17 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
                 reasons.get("pooled_scratch_capacity", 0) + 1
             )
             return None
+        return packs
+
+    def _resume_cross_prediction(self, final, current):
+        packs = self._resume_cross_packs(final, current)
+        if packs is None:
+            return None
         return self._predict_joint(
-            packs, ("final", "source", "active"), current.visual.shape[2:], cache
+            packs,
+            ("final", "source", "active"),
+            current.visual.shape[2:],
+            current.cache,
         )
 
     def _sample_cross_chunk(self, state):

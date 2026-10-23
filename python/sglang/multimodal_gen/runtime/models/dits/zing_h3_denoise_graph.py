@@ -409,7 +409,8 @@ class ZingChunkGraphs:
             saved = tuple(value.clone() for value in flat)
 
             def restore():
-                torch._foreach_copy_(list(flat), list(saved))
+                if flat:
+                    torch._foreach_copy_(list(flat), list(saved))
 
             def capture():
                 # Production capture calls this eagerly once, then under capture.
@@ -535,7 +536,7 @@ class ZingChunkGraphs:
             ZingFixedForwardKVPlan,
         )
         from sglang.multimodal_gen.runtime.models.dits.zing_h3_joint import (
-            ZingJointTransaction,
+            joint_transaction,
         )
 
         host = packed["_zing_host_layout"]
@@ -543,7 +544,7 @@ class ZingChunkGraphs:
         rows = positions.shape[0]
         transaction = None
         if phase == "joint":
-            transaction = ZingJointTransaction(
+            transaction = joint_transaction(
                 shadow,
                 packed["_zing_joint_phases"],
                 positions,
@@ -562,9 +563,13 @@ class ZingChunkGraphs:
             positions,
             ends=ends,
             clean_rows=clean,
-            prefix=phase == "prefix",
+            prefix=phase == "prefix" or (transaction is not None and len(ends) == 6),
             after=after,
         )
+        if transaction is not None and len(ends) == 6:
+            kv.tensors["current_positions"] = transaction.mapped_positions.to(
+                packed["x"].device
+            )
         model = sampler.generator
         if (
             shadow._model_signature is None
@@ -636,7 +641,12 @@ class ZingChunkGraphs:
     def initialization(self, sampler, current):
         return self._initial_prediction(sampler, current, kind="init", prefix=True)
 
-    def _initial_prediction(self, sampler, current, *, kind, prefix):
+    def resume(self, sampler, current, packs):
+        return self._initial_prediction(
+            sampler, current, kind="resume", prefix=False, resume_packs=packs
+        )
+
+    def _initial_prediction(self, sampler, current, *, kind, prefix, resume_packs=None):
         source, target, _, _ = current.spans[0]
         # Finish every host collective before local model preparation. A peer
         # whose prefix plan fails must meet the others at the status vote, never
@@ -667,21 +677,34 @@ class ZingChunkGraphs:
                         current.positive, 0, phase="prefix", video_t=1, audio_t=1
                     )
                     plans.append(self._forward_plan(sampler, shadow, packed, "prefix"))
-            shadow.begin_chunk(target)
+            if resume_packs is None:
+                shadow.begin_chunk(target)
             vs, _ = self._schedules(sampler, current)
-            packs = [
-                sampler._select_block(
-                    current.positive, source, phase="source", video_t=1, audio_t=None
-                ),
-                sampler._select_block(
-                    current.positive,
-                    target,
-                    phase="target",
-                    video_t=sampler._host_list(vs.timesteps)[0],
-                    audio_t=None,
-                ),
-            ]
-            packed = self._joint_packed(packs, ("source", "active"))
+            if resume_packs is None:
+                packs = [
+                    sampler._select_block(
+                        current.positive,
+                        source,
+                        phase="source",
+                        video_t=1,
+                        audio_t=None,
+                    ),
+                    sampler._select_block(
+                        current.positive,
+                        target,
+                        phase="target",
+                        video_t=sampler._host_list(vs.timesteps)[0],
+                        audio_t=None,
+                    ),
+                ]
+            else:
+                packs = resume_packs
+            phases = (
+                ("source", "active")
+                if resume_packs is None
+                else ("final", "source", "active")
+            )
+            packed = self._joint_packed(packs, phases)
             plans.append(
                 self._forward_plan(
                     sampler,
@@ -691,7 +714,12 @@ class ZingChunkGraphs:
                     after=plans[-1].kv_plan if plans else None,
                 )
             )
-            tensors = {"source_x": packs[0]["x"], "latent": current.visual}
+            tensors = {
+                "source_x": packs[0]["x"]
+                if resume_packs is None
+                else torch.cat([p["x"] for p in packs[:-1]]),
+                "latent": current.visual,
+            }
             self._attach(plans, tensors)
             target_rows = packs[-1]["x"].shape[0]
 
@@ -721,7 +749,9 @@ class ZingChunkGraphs:
         kv = plans[0].kv_plan
         outputs = self._run(kind, plans, tensors, execute, kv.stores, kv.rotated)
         current.cache.publish_plan(shadow)
-        sampler._forward_counts["source_first"] += 1
+        sampler._forward_counts[
+            "source_first" if resume_packs is None else "cross_chunk"
+        ] += 1
         if len(plans) > 1:
             sampler._forward_counts["prefix"] += 1
         return outputs[0], None
@@ -735,7 +765,12 @@ class ZingChunkGraphs:
             else (sampler.video_scheduler, sampler.audio_scheduler)
         )
 
-    def chunk(self, sampler, current, first, next_state=None):
+    def chunk(self, sampler, current, first, next_state=None, *, defer_final=False):
+        if defer_final and next_state is not None:
+            raise ValueError(
+                "Deferred final and ready lookahead are mutually exclusive"
+            )
+
         def prepare():
             cache, pos = current.cache, current.positive
             shadow = cache.planning_copy()
@@ -811,7 +846,7 @@ class ZingChunkGraphs:
                         after=plans[-1].kv_plan if plans else None,
                     )
                 )
-            else:
+            elif not defer_final:
                 packed = sampler._select_block(
                     pos, target, phase="target", video_t=1, audio_t=None, final=True
                 )
@@ -829,8 +864,8 @@ class ZingChunkGraphs:
                 tensors[f"noise.{step}"] = torch.randn_like(current.visual)
             for step in range(steps):
                 tensors[f"sigma.{step}"] = vs.sigmas[step]
-            stores = plans[0].kv_plan.stores
-            rotated = plans[0].kv_plan.rotated
+            stores = plans[0].kv_plan.stores if plans else ()
+            rotated = plans[0].kv_plan.rotated if plans else ()
             latent_shape = current.visual.shape[2:]
 
             def schedule(prediction, video, step, static):
@@ -852,7 +887,7 @@ class ZingChunkGraphs:
 
             def execute(static):
                 video = schedule(static["first"], static["latent"], 0, static)
-                for index, plan in enumerate(plans[:-1]):
+                for index, plan in enumerate(plans if defer_final else plans[:-1]):
                     x = sampler.processor.patchify_visual(video).to(
                         static[f"f{index}.x"]
                     )
@@ -861,6 +896,8 @@ class ZingChunkGraphs:
                         rows, 1, latent_shape
                     )
                     video = schedule(prediction, video, index + 1, static)
+                if defer_final:
+                    return (video,)
                 index = len(plans) - 1
                 x = sampler.processor.patchify_visual(video).to(static[f"f{index}.x"])
                 if next_state is not None:
@@ -888,7 +925,13 @@ class ZingChunkGraphs:
         )
         cache, pos = current.cache, current.positive
         target = current.spans[0][1]
-        kind = "steady" if next_state is not None else "finish"
+        kind = (
+            "deferred"
+            if defer_final
+            else "steady"
+            if next_state is not None
+            else "finish"
+        )
         self._discard_rotated(cache, shadow)
         # Step zero reads no K/V, so moving the surviving rows first is
         # equivalent to compacting between step zero and the first forward.
@@ -898,7 +941,8 @@ class ZingChunkGraphs:
         current.visual.copy_(outputs[0])
         sampler._set_block_latents(pos, target, current.visual, None)
         sampler._forward_counts["denoise"] += steps - 1
-        sampler._forward_counts[
-            "cross_chunk" if next_state is not None else "commit"
-        ] += 1
+        if not defer_final:
+            sampler._forward_counts[
+                "cross_chunk" if next_state is not None else "commit"
+            ] += 1
         return outputs[0], None if next_state is None else (outputs[1], None)

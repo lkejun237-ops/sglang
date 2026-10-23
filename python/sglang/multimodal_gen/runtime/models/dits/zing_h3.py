@@ -55,7 +55,10 @@ from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
     RouteCoordinator,
     ZingDenoiseGraphs,
 )
-from sglang.multimodal_gen.runtime.models.dits.zing_h3_joint import ZingJointTransaction
+from sglang.multimodal_gen.runtime.models.dits.zing_h3_joint import (
+    joint_transaction,
+    prefix_modulation,
+)
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_model_signature import (
     model_signatures,
 )
@@ -161,6 +164,8 @@ class _BlockOptions(msgspec.Struct, frozen=True, kw_only=True):
     projection_key: object
     joint_ends: tuple | None = None
     branch_projection_keys: object = None
+    projection_group_sizes: tuple | None = None
+    joint_video_ends: tuple | None = None
     fixed_kv: object = None
     fixed_tensors: object = None
     full_rope: object = None
@@ -909,7 +914,9 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         )
         self.denoise_graph_sp = denoise_graph_sp == "1"
 
-    def _project_outputs(self, hidden, p, layout, *, joint_ends=None):
+    def _project_outputs(
+        self, hidden, p, layout, *, joint_ends=None, mixed_prefix=False
+    ):
         """Project video/audio rows and restore global packed order across SP.
 
         Stable shapes gather hidden rows before projection to match SP1 GEMM
@@ -921,9 +928,29 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         )
         output_vrows, output_arows = layout.local_vrows, layout.local_arows
         if replicated_output:
-            hidden = gather_sequence_varlen(
-                hidden, sequence_splits, get_sp_group().ulysses_group, dim=0
-            )
+            if mixed_prefix:
+                # One communicator and graph-owned buffers for equal/unequal SP shards.
+                maximum = max(sequence_splits)
+                if hidden.shape[0] < maximum:
+                    hidden = torch.cat(
+                        (
+                            hidden,
+                            hidden.new_zeros(
+                                (maximum - hidden.shape[0], hidden.shape[1])
+                            ),
+                        )
+                    )
+                parts = [torch.empty_like(hidden) for _ in sequence_splits]
+                torch.distributed.all_gather(
+                    parts, hidden.contiguous(), group=get_sp_group().ulysses_group
+                )
+                hidden = torch.cat(
+                    [part[:size] for part, size in zip(parts, sequence_splits)]
+                )
+            else:
+                hidden = gather_sequence_varlen(
+                    hidden, sequence_splits, get_sp_group().ulysses_group, dim=0
+                )
             output_vrows, output_arows = layout.vrows, layout.arows
         video_hidden = hidden.index_select(0, output_vrows).float()
         if joint_ends is None:
@@ -1313,7 +1340,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         if joint_phases is not None:
             if cache is None or self_cache_update != "joint":
                 raise ValueError("Zing joint phases require a joint cache transaction")
-            joint = ZingJointTransaction(
+            joint = joint_transaction(
                 cache,
                 joint_phases,
                 meta_positions,
@@ -1361,40 +1388,54 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 x.device,
             )
             row_start, row_stop = layout.row_start, layout.row_stop
-            unique_t, t_indices = torch.unique(meta_t, sorted=True, return_inverse=True)
-            # With host row metadata this copy lets the AdaLN projection cache
-            # key the batch without reading the device tensor back.
+            group_sizes = video_ends = None
+            prefix_joint = joint is not None and len(joint.ends) == 6
+            if prefix_joint:
+                if self.adaln_table is not None:
+                    raise ValueError("Prompt joint requires resident AdaLN weights")
+                if ulysses_size > 1 and not self.experimental_stable_shapes:
+                    raise ValueError("Prompt joint SP requires stable output shapes")
+                unique_t, group_sizes, all_indices, t_indices, video_ends = (
+                    prefix_modulation(
+                        meta_t,
+                        meta_roles,
+                        joint.ends,
+                        self.modality_tags,
+                        self.arch.num_modalities,
+                    )
+                )
+                attention_positions = host_to_device(joint.mapped_positions, x.device)
+                history_positions = None
+            else:
+                unique_t, t_indices = torch.unique(
+                    meta_t, sorted=True, return_inverse=True
+                )
+                all_indices = t_indices * self.arch.num_modalities + layout.modality
+                attention_positions, history_positions = (
+                    cache.attention_positions(
+                        position_ids,
+                        prefix=self_cache_update == "prefix",
+                        host_current=None if host_layout is None else meta_positions,
+                    )
+                    if cache is not None
+                    else (position_ids, None)
+                )
+            # Preserve each serial timestep batch, including mixed-condition
+            # batches whose rounding differs from singleton clean/media batches.
             key_unique_t = unique_t
             unique_t = host_to_device(unique_t, x.device)
-            # Sequential clean/active forwards embed one timestep at a time.
-            # Preserve those small projection batch shapes even when the main
-            # token projections share a joint traversal.
             adaln_input = (
                 F.silu(self.time_embedder(unique_t.float())).bfloat16()
                 if joint is None
                 else torch.cat(
                     [
                         F.silu(self.time_embedder(t.float())).bfloat16()
-                        for t in unique_t.split(1)
+                        for t in unique_t.split(group_sizes or 1)
                     ]
                 )
             )
-            indices = host_to_device(
-                (t_indices * self.arch.num_modalities + layout.modality)[
-                    row_start:row_stop
-                ],
-                x.device,
-            )
+            indices = host_to_device(all_indices[row_start:row_stop], x.device)
             local_t_indices = host_to_device(t_indices[row_start:row_stop], x.device)
-            attention_positions, history_positions = (
-                cache.attention_positions(
-                    position_ids,
-                    prefix=self_cache_update == "prefix",
-                    host_current=None if host_layout is None else meta_positions,
-                )
-                if cache is not None
-                else (position_ids, None)
-            )
             rope_positions = (
                 attention_positions
                 if layout.sequence_splits is not None
@@ -1424,7 +1465,11 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 # combined unique-t batch. Only require entries actually used.
                 if joint is None:
                     projection_key = projection_cache.lookup(key_unique_t)
-            elif self.adaln_projection_cache_enabled and cache is not None:
+            elif (
+                self.adaln_projection_cache_enabled
+                and cache is not None
+                and not prefix_joint
+            ):
                 projection_cache = cache.adaln_projection_cache
                 if (
                     projection_cache is None
@@ -1502,6 +1547,8 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 projection_key=projection_key,
                 joint_ends=None if joint is None else joint.ends,
                 branch_projection_keys=branch_projection_keys,
+                projection_group_sizes=group_sizes,
+                joint_video_ends=video_ends,
             )
             inputs = _BodyInputs(
                 x=x,
@@ -1674,6 +1721,22 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             host.row_role, host, rows, size, rank, replicated_prefix, device
         )
         unique_t, t_indices = torch.unique(host_t, sorted=True, return_inverse=True)
+        group_sizes = video_ends = None
+        prefix_joint = joint and len(ends) == 6
+        if prefix_joint:
+            if self.adaln_table is not None:
+                raise ValueError("Prompt joint requires resident AdaLN weights")
+            if size > 1 and not self.experimental_stable_shapes:
+                raise ValueError("Prompt joint SP requires stable output shapes")
+            unique_t, group_sizes, all_indices, t_indices, video_ends = (
+                prefix_modulation(
+                    host_t,
+                    host.row_role,
+                    ends,
+                    self.modality_tags,
+                    self.arch.num_modalities,
+                )
+            )
         tensors = {
             name: host_to_device(packed[name], device)
             for name in ("x", "audio_x", "context", "seq_lens")
@@ -1688,6 +1751,10 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         tensors["local_t_indices"] = host_to_device(
             t_indices[layout.row_start : layout.row_stop], device
         )
+        if prefix_joint:
+            tensors["indices"] = host_to_device(
+                all_indices[layout.row_start : layout.row_stop], device
+            )
         for name in _GRAPH_LAYOUT_INPUTS:
             tensors["layout." + name] = getattr(layout, name)
         tensors.update({"kv." + name: value for name, value in kv_plan.tensors.items()})
@@ -1729,6 +1796,8 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             projection_cache=None,
             projection_key=None,
             joint_ends=ends if joint else None,
+            projection_group_sizes=group_sizes,
+            joint_video_ends=video_ends,
             fixed_kv=kv_plan,
         )
 
@@ -1755,7 +1824,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 torch.cat(
                     [
                         F.silu(self.time_embedder(t.float())).bfloat16()
-                        for t in times.split(1)
+                        for t in times.split(group_sizes or 1)
                     ]
                 )
                 if joint
@@ -1802,6 +1871,8 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             _numerics_mode(),
             tuple((name, os.environ.get(name)) for name in _GRAPH_ROUTE_ENVS),
             phase,
+            group_sizes,
+            video_ends,
             ends,
             clean,
             kv_plan.capacity,
@@ -1906,7 +1977,9 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 else options.projection_cache.project(
                     slot, module, value, options.branch_projection_keys[i]
                 )
-                for i, value in enumerate(inputs.adaln_input.split(1))
+                for i, value in enumerate(
+                    inputs.adaln_input.split(options.projection_group_sizes or 1)
+                )
             ]
             return tuple(torch.cat(values) for values in zip(*parts))
         if options.projection_cache is None:
@@ -2196,9 +2269,12 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             )
         )
         hidden = self.final_layer.norm(hidden) * (1 + scale) + shift
-        video, audio = self._project_outputs(
-            hidden, p, layout, joint_ends=options.joint_ends
-        )
+        output_options = {"joint_ends": options.joint_ends}
+        if options.joint_video_ends is not None:
+            output_options.update(
+                joint_ends=options.joint_video_ends, mixed_prefix=True
+            )
+        video, audio = self._project_outputs(hidden, p, layout, **output_options)
         return video, audio, layers
 
     def _denoise_graph_rejection(

@@ -223,15 +223,15 @@ class ZingBlockSamplingHelpers:
                 for name in _GUARDED_ROWS
             )
         from sglang.multimodal_gen.runtime.models.dits.zing_h3_joint import (
-            ZingJointTransaction,
             ZingJointUnsupported,
+            joint_transaction,
         )
 
         host = _host_metadata(packed)
         layout = packed if host is None else vars(host["host_layout"])
         unsupported = error = None
         try:
-            ZingJointTransaction(
+            joint_transaction(
                 cache,
                 phases,
                 layout["position_ids"],
@@ -266,7 +266,13 @@ class ZingBlockSamplingHelpers:
             return None
         packed["_zing_joint_phases"] = phases
         video, _ = self._forward(packed, cache, "joint")
-        kind = "source_first" if len(phases) == 2 else "cross_chunk"
+        kind = (
+            "source_first"
+            if len(phases) == 2
+            else "prompt_joint"
+            if len(phases) == 6
+            else "cross_chunk"
+        )
         shapes = self.last_run_metrics.setdefault("joint_row_shapes", {}).setdefault(
             kind, {}
         )
@@ -331,9 +337,11 @@ class ZingBlockSamplingHelpers:
                 kind = (
                     "source_first"
                     if len(packed["_zing_joint_phases"]) == 2
+                    else "prompt_joint"
+                    if len(packed["_zing_joint_phases"]) == 6
                     else "cross_chunk"
                 )
-            counts[kind] += 1
+            counts[kind] = counts.get(kind, 0) + 1
         names = (
             "x",
             "audio_x",
@@ -592,6 +600,57 @@ class ZingBlockSamplingHelpers:
             _HOST_LAYOUT: selection.host_layouts[final],
             _HOST_T: t,
             _PREDICT_ROWS: selection,
+        }
+        packed[_HOST_GUARD] = tuple(
+            (name, packed[name], tensor_identity(packed[name]))
+            for name in _GUARDED_ROWS
+        )
+        return packed
+
+    def _deferred_final(self, cache, recent_visual, layout):
+        """Reconstruct the active clean block from the existing prompt history.
+
+        The cache owns its block/position identity. The session's five-frame
+        history owns its values; neither needs an additional pending record.
+        """
+        block, positions = cache.active
+        host_positions = cache._active_reference
+        if host_positions is None or host_positions.device.type != "cpu":
+            raise ValueError("Deferred final requires validated host cache positions")
+        frames = int(host_positions[:, 0].unique().numel())
+        if recent_visual is None or recent_visual.shape[2] < frames:
+            raise ValueError("Deferred final exceeds retained visual history")
+        x = self.processor.patchify_visual(recent_visual[:, :, -frames:]).to(
+            layout["clean_visual"]
+        )
+        rows = positions.shape[0]
+        if x.shape[0] != rows:
+            raise ValueError("Deferred final history does not match active geometry")
+        host = ZingHostLayout(
+            position_ids=host_positions,
+            block_idx=torch.full((rows,), block, dtype=torch.long),
+            row_role=torch.full(
+                (rows,), int(H3RowRole.TARGET_VISUAL), dtype=torch.long
+            ),
+            seq_lens=torch.tensor([rows], dtype=torch.long),
+            clean_seq_lens=torch.tensor([rows], dtype=torch.long),
+        )
+        t = torch.ones(rows, dtype=torch.float32)
+        # Layout metadata can remain on CPU while visual payloads live on CUDA.
+        # Match ordinary _select_block packs before either joint path cats them.
+        metadata_device = layout["row_role"].device
+        packed = {
+            "x": x,
+            "audio_x": layout["clean_audio"][:0],
+            "context": layout["context"][:0],
+            "position_ids": host_to_device(host_positions, metadata_device),
+            **{
+                name: host_to_device(getattr(host, name), metadata_device)
+                for name in ("block_idx", "row_role", "seq_lens", "clean_seq_lens")
+            },
+            "t": host_to_device(t, metadata_device),
+            _HOST_LAYOUT: host,
+            _HOST_T: t,
         }
         packed[_HOST_GUARD] = tuple(
             (name, packed[name], tensor_identity(packed[name]))

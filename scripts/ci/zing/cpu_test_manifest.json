@@ -1669,6 +1669,35 @@
       }
     },
     {
+      "path": "benchmark/zing_h3_causal/tests/test_prefix_joint.py",
+      "suite": "benchmark-contracts",
+      "status": "MIXED",
+      "approved": true,
+      "allowed_skips": [
+        {
+          "nodeid": "benchmark/zing_h3_causal/tests/test_prefix_joint.py::test_metadata_snapshot_mixed_devices[cuda]",
+          "reason": "CUDA only"
+        }
+      ],
+      "sources": [
+        "main"
+      ],
+      "reason": "PR #403 six-branch model/KV and recording-Graph CPU contracts; included in the 335-pass local regression. CUDA metadata case is explicitly reviewed as GPU-only.",
+      "dependencies": []
+    },
+    {
+      "path": "benchmark/zing_h3_causal/tests/test_prefix_joint_graph.py",
+      "suite": "benchmark-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "PR #403 six-branch model/KV and recording-Graph CPU contracts; included in the 335-pass local regression. CUDA metadata case is explicitly reviewed as GPU-only.",
+      "dependencies": []
+    },
+    {
       "path": "benchmark/zing_h3_causal/tests/test_prepare_encoder_overlap.py",
       "suite": "benchmark-contracts",
       "status": "CPU_PASS",
@@ -3605,6 +3634,10 @@
         {
           "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_denoise_graph.py::test_chunk_cuda_capture_restores_write_spans_and_preserves_history",
           "reason": "CUDA required"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_denoise_graph.py::test_deferred_final_matches_layout_devices[cuda]",
+          "reason": "CUDA device required for the production device layout"
         }
       ],
       "sources": [
