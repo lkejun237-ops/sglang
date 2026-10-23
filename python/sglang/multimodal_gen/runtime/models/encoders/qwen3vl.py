@@ -7,7 +7,10 @@ from transformers import (
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.utils import TransformersKwargs, is_torchdynamo_compiling
 
-from sglang.multimodal_gen.configs.models.encoders.qwen3vl import Qwen3VLConfig
+from sglang.multimodal_gen.configs.models.encoders.qwen3vl import (
+    Qwen3VLConfig,
+    Qwen3VLExecutionOptions,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     model_parallel_is_initialized,
@@ -32,10 +35,16 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_ops import (
+    Qwen3VLFA4Attention,
+    Qwen3VLHFRMSNorm,
+    rounded_swiglu,
+)
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
     Qwen3VLVisionTransformer,
 )
 from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
+    QwenVLFusedMRoPE,
     apply_qwen_vl_text_rope,
     build_qwen_vl_text_rope,
 )
@@ -69,7 +78,11 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 )
 
 
-def _make_text_rms_norm(hidden_size: int, eps: float) -> RMSNorm:
+def _make_text_rms_norm(
+    hidden_size: int, eps: float, *, fused: bool = False
+) -> nn.Module:
+    if fused:
+        return Qwen3VLHFRMSNorm(hidden_size, eps)
     return RMSNorm(
         hidden_size,
         eps=eps,
@@ -224,6 +237,8 @@ class Qwen3VLTextAttention(nn.Module):
         use_weight_only_fp8: bool = False,
         use_tensor_parallel: bool = False,
         prefix: str = "",
+        execution_options: Qwen3VLExecutionOptions = Qwen3VLExecutionOptions(),
+        fused_rope: QwenVLFusedMRoPE | None = None,
     ):
         super().__init__()
         self.config = config
@@ -289,20 +304,42 @@ class Qwen3VLTextAttention(nn.Module):
             use_tensor_parallel=use_tensor_parallel,
             prefix=f"{prefix}.o_proj",
         )
-        self.q_norm = _make_text_rms_norm(self.head_dim, config.rms_norm_eps)
-        self.k_norm = _make_text_rms_norm(self.head_dim, config.rms_norm_eps)
+        self.q_norm = _make_text_rms_norm(
+            self.head_dim, config.rms_norm_eps, fused=execution_options.hf_rmsnorm
+        )
+        self.k_norm = _make_text_rms_norm(
+            self.head_dim, config.rms_norm_eps, fused=execution_options.hf_rmsnorm
+        )
         self.rotary_emb = build_qwen_vl_text_rope(config, mrope_interleaved=True)
+        self.fused_rope = (
+            (
+                fused_rope
+                if fused_rope is not None
+                else QwenVLFusedMRoPE(self.rotary_emb)
+            )
+            if execution_options.fused_mrope
+            else None
+        )
 
-        self.attn = LocalAttention(
-            num_heads=self.num_heads,
-            head_size=self.head_dim,
-            num_kv_heads=self.num_key_value_heads,
-            softmax_scale=self.scaling,
-            causal=True,
-            supported_attention_backends=(
-                AttentionBackendEnum.FA,
-                AttentionBackendEnum.TORCH_SDPA,
-            ),
+        self.attn = (
+            Qwen3VLFA4Attention(softmax_scale=self.scaling, causal=True)
+            if execution_options.text_fa4 is True
+            else LocalAttention(
+                required_attention_backend=(
+                    AttentionBackendEnum.TORCH_SDPA
+                    if execution_options.text_fa4 is False
+                    else None
+                ),
+                num_heads=self.num_heads,
+                head_size=self.head_dim,
+                num_kv_heads=self.num_key_value_heads,
+                softmax_scale=self.scaling,
+                causal=True,
+                supported_attention_backends=(
+                    AttentionBackendEnum.FA,
+                    AttentionBackendEnum.TORCH_SDPA,
+                ),
+            )
         )
 
     def forward(
@@ -330,6 +367,7 @@ class Qwen3VLTextAttention(nn.Module):
             position_ids,
             query_states,
             key_states,
+            fused_rope=self.fused_rope,
         )
 
         if past_key_values is not None:
@@ -372,31 +410,63 @@ class Qwen3VLTextMLP(nn.Module):
         use_weight_only_fp8: bool = False,
         use_tensor_parallel: bool = False,
         prefix: str = "",
+        execution_options: Qwen3VLExecutionOptions = Qwen3VLExecutionOptions(),
     ):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = _make_text_linear(
-            self.hidden_size,
-            self.intermediate_size,
-            bias=False,
-            quant_config=quant_config,
-            use_weight_only_fp8=use_weight_only_fp8,
-            use_tensor_parallel=use_tensor_parallel,
-            gather_output=False,
-            prefix=f"{prefix}.gate_proj",
-        )
-        self.up_proj = _make_text_linear(
-            self.hidden_size,
-            self.intermediate_size,
-            bias=False,
-            quant_config=quant_config,
-            use_weight_only_fp8=use_weight_only_fp8,
-            use_tensor_parallel=use_tensor_parallel,
-            gather_output=False,
-            prefix=f"{prefix}.up_proj",
-        )
+        self.fused_gate_up = execution_options.fused_gate_up
+        if self.fused_gate_up:
+            online_fp8 = (
+                quant_config is not None
+                and quant_config.get_name() == "fp8"
+                and not quant_config.is_checkpoint_fp8_serialized
+                and quant_config.activation_scheme == "dynamic"
+                and quant_config.weight_block_size is None
+                and not quant_config.ignored_layers
+            )
+            if (
+                (quant_config is not None and not online_fp8)
+                or use_weight_only_fp8
+                or (use_tensor_parallel and _tp_world_size() != 1)
+                or config.hidden_act != "silu"
+            ):
+                raise ValueError(
+                    "Fused Qwen gate/up requires SiLU and encoder TP=1, with either "
+                    "unquantized weights or online dynamic FP8 without ignored layers"
+                )
+            self.gate_up_proj = _make_text_linear(
+                self.hidden_size,
+                2 * self.intermediate_size,
+                bias=False,
+                quant_config=quant_config,
+                use_weight_only_fp8=False,
+                use_tensor_parallel=False,
+                gather_output=False,
+                prefix=f"{prefix}.gate_up_proj",
+            )
+        else:
+            self.gate_proj = _make_text_linear(
+                self.hidden_size,
+                self.intermediate_size,
+                bias=False,
+                quant_config=quant_config,
+                use_weight_only_fp8=use_weight_only_fp8,
+                use_tensor_parallel=use_tensor_parallel,
+                gather_output=False,
+                prefix=f"{prefix}.gate_proj",
+            )
+            self.up_proj = _make_text_linear(
+                self.hidden_size,
+                self.intermediate_size,
+                bias=False,
+                quant_config=quant_config,
+                use_weight_only_fp8=use_weight_only_fp8,
+                use_tensor_parallel=use_tensor_parallel,
+                gather_output=False,
+                prefix=f"{prefix}.up_proj",
+            )
         self.down_proj = _make_text_row_linear(
             self.intermediate_size,
             self.hidden_size,
@@ -409,6 +479,8 @@ class Qwen3VLTextMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
+        if self.fused_gate_up:
+            return self.down_proj(rounded_swiglu(self.gate_up_proj(x)))
         hidden_states = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
         if not isinstance(
             self.down_proj, (Qwen3VLRowParallelLinear, WeightOnlyFP8RowParallelLinear)
@@ -429,6 +501,8 @@ class Qwen3VLTextDecoderLayer(nn.Module):
         use_weight_only_fp8: bool = False,
         use_tensor_parallel: bool = False,
         prefix: str = "",
+        execution_options: Qwen3VLExecutionOptions = Qwen3VLExecutionOptions(),
+        fused_rope: QwenVLFusedMRoPE | None = None,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -440,6 +514,8 @@ class Qwen3VLTextDecoderLayer(nn.Module):
             use_weight_only_fp8=use_weight_only_fp8,
             use_tensor_parallel=use_tensor_parallel,
             prefix=f"{prefix}.self_attn",
+            execution_options=execution_options,
+            fused_rope=fused_rope,
         )
 
         self.mlp = Qwen3VLTextMLP(
@@ -448,12 +524,13 @@ class Qwen3VLTextDecoderLayer(nn.Module):
             use_weight_only_fp8=use_weight_only_fp8,
             use_tensor_parallel=use_tensor_parallel,
             prefix=f"{prefix}.mlp",
+            execution_options=execution_options,
         )
         self.input_layernorm = _make_text_rms_norm(
-            config.hidden_size, config.rms_norm_eps
+            config.hidden_size, config.rms_norm_eps, fused=execution_options.hf_rmsnorm
         )
         self.post_attention_layernorm = _make_text_rms_norm(
-            config.hidden_size, config.rms_norm_eps
+            config.hidden_size, config.rms_norm_eps, fused=execution_options.hf_rmsnorm
         )
 
     def forward(
@@ -501,6 +578,7 @@ class Qwen3VLTextModel(nn.Module):
         use_weight_only_fp8: bool = False,
         use_tensor_parallel: bool = False,
         prefix: str = "",
+        execution_options: Qwen3VLExecutionOptions = Qwen3VLExecutionOptions(),
     ):
         super().__init__()
         self.config = config
@@ -522,6 +600,12 @@ class Qwen3VLTextModel(nn.Module):
             self.embed_tokens = nn.Embedding(
                 config.vocab_size, config.hidden_size, self.padding_idx
             )
+        # One converted cache per encoder, reused across all language layers.
+        fused_rope = (
+            QwenVLFusedMRoPE(build_qwen_vl_text_rope(config, mrope_interleaved=True))
+            if execution_options.fused_mrope
+            else None
+        )
         self.layers = nn.ModuleList(
             [
                 Qwen3VLTextDecoderLayer(
@@ -531,11 +615,15 @@ class Qwen3VLTextModel(nn.Module):
                     use_weight_only_fp8=use_weight_only_fp8,
                     use_tensor_parallel=use_tensor_parallel,
                     prefix=add_prefix(f"layers.{layer_idx}", prefix),
+                    execution_options=execution_options,
+                    fused_rope=fused_rope,
                 )
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = _make_text_rms_norm(config.hidden_size, config.rms_norm_eps)
+        self.norm = _make_text_rms_norm(
+            config.hidden_size, config.rms_norm_eps, fused=execution_options.hf_rmsnorm
+        )
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
@@ -692,6 +780,7 @@ class Qwen3VLModel(nn.Module):
         quant_config: QuantizationConfig | None = None,
         use_tensor_parallel: bool = False,
         prefix: str = "",
+        execution_options: Qwen3VLExecutionOptions = Qwen3VLExecutionOptions(),
     ):
         super().__init__()
         vision_quant_config = (
@@ -703,12 +792,14 @@ class Qwen3VLModel(nn.Module):
             config.vision_config,
             quant_config=vision_quant_config,
             prefix=add_prefix("visual", prefix),
+            use_fa4=execution_options.vision_fa4,
         )
         self.language_model = Qwen3VLTextModel(
             config.text_config,
             quant_config=quant_config,
             use_tensor_parallel=use_tensor_parallel,
             prefix=add_prefix("language_model", prefix),
+            execution_options=execution_options,
         )
         self.rope_deltas = None  # cache rope_deltas here
         self.config = config

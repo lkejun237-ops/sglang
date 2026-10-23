@@ -262,6 +262,15 @@ def _configure_encoder_quantization(
     explicit_quantization: str | None = None,
     ignored_layers: list[str] | None = None,
 ) -> None:
+    from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
+        MiniMaxH3Qwen3VLConfig,
+        resolve_h3_qwen_online_quantization,
+    )
+
+    if isinstance(model_config, MiniMaxH3Qwen3VLConfig):
+        explicit_quantization = resolve_h3_qwen_online_quantization(
+            explicit_quantization
+        )
     if (
         issubclass(model_cls, EncoderTensorParallelMixin)
         and model_cls.checkpoint_quantization_backend == "model"
@@ -297,6 +306,16 @@ def _configure_encoder_quantization(
             f"Cannot configure checkpoint quantization for {component_name!r}: {error}"
         ) from error
     model_config.quant_config = quant_config
+    if (
+        isinstance(model_config, MiniMaxH3Qwen3VLConfig)
+        and os.environ.get("SGLANG_H3_QWEN_FP8") == "0"
+        and quant_config is not None
+        and quant_config.get_name() == "fp8"
+    ):
+        raise ComponentCheckpointUnsupportedError(
+            "SGLANG_H3_QWEN_FP8=0 requires a non-FP8 checkpoint; "
+            "the switch does not dequantize serialized FP8 weights"
+        )
     if explicit_quantization is not None:
         if quant_config is not None:
             raise ComponentCheckpointUnsupportedError(
@@ -473,9 +492,22 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
     def should_raise_customized_load_error(
         self, server_args: ServerArgs, component_name: str
     ) -> bool:
+        from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
+            MiniMaxH3Qwen3VLConfig,
+        )
+
+        configs = getattr(server_args.pipeline_config, "text_encoder_configs", ())
+        index = self._extract_encoder_index(
+            self.structural_component_name(component_name)
+        )
+        # Default kernels/FP8 and explicit all-off both require native semantics.
+        h3_native_required = index < len(configs) and isinstance(
+            configs[index], MiniMaxH3Qwen3VLConfig
+        )
         return (
             super().should_raise_customized_load_error(server_args, component_name)
             or component_name in server_args.component_quantizations
+            or h3_native_required
         )
 
     def validate_component_weight_override(self, override: str) -> None:

@@ -8,6 +8,7 @@ import sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope as qwen_vl_rop
 import sglang.srt.layers.rotary_embedding.base as rope_base
 import sglang.srt.layers.rotary_embedding.factory as rope_factory
 from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
+    QwenVLFusedMRoPE,
     apply_qwen_vl_text_rope,
     build_qwen_vl_text_rope,
 )
@@ -25,6 +26,55 @@ class _RecordingRotaryEmbedding(nn.Module):
         self.query_shape = query.shape
         self.key_shape = key.shape
         return query + 1, key + 2
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_fused_rope_preserves_inputs_and_shared_cache(monkeypatch, fail):
+    # Exercise adapter ownership with CPU tensors and a deliberately in-place
+    # stand-in. This does not execute or validate the CUDA MRoPE kernel.
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+    rotary = build_qwen_vl_text_rope(
+        SimpleNamespace(
+            head_dim=32,
+            max_position_embeddings=128,
+            rope_parameters={
+                "rope_type": "default",
+                "rope_theta": 1000000.0,
+                "mrope_section": [4, 6, 6],
+            },
+        ),
+        mrope_interleaved=True,
+    )
+    cache = rotary.cos_sin_cache
+    fused_rope = QwenVLFusedMRoPE(rotary)
+
+    def kernel(query, key, cache, positions, *args):
+        assert cache.dtype == query.dtype == torch.bfloat16
+        assert args == ([4, 6, 6], 32, 32, True, False, True, None)
+        query.add_(3)
+        key.add_(7)
+        if fail:
+            raise RuntimeError("kernel failure")
+
+    monkeypatch.setattr(
+        "sglang.kernels.ops.attention.rotary_triton.triton_mrope_fused", kernel
+    )
+    query = torch.zeros(1, 2, 3, 32, dtype=torch.bfloat16)
+    key = torch.zeros(1, 1, 3, 32, dtype=torch.bfloat16)
+    positions = torch.zeros(3, 1, 3, dtype=torch.long)
+    if fail:
+        with pytest.raises(RuntimeError, match="kernel failure"):
+            apply_qwen_vl_text_rope(
+                rotary, positions, query, key, fused_rope=fused_rope
+            )
+    else:
+        qout, kout = apply_qwen_vl_text_rope(
+            rotary, positions, query, key, fused_rope=fused_rope
+        )
+        torch.testing.assert_close(qout, torch.full_like(query, 3))
+        torch.testing.assert_close(kout, torch.full_like(key, 7))
+    assert rotary.cos_sin_cache is cache
+    assert torch.count_nonzero(query) == torch.count_nonzero(key) == 0
 
 
 def test_qwen_vl_rope_supports_transformers_v5_config(monkeypatch):
@@ -58,6 +108,64 @@ def test_qwen_vl_rope_supports_transformers_v5_config(monkeypatch):
         "is_neox_style": True,
         "rope_scaling": {**rope_parameters, "mrope_interleaved": False},
     }
+
+
+def test_fused_rope_converts_cache_once_and_keeps_native_precision(monkeypatch):
+    rotary = build_qwen_vl_text_rope(
+        SimpleNamespace(
+            head_dim=32,
+            max_position_embeddings=128,
+            rope_parameters={
+                "rope_type": "default",
+                "rope_theta": 1000000.0,
+                "mrope_section": [4, 6, 6],
+            },
+        ),
+        mrope_interleaved=True,
+    )
+    native_cache = rotary.cos_sin_cache
+    assert native_cache.dtype == torch.float32
+    fused_rope = QwenVLFusedMRoPE(rotary)
+    other_encoder = QwenVLFusedMRoPE(rotary)
+    converted = []
+    original_to = torch.Tensor.to
+
+    def record_to(tensor, *args, **kwargs):
+        if tensor is native_cache:
+            converted.append(kwargs.get("dtype"))
+        return original_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", record_to)
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+    seen = []
+    monkeypatch.setattr(
+        "sglang.kernels.ops.attention.rotary_triton.triton_mrope_fused",
+        lambda q, k, cache, *args: seen.append(cache),
+    )
+    q = torch.randn(1, 2, 3, 32, dtype=torch.bfloat16)
+    k = torch.randn(1, 1, 3, 32, dtype=torch.bfloat16)
+    positions = torch.zeros(3, 1, 3, dtype=torch.long)
+    before = apply_qwen_vl_text_rope(rotary, positions, q, k)
+    for _ in range(50):
+        apply_qwen_vl_text_rope(rotary, positions, q, k, fused_rope=fused_rope)
+    assert converted == [torch.bfloat16]
+    assert all(cache is seen[0] for cache in seen)
+    assert rotary.cos_sin_cache is other_encoder.cos_sin_cache is native_cache
+    after = apply_qwen_vl_text_rope(rotary, positions, q, k)
+    for old, new in zip(before, after):
+        torch.testing.assert_close(old, new, rtol=0, atol=0)
+    # A dtype change rebuilds from FP32, never from the rounded BF16 copy.
+    apply_qwen_vl_text_rope(
+        rotary, positions, q.half(), k.half(), fused_rope=fused_rope
+    )
+    assert converted == [torch.bfloat16, torch.float16]
+    torch.testing.assert_close(
+        fused_rope.cos_sin_cache,
+        original_to(native_cache, dtype=torch.float16),
+        rtol=0,
+        atol=0,
+    )
+    assert not fused_rope.state_dict()
 
 
 def test_qwen_vl_rope_enables_interleaved_layout_explicitly(monkeypatch):

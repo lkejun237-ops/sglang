@@ -248,6 +248,62 @@ H200 两组均采用英伦 continuous-source benchmark、真实 source＋六张�
 另一份输入/采样配置，不是上述 H200 四步方案的同条件 baseline；736 尚无该配方的匹配结果。
 见[证据 E](#证据入口)。H100 低显存组合在本页只引用容量证据，不推算 FPS。
 
+### PR #404：Qwen 五项优化的历史 prompt 切换结果
+
+2026-10-23，源码 `82fd85d` + 隔离 adapter + 视觉 `head_dim=72` 准入补丁，
+比较原生 Qwen 与 HF RMSNorm、fused MRoPE、packed gate/up + rounded SwiGLU、
+语言/视觉 FA4 五项全开，**不含 FP8**。这不是正式开关实现 `e2b848d` 或本 PR
+后续提交的 GPU 结果，也不是线上部署速度。2026-10-23 按用户要求调整为 H3 六项
+默认开启（含原生 online FP8）；这项策略调整不代表下述 GPU/质量缺项已完成。
+
+双卡实测回报 **NVIDIA L20D / CC10.3 / 267.69 GiB/卡**，不能标成 H100/H200 同条件结果。
+SP2/Ulysses2，Qwen replicate/TP1，BF16；832×480、360 帧、24 fps、seed42；
+window21/sink3、block_relative/gap12、stable，前三块四步、后续两步，
+`source_work_quantum=1`、`defer_final=0`、条件缓存关闭。固定池 12,288 行，实测最大前缀
+11,806 行；其他 DiT/Graph 等优化固定为当轮基线。每 case 每组 1 次完整预热、
+3 次正式测速（交错顺序）、1 次独立诊断，共 30 次会话全部完成。
+
+| 832×480 case | 原生 → 五项优化 prompt 响应中位数（n=3/组） | 缩短 |
+| --- | ---: | ---: |
+| hiker-clay-event-480 | 2.172 → 2.066 s | 106.0 ms / 4.88% |
+| garden-glasshouse-event-480 | 2.402 → 2.232 s | 170.5 ms / 7.10% |
+| forest-deck-event-480 | 2.407 → 2.252 s | 155.2 ms / 6.45% |
+
+响应口径是同机 WebSocket 发出新 prompt 至收到首个新 `event_id` 的完整 RGB 载荷，
+包含调度及生成，不含公网/浏览器呈现，也不是画面语义生效时间。9 对中 8 对更快，
+P95 尚无充分结论。Qwen CUDA 区间约减少 32% 来自每组仅一次的独立诊断，
+不能当作完整 prompt 响应收益；更新后 context 相对 L2 为 10.2%–62.0%，画面有变化，
+质量等价未验收。完整服务 allocated 峰值最大 202.36 GiB/卡、reserved 243.89 GiB/卡，
+含其他组件和固定池，不能作为 Qwen 独占显存。
+
+**当前六项组合实测（2026-10-23，`77f40e18c1`）**：两卡 L20D / CC10.3，
+832×480 三例各 360 帧，SP2、Qwen replicate TP1，Qwen/VAE/DiT/Lynn 共卡；
+两组仅六项开关全关/全开不同，无独立 encoder overlap、六分支联合或 Qwen 缓存。
+沿用 W6/S3、gap12、Graph 全关、前三块四步后续 `[1000,750]`，区别于统一默认基线。
+每例每组正式三次，prompt 响应中位数为 **2.052→1.916 / 2.260→2.072 /
+2.271→2.110 秒**；独立单次诊断的 Qwen 切换编码为 **419.5→236.0 /
+510.3→280.9 / 512.8→285.0 ms**（取双 rank 较慢者），减少约 44%–45%。
+六项实际调用均命中，原生 FP8 为 300 个语言线性层且无 Marlin 回退。
+
+更新 prompt 的第 50 层未归一化特征相对 L2 为 **30.93% / 10.35% / 67.68%**；
+同一次 GPU 分配内最终原始 RGB 相对 L2 为 **10.25% / 25.60% / 10.67%**，
+不能判定数值或画质等价。原版两轮正式样本复用前一作业，其余数据来自新作业；
+原版跨作业 RGB 不逐位一致，因此视频误差仅采用新作业内的 A/B，不能混用跨作业结果。
+共享进程峰值 allocated 最大 **159.61→136.95 GiB/卡**，不是 Qwen 独占显存。
+完整配置、逐次结果和失败恢复记录见 [PR #404](https://github.com/seedleap/sglang/pull/404)。
+736、人眼画质、DiT/Decoder 分项 CUDA 与组件独占显存仍未验收；本次未部署线上服务。
+
+本地 H3 的 `SGLANG_H3_QWEN_HF_RMSNORM`、`FUSED_MROPE`、`FUSED_GATE_UP`、
+`TEXT_FA4`、`VISION_FA4`、`FP8` 六项均默认 `1`（后五项同样带 `SGLANG_H3_QWEN_` 前缀），
+可各设 `0` 关闭，重启后生效。全开要求 FA4 与原生 W8A8 支持、未量化 checkpoint、
+编码器 TP=1（`--encoder-parallel replicate`）；不支持时直接报错，不静默降级。
+回退须六项都显式 `0`，使用 BF16 checkpoint、取消其他 FP8 配置；取消变量会再次开启。
+
+远程 native conditioning 的 profile/receipt 尚不包含这些数值选项，因此仅允许六项显式
+全 `0` 且 `torch_sdpa` profile 的基线。`build-profile` 和服务启动时任一项未设置或开启
+均拒绝；升级后重建并分发 profile。此前远程服务“取消变量”的启动方式须相应迁移。
+完整实验与正式实现验证状态见[PR #404 报告入口](https://github.com/seedleap/sglang/pull/404)。
+
 ## 证据入口
 
 只保留关键条件、结论和一个可回查入口；原始日志、媒体与完整复现材料留在原产物目录。

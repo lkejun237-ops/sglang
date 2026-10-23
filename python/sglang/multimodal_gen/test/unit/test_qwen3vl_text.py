@@ -105,7 +105,8 @@ def test_qwen3vl_auxiliary_component_falls_back_from_global_backend(monkeypatch)
     monkeypatch.setattr(f"{_LAYER}.wrap_attention_impl_forward", lambda _impl: None)
     monkeypatch.setattr(f"{_SELECTOR}.get_global_forced_attn_backend", lambda: None)
     monkeypatch.setattr(
-        f"{_SELECTOR}.get_global_server_args", lambda: _ExplicitServerArgs()
+        "sglang.multimodal_gen.runtime.server_args.get_global_server_args",
+        lambda: _ExplicitServerArgs(),
     )
     monkeypatch.setattr(
         "sglang.multimodal_gen.runtime.platforms.current_platform", _FakePlatform
@@ -145,11 +146,13 @@ def test_qwen3vl_attention_passes_three_axis_positions_to_srt_rope(monkeypatch):
     attention.k_norm = nn.Identity()
     attention.head_dim = 4
     attention.rotary_emb = object()
+    attention.fused_rope = None
     attention.attn = _IdentityAttention()
 
     captured_position_ids = None
 
-    def apply_rope(_rotary_emb, position_ids, query, key):
+    def apply_rope(_rotary_emb, position_ids, query, key, *, fused_rope=None):
+        assert fused_rope is None
         nonlocal captured_position_ids
         captured_position_ids = position_ids
         return query, key

@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import re
 from collections.abc import Iterable
+from dataclasses import fields
 from typing import Any
 
 import torch
@@ -17,6 +20,10 @@ from sglang.multimodal_gen.configs.models.encoders.base import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
     MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,
     MiniMaxH3Qwen3VLConfig,
+    h3_qwen_fp8_enabled,
+)
+from sglang.multimodal_gen.configs.models.encoders.qwen3vl import (
+    Qwen3VLExecutionOptions,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
@@ -37,6 +44,18 @@ _PARAM_NAMES_MAPPING = {
     r"^(model\.visual\.blocks\.\d+\.attn\.)qkv\.": r"\1qkv_proj.",
 }
 _MAP_CHECKPOINT_NAME = get_param_names_mapping(_PARAM_NAMES_MAPPING)
+logger = logging.getLogger(__name__)
+
+
+def _execution_options_from_env() -> Qwen3VLExecutionOptions:
+    values = {}
+    for field in fields(Qwen3VLExecutionOptions):
+        name = f"SGLANG_H3_QWEN_{field.name.upper()}"
+        value = os.environ.get(name, "1")
+        if value not in ("0", "1"):
+            raise ValueError(f"{name} must be 0 or 1, got {value!r}")
+        values[field.name] = value == "1"
+    return Qwen3VLExecutionOptions(**values)
 
 
 def _map_checkpoint_name(name: str) -> str:
@@ -264,6 +283,16 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
 
     def __init__(self, config: MiniMaxH3Qwen3VLConfig) -> None:
         super().__init__(config)
+        self.execution_options = _execution_options_from_env()
+        logger.info("H3 Qwen execution options: %s", self.execution_options)
+        logger.info("H3 Qwen quantization: %s", config.quant_config)
+        fp8_enabled = h3_qwen_fp8_enabled()
+        if fp8_enabled and (
+            config.quant_config is None or config.quant_config.get_name() != "fp8"
+        ):
+            raise ValueError(
+                "SGLANG_H3_QWEN_FP8 requires the native component loader to configure FP8"
+            )
         arch = config.arch_config
         selected_layer = int(arch.text_config.num_hidden_layers)
         if selected_layer <= 0 or int(arch.num_hidden_layers) != selected_layer:
@@ -276,9 +305,16 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
             quant_config=config.quant_config,
             use_tensor_parallel=True,
             prefix="model",
+            execution_options=self.execution_options,
         )
         # H3 and ClipProj consume an unnormalized intermediate residual stream.
         self.model.language_model.norm = nn.Identity()
+        if fp8_enabled:
+            for module in self.model.language_model.modules():
+                if getattr(getattr(module, "quant_method", None), "use_marlin", False):
+                    raise ValueError(
+                        "H3 Qwen online FP8 requires native W8A8 support; Marlin weight-only fallback is not supported"
+                    )
         self.image_token_id = int(arch.image_token_id)
         self.video_token_id = int(arch.video_token_id)
         self.selected_lm_layer = selected_layer
@@ -397,11 +433,22 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
     ) -> set[str]:
         params = dict(self.named_parameters(remove_duplicate=False))
         loaded: set[str] = set()
+        packed_shards: dict[str, set[int]] = {}
         for name, loaded_weight in weights:
             name = _map_checkpoint_name(name)
             if not self.should_materialize_checkpoint_weight(name):
                 continue
             param_name = name
+            shard_id = None
+            if self.execution_options.fused_gate_up:
+                for shard, source in enumerate(("gate_proj", "up_proj")):
+                    suffix = f".mlp.{source}.weight"
+                    if name.endswith(suffix):
+                        param_name = (
+                            name.removesuffix(suffix) + ".mlp.gate_up_proj.weight"
+                        )
+                        shard_id = shard
+                        break
             param = params.get(param_name)
             if param is None:
                 raise KeyError(
@@ -410,6 +457,14 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
                 )
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             try:
+                if shard_id is not None:
+                    target = param.chunk(2, dim=0)[shard_id]
+                    if target.shape != loaded_weight.shape:
+                        raise ValueError("Packed gate/up checkpoint shape mismatch")
+                    with torch.no_grad():
+                        target.copy_(loaded_weight)
+                    packed_shards.setdefault(param_name, set()).add(shard_id)
+                    continue
                 can_keep_checkpoint_tensor = bool(
                     getattr(self, "_keep_checkpoint_mapping", False)
                     and weight_loader is default_weight_loader
@@ -429,6 +484,10 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
                     f"parameter={tuple(param.shape)}"
                 ) from exc
             loaded.add(param_name)
+        for name, shards in packed_shards.items():
+            if shards != {0, 1}:
+                raise ValueError(f"Incomplete packed Qwen gate/up weight: {name}")
+            loaded.add(name)
         return loaded
 
 

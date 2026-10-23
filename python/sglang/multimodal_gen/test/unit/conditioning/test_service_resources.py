@@ -105,8 +105,17 @@ def test_native_pipeline_excludes_dit_and_vae_before_loader():
     assert set(pipeline.modules) == {"text_encoder", "tokenizer", "processor"}
 
 
-def test_cpu_profile_builder_hashes_all_assets_and_explicit_null_projection(tmp_path):
-    mod = api("native")
+@pytest.fixture
+def native_profile_assets(tmp_path, monkeypatch):
+    from dataclasses import fields
+
+    from sglang.multimodal_gen.configs.models.encoders.qwen3vl import (
+        Qwen3VLExecutionOptions,
+    )
+
+    for item in fields(Qwen3VLExecutionOptions):
+        monkeypatch.setenv(f"SGLANG_H3_QWEN_{item.name.upper()}", "0")
+    monkeypatch.setenv("SGLANG_H3_QWEN_FP8", "0")
     for folder in ("text_encoder", "tokenizer", "processor"):
         path = tmp_path / folder
         path.mkdir()
@@ -123,6 +132,14 @@ def test_cpu_profile_builder_hashes_all_assets_and_explicit_null_projection(tmp_
         "precision": "bf16",
         "software": {"fixture": "1"},
     }
+    return tmp_path, environment
+
+
+def test_cpu_profile_builder_hashes_all_assets_and_explicit_null_projection(
+    native_profile_assets,
+):
+    mod = api("native")
+    tmp_path, environment = native_profile_assets
     first = mod.build_profile(tmp_path, environment)
     assert first.document["projection"] is None
     assert set(first.document["model"]["files"]) == {
@@ -132,6 +149,49 @@ def test_cpu_profile_builder_hashes_all_assets_and_explicit_null_projection(tmp_
     (tmp_path / "tokenizer" / "new_file.json").write_text("{}")
     second = mod.build_profile(tmp_path, environment)
     assert first.profile_id != second.profile_id
+
+
+@pytest.mark.parametrize(
+    "option",
+    ["HF_RMSNORM", "FUSED_MROPE", "FUSED_GATE_UP", "TEXT_FA4", "VISION_FA4", "FP8"],
+)
+@pytest.mark.parametrize("value", [None, "1"])
+def test_native_rejects_unprofiled_switches_before_build_and_saved_profile_load(
+    native_profile_assets, monkeypatch, option, value
+):
+    import torch
+
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+
+    mod = api("native")
+    root, environment = native_profile_assets
+    saved_profile = mod.build_profile(root, environment)
+    if value is None:
+        monkeypatch.delenv(f"SGLANG_H3_QWEN_{option}")
+    else:
+        monkeypatch.setenv(f"SGLANG_H3_QWEN_{option}", value)
+
+    def unexpected_cuda_probe():
+        pytest.fail("Unprofiled execution must be rejected before CUDA initialization")
+
+    monkeypatch.setattr(torch.cuda, "is_available", unexpected_cuda_probe)
+    with pytest.raises(ConditionError, match="set all six") as error:
+        mod.build_profile(root, environment)
+    assert error.value.code == "CONDITION_PROFILE_MISMATCH"
+    with pytest.raises(ConditionError, match="set all six"):
+        mod.NativeConditionEncoder(root, saved_profile)
+
+    # Restoring the explicit baseline retains the same asset/profile identity.
+    monkeypatch.setenv(f"SGLANG_H3_QWEN_{option}", "0")
+    assert mod.build_profile(root, environment).profile_id == saved_profile.profile_id
+
+
+def test_remote_all_off_requires_sdpa_profile(native_profile_assets):
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+
+    root, environment = native_profile_assets
+    with pytest.raises(ConditionError, match="torch_sdpa"):
+        api("native").build_profile(root, dict(environment, backend="fa"))
 
 
 def test_native_actual_receipt_rejects_fold_backend_precision_and_gpu_mismatch(

@@ -11,6 +11,9 @@ import transformers
 from safetensors.torch import save_file
 from torch import nn
 
+from sglang.multimodal_gen.configs.models.encoders.qwen3vl import (
+    Qwen3VLExecutionOptions,
+)
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
 from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 from sglang.multimodal_gen.runtime.layers.quantization.comfy_nvfp4 import (
@@ -318,6 +321,7 @@ class TestMiniMaxH3CheckpointFilter(unittest.TestCase):
     def test_vision_qkv_checkpoint_name_maps_to_native_projection(self):
         encoder = MiniMaxH3Qwen3VLEncoder.__new__(MiniMaxH3Qwen3VLEncoder)
         torch.nn.Module.__init__(encoder)
+        encoder.execution_options = Qwen3VLExecutionOptions()
         encoder.selected_lm_layer = 50
         encoder.model = torch.nn.Module()
         encoder.model.visual = torch.nn.Module()
@@ -339,6 +343,7 @@ class TestMiniMaxH3CheckpointFilter(unittest.TestCase):
     def test_comfy_language_checkpoint_name_maps_to_native_namespace(self):
         encoder = MiniMaxH3Qwen3VLEncoder.__new__(MiniMaxH3Qwen3VLEncoder)
         torch.nn.Module.__init__(encoder)
+        encoder.execution_options = Qwen3VLExecutionOptions()
         encoder.selected_lm_layer = 50
         encoder.model = torch.nn.Module()
         encoder.model.language_model = torch.nn.Module()

@@ -1,14 +1,44 @@
 # SPDX-License-Identifier: Apache-2.0
 """Native Qwen3-VL encoder configuration for MiniMax H3."""
 
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass, field, fields
 
 from sglang.multimodal_gen.configs.models.encoders.qwen3vl import (
     Qwen3VLArchConfig,
     Qwen3VLConfig,
+    Qwen3VLExecutionOptions,
 )
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
+
+
+def h3_qwen_execution_disabled() -> bool:
+    names = [
+        f"SGLANG_H3_QWEN_{item.name.upper()}"
+        for item in fields(Qwen3VLExecutionOptions)
+    ]
+    return all(os.environ.get(name) == "0" for name in (*names, "SGLANG_H3_QWEN_FP8"))
+
+
+def h3_qwen_fp8_enabled() -> bool:
+    value = os.environ.get("SGLANG_H3_QWEN_FP8", "1")
+    if value not in ("0", "1"):
+        raise ValueError("SGLANG_H3_QWEN_FP8 must be 0 or 1")
+    return value == "1"
+
+
+def resolve_h3_qwen_online_quantization(explicit: str | None) -> str | None:
+    """Resolve the H3-only FP8 alias before the shared loader owns conversion."""
+    if h3_qwen_fp8_enabled():
+        if explicit not in (None, "fp8"):
+            raise ValueError(
+                "SGLANG_H3_QWEN_FP8=1 conflicts with the encoder quantization override"
+            )
+        return "fp8"
+    if explicit == "fp8":
+        raise ValueError("SGLANG_H3_QWEN_FP8=0 conflicts with explicit encoder FP8")
+    return explicit
 
 
 @dataclass

@@ -4,10 +4,50 @@
 from typing import Any
 
 import torch
+from torch import nn
 
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.utils.hf_transformers.common import get_rope_config
+
+
+class QwenVLFusedMRoPE(nn.Module):
+    """Encoder-owned cache shared by its layers, independent of get_rope state."""
+
+    def __init__(self, rotary_emb: RotaryEmbedding) -> None:
+        super().__init__()
+        # Initially share the immutable source tensor. Conversion replaces only
+        # this module's buffer; it never writes to the native FP32 cache.
+        self.register_buffer(
+            "cos_sin_cache", rotary_emb.cos_sin_cache, persistent=False
+        )
+
+    def forward(self, rotary_emb, positions, query, key):
+        from sglang.kernels.ops.attention.rotary_triton import triton_mrope_fused
+
+        if (
+            self.cos_sin_cache.device != query.device
+            or self.cos_sin_cache.dtype != query.dtype
+        ):
+            self.cos_sin_cache = rotary_emb.cos_sin_cache.to(
+                device=query.device, dtype=query.dtype
+            )
+        # Same kernel and arguments as MRotaryEmbedding.forward_triton, with an
+        # explicitly owned cache instead of temporarily mutating that module.
+        triton_mrope_fused(
+            query,
+            key,
+            self.cos_sin_cache,
+            positions,
+            rotary_emb.mrope_section,
+            rotary_emb.head_size,
+            rotary_emb.rotary_dim,
+            rotary_emb.mrope_interleaved,
+            rotary_emb.mrope_interleaved_glm,
+            rotary_emb.is_neox_style,
+            rotary_emb._legacy_axis_map,
+        )
+        return query, key
 
 
 def build_qwen_vl_text_rope(
@@ -34,6 +74,8 @@ def apply_qwen_vl_text_rope(
     position_ids: torch.Tensor,
     query: torch.Tensor,
     key: torch.Tensor,
+    *,
+    fused_rope: QwenVLFusedMRoPE | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply three-axis MRoPE to batched attention tensors."""
     if query.ndim != 4 or key.ndim != 4:
@@ -57,8 +99,16 @@ def apply_qwen_vl_text_rope(
 
     query = query.transpose(1, 2).reshape(-1, num_query_heads * head_dim)
     key = key.transpose(1, 2).reshape(-1, num_key_value_heads * head_dim)
-    # Preserve HF's bf16 arithmetic order; fused MRoPE changes generated images.
-    query, key = rotary_emb.forward_native(position_ids.reshape(3, -1), query, key)
+    if fused_rope is not None:
+        if not query.is_cuda:
+            raise ValueError("Fused Qwen MRoPE requires CUDA inputs")
+        # The fused kernel writes in place. Preserve the caller's Q/K even if
+        # it raises; cache conversion is owned by the encoder's fused module.
+        query, key = query.clone(), key.clone()
+        query, key = fused_rope(rotary_emb, position_ids.reshape(3, -1), query, key)
+    else:
+        # Preserve HF's bf16 arithmetic order by default.
+        query, key = rotary_emb.forward_native(position_ids.reshape(3, -1), query, key)
     query = query.view(batch_size, sequence_length, num_query_heads, head_dim)
     key = key.view(batch_size, sequence_length, num_key_value_heads, head_dim)
     return query.transpose(1, 2), key.transpose(1, 2)

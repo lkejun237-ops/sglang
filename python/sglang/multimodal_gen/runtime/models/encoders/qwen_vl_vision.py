@@ -10,7 +10,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    get_attn_backend,
+    record_component_attn_backend,
+)
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.runtime_context import get_parallel
@@ -66,6 +70,7 @@ class QwenVLVisionAttention(nn.Module):
         prefix: str,
         model_name: str,
         quant_config: Any = None,
+        use_fa4: bool | None = None,
     ) -> None:
         super().__init__()
         parallel = get_parallel()
@@ -92,6 +97,19 @@ class QwenVLVisionAttention(nn.Module):
             tp_size=parallel.tp_size,
         )
 
+        if use_fa4 is True:
+            from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_ops import (
+                Qwen3VLFA4Attention,
+            )
+
+            self._attention_impl = Qwen3VLFA4Attention(
+                softmax_scale=self.scaling, causal=False
+            )
+            return
+        if use_fa4 is False:
+            self._attention_impl = None  # Explicit SDPA; bypass global selection.
+            record_component_attn_backend(AttentionBackendEnum.TORCH_SDPA)
+            return
         backend = get_attn_backend(self.head_dim, torch.get_default_dtype())
         self._attention_impl = None
         if backend.supports_packed_varlen():

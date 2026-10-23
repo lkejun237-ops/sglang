@@ -51,6 +51,7 @@ class Qwen3VLVisionBlock(nn.Module):
         layer_idx: int,
         quant_config: Any = None,
         prefix: str = "visual",
+        use_fa4: bool | None = None,
     ) -> None:
         super().__init__()
         parallel = get_parallel()
@@ -60,6 +61,7 @@ class Qwen3VLVisionBlock(nn.Module):
             config,
             prefix=f"{prefix}.blocks.{layer_idx}.attn",
             model_name="Qwen3-VL",
+            use_fa4=use_fa4,
             quant_config=quant_config,
         )
         self.mlp = Qwen3_VisionMLP(
@@ -189,6 +191,7 @@ class Qwen3VLVisionTransformer(nn.Module):
         config: Any,
         quant_config: Any = None,
         prefix: str = "visual",
+        use_fa4: bool | None = None,
     ) -> None:
         super().__init__()
         parallel = get_parallel()
@@ -204,7 +207,7 @@ class Qwen3VLVisionTransformer(nn.Module):
         head_dim = config.hidden_size // config.num_heads
         self.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(head_dim // 2)
         self.blocks = nn.ModuleList(
-            Qwen3VLVisionBlock(config, layer_idx, quant_config, prefix)
+            Qwen3VLVisionBlock(config, layer_idx, quant_config, prefix, use_fa4=use_fa4)
             for layer_idx in range(config.depth)
         )
         self.merger = Qwen3VLMoeVisionPatchMerger(

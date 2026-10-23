@@ -14,6 +14,17 @@ from sglang.multimodal_gen.configs.models.fsdp import (
 )
 
 
+@dataclass(frozen=True)
+class Qwen3VLExecutionOptions:
+    """Per-instance execution choices; None preserves attention selection."""
+
+    hf_rmsnorm: bool = False
+    fused_mrope: bool = False
+    fused_gate_up: bool = False
+    text_fa4: bool | None = None
+    vision_fa4: bool | None = None
+
+
 @dataclass
 class Qwen3VLArchConfig(TextEncoderArchConfig):
     """Architecture configuration for Qwen3-VL text encoder.

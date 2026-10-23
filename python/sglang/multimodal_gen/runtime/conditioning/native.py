@@ -91,15 +91,40 @@ def _code_identity():
     return "conditioning-code-sha256:" + sha256(canonical_json(files))
 
 
+def _require_profiled_execution():
+    from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
+        h3_qwen_execution_disabled,
+    )
+
+    from .contract import ConditionError
+
+    # Remote profiles currently attest BF16 and one attention backend, not the
+    # per-encoder execution options. Require an explicit all-off SDPA baseline;
+    # unset switches now enable the H3 optimizations and cannot be attested here.
+    if not h3_qwen_execution_disabled():
+        raise ConditionError(
+            "CONDITION_PROFILE_MISMATCH",
+            "Remote native conditioning does not support optimized H3 execution "
+            "yet; set all six SGLANG_H3_QWEN_* switches to 0 or use local "
+            "conditioning until execution options are part of the profile",
+        )
+
+
 def build_profile(model_path, numerical_environment, *, projection=None):
     """CPU-only asset inventory; the supplied hardware environment is declared.
 
     This does not attest GPU execution. The native loader independently measures
     and checks its actual numerical environment before serving requests.
     """
-    from .contract import DeploymentProfile, safe_json
+    from .contract import ConditionError, DeploymentProfile, safe_json
     from .inputs import PREPROCESS_VERSION
 
+    _require_profiled_execution()
+    if numerical_environment.get("backend") != "torch_sdpa":
+        raise ConditionError(
+            "CONDITION_PROFILE_MISMATCH",
+            "The remote H3 all-off baseline requires a torch_sdpa profile",
+        )
     root = Path(model_path).absolute()
     runtime = safe_json((root / "zing_config.json").read_bytes())
     projection_identity = None
@@ -182,6 +207,9 @@ class NativeConditionEncoder:
     receipt_validation = "NATIVE_MEASURED"
 
     def __init__(self, model_path, profile, *, max_rows=16384, gpu_id=0):
+        # Check again when loading a saved profile: the process environment may
+        # differ from the one that built it. Reject before CUDA/weight loading.
+        _require_profiled_execution()
         import torch
 
         from .contract import ConditionError
@@ -347,6 +375,7 @@ class NativeConditionEncoder:
 
     def __call__(self, condition_input):
         import torch
+
         from sglang.multimodal_gen.runtime.managers.forward_context import (
             set_forward_context,
         )
@@ -356,8 +385,9 @@ class NativeConditionEncoder:
         torch.cuda.set_device(self.gpu_id)
         try:
             # Encoder attention layers read the forward context; no DiT step here.
-            with torch.inference_mode(), set_forward_context(
-                current_timestep=0, attn_metadata=None
+            with (
+                torch.inference_mode(),
+                set_forward_context(current_timestep=0, attn_metadata=None),
             ):
                 result = encode_condition(
                     self.pipeline.modules,
