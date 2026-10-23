@@ -746,7 +746,7 @@ class ServerArgs(DisaggServerArgsMixin):
             if self.zing_solver is None:
                 self.zing_solver = "few_step"
             if self.zing_denoising_step_list is None:
-                self.zing_denoising_step_list = [1000, 750]
+                self.zing_denoising_step_list = [1000, 500]
             if self.zing_initial_denoising_step_list is None:
                 self.zing_initial_denoising_step_list = [1000, 750, 500, 250]
 
@@ -2097,7 +2097,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "Default: four steps for the first three realtime target blocks, "
                 "then two steps. Set 0 to disable the initial stage. "
                 "With 3, omitted Zing solver/regular/initial grids default to "
-                "few_step, 1000,750 and 1000,750,500,250. "
+                "few_step, 1000,500 and 1000,750,500,250. "
                 "Explicit grids override these defaults independently. "
                 "With 0, preserve request-level sampling defaults."
             ),

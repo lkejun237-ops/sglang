@@ -263,6 +263,14 @@ def main(argv=None):
         "torch_sdpa",
         "--performance-mode",
         "speed",
+        "--zing-solver",
+        "few_step",
+        "--zing-denoising-step-list",
+        "1000,500",
+        "--zing-initial-block-count",
+        "3",
+        "--zing-initial-denoising-step-list",
+        "1000,750,500,250",
         "--warmup-mode",
         "off",
         "--dit-cpu-offload",
@@ -281,6 +289,12 @@ def main(argv=None):
         str(args.port),
     ]
     deployment.update(
+        sampling_schedule={
+            "solver": "few_step",
+            "initial_block_count": 3,
+            "initial_denoising_step_list": [1000, 750, 500, 250],
+            "denoising_step_list": [1000, 500],
+        },
         layout="finite-local-encoding",
         resident=True,
         concurrency=1,

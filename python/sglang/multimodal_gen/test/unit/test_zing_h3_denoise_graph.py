@@ -1170,7 +1170,7 @@ def _run_ready_chunks(
         model,
         packer,
         solver="few_step",
-        denoising_step_list=[1000, 750] if initial_steps is not None else STEPS,
+        denoising_step_list=[1000, 500] if initial_steps is not None else STEPS,
         window_chunks=3,
         sink_chunks=1,
         window_eviction_timing="after_step0",

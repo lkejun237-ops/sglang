@@ -30,17 +30,17 @@ sglang serve --model-path /path/to/model --zing-initial-block-count 0
 sglang serve --model-path /path/to/model \
   --zing-initial-block-count 0 \
   --zing-solver few_step \
-  --zing-denoising-step-list 1000,750
+  --zing-denoising-step-list 1000,500
 ```
 
-客户端不用新增请求字段。初始块数默认 3，解析时补齐未指定的 `few_step`、`[1000,750]`、`[1000,750,500,250]`；显式冲突 solver/grid、空表仍报错。连续 source 的显式 CLI 优先于 profile 明确声明的计划，profile 未声明 initial 阶段时采用默认混合计划；profile 显式 count=0 保留单阶段。静态表须声明完整匹配计划。原 Euler 的 `num_inference_steps` 仍是 sigma 点数；few-step 的实际迭代数来自显式列表长度。
+客户端不用新增请求字段。初始块数默认 3，解析时补齐未指定的 `few_step`、`[1000,500]`、`[1000,750,500,250]`；显式冲突 solver/grid、空表仍报错。连续 source 的显式 CLI 优先于 profile 明确声明的计划，profile 未声明 initial 阶段时采用默认混合计划；profile 显式 count=0 保留单阶段。静态表须声明完整匹配计划。原 Euler 的 `num_inference_steps` 仍是 sigma 点数；few-step 的实际迭代数来自显式列表长度。
 
 | target 生成块（从 0 计） | 本轮 latent 数 | ON 使用的完整列表 | OFF（显式常规两步） |
 |---|---:|---|---|
-| 0 | 1 | 1000,750,500,250 | 1000,750 |
-| 1 | 2 | 1000,750,500,250 | 1000,750 |
-| 2 | 2 | 1000,750,500,250 | 1000,750 |
-| 3 及以后 | 3,2 循环 | 1000,750 | 1000,750 |
+| 0 | 1 | 1000,750,500,250 | 1000,500 |
+| 1 | 2 | 1000,750,500,250 | 1000,500 |
+| 2 | 2 | 1000,750,500,250 | 1000,500 |
+| 3 及以后 | 3,2 循环 | 1000,500 | 1000,500 |
 
 `num_frame_per_block=[3,2]`、`split_first_latent=true` 使初始块为 `[1,2,2]`。本模型下前五个 latent 对应前17帧，所以第18帧起属于常规两步区间。代码按生成块编号切换，没有硬编码第17帧。**当前初始步数校验不强制核对 chunk plan；如果改变分块，前三块未必仍等于五个 latent。上述帧数解释只适用于本轮固定分块。**
 

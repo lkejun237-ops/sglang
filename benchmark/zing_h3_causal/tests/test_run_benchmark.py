@@ -68,6 +68,20 @@ def test_single_checkpoint_preflight_creates_configs_without_launch(
     assert "--preflight-only" in calls[0]
     assert calls[0][-3:-1] == ["--source-revision", "a" * 40]
     deployment = json.loads((out / "deployment.json").read_text())
+    assert deployment["sampling_schedule"] == {
+        "solver": "few_step",
+        "initial_block_count": 3,
+        "initial_denoising_step_list": [1000, 750, 500, 250],
+        "denoising_step_list": [1000, 500],
+    }
+    command = deployment["server_command"]
+    for flag, value in (
+        ("--zing-solver", "few_step"),
+        ("--zing-initial-block-count", "3"),
+        ("--zing-denoising-step-list", "1000,500"),
+        ("--zing-initial-denoising-step-list", "1000,750,500,250"),
+    ):
+        assert command[command.index(flag) + 1] == value
     assert deployment["sp_degree"] == 2
     assert deployment["pipeline_config"] == {"video_decoder_backend": "native"}
     assert "all" in calls[0]

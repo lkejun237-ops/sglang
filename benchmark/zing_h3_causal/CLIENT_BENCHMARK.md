@@ -25,6 +25,24 @@ source-to-output 延迟、tail drain、credit wait、播放停顿等适用指标
 连续 source 分开比较。保存命令、源码 SHA、配置、预热/正式次数、失败与未执行数、
 原始 JSON 和报告；未采到的指标标为未测。
 
+## 当前默认采样口径
+
+新测试统一使用 **前三个 target block 各四步 `[1000,750,500,250]`，后续每个
+block 两步 `[1000,500]`**（few_step，initial_block_count=3）。这是 block 的
+去噪步数，不是只在整个请求开头运行四次。`run_benchmark.py` 显式固定该部署配置，
+并在 `deployment.json` 的 `sampling_schedule` 与 `server_command` 中记录。
+
+服务的部署采样配置优先于请求字段，因此 `sampling.json` 中的
+`num_inference_steps=4` / 四步列表不能证明实际全程四步。连接已有服务的
+`bench_client.py` 与 `bench_streaming_source.py` 不修改服务配置：测试前核对启动参数，
+连续 source 还需核对 admission 解析后的 profile/CLI 配置；显式 profile 或 CLI
+可覆盖默认值。复现全程四步须显式设置 `--zing-initial-block-count 0`、
+`--zing-solver few_step --zing-denoising-step-list 1000,750,500,250`。
+
+历史全程四步、4→1 及其他采样实验保留原始参数，不能改标为 4→2 或直接混作
+同条件 baseline。新测试的 baseline/candidate 必须使用相同采样配置；480 与 736
+分别验证，未实测的当前版本性能和画质标为未验证。
+
 ## PR 三部分报告格式
 
 480 和 736 的每个 case 各填一组下表，baseline / candidate 使用相同计时与显存口径。

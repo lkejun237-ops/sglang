@@ -15,7 +15,7 @@ description: "默认前三块四步、后续两步，显式关闭与部署迁移
 sglang serve --model-path /path/to/model --pipeline-config-path /path/to/pipeline.json
 ```
 
-实时有效计划是 `few_step`，initial grid `[1000,750,500,250]`，initial block count `3`，regular grid `[1000,750]`。块的边界与 generation 重置规则沿用原实现。
+实时有效计划是 `few_step`，initial grid `[1000,750,500,250]`，initial block count `3`，regular grid `[1000,500]`。块的边界与 generation 重置规则沿用原实现。
 
 关闭初始阶段：
 
@@ -23,7 +23,7 @@ sglang serve --model-path /path/to/model --pipeline-config-path /path/to/pipelin
 sglang serve --model-path /path/to/model --pipeline-config-path /path/to/pipeline.json --zing-initial-block-count 0
 ```
 
-有限实时入口此时恢复请求的 solver/grid；连续 source 此时保留 profile 原有 regular grid。要明确全程两步，关闭时再传 `--zing-solver few_step --zing-denoising-step-list 1000,750`；全程四步则传 `1000,750,500,250`。显式 Euler 必须配合 count=0，且连续 source 仍要求 few_step。两套 grid 均可显式覆盖默认值，见[自定义去噪列表](/docs/sglang-diffusion/zing/specs/configurable-step-lists)；未传入的 grid 才补默认值。
+有限实时入口此时恢复请求的 solver/grid；连续 source 此时保留 profile 原有 regular grid。要明确全程两步，关闭时再传 `--zing-solver few_step --zing-denoising-step-list 1000,500`；全程四步则传 `1000,750,500,250`。显式 Euler 必须配合 count=0，且连续 source 仍要求 few_step。两套 grid 均可显式覆盖默认值，见[自定义去噪列表](/docs/sglang-diffusion/zing/specs/configurable-step-lists)；未传入的 grid 才补默认值。
 
 连续 source 仍需有效的 checkpoint profile，但不需要为开启混合采样添加字段：
 

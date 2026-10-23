@@ -490,7 +490,7 @@ def test_invalid_profile_grid_is_not_hidden_by_cli(configured, grid):
     profile["denoising_step_list"] = grid
     path.write_text(json.dumps(profile))
     configured.zing_solver = "few_step"
-    configured.zing_denoising_step_list = [1000, 750]
+    configured.zing_denoising_step_list = [1000, 500]
     with pytest.raises(ValueError):
         initialize()
 
@@ -508,7 +508,7 @@ def test_explicit_zero_disables_profile_initial_schedule(configured):
     path = Path(configured.model_path) / "zing_realtime_profile.json"
     profile = json.loads(path.read_text())
     profile.update(
-        denoising_step_list=[1000, 750],
+        denoising_step_list=[1000, 500],
         initial_block_count=3,
         initial_denoising_step_list=[1000, 750, 500, 250],
     )
@@ -521,7 +521,7 @@ def test_explicit_zero_disables_profile_initial_schedule(configured):
     adapter, session = initialize()
     assert adapter.ready["sampling_schedule"] == dict(
         solver="few_step",
-        denoising_step_list=[1000, 750],
+        denoising_step_list=[1000, 500],
         initial_block_count=0,
         initial_denoising_step_list=None,
     )
@@ -542,7 +542,7 @@ def test_default_mixed_schedule_and_explicit_overrides(
         profile["initial_block_count"] = profile_count
     if profile_count == 3:
         profile.update(
-            denoising_step_list=[1000, 750],
+            denoising_step_list=[1000, 500],
             initial_denoising_step_list=[1000, 750, 500, 250],
         )
     path.write_text(json.dumps(profile))
@@ -569,7 +569,7 @@ def test_default_mixed_schedule_and_explicit_overrides(
         if cli_count is not None
         else (profile_count if profile_count is not None else 3)
     )
-    grid = [1000, 750] if count else profile["denoising_step_list"]
+    grid = [1000, 500] if count else profile["denoising_step_list"]
     assert adapter.ready["num_inference_steps"] == len(grid)
     assert adapter.ready["sampling_schedule"] == dict(
         solver="few_step",
@@ -601,11 +601,11 @@ def test_default_mixed_schedule_and_explicit_overrides(
 def test_bad_profile_initial_schedule_is_not_hidden_by_cli(configured, fields):
     path = Path(configured.model_path) / "zing_realtime_profile.json"
     profile = json.loads(path.read_text())
-    profile.update(denoising_step_list=[1000, 750])
+    profile.update(denoising_step_list=[1000, 500])
     profile.update(fields)
     path.write_text(json.dumps(profile))
     configured.zing_solver = "few_step"
-    configured.zing_denoising_step_list = [1000, 750]
+    configured.zing_denoising_step_list = [1000, 500]
     with pytest.raises(ValueError):
         initialize()
 

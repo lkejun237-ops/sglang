@@ -96,7 +96,7 @@ def methods(sampling_schedule=None):
         pytest.param(
             dict(
                 solver="few_step",
-                denoising_step_list=[1000, 750],
+                denoising_step_list=[1000, 500],
                 initial_block_count=3,
                 initial_denoising_step_list=[1000, 750, 500, 250],
             ),

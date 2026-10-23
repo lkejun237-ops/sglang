@@ -30,10 +30,10 @@ from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
 
 @pytest.mark.parametrize("count", [0, 3])
 def test_deployment_grids(count):
-    regular = parse_noise_grid("1000,750")
+    regular = parse_noise_grid("1000,500")
     initial = parse_noise_grid("1000,750,500,250") if count else None
     validate_initial_blocks("few_step", regular, initial, count)
-    assert regular == [1000, 750]
+    assert regular == [1000, 500]
 
 
 @pytest.mark.parametrize(
@@ -87,7 +87,7 @@ def test_source_ready_schedule_matches_worker_execution(
         path = Path(configured.model_path) / "zing_realtime_profile.json"
         profile = json.loads(path.read_text())
         profile.update(
-            denoising_step_list=[1000, 750],
+            denoising_step_list=[1000, 500],
             initial_block_count=3,
             initial_denoising_step_list=[1000, 750, 500, 250],
         )
@@ -215,7 +215,7 @@ def test_deployment_cli(count):
         "--zing-solver",
         "few_step",
         "--zing-denoising-step-list",
-        "1000,750",
+        "1000,500",
         "--zing-initial-block-count",
         str(count),
     ]
@@ -224,14 +224,14 @@ def test_deployment_cli(count):
     args = parser.parse_args(argv)
     args.pipeline_config = SimpleNamespace(zing_adaln_table_path=None)
     ServerArgs._validate_zing_sampling(args)
-    assert args.zing_denoising_step_list == [1000, 750]
+    assert args.zing_denoising_step_list == [1000, 500]
     assert args.zing_initial_block_count == count
 
 
 @pytest.mark.parametrize(
     "options, expected",
     [
-        ([], ("few_step", [1000, 750], [1000, 750, 500, 250])),
+        ([], ("few_step", [1000, 500], [1000, 750, 500, 250])),
         (["--zing-initial-block-count", "0"], (None, None, None)),
         (
             ["--zing-solver", "euler", "--zing-initial-block-count", "0"],
@@ -250,7 +250,7 @@ def test_deployment_cli(count):
         ),
         (
             ["--zing-initial-block-count", "3"],
-            ("few_step", [1000, 750], [1000, 750, 500, 250]),
+            ("few_step", [1000, 500], [1000, 750, 500, 250]),
         ),
         (
             ["--zing-denoising-step-list", "1000,500"],
@@ -258,7 +258,7 @@ def test_deployment_cli(count):
         ),
         (
             ["--zing-initial-denoising-step-list", "1000,800,600"],
-            ("few_step", [1000, 750], [1000, 800, 600]),
+            ("few_step", [1000, 500], [1000, 800, 600]),
         ),
         (
             [
@@ -274,9 +274,9 @@ def test_deployment_cli(count):
                 "--zing-initial-block-count",
                 "3",
                 "--zing-denoising-step-list",
-                "1000,750",
+                "1000,500",
             ],
-            ("few_step", [1000, 750], [1000, 750, 500, 250]),
+            ("few_step", [1000, 500], [1000, 750, 500, 250]),
         ),
     ],
 )
@@ -337,7 +337,7 @@ def test_on_defaults_have_independent_grids():
     first, second = resolve(), resolve()
     first.zing_denoising_step_list.append(250)
     first.zing_initial_denoising_step_list.append(125)
-    assert second.zing_denoising_step_list == [1000, 750]
+    assert second.zing_denoising_step_list == [1000, 500]
     assert second.zing_initial_denoising_step_list == [1000, 750, 500, 250]
 
 
@@ -354,7 +354,7 @@ def test_actual_target_steps_and_new_generation(model, count):  # noqa: F811
         model,
         packer,
         solver="few_step",
-        denoising_step_list=[1000, 750],
+        denoising_step_list=[1000, 500],
         initial_denoising_step_list=[1000, 750, 500, 250] if count else None,
         initial_block_count=count,
         window_chunks=None,
@@ -413,7 +413,7 @@ def test_ready_chunks_use_generation_index(model, count):  # noqa: F811
         model,
         packer,
         solver="few_step",
-        denoising_step_list=[1000, 750],
+        denoising_step_list=[1000, 500],
         initial_denoising_step_list=[1000, 750, 500, 250] if count else None,
         initial_block_count=count,
         joint_forward="cross_chunk",
@@ -495,7 +495,7 @@ def test_deployment_schedule_is_only_used_by_realtime(model):  # noqa: F811
     torch.testing.assert_close(
         offline.video_scheduler.timesteps, expected.video_scheduler.timesteps
     )
-    assert realtime.denoising_step_list == [1000, 750]
+    assert realtime.denoising_step_list == [1000, 500]
     assert realtime.initial_block_count == 3
 
 
@@ -509,7 +509,7 @@ def test_realtime_step_restores_schedulers_on_failure(model, monkeypatch):  # no
         model,
         packer,
         solver="few_step",
-        denoising_step_list=[1000, 750],
+        denoising_step_list=[1000, 500],
         initial_denoising_step_list=[1000, 750, 500, 250],
         initial_block_count=3,
     )
@@ -527,7 +527,7 @@ def test_realtime_step_restores_schedulers_on_failure(model, monkeypatch):  # no
 
 @pytest.fixture
 def mixed_grids(request):
-    return getattr(request, "param", ([1000, 750], [1000, 750, 500, 250]))
+    return getattr(request, "param", ([1000, 500], [1000, 750, 500, 250]))
 
 
 @pytest.fixture
@@ -620,7 +620,7 @@ def assert_same_kv(first, second, layers):
 @pytest.mark.parametrize(
     "mixed_grids",
     [
-        pytest.param(([1000, 750], [1000, 750, 500, 250]), id="default-4-to-2"),
+        pytest.param(([1000, 500], [1000, 750, 500, 250]), id="default-4-to-2"),
         pytest.param(([1000, 500], [1000, 800, 600, 200]), id="custom-4-to-2"),
         pytest.param(([1000], [1000, 800, 600]), id="3-to-1"),
         pytest.param(([1000, 600, 200], [1000]), id="1-to-3"),
@@ -968,7 +968,7 @@ def test_static_ready_cancel_releases_plan(static_mixed, joint):
 @pytest.mark.parametrize("count", [0, 3])
 @pytest.mark.parametrize(
     "mixed_grids",
-    [([1000, 750], [1000, 750, 500, 250]), ([1000, 600, 200], [1000])],
+    [([1000, 500], [1000, 750, 500, 250]), ([1000, 600, 200], [1000])],
     indirect=True,
 )
 def test_table_builder_cli_plan(

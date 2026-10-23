@@ -20,7 +20,7 @@ PYTHONPATH=python torchrun --standalone --nproc-per-node=1 \
   --model-path "$EXPORT" --plan mixed-plan.json --device cuda
 ```
 
-`ensure` 返回表目录，把已有 `--pipeline-config-path` JSON 中的 `zing_adaln_table_path` 指向该目录。实时采样默认 initial_block_count=3，自动补齐 few_step、常规 1000,750 和初始 1000,750,500,250，无需附加采样 CLI。显式 `--zing-initial-block-count 0` 关闭初始阶段；完整覆盖规则见[默认混合采样](default-mixed-sampling.md)。表路径的原有配置入口不变，构建静态表仍须显式提供上面的完整计划。
+`ensure` 返回表目录，把已有 `--pipeline-config-path` JSON 中的 `zing_adaln_table_path` 指向该目录。实时采样默认 initial_block_count=3，自动补齐 few_step、常规 1000,500 和初始 1000,750,500,250，无需附加采样 CLI。显式 `--zing-initial-block-count 0` 关闭初始阶段；完整覆盖规则见[默认混合采样](default-mixed-sampling.md)。表路径的原有配置入口不变，构建静态表仍须显式提供上面的完整计划。
 
 有限实时入口沿用内部 `cross_chunk` 默认值；本PR不增加请求方对 `zing_joint_forward` 的控制。模式选择保留在内部sampler和source-ready部署profile的 `joint_forward` 中。有限请求的 `step()` 在 streaming boundary 回退为 source_first，真实跨块合并需 source-ready `drain_ready()` 中下一块已经就绪。未修改 joint 默认值；本节讨论的 joint 选择保持原有部署方式，混合 schedule 的 profile 扩展见下节。原有CFG、source就绪、窗口淘汰及KV scratch容量等joint条件仍然生效；不满足时按原逻辑回退。SP1的joint attention分别调用各分支attention，不表示命中限定SP2形状的融合kernel。
 
@@ -28,7 +28,7 @@ PYTHONPATH=python torchrun --standalone --nproc-per-node=1 \
 
 ## 连续 source 入口的采样契约
 
-profile 可以直接声明完整混合计划：`solver="few_step"`、`denoising_step_list=[1000,750]`、`initial_block_count=3`、`initial_denoising_step_list=[1000,750,500,250]`。保留原有 checkpoint hash、guidance 和 noise 字段；不提供采样 CLI 覆盖时，入口和 worker 都使用这份计划。旧 profile 未声明 initial_block_count 时采用默认混合计划；显式写 initial_block_count=0 则保留 profile 的单阶段 grid。
+profile 可以直接声明完整混合计划：`solver="few_step"`、`denoising_step_list=[1000,500]`、`initial_block_count=3`、`initial_denoising_step_list=[1000,750,500,250]`。保留原有 checkpoint hash、guidance 和 noise 字段；不提供采样 CLI 覆盖时，入口和 worker 都使用这份计划。旧 profile 未声明 initial_block_count 时采用默认混合计划；显式写 initial_block_count=0 则保留 profile 的单阶段 grid。
 
 显式启动 solver/grid 或指定 initial 时，CLI 的整套计划优先，不把两处的初始/常规 grid 拼成第三种计划；显式 `--zing-initial-block-count 0` 且未指定 solver/grid 时，保留 profile 的常规 grid 并取消 initial 阶段。用 ServerArgs 的显式参数标记区分自动补齐的默认计划和用户配置，默认值不会覆盖 profile 的显式关闭。profile 自身和最终计划都必须合法，覆盖不掩盖坏配置。
 
@@ -39,7 +39,7 @@ profile 可以直接声明完整混合计划：`solver="few_step"`、`denoising_
 客户端迁移：混合部署不再接受写死 `num_inference_steps=4` 的请求，请省略此字段或填写2；全程四步部署仍接受4。仓库的 `continuous_source_client.py` 与 lifecycle probe 已改为省略该字段，客户端接受两步/四步 ready，并在原有 `request.json` / 事件记录中保留完整协商结果。混合采样的 ready 片段为：
 
 ```json
-{"num_inference_steps":2,"sampling_schedule":{"solver":"few_step","denoising_step_list":[1000,750],"initial_block_count":3,"initial_denoising_step_list":[1000,750,500,250]}}
+{"num_inference_steps":2,"sampling_schedule":{"solver":"few_step","denoising_step_list":[1000,500],"initial_block_count":3,"initial_denoising_step_list":[1000,750,500,250]}}
 ```
 
 改动前，入口要求四步并固定返回4，即使命令行已让 worker 执行混合计划；这是入口契约不一致，并非此前静态表推理错误。此次让 profile 也能表达完整计划，入口解析 CLI 优先级后传给实时 worker，模型和 sampler 数值路径不变。验证先完成CPU入口到worker回归，随后补齐下文64帧完整WebSocket GPU对照；无额外性能专测。

@@ -5,7 +5,7 @@ description: "覆盖 initial/regular step list，保持默认混合策略与静�
 
 # Zing 实时自定义去噪列表
 
-此前 CLI 已暴露两套 step list，但校验强制 initial 为 `[1000,750,500,250]`、regular 为 `[1000,750]`，连续 source 还限制 regular 只能有2或4项。本改动允许部署者配置合法列表，默认仍为前三块四步、后续两步。`initial_block_count` 仍只支持0/3，不扩展 Euler 混合计划、客户端采样控制或离线推理路径。
+此前 CLI 已暴露两套 step list，但校验强制 initial 为 `[1000,750,500,250]`、regular 为 `[1000,750]`，连续 source 还限制 regular 只能有2或4项。本改动允许部署者配置合法列表，当前默认为前三块四步、后续两步 `[1000,500]`。`initial_block_count` 仍只支持0/3，不扩展 Euler 混合计划、客户端采样控制或离线推理路径。
 
 ## 使用方式
 
