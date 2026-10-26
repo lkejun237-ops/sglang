@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "cutlass/epilogue/fusion/sm90_callbacks_tma_warpspecialized.hpp"
 #include "cutlass_extensions/epilogue/broadcast_load_epilogue_c3x.hpp"
 
 /*

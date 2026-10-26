@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+import logging
+from functools import lru_cache
+from typing import TYPE_CHECKING
 
 from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
 from sglang.kernels.registry import register_kernel
@@ -23,6 +25,8 @@ _SM120 = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 0))})
 _SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
 _KDA_PACKAGE = "sglang.kernels.kda_kernels"
 
+logger = logging.getLogger(__name__)
+
 
 def _prefer_torch_rowwise_fp8(
     mat_a: torch.Tensor,
@@ -30,7 +34,7 @@ def _prefer_torch_rowwise_fp8(
     scales_a: torch.Tensor,
     scales_b: torch.Tensor,
     out_dtype: torch.dtype,
-    bias: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
 ) -> bool:
     """Whether Torch's SM90 NVJet kernel wins for this row/column-scaled shape."""
     import torch
@@ -66,10 +70,50 @@ def _prefer_torch_rowwise_fp8(
     ):
         return False
 
-    # SM90 benchmarks show repeatable NVJet wins only for large prefill M with
-    # either a wide output or a broad down projection. Keep decode, narrow TP8
-    # projections, and shapes outside that measured envelope on the AOT kernel.
-    return m >= 8192 and ((k >= 4096 and n >= 6144) or (k >= 7168 and n >= 5376))
+    if m <= 64:
+        return False
+
+    # SM90 benchmarks show repeatable NVJet wins for:
+    # 1. Zing H3 narrow-N deep-K shapes (attn.out_proj, mlp.fc2) at medium/large M
+    #    to mitigate severe wave quantization tail effects.
+    # 2. Large prefill M with either a wide output or a broad down projection.
+    # Keep decode (M <= 64), narrow TP8 projections, and shapes outside that
+    # measured envelope on the AOT kernel.
+    return bool(
+        (k >= 7168 and n == 5376 and m >= 195)
+        or (m >= 8192 and ((k >= 4096 and n >= 6144) or (k >= 7168 and n >= 5376)))
+    )
+
+
+@lru_cache(maxsize=1)
+def _probe_seedleap_fp8_sm90_backend() -> bool:
+    """Statically probe if seedleap_kernels SM90 FP8 backend is installed and usable."""
+    try:
+        from seedleap_kernels.backends.cuda import fp8_gemm_sm90 as sl_sm90
+    except ImportError:
+        return False
+
+    try:
+        if hasattr(sl_sm90, "_find_cutlass_root"):
+            if sl_sm90._find_cutlass_root() is None:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _is_seedleap_fp8_sm90_available() -> bool:
+    """Check if seedleap_kernels SM90 FP8 backend is enabled and usable."""
+    import os
+
+    if os.environ.get("SGLANG_DISABLE_SEEDLEAP_KERNELS", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return False
+
+    return _probe_seedleap_fp8_sm90_backend()
 
 
 class Fp8ScaledMMOp(BaseFusedOp):
@@ -100,7 +144,7 @@ class Fp8ScaledMMOp(BaseFusedOp):
         scales_a: torch.Tensor,
         scales_b: torch.Tensor,
         out_dtype: torch.dtype,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> bool:
         if (
             backend is KernelBackend.AOT
@@ -118,6 +162,10 @@ class Fp8ScaledMMOp(BaseFusedOp):
             )
         ):
             return False
+        if backend is KernelBackend.TORCH and not _prefer_torch_rowwise_fp8(
+            mat_a, mat_b, scales_a, scales_b, out_dtype, bias
+        ):
+            return False
         return super().backend_eligible(
             backend, mat_a, mat_b, scales_a, scales_b, out_dtype, bias
         )
@@ -129,7 +177,7 @@ class Fp8ScaledMMOp(BaseFusedOp):
         scales_a: torch.Tensor,
         scales_b: torch.Tensor,
         out_dtype: torch.dtype,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         import torch
 
@@ -153,8 +201,48 @@ class Fp8ScaledMMOp(BaseFusedOp):
         scales_a: torch.Tensor,
         scales_b: torch.Tensor,
         out_dtype: torch.dtype,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        import torch
+
+        if (
+            getattr(mat_a, "device", None) is not None
+            and getattr(mat_a.device, "type", None) == "cuda"
+            and hasattr(torch, "cuda")
+            and hasattr(torch.cuda, "get_device_capability")
+            and torch.cuda.get_device_capability(mat_a.device) == (9, 0)
+            and _is_seedleap_fp8_sm90_available()
+        ):
+            try:
+                from seedleap_kernels.ops import fp8_scaled_mm
+
+                return fp8_scaled_mm(
+                    mat_a,
+                    mat_b,
+                    scales_a,
+                    scales_b,
+                    bias=bias,
+                    out_dtype=out_dtype,
+                    backend="auto",
+                )
+            except RuntimeError as e:
+                err_msg = str(e)
+                if (
+                    "CUTLASS" in err_msg
+                    or "Ninja" in err_msg
+                    or "compiler" in err_msg.lower()
+                    or "nvcc" in err_msg.lower()
+                ):
+                    logger.warning(
+                        "seedleap-kernels SM90 FP8 backend unavailable at "
+                        "runtime (%s), falling back to sgl_kernel.",
+                        e,
+                    )
+                else:
+                    raise
+            except ImportError:
+                pass
+
         import sgl_kernel
 
         return sgl_kernel.fp8_scaled_mm(
@@ -172,9 +260,15 @@ register_kernel(
         capabilities=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=("float8_e4m3fn", "float8_e5m2"),
-            description="batched (3D) per-tensor-scale FP8 matmul: D = A_fp8 @ B_fp8 * A_scale * B_scale",
+            description=(
+                "batched (3D) per-tensor-scale FP8 matmul: "
+                "D = A_fp8 @ B_fp8 * A_scale * B_scale"
+            ),
         ),
-        description="Batched FP8 matmul (flashinfer cuBLAS backend, torch.compile-safe wrapper).",
+        description=(
+            "Batched FP8 matmul (flashinfer cuBLAS backend, "
+            "torch.compile-safe wrapper)."
+        ),
     )
 )
 register_kernel(
@@ -210,7 +304,10 @@ register_kernel(
         capabilities=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=("bfloat16",),
-            description="skinny [m, k] @ [n, k].T with m in [1, max_m]; serves MoE routers and gate projections",
+            description=(
+                "skinny [m, k] @ [n, k].T with m in [1, max_m]; "
+                "serves MoE routers and gate projections"
+            ),
         ),
         description="Tiny bf16 GEMM (sglang.kernels.jit, JIT-only).",
     )
@@ -254,7 +351,7 @@ def fp8_scaled_mm(
     scales_a: torch.Tensor,
     scales_b: torch.Tensor,
     out_dtype: torch.dtype,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """FP8 matmul with per-row A and per-column B scales."""
     return _FP8_SCALED_MM(mat_a, mat_b, scales_a, scales_b, out_dtype, bias)
@@ -266,7 +363,7 @@ def bmm_fp8(
     A_scale: torch.Tensor,
     B_scale: torch.Tensor,
     dtype: torch.dtype,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Batched (3D) per-tensor-scale FP8 matmul, via flashinfer's cuBLAS backend."""
     return get_kernel("gemm.bmm_fp8", KernelBackend.FLASHINFER)(
@@ -277,7 +374,7 @@ def bmm_fp8(
 def dsv3_fused_a_gemm(
     mat_a: torch.Tensor,
     mat_b: torch.Tensor,
-    output: Optional[torch.Tensor] = None,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """DeepSeek-V3 fused QKV-A GEMM."""
     return get_kernel("gemm.dsv3_fused_a_gemm", KernelBackend.AOT)(mat_a, mat_b, output)
@@ -288,9 +385,9 @@ def dsv3_fused_a_gemm(
 def tiny_gemm_bf16(
     x: torch.Tensor,
     w: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
     *,
-    out_dtype: Optional[torch.dtype] = None,
+    out_dtype: torch.dtype | None = None,
     max_m: int = 16,
 ) -> torch.Tensor:
     """Tiny bf16 GEMM ``x[m, k] @ w[n, k].T``, support bf16/fp32 out"""
@@ -301,7 +398,7 @@ def tiny_gemm_bf16(
 def try_qwen3x_nvfp4_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
-    input_sf: Optional[torch.Tensor],
+    input_sf: torch.Tensor | None,
     weight_sf: torch.Tensor,
     alpha: torch.Tensor,
     out_dtype: torch.dtype,
@@ -316,9 +413,9 @@ def try_qwen3x_nvfp4_gemm(
 def try_sm120_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
-    input_scale: Optional[torch.Tensor],
-    output_scale: Optional[torch.Tensor],
-    bias: Optional[torch.Tensor] = None,
+    input_scale: torch.Tensor | None,
+    output_scale: torch.Tensor | None,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Run the best validated SM12x FP8 small-batch path, or return ``None``."""
     return get_kernel("gemm.sm120_fp8_linear", KernelBackend.KDA)(

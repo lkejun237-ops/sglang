@@ -8,7 +8,10 @@
 #include <torch/all.h>
 
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
+
+#include <optional>
 
 #include "cutlass/cutlass.h"
 
@@ -39,9 +42,11 @@ void cutlass_gemm_caller(
     cute::Shape<int, int, int, int> prob_shape,
     typename GemmKernel::MainloopArguments mainloop_args,
     typename GemmKernel::EpilogueArguments epilogue_args,
-    typename GemmKernel::TileSchedulerArguments scheduler = {}) {
+    typename GemmKernel::TileSchedulerArguments scheduler = {},
+    std::optional<torch::Tensor> workspace_opt = std::nullopt) {
+  c10::cuda::CUDAGuard device_guard(device);
   cutlass::KernelHardwareInfo hw_info;
-  hw_info.device_id = c10::cuda::current_device();
+  hw_info.device_id = device.index();
   hw_info.sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
   typename GemmKernel::Arguments args{
       cutlass::gemm::GemmUniversalMode::kGemm, prob_shape, mainloop_args, epilogue_args, hw_info, scheduler};
@@ -52,11 +57,33 @@ void cutlass_gemm_caller(
   CUTLASS_CHECK(gemm_op.can_implement(args));
 
   size_t workspace_size = gemm_op.get_workspace_size(args);
-  auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(device);
-  auto workspace = torch::empty(workspace_size, workspace_options);
+  torch::Tensor workspace;
+  bool is_internal_workspace = false;
+  if (workspace_opt.has_value() && workspace_opt->defined()) {
+    TORCH_CHECK(
+        workspace_opt->device() == device,
+        "Provided workspace device (",
+        workspace_opt->device(),
+        ") does not match target device (",
+        device,
+        ")");
+    TORCH_CHECK(
+        static_cast<size_t>(workspace_opt->nbytes()) >= workspace_size,
+        "Provided workspace is smaller than required CUTLASS workspace: ",
+        workspace_opt->nbytes(), " < ", workspace_size);
+    workspace = *workspace_opt;
+  } else {
+    auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(device);
+    workspace = torch::empty(workspace_size, workspace_options);
+    is_internal_workspace = true;
+  }
 
   auto stream = at::cuda::getCurrentCUDAStream(device.index());
 
-  cutlass::Status status = gemm_op.run(args, workspace.data_ptr(), stream);
-  CUTLASS_CHECK(status);
+  CUTLASS_CHECK(gemm_op.initialize(args, workspace.data_ptr(), stream));
+  CUTLASS_CHECK(gemm_op.run(stream));
+
+  if (is_internal_workspace && workspace_size > 0) {
+    c10::cuda::CUDACachingAllocator::recordStream(workspace.storage().data_ptr(), stream);
+  }
 }
