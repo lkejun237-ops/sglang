@@ -8050,6 +8050,30 @@
           "reason": "CUDA required"
         }
       ]
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/conditioning/test_prefetch.py",
+      "suite": "conditioning-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "conditioning"
+      ],
+      "reason": "Two independent Linux WSL CPU trials: 12 real IPC/ownership tests passed; no GPU overlap claim.",
+      "dependencies": []
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/realtime/test_zing_source_decoder_overlap.py",
+      "suite": "realtime-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Linux WSL CPU API-loop regression: bounded decode overlap, output/event order, source-credit failure, final drain, cancellation and next-session recovery; no GPU performance claim.",
+      "dependencies": []
     }
   ],
   "recipes": {

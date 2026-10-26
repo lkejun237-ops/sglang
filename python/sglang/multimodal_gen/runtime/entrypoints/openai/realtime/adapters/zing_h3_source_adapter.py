@@ -117,6 +117,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         self._pending_reference_upload = None
         self._inflight_reference_uploads = []
         self._pending_prompt_command = self._selected_prompt_command = None
+        self.prompt_prefetch = None
+        self.conditioning_prefetch_endpoint = None
         self.initial_prompt = request.prompt
         args = get_global_server_args()
         from ..conditioning import get_api_resources, validate_remote_request
@@ -374,6 +376,16 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         )
 
         self.source_work_quantum = source_work_quantum()
+        self.source_decoder_overlap = getattr(
+            args, "zing_source_decoder_overlap", False
+        )
+        if self.source_decoder_overlap and (
+            self.source_work_quantum != 1
+            or "remote" not in profile.get("source_decoder", {})
+        ):
+            raise ValueError(
+                "Source decoder overlap requires a dedicated decoder and source quantum 1"
+            )
         self.more_work = False
         self.clip, self.profile = clip, profile
         self.reference_ids = [ref["id"] for ref in self.reference_items]
@@ -385,6 +397,26 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         )
         self.source_encoder = profile.get("source_encoder", default_source_encoder())
         self._initialize_source_admission(session, limits)
+        if getattr(args, "zing_conditioning_prefetch", False):
+            from sglang.multimodal_gen.runtime.conditioning.prefetch import (
+                PromptPrefetchPublisher,
+            )
+
+            if session.input_temp_dir is None:
+                session.input_temp_dir = tempfile.mkdtemp(
+                    prefix="sglang_zing_source_", dir="/tmp"
+                )
+            self.conditioning_prefetch_endpoint = "ipc://" + str(
+                Path(session.input_temp_dir) / (uuid.uuid4().hex + ".sock")
+            )
+            resources = get_api_resources(session, args)
+            self.prompt_prefetch = PromptPrefetchPublisher(
+                self.conditioning_prefetch_endpoint,
+                max_bytes=self.max_message_bytes,
+                reserve=lambda size: resources.ledger.reserve(
+                    resources.tenant, ram=size, inflight=size
+                ),
+            )
         self.first_source_received_unix_ns = None
         self.prompt_event = None
         request.fps, request.num_inference_steps, request.guidance_scale = (
@@ -596,6 +628,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                     )
                 )
         self._pending_prompt_command = command
+        if self.prompt_prefetch is not None:
+            self.prompt_prefetch.submit(command)
         self.available.set()
         if not command.get("rejected"):
             await ws.send_bytes(
@@ -828,6 +862,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         batch.extra["zing_reference_ids"] = self.reference_ids
         batch.extra["zing_source_command"] = dict(
             config=self.config,
+            conditioning_prefetch_endpoint=self.conditioning_prefetch_endpoint,
+            conditioning_prefetch_max_bytes=self.max_message_bytes,
             sampling_schedule=self.sampling_schedule,
             async_output=self.profile.get("async_source_output", False),
             appends=appends,
@@ -893,6 +929,9 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         return total
 
     def clear_state(self, session):
+        if getattr(self, "prompt_prefetch", None) is not None:
+            self.prompt_prefetch.close()
+            self.prompt_prefetch = None
         if getattr(self, "admission_socket", None) is not None:
             self.admission_socket.close()
             self.admission_context.term()

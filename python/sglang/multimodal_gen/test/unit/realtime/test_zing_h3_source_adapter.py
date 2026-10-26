@@ -1929,3 +1929,69 @@ def test_reference_count_cli_does_not_add_setting_to_other_models():
     config = PipelineConfig()
     config.update_config_from_dict(vars(parsed))
     assert not hasattr(config, "zing_reference_max_images")
+
+
+def test_prompt_prefetch_publishes_before_dispatch_and_closes(configured, monkeypatch):
+    from sglang.multimodal_gen.runtime.conditioning import prefetch
+
+    class Publisher:
+        def __init__(self, endpoint, **kwargs):
+            self.endpoint, self.messages, self.closed = endpoint, [], False
+
+        def submit(self, command):
+            self.messages.append(
+                msgspec.msgpack.decode(msgspec.msgpack.encode(command))
+            )
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(prefetch, "PromptPrefetchPublisher", Publisher)
+    configured.zing_conditioning_prefetch = True
+    configured.zing_conditioning_mode = "remote"
+    _enable_reference_updates(configured)
+    adapter, session = initialize()
+    publisher = adapter.prompt_prefetch
+    ws = PromptSocket()
+
+    async def run():
+        await adapter.ingest_wire_event(
+            ws,
+            session,
+            dict(
+                type="event",
+                kind="prompt",
+                event_id=1,
+                payload="new",
+                references=[_reference()],
+            ),
+            100,
+        )
+        assert publisher.messages[0]["prompt"] == "new"
+        assert (
+            publisher.messages[0]["references"][0]["payload"] == _reference()["payload"]
+        )
+        assert adapter._selected_prompt_command is None
+        assert adapter._pending_prompt_command["event_id"] == 1
+        assert ws.messages[-1]["type"] == "control_ack"
+        adapter.clear_state(session)
+        assert publisher.closed
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("remote,quantum", [(False, "1"), (True, "0"), (True, "1")])
+def test_source_decoder_overlap_requires_dedicated_single_block_path(
+    configured, monkeypatch, remote, quantum
+):
+    configured.zing_source_decoder_overlap = True
+    configured.zing_source_decoder_port = 8098 if remote else None
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", quantum)
+    if not remote or quantum != "1":
+        with pytest.raises(ValueError, match="dedicated decoder and source quantum 1"):
+            initialize()
+    else:
+        adapter, session = initialize()
+        assert adapter.source_decoder_overlap is True
+        assert adapter.profile["source_decoder"] == {"remote": {"port": 8098}}
+        adapter.clear_state(session)

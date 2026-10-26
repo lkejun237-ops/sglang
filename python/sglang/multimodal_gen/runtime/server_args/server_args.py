@@ -449,6 +449,8 @@ class ServerArgs(DisaggServerArgsMixin):
     enable_torch_compile: bool = False
     enable_cuda_graph: bool = False
     zing_conditioning_mode: str = "local"
+    zing_conditioning_prefetch: bool = False
+    zing_source_decoder_overlap: bool = False
     # Comma-separated indices into the caller's CUDA_VISIBLE_DEVICES order.
     zing_dit_gpus: str | None = None
     zing_decoder_gpus: str | None = None
@@ -673,6 +675,19 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_scheduler_rpc_timeout()
         if self.zing_conditioning_mode not in {"local", "remote"}:
             raise ValueError("Unsupported Zing conditioning mode")
+        if self.zing_conditioning_prefetch and (
+            self.zing_conditioning_mode != "remote"
+            or self.realtime_max_sessions != 1
+            or self.realtime_max_sessions_per_worker != 1
+        ):
+            raise ValueError(
+                "Conditioning prefetch requires remote mode and one active session"
+            )
+        if self.zing_source_decoder_overlap and (
+            self.realtime_max_sessions != 1
+            or self.realtime_max_sessions_per_worker != 1
+        ):
+            raise ValueError("Source decoder overlap requires one active session")
         if self.zing_conditioning_mode != "local" and any(
             not value
             for value in (
@@ -2101,6 +2116,18 @@ class ServerArgs(DisaggServerArgsMixin):
                 "Explicit grids override these defaults independently. "
                 "With 0, preserve request-level sampling defaults."
             ),
+        )
+        parser.add_argument(
+            "--zing-conditioning-prefetch",
+            action="store_true",
+            default=ServerArgs.zing_conditioning_prefetch,
+            help="Prepare received prompt updates during in-flight DiT work (remote, single session).",
+        )
+        parser.add_argument(
+            "--zing-source-decoder-overlap",
+            action="store_true",
+            default=ServerArgs.zing_source_decoder_overlap,
+            help="Overlap dedicated source decoding/output with the next DiT block (single session, source quantum 1).",
         )
         parser.add_argument(
             "--zing-conditioning-mode",

@@ -488,6 +488,52 @@ class ZingH3Codecs(ZingH3MediaInput):
             max_area_config=max_area_config,
         )
 
+    def prepare_reference_media(self, active, references):
+        """CPU-only preparation shared by early Qwen and boundary admission."""
+        old_ids = {item["content_id"] for item in active.conditions}
+        media = [item for item in active.condition_media if item["id"] not in old_ids]
+        ids = [item["id"] for item in media + references]
+        if len(ids) != len(set(ids)) or any(
+            item["type"] != "image" for item in references
+        ):
+            raise ValueError(
+                "Reference IDs must not conflict with retained presentation"
+            )
+        decoded_references = [
+            self._decode_media(item, need_audio=False) for item in references
+        ]
+        conditions = [
+            dict(
+                content_id=item["id"],
+                role="reference",
+                latent_modalities=["visual"],
+            )
+            for item in references
+        ]
+        target = dict(
+            type=active.output_type,
+            output=dict(
+                frames=active.pixel_frame_count,
+                height=active.visual_shape[1] * self.spatial_ratio,
+                width=active.visual_shape[2] * self.spatial_ratio,
+            ),
+        )
+        normalized, _, h, w, t, _ = self._normalize_inference_media(
+            decoded_references,
+            None,
+            conditions,
+            target,
+            max_area_config=getattr(active, "max_area_config", None)
+            or self.max_area_config,
+        )
+        if (
+            t,
+            h // self.spatial_ratio,
+            w // self.spatial_ratio,
+        ) != active.visual_shape:
+            raise ValueError("Reference updates cannot change output geometry")
+        return media + normalized, normalized, conditions
+
     def prepare_reference_update(
         self, active, references, prompt, use_component, *, conditioning
     ):
@@ -502,50 +548,9 @@ class ZingH3Codecs(ZingH3MediaInput):
 
         error = None
         try:
-            old_ids = {item["content_id"] for item in active.conditions}
-            media = [
-                item for item in active.condition_media if item["id"] not in old_ids
-            ]
-            ids = [item["id"] for item in media + references]
-            if len(ids) != len(set(ids)) or any(
-                item["type"] != "image" for item in references
-            ):
-                raise ValueError(
-                    "Reference IDs must not conflict with retained presentation"
-                )
-            decoded_references = [
-                self._decode_media(item, need_audio=False) for item in references
-            ]
-            conditions = [
-                dict(
-                    content_id=item["id"],
-                    role="reference",
-                    latent_modalities=["visual"],
-                )
-                for item in references
-            ]
-            target = dict(
-                type=active.output_type,
-                output=dict(
-                    frames=active.pixel_frame_count,
-                    height=active.visual_shape[1] * self.spatial_ratio,
-                    width=active.visual_shape[2] * self.spatial_ratio,
-                ),
+            media, normalized, conditions = self.prepare_reference_media(
+                active, references
             )
-            normalized, _, h, w, t, _ = self._normalize_inference_media(
-                decoded_references,
-                None,
-                conditions,
-                target,
-                max_area_config=getattr(active, "max_area_config", None)
-                or self.max_area_config,
-            )
-            if (
-                t,
-                h // self.spatial_ratio,
-                w // self.spatial_ratio,
-            ) != active.visual_shape:
-                raise ValueError("Reference updates cannot change output geometry")
         except (ValueError, OSError) as exc:
             error = exc
         if not all(coordinate_validation(error is None)):
@@ -553,7 +558,6 @@ class ZingH3Codecs(ZingH3MediaInput):
                 "CONDITION_INVALID", "Reference media preparation failed"
             ) from error
         # Retained presentation is already normalized; only new references change.
-        media = media + normalized
         positive = conditioning(prompt, media)
         candidate = copy(active)
         candidate.conditions = conditions

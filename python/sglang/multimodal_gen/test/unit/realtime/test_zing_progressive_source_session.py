@@ -253,6 +253,25 @@ def test_worker_rejects_invalid_encoder_output_and_releases_all_state():
     assert not sampler.calls
 
 
+def test_prefetch_close_failure_still_releases_source_resources():
+    state, _ = session(ChunkPlan([1, 2, 2]))
+    encoder, sampler, decoder = state.pixels, state.sampler, state.decoder
+    releases = []
+
+    def fail_close():
+        raise RuntimeError("Conditioning prefetch did not drain")
+
+    owner = NS(close=fail_close)
+    state.conditioning_prefetch = owner
+    state.kv_lease = NS(release=lambda: releases.append("lease"))
+    with pytest.raises(RuntimeError, match="prefetch did not drain"):
+        state.dispose()
+    assert state.closed and encoder.disposed and sampler.closed and decoder.closed
+    assert state.pixels is state.bridge is state.ledger is state.inputs is None
+    assert state.conditioning_prefetch is owner
+    assert state.kv_lease is None and releases == ["lease"]
+
+
 def test_continuous_source_path_emits_dit_and_decoder_stage_spans(monkeypatch):
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
         source_session,

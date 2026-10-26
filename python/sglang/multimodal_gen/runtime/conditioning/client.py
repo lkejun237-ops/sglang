@@ -358,10 +358,14 @@ class ConditioningClient:
                 "CONDITION_INVALID", "Conditioning request exceeds the byte limit"
             )
 
-    def encode(self, prompt, media, *, input_digest):
+    def encode(self, prompt, media, *, input_digest, deadline=None):
         from .wire import decode_response, encode_request
 
-        deadline = self.clock() + self.timeout_s
+        deadline = (
+            min(deadline, self.clock() + self.timeout_s)
+            if deadline is not None
+            else self.clock() + self.timeout_s
+        )
         self.validate_input(prompt, media)
         body = encode_request(
             prompt,

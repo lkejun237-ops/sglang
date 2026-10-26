@@ -1213,11 +1213,39 @@ async def _process_realtime_generation_batch(batch):
 
 
 async def _wait_for_source_chunk_output(adapter, pending_send_task):
-    if getattr(adapter, "source_work_quantum", 0) and pending_send_task is not None:
+    if (
+        getattr(adapter, "source_work_quantum", 0)
+        and not getattr(adapter, "source_decoder_overlap", False)
+        and pending_send_task is not None
+    ):
         # Prior RGB/provenance must be sent before more experimental GPU work.
         await pending_send_task
         return None
     return pending_send_task
+
+
+async def _wait_for_source_input(adapter, session, pending_send_task):
+    if pending_send_task is None or not getattr(
+        adapter, "source_decoder_overlap", False
+    ):
+        await adapter.wait_for_next_chunk(session)
+        return
+    # A failed output cannot return source credit. Do not leave the next input
+    # wait stranded behind that failure; the loop still owns the output task.
+    ready = asyncio.create_task(adapter.wait_for_next_chunk(session))
+    try:
+        done, _ = await asyncio.wait(
+            (ready, pending_send_task), return_when=asyncio.FIRST_COMPLETED
+        )
+        if pending_send_task in done:
+            pending_send_task.result()
+        await ready
+        if pending_send_task.done():
+            pending_send_task.result()
+    finally:
+        if not ready.done():
+            ready.cancel()
+        await _await_realtime_task(ready)
 
 
 async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
@@ -1248,7 +1276,7 @@ async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
             server_args = get_global_server_args()
 
             wait_started = time.perf_counter()
-            await adapter.wait_for_next_chunk(session)
+            await _wait_for_source_input(adapter, session, pending_send_task)
             await adapter.prepare_conditioning(session, server_args)
             wait_for_next_chunk_ms = (time.perf_counter() - wait_started) * 1000
             log_realtime_trace(
@@ -1337,6 +1365,10 @@ async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
 
             # finish
             adapter.on_chunk_complete(session, result)
+            # At most one previous output and this completed result are owned.
+            # A dedicated decoder has received the latent before returning its
+            # reference. Wait here, rather than before DiT, to preserve send
+            # order and backpressure without serializing decode with DiT.
             if pending_send_task is not None:
                 await pending_send_task
             pending_send_task = asyncio.create_task(

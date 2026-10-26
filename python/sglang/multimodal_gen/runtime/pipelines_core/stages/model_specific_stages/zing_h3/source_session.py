@@ -49,6 +49,7 @@ class ZingSourceStreamState(BaseRealtimeState):
         self.failed_update = None
         self.closed = False
         self.component_capture = None
+        self.conditioning_prefetch = None
         self.kv_lease = None
         self.pending_output = None
         self.remote_decoder = False
@@ -175,6 +176,9 @@ class ZingSourceStreamState(BaseRealtimeState):
             defer_final=defer_final,
             prompt_joint=prompt_joint,
         )
+        endpoint = command.get("conditioning_prefetch_endpoint")
+        if endpoint is not None:
+            self._start_conditioning_prefetch(stage, batch, endpoint, command)
         capture_dir = os.environ.get("SGLANG_ZING_COMPONENT_CAPTURE_DIR")
         decoder_policy = batch.extra["zing_source_command"].get("decoder")
         if capture_dir and decoder_policy and "remote" in decoder_policy:
@@ -221,6 +225,73 @@ class ZingSourceStreamState(BaseRealtimeState):
             return self.kv_lease.kv_cache
 
         return acquire
+
+    def _start_conditioning_prefetch(self, stage, batch, endpoint, command):
+        from sglang.multimodal_gen.runtime.conditioning.prefetch import (
+            ConditioningPrefetch,
+        )
+        from sglang.multimodal_gen.runtime.conditioning.worker import (
+            RemoteConditioner,
+            WorkerConditioningState,
+            _identity,
+        )
+
+        provider = stage.conditioning_provider
+        if not isinstance(provider, RemoteConditioner):
+            raise ConditionError(
+                "CONDITION_INVALID", "Prefetch requires remote conditioning"
+            )
+
+        def prepare(update):
+            # Capture the current worker-owned media once; a later commit replaces
+            # self.inputs, but never mutates these normalized CPU tensors.
+            active = self.inputs
+            media = active.condition_media
+            if "references" in update:
+                media, _, _ = stage.codecs.prepare_reference_media(
+                    active, update["references"]
+                )
+            return update["prompt"], media
+
+        def identity(prompt, media):
+            provider.client.validate_input(prompt, media)
+            return _identity(
+                prompt,
+                media,
+                provider.profile_id,
+                WorkerConditioningState(),
+                provider.preprocess_version,
+            )
+
+        receipt = {"ok": True}
+        if provider.rank == 0:
+            try:
+                previous = getattr(provider, "_prefetch_owner", None)
+                if previous is not None and previous.thread.is_alive():
+                    raise ConditionError(
+                        "CONDITION_BUSY", "Previous conditioning work has not drained"
+                    )
+                self.conditioning_prefetch = ConditioningPrefetch(
+                    endpoint,
+                    prepare=prepare,
+                    identity=identity,
+                    client=provider.client,
+                    max_bytes=command["conditioning_prefetch_max_bytes"],
+                )
+                provider._prefetch_owner = self.conditioning_prefetch
+                batch.session.get_or_create_state(
+                    WorkerConditioningState
+                ).prefetch = self.conditioning_prefetch
+            except Exception:
+                logger.exception("Conditioning prefetch startup failed")
+                receipt = {"ok": False}
+        if not all(item["ok"] for item in provider.coordinate(receipt)):
+            if self.conditioning_prefetch is not None:
+                self.conditioning_prefetch.close()
+                self.conditioning_prefetch = None
+            raise ConditionError(
+                "CONDITION_UNAVAILABLE", "Conditioning prefetch startup failed"
+            )
 
     def _admit_prompt_update(self, stage, condition, inputs=None):
         """Check the new condition before it can replace active or pending KV."""
@@ -514,7 +585,16 @@ class ZingSourceStreamState(BaseRealtimeState):
                 # One reference per dispatch: the decoder host publishes while
                 # the DiT proceeds to its next dispatch. EOS already drained.
                 self._decode_ready(stage, outputs, metadata, timed, trace)
+            prefetch = self.conditioning_prefetch
             usage = {
+                "zing_conditioning_prefetch": None
+                if prefetch is None
+                else dict(
+                    encodes=prefetch.encodes,
+                    hits=prefetch.hits,
+                    failures=prefetch.failures,
+                    fallbacks=prefetch.fallbacks,
+                ),
                 "zing_realtime_blocks": metadata,
                 "zing_source_consumed_end": self.bridge.accepted_pixels,
                 "zing_source_complete": completed,
@@ -959,7 +1039,15 @@ class ZingSourceStreamState(BaseRealtimeState):
 
     def dispose(self):
         try:
-            self._dispose_states()
+            try:
+                if self.conditioning_prefetch is not None:
+                    self.conditioning_prefetch.close()
+                    self.conditioning_prefetch = None
+            finally:
+                # A slow CPU prefetch must not skip remote abort or KV cleanup.
+                # Its prepare call owns local CPU media references; the provider
+                # retains the live owner and rejects another prefetch session.
+                self._dispose_states()
         finally:
             # Return the slot only after the ready session cleared its cache.
             if self.kv_lease is not None:

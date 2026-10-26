@@ -62,6 +62,8 @@ def methods(sampling_schedule=None):
         available=asyncio.Event(),
         ledger=NS(closed=False),
         config={},
+        conditioning_prefetch_endpoint=None,
+        max_message_bytes=1 << 20,
         sampling_schedule=(
             sampling_schedule
             if sampling_schedule is not None

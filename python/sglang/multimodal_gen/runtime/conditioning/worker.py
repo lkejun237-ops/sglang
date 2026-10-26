@@ -27,10 +27,16 @@ class WorkerConditioningState(BaseRealtimeState):
     def __init__(self):
         self.identity = self.positive = None
         self.media_hashes = {}
+        self.prefetch = None
 
     def dispose(self):
-        self.identity = self.positive = None
-        self.media_hashes.clear()
+        try:
+            if self.prefetch is not None:
+                self.prefetch.close()
+                self.prefetch = None
+        finally:
+            self.identity = self.positive = None
+            self.media_hashes.clear()
 
 
 def _identity(prompt, media, profile_id, state, preprocess_version):
@@ -279,7 +285,8 @@ class RemoteConditioner:
         positive = announcement = None
         if self.rank == 0:
             try:
-                positive = self.client.encode(prompt, media, input_digest=digest)
+                encoder = state.prefetch or self.client
+                positive = encoder.encode(prompt, media, input_digest=digest)
                 announcement = {
                     "ok": True,
                     "shapes": {
