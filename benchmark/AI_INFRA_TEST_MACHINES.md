@@ -1,16 +1,18 @@
 # AI Infra 测试机器与访问方式
 
 最近核验：2026-10-22。供本仓库开发者和 Codex 查找测试资源。
-**优先上海 H200 / H100，其次泰国 B300**。明确指定硬件或需要特定 CUDA 架构的测试
+资源用途更新：2026-10-26（用户确认）。**优先上海 H100，其次泰国 B300**。
+上海 H200 已部署两个实例，供产品团队做 demo case 使用，不作为默认测试资源。
+明确指定硬件或需要特定 CUDA 架构的测试
 按实验要求选机；同条件 baseline 与改动后测试使用相同硬件，不跨机器型号计算性能收益。
 
 ## 资源入口
 
 | 优先级 | 测试资源 | 地域与资源标识 | 访问方式 |
 | --- | --- | --- | --- |
-| 1 | 上海 H200，实际设备名 `NVIDIA L20X` | `cn-shanghai`；PAI workspace `1453237`；ResourceId / QuotaId `quota3l8bnv9a35n` | PAI-DLC 查询作业，再进入该作业的 Web Terminal |
 | 1 | 上海 H100，实际设备名 `NVIDIA L20Z` | `cn-shanghai` / `cn-shanghai-b`；灵骏集群 `i119114381787650669980`；节点 `e01-cn-2zd4xi8m505` | `eflo-controller RunCommand` / `DescribeInvocations`；独立 K3s 节点，无需 SSH |
 | 2 | 泰国 B300 测试目标，实际设备名 `NVIDIA L20D` | `ap-southeast-7`；PAI GPU workspace `384`；ResourceId / QuotaId `quota1betfyi1ilu`；CPU 辅助 workspace `385` | PAI-DLC；CPFS 数据源 `d-ak7t158lhzaq7kdwp3`、版本 `v1`，挂载 `/cpfs` |
+| 不作为默认测试资源 | 上海 H200，实际设备名 `NVIDIA L20X`；两个实例供产品 demo case 使用 | `cn-shanghai`；PAI workspace `1453237`；ResourceId / QuotaId `quota3l8bnv9a35n` | PAI-DLC 查询作业，再进入该作业的 Web Terminal |
 
 上海 L20X 按用户确认的 H200 使用；保留原始设备名便于核验。
 已有真实 CUDA 查询：上海 H100/H200 为 SM90；泰国目标为 CC 10.3。
@@ -34,7 +36,10 @@ Zing 的配置、显存余量和结果边界另见
 以下命令面向已安装 Aliyun CLI 及对应插件的终端。示例显式指定 region，
 不依赖 profile 的默认地域。执行前可用 `aliyun <product> <action> --help` 核对本机参数。
 
-## 上海 H200：PAI-DLC
+## 上海 H200：产品 demo 部署（PAI-DLC）
+
+该机器已部署两个实例，供产品团队做 demo case 使用。以下保留访问与核验方式，
+不代表可占用测试；测试默认先使用上海 H100，其次泰国 B300。
 
 先查当前作业，不能把某个旧 Job ID 当作永久机器入口：
 
