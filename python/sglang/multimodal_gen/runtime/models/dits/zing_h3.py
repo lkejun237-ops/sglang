@@ -13,6 +13,7 @@ import math
 import os
 import warnings
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 import msgspec
 import torch
@@ -74,6 +75,22 @@ from sglang.multimodal_gen.runtime.models.dits.zing_h3_rope import (
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
+
+
+@lru_cache(maxsize=1)
+def _has_seedleap_kernels() -> bool:
+    try:
+        import seedleap_kernels.ops as ops
+
+        required_ops = (
+            "fused_rmsnorm_indexed_scale_shift_quant_fp8",
+            "fused_gated_residual_rmsnorm_indexed_scale_shift_quant_fp8",
+            "fused_indexed_gated_residual_add",
+            "fused_swiglu_quant_fp8",
+        )
+        return all(callable(getattr(ops, name, None)) for name in required_ops)
+    except (ImportError, ModuleNotFoundError, AttributeError, ValueError):
+        return False
 
 
 def storage_masks(roles):
@@ -605,6 +622,12 @@ def _attention(
         raise ValueError(
             "Zing experimental FA4 does not support explicit attention masks"
         )
+    hidden_tensor = (
+        (hidden[0] if isinstance(hidden, tuple) else hidden)
+        if hidden is not None
+        else None
+    )
+    total_rows = hidden_tensor.shape[0] if hidden_tensor is not None else 0
     qkv = module.qkv_proj(hidden)[0]
     q, k, v = (
         x.reshape(-1, module.num_heads, module.head_dim) for x in qkv.chunk(3, -1)
@@ -693,7 +716,7 @@ def _attention(
         with maybe_record_function("Zing.Ulysses.output_all_to_all"):
             result = _usp_output_all_to_all_varlen(result, sequence_splits, head_dim=2)[
                 0
-            ].reshape(hidden.shape[0], module.num_heads * module.head_dim)
+            ].reshape(total_rows, module.num_heads * module.head_dim)
         return module.out_proj(result)[0], raw
     # V is a view into fused QKV. Persist only V, not the entire projection.
     if capture and stage_prefix_kv is not None:
@@ -746,12 +769,12 @@ def _attention(
     if joint_ends is not None:
         result = _joint_attention(
             q, k, v, joint_ends, module.softmax_scale, attention_backend, fa4_metadata
-        ).reshape(hidden.shape[0], -1)
+        ).reshape(total_rows, -1)
     elif attention_backend == "fa4":
         with maybe_record_function("Zing.FA4"):
             result = _fa4_attention(
                 q, k, v, module.softmax_scale, metadata=fa4_metadata
-            ).reshape(hidden.shape[0], module.num_heads * module.head_dim)
+            ).reshape(total_rows, module.num_heads * module.head_dim)
     else:
         with maybe_record_function("Zing.SDPA"):
             result = (
@@ -765,7 +788,7 @@ def _attention(
                     scale=module.softmax_scale,
                 )[0]
                 .transpose(0, 1)
-                .reshape(hidden.shape[0], -1)
+                .reshape(total_rows, -1)
             )
     return module.out_proj(result)[0], raw
 
@@ -880,13 +903,12 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                     "Zing condition timesteps must be finite and within [0, 1]"
                 )
         if (
-            quant_config is not None
-            or arch.adaln_curve_grid is not None
+            arch.adaln_curve_grid is not None
             or arch.adaln_affine_input_dim is not None
             or kwargs
         ):
             raise ValueError(
-                "Zing inference requires unquantized non-curve weights and supported constructor arguments"
+                "Zing inference requires non-curve weights and supported constructor arguments"
             )
         if adaln_table is not None and (
             not isinstance(adaln_table, ZingAdalnTable)
@@ -896,13 +918,24 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             raise ValueError(
                 "Zing AdaLN table does not match the worker projection layout"
             )
+        if quant_config is not None:
+            from sglang.multimodal_gen.runtime.models.dits.zing_h3_quant import (
+                ZingLinearQuantConfig,
+            )
+
+            if not isinstance(quant_config, ZingLinearQuantConfig):
+                quant_config = ZingLinearQuantConfig(
+                    quant_config, num_layers=arch.num_layers
+                )
+
         arch.checkpoint_uses_diffusers_layout = True
         super().__init__(
             config,
             hf_config,
-            quant_config=None,
+            quant_config=quant_config,
             omit_adaln_projections=adaln_table is not None,
         )
+        self.quant_config = quant_config
         self.adaln_table = adaln_table
         self.experimental_attention_backend = experimental_attention
         self.experimental_stable_shapes = stable_shapes == "1"
@@ -924,6 +957,22 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             else None
         )
         self.denoise_graph_sp = denoise_graph_sp == "1"
+        self.inplace_residual = (
+            os.environ.get("SGLANG_ZING_INPLACE_RESIDUAL", "1") == "1"
+        )
+
+    def _should_fuse_pre_linear_quant(self, value: torch.Tensor) -> bool:
+        if os.environ.get("SGLANG_ZING_FUSED_PRE_LINEAR_QUANT", "1") == "0":
+            return False
+        if not value.is_cuda:
+            return False
+        if value.dtype != torch.bfloat16:
+            return False
+        if value.requires_grad:
+            return False
+        if value.shape[-1] > 8192:
+            return False
+        return _has_seedleap_kernels()
 
     def _project_outputs(
         self, hidden, p, layout, *, joint_ends=None, mixed_prefix=False
@@ -2079,6 +2128,12 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         )
 
     def _fixed_block_attention(self, current, hidden, index, inputs, options):
+        hidden_tensor = (
+            (hidden[0] if isinstance(hidden, tuple) else hidden)
+            if hidden is not None
+            else None
+        )
+        total_rows = hidden_tensor.shape[0] if hidden_tensor is not None else 0
         if options.replicated_prefix:
             start = options.ulysses_rank * options.prefix_heads
             stop = start + options.prefix_heads
@@ -2197,7 +2252,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             result = _usp_output_all_to_all_varlen(result[None], splits, head_dim=2)[0]
         return (
             module.out_proj(
-                result.reshape(hidden.shape[0], module.num_heads * module.head_dim)
+                result.reshape(total_rows, module.num_heads * module.head_dim)
             )[0],
             None,
         )
@@ -2216,19 +2271,98 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         fa4_metadata,
     ):
         """One main block: modulated attention and MLP; returns output and capture."""
-        with maybe_record_function("Zing.AdaLN"):
-            shift, scale, gate, ff_shift, ff_scale, ff_gate = (
-                v[inputs.indices]
-                for v in self._projection(
-                    index, current.adaln_proj, inputs, options, projections
+        if not self._should_fuse_pre_linear_quant(value):
+            with maybe_record_function("Zing.AdaLN"):
+                shift, scale, gate, ff_shift, ff_scale, ff_gate = (
+                    v[inputs.indices]
+                    for v in self._projection(
+                        index, current.adaln_proj, inputs, options, projections
+                    )
                 )
+            with maybe_record_function("Zing.norm_modulation.attention"):
+                normed = (
+                    _native_compiled_adaln(value, current.norm1, shift, scale)
+                    if self.experimental_compiled_adaln
+                    else current.norm1(value) * (1 + scale) + shift
+                )
+            attended, raw = self._block_attention(
+                current,
+                value,
+                normed,
+                index=index,
+                inputs=inputs,
+                options=options,
+                cache=cache,
+                mask=mask,
+                fa4_metadata=fa4_metadata,
             )
+            with maybe_record_function("Zing.gated_residual.attention"):
+                value = value + gate * attended
+            with maybe_record_function("Zing.norm_modulation.mlp"):
+                ff_normed = (
+                    _native_compiled_adaln(value, current.norm2, ff_shift, ff_scale)
+                    if self.experimental_compiled_adaln
+                    else current.norm2(value) * (1 + ff_scale) + ff_shift
+                )
+            ff_output = current.mlp(ff_normed)
+            with maybe_record_function("Zing.gated_residual.mlp"):
+                return value + ff_gate * ff_output, raw
+
+        with maybe_record_function("Zing.AdaLN"):
+            (
+                shift_table,
+                scale_table,
+                gate_table,
+                ff_shift_table,
+                ff_scale_table,
+                ff_gate_table,
+            ) = self._projection(
+                index, current.adaln_proj, inputs, options, projections
+            )
+
+        from seedleap_kernels.ops import (
+            fused_gated_residual_rmsnorm_indexed_scale_shift_quant_fp8,
+            fused_indexed_gated_residual_add,
+            fused_rmsnorm_indexed_scale_shift_quant_fp8,
+        )
+
+        eps1 = float(getattr(current.norm1, "eps", 1e-6))
+        eps2 = float(getattr(current.norm2, "eps", 1e-6))
+
         with maybe_record_function("Zing.norm_modulation.attention"):
-            normed = (
-                _native_compiled_adaln(value, current.norm1, shift, scale)
-                if self.experimental_compiled_adaln
-                else current.norm1(value) * (1 + scale) + shift
+            quantize_qkv = (
+                getattr(
+                    current.attn.qkv_proj.quant_method,
+                    "should_quantize_activation",
+                    lambda n: False,
+                )(value.shape[0])
+                if hasattr(current.attn.qkv_proj, "quant_method")
+                else False
             )
+            if quantize_qkv:
+                qinput, scale = fused_rmsnorm_indexed_scale_shift_quant_fp8(
+                    value,
+                    current.norm1.weight,
+                    shift_table,
+                    scale_table,
+                    inputs.indices,
+                    eps=eps1,
+                    quantize_fp8=True,
+                    compiled_norm=self.experimental_compiled_adaln,
+                )
+                normed = (qinput, scale)
+            else:
+                normed = fused_rmsnorm_indexed_scale_shift_quant_fp8(
+                    value,
+                    current.norm1.weight,
+                    shift_table,
+                    scale_table,
+                    inputs.indices,
+                    eps=eps1,
+                    quantize_fp8=False,
+                    compiled_norm=self.experimental_compiled_adaln,
+                )
+
         attended, raw = self._block_attention(
             current,
             value,
@@ -2240,17 +2374,62 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             mask=mask,
             fa4_metadata=fa4_metadata,
         )
-        with maybe_record_function("Zing.gated_residual.attention"):
-            value = value + gate * attended
+        attn_output = attended
+
         with maybe_record_function("Zing.norm_modulation.mlp"):
-            ff_normed = (
-                _native_compiled_adaln(value, current.norm2, ff_shift, ff_scale)
-                if self.experimental_compiled_adaln
-                else current.norm2(value) * (1 + ff_scale) + ff_shift
+            quantize_fc1 = (
+                getattr(
+                    current.mlp.fc1.quant_method,
+                    "should_quantize_activation",
+                    lambda n: False,
+                )(value.shape[0])
+                if hasattr(current.mlp.fc1, "quant_method")
+                else False
             )
+            if quantize_fc1:
+                value, ff_qinput, ff_scale = (
+                    fused_gated_residual_rmsnorm_indexed_scale_shift_quant_fp8(
+                        value,
+                        attn_output,
+                        gate_table,
+                        current.norm2.weight,
+                        ff_shift_table,
+                        ff_scale_table,
+                        inputs.indices,
+                        eps=eps2,
+                        inplace_residual=self.inplace_residual,
+                        quantize_fp8=True,
+                        compiled_norm=self.experimental_compiled_adaln,
+                    )
+                )
+                ff_normed = (ff_qinput, ff_scale)
+            else:
+                value, ff_normed = (
+                    fused_gated_residual_rmsnorm_indexed_scale_shift_quant_fp8(
+                        value,
+                        attn_output,
+                        gate_table,
+                        current.norm2.weight,
+                        ff_shift_table,
+                        ff_scale_table,
+                        inputs.indices,
+                        eps=eps2,
+                        inplace_residual=self.inplace_residual,
+                        quantize_fp8=False,
+                        compiled_norm=self.experimental_compiled_adaln,
+                    )
+                )
+
         ff_output = current.mlp(ff_normed)
         with maybe_record_function("Zing.gated_residual.mlp"):
-            return value + ff_gate * ff_output, raw
+            value = fused_indexed_gated_residual_add(
+                value,
+                ff_output,
+                ff_gate_table,
+                inputs.indices,
+                inplace=self.inplace_residual,
+            )
+            return value, raw
 
     def _forward_body(
         self, inputs, *, options, cache, mask, p, projections, fa4_metadata

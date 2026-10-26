@@ -153,6 +153,26 @@ def _server_args_for_transformer_component(
     return component_server_args
 
 
+def prepare_zing_runtime_quant_config(
+    model_cls: type,
+    quant_spec: TransformerQuantLoadSpec,
+    dit_config: Any,
+    init_params: dict[str, Any],
+) -> None:
+    """Wrap unquantized/online quant config in ZingLinearQuantConfig for ZingH3DiTModel."""
+    if model_cls.__name__ == "ZingH3DiTModel" and quant_spec.quant_config is not None:
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3_quant import (
+            ZingLinearQuantConfig,
+        )
+
+        if not isinstance(quant_spec.quant_config, ZingLinearQuantConfig):
+            quant_spec.quant_config = ZingLinearQuantConfig(
+                quant_spec.quant_config,
+                num_layers=dit_config.arch_config.num_layers,
+            )
+        init_params["quant_config"] = quant_spec.quant_config
+
+
 class TransformerLoader(OnlineQuantizationComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
@@ -424,7 +444,13 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
 
             if (
                 model_cls.__name__ != "ZingH3DiTModel"
-                or quant_spec.runtime_quant_config is not None
+                or (
+                    quant_spec.runtime_quant_config is not None
+                    and getattr(
+                        quant_spec.runtime_quant_config, "get_name", lambda: None
+                    )()
+                    != "fp8"
+                )
                 or gguf_file is not None
                 or use_fsdp
                 or component_starts_on_cpu
@@ -498,6 +524,13 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                 "fp32" if envs.SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32 else "match"
             )
             checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
+
+        prepare_zing_runtime_quant_config(
+            model_cls=model_cls,
+            quant_spec=quant_spec,
+            dit_config=dit_config,
+            init_params=init_params,
+        )
 
         runtime_quant_config = init_params["quant_config"]
         if runtime_quant_config is not None:

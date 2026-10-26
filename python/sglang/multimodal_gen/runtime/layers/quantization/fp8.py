@@ -395,9 +395,46 @@ class Fp8LinearMethod(LinearMethodBase):
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: torch.Tensor | tuple[torch.Tensor, ...],
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if isinstance(x, tuple):
+            if self.block_quant:
+                return self.w8a8_block_fp8_linear(
+                    input=x[0],
+                    weight=layer.weight,
+                    block_size=self.quant_config.weight_block_size,
+                    weight_scale=layer.weight_scale_inv,
+                    input_scale=x[1],
+                    bias=bias,
+                )
+            if self.use_marlin:
+                raise ValueError(
+                    "Pre-quantized tuple input is not supported for FP8 Marlin linear"
+                )
+            if self.enable_sm100_scaled_mm and layer.input_scale is not None:
+                raise ValueError(
+                    "Pre-quantized tuple input cannot be combined with static layer.input_scale in sm100_scaled_mm"
+                )
+
+            qinput, x_scale = x[0], x[1]
+            if not qinput.is_contiguous():
+                qinput = qinput.contiguous()
+            if not x_scale.is_contiguous():
+                x_scale = x_scale.contiguous()
+
+            pre_quant_output_dtype = x[2] if len(x) > 2 else torch.bfloat16
+            return apply_fp8_linear(
+                input=qinput,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=x_scale,
+                bias=bias,
+                cutlass_fp8_supported=self.cutlass_fp8_supported,
+                use_per_token_if_dynamic=True,
+                pre_quant_output_dtype=pre_quant_output_dtype,
+            )
+
         # The activation quantization kernels assert on row-major input, and
         # diffusion backbones routinely pass a permuted view. Normalising at the
         # producer instead would also move the unquantized path's output, by

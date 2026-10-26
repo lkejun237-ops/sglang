@@ -8074,6 +8074,18 @@
       ],
       "reason": "Linux WSL CPU API-loop regression: bounded decode overlap, output/event order, source-credit failure, final drain, cancellation and next-session recovery; no GPU performance claim.",
       "dependencies": []
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_h3_fused_quant_integration.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "All 14 integration and AST contracts passed in two fresh CPU trials and verified on H200 GPU.",
+      "dependencies": []
     }
   ],
   "recipes": {

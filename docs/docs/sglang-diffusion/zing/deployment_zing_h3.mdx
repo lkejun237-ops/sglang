@@ -413,6 +413,27 @@ Qwen 实际编码与连续 source 的缓存命中分列。模型张量存储按�
 本次原生实现仅完成本地 CPU/recording-backend 验证，480 与 736 的当前提交 GPU E2E、TTFF/FPS/TPOC/ICL、Encoder（Qwen/reference/source）、DiT、Decoder 的阶段中位数/P95及 allocated/reserved 常驻与峰值均未重新采集；旧 overlay 数值不作为当前版本性能结论。未启动或替换生产服务。详见 [PR 设计与验证记录](plans/SOURCE_DEFERRED_FINAL.md)。
 
 
+### DiT 前序融合量化与 Per-Token Scale 验证边界（2026-10-23，PR #414）
+
+PR #414 将 `seedleap-kernels` 的前序融合算子接入 Zing H3 DiT 主循环（`_main_block`）中，消除了 RMSNorm、AdaLN scale/shift 索引调制、残差加法与 FP8 动态量化间的碎片化访存与中间张量开销，并在 `MiniMaxH3MLP` 中接入 SwiGLU + FP8 动态量化融合。
+
+在上海 H200 集群（`quota3l8bnv9a35n`，Driver 580.95.05，CUDA 13.0，PyTorch 2.13.0+cu130，Job ID: `dlc1d7a87fegguw2`）实测，标称带宽基准 4800 GB/s：
+- **832×480（M=1560, H=5376）**：
+  - Op 1 (QKV 前序 3 合 1)：336.19 μs → 58.59 μs（5.74x）
+  - Op 2 (FC1 前序 4 合 1)：372.96 μs → 85.79 μs（4.35x）
+  - Op 3 (FC2 SwiGLU 2 合 1)：237.98 μs → 53.95 μs（4.41x）
+  - 单 Block 节省 748.80 μs；DiT 36 个 Block 单步消除 **26.96 ms**。
+- **1280×736（M=3680, H=5376）**：
+  - Op 1 (QKV 前序 3 合 1)：702.02 μs → 89.54 μs（7.84x，1547.0 GB/s，32.2% MBU）
+  - Op 2 (FC1 前序 4 合 1)：784.93 μs → 132.29 μs（5.93x，1645.2 GB/s，34.3% MBU）
+  - Op 3 (FC2 SwiGLU 2 合 1)：519.97 μs → 81.34 μs（6.39x，1216.2 GB/s，25.3% MBU）
+  - 单 Block 节省 1703.75 μs；DiT 36 个 Block 单步消除 **61.34 ms**。
+- **算子与生命周期契约**：
+  - 全网完全消除独立的 `sgl_per_token_quant_fp8` kernel 启动；
+  - `_should_fuse_pre_linear_quant` 与 `_should_fuse_swiglu_fp8` 在环境缺少 `seedleap-kernels`、非 CUDA、非 BF16 或需要梯度时自动优雅回退至原始未融合路径；
+  - 满足单活跃会话约束与 CUDA Graph 捕获前预分配要求。
+
+
 ## Qwen预取与独立Decoder重叠
 
 新增 `--zing-conditioning-prefetch`（remote、单活跃会话）与 `--zing-source-decoder-overlap`（独立Decoder、source quantum=1、单活跃会话），均默认关闭。前者提前处理已收到的prompt/reference，后者允许上一块decode/send与下一DiT重叠，保留输出顺序、背压和显式interactive event grace。当前纯源码remote native profile仍要求六项H3 Qwen优化显式全关、BF16与torch_sdpa，配置见[专属设计文档](specs/qwen-prefetch.zh-CN.md)。

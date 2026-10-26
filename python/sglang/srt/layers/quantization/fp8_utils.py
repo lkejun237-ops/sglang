@@ -1855,6 +1855,8 @@ def _apply_fallback_scaled_mm(
 
     output = _process_scaled_mm_output(output, input_2d_shape, output_shape)
     x_scale = torch.narrow(x_scale, 0, 0, input_2d_shape[0])
+    if x_scale.numel() > 1 and len(output_shape) > 2:
+        x_scale = x_scale.view(*output_shape[:-1], 1)
 
     output = output * x_scale * weight_scale.t()
     if bias is not None:
@@ -1984,13 +1986,28 @@ def apply_fp8_linear(
     )
 
     if input_prequantized:
-        assert input_scale is not None and input_scale.numel() == 1
+        assert input_scale is not None, (
+            "input_scale must be provided for pre-quantized input"
+        )
         qinput = input_2d
-        if channelwise_cutlass and not native_scalar_a_scale:
-            # Unsupported CUTLASS epilogues require one A scale per row.
-            x_scale = input_scale.repeat(input_2d.shape[0]).view(-1, 1)
+        is_per_tensor_scale = input_scale.numel() == 1 and input_scale.ndim <= 1
+        is_per_token_scale = input_scale.dtype == torch.float32 and (
+            input_scale.shape == (input_2d.shape[0], 1)
+            or input_scale.shape == (input_2d.shape[0],)
+        )
+
+        if is_per_tensor_scale:
+            if channelwise_cutlass and not native_scalar_a_scale:
+                x_scale = input_scale.repeat(input_2d.shape[0]).view(-1, 1)
+            else:
+                x_scale = input_scale
+        elif is_per_token_scale:
+            x_scale = input_scale.view(-1, 1)
         else:
-            x_scale = input_scale
+            raise AssertionError(
+                f"Invalid input_scale shape {input_scale.shape} or dtype {input_scale.dtype} "
+                f"for pre-quantized input of shape {input_2d.shape}"
+            )
     elif compressed_tensor_quant:
         # Maybe apply padding to output, see comment in __init__
         num_token_padding = output_padding
@@ -2033,7 +2050,7 @@ def apply_fp8_linear(
             x_scale = input_scale.repeat(input_2d.shape[0]).view(-1, 1)
     else:
         if input_scale is not None:
-            assert input_scale.numel() == 1
+            assert input_scale.numel() == 1, "static quant requires per-tensor scale"
             qinput, x_scale = static_quant_fp8(
                 input_2d,
                 input_scale,

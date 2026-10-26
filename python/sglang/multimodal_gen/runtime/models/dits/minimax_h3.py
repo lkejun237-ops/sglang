@@ -11,6 +11,7 @@ import math
 import os
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
+from functools import lru_cache
 from typing import Any, Callable
 
 import torch
@@ -97,6 +98,22 @@ logger = init_logger(__name__)
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 
 _NON_LORA_DELTA_SUFFIXES = (".diff", ".diff_b", ".set_weight")
+
+
+@lru_cache(maxsize=1)
+def _has_seedleap_kernels() -> bool:
+    try:
+        import seedleap_kernels.ops as ops
+
+        required_ops = (
+            "fused_rmsnorm_indexed_scale_shift_quant_fp8",
+            "fused_gated_residual_rmsnorm_indexed_scale_shift_quant_fp8",
+            "fused_indexed_gated_residual_add",
+            "fused_swiglu_quant_fp8",
+        )
+        return all(callable(getattr(ops, name, None)) for name in required_ops)
+    except (ImportError, ModuleNotFoundError, AttributeError, ValueError):
+        return False
 
 
 def _reject_non_lora_delta_tensors(adapter: dict[str, torch.Tensor]) -> None:
@@ -1336,12 +1353,43 @@ class MiniMaxH3MLP(nn.Module):
             quant_config.get_name() == "gguf"
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.device.type == "mps":
-            out = torch.empty_like(x)
-            for start in range(0, x.shape[0], _MPS_MLP_TOKEN_CHUNK_SIZE):
-                stop = min(start + _MPS_MLP_TOKEN_CHUNK_SIZE, x.shape[0])
-                hidden, _ = self.fc1(x[start:stop])
+    def _should_fuse_swiglu_fp8(self, hidden: torch.Tensor) -> bool:
+        if os.environ.get("SGLANG_ZING_FUSED_PRE_LINEAR_QUANT", "1") == "0":
+            return False
+        if not hidden.is_cuda:
+            return False
+        if hidden.dtype != torch.bfloat16:
+            return False
+        if hidden.requires_grad:
+            return False
+        if not _has_seedleap_kernels():
+            return False
+        quant_method = getattr(self.fc2, "quant_method", None)
+        if quant_method is None:
+            return False
+        should_quant = getattr(quant_method, "should_quantize_activation", None)
+        if should_quant is None:
+            return False
+        return should_quant(hidden.shape[0])
+
+    def _apply_fused_swiglu_fp8(
+        self, hidden: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from seedleap_kernels.ops import fused_swiglu_quant_fp8
+
+        return fused_swiglu_quant_fp8(hidden)
+
+    def forward(self, x: torch.Tensor | tuple[torch.Tensor, ...]) -> torch.Tensor:
+        x_tensor = x[0] if isinstance(x, tuple) else x
+        if x_tensor.device.type == "mps":
+            out = torch.empty_like(x_tensor)
+            for start in range(0, x_tensor.shape[0], _MPS_MLP_TOKEN_CHUNK_SIZE):
+                stop = min(start + _MPS_MLP_TOKEN_CHUNK_SIZE, x_tensor.shape[0])
+                hidden, _ = self.fc1(
+                    x[start:stop]
+                    if not isinstance(x, tuple)
+                    else (x[0][start:stop], x[1][start:stop])
+                )
                 hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
                 chunk, _ = self.fc2(hidden)
                 out[start:stop].copy_(chunk)
@@ -1350,8 +1398,12 @@ class MiniMaxH3MLP(nn.Module):
                 torch.mps.empty_cache()
             return out
         hidden, _ = self.fc1(x)
-        hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
-        out, _ = self.fc2(hidden)
+        if self._should_fuse_swiglu_fp8(hidden):
+            qinput_fp8, x_scale = self._apply_fused_swiglu_fp8(hidden)
+            out, _ = self.fc2((qinput_fp8, x_scale))
+        else:
+            hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
+            out, _ = self.fc2(hidden)
         return out
 
 

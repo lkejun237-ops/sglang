@@ -48,6 +48,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "AWQLinearMethod",
     "GPTQMarlinLinearMethod",
     "Fp8LinearMethod",
+    "SelectiveFp8Method",
     "MarlinLinearMethod",
     "QQQLinearMethod",
     "GPTQMarlin24LinearMethod",
@@ -1177,6 +1178,10 @@ class RowParallelLinear(LinearBase):
         param.load_row_parallel_weight(loaded_weight=loaded_weight)
 
     def forward(self, input_) -> tuple[torch.Tensor, Parameter | None]:
+        if not self.input_is_parallel and isinstance(input_, tuple):
+            raise ValueError(
+                "Pre-quantized tuple input requires input_is_parallel=True"
+            )
         if self.input_is_parallel:
             input_parallel = input_
         else:
