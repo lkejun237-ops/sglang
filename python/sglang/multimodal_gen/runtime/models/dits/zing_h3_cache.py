@@ -117,7 +117,8 @@ class ZingFixedForwardKVPlan:
     rotates the whole fixed-shape raw K itself (``rotates_history``) unless the
     plan executed right before it in the same graph already did so for equal
     history coordinates: the rows ``[0, L)`` are not written in between, so the
-    rotation is still exact.
+    rotation is still exact. Optional cross-graph reuse keeps the stable prefix
+    described by the cache's last successful publication and rebuilds its tail.
     """
 
     def __init__(
@@ -157,6 +158,7 @@ class ZingFixedForwardKVPlan:
             and torch.equal(after.rotated_positions, historical)
         )
         self.rotates_history = historical is not None and not reusable
+        self.reused_history_rows = history if reusable else 0
         # Without history nothing is rotated and nothing carries over.
         self.rotated_positions = (
             None
@@ -191,6 +193,50 @@ class ZingFixedForwardKVPlan:
             )
             previous = stop
         self.tensors = tensors
+
+    def prepare_history_reuse(self, cache):
+        """Plan a stable prefix from the last successful rotation publication.
+
+        Called after binding the effective coordinates, on the private planning
+        cache only. A miss ends the reusable prefix for every layer; the remaining
+        live rows are rebuilt by one device-bounded kernel. Values stay outside
+        the graph key, including when the prefix grows, shrinks or becomes empty.
+        New clean rows are deliberately not published until a later history pass.
+        """
+        if not cache.cross_graph_rope_reuse:
+            return
+        if not self.rotates_history:
+            # The preceding plan already published exactly this history in the
+            # shadow. Active forwards neither replace nor move its raw rows.
+            cache.rope_reuse_stats["reused_rows"] += (
+                self.reused_history_rows * cache.num_layers
+            )
+            return
+        reused = self.write_start
+        publications = {}
+        for layer in range(cache.num_layers):
+            cache._observe_raw_store(layer)
+            ranges, _ = cache._chunk_ranges(layer)
+            previous = set(cache._rotated_store_signatures.get(layer, ()))
+            for entry in ranges:
+                if entry not in previous:
+                    reused = min(reused, entry[0])
+                    break
+            publications[layer] = tuple(ranges)
+            cache._rotated_stores[layer] = self.rotated[layer]
+        self.reused_history_rows = reused
+        self.tensors["history_rope_range"] = torch.tensor(
+            [reused, self.write_start],
+            dtype=torch.int32,
+            device=self.stores[0][0].device,
+        )
+        # Prospective state only: the owner unpublishes the real cache before
+        # execution and publishes this shadow after successful completion.
+        cache._rotated_store_signatures = publications
+        cache.rope_reuse_stats["reused_rows"] += reused * cache.num_layers
+        cache.rope_reuse_stats["rebuilt_rows"] += (
+            self.write_start - reused
+        ) * cache.num_layers
 
     def write_current(self, layer, rotated_k, k, v, tensors=None):
         """Write this forward's rows at ``[L, L + rows)``; clean raw K persists."""
@@ -722,8 +768,22 @@ class ZingH3KVCache:
         """Publish successful device execution's host effects exactly once."""
         if not getattr(shadow, "_bookkeeping_only", False):
             raise ValueError("Zing KV host publication requires a planning transaction")
+        if shadow.cross_graph_rope_reuse:
+            # Warmup, capture, replay and compaction performed cache-owned writes
+            # after planning. Acknowledge those versions before the next observer.
+            for layer in shadow._stores:
+                shadow._mark_raw_store(layer)
         self.__dict__.update(shadow.__dict__)
         self._bookkeeping_only = False
+
+    @property
+    def cross_graph_rope_reuse(self):
+        return (
+            self.pooled
+            and self.raw_store
+            and self.chunk_rope_reuse
+            and os.environ.get("SGLANG_ZING_HISTORY_ROPE_CROSS_GRAPH", "1") == "1"
+        )
 
     def begin_chunk(self, target_block):
         """Open a target boundary without changing delayed-policy history."""

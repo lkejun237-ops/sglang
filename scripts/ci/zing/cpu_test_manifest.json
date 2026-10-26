@@ -5771,6 +5771,18 @@
           "reason": "CUDA required"
         },
         {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_history_rope.py::test_history_dirty_range_replay_preserves_prefix_and_tail[False-cuda]",
+          "reason": "CUDA required"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_history_rope.py::test_history_dirty_range_replay_preserves_prefix_and_tail[True-cuda]",
+          "reason": "CUDA required"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_history_rope.py::test_history_live_rows_refresh_during_graph_replay",
+          "reason": "CUDA required"
+        },
+        {
           "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_history_rope.py::test_history_matches_eager_with_offset_and_sentinels[False-1-12-cuda]",
           "reason": "CUDA required"
         },
@@ -5980,10 +5992,6 @@
         },
         {
           "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_history_rope.py::test_unsupported_current_rope_layouts_fall_back",
-          "reason": "CUDA required"
-        },
-        {
-          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_history_rope.py::test_history_live_rows_refresh_during_graph_replay",
           "reason": "CUDA required"
         }
       ],

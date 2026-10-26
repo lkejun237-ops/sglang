@@ -93,7 +93,7 @@ def apply_current_rope(x, coefficients):
     return out
 
 
-def apply_history_rope_into(x, coefficients, out, *, live_rows=None):
+def apply_history_rope_into(x, coefficients, out, *, live_rows=None, row_range=None):
     # Enabled by default; unsupported inputs retain the eager fallback.
     reason = (
         "disabled"
@@ -104,12 +104,21 @@ def apply_history_rope_into(x, coefficients, out, *, live_rows=None):
     HISTORY_ROPE_ROUTES["rows"] += x.shape[0]
     with maybe_record_function("Zing.history_K_RoPE_rebuild"):
         if reason is not None:
+            if row_range is not None:
+                rows = torch.arange(x.shape[0], device=x.device)
+                dirty = (rows >= row_range[0]) & (rows < row_range[1])
+                out.copy_(
+                    torch.where(dirty[:, None, None], _apply_rope(x, coefficients), out)
+                )
+                return out
             return _apply_rope_into(x, coefficients, out)
         from sglang.kernels.ops.diffusion.rope.zing_history_rope import (
             fused_zing_history_rope,
         )
 
-        fused_zing_history_rope(x, coefficients, out, live_rows=live_rows)
+        fused_zing_history_rope(
+            x, coefficients, out, live_rows=live_rows, row_range=row_range
+        )
         return out
 
 

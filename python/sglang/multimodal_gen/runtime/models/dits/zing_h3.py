@@ -223,6 +223,7 @@ _GRAPH_ROUTE_ENVS = (
     "SGLANG_ZING_SP_DESTINATION_MAJOR",
     "SGLANG_ZING_FUSED_QKNORM_ROPE_KV",
     "SGLANG_ZING_HISTORY_ROPE_LIVE_ROWS",
+    "SGLANG_ZING_HISTORY_ROPE_CROSS_GRAPH",
     "SGLANG_ZING_FUSED_CURRENT_ROPE",
     "SGLANG_ZING_FUSED_CURRENT_ROPE_KV",
     "SGLANG_ZING_FA4_FIXED",
@@ -2178,6 +2179,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 options.full_rope,
                 fixed.rotated[index],
                 live_rows=options.fixed_tensors.get("history_live_rows"),
+                row_range=options.fixed_tensors.get("history_rope_range"),
             )
         if fused_norm:
             fused_q = apply_current_qknorm_rope_kv(

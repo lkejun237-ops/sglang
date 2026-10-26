@@ -334,13 +334,17 @@ class ZingChunkGraphs:
         )
 
     @staticmethod
-    def _capture_store_views(plans, stores):
+    def _capture_store_views(plans, stores, rotated=()):
         """Only snapshot the K/V spans the capture warm-up can overwrite.
 
         Clean rows persist raw K; every current row writes V. History outside
-        these spans is read-only, and rotated K is rebuilt before being read.
+        these spans is read-only. Also protect any entry-time reused rotations
+        that a later forward in the same capture can overwrite.
         Bounds come from host plans, without reading device index tensors.
         """
+        if not plans:
+            # A single-step deferred-final graph has no KV forwards to snapshot.
+            return ()
         views = []
         for column, count in enumerate(("clean_rows", "rows")):
             ranges = [
@@ -352,12 +356,24 @@ class ZingChunkGraphs:
                 start = min(begin for begin, _ in ranges)
                 stop = max(end for _, end in ranges)
                 views.extend(pair[column][start:stop] for pair in stores)
+        reused = getattr(plans[0].kv_plan, "reused_history_rows", 0)
+        if rotated and reused:
+            ranges = []
+            for plan in plans:
+                kv = plan.kv_plan
+                start = kv.reused_history_rows if kv.rotates_history else kv.write_start
+                stop = min(reused, kv.write_start + kv.rows)
+                if start < stop:
+                    ranges.append((start, stop))
+            if ranges:
+                start = min(begin for begin, _ in ranges)
+                stop = max(end for _, end in ranges)
+                views.extend(value[start:stop] for value in rotated)
         return tuple(views)
 
     def _run(self, kind, plans, tensors, execute, stores, rotated=()):
         signatures = tuple(plan.signature for plan in plans)
-        # ``rotated`` is addressed but never snapshotted: it is rewritten by
-        # every execution before it is read.
+        # The graph reads and writes the same fixed rotated-K allocation.
         addresses = tuple(
             value.data_ptr() for pair in stores for value in pair
         ) + tuple(value.data_ptr() for value in rotated)
@@ -389,7 +405,7 @@ class ZingChunkGraphs:
             return execute(tensors)
         if entry is None:
             static = {name: tensor.clone() for name, tensor in tensors.items()}
-            flat = self._capture_store_views(plans, stores)
+            flat = self._capture_store_views(plans, stores, rotated)
             logger.info(
                 "ZING_CHUNK_GRAPH_SNAPSHOT_JSON %s",
                 json.dumps(
@@ -582,6 +598,7 @@ class ZingChunkGraphs:
                     torch.zeros(1, dtype=torch.float32, device=packed["x"].device)
                 )
         model._bind_cache(shadow, kv.history_positions)
+        kv.prepare_history_reuse(shadow)
         # _bind_cache just validated the live model (including lazy constants).
         # Reuse that snapshot within this host preparation transaction instead
         # of rescanning every parameter for the same forward plan.
@@ -615,13 +632,12 @@ class ZingChunkGraphs:
     def _discard_rotated(cache, shadow):
         """Unpublish rotated-K reuse before any execution may overwrite it.
 
-        An execution rewrites the rotated-K scratch of every layer, so no
-        earlier publication may describe it. The real cache covers a failed
-        execution and the shadow covers publication of a successful one, which
-        replaces the real cache's state wholesale.
+        A failed execution must leave no publication. Cross-graph reuse keeps
+        only the shadow's prospective publication, installed on success.
         """
         cache._rotated_store_signatures.clear()
-        shadow._rotated_store_signatures.clear()
+        if not shadow.cross_graph_rope_reuse:
+            shadow._rotated_store_signatures.clear()
 
     @staticmethod
     def _attach(plans, tensors):

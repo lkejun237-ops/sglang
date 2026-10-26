@@ -19,6 +19,55 @@ from sglang.multimodal_gen.runtime.models.dits.zing_h3_rope import (
 )
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("fused", [False, True])
+@torch.no_grad()
+def test_history_dirty_range_replay_preserves_prefix_and_tail(
+    device, fused, monkeypatch
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from sglang.multimodal_gen.test.unit.test_zing_h3_denoise_graph import (
+        RecordingGraphBackend,
+    )
+
+    monkeypatch.setenv("SGLANG_ZING_FUSED_HISTORY_ROPE", str(int(fused)))
+    # More tiles than the persistent grid, with partial first/last tiles.
+    storage = torch.randn(1033, 21, 128, device=device, dtype=torch.bfloat16)
+    x = storage[1:1032, :7]
+    coefficients = torch.randn(1031, 96, device=device, dtype=x.dtype)
+    out = torch.full(x.shape, 37, device=device, dtype=x.dtype)
+    row_range = torch.tensor([13, 700], device=device, dtype=torch.int32)
+
+    def execute():
+        apply_history_rope_into(x, coefficients, out, row_range=row_range)
+        return (out,)
+
+    execute()
+    if device == "cuda":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            execute()
+        replay = graph.replay
+    else:
+        backend = RecordingGraphBackend()
+        graph, _ = backend.capture(execute)
+
+        def replay():
+            backend.replay(graph)
+
+    for start, stop in ((17, 1031), (0, 2), (1031, 1031), (0, 0), (99, 713)):
+        row_range.copy_(torch.tensor([start, stop], device=device, dtype=torch.int32))
+        x.add_(0.125)
+        coefficients.add_(0.25)
+        out.fill_(37)
+        replay()
+        assert torch.equal(
+            out[start:stop], _apply_rope(x[start:stop], coefficients[start:stop])
+        )
+        assert torch.all(out[:start] == 37) and torch.all(out[stop:] == 37)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.no_grad()
 def test_history_live_rows_refresh_during_graph_replay(monkeypatch):

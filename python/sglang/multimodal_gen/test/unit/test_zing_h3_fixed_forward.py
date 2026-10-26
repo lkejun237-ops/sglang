@@ -177,9 +177,9 @@ def test_fixed_forward_replays_changed_history_with_one_signature(
     observed = []
     rotate = zing_h3.apply_history_rope_into
 
-    def record_live_rows(*args, live_rows=None):
+    def record_live_rows(*args, live_rows=None, row_range=None):
         observed.append(live_rows)
-        return rotate(*args, live_rows=live_rows)
+        return rotate(*args, live_rows=live_rows, row_range=row_range)
 
     monkeypatch.setattr(zing_h3, "apply_history_rope_into", record_live_rows)
     packer, inputs, visual, _ = request(model, audio=False)
@@ -840,6 +840,73 @@ def test_history_live_length_has_stable_device_metadata_shape(monkeypatch):
         assert live.dtype == torch.int32 and live.shape == (1,)
         assert live.item() == sum(chunks)
         assert live.device == plan.stores[0][0].device
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    "mutation", ["raw_layer_1", "spatial_coordinate", "unpublished"]
+)
+def test_cross_graph_prefix_requires_all_layers_and_exact_coordinates(
+    monkeypatch, mutation
+):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+        ZingChunkGraphs,
+    )
+    from sglang.multimodal_gen.runtime.realtime.zing_window import ZingWindowPolicy
+
+    monkeypatch.delenv("SGLANG_ZING_HISTORY_ROPE_CROSS_GRAPH", raising=False)
+    storage = _fake_cache(2, 32, ()).storage
+    cache = ZingH3KVCache(
+        2,
+        storage=storage,
+        rope_position_mode="block_relative",
+        window_policy=ZingWindowPolicy(3, 1),
+    )
+    positions = torch.tensor([[0, 0, 0], [0, 1, 0]])
+    blocks = torch.zeros(2, dtype=torch.long)
+    cache.update(
+        positions,
+        blocks,
+        "prefix",
+        0,
+        [
+            (torch.randn(2, 2, 8).bfloat16(), torch.randn(2, 2, 8).bfloat16())
+            for _ in storage
+        ],
+        validation=(positions, blocks),
+    )
+
+    def prepare():
+        shadow = cache.planning_copy()
+        current = torch.tensor([[1, 0, 0]])
+        plan = ZingFixedForwardKVPlan(shadow, current, ends=(1,), clean_rows=0)
+        shadow.bind_attention_positions(plan.history_positions)
+        plan.prepare_history_reuse(shadow)
+        return plan, shadow
+
+    first, shadow = prepare()
+    assert first.tensors["history_rope_range"].tolist() == [0, 2]
+    ZingChunkGraphs._discard_rotated(cache, shadow)
+    cache.publish_plan(shadow)
+    reused, _ = prepare()
+    assert reused.tensors["history_rope_range"].tolist() == [2, 2]
+    if mutation == "raw_layer_1":
+        storage[1].k[0].add_(1)
+    elif mutation == "spatial_coordinate":
+        cache.prefix.host_positions[0, 1] += 1
+    else:
+        cache._rotated_store_signatures.clear()
+    rebuilt, shadow = prepare()
+    assert rebuilt.tensors["history_rope_range"].tolist() == [0, 2]
+    if mutation == "raw_layer_1":
+        assert shadow._raw_write_epochs.get(0, 0) == 0
+        assert shadow._raw_write_epochs[1] == 1
+    assert reused.tensors.keys() == rebuilt.tensors.keys()
+    assert (
+        reused.tensors["history_rope_range"].shape
+        == rebuilt.tensors["history_rope_range"].shape
+    )
 
 
 def test_plan_admission_covers_every_row_written_into_the_slot():

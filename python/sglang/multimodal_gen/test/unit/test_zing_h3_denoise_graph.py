@@ -1405,7 +1405,11 @@ def test_deferred_final_across_single_chunk_dispatches(model, monkeypatch, switc
         assert replay[5][13:] == [113] * 11
 
 
-def test_single_step_deferred_final_captures_without_kv_writes(model, monkeypatch):
+@pytest.mark.parametrize("cross_graph", [False, True])
+def test_single_step_deferred_final_captures_without_kv_writes(
+    model, monkeypatch, cross_graph
+):
+    monkeypatch.setenv("SGLANG_ZING_HISTORY_ROPE_CROSS_GRAPH", str(int(cross_graph)))
     options = dict(batches=(1,) * 12, steps=[1000], defer_final=True)
     fixed = _run_ready_chunks(model, monkeypatch, backend="eager", **options)
     replay = _run_ready_chunks(
@@ -1494,6 +1498,7 @@ def test_whole_chunk_execution_unpublishes_rotated_k_and_shares_rotations(
         ZingChunkGraphs,
     )
 
+    monkeypatch.setenv("SGLANG_ZING_HISTORY_ROPE_CROSS_GRAPH", "0")
     rotations = []
     original = ZingChunkGraphs._forward_plan
 
@@ -1555,6 +1560,140 @@ class WarmupRecordingGraphBackend(RecordingGraphBackend):
         if error is not None or not all_ok:
             raise GraphWarmupError("recording warmup failed") from error
         return super().capture(fn)
+
+
+@pytest.mark.parametrize("prompt_updates", [None, {2: 6}])
+def test_cross_graph_history_reuse_matches_rebuild_across_eviction_and_recovery(
+    model, monkeypatch, prompt_updates
+):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+        ZingChunkGraphs,
+    )
+
+    monkeypatch.setenv("SGLANG_ZING_HISTORY_ROPE_CROSS_GRAPH", "0")
+    expected = _run_ready_chunks(
+        model, monkeypatch, backend="eager", prompt_updates=prompt_updates
+    )
+    monkeypatch.delenv("SGLANG_ZING_HISTORY_ROPE_CROSS_GRAPH", raising=False)
+    plans, states = [], []
+    original = ZingChunkGraphs._forward_plan
+
+    def spy(sampler, shadow, packed, phase, after=None):
+        plan = original(sampler, shadow, packed, phase, after=after)
+        if after is None:
+            plans.append(
+                (phase, plan.kv_plan.write_start, plan.kv_plan.reused_history_rows)
+            )
+        return plan
+
+    def observe(session, drain, count):
+        cache = session.cache
+        states.append(
+            (dict(cache._rotated_store_signatures), dict(cache._raw_write_epochs))
+        )
+
+    monkeypatch.setattr(ZingChunkGraphs, "_forward_plan", staticmethod(spy))
+    backend = WarmupRecordingGraphBackend()
+    actual = _run_ready_chunks(
+        model,
+        monkeypatch,
+        backend=backend,
+        prompt_updates=prompt_updates,
+        yield_hook=observe,
+    )
+    assert torch.equal(actual[0], expected[0])
+    assert actual[3] == expected[3] and actual[5] == expected[5]
+    for got, want in zip(actual[1], expected[1], strict=True):
+        assert got[0] == want[0]
+        assert [(c[0], c[1]) for c in got[1]] == [(c[0], c[1]) for c in want[1]]
+        for (gk, gv), (wk, wv) in zip(got[2], want[2], strict=True):
+            assert torch.equal(gk, wk) and torch.equal(gv, wv)
+    assert any(0 < reused < live for _, live, reused in plans)
+    assert any(live == 0 and reused == 0 for _, live, reused in plans)
+    assert any(published for published, _ in states)
+    # Owned raw writes and compaction must not masquerade as external mutations.
+    assert all(not any(epochs.values()) for _, epochs in states)
+    assert backend.captures > 0 and backend.warmups == backend.captures
+    assert actual[4].routes["steady", "replay"] > 0
+
+
+def test_cross_graph_unpublishes_before_execution_and_publishes_only_on_success(
+    monkeypatch,
+):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+        ZingChunkGraphs,
+    )
+    from sglang.multimodal_gen.runtime.realtime.zing_window import ZingWindowPolicy
+
+    monkeypatch.delenv("SGLANG_ZING_HISTORY_ROPE_CROSS_GRAPH", raising=False)
+    stores = allocate_layer_stores(
+        32,
+        num_layers=1,
+        local_heads=2,
+        head_dim=8,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+    cache = ZingH3KVCache(
+        1,
+        rope_position_mode="block_relative",
+        storage=stores,
+        window_policy=ZingWindowPolicy(3, 1),
+    )
+    cache._rotated_store_signatures[0] = ("previous",)
+    shadow = cache.planning_copy()
+    shadow._rotated_store_signatures[0] = ("planned",)
+    ZingChunkGraphs._discard_rotated(cache, shadow)
+    # Failure leaves the real cache invalid; the uncommitted shadow is private.
+    assert not cache._rotated_store_signatures
+    assert shadow._rotated_store_signatures == {0: ("planned",)}
+    cache.publish_plan(shadow)
+    assert cache._rotated_store_signatures == {0: ("planned",)}
+    cache.clear()
+    assert not cache._rotated_store_signatures
+
+
+@torch.no_grad()
+def test_cross_graph_capture_restores_reused_rows_overwritten_by_later_forward():
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+        ZingChunkGraphs,
+    )
+
+    k, v, rotated = (torch.zeros(1024, 2, 8) for _ in range(3))
+    rotated[:8] = 10
+    plans = [
+        SimpleNamespace(
+            signature=(index,),
+            kv_plan=SimpleNamespace(
+                write_start=8,
+                rows=2,
+                clean_rows=0,
+                rotates_history=True,
+                reused_history_rows=reused,
+            ),
+        )
+        for index, reused in enumerate((8, 3))
+    ]
+    views = ZingChunkGraphs._capture_store_views(plans, [(k, v)], (rotated,))
+    assert len(views) == 2  # V tail plus only five threatened historical rows.
+    assert views[-1].data_ptr() == rotated[3:8].data_ptr() and views[-1].shape[0] == 5
+    backend = WarmupRecordingGraphBackend()
+    graphs = ZingChunkGraphs(backend=backend)
+
+    def execute(static):
+        result = rotated[:8].clone()  # First forward reuses entry-time rotations.
+        rotated[3:10].add_(static["delta"])  # Later map overwrites part of them.
+        v[8:10].add_(static["delta"])
+        return (result,)
+
+    for step in range(3):
+        (out,) = graphs._run(
+            "steady", plans, {"delta": torch.tensor(1.0)}, execute, [(k, v)], (rotated,)
+        )
+        assert torch.all(out[:3] == 10) and torch.all(out[3:8] == 10 + step)
+        assert torch.all(rotated[:3] == 10) and torch.all(rotated[3:8] == 11 + step)
+    assert backend.captures == 1 and graphs.routes["steady", "replay"] == 1
 
 
 def test_source_ready_whole_chunk_warmup_capture_do_not_double_apply(
