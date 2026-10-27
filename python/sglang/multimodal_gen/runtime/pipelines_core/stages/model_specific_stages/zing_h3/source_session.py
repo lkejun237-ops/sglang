@@ -271,17 +271,26 @@ class ZingSourceStreamState(BaseRealtimeState):
                     raise ConditionError(
                         "CONDITION_BUSY", "Previous conditioning work has not drained"
                     )
-                self.conditioning_prefetch = ConditioningPrefetch(
-                    endpoint,
-                    prepare=prepare,
-                    identity=identity,
-                    client=provider.client,
-                    max_bytes=command["conditioning_prefetch_max_bytes"],
-                )
-                provider._prefetch_owner = self.conditioning_prefetch
-                batch.session.get_or_create_state(
-                    WorkerConditioningState
-                ).prefetch = self.conditioning_prefetch
+                if getattr(provider.client, "result_transport", "http") == "nccl":
+                    # The prefetcher owns CPU HTTP results only. NCCL receives
+                    # must stay on the worker thread until GPU prefetch has its
+                    # own stream and result-lifetime contract.
+                    logger.warning(
+                        "HTTP conditioning prefetch is disabled for NCCL results; "
+                        "encoding runs at the worker update boundary"
+                    )
+                else:
+                    self.conditioning_prefetch = ConditioningPrefetch(
+                        endpoint,
+                        prepare=prepare,
+                        identity=identity,
+                        client=provider.client,
+                        max_bytes=command["conditioning_prefetch_max_bytes"],
+                    )
+                    provider._prefetch_owner = self.conditioning_prefetch
+                    batch.session.get_or_create_state(
+                        WorkerConditioningState
+                    ).prefetch = self.conditioning_prefetch
             except Exception:
                 logger.exception("Conditioning prefetch startup failed")
                 receipt = {"ok": False}

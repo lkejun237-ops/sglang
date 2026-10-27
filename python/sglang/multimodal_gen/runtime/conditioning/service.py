@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 from .cache import ConditioningCache, tensor_bytes
-from .contract import ConditionError, _tensor_spec, canonical_json
+from .contract import ConditionError, _tensor_spec, canonical_json, safe_json
 from .resources import AdmissionLedger, BoundedExecutor, ResourceLimits
 from .wire import decode_request, pack_message
 
@@ -41,8 +41,17 @@ class EncodeQueue:
     """FIFO queue whose last queued waiter can leave without submitting work."""
 
     def __init__(
-        self, encoder, cache, limits, flights, on_encoded, clock=time.monotonic
+        self,
+        encoder,
+        cache,
+        limits,
+        flights,
+        on_encoded,
+        clock=time.monotonic,
+        *,
+        keep_device=False,
     ):
+        self.keep_device = keep_device
         self.encoder, self.cache, self.limits = encoder, cache, limits
         self.flights, self.on_encoded, self.clock = flights, on_encoded, clock
         self.pending = deque()
@@ -99,11 +108,14 @@ class EncodeQueue:
             torch.inference_mode(),
             set_forward_context(current_timestep=0, attn_metadata=None),
         ):
-            condition = self.encoder(value)
-            condition = {
-                name: tensor.detach().to("cpu").contiguous()
-                for name, tensor in condition.items()
-            }
+            if self.keep_device:
+                condition = self.encoder.encode_device(value)
+            else:
+                condition = self.encoder(value)
+                condition = {
+                    name: tensor.detach().to("cpu").contiguous()
+                    for name, tensor in condition.items()
+                }
             _tensor_spec(condition, self.limits.max_condition_rows)
             if tensor_bytes(condition) > self.limits.max_condition_bytes:
                 raise ConditionError(
@@ -148,6 +160,11 @@ class EncodeQueue:
                 if self.flights.get(flight.key) is flight:
                     del self.flights[flight.key]
 
+                # Requests own the published result until delivery completes.
+                # The idle queue must not pin its last CUDA result (including
+                # through either Future) while waiting for the next request.
+                condition = future = flight = None
+
     async def close(self):
         self.closed = True
         for flight in list(self.pending):
@@ -179,6 +196,7 @@ class ConditioningService:
         tokens=None,
         limits=None,
         clock=time.monotonic,
+        result_transport="http",
     ):
         if credentials is not None and tokens is not None:
             raise ValueError("Configure conditioning tokens only once")
@@ -203,13 +221,31 @@ class ConditioningService:
             self.limits.cpu_executor_active, self.limits.cpu_executor_waiting
         )
         self._cpu_gate = asyncio.Semaphore(self.cpu.capacity)
+        if result_transport not in {"http", "nccl"}:
+            raise ValueError("Unknown conditioning result transport")
+        self.nccl = None
+        if result_transport == "nccl":
+            from .nccl import NcclSender
+
+            if not callable(getattr(encoder, "encode_device", None)):
+                raise ValueError("NCCL conditioning requires a device-native encoder")
+            self.nccl = NcclSender(
+                f"cuda:{encoder.gpu_id}", self.limits.request_timeout_s
+            )
         self.cache = ConditioningCache(
-            self.limits.cache_bytes, per_tenant_bytes=self.limits.cache_bytes_per_tenant
+            0 if self.nccl else self.limits.cache_bytes,
+            per_tenant_bytes=0 if self.nccl else self.limits.cache_bytes_per_tenant,
         )
         self.flights = {}
         self._stats = defaultdict(self._new_stats)
         self.queue = EncodeQueue(
-            encoder, self.cache, self.limits, self.flights, self._encoded, clock
+            encoder,
+            self.cache,
+            self.limits,
+            self.flights,
+            self._encoded,
+            clock,
+            keep_device=self.nccl is not None,
         )
         self._closed = False
         self._requests = set()
@@ -288,6 +324,7 @@ class ConditioningService:
                     200,
                     dict(
                         schema_version=1,
+                        result_transport="nccl" if self.nccl else "http",
                         profile_id=self.profile.profile_id,
                         preprocess_version=self.profile.document["preprocess_version"],
                         tensor_contract={
@@ -299,10 +336,36 @@ class ConditioningService:
                 )
             if path == PREFIX + "/stats" and method == "GET":
                 return await self._json(send, 200, self._stats_snapshot(principal))
+            if self.nccl is not None and path in {
+                PREFIX + "/encode",
+                PREFIX + "/bridge/open",
+            }:
+                peer = scope.get("client")
+                if peer is None or peer[0] not in {"127.0.0.1", "::1"}:
+                    raise ConditionError("CONDITION_UNAUTHORIZED")
+            if (
+                path == PREFIX + "/bridge/open"
+                and method == "POST"
+                and self.nccl is not None
+            ):
+                self._requests.add(task)
+                return await self._open_bridge(
+                    principal["tenant"], headers, receive, send
+                )
             if path != PREFIX + "/encode" or method != "POST":
                 raise ConditionError("CONDITION_INVALID", 404)
             self._requests.add(task)
-            await self._encode(principal["tenant"], headers, receive, send)
+            if self.nccl is not None:
+                self.nccl.acquire(
+                    headers.get(b"x-conditioning-bridge", b"").decode("ascii"),
+                    principal["tenant"],
+                )
+                try:
+                    await self._encode(principal["tenant"], headers, receive, send)
+                finally:
+                    self.nccl.busy = False
+            else:
+                await self._encode(principal["tenant"], headers, receive, send)
         except _Disconnected:
             return
         except ConditionError as error:
@@ -329,6 +392,89 @@ class ConditioningService:
             )
         finally:
             self._requests.discard(task)
+
+    async def _open_bridge(self, tenant, headers, receive, send):
+        size = self._body_length(headers)
+        if size > 1024:
+            raise ConditionError("CONDITION_INVALID")
+        reservations = [self.ledger.reserve(tenant, slots=1)]
+        try:
+            body = await asyncio.wait_for(
+                self._read_body(receive, size, tenant, reservations),
+                self.limits.request_timeout_s,
+            )
+            await self.nccl.open(safe_json(body), tenant, self._cpu_run)
+            await self._json(send, 200, {"bridge_id": self.nccl.bridge_id})
+        finally:
+            for reservation in reversed(reservations):
+                reservation.release()
+
+    async def _send_nccl(self, send, condition, header, watcher, deadline):
+        if self.clock() >= deadline:
+            raise ConditionError("CONDITION_TIMEOUT")
+        if watcher.done():
+            watcher.result()
+            raise _Disconnected()
+        metadata = (
+            canonical_json(
+                dict(
+                    schema_version=1,
+                    profile_id=self.profile.profile_id,
+                    input_digest=header["input_digest"],
+                    bridge_id=self.nccl.bridge_id,
+                    rows=condition["context"].shape[0],
+                )
+            )
+            + b"\n"
+        )
+        completion = canonical_json({"done": header["input_digest"]}) + b"\n"
+
+        async def stream():
+            try:
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 200,
+                        "headers": [(b"content-type", b"application/x-ndjson")],
+                    }
+                )
+                # Receiver must know shape and allocate before NCCL send waits.
+                await send(
+                    {"type": "http.response.body", "body": metadata, "more_body": True}
+                )
+                await self._cpu_run(self.nccl.send, condition)
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": completion,
+                        "more_body": False,
+                    }
+                )
+                return len(metadata) + len(completion)
+            except BaseException as error:
+                self.nccl.failed = True
+                if isinstance(error, ConditionError):
+                    # Headers already belong to this streaming result. The
+                    # outer encode error handler must not send a second reply.
+                    raise RuntimeError(
+                        "Conditioning NCCL result transfer failed"
+                    ) from error
+                raise
+
+        sender = asyncio.create_task(stream())
+        try:
+            done, _ = await asyncio.wait(
+                [sender, watcher],
+                timeout=max(0, deadline - self.clock()),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if sender in done:
+                return sender.result()
+            raise _Disconnected()
+        finally:
+            # BoundedExecutor drains an in-flight GPU operation on cancellation;
+            # result/ledger ownership must last through that drain.
+            await self._cancel_and_drain(sender)
 
     async def _cpu_run(self, function, *args):
         # Requests waiting outside the executor remain bounded by request slots.
@@ -488,6 +634,12 @@ class ConditioningService:
                 output_reservation.reduce(inflight=tensor_bytes(condition))
             else:
                 self._stats[tenant]["hit"] += 1
+            if self.nccl is not None:
+                control_bytes = await self._send_nccl(
+                    send, condition, header, watcher, deadline
+                )
+                self._stats[tenant]["response_bytes"] += control_bytes
+                return
             response = await self._cpu_run(
                 pack_message,
                 dict(

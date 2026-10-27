@@ -36,6 +36,26 @@ Qwen 是独立进程，可与一张 Encoder 共卡。所有方案都是**单活�
 L20Z/L20X/L20D 标识，不把它们改写成已核验的商业 SKU。CUDA 可见容量与 driver 总量
 可能不同，不混作同一读数。单卡余量按角色检查，不能用所有卡总显存判断能否部署。
 
+### Qwen GPU 结果通道（条件链路已验证，完整流水线待验）
+
+2026-10-25 基于 `a99560cf90` 的独立工作树增加可选 `result_transport: "nccl"`：
+Qwen 的 context/row_role 通过独立两 rank NCCL group 到 DiT leader，再沿现有 SP GPU
+广播。与 source encoder/decoder 共用建组和张量传输实现，不共用 communicator。
+服务端、客户端须同时开启，默认仍为 HTTP。NCCL 模式跳过服务端 CPU 结果 LRU，保留
+DiT 会话内缓存；仅支持同机 loopback、一个接收 worker，传输失败后须重启两端。
+2026-10-26 同步 main `3e5ddd880360` 后，HTTP 路径保留异步 Qwen prefetch；NCCL
+路径会跳过当前仅支持 CPU 结果的预取器并输出 warning，仍在 worker 更新边界编码。
+独立 Decoder overlap 保留；异步 NCCL 预取及合并后 GPU 性能尚未验证。
+已完成上海 L20X / SM90 的 Qwen→NCCL→SP2 专项：三个常用 prompt1、480 source，
+热态完整条件链路中位数缩短约 20%，首个正式请求的输出在两个 SP rank 上逐元素一致。
+首次 NCCL 收发需要真实链路预热。完整 480/736 视频性能/质量、其他硬件、
+source/decoder 共存和故障恢复仍未验证；专项组件显存不代表完整服务峰值。配置、调用链、
+实测范围及限制见 [Qwen NCCL bridge 设计](plans/QWEN_NCCL_BRIDGE.md)。
+
+2026-10-26 在 PR #415 修复控制流绝对超时与空闲编码队列持有上一轮 GPU 结果的问题；
+配置不变。上述 GPU 性能数据来自修复前版本，修复后的 HTTP 调度路径尚未重测 GPU 性能，
+CPU 回归与验证范围见同一设计文档。
+
 ### Decoder 拆分（实验布局，未合入默认）
 
 把 Lynn source decoder 放到独立 GPU 进程后，DiT 只收共享内存引用，不再解码也不再

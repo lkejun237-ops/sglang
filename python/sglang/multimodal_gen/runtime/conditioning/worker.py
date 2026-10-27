@@ -209,6 +209,7 @@ class RemoteConditioner:
                     max_input_bytes=limits.max_input_bytes,
                     max_decoded_pixels=limits.max_decoded_pixels,
                 ),
+                result_transport=config.get("result_transport", "http"),
                 retry_initial_s=config.get("retry_initial_s", 0.05),
                 retry_max_s=config.get("retry_max_s", 0.5),
             )
@@ -285,8 +286,13 @@ class RemoteConditioner:
         positive = announcement = None
         if self.rank == 0:
             try:
-                encoder = state.prefetch or self.client
-                positive = encoder.encode(prompt, media, input_digest=digest)
+                if getattr(self.client, "result_transport", "http") == "nccl":
+                    positive = self.client.encode_device(
+                        prompt, media, input_digest=digest, device=device
+                    )
+                else:
+                    encoder = state.prefetch or self.client
+                    positive = encoder.encode(prompt, media, input_digest=digest)
                 announcement = {
                     "ok": True,
                     "shapes": {

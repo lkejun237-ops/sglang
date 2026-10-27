@@ -6,23 +6,23 @@ the process-group methods directly avoids registering it in either default world
 Only GPU moments cross this group; source RGB originates on the host.
 """
 
-from datetime import timedelta
-
 import torch
-import torch.distributed as dist
+
+from sglang.multimodal_gen.runtime.tensor_bridge import bridge_group as _bridge_group
+from sglang.multimodal_gen.runtime.tensor_bridge import (
+    receive_tensor,
+)
 
 
 def bridge_group(store, rank, *, backend="nccl", timeout_seconds=120):
     """Connect DiT leader (0) and Encoder leader (1), outside either SP world."""
-    store = dist.PrefixStore("zing-encoder-bridge", store)
-    timeout = timedelta(seconds=timeout_seconds)
-    if backend == "gloo":
-        return dist.ProcessGroupGloo(store, rank, 2, timeout)
-    if backend != "nccl":
-        raise ValueError("Unsupported encoder bridge backend")
-    options = dist.ProcessGroupNCCL.Options()
-    options._timeout = timeout
-    return dist.ProcessGroupNCCL(store, rank, 2, options)
+    return _bridge_group(
+        store,
+        rank,
+        prefix="zing-encoder-bridge",
+        backend=backend,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def receive_moments(group, shape, dtype, device):
@@ -42,6 +42,4 @@ def receive_moments(group, shape, dtype, device):
 
     if math.prod(shape) * size > 256 << 20:
         raise ValueError("Encoder moments exceed transfer capacity")
-    value = torch.empty(shape, dtype=dtype, device=device)
-    group.recv([value], 1, 0).wait()
-    return value
+    return receive_tensor(group, shape, dtype, device, peer=1)

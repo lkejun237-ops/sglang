@@ -7,10 +7,14 @@ latents cross it; RGB returns through the shared-memory callback channel.
 """
 
 import math
-from datetime import timedelta
 
 import torch
-import torch.distributed as dist
+
+from sglang.multimodal_gen.runtime.tensor_bridge import bridge_group as _bridge_group
+from sglang.multimodal_gen.runtime.tensor_bridge import (
+    receive_tensor,
+    send_tensor,
+)
 
 _BRIDGE_PREFIX = "zing-decoder-bridge"
 _MAX_TRANSFER_BYTES = 256 << 20
@@ -18,15 +22,13 @@ _MAX_TRANSFER_BYTES = 256 << 20
 
 def bridge_group(store, rank, *, backend="nccl", timeout_seconds=120):
     """Connect DiT leader (0) and decoder leader (1) on a private group."""
-    store = dist.PrefixStore(_BRIDGE_PREFIX, store)
-    timeout = timedelta(seconds=timeout_seconds)
-    if backend == "gloo":
-        return dist.ProcessGroupGloo(store, rank, 2, timeout)
-    if backend != "nccl":
-        raise ValueError("Unsupported decoder bridge backend")
-    options = dist.ProcessGroupNCCL.Options()
-    options._timeout = timeout
-    return dist.ProcessGroupNCCL(store, rank, 2, options)
+    return _bridge_group(
+        store,
+        rank,
+        prefix=_BRIDGE_PREFIX,
+        backend=backend,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def check_latent(shape, dtype):
@@ -44,12 +46,10 @@ def send_latent(group, latent, *, peer):
     """Send a normalized latent to `peer` from the DiT leader."""
     value = latent.detach().contiguous()
     check_latent(tuple(int(n) for n in value.shape), value.dtype)
-    group.send([value], peer, 0).wait()
+    send_tensor(group, value, peer=peer)
 
 
 def receive_latent(group, shape, dtype, device):
     """Receive a normalized latent from the DiT leader."""
     check_latent(shape, dtype)
-    value = torch.empty(shape, dtype=dtype, device=device)
-    group.recv([value], 0, 0).wait()
-    return value
+    return receive_tensor(group, shape, dtype, device, peer=0)

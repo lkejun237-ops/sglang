@@ -114,14 +114,18 @@ class _NetworkLoop:
         )
         self.thread.start()
 
-    def run(self, function, timeout):
+    def submit(self, function):
+        """Start bounded I/O; its owner retains admission until cleanup ends."""
         if not self.capacity.acquire(blocking=False):
             raise ConditionError("CONDITION_BUSY")
         try:
-            future = asyncio.run_coroutine_threadsafe(function(), self.loop)
+            return asyncio.run_coroutine_threadsafe(self.owned(function), self.loop)
         except BaseException:
             self.capacity.release()
             raise
+
+    def run(self, function, timeout):
+        future = self.submit(function)
         # Keep admission until coroutine cleanup really ends, even if its sync
         # caller times out. Cancelling the concurrent future alone is not proof
         # that the socket/async task has reached its terminal state.
@@ -169,6 +173,7 @@ class ConditioningClient:
         retry_initial_s=0.05,
         retry_max_s=0.5,
         transport=None,
+        result_transport="http",
         clock=time.monotonic,
         sleep=time.sleep,
         jitter=random.random,
@@ -203,6 +208,22 @@ class ConditioningClient:
             raise ConditionError(
                 "CONDITION_INVALID", "Conditioning byte and row limits must be positive"
             )
+        if result_transport not in {"http", "nccl"}:
+            raise ConditionError(
+                "CONDITION_INVALID", "Unknown conditioning result transport"
+            )
+        if result_transport == "nccl":
+            if urlsplit(url).hostname not in {"127.0.0.1", "localhost"}:
+                raise ConditionError(
+                    "CONDITION_INVALID", "NCCL conditioning requires IPv4 loopback"
+                )
+            # A timed-out native collective can drain after the HTTP deadline.
+            if sp_timeout_s is not None and 2 * timeout_s >= sp_timeout_s:
+                raise ConditionError(
+                    "CONDITION_INVALID", "NCCL drain must fit the SP CPU timeout"
+                )
+        self.result_transport = result_transport
+        self._nccl = None
         self.url, self.token, self.profile_id = url, token, profile_id
         self.timeout_s, self.max_rows, self.max_bytes = timeout_s, max_rows, max_bytes
         self.max_request_bytes = max_request_bytes
@@ -219,9 +240,7 @@ class ConditioningClient:
         if remaining <= 0:
             raise ConditionError("CONDITION_TIMEOUT")
         return network.run(
-            lambda: network.owned(
-                lambda: self._async_transport(method, path, body, deadline)
-            ),
+            lambda: self._async_transport(method, path, body, deadline),
             remaining,
         )
 
@@ -346,6 +365,31 @@ class ConditioningClient:
             raise ConditionError(
                 "CONDITION_PROFILE_MISMATCH", "Conditioning deployment profile differs"
             )
+
+        if document.get("result_transport", "http") != self.result_transport:
+            raise ConditionError(
+                "CONDITION_INVALID", "Conditioning result transports differ"
+            )
+
+    def encode_device(self, prompt, media, *, input_digest, device):
+        from .nccl import NcclReceiver
+        from .wire import encode_request
+
+        self.validate_input(prompt, media)
+        body = encode_request(
+            prompt,
+            media,
+            self.profile_id,
+            int(self.timeout_s * 1000),
+            input_digest=input_digest,
+        )
+        if len(body) > self.max_request_bytes:
+            raise ConditionError(
+                "CONDITION_INVALID", "Conditioning request exceeds the byte limit"
+            )
+        if self._nccl is None:
+            self._nccl = NcclReceiver(self)
+        return self._nccl.encode(body, input_digest, device)
 
     def validate_input(self, prompt, media):
         """Check metadata before hashing, cloning tensors or serializing RGB."""

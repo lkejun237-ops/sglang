@@ -374,6 +374,13 @@ class NativeConditionEncoder:
         self.max_rows, self.gpu_id = max_rows, gpu_id
 
     def __call__(self, condition_input):
+        return {
+            name: tensor.to("cpu")
+            for name, tensor in self.encode_device(condition_input).items()
+        }
+
+    def encode_device(self, condition_input):
+        """Return owned CUDA tensors; transport chooses where they are consumed."""
         import torch
 
         from sglang.multimodal_gen.runtime.managers.forward_context import (
@@ -397,7 +404,8 @@ class NativeConditionEncoder:
                     self.max_rows,
                 )
                 return {
-                    name: tensor.detach().to("cpu") for name, tensor in result.items()
+                    name: tensor.detach().contiguous()
+                    for name, tensor in result.items()
                 }
         finally:
             # A failed Python forward can still leave kernels enqueued. Always

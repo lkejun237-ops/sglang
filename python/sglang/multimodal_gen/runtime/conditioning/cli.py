@@ -241,6 +241,7 @@ def warm_encoder(encoder):
 
     import numpy as np
     import torch
+
     from sglang.multimodal_gen.runtime.managers.forward_context import (
         set_forward_context,
     )
@@ -288,6 +289,11 @@ def main(argv=None):
             "Non-loopback bind or TLS is experimental; only loopback single-node "
             "deployment is validated"
         )
+    result_transport = config.get("result_transport", "http")
+    if result_transport not in {"http", "nccl"}:
+        raise ValueError("Unknown conditioning result transport")
+    if result_transport == "nccl" and args.host not in {"127.0.0.1", "localhost"}:
+        raise ValueError("NCCL conditioning requires an IPv4 loopback bind")
     native = config["native"]
     encoder = NativeConditionEncoder(
         native["model_path"],
@@ -310,7 +316,11 @@ def main(argv=None):
     )
     uvicorn.run(
         ConditioningService(
-            profile=profile, encoder=encoder, tokens=config["tokens"], limits=limits
+            profile=profile,
+            encoder=encoder,
+            tokens=config["tokens"],
+            limits=limits,
+            result_transport=result_transport,
         ),
         host=args.host,
         port=args.port,
