@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
 from sglang.multimodal_gen.test.unit.test_zing_h3_denoise_graph import (
     WarmupRecordingGraphBackend,
     _storage,
+    _weights_free_model,
 )
 from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
     cpu_execution_options,
@@ -85,6 +86,147 @@ def setup_case(model, rope):
         return pj.packs_for(sampler, inputs, inputs.positive, history, current)
 
     return sampler, cache, packs
+
+
+@pytest.mark.parametrize("rope", ["absolute", "block_relative"])
+@pytest.mark.parametrize("refs", [False, True])
+@torch.no_grad()
+def test_weights_free_mixed_prefix_matches_resident_and_replays(
+    model, tmp_path, rope, refs
+):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_table import video_plan
+
+    sampler, cache, make_packs = setup_case(model, rope)
+    schedule = sampler.video_scheduler
+    plan = video_plan(
+        "few_step", schedule.timesteps, 0.0, 0.999, sigmas=schedule.sigmas
+    )
+    candidate = _weights_free_model(model, tmp_path, plan)
+    graphs = PrefixJointGraphs(backend=WarmupRecordingGraphBackend())
+    pooled = cache(_storage(candidate))
+    for _ in range(4):
+        sampler.generator = model
+        packs = make_packs(refs)
+        expected_cache = cache()
+        expected, _ = pj.joint(sampler, packs, expected_cache)
+        sampler.generator = candidate
+        eager_cache = cache()
+        eager, _ = pj.joint(sampler, packs, eager_cache)
+        pooled.clear()
+        fixed, _ = graphs.run(sampler, packs, pooled)
+        # Same full-group BF16 projections; inspect output and every KV layer.
+        for actual, state in ((eager, eager_cache), (fixed, pooled)):
+            torch.testing.assert_close(actual, expected, atol=0.008, rtol=0.008)
+            assert state.last_block == expected_cache.last_block
+            assert state.active[0] == expected_cache.active[0]
+            assert torch.equal(state.positions(), expected_cache.positions())
+            for layer in range(model.arch.num_layers):
+                for got, want in zip(
+                    state.history(layer), expected_cache.history(layer)
+                ):
+                    torch.testing.assert_close(got, want, atol=0.008, rtol=0.008)
+    assert graphs.routes[("prefix_separate", "replay")] == 2
+    assert candidate.adaln_table.hits > 0
+    assert candidate.adaln_table.stats()["fallback"] == 0
+
+
+@pytest.mark.parametrize("fixed", [False, True])
+@torch.no_grad()
+def test_weights_free_missing_full_prefix_batch_clears_cache(model, tmp_path, fixed):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_table import (
+        batch_key,
+        video_plan,
+    )
+
+    sampler, cache, make_packs = setup_case(model, "block_relative")
+    packs = make_packs()
+    schedule = sampler.video_scheduler
+    candidate = _weights_free_model(
+        model,
+        tmp_path,
+        video_plan("few_step", schedule.timesteps, 0.0, 0.999, sigmas=schedule.sigmas),
+    )
+    # Keep both singleton entries: they must not substitute for this full batch.
+    del candidate.adaln_table.keys[batch_key(torch.tensor([0.0, 0.999]))]
+    sampler.generator = candidate
+    state = cache(_storage(candidate))
+    with pytest.raises(ValueError, match="complete timestep batch"):
+        if fixed:
+            PrefixJointGraphs(capture_enabled=False).run(sampler, packs, state)
+        else:
+            pj.joint(sampler, packs, state)
+    assert state.prefix is None and not state.committed
+    assert state.pending_source is None and state.active is None
+
+
+@torch.no_grad()
+def test_weights_free_prefix_sp2_matches_same_sp_resident(model, tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import ZingH3DiTConfig
+    from sglang.multimodal_gen.runtime.layers import usp
+    from sglang.multimodal_gen.runtime.models.dits import zing_h3
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_table import video_plan
+    from sglang.multimodal_gen.test.unit.test_zing_h3_sp_cpu import _CPUCollectives
+
+    sampler, cache, make_packs = setup_case(model, "block_relative")
+    packs = make_packs()
+    schedule = sampler.video_scheduler
+    plan = video_plan(
+        "few_step", schedule.timesteps, 0.0, 0.999, sigmas=schedule.sigmas
+    )
+    residents = [
+        zing_h3.ZingH3DiTModel(ZingH3DiTConfig(arch_config=model.arch), {}).eval()
+        for _ in range(2)
+    ]
+    for resident in residents:
+        resident.load_state_dict(model.state_dict())
+    candidates = [
+        _weights_free_model(model, tmp_path / str(rank), plan) for rank in range(2)
+    ]
+    for candidate in residents + candidates:
+        candidate.experimental_stable_shapes = True
+    comm = _CPUCollectives(2)
+    monkeypatch.setattr(zing_h3, "get_ulysses_ctx", lambda: (2, comm.thread.rank))
+    monkeypatch.setattr(
+        zing_h3,
+        "get_sp_group",
+        lambda: SimpleNamespace(ulysses_group=None, cpu_group=comm),
+    )
+    monkeypatch.setattr(zing_h3, "gather_sequence_varlen", comm.gather)
+    monkeypatch.setattr(usp, "get_ulysses_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(usp, "get_ulysses_parallel_rank", lambda: comm.thread.rank)
+    monkeypatch.setattr(usp, "_ipc_ready_group", lambda: None)
+    monkeypatch.setattr(usp, "_usp_all_to_all_single_varlen", comm.all_to_all)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", comm.gather_objects)
+
+    def gather(output, value, group=None):
+        values = comm.exchange(value, lambda values, rank: list(values))
+        for target, source in zip(output, values):
+            target.copy_(source)
+
+    monkeypatch.setattr(torch.distributed, "all_gather", gather)
+
+    @torch.no_grad()
+    def worker(rank):
+        comm.thread.rank = rank
+        local_sampler = copy.copy(sampler)
+        results = []
+        for candidate in (residents[rank], candidates[rank]):
+            local_sampler.generator = candidate
+            state = cache()
+            output, _ = pj.joint(local_sampler, packs, state)
+            results.append((output, state))
+        (expected, reference), (actual, state) = results
+        torch.testing.assert_close(actual, expected, atol=0.008, rtol=0.008)
+        assert torch.equal(state.positions(), reference.positions())
+        for layer in range(model.arch.num_layers):
+            for got, want in zip(state.history(layer), reference.history(layer)):
+                torch.testing.assert_close(got, want, atol=0.008, rtol=0.008)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for future in [pool.submit(worker, rank) for rank in range(2)]:
+            future.result(timeout=60)
 
 
 @pytest.mark.parametrize("rope", ["absolute", "block_relative"])

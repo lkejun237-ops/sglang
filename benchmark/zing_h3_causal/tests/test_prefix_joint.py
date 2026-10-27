@@ -155,6 +155,64 @@ def test_grouped_projection_preserves_prefix_batch_and_shared_zero(model):
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("refs", [False, True])
+@pytest.mark.parametrize("budget", [0, 1 << 20])
+def test_dynamic_prefix_cache_matches_resident_and_reuses_active(model, refs, budget):
+    from test_prefix_joint_graph import setup_case
+
+    sampler, cache, make_packs = setup_case(model, "block_relative")
+    model.adaln_projection_cache_enabled = False
+    packs = make_packs(refs)
+    reference = cache()
+    expected, _ = pj.joint(sampler, packs, reference)
+    expected_active, _ = sampler._forward(packs[-1], reference, "active")
+
+    model.adaln_projection_cache_enabled = True
+    model.adaln_projection_cache_bytes = budget
+    state = cache()
+    modules = [block.adaln_proj for block in model.blocks]
+    modules.append(model.final_layer.adaln_proj)
+    batches = [[] for _ in modules]
+    hooks = [
+        module.register_forward_pre_hook(
+            lambda _module, args, seen=seen: seen.append(args[0].shape[0])
+        )
+        for module, seen in zip(modules, batches)
+    ]
+    try:
+        for _ in range(2):
+            # Prompt replacement/session reset must discard old projections.
+            actual, _ = pj.joint(sampler, packs, state)
+            projections = state.adaln_projection_cache
+            assert projections is not None
+            groups = [2, 1, 1] if refs else [1, 1]
+            assert all(seen == groups for seen in batches)
+            assert projections.hits == 0
+            assert projections.misses == (len(groups) * len(modules) if budget else 0)
+            torch.testing.assert_close(actual, expected, atol=0.008, rtol=0.008)
+
+            active, _ = sampler._forward(packs[-1], state, "active")
+            torch.testing.assert_close(active, expected_active, atol=0.008, rtol=0.008)
+            assert projections.hits == (len(modules) if budget else 0)
+            assert all(seen == groups + ([] if budget else [1]) for seen in batches)
+            assert state.last_block == reference.last_block
+            assert state.active[0] == reference.active[0]
+            assert torch.equal(state.active[1], reference.active[1])
+            assert torch.equal(state.positions(), reference.positions())
+            for layer in range(model.arch.num_layers):
+                for got, want in zip(state.history(layer), reference.history(layer)):
+                    torch.testing.assert_close(got, want, atol=0.008, rtol=0.008)
+            state.clear()
+            assert state.adaln_projection_cache is None
+            assert projections.bytes == 0 and not projections.entries
+            for seen in batches:
+                seen.clear()
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+
+@torch.no_grad()
 def test_native_prefix_failure_clears_cache(model, monkeypatch):
     from test_prefix_joint_graph import setup_case
 
@@ -169,5 +227,6 @@ def test_native_prefix_failure_clears_cache(model, monkeypatch):
     with pytest.raises(RuntimeError, match="injected forward failure"):
         pj.joint(sampler, packs, state)
     assert state.prefix is None and not state.committed and state.active is None
+    assert state.adaln_projection_cache is None
     assert type(model)._forward_body is original
     assert "_forward_body" not in model.__dict__

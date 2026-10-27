@@ -470,6 +470,17 @@ Qwen 实际编码与连续 source 的缓存命中分列。模型张量存储按�
 
 本次原生实现仅完成本地 CPU/recording-backend 验证，480 与 736 的当前提交 GPU E2E、TTFF/FPS/TPOC/ICL、Encoder（Qwen/reference/source）、DiT、Decoder 的阶段中位数/P95及 allocated/reserved 常驻与峰值均未重新采集；旧 overlay 数值不作为当前版本性能结论。未启动或替换生产服务。详见 [PR 设计与验证记录](plans/SOURCE_DEFERRED_FINAL.md)。
 
+2026-10-27 兼容性补充：六分支支持 weights-free AdaLN，按原串行投影的完整 timestep
+组查表，保留混合 prefix 的 BF16 batch 形状。eager、固定执行和 Graph 准备路径已接通；
+`SGLANG_ZING_SOURCE_PROMPT_JOINT` 默认值仍为 `0`，设置为 `1` 后以实际路由指标核实命中。
+驻留权重的 eager 六分支也支持动态 AdaLN 投影缓存，沿用
+`SGLANG_ZING_ADALN_PROJECTION_CACHE=1` 及原字节预算，保留混合 prefix 的完整 batch。
+prompt 切换仍清空会话缓存，因此切换当次冷填充、后续相同组才可命中；
+静态 table 优先，fixed/Graph 不在 replay 内访问动态 LRU。
+本次仍只有 CPU 小模型/recording-backend 证据，480/736 完整服务性能、真实 SP/NCCL
+和 CUDA Graph 峰值显存未测；不据此调整上表容量或性能推荐。
+详见[兼容设计与验证](plans/PREFIX_JOINT_ADALN_TABLE.md)。
+
 
 ### DiT 前序融合量化与 Per-Token Scale 验证边界（2026-10-23，PR #414）
 

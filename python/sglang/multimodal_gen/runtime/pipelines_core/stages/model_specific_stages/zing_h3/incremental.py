@@ -336,7 +336,6 @@ class SourceReadySession:
             and sampler.window_eviction_timing == "after_step0"
             and current.audio is None
             and current.spans[0][:2] == (7, 8)
-            and model.adaln_table is None
             and (size == 1 or model.experimental_stable_shapes)
         )
         sampler._agree_sp_boundary(

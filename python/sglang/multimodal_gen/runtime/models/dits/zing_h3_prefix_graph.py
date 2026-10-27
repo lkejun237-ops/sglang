@@ -53,8 +53,6 @@ class PrefixJointGraphs(ZingChunkGraphs):
             or cache.pending_source is not None
         ):
             raise ValueError("Prefix graphs require a cleared logical cache")
-        if model.adaln_table is not None:
-            raise ValueError("Prefix graphs require resident AdaLN weights")
         if self.capture_enabled and not self.backend.supports(packs[0]["x"].device):
             raise ValueError("Unsupported prefix graph device")
         size, _ = zing_h3.get_ulysses_ctx()

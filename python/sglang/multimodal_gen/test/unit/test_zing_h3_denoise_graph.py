@@ -700,24 +700,13 @@ def _cuda_model():
 
 
 @torch.no_grad()
-def test_weights_free_table_replays_interleaved_sessions_exactly(
-    model, tmp_path, monkeypatch
-):
+def _weights_free_model(model, tmp_path, plan):
+    """Build a real table and construct a model with no projection weights."""
     from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_table import (
         ZingAdalnTable,
-        video_plan,
         write_table,
     )
-    from sglang.multimodal_gen.runtime.models.schedulers.scheduling_zing_h3_causal_renoise import (
-        ZingH3CausalRenoiseSchedule,
-    )
 
-    seeds = (11, 12)
-    expected = _run_sessions(
-        model, monkeypatch, storages=[_storage(model), _storage(model)], seeds=seeds
-    )
-    schedule = ZingH3CausalRenoiseSchedule(STEPS, num_train_timesteps=1000, shift=5.0)
-    plan = video_plan("few_step", schedule.timesteps, sigmas=schedule.sigmas)
     path = tmp_path / "table"
     write_table(
         path,
@@ -748,6 +737,25 @@ def test_weights_free_table_replays_interleaved_sessions_exactly(
         receipt["projection_parameters"] == []
         and receipt["projection_storage_bytes"] == 0
     )
+    return candidate
+
+
+@torch.no_grad()
+def test_weights_free_table_replays_interleaved_sessions_exactly(
+    model, tmp_path, monkeypatch
+):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_table import video_plan
+    from sglang.multimodal_gen.runtime.models.schedulers.scheduling_zing_h3_causal_renoise import (
+        ZingH3CausalRenoiseSchedule,
+    )
+
+    seeds = (11, 12)
+    expected = _run_sessions(
+        model, monkeypatch, storages=[_storage(model), _storage(model)], seeds=seeds
+    )
+    schedule = ZingH3CausalRenoiseSchedule(STEPS, num_train_timesteps=1000, shift=5.0)
+    plan = video_plan("few_step", schedule.timesteps, sigmas=schedule.sigmas)
+    candidate = _weights_free_model(model, tmp_path, plan)
     backend = RecordingGraphBackend()
     _graph_mode(candidate, monkeypatch, backend)
     actual = _run_sessions(
@@ -766,7 +774,8 @@ def test_weights_free_table_replays_interleaved_sessions_exactly(
         _assert_same(got, want)
         routes += _active_routes(got[1])
     assert routes["capture"] > 0 and routes["replay"] > 0
-    assert table.active_plans == 0 and table.stats()["fallback"] == 0
+    assert candidate.adaln_table.active_plans == 0
+    assert candidate.adaln_table.stats()["fallback"] == 0
 
 
 # Sequence-parallel coordination: a scripted coordinator stands in for the peer
@@ -2407,8 +2416,9 @@ def test_whole_chunk_sp_opt_out_streaming_never_captures(model, monkeypatch, wor
 
 
 @pytest.mark.parametrize("defer_final", [False, True])
+@pytest.mark.parametrize("weights_free", [False, True])
 def test_online_prompt_joint_matches_serial_and_replays(
-    model, monkeypatch, defer_final
+    model, monkeypatch, defer_final, weights_free, tmp_path
 ):
     from sglang.multimodal_gen.runtime.models.dits.zing_h3_prefix_graph import (
         PrefixJointGraphs,
@@ -2421,6 +2431,26 @@ def test_online_prompt_joint_matches_serial_and_replays(
         defer_final=defer_final,
     )
     baseline = _run_ready_chunks(model, monkeypatch, **options)
+    if weights_free:
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_table import (
+            initial_blocks_plan,
+            video_plan,
+        )
+        from sglang.multimodal_gen.runtime.models.schedulers.scheduling_zing_h3_causal_renoise import (
+            ZingH3CausalRenoiseSchedule,
+        )
+
+        plans = []
+        for steps in ([1000, 500], STEPS):
+            schedule = ZingH3CausalRenoiseSchedule(
+                steps, num_train_timesteps=1000, shift=5.0
+            )
+            plans.append(
+                video_plan("few_step", schedule.timesteps, sigmas=schedule.sigmas)
+            )
+        model = _weights_free_model(
+            model, tmp_path, initial_blocks_plan(*plans, count=3)
+        )
     eager = _run_ready_chunks(model, monkeypatch, prompt_joint=True, **options)
     model.prefix_graphs = PrefixJointGraphs(capture_enabled=False)
     fixed = _run_ready_chunks(
@@ -2451,6 +2481,10 @@ def test_online_prompt_joint_matches_serial_and_replays(
         assert actual[0] == expected[0]
         for (ak, av), (ek, ev) in zip(actual[2], expected[2]):
             assert torch.equal(ak, ek) and torch.equal(av, ev)
+    if weights_free:
+        assert model.adaln_table.active_plans == 0
+        assert model.adaln_table.hits > 0
+        assert model.adaln_table.stats()["fallback"] == 0
 
 
 def test_online_prompt_joint_failure_releases_session_and_reuses_slot(
