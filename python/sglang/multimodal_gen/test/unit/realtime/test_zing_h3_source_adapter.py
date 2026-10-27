@@ -50,7 +50,8 @@ def configured(tmp_path, monkeypatch):
     )
     args = SimpleNamespace(
         model_path=str(tmp_path),
-        zing_source_decoder_port=None,
+        disagg_encoder_port=None,
+        disagg_decoder_port=None,
         pipeline_config=SimpleNamespace(
             vae_config=SimpleNamespace(
                 arch_config=SimpleNamespace(
@@ -1985,7 +1986,7 @@ def test_source_decoder_overlap_requires_dedicated_single_block_path(
     configured, monkeypatch, remote, quantum
 ):
     configured.zing_source_decoder_overlap = True
-    configured.zing_source_decoder_port = 8098 if remote else None
+    configured.disagg_decoder_port = 8098 if remote else None
     monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", quantum)
     if not remote or quantum != "1":
         with pytest.raises(ValueError, match="dedicated decoder and source quantum 1"):
@@ -1995,3 +1996,24 @@ def test_source_decoder_overlap_requires_dedicated_single_block_path(
         assert adapter.source_decoder_overlap is True
         assert adapter.profile["source_decoder"] == {"remote": {"port": 8098}}
         adapter.clear_state(session)
+
+
+def test_adapter_init_applies_disagg_role_policies(configured):
+    configured.disagg_encoder_port = 31005
+    configured.disagg_decoder_port = 31007
+    adapter, session = initialize()
+    assert (
+        getattr(adapter, "profile", {})
+        .get("source_decoder", {})
+        .get("remote", {})
+        .get("port")
+        == 31007
+    ), "profile source_decoder remote port must be injected from disagg_decoder_port"
+    assert (
+        getattr(adapter, "profile", {})
+        .get("source_encoder", {})
+        .get("remote", {})
+        .get("port")
+        == 31005
+    ), "profile source_encoder remote port must be injected from disagg_encoder_port"
+    asyncio.run(adapter.close_conditioning(session))

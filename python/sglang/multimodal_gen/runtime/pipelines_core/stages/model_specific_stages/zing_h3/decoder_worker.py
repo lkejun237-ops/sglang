@@ -15,7 +15,6 @@ import os
 import queue
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import timedelta
 from pathlib import Path
@@ -27,19 +26,21 @@ import zmq
 from sglang.multimodal_gen.configs.pipeline_configs.zing_h3_decoder import (
     normalize_decoder_spec,
 )
-from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import (
-    publish_async_shared_memory_error,
-    publish_async_shared_memory_payload,
-    reserve_async_shared_memory_payload,
-    wait_for_async_shared_memory_terminal,
+from sglang.multimodal_gen.runtime.disaggregation.transport.shm_publisher import (
+    SharedMemoryFramePublisher,
 )
-from sglang.multimodal_gen.runtime.utils.realtime_video import stage_rgb24_segments
+from sglang.multimodal_gen.runtime.disaggregation.transport.worker_control import (
+    RoleCommandControl,
+    RoleControlError,
+)
 
 from .decoder_transport import bridge_group, receive_latent
-from .encoder_control import EncoderCommandControl, EncoderControlError
+
+EncoderCommandControl = RoleCommandControl
+EncoderControlError = RoleControlError
+_OutputPublisher = SharedMemoryFramePublisher
 from .source_decoder import check_latent_append
 
-_MAX_OUTPUT_BYTES = 128 << 20
 _DRAIN = object()
 
 
@@ -65,66 +66,6 @@ class _TileGroup:
 
     def all_gather_into(self, output, tensor):
         dist.all_gather_into_tensor(output, tensor, group=self.device_group)
-
-
-class _OutputPublisher:
-    """Reserve a shared-memory reference per dispatch, publish after decode."""
-
-    def __init__(self, *, timeout_seconds, max_in_flight=2):
-        self.timeout = timeout_seconds
-        self._slots = threading.BoundedSemaphore(max_in_flight)
-        self._executor = ThreadPoolExecutor(
-            max_workers=max_in_flight, thread_name_prefix="zing-decoder-publish"
-        )
-
-    def reserve(self, *, frames, width, height, identity):
-        num_bytes = frames * width * height * 3
-        if not 0 < num_bytes <= _MAX_OUTPUT_BYTES:
-            raise ValueError("Decoder output exceeds its payload capacity")
-        if not self._slots.acquire(timeout=self.timeout):
-            raise TimeoutError("Decoder output slots are full")
-        try:
-            reference = reserve_async_shared_memory_payload(num_bytes)
-            reference.update(
-                kind="raw_rgb24_frames",
-                version=1,
-                batch_num_frames=[frames],
-                width=width,
-                height=height,
-                channels=3,
-                **identity,
-            )
-        except BaseException:
-            self._slots.release()
-            raise
-        return reference
-
-    def publish(self, reference, frames):
-        device_frames, counts = stage_rgb24_segments([frames])
-        if counts != reference["batch_num_frames"] or (
-            device_frames.numel() != reference["num_bytes"]
-        ):
-            raise ValueError("Decoded RGB does not match the reserved reference")
-        publish_async_shared_memory_payload(reference, device_frames.cpu().numpy())
-        self._executor.submit(self._reclaim, reference)
-
-    def fail(self, reference, error):
-        try:
-            publish_async_shared_memory_error(reference, error)
-        except Exception:
-            logging.exception("Decoder output error publication failed")
-        self._executor.submit(self._reclaim, reference)
-
-    def _reclaim(self, reference):
-        try:
-            wait_for_async_shared_memory_terminal(reference)
-        except Exception:
-            logging.exception("Decoder output reference was not reclaimed")
-        finally:
-            self._slots.release()
-
-    def close(self):
-        self._executor.shutdown(wait=True, cancel_futures=False)
 
 
 class _DecodeService:

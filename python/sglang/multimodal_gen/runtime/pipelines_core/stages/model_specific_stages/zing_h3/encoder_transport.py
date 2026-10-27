@@ -8,21 +8,21 @@ Only GPU moments cross this group; source RGB originates on the host.
 
 import torch
 
-from sglang.multimodal_gen.runtime.tensor_bridge import bridge_group as _bridge_group
-from sglang.multimodal_gen.runtime.tensor_bridge import (
-    receive_tensor,
-)
+from sglang.multimodal_gen.runtime.disaggregation.transport import nccl_bridge
 
 
 def bridge_group(store, rank, *, backend="nccl", timeout_seconds=120):
     """Connect DiT leader (0) and Encoder leader (1), outside either SP world."""
-    return _bridge_group(
-        store,
-        rank,
-        prefix="zing-encoder-bridge",
-        backend=backend,
-        timeout_seconds=timeout_seconds,
-    )
+    try:
+        return nccl_bridge.create_bridge_group(
+            store,
+            rank,
+            prefix="zing-encoder-bridge",
+            backend=backend,
+            timeout_seconds=timeout_seconds,
+        )
+    except ValueError as exc:
+        raise ValueError("Unsupported encoder bridge backend") from exc
 
 
 def receive_moments(group, shape, dtype, device):
@@ -37,9 +37,17 @@ def receive_moments(group, shape, dtype, device):
         raise ValueError("Invalid progressive encoder moments dimensions")
     if dtype not in (torch.float32, torch.float16, torch.bfloat16, torch.float64):
         raise ValueError("Invalid encoder moments dtype")
-    size = torch.empty((), dtype=dtype).element_size()
-    import math
-
-    if math.prod(shape) * size > 256 << 20:
-        raise ValueError("Encoder moments exceed transfer capacity")
-    return receive_tensor(group, shape, dtype, device, peer=1)
+    return nccl_bridge.receive_bridge_tensor(
+        group,
+        shape,
+        dtype,
+        device,
+        peer=1,
+        tag=0,
+        expected_ndim=5,
+        expected_batch=1,
+        expected_channels=48,
+        max_temporal=2,
+        max_bytes=256 << 20,
+        allowed_dtypes=(torch.float32, torch.float16, torch.bfloat16, torch.float64),
+    )

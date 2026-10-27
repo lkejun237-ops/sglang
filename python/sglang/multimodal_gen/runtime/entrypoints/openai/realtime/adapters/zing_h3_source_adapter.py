@@ -22,6 +22,9 @@ from sglang.multimodal_gen.configs.zing_sampling import (
     normalize_source_sampling_schedule,
 )
 from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+from sglang.multimodal_gen.runtime.disaggregation.role_launcher import (
+    _with_disagg_role_policies,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter import (
     BaseRealtimeModelAdapter,
     RealtimeChunkInputs,
@@ -53,9 +56,7 @@ from .zing_reference_upload import prepare_reference_upload
 
 def _with_source_decoder_policy(profile, port):
     """Overlay the launcher-assigned decoder port on the attested export."""
-    if port is None:
-        return profile
-    return {**profile, "source_decoder": {"remote": {"port": port}}}
+    return _with_disagg_role_policies(profile, decoder_port=port)
 
 
 def _source_sampling_schedule(args, profile):
@@ -195,7 +196,11 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         profile = json.loads(
             (Path(args.model_path) / "zing_realtime_profile.json").read_text()
         )
-        profile = _with_source_decoder_policy(profile, args.zing_source_decoder_port)
+        profile = _with_disagg_role_policies(
+            profile,
+            encoder_port=getattr(args, "disagg_encoder_port", None),
+            decoder_port=getattr(args, "disagg_decoder_port", None),
+        )
         # require raises ContractError explicitly and is unaffected by python -O.
         require(
             runtime.get("causal") is True

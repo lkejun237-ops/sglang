@@ -20,6 +20,12 @@ class DisaggServerArgsMixin:
         RoleType.DECODER: 3,
     }
 
+    encoder_gpus: str | None = None
+    denoiser_gpus: str | None = None
+    decoder_gpus: str | None = None
+    disagg_encoder_port: int | None = None
+    disagg_decoder_port: int | None = None
+
     def get_role_parallelism(self, role_type: RoleType) -> dict[str, int | None]:
         _none = {
             "tp_size": None,
@@ -234,3 +240,96 @@ class DisaggServerArgsMixin:
             default=cls.decoder_sp,
             help="Sequence parallelism for decoder role.",
         )
+        parser.add_argument(
+            "--encoder-gpus",
+            type=str,
+            default=cls.encoder_gpus,
+            help="Comma-separated indices into caller's CUDA_VISIBLE_DEVICES for encoder role.",
+        )
+        parser.add_argument(
+            "--denoiser-gpus",
+            type=str,
+            default=cls.denoiser_gpus,
+            help="Comma-separated indices into caller's CUDA_VISIBLE_DEVICES for denoiser role.",
+        )
+        parser.add_argument(
+            "--decoder-gpus",
+            type=str,
+            default=cls.decoder_gpus,
+            help="Comma-separated indices into caller's CUDA_VISIBLE_DEVICES for decoder role.",
+        )
+
+    def _validate_disagg_gpu_roles(self) -> None:
+        """Validate explicit disaggregated role GPU placements and topologies."""
+        from sglang.multimodal_gen.runtime.server_args.server_args import parse_gpu_list
+
+        encoder = parse_gpu_list(self.encoder_gpus)
+        denoiser = parse_gpu_list(self.denoiser_gpus)
+        decoder = parse_gpu_list(self.decoder_gpus)
+
+        if encoder is None and denoiser is None and decoder is None:
+            return
+
+        if encoder is not None or decoder is not None:
+            if denoiser is None:
+                raise ValueError(
+                    "Disaggregated encoder or decoder roles require --denoiser-gpus to be specified"
+                )
+
+        if denoiser is not None and encoder is None and decoder is None:
+            raise ValueError(
+                "--denoiser-gpus specified without --encoder-gpus or --decoder-gpus"
+            )
+
+        if getattr(self, "nnodes", 1) != 1:
+            raise ValueError(
+                "Disaggregated role worker topology supports a single node only (nnodes == 1)"
+            )
+
+        if len(denoiser) != getattr(self, "num_gpus", len(denoiser)):
+            raise ValueError(
+                f"--denoiser-gpus must list exactly num_gpus (--num-gpus={getattr(self, 'num_gpus', None)}) devices, got {len(denoiser)}"
+            )
+
+        if hasattr(self, "ulysses_degree") or hasattr(self, "ring_degree"):
+            ulysses = int(getattr(self, "ulysses_degree", 1) or 1)
+            ring = int(getattr(self, "ring_degree", 1) or 1)
+            tp = int(getattr(self, "tp_size", 1) or 1)
+            dp = int(getattr(self, "dp_size", 1) or 1)
+            cfg = int(getattr(self, "cfg_parallel_degree", 1) or 1)
+            if ulysses * ring * tp * dp * cfg != len(denoiser):
+                raise ValueError(
+                    f"--denoiser-gpus (denoiser_gpus) count ({len(denoiser)}) must match denoiser parallelism "
+                    f"(ulysses_degree={ulysses}, ring_degree={ring})"
+                )
+
+        if len(set(denoiser)) != len(denoiser):
+            raise ValueError(
+                "--denoiser-gpus lists a device more than once (duplicate GPU)"
+            )
+
+        if encoder is not None:
+            if len(set(encoder)) != len(encoder):
+                raise ValueError(
+                    "--encoder-gpus lists a device more than once (duplicate GPU)"
+                )
+            if set(encoder) & set(denoiser):
+                raise ValueError(
+                    "A GPU cannot belong to both the encoder and denoiser (overlap)"
+                )
+
+        if decoder is not None:
+            if len(set(decoder)) != len(decoder):
+                raise ValueError(
+                    "--decoder-gpus lists a device more than once (duplicate GPU)"
+                )
+            if set(decoder) & set(denoiser):
+                raise ValueError(
+                    "A GPU cannot belong to both the denoiser and decoder (overlap)"
+                )
+
+        if encoder is not None and decoder is not None:
+            if set(encoder) & set(decoder):
+                raise ValueError(
+                    "A GPU cannot belong to both the encoder and decoder (overlap)"
+                )

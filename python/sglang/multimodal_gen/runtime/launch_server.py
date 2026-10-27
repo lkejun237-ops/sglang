@@ -1,5 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+import atexit
 import dataclasses
 import multiprocessing as mp
 import os
@@ -11,17 +12,16 @@ import uvicorn
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
     DiffusionServer,
 )
+from sglang.multimodal_gen.runtime.disaggregation.role_launcher import (
+    assign_denoiser_visible_devices,
+    resolve_role_devices,
+    start_role_workers,
+    stop_role_workers,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import ShutdownReq
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
 from sglang.multimodal_gen.runtime.managers.gpu_worker import run_scheduler_process
-from sglang.multimodal_gen.runtime.managers.zing_source_decoder import (
-    assign_dit_visible_devices,
-    resolve_role_devices,
-)
-from sglang.multimodal_gen.runtime.managers.zing_source_decoder import (
-    start as start_source_decoder,
-)
 from sglang.multimodal_gen.runtime.realtime.source_transport import (
     SourceTransportBudget,
 )
@@ -149,19 +149,36 @@ def _launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         SourceTransportBudget.from_args(server_args).websocket_options()
     configure_logger(server_args)
 
-    # Translate both role lists from one snapshot of the caller's devices before
-    # narrowing this process, so the decoder and DiT never depend on order.
-    if server_args.zing_decoder_gpus:
-        dit_devices, decoder_devices = resolve_role_devices(
+    # Translate role lists from one snapshot of the caller's devices before
+    # narrowing this process, so roles never depend on order.
+    if getattr(server_args, "encoder_gpus", None) or getattr(
+        server_args, "decoder_gpus", None
+    ):
+        try:
+            import torch
+
+            if torch.cuda.is_initialized():
+                raise RuntimeError(
+                    "launch_server with role GPU partitioning must be called before CUDA runtime initialization"
+                )
+        except ImportError:
+            pass
+        encoder_devices, denoiser_devices, decoder_devices = resolve_role_devices(
             server_args, caller=os.environ.get("CUDA_VISIBLE_DEVICES", "")
         )
-        assign_dit_visible_devices(server_args, dit_devices)
+        assign_denoiser_visible_devices(server_args, denoiser_devices)
     else:
-        decoder_devices = None
+        encoder_devices, denoiser_devices, decoder_devices = None, None, None
 
-    # The decoder owns its own GPUs and must be healthy before the DiT ranks
+    # Role workers own their own GPUs and must be healthy before the DiT ranks
     # accept sessions; readiness failure aborts the launch.
-    start_source_decoder(server_args, decoder_devices)
+    role_processes = start_role_workers(
+        server_args,
+        encoder_devices=encoder_devices,
+        decoder_devices=decoder_devices,
+    )
+    if role_processes:
+        atexit.register(stop_role_workers, server_args, role_processes)
 
     # Start a new server with multiple worker processes
     logger.info("Starting server...")
@@ -290,6 +307,7 @@ def _launch_server(server_args: ServerArgs, launch_http_server: bool = True):
                 p.join()
         finally:
             shutdown_scheduler_processes(None, processes, request_shutdown=False)
+            stop_role_workers(server_args, role_processes)
         return processes
 
     if launch_http_server:
@@ -314,15 +332,16 @@ def _launch_server(server_args: ServerArgs, launch_http_server: bool = True):
                 launch_http_server_only(server_args)
             finally:
                 shutdown_scheduler_processes(server_args, processes)
+                stop_role_workers(server_args, role_processes)
 
-    return processes
+    return processes + (role_processes or [])
 
 
 def launch_pool_disagg_server(
     server_args: ServerArgs,
-    encoder_gpus: list[list[int]],
-    denoiser_gpus: list[list[int]],
-    decoder_gpus: list[list[int]],
+    encoder_gpus: list[list[int]] | None = None,
+    denoiser_gpus: list[list[int]] | None = None,
+    decoder_gpus: list[list[int]] | None = None,
     launch_http_server: bool = True,
 ):
     """Launch a pool-based disaggregated server with N:M:K independent role instances.
@@ -347,6 +366,53 @@ def launch_pool_disagg_server(
             decoder_gpus=[[0], [2]],
         )
     """
+    pipeline_config = getattr(server_args, "pipeline_config", None)
+    is_zing_streaming = (
+        type(pipeline_config).__name__ == "ZingH3CausalPipelineConfig"
+        or getattr(pipeline_config, "decoder_config", None) is not None
+        or any(
+            getattr(server_args, attr, None) is not None
+            for attr in ("encoder_gpus", "denoiser_gpus", "decoder_gpus")
+        )
+    )
+    if is_zing_streaming:
+        for name, role_list in (
+            ("encoder_gpus", encoder_gpus),
+            ("denoiser_gpus", denoiser_gpus),
+            ("decoder_gpus", decoder_gpus),
+        ):
+            if role_list and len(role_list) > 1:
+                raise ValueError(
+                    f"Streaming Zing topology supports a single active session; "
+                    f"multiple {name} instances are not supported"
+                )
+
+        def _to_gpus_str(role_list):
+            if not role_list or not role_list[0]:
+                return None
+            return ",".join(str(g) for g in role_list[0])
+
+        update_kwargs = {}
+        if encoder_gpus is not None:
+            update_kwargs["encoder_gpus"] = _to_gpus_str(encoder_gpus)
+        if denoiser_gpus is not None:
+            update_kwargs["denoiser_gpus"] = _to_gpus_str(denoiser_gpus)
+        if decoder_gpus is not None:
+            update_kwargs["decoder_gpus"] = _to_gpus_str(decoder_gpus)
+
+        if denoiser_gpus and denoiser_gpus[0]:
+            update_kwargs["num_gpus"] = len(denoiser_gpus[0])
+
+        if dataclasses.is_dataclass(server_args):
+            server_args = dataclasses.replace(server_args, **update_kwargs)
+        else:
+            for k, v in update_kwargs.items():
+                setattr(server_args, k, v)
+            if hasattr(server_args, "_validate_disagg_gpu_roles"):
+                server_args._validate_disagg_gpu_roles()
+
+        return launch_server(server_args, launch_http_server=launch_http_server)
+
     configure_logger(server_args)
 
     num_encoders = len(encoder_gpus)

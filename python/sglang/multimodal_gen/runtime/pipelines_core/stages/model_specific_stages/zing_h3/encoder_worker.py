@@ -18,13 +18,18 @@ import torch
 import torch.distributed as dist
 import zmq
 
+from sglang.multimodal_gen.runtime.disaggregation.transport.worker_control import (
+    RoleCommandControl,
+    RoleControlError,
+)
 from sglang.multimodal_gen.runtime.utils.zing_stage_timing import (
     handoff,
     stage_span,
     trace_for_ids,
 )
 
-from .encoder_control import EncoderCommandControl, EncoderControlError
+EncoderCommandControl = RoleCommandControl
+EncoderControlError = RoleControlError
 from .encoder_recovery import abort_owner
 from .encoder_transport import bridge_group
 from .progressive_encoder import H3ProgressiveEncoderSession

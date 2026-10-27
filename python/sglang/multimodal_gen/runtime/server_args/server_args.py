@@ -143,9 +143,15 @@ def parse_gpu_list(value: str | None) -> list[int] | None:
     """Parse a comma-separated device list; None means the role is not configured."""
     if value is None:
         return None
+    if not value or not isinstance(value, str):
+        raise ValueError(
+            f"GPU list must be comma-separated non-negative integer indices, got {value!r}"
+        )
     parts = [part.strip() for part in value.split(",")]
-    if not all(part.isdigit() for part in parts):
-        raise ValueError(f"GPU list must be comma-separated indices, got {value!r}")
+    if not parts or any(not part.isdigit() for part in parts):
+        raise ValueError(
+            f"GPU list must be comma-separated non-negative integer indices, got {value!r}"
+        )
     return [int(part) for part in parts]
 
 
@@ -451,11 +457,11 @@ class ServerArgs(DisaggServerArgsMixin):
     zing_conditioning_mode: str = "local"
     zing_conditioning_prefetch: bool = False
     zing_source_decoder_overlap: bool = False
-    # Comma-separated indices into the caller's CUDA_VISIBLE_DEVICES order.
-    zing_dit_gpus: str | None = None
-    zing_decoder_gpus: str | None = None
-    # Launcher-assigned; kept on ServerArgs so worker processes see the policy.
-    zing_source_decoder_port: int | None = field(default=None, repr=False)
+    encoder_gpus: str | None = None
+    denoiser_gpus: str | None = None
+    decoder_gpus: str | None = None
+    disagg_encoder_port: int | None = field(default=None, repr=False)
+    disagg_decoder_port: int | None = field(default=None, repr=False)
     conditioning_expected_profile: str | None = None
     zing_conditioning_local_cache_bytes: int = 256 << 20
     conditioning_service_url: str | None = None
@@ -709,7 +715,7 @@ class ServerArgs(DisaggServerArgsMixin):
             )
 
             validate_service_url(self.conditioning_service_url)
-        self._validate_zing_gpu_roles()
+        self._validate_disagg_gpu_roles()
         if (
             type(self.zing_conditioning_local_cache_bytes) is not int
             or self.zing_conditioning_local_cache_bytes < 0
@@ -730,25 +736,6 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_minimax_h3_adaln()
         self._validate_zing_sampling()
         self.pipeline_config.validate_server_args(self)
-
-    def _validate_zing_gpu_roles(self) -> None:
-        """Check explicit role device lists; the launcher maps them, never guesses."""
-        dit = parse_gpu_list(self.zing_dit_gpus)
-        decoder = parse_gpu_list(self.zing_decoder_gpus)
-        if decoder is None:
-            if dit is not None:
-                raise ValueError("--zing-dit-gpus requires --zing-decoder-gpus")
-            return
-        if self.nnodes != 1:
-            raise ValueError(
-                "Dedicated Zing source decoder supports a single node only"
-            )
-        if dit is None or len(dit) != self.num_gpus:
-            raise ValueError("--zing-dit-gpus must list exactly --num-gpus devices")
-        if set(dit) & set(decoder):
-            raise ValueError("A GPU cannot belong to both the DiT and the decoder")
-        if len(set(decoder)) != len(decoder):
-            raise ValueError("--zing-decoder-gpus lists a device more than once")
 
     def _validate_zing_sampling(self):
         from sglang.multimodal_gen.configs.zing_sampling import (
@@ -2134,26 +2121,6 @@ class ServerArgs(DisaggServerArgsMixin):
             choices=("local", "remote"),
             default=ServerArgs.zing_conditioning_mode,
             help="Select local encoding or trusted external conditioning for Zing.",
-        )
-        parser.add_argument(
-            "--zing-dit-gpus",
-            type=str,
-            default=ServerArgs.zing_dit_gpus,
-            help=(
-                "Comma-separated indices into the caller's CUDA_VISIBLE_DEVICES "
-                "(not nvidia-smi IDs) for the DiT ranks; must match --num-gpus. "
-                "Required with --zing-decoder-gpus."
-            ),
-        )
-        parser.add_argument(
-            "--zing-decoder-gpus",
-            type=str,
-            default=ServerArgs.zing_decoder_gpus,
-            help=(
-                "Comma-separated indices into the caller's CUDA_VISIBLE_DEVICES "
-                "for the dedicated Lynn source decoder. Omit to keep decoding on "
-                "the DiT ranks."
-            ),
         )
         parser.add_argument(
             "--conditioning-expected-profile",

@@ -100,19 +100,19 @@ D1 与 D2 之间同样是 2.30/255 量级。差异来源尚未定位，不能把
 AdaLN，否则 DiT 峰值超出单卡容量。证据：`/cpfs/world-model/sglang/decoder-split/20261021-gpu-r6`
 、`20261022-gpu-d2-th` 与 `20261022-gpu-smoke-ec4230cc7d`。
 
-角色边界：部署方用 `--zing-dit-gpus` 与 `--zing-decoder-gpus` 显式指定每个角色的物理卡，
-两者都是调用方 `CUDA_VISIBLE_DEVICES` 中的**序号**（不是 `nvidia-smi` 编号），例如：
+角色边界：部署方用 `--encoder-gpus`、`--denoiser-gpus` 与 `--decoder-gpus` 显式指定每个角色的物理卡，
+均为调用方 `CUDA_VISIBLE_DEVICES` 中的**序号**（不是 `nvidia-smi` 编号），例如：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2 sglang serve --model-path MODEL_PATH \
   --num-gpus 2 --sp-degree 2 \
-  --zing-dit-gpus 0,1 --zing-decoder-gpus 2
+  --denoiser-gpus 0,1 --decoder-gpus 2
 ```
 
-launcher 只做翻译与校验，不替用户分配：DiT 卡数必须等于 `--num-gpus`，两个角色不得共用同一张卡，
-并且 decoder 只能在单节点上使用。Decoder 不配置时保持与 DiT 同卡。编码、解码能力及各自的进程入口彼此独立；
+launcher 只做翻译与校验，不替用户分配：Denoiser 卡数必须等于 `--num-gpus`，角色之间不得共用同一张卡，
+并且分卡只能在单节点上使用。Role 不配置时保持单角色同卡模式。编码、解码能力及各自的进程入口彼此独立；
 会话协议不假设“一个角色一个进程”。共用 GPU 不等于合并进程，只有显式配置才会合并。
-把 Encoder、DiT、Decoder 统一交给 `launch_pool_disagg_server()` 声明与调度是后续 TODO，本版尚未接入。
+现已支持通过 CLI（`--encoder-gpus` / `--denoiser-gpus` / `--decoder-gpus`）或 `launch_pool_disagg_server()` 统一声明与编排各角色卡位。
 
 ## H100/H200 Decoder 已验证范围
 
