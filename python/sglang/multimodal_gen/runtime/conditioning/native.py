@@ -91,23 +91,116 @@ def _code_identity():
     return "conditioning-code-sha256:" + sha256(canonical_json(files))
 
 
-def _require_profiled_execution():
+def _execution_options():
+    from dataclasses import asdict
+
     from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
-        h3_qwen_execution_disabled,
+        h3_qwen_execution_options,
+        h3_qwen_fp8_enabled,
     )
+
+    return asdict(h3_qwen_execution_options()) | {"fp8": h3_qwen_fp8_enabled()}
+
+
+def _require_profiled_execution(environment):
+    from .contract import ConditionError
+
+    actual = _execution_options()
+    # An old saved profile only describes the explicit all-off baseline.
+    expected = environment.get("execution_options", dict.fromkeys(actual, False))
+    if (
+        not isinstance(expected, dict)
+        or set(expected) != set(actual)
+        or any(type(value) is not bool for value in expected.values())
+        or expected != actual
+    ):
+        raise ConditionError(
+            "CONDITION_PROFILE_MISMATCH",
+            "H3 execution options differ from the frozen conditioning profile",
+        )
+    return actual
+
+
+def _attention_backend(options):
+    return "+".join(
+        sorted(
+            {
+                "fa4" if options[key] else "torch_sdpa"
+                for key in ("text_fa4", "vision_fa4")
+            }
+        )
+    )
+
+
+def _measure_execution(encoder):
+    """Inspect loaded modules once; never run these checks per request."""
+    from dataclasses import asdict
+
+    import torch
 
     from .contract import ConditionError
 
-    # Remote profiles currently attest BF16 and one attention backend, not the
-    # per-encoder execution options. Require an explicit all-off SDPA baseline;
-    # unset switches now enable the H3 optimizations and cannot be attested here.
-    if not h3_qwen_execution_disabled():
-        raise ConditionError(
-            "CONDITION_PROFILE_MISMATCH",
-            "Remote native conditioning does not support optimized H3 execution "
-            "yet; set all six SGLANG_H3_QWEN_* switches to 0 or use local "
-            "conditioning until execution options are part of the profile",
-        )
+    options = asdict(encoder.execution_options)
+    fp8 = False
+    for name, param in encoder.named_parameters():
+        if not param.is_floating_point() or param.dtype == torch.bfloat16:
+            continue
+        leaf = name.rsplit(".", 1)[-1]
+        if leaf == "weight" and str(param.dtype).startswith("torch.float8"):
+            fp8 = True
+        elif (
+            leaf in {"weight_scale", "weight_scale_inv", "input_scale"}
+            and param.dtype == torch.float32
+        ):
+            continue
+        else:
+            raise ConditionError(
+                "CONDITION_PROFILE_MISMATCH",
+                "Unexpected native encoder weight precision",
+            )
+    options["fp8"] = fp8
+    for part, key in (
+        (encoder.model.language_model, "text_fa4"),
+        (encoder.model.visual, "vision_fa4"),
+    ):
+        backends = set()
+        for module in part.modules():
+            if type(module).__name__ == "Qwen3VLFA4Attention":
+                backends.add("fa4")
+            elif (
+                type(module).__name__ == "QwenVLVisionAttention"
+                and module._attention_impl is None
+            ):
+                # Vision SDPA calls F.scaled_dot_product_attention directly;
+                # unlike text LocalAttention it has no backend enum member.
+                backends.add("torch_sdpa")
+            elif hasattr(module, "backend") and hasattr(module.backend, "name"):
+                backends.add(module.backend.name.lower())
+        if backends != {"fa4" if options[key] else "torch_sdpa"}:
+            raise ConditionError(
+                "CONDITION_PROFILE_MISMATCH",
+                "Loaded Qwen attention differs from execution options",
+            )
+    for layer in encoder.model.language_model.layers:
+        attention = layer.self_attn
+        if (
+            (attention.fused_rope is not None) != options["fused_mrope"]
+            or layer.mlp.fused_gate_up != options["fused_gate_up"]
+            or any(
+                (type(module).__name__ == "Qwen3VLHFRMSNorm") != options["hf_rmsnorm"]
+                for module in (
+                    layer.input_layernorm,
+                    layer.post_attention_layernorm,
+                    layer.self_attn.q_norm,
+                    layer.self_attn.k_norm,
+                )
+            )
+        ):
+            raise ConditionError(
+                "CONDITION_PROFILE_MISMATCH",
+                "Loaded Qwen operators differ from execution options",
+            )
+    return options
 
 
 def build_profile(model_path, numerical_environment, *, projection=None):
@@ -119,11 +212,13 @@ def build_profile(model_path, numerical_environment, *, projection=None):
     from .contract import ConditionError, DeploymentProfile, safe_json
     from .inputs import PREPROCESS_VERSION
 
-    _require_profiled_execution()
-    if numerical_environment.get("backend") != "torch_sdpa":
+    numerical_environment = dict(numerical_environment)
+    numerical_environment.setdefault("execution_options", _execution_options())
+    options = _require_profiled_execution(numerical_environment)
+    if numerical_environment.get("backend") != _attention_backend(options):
         raise ConditionError(
             "CONDITION_PROFILE_MISMATCH",
-            "The remote H3 all-off baseline requires a torch_sdpa profile",
+            "The native attention backend differs from the H3 execution options",
         )
     root = Path(model_path).absolute()
     runtime = safe_json((root / "zing_config.json").read_bytes())
@@ -209,7 +304,7 @@ class NativeConditionEncoder:
     def __init__(self, model_path, profile, *, max_rows=16384, gpu_id=0):
         # Check again when loading a saved profile: the process environment may
         # differ from the one that built it. Reject before CUDA/weight loading.
-        _require_profiled_execution()
+        _require_profiled_execution(profile.document["numerical_environment"])
         import torch
 
         from .contract import ConditionError
@@ -293,7 +388,9 @@ class NativeConditionEncoder:
             ulysses_degree=1,
             ring_degree=1,
             encoder_parallel="replicate",
-            attention_backend=env["backend"],
+            # Explicit H3 choices select FA4 per text/vision module. The generic
+            # loader fallback stays SDPA, including mixed FA4/SDPA profiles.
+            attention_backend="torch_sdpa",
             text_encoder_cpu_offload=False,
             dit_cpu_offload=False,
             vae_cpu_offload=False,
@@ -334,28 +431,17 @@ class NativeConditionEncoder:
         # Actual loader receipt, rather than trusting a CLI parallelism flag.
         from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 
-        if get_tp_world_size() != 1 or any(
-            param.is_floating_point() and param.dtype != torch.bfloat16
-            for param in encoder.parameters()
-        ):
+        measured_options = _measure_execution(encoder)
+        if get_tp_world_size() != 1:
             raise ConditionError(
                 "CONDITION_PROFILE_MISMATCH",
                 "Native encoder TP or resident weight precision differs from the profile",
             )
-        backends = {
-            module.backend.name.lower()
-            for module in encoder.modules()
-            if hasattr(module, "backend") and hasattr(module.backend, "name")
-        }
-        if len(backends) != 1:
-            raise ConditionError(
-                "CONDITION_PROFILE_MISMATCH",
-                "Native encoder has mixed or unobservable attention backends",
-            )
         folding = getattr(encoder.config, "parallel_folding_mode", None)
         self.receipt = receipt | {
             "encoder_tp": get_tp_world_size(),
-            "backend": next(iter(backends)),
+            "backend": _attention_backend(measured_options),
+            "execution_options": measured_options,
             "software": software,
             "folding_mode": folding,
         }

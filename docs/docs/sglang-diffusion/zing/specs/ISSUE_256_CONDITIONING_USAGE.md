@@ -19,6 +19,12 @@ python -m sglang.multimodal_gen.runtime.conditioning.cli warmup --config /intern
 
 ## 服务与 worker 配置
 
+H3 六项优化现由 profile 的 `numerical_environment.execution_options` 冻结，builder
+从 `SGLANG_H3_QWEN_*` 环境解析（默认全开）；构建与启动环境须一致。文本/视觉 FA4
+均关闭、均开启或仅一项开启时，`backend` 分别为 `torch_sdpa`、`fa4`、`fa4+torch_sdpa`。
+`precision=bf16` 与独立 FP8 权重选项并存；加载回执检查实际权重和算子。升级需重建并
+分发 profile，详见 [执行契约及验证边界](../plans/QWEN_REMOTE_EXECUTION_OPTIONS.md)。
+
 服务配置为 JSON：`tokens` 映射私有 bearer token 到 `{tenant,admin}`，`native` 指定 `{model_path,gpu_id}`，`limits` 必须显式填写 **ResourceLimits 的全部字段**，所有值有限、正值且 tenant 不大于 global。字段及默认值由实际代码生成，避免复制过期字段：
 
 ```python

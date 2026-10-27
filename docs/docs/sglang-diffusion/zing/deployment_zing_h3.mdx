@@ -332,9 +332,13 @@ P95 尚无充分结论。Qwen CUDA 区间约减少 32% 来自每组仅一次的�
 编码器 TP=1（`--encoder-parallel replicate`）；不支持时直接报错，不静默降级。
 回退须六项都显式 `0`，使用 BF16 checkpoint、取消其他 FP8 配置；取消变量会再次开启。
 
-远程 native conditioning 的 profile/receipt 尚不包含这些数值选项，因此仅允许六项显式
-全 `0` 且 `torch_sdpa` profile 的基线。`build-profile` 和服务启动时任一项未设置或开启
-均拒绝；升级后重建并分发 profile。此前远程服务“取消变量”的启动方式须相应迁移。
+远程 native conditioning 现将六项布尔选项纳入 profile/加载回执，允许全开、全关与混合配置。
+构建 profile 和启动服务必须使用相同环境；`backend` 对应 `torch_sdpa`、`fa4` 或
+`fa4+torch_sdpa`，FP8 权重由独立字段记录，`precision` 仍为 BF16。升级须重建并分发
+profile，旧文件不能沿用。详见 [remote 执行契约](./plans/QWEN_REMOTE_EXECUTION_OPTIONS.md)。
+当前整理版本未新增 GPU 验证；历史 2026-10-24 r5 的 480p 混合补丁仅证明当时加载及
+完整服务可运行，含六分支联合改动，不能作为本 PR 独立性能收益。当前 480/736 同条件
+整体及分组件性能、显存与质量验收待补；不改变上表硬件部署结论。
 完整实验与正式实现验证状态见[PR #404 报告入口](https://github.com/seedleap/sglang/pull/404)。
 
 ## 证据入口

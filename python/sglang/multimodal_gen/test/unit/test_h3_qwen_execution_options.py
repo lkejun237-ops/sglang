@@ -127,6 +127,50 @@ def test_independent_h3_construction(values, fp8, monkeypatch, fa4_available):
     assert layer.mlp.fused_gate_up == values[2]
 
 
+@pytest.mark.parametrize("values", itertools.product((False, True), repeat=5))
+def test_remote_receipt_observes_constructed_operators(
+    values, monkeypatch, fa4_available
+):
+    from sglang.multimodal_gen.runtime.conditioning.native import _measure_execution
+
+    for field, enabled in zip(fields(Qwen3VLExecutionOptions), values):
+        monkeypatch.setenv(f"SGLANG_H3_QWEN_{field.name.upper()}", str(int(enabled)))
+    encoder = make_h3().to(torch.bfloat16)
+    expected = dict(
+        zip((field.name for field in fields(Qwen3VLExecutionOptions)), values)
+    )
+    assert _measure_execution(encoder) == expected | {"fp8": False}
+    # Precision inspection only: emulate one resident FP8 weight and its scale.
+    # This does not exercise the GPU loader or establish FP8 kernel behavior.
+    linear = encoder.model.language_model.layers[0].self_attn.q_proj
+    linear.weight = nn.Parameter(
+        linear.weight.to(torch.float8_e4m3fn), requires_grad=False
+    )
+    linear.weight_scale = nn.Parameter(torch.ones(1), requires_grad=False)
+    assert _measure_execution(encoder) == expected | {"fp8": True}
+
+
+@pytest.mark.parametrize(
+    "option", [field.name for field in fields(Qwen3VLExecutionOptions)]
+)
+def test_remote_receipt_rejects_declared_but_unloaded_operators(option):
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+    from sglang.multimodal_gen.runtime.conditioning.native import _measure_execution
+
+    encoder = make_h3().to(torch.bfloat16)
+    encoder.execution_options = Qwen3VLExecutionOptions(**{option: True})
+    with pytest.raises(ConditionError, match="Loaded Qwen"):
+        _measure_execution(encoder)
+
+
+def test_remote_receipt_rejects_unexpected_weight_precision():
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+    from sglang.multimodal_gen.runtime.conditioning.native import _measure_execution
+
+    with pytest.raises(ConditionError, match="weight precision"):
+        _measure_execution(make_h3())
+
+
 @pytest.mark.parametrize("invalid", ["", "true", "2", " 1"])
 def test_invalid_option_rejected(invalid, monkeypatch):
     monkeypatch.setenv("SGLANG_H3_QWEN_TEXT_FA4", invalid)

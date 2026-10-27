@@ -3,6 +3,7 @@
 
 import asyncio
 import importlib
+import itertools
 import threading
 
 import pytest
@@ -175,10 +176,10 @@ def test_native_rejects_unprofiled_switches_before_build_and_saved_profile_load(
         pytest.fail("Unprofiled execution must be rejected before CUDA initialization")
 
     monkeypatch.setattr(torch.cuda, "is_available", unexpected_cuda_probe)
-    with pytest.raises(ConditionError, match="set all six") as error:
-        mod.build_profile(root, environment)
+    with pytest.raises(ConditionError, match="execution options differ") as error:
+        mod.build_profile(root, saved_profile.document["numerical_environment"])
     assert error.value.code == "CONDITION_PROFILE_MISMATCH"
-    with pytest.raises(ConditionError, match="set all six"):
+    with pytest.raises(ConditionError, match="execution options differ"):
         mod.NativeConditionEncoder(root, saved_profile)
 
     # Restoring the explicit baseline retains the same asset/profile identity.
@@ -190,8 +191,122 @@ def test_remote_all_off_requires_sdpa_profile(native_profile_assets):
     from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
 
     root, environment = native_profile_assets
-    with pytest.raises(ConditionError, match="torch_sdpa"):
+    with pytest.raises(ConditionError, match="attention backend"):
         api("native").build_profile(root, dict(environment, backend="fa"))
+
+
+def test_native_all_execution_combinations_have_distinct_profiles(
+    native_profile_assets, monkeypatch
+):
+    root, environment = native_profile_assets
+    mod = api("native")
+    names = (
+        "hf_rmsnorm",
+        "fused_mrope",
+        "fused_gate_up",
+        "text_fa4",
+        "vision_fa4",
+        "fp8",
+    )
+    identities = set()
+    for values in itertools.product((False, True), repeat=6):
+        options = dict(zip(names, values))
+        for name, enabled in options.items():
+            monkeypatch.setenv("SGLANG_H3_QWEN_" + name.upper(), str(int(enabled)))
+        profile = mod.build_profile(
+            root, dict(environment, backend=mod._attention_backend(options))
+        )
+        assert profile.document["numerical_environment"]["execution_options"] == options
+        identities.add(profile.profile_id)
+    assert len(identities) == 64
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {},
+        {"fp8": True},
+        dict.fromkeys(
+            (
+                "hf_rmsnorm",
+                "fused_mrope",
+                "fused_gate_up",
+                "text_fa4",
+                "vision_fa4",
+                "fp8",
+            ),
+            0,
+        ),
+    ],
+)
+def test_native_rejects_incomplete_or_non_boolean_execution_options(
+    native_profile_assets, options
+):
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+
+    root, environment = native_profile_assets
+    with pytest.raises(ConditionError):
+        api("native").build_profile(root, dict(environment, execution_options=options))
+
+
+@pytest.mark.parametrize(
+    "text,vision", [(False, False), (True, False), (False, True), (True, True)]
+)
+def test_native_profile_records_options_and_mixed_attention(
+    native_profile_assets, monkeypatch, text, vision
+):
+    root, environment = native_profile_assets
+    mod = api("native")
+    baseline = mod.build_profile(root, environment)
+    monkeypatch.setenv("SGLANG_H3_QWEN_TEXT_FA4", str(int(text)))
+    monkeypatch.setenv("SGLANG_H3_QWEN_VISION_FA4", str(int(vision)))
+    backend = (
+        "fa4"
+        if text and vision
+        else "fa4+torch_sdpa"
+        if text or vision
+        else "torch_sdpa"
+    )
+    profile = mod.build_profile(root, dict(environment, backend=backend))
+    options = profile.document["numerical_environment"]["execution_options"]
+    assert options == dict(
+        hf_rmsnorm=False,
+        fused_mrope=False,
+        fused_gate_up=False,
+        text_fa4=text,
+        vision_fa4=vision,
+        fp8=False,
+    )
+    assert (profile.profile_id != baseline.profile_id) == (text or vision)
+    receipt = dict(profile.document["numerical_environment"], folding_mode=None)
+    mod.validate_runtime_receipt(profile, receipt)
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+
+    with pytest.raises(ConditionError):
+        mod.validate_runtime_receipt(
+            profile, dict(receipt, execution_options=dict(options, fp8=True))
+        )
+
+
+@pytest.mark.parametrize(
+    "option",
+    ["HF_RMSNORM", "FUSED_MROPE", "FUSED_GATE_UP", "TEXT_FA4", "VISION_FA4", "FP8"],
+)
+def test_native_new_profile_accepts_each_optimization(
+    native_profile_assets, monkeypatch, option
+):
+    root, environment = native_profile_assets
+    mod = api("native")
+    baseline = mod.build_profile(root, environment)
+    monkeypatch.setenv("SGLANG_H3_QWEN_" + option, "1")
+    if option in {"TEXT_FA4", "VISION_FA4"}:
+        environment = dict(environment, backend="fa4+torch_sdpa")
+    profile = mod.build_profile(root, environment)
+    assert profile.profile_id != baseline.profile_id
+    assert (
+        profile.document["numerical_environment"]["execution_options"][option.lower()]
+        is True
+    )
 
 
 def test_native_actual_receipt_rejects_fold_backend_precision_and_gpu_mismatch(

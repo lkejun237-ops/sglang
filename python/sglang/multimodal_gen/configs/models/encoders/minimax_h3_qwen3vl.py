@@ -13,6 +13,18 @@ from sglang.multimodal_gen.configs.models.encoders.qwen3vl import (
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 
 
+def h3_qwen_execution_options() -> Qwen3VLExecutionOptions:
+    """Resolve the same H3 choices for profile creation and model construction."""
+    values = {}
+    for item in fields(Qwen3VLExecutionOptions):
+        name = f"SGLANG_H3_QWEN_{item.name.upper()}"
+        value = os.environ.get(name, "1")
+        if value not in ("0", "1"):
+            raise ValueError(f"{name} must be 0 or 1, got {value!r}")
+        values[item.name] = value == "1"
+    return Qwen3VLExecutionOptions(**values)
+
+
 def h3_qwen_execution_disabled() -> bool:
     names = [
         f"SGLANG_H3_QWEN_{item.name.upper()}"

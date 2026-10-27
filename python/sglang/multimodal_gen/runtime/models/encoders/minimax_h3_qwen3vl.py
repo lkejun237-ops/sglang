@@ -4,10 +4,8 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 from collections.abc import Iterable
-from dataclasses import fields
 from typing import Any
 
 import torch
@@ -20,10 +18,12 @@ from sglang.multimodal_gen.configs.models.encoders.base import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
     MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,
     MiniMaxH3Qwen3VLConfig,
-    h3_qwen_fp8_enabled,
 )
-from sglang.multimodal_gen.configs.models.encoders.qwen3vl import (
-    Qwen3VLExecutionOptions,
+from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
+    h3_qwen_execution_options as _execution_options_from_env,
+)
+from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
+    h3_qwen_fp8_enabled,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
@@ -45,17 +45,6 @@ _PARAM_NAMES_MAPPING = {
 }
 _MAP_CHECKPOINT_NAME = get_param_names_mapping(_PARAM_NAMES_MAPPING)
 logger = logging.getLogger(__name__)
-
-
-def _execution_options_from_env() -> Qwen3VLExecutionOptions:
-    values = {}
-    for field in fields(Qwen3VLExecutionOptions):
-        name = f"SGLANG_H3_QWEN_{field.name.upper()}"
-        value = os.environ.get(name, "1")
-        if value not in ("0", "1"):
-            raise ValueError(f"{name} must be 0 or 1, got {value!r}")
-        values[field.name] = value == "1"
-    return Qwen3VLExecutionOptions(**values)
 
 
 def _map_checkpoint_name(name: str) -> str:
