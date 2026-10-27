@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.decoder_worker import (
     _DecodeService,
+    _output_identity,
     _OutputPublisher,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.remote_decoder import (
@@ -537,9 +538,10 @@ def _run_decoder_loop(commands, *, fail_on=None, live=None):
         ),
         _DecodeService=_loop_service(fail_on=fail_on),
         _OutputPublisher=lambda **kw: SimpleNamespace(
-            reserve=lambda **kw: dict(frames=kw["frames"]), close=lambda: None
+            reserve=lambda **kw: dict(frames=kw["frames"], **kw["identity"]),
+            close=lambda: None,
         ),
-        _output_identity=lambda command: {},
+        _output_identity=_output_identity,
         EncoderCommandControl=encoder_control.EncoderCommandControl,
         EncoderControlError=encoder_control.EncoderControlError,
     )
@@ -653,7 +655,13 @@ def test_timed_out_output_releases_owner_before_next_session(monkeypatch):
             source_dependency_end=4,
         )["ok"]
         with pytest.raises(RuntimeError, match="Remote decoder failed"):
-            decoder._request("output", frames=4)
+            decoder._request(
+                "output",
+                frames=4,
+                request_id="request-1",
+                generation_id="generation-1",
+                chunk_index=0,
+            )
         assert live["output_entered"].is_set()
         live["release_output"].set()
         assert request(dict(op="ping"))["busy"] is True
@@ -706,7 +714,13 @@ def test_decoder_loop_acknowledges_every_payload_free_op():
     assert error is None
     assert len(replies) == 6
     assert all(reply is not None and reply.get("ok") is True for reply in replies)
-    assert replies[2]["reference"] == {"frames": 4}
+    assert replies[2]["reference"] == {
+        "frames": 4,
+        "session_id": "owner",
+        "request_id": "request-1",
+        "generation_id": "generation-1",
+        "chunk_index": 0,
+    }
     assert replies[-1]["busy"] is False
 
 

@@ -1152,14 +1152,8 @@ def _run_ready_chunks(
     packer = ZingH3Packer(
         model.arch, num_frame_per_block=[3, 2], split_first_latent=True
     )
-    frames, model_index = 0, 0
-    for batch_index, count in enumerate(batches):
-        if prompt_updates and batch_index in prompt_updates:
-            model_index = 3
-        for _ in range(count):
-            chunk = packer.chunk_plan.chunk(model_index)
-            frames += chunk.end - chunk.start
-            model_index += 1
+    # Prompt changes preserve the global native chunk sequence.
+    frames = packer.chunk_plan.chunk(sum(batches) - 1).end
     torch.manual_seed(input_seed)
     inputs, noise = _inputs(frames), torch.randn(1, 2, frames, 2, 2)
     extra = {}
@@ -1230,14 +1224,10 @@ def _run_ready_chunks(
                     },
                     100 + batch_index,
                 )
-            # The first post-update chunk activates the new epoch before lookahead.
-            groups = (
-                (1, count - 1)
-                if prompt_updates and batch_index in prompt_updates
-                else (count,)
-            )
-            for count in groups:
-                for _ in range(count):
+            # Drain whenever a pending prompt blocks lookahead, including the
+            # old cycle's final chunk before the new epoch can be planned.
+            while count:
+                while count and session.next_chunk_size is not None:
                     start = session.next_latent
                     end = min(frames, start + session.next_chunk_size)
                     session.append(
@@ -1247,6 +1237,7 @@ def _run_ready_chunks(
                         final=known_eos and end == frames,
                     )
                     cursor += 1
+                    count -= 1
                 drain = session.drain_ready()
                 for result in drain:
                     outputs.append(result.visual.clone())
@@ -2451,7 +2442,10 @@ def test_online_prompt_joint_matches_serial_and_replays(
             assert (got is None and want is None) or torch.equal(got, want)
     assert torch.equal(fixed[0], replay[0])
     assert model.prefix_graphs.routes[("prefix_separate", "replay")] == 2
-    assert replay[5][4:7] == [104] * 3
+    assert replay[5][:5] == [None] * 5
+    assert replay[5][5:7] == [104] * 2
+    assert replay[5][7:11] == [107] * 4
+    assert replay[5][11:13] == [110] * 2
     assert replay[5][13:] == [113] * 3
     for actual, expected in zip(replay[1], fixed[1]):
         assert actual[0] == expected[0]
@@ -2493,7 +2487,8 @@ def test_online_prompt_joint_failure_releases_session_and_reuses_slot(
     assert all(v == 0 for v in owned[0].memory_snapshot().values())
     model.prefix_graphs = PrefixJointGraphs(capture_enabled=False)
     result = _run_ready_chunks(model, monkeypatch, **options)
-    assert result[5][4:] == [104] * 6
+    assert result[5][:5] == [None] * 5
+    assert result[5][5:] == [104] * 5
 
 
 def test_online_prompt_joint_unsupported_route_keeps_serial_result(model, monkeypatch):

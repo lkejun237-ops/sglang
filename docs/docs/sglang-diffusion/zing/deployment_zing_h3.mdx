@@ -18,6 +18,19 @@ profile/CLI 也可能覆盖默认值。下表全程四步和 4→1 等结果仍�
 不代表当前默认 4→2 的性能或画质；当前版本 480/736 的配套性能、分组件显存与
 画质尚未在本次变更中重测。
 
+## Prompt 生效的 codec 周期边界
+
+2026-10-26 的周期边界修复基于 `844fdf42b077`：候选 prompt 可随时接收，
+已有五个历史 latent 且下一全局 latent 起点为 5 的倍数时才生效。
+例如在 43 收到更新，旧 prompt 完成 43、44，新 prompt 从 45 开始；
+Decoder 状态继续运行，dispatch 的合并方式不变。实现与验证范围见
+[设计说明](plans/PROMPT_SWITCH_CODEC_BOUNDARY.md)。
+运行时代码 `02a234e7e633` 已在上海 L20Z/SM90 四卡通过三例 832×480 成片验证：
+Qwen+Encoder 一卡、DiT SP2 两卡、独立 Lynn Decoder 一卡，使用 weights-free AdaLN 静态表。
+三例均在 latent 38 收到更新、到 40 才生效，完整输出 360 帧；具体配方、显存采样和
+[视频链接见 PR #430](https://github.com/seedleap/sglang/pull/430)。未测 736、性能或修复前后画质 A/B，
+不能据此认定闪烁已消失。
+
 ## 部署决策矩阵
 
 `E2 + SP2` 表示两张 source Encoder 卡、两张 DiT/Lynn Decoder 卡；

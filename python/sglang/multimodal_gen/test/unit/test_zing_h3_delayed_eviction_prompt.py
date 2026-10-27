@@ -152,7 +152,7 @@ def test_block_and_source_ready_share_latest_wins_and_repeated_rebuilds(model, p
                 if pooled:
                     assert _pointers(storage) == pointers
             assert switches == [12, 13]
-            assert events[3] == (12, 3) and events[4] == (13, 4)
+            assert events[3:6] == [(12, 3), (12, 3), (13, 4)]
             assert spans[0][0] == 0 and spans[-1][1] == 18
             assert all(left[1] == right[0] for left, right in zip(spans, spans[1:]))
             return torch.cat(outputs, dim=2), events, spans
@@ -266,6 +266,8 @@ def test_block_stage_reports_only_applied_prompt_and_drops_superseded_candidates
         }
         assert step("new", 15)[1] == tag(15)
         assert calls == ["new", "bad"]
+        step("old", 16)
+        assert state.prompt == "new"
         step("old", 16)
         assert state.prompt == "old"
         assert calls == ["new", "bad", "old"]

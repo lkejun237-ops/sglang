@@ -1339,7 +1339,7 @@ def test_block_adapter_stops_at_worker_eos_after_repeated_prompt_switches(
         result = stage.forward(batch, None)
         outputs.append(result.output)
         adapter.on_chunk_complete(api, result)
-    assert api.generate_chunk_cnt == api.request.max_chunks == 6
+    assert api.generate_chunk_cnt == api.request.max_chunks == 7
     assert api.adapter_state.complete
     assert worker.get_state(ZingH3RealtimeState).sampling is None
     joined = torch.cat(outputs, dim=2)

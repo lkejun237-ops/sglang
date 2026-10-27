@@ -330,9 +330,9 @@ class _DecodeService:
         self._stream.close()
 
 
-def _output_identity(command):
-    session, generation, request = (
-        command.get("session"),
+def _output_identity(command, *, session):
+    # Later commands carry a channel; the validated owner was saved by open.
+    generation, request = (
         command.get("generation_id"),
         command.get("request_id"),
     )
@@ -586,7 +586,7 @@ def main():
                                     frames=frames,
                                     width=service.width,
                                     height=service.height,
-                                    identity=_output_identity(command),
+                                    identity=_output_identity(command, session=token),
                                 )
                                 metadata = dict(
                                     format="rgb24",

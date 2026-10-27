@@ -227,14 +227,17 @@ class SourceReadySession:
 
     @property
     def prompt_switch_ready(self):
+        # Repacking the last five latents as 0..4 must preserve codec phase.
         return (
             self.recent_visual is not None
             and self.recent_visual.shape[2] == self.prompt_switch_prefix_latent_frames
+            and self.committed_latent % 5 == 0
         )
 
     def _next_model_chunk(self):
         if self.pending:
-            if self.pending_prompt is not None and self.prompt_switch_ready:
+            # Drain queued work before planning the first block of a new epoch.
+            if self.pending_prompt is not None:
                 return None
             previous = self.pending[-1].model_chunk
             return self.plan.chunk(previous.chunk_id + 1)
@@ -262,6 +265,7 @@ class SourceReadySession:
         if (
             self.pending_prompt is None
             or not self.prompt_switch_ready
+            or ready.chunk.start % 5 != 0
             or ready.model_chunk.chunk_id != 3
             or ready.model_chunk.start != 5
         ):

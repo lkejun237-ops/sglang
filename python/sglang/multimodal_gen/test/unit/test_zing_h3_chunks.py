@@ -267,7 +267,7 @@ def test_ready_queue_ownership_budget_prompt_eos(model):
 
 
 @torch.no_grad()
-def test_prompt_switch_waits_for_five_latents_then_rebuilds_latest_epoch(
+def test_prompt_switch_waits_for_complete_cycle_then_rebuilds_latest_epoch(
     model, monkeypatch
 ):
     packer, inputs, noise, _ = _long_request(model, [3, 2], frames=13)
@@ -331,20 +331,92 @@ def test_prompt_switch_waits_for_five_latents_then_rebuilds_latest_epoch(
         2,
         2,
         3,
-        3,
         2,
+        3,
     ]
-    assert [result.prompt_event_id for result in results] == [10, 10, 10, 13, 14, 14]
-    assert [result.prompt_version for result in results] == [1, 1, 1, 4, 5, 5]
+    assert [result.prompt_event_id for result in results] == [10, 10, 10, 13, 13, 14]
+    assert [result.prompt_version for result in results] == [1, 1, 1, 4, 4, 5]
     assert rng_checks == [True, True]
     assert session.pending_prompt is None
-    # The second switch restarts the native 3,2 phase while global output IDs
-    # continue: local target block 10 versus external target block 12.
-    assert session.cache.last_block == 10
+    # The second switch waits until global latent 10, then restarts local 5..7.
+    assert session.cache.last_block == 8
     assert results[-1].chunk.target_block == 12
     assert session.recent_visual.shape[2] == 5
     session.dispose()
     assert session.recent_visual is session.pending_prompt is None
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("joint_forward", ["off", "cross_chunk"])
+@pytest.mark.parametrize("frames", [9, 13])
+def test_mid_cycle_prompt_drains_old_chunk_before_replanning(
+    model, joint_forward, frames
+):
+    packer, inputs, noise, _ = _long_request(model, [3, 2], frames=frames)
+    sampler = ZingH3Sampler(
+        model,
+        packer,
+        solver="few_step",
+        denoising_step_list=[1000, 500],
+        window_chunks=6,
+        sink_chunks=3,
+        joint_forward=joint_forward,
+    )
+    session = SourceReadySession(
+        sampler,
+        inputs,
+        seed=7,
+        max_pending_chunks=2,
+        max_pending_bytes=1 << 20,
+        total_latent_frames=frames,
+        initial_prompt_event_id=0,
+    )
+
+    def append():
+        start = session.next_latent
+        end = start + session.next_chunk_size
+        session.append(
+            inputs.source_visual[:, :, start:end],
+            noise[:, :, start:end],
+            provenance=fixture_provenance(1, end, start, end),
+            final=end == frames,
+        )
+
+    def consume():
+        if joint_forward == "cross_chunk":
+            results = list(session.drain_ready())
+            assert len(results) == 1
+            return results[0]
+        return session.step()
+
+    try:
+        for _ in range(4):
+            append()
+            assert consume().prompt_event_id == 0
+        assert session.committed_latent == 8
+        session.update_prompt(inputs.positive, 1)
+        # Finish the old cycle's 2, clipped only by EOS; never start a new 3 here.
+        assert session.next_chunk_size == min(2, frames - 8)
+        append()
+        # A pending candidate must prevent lookahead from crossing the boundary.
+        assert session.next_chunk_size is None
+        old = consume()
+        assert (old.chunk.start, old.chunk.end, old.prompt_event_id) == (
+            8,
+            min(10, frames),
+            0,
+        )
+        if frames == 9:
+            assert session.next_chunk_size is None
+            assert session.applied_prompt is None
+        else:
+            assert session.next_chunk_size == 3
+            append()
+            new = consume()
+            assert (new.chunk.start, new.chunk.end, new.prompt_event_id) == (10, 13, 1)
+            assert session.pending_prompt is None
+    finally:
+        session.dispose()
 
 
 def test_prompt_switch_rejects_unsupported_prefix_geometry(model):
@@ -451,6 +523,7 @@ def test_reference_switch_rebuild_matches_fresh_cache(model, monkeypatch, ids):
     # A later text-only update keeps the newly committed reference snapshot.
     monkeypatch.setattr(sampler, "rebuild_prompt_prefix", rebuild)
     session.update_prompt(inputs.positive, 2)
+    assert step().prompt_event_id == 1
     assert step().prompt_event_id == 2
     assert session.inputs.visual is candidate.visual
     session.dispose()
