@@ -24,7 +24,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("batch", [6, 14, 30])
+@pytest.mark.parametrize("batch", [6, 12, 14, 28, 30])
 @pytest.mark.parametrize("history", [0, 256, 512])
 @pytest.mark.parametrize("rotary_dtype", [torch.float32, torch.bfloat16])
 @torch.no_grad()
@@ -126,4 +126,4 @@ def test_startup_precompiles_all_supported_preparation_shapes():
     }
     decoder = StreamingDecoder(replace(CONFIG, tile_size=64), architecture)
     decoder.to_compute("cpu", torch.bfloat16).eval().requires_grad_(False)
-    assert decoder.warmup_preparation("cuda:0") == 18
+    assert decoder.warmup_preparation("cuda:0") == 30

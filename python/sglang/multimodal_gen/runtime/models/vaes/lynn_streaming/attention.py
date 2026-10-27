@@ -56,7 +56,7 @@ def _can_fuse_preparation(
     if (
         not q.is_cuda
         or q.dtype != torch.bfloat16
-        or q.shape[0] not in (6, 14, 30)
+        or q.shape[0] not in (6, 12, 14, 28, 30)
         or q.shape[1:] != (261, 32, 64)
         or k.shape != q.shape
         or v.shape != q.shape

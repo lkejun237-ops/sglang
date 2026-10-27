@@ -112,7 +112,7 @@ class StreamingDecoder(nn.Module):
         # Use the model's real RoPE layout, even while its weights reside on CPU.
         rope_device = self.phase_embedding.device
         count = 0
-        for batch in (6, 14, 30):
+        for batch in (6, 12, 14, 28, 30):
             q = torch.zeros(batch, 261, 32, 64, device=device, dtype=torch.bfloat16)
             for history in (0, 256, 512):
                 past = q.new_zeros(batch, history, 32, 64)
