@@ -1,6 +1,7 @@
 # Zing 固定输入客户端基线
 
-客户端测量 TTFF、E2E、FPS、TPOC、ICL；服务端阶段计时见
+客户端测量 TTFF、E2E、FPS、TPOC、ICL，以及连续 source 的 Prompt-switch TTFF；
+服务端阶段计时见
 [阶段计时说明](STAGE_TIMING.md)。参考官方
 [serving benchmark](https://docs.sglang.io/docs/developer_guide/benchmark_and_profiling#benchmark)
 的常驻服务、预热、重复请求及逐请求记录方式；协议差异使此入口独立于文本
@@ -21,9 +22,47 @@ TPOC、ICL 中位数/P95 与样本量，以及 **Encoder、DiT、Decoder 三部�
 采集开销；重叠阶段不相加成 E2E，microbenchmark 不能替代端到端结论。
 
 连续 source 使用 `bench_streaming_source.py` 及 `build_streaming_report.py`，补充
-source-to-output 延迟、tail drain、credit wait、播放停顿等适用指标。有限输入与
-连续 source 分开比较。保存命令、源码 SHA、配置、预热/正式次数、失败与未执行数、
+source-to-output 延迟、tail drain、credit wait、播放停顿，以及有 prompt 切换时的
+**Prompt-switch TTFF**。有限输入与连续 source 分开比较。保存命令、源码 SHA、配置、预热/正式次数、失败与未执行数、
 原始 JSON 和报告；未采到的指标标为未测。
+
+## Prompt-switch TTFF（完整帧批次接收口径）
+
+连续 source 入口使用 `bench_streaming_source.py --prompt-updates updates.json`；
+清单按 `source_frame_start` 递增安排更新，例如：
+
+```json
+[{"source_frame_start": 48, "prompt": "Change the lighting to blue."}]
+```
+
+位置表示客户端提交到该 source 帧边界时发送更新，不保证模型在该帧切换。
+更新采用唯一 `event_id`；以输出中实际携带该事件的首个帧批次匹配，ACK 不算生效。
+
+```text
+Prompt-switch TTFF / ms = 1000 × (
+    客户端完整收到首个匹配 event_id 的帧批次 payload 的 monotonic 时间
+  − 客户端发送该 prompt 前的 monotonic 时间
+)
+```
+
+计时包含序列化、发送队列等待、上传、服务端等待/条件编码/生成和输出传输；
+排除本地参考图片文件读取、浏览器解码和渲染。缺少后续 source 时的等待也包含在内，
+因此 baseline/candidate 必须固定 source 节奏、切换位置和帧批次配置。
+同一批次含多帧时须等完整 payload 收到，不能解释为该批第一帧字节到达时间。
+该指标证明新条件被采用，不证明画面语义已成功变化；视觉效果须单独验收。
+
+JSON 的正式字段为 `prompt_switch_ttff_ms`（此前名为 `prompt_update_latency_ms`，
+计时算法不变）。单次客户端 summary、`prompt-updates.json` 和请求 `streaming`
+均保留分布；`summary.json` 的 `streaming.prompt_switch_ttff_ms` 按成功正式会话
+中的 applied **事件**汇总，报告中展示中位数/P95/事件样本量及逐事件记录。
+样本不是会话数，不平均每会话的中位数或 P95。480、736 及各 case 分开报告。
+
+`prompt_updates` 保留 `event_id`、`submitted_seconds`、`received_seconds`、
+`latency_ms`、`output_frame_start` 和 `pts_us`，以及
+`applied / rejected / superseded / not_observed / interrupted` 状态。
+失败会话与预热不进入正式分布；被覆盖、拒绝或未观察到的更新不记为零延迟。
+无更新时分布样本数为 0，不代表零延迟。HTML 保留正式轮的逐事件状态，包括失败会话。
+旧报告仍可按逐事件 `latency_ms` 展示相同计时口径。
 
 ## 当前默认采样口径
 

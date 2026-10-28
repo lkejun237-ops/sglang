@@ -330,11 +330,11 @@
       ? promptLatencies[low] + (promptLatencies[high] - promptLatencies[low]) * (position - low)
       : null;
     $("prompt-updates").innerHTML = promptRows.length
-      ? "<p>applied 样本 " + promptLatencies.length + "；中位数 " + fmt(median(promptLatencies))
+      ? "<p>Prompt-switch TTFF · applied 样本 " + promptLatencies.length + "；中位数 " + fmt(median(promptLatencies))
         + " ms；P95 " + fmt(p95) + " ms</p>" + cellTable(
           promptRows.map((u) => [u.run, u.event_id, u.status, fmt(u.submitted_seconds, 4),
             u.output_frame_start ?? "—", u.pts_us ?? "—", fmt(u.received_seconds, 4), fmt(u.latency_ms)]),
-          ["轮次", "event_id", "状态", "提交 / s", "首帧序号", "视频PTS / µs", "收到 / s", "延迟 / ms"],
+          ["轮次", "event_id", "状态", "提交 / s", "首批起始帧", "视频PTS / µs", "完整帧批次收到 / s", "Prompt-switch TTFF / ms"],
         )
       : "<p class='muted'>未记录 prompt 更新，不计为零延迟。</p>";
     $("warmups").innerHTML = cellTable(

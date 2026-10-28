@@ -212,7 +212,7 @@ async def benchmark(cases, args):
                                     "dependency_to_output_seconds",
                                     "source_to_output_seconds",
                                     "prompt_updates",
-                                    "prompt_update_latency_ms",
+                                    "prompt_switch_ttff_ms",
                                     "prompt_update_status_counts",
                                 )
                             },
@@ -340,6 +340,14 @@ async def benchmark(cases, args):
                 key: distribution([row["streaming"][key] for row in passed])
                 for key in STREAM_METRICS
             }
+            summary[case["label"]]["streaming"]["prompt_switch_ttff_ms"] = distribution(
+                [
+                    update["latency_ms"]
+                    for row in passed
+                    for update in row["streaming"]["prompt_updates"]
+                    if update["status"] == "applied"
+                ]
+            )
             summary[case["label"]]["init_send_to_rgb"] = {
                 key: distribution(
                     [

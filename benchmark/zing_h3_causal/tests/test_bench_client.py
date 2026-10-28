@@ -413,6 +413,7 @@ async def streaming_peer(
     missing_completion=False,
     prompt_modes=None,
     max_references=21,
+    first_payload_delay=0,
 ):
     """Protocol peer: echo bytes, with bounded credit; it is not a model."""
     import asyncio
@@ -540,6 +541,8 @@ async def streaming_peer(
                 ],
             )
         )
+        if start == 0 and first_payload_delay:
+            await asyncio.sleep(first_payload_delay)
         await ws.send(packet["data"])
 
 
@@ -701,7 +704,7 @@ def test_streaming_client_delivers_before_eos_and_obeys_credit(
             and row["pts_us"] == row["output_frame_start"] * 1_000_000 // 24
             for row in outcomes
         )
-        assert result["prompt_update_latency_ms"]["count"] == 3
+        assert result["prompt_switch_ttff_ms"]["count"] == 3
         source_position = 0
         positions = []
         event_ids = []
@@ -713,6 +716,10 @@ def test_streaming_client_delivers_before_eos_and_obeys_credit(
                 positions.append(source_position)
         assert positions == [1, 3, 5]
         assert event_ids == sorted(set(event_ids))
+    else:
+        assert result["prompt_switch_ttff_ms"]["count"] == 0
+        assert result["prompt_switch_ttff_ms"]["median"] is None
+        assert result["prompt_switch_ttff_ms"]["p95"] is None
 
 
 @pytest.mark.parametrize(
@@ -822,7 +829,7 @@ def test_prompt_delivery_outcomes_exclude_rejected_superseded_and_unobserved(tmp
         "applied",
         "not_observed",
     ]
-    assert result["prompt_update_latency_ms"]["count"] == 2
+    assert result["prompt_switch_ttff_ms"]["count"] == 2
     assert all(row["latency_ms"] is None for row in rows if row["status"] != "applied")
     assert result["prompt_update_status_counts"]["rejected"] == 1
     assert (
@@ -873,6 +880,7 @@ def test_prompt_latency_includes_send_wait_and_retains_interrupted_outcome(
                 [],
                 disconnect=disconnect,
                 prompt_modes={"update": "skip"} if disconnect else None,
+                first_payload_delay=0.04,
             ),
             "127.0.0.1",
             0,
@@ -900,14 +908,15 @@ def test_prompt_latency_includes_send_wait_and_retains_interrupted_outcome(
                     await run(args)
             else:
                 result = await run(args)
-                assert result["prompt_updates"][0]["latency_ms"] >= 40
+                assert result["prompt_updates"][0]["latency_ms"] >= 80
+                assert "frame-batch payload" in result["prompt_update_timing_scope"]
 
     asyncio.run(exercise())
     report = json.loads((tmp_path / "result/prompt-updates.json").read_text())
     assert report["prompt_updates"][0]["status"] == (
         "interrupted" if disconnect else "applied"
     )
-    assert report["prompt_update_latency_ms"]["count"] == (0 if disconnect else 1)
+    assert report["prompt_switch_ttff_ms"]["count"] == (0 if disconnect else 1)
     if disconnect:
         assert report["prompt_updates"][0]["latency_ms"] is None
 
@@ -1155,7 +1164,7 @@ def test_streaming_benchmark_keeps_warmup_out_of_summary_and_exports(
                     pts_us=0,
                 )
             ],
-            prompt_update_latency_ms=dict(count=1, median=1000, p95=1000),
+            prompt_switch_ttff_ms=dict(count=1, median=1000, p95=1000),
             prompt_update_status_counts=dict(applied=1),
         )
 
@@ -1204,9 +1213,10 @@ def test_streaming_benchmark_keeps_warmup_out_of_summary_and_exports(
     assert (
         exported["requests"][1]["streaming"]["prompt_updates"][0]["latency_ms"] == 1000
     )
-    assert (
-        exported["requests"][1]["streaming"]["prompt_update_latency_ms"]["count"] == 1
-    )
+    assert exported["requests"][1]["streaming"]["prompt_switch_ttff_ms"]["count"] == 1
+    assert summary["5s"]["streaming"]["prompt_switch_ttff_ms"]["count"] == 3
+    assert summary["5s"]["streaming"]["prompt_switch_ttff_ms"]["median"] == 1000
+    assert "Prompt-switch TTFF" in (tmp_path / "results.html").read_text()
     assert (tmp_path / "results.html").is_file()
     assert (
         json.loads((tmp_path / "report.json").read_text())["data"]["kind"]

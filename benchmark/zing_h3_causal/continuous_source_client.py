@@ -684,7 +684,7 @@ async def exchange(args, output, started, read_source, received_file, trace):
             updates = list(prompt_results.values())
             prompt_metrics = dict(
                 prompt_updates=updates,
-                prompt_update_latency_ms=distribution(
+                prompt_switch_ttff_ms=distribution(
                     [row["latency_ms"] for row in updates if row["status"] == "applied"]
                 ),
                 prompt_update_status_counts={
@@ -697,7 +697,7 @@ async def exchange(args, output, started, read_source, received_file, trace):
                         "interrupted",
                     )
                 },
-                prompt_update_timing_scope="client before send to complete first matching frame payload; excludes image-file reads and browser rendering",
+                prompt_update_timing_scope="client monotonic before prompt send to complete first matching frame-batch payload; includes serialization, writer waiting and upload; excludes image-file reads, browser decoding and rendering",
             )
             (output / "prompt-updates.json").write_text(
                 json.dumps(prompt_metrics, indent=2)

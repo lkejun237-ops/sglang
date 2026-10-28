@@ -258,6 +258,20 @@ prefix/KV 容量和 Graph/offload/compile；只改变本 PR 要测试的因素�
 通过 `report --memory-run` 与已有结果合并查看。采集轮与关闭采集后的正式计时分开。
 这次整理未补跑 GPU，也未改变部署配方；历史冻结数据不证明新 worker launcher 已通过 GPU 验收。
 
+### Prompt-switch TTFF
+
+2026-10-28，benchmark `92e6f46657` 正式使用 `prompt_switch_ttff_ms`：同一客户端
+monotonic 时钟下，从发送新 prompt 前到完整收到首个匹配 `event_id` 的帧批次 payload。
+多帧批次须整批收完；包含序列化、发送等待、上传、服务端等待/生成与回传，排除本地
+参考图文件读取、浏览器解码与渲染。ACK 不代表切换生效，事件匹配也不证明画面语义变化。
+
+连续 source 使用 `bench_streaming_source.py --prompt-updates updates.json`，按成功正式会话
+中的 applied 事件汇总中位数/P95/事件样本量；预热、失败及非 applied 事件不计入分布，
+逐事件状态保留，无样本不记为零延迟。480/736 分开，baseline/candidate 固定 source 节奏、
+切换位置与传输批次配置。此变更不修改推理或计时算法，128 项 CPU 客户端/报告回归通过；
+当前版本两档 GPU 切换延迟均未实测，不新增性能或画质结论。
+字段与完整口径见 [PR #450](https://github.com/seedleap/sglang/pull/450)。
+
 ## 已有速度观测
 
 这些数字用于选实验起点，不构成跨硬件排名；各组采样、窗口和版本不同。
@@ -417,7 +431,9 @@ E2E 从 **69.198 / 155.479 秒**降至 **67.688 / 150.922 秒**。
 
 ## 后续 PR 如何维护
 
-对 Zing H3 性能或显存有影响的 PR，必须在同一 PR 更新本页受影响的决策、数字或验证状态。
+后续 Zing H3 变更统一同步维护本页的相关部署策略、API 行为、benchmark 指标与验证状态；
+详细契约和操作说明通过链接引用，不只更新 benchmark 文档。
+对性能或显存有影响的 PR，必须在同一 PR 更新本页受影响的决策、数字或验证状态。
 范围包括权重常驻、Qwen/Encoder/Decoder 布局、KV、attention、Graph、精度、编译与采样默认值。
 即使尚未跑 GPU，也要写明受影响行“当前版本未验证”，保留旧数字对应的版本，不能直接沿用为新结论。
 
