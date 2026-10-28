@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import hashlib
 import json
-import os
 import time
 from contextlib import contextmanager, nullcontext
 
@@ -148,7 +147,28 @@ class ZingH3GenerationStage(PipelineStage):
             max_sessions=server_args.realtime_max_sessions_per_worker,
         )
         if config is None:
+            logger.info("Zing Block0 cache skipped: no GPU KV pool configured")
             return
+        from sglang.multimodal_gen.runtime.conditioning.worker import (
+            coordinate_validation,
+        )
+
+        from .block0_identity import startup_config
+
+        block0 = config_error = None
+        try:
+            block0 = startup_config(server_args)
+        except Exception as exc:
+            config_error = str(exc)
+        receipts = coordinate_validation(
+            (config_error, None if block0 is None else (*block0[:2], str(block0[2])))
+        )
+        if any(error is not None for error, _ in receipts) or any(
+            value != receipts[0] for value in receipts
+        ):
+            raise ValueError(
+                f"Block0 startup configuration differs or is invalid: {receipts}"
+            )
         from sglang.multimodal_gen.runtime.distributed.parallel_state import (
             get_sp_parallel_rank,
             get_ulysses_parallel_world_size,
@@ -222,14 +242,42 @@ class ZingH3GenerationStage(PipelineStage):
             ),
         )
         self.kv_pool = pool
-        cache_mode = os.environ.get("SGLANG_ZING_BLOCK0_CACHE_MODE", "off")
-        if cache_mode != "off":
+        if block0 is not None:
+            from .block0_identity import build_identity, fingerprint
+            from .disk_cache import Block0DiskCache
             from .preparation_cache import Block0PreparationCache
 
-            self.block0_cache = Block0PreparationCache(
-                pool,
-                cache_mode,
-                entries=int(os.environ.get("SGLANG_ZING_BLOCK0_CACHE_ENTRIES", "6")),
+            host_bytes, disk_bytes, root = block0
+            identity = build_identity(self, server_args, device=layout["device"])
+            owner = error = None
+            try:
+                disk = Block0DiskCache(
+                    root,
+                    max_bytes=disk_bytes,
+                    identity=identity,
+                    rank=get_sp_parallel_rank(),
+                    world_size=identity["layout"]["sp"],
+                )
+                owner = Block0PreparationCache(
+                    pool,
+                    max_bytes=host_bytes // identity["layout"]["sp"],
+                    identity=identity,
+                    disk_cache=disk,
+                )
+            except Exception as exc:
+                error = str(exc)
+            errors = coordinate_validation(error)
+            if any(value is not None for value in errors):
+                raise ValueError(f"Block0 startup failed: {errors}")
+            self.block0_cache = owner
+            logger.info(
+                "Zing Block0 cache ready: model=%s layout=%s pinned_bytes_per_rank=%d slots=%d root=%s disk_bytes=%d",
+                fingerprint(identity["model"]),
+                fingerprint(identity["layout"]),
+                owner.data.numel() * owner.data.element_size(),
+                owner.data.shape[0],
+                root,
+                disk_bytes,
             )
 
     def kv_request(self, sampler, inputs, layout, *, source_shape, total_frames):

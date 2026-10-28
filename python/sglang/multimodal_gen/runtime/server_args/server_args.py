@@ -474,6 +474,12 @@ class ServerArgs(DisaggServerArgsMixin):
     conditioning_expected_profile: str | None = None
     zing_conditioning_local_cache_bytes: int = 256 << 20
     zing_reference_cache_bytes: int = 256 << 20
+    # Only used when a Zing GPU KV pool is configured. GB means 10**9 bytes;
+    # the host budget covers all SP ranks in this deployment, not each rank.
+    zing_block0_cache_mode: str = "on"
+    zing_block0_cache_host_gb: float | None = None
+    zing_block0_cache_dir: str | None = None
+    zing_block0_cache_disk_gb: float | None = None
     conditioning_service_url: str | None = None
     conditioning_config: str | None = field(default=None, repr=False)
     realtime_max_message_bytes: int = DEFAULT_MESSAGE_BYTES
@@ -2118,6 +2124,30 @@ class ServerArgs(DisaggServerArgsMixin):
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         from sglang.multimodal_gen.configs.zing_sampling import parse_noise_grid
+
+        parser.add_argument(
+            "--zing-block0-cache-mode",
+            choices=("on", "off"),
+            default=ServerArgs.zing_block0_cache_mode,
+            help="Enable Block0 CPU/disk caching when a Zing GPU KV pool exists (default: on).",
+        )
+        parser.add_argument(
+            "--zing-block0-cache-host-gb",
+            type=float,
+            default=None,
+            help="Required with Block0 caching: pinned KV budget in decimal GB across all SP ranks (e.g. 800).",
+        )
+        parser.add_argument(
+            "--zing-block0-cache-dir",
+            default=None,
+            help="Required with Block0 caching: an existing directory on mounted shared storage (CPFS).",
+        )
+        parser.add_argument(
+            "--zing-block0-cache-disk-gb",
+            type=float,
+            default=None,
+            help="Required with Block0 caching: decimal GB budget for the entire cache root; no entry-count limit.",
+        )
 
         parser.add_argument(
             "--zing-solver", choices=["euler", "few_step"], default=None

@@ -5,6 +5,7 @@ import hashlib
 import json
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -12,10 +13,12 @@ from pathlib import Path
 
 import torch
 
-from sglang.multimodal_gen.runtime.conditioning.worker import coordinate_validation
+from sglang.multimodal_gen.runtime.conditioning.worker import (
+    broadcast_receipt,
+    coordinate_validation,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
-from .disk_cache import Block0DiskCache
 from .media_input import _local_media
 
 logger = init_logger(__name__)
@@ -114,6 +117,7 @@ class PreparationEntry:
     model_signature: object
     data: torch.Tensor
     slot: int
+    generation: str
 
 
 @dataclass
@@ -182,20 +186,32 @@ class Block0PreparationCache:
     published L1 entry is written back to disk on a daemon thread.
     """
 
-    def __init__(self, pool, mode, *, entries=6):
-        if mode not in {"late", "early", "overlap"}:
-            raise ValueError("Block0 cache mode must be off, late, early or overlap")
-        if type(entries) is not int or entries < 1:
-            raise ValueError("Block0 cache entries must be a positive integer")
-        self.mode = mode
+    def __init__(self, pool, *, max_bytes, identity, disk_cache):
+        if type(max_bytes) is not int or max_bytes < 1:
+            raise ValueError("Block0 cache byte budget must be a positive integer")
+        self.mode = "on"
+        self.identity = identity
         self.entries = OrderedDict()
         self.pending = None
         self.hits = self.misses = self.evictions = 0
-        self.disk_cache = Block0DiskCache()
+        self.disk_cache = disk_cache
         self._disk_tasks = {}
         # Reserve once, before readiness, instead of pinning gigabytes on a request.
         stores = pool._pool._slots[0].kv_cache
         first = stores[0].k
+        slot_bytes = (
+            len(stores)
+            * 2
+            * pool.plan.config.max_prefix_rows
+            * first[0].numel()
+            * first.element_size()
+        )
+        entries = max_bytes // slot_bytes
+        if entries < 1:
+            raise ValueError(
+                "Block0 host budget cannot hold one maximum-prefix KV slot"
+            )
+        self.max_bytes = max_bytes
         self.data = torch.empty(
             (
                 entries,
@@ -264,13 +280,22 @@ class Block0PreparationCache:
             positions = conditions.get("positions")
             if inputs is None or not isinstance(positions, torch.Tensor):
                 return None
+            if (
+                positions.ndim != 2
+                or positions.shape[1] != 3
+                or not torch.isfinite(positions).all()
+            ):
+                return None
             rows = int(positions.shape[0])
             if rows < 1 or rows > self.data.shape[3]:
                 return None
             slot = self._take_slot(key)
             try:
+                # A disk read runs on the CPU, outside the DMA stream. Fence
+                # earlier H2D reads before overwriting the reused pinned slot.
+                self.stream.synchronize()
                 data = self.data[slot, :, :, :rows]
-                cached.load_kv_into(data, rank=disk.local_rank)
+                disk.load_kv_into(cached, data)
             except BaseException:
                 self.free_slots.append(slot)
                 raise
@@ -285,6 +310,7 @@ class Block0PreparationCache:
                 None,
                 data,
                 slot,
+                cached.manifest["generation"],
             )
             self.entries[key] = entry
             return entry
@@ -311,8 +337,6 @@ class Block0PreparationCache:
                 k.copy_(entry.data[layer, 0], non_blocking=True)
                 v.copy_(entry.data[layer, 1], non_blocking=True)
             end.record()
-        if self.mode == "early":
-            end.synchronize()  # Serial ablation; overlap waits only at consumption.
         return PrefixRestore(
             entry,
             begin,
@@ -343,6 +367,7 @@ class Block0PreparationCache:
             cache._model_signature,
             data,
             slot,
+            broadcast_receipt(uuid.uuid4().hex),
         )
         self.stream.wait_stream(torch.cuda.current_stream(prefix.positions.device))
         done = torch.cuda.Event()
@@ -395,6 +420,8 @@ class Block0PreparationCache:
             "positions": entry.positions,
         }
         manifest = {
+            "identity": self.identity,
+            "generation": entry.generation,
             "sp_world_size": disk.sp_world_size,
             "geometry": _block0_geometry(entry),
             "prompt_preview": _prompt_preview(entry.request),

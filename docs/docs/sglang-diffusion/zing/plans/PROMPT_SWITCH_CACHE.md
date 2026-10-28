@@ -1,5 +1,9 @@
 # Zing H3 prompt switch Block0 cache
 
+> 本页保留 #445 及之前版本的设计/实验记录。当前默认开关、启动参数、字节预算和持久身份
+> 以 [Block0 Cache 默认方案](/docs/sglang-diffusion/zing/plans/BLOCK0_CACHE_DEFAULTS) 为准；
+> 下文的 late/early/overlap 和旧环境变量不是当前生产配置入口。
+
 2026-10-27，当前 `feat/zing-preparation-cache` 工作区实现。基于 `df0f677e97` 的初始
 Block0 cache 接入继续修改；本版按评审收敛到同一个 cache、一个内容 key、原位恢复和串行历史重建。
 

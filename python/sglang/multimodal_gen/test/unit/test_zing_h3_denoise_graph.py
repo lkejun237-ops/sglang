@@ -44,6 +44,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
 )
 from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import allocate_layer_stores
 from sglang.multimodal_gen.test.unit.realtime.test_zing_prompt_switch_cache import (  # noqa: F401
+    cpu_cache,
     cpu_dma,
 )
 from sglang.multimodal_gen.test.unit.test_zing_h3_kv_pool_cache import _inputs
@@ -2887,9 +2888,6 @@ def test_block0_provider_routes_start_and_prompt_cycle(
     from sglang.multimodal_gen.runtime.models.dits.zing_h3_prefix_graph import (
         PrefixJointGraphs,
     )
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.preparation_cache import (
-        Block0PreparationCache,
-    )
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.source_session import (
         ZingSourceStreamState,
     )
@@ -2914,11 +2912,7 @@ def test_block0_provider_routes_start_and_prompt_cycle(
 
     def provider(sampler):
         stores = _storage(model)
-        pool = NS(
-            _pool=NS(_slots=[NS(kv_cache=stores)]),
-            plan=NS(config=NS(max_prefix_rows=stores[0].rows)),
-        )
-        owner = Block0PreparationCache(pool, "overlap", entries=2)
+        owner = cpu_cache(stores, entries=2, rows=stores[0].rows)
         state = ZingSourceStreamState()
         state.block0_cache = owner
         state.sampler = NS(sampler=sampler, applied_prompt=None)

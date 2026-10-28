@@ -20,3 +20,5 @@
 其他设计与契约见 [specs/](specs/)。运行时内部流式设计见
 [STREAMING_DESIGN.md](../../../../python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/zing_h3/STREAMING_DESIGN.md)。
 测试输入、复现工具和验收记录保留在 [Zing benchmark](../../../../benchmark/zing_h3_causal/README.md)。
+
+Block0 Cache 后续默认开关、容量与身份方案见 [默认缓存方案](plans/BLOCK0_CACHE_DEFAULTS.md)，验证状态见 [CPU 记录](/benchmark/zing_h3_causal/BLOCK0_CACHE_DEFAULTS_VALIDATION)。

@@ -1,5 +1,9 @@
 # Block0 CPU 缓存与请求提前分流
 
+> 本页保留 #445 及之前版本的设计/实验记录。当前默认开关、启动参数、字节预算和持久身份
+> 以 [Block0 Cache 默认方案](/docs/sglang-diffusion/zing/plans/BLOCK0_CACHE_DEFAULTS) 为准；
+> 下文的 late/early/overlap 和旧环境变量不是当前生产配置入口。
+
 状态：2026-10-27，基于 `df0f677e97` 的工作区 MVP 已接入，默认关闭，GPU 对照进行中。
 一个部署同时一个活跃会话；首版只保留一个完整 CPU 条目。
 

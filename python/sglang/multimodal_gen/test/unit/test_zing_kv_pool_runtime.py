@@ -301,7 +301,9 @@ def test_stage_allocates_the_pool_and_logs_readiness(monkeypatch, caplog):
     )
     stage.config = pipeline
     server_args = SimpleNamespace(
-        pipeline_config=pipeline, realtime_max_sessions_per_worker=2
+        pipeline_config=pipeline,
+        realtime_max_sessions_per_worker=2,
+        zing_block0_cache_mode="off",
     )
     with caplog.at_level(logging.INFO):
         stage.initialize_realtime_kv_cache_pool(server_args)

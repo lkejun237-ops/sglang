@@ -339,6 +339,7 @@ def test_internal_prefill_miss_then_hit_runs_only_prefix_and_releases_lease():
     events, entries = [], {}
     generator = torch.nn.Linear(1, 1)
     cache = NS(
+        identity={"model": {"dit": "fixture"}, "layout": {"sp": 1}},
         lookup=lambda key: entries.get(key),
         entries=entries,
         finish_fill=lambda: events.append("fill-done"),

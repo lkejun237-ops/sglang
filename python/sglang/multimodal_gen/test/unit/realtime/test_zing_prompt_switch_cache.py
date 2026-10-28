@@ -2,6 +2,7 @@
 """Shared startup/switch cache: real CPU KV arithmetic and transport stand-ins."""
 
 import json
+import os
 import time
 from contextlib import nullcontext
 from types import SimpleNamespace as NS
@@ -79,7 +80,23 @@ def cpu_cache(storage, *, entries=6, rows=32):
         _pool=NS(_slots=[NS(kv_cache=storage)]),
         plan=NS(config=NS(max_prefix_rows=rows)),
     )
-    return Block0PreparationCache(pool, "overlap", entries=entries)
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.disk_cache import (
+        Block0DiskCache,
+    )
+
+    identity = {"model": {"fixture": "model"}, "layout": {"sp": 1}}
+    root = os.environ.get("SGLANG_ZING_DISK_CACHE_DIR")
+    disk = None
+    if root:
+        from pathlib import Path
+
+        Path(root).mkdir(parents=True, exist_ok=True)
+        disk = Block0DiskCache(root, max_bytes=1 << 30, identity=identity)
+    first = storage[0].k
+    slot_bytes = len(storage) * 2 * rows * first[0].numel() * first.element_size()
+    return Block0PreparationCache(
+        pool, max_bytes=entries * slot_bytes, identity=identity, disk_cache=disk
+    )
 
 
 def test_lru_reuses_preallocated_slots_and_waits_for_fill(cpu_dma):
@@ -120,14 +137,14 @@ def test_lru_reuses_preallocated_slots_and_waits_for_fill(cpu_dma):
     assert owner.evictions == 1
 
 
-@pytest.mark.parametrize("entries", [0, -1, True, 1.5])
-def test_reject_invalid_entry_capacity(entries):
+@pytest.mark.parametrize("budget", [0, -1, True, 1.5])
+def test_reject_invalid_byte_capacity(budget):
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.preparation_cache import (
         Block0PreparationCache,
     )
 
     with pytest.raises(ValueError, match="positive integer"):
-        Block0PreparationCache(None, "overlap", entries=entries)
+        Block0PreparationCache(None, max_bytes=budget, identity={}, disk_cache=None)
 
 
 def test_partial_sp_hit_falls_back(cpu_dma, monkeypatch):
@@ -589,27 +606,46 @@ def disk_cache(tmp_path, monkeypatch, **env):
         Block0DiskCache,
     )
 
-    monkeypatch.setenv("SGLANG_ZING_DISK_CACHE_DIR", str(tmp_path / "disk"))
-    for name, value in env.items():
-        monkeypatch.setenv(name, str(value))
-    return Block0DiskCache()
+    root = tmp_path / "disk"
+    root.mkdir(parents=True, exist_ok=True)
+    return Block0DiskCache(
+        root,
+        max_bytes=1 << 30,
+        identity={"model": {"fixture": "model"}, "layout": {"sp": 1}},
+    )
 
 
 def disk_commit(cache, key, value=1.0, rows=3, layers=2, rank=0):
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.disk_cache import (
         Block0DiskCache,
     )
+    from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import ZingKVRequest
 
     assert isinstance(cache, Block0DiskCache)
     kv = torch.full((layers, 2, rows, 2, 2), value, dtype=torch.bfloat16)
     tmp = cache.new_tmp_dir(key)
     path = cache.save_rank_kv(key, rank, kv, tmp)
+    prepared = inputs()
+    prepared.positive["context"] = torch.full((rows, 4), value, dtype=torch.bfloat16)
     conditions = {
-        "identity": f"{key}-condition",
-        "inputs": torch.full((rows,), value, dtype=torch.bfloat16),
+        "conditioning_identity": f"{key}-condition",
+        "inputs": prepared,
+        "request": ZingKVRequest(
+            target_height=32,
+            target_width=32,
+            source_shape=(32, 32),
+            prefix_rows=rows,
+            window_chunks=6,
+            sink_chunks=3,
+            rope_position_mode="block_relative",
+            rope_max_frame_gap=12,
+        ),
         "positions": torch.arange(rows).reshape(rows, 1).repeat(1, 3),
     }
     manifest = {
+        "identity": cache.identity,
+        "generation": "fixture-" + key,
+        "sp_world_size": cache.sp_world_size,
         "geometry": {"prefix_rows": rows},
         "prompt_preview": f"prompt-{key}",
     }
@@ -623,7 +659,7 @@ def test_disk_cache_roundtrip_complete_marker_and_index(tmp_path, monkeypatch):
     key = "abcdef012345"
     kv, entry = disk_commit(cache, key, value=2.5)
 
-    folder = cache.cache_dir / key[:2] / key
+    folder = cache._entry_dir(key)
     assert folder.is_dir()
     assert (folder / ".complete").is_file()
     assert not any(cache.tmp_root.iterdir())
@@ -632,7 +668,6 @@ def test_disk_cache_roundtrip_complete_marker_and_index(tmp_path, monkeypatch):
         "early_key",
         "created_at",
         "last_accessed_at",
-        "size_bytes",
         "sp_world_size",
         "geometry",
         "prompt_preview",
@@ -640,14 +675,13 @@ def test_disk_cache_roundtrip_complete_marker_and_index(tmp_path, monkeypatch):
         assert name in manifest
     assert manifest["early_key"] == key
     assert manifest["sp_world_size"] == 1
-    assert manifest["size_bytes"] == entry["size_bytes"]
 
     index = json.loads((cache.cache_dir / "lru_index.json").read_text())
-    assert index["version"] == 1
+    assert index["version"] == 2
     assert index["stats"]["total_entries"] == 1
 
     assert index["stats"]["total_bytes"] == entry["size_bytes"]
-    assert index["stats"]["max_entries"] == cache.max_entries
+    assert "max_entries" not in index["stats"]
     assert index["stats"]["max_bytes"] == cache.max_bytes
     assert [item["key"] for item in index["entries"]] == [key]
 
@@ -656,7 +690,7 @@ def test_disk_cache_roundtrip_complete_marker_and_index(tmp_path, monkeypatch):
     restored = torch.zeros_like(kv)
     assert hit.load_kv_into(restored) is restored
     assert torch.equal(restored, kv)
-    assert hit.conditions["identity"] == f"{key}-condition"
+    assert hit.conditions["conditioning_identity"] == f"{key}-condition"
     assert hit.manifest["early_key"] == key
     accessed = json.loads((cache.cache_dir / "lru_index.json").read_text())
     assert (
@@ -673,13 +707,13 @@ def test_disk_prefetch_hint_is_local_read_only_and_not_a_validated_hit(
     assert not cache.may_contain(key)
     disk_commit(cache, key)
     index = cache.index_path.read_bytes()
-    folder = cache.cache_dir / key[:2] / key
+    folder = cache._entry_dir(key)
     assert cache.may_contain(key)
     assert cache.index_path.read_bytes() == index
-    cache._rank = 1
+    cache.local_rank = 1
     assert not cache.may_contain(key)  # Another rank's KV is not this shard.
-    cache._rank = 0
-    (folder / "conditions.pt").write_bytes(b"corrupt")
+    cache.local_rank = 0
+    (folder / "rank-0/conditions.pt").write_bytes(b"corrupt")
     assert cache.may_contain(key)  # A hint must still be validated by the owner.
     assert cache.lookup(key) is None
     (folder / ".complete").unlink()
@@ -700,37 +734,23 @@ def test_disk_index_self_heals_when_missing_or_corrupt(tmp_path, monkeypatch):
     index_path.write_text("{not json")
     assert cache.lookup(key, 0) is not None
     rebuilt = json.loads(index_path.read_text())
-    assert rebuilt["version"] == 1
+    assert rebuilt["version"] == 2
     assert [item["key"] for item in rebuilt["entries"]] == [key]
 
 
-def test_disk_lru_evicts_by_entries_and_bytes(tmp_path, monkeypatch):
-    cache = disk_cache(tmp_path, monkeypatch, SGLANG_ZING_DISK_CACHE_MAX_ENTRIES=2)
+def test_disk_lru_evicts_only_by_bytes(tmp_path, monkeypatch):
+    cache = disk_cache(tmp_path, monkeypatch)
     for key in ("a1", "b2", "c3"):
         disk_commit(cache, key)
-        time.sleep(0.002)
-    keys = [
-        item["key"]
-        for item in json.loads((cache.cache_dir / "lru_index.json").read_text())[
-            "entries"
-        ]
-    ]
-    assert keys == ["b2", "c3"]
-    assert not (cache.cache_dir / "a1"[:2] / "a1").exists()
-    assert (cache.cache_dir / "c3"[:2] / "c3" / ".complete").is_file()
-
-    byte_cache = disk_cache(tmp_path / "bytes", monkeypatch)
-    _, first = disk_commit(byte_cache, "d4")
-    byte_cache.max_bytes = int(first["size_bytes"] * 1.5)
-    disk_commit(byte_cache, "e5")
-    keys = [
-        item["key"]
-        for item in json.loads((byte_cache.cache_dir / "lru_index.json").read_text())[
-            "entries"
-        ]
-    ]
-    assert keys == ["e5"]
-    assert not (byte_cache.cache_dir / "d4"[:2] / "d4").exists()
+    index = json.loads(cache.index_path.read_text())
+    assert len(index["entries"]) == 3
+    assert "max_entries" not in index["stats"]
+    cache.max_bytes = int(index["stats"]["total_bytes"] * 0.6)
+    disk_commit(cache, "d4")
+    index = json.loads(cache.index_path.read_text())
+    assert index["stats"]["total_bytes"] <= cache.max_bytes
+    assert not cache._entry_dir("a1").exists()
+    assert cache.lookup("d4") is not None
 
 
 def test_l2_disk_hit_promotes_into_l1_and_matches_values(
@@ -788,11 +808,14 @@ def test_l2_restore_rebinds_process_local_signature(
     owner.fill("restart", inputs(), "condition", "pool-request", source)
     owner.finish_fill()
     owner.wait_for_disk()
-    path = owner.disk_cache._entry_dir("restart") / "conditions.pt"
-    conditions = torch.load(path, weights_only=False)
+    path = owner.disk_cache._entry_dir("restart") / "rank-0" / "conditions.pt"
+    payload = torch.load(path, weights_only=True)
+    conditions = payload["conditions"]
     if legacy_signature:
-        conditions["model_signature"] = old_signature
-        torch.save(conditions, path)
+        # Runtime signatures are no longer serializable objects. Even a plain
+        # representation supplied in a new-format file must never be imported.
+        conditions["model_signature"] = repr(old_signature)
+        torch.save(payload, path)
     else:
         assert "model_signature" not in conditions
 
@@ -822,20 +845,17 @@ def test_l2_restore_rebinds_process_local_signature(
         restarted._bind_cache(destination, positions)
 
 
-def test_disk_cache_fails_open_on_invalid_path(tmp_path, monkeypatch):
-    blocked = tmp_path / "not-a-directory"
-    blocked.write_text("x")
-    monkeypatch.setenv("SGLANG_ZING_DISK_CACHE_DIR", str(blocked))
+def test_disk_cache_rejects_invalid_root_at_startup(tmp_path, monkeypatch):
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.disk_cache import (
         Block0DiskCache,
     )
 
-    cache = Block0DiskCache()
-    assert not cache.is_enabled()
-    assert cache.lookup("safe", 0) is None
-    assert cache.new_tmp_dir("safe") is None
-    assert cache.save_rank_kv("safe", 0, torch.zeros(2), None) is None
-    assert cache.commit_entry("safe", {}, {}, None, None) is None
+    blocked = tmp_path / "file"
+    blocked.write_bytes(b"not a directory")
+    with pytest.raises(ValueError, match="already exist"):
+        Block0DiskCache(
+            blocked, max_bytes=1 << 20, identity={"model": {}, "layout": {}}
+        )
 
 
 def test_dispose_drains_transfers_before_releasing_gpu_slot():

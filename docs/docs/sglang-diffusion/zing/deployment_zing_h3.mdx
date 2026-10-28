@@ -18,6 +18,29 @@ profile/CLI 也可能覆盖默认值。下表全程四步和 4→1 等结果仍�
 不代表当前默认 4→2 的性能或画质；当前请求准备缓存的 H100 验证状态见下一节，
 画质尚未在本次变更中做人工验收。
 
+## Block0 Cache 默认启用（Draft，当前版本未验证）
+
+2026-10-28，基于 `5e66d5e2c3` 的后续改动：有 GPU KV pool 时默认启用 pinned CPU +
+磁盘 Block0 缓存；没有 pool 时跳过缓存，服务继续启动。生产只保留 `on/off`，开启统一 overlap。
+启用时必须在启动参数显式给出 `--zing-block0-cache-host-gb`、`--zing-block0-cache-dir`、
+`--zing-block0-cache-disk-gb`。路径由部署先挂载 CPFS 并创建，缺参数/未挂载/不可写/分配失败退出。
+GB 为十进制，pinned KV 预算按整个部署而非每 rank 计；上海 H100 机型规格为 2048 GB 内存，
+建议从整部署 800 GB 起配（SP2 每 rank 约 400 GB，实际按完整槽位向下取整），
+不代表当前容器一定可分配 800 GB。磁盘仅按总字节数淘汰，无 50 条上限。
+同一根目录的部署应使用相同磁盘预算，避免不同 worker 的容量策略冲突。
+
+每次启动复用 AdaLN 已验证的 DiT identity，补 Qwen/VAE 资产扫描；身份与数值/布局不兼容、
+缺 rank 或旧格式磁盘条目一律 miss。原 `SGLANG_ZING_BLOCK0_CACHE_*` / `SGLANG_ZING_DISK_CACHE_*`
+开关迁移到上述服务参数；下文旧版本的环境变量与结果仅为历史记录。
+conditioning 文件改用基础数据与 Tensor 协议及 `weights_only=True`，不加载任意 Python 对象；
+旧条件格式直接 miss。目录写权限由部署控制。L1/L2 淘汰与槽位策略留到后续 PR。
+针对 `e17d9f166b` 的 GitHub Actions `40705343014` 两轮 CPU 契约每轮 87 项通过、无失败/跳过，
+覆盖寻址、字节预算、重启恢复、SP2 分片完整性及安全条件加载；完整 CI 状态见 PR 检查。
+**800 GB pinned 分配、CPFS 实机、480/736 GPU 数值与性能均未测**；本轮按用户决定只验缓存 CPU 契约。
+Encoder/DiT/Decoder 的新耗时和常驻/峰值显存均未测，不能沿用下文旧收益作为本版验收。
+设计与配置见[默认缓存方案](/docs/sglang-diffusion/zing/plans/BLOCK0_CACHE_DEFAULTS)，
+测试范围和当前状态见[CPU 验证记录](/benchmark/zing_h3_causal/BLOCK0_CACHE_DEFAULTS_VALIDATION)。
+
 ## 固定 case 的请求准备缓存
 
 Qwen 继续使用现有 CPU conditioning LRU；local 模式在日志 `Zing Qwen cache` 输出

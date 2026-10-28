@@ -247,6 +247,7 @@ class ZingH3CausalPipeline(ComposedPipelineBase):
             reference_cache_bytes=server_args.zing_reference_cache_bytes,
         )
         stage.conditioning_loader_receipt = self.conditioning_loader_receipt
+        stage.model_path = self.model_path
         stage.deployment_sampling = {
             "solver": server_args.zing_solver,
             "denoising_step_list": server_args.zing_denoising_step_list,

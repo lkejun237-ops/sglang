@@ -77,17 +77,21 @@ def test_cpu_snapshot_retains_pixels_and_owns_prepared_tensors():
     assert frozen.condition_media[0]["frames"].sum() == 12
 
 
-@pytest.mark.parametrize("mode", ["late", "early", "overlap"])
 @pytest.mark.parametrize("joint", [False, True])
 @pytest.mark.parametrize("cache_enabled", [False, True])
 @pytest.mark.parametrize("joint_forward", ["off", "cross_chunk"])
 def test_startup_wires_cache_without_gating_joint(
-    monkeypatch, mode, joint, cache_enabled, joint_forward
+    monkeypatch, joint, cache_enabled, joint_forward
 ):
     prepared = inputs()
     condition = WorkerConditioningState()
     entry = NS(inputs=prepared, conditioning_identity="cached", request=object())
-    owner = NS(mode=mode, lookup=Mock(return_value=entry), restore=Mock())
+    owner = NS(
+        mode="on",
+        identity={"model": "fixture", "layout": {}},
+        lookup=Mock(return_value=entry),
+        restore=Mock(),
+    )
     lease = NS(kv_cache=object())
     sampler = NS(
         window_policy=NS(window_chunks=6, sink_chunks=3),
@@ -141,12 +145,10 @@ def test_startup_wires_cache_without_gating_joint(
         session=NS(get_or_create_state=lambda _: condition),
     )
     state.initialize(stage, batch, dict(width=32, height=32, fps=24))
-    assert codecs.prepare.call_count == int(not cache_enabled or mode == "late")
-    assert stage._conditioning_consumer.call_count == int(
-        not cache_enabled or mode == "late"
-    )
-    assert stage.kv_pool.acquire.call_count == int(cache_enabled and mode != "late")
-    assert owner.restore.call_count == int(cache_enabled and mode != "late")
+    assert codecs.prepare.call_count == int(not cache_enabled)
+    assert stage._conditioning_consumer.call_count == int(not cache_enabled)
+    assert stage.kv_pool.acquire.call_count == int(cache_enabled)
+    assert owner.restore.call_count == int(cache_enabled)
     assert build_ready.call_args.kwargs["prompt_joint"] is joint
     cached_joint = joint and joint_forward == "cross_chunk"
     assert build_ready.call_args.kwargs["prefix_loader"] == (
@@ -158,7 +160,7 @@ def test_startup_wires_cache_without_gating_joint(
     assert hasattr(ready, "restore_initial_prefix") is (
         cache_enabled and not cached_joint
     )
-    if cache_enabled and mode != "late":
+    if cache_enabled:
         assert condition.identity == "cached"
         assert condition.positive is state.inputs.positive
         stage.kv_pool.acquire.assert_called_once_with(batch.session, entry.request)
@@ -173,7 +175,9 @@ def test_joint_policy_is_independent_of_cache(
 ):
     monkeypatch.setenv("SGLANG_ZING_SOURCE_PROMPT_JOINT", str(int(env_joint)))
     stage = NS(
-        block0_cache=object() if cache_enabled else None,
+        block0_cache=NS(identity={"model": "fixture", "layout": {}})
+        if cache_enabled
+        else None,
         codecs=NS(video_decoder_name="lynn"),
     )
     sampler = NS(

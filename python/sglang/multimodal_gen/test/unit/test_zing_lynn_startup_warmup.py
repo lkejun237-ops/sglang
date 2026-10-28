@@ -33,6 +33,7 @@ def test_lynn_preparation_precedes_pool_and_readiness(monkeypatch, fails):
         pipeline_module, "ZingH3GenerationStage", lambda *a, **kw: stage
     )
     pipeline = object.__new__(pipeline_module.ZingH3CausalPipeline)
+    pipeline.model_path = "/unused/zing-model"
     pipeline.modules = {}
     pipeline.conditioning_mode = "local"
     pipeline.zing_runtime = {}
@@ -54,6 +55,7 @@ def test_lynn_preparation_precedes_pool_and_readiness(monkeypatch, fails):
     else:
         pipeline.create_pipeline_stages(args)
         assert calls == ["sampler", "warmup", "pool", "stage"]
+    assert stage.model_path == pipeline.model_path
 
 
 @pytest.mark.parametrize(

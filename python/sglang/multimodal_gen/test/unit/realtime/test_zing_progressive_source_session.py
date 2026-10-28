@@ -920,7 +920,9 @@ def test_block0_prefill_and_live_session_share_command_policy_key(monkeypatch, e
         raise LookupBoundary()
 
     stage = NS(
-        block0_cache=NS(lookup=lookup),
+        block0_cache=NS(
+            lookup=lookup, identity={"model": {"dit": "fixture"}, "layout": {"sp": 1}}
+        ),
         _validate_sampling_params=lambda params: None,
         _build_realtime_sampler=lambda params: NS(
             joint_forward="cross_chunk" if enabled else "off",

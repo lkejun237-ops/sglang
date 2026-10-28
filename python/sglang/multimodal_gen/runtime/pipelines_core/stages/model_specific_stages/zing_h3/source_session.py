@@ -88,6 +88,11 @@ def _source_key_policy(stage, sampler, work_quantum, command):
     }
     if getattr(sampler, "joint_forward", "off") != "off":
         policy["joint_forward"] = sampler.joint_forward
+    cache = getattr(stage, "block0_cache", None)
+    if cache is not None:
+        from .block0_identity import fingerprint
+
+        policy["block0_identity"] = fingerprint(cache.identity)
     return policy, defer_final, prompt_joint
 
 
@@ -174,7 +179,7 @@ class ZingSourceStreamState(BaseRealtimeState):
             )
             self.block0_entry = self.block0_cache.lookup(self.block0_key)
             self.block0_lookup_ms = (time.perf_counter() - started) * 1000
-        if self.block0_entry is None or self.block0_cache.mode == "late":
+        if self.block0_entry is None:
             self.inputs = stage.codecs.prepare(
                 request,
                 prepare_use,
@@ -188,8 +193,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                 WorkerConditioningState,
             )
 
-            # Even the late timing ablation consumes the preparation that
-            # produced the cached KV, not a potentially different VAE sample.
+            # Consume the preparation that produced the cached KV.
             device = next(stage.modules["transformer"].parameters()).device
             self.inputs = inputs_on(self.block0_entry.inputs, device)
             condition = batch.session.get_or_create_state(WorkerConditioningState)
@@ -268,15 +272,14 @@ class ZingSourceStreamState(BaseRealtimeState):
         if self.block0_entry is not None:
             if not cached_joint:
                 self.sampler.restore_initial_prefix = self._restore_block0
-            if self.block0_cache.mode != "late":
-                # The fixed case's previous admission already resolved its layout.
-                self.kv_lease = stage.kv_pool.acquire(
-                    batch.session, self.block0_entry.request
-                )
-                self.sampler.cache = self.sampler._new_cache(self.kv_lease.kv_cache)
-                self.block0_restore = self.block0_cache.restore(
-                    self.sampler.cache, self.block0_entry
-                )
+            # The cached admission already resolved its layout.
+            self.kv_lease = stage.kv_pool.acquire(
+                batch.session, self.block0_entry.request
+            )
+            self.sampler.cache = self.sampler._new_cache(self.kv_lease.kv_cache)
+            self.block0_restore = self.block0_cache.restore(
+                self.sampler.cache, self.block0_entry
+            )
         elif self.block0_cache is not None:
             self.sampler.capture_initial_prefix = self._remember_block0
         endpoint = command.get("conditioning_prefetch_endpoint")
@@ -1419,8 +1422,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                             mode=self.block0_cache.mode,
                             key=self.block0_key,
                             hit=self.block0_entry is not None,
-                            prepare_bypassed=self.block0_entry is not None
-                            and self.block0_cache.mode != "late",
+                            prepare_bypassed=self.block0_entry is not None,
                             lookup_host_ms=self.block0_lookup_ms,
                             restore_submit_host_ms=None
                             if transfer is None
