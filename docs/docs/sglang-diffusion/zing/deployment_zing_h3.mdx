@@ -649,6 +649,14 @@ prompt 切换仍清空会话缓存，因此切换当次冷填充、后续相同�
 详见[兼容设计与验证](plans/PREFIX_JOINT_ADALN_TABLE.md)。
 
 
+### 外部 prompt/reference KV 的联合消费（2026-10-27，开发中）
+
+内部 `prefix_loader` 在单活跃会话的启动/切换安全边界将已命中的静态 KV 发布到本 rank 的租用池。
+启动命中后联合执行 source 与 target 首步；切换命中后联合重建 1/2/2 的五 latent 历史并执行 source 与 target 首步，不重算静态 prefix。
+2026-10-28 对接 PR #445 `2d70a4575e`，替代 #441 单条目缓存：联合执行与缓存独立控制。设置 `SGLANG_ZING_SOURCE_PROMPT_JOINT=1`（默认 0；source command 的 `prompt_joint` 可显式覆盖），在受支持的 cross_chunk 路径上，关缓存及未命中均走六分支，命中走五分支。缓存默认 `SGLANG_ZING_BLOCK0_CACHE_MODE=off`，配置 KV pool 并设置 `overlap` 启用；仅开缓存不会自动打开联合执行。启动命中使用二分支，启动未命中保持 prefix 单独计算后执行二分支。五／六分支保留 AdaLN 静态表、动态投影缓存与 history RoPE；fixed/Graph 在捕获外解析投影。缓存 key、L1/L2、恢复和新 epoch 首帧后写回完全沿用 #445。历史 r8 `bf65c97431` 的 off 组实际为串行重建、on 命中组为五分支，2208.979/894.188 ms 同时包含缓存与联合执行变化；当前开关解耦版本 GPU 性能尚未重测，不作为六分支对五分支的性能证据。配置、验证与版本边界见 [专属设计](specs/CACHED_PREFIX_JOINT.md)。
+480/736 当前代码的 GPU 数值、真实 Graph/NCCL、整体及 Encoder/DiT/Decoder 时间和显存均未测，不声明性能收益，也未修改在线服务。
+接入契约、CPU 验证与后续验收见 [外部前缀 KV 联合执行](specs/CACHED_PREFIX_JOINT.md)。
+
 ### DiT 前序融合量化与 Per-Token Scale 验证边界（2026-10-23，PR #414）
 
 PR #414 将 `seedleap-kernels` 的前序融合算子接入 Zing H3 DiT 主循环（`_main_block`）中，消除了 RMSNorm、AdaLN scale/shift 索引调制、残差加法与 FP8 动态量化间的碎片化访存与中间张量开销，并在 `MiniMaxH3MLP` 中接入 SwiGLU + FP8 动态量化融合。

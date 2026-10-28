@@ -211,6 +211,16 @@ class Block0PreparationCache:
         self.stream = torch.cuda.Stream(device=first.device)
         self.free_slots = list(reversed(range(entries)))
 
+    def may_contain(self, key):
+        """CPU-only hint for speculative work; lookup remains authoritative.
+
+        Never finish a pending CUDA fill or run a collective on the prefetch
+        thread. Eviction and partial-rank hits simply fall back at the boundary.
+        """
+        return key in self.entries or (
+            self.disk_cache is not None and self.disk_cache.may_contain(key)
+        )
+
     def lookup(self, key):
         self.finish_fill()
         local = self.entries.get(key)

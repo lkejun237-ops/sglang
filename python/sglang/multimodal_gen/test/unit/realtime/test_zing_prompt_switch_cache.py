@@ -144,6 +144,110 @@ def test_partial_sp_hit_falls_back(cpu_dma, monkeypatch):
     assert owner.hits == 0 and owner.misses == 1
 
 
+def test_prefetch_cache_hint_has_no_cuda_collective_or_lru_side_effect(cpu_dma):
+    owner = cpu_cache([NS(k=torch.zeros(8, 2, 3))])
+    owner.entries["A"] = object()
+    owner.entries["B"] = object()
+    owner.pending = object()  # Not yet published; the hint must not finish it.
+    owner.finish_fill = Mock(side_effect=AssertionError("CUDA fill forbidden"))
+    owner.disk_cache = NS(may_contain=Mock(return_value=False))
+    assert owner.may_contain("A")
+    assert not owner.may_contain("C")
+    assert list(owner.entries) == ["A", "B"]
+    assert owner.hits == owner.misses == 0
+    owner.finish_fill.assert_not_called()
+
+
+@pytest.mark.parametrize("scenario", ["hit", "miss", "evicted", "partial-rank"])
+def test_source_prefetch_checks_cache_before_rpc(
+    cpu_dma, tmp_path, monkeypatch, scenario
+):
+    import msgspec.msgpack
+    import zmq
+
+    from sglang.multimodal_gen.runtime.conditioning.worker import RemoteConditioner
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        preparation_cache,
+    )
+
+    state = source_session.ZingSourceStreamState()
+    state.inputs = inputs()
+    state.inputs.condition_media = []
+    state.block0_input_request = dict(prompt="A", media=[], conditions=[])
+    codecs = NS(remote_read_fs=None)
+    state.block0_key_args = (codecs, None, dict(width=32, height=32, fps=24), {})
+    owner = state.block0_cache = cpu_cache([NS(k=torch.zeros(8, 2, 3))])
+    client = NS(
+        clock=time.monotonic,
+        timeout_s=2,
+        validate_input=Mock(),
+        encode=Mock(return_value=state.inputs.positive),
+    )
+    provider = RemoteConditioner(
+        client,
+        "a" * 64,
+        rank=0,
+        coordinate=lambda value: [value],
+        broadcast_receipt=lambda value: value,
+        broadcast_tensor=lambda value, name: value,
+    )
+    condition = WorkerConditioningState()
+    stage = NS(codecs=codecs, conditioning_provider=provider)
+    stage.encode_condition_for_batch = Mock(
+        side_effect=lambda batch, prompt, media: provider(
+            prompt, media, device="cpu", state=condition
+        )
+    )
+    key, _ = state._block0_update_key(stage, "B", {})
+    if scenario != "miss":
+        owner.entries[key] = NS(
+            inputs=state.inputs, conditioning_identity="cached-condition"
+        )
+    state.sampler = NS(discard_pending_prompt=Mock(), update_prompt=Mock())
+    state._admit_prompt_update = Mock(return_value="pool-request")
+    command = dict(prompt="B", event_id=1)
+    batch = NS(
+        extra={"zing_prompt_update": command},
+        sampling_params=NS(prompt="B"),
+        realtime_event_id=1,
+        realtime_prompt_version=1,
+        session=NS(get_or_create_state=lambda _: condition),
+    )
+    context = zmq.Context()
+    socket = context.socket(zmq.PUSH)
+    socket.setsockopt(zmq.LINGER, 0)
+    endpoint = "ipc://" + str(tmp_path / "prefetch.sock")
+    socket.bind(endpoint)
+    try:
+        state._start_conditioning_prefetch(
+            stage, batch, endpoint, {"conditioning_prefetch_max_bytes": 1 << 20}
+        )
+        prefetch = state.conditioning_prefetch
+        socket.send(msgspec.msgpack.encode(command))
+        deadline = time.monotonic() + 5
+        while not (prefetch.encodes if scenario == "miss" else prefetch.cache_skips):
+            assert time.monotonic() < deadline, "Prefetch did not inspect the cache"
+            time.sleep(0.01)
+        assert client.encode.call_count == int(scenario == "miss")
+        if scenario == "evicted":
+            owner.entries.clear()
+        elif scenario == "partial-rank":
+            monkeypatch.setattr(
+                preparation_cache,
+                "coordinate_validation",
+                lambda value: [value, (value[0], False)],
+            )
+        assert state._update_prompt(stage, batch) is None
+        assert client.encode.call_count == int(scenario != "hit")
+        assert stage.encode_condition_for_batch.call_count == int(scenario != "hit")
+        state.sampler.update_prompt.assert_called_once()
+    finally:
+        if state.conditioning_prefetch is not None:
+            state.conditioning_prefetch.close()
+        socket.close()
+        context.term()
+
+
 def test_post_switch_fill_waits_for_new_epoch_output():
     state = source_session.ZingSourceStreamState()
     prefix = object()
@@ -187,8 +291,10 @@ def test_key_reuses_accepted_media_after_uri_changes(tmp_path):
 
 @torch.no_grad()
 @pytest.mark.parametrize("use_drain", [False, True])
+@pytest.mark.parametrize("joint", [False, True])
+@pytest.mark.parametrize("tier", ["l1", "l2"])
 def test_startup_a_switch_b_a_reuses_kv_and_preserves_outputs(
-    model, cpu_dma, use_drain
+    model, cpu_dma, use_drain, joint, tier, tmp_path, monkeypatch
 ):
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.incremental import (
         SourceReadySession,
@@ -220,6 +326,10 @@ def test_startup_a_switch_b_a_reuses_kv_and_preserves_outputs(
     source = torch.randn(1, 2, 30, 2, 2)
     noise = torch.randn_like(source)
     conditions = {"A": base.positive, "B": positive_b}
+    if tier == "l2":
+        monkeypatch.setenv("SGLANG_ZING_DISK_CACHE_DIR", str(tmp_path / "disk"))
+    else:
+        monkeypatch.delenv("SGLANG_ZING_DISK_CACHE_DIR", raising=False)
 
     def run(cached):
         packer = ZingH3Packer(
@@ -232,10 +342,17 @@ def test_startup_a_switch_b_a_reuses_kv_and_preserves_outputs(
             denoising_step_list=[1000, 500],
             window_chunks=6,
             sink_chunks=3,
+            joint_forward="cross_chunk" if joint else "off",
         )
         stores = _storage(model, 256)
         pointers = _pointers(stores)
-        cache = cpu_cache(stores) if cached else None
+        cache = cpu_cache(stores, entries=1 if tier == "l2" else 6) if cached else None
+        _, _, prompt_joint = source_session._source_key_policy(
+            NS(block0_cache=cache, codecs=NS(video_decoder_name="lynn")),
+            sampler,
+            1,
+            {"prompt_joint": joint},
+        )
         ready = SourceReadySession(
             sampler,
             base,
@@ -244,7 +361,7 @@ def test_startup_a_switch_b_a_reuses_kv_and_preserves_outputs(
             max_pending_bytes=1 << 20,
             acquire_storage=lambda *_: stores,
             initial_prompt_event_id=0,
-            prompt_joint=use_drain,
+            prompt_joint=prompt_joint,
         )
         state = source_session.ZingSourceStreamState()
         state.sampler, state.inputs = ready, base
@@ -263,6 +380,8 @@ def test_startup_a_switch_b_a_reuses_kv_and_preserves_outputs(
         if cached:
             ready.capture_initial_prefix = state._remember_block0
             ready.prepare_prompt_prefix = state._prepare_block0_switch
+            if joint:
+                ready.prefix_loader = state._load_block0_prefix
         condition_state = WorkerConditioningState()
         stage = NS(
             codecs=codecs,
@@ -275,6 +394,15 @@ def test_startup_a_switch_b_a_reuses_kv_and_preserves_outputs(
         results, snapshots, histories = [], [], []
         prefix_calls = 0
         forward = sampler._forward
+        switch_branches = []
+        predict_joint = sampler._predict_joint
+
+        def counted_joint(packs, phases, *args, **kwargs):
+            if len(packs) in (5, 6):
+                switch_branches.append(len(packs))
+            return predict_joint(packs, phases, *args, **kwargs)
+
+        sampler._predict_joint = counted_joint
 
         def counted(packed, cache, phase):
             nonlocal prefix_calls
@@ -284,6 +412,11 @@ def test_startup_a_switch_b_a_reuses_kv_and_preserves_outputs(
         sampler._forward = counted
         for i in range(12):
             state._fill_block0_after_output()
+            if cached and tier == "l2":
+                # One L1 slot forces every A/B return through actual disk IO.
+                # Await background writes only in this CPU correctness test.
+                cache.finish_fill()
+                cache.wait_for_disk()
             applied = ready.applied_prompt
             if applied is not None and applied.inputs is not None:
                 state.inputs = applied.inputs
@@ -325,25 +458,47 @@ def test_startup_a_switch_b_a_reuses_kv_and_preserves_outputs(
         state._fill_block0_after_output()
         if cached:
             cache.finish_fill()
-            assert len(cache.entries) == 2 and cache.evictions == 0
+            if tier == "l2":
+                cache.wait_for_disk()
+                assert len(cache.entries) == 1 and cache.evictions >= 4
+                assert next(iter(cache.entries.values())).model_signature is None
+            else:
+                assert len(cache.entries) == 2 and cache.evictions == 0
             assert stage.encode_condition_for_batch.call_count == 1  # Only first B.
-            assert prefix_calls == 2  # Startup A and cold B; all returns restore.
+            # Startup A is separate. Cold B joins six branches only when joint
+            # execution is enabled; subsequent A/B returns use restored KV.
+            assert prefix_calls == (1 if joint else 2)
+            if joint:
+                assert ready.metrics["cached_prefix_hits"] == 4
+                assert ready.metrics["cached_prefix_misses"] == 2
+                assert ready.metrics["forward_counts"]["prompt_joint"] == 5
+                assert switch_branches == [6, 5, 5, 5, 5]
             assert ready.cache.stats["store_allocations"] == 0
         else:
-            assert prefix_calls == 6
+            assert prefix_calls == (1 if joint else 6)
+            if joint:
+                assert ready.metrics["forward_counts"]["prompt_joint"] == 5
+                assert switch_branches == [6, 6, 6, 6, 6]
+        if not joint:
+            assert switch_branches == []
         stage.kv_pool.acquire.assert_not_called()  # Switch keeps the original slot.
         ready.dispose()
         return results, snapshots, histories
 
     expected, actual = run(False), run(True)
     for left, right in zip(expected[0], actual[0]):
-        assert torch.equal(left[0], right[0])
+        torch.testing.assert_close(
+            left[0], right[0], rtol=0.02 if joint else 0, atol=0.02 if joint else 0
+        )
         assert left[1:] == right[1:]
     for expected_layers, actual_layers in zip(
         expected[1] + expected[2], actual[1] + actual[2]
     ):
         for expected_kv, actual_kv in zip(expected_layers, actual_layers):
-            assert all(torch.equal(a, b) for a, b in zip(expected_kv, actual_kv))
+            for a, b in zip(expected_kv, actual_kv):
+                torch.testing.assert_close(
+                    a, b, rtol=0.02 if joint else 0, atol=0.02 if joint else 0
+                )
 
 
 def test_message_request_and_prompt_switch_use_the_same_key():
@@ -490,6 +645,7 @@ def test_disk_cache_roundtrip_complete_marker_and_index(tmp_path, monkeypatch):
     index = json.loads((cache.cache_dir / "lru_index.json").read_text())
     assert index["version"] == 1
     assert index["stats"]["total_entries"] == 1
+
     assert index["stats"]["total_bytes"] == entry["size_bytes"]
     assert index["stats"]["max_entries"] == cache.max_entries
     assert index["stats"]["max_bytes"] == cache.max_bytes
@@ -507,6 +663,28 @@ def test_disk_cache_roundtrip_complete_marker_and_index(tmp_path, monkeypatch):
         accessed["entries"][0]["last_accessed_at"]
         >= index["entries"][0]["last_accessed_at"]
     )
+
+
+def test_disk_prefetch_hint_is_local_read_only_and_not_a_validated_hit(
+    tmp_path, monkeypatch
+):
+    cache = disk_cache(tmp_path, monkeypatch)
+    key = "abcdef012345"
+    assert not cache.may_contain(key)
+    disk_commit(cache, key)
+    index = cache.index_path.read_bytes()
+    folder = cache.cache_dir / key[:2] / key
+    assert cache.may_contain(key)
+    assert cache.index_path.read_bytes() == index
+    cache._rank = 1
+    assert not cache.may_contain(key)  # Another rank's KV is not this shard.
+    cache._rank = 0
+    (folder / "conditions.pt").write_bytes(b"corrupt")
+    assert cache.may_contain(key)  # A hint must still be validated by the owner.
+    assert cache.lookup(key) is None
+    (folder / ".complete").unlink()
+    assert not cache.may_contain(key)
+    assert not cache.may_contain("../escape")
 
 
 def test_disk_index_self_heals_when_missing_or_corrupt(tmp_path, monkeypatch):

@@ -1,10 +1,10 @@
 # Prompt 切换六分支组件与在线接入
 
-六分支将 conditions、五个 latent 的 1/2/2 三块历史、source、target 首步合为一次 DiT forward。在线 source 设置 `SGLANG_ZING_SOURCE_PROMPT_JOINT=1` 启用；默认 0，保留串行对照。续推由 `SOURCE_DEFER_FINAL` 单独控制，无融合 attention kernel。
+六分支将 conditions、五个 latent 的 1/2/2 三块历史、source、target 首步合为一次 DiT forward。当前 #439 接入 #445：配置 KV pool 并设置 `SGLANG_ZING_BLOCK0_CACHE_MODE=overlap` 后自动启用，默认 off；旧 `SOURCE_PROMPT_JOINT` 不再控制在线路径。命中静态 KV 时省去 conditions 分支，进入五分支，见[缓存消费设计](../specs/CACHED_PREFIX_JOINT.md)。续推由 `SOURCE_DEFER_FINAL` 单独控制，无融合 attention kernel。
 
 在线入口为 `ZingSourceStreamState` → `SourceReadySession.drain_ready`。会话在 prompt 边界准备四块 prefix，并在 source/target 就绪后调用原生模型事务；Graph 使用模型持有的 `PrefixJointGraphs`。runtime 不导入 benchmark、不安装 Python monkeypatch。模型负责分组 AdaLN、紧凑 visual 输出边界及一致的 RoPE，cache 事务负责逐块提交。Graph 仍采用独立 pool 和整代 shape 回收。
 
-仅 video-only、raw chunk KV、cross_chunk、after_step0、resident AdaLN 支持；SP 要求 stable shapes。不满足时使用同一批 prefix 张量串行提交并记录 fallback。Graph 未启用时支持 eager 六分支；单步 `step` 接口保留串行，线上 dispatch 使用 `drain_ready`。取消/异常清空会话持有的 prefix；event 标签仍由成功输出的 ChunkResult 携带，打包结束不代表 GPU 已采用。
+仅 video-only、raw chunk KV、cross_chunk、after_step0 支持；SP 要求 stable shapes，AdaLN 支持驻留权重／动态缓存和静态表。不满足时使用同一批 prefix 张量串行提交并记录 fallback；外部 KV 命中但不支持联合执行时明确失败。Graph 未启用时支持 eager 五／六分支；安装缓存消费者后的 `step` 和 `drain_ready` 均支持。取消/异常清空会话持有的 prefix；event 标签仍由成功输出的 ChunkResult 携带，打包结束不代表 GPU 已采用。
 
 VAE 单独实验已复现 performance 模式跨进程编码差异，确定性模式相同；固定输入的串行/joint KV 抽样相同。这解释旧 RGB A/B 差异的已知来源，不替代本次原生实现的验证。本次原生接入的 CPU 验证见下文；480/736 当前提交端到端数据待补。
 

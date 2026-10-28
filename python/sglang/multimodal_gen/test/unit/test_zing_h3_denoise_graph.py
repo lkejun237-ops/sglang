@@ -43,6 +43,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
     ZingH3Sampler,
 )
 from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import allocate_layer_stores
+from sglang.multimodal_gen.test.unit.realtime.test_zing_prompt_switch_cache import (  # noqa: F401
+    cpu_dma,
+)
 from sglang.multimodal_gen.test.unit.test_zing_h3_kv_pool_cache import _inputs
 from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401  # noqa: F401
     cpu_execution_options,
@@ -1150,6 +1153,9 @@ def _run_ready_chunks(
     known_eos=True,
     prompt_joint=False,
     joint_forward="cross_chunk",
+    prefix_loader_factory=None,
+    use_step=False,
+    reference=False,
 ):
     """Exercise the production streaming iterator, including source pauses."""
     from sglang.multimodal_gen.runtime.models.dits import zing_h3_denoise_graph
@@ -1165,6 +1171,10 @@ def _run_ready_chunks(
     frames = packer.chunk_plan.chunk(sum(batches) - 1).end
     torch.manual_seed(input_seed)
     inputs, noise = _inputs(frames), torch.randn(1, 2, frames, 2, 2)
+    if reference:
+        inputs.visual = {"ref": torch.arange(8).reshape(1, 2, 1, 2, 2).float() / 9}
+        inputs.media = [{"id": "ref", "type": "image"}]
+        inputs.conditions = [{"content_id": "ref", "role": "reference"}]
     extra = {}
     sampler_type = ZingH3Sampler
     if initial_steps is not None:
@@ -1174,6 +1184,8 @@ def _run_ready_chunks(
 
         sampler_type = ZingH3RealtimeSampler
         extra = dict(initial_denoising_step_list=initial_steps, initial_block_count=3)
+    if reference:
+        extra.update(ar_condition_timestep=0.875, reference_visual_timestep=0.999)
     sampler = sampler_type(
         model,
         packer,
@@ -1217,6 +1229,9 @@ def _run_ready_chunks(
         acquire_storage=lambda *_: storage,
         defer_final=defer_final,
         prompt_joint=prompt_joint,
+        prefix_loader=None
+        if prefix_loader_factory is None
+        else prefix_loader_factory(sampler),
     )
     outputs, snapshots, rng_states, boundary = [], [], [], []
     cursor = 0
@@ -1227,7 +1242,9 @@ def _run_ready_chunks(
             if prompt_updates and batch_index in prompt_updates:
                 size = prompt_updates[batch_index]
                 session.update_prompt(
-                    {
+                    inputs.positive
+                    if size is None
+                    else {
                         "context": torch.randn(size, 12).bfloat16(),
                         "row_role": torch.tensor([0, 1, 0] * (size // 3)),
                     },
@@ -1247,7 +1264,11 @@ def _run_ready_chunks(
                     )
                     cursor += 1
                     count -= 1
-                drain = session.drain_ready()
+                drain = (
+                    (session.step() for _ in range(len(session.pending)))
+                    if use_step
+                    else session.drain_ready()
+                )
                 for result in drain:
                     outputs.append(result.visual.clone())
                     events.append(result.prompt_event_id)
@@ -2326,7 +2347,10 @@ def test_whole_chunk_respects_sp_graph_topology(
 
 
 @pytest.mark.parametrize("world", [2, 4])
-def test_whole_chunk_sp_opt_out_streaming_never_captures(model, monkeypatch, world):
+@pytest.mark.parametrize("cached_prefix", [False, True])
+def test_whole_chunk_sp_opt_out_streaming_never_captures(
+    model, monkeypatch, world, cached_prefix
+):
     from concurrent.futures import ThreadPoolExecutor
 
     from sglang.multimodal_gen.runtime.layers import usp
@@ -2348,6 +2372,8 @@ def test_whole_chunk_sp_opt_out_streaming_never_captures(model, monkeypatch, wor
     ]
     for rank_model in rank_models:
         rank_model.denoise_graph_sp = False
+        if cached_prefix:
+            rank_model.experimental_stable_shapes = True
         with torch.no_grad():
             for name, value in rank_model.named_parameters():
                 value.copy_(
@@ -2384,6 +2410,13 @@ def test_whole_chunk_sp_opt_out_streaming_never_captures(model, monkeypatch, wor
 
     monkeypatch.setattr(sampling.dist, "all_reduce", all_reduce)
 
+    def all_gather(output, value, group=None):
+        values = comm.exchange(value.clone(), lambda values, _: list(values))
+        for destination, source in zip(output, values, strict=True):
+            destination.copy_(source)
+
+    monkeypatch.setattr(sampling.dist, "all_gather", all_gather)
+
     @torch.no_grad()
     def worker(rank):
         comm.thread.rank = rank
@@ -2401,7 +2434,9 @@ def test_whole_chunk_sp_opt_out_streaming_never_captures(model, monkeypatch, wor
             monkeypatch,
             backend=backend,
             storage=storage,
-            batches=(4, 4, 4, 5),
+            batches=(1,) * 17 if cached_prefix else (4, 4, 4, 5),
+            prompt_updates={4: 9} if cached_prefix else None,
+            prefix_loader_factory=_cached_prefix_writer([]) if cached_prefix else None,
         )
         assert torch.isfinite(actual[0]).all()
         assert backend.captures == 0, actual[4].routes
@@ -2540,3 +2575,434 @@ def test_online_prompt_joint_unsupported_route_keeps_serial_result(model, monkey
     assert actual[5] == baseline[5]
     assert metrics[-1]["prompt_joint_fallbacks"] == {"unsupported_layout": 1}
     assert metrics[-1]["forward_counts"].get("prompt_joint", 0) == 0
+
+
+def _cached_prefix_writer(receipts, *, fail=None):
+    """Fixture producer: compute donor KV, then publish it into the leased pool.
+
+    This is a correctness oracle, not a cache lookup/performance measurement.
+    Donor model work is deliberately excluded from consumer forward counters.
+    """
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
+
+    def factory(sampler):
+        def load(cache, inputs, prompt, prefix):
+            if fail is not None:
+                return fail(cache, inputs, prompt, prefix)
+            donor = ZingH3KVCache(
+                cache.num_layers,
+                window_policy=cache.window_policy,
+                window_eviction_timing=cache.window_eviction_timing,
+                rope_position_mode=cache.rope_position_mode,
+                rope_max_frame_gap=cache.rope_max_frame_gap,
+            )
+            counts, sampler._forward_counts = sampler._forward_counts, None
+            try:
+                sampler._forward(prefix, donor, "prefix")
+            finally:
+                sampler._forward_counts = counts
+            layers = [(k.clone(), v.clone()) for k, v in donor.prefix.layers]
+            cache.clear()
+            host = sampler._layout_index(prefix).host
+            cache.update(
+                prefix["position_ids"],
+                prefix["block_idx"],
+                "prefix",
+                0,
+                layers,
+                validation=(host["position_ids"], host["block_idx"]),
+            )
+            cache._model_signature = donor._model_signature
+            receipts.append((prompt.event_id, layers, counts))
+            return True
+
+        return load
+
+    return factory
+
+
+@pytest.mark.parametrize("backend", [None, "eager", "recording"])
+@pytest.mark.parametrize("adaln_mode", ["dynamic", "table"])
+@pytest.mark.parametrize("switch_miss", [False, True])
+def test_cached_prefix_start_and_switch_match_serial(
+    model, monkeypatch, tmp_path, backend, adaln_mode, switch_miss
+):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_prefix_graph import (
+        PrefixJointGraphs,
+    )
+
+    monkeypatch.setattr(model.arch, "ar_condition_timestep", 0.875)
+    monkeypatch.setattr(model.arch, "reference_visual_timestep", 0.999)
+    options = dict(
+        batches=(1,) * 17,
+        prompt_updates={4: 9, 7: 6, 10: 9, 13: 9},
+        reference=True,
+    )
+    baseline = _run_ready_chunks(model, monkeypatch, joint_forward="off", **options)
+    if adaln_mode == "table":
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_table import (
+            ZingAdalnTable,
+            video_plan,
+            write_table,
+        )
+        from sglang.multimodal_gen.runtime.models.schedulers.scheduling_zing_h3_causal_renoise import (
+            ZingH3CausalRenoiseSchedule,
+        )
+
+        schedule = ZingH3CausalRenoiseSchedule(
+            STEPS, num_train_timesteps=1000, shift=5.0
+        )
+        path = tmp_path / "cached-prefix-table"
+        write_table(
+            path,
+            arch=model.arch,
+            tags=model.modality_tags,
+            embedder=model.time_embedder,
+            projections=[
+                *((i, b.adaln_proj) for i, b in enumerate(model.blocks)),
+                ("final", model.final_layer.adaln_proj),
+            ],
+            plan=video_plan(
+                "few_step",
+                schedule.timesteps,
+                condition=0.875,
+                reference=0.999,
+                sigmas=schedule.sigmas,
+            ),
+            identity={"fixture": True},
+            provenance={"synthetic": True},
+        )
+        table = ZingAdalnTable(
+            path, arch=model.arch, tags=model.modality_tags, max_bytes=1 << 20
+        )
+        verify_synthetic_table(table, tmp_path)
+        candidate = ZingH3DiTModel(
+            ZingH3DiTConfig(arch_config=replace(model.arch)), {}, adaln_table=table
+        ).eval()
+        candidate.load_state_dict(
+            {k: v for k, v in model.state_dict().items() if "adaln_proj" not in k}
+        )
+        candidate.initialize_adaln_table()
+        assert candidate.adaln_deployment_receipt()["projection_storage_bytes"] == 0
+        model = candidate
+    else:
+        assert model.adaln_projection_cache_enabled
+    cache_stats = []
+    five_branch_projections = []
+    forward_body = model._forward_body
+
+    def inspect_modulation(*args, **kwargs):
+        options = kwargs["options"]
+        if options.joint_ends is not None and len(options.joint_ends) in (5, 6):
+            if options.fixed_kv is not None:
+                # Captured execution consumes resolved inputs, with no resident
+                # projection GEMMs or Python LRU calls inside the graph body.
+                assert kwargs["projections"] is not None
+            else:
+                assert options.projection_cache is not None
+                assert options.branch_projection_keys is not None
+            five_branch_projections.append(len(options.joint_ends))
+        return forward_body(*args, **kwargs)
+
+    monkeypatch.setattr(model, "_forward_body", inspect_modulation)
+
+    def observe(session, *_):
+        metrics.append(session.metrics)
+        cache = session.cache.adaln_projection_cache
+        if cache is not None:
+            cache_stats.append(cache.stats())
+
+    receipts, metrics = [], []
+
+    def loader(sampler):
+        writer = _cached_prefix_writer(receipts)(sampler)
+        return lambda cache, inputs, prompt, prefix: (
+            False
+            if switch_miss and prompt.event_id == 107
+            else writer(cache, inputs, prompt, prefix)
+        )
+
+    prefix_backend = WarmupRecordingGraphBackend() if backend == "recording" else None
+    model.prefix_graphs = PrefixJointGraphs(
+        backend=prefix_backend, capture_enabled=backend == "recording"
+    )
+    actual = _run_ready_chunks(
+        model,
+        monkeypatch,
+        backend=WarmupRecordingGraphBackend() if backend == "recording" else backend,
+        prompt_joint=True,
+        prefix_loader_factory=loader,
+        yield_hook=observe,
+        **options,
+    )
+    assert 5 in five_branch_projections
+    if switch_miss:
+        assert 6 in five_branch_projections
+    if adaln_mode == "dynamic":
+        assert cache_stats and max(s["hits"] for s in cache_stats) > 0
+    else:
+        assert table.hits > 0
+    torch.testing.assert_close(actual[0], baseline[0], rtol=0.02, atol=0.02)
+    assert actual[5] == baseline[5]
+    assert [r[0] for r in receipts] == (
+        [None, 104, 110, 113] if switch_miss else [None, 104, 107, 110, 113]
+    )
+    assert metrics[-1]["cached_prefix_hits"] == 5 - int(switch_miss)
+    assert metrics[-1]["forward_counts"]["prefix"] == 0
+    assert metrics[-1]["forward_counts"]["prompt_joint"] == 4
+    assert all(r[2]["prefix"] == 0 for r in receipts)
+    for got, want in zip(actual[1], baseline[1], strict=True):
+        assert got[0] == want[0]
+        assert [(c[0], c[1]) for c in got[1]] == [(c[0], c[1]) for c in want[1]]
+        for (gk, gv), (wk, wv) in zip(got[2], want[2], strict=True):
+            torch.testing.assert_close(gk, wk, rtol=0.02, atol=0.02)
+            torch.testing.assert_close(gv, wv, rtol=0.02, atol=0.02)
+    # Every snapshot keeps the producer's prefix bytes exactly, even as the
+    # rolling window evicts dynamic history or the graph changes shape.
+    by_event = {event: layers for event, layers, _ in receipts}
+    for event, snapshot in zip(actual[5], actual[1], strict=True):
+        if snapshot[0] == 0 or event not in by_event:
+            # EOS disposal already released the logical cache before yielding.
+            continue
+        for (k, v), (pk, pv) in zip(snapshot[2], by_event[event], strict=True):
+            assert torch.equal(k[: pk.shape[0]], pk)
+            assert torch.equal(v[: pv.shape[0]], pv)
+    for got, want in zip(actual[2], baseline[2], strict=True):
+        assert (got is None and want is None) or torch.equal(got, want)
+    if prefix_backend is not None:
+        assert prefix_backend.captures > 0
+        assert model.prefix_graphs.routes[("prefix_separate", "replay")] > 0
+
+
+@pytest.mark.parametrize("prompt_joint", [False, True])
+def test_cached_prefix_miss_preserves_existing_path(model, monkeypatch, prompt_joint):
+    options = dict(batches=(1,) * 8, prompt_updates={4: 9}, prompt_joint=prompt_joint)
+    expected = _run_ready_chunks(model, monkeypatch, **options)
+    actual = _run_ready_chunks(
+        model,
+        monkeypatch,
+        prefix_loader_factory=_cached_prefix_writer([], fail=lambda *_: False),
+        **options,
+    )
+    assert torch.equal(actual[0], expected[0])
+    assert actual[5] == expected[5]
+
+
+@pytest.mark.parametrize("failure", ["raise", "unpublished", "return_type"])
+def test_cached_prefix_bad_writer_releases_session(model, monkeypatch, failure):
+    owned = []
+
+    def fail(cache, *_):
+        owned.append(cache)
+        if failure == "raise":
+            raise RuntimeError("injected writer failure")
+        return True if failure == "unpublished" else None
+
+    with pytest.raises(
+        (ValueError, RuntimeError), match="writer failure|prefix-only|boolean"
+    ):
+        _run_ready_chunks(
+            model,
+            monkeypatch,
+            batches=(1,) * 4,
+            prefix_loader_factory=_cached_prefix_writer([], fail=fail),
+        )
+    assert owned and owned[0].prefix is None
+    assert owned[0]._length == 0 and not owned[0].committed
+
+
+def test_cached_prefix_step_also_joins_switch(model, monkeypatch):
+    options = dict(batches=(1,) * 8, prompt_updates={4: 9}, use_step=True)
+    expected = _run_ready_chunks(model, monkeypatch, **options)
+    metrics = []
+    actual = _run_ready_chunks(
+        model,
+        monkeypatch,
+        prefix_loader_factory=_cached_prefix_writer([]),
+        yield_hook=lambda session, *_: metrics.append(session.metrics),
+        **options,
+    )
+    torch.testing.assert_close(actual[0], expected[0], rtol=0.02, atol=0.02)
+    assert actual[5] == expected[5]
+    assert metrics[-1]["forward_counts"]["prompt_joint"] == 1
+    assert metrics[-1]["forward_counts"]["prefix"] == 0
+
+
+def test_cached_prefix_switch_failure_releases_and_reuses_slot(model, monkeypatch):
+    owned, receipts = [], []
+    storage = _storage(model)
+
+    def factory(sampler):
+        load = _cached_prefix_writer(receipts)(sampler)
+
+        def writer(cache, inputs, prompt, prefix):
+            if prompt.event_id is not None:
+                # The writer may already have replaced old logical state.
+                cache.clear()
+                raise RuntimeError("injected switch writer failure")
+            return load(cache, inputs, prompt, prefix)
+
+        return writer
+
+    options = dict(batches=(1,) * 8, prompt_updates={4: 9}, storage=storage)
+    with pytest.raises(RuntimeError, match="switch writer failure"):
+        _run_ready_chunks(
+            model,
+            monkeypatch,
+            prefix_loader_factory=factory,
+            yield_hook=lambda session, *_: owned.append(session),
+            **options,
+        )
+    assert owned and owned[-1].closed
+    assert owned[-1].cache.prefix is None and owned[-1].cache._length == 0
+    assert owned[-1].prefix_loader is None
+    assert all(value == 0 for value in owned[-1].memory_snapshot().values())
+    actual = _run_ready_chunks(
+        model, monkeypatch, prefix_loader_factory=_cached_prefix_writer([]), **options
+    )
+    assert actual[5][-1] == 104
+
+
+def test_cached_prefix_only_loads_latest_candidate(model, monkeypatch):
+    receipts = []
+    actual = _run_ready_chunks(
+        model,
+        monkeypatch,
+        batches=(1,) * 8,
+        prompt_updates={4: 9, 5: 6},
+        prefix_loader_factory=_cached_prefix_writer(receipts),
+    )
+    assert [event for event, *_ in receipts] == [None, 105]
+    assert 104 not in actual[5] and actual[5][-1] == 105
+
+
+@pytest.mark.parametrize("backend", [None, "eager", "recording"])
+@pytest.mark.parametrize("warm_start", [False, True])
+@pytest.mark.usefixtures("cpu_dma")
+def test_block0_provider_routes_start_and_prompt_cycle(
+    model, monkeypatch, backend, warm_start
+):
+    from types import SimpleNamespace as NS
+
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_prefix_graph import (
+        PrefixJointGraphs,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.preparation_cache import (
+        Block0PreparationCache,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.source_session import (
+        ZingSourceStreamState,
+    )
+
+    options = dict(batches=(1,) * 11, prompt_updates={4: 6, 7: None})
+    baseline = _run_ready_chunks(model, monkeypatch, joint_forward="off", **options)
+    metrics, owners, states = [], [], []
+
+    def prepared(inputs, condition):
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.packing import (
+            H3InferenceInputs,
+        )
+
+        return H3InferenceInputs(
+            **{**vars(inputs), "positive": condition},
+            output_type="video",
+            audio_shape=None,
+            pixel_frame_count=1,
+            sample_count=None,
+            sample_rate=24000,
+        )
+
+    def provider(sampler):
+        stores = _storage(model)
+        pool = NS(
+            _pool=NS(_slots=[NS(kv_cache=stores)]),
+            plan=NS(config=NS(max_prefix_rows=stores[0].rows)),
+        )
+        owner = Block0PreparationCache(pool, "overlap", entries=2)
+        state = ZingSourceStreamState()
+        state.block0_cache = owner
+        state.sampler = NS(sampler=sampler, applied_prompt=None)
+        writer = _cached_prefix_writer([])(sampler)
+        calls = 0
+        owners.append(owner)
+        states.append(state)
+
+        def load(cache, inputs, prompt, prefix):
+            nonlocal calls
+            if calls == 0:
+                if warm_start:
+                    assert writer(cache, inputs, prompt, prefix)
+                    owner.fill(
+                        "case-A",
+                        prepared(inputs, prompt.condition),
+                        "A",
+                        object(),
+                        cache,
+                    )
+                    owner.finish_fill()
+                    cache.clear()
+                    state.block0_entry = owner.entries["case-A"]
+                    state.block0_restore = owner.restore(cache, state.block0_entry)
+            calls += 1
+            return state._load_block0_prefix(cache, inputs, prompt, prefix)
+
+        return load
+
+    def observe(session, _, count):
+        metrics.append(session.metrics)
+        state = states[0]
+        state.sampler = session
+
+        def prepare(candidate):
+            # Real prompt snapshots clone condition tensors. Cache keys belong
+            # to the provider, independent of the snapshot's Python identity.
+            key = "case-A" if candidate.event_id == 107 else "case-B"
+            state.pending_block0 = (
+                key,
+                {"prompt": key},
+                prepared(session.inputs, candidate.condition),
+                key,
+                object(),
+            )
+            return state._prepare_block0_switch(candidate)
+
+        session.prepare_prompt_prefix = prepare
+        if count == 1 and not warm_start:
+            # Match the provider's post-output backfill; retain its one A entry.
+            owners[0].fill(
+                "case-A",
+                prepared(session.inputs, session.prompt.condition),
+                "A",
+                object(),
+                session.cache,
+            )
+            owners[0].finish_fill()
+
+    recording = WarmupRecordingGraphBackend() if backend == "recording" else None
+    model.prefix_graphs = PrefixJointGraphs(
+        backend=recording, capture_enabled=backend == "recording"
+    )
+    actual = _run_ready_chunks(
+        model,
+        monkeypatch,
+        backend=recording if recording else backend,
+        prompt_joint=True,
+        prefix_loader_factory=provider,
+        yield_hook=observe,
+        **options,
+    )
+    torch.testing.assert_close(actual[0], baseline[0], rtol=0.02, atol=0.02)
+    assert actual[5] == baseline[5]
+    for got, want in zip(actual[1], baseline[1], strict=True):
+        assert got[0] == want[0]
+        assert [(c[0], c[1]) for c in got[1]] == [(c[0], c[1]) for c in want[1]]
+        for (gk, gv), (wk, wv) in zip(got[2], want[2], strict=True):
+            torch.testing.assert_close(gk, wk, rtol=0.02, atol=0.02)
+            torch.testing.assert_close(gv, wv, rtol=0.02, atol=0.02)
+    for got, want in zip(actual[2], baseline[2], strict=True):
+        assert (got is None and want is None) or torch.equal(got, want)
+    assert metrics[-1]["cached_prefix_hits"] == 1 + int(warm_start)
+    assert metrics[-1]["cached_prefix_misses"] == 1 + int(not warm_start)
+    assert metrics[-1]["forward_counts"]["prompt_joint"] == 2
+    assert metrics[-1]["forward_counts"]["prefix"] == int(not warm_start)
+    assert "case-A" in owners[0].entries

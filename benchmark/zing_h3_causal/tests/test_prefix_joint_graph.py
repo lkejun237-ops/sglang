@@ -278,7 +278,7 @@ def test_failure_preserves_hooks_and_rejects_live_cache(model, monkeypatch):
     current = packs()
     graphs.run(sampler, current, pooled)
     before = pooled.positions().clone()
-    with pytest.raises(ValueError, match="cleared logical cache"):
+    with pytest.raises(ValueError, match="empty or restored prefix-only cache"):
         graphs.run(sampler, current, pooled)
     torch.testing.assert_close(pooled.positions(), before)
     pooled.clear()

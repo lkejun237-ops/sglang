@@ -86,10 +86,21 @@ class ConditioningPrefetch:
     received on the client's private stream and completed before publication.
     """
 
-    def __init__(self, endpoint, *, prepare, identity, client, max_bytes, device=None):
+    def __init__(
+        self,
+        endpoint,
+        *,
+        prepare,
+        identity,
+        client,
+        max_bytes,
+        device=None,
+        should_prefetch=None,
+    ):
         if not isinstance(endpoint, str) or not endpoint.startswith("ipc:///"):
             raise ValueError("Conditioning prefetch requires a private local endpoint")
         self.prepare, self.identity, self.client = prepare, identity, client
+        self.should_prefetch = should_prefetch
         if getattr(client, "result_transport", "http") == "nccl" and device is None:
             raise ValueError("NCCL prefetch requires the DiT leader device")
         self.device = device
@@ -98,6 +109,7 @@ class ConditioningPrefetch:
         self.stop = threading.Event()
         self.cached = None
         self.hits = self.encodes = self.failures = self.fallbacks = 0
+        self.cache_skips = 0
         self.thread = threading.Thread(
             target=self._receive,
             args=(endpoint,),
@@ -164,6 +176,14 @@ class ConditioningPrefetch:
                     with self.lock:
                         if self.stop.is_set():
                             break
+                        # Advisory CPU lookup only. The owner still validates the
+                        # cache across ranks and can encode on a boundary miss.
+                        if (
+                            self.should_prefetch is not None
+                            and not self.should_prefetch(command)
+                        ):
+                            self.cache_skips += 1
+                            continue
                         prompt, media = self.prepare(command)
                         digest = self.identity(prompt, media)
                         if self.stop.is_set():
@@ -195,3 +215,4 @@ class ConditioningPrefetch:
                 "Conditioning prefetch did not drain before session cleanup"
             )
         self.cached = self.prepare = self.identity = None
+        self.should_prefetch = None

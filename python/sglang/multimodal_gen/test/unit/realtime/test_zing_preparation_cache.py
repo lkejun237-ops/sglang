@@ -78,7 +78,12 @@ def test_cpu_snapshot_retains_pixels_and_owns_prepared_tensors():
 
 
 @pytest.mark.parametrize("mode", ["late", "early", "overlap"])
-def test_complete_hit_bypasses_prepare_and_reuses_pool(monkeypatch, mode):
+@pytest.mark.parametrize("joint", [False, True])
+@pytest.mark.parametrize("cache_enabled", [False, True])
+@pytest.mark.parametrize("joint_forward", ["off", "cross_chunk"])
+def test_startup_wires_cache_without_gating_joint(
+    monkeypatch, mode, joint, cache_enabled, joint_forward
+):
     prepared = inputs()
     condition = WorkerConditioningState()
     entry = NS(inputs=prepared, conditioning_identity="cached", request=object())
@@ -88,6 +93,7 @@ def test_complete_hit_bypasses_prepare_and_reuses_pool(monkeypatch, mode):
         window_policy=NS(window_chunks=6, sink_chunks=3),
         rope_position_mode="relative",
         rope_max_frame_gap=12,
+        joint_forward=joint_forward,
     )
     codecs = NS(
         remote_read_fs=None,
@@ -99,7 +105,7 @@ def test_complete_hit_bypasses_prepare_and_reuses_pool(monkeypatch, mode):
     )
     stage = NS(
         codecs=codecs,
-        block0_cache=owner,
+        block0_cache=owner if cache_enabled else None,
         modules={"transformer": torch.nn.Linear(1, 1)},
         _validate_sampling_params=lambda _: None,
         _build_realtime_sampler=lambda *a, **kw: sampler,
@@ -110,7 +116,8 @@ def test_complete_hit_bypasses_prepare_and_reuses_pool(monkeypatch, mode):
         kv_pool=NS(acquire=Mock(return_value=lease)),
     )
     ready = NS(_new_cache=Mock(return_value=object()))
-    monkeypatch.setattr(source_session, "SourceReadySession", lambda *a, **kw: ready)
+    build_ready = Mock(return_value=ready)
+    monkeypatch.setattr(source_session, "SourceReadySession", build_ready)
     monkeypatch.setattr(
         source_session, "SourceLedger", lambda **kw: NS(provenance_for=None)
     )
@@ -123,20 +130,75 @@ def test_complete_hit_bypasses_prepare_and_reuses_pool(monkeypatch, mode):
     monkeypatch.setattr(state, "_encoder_use", lambda _: nullcontext())
     batch = NS(
         sampling_params=NS(prompt="scene", seed=123),
-        extra={"zing_source_command": {"encoder": {"mode": "progressive"}}},
+        extra={
+            "zing_source_command": {
+                "encoder": {"mode": "progressive"},
+                "prompt_joint": joint,
+            }
+        },
         realtime_session_id="new-session",
         realtime_event_id="new-event",
         session=NS(get_or_create_state=lambda _: condition),
     )
     state.initialize(stage, batch, dict(width=32, height=32, fps=24))
-    assert codecs.prepare.call_count == int(mode == "late")
-    assert stage._conditioning_consumer.call_count == int(mode == "late")
-    assert stage.kv_pool.acquire.call_count == int(mode != "late")
-    assert owner.restore.call_count == int(mode != "late")
-    if mode != "late":
+    assert codecs.prepare.call_count == int(not cache_enabled or mode == "late")
+    assert stage._conditioning_consumer.call_count == int(
+        not cache_enabled or mode == "late"
+    )
+    assert stage.kv_pool.acquire.call_count == int(cache_enabled and mode != "late")
+    assert owner.restore.call_count == int(cache_enabled and mode != "late")
+    assert build_ready.call_args.kwargs["prompt_joint"] is joint
+    cached_joint = joint and joint_forward == "cross_chunk"
+    assert build_ready.call_args.kwargs["prefix_loader"] == (
+        state._load_block0_prefix if cached_joint and cache_enabled else None
+    )
+    assert hasattr(ready, "prepare_prompt_prefix") is cache_enabled
+    if cache_enabled:
+        assert ready.prepare_prompt_prefix == state._prepare_block0_switch
+    assert hasattr(ready, "restore_initial_prefix") is (
+        cache_enabled and not cached_joint
+    )
+    if cache_enabled and mode != "late":
         assert condition.identity == "cached"
         assert condition.positive is state.inputs.positive
         stage.kv_pool.acquire.assert_called_once_with(batch.session, entry.request)
+
+
+@pytest.mark.parametrize("cache_enabled", [False, True])
+@pytest.mark.parametrize("joint_forward", ["off", "cross_chunk"])
+@pytest.mark.parametrize("env_joint", [False, True])
+@pytest.mark.parametrize("command_joint", [None, False, True])
+def test_joint_policy_is_independent_of_cache(
+    monkeypatch, cache_enabled, joint_forward, env_joint, command_joint
+):
+    monkeypatch.setenv("SGLANG_ZING_SOURCE_PROMPT_JOINT", str(int(env_joint)))
+    stage = NS(
+        block0_cache=object() if cache_enabled else None,
+        codecs=NS(video_decoder_name="lynn"),
+    )
+    sampler = NS(
+        joint_forward=joint_forward,
+        window_policy=NS(window_chunks=21, sink_chunks=3),
+        rope_position_mode="block_relative",
+        rope_max_frame_gap=12,
+    )
+    command = {} if command_joint is None else {"prompt_joint": command_joint}
+    policy, _, joint = source_session._source_key_policy(stage, sampler, 1, command)
+    assert joint is (env_joint if command_joint is None else command_joint)
+    assert policy["source_prompt_joint"] is joint
+
+
+def test_startup_joint_consumer_commits_existing_transfer():
+    state = source_session.ZingSourceStreamState()
+    state.block0_entry = object()
+    state.block0_restore = NS(commit=Mock())
+    state.block0_cache = NS(lookup=Mock(), restore=Mock())
+    state.sampler = NS(applied_prompt=None)
+    cache = object()
+    assert state._load_block0_prefix(cache, None, None, None)
+    state.block0_restore.commit.assert_called_once_with(cache)
+    state.block0_cache.lookup.assert_not_called()
+    state.block0_cache.restore.assert_not_called()
 
 
 def test_fill_starts_on_dispatch_after_output():

@@ -76,7 +76,7 @@ def _bridge_worker_proc(rank, store_file, queue):
 
 
 def test_bridge_group_mp_spawn_send_recv(tmp_path):
-    nccl_bridge = _load_nccl_bridge()
+    _load_nccl_bridge()
     store_file = str(tmp_path / "bridge_store")
     ctx = mp.get_context("spawn")
     queue = ctx.Queue()
@@ -167,7 +167,7 @@ def test_validate_bridge_tensor_capacity_exceeded():
 
 
 def test_encoder_and_decoder_transport_reuse_nccl_bridge():
-    nccl_bridge = _load_nccl_bridge()
+    _load_nccl_bridge()
     import sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.decoder_transport as dec_trans
     import sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.encoder_transport as enc_trans
 
@@ -290,6 +290,33 @@ def test_role_command_control_next_command():
     assert payload is None
 
 
+@pytest.mark.parametrize("lost_receiver", [False, True])
+def test_idle_requires_cpu_ack_even_when_broadcast_completes(lost_receiver):
+    ctrl_mod = _load_worker_control()
+    acknowledgements = []
+
+    class Dist(_MockDist):
+        def all_gather_object(self, values, value, group=None):
+            acknowledgements.append((group, value))
+            if lost_receiver:
+                raise RuntimeError("Idle receiver disappeared")
+            super().all_gather_object(values, value, group=group)
+
+    control = ctrl_mod.RoleCommandControl(
+        dist=Dist(),
+        rank=0,
+        socket=_MockSocket(),
+        idle_group="idle",
+        operation_group="op",
+    )
+    if lost_receiver:
+        with pytest.raises(ctrl_mod.RoleControlError, match="communication failed"):
+            control.next()
+    else:
+        assert control.next() == (None, None)
+    assert acknowledgements == [("idle", ("idle", 0, False))]
+
+
 def test_role_command_control_next_invalid_command_raises():
     ctrl_mod = _load_worker_control()
     RoleCommandControl = ctrl_mod.RoleCommandControl
@@ -373,8 +400,8 @@ def test_shm_publisher_slots_exhaustion_and_timeout(monkeypatch):
         lambda num_bytes: {"slot": 1, "num_bytes": num_bytes},
     )
 
-    ref1 = publisher.reserve(frames=1, width=32, height=32, identity={})
-    ref2 = publisher.reserve(frames=1, width=32, height=32, identity={})
+    publisher.reserve(frames=1, width=32, height=32, identity={})
+    publisher.reserve(frames=1, width=32, height=32, identity={})
 
     with pytest.raises(TimeoutError, match="slots are full"):
         publisher.reserve(frames=1, width=32, height=32, identity={})

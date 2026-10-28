@@ -363,6 +363,15 @@ class LocalConditioner:
         self.device = torch.device("cpu")
 
     def __call__(self, prompt, media, *, state=None):
+        def uncached():
+            positive = self.encode(prompt, media)
+            if state is not None:
+                # Publish only after encoding succeeds; a rejected candidate
+                # must preserve the active condition, and a successful bypass
+                # must not retain its predecessor's usable cache identity.
+                state.identity = state.positive = None
+            return positive
+
         # Preserve native local multi-frame and audio inputs; cache the single
         # frame subset only, without imposing remote output-row limits.
         if self.cache.max_bytes == 0 or any(
@@ -372,7 +381,7 @@ class LocalConditioner:
             or item["frames"].shape[1] != 1
             for item in media
         ):
-            return self.encode(prompt, media)
+            return uncached()
         try:
             digest = _identity(
                 prompt,
@@ -384,7 +393,7 @@ class LocalConditioner:
         except ConditionError:
             # Local native inputs may exceed the RPC validator's bounds.
             # Such inputs retain the original encoder path without caching.
-            return self.encode(prompt, media)
+            return uncached()
 
         original = []
 
@@ -401,5 +410,11 @@ class LocalConditioner:
         if original:
             # The encoding caller already owns its native-device result. Cache
             # CPU copies independently; avoid an unnecessary second H2D copy.
-            return original[0]
-        return {name: tensor.to(device=self.device) for name, tensor in result.items()}
+            positive = original[0]
+        else:
+            positive = {
+                name: tensor.to(device=self.device) for name, tensor in result.items()
+            }
+        if state is not None:
+            state.identity, state.positive = digest, positive
+        return positive

@@ -602,11 +602,29 @@ class ZingChunkGraphs:
         # _bind_cache just validated the live model (including lazy constants).
         # Reuse that snapshot within this host preparation transaction instead
         # of rescanning every parameter for the same forward plan.
+        projection_cache = None
+        if (
+            len(ends) in (2, 3, 5, 6)
+            and model.adaln_table is None
+            and model.adaln_projection_cache_enabled
+        ):
+            from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_cache import (
+                ZingH3AdalnCache,
+            )
+
+            projection_cache = shadow.adaln_projection_cache
+            if (
+                projection_cache is None
+                or projection_cache.max_bytes != model.adaln_projection_cache_bytes
+            ):
+                projection_cache = ZingH3AdalnCache(model.adaln_projection_cache_bytes)
+                shadow.adaln_projection_cache = projection_cache
         plan = model.prepare_fixed_forward(
             packed=packed,
             kv_plan=kv,
             phase=phase,
             _model_state=model._zing_model_signatures,
+            projection_cache=projection_cache,
         )
         layers = [(k[:rows], v[:rows]) for k, v in kv.stores]
         if transaction is not None:

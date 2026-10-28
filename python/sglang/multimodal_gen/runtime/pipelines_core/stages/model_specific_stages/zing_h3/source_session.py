@@ -63,6 +63,7 @@ def _source_key_policy(stage, sampler, work_quantum, command):
     defer_final = command.get(
         "defer_final", os.environ.get("SGLANG_ZING_SOURCE_DEFER_FINAL", "0") == "1"
     )
+    # Joint scheduling is independent of whether a prefix cache is available.
     prompt_joint = command.get(
         "prompt_joint", os.environ.get("SGLANG_ZING_SOURCE_PROMPT_JOINT", "0") == "1"
     )
@@ -237,6 +238,9 @@ class ZingSourceStreamState(BaseRealtimeState):
             seed=params.seed[0] if isinstance(params.seed, list) else params.seed,
             provenance_for=self.ledger.provenance_for,
         )
+        cached_joint = (
+            prompt_joint and getattr(sampler, "joint_forward", "off") == "cross_chunk"
+        )
         self.sampler = SourceReadySession(
             sampler,
             self.inputs,
@@ -253,11 +257,17 @@ class ZingSourceStreamState(BaseRealtimeState):
             initial_prompt_version=getattr(batch, "realtime_prompt_version", None),
             defer_final=defer_final,
             prompt_joint=prompt_joint,
+            prefix_loader=(
+                self._load_block0_prefix
+                if cached_joint and self.block0_cache is not None
+                else None
+            ),
         )
         if self.block0_cache is not None:
             self.sampler.prepare_prompt_prefix = self._prepare_block0_switch
         if self.block0_entry is not None:
-            self.sampler.restore_initial_prefix = self._restore_block0
+            if not cached_joint:
+                self.sampler.restore_initial_prefix = self._restore_block0
             if self.block0_cache.mode != "late":
                 # The fixed case's previous admission already resolved its layout.
                 self.kv_lease = stage.kv_pool.acquire(
@@ -437,6 +447,17 @@ class ZingSourceStreamState(BaseRealtimeState):
             self.block0_restore = self.block0_cache.restore(cache, self.block0_entry)
         self.block0_restore.commit(cache)
 
+    def _load_block0_prefix(self, cache, inputs, prompt, prefix):
+        """Consume the startup entry selected by the preparation cache.
+
+        Prompt switches use prepare_prompt_prefix so L1/L2 lookup and epoch
+        writeback remain owned by the same provider as the serial consumer.
+        """
+        if self.sampler.applied_prompt is not None or self.block0_entry is None:
+            return False
+        self._restore_block0(cache)
+        return True
+
     def _remember_block0(self, prefix):
         self.block0_prefix = prefix
         # Only pixels generated under this prefix qualify, even if old output
@@ -480,6 +501,31 @@ class ZingSourceStreamState(BaseRealtimeState):
                     self.sampler.cache,
                 )
 
+    def _block0_update_key(self, stage, prompt, command):
+        """Share the CPU request identity between prefetch and owner lookup."""
+        from .preparation_cache import preparation_key, preparation_request
+
+        request = {**self.block0_input_request, "prompt": prompt}
+        if "references" in command:
+            active = self.inputs
+            old_ids = {item["content_id"] for item in active.conditions}
+            refs = preparation_request(stage.codecs, {"media": command["references"]})[
+                "media"
+            ]
+            request["media"] = [
+                item for item in request["media"] if item["id"] not in old_ids
+            ] + refs
+            request["conditions"] = [
+                dict(
+                    content_id=item["id"],
+                    role="reference",
+                    latent_modalities=["visual"],
+                )
+                for item in refs
+            ]
+        codecs, preview, config, policy = self.block0_key_args
+        return preparation_key(codecs, request, preview, config, policy), request
+
     def _start_conditioning_prefetch(self, stage, batch, endpoint, command):
         from sglang.multimodal_gen.runtime.conditioning.prefetch import (
             ConditioningPrefetch,
@@ -517,6 +563,10 @@ class ZingSourceStreamState(BaseRealtimeState):
                 provider.preprocess_version,
             )
 
+        def should_prefetch(update):
+            key, _ = self._block0_update_key(stage, update["prompt"], update)
+            return not self.block0_cache.may_contain(key)
+
         receipt = {"ok": True}
         if provider.rank == 0:
             try:
@@ -537,6 +587,9 @@ class ZingSourceStreamState(BaseRealtimeState):
                         == "nccl"
                         else None
                     ),
+                    should_prefetch=should_prefetch
+                    if self.block0_cache is not None
+                    else None,
                 )
                 provider._prefetch_owner = self.conditioning_prefetch
                 batch.session.get_or_create_state(
@@ -602,37 +655,11 @@ class ZingSourceStreamState(BaseRealtimeState):
                     coordinate_validation,
                 )
 
-                from .preparation_cache import (
-                    inputs_on,
-                    preparation_key,
-                    preparation_request,
-                )
+                from .preparation_cache import inputs_on
 
                 key_error = None
                 try:
-                    request = {**self.block0_input_request, "prompt": update[0]}
-                    if "references" in command:
-                        old_ids = {
-                            item["content_id"] for item in self.inputs.conditions
-                        }
-                        refs = preparation_request(
-                            stage.codecs, {"media": command["references"]}
-                        )["media"]
-                        request["media"] = [
-                            item
-                            for item in request["media"]
-                            if item["id"] not in old_ids
-                        ] + refs
-                        request["conditions"] = [
-                            dict(
-                                content_id=item["id"],
-                                role="reference",
-                                latent_modalities=["visual"],
-                            )
-                            for item in refs
-                        ]
-                    codecs, preview, config, policy = self.block0_key_args
-                    key = preparation_key(codecs, request, preview, config, policy)
+                    key, request = self._block0_update_key(stage, update[0], command)
                 except (OSError, ValueError) as exc:
                     key_error = exc
                 if not all(coordinate_validation(key_error is None)):
@@ -928,6 +955,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                 else dict(
                     encodes=prefetch.encodes,
                     hits=prefetch.hits,
+                    cache_skips=prefetch.cache_skips,
                     failures=prefetch.failures,
                     fallbacks=prefetch.fallbacks,
                 ),

@@ -9,7 +9,10 @@ from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
     RouteCoordinator,
     ZingChunkGraphs,
 )
-from sglang.multimodal_gen.runtime.models.dits.zing_h3_joint import PREFIX_PHASES
+from sglang.multimodal_gen.runtime.models.dits.zing_h3_joint import (
+    CACHED_PREFIX_PHASES,
+    PREFIX_PHASES,
+)
 
 
 class PrefixGraphBackend(CudaGraphBackend):
@@ -28,7 +31,7 @@ class PrefixGraphBackend(CudaGraphBackend):
 class PrefixJointGraphs(ZingChunkGraphs):
     """A bounded graph set over the caller's single fixed KV slot.
 
-    Caller clears the logical cache before every prompt-prefix replacement.
+    Caller supplies an empty cache, or a restored static prefix with no history.
     A full shape budget drains the old graph generation before building another.
     The first occurrence warms up; the second captures; later calls replay.
     """
@@ -47,12 +50,14 @@ class PrefixJointGraphs(ZingChunkGraphs):
         if not cache.pooled or not cache.raw_store:
             raise ValueError("Prefix graphs require a fixed raw KV pool")
         if (
-            cache.prefix is not None
+            (cache.prefix is None if len(packs) == 5 else cache.prefix is not None)
             or cache.committed
             or cache.active is not None
             or cache.pending_source is not None
         ):
-            raise ValueError("Prefix graphs require a cleared logical cache")
+            raise ValueError(
+                "Prefix graphs require an empty or restored prefix-only cache"
+            )
         if self.capture_enabled and not self.backend.supports(packs[0]["x"].device):
             raise ValueError("Unsupported prefix graph device")
         size, _ = zing_h3.get_ulysses_ctx()
@@ -65,7 +70,8 @@ class PrefixJointGraphs(ZingChunkGraphs):
 
     def _prepare(self, sampler, packs, cache):
         shadow = cache.planning_copy()
-        packed = self._joint_packed(packs, PREFIX_PHASES)
+        phases = CACHED_PREFIX_PHASES if len(packs) == 5 else PREFIX_PHASES
+        packed = self._joint_packed(packs, phases)
         plan = self._forward_plan(sampler, shadow, packed, "joint")
         return plan, plan.execute, shadow
 

@@ -82,6 +82,10 @@ class RoleCommandControl:
         self.dist.broadcast_object_list(rows, src=0, group=self.idle_group)
         kind, sequence, command = rows[0]
         if kind == "IDLE" and sequence == self.sequence:
+            # Broadcast completion alone need not acknowledge every receiver.
+            # An idle CPU rendezvous detects a lost leaf within the watchdog,
+            # without leaving a device-group collective pending during idle.
+            self.agree("idle", self.sequence, group=self.idle_group)
             return None, None
         if kind != "COMMAND" or sequence != self.sequence + 1:
             raise RoleControlError(f"{self.role_name} command channel failed")

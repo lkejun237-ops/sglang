@@ -88,6 +88,7 @@ class SourceReadySession:
         initial_prompt_version=None,
         defer_final=False,
         prompt_joint=False,
+        prefix_loader=None,
     ):
         if any(
             type(n) is not int or n < 1
@@ -115,6 +116,9 @@ class SourceReadySession:
                 "Deferred final requires cross-chunk, five-frame history, no CFG and after-step0 eviction"
             )
         self.prompt_joint = prompt_joint
+        self.prefix_loader = prefix_loader
+        self._prefix_load_attempted = False
+        self._cached_prefix_ready = False
         self._pending_prefix = None
         self.defer_final = defer_final
         self.sampler = sampler
@@ -282,7 +286,11 @@ class SourceReadySession:
             if self.prepare_prompt_prefix is None
             else self.prepare_prompt_prefix(candidate)
         )
-        if defer_prefix and self.prompt_joint and restore_prefix is None:
+        if (
+            defer_prefix
+            and (self.prompt_joint or self.prefix_loader is not None)
+            and (restore_prefix is None or self.sampler.joint_forward == "cross_chunk")
+        ):
             prepared, error = None, None
             try:
                 prepared = self.sampler.pack_prompt_prefix(
@@ -299,8 +307,19 @@ class SourceReadySession:
             )
             if error is not None:
                 raise error
-            self._pending_prefix, origin, latent_end = prepared
-            self.cache.clear()
+            packs, origin, latent_end = prepared
+            self._cached_prefix_ready = self._load_prefix(
+                inputs, candidate, packs[0], restore_prefix=restore_prefix
+            )
+            if self._cached_prefix_ready:
+                self._pending_prefix = packs[1:]
+            elif self.prompt_joint:
+                self._pending_prefix = packs
+                self.cache.clear()
+            else:
+                origin, latent_end = self.sampler.rebuild_prompt_prefix(
+                    inputs, candidate.condition, self.recent_visual, self.cache
+                )
         else:
             origin, latent_end = self.sampler.rebuild_prompt_prefix(
                 inputs,
@@ -321,6 +340,77 @@ class SourceReadySession:
         self.media_origin = origin
         self.model_chunk_id = ready.model_chunk.chunk_id
 
+    def _load_prefix(self, inputs, prompt, prefix, *, restore_prefix=None):
+        """Consume an external writer's prefix at a quiescent session boundary.
+
+        False must leave the cache untouched. True publishes a complete prefix
+        in this leased slot, with no dynamic history. The external writer owns
+        content identity and any cross-stream dependency; we never fetch KV.
+        """
+        if self.prefix_loader is None and restore_prefix is None:
+            return False
+        error, hit = None, False
+        try:
+            if restore_prefix is not None:
+                self.cache.clear()
+                restore_prefix(self.cache)
+                hit = True
+            else:
+                hit = self.prefix_loader(self.cache, inputs, prompt, prefix)
+            if type(hit) is not bool:
+                raise ValueError("Prefix loader must return a boolean")
+            if hit:
+                from sglang.multimodal_gen.runtime.models.dits.zing_h3 import (
+                    get_ulysses_ctx,
+                )
+
+                cache = self.cache
+                host = self.sampler._layout_index(prefix).host
+                chunk = cache.prefix
+                if (
+                    not cache.pooled
+                    or not cache.raw_store
+                    or chunk is None
+                    or cache.committed
+                    or cache.active is not None
+                    or cache.pending_source is not None
+                    or cache.last_block != 0
+                    or chunk.offset != 0
+                    or cache._length != host["block_idx"].numel()
+                    or chunk.host_positions is None
+                    or not torch.equal(chunk.host_positions, host["position_ids"])
+                    or chunk.block != 0
+                ):
+                    raise ValueError(
+                        "Prefix loader must publish matching prefix-only pooled KV"
+                    )
+                if (
+                    self.sampler.joint_forward != "cross_chunk"
+                    or self.sampler.do_cfg
+                    or self.audio_enabled
+                    or self.sampler.solver != "few_step"
+                    or self.sampler.window_eviction_timing != "after_step0"
+                    or get_ulysses_ctx()[0] not in (1, 2, 4)
+                ):
+                    raise ValueError(
+                        "Cached prefix requires video-only cross-chunk joint execution"
+                    )
+        except Exception as exc:
+            error = exc
+        self.sampler._agree_sp_boundary(
+            self.cache,
+            0,
+            phase="cached_prefix_load",
+            ready_route=(hit,),
+            precheck_error=error is not None,
+            local_error=error,
+        )
+        if error is not None:
+            raise error
+        key = "cached_prefix_hits" if hit else "cached_prefix_misses"
+        self.metrics[key] = self.metrics.get(key, 0) + 1
+        return hit
+
     def _prefix_prediction(self, current, graph_eligible):
         """Consume the session-owned prefix at the first target of the new epoch."""
         if self._pending_prefix is None:
@@ -330,6 +420,7 @@ class SourceReadySession:
             ZingChunkGraphs,
         )
         from sglang.multimodal_gen.runtime.models.dits.zing_h3_joint import (
+            CACHED_PREFIX_PHASES,
             PREFIX_PHASES,
         )
         from sglang.multimodal_gen.runtime.models.dits.zing_h3_prefix_graph import (
@@ -358,6 +449,10 @@ class SourceReadySession:
         )
         packs, self._pending_prefix = self._pending_prefix, None
         if not supported:
+            if self._cached_prefix_ready:
+                raise ValueError(
+                    "Cached prompt switch requires supported joint execution"
+                )
             # The same packed tensors feed the established serial cache contract.
             sampler._forward(packs[0], cache, "prefix")
             for packed in packs[1:]:
@@ -417,7 +512,10 @@ class SourceReadySession:
             )
         else:
             prediction = sampler._predict_joint(
-                packs, PREFIX_PHASES, current.visual.shape[2:], cache
+                packs,
+                CACHED_PREFIX_PHASES if self._cached_prefix_ready else PREFIX_PHASES,
+                current.visual.shape[2:],
+                cache,
             )
             if prediction is None:
                 raise RuntimeError(
@@ -594,6 +692,8 @@ class SourceReadySession:
                 self.total_latent_frames,
                 self.defer_final,
                 self.cache is not None and self.cache.active is not None,
+                self.prompt_joint,
+                self.prefix_loader is not None,
             ),
         )
 
@@ -705,10 +805,18 @@ class SourceReadySession:
             self.cache,
             generation_block_index=int(ready.chunk.chunk_id),
         )
+        if self.prefix_loader is not None and not self._prefix_load_attempted:
+            self._prefix_load_attempted = True
+            prefix = sampler._select_block(
+                positive, 0, phase="prefix", video_t=1, audio_t=1
+            )
+            self._cached_prefix_ready = self._load_prefix(self.inputs, prompt, prefix)
         return current, origin
 
     def _apply_prefix(self, current, prompt):
         if prompt is self.applied_prompt:
+            return
+        if self._cached_prefix_ready:
             return
         # Later prompt changes rebuild the full rolling prefix before _prepare.
         # This path only initializes an empty session cache.
@@ -734,8 +842,7 @@ class SourceReadySession:
             self.capture_initial_prefix = None
 
     def _finish(self, ready, current, prompt, origin):
-        # The joint miss route creates its prefix after activation. Capture only
-        # after that forward has committed, using the same hook as startup.
+        # A joint miss publishes the new prefix in its first target forward.
         if self.capture_initial_prefix is not None:
             self.capture_initial_prefix(self.cache.prefix)
             self.capture_initial_prefix = None
@@ -773,12 +880,16 @@ class SourceReadySession:
 
     def _step(self):
         ready = self.pending[0]
-        self._activate_pending_prompt(ready)
+        self._activate_pending_prompt(ready, defer_prefix=True)
         prompt = self.prompt
         current, origin = self._prepare(ready, prompt, self.media_origin)
         with self.rng.random_stream(self.sampler.device, self.seed):
             self._apply_prefix(current, prompt)
-            self.sampler.step(current)
+            if self._pending_prefix is None:
+                self.sampler.step(current)
+            else:
+                first = self._prefix_prediction(current, False)
+                self.sampler.step(current, first_prediction=first)
         return self._finish(ready, current, prompt, origin)
 
     @torch.no_grad()
@@ -1055,6 +1166,8 @@ class SourceReadySession:
         self.rng.dispose()
         self.inputs = self.prompt = self.pending_prompt = self.applied_prompt = None
         self.recent_visual = self.sampler = None
+        self.prefix_loader = None
         self.restore_initial_prefix = self.capture_initial_prefix = None
         self.prepare_prompt_prefix = None
+        self._cached_prefix_ready = False
         self.closed = True

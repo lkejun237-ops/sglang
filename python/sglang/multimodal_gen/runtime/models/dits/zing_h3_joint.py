@@ -130,25 +130,30 @@ class ZingJointTransaction:
 
 
 PREFIX_PHASES = ("prefix", "history", "history", "history", "source", "active")
+CACHED_PREFIX_PHASES = PREFIX_PHASES[1:]
 
 
 class PrefixJointTransaction:
     def __init__(self, cache, phases, positions, blocks, roles, t, clean):
         if (
-            tuple(phases) != PREFIX_PHASES
+            tuple(phases) not in (PREFIX_PHASES, CACHED_PREFIX_PHASES)
             or not cache.raw_store
             or cache.local_frames != -1
         ):
-            raise ValueError("Prompt joint requires the six-branch raw cache contract")
+            raise ValueError("Prompt joint requires the raw prefix/history contract")
+        cached = tuple(phases) == CACHED_PREFIX_PHASES
         if (
-            cache.prefix is not None
+            (cache.prefix is None if cached else cache.prefix is not None)
             or cache.committed
             or cache.active is not None
             or cache.pending_source is not None
+            or cache.last_block != 0
         ):
-            raise ValueError("Prompt joint requires a cleared cache")
+            raise ValueError(
+                "Prompt joint requires an empty or restored prefix-only cache"
+            )
         ids, counts = torch.unique_consecutive(blocks, return_counts=True)
-        if ids.tolist() != [0, 2, 4, 6, 7, 8]:
+        if ids.tolist() != ([2, 4, 6, 7, 8] if cached else [0, 2, 4, 6, 7, 8]):
             raise ValueError("Expected prefix, history 1+2+2, source7 and target8")
         self.branches = []
         start = 0
@@ -167,7 +172,8 @@ class PrefixJointTransaction:
                 raise ValueError("History and source must be clean")
             self.branches.append(JointBranch(phase, start, stop, frames))
             start = stop
-        if [b.frames for b in self.branches[1:4]] != [
+        history_branches = self.branches[:3] if cached else self.branches[1:4]
+        if [b.frames for b in history_branches] != [
             1,
             2,
             2,
@@ -176,23 +182,32 @@ class PrefixJointTransaction:
         # Prefix coordinates stay absolute. All media use the same mapping as
         # after the sequential prefix commit. Verify every branch's view before
         # entering a transformer layer; never assume union RoPE is equivalent.
-        first = self.branches[0].stop
+        first = 0 if cached else self.branches[0].stop
         shadow = copy.copy(cache)
-        shadow.prefix = SimpleNamespace(positions=positions[:first])
-        mapped, _ = shadow._map_attention_positions(
-            positions, False, history=positions[:0]
+        history = cache.host_positions() if cached else positions[:0]
+        if not cached:
+            shadow.prefix = SimpleNamespace(positions=positions[:first])
+        mapped, mapped_history = shadow._map_attention_positions(
+            positions, False, history
         )
         if not torch.equal(mapped[:first], positions[:first]):
             raise ValueError("Joint prefix coordinates changed")
-        for b in self.branches[1:]:
+        for b in self.branches if cached else self.branches[1:]:
+            prior = torch.cat((history, positions[: b.start]))
             cp, hp = shadow._map_attention_positions(
-                positions[b.start : b.stop], False, positions[: b.start]
+                positions[b.start : b.stop], False, prior
+            )
+            expected_history = (
+                mapped[: b.start]
+                if mapped_history is None
+                else torch.cat((mapped_history, mapped[: b.start]))
             )
             if not torch.equal(cp, mapped[b.start : b.stop]) or not torch.equal(
-                hp, mapped[: b.start]
+                hp, expected_history
             ):
                 raise ValueError("Sequential and joint RoPE views differ")
         self.mapped_positions = mapped
+        self.mapped_history = mapped_history
 
     @property
     def ends(self):
@@ -227,7 +242,7 @@ class PrefixJointTransaction:
 def joint_transaction(cache, phases, positions, blocks, roles, t, clean):
     transaction = (
         PrefixJointTransaction
-        if tuple(phases) == PREFIX_PHASES
+        if tuple(phases) in (PREFIX_PHASES, CACHED_PREFIX_PHASES)
         else ZingJointTransaction
     )
     return transaction(cache, phases, positions, blocks, roles, t, clean)

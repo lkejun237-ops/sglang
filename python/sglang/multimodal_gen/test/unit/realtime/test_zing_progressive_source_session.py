@@ -902,7 +902,7 @@ def test_worker_initialization_uses_command_policy(
         state.initialize(stage, request, {})
     assert state.policy["source_work_quantum"] == 1
     assert state.policy["source_defer_final"] == defer_final
-    assert state.policy["source_prompt_joint"] == prompt_joint
+    assert state.policy["source_prompt_joint"] is prompt_joint
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -923,6 +923,7 @@ def test_block0_prefill_and_live_session_share_command_policy_key(monkeypatch, e
         block0_cache=NS(lookup=lookup),
         _validate_sampling_params=lambda params: None,
         _build_realtime_sampler=lambda params: NS(
+            joint_forward="cross_chunk" if enabled else "off",
             window_policy=NS(window_chunks=6, sink_chunks=3),
             rope_position_mode="block_relative",
             rope_max_frame_gap=12,
@@ -945,4 +946,8 @@ def test_block0_prefill_and_live_session_share_command_policy_key(monkeypatch, e
     command["prompt_joint"] = not enabled
     with pytest.raises(LookupBoundary):
         ZingSourceStreamState().prefill({}, stage=stage, batch=request, config=config)
-    assert keys[2] != keys[0]
+    assert keys[2] != keys[0]  # Joint scheduling remains part of the cache policy.
+    command["defer_final"] = not enabled
+    with pytest.raises(LookupBoundary):
+        ZingSourceStreamState().prefill({}, stage=stage, batch=request, config=config)
+    assert keys[3] != keys[0]

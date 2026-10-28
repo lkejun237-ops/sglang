@@ -11,10 +11,10 @@
 ```bash
 export SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM=1
 export SGLANG_ZING_SOURCE_DEFER_FINAL=1
-export SGLANG_ZING_SOURCE_PROMPT_JOINT=1
+export SGLANG_ZING_BLOCK0_CACHE_MODE=overlap
 ```
 
-两个开关默认均为 0；`SOURCE_PROMPT_JOINT` 的准入与回退见[六分支设计](PROMPT_PREFIX_JOINT_PROBE.md)，不开 Graph 时仍支持 eager 六分支。`SOURCE_DEFER_FINAL` 启用要求 cross_chunk、五帧 history、video-only、无 CFG、after_step0 淘汰、每次 dispatch 一个块，不满足会在入口报错。客户端协议、source credit、事件归属和采样契约不变。
+`SOURCE_DEFER_FINAL` 默认 0；当前 #439 的 prompt 联合执行由 #445 缓存总开关控制，默认 off，上例须先配置 KV pool。旧 `SOURCE_PROMPT_JOINT` 不再控制在线路径，命中五分支、miss 六分支的准入与回退见[缓存消费设计](../specs/CACHED_PREFIX_JOINT.md)，不开 Graph 时仍支持 eager。`SOURCE_DEFER_FINAL` 启用要求 cross_chunk、五帧 history、video-only、无 CFG、after_step0 淘汰、每次 dispatch 一个块，不满足会在入口报错。客户端协议、source credit、事件归属和采样契约不变。
 
 续推与六分支都使用原来的分段 attention。融合 kernel、专用路由及开关已移除；历史脚本应删除该开关。
 

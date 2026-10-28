@@ -270,7 +270,7 @@ class ZingBlockSamplingHelpers:
             "source_first"
             if len(phases) == 2
             else "prompt_joint"
-            if len(phases) == 6
+            if len(phases) in (5, 6)
             else "cross_chunk"
         )
         shapes = self.last_run_metrics.setdefault("joint_row_shapes", {}).setdefault(
@@ -338,7 +338,7 @@ class ZingBlockSamplingHelpers:
                     "source_first"
                     if len(packed["_zing_joint_phases"]) == 2
                     else "prompt_joint"
-                    if len(packed["_zing_joint_phases"]) == 6
+                    if len(packed["_zing_joint_phases"]) in (5, 6)
                     else "cross_chunk"
                 )
             counts[kind] = counts.get(kind, 0) + 1

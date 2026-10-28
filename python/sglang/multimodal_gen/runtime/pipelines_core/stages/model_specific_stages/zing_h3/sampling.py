@@ -142,8 +142,6 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             return None
         if audio is not None:
             raise ValueError("Zing weights-free AdaLN supports video requests only")
-        if self.joint_forward != "off":
-            raise ValueError("Zing weights-free AdaLN does not support joint forwards")
         from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_table import (
             schedule_contract,
         )
@@ -367,7 +365,7 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         )
 
     @torch.no_grad()
-    def step(self, state):
+    def step(self, state, *, first_prediction=None):
         """Denoise one block; any execution failure closes the sampling state."""
         if state.closed or state.index >= len(state.spans):
             raise ValueError("Zing sampling state is closed or complete")
@@ -378,11 +376,17 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         self.device = visual.device
         source, target, start, end = state.spans[state.index]
         try:
-            self._begin_chunk(cache, state.positive, source, target)
+            if first_prediction is None:
+                self._begin_chunk(cache, state.positive, source, target)
             history_rows = sum(c.positions.shape[0] for c in cache._history())
             with maybe_record_function(
                 f"Zing.causal_block{target}.latent{start}-{end}.history_rows{history_rows}"
             ):
+                warm_start = (
+                    {}
+                    if first_prediction is None
+                    else {"first_prediction": first_prediction}
+                )
                 self._sample_block(
                     visual,
                     audio,
@@ -395,6 +399,7 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
                     target,
                     start,
                     end,
+                    **warm_start,
                 )
         except BaseException:
             state.close()

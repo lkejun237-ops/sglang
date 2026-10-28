@@ -3,12 +3,12 @@
 ## 使用与范围
 
 在已配置 weights-free AdaLN table 的连续 source 服务中设置
-`SGLANG_ZING_SOURCE_PROMPT_JOINT=1`，并使用 `joint_forward=cross_chunk`、
+`SGLANG_ZING_BLOCK0_CACHE_MODE=overlap`（先配置 KV pool），并使用 `joint_forward=cross_chunk`、
 few-step、after_step0、纯视频和 raw KV。prompt 切换后的 prefix、三段 history、
 source 和 active 首次求值可进入同一次六分支 forward。SP 仍要求 stable shapes，
 部署层既有的 AdaLN/SP 准入范围不变；固定执行仍要求固定 raw KV 池，
 CUDA Graph 保留已有设备和拓扑检查。
-默认开关不变；这是执行兼容性改动，不改变 prompt 的生效边界、求解步数或权重。
+缓存默认 off，与 #445 一致；旧 `SOURCE_PROMPT_JOINT` 不再控制在线路径。这是执行兼容性改动，不改变 prompt 的生效边界、求解步数或权重。命中走五分支，接口及配置见 [缓存消费设计](../specs/CACHED_PREFIX_JOINT.md)。
 
 此前 session 因 `model.adaln_table is not None` 回退串行；直接调用 eager/fixed
 六分支会报错。完成后按原条件选择六分支，表项不全仍拒绝执行，不恢复已卸载的投影权重。

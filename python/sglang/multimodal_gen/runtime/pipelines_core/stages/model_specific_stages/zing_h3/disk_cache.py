@@ -8,6 +8,7 @@ written independently so sequence-parallel workers never exchange KV bytes.
 
 import json
 import os
+import pickle
 import shutil
 import time
 import uuid
@@ -416,6 +417,18 @@ class Block0DiskCache:
             self._remove_entry(victim)
         return self._normalize(entries)["entries"]
 
+    def may_contain(self, key):
+        """Read-only local-rank hint; do not load conditions/KV or update LRU."""
+        if self.cache_dir is None or self._writable is False or not self._safe_key(key):
+            return False
+        try:
+            folder = self._entry_dir(key)
+            return (folder / ".complete").is_file() and (
+                folder / f"block0_kv_rank_{self.local_rank}.bin"
+            ).is_file()
+        except OSError:
+            return False
+
     def lookup(self, key, rank=0):
         if not self.is_enabled() or not self._safe_key(key):
             return None
@@ -464,7 +477,14 @@ class Block0DiskCache:
                         map_location="cpu",
                         weights_only=False,
                     )
-                except (OSError, RuntimeError, ValueError, TypeError) as exc:
+                except (
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                    TypeError,
+                    EOFError,
+                    pickle.UnpicklingError,
+                ) as exc:
                     logger.warning("Zing Block0 conditions load failed: %s", exc)
                     conditions = None
                 if not isinstance(conditions, dict):

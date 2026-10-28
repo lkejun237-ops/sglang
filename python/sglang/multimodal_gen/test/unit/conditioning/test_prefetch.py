@@ -106,6 +106,55 @@ def test_rpc_starts_before_boundary_and_reuses_result(channel):
     assert len(client.calls) == 1 and prefetch.hits == 1
 
 
+def test_preparation_hit_skips_rpc_before_media_preparation(channel):
+    socket, prefetch, client = channel
+    prepared = []
+    prefetch.prepare = lambda command: prepared.append(command)
+    prefetch.should_prefetch = lambda command: False
+    send(socket, "cached")
+    wait_for(lambda: prefetch.cache_skips == 1)
+    assert not prepared and not client.calls and prefetch.cached is None
+
+
+def test_skipped_hint_can_fall_back_after_eviction_or_partial_rank_miss(channel):
+    socket, prefetch, client = channel
+    prefetch.should_prefetch = lambda command: False
+    send(socket, "cached")
+    wait_for(lambda: prefetch.cache_skips == 1)
+    # The authoritative owner lookup can miss after the advisory local check.
+    result = prefetch.encode("cached", "active", input_digest="cachedactive")
+    assert result["context"] == "cached"
+    assert len(client.calls) == 1 and prefetch.fallbacks == 1
+
+
+def test_cache_hint_keeps_miss_prefetch_and_distinguishes_references(channel):
+    socket, prefetch, client = channel
+    prefetch.should_prefetch = lambda command: command.get("references") != "old"
+    send(socket, "same", references="old")
+    wait_for(lambda: prefetch.cache_skips == 1)
+    send(socket, "same", references="new")
+    wait_for(lambda: prefetch.encodes == 1)
+    assert [call[:2] for call in client.calls] == [("same", "new")]
+    assert prefetch.encode("same", "new", input_digest="samenew")["context"] == "same"
+    assert len(client.calls) == 1 and prefetch.hits == 1
+
+
+def test_cache_hint_failure_keeps_authoritative_boundary_fallback(channel):
+    socket, prefetch, client = channel
+
+    def invalid(command):
+        raise ValueError("Invalid speculative cache key")
+
+    prefetch.should_prefetch = invalid
+    send(socket, "new")
+    wait_for(lambda: prefetch.failures == 1)
+    assert not client.calls
+    assert (
+        prefetch.encode("new", "active", input_digest="newactive")["context"] == "new"
+    )
+    assert len(client.calls) == 1
+
+
 def test_boundary_waits_for_remaining_rpc_without_duplicate_encode(channel):
     socket, prefetch, client = channel
     client.release.clear()
@@ -168,6 +217,7 @@ def test_close_drains_rpc_and_discards_result(channel):
     wait_for(lambda: prefetch.encodes == 1)
     prefetch.close()
     assert not prefetch.thread.is_alive() and prefetch.cached is None
+    assert prefetch.should_prefetch is None
     prefetch.close()
 
 

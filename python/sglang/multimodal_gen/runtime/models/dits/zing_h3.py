@@ -1450,7 +1450,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             )
             row_start, row_stop = layout.row_start, layout.row_stop
             group_sizes = video_ends = None
-            prefix_joint = joint is not None and len(joint.ends) == 6
+            prefix_joint = joint is not None and len(joint.ends) in (5, 6)
             if prefix_joint:
                 if ulysses_size > 1 and not self.experimental_stable_shapes:
                     raise ValueError("Prompt joint SP requires stable output shapes")
@@ -1464,7 +1464,11 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                     )
                 )
                 attention_positions = host_to_device(joint.mapped_positions, x.device)
-                history_positions = None
+                history_positions = (
+                    None
+                    if joint.mapped_history is None
+                    else host_to_device(joint.mapped_history, x.device)
+                )
             else:
                 unique_t, t_indices = torch.unique(
                     meta_t, sorted=True, return_inverse=True
@@ -1520,8 +1524,8 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                         "Zing weights-free AdaLN supports video requests only"
                     )
                 projection_cache = self.adaln_table
-                # Joint forwards use their serial projection groups below,
-                # including the complete mixed-timestep prompt prefix.
+                # Joint forwards preserve each serial timestep batch below,
+                # rather than projecting the combined union of all timesteps.
                 if joint is None:
                     projection_key = projection_cache.lookup(key_unique_t)
             elif self.adaln_projection_cache_enabled and cache is not None:
@@ -1534,23 +1538,22 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                         self.adaln_projection_cache_bytes
                     )
                     cache.adaln_projection_cache = projection_cache
-                if joint is None:
-                    with maybe_record_function("Zing.AdaLN.cache_key"):
-                        projection_key = projection_cache.begin(
-                            key_unique_t,
-                            adaln_input,
-                            self.time_embedder,
-                            self._cache_weight_generation,
-                        )
+                with maybe_record_function("Zing.AdaLN.cache_key"):
+                    projection_key = projection_cache.begin(
+                        key_unique_t,
+                        adaln_input,
+                        self.time_embedder,
+                        self._cache_weight_generation,
+                    )
             elif cache is not None and cache.adaln_projection_cache is not None:
                 cache.adaln_projection_cache.clear()
                 cache.adaln_projection_cache = None
 
             branch_projection_keys = None
             if joint is not None and projection_cache is not None:
-                # Keys follow projection groups, not token branches. A mixed
-                # prefix needs its full batch entry; clean history/source share
-                # a singleton entry. Preserve the resident GEMM shapes exactly.
+                # Clean/source groups share t=1; a six-branch prefix may have
+                # mixed condition/reference times. Key complete serial GEMM
+                # batches so neither cache mode changes projection rounding.
                 branch_projection_keys = [
                     projection_cache.lookup(times)
                     if self.adaln_table is not None
@@ -1563,6 +1566,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                     for times, embedding in zip(
                         key_unique_t.split(group_sizes or 1),
                         adaln_input.split(group_sizes or 1),
+                        strict=True,
                     )
                 ]
 
@@ -1693,7 +1697,9 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 metadata.clear()
 
     @torch.no_grad()
-    def prepare_fixed_forward(self, *, packed, kv_plan, phase, _model_state=None):
+    def prepare_fixed_forward(
+        self, *, packed, kv_plan, phase, _model_state=None, projection_cache=None
+    ):
         """Validate/pack on the host; execution contains only device arithmetic.
 
         The cache owner prepares effective RoPE coordinates and each branch's
@@ -1781,7 +1787,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         )
         unique_t, t_indices = torch.unique(host_t, sorted=True, return_inverse=True)
         group_sizes = video_ends = None
-        prefix_joint = joint and len(ends) == 6
+        prefix_joint = joint and len(ends) in (5, 6)
         if prefix_joint:
             if size > 1 and not self.experimental_stable_shapes:
                 raise ValueError("Prompt joint SP requires stable output shapes")
@@ -1817,31 +1823,42 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         tensors.update({"kv." + name: value for name, value in kv_plan.tensors.items()})
         # Initialize the embedder's immutable frequency buffer outside capture.
         self.time_embedder(tensors["unique_t"].float())
-        table_keys = None
-        if self.adaln_table is not None:
-            if packed["audio_x"].shape[0]:
+        # Resolve small modulation outputs before capture. Replay copies these
+        # tensors just like latent inputs; it never runs Python cache operations.
+        projection_cache = self.adaln_table or projection_cache
+        precomputed_projections = projection_cache is not None
+        if precomputed_projections:
+            if self.adaln_table is not None and packed["audio_x"].shape[0]:
                 raise ValueError("Zing weights-free AdaLN supports video requests only")
-            # Resolve every complete serial batch before capture. Concatenating
-            # group results is valid; synthesizing a mixed batch from singleton
-            # table rows would change the BF16 projection arithmetic.
-            groups = unique_t.split(group_sizes or 1) if joint else (unique_t,)
-            table_keys = [self.adaln_table.lookup(times) for times in groups]
-            adaln = F.silu(self.time_embedder(tensors["unique_t"].float())).bfloat16()
+            time_groups = unique_t.split(group_sizes or 1) if joint else (unique_t,)
+            device_groups = (
+                tensors["unique_t"].split(group_sizes or 1)
+                if joint
+                else (tensors["unique_t"],)
+            )
+            embeddings = [
+                F.silu(self.time_embedder(t.float())).bfloat16() for t in device_groups
+            ]
+            keys = [
+                projection_cache.lookup(t)
+                if self.adaln_table is not None
+                else projection_cache.begin(
+                    t, embedding, self.time_embedder, self._cache_weight_generation
+                )
+                for t, embedding in zip(time_groups, embeddings, strict=True)
+            ]
             for slot, module in [
                 *((i, b.adaln_proj) for i, b in enumerate(self.blocks)),
                 ("final", self.final_layer.adaln_proj),
             ]:
                 parts = [
-                    self.adaln_table.project(slot, module, adaln, key)
-                    for key in table_keys
+                    projection_cache.project(slot, module, embedding, key)
+                    for embedding, key in zip(embeddings, keys, strict=True)
                 ]
-                values = (
-                    tuple(torch.cat(values) for values in zip(*parts))
-                    if joint
-                    else parts[0]
-                )
-                for i, value in enumerate(values):
-                    tensors[f"projection.{slot}.{i}"] = value
+                for i, values in enumerate(zip(*parts)):
+                    tensors[f"projection.{slot}.{i}"] = (
+                        values[0] if len(parts) == 1 else torch.cat(values)
+                    )
         optimized_fixed_480p = validated_fixed_480p(
             host,
             device,
@@ -1915,7 +1932,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 options, fixed_tensors=kv_tensors, full_rope=full_rope
             )
             projections = None
-            if table_keys is not None:
+            if precomputed_projections:
                 projections = [
                     tuple(
                         static[f"projection.{slot}.{i}"]
@@ -1950,7 +1967,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             self.experimental_attention_backend,
             self.experimental_stable_shapes,
             self.experimental_compiled_adaln,
-            table_keys is not None,
+            precomputed_projections,
             tuple(
                 (name, tuple(value.shape), value.dtype, value.device)
                 for name, value in sorted(tensors.items())
