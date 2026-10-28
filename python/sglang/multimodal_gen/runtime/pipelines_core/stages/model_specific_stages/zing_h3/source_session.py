@@ -39,10 +39,16 @@ from .streaming_noise import STREAMING_NOISE_VERSION
 logger = init_logger(__name__)
 
 
-def _source_key_policy(stage, sampler, work_quantum):
+def _source_key_policy(stage, sampler, work_quantum, command):
     """Policy fields that must be identical for a warmup and a live session."""
-    defer_final = os.environ.get("SGLANG_ZING_SOURCE_DEFER_FINAL", "0") == "1"
-    prompt_joint = os.environ.get("SGLANG_ZING_SOURCE_PROMPT_JOINT", "0") == "1"
+    defer_final = command.get(
+        "defer_final", os.environ.get("SGLANG_ZING_SOURCE_DEFER_FINAL", "0") == "1"
+    )
+    prompt_joint = command.get(
+        "prompt_joint", os.environ.get("SGLANG_ZING_SOURCE_PROMPT_JOINT", "0") == "1"
+    )
+    if type(defer_final) is not bool or type(prompt_joint) is not bool:
+        raise ValueError("Source scheduling flags must be boolean")
     if defer_final and work_quantum != 1:
         raise ValueError("Deferred source final currently requires work quantum 1")
     if sampler.window_policy.window_chunks is None:
@@ -80,7 +86,8 @@ class ZingSourceStreamState(BaseRealtimeState):
         self.kv_lease = None
         self.pending_output = None
         self.remote_decoder = False
-        self.work_quantum = source_work_quantum()
+        # Resolve once from the API's deployment command, not a worker-local env.
+        self.work_quantum = None
         self.end_received = self.bridge_finished = False
         self.dispatch_steps = 0
         self.block0_cache = self.block0_entry = self.block0_restore = None
@@ -94,6 +101,7 @@ class ZingSourceStreamState(BaseRealtimeState):
         params = batch.sampling_params
         stage._validate_sampling_params(params)
         command = batch.extra["zing_source_command"]
+        self.work_quantum = source_work_quantum(command.get("work_quantum"))
         sampling_options = (
             {"source_sampling_schedule": command["sampling_schedule"]}
             if "sampling_schedule" in command
@@ -101,7 +109,7 @@ class ZingSourceStreamState(BaseRealtimeState):
         )
         sampler = stage._build_realtime_sampler(params, **sampling_options)
         self.policy, defer_final, prompt_joint = _source_key_policy(
-            stage, sampler, self.work_quantum
+            stage, sampler, self.work_quantum, command
         )
         self.qwen_init_host_ms = None
 
@@ -324,8 +332,10 @@ class ZingSourceStreamState(BaseRealtimeState):
             ),
         )
         self.sampler = sampler
-        self.work_quantum = source_work_quantum()
-        self.policy, _, _ = _source_key_policy(stage, sampler, self.work_quantum)
+        self.work_quantum = source_work_quantum(command.get("work_quantum"))
+        self.policy, _, _ = _source_key_policy(
+            stage, sampler, self.work_quantum, command
+        )
 
         from .preparation_cache import preparation_key, preparation_request
 
@@ -506,26 +516,23 @@ class ZingSourceStreamState(BaseRealtimeState):
                     raise ConditionError(
                         "CONDITION_BUSY", "Previous conditioning work has not drained"
                     )
-                if getattr(provider.client, "result_transport", "http") == "nccl":
-                    # The prefetcher owns CPU HTTP results only. NCCL receives
-                    # must stay on the worker thread until GPU prefetch has its
-                    # own stream and result-lifetime contract.
-                    logger.warning(
-                        "HTTP conditioning prefetch is disabled for NCCL results; "
-                        "encoding runs at the worker update boundary"
-                    )
-                else:
-                    self.conditioning_prefetch = ConditioningPrefetch(
-                        endpoint,
-                        prepare=prepare,
-                        identity=identity,
-                        client=provider.client,
-                        max_bytes=command["conditioning_prefetch_max_bytes"],
-                    )
-                    provider._prefetch_owner = self.conditioning_prefetch
-                    batch.session.get_or_create_state(
-                        WorkerConditioningState
-                    ).prefetch = self.conditioning_prefetch
+                self.conditioning_prefetch = ConditioningPrefetch(
+                    endpoint,
+                    prepare=prepare,
+                    identity=identity,
+                    client=provider.client,
+                    max_bytes=command["conditioning_prefetch_max_bytes"],
+                    device=(
+                        torch.device("cuda", torch.cuda.current_device())
+                        if getattr(provider.client, "result_transport", "http")
+                        == "nccl"
+                        else None
+                    ),
+                )
+                provider._prefetch_owner = self.conditioning_prefetch
+                batch.session.get_or_create_state(
+                    WorkerConditioningState
+                ).prefetch = self.conditioning_prefetch
             except Exception:
                 logger.exception("Conditioning prefetch startup failed")
                 receipt = {"ok": False}
@@ -705,6 +712,8 @@ class ZingSourceStreamState(BaseRealtimeState):
             raise ValueError("Continuous source commands must be consecutive")
         self.session_id = batch.realtime_session_id
         command = batch.extra["zing_source_command"]
+        if self.work_quantum is None:
+            self.work_quantum = source_work_quantum(command.get("work_quantum"))
         measure_cuda = command.get("measure_cuda", False)
         trace = trace_for_batch(batch)
         timings, outputs, metadata = {}, [], []

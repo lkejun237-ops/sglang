@@ -844,3 +844,105 @@ def test_remote_decoder_returns_one_reference_per_dispatch(
     )
     if not final:
         state.dispose()
+
+
+@pytest.mark.parametrize("quantum", [0, 1])
+def test_worker_command_quantum_overrides_worker_environment(monkeypatch, quantum):
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", "invalid")
+    state, stage = session(ChunkPlan([1, 2, 2]))
+    request = batch(state, 0, 17, 0)
+    request.extra["zing_source_command"]["work_quantum"] = quantum
+    result = state.run(stage, request)
+    assert state.work_quantum == quantum
+    if quantum == 1:
+        assert result.usage["zing_source_dispatch_steps"] == 1
+        assert result.usage["zing_source_more_work"]
+    else:
+        assert result.usage["zing_source_dispatch_steps"] > 1
+    state.dispose()
+
+
+@pytest.mark.parametrize("defer_final,prompt_joint", [(False, False), (True, True)])
+def test_worker_initialization_uses_command_policy(
+    monkeypatch, defer_final, prompt_joint
+):
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", "invalid")
+    monkeypatch.setenv("SGLANG_ZING_SOURCE_DEFER_FINAL", "0" if defer_final else "1")
+    monkeypatch.setenv("SGLANG_ZING_SOURCE_PROMPT_JOINT", "0" if prompt_joint else "1")
+
+    class MediaBoundary(Exception):
+        pass
+
+    def prepare(*args, **kwargs):
+        raise MediaBoundary()
+
+    stage = NS(
+        _validate_sampling_params=lambda params: None,
+        _build_realtime_sampler=lambda params: NS(
+            window_policy=NS(window_chunks=21, sink_chunks=3),
+            rope_position_mode="block_relative",
+            rope_max_frame_gap=12,
+        ),
+        _build_request=lambda batch: {},
+        _conditioning_consumer=lambda batch: None,
+        codecs=NS(video_decoder_name="test", prepare=prepare),
+    )
+    request = NS(
+        sampling_params=NS(),
+        extra={
+            "zing_source_command": {
+                "work_quantum": 1,
+                "defer_final": defer_final,
+                "prompt_joint": prompt_joint,
+            }
+        },
+    )
+    state = ZingSourceStreamState()
+    with pytest.raises(MediaBoundary):
+        state.initialize(stage, request, {})
+    assert state.policy["source_work_quantum"] == 1
+    assert state.policy["source_defer_final"] == defer_final
+    assert state.policy["source_prompt_joint"] == prompt_joint
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_block0_prefill_and_live_session_share_command_policy_key(monkeypatch, enabled):
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", "invalid")
+    for name in ("SGLANG_ZING_SOURCE_DEFER_FINAL", "SGLANG_ZING_SOURCE_PROMPT_JOINT"):
+        monkeypatch.setenv(name, "0" if enabled else "1")
+    keys = []
+
+    class LookupBoundary(Exception):
+        pass
+
+    def lookup(key):
+        keys.append(key)
+        raise LookupBoundary()
+
+    stage = NS(
+        block0_cache=NS(lookup=lookup),
+        _validate_sampling_params=lambda params: None,
+        _build_realtime_sampler=lambda params: NS(
+            window_policy=NS(window_chunks=6, sink_chunks=3),
+            rope_position_mode="block_relative",
+            rope_max_frame_gap=12,
+        ),
+        _build_request=lambda batch: {},
+        codecs=NS(video_decoder_name="test"),
+    )
+    config = dict(width=832, height=480, fps=24)
+    command = dict(work_quantum=1, defer_final=enabled, prompt_joint=enabled)
+    request = NS(sampling_params=NS(), extra={"zing_source_command": command})
+    live, warmup = ZingSourceStreamState(), ZingSourceStreamState()
+    with pytest.raises(LookupBoundary):
+        live.initialize(stage, request, config)
+    with pytest.raises(LookupBoundary):
+        warmup.prefill({}, stage=stage, batch=request, config=config)
+    assert keys[0] == keys[1]
+    assert live.policy == warmup.policy
+    assert warmup.policy["source_defer_final"] is enabled
+    assert warmup.policy["source_prompt_joint"] is enabled
+    command["prompt_joint"] = not enabled
+    with pytest.raises(LookupBoundary):
+        ZingSourceStreamState().prefill({}, stage=stage, batch=request, config=config)
+    assert keys[2] != keys[0]

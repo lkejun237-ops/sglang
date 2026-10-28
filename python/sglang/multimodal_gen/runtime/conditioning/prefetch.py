@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Session-private early conditioning RPC; GPU collectives stay on the caller."""
+"""Session-private early conditioning; SP collectives stay on the caller."""
 
 import asyncio
 import logging
@@ -79,16 +79,20 @@ class PromptPrefetchPublisher:
 
 
 class ConditioningPrefetch:
-    """One CPU receiver/encoder thread and one digest-checked CPU result.
+    """One receiver/encoder thread and one digest-checked result.
 
     The same lock serializes boundary fallback and speculative RPC. No SP
-    collective, CUDA allocation, or active prompt mutation runs in this thread.
+    collective or active prompt mutation runs in this thread. NCCL results are
+    received on the client's private stream and completed before publication.
     """
 
-    def __init__(self, endpoint, *, prepare, identity, client, max_bytes):
+    def __init__(self, endpoint, *, prepare, identity, client, max_bytes, device=None):
         if not isinstance(endpoint, str) or not endpoint.startswith("ipc:///"):
             raise ValueError("Conditioning prefetch requires a private local endpoint")
         self.prepare, self.identity, self.client = prepare, identity, client
+        if getattr(client, "result_transport", "http") == "nccl" and device is None:
+            raise ValueError("NCCL prefetch requires the DiT leader device")
+        self.device = device
         self.max_bytes = max_bytes
         self.lock = threading.Lock()
         self.stop = threading.Event()
@@ -104,7 +108,7 @@ class ConditioningPrefetch:
 
     def encode(self, prompt, media, *, input_digest):
         # If the receiver is already encoding this input, wait only for its
-        # remaining work, then reuse the CPU result. Verify against the actual
+        # remaining work, then reuse the result. Verify against the actual
         # worker-normalized input, never merely an event ID.
         deadline = self.client.clock() + self.client.timeout_s
         if not self.lock.acquire(timeout=self.client.timeout_s):
@@ -118,13 +122,26 @@ class ConditioningPrefetch:
                 self.hits += 1
                 return self.cached[1]
             self.fallbacks += 1
-            value = self.client.encode(
+            value = self._encode(
                 prompt, media, input_digest=input_digest, deadline=deadline
             )
             self.cached = input_digest, value
             return value
         finally:
             self.lock.release()
+
+    def _encode(self, prompt, media, *, input_digest, deadline=None):
+        if getattr(self.client, "result_transport", "http") == "nccl":
+            return self.client.encode_device(
+                prompt,
+                media,
+                input_digest=input_digest,
+                device=self.device,
+                deadline=deadline,
+            )
+        return self.client.encode(
+            prompt, media, input_digest=input_digest, deadline=deadline
+        )
 
     def _receive(self, endpoint):
         context = zmq.Context()
@@ -155,7 +172,7 @@ class ConditioningPrefetch:
                         # packet was received. Do not encode the same input again.
                         if self.cached is not None and self.cached[0] == digest:
                             continue
-                        result = self.client.encode(prompt, media, input_digest=digest)
+                        result = self._encode(prompt, media, input_digest=digest)
                         self.encodes += 1
                         if not self.stop.is_set():
                             self.cached = digest, result

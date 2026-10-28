@@ -17,6 +17,7 @@ if __name__ == "__main__":
 from types import SimpleNamespace
 
 import pytest
+
 from sglang.multimodal_gen.runtime.conditioning import cli
 from sglang.multimodal_gen.runtime.conditioning.client import (
     ConditioningClient,
@@ -109,12 +110,14 @@ def test_serve_warns_when_leaving_the_validated_loopback_scope(
     monkeypatch, caplog, host, tls, warned
 ):
     import uvicorn
+
     from sglang.multimodal_gen.runtime.conditioning import native, service
 
     config = {
         "native": {"model_path": "m", "gpu_id": 0},
         "tokens": {},
         "tls": tls and {"certificate": "c", "private_key": "k", "ca": "a"},
+        "result_transport": "http",
     }
     monkeypatch.setattr(
         cli,

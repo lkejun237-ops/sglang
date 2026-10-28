@@ -371,16 +371,24 @@ class ConditioningClient:
                 "CONDITION_INVALID", "Conditioning result transports differ"
             )
 
-    def encode_device(self, prompt, media, *, input_digest, device):
+    def encode_device(self, prompt, media, *, input_digest, device, deadline=None):
         from .nccl import NcclReceiver
         from .wire import encode_request
 
+        deadline = (
+            min(deadline, self.clock() + self.timeout_s)
+            if deadline is not None
+            else self.clock() + self.timeout_s
+        )
         self.validate_input(prompt, media)
+        remaining = deadline - self.clock()
+        if remaining <= 0:
+            raise ConditionError("CONDITION_TIMEOUT")
         body = encode_request(
             prompt,
             media,
             self.profile_id,
-            int(self.timeout_s * 1000),
+            max(1, int(remaining * 1000)),
             input_digest=input_digest,
         )
         if len(body) > self.max_request_bytes:
@@ -389,7 +397,7 @@ class ConditioningClient:
             )
         if self._nccl is None:
             self._nccl = NcclReceiver(self)
-        return self._nccl.encode(body, input_digest, device)
+        return self._nccl.encode(body, input_digest, device, deadline=deadline)
 
     def validate_input(self, prompt, media):
         """Check metadata before hashing, cloning tensors or serializing RGB."""

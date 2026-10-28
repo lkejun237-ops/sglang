@@ -2,6 +2,8 @@
 
 基线：`seedleap/sglang` main `a99560cf901be9b1589bcc9537593e9cc3883fb4`。本功能只改变 Qwen 条件结果的传输方式，不改变编码算子，不引入前缀复用或异步编码。
 
+后续集成：基于 main `7add23fd79` 的 [NCCL 提前编码适配](QWEN_NCCL_PREFETCH.md) 已连接设备结果与预取器；同时启用 `result_transport: "nccl"` 和 `--zing-conditioning-prefetch` 后可以提前编码/接收。下文 2026-10-26 禁用预取的说明与 GPU 测量保留为原 #415 的历史版本记录，不代表新适配的行为或验收。
+
 ## 使用与边界
 
 目标是让远程 Qwen 的 BF16 `context[rows,5120]` 和 I64 `row_role[rows]` 直接进入 DiT leader GPU，再沿现有 SP GPU 广播。输入 RGB、身份、形状、完成通知仍走 HTTP。新增配置 `result_transport: "nccl"`，服务端与客户端均显式开启；默认 `"http"` 保留原行为。

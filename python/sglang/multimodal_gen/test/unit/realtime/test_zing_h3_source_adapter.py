@@ -2187,3 +2187,123 @@ def test_adapter_init_applies_disagg_role_policies(configured):
         == 31005
     ), "profile source_encoder remote port must be injected from disagg_encoder_port"
     asyncio.run(adapter.close_conditioning(session))
+
+
+@pytest.mark.parametrize("quantum", [0, 1])
+def test_cli_source_policy_reaches_worker_command(configured, monkeypatch, quantum):
+    configured.disagg_encoder_port = 31005
+    configured.disagg_decoder_port = 31007
+    configured.zing_source_encoder_mode = "overlap"
+    configured.zing_source_encoder_prefetch = True
+    configured.zing_source_async_output = True
+    configured.zing_source_work_quantum = quantum
+    configured.zing_source_defer_final = False
+    configured.zing_source_prompt_joint = False
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", "invalid")
+    monkeypatch.setenv("SGLANG_ZING_SOURCE_DEFER_FINAL", "1")
+    monkeypatch.setenv("SGLANG_ZING_SOURCE_PROMPT_JOINT", "1")
+    profile_path = Path(configured.model_path) / "zing_realtime_profile.json"
+    original = profile_path.read_bytes()
+    # Keep the generic request factory isolated; test the real source command assembly.
+    monkeypatch.setattr(
+        source.BaseRealtimeModelAdapter,
+        "prepare_next_request",
+        lambda *a: SimpleNamespace(extra={}, block_idx=0),
+    )
+    adapter, session = initialize()
+    try:
+        command = adapter.prepare_next_request(session, configured, None).extra[
+            "zing_source_command"
+        ]
+        command = msgspec.msgpack.decode(msgspec.msgpack.encode(command))
+        assert command["work_quantum"] == quantum
+        assert command["defer_final"] is False and command["prompt_joint"] is False
+        assert command["async_output"] is True
+        assert command["encoder"]["remote"]["mode"] == "overlap"
+        assert command["encoder"]["remote"]["cross_dispatch_prefetch"] is True
+        assert command["encoder"]["remote"]["admission_endpoint"].startswith("ipc:///")
+        assert command["decoder"]["remote"]["port"] == 31007
+        assert profile_path.read_bytes() == original
+    finally:
+        adapter.clear_state(session)
+
+
+def test_cli_false_disables_profile_policies(configured):
+    profile_path = Path(configured.model_path) / "zing_realtime_profile.json"
+    profile = json.loads(profile_path.read_text())
+    profile.update(
+        async_source_output=True,
+        source_encoder={
+            "mode": "progressive",
+            "remote": {
+                "port": 31005,
+                "mode": "overlap",
+                "cross_dispatch_prefetch": True,
+            },
+        },
+    )
+    profile_path.write_text(json.dumps(profile))
+    configured.zing_source_encoder_prefetch = False
+    configured.zing_source_encoder_mode = "serial"
+    configured.zing_source_async_output = False
+    adapter, session = initialize()
+    try:
+        assert adapter.profile["async_source_output"] is False
+        assert adapter.source_encoder["remote"] == {
+            "port": 31005,
+            "mode": "serial",
+            "cross_dispatch_prefetch": False,
+        }
+        assert adapter.admission_socket is None
+        assert json.loads(profile_path.read_text()) == profile
+    finally:
+        adapter.clear_state(session)
+
+
+def test_cli_prefetch_requires_remote_overlap(configured):
+    configured.zing_source_encoder_prefetch = True
+    with pytest.raises(ValueError, match="requires a remote Encoder"):
+        initialize()
+    configured.disagg_encoder_port = 31005
+    configured.zing_source_encoder_mode = "serial"
+    with pytest.raises(ValueError, match="overlap deployment"):
+        initialize()
+
+
+def test_cli_decoder_overlap_uses_explicit_quantum(configured, monkeypatch):
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", "0")
+    configured.zing_source_work_quantum = 1
+    configured.zing_source_decoder_overlap = True
+    configured.disagg_decoder_port = 31007
+    adapter, session = initialize()
+    try:
+        assert adapter.source_decoder_overlap and adapter.source_work_quantum == 1
+    finally:
+        adapter.clear_state(session)
+
+
+@pytest.mark.parametrize("mode", ["off", "source_first", "cross_chunk"])
+def test_cli_joint_forward_overrides_profile(configured, monkeypatch, mode):
+    profile_path = Path(configured.model_path) / "zing_realtime_profile.json"
+    profile = json.loads(profile_path.read_text())
+    profile["joint_forward"] = "off" if mode == "cross_chunk" else "cross_chunk"
+    profile_path.write_text(json.dumps(profile))
+    configured.zing_source_joint_forward = mode
+    adapter, session = initialize()
+    try:
+        monkeypatch.setattr(
+            source,
+            "build_realtime_sampling_params",
+            lambda *a, **kw: SimpleNamespace(**kw),
+        )
+        params = adapter.build_sampling_params(
+            session,
+            configured,
+            SimpleNamespace(request_id="joint-cli"),
+            SimpleNamespace(prompt="snow"),
+            17,
+        )
+        assert params.zing_joint_forward == mode
+        assert json.loads(profile_path.read_text()) == profile
+    finally:
+        adapter.clear_state(session)

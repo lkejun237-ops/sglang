@@ -107,7 +107,7 @@ def _broadcast_tensor(tensor, name):
 
 
 def _allocate(shapes, device, positive):
-    return {
+    transferred = {
         name: positive[name].to(device=device)
         if positive is not None
         else torch.empty(
@@ -117,6 +117,13 @@ def _allocate(shapes, device, positive):
         )
         for name, shape in shapes.items()
     }
+    if positive is not None and torch.device(device).type == "cuda":
+        # Prefetched NCCL storage was allocated on the private receive stream.
+        # Cache replacement must not recycle it while SP/DiT still consumes it.
+        stream = torch.cuda.current_stream(device)
+        for tensor in transferred.values():
+            tensor.record_stream(stream)
+    return transferred
 
 
 def _failure(receipts):
@@ -209,7 +216,10 @@ class RemoteConditioner:
                     max_input_bytes=limits.max_input_bytes,
                     max_decoded_pixels=limits.max_decoded_pixels,
                 ),
-                result_transport=config.get("result_transport", "http"),
+                result_transport=(
+                    getattr(args, "conditioning_result_transport", None)
+                    or config.get("result_transport", "nccl")
+                ),
                 retry_initial_s=config.get("retry_initial_s", 0.05),
                 retry_max_s=config.get("retry_max_s", 0.5),
             )
@@ -286,13 +296,14 @@ class RemoteConditioner:
         positive = announcement = None
         if self.rank == 0:
             try:
-                if getattr(self.client, "result_transport", "http") == "nccl":
+                if state.prefetch is not None:
+                    positive = state.prefetch.encode(prompt, media, input_digest=digest)
+                elif getattr(self.client, "result_transport", "http") == "nccl":
                     positive = self.client.encode_device(
                         prompt, media, input_digest=digest, device=device
                     )
                 else:
-                    encoder = state.prefetch or self.client
-                    positive = encoder.encode(prompt, media, input_digest=digest)
+                    positive = self.client.encode(prompt, media, input_digest=digest)
                 announcement = {
                     "ok": True,
                     "shapes": {
@@ -315,7 +326,9 @@ class RemoteConditioner:
         try:
             transferred = self.allocate(announcement["shapes"], device, positive)
             if torch.device(device).type == "cuda":
-                torch.cuda.synchronize(device)
+                # NCCL candidates are already ready. Wait only for this
+                # consumer's allocations/copies, not the next prefetch receive.
+                torch.cuda.current_stream(device).synchronize()
             transfer = {"ok": True}
         except Exception:
             logger.exception("Conditioning allocation or host transfer failed")

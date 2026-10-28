@@ -457,6 +457,15 @@ class ServerArgs(DisaggServerArgsMixin):
     zing_conditioning_mode: str = "local"
     zing_conditioning_prefetch: bool = False
     zing_source_decoder_overlap: bool = False
+    # None preserves legacy environment/profile settings; explicit false overrides them.
+    zing_source_work_quantum: int | None = None
+    zing_source_encoder_mode: str | None = None
+    zing_source_joint_forward: str | None = None
+    zing_source_encoder_prefetch: bool | None = None
+    zing_source_async_output: bool | None = None
+    zing_source_defer_final: bool | None = None
+    zing_source_prompt_joint: bool | None = None
+    conditioning_result_transport: str | None = None
     encoder_gpus: str | None = None
     denoiser_gpus: str | None = None
     decoder_gpus: str | None = None
@@ -680,6 +689,35 @@ class ServerArgs(DisaggServerArgsMixin):
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
         self._validate_scheduler_rpc_timeout()
+        if self.conditioning_result_transport not in {None, "http", "nccl"}:
+            raise ValueError("Unknown conditioning result transport")
+        if self.zing_source_encoder_mode not in {None, "serial", "overlap"}:
+            raise ValueError("Source encoder mode must be serial or overlap")
+        if self.zing_source_joint_forward not in {
+            None,
+            "off",
+            "source_first",
+            "cross_chunk",
+        }:
+            raise ValueError(
+                "Source joint forward must be off, source_first or cross_chunk"
+            )
+        if self.zing_source_work_quantum is not None and (
+            type(self.zing_source_work_quantum) is not int
+            or self.zing_source_work_quantum not in (0, 1)
+        ):
+            raise ValueError("Source work quantum must be 0 or 1")
+        for name in (
+            "zing_source_encoder_prefetch",
+            "zing_source_async_output",
+            "zing_source_defer_final",
+            "zing_source_prompt_joint",
+        ):
+            if (
+                getattr(self, name) is not None
+                and type(getattr(self, name)) is not bool
+            ):
+                raise ValueError(f"{name} must be boolean")
         if self.zing_conditioning_mode not in {"local", "remote"}:
             raise ValueError("Unsupported Zing conditioning mode")
         if self.zing_conditioning_prefetch and (
@@ -2112,16 +2150,60 @@ class ServerArgs(DisaggServerArgsMixin):
         )
         parser.add_argument(
             "--zing-conditioning-prefetch",
-            action="store_true",
+            action=StoreBoolean,
             default=ServerArgs.zing_conditioning_prefetch,
             help="Prepare received prompt updates during in-flight DiT work (remote, single session).",
         )
         parser.add_argument(
             "--zing-source-decoder-overlap",
-            action="store_true",
+            action=StoreBoolean,
             default=ServerArgs.zing_source_decoder_overlap,
             help="Overlap dedicated source decoding/output with the next DiT block (single session, source quantum 1).",
         )
+        parser.add_argument(
+            "--conditioning-result-transport",
+            choices=("http", "nccl"),
+            default=None,
+            help="Override client JSON result_transport (nccl if absent). Explicit overrides must match the Qwen service.",
+        )
+        parser.add_argument(
+            "--zing-source-work-quantum",
+            type=int,
+            choices=(0, 1),
+            default=None,
+            help="Maximum DiT advances per source dispatch (0: unrestricted, 1: one). Overrides SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM.",
+        )
+        parser.add_argument(
+            "--zing-source-encoder-mode",
+            choices=("serial", "overlap"),
+            default=None,
+            help="Override source_encoder.remote.mode in the deployment profile; requires a remote Encoder.",
+        )
+        parser.add_argument(
+            "--zing-source-joint-forward",
+            choices=("off", "source_first", "cross_chunk"),
+            default=None,
+            help="Override joint_forward in the source deployment profile; default preserves profile (cross_chunk if absent).",
+        )
+        for flag, help_text in (
+            (
+                "--zing-source-encoder-prefetch",
+                "Override source_encoder.remote.cross_dispatch_prefetch; requires a remote Encoder in overlap mode.",
+            ),
+            (
+                "--zing-source-async-output",
+                "Override async_source_output: materialize worker output asynchronously.",
+            ),
+            (
+                "--zing-source-defer-final",
+                "Override experimental SGLANG_ZING_SOURCE_DEFER_FINAL; requires source quantum 1.",
+            ),
+            (
+                "--zing-source-prompt-joint",
+                "Override experimental SGLANG_ZING_SOURCE_PROMPT_JOINT.",
+            ),
+        ):
+            parser.add_argument(flag, action=StoreBoolean, default=None, help=help_text)
         parser.add_argument(
             "--zing-conditioning-mode",
             choices=("local", "remote"),

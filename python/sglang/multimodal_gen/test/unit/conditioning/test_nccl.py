@@ -368,27 +368,33 @@ def test_worker_uses_device_result_and_keeps_session_cache():
         broadcast_tensor=lambda tensor, name: tensor,
     )
     state = WorkerConditioningState()
-    state.prefetch = SimpleNamespace(
-        encode=lambda *args, **kwargs: pytest.fail("NCCL must not consume CPU prefetch")
-    )
     assert worker("prompt", [], device="cpu", state=state) is result
     assert worker("prompt", [], device="cpu", state=state) is result
     assert calls == [("prompt", "cpu")]
 
 
 @pytest.mark.parametrize("rank", [0, 1])
-def test_nccl_session_does_not_start_http_prefetch(rank, monkeypatch):
+def test_nccl_session_starts_device_prefetch_only_on_leader(rank, monkeypatch):
     from sglang.multimodal_gen.runtime.conditioning import prefetch
-    from sglang.multimodal_gen.runtime.conditioning.worker import RemoteConditioner
+    from sglang.multimodal_gen.runtime.conditioning.worker import (
+        RemoteConditioner,
+        WorkerConditioningState,
+    )
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.source_session import (
         ZingSourceStreamState,
     )
 
-    monkeypatch.setattr(
-        prefetch,
-        "ConditioningPrefetch",
-        lambda *args, **kwargs: pytest.fail("NCCL must not start an HTTP prefetch RPC"),
-    )
+    created = []
+    owner = object()
+
+    def create(endpoint, **kwargs):
+        assert kwargs["device"] == torch.device("cuda:2")
+        assert kwargs["max_bytes"] == 1024
+        created.append(endpoint)
+        return owner
+
+    monkeypatch.setattr(prefetch, "ConditioningPrefetch", create)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
     receipts = []
 
     def coordinate(receipt):
@@ -402,15 +408,21 @@ def test_nccl_session_does_not_start_http_prefetch(rank, monkeypatch):
         coordinate=coordinate,
     )
     state = ZingSourceStreamState()
+    conditioning_state = WorkerConditioningState()
     state._start_conditioning_prefetch(
         SimpleNamespace(conditioning_provider=provider),
-        SimpleNamespace(),
+        SimpleNamespace(
+            session=SimpleNamespace(get_or_create_state=lambda cls: conditioning_state)
+        ),
         "ipc:///unused-nccl-prefetch",
-        {},
+        {"conditioning_prefetch_max_bytes": 1024},
     )
     assert receipts == [{"ok": True}]
-    assert state.conditioning_prefetch is None
-    assert getattr(provider, "_prefetch_owner", None) is None
+    expected = owner if rank == 0 else None
+    assert state.conditioning_prefetch is expected
+    assert getattr(provider, "_prefetch_owner", None) is expected
+    assert conditioning_state.prefetch is expected
+    assert len(created) == (1 if rank == 0 else 0)
 
 
 def _transport_process(rank, path):
@@ -623,6 +635,283 @@ def test_receiver_open_and_exchange_share_one_deadline(monkeypatch, open_elapsed
         assert error.value.code == "CONDITION_TIMEOUT" and not exchanges
 
 
+@pytest.mark.parametrize("budget", [3, 30])
+def test_device_fallback_keeps_deadline_through_serialization_and_open(
+    monkeypatch, budget
+):
+    from sglang.multimodal_gen.runtime.conditioning import wire
+
+    now, observed = [10.0], []
+    client = ConditioningClient(
+        "http://127.0.0.1:8093",
+        "token",
+        "a" * 64,
+        result_transport="nccl",
+        clock=lambda: now[0],
+        timeout_s=10,
+    )
+    receiver = client._nccl = NcclReceiver(client)
+    original_encode = wire.encode_request
+
+    def serialize(*args, **kwargs):
+        result = original_encode(*args, **kwargs)
+        now[0] += 1
+        return result
+
+    def open_bridge(device, deadline):
+        observed.append(("open", deadline, now[0]))
+        now[0] += 1
+        receiver.group, receiver.device = object(), torch.device(device)
+
+    def exchange(body, digest, deadline):
+        observed.append(("exchange", deadline, now[0]))
+        return condition()
+
+    monkeypatch.setattr(wire, "encode_request", serialize)
+    monkeypatch.setattr(receiver, "_open", open_bridge)
+    monkeypatch.setattr(receiver, "_exchange", exchange)
+    result = client.encode_device(
+        "new", [], input_digest="b" * 64, device="cuda:2", deadline=10 + budget
+    )
+    end = 10 + min(budget, 10)
+    assert observed == [("open", end, 11), ("exchange", end, 12)]
+    assert result["context"].shape == (2, 5120)
+
+
+def test_serialization_timeout_does_not_poison_unused_receiver(monkeypatch):
+    from sglang.multimodal_gen.runtime.conditioning import wire
+
+    now = [0.0]
+    client = ConditioningClient(
+        "http://127.0.0.1:8093",
+        "token",
+        "a" * 64,
+        result_transport="nccl",
+        clock=lambda: now[0],
+        timeout_s=10,
+    )
+    receiver = client._nccl = NcclReceiver(client)
+    original_encode = wire.encode_request
+
+    def serialize(*args, **kwargs):
+        result = original_encode(*args, **kwargs)
+        now[0] += 2
+        return result
+
+    monkeypatch.setattr(wire, "encode_request", serialize)
+    with pytest.raises(ConditionError) as error:
+        client.encode_device(
+            "new", [], input_digest="b" * 64, device="cuda:2", deadline=1
+        )
+    assert error.value.code == "CONDITION_TIMEOUT"
+    assert not receiver.failed and receiver.group is None and receiver.pending is None
+    receiver.group, receiver.device = object(), torch.device("cuda:2")
+    monkeypatch.setattr(receiver, "_exchange", lambda *args: condition())
+    assert client.encode_device("new", [], input_digest="b" * 64, device="cuda:2")
+
+
+def test_allocate_records_consumer_stream_before_candidate_can_be_released(monkeypatch):
+    from sglang.multimodal_gen.runtime.conditioning.worker import _allocate
+
+    events = []
+    stream = object()
+
+    class Tensor:
+        def __init__(self, name):
+            self.name = name
+
+        def to(self, *, device):
+            assert device == "cuda:2"
+            return self
+
+        def record_stream(self, current):
+            assert current is stream
+            events.append(self.name)
+
+    def current_stream(device):
+        assert device == "cuda:2"
+        return stream
+
+    monkeypatch.setattr(torch.cuda, "current_stream", current_stream)
+    positive = {name: Tensor(name) for name in ("context", "row_role")}
+    shapes = {"context": (2, 5120), "row_role": (2,)}
+    transferred = _allocate(shapes, "cuda:2", positive)
+    assert all(transferred[name] is positive[name] for name in positive)
+    assert events == ["context", "row_role"]
+
+
+@pytest.mark.parametrize("transport", ["http", "nccl"])
+def test_ready_candidate_does_not_wait_for_unrelated_receive(monkeypatch, transport):
+    from sglang.multimodal_gen.runtime.conditioning.worker import (
+        RemoteConditioner,
+        WorkerConditioningState,
+    )
+
+    unrelated_finished = threading.Event()
+    events = []
+    stream = SimpleNamespace(synchronize=lambda: events.append("consumer_ready"))
+
+    def device_barrier(*args):
+        raise AssertionError("Must not wait for the unrelated receive stream")
+
+    monkeypatch.setattr(torch.cuda, "synchronize", device_barrier)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: stream)
+    result = condition()
+    state = WorkerConditioningState()
+    state.prefetch = SimpleNamespace(encode=lambda *args, **kwargs: result)
+
+    def broadcast(value, name):
+        assert not unrelated_finished.is_set()
+        assert events[0] == "consumer_ready"
+        events.append(name)
+
+    worker = RemoteConditioner(
+        SimpleNamespace(result_transport=transport),
+        "a" * 64,
+        rank=0,
+        coordinate=lambda receipt: [receipt],
+        broadcast_receipt=lambda receipt: receipt,
+        allocate=lambda shapes, device, positive: positive,
+        broadcast_tensor=broadcast,
+    )
+    assert worker("new", [], device="cuda:0", state=state) is result
+    assert events == ["consumer_ready", "context", "row_role"]
+
+
+def test_cold_open_separates_connection_and_persistent_timeouts(monkeypatch):
+    from sglang.multimodal_gen.runtime.conditioning import nccl
+
+    now, observed = [9.0], {}
+    client = SimpleNamespace(clock=lambda: now[0], timeout_s=10.0)
+    receiver = NcclReceiver(client)
+    store_timeouts = []
+
+    def store(*args, **kwargs):
+        observed["connect"] = args[4].total_seconds()
+        return SimpleNamespace(
+            port=31000,
+            set_timeout=lambda value: store_timeouts.append(value.total_seconds()),
+        )
+
+    def transport(method, path, body, timeout):
+        observed["request"] = safe_json(body)
+        observed["http"] = timeout
+        return SimpleNamespace(
+            status=200, body=canonical_json({"bridge_id": receiver.bridge_id})
+        )
+
+    def group(store, rank, *, prefix, timeout_seconds):
+        observed["operation"] = timeout_seconds
+        return object()
+
+    client.transport = transport
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: object())
+    monkeypatch.setattr(nccl.dist, "TCPStore", store)
+    monkeypatch.setattr(nccl, "bridge_group", group)
+    receiver._open("cuda:0", deadline=10.0)
+    assert observed["connect"] == observed["http"] == 1
+    assert observed["request"]["connect_timeout_s"] == 1
+    assert observed["request"]["timeout_s"] == observed["operation"] == 10
+    assert store_timeouts == [1, 10]
+    calls = []
+    monkeypatch.setattr(
+        receiver, "_exchange", lambda body, digest, deadline: calls.append(deadline)
+    )
+    now[0] = 20
+    receiver.encode(b"", "new", "cuda:0")
+    assert calls == [30] and store_timeouts[-1] == 10
+
+
+@pytest.mark.parametrize("connect_budget", [None, 1.0])
+def test_sender_connection_budget_counts_executor_wait(monkeypatch, connect_budget):
+    from sglang.multimodal_gen.runtime.conditioning import nccl
+
+    now, observed = [0.0], {}
+    monkeypatch.setattr(nccl.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: object())
+    store_timeouts = []
+
+    def store(*args):
+        observed["connect"] = args[4].total_seconds()
+        now[0] += 0.25
+        return SimpleNamespace(
+            set_timeout=lambda value: store_timeouts.append(value.total_seconds())
+        )
+
+    def group(store, rank, *, prefix, timeout_seconds):
+        observed["operation"] = timeout_seconds
+        return object()
+
+    monkeypatch.setattr(nccl.dist, "TCPStore", store)
+    monkeypatch.setattr(nccl, "bridge_group", group)
+
+    async def run(function, *args):
+        now[0] += 0.25
+        return function(*args)
+
+    document = dict(port=31000, bridge_id="b" * 32, timeout_s=10)
+    if connect_budget is not None:
+        document["connect_timeout_s"] = connect_budget
+    sender = NcclSender("cuda:0", 10)
+    asyncio.run(sender.open(document, "tenant", run))
+    budget = 10 if connect_budget is None else connect_budget
+    assert observed == {"connect": budget - 0.25, "operation": 10}
+    assert store_timeouts == [budget - 0.5, 10]
+    assert not sender.failed and not sender.busy
+
+
+def test_sender_expired_queue_budget_does_not_start_store(monkeypatch):
+    from sglang.multimodal_gen.runtime.conditioning import nccl
+
+    now = [0.0]
+    monkeypatch.setattr(nccl.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Expired connect budget must not start TCPStore")
+
+    monkeypatch.setattr(nccl.dist, "TCPStore", forbidden)
+
+    async def run(function, *args):
+        now[0] = 2
+        return function(*args)
+
+    sender = NcclSender("cuda:0", 10)
+    with pytest.raises(ConditionError) as error:
+        asyncio.run(
+            sender.open(
+                dict(port=31000, bridge_id="b" * 32, timeout_s=10, connect_timeout_s=1),
+                "tenant",
+                run,
+            )
+        )
+    assert error.value.code == "CONDITION_TIMEOUT"
+    assert sender.failed and not sender.busy and sender.store is None
+
+
+@pytest.mark.parametrize("budget", [True, 0, -1, 11, float("nan"), "1"])
+def test_sender_rejects_invalid_connection_budget(budget):
+    sender = NcclSender("cuda:0", 10)
+    with pytest.raises(ConditionError) as error:
+        asyncio.run(
+            sender.open(
+                dict(
+                    port=31000,
+                    bridge_id="b" * 32,
+                    timeout_s=10,
+                    connect_timeout_s=budget,
+                ),
+                "tenant",
+                None,
+            )
+        )
+    assert error.value.code == "CONDITION_INVALID"
+    assert not sender.busy and not sender.failed and sender.bridge_id is None
+
+
 @pytest.mark.parametrize("phase", ["metadata", "completion", "eof"])
 def test_receiver_deadline_interrupts_real_http_stream(monkeypatch, phase):
     """Use a real socket: HTTPX inactivity timeouts cannot catch this peer."""
@@ -722,3 +1011,66 @@ def test_receiver_deadline_interrupts_real_http_stream(monkeypatch, phase):
         server.shutdown()
         server.server_close()
         thread.join(2)
+
+
+@pytest.mark.parametrize(
+    "cli_transport,json_transport,expected",
+    [
+        (None, None, "nccl"),
+        (None, "http", "http"),
+        (None, "nccl", "nccl"),
+        ("http", None, "http"),
+        ("nccl", "http", "nccl"),
+        ("http", "nccl", "http"),
+    ],
+)
+def test_cli_transport_overrides_both_endpoint_configs(
+    tmp_path, monkeypatch, cli_transport, json_transport, expected
+):
+    import json
+    from dataclasses import asdict
+
+    import uvicorn
+
+    from sglang.multimodal_gen.runtime.conditioning import cli, native, service, worker
+    from sglang.multimodal_gen.runtime.conditioning.contract import DeploymentProfile
+    from sglang.multimodal_gen.runtime.conditioning.resources import ResourceLimits
+
+    config = dict(
+        tokens={"token": {"tenant": "test"}},
+        bearer_token="token",
+        native={"model_path": "model", "gpu_id": 0},
+        limits=asdict(ResourceLimits()),
+    )
+    if json_transport is not None:
+        config["result_transport"] = json_transport
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    original = path.read_bytes()
+    profile = SimpleNamespace(
+        profile_id="p", document={"preprocess_version": PREPROCESS_VERSION}
+    )
+    monkeypatch.setattr(DeploymentProfile, "load", lambda path: profile)
+    argv = ["serve", "--config", str(path), "--profile", "profile.json"]
+    if cli_transport:
+        argv += ["--conditioning-result-transport", cli_transport]
+    # Exercise the actual serve entry point: a test-side fallback would mask
+    # disagreement between the service and DiT defaults.
+    captured = {}
+    monkeypatch.setattr(native, "NativeConditionEncoder", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "warm_encoder", lambda encoder: None)
+    monkeypatch.setattr(service, "ConditioningService", lambda **k: captured.update(k))
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: None)
+    cli.main(argv)
+    assert captured["result_transport"] == expected
+    monkeypatch.setattr(worker, "_sp_group", lambda: None)
+    monkeypatch.setattr(ConditioningClient, "handshake", lambda self: None)
+    args = SimpleNamespace(
+        conditioning_config=str(path),
+        conditioning_expected_profile="profile.json",
+        conditioning_service_url="http://127.0.0.1:8093",
+        conditioning_result_transport=cli_transport,
+    )
+    provider = worker.RemoteConditioner.from_server_args(args)
+    assert provider.client.result_transport == expected
+    assert path.read_bytes() == original

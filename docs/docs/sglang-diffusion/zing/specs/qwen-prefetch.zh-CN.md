@@ -1,5 +1,7 @@
 # Qwen 提前编码与独立 Decoder 的跨块重叠
 
+后续 NCCL 支持见 [NCCL 提前编码适配](../plans/QWEN_NCCL_PREFETCH.md)：基于 main `7add23fd79`，两端配置 `result_transport: "nccl"` 后可与既有提前编码开关组合。后台使用独立接收 stream，结果完成后才发布，正式边界登记消费 stream 并执行 SP 广播。下文原 #410 的 CPU 结果契约及测试数据按历史版本保留；新组合尚未完成当前版本 480/736 GPU 验收。
+
 本PR提供两个默认关闭、可分别A/B的优化：`--zing-conditioning-prefetch`提前处理已经收到的prompt/reference，要求remote conditioning与单活跃会话；`--zing-source-decoder-overlap`让独立Decoder/输出与下一DiT块重叠，要求独立Decoder与source quantum=1。新目标四卡布局为DiT两卡、Source Encoder＋Qwen一卡、Lynn Decoder一卡；不预测未来prompt，不自动迁移或拉起服务。前一阶段的独立Qwen一卡、Decoder仍在DiT卡上的布局也可仅开启Qwen预取。
 
 ## 使用

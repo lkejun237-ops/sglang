@@ -24,6 +24,12 @@ def parser():
         command.add_argument("--config", required=True)
         command.add_argument("--profile", required=True)
         if name == "serve":
+            command.add_argument(
+                "--conditioning-result-transport",
+                choices=("http", "nccl"),
+                default=None,
+                help="Override config result_transport (nccl if absent); must match the DiT client.",
+            )
             command.add_argument("--host", default="127.0.0.1")
             command.add_argument("--port", type=int, default=8093)
         else:
@@ -41,6 +47,12 @@ def load_configuration(args):
     from .resources import ResourceLimits
 
     config = safe_json(Path(args.config).read_bytes())
+    transport = getattr(args, "conditioning_result_transport", None)
+    if transport is not None:
+        if transport not in {"http", "nccl"}:
+            raise ValueError("Unknown conditioning result transport")
+        if type(config) is dict:
+            config["result_transport"] = transport
     required_limits = {field.name for field in fields(ResourceLimits)}
     if (
         type(config) is not dict
@@ -289,7 +301,7 @@ def main(argv=None):
             "Non-loopback bind or TLS is experimental; only loopback single-node "
             "deployment is validated"
         )
-    result_transport = config.get("result_transport", "http")
+    result_transport = config.get("result_transport", "nccl")
     if result_transport not in {"http", "nccl"}:
         raise ValueError("Unknown conditioning result transport")
     if result_transport == "nccl" and args.host not in {"127.0.0.1", "localhost"}:

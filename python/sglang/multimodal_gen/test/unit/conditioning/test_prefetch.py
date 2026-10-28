@@ -34,8 +34,18 @@ class Client:
         self.started = threading.Event()
         self.release = threading.Event()
         self.release.set()
+        self.deadlines = []
 
     def encode(self, prompt, media, *, input_digest, deadline=None):
+        assert getattr(self, "result_transport", "http") == "http"
+        return self._encode(prompt, media, input_digest=input_digest, deadline=deadline)
+
+    def encode_device(self, prompt, media, *, input_digest, device, deadline=None):
+        assert self.result_transport == "nccl" and device == "cuda:2"
+        return self._encode(prompt, media, input_digest=input_digest, deadline=deadline)
+
+    def _encode(self, prompt, media, *, input_digest, deadline):
+        self.deadlines.append(deadline)
         self.calls.append(
             (prompt, media, input_digest, threading.current_thread().name)
         )
@@ -44,8 +54,8 @@ class Client:
         return {"context": prompt, "row_role": media}
 
 
-@pytest.fixture
-def channel(tmp_path):
+@pytest.fixture(params=["http", "nccl"])
+def channel(tmp_path, request):
     endpoint = "ipc://" + str(tmp_path / (uuid.uuid4().hex + ".sock"))
     context = zmq.Context()
     socket = context.socket(zmq.PUSH)
@@ -58,12 +68,14 @@ def channel(tmp_path):
         context.term()
         raise
     client = Client()
+    client.result_transport = request.param
     prefetch = ConditioningPrefetch(
         endpoint,
         prepare=lambda c: (c["prompt"], c.get("references", "active")),
         identity=lambda p, m: p + str(m),
         client=client,
         max_bytes=1 << 20,
+        device="cuda:2" if request.param == "nccl" else None,
     )
     try:
         yield socket, prefetch, client
@@ -119,6 +131,7 @@ def test_changed_media_never_reuses_stale_result(channel):
     result = prefetch.encode("same", "new", input_digest="samenew")
     assert result["row_role"] == "new"
     assert len(client.calls) == 2 and prefetch.hits == 0
+    assert client.deadlines[0] is None and client.deadlines[1] is not None
 
 
 def test_only_latest_waiting_event_is_encoded(channel):
@@ -259,7 +272,8 @@ def test_boundary_wait_has_a_total_rpc_deadline(channel):
     client.release.set()
 
 
-def test_worker_consumes_prefetched_cpu_features_on_owner_thread():
+@pytest.mark.parametrize("transport", ["http", "nccl"])
+def test_worker_consumes_prefetched_features_on_owner_thread(transport):
     import torch
 
     from sglang.multimodal_gen.runtime.conditioning.worker import (
@@ -288,7 +302,7 @@ def test_worker_consumes_prefetched_cpu_features_on_owner_thread():
     state = WorkerConditioningState()
     state.prefetch = SimpleNamespace(encode=encode)
     remote = RemoteConditioner(
-        SimpleNamespace(),
+        SimpleNamespace(result_transport=transport),
         "a" * 64,
         rank=0,
         coordinate=lambda x: [record(x)],
@@ -309,7 +323,8 @@ def test_worker_consumes_prefetched_cpu_features_on_owner_thread():
     assert state.positive is result and len(calls) >= 4
 
 
-def test_worker_prefetch_failure_preserves_active_condition():
+@pytest.mark.parametrize("transport", ["http", "nccl"])
+def test_worker_prefetch_failure_preserves_active_condition(transport):
     import torch
 
     from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
@@ -326,7 +341,7 @@ def test_worker_prefetch_failure_preserves_active_condition():
     state.identity, state.positive = "old", old
     state.prefetch = SimpleNamespace(encode=fail)
     remote = RemoteConditioner(
-        SimpleNamespace(),
+        SimpleNamespace(result_transport=transport),
         "a" * 64,
         rank=0,
         coordinate=lambda x: [x],
@@ -343,3 +358,66 @@ def test_worker_prefetch_failure_preserves_active_condition():
         remote("new", media, device="cpu", state=state)
     assert caught.value.code == "CONDITION_TIMEOUT"
     assert state.identity == "old" and state.positive is old
+
+
+def test_nccl_prefetch_requires_explicit_leader_device():
+    client = SimpleNamespace(result_transport="nccl")
+    with pytest.raises(ValueError, match="leader device"):
+        ConditioningPrefetch(
+            "ipc:///unused", prepare=None, identity=None, client=client, max_bytes=1024
+        )
+
+
+def test_close_discards_inflight_result_and_prevents_new_encode(channel):
+    socket, prefetch, client = channel
+    client.release.clear()
+    send(socket, "new")
+    assert client.started.wait(5)
+    closed = threading.Event()
+
+    def close():
+        prefetch.close()
+        closed.set()
+
+    closer = threading.Thread(target=close)
+    closer.start()
+    assert prefetch.stop.wait(5) and not closed.is_set()
+    client.release.set()
+    closer.join(5)
+    assert closed.is_set() and prefetch.cached is None
+    assert len(client.calls) == 1
+    with pytest.raises(RuntimeError, match="closed"):
+        prefetch.encode("new", "active", input_digest="newactive")
+
+
+def test_nccl_background_failure_is_not_retried_on_the_poisoned_channel(channel):
+    import torch
+
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+    from sglang.multimodal_gen.runtime.conditioning.nccl import NcclReceiver
+
+    socket, prefetch, client = channel
+    # Exercise real IPC, the prefetch owner and receiver failure state together;
+    # the exchange is a CPU fault injection, not a CUDA/NCCL validation.
+    client.result_transport, prefetch.device = "nccl", "cuda:2"
+    receiver = NcclReceiver(client)
+    receiver.group, receiver.device = object(), torch.device("cuda:2")
+    exchanges = []
+
+    def fail_exchange(*args):
+        exchanges.append(args)
+        raise RuntimeError("injected ambiguous receive")
+
+    receiver._exchange = fail_exchange
+    client.encode_device = (
+        lambda prompt, media, *, input_digest, device, deadline=None: receiver.encode(
+            b"", input_digest, device, deadline=deadline
+        )
+    )
+    send(socket, "new")
+    wait_for(lambda: prefetch.failures == 1)
+    assert receiver.failed and prefetch.cached is None
+    with pytest.raises(ConditionError) as error:
+        prefetch.encode("new", "active", input_digest="newactive")
+    assert error.value.code == "CONDITION_UNAVAILABLE"
+    assert len(exchanges) == 1

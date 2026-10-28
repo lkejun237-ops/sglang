@@ -240,11 +240,15 @@ class SourceLedger:
         self.closed = True
 
 
-def source_work_quantum():
-    """Trusted experimental deployment policy, never a client request field."""
+def source_work_quantum(value=None):
+    """Resolve trusted deployment policy, with explicit settings before legacy env."""
     import os
 
-    value = os.environ.get("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", "0")
-    if value not in ("0", "1"):
+    if value is None:
+        raw = os.environ.get("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", "0")
+        if raw not in ("0", "1"):
+            raise ValueError("Source work quantum must be 0 or 1")
+        value = int(raw)
+    if type(value) is not int or value not in (0, 1):
         raise ValueError("Source work quantum must be 0 or 1")
-    return int(value)
+    return value

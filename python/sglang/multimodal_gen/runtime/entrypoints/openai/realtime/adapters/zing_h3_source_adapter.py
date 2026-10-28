@@ -5,11 +5,12 @@ import asyncio
 import hashlib
 import json
 import math
+import os
 import tempfile
 import time
 import uuid
 from collections import deque
-from copy import copy
+from copy import copy, deepcopy
 from dataclasses import asdict
 from pathlib import Path
 
@@ -57,6 +58,36 @@ from .zing_reference_upload import prepare_reference_upload
 def _with_source_decoder_policy(profile, port):
     """Overlay the launcher-assigned decoder port on the attested export."""
     return _with_disagg_role_policies(profile, decoder_port=port)
+
+
+def _with_source_pipeline_policy(
+    profile,
+    *,
+    encoder_mode=None,
+    encoder_prefetch=None,
+    async_output=None,
+    joint_forward=None,
+):
+    """Overlay deployment-only switches without mutating the exported profile."""
+    if all(
+        value is None
+        for value in (encoder_mode, encoder_prefetch, async_output, joint_forward)
+    ):
+        return profile
+    result = deepcopy(profile)
+    remote = result.get("source_encoder", {}).get("remote")
+    if encoder_mode is not None or encoder_prefetch is True:
+        if remote is None:
+            raise ValueError("Source encoder CLI policy requires a remote Encoder")
+    if encoder_mode is not None:
+        remote["mode"] = encoder_mode
+    if encoder_prefetch is not None and remote is not None:
+        remote["cross_dispatch_prefetch"] = encoder_prefetch
+    if async_output is not None:
+        result["async_source_output"] = async_output
+    if joint_forward is not None:
+        result["joint_forward"] = joint_forward
+    return result
 
 
 def _source_sampling_schedule(args, profile):
@@ -200,6 +231,13 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             profile,
             encoder_port=getattr(args, "disagg_encoder_port", None),
             decoder_port=getattr(args, "disagg_decoder_port", None),
+        )
+        profile = _with_source_pipeline_policy(
+            profile,
+            encoder_mode=getattr(args, "zing_source_encoder_mode", None),
+            encoder_prefetch=getattr(args, "zing_source_encoder_prefetch", None),
+            async_output=getattr(args, "zing_source_async_output", None),
+            joint_forward=getattr(args, "zing_source_joint_forward", None),
         )
         # require raises ContractError explicitly and is unaffected by python -O.
         require(
@@ -380,7 +418,21 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             source_work_quantum,
         )
 
-        self.source_work_quantum = source_work_quantum()
+        self.source_work_quantum = source_work_quantum(
+            getattr(args, "zing_source_work_quantum", None)
+        )
+        self.source_defer_final = getattr(args, "zing_source_defer_final", None)
+        if self.source_defer_final is None:
+            self.source_defer_final = (
+                os.environ.get("SGLANG_ZING_SOURCE_DEFER_FINAL", "0") == "1"
+            )
+        self.source_prompt_joint = getattr(args, "zing_source_prompt_joint", None)
+        if self.source_prompt_joint is None:
+            self.source_prompt_joint = (
+                os.environ.get("SGLANG_ZING_SOURCE_PROMPT_JOINT", "0") == "1"
+            )
+        if self.source_defer_final and self.source_work_quantum != 1:
+            raise ValueError("Deferred source final currently requires work quantum 1")
         self.source_decoder_overlap = getattr(
             args, "zing_source_decoder_overlap", False
         )
@@ -891,6 +943,9 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             conditioning_prefetch_max_bytes=self.max_message_bytes,
             sampling_schedule=self.sampling_schedule,
             async_output=self.profile.get("async_source_output", False),
+            work_quantum=self.source_work_quantum,
+            defer_final=self.source_defer_final,
+            prompt_joint=self.source_prompt_joint,
             appends=appends,
             end=end,
             encoder=self.source_encoder,

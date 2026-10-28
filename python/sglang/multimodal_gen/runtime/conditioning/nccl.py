@@ -9,6 +9,7 @@ the same communicator could pair an old send with a new prompt's receive.
 import asyncio
 import concurrent.futures
 import threading
+import time
 import uuid
 from datetime import timedelta
 
@@ -97,7 +98,8 @@ class NcclSender:
             raise ConditionError("CONDITION_BUSY")
         if (
             type(document) is not dict
-            or set(document) != {"port", "bridge_id", "timeout_s"}
+            or not {"port", "bridge_id", "timeout_s"} <= set(document)
+            or set(document) - {"port", "bridge_id", "timeout_s", "connect_timeout_s"}
             or type(document["port"]) is not int
             or not 0 < document["port"] < 65536
             or type(document["bridge_id"]) is not str
@@ -107,25 +109,41 @@ class NcclSender:
             or not 0 < document["timeout_s"] <= self.timeout_s
         ):
             raise ConditionError("CONDITION_INVALID", "Invalid NCCL bridge handshake")
+        connect_timeout = document.get("connect_timeout_s", document["timeout_s"])
+        if (
+            type(connect_timeout) not in (int, float)
+            or not 0 < connect_timeout <= document["timeout_s"]
+        ):
+            raise ConditionError("CONDITION_INVALID", "Invalid NCCL connection budget")
         self.busy = True
         self.bridge_id, self.tenant = document["bridge_id"], tenant
         try:
-            await run(self._connect, document)
+            await run(self._connect, document, time.monotonic() + connect_timeout)
         except BaseException:
             self.failed = True
             raise
         finally:
             self.busy = False
 
-    def _connect(self, document):
+    def _connect(self, document, deadline):
         torch.cuda.set_device(self.device)
         timeout = document["timeout_s"]
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ConditionError("CONDITION_TIMEOUT")
         self.store = dist.TCPStore(
-            "127.0.0.1", document["port"], 2, False, timedelta(seconds=timeout)
+            "127.0.0.1", document["port"], 2, False, timedelta(seconds=remaining)
         )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ConditionError("CONDITION_TIMEOUT")
+        self.store.set_timeout(timedelta(seconds=remaining))
         self.group = bridge_group(
             self.store, 1, prefix=GROUP_PREFIX, timeout_seconds=timeout
         )
+        if time.monotonic() >= deadline:
+            raise ConditionError("CONDITION_TIMEOUT")
+        self.store.set_timeout(timedelta(seconds=timeout))
         self.stream = torch.cuda.Stream(device=self.device)
 
     def acquire(self, bridge_id, tenant):
@@ -200,6 +218,7 @@ class NcclReceiver:
                 port=self.store.port,
                 bridge_id=self.bridge_id,
                 timeout_s=client.timeout_s,
+                connect_timeout_s=self._remaining(deadline),
             )
         )
         # Both participants must join concurrently. Do not use the retrying RPC
@@ -212,6 +231,7 @@ class NcclReceiver:
                 body,
                 self._remaining(deadline),
             )
+            self.store.set_timeout(timedelta(seconds=self._remaining(deadline)))
             self.group = bridge_group(
                 self.store, 0, prefix=GROUP_PREFIX, timeout_seconds=client.timeout_s
             )
@@ -222,13 +242,25 @@ class NcclReceiver:
                 raise ConditionError(
                     "CONDITION_UNAVAILABLE", "NCCL bridge handshake failed"
                 )
+        self._remaining(deadline)
+        # The group/Store survive this request; lazy NCCL initialization and
+        # later exchanges retain the normal operation timeout, not a short
+        # first request's remaining connection budget.
+        self.store.set_timeout(timedelta(seconds=client.timeout_s))
         self.stream = torch.cuda.Stream(device=self.device)
 
-    def encode(self, body, input_digest, device):
+    def encode(self, body, input_digest, device, *, deadline=None):
+        deadline = (
+            min(deadline, self.client.clock() + self.client.timeout_s)
+            if deadline is not None
+            else self.client.clock() + self.client.timeout_s
+        )
+        # A boundary fallback may have spent its budget waiting for prefetch or
+        # serializing input. No exchange has started, so keep the channel usable.
+        self._remaining(deadline)
         if not self.lock.acquire(blocking=False):
             raise ConditionError("CONDITION_BUSY")
         try:
-            deadline = self.client.clock() + self.client.timeout_s
             if self.failed:
                 raise ConditionError(
                     "CONDITION_UNAVAILABLE", "NCCL channel requires a worker restart"

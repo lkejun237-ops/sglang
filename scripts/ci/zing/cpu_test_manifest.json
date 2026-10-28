@@ -2011,47 +2011,90 @@
       "sources": [
         "conditioning"
       ],
-      "reason": "Two complete default-suite trials passed in WSL Linux with the pinned conditioning environment and explicit CPU platform selection; all 22 NCCL control/lifetime and Gloo cases passed in each trial.",
+      "reason": "Two targeted CPU regression trials passed after defaulting deployment entry points to NCCL: 173 primary cases and 27 subtests each, zero skips. Includes both endpoint startup and explicit HTTP compatibility.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "200294455d2dce10b6efb5bb9ff706688c319810b1d8ac4a8ca20ee6c6964108",
-        "receipt": "D:/qwen-nccl-work/ci-conditioning-main-merge/receipt.json",
-        "receipt_sha256": "fccd2e1928cbeb8c09069e8fcc9a62e42ce40fe38563d3a85f526e5aec505564",
+        "source_sha256": "7ad7ea88015c33acabb19e3caf764d9c4e10e8bdbb6b4dd7da67398e2fa2b61b",
+        "receipt": "D:\\qwen-nccl-prefetch-20261028\\nccl-default-validation-receipt.json",
+        "receipt_sha256": "8a0ec3f6271b923c21b52dc668f25b3da2b3664ab92f9a8bc07e3bc5ca5b0d44",
         "trials": [
           {
             "trial": 1,
-            "passed": 22,
-            "collected": 22,
+            "passed": 173,
+            "collected": 173,
+            "subtests_passed": 27,
             "skipped": 0,
             "exit_code": 0,
-            "full_suite_passed": 1820,
-            "full_suite_collected": 1820,
-            "full_suite_skipped": 0,
-            "log_path": "D:/qwen-nccl-work/ci-conditioning-main-merge/conditioning-trial-1.log",
-            "junit_path": "D:/qwen-nccl-work/ci-conditioning-main-merge/conditioning-trial-1.xml"
+            "duration_seconds": 47.26,
+            "log_path": "D:\\qwen-nccl-prefetch-20261028\\nccl-default-1.log",
+            "junit_path": "D:\\qwen-nccl-prefetch-20261028\\nccl-default-1.xml"
           },
           {
             "trial": 2,
-            "passed": 22,
-            "collected": 22,
+            "passed": 173,
+            "collected": 173,
+            "subtests_passed": 27,
             "skipped": 0,
             "exit_code": 0,
-            "full_suite_passed": 1820,
-            "full_suite_collected": 1820,
-            "full_suite_skipped": 0,
-            "log_path": "D:/qwen-nccl-work/ci-conditioning-main-merge/conditioning-trial-2.log",
-            "junit_path": "D:/qwen-nccl-work/ci-conditioning-main-merge/conditioning-trial-2.xml"
+            "duration_seconds": 43.39,
+            "log_path": "D:\\qwen-nccl-prefetch-20261028\\nccl-default-2.log",
+            "junit_path": "D:\\qwen-nccl-prefetch-20261028\\nccl-default-2.xml"
           }
         ],
         "environment": {
           "python": "3.12.3",
-          "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+          "platform": "WSL Linux",
           "torch": "2.14.1+cpu",
-          "pytest": "9.1.1",
+          "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": "cpu"
+        }
+      }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/conditioning/test_pipeline_cli.py",
+      "suite": "conditioning-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "conditioning"
+      ],
+      "reason": "Two complete conditioning CPU default-suite trials passed after the pipeline CLI changes; both 1876 primary cases and 59 subtests passed with no skips.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "412314f2acdab11acd86cdd00018433121abb00317a6bf4f1c1dc073dc530e55",
+        "receipt": "D:\\qwen-nccl-prefetch-20261028\\pipeline-validation-receipt.json",
+        "receipt_sha256": "6aab4dcb470fac636183c2796a91f927732289c08c9ebcaeb68664f1b0995571",
+        "trials": [
+          {
+            "trial": 1,
+            "full_suite_passed": 1876,
+            "full_suite_collected": 1876,
+            "full_suite_subtests_passed": 59,
+            "full_suite_skipped": 0,
+            "exit_code": 0,
+            "duration_seconds": 363.41,
+            "log_path": "D:\\qwen-nccl-prefetch-20261028\\pipeline-full-1.log",
+            "junit_path": "D:\\qwen-nccl-prefetch-20261028\\pipeline-full-1.xml"
+          },
+          {
+            "trial": 2,
+            "full_suite_passed": 1876,
+            "full_suite_collected": 1876,
+            "full_suite_subtests_passed": 59,
+            "full_suite_skipped": 0,
+            "exit_code": 0,
+            "duration_seconds": 413.6,
+            "log_path": "D:\\qwen-nccl-prefetch-20261028\\pipeline-full-2.log",
+            "junit_path": "D:\\qwen-nccl-prefetch-20261028\\pipeline-full-2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.12.3",
+          "platform": "WSL Linux",
+          "torch": "2.14.1+cpu",
           "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": "cpu"
         },
-        "environment_lock_sha256": "5f7d2b06884bcdfa76f2bbc3da82fbdbcb29f12a06c60a6265e7feacfb2fe765",
-        "candidate_fingerprint": "2ff69503a5100ba881eb821a1b7e73b70fdb5df983a567b8a0fb0370ef4bdd84"
+        "environment_lock_sha256": "5f7d2b06884bcdfa76f2bbc3da82fbdbcb29f12a06c60a6265e7feacfb2fe765"
       }
     },
     {
@@ -2330,48 +2373,43 @@
         "main",
         "conditioning"
       ],
-      "reason": "Profile-only mixed plan, CLI precedence, source command transport and worker execution passed in two fresh pinned Linux CPU processes; no failures or skips.",
+      "reason": "Two complete conditioning CPU default-suite trials passed after the pipeline CLI changes; both 1876 primary cases and 59 subtests passed with no skips.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "fef2cb47f52d1ba7250909da70e3b610507e63584e758086842ae5ca9fc1ea05",
-        "receipt": "/cpfs/world-model/sglang/static-adaln-mixed/20261015-profile-mixed-r2/result.json",
-        "receipt_sha256": "1a54ef5a8f7a275f83f1953a7dcac048adffd70934df1ad2fbde3114a28682a0",
-        "source_lock": "/cpfs/world-model/sglang/static-adaln-mixed/20261015-profile-mixed-r2/source-lock.json",
-        "source_lock_sha256": "4559bbd9ffdf0fac5168ba4444421657bd43696d0129556c4d750b00681376ab",
-        "source_directory": "/cpfs/world-model/sglang/static-adaln-mixed/20261015-profile-mixed-r2/source",
-        "job_id": "dlc1pewikr6a9f9j",
-        "runner": "Direct pytest -q -p no:cacheprovider on source adapter, initial blocks, progressive source session and model tests; not the canonical triage runner.",
+        "source_sha256": "7b2483b0ed7eb88c9d71d5235c764f8e6196c6a618921a6f7a57c7adebd793c4",
+        "receipt": "D:\\qwen-nccl-prefetch-20261028\\pipeline-validation-receipt.json",
+        "receipt_sha256": "6aab4dcb470fac636183c2796a91f927732289c08c9ebcaeb68664f1b0995571",
         "trials": [
           {
             "trial": 1,
-            "passed": 103,
-            "collected": 103,
-            "skipped": 0,
+            "full_suite_passed": 1876,
+            "full_suite_collected": 1876,
+            "full_suite_subtests_passed": 59,
+            "full_suite_skipped": 0,
             "exit_code": 0,
-            "duration_seconds": 7.07,
-            "log_path": "/cpfs/world-model/sglang/static-adaln-mixed/20261015-profile-mixed-r2/trial-1.log",
-            "junit_path": "/cpfs/world-model/sglang/static-adaln-mixed/20261015-profile-mixed-r2/trial-1.xml",
-            "duration_note": "Sum of testcase durations for this file; four selected files share each fresh pytest process."
+            "duration_seconds": 363.41,
+            "log_path": "D:\\qwen-nccl-prefetch-20261028\\pipeline-full-1.log",
+            "junit_path": "D:\\qwen-nccl-prefetch-20261028\\pipeline-full-1.xml"
           },
           {
             "trial": 2,
-            "passed": 103,
-            "collected": 103,
-            "skipped": 0,
+            "full_suite_passed": 1876,
+            "full_suite_collected": 1876,
+            "full_suite_subtests_passed": 59,
+            "full_suite_skipped": 0,
             "exit_code": 0,
-            "duration_seconds": 6.8420000000000005,
-            "log_path": "/cpfs/world-model/sglang/static-adaln-mixed/20261015-profile-mixed-r2/trial-2.log",
-            "junit_path": "/cpfs/world-model/sglang/static-adaln-mixed/20261015-profile-mixed-r2/trial-2.xml",
-            "duration_note": "Sum of testcase durations for this file; four selected files share each fresh pytest process."
+            "duration_seconds": 413.6,
+            "log_path": "D:\\qwen-nccl-prefetch-20261028\\pipeline-full-2.log",
+            "junit_path": "D:\\qwen-nccl-prefetch-20261028\\pipeline-full-2.xml"
           }
         ],
         "environment": {
-          "python": "3.11.12 (main, Apr  9 2025, 04:04:00) [Clang 20.1.0 ]",
-          "torch": "2.8.0+cpu",
-          "cuda": null,
-          "av": "18.1.0"
+          "python": "3.12.3",
+          "platform": "WSL Linux",
+          "torch": "2.14.1+cpu",
+          "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": "cpu"
         },
-        "environment_note": "Existing py311 Torch CPU environment and isolated av==18.1.0 from 20261015-source-profile-r4/deps, without dependency changes; version output captured in environment.json."
+        "environment_lock_sha256": "5f7d2b06884bcdfa76f2bbc3da82fbdbcb29f12a06c60a6265e7feacfb2fe765"
       }
     },
     {
@@ -2437,53 +2475,43 @@
         "main",
         "conditioning"
       ],
-      "reason": "Two fresh Alibaba Linux CPU process trials passed after main integration.",
+      "reason": "Two complete conditioning CPU default-suite trials passed after the pipeline CLI changes; both 1876 primary cases and 59 subtests passed with no skips.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "142912109dae2cd383378cf0608d86265abe9fd29e985df89739bf5291ba8310",
-        "receipt": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/conditioning-file-1/receipt.json",
-        "receipt_sha256": "8cbb9004c1ea5348177e936d811004c62488b27e70a61697314c4ec6e2a84af1",
+        "source_sha256": "94e6f0c038fb67a5d147b0579e486dd20242cf02754b01f62cca1ae3d83500bb",
+        "receipt": "D:\\qwen-nccl-prefetch-20261028\\pipeline-validation-receipt.json",
+        "receipt_sha256": "6aab4dcb470fac636183c2796a91f927732289c08c9ebcaeb68664f1b0995571",
         "trials": [
           {
             "trial": 1,
-            "passed": 663,
-            "collected": 663,
-            "skipped": 0,
-            "duration_seconds": 41.64783355710097,
+            "full_suite_passed": 1876,
+            "full_suite_collected": 1876,
+            "full_suite_subtests_passed": 59,
+            "full_suite_skipped": 0,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/conditioning-file-1/conditioning-trial-1.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/conditioning-file-1/conditioning-trial-1.xml"
+            "duration_seconds": 363.41,
+            "log_path": "D:\\qwen-nccl-prefetch-20261028\\pipeline-full-1.log",
+            "junit_path": "D:\\qwen-nccl-prefetch-20261028\\pipeline-full-1.xml"
           },
           {
             "trial": 2,
-            "passed": 663,
-            "collected": 663,
-            "skipped": 0,
-            "duration_seconds": 20.67816553101875,
+            "full_suite_passed": 1876,
+            "full_suite_collected": 1876,
+            "full_suite_subtests_passed": 59,
+            "full_suite_skipped": 0,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/conditioning-file-1/conditioning-trial-2.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/conditioning-file-1/conditioning-trial-2.xml"
+            "duration_seconds": 413.6,
+            "log_path": "D:\\qwen-nccl-prefetch-20261028\\pipeline-full-2.log",
+            "junit_path": "D:\\qwen-nccl-prefetch-20261028\\pipeline-full-2.xml"
           }
         ],
         "environment": {
-          "python": "3.12.10",
-          "platform": "Linux-6.6.102-001.8.100.kangaroo.al8.x86_64-x86_64-with-glibc2.39"
+          "python": "3.12.3",
+          "platform": "WSL Linux",
+          "torch": "2.14.1+cpu",
+          "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": "cpu"
         },
-        "environment_recipe": {
-          "environment_lock_sha256": "2d56cab7c584539b2ad7f742c8ed9833f244ea46f3ff4d80938e3a1eddb3591d",
-          "history_base": "b1899c0bd538a342056a39893e8ce048b17afa32",
-          "reference_sha": "8b4bf2c3d9f5ceeb2b8bc9c20af7afbba6f24982"
-        },
-        "manifest_sha256": "4abd3c0a8465905e4340d8303ec04f1ae88cb15e6885b98d93f6b919731b44cf",
-        "tooling_sha256": {
-          "check_python.py": "a22e6bde47103b7e2ffa065b137441794a64c9b622822e7301aa8d938e32cada",
-          "common.py": "2edda6b9e4e6f372d70851a47d065dd99eaf436fcc6d8714b9609b72aa13311f",
-          "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
-          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
-          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
-          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
-          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
-        }
+        "environment_lock_sha256": "5f7d2b06884bcdfa76f2bbc3da82fbdbcb29f12a06c60a6265e7feacfb2fe765"
       }
     },
     {
@@ -7398,48 +7426,43 @@
       "sources": [
         "conditioning"
       ],
-      "reason": "Two isolated Linux CPU process trials plus two full default-suite trials passed",
+      "reason": "Two targeted CPU regression trials passed after defaulting deployment entry points to NCCL: 173 primary cases and 27 subtests each, zero skips. Includes both endpoint startup and explicit HTTP compatibility.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "a52638c1585a5ff6ddc05fb62eb793f21ecbee72d12adb83bd2b68c818e53079",
-        "receipt": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/conditioning-files-r6/23/receipt.json",
-        "receipt_sha256": "472650c0959483667a7358254ce9abf89367aa69e4582827b3accbb2de2292a6",
+        "source_sha256": "803f7fb8c03e50ec555c138168be9bd44afad5776bc5db31c9521ac3055d5397",
+        "receipt": "D:\\qwen-nccl-prefetch-20261028\\nccl-default-validation-receipt.json",
+        "receipt_sha256": "8a0ec3f6271b923c21b52dc668f25b3da2b3664ab92f9a8bc07e3bc5ca5b0d44",
         "trials": [
           {
             "trial": 1,
-            "passed": 21,
-            "collected": 21,
+            "passed": 173,
+            "collected": 173,
+            "subtests_passed": 27,
             "skipped": 0,
-            "duration_seconds": 32.84871306712739,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/conditioning-files-r6/23/conditioning-trial-1.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/conditioning-files-r6/23/conditioning-trial-1.xml"
+            "duration_seconds": 47.26,
+            "log_path": "D:\\qwen-nccl-prefetch-20261028\\nccl-default-1.log",
+            "junit_path": "D:\\qwen-nccl-prefetch-20261028\\nccl-default-1.xml"
           },
           {
             "trial": 2,
-            "passed": 21,
-            "collected": 21,
+            "passed": 173,
+            "collected": 173,
+            "subtests_passed": 27,
             "skipped": 0,
-            "duration_seconds": 18.088401316897944,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/conditioning-files-r6/23/conditioning-trial-2.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/conditioning-files-r6/23/conditioning-trial-2.xml"
+            "duration_seconds": 43.39,
+            "log_path": "D:\\qwen-nccl-prefetch-20261028\\nccl-default-2.log",
+            "junit_path": "D:\\qwen-nccl-prefetch-20261028\\nccl-default-2.xml"
           }
         ],
         "environment": {
-          "python": "3.12.10",
-          "platform": "Linux-6.6.102-001.8.100.kangaroo.al8.x86_64-x86_64-with-glibc2.39"
+          "python": "3.12.3",
+          "platform": "WSL Linux",
+          "torch": "2.14.1+cpu",
+          "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": "cpu"
         },
-        "manifest_sha256": "c8e0395b052a655d3c94a6423232a5afc0df3ebf290fcb213131d8453d694cd9",
-        "tooling_sha256": {
-          "check_python.py": "74cd3e50f08aad32badc19c1798da4a4867fe3636573f8462d5a1a7efae4bd54",
-          "common.py": "4477c2ab42f0e8578cd2ad96ea6428e2f9a96d2d989a7b868800c431f411ae03",
-          "run_cpu_tests.py": "0891f9c7c8ae491d9daaddf211485bb774eeb30dc49fa66a4dfad4206ebe7357",
-          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
-          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
-          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
-          "zing_pytest_receipt.py": "31aa23143fa9ba6f5eb752d61118aa17ea81579152ec6ec7f3e7e34472e454fe"
-        }
+        "post_test_formatting": "Two blank lines only; verified AST equal to tested file."
       }
     },
     {
@@ -8226,8 +8249,44 @@
       "sources": [
         "conditioning"
       ],
-      "reason": "Two independent Linux WSL CPU trials: 12 real IPC/ownership tests passed; no GPU overlap claim.",
-      "dependencies": []
+      "reason": "Two complete conditioning CPU default-suite trials passed after the pipeline CLI changes; both 1876 primary cases and 59 subtests passed with no skips.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "f110dfe732d5fe941734842e606714524f4bdf2bff412bcd898b6a18c530e764",
+        "receipt": "D:\\qwen-nccl-prefetch-20261028\\pipeline-validation-receipt.json",
+        "receipt_sha256": "6aab4dcb470fac636183c2796a91f927732289c08c9ebcaeb68664f1b0995571",
+        "trials": [
+          {
+            "trial": 1,
+            "full_suite_passed": 1876,
+            "full_suite_collected": 1876,
+            "full_suite_subtests_passed": 59,
+            "full_suite_skipped": 0,
+            "exit_code": 0,
+            "duration_seconds": 363.41,
+            "log_path": "D:\\qwen-nccl-prefetch-20261028\\pipeline-full-1.log",
+            "junit_path": "D:\\qwen-nccl-prefetch-20261028\\pipeline-full-1.xml"
+          },
+          {
+            "trial": 2,
+            "full_suite_passed": 1876,
+            "full_suite_collected": 1876,
+            "full_suite_subtests_passed": 59,
+            "full_suite_skipped": 0,
+            "exit_code": 0,
+            "duration_seconds": 413.6,
+            "log_path": "D:\\qwen-nccl-prefetch-20261028\\pipeline-full-2.log",
+            "junit_path": "D:\\qwen-nccl-prefetch-20261028\\pipeline-full-2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.12.3",
+          "platform": "WSL Linux",
+          "torch": "2.14.1+cpu",
+          "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": "cpu"
+        },
+        "environment_lock_sha256": "5f7d2b06884bcdfa76f2bbc3da82fbdbcb29f12a06c60a6265e7feacfb2fe765"
+      }
     },
     {
       "path": "python/sglang/multimodal_gen/test/unit/realtime/test_zing_source_decoder_overlap.py",
