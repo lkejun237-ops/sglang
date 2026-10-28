@@ -401,6 +401,12 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             and self.joint_plan.split_first_latent
         )
         self.source_encoder = profile.get("source_encoder", default_source_encoder())
+        self.source_append_overlap = bool(
+            self.source_work_quantum
+            and self.source_encoder.get("remote", {}).get("cross_dispatch_prefetch")
+        )
+        self.append_capacity_frames = None  # First dispatch uses existing limits.
+        self.pending_source_consumed_end = 0
         self._initialize_source_admission(session, limits)
         if getattr(args, "zing_conditioning_prefetch", False):
             from sglang.multimodal_gen.runtime.conditioning.prefetch import (
@@ -849,7 +855,21 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             )
             batch.realtime_event_id = None
         appends, count = [], 0
-        while not self.more_work and self.pending and count < self.clip:
+        while (
+            (not self.more_work or self.source_append_overlap)
+            and self.pending
+            and count < self.clip
+        ):
+            size = self.pending[0]["payload"]["num_frames"]
+            capacity = 2 * self.clip
+            if self.source_append_overlap and self.append_capacity_frames is not None:
+                capacity = min(capacity, self.append_capacity_frames)
+            if count + size > capacity:
+                require(
+                    count > 0 or self.more_work,
+                    "Source input cannot progress within the configured capacity.",
+                )
+                break
             item = self.pending.popleft()
             reservation = self._source_reservations.pop(
                 item["payload"]["client_seq"], None
@@ -897,6 +917,25 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         more_work = (result.usage or {}).get("zing_source_more_work", False)
         require(type(more_work) is bool, "Invalid source continuation state.")
         self.more_work = bool(self.source_work_quantum and more_work)
+        if self.source_append_overlap:
+            capacity = (result.usage or {}).get("zing_source_append_capacity_frames")
+            require(
+                type(capacity) is int and capacity >= 0,
+                "Invalid source append capacity.",
+            )
+            self.append_capacity_frames = capacity
+        if self.source_decoder_overlap:
+            consumed = (result.usage or {}).get("zing_source_consumed_end")
+            require(
+                type(consumed) is int
+                and self.pending_source_consumed_end
+                <= consumed
+                <= self.dispatched_source_frames,
+                "Invalid source ownership watermark.",
+            )
+            # The worker watermark may fall inside a transport packet. The
+            # ledger grants credit only for whole packets covered by it.
+            self.pending_source_consumed_end = consumed
         for reservation in self._inflight_reservations:
             reservation.release()
         self._inflight_reservations.clear()
@@ -926,12 +965,27 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         total = await super().send_output(ws, session, result, sub_batch)
         for block in source_blocks:
             self.ledger.delivered(block["provenance"].pixels)
-        consumed = self.ledger.consume(usage["zing_source_consumed_end"])
-        if consumed is not None:
-            await ws.send_bytes(msgspec.msgpack.encode(consumed))
+        if self.source_decoder_overlap:
+            await self.flush_source_credit(ws)
+        else:
+            consumed = self.ledger.consume(usage["zing_source_consumed_end"])
+            if consumed is not None:
+                await ws.send_bytes(msgspec.msgpack.encode(consumed))
         if usage.get("zing_source_complete"):
             await ws.send_bytes(msgspec.msgpack.encode(self.ledger.completed()))
         return total
+
+    async def flush_source_credit(self, ws):
+        """Merge validated progress without a second sender or stale RGB watermark."""
+        if not self.source_decoder_overlap:
+            return
+        # Both the output task and the input waiter use this entry point.
+        # Re-read after acquiring the reentrant output group lock.
+        async with ws.send_group():
+            if self.pending_source_consumed_end > self.ledger.consumed_frames:
+                consumed = self.ledger.consume(self.pending_source_consumed_end)
+                if consumed is not None:
+                    await ws.send_bytes(msgspec.msgpack.encode(consumed))
 
     def clear_state(self, session):
         if getattr(self, "prompt_prefetch", None) is not None:

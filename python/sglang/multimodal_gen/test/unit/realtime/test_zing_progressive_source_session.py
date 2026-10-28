@@ -543,6 +543,23 @@ def test_quantum_one_drains_eos_by_continuation_without_new_input(monkeypatch, f
     )
 
 
+def test_continuation_with_new_input_consumes_one_plus_eight_in_one_dispatch(
+    monkeypatch,
+):
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", "1")
+    state, stage = session(ChunkPlan([3, 2]))
+    first = batch(state, 0, 1, 0).extra["zing_source_command"]["appends"][0]
+    state.ledger.accept(**first)
+    state.pixels.append(torch.zeros(3, 1, 1, 1, dtype=torch.uint8), frame_start=0)
+    assert state.pixels.ready and state.bridge.accepted_latents == 0
+    # The old API forced an empty append here, producing a pure progress turn.
+    result = state.run(stage, batch(state, 1, 8, 1))
+    assert state.pixels.emitted_latents == 3
+    assert result.usage["zing_source_consumed_end"] == 9
+    assert result.usage["zing_source_dispatch_steps"] == 1
+    assert len(state.sampler.calls) == 1
+
+
 def test_quantum_yields_ready_rgb_before_next_dit_step(monkeypatch):
     monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", "1")
     state, stage = session(ChunkPlan([1, 2, 2]))

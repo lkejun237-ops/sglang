@@ -21,6 +21,10 @@ def pipeline(monkeypatch):
         sent=[],
         cancelled=[],
         results=[],
+        progress_indices=set(),
+        progress_steps=0,
+        progress_completed=asyncio.Event(),
+        third_started=asyncio.Event(),
         errors=[],
         output_started=asyncio.Event(),
         output_release=asyncio.Event(),
@@ -65,12 +69,16 @@ def pipeline(monkeypatch):
             session.generate_chunk_completed()
             if session.generate_chunk_cnt == 2:
                 state.second_completed.set()
+            if session.generate_chunk_cnt - 1 in state.progress_indices:
+                state.progress_completed.set()
 
         def session_ready_message(self, session):
             return {}
 
     async def worker(_client, batch):
         state.started.append(batch.block_idx)
+        if batch.block_idx == 2:
+            state.third_started.set()
         if batch.block_idx == 1:
             state.second_started.set()
             if state.block_worker:
@@ -79,6 +87,12 @@ def pipeline(monkeypatch):
             raw_frame_shared_memory_ref={"index": batch.block_idx},
             realtime_request_metadata={"event_id": batch.realtime_event_id},
         )
+        if batch.block_idx in state.progress_indices:
+            result.raw_frame_shared_memory_ref = None
+            result.usage = {
+                "zing_source_consumed_end": batch.block_idx + 1,
+                "zing_source_dispatch_steps": state.progress_steps,
+            }
         state.results.append(result)
         return None, result
 
@@ -103,6 +117,7 @@ def pipeline(monkeypatch):
         "_emit_realtime_result_stage_traces",
         "log_realtime_trace",
         "observe_stage_ms",
+        "_log_realtime_chunk_timing",
     ):
         monkeypatch.setattr(realtime_video_api, name, lambda *_a, **_k: None)
     monkeypatch.setattr(
@@ -249,3 +264,62 @@ def test_cancel_drains_inflight_dit_and_releases_both_outputs(pipeline):
         assert not p.sent
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("steps", [0, 1])
+def test_progress_dispatch_does_not_wait_for_or_replace_old_output(pipeline, steps):
+    async def run():
+        p = pipeline
+        p.progress_indices = {1}
+        p.progress_steps = steps
+        p.session.request.max_chunks = 4
+        task = asyncio.create_task(
+            realtime_video_api._generate_loop_local(SimpleNamespace(), p.session)
+        )
+        try:
+            if not steps:
+                await asyncio.wait_for(p.third_started.wait(), 2)
+                await asyncio.sleep(0)
+                # Dispatch 1 only advanced source. Dispatch 2 can run, but its
+                # real result must wait for output 0 before dispatch 3 starts.
+                assert p.started == [0, 1, 2] and p.sent == []
+            else:
+                await asyncio.wait_for(p.progress_completed.wait(), 2)
+                await asyncio.sleep(0)
+                # Decoder lookahead is not permission to run more DiT work.
+                assert p.started == [0, 1] and p.sent == []
+            p.output_release.set()
+            await asyncio.wait_for(task, 2)
+            expected = [0, 2, 3] if not steps else [0, 1, 2, 3]
+            assert p.sent == [(i, 0) for i in expected]
+            assert not p.errors and not p.cancelled and not p.session.active_chunks
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_terminal_and_real_output_are_never_discarded_as_progress(terminal):
+    adapter = SimpleNamespace(source_decoder_overlap=True)
+    usage = {"zing_source_consumed_end": 9, "zing_source_complete": terminal}
+    result = OutputBatch(usage=usage)
+    assert realtime_video_api._is_source_progress_only(adapter, result) is not terminal
+    for field, value in (
+        ("output", [object()]),
+        ("raw_frame_batches", [[b"rgb"]]),
+        ("raw_frame_shared_memory_ref", {"ref": "owned"}),
+        ("raw_frame_metadata", {"num_frames": 8}),
+        ("error", "worker failed"),
+    ):
+        assert not realtime_video_api._is_source_progress_only(
+            adapter, OutputBatch(usage=usage, **{field: value})
+        )
+    result.usage["zing_realtime_blocks"] = [{"num_frames": 8}]
+    assert not realtime_video_api._is_source_progress_only(adapter, result)
+    # A DiT step can have no RGB yet (decoder lookahead). It still owns the
+    # next-result budget and must not allow unbounded model work ahead.
+    result.usage.pop("zing_realtime_blocks")
+    result.usage["zing_source_dispatch_steps"] = 1
+    assert not realtime_video_api._is_source_progress_only(adapter, result)

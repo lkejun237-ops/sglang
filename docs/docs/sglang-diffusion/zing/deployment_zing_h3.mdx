@@ -526,3 +526,11 @@ PR #414 将 `seedleap-kernels` 的前序融合算子接入 Zing H3 DiT 主循环
 2026-10-25，`428cd48295`异步实现加T033七处部署兼容覆盖，在B300资源池实际L20D/CC10.3、Thai r10模型、832×480上测量：GPU0/1 DiT、GPU2 Encoder＋Qwen、GPU3 Lynn Decoder；三个异步与Qwen六项、prompt_joint开启，Graph关闭、W6/S3。三个案例首批后FPS为24.10/23.55/23.60，prompt到新RGB为1.244/1.470/1.393秒；诊断已观察Decoder与下一DiT部分重叠，仍有周期空泡和切换等待。完整阶段P50/P95、显存及可回查原始证据见同一设计文档。
 
 按用户要求只测全开单配置，无同条件A/B收益结论。736、reference切换、纯HEAD无覆盖GPU数值及生命周期未验收；不能将上述结果外推至H200或其他布局。收尾补充的预取超时清理修复已通过689项CPU回归，未重跑GPU。Source槽位/零RGB轮次等后续调度改动不属于本PR。
+
+## Source 续推调度（基于 Qwen/Decoder overlap 的后续改动）
+
+2026-10-25，基于 #410 的 `87c544b9a8`，独立 stacked 分支增加 remote Encoder overlap 三份 slice 额度；q1＋cross-dispatch prefetch 可在续推时按实际帧/字节余量补输入；独立 Decoder overlap 的纯进度返回跳过旧 RGB 等待，credit 合并到既有输出任务。布局、模型、VAE 1+8+8 shape 和播放缓冲不变。非终态零输出轮次只保留服务端逐轮诊断，不再发送会争用 RGB 锁的 WebSocket chunk telemetry；真实输出、credit、终态和错误仍有序交付。
+
+2026-10-25，`c0d0687832`加相同七项兼容覆盖，在原B300/L20D四卡、Thai r10、832×480全异步/W6/S3/Graph OFF条件复测。三例首批后FPS24.20/23.61/23.60，prompt到新RGB1.304/1.437/1.479秒，未见明显总体或切换收益；原对应174/171ms间隔降至约51.8/51.4ms，三次诊断无DiT调用62→0，但后段仍受joint lookahead凑批影响，出现约250ms间隔。三视频/输入输出/EOS与正常顺序会话通过；组件Host/CUDA、逐rank显存和证据入口见[独立设计文档](plans/SOURCE_PIPELINE_SCHEDULING.md)。每例一次正式/诊断，仅历史描述性比较；736、reference切换、数值等价、GPU故障注入和纯HEAD无覆盖未验证，PR保持draft。
+
+2026-10-28，#417 对齐 main `387f693f30`（已含 #410、#415、#430、#437、#438、#440、#442），保留 Source 调度增量及 Disaggregation 角色配置；Source adapter 的双方新增测试均保留。历史播放指标与 GPU 数据不变，本次未重跑 GPU；以上结果不代表最新 main 整合版本的性能验收。

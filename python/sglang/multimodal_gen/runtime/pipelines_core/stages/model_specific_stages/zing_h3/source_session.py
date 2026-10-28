@@ -621,6 +621,10 @@ class ZingSourceStreamState(BaseRealtimeState):
                     "pending_blocks": len(self.blocks),
                 },
             }
+            if "remote" in self.policy["source_encoder"]:
+                usage["zing_source_append_capacity_frames"] = (
+                    self.pixels.append_capacity_frames
+                )
             if self.policy.get("joint_forward", "off") != "off" or self.policy.get(
                 "source_prompt_joint", False
             ):

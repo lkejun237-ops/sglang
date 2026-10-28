@@ -1998,6 +1998,176 @@ def test_source_decoder_overlap_requires_dedicated_single_block_path(
         adapter.clear_state(session)
 
 
+def _queue_source_packets(adapter, sizes):
+    for seq, size in enumerate(sizes):
+        start = adapter.ledger.accepted_frames
+        payload = dict(
+            client_seq=seq,
+            source_frame_start=start,
+            num_frames=size,
+            pts_us=start * 1_000_000 // 24,
+            data=bytes(size * adapter.ledger.frame_bytes),
+        )
+        item = dict(
+            payload=payload, event_id=seq + 1, message_bytes=len(payload["data"]) + 100
+        )
+        adapter.ledger.accept(**item)
+        adapter.pending.append(item)
+        adapter.pending_frames += size
+
+
+@pytest.mark.parametrize(
+    "overlap,capacity,expected",
+    [(False, 17, 0), (True, 17, 16), (True, 8, 8), (True, 7, 0)],
+)
+def test_continuation_can_append_whole_packets_within_capacity(
+    configured, monkeypatch, overlap, capacity, expected
+):
+    adapter, session = initialize()
+    adapter.more_work = True
+    adapter.source_append_overlap = overlap
+    adapter.append_capacity_frames = capacity
+    _queue_source_packets(adapter, [8, 8])
+    monkeypatch.setattr(
+        source.BaseRealtimeModelAdapter,
+        "prepare_next_request",
+        lambda *a: SimpleNamespace(block_idx=1, extra={}),
+    )
+    batch = adapter.prepare_next_request(session, configured, None)
+    assert (
+        sum(
+            item["payload"]["num_frames"]
+            for item in batch.extra["zing_source_command"]["appends"]
+        )
+        == expected
+    )
+    assert adapter.dispatched_source_frames == expected
+    assert adapter.pending_frames == 16 - expected
+    adapter.clear_state(session)
+
+
+def test_no_capacity_and_no_progress_is_rejected_instead_of_spinning(
+    configured, monkeypatch
+):
+    adapter, session = initialize()
+    adapter.source_append_overlap = True
+    adapter.append_capacity_frames = 7
+    _queue_source_packets(adapter, [8])
+    monkeypatch.setattr(
+        source.BaseRealtimeModelAdapter,
+        "prepare_next_request",
+        lambda *a: SimpleNamespace(block_idx=1, extra={}),
+    )
+    with pytest.raises(ValueError, match="cannot progress"):
+        adapter.prepare_next_request(session, configured, None)
+    assert len(adapter.pending) == 1
+    adapter.clear_state(session)
+
+
+def test_credit_coalesces_progress_and_preserves_old_output_provenance(configured):
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_video_api import (
+        _LockedRealtimeWebSocket,
+    )
+
+    adapter, session = initialize()
+    adapter.source_decoder_overlap = True
+    adapter.source_work_quantum = 1
+    _queue_source_packets(adapter, [8, 8])
+    adapter.dispatched_source_frames = 16
+    messages = []
+
+    class Socket:
+        async def send_bytes(self, payload):
+            messages.append(msgspec.msgpack.decode(payload))
+
+    def progress(end):
+        session.new_chunk()
+        adapter.on_chunk_complete(
+            session,
+            SimpleNamespace(
+                usage={"zing_source_consumed_end": end, "zing_source_more_work": True}
+            ),
+        )
+
+    async def run():
+        ws = _LockedRealtimeWebSocket(Socket())
+        progress(1)  # A codec slice may end inside a transport packet.
+        await adapter.flush_source_credit(ws)
+        assert messages == [] and adapter.ledger.consumed_frames == 0
+        progress(8)
+        progress(9)
+        async with ws.send_group():  # Existing RGB group calls this reentrantly.
+            await adapter.flush_source_credit(ws)
+        assert [m["source_frame_end"] for m in messages] == [8]
+        assert adapter.ledger.provenance_for(PixelRange(0, 8), 8).pixels == PixelRange(
+            0, 8
+        )
+        adapter.ledger.delivered(PixelRange(0, 8))
+        progress(16)
+        await adapter.flush_source_credit(ws)
+        await adapter.flush_source_credit(ws)
+        assert [m["source_frame_end"] for m in messages] == [8, 16]
+        assert len(adapter.ledger.records) == 1
+        for invalid in (15, 17, True):
+            with pytest.raises(ValueError, match="ownership watermark"):
+                progress(invalid)
+        assert adapter.pending_source_consumed_end == 16
+
+    asyncio.run(run())
+    adapter.clear_state(session)
+
+
+def test_output_completion_flushes_progress_before_waiting_for_credit_input(configured):
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
+        realtime_video_api as api,
+    )
+
+    adapter, session = initialize()
+    adapter.source_decoder_overlap = True
+    _queue_source_packets(adapter, [8, 8])
+
+    async def run():
+        input_ready = asyncio.Event()
+        output_flushed = asyncio.Event()
+        output_release = asyncio.Event()
+        messages = []
+
+        class Socket:
+            async def send_bytes(self, payload):
+                message = msgspec.msgpack.decode(payload)
+                messages.append(message)
+                if message.get("source_frame_end") == 16:
+                    input_ready.set()
+
+        ws = api._LockedRealtimeWebSocket(Socket())
+
+        async def wait_input(_session):
+            await input_ready.wait()
+
+        adapter.wait_for_next_chunk = wait_input
+
+        async def old_output():
+            adapter.pending_source_consumed_end = 8
+            await adapter.flush_source_credit(ws)
+            output_flushed.set()
+            await output_release.wait()
+
+        output = asyncio.create_task(old_output())
+        await output_flushed.wait()
+        adapter.pending_source_consumed_end = 16
+        waiter = asyncio.create_task(
+            api._wait_for_source_input(adapter, session, output, ws)
+        )
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        output_release.set()
+        await asyncio.wait_for(waiter, 2)
+        assert [m["source_frame_end"] for m in messages] == [8, 16]
+
+    asyncio.run(run())
+    adapter.clear_state(session)
+
+
 def test_adapter_init_applies_disagg_role_policies(configured):
     configured.disagg_encoder_port = 31005
     configured.disagg_decoder_port = 31007

@@ -1224,10 +1224,33 @@ async def _wait_for_source_chunk_output(adapter, pending_send_task):
     return pending_send_task
 
 
-async def _wait_for_source_input(adapter, session, pending_send_task):
+async def _flush_source_credit(ws, adapter):
+    flush = getattr(adapter, "flush_source_credit", None)
+    if flush is not None:
+        await flush(ws)
+
+
+def _is_source_progress_only(adapter, result):
+    usage = result.usage or {}
+    return (
+        getattr(adapter, "source_decoder_overlap", False)
+        and "zing_source_consumed_end" in usage
+        and not usage.get("zing_source_complete")
+        and not usage.get("zing_source_dispatch_steps")
+        and result.error is None
+        and not usage.get("zing_realtime_blocks")
+        and (result.output is None or len(result.output) == 0)
+        and not result.raw_frame_batches
+        and not result.raw_frame_metadata
+        and result.raw_frame_shared_memory_ref is None
+    )
+
+
+async def _wait_for_source_input(adapter, session, pending_send_task, ws):
     if pending_send_task is None or not getattr(
         adapter, "source_decoder_overlap", False
     ):
+        await _flush_source_credit(ws, adapter)
         await adapter.wait_for_next_chunk(session)
         return
     # A failed output cannot return source credit. Do not leave the next input
@@ -1239,6 +1262,9 @@ async def _wait_for_source_input(adapter, session, pending_send_task):
         )
         if pending_send_task in done:
             pending_send_task.result()
+            # Progress may arrive just after the old output flushed its
+            # credit. Release it before waiting on credit-dependent input.
+            await _flush_source_credit(ws, adapter)
         await ready
         if pending_send_task.done():
             pending_send_task.result()
@@ -1276,7 +1302,7 @@ async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
             server_args = get_global_server_args()
 
             wait_started = time.perf_counter()
-            await _wait_for_source_input(adapter, session, pending_send_task)
+            await _wait_for_source_input(adapter, session, pending_send_task, ws)
             await adapter.prepare_conditioning(session, server_args)
             wait_for_next_chunk_ms = (time.perf_counter() - wait_started) * 1000
             log_realtime_trace(
@@ -1365,6 +1391,22 @@ async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
 
             # finish
             adapter.on_chunk_complete(session, result)
+            if _is_source_progress_only(adapter, result):
+                # No RGB ownership is being handed off. Keep the old output
+                # task and advance immediately; its completion flushes credit.
+                # WebSocket chunk telemetry also takes the RGB lock, so these
+                # zero-output dispatches use server traces/metrics only.
+                _log_realtime_chunk_timing(
+                    session,
+                    chunk,
+                    batch,
+                    request_prepare_ms,
+                    scheduler_forward_ms,
+                    (time.perf_counter() - chunk_started) * 1000,
+                    empty_frame_send_stats(),
+                )
+                current_result = None
+                continue
             # At most one previous output and this completed result are owned.
             # A dedicated decoder has received the latent before returning its
             # reference. Wait here, rather than before DiT, to preserve send
@@ -1438,6 +1480,7 @@ async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
     else:
         if pending_send_task is not None:
             await pending_send_task
+        await _flush_source_credit(ws, adapter)
         logger.info(
             "generation reached max chunks, session_id=%s, max_chunks=%s",
             session.id,

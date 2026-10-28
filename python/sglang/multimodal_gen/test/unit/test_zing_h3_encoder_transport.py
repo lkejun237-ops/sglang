@@ -57,6 +57,7 @@ def _fake_producer(self):
     )
 
     frames = emitted = 0
+    self.started_slices = []
     while not self.stop.is_set():
         try:
             op, value, _ = self.commands.get(timeout=0.05)
@@ -71,6 +72,7 @@ def _fake_producer(self):
             if self.stop.is_set():
                 break
             end = min(target, emitted + (1 if emitted % 5 == 0 else 2))
+            self.started_slices.append((emitted, end))
             dependency = min(
                 frames,
                 emitted // 5 * 17 + (1 if end % 5 == 1 else 9 if end % 5 == 3 else 17),
@@ -188,9 +190,11 @@ def test_cancel_while_producer_waits_for_credit_then_reset(monkeypatch, mode):
     session.append(torch.zeros(3, 34, 2, 2, dtype=torch.uint8), frame_start=0)
     if mode == "overlap":
         deadline = time.monotonic() + 2
-        while session.results.qsize() < 2 and time.monotonic() < deadline:
+        while session.results.qsize() < 3 and time.monotonic() < deadline:
             time.sleep(0.01)
-        assert session.results.qsize() == 2
+        assert session.results.qsize() == 3
+        assert session.started_slices == [(0, 1), (1, 3), (3, 5)]
+        assert not session.permits.acquire(blocking=False)
     old_thread, old_token = session.thread, session.token
     session.reset()
     assert not old_thread.is_alive()
@@ -199,6 +203,32 @@ def test_cancel_while_producer_waits_for_credit_then_reset(monkeypatch, mode):
     assert session.results.empty() and session.commands.empty()
     session.dispose()
     assert not session.thread.is_alive()
+
+
+@pytest.mark.parametrize("capacity_bytes,expected", [(4096, 25), (12 * 20, 11)])
+def test_append_capacity_uses_formal_frames_and_bytes(
+    monkeypatch, capacity_bytes, expected
+):
+    from sglang.multimodal_gen.runtime.distributed import parallel_state
+
+    monkeypatch.setattr(
+        parallel_state, "get_world_group", lambda: SimpleNamespace(rank_in_group=1)
+    )
+    codecs = SimpleNamespace(
+        modules={"video_vae": SimpleNamespace(encoder=torch.nn.Linear(1, 1))}
+    )
+    encoder = RemoteEncoderSession(
+        codecs,
+        capacity_frames=34,
+        config=dict(port=31001, mode="overlap", capacity_bytes=capacity_bytes),
+    )
+    encoder.append(torch.zeros(3, 9, 2, 2, dtype=torch.uint8), frame_start=0)
+    assert encoder.append_capacity_frames == expected
+    encoder.prefetched_frames = 100  # Background progress cannot grant headroom.
+    assert encoder.append_capacity_frames == expected
+    encoder.finish()
+    assert encoder.append_capacity_frames == 0
+    encoder.dispose()
 
 
 def test_producer_failure_is_broadcast_before_tensor_collective(monkeypatch):

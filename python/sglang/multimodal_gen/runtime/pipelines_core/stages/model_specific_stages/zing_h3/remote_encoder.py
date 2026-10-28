@@ -85,8 +85,13 @@ class RemoteEncoderSession:
         self.ended = self.disposed = False
         self.signature = None
         self.commands = queue.Queue(maxsize=capacity_frames + 1)
-        self.results = queue.Queue(maxsize=2)
-        self.permits = threading.Semaphore(2 if self.mode == "overlap" else 0)
+        # A clip boundary can leave an 8-frame slice followed by the new
+        # clip's first frame. Admit the next 8 frames before either is popped.
+        result_slots = 3 if self.mode == "overlap" else 2
+        self.results = queue.Queue(maxsize=result_slots)
+        self.permits = threading.Semaphore(
+            result_slots if self.mode == "overlap" else 0
+        )
         self.stop = threading.Event()
         self.failure = None
         self.recovery = None
@@ -118,6 +123,18 @@ class RemoteEncoderSession:
     @property
     def buffered_frames(self):
         return self.accepted_frames - self._consumed
+
+    @property
+    def append_capacity_frames(self):
+        """Formal input headroom, independent of background producer progress."""
+        if self.ended or self.disposed:
+            return 0
+        if self.signature is None:
+            raise ValueError("Source dimensions are not established")
+        capacity = min(
+            self.capacity_frames, self.capacity_bytes // (3 * math.prod(self.signature))
+        )
+        return max(0, capacity - self.buffered_frames)
 
     @property
     def ready(self):

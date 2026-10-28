@@ -57,6 +57,9 @@ def methods(sampling_schedule=None):
         end_dispatched=False,
         more_work=False,
         source_work_quantum=1,
+        # These legacy quantum tests exercise serial input/output scheduling.
+        source_append_overlap=False,
+        source_decoder_overlap=False,
         clip=17,
         source_encoder={"mode": "progressive"},
         available=asyncio.Event(),
