@@ -39,6 +39,25 @@ from .streaming_noise import STREAMING_NOISE_VERSION
 logger = init_logger(__name__)
 
 
+def source_preview(config, data):
+    """Construct identical S0 conditioning for prefill and normal generation."""
+    width, height = config["width"], config["height"]
+    size = width * height * 3
+    if not isinstance(data, bytes) or len(data) < size:
+        raise ValueError("Source preview requires one complete RGB24 frame")
+    pixels = torch.frombuffer(bytearray(data[:size]), dtype=torch.uint8).reshape(
+        height, width, 3
+    )
+    return dict(
+        type="video",
+        id="<Video 1>",
+        clip=dict(start=0, end=0),
+        frames=pixels.permute(2, 0, 1).unsqueeze(1),
+        fps=float(config["fps"]),
+        origin="source_s0",
+    )
+
+
 def _source_key_policy(stage, sampler, work_quantum, command):
     """Policy fields that must be identical for a warmup and a live session."""
     defer_final = command.get(
@@ -123,23 +142,9 @@ class ZingSourceStreamState(BaseRealtimeState):
                 # does not imply CUDA completion.
                 self.qwen_init_host_ms = (time.perf_counter() - start) * 1000
 
-        source_preview = None
+        preview = None
         if command.get("source_preview", False):
-            # Read S0 from the same accepted bytes later fed to the source VAE.
-            # This bounded CPU tensor crosses neither a file nor a second IPC.
-            payload = command["appends"][0]["payload"]
-            width, height = config["width"], config["height"]
-            pixels = torch.frombuffer(
-                bytearray(payload["data"][: width * height * 3]), dtype=torch.uint8
-            ).reshape(height, width, 3)
-            source_preview = dict(
-                type="video",
-                id="<Video 1>",
-                clip=dict(start=0, end=0),
-                frames=pixels.permute(2, 0, 1).unsqueeze(1),
-                fps=float(config["fps"]),
-                origin="source_s0",
-            )
+            preview = source_preview(config, command["appends"][0]["payload"]["data"])
         request = stage._build_request(batch)
         self.block0_cache = getattr(stage, "block0_cache", None)
         if self.block0_cache is not None:
@@ -155,14 +160,14 @@ class ZingSourceStreamState(BaseRealtimeState):
             # gains reporting-only encoder/decoder fields after initialization.
             self.block0_key_args = (
                 stage.codecs,
-                source_preview,
+                preview,
                 dict(config),
                 dict(self.policy),
             )
             self.block0_key = preparation_key(
                 stage.codecs,
                 self.block0_input_request,
-                source_preview,
+                preview,
                 config,
                 self.policy,
             )
@@ -173,7 +178,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                 request,
                 prepare_use,
                 retain_condition_media=True,
-                source_preview=source_preview,
+                source_preview=preview,
                 conditioning=stage._conditioning_consumer(batch),
                 stage_trace=trace,
             )
@@ -363,46 +368,50 @@ class ZingSourceStreamState(BaseRealtimeState):
 
         condition = batch.session.get_or_create_state(WorkerConditioningState)
         identity = condition.identity
-        device = next(stage.modules["transformer"].parameters()).device
-        visual = (
-            inputs.positive["context"]
-            .new_zeros((1, stage.packer.visual_channels, *inputs.visual_shape))
-            .to(device)
-        )
-        layout = sampler.processor.pack_inference_layout(
-            inputs, inputs.positive, visual, None
-        )
-        source_shape = (
-            inputs.visual_shape[-2:] if source_shape is None else source_shape
-        )
-        lease = storage = pool_request = None
-        if getattr(stage, "kv_pool", None) is not None:
-            pool_request = stage.kv_request(
-                sampler,
-                inputs,
-                layout,
-                source_shape=source_shape,
-                total_frames=None,
+        with stage._use("transformer", "denoise") as transformer:
+            sampler.generator = transformer
+            device = next(transformer.parameters()).device
+            visual = (
+                inputs.positive["context"]
+                .new_zeros((1, stage.packer.visual_channels, *inputs.visual_shape))
+                .to(device)
             )
-            lease = stage.kv_pool.acquire(batch.session, pool_request)
-            storage = lease.kv_cache
-        state = None
-        try:
-            state = sampler.initialize(inputs, visual, storage=storage)
-            cache.fill(
-                key,
-                inputs,
-                identity,
-                pool_request if pool_request is not None else request,
-                state.cache,
+            layout = sampler.processor.pack_inference_layout(
+                inputs, inputs.positive, visual, None
             )
-            cache.finish_fill()
-            return cache.entries.get(key)
-        finally:
-            if state is not None:
-                state.close()
-            if lease is not None:
-                lease.release()
+            source_shape = (
+                inputs.visual_shape[-2:] if source_shape is None else source_shape
+            )
+            lease = storage = pool_request = None
+            if getattr(stage, "kv_pool", None) is not None:
+                pool_request = stage.kv_request(
+                    sampler,
+                    inputs,
+                    layout,
+                    source_shape=source_shape,
+                    total_frames=None,
+                )
+                lease = stage.kv_pool.acquire(batch.session, pool_request)
+                storage = lease.kv_cache
+            state = None
+            try:
+                state = sampler.initialize(inputs, visual, storage=storage)
+                cache.fill(
+                    key,
+                    inputs,
+                    identity,
+                    pool_request if pool_request is not None else request,
+                    state.cache,
+                )
+                cache.finish_fill()
+                return cache.entries.get(key)
+            finally:
+                try:
+                    if state is not None:
+                        state.close()
+                finally:
+                    if lease is not None:
+                        lease.release()
 
     def _pooled_storage(self, stage, session, sampler):
         """Lease a slot at the first step; the ready session never sees the pool."""

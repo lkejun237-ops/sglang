@@ -126,6 +126,33 @@ dispatch 回写。默认关闭；启用原有 KV pool 后，设置 `SGLANG_ZING_
 本地跨实例恢复与变更拒绝回归已补充，H100 Attempt 2 验收进行中；CPFS、736 与长流未验证。
 回执入口：`exports/block0-l1-l2-prefill-h100-20261028-r1/attempt2/`。
 
+### 启动后串行 prefill 接口
+
+2026-10-28：独立 WebSocket `/v1/realtime_video/prefill` 接收完整固定 case，复用
+普通请求调度，在 L1 Block0 缓存可用及本次 worker 资源清理后返回回执，再接下一条。
+协议、错误、LRU 与多副本边界见 [接口说明](specs/block0-prefill-websocket.md)。
+
+CPU 验收已通过：冻结源码 `44c2fb9cc98d77f2674ce524bd90cc8677b37e69`，
+PAI 作业 `dlc19esqvf4vrngx`，上海 `cn-shanghai`，8 CPU / 96 GiB / **0 GPU**，
+45 分钟上限。使用 Python 3.12、Torch 2.14.1+cpu / torchvision 0.29.1+cpu，
+逐项核验完整 conditioning 依赖锁及 triton 3.8.0，离线安装全部 139 个 wheel。
+两个独立进程执行完整默认套件，28 个文件每轮 **1859 项与 56 个 subtest 通过**，
+零失败、零跳过；其中新增 API 的 10 项用例每轮均通过，已批准进入 CPU CI 清单。
+覆盖串行处理、busy 拒绝、输入重试、错误脱敏、断连清理、普通调度复用以及
+prefill miss/hit 的 lease 释放。日志、JUnit、逐文件覆盖、源码/依赖/Git 对象身份
+均已核验，回执为 `exports/zing-prefill-api-20261028-r7/VERIFIED.json`。
+
+补充 CPU 作业 `dlc1hg74zvwxj03i` 在 Torch 2.8.0+cpu 环境两轮各 1051 项通过，
+包含普通 cache suite，零失败、零跳过；证据在 `exports/zing-prefill-api-20261028-r4`。
+这些结果只验证 CPU 协议与生命周期，不新增真实模型、GPU 精度或性能结论，
+也不声称 GitHub Actions 已运行。发布分支同步主线后的组合版本由本 PR 的 CPU CI 再验证。
+
+准备过程的失败均保留在 `exports/zing-prefill-api-20261028-rN`：
+`dlc1jxl823wek77p`（镜像拉取失败，经用户授权停止）、`dlc1d02ebvitg4fg`（联网依赖
+下载失败）、`dlc8rz3t7wwfka5a`（测试隔离入口混用）、`dlczf35e3v0jhvjq`（空 GPU
+可见性变量）、`dlc1lw7nyjyiycib`（源码归档缺历史 Git 对象）。最终作业复用上海
+内网 ACR 镜像、核验后的 OSS 离线依赖和真实 Git 快照，未修改或跳过失败用例。
+
 ## Prompt 生效的 codec 周期边界
 
 2026-10-26 的周期边界修复基于 `844fdf42b077`：候选 prompt 可随时接收，

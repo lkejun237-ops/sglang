@@ -142,7 +142,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
     def create_state(self):
         return None  # Initialized atomically after negotiation validation.
 
-    async def on_init(self, session, request):
+    async def on_init(self, session, request, *, prefill=False):
         self.init_started_ns = time.time_ns()
         self._source_reservations, self._inflight_reservations = {}, []
         self._s0_reservation = None
@@ -459,8 +459,10 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         )
         self.append_capacity_frames = None  # First dispatch uses existing limits.
         self.pending_source_consumed_end = 0
-        self._initialize_source_admission(session, limits)
-        if getattr(args, "zing_conditioning_prefetch", False):
+        self.admission_socket = self.admission_context = None
+        if not prefill:
+            self._initialize_source_admission(session, limits)
+        if not prefill and getattr(args, "zing_conditioning_prefetch", False):
             from sglang.multimodal_gen.runtime.conditioning.prefetch import (
                 PromptPrefetchPublisher,
             )
@@ -891,6 +893,23 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             12,
         )
         return params
+
+    def prepare_prefill_request(self, session, server_args, source_frame):
+        require(
+            isinstance(source_frame, bytes)
+            and len(source_frame) == self.config["width"] * self.config["height"] * 3,
+            "Please provide exactly one RGB24 source frame for prefill.",
+        )
+        batch = super().prepare_next_request(session, server_args, session.new_chunk())
+        batch.extra["zing_prefill"] = dict(source_frame=source_frame)
+        batch.extra["zing_source_command"] = dict(
+            config=self.config,
+            sampling_schedule=self.sampling_schedule,
+            work_quantum=self.source_work_quantum,
+            defer_final=self.source_defer_final,
+            prompt_joint=self.source_prompt_joint,
+        )
+        return batch
 
     def prepare_next_request(self, session, server_args, chunk):
         batch = super().prepare_next_request(session, server_args, chunk)

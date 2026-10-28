@@ -134,6 +134,7 @@ DEFAULT_TESTS = [
     "conditioning",
     "realtime/test_zing_conditioning_lifecycle.py",
     "realtime/test_zing_h3_source_adapter.py",
+    "realtime/test_zing_prefill_api.py",
     "realtime/test_zing_h3_realtime_adapter.py",
     "test_zing_h3_media_contract.py",
     "test_zing_h3_shared_primitives.py",

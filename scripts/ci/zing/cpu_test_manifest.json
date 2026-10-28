@@ -8311,6 +8311,95 @@
       ],
       "reason": "All 14 integration and AST contracts passed in two fresh CPU trials and verified on H200 GPU.",
       "dependencies": []
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/realtime/test_zing_prefill_api.py",
+      "suite": "conditioning-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main",
+        "conditioning"
+      ],
+      "reason": "Two fresh Linux Python 3.12 CPU trials passed all 10 API cases without skips in PAI job dlc19esqvf4vrngx, with the exact conditioning lock and complete 28-file default suite (1859 cases plus 56 passing subtests per trial).",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "648c8f4fb54888fb7c0598a5acedb1b22f946596291c807621b14a17cc45ebbc",
+        "receipt": "/home/ss80194/work/sglang-zing/exports/zing-prefill-api-20261028-r7/VERIFIED.json",
+        "receipt_sha256": "8914319cd7399ae43c3bd8185a1294d53c28bb22b20d9df67b99cd6228ac3881",
+        "checkout_sha": "44c2fb9cc98d77f2674ce524bd90cc8677b37e69",
+        "job_id": "dlc19esqvf4vrngx",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 10,
+            "collected": 10,
+            "skipped": 0,
+            "exit_code": 0,
+            "duration_seconds": 0.254,
+            "log_path": "/home/ss80194/work/sglang-zing/exports/zing-prefill-api-20261028-r7/trial-1.log",
+            "junit_path": "/home/ss80194/work/sglang-zing/exports/zing-prefill-api-20261028-r7/trial-1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 10,
+            "collected": 10,
+            "skipped": 0,
+            "exit_code": 0,
+            "duration_seconds": 0.291,
+            "log_path": "/home/ss80194/work/sglang-zing/exports/zing-prefill-api-20261028-r7/trial-2.log",
+            "junit_path": "/home/ss80194/work/sglang-zing/exports/zing-prefill-api-20261028-r7/trial-2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.12.3 (main, Jul 15 2026, 23:46:41) [GCC 13.3.0]",
+          "torch": "2.14.1+cpu",
+          "gpu_count": 0,
+          "packages": {
+            "pytest": "9.1.1",
+            "pydantic": "2.14.0",
+            "msgspec": "0.22.0",
+            "fastapi": "0.143.0",
+            "transformers": "5.19.0"
+          }
+        },
+        "environment_recipe": {
+          "python_version": "3.12",
+          "environment_lock_sha256": "2d56cab7c584539b2ad7f742c8ed9833f244ea46f3ff4d80938e3a1eddb3591d",
+          "runner_sha256": "6cbc06bcd24d476cd441186e944f0a567eea422efa6bb6f3b452d0d2c9800523",
+          "extra_dependencies": {
+            "triton": "3.8.0"
+          },
+          "torch": "2.14.1+cpu",
+          "torchvision": "0.29.1+cpu",
+          "history_base": "b1899c0bd538a342056a39893e8ce048b17afa32",
+          "reference_sha": "8b4bf2c3d9f5ceeb2b8bc9c20af7afbba6f24982"
+        },
+        "full_suite_trials": [
+          {
+            "trial": 1,
+            "passed": 1859,
+            "subtests_passed": 56,
+            "junit_reported_tests": 1915,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0,
+            "duration_seconds": 203.81
+          },
+          {
+            "trial": 2,
+            "passed": 1859,
+            "subtests_passed": 56,
+            "junit_reported_tests": 1915,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0,
+            "duration_seconds": 212.19
+          }
+        ],
+        "full_suite_file_count": 28
+      }
     }
   ],
   "recipes": {
@@ -8351,6 +8440,7 @@
         "python/sglang/multimodal_gen/test/unit/conditioning",
         "python/sglang/multimodal_gen/test/unit/realtime/test_zing_conditioning_lifecycle.py",
         "python/sglang/multimodal_gen/test/unit/realtime/test_zing_h3_source_adapter.py",
+        "python/sglang/multimodal_gen/test/unit/realtime/test_zing_prefill_api.py",
         "python/sglang/multimodal_gen/test/unit/realtime/test_zing_h3_realtime_adapter.py",
         "python/sglang/multimodal_gen/test/unit/test_zing_h3_media_contract.py",
         "python/sglang/multimodal_gen/test/unit/test_zing_h3_shared_primitives.py",

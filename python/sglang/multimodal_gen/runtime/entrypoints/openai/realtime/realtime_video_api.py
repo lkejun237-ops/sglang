@@ -35,6 +35,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.timer import (
     RealtimeStageTimer,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.zing_prefill import (
+    router as prefill_router,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     process_generation_batch,
 )
@@ -90,6 +93,7 @@ logger = init_logger(__name__)
 
 _REALTIME_CONTROL_REFRESH_TIMEOUT_S = 1.0
 router = APIRouter(prefix="/v1/realtime_video", tags=["realtime"])
+router.include_router(prefill_router)
 _REALTIME_RESULT_STAGE_MARKERS = ("vae", "denois")
 _RAW_FRAME_ASYNC_ENQUEUE_STAGE = "GPUWorker.raw_frame_async_enqueue"
 _ADMISSION_CONTROLLER: RealtimeAdmissionController | None = None
@@ -2025,7 +2029,7 @@ async def _cleanup_realtime_session(
     session: GenerateSession,
     generate_task: asyncio.Task | None,
     listen_task: asyncio.Task | None,
-) -> None:
+) -> bool:
     log_realtime_trace(logger, session, "server.session_cleanup_start")
     logger.info("terminating session, session_id=%s", session.id)
     refresh_task = session.control_refresh_task
@@ -2070,6 +2074,7 @@ async def _cleanup_realtime_session(
         scheduler_released=scheduler_released,
         input_files_removed=input_files_removed,
     )
+    return scheduler_released
 
 
 async def _close_realtime_websocket(

@@ -599,6 +599,35 @@ class ZingH3GenerationStage(PipelineStage):
     def _forward_realtime(self, batch, server_args):
         if batch.session is None:
             raise ValueError("Zing realtime request is missing its worker session")
+        if "zing_prefill" in batch.extra:
+            from .source_session import ZingSourceStreamState, source_preview
+
+            if self.block0_cache is None:
+                raise ValueError("Block0 prefill requires an enabled Block0 cache")
+            config = batch.extra["zing_source_command"]["config"]
+            data = batch.extra["zing_prefill"]["source_frame"]
+            hits = self.block0_cache.hits
+            with set_forward_context(current_timestep=0, attn_metadata=None):
+                entry = ZingSourceStreamState().prefill(
+                    self._build_request(batch),
+                    stage=self,
+                    batch=batch,
+                    config=config,
+                    source_preview=source_preview(config, data),
+                )
+            if entry is None:
+                raise ValueError("Block0 prefill did not publish a cache entry")
+            return OutputBatch(
+                output=[],
+                usage={
+                    "zing_prefill": dict(
+                        cache_key=entry.key,
+                        hit=self.block0_cache.hits > hits,
+                        entries=len(self.block0_cache.entries),
+                        evictions=self.block0_cache.evictions,
+                    )
+                },
+            )
         if "zing_source_command" in batch.extra:
             from .source_session import ZingSourceStreamState
 
