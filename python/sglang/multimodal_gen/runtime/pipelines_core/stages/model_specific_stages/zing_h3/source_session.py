@@ -6,6 +6,7 @@ import os
 import time
 from collections import deque
 from contextlib import closing, contextmanager, nullcontext
+from dataclasses import replace
 
 import psutil
 import torch
@@ -38,6 +39,32 @@ from .streaming_noise import STREAMING_NOISE_VERSION
 logger = init_logger(__name__)
 
 
+def _source_key_policy(stage, sampler, work_quantum):
+    """Policy fields that must be identical for a warmup and a live session."""
+    defer_final = os.environ.get("SGLANG_ZING_SOURCE_DEFER_FINAL", "0") == "1"
+    prompt_joint = os.environ.get("SGLANG_ZING_SOURCE_PROMPT_JOINT", "0") == "1"
+    if defer_final and work_quantum != 1:
+        raise ValueError("Deferred source final currently requires work quantum 1")
+    if sampler.window_policy.window_chunks is None:
+        raise ValueError("Continuous source requires a bounded attention window")
+    policy = {
+        "window_chunks": sampler.window_policy.window_chunks,
+        "window_eviction_timing": getattr(
+            sampler, "window_eviction_timing", "after_step0"
+        ),
+        "sink_chunks": sampler.window_policy.sink_chunks,
+        "rope_position_mode": sampler.rope_position_mode,
+        "rope_max_frame_gap": sampler.rope_max_frame_gap,
+        "video_decoder": stage.codecs.video_decoder_name,
+        "source_work_quantum": work_quantum,
+        "source_defer_final": defer_final,
+        "source_prompt_joint": prompt_joint,
+    }
+    if getattr(sampler, "joint_forward", "off") != "off":
+        policy["joint_forward"] = sampler.joint_forward
+    return policy, defer_final, prompt_joint
+
+
 class ZingSourceStreamState(BaseRealtimeState):
     def __init__(self):
         self.inputs = self.sampler = self.ledger = self.pixels = self.bridge = (
@@ -56,6 +83,12 @@ class ZingSourceStreamState(BaseRealtimeState):
         self.work_quantum = source_work_quantum()
         self.end_received = self.bridge_finished = False
         self.dispatch_steps = 0
+        self.block0_cache = self.block0_entry = self.block0_restore = None
+        self.block0_prefix = self.block0_request = None
+        self.block0_key = None
+        self.block0_lookup_ms = 0.0
+        self.block0_output_start = 0
+        self.pending_block0 = None
 
     def initialize(self, stage, batch, config, trace=None):
         params = batch.sampling_params
@@ -67,27 +100,9 @@ class ZingSourceStreamState(BaseRealtimeState):
             else {}
         )
         sampler = stage._build_realtime_sampler(params, **sampling_options)
-        defer_final = os.environ.get("SGLANG_ZING_SOURCE_DEFER_FINAL", "0") == "1"
-        prompt_joint = os.environ.get("SGLANG_ZING_SOURCE_PROMPT_JOINT", "0") == "1"
-        if defer_final and self.work_quantum != 1:
-            raise ValueError("Deferred source final currently requires work quantum 1")
-        if sampler.window_policy.window_chunks is None:
-            raise ValueError("Continuous source requires a bounded attention window")
-        self.policy = {
-            "window_chunks": sampler.window_policy.window_chunks,
-            "window_eviction_timing": getattr(
-                sampler, "window_eviction_timing", "after_step0"
-            ),
-            "sink_chunks": sampler.window_policy.sink_chunks,
-            "rope_position_mode": sampler.rope_position_mode,
-            "rope_max_frame_gap": sampler.rope_max_frame_gap,
-            "video_decoder": stage.codecs.video_decoder_name,
-            "source_work_quantum": self.work_quantum,
-            "source_defer_final": defer_final,
-            "source_prompt_joint": prompt_joint,
-        }
-        if getattr(sampler, "joint_forward", "off") != "off":
-            self.policy["joint_forward"] = sampler.joint_forward
+        self.policy, defer_final, prompt_joint = _source_key_policy(
+            stage, sampler, self.work_quantum
+        )
         self.qwen_init_host_ms = None
 
         @contextmanager
@@ -117,14 +132,64 @@ class ZingSourceStreamState(BaseRealtimeState):
                 fps=float(config["fps"]),
                 origin="source_s0",
             )
-        self.inputs = stage.codecs.prepare(
-            stage._build_request(batch),
-            prepare_use,
-            retain_condition_media=True,
-            source_preview=source_preview,
-            conditioning=stage._conditioning_consumer(batch),
-            stage_trace=trace,
-        )
+        request = stage._build_request(batch)
+        self.block0_cache = getattr(stage, "block0_cache", None)
+        if self.block0_cache is not None:
+            from .preparation_cache import (
+                inputs_on,
+                preparation_key,
+                preparation_request,
+            )
+
+            started = time.perf_counter()
+            self.block0_input_request = preparation_request(stage.codecs, request)
+            # Freeze the same key inputs for later prompt changes. self.policy
+            # gains reporting-only encoder/decoder fields after initialization.
+            self.block0_key_args = (
+                stage.codecs,
+                source_preview,
+                dict(config),
+                dict(self.policy),
+            )
+            self.block0_key = preparation_key(
+                stage.codecs,
+                self.block0_input_request,
+                source_preview,
+                config,
+                self.policy,
+            )
+            self.block0_entry = self.block0_cache.lookup(self.block0_key)
+            self.block0_lookup_ms = (time.perf_counter() - started) * 1000
+        if self.block0_entry is None or self.block0_cache.mode == "late":
+            self.inputs = stage.codecs.prepare(
+                request,
+                prepare_use,
+                retain_condition_media=True,
+                source_preview=source_preview,
+                conditioning=stage._conditioning_consumer(batch),
+                stage_trace=trace,
+            )
+        if self.block0_entry is not None:
+            from sglang.multimodal_gen.runtime.conditioning.worker import (
+                WorkerConditioningState,
+            )
+
+            # Even the late timing ablation consumes the preparation that
+            # produced the cached KV, not a potentially different VAE sample.
+            device = next(stage.modules["transformer"].parameters()).device
+            self.inputs = inputs_on(self.block0_entry.inputs, device)
+            condition = batch.session.get_or_create_state(WorkerConditioningState)
+            condition.identity = self.block0_entry.conditioning_identity
+            condition.positive = self.inputs.positive
+        if self.block0_cache is not None:
+            from sglang.multimodal_gen.runtime.conditioning.worker import (
+                WorkerConditioningState,
+            )
+
+            self.block0_inputs = self.inputs
+            self.block0_condition_identity = batch.session.get_or_create_state(
+                WorkerConditioningState
+            ).identity
         if self.inputs.audio_shape is not None or self.inputs.source_visual is not None:
             raise ValueError("Continuous source requires a video-only static prefix")
         self.prompt = params.prompt
@@ -176,6 +241,21 @@ class ZingSourceStreamState(BaseRealtimeState):
             defer_final=defer_final,
             prompt_joint=prompt_joint,
         )
+        if self.block0_cache is not None:
+            self.sampler.prepare_prompt_prefix = self._prepare_block0_switch
+        if self.block0_entry is not None:
+            self.sampler.restore_initial_prefix = self._restore_block0
+            if self.block0_cache.mode != "late":
+                # The fixed case's previous admission already resolved its layout.
+                self.kv_lease = stage.kv_pool.acquire(
+                    batch.session, self.block0_entry.request
+                )
+                self.sampler.cache = self.sampler._new_cache(self.kv_lease.kv_cache)
+                self.block0_restore = self.block0_cache.restore(
+                    self.sampler.cache, self.block0_entry
+                )
+        elif self.block0_cache is not None:
+            self.sampler.capture_initial_prefix = self._remember_block0
         endpoint = command.get("conditioning_prefetch_endpoint")
         if endpoint is not None:
             self._start_conditioning_prefetch(stage, batch, endpoint, command)
@@ -208,6 +288,112 @@ class ZingSourceStreamState(BaseRealtimeState):
                 batch.realtime_session_id,
             )
 
+    @torch.no_grad()
+    def prefill(
+        self,
+        request,
+        *,
+        stage,
+        batch,
+        config=None,
+        source_preview=None,
+        source_shape=None,
+        trace=None,
+    ):
+        """Warm one Block0 entry without source history, sampling or decoding.
+
+        Only the Qwen/reference preparation and the Block0 prefix forward run.
+        The resulting L1 slot is immediately visible to normal source sessions,
+        and disk persistence is queued on the existing daemon writer.
+        """
+        cache = getattr(stage, "block0_cache", None)
+        if cache is None:
+            raise ValueError("Block0 prefill requires an enabled Block0 cache")
+        command = batch.extra.get("zing_source_command", {})
+        config = dict(config or command.get("config") or {})
+        if not {"width", "height", "fps"} <= config.keys():
+            raise ValueError("Block0 prefill requires width, height and fps")
+        params = batch.sampling_params
+        stage._validate_sampling_params(params)
+        sampler = stage._build_realtime_sampler(
+            params,
+            **(
+                {"source_sampling_schedule": command["sampling_schedule"]}
+                if "sampling_schedule" in command
+                else {}
+            ),
+        )
+        self.sampler = sampler
+        self.work_quantum = source_work_quantum()
+        self.policy, _, _ = _source_key_policy(stage, sampler, self.work_quantum)
+
+        from .preparation_cache import preparation_key, preparation_request
+
+        input_request = preparation_request(stage.codecs, request)
+        key = preparation_key(
+            stage.codecs, input_request, source_preview, config, self.policy
+        )
+        entry = cache.lookup(key)
+        if entry is not None:
+            return entry
+
+        inputs = stage.codecs.prepare(
+            request,
+            stage._use,
+            retain_condition_media=True,
+            source_preview=source_preview,
+            conditioning=stage._conditioning_consumer(batch),
+            stage_trace=trace,
+        )
+        if inputs.audio_shape is not None or inputs.source_visual is not None:
+            raise ValueError("Block0 prefill requires a video-only static prefix")
+        from sglang.multimodal_gen.runtime.conditioning.worker import (
+            WorkerConditioningState,
+        )
+
+        condition = batch.session.get_or_create_state(WorkerConditioningState)
+        identity = condition.identity
+        device = next(stage.modules["transformer"].parameters()).device
+        visual = (
+            inputs.positive["context"]
+            .new_zeros((1, stage.packer.visual_channels, *inputs.visual_shape))
+            .to(device)
+        )
+        layout = sampler.processor.pack_inference_layout(
+            inputs, inputs.positive, visual, None
+        )
+        source_shape = (
+            inputs.visual_shape[-2:] if source_shape is None else source_shape
+        )
+        lease = storage = pool_request = None
+        if getattr(stage, "kv_pool", None) is not None:
+            pool_request = stage.kv_request(
+                sampler,
+                inputs,
+                layout,
+                source_shape=source_shape,
+                total_frames=None,
+            )
+            lease = stage.kv_pool.acquire(batch.session, pool_request)
+            storage = lease.kv_cache
+        state = None
+        try:
+            state = sampler.initialize(inputs, visual, storage=storage)
+            cache.fill(
+                key,
+                inputs,
+                identity,
+                pool_request if pool_request is not None else request,
+                state.cache,
+            )
+            cache.finish_fill()
+            return cache.entries.get(key)
+        finally:
+            if state is not None:
+                state.close()
+            if lease is not None:
+                lease.release()
+
     def _pooled_storage(self, stage, session, sampler):
         """Lease a slot at the first step; the ready session never sees the pool."""
         if stage.kv_pool is None:
@@ -221,10 +407,59 @@ class ZingSourceStreamState(BaseRealtimeState):
                 source_shape=ready.source.shape,
                 total_frames=None,
             )
+            self.block0_request = request
             self.kv_lease = stage.kv_pool.acquire(session, request)
             return self.kv_lease.kv_cache
 
         return acquire
+
+    def _restore_block0(self, cache):
+        if self.block0_restore is None:
+            self.block0_restore = self.block0_cache.restore(cache, self.block0_entry)
+        self.block0_restore.commit(cache)
+
+    def _remember_block0(self, prefix):
+        self.block0_prefix = prefix
+        # Only pixels generated under this prefix qualify, even if old output
+        # is still queued in the decoder when the switch occurs.
+        self.block0_output_start = self.sampler.committed_pixel
+
+    def _prepare_block0_switch(self, candidate):
+        """Called at the actual switch boundary, before clearing the live slot."""
+        self.block0_cache.finish_fill()
+        key, request, inputs, identity, pool_request = self.pending_block0
+        self.pending_block0 = None
+        self.block0_key, self.block0_input_request = key, request
+        self.block0_inputs, self.block0_condition_identity = inputs, identity
+        self.block0_request = pool_request
+        self.block0_prefix = None
+        self.block0_entry = self.block0_cache.lookup(key)
+        self.sampler.capture_initial_prefix = None
+        if self.block0_entry is None:
+            self.sampler.capture_initial_prefix = self._remember_block0
+            return None
+
+        def restore(cache):
+            self.block0_restore = self.block0_cache.restore(cache, self.block0_entry)
+            self.block0_restore.commit(cache)
+
+        return restore
+
+    def _fill_block0_after_output(self):
+        # Called on the dispatch after the first RGB output has been returned.
+        if (
+            self.block0_prefix is not None
+            and self.ledger.output_frames > self.block0_output_start
+        ):
+            prefix, self.block0_prefix = self.block0_prefix, None
+            if self.sampler.cache.prefix is prefix:
+                self.block0_cache.fill(
+                    self.block0_key,
+                    self.block0_inputs,
+                    self.block0_condition_identity,
+                    self.block0_request,
+                    self.sampler.cache,
+                )
 
     def _start_conditioning_prefetch(self, stage, batch, endpoint, command):
         from sglang.multimodal_gen.runtime.conditioning.prefetch import (
@@ -326,7 +561,8 @@ class ZingSourceStreamState(BaseRealtimeState):
             stage.kv_pool.plan.admit(request)
         except ZingKVPoolAdmissionError as exc:
             logger.warning("Prompt update rejected by KV pool: %s", exc.detail)
-            raise ConditionError("CONDITION_INVALID", exc.detail) from exc
+            raise ConditionError("CONDITION_INVALID", exc.message) from exc
+        return request
 
     def _update_prompt(self, stage, batch):
         """Reject invalid candidates without disturbing the active generation."""
@@ -339,12 +575,61 @@ class ZingSourceStreamState(BaseRealtimeState):
         discard = getattr(self.sampler, "discard_pending_prompt", None)
         if discard is not None:
             discard()
+        self.pending_block0 = None
         if command.get("rejected"):
             self.failed_update = update
             return None  # API already sent the nonfatal error for this event.
-        candidate = None
+        candidate = entry = None
         try:
-            if "references" in command:
+            if self.block0_cache is not None:
+                from sglang.multimodal_gen.runtime.conditioning.worker import (
+                    coordinate_validation,
+                )
+
+                from .preparation_cache import (
+                    inputs_on,
+                    preparation_key,
+                    preparation_request,
+                )
+
+                key_error = None
+                try:
+                    request = {**self.block0_input_request, "prompt": update[0]}
+                    if "references" in command:
+                        old_ids = {
+                            item["content_id"] for item in self.inputs.conditions
+                        }
+                        refs = preparation_request(
+                            stage.codecs, {"media": command["references"]}
+                        )["media"]
+                        request["media"] = [
+                            item
+                            for item in request["media"]
+                            if item["id"] not in old_ids
+                        ] + refs
+                        request["conditions"] = [
+                            dict(
+                                content_id=item["id"],
+                                role="reference",
+                                latent_modalities=["visual"],
+                            )
+                            for item in refs
+                        ]
+                    codecs, preview, config, policy = self.block0_key_args
+                    key = preparation_key(codecs, request, preview, config, policy)
+                except (OSError, ValueError) as exc:
+                    key_error = exc
+                if not all(coordinate_validation(key_error is None)):
+                    raise ConditionError(
+                        "CONDITION_INVALID", "Reference media preparation failed"
+                    ) from key_error
+                entry = self.block0_cache.lookup(key)
+            if entry is not None:
+                candidate = inputs_on(
+                    entry.inputs, self.inputs.positive["context"].device
+                )
+                positive = candidate.positive
+            elif "references" in command:
                 if getattr(stage, "prompt_switch_prefix_latent_frames", None) != 5:
                     raise ConditionError(
                         "CONDITION_INVALID",
@@ -371,7 +656,7 @@ class ZingSourceStreamState(BaseRealtimeState):
 
             admission_error = None
             try:
-                self._admit_prompt_update(stage, positive, candidate)
+                pool_request = self._admit_prompt_update(stage, positive, candidate)
             except ConditionError as exc:
                 admission_error = exc
             if not all(coordinate_validation(admission_error is None)):
@@ -382,6 +667,27 @@ class ZingSourceStreamState(BaseRealtimeState):
             self.failed_update = update
             notice = {"code": exc.code, "event_id": update[1]}
         else:
+            if self.block0_cache is not None:
+                from sglang.multimodal_gen.runtime.conditioning.worker import (
+                    WorkerConditioningState,
+                )
+
+                state = batch.session.get_or_create_state(WorkerConditioningState)
+                if entry is not None:
+                    state.identity, state.positive = (
+                        entry.conditioning_identity,
+                        positive,
+                    )
+                prepared = replace(
+                    self.inputs if candidate is None else candidate, positive=positive
+                )
+                self.pending_block0 = (
+                    key,
+                    request,
+                    prepared,
+                    state.identity,
+                    pool_request,
+                )
             kwargs = {} if candidate is None else {"inputs": candidate}
             self.sampler.update_prompt(
                 positive,
@@ -432,6 +738,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                     chunk_index=batch.block_idx,
                     generation_id=batch.realtime_generation_id,
                 )
+            self._fill_block0_after_output()
             notice = None
             applied = getattr(self.sampler, "applied_prompt", None)
             if applied is not None and applied.inputs is not None:
@@ -445,6 +752,8 @@ class ZingSourceStreamState(BaseRealtimeState):
                 self.prompt,
                 self.prompt_event,
             ):
+                if self.block0_cache is not None:
+                    self.block0_cache.finish_fill()
                 with timed("prompt_host_ms"):
                     notice = self._update_prompt(stage, batch)
             count = sum(x["payload"]["num_frames"] for x in command["appends"])
@@ -1052,20 +1361,66 @@ class ZingSourceStreamState(BaseRealtimeState):
 
     def dispose(self):
         try:
-            try:
-                if self.conditioning_prefetch is not None:
-                    self.conditioning_prefetch.close()
-                    self.conditioning_prefetch = None
-            finally:
-                # A slow CPU prefetch must not skip remote abort or KV cleanup.
-                # Its prepare call owns local CPU media references; the provider
-                # retains the live owner and rejects another prefetch session.
-                self._dispose_states()
+            if self.block0_cache is not None:
+                self.block0_cache.finish_fill()
+                transfer = self.block0_restore
+                if transfer is not None:
+                    transfer.end.synchronize()
+                logger.info(
+                    "zing_block0_cache %s",
+                    json.dumps(
+                        dict(
+                            mode=self.block0_cache.mode,
+                            key=self.block0_key,
+                            hit=self.block0_entry is not None,
+                            prepare_bypassed=self.block0_entry is not None
+                            and self.block0_cache.mode != "late",
+                            lookup_host_ms=self.block0_lookup_ms,
+                            restore_submit_host_ms=None
+                            if transfer is None
+                            else transfer.submit_ms,
+                            restore_cuda_ms=None
+                            if transfer is None
+                            else transfer.begin.elapsed_time(transfer.end),
+                            ready_at_consumer=None
+                            if transfer is None
+                            else transfer.ready_at_consumer,
+                            restore_lead_host_ms=None
+                            if transfer is None
+                            else transfer.lead_ms,
+                            cpu_capacity_bytes=self.block0_cache.data.numel()
+                            * self.block0_cache.data.element_size(),
+                            ready=bool(self.block0_cache.entries),
+                            entries=len(self.block0_cache.entries),
+                            evictions=self.block0_cache.evictions,
+                            hits=self.block0_cache.hits,
+                            misses=self.block0_cache.misses,
+                            rank=torch.distributed.get_rank()
+                            if torch.distributed.is_initialized()
+                            else 0,
+                        )
+                    ),
+                    main_process_only=False,
+                    local_main_process_only=False,
+                )
         finally:
-            # Return the slot only after the ready session cleared its cache.
-            if self.kv_lease is not None:
-                self.kv_lease.release()
-                self.kv_lease = None
+            try:
+                try:
+                    if self.conditioning_prefetch is not None:
+                        self.conditioning_prefetch.close()
+                        self.conditioning_prefetch = None
+                finally:
+                    # Prefetch failure must not skip remote abort or KV cleanup.
+                    self._dispose_states()
+            finally:
+                self.block0_cache = self.block0_entry = self.block0_restore = None
+                self.block0_inputs = self.block0_prefix = None
+                self.pending_block0 = self.block0_key_args = None
+                self.block0_input_request = None
+                # Return the slot only after the ready session cleared its cache.
+                if self.kv_lease is not None:
+                    self.kv_lease.release()
+                    self.kv_lease = None
 
     def _dispose_states(self):
         for state in (

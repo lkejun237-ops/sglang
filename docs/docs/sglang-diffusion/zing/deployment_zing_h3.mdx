@@ -15,8 +15,116 @@ description: "供 Codex 与部署同学使用的 H100/H200/B300 部署决策、�
 操作与覆盖方法见 [客户端基线](https://github.com/seedleap/sglang/blob/main/benchmark/zing_h3_causal/CLIENT_BENCHMARK.md#当前默认采样口径)。
 请求中的四步列表不代表实际全程四步，部署配置具有更高优先级；连续 source 的显式
 profile/CLI 也可能覆盖默认值。下表全程四步和 4→1 等结果仍是各自配置的历史证据，
-不代表当前默认 4→2 的性能或画质；当前版本 480/736 的配套性能、分组件显存与
-画质尚未在本次变更中重测。
+不代表当前默认 4→2 的性能或画质；当前请求准备缓存的 H100 验证状态见下一节，
+画质尚未在本次变更中做人工验收。
+
+## 固定 case 的请求准备缓存
+
+Qwen 继续使用现有 CPU conditioning LRU；local 模式在日志 `Zing Qwen cache` 输出
+累计 hit/miss、淘汰、超限跳过、条目数与驻留字节，remote 模式使用已鉴权的
+`/v1/conditioning/stats`：原有请求计数不变，新增 `cache` 容量统计，普通调用方
+只看到自身租户。local 默认 256 MiB，由 `--zing-conditioning-local-cache-bytes` 设置；
+remote 服务通过 `limits.cache_bytes` 和 `limits.cache_bytes_per_tenant` 设置。
+多个 case/分辨率/prompt 的 Qwen 输出可能超过默认预算，预热后须检查淘汰统计。
+
+参考图预处理（RGB 解码、选桶、resize）与 VAE latent 共用现有 `ConditioningCache`，
+每个 worker 的 CPU 总预算默认 256 MiB，可用 `--zing-reference-cache-bytes` 修改，
+设为 0 同时关闭这两项。缓存只持有独立 CPU tensor；不保留请求或会话 GPU 状态。
+图像按实际文件/载荷内容和预处理参数匹配，URI 每次仍读取，因此同路径换图不会复用
+旧结果。VAE 按归一后的像素、编码/后验采样配置、latent 归一化及模型实例匹配；
+prompt、媒体 ID 和生成 seed 不影响参考图 latent。只缓存图片 reference，source
+视频与视频 reference 保持原编码路径。进程退出/重载模型时重建缓存，不提供落盘缓存。
+
+初始化和参考图替换共用缓存；SP rank 部分命中时全组重算，避免跳过 VAE collective。
+日志 `Zing reference cache` 分别给出 preprocess/vae 的查询与容量统计，共享预算不能相加。
+固定 case 预热复用正常生成请求，入口与冷/热对照口径见
+[客户端基线](https://github.com/seedleap/sglang/blob/main/benchmark/zing_h3_causal/CLIENT_BENCHMARK.md#固定-case-预热和缓存-ttff-对照)。
+预热包含正常 DiT/Decoder 运行；其耗时不计入之后的正式 TTFF。
+
+2026-10-26，`51feaf0add`：H100 测试目标（机内 L20Z），832×480、真实 5 秒
+source/120 帧与六图，E1 + SP2 + D1、BF16、4→2、W6/sink3、Graph 关闭，
+两组均使用现有单槽 KV pool（24160 rows、prefix 上限 12288）与已预热的 Qwen 缓存。
+仅切换参考图缓存 0/256 MiB，每组一次完整预热、三次正式请求：TTFF 中位数/P95
+从 **3.390/3.460 秒降至 2.923/2.931 秒**，中位数降低 **13.8%**；E2E 中位数
+11.485→11.036 秒，首包后 FPS 基本不变。六次请求完整交付，RGB SHA256 全部一致。
+参考图缓存驻留 15.7 MiB CPU tensor/rank，正式请求命中 36 次（预处理与 latent 各 18 次），无淘汰。
+另跑每组三次阶段诊断：参考图 VAE 路径逐请求 Host 耗时约 395→18 ms；
+DiT worker allocated 峰值约 65.69→65.52 GiB/rank，reserved 约 66.35 GiB，基本不变。
+该版本另修复了独立 Decoder 在 channel 校验后发布输出时的 owner 身份传递；
+CPU CI 的 13 个 job 已通过，后续 `82c8005796` 只补全测试夹具，运行时代码一致。
+
+736（1280×736）在当前 SP2 布局下未通过容量预检，尚无 TTFF 验收：KV pool 与已观测的
+非 KV allocated 工作集合计约 79.29 GiB，超过 79.18 GiB CUDA 可见容量，尚未计驱动及额外临时分配。
+480 已补充逐 rank Host 阶段时间及进程/整卡显存；Qwen 独立耗时与 D1 服务内部解码耗时未测，
+现有 Decoder span 仅覆盖 DiT 侧提交/接收开销。完整命令、失败记录、CPU/GPU 回执和对照结果统一回查
+`oss://leap-world-shanghai/world-model/sglang/evals/preparation-cache-h100-20261026-r1/REPORT.md`。
+
+### Block0 CPU KV 恢复对照（隔离实验）
+
+2026-10-26，`df0f677e97`：复用上述 H100 480 布局，Qwen 与参考缓存三组均已预热；
+每组两次预热、三次正式请求，另进程各三次阶段/allocator 诊断。专用 launcher 在原生
+KV pool 中对照重算、全量 pinned CPU LRU、普通 CPU LRU 加双层 pinned staging。
+生产运行时尚未接入 Block0 跨请求缓存。
+
+| 路径 | Block0 重算/恢复中位数 | TTFF 中位数 / P95 | TTFF 变化 | E2E 中位数 |
+| --- | --- | --- | --- | --- |
+| 重算 | 1055.9 ms | 3.008 / 3.032 s | 基线 | 11.051 s |
+| pinned CPU LRU | 150.3 ms | 2.176 / 2.185 s | -27.7% | 10.059 s |
+| 普通 CPU LRU + staging | 488.5 ms | 2.471 / 2.563 s | -17.9% | 10.513 s |
+
+Block0 取同次请求两 rank CUDA event span 的较大值，包含提交空隙；普通 CPU 路径
+包含 staging 的 CPU 拷贝。11596 prefix rows、50 层 BF16 K/V 为 **7.741 GiB/rank**，
+SP2 整条目 **15.482 GiB**；普通 CPU 路径另用 **317.08 MiB/rank** pinned staging。
+pinned 恢复约 55.3 GB/s/rank；普通 CPU 关键 rank 的 staging 拷贝中位数 480.5 ms，
+占恢复成本大部，NUMA/线程/布局尚未定向优化。冷填充未混入 hit 统计：实验的全量
+pinned 分配约 3.2–3.5 s，普通 CPU 同步回写约 2.8–3.0 s，生产应预分配缓冲并把
+填充移出首帧关键路径，另测对首帧后吞吐的影响。
+
+三组九次正式请求 RGB SHA256 一致；缓存组在 warm hit 清空 GPU 目标后恢复，50 层
+K/V 用 `torch.equal` 逐元素完全一致，并通过 A→修改 prompt 的 B→A（B miss、返回 A hit）。
+每 rank 的 18 GiB CPU LRU 保留了两个输入，未做淘汰压力测试。所有组在既有准备后
+对完整 packed prefix 求摘要，约 80 ms 计入 TTFF；尚未验证编码前直接命中、source
+VAE overlap、Graph 或滚动 prompt prefix，不能把表中收益当作这些后续设计的验收。
+736 完整请求仍未通过容量预检。GPU 执行 `t-sh0717dh9459c00` 正常退出，CPU 预检
+`t-sh0717d96wwxxxc` 通过；证据归档
+`oss://leap-world-shanghai/world-model/sglang/evals/block0-kv-h100-20261026-r1/evidence-final.tgz`。
+内容身份、完整准备条目与提前分流见
+[Block0 CPU 缓存设计](/docs/sglang-diffusion/zing/plans/BLOCK0_CPU_CACHE)。
+
+### 完整准备条目提前命中（MVP）
+
+2026-10-27，`df0f677e97` + 工作区补丁：原生运行时增加一个完整 pinned CPU 条目，
+命中跳过 `codecs.prepare`，复用现有 GPU pool slot 恢复 KV；MISS 在首帧输出后的下一次
+dispatch 回写。默认关闭；启用原有 KV pool 后，设置 `SGLANG_ZING_BLOCK0_CACHE_MODE`
+为 `overlap` 开启提前恢复，`early` 为串行恢复对照，`late` 保留原准备路径作为对照。
+三组均使用原始内容 early key，不包含上一轮约 80 ms 的 packed-prefix 摘要。
+
+远端 CPU 预检两轮各 732 项通过、6 项既有跳过；新增六项均通过，GitHub Actions 未运行。
+480 的 H100 三组正式对照与独立阶段诊断进行中，尚无性能结论；736 仍受原 SP2 容量限制。
+原始回执与材料位于 `exports/early-block0-h100-20261027-r1/`，完成后更新本节。
+具体时序与开关见 [Block0 CPU 缓存设计](/docs/sglang-diffusion/zing/plans/BLOCK0_CPU_CACHE)。
+
+### Prompt switch Block0 缓存
+
+2026-10-27，`df0f677e97` + 当前工作区：将初始 Block0 准备缓存扩展为启动与运行时切换共用的 `Block0PreparationCache`，实现以下特性：
+- **多槽位 CPU Pinned LRU**：默认预分配 6 个 pinned CPU 条目/rank（可用 `SGLANG_ZING_BLOCK0_CACHE_ENTRIES` 环境变量配置），避免运行时动态 pin 内存的抖动开销；
+- **极简原位恢复**：命中时在当前 GPU KV pool slot 原位异步 DMA 恢复 Block0（50 层 BF16 KV），后续 5 帧 clean history 保持原生串行 `1+2+2` 提交；未命中走重算并在首帧输出后 D2H 回写填入缓存；
+- **配置与启用**：设置环境变量 `SGLANG_ZING_BLOCK0_CACHE_MODE=overlap` 启用，默认 `off`。
+
+**H100 实测结果（832×480，120 帧，E1+SP2+D1，A→B→A 往返切换）**：
+- **Block0 算子延迟**：重算 **1052 ms** → Pinned DMA **150 ms**（**-85.7%**）；
+- **完整 Prefix 重建延迟**：**1269 ms** → **370 ms**（**-70.9%**）；
+- **客户端切换播放卡顿 (Stall)**：**1659 ms** → **486 ms**（**-70.7%**，切换卡顿显著平滑）；
+- **端到端总时间 (E2E)**：**13.74 s** → **9.86 s**（**-28.2%**）；
+- **全流程生成 FPS**：**8.74** → **12.17 FPS**（**+39.3%**）；
+- **首帧交付延迟 (TTFF)**：**2.83 s** → **1.48 s**（**-47.8%**）；
+- **数值与视觉一致性**：三对正式请求完整 RGB 120 帧输出 SHA256 逐位一致（`57a915fc46aad1de...`），50 层全部 KV 逐层校验完全一致；21 项单元测试与静态检查全数通过。
+- 完整验收报告与回执见 [Prompt Switch 缓存报告](/benchmark/zing_h3_causal/PROMPT_SWITCH_CACHE_RESULTS)。
+
+2026-10-28 L2 重启修复：磁盘条目不再保存或恢复进程内 `model_signature`，由首次消费 KV 的前向绑定当前模型；
+同进程 L1 和活跃会话的模型变更检查保留。支持读取此前含旧签名的条目；磁盘目录仍用于相同 checkpoint 和部署配置。
+本地跨实例恢复与变更拒绝回归已补充，H100 Attempt 2 验收进行中；CPFS、736 与长流未验证。
+回执入口：`exports/block0-l1-l2-prefill-h100-20261028-r1/attempt2/`。
 
 ## Prompt 生效的 codec 周期边界
 

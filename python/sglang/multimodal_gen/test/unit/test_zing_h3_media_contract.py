@@ -72,6 +72,194 @@ def make_request(kind, *, references=0, source=True):
     }
 
 
+@pytest.fixture
+def cached_codecs(codecs, monkeypatch):
+    from sglang.multimodal_gen.runtime.conditioning.cache import ConditioningCache
+
+    codecs.reference_cache = ConditioningCache(1 << 20)
+    codecs.remote_read_fs = None
+    codecs.max_short_edge = 64
+    codecs.runtime = {
+        "vae_config": {"posterior_seed": 42, "encode_mode": "deterministic"}
+    }
+    codecs.va = SimpleNamespace(latents_mean=[0.0], latents_std=[1.0])
+    codecs.modules = {"video_vae": torch.nn.Linear(1, 1)}
+    codecs.reference_encodes = []
+
+    def encode(frames):
+        codecs.reference_encodes.append(frames.clone())
+        return frames.float().mean().reshape(1, 1, 1, 1, 1)
+
+    monkeypatch.setattr(codecs, "encode_visual", encode)
+    monkeypatch.setattr(codecs, "encode_condition", lambda *args: {})
+    return codecs
+
+
+def reference_bytes(color="red", media_id="ref-0"):
+    from io import BytesIO
+
+    from PIL import Image
+
+    output = BytesIO()
+    Image.new("RGB", (96, 64), color).save(output, format="PNG")
+    return dict(type="image", id=media_id, format="png", payload=output.getvalue())
+
+
+def test_reference_cache_reuses_across_sessions_prompts_and_updates(
+    cached_codecs, monkeypatch
+):
+    from contextlib import nullcontext
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        media_input,
+    )
+
+    codec = cached_codecs
+    reads = []
+    read_image = media_input._read_image
+    monkeypatch.setattr(
+        media_input,
+        "_read_image",
+        lambda *a, **kw: reads.append(1) or read_image(*a, **kw),
+    )
+    request = make_request("video", references=1, source=False)
+    request["messages"][0]["content"][1] = reference_bytes()
+
+    def use(_):
+        return nullcontext()
+
+    first = codec.prepare(request, use, retain_condition_media=True)
+    expected = first.visual["ref-0"].clone()
+    first.visual["ref-0"].fill_(999)
+    first.condition_media[0]["frames"].zero_()
+    request["messages"][0]["content"][0]["text"] = "Changed prompt"
+    second = codec.prepare(request, use, retain_condition_media=True)
+    torch.testing.assert_close(second.visual["ref-0"], expected, rtol=0, atol=0)
+    updated = codec.prepare_reference_update(
+        second,
+        [reference_bytes(media_id="renamed")],
+        "another prompt",
+        use,
+        conditioning=lambda *a: {},
+    )
+    assert list(updated.visual) == ["renamed"]
+    assert reads == [1]
+    assert len(codec.reference_encodes) == 1
+    assert codec.reference_cache.snapshot(tenant="preprocess")["hit"] == 2
+    assert codec.reference_cache.snapshot(tenant="vae")["hit"] == 2
+    # Source/video encoding never enters the image-reference cache.
+    codec.encode_reference(
+        dict(type="video", frames=second.condition_media[0]["frames"])
+    )
+    assert len(codec.reference_encodes) == 2
+
+
+def test_reference_preprocess_key_uses_file_contents_and_geometry(
+    cached_codecs, tmp_path
+):
+    codec = cached_codecs
+    path = tmp_path / "reference.png"
+    path.write_bytes(reference_bytes()["payload"])
+    item = dict(type="image", id="ref-0", uri=str(path))
+
+    def decode():
+        return codec._decode_reference_image(
+            item, max_area_config=codec.max_area_config
+        )
+
+    red = decode()["frames"]
+    assert torch.equal(decode()["frames"], red)
+    path.write_bytes(reference_bytes("blue")["payload"])
+    assert not torch.equal(decode()["frames"], red)
+    codec.max_area_config["reference_image"] = 4096
+    assert decode()["frames"].shape[-2:] != red.shape[-2:]
+    assert codec.reference_cache.snapshot(tenant="preprocess")["miss"] == 3
+    invalid = reference_bytes()
+    invalid["format"] = "jpeg"
+    with pytest.raises(ValueError, match="format"):
+        codec._decode_reference_image(invalid, max_area_config=codec.max_area_config)
+
+
+@pytest.mark.parametrize("change", ["pixel", "seed", "dtype", "mode", "mean", "model"])
+def test_reference_latent_key_invalidates_effective_encoder_inputs(
+    cached_codecs, change
+):
+    codec = cached_codecs
+    item = dict(type="image", frames=torch.ones(3, 1, 32, 32, dtype=torch.uint8))
+    codec.encode_reference(item)
+    if change == "pixel":
+        item["frames"][0, 0, 0, 0] = 2
+    elif change == "mean":
+        codec.va.latents_mean = [1.0]
+    elif change == "model":
+        codec.modules["video_vae"] = torch.nn.Linear(1, 1)
+    else:
+        key, value = {
+            "seed": ("posterior_seed", 43),
+            "dtype": ("encode_dtype", "float32"),
+            "mode": ("encode_mode", "performance"),
+        }[change]
+        codec.runtime["vae_config"][key] = value
+    codec.encode_reference(item)
+    assert len(codec.reference_encodes) == 2
+
+
+def test_reference_partial_sp_hit_reencodes_on_every_rank(cached_codecs, monkeypatch):
+    from sglang.multimodal_gen.runtime.conditioning import worker
+
+    codec = cached_codecs
+    item = dict(type="image", frames=torch.ones(3, 1, 32, 32, dtype=torch.uint8))
+    codec.encode_reference(item)
+    monkeypatch.setattr(
+        worker, "coordinate_validation", lambda receipt: [receipt, (receipt[0], False)]
+    )
+    codec.encode_reference(item)
+    assert len(codec.reference_encodes) == 2
+    monkeypatch.setattr(
+        worker,
+        "coordinate_validation",
+        lambda receipt: [receipt, ("different-input", True)],
+    )
+    with pytest.raises(ValueError, match="SP ranks"):
+        codec.encode_reference(item)
+    assert len(codec.reference_encodes) == 2
+
+
+@pytest.mark.parametrize("capacity", [0, 1])
+def test_reference_disabled_or_oversize_preserves_uncached_results(
+    cached_codecs, capacity
+):
+    from sglang.multimodal_gen.runtime.conditioning.cache import ConditioningCache
+
+    codec = cached_codecs
+    codec.reference_cache = ConditioningCache(capacity)
+    item = reference_bytes()
+    decoded = codec._decode_media(item, need_audio=False)
+    target = make_request("video", references=1, source=False)["messages"][1]
+    expected, *_ = codec._normalize_inference_media(
+        [decoded],
+        None,
+        target["conditions"],
+        target["content"][0],
+        max_area_config=codec.max_area_config,
+    )
+    for _ in range(2):
+        actual = codec._decode_reference_image(
+            item, max_area_config=codec.max_area_config
+        )
+        actual, *_ = codec._normalize_inference_media(
+            [actual],
+            None,
+            target["conditions"],
+            target["content"][0],
+            max_area_config=codec.max_area_config,
+        )
+        assert torch.equal(actual[0]["frames"], expected[0]["frames"])
+        codec.encode_reference(actual[0])
+    assert len(codec.reference_encodes) == 2
+    assert codec.reference_cache.current_bytes == 0
+
+
 @pytest.mark.parametrize("format_name", ["PNG", "JPEG", "WEBP"])
 def test_init_and_reference_update_decode_file_bytes_in_memory(
     codecs, monkeypatch, format_name

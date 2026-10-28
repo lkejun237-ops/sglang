@@ -26,6 +26,38 @@ source-to-output 延迟、tail drain、credit wait、播放停顿，以及有 pr
 **Prompt-switch TTFF**。有限输入与连续 source 分开比较。保存命令、源码 SHA、配置、预热/正式次数、失败与未执行数、
 原始 JSON 和报告；未采到的指标标为未测。
 
+## 固定 case 预热和缓存 TTFF 对照
+
+常驻服务启动后，可用现有固定 case 和正常请求预热 Qwen、参考图预处理及 VAE latent：
+
+```bash
+python3 benchmark/zing_h3_causal/bench_streaming_source.py \
+  --url ws://127.0.0.1:30000/v1/realtime_video/generate \
+  --media-root /path/to/media --case 30s-wasteland \
+  --prewarm-only --warmup-runs 1 --no-stage-timing --output-dir prewarm-wasteland
+```
+
+`--prewarm-only` 不执行 measured 请求；仍完成正常生成与会话清理，保存预热请求、
+错误和输出回执。它不是只跑 Encoder 的专用 RPC，也不缓存 source 视频。
+用 `--case all` 按固定顺序预热全部内置 case；预算不足时早期条目可能被淘汰，
+因此不能仅凭预热完成判断所有 case 都驻留。预热后保持同一服务进程，再用
+`--warmup-runs 0 --measured-runs 3` 测重复请求。
+
+缓存对照固定源码、硬件、checkpoint、输入 SHA、有效几何、采样、编译与 SP 布局：
+
+| 组 | 设置 | 记录 |
+| --- | --- | --- |
+| 关闭新增缓存 | `--zing-reference-cache-bytes 0`，保留原 Qwen 缓存设置 | runtime 预热后 3 次正式请求，作为本改动的主要 baseline |
+| 首次填充 | 新服务启用参考图缓存，首次请求 | 单独记录，可能含编译/Graph 首次开销，不混入正式中位数 |
+| 重复命中 | 同一服务预热后，同一输入重复 3 次 | TTFF 中位数/P95；核对 reference 统计及 Qwen hit/miss |
+
+若另测所有准备缓存关闭，local Qwen 再设 `--zing-conditioning-local-cache-bytes 0`；
+remote Qwen 的 `limits.cache_bytes` 和 `limits.cache_bytes_per_tenant` 都设为 0，
+与保留已有 Qwen 缓存的 baseline 分开标注。分辨率 480/736 分组报告。
+VAE/SP 部分命中会重算，缓存 `hit` 是每 rank 的本地查询计数，不单独证明 GPU forward
+已跳过；结合插入计数和独立阶段诊断判断。cache `current_bytes` 只计驻留 CPU tensor，
+不含请求副本、Python 对象、文件读入和临时传输缓冲，不等于进程 RSS 或显存。
+
 ## Prompt-switch TTFF（完整帧批次接收口径）
 
 连续 source 入口使用 `bench_streaming_source.py --prompt-updates updates.json`；

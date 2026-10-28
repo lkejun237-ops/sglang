@@ -41,6 +41,7 @@ def test_lynn_preparation_precedes_pool_and_readiness(monkeypatch, fails):
     args = SimpleNamespace(
         pipeline_config=SimpleNamespace(resolve_decoder_spec=lambda: None),
         zing_conditioning_local_cache_bytes=0,
+        zing_reference_cache_bytes=0,
         zing_solver="few_step",
         zing_denoising_step_list=[1000, 750, 500, 250],
         zing_initial_denoising_step_list=None,

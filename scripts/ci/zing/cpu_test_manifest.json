@@ -2375,6 +2375,59 @@
       }
     },
     {
+      "path": "python/sglang/multimodal_gen/test/unit/realtime/test_zing_preparation_cache.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two isolated Ubuntu 24.04 / Python 3.11 CPU trials passed without skips in GitHub Actions run 40663492301.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "e0a7db194368a0e1f003133da7911f7dc3338b934943118884e370441bc18b2a",
+        "receipt": "https://github.com/seedleap/sglang/actions/runs/40663492301/artifacts/12805027284",
+        "receipt_sha256": "eb1ea2c370aa269a2f3a6f9cddbcab06be48aa8ce2298ccb1adcdf40089b4352",
+        "checkout_sha": "8d5e41483633fcbb0dec15b58c60738eae97028d",
+        "pull_request_head_sha": "dab2f9ca7e14268a51d4344f398bddcd9d49c9fd",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 6,
+            "collected": 6,
+            "skipped": 0,
+            "duration_seconds": 31.306409031000015,
+            "exit_code": 0,
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/pr445-cache-triage/cpu-0-trial-1.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/pr445-cache-triage/cpu-0-trial-1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 6,
+            "collected": 6,
+            "skipped": 0,
+            "duration_seconds": 11.199133089000014,
+            "exit_code": 0,
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/pr445-cache-triage/cpu-0-trial-2.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/pr445-cache-triage/cpu-0-trial-2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.17",
+          "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39"
+        },
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          },
+          "torch": "2.8.0+cpu"
+        }
+      }
+    },
+    {
       "path": "python/sglang/multimodal_gen/test/unit/realtime/test_zing_progressive_source_session.py",
       "suite": "conditioning-contracts",
       "status": "CPU_PASS",
@@ -2430,6 +2483,59 @@
           "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
           "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
           "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
+        }
+      }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/realtime/test_zing_prompt_switch_cache.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two isolated Ubuntu 24.04 / Python 3.11 CPU trials passed without skips in GitHub Actions run 40663492301.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "e59a62d1f0031d75ca8e62ddbf422eda4c884b93f4c3b616c98c730e29a85594",
+        "receipt": "https://github.com/seedleap/sglang/actions/runs/40663492301/artifacts/12805027284",
+        "receipt_sha256": "eb1ea2c370aa269a2f3a6f9cddbcab06be48aa8ce2298ccb1adcdf40089b4352",
+        "checkout_sha": "8d5e41483633fcbb0dec15b58c60738eae97028d",
+        "pull_request_head_sha": "dab2f9ca7e14268a51d4344f398bddcd9d49c9fd",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 24,
+            "collected": 24,
+            "skipped": 0,
+            "duration_seconds": 13.569781806000009,
+            "exit_code": 0,
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/pr445-cache-triage/cpu-1-trial-1.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/pr445-cache-triage/cpu-1-trial-1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 24,
+            "collected": 24,
+            "skipped": 0,
+            "duration_seconds": 12.702797267000022,
+            "exit_code": 0,
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/pr445-cache-triage/cpu-1-trial-2.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/pr445-cache-triage/cpu-1-trial-2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.17",
+          "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39"
+        },
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          },
+          "torch": "2.8.0+cpu"
         }
       }
     },

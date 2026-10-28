@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import shutil
@@ -11,13 +12,14 @@ import tempfile
 import time
 from contextlib import contextmanager
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 
 import fsspec
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.media_request import (
     optional_nonnegative_media_time,
@@ -232,6 +234,26 @@ def _resize_frames(frames: torch.Tensor, height: int, width: int) -> torch.Tenso
     )
 
 
+def _read_image(source, *, image_format=None):
+    try:
+        with Image.open(source) as image:
+            if image_format is not None and (
+                image.format.lower() != image_format
+                or image.width * image.height > 16_777_216
+            ):
+                raise ValueError("Encoded image format or dimensions are not supported")
+            return np.array(image.convert("RGB"), dtype=np.uint8, copy=True)
+    except (UnidentifiedImageError, OSError):
+        if image_format is not None:
+            raise
+        import av
+
+        if hasattr(source, "seek"):
+            source.seek(0)
+        with av.open(source) as container:
+            return next(container.decode(video=0)).to_rgb().to_ndarray()
+
+
 def _resample_video(
     frames: torch.Tensor, source_fps: float, target_fps: float
 ) -> torch.Tensor:
@@ -261,6 +283,54 @@ def _trimmed_vae_reference_frames(
 
 
 class ZingH3MediaInput:
+    def _decode_reference_image(self, item, *, max_area_config):
+        """Cache only reference images, using the bytes actually decoded.
+
+        URI content is still read on every request. A path or case label is not
+        a content identity, and source video preparation remains uncached.
+        """
+        cache = getattr(self, "reference_cache", None)
+        if cache is None or cache.max_bytes == 0:
+            return self._decode_media(item, need_audio=False)
+        _clip_bounds(item)
+        image_format = None
+        if "payload" in item:
+            _parse_media_descriptor(item, path="media")
+            payload, image_format = item["payload"], item["format"]
+        else:
+            with _local_media(str(item["uri"]), fs=self.remote_read_fs) as (path, fs):
+                self.remote_read_fs = fs
+                payload = Path(path).read_bytes()
+        key = (
+            "preprocess",
+            hashlib.sha256(payload).hexdigest(),
+            image_format,
+            self.canvas_multiple,
+            self.max_short_edge,
+            max_area_config["reference_image"],
+        )
+
+        def prepare():
+            frame = _read_image(BytesIO(payload), image_format=image_format)
+            frames = torch.from_numpy(frame).permute(2, 0, 1).unsqueeze(1)
+            height, width = _select_h3_bucket(
+                *frames.shape[-2:],
+                multiple=self.canvas_multiple,
+                max_short_edge=self.max_short_edge,
+                max_area=max_area_config["reference_image"],
+            )
+            return {"frames": _resize_frames(frames, height, width)}
+
+        return {
+            **{
+                key: item[key]
+                for key in ("id", "type", "uri", "clip", "origin")
+                if key in item
+            },
+            **cache.get_or_encode(key, prepare),
+            "fps": 1.0,
+        }
+
     def _validate_paired_aspect(
         self, source_frames: torch.Tensor, target_height: int, target_width: int
     ) -> None:
@@ -608,7 +678,6 @@ class ZingH3MediaInput:
     ) -> dict[str, Any]:
         """Decode URI media or inline presentation/reference file bytes."""
         import av
-        from PIL import Image, UnidentifiedImageError
 
         result = {
             key: item[key]
@@ -633,15 +702,7 @@ class ZingH3MediaInput:
                 raise ValueError(
                     "Single-frame video requires matching clip times and frame rate"
                 )
-            with Image.open(BytesIO(item["payload"])) as image:
-                if (
-                    image.format.lower() != item["format"]
-                    or image.width * image.height > 16_777_216
-                ):
-                    raise ValueError(
-                        "Encoded image format or dimensions are not supported"
-                    )
-                frame = np.array(image.convert("RGB"), dtype=np.uint8, copy=True)
+            frame = _read_image(BytesIO(item["payload"]), image_format=item["format"])
             result["frames"] = torch.from_numpy(frame).permute(2, 0, 1).unsqueeze(1)
             result["fps"] = float(fps)
             return result
@@ -652,15 +713,7 @@ class ZingH3MediaInput:
             self.remote_read_fs = remote_read_fs
             frames, fps = None, None
             if item["type"] == "image":
-                try:
-                    with Image.open(path) as image:
-                        frame = np.array(
-                            image.convert("RGB"), dtype=np.uint8, copy=True
-                        )
-                except (UnidentifiedImageError, OSError):
-                    with av.open(path) as container:
-                        decoded_frame = next(container.decode(video=0))
-                        frame = decoded_frame.to_rgb().to_ndarray()
+                frame = _read_image(path)
                 frames, fps = frame[None], 1.0
             elif item["type"] in {"video", "video_audio"}:
                 if "presentation_fps" in item:

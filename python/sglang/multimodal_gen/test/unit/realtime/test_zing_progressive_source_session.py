@@ -272,6 +272,37 @@ def test_prefetch_close_failure_still_releases_source_resources():
     assert state.kv_lease is None and releases == ["lease"]
 
 
+@pytest.mark.parametrize("prefetch_fails", [False, True])
+def test_block0_fill_failure_still_closes_prefetch_and_releases_resources(
+    prefetch_fails,
+):
+    state, _ = session(ChunkPlan([1, 2, 2]))
+    encoder, sampler, decoder = state.pixels, state.sampler, state.decoder
+    events = []
+
+    def fail_fill():
+        events.append("fill")
+        raise RuntimeError("Block0 fill failed")
+
+    def close_prefetch():
+        events.append("prefetch")
+        if prefetch_fails:
+            raise RuntimeError("Conditioning prefetch did not drain")
+
+    owner = NS(close=close_prefetch)
+    state.block0_cache = NS(finish_fill=fail_fill)
+    state.conditioning_prefetch = owner
+    state.kv_lease = NS(release=lambda: events.append("lease"))
+    error = "prefetch did not drain" if prefetch_fails else "Block0 fill failed"
+    with pytest.raises(RuntimeError, match=error):
+        state.dispose()
+    assert events == ["fill", "prefetch", "lease"]
+    assert state.closed and encoder.disposed and sampler.closed and decoder.closed
+    assert state.pixels is state.bridge is state.ledger is state.inputs is None
+    assert state.conditioning_prefetch is (owner if prefetch_fails else None)
+    assert state.block0_cache is state.kv_lease is None
+
+
 def test_continuous_source_path_emits_dit_and_decoder_stage_spans(monkeypatch):
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
         source_session,

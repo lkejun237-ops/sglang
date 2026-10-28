@@ -168,6 +168,9 @@ class SourceReadySession:
         )
         self.pending_prompt = None
         self.applied_prompt = None
+        self.restore_initial_prefix = None
+        self.capture_initial_prefix = None
+        self.prepare_prompt_prefix = None
         self.recent_visual = None
         self.model_chunk_id = 0
         self.source_dependency_end = 0
@@ -274,7 +277,12 @@ class SourceReadySession:
             raise ValueError("Prompt switching currently supports video-only sessions")
         candidate = self.pending_prompt
         inputs = self.inputs if candidate.inputs is None else candidate.inputs
-        if defer_prefix and self.prompt_joint:
+        restore_prefix = (
+            None
+            if self.prepare_prompt_prefix is None
+            else self.prepare_prompt_prefix(candidate)
+        )
+        if defer_prefix and self.prompt_joint and restore_prefix is None:
             prepared, error = None, None
             try:
                 prepared = self.sampler.pack_prompt_prefix(
@@ -295,7 +303,11 @@ class SourceReadySession:
             self.cache.clear()
         else:
             origin, latent_end = self.sampler.rebuild_prompt_prefix(
-                inputs, candidate.condition, self.recent_visual, self.cache
+                inputs,
+                candidate.condition,
+                self.recent_visual,
+                self.cache,
+                **({"restore_prefix": restore_prefix} if restore_prefix else {}),
             )
         if latent_end != ready.model_chunk.start:
             raise ValueError("Prompt-switch prefix does not meet the next model block")
@@ -705,6 +717,10 @@ class SourceReadySession:
         sampler, positive = self.sampler, current.positive
         source, target, _, _ = current.spans[0]
         sampler._precheck_initial_prefix(self.cache, positive, source, target)
+        if self.restore_initial_prefix is not None:
+            self.restore_initial_prefix(self.cache)
+            self.restore_initial_prefix = None
+            return
         if bool((positive["block_idx"] == 0).any()):
             sampler._forward(
                 sampler._select_block(
@@ -713,8 +729,16 @@ class SourceReadySession:
                 self.cache,
                 "prefix",
             )
+        if self.capture_initial_prefix is not None:
+            self.capture_initial_prefix(self.cache.prefix)
+            self.capture_initial_prefix = None
 
     def _finish(self, ready, current, prompt, origin):
+        # The joint miss route creates its prefix after activation. Capture only
+        # after that forward has committed, using the same hook as startup.
+        if self.capture_initial_prefix is not None:
+            self.capture_initial_prefix(self.cache.prefix)
+            self.capture_initial_prefix = None
         dependency = self.source_dependency_end
         provenance = ready.provenance
         if provenance is not None:
@@ -1031,4 +1055,6 @@ class SourceReadySession:
         self.rng.dispose()
         self.inputs = self.prompt = self.pending_prompt = self.applied_prompt = None
         self.recent_visual = self.sampler = None
+        self.restore_initial_prefix = self.capture_initial_prefix = None
+        self.prepare_prompt_prefix = None
         self.closed = True

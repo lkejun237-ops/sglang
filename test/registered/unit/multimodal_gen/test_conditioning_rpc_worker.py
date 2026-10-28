@@ -541,6 +541,12 @@ class TestConditioningRPCWorker(CustomTestCase):
         self.assertEqual(second["context"][0, 0].item(), 3)
         self.assertEqual(calls, ["prompt"])
         self.assertEqual(second["context"].device.type, "cpu")
+        stats = local.cache.snapshot()
+        self.assertEqual((stats["hit"], stats["miss"], stats["entries"]), (1, 1, 1))
+        self.assertEqual(
+            stats["current_bytes"],
+            sum(t.numel() * t.element_size() for t in second.values()),
+        )
 
     def test_t22_oversized_local_result_is_returned_without_retention(self):
         local_cls = self.api("worker", "LocalConditioner")
@@ -551,6 +557,25 @@ class TestConditioningRPCWorker(CustomTestCase):
         first, second = local("prompt", []), local("prompt", [])
         self.assertTrue(torch.equal(first["context"], second["context"]))
         self.assertEqual(calls, ["prompt", "prompt"])
+        self.assertEqual(local.cache.snapshot()["oversize"], 2)
+        self.assertEqual(local.cache.snapshot()["current_bytes"], 0)
+
+    def test_cache_stats_follow_byte_lru_and_tenant_eviction(self):
+        cache_cls = self.api("cache", "ConditioningCache")
+        cache = cache_cls(12, per_tenant_bytes=8)
+        value = {"context": torch.ones(1)}
+        for key in [("a", 1), ("a", 2), ("b", 1)]:
+            cache.get_or_encode(key, lambda: value)
+        cache.get(("a", 1))  # b:1 is older than the next a entry, but a:2 is evicted.
+        cache.put(("a", 3), value)
+        assert cache.entry_size(("a", 2)) is None
+        assert cache.snapshot(tenant="a")["eviction"] == 1
+        assert cache.snapshot(tenant="b")["eviction"] == 0
+        assert cache.snapshot()["current_bytes"] == 12
+        before = cache.snapshot()
+        cache.get_or_encode(("a", 1), lambda: self.fail("Cache hit encoded"))
+        assert cache.snapshot()["hit"] == before["hit"] + 1
+        assert cache.snapshot()["miss"] == before["miss"]
 
     def test_t23_two_busy_responses_retry_then_return_success_before_deadline(self):
         now, calls = [0.0], []

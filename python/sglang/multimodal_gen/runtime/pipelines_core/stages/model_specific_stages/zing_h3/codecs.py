@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Zing request preparation using SGLang's shared H3 Qwen and VAE modules."""
 
+import hashlib
+import json
 import math
 import os
 import threading
+import weakref
 from contextlib import contextmanager
 from copy import copy
 
 import torch
 
+from sglang.multimodal_gen.runtime.conditioning.cache import ConditioningCache
 from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
 from sglang.multimodal_gen.runtime.conditioning.encoder import encode_condition
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.presentation import (
@@ -21,6 +25,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.decoding import (
     _deterministic_audio_decode_context,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.zing_stage_timing import handoff, stage_span
 
 from .decoder import decoder_adapter
@@ -29,6 +34,7 @@ from .packing import H3InferenceInputs
 from .visual_encoding import encode_clips
 
 _VISUAL_ENCODE_POLICY_LOCK = threading.RLock()
+logger = init_logger(__name__)
 
 
 def _validate_encoder_benchmark_limit(value):
@@ -101,7 +107,9 @@ def _replicated_visual_latent(latent, encode_mode):
 
 
 class ZingH3Codecs(ZingH3MediaInput):
-    def __init__(self, modules, pipeline_config, runtime):
+    def __init__(
+        self, modules, pipeline_config, runtime, *, reference_cache_bytes=256 << 20
+    ):
         self.modules, self.pipeline_config, self.runtime = (
             modules,
             pipeline_config,
@@ -126,6 +134,9 @@ class ZingH3Codecs(ZingH3MediaInput):
         )
         self.audio_sample_rate = self.aa.sample_rate
         self.remote_read_fs = None
+        # CPU tensors only; lifetime is the loaded codecs/model, not a session.
+        # Both preparation products share one byte-accounted LRU budget.
+        self.reference_cache = ConditioningCache(reference_cache_bytes)
         self.decoder = decoder_adapter(pipeline_config.resolve_decoder_spec())
 
     def prepare_visual_encoder_weights(self):
@@ -277,6 +288,59 @@ class ZingH3Codecs(ZingH3MediaInput):
             normalized, self.runtime["vae_config"]["encode_mode"]
         )
 
+    def encode_reference(self, item):
+        cache = getattr(self, "reference_cache", None)
+        if item["type"] != "image" or cache is None or cache.max_bytes == 0:
+            return self.encode_visual(item["frames"])
+        from sglang.multimodal_gen.runtime.conditioning.worker import (
+            coordinate_validation,
+        )
+
+        frames = item["frames"]
+        model = self.modules["video_vae"]
+        profile = json.dumps(
+            {
+                "shape": list(frames.shape),
+                "dtype": str(frames.dtype),
+                "vae": self.runtime["vae_config"],
+                "mean": self.va.latents_mean,
+                "std": self.va.latents_std,
+                "cudnn_benchmark_limit": torch.backends.cudnn.benchmark_limit,
+                "cudnn_tf32": torch.backends.cudnn.allow_tf32,
+                "matmul_tf32": torch.backends.cuda.matmul.allow_tf32,
+            },
+            sort_keys=True,
+        )
+        digest = hashlib.sha256(profile.encode())
+        digest.update(frames.contiguous().numpy().tobytes())
+        identity = digest.hexdigest()
+        key = ("vae", weakref.ref(model), identity)
+        cached = cache.get(key)
+        receipts = coordinate_validation((identity, cached is not None))
+        if any(receipt[0] != identity for receipt in receipts):
+            raise ValueError("Reference encoding inputs differ across SP ranks")
+        # A partial hit must not skip encode_visual's replicated-latent broadcast.
+        if all(receipt[1] for receipt in receipts):
+            return cached["latent"].to(device=next(model.parameters()).device)
+        latent = self.encode_visual(frames)
+        cache.put(key, {"latent": latent.detach().cpu()})
+        return latent
+
+    def _log_reference_cache(self):
+        cache = getattr(self, "reference_cache", None)
+        if cache is not None:
+            logger.info(
+                "Zing reference cache: %s",
+                json.dumps(
+                    {
+                        "total": cache.snapshot(),
+                        "preprocess": cache.snapshot(tenant="preprocess"),
+                        "vae": cache.snapshot(tenant="vae"),
+                    },
+                    sort_keys=True,
+                ),
+            )
+
     def encode_visual_moments(self, frames):
         """Encode one complete native clip (or an EOS single image), without RNG.
 
@@ -357,8 +421,11 @@ class ZingH3Codecs(ZingH3MediaInput):
         audio_ids = {
             c["content_id"] for c in conditions if "audio" in c["latent_modalities"]
         }
+        reference_ids = {c["content_id"] for c in conditions}
         media = [
-            self._decode_media(item, need_audio=item["id"] in audio_ids)
+            self._decode_reference_image(item, max_area_config=max_area_config)
+            if item["type"] == "image" and item["id"] in reference_ids
+            else self._decode_media(item, need_audio=item["id"] in audio_ids)
             for item in items
         ]
         if source_preview is not None:
@@ -443,7 +510,7 @@ class ZingH3Codecs(ZingH3MediaInput):
                         input_ids=[f"{request_id}:media:{item['id']}"],
                         output_ids=[f"{request_id}:reference:{item['id']}"],
                     ) as span:
-                        visual[item["id"]] = self.encode_visual(item["frames"])
+                        visual[item["id"]] = self.encode_reference(item)
                     handoff(span)
                 if source is not None:
                     with stage_span(
@@ -471,6 +538,7 @@ class ZingH3Codecs(ZingH3MediaInput):
                     audio_shape = tuple(
                         self.encode_audio(torch.zeros(2, samples)).shape[1:]
                     )
+        self._log_reference_cache()
         return H3InferenceInputs(
             target["type"],
             conditions,
@@ -499,8 +567,12 @@ class ZingH3Codecs(ZingH3MediaInput):
             raise ValueError(
                 "Reference IDs must not conflict with retained presentation"
             )
+        max_area_config = (
+            getattr(active, "max_area_config", None) or self.max_area_config
+        )
         decoded_references = [
-            self._decode_media(item, need_audio=False) for item in references
+            self._decode_reference_image(item, max_area_config=max_area_config)
+            for item in references
         ]
         conditions = [
             dict(
@@ -523,8 +595,7 @@ class ZingH3Codecs(ZingH3MediaInput):
             None,
             conditions,
             target,
-            max_area_config=getattr(active, "max_area_config", None)
-            or self.max_area_config,
+            max_area_config=max_area_config,
         )
         if (
             t,
@@ -571,9 +642,8 @@ class ZingH3Codecs(ZingH3MediaInput):
             with use_component("video_vae"):
                 for item in normalized:
                     if item["id"] in reference_ids:
-                        candidate.visual[item["id"]] = self.encode_visual(
-                            item["frames"]
-                        )
+                        candidate.visual[item["id"]] = self.encode_reference(item)
+        self._log_reference_cache()
         return candidate
 
     def decode_visual_range(self, latent, frame_start, frame_end):

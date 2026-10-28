@@ -464,6 +464,7 @@ class ServerArgs(DisaggServerArgsMixin):
     disagg_decoder_port: int | None = field(default=None, repr=False)
     conditioning_expected_profile: str | None = None
     zing_conditioning_local_cache_bytes: int = 256 << 20
+    zing_reference_cache_bytes: int = 256 << 20
     conditioning_service_url: str | None = None
     conditioning_config: str | None = field(default=None, repr=False)
     realtime_max_message_bytes: int = DEFAULT_MESSAGE_BYTES
@@ -723,6 +724,11 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError(
                 "Local Zing conditioning cache bytes must be a nonnegative integer"
             )
+        if (
+            type(self.zing_reference_cache_bytes) is not int
+            or self.zing_reference_cache_bytes < 0
+        ):
+            raise ValueError("Zing reference cache bytes must be a nonnegative integer")
         self._validate_pipeline()
         self._validate_offload()
         self._validate_direct_gpu_weight_loading()
@@ -2133,6 +2139,15 @@ class ServerArgs(DisaggServerArgsMixin):
             type=int,
             default=ServerArgs.zing_conditioning_local_cache_bytes,
             help="CPU byte capacity for local Zing conditioning cache; 0 disables it.",
+        )
+        parser.add_argument(
+            "--zing-reference-cache-bytes",
+            type=int,
+            default=ServerArgs.zing_reference_cache_bytes,
+            help=(
+                "Per-worker CPU byte capacity shared by reference image preprocessing "
+                "and VAE latents; 0 disables both. Source video is not cached."
+            ),
         )
         parser.add_argument(
             "--conditioning-service-url",

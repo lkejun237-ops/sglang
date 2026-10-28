@@ -768,12 +768,20 @@ def test_t13_stats_tenant_isolation_and_admin_global():
                 and own.json()["hit"] == 1
             )
             assert "tenants" not in own.json()
+            own_cache = own.json()["cache"]
+            assert own_cache["entries"] == 1
+            assert own_cache["current_bytes"] > 0
+            assert own_cache["current_bytes"] <= own_cache["max_bytes"]
             client.headers["Authorization"] = "Bearer secret"
             first = await client.get(PREFIX + "/stats")
             assert first.json()["hit"] == 0
             client.headers["Authorization"] = "Bearer admin"
             global_stats = await client.get(PREFIX + "/stats")
             assert global_stats.json()["miss"] == 2 and global_stats.json()["hit"] == 1
+            assert global_stats.json()["cache"]["entries"] == 2
+            assert global_stats.json()["cache"]["current_bytes"] == (
+                own_cache["current_bytes"] + first.json()["cache"]["current_bytes"]
+            )
         finally:
             await client.aclose()
             await app.close()

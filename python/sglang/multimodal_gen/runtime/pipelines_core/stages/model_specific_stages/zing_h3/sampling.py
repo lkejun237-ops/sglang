@@ -223,7 +223,9 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         target = host["row_role"] == int(H3RowRole.TARGET_VISUAL)
         return packs, float(host["position_ids"][target][0, 0]), chunks[-1].end
 
-    def rebuild_prompt_prefix(self, inputs, condition, visual_prefix, cache):
+    def rebuild_prompt_prefix(
+        self, inputs, condition, visual_prefix, cache, *, restore_prefix=None
+    ):
         """Replace all logical KV with a new condition and clean latent prefix."""
         prefix_inputs = copy(inputs)
         prefix_inputs.positive = condition
@@ -232,7 +234,9 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             prefix_inputs, condition, visual_prefix
         )
         cache.clear()
-        if bool((layout["block_idx"] == 0).any()):
+        if restore_prefix is not None:
+            restore_prefix(cache)
+        elif bool((layout["block_idx"] == 0).any()):
             self._forward(
                 self._select_block(layout, 0, phase="prefix", video_t=1.0, audio_t=1.0),
                 cache,

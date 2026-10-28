@@ -1099,8 +1099,9 @@ def test_video_decode_is_incremental_and_cancel_closes_process(tmp_path):
     asyncio.run(bounded())
 
 
+@pytest.mark.parametrize("prewarm_only", [False, True])
 def test_streaming_benchmark_keeps_warmup_out_of_summary_and_exports(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, prewarm_only
 ):
     import asyncio
     from pathlib import Path
@@ -1184,7 +1185,8 @@ def test_streaming_benchmark_keeps_warmup_out_of_summary_and_exports(
         output_dir=tmp_path,
         paced=False,
         warmup_runs=1,
-        measured_runs=3,
+        measured_runs=0 if prewarm_only else 3,
+        prewarm_only=prewarm_only,
         seed=123,
         url="ws://unused",
         timeout=10,
@@ -1193,29 +1195,35 @@ def test_streaming_benchmark_keeps_warmup_out_of_summary_and_exports(
         prompt_updates=None,
     )
     summary = asyncio.run(streaming.benchmark([case], args))
-    assert seen == ["warmup-0", "measured-0", "measured-1", "measured-2"]
-    assert summary["5s"]["succeeded"] == 3
-    assert summary["5s"]["metrics"]["ttff_seconds"]["count"] == 3
+    assert seen == (
+        ["warmup-0"]
+        if prewarm_only
+        else ["warmup-0", "measured-0", "measured-1", "measured-2"]
+    )
+    assert summary["5s"]["succeeded"] == args.measured_runs
+    assert summary["5s"]["metrics"]["ttff_seconds"]["count"] == args.measured_runs
     exported = json.loads((tmp_path / "results.json").read_text())
-    assert len(exported["requests"]) == 4
+    assert len(exported["requests"]) == 1 + args.measured_runs
+    assert exported["config"]["prewarm_only"] is prewarm_only
     assert exported["config"]["transport"] == "continuous_source"
-    assert exported["requests"][1]["server_session_id"] == "session-2"
-    assert exported["requests"][1]["metrics"]["stall_seconds"] == 0.5
-    assert exported["requests"][1]["metrics"]["ifl_seconds"] is None
-    assert exported["requests"][1]["streaming"]["source_send_span_seconds"] == 3
-    assert exported["requests"][1]["client_observation"]["elapsed_seconds"] == 4.5
+    assert exported["requests"][0]["server_session_id"] == "session-1"
+    assert exported["requests"][0]["metrics"]["stall_seconds"] == 0.5
+    assert exported["requests"][0]["metrics"]["ifl_seconds"] is None
+    assert exported["requests"][0]["streaming"]["source_send_span_seconds"] == 3
+    assert exported["requests"][0]["client_observation"]["elapsed_seconds"] == 4.5
     assert (
-        exported["requests"][1]["client_observation"]["client_clock_domain"]
+        exported["requests"][0]["client_observation"]["client_clock_domain"]
         == "CLOCK_MONOTONIC:test"
     )
-    assert exported["requests"][1]["delivery_complete"]
-    assert exported["requests"][1]["delivery_metrics"]["e2e_seconds"] == 4
+    assert exported["requests"][0]["delivery_complete"]
+    assert exported["requests"][0]["delivery_metrics"]["e2e_seconds"] == 4
     assert (
-        exported["requests"][1]["streaming"]["prompt_updates"][0]["latency_ms"] == 1000
+        exported["requests"][0]["streaming"]["prompt_updates"][0]["latency_ms"] == 1000
     )
-    assert exported["requests"][1]["streaming"]["prompt_switch_ttff_ms"]["count"] == 1
-    assert summary["5s"]["streaming"]["prompt_switch_ttff_ms"]["count"] == 3
-    assert summary["5s"]["streaming"]["prompt_switch_ttff_ms"]["median"] == 1000
+    assert exported["requests"][0]["streaming"]["prompt_switch_ttff_ms"]["count"] == 1
+    switch_ttff = summary["5s"]["streaming"]["prompt_switch_ttff_ms"]
+    assert switch_ttff["count"] == args.measured_runs
+    assert switch_ttff["median"] == (None if prewarm_only else 1000)
     assert "Prompt-switch TTFF" in (tmp_path / "results.html").read_text()
     assert (tmp_path / "results.html").is_file()
     assert (

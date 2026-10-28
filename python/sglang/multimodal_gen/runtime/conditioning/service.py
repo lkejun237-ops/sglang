@@ -772,6 +772,13 @@ class ConditioningService:
         }
         # Tenant stats reveal only that tenant's queued work.
         tenant = None if principal.get("admin") else principal["tenant"]
+        # RPC admission/singleflight owns request hit/miss accounting. The LRU
+        # contributes capacity/eviction data, scoped by the same principal.
+        result["cache"] = {
+            name: value
+            for name, value in self.cache.snapshot(tenant=tenant).items()
+            if name not in {"hit", "miss", "joined"}
+        }
         result["queue_depth"] = sum(
             f.state == "queued"
             and f.waiters > 0

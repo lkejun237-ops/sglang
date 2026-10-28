@@ -100,6 +100,7 @@ async def benchmark(cases, args):
         "timing_origin": "client_start_before_connect_and_source_decode",
         "timing_boundaries": CLIENT_TIMING,
         "concurrency": 1,
+        "prewarm_only": getattr(args, "prewarm_only", False),
         "warmup_runs": args.warmup_runs,
         "measured_runs": args.measured_runs,
         "seed": args.seed,
@@ -389,13 +390,21 @@ def main():
     parser.add_argument("--batch-pattern", type=int, nargs="+", default=[1])
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--measured-runs", type=int, default=3)
+    parser.add_argument(
+        "--prewarm-only",
+        action="store_true",
+        help="Populate resident caches with normal fixed-case warmup requests, without measured runs.",
+    )
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--timeout", type=float, default=900)
     parser.add_argument("--ffmpeg", default="ffmpeg")
     args = parser.parse_args()
+    if args.prewarm_only:
+        args.measured_runs = 0
     if (
         args.warmup_runs < 0
-        or args.measured_runs < 1
+        or (args.measured_runs < 1 and not args.prewarm_only)
+        or (args.prewarm_only and args.warmup_runs < 1)
         or min(args.batch_pattern) < 1
         or args.timeout <= 0
     ):
@@ -407,6 +416,10 @@ def main():
         for label in labels
     ]
     asyncio.run(benchmark(cases, args))
+    if args.prewarm_only:
+        rows = json.loads((args.output_dir / "results.json").read_text())["requests"]
+        if not rows or any(not row["success"] for row in rows):
+            raise SystemExit("Fixed-case prewarm failed; inspect results.json")
 
 
 if __name__ == "__main__":

@@ -244,6 +244,7 @@ class ZingH3CausalPipeline(ComposedPipelineBase):
             conditioning_mode=self.conditioning_mode,
             conditioning_provider=provider,
             local_cache_bytes=server_args.zing_conditioning_local_cache_bytes,
+            reference_cache_bytes=server_args.zing_reference_cache_bytes,
         )
         stage.conditioning_loader_receipt = self.conditioning_loader_receipt
         stage.deployment_sampling = {

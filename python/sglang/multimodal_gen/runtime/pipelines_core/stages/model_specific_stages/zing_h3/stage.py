@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import hashlib
 import json
+import os
 import time
 from contextlib import contextmanager, nullcontext
 
@@ -48,6 +49,7 @@ logger = init_logger(__name__)
 class ZingH3GenerationStage(PipelineStage):
     # Set by initialize_realtime_kv_cache_pool; None keeps per-session caches.
     kv_pool = None
+    block0_cache = None
 
     def __init__(
         self,
@@ -58,6 +60,7 @@ class ZingH3GenerationStage(PipelineStage):
         conditioning_mode="local",
         conditioning_provider=None,
         local_cache_bytes=256 << 20,
+        reference_cache_bytes=256 << 20,
     ):
         super().__init__()
         self.modules, self.config, self.runtime = modules, config, runtime
@@ -65,7 +68,9 @@ class ZingH3GenerationStage(PipelineStage):
             conditioning_mode,
             conditioning_provider,
         )
-        self.codecs = ZingH3Codecs(modules, config, runtime)
+        self.codecs = ZingH3Codecs(
+            modules, config, runtime, reference_cache_bytes=reference_cache_bytes
+        )
         self.codecs.conditioning_mode = conditioning_mode
         if conditioning_mode == "local":
             self.local_conditioner = LocalConditioner(
@@ -102,7 +107,12 @@ class ZingH3GenerationStage(PipelineStage):
             else WorkerConditioningState()
         )
         if self.conditioning_mode == "local":
-            return self.local_conditioner(prompt, media, state=state)
+            result = self.local_conditioner(prompt, media, state=state)
+            logger.info(
+                "Zing Qwen cache: %s",
+                json.dumps(self.local_conditioner.cache.snapshot(), sort_keys=True),
+            )
+            return result
         if self.conditioning_provider is None:
             raise ConditionError(
                 "CONDITION_UNAVAILABLE", "The remote conditioner is unavailable"
@@ -212,6 +222,15 @@ class ZingH3GenerationStage(PipelineStage):
             ),
         )
         self.kv_pool = pool
+        cache_mode = os.environ.get("SGLANG_ZING_BLOCK0_CACHE_MODE", "off")
+        if cache_mode != "off":
+            from .preparation_cache import Block0PreparationCache
+
+            self.block0_cache = Block0PreparationCache(
+                pool,
+                cache_mode,
+                entries=int(os.environ.get("SGLANG_ZING_BLOCK0_CACHE_ENTRIES", "6")),
+            )
 
     def kv_request(self, sampler, inputs, layout, *, source_shape, total_frames):
         """Describe a realtime session for pool admission after packing."""
