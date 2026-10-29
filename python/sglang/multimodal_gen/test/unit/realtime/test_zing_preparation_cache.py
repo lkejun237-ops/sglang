@@ -3,6 +3,7 @@
 
 from contextlib import nullcontext
 from copy import deepcopy
+from dataclasses import asdict
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
@@ -12,6 +13,9 @@ import torch
 from sglang.multimodal_gen.runtime.conditioning.worker import WorkerConditioningState
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
     source_session,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.media_geometry import (
+    SourceGeometry,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.packing import (
     H3InferenceInputs,
@@ -106,6 +110,18 @@ def test_startup_wires_cache_without_gating_joint(
         vae_frames_per_chunk=17,
         vae_latents_per_chunk=5,
         temporal_ratio=4,
+        spatial_ratio=16,
+        runtime={
+            "h3_media_config": {
+                "max_short_edge": 2048,
+                "max_area_config": {"source": 1032192},
+                "max_source_target_aspect_ratio_factor": 1.02,
+            }
+        },
+        pipeline_config=NS(
+            vae_config=NS(arch_config=NS(spatial_compression_ratio=16)),
+            dit_config=NS(arch_config=NS(patch_size=(1, 2, 2))),
+        ),
         prepare=Mock(return_value=prepared),
     )
     stage = NS(
@@ -116,7 +132,7 @@ def test_startup_wires_cache_without_gating_joint(
         _build_realtime_sampler=lambda *a, **kw: sampler,
         _build_request=lambda _: dict(prompt="scene"),
         _conditioning_consumer=Mock(),
-        packer=NS(chunk_plan=NS(lengths=(1, 2, 2))),
+        packer=NS(chunk_plan=NS(lengths=(1, 2, 2)), visual_channels=2),
         prompt_switch_prefix_latent_frames=5,
         kv_pool=NS(acquire=Mock(return_value=lease)),
     )
@@ -139,6 +155,7 @@ def test_startup_wires_cache_without_gating_joint(
             "zing_source_command": {
                 "encoder": {"mode": "progressive"},
                 "prompt_joint": joint,
+                "source_geometry": asdict(SourceGeometry(32, 32, 32, 32, 32, 32)),
             }
         },
         realtime_session_id="new-session",

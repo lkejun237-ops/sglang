@@ -4,6 +4,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import os
 import tempfile
@@ -85,6 +86,9 @@ def _with_source_pipeline_policy(
     if joint_forward is not None:
         result["joint_forward"] = joint_forward
     return result
+
+
+logger = logging.getLogger(__name__)
 
 
 def _source_sampling_schedule(args, profile):
@@ -300,14 +304,39 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         )
         self.source_attention_window = dict(window)
         source = getattr(request, "source_stream", None)
-        width, height = map(int, request.size.split("x"))
+        target_width, target_height = map(int, request.size.split("x"))
         fps = int(runtime["h3_media_config"]["fps"])
         require(
-            source == dict(format="rgb24", width=width, height=height, fps=fps)
+            isinstance(source, dict)
+            and set(source) == {"format", "width", "height", "fps"}
+            and source["format"] == "rgb24"
+            and source["fps"] == fps
+            and all(
+                type(source[k]) is int and source[k] > 0 for k in ("width", "height")
+            )
             and request.fps in (None, fps),
             "Please provide matching RGB source dimensions and frame rate.",
         )
-        validate_source_dimensions(width, height, args.pipeline_config)
+        width, height = source["width"], source["height"]
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.media_geometry import (
+            resolve_source_geometry,
+        )
+
+        validate_source_dimensions(target_width, target_height, args.pipeline_config)
+        try:
+            self.source_geometry = resolve_source_geometry(
+                (height, width),
+                (target_height, target_width),
+                args.pipeline_config,
+                runtime["h3_media_config"],
+            )
+        except ValueError as exc:
+            logger.warning("Source geometry rejected: %s", exc)
+            check(
+                False,
+                "source_geometry_unsupported",
+                "This video size is not supported by the server.",
+            )
         transport = SourceTransportBudget.from_args(args)
         transport.validate_sessions(
             max(
@@ -329,7 +358,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             8 * clip,
         )
         require(
-            request.realtime_preview_max_width in (None, width),
+            request.realtime_preview_max_width in (None, target_width),
             "This session requires the full output dimensions.",
         )
         self.max_references = getattr(
@@ -499,7 +528,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             profile["guidance_scale"],
         )
         request.realtime_output_format = request.realtime_output_format or "raw"
-        request.realtime_preview_max_width = width
+        request.realtime_preview_max_width = target_width
         self.ready = {
             "type": "session.ready",
             "zing_realtime_api_version": 1,
@@ -508,6 +537,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             "sampling_schedule": self.sampling_schedule,
             "realtime_output_format": request.realtime_output_format,
             "source_stream": source,
+            "source_encoding": self.source_geometry.receipt(),
             "max_message_bytes": transport.message_bytes,
             "max_source_batch_frames": limits.batch_frames,
             "max_source_message_bytes": limits.message_bytes,
@@ -869,8 +899,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                             type="video",
                             output=dict(
                                 frames=self.clip,
-                                width=self.config["width"],
-                                height=self.config["height"],
+                                width=self.source_geometry.target_width,
+                                height=self.source_geometry.target_height,
                             ),
                         )
                     ],
@@ -967,6 +997,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         batch.extra["zing_reference_ids"] = self.reference_ids
         batch.extra["zing_source_command"] = dict(
             config=self.config,
+            source_geometry=asdict(self.source_geometry),
             conditioning_prefetch_endpoint=self.conditioning_prefetch_endpoint,
             conditioning_prefetch_max_bytes=self.max_message_bytes,
             sampling_schedule=self.sampling_schedule,

@@ -58,7 +58,15 @@ def _request(h=480, w=832, *, source=True, prefix=1000, **overrides):
 
 @torch.no_grad()
 def _simulated_peak(
-    plan, window, *, prefix_rows, per_frame, has_source, chunks, audio_rows=None
+    plan,
+    window,
+    *,
+    prefix_rows,
+    per_frame,
+    has_source,
+    chunks,
+    audio_rows=None,
+    source_per_frame=None,
 ):
     """Drive the real cache and record rows held at each denoise step."""
     cache = ZingH3KVCache(
@@ -85,8 +93,11 @@ def _simulated_peak(
         rows = per_frame * frames
         cache.prepare_chunk(chunk.target_block)
         if has_source:
-            pos, idx = block(rows, chunk.source_block)
-            cache.update(pos, idx, "source", frames, layers(rows))
+            source_rows = (
+                rows if source_per_frame is None else source_per_frame * frames
+            )
+            pos, idx = block(source_rows, chunk.source_block)
+            cache.update(pos, idx, "source", frames, layers(source_rows))
         # Target audio rows share the target transaction.
         rows += 0 if audio_rows is None else audio_rows(chunk)
         pos, idx = block(rows, chunk.target_block)
@@ -96,6 +107,41 @@ def _simulated_peak(
         cache.update(pos, idx, "final", frames, layers(rows))
     cache.clear()
     return peak
+
+
+@pytest.mark.parametrize("lengths,split", [(5, False), ([1, 2, 2], False), (3, True)])
+def test_mixed_spatial_grids_match_real_cache_peak(lengths, split):
+    geometry, policy = _geometry(lengths, split, short_edge=736), ZingWindowPolicy(4, 1)
+    expected = peak_rows(
+        geometry,
+        policy,
+        prefix_rows=7,
+        rows_per_frame=6,
+        has_source=True,
+        source_rows_per_frame=2,
+    )
+    actual = _simulated_peak(
+        geometry.chunk_plan,
+        policy,
+        prefix_rows=7,
+        per_frame=6,
+        source_per_frame=2,
+        has_source=True,
+        chunks=20,
+    )
+    assert actual == expected
+
+
+def test_source_480_target_736_admission_retains_slot_bound():
+    plan = ZingKVPoolPlan.build(
+        _config(max_target_area=1280 * 736), _geometry(short_edge=736)
+    )
+    request = _request(736, 1280, source_shape=(480, 832))
+    rows = plan.admit(request)
+    assert rows == 1000 + (920 + 390) * 5 * 21
+    assert rows < plan.admit(_request(736, 1280)) <= plan.slot_rows
+    with pytest.raises(ZingKVPoolAdmissionError):
+        plan.admit(_request(736, 1280, source_shape=(768, 1280)))
 
 
 @pytest.mark.parametrize("lengths,split", [(5, False), (3, True), ([1, 2, 2], False)])
@@ -175,7 +221,7 @@ def test_source_free_session_uses_target_rows_only():
         dict(h=736, w=1280),  # short edge above the checkpoint bound
         dict(h=320, w=1312),  # long edge above the pool bound
         dict(h=704, w=1280, prefix=4097),  # prefix above the bound
-        dict(source_shape=(480, 864)),  # source must equal target
+        dict(source_shape=(481, 864)),  # source has its own grid checks
         dict(window_chunks=None),
         dict(window_chunks=12),
         dict(sink_chunks=0),

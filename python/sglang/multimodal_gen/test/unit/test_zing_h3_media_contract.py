@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.multimodal_gen.configs.zing_media import ZingResizeLimits
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
     codecs as codecs_module,
 )
@@ -260,6 +261,44 @@ def test_reference_disabled_or_oversize_preserves_uncached_results(
     assert codec.reference_cache.current_bytes == 0
 
 
+def test_reference_resize_cache_matches_uncached_pixels_across_limit_changes(
+    cached_codecs,
+):
+    from contextlib import nullcontext
+    from io import BytesIO
+
+    import numpy as np
+    from PIL import Image
+
+    from sglang.multimodal_gen.runtime.conditioning.cache import ConditioningCache
+
+    codec = cached_codecs
+    codec.max_short_edge = 128
+    codec.max_area_config["reference_image"] = 128 * 96
+    pixels = np.random.default_rng(42).integers(0, 256, (97, 131, 3), dtype=np.uint8)
+    output = BytesIO()
+    Image.fromarray(pixels).save(output, format="PNG")
+    request = make_request("video", references=1, source=False)
+    request["messages"][0]["content"][1] = dict(
+        type="image", id="ref-0", format="png", payload=output.getvalue()
+    )
+    results = []
+    for capacity in (0, 1 << 20):
+        codec.reference_cache = ConditioningCache(capacity)
+        frames = []
+        for limits in (None, ZingResizeLimits(32, 2048), None):
+            codec.reference_resize = limits
+            prepared = codec.prepare(
+                request, lambda _: nullcontext(), retain_condition_media=True
+            )
+            frames.append(prepared.condition_media[0]["frames"])
+        results.append(frames)
+    for uncached, cached in zip(*results):
+        assert torch.equal(uncached, cached)
+    assert results[1][0].shape != results[1][1].shape
+    assert codec.reference_cache.snapshot(tenant="preprocess")["hit"] == 1
+
+
 @pytest.mark.parametrize("format_name", ["PNG", "JPEG", "WEBP"])
 def test_init_and_reference_update_decode_file_bytes_in_memory(
     codecs, monkeypatch, format_name
@@ -488,6 +527,233 @@ def test_worker_newest_update_uses_active_media_and_discards_pending(mode):
         assert seen == ([[]] if mode == "clear" else [state.inputs.condition_media])
         assert (pending[0][1] is not None) == (mode == "clear")
     assert state.inputs.condition_media == [dict(id="active")]
+
+
+@pytest.mark.parametrize(
+    "shape,expected",
+    [
+        ((736, 1280), (480, 832)),
+        ((480, 832), (480, 832)),
+        ((384, 640), (384, 640)),
+        ((1024, 832), (608, 480)),
+    ],
+)
+def test_source_resize_preserves_frames_and_pixels_at_noop(shape, expected):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.media_geometry import (
+        resolve_source_geometry,
+    )
+
+    config = SimpleNamespace(
+        vae_config=SimpleNamespace(
+            arch_config=SimpleNamespace(spatial_compression_ratio=16)
+        ),
+        dit_config=SimpleNamespace(arch_config=SimpleNamespace(patch_size=(1, 2, 2))),
+    )
+    geometry = resolve_source_geometry(
+        shape,
+        shape,
+        config,
+        dict(
+            max_short_edge=1024,
+            max_area_config={"source": 1280 * 1024},
+            max_source_target_aspect_ratio_factor=2.0,
+        ),
+    )
+    pixels = (
+        torch.arange(3 * 2 * shape[0] * shape[1], dtype=torch.int64)
+        .to(torch.uint8)
+        .reshape(3, 2, *shape)
+    )
+    resized = geometry.resize(pixels)
+    assert resized.shape == (3, 2, *expected)
+    assert resized.dtype == torch.uint8
+    # Network packet boundaries must not change per-frame filtering.
+    assert torch.equal(
+        resized,
+        torch.cat([geometry.resize(pixels[:, :1]), geometry.resize(pixels[:, 1:])], 1),
+    )
+    if shape == expected:
+        assert resized is pixels
+    with pytest.raises(ValueError, match="input geometry"):
+        geometry.resize(pixels[:, :, :-1])
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {},
+        True,
+        {"max_area": 399360},
+        {"max_short_edge": True, "max_area": 399360},
+        {"max_short_edge": 480, "max_area": 0},
+        {"max_short_edge": 16, "max_area": 1024},
+    ],
+)
+def test_resize_config_rejects_invalid_limits(value):
+    with pytest.raises(ValueError):
+        ZingResizeLimits.parse(value, multiple=32)
+
+
+@pytest.mark.parametrize("external", [False, True], ids=["local", "remote-rpc"])
+@pytest.mark.parametrize("resize", [False, True], ids=["original", "480p"])
+def test_reference_480p_shared_by_qwen_vae_and_prompt_refresh(
+    codecs, monkeypatch, tmp_path, external, resize
+):
+    """Decode real PNGs; remote transport hashes the same RGB that VAE sees."""
+    codecs.reference_resize = ZingResizeLimits(480, 832 * 480) if resize else None
+    from contextlib import nullcontext
+
+    import numpy as np
+    from PIL import Image
+
+    from sglang.multimodal_gen.runtime.conditioning.inputs import (
+        PREPROCESS_VERSION,
+        content_identity,
+    )
+    from sglang.multimodal_gen.runtime.conditioning.resources import ResourceLimits
+    from sglang.multimodal_gen.runtime.conditioning.wire import (
+        decode_request,
+        encode_request,
+    )
+    from sglang.multimodal_gen.runtime.conditioning.worker import (
+        RemoteConditioner,
+        WorkerConditioningState,
+    )
+
+    codecs.max_short_edge = 1024
+    codecs.max_area_config = dict(reference_image=1280 * 720, source=1280 * 720)
+    codecs.conditioning_mode = "remote" if external else "local"
+    codecs.remote_read_fs = None
+    request = make_request("image", references=2)
+    # The source and its Qwen presentation retain the requested spatial bucket.
+    source_path = tmp_path / "source.png"
+    Image.new("RGB", (1280, 704), (11, 22, 33)).save(source_path)
+    request["messages"][1]["source"]["uri"] = str(source_path)
+    request["messages"][1]["content"][0]["output"].update(height=704, width=1280)
+    originals = []
+    for i, item in enumerate(request["messages"][0]["content"][1:]):
+        width, height = (1280, 720) if i == 0 else (1024, 832)
+        rgb = np.random.default_rng(i).integers(0, 256, (height, width, 3), np.uint8)
+        path = tmp_path / f"reference-{i}.png"
+        Image.fromarray(rgb).save(path)
+        item["uri"] = str(path)
+        originals.append(
+            {**item, "frames": torch.from_numpy(rgb).permute(2, 0, 1)[:, None]}
+        )
+    request["messages"][0]["content"].append(
+        dict(type="image", id="qwen-only", uri=str(source_path))
+    )
+    preview = dict(
+        id="preview",
+        type="video",
+        fps=24.0,
+        frames=torch.zeros(3, 1, 704, 1280, dtype=torch.uint8),
+    )
+    encoded, vae, calls = [], [], []
+    profile = SimpleNamespace(
+        profile_id="a" * 64, document={"preprocess_version": PREPROCESS_VERSION}
+    )
+
+    def encode(prompt, media):
+        encoded.append(media)
+        calls.append("condition")
+        return {
+            "context": torch.zeros(1, 4, dtype=torch.bfloat16),
+            "row_role": torch.zeros(1, dtype=torch.long),
+        }
+
+    def rpc(prompt, media, *, input_digest):
+        body = encode_request(
+            prompt, media, profile.profile_id, input_digest=input_digest
+        )
+        header, decoded = decode_request(body, profile, ResourceLimits())
+        assert header["input_digest"] == content_identity(
+            prompt, media, profile.profile_id
+        )
+        assert all(
+            torch.equal(a["frames"], b["frames"]) for a, b in zip(media, decoded)
+        )
+        return encode(prompt, media)
+
+    def visual(pixels):
+        calls.append("vae")
+        vae.append(pixels)
+        return torch.zeros(1, 2, 1, pixels.shape[-2] // 16, pixels.shape[-1] // 16)
+
+    monkeypatch.setattr(codecs, "encode_condition", encode)
+    monkeypatch.setattr(codecs, "encode_visual", visual)
+    conditioner = RemoteConditioner(
+        SimpleNamespace(encode=rpc), profile.profile_id, rank=0
+    )
+    state = WorkerConditioningState()
+
+    def consume(prompt, media):
+        return conditioner(prompt, media, state=state, device="cpu")
+
+    result = codecs.prepare(
+        request,
+        lambda name: nullcontext(),
+        retain_condition_media=True,
+        source_preview=preview,
+        conditioning=consume if external else None,
+    )
+    media = result.condition_media
+    assert calls == ["condition"] + ["vae"] * 3
+    assert media[0]["origin"] == "source_s0"
+    assert media[0]["frames"] is preview["frames"]
+    assert media[-1]["frames"].shape[-2:] == (704, 1280)
+    assert vae[-1].shape[-2:] == (704, 1280)
+    assert result.visual_shape[-2:] == (44, 80)  # Output/source stay above 480p.
+    refs = media[1:3]
+    assert [item["id"] for item in refs] == ["ref-0", "ref-1"]
+    expected_shapes = [(480, 832), (480, 608)] if resize else [(704, 1280), (832, 1024)]
+    assert [tuple(item["frames"].shape[-2:]) for item in refs] == expected_shapes
+    for item, pixels, original, qwen in zip(refs, vae, originals, encoded[0][1:3]):
+        # #391 shares normalized reference RGB with Qwen even without the
+        # optional resize cap; a 720-high input aligns down to 704.
+        assert item["frames"] is pixels
+        assert item["frames"] is qwen["frames"]
+        assert original["frames"].shape[-2] > 480
+    if resize:
+        assert content_identity("prompt", refs, profile.profile_id) != content_identity(
+            "prompt", originals, profile.profile_id
+        )
+    # The prompt-refresh callers reuse condition_media, including for remote RPC.
+    (consume if external else encode)("new prompt", media)
+    assert encoded[-1] is media
+    if external:
+        consume("new prompt", media)
+        assert len(encoded) == 2  # Same normalized input hits the existing cache.
+
+
+@pytest.mark.parametrize(
+    "height,width,area,expected",
+    [
+        (832, 1024, 1280 * 720, (480, 608)),
+        (1024, 832, 1280 * 720, (608, 480)),
+        (256, 320, 1280 * 720, (256, 320)),
+        (832, 1024, 256 * 320, (256, 320)),
+    ],
+)
+def test_reference_480p_geometry_preserves_stricter_limits(
+    codecs, height, width, area, expected
+):
+    codecs.reference_resize = ZingResizeLimits(480, 832 * 480)
+    codecs.max_short_edge = 1024
+    pixels = torch.zeros(3, 1, height, width, dtype=torch.uint8)
+    media = [dict(id="ref-0", type="image", frames=pixels)]
+    request = make_request("image", references=1, source=False)
+    target_message = request["messages"][1]
+    refs, *_ = codecs._normalize_inference_media(
+        media,
+        None,
+        target_message["conditions"],
+        target_message["content"][0],
+        max_area_config={"reference_image": area},
+    )
+    assert refs[0]["frames"].shape[-2:] == expected
+    assert media[0]["frames"] is pixels
+    assert pixels.shape[-2:] == (height, width)
 
 
 @pytest.mark.parametrize(

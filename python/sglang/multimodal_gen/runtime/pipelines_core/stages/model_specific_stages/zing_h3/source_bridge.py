@@ -41,6 +41,7 @@ class SourceChunkBridge:
         capacity_bytes,
         seed,
         provenance_for,
+        target_shape=None,
     ):
         if any(
             type(v) is not int or v < 1
@@ -63,6 +64,12 @@ class SourceChunkBridge:
         )
         self.capacity_latents, self.capacity_bytes = capacity_latents, capacity_bytes
         self.seed, self.provenance_for = seed, provenance_for
+        if target_shape is not None and (
+            len(target_shape) != 3
+            or any(type(v) is not int or v < 1 for v in target_shape)
+        ):
+            raise ValueError("Target latent shape must be positive [C,H,W]")
+        self.target_shape = target_shape
         self.values = None
         self.pixel_ends, self.dependencies = deque(), deque()
         self.accepted_latents = self.accepted_pixels = self.chunk_id = (
@@ -191,8 +198,12 @@ class SourceChunkBridge:
         ):
             raise ValueError("Source provenance does not match the codec chunk")
         source = self.values[:, :, :count].clone()
+        channels, height, width = self.target_shape or (
+            source.shape[1],
+            *source.shape[-2:],
+        )
         noise = indexed_video_noise(
-            tuple(source.shape),
+            (source.shape[0], channels, count, height, width),
             seed=self.seed,
             latent_start=chunk.start,
             purpose="target_initial",

@@ -409,6 +409,9 @@ def test_reference_admission_counts_candidate_rows(model):
     from copy import copy
 
     from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.media_geometry import (
+        SourceGeometry,
+    )
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.source_session import (
         ZingSourceStreamState,
     )
@@ -420,6 +423,10 @@ def test_reference_admission_counts_candidate_rows(model):
     state = ZingSourceStreamState()
     state.inputs = _inputs(8)
     state.inputs.source_visual = state.inputs.audio_shape = None
+    height, width = (
+        n * stage.codecs.spatial_ratio for n in state.inputs.visual_shape[-2:]
+    )
+    state.source_geometry = SourceGeometry(height, width, height, width, height, width)
     state.sampler = SimpleNamespace(sampler=sampler)
     condition = dict(
         context=torch.zeros(16, 12).bfloat16(),
@@ -444,6 +451,9 @@ def test_prompt_budget_rejection_preserves_live_pool_and_recovers(
 ):
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.incremental import (
         SourceReadySession,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.media_geometry import (
+        SourceGeometry,
     )
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.source_session import (
         ZingSourceStreamState,
@@ -473,6 +483,8 @@ def test_prompt_budget_rejection_preserves_live_pool_and_recovers(
     stage.encode_condition_for_batch = lambda *args: candidate
     state = ZingSourceStreamState()
     state.inputs = inputs
+    height, width = (n * stage.codecs.spatial_ratio for n in inputs.visual_shape[-2:])
+    state.source_geometry = SourceGeometry(height, width, height, width, height, width)
     owner = RealtimeSession()
     session = state.sampler = SourceReadySession(
         sampler,

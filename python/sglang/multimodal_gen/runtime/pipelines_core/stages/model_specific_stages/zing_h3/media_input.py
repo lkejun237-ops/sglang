@@ -26,6 +26,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     parse_h3_media_descriptor,
 )
 
+from .media_geometry import _resize_frames, _select_h3_bucket
+
 
 @contextmanager
 def _local_media(uri: str, *, fs: Any | None = None):
@@ -137,103 +139,6 @@ def _sample_max_area_config(
     return {**defaults, **override}
 
 
-def _select_h3_bucket(
-    height: int, width: int, *, multiple: int, max_short_edge: int, max_area: int
-) -> tuple[int, int]:
-    # 每条媒体独立选桶，候选始终不得超过自身原始尺寸。
-    if min(height, width, multiple, max_short_edge, max_area) < 1:
-        raise ValueError("H3 media geometry and max_area must be positive")
-    source_ratio = width / height
-    if not 0.25 <= source_ratio <= 4.0:
-        raise ValueError(
-            f"H3 supports image/video aspect ratios in [1:4,4:1], got {width}:{height}"
-        )
-    candidates = set()
-    max_height = min(height, max_area // multiple)
-    for bucket_h in range(multiple, max_height + 1, multiple):
-        width_limit = min(width, max_area // bucket_h)
-        if width_limit < multiple:
-            continue
-        ideal = source_ratio * bucket_h
-        for bucket_w in {
-            math.floor(ideal / multiple) * multiple,
-            math.ceil(ideal / multiple) * multiple,
-            width_limit // multiple * multiple,
-        }:
-            if (
-                bucket_w < multiple
-                or bucket_w > width_limit
-                or min(bucket_h, bucket_w) > max_short_edge
-            ):
-                continue
-            ratio = bucket_w / bucket_h
-            if 0.25 <= ratio <= 4.0:
-                candidates.add((bucket_h, bucket_w))
-    if not candidates:
-        raise ValueError(
-            f"H3 media {height}x{width} has no non-upscaling bucket under max_area={max_area}"
-        )
-    if height * width <= max_area:
-        # 原图与候选桶共左下角；按矩形 IoU 最大选桶，不用 H/W 欧氏距离混淆几何重叠。
-        ranked_iou = []
-        for bucket_h, bucket_w in candidates:
-            intersection = min(height, bucket_h) * min(width, bucket_w)
-            ranked_iou.append(
-                (
-                    intersection
-                    / (height * width + bucket_h * bucket_w - intersection),
-                    bucket_h * bucket_w,
-                    -bucket_h,
-                    -bucket_w,
-                )
-            )
-        _, _, neg_h, neg_w = max(ranked_iou)
-        return -neg_h, -neg_w
-    ranked = [
-        (
-            max(
-                (bucket_w / bucket_h) / source_ratio,
-                source_ratio / (bucket_w / bucket_h),
-            ),
-            bucket_h,
-            bucket_w,
-        )
-        for bucket_h, bucket_w in candidates
-    ]
-    near_aspect = [
-        item for item in ranked if item[0] <= 1.05
-    ]  # 与 Wan 一致：比例形变不超过 5% 时优先吃满面积预算
-    if near_aspect:
-        _, bucket_h, bucket_w = min(
-            near_aspect, key=lambda item: (-(item[1] * item[2]), item)
-        )
-        return bucket_h, bucket_w
-    _, bucket_h, bucket_w = min(
-        ranked, key=lambda item: (item[0], -(item[1] * item[2]), item[1], item[2])
-    )  # 多媒体共享画布受限时退回最接近比例桶
-    return bucket_h, bucket_w
-
-
-def _resize_frames(frames: torch.Tensor, height: int, width: int) -> torch.Tensor:
-    """在 CPU 上逐帧做 Lanczos resize，并维持 dataloader 的 uint8 ``[C,T,H,W]`` 契约。"""
-    if tuple(frames.shape[-2:]) == (height, width):
-        return frames
-    images = [
-        np.asarray(
-            Image.fromarray(frame.permute(1, 2, 0).numpy()).resize(
-                (width, height), Image.Resampling.LANCZOS
-            )
-        )
-        for frame in frames.permute(1, 0, 2, 3)
-    ]
-    return (
-        torch.from_numpy(np.stack(images))
-        .permute(3, 0, 1, 2)
-        .contiguous()
-        .to(torch.uint8)
-    )
-
-
 def _read_image(source, *, image_format=None):
     try:
         with Image.open(source) as image:
@@ -283,6 +188,14 @@ def _trimmed_vae_reference_frames(
 
 
 class ZingH3MediaInput:
+    def _reference_image_limits(self, max_area_config):
+        short_edge, area = self.max_short_edge, max_area_config["reference_image"]
+        limits = getattr(self, "reference_resize", None)
+        if limits is not None:
+            short_edge = min(short_edge, limits.max_short_edge)
+            area = min(area, limits.max_area)
+        return short_edge, area
+
     def _decode_reference_image(self, item, *, max_area_config):
         """Cache only reference images, using the bytes actually decoded.
 
@@ -301,13 +214,14 @@ class ZingH3MediaInput:
             with _local_media(str(item["uri"]), fs=self.remote_read_fs) as (path, fs):
                 self.remote_read_fs = fs
                 payload = Path(path).read_bytes()
+        max_short_edge, max_area = self._reference_image_limits(max_area_config)
         key = (
             "preprocess",
             hashlib.sha256(payload).hexdigest(),
             image_format,
             self.canvas_multiple,
-            self.max_short_edge,
-            max_area_config["reference_image"],
+            max_short_edge,
+            max_area,
         )
 
         def prepare():
@@ -316,8 +230,8 @@ class ZingH3MediaInput:
             height, width = _select_h3_bucket(
                 *frames.shape[-2:],
                 multiple=self.canvas_multiple,
-                max_short_edge=self.max_short_edge,
-                max_area=max_area_config["reference_image"],
+                max_short_edge=max_short_edge,
+                max_area=max_area,
             )
             return {"frames": _resize_frames(frames, height, width)}
 
@@ -581,12 +495,13 @@ class ZingH3MediaInput:
         for condition in conditions:
             item = media_by_id[condition["content_id"]]
             if item["type"] == "image":
+                max_short_edge, max_area = self._reference_image_limits(max_area_config)
                 height, width = _select_h3_bucket(
                     item["frames"].shape[-2],
                     item["frames"].shape[-1],
                     multiple=self.canvas_multiple,
-                    max_short_edge=self.max_short_edge,
-                    max_area=max_area_config["reference_image"],
+                    max_short_edge=max_short_edge,
+                    max_area=max_area,
                 )
                 item["frames"] = _resize_frames(item["frames"], height, width)
             elif "frames" in item:

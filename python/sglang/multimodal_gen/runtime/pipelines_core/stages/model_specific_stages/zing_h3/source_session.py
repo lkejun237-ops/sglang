@@ -31,6 +31,7 @@ from sglang.multimodal_gen.runtime.utils.zing_stage_timing import (
 )
 
 from .incremental import SourceReadySession
+from .media_geometry import resolve_source_geometry
 from .remote_decoder import create_decoder
 from .source_bridge import SourceChunk, SourceChunkBridge
 from .source_encoder import create_source_buffer
@@ -114,6 +115,7 @@ class ZingSourceStreamState(BaseRealtimeState):
         # Resolve once from the API's deployment command, not a worker-local env.
         self.work_quantum = None
         self.end_received = self.bridge_finished = False
+        self.source_geometry = None
         self.dispatch_steps = 0
         self.block0_cache = self.block0_entry = self.block0_restore = None
         self.block0_prefix = self.block0_request = None
@@ -210,6 +212,17 @@ class ZingSourceStreamState(BaseRealtimeState):
             ).identity
         if self.inputs.audio_shape is not None or self.inputs.source_visual is not None:
             raise ValueError("Continuous source requires a video-only static prefix")
+        ratio = stage.codecs.spatial_ratio
+        self.source_geometry = resolve_source_geometry(
+            (config["height"], config["width"]),
+            tuple(n * ratio for n in self.inputs.visual_shape[-2:]),
+            stage.codecs.pipeline_config,
+            stage.codecs.runtime["h3_media_config"],
+        )
+        from dataclasses import asdict
+
+        if command.get("source_geometry") != asdict(self.source_geometry):
+            raise ValueError("Source geometry differs between adapter and worker")
         self.prompt = params.prompt
         self.prompt_event = batch.realtime_event_id
         self.ledger = SourceLedger(**config)
@@ -223,6 +236,14 @@ class ZingSourceStreamState(BaseRealtimeState):
         encoder = batch.extra["zing_source_command"].get(
             "encoder", default_source_encoder()
         )
+        if "remote" in encoder:
+            encoder = {
+                **encoder,
+                "remote": {
+                    **encoder["remote"],
+                    "source_geometry": asdict(self.source_geometry),
+                },
+            }
         self.policy["source_encoder"] = encoder
         with self._encoder_use(stage):
             self.pixels = create_source_buffer(
@@ -241,6 +262,7 @@ class ZingSourceStreamState(BaseRealtimeState):
             capacity_bytes=256 << 20,
             seed=params.seed[0] if isinstance(params.seed, list) else params.seed,
             provenance_for=self.ledger.provenance_for,
+            target_shape=(stage.packer.visual_channels, *self.inputs.visual_shape[-2:]),
         )
         cached_joint = (
             prompt_joint and getattr(sampler, "joint_forward", "off") == "cross_chunk"
@@ -626,7 +648,10 @@ class ZingSourceStreamState(BaseRealtimeState):
             self.sampler.sampler,
             inputs,
             layout,
-            source_shape=(height, width),
+            source_shape=tuple(
+                n // stage.codecs.spatial_ratio
+                for n in self.source_geometry.encoded_shape
+            ),
             total_frames=None,
         )
         try:
@@ -780,6 +805,8 @@ class ZingSourceStreamState(BaseRealtimeState):
                     self.initialize(stage, batch, config, trace)
                 if self.qwen_init_host_ms is not None:
                     timings["qwen_init_host_ms"] = self.qwen_init_host_ms
+            # Every initialized session has negotiated input/encoding/output geometry.
+            assert self.source_geometry is not None
             if self.remote_decoder:
                 self.decoder.bind_dispatch(
                     request_id=batch.request_id,
@@ -829,6 +856,9 @@ class ZingSourceStreamState(BaseRealtimeState):
                     )
                 # The shared factory may advance its cache in append/finish,
                 # not only pop. Keep the declared component active throughout.
+                if "remote" not in self.policy["source_encoder"]:
+                    with timed("source_resize_host_ms"):
+                        pixels = self.source_geometry.resize(pixels)
                 with timed("encoder_host_ms"), self._encoder_use(stage):
                     self.pixels.append(
                         pixels,
@@ -865,6 +895,11 @@ class ZingSourceStreamState(BaseRealtimeState):
                         latent_start=encoded.start,
                         noise_version=STREAMING_NOISE_VERSION,
                     )
+                    if (
+                        tuple(n * stage.codecs.spatial_ratio for n in source.shape[-2:])
+                        != self.source_geometry.encoded_shape
+                    ):
+                        raise ValueError("Source latent differs from encoded geometry")
                     if measure_cuda and torch.cuda.is_available():
                         torch.cuda.synchronize()
                 if self.component_capture is not None:

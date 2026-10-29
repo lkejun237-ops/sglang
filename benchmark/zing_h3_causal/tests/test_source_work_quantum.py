@@ -5,12 +5,25 @@ import ast
 import asyncio
 import time
 from collections import deque
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3] / "python/sglang/multimodal_gen/runtime"
+
+
+@dataclass(frozen=True)
+class GeometryFixture:
+    """Wire data only; keep AST wiring tests independent of pipeline imports."""
+
+    input_height: int
+    input_width: int
+    encoded_height: int
+    encoded_width: int
+    target_height: int
+    target_width: int
 
 
 def methods(sampling_schedule=None):
@@ -35,7 +48,7 @@ def methods(sampling_schedule=None):
         if not ok:
             raise ValueError(message)
 
-    ns = dict(Base=Base, asyncio=asyncio, time=time, require=require)
+    ns = dict(Base=Base, asyncio=asyncio, time=time, require=require, asdict=asdict)
     exec(
         compile(
             ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])),
@@ -64,6 +77,7 @@ def methods(sampling_schedule=None):
         source_decoder_overlap=False,
         clip=17,
         source_encoder={"mode": "progressive"},
+        source_geometry=GeometryFixture(736, 1280, 480, 832, 736, 1280),
         available=asyncio.Event(),
         ledger=NS(closed=False),
         config={},
@@ -123,6 +137,9 @@ def test_continuation_keeps_new_source_queued_and_never_repeats_eos(sampling_sch
     assert batch.extra["zing_source_command"]["appends"] == []
     assert batch.extra["zing_source_command"]["end"] is None
     assert batch.extra["zing_source_command"]["sampling_schedule"] == sampling_schedule
+    assert batch.extra["zing_source_command"]["source_geometry"] == asdict(
+        adapter.source_geometry
+    )
     assert list(adapter.pending) == [row] and adapter.pending_frames == 1
 
 

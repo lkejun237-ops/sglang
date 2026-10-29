@@ -102,6 +102,8 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
     # Optional limit on one uploaded reference set, measured as decoded RGB bytes.
     # None derives N * 48 MiB from the image pixel maximum. Not total process RSS.
     zing_reference_max_decoded_bytes: int | None = None
+    # Optional reference resize limits; realtime source always uses the 480p cap.
+    zing_reference_resize: dict | None = None
 
     # Legacy decoder fields the caller supplied; a default must not look like a choice.
     _explicit_decoder_fields = frozenset()
@@ -177,6 +179,12 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
         return self.zing_adaln_table_path
 
     def validate_server_args(self, server_args):
+        from sglang.multimodal_gen.configs.zing_media import ZingResizeLimits
+
+        multiple = self.vae_config.arch_config.spatial_compression_ratio * max(
+            self.dit_config.arch_config.patch_size[1:]
+        )
+        ZingResizeLimits.parse(self.zing_reference_resize, multiple=multiple)
         ReferenceLimits(self.zing_reference_max_images)
         if self.zing_reference_max_decoded_bytes is not None and (
             type(self.zing_reference_max_decoded_bytes) is not int
@@ -255,9 +263,7 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
                     "Zing SP requires the numerically validated configuration: "
                     + ", ".join(missing)
                 )
-        from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
-            ZingKVPoolConfig,
-        )
+        from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import ZingKVPoolConfig
 
         ZingKVPoolConfig.from_pipeline_config(
             self,

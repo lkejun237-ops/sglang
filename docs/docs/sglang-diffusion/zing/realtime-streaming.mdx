@@ -61,10 +61,12 @@ profile 和最终有效计划均须合法。迁移边界见[默认混合采样�
 
 ### 尺寸与传输预算
 
-source 入口按已加载模型的 `VAE spatial compression × DiT patch size` 校验宽高。
-当前 H3 两轴都要求 32 整除：832×480、896×512、1280×736 可通过网格校验；
-**精确 1280×720 不支持**，返回 `source_dimensions_unaligned`。服务不隐式缩放，
-1280×736 的结果不能替代 1280×720 验收。网格与传输准入通过仍不保证 KV 容量或生成质量。
+输出尺寸按已加载模型的 `VAE spatial compression × DiT patch size` 校验，当前两轴要求 32 整除。
+832×480、896×512、1280×736 可通过输出网格校验；精确 1280×720 输出不支持。
+实时上传 source 始终在 VAE 前按短边 ≤480、面积 ≤399360 选桶缩放，小输入不放大。
+例如上传 1280×736 时编码为 832×480，输出仍可请求 1280×736；上传尺寸不必与输出相同，
+但须满足宽高比与传输限制。实际编码尺寸见 `session.ready.source_encoding`。
+网格与传输准入通过仍不保证 KV 容量或生成质量。
 
 部署参数 `--realtime-max-message-bytes` 默认 `67108864`（64 MiB），统一限制完整
 MessagePack 消息与 source admission，不能设置无限大小。`--realtime-transport-host-bytes`

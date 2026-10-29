@@ -129,6 +129,12 @@ class ZingH3Codecs(ZingH3MediaInput):
         self.target_fps = float(media["fps"])
         self.max_short_edge = int(media["max_short_edge"])
         self.max_area_config = media["max_area_config"]
+        from sglang.multimodal_gen.configs.zing_media import ZingResizeLimits
+
+        self.reference_resize = ZingResizeLimits.parse(
+            getattr(pipeline_config, "zing_reference_resize", None),
+            multiple=self.canvas_multiple,
+        )
         self.max_source_target_aspect_ratio_factor = float(
             media["max_source_target_aspect_ratio_factor"]
         )

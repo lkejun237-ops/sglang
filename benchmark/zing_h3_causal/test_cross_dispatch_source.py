@@ -17,6 +17,7 @@ import threading
 import time
 import uuid
 from contextlib import nullcontext
+from dataclasses import asdict, dataclass
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -53,8 +54,28 @@ def production_class():
         uuid=uuid,
         hashlib=hashlib,
         timedelta=timedelta,
+        time=time,
+        dataclass=dataclass,
+        asdict=asdict,
+        SOURCE_RESIZE_VERSION="h3-lanczos-v1",
         request_abort=recovery.request_abort,
         PROGRESSIVE_ENCODER_VERSION="h3-clip17-progressive-v1",
+    )
+    geometry = ast.parse(path.with_name("media_geometry.py").read_text())
+    exec(
+        compile(
+            ast.Module(
+                body=[
+                    node
+                    for node in geometry.body
+                    if isinstance(node, (ast.ClassDef, ast.FunctionDef))
+                ],
+                type_ignores=[],
+            ),
+            "media_geometry.py",
+            "exec",
+        ),
+        namespace,
     )
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
     return namespace
@@ -79,8 +100,9 @@ def test_admission_identity_both_orders_and_wrong_content(first):
 
 
 @pytest.mark.parametrize("capacity_bytes", [256 << 20, 100])
+@pytest.mark.parametrize("resize", [False, True])
 def test_real_ipc_prefetches_next_dispatch_and_credit_bounds(
-    monkeypatch, tmp_path, capacity_bytes
+    monkeypatch, tmp_path, capacity_bytes, resize
 ):
     ns = production_class()
     cls = ns["RemoteEncoderSession"]
@@ -108,6 +130,8 @@ def test_real_ipc_prefetches_next_dispatch_and_credit_bounds(
                     )
                     return
                 reply = {"ok": True, "ready": False}
+                if op == "open":
+                    reply["source_encoding"] = cmd.get("source_encoding")
                 if op == "append":
                     frames += cmd["shape"][1]
                     received.append((cmd, parts[1]))
@@ -141,6 +165,8 @@ def test_real_ipc_prefetches_next_dispatch_and_credit_bounds(
         shape, dtype=dtype
     )
     session = cls.__new__(cls)
+    session.source_geometry = ns["SourceGeometry"](2, 2, 1, 1, 2, 2) if resize else None
+    session.resize_host_ms = 0.0
     session.device, session.port, session.timeout = "cpu", port, 2
     session.admission_endpoint = endpoint
     session.profile_dir, session.token = None, "private-generation"
@@ -190,15 +216,16 @@ def test_real_ipc_prefetches_next_dispatch_and_credit_bounds(
             assert session.prefetched_frames >= 9
             assert received[1][0]["dispatch_accepted_frames"] == 1
             # CHW worker bytes are the exact transpose of the original RGB source.
-            assert (
-                received[1][1]
-                == torch.frombuffer(bytearray(bytes(range(12)) * 8), dtype=torch.uint8)
+            original = (
+                torch.frombuffer(bytearray(bytes(range(12)) * 8), dtype=torch.uint8)
                 .reshape(8, 2, 2, 3)
                 .permute(3, 0, 1, 2)
-                .contiguous()
-                .numpy()
-                .tobytes()
             )
+            expected = session.source_geometry.resize(original) if resize else original
+            assert received[1][1] == expected.contiguous().numpy().tobytes()
+            assert received[1][0]["shape"] == list(expected.shape)
+            session._check_admission(0, bytes(range(12)), "dispatch")
+            assert 0 not in session.admission_digests
             time.sleep(0.05)
             assert session.results.qsize() == 2  # No third completed/in-flight result.
     finally:
@@ -232,6 +259,7 @@ def test_dispose_clears_retention_when_prefetch_is_ahead_of_dispatch():
     ns = production_class()
     ns["EncoderStateUsage"] = lambda retained, positions: (retained, positions)
     session = ns["RemoteEncoderSession"].__new__(ns["RemoteEncoderSession"])
+    session.resize_host_ms = 0.0
     session.accepted_frames, session.prefetched_frames, session._consumed = 3, 5, 1
     session.disposed = False
     session.signature = (2, 2)

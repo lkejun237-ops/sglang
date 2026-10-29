@@ -7,6 +7,9 @@ from types import SimpleNamespace as NS
 import pytest
 import torch
 
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.media_geometry import (
+    SourceGeometry,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.source_bridge import (
     SourceChunkBridge,
 )
@@ -144,6 +147,7 @@ class SyntheticDecoder:
 
 def session(plan, mode="progressive"):
     state = ZingSourceStreamState()
+    state.source_geometry = SourceGeometry(1, 1, 1, 1, 1, 1)
     state.ledger = SourceLedger(
         width=1, height=1, fps=24, limits=SourceLimits(17, 4096, 68, 4096, 136)
     )
@@ -164,6 +168,7 @@ def session(plan, mode="progressive"):
     )
     stage = NS(
         codecs=NS(
+            spatial_ratio=1,
             vae_frames_per_chunk=17,
             vae_latents_per_chunk=5,
             temporal_ratio=4,
@@ -251,6 +256,48 @@ def test_worker_rejects_invalid_encoder_output_and_releases_all_state():
         state.run(stage, batch(state, 0, 1, 0))
     assert state.closed and encoder.disposed and sampler.closed and decoder.closed
     assert not sampler.calls
+
+
+@pytest.mark.parametrize("remote", [False, True])
+def test_worker_resizes_only_local_pixels_and_preserves_target_noise(remote):
+    state, stage = session(ChunkPlan([1, 2, 2]))
+    state.source_geometry = SourceGeometry(64, 64, 32, 32, 64, 64)
+    stage.codecs.spatial_ratio = 32
+    state.ledger = SourceLedger(
+        width=64,
+        height=64,
+        fps=24,
+        limits=SourceLimits(17, 1 << 20, 68, 4 << 20, 136),
+    )
+    state.bridge.provenance_for = state.ledger.provenance_for
+    state.bridge.target_shape = (1, 2, 2)
+    state.decoder.ledger = state.ledger
+    if remote:
+        state.policy["source_encoder"]["remote"] = {}
+        state.pixels.append_capacity_frames = 17
+    shapes, noises = [], []
+    append_pixels, append_latent = state.pixels.append, state.sampler.append
+
+    def encode(pixels, **kwargs):
+        shapes.append(tuple(pixels.shape))
+        append_pixels(pixels, **kwargs)
+
+    def sample(source, noise, **kwargs):
+        assert source.shape == (1, 1, 1, 1, 1)
+        noises.append(noise)
+        append_latent(source, noise, **kwargs)
+
+    state.pixels.append, state.sampler.append = encode, sample
+    command = batch(state, 0, 1, 0)
+    item = command.extra["zing_source_command"]["appends"][0]
+    item["payload"]["data"] = bytes(64 * 64 * 3)
+    item["message_bytes"] = 64 * 64 * 3 + 100
+    state.run(stage, command)
+    assert shapes == [(3, 1, 64, 64) if remote else (3, 1, 32, 32)]
+    assert noises[0].shape == (1, 1, 1, 2, 2)
+    result = state.run(stage, batch(state, 1, 0, 1, final=True))
+    assert result.usage["zing_source_complete"]
+    assert state.closed
 
 
 def test_prefetch_close_failure_still_releases_source_resources():

@@ -4,8 +4,8 @@
 Zing stores K/V as linear rows ``[rows, local heads, head dim]``; a slot is not
 tied to a spatial shape. A slot is sized once for the configured upper bounds
 and any realtime session whose peak row count fits is admitted, so smaller
-resolutions reuse the same slot. Every target chunk pairs with a same-size
-source chunk (or none) and, when the session generates audio, with the stereo
+resolutions reuse the same slot. Every target chunk pairs with a temporally aligned
+source chunk (or none), with an independent spatial grid, and with the stereo
 audio latents that packing assigns to its time span. Slots always reserve that
 target audio. Reference audio lives in the block-zero prefix and is covered by
 ``max_prefix_rows``.
@@ -243,6 +243,7 @@ def peak_rows(
     prefix_rows: int,
     rows_per_frame: int,
     has_source: bool,
+    source_rows_per_frame: int | None = None,
     total_frames: int | None = None,
     has_audio: bool = False,
     audio_length: int | None = None,
@@ -266,7 +267,15 @@ def peak_rows(
         )
     committed = {}
     plan = geometry.chunk_plan
-    per_frame = rows_per_frame * (2 if has_source else 1)
+    if source_rows_per_frame is not None:
+        _positive_int("source_rows_per_frame", source_rows_per_frame)
+        if not has_source:
+            raise ValueError("Source rows require a source chunk")
+    per_frame = rows_per_frame
+    if has_source:
+        per_frame += (
+            rows_per_frame if source_rows_per_frame is None else source_rows_per_frame
+        )
     split = int(plan.split_first_latent and plan.lengths[0] > 1)
     steady = window.window_chunks + 2 + split
     best, seen, stop, current = 0, {}, None, 0
@@ -416,10 +425,23 @@ class ZingKVPoolPlan:
             )
         if h * w > c.max_target_area:
             raise _unsupported(f"target area {h * w} exceeds {c.max_target_area}")
-        if request.source_shape is not None and tuple(request.source_shape) != (h, w):
-            raise _unsupported(
-                f"source canvas {request.source_shape} must equal target {(h, w)}"
-            )
+        source_rows = None
+        if request.source_shape is not None:
+            shape = request.source_shape
+            if len(shape) != 2 or any(type(n) is not int or n < 1 for n in shape):
+                raise _unsupported(f"invalid source canvas {shape}")
+            sh, sw = shape
+            if (
+                sh % mh
+                or sw % mw
+                or min(sh, sw) > g.max_short_edge
+                or max(sh, sw) > c.max_target_long_edge
+                or sh * sw > c.max_target_area
+            ):
+                raise _unsupported(
+                    f"source canvas {shape} exceeds pool geometry limits"
+                )
+            source_rows = g.rows_per_frame(sh, sw)
         if type(request.prefix_rows) is not int or request.prefix_rows < 0:
             raise _unsupported(f"invalid prefix rows {request.prefix_rows}")
         if request.prefix_rows > c.max_prefix_rows:
@@ -432,6 +454,7 @@ class ZingKVPoolPlan:
             prefix_rows=request.prefix_rows,
             rows_per_frame=g.rows_per_frame(h, w),
             has_source=request.source_shape is not None,
+            source_rows_per_frame=source_rows,
             total_frames=request.total_frames,
             window_eviction_timing=request.window_eviction_timing,
             has_audio=request.generates_audio,

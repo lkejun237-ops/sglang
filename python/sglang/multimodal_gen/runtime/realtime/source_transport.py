@@ -163,5 +163,5 @@ def validate_source_dimensions(width, height, pipeline_config):
     check(
         min(width, height) > 0 and width % grid_w == height % grid_h == 0,
         "source_dimensions_unaligned",
-        f"Please use a video width divisible by {grid_w} and height divisible by {grid_h}. No automatic resizing is applied.",
+        f"Please use an output video width divisible by {grid_w} and height divisible by {grid_h}.",
     )

@@ -9,6 +9,8 @@ from dataclasses import asdict
 from importlib import metadata
 from pathlib import Path
 
+from sglang.multimodal_gen.configs.zing_media import ZING_SOURCE_RESIZE
+
 SCHEMA = "zing-block0-v2"
 
 
@@ -155,9 +157,7 @@ def build_identity(stage, args, *, device):
         broadcast_receipt,
         coordinate_validation,
     )
-    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        get_sp_group,
-    )
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
 
     group = get_sp_group()
     receipt = None
@@ -245,6 +245,10 @@ def _layout_contract(stage, args, device, group):
         "tp": get_tensor_model_parallel_world_size(),
         "arch": asdict(stage.config.dit_config.arch_config),
         "vae_arch": asdict(stage.config.vae_config.arch_config),
+        # Persistent preparations contain normalized reference pixels/latents
+        # and the source geometry used for KV admission.
+        "source_resize": asdict(ZING_SOURCE_RESIZE),
+        "reference_resize": getattr(stage.config, "zing_reference_resize", None),
         "dtype": str(next(model.parameters()).dtype),
         "qwen_execution": _execution_options()
         if stage.conditioning_mode == "local"

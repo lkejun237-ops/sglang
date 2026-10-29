@@ -115,8 +115,11 @@ def test_zing_h3_sp_request_preserves_requested_frame_count(
 
 
 @torch.no_grad()
-def test_incremental_kv_matches_explicit_clean_history(model):
+@pytest.mark.parametrize("target_hw", [(2, 2), (4, 6)])
+def test_incremental_kv_matches_explicit_clean_history(model, target_hw):
     packer, inputs, visual, audio = request(model)
+    inputs.visual_shape = (3, *target_hw)
+    visual = torch.randn(1, 2, *inputs.visual_shape)
     sampler = ZingH3Sampler(model, packer, sigma_points=3)
     sampler.device = torch.device("cpu")
     layout = packer.pack_inference_layout(inputs, inputs.positive, visual, audio)

@@ -12,6 +12,7 @@ import math
 import queue
 import sys
 import threading
+import time
 import uuid
 from datetime import timedelta
 
@@ -21,6 +22,7 @@ import zmq
 
 from .encoder_recovery import request_abort
 from .encoder_transport import bridge_group, receive_moments
+from .media_geometry import SourceGeometry
 from .progressive_encoder import PROGRESSIVE_ENCODER_VERSION, EncoderStateUsage
 from .streaming_codecs import CodecSlice
 
@@ -42,6 +44,9 @@ class RemoteEncoderSession:
         )
 
         self.codecs, self.config = codecs, dict(config)
+        geometry = config.get("source_geometry")
+        self.source_geometry = None if geometry is None else SourceGeometry(**geometry)
+        self.resize_host_ms = 0.0
         self.group = get_world_group()
         self.leader = self.group.rank_in_group == 0
         self.device = next(codecs.modules["video_vae"].encoder.parameters()).device
@@ -158,6 +163,11 @@ class RemoteEncoderSession:
         ):
             raise ValueError("Source pixels must be nonempty RGB bytes [3,T,H,W]")
         signature = tuple(pixels.shape[2:])
+        if (
+            self.source_geometry is not None
+            and signature != self.source_geometry.input_shape
+        ):
+            raise ValueError("Remote source differs from negotiated input dimensions")
         count = pixels.shape[1]
         if self.signature is not None and signature != self.signature:
             raise ValueError("Source pixel dimensions cannot change")
@@ -248,16 +258,25 @@ class RemoteEncoderSession:
                 wait_for_workers=False,
             )
             open_attempted = True
-            rpc(
+            source_encoding = (
+                None if self.source_geometry is None else self.source_geometry.receipt()
+            )
+            opened_reply = rpc(
                 "open",
                 bridge_port=store.port,
                 capacity_frames=self.capacity_frames,
                 stage_timing_dir=self.stage_timing_dir,
+                source_encoding=source_encoding,
             )
             opened = True
             data_operation_active = True
             bridge = bridge_group(store, 0, timeout_seconds=self.timeout)
             data_operation_active = False
+            if (
+                self.source_geometry is not None
+                and opened_reply.get("source_encoding") != source_encoding
+            ):
+                raise ValueError("Encoder did not acknowledge source geometry")
             with torch.cuda.stream(stream):
                 while not self.stop.is_set():
                     try:
@@ -276,6 +295,14 @@ class RemoteEncoderSession:
                                     header["num_frames"],
                                 )
                                 width, height = header["width"], header["height"]
+                                if (
+                                    self.source_geometry is not None
+                                    and (height, width)
+                                    != self.source_geometry.input_shape
+                                ):
+                                    raise ValueError(
+                                        "Source admission dimensions changed"
+                                    )
                                 if (
                                     start != self.prefetched_frames
                                     or not 1 <= count <= 17
@@ -311,6 +338,12 @@ class RemoteEncoderSession:
                     except queue.Empty:
                         continue
                     if op == "append":
+                        if self.source_geometry is not None:
+                            started = time.perf_counter()
+                            pixels = self.source_geometry.resize(pixels)
+                            self.resize_host_ms += (
+                                time.perf_counter() - started
+                            ) * 1000
                         reply = rpc(
                             op,
                             pixels.numpy().tobytes(),
@@ -450,6 +483,7 @@ class RemoteEncoderSession:
                 v.numel() * v.element_size() for _, v in self.results.queue
             )
         return dict(
+            source_resize_host_ms_total=self.resize_host_ms,
             prefetch_retained_input_frames=prefetched_retained,
             prefetch_retained_input_bytes=prefetched_retained
             * 3

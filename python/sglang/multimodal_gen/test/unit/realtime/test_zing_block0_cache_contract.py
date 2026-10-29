@@ -280,6 +280,25 @@ def test_sp_identity_scan_broadcast_and_numeric_contract_without_cuda(monkeypatc
     )
     result = block0_identity.build_identity(stage, args, device="cpu")
     assert len(scanned) == 1 and result["layout"]["sp"] == 2
+    assert result["layout"]["source_resize"] == {
+        "max_short_edge": 480,
+        "max_area": 399360,
+    }
+    # A restart with the same source/model must not restore preparations made
+    # under another reference cap or source admission geometry.
+    setattr(
+        stage.config, "zing_reference_resize", dict(max_short_edge=480, max_area=399360)
+    )
+    resized = block0_identity.build_identity(stage, args, device="cpu")
+    assert block0_identity.fingerprint(resized) != block0_identity.fingerprint(result)
+    setattr(
+        stage.config, "zing_reference_resize", dict(max_short_edge=384, max_area=245760)
+    )
+    stricter = block0_identity.build_identity(stage, args, device="cpu")
+    assert block0_identity.fingerprint(stricter) != block0_identity.fingerprint(resized)
+    setattr(stage.config, "zing_reference_resize", None)
+    assert block0_identity.build_identity(stage, args, device="cpu") == result
+    scanned.clear()
     group.rank_in_group = 1
     monkeypatch.setattr(
         worker,
@@ -287,7 +306,7 @@ def test_sp_identity_scan_broadcast_and_numeric_contract_without_cuda(monkeypatc
         lambda value: {"ok": True, "models": result["model"]},
     )
     assert block0_identity.build_identity(stage, args, device="cpu") == result
-    assert len(scanned) == 1
+    assert not scanned
     monkeypatch.setattr(
         worker, "coordinate_validation", lambda value: [value, ("rank failed", None)]
     )

@@ -29,6 +29,47 @@ def bridge(plan):
     )
 
 
+@pytest.mark.parametrize("source_hw", [(2, 3), (4, 6)])
+@pytest.mark.parametrize("plan", [ChunkPlan(5), ChunkPlan([1, 2, 2])])
+def test_target_noise_is_independent_of_source_grid_and_chunking(source_hw, plan):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.streaming_noise import (
+        indexed_video_noise,
+    )
+
+    b = SourceChunkBridge(
+        plan,
+        clip_frames=17,
+        clip_latents=5,
+        temporal_ratio=4,
+        capacity_latents=10,
+        capacity_bytes=4096,
+        seed=42,
+        provenance_for=provenance,
+        target_shape=(2, 4, 6),
+    )
+    b.append(
+        torch.ones(1, 2, 5, *source_hw),
+        latent_start=0,
+        pixel_end=17,
+        source_dependency_end=17,
+    )
+    b.finish()
+    outputs = []
+    while b.ready:
+        chunk = b.pop()
+        assert chunk.source.shape[-2:] == source_hw
+        outputs.append(chunk.noise)
+    expected = indexed_video_noise(
+        (1, 2, 5, 4, 6),
+        seed=42,
+        latent_start=0,
+        purpose="target_initial",
+        device="cpu",
+        dtype=torch.float32,
+    )
+    assert torch.equal(torch.cat(outputs, 2), expected)
+
+
 @pytest.mark.parametrize("frames", list(range(1, 52)) + [240, 1440])
 @pytest.mark.parametrize(
     "plan", [ChunkPlan(5), ChunkPlan([1, 2, 2]), ChunkPlan(5, True)]

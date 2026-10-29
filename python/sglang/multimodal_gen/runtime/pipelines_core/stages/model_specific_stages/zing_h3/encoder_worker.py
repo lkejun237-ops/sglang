@@ -264,7 +264,35 @@ def main():
                             session = H3ProgressiveEncoderSession(
                                 codecs, capacity_frames=source_capacity, cache=cache
                             )
-                            source_frames, source_shape, source_ended = 0, None, False
+                            encoding = command.get("source_encoding")
+                            source_shape = None
+                            if encoding is not None:
+                                from .media_geometry import SOURCE_RESIZE_VERSION
+
+                                if (
+                                    not isinstance(encoding, dict)
+                                    or set(encoding)
+                                    != {
+                                        "width",
+                                        "height",
+                                        "resize_applied",
+                                        "algorithm",
+                                    }
+                                    or encoding["algorithm"] != SOURCE_RESIZE_VERSION
+                                    or type(encoding["resize_applied"]) is not bool
+                                    or any(
+                                        type(encoding[k]) is not int or encoding[k] < 1
+                                        for k in ("height", "width")
+                                    )
+                                ):
+                                    raise ValueError("Invalid source encoding geometry")
+                                source_shape = [encoding["height"], encoding["width"]]
+                                multiple = codecs.canvas_multiple
+                                if any(n % multiple for n in source_shape):
+                                    raise ValueError(
+                                        "Source encoding canvas is unaligned"
+                                    )
+                            source_frames, source_ended = 0, False
                         except Exception as exc:
                             logging.exception(
                                 "Encoder open preparation failed on rank %s", rank
@@ -290,7 +318,10 @@ def main():
                                 ]
                             )
                             profiler.start()
-                        reply = {"ok": True}
+                        reply = {
+                            "ok": True,
+                            "source_encoding": command.get("source_encoding"),
+                        }
                 else:
                     error = None
                     try:

@@ -34,7 +34,17 @@ from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
 
 @pytest.fixture
 def configured(tmp_path, monkeypatch):
-    raw = json.dumps({"causal": True, "h3_media_config": {"fps": 24}}).encode()
+    raw = json.dumps(
+        {
+            "causal": True,
+            "h3_media_config": {
+                "fps": 24,
+                "max_short_edge": 2048,
+                "max_area_config": {"source": 1032192},
+                "max_source_target_aspect_ratio_factor": 1.02,
+            },
+        }
+    ).encode()
     (tmp_path / "zing_config.json").write_bytes(raw)
     (tmp_path / "zing_realtime_profile.json").write_text(
         json.dumps(
@@ -640,7 +650,7 @@ def test_source_over_capacity_rejects_with_transport_error(configured):
 
     with pytest.raises(SourceTransportError) as error:
         initialize(
-            size="4096x4096",
+            size="32x32",
             source_stream={"format": "rgb24", "width": 4096, "height": 4096, "fps": 24},
         )
     assert error.value.code == "source_message_too_large"
@@ -1233,6 +1243,54 @@ def test_high_resolution_ready(configured, width, height):
     assert ready["max_message_bytes"] == DEFAULT_MESSAGE_BYTES
     assert ready["max_source_message_bytes"] == 17 * width * height * 3 + 4096
     assert ready["max_pending_source_bytes"] == 4 * 17 * width * height * 3
+
+
+@pytest.mark.parametrize("width,height", [(1280, 736), (1280, 720), (832, 480)])
+@pytest.mark.parametrize("target_width,target_height", [(832, 480), (1280, 736)])
+def test_resize_negotiates_encoded_size_but_accounts_original_bytes(
+    configured, monkeypatch, width, height, target_width, target_height
+):
+    path = Path(configured.model_path)
+    runtime = json.loads((path / "zing_config.json").read_text())
+    runtime["h3_media_config"].update(
+        max_short_edge=1024,
+        max_area_config={"source": 1280 * 1024},
+        max_source_target_aspect_ratio_factor=2.0,
+    )
+    raw = json.dumps(runtime).encode()
+    (path / "zing_config.json").write_bytes(raw)
+    profile = json.loads((path / "zing_realtime_profile.json").read_text())
+    profile["model_config_sha256"] = hashlib.sha256(raw).hexdigest()
+    (path / "zing_realtime_profile.json").write_text(json.dumps(profile))
+    adapter, session = initialize(
+        size=f"{target_width}x{target_height}",
+        source_stream=dict(format="rgb24", width=width, height=height, fps=24),
+    )
+    ready = adapter.session_ready_message(session)
+    assert ready["source_stream"]["width"] == width
+    assert ready["source_encoding"]["width"] == 832
+    assert ready["source_encoding"]["height"] == 480
+    assert ready["source_encoding"]["resize_applied"] == (width == 1280)
+    assert session.request.size == f"{target_width}x{target_height}"
+    assert session.request.realtime_preview_max_width == target_width
+    assert adapter.ledger.frame_bytes == width * height * 3
+    assert ready["max_pending_source_bytes"] == 4 * 17 * width * height * 3
+    payload = dict(client_seq=0, source_frame_start=0, num_frames=1, pts_us=0, data=b"")
+    with pytest.raises(ValueError, match="dimensions"):
+        adapter.ledger.accept(payload, event_id=1, message_bytes=100)
+    assert adapter.ledger.accepted_frames == 0
+    monkeypatch.setattr(
+        source, "build_realtime_sampling_params", lambda *a, **kw: SimpleNamespace(**kw)
+    )
+    params = adapter.build_sampling_params(
+        session,
+        configured,
+        SimpleNamespace(request_id="geometry"),
+        SimpleNamespace(prompt="Edit"),
+        1,
+    )
+    output = params.zing_request["messages"][1]["content"][0]["output"]
+    assert (output["width"], output["height"]) == (target_width, target_height)
 
 
 @pytest.mark.parametrize(

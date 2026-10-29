@@ -3,7 +3,6 @@
 
 import importlib.util
 import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -25,13 +24,16 @@ def test_fresh_socket_after_open_acknowledged_append_timeout():
     port = server.bind_to_random_port("tcp://127.0.0.1")
     owner = ["old"]
     failures = []
+    append_received = threading.Event()
+    release_append = threading.Event()
 
     def worker():
         try:
             server.recv_json()
             server.send_json({"ok": True})
             server.recv_json()
-            time.sleep(0.08)
+            append_received.set()
+            assert release_append.wait(5)
             server.send_json({"ok": True})
             command = server.recv_json()
             reply, quarantine = recovery.abort_owner(
@@ -51,20 +53,24 @@ def test_fresh_socket_after_open_acknowledged_append_timeout():
     thread.start()
     client = context.socket(zmq.REQ)
     client.setsockopt(zmq.LINGER, 0)
-    client.setsockopt(zmq.RCVTIMEO, 30)
+    client.setsockopt(zmq.RCVTIMEO, 5000)
     client.connect(f"tcp://127.0.0.1:{port}")
     try:
         client.send_json({"op": "open"})
         assert client.recv_json()["ok"]
         client.send_json({"op": "append"})
+        assert append_received.wait(5)
+        client.setsockopt(zmq.RCVTIMEO, 30)
         with pytest.raises(zmq.Again):
             client.recv_json()
         client.close()
+        release_append.set()
         reply = recovery.request_abort(port, "old", 1)
         assert reply["released"] and owner[0] is None
         thread.join(2)
         assert not thread.is_alive() and not failures
     finally:
+        release_append.set()
         client.close()
         server.close()
         context.term()
@@ -237,6 +243,7 @@ def test_actual_producer_recovers_unknown_ack_and_marks_data_failure(
         profile_dir=None,
         stage_timing_dir=None,
         remote_usage={},
+        source_geometry=None,
         admission_endpoint=None,
         accepted_frames=1,
         capacity_frames=51,
@@ -248,6 +255,14 @@ def test_actual_producer_recovers_unknown_ack_and_marks_data_failure(
     )
     remote_encoder.RemoteEncoderSession._produce(session)
     assert session.failure is not None and len(recovered) == 1
+    assert [command["op"] for command in sent] == (
+        ["open", "append"] if failure_at == "append_ack" else ["open"]
+    )
+    if failure_at == "bridge_setup":
+        assert isinstance(session.failure, RuntimeError)
+        assert str(session.failure) == "Injected bridge failure"
+    else:
+        assert isinstance(session.failure, zmq.Again)
     assert recovered[0][0] == (31001, "old", 1)
     assert recovered[0][1]["require_restart"] == (failure_at == "bridge_setup")
     assert all(command["op"] != "close" for command in sent)
