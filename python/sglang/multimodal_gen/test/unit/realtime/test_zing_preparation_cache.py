@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
     H3InferenceInputs,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.preparation_cache import (
+    Block0PreparationCache,
     inputs_on,
     preparation_key,
 )
@@ -223,3 +224,50 @@ def test_fill_starts_on_dispatch_after_output():
     state.block0_cache.fill.assert_called_once()
     state._fill_block0_after_output()
     state.block0_cache.fill.assert_called_once()
+
+
+def test_fill_accepts_host_positions_and_waits_on_kv_device(monkeypatch):
+    stream = NS(device=torch.device("cuda:0"), wait_stream=Mock())
+    done = NS(record=Mock(), synchronize=Mock())
+    empty = torch.empty
+
+    def allocate(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", allocate)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: stream)
+    monkeypatch.setattr(torch.cuda, "Event", lambda: done)
+    monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
+    store = NS(k=torch.zeros(8, 2, 3))
+    pool = NS(
+        _pool=NS(_slots=[NS(kv_cache=[store])]),
+        plan=NS(config=NS(max_prefix_rows=8)),
+    )
+    owner = Block0PreparationCache(
+        pool, max_bytes=2 * 8 * 2 * 3 * 4, identity={}, disk_cache=None
+    )
+    positions = torch.arange(9).reshape(3, 3)
+    cache = NS(
+        prefix=NS(
+            positions=positions,
+            layers=[(torch.ones(3, 2, 3), torch.full((3, 2, 3), 2.0))],
+        ),
+        _model_signature="model",
+    )
+
+    def current_stream(device):
+        if device.type != "cuda":
+            raise ValueError(f"Expected a cuda device, but got: {device}")
+        assert device == owner.stream.device
+        return stream
+
+    monkeypatch.setattr(torch.cuda, "current_stream", current_stream)
+    owner.fill("host-positions", inputs(), "condition", "request", cache)
+    assert not owner.entries  # Publish only after the asynchronous copy finishes.
+    owner.finish_fill()
+    entry = owner.entries["host-positions"]
+    assert torch.equal(entry.positions, positions)
+    assert torch.equal(entry.data[0, 0], cache.prefix.layers[0][0])
+    assert torch.equal(entry.data[0, 1], cache.prefix.layers[0][1])
+    done.synchronize.assert_called_once()

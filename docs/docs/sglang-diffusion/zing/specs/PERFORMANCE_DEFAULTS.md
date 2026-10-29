@@ -3,6 +3,14 @@
 基于主线 `df69ad4265` 梳理最近合入的优化。下表环境变量均省略
 `SGLANG_ZING_` 前缀（单独注明者除外）。显式设置仍优先于默认值。
 
+Source 流水线默认采用 quantum=1、cross_chunk、async output、defer-final、
+prompt-joint，Zing 校验后的 realtime 会话容量为 1（公共默认保持 8）。remote Qwen 默认 conditioning prefetch，
+remote Encoder 默认 overlap + prefetch，独立 remote Decoder 在 quantum=1
+时默认 overlap；本地组件保留本地路径。布尔开关可显式传 false，详见
+[流水线默认值与兼容边界](../plans/PIPELINE_DEFAULTS.md)。
+Block0 cache 沿用 #455 的默认 on 和 host/disk 字节预算，旧 overlap/entries
+环境变量已移除，不应继续配置。
+
 | 字段 | 默认值 | 用途 |
 | --- | --- | --- |
 | `FUSED_HISTORY_ROPE` | `1`（本次开启） | 融合历史 K RoPE；不支持的设备和布局仍回退 |

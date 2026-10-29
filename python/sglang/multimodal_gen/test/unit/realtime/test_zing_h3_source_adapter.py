@@ -1932,7 +1932,10 @@ def test_reference_count_cli_does_not_add_setting_to_other_models():
     assert not hasattr(config, "zing_reference_max_images")
 
 
-def test_prompt_prefetch_publishes_before_dispatch_and_closes(configured, monkeypatch):
+@pytest.mark.parametrize("enabled", [None, True, False])
+def test_prompt_prefetch_publishes_before_dispatch_and_closes(
+    configured, monkeypatch, enabled
+):
     from sglang.multimodal_gen.runtime.conditioning import prefetch
 
     class Publisher:
@@ -1948,11 +1951,15 @@ def test_prompt_prefetch_publishes_before_dispatch_and_closes(configured, monkey
             self.closed = True
 
     monkeypatch.setattr(prefetch, "PromptPrefetchPublisher", Publisher)
-    configured.zing_conditioning_prefetch = True
+    configured.zing_conditioning_prefetch = enabled
     configured.zing_conditioning_mode = "remote"
     _enable_reference_updates(configured)
     adapter, session = initialize()
     publisher = adapter.prompt_prefetch
+    if enabled is False:
+        assert publisher is None
+        adapter.clear_state(session)
+        return
     ws = PromptSocket()
 
     async def run():
@@ -2224,6 +2231,67 @@ def test_cli_source_policy_reaches_worker_command(configured, monkeypatch, quant
         assert command["encoder"]["remote"]["admission_endpoint"].startswith("ipc:///")
         assert command["decoder"]["remote"]["port"] == 31007
         assert profile_path.read_bytes() == original
+    finally:
+        adapter.clear_state(session)
+
+
+@pytest.mark.parametrize("remote_codecs", [False, True])
+def test_server_defaults_reach_source_command(configured, monkeypatch, remote_codecs):
+    from unittest.mock import patch
+
+    from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+    from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
+        ZingH3CausalPipelineConfig,
+    )
+    from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+    # The adapter consumes validated Zing values, not public class defaults.
+    with patch.object(
+        PipelineConfig,
+        "from_kwargs",
+        return_value=ZingH3CausalPipelineConfig(decoder_config={"type": "official_h3"}),
+    ):
+        validated = ServerArgs.from_dict({"model_path": str(configured.model_path)})
+
+    for name in (
+        "zing_source_encoder_mode",
+        "zing_source_encoder_prefetch",
+        "zing_source_async_output",
+        "zing_source_joint_forward",
+        "zing_source_work_quantum",
+        "zing_source_defer_final",
+        "zing_source_prompt_joint",
+        "zing_source_decoder_overlap",
+        "zing_conditioning_prefetch",
+        "realtime_max_sessions",
+        "realtime_max_sessions_per_worker",
+    ):
+        setattr(configured, name, getattr(validated, name))
+    if remote_codecs:
+        configured.disagg_encoder_port = 31005
+        configured.disagg_decoder_port = 31007
+    monkeypatch.setattr(
+        source.BaseRealtimeModelAdapter,
+        "prepare_next_request",
+        lambda *a: SimpleNamespace(extra={}, block_idx=0),
+    )
+    adapter, session = initialize()
+    try:
+        command = adapter.prepare_next_request(session, configured, None).extra[
+            "zing_source_command"
+        ]
+        command = msgspec.msgpack.decode(msgspec.msgpack.encode(command))
+        assert command["work_quantum"] == 1
+        assert command["defer_final"] is True and command["prompt_joint"] is True
+        assert command["async_output"] is True
+        assert adapter.profile["joint_forward"] == "cross_chunk"
+        assert adapter.source_decoder_overlap is remote_codecs
+        if remote_codecs:
+            assert command["encoder"]["remote"]["mode"] == "overlap"
+            assert command["encoder"]["remote"]["cross_dispatch_prefetch"] is True
+        else:
+            assert "remote" not in command["encoder"]
+        assert adapter.prompt_prefetch is None  # Local Qwen needs no publisher.
     finally:
         adapter.clear_state(session)
 

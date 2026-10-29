@@ -369,7 +369,8 @@ class Block0PreparationCache:
             slot,
             broadcast_receipt(uuid.uuid4().hex),
         )
-        self.stream.wait_stream(torch.cuda.current_stream(prefix.positions.device))
+        # Positions may stay on the host; the transfer stream owns the KV device.
+        self.stream.wait_stream(torch.cuda.current_stream(self.stream.device))
         done = torch.cuda.Event()
         with torch.cuda.stream(self.stream):
             for layer, (k, v) in enumerate(prefix.layers):

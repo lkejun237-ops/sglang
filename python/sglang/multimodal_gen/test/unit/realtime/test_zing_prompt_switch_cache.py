@@ -37,7 +37,12 @@ def cpu_dma(monkeypatch):
         preparation_cache,
     )
 
-    stream = NS(wait_stream=Mock(), wait_event=Mock(), synchronize=Mock())
+    stream = NS(
+        device=torch.device("cuda:0"),
+        wait_stream=Mock(),
+        wait_event=Mock(),
+        synchronize=Mock(),
+    )
     events = []
 
     class Event:

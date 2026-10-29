@@ -455,16 +455,16 @@ class ServerArgs(DisaggServerArgsMixin):
     enable_torch_compile: bool = False
     enable_cuda_graph: bool = False
     zing_conditioning_mode: str = "local"
-    zing_conditioning_prefetch: bool = False
-    zing_source_decoder_overlap: bool = False
-    # None preserves legacy environment/profile settings; explicit false overrides them.
-    zing_source_work_quantum: int | None = None
+    # None enables overlap only when the required remote service is available.
+    zing_conditioning_prefetch: bool | None = None
+    zing_source_decoder_overlap: bool | None = None
+    zing_source_work_quantum: int | None = 1
     zing_source_encoder_mode: str | None = None
-    zing_source_joint_forward: str | None = None
+    zing_source_joint_forward: str | None = "cross_chunk"
     zing_source_encoder_prefetch: bool | None = None
-    zing_source_async_output: bool | None = None
-    zing_source_defer_final: bool | None = None
-    zing_source_prompt_joint: bool | None = None
+    zing_source_async_output: bool | None = True
+    zing_source_defer_final: bool | None = True
+    zing_source_prompt_joint: bool | None = True
     conditioning_result_transport: str | None = None
     encoder_gpus: str | None = None
     denoiser_gpus: str | None = None
@@ -2182,13 +2182,13 @@ class ServerArgs(DisaggServerArgsMixin):
             "--zing-conditioning-prefetch",
             action=StoreBoolean,
             default=ServerArgs.zing_conditioning_prefetch,
-            help="Prepare received prompt updates during in-flight DiT work (remote, single session).",
+            help="Default: enabled with remote conditioning and one active session. Prepare prompt updates during in-flight DiT work; false disables it.",
         )
         parser.add_argument(
             "--zing-source-decoder-overlap",
             action=StoreBoolean,
             default=ServerArgs.zing_source_decoder_overlap,
-            help="Overlap dedicated source decoding/output with the next DiT block (single session, source quantum 1).",
+            help="Default: enabled with a dedicated decoder, one active session and source quantum 1. Overlap source output with the next DiT block; false disables it.",
         )
         parser.add_argument(
             "--conditioning-result-transport",
@@ -2200,40 +2200,45 @@ class ServerArgs(DisaggServerArgsMixin):
             "--zing-source-work-quantum",
             type=int,
             choices=(0, 1),
-            default=None,
-            help="Maximum DiT advances per source dispatch (0: unrestricted, 1: one). Overrides SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM.",
+            default=ServerArgs.zing_source_work_quantum,
+            help="Default: 1. Maximum DiT advances per source dispatch (0: unrestricted, 1: one). Overrides SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM.",
         )
         parser.add_argument(
             "--zing-source-encoder-mode",
             choices=("serial", "overlap"),
             default=None,
-            help="Override source_encoder.remote.mode in the deployment profile; requires a remote Encoder.",
+            help="Default: overlap for a remote Encoder. Explicit serial/overlap requires a remote Encoder.",
         )
         parser.add_argument(
             "--zing-source-joint-forward",
             choices=("off", "source_first", "cross_chunk"),
-            default=None,
-            help="Override joint_forward in the source deployment profile; default preserves profile (cross_chunk if absent).",
+            default=ServerArgs.zing_source_joint_forward,
+            help="Default: cross_chunk. Override joint_forward in the source deployment profile.",
         )
         for flag, help_text in (
             (
                 "--zing-source-encoder-prefetch",
-                "Override source_encoder.remote.cross_dispatch_prefetch; requires a remote Encoder in overlap mode.",
+                "Default: enabled for a remote Encoder in overlap mode. Override cross_dispatch_prefetch; false disables it.",
             ),
             (
                 "--zing-source-async-output",
-                "Override async_source_output: materialize worker output asynchronously.",
+                "Default: true. Override async_source_output: materialize worker output asynchronously.",
             ),
             (
                 "--zing-source-defer-final",
-                "Override experimental SGLANG_ZING_SOURCE_DEFER_FINAL; requires source quantum 1.",
+                "Default: true. Override SGLANG_ZING_SOURCE_DEFER_FINAL; requires source quantum 1.",
             ),
             (
                 "--zing-source-prompt-joint",
-                "Override experimental SGLANG_ZING_SOURCE_PROMPT_JOINT.",
+                "Default: true. Override SGLANG_ZING_SOURCE_PROMPT_JOINT.",
             ),
         ):
-            parser.add_argument(flag, action=StoreBoolean, default=None, help=help_text)
+            parser.add_argument(
+                flag,
+                action=StoreBoolean,
+                default=getattr(ServerArgs, flag[2:].replace("-", "_")),
+                help=help_text,
+            )
         parser.add_argument(
             "--zing-conditioning-mode",
             choices=("local", "remote"),

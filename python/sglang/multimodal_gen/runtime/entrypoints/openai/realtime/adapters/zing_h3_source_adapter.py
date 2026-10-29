@@ -69,18 +69,15 @@ def _with_source_pipeline_policy(
     joint_forward=None,
 ):
     """Overlay deployment-only switches without mutating the exported profile."""
-    if all(
-        value is None
-        for value in (encoder_mode, encoder_prefetch, async_output, joint_forward)
-    ):
-        return profile
     result = deepcopy(profile)
     remote = result.get("source_encoder", {}).get("remote")
     if encoder_mode is not None or encoder_prefetch is True:
         if remote is None:
             raise ValueError("Source encoder CLI policy requires a remote Encoder")
-    if encoder_mode is not None:
-        remote["mode"] = encoder_mode
+    if remote is not None:
+        remote["mode"] = encoder_mode if encoder_mode is not None else "overlap"
+        if encoder_prefetch is None:
+            encoder_prefetch = remote["mode"] == "overlap"
     if encoder_prefetch is not None and remote is not None:
         remote["cross_dispatch_prefetch"] = encoder_prefetch
     if async_output is not None:
@@ -433,9 +430,14 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             )
         if self.source_defer_final and self.source_work_quantum != 1:
             raise ValueError("Deferred source final currently requires work quantum 1")
-        self.source_decoder_overlap = getattr(
-            args, "zing_source_decoder_overlap", False
-        )
+        self.source_decoder_overlap = getattr(args, "zing_source_decoder_overlap", None)
+        if self.source_decoder_overlap is None:
+            self.source_decoder_overlap = (
+                self.source_work_quantum == 1
+                and "remote" in profile.get("source_decoder", {})
+                and getattr(args, "realtime_max_sessions", 1) == 1
+                and getattr(args, "realtime_max_sessions_per_worker", 1) == 1
+            )
         if self.source_decoder_overlap and (
             self.source_work_quantum != 1
             or "remote" not in profile.get("source_decoder", {})
@@ -462,7 +464,14 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         self.admission_socket = self.admission_context = None
         if not prefill:
             self._initialize_source_admission(session, limits)
-        if not prefill and getattr(args, "zing_conditioning_prefetch", False):
+        conditioning_prefetch = getattr(args, "zing_conditioning_prefetch", None)
+        if conditioning_prefetch is None:
+            conditioning_prefetch = (
+                getattr(args, "zing_conditioning_mode", "local") == "remote"
+                and getattr(args, "realtime_max_sessions", 1) == 1
+                and getattr(args, "realtime_max_sessions_per_worker", 1) == 1
+            )
+        if not prefill and conditioning_prefetch:
             from sglang.multimodal_gen.runtime.conditioning.prefetch import (
                 PromptPrefetchPublisher,
             )
