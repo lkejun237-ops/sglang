@@ -91,6 +91,37 @@ def prepare_case(label, media_root, output):
     return prepared
 
 
+def case_geometry(
+    case, *, width=None, height=None, source_width=None, source_height=None
+):
+    """Derive a case while retaining its frozen assets and original canvas."""
+    for label, w, h in [
+        ("output", width, height),
+        ("source", source_width, source_height),
+    ]:
+        if (w is None) != (h is None) or (w is not None and min(w, h) < 1):
+            raise ValueError(f"Specify positive {label} width and height together")
+    if width is None and source_width is None:
+        return case
+    derived = dict(
+        case,
+        original_case_id=case["case_id"],
+        original_manifest_dimensions=[case["width"], case["height"]],
+    )
+    if width is not None:
+        derived.update(width=width, height=height)
+    if source_width is not None:
+        derived.update(source_width=source_width, source_height=source_height)
+    sw, sh = (
+        derived.get("source_width", derived["width"]),
+        derived.get("source_height", derived["height"]),
+    )
+    derived["case_id"] += (
+        f"-source-{sw}x{sh}-output-{derived['width']}x{derived['height']}"
+    )
+    return derived
+
+
 async def benchmark(cases, args):
     results = []
     config = {
@@ -153,6 +184,15 @@ async def benchmark(cases, args):
                         "--batch-pattern",
                         *map(str, args.batch_pattern),
                     ]
+                    if "source_width" in case:
+                        command.extend(
+                            [
+                                "--source-width",
+                                str(case["source_width"]),
+                                "--source-height",
+                                str(case["source_height"]),
+                            ]
+                        )
                     for path, media_id in zip(
                         case["references"], case["reference_ids"], strict=True
                     ):
@@ -383,6 +423,18 @@ def main():
     parser.add_argument("--paced", action="store_true")
     parser.add_argument("--no-stage-timing", action="store_true")
     parser.add_argument(
+        "--width",
+        type=int,
+        help="Override the generated canvas width; pair with --height",
+    )
+    parser.add_argument("--height", type=int)
+    parser.add_argument(
+        "--source-width",
+        type=int,
+        help="Source RGB width; pair with --source-height; requires a resize-enabled server",
+    )
+    parser.add_argument("--source-height", type=int)
+    parser.add_argument(
         "--prompt-updates",
         type=Path,
         help="Prompt update manifest for each serial request",
@@ -415,6 +467,23 @@ def main():
         prepare_case(label, args.media_root, args.output_dir / "cases" / label)
         for label in labels
     ]
+    try:
+        cases = [
+            case_geometry(
+                case,
+                width=args.width,
+                height=args.height,
+                source_width=args.source_width,
+                source_height=args.source_height,
+            )
+            for case in cases
+        ]
+    except ValueError as exc:
+        parser.error(str(exc))
+    for case in cases:
+        write_json(
+            args.output_dir / "cases" / case["label"] / "streaming-case.json", case
+        )
     asyncio.run(benchmark(cases, args))
     if args.prewarm_only:
         rows = json.loads((args.output_dir / "results.json").read_text())["requests"]

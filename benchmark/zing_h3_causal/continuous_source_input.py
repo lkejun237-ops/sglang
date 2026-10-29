@@ -14,9 +14,22 @@ async def read_packet(reader, size):
         return exc.partial
 
 
+def source_dimensions(args):
+    width = getattr(args, "source_width", None)
+    height = getattr(args, "source_height", None)
+    if (width is None) != (height is None):
+        raise ValueError("Specify source width and height together")
+    if width is None:
+        width, height = args.width, args.height
+    if min(width, height) < 1:
+        raise ValueError("Source dimensions must be positive")
+    return width, height
+
+
 @asynccontextmanager
 async def open_source(args, frame_bytes, stderr_path):
     if getattr(args, "source_video", None):
+        width, height = source_dimensions(args)
         with stderr_path.open("wb") as stderr:
             process = await asyncio.create_subprocess_exec(
                 args.ffmpeg,
@@ -29,7 +42,7 @@ async def open_source(args, frame_bytes, stderr_path):
                 "0:v:0",
                 "-an",
                 "-vf",
-                f"scale={args.width}:{args.height}:flags=bilinear",
+                f"scale={width}:{height}:flags=bilinear",
                 "-vsync",
                 "0",
                 "-pix_fmt",

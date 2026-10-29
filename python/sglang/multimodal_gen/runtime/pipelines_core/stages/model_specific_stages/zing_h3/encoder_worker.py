@@ -80,6 +80,13 @@ def load_encoder(root):
     codecs = object.__new__(ZingH3Codecs)
     codecs.modules = {"video_vae": model.cuda().eval()}
     codecs.va = config.arch_config
+    # This lightweight path skips ZingH3Codecs.__init__; mirror its RGB grid
+    # initialization for the source geometry handshake's alignment check.
+    # Read only DiT metadata: VAE spatial ratio * patch_size[2] (width, in T/H/W).
+    codecs.patch_size = tuple(
+        json.loads((root / "transformer/config.json").read_text())["patch_size"]
+    )
+    codecs.canvas_multiple = codecs.va.spatial_compression_ratio * codecs.patch_size[2]
     codecs.temporal_ratio = codecs.va.temporal_compression_ratio
     codecs.vae_frames_per_chunk = codecs.va.vae_clip_length
     codecs.vae_latents_per_chunk = math.ceil(

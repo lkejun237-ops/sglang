@@ -395,3 +395,33 @@ python3 -m pytest -q benchmark/zing_h3_causal/tests/test_bench_client.py
 
 全50层三目标的场景、运行版本、phase 与算子口径，以及离线报告重建命令见
 [完整链路实测](STAGE_TIMING.md#全50层完整链路实测2026-10-19)。
+
+### 连续 source 的独立输入与输出尺寸
+
+`bench_streaming_source.py` 可保留标准 case 的素材、参考图、prompt 与帧数，显式派生
+输出尺寸及 source RGB 尺寸。例如测试 **source 832×480、输出 1280×736**：
+
+```bash
+python3 benchmark/zing_h3_causal/bench_streaming_source.py \
+  --url ws://127.0.0.1:30000/v1/realtime_video/generate \
+  --media-root /data/media --output-dir /data/benchmark/source480-output736 \
+  --case 30s-wasteland --width 1280 --height 736 \
+  --source-width 832 --source-height 480 \
+  --warmup-runs 2 --measured-runs 3 --no-stage-timing
+```
+
+本 PR 的客户端已支持独立 source 几何：视频解码、RGB 字节计数、传输声明与 credit
+使用 source 尺寸，输出 RGB 校验使用 output 尺寸；raw 文件和管道必须提供声明尺寸的 RGB24。
+服务端尺寸解耦仍依赖 [PR #370](https://github.com/seedleap/sglang/pull/370)（2026-10-29仍未合入）；
+benchmark 参数不会自行启用服务端尺寸解耦。
+服务端必须显式启用 `zing_source_resize={"max_short_edge":480,"max_area":399360}`。
+客户端先把视频解码为声明的 source 尺寸，服务端仍按输出 canvas 生成 target noise、
+DiT target latent 和 Decoder RGB；不得把 source 缩小后又放大来代替此路径。
+本轮快配方同时启用 `zing_reference_resize`，取相同短边和面积上限；两项策略均由部署配置记录。
+省略尺寸参数时保持标准 manifest 的尺寸；宽高必须成对指定。
+
+派生 case 保留 `original_case_id`、`original_manifest_dimensions` 和资产身份，另记录
+`source_width/source_height`、输出 `width/height` 及含两种 canvas 的新 case ID。
+比较结果时核对实际 Encoder shape、target latent shape 和 Decoder 输出，不仅检查 CLI。
+全程 FPS 与首包后 FPS仍按输出帧统计。Source VAE、DiT、独立 Decoder 的实际 CUDA
+执行区间应另采诊断；调用方提交 remote decode 的 Host scope 不能当作 Decoder 耗时。

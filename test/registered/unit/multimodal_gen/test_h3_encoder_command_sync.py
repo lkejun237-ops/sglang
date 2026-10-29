@@ -9,13 +9,13 @@ transport or rank-agreement collective is mocked.
 import importlib.util
 import json
 import multiprocessing as mp
-import queue
 import socket as socket_module
 import sys
 import time
 import unittest
 import uuid
 from datetime import timedelta
+from multiprocessing.connection import wait
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
@@ -53,7 +53,7 @@ def _worker(
     torch.set_num_threads(1)
 
     def event(kind, **fields):
-        events.put(dict(kind=kind, rank=rank, **fields))
+        events.send(dict(kind=kind, rank=rank, **fields))
 
     class DistBoundary:
         def __getattr__(self, name):
@@ -300,7 +300,11 @@ def _worker(
 class _Service:
     def __init__(self, path, world=3, mode="normal"):
         context = mp.get_context("spawn")
-        self.events = context.Queue()
+        # A killed Queue writer can die holding its shared feeder lock and
+        # strand surviving workers at process exit. Give each rank its own
+        # synchronous event pipe so fault injection cannot poison its peers.
+        event_pipes = [context.Pipe(duplex=False) for _ in range(world)]
+        self.events = [reader for reader, _ in event_pipes]
         self.gate = context.Event()
         self.bridge_gate = context.Event()
         self.bootstrap_release = context.Event()
@@ -323,7 +327,7 @@ class _Service:
                     world,
                     "file://" + str(path),
                     self.port,
-                    self.events,
+                    event_pipes[rank][1],
                     self.gate,
                     self.bridge_gate,
                     self.bootstrap_release,
@@ -334,6 +338,8 @@ class _Service:
         ]
         for process in self.processes:
             process.start()
+        for _, writer in event_pipes:
+            writer.close()
         try:
             # Imports and fixture setup have their own budget; only release the
             # ranks into the real short-watchdog rendezvous once all are ready.
@@ -354,11 +360,15 @@ class _Service:
             raise
 
     def drain(self):
-        while True:
-            try:
-                self.rows.append(self.events.get_nowait())
-            except queue.Empty:
-                return self.rows
+        for reader in list(self.events):
+            while reader.poll():
+                try:
+                    self.rows.append(reader.recv())
+                except EOFError:
+                    self.events.remove(reader)
+                    reader.close()
+                    break
+        return self.rows
 
     def wait_for(self, predicate, timeout=5):
         deadline = time.monotonic() + timeout
@@ -366,10 +376,7 @@ class _Service:
             self.drain()
             if predicate(self.rows):
                 return
-            try:
-                self.rows.append(self.events.get(timeout=0.05))
-            except queue.Empty:
-                pass
+            wait(self.events, timeout=0.05)
         raise AssertionError(
             f"Encoder events did not reach expected state: {self.rows}"
         )
@@ -423,8 +430,8 @@ class _Service:
                 process.join(5)
         self.client.close()
         self.context.term()
-        self.events.close()
-        self.events.join_thread()
+        for reader in self.events:
+            reader.close()
 
 
 class TestH3EncoderCommandSync(CustomTestCase):

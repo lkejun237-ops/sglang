@@ -245,6 +245,8 @@ def test_custom_collection_preflight_uses_existing_nondefault_case(
             "--output-dir",
             str(out),
             "--preflight-only",
+            "--source-revision",
+            "0" * 40,
         ]
     )
     config = json.loads((out / "config.json").read_text())
@@ -427,6 +429,8 @@ async def streaming_peer(
     observations.append(init)
     width, height = (init["source_stream"][key] for key in ("width", "height"))
     stride = width * height * 3
+    output_width, output_height = map(int, init["size"].split("x"))
+    output_stride = output_width * output_height * 3
     await send(
         dict(
             type="session.ready",
@@ -493,6 +497,7 @@ async def streaming_peer(
         packet = message["payload"]
         assert packet["source_frame_start"] == frames
         count = packet["num_frames"]
+        assert len(packet["data"]) == count * stride
         assert count <= 2
         start, frames = frames, frames + count
         source_id = packet["client_seq"] + 1
@@ -523,12 +528,12 @@ async def streaming_peer(
                 event_id=active_prompt,
                 output_frame_start=start,
                 num_frames=count,
-                total_size=count * stride,
+                total_size=count * output_stride,
                 format="rgb24",
                 encoding="raw",
                 channels=3,
-                width=width,
-                height=height,
+                width=output_width,
+                height=output_height,
                 pts_us=start * 1_000_000 // 24,
                 source_dependency_end=frames,
                 source_alignment=[
@@ -543,7 +548,9 @@ async def streaming_peer(
         )
         if start == 0 and first_payload_delay:
             await asyncio.sleep(first_payload_delay)
-        await ws.send(packet["data"])
+        await ws.send(
+            packet["data"] if output_stride == stride else bytes(count * output_stride)
+        )
 
 
 @pytest.mark.parametrize("paced", [False, True])
@@ -1616,3 +1623,178 @@ def test_streaming_client_rejects_removed_user_media_option(capsys):
         )
     assert error.value.code == 2
     assert "unrecognized arguments: --user-media" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"width": 1280},
+        {"source_height": 480},
+        {"source_width": 0, "source_height": 480},
+    ],
+)
+def test_streaming_case_rejects_incomplete_or_nonpositive_dimensions(kwargs):
+    from bench_streaming_source import case_geometry
+
+    with pytest.raises(ValueError):
+        case_geometry({"case_id": "fixed", "width": 832, "height": 480}, **kwargs)
+
+
+def test_streaming_case_records_source_and_output_separately_without_mutating_manifest():
+    from bench_streaming_source import case_geometry
+
+    original = {
+        "case_id": "fixed",
+        "width": 832,
+        "height": 480,
+        "assets": [{"sha256": "frozen"}],
+    }
+    derived = case_geometry(
+        original, width=1280, height=736, source_width=832, source_height=480
+    )
+    assert (derived["width"], derived["height"]) == (1280, 736)
+    assert (derived["source_width"], derived["source_height"]) == (832, 480)
+    assert derived["original_case_id"] == original["case_id"]
+    assert derived["case_id"] != original["case_id"]
+    assert derived["assets"] == original["assets"]
+    assert original == {
+        "case_id": "fixed",
+        "width": 832,
+        "height": 480,
+        "assets": [{"sha256": "frozen"}],
+    }
+    assert case_geometry(original) is original
+
+
+@pytest.mark.parametrize("source_format", ["rgb", "video"])
+def test_streaming_benchmark_runs_independent_source_geometry(
+    tmp_path, monkeypatch, source_format
+):
+    import asyncio
+    import shutil
+    import subprocess
+    from types import SimpleNamespace
+
+    import bench_streaming_source as streaming
+    import imageio_ffmpeg
+    import websockets
+
+    raw = bytes(range(72))  # Six 2x2 RGB frames; output is 4x2.
+    source = tmp_path / "source.rgb"
+    source.write_bytes(raw)
+    ffmpeg = shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe()
+    video = tmp_path / "source.mkv"
+    subprocess.run(
+        [
+            ffmpeg,
+            "-v",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            "2x2",
+            "-r",
+            "24",
+            "-i",
+            str(source),
+            "-c:v",
+            "ffv1",
+            str(video),
+        ],
+        check=True,
+    )
+    native_run = streaming.run
+
+    async def run_client(args):
+        # Exercise the real benchmark parser and runtime, including the raw reader.
+        if source_format == "rgb":
+            args.source_video = None
+            args.source_rgb = str(source)
+        return await native_run(args)
+
+    monkeypatch.setattr(streaming, "run", run_client)
+    case = streaming.case_geometry(
+        dict(
+            label="5s",
+            case_id="fixture",
+            frames=6,
+            width=2,
+            height=2,
+            source_video=str(video),
+            prompt="test",
+            references=[],
+            reference_ids=[],
+        ),
+        width=4,
+        height=2,
+        source_width=2,
+        source_height=2,
+    )
+    observations = []
+
+    async def exercise():
+        async with websockets.serve(
+            lambda ws: streaming_peer(ws, observations), "127.0.0.1", 0
+        ) as server:
+            args = SimpleNamespace(
+                output_dir=tmp_path,
+                paced=False,
+                warmup_runs=0,
+                measured_runs=1,
+                seed=123,
+                url=f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
+                timeout=10,
+                ffmpeg=ffmpeg,
+                batch_pattern=[17],
+                prompt_updates=None,
+                no_stage_timing=True,
+            )
+            return await streaming.benchmark([case], args)
+
+    summary = asyncio.run(exercise())
+    assert summary["5s"]["succeeded"] == 1
+    init = observations[0]
+    assert init["size"] == "4x2"
+    assert init["source_stream"] == dict(format="rgb24", width=2, height=2, fps=24)
+    result_dir = tmp_path / "5s" / "measured-0"
+    result = json.loads((result_dir / "summary.json").read_text())
+    assert result["submitted"] == result["consumed"] == result["received"] == 6
+    import hashlib
+
+    assert result["input_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert (result_dir / "output.rgb").stat().st_size == 6 * 4 * 2 * 3
+
+
+@pytest.mark.parametrize(
+    "dimensions",
+    [
+        ["--source-width", "2"],
+        ["--source-height", "2"],
+        ["--source-width", "0", "--source-height", "2"],
+        ["--source-width", "2", "--source-height", "-1"],
+    ],
+)
+def test_streaming_client_rejects_invalid_source_dimensions_before_io(
+    tmp_path, dimensions
+):
+    import asyncio
+
+    from continuous_source_client import parser, run
+
+    output = tmp_path / "result"
+    args = parser().parse_args(
+        [
+            "--source-rgb",
+            "missing.rgb",
+            "--output",
+            str(output),
+            "--prompt",
+            "p",
+            *dimensions,
+        ]
+    )
+    with pytest.raises(ValueError, match="[Ss]ource"):
+        asyncio.run(run(args))
+    assert not output.exists()

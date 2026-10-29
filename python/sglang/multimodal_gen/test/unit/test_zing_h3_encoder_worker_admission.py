@@ -315,3 +315,74 @@ def test_deployment_admission_capacity_is_single_session_for_zing(monkeypatch, z
         args.realtime_max_sessions == args.realtime_max_sessions_per_worker == expected
     )
     assert capacities == [expected]
+
+
+@pytest.mark.parametrize("patch_size,expected", [([1, 1, 1], 16), ([1, 2, 2], 32)])
+def test_lightweight_encoder_loader_initializes_exported_spatial_grid(
+    monkeypatch, tmp_path, patch_size, expected
+):
+    """Source geometry negotiation needs the grid even without full Codecs init."""
+    import safetensors.torch
+
+    from sglang.multimodal_gen.configs.models.vaes import (
+        minimax_h3_video as config_module,
+    )
+    from sglang.multimodal_gen.runtime.loader import utils as loader_utils
+    from sglang.multimodal_gen.runtime.loader.component_loaders import vae_loader
+    from sglang.multimodal_gen.runtime.models.vaes import minimax_h3 as model_module
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        codecs as codecs_module,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        encoder_worker,
+    )
+
+    class Config:
+        arch_config = SimpleNamespace(
+            spatial_compression_ratio=16,
+            temporal_compression_ratio=4,
+            vae_clip_length=17,
+        )
+
+        def update_model_arch(self, value):
+            assert value == {}
+
+    class Model:
+        def __init__(self):
+            self.decoder = None
+            self.post_quant_conv = None
+
+        def cuda(self):
+            return self
+
+        def eval(self):
+            return self
+
+        def state_dict(self):
+            return {}
+
+    monkeypatch.setattr(config_module, "MiniMaxH3VideoVAEConfig", Config)
+    monkeypatch.setattr(model_module, "MiniMaxH3VideoVAE", lambda config: Model())
+    monkeypatch.setattr(safetensors.torch, "load_file", lambda path: {})
+    monkeypatch.setattr(
+        vae_loader, "_consume_vae_checkpoint_arch_metadata", lambda *args: None
+    )
+    monkeypatch.setattr(
+        loader_utils, "load_model_state_dict", lambda *args, **kwargs: None
+    )
+    prepared = []
+    monkeypatch.setattr(
+        codecs_module.ZingH3Codecs,
+        "prepare_visual_encoder_weights",
+        lambda self: prepared.append(self.canvas_multiple),
+    )
+    (tmp_path / "video_vae").mkdir()
+    (tmp_path / "video_vae/config.json").write_text("{}")
+    (tmp_path / "transformer").mkdir()
+    (tmp_path / "transformer/config.json").write_text(
+        json.dumps({"patch_size": patch_size})
+    )
+    (tmp_path / "zing_config.json").write_text("{}")
+    codecs = encoder_worker.load_encoder(tmp_path)
+    assert codecs.canvas_multiple == expected
+    assert prepared == [expected]

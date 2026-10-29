@@ -684,7 +684,8 @@ def test_timed_out_output_releases_owner_before_next_session(monkeypatch):
     assert not errors
 
 
-def test_decoder_loop_acknowledges_every_payload_free_op():
+@pytest.mark.parametrize("session_field", [{}, {"session": "forged-owner"}])
+def test_decoder_loop_acknowledges_every_payload_free_op(session_field):
     """Append must reply ok; a null reply reached the DiT and failed the whole session."""
     replies, error = _run_decoder_loop(
         [
@@ -705,6 +706,7 @@ def test_decoder_loop_acknowledges_every_payload_free_op():
                 request_id="request-1",
                 chunk_index=0,
                 generation_id="generation-1",
+                **session_field,
             ),
             dict(op="finish", channel="$open", total_frames=4),
             dict(op="close", channel="$open"),

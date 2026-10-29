@@ -716,3 +716,33 @@ PR #414 将 `seedleap-kernels` 的前序融合算子接入 Zing H3 DiT 主循环
 2026-10-25，`c0d0687832`加相同七项兼容覆盖，在原B300/L20D四卡、Thai r10、832×480全异步/W6/S3/Graph OFF条件复测。三例首批后FPS24.20/23.61/23.60，prompt到新RGB1.304/1.437/1.479秒，未见明显总体或切换收益；原对应174/171ms间隔降至约51.8/51.4ms，三次诊断无DiT调用62→0，但后段仍受joint lookahead凑批影响，出现约250ms间隔。三视频/输入输出/EOS与正常顺序会话通过；组件Host/CUDA、逐rank显存和证据入口见[独立设计文档](plans/SOURCE_PIPELINE_SCHEDULING.md)。每例一次正式/诊断，仅历史描述性比较；736、reference切换、数值等价、GPU故障注入和纯HEAD无覆盖未验证，PR保持draft。
 
 2026-10-28，#417 对齐 main `387f693f30`（已含 #410、#415、#430、#437、#438、#440、#442），保留 Source 调度增量及 Disaggregation 角色配置；Source adapter 的双方新增测试均保留。历史播放指标与 GPU 数据不变，本次未重跑 GPU；以上结果不代表最新 main 整合版本的性能验收。
+
+
+
+### Source 480、输出 736 的独立尺寸验证
+
+`source=832×480` 与 `target=1280×736` 属于不同于 source/target 均为 736 的部署配方。
+客户端独立 source 几何由 #408 补齐，并通过本地协议 peer 回归（非模型验收）；
+当前版本 480/736 GPU 性能、效果及逐组件显存仍未验证。服务端尺寸解耦依赖 [PR #370](https://github.com/seedleap/sglang/pull/370)（2026-10-29仍未合入），尚不能据此将 main
+的同尺寸性能表改标为该配方已验证。使用显式 source resize 策略，并核对真实 Source VAE
+输入、target latent 与 Decoder RGB 的尺寸。连续 source 的复现参数见
+[客户端基准说明](https://github.com/seedleap/sglang/blob/main/benchmark/zing_h3_causal/CLIENT_BENCHMARK.md#连续-source-的独立输入与输出尺寸)。
+
+2026-10-24，冻结组合 `main@a99560cf90` + `#370@c25e4cc90d` + 分离部署修复与诊断
+（tree `6382a5432f`），B300 目标（实际 L20D / CC10.3）完成 source832×480 → 输出1280×736：
+E1+SP2+D1、Lynn BF16、W6/sink3、前三 block 四步、其余 `[1000,500]` / `[1000]`，720帧废土，seed123。
+每组正式 n=3、独立CUDA诊断 n=3，中位数如下；组件秒数为每720帧累计CUDA stream elapsed，
+DiT取较慢SP rank；含依赖等待且阶段重叠，不能相加为E2E。
+
+|后续步数|全程 / 首包后 FPS|TTFF / E2E 秒|Source VAE 秒 / FPS|DiT 秒 / FPS|实际 Decoder 秒 / FPS|
+|---|---:|---:|---:|---:|---:|
+|2|20.229 / 21.469|2.154 / 35.592|17.444 / 41.27|29.778 / 24.18|16.124 / 44.65|
+|1|24.728 / 26.722|2.169 / 29.117|17.439 / 41.29|22.092 / 32.59|16.053 / 44.85|
+
+同一冻结组合中，减少采样步数使全程吞吐提高22.2%，不代表本PR的代码优化收益；
+RGB转换/回传另计两步1.604s、一步1.704s。
+回查 `oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/zing-736-source480-20261024/r5/b300/`，
+两子目录保存P95、原始请求、逐rank阶段计时及实际后台Decoder记录。
+上述数值仅验证2026-10-24冻结组合；合并当前main后尚未重新进行GPU性能或效果验收。
+H200两组结果尚未验收；480输出、请求峰值显存与完整画质未验证。
+旧 TAEH3 FP16、全程四步的 source480/target736 数据仅作历史证据，不作该 Lynn 配方验收。

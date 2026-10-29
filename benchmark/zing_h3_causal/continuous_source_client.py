@@ -20,7 +20,7 @@ from pathlib import Path
 import msgpack
 import websockets
 from bench_client import calculate_metrics, distribution
-from continuous_source_input import open_source
+from continuous_source_input import open_source, source_dimensions
 from continuous_source_media import load_prompt_updates, reference_payload
 
 from sglang.multimodal_gen.runtime.realtime.source_transport import (
@@ -71,6 +71,7 @@ def websocket_options(*, profile, timeout, message_budget=DEFAULT_MESSAGE_BYTES)
 
 
 async def run(args):
+    source_width, source_height = source_dimensions(args)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
@@ -80,7 +81,7 @@ async def run(args):
             (output / "events.jsonl").open("w") as trace,
         ):
             async with open_source(
-                args, args.width * args.height * 3, output / "source-decode.log"
+                args, source_width * source_height * 3, output / "source-decode.log"
             ) as read_source:
                 return await exchange(
                     args, output, started, read_source, received_file, trace
@@ -91,8 +92,12 @@ async def exchange(args, output, started, read_source, received_file, trace):
     prompt_updates = deque(load_prompt_updates(args.prompt_updates))
     message_budget = getattr(args, "max_message_bytes", DEFAULT_MESSAGE_BYTES)
     SourceTransportBudget(message_bytes=message_budget)
-    frame_bytes = args.width * args.height * 3
-    source_format = dict(format="rgb24", width=args.width, height=args.height, fps=24)
+    source_width, source_height = source_dimensions(args)
+    frame_bytes = source_width * source_height * 3
+    output_frame_bytes = args.width * args.height * 3
+    source_format = dict(
+        format="rgb24", width=source_width, height=source_height, fps=24
+    )
     input_hash, output_hash = hashlib.sha256(), hashlib.sha256()
     state = dict(
         submitted=0,
@@ -478,7 +483,7 @@ async def exchange(args, output, started, read_source, received_file, trace):
                     if (
                         start != state["received"]
                         or count < 1
-                        or len(payload) != count * frame_bytes
+                        or len(payload) != count * output_frame_bytes
                         or len(payload) != message["total_size"]
                         or message.get("encoding") not in (None, "raw")
                         or message.get("format") != "rgb24"
@@ -798,6 +803,12 @@ def parser():
     parser.add_argument("--max-message-bytes", type=int, default=DEFAULT_MESSAGE_BYTES)
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--height", type=int, default=480)
+    parser.add_argument(
+        "--source-width", type=int, help="Source RGB width; defaults to output width"
+    )
+    parser.add_argument(
+        "--source-height", type=int, help="Source RGB height; defaults to output height"
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--paced", action="store_true")
     parser.add_argument("--receive-stage-timing", action="store_true")
@@ -823,6 +834,10 @@ def main():
         or args.startup_buffer_seconds < 0
     ):
         cli.error("Dimensions, batch lengths and startup buffering must be valid")
+    try:
+        source_dimensions(args)
+    except ValueError as exc:
+        cli.error(str(exc))
     asyncio.run(run(args))
 
 
