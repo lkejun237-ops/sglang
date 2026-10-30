@@ -6,6 +6,7 @@
 | 主题 | 文档 |
 | --- | --- |
 | H100/H200/B300 部署 | [部署 recipe 与决策矩阵](deployment_zing_h3.mdx) |
+| Prompt 与参考图预算 | [H200 两卡的 token 换算、20 FPS 组合与显存准入建议](/docs/sglang-diffusion/zing/prompt-reference-budgets) |
 | Prompt switch 缓存 | [Block0 复用与动态历史重建方案](/docs/sglang-diffusion/zing/plans/PROMPT_SWITCH_CACHE) |
 | 增量编解码与缓存 | [Incremental codecs](specs/INCREMENTAL_CODECS.md) |
 | 渐进 source encoder | [接入契约](specs/PROGRESSIVE_ENCODER.md)、[tile 并行设计](specs/PROGRESSIVE_TILE_PARALLEL_DESIGN.md) |

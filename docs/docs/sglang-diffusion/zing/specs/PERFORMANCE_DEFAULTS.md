@@ -52,6 +52,10 @@ host sync 已直接集成，无需额外开关。已退休的 `EXPERIMENTAL_CACH
 当前请求默认 window21 / sink3、block_relative、max_frame_gap=12；
 解码模式仍为 `stable`。修改窗口或改为 stateful 解码会改变请求语义，不属于纯算子开关。
 
+选择 prompt/reference 预算时，可参考 [H200 两卡输入预算](/docs/sglang-diffusion/zing/prompt-reference-budgets)。
+该页基于历史 W6/S3、拆分首块、Graph 关闭的 DiT 实测；25.6k 是约20 FPS 的估算边界，
+40k文本/25图/50k完整condition是留显存余量的准入建议，尚未作为统一服务限制实施，不能直接套用当前默认布局。
+
 ## 验证边界与回退
 
 本次默认值调整不代表完成三项优化组合的 GPU 端到端验收，也不叠乘独立 PR 收益。

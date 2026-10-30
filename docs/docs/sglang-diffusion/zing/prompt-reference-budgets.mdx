@@ -1,0 +1,159 @@
+---
+title: "Prompt 与参考图预算"
+description: "根据 H200 两卡 DiT 实测，估算文本与参考图的性能预算、显存余量及部署限制。"
+---
+
+你可以用本页估算 prompt 长度和 reference 数量的组合。以下数字来自
+2026-10-30 的 **H200 两卡、480p、W6/S3、Graph 关闭**专项测试，
+是特定配置的性能和容量参考，不是所有部署的统一上限。
+
+| 用途 | 建议 | 状态 |
+| --- | --- | --- |
+| 常用组合 | 5k 文本 token + 5 张参考图 | 实测 DiT 稳态 24.39 FPS |
+| DiT 约 20 FPS 的组合预算 | 文本 token + 1,700 × 图数 + 500 ≤ 25,600 | 根据实测拟合，组合边界未逐一验证 |
+| 每卡保留约 20 GiB 的容量预算 | 文本 ≤ 40k、图数 ≤ 25、实际完整 condition ≤ 50k，三项同时满足 | 部署准入建议，尚未作为服务校验实施 |
+
+**实际请求还受当前服务的图数、Qwen conditioning 和 DiT KV 池容量限制。**
+例如 streaming reference 图数默认上限为 21；上表的 25 张不是当前入口已经放开的数量。
+部署方应在现有容量与本页建议中采用更严格的限制。
+
+## 适用配置
+
+- 受测源码：`a90d51fcfec8a1dd2f672fa572e65cf77c5cb504`。
+- H200 资源池实际设备为 NVIDIA L20X / CC9.0；每卡 CUDA 可见约 139.72 GiB。
+- 两卡 TP1 / Ulysses SP2 / ring1，完整 50 层 DiT，BF16 主参数、部分 FP32 参数，
+  weights-free AdaLN 静态表；模型初始化常驻约 37.70 GiB/卡。
+- 输出为 832×480；分块为 `[3,2]`、`split_first_latent=true`，
+  W6/S3 历史窗口填满后计时，`block_relative` / gap12。
+- 前三块四步 `[1000,750,500,250]`，之后两步 `[1000,500]`；
+  FA4、RoPE 融合/grouped/chunk reuse、stable shapes、compiled AdaLN、metadata reuse 开启；
+  CUDA Graph / SP Graph 关闭，`HISTORY_ROPE_PLAN=0`。
+- 单活跃会话，DiT 两卡不加载 Qwen、Encoder 或 Decoder。
+
+这与[当前性能默认配置](/docs/sglang-diffusion/zing/specs/PERFORMANCE_DEFAULTS)中的
+window21、Graph 默认开启等存在差异。当前默认测试模型还使用 `split_first_latent=false`，
+见[部署 recipe](/docs/sglang-diffusion/zing/deployment_zing_h3)。
+换 checkpoint、首块规则、窗口、并行布局、精度或参考图缩放后，应重新验证，不能直接沿用这些限额。
+
+## 每张 reference 估算多少 token
+
+按本轮参考图尺寸分布，**每张按 1,700 个完整 condition token 估算**，
+包括 Qwen 图像、VAE 图像及随图增加的上下文；其余固定上下文另预留 500 token。
+
+本轮五张图编码后的尺寸为一张 1280×704、四张 1024×832，
+合计 4,208 个 VAE token，Qwen 图像 token 另计。
+每增加十张同尺寸分布的图，实际完整 condition 增加约 16,918～16,922 token。
+1,700 是该分布的平均近似值，不是任意图片的固定成本。
+
+```text
+T = 纯 prompt 文本的 tokenizer token 数
+R = reference 图数
+C = 实际完整 condition token 数
+
+估算 C ≈ T + 1,700 × R + 500
+```
+
+图片变大或预处理策略改变时，应以实际编码/packer 得到的完整行数为准。
+完整 condition 包括文本、Qwen 图像、VAE 图像及其他上下文，不能只计算纯文本。
+
+## 约 20 FPS 的推荐组合
+
+以下是 **DiT 稳态等效 FPS**，不含 Encoder、Decoder、网络、冷启动或 prompt 切换。
+完整服务的平均吞吐、块间到达波动和播放缓冲还需要单独核验。
+
+```text
+T + 1,700 × R + 500 ≤ 25,600
+
+给定图数：prompt 最长 ≈ 25,100 − 1,700 × R
+给定文本长度：最多图数 ≈ floor((25,100 − T) / 1,700)
+```
+
+如果计算结果为负，表示输入不在推荐范围内。这里没有额外保留性能余量，
+也不承诺边界组合在真实服务中持续达到 20 FPS。
+
+| Reference 数量 | 约 20 FPS 预算下的 prompt 最长 |
+| ---: | ---: |
+| 5 张 | 16,600 token |
+| 8 张 | 11,500 token |
+| 10 张 | 8,100 token |
+| 12 张 | 4,700 token |
+| 14 张 | 1,300 token |
+
+例如：5k 文本可估算配 11 张图，10k 配 8 张，16k 配 5 张。
+以上组合上限是估算；**5k 文本 + 5 张图的 24.39 FPS 是实测值**。
+
+25,600 来自 12 个成功的 480p 档位拟合：完整 condition 每增加 10k token，
+17 帧周期的稳态耗时约增加 130.46 ms，20 FPS 的交点约为 25,612 token。
+不能用这个拟合补填 OOM 档位的 FPS，也不能把容量上限等同于性能推荐边界。
+
+## 显存准入建议
+
+若部署方希望在上述布局中每卡保留约 20 GiB，可采用三项同时满足的准入策略：
+
+| 检查项 | 建议上限 |
+| --- | ---: |
+| 纯 prompt 文本 | 40,000 token |
+| Reference 数量 | 25 张 |
+| 实际完整 condition | 50,000 token |
+
+**建议策略是任意一项超限即报错；本页没有新增这些校验。**
+不能同时取满 40k 文本和 25 张图；先检查文本与图数，再按实际编码后的完整 condition 检查容量。
+超过 25.6k 性能推荐边界、但满足容量限制的输入，仍可能运行，只是预计低于 20 FPS。
+
+依据：41k 文本 + 5 张图的实测完整 condition 为 49,860，
+整档显存采样峰值 117.92 GiB/卡，距 139.72 GiB 总容量约余 21.80 GiB；
+5k 文本 + 25 张图峰值 114.48 GiB/卡，约余 25.24 GiB。
+50k 边界约 118 GiB/卡属于插值估算，采样也可能漏掉瞬时峰值，不是硬件最大容量或显存保证。
+
+本轮 KV 池每增加 1,000 个 prefix 行约增加 1.00 GiB/卡；
+池中还包含窗口历史及旋转后 K。窗口变大、共卡加载其他模型或改变池配置会减少余量。
+
+### 与现有部署限制对齐
+
+- Streaming 图数由 `zing_reference_max_images` 控制，默认 21，
+  `session.ready` 会声明实际图数及传输容量，见[输入契约](/docs/sglang-diffusion/zing/specs/SOURCE_REFERENCE_INPUTS)。
+- Qwen conditioning 有自身的行数/字节限制；它与 DiT 完整 condition 的 token 范围不同。
+  DiT 能容纳 50k，不表示 Qwen 服务已经允许对应输入。
+- `zing_kv_pool_max_prefix_rows` 是完整 condition 的预留容量，
+  还须结合 pool size、目标面积/长边、window/sink 配置；启动时分配的池不会因当前请求较短就自动缩小。
+  参数含义见[KV 池容量字段](/docs/sglang-diffusion/zing/specs/PERFORMANCE_DEFAULTS#预分配-kv-池的容量字段)。
+
+先以服务的实际限制判断是否能接收，再用本页估算速度。
+本轮未验证服务入口直接接收 25 张图、40k 文本或 50k 完整 condition，也没有修改部署配置。
+
+## Token 与字符数的粗略换算
+
+用本轮缓存的 Qwen tokenizer 核对的短句，可粗略按中文每 token 约 1.5 个字符、
+英文每 token 约 5 个字符估算，字符包含空格和标点。例如 5k token 大约对应
+7,500 个中文字符或 25,000 个英文字符。
+这不是固定换算率，中英混合、数字、符号和生僻字会改变比例；服务应使用实际 tokenizer 计数。
+
+## 关键实测与证据范围
+
+每个成功档位填满 W6/S3 后，统计 24 个块、204 帧的正式区间，
+FPS 使用三次正式测量的中位数。显存是含准备阶段的整档 NVML 每 0.5 秒采样峰值，
+不是完整服务的稳态显存，也不是组件独占或瞬时精确峰值。
+
+| 纯文本 token | 图数 | 完整 condition | DiT 稳态 FPS | 整档显存峰值 GiB/卡 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 5 | 9,860 | 26.32 | 67.06 |
+| 5,000 | 5 | 13,860 | 24.39 | 72.10 |
+| 11,000 | 5 | 19,860 | 21.91 | 80.03 |
+| 21,000 | 5 | 29,860 | 18.74 | 92.68 |
+| 41,000 | 5 | 49,860 | 14.62 | 117.92 |
+| 5,000 | 15 | 30,778 | 18.43 | 93.56 |
+| 5,000 | 25 | 47,700 | 14.95 | 114.48 |
+| 5,000 | 35 | 64,622 | 12.51 | 135.54 |
+
+完整 34 档合并结果保存在
+[benchmark 结果表](https://github.com/seedleap/sglang/blob/main/benchmark/zing_h3_causal/prompt_reference_h200_20261030.csv)。
+其中 22 档完成稳态推理、1 档 prefix 准备 OOM、11 档容量预检拒绝；未运行稳态的档位没有 FPS。
+三个大档补测采用计时外 prefix 临时槽计算、CPU 暂存后恢复完整 GPU 池，
+它们只证明缓存就绪后的稳态可运行，不证明当前服务冷未命中准备也能容纳。
+
+输入是形状性能压测：文本精确计数，但 context embedding 按可信快照循环展开；
+增加 reference 时循环原五张真实 latent，并分配独立 ID。完整 50 层 DiT 实际计算 prefix KV。
+本轮没有验证长文本语义、几十张不同内容图片的画质或端到端 20 FPS。
+
+1280×736 最轻的已测组合为 1k 文本 + 5 张图，只有 10.34 FPS；
+本轮没有可推荐达到 20 FPS 的 736p 组合，不能直接套用本页的 480p 公式与显存限额。
