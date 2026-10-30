@@ -1157,6 +1157,7 @@ def _run_ready_chunks(
     prefix_loader_factory=None,
     use_step=False,
     reference=False,
+    split_first_latent=True,
 ):
     """Exercise the production streaming iterator, including source pauses."""
     from sglang.multimodal_gen.runtime.models.dits import zing_h3_denoise_graph
@@ -1166,7 +1167,7 @@ def _run_ready_chunks(
     from sglang.multimodal_gen.test.unit.test_zing_h3_chunks import fixture_provenance
 
     packer = ZingH3Packer(
-        model.arch, num_frame_per_block=[3, 2], split_first_latent=True
+        model.arch, num_frame_per_block=[3, 2], split_first_latent=split_first_latent
     )
     # Prompt changes preserve the global native chunk sequence.
     frames = packer.chunk_plan.chunk(sum(batches) - 1).end
@@ -3000,3 +3001,26 @@ def test_block0_provider_routes_start_and_prompt_cycle(
     assert metrics[-1]["forward_counts"]["prompt_joint"] == 2
     assert metrics[-1]["forward_counts"]["prefix"] == int(not warm_start)
     assert "case-A" in owners[0].entries
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_unsplit_prompt_prefix_falls_back_to_serial(model, monkeypatch, cached):
+    options = dict(
+        batches=(1,) * 8, prompt_updates={3: 9, 5: 6}, split_first_latent=False
+    )
+    baseline = _run_ready_chunks(model, monkeypatch, **options)
+    metrics, receipts = [], []
+    actual = _run_ready_chunks(
+        model,
+        monkeypatch,
+        prompt_joint=True,
+        prefix_loader_factory=(_cached_prefix_writer(receipts) if cached else None),
+        yield_hook=lambda session, drain, count: metrics.append(session.metrics),
+        **options,
+    )
+    torch.testing.assert_close(actual[0], baseline[0], rtol=1e-5, atol=1e-6)
+    assert actual[5] == baseline[5]
+    assert metrics[-1]["prompt_joint_fallbacks"] == {"unsupported_layout": 2}
+    assert metrics[-1]["forward_counts"].get("prompt_joint", 0) == 0
+    if cached:
+        assert receipts

@@ -104,7 +104,7 @@ class H3InferenceInputs:
 
 
 class ZingH3Packer:
-    PROMPT_SWITCH_PREFIX_LENGTHS = (1, 2, 2)
+    PROMPT_SWITCH_PREFIX_FRAMES = 5
 
     def __init__(
         self,
@@ -245,14 +245,11 @@ class ZingH3Packer:
         return self._pack_layout(inputs.conditions, inputs.media, encoded)
 
     def prompt_switch_prefix_chunks(self) -> tuple[TemporalChunk, ...]:
-        """Return the only prompt-switch prefix geometry supported today."""
+        """Return five prefix latents using the configured native chunk boundaries."""
         plan = self.chunk_plan
-        if plan.lengths != (3, 2) or not plan.split_first_latent:
-            raise ValueError(
-                "Prompt switching requires an initial Zing chunk plan of 1,2,2 "
-                "from num_frame_per_block=[3,2] and split_first_latent=True"
-            )
-        return tuple(plan.chunk(i) for i in range(3))
+        if plan.lengths != (3, 2):
+            raise ValueError("Prompt switching requires num_frame_per_block=[3,2]")
+        return tuple(plan.chunks(self.PROMPT_SWITCH_PREFIX_FRAMES))
 
     def pack_prompt_switch_prefix(
         self,
@@ -260,9 +257,9 @@ class ZingH3Packer:
         condition: dict[str, torch.Tensor],
         visual_prefix: torch.Tensor,
     ) -> tuple[dict[str, torch.Tensor], tuple[TemporalChunk, ...]]:
-        """Pack five clean target latents as a fresh local ``1+2+2`` epoch."""
+        """Pack five clean target latents using the configured local epoch."""
         chunks = self.prompt_switch_prefix_chunks()
-        expected = sum(self.PROMPT_SWITCH_PREFIX_LENGTHS)
+        expected = self.PROMPT_SWITCH_PREFIX_FRAMES
         self._validate_visual(visual_prefix)
         if visual_prefix.shape[2] != expected:
             raise ValueError(

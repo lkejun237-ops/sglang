@@ -193,7 +193,7 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         )
 
     def pack_prompt_prefix(self, inputs, condition, visual_prefix):
-        """Prepare condition + 1/2/2 history without changing the live KV cache."""
+        """Prepare condition and native history without changing the live KV cache."""
         prefix_inputs = copy(inputs)
         prefix_inputs.positive, prefix_inputs.source_visual = condition, None
         layout, chunks = self.processor.pack_prompt_switch_prefix(

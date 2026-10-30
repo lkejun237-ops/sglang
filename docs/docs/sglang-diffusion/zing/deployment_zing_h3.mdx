@@ -54,6 +54,14 @@ prompt/reference 切换的 runtime（相关支持见 [PR #483](https://github.co
 既有 `true` 配置的视频不能当作 `false` 的效果或性能证据。此 PR 未补跑 480/736 GPU，
 Encoder、DiT、Decoder 性能及显存均未测。
 
+## 不拆首块的 prompt prefix（H100 480 已验证）
+
+以下为 `1ab209cad6` 的历史受测记录，不替代上文修正 serving 目录的配置与 GPU 验收。
+
+`num_frame_per_block=[3,2]` 配合 `split_first_latent=false` 支持全程 3/2，以及切换时五 latent 的 3/2 prefix。2026-10-30 / `1ab209cad6`：H100 四卡、DiT SP2、用户指定 W6/S3，832×480 两遍各360帧、各一次 prompt 更新通过；实际 prefix 为 `[0,3)、[3,5)`，两遍 RGB exact。两个历史块的 prompt-joint 使用串行回退，condition KV 可命中。正式轮 init→RGB 2.070s、切换0.890s；n=1、有阶段观测且同机另一档并行加载，仅作诊断，不代表 true/false 性能对比。
+
+1280×736 在相同四卡/SP2/W6S3、单槽/prefix4096的 KV 池预分配时 OOM，未进入生成；480 的 W21/S3 预分配也 OOM。不得把480成功外推到736或W21。原始记录、组件时间和逐rank显存范围见 [PR #483](https://github.com/seedleap/sglang/pull/483)，配置与调用链见 [实现说明](plans/UNSPLIT_PROMPT_PREFIX.md)。
+
 ## 当前测试默认采样
 
 截至 2026-10-23，主线服务默认前三个 target block 各四步

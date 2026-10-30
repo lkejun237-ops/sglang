@@ -349,10 +349,12 @@ def test_prompt_switch_waits_for_complete_cycle_then_rebuilds_latest_epoch(
 @torch.no_grad()
 @pytest.mark.parametrize("joint_forward", ["off", "cross_chunk"])
 @pytest.mark.parametrize("frames", [9, 13])
+@pytest.mark.parametrize("split", [False, True])
 def test_mid_cycle_prompt_drains_old_chunk_before_replanning(
-    model, joint_forward, frames
+    model, joint_forward, frames, split
 ):
     packer, inputs, noise, _ = _long_request(model, [3, 2], frames=frames)
+    packer.split_first_latent = split
     sampler = ZingH3Sampler(
         model,
         packer,
@@ -390,7 +392,7 @@ def test_mid_cycle_prompt_drains_old_chunk_before_replanning(
         return session.step()
 
     try:
-        for _ in range(4):
+        for _ in range(4 if split else 3):
             append()
             assert consume().prompt_event_id == 0
         assert session.committed_latent == 8
@@ -432,7 +434,7 @@ def test_prompt_switch_rejects_unsupported_prefix_geometry(model):
                 max_pending_bytes=1024,
                 prompt_switch_prefix_latent_frames=value,
             )
-    with pytest.raises(ValueError, match="chunk plan of 1,2,2"):
+    with pytest.raises(ValueError, match="num_frame_per_block"):
         SourceReadySession(
             sampler,
             inputs,
@@ -445,9 +447,10 @@ def test_prompt_switch_rejects_unsupported_prefix_geometry(model):
 
 @torch.no_grad()
 @pytest.mark.parametrize("ids", [[], ["old"], ["new", "old"]])
-def test_reference_switch_rebuild_matches_fresh_cache(model, monkeypatch, ids):
+@pytest.mark.parametrize("split", [False, True])
+def test_reference_switch_rebuild_matches_fresh_cache(model, monkeypatch, ids, split):
     packer, inputs, noise, _ = _long_request(model, [3, 2], frames=16)
-    packer.split_first_latent = True
+    packer.split_first_latent = split
     inputs.conditions = [
         dict(content_id="old", role="reference", latent_modalities=["visual"])
     ]
@@ -482,7 +485,7 @@ def test_reference_switch_rebuild_matches_fresh_cache(model, monkeypatch, ids):
         )
         return session.step()
 
-    for _ in range(3):
+    for _ in range(3 if split else 2):
         assert step().prompt_event_id == 0
     candidate = copy(inputs)
     candidate.conditions = [
@@ -531,7 +534,7 @@ def test_reference_switch_rebuild_matches_fresh_cache(model, monkeypatch, ids):
 
 @pytest.mark.parametrize(
     "lengths,split",
-    [([3, 7], True), ([1, 2, 7], False), ([1, 2, 2], False), ([3, 2], False)],
+    [([3, 7], True), ([1, 2, 7], False), ([1, 2, 2], False)],
 )
 def test_prompt_switch_rejects_clipped_or_wrong_phase_plans(model, lengths, split):
     packer, inputs, _, _ = _long_request(model, lengths, frames=10)
@@ -958,3 +961,18 @@ def test_window_cancelled_eos_is_not_successful_completion(model, commit_first):
     session.dispose()
     assert session.closed and not session.complete
     assert all(value == 0 for value in session.memory_snapshot().values())
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("split", [False, True])
+def test_prompt_prefix_packing_respects_split_setting(model, split):
+    packer, inputs, noise, _ = _long_request(model, [3, 2], frames=5)
+    packer.split_first_latent = split
+    inputs.source_visual = None
+    layout, chunks = packer.pack_prompt_switch_prefix(inputs, inputs.positive, noise)
+    assert [(c.start, c.end) for c in chunks] == (
+        [(0, 1), (1, 3), (3, 5)] if split else [(0, 3), (3, 5)]
+    )
+    assert layout["block_idx"].unique(sorted=True).tolist() == (
+        [0, 2, 4, 6] if split else [0, 2, 4]
+    )

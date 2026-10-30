@@ -477,12 +477,9 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         self.more_work = False
         self.clip, self.profile = clip, profile
         self.reference_ids = [ref["id"] for ref in self.reference_items]
-        self.reference_updates = (
-            getattr(args.pipeline_config, "prompt_switch_prefix_latent_frames", None)
-            == 5
-            and self.joint_plan.lengths == (3, 2)
-            and self.joint_plan.split_first_latent
-        )
+        self.reference_updates = getattr(
+            args.pipeline_config, "prompt_switch_prefix_latent_frames", None
+        ) == 5 and self.joint_plan.lengths == (3, 2)
         self.source_encoder = profile.get("source_encoder", default_source_encoder())
         self.source_append_overlap = bool(
             self.source_work_quantum

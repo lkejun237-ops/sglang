@@ -105,7 +105,9 @@ class SourceReadySession:
             raise ValueError(
                 "prompt_switch_prefix_latent_frames currently only supports 5"
             )
-        sampler.processor.prompt_switch_prefix_chunks()
+        self.prompt_prefix_chunk_count = len(
+            sampler.processor.prompt_switch_prefix_chunks()
+        )
         if defer_final and (
             prompt_switch_prefix_latent_frames != 5
             or sampler.joint_forward != "cross_chunk"
@@ -249,7 +251,7 @@ class SourceReadySession:
             previous = self.pending[-1].model_chunk
             return self.plan.chunk(previous.chunk_id + 1)
         if self.pending_prompt is not None and self.prompt_switch_ready:
-            return self.plan.chunk(3)
+            return self.plan.chunk(self.prompt_prefix_chunk_count)
         return self.plan.chunk(self.model_chunk_id)
 
     @property
@@ -273,7 +275,7 @@ class SourceReadySession:
             self.pending_prompt is None
             or not self.prompt_switch_ready
             or ready.chunk.start % 5 != 0
-            or ready.model_chunk.chunk_id != 3
+            or ready.model_chunk.chunk_id != self.prompt_prefix_chunk_count
             or ready.model_chunk.start != 5
         ):
             return
@@ -449,13 +451,16 @@ class SourceReadySession:
         )
         packs, self._pending_prefix = self._pending_prefix, None
         if not supported:
-            if self._cached_prefix_ready:
+            if self._cached_prefix_ready and self.plan.split_first_latent:
                 raise ValueError(
                     "Cached prompt switch requires supported joint execution"
                 )
-            # The same packed tensors feed the established serial cache contract.
-            sampler._forward(packs[0], cache, "prefix")
-            for packed in packs[1:]:
+            # Joint graphs require three history blocks. Unsplit 3/2 history
+            # uses serial commits, retaining an already restored condition KV.
+            if not self._cached_prefix_ready:
+                sampler._forward(packs[0], cache, "prefix")
+                packs = packs[1:]
+            for packed in packs:
                 host = sampler._layout_index(packed).host
                 cache.update(
                     packed["position_ids"],

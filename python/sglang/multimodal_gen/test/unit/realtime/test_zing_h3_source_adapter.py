@@ -95,12 +95,12 @@ def initialize(**overrides):
     return adapter, session
 
 
-def _enable_reference_updates(args):
+def _enable_reference_updates(args, *, split=True):
     from pathlib import Path
 
     root = Path(args.model_path)
     runtime = json.loads((root / "zing_config.json").read_text())
-    runtime.update(num_frame_per_block=[3, 2], split_first_latent=True)
+    runtime.update(num_frame_per_block=[3, 2], split_first_latent=split)
     raw = json.dumps(runtime).encode()
     (root / "zing_config.json").write_bytes(raw)
     profile = json.loads((root / "zing_realtime_profile.json").read_text())
@@ -127,10 +127,11 @@ class PromptSocket:
         self.messages.append(msgspec.msgpack.decode(raw))
 
 
-def test_reference_capability_requires_supported_deployment(configured):
+@pytest.mark.parametrize("split", [False, True])
+def test_reference_capability_requires_supported_deployment(configured, split):
     adapter, _ = initialize()
     assert adapter.ready["prompt_reference_updates"] is False
-    _enable_reference_updates(configured)
+    _enable_reference_updates(configured, split=split)
     adapter, _ = initialize()
     assert adapter.ready["prompt_reference_updates"] is True
 
