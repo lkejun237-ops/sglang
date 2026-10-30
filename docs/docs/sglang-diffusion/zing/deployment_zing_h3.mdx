@@ -96,6 +96,24 @@ Encoder/DiT/Decoder 的新耗时和常驻/峰值显存均未测，不能沿用�
 设计与配置见[默认缓存方案](/docs/sglang-diffusion/zing/plans/BLOCK0_CACHE_DEFAULTS)，
 测试范围和当前状态见[CPU 验证记录](/benchmark/zing_h3_causal/BLOCK0_CACHE_DEFAULTS_VALIDATION)。
 
+## 连续 source 的首次合批等待
+
+2026-10-29，首块调度修复：progressive Encoder 的首次派发按当前首块依赖执行，
+1 latent 首块收到第一个 source 帧即可继续；后续保留跨块合批等待，无新增配置。
+未拆分首块仍按真实 9/17 帧依赖等待，缓存开关不影响该策略。
+2026-10-29，`1ffee5c9e1` 在 H100/SP2、832×480、window6/sink3、静态AdaLN、Graph0、
+NCCL、cache on 下，两遍360帧均完成且RGB一致，首次合批等待0.0019/0.0013 ms。
+本轮没有baseline对照，不把旧版本约333 ms当作TTFF净收益；736及baseline画质未验证。
+行为与验证入口见 [Source 首块合批等待修复](/docs/sglang-diffusion/zing/specs/SOURCE_STARTUP_JOINT_WAIT)。
+
+2026-10-29，后续补齐 Decoder 会话结束时的 bridge/store 引用清理，避免下一次open
+承担旧组释放。H100两卡4轮连接/传输/释放通过，后续连接约3.4ms；开销移到结束阶段。
+随后 `a90d51fcfe` 在同配置H100四卡完成一条832×480/360帧的cache-on两遍，
+第二遍TTFT745.7ms、Decoder建连4.7ms、prompt切换863.8ms；RGB与前轮同输入一致。
+结束清理仍在末次派发返回前，客户端dispose1044.6ms，末批前间隔1673.4ms，
+已计入E2E17.344秒。736、同条件baseline及长期显存未验收；范围与原始入口见
+[Decoder通信组生命周期](/docs/sglang-diffusion/zing/specs/DECODER_BRIDGE_LIFECYCLE)。
+
 ## 固定 case 的请求准备缓存
 
 Qwen 继续使用现有 CPU conditioning LRU；local 模式在日志 `Zing Qwen cache` 输出

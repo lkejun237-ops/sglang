@@ -822,9 +822,13 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             <= self.dispatched_source_frames
         ):
             self.joint_chunk_id += 1
-        following = self.joint_plan.chunk(self.joint_chunk_id + 1)
+        # Start as soon as the first chunk is ready. Only later dispatches
+        # wait for the following chunk to enable cross-chunk joint execution.
+        target_chunk = self.joint_plan.chunk(
+            self.joint_chunk_id + (1 if self.dispatched_source_frames else 0)
+        )
         target = min(
-            self.clip, dependency(following.end) - self.dispatched_source_frames
+            self.clip, dependency(target_chunk.end) - self.dispatched_source_frames
         )
         # Wait only for the missing source at its declared frame rate, with a
         # hard deadline. Interrupts and the dispatch/credit limits still win.

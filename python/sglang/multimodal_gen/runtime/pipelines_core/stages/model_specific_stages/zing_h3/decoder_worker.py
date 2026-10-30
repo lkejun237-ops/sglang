@@ -355,7 +355,8 @@ def main():
         idle_group=idle_group,
         operation_group=control_group,
     )
-    module = publisher = service = bridge = token = channel = socket = context = None
+    module = publisher = service = None
+    bridge = store = token = channel = socket = context = None
     device = torch.device("cuda", torch.cuda.current_device())
     try:
         error = None
@@ -416,6 +417,9 @@ def main():
                             raise ValueError("Decoder could not drain before abort")
                         service.dispose()
                         service = token = channel = None
+                        # Release the session's transport before acknowledging it;
+                        # otherwise the next open pays for the old group's teardown.
+                        bridge = store = None
                         reply = dict(ok=True, session=requested, released=True)
                     else:
                         reply = dict(
@@ -546,6 +550,7 @@ def main():
                         service.drain(args.timeout_seconds)
                         service.dispose()
                         service = token = channel = None
+                        bridge = store = None
             except EncoderControlError:
                 raise
             except Exception as exc:
@@ -601,6 +606,7 @@ def main():
         # communication failure.
         if service is not None:
             service.dispose()
+        bridge = store = None
         if publisher is not None:
             publisher.close()
         if socket is not None:

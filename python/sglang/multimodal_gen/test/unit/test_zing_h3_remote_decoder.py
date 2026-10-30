@@ -96,17 +96,16 @@ def _remote_decoder(monkeypatch, protocol):
         decoder=SimpleNamespace(module_key="lynn_decoder"),
     )
     from sglang.multimodal_gen.runtime.distributed import parallel_state
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        remote_decoder,
+    )
 
     monkeypatch.setattr(parallel_state, "get_world_group", lambda: _FakeGroup())
     monkeypatch.setattr(RemoteLynnDecoder, "_connect", lambda self: None)
     monkeypatch.setattr(
         torch.distributed, "broadcast_object_list", lambda *a, **k: None
     )
-    monkeypatch.setattr(
-        "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
-        "zing_h3.remote_decoder.send_latent",
-        lambda *args, **kwargs: None,
-    )
+    monkeypatch.setattr(remote_decoder, "send_latent", lambda *args, **kwargs: None)
     decoder = RemoteLynnDecoder(
         codecs,
         capacity_latents=40,
@@ -436,7 +435,7 @@ def _loop_service(*, fail_on=None):
     return Service
 
 
-def _run_decoder_loop(commands, *, fail_on=None, live=None):
+def _run_decoder_loop(commands, *, fail_on=None, live=None, transport_events=None):
     """Run the worker control loop with fake devices and optional real ZMQ."""
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
         encoder_control,
@@ -469,6 +468,8 @@ def _run_decoder_loop(commands, *, fail_on=None, live=None):
         if isinstance(reply, dict) and "channel" in reply:
             channel_from_open["channel"] = reply["channel"]
         replies.append(reply)
+        if transport_events is not None:
+            transport_events.append(("reply", dict(reply)))
 
     socket = SimpleNamespace(
         setsockopt=lambda *a: None,
@@ -545,6 +546,18 @@ def _run_decoder_loop(commands, *, fail_on=None, live=None):
         EncoderCommandControl=encoder_control.EncoderCommandControl,
         EncoderControlError=encoder_control.EncoderControlError,
     )
+    if transport_events is not None:
+
+        class Transport:
+            def __init__(self, kind, store=None):
+                self.kind, self.store = kind, store
+                transport_events.append(("create", kind))
+
+            def __del__(self):
+                transport_events.append(("release", self.kind))
+
+        dist.TCPStore = lambda *a, **kw: Transport("store")
+        namespace["bridge_group"] = lambda store, *a, **kw: Transport("bridge", store)
     if live is not None:
         context = zmq.Context()
         socket = context.socket(zmq.REP)
@@ -724,6 +737,79 @@ def test_decoder_loop_acknowledges_every_payload_free_op(session_field):
         "chunk_index": 0,
     }
     assert replies[-1]["busy"] is False
+
+
+@pytest.mark.parametrize("operation", ["close", "abort"])
+def test_decoder_releases_transport_before_release_ack_and_next_open(operation):
+    """The next session must not inherit the previous session's group teardown."""
+    events = []
+    release = (
+        dict(op="close", channel="$open")
+        if operation == "close"
+        else dict(op="abort", session="owner")
+    )
+    replies, error = _run_decoder_loop(
+        [
+            dict(op="open", session="owner", bridge_port=1001, capacity_latents=40),
+            release,
+            dict(
+                op="open", session="next-owner", bridge_port=1002, capacity_latents=40
+            ),
+            dict(op="abort", session="next-owner"),
+        ],
+        transport_events=events,
+    )
+    assert error is None
+    assert all(reply["ok"] for reply in replies)
+    assert events[:7] == [
+        ("create", "store"),
+        ("create", "bridge"),
+        ("reply", replies[0]),
+        ("release", "bridge"),
+        ("release", "store"),
+        ("reply", replies[1]),
+        ("create", "store"),
+    ]
+    assert [event for event in events if event[0] == "release"] == [
+        ("release", "bridge"),
+        ("release", "store"),
+    ] * 2
+
+
+def test_stale_abort_keeps_active_decoder_transport():
+    events = []
+    replies, error = _run_decoder_loop(
+        [
+            dict(op="open", session="owner", bridge_port=1001, capacity_latents=40),
+            dict(op="abort", session="previous-owner"),
+            dict(op="ping"),
+            dict(op="abort", session="owner"),
+        ],
+        transport_events=events,
+    )
+    assert error is None
+    assert replies[1]["released"] is False and replies[2]["busy"] is True
+    assert events[:5] == [
+        ("create", "store"),
+        ("create", "bridge"),
+        ("reply", replies[0]),
+        ("reply", replies[1]),
+        ("reply", replies[2]),
+    ]
+    assert events[5:7] == [("release", "bridge"), ("release", "store")]
+
+
+def test_failed_decoder_command_releases_transport_on_worker_exit():
+    events = []
+    _, error = _run_decoder_loop(
+        [
+            dict(op="open", session="owner", bridge_port=1001, capacity_latents=40),
+            dict(op="finish", channel="stale-channel", total_frames=4),
+        ],
+        transport_events=events,
+    )
+    assert error is not None
+    assert events[-2:] == [("release", "bridge"), ("release", "store")]
 
 
 def test_a_command_with_a_stale_channel_is_rejected_and_ends_the_service():

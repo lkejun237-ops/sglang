@@ -1457,11 +1457,14 @@ def test_joint_wait_rejects_invalid_deployment_budget(configured, value):
 @pytest.mark.parametrize(
     "lengths,split,dispatched,pending,target,missing",
     [
-        ([1, 2, 2], False, 0, 1, 9, 8),
+        ([1, 2, 2], False, 0, 1, 1, 0),
         ([1, 2, 2], False, 1, 1, 16, 15),
-        ([3, 2], True, 0, 1, 9, 8),
+        ([3, 2], True, 0, 1, 1, 0),
         ([3, 2], True, 9, 1, 17, 16),
-        ([1, 2, 2], False, 0, 9, 9, 0),
+        ([1, 2, 2], False, 0, 9, 1, 0),
+        ([3, 2], False, 0, 1, 9, 8),
+        ([3, 2], False, 0, 9, 9, 0),
+        ([5], False, 0, 1, 17, 16),
     ],
 )
 def test_auto_wait_uses_checkpoint_chunks_and_codec_watermarks(
@@ -1475,6 +1478,48 @@ def test_auto_wait_uses_checkpoint_chunks_and_codec_watermarks(
     frames, budget = adapter._joint_wait_target()
     assert frames == target
     assert budget == pytest.approx(missing * 1000 / 24)
+
+
+@pytest.mark.parametrize("lengths,split", [([1, 2, 2], False), ([3, 2], True)])
+@pytest.mark.parametrize("budget", ["auto", 30])
+def test_first_latent_dispatch_does_not_wait_for_following_chunk(
+    configured, monkeypatch, lengths, split, budget
+):
+    adapter, session = initialize()
+    adapter.profile.update(joint_forward="cross_chunk", joint_wait_ms=budget)
+    adapter.source_encoder = {"mode": "progressive"}
+    adapter.joint_plan = source.ChunkPlan(lengths, split)
+    adapter.pending_frames = 1
+
+    async def unexpected_wait():
+        pytest.fail("The first latent is ready without another source frame")
+
+    monkeypatch.setattr(adapter.available, "wait", unexpected_wait)
+    asyncio.run(adapter.wait_for_next_chunk(session))
+    assert adapter.joint_wait["target_frames"] == 1
+    assert adapter.joint_wait["reason"] == "ready"
+    if budget == "auto":
+        assert adapter.joint_wait["budget_ms"] == 0
+
+
+def test_unsplit_first_chunk_waits_for_its_source_dependency(configured):
+    adapter, session = initialize()
+    adapter.profile.update(joint_forward="cross_chunk", joint_wait_ms="auto")
+    adapter.source_encoder = {"mode": "progressive"}
+    adapter.joint_plan = source.ChunkPlan([3, 2], False)
+    adapter.pending_frames = 1
+
+    async def run():
+        task = asyncio.create_task(adapter.wait_for_next_chunk(session))
+        await asyncio.sleep(0)
+        assert not task.done()
+        adapter.pending_frames = 9
+        adapter.available.set()
+        await asyncio.wait_for(task, 0.5)
+
+    asyncio.run(run())
+    assert adapter.joint_wait["target_frames"] == 9
+    assert adapter.joint_wait["reason"] == "ready"
 
 
 def test_joint_defaults_need_no_user_tuning(configured):
@@ -2302,8 +2347,13 @@ def test_server_defaults_reach_source_command(configured, monkeypatch, remote_co
     from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
         ZingH3CausalPipelineConfig,
     )
+    from sglang.multimodal_gen.runtime.platforms import current_platform
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
+    # Validate real auto defaults without probing a CUDA device in CPU tests.
+    monkeypatch.setattr(
+        current_platform, "get_available_gpu_memory", lambda **kwargs: 80.0
+    )
     # The adapter consumes validated Zing values, not public class defaults.
     with patch.object(
         PipelineConfig,
