@@ -3,9 +3,68 @@ title: "Zing H3 部署 recipe"
 description: "供 Codex 与部署同学使用的 H100/H200/B300 部署决策、显存实测与验证边界。"
 ---
 
-本页供 Codex 和部署同学（克君）选配置、判断显存余量。最近整理：2026-10-22；
+本页供 Codex 和部署同学（克君）选配置、判断显存余量。性能记录更新：2026-10-30；历史基线整理：2026-10-22；
 核对主线 `18d7e0cd9295`。下面是已有部署经验，只有对应版本、输入和配置的实测结论；
 实验补丁、显存快照、未验收画质均单独标注。新部署先选择一行，再沿证据入口取得原配置。
+
+## 736p 部署性能更新（2026-10-30）
+
+以下均为 **1280×736 输出**，全程与首包后 FPS 分列。历史 1312×736/SP4/W21
+实验不作为当前部署结果；不同硬件、输入、source 尺寸和采样之间不计算优化收益。
+
+### B300：736 source 产品 case
+
+冻结 runtime `521ade5a6e`、旧 split-first 模型，BF16，DiT SP4/resident AdaLN；
+GPU0–3 为 DiT、GPU4 为 Source Encoder/Qwen、GPU5 为 Lynn Decoder，实际工作六卡
+（分配八卡）。source/output 均为 1280×736；W6/sink3、after_step0，前三块四步
+`[1000,750,500,250]`，随后两步 `[1000,500]`；Graph、quantum1、Encoder/Decoder overlap、
+cross-chunk joint、预热 Block0 cache；无 offload、无 FP8 GEMM，单活跃会话。
+输入为 `product-case-20261029` 的显式 736 派生，不代表仓库默认集合已冻结 736 输入。
+
+| case | 完整正式 n | 全程 FPS 中位数 / P95 | 首包后 FPS 中位数 / P95 |
+| --- | ---: | ---: | ---: |
+| 少图 | 3 | 18.411 / 18.992 | 19.951 / 20.467 |
+| 长 prompt | 3 | 20.589 / 20.710 | 20.830 / 20.924 |
+| 动态换图 | 3 | 20.386 / 20.434 | 21.283 / 21.291 |
+| 长会话 | 2 / 计划3 | 20.626 / 20.636 | 20.669 / 20.679 |
+
+作业 `dlc1n5jwgbtjp6p5` 被外部停止，11/12 次正式请求完整完成，长会话第三次中断并排除；
+SP2 对照和 DiT 诊断未执行，不能宣称所有 case 稳定超过 20 FPS。
+这是服务交付 FPS；最新 main、新 1027 step010000 unsplit 模型、当前组合画质及
+分组件计时/显存的完整验收尚未完成。证据：[PR #481](https://github.com/seedleap/sglang/pull/481)，
+原始回执 `oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/zing-b300-product-20261030/postprocess-r7-v2/r7-scaling-0-candidate-sp4-resident-736/`。
+
+另有四卡 E1+SP2+D1 固定废土 case（runtime `4c5e387948`）全程 FPS
+19.3580 / 20.0492、首包后 20.1090 / 20.8317（中位数/P95，n=3）；
+首包后三次为 19.2635、20.1090、20.9120，不能称每次稳定 ≥20。
+
+### H200：冻结配置的已完成测试
+
+H200 目标实机为上海 L20X / SM90。以下均为四卡 E1+SP2+D1、旧废土 case、720 帧、
+W6/sink3、Graph、无 offload、单活跃会话，**不是上方 B300 SP4 产品 case 的同条件对照**。
+每项 n=3；一步采样和 source 降分辨率改变生成配置，画质须单独验收。
+
+| 配置 | source → output | 全程 FPS 中位数 / P95 | 首包后 FPS 中位数 / P95 |
+| --- | --- | ---: | ---: |
+| BF16，`f8995495fa` + #401/#406，4→2，quantum0 | 1280×736 → 1280×736 | **8.4861 / 8.4879** | 8.8797 / 8.8818 |
+| BF16，`a99560cf90` + #370 及 Decoder 身份修正，4→2，quantum0 | 832×480 → 1280×736 | **12.783 / 12.798** | 13.327 / 13.346 |
+| 同上，4→1 | 832×480 → 1280×736 | **16.357 / 16.363** | 17.273 / 17.280 |
+
+BF16 #401/#406 同卡 baseline→组合全程 FPS 为 8.0333→8.4861（+5.64%），
+每侧两次预热、三次正式；source480 矩阵每格一次冷校准、一次完整预热、三次正式。
+正式轮关闭阶段诊断。
+
+另有完整 FP8 实验组合（#401/#406、#420 runtime `225bfc787b`、joint-vchannel FP8
+attention、Source VAE tile batch2），736 source 的废土/小镇/室内全程 FPS 中位数为
+**9.9354 / 9.8968 / 10.4932**（P95 9.9502 / 9.8983 / 10.5175，各 n=3）。
+这是组合结果，不是单 PR 收益或默认推荐；效果采用仍待验收。
+现有 H200 记录没有证明 736 source 完整服务达到20 FPS；
+与 B300 新产品 case/SP4 配方匹配的 H200 测试仍未验证。
+证据：[PR #401](https://github.com/seedleap/sglang/pull/401)、
+[PR #420](https://github.com/seedleap/sglang/pull/420)；source480 记录为
+`oss://leap-world-shanghai/world-model/sglang/evals/zing-736-source480-20261024/r5/`；
+H200 BF16/FP8 回执根为 `oss://leap-world-shanghai/world-model/sglang/evals/zing-h200-current-20261024/`，
+分别回查 `GPU-PAIRED-r1-INPUTS.json`、`COMPOSITION-E2E-r2-INPUTS.json` 与逐格 READY。
 
 ## Prompt 与参考图的输入预算
 
@@ -93,8 +152,9 @@ main 强制 fused1 **28.922（−4.12%）**、旧 `13cd4ca52a` 默认 **29.404�
 `521ade5a6e` 将新增优化限制到实际目标 1280×736，480p 保留 main 既有路径；
 Linux CPU 完整相关套件 1142 passed、4 项 CUDA 测试 skipped。r5 的 SP4 arm 在 CPU 准备
 被 offline AdaLN guard 拒绝；产物保留。r6 准备 main/SP2/table、gate/SP2/table、
-gate/SP2/resident、gate/SP4/resident 四臂，736 逆序优先、480 正序；尚未运行 GPU。
-门限后收益及 SP4 扩展尚未验证。
+gate/SP2/resident、gate/SP4/resident 四臂，736 逆序优先、480 正序。
+后续 r7 已完成 SP4 的11次正式请求，见本页“736p 部署性能更新”；
+SP2 对照未执行，门限后同条件收益及完整 SP4 验收仍未验证。
 {/* TODO: 补充目标分辨率门限后的同条件480/736、组件阶段和显存实测；不沿用门限前结果作为验收。 */}
 产品集合 480/736 全量 GPU 对照、组件 CUDA/显存及 DiT-only 吞吐待补；736 输入为全帧
 上采样到 1280×736，非原生采集。指标、缺项与原始证据见
@@ -886,5 +946,6 @@ RGB转换/回传另计两步1.604s、一步1.704s。
 回查 `oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/zing-736-source480-20261024/r5/b300/`，
 两子目录保存P95、原始请求、逐rank阶段计时及实际后台Decoder记录。
 上述数值仅验证2026-10-24冻结组合；合并当前main后尚未重新进行GPU性能或效果验收。
-H200两组结果尚未验收；480输出、请求峰值显存与完整画质未验证。
+H200两组速度回执见本页“736p 部署性能更新”；完整画质仍未验收。
+480输出、请求峰值显存与当前main的完整画质未验证。
 旧 TAEH3 FP16、全程四步的 source480/target736 数据仅作历史证据，不作该 Lynn 配方验收。
