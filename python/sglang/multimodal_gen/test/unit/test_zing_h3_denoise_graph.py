@@ -1525,8 +1525,8 @@ def test_whole_chunk_execution_unpublishes_rotated_k_and_shares_rotations(
     rotations = []
     original = ZingChunkGraphs._forward_plan
 
-    def spy(sampler, shadow, packed, phase, after=None):
-        plan = original(sampler, shadow, packed, phase, after=after)
+    def spy(sampler, shadow, packed, phase, after=None, **kwargs):
+        plan = original(sampler, shadow, packed, phase, after=after, **kwargs)
         rotations.append((phase, plan.kv_plan.rotates_history))
         return plan
 
@@ -1601,8 +1601,8 @@ def test_cross_graph_history_reuse_matches_rebuild_across_eviction_and_recovery(
     plans, states = [], []
     original = ZingChunkGraphs._forward_plan
 
-    def spy(sampler, shadow, packed, phase, after=None):
-        plan = original(sampler, shadow, packed, phase, after=after)
+    def spy(sampler, shadow, packed, phase, after=None, **kwargs):
+        plan = original(sampler, shadow, packed, phase, after=after, **kwargs)
         if after is None:
             plans.append(
                 (phase, plan.kv_plan.write_start, plan.kv_plan.reused_history_rows)
@@ -3001,6 +3001,59 @@ def test_block0_provider_routes_start_and_prompt_cycle(
     assert metrics[-1]["forward_counts"]["prompt_joint"] == 2
     assert metrics[-1]["forward_counts"]["prefix"] == int(not warm_start)
     assert "case-A" in owners[0].entries
+
+
+@pytest.mark.parametrize(
+    "shapes,expected",
+    [
+        ([(46, 80)], (23, 40)),
+        ([(30, 52)], (15, 26)),
+        ([(80, 46)], (40, 23)),
+        ([(46, 80), (46, 80)], (23, 40)),
+        ([(30, 52), (46, 80)], None),
+        ([(45, 80)], None),
+    ],
+)
+def test_fixed_target_grid_uses_latent_shape_only(monkeypatch, shapes, expected):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+        ZingChunkGraphs,
+    )
+
+    def unexpected_scan(*args, **kwargs):
+        raise AssertionError("Target geometry must not scan tensor coordinates")
+
+    monkeypatch.setattr(torch, "unique", unexpected_scan)
+    sampler = SimpleNamespace(processor=SimpleNamespace(patch_size=(1, 2, 2)))
+    states = [
+        SimpleNamespace(visual=SimpleNamespace(shape=(1, 16, 1, *s))) for s in shapes
+    ]
+    assert ZingChunkGraphs._target_grid(sampler, *states) == expected
+
+
+def test_chunk_plans_carry_actual_target_grid(model, monkeypatch):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+        ZingChunkGraphs,
+    )
+
+    original = ZingChunkGraphs._forward_plan
+    observed = []
+    grid = (23, 40)
+    monkeypatch.setattr(
+        ZingChunkGraphs, "_target_grid", staticmethod(lambda *args: grid)
+    )
+
+    def spy(sampler, shadow, packed, phase, after=None, *, target_grid=None):
+        observed.append((phase, target_grid))
+        return original(
+            sampler, shadow, packed, phase, after=after, target_grid=target_grid
+        )
+
+    monkeypatch.setattr(ZingChunkGraphs, "_forward_plan", staticmethod(spy))
+    _run_ready_chunks(model, monkeypatch, backend=RecordingGraphBackend())
+    assert {phase for phase, _ in observed} >= {"active", "joint", "final"}
+    assert all(
+        value == (None if phase == "prefix" else grid) for phase, value in observed
+    )
 
 
 @pytest.mark.parametrize("cached", [False, True])

@@ -73,6 +73,57 @@ profile/CLI 也可能覆盖默认值。下表全程四步和 4→1 等结果仍�
 不代表当前默认 4→2 的性能或画质；当前请求准备缓存的 H100 验证状态见下一节，
 画质尚未在本次变更中做人工验收。
 
+## B300 SP2 736 输入布局与固定 Q attention（Draft）
+
+2026-10-30 后续 480p ABBA 复测（main `480b48c853` → candidate `13cd4ca52a`）：
+同次四卡分配、DiT SP2、BF16、旧 720 帧 case，首包后**服务 FPS** 中位
+**30.715→28.520（−7.15%，各 n=6）**，12 份完整 RGB 独立重读一致。
+候选含 `SGLANG_ZING_FUSED_CURRENT_ROPE_KV=1`，main unset；奇数 dispatch 的 encoder
+results 队列等待增加，根因未证明。独立 r3 同机三臂各 n=3：main 默认 **30.166**、
+main 强制 fused1 **28.922（−4.12%）**、旧 `13cd4ca52a` 默认 **29.404（−2.53%）**；
+15 份完整 RGB 独立读回一致。后两比例不能相加或跨 allocation 拼接交互作用，
+旧代码组只是三次请求中位回退观测，不代表门限后版本。此旧组合不推荐用于 480p 升级。
+`521ade5a6e` 将新增优化限制到实际目标 1280×736，480p 保留 main 既有路径；
+Linux CPU 完整相关套件 1142 passed、4 项 CUDA 测试 skipped。r5 的 SP4 arm 在 CPU 准备
+被 offline AdaLN guard 拒绝；产物保留。r6 准备 main/SP2/table、gate/SP2/table、
+gate/SP2/resident、gate/SP4/resident 四臂，736 逆序优先、480 正序；尚未运行 GPU。
+门限后收益及 SP4 扩展尚未验证。
+{/* TODO: 补充目标分辨率门限后的同条件480/736、组件阶段和显存实测；不沿用门限前结果作为验收。 */}
+产品集合 480/736 全量 GPU 对照、组件 CUDA/显存及 DiT-only 吞吐待补；736 输入为全帧
+上采样到 1280×736，非原生采集。指标、缺项与原始证据见
+[本轮实验记录](https://github.com/seedleap/sglang/blob/codex/zing-b300-736-20fps/benchmark/zing_h3_causal/pr481/README.md)。
+下述历史 20.109 是服务首包后 FPS。另从同版三个独立诊断请求重算，按有效 RGB 帧数
+除以较慢 rank 的 DiT CUDA-event 累计时长，中位 **23.433 FPS**；不含调用间调度等待，
+不是 GPU busy 或完整组件 wall，也不构成当前产品集合达标证据。计算证据见本轮实验记录；历史版本边界保留如下。
+
+2026-10-30，runtime `4c5e387948`（main 基线 `b65640dd4b2d`）：resize 前显式生成连续 HWC，
+将 admission 输入的 CHW 复制延后到 resize 后，并为已测 SP2 shape 使用固定 Q FA4；
+KV 实际长度仍由设备端 metadata 限定。新增路径限定 CC 10.3、148 SM、FA4 b19；
+其他设备或版本回退原路径。包含准入门限的上述提交已完成 736p GPU 验证。
+保持完整 50 层、默认 4→2、W6/sink3。
+
+泰国 B300（CC 10.3、148 SM），1280×736、30s-wasteland/720 帧、七张参考图、
+seed 123、E1 + SP2 + D1、BF16、Graph 与 Block0 热缓存，候选显式开启已有
+`SGLANG_ZING_FUSED_CURRENT_ROPE_KV=1`：同次 GPU 分配、每臂两次预热后三次正式请求，
+服务首包后 FPS 中位 **15.089→20.109（+33.27%）**。候选三次为
+**19.264 / 20.109 / 20.912**，中位达到 20，但不保证每次 ≥20；频率未锁定。
+全程 FPS 中位 **14.659→19.358**，该口径尚未达到 20。
+独立读取 main 两次、候选一次完整 720 帧 RGB，逐字节一致，六次正式客户端 hash 一致；
+仅证明此固定 case。三次候选的 DiT Host 累计约 22.8 秒，Encoder Host（含等待）
+从 5.40 降至 2.32 秒，与 FPS 上升相对应，具体因果尚未定位到锁或线程。
+
+此前实验版的 FP8 FFN + attention projection GEMM 对照首包后 FPS 中位
+**20.895→18.837**，每张 DiT 卡 allocated 约省 17.93 GiB，但输出出现可见布局变化；
+该版本不含最终硬件准入门限，不作为当前提交的结果。此配置优先使用 BF16。
+832×480 同版本同机对照的首包后 FPS 中位 **30.835→29.090（-5.66%，各 n=3）**，
+完整输出与 main 一致；DiT/source VAE/Decoder CUDA 基本不变，Encoder Host（含等待）
+累计中位从 4.26 增至 5.75 秒，具体因果未定位。**此组合仅作上述 736p 方案，
+不作为 480p 性能升级建议；H100/H200 未验证**。Qwen/参考图 VAE 冷路径未测，
+后续用冷请求补测；共享进程/卡级显存不代表组件独占。
+
+复现条件、Encoder/DiT/Decoder 计时及显存、历史实验版本边界和原始产物入口见
+[PR #481](https://github.com/seedleap/sglang/pull/481)。
+
 ## Block0 Cache 默认启用（Draft，当前版本未验证）
 
 2026-10-28，基于 `5e66d5e2c3` 的后续改动：有 GPU KV pool 时默认启用 pinned CPU +

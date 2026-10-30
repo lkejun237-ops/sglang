@@ -64,6 +64,7 @@ from sglang.multimodal_gen.runtime.models.dits.zing_h3_model_signature import (
     model_signatures,
 )
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_rope import (
+    _validated_fixed_device,
     apply_contiguous_history_rope_batch,
     apply_current_qknorm_rope_kv,
     apply_current_rope,
@@ -189,6 +190,7 @@ class _BlockOptions(msgspec.Struct, frozen=True, kw_only=True):
     fixed_tensors: object = None
     full_rope: object = None
     optimized_fixed_480p: bool = False
+    target_fixed_736p: bool = False
 
 
 class _BodyInputs(msgspec.Struct, frozen=True, kw_only=True):
@@ -542,16 +544,25 @@ def _fa4_attention(q, k, v, scale, metadata=None):
     return result
 
 
-def _fixed_fa4_attention(q, k, v, scale, metadata, *, optimized):
-    """Keep Q1170 varlen; measured Q390/780 use fixed Q with device KV bounds.
+def _fixed_fa4_attention(q, k, v, scale, metadata, *, optimized, target_736p=False):
+    """Keep legacy 480 routes; extend fixed Q only for measured 736 targets.
 
     The slot capacity is not its live length. Pass cu_seqlens_k unchanged so
     source/step0 cannot read future branches or stale slot rows on replay.
     """
     if (
-        optimized
+        (
+            optimized
+            or (
+                target_736p
+                and q.is_cuda
+                and q.shape[1:] == (28, 128)
+                and k.shape == v.shape == (44156, 28, 128)
+                and _validated_fixed_device(q.device)
+            )
+        )
         and os.environ.get("SGLANG_ZING_FA4_FIXED", "1") == "1"
-        and q.shape[0] in (390, 780)
+        and q.shape[0] in ((390, 780, 920, 1840, 2760) if target_736p else (390, 780))
         and q.dtype == k.dtype == v.dtype == torch.bfloat16
         and all(x.is_contiguous() for x in (q, k, v))
     ):
@@ -1698,7 +1709,14 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
 
     @torch.no_grad()
     def prepare_fixed_forward(
-        self, *, packed, kv_plan, phase, _model_state=None, projection_cache=None
+        self,
+        *,
+        packed,
+        kv_plan,
+        phase,
+        _model_state=None,
+        projection_cache=None,
+        target_grid=None,
     ):
         """Validate/pack on the host; execution contains only device arithmetic.
 
@@ -1868,8 +1886,16 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             backend=self.experimental_attention_backend,
             audio=bool(packed["audio_x"].shape[0]),
         )
+        # Actual target shape supplied by the graph owner, never inferred from Q
+        # or source/reference positions. Missing geometry keeps legacy routes.
+        target_fixed_736p = target_grid == (23, 40) and phase in {
+            "active",
+            "final",
+            "joint",
+        }
         options = _BlockOptions(
             optimized_fixed_480p=optimized_fixed_480p,
+            target_fixed_736p=target_fixed_736p,
             capture=False,
             use_cache=False,
             raw_attention=False,
@@ -1974,6 +2000,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             ),
             kv_plan.rotates_history,
             optimized_fixed_480p,
+            target_fixed_736p,
             tuple(
                 (value.data_ptr(), _tensor_layout(value))
                 for value in (
@@ -2154,6 +2181,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         )
 
     def _fixed_block_attention(self, current, hidden, index, inputs, options):
+        """Use fixed KV storage; choose fixed-Q or varlen FA4 per branch below."""
         hidden_tensor = (
             (hidden[0] if isinstance(hidden, tuple) else hidden)
             if hidden is not None
@@ -2251,6 +2279,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                     module.softmax_scale,
                     _FixedFA4Metadata(options.fixed_tensors, branch),
                     optimized=options.optimized_fixed_480p,
+                    target_736p=options.target_fixed_736p,
                 )
             elif query.device.type == "cpu":
                 result = _cpu_varlen_attention(

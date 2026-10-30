@@ -1,15 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU contracts for Zing media routing; model inference is mocked."""
 
+import contextlib
+import json
+import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
+from PIL import Image
 
 from sglang.multimodal_gen.configs.zing_media import ZingResizeLimits
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
     codecs as codecs_module,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+    media_geometry,
+    remote_encoder,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.decoder import (
     DECODERS,
@@ -1864,3 +1873,153 @@ def test_request_cannot_claim_internal_source_origin(codecs, origin):
     request["messages"][0]["content"][1]["origin"] = origin
     with pytest.raises(ValueError, match="reserved for internal source presentation"):
         codecs._parse_inference_request(request)
+
+
+@pytest.mark.parametrize(
+    "target,optimized",
+    [
+        ((480, 832), False),
+        ((736, 1280), True),
+        ((720, 1280), False),
+        ((1280, 736), False),
+    ],
+)
+def test_resize_uses_target_and_preserves_pixels(monkeypatch, target, optimized):
+    # Input/encoded sizes deliberately do not identify the target bucket.
+    geometry = media_geometry.SourceGeometry(12, 16, 6, 8, *target)
+    pixels = (
+        torch.arange(3 * 2 * 12 * 16, dtype=torch.int64)
+        .to(torch.uint8)
+        .reshape(3, 2, 12, 16)
+    )
+    baseline = media_geometry._resize_frames(pixels, 6, 8)
+    layouts = []
+    original = Image.fromarray
+
+    def fromarray(array, *args, **kwargs):
+        layouts.append(array.flags.c_contiguous)
+        return original(array, *args, **kwargs)
+
+    monkeypatch.setattr(Image, "fromarray", fromarray)
+    result = geometry.resize(pixels)
+    assert geometry.use_target_736_media_path is optimized
+    assert layouts == [optimized, optimized]
+    assert result.is_contiguous() and result.dtype == torch.uint8
+    assert torch.equal(result, baseline)
+    assert geometry.receipt() == dict(
+        width=8, height=6, resize_applied=True, algorithm="h3-lanczos-v1"
+    )
+
+
+@pytest.mark.parametrize("target", [(480, 832), (736, 1280)])
+def test_source_736_does_not_select_target_path(target):
+    geometry = media_geometry.SourceGeometry(736, 1280, 480, 832, *target)
+    assert geometry.use_target_736_media_path == (target == (736, 1280))
+
+
+@pytest.mark.parametrize("target", [None, (480, 832), (736, 1280), (720, 1280)])
+@pytest.mark.parametrize("resize", [False, True])
+def test_admission_copy_boundary_and_wire_pixels(monkeypatch, target, resize):
+    geometry = (
+        None
+        if target is None
+        else media_geometry.SourceGeometry(
+            12, 16, 6 if resize else 12, 8 if resize else 16, *target
+        )
+    )
+    optimized = target == (736, 1280)
+    hwc = np.arange(2 * 12 * 16 * 3, dtype=np.uint8).reshape(2, 12, 16, 3)
+    expected = torch.from_numpy(hwc.copy()).permute(3, 0, 1, 2).contiguous()
+    if geometry is not None:
+        expected = media_geometry._resize_frames(expected, *geometry.encoded_shape)
+    session = SimpleNamespace(
+        source_geometry=geometry,
+        timeout=1,
+        port=1,
+        admission_endpoint="inproc://test",
+        capacity_frames=17,
+        capacity_bytes=100000,
+        token="test",
+        profile_dir="test",
+        stage_timing_dir=None,
+        device="cpu",
+        stop=threading.Event(),
+        prefetched_frames=0,
+        _consumed=0,
+        accepted_frames=2,
+        resize_host_ms=0,
+        failure=None,
+        remote_usage={},
+        _check_admission=lambda *args: None,
+    )
+    copy_boundaries = []
+    original_contiguous = torch.Tensor.contiguous
+
+    def contiguous(tensor, *args, **kwargs):
+        copy_boundaries.append(session.prefetched_frames)
+        return original_contiguous(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "contiguous", contiguous)
+    payloads = []
+
+    class Socket:
+        def setsockopt(self, *args):
+            pass
+
+        def connect(self, *args):
+            pass
+
+        def close(self):
+            pass
+
+        def poll(self, *args):
+            return True
+
+        def recv_multipart(self):
+            return [
+                json.dumps(
+                    dict(
+                        op="append",
+                        source_frame_start=0,
+                        num_frames=2,
+                        width=16,
+                        height=12,
+                    )
+                ).encode(),
+                hwc.tobytes(),
+            ]
+
+        def send_multipart(self, parts):
+            self.request = json.loads(parts[0])
+            if self.request["op"] == "append":
+                payloads.append(parts[1])
+                session.stop.set()
+
+        def recv_json(self):
+            return dict(
+                ok=True,
+                source_encoding=None if geometry is None else geometry.receipt(),
+            )
+
+    class Context:
+        def socket(self, *args):
+            return Socket()
+
+        def term(self):
+            pass
+
+    monkeypatch.setattr(remote_encoder.zmq, "Context", Context)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda *args: None)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: object())
+    monkeypatch.setattr(torch.cuda, "stream", lambda *args: contextlib.nullcontext())
+    monkeypatch.setattr(
+        remote_encoder.dist, "TCPStore", lambda *args, **kwargs: SimpleNamespace(port=1)
+    )
+    monkeypatch.setattr(remote_encoder, "bridge_group", lambda *args, **kwargs: None)
+    remote_encoder.RemoteEncoderSession._produce(session)
+    assert session.failure is None
+    assert session.prefetched_frames == 2
+    assert payloads == [expected.numpy().tobytes()]
+    # The first CHW copy occurs before admission accounting for all old paths,
+    # including unknown geometry and the no-resize path.
+    assert copy_boundaries[0] == (2 if optimized else 0)

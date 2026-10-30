@@ -35,10 +35,18 @@ class SourceGeometry:
     def encoded_shape(self):
         return self.encoded_height, self.encoded_width
 
+    @property
+    def use_target_736_media_path(self):
+        return (self.target_height, self.target_width) == (736, 1280)
+
     def resize(self, pixels):
         if tuple(pixels.shape[-2:]) != self.input_shape:
             raise ValueError("Source pixels differ from the negotiated input geometry")
-        return _resize_frames(pixels, *self.encoded_shape)
+        return _resize_frames(
+            pixels,
+            *self.encoded_shape,
+            contiguous_hwc=self.use_target_736_media_path,
+        )
 
     def receipt(self):
         return dict(
@@ -159,7 +167,7 @@ def _select_h3_bucket(
     return bucket_h, bucket_w
 
 
-def _resize_frames(frames, height: int, width: int):
+def _resize_frames(frames, height: int, width: int, *, contiguous_hwc: bool = False):
     """在 CPU 上逐帧做 Lanczos resize，并维持 dataloader 的 uint8 ``[C,T,H,W]`` 契约。"""
     import numpy as np
     import torch
@@ -169,9 +177,11 @@ def _resize_frames(frames, height: int, width: int):
         return frames
     images = [
         np.asarray(
-            Image.fromarray(frame.permute(1, 2, 0).numpy()).resize(
-                (width, height), Image.Resampling.LANCZOS
-            )
+            Image.fromarray(
+                np.ascontiguousarray(frame.permute(1, 2, 0).numpy())
+                if contiguous_hwc
+                else frame.permute(1, 2, 0).numpy()
+            ).resize((width, height), Image.Resampling.LANCZOS)
         )
         for frame in frames.permute(1, 0, 2, 3)
     ]

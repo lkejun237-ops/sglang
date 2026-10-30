@@ -213,6 +213,10 @@ class RemoteEncoderSession:
                 self.admission_digests[start] = (owner, digest)
 
     def _produce(self):
+        defer_admission_copy = (
+            self.source_geometry is not None
+            and self.source_geometry.use_target_736_media_path
+        )
         context = zmq.Context()
         socket = context.socket(zmq.REQ)
         socket.setsockopt(zmq.LINGER, 0)
@@ -327,8 +331,9 @@ class RemoteEncoderSession:
                                     )
                                     .reshape(count, height, width, 3)
                                     .permute(3, 0, 1, 2)
-                                    .contiguous()
                                 )
+                                if not defer_admission_copy:
+                                    pixels = pixels.contiguous()
                                 self.prefetched_frames += count
                             elif (
                                 op != "finish"
@@ -344,6 +349,10 @@ class RemoteEncoderSession:
                             self.resize_host_ms += (
                                 time.perf_counter() - started
                             ) * 1000
+                        # Only the 736 target defers the admission CHW copy so resize
+                        # can consume its HWC-backed view. Keep the wire bytes contiguous.
+                        if admission is not None and defer_admission_copy:
+                            pixels = pixels.contiguous()
                         reply = rpc(
                             op,
                             pixels.numpy().tobytes(),

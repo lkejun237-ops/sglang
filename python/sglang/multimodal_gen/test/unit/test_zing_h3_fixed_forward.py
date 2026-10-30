@@ -985,3 +985,22 @@ def test_fixed_forward_rotates_current_qk_once_across_kv_routes(
         torch.testing.assert_close(value, reference, atol=0.008, rtol=0.008)
     assert calls.count("kv") == len(model.blocks)
     assert calls.count("current") == (0 if fused_kv else 2 * len(model.blocks))
+
+
+def test_target_geometry_separates_fixed_forward_signatures(model):
+    packer, inputs, visual, _ = request(model, audio=False)
+    sampler = ZingH3Sampler(model, packer, sigma_points=3)
+    sampler.device = torch.device("cpu")
+    layout = packer.pack_inference_layout(inputs, inputs.positive, visual, None)
+    packed = sampler._select_block(layout, 2, phase="target", video_t=0.3, audio_t=1.0)
+    kv = _workspace(model, packed, history=3)
+
+    def signature(grid):
+        return model.prepare_fixed_forward(
+            packed=packed, kv_plan=kv, phase="active", target_grid=grid
+        ).signature
+
+    legacy = signature(None)
+    assert signature((15, 26)) == legacy
+    assert signature((40, 23)) == legacy
+    assert signature((23, 40)) != legacy

@@ -131,3 +131,75 @@ def test_new_route_switches_participate_in_graph_keys():
     assert {"SGLANG_ZING_FUSED_CURRENT_ROPE_KV", "SGLANG_ZING_FA4_FIXED"} <= set(
         model_module._GRAPH_ROUTE_ENVS
     )
+
+
+@pytest.mark.parametrize(
+    "admitted,qrows,flag,target_736p,fixed",
+    [
+        (True, 1840, "1", True, True),
+        (False, 1840, "1", True, False),
+        (True, 1170, "1", True, False),
+        (True, 1840, "0", True, False),
+        (True, 1840, "1", False, False),
+        # The same source Q780 is enabled only by the actual 736 target.
+        (True, 780, "1", True, True),
+        (True, 780, "1", False, False),
+    ],
+)
+def test_736p_fixed_q_requires_validated_device(
+    monkeypatch, admitted, qrows, flag, target_736p, fixed
+):
+    """Route-only test: no CUDA allocation or FA4 kernel is needed."""
+    monkeypatch.setenv("SGLANG_ZING_FA4_FIXED", flag)
+    devices, calls = [], []
+
+    def admit(device):
+        devices.append(device)
+        return admitted
+
+    monkeypatch.setattr(model_module, "_validated_fixed_device", admit)
+
+    class TensorStub:
+        is_cuda = True
+        dtype = torch.bfloat16
+        device = torch.device("cuda", 0)
+
+        def __init__(self, shape):
+            self.shape = shape
+
+        def is_contiguous(self):
+            return True
+
+        def __getitem__(self, index):
+            assert index is None
+            return self
+
+        def squeeze(self, dim):
+            assert dim == 0
+            return self
+
+    q = TensorStub((qrows, 28, 128))
+    k = v = TensorStub((44156, 28, 128))
+    live_lengths = object()
+    metadata = SimpleNamespace(lengths=lambda *args: (None, live_lengths))
+    fake = ModuleType("flash_attn.cute.interface")
+
+    def fwd(q, k, v, **kwargs):
+        calls.append(kwargs)
+        return (q,)
+
+    fake._flash_attn_fwd = fwd
+    monkeypatch.setitem(sys.modules, "flash_attn.cute.interface", fake)
+    fallback = object()
+    monkeypatch.setattr(model_module, "_fa4_attention", lambda *args, **kw: fallback)
+    result = model_module._fixed_fa4_attention(
+        q, k, v, 0.5, metadata, optimized=False, target_736p=target_736p
+    )
+    assert devices == ([q.device] if target_736p else [])
+    if fixed:
+        assert result is q
+        assert calls[0]["cu_seqlens_k"] is live_lengths
+        assert calls[0]["max_seqlen_k"] == 44156
+    else:
+        assert result is fallback
+        assert not calls

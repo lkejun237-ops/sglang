@@ -547,7 +547,20 @@ class ZingChunkGraphs:
         return packed
 
     @staticmethod
-    def _forward_plan(sampler, shadow, packed, phase, after=None):
+    def _target_grid(sampler, *states):
+        """Keep target identity when joint plans include lower-resolution source Q."""
+        # Shapes are host metadata: no coordinate scan or device synchronization.
+        patch_h, patch_w = sampler.processor.patch_size[-2:]
+        shapes = [tuple(state.visual.shape[-2:]) for state in states]
+        if not shapes or any(shape != shapes[0] for shape in shapes[1:]):
+            return None
+        height, width = shapes[0]
+        if height % patch_h or width % patch_w:
+            return None
+        return height // patch_h, width // patch_w
+
+    @staticmethod
+    def _forward_plan(sampler, shadow, packed, phase, after=None, *, target_grid=None):
         from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import (
             ZingFixedForwardKVPlan,
         )
@@ -625,6 +638,7 @@ class ZingChunkGraphs:
             phase=phase,
             _model_state=model._zing_model_signatures,
             projection_cache=projection_cache,
+            target_grid=target_grid,
         )
         layers = [(k[:rows], v[:rows]) for k, v in kv.stores]
         if transaction is not None:
@@ -745,6 +759,7 @@ class ZingChunkGraphs:
                     shadow,
                     packed,
                     "joint",
+                    target_grid=self._target_grid(sampler, current),
                     after=plans[-1].kv_plan if plans else None,
                 )
             )
@@ -839,6 +854,7 @@ class ZingChunkGraphs:
                         shadow,
                         packed,
                         "active",
+                        target_grid=self._target_grid(sampler, current),
                         after=plans[-1].kv_plan if plans else None,
                     )
                 )
@@ -877,6 +893,7 @@ class ZingChunkGraphs:
                         shadow,
                         packed,
                         "joint",
+                        target_grid=self._target_grid(sampler, current, next_state),
                         after=plans[-1].kv_plan if plans else None,
                     )
                 )
@@ -890,6 +907,7 @@ class ZingChunkGraphs:
                         shadow,
                         packed,
                         "final",
+                        target_grid=self._target_grid(sampler, current),
                         after=plans[-1].kv_plan if plans else None,
                     )
                 )
