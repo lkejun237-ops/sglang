@@ -7,6 +7,16 @@
 的常驻服务、预热、重复请求及逐请求记录方式；协议差异使此入口独立于文本
 benchmark，不将 token 指标或视频任务轮询直接套到 Zing。
 
+## 默认测试模型（2026-10-30 起）
+
+后续测试固定使用 **1027 的 step 010000 AR + DMD diff** 模型，配置为
+`num_frame_per_block=[3,2]`、`split_first_latent=false`。原始 checkpoint 的 SHA256 为
+`89c3a67d77214e57d810e6a4e5554c7c919ae929db0174e6439dfadb53a1d731`。
+模型位置、修正配置版本与部署前置条件见
+[部署 recipe：当前测试模型](../../docs/docs/sglang-diffusion/zing/deployment_zing_h3.mdx#当前测试模型1027-step-010000)。
+客户端连接已有服务时不修改模型配置，运行前须核对服务实际加载的模型身份和 split 开关，
+并记录到部署回执。旧 checkpoint 或 `split_first_latent=true` 的结果保留原身份，不能改标为新模型结果。
+
 ## 默认测试集合（2026-10-30 起）
 
 后续 Zing / SGLang 测试默认使用 [`product-case-20261029`](PRODUCT_CASE_REPLAY.md)，覆盖单图、

@@ -35,6 +35,10 @@
 - 后续 Zing / SGLang 相关 PR 与测试优先使用英伦维护的 benchmark，入口和指标口径见
   `benchmark/zing_h3_causal/CLIENT_BENCHMARK.md`；有限输入使用 `run_benchmark.py`
   / `bench_client.py`，连续 source 使用 `bench_streaming_source.py`，报告沿用配套生成器。
+- 后续测试默认模型使用 1027 的 `global_step_010000` AR + DMD diff checkpoint，保持
+  `num_frame_per_block=[3,2]`、`split_first_latent=false`；模型身份、修正后的 serving 路径
+  和未验证范围见 `docs/docs/sglang-diffusion/zing/deployment_zing_h3.mdx` 的“当前测试模型”。
+  不得为适配旧 runtime 静默改成 `true` 或回退旧 checkpoint；无法运行时明确报告阻塞。
 - 用户于 2026-10-30 确认：后续 Zing / SGLang 测试默认使用真实请求集合
   `product-case-20261029`（`benchmark/zing_h3_causal/case_sets/product-case-20261029.json`），
   覆盖长 prompt、少图、动态换图和长会话。默认入口为 `bench_streaming_source.py`，

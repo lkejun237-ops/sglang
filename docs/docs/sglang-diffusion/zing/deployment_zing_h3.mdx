@@ -7,6 +7,53 @@ description: "供 Codex 与部署同学使用的 H100/H200/B300 部署决策、�
 核对主线 `18d7e0cd9295`。下面是已有部署经验，只有对应版本、输入和配置的实测结论；
 实验补丁、显存快照、未验收画质均单独标注。新部署先选择一行，再沿证据入口取得原配置。
 
+## 当前测试模型：1027 step 010000
+
+2026-10-30 起默认测试模型为 **AR + DMD diff，1027 step 010000**。训练配置及后续 serving
+配置均应保持 `num_frame_per_block=[3,2]`、`split_first_latent=false`，不静默回退旧模型或旧首块行为。
+
+原始 checkpoint：
+
+```text
+oss://leap-worldmodel-thailand-single-az/world-model/zing/checkpoints/run-archive/ar/h3-ar-sp8-15-1026-bf43a6c8/checkpoints/global_step_010000/generator/model_dmd_diff_h3-dmd-sp4-04-1027.pt
+```
+
+原始权重 SHA256：`89c3a67d77214e57d810e6a4e5554c7c919ae929db0174e6439dfadb53a1d731`。
+原始训练配置 SHA256：`ef82e9f4f3adbba62b559fcc49b913bfd64d9e286e2a39fd10953fc337a4c9c5`。
+
+上海 CPFS 已准备仅修正配置的 serving 版本：
+
+```text
+/mnt/prefill-cpfs/deployments/model32-step10000-20261030-unsplit-r1/serving
+```
+
+该路径是上海部署数据源挂载在 `/mnt/prefill-cpfs` 时的路径，不是泰国 `/cpfs` 的同名目录。
+`zing_config.json` SHA256 为 `21cf5379e60ac8554a59a1aa4400f776329337f6f2847fe9659c6a34cf6bf8f4`；
+完整修正回执为同级父目录的 `CONFIGURATION_FIX.json`。权重未重新转换，组件及权重链接复用
+旧 `model32-step10000-20261030-r1`，必须保留该源目录，不把修正目录单独打包当作可迁移完整包。
+随附 realtime profile 已更新模型配置摘要，但仍保留原部署的 remote source encoder 配置，
+迁移时须核对对应服务及端口。
+
+**当前仅完成配置与链接核验，尚未切换线上或通过修正版本的 GPU 验收。**
+现网 `true` 配置的视频与性能数据仅属于旧配置。使用新版本前须采用支持 unsplit 3/2
+prompt/reference 切换的 runtime（相关支持见 [PR #483](https://github.com/seedleap/sglang/pull/483)，
+不能把 PR 状态等同于已部署），重新生成并验证绑定新配置的 AdaLN cache；本目录不携带旧 cache。
+480/736 及 Encoder、DiT、Decoder 的性能和显存均尚未补测，不外推旧结果。
+
+## 导出时保留训练分块配置
+
+`export_checkpoint.py --config` 应直接使用原始 effective training config，不能为沿用旧部署
+而改写 `num_frame_per_block` 或 `split_first_latent`。例如 `[3,2]` 配合 `false` 表示
+`3,2,3,2,…`；改成 `true` 会将开头拆成 `1,2,2,3,2,…`，改变模型计算边界。
+在 `--provenance` JSON 中提供原始文件的 `original_config_sha256`，导出器会在加载权重、
+写出产物前核对输入文件的原始字节摘要，不匹配则拒绝导出；未提供摘要时不校验来源。
+验收同时核对导出配置顶层、`training_effective_config` 和实际加载配置，不能只看 `[3,2]`。
+
+该校验不修改已有模型包或线上配置，也不增加运行时对分块组合的支持。恢复
+`split_first_latent=false` 前仍须验证目标 runtime 的初始化、prompt/reference 切换和 EOS；
+既有 `true` 配置的视频不能当作 `false` 的效果或性能证据。此 PR 未补跑 480/736 GPU，
+Encoder、DiT、Decoder 性能及显存均未测。
+
 ## 当前测试默认采样
 
 截至 2026-10-23，主线服务默认前三个 target block 各四步

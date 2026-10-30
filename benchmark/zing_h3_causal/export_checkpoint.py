@@ -204,7 +204,18 @@ def export(
         )
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Missing merged Zing checkpoint: {checkpoint}")
-    cfg = yaml.safe_load(config_path.read_text())
+    config_bytes = config_path.read_bytes()
+    config_sha256 = hashlib.sha256(config_bytes).hexdigest()
+    provenance = {} if provenance is None else dict(provenance)
+    if (
+        "original_config_sha256" in provenance
+        and provenance["original_config_sha256"] != config_sha256
+    ):
+        raise ValueError(
+            "Training config SHA256 does not match provenance.original_config_sha256; "
+            "pass the original effective training config without serving overrides"
+        )
+    cfg = yaml.safe_load(config_bytes)
     arch = cfg["generator_config"]
     if cfg["causal"] is not True:
         raise ValueError("Export requires a causal checkpoint")
@@ -256,7 +267,6 @@ def export(
             "Expected a merged generator state dict with backbone.* tensor keys"
         )
     state, input_layout = normalize_adaln_checkpoint(state, arch)
-    provenance = {} if provenance is None else dict(provenance)
     if (
         input_layout == "split"
         or provenance
@@ -399,7 +409,7 @@ def export(
         local_attn_size=arch["local_attn_size"],
         sink_size=arch["sink_size"],
         checkpoint=str(Path(checkpoint).resolve()),
-        training_config_sha256=hashlib.sha256(config_path.read_bytes()).hexdigest(),
+        training_config_sha256=config_sha256,
     )
     (output / "zing_config.json").write_text(json.dumps(runtime, indent=2) + "\n")
     index = {
@@ -435,7 +445,10 @@ def main():
     )
     parser.add_argument(
         "--provenance",
-        help="JSON with native_sha, checkpoint_source, component_versions and lora_merged",
+        help=(
+            "JSON with native_sha, checkpoint_source, component_versions and lora_merged; "
+            "include original_config_sha256 to verify --config against the original training file"
+        ),
     )
     args = parser.parse_args()
     print(

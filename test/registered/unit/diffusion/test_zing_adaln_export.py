@@ -156,7 +156,7 @@ def test_split_export_requires_and_preserves_provenance(tmp_path, layout, tags):
     cfg = dict(
         generator_config=arch,
         causal=True,
-        num_frame_per_block=[1, 2, 2],
+        num_frame_per_block=[3, 2],
         split_first_latent=False,
         num_train_timestep=1000,
         timestep_shift=5,
@@ -200,7 +200,17 @@ def test_split_export_requires_and_preserves_provenance(tmp_path, layout, tags):
         checkpoint_source="generator",
         component_versions={"h3": "fixture"},
         lora_merged=True,
+        original_config_sha256=exporter.file_sha256(config),
     )
+    original_config = config.read_bytes()
+    for override in [{"split_first_latent": True}, {"num_frame_per_block": [1, 2, 2]}]:
+        config.write_text(yaml.safe_dump(dict(cfg, **override)))
+        with pytest.raises(ValueError, match="original effective training config"):
+            exporter.export(
+                checkpoint, config, components, destination, provenance=provenance
+            )
+        assert not destination.exists()
+    config.write_bytes(original_config)
     exporter.export(
         checkpoint,
         config,
@@ -232,6 +242,9 @@ def test_split_export_requires_and_preserves_provenance(tmp_path, layout, tags):
     )
     assert runtime["checkpoint_sha256"] == exporter.file_sha256(checkpoint)
     assert runtime["training_effective_config"] == cfg
+    assert runtime["num_frame_per_block"] == [3, 2]
+    assert runtime["split_first_latent"] is False
+    assert runtime["training_config_sha256"] == provenance["original_config_sha256"]
     assert runtime["provenance"] == provenance
     weights = {}
     for path in (destination / "transformer").glob("*.safetensors"):
