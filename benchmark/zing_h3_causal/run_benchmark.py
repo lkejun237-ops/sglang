@@ -165,7 +165,8 @@ def parser():
         "--case", choices=["all", *bench_client.DEFAULT_CASES], default="all"
     )
     selection.add_argument(
-        "--case-set", help="Collection name or JSON file; default: whitebox-basic"
+        "--case-set",
+        help="Finite-input collection; use whitebox-basic for legacy cases",
     )
     result.add_argument(
         "--media-root", type=Path, default=Path.home() / ".cache/sglang/zing-benchmark"

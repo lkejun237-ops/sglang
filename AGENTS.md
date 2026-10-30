@@ -35,6 +35,12 @@
 - 后续 Zing / SGLang 相关 PR 与测试优先使用英伦维护的 benchmark，入口和指标口径见
   `benchmark/zing_h3_causal/CLIENT_BENCHMARK.md`；有限输入使用 `run_benchmark.py`
   / `bench_client.py`，连续 source 使用 `bench_streaming_source.py`，报告沿用配套生成器。
+- 用户于 2026-10-30 确认：后续 Zing / SGLang 测试默认使用真实请求集合
+  `product-case-20261029`（`benchmark/zing_h3_causal/case_sets/product-case-20261029.json`），
+  覆盖长 prompt、少图、动态换图和长会话。默认入口为 `bench_streaming_source.py`，
+  不传 case 选择参数即运行该集合；保留完整 prompt、参考图顺序及逐帧更新边界。
+  原四个 case 仅作为显式 `--case-set whitebox-basic` 的旧集合回归，不再作为默认。
+  新集合当前仅冻结 832×480 输入；736 档仍须另行冻结并验证，不得外推。
 - 性能测试必须分别覆盖 480 和 736 两档分辨率，记录实际宽×高、case 与输入身份，
   不混合统计，也不以 704、720 或其他档位代替 736。工具或部署尚不支持某档时，
   明确列为未验证及说明原因，不得用另一档外推为通过。

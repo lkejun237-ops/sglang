@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import urlsplit
 
-
 DEFAULT_CASE = "zing-whitebox-video-five-triview-0001"
 DEFAULT_MANIFEST = Path(__file__).with_name("whitebox_video_smoke_cases.jsonl")
 
@@ -91,7 +90,7 @@ def expected_assets(case: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 def local_source_path(uri: str, media_root: Path) -> Path:
     parsed = urlsplit(uri)
-    if parsed.scheme == "s3":
+    if parsed.scheme in {"s3", "oss"}:
         return media_root / parsed.path.lstrip("/")
     if parsed.scheme == "file":
         return Path(parsed.path)

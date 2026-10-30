@@ -410,18 +410,21 @@ CPU 作业 `dlcouce8bl26f472`（826 项及 24 个子用例通过），GPU 作业
 
 ## 固定 workload 与 baseline
 
-后续 PR 的固定输入基线使用英伦 benchmark 的 `whitebox-basic` 集合
-（`benchmark/zing_h3_causal/case_sets/whitebox-basic.json`），保留 manifest 原始
-source、prompt、参考图及条件映射：
+自 2026-10-30 起，后续 PR 与测试默认使用英伦 benchmark 的 `product-case-20261029`
+真实请求集合（`benchmark/zing_h3_causal/case_sets/product-case-20261029.json`）。
+默认入口为 `bench_streaming_source.py`，不指定 case 选择参数即运行该集合；保留原始
+prompt、参考图 ID / 顺序和条件更新边界，以连续 source 方式完整回放。
 
-| case | 固定 case ID | 帧数 / 输入帧率 | 参考图 |
+| case ID 后缀 | 帧数 / 回放帧率 | 参考图数（逐版本） | 覆盖 |
 | --- | --- | --- | --- |
-| `5s` 海岸 | `zing-whitebox-video-five-triview-0001` | 120 / 24 FPS | 6 张 |
-| `30s-wasteland` 废土 | `zing-whitebox-video-30s-six-triview-0001` | 720 / 24 FPS | 7 张 |
-| `30s-town` 地中海小镇 | `zing-whitebox-video-30s-six-triview-0002` | 720 / 24 FPS | 7 张 |
-| `30s-indoor` 室内 | `zing-whitebox-video-30s-two-triview-0001` | 720 / 24 FPS | 3 张 |
+| `few-images` | 403 / 24 FPS | 1 | 单图短 prompt |
+| `long-prompt` | 6247 / 24 FPS | 3 | 长 prompt 连续改写 |
+| `reference-switch` | 764 / 24 FPS | 3→1→2→1→2→1→2 | 动态增减参考图 |
+| `long-session` | 15921 / 24 FPS | 5 | 完整长会话与参考替换 |
 
-标准集合用于完整 source 的有限输入测量；continuous-source 的 `source.append` 测量单独统计。
+原 `whitebox-basic` 四个 case 保留为显式 `--case-set whitebox-basic` 的旧集合，
+用于有限输入及历史结果回归，不再默认运行。有限输入与连续 source 的指标分开比较。
+新默认集合目前仅冻结 832×480 输入；GPU 生成、性能及 736 档仍未验证。
 480 与 736 分别使用显式声明实际尺寸的 manifest/case-set（部署目标为 832×480、1280×736），
 不静默改写原 manifest，也不认为默认集合已覆盖两档。具体入口与素材身份见
 [固定输入客户端基线](https://github.com/seedleap/sglang/blob/main/benchmark/zing_h3_causal/CLIENT_BENCHMARK.md)。

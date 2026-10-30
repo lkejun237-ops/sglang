@@ -8466,6 +8466,22 @@
         ],
         "full_suite_file_count": 28
       }
+    },
+    {
+      "path": "benchmark/zing_h3_causal/tests/test_product_cases.py",
+      "suite": "benchmark-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "CPU replay contracts verify real frame and reference identities, per-case replacements, finite-client rejection and nonzero PTS duration handling. Local Python 3.11 tests pass; exact-head Zing CPU CI supplies Linux execution receipts.",
+      "dependencies": [
+        "Pillow",
+        "websockets",
+        "msgpack"
+      ]
     }
   ],
   "recipes": {

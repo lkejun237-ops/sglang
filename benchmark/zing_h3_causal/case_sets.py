@@ -8,9 +8,10 @@ from pathlib import Path
 from prepare_whitebox_video_smoke import load_cases
 
 CHECKOUT = Path(__file__).resolve().parents[2]
+DEFAULT_CASE_SET = "product-case-20261029"
 
 
-def load_case_set(selection="whitebox-basic", checkout=CHECKOUT):
+def load_case_set(selection=DEFAULT_CASE_SET, checkout=CHECKOUT):
     """Manifest paths are relative to checkout, including for custom collections."""
     checkout = Path(checkout)
     path = Path(selection)

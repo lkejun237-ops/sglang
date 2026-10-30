@@ -1,0 +1,22 @@
+{
+  "name": "product-case-20261029",
+  "transport": "continuous_source",
+  "cases": [
+    {
+      "manifest": "benchmark/zing_h3_causal/product_case_20261029_cases.jsonl",
+      "case_id": "zing-product-case-20261029-few-images"
+    },
+    {
+      "manifest": "benchmark/zing_h3_causal/product_case_20261029_cases.jsonl",
+      "case_id": "zing-product-case-20261029-long-prompt"
+    },
+    {
+      "manifest": "benchmark/zing_h3_causal/product_case_20261029_cases.jsonl",
+      "case_id": "zing-product-case-20261029-reference-switch"
+    },
+    {
+      "manifest": "benchmark/zing_h3_causal/product_case_20261029_cases.jsonl",
+      "case_id": "zing-product-case-20261029-long-session"
+    }
+  ]
+}

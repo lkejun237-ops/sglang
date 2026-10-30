@@ -19,7 +19,7 @@ import threading
 import time
 from pathlib import Path
 
-from case_sets import load_case_set
+from case_sets import DEFAULT_CASE_SET, load_case_set
 from prepare_whitebox_video_smoke import (
     expected_assets,
     load_cases,
@@ -28,6 +28,7 @@ from prepare_whitebox_video_smoke import (
 )
 
 HERE = Path(__file__).resolve().parent
+# Explicit legacy finite-input aliases; case_sets defines the default replay set.
 CASES = {
     "5s": ("zing-whitebox-video-five-triview-0001", 120),
     "30s-wasteland": ("zing-whitebox-video-30s-six-triview-0001", 720),
@@ -64,7 +65,12 @@ def select_cases(args):
             default_manifest(label),
         )
         return None, [(label, manifest, CASES[label][0])]
-    collection = load_case_set(args.case_set or "whitebox-basic")
+    collection = load_case_set(args.case_set or DEFAULT_CASE_SET)
+    if collection["definition"].get("transport") == "continuous_source":
+        raise ValueError(
+            "The default collection requires bench_streaming_source.py; "
+            "use --case-set whitebox-basic for the legacy finite-input cases"
+        )
     aliases = {case_id: label for label, (case_id, _) in CASES.items()}
     selected = [
         (
@@ -247,6 +253,8 @@ def prepare_case(label, manifest, media_root, sampling, case_id=None):
     if case_id not in cases:
         raise ValueError(f"Fixed case is unavailable: {case_id}")
     case = cases[case_id]
+    if "streaming_replay" in case.get("metadata", {}):
+        raise ValueError("Archive replay cases require bench_streaming_source.py")
     user, target = case["messages"]
     conditions = target.get("conditions", [])
     content = target.get("content", [])
@@ -600,7 +608,8 @@ def parser():
     selection = result.add_mutually_exclusive_group()
     selection.add_argument("--case", choices=["all", *CASES], default="all")
     selection.add_argument(
-        "--case-set", help="Collection name or JSON file; default: whitebox-basic"
+        "--case-set",
+        help="Finite-input collection; use whitebox-basic for legacy cases",
     )
     result.add_argument(
         "--manifest-5s", type=Path, default=HERE / "whitebox_video_smoke_cases.jsonl"

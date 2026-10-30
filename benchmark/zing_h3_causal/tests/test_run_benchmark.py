@@ -56,6 +56,8 @@ def test_single_checkpoint_preflight_creates_configs_without_launch(
     out = tmp_path / "run"
     runner.main(
         [
+            "--case-set",
+            "whitebox-basic",
             "--model-path",
             str(model),
             "--source-revision",
@@ -84,7 +86,8 @@ def test_single_checkpoint_preflight_creates_configs_without_launch(
         assert command[command.index(flag) + 1] == value
     assert deployment["sp_degree"] == 2
     assert deployment["pipeline_config"] == {"video_decoder_backend": "native"}
-    assert "all" in calls[0]
+    assert "--case-set" in calls[0]
+    assert calls[0][calls[0].index("--case-set") + 1].endswith("whitebox-basic.json")
 
 
 def test_bundled_decoder_config_resolves_checkpoint_relative_path(
@@ -108,7 +111,15 @@ def test_bundled_decoder_config_resolves_checkpoint_relative_path(
     monkeypatch.setattr(runner.bench_client, "main", lambda *a: None)
     out = tmp_path / "run"
     runner.main(
-        ["--model-path", str(model), "--output-dir", str(out), "--preflight-only"]
+        [
+            "--case-set",
+            "whitebox-basic",
+            "--model-path",
+            str(model),
+            "--output-dir",
+            str(out),
+            "--preflight-only",
+        ]
     )
     pipeline = json.loads((out / "pipeline.json").read_text())
     assert pipeline["decoder_config"]["checkpoint_path"] == str(decoder)
@@ -215,6 +226,8 @@ def test_failed_client_still_releases_owned_server(model, tmp_path, monkeypatch)
     with pytest.raises(SystemExit):
         runner.main(
             [
+                "--case-set",
+                "whitebox-basic",
                 "--model-path",
                 str(model),
                 "--output-dir",
@@ -285,6 +298,8 @@ def test_checkpoint_stage_timing_preflight_enables_client_receipt(
     output = tmp_path / "run"
     runner.main(
         [
+            "--case-set",
+            "whitebox-basic",
             "--model-path",
             str(model),
             *([] if mode is None else ["--stage-timing", mode]),
@@ -370,7 +385,15 @@ def test_refresh_entry_records_failed_preparation_without_launch(
     output = tmp_path / "run"
     with pytest.raises(OSError, match="Interrupted"):
         runner.main(
-            ["--model-path", str(model), "--refresh-cache", "--output-dir", str(output)]
+            [
+                "--case-set",
+                "whitebox-basic",
+                "--model-path",
+                str(model),
+                "--refresh-cache",
+                "--output-dir",
+                str(output),
+            ]
         )
     assert (
         json.loads((output / "media_preparation.json").read_text())["status"]

@@ -1,4 +1,4 @@
-# Zing 固定输入客户端基线
+# Zing 客户端 benchmark
 
 客户端测量 TTFF、E2E、FPS、TPOC、ICL，以及连续 source 的 Prompt-switch TTFF；
 服务端阶段计时见
@@ -6,6 +6,26 @@
 [serving benchmark](https://docs.sglang.io/docs/developer_guide/benchmark_and_profiling#benchmark)
 的常驻服务、预热、重复请求及逐请求记录方式；协议差异使此入口独立于文本
 benchmark，不将 token 指标或视频任务轮询直接套到 Zing。
+
+## 默认测试集合（2026-10-30 起）
+
+后续 Zing / SGLang 测试默认使用 [`product-case-20261029`](PRODUCT_CASE_REPLAY.md)，覆盖单图、
+长 prompt、动态增减参考图和完整长会话。先按该说明准备真实素材，再连接已部署的
+连续 source 服务；不传 `--case` / `--case-set` 即串行运行四条真实请求：
+
+```bash
+PYTHONPATH=python SGLANG_LIGHTWEIGHT_RUNTIME=1 \
+python3 benchmark/zing_h3_causal/bench_streaming_source.py \
+  --url ws://127.0.0.1:30000/v1/realtime_video/generate \
+  --media-root /data/zing-product-case-media --output-dir /data/product-case-run \
+  --seed 42 --paced --timeout 1800 --warmup-runs 1 --measured-runs 3
+```
+
+原四个 case 保留为显式 `--case-set whitebox-basic` 的旧集合回归。
+有限输入工具 `run_benchmark.py` / `bench_client.py` 不支持新集合的动态更新，须显式
+选择旧集合或单 case；未选择时提示改用连续 source，不静默回退旧四条。
+新默认集合目前为 832×480；736 档未验证，仍按下文两档独立验收要求执行。
+四条每轮 RAW RGB 约 26.04 GiB，预热一轮加正式三轮约 104.15 GiB。
 
 ## PR 性能测试要求
 
@@ -142,12 +162,12 @@ Encoder 共卡时，driver 数据属于整卡。保留这类共享范围并标�
 现有阶段回传与 rank memory snapshots 不自动证明三部分均可独立归因；边界详见
 [阶段计时与显存](STAGE_TIMING.md#三部分显存与性能的归因边界)。
 
-## 从 checkpoint 一次运行
+## 旧有限输入集合：从 checkpoint 一次运行
 
 在已安装 SGLang 的 NVIDIA 环境中运行：
 
 ```bash
-python3 benchmark/zing_h3_causal/run_benchmark.py --model-path /path/to/sglang-checkpoint
+python3 benchmark/zing_h3_causal/run_benchmark.py --model-path /path/to/sglang-checkpoint --case-set whitebox-basic
 ```
 
 读取 checkpoint 的 `zing_config.json` 和 `zing_realtime_profile.json`，从 profile
@@ -203,7 +223,9 @@ benchmark 默认请求 Host 阶段数据；无需设置计时环境变量。普�
 
 ## 选择用例集合
 
-默认集合为 [`whitebox-basic`](case_sets/whitebox-basic.json)，包含下面的四组输入，由 Xiaoxiao 提供。
+默认集合为 [`product-case-20261029`](case_sets/product-case-20261029.json)，使用上文连续 source 入口。
+旧集合 [`whitebox-basic`](case_sets/whitebox-basic.json) 包含下面由 Xiaoxiao 提供的四组输入，
+须显式选择，用于旧有限输入与历史结果回归。
 用例保留各自 manifest 内的原始请求与来源信息。
 
 ```bash
@@ -219,7 +241,12 @@ manifest 路径相对于 SGLang 仓库根目录解析。集合按顺序串行运
 其他工具可调用 `case_sets.load_case_set(name_or_path, checkout=...)`，取得集合定义、
 成员 manifest/ID 及原始请求。集合定义与 SHA256 写入客户端 `config.json` 并随报告 JSON 保存。
 
-## 固定输入与部署
+默认真实请求集合 [`product-case-20261029`](PRODUCT_CASE_REPLAY.md) 覆盖单图、长
+prompt、动态增减 reference 和完整长会话；旧四个 case 的内容保持原样。该集合通过
+`bench_streaming_source.py --case-set product-case-20261029` 运行，各 case 自动使用自己的
+条件更新序列；不能用于有限输入入口。素材准备、回放边界与验证状态见该说明。
+
+## 旧集合的固定输入与部署
 
 | case | 固定身份 | 输出 | 参考条件 |
 |---|---|---|---|
@@ -232,7 +259,7 @@ PR #299 的室内用例保留原始三图条件与 prompt；素材及请求准�
 人工检查重点为人物身份、入镜／离镜时序、参考下排外观与长期闪烁／漂移。
 
 2026-10-12 按用户确认采用 PR #261 的两条准确七图长视频输入。
-默认 `--case all` 串行执行四个独立 case；长视频使用
+旧有限输入工具显式选择 `--case-set whitebox-basic` 时串行执行四个旧 case；长视频使用
 `whitebox_video_long_cases.jsonl`（可用 `--manifest-long` 指定）。请求及条件必须与仓库
 规范 case 一致，不能裁剪、循环、减少参考或改写 prompt。旧 `--case 30s` 的六图 ID
 保留为显式旧入口，缺少其 manifest 时仍明确失败；它不进入默认矩阵，也不会被七图冒名替换。
@@ -272,7 +299,7 @@ offload 与编译设置；这是运行者提供的记录，不冒充客户端自
 不强加 GPU 优化开关。不支持有声输出，音视频请求明确拒绝。
 
 ```bash
-python3 benchmark/zing_h3_causal/bench_client.py \
+python3 benchmark/zing_h3_causal/bench_client.py --case-set whitebox-basic \
   --url ws://127.0.0.1:30000/v1/realtime_video/generate \
   --media-root /data/leap-worldmodel-thailand \
   --sampling-params /data/benchmark/sampling.json \

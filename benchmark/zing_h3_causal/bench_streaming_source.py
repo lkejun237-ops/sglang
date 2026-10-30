@@ -17,9 +17,11 @@ from bench_client import (
     write_json,
 )
 from build_streaming_report import build_report, load_received_profiles
+from case_sets import DEFAULT_CASE_SET, load_case_set
 from continuous_source_client import CLIENT_TIMING
 from continuous_source_client import parser as client_parser
 from continuous_source_client import run
+from continuous_source_media import load_prompt_updates
 from prepare_whitebox_video_smoke import (
     expected_assets,
     load_cases,
@@ -51,9 +53,11 @@ STREAM_METRICS = (
 )
 
 
-def prepare_case(label, media_root, output):
-    manifest, case_id = CASES[label]
-    case = load_cases(HERE / manifest)[case_id]
+def prepare_case(label, media_root, output, *, manifest=None, case_id=None):
+    if manifest is None:
+        manifest, case_id = CASES[label]
+        manifest = HERE / manifest
+    case = load_cases(manifest)[case_id]
     assets, local = [], {}
     for uri, identity in expected_assets(case).items():
         path = local_source_path(uri, media_root).resolve()
@@ -71,7 +75,9 @@ def prepare_case(label, media_root, output):
 
     prepared = {
         "label": label,
-        "display_name": CASE_NAMES[label],
+        "display_name": case.get("metadata", {}).get(
+            "display_name", CASE_NAMES.get(label, label)
+        ),
         "case_id": case_id,
         "frames": spec["frames"],
         "width": spec["width"],
@@ -86,7 +92,34 @@ def prepare_case(label, media_root, output):
         "conditioning": "text_and_references_plus_first_accepted_source_frame",
         "assets": assets,
     }
+    replay = case.get("metadata", {}).get("streaming_replay")
+    if replay is not None:
+        prepared["reference_ids"] = replay["initial_reference_ids"]
+        if len(prepared["reference_ids"]) != len(prepared["references"]):
+            raise ValueError("Replay reference IDs do not match the initial images")
+        updates = []
+        for update in replay["prompt_updates"]:
+            updates.append(
+                {
+                    **update,
+                    "references": [
+                        {"id": item["id"], "path": local[item["uri"]]}
+                        for item in update["references"]
+                    ],
+                }
+            )
+        prepared["replay"] = replay
+        prepared["provenance"] = case["provenance"]
+        prepared["manifest_sha256"] = sha256_file(Path(manifest))
+        prepared["prompt_updates"] = updates
     output.mkdir(parents=True, exist_ok=False)
+    if replay is not None:
+        updates_path = (output / "prompt-updates.json").resolve()
+        write_json(updates_path, prepared["prompt_updates"])
+        validated = load_prompt_updates(updates_path)
+        if any(item["source_frame_start"] >= prepared["frames"] for item in validated):
+            raise ValueError("Replay update lies outside the source video")
+        prepared["prompt_updates_path"] = str(updates_path)
     write_json(output / "streaming-case.json", prepared)
     return prepared
 
@@ -139,6 +172,7 @@ async def benchmark(cases, args):
         "timeout_seconds": args.timeout,
         "url": args.url,
         "cases": cases,
+        "case_collection": getattr(args, "case_collection", None),
         "prompt_updates_manifest": (
             dict(
                 path=str(args.prompt_updates),
@@ -203,7 +237,9 @@ async def benchmark(cases, args):
                         command.append("--receive-stage-timing")
                     if args.paced:
                         command.append("--paced")
-                    prompt_updates = args.prompt_updates
+                    prompt_updates = (
+                        case.get("prompt_updates_path") or args.prompt_updates
+                    )
                     if prompt_updates:
                         command.extend(["--prompt-updates", str(prompt_updates)])
                     result = {
@@ -417,7 +453,12 @@ def main():
     parser.add_argument(
         "--url", default="ws://127.0.0.1:30000/v1/realtime_video/generate"
     )
-    parser.add_argument("--case", choices=["all", *CASES], default="5s")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--case", choices=["all", *CASES])
+    selection.add_argument(
+        "--case-set", help=f"Named collection or JSON file; default: {DEFAULT_CASE_SET}"
+    )
+    parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--media-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--paced", action="store_true")
@@ -462,11 +503,30 @@ def main():
     ):
         parser.error("Invalid repetition count, source batch size or timeout")
     args.output_dir.mkdir(parents=True, exist_ok=False)
-    labels = list(CASES) if args.case == "all" else [args.case]
-    cases = [
-        prepare_case(label, args.media_root, args.output_dir / "cases" / label)
-        for label in labels
-    ]
+    if args.case_set or args.case in (None, "all"):
+        collection = load_case_set(args.case_set or DEFAULT_CASE_SET)
+        if args.prompt_updates:
+            parser.error("Collection cases provide their own prompt updates")
+        cases = [
+            prepare_case(
+                member["case_id"],
+                args.media_root,
+                args.output_dir / "cases" / member["case_id"],
+                manifest=member["manifest"],
+                case_id=member["case_id"],
+            )
+            for member in collection["members"]
+        ]
+        args.case_collection = {
+            key: value for key, value in collection.items() if key != "members"
+        }
+        write_json(args.output_dir / "case-set.json", args.case_collection)
+    else:
+        labels = [args.case]
+        cases = [
+            prepare_case(label, args.media_root, args.output_dir / "cases" / label)
+            for label in labels
+        ]
     try:
         cases = [
             case_geometry(
@@ -484,6 +544,9 @@ def main():
         write_json(
             args.output_dir / "cases" / case["label"] / "streaming-case.json", case
         )
+    if args.preflight_only:
+        write_json(args.output_dir / "preflight.json", {"cases": cases})
+        return
     asyncio.run(benchmark(cases, args))
     if args.prewarm_only:
         rows = json.loads((args.output_dir / "results.json").read_text())["requests"]

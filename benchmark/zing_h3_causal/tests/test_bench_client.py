@@ -160,7 +160,7 @@ def test_registered_long_cases_preserve_conditions_and_full_source(
     assert source.get("clip") is None
 
 
-def test_default_matrix_is_four_distinct_business_cases():
+def test_legacy_finite_matrix_is_four_distinct_business_cases():
     import bench_client as client
 
     assert client.DEFAULT_CASES == ("5s", "30s-wasteland", "30s-town", "30s-indoor")
@@ -172,7 +172,7 @@ def test_named_collection_preserves_order_requests_and_provenance():
     import bench_client as client
     from case_sets import load_case_set
 
-    collection = load_case_set()
+    collection = load_case_set("whitebox-basic")
     assert collection["definition"]["name"] == "whitebox-basic"
     assert [m["case_id"] for m in collection["members"]] == [
         client.CASES[label][0] for label in client.DEFAULT_CASES
