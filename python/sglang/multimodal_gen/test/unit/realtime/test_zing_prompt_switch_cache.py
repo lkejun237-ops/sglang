@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared startup/switch cache: real CPU KV arithmetic and transport stand-ins."""
 
-import json
-import os
 import time
-from contextlib import nullcontext
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
@@ -19,6 +16,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
     preparation_key,
 )
 from sglang.multimodal_gen.test.unit.realtime.test_zing_preparation_cache import inputs
+from sglang.multimodal_gen.test.unit.realtime.zing_cache_fixtures import (  # noqa: F401
+    cpu_cache,
+    cpu_dma,
+    disk_commit,
+)
 from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
     cpu_execution_options,
 )
@@ -28,80 +30,6 @@ from sglang.multimodal_gen.test.unit.test_zing_h3_model import model as model_fi
 @pytest.fixture
 def model():
     return model_fixture.__wrapped__()
-
-
-@pytest.fixture
-def cpu_dma(monkeypatch):
-    """Run real tensor copies/KV commits, replacing only CUDA transport on CPU."""
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
-        preparation_cache,
-    )
-
-    stream = NS(
-        device=torch.device("cuda:0"),
-        wait_stream=Mock(),
-        wait_event=Mock(),
-        synchronize=Mock(),
-    )
-    events = []
-
-    class Event:
-        def __init__(self, **kwargs):
-            self.synchronized = False
-            events.append(self)
-
-        def record(self):
-            pass
-
-        def synchronize(self):
-            self.synchronized = True
-
-        def query(self):
-            return self.synchronized
-
-    empty = torch.empty
-
-    def allocate(*args, **kwargs):
-        kwargs.pop("pin_memory", None)
-        return empty(*args, **kwargs)
-
-    monkeypatch.setattr(torch, "empty", allocate)
-    monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: stream)
-    monkeypatch.setattr(torch.cuda, "Event", Event)
-    monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda *args: stream)
-    monkeypatch.setattr(
-        preparation_cache, "coordinate_validation", lambda value: [value]
-    )
-    return events, stream
-
-
-def cpu_cache(storage, *, entries=6, rows=32):
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.preparation_cache import (
-        Block0PreparationCache,
-    )
-
-    pool = NS(
-        _pool=NS(_slots=[NS(kv_cache=storage)]),
-        plan=NS(config=NS(max_prefix_rows=rows)),
-    )
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.disk_cache import (
-        Block0DiskCache,
-    )
-
-    identity = {"model": {"fixture": "model"}, "layout": {"sp": 1}}
-    root = os.environ.get("SGLANG_ZING_DISK_CACHE_DIR")
-    disk = None
-    if root:
-        from pathlib import Path
-
-        Path(root).mkdir(parents=True, exist_ok=True)
-        disk = Block0DiskCache(root, max_bytes=1 << 30, identity=identity)
-    first = storage[0].k
-    slot_bytes = len(storage) * 2 * rows * first[0].numel() * first.element_size()
-    return Block0PreparationCache(
-        pool, max_bytes=entries * slot_bytes, identity=identity, disk_cache=disk
-    )
 
 
 def test_lru_reuses_preallocated_slots_and_waits_for_fill(cpu_dma):
@@ -158,7 +86,7 @@ def test_partial_sp_hit_falls_back(cpu_dma, monkeypatch):
     )
 
     owner = cpu_cache([NS(k=torch.zeros(8, 2, 3))])
-    owner.entries["A"] = object()
+    owner.entries["A"] = NS(generation="A-generation")
     monkeypatch.setattr(
         preparation_cache, "coordinate_validation", lambda value: [value, ("A", False)]
     )
@@ -223,7 +151,9 @@ def test_source_prefetch_checks_cache_before_rpc(
     key, _ = state._block0_update_key(stage, "B", {})
     if scenario != "miss":
         owner.entries[key] = NS(
-            inputs=state.inputs, conditioning_identity="cached-condition"
+            inputs=state.inputs,
+            conditioning_identity="cached-condition",
+            generation="fixture",
         )
     state.sampler = NS(discard_pending_prompt=Mock(), update_prompt=Mock())
     state._admit_prompt_update = Mock(return_value="pool-request")
@@ -270,11 +200,13 @@ def test_source_prefetch_checks_cache_before_rpc(
         context.term()
 
 
-def test_post_switch_fill_waits_for_new_epoch_output():
+@pytest.mark.parametrize("enabled", [False, True])
+def test_post_switch_fill_waits_for_new_epoch_output(enabled):
     state = source_session.ZingSourceStreamState()
     prefix = object()
     state.sampler = NS(cache=NS(prefix=prefix), committed_pixel=21)
-    state.block0_cache = NS(fill=Mock())
+    state.block0_cache = NS(fill=Mock(), register=Mock())
+    state.cache_write = enabled
     state.block0_key = "B"
     state.block0_inputs = inputs()
     state.block0_condition_identity = "B-condition"
@@ -288,8 +220,10 @@ def test_post_switch_fill_waits_for_new_epoch_output():
     state.ledger.output_frames = 22
     state._fill_block0_after_output()
     state._fill_block0_after_output()
-    state.block0_cache.fill.assert_called_once()
-    assert state.block0_cache.fill.call_args.args[0] == "B"
+    assert state.block0_cache.fill.call_count == int(enabled)
+    assert state.block0_cache.register.call_count == int(enabled)
+    if enabled:
+        assert state.block0_cache.fill.call_args.args[0] == "B"
 
 
 def test_key_reuses_accepted_media_after_uri_changes(tmp_path):
@@ -389,6 +323,7 @@ def test_startup_a_switch_b_a_reuses_kv_and_preserves_outputs(
         state.sampler, state.inputs = ready, base
         state.ledger = NS(output_frames=0)
         state.block0_cache = cache
+        state.cache_write = cached
         state.block0_inputs = base
         state.block0_condition_identity = "A-condition"
         state.block0_request = "pool-request"
@@ -452,6 +387,10 @@ def test_startup_a_switch_b_a_reuses_kv_and_preserves_outputs(
                     realtime_prompt_version=i,
                     session=NS(get_or_create_state=lambda _: condition_state),
                 )
+                if cached and tier == "l2":
+                    # Explicit preparation is outside the online lookup path.
+                    key, _ = state._block0_update_key(stage, prompt, {})
+                    cache.manage("preload", [key])
                 assert state._update_prompt(stage, batch) is None
             start, end = ready.next_latent, ready.next_latent + ready.next_chunk_size
             ready.append(
@@ -620,88 +559,22 @@ def disk_cache(tmp_path, monkeypatch, **env):
     )
 
 
-def disk_commit(cache, key, value=1.0, rows=3, layers=2, rank=0):
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.disk_cache import (
-        Block0DiskCache,
-    )
-    from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import ZingKVRequest
-
-    assert isinstance(cache, Block0DiskCache)
-    kv = torch.full((layers, 2, rows, 2, 2), value, dtype=torch.bfloat16)
-    tmp = cache.new_tmp_dir(key)
-    path = cache.save_rank_kv(key, rank, kv, tmp)
-    prepared = inputs()
-    prepared.positive["context"] = torch.full((rows, 4), value, dtype=torch.bfloat16)
-    conditions = {
-        "conditioning_identity": f"{key}-condition",
-        "inputs": prepared,
-        "request": ZingKVRequest(
-            target_height=32,
-            target_width=32,
-            source_shape=(32, 32),
-            prefix_rows=rows,
-            window_chunks=6,
-            sink_chunks=3,
-            rope_position_mode="block_relative",
-            rope_max_frame_gap=12,
-        ),
-        "positions": torch.arange(rows).reshape(rows, 1).repeat(1, 3),
-    }
-    manifest = {
-        "identity": cache.identity,
-        "generation": "fixture-" + key,
-        "sp_world_size": cache.sp_world_size,
-        "geometry": {"prefix_rows": rows},
-        "prompt_preview": f"prompt-{key}",
-    }
-    entry = cache.commit_entry(key, conditions, manifest, {rank: path}, tmp)
-    assert entry is not None
-    return kv, entry
-
-
-def test_disk_cache_roundtrip_complete_marker_and_index(tmp_path, monkeypatch):
+def test_disk_cache_roundtrip_and_usage_snapshot(tmp_path, monkeypatch):
     cache = disk_cache(tmp_path, monkeypatch)
     key = "abcdef012345"
-    kv, entry = disk_commit(cache, key, value=2.5)
-
+    kv, _ = disk_commit(cache, key, value=2.5)
     folder = cache._entry_dir(key)
-    assert folder.is_dir()
-    assert (folder / ".complete").is_file()
+    assert (folder / "rank-0/ready.json").is_file()
     assert not any(cache.tmp_root.iterdir())
-    manifest = json.loads((folder / "manifest.json").read_text())
-    for name in (
-        "early_key",
-        "created_at",
-        "last_accessed_at",
-        "sp_world_size",
-        "geometry",
-        "prompt_preview",
-    ):
-        assert name in manifest
-    assert manifest["early_key"] == key
-    assert manifest["sp_world_size"] == 1
-
-    index = json.loads((cache.cache_dir / "lru_index.json").read_text())
-    assert index["version"] == 2
-    assert index["stats"]["total_entries"] == 1
-
-    assert index["stats"]["total_bytes"] == entry["size_bytes"]
-    assert "max_entries" not in index["stats"]
-    assert index["stats"]["max_bytes"] == cache.max_bytes
-    assert [item["key"] for item in index["entries"]] == [key]
-
+    usage = cache.collect()
+    assert usage["root_entries"] == 1
+    assert usage["root_bytes"] > kv.numel() * kv.element_size()
     hit = cache.lookup(key, 0)
-    assert hit is not None
     restored = torch.zeros_like(kv)
     assert hit.load_kv_into(restored) is restored
     assert torch.equal(restored, kv)
     assert hit.conditions["conditioning_identity"] == f"{key}-condition"
     assert hit.manifest["early_key"] == key
-    accessed = json.loads((cache.cache_dir / "lru_index.json").read_text())
-    assert (
-        accessed["entries"][0]["last_accessed_at"]
-        >= index["entries"][0]["last_accessed_at"]
-    )
 
 
 def test_disk_prefetch_hint_is_local_read_only_and_not_a_validated_hit(
@@ -711,49 +584,47 @@ def test_disk_prefetch_hint_is_local_read_only_and_not_a_validated_hit(
     key = "abcdef012345"
     assert not cache.may_contain(key)
     disk_commit(cache, key)
-    index = cache.index_path.read_bytes()
+    cache.collect()
+    index = cache.usage_path.read_bytes()
     folder = cache._entry_dir(key)
     assert cache.may_contain(key)
-    assert cache.index_path.read_bytes() == index
+    assert cache.usage_path.read_bytes() == index
     cache.local_rank = 1
     assert not cache.may_contain(key)  # Another rank's KV is not this shard.
     cache.local_rank = 0
     (folder / "rank-0/conditions.pt").write_bytes(b"corrupt")
     assert cache.may_contain(key)  # A hint must still be validated by the owner.
     assert cache.lookup(key) is None
-    (folder / ".complete").unlink()
+    (folder / "rank-0/ready.json").unlink()
     assert not cache.may_contain(key)
     assert not cache.may_contain("../escape")
 
 
-def test_disk_index_self_heals_when_missing_or_corrupt(tmp_path, monkeypatch):
+def test_usage_snapshot_corruption_does_not_affect_hits_and_gc_repairs_it(
+    tmp_path, monkeypatch
+):
     cache = disk_cache(tmp_path, monkeypatch)
     key = "012345abcdef"
     disk_commit(cache, key)
-    index_path = cache.cache_dir / "lru_index.json"
-
-    index_path.unlink()
-    assert cache.lookup(key, 0) is not None
-    assert index_path.is_file()
-
-    index_path.write_text("{not json")
-    assert cache.lookup(key, 0) is not None
-    rebuilt = json.loads(index_path.read_text())
-    assert rebuilt["version"] == 2
-    assert [item["key"] for item in rebuilt["entries"]] == [key]
+    assert cache.lookup(key) is not None
+    assert cache.list_entries()["root_bytes"] is None
+    cache.usage_path.write_text("broken")
+    assert cache.lookup(key) is not None
+    cache.collect()
+    assert cache.list_entries()["total_entries"] == 1
 
 
-def test_disk_lru_evicts_only_by_bytes(tmp_path, monkeypatch):
+def test_disk_lru_evicts_only_during_gc(tmp_path, monkeypatch):
     cache = disk_cache(tmp_path, monkeypatch)
     for key in ("a1", "b2", "c3"):
         disk_commit(cache, key)
-    index = json.loads(cache.index_path.read_text())
-    assert len(index["entries"]) == 3
-    assert "max_entries" not in index["stats"]
-    cache.max_bytes = int(index["stats"]["total_bytes"] * 0.6)
+    usage = cache.collect()
+    assert len(usage["entries"]) == 3
+    cache.max_bytes = int(usage["root_bytes"] * 0.6)
     disk_commit(cache, "d4")
-    index = json.loads(cache.index_path.read_text())
-    assert index["stats"]["total_bytes"] <= cache.max_bytes
+    assert len(cache._scan()) == 4
+    usage = cache.collect()
+    assert usage["root_bytes"] <= cache.max_bytes * cache.gc_low_watermark
     assert not cache._entry_dir("a1").exists()
     assert cache.lookup("d4") is not None
 
@@ -778,9 +649,10 @@ def test_l2_disk_hit_promotes_into_l1_and_matches_values(
     old = owner.entries["L2"]
 
     fresh = cpu_cache(stores, entries=2, rows=8)
-    assert fresh.lookup("L2") is not None
+    assert fresh.lookup("L2") is None
+    assert fresh.manage("preload", ["L2"])["all_ready"]
     promoted = fresh.entries["L2"]
-    assert fresh.hits == 1 and fresh.misses == 0
+    assert fresh.hits == 1 and fresh.misses == 1  # Online miss, then explicit preload.
     assert promoted.slot == 0
     assert promoted.conditioning_identity == "L2-condition"
     assert torch.equal(promoted.data, old.data)
@@ -837,6 +709,8 @@ def test_l2_restore_rebinds_process_local_signature(
         restarted._bind_cache(destination, torch.empty(0, 3))
         destination.clear()  # Existing prompt-switch boundary.
     fresh = cpu_cache(destination.storage, entries=2)
+    assert fresh.lookup("restart") is None
+    assert fresh.manage("preload", ["restart"])["all_ready"]
     promoted = fresh.lookup("restart")
     assert promoted is not None
     fresh.restore(destination, promoted).commit(destination)

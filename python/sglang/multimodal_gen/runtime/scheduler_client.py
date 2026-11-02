@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
+    ZingCacheReq,
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
@@ -129,6 +130,8 @@ def _session_key(batch: Any) -> str | None:
 
 
 def _select_replica(batch: Any, dp_size: int, counter: "itertools.count") -> int:
+    if isinstance(batch, ZingCacheReq) and dp_size != 1:
+        raise ValueError("Zing L1 cache management requires DP=1")
     if dp_size <= 1:
         return 0
     session = _session_key(batch)

@@ -243,7 +243,7 @@ class ZingH3GenerationStage(PipelineStage):
         )
         self.kv_pool = pool
         if block0 is not None:
-            from .block0_identity import build_identity, fingerprint
+            from .block0_identity import build_identity
             from .disk_cache import Block0DiskCache
             from .preparation_cache import Block0PreparationCache
 
@@ -256,11 +256,20 @@ class ZingH3GenerationStage(PipelineStage):
                     max_bytes=disk_bytes,
                     identity=identity,
                     rank=get_sp_parallel_rank(),
-                    world_size=identity["layout"]["sp"],
+                    world_size=identity["sp"]["size"],
+                    gc_interval=getattr(
+                        server_args, "zing_block0_cache_gc_interval_s", 60.0
+                    ),
+                    gc_stale_seconds=getattr(
+                        server_args, "zing_block0_cache_gc_stale_s", 600.0
+                    ),
+                    gc_low_watermark=getattr(
+                        server_args, "zing_block0_cache_gc_low_watermark", 0.9
+                    ),
                 )
                 owner = Block0PreparationCache(
                     pool,
-                    max_bytes=host_bytes // identity["layout"]["sp"],
+                    max_bytes=host_bytes // identity["sp"]["size"],
                     identity=identity,
                     disk_cache=disk,
                 )
@@ -270,14 +279,20 @@ class ZingH3GenerationStage(PipelineStage):
             if any(value is not None for value in errors):
                 raise ValueError(f"Block0 startup failed: {errors}")
             self.block0_cache = owner
+            # Global rank zero gives one collector even with multiple SP/DP groups.
+            if getattr(server_args, "zing_block0_cache_gc", False) and (
+                not torch.distributed.is_initialized()
+                or torch.distributed.get_rank() == 0
+            ):
+                disk.start_gc()
             logger.info(
                 "Zing Block0 cache ready: model=%s layout=%s pinned_bytes_per_rank=%d slots=%d root=%s disk_bytes=%d",
-                fingerprint(identity["model"]),
-                fingerprint(identity["layout"]),
+                identity["zing_config"].get("checkpoint_sha256"),
+                identity["sp"],
                 owner.data.numel() * owner.data.element_size(),
                 owner.data.shape[0],
                 root,
-                disk_bytes,
+                disk.max_bytes,
             )
 
     def kv_request(self, sampler, inputs, layout, *, source_shape, total_frames):
@@ -645,6 +660,12 @@ class ZingH3GenerationStage(PipelineStage):
             )
 
     def _forward_realtime(self, batch, server_args):
+        from .cache_logging import batch_context, cache_scope
+
+        with cache_scope(batch_context(batch)):
+            return self._forward_realtime_with_cache_context(batch, server_args)
+
+    def _forward_realtime_with_cache_context(self, batch, server_args):
         if batch.session is None:
             raise ValueError("Zing realtime request is missing its worker session")
         if "zing_prefill" in batch.extra:
@@ -662,9 +683,14 @@ class ZingH3GenerationStage(PipelineStage):
                     batch=batch,
                     config=config,
                     source_preview=source_preview(config, data),
+                    force=batch.extra["zing_prefill"].get("force", False),
                 )
             if entry is None:
                 raise ValueError("Block0 prefill did not publish a cache entry")
+            labels = batch.extra["zing_prefill"]
+            self.block0_cache.register(
+                entry.key, labels.get("game_id"), labels.get("group_id")
+            )
             return OutputBatch(
                 output=[],
                 usage={

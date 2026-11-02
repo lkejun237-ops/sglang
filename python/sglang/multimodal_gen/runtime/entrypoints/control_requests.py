@@ -57,3 +57,11 @@ class ReplaceQueuedRealtimeReq(msgspec.Struct):
     chunk_index: int
     request_id: str
     replacement: Any
+
+
+class ZingCacheReq(msgspec.Struct):
+    operation: str
+    game_id: Optional[str] = None
+    group_id: Optional[str] = None
+    cache_key: Optional[str] = None
+    log_context: Optional[dict] = None

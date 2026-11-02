@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
+    ZingCacheReq,
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
@@ -158,6 +159,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             UnmergeLoraWeightsReq: self._handle_unmerge_lora,
             Req: self._handle_generation,
             ListLorasReq: self._handle_list_loras,
+            ZingCacheReq: self._handle_zing_cache,
             ShutdownReq: self._handle_shutdown,
             ReleaseRealtimeSessionReq: self._handle_release_realtime_session,
             GetDisaggStatsReq: self._handle_get_disagg_stats,
@@ -210,6 +212,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if self._disagg_metrics is None:
             return None
         return self._disagg_metrics.snapshot().to_dict()
+
+    def _handle_zing_cache(self, reqs: List[Any]) -> OutputBatch:
+        return self.worker.manage_zing_cache(reqs[0])
 
     def _handle_get_disagg_stats(self, _reqs: List[Any]) -> OutputBatch:
         """Handle stats request — return disagg metrics via OutputBatch.output."""

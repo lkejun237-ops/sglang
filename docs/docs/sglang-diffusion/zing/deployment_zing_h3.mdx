@@ -196,7 +196,8 @@ seed 123、E1 + SP2 + D1、BF16、Graph 与 Block0 热缓存，候选显式开�
 2026-10-28，基于 `5e66d5e2c3` 的后续改动：有 GPU KV pool 时默认启用 pinned CPU +
 磁盘 Block0 缓存；没有 pool 时跳过缓存，服务继续启动。生产只保留 `on/off`，开启统一 overlap。
 启用时必须在启动参数显式给出 `--zing-block0-cache-host-gb`、`--zing-block0-cache-dir`、
-`--zing-block0-cache-disk-gb`。路径由部署先挂载 CPFS 并创建，缺参数/未挂载/不可写/分配失败退出。
+`--zing-block0-cache-disk-gb`。路径由部署先挂载本地 NVMe 并创建；缺参数、未挂载或 pinned 分配失败退出。
+磁盘写入失败按下述 #467 的 L2 降级语义处理。
 GB 为十进制，pinned KV 预算按整个部署而非每 rank 计；上海 H100 机型规格为 2048 GB 内存，
 建议从整部署 800 GB 起配（SP2 每 rank 约 400 GB，实际按完整槽位向下取整），
 不代表当前容器一定可分配 800 GB。磁盘仅按总字节数淘汰，无 50 条上限。
@@ -209,10 +210,69 @@ conditioning 文件改用基础数据与 Tensor 协议及 `weights_only=True`，
 旧条件格式直接 miss。目录写权限由部署控制。L1/L2 淘汰与槽位策略留到后续 PR。
 针对 `e17d9f166b` 的 GitHub Actions `40705343014` 两轮 CPU 契约每轮 87 项通过、无失败/跳过，
 覆盖寻址、字节预算、重启恢复、SP2 分片完整性及安全条件加载；完整 CI 状态见 PR 检查。
-**800 GB pinned 分配、CPFS 实机、480/736 GPU 数值与性能均未测**；本轮按用户决定只验缓存 CPU 契约。
+**800 GB pinned 分配、480/736 GPU 数值与性能均未测**；本节版本只验缓存 CPU 契约，后续本地盘验收见下一节。
 Encoder/DiT/Decoder 的新耗时和常驻/峰值显存均未测，不能沿用下文旧收益作为本版验收。
 设计与配置见[默认缓存方案](/docs/sglang-diffusion/zing/plans/BLOCK0_CACHE_DEFAULTS)，
 测试范围和当前状态见[CPU 验证记录](/benchmark/zing_h3_causal/BLOCK0_CACHE_DEFAULTS_VALIDATION)。
+
+### 本地 NVMe L2 管理与强制 prefill（PR #467）
+
+2026-10-30 确认先以同机本地 NVMe 为验收和部署范围：各实例独立 L1，同机实例共享一个已挂载的
+NVMe 缓存目录；不同机器的本地盘相互独立。同 key 结果视为等价，唯一临时文件写完后逐文件
+原子替换，不依赖跨机器 flock，不要求缓存 generation 一致或整组分片原子切换。
+各 rank 全部加载校验成功才命中；缺失、读取失败或删除竞争则整组 miss。
+
+截至 `1889a04f78`，L1 miss 会同步读盘并加载到 L1，然后搬到 GPU。prefill 可提前准备缓存，
+`force=true` 重建本实例 Block0 并异步覆盖 L2，完成回执不等磁盘；但复用正在写盘的 L1 槽位仍可能等待。
+磁盘删除不影响已有 L1、活跃会话，也不阻止在途写回。
+
+2026-10-30 候选代码改为正常视频只查 L1、默认 cache_write=false，增加显式
+preload/status/unload 与 game/group 索引，并简化 key 和目录。L1 管理要求 DP=1，
+中台先准备缓存再把视频请求路由到同一实例。`65ae9daf74` 的缓存专项两轮 378 项通过，
+完整 CPU CI（`87ec8e38f3`）已通过；
+接口参数与实现边界见[最新确认方案](/docs/sglang-diffusion/zing/plans/BLOCK0_CACHE_MANAGEMENT_SHARED_L2)。
+本次新目录/索引的同机双进程 NVMe 小规模探针已通过，详见下方验收链接。
+下述 181 项 CPU 和大 KV IO 结果只覆盖原有代码，不作为新业务路径的完整验收。
+旧 v2 目录不迁移，升级使用新空目录或由部署清理旧目录。
+
+2026-11-01 的缓存日志增量沿用服务 stdout/logger，默认 `--log-level info` 可查看
+`zing_cache_event` 单行 JSON：查询、prefill、填充/淘汰、写盘、管理操作及发生删除的 GC。
+按 `operation_id` 关联发起操作与异步写盘，按 `instance` / `rank` 区分实例和分片；
+正常 INFO 仅由各实例 SP rank 0 输出，失败 WARNING 保留实际 rank。
+状态轮询、空转 GC 和逐分片细节需 `--log-level debug`。
+prefill completed 仅说明本实例 L1 可用，L2 持久化看独立的 l2_write completed；
+日志的 `elapsed_host_ms` 是 host 耗时，不是 GPU 完成时间。
+本轮同时删除 key 中重复的 `source.fps`，模型配置与媒体 FPS 身份保持原有语义，需按新 key 重新 prefill。
+本增量验证走 CPU CI，具体 run 和回执见 PR #467；本版本 GPU 性能未重新测量。
+
+2026-11-01，`37e76af6fd` 在上海 L20Z 80GB 四卡完成 SP=2 的 832×480 输出对照：
+1027 step010000、chunk `[3,2]`、`split_first_latent=false`、eager，显式 prefill 后使用 L1。
+原始 product case 的少图 403 帧与换图 764 帧（六次更新全部生效），各组各一次，
+与关闭缓存重算的完整 RGB 逐字节一致；日志确认初始及换图查询均命中 L1。
+[同步对比视频与配置](https://review-cdn.loopit.com.cn/reports/pr467-cache-20261101/r5/index.html)
+需办公网或公司 VPN；人工画质验收待完成。这是输出正确性证据，480/736 正式性能与阶段显存对照仍未测，
+双实例 API 闭环的独立验收状态和回执见 PR #467；视频启动方式与精确 Pod 记录见下方验收链接。
+
+部署时配置共享本地路径、每实例 L1 预算和磁盘容量水位，并关注：
+
+1. **指定 GC 实例**：同一目录只在一个实例添加 `--zing-block0-cache-gc`，其余实例默认关闭。
+2. **预留磁盘余量**：`--zing-block0-cache-disk-gb` 是清理高水位，低于分配给缓存的容量，并为临时文件、并发写入和同盘其他数据留余量；它不是硬配额。写满错误捕获后按 L2 写入失败处理。
+
+GC 根据 mtime 清理残留，超水位后按近似 LRU 淘汰；不做实时全局计数或空间预留。
+可选参数 `--zing-block0-cache-gc-interval-s` 默认 60、`--zing-block0-cache-gc-stale-s` 默认 600、
+`--zing-block0-cache-gc-low-watermark` 默认 0.9。无须手工初始化共享预算文件。
+不兼容旧 #455/#467 中间版本进程混跑，两个实例统一升级；旧格式 miss 后重建。
+
+运行时 `e42b951c15` 的缓存专项两轮 362 项与完整 CPU CI 均通过。2026-10-30 上海同机 Samsung
+NVMe/ext4 验收通过（工具提交 `08883300b3`，运行时未变）：181 项 CPU 用例，以及双进程发布、
+读删恢复与残留 GC 均通过。合成 SP2 单 key 16.406 GiB、每 rank 8.203 GiB，并行 IO 三轮中位数：
+冷读 2.840 秒、页缓存热读 2.093 秒、写入并 fsync 7.911 秒；每轮冷读前驻留率 0%、热读前 100%。
+这些是预分配 pageable CPU Tensor 的文件 IO 测量，不含 pinned 分配、H2D 或完整 lookup/业务 TTFF。
+验收 Pod `pr467-nvme-20261030-r4` Succeeded / exit 0，8 CPU / 80 GiB / 零 GPU；完整回执见下文链接。
+本 PR 只支持同机本地磁盘；网络存储与跨机器共享不在支持范围。
+[管理方案](/docs/sglang-diffusion/zing/plans/BLOCK0_CACHE_MANAGEMENT_SHARED_L2)与
+[验收方法和状态](/benchmark/zing_h3_causal/BLOCK0_CACHE_MANAGEMENT_VALIDATION)。
+480/736 的本版 GPU TTFF、E2E、FPS、Encoder/DiT/Decoder 耗时及显存均未测。
 
 ## 连续 source 的首次合批等待
 
@@ -520,7 +580,7 @@ latent 来自历史 10 层 DiT 诊断，Decoder 本身仍为完整 26 层。上�
    独立 Qwen 与 source Encoder 可共卡，但需要把两进程的整卡占用一起考虑。
    [PR #331](https://github.com/seedleap/sglang/pull/331) 的 remote 默认值修改尚未合入，
    不要因文档里的推荐而省略参数。
-2. **准备匹配的离线 AdaLN 表。** 主线 #374 已默认 weights-free，部署前按
+2. **准备匹配的离线 AdaLN 表。** 主线 #378 已默认 weights-free，部署前按
    [AdaLN 表契约](/docs/sglang-diffusion/zing/specs/ADALN_TABLE)准备目标设备、权重和完整
    schedule 对应的表，检查零 projection storage、零 miss/fallback。
    SP2 历史四分支模型 ready allocated 从 127.90 降到 95.58 GiB/rank，

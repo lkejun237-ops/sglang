@@ -480,6 +480,10 @@ class ServerArgs(DisaggServerArgsMixin):
     zing_block0_cache_host_gb: float | None = None
     zing_block0_cache_dir: str | None = None
     zing_block0_cache_disk_gb: float | None = None
+    zing_block0_cache_gc: bool = False
+    zing_block0_cache_gc_interval_s: float = 60.0
+    zing_block0_cache_gc_stale_s: float = 600.0
+    zing_block0_cache_gc_low_watermark: float = 0.9
     conditioning_service_url: str | None = None
     conditioning_config: str | None = field(default=None, repr=False)
     realtime_max_message_bytes: int = DEFAULT_MESSAGE_BYTES
@@ -2140,13 +2144,37 @@ class ServerArgs(DisaggServerArgsMixin):
         parser.add_argument(
             "--zing-block0-cache-dir",
             default=None,
-            help="Required with Block0 caching: an existing directory on mounted shared storage (CPFS).",
+            help="Required with Block0 caching: an existing directory on mounted local storage (NVMe); same-host instances may share it.",
         )
         parser.add_argument(
             "--zing-block0-cache-disk-gb",
             type=float,
             default=None,
-            help="Required with Block0 caching: decimal GB budget for the entire cache root; no entry-count limit.",
+            help="Required with Block0 caching: shared-root GC high watermark in decimal GB (not a hard quota).",
+        )
+
+        parser.add_argument(
+            "--zing-block0-cache-gc",
+            action="store_true",
+            help="Enable periodic shared-root GC in this instance only; enable in exactly one instance per root.",
+        )
+        parser.add_argument(
+            "--zing-block0-cache-gc-interval-s",
+            type=float,
+            default=60.0,
+            help="Seconds between GC scans (default: 60).",
+        )
+        parser.add_argument(
+            "--zing-block0-cache-gc-stale-s",
+            type=float,
+            default=600.0,
+            help="Modification-age timeout for incomplete entries and temporary files (default: 600 seconds).",
+        )
+        parser.add_argument(
+            "--zing-block0-cache-gc-low-watermark",
+            type=float,
+            default=0.9,
+            help="Fraction of the disk budget to retain after capacity eviction (default: 0.9).",
         )
 
         parser.add_argument(

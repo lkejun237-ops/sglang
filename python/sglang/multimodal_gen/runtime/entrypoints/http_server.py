@@ -451,12 +451,17 @@ def create_app(server_args: ServerArgs):
     app.include_router(health_router)
     app.include_router(vertex_router)
 
-    from sglang.multimodal_gen.runtime.entrypoints.openai import common_api, mesh_api
+    from sglang.multimodal_gen.runtime.entrypoints.openai import (
+        common_api,
+        mesh_api,
+        zing_cache_api,
+    )
 
     app.include_router(common_api.router)
     app.include_router(image_api.router)
     app.include_router(video_api.router)
     app.include_router(realtime_video_api.router)
+    app.include_router(zing_cache_api.router)
     if server_args.pipeline_config.supports_action_endpoint():
         app.include_router(action_api.router)
     if server_args.pipeline_config.supports_openpi_endpoint():

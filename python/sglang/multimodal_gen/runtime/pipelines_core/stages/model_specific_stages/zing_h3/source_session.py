@@ -2,6 +2,7 @@
 """Worker-owned continuous RGB session; reuse codec and source-ready kernels."""
 
 import json
+import logging
 import os
 import time
 from collections import deque
@@ -30,6 +31,7 @@ from sglang.multimodal_gen.runtime.utils.zing_stage_timing import (
     trace_for_batch,
 )
 
+from .cache_logging import batch_context, cache_event, cache_scope
 from .incremental import SourceReadySession
 from .media_geometry import resolve_source_geometry
 from .remote_decoder import create_decoder
@@ -89,11 +91,6 @@ def _source_key_policy(stage, sampler, work_quantum, command):
     }
     if getattr(sampler, "joint_forward", "off") != "off":
         policy["joint_forward"] = sampler.joint_forward
-    cache = getattr(stage, "block0_cache", None)
-    if cache is not None:
-        from .block0_identity import fingerprint
-
-        policy["block0_identity"] = fingerprint(cache.identity)
     return policy, defer_final, prompt_joint
 
 
@@ -123,11 +120,17 @@ class ZingSourceStreamState(BaseRealtimeState):
         self.block0_lookup_ms = 0.0
         self.block0_output_start = 0
         self.pending_block0 = None
+        self.cache_write = False
+        self.cache_labels = {}
 
     def initialize(self, stage, batch, config, trace=None):
         params = batch.sampling_params
         stage._validate_sampling_params(params)
         command = batch.extra["zing_source_command"]
+        self.cache_write = command.get("cache_write", False)
+        self.cache_labels = {
+            name: command.get(name) for name in ("game_id", "group_id")
+        }
         self.work_quantum = source_work_quantum(command.get("work_quantum"))
         sampling_options = (
             {"source_sampling_schedule": command["sampling_schedule"]}
@@ -155,6 +158,21 @@ class ZingSourceStreamState(BaseRealtimeState):
             preview = source_preview(config, command["appends"][0]["payload"]["data"])
         request = stage._build_request(batch)
         self.block0_cache = getattr(stage, "block0_cache", None)
+        log_rank = (
+            torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        )
+        if self.block0_cache is None:
+            cache_event(
+                "lookup",
+                "disabled",
+                reason="cache_disabled",
+                next_action="recompute",
+                rank=log_rank,
+            )
+        if not self.cache_write:
+            cache_event(
+                "cache_write", "disabled", reason="cache_write_false", rank=log_rank
+            )
         if self.block0_cache is not None:
             from .preparation_cache import (
                 inputs_on,
@@ -170,14 +188,14 @@ class ZingSourceStreamState(BaseRealtimeState):
                 stage.codecs,
                 preview,
                 dict(config),
-                dict(self.policy),
+                self.block0_cache.identity,
             )
             self.block0_key = preparation_key(
                 stage.codecs,
                 self.block0_input_request,
                 preview,
                 config,
-                self.policy,
+                self.block0_cache.identity,
             )
             self.block0_entry = self.block0_cache.lookup(self.block0_key)
             self.block0_lookup_ms = (time.perf_counter() - started) * 1000
@@ -302,7 +320,7 @@ class ZingSourceStreamState(BaseRealtimeState):
             self.block0_restore = self.block0_cache.restore(
                 self.sampler.cache, self.block0_entry
             )
-        elif self.block0_cache is not None:
+        elif self.block0_cache is not None and self.cache_write:
             self.sampler.capture_initial_prefix = self._remember_block0
         endpoint = command.get("conditioning_prefetch_endpoint")
         if endpoint is not None:
@@ -347,6 +365,61 @@ class ZingSourceStreamState(BaseRealtimeState):
         source_preview=None,
         source_shape=None,
         trace=None,
+        force=False,
+    ):
+        with cache_scope(batch_context(batch)):
+            started = time.perf_counter()
+            rank = getattr(getattr(stage, "block0_cache", None), "log_rank", None)
+            self.prefill_reused = False
+            cache_event(
+                "prefill",
+                "started",
+                rank=rank,
+                reason="force_recompute" if force else None,
+            )
+            try:
+                entry = self._prefill(
+                    request,
+                    stage=stage,
+                    batch=batch,
+                    config=config,
+                    source_preview=source_preview,
+                    source_shape=source_shape,
+                    trace=trace,
+                    force=force,
+                )
+            except Exception as exc:
+                cache_event(
+                    "prefill",
+                    "failed",
+                    rank=rank,
+                    started=started,
+                    reason=type(exc).__name__,
+                    level=logging.WARNING,
+                )
+                raise
+            cache_event(
+                "prefill",
+                "completed",
+                cache_key=entry.key,
+                rank=rank,
+                started=started,
+                reason="reused" if self.prefill_reused else "recomputed",
+                l2_persisted=None,
+            )
+            return entry
+
+    def _prefill(
+        self,
+        request,
+        *,
+        stage,
+        batch,
+        config,
+        source_preview,
+        source_shape,
+        trace,
+        force,
     ):
         """Warm one Block0 entry without source history, sampling or decoding.
 
@@ -381,10 +454,11 @@ class ZingSourceStreamState(BaseRealtimeState):
 
         input_request = preparation_request(stage.codecs, request)
         key = preparation_key(
-            stage.codecs, input_request, source_preview, config, self.policy
+            stage.codecs, input_request, source_preview, config, cache.identity
         )
-        entry = cache.lookup(key)
+        entry = None if force else cache.lookup(key, allow_disk=True)
         if entry is not None:
+            self.prefill_reused = True
             return entry
 
         inputs = stage.codecs.prepare(
@@ -437,6 +511,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                     identity,
                     pool_request if pool_request is not None else request,
                     state.cache,
+                    force=force,
                 )
                 cache.finish_fill()
                 return cache.entries.get(key)
@@ -501,7 +576,9 @@ class ZingSourceStreamState(BaseRealtimeState):
         self.block0_entry = self.block0_cache.lookup(key)
         self.sampler.capture_initial_prefix = None
         if self.block0_entry is None:
-            self.sampler.capture_initial_prefix = self._remember_block0
+            self.sampler.capture_initial_prefix = (
+                self._remember_block0 if self.cache_write else None
+            )
             return None
 
         def restore(cache):
@@ -513,7 +590,8 @@ class ZingSourceStreamState(BaseRealtimeState):
     def _fill_block0_after_output(self):
         # Called on the dispatch after the first RGB output has been returned.
         if (
-            self.block0_prefix is not None
+            self.cache_write
+            and self.block0_prefix is not None
             and self.ledger.output_frames > self.block0_output_start
         ):
             prefix, self.block0_prefix = self.block0_prefix, None
@@ -525,6 +603,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                     self.block0_request,
                     self.sampler.cache,
                 )
+                self.block0_cache.register(self.block0_key, **self.cache_labels)
 
     def _block0_update_key(self, stage, prompt, command):
         """Share the CPU request identity between prefetch and owner lookup."""
@@ -548,8 +627,8 @@ class ZingSourceStreamState(BaseRealtimeState):
                 )
                 for item in refs
             ]
-        codecs, preview, config, policy = self.block0_key_args
-        return preparation_key(codecs, request, preview, config, policy), request
+        codecs, preview, config, identity = self.block0_key_args
+        return preparation_key(codecs, request, preview, config, identity), request
 
     def _start_conditioning_prefetch(self, stage, batch, endpoint, command):
         from sglang.multimodal_gen.runtime.conditioning.prefetch import (

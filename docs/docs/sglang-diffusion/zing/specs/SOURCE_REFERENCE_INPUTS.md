@@ -23,6 +23,23 @@ the internally derived source presentation. There is no caller-provided video
 preview or presentation-only image. The removed `user_media` field is rejected,
 even when null or empty, and the client no longer offers `--user-media`.
 
+## Block0 cache controls
+
+The session `init` accepts `cache_write` (strict boolean, default `false`) and
+optional `game_id` / `group_id` labels. Labels are nonempty strings of at most
+128 UTF-8 bytes; a group requires a game. They describe cache ownership and do
+not enter the model input or content key. The write setting applies to the
+initial prompt and subsequent prompt changes for the whole session.
+
+Normal video requests only query L1. A miss recomputes the prefix without
+checking disk; new L1/L2 entries and business associations are created only when
+`cache_write=true`. Existing L1 entries remain readable with writes disabled.
+Use prefill or explicit preload before routing video to the prepared instance.
+See the [managed cache contract](/docs/sglang-diffusion/zing/plans/BLOCK0_CACHE_MANAGEMENT_SHARED_L2)
+for preload/status/unload and the game/group selection parameters.
+
+## Source presentation and admission
+
 `session.ready` advertises reference count, image/upload/decoded-byte limits and
 source transport limits. It does not advertise the removed independent-media
 capabilities. `prompt_video_frame`, `source_preview` and their former client flags

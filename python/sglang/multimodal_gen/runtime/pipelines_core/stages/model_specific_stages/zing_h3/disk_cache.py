@@ -1,17 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier-2 Block0 cache on CPFS or a local SSD.
-
-The directory is intentionally simple: one immutable entry directory per
-content key plus one small LRU index shared by every process.  Rank files are
-written independently so sequence-parallel workers never exchange KV bytes.
-"""
+"""Shared Block0 files: atomic per-file replacement and one deployment-owned GC."""
 
 import json
+import logging
+import math
 import os
 import shutil
+import threading
 import time
 import uuid
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,16 +17,11 @@ import torch
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 from .block0_conditions import CONDITIONS_SCHEMA, decode_conditions, encode_conditions
-from .block0_identity import SCHEMA, fingerprint
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows development only
-    fcntl = None
+from .block0_identity import SCHEMA
+from .cache_logging import cache_event, cache_scope
 
 logger = init_logger(__name__)
-
-INDEX_VERSION = 2
+DISK_FORMAT = 4
 
 
 def _dump_json(path, value):
@@ -37,14 +29,12 @@ def _dump_json(path, value):
     try:
         with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(value, handle, sort_keys=True, separators=(",", ":"), default=str)
-            handle.flush()
-            os.fsync(handle.fileno())
         os.replace(tmp, path)
     finally:
         try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Block0 temporary metadata cleanup failed", exc_info=True)
 
 
 def _read_json(path):
@@ -88,9 +78,9 @@ def _readinto(handle, tensor):
 
 def _read_kv(path, target):
     expected = target.numel() * target.element_size()
-    if path.stat().st_size != expected:
-        raise ValueError("Block0 KV file size does not match the target slot")
     with open(path, "rb") as handle:
+        if os.fstat(handle.fileno()).st_size != expected:
+            raise ValueError("Block0 KV file size does not match the target slot")
         if target.dim() >= 2 and target.shape[1] == 2:
             for layer in range(target.shape[0]):
                 for part in range(target.shape[1]):
@@ -119,35 +109,52 @@ class DiskEntry:
 
 
 class Block0DiskCache:
-    """One root-wide byte LRU; immutable complete entries contain every SP rank.
+    """Same-key fills are interchangeable; only individual files are atomic.
 
-    The deployment owns and mounts the root. Only schema-v2 children enter this
-    index. Old identity-free files are left untouched and can never be loaded.
-    Pending entries count towards the same budget as complete entries.
+    GC owns the approximate usage snapshot. Writers never update shared counters
+    or take filesystem locks. The deployment enables GC in exactly one instance.
+    Existing key directories are reused, but the previous disk format and mixed
+    old/new processes are unsupported.
     """
 
-    def __init__(self, cache_dir, *, max_bytes, identity, rank=0, world_size=1):
-        if type(max_bytes) is not int or max_bytes < 1:
+    def __init__(
+        self,
+        cache_dir,
+        *,
+        max_bytes=None,
+        identity=None,
+        rank=0,
+        world_size=1,
+        gc_interval=60.0,
+        gc_stale_seconds=600.0,
+        gc_low_watermark=0.9,
+    ):
+        if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 1):
             raise ValueError("Block0 disk byte budget must be positive")
+        if (
+            not math.isfinite(gc_interval)
+            or gc_interval <= 0
+            or not math.isfinite(gc_stale_seconds)
+            or gc_stale_seconds <= 0
+            or not 0 < gc_low_watermark < 1
+        ):
+            raise ValueError("Invalid Block0 GC interval, timeout or low watermark")
         self.cache_dir = Path(cache_dir).resolve()
         if not self.cache_dir.is_dir():
             raise ValueError("Block0 disk root must already exist on mounted storage")
         self.max_bytes = max_bytes
         self.identity = identity
-        self.model = fingerprint(identity["model"])
-        self.layout = fingerprint(identity["layout"])
         self.local_rank, self.sp_world_size = rank, world_size
         if not 0 <= rank < world_size:
             raise ValueError("Invalid Block0 disk SP rank")
         self.tmp_root = self.cache_dir / ".tmp"
-        self.tmp_root.mkdir(exist_ok=True)
-        probe = self.tmp_root / uuid.uuid4().hex
-        probe.write_bytes(b"")
-        probe.unlink()
-
-    @property
-    def index_path(self):
-        return self.cache_dir / "lru_index.json"
+        self.usage_path = self.cache_dir / "cache_usage.json"
+        self.gc_interval = gc_interval
+        self.gc_stale_seconds = gc_stale_seconds
+        self.gc_low_watermark = gc_low_watermark
+        self._gc_stop = threading.Event()
+        self._gc_thread = None
+        # Do not probe writes here: a full quota must not prevent L1 startup.
 
     def is_enabled(self):
         return True
@@ -162,7 +169,7 @@ class Block0DiskCache:
         )
 
     def _entry_dir(self, key):
-        return self.cache_dir / "v2" / self.model / self.layout / key[:2] / key
+        return self.cache_dir / "entries" / key
 
     def _under_root(self, path):
         target = Path(path).resolve()
@@ -172,6 +179,7 @@ class Block0DiskCache:
         if not self._safe_key(key):
             return None
         try:
+            self.tmp_root.mkdir(exist_ok=True)
             path = self.tmp_root / uuid.uuid4().hex
             path.mkdir()
             return str(path)
@@ -183,21 +191,6 @@ class Block0DiskCache:
         if tmp_dir is not None and self._under_root(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    @contextmanager
-    def _locked(self):
-        with open(self.cache_dir / ".index.lock", "a+b") as handle:
-            if fcntl is not None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                if fcntl is not None:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-    @staticmethod
-    def _dir_size(folder):
-        return sum(p.stat().st_size for p in Path(folder).rglob("*") if p.is_file())
-
     @staticmethod
     def _manifest(folder):
         try:
@@ -206,168 +199,105 @@ class Block0DiskCache:
         except (OSError, ValueError):
             return None
 
-    def _record(self, folder, manifest):
-        return {
-            "dir": str(folder.relative_to(self.cache_dir)),
-            "key": manifest["early_key"],
-            "size_bytes": self._dir_size(folder),
-            "last_accessed_at": manifest["last_accessed_at"],
-            "complete": (folder / ".complete").is_file(),
-        }
-
     @staticmethod
-    def _normalize(entries):
-        entries = sorted(entries, key=lambda e: (e["last_accessed_at"], e["dir"]))
-        return {
-            "version": INDEX_VERSION,
-            "entries": entries,
-            "stats": {
-                "total_entries": len(entries),
-                "total_bytes": sum(e["size_bytes"] for e in entries),
-            },
-        }
+    def _rank_info(folder, rank):
+        return _read_json(folder / f"rank-{rank}" / "ready.json")
 
-    def _write_index_locked(self, index):
-        index["stats"]["max_bytes"] = self.max_bytes
-        _dump_json(self.index_path, index)
-
-    def _rebuild_locked(self):
-        entries = []
-        for path in (self.cache_dir / "v2").glob("*/*/*/*/manifest.json"):
-            manifest = self._manifest(path.parent)
-            if manifest is not None and manifest.get("schema") == SCHEMA:
-                try:
-                    entries.append(self._record(path.parent, manifest))
-                except (KeyError, OSError, TypeError):
-                    continue
-        index = self._normalize(entries)
-        self._write_index_locked(index)
-        return index
-
-    def _load_index_locked(self):
-        try:
-            raw = _read_json(self.index_path)
-            if raw["version"] != INDEX_VERSION or not isinstance(raw["entries"], list):
-                raise ValueError("Invalid Block0 disk index")
-            entries = []
-            for entry in raw["entries"]:
-                folder = self.cache_dir / entry["dir"]
-                if not self._under_root(folder) or not folder.resolve().is_relative_to(
-                    self.cache_dir / "v2"
-                ):
-                    raise ValueError("Invalid Block0 index path")
-                if folder.is_dir():
-                    entries.append(dict(entry, size_bytes=self._dir_size(folder)))
-            return self._normalize(entries)
-        except (OSError, ValueError, TypeError, KeyError):
-            return self._rebuild_locked()
-
-    def _record_locked(self, entry, index):
-        entries = [e for e in index["entries"] if e["dir"] != entry["dir"]] + [entry]
-        entries = self._normalize(entries)["entries"]
-        total = sum(e["size_bytes"] for e in entries)
-        while entries and total > self.max_bytes:
-            victim = entries.pop(0)
-            folder = self.cache_dir / victim["dir"]
-            if self._under_root(folder):
-                # On failure do not pretend bytes were reclaimed.
-                shutil.rmtree(folder)
-            total -= victim["size_bytes"]
-        return self._normalize(entries)
-
-    def _valid_manifest(self, folder, key):
+    def _valid_manifest(self, folder, key, *, check_identity=True):
         manifest = self._manifest(folder)
         if (
-            not isinstance((manifest or {}).get("generation"), str)
-            or not manifest["generation"]
-        ):
-            return None
-        if not manifest or any(
-            (
-                manifest.get("schema") != SCHEMA,
-                manifest.get("early_key") != key,
-                manifest.get("identity") != self.identity,
-                manifest.get("sp_world_size") != self.sp_world_size,
+            not manifest
+            or manifest.get("schema") != SCHEMA
+            or manifest.get("disk_format") != DISK_FORMAT
+            or manifest.get("early_key") != key
+            or (
+                check_identity
+                and self.identity is not None
+                and manifest.get("identity") != self.identity
             )
         ):
             return None
-        ranks = manifest.get("ranks", {})
-        if set(ranks) != {str(rank) for rank in range(self.sp_world_size)}:
+        if not isinstance(manifest.get("identity"), dict):
             return None
-        for rank, info in ranks.items():
-            base = folder / f"rank-{rank}"
-            if (
-                info.get("generation") != manifest.get("generation")
-                or info.get("conditions_schema") != CONDITIONS_SCHEMA
-                or not (base / "conditions.pt").is_file()
-                or not (base / "kv.bin").is_file()
-                or (base / "kv.bin").stat().st_size != info.get("kv_bytes")
-            ):
-                return None
-        return manifest
+        world = manifest.get("sp_world_size")
+        if (
+            type(world) is not int
+            or world < 1
+            or (
+                check_identity
+                and self.identity is not None
+                and world != self.sp_world_size
+            )
+        ):
+            return None
+        ranks = {}
+        try:
+            for rank in range(world):
+                base = folder / f"rank-{rank}"
+                info = self._rank_info(folder, rank)
+                if (
+                    info.get("conditions_schema") != CONDITIONS_SCHEMA
+                    or info.get("disk_format") != DISK_FORMAT
+                    or not (base / "conditions.pt").is_file()
+                    or (base / "kv.bin").stat().st_size != info.get("kv_bytes")
+                ):
+                    return None
+                ranks[str(rank)] = info
+        except (OSError, ValueError, TypeError, AttributeError):
+            return None
+        return dict(manifest, ranks=ranks)
 
     def may_contain(self, key):
-        """Read-only local-rank hint; lookup still validates the complete entry."""
         if not self._safe_key(key):
             return False
-        try:
-            folder = self._entry_dir(key)
-            return (folder / ".complete").is_file() and (
-                folder / f"rank-{self.local_rank}" / "kv.bin"
-            ).is_file()
-        except OSError:
-            return False
+        folder = self._entry_dir(key)
+        return (folder / f"rank-{self.local_rank}" / "ready.json").is_file()
 
     def lookup(self, key, rank=None):
         rank = self.local_rank if rank is None else rank
         if not self._safe_key(key) or not 0 <= rank < self.sp_world_size:
             return None
         try:
-            with self._locked():
-                folder = self._entry_dir(key)
-                if not (folder / ".complete").is_file():
-                    return None
-                manifest = self._valid_manifest(folder, key)
-                if manifest is None:
-                    return None
-                conditions = decode_conditions(
-                    torch.load(
-                        folder / f"rank-{rank}" / "conditions.pt",
-                        map_location="cpu",
-                        weights_only=True,
-                    )
+            folder = self._entry_dir(key)
+            manifest = self._valid_manifest(folder, key)
+            if manifest is None:
+                return None
+            conditions = decode_conditions(
+                torch.load(
+                    folder / f"rank-{rank}" / "conditions.pt",
+                    map_location="cpu",
+                    weights_only=True,
                 )
-                manifest["last_accessed_at"] = time.time()
-                _dump_json(folder / "manifest.json", manifest)
-                index = self._record_locked(
-                    self._record(folder, manifest), self._load_index_locked()
-                )
-                self._write_index_locked(index)
-                if not folder.is_dir():
-                    return None
-                return DiskEntry(key, folder, manifest, rank, conditions)
+            )
+            return DiskEntry(key, folder, manifest, rank, conditions)
         except Exception as exc:
-            logger.warning("Block0 disk lookup skipped: %s", exc)
+            cache_event(
+                "l2_lookup",
+                "failed",
+                cache_key=key,
+                rank=rank,
+                reason=type(exc).__name__,
+                level=logging.WARNING,
+            )
             return None
 
+    def _touch(self, entry):
+        # Touch only an existing marker, never resurrect an evicted directory.
+        try:
+            marker = entry.path / ".access"
+            if time.time() - marker.stat().st_mtime >= 60:
+                os.utime(marker, None)
+        except OSError:
+            pass
+
     def load_kv_into(self, entry, target):
-        # Eviction/commit and the complete file read share the root lock. A
-        # promoted L1 entry owns its bytes after this method returns.
-        with self._locked():
-            current = self._valid_manifest(entry.path, entry.key)
-            if (
-                not (entry.path / ".complete").is_file()
-                or current is None
-                or current["generation"] != entry.manifest["generation"]
-                or current["ranks"] != entry.manifest["ranks"]
-            ):
-                raise ValueError("Block0 disk entry changed before promotion")
-            info = current["ranks"][str(entry.rank)]
-            if info["shape"] != list(target.shape) or info["dtype"] != str(
-                target.dtype
-            ):
-                raise ValueError("Block0 disk KV shape/dtype differs from the L1 slot")
-            return entry.load_kv_into(target)
+        info = entry.manifest["ranks"][str(entry.rank)]
+        if info["shape"] != list(target.shape) or info["dtype"] != str(target.dtype):
+            raise ValueError("Block0 disk KV shape/dtype differs from the L1 slot")
+        # The open file owns its inode through concurrent replacement/unlink.
+        result = entry.load_kv_into(target)
+        self._touch(entry)
+        return result
 
     def save_rank_kv(self, key, rank, kv_tensor, tmp_dir):
         if not self._safe_key(key) or tmp_dir is None or not self._under_root(tmp_dir):
@@ -384,74 +314,419 @@ class Block0DiskCache:
             logger.warning("Block0 KV write skipped: %s", exc)
             return None
 
-    def commit_entry(self, key, conditions_dict, manifest, rank_bins, tmp_dir):
+    def commit_entry(
+        self, key, conditions_dict, manifest, rank_bins, tmp_dir, *, force=False
+    ):
         if not self._safe_key(key) or tmp_dir is None or not self._under_root(tmp_dir):
             return None
         tmp = Path(tmp_dir)
         try:
-            # A fill cohort shares one generation across SP ranks. This prevents
-            # mixing shards from competing deployments writing the same key.
-            generation = manifest["generation"]
-            if not isinstance(generation, str) or not generation:
-                raise ValueError("Block0 snapshot generation is missing")
             if (
                 manifest["identity"] != self.identity
                 or manifest["sp_world_size"] != self.sp_world_size
             ):
                 raise ValueError("Block0 snapshot identity/layout differs")
-            prepared = {}
+            folder = self._entry_dir(key)
+            if not force and self._valid_manifest(folder, key) is not None:
+                return {"key": key, "dir": str(folder.relative_to(self.cache_dir))}
             for rank, source in rank_bins.items():
                 if not 0 <= rank < self.sp_world_size or not self._under_root(source):
                     raise ValueError("Invalid Block0 rank staging file")
-                rank_dir = tmp / f"rank-{rank}"
-                rank_dir.mkdir()
-                os.replace(source, rank_dir / "kv.bin")
-                torch.save(
-                    encode_conditions(conditions_dict), rank_dir / "conditions.pt"
+                conditions = tmp / f"conditions-{rank}.pt"
+                torch.save(encode_conditions(conditions_dict), conditions)
+                info = dict(
+                    _read_json(tmp / f"kvmeta-{rank}.json"),
+                    kv_bytes=Path(source).stat().st_size,
+                    conditions_schema=CONDITIONS_SCHEMA,
+                    disk_format=DISK_FORMAT,
                 )
-                prepared[str(rank)] = {
-                    **_read_json(tmp / f"kvmeta-{rank}.json"),
-                    "kv_bytes": (rank_dir / "kv.bin").stat().st_size,
-                    "generation": generation,
-                    "conditions_schema": CONDITIONS_SCHEMA,
-                }
-            with self._locked():
-                folder = self._entry_dir(key)
-                if (folder / ".complete").is_file() and self._valid_manifest(
-                    folder, key
-                ) is not None:
-                    return self._record(folder, self._manifest(folder))
-                old = self._manifest(folder)
-                if old is not None and old.get("generation") != generation:
-                    shutil.rmtree(folder)
-                    old = None
-                folder.mkdir(parents=True, exist_ok=True)
-                (folder / ".complete").unlink(missing_ok=True)
-                for rank in prepared:
-                    destination = folder / f"rank-{rank}"
-                    if destination.exists():
-                        shutil.rmtree(destination)
-                    os.replace(tmp / f"rank-{rank}", destination)
-                now = time.time()
-                value = dict(
-                    manifest,
-                    schema=SCHEMA,
-                    early_key=key,
-                    created_at=(old or {}).get("created_at", now),
-                    last_accessed_at=now,
-                    ranks={**(old or {}).get("ranks", {}), **prepared},
-                )
-                _dump_json(folder / "manifest.json", value)
-                if self._valid_manifest(folder, key) is not None:
-                    marker = folder / f".complete.{uuid.uuid4().hex}"
-                    marker.write_bytes(b"")
-                    os.replace(marker, folder / ".complete")
-                entry = self._record(folder, value)
-                index = self._record_locked(entry, self._load_index_locked())
-                self._write_index_locked(index)
-                return entry if folder.is_dir() else None
+                base = folder / f"rank-{rank}"
+                base.mkdir(parents=True, exist_ok=True)
+                os.replace(source, base / "kv.bin")
+                os.replace(conditions, base / "conditions.pt")
+                _dump_json(base / "ready.json", info)
+            # Shared fields are identical in meaning for the same content key;
+            # there is no read/modify/write merge of rank metadata.
+            value = {
+                name: manifest[name]
+                for name in ("identity", "sp_world_size", "geometry", "prompt_preview")
+            }
+            value.update(schema=SCHEMA, disk_format=DISK_FORMAT, early_key=key)
+            _dump_json(folder / "manifest.json", value)
+            (folder / ".access").touch()
+            return {"key": key, "dir": str(folder.relative_to(self.cache_dir))}
         except Exception as exc:
             logger.warning("Block0 disk commit skipped: %s", exc)
             return None
         finally:
             self.discard_tmp(tmp)
+
+    def _folders(self):
+        for folder in (self.cache_dir / "entries").glob("*"):
+            if (
+                folder.is_dir()
+                and self._safe_key(folder.name)
+                and self._under_root(folder)
+            ):
+                yield folder
+
+    def _files(self, folder):
+        for path in folder.rglob("*"):
+            if path.is_file() and self._under_root(path):
+                yield path
+
+    def _measure(self, folder):
+        size = 0
+        modified = folder.stat().st_mtime
+        for path in self._files(folder):
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+            size += stat.st_size
+            modified = max(modified, stat.st_mtime)
+        return size, modified
+
+    def _scan(self):
+        entries = []
+        for folder in self._folders():
+            try:
+                size, modified = self._measure(folder)
+                manifest = self._manifest(folder) or {}
+                access = folder / ".access"
+                entries.append(
+                    dict(
+                        dir=str(folder.relative_to(self.cache_dir)),
+                        key=folder.name,
+                        size_bytes=size,
+                        modified_at=modified,
+                        last_accessed_at=access.stat().st_mtime
+                        if access.exists()
+                        else modified,
+                        complete=self._valid_manifest(
+                            folder, folder.name, check_identity=False
+                        )
+                        is not None,
+                        prompt_preview=manifest.get("prompt_preview"),
+                    )
+                )
+            except FileNotFoundError:
+                continue
+        return entries
+
+    def _usage(self):
+        try:
+            value = _read_json(self.usage_path)
+            if value["version"] == DISK_FORMAT and isinstance(value["entries"], list):
+                return value
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return {
+            "max_bytes": self.max_bytes,
+            "sampled_at": None,
+            "root_bytes": None,
+            "root_entries": None,
+            "temporary_bytes": None,
+            "entries": [],
+        }
+
+    def collect(self):
+        """One best-effort GC pass; only the designated collector calls this."""
+        with cache_scope():
+            started = time.perf_counter()
+            activity = dict(
+                deleted_count=0,
+                stale_deleted_count=0,
+                capacity_deleted_count=0,
+                reclaimed_bytes=0,
+            )
+            try:
+                usage = self._collect(activity)
+            except Exception as exc:
+                cache_event(
+                    "gc",
+                    "failed",
+                    rank=self.local_rank,
+                    started=started,
+                    reason=type(exc).__name__,
+                    level=logging.WARNING,
+                    **activity,
+                )
+                raise
+            failed = len(usage["failed"])
+            changed = activity["deleted_count"] > 0
+            cache_event(
+                "gc",
+                "partial" if failed else "completed" if changed else "idle",
+                rank=self.local_rank,
+                started=started,
+                level=logging.WARNING
+                if failed
+                else logging.INFO
+                if changed
+                else logging.DEBUG,
+                reason="delete_failed"
+                if failed
+                else "stale_or_capacity"
+                if changed
+                else None,
+                root_bytes=usage["root_bytes"],
+                max_bytes=self.max_bytes,
+                failed_count=failed,
+                **activity,
+            )
+            return usage
+
+    def _collect(self, activity):
+        if self.max_bytes is None:
+            raise ValueError("Block0 GC requires a disk byte budget")
+        now = time.time()
+        entries = self._scan()
+        activity["scanned_bytes"] = sum(entry["size_bytes"] for entry in entries)
+        temporary_bytes = 0
+        failed = []
+        for folder in list(self.tmp_root.glob("*")) + list(
+            self.cache_dir.glob("*.tmp")
+        ):
+            size = 0
+            if not self._under_root(folder):
+                continue
+            try:
+                size, modified = (
+                    self._measure(folder)
+                    if folder.is_dir()
+                    else (folder.stat().st_size, folder.stat().st_mtime)
+                )
+                activity["scanned_bytes"] += size
+                if now - modified >= self.gc_stale_seconds:
+                    if folder.is_dir():
+                        shutil.rmtree(folder)
+                    else:
+                        folder.unlink()
+                    activity["deleted_count"] += 1
+                    activity["stale_deleted_count"] += 1
+                    activity["reclaimed_bytes"] += size
+                else:
+                    temporary_bytes += size
+            except FileNotFoundError:
+                continue
+            except OSError:
+                temporary_bytes += size
+                failed.append(str(folder.relative_to(self.cache_dir)))
+        remaining = []
+        for entry in entries:
+            folder = self.cache_dir / entry["dir"]
+            try:
+                # Abandoned JSON temp files can also live alongside valid data.
+                for path in folder.rglob("*.tmp"):
+                    if self._under_root(path):
+                        stat = path.stat()
+                        if now - stat.st_mtime >= self.gc_stale_seconds:
+                            path.unlink()
+                            activity["deleted_count"] += 1
+                            activity["stale_deleted_count"] += 1
+                            activity["reclaimed_bytes"] += stat.st_size
+                            entry["size_bytes"] = max(
+                                0, entry["size_bytes"] - stat.st_size
+                            )
+                if (
+                    not entry["complete"]
+                    and now - entry["modified_at"] >= self.gc_stale_seconds
+                ):
+                    shutil.rmtree(folder)
+                    activity["deleted_count"] += 1
+                    activity["stale_deleted_count"] += 1
+                    activity["reclaimed_bytes"] += entry["size_bytes"]
+                    continue
+            except FileNotFoundError:
+                pass
+            except OSError:
+                failed.append(entry["key"])
+            remaining.append(entry)
+        total = temporary_bytes + sum(e["size_bytes"] for e in remaining)
+        if total > self.max_bytes:
+            for entry in sorted(
+                remaining.copy(), key=lambda e: (e["last_accessed_at"], e["dir"])
+            ):
+                if total <= self.max_bytes * self.gc_low_watermark:
+                    break
+                # Fresh incomplete writes are left for the timeout rule.
+                if not entry["complete"]:
+                    continue
+                try:
+                    shutil.rmtree(self.cache_dir / entry["dir"])
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    failed.append(entry["key"])
+                    continue
+                total -= entry["size_bytes"]
+                remaining.remove(entry)
+                activity["deleted_count"] += 1
+                activity["capacity_deleted_count"] += 1
+                activity["reclaimed_bytes"] += entry["size_bytes"]
+        usage = dict(
+            version=DISK_FORMAT,
+            max_bytes=self.max_bytes,
+            sampled_at=now,
+            root_bytes=total,
+            root_entries=len(remaining),
+            temporary_bytes=temporary_bytes,
+            entries=remaining,
+            failed=failed,
+        )
+        _dump_json(self.usage_path, usage)
+        return usage
+
+    def start_gc(self):
+        if self.local_rank != 0 or self._gc_thread is not None:
+            return
+        if self.max_bytes is None:
+            raise ValueError("Block0 GC requires a disk byte budget")
+
+        def run():
+            while not self._gc_stop.is_set():
+                try:
+                    self.collect()
+                except Exception:
+                    logger.warning("Block0 disk GC failed", exc_info=True)
+                if self._gc_stop.wait(self.gc_interval):
+                    break
+
+        self._gc_thread = threading.Thread(
+            target=run, name="zing-block0-gc", daemon=True
+        )
+        self._gc_thread.start()
+
+    def close(self):
+        self._gc_stop.set()
+        if self._gc_thread is not None:
+            self._gc_thread.join()
+
+    def list_entries(self, *, cache_key=None, offset=0, limit=100):
+        if (
+            type(offset) is not int
+            or offset < 0
+            or type(limit) is not int
+            or not 1 <= limit <= 1000
+        ):
+            raise ValueError("Offset must be nonnegative and limit must be 1..1000")
+        if cache_key is not None and not self._safe_key(cache_key):
+            raise ValueError("Invalid cache key")
+        cache_event(
+            "list",
+            "completed",
+            rank=self.local_rank,
+            level=logging.DEBUG,
+            cache_key=cache_key,
+        )
+        usage = self._usage()
+        selected = sorted(
+            (e for e in usage["entries"] if cache_key is None or e["key"] == cache_key),
+            key=lambda e: e["dir"],
+        )
+        return dict(
+            max_bytes=usage["max_bytes"],
+            root_entries=usage["root_entries"],
+            root_bytes=usage["root_bytes"],
+            sampled_at=usage["sampled_at"],
+            temporary_bytes=usage["temporary_bytes"],
+            total_entries=len(selected) if usage["sampled_at"] is not None else None,
+            total_bytes=sum(e["size_bytes"] for e in selected)
+            if usage["sampled_at"] is not None
+            else None,
+            complete_entries=sum(e["complete"] for e in selected)
+            if usage["sampled_at"] is not None
+            else None,
+            offset=offset,
+            entries=selected[offset : offset + limit],
+            next_offset=offset + limit if offset + limit < len(selected) else None,
+        )
+
+    def delete_entries(self, *, keys=None):
+        """Live scoped deletion, independent of GC's possibly stale snapshot."""
+        with cache_scope():
+            started = time.perf_counter()
+            event = "clear" if keys is None else "delete"
+            cache_event(
+                event,
+                "started",
+                rank=self.local_rank,
+                cache_key=keys[0] if keys and len(keys) == 1 else None,
+            )
+            try:
+                value = self._delete_entries(keys=keys)
+            except Exception as exc:
+                cache_event(
+                    event,
+                    "failed",
+                    rank=self.local_rank,
+                    started=started,
+                    reason=type(exc).__name__,
+                    level=logging.WARNING,
+                )
+                raise
+            failed = len(value["failed"])
+            cache_event(
+                event,
+                "partial" if failed else "completed",
+                rank=self.local_rank,
+                cache_key=keys[0] if keys and len(keys) == 1 else None,
+                started=started,
+                reason="delete_failed" if failed else None,
+                level=logging.WARNING if failed else logging.INFO,
+                deleted_count=len(value["deleted"]),
+                missing_count=len(value["missing"]),
+                failed_count=failed,
+                reclaimed_bytes=value["reclaimed_bytes"],
+            )
+            return value
+
+    def _delete_entries(self, *, keys=None):
+        if keys is not None and (
+            not isinstance(keys, (list, tuple))
+            or not all(self._safe_key(k) for k in keys)
+        ):
+            raise ValueError("Invalid cache keys")
+        deleted, failed, reclaimed = [], [], 0
+        found = set()
+        for folder in self._folders():
+            key = folder.name
+            if keys is not None and key not in keys:
+                continue
+            found.add(key)
+            try:
+                size, _ = self._measure(folder)
+                shutil.rmtree(folder)
+                reclaimed += size
+                deleted.append(key)
+                cache_event(
+                    "l2_delete",
+                    "completed",
+                    cache_key=key,
+                    rank=self.local_rank,
+                    reason="clear" if keys is None else "delete",
+                    reclaimed_bytes=size,
+                )
+            except FileNotFoundError:
+                deleted.append(key)
+                cache_event("l2_delete", "missing", cache_key=key, rank=self.local_rank)
+            except OSError as exc:
+                cache_event(
+                    "l2_delete",
+                    "failed",
+                    cache_key=key,
+                    rank=self.local_rank,
+                    reason=type(exc).__name__,
+                    level=logging.WARNING,
+                )
+                failed.append({"key": key, "code": "delete_failed"})
+        usage = self._usage()
+        return dict(
+            deleted=deleted,
+            missing=sorted(set(keys or ()) - found),
+            failed=failed,
+            reclaimed_bytes=reclaimed,
+            remaining_bytes=usage["root_bytes"],
+            sampled_at=usage["sampled_at"],
+        )

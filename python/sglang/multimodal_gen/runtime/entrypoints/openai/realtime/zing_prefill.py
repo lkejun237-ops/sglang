@@ -2,6 +2,7 @@
 """Serial fixed-case prefill using ordinary realtime request dispatch/cleanup."""
 
 import asyncio
+import logging
 from uuid import uuid4
 
 import msgspec.msgpack
@@ -10,6 +11,9 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeVideoGenerationsRequest,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.cache_logging import (
+    cache_event,
 )
 from sglang.multimodal_gen.runtime.realtime.admission import AdmissionRejected
 from sglang.multimodal_gen.runtime.realtime.source_transport import (
@@ -39,6 +43,9 @@ def parse_prefill(data):
         raise PrefillRequestError("A request ID is required")
     values = dict(data)
     values.pop("request_id")
+    force = values.pop("force", False)
+    if type(force) is not bool:
+        raise PrefillRequestError("Prefill force must be a boolean")
     frame = values.pop("source_frame", None)
     values["type"] = "init"
     return RealtimeVideoGenerationsRequest.model_validate(values), frame
@@ -83,6 +90,12 @@ async def run_prefill_case(ws, data, wire_size, session_id):
             raise PrefillRequestError("The prefill request exceeds its message budget")
         session.set_request(request)
         batch = adapter.prepare_prefill_request(session, args, frame)
+        batch.extra["zing_prefill"].update(
+            operation_id=data["request_id"],
+            force=data.get("force", False),
+            game_id=request.game_id,
+            group_id=request.group_id,
+        )
         _, result = await api._process_realtime_generation_batch(batch)
         receipt = (result.usage or {}).get("zing_prefill")
         if not isinstance(receipt, dict) or not receipt.get("cache_key"):
@@ -137,6 +150,13 @@ async def prefill_websocket(ws: WebSocket):
             receipt = await run_prefill_case(ws, data, size, session_id)
             await send(receipt)
         except AdmissionRejected:
+            cache_event(
+                "prefill_request",
+                "rejected",
+                reason="prefill_busy",
+                context={"operation_id": request_id, "session_id": session_id},
+                level=logging.WARNING,
+            )
             await send(
                 dict(
                     type="prefill.failed",
@@ -147,6 +167,13 @@ async def prefill_websocket(ws: WebSocket):
                 )
             )
         except ConditionError as exc:
+            cache_event(
+                "prefill_request",
+                "failed",
+                reason=exc.code,
+                context={"operation_id": request_id, "session_id": session_id},
+                level=logging.WARNING,
+            )
             fatal = exc.code in {"CONDITION_UNAVAILABLE", "CONDITION_TIMEOUT"}
             await send(
                 dict(
@@ -160,6 +187,13 @@ async def prefill_websocket(ws: WebSocket):
             if fatal:
                 await ws.close(code=1011)
         except (ValueError, TypeError, KeyError):
+            cache_event(
+                "prefill_request",
+                "rejected",
+                reason="prefill_invalid",
+                context={"operation_id": request_id, "session_id": session_id},
+                level=logging.WARNING,
+            )
             await send(
                 dict(
                     type="prefill.failed",

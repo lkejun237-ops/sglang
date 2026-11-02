@@ -4,7 +4,7 @@ from abc import ABC
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 
 # Image API protocol models
@@ -168,6 +168,9 @@ class VideoRemixRequest(BaseModel):
 
 
 class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
+    cache_write: StrictBool = False
+    game_id: Optional[str] = None
+    group_id: Optional[str] = None
     type: Literal["init"]
     # Explicit realtime task selection. When omitted, model adapters may infer
     # I2V from first_frame presence for backwards compatibility.

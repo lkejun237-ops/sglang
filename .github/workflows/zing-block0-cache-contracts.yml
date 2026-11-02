@@ -6,6 +6,11 @@ on:
       - '.github/workflows/zing-block0-cache-contracts.yml'
       - 'python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/zing_h3/**'
       - 'python/sglang/multimodal_gen/runtime/server_args/server_args.py'
+      - 'python/sglang/multimodal_gen/runtime/entrypoints/openai/zing_cache_api.py'
+      - 'python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/zing_prefill.py'
+      - 'python/sglang/multimodal_gen/test/unit/realtime/test_zing_prefill_api.py'
+      - 'python/sglang/multimodal_gen/test/unit/realtime/test_zing_progressive_source_session.py'
+      - 'python/sglang/multimodal_gen/test/unit/realtime/zing_cache_fixtures.py'
       - 'python/sglang/multimodal_gen/test/unit/realtime/test_zing*cache*.py'
       - 'python/sglang/multimodal_gen/test/unit/test_zing_kv_pool_runtime.py'
       - 'python/sglang/multimodal_gen/test/unit/test_zing_lynn_startup_warmup.py'
@@ -59,6 +64,15 @@ jobs:
               python/sglang/multimodal_gen/test/unit/test_zing_h3_denoise_graph.py::test_block0_provider_routes_start_and_prompt_cycle \
               --junitxml="artifacts/block0-cache/prefix-provider-trial-${trial}.xml" \
               > "artifacts/block0-cache/prefix-provider-trial-${trial}.log" 2>&1
+          done
+      - name: Run prefill and management API contracts in two CPU trials
+        run: |
+          for trial in 1 2; do
+            python -m pytest -c test/pytest.ini --rootdir=. --strict-config --strict-markers -v \
+              python/sglang/multimodal_gen/test/unit/realtime/test_zing_prefill_api.py \
+              python/sglang/multimodal_gen/test/unit/realtime/test_zing_progressive_source_session.py::test_block0_prefill_and_live_share_key_without_scheduling_policy \
+              --junitxml="artifacts/block0-cache/prefill-api-trial-${trial}.xml" \
+              > "artifacts/block0-cache/prefill-api-trial-${trial}.log" 2>&1
           done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()

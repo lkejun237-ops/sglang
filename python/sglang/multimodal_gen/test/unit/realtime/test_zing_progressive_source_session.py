@@ -953,16 +953,19 @@ def test_worker_initialization_uses_command_policy(
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_block0_prefill_and_live_session_share_command_policy_key(monkeypatch, enabled):
+def test_block0_prefill_and_live_share_key_without_scheduling_policy(
+    monkeypatch, enabled
+):
     monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", "invalid")
     for name in ("SGLANG_ZING_SOURCE_DEFER_FINAL", "SGLANG_ZING_SOURCE_PROMPT_JOINT"):
         monkeypatch.setenv(name, "0" if enabled else "1")
-    keys = []
+    keys, disk_reads = [], []
 
     class LookupBoundary(Exception):
         pass
 
-    def lookup(key):
+    def lookup(key, *, allow_disk=False):
+        disk_reads.append(allow_disk)
         keys.append(key)
         raise LookupBoundary()
 
@@ -995,8 +998,9 @@ def test_block0_prefill_and_live_session_share_command_policy_key(monkeypatch, e
     command["prompt_joint"] = not enabled
     with pytest.raises(LookupBoundary):
         ZingSourceStreamState().prefill({}, stage=stage, batch=request, config=config)
-    assert keys[2] != keys[0]  # Joint scheduling remains part of the cache policy.
+    assert keys[2] == keys[0]  # Scheduling flags do not change cached KV identity.
     command["defer_final"] = not enabled
     with pytest.raises(LookupBoundary):
         ZingSourceStreamState().prefill({}, stage=stage, batch=request, config=config)
-    assert keys[3] != keys[0]
+    assert keys[3] == keys[0]
+    assert disk_reads == [False, True, True, True]

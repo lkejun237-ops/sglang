@@ -275,6 +275,21 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 self._cached_default_workload_failed = True
         return self._cached_default_workload
 
+    def manage_zing_cache(self, req) -> OutputBatch:
+        owner = next(
+            (
+                getattr(stage, "block0_cache", None)
+                for stage in self.pipeline.stages
+                if getattr(stage, "block0_cache", None) is not None
+            ),
+            None,
+        )
+        if owner is None:
+            return OutputBatch(output={"code": "cache_unavailable"})
+        return OutputBatch(
+            output=owner.control(req, busy=bool(self._realtime_sessions._sessions))
+        )
+
     def release_realtime_session(self, session_id: str) -> OutputBatch:
         """release the session of a realtime connection"""
         if not session_id:

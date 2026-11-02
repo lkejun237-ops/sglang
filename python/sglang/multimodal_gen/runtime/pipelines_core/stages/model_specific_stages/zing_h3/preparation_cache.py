@@ -2,23 +2,23 @@
 """Shared startup/prompt-switch snapshots for single-session deployments."""
 
 import hashlib
-import json
+import logging
 import threading
 import time
-import uuid
 from collections import OrderedDict
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import torch
 
 from sglang.multimodal_gen.runtime.conditioning.worker import (
-    broadcast_receipt,
     coordinate_validation,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
+from .block0_identity import fingerprint
+from .cache_logging import cache_event, cache_scope, log_context
 from .media_input import _local_media
 
 logger = init_logger(__name__)
@@ -26,6 +26,20 @@ logger = init_logger(__name__)
 
 def preparation_request(codecs, request):
     """Freeze accepted media contents once; prompt updates reuse these contents."""
+    request = {
+        k: v
+        for k, v in request.items()
+        if k
+        not in {
+            "game_id",
+            "group_id",
+            "event_id",
+            "request_id",
+            "session_id",
+            "force",
+            "cache_write",
+        }
+    }
     if "messages" in request:
         prompt, media, target, conditions, source = codecs._parse_inference_request(
             request
@@ -59,21 +73,24 @@ def preparation_request(codecs, request):
     return content(request)
 
 
-def preparation_key(codecs, request, preview, config, policy):
+def preparation_key(codecs, request, preview, config, identity):
     """One content key shared by startup and prompt switches within this stage."""
     identity = dict(
         request=preparation_request(codecs, request),
-        source={name: config[name] for name in ("width", "height", "fps")},
-        policy=policy,
+        source={name: config[name] for name in ("width", "height")},
+        **identity,
         s0=None
         if preview is None
         else hashlib.sha256(
             preview["frames"].contiguous().numpy().tobytes()
         ).hexdigest(),
     )
-    return hashlib.sha256(
-        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    # Reference resizing changes the effective model inputs even when the
+    # encoded images and exported checkpoint stay the same.
+    reference_resize = getattr(codecs, "reference_resize", None)
+    if reference_resize is not None:
+        identity["reference_resize"] = asdict(reference_resize)
+    return fingerprint(identity)
 
 
 def inputs_on(inputs, device, *, snapshot=False):
@@ -117,7 +134,9 @@ class PreparationEntry:
     model_signature: object
     data: torch.Tensor
     slot: int
-    generation: str
+    force: bool = False
+    log_context: dict | None = None
+    fill_started: float | None = None
 
 
 @dataclass
@@ -182,7 +201,7 @@ class Block0PreparationCache:
 
     One session writes this cache. Transfers share one stream, so a reused CPU
     slot is overwritten only after earlier restores from that slot have finished.
-    A hit missing from L1 is promoted from the Tier-2 disk cache, and every
+    Only explicit preload/prefill may promote from Tier-2 disk. Every
     published L1 entry is written back to disk on a daemon thread.
     """
 
@@ -233,21 +252,64 @@ class Block0PreparationCache:
         Never finish a pending CUDA fill or run a collective on the prefetch
         thread. Eviction and partial-rank hits simply fall back at the boundary.
         """
-        return key in self.entries or (
-            self.disk_cache is not None and self.disk_cache.may_contain(key)
+        return key in self.entries
+
+    @property
+    def log_rank(self):
+        return (
+            getattr(self.disk_cache, "local_rank", None)
+            if self.disk_cache is not None
+            else (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
         )
 
-    def lookup(self, key):
+    def lookup(self, key, *, allow_disk=False):
+        with cache_scope():
+            return self._lookup(key, allow_disk=allow_disk)
+
+    def _lookup(self, key, *, allow_disk):
+        started = time.perf_counter()
         self.finish_fill()
         local = self.entries.get(key)
-        if local is None:
-            local = self._promote_from_disk(key)
+        tier = "l1"
+        # Agree before IO: a partial L1 hit must take the same SP path.
+        if allow_disk:
+            present = coordinate_validation(local is not None)
+            if not all(present):
+                local = self._promote_from_disk(key)
+                tier = "l2"
         votes = coordinate_validation((key, local is not None))
-        hit = all(digest == key and ready for digest, ready in votes)
+        hit = local is not None and all(
+            digest == key and ready for digest, ready in votes
+        )
         self.hits += int(hit)
         self.misses += int(not hit)
         if hit:
             self.entries.move_to_end(key)
+        cache_event(
+            "lookup",
+            "hit" if hit else "miss",
+            cache_key=key,
+            rank=self.log_rank,
+            started=started,
+            tier=tier,
+            allow_disk=allow_disk,
+            reason=None
+            if hit
+            else "sp_key_mismatch"
+            if any(digest != key for digest, _ in votes)
+            else "partial_sp_hit"
+            if any(ready for _, ready in votes)
+            else "not_resident",
+            next_action=None
+            if hit
+            else "recompute"
+            if not allow_disk
+            else "caller_decides",
+        )
         return local if hit else None
 
     def _take_slot(self, key):
@@ -258,9 +320,17 @@ class Block0PreparationCache:
         elif self.free_slots:
             slot = self.free_slots.pop()
         else:
-            _, old = self.entries.popitem(last=False)
+            old_key, old = self.entries.popitem(last=False)
             slot = old.slot
             self.evictions += 1
+            cache_event(
+                "l1_evict",
+                "completed",
+                cache_key=old_key,
+                rank=self.log_rank,
+                reason="capacity",
+                replacement_key=key,
+            )
         task = self._disk_tasks.pop(slot, None)
         if task is not None:
             # The disk writer reads this slot directly; never overwrite it.
@@ -279,15 +349,39 @@ class Block0PreparationCache:
             inputs = conditions.get("inputs")
             positions = conditions.get("positions")
             if inputs is None or not isinstance(positions, torch.Tensor):
+                cache_event(
+                    "l2_read",
+                    "failed",
+                    cache_key=key,
+                    rank=self.log_rank,
+                    reason="invalid_conditions",
+                    level=logging.WARNING,
+                )
                 return None
             if (
                 positions.ndim != 2
                 or positions.shape[1] != 3
                 or not torch.isfinite(positions).all()
             ):
+                cache_event(
+                    "l2_read",
+                    "failed",
+                    cache_key=key,
+                    rank=self.log_rank,
+                    reason="invalid_positions",
+                    level=logging.WARNING,
+                )
                 return None
             rows = int(positions.shape[0])
             if rows < 1 or rows > self.data.shape[3]:
+                cache_event(
+                    "l2_read",
+                    "failed",
+                    cache_key=key,
+                    rank=self.log_rank,
+                    reason="invalid_prefix_rows",
+                    level=logging.WARNING,
+                )
                 return None
             slot = self._take_slot(key)
             try:
@@ -310,12 +404,18 @@ class Block0PreparationCache:
                 None,
                 data,
                 slot,
-                cached.manifest["generation"],
             )
             self.entries[key] = entry
             return entry
         except Exception as exc:
-            logger.warning("Zing Block0 disk promotion failed: %s", exc)
+            cache_event(
+                "l2_read",
+                "failed",
+                cache_key=key,
+                rank=self.log_rank,
+                reason=type(exc).__name__,
+                level=logging.WARNING,
+            )
             return None
 
     def restore(self, cache, entry):
@@ -348,7 +448,8 @@ class Block0PreparationCache:
             started,
         )
 
-    def fill(self, key, inputs, conditioning_identity, request, cache):
+    def fill(self, key, inputs, conditioning_identity, request, cache, *, force=False):
+        started = time.perf_counter()
         self.finish_fill()
         prefix = cache.prefix
         rows = prefix.positions.shape[0]
@@ -367,7 +468,9 @@ class Block0PreparationCache:
             cache._model_signature,
             data,
             slot,
-            broadcast_receipt(uuid.uuid4().hex),
+            force,
+            log_context(),
+            started,
         )
         # Positions may stay on the host; the transfer stream owns the KV device.
         self.stream.wait_stream(torch.cuda.current_stream(self.stream.device))
@@ -378,6 +481,14 @@ class Block0PreparationCache:
                 data[layer, 1].copy_(v, non_blocking=True)
             done.record()
         self.pending = (entry, done)
+        cache_event(
+            "l1_fill",
+            "submitted",
+            cache_key=key,
+            rank=self.log_rank,
+            context=entry.log_context,
+            force=force,
+        )
 
     def finish_fill(self):
         if self.pending is not None:
@@ -385,6 +496,15 @@ class Block0PreparationCache:
             done.synchronize()
             self.entries[entry.key] = entry
             self.pending = None
+            cache_event(
+                "l1_fill",
+                "completed",
+                cache_key=entry.key,
+                rank=self.log_rank,
+                context=entry.log_context,
+                started=entry.fill_started,
+                entries=len(self.entries),
+            )
             self._persist(entry)
 
     def _persist(self, entry):
@@ -395,12 +515,35 @@ class Block0PreparationCache:
         self._disk_tasks[entry.slot] = done
 
         def write():
-            try:
-                self._write_disk(entry)
-            except Exception:
-                logger.warning("Zing Block0 disk write failed", exc_info=True)
-            finally:
-                done.set()
+            # ContextVars do not cross threads; keep only the metadata snapshot.
+            with cache_scope(entry.log_context):
+                started = time.perf_counter()
+                try:
+                    cache_event(
+                        "l2_write", "started", cache_key=entry.key, rank=self.log_rank
+                    )
+                    committed = self._write_disk(entry)
+                    cache_event(
+                        "l2_write",
+                        "completed" if committed else "failed",
+                        cache_key=entry.key,
+                        rank=self.log_rank,
+                        started=started,
+                        reason=None if committed else "storage_write_skipped",
+                        level=logging.INFO if committed else logging.WARNING,
+                    )
+                except Exception as exc:
+                    cache_event(
+                        "l2_write",
+                        "failed",
+                        cache_key=entry.key,
+                        rank=self.log_rank,
+                        started=started,
+                        reason=type(exc).__name__,
+                        level=logging.WARNING,
+                    )
+                finally:
+                    done.set()
 
         threading.Thread(
             target=write,
@@ -422,7 +565,6 @@ class Block0PreparationCache:
         }
         manifest = {
             "identity": self.identity,
-            "generation": entry.generation,
             "sp_world_size": disk.sp_world_size,
             "geometry": _block0_geometry(entry),
             "prompt_preview": _prompt_preview(entry.request),
@@ -431,10 +573,183 @@ class Block0PreparationCache:
         if path is None:
             disk.discard_tmp(tmp)
             return
-        disk.commit_entry(entry.key, conditions, manifest, {rank: path}, tmp)
+        return disk.commit_entry(
+            entry.key, conditions, manifest, {rank: path}, tmp, force=entry.force
+        )
 
     def wait_for_disk(self):
         """Wait for in-flight L2 writes; used by shutdown and deterministic tests."""
         while self._disk_tasks:
             _, done = self._disk_tasks.popitem()
             done.wait()
+
+    def register(self, key, game_id=None, group_id=None):
+        if (
+            game_id is None
+            or self.disk_cache is None
+            or self.disk_cache.local_rank != 0
+        ):
+            return
+        from .cache_index import CacheIndex
+
+        try:
+            CacheIndex(self.disk_cache.cache_dir).bind(game_id, group_id, key)
+            cache_event(
+                "index_bind",
+                "completed",
+                cache_key=key,
+                rank=self.log_rank,
+                game_id=game_id,
+                group_id=group_id,
+            )
+        except OSError as exc:
+            cache_event(
+                "index_bind",
+                "failed",
+                cache_key=key,
+                rank=self.log_rank,
+                game_id=game_id,
+                group_id=group_id,
+                reason=type(exc).__name__,
+                level=logging.WARNING,
+            )
+
+    def control(self, request, *, busy):
+        """Select once on SP rank zero, then execute the same operation everywhere."""
+        with cache_scope(
+            getattr(request, "log_context", None),
+            game_id=request.game_id,
+            group_id=request.group_id,
+        ):
+            started = time.perf_counter()
+            level = logging.DEBUG if request.operation == "status" else logging.INFO
+            cache_event(
+                request.operation,
+                "started",
+                cache_key=request.cache_key,
+                rank=self.log_rank,
+                level=level,
+            )
+            try:
+                value = self._control(request, busy=busy)
+            except Exception as exc:
+                cache_event(
+                    request.operation,
+                    "failed",
+                    cache_key=request.cache_key,
+                    rank=self.log_rank,
+                    started=started,
+                    reason=type(exc).__name__,
+                    level=logging.WARNING,
+                )
+                raise
+            missing = sum(
+                item["status"] == "missing" for item in value.get("results", [])
+            )
+            code = value.get("code")
+            partial = (
+                request.operation == "preload"
+                and not code
+                and not value.get("all_ready")
+            )
+            cache_event(
+                request.operation,
+                "rejected" if code else "partial" if partial else "completed",
+                cache_key=request.cache_key,
+                rank=self.log_rank,
+                started=started,
+                reason=code or ("not_all_ready" if partial else None),
+                level=logging.WARNING if code or partial else level,
+                selected_count=len(value.get("results", value.get("selected", []))),
+                missing_count=missing,
+            )
+            return value
+
+    def _control(self, request, *, busy):
+        from sglang.multimodal_gen.runtime.conditioning.worker import broadcast_receipt
+
+        from .cache_index import CacheIndex
+
+        busy = any(coordinate_validation(busy))
+        if request.operation != "status" and busy:
+            return {"code": "cache_busy"}
+        selection = None
+        if self.disk_cache.local_rank == 0:
+            try:
+                if request.game_id is not None:
+                    keys = CacheIndex(self.disk_cache.cache_dir).select(
+                        request.game_id, request.group_id, request.cache_key
+                    )
+                elif request.operation == "status" and request.group_id is None:
+                    keys = None if request.cache_key is None else [request.cache_key]
+                else:
+                    raise ValueError("A cache selection requires a game ID")
+                selection = {"keys": keys}
+            except ValueError:
+                selection = {"code": "invalid_cache_selection"}
+            except OSError:
+                logger.warning("Block0 business index is unavailable", exc_info=True)
+                selection = {"code": "cache_unavailable"}
+        selection = broadcast_receipt(selection)
+        if "code" in selection:
+            return selection
+        return dict(self.manage(request.operation, selection["keys"]), busy=busy)
+
+    def status(self, keys=None):
+        local = list(self.entries)
+        ranks = coordinate_validation(local)
+        resident = sorted(set.intersection(*(set(items) for items in ranks)))
+        selected = resident if keys is None else keys
+        states = [{"cache_key": key, "ready": key in resident} for key in selected]
+        return dict(
+            capacity=int(self.data.shape[0]),
+            entries=len(resident),
+            cache_keys=resident,
+            selected=states,
+            all_ready=bool(states) and all(item["ready"] for item in states),
+        )
+
+    def manage(self, operation, keys):
+        if operation == "status":
+            return self.status(keys)
+        self.finish_fill()
+        if operation == "preload" and len(keys) > self.data.shape[0]:
+            return {
+                "code": "cache_capacity_exceeded",
+                "capacity": int(self.data.shape[0]),
+                "requested": len(keys),
+            }
+        results = []
+        for key in keys:
+            if operation == "preload":
+                entry = self.lookup(key, allow_disk=True)
+                results.append(
+                    {
+                        "cache_key": key,
+                        "status": "ready" if entry is not None else "missing",
+                    }
+                )
+            elif operation == "unload":
+                entry = self.entries.pop(key, None)
+                if entry is not None:
+                    task = self._disk_tasks.pop(entry.slot, None)
+                    if task is not None:
+                        task.wait()
+                    self.stream.synchronize()
+                    self.free_slots.append(entry.slot)
+                found = coordinate_validation(entry is not None)
+                cache_event(
+                    "l1_unload",
+                    "completed" if any(found) else "missing",
+                    cache_key=key,
+                    rank=self.log_rank,
+                )
+                results.append(
+                    {
+                        "cache_key": key,
+                        "status": "unloaded" if any(found) else "missing",
+                    }
+                )
+            else:
+                raise ValueError("Unknown Block0 cache operation")
+        return dict(self.status(keys), results=results)

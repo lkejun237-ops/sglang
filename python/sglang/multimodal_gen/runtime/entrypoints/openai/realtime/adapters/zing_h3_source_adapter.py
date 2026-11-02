@@ -153,6 +153,16 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         self.prompt_prefetch = None
         self.conditioning_prefetch_endpoint = None
         self.initial_prompt = request.prompt
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.cache_index import (
+            validate_labels,
+        )
+
+        validate_labels(request.game_id, request.group_id)
+        self.cache_options = dict(
+            cache_write=request.cache_write,
+            game_id=request.game_id,
+            group_id=request.group_id,
+        )
         args = get_global_server_args()
         from ..conditioning import get_api_resources, validate_remote_request
 
@@ -943,6 +953,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         batch = super().prepare_next_request(session, server_args, session.new_chunk())
         batch.extra["zing_prefill"] = dict(source_frame=source_frame)
         batch.extra["zing_source_command"] = dict(
+            **self.cache_options,
             config=self.config,
             sampling_schedule=self.sampling_schedule,
             work_quantum=self.source_work_quantum,
@@ -997,6 +1008,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         self.end_dispatched = self.end_dispatched or end is not None
         batch.extra["zing_reference_ids"] = self.reference_ids
         batch.extra["zing_source_command"] = dict(
+            **self.cache_options,
             config=self.config,
             source_geometry=asdict(self.source_geometry),
             conditioning_prefetch_endpoint=self.conditioning_prefetch_endpoint,

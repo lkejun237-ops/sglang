@@ -2,6 +2,9 @@
 """CPU protocol and request ownership; no GPU/model execution evidence."""
 
 import asyncio
+import json
+import logging
+import threading
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
@@ -24,6 +27,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.realtime.admission import (
     InMemorySessionLeaseStore,
     RealtimeAdmissionController,
+)
+from sglang.multimodal_gen.test.unit.realtime.zing_cache_fixtures import (  # noqa: F401
+    cpu_dma,
 )
 
 
@@ -179,7 +185,10 @@ def test_disconnect_waits_for_case_cleanup(service, monkeypatch):
 
 
 @pytest.mark.parametrize("hit", [False, True])
-def test_case_uses_normal_request_and_cleans_before_receipt(service, monkeypatch, hit):
+@pytest.mark.parametrize("force", [False, True])
+def test_case_uses_normal_request_and_cleans_before_receipt(
+    service, monkeypatch, hit, force
+):
     args, controller = service
     args.zing_source_work_quantum = 1
     args.zing_source_defer_final = True
@@ -220,6 +229,8 @@ def test_case_uses_normal_request_and_cleans_before_receipt(service, monkeypatch
 
     async def exercise():
         data = payload()
+        data["force"] = force
+        data.update(game_id="game", group_id="stage")
         result = await prefill.run_prefill_case(
             Socket(), data, len(msgspec.msgpack.encode(data)), "connection"
         )
@@ -228,6 +239,11 @@ def test_case_uses_normal_request_and_cleans_before_receipt(service, monkeypatch
         assert events == ["dispatch", "release", "receipt"]
         command = batches[0].extra
         assert command["zing_prefill"]["source_frame"] == data["source_frame"]
+        assert command["zing_prefill"]["force"] is force
+        assert command["zing_prefill"]["game_id"] == "game"
+        assert command["zing_prefill"]["group_id"] == "stage"
+        for field in ("force", "game_id", "group_id", "cache_write"):
+            assert field not in batches[0].sampling_params.zing_request
         policy = command["zing_source_command"]
         assert policy["work_quantum"] == 1
         assert policy["defer_final"] is True
@@ -264,7 +280,8 @@ def test_invalid_s0_never_dispatches_and_releases_slot(service, monkeypatch, bad
     asyncio.run(exercise())
 
 
-def test_worker_prefill_never_enters_source_generation(monkeypatch):
+@pytest.mark.parametrize("force", [False, True])
+def test_worker_prefill_never_enters_source_generation(monkeypatch, force):
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
         source_session,
     )
@@ -273,12 +290,15 @@ def test_worker_prefill_never_enters_source_generation(monkeypatch):
     )
 
     stage = object.__new__(ZingH3GenerationStage)
-    stage.block0_cache = NS(hits=0, entries={"key": object()}, evictions=2)
+    stage.block0_cache = NS(
+        hits=0, entries={"key": object()}, evictions=2, register=Mock()
+    )
     stage._build_request = lambda _: dict(prompt="scene")
     seen = []
 
     def prefill(state, request, **kwargs):
         seen.append(kwargs["source_preview"]["frames"])
+        seen.append(kwargs["force"])
         return NS(key="key")
 
     monkeypatch.setattr(source_session.ZingSourceStreamState, "prefill", prefill)
@@ -290,7 +310,7 @@ def test_worker_prefill_never_enters_source_generation(monkeypatch):
     batch = NS(
         session=object(),
         extra={
-            "zing_prefill": dict(source_frame=bytes(32 * 32 * 3)),
+            "zing_prefill": dict(source_frame=bytes(32 * 32 * 3), force=force),
             "zing_source_command": dict(config=dict(width=32, height=32, fps=24)),
         },
     )
@@ -300,6 +320,7 @@ def test_worker_prefill_never_enters_source_generation(monkeypatch):
         cache_key="key", hit=False, entries=1, evictions=2
     )
     assert seen[0].dtype == torch.uint8 and tuple(seen[0].shape) == (3, 1, 32, 32)
+    assert seen[1] is force
 
 
 def test_prefill_route_reuses_one_websocket_for_two_cases(service, monkeypatch):
@@ -326,7 +347,8 @@ def test_prefill_route_reuses_one_websocket_for_two_cases(service, monkeypatch):
                 assert msgspec.msgpack.decode(ws.receive_bytes())["request_id"] == name
 
 
-def test_internal_prefill_miss_then_hit_runs_only_prefix_and_releases_lease():
+def test_internal_prefill_miss_then_hit_runs_only_prefix_and_releases_lease(caplog):
+    caplog.set_level(logging.DEBUG)
     from contextlib import contextmanager
 
     from test_zing_preparation_cache import inputs
@@ -340,12 +362,13 @@ def test_internal_prefill_miss_then_hit_runs_only_prefix_and_releases_lease():
     generator = torch.nn.Linear(1, 1)
     cache = NS(
         identity={"model": {"dit": "fixture"}, "layout": {"sp": 1}},
-        lookup=lambda key: entries.get(key),
+        lookup=lambda key, **kwargs: entries.get(key),
         entries=entries,
         finish_fill=lambda: events.append("fill-done"),
     )
 
-    def fill(key, *args):
+    def fill(key, *args, force=False):
+        events.append(("force", force))
         entries[key] = NS(key=key)
 
     cache.fill = fill
@@ -396,6 +419,7 @@ def test_internal_prefill_miss_then_hit_runs_only_prefix_and_releases_lease():
     assert events == [
         "transformer",
         "prefix",
+        ("force", False),
         "fill-done",
         "state-close",
         "lease-release",
@@ -410,4 +434,312 @@ def test_internal_prefill_miss_then_hit_runs_only_prefix_and_releases_lease():
         is first
     )
     codecs.prepare.assert_called_once()
+    events.clear()
+    forced = state.prefill(
+        dict(prompt="scene"),
+        stage=stage,
+        batch=batch,
+        config=dict(width=32, height=32, fps=24),
+        force=True,
+    )
+    assert forced is not first and forced.key == first.key
+    assert codecs.prepare.call_count == 2
+    assert ("force", True) in events and "prefix" in events
     assert state.pixels is state.decoder is None
+    values = [
+        json.loads(r.getMessage().removeprefix("zing_cache_event "))
+        for r in caplog.records
+        if r.getMessage().startswith("zing_cache_event ")
+    ]
+    prefill = [v for v in values if v["event"] == "prefill"]
+    assert [v["reason"] for v in prefill if v["result"] == "completed"] == [
+        "recomputed",
+        "reused",
+        "recomputed",
+    ]
+    assert prefill[-2]["reason"] == "force_recompute"
+    assert all(v["l2_persisted"] is None for v in prefill if v["result"] == "completed")
+    assert all(v["event"] != "l2_write" for v in values)
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true", [], {}])
+def test_force_is_a_strict_operation_flag(value):
+    data = payload()
+    data["force"] = value
+    with pytest.raises(prefill.PrefillRequestError, match="boolean"):
+        prefill.parse_prefill(data)
+
+
+def test_force_is_not_part_of_the_model_request():
+    data = payload()
+    default, frame = prefill.parse_prefill(data)
+    data["force"] = True
+    forced, forced_frame = prefill.parse_prefill(data)
+    assert forced.model_dump() == default.model_dump()
+    assert frame == forced_frame
+
+
+def test_forced_prefill_receipt_does_not_wait_for_real_background_writer(
+    service, monkeypatch, tmp_path, cpu_dma
+):
+    from test_zing_preparation_cache import inputs
+
+    from sglang.multimodal_gen.test.unit.realtime.zing_cache_fixtures import cpu_cache
+
+    monkeypatch.setenv("SGLANG_ZING_DISK_CACHE_DIR", str(tmp_path))
+    owner = cpu_cache([NS(k=torch.zeros(8, 2, 3))], rows=8, entries=1)
+    started, release = threading.Event(), threading.Event()
+    write = owner._write_disk
+
+    def delayed(entry):
+        started.set()
+        assert release.wait(10)
+        write(entry)
+
+    monkeypatch.setattr(owner, "_write_disk", delayed)
+    monkeypatch.setattr(
+        source.BaseRealtimeModelAdapter,
+        "prepare_next_request",
+        lambda *a: NS(extra={}, sampling_params=NS()),
+    )
+    live = NS(
+        prefix=NS(
+            positions=torch.zeros(3, 3),
+            layers=[(torch.ones(3, 2, 3), torch.ones(3, 2, 3))],
+        ),
+        _model_signature="model",
+    )
+
+    async def forward(batch):
+        assert batch.extra["zing_prefill"]["force"] is True
+        owner.fill("case", inputs(), "condition", "request", live, force=True)
+        owner.finish_fill()
+        return [], OutputBatch(
+            output=[], usage={"zing_prefill": {"cache_key": "case", "hit": False}}
+        )
+
+    async def cleanup(_):
+        return True
+
+    monkeypatch.setattr(api, "_process_realtime_generation_batch", forward)
+    monkeypatch.setattr(api, "_release_scheduler_realtime_session", cleanup)
+
+    async def exercise():
+        data = payload()
+        data["force"] = True
+        result = await asyncio.wait_for(
+            prefill.run_prefill_case(Socket(), data, 4096, "connection"), 3
+        )
+        assert result["type"] == "prefill.completed"
+        assert started.wait(3) and not release.is_set()
+        assert owner.entries["case"].force
+        assert owner.disk_cache.lookup("case") is None
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        release.set()
+        owner.wait_for_disk()
+    assert owner.disk_cache.lookup("case") is not None
+
+
+def test_disk_management_api_is_scoped_and_never_dispatches_models(
+    tmp_path, monkeypatch
+):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from sglang.multimodal_gen.runtime.entrypoints.openai import zing_cache_api
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.disk_cache import (
+        Block0DiskCache,
+    )
+    from sglang.multimodal_gen.test.unit.realtime.zing_cache_fixtures import (
+        disk_commit,
+    )
+
+    owner = Block0DiskCache(
+        tmp_path,
+        max_bytes=1 << 24,
+        identity={"model": {"fixture": "model"}, "layout": {"sp": 1}},
+    )
+    first, second = "a" * 64, "b" * 64
+    disk_commit(owner, first)
+    disk_commit(owner, second)
+    owner.collect()
+    monkeypatch.setattr(
+        zing_cache_api,
+        "get_global_server_args",
+        lambda: NS(zing_block0_cache_dir=str(tmp_path)),
+    )
+    monkeypatch.setattr(
+        api,
+        "_process_realtime_generation_batch",
+        Mock(side_effect=AssertionError("Model dispatched")),
+    )
+    app = FastAPI()
+    app.include_router(zing_cache_api.router)
+    with TestClient(app) as client:
+        response = client.get("/v1/zing/cache", params={"limit": 1})
+        assert response.status_code == 200
+        assert response.json()["total_entries"] == 2
+        assert response.json()["next_offset"] == 1
+        assert client.delete("/v1/zing/cache/entries/first").status_code == 422
+        deleted = client.delete(f"/v1/zing/cache/entries/{first}").json()
+        assert deleted["deleted"] == [first] and not deleted["failed"]
+        cleared = client.post("/v1/zing/cache/clear").json()
+        assert cleared["deleted"] == [second]
+        owner.collect()
+        assert client.get("/v1/zing/cache").json()["total_entries"] == 0
+        monkeypatch.setattr(
+            zing_cache_api,
+            "get_global_server_args",
+            lambda: NS(zing_block0_cache_dir=None),
+        )
+        assert client.get("/v1/zing/cache").json() == {
+            "detail": {"code": "cache_unavailable"}
+        }
+
+
+def test_l1_api_busy_status_and_cancel_drain_preserve_admission(service, monkeypatch):
+    from fastapi import HTTPException
+
+    from sglang.multimodal_gen.runtime.entrypoints.control_requests import ZingCacheReq
+    from sglang.multimodal_gen.runtime.entrypoints.openai import zing_cache_api
+
+    args, controller = service
+    args.dp_size = 1
+    monkeypatch.setattr(zing_cache_api, "get_global_server_args", lambda: args)
+
+    async def exercise():
+        started, release = asyncio.Event(), asyncio.Event()
+        calls = []
+
+        async def forward(req):
+            assert isinstance(req, ZingCacheReq)
+            assert req.log_context["operation_id"]
+            if req.operation != "status":
+                assert req.log_context["game_id"] == "game"
+            calls.append(req.operation)
+            if req.operation == "status":
+                return OutputBatch(output={"busy": True, "entries": 0})
+            started.set()
+            await release.wait()
+            return OutputBatch(output={"results": [], "all_ready": True})
+
+        monkeypatch.setattr(api.async_scheduler_client, "forward", forward)
+        task = asyncio.create_task(
+            zing_cache_api._worker_call(Socket(), "preload", game_id="game")
+        )
+        await started.wait()
+        assert await controller.store.active_count() == 1
+        with pytest.raises(HTTPException) as exc:
+            await zing_cache_api._worker_call(Socket(), "unload", game_id="game")
+        assert exc.value.status_code == 409
+        assert (await zing_cache_api._worker_call(Socket(), "status"))["busy"]
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done() and await controller.store.active_count() == 1
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await controller.store.active_count() == 0
+        await zing_cache_api._worker_call(Socket(), "unload", game_id="game")
+        assert calls == ["preload", "status", "unload"]
+        args.dp_size = 2
+        with pytest.raises(HTTPException) as exc:
+            await zing_cache_api._worker_call(Socket(), "preload", game_id="game")
+        assert exc.value.detail["code"] == "cache_requires_dp1"
+        assert await controller.store.active_count() == 0
+
+    asyncio.run(exercise())
+
+
+def test_cache_management_routes_validate_and_forward_selectors(service, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from sglang.multimodal_gen.runtime.entrypoints.openai import zing_cache_api
+
+    args, _ = service
+    args.dp_size = 1
+    monkeypatch.setattr(zing_cache_api, "get_global_server_args", lambda: args)
+    seen = []
+
+    async def forward(req):
+        seen.append((req.operation, req.game_id, req.group_id, req.cache_key))
+        return OutputBatch(output={"all_ready": True, "selected": []})
+
+    monkeypatch.setattr(api.async_scheduler_client, "forward", forward)
+    app = FastAPI()
+    app.include_router(zing_cache_api.router)
+    with TestClient(app) as client:
+        assert client.post("/v1/zing/cache/preload", json={}).status_code == 422
+        assert (
+            client.post(
+                "/v1/zing/cache/preload", json={"game_id": "g", "cache_key": "../bad"}
+            ).status_code
+            == 422
+        )
+        assert (
+            client.get(
+                "/v1/zing/cache/status", params={"group_id": "stage"}
+            ).status_code
+            == 422
+        )
+        body = {"game_id": "g", "group_id": "stage", "cache_key": "a" * 64}
+        assert client.post("/v1/zing/cache/preload", json=body).status_code == 200
+        assert client.post("/v1/zing/cache/unload", json=body).status_code == 200
+        assert (
+            client.get(
+                "/v1/zing/cache/status", params={"cache_key": "a" * 64}
+            ).status_code
+            == 200
+        )
+    assert seen == [
+        ("preload", "g", "stage", "a" * 64),
+        ("unload", "g", "stage", "a" * 64),
+        ("status", None, None, "a" * 64),
+    ]
+
+
+def test_cache_control_selects_index_and_rejects_busy_mutation(tmp_path, cpu_dma):
+    from sglang.multimodal_gen.runtime.entrypoints.control_requests import ZingCacheReq
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.cache_index import (
+        CacheIndex,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.disk_cache import (
+        Block0DiskCache,
+    )
+    from sglang.multimodal_gen.test.unit.realtime.zing_cache_fixtures import (
+        cpu_cache,
+        disk_commit,
+    )
+
+    owner = cpu_cache(
+        [NS(k=torch.zeros(8, 2, 2, dtype=torch.bfloat16)) for _ in range(2)],
+        rows=8,
+        entries=2,
+    )
+    owner.disk_cache = Block0DiskCache(tmp_path, identity=owner.identity)
+    key = "a" * 64
+    disk_commit(owner.disk_cache, key)
+    owner.register(key, "game", "stage")
+    active = {}
+
+    def call(op, game=None, group=None, selected=None):
+        return owner.control(ZingCacheReq(op, game, group, selected), busy=bool(active))
+
+    assert call("preload", "game", "stage")["all_ready"]
+    assert call("status", "game")["selected"] == [{"cache_key": key, "ready": True}]
+    assert call("preload", "other", selected=key)["code"] == "invalid_cache_selection"
+    assert not call("status", "unknown-game")["all_ready"]
+    active["session"] = object()
+    assert call("status", selected=key)["busy"]
+    assert call("unload", "game")["code"] == "cache_busy"
+    assert key in owner.entries
+    active.clear()
+    assert call("unload", "game")["results"] == [
+        {"cache_key": key, "status": "unloaded"}
+    ]
+    assert CacheIndex(tmp_path).select("game") == [key]
+    assert owner.disk_cache.lookup(key) is not None

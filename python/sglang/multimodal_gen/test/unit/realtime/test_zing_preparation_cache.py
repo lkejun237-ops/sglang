@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU checks for the fixed-case key and early preparation bypass."""
 
+import json
+import logging
 from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import asdict
@@ -86,8 +88,9 @@ def test_cpu_snapshot_retains_pixels_and_owns_prepared_tensors():
 @pytest.mark.parametrize("cache_enabled", [False, True])
 @pytest.mark.parametrize("joint_forward", ["off", "cross_chunk"])
 def test_startup_wires_cache_without_gating_joint(
-    monkeypatch, joint, cache_enabled, joint_forward
+    monkeypatch, joint, cache_enabled, joint_forward, caplog
 ):
+    caplog.set_level(logging.INFO)
     prepared = inputs()
     condition = WorkerConditioningState()
     entry = NS(inputs=prepared, conditioning_identity="cached", request=object())
@@ -163,6 +166,18 @@ def test_startup_wires_cache_without_gating_joint(
         session=NS(get_or_create_state=lambda _: condition),
     )
     state.initialize(stage, batch, dict(width=32, height=32, fps=24))
+    disabled = [
+        json.loads(r.getMessage().removeprefix("zing_cache_event "))
+        for r in caplog.records
+        if r.getMessage().startswith("zing_cache_event ")
+    ]
+    assert any(
+        v["event"] == "lookup" and v["result"] == "disabled" for v in disabled
+    ) is (not cache_enabled)
+    assert any(
+        v["event"] == "cache_write" and v["reason"] == "cache_write_false"
+        for v in disabled
+    )
     assert codecs.prepare.call_count == int(not cache_enabled)
     assert stage._conditioning_consumer.call_count == int(not cache_enabled)
     assert stage.kv_pool.acquire.call_count == int(cache_enabled)
@@ -223,11 +238,13 @@ def test_startup_joint_consumer_commits_existing_transfer():
     state.block0_cache.restore.assert_not_called()
 
 
-def test_fill_starts_on_dispatch_after_output():
+@pytest.mark.parametrize("enabled", [False, True])
+def test_fill_starts_on_dispatch_after_output(enabled):
     state = source_session.ZingSourceStreamState()
     prefix = object()
     state.block0_prefix = prefix
-    state.block0_cache = NS(fill=Mock())
+    state.block0_cache = NS(fill=Mock(), register=Mock())
+    state.cache_write = enabled
     state.block0_key = "key"
     state.block0_inputs = inputs()
     state.block0_condition_identity = "condition"
@@ -238,9 +255,9 @@ def test_fill_starts_on_dispatch_after_output():
     state.block0_cache.fill.assert_not_called()
     state.ledger.output_frames = 1
     state._fill_block0_after_output()
-    state.block0_cache.fill.assert_called_once()
+    assert state.block0_cache.fill.call_count == int(enabled)
     state._fill_block0_after_output()
-    state.block0_cache.fill.assert_called_once()
+    assert state.block0_cache.fill.call_count == int(enabled)
 
 
 def test_fill_accepts_host_positions_and_waits_on_kv_device(monkeypatch):

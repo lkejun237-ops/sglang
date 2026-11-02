@@ -70,6 +70,7 @@ def methods(sampling_schedule=None):
         end_dispatched=False,
         more_work=False,
         source_work_quantum=1,
+        cache_options={"cache_write": False},
         source_defer_final=False,
         source_prompt_joint=False,
         # These legacy quantum tests exercise serial input/output scheduling.
