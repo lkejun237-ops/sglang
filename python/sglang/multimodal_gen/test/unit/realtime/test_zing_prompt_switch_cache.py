@@ -19,6 +19,7 @@ from sglang.multimodal_gen.test.unit.realtime.test_zing_preparation_cache import
 from sglang.multimodal_gen.test.unit.realtime.zing_cache_fixtures import (  # noqa: F401
     cpu_cache,
     cpu_dma,
+    dense_kv,
     disk_commit,
 )
 from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
@@ -35,7 +36,7 @@ def model():
 def test_lru_reuses_preallocated_slots_and_waits_for_fill(cpu_dma):
     stores = [NS(k=torch.zeros(8, 2, 3), v=torch.zeros(8, 2, 3)) for _ in range(2)]
     owner = cpu_cache(stores, entries=4, rows=8)
-    pointers = [owner.data[i].data_ptr() for i in range(4)]
+    pointers = [owner.pages[:, :, i].data_ptr() for i in range(4)]
 
     def fill(key, value, rows=3):
         cache = NS(
@@ -53,20 +54,24 @@ def test_lru_reuses_preallocated_slots_and_waits_for_fill(cpu_dma):
 
     for index, key in enumerate("ABCD"):
         entry = fill(key, float(index + 1))
-        assert entry.slot == index
+        assert entry.page_ids == (index,)
         assert cpu_dma[0][-1].synchronized
-    assert owner.lookup("A").data[0, 0, 0, 0, 0] == 1
+    assert dense_kv(owner.lookup("A").data)[0, 0, 0, 0, 0] == 1
     entry = fill("E", 5.0, rows=7)
-    assert entry.slot == 1  # B is oldest after A was accessed.
+    assert entry.page_ids == (1,)  # B is oldest after A was accessed.
     assert owner.lookup("B") is None
     assert owner.lookup("A") is not None
     assert owner.evictions == 1
-    assert torch.equal(entry.data[:, 0], torch.full_like(entry.data[:, 0], 5))
-    assert torch.equal(entry.data[:, 1], torch.full_like(entry.data[:, 1], -5))
-    assert [owner.data[i].data_ptr() for i in range(4)] == pointers
+    assert torch.equal(
+        dense_kv(entry.data)[:, 0], torch.full_like(dense_kv(entry.data)[:, 0], 5)
+    )
+    assert torch.equal(
+        dense_kv(entry.data)[:, 1], torch.full_like(dense_kv(entry.data)[:, 1], -5)
+    )
+    assert [owner.pages[:, :, i].data_ptr() for i in range(4)] == pointers
     # Repeated fill neither allocates nor evicts an existing ready entry.
     fill("E", 99.0)
-    assert owner.lookup("E").data[0, 0, 0, 0, 0] == 99
+    assert dense_kv(owner.lookup("E").data)[0, 0, 0, 0, 0] == 99
     assert owner.evictions == 1
 
 
@@ -653,9 +658,9 @@ def test_l2_disk_hit_promotes_into_l1_and_matches_values(
     assert fresh.manage("preload", ["L2"])["all_ready"]
     promoted = fresh.entries["L2"]
     assert fresh.hits == 1 and fresh.misses == 1  # Online miss, then explicit preload.
-    assert promoted.slot == 0
+    assert promoted.page_ids == (0,)
     assert promoted.conditioning_identity == "L2-condition"
-    assert torch.equal(promoted.data, old.data)
+    assert torch.equal(dense_kv(promoted.data), dense_kv(old.data))
 
 
 @torch.no_grad()

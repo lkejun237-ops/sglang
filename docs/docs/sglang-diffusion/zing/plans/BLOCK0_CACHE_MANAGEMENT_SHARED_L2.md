@@ -1,4 +1,7 @@
 ---
+
+2026-11-02：本文件记录 PR #467 的初始管理设计。L1 定长槽、capacity 字段与 preload 条数准入由[分页方案](/docs/sglang-diffusion/zing/plans/BLOCK0_PAGED_L1)替代；业务索引、L2 与单会话管理语义沿用。
+
 title: "Block0 Cache 管理、业务索引与显式预加载"
 description: "用户管理缓存、简化内容 key、game/group 索引和实例级 preload/status/unload 的确认方案。"
 ---

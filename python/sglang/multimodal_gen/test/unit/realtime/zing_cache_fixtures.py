@@ -56,7 +56,7 @@ def cpu_dma(monkeypatch):
     return events, stream
 
 
-def cpu_cache(storage, *, entries=6, rows=32):
+def cpu_cache(storage, *, entries=6, rows=32, page_rows=None):
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.preparation_cache import (
         Block0PreparationCache,
     )
@@ -80,7 +80,11 @@ def cpu_cache(storage, *, entries=6, rows=32):
     first = storage[0].k
     slot_bytes = len(storage) * 2 * rows * first[0].numel() * first.element_size()
     return Block0PreparationCache(
-        pool, max_bytes=entries * slot_bytes, identity=identity, disk_cache=disk
+        pool,
+        max_bytes=entries * slot_bytes,
+        identity=identity,
+        disk_cache=disk,
+        page_rows=rows if page_rows is None else page_rows,
     )
 
 
@@ -129,3 +133,15 @@ def disk_commit(
     )
     assert entry is not None
     return kv, entry
+
+
+def dense_kv(data):
+    """Materialize only in tests; production IO streams pages without staging."""
+    page_rows = data.pages.shape[3]
+    return torch.cat(
+        [
+            data.pages[:, :, page_id, : min(page_rows, data.rows - index * page_rows)]
+            for index, page_id in enumerate(data.page_ids)
+        ],
+        dim=2,
+    )

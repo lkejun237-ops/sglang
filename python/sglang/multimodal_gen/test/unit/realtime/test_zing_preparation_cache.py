@@ -279,7 +279,7 @@ def test_fill_accepts_host_positions_and_waits_on_kv_device(monkeypatch):
         plan=NS(config=NS(max_prefix_rows=8)),
     )
     owner = Block0PreparationCache(
-        pool, max_bytes=2 * 8 * 2 * 3 * 4, identity={}, disk_cache=None
+        pool, max_bytes=2 * 8 * 2 * 3 * 4, identity={}, disk_cache=None, page_rows=8
     )
     positions = torch.arange(9).reshape(3, 3)
     cache = NS(
@@ -302,6 +302,10 @@ def test_fill_accepts_host_positions_and_waits_on_kv_device(monkeypatch):
     owner.finish_fill()
     entry = owner.entries["host-positions"]
     assert torch.equal(entry.positions, positions)
-    assert torch.equal(entry.data[0, 0], cache.prefix.layers[0][0])
-    assert torch.equal(entry.data[0, 1], cache.prefix.layers[0][1])
+    assert torch.equal(
+        entry.data.pages[0, 0, entry.page_ids[0], :3], cache.prefix.layers[0][0]
+    )
+    assert torch.equal(
+        entry.data.pages[0, 1, entry.page_ids[0], :3], cache.prefix.layers[0][1]
+    )
     done.synchronize.assert_called_once()

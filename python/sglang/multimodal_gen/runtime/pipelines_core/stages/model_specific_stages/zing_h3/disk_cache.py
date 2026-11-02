@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from .block0_conditions import CONDITIONS_SCHEMA, decode_conditions, encode_conditions
 from .block0_identity import SCHEMA
 from .cache_logging import cache_event, cache_scope
+from .paged_kv import kv_slices
 
 logger = init_logger(__name__)
 DISK_FORMAT = 4
@@ -49,15 +50,7 @@ def _write_kv(path, tensor):
     avoids materializing a second full-size contiguous copy.
     """
     with open(path, "wb") as handle:
-        if tensor.dim() >= 2 and tensor.shape[1] == 2:
-            slices = (
-                tensor[layer, part]
-                for layer in range(tensor.shape[0])
-                for part in range(tensor.shape[1])
-            )
-        else:
-            slices = (tensor,)
-        for value in slices:
+        for value in kv_slices(tensor):
             value = value.contiguous().reshape(-1)
             value.view(torch.uint8).numpy().tofile(handle)
 
@@ -81,12 +74,8 @@ def _read_kv(path, target):
     with open(path, "rb") as handle:
         if os.fstat(handle.fileno()).st_size != expected:
             raise ValueError("Block0 KV file size does not match the target slot")
-        if target.dim() >= 2 and target.shape[1] == 2:
-            for layer in range(target.shape[0]):
-                for part in range(target.shape[1]):
-                    _readinto(handle, target[layer, part])
-        else:
-            _readinto(handle, target)
+        for value in kv_slices(target):
+            _readinto(handle, value)
     return target
 
 
@@ -252,6 +241,20 @@ class Block0DiskCache:
             return False
         folder = self._entry_dir(key)
         return (folder / f"rank-{self.local_rank}" / "ready.json").is_file()
+
+    def prefix_rows(self, key):
+        """Metadata-only preload sizing; loading still validates actual tensors."""
+        if not self._safe_key(key):
+            return None
+        try:
+            manifest = self._valid_manifest(self._entry_dir(key), key)
+            return (
+                None
+                if manifest is None
+                else manifest.get("geometry", {}).get("prefix_rows")
+            )
+        except (OSError, ValueError, TypeError, AttributeError):
+            return None
 
     def lookup(self, key, rank=None):
         rank = self.local_rank if rank is None else rank

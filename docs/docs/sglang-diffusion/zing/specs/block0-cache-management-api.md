@@ -5,6 +5,9 @@ description: "实例级 L1 preload/unload/status、同机共享 NVMe L2 管理�
 
 # Block0 缓存管理 API 与部署契约
 
+2026-11-02 分页变更：管理响应删除 `capacity`，统一报告页数与字节容量；中台需同步修改。
+页预算取代固定条目上限，接口字段见下文。设计与验证边界见 [分页方案](/docs/sglang-diffusion/zing/plans/BLOCK0_PAGED_L1)。
+
 本文定义 Zing H3 受管 Block0 前缀缓存（PR #467，schema `zing-block0-v3`、`disk_format=4`）的外部接口契约、HTTP 状态码、完整返回值结构、结构化日志与部署边界。
 设计背景与验证记录见[确认方案](/docs/sglang-diffusion/zing/plans/BLOCK0_CACHE_MANAGEMENT_SHARED_L2)，串行预热协议见[prefill WebSocket 契约](/docs/sglang-diffusion/zing/specs/block0-prefill-websocket)。
 
@@ -14,7 +17,7 @@ description: "实例级 L1 preload/unload/status、同机共享 NVMe L2 管理�
 
 Block0 缓存采用 **“实例独占 L1（Host Pinned Memory） + 同机共享 L2（本地 NVMe 磁盘） + 业务标签索引（`game_id` / `group_id`）”** 的双层受管架构：
 
-- **L1（实例内存层）**：每个推理实例（SP 组）独立持有预分配的 Pinned CPU 内存槽位。命中时通过异步 DMA 直接恢复 50 层 Block0 KV，跳过 `codecs.prepare` 与首块前缀计算。
+- **L1（实例内存层）**：每个推理实例（SP 组）独立持有预分配的 Pinned CPU 内存页。命中时通过异步 DMA 直接恢复 50 层 Block0 KV，跳过 `codecs.prepare` 与首块前缀计算。
 - **L2（同机磁盘层）**：同一台物理机上的多个实例可共享同一个本地 NVMe 目录（`--zing-block0-cache-dir`），存储 `entries/<cache_key>/` 实体与 `index/<game_id>/<group_id>/` 业务关联索引。
 - **在线生成与磁盘解耦**：正常视频会话（初始请求与后续 prompt 切换，含 `may_contain` 预取提示）**严格只查本实例 L1，永不阻塞读盘**。
 
@@ -25,21 +28,21 @@ Block0 缓存采用 **“实例独占 L1（Host Pinned Memory） + 同机共享 
 | **预热接口 (`prefill`)**<br/>`force=false`（**默认**） | 优先复用 L1；L1 未命中时查 L2 并恢复至 L1；L1+L2 均未命中则重算并写回 L1 | L1+L2 均未命中时，后台异步落盘 L2 | 无论命中或重算，只要携带标签即登记关联 |
 | **预热接口 (`prefill`)**<br/>`force=true` | **跳过 L1/L2 命中**，强制重算并覆盖本实例 L1（不影响其他实例已有 L1） | 后台异步覆盖 L2 对应 key | 携带标签时登记关联 |
 | **显式预加载 (`preload`)** | 已在 L1 则复用；不在 L1 则同步从 L2 加载校验并填入本实例 L1（满时按 LRU 淘汰） | 只读 L2；若 L2 缺失或损坏，逐项返回 `missing`，**不触发 GPU 重算** | 只读索引解析目标 `cache_key` 集合 |
-| **显式卸载 (`unload`)** | 从本实例 L1 移除选中条目并归还空闲槽位（等待该槽位在途异步写盘完成） | 保留 L2 磁盘实体 | 保留业务索引 |
+| **显式卸载 (`unload`)** | 从本实例 L1 移除选中条目并归还空闲页（等待该条目写盘与 DMA 完成） | 保留 L2 磁盘实体 | 保留业务索引 |
 | **磁盘清理 (`DELETE` / `clear`)** | 保留各实例已有 L1（不跨实例广播失效） | 立即删除目标 L2 磁盘目录及分片文件 | 保留索引（后续对被删 key 执行 `preload` 将返回 `missing`） |
 
 ---
 
 ## 2. 容量规格与淘汰边界
 
-以下是与历史合成 IO 验收一致的容量示例：**SP=2、50 层 BF16 KV、每 rank 28 个 head、head_dim=128、12,288 prefix rows**。实际容量取决于模型、SP 布局与 KV pool 的 max_prefix_rows，应以实例启动时的槽位与字节日志为准：
+以下是与历史合成 IO 验收一致的容量示例：**SP=2、50 层 BF16 KV、每 rank 28 个 head、head_dim=128、12,288 prefix rows**。实际页容量取决于模型、SP 布局、页行数与 host 预算，应以实例启动时的页数与字节日志为准；max_prefix_rows 只限制单条合法行数：
 
 - **单分片（每张卡 / 每 rank）**：`50 × 2 × 12288 × 28 × 128 × 2 Bytes` = **8.81 GB**（二进制 **8.203 GiB**）
 - **单完整条目（SP=2 双卡合计）**：**17.62 GB**（二进制 **16.406 GiB**）
 
 | 层级 | 配置参数 | 默认值与示例配置 | 按上述布局估算的完整条目数 | 满容后的淘汰与边界行为 |
 | --- | --- | --- | --- | --- |
-| **L1 内存缓存** | `--zing-block0-cache-host-gb` | **无，启用缓存时必填**；示例 `800`（整实例十进制 GB，SP=2 下每 rank 400 GB） | **45 条** | **自动 LRU 淘汰**：新条目写入或 `preload` 超出剩余空闲槽位时，自动驱逐本实例最久未使用的 L1 槽位（磁盘 L2 仍保留）。若单次 `preload` 请求去重后的 key 总数直接超过实例总槽位上限（如 `> 45`），在加载前直接拒绝并返回 `HTTP 409 / cache_capacity_exceeded`。 |
+| **L1 内存缓存** | `--zing-block0-cache-host-gb` | **无，启用缓存时必填**；示例 `800`（整实例十进制 GB，SP=2 下每 rank 400 GB） | **每 rank 272 页（2048 行/页）** | **按实际行数占页，整条 LRU 淘汰**：页不足时逐条淘汰至足够；单次 `preload` 的有效 key 总页需求超过实例总页数时，在加载前返回 `HTTP 409 / cache_capacity_exceeded`。L2 缺失的 key 不计需求页；已在全部 SP rank 的 L1 hit 即使 L2 已删仍可复用。 |
 | **L2 磁盘缓存** | `--zing-block0-cache-disk-gb` | **无，启用缓存时必填**；示例 `4000`（十进制 GB，清理高水位） | 高水位 **≈ 227 条**<br/>低水位(`0.9`) **≈ 204 条** | **周期性后台 GC**：开启 `--zing-block0-cache-gc` 的实例每 60 秒扫描一次元数据：先清理超时未完成的临时文件（默认 `600s`），若总占用超过高水位，按 `.access` 的近似 LRU 顺序删除磁盘条目直至降至低水位（默认 `90%`）。 |
 
 ---
@@ -81,7 +84,7 @@ Block0 缓存采用 **“实例独占 L1（Host Pinned Memory） + 同机共享 
 | --- | --- | --- | --- |
 | **`200 OK`** | 无（正常返回业务 JSON） | 请求执行完成（**注：需检查 JSON 内的 `all_ready`、`results[].status`、`failed` 判断条目级结果**） | 解析返回字段，按需路由或补做 `prefill` |
 | **`409 Conflict`** | `cache_busy` | 目标实例正在执行视频生成、`prefill` 或其他 `preload`/`unload` 操作 | 稍后重试，或调度到其他空闲实例 |
-| **`409 Conflict`** | `cache_capacity_exceeded` | 单次 `preload` 选中的去重 `cache_key` 数量超过本实例 L1 总槽位（额外返回 `capacity` 与 `requested`） | 拆分 `group_id` 控制单组大小，或调大 `--zing-block0-cache-host-gb` |
+| **`409 Conflict`** | `cache_capacity_exceeded` | 单次 `preload` 有效 key 的总页需求超过 SP 共同页容量（返回 `page_rows`、`total_pages`、`requested_pages`） | 拆分 `group_id` 控制单组大小，或调大 `--zing-block0-cache-host-gb` |
 | **`409 Conflict`** | `cache_requires_dp1` | 当前服务实例 `dp_size != 1`，不支持实例级 L1 定向管理 | 部署确保单实例 `dp_size=1` |
 | **`422 Unprocessable Entity`** | `invalid_cache_selection` | 标签格式非法、传了 `group_id` 但未传 `game_id`、或指定的 `cache_key` 未绑定在该 `game_id`/`group_id` 下 | 修正请求参数，或先通过 `prefill` 绑定标签关联 |
 | **`422 Unprocessable Entity`** | DELETE 路径参数为 `invalid_cache_key`；框架校验为 `detail[]` | `cache_key` 不是 64 位小写 hex，`offset < 0`，`limit` 不在 `1..1000`，或传入了未定义的额外字段 | 修正请求参数格式 |
@@ -201,7 +204,12 @@ Block0 缓存采用 **“实例独占 L1（Host Pinned Memory） + 同机共享 
 
 ```json
 {
-  "capacity": 45,
+  "page_rows": 2048,
+  "total_pages": 272,
+  "free_pages": 254,
+  "budget_bytes": 800000000000,
+  "reserved_bytes": 798595481600,
+  "used_bytes": 52848230400,
   "entries": 3,
   "cache_keys": [
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -229,7 +237,12 @@ Block0 缓存采用 **“实例独占 L1（Host Pinned Memory） + 同机共享 
 
 | 字段名 | 类型 | 说明 |
 | --- | --- | --- |
-| `capacity` | `int` | 本实例 L1 的总槽位上限，以实际返回为准（上述布局配置 800 GB 的示例为 `45`） |
+| `page_rows` | `int` | 每页行数，当前为 2048 |
+| `total_pages` | `int` | SP 各 rank 总页数的最小值，共同保证的逻辑页容量 |
+| `free_pages` | `int` | SP 各 rank 空闲页数的最小值 |
+| `budget_bytes` | `int` | 整实例 KV 数据预算，跨 SP rank 求和 |
+| `reserved_bytes` | `int` | 实际预分配 pinned KV 字节，跨 rank 求和；预算余数不分配 |
+| `used_bytes` | `int` | 已分配给驻留条目和 pending fill 的页字节，跨 rank 求和；不含 conditioning/元数据 |
 | `entries` | `int` | 操作完成后，本实例所有 SP rank 均驻留的 L1 条目总数 |
 | `cache_keys` | `list[str]` | 本实例当前 L1 全部已就绪的 `cache_key` 升序列表 |
 | `selected` | `list[object]` | 本次选择器命中的目标 `cache_key` 在操作完成后的最终 L1 驻留状态：`{"cache_key": "...", "ready": true/false}` |
@@ -241,7 +254,7 @@ Block0 缓存采用 **“实例独占 L1（Host Pinned Memory） + 同机共享 
 
 - `409 Conflict`：
   - 实例忙：`{"detail": {"code": "cache_busy"}}`
-  - 请求条数超 L1 总容量：`{"detail": {"code": "cache_capacity_exceeded", "capacity": 45, "requested": 50}}`
+  - 请求有效 key 的总页需求超 L1 总页容量：`{"detail": {"code": "cache_capacity_exceeded", "page_rows": 2048, "total_pages": 272, "requested_pages": 300}}`
   - DP 配置不支持：`{"detail": {"code": "cache_requires_dp1"}}`
 - `422 Unprocessable Entity`：`{"detail": {"code": "invalid_cache_selection"}}`
 - `503 Service Unavailable`：`{"detail": {"code": "cache_unavailable"}}`
@@ -250,7 +263,7 @@ Block0 缓存采用 **“实例独占 L1（Host Pinned Memory） + 同机共享 
 
 ### 4.4 显式从实例 L1 卸载：`POST /v1/zing/cache/unload`
 
-将指定游戏/分组/单键从**当前实例 L1** 中移除并释放槽位，**不删除 L2 磁盘文件和业务索引**。
+将指定游戏/分组/单键从**当前实例 L1** 中移除并归还页面，**不删除 L2 磁盘文件和业务索引**。
 
 #### 请求体（JSON）
 
@@ -260,7 +273,12 @@ Block0 缓存采用 **“实例独占 L1（Host Pinned Memory） + 同机共享 
 
 ```json
 {
-  "capacity": 45,
+  "page_rows": 2048,
+  "total_pages": 272,
+  "free_pages": 260,
+  "budget_bytes": 800000000000,
+  "reserved_bytes": 798595481600,
+  "used_bytes": 35232153600,
   "entries": 2,
   "cache_keys": [
     "1111111111111111111111111111111111111111111111111111111111111111",
@@ -307,7 +325,12 @@ Block0 缓存采用 **“实例独占 L1（Host Pinned Memory） + 同机共享 
 
 ```json
 {
-  "capacity": 45,
+  "page_rows": 2048,
+  "total_pages": 272,
+  "free_pages": 260,
+  "budget_bytes": 800000000000,
+  "reserved_bytes": 798595481600,
+  "used_bytes": 35232153600,
   "entries": 2,
   "cache_keys": [
     "1111111111111111111111111111111111111111111111111111111111111111",

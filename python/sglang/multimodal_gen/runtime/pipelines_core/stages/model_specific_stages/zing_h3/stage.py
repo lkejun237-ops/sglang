@@ -286,11 +286,11 @@ class ZingH3GenerationStage(PipelineStage):
             ):
                 disk.start_gc()
             logger.info(
-                "Zing Block0 cache ready: model=%s layout=%s pinned_bytes_per_rank=%d slots=%d root=%s disk_bytes=%d",
+                "Zing Block0 cache ready: model=%s layout=%s pinned_bytes_per_rank=%d pages=%d root=%s disk_bytes=%d",
                 identity["zing_config"].get("checkpoint_sha256"),
                 identity["sp"],
-                owner.data.numel() * owner.data.element_size(),
-                owner.data.shape[0],
+                owner.pages.numel() * owner.pages.element_size(),
+                owner.total_pages,
                 root,
                 disk.max_bytes,
             )

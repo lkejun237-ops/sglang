@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from .block0_identity import fingerprint
 from .cache_logging import cache_event, cache_scope, log_context
 from .media_input import _local_media
+from .paged_kv import PAGE_ROWS, PagedKV
 
 logger = init_logger(__name__)
 
@@ -132,11 +133,15 @@ class PreparationEntry:
     request: object
     positions: torch.Tensor
     model_signature: object
-    data: torch.Tensor
-    slot: int
+    data: PagedKV
     force: bool = False
     log_context: dict | None = None
     fill_started: float | None = None
+    disk_task: threading.Event | None = None
+
+    @property
+    def page_ids(self):
+        return self.data.page_ids
 
 
 @dataclass
@@ -200,12 +205,12 @@ class Block0PreparationCache:
     """A bounded pinned LRU; the existing GPU pool remains the only KV owner.
 
     One session writes this cache. Transfers share one stream, so a reused CPU
-    slot is overwritten only after earlier restores from that slot have finished.
+    page is recycled only after transfers and its entry's disk writer finish.
     Only explicit preload/prefill may promote from Tier-2 disk. Every
     published L1 entry is written back to disk on a daemon thread.
     """
 
-    def __init__(self, pool, *, max_bytes, identity, disk_cache):
+    def __init__(self, pool, *, max_bytes, identity, disk_cache, page_rows=PAGE_ROWS):
         if type(max_bytes) is not int or max_bytes < 1:
             raise ValueError("Block0 cache byte budget must be a positive integer")
         self.mode = "on"
@@ -214,37 +219,29 @@ class Block0PreparationCache:
         self.pending = None
         self.hits = self.misses = self.evictions = 0
         self.disk_cache = disk_cache
-        self._disk_tasks = {}
-        # Reserve once, before readiness, instead of pinning gigabytes on a request.
+        if type(page_rows) is not int or page_rows < 1:
+            raise ValueError("Block0 page rows must be a positive integer")
+        # Pin once before readiness. Rows are a testable storage layout, not a
+        # request-time allocation or a new deployment configuration option.
         stores = pool._pool._slots[0].kv_cache
         first = stores[0].k
-        slot_bytes = (
-            len(stores)
-            * 2
-            * pool.plan.config.max_prefix_rows
-            * first[0].numel()
-            * first.element_size()
+        self.max_prefix_rows = pool.plan.config.max_prefix_rows
+        self.page_rows = page_rows
+        self.page_bytes = (
+            len(stores) * 2 * page_rows * first[0].numel() * first.element_size()
         )
-        entries = max_bytes // slot_bytes
-        if entries < 1:
-            raise ValueError(
-                "Block0 host budget cannot hold one maximum-prefix KV slot"
-            )
+        self.total_pages = max_bytes // self.page_bytes
+        if self.total_pages < 1:
+            raise ValueError("Block0 host budget cannot hold one pinned KV page")
         self.max_bytes = max_bytes
-        self.data = torch.empty(
-            (
-                entries,
-                len(stores),
-                2,
-                pool.plan.config.max_prefix_rows,
-                *first.shape[1:],
-            ),
+        self.pages = torch.empty(
+            (len(stores), 2, self.total_pages, page_rows, *first.shape[1:]),
             dtype=first.dtype,
             device="cpu",
             pin_memory=True,
         )
         self.stream = torch.cuda.Stream(device=first.device)
-        self.free_slots = list(reversed(range(entries)))
+        self.free_pages = [True] * self.total_pages
 
     def may_contain(self, key):
         """CPU-only hint for speculative work; lookup remains authoritative.
@@ -266,11 +263,11 @@ class Block0PreparationCache:
             )
         )
 
-    def lookup(self, key, *, allow_disk=False):
+    def lookup(self, key, *, allow_disk=False, protected=()):
         with cache_scope():
-            return self._lookup(key, allow_disk=allow_disk)
+            return self._lookup(key, allow_disk=allow_disk, protected=protected)
 
-    def _lookup(self, key, *, allow_disk):
+    def _lookup(self, key, *, allow_disk, protected):
         started = time.perf_counter()
         self.finish_fill()
         local = self.entries.get(key)
@@ -279,7 +276,7 @@ class Block0PreparationCache:
         if allow_disk:
             present = coordinate_validation(local is not None)
             if not all(present):
-                local = self._promote_from_disk(key)
+                local = self._promote_from_disk(key, protected=protected)
                 tier = "l2"
         votes = coordinate_validation((key, local is not None))
         hit = local is not None and all(
@@ -312,16 +309,39 @@ class Block0PreparationCache:
         )
         return local if hit else None
 
-    def _take_slot(self, key):
+    def _release(self, key):
+        entry = self.entries[key]
+        if entry.disk_task is not None:
+            entry.disk_task.wait()
+        # Keep ownership until both CPU readers and DMA have retired. This also
+        # makes free pages safe for synchronous disk IO, not just queued DMA.
+        self.stream.synchronize()
+        self._return_pages(entry.page_ids)
+        del self.entries[key]
+
+    def _return_pages(self, page_ids):
+        if len(set(page_ids)) != len(page_ids) or any(
+            self.free_pages[page] for page in page_ids
+        ):
+            raise ValueError("Block0 page was returned more than once")
+        for page in page_ids:
+            self.free_pages[page] = True
+
+    def _take_pages(self, key, rows, *, protected=()):
+        if type(rows) is not int or not 0 < rows <= self.max_prefix_rows:
+            raise ValueError("Block0 prefix exceeds the configured row limit")
+        needed = (rows + self.page_rows - 1) // self.page_rows
+        if needed > self.total_pages:
+            raise ValueError("Block0 prefix exceeds the pinned page budget")
         if key in self.entries:
-            # A partial SP miss recomputes on every rank. Replace the matching
-            # local entry too, so all shards describe that same preparation.
-            slot = self.entries.pop(key).slot
-        elif self.free_slots:
-            slot = self.free_slots.pop()
-        else:
-            old_key, old = self.entries.popitem(last=False)
-            slot = old.slot
+            self._release(key)
+        while self.free_pages.count(True) < needed:
+            old_key = next((k for k in self.entries if k not in protected), None)
+            if old_key is None:
+                raise ValueError(
+                    "Block0 preload selection exceeds the pinned page budget"
+                )
+            self._release(old_key)
             self.evictions += 1
             cache_event(
                 "l1_evict",
@@ -331,13 +351,12 @@ class Block0PreparationCache:
                 reason="capacity",
                 replacement_key=key,
             )
-        task = self._disk_tasks.pop(slot, None)
-        if task is not None:
-            # The disk writer reads this slot directly; never overwrite it.
-            task.wait()
-        return slot
+        ids = tuple(page for page, free in enumerate(self.free_pages) if free)[:needed]
+        for page in ids:
+            self.free_pages[page] = False
+        return PagedKV(self.pages, ids, rows)
 
-    def _promote_from_disk(self, key):
+    def _promote_from_disk(self, key, *, protected=()):
         disk = self.disk_cache
         if disk is None or not disk.is_enabled():
             return None
@@ -373,7 +392,7 @@ class Block0PreparationCache:
                 )
                 return None
             rows = int(positions.shape[0])
-            if rows < 1 or rows > self.data.shape[3]:
+            if rows < 1 or rows > self.max_prefix_rows:
                 cache_event(
                     "l2_read",
                     "failed",
@@ -383,15 +402,14 @@ class Block0PreparationCache:
                     level=logging.WARNING,
                 )
                 return None
-            slot = self._take_slot(key)
+            data = self._take_pages(key, rows, protected=protected)
             try:
                 # A disk read runs on the CPU, outside the DMA stream. Fence
                 # earlier H2D reads before overwriting the reused pinned slot.
                 self.stream.synchronize()
-                data = self.data[slot, :, :, :rows]
                 disk.load_kv_into(cached, data)
             except BaseException:
-                self.free_slots.append(slot)
+                self._return_pages(data.page_ids)
                 raise
             entry = PreparationEntry(
                 key,
@@ -403,7 +421,6 @@ class Block0PreparationCache:
                 # Never import that runtime-only guard into this cache.
                 None,
                 data,
-                slot,
             )
             self.entries[key] = entry
             return entry
@@ -433,10 +450,15 @@ class Block0PreparationCache:
         begin, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
         with torch.cuda.stream(self.stream):
             begin.record()
-            for layer, (k, v) in enumerate(views):
-                k.copy_(entry.data[layer, 0], non_blocking=True)
-                v.copy_(entry.data[layer, 1], non_blocking=True)
-            end.record()
+            try:
+                for layer, part, start, value in entry.data.slices():
+                    views[layer][part][start : start + value.shape[0]].copy_(
+                        value, non_blocking=True
+                    )
+                end.record()
+            except BaseException:
+                self.stream.synchronize()
+                raise
         return PrefixRestore(
             entry,
             begin,
@@ -453,12 +475,11 @@ class Block0PreparationCache:
         self.finish_fill()
         prefix = cache.prefix
         rows = prefix.positions.shape[0]
-        if rows > self.data.shape[3]:
-            raise ValueError("Block0 prefix exceeds the preallocated CPU slot")
+        if rows > self.max_prefix_rows:
+            raise ValueError("Block0 prefix exceeds the configured row limit")
         snapshot = inputs_on(inputs, "cpu", snapshot=True)
         positions = prefix.positions.detach().cpu().clone()
-        slot = self._take_slot(key)
-        data = self.data[slot, :, :, :rows]
+        data = self._take_pages(key, rows)
         entry = PreparationEntry(
             key,
             snapshot,
@@ -467,20 +488,27 @@ class Block0PreparationCache:
             positions,
             cache._model_signature,
             data,
-            slot,
             force,
             log_context(),
             started,
         )
-        # Positions may stay on the host; the transfer stream owns the KV device.
-        self.stream.wait_stream(torch.cuda.current_stream(self.stream.device))
-        done = torch.cuda.Event()
-        with torch.cuda.stream(self.stream):
-            for layer, (k, v) in enumerate(prefix.layers):
-                data[layer, 0].copy_(k, non_blocking=True)
-                data[layer, 1].copy_(v, non_blocking=True)
-            done.record()
-        self.pending = (entry, done)
+        # Own the pages even if event construction or a later copy submission
+        # fails. A failed drain must never return still-active pages to the pool.
+        self.pending = (entry, None)
+        try:
+            self.stream.wait_stream(torch.cuda.current_stream(self.stream.device))
+            done = torch.cuda.Event()
+            with torch.cuda.stream(self.stream):
+                for layer, part, start, value in data.slices():
+                    value.copy_(
+                        prefix.layers[layer][part][start : start + value.shape[0]],
+                        non_blocking=True,
+                    )
+                done.record()
+            self.pending = (entry, done)
+        except BaseException:
+            self.finish_fill()
+            raise
         cache_event(
             "l1_fill",
             "submitted",
@@ -493,6 +521,11 @@ class Block0PreparationCache:
     def finish_fill(self):
         if self.pending is not None:
             entry, done = self.pending
+            if done is None:
+                self.stream.synchronize()
+                self._return_pages(entry.page_ids)
+                self.pending = None
+                return
             done.synchronize()
             self.entries[entry.key] = entry
             self.pending = None
@@ -512,7 +545,7 @@ class Block0PreparationCache:
         if disk is None or not disk.is_enabled():
             return
         done = threading.Event()
-        self._disk_tasks[entry.slot] = done
+        entry.disk_task = done
 
         def write():
             # ContextVars do not cross threads; keep only the metadata snapshot.
@@ -545,11 +578,15 @@ class Block0PreparationCache:
                 finally:
                     done.set()
 
-        threading.Thread(
-            target=write,
-            name=f"zing-block0-disk-{entry.slot}",
-            daemon=True,
-        ).start()
+        try:
+            threading.Thread(
+                target=write,
+                name=f"zing-block0-disk-{entry.key[:12]}",
+                daemon=True,
+            ).start()
+        except Exception:
+            done.set()
+            logger.warning("Block0 disk writer could not start", exc_info=True)
 
     def _write_disk(self, entry):
         disk = self.disk_cache
@@ -579,9 +616,9 @@ class Block0PreparationCache:
 
     def wait_for_disk(self):
         """Wait for in-flight L2 writes; used by shutdown and deterministic tests."""
-        while self._disk_tasks:
-            _, done = self._disk_tasks.popitem()
-            done.wait()
+        for entry in list(self.entries.values()):
+            if entry.disk_task is not None:
+                entry.disk_task.wait()
 
     def register(self, key, game_id=None, group_id=None):
         if (
@@ -696,33 +733,92 @@ class Block0PreparationCache:
         return dict(self.manage(request.operation, selection["keys"]), busy=busy)
 
     def status(self, keys=None):
-        local = list(self.entries)
-        ranks = coordinate_validation(local)
-        resident = sorted(set.intersection(*(set(items) for items in ranks)))
+        snapshots = coordinate_validation(
+            (
+                list(self.entries),
+                self.free_pages.count(True),
+                self.total_pages,
+                self.page_bytes,
+                self.max_bytes,
+            )
+        )
+        resident = sorted(set.intersection(*(set(item[0]) for item in snapshots)))
         selected = resident if keys is None else keys
         states = [{"cache_key": key, "ready": key in resident} for key in selected]
         return dict(
-            capacity=int(self.data.shape[0]),
+            page_rows=self.page_rows,
+            total_pages=min(item[2] for item in snapshots),
+            free_pages=min(item[1] for item in snapshots),
+            budget_bytes=sum(item[4] for item in snapshots),
+            reserved_bytes=sum(item[2] * item[3] for item in snapshots),
+            used_bytes=sum((item[2] - item[1]) * item[3] for item in snapshots),
             entries=len(resident),
             cache_keys=resident,
             selected=states,
             all_ready=bool(states) and all(item["ready"] for item in states),
         )
 
+    def _preload_plan(self, keys):
+        # Agree on residency first: partial L1 hits must all use the disk path.
+        resident = coordinate_validation(
+            [
+                int(self.entries[k].positions.shape[0]) if k in self.entries else None
+                for k in keys
+            ]
+        )
+        local_rows = []
+        for index, key in enumerate(keys):
+            values = [rank[index] for rank in resident]
+            if values[0] is not None and all(value == values[0] for value in values):
+                rows = values[0]
+            else:
+                rows = (
+                    None
+                    if self.disk_cache is None
+                    else self.disk_cache.prefix_rows(key)
+                )
+            local_rows.append(
+                rows if type(rows) is int and 0 < rows <= self.max_prefix_rows else None
+            )
+        plans = coordinate_validation((self.total_pages, local_rows))
+        # No rank returns before this collective. Metadata races are handled by
+        # the actual load and final all-rank residency check, as before.
+        rows = []
+        for index in range(len(keys)):
+            values = [rank[1][index] for rank in plans]
+            rows.append(
+                values[0]
+                if values[0] is not None and all(v == values[0] for v in values)
+                else 0
+            )
+        needed = sum((n + self.page_rows - 1) // self.page_rows for n in rows)
+        total = min(rank[0] for rank in plans)
+        return rows, needed, total
+
     def manage(self, operation, keys):
         if operation == "status":
             return self.status(keys)
         self.finish_fill()
-        if operation == "preload" and len(keys) > self.data.shape[0]:
-            return {
-                "code": "cache_capacity_exceeded",
-                "capacity": int(self.data.shape[0]),
-                "requested": len(keys),
-            }
+        keys = list(dict.fromkeys(keys))
+        protected = set()
+        if operation == "preload":
+            rows, needed, total = self._preload_plan(keys)
+            if needed > total:
+                return {
+                    "code": "cache_capacity_exceeded",
+                    "total_pages": total,
+                    "requested_pages": needed,
+                    "page_rows": self.page_rows,
+                }
+            protected = {key for key, n in zip(keys, rows) if n}
         results = []
         for key in keys:
             if operation == "preload":
-                entry = self.lookup(key, allow_disk=True)
+                entry = (
+                    self.lookup(key, allow_disk=True, protected=protected)
+                    if key in protected
+                    else None
+                )
                 results.append(
                     {
                         "cache_key": key,
@@ -730,24 +826,20 @@ class Block0PreparationCache:
                     }
                 )
             elif operation == "unload":
-                entry = self.entries.pop(key, None)
-                if entry is not None:
-                    task = self._disk_tasks.pop(entry.slot, None)
-                    if task is not None:
-                        task.wait()
-                    self.stream.synchronize()
-                    self.free_slots.append(entry.slot)
-                found = coordinate_validation(entry is not None)
+                found = key in self.entries
+                if found:
+                    self._release(key)
+                votes = coordinate_validation(found)
                 cache_event(
                     "l1_unload",
-                    "completed" if any(found) else "missing",
+                    "completed" if any(votes) else "missing",
                     cache_key=key,
                     rank=self.log_rank,
                 )
                 results.append(
                     {
                         "cache_key": key,
-                        "status": "unloaded" if any(found) else "missing",
+                        "status": "unloaded" if any(votes) else "missing",
                     }
                 )
             else:

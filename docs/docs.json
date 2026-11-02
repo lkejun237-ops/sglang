@@ -1640,6 +1640,7 @@
                     "pages": [
                       "docs/sglang-diffusion/zing/overview",
                       "docs/sglang-diffusion/zing/deployment_zing_h3",
+                      "docs/sglang-diffusion/zing/plans/BLOCK0_PAGED_L1",
                       "docs/sglang-diffusion/zing/prompt-reference-budgets",
                       "docs/sglang-diffusion/zing/architecture",
                       "docs/sglang-diffusion/zing/realtime-streaming",

@@ -8482,6 +8482,49 @@
         "websockets",
         "msgpack"
       ]
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/realtime/test_zing_paged_cache.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two fresh Ubuntu 24.04 / Python 3.11 CPU trials passed in GitHub Actions run 41409448193: 13 passed, zero failures/skips in each trial.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "689999bb7474ba891a1328638be9ddab7a8bd3cad675e6b3b6b4363c5b831e57",
+        "receipt": "https://github.com/seedleap/sglang/actions/runs/41409448193/artifacts/13124494918",
+        "receipt_sha256": "c18c1be2038eee5e4c045f33e0835705c3c6e44bf18e7687725999d162a3f03a",
+        "receipt_file_sha256": "44dbf35558007ad5939c70244a0967bcef6ac06e8c34143def7bd8e4bdb90fa0",
+        "checkout_sha": "5ee8422b44671d87800981c6bfe09bda90b47255",
+        "pull_request_head_sha": "367a32adc65542ad52742ba2d851f7ff90406508",
+        "candidate_fingerprint": "f91c9217b6ab7410b4f88db488d1062c0de33b178f98826a232db0fd75969cf2",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 13,
+            "collected": 13,
+            "skipped": 0,
+            "exit_code": 0,
+            "duration_seconds": 11.92389385399997,
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/block0-cache/cpu-5-trial-1.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/block0-cache/cpu-5-trial-1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 13,
+            "collected": 13,
+            "skipped": 0,
+            "exit_code": 0,
+            "duration_seconds": 12.234196163000036,
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/block0-cache/cpu-5-trial-2.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/block0-cache/cpu-5-trial-2.xml"
+          }
+        ]
+      }
     }
   ],
   "recipes": {

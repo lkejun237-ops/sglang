@@ -51,6 +51,7 @@ jobs:
       - name: Run cache and pool contracts in two fresh CPU trials
         run: |
           python scripts/ci/zing/run_cpu_tests.py --suite dit-pipeline-contracts --triage --trials 2 --timeout 500 \
+            --file python/sglang/multimodal_gen/test/unit/realtime/test_zing_paged_cache.py \
             --file python/sglang/multimodal_gen/test/unit/realtime/test_zing_block0_cache_contract.py \
             --file python/sglang/multimodal_gen/test/unit/realtime/test_zing_preparation_cache.py \
             --file python/sglang/multimodal_gen/test/unit/realtime/test_zing_prompt_switch_cache.py \

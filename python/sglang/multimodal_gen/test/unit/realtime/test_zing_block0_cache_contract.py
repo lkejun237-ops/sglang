@@ -144,13 +144,21 @@ def test_pinned_slots_are_sized_by_bytes_and_floor_unused_remainder(cpu_dma):
     )
     slot_bytes = 2 * 8 * 2 * 3 * 4
     owner = Block0PreparationCache(
-        pool, max_bytes=3 * slot_bytes + 17, identity=identity(), disk_cache=None
+        pool,
+        max_bytes=3 * slot_bytes + 17,
+        identity=identity(),
+        disk_cache=None,
+        page_rows=8,
     )
-    assert owner.data.shape[0] == 3
-    assert owner.data.numel() * owner.data.element_size() == 3 * slot_bytes
-    with pytest.raises(ValueError, match="one maximum-prefix"):
+    assert owner.pages.shape[2] == 3
+    assert owner.pages.numel() * owner.pages.element_size() == 3 * slot_bytes
+    with pytest.raises(ValueError, match="one pinned KV page"):
         Block0PreparationCache(
-            pool, max_bytes=slot_bytes - 1, identity=identity(), disk_cache=None
+            pool,
+            max_bytes=slot_bytes - 1,
+            identity=identity(),
+            disk_cache=None,
+            page_rows=8,
         )
 
 
@@ -973,16 +981,21 @@ def test_online_lookup_never_touches_disk_and_preload_unload_use_real_files(
     result = owner.manage("preload", ["a" * 64, "b" * 64])
     assert not result["all_ready"]
     assert [item["status"] for item in result["results"]] == ["ready", "missing"]
-    assert torch.all(owner.entries["a" * 64].data == 7)
+    assert all(
+        torch.all(value == 7)
+        for _, _, _, value in owner.entries["a" * 64].data.slices()
+    )
     assert owner.manage("preload", ["a" * 64])["all_ready"]
     before = list(owner.entries)
-    assert owner.manage("preload", ["a", "b", "c"])["code"] == "cache_capacity_exceeded"
+    # Missing keys consume no pages; key count alone no longer rejects preload.
+    missing = owner.manage("preload", ["a", "b", "c"])
+    assert all(item["status"] == "missing" for item in missing["results"])
     assert list(owner.entries) == before
     owner.manage("unload", ["a" * 64])
     assert not owner.status(["a" * 64])["all_ready"]
     assert writer.lookup("a" * 64) is not None
     assert index.select("game", "stage") == ["a" * 64]
-    assert len(owner.free_slots) == 2
+    assert owner.free_pages.count(True) == 2
 
 
 def test_preload_rechecks_actual_residency_and_sp_ready(tmp_path, cpu_dma, monkeypatch):
@@ -999,11 +1012,14 @@ def test_preload_rechecks_actual_residency_and_sp_ready(tmp_path, cpu_dma, monke
         return owner.entries[key]
 
     monkeypatch.setattr(owner, "lookup", loaded)
+    monkeypatch.setattr(owner, "_preload_plan", lambda keys: ([1, 1], 2, 2))
     result = owner.manage("preload", ["a", "b"])
     assert all(item["status"] == "ready" for item in result["results"])
     assert not result["all_ready"]
     monkeypatch.setattr(
-        preparation_cache, "coordinate_validation", lambda value: [value, []]
+        preparation_cache,
+        "coordinate_validation",
+        lambda value: [value, ([], *value[1:])],
     )
     assert not owner.status(["b"])["all_ready"]
 
@@ -1071,14 +1087,14 @@ def test_cache_lookup_and_eviction_logs_have_context_without_prompt(cpu_dma, cap
 
     caplog.set_level(logging.DEBUG)
     owner = cpu_cache([NS(k=torch.zeros(8, 2, 2))], rows=8, entries=1)
-    owner.entries["a"] = NS(slot=0)
-    owner.free_slots.clear()
+    owner.entries["a"] = NS(page_ids=(0,), disk_task=None)
+    owner.free_pages[:] = [False] * owner.total_pages
     with cache_scope(
         operation_id="switch-a", session_id="session", event_id=3, game_id="game"
     ):
         assert owner.lookup("a") is not None
         assert owner.lookup("b") is None
-        assert owner._take_slot("b") == 0
+        assert owner._take_pages("b", 1).page_ids == (0,)
     records = _cache_log_records(caplog)
     assert [(r["event"], r["result"]) for _, r in records] == [
         ("lookup", "hit"),
@@ -1286,3 +1302,58 @@ def test_control_logs_partial_preload_and_busy_rejection(
     )
     assert records[1][1]["missing_count"] == 1
     assert records[3][1]["reason"] == "cache_busy"
+
+
+def test_paged_status_counts_pending_bytes_and_aggregates_sp(cpu_dma, monkeypatch):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        preparation_cache,
+    )
+    from sglang.multimodal_gen.test.unit.realtime.test_zing_preparation_cache import (
+        inputs,
+    )
+    from sglang.multimodal_gen.test.unit.realtime.zing_cache_fixtures import cpu_cache
+
+    owner = cpu_cache([NS(k=torch.zeros(8, 2, 2))], rows=8, entries=3, page_rows=4)
+    source = NS(
+        prefix=NS(
+            positions=torch.zeros(5, 3),
+            layers=[(torch.ones(5, 2, 2), torch.ones(5, 2, 2))],
+        ),
+        _model_signature="model",
+    )
+    owner.fill("a", inputs(), "condition", "request", source)
+    status = owner.status(["a"])
+    assert "capacity" not in status
+    assert {
+        k: status[k]
+        for k in [
+            "page_rows",
+            "total_pages",
+            "free_pages",
+            "budget_bytes",
+            "reserved_bytes",
+            "used_bytes",
+            "entries",
+        ]
+    } == dict(
+        page_rows=4,
+        total_pages=6,
+        free_pages=4,
+        budget_bytes=768,
+        reserved_bytes=768,
+        used_bytes=256,
+        entries=0,
+    )
+    assert not status["all_ready"]  # pending occupies pages but is not published.
+    owner.finish_fill()
+    assert owner.status(["a"])["all_ready"]
+    monkeypatch.setattr(
+        preparation_cache,
+        "coordinate_validation",
+        lambda snapshot: [snapshot, ([], 5, 6, 128, 768)],
+    )
+    status = owner.status(["a"])
+    assert status["free_pages"] == 4  # SP guarantee uses the minimum, not sum.
+    assert status["budget_bytes"] == status["reserved_bytes"] == 1536
+    assert status["used_bytes"] == 384
+    assert not status["all_ready"]

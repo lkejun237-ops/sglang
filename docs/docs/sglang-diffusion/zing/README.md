@@ -16,6 +16,7 @@
 | RoPE 与性能配置 | [Chunk RoPE reuse](specs/CHUNK_ROPE_REUSE.md)、[性能默认配置](specs/PERFORMANCE_DEFAULTS.md) |
 | AdaLN 导出与离线表 | [Split export](specs/SPLIT_ADALN_EXPORT.md)、[AdaLN table](specs/ADALN_TABLE.md)、[设计分析](plans/ISSUE_257_ANALYSIS.md) |
 | Conditioning 服务 | [RPC 使用与部署契约](specs/ISSUE_256_CONDITIONING_USAGE.md) |
+| Block0 L1 分页 | [预分配页、生命周期与验收](/docs/sglang-diffusion/zing/plans/BLOCK0_PAGED_L1) |
 | Block0 完整准备缓存 | [单条目 CPU 缓存与提前恢复](plans/BLOCK0_CPU_CACHE.md)、[缓存管理 API 与部署契约](specs/block0-cache-management-api.md)、[串行 prefill 协议](specs/block0-prefill-websocket.md) |
 
 其他设计与契约见 [specs/](specs/)。运行时内部流式设计见
