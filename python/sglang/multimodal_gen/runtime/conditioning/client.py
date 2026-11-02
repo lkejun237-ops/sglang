@@ -399,6 +399,14 @@ class ConditioningClient:
             self._nccl = NcclReceiver(self)
         return self._nccl.encode(body, input_digest, device, deadline=deadline)
 
+    def close(self, *, timeout=None, force: bool = False):
+        """Explicitly close any open NCCL bridge owned by this client."""
+        nccl_recv = self._nccl
+        self._nccl = None
+        if nccl_recv is not None:
+            return nccl_recv.close(timeout=timeout, force=force)
+        return {"closed": False}
+
     def validate_input(self, prompt, media):
         """Check metadata before hashing, cloning tensors or serializing RGB."""
         validate_prompt(prompt)

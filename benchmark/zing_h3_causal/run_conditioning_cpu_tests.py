@@ -60,6 +60,7 @@ fsdp.maybe_load_fsdp_model = forbidden_gpu_loader
 sys.modules[fsdp.__name__] = fsdp
 registry = types.ModuleType("sglang.multimodal_gen.registry")
 registry.get_pipeline_config_classes = forbidden_gpu_loader
+registry.get_model_info = forbidden_gpu_loader
 sys.modules[registry.__name__] = registry
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 

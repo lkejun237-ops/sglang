@@ -471,6 +471,9 @@ class ServerArgs(DisaggServerArgsMixin):
     decoder_gpus: str | None = None
     disagg_encoder_port: int | None = field(default=None, repr=False)
     disagg_decoder_port: int | None = field(default=None, repr=False)
+    disagg_encoder_ports: list[int] | None = field(default=None, repr=False)
+    disagg_decoder_ports: list[int] | None = field(default=None, repr=False)
+    disagg_max_sessions: int | None = field(default=None, repr=False)
     conditioning_expected_profile: str | None = None
     zing_conditioning_local_cache_bytes: int = 256 << 20
     zing_reference_cache_bytes: int = 256 << 20
@@ -3457,6 +3460,11 @@ class ServerArgs(DisaggServerArgsMixin):
 
     @property
     def scheduler_endpoints(self) -> list[str]:
+        # Disabled legacy DP1 multi-DiT shared-HTTP endpoint expansion.
+        # if self.scheduler_ports is not None and len(self.scheduler_ports) > 0:
+        # return [
+        # self.scheduler_endpoint_for(r) for r in range(len(self.scheduler_ports))
+        # ]
         return [self.scheduler_endpoint_for(r) for r in range(self.dp_size or 1)]
 
     def settle_port(

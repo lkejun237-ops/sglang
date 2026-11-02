@@ -7,6 +7,7 @@ and RNG state. No codec or media IO executes within the measured region.
 """
 
 import argparse
+import asyncio
 import json
 import os
 import statistics
@@ -36,6 +37,11 @@ def main():
     parser.add_argument("--capture", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--measured-runs", type=int, default=5)
+    parser.add_argument(
+        "--queued-encoder",
+        action="store_true",
+        help="Validate the DiT input queue using captured Encoder moments and Qwen features",
+    )
     args = parser.parse_args()
     world, rank, local = (
         int(os.environ[k]) for k in ("WORLD_SIZE", "RANK", "LOCAL_RANK")
@@ -126,6 +132,55 @@ def main():
             rope_max_frame_gap=params.zing_rope_max_frame_gap,
             window_eviction_timing=params.zing_window_eviction_timing,
         )
+
+    if args.queued_encoder:
+        from mock_encoder import replay_queued_encoder
+
+        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+            cleanup_dist_env_and_memory,
+        )
+
+        try:
+            with (
+                torch.no_grad(),
+                set_forward_context(current_timestep=0, attn_metadata=None),
+            ):
+                outputs = asyncio.run(
+                    replay_queued_encoder(
+                        args.capture,
+                        session,
+                        frozen,
+                        new_sampler,
+                        server.pipeline_config,
+                    )
+                )
+            torch.cuda.synchronize()
+            if len(outputs) != len(frozen):
+                raise RuntimeError("Queued DiT replay changed the output chunk count")
+            comparison = []
+            for result, expected in zip(outputs, frozen):
+                actual = result.visual
+                wanted = expected["expected_visual"]
+                comparison.append(
+                    dict(
+                        latent_start=result.chunk.start,
+                        latent_end=result.chunk.end,
+                        exact=bool(torch.equal(actual, wanted)),
+                        max_abs=(actual.float() - wanted.float()).abs().max().item(),
+                    )
+                )
+            torch.save(
+                [result.visual.cpu() for result in outputs], out / "replay-latents.pt"
+            )
+            (out / "replay-comparison.json").write_text(
+                json.dumps(comparison, indent=2)
+            )
+            if not all(row["exact"] for row in comparison):
+                raise RuntimeError("Queued DiT replay differs from captured outputs")
+            (out / "COMPLETE").write_text("Queued Encoder-to-DiT replay passed\n")
+        finally:
+            cleanup_dist_env_and_memory()
+        return
 
     @torch.no_grad()
     def run(capture=False):

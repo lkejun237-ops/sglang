@@ -12,13 +12,13 @@ _BRIDGE_PREFIX = "zing-decoder-bridge"
 _MAX_TRANSFER_BYTES = 256 << 20
 
 
-def bridge_group(store, rank, *, backend="nccl", timeout_seconds=120):
+def bridge_group(store, rank, *, backend="nccl", timeout_seconds=120, prefix=None):
     """Connect DiT leader (0) and decoder leader (1) on a private group."""
     try:
         return nccl_bridge.create_bridge_group(
             store,
             rank,
-            prefix=_BRIDGE_PREFIX,
+            prefix=prefix or _BRIDGE_PREFIX,
             backend=backend,
             timeout_seconds=timeout_seconds,
         )

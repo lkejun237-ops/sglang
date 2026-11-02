@@ -138,7 +138,7 @@ def _failure(receipts):
 
 
 def _cpu_timeout(group):
-    if group is None:
+    if group is None or getattr(group, "world_size", 1) <= 1:
         return None
     backend = group.cpu_group._get_backend(torch.device("cpu"))
     timeout = getattr(backend.options, "_timeout", None)

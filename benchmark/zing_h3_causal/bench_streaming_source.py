@@ -171,6 +171,7 @@ async def benchmark(cases, args):
         "batch_pattern": args.batch_pattern,
         "timeout_seconds": args.timeout,
         "url": args.url,
+        "decoder_url": getattr(args, "decoder_url", None),
         "cases": cases,
         "case_collection": getattr(args, "case_collection", None),
         "prompt_updates_manifest": (
@@ -233,6 +234,8 @@ async def benchmark(cases, args):
                         command.extend(
                             ["--reference", path, "--reference-id", media_id]
                         )
+                    if config["decoder_url"]:
+                        command.extend(["--decoder-url", config["decoder_url"]])
                     if not getattr(args, "no_stage_timing", False):
                         command.append("--receive-stage-timing")
                     if args.paced:
@@ -433,7 +436,13 @@ async def benchmark(cases, args):
                         if row.get("init_send_to_rgb", {}).get(key) is not None
                     ]
                 )
-                for key in ("ttff_seconds", "e2e_seconds", "fps")
+                for key in (
+                    "ttff_seconds",
+                    "e2e_seconds",
+                    "fps",
+                    "post_ttff_fps",
+                    "tpoc_seconds",
+                )
             }
         write_json(args.output_dir / "summary.json", summary)
         bundle = {"config": config, "requests": results, "summary": summary}
@@ -459,6 +468,7 @@ def main():
         "--case-set", help=f"Named collection or JSON file; default: {DEFAULT_CASE_SET}"
     )
     parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--decoder-url", help="Separate Decoder output WebSocket URL")
     parser.add_argument("--media-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--paced", action="store_true")

@@ -55,25 +55,38 @@ def _call(operation, **kwargs):
         raise HTTPException(503, detail={"code": "cache_unavailable"}) from None
 
 
+async def _disk_call(request, operation, **arguments):
+    client = getattr(request.app.state, "realtime_execution_client", None)
+    if client is not None and hasattr(client, "cache_disk"):
+        value = await client.cache_disk(operation, **arguments)
+        if value.get("code"):
+            raise HTTPException(503, detail=value)
+        return value
+    return _call(operation, **arguments)
+
+
 @router.get("")
-def list_cache(
+async def list_cache(
+    request: Request,
     cache_key: str | None = Query(None, pattern=_ID_PATTERN),
     offset: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=1000),
 ):
-    return _call("list_entries", cache_key=cache_key, offset=offset, limit=limit)
+    return await _disk_call(
+        request, "list_entries", cache_key=cache_key, offset=offset, limit=limit
+    )
 
 
 @router.delete("/entries/{cache_key}")
-def delete_cache_entry(cache_key: str):
+async def delete_cache_entry(cache_key: str, request: Request):
     if len(cache_key) != 64 or any(c not in "0123456789abcdef" for c in cache_key):
         raise HTTPException(422, detail={"code": "invalid_cache_key"})
-    return _call("delete_entries", keys=[cache_key])
+    return await _disk_call(request, "delete_entries", keys=[cache_key])
 
 
 @router.post("/clear")
-def clear_cache():
-    return _call("delete_entries")
+async def clear_cache(request: Request):
+    return await _disk_call(request, "delete_entries")
 
 
 class CacheSelection(BaseModel):
@@ -160,7 +173,9 @@ async def _worker_call_impl(
     args = get_global_server_args()
     if args.dp_size != 1:
         raise HTTPException(409, detail={"code": "cache_requires_dp1"})
-    controller = api._get_admission_controller(args)
+    controller = getattr(
+        request.app.state, "realtime_admission_controller", None
+    ) or api._get_admission_controller(args)
     lease = renewal = task = None
     try:
         if operation != "status":
@@ -182,7 +197,10 @@ async def _worker_call_impl(
                 )
             )
         task = asyncio.create_task(
-            api.async_scheduler_client.forward(
+            (
+                getattr(request.app.state, "realtime_execution_client", None)
+                or api.async_scheduler_client
+            ).forward(
                 ZingCacheReq(
                     operation, game_id, group_id, cache_key, log_context=log_context()
                 )
@@ -197,7 +215,8 @@ async def _worker_call_impl(
         if code:
             status = (
                 409
-                if code in {"cache_busy", "cache_capacity_exceeded"}
+                if code
+                in {"cache_busy", "cache_capacity_exceeded", "connection_not_ready"}
                 else 422
                 if code == "invalid_cache_selection"
                 else 503

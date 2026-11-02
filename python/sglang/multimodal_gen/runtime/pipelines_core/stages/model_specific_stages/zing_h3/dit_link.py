@@ -1,0 +1,381 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Single-session queued DiT input with independent data sends and result notices.
+
+Control and tensor descriptors use ZMQ; tensor payloads use NCCL. DiT's I/O
+owners receive independently of the model loops. Direct Decoder output permits
+send-and-continue; init, EOS drain and teardown retain completion barriers.
+"""
+
+import asyncio
+
+from sglang.multimodal_gen.runtime.realtime.polling_task_queue import PollingTaskQueue
+
+from .source_bridge import source_pixel_end
+
+
+class DiTLinkClient:
+    def __init__(self, channel):
+        self.channel = channel
+        self.owner = None
+        self.failed = False
+        self.sequence = 0
+        self.async_inputs = False
+        self.pending_results = []
+        self.cache_identity = None
+
+    def _validate_reply(self, reply):
+        transfer = reply.get("transfer_id")
+        if type(transfer) is not int or not 0 <= transfer < self.sequence:
+            raise ValueError("DiT reply does not match a sent input")
+        if reply["type"] == "worker.error":
+            raise RuntimeError("DiT processing failed; restart the worker")
+        if reply["type"] == "input.rejected":
+            raise ValueError("DiT rejected the session identity")
+        if (
+            reply["type"] != "input.processed"
+            and self.owner is not None
+            and (reply.get("session_id"), reply.get("generation_id")) != self.owner
+        ):
+            raise ValueError("DiT output belongs to another session")
+
+    def _collect_available(self):
+        while self.channel.poll():
+            reply = self.channel.receive()
+            self._validate_reply(reply)
+            if reply["type"] != "input.processed":
+                self.pending_results.append(reply)
+                if len(self.pending_results) > 128:
+                    raise ValueError("DiT notifications exceed their bounded budget")
+
+    def collect(self):
+        if self.failed:
+            raise RuntimeError("Encoder/DiT link requires restart")
+        try:
+            self._collect_available()
+            results, self.pending_results = self.pending_results, []
+            return results
+        except BaseException:
+            self.failed = True
+            raise
+
+    def exchange(self, message):
+        if self.failed:
+            raise RuntimeError("Encoder/DiT link requires restart")
+        sequence = self.sequence
+        self.sequence += 1
+        outputs, self.pending_results = self.pending_results, []
+        try:
+            self.channel.send(dict(message, transfer_id=sequence))
+            while True:
+                reply = self.channel.receive()
+                if not self.async_inputs and reply.get("transfer_id") != sequence:
+                    raise ValueError("DiT reply does not match the input message")
+                self._validate_reply(reply)
+                if reply["type"] in ("input.processed", "input.rejected"):
+                    if reply["type"] == "input.rejected":
+                        raise ValueError("DiT rejected the session identity")
+                    if reply["transfer_id"] == sequence:
+                        return outputs
+                    continue
+                if reply["type"] == "worker.error":
+                    raise RuntimeError("DiT processing failed; restart the worker")
+                if (
+                    self.owner is not None
+                    and (reply.get("session_id"), reply.get("generation_id"))
+                    != self.owner
+                ):
+                    raise ValueError("DiT output belongs to another session")
+                outputs.append(reply)
+                if len(outputs) > (128 if self.async_inputs else 10):
+                    raise ValueError("DiT reply exceeds the output budget")
+        except BaseException:
+            from sglang.multimodal_gen.runtime.utils.realtime_video import (
+                cancel_async_raw_rgb_frame_reference,
+            )
+
+            for item in outputs:
+                if item.get("reference") is not None:
+                    cancel_async_raw_rgb_frame_reference(item["reference"])
+            self.failed = True
+            raise
+
+    def open(self, message):
+        if self.owner is not None:
+            raise ValueError("An Encoder/DiT session is already active")
+        self.owner = message["session_id"], message["generation_id"]
+        try:
+            opened = self.exchange(dict(message, type="session.init"))
+            self.async_inputs = any(r.get("async_inputs", False) for r in opened)
+            return opened
+        except BaseException:
+            self.owner = None
+            raise
+
+    def send(self, kind, **fields):
+        if self.owner is None:
+            raise ValueError("Encoder/DiT session is not initialized")
+        message = dict(
+            type=kind,
+            session_id=self.owner[0],
+            generation_id=self.owner[1],
+            **fields,
+        )
+        if not self.async_inputs or kind in ("source.end", "session.cancel"):
+            return self.exchange(message)
+        try:
+            message["transfer_id"] = self.sequence
+            self.sequence += 1
+            # The communication owner keeps receiving notifications during the
+            # next model invocation. Full queues still apply bounded backpressure.
+            self.channel.send(message, on_wait=self._collect_available)
+            return self.collect()
+        except BaseException:
+            self.failed = True
+            raise
+
+    def cache_control(self, operation, **arguments):
+        if operation == "identity" and self.cache_identity is not None:
+            return self.cache_identity
+        message = dict(type="cache.control", operation=operation, arguments=arguments)
+        if self.owner is not None:
+            message.update(session_id=self.owner[0], generation_id=self.owner[1])
+        replies = self.exchange(message)
+        results = [item["result"] for item in replies if item["type"] == "cache.result"]
+        self.pending_results.extend(
+            item for item in replies if item["type"] != "cache.result"
+        )
+        if len(results) != 1:
+            raise RuntimeError("Invalid cache control response")
+        if operation == "identity":
+            self.cache_identity = results[0]
+        return results[0]
+
+    def release(self, session_id):
+        if self.owner is not None and session_id == self.owner[0]:
+            try:
+                self.send("session.cancel")
+            finally:
+                self.owner = None
+                self.async_inputs = False
+
+    def disconnect(self):
+        """Close this link without terminating the remote model worker."""
+        try:
+            if self.owner is not None and not self.failed:
+                self.release(self.owner[0])
+        finally:
+            self.channel.close()
+
+    def shutdown(self):
+        try:
+            if not self.failed:
+                if self.owner is not None:
+                    self.release(self.owner[0])
+                self.exchange(dict(type="worker.shutdown"))
+        finally:
+            self.channel.close()
+
+
+class DiTInputService:
+    def __init__(self, channel, create_session, create_decoder=None):
+        self.channel, self.create_session = channel, create_session
+        self.create_decoder = create_decoder
+        self.decoder = None
+        self.transport_failed = False
+        self.worker = self.owner = None
+        self.stopped = False
+        self.queue = PollingTaskQueue(self._process)
+        self.sequence = 0
+
+    async def _process(self, queue):
+        message = queue.popleft()
+        sequence = message["transfer_id"]
+        if sequence != self.sequence:
+            raise ValueError("Encoder input sequence does not match")
+        self.sequence += 1
+        identity = message.get("session_id"), message.get("generation_id")
+        kind = message["type"]
+
+        def reply(kind, **fields):
+            self.channel.send(dict(type=kind, transfer_id=sequence, **fields))
+
+        if kind == "cache.control":
+            if self.owner is not None and identity != self.owner:
+                reply("input.rejected")
+                return
+            try:
+                control = getattr(self.create_session, "cache_control", None)
+                result = (
+                    {"code": "cache_unavailable"}
+                    if control is None
+                    else control(
+                        message["operation"],
+                        message.get("arguments", {}),
+                        busy=self.owner is not None,
+                    )
+                )
+            except BaseException:
+                reply("worker.error")
+                raise
+            reply(
+                "cache.result",
+                **(
+                    {"session_id": self.owner[0], "generation_id": self.owner[1]}
+                    if self.owner is not None
+                    else {}
+                ),
+                result=result,
+            )
+            reply("input.processed")
+            return
+
+        # Reject another owner without destroying the active session's state.
+        if (kind == "session.init" and self.owner is not None) or (
+            kind not in ("session.init", "worker.shutdown") and identity != self.owner
+        ):
+            reply("input.rejected")
+            return
+        try:
+            if kind == "worker.shutdown":
+                if self.worker is not None:
+                    self.worker.close()
+                self._close_decoder()
+                self.stopped = True
+            elif kind == "session.init":
+                if not all(isinstance(v, str) and v for v in identity):
+                    raise ValueError("Session identity is required")
+
+                async def output(result):
+                    item = dict(
+                        type="dit.latents",
+                        format="dit_latents",
+                        transfer_id=self.current_transfer,
+                        session_id=self.owner[0],
+                        generation_id=self.owner[1],
+                        tensor=result.visual,
+                        latent_start=result.chunk.start,
+                        latent_end=result.chunk.end,
+                        event_id=result.prompt_event_id,
+                        prompt_version=result.prompt_version,
+                        **result.provenance.metadata(),
+                    )
+                    if self.decoder is not None:
+                        item = self.decoder.output(result, self.current_message, item)
+                    try:
+                        self.channel.send(item)
+                    except BaseException:
+                        if item.get("reference") is not None:
+                            from sglang.multimodal_gen.runtime.utils.realtime_video import (
+                                cancel_async_raw_rgb_frame_reference,
+                            )
+
+                            cancel_async_raw_rgb_frame_reference(item["reference"])
+                        raise
+
+                self.worker = self.create_session(message, output)
+                self.owner = identity
+                if self.create_decoder is not None:
+                    self.decoder = self.create_decoder(message)
+                    reply(
+                        "session.opened",
+                        session_id=identity[0],
+                        generation_id=identity[1],
+                        output_kind="rgb",
+                        async_inputs=bool(
+                            getattr(
+                                getattr(self.decoder, "remote", None), "oneway", False
+                            )
+                        ),
+                        **(
+                            {"output_attachment": self.decoder.remote.output_attachment}
+                            if getattr(
+                                getattr(self.decoder, "remote", None),
+                                "output_attachment",
+                                None,
+                            )
+                            else {}
+                        ),
+                    )
+            elif kind == "session.cancel":
+                self._close_decoder()
+                self.worker.close()
+                self.worker = self.owner = None
+            else:
+                self.current_transfer = sequence
+                self.current_message = message
+                if kind == "source.moments":
+                    # Identical boundary calculation to the integrated pipeline.
+                    message["pixel_end"] = source_pixel_end(
+                        message["latent_end"],
+                        self.worker.bridge,
+                        frame_end=message.get("final_source_frames"),
+                    )
+                    self.worker.source_records = message["source_records"]
+                if kind == "conditioning" and message.get("cache_hit"):
+                    expand = getattr(self.create_session, "cached_condition", None)
+                    if expand is None:
+                        raise ValueError("Cached conditioning is unavailable")
+                    message = expand(message)
+                await self.worker.put(message)
+                while self.worker.queue:
+                    await self.worker.queue.run_once()
+                if self.decoder is not None and kind in (
+                    "source.moments",
+                    "source.end",
+                ):
+                    self.decoder.source_progress(
+                        self.worker.bridge.accepted_pixels, self.worker.source_records
+                    )
+                notice = getattr(self.worker, "conditioning_notice", None)
+                if notice is not None:
+                    self.worker.conditioning_notice = None
+                    reply(
+                        "conditioning.rejected",
+                        session_id=self.owner[0],
+                        generation_id=self.owner[1],
+                        **notice,
+                    )
+                if self.worker.complete:
+                    if self.decoder is not None:
+                        self.decoder.finish(self.worker.bridge.accepted_pixels)
+                        self._close_decoder()
+                    reply(
+                        "session.completed",
+                        session_id=self.owner[0],
+                        generation_id=self.owner[1],
+                        latent_frames=self.worker.bridge.accepted_latents,
+                        source_frames=self.worker.bridge.accepted_pixels,
+                    )
+                    self.worker.close()
+            reply("input.processed")
+        except BaseException:
+            # Teardown clears decoder; preserve the failure category for the
+            # group owner before deciding whether model restart is required.
+            remote = getattr(self.decoder, "remote", None)
+            self.transport_failed = remote is not None and remote.failure is not None
+            self._close_decoder()
+            if self.worker is not None:
+                self.worker.close()
+            reply("worker.error")
+            raise
+
+    def _close_decoder(self):
+        if self.decoder is not None:
+            self.decoder.close()
+            self.decoder = None
+
+    async def run(self):
+        try:
+            while not self.stopped:
+                # Consume the I/O owner's completed-message inbox. Socket/NCCL
+                # reception continues on its own thread during model execution.
+                if self.queue:
+                    await self.queue.run_once()
+                elif self.channel.poll():
+                    self.queue.append(self.channel.receive())
+                else:
+                    await asyncio.sleep(self.queue.poll_interval_s)
+        finally:
+            self._close_decoder()
+            if self.worker is not None:
+                self.worker.close()

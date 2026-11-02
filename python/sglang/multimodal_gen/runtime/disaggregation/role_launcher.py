@@ -96,12 +96,30 @@ def assign_denoiser_visible_devices(server_args, denoiser_devices: str | None) -
         os.environ["CUDA_VISIBLE_DEVICES"] = denoiser_devices
 
 
-def build_role_command(server_args, role: RoleType, port: int) -> list[str]:
+def build_role_command(
+    server_args,
+    role: RoleType,
+    port: int,
+    *,
+    gpus: str | None = None,
+    max_sessions: int | None = None,
+) -> list[str]:
     """Construct command to start a role worker via torch.distributed.run."""
+    eff_max_sessions = (
+        max_sessions
+        if max_sessions is not None
+        else getattr(server_args, "disagg_max_sessions", None)
+    )
     if role == RoleType.ENCODER:
-        encoder_gpus = getattr(server_args, "encoder_gpus", None)
-        nproc = len(encoder_gpus.split(",")) if encoder_gpus else 1
-        return [
+        encoder_gpus = (
+            gpus if gpus is not None else getattr(server_args, "encoder_gpus", None)
+        )
+        nproc = (
+            len([x for x in encoder_gpus.split(",") if x.strip()])
+            if encoder_gpus
+            else 1
+        )
+        cmd = [
             sys.executable,
             "-m",
             "torch.distributed.run",
@@ -115,6 +133,9 @@ def build_role_command(server_args, role: RoleType, port: int) -> list[str]:
             "--port",
             str(port),
         ]
+        if eff_max_sessions is not None and int(eff_max_sessions) > 1:
+            cmd.extend(["--max-sessions", str(int(eff_max_sessions))])
+        return cmd
     elif role == RoleType.DECODER:
         config = getattr(
             getattr(server_args, "pipeline_config", None), "decoder_config", None
@@ -123,9 +144,15 @@ def build_role_command(server_args, role: RoleType, port: int) -> list[str]:
             raise ValueError(
                 "Dedicated Zing source decoder requires a pipeline decoder_config"
             )
-        decoder_gpus = getattr(server_args, "decoder_gpus", None)
-        nproc = len(decoder_gpus.split(",")) if decoder_gpus else 1
-        return [
+        decoder_gpus = (
+            gpus if gpus is not None else getattr(server_args, "decoder_gpus", None)
+        )
+        nproc = (
+            len([x for x in decoder_gpus.split(",") if x.strip()])
+            if decoder_gpus
+            else 1
+        )
+        cmd = [
             sys.executable,
             "-m",
             "torch.distributed.run",
@@ -134,6 +161,7 @@ def build_role_command(server_args, role: RoleType, port: int) -> list[str]:
             "-m",
             "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
             "zing_h3.decoder_worker",
+            "--static-connection",
             "--model",
             str(server_args.model_path),
             "--port",
@@ -141,6 +169,9 @@ def build_role_command(server_args, role: RoleType, port: int) -> list[str]:
             "--decoder-config",
             json.dumps(config, sort_keys=True),
         ]
+        if eff_max_sessions is not None and int(eff_max_sessions) > 1:
+            cmd.extend(["--max-sessions", str(int(eff_max_sessions))])
+        return cmd
     else:
         raise ValueError(f"Unsupported role for build_role_command: {role}")
 
@@ -177,7 +208,7 @@ def _kill_tree(pid: int) -> None:
 
 def stop(process) -> None:
     """Terminate a process and its child tree."""
-    if process is None or process.poll() is not None:
+    if process is None or not hasattr(process, "poll") or process.poll() is not None:
         return
     _kill_tree(process.pid)
 
@@ -189,6 +220,8 @@ def stop_role_workers(server_args, processes: list | None = None) -> None:
     if server_args is not None:
         server_args.disagg_encoder_port = None
         server_args.disagg_decoder_port = None
+        server_args.disagg_encoder_ports = None
+        server_args.disagg_decoder_ports = None
 
 
 def _die_with_parent() -> None:
@@ -219,12 +252,26 @@ def start_role_workers(
     *,
     encoder_devices: str | None = None,
     decoder_devices: str | None = None,
+    encoder_device_groups: list[str] | None = None,
+    decoder_device_groups: list[str] | None = None,
+    max_sessions: int | None = None,
 ) -> list:
     """Start required role worker subprocesses, probe readiness, and roll back on error."""
-    start_encoder = bool(getattr(server_args, "encoder_gpus", None) and encoder_devices)
-    start_decoder = bool(getattr(server_args, "decoder_gpus", None) and decoder_devices)
+    if encoder_device_groups is not None:
+        enc_groups = [g for g in encoder_device_groups if g]
+    elif getattr(server_args, "encoder_gpus", None) and encoder_devices:
+        enc_groups = [encoder_devices]
+    else:
+        enc_groups = []
 
-    if not start_encoder and not start_decoder:
+    if decoder_device_groups is not None:
+        dec_groups = [g for g in decoder_device_groups if g]
+    elif getattr(server_args, "decoder_gpus", None) and decoder_devices:
+        dec_groups = [decoder_devices]
+    else:
+        dec_groups = []
+
+    if not enc_groups and not dec_groups:
         return []
 
     avoid = [
@@ -234,20 +281,30 @@ def start_role_workers(
     ]
     parent_dies = _die_with_parent if sys.platform.startswith("linux") else None
 
-    enc_port = None
-    dec_port = None
+    enc_ports: list[int] = []
+    dec_ports: list[int] = []
     processes = []
     _stop_on_signal(processes)
     started_roles = []
 
     try:
-        if start_encoder:
+        for dev_group in enc_groups:
             enc_port = free_port(avoid=tuple(avoid))
             avoid.append(enc_port)
-            enc_cmd = build_role_command(server_args, RoleType.ENCODER, enc_port)
+            enc_ports.append(enc_port)
+            if encoder_device_groups is None and max_sessions is None:
+                enc_cmd = build_role_command(server_args, RoleType.ENCODER, enc_port)
+            else:
+                enc_cmd = build_role_command(
+                    server_args,
+                    RoleType.ENCODER,
+                    enc_port,
+                    gpus=dev_group,
+                    max_sessions=max_sessions,
+                )
             enc_env = dict(
                 os.environ,
-                CUDA_VISIBLE_DEVICES=encoder_devices,
+                CUDA_VISIBLE_DEVICES=dev_group,
                 PYTHONUNBUFFERED="1",
             )
             enc_proc = subprocess.Popen(enc_cmd, env=enc_env, preexec_fn=parent_dies)
@@ -255,13 +312,23 @@ def start_role_workers(
             atexit.register(stop, enc_proc)
             started_roles.append((enc_proc, enc_port, "encoder"))
 
-        if start_decoder:
+        for dev_group in dec_groups:
             dec_port = free_port(avoid=tuple(avoid))
             avoid.append(dec_port)
-            dec_cmd = build_role_command(server_args, RoleType.DECODER, dec_port)
+            dec_ports.append(dec_port)
+            if decoder_device_groups is None and max_sessions is None:
+                dec_cmd = build_role_command(server_args, RoleType.DECODER, dec_port)
+            else:
+                dec_cmd = build_role_command(
+                    server_args,
+                    RoleType.DECODER,
+                    dec_port,
+                    gpus=dev_group,
+                    max_sessions=max_sessions,
+                )
             dec_env = dict(
                 os.environ,
-                CUDA_VISIBLE_DEVICES=decoder_devices,
+                CUDA_VISIBLE_DEVICES=dev_group,
                 PYTHONUNBUFFERED="1",
             )
             dec_proc = subprocess.Popen(dec_cmd, env=dec_env, preexec_fn=parent_dies)
@@ -276,10 +343,12 @@ def start_role_workers(
         stop_role_workers(server_args, processes)
         raise
 
-    if enc_port is not None:
-        server_args.disagg_encoder_port = enc_port
-    if dec_port is not None:
-        server_args.disagg_decoder_port = dec_port
+    if enc_ports:
+        server_args.disagg_encoder_port = enc_ports[0]
+        server_args.disagg_encoder_ports = list(enc_ports)
+    if dec_ports:
+        server_args.disagg_decoder_port = dec_ports[0]
+        server_args.disagg_decoder_ports = list(dec_ports)
 
     return processes
 
@@ -289,12 +358,19 @@ def _with_disagg_role_policies(
     *,
     encoder_port: int | None = None,
     decoder_port: int | None = None,
+    encoder_ports: list[int] | None = None,
+    decoder_ports: list[int] | None = None,
 ) -> dict:
     """Inject disaggregated encoder and decoder ports into runtime profile."""
-    if encoder_port is None and decoder_port is None:
+    if (
+        encoder_port is None
+        and decoder_port is None
+        and not encoder_ports
+        and not decoder_ports
+    ):
         return profile
     result = copy.deepcopy(profile)
-    if encoder_port is not None:
+    if encoder_port is not None or encoder_ports:
         enc_cfg = result.setdefault("source_encoder", {})
         enc_cfg.setdefault("mode", "progressive")
         enc_cfg.setdefault("contract_version", "h3-clip17-progressive-v1")
@@ -304,9 +380,17 @@ def _with_disagg_role_policies(
             "model_specific_stages.zing_h3.progressive_encoder:create_session",
         )
         enc_remote = enc_cfg.setdefault("remote", {})
-        enc_remote["port"] = encoder_port
+        enc_remote["port"] = (
+            encoder_port if encoder_port is not None else encoder_ports[0]
+        )
+        if encoder_ports:
+            enc_remote["ports"] = list(encoder_ports)
         enc_remote.setdefault("mode", "overlap")
-    if decoder_port is not None:
+    if decoder_port is not None or decoder_ports:
         dec_remote = result.setdefault("source_decoder", {}).setdefault("remote", {})
-        dec_remote["port"] = decoder_port
+        dec_remote["port"] = (
+            decoder_port if decoder_port is not None else decoder_ports[0]
+        )
+        if decoder_ports:
+            dec_remote["ports"] = list(decoder_ports)
     return result

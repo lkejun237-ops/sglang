@@ -431,13 +431,17 @@ class SourceReadySession:
 
         sampler, model, cache = self.sampler, self.sampler.generator, self.cache
         size, _ = get_ulysses_ctx()
+        heads = int(
+            getattr(getattr(model, "arch", None), "num_attention_heads", 0) or 0
+        )
         supported = (
             cache.raw_store
             and cache.local_frames == -1
             and sampler.joint_forward == "cross_chunk"
             and not sampler.do_cfg
             and sampler.solver == "few_step"
-            and size in (1, 2, 4)
+            and size >= 1
+            and (heads <= 0 or heads % size == 0)
             and sampler.window_eviction_timing == "after_step0"
             and current.audio is None
             and current.spans[0][:2] == (7, 8)

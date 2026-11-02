@@ -103,8 +103,14 @@ def main():
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--timeout-seconds", type=int, default=120)
     parser.add_argument("--startup-timeout-seconds", type=int, default=600)
+    parser.add_argument("--max-sessions", type=int, default=1)
     args = parser.parse_args()
-    if args.timeout_seconds <= 0 or args.startup_timeout_seconds <= 0:
+    max_sessions = int(getattr(args, "max_sessions", None) or 1)
+    if (
+        args.timeout_seconds <= 0
+        or args.startup_timeout_seconds <= 0
+        or max_sessions <= 0
+    ):
         raise ValueError("Encoder timeouts must be positive")
     ServerArgs, set_global_server_args = initialize_runtime_imports()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -125,11 +131,13 @@ def main():
         idle_group=idle_group,
         operation_group=control_group,
     )
-    session = bridge = token = profiler = socket = context = None
-    stage_timing_dir = None
+    sessions = {}
+    bridges = {}
+    released_tokens = set()
+    socket = context = None
     last_released = None
     quarantined = False
-    source_frames, source_shape, source_capacity, source_ended = 0, None, 0, False
+    draining = False
     try:
         from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.parallel_encoder import (
             create_encoder_cache,
@@ -175,6 +183,20 @@ def main():
                 continue
             op = command["op"]
             started = time.time_ns()
+            token = command.get("session")
+            entry = sessions.get(token) if isinstance(token, str) else None
+            session_snapshots = tuple(
+                sorted(
+                    (
+                        k,
+                        v["source_frames"],
+                        v["source_shape"],
+                        v["source_capacity"],
+                        v["source_ended"],
+                    )
+                    for k, v in sessions.items()
+                )
+            )
             # The full command, generation identity and local input cursor must
             # match before branching or touching a device input collective.
             control.agree(
@@ -182,20 +204,16 @@ def main():
                 (
                     control.sequence,
                     command,
-                    token,
+                    session_snapshots,
                     last_released,
                     quarantined,
-                    session is not None,
-                    source_frames,
-                    source_shape,
-                    source_capacity,
-                    source_ended,
                 ),
             )
             value = None
+            active_bridge = entry["bridge"] if entry is not None else None
             error = None
             try:
-                if quarantined and op not in ("ping", "abort"):
+                if quarantined and op not in ("ping", "abort", "bridge_close"):
                     reply = dict(
                         ok=False,
                         code="ENCODER_RESTART_REQUIRED",
@@ -205,51 +223,202 @@ def main():
                     reply = dict(
                         ok=True,
                         world_size=control.world_size,
-                        busy=session is not None,
+                        busy=quarantined or draining or len(sessions) >= max_sessions,
+                        active_sessions=len(sessions),
+                        max_sessions=max_sessions,
+                        active_bridges=len(bridges),
+                        bridge_ids=sorted(bridges.keys()),
+                        draining=draining,
                         restart_required=quarantined,
                     )
+                elif op == "set_draining":
+                    flag = command.get("draining")
+                    if type(flag) is not bool:
+                        reply = dict(
+                            ok=False,
+                            code="INVALID_DRAINING_FLAG",
+                            error="draining flag must be boolean.",
+                            draining=draining,
+                            active_sessions=len(sessions),
+                        )
+                    else:
+                        draining = flag
+                        reply = dict(
+                            ok=True,
+                            draining=draining,
+                            active_sessions=len(sessions),
+                            max_sessions=max_sessions,
+                            busy=quarantined
+                            or draining
+                            or len(sessions) >= max_sessions,
+                        )
+                elif op == "set_max_sessions":
+                    new_max = command.get("max_sessions")
+                    if type(new_max) is not int or new_max < 1:
+                        reply = dict(
+                            ok=False,
+                            code="INVALID_MAX_SESSIONS",
+                            error="max_sessions must be a positive integer.",
+                            max_sessions=max_sessions,
+                            active_sessions=len(sessions),
+                        )
+                    elif new_max < len(sessions):
+                        reply = dict(
+                            ok=False,
+                            code="ENCODER_BUSY",
+                            error="Cannot reduce max_sessions below active_sessions.",
+                            max_sessions=max_sessions,
+                            active_sessions=len(sessions),
+                        )
+                    else:
+                        max_sessions = new_max
+                        reply = dict(
+                            ok=True,
+                            max_sessions=max_sessions,
+                            active_sessions=len(sessions),
+                            busy=quarantined
+                            or draining
+                            or len(sessions) >= max_sessions,
+                        )
+                elif op == "bridge_close":
+                    bridge_id = command.get("bridge_id")
+                    force = bool(command.get("force", False))
+                    if not isinstance(bridge_id, str) or not bridge_id:
+                        reply = dict(
+                            ok=False,
+                            code="INVALID_BRIDGE_ID",
+                            error="Invalid encoder bridge_id.",
+                        )
+                    else:
+                        in_use_tokens = [
+                            k
+                            for k, v in sorted(sessions.items())
+                            if v.get("bridge_id") == bridge_id
+                        ]
+                        if in_use_tokens and not force:
+                            reply = dict(
+                                ok=False,
+                                code="ENCODER_BUSY",
+                                error="Encoder bridge is currently in use by an active session.",
+                                bridge_id=bridge_id,
+                            )
+                        else:
+                            for k in in_use_tokens:
+                                target = sessions.pop(k, None)
+                                if target is not None:
+                                    if target["session"] is not None:
+                                        target["session"].dispose()
+                                    if target["profiler"] is not None:
+                                        target["profiler"].stop()
+                                        target["profiler"] = None
+                                    target["bridge"] = None
+                                last_released = k
+                                released_tokens.add(k)
+                            closed = False
+                            if rank == 0:
+                                bridge_grp = bridges.pop(bridge_id, None)
+                                if bridge_grp is not None:
+                                    closed = True
+                                    try:
+                                        dist.destroy_process_group(bridge_grp)
+                                    except Exception:
+                                        pass
+                            reply = dict(
+                                ok=True,
+                                bridge_id=bridge_id,
+                                closed=closed,
+                                active_bridges=len(bridges),
+                                bridge_ids=sorted(bridges.keys()),
+                            )
                 elif op == "abort":
+                    requested = command.get("session")
+                    if isinstance(requested, str) and requested in sessions:
+                        owner_token = requested
+                    elif not isinstance(requested, str) or not requested:
+                        owner_token = requested
+                    else:
+                        owner_token = None
+                    prev_released = (
+                        requested if requested in released_tokens else last_released
+                    )
 
                     def cleanup_owner():
-                        nonlocal session, bridge, profiler
-                        if session is not None:
-                            session.dispose()
-                        if profiler is not None:
-                            profiler.stop()
-                            profiler = None
-                        bridge = None
+                        target = sessions.get(owner_token)
+                        if target is not None:
+                            if target["session"] is not None:
+                                target["session"].dispose()
+                            if target["profiler"] is not None:
+                                target["profiler"].stop()
+                                target["profiler"] = None
+                            target["bridge"] = None
 
                     reply, quarantine = abort_owner(
                         command,
-                        token,
-                        last_released,
+                        owner_token,
+                        prev_released,
                         quarantined,
                         cleanup_owner,
                         control.gather,
                     )
                     quarantined = quarantined or quarantine
-                    if reply.get("released"):
-                        last_released = token
-                        session = bridge = token = None
-                        source_frames, source_shape, source_capacity, source_ended = (
-                            0,
-                            None,
-                            0,
-                            False,
+                    if reply.get("released") and owner_token is not None:
+                        last_released = owner_token
+                        released_tokens.add(owner_token)
+                        sessions.pop(owner_token, None)
+                elif op == "bridge_open":
+                    error = None
+                    bridge_id = None
+                    try:
+                        bridge_id = command.get("bridge_id")
+                        if not isinstance(bridge_id, str) or not bridge_id:
+                            raise ValueError("Invalid encoder bridge_id")
+                        if type(command.get("bridge_port")) is not int or not (
+                            1 <= command["bridge_port"] <= 65535
+                        ):
+                            raise ValueError("Invalid encoder bridge_port")
+                        if rank == 0 and bridge_id not in bridges:
+                            store = dist.TCPStore(
+                                "127.0.0.1",
+                                command["bridge_port"],
+                                2,
+                                False,
+                                timeout=timedelta(seconds=args.timeout_seconds),
+                            )
+                            bridges[bridge_id] = bridge_group(
+                                store, 1, timeout_seconds=args.timeout_seconds
+                            )
+                    except Exception as exc:
+                        logging.exception(
+                            "Encoder bridge_open preparation failed on rank %s", rank
                         )
+                        error = exc
+                    control.agree("bridge_open_prepared", bridge_id, error=error)
+                    reply = {"ok": True, "bridge_id": bridge_id}
                 elif op == "open":
-                    if session is not None:
+                    if (
+                        draining
+                        or len(sessions) >= max_sessions
+                        or command.get("session") in sessions
+                    ):
                         reply = dict(
                             ok=False,
                             code="ENCODER_BUSY",
                             error="The encoder is busy. Please try again later.",
                         )
+                        if draining:
+                            reply["draining"] = True
                     else:
                         error = None
+                        new_session = None
+                        source_capacity = 0
+                        stage_timing_dir = None
                         try:
                             token = command["session"]
                             if not isinstance(token, str) or not token:
                                 raise ValueError("Invalid encoder session")
+                            if "bridge_id" in command:
+                                if rank == 0 and command["bridge_id"] not in bridges:
+                                    raise ValueError("Unknown encoder bridge_id")
                             stage_timing_dir = command.get("stage_timing_dir")
                             cache = create_encoder_cache(
                                 codecs.modules["video_vae"],
@@ -261,7 +430,7 @@ def main():
                                 ],
                             )
                             source_capacity = command["capacity_frames"]
-                            session = H3ProgressiveEncoderSession(
+                            new_session = H3ProgressiveEncoderSession(
                                 codecs, capacity_frames=source_capacity, cache=cache
                             )
                             encoding = command.get("source_encoding")
@@ -299,17 +468,22 @@ def main():
                             )
                             error = exc
                         control.agree("open_prepared", token, error=error)
+                        sess_bridge = None
                         if rank == 0:
-                            store = dist.TCPStore(
-                                "127.0.0.1",
-                                command["bridge_port"],
-                                2,
-                                False,
-                                timeout=timedelta(seconds=args.timeout_seconds),
-                            )
-                            bridge = bridge_group(
-                                store, 1, timeout_seconds=args.timeout_seconds
-                            )
+                            if "bridge_id" in command:
+                                sess_bridge = bridges[command["bridge_id"]]
+                            else:
+                                store = dist.TCPStore(
+                                    "127.0.0.1",
+                                    command["bridge_port"],
+                                    2,
+                                    False,
+                                    timeout=timedelta(seconds=args.timeout_seconds),
+                                )
+                                sess_bridge = bridge_group(
+                                    store, 1, timeout_seconds=args.timeout_seconds
+                                )
+                        profiler = None
                         if command.get("profile_dir"):
                             profiler = torch.profiler.profile(
                                 activities=[
@@ -318,6 +492,18 @@ def main():
                                 ]
                             )
                             profiler.start()
+                        sessions[token] = dict(
+                            session=new_session,
+                            bridge=sess_bridge,
+                            bridge_id=command.get("bridge_id"),
+                            profiler=profiler,
+                            stage_timing_dir=stage_timing_dir,
+                            source_frames=0,
+                            source_shape=source_shape,
+                            source_capacity=source_capacity,
+                            source_ended=False,
+                        )
+                        released_tokens.discard(token)
                         reply = {
                             "ok": True,
                             "source_encoding": command.get("source_encoding"),
@@ -325,8 +511,16 @@ def main():
                 else:
                     error = None
                     try:
-                        if session is None or command.get("session") != token:
+                        if entry is None or entry["session"] is None:
                             raise ValueError("Encoder session does not match")
+                        session = entry["session"]
+                        source_frames = entry["source_frames"]
+                        source_shape = entry["source_shape"]
+                        source_capacity = entry["source_capacity"]
+                        source_ended = entry["source_ended"]
+                        stage_timing_dir = entry["stage_timing_dir"]
+                        profiler = entry["profiler"]
+                        active_bridge = entry["bridge"]
                         if op not in ("append", "finish", "pop", "close"):
                             raise ValueError("Unknown encoder operation")
                         if op == "append":
@@ -393,11 +587,11 @@ def main():
                             f"Zing.encoder_admission.source_{command['frame_start']}_{command['frame_start'] + shape[1]}.dispatch_end_{command.get('dispatch_accepted_frames', -1)}"
                         ):
                             session.append(pixels, frame_start=command["frame_start"])
-                        source_frames += shape[1]
-                        source_shape = shape[2:]
+                        entry["source_frames"] += shape[1]
+                        entry["source_shape"] = shape[2:]
                     elif op == "finish":
                         session.finish()
-                        source_ended = True
+                        entry["source_ended"] = True
                     elif op == "pop":
                         with torch.profiler.record_function(
                             f"Zing.clock_anchor.unix_ns{time.time_ns()}"
@@ -452,7 +646,7 @@ def main():
                                     directory / f"encoder-{token}-rank{rank}.trace.json"
                                 )
                             )
-                            profiler = None
+                            entry["profiler"] = None
                     reply = dict(
                         ok=True,
                         ready=session.ready,
@@ -489,7 +683,7 @@ def main():
                     # The DiT receiver allocates from metadata before posting
                     # its receive. Sending the tensor first would deadlock.
                     with torch.profiler.record_function("Zing.encoder_output_transfer"):
-                        bridge.send([value.values.contiguous()], 0, 0).wait()
+                        active_bridge.send([value.values.contiguous()], 0, 0).wait()
                         output_sent = torch.cuda.Event()
                         output_sent.record(torch.cuda.current_stream())
                         output_sent.synchronize()
@@ -498,7 +692,15 @@ def main():
                 error = exc
             # This uses the execution budget, never the idle heartbeat timeout.
             control.agree(f"{op}_complete", control.sequence, error=error)
-            if op not in ("open", "abort", "ping") and reply.get("ok"):
+            if op not in (
+                "open",
+                "bridge_open",
+                "bridge_close",
+                "set_max_sessions",
+                "set_draining",
+                "abort",
+                "ping",
+            ) and reply.get("ok"):
                 print(
                     json.dumps(
                         dict(
@@ -518,13 +720,8 @@ def main():
                 )
             if op == "close" and reply.get("ok"):
                 last_released = token
-                session = bridge = token = None
-                source_frames, source_shape, source_capacity, source_ended = (
-                    0,
-                    None,
-                    0,
-                    False,
-                )
+                released_tokens.add(token)
+                sessions.pop(token, None)
     except Exception:
         logging.exception("Encoder service stopped on rank %s", rank)
         if rank == 0 and control.request_pending:
@@ -542,8 +739,10 @@ def main():
     finally:
         # Local tensor/cache disposal is safe; do not issue another collective
         # or a synchronizing NCCL shutdown after communication has failed.
-        if session is not None:
-            session.dispose()
+        for entry in list(sessions.values()):
+            sess = entry.get("session")
+            if sess is not None and not getattr(sess, "closed", False):
+                sess.dispose()
         if socket is not None:
             socket.close()
         if context is not None:

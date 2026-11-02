@@ -65,6 +65,25 @@ from sglang.multimodal_gen.runtime.realtime.source_transport import (
     SourceTransportError,
     check,
 )
+from sglang.multimodal_gen.runtime.realtime.websocket_transport import (
+    _await_realtime_task,
+    _close_realtime_websocket,
+    _drain_realtime_cleanup,
+)
+from sglang.multimodal_gen.runtime.realtime.websocket_transport import (
+    _LockedRealtimeWebSocket as _LockedRealtimeWebSocket,
+)
+from sglang.multimodal_gen.runtime.realtime.websocket_transport import (
+    _RealtimeWebSocketSendGroup as _RealtimeWebSocketSendGroup,
+)
+from sglang.multimodal_gen.runtime.realtime.websocket_transport import (
+    accept_realtime_websocket,
+    cancel_realtime_tasks,
+    wait_realtime_tasks,
+)
+from sglang.multimodal_gen.runtime.realtime.websocket_transport import (
+    write_error_msg as write_error_msg,
+)
 from sglang.multimodal_gen.runtime.realtime.worker_reservation import (
     WorkerReservationRegistry,
     WorkerReservationRejected,
@@ -224,66 +243,6 @@ def _sync_batch_realtime_metadata(batch: "Req", result: OutputBatch) -> None:
     ):
         if metadata_field in metadata:
             setattr(batch, batch_field, metadata[metadata_field])
-
-
-class _LockedRealtimeWebSocket:
-    def __init__(self, websocket: WebSocket):
-        self._websocket = websocket
-        self._send_lock = asyncio.Lock()
-        self._send_lock_owner: asyncio.Task | None = None
-        self._send_lock_depth = 0
-
-    async def send_bytes(self, payload):
-        await self._acquire_send_lock()
-        try:
-            await self._websocket.send_bytes(payload)
-        finally:
-            self._release_send_lock()
-
-    async def close(self, *args, **kwargs):
-        await self._acquire_send_lock()
-        try:
-            await self._websocket.close(*args, **kwargs)
-        finally:
-            self._release_send_lock()
-
-    def send_group(self):
-        return _RealtimeWebSocketSendGroup(self)
-
-    def __getattr__(self, name):
-        return getattr(self._websocket, name)
-
-    async def _acquire_send_lock(self):
-        task = asyncio.current_task()
-        if self._send_lock_owner is task:
-            self._send_lock_depth += 1
-            return
-        await self._send_lock.acquire()
-        self._send_lock_owner = task
-        self._send_lock_depth = 1
-
-    def _release_send_lock(self):
-        task = asyncio.current_task()
-        if self._send_lock_owner is not task:
-            return
-        self._send_lock_depth -= 1
-        if self._send_lock_depth <= 0:
-            self._send_lock_owner = None
-            self._send_lock_depth = 0
-            self._send_lock.release()
-
-
-class _RealtimeWebSocketSendGroup:
-    def __init__(self, websocket: _LockedRealtimeWebSocket):
-        self.websocket = websocket
-
-    async def __aenter__(self):
-        await self.websocket._acquire_send_lock()
-        return self.websocket
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        self.websocket._release_send_lock()
-        return False
 
 
 class _NullAsyncContext:
@@ -1069,7 +1028,9 @@ async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
                 event_id=getattr(batch, "realtime_event_id", None),
             )
             denoise_started = time.perf_counter()
-            _, result = await _process_realtime_generation_batch(batch)
+            _, result = await _process_realtime_generation_batch(
+                batch, getattr(session, "execution_client", None)
+            )
             _sync_batch_realtime_metadata(batch, result)
             await _write_conditioning_notice(ws, result)
             denoise_completed = time.perf_counter()
@@ -1197,13 +1158,15 @@ async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
         session.vae_decoder_backend = None
 
 
-async def _process_realtime_generation_batch(batch):
+async def _process_realtime_generation_batch(batch, execution_client=None):
     """Keep the worker RPC owned until its in-flight execution has finished.
 
     Cancelling a socket wait cannot cancel GPU kernels. Cleanup must wait for
     this response before releasing worker state, input files and admission.
     """
-    task = asyncio.create_task(process_generation_batch(async_scheduler_client, batch))
+    task = asyncio.create_task(
+        process_generation_batch(execution_client or async_scheduler_client, batch)
+    )
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
@@ -1376,7 +1339,12 @@ async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
                 ),
             )
 
-            _, result = await _process_realtime_generation_batch(batch)
+            process_batch = getattr(
+                adapter, "process_batch", _process_realtime_generation_batch
+            )
+            _, result = await process_batch(
+                batch, getattr(session, "execution_client", None)
+            )
             current_result = result
             _sync_batch_realtime_metadata(batch, result)
             await _write_conditioning_notice(ws, result)
@@ -1561,14 +1529,22 @@ def _cancel_unconsumed_output_ref(
     *,
     result: OutputBatch | None,
 ) -> None:
-    if result is None or result.raw_frame_shared_memory_ref is None:
+    if result is None:
         return
-    try:
-        cancel_async_raw_rgb_frame_reference(result.raw_frame_shared_memory_ref)
-    except Exception:
-        logger.exception("failed to cancel unconsumed raw-frame reference")
-    finally:
+    references = []
+    if result.raw_frame_shared_memory_ref is not None:
+        references.append(result.raw_frame_shared_memory_ref)
         result.raw_frame_shared_memory_ref = None
+    for item in (getattr(result, "realtime_handoff", None) or {}).get(
+        "dit_latents", []
+    ):
+        if item.get("type") == "decoder.frames" and item.get("reference") is not None:
+            references.append(item.pop("reference"))
+    for reference in references:
+        try:
+            cancel_async_raw_rgb_frame_reference(reference)
+        except Exception:
+            logger.exception("failed to cancel unconsumed raw-frame reference")
 
 
 async def _wait_for_realtime_interactive_event_window(
@@ -1618,17 +1594,6 @@ async def _wait_for_realtime_output_slot(
     return 0.0
 
 
-async def _await_realtime_task(task: asyncio.Task | None) -> None:
-    if task is None:
-        return
-    try:
-        await task
-    except (asyncio.CancelledError, WebSocketDisconnect):
-        pass
-    except Exception as e:
-        logger.debug("realtime task exited with error: %s", e)
-
-
 def _realtime_task_trace_fields(task: asyncio.Task) -> dict[str, Any]:
     fields: dict[str, Any] = {
         "task_name": task.get_name(),
@@ -1674,7 +1639,9 @@ async def _refresh_latest_queued_controls(
         return
     try:
         output = await asyncio.wait_for(
-            async_scheduler_client.forward(
+            (
+                getattr(session, "execution_client", None) or async_scheduler_client
+            ).forward(
                 ReplaceQueuedRealtimeReq(
                     session_id=session.id,
                     generation_id=session.generation_id,
@@ -1902,7 +1869,8 @@ async def _listen_generate_request(
                 num_frames=realtime_req.num_frames,
                 max_chunks=realtime_req.max_chunks,
             )
-            adapter = get_realtime_model_adapter(get_global_server_args())
+            factory = getattr(session, "adapter_factory", None)
+            adapter = (factory or get_realtime_model_adapter)(get_global_server_args())
             adapter = adapter.for_request(realtime_req)
             session.set_adapter(adapter)
             log_realtime_trace(
@@ -1991,6 +1959,7 @@ async def _release_scheduler_realtime_session(
     attempts: int = 3,
     retry_delay_s: float = 0.05,
     timeout_s: float = 900.0,
+    execution_client=None,
 ) -> bool:
     # Release drains the remote Encoder producer as well as local state. Its
     # default RPC budget is 120 s and dispose permits six such operations.
@@ -2002,7 +1971,7 @@ async def _release_scheduler_realtime_session(
             return False
         try:
             await asyncio.wait_for(
-                async_scheduler_client.forward(
+                (execution_client or async_scheduler_client).forward(
                     ReleaseRealtimeSessionReq(session_id=session_id)
                 ),
                 timeout=remaining,
@@ -2033,14 +2002,13 @@ async def _cleanup_realtime_session(
     log_realtime_trace(logger, session, "server.session_cleanup_start")
     logger.info("terminating session, session_id=%s", session.id)
     refresh_task = session.control_refresh_task
-    for task in (generate_task, listen_task, refresh_task):
-        if task and not task.done():
-            task.cancel()
-    for task in (generate_task, listen_task, refresh_task):
-        if task is None:
-            continue
-        await _await_realtime_task(task)
-    scheduler_released = await _release_scheduler_realtime_session(session.id)
+    await cancel_realtime_tasks(generate_task, listen_task, refresh_task)
+    release_kwargs = {}
+    if getattr(session, "execution_client", None) is not None:
+        release_kwargs["execution_client"] = session.execution_client
+    scheduler_released = await _release_scheduler_realtime_session(
+        session.id, **release_kwargs
+    )
     if session.adapter is not None:
         await session.adapter.close_conditioning(session)
     if session.input_temp_dir is not None:
@@ -2075,18 +2043,6 @@ async def _cleanup_realtime_session(
         input_files_removed=input_files_removed,
     )
     return scheduler_released
-
-
-async def _close_realtime_websocket(
-    websocket: WebSocket,
-    *,
-    code: int,
-    reason: str,
-) -> None:
-    try:
-        await websocket.close(code=code, reason=reason)
-    except (RuntimeError, WebSocketDisconnect):
-        pass
 
 
 async def _send_stage_profile(
@@ -2214,25 +2170,6 @@ async def _cleanup_realtime_session_then_close(
             await _await_realtime_task(renewal)
 
 
-async def _drain_realtime_cleanup(cleanup) -> None:
-    """Keep cleanup and its lease alive through repeated handler cancellation.
-
-    Socket cancellation cannot stop worker kernels or the Encoder producer.
-    The endpoint must not return admission or unlink inputs before cleanup
-    finishes, even if shutdown cancels it a second time.
-    """
-    task = asyncio.create_task(cleanup, name="realtime-session-cleanup")
-    cancelled = False
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            cancelled = True
-    await task
-    if cancelled:
-        raise asyncio.CancelledError
-
-
 async def _wait_for_server_warmup(websocket: WebSocket) -> None:
     warmup_done = getattr(websocket.app.state, "server_warmup_done", None)
     if warmup_done is not None and not warmup_done.is_set():
@@ -2260,8 +2197,7 @@ async def _wait_for_initialization_or_watchdog(
 @router.websocket("/generate")
 async def generate(websocket: WebSocket):
     """endpoint for creating a new realtime session"""
-    await websocket.accept()
-    ws = _LockedRealtimeWebSocket(websocket)
+    ws = await accept_realtime_websocket(websocket)
     server_args = get_global_server_args()
     try:
         gateway_config = _gateway_managed_config(websocket)
@@ -2280,6 +2216,12 @@ async def generate(websocket: WebSocket):
         session_id=gateway_config.session_id if gateway_config else None,
         generation_id=gateway_config.generation_id if gateway_config else None,
     )
+    session.execution_client = getattr(
+        websocket.app.state, "realtime_execution_client", None
+    )
+    session.adapter_factory = getattr(
+        websocket.app.state, "realtime_adapter_factory", None
+    )
     if gateway_config is not None:
         session.vae_worker_url = gateway_config.vae_worker_url
         session.vae_worker_epoch = gateway_config.vae_worker_epoch
@@ -2296,7 +2238,10 @@ async def generate(websocket: WebSocket):
         client=str(websocket.client) if websocket.client else None,
     )
     controller = (
-        None if gateway_config is not None else _get_admission_controller(server_args)
+        None
+        if gateway_config is not None
+        else getattr(websocket.app.state, "realtime_admission_controller", None)
+        or _get_admission_controller(server_args)
     )
     lease = None
     initialization_task = None
@@ -2434,9 +2379,7 @@ async def generate(websocket: WebSocket):
         wait_tasks = [generate_task, listen_task]
         if watchdog_task is not None:
             wait_tasks.append(watchdog_task)
-        done, pending = await asyncio.wait(
-            wait_tasks, return_when=asyncio.FIRST_COMPLETED
-        )
+        done, pending = await wait_realtime_tasks(wait_tasks)
         for task in done:
             log_realtime_trace(
                 logger,
@@ -2507,16 +2450,3 @@ async def _write_conditioning_notice(websocket: WebSocket, result: OutputBatch):
             fatal=False,
             event_id=notice.get("event_id"),
         )
-
-
-async def write_error_msg(
-    error_msg: str, websocket: WebSocket, *, code=None, fatal=None, event_id=None
-):
-    message = {"type": "error", "content": error_msg}
-    if code is not None:
-        message["code"] = code
-    if fatal is not None:
-        message["fatal"] = fatal
-    if event_id is not None:
-        message["event_id"] = event_id
-    await websocket.send_bytes(msgspec.msgpack.encode(message))

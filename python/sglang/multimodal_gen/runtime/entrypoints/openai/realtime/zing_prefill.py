@@ -58,11 +58,18 @@ async def run_prefill_case(ws, data, wire_size, session_id):
 
     args = api.get_global_server_args()
     request, frame = parse_prefill(data)
-    adapter = api.get_realtime_model_adapter(args).for_request(request)
+    factory = (
+        getattr(ws.app.state, "realtime_adapter_factory", None)
+        or api.get_realtime_model_adapter
+    )
+    adapter = factory(args).for_request(request)
     if not isinstance(adapter, ZingH3SourceStreamAdapter):
         raise PrefillRequestError("The selected model does not support prefill")
     session = GenerateSession(session_id=session_id)
-    controller = api._get_admission_controller(args)
+    session.execution_client = getattr(ws.app.state, "realtime_execution_client", None)
+    controller = getattr(
+        ws.app.state, "realtime_admission_controller", None
+    ) or api._get_admission_controller(args)
     lease = await controller.admit(
         api._resolve_realtime_user_id(ws),
         session.id,
@@ -96,7 +103,12 @@ async def run_prefill_case(ws, data, wire_size, session_id):
             game_id=request.game_id,
             group_id=request.group_id,
         )
-        _, result = await api._process_realtime_generation_batch(batch)
+        execution = (
+            {}
+            if session.execution_client is None
+            else {"execution_client": session.execution_client}
+        )
+        _, result = await api._process_realtime_generation_batch(batch, **execution)
         receipt = (result.usage or {}).get("zing_prefill")
         if not isinstance(receipt, dict) or not receipt.get("cache_key"):
             raise RuntimeError("Prefill completed without a cache receipt")

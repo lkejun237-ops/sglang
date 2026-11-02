@@ -25,6 +25,9 @@ class DisaggServerArgsMixin:
     decoder_gpus: str | None = None
     disagg_encoder_port: int | None = None
     disagg_decoder_port: int | None = None
+    disagg_encoder_ports: list[int] | None = None
+    disagg_decoder_ports: list[int] | None = None
+    disagg_max_sessions: int | None = None
 
     def get_role_parallelism(self, role_type: RoleType) -> dict[str, int | None]:
         _none = {
@@ -258,6 +261,38 @@ class DisaggServerArgsMixin:
             default=cls.decoder_gpus,
             help="Comma-separated indices into caller's CUDA_VISIBLE_DEVICES for decoder role.",
         )
+        parser.add_argument(
+            "--disagg-encoder-port",
+            type=int,
+            default=cls.disagg_encoder_port,
+            help="External disaggregated encoder control port.",
+        )
+        parser.add_argument(
+            "--disagg-decoder-port",
+            type=int,
+            default=cls.disagg_decoder_port,
+            help="External disaggregated decoder control port.",
+        )
+        parser.add_argument(
+            "--disagg-encoder-ports",
+            type=int,
+            nargs="+",
+            default=cls.disagg_encoder_ports,
+            help="Candidate pool of external disaggregated encoder control ports.",
+        )
+        parser.add_argument(
+            "--disagg-decoder-ports",
+            type=int,
+            nargs="+",
+            default=cls.disagg_decoder_ports,
+            help="Candidate pool of external disaggregated decoder control ports.",
+        )
+        parser.add_argument(
+            "--disagg-max-sessions",
+            type=int,
+            default=cls.disagg_max_sessions,
+            help="Maximum concurrent sessions per pooled encoder/decoder worker.",
+        )
 
     def _validate_disagg_gpu_roles(self) -> None:
         """Validate explicit disaggregated role GPU placements and topologies."""
@@ -276,7 +311,19 @@ class DisaggServerArgsMixin:
                     "Disaggregated encoder or decoder roles require --denoiser-gpus to be specified"
                 )
 
-        if denoiser is not None and encoder is None and decoder is None:
+        has_external_disagg_ports = bool(
+            getattr(self, "disagg_encoder_port", None)
+            or getattr(self, "disagg_decoder_port", None)
+            or getattr(self, "disagg_encoder_ports", None)
+            or getattr(self, "disagg_decoder_ports", None)
+            or getattr(self, "disagg_max_sessions", None)
+        )
+        if (
+            denoiser is not None
+            and encoder is None
+            and decoder is None
+            and not has_external_disagg_ports
+        ):
             raise ValueError(
                 "--denoiser-gpus specified without --encoder-gpus or --decoder-gpus"
             )

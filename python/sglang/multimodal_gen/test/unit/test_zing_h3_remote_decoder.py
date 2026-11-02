@@ -7,6 +7,7 @@ dispatch identity, and frames identical to the local stream decoder.
 """
 
 import ast
+import importlib
 import json
 import logging
 import threading
@@ -435,7 +436,9 @@ def _loop_service(*, fail_on=None):
     return Service
 
 
-def _run_decoder_loop(commands, *, fail_on=None, live=None, transport_events=None):
+def _run_decoder_loop(
+    commands, *, fail_on=None, live=None, transport_events=None, service_count=1
+):
     """Run the worker control loop with fake devices and optional real ZMQ."""
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
         encoder_control,
@@ -483,6 +486,11 @@ def _run_decoder_loop(commands, *, fail_on=None, live=None, transport_events=Non
     args = SimpleNamespace(
         model=Path("model"),
         port=31003,
+        http_port=None,
+        http_host="127.0.0.1",
+        service_count=service_count,
+        worker_id="decoder-component-test",
+        static_connection=True,
         decoder_config="{}",
         timeout_seconds=120,
         startup_timeout_seconds=600,
@@ -543,6 +551,9 @@ def _run_decoder_loop(commands, *, fail_on=None, live=None, transport_events=Non
             close=lambda: None,
         ),
         _output_identity=_output_identity,
+        service_ports=importlib.import_module(
+            "sglang.multimodal_gen.runtime.realtime.worker_services"
+        ).service_ports,
         EncoderCommandControl=encoder_control.EncoderCommandControl,
         EncoderControlError=encoder_control.EncoderControlError,
     )
@@ -607,7 +618,22 @@ def _run_decoder_loop(commands, *, fail_on=None, live=None, transport_events=Non
         compile(ast.Module(body=[main], type_ignores=[]), str(path), "exec"), namespace
     )
     try:
-        namespace["main"]()
+        from unittest.mock import patch
+
+        def command_sockets(*args, **kwargs):
+            if live is None:
+                socket.selected = 0
+                return socket
+            listener = LiveSocket()
+            listener.selected = 0
+            listener.bind(None)
+            return listener
+
+        with patch(
+            "sglang.multimodal_gen.runtime.realtime.worker_services.ServiceCommandSockets",
+            command_sockets,
+        ):
+            namespace["main"]()
     except _LoopExit:
         return replies, None
     except encoder_control.EncoderControlError as error:
@@ -851,3 +877,269 @@ def test_decoder_loop_failed_append_ends_service_without_ok_reply():
     # Open acks, the failed append sends nothing ok, and the restart reply ends the session.
     assert [reply.get("ok") for reply in replies] == [True, False]
     assert replies[-1]["code"] == "DECODER_RESTART_REQUIRED"
+
+
+def test_auto_output_append_publishes_without_output_command():
+    replies, error = _run_decoder_loop(
+        [
+            dict(
+                op="open",
+                session="auto",
+                bridge_port=1234,
+                capacity_latents=10,
+                auto_output=True,
+            ),
+            dict(
+                op="append",
+                channel="$open",
+                shape=[1, 24, 1, 1, 1],
+                dtype="float32",
+                latent_start=0,
+                valid_frame_end=1,
+                source_dependency_end=1,
+                request_id="req",
+                generation_id="gen",
+                chunk_index=0,
+            ),
+            dict(op="finish", channel="$open", total_frames=1),
+            dict(op="close", channel="$open"),
+        ]
+    )
+    assert error is None
+    assert all(r["ok"] for r in replies)
+    assert replies[1]["reference"] == dict(
+        frames=1,
+        session_id="auto",
+        request_id="req",
+        generation_id="gen",
+        chunk_index=0,
+    )
+
+
+@pytest.mark.parametrize("direct_output", [False, True])
+def test_auto_output_client_reuses_append_reply_without_output_rpc(
+    monkeypatch, model, direct_output
+):
+    decoder = _remote_decoder(monkeypatch, model.protocol)
+    decoder.auto_output = True
+    decoder.channel = "channel"
+    if direct_output:
+        decoder.output_attachment = {"token": "output-token"}
+        decoder.output_metadata = {"event_id": 7}
+    decoder.socket = _FakeSocket(
+        [
+            dict(
+                ok=True,
+                reference=None if direct_output else {"id": "rgb"},
+                metadata={"format": "rgb24"},
+                output_queued=direct_output,
+            ),
+            dict(ok=True),
+        ]
+    )
+    latent = _latent(1, seed=2, height=3, width=5)
+    frames = model.protocol.frame_count(1)
+    decoder.append(
+        latent, latent_start=0, valid_frame_end=frames, source_dependency_end=frames
+    )
+    output = decoder.pop()
+    assert output.reference == (None if direct_output else {"id": "rgb"})
+    if direct_output:
+        assert decoder.socket.sent[0]["output_metadata"] == {"event_id": 7}
+    assert [m["op"] for m in decoder.socket.sent] == ["append"]
+    assert decoder.socket.sent[0]["request_id"] == "request-1"
+    decoder.finish(total_frames=frames)
+    assert decoder.pop().reference is None
+    assert [m["op"] for m in decoder.socket.sent] == ["append", "finish"]
+
+
+def test_direct_decoder_data_never_receives_ack(monkeypatch, model):
+    decoder = _remote_decoder(monkeypatch, model.protocol)
+    decoder.auto_output = decoder.oneway = True
+    decoder.channel = "channel"
+    decoder.output_session = dict(generation_id="generation-1")
+    decoder.output_attachment = {"token": "output-token"}
+    decoder.output_metadata = {"event_id": 7}
+    decoder.socket = _FakeSocket([])  # Any receive during data transfer fails.
+    for start in (0, 1):
+        frames = model.protocol.frame_count(start + 1)
+        decoder.append(
+            _latent(1, seed=start, height=3, width=5),
+            latent_start=start,
+            valid_frame_end=frames,
+            source_dependency_end=frames,
+        )
+        assert decoder.pop().reference is None
+        decoder.source_progress(owned_frame_end=frames, source_records=[[1, 0, frames]])
+    assert [m["op"] for m in decoder.socket.sent] == [
+        "append",
+        "source_progress",
+        "append",
+        "source_progress",
+    ]
+    assert all(m["oneway"] for m in decoder.socket.sent)
+    decoder.socket.replies.append(dict(ok=True))
+    decoder.finish(total_frames=frames)
+    decoder.pop()
+    assert decoder.drained and not decoder.socket.replies
+
+
+def test_oneway_cancel_uses_the_same_ordered_command_stream(monkeypatch, model):
+    decoder = _remote_decoder(monkeypatch, model.protocol)
+    decoder.oneway = True
+    decoder.socket = _FakeSocket([dict(ok=True)])
+    socket = decoder.socket
+    closed = []
+    decoder.context = SimpleNamespace(
+        socket=lambda *a: pytest.fail("Cancel must not overtake data on a new peer"),
+        term=lambda: closed.append(True),
+    )
+    decoder.dispose()
+    assert socket.sent == [dict(op="abort", session=decoder.token)]
+    assert closed == [True] and decoder.closed and decoder.context is None
+
+
+def test_queue_driven_eos_follows_decode_and_releases_stream(model, decode_group):
+    publisher = _RecordingPublisher()
+    entered, release = threading.Event(), threading.Event()
+    publish = publisher.publish
+
+    def blocked_publish(reference, frames):
+        entered.set()
+        assert release.wait(10)
+        publish(reference, frames)
+
+    publisher.publish = blocked_publish
+    service = _DecodeService(
+        model,
+        capacity_latents=10,
+        group=None,
+        publisher=publisher,
+        decode_group=decode_group,
+        device=torch.device("cpu"),
+        queue_driven=True,
+    )
+    try:
+        value = _latent(1, seed=3, height=3, width=5)
+        frames = model.protocol.frame_count(1)
+        service.append(
+            value, latent_start=0, valid_frame_end=frames, source_dependency_end=frames
+        )
+        service.submit(frames, {"dispatch": 0})
+        assert entered.wait(10)
+        service.finish(frames)
+        assert not service._stream.closed
+        assert service._jobs.qsize() == 1 and service._jobs.maxsize == 10
+        release.set()
+        service.drain(10)
+        assert len(publisher.published) == 1 and service._stream.closed
+        assert not service.thread_alive
+        with pytest.raises(ValueError, match="closed"):
+            service.append(
+                value,
+                latent_start=1,
+                valid_frame_end=frames,
+                source_dependency_end=frames,
+            )
+    finally:
+        release.set()
+        service.dispose()
+
+
+def test_dedicated_dit_uses_decoder_factory_without_loading_weights(
+    tmp_path, monkeypatch
+):
+    from sglang.multimodal_gen.runtime.distributed import parallel_state
+    from sglang.multimodal_gen.runtime.models.vaes.lynn_streaming.temporal import (
+        TemporalProtocol,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.dit_decoder import (
+        DiTDecoderOutput,
+    )
+
+    (tmp_path / "config.json").write_text(json.dumps(ARCHITECTURE))
+    codecs = SimpleNamespace(
+        modules={},
+        decoder=ADAPTER,
+        pipeline_config=SimpleNamespace(
+            resolve_decoder_spec=lambda: SimpleNamespace(
+                type="lynn_streaming",
+                model_dir=str(tmp_path),
+            )
+        ),
+    )
+    monkeypatch.setattr(parallel_state, "get_world_group", lambda: _FakeGroup())
+    monkeypatch.setattr(RemoteLynnDecoder, "_connect", lambda self: None)
+    monkeypatch.setattr(
+        torch, "load", lambda *a, **k: pytest.fail("DiT loaded decoder weights")
+    )
+    output = DiTDecoderOutput(codecs, {"session_id": "s"}, {"port": 31002})
+    try:
+        assert isinstance(output.remote, RemoteLynnDecoder)
+        assert output.remote.token == "s" and output.remote.auto_output
+        assert output.remote.capacity_latents == 10
+        expected = TemporalProtocol(ARCHITECTURE)
+        for n in (1, 3, 5, 10):
+            assert output.remote.protocol.frame_count(n) == expected.frame_count(n)
+        assert codecs.modules == {}
+    finally:
+        output.close()
+    assert output.remote.closed
+
+
+def test_decoder_listeners_isolate_owners_even_with_equal_session_tokens():
+    replies, error = _run_decoder_loop(
+        [
+            dict(
+                op="open",
+                session="same",
+                bridge_port=1001,
+                capacity_latents=10,
+                _service_index=0,
+            ),
+            dict(
+                op="open",
+                session="same",
+                bridge_port=1002,
+                capacity_latents=10,
+                _service_index=1,
+            ),
+            dict(op="ping", _service_index=0),
+            dict(
+                op="open",
+                session="second",
+                bridge_port=1003,
+                capacity_latents=10,
+                _service_index=0,
+            ),
+            dict(op="close", channel="$open", _service_index=1),
+            dict(op="ping", _service_index=0),
+            dict(op="ping", _service_index=1),
+        ],
+        service_count=2,
+    )
+    assert error is None
+    assert replies[0]["ok"] and replies[1]["ok"]
+    assert replies[2]["active_sessions"] == 1
+    assert replies[3]["code"] == "DECODER_BUSY"
+    assert replies[4]["ok"]
+    assert replies[5]["active_sessions"] == 1
+    assert replies[6]["active_sessions"] == 0
+
+
+def test_decoder_channel_from_other_listener_is_rejected():
+    replies, error = _run_decoder_loop(
+        [
+            dict(
+                op="open",
+                session="a",
+                bridge_port=1001,
+                capacity_latents=10,
+                _service_index=0,
+            ),
+            dict(op="finish", channel="$open", total_frames=1, _service_index=1),
+        ],
+        service_count=2,
+    )
+    assert error is not None
+    assert replies[0]["ok"] and not replies[-1]["ok"]

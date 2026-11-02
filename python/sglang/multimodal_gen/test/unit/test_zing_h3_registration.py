@@ -259,11 +259,10 @@ def test_adaln_table_is_limited_to_sp1_sp2():
         },
         zing_adaln_table_path="/table",
     )
-    config.validate_server_args(args(1))
-    config.validate_server_args(args(2))
-    for sp in (4, 8):
-        with pytest.raises(ValueError, match="SP1 and SP2 only"):
-            config.validate_server_args(args(sp))
+    for sp in (1, 2, 4, 8):
+        config.validate_server_args(args(sp))
+    with pytest.raises(ValueError, match="divisible by ulysses_degree"):
+        config.validate_server_args(args(3))
 
 
 @pytest.mark.parametrize("fps", [24, 30])

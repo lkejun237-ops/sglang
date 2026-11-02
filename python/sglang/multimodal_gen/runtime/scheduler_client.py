@@ -1,7 +1,12 @@
 import itertools
+
+# import json
+# import os
 import pickle
 import time
 import zlib
+
+# from pathlib import Path
 from typing import Any, Optional
 
 import zmq
@@ -149,6 +154,112 @@ def _merge_fanout_results(results: list[Any]) -> Any:
     return results[0]
 
 
+# Legacy shared-HTTP multi-DiT routing is disabled; retain its source for reference.
+# Release removed session ownership before acknowledgement, so a failed release
+# could retry on the wrong DiT. Post-send timeouts could replay a stateful request
+# on another DiT and leave duplicate sessions. Re-enabling requires confirmed
+# owner cleanup and safe request retry semantics. Use explicit worker groups.
+# _DYNAMIC_DENOISER_PORTS: list[int] | None = None
+#
+#
+# def set_dynamic_denoiser_ports(ports: list[int] | tuple[int, ...] | None) -> None:
+# """Dynamically override the pooled DiT scheduler ports for single-entrypoint routing."""
+# global _DYNAMIC_DENOISER_PORTS
+# if ports is None:
+# _DYNAMIC_DENOISER_PORTS = None
+# return
+# validated = [int(p) for p in ports if type(p) is int and 1024 <= p <= 65535]
+# if not validated or len(validated) != len(ports):
+# raise ValueError("Invalid dynamic denoiser scheduler ports")
+# _DYNAMIC_DENOISER_PORTS = validated
+#
+#
+# def _resolve_dynamic_denoiser_ports(server_args: Any = None) -> list[int] | None:
+# if _DYNAMIC_DENOISER_PORTS:
+# return list(_DYNAMIC_DENOISER_PORTS)
+# reg_path = (
+# getattr(server_args, "pool_registry_path", None)
+# if server_args is not None
+# else None
+# ) or os.environ.get("SGLANG_DISAGG_POOL_REGISTRY")
+# if reg_path:
+# try:
+# p = Path(reg_path)
+# if p.exists():
+# data = json.loads(p.read_text(encoding="utf-8"))
+# ports = data.get("denoiser_ports")
+# if isinstance(ports, list) and ports:
+# return [int(x) for x in ports]
+# except Exception:
+# pass
+# return None
+#
+#
+# def _resolve_scheduler_endpoints(server_args: Any) -> tuple[list[str], bool]:
+# host = getattr(server_args, "host", None)
+# if host is None or host == "localhost":
+# host = "127.0.0.1"
+# dyn_ports = _resolve_dynamic_denoiser_ports(server_args)
+# if dyn_ports:
+# return [f"tcp://{host}:{p}" for p in dyn_ports], True
+# dit_ports = getattr(server_args, "denoiser_scheduler_ports", None)
+# if isinstance(dit_ports, (list, tuple)) and dit_ports:
+# return [f"tcp://{host}:{int(p)}" for p in dit_ports], True
+# endpoints = getattr(server_args, "scheduler_endpoints", None)
+# if endpoints:
+# is_pooled = (
+# bool(getattr(server_args, "scheduler_ports", None))
+# and (getattr(server_args, "dp_size", 1) or 1) == 1
+# )
+# return list(endpoints), is_pooled
+# port = getattr(server_args, "scheduler_port", 31000)
+# return [f"tcp://{host}:{port}"], False
+#
+#
+# def _is_release_session_req(batch: Any) -> bool:
+# reqs = batch if isinstance(batch, list) else [batch]
+# return any(isinstance(r, ReleaseRealtimeSessionReq) for r in reqs)
+#
+#
+# def _select_endpoint_candidates(
+# batch: Any,
+# endpoints: list[str],
+# is_pooled: bool,
+# counter: "itertools.count",
+# session_endpoints: dict[str, str],
+# ) -> list[str]:
+# if len(endpoints) <= 1:
+# session = _session_key(batch)
+# if session is not None:
+# if _is_release_session_req(batch):
+# session_endpoints.pop(session, None)
+# elif endpoints:
+# session_endpoints[session] = endpoints[0]
+# return list(endpoints)
+#
+# session = _session_key(batch)
+# if session is not None:
+# if _is_release_session_req(batch):
+# pinned = session_endpoints.pop(session, None)
+# if pinned in endpoints:
+# return [pinned]
+# elif session in session_endpoints and session_endpoints[session] in endpoints:
+# return [session_endpoints[session]]
+# if is_pooled:
+# primary_idx = next(counter) % len(endpoints)
+# else:
+# primary_idx = _select_replica(batch, len(endpoints), counter)
+# chosen = endpoints[primary_idx]
+# if not _is_release_session_req(batch):
+# session_endpoints[session] = chosen
+# return [chosen] + [ep for i, ep in enumerate(endpoints) if i != primary_idx]
+#
+# primary_idx = _select_replica(batch, len(endpoints), counter)
+# return [endpoints[primary_idx]] + [
+# ep for i, ep in enumerate(endpoints) if i != primary_idx
+# ]
+#
+#
 class SchedulerClient:
     """
     A synchronous, singleton client for communicating with the Scheduler service.
@@ -160,6 +271,7 @@ class SchedulerClient:
         self.server_args = None
         self.request_logger: Optional[DiffusionRequestLogger] = None
         self._replica_counter = itertools.count()
+        # self._session_endpoints: dict[str, str] = {}
 
     def initialize(self, server_args: ServerArgs):
         if self.context is not None and not self.context.closed:
@@ -169,6 +281,7 @@ class SchedulerClient:
         self.server_args = server_args
         self.request_logger = DiffusionRequestLogger.from_server_args(server_args)
         self.context = zmq.Context()
+        # self._session_endpoints.clear()
 
     def forward(self, batch: Any, timeout_ms: int | None = None) -> Any:
         """Sends a batch or request to the scheduler and waits for the response."""
@@ -193,11 +306,40 @@ class SchedulerClient:
 
     def _forward_routed(self, batch: Any, timeout_ms: int | None) -> Any:
         self.request_logger.log_received_request(batch)
+        # endpoints, is_pooled = _resolve_scheduler_endpoints(self.server_args)
         endpoints = self.server_args.scheduler_endpoints
         if isinstance(batch, _CONTROL_REQ_TYPES):
             results = [self._forward_one(ep, batch, timeout_ms) for ep in endpoints]
             output_batch = _merge_fanout_results(results)
         else:
+            # Disabled legacy candidate retry; see the ownership/timeout notes above.
+            # candidates = _select_endpoint_candidates(
+            # batch,
+            # endpoints,
+            # is_pooled,
+            # self._replica_counter,
+            # # self._session_endpoints,
+            # )
+            # last_err: Exception | None = None
+            # output_batch = None
+            # session = _session_key(batch)
+            # for idx, ep in enumerate(candidates):
+            # try:
+            # output_batch = self._forward_one(ep, batch, timeout_ms)
+            # if (
+            # idx > 0
+            # and session is not None
+            # and not _is_release_session_req(batch)
+            # ):
+            # # self._session_endpoints[session] = ep
+            # last_err = None
+            # break
+            # except (TimeoutError, zmq.error.ZMQError) as exc:
+            # last_err = exc
+            # if not is_pooled or idx == len(candidates) - 1:
+            # raise
+            # if last_err is not None:
+            # raise last_err
             replica = _select_replica(batch, len(endpoints), self._replica_counter)
             output_batch = self._forward_one(endpoints[replica], batch, timeout_ms)
         self.request_logger.log_finished_request(batch, output_batch)
@@ -211,6 +353,8 @@ class SchedulerClient:
             logger.error("Cannot ping: client is not initialized.")
             return False
 
+        # endpoints, _ = _resolve_scheduler_endpoints(self.server_args)
+        # for endpoint in endpoints:
         for endpoint in self.server_args.scheduler_endpoints:
             ping_socket = self.context.socket(zmq.REQ)
             ping_socket.setsockopt(zmq.LINGER, 0)
@@ -230,6 +374,7 @@ class SchedulerClient:
         if self.context:
             self.context.term()
             self.context = None
+        # self._session_endpoints.clear()
 
 
 class AsyncSchedulerClient:
@@ -246,6 +391,7 @@ class AsyncSchedulerClient:
         self.server_args = None
         self.request_logger: Optional[DiffusionRequestLogger] = None
         self._replica_counter = itertools.count()
+        # self._session_endpoints: dict[str, str] = {}
 
     def initialize(self, server_args: ServerArgs):
         if self.context is not None and not self.context.closed:
@@ -257,6 +403,7 @@ class AsyncSchedulerClient:
         self.server_args = server_args
         self.request_logger = DiffusionRequestLogger.from_server_args(server_args)
         self.context = zmq.asyncio.Context()
+        # self._session_endpoints.clear()
         logger.debug("AsyncSchedulerClient initialized with zmq.asyncio.Context")
 
     async def forward(self, batch: Any, timeout_ms: int | None = None) -> Any:
@@ -267,6 +414,7 @@ class AsyncSchedulerClient:
                 "AsyncSchedulerClient is not initialized. Call initialize() first."
             )
 
+        # endpoints, is_pooled = _resolve_scheduler_endpoints(self.server_args)
         endpoints = self.server_args.scheduler_endpoints
         if isinstance(batch, _CONTROL_REQ_TYPES):
             # replica state (weights, LoRA, memory) must change everywhere
@@ -275,6 +423,34 @@ class AsyncSchedulerClient:
             ]
             output_batch = _merge_fanout_results(results)
         else:
+            # Disabled legacy candidate retry; see the ownership/timeout notes above.
+            # candidates = _select_endpoint_candidates(
+            # batch,
+            # endpoints,
+            # is_pooled,
+            # self._replica_counter,
+            # # self._session_endpoints,
+            # )
+            # last_err: Exception | None = None
+            # output_batch = None
+            # session = _session_key(batch)
+            # for idx, ep in enumerate(candidates):
+            # try:
+            # output_batch = await self._forward_one(ep, batch, timeout_ms)
+            # if (
+            # idx > 0
+            # and session is not None
+            # and not _is_release_session_req(batch)
+            # ):
+            # # self._session_endpoints[session] = ep
+            # last_err = None
+            # break
+            # except (TimeoutError, zmq.error.ZMQError) as exc:
+            # last_err = exc
+            # if not is_pooled or idx == len(candidates) - 1:
+            # raise
+            # if last_err is not None:
+            # raise last_err
             replica = _select_replica(batch, len(endpoints), self._replica_counter)
             output_batch = await self._forward_one(
                 endpoints[replica], batch, timeout_ms
@@ -312,6 +488,8 @@ class AsyncSchedulerClient:
             logger.error("Cannot ping: client is not initialized.")
             return False
 
+        # endpoints, _ = _resolve_scheduler_endpoints(self.server_args)
+        # for endpoint in endpoints:
         for endpoint in self.server_args.scheduler_endpoints:
             ping_socket = self.context.socket(zmq.REQ)
             ping_socket.setsockopt(zmq.LINGER, 0)
@@ -331,6 +509,7 @@ class AsyncSchedulerClient:
         if self.context:
             self.context.term()
             self.context = None
+        # self._session_endpoints.clear()
 
 
 # Singleton instances for easy access

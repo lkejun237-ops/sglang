@@ -16,7 +16,6 @@ from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.realtime.session import BaseRealtimeState
 from sglang.multimodal_gen.runtime.realtime.zing_contracts import PixelRange
-from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import ZingKVPoolAdmissionError
 from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
     SourceLedger,
     SourceLimits,
@@ -34,8 +33,13 @@ from sglang.multimodal_gen.runtime.utils.zing_stage_timing import (
 from .cache_logging import batch_context, cache_event, cache_scope
 from .incremental import SourceReadySession
 from .media_geometry import resolve_source_geometry
+from .prompt_update import (
+    admit_prompt_update,
+    coordinate_prompt_admission,
+    prepare_prompt_update,
+)
 from .remote_decoder import create_decoder
-from .source_bridge import SourceChunk, SourceChunkBridge
+from .source_bridge import SourceChunk, SourceChunkBridge, source_pixel_end
 from .source_encoder import create_source_buffer
 from .streaming_noise import STREAMING_NOISE_VERSION
 
@@ -477,51 +481,19 @@ class ZingSourceStreamState(BaseRealtimeState):
 
         condition = batch.session.get_or_create_state(WorkerConditioningState)
         identity = condition.identity
-        with stage._use("transformer", "denoise") as transformer:
-            sampler.generator = transformer
-            device = next(transformer.parameters()).device
-            visual = (
-                inputs.positive["context"]
-                .new_zeros((1, stage.packer.visual_channels, *inputs.visual_shape))
-                .to(device)
-            )
-            layout = sampler.processor.pack_inference_layout(
-                inputs, inputs.positive, visual, None
-            )
-            source_shape = (
-                inputs.visual_shape[-2:] if source_shape is None else source_shape
-            )
-            lease = storage = pool_request = None
-            if getattr(stage, "kv_pool", None) is not None:
-                pool_request = stage.kv_request(
-                    sampler,
-                    inputs,
-                    layout,
-                    source_shape=source_shape,
-                    total_frames=None,
-                )
-                lease = stage.kv_pool.acquire(batch.session, pool_request)
-                storage = lease.kv_cache
-            state = None
-            try:
-                state = sampler.initialize(inputs, visual, storage=storage)
-                cache.fill(
-                    key,
-                    inputs,
-                    identity,
-                    pool_request if pool_request is not None else request,
-                    state.cache,
-                    force=force,
-                )
-                cache.finish_fill()
-                return cache.entries.get(key)
-            finally:
-                try:
-                    if state is not None:
-                        state.close()
-                finally:
-                    if lease is not None:
-                        lease.release()
+        from .preparation_cache import fill_prepared_prefix
+
+        return fill_prepared_prefix(
+            stage,
+            sampler,
+            inputs,
+            owner=batch.session,
+            key=key,
+            identity=identity,
+            request=request,
+            source_shape=source_shape,
+            force=force,
+        )
 
     def _pooled_storage(self, stage, session, sampler):
         """Lease a slot at the first step; the ready session never sees the pool."""
@@ -607,26 +579,11 @@ class ZingSourceStreamState(BaseRealtimeState):
 
     def _block0_update_key(self, stage, prompt, command):
         """Share the CPU request identity between prefetch and owner lookup."""
-        from .preparation_cache import preparation_key, preparation_request
+        from .preparation_cache import preparation_key, updated_preparation_request
 
-        request = {**self.block0_input_request, "prompt": prompt}
-        if "references" in command:
-            active = self.inputs
-            old_ids = {item["content_id"] for item in active.conditions}
-            refs = preparation_request(stage.codecs, {"media": command["references"]})[
-                "media"
-            ]
-            request["media"] = [
-                item for item in request["media"] if item["id"] not in old_ids
-            ] + refs
-            request["conditions"] = [
-                dict(
-                    content_id=item["id"],
-                    role="reference",
-                    latent_modalities=["visual"],
-                )
-                for item in refs
-            ]
+        request = updated_preparation_request(
+            stage.codecs, self.block0_input_request, self.inputs, prompt, command
+        )
         codecs, preview, config, identity = self.block0_key_args
         return preparation_key(codecs, request, preview, config, identity), request
 
@@ -711,34 +668,18 @@ class ZingSourceStreamState(BaseRealtimeState):
             )
 
     def _admit_prompt_update(self, stage, condition, inputs=None):
-        """Check the new condition before it can replace active or pending KV."""
         if getattr(stage, "kv_pool", None) is None:
             return
-        # Pack one placeholder target to reuse the authoritative reference-row
-        # accounting. No model forward, random draw, lease or KV write occurs.
-        packer = stage.packer
-        inputs = self.inputs if inputs is None else inputs
-        _, height, width = inputs.visual_shape
-        visual = condition["context"].new_zeros(
-            (1, packer.visual_channels, 1, height, width)
-        )
-        layout = packer.pack_inference_layout(inputs, condition, visual, None)
-        request = stage.kv_request(
+        return admit_prompt_update(
+            stage,
             self.sampler.sampler,
-            inputs,
-            layout,
+            self.inputs if inputs is None else inputs,
+            condition,
             source_shape=tuple(
                 n // stage.codecs.spatial_ratio
                 for n in self.source_geometry.encoded_shape
             ),
-            total_frames=None,
         )
-        try:
-            stage.kv_pool.plan.admit(request)
-        except ZingKVPoolAdmissionError as exc:
-            logger.warning("Prompt update rejected by KV pool: %s", exc.detail)
-            raise ConditionError("CONDITION_INVALID", exc.message) from exc
-        return request
 
     def _update_prompt(self, stage, batch):
         """Reject invalid candidates without disturbing the active generation."""
@@ -779,40 +720,23 @@ class ZingSourceStreamState(BaseRealtimeState):
                     entry.inputs, self.inputs.positive["context"].device
                 )
                 positive = candidate.positive
-            elif "references" in command:
-                if getattr(stage, "prompt_switch_prefix_latent_frames", None) != 5:
-                    raise ConditionError(
-                        "CONDITION_INVALID",
-                        "Reference updates require prompt prefix rebuilding",
-                    )
-                candidate = stage.codecs.prepare_reference_update(
+            else:
+                positive, candidate = prepare_prompt_update(
+                    stage.codecs,
                     self.inputs,
-                    command["references"],
                     update[0],
-                    stage._use,
+                    command,
+                    use_component=lambda name: stage._use(name),
                     conditioning=lambda prompt, media: stage.encode_condition_for_batch(
                         batch, prompt, media
                     ),
+                    prefix_latent_frames=getattr(
+                        stage, "prompt_switch_prefix_latent_frames", None
+                    ),
                 )
-                positive = candidate.positive
-            else:
-                positive = stage.encode_condition_for_batch(
-                    batch, update[0], self.inputs.condition_media
-                )
-            # All ranks agree on capacity before any cache is changed.
-            from sglang.multimodal_gen.runtime.conditioning.worker import (
-                coordinate_validation,
+            pool_request = coordinate_prompt_admission(
+                lambda: self._admit_prompt_update(stage, positive, candidate)
             )
-
-            admission_error = None
-            try:
-                pool_request = self._admit_prompt_update(stage, positive, candidate)
-            except ConditionError as exc:
-                admission_error = exc
-            if not all(coordinate_validation(admission_error is None)):
-                raise ConditionError(
-                    "CONDITION_INVALID", "Reference update exceeds KV capacity"
-                ) from admission_error
         except ConditionError as exc:
             self.failed_update = update
             notice = {"code": exc.code, "event_id": update[1]}
@@ -990,16 +914,13 @@ class ZingSourceStreamState(BaseRealtimeState):
                     source_dependency_end=encoded.source_dependency_end,
                 )
                 with timed("bridge_host_ms"):
-                    clip_index, last_offset = divmod(
-                        encoded.end - 1, self.bridge.clip_latents
+                    pixel_end = source_pixel_end(
+                        encoded.end,
+                        self.bridge,
+                        frame_end=self.ledger.accepted_frames
+                        if self.end_received
+                        else None,
                     )
-                    pixel_end = (
-                        clip_index * self.bridge.clip_frames
-                        + 1
-                        + last_offset * self.bridge.ratio
-                    )
-                    if self.end_received:
-                        pixel_end = min(pixel_end, self.ledger.accepted_frames)
                     self.bridge.append(
                         source,
                         latent_start=encoded.start,

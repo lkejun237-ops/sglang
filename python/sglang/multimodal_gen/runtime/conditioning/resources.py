@@ -36,6 +36,7 @@ class ResourceLimits:
     max_side: int = 8192
     max_decoded_pixels: int | None = None
     max_queued_encodes: int = 16
+    max_bridges: int = 8
     request_timeout_s: float = 10.0
     cpu_executor_active: int = 2
     cpu_executor_waiting: int = 4

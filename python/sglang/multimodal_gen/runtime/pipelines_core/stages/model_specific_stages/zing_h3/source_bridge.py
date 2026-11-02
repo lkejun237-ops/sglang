@@ -12,6 +12,13 @@ from sglang.multimodal_gen.runtime.realtime.zing_contracts import PixelRange, Pr
 from .streaming_noise import STREAMING_NOISE_VERSION, indexed_video_noise
 
 
+def source_pixel_end(latent_end, bridge, *, frame_end=None):
+    """Original absolute latent-to-pixel boundary, clipped only at source EOS."""
+    clip_index, last_offset = divmod(latent_end - 1, bridge.clip_latents)
+    end = clip_index * bridge.clip_frames + 1 + last_offset * bridge.ratio
+    return end if frame_end is None else min(end, frame_end)
+
+
 @dataclass(frozen=True)
 class SourceChunk:
     chunk: TemporalChunk

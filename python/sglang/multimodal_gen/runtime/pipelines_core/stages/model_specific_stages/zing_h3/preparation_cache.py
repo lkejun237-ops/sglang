@@ -845,3 +845,89 @@ class Block0PreparationCache:
             else:
                 raise ValueError("Unknown Block0 cache operation")
         return dict(self.status(keys), results=results)
+
+
+def fill_prepared_prefix(
+    stage,
+    sampler,
+    inputs,
+    *,
+    owner,
+    key,
+    identity,
+    request,
+    source_shape=None,
+    force=False,
+):
+    """Fill the original Block0 cache from already prepared Encoder inputs.
+
+    Shared by integrated prefill and the disaggregated model owner. No Qwen,
+    source VAE, target sampling or decoder execution takes place here.
+    """
+    cache = stage.block0_cache
+    with stage._use("transformer", "denoise") as transformer:
+        sampler.generator = transformer
+        device = next(transformer.parameters()).device
+        visual = (
+            inputs.positive["context"]
+            .new_zeros((1, stage.packer.visual_channels, *inputs.visual_shape))
+            .to(device)
+        )
+        layout = sampler.processor.pack_inference_layout(
+            inputs, inputs.positive, visual, None
+        )
+        source_shape = (
+            inputs.visual_shape[-2:] if source_shape is None else source_shape
+        )
+        lease = storage = pool_request = None
+        if getattr(stage, "kv_pool", None) is not None:
+            pool_request = stage.kv_request(
+                sampler,
+                inputs,
+                layout,
+                source_shape=source_shape,
+                total_frames=None,
+            )
+            lease = stage.kv_pool.acquire(owner, pool_request)
+            storage = lease.kv_cache
+        state = None
+        try:
+            state = sampler.initialize(inputs, visual, storage=storage)
+            cache.fill(
+                key,
+                inputs,
+                identity,
+                pool_request if pool_request is not None else request,
+                state.cache,
+                force=force,
+            )
+            cache.finish_fill()
+            return cache.entries.get(key)
+        finally:
+            try:
+                if state is not None:
+                    state.close()
+            finally:
+                if lease is not None:
+                    lease.release()
+
+
+def updated_preparation_request(codecs, frozen, inputs, prompt, command):
+    """Share prompt/reference key updates with the external Encoder."""
+    request = {**frozen, "prompt": prompt}
+    if "references" in command:
+        active = inputs
+        old_ids = {item["content_id"] for item in active.conditions}
+        refs = preparation_request(codecs, {"media": command["references"]})["media"]
+        request["media"] = [
+            item for item in request["media"] if item["id"] not in old_ids
+        ] + refs
+        request["conditions"] = [
+            dict(
+                content_id=item["id"],
+                role="reference",
+                latent_modalities=["visual"],
+            )
+            for item in refs
+        ]
+    return request

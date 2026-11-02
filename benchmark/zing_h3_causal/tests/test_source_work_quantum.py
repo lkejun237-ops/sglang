@@ -33,7 +33,13 @@ def methods(sampling_schedule=None):
         for n in ast.parse(path.read_text()).body
         if isinstance(n, ast.ClassDef) and n.name == "ZingH3SourceStreamAdapter"
     )
-    selected = {"wait_for_next_chunk", "prepare_next_request", "on_chunk_complete"}
+    selected = {
+        "wait_for_next_chunk",
+        "has_control_work",
+        "_take_source_input",
+        "prepare_next_request",
+        "on_chunk_complete",
+    }
     cls.body = [n for n in cls.body if getattr(n, "name", None) in selected]
     cls.bases = [ast.Name(id="Base", ctx=ast.Load())]
 

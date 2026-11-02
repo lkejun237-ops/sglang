@@ -60,6 +60,7 @@ class ZingH3GenerationStage(PipelineStage):
         conditioning_provider=None,
         local_cache_bytes=256 << 20,
         reference_cache_bytes=256 << 20,
+        external_inputs=False,
     ):
         super().__init__()
         self.modules, self.config, self.runtime = modules, config, runtime
@@ -71,7 +72,7 @@ class ZingH3GenerationStage(PipelineStage):
             modules, config, runtime, reference_cache_bytes=reference_cache_bytes
         )
         self.codecs.conditioning_mode = conditioning_mode
-        if conditioning_mode == "local":
+        if conditioning_mode == "local" and not external_inputs:
             self.local_conditioner = LocalConditioner(
                 self._encode_local_condition,
                 hashlib.sha256(str(id(self.codecs)).encode()).hexdigest(),
@@ -79,8 +80,9 @@ class ZingH3GenerationStage(PipelineStage):
             )
         # Prepare shared encoder weights before any session owns causal caches.
         # A source-only request may never call encode_visual for a reference.
-        self.codecs.prepare_visual_encoder_weights()
-        self.codecs.warmup_encoder()
+        if not external_inputs:
+            self.codecs.prepare_visual_encoder_weights()
+            self.codecs.warmup_encoder()
         rope = runtime["rope_config"]
         self.packer = ZingH3Packer(
             config.dit_config.arch_config,
@@ -485,7 +487,7 @@ class ZingH3GenerationStage(PipelineStage):
         )
 
     def _build_realtime_sampler(self, params, *, source_sampling_schedule=None):
-        from .realtime_sampling import ZingH3RealtimeSampler
+        from .realtime_sampling import build_source_realtime_sampler
 
         # Validate sampling settings before encoding inputs or loading the DiT.
         deployment = getattr(self, "deployment_sampling", {})
@@ -496,38 +498,8 @@ class ZingH3GenerationStage(PipelineStage):
 
             # Source admission already resolved CLI/profile precedence for this session.
             deployment = normalize_source_sampling_schedule(source_sampling_schedule)
-        solver = deployment.get("solver") or getattr(params, "zing_solver", "euler")
-        grid = (
-            deployment.get("denoising_step_list")
-            if deployment.get("solver") is not None
-            else getattr(params, "zing_denoising_step_list", None)
-        )
-        return ZingH3RealtimeSampler(
-            self.modules["transformer"],
-            self.packer,
-            solver=solver,
-            sigma_points=params.num_inference_steps,
-            denoising_step_list=grid,
-            initial_denoising_step_list=deployment.get("initial_denoising_step_list"),
-            initial_block_count=deployment.get("initial_block_count", 0),
-            video_shift=self.runtime["timestep_shift"],
-            audio_shift=self.runtime["audio_timestep_shift"],
-            num_train_timesteps=self.runtime["num_train_timestep"],
-            ar_condition_timestep=self.runtime.get("ar_condition_timestep", 1.0),
-            reference_visual_timestep=self.runtime.get(
-                "reference_visual_timestep", 1.0
-            ),
-            guidance_scale=params.guidance_scale,
-            joint_forward=getattr(params, "zing_joint_forward", "cross_chunk"),
-            window_eviction_timing=getattr(
-                params, "zing_window_eviction_timing", "after_step0"
-            ),
-            window_chunks=getattr(params, "zing_window_chunks", 21),
-            sink_chunks=getattr(params, "zing_sink_chunks", 3),
-            rope_position_mode=getattr(
-                params, "zing_rope_position_mode", "block_relative"
-            ),
-            rope_max_frame_gap=getattr(params, "zing_rope_max_frame_gap", 12),
+        return build_source_realtime_sampler(
+            self.modules["transformer"], self.packer, self.runtime, params, deployment
         )
 
     @torch.no_grad()

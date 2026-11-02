@@ -69,6 +69,21 @@ class AcceptedSource:
         }
 
 
+def source_consumed_message(boundaries, consumed_frames, owned_frame_end):
+    """Select whole input packets, shared by ingress accounting and Decoder WS."""
+    boundary = None
+    for end, bytes_end in boundaries:
+        if consumed_frames < end <= owned_frame_end:
+            boundary = end, bytes_end
+    if boundary is None:
+        return None
+    return {
+        "type": "source.consumed",
+        "source_frame_end": boundary[0],
+        "source_bytes_end": boundary[1],
+    }
+
+
 class SourceLedger:
     def __init__(self, *, width, height, fps, limits, total_frames=None):
         require(
@@ -168,19 +183,17 @@ class SourceLedger:
             and self.consumed_frames <= owned_frame_end <= self.accepted_frames,
             "Invalid source ownership watermark.",
         )
-        boundary = None
-        for record in self.records:
-            if self.consumed_frames < record.end <= owned_frame_end:
-                boundary = record
-        if boundary is None:
+        message = source_consumed_message(
+            ((record.end, record.bytes_end) for record in self.records),
+            self.consumed_frames,
+            owned_frame_end,
+        )
+        if message is None:
             return None
-        self.consumed_frames, self.consumed_bytes = boundary.end, boundary.bytes_end
+        self.consumed_frames = message["source_frame_end"]
+        self.consumed_bytes = message["source_bytes_end"]
         self._retire()
-        return {
-            "type": "source.consumed",
-            "source_frame_end": self.consumed_frames,
-            "source_bytes_end": self.consumed_bytes,
-        }
+        return message
 
     def provenance_for(self, pixels, dependency):
         require(

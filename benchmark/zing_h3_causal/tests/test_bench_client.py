@@ -1107,8 +1107,9 @@ def test_video_decode_is_incremental_and_cancel_closes_process(tmp_path):
 
 
 @pytest.mark.parametrize("prewarm_only", [False, True])
+@pytest.mark.parametrize("decoder_url", [None, "ws://decoder/v1/realtime_video/output"])
 def test_streaming_benchmark_keeps_warmup_out_of_summary_and_exports(
-    tmp_path, monkeypatch, prewarm_only
+    tmp_path, monkeypatch, prewarm_only, decoder_url
 ):
     import asyncio
     from pathlib import Path
@@ -1119,6 +1120,7 @@ def test_streaming_benchmark_keeps_warmup_out_of_summary_and_exports(
     seen = []
 
     async def observe(args):
+        assert args.decoder_url == decoder_url
         output = Path(args.output)
         seen.append(output.name)
         output.mkdir(parents=True)
@@ -1126,6 +1128,7 @@ def test_streaming_benchmark_keeps_warmup_out_of_summary_and_exports(
             dict(
                 kind="frames",
                 received_seconds=at,
+                init_wire_received_seconds=at - 0.5,
                 header=dict(
                     num_frames=2,
                     output_frame_start=i * 2,
@@ -1196,6 +1199,7 @@ def test_streaming_benchmark_keeps_warmup_out_of_summary_and_exports(
         prewarm_only=prewarm_only,
         seed=123,
         url="ws://unused",
+        decoder_url=decoder_url,
         timeout=10,
         ffmpeg="ffmpeg",
         batch_pattern=[1],
@@ -1213,6 +1217,11 @@ def test_streaming_benchmark_keeps_warmup_out_of_summary_and_exports(
     assert len(exported["requests"]) == 1 + args.measured_runs
     assert exported["config"]["prewarm_only"] is prewarm_only
     assert exported["config"]["transport"] == "continuous_source"
+    assert exported["config"]["decoder_url"] == decoder_url
+    init_metrics = summary["5s"]["init_send_to_rgb"]
+    assert init_metrics["post_ttff_fps"]["count"] == args.measured_runs
+    assert init_metrics["fps"]["median"] == (None if prewarm_only else 6 / 3.5)
+    assert init_metrics["post_ttff_fps"]["median"] == (None if prewarm_only else 2)
     assert exported["requests"][0]["server_session_id"] == "session-1"
     assert exported["requests"][0]["metrics"]["stall_seconds"] == 0.5
     assert exported["requests"][0]["metrics"]["ifl_seconds"] is None

@@ -1846,6 +1846,19 @@ def run_scheduler_process(
             if close_materializer is not None:
                 close_materializer()
             del scheduler
+        if rank == 0:
+            try:
+                from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.remote_decoder import (
+                    close_persistent_decoder_bridges,
+                )
+                from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.remote_encoder import (
+                    close_persistent_encoder_bridges,
+                )
+
+                close_persistent_encoder_bridges()
+                close_persistent_decoder_bridges()
+            except Exception:
+                pass
         gc.collect()
         if torch.cuda.is_initialized():
             torch.cuda.empty_cache()

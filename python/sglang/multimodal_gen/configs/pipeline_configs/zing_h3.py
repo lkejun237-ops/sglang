@@ -210,8 +210,6 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
                 raise ValueError(
                     "Zing AdaLN tables require offline-merged LoRA weights"
                 )
-            if (getattr(server_args, "sp_degree", 1) or 1) not in (1, 2):
-                raise ValueError("Zing AdaLN tables currently support SP1 and SP2 only")
         decoder = self.resolve_decoder_spec()
         if decoder.type == "lynn_streaming":
             # Lynn owns decoding; the exported H3 VAE is only used for encoding.

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import inspect
 import logging
 import time
 from collections import defaultdict, deque
@@ -230,7 +231,9 @@ class ConditioningService:
             if not callable(getattr(encoder, "encode_device", None)):
                 raise ValueError("NCCL conditioning requires a device-native encoder")
             self.nccl = NcclSender(
-                f"cuda:{encoder.gpu_id}", self.limits.request_timeout_s
+                f"cuda:{encoder.gpu_id}",
+                self.limits.request_timeout_s,
+                max_bridges=getattr(self.limits, "max_bridges", 8),
             )
         self.cache = ConditioningCache(
             0 if self.nccl else self.limits.cache_bytes,
@@ -339,6 +342,7 @@ class ConditioningService:
             if self.nccl is not None and path in {
                 PREFIX + "/encode",
                 PREFIX + "/bridge/open",
+                PREFIX + "/bridge/close",
             }:
                 peer = scope.get("client")
                 if peer is None or peer[0] not in {"127.0.0.1", "::1"}:
@@ -352,18 +356,34 @@ class ConditioningService:
                 return await self._open_bridge(
                     principal["tenant"], headers, receive, send
                 )
+            if (
+                path == PREFIX + "/bridge/close"
+                and method == "POST"
+                and self.nccl is not None
+            ):
+                self._requests.add(task)
+                return await self._close_bridge(
+                    principal["tenant"], headers, receive, send
+                )
             if path != PREFIX + "/encode" or method != "POST":
                 raise ConditionError("CONDITION_INVALID", 404)
             self._requests.add(task)
             if self.nccl is not None:
+                bridge_id = headers.get(b"x-conditioning-bridge", b"").decode("ascii")
                 self.nccl.acquire(
-                    headers.get(b"x-conditioning-bridge", b"").decode("ascii"),
+                    bridge_id,
                     principal["tenant"],
                 )
                 try:
-                    await self._encode(principal["tenant"], headers, receive, send)
+                    await self._encode(
+                        principal["tenant"],
+                        headers,
+                        receive,
+                        send,
+                        bridge_id=bridge_id,
+                    )
                 finally:
-                    self.nccl.busy = False
+                    self.nccl.release(bridge_id)
             else:
                 await self._encode(principal["tenant"], headers, receive, send)
         except _Disconnected:
@@ -403,25 +423,68 @@ class ConditioningService:
                 self._read_body(receive, size, tenant, reservations),
                 self.limits.request_timeout_s,
             )
-            await self.nccl.open(safe_json(body), tenant, self._cpu_run)
-            await self._json(send, 200, {"bridge_id": self.nccl.bridge_id})
+            doc = safe_json(body)
+            await self.nccl.open(doc, tenant, self._cpu_run)
+            opened_id = (
+                doc["bridge_id"]
+                if isinstance(doc, dict) and "bridge_id" in doc
+                else self.nccl.bridge_id
+            )
+            await self._json(send, 200, {"bridge_id": opened_id})
         finally:
             for reservation in reversed(reservations):
                 reservation.release()
 
-    async def _send_nccl(self, send, condition, header, watcher, deadline):
+    async def _close_bridge(self, tenant, headers, receive, send):
+        size = self._body_length(headers)
+        if size > 1024:
+            raise ConditionError("CONDITION_INVALID")
+        reservations = [self.ledger.reserve(tenant, slots=1)]
+        try:
+            body = await asyncio.wait_for(
+                self._read_body(receive, size, tenant, reservations),
+                self.limits.request_timeout_s,
+            )
+            doc = safe_json(body)
+            if (
+                type(doc) is not dict
+                or "bridge_id" not in doc
+                or set(doc) - {"bridge_id", "force"}
+                or ("force" in doc and type(doc["force"]) is not bool)
+            ):
+                raise ConditionError(
+                    "CONDITION_INVALID", "Invalid NCCL bridge close request"
+                )
+            result = self.nccl.close_bridge(
+                doc["bridge_id"], tenant, force=bool(doc.get("force", False))
+            )
+            await self._json(send, 200, result)
+        finally:
+            for reservation in reversed(reservations):
+                reservation.release()
+
+    def _invoke_nccl_send(self, condition, bridge_id):
+        params = inspect.signature(self.nccl.send).parameters
+        if len(params) >= 2:
+            return self.nccl.send(condition, bridge_id)
+        return self.nccl.send(condition)
+
+    async def _send_nccl(
+        self, send, condition, header, watcher, deadline, *, bridge_id=None
+    ):
         if self.clock() >= deadline:
             raise ConditionError("CONDITION_TIMEOUT")
         if watcher.done():
             watcher.result()
             raise _Disconnected()
+        active_bridge_id = bridge_id or self.nccl.bridge_id
         metadata = (
             canonical_json(
                 dict(
                     schema_version=1,
                     profile_id=self.profile.profile_id,
                     input_digest=header["input_digest"],
-                    bridge_id=self.nccl.bridge_id,
+                    bridge_id=active_bridge_id,
                     rows=condition["context"].shape[0],
                 )
             )
@@ -442,7 +505,7 @@ class ConditioningService:
                 await send(
                     {"type": "http.response.body", "body": metadata, "more_body": True}
                 )
-                await self._cpu_run(self.nccl.send, condition)
+                await self._cpu_run(self._invoke_nccl_send, condition, active_bridge_id)
                 await send(
                     {
                         "type": "http.response.body",
@@ -452,7 +515,7 @@ class ConditioningService:
                 )
                 return len(metadata) + len(completion)
             except BaseException as error:
-                self.nccl.failed = True
+                self.nccl.fail(active_bridge_id)
                 if isinstance(error, ConditionError):
                     # Headers already belong to this streaming result. The
                     # outer encode error handler must not send a second reply.
@@ -543,7 +606,7 @@ class ConditioningService:
             # extra transport data as an invalid request, without busy looping.
             raise ConditionError("CONDITION_INVALID", "Unexpected ASGI request event")
 
-    async def _encode(self, tenant, headers, receive, send):
+    async def _encode(self, tenant, headers, receive, send, *, bridge_id=None):
         expected = self._body_length(headers)
         reservations, flight, watcher = [], None, None
         left_flight = False
@@ -636,7 +699,12 @@ class ConditioningService:
                 self._stats[tenant]["hit"] += 1
             if self.nccl is not None:
                 control_bytes = await self._send_nccl(
-                    send, condition, header, watcher, deadline
+                    send,
+                    condition,
+                    header,
+                    watcher,
+                    deadline,
+                    bridge_id=bridge_id,
                 )
                 self._stats[tenant]["response_bytes"] += control_bytes
                 return
@@ -817,6 +885,8 @@ class ConditioningService:
         for task in requests:
             task.cancel()
         await asyncio.gather(*requests, return_exceptions=True)
+        if self.nccl is not None and hasattr(self.nccl, "close"):
+            self.nccl.close()
         await self.queue.close()
         await self.cpu.close()
 

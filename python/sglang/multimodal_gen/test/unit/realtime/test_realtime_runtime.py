@@ -1473,7 +1473,10 @@ def test_local_loop_keeps_async_output_ownership_through_metric_observation():
     ownership = source.index("current_result = result")
     observe = source.index("_observe_realtime_result_stage_metrics(result")
     register_cleanup = source.index("pending_send_task.add_done_callback(")
-    transfer = source.index("current_result = None")
+    # The progress-only branch also clears current_result, but transfers no
+    # output. Check the asynchronous send branch's actual ownership transfer.
+    send = source.index("pending_send_task = asyncio.create_task(", ownership)
+    transfer = source.index("current_result = None", send)
     assert ownership < observe < register_cleanup < transfer
 
 

@@ -242,6 +242,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             profile,
             encoder_port=getattr(args, "disagg_encoder_port", None),
             decoder_port=getattr(args, "disagg_decoder_port", None),
+            encoder_ports=getattr(args, "disagg_encoder_ports", None),
+            decoder_ports=getattr(args, "disagg_decoder_ports", None),
         )
         profile = _with_source_pipeline_policy(
             profile,
@@ -754,12 +756,16 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                 )
             )
 
+    def has_control_work(self):
+        return False
+
     async def wait_for_next_chunk(self, session):
         # The first accepted frame supplies Qwen's source presentation;
         # subsequent codec readiness is independent of transport packet size.
         minimum = 1
         while (
             not self.more_work
+            and not self.has_control_work()
             and self.pending_frames < minimum
             and (self.end is None or self.end_dispatched)
         ):
@@ -768,7 +774,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             self.available.clear()
             await self.available.wait()
 
-        if self.more_work:
+        if self.more_work or self.has_control_work():
             return
         target, automatic_budget = self._joint_wait_target()
         configured_budget = self.profile.get("joint_wait_ms", "auto")
@@ -962,20 +968,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         )
         return batch
 
-    def prepare_next_request(self, session, server_args, chunk):
-        batch = super().prepare_next_request(session, server_args, chunk)
-        if self._selected_prompt_command is not None:
-            batch.extra["zing_prompt_update"] = self._selected_prompt_command
-            self._selected_prompt_command = None
-        update = batch.extra.get("zing_prompt_update", {})
-        if batch.block_idx == 0 and ("references" in update or update.get("rejected")):
-            # Initialize the original epoch before applying a queued update;
-            # an early invalid reference must not change its prompt or identity.
-            batch.sampling_params.prompt = self.initial_prompt
-            batch.sampling_params.zing_request["messages"][0]["content"][-1]["text"] = (
-                self.initial_prompt
-            )
-            batch.realtime_event_id = None
+    def _take_source_input(self):
         appends, count = [], 0
         while (
             (not self.more_work or self.source_append_overlap)
@@ -1006,6 +999,23 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         if self.end_dispatched and not self.more_work:
             raise ValueError("Source end was already dispatched")
         self.end_dispatched = self.end_dispatched or end is not None
+        return appends, end
+
+    def prepare_next_request(self, session, server_args, chunk):
+        batch = super().prepare_next_request(session, server_args, chunk)
+        if self._selected_prompt_command is not None:
+            batch.extra["zing_prompt_update"] = self._selected_prompt_command
+            self._selected_prompt_command = None
+        update = batch.extra.get("zing_prompt_update", {})
+        if batch.block_idx == 0 and ("references" in update or update.get("rejected")):
+            # Initialize the original epoch before applying a queued update;
+            # an early invalid reference must not change its prompt or identity.
+            batch.sampling_params.prompt = self.initial_prompt
+            batch.sampling_params.zing_request["messages"][0]["content"][-1]["text"] = (
+                self.initial_prompt
+            )
+            batch.realtime_event_id = None
+        appends, end = self._take_source_input()
         batch.extra["zing_reference_ids"] = self.reference_ids
         batch.extra["zing_source_command"] = dict(
             **self.cache_options,

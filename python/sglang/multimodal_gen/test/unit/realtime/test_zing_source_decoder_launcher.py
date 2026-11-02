@@ -161,6 +161,7 @@ def test_build_role_command_decoder():
     assert cmd[cmd.index("--model") + 1] == "/models/zing"
     assert '"type": "lynn_streaming"' in cmd[cmd.index("--decoder-config") + 1]
     assert any("decoder_worker" in part for part in cmd)
+    assert "--static-connection" in cmd
 
 
 def test_build_role_command_decoder_missing_config_rejected():
@@ -656,3 +657,37 @@ def test_launch_server_returns_role_processes_when_offline_mode(monkeypatch):
     result_processes = ls_mod.launch_server(server_args, launch_http_server=False)
     assert role_p1 in result_processes
     assert role_p2 in result_processes
+
+
+@pytest.mark.parametrize("multiple_role", ["encoder", "denoiser", "decoder"])
+def test_legacy_multi_dit_pool_rejected_before_workers_start(
+    monkeypatch, multiple_role
+):
+    monkeypatch.setitem(
+        sys.modules, "setproctitle", SimpleNamespace(setproctitle=lambda *a, **k: None)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.multimodal_gen.runtime.managers.gpu_worker",
+        SimpleNamespace(run_scheduler_process=lambda *a, **k: None),
+    )
+    import sglang.multimodal_gen.runtime.launch_server as launcher
+    from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
+        ZingH3CausalPipelineConfig,
+    )
+
+    def unexpected_start(*args, **kwargs):
+        pytest.fail("A rejected legacy topology must not start workers")
+
+    monkeypatch.setattr(launcher, "launch_server", unexpected_start)
+    args = _make_args(
+        model_path="/models/zing",
+        num_gpus=1,
+        pipeline_config=ZingH3CausalPipelineConfig(),
+    )
+    topology = dict(encoder_gpus=[[0]], denoiser_gpus=[[1]], decoder_gpus=[[2]])
+    topology[multiple_role + "_gpus"].append([3])
+    with pytest.raises(
+        ValueError, match="legacy shared-HTTP Zing pool launcher is disabled"
+    ):
+        launcher.launch_pool_disagg_server(args, **topology)

@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import threading
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -22,6 +23,11 @@ import websockets
 from bench_client import calculate_metrics, distribution
 from continuous_source_input import open_source, source_dimensions
 from continuous_source_media import load_prompt_updates, reference_payload
+from decoder_output_client import (
+    ThreadCredit,
+    consume_source_credit,
+    retire_source_boundaries,
+)
 
 from sglang.multimodal_gen.runtime.realtime.source_transport import (
     DEFAULT_MESSAGE_BYTES,
@@ -70,25 +76,35 @@ def websocket_options(*, profile, timeout, message_budget=DEFAULT_MESSAGE_BYTES)
     )
 
 
-async def run(args):
+async def run(args, *, output_sink=None):
     source_width, source_height = source_dimensions(args)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
     async with asyncio.timeout(args.timeout):
         with (
-            (output / "output.rgb").open("wb") as received_file,
+            (output / (output_sink.filename if output_sink else "output.rgb")).open(
+                "wb"
+            ) as received_file,
             (output / "events.jsonl").open("w") as trace,
         ):
             async with open_source(
                 args, source_width * source_height * 3, output / "source-decode.log"
             ) as read_source:
                 return await exchange(
-                    args, output, started, read_source, received_file, trace
+                    args,
+                    output,
+                    started,
+                    read_source,
+                    received_file,
+                    trace,
+                    output_sink=output_sink,
                 )
 
 
-async def exchange(args, output, started, read_source, received_file, trace):
+async def exchange(
+    args, output, started, read_source, received_file, trace, *, output_sink=None
+):
     prompt_updates = deque(load_prompt_updates(args.prompt_updates))
     message_budget = getattr(args, "max_message_bytes", DEFAULT_MESSAGE_BYTES)
     SourceTransportBudget(message_bytes=message_budget)
@@ -125,25 +141,53 @@ async def exchange(args, output, started, read_source, received_file, trace):
     latency_samples, delivery_times, wire_delivery_times = [], [], []
     dependency_latency_samples = []
     block_capture_latency_samples = []
-    credit, writer = asyncio.Condition(), asyncio.Lock()
+    credit, writer = ThreadCredit(), asyncio.Lock()
+    trace_lock = threading.Lock()
+    submitted_packets = deque()
 
     def record(kind, **fields):
-        trace.write(
-            json.dumps(dict(kind=kind, seconds=time.monotonic() - started, **fields))
-            + "\n"
-        )
-        trace.flush()
+        with trace_lock:
+            trace.write(
+                json.dumps(
+                    dict(kind=kind, seconds=time.monotonic() - started, **fields)
+                )
+                + "\n"
+            )
+            trace.flush()
 
-    async with connection_preserving_error(
-        websockets.connect(
-            args.url,
-            **websocket_options(
-                profile=args.profile,
-                timeout=args.timeout,
-                message_budget=message_budget,
-            ),
-        )
-    ) as ws:
+    def record_applied_prompt(message):
+        update = prompt_results.get(message.get("event_id"))
+        if update is not None and update["status"] == "pending":
+            received = time.monotonic() - started
+            update.update(
+                status="applied",
+                received_seconds=received,
+                latency_ms=(received - update["submitted_seconds"]) * 1000,
+                output_frame_start=message["output_frame_start"],
+                pts_us=message.get("pts_us"),
+            )
+            # Only observed output of a newer epoch proves an older
+            # pending event was superseded; submission/ACK cannot.
+            for older in list(prompt_results.values()):
+                if (
+                    older["event_id"] < update["event_id"]
+                    and older["status"] == "pending"
+                ):
+                    older["status"] = "superseded"
+            record("prompt_applied", **update)
+
+    async with (
+        connection_preserving_error(
+            websockets.connect(
+                args.url,
+                **websocket_options(
+                    profile=args.profile,
+                    timeout=args.timeout,
+                    message_budget=message_budget,
+                ),
+            )
+        ) as ws,
+    ):
 
         async def send(message):
             wire = msgpack.packb(message, use_bin_type=True)
@@ -215,6 +259,17 @@ async def exchange(args, output, started, read_source, received_file, trace):
                 raise ValueError(
                     f"The service accepts at most {max_references} reference images"
                 )
+        if output_sink is not None:
+            output_sink.negotiate(ready)
+        decoder_url = getattr(args, "decoder_url", None)
+        split_output = ready.get("output_transport") == "decoder_websocket"
+        if split_output:
+            if not decoder_url or output_sink is not None:
+                raise ValueError(
+                    "Direct Decoder RGB output requires --decoder-url and --output-kind rgb"
+                )
+        elif decoder_url:
+            raise ValueError("The service did not negotiate direct Decoder output")
         record("ready", message=ready)
         needs_reference_updates = any(
             "references" in update for update in prompt_updates
@@ -338,42 +393,52 @@ async def exchange(args, output, started, read_source, received_file, trace):
                 # In paced replay the intended capture time is independent of
                 # credit stalls. Using read time would hide upstream backlog.
                 capture_at = source_started + start / 24 if args.paced else available_at
-                async with credit:
-                    await credit.wait_for(
-                        lambda: (
-                            start + count - state["consumed"]
-                            <= ready["max_pending_source_frames"]
-                            and (start + count) * frame_bytes - state["consumed_bytes"]
-                            <= ready["max_pending_source_bytes"]
-                        )
+                await credit.wait_for(
+                    lambda: (
+                        start + count - state["consumed"]
+                        <= ready["max_pending_source_frames"]
+                        and (start + count) * frame_bytes - state["consumed_bytes"]
+                        <= ready["max_pending_source_bytes"]
                     )
-                    credit_wait = time.monotonic() - available_at
-                    state["credit_wait_seconds"] += credit_wait
-                    state["event_id"] += 1
-                    event_id = state["event_id"]
-                    payload = dict(
-                        client_seq=state["sequence"],
-                        source_frame_start=start,
-                        num_frames=count,
-                        pts_us=start * 1_000_000 // 24,
-                        data=data,
+                )
+                credit_wait = time.monotonic() - available_at
+                state["credit_wait_seconds"] += credit_wait
+                state["event_id"] += 1
+                event_id = state["event_id"]
+                payload = dict(
+                    client_seq=state["sequence"],
+                    source_frame_start=start,
+                    num_frames=count,
+                    pts_us=start * 1_000_000 // 24,
+                    data=data,
+                )
+                message = dict(
+                    type="event",
+                    kind="source.append",
+                    event_id=event_id,
+                    payload=payload,
+                )
+                if (
+                    len(msgpack.packb(message, use_bin_type=True))
+                    > ready["max_source_message_bytes"]
+                ):
+                    raise ValueError(
+                        "Source append exceeds the negotiated message size"
                     )
-                    message = dict(
-                        type="event",
-                        kind="source.append",
-                        event_id=event_id,
-                        payload=payload,
-                    )
-                    if (
-                        len(msgpack.packb(message, use_bin_type=True))
-                        > ready["max_source_message_bytes"]
-                    ):
-                        raise ValueError(
-                            "Source append exceeds the negotiated message size"
-                        )
+                with credit.lock:
                     boundaries.append(
                         (start + count, (start + count) * frame_bytes, event_id)
                     )
+                    if split_output:
+                        # Registered before upload; Decoder output never waits
+                        # for the independent Encoder acknowledgement stream.
+                        submitted_packets.append(
+                            dict(
+                                source_id=state["sequence"] + 1,
+                                source_frame_start=start,
+                                source_frame_end=start + count,
+                            )
+                        )
                     capture.append((start, start + count, capture_at))
                     state["submitted"] += count
                     state["sequence"] += 1
@@ -424,13 +489,28 @@ async def exchange(args, output, started, read_source, received_file, trace):
             )
             record("source_end", frames=state["submitted"])
 
-        async def receive():
+        async def receive(receive_ws, *, channel="combined"):
             next_source_id = 1
             profile_received = False
-            async for wire in ws:
+            async for wire in receive_ws:
                 wire_received = time.monotonic()
                 message = msgpack.unpackb(wire, raw=False)
                 kind = message.get("type")
+                if channel == "output" and kind not in (
+                    "frame_batch",
+                    "frame_batch_header",
+                    "source.consumed",
+                    "session.completed",
+                    "error",
+                ):
+                    raise ValueError("Unexpected Decoder output message")
+                if channel == "input" and kind in (
+                    "source.consumed",
+                    "frame_batch",
+                    "frame_batch_header",
+                    "session.completed",
+                ):
+                    raise ValueError("Encoder unexpectedly returned video output")
                 if kind == "error":
                     if message.get("fatal") is False:
                         update = prompt_results.get(message.get("event_id"))
@@ -442,37 +522,74 @@ async def exchange(args, output, started, read_source, received_file, trace):
                         continue
                     raise RuntimeError(message.get("content", "Generation failed"))
                 if kind == "source.accepted":
-                    end = message["source_frame_end"]
-                    if (
-                        message["source_id"] != next_source_id
-                        or message["client_seq"] != next_source_id - 1
-                        or message["source_frame_start"] != state["accepted"]
-                        or not state["accepted"] < end <= state["submitted"]
-                        or (end, end * frame_bytes, message["event_id"])
-                        not in boundaries
-                    ):
-                        raise ValueError("Invalid source acceptance")
-                    next_source_id += 1
-                    accepted.append(message)
-                    state["accepted"] = end
+                    with credit.lock:
+                        end = message["source_frame_end"]
+                        if (
+                            message["source_id"] != next_source_id
+                            or message["client_seq"] != next_source_id - 1
+                            or message["source_frame_start"] != state["accepted"]
+                            or not state["accepted"] < end <= state["submitted"]
+                            or (end, end * frame_bytes, message["event_id"])
+                            not in boundaries
+                        ):
+                            raise ValueError("Invalid source acceptance")
+                        next_source_id += 1
+                        accepted.append(message)
+                        state["accepted"] = end
+                        retire_source_boundaries(state, boundaries)
                 elif kind == "source.consumed":
-                    end, nbytes = (
-                        message["source_frame_end"],
-                        message["source_bytes_end"],
+                    with credit.lock:
+                        consume_source_credit(
+                            state, boundaries, message, from_decoder=channel == "output"
+                        )
+                    credit.notify()
+                elif output_sink is not None and kind == "conditioning":
+                    receipt = await output_sink.receive_conditioning(
+                        message, received_file
                     )
-                    if not state["consumed"] <= end <= state["accepted"] or (
-                        end,
-                        nbytes,
-                    ) not in [b[:2] for b in boundaries]:
-                        raise ValueError("Invalid source credit watermark")
-                    async with credit:
-                        state["consumed"], state["consumed_bytes"] = end, nbytes
-                        while boundaries and boundaries[0][0] <= end:
-                            boundaries.popleft()
-                        credit.notify_all()
+                    update = prompt_results.get(message.get("event_id"))
+                    if update is not None and update["status"] == "pending":
+                        received = time.monotonic() - started
+                        update.update(
+                            status="encoded",
+                            received_seconds=received,
+                            latency_ms=(received - update["submitted_seconds"]) * 1000,
+                        )
+                        for older in list(prompt_results.values()):
+                            if (
+                                older["event_id"] < update["event_id"]
+                                and older["status"] == "pending"
+                            ):
+                                older["status"] = "superseded"
+                    record(kind, message=receipt)
+                    continue
+                elif output_sink is not None and kind == output_sink.message_type:
+                    state["received"] = await output_sink.receive(
+                        message, received_file, accepted_frames=state["accepted"]
+                    )
+                    if kind == "dit.latents":
+                        record_applied_prompt(message)
+                    while (
+                        accepted
+                        and accepted[0]["source_frame_end"] <= state["received"]
+                    ):
+                        accepted.popleft()
+                    while sent and sent[0][1] <= state["received"]:
+                        sent.popleft()
+                    record(
+                        kind,
+                        message={k: v for k, v in message.items() if k != "payload"},
+                    )
+                    if args.consumer_delay:
+                        await asyncio.sleep(args.consumer_delay)
+                    continue
                 elif kind in ("frame_batch", "frame_batch_header"):
+                    if output_sink is not None:
+                        raise ValueError(
+                            "Unexpected RGB output from the encoding endpoint"
+                        )
                     payload = (
-                        await ws.recv()
+                        await receive_ws.recv()
                         if kind == "frame_batch_header"
                         else message.pop("payload")
                     )
@@ -493,7 +610,7 @@ async def exchange(args, output, started, read_source, received_file, trace):
                         or message["pts_us"] != start * 1_000_000 // 24
                         or not start + count
                         <= message["source_dependency_end"]
-                        <= state["accepted"]
+                        <= state["submitted" if split_output else "accepted"]
                     ):
                         raise ValueError("Invalid delivered frame batch")
                     cursor = start
@@ -501,7 +618,11 @@ async def exchange(args, output, started, read_source, received_file, trace):
                         owner = next(
                             (
                                 a
-                                for a in accepted
+                                for a in (
+                                    submitted_packets.copy()
+                                    if split_output
+                                    else accepted
+                                )
                                 if a["source_id"] == span["source_id"]
                             ),
                             None,
@@ -521,7 +642,11 @@ async def exchange(args, output, started, read_source, received_file, trace):
                         raise ValueError("Incomplete delivered source alignment")
                     dependency = message["source_dependency_end"]
                     owner = next(
-                        (entry for entry in sent if entry[0] < dependency <= entry[1]),
+                        (
+                            entry
+                            for entry in sent.copy()
+                            if entry[0] < dependency <= entry[1]
+                        ),
                         None,
                     )
                     if owner is None:
@@ -546,25 +671,7 @@ async def exchange(args, output, started, read_source, received_file, trace):
                     block_capture_latency = now - capture_time
                     block_capture_latency_samples.append(block_capture_latency)
                     state["last_output"] = now
-                    update = prompt_results.get(message.get("event_id"))
-                    if update is not None and update["status"] == "pending":
-                        received = now - started
-                        update.update(
-                            status="applied",
-                            received_seconds=received,
-                            latency_ms=(received - update["submitted_seconds"]) * 1000,
-                            output_frame_start=start,
-                            pts_us=message["pts_us"],
-                        )
-                        # Only observed output of a newer epoch proves an older
-                        # pending event was superseded; submission/ACK cannot.
-                        for older in prompt_results.values():
-                            if (
-                                older["event_id"] < update["event_id"]
-                                and older["status"] == "pending"
-                            ):
-                                older["status"] = "superseded"
-                        record("prompt_applied", **update)
+                    record_applied_prompt(message)
                     state["received"] += count
                     delivery_times.append((now - started, count))
                     wire_delivery_times.append(
@@ -593,6 +700,12 @@ async def exchange(args, output, started, read_source, received_file, trace):
                         state["received"], state["consumed"]
                     ):
                         accepted.popleft()
+                    while (
+                        submitted_packets
+                        and submitted_packets[0]["source_frame_end"]
+                        <= state["received"]
+                    ):
+                        submitted_packets.popleft()
                     if args.consumer_delay:
                         await asyncio.sleep(args.consumer_delay)
                 elif kind == "profile_result":
@@ -621,36 +734,82 @@ async def exchange(args, output, started, read_source, received_file, trace):
                     )
                     continue
                 elif kind == "session.completed":
+                    if channel == "output" and any(
+                        message.get(k) != ready[k]
+                        for k in ("session_id", "generation_id")
+                    ):
+                        raise ValueError("Decoder completion identity does not match")
+                    if output_sink is not None:
+                        output_sink.complete(message, state)
+                        state["completed"] = True
+                        record(kind, message=message)
+                        continue
                     if (
                         not state["ended"]
                         or any(
                             state[key] != state["submitted"]
-                            for key in ("accepted", "consumed", "received")
+                            for key in (
+                                ("received",)
+                                if split_output
+                                else ("accepted", "consumed", "received")
+                            )
                         )
                         or message["output_frames"] != state["received"]
                     ):
                         raise ValueError("The completed session is missing frames")
                     state["completed"] = True
+                elif kind == "input.completed":
+                    state["input_completed"] = True
                 record(kind, message=message)
-            if not state["completed"]:
-                raise RuntimeError("Connection closed before session.completed")
+            if not state.get("input_completed" if channel == "input" else "completed"):
+                raise RuntimeError("Connection closed before session completion")
             # A normal server close follows scheduler cleanup. Wait for it before
             # the next serial request; receipt of all RGB alone is not release.
 
         async def heartbeat():
             while True:
                 await asyncio.sleep(5)
+                if state.get("input_completed"):
+                    return
                 await send(dict(type="event", kind="heartbeat"))
 
+        output_thread = None
         try:
+            if split_output:
+                from decoder_output_client import (
+                    OutputReceiverThread,
+                    receive_decoder_output,
+                    validate_split_completion,
+                )
+
+                output_thread = OutputReceiverThread(
+                    lambda: receive_decoder_output(
+                        ready,
+                        decoder_url,
+                        websocket_options(
+                            profile=args.profile,
+                            timeout=args.timeout,
+                            message_budget=message_budget,
+                        ),
+                        receive,
+                    )
+                )
             async with asyncio.TaskGroup() as group:
                 h = group.create_task(heartbeat())
                 producer = group.create_task(produce())
-                receiver = group.create_task(receive())
+                receiver = group.create_task(
+                    receive(ws, channel="input" if split_output else "combined")
+                )
+                if output_thread is not None:
+                    group.create_task(output_thread.wait())
                 await receiver
                 await producer
                 h.cancel()
+            if split_output:
+                validate_split_completion(state)
         except BaseException as exc:
+            if output_thread is not None:
+                await output_thread.close()
             # The cancelled receiver no longer drains the bounded incoming queue.
             # Abort a failed session rather than wait for a close handshake whose
             # reads may be paused; preserve the original error or cancellation.
@@ -681,6 +840,8 @@ async def exchange(args, output, started, read_source, received_file, trace):
                 )
             raise
         finally:
+            if output_thread is not None:
+                await output_thread.close()
             for update in prompt_results.values():
                 if update["status"] == "pending":
                     update["status"] = (
@@ -696,6 +857,7 @@ async def exchange(args, output, started, read_source, received_file, trace):
                     status: sum(row["status"] == status for row in updates)
                     for status in (
                         "applied",
+                        "encoded",
                         "rejected",
                         "superseded",
                         "not_observed",
@@ -704,10 +866,36 @@ async def exchange(args, output, started, read_source, received_file, trace):
                 },
                 prompt_update_timing_scope="client monotonic before prompt send to complete first matching frame-batch payload; includes serialization, writer waiting and upload; excludes image-file reads, browser decoding and rendering",
             )
+            if output_sink is not None and output_sink.message_type == "dit.latents":
+                prompt_metrics["prompt_activation_latency_ms"] = prompt_metrics.pop(
+                    "prompt_switch_ttff_ms"
+                )
+                prompt_metrics["prompt_update_timing_scope"] = (
+                    "Client prompt send to complete first generated latent using that event_id; no RGB decoding"
+                )
+            elif output_sink is not None:
+                prompt_metrics.pop("prompt_switch_ttff_ms")
+                prompt_metrics["prompt_encode_latency_ms"] = distribution(
+                    [row["latency_ms"] for row in updates if row["status"] == "encoded"]
+                )
+                prompt_metrics["prompt_update_timing_scope"] = (
+                    "Client prompt send to encoded condition receipt; not DiT activation"
+                )
             (output / "prompt-updates.json").write_text(
                 json.dumps(prompt_metrics, indent=2)
             )
         elapsed = time.monotonic() - started
+        if output_sink is not None:
+            summary = dict(
+                completed=state["completed"],
+                session_id=ready["session_id"],
+                input_sha256=input_hash.hexdigest(),
+                source_frames=state["submitted"],
+                elapsed_seconds=elapsed,
+                **output_sink.summary(),
+            )
+            (output / "summary.json").write_text(json.dumps(summary, indent=2))
+            return summary
         source_latency = distribution(latency_samples)
         dependency_latency = distribution(dependency_latency_samples)
         block_latency = distribution(block_capture_latency_samples)
@@ -778,6 +966,10 @@ def parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--url", default="ws://127.0.0.1:30000/v1/realtime_video/generate"
+    )
+    parser.add_argument(
+        "--decoder-url",
+        help="Decoder output WebSocket URL when RGB uses a separate connection",
     )
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--source-rgb", help="RGB24 file or - for an engine pipe")

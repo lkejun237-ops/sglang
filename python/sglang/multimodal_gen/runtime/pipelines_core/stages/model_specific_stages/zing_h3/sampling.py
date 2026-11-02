@@ -734,7 +734,12 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
 
         reason = None
         roles = self._layout_index(pos).host["row_role"]
-        if get_ulysses_ctx()[0] not in (1, 2, 4):
+        sp_size = get_ulysses_ctx()[0]
+        heads = int(
+            getattr(getattr(self.generator, "arch", None), "num_attention_heads", 0)
+            or 0
+        )
+        if sp_size < 1 or (heads > 0 and heads % sp_size != 0):
             reason = "sp_size"
         elif self.do_cfg:
             reason = "cfg"

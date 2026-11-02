@@ -184,16 +184,18 @@ def test_disconnect_waits_for_case_cleanup(service, monkeypatch):
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("routed", [False, True])
 @pytest.mark.parametrize("hit", [False, True])
 @pytest.mark.parametrize("force", [False, True])
 def test_case_uses_normal_request_and_cleans_before_receipt(
-    service, monkeypatch, hit, force
+    service, monkeypatch, hit, force, routed
 ):
     args, controller = service
     args.zing_source_work_quantum = 1
     args.zing_source_defer_final = True
     args.zing_source_prompt_joint = True
     events, batches = [], []
+    execution_client = object() if routed else None
     monkeypatch.setattr(source, "build_realtime_sampling_params", lambda *a, **kw: NS())
 
     def prepare(adapter, session, server_args, chunk):
@@ -210,7 +212,8 @@ def test_case_uses_normal_request_and_cleans_before_receipt(
         source.BaseRealtimeModelAdapter, "prepare_next_request", prepare
     )
 
-    async def forward(batch):
+    async def forward(batch, *, execution_client=None):
+        assert (execution_client is not None) is routed
         batches.append(batch)
         events.append("dispatch")
         return [], OutputBatch(
@@ -220,7 +223,8 @@ def test_case_uses_normal_request_and_cleans_before_receipt(
             },
         )
 
-    async def release(session_id):
+    async def release(session_id, *, execution_client=None):
+        assert (execution_client is not None) is routed
         events.append("release")
         return True
 
@@ -231,8 +235,15 @@ def test_case_uses_normal_request_and_cleans_before_receipt(
         data = payload()
         data["force"] = force
         data.update(game_id="game", group_id="stage")
+        ws = Socket()
+        if routed:
+            ws.app.state.realtime_execution_client = execution_client
+            ws.app.state.realtime_admission_controller = controller
+            ws.app.state.realtime_adapter_factory = lambda _: (
+                source.ZingH3SourceStreamAdapter()
+            )
         result = await prefill.run_prefill_case(
-            Socket(), data, len(msgspec.msgpack.encode(data)), "connection"
+            ws, data, len(msgspec.msgpack.encode(data)), "connection"
         )
         events.append("receipt")
         assert result["hit"] is hit and result["request_id"] == "case-a"

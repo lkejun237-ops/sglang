@@ -1,0 +1,263 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Existing Encoder input contract, returning the dedicated DiT's latents."""
+
+from copy import copy
+
+import msgspec.msgpack
+
+from sglang.multimodal_gen.configs.sample.zing_h3 import ZingH3SamplingParams
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_adapter import (
+    empty_frame_send_stats,
+)
+from sglang.multimodal_gen.runtime.realtime.zing_contracts import PixelRange, require
+
+from .zing_source_encoder_adapter import ZingSourceEncoderAdapter
+
+
+class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
+    async def on_init(self, session, request, *, prefill=False):
+        import asyncio
+
+        self.connection_admission = asyncio.Lock()
+        connection_app = getattr(self, "connection_app", None)
+        if connection_app is not None:
+            controller = connection_app.state.worker_connections
+            require(
+                controller.state == "connected", "The worker connections are not ready."
+            )
+            import asyncio
+
+            self.connection_loop = asyncio.get_running_loop()
+            self.connection_draining = False
+        await super().on_init(session, request, prefill=prefill)
+        if connection_app is not None:
+            connection_app.state.connection_adapter = self
+        # No Qwen/VAE invocation and no wait for S0: forward session parameters
+        # as their own ZMQ message before accepting source input.
+        if prefill:
+            return
+        opened = await session.execution_client.open_dit(
+            dict(
+                session_id=session.id,
+                generation_id=session.generation_id,
+                async_inputs=True,
+                seed=request.seed
+                if request.seed is not None
+                else ZingH3SamplingParams.seed,
+                width=self.source_geometry.target_width,
+                height=self.source_geometry.target_height,
+                source_encoding=self.source_geometry.receipt(),
+                fps=self.config["fps"],
+                total_frames=self.config["total_frames"],
+                realtime_output_format=request.realtime_output_format,
+                output_compression=getattr(request, "output_compression", None),
+                realtime_preview_max_width=getattr(
+                    request, "realtime_preview_max_width", None
+                ),
+                trace_id=getattr(session, "trace_id", None),
+            )
+        )
+        self.output_kind = next(
+            (v["output_kind"] for v in (opened or []) if v["type"] == "session.opened"),
+            "dit_latents",
+        )
+        self.ready.update(output_kind=self.output_kind)
+        self.output_attachment = next(
+            (
+                v.get("output_attachment")
+                for v in (opened or [])
+                if v["type"] == "session.opened"
+            ),
+            None,
+        )
+        if self.output_attachment:
+            self.ready.update(
+                output_transport="decoder_websocket",
+                output_attachment=self.output_attachment,
+            )
+        self.latents_sent = 0
+
+    def clear_state(self, session):
+        super().clear_state(session)
+        app = getattr(self, "connection_app", None)
+        if app is not None and getattr(app.state, "connection_adapter", None) is self:
+            app.state.connection_adapter = None
+
+    async def ingest_wire_event(self, ws, session, data, message_bytes):
+        async with self.connection_admission:
+            app = getattr(self, "connection_app", None)
+            if getattr(self, "connection_draining", False) or (
+                app is not None and app.state.worker_connections.state != "connected"
+            ):
+                await ws.send_bytes(
+                    msgspec.msgpack.encode(
+                        dict(
+                            type="error",
+                            fatal=False,
+                            code="CONNECTION_DRAINING",
+                            content="The connection is closing. Please wait before starting again.",
+                        )
+                    )
+                )
+                return True
+            return await super().ingest_wire_event(ws, session, data, message_bytes)
+
+    async def drain_connection(self):
+        import asyncio
+
+        async with self.connection_admission:
+            self.connection_draining = True
+            if self.ledger.closed:
+                return
+            if self.end is None and self.ledger.accepted_frames:
+                # Administrative EOS may end a finite request before its declared
+                # target. Public source.end keeps its original strict validation.
+                self.ledger.total_frames = self.ledger.accepted_frames
+                event_id = self.ledger.event_id + 1
+                self.ledger.finish(self.ledger.accepted_frames, event_id=event_id)
+                self.end = dict(
+                    frame_end=self.ledger.accepted_frames, event_id=event_id
+                )
+                self.pending.append(dict(kind="source.end", end=self.end))
+                self.available.set()
+        while (
+            not self.ledger.closed
+            and self.ledger.accepted_frames
+            and not getattr(self, "connection_eos_done", False)
+        ):
+            await asyncio.sleep(0.005)
+
+        self.ledger.dispose()
+
+    def prepare_next_request(self, session, server_args, chunk):
+        batch = super().prepare_next_request(session, server_args, chunk)
+        batch.extra["zing_dit_source_records"] = [
+            [r.source_id, r.start, r.end] for r in self.ledger.records
+        ]
+        return batch
+
+    def _take_source_input(self):
+        appends, end = super()._take_source_input()
+        if self.output_attachment:
+            # Execution now owns these inputs. Decoder can return client credit
+            # before this dispatch returns to the Encoder API, so update local
+            # admission here. Only Decoder publishes source.consumed on the wire.
+            self.ledger.consume(self.dispatched_source_frames)
+        return appends, end
+
+    async def send_output(self, ws, session, result, batch):
+        try:
+            return await self._send_connected_output(ws, session, result, batch)
+        except BaseException:
+            app = getattr(self, "connection_app", None)
+            if app is not None:
+                app.state.worker_connections.failed()
+            raise
+        finally:
+            if result.usage.get("zing_source_complete"):
+                self.connection_eos_done = True
+
+    async def _send_connected_output(self, ws, session, result, batch):
+        total = empty_frame_send_stats()
+        for notice in result.realtime_handoff.get("conditioning_notices", []):
+            await ws.send_bytes(
+                msgspec.msgpack.encode(
+                    dict(
+                        type="error",
+                        fatal=False,
+                        code=notice["code"],
+                        event_id=notice["event_id"],
+                        content="The prompt update could not be applied. Please try again.",
+                    )
+                )
+            )
+        for item in result.realtime_handoff["dit_latents"]:
+            require(
+                item["latent_start"] == self.latents_sent, "Invalid DiT latent order."
+            )
+            require(
+                (item["session_id"], item["generation_id"])
+                == (session.id, session.generation_id),
+                "Invalid DiT result identity.",
+            )
+            pixels = PixelRange(
+                item["output_frame_start"],
+                item["output_frame_start"] + item["num_frames"],
+            )
+            provenance = self.ledger.provenance_for(
+                pixels, item["source_dependency_end"]
+            )
+            expected = provenance.metadata()
+            require(
+                all(item[k] == value for k, value in expected.items()),
+                "Invalid DiT result alignment.",
+            )
+            if self.output_attachment:
+                require(
+                    item["type"] in ("decoder.output_queued", "decoder.input_sent")
+                    and item.get("reference") is None,
+                    "Invalid direct Decoder receipt.",
+                )
+            elif self.output_kind == "rgb":
+                from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+                    OutputBatch,
+                )
+
+                require(item["type"] == "decoder.frames", "Invalid video output.")
+                sub_batch = copy(batch)
+                sub_batch.extra = dict(
+                    batch.extra,
+                    zing_source_output_blocks=[
+                        dict(
+                            item,
+                            provenance=provenance,
+                            request_id=batch.request_id,
+                            block_idx=item["block_idx"],
+                        )
+                    ],
+                )
+                decoded = OutputBatch(
+                    raw_frame_shared_memory_ref=item["reference"],
+                    raw_frame_metadata=item["metadata"],
+                )
+                try:
+                    stats = await self.output_adapter.send(
+                        ws, session, decoded, sub_batch
+                    )
+                finally:
+                    # The original output adapter consumes or cancels ownership.
+                    item["reference"] = decoded.raw_frame_shared_memory_ref
+                for key, value in stats.items():
+                    if isinstance(value, (int, float)):
+                        total[key] += value
+                    elif value:
+                        total[key] = value
+            else:
+                require(item["type"] == "dit.latents", "Invalid latent output.")
+                await ws.send_bytes(msgspec.msgpack.encode(item))
+            self.ledger.delivered(pixels)
+            self.latents_sent = item["latent_end"]
+        if not self.output_attachment:
+            consumed = self.ledger.consume(result.usage["zing_source_consumed_end"])
+            if consumed is not None:
+                await ws.send_bytes(msgspec.msgpack.encode(consumed))
+        if result.usage["zing_source_complete"]:
+            completion = self.ledger.completed()
+            if self.output_kind == "rgb":
+                if self.output_attachment:
+                    completion = dict(completion, type="input.completed")
+                await ws.send_bytes(msgspec.msgpack.encode(completion))
+                return total
+            await ws.send_bytes(
+                msgspec.msgpack.encode(
+                    dict(
+                        type="session.completed",
+                        output_kind="dit_latents",
+                        session_id=session.id,
+                        generation_id=session.generation_id,
+                        source_frames=self.ledger.output_frames,
+                        latent_frames=self.latents_sent,
+                    )
+                )
+            )
+        return total

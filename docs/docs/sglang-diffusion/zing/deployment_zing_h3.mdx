@@ -13,7 +13,11 @@ description: "供 Codex 与部署同学使用的 H100/H200/B300 部署决策、�
 按实际行数占页、整条 LRU 淘汰。管理接口删除 `capacity`，中台改用页数/字节字段。
 GPU KV 池和 L2 文件格式不变；这是 L1 预算利用率改动，不降低预分配预算或 GPU 常驻显存。
 本轮进一步改为同层页连续布局、占用表升序扫描和连续段 DMA；保持 2048 行页与单 copy stream。
-当前改动的 CPU CI 与单卡 H2D/D2H 组件验证待执行，旧逐页版结果不作为本轮性能结论。
+当前改动的完整 CPU CI、独立 D2H 微基准及逐页版同条件性能对照仍待执行。
+2026-11-02，`d71ce75fae`的 H100 单卡 H2D／L2→L1 组件回归通过：
+2855/4886/12288/40960 行 × 1024/2048 行页，共 8 格，每格预热 2 次、正式 5 次，尾部 guard 通过。
+这是 warm-cache 读取，不是冷 NVMe 或模型端到端性能结论；回执见下文独立 worker 缓存适配的证据目录。
+原 192 GiB 容器主存上限触发 OOMKilled，提高到 384 GiB 后同配置通过；没有 GPU OOM。
 `fa171b20ee` 的完整 CPU CI 与缓存专项均通过（run 41410737009 / 41410736946）。
 H100 目标（实际 L20Z）的限时单卡 H2D／L2→L1 组件执行与结果见 [PR #499](https://github.com/seedleap/sglang/pull/499)；
 480/736 端到端及 Encoder/DiT/Decoder 性能显存矩阵仍未验证。
@@ -202,6 +206,41 @@ seed 123、E1 + SP2 + D1、BF16、Graph 与 Block0 热缓存，候选显式开�
 
 复现条件、Encoder/DiT/Decoder 计时及显存、历史实验版本边界和原始产物入口见
 [PR #481](https://github.com/seedleap/sglang/pull/481)。
+
+## 独立 worker 缓存适配（Draft，H100 480 功能已回归）
+
+2026-11-02，在 main `3dce3950ba` 上适配独立 Encoder/DiT 的 Block0 查询、prefill 和缓存管理，
+L1 复用 #499 按实际 prefix 行数分页分配的实现。
+缓存外部接口统一位于 Encoder，内部复用 ZMQ/NCCL；计算、恢复与本地盘管理复用 main 的 owner。
+缓存与通信组生命周期独立，断连保留缓存，管理操作要求已有通信组。
+2026-11-02，`d71ce75fae`在 H100 上通过 Encoder 1 卡、DiT SP2、Decoder 1 卡回归：
+832×480 product case 的 403 帧单图和 764 帧参考图切换，预热一次，每种模式每个 case 一次。
+8 次显式 prefill 形成 5 个 key，卸载后从 L2 重新加载；随后生成和断连重建共 26 条查询均命中 L1。
+两个 case 的缓存与重算 RGB 逐字节一致；更新场景两侧均为 5 次 applied、1 次 superseded，生效帧边界相同。
+断连重建后模型未重启、缓存仍命中，403 帧输出一致。源码补丁哈希、命令和原始回执位于 H100 节点
+`/mnt/zing-nvme/yesheng-main-regression-20261102-r7/` 的 `SOURCE.json`、`RESULTS.json` 和 `cache-hit-validation.json`。
+这仅是固定 case 的功能回归，**同条件 main/candidate 性能、三组件分项与逐 rank 峰值显存仍未验证**；
+736 与 B300 按本轮要求暂缓，旧结果不作为本组合的性能验收。启动与复现入口见
+[测试 Master 说明](https://github.com/seedleap/sglang/blob/feat/zing-disagg-pooling-elastic-scaling-rebase/benchmark/zing_h3_causal/WORKER_GROUP_MASTER.md)。
+
+## 独立 worker 的 SP2 接入（H100 480 已测）
+
+2026-11-02，`7140d4cbdd13` + 冻结源码 `ab8b913ad554`：独立 DiT 以 torchrun 两进程、
+`--sp-degree 2` 复用原 Ulysses SP、模型加载和 KV 分片，仅 rank 0 对外建连。
+H100 E1 + SP2 + D1，三个独立网络实例，832×480、FP8 FFN/attention、BF16 KV、
+4→2、W6/sink3、pool 1 槽、prefix 13314、Block0 cache 关闭。
+5/30/120s 各预热一次后交替三轮，全程保留 worker 和连接。九次正式请求均完整输出、无 OOM、
+worker 无重启；5s/120s 的 RGB 哈希与此前对应 SP1 case 一致。
+5/30/120s 的 TTFF 中位数分别为 **1.594/1.814/1.814s**，
+全程 FPS **15.731/20.208/21.164**，首包后 FPS **19.726/21.275/21.443**（各 n=3，客户端 init→RGB 口径）。
+5s 使用 coastal 六图，30/120s 使用 wasteland 七图，不能只以时长解释跨 case 差异。
+
+**736、H200 混合链路、同条件 SP1 性能对照、三模块分项耗时与逐 rank 请求峰值显存未测**；
+当前数据不构成这些项目的验收，也不宣称相对旧入口的性能收益。
+上述结果属于冻结源码；后续提交整理中的 DiT 通信故障清理修复仅有 CPU 回归，GPU 故障注入未验证。
+启动方式见[测试 Master 说明](https://github.com/seedleap/sglang/blob/feat/zing-disagg-pooling-elastic-scaling/benchmark/zing_h3_causal/WORKER_GROUP_MASTER.md)；
+原始证据入口为上海 H100 节点 `/mnt/zing-nvme/yesheng-http-group-20261102-r1/sp2-r1/ACCEPTANCE.json`，
+同目录保留源码身份、各请求摘要、命令、日志和视频。
 
 ## Block0 Cache 默认启用（Draft，当前版本未验证）
 
@@ -1021,3 +1060,38 @@ RGB转换/回传另计两步1.604s、一步1.704s。
 H200两组速度回执见本页“736p 部署性能更新”；完整画质仍未验收。
 480输出、请求峰值显存与当前main的完整画质未验证。
 旧 TAEH3 FP16、全程四步的 source480/target736 数据仅作历史证据，不作该 Lynn 配方验收。
+
+## 分离式 Encoder/Decoder 池化（N:M:K）、通用 SP=k 与全组件运行时弹性扩缩容（2026-10-29）
+
+### 当前状态：旧共享 API 多 DiT 入口停用（2026-11-03）
+
+旧的“一个公共 HTTP/WS API 入口自动选择多个 DiT”启动及候选路由代码已注释保留，
+不再作为部署入口。旧多组 `launch_pool_disagg_server()` 调用会明确报错；
+单组启动、其他模型的通用 launcher，以及 Encoder／Decoder 共模型多 service 不属于本次停用范围。
+新部署使用独立 worker service，由 Master 通过 HTTP 显式建立 Encoder → DiT → Decoder 通信组；
+操作入口见 [Worker group 测试 Master](../../../../benchmark/zing_h3_causal/WORKER_GROUP_MASTER.md)。
+
+停用前检查发现旧候选路由存在以下故障处理问题：
+
+- **会话释放失败后，重试可能找错 DiT。** 公共 API 在发出释放请求前，就删除了“该会话属于哪个 DiT”的记录。
+  例如会话实际运行在第二个 DiT，释放请求超时后，重试可能被路由到第一个 DiT。
+  第一个 DiT 返回“没有释放会话”时，上层仍可能将此次 RPC 成功视为清理完成，导致原会话资源没有确认释放。
+- **回包超时后，重试可能重复执行。** 请求已发送给第一个 DiT 后，即使只是响应超时，旧逻辑也可能把同一请求再发给第二个 DiT。
+  第一个 DiT 可能已经开始处理，因此两个 DiT 都可能执行该请求，而会话归属只记录一个，后续清理也可能遗漏另一个。
+
+上述问题位于旧公共 API 的候选调度与会话释放路径，不是新 worker `destroy_group` 的语义。
+目前采取停用旧入口，而非声称已修复其重试算法；重新启用前，必须保证释放确认前保留会话归属、
+禁止未经确认的跨 DiT 状态请求重放，并补充释放超时和发送后回包超时的故障回归。
+2026-11-03，`de13d4c1b8` 加本轮启动兼容及资源释放补丁，在 H100／832×480 上完成跨实例双路回归（10 条请求），
+并验证保留的旧 Decoder 启动命令及双 rank NCCL 错误传播；源码哈希、命令和回执见
+`/mnt/zing-nvme/yesheng-final-regression-20261103-r5/`。736／B300 本轮按用户要求暂缓。
+下面的数据保留为旧版本的历史证据，不代表当前入口支持旧动态池化模式。
+
+基于 `387f693f306e` 新增分离式 Encoder/Decoder 多会话池化共享（`--disagg-encoder-ports`、`--disagg-decoder-ports`、`--disagg-max-sessions`）、DiT 任意合法 `SP=k`（`1/2/4/8`）通用切分，以及 DiT、Encoder、Decoder 全组件运行时零中断弹性扩缩容能力（`set_max_sessions`、`bridge_close`、`set_draining` 优雅摘流、`SGLANG_DISAGG_POOL_REGISTRY` 动态端口池热发现）。默认单实例部署行为保持不变。
+
+已在上海 H200（`quota3l8bnv9a35n`，4 × H200 / SM90 140.40 GiB，FP8 + CUDA Graph，4→2 步采样，`30s-wasteland` 720 帧）完成三组实测：
+- **静态池化 1 Encoder + 1 Decoder + 2 × 单卡 DiT (`SP=1`)（Job `dlcfqqvpnik628l1`）**：
+  - **832×480**：单 DiT 基线 14.66 FPS（TTFF 2.94s）；双 DiT 并发聚合 **25.78 FPS**（1.76×，#0 12.88 / #1 12.90 FPS，TTFF 3.21s / 3.01s）；整卡峰值显存 GPU0(Qwen+Enc) 43,755 MiB、GPU1(DiT#0) 97,231 MiB、GPU2(DiT#1) 113,741 MiB、GPU3(Dec) 82,803 MiB。
+  - **1280×736**：单 DiT 基线 5.56 FPS（TTFF 8.21s）；双 DiT 并发聚合 **10.61 FPS**（1.91×，#0 5.30 / #1 5.30 FPS，TTFF 8.33s / 8.51s）；整卡峰值显存 GPU0 44,507 MiB、GPU1 110,923 MiB、GPU2 127,433 MiB、GPU3 106,017 MiB。
+- **DiT 运行时在线扩缩容 1→2→1→2（Job `dlc1nnv9nqr137yw`，832×480）**：`DiT #0` 全程流式推理零中断（单流 14.66→14.68→14.71 FPS），在线 `set_max_sessions(2)` 热接入 `DiT #1` 后双流聚合 **26.54 FPS**（1.81×），在线下线 `#1` 并 `bridge_close` 回收 NCCL 通信组（`active_bridges: 2→1`），再次扩容重连聚合 **27.09 FPS**（1.85×），全程 0 失败。
+- **Encoder/Decoder 运行时在线热扩容与 `set_draining` 优雅摘流缩容（Job `dlc1lfsb2jtk9qgr`，832×480）**：`DiT #0` 常驻不重启，初始 `#0` 14.69 FPS；在途流期间热启动 `Enc#1` / `Dec#1`、原子更新 `SGLANG_DISAGG_POOL_REGISTRY` 并对 `#0` 开启 `set_draining(True)`，在途会话完整跑完排空至 `active_sessions=0`，后续会话自动建连迁移至 `#1`（12.05 FPS，3/3 零中断），最终在线 `bridge_close` 并终止 `#0` 进程后 `#1` 独立稳定服务（12.05 FPS，3/3 成功）。736 档在线扩缩容与跨机多节点池化尚未验证。

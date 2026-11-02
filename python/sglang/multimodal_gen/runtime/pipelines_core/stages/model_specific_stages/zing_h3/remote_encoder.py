@@ -6,15 +6,18 @@ completed moments to DiT ranks before the unchanged posterior sampler runs.
 The producer never calls a DiT collective or changes its model/backend flags.
 """
 
+import atexit
 import hashlib
 import json
 import math
+import os
 import queue
 import sys
 import threading
 import time
 import uuid
 from datetime import timedelta
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -25,6 +28,172 @@ from .encoder_transport import bridge_group, receive_moments
 from .media_geometry import SourceGeometry
 from .progressive_encoder import PROGRESSIVE_ENCODER_VERSION, EncoderStateUsage
 from .streaming_codecs import CodecSlice
+
+_PERSISTENT_ENCODER_BRIDGES: dict[int, tuple[str, Any, Any]] = {}
+_DYNAMIC_ENCODER_PORTS: list[int] | None = None
+
+
+def _encoder_control_rpc(port: int, request: dict, *, timeout: float = 5.0) -> dict:
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.LINGER, 0)
+    timeout_ms = max(1, int(timeout * 1000))
+    socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+    socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
+    socket.connect(f"tcp://127.0.0.1:{port}")
+    try:
+        socket.send_multipart([json.dumps(request).encode()])
+        return socket.recv_json()
+    finally:
+        socket.close()
+        context.term()
+
+
+def set_encoder_max_sessions(
+    port: int, max_sessions: int, *, timeout: float = 5.0
+) -> dict:
+    """Dynamically adjust max_sessions on a running encoder_worker."""
+    return _encoder_control_rpc(
+        port,
+        {"op": "set_max_sessions", "max_sessions": max_sessions},
+        timeout=timeout,
+    )
+
+
+def set_encoder_draining(
+    port: int, draining: bool = True, *, timeout: float = 5.0
+) -> dict:
+    """Toggle graceful draining mode on a running encoder_worker."""
+    return _encoder_control_rpc(
+        port,
+        {"op": "set_draining", "draining": bool(draining)},
+        timeout=timeout,
+    )
+
+
+def set_dynamic_encoder_ports(ports: list[int] | tuple[int, ...] | None) -> None:
+    """Dynamically override the encoder port pool for new sessions in this process."""
+    global _DYNAMIC_ENCODER_PORTS
+    if ports is None:
+        _DYNAMIC_ENCODER_PORTS = None
+        return
+    validated = [int(p) for p in ports if type(p) is int and 1024 <= p <= 65535]
+    if not validated or len(validated) != len(ports):
+        raise ValueError("Invalid dynamic encoder service ports")
+    _DYNAMIC_ENCODER_PORTS = validated
+
+
+def update_disagg_pool_registry(
+    registry_path,
+    *,
+    encoder_ports: list[int] | tuple[int, ...] | None = None,
+    decoder_ports: list[int] | tuple[int, ...] | None = None,
+    denoiser_ports: list[int] | tuple[int, ...] | None = None,
+) -> dict:
+    """Atomically update a shared JSON registry of pooled Encoder/Decoder/Denoiser ports."""
+    from pathlib import Path
+
+    path = Path(registry_path)
+    data: dict = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    if encoder_ports is not None:
+        enc_list = [
+            int(p) for p in encoder_ports if type(p) is int and 1024 <= p <= 65535
+        ]
+        if not enc_list or len(enc_list) != len(encoder_ports):
+            raise ValueError("Invalid encoder_ports for pool registry")
+        data["encoder_ports"] = enc_list
+    if decoder_ports is not None:
+        dec_list = [
+            int(p) for p in decoder_ports if type(p) is int and 1024 <= p <= 65535
+        ]
+        if not dec_list or len(dec_list) != len(decoder_ports):
+            raise ValueError("Invalid decoder_ports for pool registry")
+        data["decoder_ports"] = dec_list
+    if denoiser_ports is not None:
+        dit_list = [
+            int(p) for p in denoiser_ports if type(p) is int and 1024 <= p <= 65535
+        ]
+        if not dit_list or len(dit_list) != len(denoiser_ports):
+            raise ValueError("Invalid denoiser_ports for pool registry")
+        data["denoiser_ports"] = dit_list
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(f".{uuid.uuid4().hex[:8]}.tmp")
+    tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp_path, path)
+    return data
+
+
+def _resolve_dynamic_encoder_ports(config: dict) -> list[int] | None:
+    dyn_ports = globals().get("_DYNAMIC_ENCODER_PORTS")
+    if dyn_ports:
+        return list(dyn_ports)
+    reg_path = config.get("pool_registry_path") or os.environ.get(
+        "SGLANG_DISAGG_POOL_REGISTRY"
+    )
+    if reg_path:
+        try:
+            from pathlib import Path
+
+            p = Path(reg_path)
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                ports = data.get("encoder_ports")
+                if isinstance(ports, list) and ports:
+                    return [int(x) for x in ports]
+        except Exception:
+            pass
+    return None
+
+
+def close_encoder_bridge(
+    port: int, bridge_id: str, *, timeout: float = 5.0, force: bool = False
+) -> dict:
+    """Explicitly close a persistent bridge on a running encoder_worker."""
+    return _encoder_control_rpc(
+        port,
+        {"op": "bridge_close", "bridge_id": bridge_id, "force": bool(force)},
+        timeout=timeout,
+    )
+
+
+def close_persistent_encoder_bridges(
+    ports: list[int] | tuple[int, ...] | None = None,
+    *,
+    timeout: float = 5.0,
+    force: bool = False,
+) -> dict[int, dict]:
+    """Close and destroy cached persistent encoder bridges for this DiT worker."""
+    target_ports = (
+        list(_PERSISTENT_ENCODER_BRIDGES.keys())
+        if ports is None
+        else [p for p in ports if p in _PERSISTENT_ENCODER_BRIDGES]
+    )
+    results: dict[int, dict] = {}
+    for port in target_ports:
+        entry = _PERSISTENT_ENCODER_BRIDGES.pop(port, None)
+        if entry is None:
+            continue
+        bridge_id, _store, bridge = entry
+        try:
+            results[port] = close_encoder_bridge(
+                port, bridge_id, timeout=timeout, force=force
+            )
+        except Exception as exc:
+            results[port] = {"ok": False, "bridge_id": bridge_id, "error": str(exc)}
+        if bridge is not None:
+            try:
+                dist.destroy_process_group(bridge)
+            except Exception:
+                pass
+    return results
+
+
+atexit.register(close_persistent_encoder_bridges)
 
 
 def available_latents(frames, ended):
@@ -71,12 +240,25 @@ class RemoteEncoderSession:
         self.admission_lock = threading.Lock()
         self.admission_digests = {}
         self.prefetched_frames = 0
-        self.port = config["port"]
+        dyn_ports = _resolve_dynamic_encoder_ports(config)
+        raw_ports = dyn_ports if dyn_ports is not None else config.get("ports")
+        if raw_ports is not None:
+            if not isinstance(raw_ports, (list, tuple)) or not raw_ports:
+                raise ValueError("Invalid encoder service ports")
+            if any(type(p) is not int or not (1024 <= p <= 65535) for p in raw_ports):
+                raise ValueError("Invalid encoder service port")
+            self.ports = [int(p) for p in raw_ports]
+            self.port = int(config.get("port", self.ports[0]))
+            self._pool_mode = True
+        else:
+            self.port = config["port"]
+            if type(self.port) is not int or not 1024 <= self.port <= 65535:
+                raise ValueError("Invalid encoder service port")
+            self.ports = [self.port]
+            self._pool_mode = False
         self.mode = config["mode"]
         if self.mode not in ("serial", "overlap"):
             raise ValueError("Encoder execution mode must be serial or overlap")
-        if type(self.port) is not int or not 1024 <= self.port <= 65535:
-            raise ValueError("Invalid encoder service port")
         if not 1 <= self.capacity_bytes <= 256 << 20 or not 1 <= self.timeout <= 600:
             raise ValueError("Invalid encoder queue capacity or timeout")
         self.profile_dir = config.get("profile_dir")
@@ -218,11 +400,17 @@ class RemoteEncoderSession:
             and self.source_geometry.use_target_736_media_path
         )
         context = zmq.Context()
-        socket = context.socket(zmq.REQ)
-        socket.setsockopt(zmq.LINGER, 0)
-        socket.setsockopt(zmq.RCVTIMEO, self.timeout * 1000)
-        socket.setsockopt(zmq.SNDTIMEO, self.timeout * 1000)
-        socket.connect(f"tcp://127.0.0.1:{self.port}")
+        persistent_bridges = globals().setdefault("_PERSISTENT_ENCODER_BRIDGES", {})
+        use_pool = getattr(self, "_pool_mode", False) or (
+            self.port in persistent_bridges
+        )
+        socket = None
+        if not use_pool:
+            socket = context.socket(zmq.REQ)
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.setsockopt(zmq.RCVTIMEO, self.timeout * 1000)
+            socket.setsockopt(zmq.SNDTIMEO, self.timeout * 1000)
+            socket.connect(f"tcp://127.0.0.1:{self.port}")
         admission = None
         if self.admission_endpoint:
             admission = context.socket(zmq.PULL)
@@ -253,34 +441,173 @@ class RemoteEncoderSession:
         try:
             torch.cuda.set_device(self.device)
             stream = torch.cuda.Stream(device=self.device)
-            store = dist.TCPStore(
-                "127.0.0.1",
-                0,
-                2,
-                True,
-                timeout=timedelta(seconds=self.timeout),
-                wait_for_workers=False,
-            )
-            open_attempted = True
             source_encoding = (
                 None if self.source_geometry is None else self.source_geometry.receipt()
             )
-            opened_reply = rpc(
-                "open",
-                bridge_port=store.port,
-                capacity_frames=self.capacity_frames,
-                stage_timing_dir=self.stage_timing_dir,
-                source_encoding=source_encoding,
-            )
-            opened = True
-            data_operation_active = True
-            bridge = bridge_group(store, 0, timeout_seconds=self.timeout)
-            data_operation_active = False
-            if (
-                self.source_geometry is not None
-                and opened_reply.get("source_encoding") != source_encoding
-            ):
-                raise ValueError("Encoder did not acknowledge source geometry")
+            if not use_pool:
+                store = dist.TCPStore(
+                    "127.0.0.1",
+                    0,
+                    2,
+                    True,
+                    timeout=timedelta(seconds=self.timeout),
+                    wait_for_workers=False,
+                )
+                open_attempted = True
+                opened_reply = rpc(
+                    "open",
+                    bridge_port=store.port,
+                    capacity_frames=self.capacity_frames,
+                    stage_timing_dir=self.stage_timing_dir,
+                    source_encoding=source_encoding,
+                )
+                opened = True
+                data_operation_active = True
+                bridge = bridge_group(store, 0, timeout_seconds=self.timeout)
+                data_operation_active = False
+                if (
+                    self.source_geometry is not None
+                    and opened_reply.get("source_encoding") != source_encoding
+                ):
+                    raise ValueError("Encoder did not acknowledge source geometry")
+            else:
+                if len(self.ports) > 1:
+                    candidates = []
+                    for idx, p in enumerate(self.ports):
+                        probe = context.socket(zmq.REQ)
+                        probe.setsockopt(zmq.LINGER, 0)
+                        probe.setsockopt(zmq.RCVTIMEO, self.timeout * 1000)
+                        probe.setsockopt(zmq.SNDTIMEO, self.timeout * 1000)
+                        probe.connect(f"tcp://127.0.0.1:{p}")
+                        try:
+                            probe.send_multipart([json.dumps({"op": "ping"}).encode()])
+                            ping_reply = probe.recv_json()
+                            if ping_reply.get("ok") and not ping_reply.get(
+                                "restart_required"
+                            ):
+                                max_s = int(ping_reply.get("max_sessions", 1))
+                                act_s = int(
+                                    ping_reply.get(
+                                        "active_sessions",
+                                        1 if ping_reply.get("busy") else 0,
+                                    )
+                                )
+                                free_slots = max_s - act_s
+                                is_busy = bool(ping_reply.get("busy", free_slots <= 0))
+                                candidates.append(
+                                    (0 if not is_busy else 1, -free_slots, idx, p)
+                                )
+                        except Exception:
+                            pass
+                        finally:
+                            probe.close()
+                    if candidates:
+                        candidates.sort()
+                        ordered_ports = [c[3] for c in candidates]
+                    else:
+                        ordered_ports = list(self.ports)
+                else:
+                    ordered_ports = list(self.ports)
+
+                for cand_idx, candidate_port in enumerate(ordered_ports):
+                    cand_sock = context.socket(zmq.REQ)
+                    cand_sock.setsockopt(zmq.LINGER, 0)
+                    cand_sock.setsockopt(zmq.RCVTIMEO, self.timeout * 1000)
+                    cand_sock.setsockopt(zmq.SNDTIMEO, self.timeout * 1000)
+                    cand_sock.connect(f"tcp://127.0.0.1:{candidate_port}")
+                    try:
+                        if candidate_port in persistent_bridges:
+                            bridge_id, store, bridge = persistent_bridges[
+                                candidate_port
+                            ]
+                        else:
+                            bridge_id = (
+                                f"enc-bridge-{candidate_port}-{uuid.uuid4().hex[:8]}"
+                            )
+                            store = dist.TCPStore(
+                                "127.0.0.1",
+                                0,
+                                2,
+                                True,
+                                timeout=timedelta(seconds=self.timeout),
+                                wait_for_workers=False,
+                            )
+                            b_req = dict(
+                                op="bridge_open",
+                                session=self.token,
+                                bridge_id=bridge_id,
+                                bridge_port=store.port,
+                            )
+                            rpc_in_flight = True
+                            cand_sock.send_multipart([json.dumps(b_req).encode()])
+                            b_reply = cand_sock.recv_json()
+                            rpc_in_flight = False
+                            if not b_reply.get("ok"):
+                                if cand_idx < len(ordered_ports) - 1:
+                                    cand_sock.close()
+                                    continue
+                                socket = cand_sock
+                                self.port = candidate_port
+                                raise RuntimeError(
+                                    "Encoder service rejected the operation"
+                                )
+                            data_operation_active = True
+                            bridge = bridge_group(
+                                store, 0, timeout_seconds=self.timeout
+                            )
+                            data_operation_active = False
+                            persistent_bridges[candidate_port] = (
+                                bridge_id,
+                                store,
+                                bridge,
+                            )
+
+                        open_req = dict(
+                            op="open",
+                            session=self.token,
+                            profile_dir=self.profile_dir,
+                            bridge_id=bridge_id,
+                            capacity_frames=self.capacity_frames,
+                            stage_timing_dir=self.stage_timing_dir,
+                            source_encoding=source_encoding,
+                        )
+                        self.port = candidate_port
+                        open_attempted = True
+                        rpc_in_flight = True
+                        cand_sock.send_multipart([json.dumps(open_req).encode()])
+                        open_reply = cand_sock.recv_json()
+                        rpc_in_flight = False
+                        if not open_reply.get("ok"):
+                            if (
+                                open_reply.get("code") == "ENCODER_BUSY"
+                                and cand_idx < len(ordered_ports) - 1
+                            ):
+                                cand_sock.close()
+                                open_attempted = False
+                                continue
+                            if open_reply.get("code") != "ENCODER_BUSY":
+                                persistent_bridges.pop(candidate_port, None)
+                            socket = cand_sock
+                            raise RuntimeError("Encoder service rejected the operation")
+                        if (
+                            self.source_geometry is not None
+                            and open_reply.get("source_encoding") != source_encoding
+                        ):
+                            raise ValueError(
+                                "Encoder did not acknowledge source geometry"
+                            )
+                        self.remote_usage = open_reply.get("state", self.remote_usage)
+                        socket = cand_sock
+                        opened = True
+                        break
+                    except BaseException:
+                        rpc_in_flight = False
+                        persistent_bridges.pop(candidate_port, None)
+                        if socket is not cand_sock:
+                            cand_sock.close()
+                        if not open_attempted and cand_idx < len(ordered_ports) - 1:
+                            continue
+                        raise
             with torch.cuda.stream(stream):
                 while not self.stop.is_set():
                     try:
@@ -398,7 +725,8 @@ class RemoteEncoderSession:
                         self.failure = error
             if admission is not None:
                 admission.close()
-            socket.close()
+            if socket is not None:
+                socket.close()
             context.term()
             if open_attempted and self.failure is not None:
                 self.recovery = request_abort(
@@ -442,9 +770,13 @@ class RemoteEncoderSession:
             except BaseException:
                 reply = {"error": self._failure_message()}
         metadata = [reply]
-        dist.broadcast_object_list(
-            metadata, src=self.group.ranks[0], group=self.group.cpu_group
-        )
+        if getattr(self.group, "world_size", 2) > 1 or (
+            getattr(self.group, "cpu_group", None) is not None
+            and not hasattr(self.group, "unique_name")
+        ):
+            dist.broadcast_object_list(
+                metadata, src=self.group.ranks[0], group=self.group.cpu_group
+            )
         reply = metadata[0]
         if "error" in reply:
             raise RuntimeError(reply["error"])
@@ -452,10 +784,11 @@ class RemoteEncoderSession:
             value = torch.empty(
                 reply["shape"], dtype=getattr(torch, reply["dtype"]), device=self.device
             )
-        with torch.profiler.record_function("Zing.encoder_to_dit_ranks"):
-            dist.broadcast(
-                value, src=self.group.ranks[0], group=self.group.device_group
-            )
+        if getattr(self.group, "world_size", len(getattr(self.group, "ranks", ()))) > 1:
+            with torch.profiler.record_function("Zing.encoder_to_dit_ranks"):
+                dist.broadcast(
+                    value, src=self.group.ranks[0], group=self.group.device_group
+                )
         if (
             reply["start"] != self.emitted_latents
             or not self._consumed < reply["dependency"] <= self.accepted_frames

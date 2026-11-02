@@ -186,3 +186,38 @@ def test_broker_closes_socket_and_context_when_cancelled(monkeypatch):
         context.destroy.assert_called_once_with(linger=0)
 
     asyncio.run(run_test())
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_stateful_timeout_does_not_fail_over_and_release_keeps_replica(asynchronous):
+    """A sent request may already run; timeout must not replay on another DiT."""
+    client = AsyncSchedulerClient() if asynchronous else SchedulerClient()
+    client.context = object()
+    client.server_args = SimpleNamespace(
+        scheduler_endpoints=["tcp://replica-0", "tcp://replica-1"],
+        disagg_denoiser_ports=[34000, 34001],
+    )
+    client.request_logger = MagicMock()
+    calls = []
+
+    def fail(endpoint, batch, timeout_ms):
+        calls.append(endpoint)
+        raise TimeoutError("Response lost after send")
+
+    async def async_fail(endpoint, batch, timeout_ms):
+        return fail(endpoint, batch, timeout_ms)
+
+    client._forward_one = async_fail if asynchronous else fail
+    generation = Req(
+        sampling_params=SamplingParams(), realtime_session_id="persistent-session"
+    )
+    for batch in (
+        [generation],
+        ReleaseRealtimeSessionReq(session_id="persistent-session"),
+    ):
+        with pytest.raises(TimeoutError, match="Response lost"):
+            result = client.forward(batch, timeout_ms=1000)
+            if asynchronous:
+                asyncio.run(result)
+    assert len(calls) == 2
+    assert calls[0] == calls[1]

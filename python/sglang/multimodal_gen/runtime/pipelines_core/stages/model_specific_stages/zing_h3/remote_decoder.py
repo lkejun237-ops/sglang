@@ -7,8 +7,12 @@ boundaries and that reference travel back. D2 append waits for the previous
 tile job before bridge transfer; publisher capacity can also apply backpressure.
 """
 
+import atexit
+import json
+import os
 import uuid
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
 import msgspec
@@ -20,6 +24,124 @@ from sglang.multimodal_gen.runtime.realtime.zing_contracts import PixelRange
 
 from .decoder_transport import bridge_group, send_latent
 from .source_decoder import check_latent_append
+
+_PERSISTENT_DECODER_BRIDGES: dict[int, tuple[str, Any, Any]] = {}
+_DYNAMIC_DECODER_PORTS: list[int] | None = None
+
+
+def _decoder_control_rpc(port: int, request: dict, *, timeout: float = 5.0) -> dict:
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.LINGER, 0)
+    timeout_ms = max(1, int(timeout * 1000))
+    socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+    socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
+    socket.connect(f"tcp://127.0.0.1:{port}")
+    try:
+        socket.send_json(request)
+        return socket.recv_json()
+    finally:
+        socket.close()
+        context.term()
+
+
+def set_decoder_max_sessions(
+    port: int, max_sessions: int, *, timeout: float = 5.0
+) -> dict:
+    """Dynamically adjust max_sessions on a running decoder_worker."""
+    return _decoder_control_rpc(
+        port,
+        {"op": "set_max_sessions", "max_sessions": max_sessions},
+        timeout=timeout,
+    )
+
+
+def set_decoder_draining(
+    port: int, draining: bool = True, *, timeout: float = 5.0
+) -> dict:
+    """Toggle graceful draining mode on a running decoder_worker."""
+    return _decoder_control_rpc(
+        port,
+        {"op": "set_draining", "draining": bool(draining)},
+        timeout=timeout,
+    )
+
+
+def set_dynamic_decoder_ports(ports: list[int] | tuple[int, ...] | None) -> None:
+    """Dynamically override the decoder port pool for new sessions in this process."""
+    global _DYNAMIC_DECODER_PORTS
+    if ports is None:
+        _DYNAMIC_DECODER_PORTS = None
+        return
+    validated = [int(p) for p in ports if type(p) is int and 1024 <= p <= 65535]
+    if not validated or len(validated) != len(ports):
+        raise ValueError("Invalid dynamic decoder service ports")
+    _DYNAMIC_DECODER_PORTS = validated
+
+
+def _resolve_dynamic_decoder_ports(config: dict) -> list[int] | None:
+    if _DYNAMIC_DECODER_PORTS:
+        return list(_DYNAMIC_DECODER_PORTS)
+    reg_path = config.get("pool_registry_path") or os.environ.get(
+        "SGLANG_DISAGG_POOL_REGISTRY"
+    )
+    if reg_path:
+        try:
+            p = Path(reg_path)
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                ports = data.get("decoder_ports")
+                if isinstance(ports, list) and ports:
+                    return [int(x) for x in ports]
+        except Exception:
+            pass
+    return None
+
+
+def close_decoder_bridge(
+    port: int, bridge_id: str, *, timeout: float = 5.0, force: bool = False
+) -> dict:
+    """Explicitly close a persistent bridge on a running decoder_worker."""
+    return _decoder_control_rpc(
+        port,
+        {"op": "bridge_close", "bridge_id": bridge_id, "force": bool(force)},
+        timeout=timeout,
+    )
+
+
+def close_persistent_decoder_bridges(
+    ports: list[int] | tuple[int, ...] | None = None,
+    *,
+    timeout: float = 5.0,
+    force: bool = False,
+) -> dict[int, dict]:
+    """Close and destroy cached persistent decoder bridges for this DiT worker."""
+    target_ports = (
+        list(_PERSISTENT_DECODER_BRIDGES.keys())
+        if ports is None
+        else [p for p in ports if p in _PERSISTENT_DECODER_BRIDGES]
+    )
+    results: dict[int, dict] = {}
+    for port in target_ports:
+        entry = _PERSISTENT_DECODER_BRIDGES.pop(port, None)
+        if entry is None:
+            continue
+        bridge_id, _store, bridge = entry
+        try:
+            results[port] = close_decoder_bridge(
+                port, bridge_id, timeout=timeout, force=force
+            )
+        except Exception as exc:
+            results[port] = {"ok": False, "bridge_id": bridge_id, "error": str(exc)}
+        if bridge is not None:
+            try:
+                dist.destroy_process_group(bridge)
+            except Exception:
+                pass
+    return results
+
+
+atexit.register(close_persistent_decoder_bridges)
 
 
 class RemoteDecodedSlice(msgspec.Struct, frozen=True):
@@ -48,13 +170,65 @@ class RemoteLynnDecoder:
             get_world_group,
         )
 
-        module = codecs.modules[codecs.decoder.module_key]
-        self.protocol = module.protocol
+        module = codecs.modules.get(codecs.decoder.module_key)
+        if module is not None:
+            self.protocol = module.protocol
+        else:
+            # A dedicated DiT has no local decoder weights. Read the same
+            # architecture metadata used by the decoder loader, without
+            # constructing a second model or a synthetic codecs object.
+            from sglang.multimodal_gen.runtime.models.vaes.lynn_streaming.loader import (
+                read_architecture,
+            )
+            from sglang.multimodal_gen.runtime.models.vaes.lynn_streaming.temporal import (
+                TemporalProtocol,
+            )
+
+            spec = codecs.pipeline_config.resolve_decoder_spec()
+            if spec.type != "lynn_streaming":
+                raise ValueError("Remote source decoding requires the Lynn decoder")
+            self.protocol = TemporalProtocol(read_architecture(spec.model_dir))
+        self.connection = config.get("connection")
+        self.host = config.get("host", "127.0.0.1")
+        self.auto_output = config.get("auto_output", False)
+        self.output_session = config.get("output_session")
+        self.oneway = config.get("oneway", False)
+        if type(self.oneway) is not bool or (
+            self.oneway and not (self.auto_output and self.output_session)
+        ):
+            raise ValueError("One-way decoding requires direct output")
+        self.output_attachment = None
+        self.output_metadata = None
+        if type(self.auto_output) is not bool:
+            raise ValueError("Invalid decoder auto-output mode")
+        self._pending_output = None
         self.group = get_world_group()
         self.leader = self.group.rank_in_group == 0
         self.capacity_latents = capacity_latents
         self.provenance_for = provenance_for
-        self.port = config["port"]
+        dyn_ports = (
+            None
+            if self.connection is not None
+            else _resolve_dynamic_decoder_ports(config)
+        )
+        raw_ports = dyn_ports if dyn_ports is not None else config.get("ports")
+        if raw_ports is not None:
+            if not isinstance(raw_ports, (list, tuple)) or not raw_ports:
+                raise ValueError("Invalid decoder service ports")
+            ports = [int(p) for p in raw_ports if type(p) is int]
+            if len(ports) != len(raw_ports) or any(
+                not 1024 <= p <= 65535 for p in ports
+            ):
+                raise ValueError("Invalid decoder service port")
+            self.ports = ports
+            self.port = config.get("port", ports[0])
+            self._pool_mode = True
+        else:
+            self.port = config["port"]
+            if type(self.port) is not int or not 1024 <= self.port <= 65535:
+                raise ValueError("Invalid decoder service port")
+            self.ports = [self.port]
+            self._pool_mode = self.port in _PERSISTENT_DECODER_BRIDGES
         if type(self.port) is not int or not 1024 <= self.port <= 65535:
             raise ValueError("Invalid decoder service port")
         self.timeout = config.get("timeout_seconds", 120)
@@ -74,7 +248,46 @@ class RemoteLynnDecoder:
         self.socket = self.context = self.bridge = self.store = None
         self.channel = None
         self.request_id = self.chunk_index = self.generation_id = None
-        self._connect()
+        if self.connection is not None:
+            self._connect_group()
+        else:
+            self._connect()
+
+    def _connect_group(self):
+        """Reuse the group built by HTTP; opening a session loads no weights."""
+        if not self.leader:
+            return
+        context = self.context = zmq.Context()
+        self.socket = self._command_socket(context)
+        self.socket.setsockopt(zmq.LINGER, 0)
+        self.socket.setsockopt(zmq.RCVTIMEO, self.timeout * 1000)
+        self.socket.setsockopt(zmq.SNDTIMEO, self.timeout * 1000)
+        self.socket.connect(f"tcp://{self.host}:{self.port}")
+        self.bridge = self.connection["bridge"]
+        try:
+            opened = self._request(
+                "open",
+                bridge_id=self.connection["group_id"],
+                capacity_latents=self.capacity_latents,
+                auto_output=self.auto_output,
+                output_session=self.output_session,
+            )
+            self.channel = opened["channel"]
+            self.output_attachment = opened.get("output_attachment")
+            self.oneway = self.oneway and bool(
+                self.output_attachment and opened.get("oneway_supported")
+            )
+        except BaseException as error:
+            self.failure = error
+
+    def _command_socket(self, context):
+        if self.oneway:
+            from sglang.multimodal_gen.runtime.realtime.worker_services import (
+                OneWayCommandClient,
+            )
+
+            return OneWayCommandClient(context)
+        return context.socket(zmq.REQ)
 
     @property
     def buffered_latents(self):
@@ -103,32 +316,156 @@ class RemoteLynnDecoder:
     def _failure_message(self):
         return "Remote decoder failed"
 
+    def _rank_candidate_ports(self, context) -> list[int]:
+        if len(self.ports) == 1 and not self._pool_mode:
+            return list(self.ports)
+        scored = []
+        for idx, cand_port in enumerate(self.ports):
+            sock = context.socket(zmq.REQ)
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.setsockopt(zmq.RCVTIMEO, min(self.timeout, 2) * 1000)
+            sock.setsockopt(zmq.SNDTIMEO, min(self.timeout, 2) * 1000)
+            sock.connect(f"tcp://127.0.0.1:{cand_port}")
+            try:
+                sock.send_json({"op": "ping"})
+                reply = sock.recv_json()
+                if isinstance(reply, dict) and reply.get("ok"):
+                    busy = bool(reply.get("busy", False))
+                    max_s = int(reply.get("max_sessions", 1))
+                    act_s = int(reply.get("active_sessions", 1 if busy else 0))
+                    free_slots = max(0, max_s - act_s)
+                    scored.append(((1 if busy else 0, -free_slots, idx), cand_port))
+                else:
+                    scored.append(((2, 0, idx), cand_port))
+            except Exception:
+                scored.append(((2, 0, idx), cand_port))
+            finally:
+                sock.close()
+        scored.sort(key=lambda item: item[0])
+        return [p for _, p in scored]
+
     def _connect(self):
         if not self.leader:
             return
         context = zmq.Context()
-        socket = context.socket(zmq.REQ)
-        socket.setsockopt(zmq.LINGER, 0)
-        socket.setsockopt(zmq.RCVTIMEO, self.timeout * 1000)
-        socket.setsockopt(zmq.SNDTIMEO, self.timeout * 1000)
-        socket.connect(f"tcp://127.0.0.1:{self.port}")
-        self.context, self.socket = context, socket
+        if not self._pool_mode:
+            socket = self._command_socket(context)
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.setsockopt(zmq.RCVTIMEO, self.timeout * 1000)
+            socket.setsockopt(zmq.SNDTIMEO, self.timeout * 1000)
+            socket.connect(f"tcp://{self.host}:{self.port}")
+            self.context, self.socket = context, socket
+            try:
+                store = dist.TCPStore(
+                    "127.0.0.1",
+                    0,
+                    2,
+                    True,
+                    timeout=timedelta(seconds=self.timeout),
+                    wait_for_workers=False,
+                )
+                self.store = store
+                opened = self._request(
+                    "open",
+                    bridge_port=store.port,
+                    capacity_latents=self.capacity_latents,
+                    **({"auto_output": True} if self.auto_output else {}),
+                    **(
+                        {"output_session": self.output_session}
+                        if self.output_session
+                        else {}
+                    ),
+                )
+                self.channel = opened["channel"]
+                self.output_attachment = opened.get("output_attachment")
+                self.oneway = self.oneway and bool(
+                    self.output_attachment and opened.get("oneway_supported")
+                )
+                self.bridge = bridge_group(store, 0, timeout_seconds=self.timeout)
+            except BaseException as error:
+                # Reported by the first pop on every DiT rank, like a later failure.
+                self.failure = error
+            return
+
+        self.context = context
         try:
-            store = dist.TCPStore(
-                "127.0.0.1",
-                0,
-                2,
-                True,
-                timeout=timedelta(seconds=self.timeout),
-                wait_for_workers=False,
-            )
-            self.store = store
-            self.channel = self._request(
-                "open", bridge_port=store.port, capacity_latents=self.capacity_latents
-            )["channel"]
-            self.bridge = bridge_group(store, 0, timeout_seconds=self.timeout)
+            candidates = self._rank_candidate_ports(context)
+            last_error = None
+            for cand_port in candidates:
+                socket = self._command_socket(context)
+                socket.setsockopt(zmq.LINGER, 0)
+                socket.setsockopt(zmq.RCVTIMEO, self.timeout * 1000)
+                socket.setsockopt(zmq.SNDTIMEO, self.timeout * 1000)
+                socket.connect(f"tcp://127.0.0.1:{cand_port}")
+                try:
+                    if cand_port in _PERSISTENT_DECODER_BRIDGES:
+                        bridge_id, store, bridge = _PERSISTENT_DECODER_BRIDGES[
+                            cand_port
+                        ]
+                    else:
+                        store = dist.TCPStore(
+                            "127.0.0.1",
+                            0,
+                            2,
+                            True,
+                            timeout=timedelta(seconds=self.timeout),
+                            wait_for_workers=False,
+                        )
+                        bridge_id = uuid.uuid4().hex
+                        socket.send_json(
+                            dict(
+                                op="bridge_open",
+                                bridge_id=bridge_id,
+                                bridge_port=store.port,
+                            )
+                        )
+                        b_reply = socket.recv_json()
+                        if not isinstance(b_reply, dict) or not b_reply.get("ok"):
+                            raise RuntimeError(self._failure_message())
+                        bridge = bridge_group(store, 0, timeout_seconds=self.timeout)
+                        _PERSISTENT_DECODER_BRIDGES[cand_port] = (
+                            bridge_id,
+                            store,
+                            bridge,
+                        )
+                    socket.send_json(
+                        dict(
+                            op="open",
+                            session=self.token,
+                            bridge_id=bridge_id,
+                            capacity_latents=self.capacity_latents,
+                            **({"auto_output": True} if self.auto_output else {}),
+                            **(
+                                {"output_session": self.output_session}
+                                if self.output_session
+                                else {}
+                            ),
+                        )
+                    )
+                    reply = socket.recv_json()
+                    if isinstance(reply, dict) and reply.get("ok"):
+                        self.output_attachment = reply.get("output_attachment")
+                        self.oneway = self.oneway and bool(
+                            self.output_attachment and reply.get("oneway_supported")
+                        )
+                        self.port = cand_port
+                        self.socket = socket
+                        self.store = store
+                        self.bridge = bridge
+                        self.channel = reply["channel"]
+                        return
+                    if isinstance(reply, dict) and reply.get("code") == "DECODER_BUSY":
+                        socket.close()
+                        last_error = RuntimeError("Decoder is busy")
+                        continue
+                    _PERSISTENT_DECODER_BRIDGES.pop(cand_port, None)
+                    raise RuntimeError(self._failure_message())
+                except BaseException as exc:
+                    _PERSISTENT_DECODER_BRIDGES.pop(cand_port, None)
+                    socket.close()
+                    last_error = exc
+            raise last_error or RuntimeError(self._failure_message())
         except BaseException as error:
-            # Reported by the first pop on every DiT rank, like a later failure.
             self.failure = error
 
     def _request(self, op, **fields):
@@ -142,7 +479,18 @@ class RemoteLynnDecoder:
         else:
             identity = dict(channel=self.channel)
         try:
-            self.socket.send_json(dict(op=op, **identity, **fields))
+            self.socket.send_json(
+                dict(
+                    op=op,
+                    **identity,
+                    **fields,
+                    **(
+                        {"worker_group_id": self.connection["group_id"]}
+                        if self.connection is not None
+                        else {}
+                    ),
+                )
+            )
             reply = self.socket.recv_json()
         except BaseException as error:
             self.failure = error
@@ -154,6 +502,8 @@ class RemoteLynnDecoder:
     def append(self, latent, *, latent_start, source_dependency_end, valid_frame_end):
         if self.closed or self.total_frames is not None:
             raise ValueError("Decoder stream is closed")
+        if self.auto_output and self._pending_output is not None:
+            raise ValueError("Consume the preceding decoder output before appending")
         count = check_latent_append(
             latent=latent,
             latent_start=latent_start,
@@ -176,19 +526,47 @@ class RemoteLynnDecoder:
             self.socket.send_json(
                 dict(
                     op="append",
+                    **(
+                        {"worker_group_id": self.connection["group_id"]}
+                        if self.connection is not None
+                        else {}
+                    ),
+                    **({"oneway": True} if self.oneway else {}),
                     channel=self.channel,
                     shape=[int(n) for n in latent.shape],
                     dtype=str(latent.dtype).split(".")[-1],
                     latent_start=latent_start,
                     valid_frame_end=valid_frame_end,
                     source_dependency_end=source_dependency_end,
+                    **(
+                        {"output_metadata": self.output_metadata}
+                        if self.output_attachment
+                        else {}
+                    ),
+                    **(
+                        dict(
+                            request_id=self.request_id,
+                            chunk_index=self.chunk_index,
+                            generation_id=self.generation_id,
+                        )
+                        if self.auto_output
+                        else {}
+                    ),
                 )
             )
             # The decoder allocates from this metadata before posting its receive.
             send_latent(self.bridge, latent, peer=1)
+            if self.oneway:
+                # Preserve ownership until NCCL has finished reading this tensor.
+                # This is transport completion, not Decoder model completion.
+                if latent.is_cuda:
+                    torch.cuda.current_stream(latent.device).synchronize()
+                return
             reply = self.socket.recv_json()
             if not isinstance(reply, dict) or not reply.get("ok"):
                 raise RuntimeError("Decoder service rejected the latent")
+            if self.auto_output:
+                self._pending_output = reply
         except BaseException as error:
             self.failure = error
 
@@ -208,26 +586,40 @@ class RemoteLynnDecoder:
             raise ValueError("Provenance must match decoded pixels and dependency")
         frames = end - self.emitted_frames
         reference = metadata = None
-        if self.leader and self.failure is None:
+        if self.leader and self.failure is None and not self.oneway:
             try:
-                reply = self._request(
-                    "output",
-                    frames=frames,
-                    request_id=self.request_id,
-                    chunk_index=self.chunk_index,
-                    generation_id=self.generation_id,
+                reply = (
+                    (self._pending_output or {})
+                    if self.auto_output
+                    else self._request(
+                        "output",
+                        frames=frames,
+                        request_id=self.request_id,
+                        chunk_index=self.chunk_index,
+                        generation_id=self.generation_id,
+                    )
                 )
                 reference, metadata = reply.get("reference"), reply.get("metadata")
-                if bool(frames) != isinstance(reference, dict):
+                self._pending_output = None
+                if self.output_attachment:
+                    if frames and (
+                        reference is not None or reply.get("output_queued") is not True
+                    ):
+                        raise ValueError("Decoder did not accept direct output")
+                elif bool(frames) != isinstance(reference, dict):
                     raise ValueError("Remote decoder output reference is invalid")
             except BaseException as error:
                 self.failure = error
         # Only the failure flag crosses ranks: a reference reaching a non-output
         # rank would be cancelled there as an unsent result.
         status = [self.failure is not None]
-        dist.broadcast_object_list(
-            status, src=self.group.ranks[0], group=self.group.cpu_group
-        )
+        if getattr(self.group, "world_size", 2) > 1 or (
+            getattr(self.group, "cpu_group", None) is not None
+            and not hasattr(self.group, "unique_name")
+        ):
+            dist.broadcast_object_list(
+                status, src=self.group.ranks[0], group=self.group.cpu_group
+            )
         if status[0]:
             self.closed = True
             raise RuntimeError(self._failure_message()) from self.failure
@@ -245,6 +637,30 @@ class RemoteLynnDecoder:
             transport_metadata=metadata,
         )
 
+    def source_progress(self, *, owned_frame_end, source_records):
+        if self.output_attachment and self.leader:
+            fields = dict(
+                generation_id=self.output_session["generation_id"],
+                owned_frame_end=owned_frame_end,
+                source_records=source_records,
+            )
+            if self.oneway:
+                self.socket.send_json(
+                    dict(
+                        op="source_progress",
+                        channel=self.channel,
+                        oneway=True,
+                        **fields,
+                        **(
+                            {"worker_group_id": self.connection["group_id"]}
+                            if self.connection is not None
+                            else {}
+                        ),
+                    )
+                )
+            else:
+                self._request("source_progress", **fields)
+
     def finish(self, *, total_frames):
         if self.closed or self.total_frames is not None:
             raise ValueError("Decoder stream is already closed")
@@ -260,7 +676,29 @@ class RemoteLynnDecoder:
                 self.failure = error
 
     def dispose(self):
+        if self._pending_output is not None:
+            reference = self._pending_output.get("reference")
+            if reference is not None:
+                from sglang.multimodal_gen.runtime.utils.realtime_video import (
+                    cancel_async_raw_rgb_frame_reference,
+                )
+
+                cancel_async_raw_rgb_frame_reference(reference)
+            self._pending_output = None
         if self.leader and self.context is not None:
+            if self.oneway and self.failure is None:
+                # Keep abort behind all previously sent append/progress commands.
+                # A fresh REQ peer could overtake queued DEALER data, leaving
+                # stale commands to hit the next session after its owner closes.
+                try:
+                    self._request("abort")
+                except RuntimeError:
+                    self.failure = RuntimeError("Decoder teardown failed")
+                else:
+                    self.closed = True
+                    self._close_channel()
+                    self.provenance_for = None
+                    return
             # A receive timeout leaves REQ waiting for its old reply. A fresh
             # channel can still release this owner after that reply is sent.
             self._close_socket()
@@ -268,9 +706,19 @@ class RemoteLynnDecoder:
             socket.setsockopt(zmq.LINGER, 0)
             socket.setsockopt(zmq.RCVTIMEO, min(self.timeout, 1) * 1000)
             socket.setsockopt(zmq.SNDTIMEO, min(self.timeout, 1) * 1000)
-            socket.connect(f"tcp://127.0.0.1:{self.port}")
+            socket.connect(f"tcp://{self.host}:{self.port}")
             try:
-                socket.send_json(dict(op="abort", session=self.token))
+                socket.send_json(
+                    dict(
+                        op="abort",
+                        session=self.token,
+                        **(
+                            {"worker_group_id": self.connection["group_id"]}
+                            if self.connection is not None
+                            else {}
+                        ),
+                    )
+                )
                 socket.recv_json()
             except zmq.ZMQError:
                 pass
