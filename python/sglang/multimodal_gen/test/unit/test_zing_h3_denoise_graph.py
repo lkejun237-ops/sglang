@@ -2066,7 +2066,10 @@ def test_low_level_kv_cache_defaults_to_after_step0():
     assert ZingH3KVCache(1).window_eviction_timing == "after_step0"
 
 
-def test_init_prefix_prepare_failure_agrees_before_next_collective(model, monkeypatch):
+@pytest.mark.parametrize("stable_shapes", [False, True])
+def test_init_prefix_prepare_failure_agrees_before_next_collective(
+    model, monkeypatch, stable_shapes
+):
     from concurrent.futures import ThreadPoolExecutor
     from copy import copy
     from threading import Barrier
@@ -2099,7 +2102,11 @@ def test_init_prefix_prepare_failure_agrees_before_next_collective(model, monkey
     original = ZingH3DiTModel.prepare_fixed_forward
 
     def fail_prefix(self, **kwargs):
-        if comm.thread.rank == 0 and kwargs["phase"] == "prefix":
+        prefix = (
+            kwargs["phase"] == "prefix"
+            or kwargs["packed"].get("_zing_joint_phases", (None,))[0] == "prefix"
+        )
+        if comm.thread.rank == 0 and prefix:
             raise RuntimeError("injected prefix plan failure")
         return original(self, **kwargs)
 
@@ -2114,6 +2121,7 @@ def test_init_prefix_prepare_failure_agrees_before_next_collective(model, monkey
     # This fault injection exercises admitted SP graphs, independent of env defaults.
     for rank_model in rank_models:
         rank_model.denoise_graph_sp = True
+        rank_model.experimental_stable_shapes = stable_shapes
     monkeypatch.setattr(zing_h3, "get_tp_world_size", lambda: 1)
 
     @torch.no_grad()
@@ -2999,8 +3007,69 @@ def test_block0_provider_routes_start_and_prompt_cycle(
     assert metrics[-1]["cached_prefix_hits"] == 1 + int(warm_start)
     assert metrics[-1]["cached_prefix_misses"] == 1 + int(not warm_start)
     assert metrics[-1]["forward_counts"]["prompt_joint"] == 2
-    assert metrics[-1]["forward_counts"]["prefix"] == int(not warm_start)
+    assert metrics[-1]["forward_counts"]["prefix"] == 0
+    assert metrics[-1]["forward_counts"].get("initial_joint", 0) == int(not warm_start)
     assert "case-A" in owners[0].entries
+
+
+@pytest.mark.parametrize("reference", [False, True])
+@pytest.mark.parametrize("route", ["step", "drain", "graph"])
+@pytest.mark.parametrize("initial_joint", [False, True])
+def test_initial_prefix_joint_matches_serial_cache(
+    model, monkeypatch, reference, route, initial_joint
+):
+    """Compare the real session entry, latent and every live raw KV row."""
+    if reference:
+        monkeypatch.setattr(model.arch, "ar_condition_timestep", 0.875)
+        monkeypatch.setattr(model.arch, "reference_visual_timestep", 0.999)
+    options = dict(batches=(1, 1, 1), reference=reference, use_step=route == "step")
+    expected = _run_ready_chunks(model, monkeypatch, joint_forward="off", **options)
+    monkeypatch.setenv(
+        "SGLANG_ZING_INITIAL_PREFIX_JOINT", "1" if initial_joint else "0"
+    )
+    metrics = []
+
+    def observe(session, *_):
+        if session.sampler is not None:
+            metrics.append(dict(session.sampler._forward_counts))
+
+    owner = None
+    storage = _storage(model)
+    if route == "graph":
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+            ZingChunkGraphs,
+        )
+
+        owner = ZingChunkGraphs(backend=RecordingGraphBackend(), max_graphs=16)
+    first_fixed = None
+    # Repeat a fresh session to cover initial warmup, capture and replay.
+    for _ in range(3 if owner is not None else 1):
+        actual = _run_ready_chunks(
+            model,
+            monkeypatch,
+            graph_owner=owner,
+            storage=storage,
+            yield_hook=observe,
+            **options,
+        )
+        torch.testing.assert_close(actual[0], expected[0], atol=0.02, rtol=0.02)
+        if first_fixed is None:
+            first_fixed = actual[0].clone()
+        else:
+            assert torch.equal(actual[0], first_fixed)
+        for got, want in zip(actual[1], expected[1], strict=True):
+            assert got[0] == want[0]
+            assert [(c[0], c[1]) for c in got[1]] == [(c[0], c[1]) for c in want[1]]
+            for (gk, gv), (wk, wv) in zip(got[2], want[2], strict=True):
+                torch.testing.assert_close(gk, wk, atol=0.02, rtol=0.02)
+                torch.testing.assert_close(gv, wv, atol=0.02, rtol=0.02)
+    assert metrics and all(
+        m["prefix"] == (0 if initial_joint else 1)
+        and m.get("initial_joint", 0) == int(initial_joint)
+        for m in metrics
+    )
+    if owner is not None:
+        assert owner.routes["init", "replay"] > 0, owner.routes
 
 
 @pytest.mark.parametrize(

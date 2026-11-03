@@ -1031,6 +1031,12 @@ PR #414 将 `seedleap-kernels` 的前序融合算子接入 Zing H3 DiT 主循环
 2026-10-28，#417 对齐 main `387f693f30`（已含 #410、#415、#430、#437、#438、#440、#442），保留 Source 调度增量及 Disaggregation 角色配置；Source adapter 的双方新增测试均保留。历史播放指标与 GPU 数据不变，本次未重跑 GPU；以上结果不代表最新 main 整合版本的性能验收。
 
 
+### 首次 prefix 联合执行（forward已测，服务收益待验证）
+
+SourceReadySession 的视频 few-step 联合模式将首次未命中的 condition prefix、source、target step0 合并为三分支 forward；Graph 初始化同样使用一个联合计划。独立环境变量 `SGLANG_ZING_INITIAL_PREFIX_JOINT` 默认 `1`；设为 `0` 仅恢复首次独立 prefix + source/target 联合，其他联合配置保持各自作用。命中已有 prefix 时继续直接复用，关闭联合、CFG、音频或不支持布局时保留串行。指标新增 `initial_joint`，不再把这次调用计入独立 `prefix`。设计与验证边界见 [首次联合方案](/docs/sglang-diffusion/zing/plans/INITIAL_PREFIX_JOINT_FORWARD)。2026-10-29，`be7f1f7a6c` 在上海 L20Z/SM90 两卡 SP2、W6/S3、真实 condition/reference/source 首 latent 上完成 forward A/B：480 的 eager/Graph 中位数从 1112.86/1110.69 ms 降至 657.03/674.51 ms，736 从 1173.94/1172.55 ms 降至 712.92/734.37 ms；首步预测及全部 50 层 condition/source KV 逐位一致。736 复用同一份 480 condition；KV 槽仅容纳首次事务，计时不含准备/编码/Graph 捕获。完整服务端到端、后续多步、最终 RGB 和各组件独立显存仍未验证，不能据此判断完整 736 服务容量。
+
+2026-10-30（10-31回读），`aae0f99d85` 在同一原step2500模型、单case、四卡E1+SP2+D1、W6/S3、Block0 cache/Graph均关闭下完成480服务A/B（各臂1次预热、1次正式、另1次诊断）。首次联合实际命中，但正式TTFF为2.032→3.476s、全程FPS19.070→17.482，尚未证明整请求收益；诊断轮不同口径的数据不能替换正式结果。736在KV池预分配时OOM，无有效请求。受测输入、逐rank采样显存、未测项与归档入口见[首次联合方案](/docs/sglang-diffusion/zing/plans/INITIAL_PREFIX_JOINT_FORWARD)末节；不把历史两卡forward加速外推为当前服务净收益，PR保留draft。
+
 
 ### Source 480、输出 736 的独立尺寸验证
 

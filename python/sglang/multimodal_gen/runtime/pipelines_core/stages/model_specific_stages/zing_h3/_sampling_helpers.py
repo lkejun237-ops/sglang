@@ -248,7 +248,7 @@ class ZingBlockSamplingHelpers:
             cache,
             int(layout["block_idx"][-1]),
             phase="joint_precheck",
-            cross=len(phases) == 3,
+            cross=phases[0] == "final",
             joint_eligible=unsupported is None and error is None,
             required_rows=int(layout["block_idx"].numel()),
             precheck_error=error is not None,
@@ -267,7 +267,9 @@ class ZingBlockSamplingHelpers:
         packed["_zing_joint_phases"] = phases
         video, _ = self._forward(packed, cache, "joint")
         kind = (
-            "source_first"
+            "initial_joint"
+            if tuple(phases) == ("prefix", "source", "active")
+            else "source_first"
             if len(phases) == 2
             else "prompt_joint"
             if len(phases) in (5, 6)
@@ -335,7 +337,10 @@ class ZingBlockSamplingHelpers:
             }.get(update, update)
             if update == "joint":
                 kind = (
-                    "source_first"
+                    "initial_joint"
+                    if tuple(packed["_zing_joint_phases"])
+                    == ("prefix", "source", "active")
+                    else "source_first"
                     if len(packed["_zing_joint_phases"]) == 2
                     else "prompt_joint"
                     if len(packed["_zing_joint_phases"]) in (5, 6)

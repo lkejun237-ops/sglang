@@ -822,6 +822,75 @@ class SourceReadySession:
             self._cached_prefix_ready = self._load_prefix(self.inputs, prompt, prefix)
         return current, origin
 
+    def _initial_prediction(self, current, prompt):
+        """Join an uncached initial condition with source and target step0."""
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3 import get_ulysses_ctx
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3_joint import (
+            INITIAL_PREFIX_PHASES,
+        )
+
+        sampler, cache = self.sampler, self.cache
+        source, target, *_ = current.spans[0]
+        if (
+            not sampler.initial_prefix_joint
+            or prompt is self.applied_prompt
+            or self._cached_prefix_ready
+            or self.restore_initial_prefix is not None
+            or self._pending_prefix is not None
+            or cache.prefix is not None
+            or cache.last_block != 0
+            or cache.active is not None
+            or (source, target) != (1, 2)
+            or sampler.solver != "few_step"
+            or not sampler._has_block(current.positive, 0)
+            or (
+                get_ulysses_ctx()[0] > 1
+                and not sampler.generator.experimental_stable_shapes
+            )
+        ):
+            return None
+        if not sampler._joint_eligible(
+            current.positive, cache, source, target, current.audio
+        ):
+            return None
+        sampler._precheck_initial_prefix(cache, current.positive, source, target)
+        packs = error = None
+        try:
+            vs, _ = (
+                sampler.schedules_for(current)
+                if hasattr(sampler, "schedules_for")
+                else (sampler.video_scheduler, sampler.audio_scheduler)
+            )
+            packs = [
+                sampler._select_block(
+                    current.positive, 0, phase="prefix", video_t=1, audio_t=1
+                ),
+                sampler._select_block(
+                    current.positive, source, phase="source", video_t=1, audio_t=None
+                ),
+                sampler._select_block(
+                    current.positive,
+                    target,
+                    phase="target",
+                    video_t=sampler._host_list(vs.timesteps)[0],
+                    audio_t=None,
+                ),
+            ]
+        except Exception as failure:
+            error = failure
+        sampler._agree_sp_boundary(
+            cache,
+            target,
+            phase="initial_joint_prepare",
+            precheck_error=error is not None,
+            local_error=error,
+        )
+        if error is not None:
+            raise error
+        return sampler._predict_joint(
+            packs, INITIAL_PREFIX_PHASES, current.visual.shape[2:], cache
+        )
+
     def _apply_prefix(self, current, prompt):
         if prompt is self.applied_prompt:
             return
@@ -893,9 +962,11 @@ class SourceReadySession:
         prompt = self.prompt
         current, origin = self._prepare(ready, prompt, self.media_origin)
         with self.rng.random_stream(self.sampler.device, self.seed):
-            self._apply_prefix(current, prompt)
+            first = self._initial_prediction(current, prompt)
+            if first is None:
+                self._apply_prefix(current, prompt)
             if self._pending_prefix is None:
-                self.sampler.step(current)
+                self.sampler.step(current, first_prediction=first)
             else:
                 first = self._prefix_prediction(current, False)
                 self.sampler.step(current, first_prediction=first)
@@ -965,7 +1036,10 @@ class SourceReadySession:
                     if cold_init:
                         first = graphs.initialization(sampler, current)
                     else:
-                        self._apply_prefix(current, prompt)
+                        if first is None:
+                            first = self._initial_prediction(current, prompt)
+                        if first is None:
+                            self._apply_prefix(current, prompt)
                     # A prompt rebuild has already cleared the old active block.
                     # Otherwise its values are the tail of the existing history.
                     if (

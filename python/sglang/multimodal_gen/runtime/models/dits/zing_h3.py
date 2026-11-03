@@ -57,6 +57,7 @@ from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
     ZingDenoiseGraphs,
 )
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_joint import (
+    PrefixJointTransaction,
     joint_transaction,
     prefix_modulation,
 )
@@ -1461,7 +1462,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             )
             row_start, row_stop = layout.row_start, layout.row_stop
             group_sizes = video_ends = None
-            prefix_joint = joint is not None and len(joint.ends) in (5, 6)
+            prefix_joint = isinstance(joint, PrefixJointTransaction)
             if prefix_joint:
                 if ulysses_size > 1 and not self.experimental_stable_shapes:
                     raise ValueError("Prompt joint SP requires stable output shapes")
@@ -1805,7 +1806,9 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         )
         unique_t, t_indices = torch.unique(host_t, sorted=True, return_inverse=True)
         group_sizes = video_ends = None
-        prefix_joint = joint and len(ends) in (5, 6)
+        prefix_joint = joint and (
+            packed["_zing_joint_phases"][0] == "prefix" or len(ends) == 5
+        )
         if prefix_joint:
             if size > 1 and not self.experimental_stable_shapes:
                 raise ValueError("Prompt joint SP requires stable output shapes")

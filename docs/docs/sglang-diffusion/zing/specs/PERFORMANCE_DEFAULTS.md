@@ -19,6 +19,7 @@ Block0 cache 沿用 #455 的默认 on 和 host/disk 字节预算，旧 overlap/e
 | `FA4_FIXED` | 已验证 480p 固定槽路径为 `1` | 最佳分段 FA：Q390/780 使用 fixed Q + GPU KV 有效长度；Q1170 保留 varlen；`0` 回退全 varlen |
 | `GROUPED_HISTORY_ROPE` | `1`（本次开启） | 多片段 grouped 处理；`contiguous` 是替代模式 |
 | `CHUNK_ROPE_REUSE` | `1`（本次开启） | 按 chunk 复用未失效的历史 RoPE |
+| `INITIAL_PREFIX_JOINT` | `1` | 首次未命中时联合 condition/source/target step0；`0` 仅恢复独立 prefix + source/target 联合，仍受视频/joint mode/布局准入限制 |
 | `HISTORY_ROPE_PLAN` | `0` | 跨层复用 forward metadata；现有实测无稳定额外收益 |
 | `EXPERIMENTAL_ATTENTION` | `fa4` | 已默认使用 FA4 |
 | `EXPERIMENTAL_STABLE_SHAPES` | `1` | 已开启稳定形状 |

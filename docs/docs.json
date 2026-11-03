@@ -1645,6 +1645,7 @@
                       "docs/sglang-diffusion/zing/architecture",
                       "docs/sglang-diffusion/zing/realtime-streaming",
                       "docs/sglang-diffusion/zing/specs/configurable-step-lists",
+                      "docs/sglang-diffusion/zing/plans/INITIAL_PREFIX_JOINT_FORWARD",
                       {
                         "group": "API Proposals",
                         "pages": [

@@ -129,6 +129,7 @@ class ZingJointTransaction:
             raise
 
 
+INITIAL_PREFIX_PHASES = ("prefix", "source", "active")
 PREFIX_PHASES = ("prefix", "history", "history", "history", "source", "active")
 CACHED_PREFIX_PHASES = PREFIX_PHASES[1:]
 
@@ -136,11 +137,13 @@ CACHED_PREFIX_PHASES = PREFIX_PHASES[1:]
 class PrefixJointTransaction:
     def __init__(self, cache, phases, positions, blocks, roles, t, clean):
         if (
-            tuple(phases) not in (PREFIX_PHASES, CACHED_PREFIX_PHASES)
+            tuple(phases)
+            not in (INITIAL_PREFIX_PHASES, PREFIX_PHASES, CACHED_PREFIX_PHASES)
             or not cache.raw_store
             or cache.local_frames != -1
         ):
             raise ValueError("Prompt joint requires the raw prefix/history contract")
+        initial = tuple(phases) == INITIAL_PREFIX_PHASES
         cached = tuple(phases) == CACHED_PREFIX_PHASES
         if (
             (cache.prefix is None if cached else cache.prefix is not None)
@@ -153,8 +156,13 @@ class PrefixJointTransaction:
                 "Prompt joint requires an empty or restored prefix-only cache"
             )
         ids, counts = torch.unique_consecutive(blocks, return_counts=True)
-        if ids.tolist() != ([2, 4, 6, 7, 8] if cached else [0, 2, 4, 6, 7, 8]):
-            raise ValueError("Expected prefix, history 1+2+2, source7 and target8")
+        expected = (
+            [0, 1, 2]
+            if initial
+            else ([2, 4, 6, 7, 8] if cached else [0, 2, 4, 6, 7, 8])
+        )
+        if ids.tolist() != expected:
+            raise ValueError(f"Expected joint block sequence {expected}")
         self.branches = []
         start = 0
         for phase, count in zip(phases, counts.tolist()):
@@ -172,12 +180,11 @@ class PrefixJointTransaction:
                 raise ValueError("History and source must be clean")
             self.branches.append(JointBranch(phase, start, stop, frames))
             start = stop
-        history_branches = self.branches[:3] if cached else self.branches[1:4]
-        if [b.frames for b in history_branches] != [
-            1,
-            2,
-            2,
-        ] or clean != self.branches[-1].start:
+        history_branches = self.branches[:3] if cached else self.branches[1:-2]
+        expected_history = [] if initial else [1, 2, 2]
+        if [
+            b.frames for b in history_branches
+        ] != expected_history or clean != self.branches[-1].start:
             raise ValueError("Incorrect clean history or active boundary")
         # Prefix coordinates stay absolute. All media use the same mapping as
         # after the sequential prefix commit. Verify every branch's view before
@@ -220,7 +227,9 @@ class PrefixJointTransaction:
                 check = None if validation is None else tuple(v[s] for v in validation)
                 phase = b.phase
                 if phase == "source":
-                    cache.begin_chunk(8)
+                    cache.begin_chunk(
+                        int((blocks if validation is None else validation[1])[s][0]) + 1
+                    )
                 if phase == "history":
                     cache.update(
                         positions[s], blocks[s], "active", b.frames, validation=check
@@ -242,7 +251,7 @@ class PrefixJointTransaction:
 def joint_transaction(cache, phases, positions, blocks, roles, t, clean):
     transaction = (
         PrefixJointTransaction
-        if tuple(phases) in (PREFIX_PHASES, CACHED_PREFIX_PHASES)
+        if tuple(phases) in (INITIAL_PREFIX_PHASES, PREFIX_PHASES, CACHED_PREFIX_PHASES)
         else ZingJointTransaction
     )
     return transaction(cache, phases, positions, blocks, roles, t, clean)

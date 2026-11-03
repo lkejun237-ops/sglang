@@ -592,10 +592,11 @@ class ZingChunkGraphs:
             positions,
             ends=ends,
             clean_rows=clean,
-            prefix=phase == "prefix" or (transaction is not None and len(ends) == 6),
+            prefix=phase == "prefix"
+            or (transaction is not None and transaction.branches[0].phase == "prefix"),
             after=after,
         )
-        if transaction is not None and len(ends) == 6:
+        if transaction is not None and transaction.branches[0].phase == "prefix":
             kv.tensors["current_positions"] = transaction.mapped_positions.to(
                 packed["x"].device
             )
@@ -695,7 +696,18 @@ class ZingChunkGraphs:
         )
 
     def _initial_prediction(self, sampler, current, *, kind, prefix, resume_packs=None):
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3 import get_ulysses_ctx
+
         source, target, _, _ = current.spans[0]
+        join_prefix = (
+            prefix
+            and sampler.initial_prefix_joint
+            and sampler._has_block(current.positive, 0)
+            and (
+                get_ulysses_ctx()[0] == 1
+                or sampler.generator.experimental_stable_shapes
+            )
+        )
         # Finish every host collective before local model preparation. A peer
         # whose prefix plan fails must meet the others at the status vote, never
         # a different chunk-begin collective.
@@ -719,13 +731,19 @@ class ZingChunkGraphs:
             shadow = current.cache.planning_copy()
             source, target, _, _ = current.spans[0]
             plans = []
+            initial_prefix = None
             if prefix:
                 if sampler._has_block(current.positive, 0):
                     packed = sampler._select_block(
                         current.positive, 0, phase="prefix", video_t=1, audio_t=1
                     )
-                    plans.append(self._forward_plan(sampler, shadow, packed, "prefix"))
-            if resume_packs is None:
+                    if join_prefix:
+                        initial_prefix = packed
+                    else:
+                        plans.append(
+                            self._forward_plan(sampler, shadow, packed, "prefix")
+                        )
+            if resume_packs is None and initial_prefix is None:
                 shadow.begin_chunk(target)
             vs, _ = self._schedules(sampler, current)
             if resume_packs is None:
@@ -752,6 +770,9 @@ class ZingChunkGraphs:
                 if resume_packs is None
                 else ("final", "source", "active")
             )
+            if initial_prefix is not None:
+                packs.insert(0, initial_prefix)
+                phases = ("prefix", "source", "active")
             packed = self._joint_packed(packs, phases)
             plans.append(
                 self._forward_plan(
@@ -765,7 +786,7 @@ class ZingChunkGraphs:
             )
             tensors = {
                 "source_x": packs[0]["x"]
-                if resume_packs is None
+                if resume_packs is None and initial_prefix is None
                 else torch.cat([p["x"] for p in packs[:-1]]),
                 "latent": current.visual,
             }
@@ -798,9 +819,14 @@ class ZingChunkGraphs:
         kv = plans[0].kv_plan
         outputs = self._run(kind, plans, tensors, execute, kv.stores, kv.rotated)
         current.cache.publish_plan(shadow)
-        sampler._forward_counts[
-            "source_first" if resume_packs is None else "cross_chunk"
-        ] += 1
+        kind = (
+            "initial_joint"
+            if join_prefix
+            else "source_first"
+            if resume_packs is None
+            else "cross_chunk"
+        )
+        sampler._forward_counts[kind] = sampler._forward_counts.get(kind, 0) + 1
         if len(plans) > 1:
             sampler._forward_counts["prefix"] += 1
         return outputs[0], None

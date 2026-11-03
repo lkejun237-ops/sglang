@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
     ZingKVCapacityError,
 )
 from sglang.multimodal_gen.runtime.realtime.zing_window import ZingWindowPolicy
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.multimodal_gen.runtime.utils.zing_diagnostics import current_diagnostic
 
@@ -94,6 +95,10 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             window_eviction_timing == "after_step0"
         )
         self.joint_forward = joint_forward
+        # Snapshot per sampler so eager and Graph choose the same initial route.
+        self.initial_prefix_joint = get_bool_env_var(
+            "SGLANG_ZING_INITIAL_PREFIX_JOINT", "true"
+        )
         for value in (ar_condition_timestep, reference_visual_timestep):
             if (
                 type(value) not in (int, float)

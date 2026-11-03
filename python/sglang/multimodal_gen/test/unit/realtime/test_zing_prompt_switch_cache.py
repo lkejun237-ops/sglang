@@ -431,9 +431,9 @@ def test_startup_a_switch_b_a_reuses_kv_and_preserves_outputs(
             else:
                 assert len(cache.entries) == 2 and cache.evictions == 0
             assert stage.encode_condition_for_batch.call_count == 1  # Only first B.
-            # Startup A is separate. Cold B joins six branches only when joint
-            # execution is enabled; subsequent A/B returns use restored KV.
-            assert prefix_calls == (1 if joint else 2)
+            # Startup A joins prefix/source/active. Cold B joins six branches;
+            # subsequent A/B returns use restored KV.
+            assert prefix_calls == (0 if joint else 2)
             if joint:
                 assert ready.metrics["cached_prefix_hits"] == 4
                 assert ready.metrics["cached_prefix_misses"] == 2
@@ -441,12 +441,13 @@ def test_startup_a_switch_b_a_reuses_kv_and_preserves_outputs(
                 assert switch_branches == [6, 5, 5, 5, 5]
             assert ready.cache.stats["store_allocations"] == 0
         else:
-            assert prefix_calls == (1 if joint else 6)
+            assert prefix_calls == (0 if joint else 6)
             if joint:
                 assert ready.metrics["forward_counts"]["prompt_joint"] == 5
                 assert switch_branches == [6, 6, 6, 6, 6]
         if not joint:
             assert switch_branches == []
+        assert ready.metrics["forward_counts"].get("initial_joint", 0) == int(joint)
         stage.kv_pool.acquire.assert_not_called()  # Switch keeps the original slot.
         ready.dispose()
         return results, snapshots, histories

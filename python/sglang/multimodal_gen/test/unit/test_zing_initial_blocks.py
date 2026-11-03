@@ -886,12 +886,13 @@ def test_static_ready_matches_resident_and_releases(static_mixed, mode, joint, c
         assert actual_steps == ([4, 4, 4, 2, 2] if count else [2] * 5)
         for s in (baseline, sampler):
             counts = s.last_run_metrics["forward_counts"]
+            assert counts.get("initial_joint", 0) == int(joint != "off")
             if joint == "cross_chunk" and mode == "drain":
                 # Includes the third -> fourth block boundary, not a fallback.
                 assert counts["cross_chunk"] == 4
-                assert counts["source_first"] == 1
+                assert counts["source_first"] == 0
             elif joint != "off":
-                assert counts["source_first"] == 5
+                assert counts["source_first"] == 4
                 assert counts["cross_chunk"] == 0
         assert table.hits > 0 and table.stats()["fallback"] == 0
     finally:
