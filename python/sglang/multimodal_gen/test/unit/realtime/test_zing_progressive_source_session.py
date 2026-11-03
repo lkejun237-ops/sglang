@@ -210,6 +210,52 @@ def batch(state, start, count, sequence, *, final=False):
     )
 
 
+@pytest.mark.parametrize("finish", ["dispose", "eos"])
+def test_dispose_logs_paged_block0_capacity_and_releases_state(monkeypatch, finish):
+    import json
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        source_session,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.preparation_cache import (
+        Block0PreparationCache,
+    )
+
+    state, stage = session(ChunkPlan([3, 2]))
+    # Exercise the real paged-cache layout without allocating pinned CUDA pages.
+    cache = Block0PreparationCache.__new__(Block0PreparationCache)
+    cache.mode, cache.pending = "on", None
+    cache.pages = torch.empty(2, 2, 3, 4, dtype=torch.bfloat16)
+    cache.entries = {}
+    cache.evictions = cache.hits = cache.misses = 0
+    state.block0_cache = cache
+    records = []
+    monkeypatch.setattr(
+        source_session.logger,
+        "info",
+        lambda message, payload, **kwargs: records.append(
+            (message, json.loads(payload))
+        ),
+    )
+
+    if finish == "eos":
+        state.run(stage, batch(state, 0, 3, 0))
+        result = state.run(stage, batch(state, 3, 0, 1, final=True))
+        assert result.usage["zing_source_complete"]
+        assert sum(value.shape[1] for value in result.output) == 3
+    else:
+        state.dispose()
+
+    receipt = next(
+        value for message, value in records if message == "zing_block0_cache %s"
+    )
+    assert (
+        receipt["cpu_capacity_bytes"]
+        == cache.pages.numel() * cache.pages.element_size()
+    )
+    assert state.closed and state.sampler is None and state.block0_cache is None
+
+
 @pytest.mark.parametrize("mode", ["clip17", "progressive"])
 @pytest.mark.parametrize("frames", range(1, 35))
 @pytest.mark.parametrize("partition", [[1], [2, 3, 1], [17]])

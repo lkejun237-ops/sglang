@@ -1471,8 +1471,8 @@ class ZingSourceStreamState(BaseRealtimeState):
                             restore_lead_host_ms=None
                             if transfer is None
                             else transfer.lead_ms,
-                            cpu_capacity_bytes=self.block0_cache.data.numel()
-                            * self.block0_cache.data.element_size(),
+                            cpu_capacity_bytes=self.block0_cache.pages.numel()
+                            * self.block0_cache.pages.element_size(),
                             ready=bool(self.block0_cache.entries),
                             entries=len(self.block0_cache.entries),
                             evictions=self.block0_cache.evictions,

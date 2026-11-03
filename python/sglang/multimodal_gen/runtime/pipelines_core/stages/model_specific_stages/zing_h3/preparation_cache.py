@@ -272,15 +272,18 @@ class Block0PreparationCache:
         self.finish_fill()
         local = self.entries.get(key)
         tier = "l1"
-        # Agree before IO: a partial L1 hit must take the same SP path.
+        # Partial L1 hits and unequal row counts must take the same SP disk path.
         if allow_disk:
-            present = coordinate_validation(local is not None)
-            if not all(present):
+            present = coordinate_validation(
+                None if local is None else int(local.positions.shape[0])
+            )
+            if present[0] is None or any(rows != present[0] for rows in present):
                 local = self._promote_from_disk(key, protected=protected)
                 tier = "l2"
-        votes = coordinate_validation((key, local is not None))
+        local_rows = None if local is None else int(local.positions.shape[0])
+        votes = coordinate_validation((key, local_rows))
         hit = local is not None and all(
-            digest == key and ready for digest, ready in votes
+            digest == key and rows == local_rows for digest, rows in votes
         )
         self.hits += int(hit)
         self.misses += int(not hit)
@@ -358,9 +361,13 @@ class Block0PreparationCache:
 
     def _promote_from_disk(self, key, *, protected=()):
         disk = self.disk_cache
-        if disk is None or not disk.is_enabled():
-            return None
         try:
+            # A failed disk lookup must not leave an old shard looking ready
+            # after another rank reloads to the same row count.
+            if key in self.entries:
+                self._release(key)
+            if disk is None or not disk.is_enabled():
+                return None
             cached = disk.lookup(key, disk.local_rank)
             if cached is None:
                 return None
@@ -735,14 +742,21 @@ class Block0PreparationCache:
     def status(self, keys=None):
         snapshots = coordinate_validation(
             (
-                list(self.entries),
+                {
+                    key: int(entry.positions.shape[0])
+                    for key, entry in self.entries.items()
+                },
                 self.free_pages.count(True),
                 self.total_pages,
                 self.page_bytes,
                 self.max_bytes,
             )
         )
-        resident = sorted(set.intersection(*(set(item[0]) for item in snapshots)))
+        resident = sorted(
+            key
+            for key, rows in snapshots[0][0].items()
+            if all(item[0].get(key) == rows for item in snapshots)
+        )
         selected = resident if keys is None else keys
         states = [{"cache_key": key, "ready": key in resident} for key in selected]
         return dict(

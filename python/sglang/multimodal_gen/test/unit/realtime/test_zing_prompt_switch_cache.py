@@ -91,9 +91,9 @@ def test_partial_sp_hit_falls_back(cpu_dma, monkeypatch):
     )
 
     owner = cpu_cache([NS(k=torch.zeros(8, 2, 3))])
-    owner.entries["A"] = NS(generation="A-generation")
+    owner.entries["A"] = NS(generation="A-generation", positions=torch.zeros(3, 3))
     monkeypatch.setattr(
-        preparation_cache, "coordinate_validation", lambda value: [value, ("A", False)]
+        preparation_cache, "coordinate_validation", lambda value: [value, ("A", None)]
     )
     assert owner.lookup("A") is None
     assert owner.hits == 0 and owner.misses == 1
@@ -159,6 +159,7 @@ def test_source_prefetch_checks_cache_before_rpc(
             inputs=state.inputs,
             conditioning_identity="cached-condition",
             generation="fixture",
+            positions=torch.zeros(3, 3),
         )
     state.sampler = NS(discard_pending_prompt=Mock(), update_prompt=Mock())
     state._admit_prompt_update = Mock(return_value="pool-request")
@@ -192,7 +193,7 @@ def test_source_prefetch_checks_cache_before_rpc(
             monkeypatch.setattr(
                 preparation_cache,
                 "coordinate_validation",
-                lambda value: [value, (value[0], False)],
+                lambda value: [value, (value[0], None)],
             )
         assert state._update_prompt(stage, batch) is None
         assert client.encode.call_count == int(scenario != "hit")
@@ -749,7 +750,7 @@ def test_dispose_drains_transfers_before_releasing_gpu_slot():
     state.block0_cache = NS(
         finish_fill=lambda: actions.append("fill"),
         mode="overlap",
-        data=torch.empty(0),
+        pages=torch.empty(0),
         entries={},
         hits=0,
         misses=0,

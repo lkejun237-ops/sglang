@@ -253,7 +253,9 @@ class Block0DiskCache:
                 if manifest is None
                 else manifest.get("geometry", {}).get("prefix_rows")
             )
-        except (OSError, ValueError, TypeError, AttributeError):
+        except Exception:
+            # Match lookup's best-effort disk reads, including JSON recursion
+            # failures. Every SP rank must reach the preload plan collective.
             return None
 
     def lookup(self, key, rank=None):

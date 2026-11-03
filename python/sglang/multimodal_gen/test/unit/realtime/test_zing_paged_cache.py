@@ -70,6 +70,38 @@ def conserved(cache):
     assert sorted(ids) == list(range(cache.total_pages))
 
 
+@pytest.fixture
+def sp_workers(monkeypatch):
+    """Run cache operations with matching two-rank CPU collectives."""
+
+    def run(caches, operation):
+        condition = threading.Condition()
+        rounds, local = {}, threading.local()
+
+        def collective(value):
+            step = getattr(local, "step", 0)
+            local.step = step + 1
+            with condition:
+                votes = rounds.setdefault(step, {})
+                votes[local.rank] = value
+                condition.notify_all()
+                assert condition.wait_for(lambda: len(votes) == 2, timeout=5), (
+                    "SP collective order diverged"
+                )
+                return [votes[rank] for rank in range(2)]
+
+        monkeypatch.setattr(preparation_cache, "coordinate_validation", collective)
+
+        def worker(rank):
+            local.rank = rank
+            return operation(caches[rank])
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            return list(executor.map(worker, range(2)))
+
+    return run
+
+
 @pytest.mark.parametrize("rows", [2047, 2048, 2049, 2 * 2048 + 13])
 @pytest.mark.parametrize("page_ids", [(0, 1, 2), (0, 1, 4), (0, 2, 4)])
 def test_nonadjacent_pages_preserve_order_and_exclude_tail(
@@ -322,12 +354,10 @@ def test_preload_read_failure_returns_all_pages(tmp_path, cpu_dma, monkeypatch):
 
 @pytest.mark.parametrize("missing_rank", [False, True])
 def test_sp_preflight_uses_identical_collective_order(
-    cpu_dma, monkeypatch, missing_rank
+    cpu_dma, sp_workers, missing_rank
 ):
     # Real rendezvous between two CPU workers: divergent early returns make the
     # peer's next collective time out, instead of silently passing a vote stub.
-    condition = threading.Condition()
-    rounds, local = {}, threading.local()
     caches = [owner(pages=3), owner(pages=3)]
     caches[0].entries["a"] = NS(positions=torch.zeros(8, 3))
     for rank, cache in enumerate(caches):
@@ -338,29 +368,89 @@ def test_sp_preflight_uses_identical_collective_order(
             ),
         )
 
-    def collective(value):
-        step = getattr(local, "step", 0)
-        local.step = step + 1
-        with condition:
-            votes = rounds.setdefault(step, {})
-            votes[local.rank] = value
-            condition.notify_all()
-            assert condition.wait_for(lambda: len(votes) == 2, timeout=5), (
-                "SP collective order diverged"
-            )
-            return [votes[rank] for rank in range(2)]
-
-    monkeypatch.setattr(preparation_cache, "coordinate_validation", collective)
-
-    def run(rank):
-        local.rank = rank
-        return caches[rank]._preload_plan(["a", "b"])
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        results = list(executor.map(run, range(2)))
+    results = sp_workers(caches, lambda cache: cache._preload_plan(["a", "b"]))
     assert results[0] == results[1]
     assert results[0] == (
         [0, 8] if missing_rank else [8, 8],
         2 if missing_rank else 4,
         3,
     )
+
+
+@pytest.mark.parametrize("disk_state", ["missing", "ready", "bad_conditions"])
+def test_preload_revalidates_different_l1_row_counts(
+    tmp_path, cpu_dma, sp_workers, disk_state
+):
+    from sglang.multimodal_gen.test.unit.realtime.test_zing_block0_cache_contract import (
+        disk,
+    )
+    from sglang.multimodal_gen.test.unit.realtime.zing_cache_fixtures import disk_commit
+
+    key = "a" * 64
+    writers = [disk(tmp_path, sp=2, rank=rank) for rank in range(2)]
+    caches = [
+        cpu_cache(
+            [NS(k=torch.zeros(16, 2, 2, dtype=torch.bfloat16)) for _ in range(2)],
+            rows=16,
+            entries=1,
+            page_rows=4,
+        )
+        for _ in range(2)
+    ]
+    for rank, cache in enumerate(caches):
+        fill(cache, key, 3 + 2 * rank)
+        cache.finish_fill()
+        cache.disk_cache = writers[rank]
+        if disk_state != "missing":
+            disk_commit(writers[rank], key, value=7, rows=5, rank=rank)
+    if disk_state == "bad_conditions":
+        # The sizing manifest is valid, but one rank cannot decode conditions.
+        # Its old five-row shard must not become ready when its peer loads five.
+        (writers[1]._entry_dir(key) / "rank-1" / "conditions.pt").write_bytes(b"bad")
+
+    # Online lookup must also reject the inconsistent L1 entry.
+    assert sp_workers(caches, lambda cache: cache.lookup(key)) == [None, None]
+    results = sp_workers(caches, lambda cache: cache.manage("preload", [key]))
+    ready = disk_state == "ready"
+    for cache, result in zip(caches, results):
+        assert result["all_ready"] is ready
+        assert result["selected"] == [{"cache_key": key, "ready": ready}]
+        assert result["results"] == [
+            {"cache_key": key, "status": "ready" if ready else "missing"}
+        ]
+        if ready:
+            assert cache.entries[key].positions.shape[0] == 5
+            assert torch.all(dense_kv(cache.entries[key].data) == 7)
+        conserved(cache)
+    if not ready:
+        assert sp_workers(caches, lambda cache: cache.lookup(key)) == [None, None]
+
+
+@pytest.mark.parametrize("one_rank_only", [False, True])
+def test_bad_preload_metadata_keeps_sp_collectives_and_other_keys(
+    tmp_path, cpu_dma, sp_workers, one_rank_only
+):
+    from sglang.multimodal_gen.test.unit.realtime.test_zing_block0_cache_contract import (
+        disk,
+    )
+
+    caches = [owner(pages=3), owner(pages=3)]
+    bad = "a" * 64
+    for rank, cache in enumerate(caches):
+        fill(cache, "good", 3)
+        cache.finish_fill()
+        cache.disk_cache = disk(tmp_path / str(rank), sp=2, rank=rank)
+        folder = cache.disk_cache._entry_dir(bad)
+        folder.mkdir(parents=True)
+        if rank == 0 or not one_rank_only:
+            (folder / "manifest.json").write_text("[" * 2000 + "0" + "]" * 2000)
+
+    results = sp_workers(caches, lambda cache: cache.manage("preload", [bad, "good"]))
+    for cache, result in zip(caches, results):
+        assert not result["all_ready"]
+        assert result["results"] == [
+            {"cache_key": bad, "status": "missing"},
+            {"cache_key": "good", "status": "ready"},
+        ]
+        assert result["cache_keys"] == ["good"]
+        conserved(cache)

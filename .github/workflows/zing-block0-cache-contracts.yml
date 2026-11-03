@@ -72,6 +72,7 @@ jobs:
             python -m pytest -c test/pytest.ini --rootdir=. --strict-config --strict-markers -v \
               python/sglang/multimodal_gen/test/unit/realtime/test_zing_prefill_api.py \
               python/sglang/multimodal_gen/test/unit/realtime/test_zing_progressive_source_session.py::test_block0_prefill_and_live_share_key_without_scheduling_policy \
+              python/sglang/multimodal_gen/test/unit/realtime/test_zing_progressive_source_session.py::test_dispose_logs_paged_block0_capacity_and_releases_state \
               --junitxml="artifacts/block0-cache/prefill-api-trial-${trial}.xml" \
               > "artifacts/block0-cache/prefill-api-trial-${trial}.log" 2>&1
           done

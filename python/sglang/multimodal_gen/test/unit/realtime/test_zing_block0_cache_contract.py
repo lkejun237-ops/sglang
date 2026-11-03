@@ -515,11 +515,12 @@ def test_l1_sp_votes_accept_equivalent_hits_and_reject_partial_or_wrong_key(
     from sglang.multimodal_gen.test.unit.realtime.zing_cache_fixtures import cpu_cache
 
     owner = cpu_cache([NS(k=torch.zeros(8, 2, 3))])
-    owner.entries["case"] = object()
+    owner.entries["case"] = NS(positions=torch.zeros(3, 3))
     for remote, expected in (
-        (("case", True), True),
-        (("case", False), False),
-        (("other", True), False),
+        (("case", 3), True),
+        (("case", None), False),
+        (("case", 5), False),
+        (("other", 3), False),
     ):
         monkeypatch.setattr(
             preparation_cache, "coordinate_validation", lambda vote: [vote, remote]
@@ -1008,7 +1009,7 @@ def test_preload_rechecks_actual_residency_and_sp_ready(tmp_path, cpu_dma, monke
 
     def loaded(key, **kwargs):
         owner.entries.clear()  # A previously successful load was evicted.
-        owner.entries[key] = object()
+        owner.entries[key] = NS(positions=torch.zeros(1, 3))
         return owner.entries[key]
 
     monkeypatch.setattr(owner, "lookup", loaded)
@@ -1019,7 +1020,7 @@ def test_preload_rechecks_actual_residency_and_sp_ready(tmp_path, cpu_dma, monke
     monkeypatch.setattr(
         preparation_cache,
         "coordinate_validation",
-        lambda value: [value, ([], *value[1:])],
+        lambda value: [value, ({}, *value[1:])],
     )
     assert not owner.status(["b"])["all_ready"]
 
@@ -1087,7 +1088,7 @@ def test_cache_lookup_and_eviction_logs_have_context_without_prompt(cpu_dma, cap
 
     caplog.set_level(logging.DEBUG)
     owner = cpu_cache([NS(k=torch.zeros(8, 2, 2))], rows=8, entries=1)
-    owner.entries["a"] = NS(page_ids=(0,), disk_task=None)
+    owner.entries["a"] = NS(page_ids=(0,), disk_task=None, positions=torch.zeros(1, 3))
     owner.free_pages[:] = [False] * owner.total_pages
     with cache_scope(
         operation_id="switch-a", session_id="session", event_id=3, game_id="game"
@@ -1350,7 +1351,7 @@ def test_paged_status_counts_pending_bytes_and_aggregates_sp(cpu_dma, monkeypatc
     monkeypatch.setattr(
         preparation_cache,
         "coordinate_validation",
-        lambda snapshot: [snapshot, ([], 5, 6, 128, 768)],
+        lambda snapshot: [snapshot, ({}, 5, 6, 128, 768)],
     )
     status = owner.status(["a"])
     assert status["free_pages"] == 4  # SP guarantee uses the minimum, not sum.
