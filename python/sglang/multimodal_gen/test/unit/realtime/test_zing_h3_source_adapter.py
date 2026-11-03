@@ -6,10 +6,12 @@ import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import msgspec.msgpack
 import pytest
 
+from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeVideoGenerationsRequest,
 )
@@ -22,6 +24,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session 
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_adapter import (
     RawRGBRealtimeOutputAdapter,
 )
+from sglang.multimodal_gen.runtime.realtime import zing_input_budget as budget
 from sglang.multimodal_gen.runtime.realtime.source_transport import (
     DEFAULT_MESSAGE_BYTES,
 )
@@ -74,6 +77,11 @@ def configured(tmp_path, monkeypatch):
         ),
     )
     monkeypatch.setattr(source, "get_global_server_args", lambda: args)
+    # These ingress tests do not ship a model export; real tokenizer loading and
+    # non-truncated counting are covered separately below in this module.
+    monkeypatch.setattr(
+        source, "count_prompt_tokens", lambda root, text: len(text.split())
+    )
     return args
 
 
@@ -134,6 +142,38 @@ def test_reference_capability_requires_supported_deployment(configured, split):
     _enable_reference_updates(configured, split=split)
     adapter, _ = initialize()
     assert adapter.ready["prompt_reference_updates"] is True
+
+
+@pytest.mark.parametrize("dispatched", [0, 1])
+def test_text_only_update_checks_reference_budget_before_and_after_dispatch(
+    configured, dispatched
+):
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.conditioning import (
+        release_api_media,
+    )
+
+    configured.pipeline_config.zing_condition_max_tokens = 2202
+    adapter, session = initialize(prompt="old", references=[_reference()])
+    adapter.dispatched_source_frames = dispatched
+    ws = PromptSocket()
+
+    async def run():
+        try:
+            await adapter.ingest_wire_event(
+                ws,
+                session,
+                dict(type="event", kind="prompt", event_id=1, payload="one two three"),
+                100,
+            )
+            assert ws.messages[-1]["code"] == "CONDITION_BUDGET_EXCEEDED"
+            assert ws.messages[-1]["fatal"] is False
+            assert adapter._pending_prompt_command["rejected"]
+            assert session.request.prompt == "old"
+        finally:
+            await adapter.close_conditioning(session)
+            release_api_media(session)
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize(
@@ -1698,6 +1738,9 @@ def test_configured_reference_count_init_update_and_ready(configured, limit):
     )
 
     configured.pipeline_config.zing_reference_max_images = limit
+    configured.pipeline_config.zing_condition_max_tokens = max(
+        50000, 1700 * limit + 1000
+    )
     _enable_reference_updates(configured)
     refs = [_reference(f"picture-{i}") for i in range(limit + 1)]
     adapter, session = initialize(references=refs[:limit])
@@ -2484,3 +2527,246 @@ def test_cli_joint_forward_overrides_profile(configured, monkeypatch, mode):
         assert json.loads(profile_path.read_text()) == profile
     finally:
         adapter.clear_state(session)
+
+
+@pytest.mark.parametrize(
+    "tokens,images,error",
+    [
+        (40000, 5, None),
+        (40001, 0, "CONDITION_PROMPT_TOO_LONG"),
+        (7000, 25, None),  # Exactly 50000 estimated condition tokens.
+        (7001, 25, "CONDITION_BUDGET_EXCEEDED"),
+        (39999, 25, "CONDITION_BUDGET_EXCEEDED"),
+        (1, 26, "CONDITION_REFERENCE_LIMIT"),
+        (30000, 0, None),  # Performance recommendation is not a rejection gate.
+    ],
+)
+def test_individual_and_combined_boundaries(tokens, images, error):
+    policy = budget.ZingInputBudget(max_references=25)
+    if error:
+        with pytest.raises(ConditionError) as caught:
+            policy.validate(tokens, images)
+        assert caught.value.code == error
+        assert caught.value.public_message.isascii()
+    else:
+        policy.validate(tokens, images)
+
+
+@pytest.mark.parametrize(
+    "name", ["zing_prompt_max_tokens", "zing_condition_max_tokens"]
+)
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, None])
+def test_invalid_deployment_budget(name, value):
+    with pytest.raises(ValueError, match=name):
+        budget.ZingInputBudget.from_config(SimpleNamespace(**{name: value}))
+
+
+def test_real_export_tokenizer_counts_without_truncation(tmp_path):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+    from transformers import PreTrainedTokenizerFast
+
+    native = Tokenizer(
+        WordLevel({"[UNK]": 0, "hello": 1, "world": 2, "你好": 3}, unk_token="[UNK]")
+    )
+    native.pre_tokenizer = WhitespaceSplit()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=native, unk_token="[UNK]", model_max_length=2
+    )
+    tokenizer.save_pretrained(tmp_path / "tokenizer")
+    (tmp_path / "model_index.json").write_text(
+        json.dumps({"tokenizer": ["transformers", "PreTrainedTokenizerFast"]})
+    )
+    budget._prompt_tokenizer.cache_clear()
+    try:
+        for prompt in ("hello world 你好", "你好 unknown world hello", ""):
+            assert budget.count_prompt_tokens(tmp_path, prompt) == len(
+                tokenizer.encode(prompt, add_special_tokens=False, truncation=False)
+            )
+        assert budget.count_prompt_tokens(tmp_path, "hello world 你好") == 3
+        assert budget._prompt_tokenizer.cache_info().misses == 1
+    finally:
+        budget._prompt_tokenizer.cache_clear()
+
+
+def test_missing_tokenizer_fails_closed(tmp_path):
+    with pytest.raises(ConditionError) as caught:
+        budget.count_prompt_tokens(tmp_path, "hello")
+    assert caught.value.code == "CONDITION_UNAVAILABLE"
+
+
+@pytest.mark.parametrize("reference_count", [0, 2])
+@pytest.mark.parametrize("outcome", ["applied", "failed", "waiting"])
+def test_api_prompt_budget_tracks_dispatched_reference_updates(
+    configured, monkeypatch, reference_count, outcome
+):
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.conditioning import (
+        release_api_media,
+    )
+
+    _enable_reference_updates(configured)
+    configured.pipeline_config.zing_condition_max_tokens = 5000
+    initial = [_reference(str(i)) for i in range(2 if reference_count == 0 else 0)]
+    adapter, session = initialize(prompt="old", references=initial)
+    ws = PromptSocket()
+
+    def prepare(self, session, args, chunk):
+        inputs = self.sample_chunk_inputs(session, args, chunk, 17)
+        return SimpleNamespace(
+            block_idx=1,
+            extra={},
+            realtime_event_id=self.prompt_event,
+            sampling_params=SimpleNamespace(prompt=inputs.prompt),
+        )
+
+    monkeypatch.setattr(
+        source.BaseRealtimeModelAdapter, "prepare_next_request", prepare
+    )
+    monkeypatch.setattr(
+        source.BaseRealtimeModelAdapter, "on_chunk_complete", lambda *a: None
+    )
+
+    async def run():
+        try:
+            await adapter.ingest_wire_event(
+                ws,
+                session,
+                dict(
+                    type="event",
+                    kind="prompt",
+                    event_id=1,
+                    payload="new",
+                    references=[_reference(str(i)) for i in range(reference_count)],
+                ),
+                100,
+            )
+            batch = adapter.prepare_next_request(session, configured, None)
+            assert "prompt_tokens" not in batch.extra["zing_prompt_update"]
+            adapter.on_chunk_complete(
+                session,
+                SimpleNamespace(
+                    usage={
+                        "zing_realtime_blocks": [{"event_id": 1}]
+                        if outcome == "applied"
+                        else []
+                    },
+                    conditioning_notice={"event_id": 1, "code": "CONDITION_INVALID"}
+                    if outcome == "failed"
+                    else None,
+                ),
+            )
+            await adapter.ingest_wire_event(
+                ws,
+                session,
+                dict(type="event", kind="prompt", event_id=2, payload="word " * 3000),
+                100,
+            )
+            if reference_count == 0 and outcome == "applied":
+                assert ws.messages[-1]["type"] == "control_ack"
+            else:
+                assert ws.messages[-1]["code"] == "CONDITION_BUDGET_EXCEEDED"
+        finally:
+            await adapter.close_conditioning(session)
+            release_api_media(session)
+
+    asyncio.run(run())
+
+
+def test_init_rejects_before_reference_decode(configured, monkeypatch):
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import conditioning
+
+    decode = Mock(side_effect=AssertionError("Image decoding must not start"))
+    monkeypatch.setattr(conditioning, "verify_presentation_upload", decode)
+    configured.pipeline_config.zing_condition_max_tokens = 2200
+    with pytest.raises(ConditionError) as caught:
+        initialize(prompt="hello", references=[_reference()])
+    assert caught.value.code == "CONDITION_BUDGET_EXCEEDED"
+    decode.assert_not_called()
+
+
+def test_api_update_rejection_supersedes_and_recovers(configured):
+    configured.pipeline_config.zing_condition_max_tokens = 2202
+    configured.pipeline_config.zing_prompt_max_tokens = 3
+    _enable_reference_updates(configured)
+    adapter, session = initialize(prompt="old")
+    ws = PromptSocket()
+
+    async def update(event_id, prompt, **fields):
+        await adapter.ingest_wire_event(
+            ws,
+            session,
+            dict(
+                type="event", kind="prompt", event_id=event_id, payload=prompt, **fields
+            ),
+            100,
+        )
+
+    async def run():
+        try:
+            await update(1, "two words", references=[_reference()])
+            previous = adapter._pending_reference_upload
+            assert ws.messages[-1]["type"] == "control_ack"
+            await update(2, "one two three four", prompt_tokens=0)
+            assert previous.items == []
+            assert adapter._pending_reference_upload is None
+            assert adapter._pending_prompt_command["rejected"]
+            assert ws.messages[-1]["code"] == "CONDITION_PROMPT_TOO_LONG"
+            assert ws.messages[-1]["fatal"] is False
+            assert ws.messages[-1]["event_id"] == 2
+            await update(3, "one two three", references=[_reference()])
+            assert ws.messages[-1]["code"] == "CONDITION_BUDGET_EXCEEDED"
+            await update(4, "one two three", references=[])
+            assert ws.messages[-1]["type"] == "control_ack"
+            assert adapter._pending_prompt_command["references"] == []
+            assert "prompt_tokens" not in adapter._pending_prompt_command
+            assert session.request.prompt == "old"
+            assert adapter.ready["input_budget"]["max_prompt_tokens"] == 3
+        finally:
+            await adapter.close_conditioning(session)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cli_override", [False, True])
+def test_budget_cli_overrides_pipeline_json(tmp_path, monkeypatch, cli_override):
+    import sys
+
+    import sglang.multimodal_gen.registry as registry
+    from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
+        ZingH3CausalPipelineConfig,
+    )
+    from sglang.multimodal_gen.runtime.server_args.server_args import (
+        ServerArgs,
+        prepare_server_args,
+    )
+
+    monkeypatch.setattr(
+        registry,
+        "get_model_info",
+        lambda *a, **k: SimpleNamespace(pipeline_config_cls=ZingH3CausalPipelineConfig),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ServerArgs, "__post_init__", lambda self: self._validate_batching()
+    )
+    path = tmp_path / "pipeline.json"
+    path.write_text(
+        json.dumps(dict(zing_prompt_max_tokens=2000, zing_condition_max_tokens=8000))
+    )
+    argv = ["--model-path", str(tmp_path), "--pipeline-config-path", str(path)]
+    if cli_override:
+        argv += [
+            "--zing-prompt-max-tokens",
+            "40000",
+            "--zing-condition-max-tokens=50000",
+        ]
+    monkeypatch.setattr(sys, "argv", ["sglang", *argv])
+    args = prepare_server_args(argv)
+    assert args.pipeline_config.zing_prompt_max_tokens == (
+        40000 if cli_override else 2000
+    )
+    assert args.pipeline_config.zing_condition_max_tokens == (
+        50000 if cli_override else 8000
+    )
+    assert args.pipeline_config.zing_reference_max_images == 21

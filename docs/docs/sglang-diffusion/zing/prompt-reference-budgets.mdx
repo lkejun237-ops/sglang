@@ -11,7 +11,7 @@ description: "根据 H200 两卡 DiT 实测，估算文本与参考图的性能�
 | --- | --- | --- |
 | 常用组合 | 5k 文本 token + 5 张参考图 | 实测 DiT 稳态 24.39 FPS |
 | DiT 约 20 FPS 的组合预算 | 文本 token + 1,700 × 图数 + 500 ≤ 25,600 | 根据实测拟合，组合边界未逐一验证 |
-| 每卡保留约 20 GiB 的容量预算 | 文本 ≤ 40k、图数 ≤ 25、实际完整 condition ≤ 50k，三项同时满足 | 部署准入建议，尚未作为服务校验实施 |
+| 每卡保留约 20 GiB 的容量预算 | 文本 ≤ 40k、图数 ≤ 25、估计完整 condition ≤ 50k，三项同时满足 | API 实施文本与估计组合预算；图数默认仍为 21，25 图需显式配置 |
 
 **实际请求还受当前服务的图数、Qwen conditioning 和 DiT KV 池容量限制。**
 例如 streaming reference 图数默认上限为 21；上表的 25 张不是当前入口已经放开的数量。
@@ -48,9 +48,9 @@ window21、Graph 默认开启等存在差异。当前默认测试模型还使用
 ```text
 T = 纯 prompt 文本的 tokenizer token 数
 R = reference 图数
-C = 实际完整 condition token 数
+C_est = 估计完整 condition token 数
 
-估算 C ≈ T + 1,700 × R + 500
+C_est = T + 1,700 × R + 500
 ```
 
 图片变大或预处理策略改变时，应以实际编码/packer 得到的完整行数为准。
@@ -94,10 +94,10 @@ T + 1,700 × R + 500 ≤ 25,600
 | --- | ---: |
 | 纯 prompt 文本 | 40,000 token |
 | Reference 数量 | 25 张 |
-| 实际完整 condition | 50,000 token |
+| 估计完整 condition（API 准入预算） | 50,000 token |
 
-**建议策略是任意一项超限即报错；本页没有新增这些校验。**
-不能同时取满 40k 文本和 25 张图；先检查文本与图数，再按实际编码后的完整 condition 检查容量。
+**任意一项超限即报错。连续 source API 已接入文本与组合预算，默认图数仍为 21。**
+不能同时取满 40k 文本和 25 张图；API 检查文本、图数和公式估计的组合预算，不计算实际编码后的完整 condition 行数。
 超过 25.6k 性能推荐边界、但满足容量限制的输入，仍可能运行，只是预计低于 20 FPS。
 
 依据：41k 文本 + 5 张图的实测完整 condition 为 49,860，
@@ -119,7 +119,44 @@ T + 1,700 × R + 500 ≤ 25,600
   参数含义见[KV 池容量字段](/docs/sglang-diffusion/zing/specs/PERFORMANCE_DEFAULTS#预分配-kv-池的容量字段)。
 
 先以服务的实际限制判断是否能接收，再用本页估算速度。
-本轮未验证服务入口直接接收 25 张图、40k 文本或 50k 完整 condition，也没有修改部署配置。
+历史专项未验证完整服务直接接收 25 张图、40k 文本或 50k 完整 condition。
+新增准入校验不扩容 Qwen 和 KV 池，也没有自动修改已部署服务。
+
+### API 校验和启动参数
+
+连续 source 的 init、prompt/reference 更新采用以下规则，等于边界可通过，超过即拒绝：
+
+```text
+T ≤ zing_prompt_max_tokens                          # 默认 40000
+R ≤ zing_reference_max_images                       # 默认 21
+T + 1700 × R + 500 ≤ zing_condition_max_tokens       # 默认 50000
+```
+
+T 由导出中的 tokenizer 对纯 prompt 计数，不添加特殊 token、不截断；不能使用字符数换算。
+API按上面的估算公式限制输入；小图也统一按每图1700计算，缩小图片不会降低这项估计预算。
+显式references（含空数组）按本次完整快照的张数检查。只更新prompt时，API使用已派发参考图的数量上界；
+参考图更新尚未产生对应输出时，先按新旧图数较大值检查，确认输出后再降低。
+失败、被覆盖或未输出的更新不会提前放宽额度；这时可提交显式完整references校验新组合。
+校验在准备图片、提交prefetch和派发前完成。后端编码、实际容量校验、KV缓存与推理路径沿用原有实现。
+
+在已有服务命令上添加以下参数，可采用前述 H200 两卡专项的容量预算；其他布局须自行核实容量：
+
+```bash
+--zing-prompt-max-tokens 40000 \
+--zing-reference-max-images 25 \
+--zing-condition-max-tokens 50000
+```
+
+例如 40k 文本 + 5 图的估算为 49k，可通过组合检查；10k + 25 图为 53k，拒绝；
+7k + 25 图恰好 50k，可通过API估算检查，后端已有服务容量限制仍生效。
+**25.6k 性能推荐线不作为默认报错条件。**
+
+`session.ready.input_budget` 返回实际预算及公式系数。
+初始输入不合规时拒绝会话；更新不合规时发送非致命错误并保留当前生成。
+错误码为 `CONDITION_PROMPT_TOO_LONG`、`CONDITION_REFERENCE_LIMIT` 或
+`CONDITION_BUDGET_EXCEEDED`，公开错误为英文，更新错误附带 `event_id`。
+参考图初始数量的既有校验和 Qwen/传输/KV 池错误仍保持自身错误规则。
+实现与验证边界见 [组合准入设计](/docs/sglang-diffusion/zing/plans/INPUT_TOKEN_ADMISSION)。
 
 ## Token 与字符数的粗略换算
 

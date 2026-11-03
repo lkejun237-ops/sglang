@@ -46,6 +46,10 @@ from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
     ReferenceLimits,
     require,
 )
+from sglang.multimodal_gen.runtime.realtime.zing_input_budget import (
+    ZingInputBudget,
+    count_prompt_tokens,
+)
 from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
     SourceLedger,
     SourceLimits,
@@ -384,6 +388,15 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             isinstance(references, list) and len(references) <= self.max_references,
             f"Please provide at most {self.max_references} reference images.",
         )
+        from ..conditioning import get_api_resources
+
+        self.input_budget = ZingInputBudget.from_config(args.pipeline_config)
+        prompt_tokens = await get_api_resources(session, args).cpu.run(
+            count_prompt_tokens, args.model_path, request.prompt
+        )
+        self.input_budget.validate(prompt_tokens, len(references))
+        self._budget_reference_count = len(references)
+        self._budget_reference_update = None
         self.reference_max_decoded_bytes = getattr(
             args.pipeline_config, "zing_reference_max_decoded_bytes", None
         )
@@ -553,6 +566,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             "max_pending_source_frames": limits.pending_frames,
             "max_pending_source_bytes": limits.pending_bytes,
             "max_references": self.max_references,
+            "input_budget": self.input_budget.metadata(),
             "prompt_reference_updates": self.reference_updates,
             "max_reference_bytes": reference_limits.reference_bytes,
             "max_reference_image_bytes": MAX_REFERENCE_IMAGE_BYTES,
@@ -698,8 +712,21 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             self._pending_reference_upload.release(session)
             self._pending_reference_upload = None
         command = dict(prompt=payload, event_id=event_id)
-        if "references" in data:
-            try:
+        try:
+            from ..conditioning import get_api_resources
+
+            args = get_global_server_args()
+            tokens = await get_api_resources(session, args).cpu.run(
+                count_prompt_tokens, args.model_path, payload
+            )
+            references = data.get("references")
+            reference_count = (
+                len(references)
+                if isinstance(references, list)
+                else self._budget_reference_count
+            )
+            self.input_budget.validate(tokens, reference_count)
+            if "references" in data:
                 require(
                     self.reference_updates,
                     "This session does not support reference updates.",
@@ -711,35 +738,35 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                     max_decoded_bytes=self.reference_max_decoded_bytes,
                 )
                 command["references"] = self._pending_reference_upload.items
-            except (
-                ValueError,
-                OSError,
-                SyntaxError,
-                Image.DecompressionBombError,
-                ConditionError,
-            ) as exc:
-                # Still dispatch the rejection: a newer event supersedes any
-                # older candidate already waiting at the worker boundary.
-                command["rejected"] = True
-                await ws.send_bytes(
-                    msgspec.msgpack.encode(
-                        dict(
-                            type="error",
-                            code=exc.code
+        except (
+            ValueError,
+            OSError,
+            SyntaxError,
+            Image.DecompressionBombError,
+            ConditionError,
+        ) as exc:
+            # Still dispatch the rejection: a newer event supersedes any
+            # older candidate already waiting at the worker boundary.
+            command["rejected"] = True
+            await ws.send_bytes(
+                msgspec.msgpack.encode(
+                    dict(
+                        type="error",
+                        code=exc.code
+                        if isinstance(exc, ConditionError)
+                        else "CONDITION_INVALID",
+                        fatal=False,
+                        event_id=event_id,
+                        content=(
+                            exc.public_message
                             if isinstance(exc, ConditionError)
-                            else "CONDITION_INVALID",
-                            fatal=False,
-                            event_id=event_id,
-                            content=(
-                                exc.public_message
-                                if isinstance(exc, ConditionError)
-                                else "This session does not support reference updates."
-                                if not self.reference_updates
-                                else "The prompt update could not be prepared. Please check the reference images and try again."
-                            ),
-                        )
+                            else "This session does not support reference updates."
+                            if not self.reference_updates
+                            else "The prompt update could not be prepared. Please check the reference images and try again."
+                        ),
                     )
                 )
+            )
         self._pending_prompt_command = command
         if self.prompt_prefetch is not None:
             self.prompt_prefetch.submit(command)
@@ -1007,6 +1034,12 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             batch.extra["zing_prompt_update"] = self._selected_prompt_command
             self._selected_prompt_command = None
         update = batch.extra.get("zing_prompt_update", {})
+        if "references" in update and not update.get("rejected"):
+            count = len(update["references"])
+            # Until output confirms this update, the prior snapshot may remain
+            # active after a failed or superseded update. Keep the larger count.
+            self._budget_reference_count = max(self._budget_reference_count, count)
+            self._budget_reference_update = (update["event_id"], count)
         if batch.block_idx == 0 and ("references" in update or update.get("rejected")):
             # Initialize the original epoch before applying a queued update;
             # an early invalid reference must not change its prompt or identity.
@@ -1048,6 +1081,14 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
 
     def on_chunk_complete(self, session, result):
         super().on_chunk_complete(session, result)
+        if getattr(self, "_budget_reference_update", None) is not None:
+            event_id, count = self._budget_reference_update
+            if any(
+                block["event_id"] == event_id
+                for block in (result.usage or {}).get("zing_realtime_blocks", [])
+            ):
+                self._budget_reference_count = count
+                self._budget_reference_update = None
         for upload in self._inflight_reference_uploads:
             upload.release(session)
         self._inflight_reference_uploads.clear()

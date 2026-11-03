@@ -22,6 +22,9 @@ MAX_MANIFEST_BYTES = 65536
 MAX_HEADER_BYTES = 65536
 _HEX = re.compile(r"^[0-9a-f]{64}$")
 _PUBLIC = {
+    "CONDITION_PROMPT_TOO_LONG": "The prompt is too long. Please shorten it.",
+    "CONDITION_REFERENCE_LIMIT": "There are too many reference images. Please use fewer images.",
+    "CONDITION_BUDGET_EXCEEDED": "The estimated input size exceeds the limit. Please shorten the prompt or use fewer reference images.",
     "CONDITION_INVALID": "We could not prepare this request. Please try again.",
     "CONDITION_UNAUTHORIZED": "We could not prepare this request. Please try again.",
     "CONDITION_PROFILE_MISMATCH": "We could not prepare this request. Please try again.",

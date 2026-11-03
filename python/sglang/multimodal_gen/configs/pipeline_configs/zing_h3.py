@@ -22,7 +22,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.zing_h3_decoder import (
 )
 from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
     DEFAULT_MAX_REFERENCE_IMAGES,
-    ReferenceLimits,
 )
 
 
@@ -99,6 +98,8 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
     prompt_switch_prefix_latent_frames: int = 5
     # Count admission only; the source/presentation budget is this count plus one.
     zing_reference_max_images: int = DEFAULT_MAX_REFERENCE_IMAGES
+    zing_prompt_max_tokens: int = 40000
+    zing_condition_max_tokens: int = 50000
     # Optional limit on one uploaded reference set, measured as decoded RGB bytes.
     # None derives N * 48 MiB from the image pixel maximum. Not total process RSS.
     zing_reference_max_decoded_bytes: int | None = None
@@ -185,7 +186,11 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
             self.dit_config.arch_config.patch_size[1:]
         )
         ZingResizeLimits.parse(self.zing_reference_resize, multiple=multiple)
-        ReferenceLimits(self.zing_reference_max_images)
+        from sglang.multimodal_gen.runtime.realtime.zing_input_budget import (
+            ZingInputBudget,
+        )
+
+        ZingInputBudget.from_config(self)
         if self.zing_reference_max_decoded_bytes is not None and (
             type(self.zing_reference_max_decoded_bytes) is not int
             or self.zing_reference_max_decoded_bytes <= 0

@@ -817,6 +817,24 @@ class PipelineConfig:
             help="Zing: maximum reference images (default 21; 0 disables references). Overrides the pipeline JSON value and derives input/transport capacities.",
         )
 
+        for name, help_text in (
+            (
+                "zing-prompt-max-tokens",
+                "Zing: maximum pure prompt tokens (default 40000).",
+            ),
+            (
+                "zing-condition-max-tokens",
+                "Zing: maximum estimated condition tokens for API admission (default 50000). Does not expand the Qwen service or KV pool.",
+            ),
+        ):
+            parser.add_argument(
+                f"--{prefix_with_dot}{name}",
+                type=int,
+                dest=f"{prefix_with_dot.replace('-', '_')}{name.replace('-', '_')}",
+                default=None,
+                help=help_text,
+            )
+
         # SANA-WM streaming knobs. default=None so they only apply to pipeline
         # configs that define these fields (e.g. SanaWMPipelineConfig); other
         # configs are left untouched by update_config_from_args.
