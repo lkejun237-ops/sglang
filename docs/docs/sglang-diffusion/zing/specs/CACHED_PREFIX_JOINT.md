@@ -1,5 +1,10 @@
 # 外部前缀 KV 的联合执行适配
 
+2026-11-02 布局扩展：下文六／五分支对应 `split_first_latent=true` 的历史实现与证据。
+当前 `false` 使用 3/2 两个历史块，condition miss / cache off 为五分支，hit 为四分支；
+两种布局共用分段 attention、AdaLN 分组和按序 KV 提交机制。
+新布局的独立方案、验证与 GPU 缺口见 [Prompt joint 开关适配](../plans/UNSPLIT_PROMPT_JOINT.md)。
+
 依赖：PR #445 `2d70a4575efe18b446e1fcf5007f1b785ac09a39`（替代 #441 的单条目提供方）；本地分支 `codex/zing-cached-prefix-joint`。状态：消费者接入新版 L1/L2 缓存，联合执行与缓存开关独立。历史 r8 的 480/SP2/L1 单输入 GPU A/B 使用修正前的开关绑定；当前解耦版本尚未重测 GPU，不能沿用旧数据证明六分支与五分支的性能差异；未上线。
 
 ## 使用与分工

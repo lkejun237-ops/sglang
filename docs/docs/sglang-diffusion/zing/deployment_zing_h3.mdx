@@ -144,6 +144,23 @@ Encoder、DiT、Decoder 性能及显存均未测。
 
 1280×736 在相同四卡/SP2/W6S3、单槽/prefix4096的 KV 池预分配时 OOM，未进入生成；480 的 W21/S3 预分配也 OOM。不得把480成功外推到736或W21。原始记录、组件时间和逐rank显存范围见 [PR #483](https://github.com/seedleap/sglang/pull/483)，配置与调用链见 [实现说明](plans/UNSPLIT_PROMPT_PREFIX.md)。
 
+2026-11-02 本改动扩展 prompt joint，按 `split_first_latent` 选择历史布局。
+`false` 时 condition miss / cache off 联合 condition、history3、history2、source 和 target 首步（五分支）；
+condition hit 恢复 KV 后联合两个 history、source 和 target 首步（四分支）。
+`true` 沿用六／五分支。分段 attention、AdaLN 分组与顺序 KV 提交语义保持，
+不支持的执行模式沿用既有处理。480 已在 H100 测试节点以四卡 E1+DiT SP2+D1、W6/S3
+完成旧/新各三次 cache off/on 正式请求；on 在完整 fill 与独立 hit warmup 后逐 rank
+确认每请求七次 hit、零 miss及新版六次四分支。on 全程 FPS 中位数旧20.0524/新20.1568，
+样本范围重叠，不宣称稳定整体加速；独立四分支数值诊断通过，但 off 的 live K 超差仍未解决，
+PR 保持草稿。736 按用户要求暂停。on 的独立阶段 CUDA/Host 与 prompt 细分、正式采样显存、
+原始证据及限制见 [开关适配方案](plans/UNSPLIT_PROMPT_JOINT.md)。
+不能将上方串行回退的历史数据当作新联合路径的性能证据。
+
+2026-11-03 合并主线 `772927dc45` 后，首次三分支与 prompt 切换五/四分支
+共用合法事务校验；`split_first_latent=false` 不关闭首次联合。
+`INITIAL_PREFIX_JOINT=0` 仍可恢复首次独立 condition 路径。
+合并版本仅补 CPU 组合回归，尚未重跑 GPU；上述性能数据保留原受测版本边界。
+
 ## 当前测试默认采样
 
 截至 2026-10-23，主线服务默认前三个 target block 各四步

@@ -165,6 +165,7 @@ async def benchmark(cases, args):
         "timing_boundaries": CLIENT_TIMING,
         "concurrency": 1,
         "prewarm_only": getattr(args, "prewarm_only", False),
+        "cache_write": getattr(args, "cache_write", False),
         "warmup_runs": args.warmup_runs,
         "measured_runs": args.measured_runs,
         "seed": args.seed,
@@ -240,6 +241,8 @@ async def benchmark(cases, args):
                         command.append("--receive-stage-timing")
                     if args.paced:
                         command.append("--paced")
+                    if getattr(args, "cache_write", False):
+                        command.append("--cache-write")
                     prompt_updates = (
                         case.get("prompt_updates_path") or args.prompt_updates
                     )
@@ -472,6 +475,11 @@ def main():
     parser.add_argument("--media-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--paced", action="store_true")
+    parser.add_argument(
+        "--cache-write",
+        action="store_true",
+        help="Allow warmup and measured requests to populate an enabled Block0 cache",
+    )
     parser.add_argument("--no-stage-timing", action="store_true")
     parser.add_argument(
         "--width",

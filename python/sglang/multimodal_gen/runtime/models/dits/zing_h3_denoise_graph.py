@@ -565,6 +565,7 @@ class ZingChunkGraphs:
             ZingFixedForwardKVPlan,
         )
         from sglang.multimodal_gen.runtime.models.dits.zing_h3_joint import (
+            PrefixJointTransaction,
             joint_transaction,
         )
 
@@ -593,10 +594,13 @@ class ZingChunkGraphs:
             ends=ends,
             clean_rows=clean,
             prefix=phase == "prefix"
-            or (transaction is not None and transaction.branches[0].phase == "prefix"),
+            or (
+                isinstance(transaction, PrefixJointTransaction)
+                and transaction.branches[0].phase == "prefix"
+            ),
             after=after,
         )
-        if transaction is not None and transaction.branches[0].phase == "prefix":
+        if isinstance(transaction, PrefixJointTransaction):
             kv.tensors["current_positions"] = transaction.mapped_positions.to(
                 packed["x"].device
             )
@@ -618,7 +622,7 @@ class ZingChunkGraphs:
         # of rescanning every parameter for the same forward plan.
         projection_cache = None
         if (
-            len(ends) in (2, 3, 5, 6)
+            len(ends) in (2, 3, 4, 5, 6)
             and model.adaln_table is None
             and model.adaln_projection_cache_enabled
         ):

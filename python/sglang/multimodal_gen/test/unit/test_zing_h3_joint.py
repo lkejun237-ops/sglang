@@ -73,7 +73,7 @@ def test_joint_option_rejects_typo(model):
         ZingH3Sampler(model, packer, joint_forward="typo")
 
 
-@pytest.mark.parametrize("ends", [(2, 5), (1, 3, 5)])
+@pytest.mark.parametrize("ends", [(2, 5), (1, 3, 5), (1, 3, 4, 5), (1, 2, 3, 4, 5)])
 def test_branch_attention_is_block_bidirectional(ends):
     import torch.nn.functional as F
 

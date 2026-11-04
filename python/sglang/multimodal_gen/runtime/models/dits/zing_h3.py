@@ -1807,7 +1807,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         unique_t, t_indices = torch.unique(host_t, sorted=True, return_inverse=True)
         group_sizes = video_ends = None
         prefix_joint = joint and (
-            packed["_zing_joint_phases"][0] == "prefix" or len(ends) == 5
+            packed["_zing_joint_phases"][0] == "prefix" or len(ends) in (4, 5)
         )
         if prefix_joint:
             if size > 1 and not self.experimental_stable_shapes:

@@ -1676,8 +1676,9 @@ def test_streaming_case_records_source_and_output_separately_without_mutating_ma
 
 
 @pytest.mark.parametrize("source_format", ["rgb", "video"])
+@pytest.mark.parametrize("cache_write", [False, True])
 def test_streaming_benchmark_runs_independent_source_geometry(
-    tmp_path, monkeypatch, source_format
+    tmp_path, monkeypatch, source_format, cache_write
 ):
     import asyncio
     import shutil
@@ -1759,6 +1760,7 @@ def test_streaming_benchmark_runs_independent_source_geometry(
                 batch_pattern=[17],
                 prompt_updates=None,
                 no_stage_timing=True,
+                cache_write=cache_write,
             )
             return await streaming.benchmark([case], args)
 
@@ -1767,6 +1769,10 @@ def test_streaming_benchmark_runs_independent_source_geometry(
     init = observations[0]
     assert init["size"] == "4x2"
     assert init["source_stream"] == dict(format="rgb24", width=2, height=2, fps=24)
+    assert init.get("cache_write", False) is cache_write
+    assert (
+        json.loads((tmp_path / "config.json").read_text())["cache_write"] is cache_write
+    )
     result_dir = tmp_path / "5s" / "measured-0"
     result = json.loads((result_dir / "summary.json").read_text())
     assert result["submitted"] == result["consumed"] == result["received"] == 6

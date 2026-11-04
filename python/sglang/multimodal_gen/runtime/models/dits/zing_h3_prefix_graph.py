@@ -10,8 +10,7 @@ from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
     ZingChunkGraphs,
 )
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_joint import (
-    CACHED_PREFIX_PHASES,
-    PREFIX_PHASES,
+    prefix_joint_phases,
 )
 
 
@@ -50,14 +49,17 @@ class PrefixJointGraphs(ZingChunkGraphs):
         if not cache.pooled or not cache.raw_store:
             raise ValueError("Prefix graphs require a fixed raw KV pool")
         if (
-            (cache.prefix is None if len(packs) == 5 else cache.prefix is not None)
-            or cache.committed
+            cache.committed
             or cache.active is not None
             or cache.pending_source is not None
         ):
             raise ValueError(
                 "Prefix graphs require an empty or restored prefix-only cache"
             )
+        prefix_joint_phases(
+            len(packs) - (2 if cache.prefix is not None else 3),
+            cached=cache.prefix is not None,
+        )
         if self.capture_enabled and not self.backend.supports(packs[0]["x"].device):
             raise ValueError("Unsupported prefix graph device")
         size, _ = zing_h3.get_ulysses_ctx()
@@ -70,7 +72,8 @@ class PrefixJointGraphs(ZingChunkGraphs):
 
     def _prepare(self, sampler, packs, cache):
         shadow = cache.planning_copy()
-        phases = CACHED_PREFIX_PHASES if len(packs) == 5 else PREFIX_PHASES
+        cached = cache.prefix is not None
+        phases = prefix_joint_phases(len(packs) - (2 if cached else 3), cached=cached)
         packed = self._joint_packed(packs, phases)
         plan = self._forward_plan(sampler, shadow, packed, "joint")
         return plan, plan.execute, shadow

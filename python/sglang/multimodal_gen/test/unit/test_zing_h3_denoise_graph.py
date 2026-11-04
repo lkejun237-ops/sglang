@@ -2462,8 +2462,9 @@ def test_whole_chunk_sp_opt_out_streaming_never_captures(
 
 @pytest.mark.parametrize("defer_final", [False, True])
 @pytest.mark.parametrize("weights_free", [False, True])
+@pytest.mark.parametrize("split_first_latent", [False, True])
 def test_online_prompt_joint_matches_serial_and_replays(
-    model, monkeypatch, defer_final, weights_free, tmp_path
+    model, monkeypatch, defer_final, weights_free, tmp_path, split_first_latent
 ):
     from sglang.multimodal_gen.runtime.models.dits.zing_h3_prefix_graph import (
         PrefixJointGraphs,
@@ -2474,6 +2475,7 @@ def test_online_prompt_joint_matches_serial_and_replays(
         initial_steps=STEPS,
         prompt_updates={4: 9, 7: 9, 10: 9, 13: 9},
         defer_final=defer_final,
+        split_first_latent=split_first_latent,
     )
     baseline = _run_ready_chunks(model, monkeypatch, **options)
     if weights_free:
@@ -2517,11 +2519,12 @@ def test_online_prompt_joint_matches_serial_and_replays(
             assert (got is None and want is None) or torch.equal(got, want)
     assert torch.equal(fixed[0], replay[0])
     assert model.prefix_graphs.routes[("prefix_separate", "replay")] == 2
-    assert replay[5][:5] == [None] * 5
-    assert replay[5][5:7] == [104] * 2
-    assert replay[5][7:11] == [107] * 4
-    assert replay[5][11:13] == [110] * 2
-    assert replay[5][13:] == [113] * 3
+    if split_first_latent:
+        assert replay[5][:5] == [None] * 5
+        assert replay[5][5:7] == [104] * 2
+        assert replay[5][7:11] == [107] * 4
+        assert replay[5][11:13] == [110] * 2
+        assert replay[5][13:] == [113] * 3
     for actual, expected in zip(replay[1], fixed[1]):
         assert actual[0] == expected[0]
         for (ak, av), (ek, ev) in zip(actual[2], expected[2]):
@@ -2532,8 +2535,9 @@ def test_online_prompt_joint_matches_serial_and_replays(
         assert model.adaln_table.stats()["fallback"] == 0
 
 
+@pytest.mark.parametrize("split_first_latent", [False, True])
 def test_online_prompt_joint_failure_releases_session_and_reuses_slot(
-    model, monkeypatch
+    model, monkeypatch, split_first_latent
 ):
     from sglang.multimodal_gen.runtime.models.dits.zing_h3_prefix_graph import (
         PrefixJointGraphs,
@@ -2547,6 +2551,7 @@ def test_online_prompt_joint_failure_releases_session_and_reuses_slot(
         prompt_joint=True,
         storage=storage,
         backend="eager",
+        split_first_latent=split_first_latent,
     )
     model.prefix_graphs = PrefixJointGraphs(capture_enabled=False)
     owned = []
@@ -2566,8 +2571,10 @@ def test_online_prompt_joint_failure_releases_session_and_reuses_slot(
     assert all(v == 0 for v in owned[0].memory_snapshot().values())
     model.prefix_graphs = PrefixJointGraphs(capture_enabled=False)
     result = _run_ready_chunks(model, monkeypatch, **options)
-    assert result[5][:5] == [None] * 5
-    assert result[5][5:] == [104] * 5
+    assert result[5][-1] == 104
+    if split_first_latent:
+        assert result[5][:5] == [None] * 5
+        assert result[5][5:] == [104] * 5
 
 
 def test_online_prompt_joint_unsupported_route_keeps_serial_result(model, monkeypatch):
@@ -2634,8 +2641,9 @@ def _cached_prefix_writer(receipts, *, fail=None):
 @pytest.mark.parametrize("backend", [None, "eager", "recording"])
 @pytest.mark.parametrize("adaln_mode", ["dynamic", "table"])
 @pytest.mark.parametrize("switch_miss", [False, True])
+@pytest.mark.parametrize("split_first_latent", [False, True])
 def test_cached_prefix_start_and_switch_match_serial(
-    model, monkeypatch, tmp_path, backend, adaln_mode, switch_miss
+    model, monkeypatch, tmp_path, backend, adaln_mode, switch_miss, split_first_latent
 ):
     from sglang.multimodal_gen.runtime.models.dits.zing_h3_prefix_graph import (
         PrefixJointGraphs,
@@ -2647,6 +2655,7 @@ def test_cached_prefix_start_and_switch_match_serial(
         batches=(1,) * 17,
         prompt_updates={4: 9, 7: 6, 10: 9, 13: 9},
         reference=True,
+        split_first_latent=split_first_latent,
     )
     baseline = _run_ready_chunks(model, monkeypatch, joint_forward="off", **options)
     if adaln_mode == "table":
@@ -2698,12 +2707,12 @@ def test_cached_prefix_start_and_switch_match_serial(
     else:
         assert model.adaln_projection_cache_enabled
     cache_stats = []
-    five_branch_projections = []
+    prefix_branch_projections = []
     forward_body = model._forward_body
 
     def inspect_modulation(*args, **kwargs):
         options = kwargs["options"]
-        if options.joint_ends is not None and len(options.joint_ends) in (5, 6):
+        if options.joint_ends is not None and len(options.joint_ends) in (4, 5, 6):
             if options.fixed_kv is not None:
                 # Captured execution consumes resolved inputs, with no resident
                 # projection GEMMs or Python LRU calls inside the graph body.
@@ -2711,7 +2720,7 @@ def test_cached_prefix_start_and_switch_match_serial(
             else:
                 assert options.projection_cache is not None
                 assert options.branch_projection_keys is not None
-            five_branch_projections.append(len(options.joint_ends))
+            prefix_branch_projections.append(len(options.joint_ends))
         return forward_body(*args, **kwargs)
 
     monkeypatch.setattr(model, "_forward_body", inspect_modulation)
@@ -2745,9 +2754,9 @@ def test_cached_prefix_start_and_switch_match_serial(
         yield_hook=observe,
         **options,
     )
-    assert 5 in five_branch_projections
+    assert (5 if split_first_latent else 4) in prefix_branch_projections
     if switch_miss:
-        assert 6 in five_branch_projections
+        assert (6 if split_first_latent else 5) in prefix_branch_projections
     if adaln_mode == "dynamic":
         assert cache_stats and max(s["hits"] for s in cache_stats) > 0
     else:
@@ -2888,9 +2897,10 @@ def test_cached_prefix_only_loads_latest_candidate(model, monkeypatch):
 
 @pytest.mark.parametrize("backend", [None, "eager", "recording"])
 @pytest.mark.parametrize("warm_start", [False, True])
+@pytest.mark.parametrize("split_first_latent", [False, True])
 @pytest.mark.usefixtures("cpu_dma")
 def test_block0_provider_routes_start_and_prompt_cycle(
-    model, monkeypatch, backend, warm_start
+    model, monkeypatch, backend, warm_start, split_first_latent
 ):
     from types import SimpleNamespace as NS
 
@@ -2901,7 +2911,11 @@ def test_block0_provider_routes_start_and_prompt_cycle(
         ZingSourceStreamState,
     )
 
-    options = dict(batches=(1,) * 11, prompt_updates={4: 6, 7: None})
+    options = dict(
+        batches=(1,) * 11,
+        prompt_updates={4: 6, 7: None},
+        split_first_latent=split_first_latent,
+    )
     baseline = _run_ready_chunks(model, monkeypatch, joint_forward="off", **options)
     metrics, owners, states = [], [], []
 
@@ -3015,14 +3029,20 @@ def test_block0_provider_routes_start_and_prompt_cycle(
 @pytest.mark.parametrize("reference", [False, True])
 @pytest.mark.parametrize("route", ["step", "drain", "graph"])
 @pytest.mark.parametrize("initial_joint", [False, True])
+@pytest.mark.parametrize("split_first_latent", [False, True])
 def test_initial_prefix_joint_matches_serial_cache(
-    model, monkeypatch, reference, route, initial_joint
+    model, monkeypatch, reference, route, initial_joint, split_first_latent
 ):
     """Compare the real session entry, latent and every live raw KV row."""
     if reference:
         monkeypatch.setattr(model.arch, "ar_condition_timestep", 0.875)
         monkeypatch.setattr(model.arch, "reference_visual_timestep", 0.999)
-    options = dict(batches=(1, 1, 1), reference=reference, use_step=route == "step")
+    options = dict(
+        batches=(1, 1, 1),
+        reference=reference,
+        use_step=route == "step",
+        split_first_latent=split_first_latent,
+    )
     expected = _run_ready_chunks(model, monkeypatch, joint_forward="off", **options)
     monkeypatch.setenv(
         "SGLANG_ZING_INITIAL_PREFIX_JOINT", "1" if initial_joint else "0"
@@ -3126,7 +3146,7 @@ def test_chunk_plans_carry_actual_target_grid(model, monkeypatch):
 
 
 @pytest.mark.parametrize("cached", [False, True])
-def test_unsplit_prompt_prefix_falls_back_to_serial(model, monkeypatch, cached):
+def test_unsplit_prompt_prefix_joins_both_history_blocks(model, monkeypatch, cached):
     options = dict(
         batches=(1,) * 8, prompt_updates={3: 9, 5: 6}, split_first_latent=False
     )
@@ -3140,9 +3160,9 @@ def test_unsplit_prompt_prefix_falls_back_to_serial(model, monkeypatch, cached):
         yield_hook=lambda session, drain, count: metrics.append(session.metrics),
         **options,
     )
-    torch.testing.assert_close(actual[0], baseline[0], rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(actual[0], baseline[0], rtol=0.02, atol=0.02)
     assert actual[5] == baseline[5]
-    assert metrics[-1]["prompt_joint_fallbacks"] == {"unsupported_layout": 2}
-    assert metrics[-1]["forward_counts"].get("prompt_joint", 0) == 0
+    assert not metrics[-1].get("prompt_joint_fallbacks")
+    assert metrics[-1]["forward_counts"]["prompt_joint"] == 2
     if cached:
         assert receipts

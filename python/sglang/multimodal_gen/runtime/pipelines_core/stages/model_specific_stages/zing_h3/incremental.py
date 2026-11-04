@@ -422,14 +422,14 @@ class SourceReadySession:
             ZingChunkGraphs,
         )
         from sglang.multimodal_gen.runtime.models.dits.zing_h3_joint import (
-            CACHED_PREFIX_PHASES,
-            PREFIX_PHASES,
+            prefix_joint_phases,
         )
         from sglang.multimodal_gen.runtime.models.dits.zing_h3_prefix_graph import (
             PrefixJointGraphs,
         )
 
         sampler, model, cache = self.sampler, self.sampler.generator, self.cache
+        prefix_target = self.plan.chunk(self.prompt_prefix_chunk_count).target_block
         size, _ = get_ulysses_ctx()
         heads = int(
             getattr(getattr(model, "arch", None), "num_attention_heads", 0) or 0
@@ -444,12 +444,12 @@ class SourceReadySession:
             and (heads <= 0 or heads % size == 0)
             and sampler.window_eviction_timing == "after_step0"
             and current.audio is None
-            and current.spans[0][:2] == (7, 8)
+            and current.spans[0][:2] == (prefix_target - 1, prefix_target)
             and (size == 1 or model.experimental_stable_shapes)
         )
         sampler._agree_sp_boundary(
             cache,
-            8,
+            prefix_target,
             phase="prompt_prefix_route",
             ready_route=(supported, graph_eligible),
         )
@@ -459,8 +459,7 @@ class SourceReadySession:
                 raise ValueError(
                     "Cached prompt switch requires supported joint execution"
                 )
-            # Joint graphs require three history blocks. Unsplit 3/2 history
-            # uses serial commits, retaining an already restored condition KV.
+            # Unsupported execution modes retain an already restored condition KV.
             if not self._cached_prefix_ready:
                 sampler._forward(packs[0], cache, "prefix")
                 packs = packs[1:]
@@ -497,7 +496,7 @@ class SourceReadySession:
             error = exc
         sampler._agree_sp_boundary(
             cache,
-            8,
+            prefix_target,
             phase="prompt_joint_prepare",
             precheck_error=error is not None,
             local_error=error,
@@ -522,7 +521,9 @@ class SourceReadySession:
         else:
             prediction = sampler._predict_joint(
                 packs,
-                CACHED_PREFIX_PHASES if self._cached_prefix_ready else PREFIX_PHASES,
+                prefix_joint_phases(
+                    self.prompt_prefix_chunk_count, cached=self._cached_prefix_ready
+                ),
                 current.visual.shape[2:],
                 cache,
             )

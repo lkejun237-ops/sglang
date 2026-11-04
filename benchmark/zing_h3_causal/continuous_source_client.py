@@ -211,6 +211,8 @@ async def exchange(
             source_stream=source_format,
             source_message_budget_bytes=message_budget,
         )
+        if getattr(args, "cache_write", False):
+            init["cache_write"] = True
         if getattr(args, "receive_stage_timing", False):
             init["return_stage_timing"] = True
         if args.profile:
@@ -1003,6 +1005,11 @@ def parser():
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--paced", action="store_true")
+    parser.add_argument(
+        "--cache-write",
+        action="store_true",
+        help="Allow this request to populate the server's enabled Block0 cache",
+    )
     parser.add_argument("--receive-stage-timing", action="store_true")
     parser.add_argument(
         "--profile",

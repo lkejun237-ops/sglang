@@ -73,6 +73,13 @@ python3 benchmark/zing_h3_causal/bench_streaming_source.py \
 因此不能仅凭预热完成判断所有 case 都驻留。预热后保持同一服务进程，再用
 `--warmup-runs 0 --measured-runs 3` 测重复请求。
 
+测 Block0 condition cache 时，服务需开启 `--zing-block0-cache-mode on`，
+客户端还需传 `--cache-write`，允许完整预热请求填充缓存（默认不写入）。
+保持同一服务，用相同数据再跑至少一次，并检查实际 `cached_prefix_hits`、
+`cached_prefix_misses` 和恢复记录后，才将后续请求计为 cache hit 测量。
+包含 prompt 切换的数据须容纳全部 condition；host 预算是全 SP 总额，
+不能把全局预算当作每 rank 的容量。仅开启服务缓存或完成预热不足以证明命中。
+
 缓存对照固定源码、硬件、checkpoint、输入 SHA、有效几何、采样、编译与 SP 布局：
 
 | 组 | 设置 | 记录 |
