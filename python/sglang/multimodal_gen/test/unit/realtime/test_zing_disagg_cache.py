@@ -4,6 +4,7 @@
 import ast
 import asyncio
 from collections import deque
+from contextlib import nullcontext
 from pathlib import Path
 
 from sglang.multimodal_gen.runtime.realtime.polling_task_queue import PollingTaskQueue
@@ -17,7 +18,11 @@ LINK = (
 def link_classes():
     tree = ast.parse(LINK.read_text())
     classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
-    scope = {"PollingTaskQueue": PollingTaskQueue, "asyncio": asyncio}
+    scope = {
+        "PollingTaskQueue": PollingTaskQueue,
+        "asyncio": asyncio,
+        "nullcontext": nullcontext,
+    }
     exec(compile(ast.Module(body=classes, type_ignores=[]), str(LINK), "exec"), scope)
     return scope["DiTLinkClient"], scope["DiTInputService"]
 

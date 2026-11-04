@@ -7,6 +7,7 @@ send-and-continue; init, EOS drain and teardown retain completion barriers.
 """
 
 import asyncio
+from contextlib import nullcontext
 
 from sglang.multimodal_gen.runtime.realtime.polling_task_queue import PollingTaskQueue
 
@@ -164,7 +165,10 @@ class DiTLinkClient:
             if self.owner is not None and not self.failed:
                 self.release(self.owner[0])
         finally:
-            self.channel.close()
+            if self.failed:
+                self.channel.close(fault=True)
+            else:
+                self.channel.close()
 
     def shutdown(self):
         try:
@@ -177,9 +181,20 @@ class DiTLinkClient:
 
 
 class DiTInputService:
-    def __init__(self, channel, create_session, create_decoder=None):
+    def __init__(
+        self,
+        channel,
+        create_session,
+        create_decoder=None,
+        *,
+        on_failure=None,
+        cleanup_guard=nullcontext,
+        abort_transport=None,
+    ):
         self.channel, self.create_session = channel, create_session
         self.create_decoder = create_decoder
+        self.on_failure, self.cleanup_guard = on_failure, cleanup_guard
+        self.abort_transport = abort_transport
         self.decoder = None
         self.transport_failed = False
         self.worker = self.owner = None
@@ -353,10 +368,22 @@ class DiTInputService:
             # group owner before deciding whether model restart is required.
             remote = getattr(self.decoder, "remote", None)
             self.transport_failed = remote is not None and remote.failure is not None
-            self._close_decoder()
-            if self.worker is not None:
-                self.worker.close()
-            reply("worker.error")
+            if self.on_failure is not None:
+                self.on_failure()
+            with self.cleanup_guard():
+                if self.abort_transport is not None:
+                    self.abort_transport()
+                if remote is not None:
+                    remote.failure = remote.failure or RuntimeError("DiT input failed")
+                self._close_decoder()
+                if self.worker is not None:
+                    self.worker.close()
+                # The channel may already be broken. Preserve the original
+                # failure rather than blocking recovery on an error receipt.
+                try:
+                    reply("worker.error")
+                except Exception:
+                    pass
             raise
 
     def _close_decoder(self):

@@ -62,16 +62,25 @@ def admit_prompt_update(stage, sampler, inputs, condition, *, source_shape=None)
 
 
 def coordinate_prompt_admission(admit):
-    """Keep the original all-rank decision before any cache is changed."""
-    from sglang.multimodal_gen.runtime.conditioning.worker import coordinate_validation
+    """Validate locally, then agree before publishing any candidate state.
+
+    The callback must only prepare/validate a candidate and must not contain
+    collectives: every rank must reach the vote even when local validation fails.
+    """
+    from sglang.multimodal_gen.runtime.conditioning.worker import (
+        coordinate_validation_decision,
+    )
 
     error = request = None
     try:
         request = admit()
-    except ConditionError as exc:
+    except ValueError as exc:
+        # ConditionError is also a ValueError. Packing/row_role validation uses
+        # plain ValueError and must not bypass the same rank-wide decision.
+        logger.warning("Condition admission rejected locally", exc_info=True)
         error = exc
-    if not all(coordinate_validation(error is None)):
+    if not coordinate_validation_decision(error is None):
         raise ConditionError(
-            "CONDITION_INVALID", "Reference update exceeds KV capacity"
+            "CONDITION_INVALID", "Condition validation failed on a DiT rank"
         ) from error
     return request

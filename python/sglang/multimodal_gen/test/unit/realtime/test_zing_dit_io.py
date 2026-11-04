@@ -153,3 +153,121 @@ def test_one_send_failure_notifies_lifecycle_once():
     finally:
         io.close()
     assert failures == ["failed"]
+
+
+@pytest.mark.parametrize("abort_fails", [False, True])
+@pytest.mark.parametrize("second_abort", [False, True])
+def test_transport_abort_claim_prevents_concurrent_shutdown(abort_fails, second_abort):
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.dit_transport import (
+        EncoderDiTChannel,
+    )
+
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    def abort():
+        calls.append("abort")
+        entered.set()
+        assert release.wait(3)
+        if abort_fails:
+            raise RuntimeError("Injected native abort failure")
+
+    channel = EncoderDiTChannel(
+        SimpleNamespace(abort=abort, shutdown=lambda: calls.append("shutdown")),
+        SimpleNamespace(close=lambda: calls.append("socket.close")),
+        rank=0,
+        device="cpu",
+    )
+
+    def io_cleanup():
+        # A second fault observer must neither repeat abort nor drain the group.
+        if second_abort:
+            channel.abort()
+        channel.close()
+
+    with ThreadPoolExecutor(max_workers=2) as threads:
+        model = threads.submit(channel.abort)
+        try:
+            assert entered.wait(3)
+            threads.submit(io_cleanup).result(timeout=2)
+            assert calls == ["abort", "socket.close"]
+        finally:
+            release.set()
+        if abort_fails:
+            with pytest.raises(RuntimeError, match="Injected native abort failure"):
+                model.result(timeout=2)
+        else:
+            model.result(timeout=2)
+    channel.abort()
+    assert calls == ["abort", "socket.close"]
+
+
+def test_transport_close_claim_prevents_concurrent_native_abort():
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.dit_transport import (
+        EncoderDiTChannel,
+    )
+
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    def shutdown():
+        calls.append("shutdown")
+        entered.set()
+        assert release.wait(3)
+
+    channel = EncoderDiTChannel(
+        SimpleNamespace(abort=lambda: calls.append("abort"), shutdown=shutdown),
+        SimpleNamespace(close=lambda: calls.append("socket.close")),
+        rank=0,
+        device="cpu",
+    )
+    with ThreadPoolExecutor(max_workers=2) as threads:
+        io = threads.submit(channel.close)
+        try:
+            assert entered.wait(3)
+            threads.submit(channel.abort).result(timeout=2)
+            assert calls == ["shutdown"]
+        finally:
+            release.set()
+        io.result(timeout=2)
+    assert calls == ["shutdown", "socket.close"]
+
+
+@pytest.mark.parametrize("abort_fails", [False, True])
+def test_fault_abort_precedes_io_stop_notification(abort_fails):
+    from concurrent.futures import ThreadPoolExecutor
+
+    entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+
+    class FaultTransport(Transport):
+        def abort(self):
+            entered.set()
+            assert release.wait(3)
+            if abort_fails:
+                raise RuntimeError("Injected native abort failure")
+
+    io = DiTIOChannel(lambda: FaultTransport(Queue(), [], closed)).start()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            fault = threads.submit(io.abort)
+            try:
+                assert entered.wait(3)
+                # Stop wakes the normal close path; publish the fault first.
+                assert not io.stopping.is_set()
+                assert not closed.is_set()
+            finally:
+                release.set()
+            if abort_fails:
+                with pytest.raises(RuntimeError, match="Injected native abort failure"):
+                    fault.result(timeout=2)
+            else:
+                fault.result(timeout=2)
+        assert closed.wait(3)
+    finally:
+        io.close()

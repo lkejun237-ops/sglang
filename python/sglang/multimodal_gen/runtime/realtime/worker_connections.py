@@ -12,6 +12,7 @@ import logging
 import secrets
 import threading
 import time
+from contextlib import nullcontext
 from copy import deepcopy
 from urllib.parse import urlsplit
 
@@ -26,13 +27,22 @@ class ServiceConnections:
     RESERVATION_SECONDS = 10
 
     def __init__(
-        self, service, *, ready, build, destroy, rollback, clock=time.monotonic
+        self,
+        service,
+        *,
+        ready,
+        build,
+        destroy,
+        rollback,
+        clock=time.monotonic,
+        cleanup_timeout=None,
     ):
         self.service = deepcopy(service)
         self.ready = ready
         self.build_callback, self.destroy_callback = build, destroy
         self.rollback_callback = rollback
         self.clock = clock
+        self.cleanup_timeout = cleanup_timeout
         self.lock = threading.RLock()
         self.state = "idle"
         self.token = None
@@ -157,6 +167,18 @@ class ServiceConnections:
             )
         return group, token, deepcopy(topology)
 
+    def cleanup_guard(self):
+        if self.cleanup_timeout is None:
+            return nullcontext()
+        from .cleanup_watchdog import CleanupWatchdog
+
+        return CleanupWatchdog(self.cleanup_timeout)
+
+    def quarantine(self):
+        """Reject all reuse before attempting potentially blocking cleanup."""
+        with self.lock:
+            self.restart_required, self.state = True, "failed"
+
     async def _call(self, callback, *args):
         if inspect.iscoroutinefunction(callback):
             return await callback(*args)
@@ -203,29 +225,33 @@ class ServiceConnections:
     async def _build(self, group, topology):
         try:
             await self._call(self.build_callback, group, topology)
+            with self.lock:
+                if self.restart_required:
+                    raise RuntimeError("Worker failed during connection construction")
+                self.state = "connected"
+            return dict(success=True, state="connected", worker_group_id=group), 200
         except Exception:
             logging.exception("Worker group construction failed")
             cleaned = False
             try:
-                await self._call(self.rollback_callback)
+                with self.cleanup_guard():
+                    await self._call(self.rollback_callback)
                 cleaned = True
             except Exception:
                 logging.exception("Worker group rollback failed")
             with self.lock:
-                self.restart_required = not cleaned
-                self.state = "idle" if cleaned else "failed"
+                self.restart_required = self.restart_required or not cleaned
+                reusable = not self.restart_required
+                self.state = "idle" if reusable else "failed"
                 self.token = self.group = self.topology = None
             return dict(
                 success=False,
-                state="idle" if cleaned else "unavailable",
+                state="idle" if reusable else "unavailable",
                 worker_group_id=group,
-                restart_required=not cleaned,
+                restart_required=not reusable,
                 code="CONNECTION_FAILED",
                 message="Failed to establish the worker connections.",
             ), 503
-        with self.lock:
-            self.state = "connected"
-        return dict(success=True, state="connected", worker_group_id=group), 200
 
     async def destroy(self, payload):
         group = payload.get("worker_group_id") if isinstance(payload, dict) else None
@@ -249,7 +275,8 @@ class ServiceConnections:
 
     async def _destroy(self, group):
         try:
-            await self._call(self.destroy_callback)
+            with self.cleanup_guard():
+                await self._call(self.destroy_callback)
         except Exception:
             logging.exception("Worker group destruction failed")
             with self.lock:
@@ -263,6 +290,16 @@ class ServiceConnections:
                 message="Failed to close the worker connections.",
             ), 503
         with self.lock:
+            if self.restart_required:
+                self.state = "failed"
+                return dict(
+                    success=False,
+                    state="unavailable",
+                    worker_group_id=group,
+                    restart_required=True,
+                    code="WORKER_RESTART_REQUIRED",
+                    message="The worker must be restarted.",
+                ), 503
             self.last_destroyed = group
             self.state = "idle"
             self.token = self.group = self.topology = None
@@ -271,9 +308,12 @@ class ServiceConnections:
     def failed(self):
         """Called from a transport/model owner; cleanup stays off that thread."""
         with self.lock:
-            if self.state in ("idle", "failed", "draining", "connecting"):
+            if self.state in ("idle", "failed"):
                 return
-            self.state = "draining"
+            if self.state in ("draining", "connecting"):
+                self.state, self.restart_required = "failed", True
+                return
+            self.state, self.restart_required = "failed", True
         if self.loop is None or self.loop.is_closed():
             with self.lock:
                 self.restart_required, self.state = True, "failed"
@@ -281,16 +321,14 @@ class ServiceConnections:
         self.loop.call_soon_threadsafe(lambda: asyncio.create_task(self._failed()))
 
     async def _failed(self):
+        self.quarantine()
         try:
-            await self._call(self.rollback_callback)
+            with self.cleanup_guard():
+                await self._call(self.rollback_callback)
         except Exception:
             logging.exception("Failed connection cleanup requires a worker restart")
-            with self.lock:
-                self.restart_required, self.state = True, "failed"
-        else:
-            with self.lock:
-                self.state = "idle"
-                self.token = self.group = self.topology = None
+        # Even successful host cleanup does not prove a failed CUDA/NCCL
+        # context reusable. Keep the worker quarantined until replacement.
 
     def install(self, app):
         app.state.worker_connections = self

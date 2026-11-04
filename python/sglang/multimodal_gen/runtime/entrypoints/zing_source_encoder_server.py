@@ -702,11 +702,21 @@ class EncoderClient:
         import torch
 
         try:
-            return self.executor.forward(request)
-        finally:
-            # Also drain kernels on a failed Qwen forward before API cleanup
-            # can release the shared session or admit the next owner.
-            torch.cuda.synchronize()
+            result = self.executor.forward(request)
+        except BaseException:
+            from sglang.multimodal_gen.runtime.realtime.cleanup_watchdog import (
+                CleanupWatchdog,
+            )
+
+            # Publish failure before waiting on a possibly broken CUDA stream.
+            with CleanupWatchdog(120):
+                controller = getattr(self.executor, "connection_controller", None)
+                if controller is not None:
+                    controller.failed()
+                torch.cuda.synchronize()
+            raise
+        torch.cuda.synchronize()
+        return result
 
 
 def create_apps(
@@ -811,7 +821,8 @@ def create_apps(
                             DiTIOChannel(
                                 lambda peer=peer: EncoderDiTChannel.connect(
                                     peer, rank=0, device="cuda:0"
-                                )
+                                ),
+                                cleanup_timeout=120,
                             ).start()
                         )
                     executors.append(

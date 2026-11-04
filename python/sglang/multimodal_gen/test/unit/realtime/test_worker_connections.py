@@ -182,7 +182,7 @@ def test_topology_cannot_replace_local_service():
     assert controller.query()[0] == dict(state="reserved")
 
 
-def test_first_failure_discards_group_and_recovers_after_cleanup():
+def test_transport_failure_stays_quarantined_after_cleanup():
     async def run():
         rolled_back = asyncio.Event()
 
@@ -192,10 +192,20 @@ def test_first_failure_discards_group_and_recovers_after_cleanup():
         controller = manager(rollback=rollback)
         await controller.build(request(controller))
         controller.failed()
-        assert controller.query()[0] == dict(state="reserved")
+        body, status = controller.query()
+        assert status == 503 and body["restart_required"]
         await rolled_back.wait()
         await asyncio.sleep(0)
-        assert controller.query()[0]["state"] == "available"
+        body, status = controller.query()
+        assert status == 503 and body["state"] == "unavailable"
+        with pytest.raises(ConnectionRejected):
+            await controller.build(
+                dict(
+                    worker_group_id="other",
+                    reservation_token="unused",
+                    topology=topology(),
+                )
+            )
 
     asyncio.run(run())
 
@@ -362,3 +372,115 @@ def test_background_cleanup_failure_is_reported_by_query():
         assert reply["restart_required"]
 
     asyncio.run(run())
+
+
+def test_connected_waits_for_gpu_completion(monkeypatch):
+    import sys
+    import threading
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.runtime.realtime.worker_connection_ports import (
+        confirm_bridge_connection,
+    )
+
+    recorded, completed = threading.Event(), threading.Event()
+
+    class Event:
+        def record(self, stream):
+            recorded.set()
+
+        def query(self):
+            return completed.is_set()
+
+    class Store:
+        values = {"attempt/connection-complete/1": "complete"}
+
+        def set(self, key, value):
+            self.values[key] = value
+
+        def check(self, keys):
+            return all(key in self.values for key in keys)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            device=lambda _: SimpleNamespace(type="cuda"),
+            cuda=SimpleNamespace(Event=Event, current_stream=lambda _: object()),
+        ),
+    )
+    store = Store()
+    controller = manager(
+        build=lambda *_: confirm_bridge_connection(
+            store, "attempt", 0, "cuda:0", timeout=2
+        )
+    )
+    payload = request(controller)
+
+    async def run():
+        task = asyncio.create_task(controller.build(payload))
+        try:
+            assert await asyncio.to_thread(recorded.wait, 1)
+            assert controller.state == "connecting"
+            assert controller.query()[0]["state"] != "connected"
+            assert not task.done()
+            assert "attempt/connection-complete/0" not in store.values
+        finally:
+            completed.set()
+        body, status = await task
+        assert status == 200 and body["state"] == "connected"
+
+    asyncio.run(run())
+
+
+def test_connected_requires_current_peer_confirmation():
+    from sglang.multimodal_gen.runtime.realtime.worker_connection_ports import (
+        confirm_bridge_connection,
+    )
+
+    class Store:
+        # A previous attempt cannot confirm the new connection.
+        values = {"old-attempt/connection-complete/1": "complete"}
+
+        def set(self, key, value):
+            self.values[key] = value
+
+        def check(self, keys):
+            return all(key in self.values for key in keys)
+
+    rolled_back = []
+    controller = manager(
+        build=lambda *_: confirm_bridge_connection(
+            Store(), "new-attempt", 0, "cpu", timeout=0.03
+        ),
+        rollback=lambda: rolled_back.append(True),
+    )
+    body, status = asyncio.run(controller.build(request(controller)))
+    assert status == 503 and body["success"] is False
+    assert controller.state != "connected"
+    assert rolled_back == [True]
+
+
+def test_successful_destroy_does_not_overwrite_concurrent_fault():
+    async def run():
+        async def destroy():
+            controller.quarantine()
+
+        controller = manager(destroy=destroy)
+        await controller.build(request(controller))
+        await controller.destroy(dict(worker_group_id="a"))
+        body, status = await controller.operation
+        assert status == 503 and body["restart_required"]
+        assert controller.query()[0]["state"] == "unavailable"
+
+    asyncio.run(run())
+
+
+def test_completed_build_does_not_overwrite_concurrent_fault():
+    def build(*_):
+        controller.quarantine()
+
+    controller = manager(build=build)
+    body, status = asyncio.run(controller.build(request(controller)))
+    assert status == 503 and body["restart_required"]
+    assert controller.query()[0]["state"] == "unavailable"

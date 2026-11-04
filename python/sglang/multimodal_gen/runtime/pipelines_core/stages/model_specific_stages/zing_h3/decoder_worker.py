@@ -617,6 +617,7 @@ def main():
                         ),
                         destroy=lambda local=local: local("group_destroy", force=False),
                         rollback=lambda local=local: local("group_destroy", force=True),
+                        cleanup_timeout=args.timeout_seconds,
                     )
                     lane["connections"] = manager
                     broker = DecoderOutputBroker(cancel_async_raw_rgb_frame_reference)
@@ -783,8 +784,19 @@ def main():
                                 receive_bridge_tensor,
                             )
 
-                            receive_bridge_tensor(
+                            initialization = receive_bridge_tensor(
                                 bridges[group_id], [1], torch.float32, device, peer=0
+                            )
+                            from sglang.multimodal_gen.runtime.realtime.worker_connection_ports import (
+                                confirm_bridge_connection,
+                            )
+
+                            confirm_bridge_connection(
+                                store,
+                                "zing-decoder-group:" + epoch,
+                                1,
+                                initialization.device,
+                                timeout=args.timeout_seconds,
                             )
                             lane["group_store"] = store
                         lane["group_id"] = group_id
@@ -794,6 +806,13 @@ def main():
                     outcomes = control.gather(group_error is None)
                     reply = dict(ok=all(outcomes))
                 elif op == "group_destroy":
+                    if command.get("force") and rank == 0:
+                        from sglang.multimodal_gen.runtime.disaggregation.transport.nccl_bridge import (
+                            abort_bridge_group,
+                        )
+
+                        for failed_bridge in bridges.values():
+                            abort_bridge_group(failed_bridge)
                     for ch, target in list(sessions.items()):
                         svc = target["service"]
                         direct = target.get("output_session")
@@ -830,7 +849,7 @@ def main():
                     if rank == 0:
                         for group in bridges.values():
                             shutdown = getattr(group, "shutdown", None)
-                            if shutdown is not None:
+                            if shutdown is not None and not command.get("force"):
                                 shutdown()
                         bridges.clear()
                         lane["group_store"] = None
@@ -1371,7 +1390,21 @@ def main():
                 error = exc
             # A failed execution ends the service: no peer may reuse a possibly
             # damaged stream or communicator, even if its local work succeeded.
-            control.agree("executed", control.sequence, error=error)
+            if error is not None:
+                for worker_lane in lanes:
+                    if worker_lane.get("connections") is not None:
+                        worker_lane["connections"].quarantine()
+                    if worker_lane["http"] is not None:
+                        worker_lane["http"].ready = False
+                from sglang.multimodal_gen.runtime.realtime.cleanup_watchdog import (
+                    CleanupWatchdog,
+                )
+
+                # Even the CPU failure agreement can stall behind a peer.
+                with CleanupWatchdog(args.timeout_seconds):
+                    control.agree("executed", control.sequence, error=error)
+            else:
+                control.agree("executed", control.sequence)
             # Payload-free ops reply ok only after every rank agreed no error.
             if reply is None:
                 reply = dict(ok=True)
@@ -1420,6 +1453,12 @@ def main():
                 )
     except Exception:
         logging.exception("Decoder service stopped on rank %s", rank)
+        quarantined = True
+        for lane in lanes:
+            if lane.get("connections") is not None:
+                lane["connections"].quarantine()
+            if lane["http"] is not None:
+                lane["http"].ready = False
         if rank == 0 and control.request_pending:
             try:
                 control.reply(
@@ -1433,33 +1472,46 @@ def main():
                 logging.exception("Decoder failure reply could not be sent")
         raise
     finally:
-        for lane in lanes:
-            if lane["http"] is not None:
-                lane["http"].ready = False
-            if lane["broker"] is not None:
-                lane["broker"].close(lane["broker"].session)
-        # No cross-rank collective after failure; retain the existing per-stream
-        # drain/disposal policy and release every service's output resources.
-        for lane in lanes:
-            for entry in list(lane["sessions"].values()):
-                if entry.get("service") is not None:
-                    entry["service"].dispose()
-            lane["sessions"].clear()
-            lane["channels"].clear()
-            lane["bridges"].clear()
-            lane["group_store"] = None
-            if lane["publisher"] is not None:
-                lane["publisher"].close()
-            if lane["output_http"] is not None:
-                lane["output_http"].close()
-            if lane["http"] is not None:
-                lane["http"].close()
-        entry = service = bridge = store = None
-        new_service = new_bridge = None
-        if socket is not None:
-            socket.close()
-        if context is not None:
-            context.term()
+        from sglang.multimodal_gen.runtime.realtime.cleanup_watchdog import (
+            CleanupWatchdog,
+        )
+
+        with CleanupWatchdog(args.timeout_seconds):
+            if quarantined and rank == 0:
+                from sglang.multimodal_gen.runtime.disaggregation.transport.nccl_bridge import (
+                    abort_bridge_group,
+                )
+
+                for failed_lane in lanes:
+                    for failed_bridge in failed_lane["bridges"].values():
+                        abort_bridge_group(failed_bridge)
+            for lane in lanes:
+                if lane["http"] is not None:
+                    lane["http"].ready = False
+                if lane["broker"] is not None:
+                    lane["broker"].close(lane["broker"].session)
+            # No cross-rank collective after failure; retain the existing per-stream
+            # drain/disposal policy and release every service's output resources.
+            for lane in lanes:
+                for entry in list(lane["sessions"].values()):
+                    if entry.get("service") is not None:
+                        entry["service"].dispose()
+                lane["sessions"].clear()
+                lane["channels"].clear()
+                lane["bridges"].clear()
+                lane["group_store"] = None
+                if lane["publisher"] is not None:
+                    lane["publisher"].close()
+                if lane["output_http"] is not None:
+                    lane["output_http"].close()
+                if lane["http"] is not None:
+                    lane["http"].close()
+            entry = service = bridge = store = None
+            new_service = new_bridge = None
+            if socket is not None:
+                socket.close()
+            if context is not None:
+                context.term()
 
 
 if __name__ == "__main__":

@@ -29,6 +29,8 @@ def discover(repo):
     patterns = (
         UNIT + "/test_zing*.py",
         UNIT + "/realtime/**/test_zing*.py",
+        UNIT + "/realtime/test_worker_connections.py",
+        UNIT + "/realtime/test_cleanup_watchdog.py",
         UNIT + "/conditioning/**/test_*.py",
         "test/registered/**/test_zing*.py",
         "test/registered/unit/multimodal_gen/**/test_*.py",

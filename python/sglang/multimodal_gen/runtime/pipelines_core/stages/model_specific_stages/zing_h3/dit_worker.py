@@ -90,8 +90,7 @@ def create_link_session(sampler, codecs, init, output, *, stage=None):
         ),
     )
 
-    def prepare(message):
-        nonlocal inputs
+    def prepare_candidate(message):
         active = inputs if message["initial"] else worker.state.inputs
         candidate = active
         if "inputs" in message:
@@ -126,18 +125,16 @@ def create_link_session(sampler, codecs, init, output, *, stage=None):
         condition = message["tensors"]
         # Use the original admission/packing rules with the candidate references.
         if kv_pool is not None:
-            coordinate_prompt_admission(
-                lambda: admit_prompt_update(
-                    stage,
-                    sampler,
-                    candidate,
-                    condition,
-                    source_shape=tuple(
-                        init.get("source_encoding", {}).get(k, init[k])
-                        // codecs.spatial_ratio
-                        for k in ("height", "width")
-                    ),
-                )
+            admit_prompt_update(
+                stage,
+                sampler,
+                candidate,
+                condition,
+                source_shape=tuple(
+                    init.get("source_encoding", {}).get(k, init[k])
+                    // codecs.spatial_ratio
+                    for k in ("height", "width")
+                ),
             )
         else:
             _, height, width = candidate.visual_shape
@@ -145,6 +142,14 @@ def create_link_session(sampler, codecs, init, output, *, stage=None):
                 (1, sampler.processor.visual_channels, 1, height, width)
             )
             sampler.processor.pack_inference_layout(candidate, condition, visual, None)
+        return candidate
+
+    def prepare(message):
+        nonlocal inputs
+        # Include geometry and packing, with or without a KV pool, in the same
+        # vote. Publish snapshots only after the leader accepts every rank.
+        candidate = coordinate_prompt_admission(lambda: prepare_candidate(message))
+        condition = message["tensors"]
         if message.get("cache_key") is not None:
             conditions.clear()
             snapshot = copy(candidate)

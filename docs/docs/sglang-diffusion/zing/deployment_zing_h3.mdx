@@ -1101,3 +1101,18 @@ H200两组速度回执见本页“736p 部署性能更新”；完整画质仍�
   - **1280×736**：单 DiT 基线 5.56 FPS（TTFF 8.21s）；双 DiT 并发聚合 **10.61 FPS**（1.91×，#0 5.30 / #1 5.30 FPS，TTFF 8.33s / 8.51s）；整卡峰值显存 GPU0 44,507 MiB、GPU1 110,923 MiB、GPU2 127,433 MiB、GPU3 106,017 MiB。
 - **DiT 运行时在线扩缩容 1→2→1→2（Job `dlc1nnv9nqr137yw`，832×480）**：`DiT #0` 全程流式推理零中断（单流 14.66→14.68→14.71 FPS），在线 `set_max_sessions(2)` 热接入 `DiT #1` 后双流聚合 **26.54 FPS**（1.81×），在线下线 `#1` 并 `bridge_close` 回收 NCCL 通信组（`active_bridges: 2→1`），再次扩容重连聚合 **27.09 FPS**（1.85×），全程 0 失败。
 - **Encoder/Decoder 运行时在线热扩容与 `set_draining` 优雅摘流缩容（Job `dlc1lfsb2jtk9qgr`，832×480）**：`DiT #0` 常驻不重启，初始 `#0` 14.69 FPS；在途流期间热启动 `Enc#1` / `Dec#1`、原子更新 `SGLANG_DISAGG_POOL_REGISTRY` 并对 `#0` 开启 `set_draining(True)`，在途会话完整跑完排空至 `active_sessions=0`，后续会话自动建连迁移至 `#1`（12.05 FPS，3/3 零中断），最终在线 `bridge_close` 并终止 `#0` 进程后 `#1` 独立稳定服务（12.05 FPS，3/3 成功）。736 档在线扩缩容与跨机多节点池化尚未验证。
+
+## Worker 通信生命周期修复验收（2026-11-04）
+
+本地修复覆盖连接完成确认、DiT 校验结果汇总和故障清理截止时间；接口语义与进程故障边界见 [Worker connection API](specs/WORKER_CONNECTION_API.md)。`connected` 需要本端 CUDA 完成及同次 bridge 的对端确认，三角色须配套升级。普通校验失败由 SP 主 rank 汇总后发布统一决定；通信故障后的 worker 保持隔离，不因本机清理成功而重新可用。
+
+- **配置**：H100 Encoder/Decoder 各一卡、H200 DiT SP2，1027 模型、832×480、既有采样与池配置。完整依赖层、Python 和 365 条发行包记录核对一致。所有进程显式设置 NCCL min/max channels=2、跨机 Socket；该进程环境变量也影响内部 SP2，不是独立 bridge 调优。
+- **早期证据**：`772927dc45` 加修复覆盖包 `0625094650c2`；独立 GPU 建连短测覆盖延迟 GPU/对端和缺失确认，4 个相关回归文件 40 项通过。少图 case 一次请求完整交付 403/403 帧、48 个 chunk。
+- **30 秒短测**：真实产品换图 case 的前 720 帧（24 FPS），不循环或重新编码，保留完整 prompt、参考图顺序及这段内全部更新边界。一次预热和一次正式均交付 720/720 帧、85 个 chunk。正式 TTFF **1.99s**、E2E **37.39s**、全程 **19.26 FPS**、首包后 **20.08 FPS**；这是单次派生短测，不代表完整原 case 集合通过。
+- **合入 main 后**：`a9a4b2f93e` 加同组修复，覆盖包 `95a924f86258`；本次三个修复的回归通过。再次建组后，一次不预热的同输入请求完整交付 720/720 帧、85 个 chunk，无客户端错误或 Encoder/Decoder NCCL 超时。该次只验流程，不作性能对照。扩展的上游 CUDA fixture 未完成验证，不计入本次通过范围。
+
+统一回查入口：上海 H100 `/mnt/zing-nvme/yesheng-aligned2-group-20261104-r1/`，含 `service-retest-fixed-code/`、`30s-warm-r1/`、`30s-mainfix-r1/` 和测试日志；每组保留命令、源码/输入身份、原始 JSON 与 RGB。监督器的子进程回归曾发现并修正脚本转义错误；其挂起/异常终止测试已通过，但真实 GPU 上逐项注入三类故障、NCCL abort 后退出/显存回收及重建仍未验证。
+
+本轮没有同条件预热后 baseline，也未采逐组件/逐 rank 时延与显存；736、完整产品集合、长期稳定性和逐张量数值 diff 待独立补测，不由这些正常路径结果外推。不同输入、缓存状态或源码版本的 FPS 不作为修复收益对照。
+
+后续 abort/close 并发修正（验证快照 `8591d6e89d`）已通过固定 Linux CPU 环境两轮 DiT I/O 回归，每轮 15 项、无跳过；覆盖 abort 未返回时的并发 close/重复 abort、abort 抛错及关闭顺序。原 GPU 服务结果不能外推到此修正，当前版本的真实 NCCL 故障注入与退出/资源回收仍未验证。[CPU 回执](https://github.com/seedleap/sglang/actions/runs/41805829330)仅证明受控线程交错和 I/O 生命周期行为。

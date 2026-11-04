@@ -27,6 +27,7 @@ class DiTGroups:
         self.leader = parallel is None or parallel.rank_in_group == 0
         self.commands = Queue()
         self.link = self.service = self.decoder_bridge = self.decoder_store = None
+        self.decoder_aborted = False
         self.running = True
         self.manager = ServiceConnections(
             descriptor,
@@ -34,6 +35,7 @@ class DiTGroups:
             build=lambda group, topology: self.submit("build", group, topology),
             destroy=lambda: self.submit("destroy"),
             rollback=lambda: self.submit("rollback"),
+            cleanup_timeout=timeout,
         )
 
     def submit(self, kind, *args):
@@ -101,7 +103,14 @@ class DiTGroups:
                 raise
             return result
 
-        self.service = DiTInputService(self.link, self.create_session, decoder)
+        self.service = DiTInputService(
+            self.link,
+            self.create_session,
+            decoder,
+            on_failure=self.manager.quarantine,
+            cleanup_guard=self.manager.cleanup_guard,
+            abort_transport=self.abort_transport,
+        )
 
     def _build_transport(self, group, topology):
         import torch
@@ -128,7 +137,8 @@ class DiTGroups:
                 identities=[
                     topology[role]["service_id"] for role in ("encoder", "dit")
                 ],
-            )
+            ),
+            cleanup_timeout=self.timeout,
         )
         self.link.start()
         self.decoder_store = self.store
@@ -144,6 +154,7 @@ class DiTGroups:
             0,
             timeout=self.timeout,
         )
+        self.decoder_aborted = False
         self.decoder_bridge = bridge_group(
             self.store,
             0,
@@ -154,11 +165,32 @@ class DiTGroups:
             send_bridge_tensor,
         )
 
-        send_bridge_tensor(
-            self.decoder_bridge, torch.zeros(1, device=self.device), peer=1
+        initialization = torch.zeros(1, device=self.device)
+        send_bridge_tensor(self.decoder_bridge, initialization, peer=1)
+        from .worker_connection_ports import confirm_bridge_connection
+
+        confirm_bridge_connection(
+            self.store,
+            "zing-decoder-group:" + epoch,
+            0,
+            initialization.device,
+            timeout=self.timeout,
         )
 
+    def abort_transport(self):
+        if self.link is not None:
+            self.link.abort_local()
+        if self.decoder_bridge is not None and not self.decoder_aborted:
+            from sglang.multimodal_gen.runtime.disaggregation.transport.nccl_bridge import (
+                abort_bridge_group,
+            )
+
+            abort_bridge_group(self.decoder_bridge)
+            self.decoder_aborted = True
+
     async def destroy(self, *, force=False):
+        if force:
+            self.abort_transport()
         service = self.service
         if service is not None:
             if not force:
@@ -197,16 +229,23 @@ class DiTGroups:
                     )
                     await service.queue.run_once()
             service.queue.clear()
+            if force and service.decoder is not None:
+                service.decoder.remote.failure = RuntimeError(
+                    "Worker connection failed"
+                )
             service._close_decoder()
             if service.worker is not None:
                 service.worker.close()
             self.service = None
         if self.link is not None:
-            self.link.close()
+            if force:
+                self.link.close(fault=True)
+            else:
+                self.link.close()
             self.link = None
         if self.decoder_bridge is not None:
             shutdown = getattr(self.decoder_bridge, "shutdown", None)
-            if shutdown is not None:
+            if shutdown is not None and not force:
                 shutdown()
             self.decoder_bridge = self.decoder_store = None
 
@@ -247,27 +286,19 @@ class DiTGroups:
                         # A failed model invocation cannot be treated as a clean
                         # transport disconnect. Keep the worker unavailable even
                         # when host-side resource release succeeds.
-                        transport_failed = (
-                            self.link.error is not None or self.service.transport_failed
-                        )
-                        with self.manager.lock:
-                            self.manager.state = "draining"
+                        self.manager.quarantine()
                         try:
-                            await self.destroy(force=True)
-                        except Exception:  # noqa: BLE001 - worker failure cleanup
-                            with self.manager.lock:
-                                self.manager.restart_required = True
-                                self.manager.state = "failed"
-                        else:
-                            with self.manager.lock:
-                                self.manager.restart_required = not transport_failed
-                                self.manager.state = (
-                                    "idle" if transport_failed else "failed"
-                                )
-                                self.manager.token = self.manager.group = (
-                                    self.manager.topology
-                                ) = None
+                            with self.manager.cleanup_guard():
+                                await self.destroy(force=True)
+                        except Exception:
+                            # The external guard remains armed on failure.
+                            # Never republish this worker as idle.
+                            import logging
+
+                            logging.exception("DiT fault cleanup failed")
+                            raise
                 await asyncio.sleep(0.005)
         finally:
             self.running = False
-            await self.destroy(force=True)
+            with self.manager.cleanup_guard():
+                await self.destroy(force=True)

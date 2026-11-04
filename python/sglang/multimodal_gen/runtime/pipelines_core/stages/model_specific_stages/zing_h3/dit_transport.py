@@ -9,6 +9,7 @@ synchronize. Pure control messages never allocate CUDA tensors.
 import math
 from contextlib import contextmanager
 from datetime import timedelta
+from threading import Lock
 
 import msgspec.msgpack
 import torch
@@ -34,6 +35,8 @@ class EncoderDiTChannel:
         self.max_bytes = max_bytes
         self.sent = self.received = 0
         self.store = self.context = None
+        self.aborted = False
+        self._group_close_lock = Lock()
 
     @contextmanager
     def io_context(self):
@@ -161,18 +164,41 @@ class EncoderDiTChannel:
                 reply = socket.recv_json()
                 if reply != dict(type="bridge.ready", version=1):
                     raise ValueError("Encoder/DiT link protocol does not match")
-                send_bridge_tensor(group, torch.zeros(1, device=device), peer=1)
+                initialization = torch.zeros(1, device=device)
+                send_bridge_tensor(group, initialization, peer=1)
             else:
                 socket.send_json(dict(type="bridge.ready", version=1))
-                receive_bridge_tensor(group, [1], torch.float32, device, peer=0)
+                initialization = receive_bridge_tensor(
+                    group, [1], torch.float32, device, peer=0
+                )
+            from sglang.multimodal_gen.runtime.realtime.worker_connection_ports import (
+                confirm_bridge_connection,
+            )
+
+            confirm_bridge_connection(
+                store,
+                "zing-encoder-dit-v1:" + epoch,
+                rank,
+                initialization.device,
+                timeout=timeout,
+            )
             channel = cls(group, socket, rank=rank, device=device)
             channel.store, channel.context = store, context
             return channel
         except BaseException:
-            if group is not None and hasattr(group, "shutdown"):
-                group.shutdown()
-            socket.close()
-            context.term()
+            from sglang.multimodal_gen.runtime.realtime.cleanup_watchdog import (
+                CleanupWatchdog,
+            )
+
+            with CleanupWatchdog(timeout):
+                if group is not None:
+                    from sglang.multimodal_gen.runtime.disaggregation.transport.nccl_bridge import (
+                        abort_bridge_group,
+                    )
+
+                    abort_bridge_group(group)
+                socket.close()
+                context.term()
             raise
 
     def send(self, message):
@@ -270,12 +296,32 @@ class EncoderDiTChannel:
         self.received += 1
         return message
 
+    def abort(self):
+        # May be called by the owner thread to unblock an I/O receive. Socket
+        # teardown remains exclusively on the I/O thread.
+        with self._group_close_lock:
+            if self.group is None or self.aborted:
+                return
+            group = self.group
+            # Publish the fault before releasing the lock or entering native
+            # code. An abort failure must never fall back to graceful shutdown.
+            self.aborted = True
+        from sglang.multimodal_gen.runtime.disaggregation.transport.nccl_bridge import (
+            abort_bridge_group,
+        )
+
+        abort_bridge_group(group)
+
     def close(self):
         # Private ProcessGroups are not registered in the default world.
-        shutdown = getattr(self.group, "shutdown", None)
+        with self._group_close_lock:
+            group, self.group = self.group, None
+            shutdown = None if self.aborted else getattr(group, "shutdown", None)
+        # Native operations may block. Claim teardown under the lock, but do
+        # not hold it while calling NCCL. The local reference owns the group
+        # until this call returns, even if another thread observes it closed.
         if shutdown is not None:
             shutdown()
-        self.group = None
         self.store = None
         self.socket.close()
         if self.context is not None:

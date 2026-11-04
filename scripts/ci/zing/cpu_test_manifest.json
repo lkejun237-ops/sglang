@@ -9652,163 +9652,41 @@
       "sources": [
         "main"
       ],
-      "reason": "Two fresh GitHub Ubuntu 24.04 / Python 3.11 CPU-recipe trials passed for PR #509; reviewed skips are listed explicitly.",
+      "reason": "Two fresh GitHub Actions Linux CPU trials passed with the unchanged pinned Python 3.11 CPU recipe; no skips.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "677ac824cf31dd6801755376642099f126647174cc52971825624bf2ba633a1c",
-        "source_revision": "862cc2862be7384df9e0deed8df92229c35dfd78",
-        "receipt": "https://github.com/seedleap/sglang/actions/runs/41491704793",
-        "artifact": "pr509-triage-dit-pipeline-contracts-41491704793",
-        "receipt_sha256": "4f33dfaa7d278a9d70494c50c898762dc14fc6e916ecdcab30954fbf76e9801b",
+        "source_sha256": "063b946896b09b1cc5f573b0416ac943ef8252cb22b9305d2c89b8a97c904b99",
+        "receipt": "https://github.com/seedleap/sglang/actions/runs/41805829330",
+        "artifact": "pr552-abort-race-cpu",
+        "receipt_path": "dit-io/receipt.json",
+        "receipt_sha256": "9d036f4eebfee31c2b15268a1bbee414b5dd5bd6d4eed657da16b56e21410125",
+        "checkout_sha": "8591d6e89d82d9c840bd6a716b44ce694eedf7ed",
+        "candidate_fingerprint": "44c377abfaca40e5799af7bde7ea4ef35d89cd7c59b91c0537a6ee7e372ab293",
         "trials": [
           {
             "trial": 1,
-            "passed": 8,
-            "collected": 8,
+            "passed": 15,
+            "collected": 15,
             "skipped": 0,
-            "duration_seconds": 13.736383286999995,
-            "exit_code": 0
+            "duration_seconds": 39.806434640000006,
+            "exit_code": 0,
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/dit-io/cpu-0-trial-1.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/dit-io/cpu-0-trial-1.xml"
           },
           {
             "trial": 2,
-            "passed": 8,
-            "collected": 8,
+            "passed": 15,
+            "collected": 15,
             "skipped": 0,
-            "duration_seconds": 13.018160943999987,
-            "exit_code": 0
+            "duration_seconds": 13.671973985000022,
+            "exit_code": 0,
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/dit-io/cpu-0-trial-2.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/dit-io/cpu-0-trial-2.xml"
           }
         ],
         "environment": {
-          "dependencies": {
-            "ImageIO": "2.38.1",
-            "Jinja2": "3.1.6",
-            "MarkupSafe": "3.0.3",
-            "PyYAML": "6.0.3",
-            "Pygments": "2.21.0",
-            "accelerate": "1.15.0",
-            "addict": "2.4.0",
-            "aiofiles": "25.1.0",
-            "aiohappyeyeballs": "2.7.1",
-            "aiohttp": "3.14.5",
-            "aiosignal": "1.4.0",
-            "annotated-doc": "0.0.5",
-            "annotated-types": "0.8.0",
-            "antlr4-python3-runtime": "4.9.3",
-            "anyio": "4.15.1",
-            "apache-tvm-ffi": "0.1.11",
-            "asttokens": "3.0.2",
-            "attrs": "26.1.0",
-            "certifi": "2026.7.22",
-            "charset-normalizer": "3.5.2",
-            "click": "8.5.0",
-            "cloudpickle": "3.1.2",
-            "datasets": "5.1.0",
-            "diffusers": "0.41.0",
-            "dill": "0.4.1",
-            "einops": "0.8.2",
-            "executing": "2.3.0",
-            "fastapi": "0.143.0",
-            "filelock": "3.32.3",
-            "frozenlist": "1.8.0",
-            "fsspec": "2026.7.0",
-            "h11": "0.16.0",
-            "hf-xet": "1.7.0",
-            "httpcore": "1.0.9",
-            "httpcore2": "2.13.1",
-            "httpx": "0.28.1",
-            "httpx2": "2.13.1",
-            "huggingface_hub": "1.33.0",
-            "idna": "3.20",
-            "imageio-ffmpeg": "0.6.0",
-            "importlib_metadata": "9.0.1",
-            "iniconfig": "2.3.1",
-            "ipython": "9.17.1",
-            "ipython_pygments_lexers": "1.1.1",
-            "isort": "7.0.0",
-            "jedi": "0.20.0",
-            "jiter": "0.17.0",
-            "loguru": "0.7.3",
-            "markdown-it-py": "4.2.0",
-            "matplotlib-inline": "0.2.2",
-            "mdurl": "0.1.2",
-            "mpmath": "1.3.0",
-            "msgpack": "1.2.3",
-            "msgspec": "0.22.0",
-            "multidict": "7.1.0",
-            "multiprocess": "0.70.19",
-            "networkx": "3.6.1",
-            "numpy": "2.2.6",
-            "omegaconf": "2.3.1",
-            "openai": "3.26.1",
-            "opentelemetry-api": "1.45.1",
-            "orjson": "3.13.0",
-            "packaging": "26.3",
-            "pandas": "3.0.6",
-            "parso": "0.8.7",
-            "partial-json-parser": "0.2.1.1.post7",
-            "pexpect": "4.9.0",
-            "pillow": "12.3.0",
-            "pip": "26.2.2",
-            "pluggy": "1.6.0",
-            "prometheus_client": "0.26.0",
-            "prompt_toolkit": "3.0.53",
-            "propcache": "0.5.4",
-            "psutil": "7.2.2",
-            "ptyprocess": "0.7.0",
-            "pure_eval": "0.2.4",
-            "pyarrow": "26.0.0",
-            "pybase64": "1.5.1",
-            "pydantic": "2.14.0",
-            "pydantic-settings": "2.15.0",
-            "pydantic_core": "2.50.0",
-            "pytest": "8.4.2",
-            "pytest-asyncio": "1.4.0",
-            "python-dateutil": "2.9.0.post0",
-            "python-dotenv": "1.2.4",
-            "python-multipart": "0.0.32",
-            "pyzmq": "27.2.0",
-            "regex": "2026.9.29",
-            "requests": "2.34.2",
-            "rich": "15.0.0",
-            "ruff": "0.15.1",
-            "safetensors": "0.8.0",
-            "scipy": "1.17.1",
-            "sentencepiece": "0.2.2",
-            "setuptools": "79.0.1",
-            "shellingham": "1.5.4",
-            "six": "1.17.0",
-            "sniffio": "1.3.1",
-            "stack-data": "0.6.3",
-            "starlette": "1.7.0",
-            "sympy": "1.14.0",
-            "tokenizers": "0.23.3",
-            "torch": "2.8.0+cpu",
-            "torchvision": "0.23.0+cpu",
-            "tqdm": "4.67.1",
-            "traitlets": "5.16.1",
-            "transformers": "5.19.0",
-            "triton": "3.8.0",
-            "truststore": "0.10.4",
-            "typer": "0.27.3",
-            "typing-inspection": "0.4.4",
-            "typing_extensions": "4.16.0",
-            "urllib3": "2.8.0",
-            "uvicorn": "0.39.0",
-            "wcwidth": "0.9.2",
-            "websockets": "15.0.1",
-            "xgrammar": "0.2.1",
-            "xxhash": "4.0.1",
-            "yarl": "1.25.1",
-            "zipp": "4.1.1"
-          },
-          "executable": "/opt/hostedtoolcache/Python/3.11.17/x64/bin/python",
-          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
           "python": "3.11.17",
-          "threads": {
-            "MKL_NUM_THREADS": "1",
-            "OMP_NUM_THREADS": "1",
-            "OPENBLAS_NUM_THREADS": "1"
-          }
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
         },
         "environment_recipe": {
           "python_version": "3.11",
@@ -9816,6 +9694,16 @@
             "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
             "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
           }
+        },
+        "manifest_sha256": "34aacf057268b21b843df0acb18d0cf11e97bcc3b70e12ce07b5abec4c569c4f",
+        "tooling_sha256": {
+          "check_python.py": "edced74edc439191f8ff97373e71fbb50d1469cff016c7163f0cb80d93ede73b",
+          "common.py": "52128fc66405da6918eecb98a73d76f322aa3fbe6fec9b55c0a3ff9924cb8f4b",
+          "run_cpu_tests.py": "f5981aec18cde4485454b14e473453533fd57bc98aa1af8631fc9148c3be479f",
+          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
+          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
+          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
+          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
         }
       }
     },
@@ -10802,6 +10690,198 @@
             "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
             "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
           }
+        }
+      }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/realtime/test_cleanup_watchdog.py",
+      "suite": "realtime-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two fresh GitHub Actions Linux CPU trials passed with the unchanged pinned Python 3.11 CPU recipe; no skips.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "ff6750b470e9ed3cb7ef04a56500b60b25913e15b9e93696f11504144e57abf5",
+        "receipt": "https://github.com/seedleap/sglang/actions/runs/41801838902",
+        "artifact": "pr552-targeted-cpu",
+        "receipt_path": "realtime/receipt.json",
+        "receipt_sha256": "c73ec4d63cb08c4e7dcc041bd65f028c07cbf3d304107199ff5a94aac8270a9b",
+        "checkout_sha": "c1e1336865ebcd8c9672f630d433db66bee6dbce",
+        "candidate_fingerprint": "e22437253253b8c4e55bb26d3669db626fa35a612736c413955b9a98804de0aa",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 6,
+            "collected": 6,
+            "skipped": 0,
+            "duration_seconds": 7.7520967650000046,
+            "exit_code": 0,
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/realtime/cpu-0-trial-1.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/realtime/cpu-0-trial-1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 6,
+            "collected": 6,
+            "skipped": 0,
+            "duration_seconds": 6.210508478000008,
+            "exit_code": 0,
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/realtime/cpu-0-trial-2.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/realtime/cpu-0-trial-2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.17",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
+        },
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          }
+        },
+        "manifest_sha256": "47b1355571535e2abb45def6b02c2c9c422ab4e9bf71f46818f2a6903748b76f",
+        "tooling_sha256": {
+          "check_python.py": "edced74edc439191f8ff97373e71fbb50d1469cff016c7163f0cb80d93ede73b",
+          "common.py": "52128fc66405da6918eecb98a73d76f322aa3fbe6fec9b55c0a3ff9924cb8f4b",
+          "run_cpu_tests.py": "f5981aec18cde4485454b14e473453533fd57bc98aa1af8631fc9148c3be479f",
+          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
+          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
+          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
+          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
+        }
+      }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/realtime/test_worker_connections.py",
+      "suite": "realtime-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two fresh GitHub Actions Linux CPU trials passed with the unchanged pinned Python 3.11 CPU recipe; no skips.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "76e180719a419102f4f7265c9dd0f072baded7f4e72af6c7838eeccfb40864fb",
+        "receipt": "https://github.com/seedleap/sglang/actions/runs/41801838902",
+        "artifact": "pr552-targeted-cpu",
+        "receipt_path": "realtime/receipt.json",
+        "receipt_sha256": "c73ec4d63cb08c4e7dcc041bd65f028c07cbf3d304107199ff5a94aac8270a9b",
+        "checkout_sha": "c1e1336865ebcd8c9672f630d433db66bee6dbce",
+        "candidate_fingerprint": "e22437253253b8c4e55bb26d3669db626fa35a612736c413955b9a98804de0aa",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 17,
+            "collected": 17,
+            "skipped": 0,
+            "duration_seconds": 5.319607008999981,
+            "exit_code": 0,
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/realtime/cpu-1-trial-1.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/realtime/cpu-1-trial-1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 17,
+            "collected": 17,
+            "skipped": 0,
+            "duration_seconds": 5.3039984119999986,
+            "exit_code": 0,
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/realtime/cpu-1-trial-2.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/realtime/cpu-1-trial-2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.17",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
+        },
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          }
+        },
+        "manifest_sha256": "47b1355571535e2abb45def6b02c2c9c422ab4e9bf71f46818f2a6903748b76f",
+        "tooling_sha256": {
+          "check_python.py": "edced74edc439191f8ff97373e71fbb50d1469cff016c7163f0cb80d93ede73b",
+          "common.py": "52128fc66405da6918eecb98a73d76f322aa3fbe6fec9b55c0a3ff9924cb8f4b",
+          "run_cpu_tests.py": "f5981aec18cde4485454b14e473453533fd57bc98aa1af8631fc9148c3be479f",
+          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
+          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
+          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
+          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
+        }
+      }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_prompt_admission.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two fresh GitHub Actions Linux CPU trials passed with the unchanged pinned Python 3.11 CPU recipe; no skips.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "35be2c5b812639a7f6e3a3fddbf8c84aa441e69c48b28bb18d1852afdb2c50be",
+        "receipt": "https://github.com/seedleap/sglang/actions/runs/41801838902",
+        "artifact": "pr552-targeted-cpu",
+        "receipt_path": "prompt/receipt.json",
+        "receipt_sha256": "9127b13b9229fc7d8f4c5226f202d77309d377706057e0a16e7f7165b551e208",
+        "checkout_sha": "c1e1336865ebcd8c9672f630d433db66bee6dbce",
+        "candidate_fingerprint": "e22437253253b8c4e55bb26d3669db626fa35a612736c413955b9a98804de0aa",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 9,
+            "collected": 9,
+            "skipped": 0,
+            "duration_seconds": 36.582492040000005,
+            "exit_code": 0,
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/prompt/cpu-0-trial-1.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/prompt/cpu-0-trial-1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 9,
+            "collected": 9,
+            "skipped": 0,
+            "duration_seconds": 13.22434742499999,
+            "exit_code": 0,
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/prompt/cpu-0-trial-2.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/prompt/cpu-0-trial-2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.17",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
+        },
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          }
+        },
+        "manifest_sha256": "47b1355571535e2abb45def6b02c2c9c422ab4e9bf71f46818f2a6903748b76f",
+        "tooling_sha256": {
+          "check_python.py": "edced74edc439191f8ff97373e71fbb50d1469cff016c7163f0cb80d93ede73b",
+          "common.py": "52128fc66405da6918eecb98a73d76f322aa3fbe6fec9b55c0a3ff9924cb8f4b",
+          "run_cpu_tests.py": "f5981aec18cde4485454b14e473453533fd57bc98aa1af8631fc9148c3be479f",
+          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
+          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
+          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
+          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
         }
       }
     }

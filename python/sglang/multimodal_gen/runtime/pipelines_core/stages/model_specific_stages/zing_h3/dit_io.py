@@ -18,12 +18,19 @@ class DiTIOChannel:
     """
 
     def __init__(
-        self, factory, *, max_pending=10, poll_interval_s=0.005, on_failure=None
+        self,
+        factory,
+        *,
+        max_pending=10,
+        poll_interval_s=0.005,
+        on_failure=None,
+        cleanup_timeout=None,
     ):
         if max_pending < 1 or poll_interval_s <= 0:
             raise ValueError("DiT I/O queue and polling interval must be positive")
         self.factory = factory
         self.on_failure = on_failure
+        self.cleanup_timeout = cleanup_timeout
         self.inbox = Queue(maxsize=max_pending)
         self.outbox = Queue(maxsize=max_pending)
         self.poll_interval_s = poll_interval_s
@@ -141,14 +148,32 @@ class DiTIOChannel:
                 except Empty:
                     break
                 done.set_exception(error)
-            if self.transport is not None:
-                try:
-                    self.transport.close()
-                except BaseException as exc:  # noqa: BLE001 - propagate thread failure to owner
-                    self.close_error = exc
-                    self.error = self.error or exc
-            if self.error is not None and self.on_failure is not None:
-                self.on_failure()
+            from sglang.multimodal_gen.runtime.realtime.cleanup_watchdog import (
+                CleanupWatchdog,
+            )
+
+            guard = (
+                CleanupWatchdog(self.cleanup_timeout)
+                if self.cleanup_timeout is not None
+                else nullcontext()
+            )
+            with guard:
+                # Notify before native shutdown: shutdown itself may hang.
+                if self.error is not None and self.on_failure is not None:
+                    self.on_failure()
+                if self.transport is not None:
+                    try:
+                        if self.error is not None:
+                            abort = getattr(self.transport, "abort", None)
+                            if abort is not None:
+                                abort()
+                        self.transport.close()
+                    except BaseException as exc:  # noqa: BLE001 - preserve owner failure
+                        self.close_error = exc
+                        self.error = self.error or exc
+                        if self.on_failure is not None:
+                            self.on_failure()
+                        raise
 
     def _finish_transfer(self, message):
         finish = getattr(self.transport, "finish_transfer", None)
@@ -160,14 +185,39 @@ class DiTIOChannel:
         while not self.pause_ack.wait(self.poll_interval_s):
             self._check()
 
-    def close(self):
-        self.stopping.set()
-        if self.thread is not None:
-            self.thread.join()
-        if self.close_error is not None:
-            raise RuntimeError("Worker transport cleanup failed") from self.close_error
-        while True:
-            try:
-                self.inbox.get_nowait()
-            except Empty:
-                break
+    def abort(self):
+        try:
+            if self.transport is not None:
+                abort = getattr(self.transport, "abort", None)
+                if abort is not None:
+                    abort()
+        finally:
+            # Waking a healthy I/O loop first would let its normal close path
+            # claim graceful shutdown before the transport publishes abort.
+            self.stopping.set()
+
+    def close(self, *, fault=False):
+        from sglang.multimodal_gen.runtime.realtime.cleanup_watchdog import (
+            CleanupWatchdog,
+        )
+
+        guard = (
+            CleanupWatchdog(self.cleanup_timeout)
+            if self.cleanup_timeout is not None
+            else nullcontext()
+        )
+        with guard:
+            if fault:
+                self.abort()
+            self.stopping.set()
+            if self.thread is not None:
+                self.thread.join()
+            if self.close_error is not None:
+                raise RuntimeError(
+                    "Worker transport cleanup failed"
+                ) from self.close_error
+            while True:
+                try:
+                    self.inbox.get_nowait()
+                except Empty:
+                    break

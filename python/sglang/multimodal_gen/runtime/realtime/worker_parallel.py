@@ -79,6 +79,17 @@ class ParallelChannel:
     def send(self, message):
         self.leader_call(lambda: self.local.send(message))
 
-    def close(self):
-        self.leader_call(lambda: self.local.close() if self.local is not None else None)
+    def abort_local(self):
+        # Fault handling cannot depend on peers entering another collective.
+        if self.leader and self.local is not None:
+            self.local.abort()
+
+    def close(self, *, fault=False):
+        if fault:
+            if self.leader and self.local is not None:
+                self.local.close(fault=True)
+        else:
+            self.leader_call(
+                lambda: self.local.close() if self.local is not None else None
+            )
         self.local = None

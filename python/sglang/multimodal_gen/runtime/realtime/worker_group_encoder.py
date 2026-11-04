@@ -39,6 +39,7 @@ def install_encoder_group(app, executor, pool, descriptor, store):
                         ],
                     ),
                     on_failure=controller.failed,
+                    cleanup_timeout=120,
                 ).start()
             )
             executor.conditioning.encode_tensor = lambda value: value.detach()
@@ -94,6 +95,7 @@ def install_encoder_group(app, executor, pool, descriptor, store):
         build=build,
         destroy=destroy,
         rollback=rollback,
+        cleanup_timeout=120,
     )
     app.state.worker_connections = controller
     executor.connection_controller = controller

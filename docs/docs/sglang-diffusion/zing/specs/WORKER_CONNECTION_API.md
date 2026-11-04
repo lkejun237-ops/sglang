@@ -257,6 +257,12 @@ topology.decoder = decoder_response.service
 
 **客户端 必须在各 service 的预留期内发送建连请求。** 接口等待本 service 建连完成后返回最终结果。
 
+`connected` 表示该 service 的每条链路已完成本端 CUDA 建连工作，并收到对端对同一次连接的完成确认。
+仅创建 communicator、提交 GPU 工作或 `Work.wait()` 返回均不足以发布 `connected`。
+确认使用本次 bridge epoch 隔离，旧连接确认不能复用；完成确认超时或失败时走建连失败与回滚路径。
+Master 仍须收到三侧成功，才能将整个通信组交给业务客户端。
+三角色须配套升级；旧版对端未提供完成确认时，新版按超时失败处理，不降级发布成功。
+
 ### 4.3 成功响应
 
 HTTP `200`：
@@ -326,5 +332,11 @@ Content-Type: application/json
 group 与当前通信组不匹配时返回 HTTP `409`。同一组正在清理时，重复请求返回相同的 `202` 清理中响应，不重复启动清理；同一组已经清理完成且 service 仍为空闲时，重复请求返回 `200`，状态为 `disconnected`。
 
 客户端 需要分别调用组内三个 service 的接口。清理期间拒绝新任务，`get_connection_status` 返回 `reserved`；清理完成后，下一次查询取得新的 10 秒预留并返回 `available`。如果后台清理失败且需要重启，查询返回 `503`、`unavailable` 和 `restart_required: true`。
+
+上述恢复 `available` 仅适用于正常拆组。运行或通信故障发生后，worker 在尝试清理前即隔离，查询返回 `503`、`unavailable` 和 `restart_required: true`；即使后续本机清理成功，也不据此复用出错的 CUDA/NCCL 上下文。建组或拆组完成不能覆盖并发出现的故障状态。
+
+故障关闭中止本地 bridge，不再等待对端补齐在途数据。独立于 CUDA 工作线程的进程监督器为清理设置绝对截止时间；正常清理完成后解除监督，清理异常或超时则保持监督并终止所属 worker 进程。Encoder 清理预算为 120 秒，DiT/Decoder 使用各自已有的 worker timeout；不依赖 NCCL watchdog 或 Python 线程取消保证退出。若多个 service 共用一个 worker 进程，该进程整体是故障边界；不主动终止其他独立服务进程。底层不支持 bridge abort 时不降级为正常排空，而是要求重启并保留退出兜底。部署层负责后续重建，本接口不自动重放业务请求。
+
+Encoder→DiT bridge 的 abort 与 close 在同一锁下取得关闭权，原生调用在锁外执行。abort 先发布故障状态，再调用底层中止；并发或后续 close 不再启动 graceful shutdown，中止失败也不回退排空。正常 close 已先取得关闭权时，不再并发发起原生 abort，其阻塞仍由清理截止时间兜底。模型线程先调用 transport abort，再通知 I/O 线程退出，避免退出通知提前触发正常关闭。
 
 本协议定义通信组管理接口；业务 WS 消息格式和缓存接口仍以各自既有协议为准。

@@ -103,3 +103,11 @@ def receive_bridge_tensor(
     value = torch.empty(shape, dtype=dtype, device=device)
     group.recv([value], peer, tag).wait()
     return value
+
+
+def abort_bridge_group(group):
+    """Abort a failed bridge; never drain unmatched operations as a fallback."""
+    abort = getattr(group, "abort", None)
+    if abort is None:
+        raise RuntimeError("Bridge abort is unavailable; worker restart is required")
+    abort()

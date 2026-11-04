@@ -86,6 +86,23 @@ def coordinate_validation(receipt):
     return values
 
 
+def coordinate_validation_decision(valid):
+    """Gather validation votes at the SP leader, then broadcast one decision."""
+    group = _sp_group()
+    if group is None or group.world_size == 1:
+        return valid
+    leader = group.rank_in_group == 0
+    receipts = [None] * group.world_size if leader else None
+    torch.distributed.gather_object(
+        valid, receipts, dst=group.ranks[0], group=group.cpu_group
+    )
+    decision = [all(receipts) if leader else None]
+    torch.distributed.broadcast_object_list(
+        decision, src=group.ranks[0], group=group.cpu_group
+    )
+    return decision[0]
+
+
 def broadcast_receipt(receipt):
     group = _sp_group()
     if group is None or group.world_size == 1:

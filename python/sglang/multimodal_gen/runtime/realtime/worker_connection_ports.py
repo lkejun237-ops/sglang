@@ -95,3 +95,30 @@ def bridge_epoch(store, group, rank, *, timeout=120):
                 return receiver + ":" + sender
         time.sleep(0.005)
     raise TimeoutError("Worker bridge handshake timed out")
+
+
+def confirm_bridge_connection(store, prefix, rank, device, *, timeout=120):
+    """Confirm local CUDA completion and the peer's completion before connected.
+
+    ``prefix`` must identify this connection attempt (the bridge epoch), never
+    just a reusable worker group ID. Work.wait() alone only orders CUDA work.
+    This runs on the thread/stream that established the bridge.
+    """
+    import time
+
+    import torch
+
+    deadline = time.monotonic() + timeout
+    if torch.device(device).type == "cuda":
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(device))
+        while not event.query():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Worker connection completion timed out")
+            time.sleep(0.005)
+    key = prefix + "/connection-complete/"
+    store.set(key + str(rank), "complete")
+    while not store.check([key + str(1 - rank)]):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Worker peer connection confirmation timed out")
+        time.sleep(0.005)
