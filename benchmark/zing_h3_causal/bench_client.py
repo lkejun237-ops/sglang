@@ -10,15 +10,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import hashlib
 import json
 import math
-import queue
 import statistics
 import subprocess
-import threading
 import time
 from pathlib import Path
 
+from benchmark_artifacts import TIMING_SCOPE, MediaCapture, check_retention
 from case_sets import DEFAULT_CASE_SET, load_case_set
 from prepare_whitebox_video_smoke import (
     expected_assets,
@@ -339,47 +339,6 @@ def prepare_case(label, manifest, media_root, sampling, case_id=None):
     }
 
 
-class MediaSink:
-    """Optional bounded background writer; never await disk inside reception."""
-
-    def __init__(self, path):
-        self.pending = queue.Queue(maxsize=4)
-        self.error = None
-        self.path = path
-        self.thread = threading.Thread(target=self.write, daemon=True)
-        self.thread.start()
-
-    def write(self):
-        try:
-            with self.path.open("wb") as file:
-                while True:
-                    payload = self.pending.get()
-                    if payload is None:
-                        return
-                    file.write(payload)
-        except Exception as exc:
-            self.error = exc
-
-    def submit(self, payload):
-        if self.error is not None:
-            raise OSError("Media writer failed") from self.error
-        try:
-            self.pending.put_nowait(payload)
-        except queue.Full as exc:
-            raise RuntimeError("Client media writer cannot keep up") from exc
-
-    def finish(self):
-        while self.thread.is_alive():
-            try:
-                self.pending.put(None, timeout=0.1)
-                break
-            except queue.Full:
-                continue
-        self.thread.join()
-        if self.error is not None:
-            raise OSError("Media writer failed") from self.error
-
-
 async def receive(ws, delivery, started, clock=time.perf_counter, sink=None):
     """Timestamp immediately on complete wire receipt, before unpacking/writing."""
     import msgpack
@@ -442,7 +401,7 @@ async def receive(ws, delivery, started, clock=time.perf_counter, sink=None):
             continue
         delivery.accept(message, payload, received - started)
         if sink is not None:
-            sink.submit(payload)
+            sink.write(payload)
 
 
 async def run_request(case, args, phase, index):
@@ -457,7 +416,21 @@ async def run_request(case, args, phase, index):
     if getattr(args, "receive_stage_timing", False):
         init["return_stage_timing"] = True
     payload = msgpack.packb(init, use_bin_type=True)
-    sink = MediaSink(args.output_dir / f"{request_id}.rgb") if args.save_media else None
+    mode = (
+        "raw"
+        if getattr(args, "save_media", False)
+        else getattr(args, "media_mode", "metrics")
+    )
+    if mode == "representative" and (phase != "measured" or index != 0):
+        mode = "metrics"
+    sink = MediaCapture(
+        args.output_dir / request_id,
+        case["width"],
+        case["height"],
+        case["frames"],
+        mode,
+        getattr(args, "ffmpeg", "ffmpeg"),
+    )
     result = {
         "request_id": request_id,
         "case_id": case["case_id"],
@@ -518,7 +491,15 @@ async def run_request(case, args, phase, index):
     result["chunk_count"] = len(delivery.chunks)
     result["metrics"] = calculate_metrics(delivery.chunks)
     result["icl_values_seconds"] = [row["icl_seconds"] for row in delivery.chunks[1:]]
-    result["media_path"] = str(sink.path) if sink is not None else None
+    result["media"] = sink.receipt
+    result["media_path"] = sink.receipt["media_path"]
+    result["output_sha256"] = sink.receipt["output_sha256"]
+    result["output_rgb_bytes"] = sink.receipt["output_rgb_bytes"]
+    result["input_sha256"] = hashlib.sha256(payload).hexdigest()
+    result["input_hash_scope"] = (
+        "serialized_init_request; referenced_assets_have_separate_hashes"
+    )
+    result["artifact_timing_scope"] = sink.timing_scope
     result["ifl_seconds"] = None
     append_jsonl(
         args.output_dir / "chunks.jsonl",
@@ -592,6 +573,7 @@ async def benchmark(cases, args):
     finally:
         summary = summarize(results, cases, args.measured_runs)
         write_json(args.output_dir / "summary.json", summary)
+        check_retention(args.output_dir)
 
 
 def write_json(path, value):
@@ -638,7 +620,7 @@ def parser():
     result.add_argument(
         "--save-media",
         action="store_true",
-        help="Save RGB through a bounded background writer",
+        help="Explicitly retain raw RGB (subject to the 2 GiB retention gate)",
     )
     result.add_argument(
         "--receive-stage-timing",
@@ -649,6 +631,12 @@ def parser():
     result.add_argument(
         "--no-stage-timing", dest="receive_stage_timing", action="store_false"
     )
+    result.add_argument(
+        "--media-mode",
+        choices=("metrics", "representative", "raw"),
+        default="representative",
+    )
+    result.add_argument("--ffmpeg", default="ffmpeg")
     result.add_argument("--preflight-only", action="store_true")
     return result
 
@@ -708,6 +696,9 @@ def main(argv=None):
             "cases": cases,
             "case_set": collection,
             "receive_stage_timing": args.receive_stage_timing,
+            "media_mode": "raw" if args.save_media else args.media_mode,
+            "artifact_timing_scope": TIMING_SCOPE,
+            "retention_budget_bytes": 2 << 30,
         }
         write_json(args.output_dir / "config.json", config)
         if not args.preflight_only and not asyncio.run(benchmark(cases, args)):

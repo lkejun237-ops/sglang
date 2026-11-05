@@ -323,16 +323,67 @@ python3 benchmark/zing_h3_causal/bench_client.py --case-set whitebox-basic \
   --sampling-params /data/benchmark/sampling.json \
   --deployment /data/benchmark/deployment.json \
   --output-dir /data/benchmark/run-001 \
-  --warmup-runs 1 --measured-runs 3 --save-media
+  --warmup-runs 1 --measured-runs 3
 ```
 
 单 case 用 `--case 5s`、`--case 30s-wasteland`、`--case 30s-town` 或 `--case 30s-indoor`。
 `--preflight-only` 核验输入并保存配置，不连接服务。输出目录必须是新目录。
 源码以冻结归档部署、没有 `.git` 时，显式传 `--source-revision` 的完整 Git SHA；
 修改后的客户端另以文件 SHA256 记录，部署方仍须校验归档和覆盖文件。
-`--save-media` 保存原尺寸 RGB；后台写盘队列有界，跟不上会明确失败而非阻塞
-接收后继续给出正常成绩。不保存时仍逐 payload 验证尺寸、格式、字节数和顺序。
-保存文件可用 ffmpeg 的 rawvideo/rgb24 输入选项按请求尺寸及 24 FPS 播放或封装。
+默认 `--media-mode representative`：每个 case 只为首个正式请求保存代表 MP4，
+其余预热/正式重复只留完整指标、帧数/字节数和输出 SHA-256；所有请求仍完整运行。
+代表视频从全程均匀选择最多 120 帧，最大宽度 640，以 12 FPS 编成 time-lapse；
+抽样原图内存上限 128 MiB，视频上限 64 MiB，FFmpeg 编码在请求结束后进行。
+`media.json` 保存抽帧索引、全量 RGB 哈希与媒体路径。它不能替代完整成片或像素 parity；
+质量验证需按动态换图等冻结边界另保留所需证据。直接调用连续客户端而未提供总帧数时，
+代表视频仅采样最初的有界帧，不能称为全程覆盖。
+
+`--media-mode metrics` 完全不留视频；`--media-mode raw`（有限客户端也支持旧的显式
+`--save-media`）才写原尺寸 RGB，并受留存门槛限制。新模式仍逐 payload 验证尺寸、
+格式、字节数和顺序，保存完整流的 SHA-256。有限接口的输入哈希覆盖序列化 init，
+其引用资产另有独立哈希；连续接口输入哈希覆盖实际发送的 RGB。
+
+### 实验结束留存与缓存清理
+
+单个实验的所有 case、配置和 attempt **合计不超过 2 GiB**（`2 << 30` bytes）；
+统计同时约束文件逻辑大小与已分配块，不跟随共享模型/素材符号链接。
+benchmark 写 `retention.json`，超预算报错，不能标记完成，不自动丢弃指标或准确性证据。
+`run_benchmark.py` 还核对包含 server 日志和报告的总输出根目录；外层矩阵 launcher
+必须用同一个实验根目录再验收，不能把每个 cell 的门槛当成总量通过。
+
+Block0 KV 是运行时可重建数据，不作为每轮长期留存。`run_benchmark.py` 显式使用
+`--block0-cache-disk-gb GB` 时，在新输出根目录创建受管缓存并在 server 停止后清理；
+这要求冻结 runtime 支持 Block0 参数，不改变未指定时的原缓存配置。
+独立 resident 客户端不会清理服务缓存，缓存收尾由拥有 worker 的外层 launcher 执行。
+新 launcher 使用冻结工具：
+
+```python
+# 示例 API；必须在本次专属实验根目录、worker 启动前取得 lease。
+from benchmark_artifacts import ExperimentRetention
+retention = ExperimentRetention(experiment_root)
+try:
+    cache = retention.create_cache("scratch/block0-cache")  # 必须此前不存在
+    # 启动本次 server，--zing-block0-cache-dir 指向 cache；执行完整矩阵。
+    # finally 中按 PID/启动身份停止本次所有 worker，并核实退出。
+    retention.finish(workers_stopped=True)
+finally:
+    retention.close()
+```
+
+`workers_stopped=True` 是调用方已核实退出的前置条件，不能在仅结束客户端请求后设置。
+工具只清理本次登记创建的缓存；先保存 JSON manifest/哈希，再删除 KV/conditions/.tmp
+payload，写 `cache-cleanup.json` 和留存回执。不接管已有缓存或共享服务缓存；
+拒绝并行 owner、路径越界、符号链接、挂载点和目录身份变化。不得在活跃任务根目录
+更新脚本，也不得扫描 `/mnt/zing-nvme` 按日期或目录名批删。
+
+成功、请求失败、OOM、超时和 SIGTERM 使用同一个 launcher finally。SIGKILL/节点故障
+不能保证自动收尾，遗留缓存需在核实精确 Job/Pod 终态、归属和活跃引用后单独恢复。
+必要的完整视频、无损窗口或逐 rank trace 超出预算时，按当前授权归档并校验远端
+大小/哈希后释放本地副本；无授权或校验失败则明确留存未通过，不能静默删除。
+
+哈希和有界抽帧在接收路径上，MP4 编码在计时结束后；旧的逐包写 RGB 结果与新模式
+须同保存模式重测 baseline。新增默认策略已做 CPU/本地 WebSocket 与媒体检查，
+当前 H100/H200/B300 的 480/736 整体性能及三组件耗时/显存**未重新验证**，不声称加速。
 
 ## 指标边界
 

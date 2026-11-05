@@ -17,6 +17,7 @@ from urllib.error import URLError
 from urllib.request import urlopen
 
 import bench_client
+from benchmark_artifacts import ExperimentRetention
 from build_benchmark_report import build_report, load_run
 from prepare_whitebox_video_smoke import open_media
 
@@ -193,6 +194,11 @@ def parser():
     result.add_argument("--stage-timing", choices=("off", "host"), default="host")
     result.add_argument("--startup-timeout", type=float, default=900)
     result.add_argument("--timeout", type=float, default=900)
+    result.add_argument(
+        "--block0-cache-disk-gb",
+        type=float,
+        help="Explicit Block0 runtime disk budget; cache is owned and removed at teardown (requires runtime support)",
+    )
     result.add_argument("--preflight-only", action="store_true")
     return result
 
@@ -210,6 +216,10 @@ def main(argv=None):
         )
     ):
         raise ValueError("Warmup/measured counts and timeouts must be positive")
+    if args.block0_cache_disk_gb is not None and (
+        not math.isfinite(args.block0_cache_disk_gb) or args.block0_cache_disk_gb <= 0
+    ):
+        raise ValueError("Block0 runtime disk budget must be positive")
     model = args.model_path.resolve(strict=True)
     sampling, deployment = checkpoint_settings(model)
     bundled = model / "pipeline_config.json"
@@ -324,7 +334,6 @@ def main(argv=None):
         str(args.measured_runs),
         "--timeout",
         str(args.timeout),
-        "--save-media",
     ]
     if args.stage_timing != "off":
         client.append("--receive-stage-timing")
@@ -345,24 +354,59 @@ def main(argv=None):
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", args.port))
     env = dict(os.environ)
-    with (output / "server.log").open("w") as log:
-        process = subprocess.Popen(
-            command,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            env=env,
-            start_new_session=True,
-        )
+    retention = ExperimentRetention(output)
+    process, workers_stopped = None, False
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def terminate(signum, frame):
+        raise SystemExit(128 + signum)
+
+    try:
+        signal.signal(signal.SIGTERM, terminate)
+        if args.block0_cache_disk_gb is not None:
+            cache = retention.create_cache("scratch/block0-cache")
+            command += [
+                "--zing-block0-cache-dir",
+                str(cache),
+                "--zing-block0-cache-disk-gb",
+                str(args.block0_cache_disk_gb),
+            ]
+            deployment["server_command"] = command
+            bench_client.write_json(output / "deployment.json", deployment)
+        with (output / "server.log").open("w") as log:
+            process = subprocess.Popen(
+                command,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+            )
+            try:
+                wait_ready(process, args.port, args.startup_timeout)
+                bench_client.main(client)
+            finally:
+                stop_server(process)
+                workers_stopped = args.block0_cache_disk_gb is None
+                if args.block0_cache_disk_gb is not None:
+                    try:
+                        os.killpg(process.pid, 0)
+                    except ProcessLookupError:
+                        workers_stopped = True
+                    else:
+                        raise RuntimeError(
+                            "Owned workers remain; Block0 cache cleanup refused"
+                        )
+                if (output / "client/summary.json").is_file():
+                    build_report(
+                        [load_run(args.stage_timing, output / "client")],
+                        output / "report.html",
+                    )
+    finally:
         try:
-            wait_ready(process, args.port, args.startup_timeout)
-            bench_client.main(client)
+            retention.finish(workers_stopped=workers_stopped or process is None)
         finally:
-            stop_server(process)
-            if (output / "client/summary.json").is_file():
-                build_report(
-                    [load_run(args.stage_timing, output / "client")],
-                    output / "report.html",
-                )
+            retention.close()
+            signal.signal(signal.SIGTERM, previous_sigterm)
     print(output / "report.html")
 
 

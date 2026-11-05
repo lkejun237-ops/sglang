@@ -5,7 +5,8 @@
 No total length is sent. EOF causes source.end, never a successful bare close.
 Use a live engine pipe, or a documented, non-looping raw export of real media.
 The receiver records local WebSocket delivery, not browser presentation or WAN
-capture latency. File writing is included and should use local fast storage.
+capture latency. Hashing and bounded sampling are included; video encoding runs
+after request completion. Full raw RGB output requires --media-mode raw.
 """
 
 import argparse
@@ -15,12 +16,13 @@ import json
 import threading
 import time
 from collections import deque
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 
 import msgpack
 import websockets
 from bench_client import calculate_metrics, distribution
+from benchmark_artifacts import TIMING_SCOPE, MediaCapture, check_retention
 from continuous_source_input import open_source, source_dimensions
 from continuous_source_media import load_prompt_updates, reference_payload
 from decoder_output_client import (
@@ -46,7 +48,7 @@ CLIENT_TIMING = {
     "wire_arrival": "complete_rgb_wire_received_before_message_unpack",
     "e2e_end": "last_valid_rgb_batch_received",
     "elapsed_end": "receiver_and_source_tasks_finished_after_server_close",
-    "scope": "client_websocket_delivery_with_rgb_file_backpressure",
+    "scope": TIMING_SCOPE,
 }
 
 
@@ -81,30 +83,63 @@ async def run(args, *, output_sink=None):
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
-    async with asyncio.timeout(args.timeout):
-        with (
-            (output / (output_sink.filename if output_sink else "output.rgb")).open(
-                "wb"
-            ) as received_file,
-            (output / "events.jsonl").open("w") as trace,
-        ):
-            async with open_source(
-                args, source_width * source_height * 3, output / "source-decode.log"
-            ) as read_source:
-                return await exchange(
-                    args,
-                    output,
-                    started,
-                    read_source,
-                    received_file,
-                    trace,
-                    output_sink=output_sink,
-                )
+    # Custom sinks own their latent/codec artifacts and retain their existing API.
+    capture = (
+        None
+        if output_sink is not None
+        else MediaCapture(
+            output,
+            args.width,
+            args.height,
+            args.expected_frames,
+            getattr(args, "media_mode", "representative"),
+            args.ffmpeg,
+        )
+    )
+    try:
+        async with asyncio.timeout(args.timeout):
+            with (
+                (
+                    (output / output_sink.filename).open("wb")
+                    if output_sink is not None
+                    else nullcontext(capture)
+                ) as received_file,
+                (output / "events.jsonl").open("w") as trace,
+            ):
+                async with open_source(
+                    args, source_width * source_height * 3, output / "source-decode.log"
+                ) as read_source:
+                    summary = await exchange(
+                        args,
+                        output,
+                        started,
+                        read_source,
+                        received_file,
+                        trace,
+                        output_sink=output_sink,
+                    )
+    finally:
+        try:
+            if capture is not None:
+                receipt = await asyncio.to_thread(capture.finish)
+        finally:
+            check_retention(output)
+    if capture is not None:
+        summary.update(
+            media=receipt, media_path=receipt["media_path"], media_mode=capture.mode
+        )
+        (output / "summary.json").write_text(json.dumps(summary, indent=2))
+    return summary
 
 
 async def exchange(
     args, output, started, read_source, received_file, trace, *, output_sink=None
 ):
+    timing = (
+        {**CLIENT_TIMING, "scope": received_file.timing_scope}
+        if output_sink is None
+        else CLIENT_TIMING
+    )
     prompt_updates = deque(load_prompt_updates(args.prompt_updates))
     message_budget = getattr(args, "max_message_bytes", DEFAULT_MESSAGE_BYTES)
     SourceTransportBudget(message_bytes=message_budget)
@@ -134,6 +169,7 @@ async def exchange(
         last_source_send=None,
         source_end_send=None,
         sink_confirmed_bytes=0,
+        sink_semantics="processed_rgb_bytes; persistence_is_recorded_in_media_receipt",
         credit_wait_seconds=0.0,
     )
     prompt_results = {}
@@ -230,7 +266,7 @@ async def exchange(
         (output / "client-timing.json").write_text(
             json.dumps(
                 {
-                    **CLIENT_TIMING,
+                    **timing,
                     "init_send_seconds": state["init_send"] - started,
                     "client_sha256": hashlib.sha256(
                         Path(__file__).read_bytes()
@@ -690,7 +726,11 @@ async def exchange(
                         dependency_to_output_seconds=dependency_latency,
                         block_capture_to_output_seconds=block_capture_latency,
                     )
-                    written = await asyncio.to_thread(received_file.write, payload)
+                    written = (
+                        await asyncio.to_thread(received_file.write, payload)
+                        if received_file.mode == "raw"
+                        else received_file.write(payload)
+                    )
                     if written != len(payload):
                         raise OSError("Incomplete RGB output write")
                     state["sink_confirmed_bytes"] += written
@@ -827,7 +867,7 @@ async def exchange(
                             "success": False,
                             "session_id": ready["session_id"],
                             "elapsed_seconds": time.monotonic() - started,
-                            "timing_boundaries": CLIENT_TIMING,
+                            "timing_boundaries": timing,
                             "input_sha256": input_hash.hexdigest(),
                             "output_sha256": output_hash.hexdigest(),
                             "delivery_times": delivery_times,
@@ -928,7 +968,7 @@ async def exchange(
             effective_delivery_fps=state["received"] / elapsed,
             completion_overhead_seconds=elapsed - metrics["e2e_seconds"],
             init_send_to_rgb=init_metrics,
-            timing_boundaries=CLIENT_TIMING,
+            timing_boundaries=timing,
             client_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             **metrics,
             timing_origin="client_start_before_connect_and_source_decode",
@@ -1002,6 +1042,11 @@ def parser():
     )
     parser.add_argument(
         "--source-height", type=int, help="Source RGB height; defaults to output height"
+    )
+    parser.add_argument(
+        "--media-mode",
+        choices=("metrics", "representative", "raw"),
+        default="representative",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--paced", action="store_true")

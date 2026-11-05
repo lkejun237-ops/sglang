@@ -7,6 +7,16 @@ description: "供 Codex 与部署同学使用的 H100/H200/B300 部署决策、�
 核对主线 `18d7e0cd9295`。下面是已有部署经验，只有对应版本、输入和配置的实测结论；
 实验补丁、显存快照、未验收画质均单独标注。新部署先选择一行，再沿证据入口取得原配置。
 
+## Benchmark 留存策略更新（2026-11-05，GPU 性能未重新验证）
+
+新实验默认保留完整指标/输入输出哈希及首个正式请求的有界代表 MP4，结束后在
+核实本次 worker 退出、持有专属 owner lease 的条件下清理本次 Block0 磁盘缓存，
+实验总留存以 2 GiB 为验收上限。不会改动已运行的任务或共享 Encoder/Decoder 缓存。
+原始逐包 RGB 写盘改为哈希/抽帧会影响客户端背压；H100/H200/B300 的 480/736
+新模式 E2E、Encoder/DiT/Decoder 耗时和逐 rank 显存均尚未重测，旧数据保留原版本
+及保存模式边界，不能归因成模型加速。参数、收尾 API 和验证入口见
+[客户端 benchmark 契约](../../../../benchmark/zing_h3_causal/CLIENT_BENCHMARK.md)。
+
 ## BF16 SP2 的 NCCL 启动配置（2026-11-05）
 
 独立 Encoder、DiT 和 Decoder 的正式 CLI 在初始化 NCCL 前统一设置

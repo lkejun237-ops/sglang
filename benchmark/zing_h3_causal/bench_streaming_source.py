@@ -16,6 +16,7 @@ from bench_client import (
     summarize,
     write_json,
 )
+from benchmark_artifacts import TIMING_SCOPE, check_retention
 from build_streaming_report import build_report, load_received_profiles
 from case_sets import DEFAULT_CASE_SET, load_case_set
 from continuous_source_client import CLIENT_TIMING
@@ -169,6 +170,9 @@ async def benchmark(cases, args):
         "concurrency": 1,
         "prewarm_only": getattr(args, "prewarm_only", False),
         "cache_write": getattr(args, "cache_write", False),
+        "media_mode": getattr(args, "media_mode", "representative"),
+        "artifact_timing_scope": TIMING_SCOPE,
+        "retention_budget_bytes": 2 << 30,
         "warmup_runs": args.warmup_runs,
         "measured_runs": args.measured_runs,
         "seed": args.seed,
@@ -200,6 +204,14 @@ async def benchmark(cases, args):
                     request_id = uuid.uuid4().hex
                     output = args.output_dir / case["label"] / f"{phase}-{index}"
                     command = [
+                        "--media-mode",
+                        (
+                            getattr(args, "media_mode", "representative")
+                            if phase == "measured"
+                            and index == 0
+                            or getattr(args, "media_mode", "") == "raw"
+                            else "metrics"
+                        ),
                         "--url",
                         args.url,
                         "--source-video",
@@ -263,7 +275,7 @@ async def benchmark(cases, args):
                         "chunk_count": 0,
                         "metrics": {},
                         "icl_values_seconds": [],
-                        "media_path": str(output / "output.rgb"),
+                        "media_path": None,
                         "input_mode": config["input_mode"],
                         "timing_origin": config["timing_origin"],
                         "expected_frames": case["frames"],
@@ -274,6 +286,8 @@ async def benchmark(cases, args):
                         result.update(
                             success=True,
                             client_observation=observation,
+                            media_path=observation.get("media_path"),
+                            media=observation.get("media"),
                             server_session_id=observation["session_id"],
                             input_sha256=observation["input_sha256"],
                             output_sha256=observation["output_sha256"],
@@ -320,6 +334,10 @@ async def benchmark(cases, args):
                                 )
                             except (OSError, ValueError) as receipt_error:
                                 result["receipt_error"] = type(receipt_error).__name__
+                    media_receipt = output / "media.json"
+                    if media_receipt.is_file():
+                        result["media"] = json.loads(media_receipt.read_text())
+                        result["media_path"] = result["media"]["media_path"]
                     prompt_evidence = output / "prompt-updates.json"
                     if prompt_evidence.is_file():
                         result.setdefault("streaming", {}).update(
@@ -460,6 +478,7 @@ async def benchmark(cases, args):
             args.output_dir / "results.html",
             json_output=args.output_dir / "report.json",
         )
+        check_retention(args.output_dir)
     return summary
 
 
@@ -512,6 +531,11 @@ def main():
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--timeout", type=float, default=900)
     parser.add_argument("--ffmpeg", default="ffmpeg")
+    parser.add_argument(
+        "--media-mode",
+        choices=("metrics", "representative", "raw"),
+        default="representative",
+    )
     args = parser.parse_args()
     if args.prewarm_only:
         args.measured_runs = 0

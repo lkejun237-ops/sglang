@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Checkpoint entry contracts; no model startup or GPU allocation."""
 
+import hashlib
 import io
 import json
+import shutil
 import signal
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 import run_benchmark as runner
+from benchmark_artifacts import ExperimentRetention, MediaCapture, check_retention
 
 
 @pytest.fixture
@@ -428,3 +434,279 @@ def test_memory_checkpoint_waits_for_the_exact_worker_count(tmp_path):
     )
     with pytest.raises(ValueError, match="alphanumeric"):
         profile_worker.checkpoint(tmp_path, "../unsafe", "snapshot", 2, 0.1)
+
+
+@pytest.mark.parametrize("workers_remain", [False, True])
+def test_block0_cache_teardown_requires_verified_worker_exit(
+    model, tmp_path, monkeypatch, workers_remain
+):
+    from pathlib import Path
+
+    monkeypatch.setattr(runner, "prepare_media", lambda *a: None)
+    monkeypatch.setattr(runner.bench_client, "prepare_case", lambda *a: {})
+    monkeypatch.setattr(runner, "wait_ready", lambda *a: None)
+    monkeypatch.setattr(runner.bench_client, "main", lambda *a: None)
+    process = type("Process", (), {"pid": 12345, "wait": lambda self, **k: None})()
+    cache_path = None
+
+    def launch(command, **kwargs):
+        nonlocal cache_path
+        cache_path = Path(command[command.index("--zing-block0-cache-dir") + 1])
+        (cache_path / "kv.bin").write_bytes(bytes(4096))
+        (cache_path / "manifest.json").write_text('{"dtype":"bfloat16"}')
+        return process
+
+    monkeypatch.setattr(runner.subprocess, "Popen", launch)
+
+    def signal_group(pid, sig):
+        assert pid == process.pid
+        if sig == 0 and not workers_remain:
+            raise ProcessLookupError()
+
+    monkeypatch.setattr(runner.os, "killpg", signal_group)
+    command = [
+        "--model-path",
+        str(model),
+        "--output-dir",
+        str(tmp_path / "run"),
+        "--case-set",
+        "whitebox-basic",
+        "--port",
+        "54321",
+        "--block0-cache-disk-gb",
+        "50",
+    ]
+    if workers_remain:
+        with pytest.raises(RuntimeError, match="Workers must be stopped"):
+            runner.main(command)
+        assert cache_path.is_dir() and (cache_path / "kv.bin").exists()
+    else:
+        runner.main(command)
+        assert not cache_path.exists()
+        receipt = json.loads((tmp_path / "run/cache-cleanup.json").read_text())
+        assert receipt["status"] == "complete"
+        assert receipt["metadata"][0]["content"] == '{"dtype":"bfloat16"}'
+        assert json.loads((tmp_path / "run/retention.json").read_text())[
+            "within_budget"
+        ]
+
+
+def test_metrics_hash_every_byte_without_raw_or_video(tmp_path):
+    capture = MediaCapture(tmp_path, 2, 2, 5, "metrics")
+    chunks = [bytes(range(24)), bytes(range(36))]
+    for chunk in chunks:
+        assert capture.write(chunk) == len(chunk)
+    receipt = capture.finish()
+    assert receipt["output_sha256"] == hashlib.sha256(b"".join(chunks)).hexdigest()
+    assert receipt["output_frames"] == 5
+    assert receipt["media_path"] is None
+    assert not list(tmp_path.glob("*.rgb")) and not list(tmp_path.glob("*.mp4"))
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="FFmpeg required")
+def test_representative_samples_across_entire_delivery_and_encodes_afterwards(tmp_path):
+    capture = MediaCapture(tmp_path, 8, 8, 240)
+    raw = bytes(range(192)) * 240
+    for i in range(0, len(raw), 192 * 17):
+        capture.write(raw[i : i + 192 * 17])
+    assert not capture.path.exists()
+    receipt = capture.finish()
+    assert receipt["sampled_frame_indices"][0] == 0
+    assert receipt["sampled_frame_indices"][-1] == 239
+    assert len(receipt["sampled_frame_indices"]) == 120
+    assert receipt["output_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert capture.path.stat().st_size < 64 << 20
+    # The pinned CPU recipe ships FFmpeg through imageio-ffmpeg, not ffprobe.
+    # Fully decode the preview to validate its frame count and geometry as well.
+    decoded = subprocess.check_output(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-i",
+            str(capture.path),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1",
+        ]
+    )
+    assert len(decoded) == 120 * 8 * 8 * 3
+    assert not list(tmp_path.glob("*.rgb"))
+
+
+def test_encoder_failure_keeps_hash_receipt_and_removes_partial_video(tmp_path):
+    capture = MediaCapture(tmp_path, 2, 2, 1, ffmpeg="missing-benchmark-encoder")
+    capture.write(bytes(12))
+    with pytest.raises(FileNotFoundError):
+        capture.finish()
+    receipt = json.loads((tmp_path / "media.json").read_text())
+    assert receipt["output_sha256"] == hashlib.sha256(bytes(12)).hexdigest()
+    assert receipt["error"] and receipt["media_path"] is None
+
+
+def test_owner_only_removes_registered_cache_after_worker_teardown(tmp_path):
+    owner = ExperimentRetention(tmp_path)
+    cache = owner.create_cache("scratch/block0")
+    (cache / "kv.bin").write_bytes(bytes(4096))
+    unrelated = tmp_path / "other-owner"
+    unrelated.mkdir()
+    (unrelated / "kv.bin").write_bytes(b"keep")
+    try:
+        with pytest.raises(RuntimeError, match="Workers must"):
+            owner.finish()
+        assert cache.exists()
+        receipt = owner.finish(workers_stopped=True)
+        assert receipt["within_budget"] and not cache.exists()
+        assert (unrelated / "kv.bin").read_bytes() == b"keep"
+    finally:
+        owner.close()
+
+
+def test_active_owner_blocks_second_process(tmp_path):
+    owner = ExperimentRetention(tmp_path)
+    cache = owner.create_cache("block0")
+    try:
+        code = "from benchmark_artifacts import ExperimentRetention; import sys; ExperimentRetention(sys.argv[1])"
+        env = {
+            **__import__("os").environ,
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+        }
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(tmp_path)],
+            env=env,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode != 0 and b"BlockingIOError" in result.stderr
+        assert cache.exists()
+    finally:
+        owner.close()
+
+
+@pytest.mark.parametrize("relative", ["../foreign", "/tmp/foreign"])
+def test_rejects_cache_path_escape(tmp_path, relative):
+    owner = ExperimentRetention(tmp_path)
+    try:
+        with pytest.raises(ValueError):
+            owner.create_cache(relative)
+    finally:
+        owner.close()
+
+
+def test_refuses_existing_cache_and_symlink_replacement(tmp_path):
+    owner = ExperimentRetention(tmp_path)
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    try:
+        with pytest.raises(FileExistsError):
+            owner.create_cache("foreign")
+        cache = owner.create_cache("block0")
+        cache.rmdir()
+        cache.symlink_to(foreign, target_is_directory=True)
+        with pytest.raises(RuntimeError, match="identity changed"):
+            owner.finish(workers_stopped=True)
+        assert foreign.exists()
+    finally:
+        owner.close()
+
+
+def test_refuses_link_inside_owned_cache_and_closed_lease(tmp_path):
+    owner = ExperimentRetention(tmp_path)
+    cache = owner.create_cache("block0")
+    (cache / "external").symlink_to(tmp_path.parent)
+    with pytest.raises(RuntimeError, match="link or mount"):
+        owner.finish(workers_stopped=True)
+    assert cache.exists()
+    owner.close()
+    with pytest.raises(RuntimeError, match="lease is closed"):
+        owner.finish(workers_stopped=True)
+
+
+def test_budget_failure_preserves_evidence_and_reports_failure(tmp_path):
+    (tmp_path / "requests.jsonl").write_bytes(bytes(65536))
+    with pytest.raises(RuntimeError, match="retention budget"):
+        check_retention(tmp_path, budget=8192)
+    assert (tmp_path / "requests.jsonl").stat().st_size == 65536
+    assert not json.loads((tmp_path / "retention.json").read_text())["within_budget"]
+
+
+def test_cache_metadata_is_retained_before_payload_removal(tmp_path):
+    owner = ExperimentRetention(tmp_path)
+    cache = owner.create_cache("block0")
+    manifest = b'{"shape":[50,2,16,14,128],"dtype":"bfloat16"}'
+    (cache / "manifest.json").write_bytes(manifest)
+    (cache / "kv.bin").write_bytes(bytes(4096))
+    try:
+        owner.finish(workers_stopped=True)
+    finally:
+        owner.close()
+    receipt = json.loads((tmp_path / "cache-cleanup.json").read_text())
+    assert receipt["status"] == "complete"
+    assert receipt["metadata"][0]["content"] == manifest.decode()
+    assert receipt["metadata"][0]["sha256"] == hashlib.sha256(manifest).hexdigest()
+    assert not cache.exists()
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="FFmpeg required")
+def test_finite_client_default_keeps_only_first_measured_preview(tmp_path):
+    import asyncio
+    from types import SimpleNamespace
+
+    import msgpack
+    from bench_client import run_request
+    from websockets.asyncio.server import serve
+
+    async def exercise():
+        async def handler(ws):
+            await ws.recv()
+            await ws.send(
+                msgpack.packb(
+                    {
+                        "type": "frame_batch",
+                        "format": "rgb24",
+                        "channels": 3,
+                        "width": 2,
+                        "height": 2,
+                        "num_frames": 2,
+                        "total_size": 24,
+                        "chunk_index": 0,
+                        "frame_batch_index": 0,
+                        "num_frame_batches": 1,
+                        "is_final_frame_batch": True,
+                        "request_id": "one",
+                        "payload": bytes(24),
+                    }
+                )
+            )
+            await ws.close(code=1000, reason="generation complete")
+
+        async with serve(handler, "127.0.0.1", 0) as server:
+            args = SimpleNamespace(
+                url=f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
+                output_dir=tmp_path,
+                media_mode="representative",
+                timeout=5,
+            )
+            case = {
+                "label": "case",
+                "case_id": "fixture",
+                "init": {"type": "init"},
+                "frames": 2,
+                "width": 2,
+                "height": 2,
+            }
+            return [
+                await run_request(case, args, phase, index)
+                for phase, index in [("warmup", 0), ("measured", 0), ("measured", 1)]
+            ]
+
+    rows = asyncio.run(exercise())
+    assert all(row["success"] for row in rows)
+    assert [row["media_path"] is not None for row in rows] == [False, True, False]
+    assert all(
+        row["output_sha256"] == hashlib.sha256(bytes(24)).hexdigest() for row in rows
+    )
+    assert len(list(tmp_path.rglob("*.mp4"))) == 1
+    assert not list(tmp_path.rglob("*.rgb"))

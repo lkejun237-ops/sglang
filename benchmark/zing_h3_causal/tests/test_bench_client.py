@@ -647,6 +647,8 @@ def test_streaming_client_delivers_before_eos_and_obeys_credit(
                     "17",
                     "--expected-frames",
                     "6",
+                    "--media-mode",
+                    "raw",
                     *(["--paced"] if paced else []),
                     *update_args,
                 ]
@@ -1403,6 +1405,7 @@ def test_streaming_benchmark_retains_delivery_after_failure(
         ) as server:
             args = SimpleNamespace(
                 output_dir=tmp_path,
+                media_mode="raw",
                 paced=False,
                 warmup_runs=1,
                 measured_runs=3,
@@ -1592,6 +1595,8 @@ def test_streaming_client_uses_advertised_reference_limit(tmp_path, limit, count
                     "2",
                     "--expected-frames",
                     "6",
+                    "--media-mode",
+                    "raw",
                     "--prompt",
                     "base",
                     "--prompt-updates",
@@ -1750,6 +1755,7 @@ def test_streaming_benchmark_runs_independent_source_geometry(
         ) as server:
             args = SimpleNamespace(
                 output_dir=tmp_path,
+                media_mode="raw",
                 paced=False,
                 warmup_runs=0,
                 measured_runs=1,
