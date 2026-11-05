@@ -10884,6 +10884,70 @@
           "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
         }
       }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/realtime/test_zing_nccl.py",
+      "suite": "realtime-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two fresh pinned Linux CPU trials passed with three cases and no skips.",
+      "dependencies": [],
+      "trial_evidence": {
+        "checkout_sha": "139bba1fc1f95892f516f7abbacf75d6d9d5ef37",
+        "candidate_fingerprint": "d493efc99afd5dc27132013694b7de8642b369d3854b3f0a0e39be20ac4f2807",
+        "manifest_sha256": "220998772dacdda349c727578c9388626c43db31569fbf5fa545a67888e13614",
+        "tooling_sha256": {
+          "check_python.py": "edced74edc439191f8ff97373e71fbb50d1469cff016c7163f0cb80d93ede73b",
+          "common.py": "52128fc66405da6918eecb98a73d76f322aa3fbe6fec9b55c0a3ff9924cb8f4b",
+          "run_cpu_tests.py": "f5981aec18cde4485454b14e473453533fd57bc98aa1af8631fc9148c3be479f",
+          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
+          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
+          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
+          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
+        },
+        "source_sha256": "ee8ef524764ad05dd2ae9403db38cd5f0ea6c9f37b7e493de8323cf414cbbf9b",
+        "receipt": "https://github.com/seedleap/sglang/actions/runs/41987625999",
+        "artifact": "zing-nccl-candidate-41987625999-1-139bba1fc1f95892f516f7abbacf75d6d9d5ef37",
+        "receipt_path": "receipt.json",
+        "receipt_sha256": "56dc91fe7568dae1c9dec7d526379d4397688e250a82d696783f7850e6b3d6d1",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 3,
+            "collected": 3,
+            "skipped": 0,
+            "duration_seconds": 6.228012931000023,
+            "exit_code": 0,
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/nccl-candidate/cpu-0-trial-1.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/nccl-candidate/cpu-0-trial-1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 3,
+            "collected": 3,
+            "skipped": 0,
+            "duration_seconds": 4.604787902999988,
+            "exit_code": 0,
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/nccl-candidate/cpu-0-trial-2.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/nccl-candidate/cpu-0-trial-2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.17",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
+        },
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          }
+        }
+      }
     }
   ],
   "recipes": {

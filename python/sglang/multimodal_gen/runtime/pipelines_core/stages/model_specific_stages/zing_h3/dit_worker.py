@@ -310,6 +310,10 @@ def main():
     if cli.sp_degree < 1 or cli.sp_degree != world_size:
         parser.error("--sp-degree must equal WORLD_SIZE; use torchrun for SP > 1")
 
+    from sglang.multimodal_gen.runtime.realtime.zing_nccl import configure_zing_nccl
+
+    configure_zing_nccl()
+
     from .encoder_worker import initialize_runtime_imports
 
     ServerArgs, set_global_server_args = initialize_runtime_imports()

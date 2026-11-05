@@ -7,6 +7,22 @@ description: "供 Codex 与部署同学使用的 H100/H200/B300 部署决策、�
 核对主线 `18d7e0cd9295`。下面是已有部署经验，只有对应版本、输入和配置的实测结论；
 实验补丁、显存快照、未验收画质均单独标注。新部署先选择一行，再沿证据入口取得原配置。
 
+## BF16 SP2 的 NCCL 启动配置（2026-11-05）
+
+独立 Encoder、DiT 和 Decoder 的正式 CLI 在初始化 NCCL 前统一设置
+`NCCL_MIN_NCHANNELS=2`，删除进程环境中的 `NCCL_MAX_NCHANNELS`、旧别名
+`NCCL_MAX_NRINGS` 以及 `NCCL_MIN_CTAS` / `NCCL_MAX_CTAS` 覆盖。
+DiT 每个 rank 都执行相同策略，MAX 不设固定值；网络、网卡等部署配置保持不变。
+启动日志记录被覆盖的值。此策略有意覆盖部署环境中的 channel/CTA 设置；
+仅适用于这些 Zing 入口，不修改其他模型或 LLM 的 NCCL 配置。
+NCCL 配置文件不能另外配置上述上限/CTA 覆盖；本策略不改写配置文件，也不修正已经
+初始化的 communicator。已有服务需用新版本重新启动。
+
+此前 MIN/MAX=2 来自测试启动脚本，而非 `2851826d1a` 的 Zing 默认值。
+复测不在测试启动脚本中重复设置 NCCL，核对实际启动日志后再与同条件基线比较。
+当前候选的 832×480 / 1280×736 GPU 性能及 Encoder、DiT、Decoder 耗时与显存矩阵
+尚未完成，不将历史 MIN-only 结果视为当前实现的验收。
+
 ## Block0 L1 分页候选（2026-11-02）
 
 在 PR #467 的管理语义上，将最大前缀定长槽改为启动预分配的 2048 行 CPU pinned 页，

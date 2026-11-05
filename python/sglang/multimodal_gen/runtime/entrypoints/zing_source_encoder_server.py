@@ -1038,6 +1038,10 @@ def main():
     )
     cli = parser.parse_args()
 
+    from sglang.multimodal_gen.runtime.realtime.zing_nccl import configure_zing_nccl
+
+    configure_zing_nccl()
+
     import uuid
 
     from sglang.multimodal_gen.runtime.realtime.worker_connection_ports import (

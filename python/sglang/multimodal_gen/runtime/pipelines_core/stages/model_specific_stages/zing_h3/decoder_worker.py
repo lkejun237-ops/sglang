@@ -466,6 +466,10 @@ def main():
         help="Base output WS port, separate from management HTTP",
     )
     args = parser.parse_args()
+    from sglang.multimodal_gen.runtime.realtime.zing_nccl import configure_zing_nccl
+
+    configure_zing_nccl()
+
     if args.static_connection:
         args.http_port = args.output_port = None
     import uuid
