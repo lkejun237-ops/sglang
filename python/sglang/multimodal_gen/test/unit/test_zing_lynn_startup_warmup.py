@@ -26,14 +26,15 @@ def test_lynn_preparation_precedes_pool_and_readiness(monkeypatch, fails):
     )
     stage = Mock()
     stage._build_realtime_sampler.side_effect = lambda params: calls.append("sampler")
-    stage.initialize_realtime_kv_cache_pool.side_effect = lambda args: calls.append(
-        "pool"
+    stage.initialize_realtime_kv_cache_pool.side_effect = lambda args, **kwargs: (
+        calls.append("pool")
     )
     monkeypatch.setattr(
         pipeline_module, "ZingH3GenerationStage", lambda *a, **kw: stage
     )
     pipeline = object.__new__(pipeline_module.ZingH3CausalPipeline)
     pipeline.model_path = "/unused/zing-model"
+    pipeline.pre_model_load_memory = 123
     pipeline.modules = {}
     pipeline.conditioning_mode = "local"
     pipeline.zing_runtime = {}

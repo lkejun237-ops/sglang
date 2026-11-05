@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Zing realtime KV pool contract, capacity and admission (#171, CPU only)."""
 
-import math
 from functools import partial
 from types import SimpleNamespace
 
@@ -16,12 +15,15 @@ from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
     ZingKVPoolConfig,
     ZingKVPoolPlan,
     ZingKVRequest,
+    cleaned_free_memory,
     peak_rows,
+    token_capacity,
 )
 from sglang.multimodal_gen.runtime.realtime.zing_window import ZingWindowPolicy
 
 # Historical capacity oracle explicitly exercises before-source eviction.
 peak_rows = partial(peak_rows, window_eviction_timing="before_source")
+build_plan = partial(ZingKVPoolPlan.build, token_capacity=250000)
 
 
 def _geometry(lengths=5, split=False, short_edge=720):
@@ -30,11 +32,9 @@ def _geometry(lengths=5, split=False, short_edge=720):
 
 def _config(**overrides):
     values = dict(
-        pool_size=2,
         window_eviction_timing="before_source",
         max_target_area=1280 * 704,
         max_target_long_edge=1280,
-        max_prefix_rows=4096,
     )
     values.update(overrides)
     return ZingKVPoolConfig(**values)
@@ -133,9 +133,7 @@ def test_mixed_spatial_grids_match_real_cache_peak(lengths, split):
 
 
 def test_source_480_target_736_admission_retains_slot_bound():
-    plan = ZingKVPoolPlan.build(
-        _config(max_target_area=1280 * 736), _geometry(short_edge=736)
-    )
+    plan = build_plan(_config(max_target_area=1280 * 736), _geometry(short_edge=736))
     request = _request(736, 1280, source_shape=(480, 832))
     rows = plan.admit(request)
     assert rows == 1000 + (920 + 390) * 5 * 21
@@ -192,9 +190,8 @@ def test_first_chunk_split_counts_short_sinks():
 
 
 def test_slot_capacity_and_budget():
-    plan = ZingKVPoolPlan.build(_config(), _geometry())
-    per_frame = (1280 // 32) * (704 // 32)
-    assert plan.slot_rows == 4096 + 2 * per_frame * 5 * 21
+    plan = build_plan(_config(), _geometry())
+    assert plan.slot_rows == 250000
     bytes_ = plan.slot_bytes(
         num_layers=50, local_heads=56, head_dim=128, element_size=2
     )
@@ -203,14 +200,14 @@ def test_slot_capacity_and_budget():
 
 @pytest.mark.parametrize("h,w", [(480, 832), (704, 1248), (704, 1280), (832, 480)])
 def test_smaller_canvases_fit_the_max_slot(h, w):
-    plan = ZingKVPoolPlan.build(_config(), _geometry())
+    plan = build_plan(_config(), _geometry())
     rows = plan.admit(_request(h, w))
     assert rows <= plan.slot_rows
     assert rows == 1000 + 2 * (h // 32) * (w // 32) * 5 * 21
 
 
 def test_source_free_session_uses_target_rows_only():
-    plan = ZingKVPoolPlan.build(_config(), _geometry())
+    plan = build_plan(_config(), _geometry())
     assert plan.admit(_request(source=False)) == 1000 + 390 * 5 * 21
 
 
@@ -220,7 +217,7 @@ def test_source_free_session_uses_target_rows_only():
         dict(h=480, w=848),  # not aligned to the 32-pixel grid
         dict(h=736, w=1280),  # short edge above the checkpoint bound
         dict(h=320, w=1312),  # long edge above the pool bound
-        dict(h=704, w=1280, prefix=4097),  # prefix above the bound
+        dict(h=704, w=1280, prefix=250001),  # total capacity exceeded
         dict(source_shape=(481, 864)),  # source has its own grid checks
         dict(window_chunks=None),
         dict(window_chunks=12),
@@ -231,7 +228,7 @@ def test_source_free_session_uses_target_rows_only():
     ],
 )
 def test_out_of_contract_requests_are_rejected(request_kwargs):
-    plan = ZingKVPoolPlan.build(_config(), _geometry(short_edge=704))
+    plan = build_plan(_config(), _geometry(short_edge=704))
     h, w = request_kwargs.pop("h", 480), request_kwargs.pop("w", 832)
     prefix = request_kwargs.pop("prefix", 1000)
     with pytest.raises(ZingKVPoolAdmissionError) as error:
@@ -241,53 +238,229 @@ def test_out_of_contract_requests_are_rejected(request_kwargs):
 
 
 def test_area_bound_rejects_aligned_canvas():
-    plan = ZingKVPoolPlan.build(_config(max_target_area=480 * 832), _geometry())
+    plan = build_plan(_config(max_target_area=480 * 832), _geometry())
     plan.admit(_request(480, 832))
     with pytest.raises(ZingKVPoolAdmissionError):
         plan.admit(_request(512, 832))
 
 
 def _pipeline(**values):
-    names = (
-        "size",
-        "max_target_area",
-        "max_target_long_edge",
-        "max_prefix_rows",
+    defaults = dict(
+        window_chunks=21,
+        sink_chunks=3,
+        rope_position_mode="block_relative",
+        rope_max_frame_gap=12,
+        window_eviction_timing="before_source",
     )
-    config = {f"zing_kv_pool_{n}": None for n in names}
-    config["zing_kv_pool_window_eviction_timing"] = "before_source"
-    config.update({f"zing_kv_pool_{k}": v for k, v in values.items()})
-    return SimpleNamespace(**config)
+    defaults.update(values)
+    return SimpleNamespace(**{f"zing_kv_pool_{k}": v for k, v in defaults.items()})
 
 
 def test_pipeline_config_disabled_by_default():
     assert ZingKVPoolConfig.from_pipeline_config(_pipeline(), max_sessions=8) is None
 
 
-def test_pipeline_config_requires_complete_contract():
-    with pytest.raises(ValueError, match="requires zing_kv_pool_size"):
+def test_pipeline_config_enforces_single_active_session():
+    with pytest.raises(ValueError, match="one active"):
         ZingKVPoolConfig.from_pipeline_config(
-            _pipeline(max_prefix_rows=10), max_sessions=1
-        )
-    with pytest.raises(ValueError, match="max_target_area"):
-        ZingKVPoolConfig.from_pipeline_config(_pipeline(size=1), max_sessions=1)
-
-
-def test_pipeline_config_must_cover_admitted_sessions():
-    kwargs = dict(max_target_area=1, max_target_long_edge=1, max_prefix_rows=1)
-    with pytest.raises(ValueError, match="cover every admitted"):
-        ZingKVPoolConfig.from_pipeline_config(
-            _pipeline(size=2, **kwargs), max_sessions=3
+            _pipeline(), max_sessions=2, mem_fraction_static=0.8
         )
     config = ZingKVPoolConfig.from_pipeline_config(
-        _pipeline(size=3, window_chunks=4, sink_chunks=1, **kwargs), max_sessions=3
+        _pipeline(window_chunks=4, sink_chunks=1),
+        max_sessions=1,
+        mem_fraction_static=0.8,
     )
-    assert (config.pool_size, config.window_chunks, config.sink_chunks) == (3, 4, 1)
+    assert (config.pool_size, config.window_chunks, config.sink_chunks) == (1, 4, 1)
+
+
+@pytest.mark.parametrize("entrypoint", ["pipeline", "dotted_args"])
+def test_retired_capacity_fields_fail_instead_of_disabling_pool(entrypoint):
+    from sglang.multimodal_gen.configs.pipeline_configs.zing_h3 import (
+        ZingH3CausalPipelineConfig,
+    )
+
+    config = ZingH3CausalPipelineConfig()
+    with pytest.raises(ValueError, match="mem-fraction-static"):
+        if entrypoint == "pipeline":
+            config.update_pipeline_config({"zing_kv_pool_size": 1})
+        else:
+            config.update_config_from_dict(
+                {"pipeline.zing_kv_pool_max_prefix_rows": 1024}, prefix="pipeline"
+            )
+
+
+def test_static_budget_uses_pre_load_available_memory():
+    gib = 1024**3
+    rows, budget = token_capacity(
+        before_load=80 * gib,
+        after_load=50 * gib,
+        mem_fraction_static=0.9,
+        num_layers=50,
+        local_heads=28,
+        head_dim=128,
+        element_size=2,
+    )
+    assert budget == 42 * gib
+    assert rows == budget // (3 * 50 * 28 * 128 * 2)
+    smaller, _ = token_capacity(
+        before_load=80 * gib,
+        after_load=50 * gib,
+        mem_fraction_static=0.8,
+        num_layers=50,
+        local_heads=28,
+        head_dim=128,
+        element_size=2,
+    )
+    assert smaller < rows
+    with pytest.raises(ValueError, match="Insufficient"):
+        token_capacity(
+            before_load=80 * gib,
+            after_load=1,
+            mem_fraction_static=0.8,
+            num_layers=50,
+            local_heads=28,
+            head_dim=128,
+            element_size=2,
+        )
+
+
+def test_static_budget_preserves_additional_runtime_reserve():
+    kwargs = dict(
+        before_load=80 << 30,
+        after_load=50 << 30,
+        mem_fraction_static=0.99,
+        num_layers=50,
+        local_heads=28,
+        head_dim=128,
+        element_size=2,
+    )
+    rows, budget = token_capacity(**kwargs, additional_runtime_reserve_bytes=8 << 30)
+    ordinary_rows, ordinary_budget = token_capacity(**kwargs)
+    assert budget == ordinary_budget - (8 << 30)
+    assert rows < ordinary_rows
+
+
+@pytest.mark.parametrize("prompt_prefix_frames", [0, 5])
+def test_kv_fit_does_not_admit_oversized_forward_workspace(prompt_prefix_frames):
+    from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+        ZING_FIXED_WORKSPACE_BYTES,
+        ZING_WORKSPACE_BYTES_PER_FEATURE,
+    )
+
+    geometry = _geometry(lengths=[3, 2], short_edge=736)
+    request = _request(prefix=24574)
+    # R29 original OOM: 24,574 prefix + three source + three target frames.
+    forward_rows = 26914
+    workspace = (
+        ZING_FIXED_WORKSPACE_BYTES
+        + ZING_WORKSPACE_BYTES_PER_FEATURE * 3584 * forward_rows
+    )
+    plan = build_plan(
+        _config(),
+        geometry,
+        runtime_budget_bytes=workspace,
+        local_hidden_width=3584,
+        prefix_hidden_width=3584,
+    )
+    assert (
+        plan.admit(request, prompt_prefix_frames=prompt_prefix_frames) < plan.slot_rows
+    )
+    smaller = build_plan(
+        _config(),
+        geometry,
+        runtime_budget_bytes=workspace - 1,
+        local_hidden_width=3584,
+        prefix_hidden_width=3584,
+    )
+    with pytest.raises(ZingKVPoolAdmissionError) as caught:
+        smaller.admit(request, prompt_prefix_frames=prompt_prefix_frames)
+    assert "forward workspace" in caught.value.detail
+    assert "forward workspace" not in str(caught.value)
+    # Same slot still admits a normal session after the refusal.
+    smaller.admit(_request(prefix=3259), prompt_prefix_frames=prompt_prefix_frames)
+
+
+@pytest.mark.parametrize(
+    "prefix,joint,forward_rows", [(0, False, 3510), (24574, True, 28864)]
+)
+def test_workspace_covers_cross_chunk_final_and_joint_prompt_replay(
+    prefix, joint, forward_rows
+):
+    from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+        ZING_FIXED_WORKSPACE_BYTES,
+        ZING_WORKSPACE_BYTES_PER_FEATURE,
+    )
+
+    request = _request(prefix=prefix)
+    # Three chunks for cross-chunk execution; joint prompt replacement also
+    # retains five clean frames in the same forward as prefix/source/target.
+    required = (
+        ZING_FIXED_WORKSPACE_BYTES
+        + ZING_WORKSPACE_BYTES_PER_FEATURE * 3584 * forward_rows
+    )
+    kwargs = dict(local_hidden_width=3584, prefix_hidden_width=3584)
+    plan = build_plan(
+        _config(), _geometry(lengths=[3, 2]), runtime_budget_bytes=required, **kwargs
+    )
+    plan.admit(request, prompt_prefix_frames=5, prompt_joint=joint)
+    smaller = build_plan(
+        _config(), plan.geometry, runtime_budget_bytes=required - 1, **kwargs
+    )
+    with pytest.raises(ZingKVPoolAdmissionError):
+        smaller.admit(request, prompt_prefix_frames=5, prompt_joint=joint)
+
+
+@pytest.mark.parametrize("sp", [1, 2, 4])
+def test_replicated_prefix_workspace_does_not_shrink_with_sp(sp):
+    from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+        ZING_FIXED_WORKSPACE_BYTES,
+        ZING_WORKSPACE_BYTES_PER_FEATURE,
+    )
+
+    request = _request(prefix=24574)
+    local_width = 7168 // sp
+    # The initial joint forward shards rows; serial prefix rebuilding uses
+    # all 24,574 rows at width 7,168 on every rank (R33's actual OOM path).
+    features = max(local_width * 26914, 7168 * 24574)
+    workspace = ZING_FIXED_WORKSPACE_BYTES + ZING_WORKSPACE_BYTES_PER_FEATURE * features
+    kwargs = dict(local_hidden_width=local_width, prefix_hidden_width=7168)
+    plan = build_plan(
+        _config(), _geometry(lengths=[3, 2]), runtime_budget_bytes=workspace, **kwargs
+    )
+    plan.admit(request, prompt_prefix_frames=5)
+    smaller = build_plan(
+        _config(), plan.geometry, runtime_budget_bytes=workspace - 1, **kwargs
+    )
+    with pytest.raises(ZingKVPoolAdmissionError, match="kv_pool_request_unsupported"):
+        smaller.admit(request, prompt_prefix_frames=5)
+    smaller.admit(_request(prefix=3259), prompt_prefix_frames=5)
+
+
+def test_measurement_collects_then_releases_idle_cache(monkeypatch):
+    calls = []
+    import sglang.multimodal_gen.runtime.realtime.zing_kv_pool as module
+
+    monkeypatch.setattr(module.gc, "collect", lambda: calls.append("gc"))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: calls.append("sync"))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty"))
+    monkeypatch.setattr(
+        torch.cuda, "mem_get_info", lambda device: calls.append("read") or (123, 456)
+    )
+    assert cleaned_free_memory("cuda:0") == 123
+    assert calls == ["gc", "sync", "empty", "read"]
+
+
+def test_prefix_and_history_share_capacity():
+    plan = build_plan(_config(), _geometry(), token_capacity=5000)
+    # A prefix larger than the old independent quota fits a short request.
+    assert plan.admit(_request(prefix=4500, source=False, total_frames=1)) == 4890
+    with pytest.raises(ZingKVPoolAdmissionError):
+        plan.admit(_request(prefix=4500, source=True, total_frames=1))
 
 
 @pytest.mark.parametrize(
     "overrides",
-    [dict(window_chunks=None), dict(sink_chunks=21), dict(pool_size=0)],
+    [dict(window_chunks=None), dict(sink_chunks=21), dict(max_target_area=0)],
 )
 def test_invalid_contract(overrides):
     with pytest.raises(ValueError):
@@ -392,11 +565,11 @@ def test_audio_peak_matches_real_cache(lengths, split, window, sink, finite):
 
 def test_slots_reserve_continuous_target_audio():
     packer = _packer()
-    plan = ZingKVPoolPlan.build(_config(), _audio_geometry(packer))
-    silent = ZingKVPoolPlan.build(_config(), _geometry())
-    assert plan.slot_rows > silent.slot_rows
+    plan = build_plan(_config(), _audio_geometry(packer))
+    silent = build_plan(_config(), _geometry())
+    assert plan.slot_rows == silent.slot_rows
     request = _request(704, 1280, prefix=4096, generates_audio=True)
-    assert plan.admit(request) == plan.slot_rows
+    assert plan.admit(request) < plan.slot_rows
     assert plan.admit(_request(generates_audio=True)) < plan.slot_rows
     # Without a time mapping the pool cannot account for target audio.
     with pytest.raises(ZingKVPoolAdmissionError):
@@ -405,11 +578,11 @@ def test_slots_reserve_continuous_target_audio():
 
 def test_finite_audio_tail_beyond_the_slot_is_rejected():
     packer = _packer()
-    plan = ZingKVPoolPlan.build(_config(), _audio_geometry(packer))
+    plan = build_plan(_config(), _audio_geometry(packer))
     frames = 5 * 21 * 3
     # The float span of the last frame lands just above an integer, so its
     # ceil already covers one extra latent; the tail must exceed that.
-    audio = math.ceil(packer._video_t_span(frames)) + 2
+    audio = 50000
     kwargs = dict(generates_audio=True, total_frames=frames, audio_length=audio)
     # Slots reserve continuous (v2v) audio; a smaller finite session has room
     # for its EOS audio remainder, one at the full bounds does not.

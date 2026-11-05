@@ -63,7 +63,7 @@ def cpu_cache(storage, *, entries=6, rows=32, page_rows=None):
 
     pool = NS(
         _pool=NS(_slots=[NS(kv_cache=storage)]),
-        plan=NS(config=NS(max_prefix_rows=rows)),
+        plan=NS(slot_rows=rows),
     )
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.disk_cache import (
         Block0DiskCache,

@@ -4,8 +4,9 @@
 The DiT leader sends normalized latents over a private NCCL bridge and receives
 one shared-memory reference per dispatch instead of pixels. Decode, uint8
 conversion, D2H and publication stay on the decoder host, so the DiT never
-waits for decode. One active session per independent listener; a failed generation ends the service
-because Lynn K/V state is not retryable.
+waits for decode. One active session per independent listener; model/transport
+failures end the service because Lynn K/V state is not retryable. Output
+cancellation drains queued inputs before the session owner releases the stream.
 """
 
 import argparse
@@ -632,6 +633,8 @@ def main():
                         ports["http"][index],
                         install=broker.install if output_port is None else None,
                     )
+                    # A client disconnect cancels its mailbox; invalid protocol
+                    # and real decoder failures retain worker isolation.
                     broker.on_send_failure = manager.failed
                     lane["http"].connections = manager
                     manager.install(lane["http"].app)
@@ -828,6 +831,7 @@ def main():
                                 rank == 0
                                 and direct is not None
                                 and not direct.completed
+                                and not direct.stopped.is_set()
                             ):
                                 direct.put(
                                     dict(
@@ -835,10 +839,10 @@ def main():
                                         output_frames=svc.valid_frame_end,
                                     ),
                                     args.timeout_seconds,
+                                    discard_if_stopped=True,
                                 )
-                                if (
-                                    not direct.done.wait(args.timeout_seconds)
-                                    or not direct.completed
+                                if not direct.done.wait(args.timeout_seconds) or (
+                                    not direct.completed and not direct.stopped.is_set()
                                 ):
                                     raise RuntimeError("Decoder output did not finish")
                         if output_broker is not None:
@@ -1321,6 +1325,7 @@ def main():
                                             output_metadata=command["output_metadata"],
                                         ),
                                         args.timeout_seconds,
+                                        discard_if_stopped=True,
                                     )
                             except BaseException as exc:
                                 if reference is not None:
@@ -1361,7 +1366,10 @@ def main():
                         if entry.get("auto_output"):
                             service.drain(args.timeout_seconds)
                         direct_output = entry.get("output_session")
-                        if direct_output is not None:
+                        if (
+                            direct_output is not None
+                            and not direct_output.stopped.is_set()
+                        ):
                             if direct_output.consumed_frames != command["total_frames"]:
                                 raise ValueError(
                                     "Decoder source credit did not drain before EOS"
@@ -1372,10 +1380,11 @@ def main():
                                     output_frames=command["total_frames"],
                                 ),
                                 args.timeout_seconds,
+                                discard_if_stopped=True,
                             )
-                            if (
-                                not direct_output.done.wait(args.timeout_seconds)
-                                or not direct_output.completed
+                            if not direct_output.done.wait(args.timeout_seconds) or (
+                                not direct_output.completed
+                                and not direct_output.stopped.is_set()
                             ):
                                 raise RuntimeError("Decoder output did not complete")
                     elif op == "close":

@@ -136,12 +136,23 @@ class EncoderConditioning:
             cache_key=self.cache_key,
             prefill=bool(batch.extra.get("zing_prefill")),
             force=batch.extra.get("zing_prefill", {}).get("force", False),
+            prompt_update=update is not None,
         )
+        if response.get("code") == "CONDITION_INVALID":
+            from sglang.multimodal_gen.runtime.conditioning.contract import (
+                ConditionError,
+            )
+
+            raise ConditionError(
+                "CONDITION_INVALID", "This request is too large for this server"
+            )
         self.cache_hit = bool(response.get("hit"))
         if not self.cache_hit:
             return None
         # Retain the original CPU condition media for later prompt-only changes.
         inputs = prepared_inputs(response["inputs"])
+        if getattr(self.codecs, "compute_plan", None) is not None:
+            self.codecs.validate_prepared_compute_inputs(inputs)
         inputs.condition_media = [
             {k: v.cpu() if hasattr(v, "cpu") else v for k, v in item.items()}
             for item in (inputs.condition_media or [])
@@ -408,6 +419,7 @@ class SourceEncoderExecutor:
             raise
 
     def forward(self, request):
+        from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
         from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
             ReleaseRealtimeSessionReq,
             ZingCacheReq,
@@ -469,8 +481,6 @@ class SourceEncoderExecutor:
         if owner != self.owner or batch.block_idx != self.command_index:
             raise ValueError("Source session identity or chunk sequence does not match")
         config = command["config"]
-        geometry = command.get("source_geometry")
-
         dit_outputs = []
         notices = []
 
@@ -496,6 +506,10 @@ class SourceEncoderExecutor:
                     result.pop("transfer_id", None)
                     dit_outputs.append(result)
                 elif result["type"] == "conditioning.rejected":
+                    if result.get("initial"):
+                        raise ConditionError(
+                            result["code"], "This request is too large for this server"
+                        )
                     if getattr(self.dit_link, "async_inputs", False):
                         self.conditioning.reject(result["event_id"])
                         notices.append(result)
@@ -512,10 +526,6 @@ class SourceEncoderExecutor:
                     raise ValueError("Unexpected DiT output")
 
             if rejection is not None:
-                from sglang.multimodal_gen.runtime.conditioning.contract import (
-                    ConditionError,
-                )
-
                 raise ConditionError(rejection["code"], "Condition update was rejected")
 
         def send_dit(kind, **payload):
@@ -551,9 +561,9 @@ class SourceEncoderExecutor:
             if notices:
                 result.realtime_handoff["conditioning_notices"] = notices
             return result
-        except BaseException:
+        except BaseException as exc:
             controller = getattr(self, "connection_controller", None)
-            if controller is not None:
+            if controller is not None and not isinstance(exc, ConditionError):
                 if self.dit_link is not None:
                     self.dit_link.failed = True
                 controller.failed()
@@ -701,9 +711,12 @@ class EncoderClient:
     def _forward(self, request):
         import torch
 
+        from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+
         try:
             result = self.executor.forward(request)
-        except BaseException:
+            torch.cuda.synchronize()
+        except BaseException as exc:
             from sglang.multimodal_gen.runtime.realtime.cleanup_watchdog import (
                 CleanupWatchdog,
             )
@@ -711,11 +724,15 @@ class EncoderClient:
             # Publish failure before waiting on a possibly broken CUDA stream.
             with CleanupWatchdog(120):
                 controller = getattr(self.executor, "connection_controller", None)
-                if controller is not None:
+                if controller is not None and not isinstance(exc, ConditionError):
                     controller.failed()
-                torch.cuda.synchronize()
+                try:
+                    torch.cuda.synchronize()
+                except BaseException:
+                    if controller is not None:
+                        controller.failed()
+                    raise
             raise
-        torch.cuda.synchronize()
         return result
 
 
@@ -800,6 +817,15 @@ def create_apps(
                     {**qwen.modules, **source.modules},
                     args.pipeline_config,
                     source.runtime,
+                )
+                from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+                    ZingComputeLimits,
+                )
+
+                # This service must reject unsafe encoding inputs before it sends
+                # tensors to a DiT, independently of that peer's token capacity.
+                codecs.compute_plan = ZingComputeLimits(
+                    (codecs.canvas_multiple,) * 2, codecs.max_short_edge
                 )
                 codecs.warmup_encoder()
                 if connection_ports is not None:

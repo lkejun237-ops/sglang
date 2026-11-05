@@ -133,6 +133,8 @@ Encoder、Decoder 支持通过 `--service-count N` 启动多个 service，默认
 
 输入 WS、输出 WS、ZMQ、TCPStore 等地址均通过查询获取，客户端 不推算这些端口。
 
+独立 DiT 也通过 `--mem-fraction-static` 启用共享静态 KV 容量，计算口径与原入口一致，并以各 rank 中最小容量为准。当前基于 main 的容量组合尚未新增 GPU 实测；历史 H100 独立 DiT 的 0.85 仅限原已测配方，不能直接作为本组合的默认值。Encoder 在执行条件计算或恢复缓存前独立检查输入几何与条件大小；DiT 再检查精确 KV 峰值。更新超限返回 `CONDITION_INVALID`，保留当前生成；初始请求超限会清理该请求，后续会话可继续使用原通信组。
+
 ### 3.1 DiT 的 SP 启动参数
 
 独立 DiT 通过 `--sp-degree` 指定序列并行度，当前允许 `1`、`2`，默认 `1`。该值必须等于启动进程的 `WORLD_SIZE`；SP2 使用 `torchrun` 启动两个 rank，每个 rank 使用一张可见 GPU。

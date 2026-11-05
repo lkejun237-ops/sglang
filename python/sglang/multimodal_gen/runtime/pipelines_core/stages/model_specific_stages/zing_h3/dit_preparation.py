@@ -30,10 +30,11 @@ class DiTPreparation:
     def cache(self):
         return self.stage.block0_cache
 
-    def cached_condition(self, message):
+    def cached_condition(self, message, *, initial):
         entry = self.cache.lookup(message["cache_key"])
         if entry is None:
             raise ValueError("The selected cache entry is no longer available")
+        self.stage.admit_cached_preparation(entry, prompt_update=not initial)
         device = next(self.stage.modules["transformer"].parameters()).device
         inputs = inputs_on(entry.inputs, device)
         return dict(
@@ -47,6 +48,15 @@ class DiTPreparation:
         )
 
     def control(self, operation, arguments, *, busy):
+        from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+
+        try:
+            return self._control(operation, arguments, busy=busy)
+        except ConditionError as exc:
+            # Admission is a request result, not a failed worker/transport.
+            return {"code": exc.code}
+
+    def _control(self, operation, arguments, *, busy):
         from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
             ZingCacheReq,
         )
@@ -71,6 +81,10 @@ class DiTPreparation:
                 if arguments.get("force", False)
                 else cache.lookup(key, allow_disk=arguments.get("prefill", False))
             )
+            if entry is not None:
+                self.stage.admit_cached_preparation(
+                    entry, prompt_update=arguments["prompt_update"]
+                )
             return {
                 "hit": entry is not None,
                 **(
@@ -91,6 +105,7 @@ class DiTPreparation:
                 else cache.lookup(arguments["cache_key"], allow_disk=True)
             )
             if existing is not None:
+                self.stage.admit_cached_preparation(existing)
                 cache.register(
                     existing.key,
                     game_id=arguments.get("game_id"),
@@ -105,10 +120,26 @@ class DiTPreparation:
             if arguments.get("inputs") is None:
                 return {"code": "cache_unavailable"}
             inputs = prepared_inputs(arguments["inputs"])
+            from .prompt_update import coordinate_prompt_admission
+
+            coordinate_prompt_admission(
+                lambda: self.stage.codecs.validate_prepared_compute_inputs(inputs)
+            )
+            sampler = self.sampler_factory()
+            admitted = self.stage.admit_realtime_condition(
+                sampler,
+                inputs,
+                inputs.positive,
+                source_shape=tuple(arguments["source_shape"]),
+                total_frames=None,
+                prompt_update=False,
+            )
+            if admitted is not None and not cache.can_store(admitted.prefix_rows):
+                return {"code": "cache_capacity_exceeded"}
             device = next(self.stage.modules["transformer"].parameters()).device
             entry = fill_prepared_prefix(
                 self.stage,
-                self.sampler_factory(),
+                sampler,
                 inputs_on(inputs, device),
                 owner=SimpleNamespace(),
                 key=arguments["cache_key"],

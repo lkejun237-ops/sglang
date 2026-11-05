@@ -84,11 +84,7 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
     # None selects <local serving export>/adaln-table; explicit paths are unchanged.
     zing_adaln_table_path: str | None = None
     zing_adaln_table_max_bytes: int = 536870912
-    # Realtime KV pool (#171). None disables it and keeps per-session growth.
-    zing_kv_pool_size: int | None = None
-    zing_kv_pool_max_target_area: int | None = None
-    zing_kv_pool_max_target_long_edge: int | None = None
-    zing_kv_pool_max_prefix_rows: int | None = None
+    # Realtime KV storage is sized by ServerArgs.mem_fraction_static.
     zing_kv_pool_window_chunks: int = 21
     zing_kv_pool_sink_chunks: int = 3
     zing_kv_pool_rope_position_mode: str = "block_relative"
@@ -109,8 +105,22 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
     # Legacy decoder fields the caller supplied; a default must not look like a choice.
     _explicit_decoder_fields = frozenset()
 
+    @staticmethod
+    def _reject_retired_kv_capacity(values, prefix=""):
+        names = ("size", "max_target_area", "max_target_long_edge", "max_prefix_rows")
+        supplied = [
+            prefix + "zing_kv_pool_" + name
+            for name in names
+            if values.get(prefix + "zing_kv_pool_" + name) is not None
+        ]
+        if supplied:
+            raise ValueError(
+                f"Retired Zing KV capacity fields {supplied}; use --mem-fraction-static"
+            )
+
     def update_config_from_dict(self, args, prefix: str = "") -> None:
         dotted = f"{prefix}." if prefix.strip() else ""
+        self._reject_retired_kv_capacity(args, dotted)
         self._explicit_decoder_fields = frozenset(
             name
             for name in LEGACY_DECODER_FIELDS
@@ -119,6 +129,7 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
         super().update_config_from_dict(args, prefix)
 
     def update_pipeline_config(self, source_pipeline_dict) -> None:
+        self._reject_retired_kv_capacity(source_pipeline_dict)
         self._explicit_decoder_fields = frozenset(
             name
             for name in LEGACY_DECODER_FIELDS

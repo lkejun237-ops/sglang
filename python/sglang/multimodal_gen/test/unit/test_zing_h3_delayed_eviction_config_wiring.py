@@ -27,7 +27,7 @@ def test_source_api_cannot_override_server_eviction_policy(policy):
 @pytest.mark.parametrize("policy", ["wrong", None, [], 1])
 def test_launch_rejects_invalid_eviction_policy(policy):
     with pytest.raises(ValueError, match="eviction"):
-        ZingKVPoolConfig(1, 1024, 32, 7, window_eviction_timing=policy)
+        ZingKVPoolConfig(window_eviction_timing=policy)
 
 
 @pytest.mark.parametrize("policy", ["before_source", "after_step0"])

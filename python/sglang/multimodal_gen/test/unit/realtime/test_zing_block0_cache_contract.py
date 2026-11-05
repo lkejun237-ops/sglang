@@ -139,9 +139,7 @@ def test_budget_is_decimal_gb_and_missing_mount_is_not_created(tmp_path, monkeyp
 
 def test_pinned_slots_are_sized_by_bytes_and_floor_unused_remainder(cpu_dma):
     store = NS(k=torch.zeros(8, 2, 3), v=torch.zeros(8, 2, 3))
-    pool = NS(
-        _pool=NS(_slots=[NS(kv_cache=[store])]), plan=NS(config=NS(max_prefix_rows=8))
-    )
+    pool = NS(_pool=NS(_slots=[NS(kv_cache=[store])]), plan=NS(slot_rows=8))
     slot_bytes = 2 * 8 * 2 * 3 * 4
     owner = Block0PreparationCache(
         pool,

@@ -451,6 +451,10 @@ class ServerArgs(DisaggServerArgsMixin):
     # ComfyUI integration
     comfyui_mode: bool = False
 
+    # Fraction of pre-load available device memory for weights and static KV.
+    # None keeps non-pooled/offline pipelines unchanged.
+    mem_fraction_static: float | None = None
+
     # Compilation
     enable_torch_compile: bool = False
     enable_cuda_graph: bool = False
@@ -702,6 +706,11 @@ class ServerArgs(DisaggServerArgsMixin):
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
         self._validate_scheduler_rpc_timeout()
+        if self.mem_fraction_static is not None and (
+            type(self.mem_fraction_static) not in (int, float)
+            or not 0 < self.mem_fraction_static < 1
+        ):
+            raise ValueError("mem_fraction_static must be between 0 and 1")
         if self.conditioning_result_transport not in {None, "http", "nccl"}:
             raise ValueError("Unknown conditioning result transport")
         if self.zing_source_encoder_mode not in {None, "serial", "overlap"}:
@@ -2308,6 +2317,12 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=None,
             help="Administrator conditioning authentication and limits JSON.",
+        )
+        parser.add_argument(
+            "--mem-fraction-static",
+            type=float,
+            default=ServerArgs.mem_fraction_static,
+            help="Fraction of pre-load available GPU memory for model weights and static KV storage. The remainder is runtime headroom (Zing H3).",
         )
         # Model and path configuration
         parser.add_argument(

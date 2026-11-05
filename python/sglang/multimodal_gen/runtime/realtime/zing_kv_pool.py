@@ -2,13 +2,12 @@
 """Launch contract, capacity and admission for the Zing realtime KV pool.
 
 Zing stores K/V as linear rows ``[rows, local heads, head dim]``; a slot is not
-tied to a spatial shape. A slot is sized once for the configured upper bounds
+tied to a spatial shape. A single slot is sized once from the static memory budget
 and any realtime session whose peak row count fits is admitted, so smaller
 resolutions reuse the same slot. Every target chunk pairs with a temporally aligned
 source chunk (or none), with an independent spatial grid, and with the stereo
-audio latents that packing assigns to its time span. Slots always reserve that
-target audio. Reference audio lives in the block-zero prefix and is covered by
-``max_prefix_rows``.
+audio latents that packing assigns to its time span. Prefix, source, target and
+audio share the same token capacity without independent quotas.
 
 Peak occupancy is enumerated through source and target stages. With
 ``before_source`` the retained window is selected before source; with
@@ -17,6 +16,7 @@ The target occupies the scratch tail until final commits it. Unconditional
 CFG forwards run without a cache and are not counted.
 """
 
+import gc
 import logging
 import math
 from collections.abc import Callable
@@ -34,6 +34,13 @@ from sglang.multimodal_gen.runtime.realtime.zing_window import ZingWindowPolicy
 
 # K/V/rotated-K per row: a finite window keeps raw K, V and a rotated-K scratch.
 ZING_KV_POOL_TENSORS_PER_ROW = 3
+
+# Runtime memory is separate from the persistent KV rows. Keep a floor even
+# when a caller sets mem_fraction_static close to one. Admission below also
+# accounts for the actual live forward, including prompt replacement.
+ZING_MIN_RUNTIME_BYTES = 8 * 1024**3
+ZING_FIXED_WORKSPACE_BYTES = 3 * 1024**3
+ZING_WORKSPACE_BYTES_PER_FEATURE = 64
 
 
 class ZingKVCapacityError(RuntimeError):
@@ -166,74 +173,117 @@ class ZingKVGeometry:
 
 @dataclass(frozen=True)
 class ZingKVPoolConfig:
-    pool_size: int
-    max_target_area: int
-    max_target_long_edge: int
-    max_prefix_rows: int
+    # These are compute geometry limits, independent of token capacity.
+    max_target_area: int = 1280 * 736
+    max_target_long_edge: int = 1280
     window_chunks: int = 21
     sink_chunks: int = 3
     rope_position_mode: str = "block_relative"
     rope_max_frame_gap: int = 12
     window_eviction_timing: str = "after_step0"
+    pool_size: int = field(default=1, init=False)
 
     def __post_init__(self):
-        for name in (
-            "pool_size",
-            "max_target_area",
-            "max_target_long_edge",
-            "max_prefix_rows",
-        ):
+        for name in ("max_target_area", "max_target_long_edge"):
             _positive_int(name, getattr(self, name))
         if self.window_chunks is None:
             raise ValueError("Zing KV pool requires a finite attention window")
         if self.window_eviction_timing not in ("before_source", "after_step0"):
-            raise ValueError(
-                "Zing window eviction timing must be before_source or after_step0"
-            )
+            raise ValueError("Invalid Zing window eviction timing")
         ZingWindowPolicy(self.window_chunks, self.sink_chunks)
         ZingWindowPolicy.validate_rope(self.rope_position_mode, self.rope_max_frame_gap)
 
     @property
-    def window_policy(self) -> ZingWindowPolicy:
+    def window_policy(self):
         return ZingWindowPolicy(self.window_chunks, self.sink_chunks)
 
     @classmethod
-    def from_pipeline_config(cls, pipeline_config, *, max_sessions: int):
-        """Return None when the pool is disabled; reject partial contracts."""
-        prefix = "zing_kv_pool_"
+    def from_pipeline_config(
+        cls, pipeline_config, *, max_sessions: int, mem_fraction_static=None
+    ):
+        if mem_fraction_static is None:
+            return None
+        if max_sessions != 1:
+            raise ValueError("Zing KV pool requires one active session per worker")
         names = (
-            "max_target_area",
-            "max_target_long_edge",
-            "max_prefix_rows",
             "window_chunks",
             "sink_chunks",
             "rope_position_mode",
             "rope_max_frame_gap",
             "window_eviction_timing",
         )
-        size = getattr(pipeline_config, prefix + "size", None)
-        values = {n: getattr(pipeline_config, prefix + n, None) for n in names}
-        if size is None:
-            configured = [prefix + n for n in names[:3] if values[n] is not None]
-            if configured:
-                raise ValueError(
-                    f"{', '.join(configured)} requires {prefix}size to be set"
-                )
-            return None
-        missing = [prefix + n for n in names[:3] if values[n] is None]
-        if missing:
-            raise ValueError(f"Zing KV pool requires {', '.join(missing)}")
-        config = cls(
-            pool_size=size, **{n: v for n, v in values.items() if v is not None}
-        )
-        _positive_int("max_sessions", max_sessions)
-        if config.pool_size < max_sessions:
-            raise ValueError(
-                "Zing KV pool must cover every admitted worker session: "
-                f"pool_size={config.pool_size} "
-                f"realtime_max_sessions_per_worker={max_sessions}"
+        return cls(**{n: getattr(pipeline_config, "zing_kv_pool_" + n) for n in names})
+
+
+@dataclass(frozen=True)
+class ZingComputeLimits:
+    """Metadata-only limits, also usable by an Encoder without a local KV pool."""
+
+    canvas_multiples: tuple[int, int]
+    max_short_edge: int
+    max_target_area: int = ZingKVPoolConfig.max_target_area
+    max_target_long_edge: int = ZingKVPoolConfig.max_target_long_edge
+
+    def validate_canvas(self, height, width):
+        mh, mw = self.canvas_multiples
+        if (
+            type(height) is not int
+            or type(width) is not int
+            or min(height, width) < 1
+            or height % mh
+            or width % mw
+            or min(height, width) > self.max_short_edge
+            or max(height, width) > self.max_target_long_edge
+            or height * width > self.max_target_area
+        ):
+            raise _unsupported(
+                f"canvas {height}x{width} exceeds compute geometry limits"
             )
-        return config
+
+
+def cleaned_free_memory(device):
+    """Use driver free bytes after releasing unreachable objects and idle cache."""
+    gc.collect()
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    return torch.cuda.mem_get_info(device)[0]
+
+
+def token_capacity(
+    *,
+    before_load,
+    after_load,
+    mem_fraction_static,
+    num_layers,
+    local_heads,
+    head_dim,
+    element_size,
+    additional_runtime_reserve_bytes=0,
+):
+    """Same static-memory definition as the LLM pool; no cached-byte add-back."""
+    if not 0 < mem_fraction_static < 1:
+        raise ValueError("mem_fraction_static must be between 0 and 1")
+    row_bytes = (
+        ZING_KV_POOL_TENSORS_PER_ROW
+        * num_layers
+        * local_heads
+        * head_dim
+        * element_size
+    )
+    _positive_int("row_bytes", row_bytes)
+    if additional_runtime_reserve_bytes < 0:
+        raise ValueError("additional runtime reserve must be nonnegative")
+    budget = math.floor(
+        after_load
+        - before_load * (1 - mem_fraction_static)
+        - additional_runtime_reserve_bytes
+    )
+    rows = budget // row_bytes
+    if rows < 1:
+        raise ValueError(
+            "Insufficient memory for Zing KV pool after runtime reserve; reduce resident weights or use a larger device"
+        )
+    return rows, budget
 
 
 def peak_rows(
@@ -248,6 +298,7 @@ def peak_rows(
     has_audio: bool = False,
     audio_length: int | None = None,
     window_eviction_timing: str = "after_step0",
+    prompt_prefix_frames: int = 0,
 ) -> int:
     """Maximum rows held by one session at any denoising step.
 
@@ -267,6 +318,15 @@ def peak_rows(
         )
     committed = {}
     plan = geometry.chunk_plan
+    current = 0
+    if prompt_prefix_frames and (
+        total_frames is None or total_frames > prompt_prefix_frames
+    ):
+        # Rebuilding clean target history commits every prefix chunk without
+        # normal eviction. The next source/target must also fit before step0.
+        for chunk in plan.chunks(prompt_prefix_frames):
+            committed[chunk.chunk_id] = rows_per_frame * (chunk.end - chunk.start)
+            current = chunk.chunk_id + 1
     if source_rows_per_frame is not None:
         _positive_int("source_rows_per_frame", source_rows_per_frame)
         if not has_source:
@@ -277,8 +337,8 @@ def peak_rows(
             rows_per_frame if source_rows_per_frame is None else source_rows_per_frame
         )
     split = int(plan.split_first_latent and plan.lengths[0] > 1)
-    steady = window.window_chunks + 2 + split
-    best, seen, stop, current = 0, {}, None, 0
+    steady = current + window.window_chunks + 2 + split
+    best, seen, stop = sum(committed.values()), {}, None
     while True:
         chunk = plan.chunk(current, total_frames)
         if chunk is None:
@@ -349,26 +409,39 @@ class ZingKVPoolPlan:
     config: ZingKVPoolConfig
     geometry: ZingKVGeometry
     slot_rows: int
+    runtime_budget_bytes: int | None = None
+    local_hidden_width: int | None = None
+    prefix_hidden_width: int | None = None
 
     @classmethod
-    def build(cls, config: ZingKVPoolConfig, geometry: ZingKVGeometry):
-        mh, mw = geometry.canvas_multiples
-        # Every admitted canvas is aligned, so its row count is at most this.
-        max_rows_per_frame = config.max_target_area // (mh * mw)
-        if max_rows_per_frame < 1:
-            raise ValueError("zing_kv_pool_max_target_area is below one grid cell")
-        slot_rows = peak_rows(
+    def build(
+        cls,
+        config: ZingKVPoolConfig,
+        geometry: ZingKVGeometry,
+        *,
+        token_capacity: int,
+        runtime_budget_bytes: int | None = None,
+        local_hidden_width: int | None = None,
+        prefix_hidden_width: int | None = None,
+    ):
+        _positive_int("token_capacity", token_capacity)
+        widths = (local_hidden_width, prefix_hidden_width)
+        if any((runtime_budget_bytes is None) != (width is None) for width in widths):
+            raise ValueError(
+                "runtime budget and joint/prefix hidden widths must be provided together"
+            )
+        if runtime_budget_bytes is not None:
+            _positive_int("runtime_budget_bytes", runtime_budget_bytes)
+            _positive_int("local_hidden_width", local_hidden_width)
+            _positive_int("prefix_hidden_width", prefix_hidden_width)
+        return cls(
+            config,
             geometry,
-            config.window_policy,
-            prefix_rows=config.max_prefix_rows,
-            rows_per_frame=max_rows_per_frame,
-            has_source=True,
-            window_eviction_timing=config.window_eviction_timing,
-            # Reserve target audio for every session; it is a small fraction
-            # of the visual rows and avoids a second slot class.
-            has_audio=geometry.video_t_span is not None,
+            token_capacity,
+            runtime_budget_bytes,
+            local_hidden_width,
+            prefix_hidden_width,
         )
-        return cls(config, geometry, slot_rows)
 
     def slot_bytes(self, *, num_layers, local_heads, head_dim, element_size):
         return (
@@ -380,7 +453,18 @@ class ZingKVPoolPlan:
             * element_size
         )
 
-    def admit(self, request: ZingKVRequest) -> int:
+    def validate_canvas(self, height, width):
+        c, g = self.config, self.geometry
+        ZingComputeLimits(
+            g.canvas_multiples,
+            g.max_short_edge,
+            c.max_target_area,
+            c.max_target_long_edge,
+        ).validate_canvas(height, width)
+
+    def admit(
+        self, request: ZingKVRequest, *, prompt_prefix_frames=0, prompt_joint=False
+    ) -> int:
         """Validate a request against the contract and return its peak rows.
 
         Only deterministic request inputs are read, so every SP rank reaches
@@ -408,23 +492,8 @@ class ZingKVPoolPlan:
         if request.generates_audio and g.video_t_span is None:
             raise _unsupported("pool geometry has no audio time mapping")
         h, w = request.target_height, request.target_width
+        self.validate_canvas(h, w)
         mh, mw = g.canvas_multiples
-        if type(h) is not int or type(w) is not int or h < 1 or w < 1:
-            raise _unsupported(f"invalid target canvas {h}x{w}")
-        if h % mh or w % mw:
-            raise _unsupported(
-                f"target canvas {h}x{w} is not aligned to the {mh}x{mw} grid"
-            )
-        if min(h, w) > g.max_short_edge:
-            raise _unsupported(
-                f"target short edge {min(h, w)} exceeds {g.max_short_edge}"
-            )
-        if max(h, w) > c.max_target_long_edge:
-            raise _unsupported(
-                f"target long edge {max(h, w)} exceeds {c.max_target_long_edge}"
-            )
-        if h * w > c.max_target_area:
-            raise _unsupported(f"target area {h * w} exceeds {c.max_target_area}")
         source_rows = None
         if request.source_shape is not None:
             shape = request.source_shape
@@ -444,26 +513,61 @@ class ZingKVPoolPlan:
             source_rows = g.rows_per_frame(sh, sw)
         if type(request.prefix_rows) is not int or request.prefix_rows < 0:
             raise _unsupported(f"invalid prefix rows {request.prefix_rows}")
-        if request.prefix_rows > c.max_prefix_rows:
-            raise _unsupported(
-                f"prefix rows {request.prefix_rows} exceed {c.max_prefix_rows}"
+        rows = max(
+            peak_rows(
+                g,
+                c.window_policy,
+                prefix_rows=request.prefix_rows,
+                rows_per_frame=g.rows_per_frame(h, w),
+                has_source=request.source_shape is not None,
+                source_rows_per_frame=source_rows,
+                total_frames=request.total_frames,
+                window_eviction_timing=request.window_eviction_timing,
+                has_audio=request.generates_audio,
+                audio_length=request.audio_length if request.generates_audio else None,
+                prompt_prefix_frames=prefix_frames,
             )
-        rows = peak_rows(
-            g,
-            c.window_policy,
-            prefix_rows=request.prefix_rows,
-            rows_per_frame=g.rows_per_frame(h, w),
-            has_source=request.source_shape is not None,
-            source_rows_per_frame=source_rows,
-            total_frames=request.total_frames,
-            window_eviction_timing=request.window_eviction_timing,
-            has_audio=request.generates_audio,
-            audio_length=request.audio_length if request.generates_audio else None,
+            for prefix_frames in {0, prompt_prefix_frames}
         )
         if rows > self.slot_rows:
-            # Only a finite session's audio tail can exceed the continuous
-            # per-chunk audio the slot reserves.
             raise _unsupported(f"peak rows {rows} exceed slot rows {self.slot_rows}")
+        if self.runtime_budget_bytes is not None:
+            # Prefix preparation and the joint source/target forward do not
+            # scale with retained KV occupancy. A replacement can additionally
+            # replay clean target frames. Use the longest chunk for both paths.
+            chunk = max(g.chunk_plan.lengths)
+            target_rows = g.rows_per_frame(h, w)
+            current_rows = chunk * (target_rows + (source_rows or 0))
+            replay_rows = prompt_prefix_frames * target_rows
+            forward_rows = max(
+                request.prefix_rows
+                + (
+                    current_rows + replay_rows
+                    if prompt_joint
+                    else max(current_rows, replay_rows)
+                ),
+                # Cross-chunk joint execution also includes the previous final.
+                chunk * (2 * target_rows + (source_rows or 0)),
+            )
+            workspace = (
+                ZING_FIXED_WORKSPACE_BYTES
+                + ZING_WORKSPACE_BYTES_PER_FEATURE
+                * max(
+                    self.local_hidden_width * forward_rows,
+                    # Stable prefix prefill/rebuild replicates every row and
+                    # the full hidden width on each SP rank. Only stored KV
+                    # heads are sharded; the prefix FFN workspace is not.
+                    self.prefix_hidden_width * request.prefix_rows,
+                )
+            )
+            if workspace > self.runtime_budget_bytes:
+                raise _unsupported(
+                    f"forward workspace {workspace} bytes exceeds runtime budget "
+                    f"{self.runtime_budget_bytes} bytes for {forward_rows} rows "
+                    f"(joint width={self.local_hidden_width}, "
+                    f"prefix rows={request.prefix_rows}, "
+                    f"prefix width={self.prefix_hidden_width})"
+                )
         return rows
 
 

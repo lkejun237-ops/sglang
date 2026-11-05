@@ -345,7 +345,7 @@ helper。
 为复用布局计数，只构造一个零值 target latent 作为占位，不执行模型、不消耗 RNG，
 也不重新申请 slot。未启用 KV pool 时不增加容量限制。
 
-超过 `max_prefix_rows` 的候选返回带该事件 ID 的非 fatal `CONDITION_INVALID` notice，
+超过共享 token 容量的候选返回带该事件 ID 的非 fatal `CONDITION_INVALID` notice，
 旧 active prompt、KV 和 lease 保留，会话继续生成，后续合法更新仍可生效。
 按既有 latest-wins 规则，失败的新事件也会淘汰更旧的 pending。检查只发生在收到
 新 prompt 时，普通生成块不重复执行。

@@ -10,8 +10,11 @@ import asyncio
 from contextlib import nullcontext
 
 from sglang.multimodal_gen.runtime.realtime.polling_task_queue import PollingTaskQueue
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 from .source_bridge import source_pixel_end
+
+logger = init_logger(__name__)
 
 
 class DiTLinkClient:
@@ -203,6 +206,8 @@ class DiTInputService:
         self.sequence = 0
 
     async def _process(self, queue):
+        from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+
         message = queue.popleft()
         sequence = message["transfer_id"]
         if sequence != self.sequence:
@@ -316,8 +321,16 @@ class DiTInputService:
                 self.worker.close()
                 self.worker = self.owner = None
             else:
+                # A rejected initial condition waits for the matching cancel;
+                # already-sent source payloads must still receive their ACKs.
+                if self.worker.closed:
+                    reply("input.processed")
+                    return
                 self.current_transfer = sequence
                 self.current_message = message
+                initial_condition = (
+                    kind == "conditioning" and not self.worker.initial_received
+                )
                 if kind == "source.moments":
                     # Identical boundary calculation to the integrated pipeline.
                     message["pixel_end"] = source_pixel_end(
@@ -330,7 +343,7 @@ class DiTInputService:
                     expand = getattr(self.create_session, "cached_condition", None)
                     if expand is None:
                         raise ValueError("Cached conditioning is unavailable")
-                    message = expand(message)
+                    message = expand(message, initial=initial_condition)
                 await self.worker.put(message)
                 while self.worker.queue:
                     await self.worker.queue.run_once()
@@ -363,7 +376,24 @@ class DiTInputService:
                     )
                     self.worker.close()
             reply("input.processed")
-        except BaseException:
+        except BaseException as exc:
+            if isinstance(exc, ConditionError) and kind == "conditioning":
+                if initial_condition:
+                    self._close_decoder()
+                    self.worker.close()
+                elif self.worker.state is not None:
+                    self.worker.state.discard_pending_prompt()
+                reply(
+                    "conditioning.rejected",
+                    session_id=self.owner[0],
+                    generation_id=self.owner[1],
+                    event_id=message.get("event_id"),
+                    initial=initial_condition,
+                    code=exc.code,
+                )
+                reply("input.processed")
+                return
+            logger.exception("DiT input processing failed")
             # Teardown clears decoder; preserve the failure category for the
             # group owner before deciding whether model restart is required.
             remote = getattr(self.decoder, "remote", None)

@@ -35,7 +35,7 @@ Block0 缓存采用 **“实例独占 L1（Host Pinned Memory） + 同机共享 
 
 ## 2. 容量规格与淘汰边界
 
-以下是与历史合成 IO 验收一致的容量示例：**SP=2、50 层 BF16 KV、每 rank 28 个 head、head_dim=128、12,288 prefix rows**。实际页容量取决于模型、SP 布局、页行数与 host 预算，应以实例启动时的页数与字节日志为准；max_prefix_rows 只限制单条合法行数：
+以下是与历史合成 IO 验收一致的容量示例：**SP=2、50 层 BF16 KV、每 rank 28 个 head、head_dim=128、12,288 prefix rows**。实际页容量取决于模型、SP 布局、页行数与 host 预算，应以实例启动时的页数与字节日志为准；单条前缀须满足共享 GPU token 容量，L1 还受 host 页预算限制：
 
 - **单分片（每张卡 / 每 rank）**：`50 × 2 × 12288 × 28 × 128 × 2 Bytes` = **8.81 GB**（二进制 **8.203 GiB**）
 - **单完整条目（SP=2 双卡合计）**：**17.62 GB**（二进制 **16.406 GiB**）
@@ -517,8 +517,9 @@ zing_cache_event {"operation_id":"wasteland-480-a","session_id":"...","game_id":
 同一网络命名空间内，每个实例还会占用 `HTTP port + 1` 作为离线 broker 端口；
 两个实例不能使用相邻 HTTP 端口，且应与 scheduler、master、conditioning 和 role 服务端口错开。
 先按[部署 recipe](/docs/sglang-diffusion/zing/deployment_zing_h3)准备模型、codec、AdaLN 等配置，并使用已有的 `--pipeline-config-path` JSON。
-该文件必须启用并完整配置 `zing_kv_pool_size`、`zing_kv_pool_max_target_area`、
-`zing_kv_pool_max_target_long_edge`、`zing_kv_pool_max_prefix_rows`；池大小须覆盖实例的会话准入上限。
+服务必须通过 `--mem-fraction-static` 启用静态 KV 池，且每个实例只允许一个活跃会话。
+比例的含义、容量计算和验证状态见
+[容量契约](/docs/sglang-diffusion/zing/specs/PERFORMANCE_DEFAULTS#预分配-kv-池的容量字段)。
 未设置 KV pool 时，Worker 不会创建 Block0 cache owner，仅传 cache 参数不能启用缓存。
 若沿用 Encoder/Decoder 分卡部署，保留 recipe 中的角色参数，并为两个实例分配互不重叠的 GPU。
 
@@ -530,10 +531,13 @@ zing_cache_event {"operation_id":"wasteland-480-a","session_id":"...","game_id":
 MODEL_PATH=/models/zing-h3
 PIPELINE_CONFIG_PATH=/models/zing-h3/pipeline.json
 CACHE_DIR=/mnt/nvme0/zing-block0-cache
+# 使用该硬件与输入集合实测通过的比例；当前迁移版本尚无推荐值。
+: "${MEM_FRACTION_STATIC:?Set the validated static memory fraction}"
 
 # 在独立终端启动实例 0：承担共享目录的 GC。
 CUDA_VISIBLE_DEVICES=0,1 sglang serve \
   --model-path "$MODEL_PATH" --pipeline-config-path "$PIPELINE_CONFIG_PATH" \
+  --mem-fraction-static "$MEM_FRACTION_STATIC" \
   --num-gpus 2 --sp-degree 2 --dp-size 1 \
   --port 30000 --master-port 30005 --scheduler-port 30555 \
   --zing-block0-cache-mode on \
@@ -548,6 +552,7 @@ CUDA_VISIBLE_DEVICES=0,1 sglang serve \
 # 在另一终端启动实例 1：共享 NVMe，不开启 GC。
 CUDA_VISIBLE_DEVICES=2,3 sglang serve \
   --model-path "$MODEL_PATH" --pipeline-config-path "$PIPELINE_CONFIG_PATH" \
+  --mem-fraction-static "$MEM_FRACTION_STATIC" \
   --num-gpus 2 --sp-degree 2 --dp-size 1 \
   --port 40000 --master-port 40005 --scheduler-port 40555 \
   --zing-block0-cache-mode on \
@@ -562,3 +567,5 @@ CUDA_VISIBLE_DEVICES=2,3 sglang serve \
 2. **开局前装载 L1**：选定目标空闲实例，调用 `POST /v1/zing/cache/preload`（传 `{"game_id": "...", "group_id": "..."}`），检查返回 `HTTP 200` 且 **`"all_ready": true`**（`missing` 也可能来自未完成、损坏或不兼容的 L2；先检查日志并按需重试或补热）。若在仍持有该 key 的原实例补写 L2，使用 `force=true`；默认 `force=false` 命中 L1 后不会重新写盘。也可在没有该 L1 条目的目标实例执行 `prefill`。
 3. **接入玩家流量**：将玩家视频会话定向路由至该实例（默认 `cache_write=false`，Block0 只查 L1、不读取 L2；未命中则重算）。
 4. **切关/退房轮换**：`preload` / `unload` 要求实例空闲。需在同一视频会话内切关时，提前装载所需分组并保证能同时驻留；要动态装载或卸载，则先结束当前会话并等待释放，再调用 `preload` / `unload`，完成后重新接入视频会话。活跃会话期间调用会返回 `409 cache_busy`。
+
+自动缓存写入遇到前缀超过 L1 host 页预算时跳过该条缓存，当前生成继续；显式预填充返回 `cache_capacity_exceeded`。这不会扩大 GPU 容量，也不会驱逐原有缓存来尝试存放无法容纳的条目。

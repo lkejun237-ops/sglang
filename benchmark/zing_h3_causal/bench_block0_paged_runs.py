@@ -43,7 +43,7 @@ def allocation_plan(rows, page_rows, layout):
     first = torch.empty((1, 1, 1), dtype=torch.bfloat16, device="cuda")
     pool = NS(
         _pool=NS(_slots=[NS(kv_cache=[NS(k=first)])]),
-        plan=NS(config=NS(max_prefix_rows=max(rows, 3 * page_rows))),
+        plan=NS(slot_rows=max(rows, 3 * page_rows)),
     )
     cache = Block0PreparationCache(
         pool,

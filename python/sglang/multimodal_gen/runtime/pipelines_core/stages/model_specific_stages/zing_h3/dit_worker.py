@@ -125,6 +125,9 @@ def create_link_session(sampler, codecs, init, output, *, stage=None):
         condition = message["tensors"]
         # Use the original admission/packing rules with the candidate references.
         if kv_pool is not None:
+            proposed = copy(candidate)
+            proposed.positive = condition
+            stage.codecs.validate_prepared_compute_inputs(proposed)
             admit_prompt_update(
                 stage,
                 sampler,
@@ -135,6 +138,7 @@ def create_link_session(sampler, codecs, init, output, *, stage=None):
                     // codecs.spatial_ratio
                     for k in ("height", "width")
                 ),
+                prompt_update=not message["initial"],
             )
         else:
             _, height, width = candidate.visual_shape
@@ -208,18 +212,20 @@ def create_link_session(sampler, codecs, init, output, *, stage=None):
                             ),
                             total_frames=None,
                         )
-                        cache.fill(
+                        stored = cache.fill(
                             message["cache_key"],
                             candidate,
                             message.get("conditioning_identity"),
                             request,
                             state.cache,
+                            required=False,
                         )
-                        cache.register(
-                            message["cache_key"],
-                            game_id=message.get("game_id"),
-                            group_id=message.get("group_id"),
-                        )
+                        if stored:
+                            cache.register(
+                                message["cache_key"],
+                                game_id=message.get("game_id"),
+                                group_id=message.get("group_id"),
+                            )
 
                     state.capture_initial_prefix = capture
                 if entry is None:
@@ -279,6 +285,11 @@ def main():
         "--http-port", type=int, default=33000, help="Serve worker health on this port"
     )
     parser.add_argument("--pipeline-config-path", type=Path)
+    parser.add_argument(
+        "--mem-fraction-static",
+        type=float,
+        help="Fraction of available GPU memory budgeted for resident models and KV",
+    )
     parser.add_argument("--zing-solver", choices=("euler", "few_step"))
     parser.add_argument("--zing-denoising-step-list", type=parse_noise_grid)
     parser.add_argument("--zing-initial-denoising-step-list", type=parse_noise_grid)
@@ -354,6 +365,7 @@ def main():
         use_fsdp_inference=False,
         performance_mode="speed",
         warmup_mode="off",
+        mem_fraction_static=cli.mem_fraction_static,
         realtime_max_sessions=1,
         realtime_max_sessions_per_worker=1,
         zing_source_joint_forward=cli.zing_source_joint_forward,
@@ -396,6 +408,13 @@ def main():
                     else "file://" + rendezvous + "/group"
                 ),
             )
+            before_load = None
+            if args.mem_fraction_static is not None:
+                from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+                    cleaned_free_memory,
+                )
+
+                before_load = cleaned_free_memory(torch.device("cuda", local_rank))
             model, _ = TransformerLoader().load(
                 str(cli.model / "transformer"),
                 args,
@@ -459,7 +478,7 @@ def main():
             # Share the original stage initialization before accepting input.
             # The configured pool must be used by every linked session below.
             stage._build_realtime_sampler(params)
-            stage.initialize_realtime_kv_cache_pool(args)
+            stage.initialize_realtime_kv_cache_pool(args, before_load=before_load)
 
             def create(init, output):
                 sampler = stage._build_realtime_sampler(params)

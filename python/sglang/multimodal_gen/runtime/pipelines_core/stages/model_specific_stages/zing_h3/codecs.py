@@ -33,6 +33,20 @@ from .media_input import ZingH3MediaInput, _sample_max_area_config
 from .packing import H3InferenceInputs
 from .visual_encoding import encode_clips
 
+# Default checkpoint reference preprocessing is larger than the output canvas.
+_STATIC_REFERENCE_MAX_AREA = 1032192
+
+
+def _source_compute_canvas_supported(height, width):
+    # Source encoding uses video chunks; the larger still-reference envelope
+    # does not establish a safe bound for this path.
+    return (
+        0 < min(height, width) <= 480
+        and max(height, width) <= 1280
+        and height * width <= 832 * 480
+    )
+
+
 _VISUAL_ENCODE_POLICY_LOCK = threading.RLock()
 logger = init_logger(__name__)
 
@@ -228,16 +242,139 @@ class ZingH3Codecs(ZingH3MediaInput):
         std = latent.new_tensor(config.latents_std, dtype=torch.float32).view(shape)
         return mean, std
 
+    def validate_compute_inputs(
+        self,
+        prompt,
+        media,
+        *,
+        target_shape=None,
+        target_frames=None,
+        source=None,
+        output_type=None,
+    ):
+        """CPU metadata gate before Qwen/VAE, also used by prompt/reference updates.
+
+        This compute envelope is separate from shared KV capacity. It bounds
+        Qwen input and reference encoding; exact packed KV is checked later.
+        """
+        plan = getattr(self, "compute_plan", None)
+        if plan is None:
+            return
+        if output_type == "video_audio":
+            raise ConditionError(
+                "CONDITION_INVALID",
+                "This server supports video-only output",
+            )
+        if target_frames is not None and target_frames > 720:
+            raise ConditionError(
+                "CONDITION_INVALID", "This video is too long for this server"
+            )
+        if source is not None:
+            frames = source["frames"]
+            if (
+                frames.ndim != 4
+                or frames.shape[1] > 720
+                or not _source_compute_canvas_supported(*frames.shape[-2:])
+            ):
+                raise ConditionError(
+                    "CONDITION_INVALID",
+                    "This source video is too large or too long for this server",
+                )
+        if len(prompt.encode("utf-8")) > 65536:
+            raise ConditionError(
+                "CONDITION_INVALID", "This prompt is too long for this server"
+            )
+        # Continuous source presentation adds one image outside the reference set.
+        references = [item for item in media if item.get("origin") != "source_s0"]
+        if len(references) > self.pipeline_config.zing_reference_max_images:
+            raise ConditionError(
+                "CONDITION_INVALID", "This request has too many reference images"
+            )
+        if target_shape is not None:
+            self._validate_compute_canvas(*target_shape)
+        for item in media:
+            frames = item.get("frames")
+            if frames is None or frames.ndim != 4 or frames.shape[1] != 1:
+                raise ConditionError(
+                    "CONDITION_INVALID",
+                    "This media configuration is not supported",
+                )
+            h, w = map(int, frames.shape[-2:])
+            if min(h, w) > self.max_short_edge or h * w > _STATIC_REFERENCE_MAX_AREA:
+                raise ConditionError(
+                    "CONDITION_INVALID",
+                    "These reference images are too large for this server",
+                )
+
+    def _validate_compute_canvas(self, height, width):
+        from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+            ZingKVPoolAdmissionError,
+        )
+
+        try:
+            self.compute_plan.validate_canvas(height, width)
+        except ZingKVPoolAdmissionError as exc:
+            logger.warning("Compute canvas rejected: %s", exc.detail)
+            raise ConditionError(
+                "CONDITION_INVALID", "This video size is not supported"
+            ) from exc
+
+    def validate_prepared_compute_inputs(self, inputs):
+        """Check persisted preparation metadata before copying it back to CUDA."""
+        plan = getattr(self, "compute_plan", None)
+        if plan is None:
+            return
+        if inputs.audio_shape is not None or inputs.audio:
+            raise ConditionError(
+                "CONDITION_INVALID",
+                "This server supports video-only output",
+            )
+        if inputs.pixel_frame_count > 720:
+            raise ConditionError(
+                "CONDITION_INVALID", "This video is too long for this server"
+            )
+        source = getattr(inputs, "source_visual", None)
+        if source is not None and not _source_compute_canvas_supported(
+            source.shape[-2] * self.spatial_ratio,
+            source.shape[-1] * self.spatial_ratio,
+        ):
+            raise ConditionError(
+                "CONDITION_INVALID", "This source video is too large for this server"
+            )
+        _, h, w = inputs.visual_shape
+        self._validate_compute_canvas(h * self.spatial_ratio, w * self.spatial_ratio)
+        if inputs.positive["context"].shape[0] > 16384:
+            raise ConditionError(
+                "CONDITION_INVALID",
+                "This prompt and its reference images are too large for this server",
+            )
+        if len(inputs.conditions) > self.pipeline_config.zing_reference_max_images:
+            raise ConditionError(
+                "CONDITION_INVALID", "This request has too many reference images"
+            )
+        for value in inputs.visual.values():
+            if (
+                value.shape[2] != 1
+                or value.shape[-2] * value.shape[-1] * self.spatial_ratio**2
+                > _STATIC_REFERENCE_MAX_AREA
+            ):
+                raise ConditionError(
+                    "CONDITION_INVALID",
+                    "These reference images are too large for this server",
+                )
+
     def encode_condition(self, prompt, media):
         if getattr(self, "conditioning_mode", "local") != "local":
             raise ConditionError(
                 "CONDITION_INVALID", "External conditioning cannot use a local encoder"
             )
+        self.validate_compute_inputs(prompt, media)
         return encode_condition(
             self.modules,
             self.runtime,
             prompt,
             media,
+            max_rows=16384 if getattr(self, "compute_plan", None) is not None else None,
             presentation_fn=minimax_h3_ref2va_video_presentation,
         )
 
@@ -462,6 +599,14 @@ class ZingH3Codecs(ZingH3MediaInput):
             normalized_media, source, h, w, t, frames = self._normalize_inference_media(
                 media, source, conditions, target, max_area_config=max_area_config
             )
+            self.validate_compute_inputs(
+                prompt,
+                normalized_media,
+                target_shape=(h, w),
+                target_frames=frames,
+                source=source,
+                output_type=target["type"],
+            )
         except (ValueError, OSError) as exc:
             if conditioning is None:
                 raise
@@ -635,6 +780,7 @@ class ZingH3Codecs(ZingH3MediaInput):
                 "CONDITION_INVALID", "Reference media preparation failed"
             ) from error
         # Retained presentation is already normalized; only new references change.
+        self.validate_compute_inputs(prompt, media)
         positive = conditioning(prompt, media)
         candidate = copy(active)
         candidate.conditions = conditions

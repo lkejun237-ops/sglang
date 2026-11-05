@@ -10110,7 +10110,19 @@
           "reason": "CUDA is required for the GPU queue regression"
         },
         {
-          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_pool_rejection_is_nonfatal_and_discards_pending_prompt[cuda]",
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_pool_rejection_is_nonfatal_and_discards_pending_prompt[cuda-False]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_pool_rejection_is_nonfatal_and_discards_pending_prompt[cuda-True]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_initial_pool_rejection_allows_inflight_ack_cancel_and_reuse[cuda-False]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_initial_pool_rejection_allows_inflight_ack_cancel_and_reuse[cuda-True]",
           "reason": "CUDA is required for the GPU queue regression"
         },
         {

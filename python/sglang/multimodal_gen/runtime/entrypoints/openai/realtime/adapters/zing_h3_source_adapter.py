@@ -879,6 +879,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         return target, min(1000.0, missing * 1000.0 / self.config["fps"])
 
     async def close_conditioning(self, session):
+        if not hasattr(self, "_source_reservations"):
+            return  # A connected-worker check can reject before on_init owns resources.
         if self._pending_reference_upload is not None:
             self._pending_reference_upload.release(session)
             self._pending_reference_upload = None

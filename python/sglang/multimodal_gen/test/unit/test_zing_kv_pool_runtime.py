@@ -50,15 +50,15 @@ LAYOUT = dict(
 )
 
 
-def _plan(pool_size=2, **overrides):
+def _plan(pool_size=1, **overrides):
     config = ZingKVPoolConfig(
-        pool_size=pool_size,
         max_target_area=64 * 64,
         max_target_long_edge=64,
-        max_prefix_rows=16,
         **{**WINDOW, **overrides},
     )
-    return ZingKVPoolPlan.build(config, ZingKVGeometry(16, (1, 2, 2), 64, ChunkPlan(2)))
+    return ZingKVPoolPlan.build(
+        config, ZingKVGeometry(16, (1, 2, 2), 64, ChunkPlan(2)), token_capacity=80
+    )
 
 
 def _request(size=64, **overrides):
@@ -114,11 +114,9 @@ def test_source_initialization_and_rolling_switch_do_not_use_a_donor(
 
 def test_sessions_hold_exclusive_slots_until_release():
     pool = ZingKVPool.allocate(_plan(), **LAYOUT)
-    first, second, third = RealtimeSession(), RealtimeSession(), RealtimeSession()
+    first, third = RealtimeSession(), RealtimeSession()
     a = pool.acquire(first, _request())
-    b = pool.acquire(second, _request(32))
-    assert a.slot_id != b.slot_id and pool.available == 0
-    assert _pointers(a.kv_cache) != _pointers(b.kv_cache)
+    assert pool.available == 0
     with pytest.raises(ZingKVPoolAdmissionError) as error:
         pool.acquire(third, _request())
     assert error.value.code == "kv_pool_exhausted"
@@ -140,7 +138,7 @@ def test_one_session_cannot_hold_two_slots():
     with pytest.raises(ZingKVPoolAdmissionError) as error:
         pool.acquire(session, _request())
     assert error.value.code == "kv_pool_request_unsupported"
-    assert pool.available == 1
+    assert pool.available == 0
     lease.release()
     # A released lease (e.g. a finished block session) allows a new session.
     pool.acquire(session, _request())
@@ -152,10 +150,10 @@ def test_rejected_request_still_joins_the_agreement():
         _plan(), agree=lambda ok: calls.append(ok) or ok, **LAYOUT
     )
     with pytest.raises(ZingKVPoolAdmissionError) as error:
-        pool.acquire(RealtimeSession(), _request(prefix_rows=17))
+        pool.acquire(RealtimeSession(), _request(prefix_rows=81))
     assert error.value.code == "kv_pool_request_unsupported"
-    assert "17" not in str(error.value)  # technical detail stays in logs
-    assert calls == [False] and pool.available == 2
+    assert "81" not in str(error.value)  # technical detail stays in logs
+    assert calls == [False] and pool.available == 1
 
 
 def test_sp_ranks_roll_back_a_partial_acquisition():
@@ -258,7 +256,7 @@ def test_block_state_rejection_leaves_the_pool_intact(model):
     state.sampler = sampler
     stage = object.__new__(ZingH3GenerationStage)
     stage.kv_pool, stage.codecs = pool, SimpleNamespace(spatial_ratio=16)
-    inputs = _inputs(5, context=30)  # prefix above max_prefix_rows=16
+    inputs = _inputs(5, context=81)  # prefix exceeds the entire shared capacity
     inputs.audio_shape = None
     with pytest.raises(ZingKVPoolAdmissionError):
         sampler.initialize(
@@ -271,9 +269,24 @@ def test_block_state_rejection_leaves_the_pool_intact(model):
     assert pool.available == 1 and state.kv_lease is None
 
 
-def test_stage_allocates_the_pool_and_logs_readiness(monkeypatch, caplog):
+@pytest.mark.parametrize("peer_budget", ["local", "smaller", "error"])
+def test_stage_allocates_the_pool_and_logs_readiness(monkeypatch, caplog, peer_budget):
+    from sglang.multimodal_gen.runtime.conditioning import worker
     from sglang.multimodal_gen.runtime.distributed import parallel_state
 
+    def coordinate(value):
+        if isinstance(value, tuple) and len(value) == 3 and isinstance(value[1], int):
+            if peer_budget == "error":
+                return [value, ("Insufficient peer memory", None, value[2])]
+            if peer_budget == "smaller":
+                return [value, (None, 7, value[2] - 1)]
+        return [value]
+
+    monkeypatch.setattr(worker, "coordinate_validation", coordinate)
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.stage.ZING_MIN_RUNTIME_BYTES",
+        0,
+    )
     monkeypatch.setattr(parallel_state, "get_ulysses_parallel_world_size", lambda: 2)
     monkeypatch.setattr(parallel_state, "get_sp_parallel_rank", lambda: 1)
     stage = object.__new__(ZingH3GenerationStage)
@@ -290,24 +303,31 @@ def test_stage_allocates_the_pool_and_logs_readiness(monkeypatch, caplog):
     pipeline = SimpleNamespace(
         dit_config=SimpleNamespace(arch_config=arch),
         dit_precision="bf16",
-        zing_kv_pool_size=2,
-        zing_kv_pool_max_target_area=64 * 64,
-        zing_kv_pool_max_target_long_edge=64,
-        zing_kv_pool_max_prefix_rows=16,
         zing_kv_pool_window_chunks=3,
         zing_kv_pool_sink_chunks=1,
         zing_kv_pool_rope_position_mode="block_relative",
         zing_kv_pool_rope_max_frame_gap=12,
+        zing_kv_pool_window_eviction_timing="after_step0",
     )
     stage.config = pipeline
     server_args = SimpleNamespace(
         pipeline_config=pipeline,
-        realtime_max_sessions_per_worker=2,
+        realtime_max_sessions_per_worker=1,
+        mem_fraction_static=0.8,
         zing_block0_cache_mode="off",
     )
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.stage.cleaned_free_memory",
+        lambda device: 20000,
+    )
+    if peer_budget == "error":
+        with pytest.raises(ValueError, match="at least one rank"):
+            stage.initialize_realtime_kv_cache_pool(server_args, before_load=20000)
+        assert stage.kv_pool is None
+        return
     with caplog.at_level(logging.INFO):
-        stage.initialize_realtime_kv_cache_pool(server_args)
-    assert stage.realtime_kv_cache_pool_enabled and stage.kv_pool.size == 2
+        stage.initialize_realtime_kv_cache_pool(server_args, before_load=20000)
+    assert stage.realtime_kv_cache_pool_enabled and stage.kv_pool.size == 1
     record = next(
         r.getMessage()
         for r in caplog.records
@@ -315,17 +335,19 @@ def test_stage_allocates_the_pool_and_logs_readiness(monkeypatch, caplog):
     )
     ready = json.loads(record.split(" ", 1)[1])
     assert ready["num_attention_heads_per_rank"] == 2 and ready["rank"] == 1
-    assert ready["reserves_target_audio"]
+    assert ready["shared_condition_and_target_budget"]
+    assert ready["runtime_budget_bytes"] == (3999 if peer_budget == "smaller" else 4000)
+    assert ready["prefix_hidden_width"] == 32
+    assert stage.kv_pool.plan.local_hidden_width == 16
     assert ready["slot_rows"] == stage.kv_pool.plan.slot_rows
-    assert ready["pool_allocated_bytes"] == 2 * ready["slot_bytes"]
+    if peer_budget == "smaller":
+        assert ready["slot_rows"] == 7
+    assert ready["pool_allocated_bytes"] == ready["slot_bytes"]
     assert stage.kv_pool.allocated_bytes() == ready["pool_allocated_bytes"]
 
     disabled = object.__new__(ZingH3GenerationStage)
     disabled.kv_pool = None
-    pipeline.zing_kv_pool_size = None
-    pipeline.zing_kv_pool_max_target_area = None
-    pipeline.zing_kv_pool_max_target_long_edge = None
-    pipeline.zing_kv_pool_max_prefix_rows = None
+    server_args.mem_fraction_static = None
     disabled.initialize_realtime_kv_cache_pool(server_args)
     assert not disabled.realtime_kv_cache_pool_enabled
 
@@ -432,7 +454,12 @@ def test_reference_admission_counts_candidate_rows(model):
         context=torch.zeros(16, 12).bfloat16(),
         row_role=torch.zeros(16, dtype=torch.long),
     )
-    state._admit_prompt_update(stage, condition)  # 16 text rows fit exactly.
+    request = state._admit_prompt_update(stage, condition)
+    from dataclasses import replace
+
+    stage.kv_pool.plan = replace(
+        stage.kv_pool.plan, slot_rows=stage.kv_pool.plan.admit(request)
+    )
     candidate = copy(state.inputs)
     candidate.conditions = [
         dict(content_id="new", role="reference", latent_modalities=["visual"])
@@ -466,6 +493,7 @@ def test_prompt_budget_rejection_preserves_live_pool_and_recovers(
     plan = ZingKVPoolPlan.build(
         _plan(1).config,
         ZingKVGeometry(16, (1, 2, 2), 64, ChunkPlan([3, 2], True)),
+        token_capacity=80,
     )
     pool = ZingKVPool.allocate(plan, **LAYOUT)
     inputs = _inputs(80)
@@ -530,7 +558,7 @@ def test_prompt_budget_rejection_preserves_live_pool_and_recovers(
     rng = session.rng.cpu_rng.clone()
     # A valid pending update must be superseded even when the newer one fails.
     assert update(7, 1) is None and session.pending_prompt.event_id == 1
-    assert update(40, 2) == {"code": "CONDITION_INVALID", "event_id": 2}
+    assert update(81, 2) == {"code": "CONDITION_INVALID", "event_id": 2}
     assert session.pending_prompt is None
     assert session.prompt is active and session.applied_prompt is applied
     assert state.prompt_event == 1  # Last accepted candidate, not rejected event 2.
@@ -542,8 +570,8 @@ def test_prompt_budget_rejection_preserves_live_pool_and_recovers(
         assert step().prompt_event_id == 0
     # The inclusive limit counts reference rows as well as text context rows.
     if with_reference:
-        assert update(16, 3) == {"code": "CONDITION_INVALID", "event_id": 3}
-    assert update(16 - int(with_reference), 4) is None
+        assert update(62, 3) == {"code": "CONDITION_INVALID", "event_id": 3}
+    assert update(62 - int(with_reference), 4) is None
     assert step().prompt_event_id == 4
     assert _pointers(state.kv_lease.kv_cache) == pointers
     session.dispose()
@@ -596,3 +624,545 @@ def test_source_stream_parity_survives_in_place_qk_norm_and_dirty_memory(
     assert staged
     assert torch.isfinite(expected).all()
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("pool_independent", [False, True])
+def test_compute_input_gate_runs_before_encoding(monkeypatch, pool_independent):
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        codecs as module,
+    )
+
+    codecs = object.__new__(module.ZingH3Codecs)
+    from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import ZingComputeLimits
+
+    codecs.compute_plan = (
+        ZingComputeLimits((32, 32), 64) if pool_independent else _plan()
+    )
+    codecs.pipeline_config = SimpleNamespace(zing_reference_max_images=2)
+    codecs.max_short_edge = 64
+    codecs.conditioning_mode = "local"
+    codecs.modules = codecs.runtime = {}
+    calls = []
+    monkeypatch.setattr(
+        module, "encode_condition", lambda *a, **kw: calls.append(kw) or {}
+    )
+    image = dict(id="ref", type="image", frames=torch.zeros(3, 1, 32, 32))
+    codecs.encode_condition("accepted", [image])
+    assert calls[0]["max_rows"] == 16384
+    for prompt, media in [
+        ("x" * 65537, [image]),
+        ("ok", [image] * 3),
+        ("ok", [dict(image, frames=torch.zeros(3, 1, 96, 96))]),
+    ]:
+        with pytest.raises(ConditionError):
+            codecs.encode_condition(prompt, media)
+    assert len(calls) == 1
+    with pytest.raises(ConditionError):
+        codecs.validate_compute_inputs("ok", [image], target_shape=(96, 96))
+
+
+@torch.no_grad()
+def test_finite_prompt_rejection_keeps_generation_equal_to_control(model):
+    from contextlib import nullcontext
+    from copy import deepcopy
+
+    original = _inputs(80)
+    original.audio_shape = None
+    original.condition_media = []
+    states = []
+    for _ in range(2):
+        stage = object.__new__(ZingH3GenerationStage)
+        stage.kv_pool = ZingKVPool.allocate(_plan(), **LAYOUT)
+        stage.codecs = SimpleNamespace(spatial_ratio=16)
+        stage._use = lambda *args: nullcontext(model)
+        sampler = _sampler(model)
+        sampler.processor.num_frame_per_block = [3, 2]
+        sampler.processor.split_first_latent = True
+        stage.packer = sampler.processor
+        state = ZingH3RealtimeState()
+        state.inputs, state.sampler = deepcopy(original), sampler
+        state.prompt = state.requested_prompt = "initial"
+        state.prompt_event = 0
+        stage.encode_condition_for_batch = lambda batch, prompt, media: dict(
+            context=torch.ones(81 if prompt == "oversized" else 5, 12).bfloat16(),
+            row_role=torch.zeros(81 if prompt == "oversized" else 5, dtype=torch.long),
+        )
+        batch = SimpleNamespace(
+            sampling_params=SimpleNamespace(prompt="initial", seed=13),
+            realtime_event_id=0,
+            session=RealtimeSession(),
+        )
+        states.append((stage, state, batch))
+
+    def advance():
+        for stage, state, batch in states:
+            stage._sample_realtime_block(batch, state)
+        assert torch.equal(states[0][1].sampling.visual, states[1][1].sampling.visual)
+        assert torch.equal(
+            states[0][1].sampling.ready.rng.cpu_rng,
+            states[1][1].sampling.ready.rng.cpu_rng,
+        )
+
+    for _ in range(3):
+        advance()
+    stage, state, batch = states[1]
+    pointers = _pointers(state.kv_lease.kv_cache)
+    batch.sampling_params.prompt, batch.realtime_event_id = "oversized", 1
+    advance()
+    assert state.conditioning_notice == {"code": "CONDITION_INVALID", "event_id": 1}
+    assert state.prompt == state.requested_prompt == "initial"
+    assert state.sampling.ready.pending_prompt is None
+    assert _pointers(state.kv_lease.kv_cache) == pointers
+    batch.sampling_params.prompt = "initial"
+    for _ in range(3):
+        advance()
+    for _, _, current in states:
+        current.sampling_params.prompt, current.realtime_event_id = "valid", 2
+    for _ in range(6):
+        advance()
+    assert state.prompt == "valid" and state.conditioning_notice is None
+    for current_stage, current_state, _ in states:
+        current_state.dispose()
+        assert current_stage.kv_pool.available == 1
+
+
+@pytest.mark.parametrize(
+    "kind", ["boundary", "long_target", "long_source", "large_source", "audio"]
+)
+def test_finite_compute_rejection_precedes_all_encoders(kind):
+    from contextlib import nullcontext
+
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.codecs import (
+        ZingH3Codecs,
+    )
+
+    codecs = object.__new__(ZingH3Codecs)
+    codecs.compute_plan = _plan()
+    codecs.pipeline_config = SimpleNamespace(zing_reference_max_images=2)
+    codecs.max_short_edge, codecs.max_area_config = 768, {"source": 64 * 64}
+    codecs.temporal_ratio, codecs.canvas_multiple, codecs.target_fps = 4, 32, 24
+    codecs.spatial_ratio, codecs.patch_size = 16, (1, 2, 2)
+    codecs.vae_frames_per_chunk, codecs.vae_latents_per_chunk = 17, 5
+    codecs.max_source_target_aspect_ratio_factor = 1.5
+    frames = (
+        721
+        if kind in ("long_target", "long_source")
+        else 720
+        if kind == "boundary"
+        else 1
+    )
+    source = (
+        dict(
+            type="video",
+            fps=24,
+            frames=torch.zeros(
+                3, frames, *([736, 736] if kind == "large_source" else [32, 32])
+            ),
+        )
+        if kind in ("long_source", "large_source")
+        else None
+    )
+    target = dict(
+        type="video_audio" if kind == "audio" else "video",
+        output=dict(width=32, height=32, frames=frames),
+    )
+    codecs._parse_inference_request = lambda request: ("prompt", [], target, [], source)
+    codecs._decode_media = lambda item, **kwargs: item
+    calls = []
+
+    def encode(*args):
+        calls.append(args)
+        raise RuntimeError("Reached encoder")
+
+    expected = RuntimeError if kind == "boundary" else ConditionError
+    with pytest.raises(expected):
+        codecs.prepare(
+            {"h3_max_area_config": {"source": 736 * 736}},
+            lambda name: nullcontext(),
+            conditioning=encode,
+        )
+    assert bool(calls) == (kind == "boundary")
+
+
+@pytest.mark.parametrize("limit", ["kv", "compute", "source_compute"])
+def test_cached_update_rejection_precedes_gpu_restore(monkeypatch, limit):
+    from copy import deepcopy
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        preparation_cache,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.codecs import (
+        ZingH3Codecs,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.source_session import (
+        ZingSourceStreamState,
+    )
+
+    stage = object.__new__(ZingH3GenerationStage)
+    stage.kv_pool = ZingKVPool.allocate(_plan(), **LAYOUT)
+    stage.codecs = object.__new__(ZingH3Codecs)
+    stage.codecs.compute_plan = stage.kv_pool.plan
+    stage.codecs.pipeline_config = SimpleNamespace(zing_reference_max_images=2)
+    stage.codecs.spatial_ratio = 16
+    active = _inputs(1)
+    active.source_visual = active.audio_shape = None
+    active.pixel_frame_count = 1
+    candidate = deepcopy(active)
+    rows = 81 if limit == "kv" else 3
+    candidate.positive = dict(
+        context=torch.ones(rows, 12).bfloat16(),
+        row_role=torch.zeros(rows, dtype=torch.long),
+    )
+    if limit == "compute":
+        candidate.pixel_frame_count = 721
+    if limit == "source_compute":
+        candidate.source_visual = torch.zeros(1, 4, 1, 46, 46)
+    entry = SimpleNamespace(inputs=candidate, request=_request(32, prefix_rows=rows))
+    state = ZingSourceStreamState()
+    state.inputs, state.prompt, state.prompt_event = active, "current", 0
+    state.block0_cache = SimpleNamespace(lookup=lambda key: entry)
+    state._block0_update_key = lambda *args: ("cached", {})
+    state.sampler = SimpleNamespace(discard_pending_prompt=lambda: None)
+    owner = RealtimeSession()
+    lease = stage.kv_pool.acquire(owner, _request(32))
+    pointers = _pointers(lease.kv_cache)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Rejected cache data was copied to GPU")
+
+    monkeypatch.setattr(preparation_cache, "inputs_on", forbidden)
+    notice = state._update_prompt(
+        stage,
+        SimpleNamespace(
+            sampling_params=SimpleNamespace(prompt="new"), realtime_event_id=1
+        ),
+    )
+    assert notice == {"code": "CONDITION_INVALID", "event_id": 1}
+    assert state.inputs is active and state.prompt == "current"
+    assert stage.kv_pool.available == 0 and _pointers(lease.kv_cache) == pointers
+    lease.release()
+    assert stage.kv_pool.available == 1
+
+
+def test_reference_compute_area_is_independent_of_output_canvas():
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.codecs import (
+        ZingH3Codecs,
+    )
+
+    codecs = object.__new__(ZingH3Codecs)
+    codecs.compute_plan = _plan()
+    codecs.pipeline_config = SimpleNamespace(zing_reference_max_images=2)
+    codecs.max_short_edge = 2048
+    codecs.spatial_ratio = 16
+    # The default checkpoint normalizes a 16:9 reference to 1344x768,
+    # even when the output is 832x480 or 1280x736.
+    media = dict(type="image", frames=torch.zeros(3, 1, 768, 1344, dtype=torch.uint8))
+    codecs.validate_compute_inputs("prompt", [media], target_shape=(64, 64))
+    inputs = SimpleNamespace(
+        audio_shape=None,
+        audio={},
+        pixel_frame_count=17,
+        visual_shape=(5, 4, 4),
+        positive={"context": torch.zeros(3, 8)},
+        conditions=[{}],
+        visual={"ref": torch.zeros(1, 24, 1, 48, 84)},
+    )
+    codecs.validate_prepared_compute_inputs(inputs)
+    media["frames"] = torch.zeros(3, 1, 800, 1344, dtype=torch.uint8)
+    with pytest.raises(ConditionError):
+        codecs.validate_compute_inputs("prompt", [media])
+    inputs.visual["ref"] = torch.zeros(1, 24, 1, 50, 84)
+    with pytest.raises(ConditionError):
+        codecs.validate_prepared_compute_inputs(inputs)
+
+
+@pytest.mark.parametrize(
+    "operation,limit",
+    [
+        ("condition", "kv"),
+        ("lookup", "kv"),
+        ("prefill", "kv"),
+        ("condition", "switch"),
+        ("lookup", "switch"),
+    ],
+)
+def test_disaggregated_cache_rejection_precedes_tensor_restore(
+    monkeypatch, operation, limit
+):
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        dit_preparation,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.codecs import (
+        ZingH3Codecs,
+    )
+
+    stage = object.__new__(ZingH3GenerationStage)
+    if limit == "switch":
+        plan = ZingKVPoolPlan.build(
+            ZingKVPoolConfig(window_chunks=1, sink_chunks=0),
+            ZingKVGeometry(16, (1, 2, 2), 64, ChunkPlan([3, 2])),
+            token_capacity=28,
+        )
+        request = _request(64, source_shape=(32, 32), window_chunks=1, sink_chunks=0)
+    else:
+        plan, request = _plan(), _request(32, prefix_rows=81)
+    stage.kv_pool = ZingKVPool.allocate(plan, **LAYOUT)
+    stage.codecs = object.__new__(ZingH3Codecs)
+    stage.codecs.compute_plan = stage.kv_pool.plan
+    stage.codecs.pipeline_config = SimpleNamespace(zing_reference_max_images=2)
+    stage.codecs.spatial_ratio = 16
+    candidate = _inputs(
+        1, size=4 if limit == "switch" else 2, context=3 if limit == "switch" else 81
+    )
+    candidate.source_visual = candidate.audio_shape = None
+    candidate.pixel_frame_count = 1
+    entry = SimpleNamespace(inputs=candidate, request=request)
+    stage.block0_cache = SimpleNamespace(lookup=lambda *args, **kwargs: entry)
+    owner = RealtimeSession()
+    lease = (
+        None
+        if operation == "prefill"
+        else stage.kv_pool.acquire(
+            owner, request if limit == "switch" else _request(32)
+        )
+    )
+    available = stage.kv_pool.available
+    pointers = None if lease is None else _pointers(lease.kv_cache)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Rejected cache data reached GPU restoration")
+
+    monkeypatch.setattr(dit_preparation, "inputs_on", forbidden)
+    preparation = dit_preparation.DiTPreparation(stage, forbidden)
+    arguments = {"cache_key": "a" * 64, "prompt_update": limit == "switch"}
+    if operation == "condition":
+        with pytest.raises(ConditionError):
+            preparation.cached_condition(arguments, initial=False)
+    else:
+        assert preparation.control(
+            operation, arguments, busy=operation == "lookup"
+        ) == {"code": "CONDITION_INVALID"}
+    assert stage.kv_pool.available == available
+    if lease is not None:
+        assert _pointers(lease.kv_cache) == pointers
+        lease.release()
+
+
+@pytest.mark.parametrize("limit", ["compute", "kv", "host_cache"])
+def test_disaggregated_prefill_rejection_precedes_tensor_restore(monkeypatch, limit):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        dit_preparation,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.codecs import (
+        ZingH3Codecs,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.packing import (
+        H3InferenceInputs,
+    )
+
+    stage = object.__new__(ZingH3GenerationStage)
+    stage.kv_pool = ZingKVPool.allocate(_plan(), **LAYOUT)
+    stage.codecs = object.__new__(ZingH3Codecs)
+    stage.codecs.compute_plan = stage.kv_pool.plan
+    stage.codecs.pipeline_config = SimpleNamespace(zing_reference_max_images=2)
+    stage.codecs.spatial_ratio = 16
+    candidate = H3InferenceInputs(
+        output_type="video",
+        conditions=[],
+        media=[],
+        positive=dict(
+            context=torch.ones(3 if limit == "host_cache" else 81, 12),
+            row_role=torch.zeros(3 if limit == "host_cache" else 81),
+        ),
+        visual={},
+        audio={},
+        source_visual=None,
+        visual_shape=(1, 2, 2),
+        audio_shape=None,
+        pixel_frame_count=721 if limit == "compute" else 1,
+        sample_count=None,
+        sample_rate=24000,
+    )
+    stage.block0_cache = SimpleNamespace(
+        lookup=lambda *a, **kw: None, can_store=lambda rows: False
+    )
+    stage.packer = SimpleNamespace(
+        visual_channels=2,
+        pack_inference_layout=lambda *args: {
+            "block_idx": torch.zeros(3 if limit == "host_cache" else 81)
+        },
+    )
+    config = stage.kv_pool.plan.config
+    sampler = SimpleNamespace(
+        window_policy=config.window_policy,
+        rope_position_mode=config.rope_position_mode,
+        rope_max_frame_gap=config.rope_max_frame_gap,
+        window_eviction_timing=config.window_eviction_timing,
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Rejected preparation reached GPU restoration")
+
+    monkeypatch.setattr(dit_preparation, "inputs_on", forbidden)
+    preparation = dit_preparation.DiTPreparation(stage, lambda: sampler)
+    assert preparation.control(
+        "prefill",
+        {
+            "cache_key": "a" * 64,
+            "inputs": dit_preparation.prepared_message(candidate),
+            "source_shape": (2, 2),
+        },
+        busy=False,
+    ) == {
+        "code": "cache_capacity_exceeded"
+        if limit == "host_cache"
+        else "CONDITION_INVALID"
+    }
+    assert stage.kv_pool.available == 1
+
+
+def test_dit_worker_forwards_static_memory_ratio_before_model_loading(monkeypatch):
+    import sys
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        dit_worker,
+        encoder_worker,
+    )
+
+    class StopBeforeModelLoading(RuntimeError):
+        pass
+
+    captured = {}
+
+    class Args:
+        @staticmethod
+        def from_kwargs(**kwargs):
+            captured.update(kwargs)
+            raise StopBeforeModelLoading
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "dit-worker",
+            "--model",
+            "/unused",
+            "--sp-degree",
+            "2",
+            "--mem-fraction-static",
+            "0.8",
+        ],
+    )
+    monkeypatch.setattr(
+        encoder_worker, "initialize_runtime_imports", lambda: (Args, lambda args: None)
+    )
+    with pytest.raises(StopBeforeModelLoading):
+        dit_worker.main()
+    assert captured["mem_fraction_static"] == 0.8
+    assert captured["sp_degree"] == 2
+
+
+@pytest.mark.parametrize("timing", ["before_source", "after_step0"])
+@pytest.mark.parametrize("has_source", [False, True])
+@torch.no_grad()
+def test_small_window_prompt_switch_checks_rebuild_and_next_step(
+    model, timing, has_source
+):
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.packing import (
+        ZingH3Packer,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.realtime import (
+        ZingH3BlockSession,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.sampling import (
+        ZingH3Sampler,
+    )
+    from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import peak_rows
+    from sglang.multimodal_gen.test.unit.test_zing_h3_kv_pool_cache import _storage
+
+    for supports_switch in (False, True):
+        packer = ZingH3Packer(
+            model.arch, num_frame_per_block=[3, 2], split_first_latent=False
+        )
+        sampler = ZingH3Sampler(
+            model,
+            packer,
+            sigma_points=2,
+            window_chunks=1,
+            sink_chunks=0,
+            window_eviction_timing=timing,
+        )
+        sampler.device = torch.device("cpu")
+        inputs = _inputs(20, size=4)
+        inputs.source_visual = torch.randn(1, 2, 20, 2, 2) if has_source else None
+        inputs.audio_shape = None
+        geometry = ZingKVGeometry(
+            16, tuple(model.arch.patch_size), 64, packer.chunk_plan
+        )
+        arguments = dict(
+            prefix_rows=3,
+            rows_per_frame=4,
+            has_source=has_source,
+            source_rows_per_frame=1 if has_source else None,
+            total_frames=20,
+            window_eviction_timing=timing,
+        )
+        rows = peak_rows(
+            geometry,
+            sampler.window_policy,
+            prompt_prefix_frames=5 if supports_switch else 0,
+            **arguments,
+        )
+        stage = object.__new__(ZingH3GenerationStage)
+        stage.packer, stage.codecs = packer, SimpleNamespace(spatial_ratio=16)
+        stage.kv_pool = SimpleNamespace(
+            plan=ZingKVPoolPlan.build(
+                ZingKVPoolConfig(
+                    window_chunks=1, sink_chunks=0, window_eviction_timing=timing
+                ),
+                geometry,
+                token_capacity=rows,
+            )
+        )
+        session = ZingH3BlockSession(
+            sampler,
+            inputs,
+            torch.randn(1, 2, 20, 4, 4),
+            seed=2,
+            initial_rng_state=(torch.get_rng_state(), None),
+            acquire_storage=lambda layout: _storage(model, rows),
+        )
+        try:
+            session.step()
+            session.step()
+            prefix = session.ready.cache.prefix
+            candidate = dict(inputs.positive, context=inputs.positive["context"] + 0.01)
+
+            def admit():
+                stage.admit_realtime_condition(
+                    sampler,
+                    inputs,
+                    candidate,
+                    source_shape=(2, 2) if has_source else None,
+                    total_frames=20,
+                )
+
+            if supports_switch:
+                admit()
+                session.update_prompt(candidate, 1, 1)
+            else:
+                with pytest.raises(ConditionError) as error:
+                    admit()
+                assert error.value.code == "CONDITION_INVALID"
+                assert session.ready.cache.prefix is prefix
+            session.step()
+            assert session.prompt_updated is supports_switch
+            assert not session.ready.closed
+        finally:
+            session.close()

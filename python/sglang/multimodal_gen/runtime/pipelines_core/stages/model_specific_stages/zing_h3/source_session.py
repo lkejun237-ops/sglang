@@ -145,6 +145,7 @@ class ZingSourceStreamState(BaseRealtimeState):
         self.policy, defer_final, prompt_joint = _source_key_policy(
             stage, sampler, self.work_quantum, command
         )
+        sampler.prompt_joint = prompt_joint
         self.qwen_init_host_ms = None
 
         @contextmanager
@@ -219,6 +220,7 @@ class ZingSourceStreamState(BaseRealtimeState):
 
             # Consume the preparation that produced the cached KV.
             device = next(stage.modules["transformer"].parameters()).device
+            stage.admit_cached_preparation(self.block0_entry)
             self.inputs = inputs_on(self.block0_entry.inputs, device)
             condition = batch.session.get_or_create_state(WorkerConditioningState)
             condition.identity = self.block0_entry.conditioning_identity
@@ -568,14 +570,16 @@ class ZingSourceStreamState(BaseRealtimeState):
         ):
             prefix, self.block0_prefix = self.block0_prefix, None
             if self.sampler.cache.prefix is prefix:
-                self.block0_cache.fill(
+                stored = self.block0_cache.fill(
                     self.block0_key,
                     self.block0_inputs,
                     self.block0_condition_identity,
                     self.block0_request,
                     self.sampler.cache,
+                    required=False,
                 )
-                self.block0_cache.register(self.block0_key, **self.cache_labels)
+                if stored:
+                    self.block0_cache.register(self.block0_key, **self.cache_labels)
 
     def _block0_update_key(self, stage, prompt, command):
         """Share the CPU request identity between prefetch and owner lookup."""
@@ -716,6 +720,11 @@ class ZingSourceStreamState(BaseRealtimeState):
                     ) from key_error
                 entry = self.block0_cache.lookup(key)
             if entry is not None:
+                stage.admit_cached_preparation(
+                    entry,
+                    prompt_update=True,
+                    prompt_joint=getattr(self.sampler, "prompt_joint", False),
+                )
                 candidate = inputs_on(
                     entry.inputs, self.inputs.positive["context"].device
                 )

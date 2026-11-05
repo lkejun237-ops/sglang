@@ -114,8 +114,9 @@ T + 1,700 × R + 500 ≤ 25,600
   `session.ready` 会声明实际图数及传输容量，见[输入契约](/docs/sglang-diffusion/zing/specs/SOURCE_REFERENCE_INPUTS)。
 - Qwen conditioning 有自身的行数/字节限制；它与 DiT 完整 condition 的 token 范围不同。
   DiT 能容纳 50k，不表示 Qwen 服务已经允许对应输入。
-- `zing_kv_pool_max_prefix_rows` 是完整 condition 的预留容量，
-  还须结合 pool size、目标面积/长边、window/sink 配置；启动时分配的池不会因当前请求较短就自动缩小。
+- 当前版本使用 `--mem-fraction-static` 自动确定单 slot 总 token 容量，
+  完整 prefix 与 source/target 共用容量；窗口策略仍决定请求峰值。
+  本页历史实验使用的独立 prefix 预留不再是当前配置接口。
   参数含义见[KV 池容量字段](/docs/sglang-diffusion/zing/specs/PERFORMANCE_DEFAULTS#预分配-kv-池的容量字段)。
 
 先以服务的实际限制判断是否能接收，再用本页估算速度。

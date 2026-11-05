@@ -37,14 +37,85 @@ host sync 已直接集成，无需额外开关。已退休的 `EXPERIMENTAL_CACH
 
 ## 预分配 KV 池的容量字段
 
-这组是部署容量契约，不能在未知显存和并发需求时任意填值：
+通过服务参数 `--mem-fraction-static`（`mem_fraction_static`）启用静态 KV 池。
+该比例与 LLM SGLang 一致：静态预算包括常驻模型及 KV，其余显存用于运行时计算。
+`None` 保留未启用池的路径；通用默认比例与完整部署组合仍待同硬件验收。
+历史合并版本的 H100 独立 DiT 配方见[部署 recipe](/docs/sglang-diffusion/zing/deployment_zing_h3)，不作为所有执行组合的默认值；当前基于 main `17a7ac4835` 的容量提交未新增 GPU 验证。
 
-| 完整字段 | 默认值 |
+启动时在模型加载前记录实际可用显存 B，模型、Encoder 与 Lynn 启动预热后执行
+`gc.collect()`、同步及 `empty_cache()`，取得空闲显存 F：
+
+```text
+ratio reserve = ceil(B * (1 - mem_fraction_static))
+additional reserve = max(0, 8 GiB - ratio reserve)
+KV bytes = floor(F - B * (1 - mem_fraction_static) - additional reserve)
+bytes per token per rank = 3 * layers * local_heads * head_dim * dtype_bytes
+total tokens = min_across_ranks(KV bytes // bytes_per_token)
+```
+
+三个存储分别为 K、V、rotated K。只分配一个 slot，要求
+`realtime_max_sessions_per_worker=1`。prefix、source、target 共享总容量；当前服务计算边界仍拒绝音频生成，
+不再提供 pool size、prefix 或目标画幅对应的独立容量参数。
+启动日志 `ZING_KV_CACHE_POOL_READY_JSON` 保留逐 rank 的加载前/后空闲字节、
+ratio、KV 字节预算、总 token 数、实际池字节数及最低／额外／跨 rank 共同运行时预留。
+
+KV 行数容得下请求，不代表 DiT 临时分配也容得下。2026-11-04 的 H100 实测中，
+`87078a671d` 在 38,614≤40,147 行时仍于 FFN 激活分配 OOM。当前修订同时检查
+`3 GiB + 64 bytes × max(local_hidden_width × forward_rows, full_hidden_width × prefix_rows)` 的计算空间预算；
+`forward_rows` 覆盖 prefix/source/target 首次联合计算、跨 chunk 的前一块 final，
+以及 prompt 替换的 clean history。串行重建取阶段最大值；启用 prompt joint 时计入同次
+forward 的 prefix、clean history、source 与 target。稳定形状模式的独立前缀预填充与串行重建
+会在每个 SP rank 复制完整前缀、使用完整 hidden width；只有保存的 KV heads 分片，
+不能用局部 head 宽度估算该阶段。`c8e6049c34` 的 H100 R33 已实际暴露该漏项：
+原始 21 图请求在 prompt 切换重建时申请 672 MiB，而 driver 仅余 242.62 MiB。
+修订后的前缀包络已在 `9b7084342d` 的 H200／SP2 安全场景中验证；KV 能容纳的输入仍可能因计算空间不足被明确拒绝。
+`696acf0da6` 的 H100／SP2 真实输入 DiT 专项另验证了两档最大产品输入、换图及拒绝后恢复，历史受测配方建议 ratio 0.85；当前新主线提交未新增 GPU 验证，H100 完整链路、B300 及其他执行组合不能由此外推。
+`679aefa5a4` 合入主线 worker readiness／故障清理修复后，容量公式与 DiT 计算路径未变；
+原安全结果保留 `9b7084342d` 的版本边界，合并后完整服务 GPU 组合未重测。
+缓存恢复同样检查当前会话的执行模式，
+不会因预填充时关闭 joint 而跳过更新时的检查。各 rank 使用共同的最小运行时预算。
+此空间包络与 8 GiB 下限是保守策略。H200／SP2 已验证原始最大输入及拒绝后恢复，尚不构成任意硬件、模型或后端的推荐值；证据必须保留原始最大输入、
+480／736、低比例与接近 1 的比例、冷启动／Graph／缓存／切换的实测及拒绝后恢复证据。
+更换架构、精度、attention backend 或联合执行模式时需重新验证，不能外推当前测试结果。
+
+请求初始化及更新先在 CPU 元数据层检查计算输入边界，packing 后再用现有
+`peak_rows()` 检查完整请求。画幅、图数及 Qwen 条件行数是计算边界，
+不能当作已预留的 prefix 配额，也不代表所有组合均已完成显存验证。
+
+当前静态池的编码前计算边界：最大画幅 1280×736（仍受 checkpoint 短边及网格约束）、
+UTF-8 prompt 最多 65536 字节、Qwen condition 最多 16384 行、参考图数不超过部署图数限制，
+参考/呈现媒体仅接受单帧图像，单张最多 1,032,192 像素（checkpoint 的默认参考图预处理边界），
+不复用输出画幅面积上限。source 使用视频编码边界：短边不超过 480、长边不超过 1280、
+面积不超过 832×480；请求中的面积覆盖和已准备的缓存输入也不能绕过此限制。
+有限请求的输出与 source 均不超过 720 帧，
+尚未验证的音频输出在编码前拒绝；连续 source 按已有有界队列处理，不按完整会话时长分配。
+这些边界限制危险分配范围。`9b7084342d` 的 H200／SP2 完整安全验收覆盖多图、两档输出、低／高比例、切换与缓存、旧／新状态共存及拒绝后恢复；详见[部署 recipe](/docs/sglang-diffusion/zing/deployment_zing_h3)。按用户要求，性能补测收敛为 DiT-only，完整 50 层两档的独立数值回读已通过；H100 的受测 ratio 建议不替代真实输入全链路性能、通用默认比例及 integrated 默认组合验收，不将专项结果外推为上述范围通过。
+
+### 输入策略的产品行为与依据
+
+以下是本轮静态池的保守服务策略，不是任意 checkpoint／硬件的物理极限，也不是“允许输入”就必然有 KV 容量。
+启用静态池的普通入口在编码前检查；独立 Encoder 即使不知道对端池容量，也独立限制编码几何；
+准备缓存恢复时在重新复制到 CUDA 前再次检查元数据，不能绕过相同边界。
+
+| 边界 | 用户可见行为 | 依据与验证范围 |
+| --- | --- | --- |
+| 输出面积≤1280×736、长边≤1280，且符合 checkpoint 短边／空间网格 | 超限尺寸在编码／分配前拒绝 | 冻结的 480／736 输出包络；网格和短边由 checkpoint／packer 决定，不能外推其他画幅 |
+| source 短边≤480、长边≤1280、面积≤832×480 | 过大的 source 编码输入拒绝；允许 source 480、输出 736 | 视频 source 与单张参考图走不同的计算路径；该包络来自已冻结 source 工作负载，不以较大的静态参考图包络证明视频编码安全 |
+| 有限 source／输出≤720帧 | 有限721帧请求拒绝；连续 source 按有界块队列处理，不将完整会话长度当一次分配 | 显式限制一次性有限输入的 CPU／VAE 分配；这是当前服务的保守准入策略，不是模型只能生成720帧，完整长有限输入需另行验证 |
+| prompt≤65,536 UTF-8字节，Qwen条件≤16,384行 | 长文本／图文编码超限拒绝 | 字节边界保护 tokenizer／编码前资源，行边界独立约束准备结果；两者不是同一量，不能由字节数精确换算token，也不据此修改原始prompt |
+| 参考图数≤`zing_reference_max_images`，每项仅一帧、短边≤checkpoint上限、单张≤1,032,192像素 | 视频参考或超大参考在编码前拒绝 | 图数来自部署声明；面积沿用默认 checkpoint 的静态参考预处理包络，不能将它当成 source 视频预算。source presentation 不计入参考图数，但仍检查其单帧几何 |
+| video-only输出 | 请求音频生成时明确拒绝 | 当前静态池的编码／工作区包络未验收音频，不将旧音频计数能力当作安全支持 |
+
+例如 source 832×480、输出1280×736仍是合法几何，但其真实条件经packing后还要检查共享KV行数及计算工作区；
+原始15／21图输入可能通过编码边界，随后被容量或工作区拒绝。初始拒绝只结束该请求，后续会话可恢复；
+更新拒绝保留当前active条件与KV，后续合法更新仍可生效。错误使用稳定ASCII code和友好英文消息，详细形状／字节仅写服务端日志。
+本次迁移不依赖PR #584，没有放宽这些策略，也没有新增GPU实测；历史合并版本的结果和具体 source SHA 见部署 recipe／PR #517。
+
+有限与连续两条 realtime prompt 更新路径共用精确 packing/admission；更新还模拟五帧 clean target history 重建，及重建后首块在窗口淘汰前的 source/target 峰值，取其与普通生成峰值的较大值。小窗口不能用普通稳态容量替代切换容量。
+候选准入成功前不会安装 pending condition 或清理当前 KV。准备缓存命中在恢复 GPU tensor 前检查计算元数据与对应的初始／更新容量；初始身份由接收方会话状态判定。
+
+| 窗口字段 | 默认值 |
 | --- | --- |
-| `zing_kv_pool_size` | `None`（未配置池） |
-| `zing_kv_pool_max_target_area` | `None` |
-| `zing_kv_pool_max_target_long_edge` | `None` |
-| `zing_kv_pool_max_prefix_rows` | `None` |
 | `zing_kv_pool_window_chunks` | `21` |
 | `zing_kv_pool_sink_chunks` | `3` |
 | `zing_kv_pool_rope_position_mode` | `block_relative` |

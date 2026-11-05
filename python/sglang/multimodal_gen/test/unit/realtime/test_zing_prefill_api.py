@@ -410,6 +410,7 @@ def test_internal_prefill_miss_then_hit_runs_only_prefix_and_releases_lease(capl
     )
     stage = NS(
         block0_cache=cache,
+        admit_cached_preparation=Mock(),
         codecs=codecs,
         _use=use,
         _validate_sampling_params=Mock(),

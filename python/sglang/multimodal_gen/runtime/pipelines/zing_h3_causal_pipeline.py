@@ -85,6 +85,18 @@ class ZingH3CausalPipeline(ComposedPipelineBase):
             "mode": self.conditioning_mode,
             "resolved_weight_components": [],
         }
+        # Capture before any model/component loading. Later warmup allocations are
+        # already reflected in the post-load free measurement and are not subtracted twice.
+        self.pre_model_load_memory = None
+        if getattr(server_args, "mem_fraction_static", None) is not None:
+            from sglang.multimodal_gen.runtime.platforms import current_platform
+            from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+                cleaned_free_memory,
+            )
+
+            self.pre_model_load_memory = cleaned_free_memory(
+                current_platform.get_local_torch_device()
+            )
         super().__init__(
             model_path,
             server_args,
@@ -270,7 +282,9 @@ class ZingH3CausalPipeline(ComposedPipelineBase):
                 time.perf_counter() - started,
             )
         # Realtime KV slots are allocated here, before the worker is ready.
-        stage.initialize_realtime_kv_cache_pool(server_args)
+        stage.initialize_realtime_kv_cache_pool(
+            server_args, before_load=self.pre_model_load_memory
+        )
         self.add_stage(stage)
 
 

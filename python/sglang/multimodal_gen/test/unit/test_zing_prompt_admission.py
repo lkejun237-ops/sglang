@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Condition validation must reach the leader before any rank commits."""
 
+import json
+import multiprocessing
+from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -104,3 +108,73 @@ def test_leader_gathers_votes_and_broadcasts_one_decision(monkeypatch, size, acc
         )
         assert worker.coordinate_validation_decision(votes[rank]) is accepted
         assert calls == ["gather", "broadcast"]
+
+
+def _gloo_admission_rank(rank, rendezvous, output):
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo",
+        init_method="file://" + rendezvous,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    group = SimpleNamespace(
+        world_size=2, rank_in_group=rank, ranks=[0, 1], cpu_group=dist.group.WORLD
+    )
+    worker._sp_group = lambda: group
+    decisions = []
+    try:
+        # Fail once on the leader and once on its peer; a valid request follows
+        # each refusal on the same process group to expose collective drift.
+        for failing_rank, error in [
+            (0, ValueError("Invalid packed condition")),
+            (1, ConditionError()),
+        ]:
+
+            def validate():
+                if rank == failing_rank:
+                    raise error
+                return "candidate"
+
+            try:
+                coordinate_prompt_admission(validate)
+            except ConditionError:
+                decisions.append("rejected")
+            else:
+                raise AssertionError("A rank accepted a rejected peer candidate")
+            decisions.append(coordinate_prompt_admission(lambda: "accepted"))
+        Path(output, str(rank) + ".json").write_text(json.dumps(decisions))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_two_gloo_ranks_reject_together_then_accept_on_the_same_group(tmp_path):
+    ctx = multiprocessing.get_context("spawn")
+    processes = [
+        ctx.Process(
+            target=_gloo_admission_rank,
+            args=(rank, str(tmp_path / "rendezvous"), str(tmp_path)),
+        )
+        for rank in range(2)
+    ]
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=120)
+            assert not process.is_alive(), "A rank remained blocked after admission"
+            assert process.exitcode == 0
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+    for rank in range(2):
+        assert json.loads((tmp_path / f"{rank}.json").read_text()) == [
+            "rejected",
+            "accepted",
+            "rejected",
+            "accepted",
+        ]

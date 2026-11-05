@@ -147,7 +147,9 @@ def test_source_prefetch_checks_cache_before_rpc(
         broadcast_tensor=lambda value, name: value,
     )
     condition = WorkerConditioningState()
-    stage = NS(codecs=codecs, conditioning_provider=provider)
+    stage = NS(
+        codecs=codecs, conditioning_provider=provider, admit_cached_preparation=Mock()
+    )
     stage.encode_condition_for_batch = Mock(
         side_effect=lambda batch, prompt, media: provider(
             prompt, media, device="cpu", state=condition
@@ -348,6 +350,7 @@ def test_startup_a_switch_b_a_reuses_kv_and_preserves_outputs(
         condition_state = WorkerConditioningState()
         stage = NS(
             codecs=codecs,
+            admit_cached_preparation=Mock(),
             encode_condition_for_batch=Mock(
                 side_effect=lambda batch, prompt, media: conditions[prompt]
             ),
@@ -432,6 +435,11 @@ def test_startup_a_switch_b_a_reuses_kv_and_preserves_outputs(
             else:
                 assert len(cache.entries) == 2 and cache.evictions == 0
             assert stage.encode_condition_for_batch.call_count == 1  # Only first B.
+            stage.admit_cached_preparation.assert_called()
+            assert all(
+                call.kwargs["prompt_joint"] == joint
+                for call in stage.admit_cached_preparation.call_args_list
+            )
             # Startup A joins prefix/source/active. Cold B joins six branches;
             # subsequent A/B returns use restored KV.
             assert prefix_calls == (0 if joint else 2)
@@ -523,6 +531,7 @@ def test_failed_update_drops_pending_but_preserves_active_cache(tmp_path, failur
     )
     stage = NS(
         codecs=codecs,
+        admit_cached_preparation=Mock(),
         encode_condition_for_batch=Mock(
             side_effect=ConditionError("CONDITION_INVALID", "Encoding failed")
         ),

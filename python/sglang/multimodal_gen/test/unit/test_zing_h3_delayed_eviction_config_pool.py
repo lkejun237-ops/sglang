@@ -279,10 +279,8 @@ def test_checkpoint_benchmark_cli_explicit_policy(policy):
 def _pool_config(timing):
     _declares(ZingKVPoolConfig, POLICY)
     return ZingKVPoolConfig(
-        pool_size=1,
         max_target_area=32 * 32,
         max_target_long_edge=32,
-        max_prefix_rows=7,
         window_chunks=3,
         sink_chunks=1,
         window_eviction_timing=timing,
@@ -300,7 +298,6 @@ def _pool_request(timing):
 def test_pool_launch_and_admission_use_same_policy(timing):
     config = _pool_config(timing)
     geometry = ZingKVGeometry(16, (1, 2, 2), 32, ChunkPlan([1, 4, 2]))
-    plan = ZingKVPoolPlan.build(config, geometry)
     expected = _oracle(
         geometry,
         config.window_policy,
@@ -309,6 +306,7 @@ def test_pool_launch_and_admission_use_same_policy(timing):
         has_source=True,
         timing=timing,
     )
+    plan = ZingKVPoolPlan.build(config, geometry, token_capacity=expected)
     assert plan.slot_rows == expected
     assert plan.admit(_pool_request(timing)) == expected
     other = "before_source" if timing == "after_step0" else "after_step0"
@@ -321,7 +319,18 @@ def test_pool_launch_and_admission_use_same_policy(timing):
 def test_capacity_shortfall_rejects_without_changing_policy():
     config = _pool_config("after_step0")
     geometry = ZingKVGeometry(16, (1, 2, 2), 32, ChunkPlan([1, 4, 2]))
-    plan = ZingKVPoolPlan.build(config, geometry)
+    plan = ZingKVPoolPlan.build(
+        config,
+        geometry,
+        token_capacity=_oracle(
+            geometry,
+            config.window_policy,
+            prefix_rows=7,
+            rows_per_frame=1,
+            has_source=True,
+            timing="after_step0",
+        ),
+    )
     limited = replace(plan, slot_rows=plan.slot_rows - 1)
     request = _pool_request("after_step0")
     with pytest.raises(ZingKVPoolAdmissionError):
@@ -333,13 +342,15 @@ def test_capacity_shortfall_rejects_without_changing_policy():
 def test_pipeline_launch_contract_propagates_policy():
     _declares(ZingKVPoolConfig, POLICY)
     pipeline = SimpleNamespace(
-        zing_kv_pool_size=1,
-        zing_kv_pool_max_target_area=1024,
-        zing_kv_pool_max_target_long_edge=32,
-        zing_kv_pool_max_prefix_rows=7,
+        zing_kv_pool_window_chunks=3,
+        zing_kv_pool_sink_chunks=1,
+        zing_kv_pool_rope_position_mode="block_relative",
+        zing_kv_pool_rope_max_frame_gap=12,
         zing_kv_pool_window_eviction_timing="after_step0",
     )
-    config = ZingKVPoolConfig.from_pipeline_config(pipeline, max_sessions=1)
+    config = ZingKVPoolConfig.from_pipeline_config(
+        pipeline, max_sessions=1, mem_fraction_static=0.8
+    )
     assert config.window_eviction_timing == "after_step0"
 
 
@@ -355,7 +366,7 @@ def test_pipeline_default_uses_delayed_eviction():
 
 
 def test_pool_default_uses_delayed_eviction():
-    config = ZingKVPoolConfig(1, 1024, 32, 7, window_chunks=3, sink_chunks=1)
+    config = ZingKVPoolConfig(window_chunks=3, sink_chunks=1)
     assert config.window_eviction_timing == "after_step0"
 
 
@@ -365,7 +376,7 @@ def test_request_default_uses_delayed_eviction():
 
 
 def test_capacity_default_uses_delayed_eviction():
-    config = ZingKVPoolConfig(1, 1024, 32, 7, window_chunks=3, sink_chunks=1)
+    config = ZingKVPoolConfig(window_chunks=3, sink_chunks=1)
     geometry = ZingKVGeometry(16, (1, 2, 2), 32, ChunkPlan([1, 4, 2]))
     assert peak_rows(
         geometry, config.window_policy, prefix_rows=7, rows_per_frame=1, has_source=True

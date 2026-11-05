@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import hashlib
 import json
+import math
 import time
 from contextlib import contextmanager, nullcontext
 
@@ -18,11 +19,15 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+    ZING_MIN_RUNTIME_BYTES,
     ZingKVGeometry,
     ZingKVPool,
+    ZingKVPoolAdmissionError,
     ZingKVPoolConfig,
     ZingKVPoolPlan,
     ZingKVRequest,
+    cleaned_free_memory,
+    token_capacity,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
@@ -101,6 +106,7 @@ class ZingH3GenerationStage(PipelineStage):
             return self.codecs.encode_condition(prompt, media)
 
     def conditioner(self, batch, prompt, media):
+        self.codecs.validate_compute_inputs(prompt, media)
         session = getattr(batch, "session", None)
         state = (
             session.get_or_create_state(WorkerConditioningState)
@@ -142,11 +148,12 @@ class ZingH3GenerationStage(PipelineStage):
     def realtime_kv_cache_pool_enabled(self):
         return self.kv_pool is not None
 
-    def initialize_realtime_kv_cache_pool(self, server_args):
+    def initialize_realtime_kv_cache_pool(self, server_args, *, before_load=None):
         """Allocate every realtime KV session slot before readiness."""
         config = ZingKVPoolConfig.from_pipeline_config(
             server_args.pipeline_config,
             max_sessions=server_args.realtime_max_sessions_per_worker,
+            mem_fraction_static=getattr(server_args, "mem_fraction_static", None),
         )
         if config is None:
             logger.info("Zing Block0 cache skipped: no GPU KV pool configured")
@@ -189,7 +196,6 @@ class ZingH3GenerationStage(PipelineStage):
             video_t_span=self.packer._video_t_span,
             time_span_period=len(self.packer.visual_token_frame_spans),
         )
-        plan = ZingKVPoolPlan.build(config, geometry)
         arch = self.config.dit_config.arch_config
         ulysses = get_ulysses_parallel_world_size()
         layout = dict(
@@ -199,9 +205,61 @@ class ZingH3GenerationStage(PipelineStage):
             dtype=PRECISION_TO_TYPE[self.config.dit_precision],
             device=current_platform.get_local_torch_device(),
         )
-        pool = ZingKVPool.allocate(plan, **layout)
-        if layout["device"].type == "cuda":
-            torch.cuda.synchronize(layout["device"])
+        if before_load is None:
+            raise ValueError(
+                "Zing KV budget requires a pre-model-load memory measurement"
+            )
+        after_load = cleaned_free_memory(layout["device"])
+        element = torch.empty((), dtype=layout["dtype"]).element_size()
+        rows = kv_budget = budget_error = None
+        runtime_reserve = additional_reserve = None
+        try:
+            if not 0 < server_args.mem_fraction_static < 1:
+                raise ValueError("mem_fraction_static must be between 0 and 1")
+            ratio_reserve = math.ceil(
+                before_load * (1 - server_args.mem_fraction_static)
+            )
+            runtime_reserve = max(ZING_MIN_RUNTIME_BYTES, ratio_reserve)
+            additional_reserve = runtime_reserve - ratio_reserve
+            rows, kv_budget = token_capacity(
+                before_load=before_load,
+                after_load=after_load,
+                mem_fraction_static=server_args.mem_fraction_static,
+                num_layers=layout["num_layers"],
+                local_heads=layout["local_heads"],
+                head_dim=layout["head_dim"],
+                element_size=element,
+                additional_runtime_reserve_bytes=additional_reserve,
+            )
+        except ValueError as exc:
+            budget_error = str(exc)
+        receipts = coordinate_validation((budget_error, rows, runtime_reserve))
+        if any(error is not None for error, _, _ in receipts):
+            raise ValueError(f"Zing KV budget failed on at least one rank: {receipts}")
+        # All ranks use the smallest capacity, including asymmetric residency.
+        rows = min(value for _, value, _ in receipts)
+        runtime_budget = min(value for _, _, value in receipts)
+        plan = ZingKVPoolPlan.build(
+            config,
+            geometry,
+            token_capacity=rows,
+            runtime_budget_bytes=runtime_budget,
+            local_hidden_width=layout["local_heads"] * layout["head_dim"],
+            prefix_hidden_width=arch.num_attention_heads * arch.attention_head_dim,
+        )
+        self.codecs.compute_plan = plan
+        pool = allocation_error = None
+        try:
+            pool = ZingKVPool.allocate(plan, **layout)
+            if layout["device"].type == "cuda":
+                torch.cuda.synchronize(layout["device"])
+        except RuntimeError as exc:
+            allocation_error = str(exc)
+        errors = coordinate_validation(allocation_error)
+        if any(error is not None for error in errors):
+            raise RuntimeError(
+                f"Zing KV allocation failed on at least one rank: {errors}"
+            )
         slot_bytes = pool.allocated_bytes()
         element = torch.empty((), dtype=layout["dtype"]).element_size()
         budget = dict(
@@ -222,7 +280,14 @@ class ZingH3GenerationStage(PipelineStage):
                     "max_target_area": config.max_target_area,
                     "max_target_long_edge": config.max_target_long_edge,
                     "max_short_edge": geometry.max_short_edge,
-                    "max_prefix_rows": config.max_prefix_rows,
+                    "mem_fraction_static": server_args.mem_fraction_static,
+                    "pre_model_load_free_bytes": before_load,
+                    "post_model_load_free_bytes": after_load,
+                    "kv_budget_bytes": kv_budget,
+                    "minimum_runtime_reserve_bytes": ZING_MIN_RUNTIME_BYTES,
+                    "additional_runtime_reserve_bytes": additional_reserve,
+                    "runtime_budget_bytes": runtime_budget,
+                    "prefix_hidden_width": plan.prefix_hidden_width,
                     "window_chunks": config.window_chunks,
                     "window_eviction_timing": config.window_eviction_timing,
                     "sink_chunks": config.sink_chunks,
@@ -230,7 +295,7 @@ class ZingH3GenerationStage(PipelineStage):
                     "rope_max_frame_gap": config.rope_max_frame_gap,
                     "chunk_lengths": list(geometry.chunk_plan.lengths),
                     "split_first_latent": geometry.chunk_plan.split_first_latent,
-                    "reserves_target_audio": True,
+                    "shared_condition_and_target_budget": True,
                     "ulysses_degree": ulysses,
                     "num_attention_heads_per_rank": layout["local_heads"],
                     "dtype": str(layout["dtype"]),
@@ -242,6 +307,8 @@ class ZingH3GenerationStage(PipelineStage):
                 sort_keys=True,
                 separators=(",", ":"),
             ),
+            main_process_only=False,
+            local_main_process_only=False,
         )
         self.kv_pool = pool
         if block0 is not None:
@@ -325,6 +392,64 @@ class ZingH3GenerationStage(PipelineStage):
                 else int(inputs.audio_shape[1])
             ),
         )
+
+    def admit_realtime_condition(
+        self,
+        sampler,
+        inputs,
+        condition,
+        *,
+        source_shape,
+        total_frames,
+        prompt_update=True,
+    ):
+        """Pack a candidate without touching current KV, for both realtime APIs."""
+        if self.kv_pool is None:
+            return None
+        from .prompt_update import admit_prompt_update, coordinate_prompt_admission
+
+        return coordinate_prompt_admission(
+            lambda: admit_prompt_update(
+                self,
+                sampler,
+                inputs,
+                condition,
+                source_shape=source_shape,
+                total_frames=total_frames,
+                prompt_update=prompt_update,
+            )
+        )
+
+    def admit_cached_preparation(
+        self, entry, *, prompt_update=False, prompt_joint=False
+    ):
+        """Reject a CPU cache snapshot before copying candidate tensors to CUDA."""
+        from sglang.multimodal_gen.runtime.conditioning.worker import (
+            coordinate_validation,
+        )
+
+        error = None
+        try:
+            self.codecs.validate_prepared_compute_inputs(entry.inputs)
+            from .packing import ZingH3Packer
+
+            self.kv_pool.plan.admit(
+                entry.request,
+                prompt_prefix_frames=ZingH3Packer.PROMPT_SWITCH_PREFIX_FRAMES
+                if prompt_update
+                else 0,
+                prompt_joint=prompt_joint,
+            )
+        except (ConditionError, ZingKVPoolAdmissionError) as exc:
+            error = exc
+            logger.warning(
+                "Cached preparation rejected: %s", getattr(exc, "detail", str(exc))
+            )
+        if not all(coordinate_validation(error is None)):
+            raise ConditionError(
+                "CONDITION_INVALID",
+                "This request is too large for this server",
+            ) from error
 
     def component_uses(self, server_args, stage_name=None):
         uses = [
@@ -761,7 +886,16 @@ class ZingH3GenerationStage(PipelineStage):
                 candidate = self.encode_condition_for_batch(
                     batch, params.prompt, inputs.condition_media
                 )
+                source = inputs.source_visual
+                self.admit_realtime_condition(
+                    sampler,
+                    inputs,
+                    candidate,
+                    source_shape=None if source is None else source.shape,
+                    total_frames=inputs.visual_shape[0],
+                )
             except ConditionError as exc:
+                candidate = None
                 state.failed_update = update
                 state.conditioning_notice = {
                     "code": exc.code,

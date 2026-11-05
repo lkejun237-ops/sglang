@@ -550,7 +550,7 @@ SHA256: 57ebd7aaac0e3909a394725890e5d35e2d1f16f73530276472f549ab3e7ced64
 
 远程Qwen是独立进程，其 `limits.max_media` 需设为 `N+1`；上述可自动字段省略（Python默认）或在现有完整admin JSON中设为 `null`。旧JSON里的数字512MiB等仍被视为明确手工限制，需改成null才能自动推导；不会远程修改已经运行的服务配额。worker端client配置也使用同一个 `ResourceLimits` 解析器；未显式提供max_media时由pipeline的N推导，显式client/service限制各自仍生效。使用本地Qwen不需要RPC配置。
 
-KV前缀行数需要Qwen processor图像token上限、文本token数、VAE resize bucket和并行/目标档位等信息，不能用原图RGB字节直接换算。因此 `zing_kv_pool_max_prefix_rows` 和真实token准入仍按原部署显式配置；没有根据N自动分配可能OOM的KV池。`max_condition_rows` 同样保持模型token约束，不能把新增原始输入预算当成模型一定接受全部最大图的证明。
+KV前缀行数需要Qwen processor图像token上限、文本token数、VAE resize bucket和并行/目标档位等信息，不能用原图RGB字节直接换算。当前版本通过 `--mem-fraction-static` 自动确定共享 KV 总 token 容量，packing 后检查完整 prefix/source/target 峰值；图数与编码计算边界仍独立检查。`max_condition_rows` 同样保持模型token约束，不能把新增原始输入预算当成模型一定接受全部最大图的证明。
 
 ### 9.3 协议、职责和社区导读
 

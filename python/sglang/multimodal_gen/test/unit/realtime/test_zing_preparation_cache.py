@@ -129,6 +129,7 @@ def test_startup_wires_cache_without_gating_joint(
     )
     stage = NS(
         codecs=codecs,
+        admit_cached_preparation=Mock(),
         block0_cache=owner if cache_enabled else None,
         modules={"transformer": torch.nn.Linear(1, 1)},
         _validate_sampling_params=lambda _: None,
@@ -276,7 +277,7 @@ def test_fill_accepts_host_positions_and_waits_on_kv_device(monkeypatch):
     store = NS(k=torch.zeros(8, 2, 3))
     pool = NS(
         _pool=NS(_slots=[NS(kv_cache=[store])]),
-        plan=NS(config=NS(max_prefix_rows=8)),
+        plan=NS(slot_rows=8),
     )
     owner = Block0PreparationCache(
         pool, max_bytes=2 * 8 * 2 * 3 * 4, identity={}, disk_cache=None, page_rows=8

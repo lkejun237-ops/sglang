@@ -34,7 +34,7 @@ def owner(*, pages=6, page_rows=4, max_rows=16):
     # Exact budget, independent of maximum entry rows.
     pool = NS(
         _pool=NS(_slots=[NS(kv_cache=stores)]),
-        plan=NS(config=NS(max_prefix_rows=max_rows)),
+        plan=NS(slot_rows=max_rows),
     )
     return preparation_cache.Block0PreparationCache(
         pool,
@@ -45,7 +45,7 @@ def owner(*, pages=6, page_rows=4, max_rows=16):
     )
 
 
-def fill(cache, key, rows, value=1):
+def fill(cache, key, rows, value=1, **kwargs):
     layers = [
         (
             torch.arange(rows * 2).reshape(rows, 1, 2).float() + value + 100 * layer,
@@ -57,7 +57,7 @@ def fill(cache, key, rows, value=1):
         prefix=NS(positions=torch.zeros(rows, 3), layers=layers),
         _model_signature="model",
     )
-    cache.fill(key, inputs(), "condition", "request", source)
+    cache.fill(key, inputs(), "condition", "request", source, **kwargs)
     return source
 
 
@@ -454,3 +454,23 @@ def test_bad_preload_metadata_keeps_sp_collectives_and_other_keys(
         ]
         assert result["cache_keys"] == ["good"]
         conserved(cache)
+
+
+def test_optional_fill_skips_oversize_without_copy_or_eviction(cpu_dma, monkeypatch):
+    cache = owner(pages=2)
+    fill(cache, "a", 3)
+    cache.finish_fill()
+    before = list(cache.free_pages)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Oversize optional fill copied inputs")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(preparation_cache, "inputs_on", forbidden)
+        fill(cache, "large", 9, required=False)
+    assert list(cache.entries) == ["a"]
+    assert cache.free_pages == before and cache.pending is None
+    fill(cache, "next", 3, required=False)
+    cache.finish_fill()
+    assert set(cache.entries) == {"a", "next"}
+    conserved(cache)

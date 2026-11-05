@@ -30,11 +30,20 @@ class DecoderOutputSession:
             source_consumed_message,
         )
 
+        if self.stopped.is_set():
+            return
         if type(owned_frame_end) is not int or owned_frame_end < self.owned_frame_end:
             raise ValueError("Invalid Decoder source ownership watermark")
         previous = None
         boundaries = []
-        frame_bytes = self.config["width"] * self.config["height"] * 3
+        # Credit acknowledges wire input, independently of source resizing and
+        # output resolution. Older same-size callers omit source_stream.
+        source = self.config.get("source_stream", self.config)
+        if not isinstance(source, dict) or any(
+            type(source.get(k)) is not int or source[k] < 1 for k in ("width", "height")
+        ):
+            raise ValueError("Invalid Decoder source stream dimensions")
+        frame_bytes = source["width"] * source["height"] * 3
         for record in records:
             if not isinstance(record, (list, tuple)) or len(record) != 3:
                 raise ValueError("Invalid source packet boundary")
@@ -63,7 +72,7 @@ class DecoderOutputSession:
         if message is not None:
             # Same FIFO as RGB: current dispatch output is sent before credit.
             # Progress without an RGB block still grants complete input packets.
-            self.put(message, timeout)
+            self.put(message, timeout, discard_if_stopped=True)
             self.consumed_frames = message["source_frame_end"]
         self.owned_frame_end = owned_frame_end
 
@@ -84,7 +93,7 @@ class DecoderOutputSession:
                 )
             self.attached = True
 
-    def put(self, item, timeout):
+    def put(self, item, timeout, *, discard_if_stopped=False):
         # Do not hold a lock across a bounded put: disconnect must unblock it.
         import time
 
@@ -92,6 +101,8 @@ class DecoderOutputSession:
         while True:
             with self.lock:
                 if self.stopped.is_set():
+                    if discard_if_stopped:
+                        break
                     raise RuntimeError("Decoder output connection is closed")
                 try:
                     self.queue.put_nowait(item)
@@ -101,6 +112,12 @@ class DecoderOutputSession:
             if time.monotonic() >= deadline:
                 raise TimeoutError("Decoder output queue is full")
             self.stopped.wait(0.005)
+        # The input owner cancels behind already-sent NCCL payloads. Continue
+        # receiving those payloads after output disconnect, without retaining
+        # their RGB references or treating cancellation as a model failure.
+        reference = item.get("reference")
+        if reference is not None:
+            self.cancel_reference(reference)
 
     def take(self):
         with self.lock:
@@ -203,6 +220,7 @@ class DecoderOutputBroker:
                 while True:
                     message = await ws.receive()
                     if message["type"] == "websocket.disconnect":
+                        session.abort()
                         return
                     raise ValueError(
                         "Decoder output connection only accepts an attachment"
@@ -296,15 +314,18 @@ class DecoderOutputBroker:
                     task.result()
                 if (
                     not session.completed
+                    and not session.stopped.is_set()
                     and getattr(self, "on_send_failure", None) is not None
                 ):
                     self.on_send_failure()
             except WebSocketDisconnect:
-                if session is not None and not session.completed:
-                    callback = getattr(self, "on_send_failure", None)
-                    if callback is not None:
-                        callback()
+                if session is not None:
+                    session.abort()
             except Exception:
+                # An owner abort ends only its request, including initial capacity
+                # refusal. Invalid output protocol still quarantines below; client disconnect cancels.
+                if session is not None and session.stopped.is_set():
+                    return
                 logging.getLogger(__name__).exception(
                     "Decoder output connection failed"
                 )

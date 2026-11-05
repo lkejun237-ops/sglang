@@ -635,12 +635,17 @@ def test_connected_encoder_sends_qwen_before_vae_and_keeps_native_tensors():
     assert sent[-1] == "cancel" and worker.owner is None
 
 
-def test_connected_api_initializes_dit_before_any_source(configured):  # noqa: F811
+@pytest.mark.parametrize(
+    "source,target", [((32, 32), (32, 32)), ((832, 480), (1280, 736))]
+)
+def test_connected_api_initializes_dit_before_any_source(configured, source, target):  # noqa: F811
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.zing_encoder_dit_adapter import (
         ZingEncoderDiTAdapter,
     )
 
     async def run():
+        width, height = target
+        source_width, source_height = source
         sent = []
 
         async def open_dit(message):
@@ -652,10 +657,12 @@ def test_connected_api_initializes_dit_before_any_source(configured):  # noqa: F
         request = RealtimeVideoGenerationsRequest(
             type="init",
             prompt="first",
-            size="32x32",
+            size=f"{width}x{height}",
             seed=None,
             zing_realtime_api_version=1,
-            source_stream=dict(format="rgb24", width=32, height=32, fps=24),
+            source_stream=dict(
+                format="rgb24", width=source_width, height=source_height, fps=24
+            ),
         )
         await adapter.on_init(session, request)
         assert not adapter.pending and not adapter.dispatched_source_frames
@@ -665,8 +672,11 @@ def test_connected_api_initializes_dit_before_any_source(configured):  # noqa: F
                 generation_id=session.generation_id,
                 async_inputs=True,
                 seed=42,
-                width=32,
-                height=32,
+                width=width,
+                height=height,
+                source_stream=dict(
+                    width=source_width, height=source_height, fps=24, format="rgb24"
+                ),
                 source_encoding=adapter.source_geometry.receipt(),
                 fps=24,
                 total_frames=None,
@@ -1226,7 +1236,10 @@ def test_encoder_services_load_once_and_keep_admission_and_conditions_private(
         return SimpleNamespace(modules={"video_vae": object()}, va=object(), runtime={})
 
     shared_codecs = SimpleNamespace(
-        warmup_encoder=lambda: calls.append("warmup"), encode_condition=lambda *a: None
+        warmup_encoder=lambda: calls.append("warmup"),
+        encode_condition=lambda *a: None,
+        canvas_multiple=32,
+        max_short_edge=768,
     )
     monkeypatch.setattr(native, "build_encoder_pipeline", load_qwen)
     monkeypatch.setattr(encoder_worker, "load_encoder", load_vae)
@@ -1243,6 +1256,7 @@ def test_encoder_services_load_once_and_keep_admission_and_conditions_private(
         async with apps[0].router.lifespan_context(apps[0]):
             clients = [app.state.realtime_execution_client for app in apps]
             assert all(c.executor.codecs is shared_codecs for c in clients)
+            shared_codecs.compute_plan.validate_canvas(736, 1280)
             assert len({id(c.pool) for c in clients}) == 1
             assert len({id(c.executor.conditioning) for c in clients}) == service_count
             assert (
@@ -1268,3 +1282,117 @@ def test_encoder_services_load_once_and_keep_admission_and_conditions_private(
 
     asyncio.run(run())
     assert calls == ["qwen", "vae", "warmup"]
+
+
+@pytest.mark.parametrize(
+    "failure", ["condition", "model", "cuda", "cuda_after_forward"]
+)
+def test_encoder_owner_queue_classifies_condition_rejection_without_quarantine(
+    monkeypatch, failure
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+    from sglang.multimodal_gen.runtime.entrypoints.zing_source_encoder_server import (
+        EncoderClient,
+    )
+    from sglang.multimodal_gen.runtime.realtime.worker_connections import (
+        ServiceConnections,
+    )
+
+    controller = ServiceConnections(
+        {"role": "encoder"},
+        ready=lambda: True,
+        build=lambda *args: None,
+        destroy=lambda: None,
+        rollback=lambda: None,
+    )
+    controller.state, controller.group = "connected", "capacity-recovery"
+    rejected = (
+        RuntimeError("Private model failure")
+        if failure == "model"
+        else ConditionError(
+            "CONDITION_INVALID", "This request is too large for this server"
+        )
+    )
+    completed = object()
+    requests = []
+
+    def forward(request):
+        requests.append(request)
+        if len(requests) == 1 and failure != "cuda_after_forward":
+            raise rejected
+        return completed
+
+    cuda_error = RuntimeError("Private CUDA synchronization failure")
+
+    def synchronize():
+        if failure in ("cuda", "cuda_after_forward"):
+            raise cuda_error
+
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
+    executor = SimpleNamespace(forward=forward, connection_controller=controller)
+
+    async def run():
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            client = EncoderClient(executor, pool)
+            expected = (
+                cuda_error if failure in ("cuda", "cuda_after_forward") else rejected
+            )
+            with pytest.raises(type(expected)) as captured:
+                await client.forward("rejected-initial-condition")
+            assert captured.value is expected
+            if failure != "condition":
+                assert controller.restart_required
+                assert controller.query()[1] == 503
+            else:
+                assert not controller.restart_required
+                assert controller.query()[0]["state"] == "connected"
+                assert await client.forward("next-legal-session") is completed
+                assert requests == ["rejected-initial-condition", "next-legal-session"]
+
+    asyncio.run(run())
+
+
+def test_early_connection_rejection_cleanup_preserves_existing_adapter(configured):  # noqa: F811
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.zing_encoder_dit_adapter import (
+        ZingEncoderDiTAdapter,
+    )
+
+    async def run():
+        from sglang.multimodal_gen.runtime.realtime.worker_connections import (
+            ServiceConnections,
+        )
+
+        active = object()
+        controller = ServiceConnections(
+            {"role": "encoder"},
+            ready=lambda: True,
+            build=lambda *args: None,
+            destroy=lambda: None,
+            rollback=lambda: None,
+        )
+        controller.state = "unavailable"
+        app = SimpleNamespace(
+            state=SimpleNamespace(
+                worker_connections=controller,
+                connection_adapter=active,
+            )
+        )
+        adapter, session = ZingEncoderDiTAdapter(), GenerateSession()
+        adapter.connection_app = app
+        session.set_adapter(adapter)
+        request = RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="first",
+            size="32x32",
+            zing_realtime_api_version=1,
+            source_stream=dict(format="rgb24", width=32, height=32, fps=24),
+        )
+        with pytest.raises(ValueError, match="worker connections are not ready"):
+            await adapter.on_init(session, request)
+        await adapter.close_conditioning(session)
+        adapter.dispose(session)
+        assert app.state.connection_adapter is active
+
+    asyncio.run(run())

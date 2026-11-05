@@ -46,6 +46,12 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
                 else ZingH3SamplingParams.seed,
                 width=self.source_geometry.target_width,
                 height=self.source_geometry.target_height,
+                source_stream=dict(
+                    width=self.config["width"],
+                    height=self.config["height"],
+                    fps=self.config["fps"],
+                    format="rgb24",
+                ),
                 source_encoding=self.source_geometry.receipt(),
                 fps=self.config["fps"],
                 total_frames=self.config["total_frames"],

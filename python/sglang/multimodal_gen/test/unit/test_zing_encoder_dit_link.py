@@ -264,14 +264,13 @@ def pooled_stage(h, codecs):
         ZingKVPool,
         ZingKVPoolConfig,
         ZingKVPoolPlan,
+        peak_rows,
     )
 
     sampler = h.sampler()
     config = ZingKVPoolConfig(
-        pool_size=1,
         max_target_area=4,
         max_target_long_edge=2,
-        max_prefix_rows=64,
         window_chunks=sampler.window_policy.window_chunks,
         sink_chunks=sampler.window_policy.sink_chunks,
         window_eviction_timing=sampler.window_eviction_timing,
@@ -286,9 +285,21 @@ def pooled_stage(h, codecs):
     )
     stage = object.__new__(ZingH3GenerationStage)
     stage.codecs = codecs
+    codecs.validate_prepared_compute_inputs = lambda inputs: None
     stage.packer = h.packer
     stage.kv_pool = ZingKVPool.allocate(
-        ZingKVPoolPlan.build(config, geometry),
+        ZingKVPoolPlan.build(
+            config,
+            geometry,
+            token_capacity=peak_rows(
+                geometry,
+                config.window_policy,
+                prefix_rows=64,
+                rows_per_frame=geometry.rows_per_frame(2, 2),
+                has_source=True,
+                window_eviction_timing=config.window_eviction_timing,
+            ),
+        ),
         num_layers=h.model.arch.num_layers,
         local_heads=h.model.arch.num_attention_heads,
         head_dim=h.model.arch.attention_head_dim,
@@ -482,6 +493,8 @@ def test_decoder_seam_routes_latents_and_drains_before_session_completion():
     def create(init, output):
         worker = SimpleNamespace(
             queue=[],
+            closed=False,
+            initial_received=True,
             complete=False,
             bridge=SimpleNamespace(
                 clip_latents=5,
@@ -812,7 +825,10 @@ def test_stage_initialization_preserves_encoder_startup_unless_inputs_are_extern
 
 
 @torch.no_grad()
-def test_pool_rejection_is_nonfatal_and_discards_pending_prompt(model):
+@pytest.mark.parametrize("cached", [False, True])
+def test_pool_rejection_is_nonfatal_and_discards_pending_prompt(model, cached):
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+
     h = Harness(model)
     codecs = SimpleNamespace(
         target_fps=24,
@@ -831,6 +847,10 @@ def test_pool_rejection_is_nonfatal_and_discards_pending_prompt(model):
         created.append(worker)
         return worker
 
+    def reject_cached(message, *, initial):
+        raise ConditionError("CONDITION_INVALID", "This update is too large")
+
+    create.cached_condition = reject_cached
     channel.service = DiTInputService(
         SimpleNamespace(send=channel.replies.append), create
     )
@@ -863,7 +883,15 @@ def test_pool_rejection_is_nonfatal_and_discards_pending_prompt(model):
                 65, dtype=torch.int64, device=condition["context"].device
             ),
         )
-        rejected = client.send("conditioning", event_id=12, tensors=oversized)
+        rejected = client.send(
+            "conditioning",
+            event_id=12,
+            **(
+                {"cache_hit": True, "cache_key": "a" * 64}
+                if cached
+                else {"tensors": oversized}
+            ),
+        )
         assert len(rejected) == 1 and rejected[0]["type"] == "conditioning.rejected"
         assert (
             rejected[0]["event_id"] == 12 and rejected[0]["code"] == "CONDITION_INVALID"
@@ -1025,3 +1053,126 @@ def test_cached_prefix_matches_uncached_queued_dit(model, cpu_dma, joint_forward
     actual = asyncio.run(run(True))
     assert len(actual) == len(baseline) > 0
     assert all(torch.equal(a, b) for a, b in zip(actual, baseline))
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("cached", [False, True])
+def test_initial_pool_rejection_allows_inflight_ack_cancel_and_reuse(
+    model, monkeypatch, cached
+):
+    h = Harness(model)
+    codecs = SimpleNamespace(
+        target_fps=24,
+        spatial_ratio=1,
+        temporal_ratio=4,
+        vae_frames_per_chunk=17,
+        vae_latents_per_chunk=5,
+        sample_streaming_visual_moments=lambda value, **kw: value,
+    )
+    stage = pooled_stage(h, codecs)
+    channel = LocalChannel()
+    created = []
+
+    def create(init, output):
+        worker = create_link_session(h.sampler(), codecs, init, output, stage=stage)
+        created.append(worker)
+        return worker
+
+    channel.service = DiTInputService(
+        SimpleNamespace(send=channel.replies.append), create
+    )
+    client = DiTLinkClient(channel)
+    init = dict(session_id="bad", generation_id="g", seed=7, width=2, height=2, fps=24)
+    client.open(init)
+    condition = h.condition(10)
+    rows = stage.kv_pool.plan.slot_rows + 1
+    oversized = dict(
+        context=condition["context"][:1].expand(rows, -1).clone(),
+        row_role=torch.zeros(
+            rows, dtype=torch.int64, device=condition["context"].device
+        ),
+    )
+    if cached:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+            dit_preparation,
+        )
+        from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import ZingKVRequest
+
+        config = stage.kv_pool.plan.config
+        entry = SimpleNamespace(
+            inputs=h.inputs,
+            request=ZingKVRequest(
+                2,
+                2,
+                (2, 2),
+                rows,
+                config.window_chunks,
+                config.sink_chunks,
+                config.rope_position_mode,
+                config.rope_max_frame_gap,
+                window_eviction_timing=config.window_eviction_timing,
+            ),
+        )
+        finished = []
+        stage.block0_cache = SimpleNamespace(
+            lookup=lambda key: entry, finish_fill=lambda: finished.append(True)
+        )
+        create.cached_condition = dit_preparation.DiTPreparation(
+            stage, lambda: None
+        ).cached_condition
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("Rejected initial cache reached tensor restoration")
+
+        monkeypatch.setattr(dit_preparation, "inputs_on", forbidden)
+    rejected = client.send(
+        "conditioning",
+        event_id=10,
+        **(
+            {"cache_hit": True, "cache_key": "a" * 64}
+            if cached
+            else {"tensors": oversized, "inputs": input_metadata(h)}
+        ),
+    )
+    assert len(rejected) == 1
+    assert rejected[0]["type"] == "conditioning.rejected" and rejected[0]["initial"]
+    assert rejected[0]["code"] == "CONDITION_INVALID" and not client.failed
+    assert created[-1].closed and stage.kv_pool.available == 1
+    if cached:
+        assert finished
+    assert (
+        client.send(
+            "source.moments",
+            tensor=h.inputs.source_visual[:, :, :1],
+            latent_start=0,
+            latent_end=1,
+            source_dependency_end=43,
+            source_records=[[1, 0, 43]],
+        )
+        == []
+    )
+    client.release("bad")
+    assert channel.service.owner is None
+
+    client.open(dict(init, session_id="good", generation_id="next"))
+    try:
+        client.send(
+            "conditioning", event_id=10, tensors=condition, inputs=input_metadata(h)
+        )
+        outputs = []
+        for start, end in [(0, 1), (1, 3), (3, 5), (5, 8), (8, 10), (10, 13)]:
+            outputs += client.send(
+                "source.moments",
+                tensor=h.inputs.source_visual[:, :, start:end],
+                latent_start=start,
+                latent_end=end,
+                source_dependency_end=43,
+                source_records=[[1, 0, 43]],
+                final_source_frames=43,
+            )
+        outputs += client.send("source.end", latent_frames=13)
+        assert any(row["type"] == "dit.latents" for row in outputs)
+        assert any(row["type"] == "session.completed" for row in outputs)
+        assert stage.kv_pool.available == 1 and not client.failed
+    finally:
+        client.release("good")

@@ -225,7 +225,7 @@ class Block0PreparationCache:
         # request-time allocation or a new deployment configuration option.
         stores = pool._pool._slots[0].kv_cache
         first = stores[0].k
-        self.max_prefix_rows = pool.plan.config.max_prefix_rows
+        self.max_rows = pool.plan.slot_rows
         self.page_rows = page_rows
         self.page_bytes = (
             len(stores) * 2 * page_rows * first[0].numel() * first.element_size()
@@ -331,7 +331,7 @@ class Block0PreparationCache:
             self.free_pages[page] = True
 
     def _take_pages(self, key, rows, *, protected=()):
-        if type(rows) is not int or not 0 < rows <= self.max_prefix_rows:
+        if type(rows) is not int or not 0 < rows <= self.max_rows:
             raise ValueError("Block0 prefix exceeds the configured row limit")
         needed = (rows + self.page_rows - 1) // self.page_rows
         if needed > self.total_pages:
@@ -399,7 +399,7 @@ class Block0PreparationCache:
                 )
                 return None
             rows = int(positions.shape[0])
-            if rows < 1 or rows > self.max_prefix_rows:
+            if rows < 1 or rows > self.max_rows:
                 cache_event(
                     "l2_read",
                     "failed",
@@ -477,13 +477,35 @@ class Block0PreparationCache:
             started,
         )
 
-    def fill(self, key, inputs, conditioning_identity, request, cache, *, force=False):
+    def can_store(self, rows):
+        return 0 < rows <= min(self.max_rows, self.total_pages * self.page_rows)
+
+    def fill(
+        self,
+        key,
+        inputs,
+        conditioning_identity,
+        request,
+        cache,
+        *,
+        force=False,
+        required=True,
+    ):
         started = time.perf_counter()
         self.finish_fill()
         prefix = cache.prefix
         rows = prefix.positions.shape[0]
-        if rows > self.max_prefix_rows:
+        if rows > self.max_rows:
             raise ValueError("Block0 prefix exceeds the configured row limit")
+        if not required and not self.can_store(rows):
+            cache_event(
+                "l1_fill",
+                "skipped",
+                cache_key=key,
+                rank=self.log_rank,
+                reason="host_budget",
+            )
+            return False
         snapshot = inputs_on(inputs, "cpu", snapshot=True)
         positions = prefix.positions.detach().cpu().clone()
         data = self._take_pages(key, rows)
@@ -524,6 +546,8 @@ class Block0PreparationCache:
             context=entry.log_context,
             force=force,
         )
+
+        return True
 
     def finish_fill(self):
         if self.pending is not None:
@@ -792,7 +816,7 @@ class Block0PreparationCache:
                     else self.disk_cache.prefix_rows(key)
                 )
             local_rows.append(
-                rows if type(rows) is int and 0 < rows <= self.max_prefix_rows else None
+                rows if type(rows) is int and 0 < rows <= self.max_rows else None
             )
         plans = coordinate_validation((self.total_pages, local_rows))
         # No rank returns before this collective. Metadata races are handled by

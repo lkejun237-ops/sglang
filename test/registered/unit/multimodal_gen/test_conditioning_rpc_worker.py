@@ -731,6 +731,7 @@ class TestConditioningRPCWorker(CustomTestCase):
         state = importlib.import_module(STAGES + ".realtime").ZingH3RealtimeState()
         stage = object.__new__(stage_cls)
         stage.conditioning_mode = "remote"
+        stage.kv_pool = None
         stage._validate_sampling_params = lambda params: None
         stage.codecs = NS(
             decoder=importlib.import_module(STAGES + ".decoder").DECODERS[
@@ -749,6 +750,7 @@ class TestConditioningRPCWorker(CustomTestCase):
         state.inputs = NS(
             positive=condition(1),
             condition_media=[],
+            source_visual=None,
             pixel_frame_count=50,
             visual_shape=(50, 1, 1),
         )
