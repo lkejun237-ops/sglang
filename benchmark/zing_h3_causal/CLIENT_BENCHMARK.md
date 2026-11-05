@@ -32,6 +32,7 @@ python3 benchmark/zing_h3_causal/bench_streaming_source.py \
 ```
 
 原四个 case 保留为显式 `--case-set whitebox-basic` 的旧集合回归。
+此外，针对细分场景（Prompt 切换、Block 0 L1 折返复用、多角色/三视图一致性、大场景、第一人称、第三人称与 `832×480 → 1280×736` 跨分辨率输出）新增显式集合 [`product-case-20261103`](PRODUCT_CASE_REPLAY.md#场景细分测试集合product-case-202611038-个核心-case)（含 8 个核心 case，高频切换截取前 4～6 次；预览见[在线报告](https://review-cdn.loopit.com.cn/reports/dev-api-cases-20261103/r1/index.html)），可通过 `--case-set product-case-20261103` 准备与运行。
 有限输入工具 `run_benchmark.py` / `bench_client.py` 不支持新集合的动态更新，须显式
 选择旧集合或单 case；未选择时提示改用连续 source，不静默回退旧四条。
 新默认集合目前为 832×480；736 档未验证，仍按下文两档独立验收要求执行。

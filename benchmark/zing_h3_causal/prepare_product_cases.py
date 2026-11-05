@@ -31,9 +31,15 @@ def archive_timing(manifest, intervals):
     }
 
 
-def prepare(media_root, profile, *, ffprobe="ffprobe"):
+def prepare(
+    media_root,
+    profile,
+    *,
+    ffprobe="ffprobe",
+    case_set="product-case-20261029",
+):
     receipt, seen = [], set()
-    for member in load_case_set("product-case-20261029")["members"]:
+    for member in load_case_set(case_set)["members"]:
         case = member["request"]
         region = case["provenance"]["region"]
         for uri, identity in expected_assets(case).items():
@@ -66,7 +72,8 @@ def prepare(media_root, profile, *, ffprobe="ffprobe"):
                 with Image.open(path) as image:
                     image.verify()
             receipt.append({"uri": uri, "path": str(path.resolve()), **identity})
-        source = local_source_path(case["messages"][1]["source"]["uri"], media_root)
+        source_spec = case["messages"][1]["source"]
+        source = local_source_path(source_spec["uri"], media_root)
         # Decode the entire video: header duration/nb_frames is not sufficient.
         video = json.loads(
             subprocess.check_output(
@@ -87,9 +94,11 @@ def prepare(media_root, profile, *, ffprobe="ffprobe"):
             )
         )["streams"][0]
         expected = case["messages"][1]["content"][0]["output"]
+        expected_width = source_spec.get("width", expected["width"])
+        expected_height = source_spec.get("height", expected["height"])
         if (video["width"], video["height"], int(video["nb_read_frames"])) != (
-            expected["width"],
-            expected["height"],
+            expected_width,
+            expected_height,
             expected["frames"],
         ):
             raise ValueError(
@@ -111,9 +120,15 @@ if __name__ == "__main__":
     parser.add_argument("--media-root", type=Path, required=True)
     parser.add_argument("--profile", required=True, help="Existing Aliyun CLI profile")
     parser.add_argument("--ffprobe", default="ffprobe")
+    parser.add_argument("--case-set", default="product-case-20261029")
     args = parser.parse_args()
-    assets = prepare(args.media_root, args.profile, ffprobe=args.ffprobe)
+    assets = prepare(
+        args.media_root,
+        args.profile,
+        ffprobe=args.ffprobe,
+        case_set=args.case_set,
+    )
     args.media_root.mkdir(parents=True, exist_ok=True)
-    (args.media_root / "product-case-20261029-assets.json").write_text(
+    (args.media_root / f"{args.case_set}-assets.json").write_text(
         json.dumps({"status": "verified", "assets": assets}, indent=2) + "\n"
     )

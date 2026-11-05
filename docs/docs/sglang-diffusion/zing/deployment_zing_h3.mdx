@@ -36,6 +36,7 @@ GPU0–3 为 DiT、GPU4 为 Source Encoder/Qwen、GPU5 为 Lynn Decoder，实际
 `[1000,750,500,250]`，随后两步 `[1000,500]`；Graph、quantum1、Encoder/Decoder overlap、
 cross-chunk joint、预热 Block0 cache；无 offload、无 FP8 GEMM，单活跃会话。
 输入为 `product-case-20261029` 的显式 736 派生，不代表仓库默认集合已冻结 736 输入。
+（注：2026-11-04 新增场景细分集合 `product-case-20261103`，采集自 2026-11-02～11-03 上海与泰国 `dev_api` 归档，包含 Prompt 切换、Block0 L1 折返命中、多角色/三视图一致性、大场景、第一人称、第三人称及真实 `832×480 → 1280×736` case `736p-dream-foyer` 共 8 个核心 case，高频切换截取前 4～6 次；详情见 [产品真实请求回放集合](https://github.com/seedleap/sglang/blob/main/benchmark/zing_h3_causal/PRODUCT_CASE_REPLAY.md#场景细分测试集合product-case-202611038-个核心-case) 与 [在线预览报告](https://review-cdn.loopit.com.cn/reports/dev-api-cases-20261103/r1/index.html)，当前版本在该集合上的 GPU 性能与显存状态为**未验证**。）
 
 | case | 完整正式 n | 全程 FPS 中位数 / P95 | 首包后 FPS 中位数 / P95 |
 | --- | ---: | ---: | ---: |

@@ -1,0 +1,38 @@
+{
+  "name": "product-case-20261103",
+  "transport": "continuous_source",
+  "cases": [
+    {
+      "manifest": "benchmark/zing_h3_causal/product_case_20261103_cases.jsonl",
+      "case_id": "zing-product-case-20261103-prompt-switch-shibuya"
+    },
+    {
+      "manifest": "benchmark/zing_h3_causal/product_case_20261103_cases.jsonl",
+      "case_id": "zing-product-case-20261103-cache-return-shibuya"
+    },
+    {
+      "manifest": "benchmark/zing_h3_causal/product_case_20261103_cases.jsonl",
+      "case_id": "zing-product-case-20261103-consistency-banquet-fpv"
+    },
+    {
+      "manifest": "benchmark/zing_h3_causal/product_case_20261103_cases.jsonl",
+      "case_id": "zing-product-case-20261103-consistency-triview-shield"
+    },
+    {
+      "manifest": "benchmark/zing_h3_causal/product_case_20261103_cases.jsonl",
+      "case_id": "zing-product-case-20261103-large-scene-winterfell"
+    },
+    {
+      "manifest": "benchmark/zing_h3_causal/product_case_20261103_cases.jsonl",
+      "case_id": "zing-product-case-20261103-first-person-spell"
+    },
+    {
+      "manifest": "benchmark/zing_h3_causal/product_case_20261103_cases.jsonl",
+      "case_id": "zing-product-case-20261103-third-person-swordsman"
+    },
+    {
+      "manifest": "benchmark/zing_h3_causal/product_case_20261103_cases.jsonl",
+      "case_id": "zing-product-case-20261103-736p-dream-foyer"
+    }
+  ]
+}

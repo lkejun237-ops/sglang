@@ -92,6 +92,9 @@ def prepare_case(label, media_root, output, *, manifest=None, case_id=None):
         "conditioning": "text_and_references_plus_first_accepted_source_frame",
         "assets": assets,
     }
+    if "width" in target["source"] and "height" in target["source"]:
+        prepared["source_width"] = target["source"]["width"]
+        prepared["source_height"] = target["source"]["height"]
     replay = case.get("metadata", {}).get("streaming_replay")
     if replay is not None:
         prepared["reference_ids"] = replay["initial_reference_ids"]

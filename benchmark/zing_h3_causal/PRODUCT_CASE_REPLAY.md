@@ -86,3 +86,39 @@ python3 benchmark/zing_h3_causal/bench_streaming_source.py \
 阶段、显存和性能验证沿用 [客户端 benchmark 规范](CLIENT_BENCHMARK.md)，包括
 baseline/candidate 的 Encoder、DiT、Decoder 数据，不能仅凭 CPU 预检或素材完整声明
 GPU 生成、换图正确性、画质、24 FPS 或性能回归通过。当前 GPU 验证状态为**未验证**。
+
+## 场景细分测试集合：`product-case-20261103`（8 个核心 case）
+
+为细化评估 **Prompt 切换、Block 0 L1 缓存折返命中、多角色/三视图一致性、大场景、第一人称、第三人称及 736p 输出**，补充显式集合 `product-case-20261103`（定义见 [`product_case_20261103_cases.jsonl`](product_case_20261103_cases.jsonl) 与 [`case_sets/product-case-20261103.json`](case_sets/product-case-20261103.json)）。输入来自北京时间 2026-11-02 至 2026-11-03 上海（`cn-shanghai`）与泰国（`ap-southeast-7`）`dev_api` 实例的真实生成归档；在线报告与白模/输出对比预览见 [2026-11-02~11-03 dev_api 场景细分 Case 预览报告](https://review-cdn.loopit.com.cn/reports/dev-api-cases-20261103/r1/index.html)。默认集合仍保持 `product-case-20261029`。
+
+| case ID 后缀 | 场景维度 | 原 recording ID | 地域 | 源 → 输出分辨率 | 帧数（24 FPS 时长） | 生效版本数（总归档版本） | prompt 字符数，逐版本 | 参考图数，逐版本 |
+| --- | --- | --- | --- | --- | ---: | ---: | --- | --- |
+| `prompt-switch-shibuya` | Prompt 切换 + 增删参考图 | `128bf7642fc445c7b52817d838f7373b` | 上海 | 832×480 → 832×480 | 2596（108.167 秒） | 7（共 23，取前 6 次切换） | 6429 → 6683 → 6420 → 6407 → 6441 → 5597 → 6341 | 3 → 4 → 4 → 4 → 4 → 3 → 4 |
+| `cache-return-shibuya` | 状态折返 + Block0 L1 命中 | `b4594e29b1924a33a3608678df785ac5` | 上海 | 832×480 → 832×480 | 5993（249.708 秒） | 7（共 14，取前 6 次切换） | 3522 → 3758 → 3486 → 3758 → 3486 → 2750 → 2750 | 3 → 3 → 3 → 3 → 3 → 2 → 2 |
+| `consistency-banquet-fpv` | 多角色颜色绑定 + 第一人称 | `80b3d329982e41c0862b495dcd3954b7` | 上海 | 832×480 → 832×480 | 1097（45.708 秒） | 5（4 次切换） | 11285 → 11000 → 10743 → 10879 → 11006 | 6 → 6 → 6 → 6 → 6 |
+| `consistency-triview-shield` | 单角色三视图转身 + 非对称铜盾 | `a749b4b779104dc7a2516d80c2ae6a87` | 上海 | 832×480 → 832×480 | 1107（46.125 秒） | 1（无切换） | 5016 | 4 |
+| `large-scene-winterfell` | 超长 Prompt 大场景（双龙夜战） | `fb01f4abe7be40c2a1b363e209b4b106` | 泰国 | 832×480 → 832×480 | 515（21.458 秒） | 1（无切换） | 10971 | 5 |
+| `first-person-spell` | 第一人称右下角裸手施法 + 减图 | `fd42d3d886e24f53bbb3bf7add6701bc` | 上海 | 832×480 → 832×480 | 790（32.917 秒） | 3（2 次切换） | 4512 → 4510 → 4073 | 5 → 5 → 4 |
+| `third-person-swordsman` | 第三人称追尾 + 126 秒长镜头 | `77ae7475ab8f468797e722214d55aaf5` | 上海 | 832×480 → 832×480 | 3023（125.958 秒） | 1（无切换） | 5291 | 3 |
+| `736p-dream-foyer` | 736p 输出（480p 源 → 736p 输出） | `908c06172f5146e095c21760fb26dc4e` | 泰国 | 832×480 → 1280×736 | 867（36.125 秒） | 1（无切换） | 9515 | 2 |
+
+完整 case ID 为 `zing-product-case-20261103-<后缀>`。该集合的回放约定：
+
+- **高频切换截取前 4～6 次**：`prompt-switch-shibuya`（原 23 版本）与 `cache-return-shibuya`（原 14 版本）均截取前 **6 次切换（7 个条件版本）**，原归档总版本数记录于 `metadata.streaming_replay.archived_total_versions`；`consistency-banquet-fpv` 完整保留全部 4 次切换（5 个版本）。其中 `cache-return-shibuya` 的前 7 个版本已完整覆盖 `l1_hit(v1) → miss(v2,v3) → l1_hit(v4,v5 折返命中) → miss(v6) → l1_hit(v7)` 闭环。
+- **独立 source 几何（832×480 → 1280×736）**：`736p-dream-foyer` 的配对白模 `whitebox.mp4` 为 `832×480`，目标输出为 `1280×736`；manifest 在 `messages[1].source` 显式记录 `"width": 832, "height": 480`，`prepare_product_cases.py` 与 `bench_streaming_source.py` 会自动校验 480p 源尺寸并向客户端传递 `--source-width 832 --source-height 480 --width 1280 --height 736`。
+
+准备与预检命令（显式指定 `--case-set product-case-20261103`）：
+
+```bash
+python3 benchmark/zing_h3_causal/prepare_product_cases.py \
+  --profile shengdong --media-root /data/zing-product-case-media \
+  --case-set product-case-20261103
+
+PYTHONPATH=python SGLANG_LIGHTWEIGHT_RUNTIME=1 \
+python3 benchmark/zing_h3_causal/bench_streaming_source.py \
+  --media-root /data/zing-product-case-media \
+  --case-set product-case-20261103 \
+  --output-dir /data/product-case-20261103-preflight --preflight-only
+```
+
+目前 `product-case-20261103` 已完成全部 OSS 资产 SHA256、视频逐帧解码数与 CPU 预检校验；当前版本在此集合上的 GPU 端到端性能、显存与画质状态为**未验证**。
