@@ -79,7 +79,7 @@ def install_encoder_group(app, executor, pool, descriptor, store):
             adapter.connection_loop.call_soon_threadsafe(clear)
         await close_link()
 
-    async def destroy():
+    async def quiesce():
         adapter = getattr(app.state, "connection_adapter", None)
         if adapter is not None:
             # Adapter queues belong to the input WS loop, not the HTTP loop.
@@ -87,6 +87,22 @@ def install_encoder_group(app, executor, pool, descriptor, store):
                 adapter.drain_connection(), adapter.connection_loop
             )
             await asyncio.wrap_future(future)
+
+        def release_session():
+            from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+                ReleaseRealtimeSessionReq,
+            )
+
+            link = executor.dit_link
+            if link is not None and link.owner is not None:
+                executor.forward(ReleaseRealtimeSessionReq(session_id=link.owner[0]))
+
+        # The model owner's queue serializes this after any accepted forward.
+        # Its cancel ACK proves DiT has finished its Decoder abort handshake.
+        await owned(release_session)
+
+    async def destroy():
+        await quiesce()
         await close_link()
 
     controller = ServiceConnections(
@@ -95,6 +111,7 @@ def install_encoder_group(app, executor, pool, descriptor, store):
         build=build,
         destroy=destroy,
         rollback=rollback,
+        quiesce=quiesce,
         cleanup_timeout=120,
     )
     app.state.worker_connections = controller

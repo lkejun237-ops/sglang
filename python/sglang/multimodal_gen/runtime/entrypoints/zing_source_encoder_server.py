@@ -698,12 +698,26 @@ class EncoderClient:
         return await asyncio.get_running_loop().run_in_executor(self.pool, call)
 
     async def open_dit(self, message):
+        return await asyncio.get_running_loop().run_in_executor(
+            self.pool, self._open_dit, message
+        )
+
+    def _open_dit(self, message):
+        from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+
+        controller = getattr(self.executor, "connection_controller", None)
+        if controller is not None:
+            # The queued init may have waited behind other model work. Check at
+            # execution, serialized with quiesce's state transition, not enqueue.
+            with controller.lock:
+                if controller.state != "connected":
+                    raise ConditionError(
+                        "CONDITION_BUSY",
+                        "The connection is closing. Please wait before starting again.",
+                    )
         try:
-            return await asyncio.get_running_loop().run_in_executor(
-                self.pool, self.executor.dit_link.open, message
-            )
+            return self.executor.dit_link.open(message)
         except BaseException:
-            controller = getattr(self.executor, "connection_controller", None)
             if controller is not None:
                 controller.failed()
             raise
@@ -743,6 +757,7 @@ def create_apps(
     service_count=1,
     connection_ports=None,
     pipeline_config=None,
+    session_max_lifetime_s=None,
 ):
     from sglang.multimodal_gen.runtime.realtime.worker_services import service_ports
 
@@ -775,6 +790,11 @@ def create_apps(
         warmup_mode="off",
         realtime_max_sessions=1,
         realtime_max_sessions_per_worker=1,
+        realtime_session_max_lifetime_s=(
+            ServerArgs.realtime_session_max_lifetime_s
+            if session_max_lifetime_s is None
+            else session_max_lifetime_s
+        ),
         zing_source_work_quantum=1,
         zing_source_joint_forward=None,
         text_encoder_cpu_offload=False,
@@ -1060,6 +1080,11 @@ def main():
     )
     parser.add_argument("--service-count", type=int, default=1)
     parser.add_argument(
+        "--session-max-lifetime-s",
+        type=float,
+        help="Hard session lifetime from first server output dispatch; defaults to the standard realtime limit",
+    )
+    parser.add_argument(
         "--http-port", type=int, help="Base management port; defaults to port + 1000"
     )
     cli = parser.parse_args()
@@ -1092,6 +1117,7 @@ def main():
             cli.model,
             service_count=cli.service_count,
             connection_ports=connection_ports,
+            session_max_lifetime_s=cli.session_max_lifetime_s,
             pipeline_config=json.loads(cli.pipeline_config_path.read_text())
             if cli.pipeline_config_path
             else None,

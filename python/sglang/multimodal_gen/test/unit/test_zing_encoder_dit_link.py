@@ -2,10 +2,12 @@
 """Loopback transport and queued DiT lifecycle; real-checkpoint tests are separate."""
 
 import asyncio
+import json
 import multiprocessing
 import socket
 import time
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -1053,6 +1055,237 @@ def test_cached_prefix_matches_uncached_queued_dit(model, cpu_dma, joint_forward
     actual = asyncio.run(run(True))
     assert len(actual) == len(baseline) > 0
     assert all(torch.equal(a, b) for a, b in zip(actual, baseline))
+
+
+def _startup_rank(rank, rendezvous, output, fail):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.dit_worker import (
+        _initialize_service_descriptor,
+    )
+
+    class Parallel:
+        def broadcast_object(self, value):
+            values = [value]
+            dist.broadcast_object_list(values, src=0)
+            return values[0]
+
+    class Ports:
+        services = [{"worker_id": "startup-fixture"}]
+
+        def initialize_stores(self, *, timeout):
+            assert timeout == 3
+            if fail:
+                raise OSError("Service store initialization failed")
+
+    dist.init_process_group(
+        "gloo",
+        init_method="file://" + rendezvous,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        try:
+            descriptor = _initialize_service_descriptor(
+                Ports() if rank == 0 else None, Parallel(), timeout=3
+            )
+            result = {"descriptor": descriptor}
+        except Exception as exc:
+            result = {"error_type": type(exc).__name__, "message": str(exc)}
+        Path(output, str(rank) + ".json").write_text(json.dumps(result))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_both_ranks_finish_service_startup_or_fail_together(tmp_path, fail):
+    context = multiprocessing.get_context("spawn")
+    processes = [
+        context.Process(
+            target=_startup_rank,
+            args=(rank, str(tmp_path / "rendezvous"), str(tmp_path), fail),
+        )
+        for rank in range(2)
+    ]
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=30)
+            assert not process.is_alive(), "A rank remained blocked during startup"
+            assert process.exitcode == 0
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+    results = [json.loads((tmp_path / f"{rank}.json").read_text()) for rank in range(2)]
+    if fail:
+        assert results[0]["error_type"] == "OSError"
+        assert results[0]["message"] == "Service store initialization failed"
+        assert results[1]["error_type"] == "RuntimeError"
+        assert (
+            results[1]["message"] == "DiT service initialization failed on the leader"
+        )
+    else:
+        assert results == [{"descriptor": {"worker_id": "startup-fixture"}}] * 2
+
+
+def _prebind_startup_rank(rank, rendezvous, output, occupied, http_port, failure):
+    """Run main's real pre-bind and Gloo path; replace only GPU import boundaries."""
+    import os
+    import sys
+    import types
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        dit_worker,
+        encoder_worker,
+    )
+
+    initialized = []
+    loaded = []
+
+    class Parallel:
+        def broadcast_object(self, value):
+            values = [value]
+            dist.broadcast_object_list(values, src=0)
+            return values[0]
+
+    def initialize(**kwargs):
+        dist.init_process_group(
+            "gloo",
+            init_method="file://" + rendezvous,
+            rank=rank,
+            world_size=2,
+            timeout=timedelta(seconds=6),
+        )
+        initialized.append(True)
+
+    def cleanup():
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+    class Loader:
+        def load(self, *args, **kwargs):
+            loaded.append(True)
+            raise AssertionError("Model loading must not run after pre-bind failure")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("GPU-only setup must not run after pre-bind failure")
+
+    modules = {
+        "sglang.multimodal_gen.runtime.distributed.parallel_state": dict(
+            cleanup_dist_env_and_memory=cleanup,
+            get_world_group=lambda: Parallel(),
+            maybe_init_distributed_environment_and_model_parallel=initialize,
+        ),
+        "sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader": dict(
+            TransformerLoader=Loader
+        ),
+        "sglang.multimodal_gen.runtime.managers.forward_context": dict(
+            set_forward_context=forbidden
+        ),
+        "sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.zing_h3_source_adapter": dict(
+            _source_sampling_schedule=forbidden, _with_source_pipeline_policy=forbidden
+        ),
+        dit_worker.__package__ + ".stage": dict(ZingH3GenerationStage=forbidden),
+    }
+    for name, fields in modules.items():
+        module = types.ModuleType(name)
+        module.__dict__.update(fields)
+        sys.modules[name] = module
+    encoder_worker.initialize_runtime_imports = lambda: (
+        SimpleNamespace(from_kwargs=lambda **kwargs: SimpleNamespace()),
+        lambda args: None,
+    )
+    torch.cuda.set_device = lambda device: None
+    os.environ.update(RANK=str(rank), LOCAL_RANK=str(rank), WORLD_SIZE="2")
+    sys.argv = [
+        "dit_worker",
+        "--model",
+        output,
+        "--sp-degree",
+        "2",
+        "--http-host",
+        "127.0.0.1",
+        "--http-port",
+        str(occupied if failure == "http" else http_port),
+        "--rendezvous-port",
+        str(occupied),
+    ]
+    try:
+        dit_worker.main()
+    except Exception as exc:
+        result = dict(
+            error_type=type(exc).__name__,
+            message=str(exc),
+            errno=getattr(exc, "errno", None),
+        )
+    else:
+        result = dict(error_type=None)
+    result.update(
+        initialized=bool(initialized),
+        model_loaded=bool(loaded),
+        group_released=not dist.is_initialized(),
+    )
+    Path(output, f"prebind-{rank}.json").write_text(json.dumps(result))
+
+
+@pytest.mark.parametrize("failure", ["http", "rendezvous"])
+def test_pre_distributed_bind_failure_is_published_to_both_ranks(tmp_path, failure):
+    import errno
+
+    with socket.socket() as occupied, socket.socket() as free:
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen()
+        free.bind(("127.0.0.1", 0))
+        http_port = free.getsockname()[1]
+        free.close()
+        context = multiprocessing.get_context("spawn")
+        processes = [
+            context.Process(
+                target=_prebind_startup_rank,
+                args=(
+                    rank,
+                    str(tmp_path / "group"),
+                    str(tmp_path),
+                    occupied.getsockname()[1],
+                    http_port,
+                    failure,
+                ),
+            )
+            for rank in range(2)
+        ]
+        try:
+            for process in processes:
+                process.start()
+            for process in processes:
+                process.join(timeout=20)
+                assert not process.is_alive(), (
+                    "A peer remained blocked after pre-bind failure"
+                )
+                assert process.exitcode == 0
+        finally:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+    leader, peer = [
+        json.loads((tmp_path / f"prebind-{rank}.json").read_text()) for rank in range(2)
+    ]
+    assert leader["errno"] == errno.EADDRINUSE
+    assert peer["error_type"] == "RuntimeError"
+    assert peer["message"] == "DiT service initialization failed on the leader"
+    assert all(
+        row["initialized"] and not row["model_loaded"] and row["group_released"]
+        for row in [leader, peer]
+    )
 
 
 @torch.no_grad()

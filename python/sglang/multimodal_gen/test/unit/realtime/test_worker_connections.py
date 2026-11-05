@@ -55,6 +55,140 @@ def request(controller, group="a"):
     )
 
 
+def test_quiesce_keeps_owner_and_transports_until_destroy():
+    async def run():
+        calls = []
+        controller = manager(
+            quiesce=lambda: calls.append("finish-session"),
+            destroy=lambda: calls.append("disconnect"),
+        )
+        payload = request(controller)
+        await controller.build(payload)
+        with pytest.raises(ConnectionRejected):
+            await controller.quiesce(dict(worker_group_id="other"))
+        assert calls == []
+        for _ in range(2):
+            reply, status = await controller.quiesce(dict(worker_group_id="a"))
+            assert status == 200 and reply["state"] == "quiesced"
+        assert calls == ["finish-session"]
+        assert controller.group == "a" and controller.topology == topology()
+        assert controller.query()[0] == dict(state="reserved")
+        with pytest.raises(ConnectionRejected):
+            await controller.build(dict(payload, worker_group_id="other"))
+        await controller.destroy(dict(worker_group_id="a"))
+        await controller.operation
+        assert calls == ["finish-session", "disconnect"]
+        assert controller.state == "idle" and controller.group is None
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_destroy_waits_for_quiesce_after_requester_cancellation(fail):
+    async def run():
+        started, release = asyncio.Event(), asyncio.Event()
+        calls = []
+
+        async def quiesce():
+            started.set()
+            await release.wait()
+            if fail:
+                raise RuntimeError("private diagnostic")
+            calls.append("finished")
+
+        controller = manager(
+            quiesce=quiesce, destroy=lambda: calls.append("disconnect")
+        )
+        await controller.build(request(controller))
+        pending = asyncio.create_task(controller.quiesce(dict(worker_group_id="a")))
+        await started.wait()
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert controller.state == "quiescing" and not controller.operation.done()
+        closing = asyncio.create_task(controller.destroy(dict(worker_group_id="a")))
+        await asyncio.sleep(0)
+        assert calls == [] and not closing.done()
+        release.set()
+        reply, status = await closing
+        if fail:
+            assert status == 503 and reply["code"] == "QUIESCE_FAILED"
+            assert controller.restart_required and controller.state == "failed"
+            assert calls == []
+            return
+        assert status == 202
+        await controller.operation
+        assert calls == ["finished", "disconnect"] and controller.state == "idle"
+
+    asyncio.run(run())
+
+
+def test_quiesce_failure_is_sanitized_and_requires_restart():
+    async def run():
+        def fail():
+            raise RuntimeError("private diagnostic")
+
+        controller = manager(quiesce=fail)
+        await controller.build(request(controller))
+        reply, status = await controller.quiesce(dict(worker_group_id="a"))
+        assert status == 503 and reply["code"] == "QUIESCE_FAILED"
+        assert "private diagnostic" not in str(reply)
+        assert controller.restart_required and controller.query()[1] == 503
+
+    asyncio.run(run())
+
+
+def test_unsupported_quiesce_preserves_connected_owner():
+    async def run():
+        controller = manager()
+        await controller.build(request(controller))
+        with pytest.raises(ConnectionRejected) as error:
+            await controller.quiesce(dict(worker_group_id="a"))
+        assert error.value.status == 501 and error.value.code == "QUIESCE_UNSUPPORTED"
+        assert controller.state == "connected" and controller.group == "a"
+
+    asyncio.run(run())
+
+
+def test_encoder_quiesce_releases_session_without_disconnecting_transport():
+    from types import SimpleNamespace
+
+    from fastapi import FastAPI
+
+    from sglang.multimodal_gen.runtime.realtime.worker_group_encoder import (
+        install_encoder_group,
+    )
+
+    async def run():
+        calls = []
+        link = SimpleNamespace(owner=("s", "g"))
+
+        async def drain():
+            calls.append("drain-ingress")
+
+        def forward(request):
+            assert request.session_id == "s"
+            calls.append("cancel-acknowledged")
+            link.owner = None
+
+        app = FastAPI()
+        app.state.realtime_execution_client = object()
+        app.state.connection_adapter = SimpleNamespace(
+            connection_loop=asyncio.get_running_loop(), drain_connection=drain
+        )
+        executor = SimpleNamespace(dit_link=link, forward=forward)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            controller = install_encoder_group(
+                app, executor, pool, topology()["encoder"], None
+            )
+            controller.group, controller.state = "a", "connected"
+            assert (await controller.quiesce(dict(worker_group_id="a")))[1] == 200
+            assert calls == ["drain-ingress", "cancel-acknowledged"]
+            assert executor.dit_link is link and link.owner is None
+
+    asyncio.run(run())
+
+
 def test_atomic_query_has_exactly_one_winner():
     controller = manager()
     with ThreadPoolExecutor(max_workers=16) as executor:
@@ -316,8 +450,13 @@ def test_startup_routes_are_unavailable_then_use_the_installed_controller():
         ) as client:
             assert (await client.get("/get_connection_status")).status_code == 503
             assert (await client.post("/build_group", json={})).status_code == 503
+            assert (await client.post("/quiesce_group", json={})).status_code == 503
             controller = manager()
             controller.install(app)
+            assert (
+                await client.get("/get_connection_status?reserve=false")
+            ).json() == {"state": "available"}
+            assert controller.state == "idle" and controller.token is None
             assert (await client.get("/get_connection_status")).json()[
                 "state"
             ] == "available"
@@ -484,3 +623,269 @@ def test_completed_build_does_not_overwrite_concurrent_fault():
     body, status = asyncio.run(controller.build(request(controller)))
     assert status == 503 and body["restart_required"]
     assert controller.query()[0]["state"] == "unavailable"
+
+
+def test_completed_quiesce_does_not_overwrite_concurrent_fault():
+    async def run():
+        started, release = asyncio.Event(), asyncio.Event()
+        rollbacks = []
+
+        async def quiesce():
+            started.set()
+            await release.wait()
+
+        controller = manager(quiesce=quiesce, rollback=lambda: rollbacks.append(True))
+        await controller.build(request(controller))
+        pending = asyncio.create_task(controller.quiesce(dict(worker_group_id="a")))
+        await started.wait()
+        controller.failed()
+        release.set()
+        body, status = await pending
+        assert status == 503 and body["restart_required"]
+        assert controller.query()[0]["state"] == "unavailable"
+        # The active owner must finish before any transport can be torn down.
+        assert rollbacks == []
+        with pytest.raises(ConnectionRejected):
+            await controller.destroy(dict(worker_group_id="a"))
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("reserved", [False, True])
+def test_nonreserving_query_leaves_idle_and_expired_reservations_available(reserved):
+    now = [0.0]
+    controller = manager(clock=lambda: now[0])
+    if reserved:
+        controller.query()
+        now[0] = controller.RESERVATION_SECONDS + 1
+    for _ in range(2):
+        assert controller.query(reserve=False) == (dict(state="available"), 200)
+        assert controller.state == "idle" and controller.token is None
+    reply, status = controller.query()
+    assert status == 200 and reply["reservation_token"]
+    token = controller.token
+    assert controller.query(reserve=False) == (dict(state="reserved"), 200)
+    assert controller.token == token
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "validation",
+        "queued",
+        "opening",
+        "invalid",
+        "cancelled",
+        "queued_cancelled",
+        "opening_cancelled",
+        "opening_fault",
+    ],
+)
+def test_encoder_initialization_is_ordered_before_quiesce_and_destroy(
+    monkeypatch, phase
+):
+    import threading
+    from types import SimpleNamespace
+
+    from fastapi import FastAPI
+
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.zing_encoder_dit_adapter import (
+        ZingEncoderDiTAdapter,
+    )
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.zing_source_encoder_adapter import (
+        ZingSourceEncoderAdapter,
+    )
+    from sglang.multimodal_gen.runtime.entrypoints.zing_source_encoder_server import (
+        EncoderClient,
+    )
+    from sglang.multimodal_gen.runtime.realtime.worker_group_encoder import (
+        install_encoder_group,
+    )
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        entered, resume = asyncio.Event(), asyncio.Event()
+        thread_resume, queue_started = threading.Event(), threading.Event()
+        calls = []
+        app = FastAPI()
+        app.state.realtime_execution_client = object()
+        executor = SimpleNamespace(
+            owner=None, encoder=None, conditioning=SimpleNamespace(dispose=lambda: None)
+        )
+
+        class Link:
+            owner = None
+
+            def open(self, message):
+                calls.append(("open", message["session_id"], controller.state))
+                if (
+                    phase in ("opening", "opening_cancelled", "opening_fault")
+                    and message["session_id"] == "first"
+                ):
+                    loop.call_soon_threadsafe(entered.set)
+                    assert thread_resume.wait(timeout=5)
+                self.owner = (message["session_id"], message["generation_id"])
+                if phase == "opening_fault" and message["session_id"] == "first":
+                    raise RuntimeError("private open failure")
+                return []
+
+            def disconnect(self):
+                assert self.owner is None
+                calls.append(("disconnect",))
+
+        executor.dit_link = Link()
+
+        def cancel(request):
+            assert request.session_id == executor.dit_link.owner[0]
+            calls.append(("cancel", request.session_id))
+            executor.dit_link.owner = None
+
+        executor.forward = cancel
+
+        async def initialize(self, session, request, **kwargs):
+            # This is the real parent's asynchronous prompt-token validation
+            # boundary; no model work or remote owner has been accepted yet.
+            if session.id == "first" and phase in (
+                "validation",
+                "invalid",
+                "cancelled",
+            ):
+                entered.set()
+                await resume.wait()
+                if phase == "invalid":
+                    raise ValueError("Invalid prompt")
+            self.config = dict(width=32, height=32, fps=24, total_frames=None)
+            self.source_geometry = SimpleNamespace(
+                target_width=32, target_height=32, receipt=lambda: {}
+            )
+            self.ready = {}
+            self.end = None
+            self.ledger = SimpleNamespace(closed=False, accepted_frames=0)
+            self.ledger.dispose = lambda: setattr(self.ledger, "closed", True)
+
+        monkeypatch.setattr(ZingSourceEncoderAdapter, "on_init", initialize)
+
+        class Pool(ThreadPoolExecutor):
+            signal_next = False
+
+            def submit(self, callback, *args, **kwargs):
+                result = super().submit(callback, *args, **kwargs)
+                if self.signal_next:
+                    self.signal_next = False
+                    loop.call_soon_threadsafe(entered.set)
+                return result
+
+        with Pool(max_workers=1) as pool:
+            controller = install_encoder_group(
+                app, executor, pool, topology()["encoder"], None
+            )
+            controller.state, controller.group = "connected", "a"
+            client = EncoderClient(executor, pool)
+            request = SimpleNamespace(seed=42, realtime_output_format="raw")
+            session = SimpleNamespace(
+                id="first", generation_id="g", execution_client=client
+            )
+            adapter = ZingEncoderDiTAdapter()
+            adapter.connection_app = app
+            if phase in ("queued", "queued_cancelled"):
+
+                def block_queue():
+                    queue_started.set()
+                    assert thread_resume.wait(timeout=5)
+
+                pool.submit(block_queue)
+                assert queue_started.wait(timeout=5)
+                pool.signal_next = True
+            initializing = asyncio.create_task(adapter.on_init(session, request))
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            closing = asyncio.create_task(controller.quiesce(dict(worker_group_id="a")))
+            await asyncio.sleep(0)
+            assert controller.state == "quiescing"
+            assert not closing.done()
+            if phase in ("cancelled", "queued_cancelled", "opening_cancelled"):
+                initializing.cancel()
+            else:
+                resume.set()
+            thread_resume.set()
+            try:
+                if phase == "opening":
+                    await initializing
+                elif phase in ("cancelled", "queued_cancelled", "opening_cancelled"):
+                    with pytest.raises(asyncio.CancelledError):
+                        await initializing
+                elif phase == "opening_fault":
+                    with pytest.raises(RuntimeError, match="private open failure"):
+                        await initializing
+                elif phase == "invalid":
+                    with pytest.raises(ValueError, match="Invalid prompt"):
+                        await initializing
+                else:
+                    with pytest.raises(ConditionError) as error:
+                        await initializing
+                    assert error.value.code == "CONDITION_BUSY"
+                reply, status = await asyncio.wait_for(closing, timeout=5)
+                if phase == "opening_fault":
+                    assert status == 503 and reply["code"] == "QUIESCE_FAILED"
+                    assert "private open failure" not in str(reply)
+                    assert controller.restart_required and controller.state == "failed"
+                    assert executor.dit_link.owner is None
+                    assert calls == [
+                        ("open", "first", "connected"),
+                        ("cancel", "first"),
+                    ]
+                    with pytest.raises(ConnectionRejected):
+                        await controller.destroy(dict(worker_group_id="a"))
+                    return
+                assert status == 200 and reply["state"] == "quiesced"
+                assert executor.dit_link.owner is None
+                assert not controller.restart_required
+                if phase in ("opening", "opening_cancelled"):
+                    assert calls == [
+                        ("open", "first", "connected"),
+                        ("cancel", "first"),
+                    ]
+                else:
+                    assert calls == []
+                if hasattr(adapter, "ledger"):
+                    assert adapter.ledger.closed
+                await controller.destroy(dict(worker_group_id="a"))
+                await controller.operation
+                assert controller.state == "idle" and executor.dit_link is None
+
+                # Rebuild only the transport fixture; use the same real control
+                # manager, model-owner queue and EncoderClient for the next init.
+                controller.build_callback = lambda *_: setattr(
+                    executor, "dit_link", Link()
+                )
+                reservation, _ = controller.query()
+                await controller.build(
+                    dict(
+                        worker_group_id="b",
+                        reservation_token=reservation["reservation_token"],
+                        topology=topology(),
+                    )
+                )
+                next_adapter = ZingEncoderDiTAdapter()
+                next_adapter.connection_app = app
+                await next_adapter.on_init(
+                    SimpleNamespace(
+                        id="next", generation_id="g2", execution_client=client
+                    ),
+                    request,
+                )
+                assert executor.dit_link.owner == ("next", "g2")
+                assert calls[-1] == ("open", "next", "connected")
+                await controller.quiesce(dict(worker_group_id="b"))
+                await controller.destroy(dict(worker_group_id="b"))
+                await controller.operation
+                assert controller.state == "idle" and not controller.restart_required
+            finally:
+                resume.set()
+                thread_resume.set()
+                for task in (initializing, closing):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(initializing, closing, return_exceptions=True)
+
+    asyncio.run(run())

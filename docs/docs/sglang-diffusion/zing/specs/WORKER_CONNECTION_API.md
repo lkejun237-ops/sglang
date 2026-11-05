@@ -6,6 +6,40 @@
 
 部署背景、业务链路和启动命令见[Zing 分离部署接入指南](../DISAGGREGATED_SERVING_GUIDE.md)。
 
+## 通信组与业务会话的生命周期
+
+一个 `worker_group_id` 配对三个角色的具体 service、外部 ZMQ 控制连接和 NCCL 张量链路；
+worker 进程及其常驻模型、DiT 内部 SP 组的生命周期更长。业务 `session_id`／
+`generation_id` 标识这组连接上当前请求的输入、输出及生成代次，不代表新建通信组。
+
+同一通信组可以顺序服务不同 session。部署同时只允许一个活跃会话；已有会话时拒绝第二个，
+不修改当前 owner。正常 EOS 或取消完成后释放该会话的 KV lease、源流、输出及 Decoder 状态，
+保留模型和外部连接，下一合法会话使用新的 session／generation 身份。故障隔离仍可能要求重建，
+不能把正常顺序复用理解为模型／NCCL 故障后在线恢复。
+
+`quiesce_group` 关闭新会话准入，等待初始化和在途任务排空、取得取消确认，保持传输连接；
+`destroy_group` 才拆除外部通信组。销组不卸载模型、不销毁 DiT 内部 SP 组，也不清空其缓存。
+要复用已 quiesce 的服务，须完成销组并重新建组；正常会话结束无需 quiesce／destroy。
+
+## Master 管理调用与数据链路
+
+`WorkerGroupMaster.rpc(role, path, payload=None, *, timeout=None)` 是异步封装的 **HTTP＋JSON
+管理调用**，并非 gRPC 或可切换的独立传输协议。`role` 从 `self.addresses` 选取 Encoder、
+DiT 或 Decoder 的管理地址，`path` 是该服务的 HTTP 路径；有 `payload` 时 POST JSON，
+否则 GET。默认超时为 `control_timeout`（当前实现中 `None`／0 均回退该值）；
+`asyncio.to_thread` 把阻塞的 HTTP 操作移出事件循环。当前 Master 实现支持此 HTTP 管理接口，
+未实现其他管理协议。
+
+例如 `await master.rpc("encoder", "/quiesce_group", {"worker_group_id": master.group})`
+调用的是 Master → Encoder 管理服务；它与客户端 → Encoder 输入 WS、客户端 → Decoder
+输出 WS，以及角色间 ZMQ 控制／NCCL 张量链路分开。Master 仅在 Encoder 排空成功后并行拆除
+三个角色的外部连接；各角色共同参与 NCCL 退出，不能逐个拆连接。
+
+销组实现分为 `_quiesce_encoder()`、`_destroy_role_until_disconnected(role)` 和入口 `destroy()`：
+入口判断是否有本组需要清理的连接，先排空，再并行运行三个角色的幂等销组／轮询，最后汇总错误。
+部分建组收到 409 时只用 `reserve=false` 查看状态，并校验 group owner，不能拆除别人的组或
+重新取得空闲服务的预留。超时和真实通信故障保留为失败，不自动重试业务生成。
+
 ## 目录
 
 - [1. 接口清单与通用返回规则](#1-接口清单与通用返回规则)
@@ -20,8 +54,9 @@
 |---|---|---|
 | GET | `/liveness` | 存活检查 |
 | GET | `/health` | 健康检查 |
-| GET | `/get_connection_status` | 查询连接状态；空闲时取得预留及连接信息 |
+| GET | `/get_connection_status` | 查询连接状态；默认空闲时取得预留及连接信息；`?reserve=false` 只查看状态、不取得预留 |
 | POST | `/build_group` | 建立通信组，返回最终结果 |
+| POST | `/quiesce_group` | Encoder 排空当前会话，保留通信组 |
 | POST | `/destroy_group` | 启动通信组清理，立即返回清理中 |
 
 `worker_group_id` 标识一组 encoder、DiT、decoder，区别于业务请求中的 `session_id`。
@@ -33,6 +68,7 @@
 | `409` | 预留失效、身份不匹配、占用或状态冲突 |
 | `422` | 请求参数不合法 |
 | `503` | worker 不可用或连接操作失败 |
+| `501` | 当前角色不支持所请求的会话排空操作 |
 
 新增接口的错误使用稳定的英文 `code` 和英文 `message`：
 
@@ -304,6 +340,59 @@ HTTP `200`：
 
 ## 5. 销毁通信组
 
+会话取消与通信组销毁分开处理。输出连接断开或输入 owner 取消时，先回收该会话的
+输出邮箱和 RGB 引用；Decoder 继续接收已发送的载荷，直到输入 owner 按顺序取消会话。
+正常输出关闭不能触发整个通信组回收，也不能影响下一会话。模型或传输的实际故障
+仍按故障处理，不能用丢弃输出掩盖。
+
+Decoder 接收的 `source_stream.width/height` 是原始输入流尺寸，独立于输出 `width/height`；
+`source_records` 中的累计字节和 `source.consumed` 均按输入 RGB24 字节计算。
+例如 source 832×480、输出 1280×736 时，一帧输入 credit 仍是 `832×480×3`，不能按输出面积计算。
+旧的同尺寸调用方省略 `source_stream` 时沿用原 config 的宽高。
+
+独立 Decoder 的像素不经过输入 WS。Encoder 在验证首个正帧数的 Decoder 调度回执后，
+启动既有会话硬时限；这是服务端 dispatch 起点，不是客户端接收或播放确认，也不增加
+输入 WS 的像素发送统计。仅断开输出、继续发送输入心跳或不发送 playback ACK 都不能
+延长该期限；到期仍由输入 owner 沿既有有序取消路径回收会话，保留通信组供下一会话使用。
+独立 Encoder 可用 `--session-max-lifetime-s` 明确设置有限上限，省略时沿用标准 realtime
+缺省值；`0` 保持管理员显式关闭硬时限的既有语义。长会话基准必须为对照两侧配置相同、
+足够长的有限期限，并单独验证短期限下的单边断连回收。
+
+### 5.1 先排空 Encoder 会话
+
+成功建组后，先向 Encoder 的管理地址发送：
+
+```http
+POST /quiesce_group
+Content-Type: application/json
+```
+
+请求为 `{"worker_group_id":"group-a"}`。服务核对当前 group 后停止接收新会话和输入，
+排空已接收的工作，并等待 DiT 的取消确认；确认前 Decoder 和全部通信通道保持可用。
+请求方断连不会取消已启动的排空。重复请求共用同一次操作。
+
+尚在异步输入校验或模型 owner 队列中的初始化也属于排空范围。初始化在首次异步校验前
+登记，登记与 connected 检查和 quiesce 状态切换同步；排空等待该初始化完成或被拒绝。
+`link.open` 执行前在 owner 队列内再次检查准入。尚未执行的初始化遇到排空时返回
+`CONDITION_BUSY`，公开消息为 `The service is busy. Please try again shortly.`；
+这是普通请求拒绝，不标记模型／通信故障。已开始的初始化由同一 owner 队列在完成后
+执行取消，取消确认前不返回 `quiesced`，因此成功排空后不能新建会话 owner。
+
+排空完成返回 HTTP `200`：
+
+```json
+{"success":true,"state":"quiesced","worker_group_id":"group-a"}
+```
+
+此时 group 仍归原 owner，查询返回 `reserved`，不会发放新预留；下一步销毁通信组后才能重新申请。
+不匹配的 group 返回 `409`，未提供排空能力的角色返回 `501 / QUIESCE_UNSUPPORTED`。
+排空失败返回 `503 / QUIESCE_FAILED`，消息为 `Failed to finish the current session.`，
+worker 标记为需要重启，内部异常仅保留在服务端日志。
+
+### 5.2 再并行销毁三个角色的通信组
+
+收到 Encoder 的 `quiesced` 后，并行向三个 service 发送：
+
 ```http
 POST /destroy_group
 Content-Type: application/json
@@ -317,7 +406,8 @@ Content-Type: application/json
 }
 ```
 
-接口受理后立即启动后台清理，不等待断连完成。
+正常受理后立即启动后台清理，不等待断连完成。若同一 group 正在排空，销毁请求等待排空结束后再受理。
+NCCL 通信组退出需要两端共同参与，三个角色的销毁请求必须并行发出。
 
 受理响应，HTTP `202`：
 
@@ -331,7 +421,11 @@ Content-Type: application/json
 
 group 与当前通信组不匹配时返回 HTTP `409`。同一组正在清理时，重复请求返回相同的 `202` 清理中响应，不重复启动清理；同一组已经清理完成且 service 仍为空闲时，重复请求返回 `200`，状态为 `disconnected`。
 
-客户端 需要分别调用组内三个 service 的接口。清理期间拒绝新任务，`get_connection_status` 返回 `reserved`；清理完成后，下一次查询取得新的 10 秒预留并返回 `available`。如果后台清理失败且需要重启，查询返回 `503`、`unavailable` 和 `restart_required: true`。
+客户端通过重复 `destroy_group` 轮询到 `disconnected`，不会取得新预留。清理期间拒绝新任务，
+`get_connection_status` 返回 `reserved`；清理完成后，下一次查询会取得新的 10 秒预留并返回 `available`。
+部分建组尚未受理而返回 `409` 时，Master 仅以 `get_connection_status?reserve=false`
+确认是否空闲；过期预留可以释放，但不会新取预留，已有有效预留或其他 owner 不受影响。
+如果后台清理失败且需要重启，查询返回 `503`、`unavailable` 和 `restart_required: true`。
 
 上述恢复 `available` 仅适用于正常拆组。运行或通信故障发生后，worker 在尝试清理前即隔离，查询返回 `503`、`unavailable` 和 `restart_required: true`；即使后续本机清理成功，也不据此复用出错的 CUDA/NCCL 上下文。建组或拆组完成不能覆盖并发出现的故障状态。
 

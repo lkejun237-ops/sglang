@@ -636,7 +636,8 @@ def test_connected_encoder_sends_qwen_before_vae_and_keeps_native_tensors():
 
 
 @pytest.mark.parametrize(
-    "source,target", [((32, 32), (32, 32)), ((832, 480), (1280, 736))]
+    "source,target",
+    [((32, 32), (32, 32)), ((32, 32), (64, 64)), ((832, 480), (1280, 736))],
 )
 def test_connected_api_initializes_dit_before_any_source(configured, source, target):  # noqa: F811
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.zing_encoder_dit_adapter import (
@@ -821,13 +822,24 @@ def test_decoder_rgb_handoff_uses_original_sender_and_cancels_stale_reference(
         finally:
             _cancel_unconsumed_output_ref(result=result)
             publisher.close()
+            await adapter.close_conditioning(session)
+            assert (
+                session.id
+                not in session.conditioning_resources.ledger.snapshot()["tenants"]
+            )
             adapter.dispose(session)
 
     asyncio.run(run())
     assert not list((tmp_path / "shm").glob("*"))
 
 
-def test_direct_decoder_receipts_only_return_input_progress(configured):  # noqa: F811
+@pytest.mark.parametrize(
+    "receipt_kind", ["decoder.output_queued", "decoder.input_sent"]
+)
+def test_direct_decoder_receipts_arm_lifetime_without_counting_input_ws_pixels(
+    configured,  # noqa: F811
+    receipt_kind,
+):
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.zing_encoder_dit_adapter import (
         ZingEncoderDiTAdapter,
     )
@@ -862,6 +874,7 @@ def test_direct_decoder_receipts_only_return_input_progress(configured):  # noqa
         await adapter.on_init(session, request)
         session.set_request(request)
         try:
+            assert session.playable_at is None
             assert adapter.ready["output_transport"] == "decoder_websocket"
             await adapter.ingest_wire_event(
                 socket,
@@ -897,7 +910,7 @@ def test_direct_decoder_receipts_only_return_input_progress(configured):  # noqa
                 realtime_handoff={
                     "dit_latents": [
                         dict(
-                            type="decoder.output_queued",
+                            type=receipt_kind,
                             session_id=session.id,
                             generation_id=session.generation_id,
                             latent_start=0,
@@ -908,10 +921,29 @@ def test_direct_decoder_receipts_only_return_input_progress(configured):  # noqa
                 },
                 usage=dict(zing_source_consumed_end=1, zing_source_complete=True),
             )
+            invalid = OutputBatch(
+                realtime_handoff={
+                    "dit_latents": [
+                        dict(
+                            result.realtime_handoff["dit_latents"][0],
+                            generation_id="wrong-generation",
+                        )
+                    ]
+                },
+                usage=result.usage,
+            )
+            with pytest.raises(ValueError, match="identity"):
+                await adapter._send_connected_output(
+                    socket, session, invalid, SimpleNamespace()
+                )
+            assert session.playable_at is None
             stats = await adapter.send_output(
                 socket, session, result, SimpleNamespace()
             )
+            first_dispatch = session.playable_at
+            assert first_dispatch is not None
             assert stats["num_frames"] == 0
+            assert stats["raw_bytes"] == stats["ws_payload_bytes"] == 0
             assert socket.messages[-1]["type"] == "input.completed"
             assert not any(
                 m["type"]
@@ -923,7 +955,46 @@ def test_direct_decoder_receipts_only_return_input_progress(configured):  # noqa
                 )
                 for m in socket.messages
             )
+            from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_video_api import (
+                _session_watchdog,
+            )
+
+            watchdog = asyncio.create_task(
+                _session_watchdog(
+                    session,
+                    None,
+                    None,
+                    idle_timeout_s=0.05,
+                    max_lifetime_s=0.01,
+                    lease_ttl_s=0.03,
+                )
+            )
+
+            # Output cannot deliver a playback ACK. The still-open input sends
+            # heartbeats, but neither those nor repeated dispatch marks extend
+            # the hard lifetime established by the first valid receipt.
+            async def heartbeat_until_limit():
+                while not watchdog.done():
+                    session.mark_client_activity()
+                    session.mark_playable()
+                    await asyncio.sleep(0.005)
+                return await watchdog
+
+            try:
+                assert (
+                    await asyncio.wait_for(heartbeat_until_limit(), timeout=5)
+                    == "maximum session lifetime reached"
+                )
+            finally:
+                watchdog.cancel()
+                await asyncio.gather(watchdog, return_exceptions=True)
+            assert session.playable_at == first_dispatch
         finally:
+            await adapter.close_conditioning(session)
+            assert (
+                session.id
+                not in session.conditioning_resources.ledger.snapshot()["tenants"]
+            )
             adapter.dispose(session)
 
     asyncio.run(run())
@@ -931,7 +1002,8 @@ def test_direct_decoder_receipts_only_return_input_progress(configured):  # noqa
 
 @pytest.mark.parametrize("direct_output", [False, True])
 def test_decoder_credit_can_arrive_before_encoder_dispatch_returns(
-    configured, direct_output
+    configured,  # noqa: F811
+    direct_output,
 ):
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.zing_encoder_dit_adapter import (
         ZingEncoderDiTAdapter,
@@ -1003,12 +1075,17 @@ def test_decoder_credit_can_arrive_before_encoder_dispatch_returns(
                     await append(capacity)
             assert not any(m["type"] == "source.consumed" for m in socket.messages)
         finally:
+            await adapter.close_conditioning(session)
+            assert (
+                session.id
+                not in session.conditioning_resources.ledger.snapshot()["tenants"]
+            )
             adapter.dispose(session)
 
     asyncio.run(run())
 
 
-def test_encoder_reuses_reference_upload_validation_and_clear(configured):
+def test_encoder_reuses_reference_upload_validation_and_clear(configured):  # noqa: F811
     from test_zing_h3_source_adapter import _enable_reference_updates, _reference
 
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.conditioning import (
@@ -1224,7 +1301,13 @@ def test_encoder_services_load_once_and_keep_admission_and_conditions_private(
     monkeypatch.setattr(
         encoder_worker,
         "initialize_runtime_imports",
-        lambda: (SimpleNamespace(from_kwargs=lambda **kw: args), lambda _: None),
+        lambda: (
+            SimpleNamespace(
+                from_kwargs=lambda **kw: args,
+                realtime_session_max_lifetime_s=600.0,
+            ),
+            lambda _: None,
+        ),
     )
 
     def load_qwen(*args):

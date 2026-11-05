@@ -120,7 +120,7 @@ HTTP `destroy_group` 只解除外部 worker 连接。
 
 ## 保留和复用连接
 
-默认测试结束后调用三个 service 的 `destroy_group`，收到 `cleaning` 后查询至清理完成。该查询会取得新的 10 秒预留，随后自然到期；重复测试建议直接保留通信组，避免反复建连。
+默认测试结束后先等待 Encoder `quiesce_group` 排空，再并行调用三个 service 的 `destroy_group`；收到 `cleaning` 后重复幂等销组直至 `disconnected`。部分建组的状态核对使用 `?reserve=false`，不取得新预留。正常 session 结束保留组内连接并释放会话状态，因此同一通信组可顺序服务不同 session；同时只允许一个活跃 session。需要跨测试保留通信组时使用下列参数。
 
 ```text
 --worker-group-id test-group-a --keep-connections

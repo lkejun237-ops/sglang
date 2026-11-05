@@ -565,9 +565,7 @@ def test_disk_management_api_is_scoped_and_never_dispatches_models(
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.disk_cache import (
         Block0DiskCache,
     )
-    from sglang.multimodal_gen.test.unit.realtime.zing_cache_fixtures import (
-        disk_commit,
-    )
+    from sglang.multimodal_gen.test.unit.realtime.zing_cache_fixtures import disk_commit
 
     owner = Block0DiskCache(
         tmp_path,

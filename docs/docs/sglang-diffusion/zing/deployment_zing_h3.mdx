@@ -34,6 +34,31 @@ NCCL 配置文件不能另外配置上述上限/CTA 覆盖；本策略不改写�
 当前候选的 832×480 / 1280×736 GPU 性能及 Encoder、DiT、Decoder 耗时与显存矩阵
 尚未完成，不将历史 MIN-only 结果视为当前实现的验收。
 
+## 独立服务启动、流控与收尾（2026-11-05）
+
+本组修复独立 Encoder／DiT／Decoder 的启动和会话收尾，不引入共享静态 KV 容量配置。
+DiT 在建立 Gloo／NCCL 之前预留服务端口；HTTP／rendezvous 预绑定失败时，leader 保留异常并继续参与内部组初始化，随后与 store 初始化失败共用广播，在模型加载前通知全部 rank 退出。普通 conditioning 拒绝不隔离 worker，模型／CUDA 同步故障仍隔离；早期 init 被拒绝时清理可幂等执行。两个 CPU/Gloo rank 已通过真实 HTTP／rendezvous 端口占用回归；真实多 GPU／NCCL 的启动故障注入仍未验证。
+
+source 与输出尺寸不同时，Decoder 的 `source.consumed` 按原始输入流宽高计算已归还的
+RGB 字节，而非输出画幅。仅断开输出 WS 时，Decoder 丢弃迟到的 RGB／credit 并释放
+对应引用，仍接收已发送的 NCCL 载荷，直到输入 owner 有序取消；正常输出取消不标记整组故障。
+直连 Decoder 的像素绕过输入 WS，故 Encoder 从首个已校验的正帧数 dispatch 回执启动
+既有硬时限；继续输入心跳或不发送 playback ACK 均不延长该期限。
+
+释放配对时，Master 先请求 Encoder `quiesce_group`：停止新输入、串行排空已接收工作，
+等待 DiT 取消及 Decoder 退出确认，此时保留全部链路；随后并行拆除三个角色的通信组。
+正常清理通过幂等重复 `destroy_group` 等到 `disconnected`，不通过空闲状态查询取得新预留。
+初始化在首个异步校验前登记到连接，并与输入排空共用 admission 锁；实际 `link.open` 在模型 owner 队列内
+重新检查连接状态。排空等待已受理的初始化完成／被拒绝，再等待取消 ACK；不能在 `quiesced` 后新建 owner。
+初始化校验失败时允许没有 ledger；普通排空拒绝不标记模型／通信故障。
+这是单活跃会话的正确性保障，不改变模型前向、采样或 KV 容量公式；Master 与三角色须共同升级。
+
+**当前合入 main `01ed0ed97a`（含 #517 容量改动）的生命周期组合未进行新的 GPU 验收，也没有本组的速度／显存收益结论。**
+历史合并版本 `9b7084342d` 的 H200 两档会话取消、输出断连硬时限和通信组复用数据保留原 SHA，
+不能作为这份单独生命周期组合已实测的证明。CPU 回归及历史私有回执入口见
+[PR #584 的修复与 CPU 验证](https://github.com/seedleap/sglang/pull/584)，协议见
+[连接管理接口](/docs/sglang-diffusion/zing/specs/WORKER_CONNECTION_API)。
+
 ## 共享静态 KV 容量与准入（2026-11-05）
 
 通过 `--mem-fraction-static`／`mem_fraction_static` 指定常驻模型与 KV 的静态预算。
@@ -44,10 +69,10 @@ head_dim 与 dtype 换算一个共享 slot 的总行数，逐 rank 取最小值�
 
 初始化、prompt／换图和缓存恢复均先检查编码输入边界，再做精确 packing／峰值准入；
 过大更新保留当前会话，初始拒绝清理当前请求并允许原服务下一会话恢复。容量拒绝继续处理在途输入 ACK，并按原有取消路径释放当前请求，保留通信组供下一会话使用。
-本容量实现基于 main，不依赖 PR #584。普通条件拒绝及客户端输出断开保留原服务，
+本容量实现已由 PR #517 合入 main；以下 GPU 证据仅属于该容量版本，不包含本节之外的 #584 生命周期组合。普通条件拒绝及客户端输出断开保留原服务，
 迟到 RGB／credit 排空并释放引用；真实模型／CUDA 同步或非法协议故障仍隔离。
 本组同时包含 source480／output736 的 source credit 几何与早期 init 幂等清理；
-初始化排空、端口失败广播、硬时限与 Master quiesce／销组继续由 #584 独立交付。
+初始化排空、端口失败广播、硬时限与 Master quiesce／销组由 #584 交付，组合验证状态见上节。
 
 **2026-11-05／`07f81748ab`：H100 完整服务两档功能回归通过，建议沿用 ratio 0.85。**
 E1＋DiT SP2＋D1、完整 50 层、1027 AR＋DMD、FP8 DiT／BF16 KV、W6/S3、weights-free AdaLN、
@@ -367,7 +392,7 @@ conditioning 文件改用基础数据与 Tensor 协议及 `weights_only=True`，
 **800 GB pinned 分配、480/736 GPU 数值与性能均未测**；本节版本只验缓存 CPU 契约，后续本地盘验收见下一节。
 Encoder/DiT/Decoder 的新耗时和常驻/峰值显存均未测，不能沿用下文旧收益作为本版验收。
 设计与配置见[默认缓存方案](/docs/sglang-diffusion/zing/plans/BLOCK0_CACHE_DEFAULTS)，
-测试范围和当前状态见[CPU 验证记录](/benchmark/zing_h3_causal/BLOCK0_CACHE_DEFAULTS_VALIDATION)。
+测试范围和当前状态见[CPU 验证记录](https://github.com/seedleap/sglang/blob/main/benchmark/zing_h3_causal/BLOCK0_CACHE_DEFAULTS_VALIDATION.md)。
 
 ### 本地 NVMe L2 管理与强制 prefill（PR #467）
 
@@ -425,7 +450,7 @@ NVMe/ext4 验收通过（工具提交 `08883300b3`，运行时未变）：181 �
 验收 Pod `pr467-nvme-20261030-r4` Succeeded / exit 0，8 CPU / 80 GiB / 零 GPU；完整回执见下文链接。
 本 PR 只支持同机本地磁盘；网络存储与跨机器共享不在支持范围。
 [管理方案](/docs/sglang-diffusion/zing/plans/BLOCK0_CACHE_MANAGEMENT_SHARED_L2)与
-[验收方法和状态](/benchmark/zing_h3_causal/BLOCK0_CACHE_MANAGEMENT_VALIDATION)。
+[验收方法和状态](https://github.com/seedleap/sglang/blob/main/benchmark/zing_h3_causal/BLOCK0_CACHE_MANAGEMENT_VALIDATION.md)。
 480/736 的本版 GPU TTFF、E2E、FPS、Encoder/DiT/Decoder 耗时及显存均未测。
 
 ## 连续 source 的首次合批等待
@@ -547,7 +572,7 @@ dispatch 回写。默认关闭；启用原有 KV pool 后，设置 `SGLANG_ZING_
 - **全流程生成 FPS**：**8.74** → **12.17 FPS**（**+39.3%**）；
 - **首帧交付延迟 (TTFF)**：**2.83 s** → **1.48 s**（**-47.8%**）；
 - **数值与视觉一致性**：三对正式请求完整 RGB 120 帧输出 SHA256 逐位一致（`57a915fc46aad1de...`），50 层全部 KV 逐层校验完全一致；21 项单元测试与静态检查全数通过。
-- 完整验收报告与回执见 [Prompt Switch 缓存报告](/benchmark/zing_h3_causal/PROMPT_SWITCH_CACHE_RESULTS)。
+- 完整验收报告与回执见 [Prompt Switch 缓存报告](https://github.com/seedleap/sglang/blob/main/benchmark/zing_h3_causal/PROMPT_SWITCH_CACHE_RESULTS.md)。
 
 2026-10-28 L2 重启修复：磁盘条目不再保存或恢复进程内 `model_signature`，由首次消费 KV 的前向绑定当前模型；
 同进程 L1 和活跃会话的模型变更检查保留。支持读取此前含旧签名的条目；磁盘目录仍用于相同 checkpoint 和部署配置。
@@ -624,7 +649,7 @@ DiT 会话内缓存；仅支持同机 loopback、一个接收 worker，传输失
 校验并沿原 SP 路径消费。不启用预取时仍在 worker 更新边界编码，独立 Decoder overlap
 保持原行为。当前适配版本的完整 GPU 性能与生命周期尚未验收；480 单次验证见下方，设计、CPU 验证及
 历史实验边界见 [NCCL 提前编码适配](plans/QWEN_NCCL_PREFETCH.md)。
-本 PR 后续将 Qwen `serve` 和 DiT remote 入口的缺省传输统一为 NCCL，省略开关和 JSON 字段即可启用。显式 CLI 优先于 JSON；旧 JSON 中的 `result_transport: "http"` 仍有效，删除该字段才采用新默认。HTTP 可在两端显式选择；默认 NCCL 仍要求同机 IPv4 loopback / NVIDIA CUDA，不自动回退。2026-10-28 的 `6421f08610` 已完成上海 L20Z/SM90 四卡、W6、832×480、360帧一次冷流程：默认NCCL和提前编码共同生效，命中1次、失败/回退0次；Qwen 482.37ms、消费等待392.69ms、发送开始到接收返回1.55ms（均Host边界）。TTFF53.718s、首批后17.00FPS，不代表热态性能。736/A/B/故障恢复及后续main合并版本未测，详见[实测记录](../../../../benchmark/zing_h3_causal/QWEN_NCCL_PREFETCH_RESULTS.md)。
+本 PR 后续将 Qwen `serve` 和 DiT remote 入口的缺省传输统一为 NCCL，省略开关和 JSON 字段即可启用。显式 CLI 优先于 JSON；旧 JSON 中的 `result_transport: "http"` 仍有效，删除该字段才采用新默认。HTTP 可在两端显式选择；默认 NCCL 仍要求同机 IPv4 loopback / NVIDIA CUDA，不自动回退。2026-10-28 的 `6421f08610` 已完成上海 L20Z/SM90 四卡、W6、832×480、360帧一次冷流程：默认NCCL和提前编码共同生效，命中1次、失败/回退0次；Qwen 482.37ms、消费等待392.69ms、发送开始到接收返回1.55ms（均Host边界）。TTFF53.718s、首批后17.00FPS，不代表热态性能。736/A/B/故障恢复及后续main合并版本未测，详见[实测记录](https://github.com/seedleap/sglang/blob/main/benchmark/zing_h3_causal/QWEN_NCCL_PREFETCH_RESULTS.md)。
 同日 review 修正将消费屏障缩到当前 stream，避免等待下一候选的接收；握手新增
 `connect_timeout_s` 使用剩余连接预算，持久通信组保留正常操作超时。升级此版本需同时
 升级 Qwen 与 DiT；旧握手可由新服务接受。已提交 GPU 通信的安全排空可能超过请求
@@ -1178,7 +1203,7 @@ H200两组速度回执见本页“736p 部署性能更新”；完整画质仍�
 不再作为部署入口。旧多组 `launch_pool_disagg_server()` 调用会明确报错；
 单组启动、其他模型的通用 launcher，以及 Encoder／Decoder 共模型多 service 不属于本次停用范围。
 新部署使用独立 worker service，由 Master 通过 HTTP 显式建立 Encoder → DiT → Decoder 通信组；
-操作入口见 [Worker group 测试 Master](../../../../benchmark/zing_h3_causal/WORKER_GROUP_MASTER.md)。
+操作入口见 [Worker group 测试 Master](https://github.com/seedleap/sglang/blob/main/benchmark/zing_h3_causal/WORKER_GROUP_MASTER.md)。
 
 停用前检查发现旧候选路由存在以下故障处理问题：
 

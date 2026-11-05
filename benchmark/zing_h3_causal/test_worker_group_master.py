@@ -19,6 +19,37 @@ from sglang.multimodal_gen.runtime.realtime.worker_http import WorkerHTTPServer
 ROLES = ("encoder", "dit", "decoder")
 
 
+def test_cleanup_quiesces_session_then_disconnects_all_nccl_peers_together(tmp_path):
+    async def run():
+        group = WorkerGroupMaster(
+            {role: "http://127.0.0.1:30000" for role in ROLES},
+            launcher=LocalWorkers(None, tmp_path),
+        )
+        group.created = True
+        started = {role: asyncio.Event() for role in ROLES}
+        disconnected = set()
+        quiesced = False
+
+        async def rpc(role, path, payload=None, **kwargs):
+            nonlocal quiesced
+            if path == "/quiesce_group":
+                assert role == "encoder" and not disconnected
+                quiesced = True
+                return dict(success=True, state="quiesced", worker_group_id=group.group)
+            assert path == "/destroy_group" and quiesced
+            started[role].set()
+            # Private NCCL shutdown requires every peer, including Decoder.
+            await asyncio.gather(*(event.wait() for event in started.values()))
+            disconnected.add(role)
+            return dict(state="disconnected")
+
+        group.rpc = rpc
+        await asyncio.wait_for(group.destroy(), timeout=2)
+        assert disconnected == set(ROLES)
+
+    asyncio.run(run())
+
+
 @pytest.fixture
 def workers():
     servers, managers, addresses, calls = [], {}, {}, []
@@ -59,6 +90,7 @@ def workers():
                 build=build,
                 destroy=destroy,
                 rollback=lambda role=role: calls.append((role, "rollback")),
+                quiesce=(lambda: None) if role == "encoder" else None,
             )
             server = WorkerHTTPServer(role, "127.0.0.1", port, install=manager.install)
             server.ready = True
@@ -88,6 +120,7 @@ def test_existing_workers_are_connected_without_launching_any_process(
             assert group.output_ws == "ws://127.0.0.1:38000/v1/realtime_video/output"
             assert group.summary()["reused"] is False
         assert all(m.group is None for m in workers.managers.values())
+        assert all(m.state == "idle" for m in workers.managers.values())
         assert len([c for c in workers.calls if c[1] == "destroy"]) == 3
 
     asyncio.run(run())
@@ -217,6 +250,7 @@ def test_partial_build_failure_cleans_successful_services(workers, tmp_path):
         assert all(m.group is None for m in workers.managers.values())
         assert len([c for c in workers.calls if c[1] == "destroy"]) == 2
         assert ("decoder", "rollback") in workers.calls
+        assert all(m.state == "idle" for m in workers.managers.values())
 
     asyncio.run(run())
 
@@ -298,5 +332,38 @@ def test_cancelled_build_waits_for_inflight_connection_before_cleanup(
             assert all(m.group is None for m in workers.managers.values())
         finally:
             release.set()
+
+    asyncio.run(run())
+
+
+def test_partial_build_not_accepted_cleanup_does_not_acquire_a_new_lease(
+    workers, tmp_path
+):
+    # This failure happens before Decoder's build callback, so the two
+    # accepted roles must not wait on the fixture's three-role build barrier.
+    for role in ("encoder", "dit"):
+        workers.managers[role].build_callback = lambda group, topology, role=role: (
+            workers.calls.append((role, "build", group))
+        )
+
+    async def run():
+        group = WorkerGroupMaster(
+            workers.addresses, launcher=LocalWorkers(None, tmp_path)
+        )
+        rpc = group.rpc
+
+        async def expire_before_build(role, path, payload=None, **kwargs):
+            if role == "decoder" and path == "/build_group":
+                # No callback and no last_destroyed marker exist for this group.
+                workers.managers[role].deadline = 0
+            return await rpc(role, path, payload, **kwargs)
+
+        group.rpc = expire_before_build
+        with pytest.raises(RuntimeError, match="build failed: decoder"):
+            async with group:
+                pass
+        assert ("decoder", "build") not in workers.calls
+        assert all(m.state == "idle" for m in workers.managers.values())
+        assert all(m.token is None for m in workers.managers.values())
 
     asyncio.run(run())

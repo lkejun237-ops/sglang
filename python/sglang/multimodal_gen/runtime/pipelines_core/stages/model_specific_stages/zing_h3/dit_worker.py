@@ -10,6 +10,8 @@ import asyncio
 import json
 import os
 import tempfile
+import traceback
+import uuid
 from copy import copy
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +24,28 @@ from .prompt_update import admit_prompt_update, coordinate_prompt_admission
 from .queued_dit import QueuedDiTSession
 from .source_bridge import SourceChunkBridge
 from .streaming_noise import STREAMING_NOISE_VERSION
+
+
+def _initialize_service_descriptor(ports, parallel, *, timeout, startup_failure=None):
+    """Publish startup failure before peers can wait for a descriptor forever."""
+    descriptor = None
+    failure = startup_failure
+    if ports is not None and failure is None:
+        try:
+            ports.initialize_stores(timeout=timeout)
+            descriptor = ports.services[0]
+        except BaseException as exc:
+            traceback.print_exc()
+            failure = exc
+    result = (descriptor, failure is not None)
+    if parallel is not None:
+        result = parallel.broadcast_object(result)
+    descriptor, failed = result
+    if failed:
+        if failure is not None:
+            raise failure
+        raise RuntimeError("DiT service initialization failed on the leader")
+    return descriptor
 
 
 def create_link_session(sampler, codecs, init, output, *, stage=None):
@@ -390,13 +414,37 @@ def main():
     link = None
     with tempfile.TemporaryDirectory(prefix="zing-dit-tp1-") as rendezvous:
         http = None
+        ports = None
         try:
-            if leader and cli.http_port is not None:
-                from sglang.multimodal_gen.runtime.realtime.worker_http import (
-                    WorkerHTTPServer,
-                )
+            startup_failure = None
+            try:
+                if leader and cli.http_port is not None:
+                    from sglang.multimodal_gen.runtime.realtime.worker_http import (
+                        WorkerHTTPServer,
+                    )
 
-                http = WorkerHTTPServer("dit", cli.http_host, cli.http_port)
+                    http = WorkerHTTPServer("dit", cli.http_host, cli.http_port)
+                if leader:
+                    from sglang.multimodal_gen.runtime.realtime.worker_connection_ports import (
+                        ConnectionPorts,
+                    )
+
+                    # Reserve fixed service ports before Gloo/NCCL choose ephemeral
+                    # sockets. Otherwise those sockets can occupy our own endpoint.
+                    ports = ConnectionPorts(
+                        "dit",
+                        1,
+                        worker_id=cli.worker_id or "dit-" + uuid.uuid4().hex,
+                        host=cli.advertise_host,
+                        bind_host=cli.http_host,
+                        http=cli.http_port,
+                        zmq=cli.port,
+                        rendezvous=cli.rendezvous_port,
+                    )
+            except BaseException as exc:
+                # Keep the leader alive until every SP rank can observe failure.
+                traceback.print_exc()
+                startup_failure = exc
             torch.cuda.set_device(local_rank)
             maybe_init_distributed_environment_and_model_parallel(
                 tp_size=1,
@@ -407,6 +455,13 @@ def main():
                     if "RANK" in os.environ
                     else "file://" + rendezvous + "/group"
                 ),
+            )
+            parallel = get_world_group() if world_size > 1 else None
+            descriptor = _initialize_service_descriptor(
+                ports,
+                parallel,
+                timeout=cli.timeout_seconds,
+                startup_failure=startup_failure,
             )
             before_load = None
             if args.mem_fraction_static is not None:
@@ -492,63 +547,36 @@ def main():
             create.cache_control = preparation.control
             create.cached_condition = preparation.cached_condition
 
-            import uuid
-
-            from sglang.multimodal_gen.runtime.realtime.worker_connection_ports import (
-                ConnectionPorts,
-            )
             from sglang.multimodal_gen.runtime.realtime.worker_group_dit import (
                 DiTGroups,
             )
 
-            parallel = get_world_group() if world_size > 1 else None
-            ports = None
-            descriptor = None
-            try:
-                if leader:
-                    ports = ConnectionPorts(
-                        "dit",
-                        1,
-                        worker_id=cli.worker_id or "dit-" + uuid.uuid4().hex,
-                        host=cli.advertise_host,
-                        bind_host=cli.http_host,
-                        http=cli.http_port,
-                        zmq=cli.port,
-                        rendezvous=cli.rendezvous_port,
-                    )
-                    ports.initialize_stores(timeout=cli.timeout_seconds)
-                    descriptor = ports.services[0]
-                if parallel is not None:
-                    descriptor = parallel.broadcast_object(descriptor)
-                groups = DiTGroups(
-                    descriptor,
-                    store=ports.stores[0] if leader else None,
-                    device=f"cuda:{local_rank}",
-                    parallel=parallel,
-                    timeout=cli.timeout_seconds,
-                    create_session=create,
-                    codecs=codecs,
-                )
-                if leader:
-                    http.connections = groups.manager
-                    groups.manager.install(http.app)
-                    http.ready = True
-                    print("DIT_SERVICE_READY " + json.dumps(descriptor), flush=True)
-            except BaseException:
-                if ports is not None:
-                    ports.close()
-                raise
-            try:
-                with (
-                    torch.inference_mode(),
-                    set_forward_context(current_timestep=0, attn_metadata=None),
-                ):
-                    asyncio.run(groups.run())
-            finally:
-                if ports is not None:
-                    ports.close()
-
+            groups = DiTGroups(
+                descriptor,
+                store=ports.stores[0] if leader else None,
+                device=f"cuda:{local_rank}",
+                parallel=parallel,
+                timeout=cli.timeout_seconds,
+                create_session=create,
+                codecs=codecs,
+            )
+            if leader:
+                http.connections = groups.manager
+                groups.manager.install(http.app)
+                http.ready = True
+                print("DIT_SERVICE_READY " + json.dumps(descriptor), flush=True)
+            with (
+                torch.inference_mode(),
+                set_forward_context(current_timestep=0, attn_metadata=None),
+            ):
+                asyncio.run(groups.run())
+        except BaseException:
+            # A failed cleanup must not hide the original startup/model error.
+            traceback.print_exc()
+            raise
         finally:
+            if ports is not None:
+                ports.close()
             if http is not None:
                 http.close()
             if link is not None:

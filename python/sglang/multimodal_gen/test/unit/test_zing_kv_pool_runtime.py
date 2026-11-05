@@ -356,9 +356,7 @@ def _source_stream(model, storage=None):
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.incremental import (
         SourceReadySession,
     )
-    from sglang.multimodal_gen.test.unit.test_zing_h3_chunks import (
-        fixture_provenance,
-    )
+    from sglang.multimodal_gen.test.unit.test_zing_h3_chunks import fixture_provenance
 
     sampler = _sampler(model)
     sampler.processor.num_frame_per_block = [3, 2]
@@ -587,9 +585,7 @@ def test_source_stream_parity_survives_in_place_qk_norm_and_dirty_memory(
     # emulate that on CPU. Fill every pooled and growth buffer with NaN so any
     # read of rows the cache never wrote poisons the output.
     from sglang.multimodal_gen.runtime.models.dits import zing_h3
-    from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import (
-        ZingH3KVCache,
-    )
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
 
     def in_place_qk_norm(module, q, k):
         q.copy_(module.q_norm(q))

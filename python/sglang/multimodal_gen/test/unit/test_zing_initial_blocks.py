@@ -200,6 +200,11 @@ def test_source_ready_schedule_matches_worker_execution(
         assert expected == ([4, 4, 4, 2, 2] if mixed else [cli_steps or 4] * 5)
     finally:
         state.close()
+        asyncio.run(adapter.close_conditioning(session))
+        assert (
+            session.id
+            not in session.conditioning_resources.ledger.snapshot()["tenants"]
+        )
         adapter.dispose(session)
 
 

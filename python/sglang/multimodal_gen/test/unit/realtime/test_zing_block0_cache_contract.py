@@ -419,9 +419,7 @@ def test_delete_does_not_invalidate_l1_and_background_write_can_recreate(
     from sglang.multimodal_gen.test.unit.realtime.test_zing_preparation_cache import (
         inputs,
     )
-    from sglang.multimodal_gen.test.unit.realtime.zing_cache_fixtures import (
-        cpu_cache,
-    )
+    from sglang.multimodal_gen.test.unit.realtime.zing_cache_fixtures import cpu_cache
 
     monkeypatch.setenv("SGLANG_ZING_DISK_CACHE_DIR", str(tmp_path))
     stores = [NS(k=torch.zeros(8, 2, 3), v=torch.zeros(8, 2, 3))]
@@ -471,9 +469,7 @@ def test_failed_async_write_leaves_local_cache_and_next_request_usable(
     from sglang.multimodal_gen.test.unit.realtime.test_zing_preparation_cache import (
         inputs,
     )
-    from sglang.multimodal_gen.test.unit.realtime.zing_cache_fixtures import (
-        cpu_cache,
-    )
+    from sglang.multimodal_gen.test.unit.realtime.zing_cache_fixtures import cpu_cache
 
     monkeypatch.setenv("SGLANG_ZING_DISK_CACHE_DIR", str(tmp_path))
     owner = cpu_cache([NS(k=torch.zeros(8, 2, 3))], rows=8, entries=1)
@@ -911,12 +907,15 @@ def test_enospc_at_each_write_stage_never_publishes_partial_files(
     assert not list(owner.tmp_root.glob("*"))
 
 
-def _bind_index_worker(root, group):
+def _bind_index_worker(root, group, ready, start):
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.cache_index import (
         CacheIndex,
     )
 
     index = CacheIndex(root)
+    ready.set()
+    if not start.wait(120):
+        raise TimeoutError("Cache index workers did not start together")
     for _ in range(5):
         index.bind("game/with unicode 游戏", group, "a" * 64)
         index.bind("game/with unicode 游戏", group, "b" * 64)
@@ -928,17 +927,36 @@ def test_index_atomic_associations_deduplicate_groups_and_survive_entity_gc(tmp_
     )
 
     index = CacheIndex(tmp_path)
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    ready = [context.Event() for _ in range(2)]
     workers = [
-        multiprocessing.get_context("spawn").Process(
-            target=_bind_index_worker, args=(str(tmp_path), group)
+        context.Process(
+            target=_bind_index_worker,
+            args=(str(tmp_path), group, worker_ready, start),
         )
-        for group in ("stage/1", "stage/2")
+        for group, worker_ready in zip(("stage/1", "stage/2"), ready)
     ]
-    for process in workers:
-        process.start()
-    for process in workers:
-        process.join(30)
-        assert process.exitcode == 0
+    try:
+        for process in workers:
+            process.start()
+        # Spawn imports the CUDA-enabled Python stack even for this CPU test.
+        # Wait for imports separately, then exercise concurrent writes within
+        # the original work deadline instead of letting startup consume it.
+        deadline = time.monotonic() + 120
+        for worker_ready in ready:
+            assert worker_ready.wait(max(0, deadline - time.monotonic()))
+        start.set()
+        for process in workers:
+            process.join(30)
+            assert process.exitcode == 0
+    finally:
+        start.set()
+        for process in workers:
+            if process.pid is not None:
+                if process.is_alive():
+                    process.terminate()
+                process.join(10)
     assert index.select("game/with unicode 游戏") == ["a" * 64, "b" * 64]
     assert index.select("game/with unicode 游戏", "stage/1", "a" * 64) == ["a" * 64]
     index.bind("game/with unicode 游戏", None, "c" * 64)

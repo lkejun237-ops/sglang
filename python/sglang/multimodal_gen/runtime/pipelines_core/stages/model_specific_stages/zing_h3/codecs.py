@@ -566,9 +566,11 @@ class ZingH3Codecs(ZingH3MediaInput):
         }
         reference_ids = {c["content_id"] for c in conditions}
         media = [
-            self._decode_reference_image(item, max_area_config=max_area_config)
-            if item["type"] == "image" and item["id"] in reference_ids
-            else self._decode_media(item, need_audio=item["id"] in audio_ids)
+            (
+                self._decode_reference_image(item, max_area_config=max_area_config)
+                if item["type"] == "image" and item["id"] in reference_ids
+                else self._decode_media(item, need_audio=item["id"] in audio_ids)
+            )
             for item in items
         ]
         if source_preview is not None:

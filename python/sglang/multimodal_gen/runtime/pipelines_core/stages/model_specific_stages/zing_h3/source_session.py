@@ -295,9 +295,9 @@ class ZingSourceStreamState(BaseRealtimeState):
             sampler,
             self.inputs,
             seed=self.bridge.seed,
-            max_pending_chunks=2
-            if getattr(sampler, "joint_forward", "off") == "cross_chunk"
-            else 1,
+            max_pending_chunks=(
+                2 if getattr(sampler, "joint_forward", "off") == "cross_chunk" else 1
+            ),
             max_pending_bytes=256 << 20,
             acquire_storage=self._pooled_storage(stage, batch.session, sampler),
             prompt_switch_prefix_latent_frames=(
@@ -652,9 +652,9 @@ class ZingSourceStreamState(BaseRealtimeState):
                         == "nccl"
                         else None
                     ),
-                    should_prefetch=should_prefetch
-                    if self.block0_cache is not None
-                    else None,
+                    should_prefetch=(
+                        should_prefetch if self.block0_cache is not None else None
+                    ),
                 )
                 provider._prefetch_owner = self.conditioning_prefetch
                 batch.session.get_or_create_state(
@@ -997,14 +997,16 @@ class ZingSourceStreamState(BaseRealtimeState):
                 self._decode_ready(stage, outputs, metadata, timed, trace)
             prefetch = self.conditioning_prefetch
             usage = {
-                "zing_conditioning_prefetch": None
-                if prefetch is None
-                else dict(
-                    encodes=prefetch.encodes,
-                    hits=prefetch.hits,
-                    cache_skips=prefetch.cache_skips,
-                    failures=prefetch.failures,
-                    fallbacks=prefetch.fallbacks,
+                "zing_conditioning_prefetch": (
+                    None
+                    if prefetch is None
+                    else dict(
+                        encodes=prefetch.encodes,
+                        hits=prefetch.hits,
+                        cache_skips=prefetch.cache_skips,
+                        failures=prefetch.failures,
+                        fallbacks=prefetch.fallbacks,
+                    )
                 ),
                 "zing_realtime_blocks": metadata,
                 "zing_source_consumed_end": self.bridge.accepted_pixels,
@@ -1468,18 +1470,20 @@ class ZingSourceStreamState(BaseRealtimeState):
                             hit=self.block0_entry is not None,
                             prepare_bypassed=self.block0_entry is not None,
                             lookup_host_ms=self.block0_lookup_ms,
-                            restore_submit_host_ms=None
-                            if transfer is None
-                            else transfer.submit_ms,
-                            restore_cuda_ms=None
-                            if transfer is None
-                            else transfer.begin.elapsed_time(transfer.end),
-                            ready_at_consumer=None
-                            if transfer is None
-                            else transfer.ready_at_consumer,
-                            restore_lead_host_ms=None
-                            if transfer is None
-                            else transfer.lead_ms,
+                            restore_submit_host_ms=(
+                                None if transfer is None else transfer.submit_ms
+                            ),
+                            restore_cuda_ms=(
+                                None
+                                if transfer is None
+                                else transfer.begin.elapsed_time(transfer.end)
+                            ),
+                            ready_at_consumer=(
+                                None if transfer is None else transfer.ready_at_consumer
+                            ),
+                            restore_lead_host_ms=(
+                                None if transfer is None else transfer.lead_ms
+                            ),
                             cpu_capacity_bytes=self.block0_cache.pages.numel()
                             * self.block0_cache.pages.element_size(),
                             ready=bool(self.block0_cache.entries),
@@ -1487,9 +1491,11 @@ class ZingSourceStreamState(BaseRealtimeState):
                             evictions=self.block0_cache.evictions,
                             hits=self.block0_cache.hits,
                             misses=self.block0_cache.misses,
-                            rank=torch.distributed.get_rank()
-                            if torch.distributed.is_initialized()
-                            else 0,
+                            rank=(
+                                torch.distributed.get_rank()
+                                if torch.distributed.is_initialized()
+                                else 0
+                            ),
                         )
                     ),
                     main_process_only=False,

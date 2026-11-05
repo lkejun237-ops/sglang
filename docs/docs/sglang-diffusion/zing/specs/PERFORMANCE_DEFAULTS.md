@@ -131,7 +131,7 @@ UTF-8 prompt 最多 65536 字节、Qwen condition 最多 16384 行、参考图�
 ## 验证边界与回退
 
 本次默认值调整不代表完成三项优化组合的 GPU 端到端验收，也不叠乘独立 PR 收益。
-原验证范围及画质状态见 [HISTORY_ROPE_GROUPED_PLAN.md](../../../../../benchmark/zing_h3_causal/HISTORY_ROPE_GROUPED_PLAN.md) 和 [CHUNK_ROPE_REUSE.md](CHUNK_ROPE_REUSE.md)。
+原验证范围及画质状态见 [HISTORY_ROPE_GROUPED_PLAN.md](https://github.com/seedleap/sglang/blob/main/benchmark/zing_h3_causal/HISTORY_ROPE_GROUPED_PLAN.md) 和 [CHUNK_ROPE_REUSE.md](CHUNK_ROPE_REUSE.md)。
 需要旧路径时显式设置前三项为 `0`；plan 保持 `0`。
 
 ## grouped 与 chunk reuse 的组合（#211）
@@ -151,7 +151,7 @@ UTF-8 prompt 最多 65536 字节、Qwen condition 最多 16384 行、参考图�
   selection；chunk reuse 的有效性与区间分组仍由已绑定的 chunk plan 决定，
   不使用 history plan 的 common-prefix geometry 替代逐片段有效性判定。
 
-针对性复现命令和实际证据见 [GROUPED_CHUNK_REUSE.md](../../../../../benchmark/zing_h3_causal/GROUPED_CHUNK_REUSE.md)。
+针对性复现命令和实际证据见 [GROUPED_CHUNK_REUSE.md](https://github.com/seedleap/sglang/blob/main/benchmark/zing_h3_causal/GROUPED_CHUNK_REUSE.md)。
 
 ## 480p 固定槽路径
 

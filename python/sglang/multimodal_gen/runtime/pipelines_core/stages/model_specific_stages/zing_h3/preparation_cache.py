@@ -12,9 +12,7 @@ from pathlib import Path
 
 import torch
 
-from sglang.multimodal_gen.runtime.conditioning.worker import (
-    coordinate_validation,
-)
+from sglang.multimodal_gen.runtime.conditioning.worker import coordinate_validation
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 from .block0_identity import fingerprint

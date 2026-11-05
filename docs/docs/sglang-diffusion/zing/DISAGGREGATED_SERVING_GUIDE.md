@@ -36,7 +36,7 @@
 | 业务连接 | 建立两条 WS：向 Encoder 发送输入，从 Decoder 接收 RGB 和 `source.consumed`。旧单 WS 客户端需要适配；发送与接收应独立推进。 |
 | 输入协议 | 沿用原有 init、source、prompt／参考图更新等业务协议；输入侧确认仍从 Encoder 返回。`accepted` 表示接受更新，不代表视频已使用该更新，实际生效以输出的 `event_id` 为准。 |
 | 通信组身份 | `worker_group_id` 标识 service 配对；`session_id`／`generation_id` 标识业务会话，不能混用。 |
-| 连接生命周期 | 业务请求结束不自动拆组。客户端 可保留连接处理后续请求，也可调用三个 service 的 `destroy_group` 释放或调整配对。 |
+| 连接生命周期 | 业务请求结束不自动拆组。保留连接可继续处理后续请求；释放配对时先向 Encoder 调用 `quiesce_group` 排空会话，再并行调用三个 service 的 `destroy_group`。 |
 | 就绪状态 | `/health` 表示 worker 健康，不表示空闲。`session.ready` 也不代表 Qwen／prefix KV 已预热；正常生成的条件准备仍依赖首批 source 中的首帧。 |
 | 显式预计算 | 使用 Encoder 业务 WS 端口上的 `/v1/realtime_video/prefill`，提供原协议要求的 `source_frame`；`prefill.completed` 由 Encoder 返回，表示 L1 可用且临时请求已清理，不等待异步 L2 落盘。 |
 | 缓存管理 | `/v1/zing/cache` 系列外部接口位于 Encoder，要求已建组，操作当前组对应的 DiT。断连保留 DiT L1／L2 缓存。 |
@@ -90,13 +90,21 @@ flowchart LR
         ↓                   ↓
 继续保留通信组          需要释放或调整通信组
 处理后续请求                ↓
-        │             分别调用三个 service
+        │             Encoder quiesce_group
+        │             确认会话排空、通信通道仍保留
+        │                   ↓
+        │             并行调用三个 service
         │               的 destroy_group
         │                   ↓
-        └─ 持续使用      查询连接状态，直到返回 available
+        └─ 持续使用      重复 destroy_group，直到返回 disconnected
 ```
 
 通信组可以在一条业务请求结束后销毁，也可以一直保留、连续处理后续请求，直到需要释放资源或调整配对。**业务请求结束不自动销毁通信组。**
+
+排空时拒绝新会话并等待已接收的输入、DiT 取消和 Decoder 退出确认；此阶段保留全部通信通道。
+排空完成后，三个角色并行销毁通信组，因为 NCCL 退出需要两端共同参与。
+清理完成使用幂等 `destroy_group` 确认，避免状态查询取得新的 10 秒预留。
+Master 与三角色 worker 须使用共同支持该收尾协议的版本。
 
 如果只取得部分预留，放弃使用的预留会自动到期。如果部分 service 建连成功、其他 service 建连失败，客户端 需要对成功部分调用 `destroy_group`。
 
@@ -166,5 +174,5 @@ SP2 的两个 rank 共同构成一个 DiT service，仅 rank 0 对外通信。�
 ## 4. 相关文档
 
 - [Worker 通信组接口协议](specs/WORKER_CONNECTION_API.md)：健康检查、查询预留、建组与销毁的请求／响应定义。
-- [测试客户端使用说明](../../../../benchmark/zing_h3_causal/WORKER_GROUP_MASTER.md)：测试启动参数、数据读取、收发与结果保存。
+- [测试客户端使用说明](https://github.com/seedleap/sglang/blob/main/benchmark/zing_h3_causal/WORKER_GROUP_MASTER.md)：测试启动参数、数据读取、收发与结果保存。
 - [Zing 部署指南](deployment_zing_h3.mdx)：模型配方、硬件配置、验证范围和旧入口停用说明。

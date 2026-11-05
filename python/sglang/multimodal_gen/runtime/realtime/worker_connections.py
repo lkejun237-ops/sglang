@@ -34,6 +34,7 @@ class ServiceConnections:
         build,
         destroy,
         rollback,
+        quiesce=None,
         clock=time.monotonic,
         cleanup_timeout=None,
     ):
@@ -41,6 +42,7 @@ class ServiceConnections:
         self.ready = ready
         self.build_callback, self.destroy_callback = build, destroy
         self.rollback_callback = rollback
+        self.quiesce_callback = quiesce
         self.clock = clock
         self.cleanup_timeout = cleanup_timeout
         self.lock = threading.RLock()
@@ -53,7 +55,7 @@ class ServiceConnections:
         self.operation = None
         self.loop = None
 
-    def query(self):
+    def query(self, *, reserve=True):
         with self.lock:
             if self.restart_required or not self.ready():
                 return dict(
@@ -69,6 +71,8 @@ class ServiceConnections:
             if self.state == "reserved" and self.clock() >= self.deadline:
                 self.state, self.token = "idle", None
             if self.state == "idle":
+                if not reserve:
+                    return dict(state="available"), 200
                 self.state = "reserved"
                 self.token = secrets.token_urlsafe(32)
                 self.deadline = self.clock() + self.RESERVATION_SECONDS
@@ -243,6 +247,8 @@ class ServiceConnections:
                 self.restart_required = self.restart_required or not cleaned
                 reusable = not self.restart_required
                 self.state = "idle" if reusable else "failed"
+                if reusable:
+                    self.last_destroyed = group
                 self.token = self.group = self.topology = None
             return dict(
                 success=False,
@@ -252,6 +258,58 @@ class ServiceConnections:
                 code="CONNECTION_FAILED",
                 message="Failed to establish the worker connections.",
             ), 503
+
+    async def quiesce(self, payload):
+        """Finish the owner session while keeping all peer transports alive."""
+        group = payload.get("worker_group_id") if isinstance(payload, dict) else None
+        if not isinstance(group, str) or not group:
+            raise ConnectionRejected(
+                "INVALID_GROUP", "A worker_group_id is required.", 422
+            )
+        with self.lock:
+            if self.group != group or self.state not in (
+                "connected",
+                "quiescing",
+                "quiesced",
+            ):
+                raise ConnectionRejected(
+                    "GROUP_MISMATCH", "The connection group does not match."
+                )
+            if self.quiesce_callback is None:
+                raise ConnectionRejected(
+                    "QUIESCE_UNSUPPORTED",
+                    "This worker cannot finish the session before closing.",
+                    501,
+                )
+            if self.state == "quiesced":
+                return dict(success=True, state="quiesced", worker_group_id=group), 200
+            if self.state == "connected":
+                self.state = "quiescing"
+                self.operation = asyncio.create_task(self._quiesce(group))
+            operation = self.operation
+        return await asyncio.shield(operation)
+
+    async def _quiesce(self, group):
+        try:
+            with self.cleanup_guard():
+                await self._call(self.quiesce_callback)
+            with self.lock:
+                if self.restart_required:
+                    raise RuntimeError("Worker failed while finishing the session")
+                self.state = "quiesced"
+        except Exception:
+            logging.exception("Worker session quiesce failed")
+            with self.lock:
+                self.state, self.restart_required = "failed", True
+            return dict(
+                success=False,
+                state="unavailable",
+                worker_group_id=group,
+                restart_required=True,
+                code="QUIESCE_FAILED",
+                message="Failed to finish the current session.",
+            ), 503
+        return dict(success=True, state="quiesced", worker_group_id=group), 200
 
     async def destroy(self, payload):
         group = payload.get("worker_group_id") if isinstance(payload, dict) else None
@@ -264,13 +322,24 @@ class ServiceConnections:
                 return dict(
                     success=True, state="disconnected", worker_group_id=group
                 ), 200
-            if self.group != group or self.state not in ("connected", "draining"):
+            if self.group != group or self.state not in (
+                "connected",
+                "quiescing",
+                "quiesced",
+                "draining",
+            ):
                 raise ConnectionRejected(
                     "GROUP_MISMATCH", "The connection group does not match."
                 )
-            if self.state == "connected":
+            pending_quiesce = self.operation if self.state == "quiescing" else None
+            if self.state in ("connected", "quiesced"):
                 self.state = "draining"
                 self.operation = asyncio.create_task(self._destroy(group))
+        if pending_quiesce is not None:
+            result = await asyncio.shield(pending_quiesce)
+            if result[1] != 200:
+                return result
+            return await self.destroy(payload)
         return dict(success=True, state="cleaning", worker_group_id=group), 202
 
     async def _destroy(self, group):
@@ -310,7 +379,7 @@ class ServiceConnections:
         with self.lock:
             if self.state in ("idle", "failed"):
                 return
-            if self.state in ("draining", "connecting"):
+            if self.state in ("draining", "connecting", "quiescing"):
                 self.state, self.restart_required = "failed", True
                 return
             self.state, self.restart_required = "failed", True
@@ -359,9 +428,13 @@ def install_connection_routes(app):
         )
 
     @app.get("/get_connection_status")
-    async def query():
+    async def query(reserve: bool = True):
         controller = getattr(app.state, "worker_connections", None)
-        return unavailable() if controller is None else response(*controller.query())
+        return (
+            unavailable()
+            if controller is None
+            else response(*controller.query(reserve=reserve))
+        )
 
     async def command(request, operation):
         controller = getattr(app.state, "worker_connections", None)
@@ -390,6 +463,10 @@ def install_connection_routes(app):
     @app.post("/destroy_group")
     async def destroy(request: Request):
         return await command(request, "destroy")
+
+    @app.post("/quiesce_group")
+    async def quiesce(request: Request):
+        return await command(request, "quiesce")
 
     app.state.worker_connection_routes_installed = True
 

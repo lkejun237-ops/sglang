@@ -22,66 +22,72 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
         connection_app = getattr(self, "connection_app", None)
         if connection_app is not None:
             controller = connection_app.state.worker_connections
-            require(
-                controller.state == "connected", "The worker connections are not ready."
-            )
-            import asyncio
-
-            self.connection_loop = asyncio.get_running_loop()
-            self.connection_draining = False
-        await super().on_init(session, request, prefill=prefill)
-        if connection_app is not None:
-            connection_app.state.connection_adapter = self
-        # No Qwen/VAE invocation and no wait for S0: forward session parameters
-        # as their own ZMQ message before accepting source input.
-        if prefill:
-            return
-        opened = await session.execution_client.open_dit(
-            dict(
-                session_id=session.id,
-                generation_id=session.generation_id,
-                async_inputs=True,
-                seed=request.seed
-                if request.seed is not None
-                else ZingH3SamplingParams.seed,
-                width=self.source_geometry.target_width,
-                height=self.source_geometry.target_height,
-                source_stream=dict(
-                    width=self.config["width"],
-                    height=self.config["height"],
+            # Registration and the connected check share quiesce's state lock.
+            # Publish the initializer before its first asynchronous validation.
+            with controller.lock:
+                require(
+                    controller.state == "connected",
+                    "The worker connections are not ready.",
+                )
+                self.connection_loop = asyncio.get_running_loop()
+                self.connection_draining = False
+                connection_app.state.connection_adapter = self
+        async with self.connection_admission:
+            await super().on_init(session, request, prefill=prefill)
+            # No Qwen/VAE invocation and no wait for S0: forward session parameters
+            # as their own ZMQ message before accepting source input.
+            if prefill:
+                return
+            opened = await session.execution_client.open_dit(
+                dict(
+                    session_id=session.id,
+                    generation_id=session.generation_id,
+                    async_inputs=True,
+                    seed=request.seed
+                    if request.seed is not None
+                    else ZingH3SamplingParams.seed,
+                    width=self.source_geometry.target_width,
+                    height=self.source_geometry.target_height,
+                    source_stream=dict(
+                        width=self.config["width"],
+                        height=self.config["height"],
+                        fps=self.config["fps"],
+                        format="rgb24",
+                    ),
+                    source_encoding=self.source_geometry.receipt(),
                     fps=self.config["fps"],
-                    format="rgb24",
-                ),
-                source_encoding=self.source_geometry.receipt(),
-                fps=self.config["fps"],
-                total_frames=self.config["total_frames"],
-                realtime_output_format=request.realtime_output_format,
-                output_compression=getattr(request, "output_compression", None),
-                realtime_preview_max_width=getattr(
-                    request, "realtime_preview_max_width", None
-                ),
-                trace_id=getattr(session, "trace_id", None),
+                    total_frames=self.config["total_frames"],
+                    realtime_output_format=request.realtime_output_format,
+                    output_compression=getattr(request, "output_compression", None),
+                    realtime_preview_max_width=getattr(
+                        request, "realtime_preview_max_width", None
+                    ),
+                    trace_id=getattr(session, "trace_id", None),
+                )
             )
-        )
-        self.output_kind = next(
-            (v["output_kind"] for v in (opened or []) if v["type"] == "session.opened"),
-            "dit_latents",
-        )
-        self.ready.update(output_kind=self.output_kind)
-        self.output_attachment = next(
-            (
-                v.get("output_attachment")
-                for v in (opened or [])
-                if v["type"] == "session.opened"
-            ),
-            None,
-        )
-        if self.output_attachment:
-            self.ready.update(
-                output_transport="decoder_websocket",
-                output_attachment=self.output_attachment,
+            self.output_kind = next(
+                (
+                    v["output_kind"]
+                    for v in (opened or [])
+                    if v["type"] == "session.opened"
+                ),
+                "dit_latents",
             )
-        self.latents_sent = 0
+            self.ready.update(output_kind=self.output_kind)
+            self.output_attachment = next(
+                (
+                    v.get("output_attachment")
+                    for v in (opened or [])
+                    if v["type"] == "session.opened"
+                ),
+                None,
+            )
+            if self.output_attachment:
+                self.ready.update(
+                    output_transport="decoder_websocket",
+                    output_attachment=self.output_attachment,
+                )
+            self.latents_sent = 0
 
     def clear_state(self, session):
         super().clear_state(session)
@@ -113,7 +119,7 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
 
         async with self.connection_admission:
             self.connection_draining = True
-            if self.ledger.closed:
+            if not hasattr(self, "ledger") or self.ledger.closed:
                 return
             if self.end is None and self.ledger.accepted_frames:
                 # Administrative EOS may end a finite request before its declared
@@ -204,6 +210,11 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
                     and item.get("reference") is None,
                     "Invalid direct Decoder receipt.",
                 )
+                # Pixels bypass this input WS, so its zero send counters cannot
+                # arm the hard lifetime. Start it at the first validated server
+                # dispatch; client heartbeats/withheld playback ACKs cannot
+                # retain the single KV owner forever after output disconnect.
+                session.mark_playable()
             elif self.output_kind == "rgb":
                 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
                     OutputBatch,

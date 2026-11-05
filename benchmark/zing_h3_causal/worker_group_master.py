@@ -319,45 +319,64 @@ class WorkerGroupMaster:
     def output_ws(self):
         return self.topology["decoder"]["endpoints"]["output_ws"]
 
+    async def _quiesce_encoder(self):
+        try:
+            reply = await self.rpc(
+                "encoder", "/quiesce_group", dict(worker_group_id=self.group)
+            )
+        except WorkerHTTPError as exc:
+            if exc.status != 409 or self.created:
+                raise
+        else:
+            if (
+                reply.get("success") is not True
+                or reply.get("state") != "quiesced"
+                or reply.get("worker_group_id") != self.group
+            ):
+                raise RuntimeError("Worker group session did not finish before cleanup")
+
+    async def _destroy_role_until_disconnected(self, role):
+        deadline = time.monotonic() + self.control_timeout
+        while time.monotonic() < deadline:
+            try:
+                result = await self.rpc(
+                    role, "/destroy_group", dict(worker_group_id=self.group)
+                )
+            except WorkerHTTPError as exc:
+                if exc.status != 409 or self.created:
+                    raise
+                # A partially built role can still be connecting or already
+                # rolled back. Never disconnect a different owner.
+                status = await self.rpc(
+                    role, "/get_connection_status?reserve=false", timeout=5
+                )
+                if status.get("state") == "available":
+                    return
+                if status.get("state") != "reserved" and not (
+                    status.get("state") == "connected"
+                    and status.get("worker_group_id") == self.group
+                ):
+                    raise RuntimeError(f"Unexpected cleanup status: {role}")
+            else:
+                if result.get("state") == "disconnected":
+                    return
+                if result.get("state") != "cleaning":
+                    raise RuntimeError(f"Unexpected destroy response: {role}")
+                # Repeating destroy is idempotent and does not reserve a
+                # newly idle service as get_connection_status would.
+            await asyncio.sleep(0.2)
+        raise TimeoutError(f"Worker cleanup timed out: {role}")
+
     async def destroy(self):
         if not self.build_attempted and not self.created and self.topology is None:
             return
 
-        async def close(role):
-            deadline = time.monotonic() + self.control_timeout
-            cleaning = False
-            while time.monotonic() < deadline:
-                if not cleaning:
-                    try:
-                        result = await self.rpc(
-                            role, "/destroy_group", dict(worker_group_id=self.group)
-                        )
-                    except WorkerHTTPError as exc:
-                        if exc.status != 409 or self.created:
-                            raise
-                        # A canceled/failed build can still be connecting on
-                        # the service. Wait for its final state before deciding
-                        # that no connection needs to be destroyed.
-                    else:
-                        if result.get("state") == "disconnected":
-                            return
-                        if result.get("state") != "cleaning":
-                            raise RuntimeError(f"Unexpected destroy response: {role}")
-                        cleaning = True
-                status = await self.rpc(role, "/get_connection_status", timeout=5)
-                state = status.get("state")
-                if state == "available":
-                    # Querying availability acquires a fresh 10 s lease.
-                    return
-                if state == "connected" and status.get("worker_group_id") == self.group:
-                    cleaning = False
-                elif state != "reserved":
-                    raise RuntimeError(f"Unexpected cleanup status: {role}")
-                await asyncio.sleep(0.2)
-            raise TimeoutError(f"Worker cleanup timed out: {role}")
-
+        # First drain the session with every transport alive. NCCL shutdown is
+        # collective, so only then may all three peers disconnect concurrently.
+        await self._quiesce_encoder()
         results = await asyncio.gather(
-            *(close(role) for role in ROLES), return_exceptions=True
+            *(self._destroy_role_until_disconnected(role) for role in ROLES),
+            return_exceptions=True,
         )
         errors = [
             f"{role}: {type(result).__name__}"

@@ -674,9 +674,11 @@ class ZingH3GenerationStage(PipelineStage):
                 device = next(transformer.parameters()).device
                 devices = (
                     [
-                        device.index
-                        if device.index is not None
-                        else torch.cuda.current_device()
+                        (
+                            device.index
+                            if device.index is not None
+                            else torch.cuda.current_device()
+                        )
                     ]
                     if device.type == "cuda"
                     else []
@@ -919,9 +921,11 @@ class ZingH3GenerationStage(PipelineStage):
                     )
                     initial_rng_state = (
                         torch.get_rng_state().clone(),
-                        torch.cuda.get_rng_state(device).clone()
-                        if device.type == "cuda"
-                        else None,
+                        (
+                            torch.cuda.get_rng_state(device).clone()
+                            if device.type == "cuda"
+                            else None
+                        ),
                     )
                 state.sampling = ZingH3BlockSession(
                     sampler,
@@ -1103,11 +1107,13 @@ class ZingH3GenerationStage(PipelineStage):
         )
         progress = {
             "complete": bool(final),
-            "next_chunk_size": None
-            if final
-            else (
-                state.sampling.spans[state.sampling.index][3]
-                - state.sampling.spans[state.sampling.index][2]
+            "next_chunk_size": (
+                None
+                if final
+                else (
+                    state.sampling.spans[state.sampling.index][3]
+                    - state.sampling.spans[state.sampling.index][2]
+                )
             ),
         }
         ready = self._queue_realtime_output(batch, state, end, mode, final)
