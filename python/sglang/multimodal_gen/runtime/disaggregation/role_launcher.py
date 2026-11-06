@@ -24,6 +24,30 @@ logger = logging.getLogger(__name__)
 START_PORT = 31003
 
 
+def _role_environment(server_args, role, devices):
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES=devices, PYTHONUNBUFFERED="1")
+    decoder = (
+        getattr(getattr(server_args, "pipeline_config", None), "decoder_config", None)
+        or {}
+    )
+    if decoder.get("type") == "lynn_streaming":
+        names = (
+            (
+                "MINIMAX_H3_PROGRESSIVE_FUSED_NORM_INPUT",
+                "MINIMAX_H3_PROGRESSIVE_FUSED_CONV_INPUT",
+            )
+            if role == RoleType.ENCODER
+            else (
+                "SGLANG_LYNN_PACKED_QKV",
+                "SGLANG_LYNN_FUSED_QK_NORM",
+                "SGLANG_LYNN_COMPILED_FFN",
+            )
+        )
+        for name in names:
+            env.setdefault(name, "1")
+    return env
+
+
 def free_port(start: int = START_PORT, avoid: tuple[int, ...] = ()) -> int:
     """Find the first available port for loopback binding outside `avoid`."""
     for port in range(max(1024, start), 65536):
@@ -302,11 +326,7 @@ def start_role_workers(
                     gpus=dev_group,
                     max_sessions=max_sessions,
                 )
-            enc_env = dict(
-                os.environ,
-                CUDA_VISIBLE_DEVICES=dev_group,
-                PYTHONUNBUFFERED="1",
-            )
+            enc_env = _role_environment(server_args, RoleType.ENCODER, dev_group)
             enc_proc = subprocess.Popen(enc_cmd, env=enc_env, preexec_fn=parent_dies)
             processes.append(enc_proc)
             atexit.register(stop, enc_proc)
@@ -326,11 +346,7 @@ def start_role_workers(
                     gpus=dev_group,
                     max_sessions=max_sessions,
                 )
-            dec_env = dict(
-                os.environ,
-                CUDA_VISIBLE_DEVICES=dev_group,
-                PYTHONUNBUFFERED="1",
-            )
+            dec_env = _role_environment(server_args, RoleType.DECODER, dev_group)
             dec_proc = subprocess.Popen(dec_cmd, env=dec_env, preexec_fn=parent_dies)
             processes.append(dec_proc)
             atexit.register(stop, dec_proc)

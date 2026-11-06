@@ -5,6 +5,7 @@ Ported from the Zing reference (seedleap/zing @ 8eda9c22c6, src/h3/vae_decoder/m
 """
 
 from functools import cache
+from importlib.util import find_spec
 
 import torch
 from diffusers.models.attention_dispatch import dispatch_attention_fn
@@ -54,7 +55,8 @@ def _can_fuse_preparation(
 ):
     # Keep the exact shape, layout and arithmetic contract on supported devices.
     if (
-        not q.is_cuda
+        torch.compiler.is_compiling()
+        or not q.is_cuda
         or q.dtype != torch.bfloat16
         or q.shape[0] not in (6, 12, 14, 28, 30)
         or q.shape[1:] != (261, 32, 64)
@@ -104,15 +106,28 @@ def streaming_block(
     spatial_tokens,
     cache_tokens,
     attention,
+    packed_qkv=None,
+    fused_qk_norm=False,
+    ffn=None,
 ):
     """One transformer block over the current latent; returns the K/V to cache (pre-RoPE)."""
     attn = block.attn
     normalized = block.norm1(hidden.float()).to(attn.to_q.weight.dtype)
-    q = attn.to_q(normalized).unflatten(-1, (attn.heads, -1))
-    k = attn.to_k(normalized).unflatten(-1, (attn.heads, -1))
-    v = attn.to_v(normalized).unflatten(-1, (attn.heads, -1))
-    q = attn.norm_q(q.float()).to(q.dtype)
-    k = attn.norm_k(k.float()).to(k.dtype)
+    if packed_qkv is not None:
+        from .execution import packed_projection
+
+        q, k, v = packed_projection(attn, normalized, packed_qkv)
+    else:
+        q = attn.to_q(normalized).unflatten(-1, (attn.heads, -1))
+        k = attn.to_k(normalized).unflatten(-1, (attn.heads, -1))
+        v = attn.to_v(normalized).unflatten(-1, (attn.heads, -1))
+    if fused_qk_norm and _can_fuse_qk_norm(q, k, attn.norm_q, attn.norm_k):
+        from .block_kernels import qk_norm
+
+        q, k = qk_norm(q, k, attn.norm_q, attn.norm_k)
+    else:
+        q = attn.norm_q(q.float()).to(q.dtype)
+        k = attn.norm_k(k.float()).to(k.dtype)
     fused = _can_fuse_preparation(
         q,
         k,
@@ -145,8 +160,11 @@ def streaming_block(
         all_v = torch.cat([history_v, v], dim=1)
         attended = attention(rotate(q, query_rope), rotate(all_k, key_rope), all_v)
     hidden = hidden + attn.to_out[0](attended.flatten(2)) * block.scale1
-    normalized = block.norm2(hidden.float()).to(attn.to_q.weight.dtype)
-    hidden = hidden + block.ff(normalized) * block.scale2
+    if ffn is not None:
+        hidden = ffn(hidden)
+    else:
+        normalized = block.norm2(hidden.float()).to(attn.to_q.weight.dtype)
+        hidden = hidden + block.ff(normalized) * block.scale2
     if not fused:
         # Own only retained spatial history: views would retain the full cat,
         # including expired frames and the current special-token suffix.
@@ -155,3 +173,37 @@ def streaming_block(
         cached_k = all_k[:, end - keep : end].clone()
         cached_v = all_v[:, end - keep : end].clone()
     return hidden, cached_k, cached_v
+
+
+def _can_fuse_qk_norm(q, k, nq, nk):
+    if torch.compiler.is_compiling():
+        return False  # Inductor compiles the original FP32 norm expression instead.
+    return (
+        q.is_cuda
+        and q.shape == k.shape
+        and q.device == k.device
+        and q.dtype == k.dtype
+        and q.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and q.shape[-1] <= 256
+        and not torch.is_grad_enabled()
+        and all(
+            type(norm) is torch.nn.RMSNorm
+            and norm.eps is not None
+            and tuple(norm.normalized_shape) == (q.shape[-1],)
+            and getattr(norm, "bias", None) is None
+            and not norm._forward_hooks
+            and not norm._forward_pre_hooks
+            and "forward" not in norm.__dict__
+            for norm in (nq, nk)
+        )
+        and all(
+            getattr(norm, "weight", None) is None
+            or (
+                norm.weight.numel() == q.shape[-1]
+                and norm.weight.is_contiguous()
+                and norm.weight.device == q.device
+            )
+            for norm in (nq, nk)
+        )
+        and find_spec("triton") is not None
+    )

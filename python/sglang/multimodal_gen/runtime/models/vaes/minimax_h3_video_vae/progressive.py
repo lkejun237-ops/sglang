@@ -98,6 +98,14 @@ class CausalEncoderCache:
             == "1"
         )
         self.encode_mode = encode_mode
+        # Experimental execution choices are snapshotted per session, never read in kernels.
+        self.fused_norm_input = (
+            os.environ.get("MINIMAX_H3_PROGRESSIVE_FUSED_NORM_INPUT", "1") == "1"
+        )
+        self.fused_conv_input = (
+            os.environ.get("MINIMAX_H3_PROGRESSIVE_FUSED_CONV_INPUT", "1") == "1"
+        )
+        self.optimization_counts = {"norm_input": 0, "conv_input": 0, "fallback": 0}
         self.default_fallback_reason = None
         if self.requested_mode == "auto":
             # Retain the supported dtype, stack and group-size guards.
@@ -143,10 +151,49 @@ class CausalEncoderCache:
     def channels_last(self):
         return self._multi_frame_layout.channels_last
 
-    def conv(self, layer, x, states, key, layout):
+    def conv(self, layer, x, states, key, layout, *, normalization=None):
         x = layout.input(x)
         history = layer.dilation[0] * (layer.kernel_size[0] - 1)
         previous, seen = self.states.get(key, (None, 0))
+        offset = (-seen) % layer.stride[0]
+        if offset >= x.shape[2]:
+            raise ValueError("Incremental block produced no strided output")
+        if normalization is not None or self.fused_conv_input:
+            from .progressive_fusion import fused_conv_input
+
+            norm = normalization[0] if normalization is not None else None
+            assembled = fused_conv_input(
+                x,
+                previous,
+                history,
+                offset,
+                layer.padding[1:],
+                layer.pad_mode,
+                # Singleton kernel dimensions make weight strides ambiguous.
+                layout.input_memory_format == torch.channels_last_3d,
+                norm=norm,
+            )
+            if assembled is not None:
+                padded, next_history = assembled
+                states[key] = (next_history, seen + x.shape[2])
+                self.optimization_counts[
+                    "norm_input" if norm is not None else "conv_input"
+                ] += 1
+                return layout.output(
+                    F.conv3d(
+                        padded,
+                        layout.weight,
+                        layer.bias,
+                        layer.stride,
+                        0,
+                        layer.dilation,
+                        layer.groups,
+                    )
+                )
+            self.optimization_counts["fallback"] += 1
+        if normalization is not None:
+            norm, fused, normalize = normalization
+            x = layout.input(normalize(norm, x, fused))
         if previous is None:
             shape = (*x.shape[:2], history, *x.shape[3:])
             previous = layout.zeros(x, shape)
@@ -156,9 +203,6 @@ class CausalEncoderCache:
             joined[:, :, -history:].clone() if history else None,
             seen + x.shape[2],
         )
-        offset = (-seen) % layer.stride[0]
-        if offset >= x.shape[2]:
-            raise ValueError("Incremental block produced no strided output")
         padded = self._pad(
             joined[:, :, offset:],
             (
@@ -190,21 +234,32 @@ class CausalEncoderCache:
         encoder = self.model.encoder
         work = 0
 
-        def conv(layer, value, name):
+        def conv(layer, value, name, norm=None, fused=False):
             nonlocal work
             positions = value.shape[0] * value.shape[2]
             work += positions
             self.layer_work[str(name)] = self.layer_work.get(str(name), 0) + positions
-            return self.conv(layer, value, states, (key, name), layout.convs[layer])
+            normalization = None
+            if norm is not None:
+                if self.fused_norm_input:
+                    normalization = (norm, fused, layout.norm)
+                else:
+                    value = layout.norm(norm, value, fused)
+            return self.conv(
+                layer,
+                value,
+                states,
+                (key, name),
+                layout.convs[layer],
+                normalization=normalization,
+            )
 
         h = conv(encoder.conv_in, x, "in")
         for i, down in enumerate(encoder.down):
             for j, block in enumerate(down.block):
                 residual = h
-                h = layout.norm(block.norm1, h, block.use_fused_norm)
-                h = conv(block.conv1, h, (i, j, 1))
-                h = layout.norm(block.norm2, h, block.use_fused_norm)
-                h = conv(block.conv2, h, (i, j, 2))
+                h = conv(block.conv1, h, (i, j, 1), block.norm1, block.use_fused_norm)
+                h = conv(block.conv2, h, (i, j, 2), block.norm2, block.use_fused_norm)
                 if block.in_channels != block.out_channels:
                     residual = conv(block.nin_shortcut, residual, (i, j, "shortcut"))
                 h = h.add_(residual)
@@ -216,8 +271,7 @@ class CausalEncoderCache:
                     if layer.space_stride == 2:
                         h = self._pad(h, (0, 1, 0, 1, 0, 0), mode=layer.pad_mode)
                     h = conv(layer.conv, h, (i, "down"))
-        h = layout.norm(encoder.norm_out, h, encoder.use_fused_norm)
-        h = conv(encoder.conv_out, h, "out")
+        h = conv(encoder.conv_out, h, "out", encoder.norm_out, encoder.use_fused_norm)
         h = layout.output(h)
         return self.model.quant_conv(h), states, work
 
@@ -477,6 +531,11 @@ class CausalEncoderCache:
             gather_calls=int(parallel),
             gather_input_bytes=payload,
             gather_output_bytes=payload * size,
+            input_optimizations=dict(
+                fused_norm_input=self.fused_norm_input,
+                fused_conv_input=self.fused_conv_input,
+                counts=dict(self.optimization_counts),
+            ),
         )
         if self.last_execution is None:
             logger.info("Progressive encoder tile execution: %s", execution)

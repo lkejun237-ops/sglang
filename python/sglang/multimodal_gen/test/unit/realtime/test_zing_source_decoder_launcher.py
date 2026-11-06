@@ -179,9 +179,24 @@ def test_build_role_command_decoder_missing_config_rejected():
 # ==============================================================================
 
 
-def test_start_role_workers_spawns_and_sets_ports(monkeypatch):
+@pytest.mark.parametrize("override", [None, "0"])
+def test_start_role_workers_spawns_and_sets_ports(monkeypatch, override):
     launcher = _load_role_launcher()
     monkeypatch.setattr(launcher.sys, "platform", "linux")
+    encoder_flags = (
+        "MINIMAX_H3_PROGRESSIVE_FUSED_NORM_INPUT",
+        "MINIMAX_H3_PROGRESSIVE_FUSED_CONV_INPUT",
+    )
+    decoder_flags = (
+        "SGLANG_LYNN_PACKED_QKV",
+        "SGLANG_LYNN_FUSED_QK_NORM",
+        "SGLANG_LYNN_COMPILED_FFN",
+    )
+    for name in (*encoder_flags, *decoder_flags):
+        if override is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, override)
     started_processes = []
 
     def popen(command, env=None, **kwargs):
@@ -221,6 +236,11 @@ def test_start_role_workers_spawns_and_sets_ports(monkeypatch):
     )
     assert dec_info["env"]["CUDA_VISIBLE_DEVICES"] == "5"
     assert dec_info["kwargs"]["preexec_fn"] is launcher._die_with_parent
+
+    for info, flags in ((enc_info, encoder_flags), (dec_info, decoder_flags)):
+        assert {name: info["env"][name] for name in flags} == {
+            name: override or "1" for name in flags
+        }
 
     assert args.disagg_encoder_port == 31001
     assert args.disagg_decoder_port == 31003

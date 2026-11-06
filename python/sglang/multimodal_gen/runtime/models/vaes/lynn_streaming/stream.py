@@ -39,6 +39,7 @@ class LynnStream:
         if self.state is not None:
             # A failure traceback may still refer to the state after close.
             self.state.pixel_send = self.state.pixel_recv = None
+            self.state.execution_signature = None
         self.state = None
         self.closed = True
 

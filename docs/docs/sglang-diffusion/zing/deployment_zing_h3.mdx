@@ -8,6 +8,29 @@ description: "供 Codex 与部署同学使用的 H100/H200/B300 部署决策、�
 下面是已有部署经验，只有对应版本、输入和配置的实测结论；
 实验补丁、显存快照、未验收画质均单独标注。新部署先选择一行，再沿证据入口取得原配置。
 
+## VAE 可选执行优化（2026-11-03）
+
+当前 H3 渐进 Encoder 与 26 层 EMA BF16 Lynn
+默认开启 Encoder 两项融合及 Lynn QKV/QK norm/FFN，workspace/整块 CUDA Graph/compile 已移除（2026-11-05 review 收缩范围）；原权重、stable解码和逐latent输出保留。开关、职责和证据见
+[VAE执行优化方案](/docs/sglang-diffusion/zing/plans/VAE_EXECUTION_OPTIMIZATIONS)。
+
+2026-11-05，`a44609ba9893` 的 VAE 改动覆盖此前成功快照并保留 main #520 EOS 修复，
+L20Z/SM90 四卡、480、W6/S3、FA4/SP2、DiT Graph 关闭，默认五项开启的完整预热与正式请求均 360/360，prompt/EOS 通过；正式单次 18.209 FPS，RGB 与历史 r21 一致。
+2026-11-06 再次同步 main `357469e16c6e` 后，VAE 融合实现保持不变；主线新增 NCCL、prefix joint 等行为尚未在合并版本重跑 GPU，以上仅为合并前冻结快照验收。
+这是默认组合功能验收；H200/B300、736、组件性能/显存 A/B 和人工画质仍未验收。配置、源码边界和回执见 [PR #524](https://github.com/seedleap/sglang/pull/524)。
+
+以下为 P2 输入布局修复前 `5bb2967485` 加分页缓存收尾修复的历史矩阵，不作为当前版本性能结论。
+
+四卡（Encoder/Qwen 0、DiT SP2 1–2、Lynn 3）、832×480、W6/S3、FA4，无FSDP/offload。
+用户指定DiT Graph全关，Lynn Graph为矩阵轴；黄色雨衣原5图、完整360帧和两版prompt。
+8格各1预热+3正式+1诊断全部360/360，正式轮配置除7个VAE开关外一致。
+全关→联合全开：整体FPS中位18.250→18.217，首批后21.400→21.734，未显示整体吞吐提升。
+Encoder全开/Decoder块内融合的34帧组件速度比1.246×/1.170×，不叠乘成整体收益。
+历史搬运及workspace/Graph在本例完整RGB上exact；GN/联合全开相对原版PSNR28.116dB，
+Decoder块内融合/全开62.307dB，属于数值近似，人工画质未验收。
+新stream仍承担Lynn Graph捕获，整体请求保留该成本；完整矩阵、阶段/显存边界与原始证据见上述方案。
+其它硬件/布局/分辨率及完整组件CUDA归因未验收；默认开启是用户指定的部署策略，不代表已证实整体加速。
+
 ## Benchmark 留存策略更新（2026-11-05，GPU 性能未重新验证）
 
 新实验默认保留完整指标/输入输出哈希及首个正式请求的有界代表 MP4，结束后在

@@ -15,6 +15,11 @@ from diffusers.models.autoencoders.autoencoder_kl_minimax_h3 import (
 from torch import nn
 
 from .attention import ATTENTION_BACKENDS, streaming_block
+from .execution import (
+    LynnBlockExecution,
+    LynnExecutionOptions,
+    parameter_signature,
+)
 from .geometry import split_tiles, tile_shard
 from .stream import LynnStream
 from .temporal import TemporalProtocol
@@ -40,10 +45,13 @@ class StreamState(msgspec.Struct):
     pixel_recv: torch.Tensor | None = None
     # tile id -> per-layer (K before RoPE, V), each [B, history spatial tokens, heads, head_dim]
     tiles: dict = {}
+    execution_signature: tuple | None = None
 
 
 class StreamingDecoder(nn.Module):
-    def __init__(self, config: LynnDecoderConfig, architecture: dict):
+    def __init__(
+        self, config: LynnDecoderConfig, architecture: dict, *, execution_options=None
+    ):
         super().__init__()
         self.config = config
         self.architecture = a = architecture
@@ -86,6 +94,11 @@ class StreamingDecoder(nn.Module):
                 name, torch.tensor(values).view(1, -1, 1, 1, 1), persistent=False
             )
         self.attention = ATTENTION_BACKENDS[config.attention_backend]()
+        self.execution = LynnBlockExecution(
+            LynnExecutionOptions.from_env()
+            if execution_options is None
+            else execution_options
+        )
 
     @torch.no_grad()
     def warmup_preparation(self, device):
@@ -141,6 +154,7 @@ class StreamingDecoder(nn.Module):
             if isinstance(module, nn.Linear) and name != "proj_in":
                 module.to(dtype=dtype)
         self.decoder.register_tokens.data = self.decoder.register_tokens.data.to(dtype)
+        self.execution.clear()
         return self
 
     def init_stream(self):
@@ -367,6 +381,16 @@ class StreamingDecoder(nn.Module):
     def _decode_tiles(self, z_t, tile_ids, state, phase):
         """Decode `tile_ids` of the de-normalized latent; updates their K/V in `state`."""
         cfg, decoder, ratio = self.config, self.decoder, self.spatial_ratio
+        if self.execution.options.block_enabled:
+            signature = parameter_signature(self)
+            if (
+                state.execution_signature is not None
+                and state.execution_signature != signature
+            ):
+                raise ValueError(
+                    "Lynn weights or device changed during an active stream"
+                )
+            state.execution_signature = signature
         batch_size = cfg.tile_batch_size or max(1, len(tile_ids))
         video_batch, decoded = z_t.shape[0], {}
         window = self.protocol.teacher_window
@@ -458,7 +482,12 @@ class StreamingDecoder(nn.Module):
                         torch.cat([*past_positions, positions, suffix], dim=1)
                     )
                 key_rope = key_ropes[history_frames]
-                hidden, k, v = streaming_block(
+                execute = (
+                    self.execution.run
+                    if self.execution.options.block_enabled
+                    else streaming_block
+                )
+                hidden, k, v = execute(
                     block,
                     hidden,
                     history_k,

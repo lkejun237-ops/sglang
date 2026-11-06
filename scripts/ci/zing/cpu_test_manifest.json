@@ -8366,49 +8366,26 @@
       "sources": [
         "main"
       ],
-      "reason": "Two DSW CPU trials on the dedicated-decoder branch passed 906/906 across the six affected Zing files (this file 8/8 each round). Pins the single-controller contract: device split, port publication, readiness failure aborting the launch, and cleanup.",
+      "reason": "Current Linux Python 3.11 CPU trial passed; exact CUDA/Triton-only skips are allowlisted where applicable. No failures or deselections.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "87285bd8bccef1e72c93722d7bd9e7e8a83656402ad6f4d061cd5860ae03fb94",
-        "receipt": "/cpfs/world-model/sglang/decoder-split/20261022-cpu-launcher/evidence/receipt.json",
-        "receipt_sha256": "097dd51668cdf5c0fea3746856d1b4617c203021c6ea3a75d7ee1ca433dcd6b0",
+        "source_sha256": "db347f8a35440a78734f06613377ed4c469976296900ae98a90e4980c237aa03",
+        "receipt": "outputs/vae-optimizations/review-jack47-launcher/receipt.json",
+        "receipt_sha256": "5d1f4a508ca16c30f8d02d909895a3693d5fc9afd7291988636d7e21a5f9a04d",
         "trials": [
           {
             "trial": 1,
-            "passed": 8,
-            "collected": 8,
+            "passed": 27,
+            "collected": 27,
             "skipped": 0,
-            "duration_seconds": 0.023,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/decoder-split/20261022-cpu-launcher/evidence/round1.log",
-            "junit_path": "/cpfs/world-model/sglang/decoder-split/20261022-cpu-launcher/evidence/round1.xml"
-          },
-          {
-            "trial": 2,
-            "passed": 8,
-            "collected": 8,
-            "skipped": 0,
-            "duration_seconds": 0.022,
-            "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/decoder-split/20261022-cpu-launcher/evidence/round2.log",
-            "junit_path": "/cpfs/world-model/sglang/decoder-split/20261022-cpu-launcher/evidence/round2.xml"
+            "log_path": "/mnt/d/Worktrees/sglang-vae-optimizations/outputs/vae-optimizations/review-jack47-launcher/cpu-0-trial-1.log",
+            "junit_path": "/mnt/d/Worktrees/sglang-vae-optimizations/outputs/vae-optimizations/review-jack47-launcher/cpu-0-trial-1.xml"
           }
         ],
         "environment": {
-          "python": "3.11.12",
-          "torch": "2.8.0+cpu",
-          "extra_pythonpath": [
-            "tree/python",
-            "/root/py311-extra",
-            "/root/py311-av"
-          ]
-        },
-        "environment_recipe": {
-          "python_version": "3.11",
-          "requirements_sha256": {
-            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
-            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
-          }
+          "python": "3.11.15",
+          "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39"
         }
       }
     },
@@ -10958,6 +10935,370 @@
             "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
             "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
           }
+        }
+      }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py",
+      "suite": "decoder-contracts",
+      "status": "MIXED",
+      "approved": true,
+      "allowed_skips": [
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-constant-1-2-0-False-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-constant-1-2-0-False-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-constant-1-2-0-True-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-constant-1-2-0-True-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-constant-2-0-0-False-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-constant-2-0-0-False-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-constant-2-0-0-True-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-constant-2-0-0-True-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-constant-3-4-1-False-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-constant-3-4-1-False-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-constant-3-4-1-True-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-constant-3-4-1-True-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-constant-8-2-0-False-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-constant-8-2-0-False-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-constant-8-2-0-True-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-constant-8-2-0-True-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-reflect-1-2-0-False-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-reflect-1-2-0-False-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-reflect-1-2-0-True-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-reflect-1-2-0-True-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-reflect-2-0-0-False-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-reflect-2-0-0-False-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-reflect-2-0-0-True-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-reflect-2-0-0-True-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-reflect-3-4-1-False-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-reflect-3-4-1-False-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-reflect-3-4-1-True-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-reflect-3-4-1-True-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-reflect-8-2-0-False-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-reflect-8-2-0-False-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-reflect-8-2-0-True-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype0-reflect-8-2-0-True-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-constant-1-2-0-False-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-constant-1-2-0-False-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-constant-1-2-0-True-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-constant-1-2-0-True-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-constant-2-0-0-False-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-constant-2-0-0-False-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-constant-2-0-0-True-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-constant-2-0-0-True-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-constant-3-4-1-False-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-constant-3-4-1-False-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-constant-3-4-1-True-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-constant-3-4-1-True-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-constant-8-2-0-False-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-constant-8-2-0-False-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-constant-8-2-0-True-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-constant-8-2-0-True-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-reflect-1-2-0-False-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-reflect-1-2-0-False-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-reflect-1-2-0-True-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-reflect-1-2-0-True-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-reflect-2-0-0-False-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-reflect-2-0-0-False-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-reflect-2-0-0-True-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-reflect-2-0-0-True-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-reflect-3-4-1-False-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-reflect-3-4-1-False-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-reflect-3-4-1-True-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-reflect-3-4-1-True-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-reflect-8-2-0-False-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-reflect-8-2-0-False-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-reflect-8-2-0-True-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_assembly_matches_original_and_owns_cache[dtype1-reflect-8-2-0-True-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_initial_zero_history_and_temporal_norm_isolation",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_multi_partition_statistics_and_strided_views[False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_multi_partition_statistics_and_strided_views[True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_real_cuda_cnn_progressive_cache_and_retry[False-True]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_real_cuda_cnn_progressive_cache_and_retry[True-False]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_fusion.py::test_real_cuda_cnn_progressive_cache_and_retry[True-True]",
+          "reason": "Requires CUDA and Triton"
+        }
+      ],
+      "sources": [
+        "main"
+      ],
+      "reason": "Current Linux Python 3.11 CPU trial passed; exact CUDA/Triton-only skips are allowlisted where applicable. No failures or deselections.",
+      "dependencies": [
+        "torch",
+        "diffusers"
+      ],
+      "trial_evidence": {
+        "source_sha256": "2b6900fa31de2b1a19a17a605805c01170bb76d3bb2fc161743ec08cb745abce",
+        "receipt": "outputs/vae-optimizations/review-jack47-cpu/receipt.json",
+        "receipt_sha256": "89d398eb15839c24a781f37e93189ebcf3207f61adeee8014efef5ef8965be7f",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 6,
+            "collected": 76,
+            "skipped": 70,
+            "exit_code": 0,
+            "log_path": "/mnt/d/Worktrees/sglang-vae-optimizations/outputs/vae-optimizations/review-jack47-cpu/cpu-0-trial-1.log",
+            "junit_path": "/mnt/d/Worktrees/sglang-vae-optimizations/outputs/vae-optimizations/review-jack47-cpu/cpu-0-trial-1.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.15",
+          "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39"
+        }
+      }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_lynn_execution.py",
+      "suite": "decoder-contracts",
+      "status": "MIXED",
+      "approved": true,
+      "allowed_skips": [
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_lynn_execution.py::test_cuda_stream_parity_and_output_ownership[options0]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_lynn_execution.py::test_cuda_stream_parity_and_output_ownership[options1]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_lynn_execution.py::test_cuda_stream_parity_and_output_ownership[options2]",
+          "reason": "Requires CUDA and Triton"
+        }
+      ],
+      "sources": [
+        "main"
+      ],
+      "reason": "Current Linux Python 3.11 CPU trial passed; exact CUDA/Triton-only skips are allowlisted where applicable. No failures or deselections.",
+      "dependencies": [
+        "torch",
+        "diffusers"
+      ],
+      "trial_evidence": {
+        "source_sha256": "921894aa0225a13824ef7e72646a231fbc43fb43d9f8c717a305a23b21d2ed81",
+        "receipt": "outputs/vae-optimizations/review-jack47-cpu/receipt.json",
+        "receipt_sha256": "89d398eb15839c24a781f37e93189ebcf3207f61adeee8014efef5ef8965be7f",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 5,
+            "collected": 8,
+            "skipped": 3,
+            "exit_code": 0,
+            "log_path": "/mnt/d/Worktrees/sglang-vae-optimizations/outputs/vae-optimizations/review-jack47-cpu/cpu-1-trial-1.log",
+            "junit_path": "/mnt/d/Worktrees/sglang-vae-optimizations/outputs/vae-optimizations/review-jack47-cpu/cpu-1-trial-1.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.15",
+          "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39"
         }
       }
     }

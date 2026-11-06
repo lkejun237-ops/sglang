@@ -196,3 +196,9 @@ H200 FP8 组合另有三个旧 case 全程 9.897–10.493 FPS，不能视为 BF1
 不同硬件、case、source 尺寸及采样不作收益比较；一步/source480 的质量须单独验收。
 完整配置、版本、P95 和原始证据入口见
 [736p 部署性能更新](../deployment_zing_h3.mdx#736p-部署性能更新2026-10-30)。
+
+## VAE 执行默认值（2026-11-05）
+
+按用户指定，`MINIMAX_H3_PROGRESSIVE_FUSED_NORM_INPUT`、`MINIMAX_H3_PROGRESSIVE_FUSED_CONV_INPUT`、`SGLANG_LYNN_PACKED_QKV`、`SGLANG_LYNN_FUSED_QK_NORM`、`SGLANG_LYNN_COMPILED_FFN` 默认 `1`；workspace、整块 CUDA Graph/compile 的选项和生产分支已移除。显式环境变量优先，已有部署需移除旧的关闭覆盖并重启对应 worker。Lynn 显式传入 execution_options 时沿用调用者配置。
+
+这是运行默认策略，不是严格无损或整体 FPS 提升承诺。当前 P2 输入布局修复尚未重跑 GPU，历史证据及精度/硬件边界见 [VAE 执行方案](../plans/VAE_EXECUTION_OPTIMIZATIONS.md)。

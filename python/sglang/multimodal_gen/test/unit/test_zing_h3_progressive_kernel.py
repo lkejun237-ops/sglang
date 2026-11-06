@@ -21,13 +21,13 @@ def codecs():
     return make_codecs()
 
 
-def make_codecs():
+def make_codecs(*, ch_mult=(1, 1, 1)):
     torch.manual_seed(7)
     model = nn.Module()
     model.encoder = (
         EncoderFCN3D(
             ch=32,
-            ch_mult=[1, 1, 1],
+            ch_mult=ch_mult,
             space_down=[1, 1, 1],
             time_down=[1, 2, 2],
             num_res_blocks=1,

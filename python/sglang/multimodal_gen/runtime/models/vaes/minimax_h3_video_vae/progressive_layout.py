@@ -43,6 +43,7 @@ def _channels_last_norm(layer, x, fused):
 @dataclass(frozen=True)
 class ConvLayout:
     weight: torch.Tensor
+    input_memory_format: torch.memory_format
     input: Callable
     history: Callable
     zeros: Callable
@@ -78,15 +79,26 @@ def make_encoder_layout(model, *, weights=None):
             continue
         if not channels_last:
             plan = ConvLayout(
-                layer.weight, _identity, _contiguous, _native_zeros, _identity
+                layer.weight,
+                torch.contiguous_format,
+                _identity,
+                _contiguous,
+                _native_zeros,
+                _identity,
             )
         elif layer.kernel_size == (1, 1, 1) or layer in legacy:
             plan = ConvLayout(
-                layer.weight, _contiguous, _contiguous, _native_zeros, _channels_last
+                layer.weight,
+                torch.contiguous_format,
+                _contiguous,
+                _contiguous,
+                _native_zeros,
+                _channels_last,
             )
         else:
             plan = ConvLayout(
                 weights[layer],
+                torch.channels_last_3d,
                 _identity,
                 _channels_last,
                 _channels_last_zeros,
