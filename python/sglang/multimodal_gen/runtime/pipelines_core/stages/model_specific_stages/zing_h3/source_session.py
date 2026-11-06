@@ -826,6 +826,11 @@ class ZingSourceStreamState(BaseRealtimeState):
                     generation_id=batch.realtime_generation_id,
                 )
             self._fill_block0_after_output()
+            sink_command = batch.extra.get("zing_sink_update")
+            if sink_command is not None:
+                self.sampler.update_sink(
+                    sink_command["operation"], sink_command["event_id"]
+                )
             notice = None
             applied = getattr(self.sampler, "applied_prompt", None)
             if applied is not None and applied.inputs is not None:
@@ -1238,6 +1243,9 @@ class ZingSourceStreamState(BaseRealtimeState):
                     "request_id": batch.request_id,
                     "event_id": result.prompt_event_id,
                     "prompt_version": result.prompt_version,
+                    "sink_event_id": getattr(result, "sink_event_id", None),
+                    "sink_chunks": getattr(result, "sink_chunks", 0),
+                    "sink_chunk_ids": getattr(result, "sink_chunk_ids", ()),
                     "frame_end": result.provenance.pixels.end,
                 }
             )
@@ -1373,6 +1381,9 @@ class ZingSourceStreamState(BaseRealtimeState):
                             "request_id": batch.request_id,
                             "event_id": result.prompt_event_id,
                             "prompt_version": result.prompt_version,
+                            "sink_event_id": getattr(result, "sink_event_id", None),
+                            "sink_chunks": getattr(result, "sink_chunks", 0),
+                            "sink_chunk_ids": getattr(result, "sink_chunk_ids", ()),
                             "frame_end": result.provenance.pixels.end,
                         }
                     )

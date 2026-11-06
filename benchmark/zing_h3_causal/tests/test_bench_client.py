@@ -8,6 +8,25 @@ import pytest
 from bench_client import Delivery, calculate_metrics, prepare_case, summarize
 
 
+def test_sink_event_manifest_keeps_same_frame_latest_wins_order(tmp_path):
+    from continuous_source_media import load_sink_updates
+
+    path = tmp_path / "sink.json"
+    events = [
+        dict(source_frame_start=348, operation="off"),
+        dict(source_frame_start=348, operation="refresh"),
+    ]
+    path.write_text(json.dumps(events))
+    assert load_sink_updates(path) == events
+    for invalid in [
+        dict(source_frame_start=-1, operation="off"),
+        dict(source_frame_start=0, operation=[]),
+    ]:
+        path.write_text(json.dumps([invalid]))
+        with pytest.raises(ValueError):
+            load_sink_updates(path)
+
+
 def header(block=0, part=0, parts=1, frames=2):
     return {
         "format": "rgb24",

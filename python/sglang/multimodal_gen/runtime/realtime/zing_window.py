@@ -9,8 +9,14 @@ class ZingWindowPolicy:
     # None preserves the checkpoint full-history baseline.
     window_chunks: int | None = None
     sink_chunks: int = 0
+    sink_start: int = 0
+    min_chunk_id: int = 0
 
     def __post_init__(self):
+        if any(
+            type(v) is not int or v < 0 for v in (self.sink_start, self.min_chunk_id)
+        ):
+            raise ValueError("Zing sink positions must be nonnegative integers")
         if type(self.sink_chunks) is not int or self.sink_chunks < 0:
             raise ValueError("Zing sink_chunks must be a nonnegative integer")
         if self.window_chunks is None:
@@ -37,6 +43,9 @@ class ZingWindowPolicy:
     def retains(self, chunk_id: int, current_id: int) -> bool:
         """Keep fixed initial sinks and recent history; current has its own slot."""
         return self.window_chunks is None or (
-            chunk_id < self.sink_chunks
-            or chunk_id >= current_id - (self.window_chunks - self.sink_chunks - 1)
+            chunk_id >= self.min_chunk_id
+            and (
+                self.sink_start <= chunk_id < self.sink_start + self.sink_chunks
+                or chunk_id >= current_id - (self.window_chunks - self.sink_chunks - 1)
+            )
         )

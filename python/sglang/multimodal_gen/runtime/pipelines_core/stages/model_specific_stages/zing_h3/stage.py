@@ -604,7 +604,7 @@ class ZingH3GenerationStage(PipelineStage):
                 params, "zing_window_eviction_timing", "after_step0"
             ),
             window_chunks=getattr(params, "zing_window_chunks", 21),
-            sink_chunks=getattr(params, "zing_sink_chunks", 3),
+            sink_chunks=getattr(params, "zing_sink_chunks", 2),
             rope_position_mode=getattr(
                 params, "zing_rope_position_mode", "block_relative"
             ),

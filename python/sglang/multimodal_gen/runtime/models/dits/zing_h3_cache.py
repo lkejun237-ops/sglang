@@ -831,6 +831,40 @@ class ZingH3KVCache:
             self._compact_store()
             self.stats["compactions"] += 1
 
+    def update_sink(self, operation, *, current_id):
+        """Select existing clean chunks at a quiescent native block boundary."""
+        if operation not in {"off", "refresh"}:
+            raise ValueError("Sink operation must be off or refresh")
+        policy = self.window_policy
+        if policy.window_chunks is None or policy.window_chunks < 4:
+            raise ValueError("Dynamic sinks require a window of at least four chunks")
+        if (
+            self.active is not None
+            or self.pending_source is not None
+            or self.eviction_target_block is not None
+        ):
+            raise ValueError("Sink updates require a completed KV boundary")
+        if current_id != self.last_block // 2:
+            raise ValueError("Sink update does not match the next model chunk")
+        if operation == "off":
+            if not policy.sink_chunks:
+                return
+            minimum = max(
+                policy.min_chunk_id,
+                min(policy.sink_start + policy.sink_chunks, current_id),
+            )
+            self.window_policy = ZingWindowPolicy(policy.window_chunks, 0, 0, minimum)
+        else:
+            latest = self.committed[-2:]
+            if (
+                len(latest) == 2
+                and latest[1].temporal_chunk_id != latest[0].temporal_chunk_id + 1
+            ):
+                raise ValueError("Sink refresh requires consecutive recent chunks")
+            start = latest[0].temporal_chunk_id if latest else current_id
+            self.window_policy = ZingWindowPolicy(policy.window_chunks, 2, start, start)
+        self._evict_committed(2 * current_id + 2)
+
     def move_store_rows(self, spans):
         """Move live raw K/V rows left; ``spans`` are (offset, rows) in row order.
 
@@ -1738,7 +1772,25 @@ class ZingH3KVCache:
             if self.pending_source is not None:
                 source = self.pending_source
                 with torch.inference_mode(False), torch.no_grad():
-                    combined_positions = torch.cat((source.positions, chunk.positions))
+                    source_positions, target_positions = (
+                        source.positions,
+                        chunk.positions,
+                    )
+                    if source_positions.device != target_positions.device:
+                        # Graph planning keeps host metadata; a standalone eager
+                        # final can supply device positions. Reuse guarded host
+                        # copies instead of reading the device back at this edge.
+                        if (
+                            source.host_positions is not None
+                            and chunk.host_positions is not None
+                        ):
+                            source_positions = source.host_positions
+                            target_positions = chunk.host_positions
+                        else:
+                            target_positions = target_positions.to(
+                                source_positions.device
+                            )
+                    combined_positions = torch.cat((source_positions, target_positions))
                 rows = combined_positions.shape[0]
                 merged = ZingKVChunk(
                     combined_positions, block, (), frames, source.offset

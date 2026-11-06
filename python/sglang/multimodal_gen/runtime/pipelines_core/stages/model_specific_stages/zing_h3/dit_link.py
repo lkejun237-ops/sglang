@@ -277,6 +277,9 @@ class DiTInputService:
                         latent_end=result.chunk.end,
                         event_id=result.prompt_event_id,
                         prompt_version=result.prompt_version,
+                        sink_event_id=getattr(result, "sink_event_id", None),
+                        sink_chunks=getattr(result, "sink_chunks", 0),
+                        sink_chunk_ids=getattr(result, "sink_chunk_ids", ()),
                         **result.provenance.metadata(),
                     )
                     if self.decoder is not None:

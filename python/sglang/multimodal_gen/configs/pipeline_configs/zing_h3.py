@@ -86,7 +86,7 @@ class ZingH3CausalPipelineConfig(MiniMaxH3PipelineConfig):
     zing_adaln_table_max_bytes: int = 536870912
     # Realtime KV storage is sized by ServerArgs.mem_fraction_static.
     zing_kv_pool_window_chunks: int = 21
-    zing_kv_pool_sink_chunks: int = 3
+    zing_kv_pool_sink_chunks: int = 2
     zing_kv_pool_rope_position_mode: str = "block_relative"
     zing_kv_pool_rope_max_frame_gap: int = 12
     zing_kv_pool_window_eviction_timing: str = "after_step0"

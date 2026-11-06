@@ -30,7 +30,7 @@ class ZingH3SamplingParams(SamplingParams):
     zing_joint_forward: str = "cross_chunk"
     zing_window_eviction_timing: str = "after_step0"
     zing_window_chunks: int | None = 21
-    zing_sink_chunks: int = 3
+    zing_sink_chunks: int = 2
     zing_rope_position_mode: str = "block_relative"
     zing_rope_max_frame_gap: int = 12
 

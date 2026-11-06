@@ -47,6 +47,7 @@ class QueuedDiTSession:
         self.initial_received = self.eos_received = self.closed = False
         self.complete = self.in_flight = False
         self.last_event_id = None
+        self.last_sink_event_id = None
         self.state = None
         self.conditioning_notice = None
         self._admission = asyncio.Lock()
@@ -82,7 +83,34 @@ class QueuedDiTSession:
         if self.eos_received:
             raise ValueError("DiT input has ended")
         kind = message.get("type")
-        if kind in {"conditioning", "conditioning.cancel"}:
+        if kind == "sink.update":
+            if not self.initial_received or message.get("operation") not in {
+                "off",
+                "refresh",
+            }:
+                raise ValueError(
+                    "Sink update requires initialized conditioning and a valid operation"
+                )
+            event_id = message.get("event_id")
+            if (
+                type(event_id) is not int
+                or event_id < 1
+                or (
+                    self.last_sink_event_id is not None
+                    and event_id <= self.last_sink_event_id
+                )
+            ):
+                raise ValueError("DiT control events must be strictly increasing")
+            while self.control_tasks >= self.max_control_tasks:
+                await asyncio.sleep(self.queue.poll_interval_s)
+                self._open()
+            task = dict(message)
+            # Prompt encoding and sink delivery can complete in a different
+            # order. Wire admission validates global order; each pending kind
+            # independently supersedes only its own older events here.
+            self.last_sink_event_id = event_id
+            self.control_tasks += 1
+        elif kind in {"conditioning", "conditioning.cancel"}:
             cancelled = kind == "conditioning.cancel"
             if cancelled and not self.initial_received:
                 raise ValueError("Initial conditioning must precede cancellation")
@@ -218,7 +246,7 @@ class QueuedDiTSession:
     def _arrange(self, message):
         if message is not None:
             kind = message["type"]
-            if kind in {"conditioning", "conditioning.cancel"}:
+            if kind in {"conditioning", "conditioning.cancel", "sink.update"}:
                 return [message]
             if kind == "source.end":
                 self.bridge.finish()
@@ -244,7 +272,12 @@ class QueuedDiTSession:
         task = queue.popleft()
         self.in_flight = True
         try:
-            if task["type"] in {"conditioning", "conditioning.cancel"}:
+            if task["type"] == "sink.update":
+                try:
+                    self.state.update_sink(task["operation"], task["event_id"])
+                finally:
+                    self.control_tasks -= 1
+            elif task["type"] in {"conditioning", "conditioning.cancel"}:
                 try:
                     if task["type"] == "conditioning.cancel":
                         self.state.discard_pending_prompt()

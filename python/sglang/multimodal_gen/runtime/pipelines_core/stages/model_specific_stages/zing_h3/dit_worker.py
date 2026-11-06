@@ -498,7 +498,7 @@ def main():
             codecs = stage.codecs
             schedule = _source_sampling_schedule(args, profile)
             window = profile.get(
-                "source_attention_window", {"window_chunks": 21, "sink_chunks": 3}
+                "source_attention_window", {"window_chunks": 21, "sink_chunks": 2}
             )
             params = SimpleNamespace(
                 num_inference_steps=len(schedule["denoising_step_list"]),

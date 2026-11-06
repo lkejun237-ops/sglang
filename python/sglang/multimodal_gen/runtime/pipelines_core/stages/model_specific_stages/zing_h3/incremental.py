@@ -7,7 +7,7 @@ would change channel-major RNG assignment and needs a separate model contract.
 
 from collections import deque
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import NamedTuple
 
 import torch
@@ -52,6 +52,9 @@ class ChunkResult:
     provenance: Provenance | None
     prompt_event_id: int | str | None
     prompt_version: int | None = None
+    sink_event_id: int | str | None = None
+    sink_chunks: int = 0
+    sink_chunk_ids: tuple[int, ...] = ()
 
 
 class PromptSnapshot(NamedTuple):
@@ -173,6 +176,9 @@ class SourceReadySession:
             inputs.positive, initial_prompt_event_id, initial_prompt_version
         )
         self.pending_prompt = None
+        self.pending_sink = None
+        self.sink_event_id = None
+        self.epoch_chunk_base = 0
         self.applied_prompt = None
         self.restore_initial_prefix = None
         self.capture_initial_prefix = None
@@ -234,6 +240,55 @@ class SourceReadySession:
             raise ValueError("The source-ready session is closed or draining")
         self.pending_prompt = None
 
+    def update_sink(self, operation, event_id):
+        """Latest-wins intent; previously queued chunks finish under the old policy."""
+        if self.closed or self.draining:
+            raise ValueError("The source-ready session is closed or draining")
+        policy = self.sampler.window_policy
+        if (
+            operation not in {"off", "refresh"}
+            or self.plan.lengths != (3, 2)
+            or self.plan.split_first_latent
+            or policy.window_chunks is None
+            or policy.window_chunks < 4
+            or policy.sink_chunks not in (0, 2)
+            or self.audio_enabled
+        ):
+            raise ValueError(
+                "Dynamic sinks require unsplit [3,2] video, sink 0/2 and a window of at least four chunks"
+            )
+        after = (
+            self.pending[-1].chunk.chunk_id
+            if self.pending
+            else self.committed_chunk_id - 1
+        )
+        self.pending_sink = (operation, event_id, after)
+
+    def _sink_ready(self, ready):
+        return (
+            self.pending_sink is not None
+            and ready.chunk.chunk_id > self.pending_sink[2]
+        )
+
+    def _apply_pending_sink(self, ready, current):
+        if not self._sink_ready(ready):
+            return
+        sampler, cache = self.sampler, self.cache
+        sampler._agree_sp_boundary(
+            cache,
+            ready.model_chunk.target_block,
+            phase="sink_update",
+            ready_route=self.pending_sink,
+        )
+        if cache.active is not None:
+            # The latest delivered picture may still lack its clean final KV.
+            final = sampler._deferred_final(cache, self.recent_visual, current.positive)
+            sampler._forward(final, cache, "final")
+        operation, event_id, _ = self.pending_sink
+        cache.update_sink(operation, current_id=ready.model_chunk.chunk_id)
+        self.sink_event_id = event_id
+        self.pending_sink = None
+
     @property
     def prompt_switch_ready(self):
         # Repacking the last five latents as 0..4 must preserve codec phase.
@@ -246,7 +301,7 @@ class SourceReadySession:
     def _next_model_chunk(self):
         if self.pending:
             # Drain queued work before planning the first block of a new epoch.
-            if self.pending_prompt is not None:
+            if self.pending_prompt is not None or self.pending_sink is not None:
                 return None
             previous = self.pending[-1].model_chunk
             return self.plan.chunk(previous.chunk_id + 1)
@@ -282,6 +337,16 @@ class SourceReadySession:
         if self.audio_enabled:
             raise ValueError("Prompt switching currently supports video-only sessions")
         candidate = self.pending_prompt
+        policy = self.cache.window_policy
+        count = policy.sink_chunks
+        if self._sink_ready(ready):
+            operation, self.sink_event_id, _ = self.pending_sink
+            count = 2 if operation == "refresh" else 0
+            self.pending_sink = None
+        # Chunk identities restart with the prompt epoch; only the on/off state survives.
+        self.cache.window_policy = replace(
+            policy, sink_chunks=count, sink_start=0, min_chunk_id=0
+        )
         inputs = self.inputs if candidate.inputs is None else candidate.inputs
         restore_prefix = (
             None
@@ -341,6 +406,7 @@ class SourceReadySession:
             self.pending_prompt = None
         self.media_origin = origin
         self.model_chunk_id = ready.model_chunk.chunk_id
+        self.epoch_chunk_base = ready.chunk.chunk_id - ready.model_chunk.chunk_id
 
     def _load_prefix(self, inputs, prompt, prefix, *, restore_prefix=None):
         """Consume an external writer's prefix at a quiescent session boundary.
@@ -704,6 +770,7 @@ class SourceReadySession:
                 self.cache is not None and self.cache.active is not None,
                 self.prompt_joint,
                 self.prefix_loader is not None,
+                self.pending_sink,
             ),
         )
 
@@ -939,6 +1006,19 @@ class SourceReadySession:
             provenance,
             prompt.event_id,
             prompt.prompt_version,
+            self.sink_event_id,
+            self.cache.window_policy.sink_chunks,
+            tuple(
+                self.epoch_chunk_base + i
+                for i in range(
+                    self.cache.window_policy.sink_start,
+                    min(
+                        self.cache.window_policy.sink_start
+                        + self.cache.window_policy.sink_chunks,
+                        ready.model_chunk.chunk_id + 1,
+                    ),
+                )
+            ),
         )
         self._remember_visual(current.visual)
         self.pending.popleft()
@@ -963,6 +1043,7 @@ class SourceReadySession:
         prompt = self.prompt
         current, origin = self._prepare(ready, prompt, self.media_origin)
         with self.rng.random_stream(self.sampler.device, self.seed):
+            self._apply_pending_sink(ready, current)
             first = self._initial_prediction(current, prompt)
             if first is None:
                 self._apply_prefix(current, prompt)
@@ -1010,6 +1091,7 @@ class SourceReadySession:
                 ready = self.pending[0]
                 next_state = next_first = None
                 with self.rng.random_stream(sampler.device, self.seed):
+                    self._apply_pending_sink(ready, current)
                     source, target, start, end = current.spans[0]
                     graphs = getattr(sampler.generator, "chunk_graphs", None)
                     graph_eligible = graphs is not None and graphs.eligible(
@@ -1086,7 +1168,11 @@ class SourceReadySession:
                     if graph_eligible:
                         if first is None:
                             first = graphs.recovery(sampler, current)
-                        if len(self.pending) > 1 and self.pending_prompt is None:
+                        if (
+                            len(self.pending) > 1
+                            and self.pending_prompt is None
+                            and self.pending_sink is None
+                        ):
                             next_state, _ = self._prepare(
                                 self.pending[1], prompt, origin, previous=current
                             )
@@ -1108,6 +1194,7 @@ class SourceReadySession:
                             sampler.joint_forward == "cross_chunk"
                             and len(self.pending) > 1
                             and self.pending_prompt is None
+                            and self.pending_sink is None
                         )
                         video, sound = sampler._sample_block(
                             current.visual,
@@ -1249,6 +1336,7 @@ class SourceReadySession:
         self.pending_spans = 0
         self.rng.dispose()
         self.inputs = self.prompt = self.pending_prompt = self.applied_prompt = None
+        self.pending_sink = None
         self.recent_visual = self.sampler = None
         self.prefix_loader = None
         self.restore_initial_prefix = self.capture_initial_prefix = None

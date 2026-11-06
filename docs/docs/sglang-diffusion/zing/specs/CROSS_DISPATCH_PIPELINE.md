@@ -1,8 +1,13 @@
 # Issue #249：持续 source 流水线与 GPU 验收
 
-本分支隔离依赖 PR #176，冻结提交
-`8f75d4c49840c5cab4d8ab33f82ec15ddb255e79`；#176 尚未合并。
-当前 Draft PR 不满足合并准入，不自动合并。
+本文为 Issue #249 冻结版本的历史实验记录，保留当时的 W6/S3、
+`split_first_latent=true` 配置和原始测量。当前缺省窗口为 `21/2`，请求与
+KV pool 的启动 window/sink 必须一致；当前模型与动态 Sink 约束见
+[动态 Sink 规格](dynamic-window-sink.zh-CN.md)。下述历史结果不作为当前默认的验收结论。
+
+历史实验分支隔离依赖 PR #176，冻结提交
+`8f75d4c49840c5cab4d8ab33f82ec15ddb255e79`；当时 #176 尚未合并，
+该 Draft PR 不满足合并准入。下文“本轮”均指该历史实验。
 
 可信 deployment profile 的 `source_encoder.remote.cross_dispatch_prefetch=true`
 仅适用于 `mode=overlap`。API 的私有同节点 IPC 将已接受的真实 RGB 按原 packet
@@ -33,15 +38,16 @@ CPU 准备与后处理零 GPU，所有配置串行且有超时；产物保持私
 
 冻结提交 `8da62b0f39792a333e54c5f8adcfdb7a6ddefba0` 在真实双卡上完成
 480p Encoder 的 102 项 moments/latent 严格比较（atol=0、rtol=0）。
-完整 shared 基线的默认 window=21、sink=3 在 dispatch_index=10（此前已完成索引 0–9）时 OOM；
+历史 shared 基线当时默认 window=21、sink=3，在 dispatch_index=10（此前已完成索引 0–9）时 OOM；
 此前已接受 154 帧、输出 141 帧。KV 的动态存储由约 47 GiB 增至 94 GiB，
 下一次几何扩容失败；失败位于 `ZingH3KVCache._reserve_store`。
 硬件为 PyTorch 可见总显存 274,113 MiB/卡、CC 10.3。
 该失败不能记为完整视频、流水线收益或实时验收通过。
 
-可信 `zing_realtime_profile.json` 可显式指定
+该历史容量实验在可信 `zing_realtime_profile.json` 中显式指定
 `source_attention_window={"window_chunks":6,"sink_chunks":3}`，矩阵输入使用
-同名字段。未指定时仍是 21/3；客户端 window/sink 覆盖仍被拒绝。
+同名字段。该冻结版本未指定时为 21/3；当前缺省为 21/2，请求与 KV pool
+的启动 Sink 必须同步配置。客户端 window/sink 覆盖仍被拒绝。
 三个臂均使用同一个窗口，正确性、正式测量、profile 和长流的绑定包含该字段，
 不能复用不同历史覆盖的结果。6/3 是单独的容量实验，改变 retained latent
 和历史覆盖；不与默认窗口或旧分块混算，也不把这部分收益归于预取。
@@ -61,7 +67,7 @@ GPU 实现源码冻结为 `8346a674aa40ed203948a159ba66703e4bc8a473`。
 102 项 moments/latent 精确一致；shared、E1 serial、E1 overlap 各输出
 完整 720 帧，source/moments/latent/noise/DiT/Decoder/RGB 两组全链路
 比较均通过。旧分块的 480 对照也单独完成三臂严格比较。
-这些不是默认 21/3 窗口的通过结论。
+这些不是历史默认 21/3 或当前默认 21/2 窗口的通过结论。
 
 480 新分块完成三臂、满速与 24FPS paced、各五轮正式测量。
 overlap 满速/paced 中位分别 17.57/17.50 FPS，相对 serial 耗时改善

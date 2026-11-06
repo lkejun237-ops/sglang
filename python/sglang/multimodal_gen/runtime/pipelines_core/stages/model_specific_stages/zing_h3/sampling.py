@@ -71,7 +71,7 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         guidance_scale=1.0,
         window_chunks=21,
         window_eviction_timing="after_step0",
-        sink_chunks=3,
+        sink_chunks=2,
         rope_position_mode="block_relative",
         rope_max_frame_gap=12,
         joint_forward="off",
@@ -625,6 +625,9 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
             else cache.window_eviction_timing,
             "sampler_policy": self.window_eviction_timing,
             "joint_mode": self.joint_forward,
+            "sink_anchor": None
+            if cache is None
+            else (cache.window_policy.sink_start, cache.window_policy.min_chunk_id),
             "window": (
                 self.window_policy.window_chunks
                 if cache is None

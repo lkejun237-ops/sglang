@@ -53,6 +53,9 @@ class RealtimeFrameBatchHeader(TypedDict, total=False):
     payload_lengths: list[int]
     event_id: int
     prompt_version: int
+    sink_event_id: int | str | None
+    sink_chunks: int
+    sink_chunk_ids: list[int]
     frame_batch_index: int
     num_frame_batches: int
     is_final_frame_batch: bool
@@ -660,6 +663,10 @@ class RawRGBRealtimeOutputAdapter:
                     header["event_id"] = event_id
                 if block_prompt_version is not None:
                     header["prompt_version"] = block_prompt_version
+                if source_block is not None:
+                    for key in ("sink_event_id", "sink_chunks", "sink_chunk_ids"):
+                        if key in source_block:
+                            header[key] = source_block[key]
                 if trace_id:
                     header["trace_id"] = trace_id
                 header.update(transport_metadata)

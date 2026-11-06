@@ -603,6 +603,11 @@ class SourceEncoderExecutor:
                         else {}
                     ),
                 )
+            sink_command = batch.extra.get("zing_sink_update")
+            if sink_command is not None:
+                if self.dit_link is None:
+                    raise ValueError("Sink updates require a connected DiT worker")
+                send_dit("sink.update", **sink_command)
             for item in command["appends"]:
                 payload = item["payload"]
                 pixels = torch.frombuffer(bytearray(payload["data"]), dtype=torch.uint8)

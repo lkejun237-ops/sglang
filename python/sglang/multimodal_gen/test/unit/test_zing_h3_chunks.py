@@ -421,6 +421,64 @@ def test_mid_cycle_prompt_drains_old_chunk_before_replanning(
         session.dispose()
 
 
+@torch.no_grad()
+@pytest.mark.parametrize("defer_final", [False, True])
+def test_sink_refresh_waits_for_owned_queue_and_includes_deferred_last_picture(
+    model, defer_final
+):
+    packer, inputs, noise, _ = _long_request(model, [3, 2], frames=30)
+    packer.split_first_latent = False
+    sampler = ZingH3Sampler(
+        model,
+        packer,
+        solver="few_step",
+        denoising_step_list=[1000, 500],
+        window_chunks=6,
+        sink_chunks=2,
+        joint_forward="cross_chunk",
+    )
+    session = SourceReadySession(
+        sampler,
+        inputs,
+        seed=7,
+        max_pending_chunks=2,
+        max_pending_bytes=1 << 20,
+        defer_final=defer_final,
+    )
+
+    def append():
+        start = session.next_latent
+        end = start + session.next_chunk_size
+        session.append(
+            inputs.source_visual[:, :, start:end],
+            noise[:, :, start:end],
+            provenance=fixture_provenance(1, end, start, end),
+        )
+
+    try:
+        for _ in range(3):
+            append()
+            list(session.drain_ready())
+        append()
+        append()  # Both blocks already belong to the old control state.
+        session.update_sink("refresh", 17)
+        assert session.next_chunk_size is None
+        old = list(session.drain_ready())
+        assert [r.chunk.chunk_id for r in old] == [3, 4]
+        assert all(r.sink_event_id is None and r.sink_chunk_ids == (0, 1) for r in old)
+        if defer_final:
+            assert session.cache.committed[-1].temporal_chunk_id == 3
+            assert session.cache.active is not None
+        append()
+        new = list(session.drain_ready())[0]
+        assert new.sink_event_id == 17 and new.sink_chunk_ids == (3, 4)
+        assert session.pending_sink is None
+        assert [c.temporal_chunk_id for c in session.cache.committed][:2] == [3, 4]
+    finally:
+        session.dispose()
+    assert all(v == 0 for v in session.memory_snapshot().values())
+
+
 def test_prompt_switch_rejects_unsupported_prefix_geometry(model):
     packer, inputs, _, _ = _long_request(model, 5, frames=5)
     sampler = ZingH3Sampler(model, packer, sigma_points=2)

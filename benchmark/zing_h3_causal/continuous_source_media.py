@@ -17,6 +17,29 @@ def reference_payload(path, media_id):
     return dict(id=media_id, format=image_format, payload=data)
 
 
+def load_sink_updates(path):
+    if path is None:
+        return []
+    updates = json.loads(Path(path).read_text())
+    if not isinstance(updates, list):
+        raise ValueError("Sink updates must be a JSON list")
+    previous = -1
+    for update in updates:
+        if (
+            not isinstance(update, dict)
+            or set(update) != {"source_frame_start", "operation"}
+            or type(update["source_frame_start"]) is not int
+            or update["source_frame_start"] < max(0, previous)
+            or not isinstance(update["operation"], str)
+            or update["operation"] not in {"off", "refresh"}
+        ):
+            raise ValueError(
+                "Sink updates require ordered nonnegative source frames and off/refresh operations"
+            )
+        previous = update["source_frame_start"]
+    return updates
+
+
 def load_prompt_updates(path):
     """Read ordered control metadata; load image bytes only when sending an event."""
     if path is None:

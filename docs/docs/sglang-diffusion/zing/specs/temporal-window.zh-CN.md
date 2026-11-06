@@ -1,12 +1,12 @@
 # Zing temporal chunk window (#125)
 
-本次集成基于 main `f1428c6d8616cdb4bc61b6fe81e10ee571f58e21`，保留 #121 的失败关闭语义和 #126 的共享 scheduler 实现。#127 冻结分支的回滚测试属于历史证据，不作为本次验收依据。
+历史 #125 集成基于 main `f1428c6d8616cdb4bc61b6fe81e10ee571f58e21`，保留 #121 的失败关闭语义和 #126 的共享 scheduler 实现。下文验收记录保留该版本的 S3 与旧 AR `[1,2,2]` 分块配置；当前默认已按 [动态 Sink 规格](dynamic-window-sink.zh-CN.md) 更新为 S2。#127 冻结分支的回滚测试属于历史证据，不作为 #125 验收依据。
 
 ## Policy
 
-Defaults `zing_window_chunks=21`, `zing_sink_chunks=3`, `zing_rope_position_mode="block_relative"`, `zing_rope_max_frame_gap=12`: three sink chunks, seventeen recent chunks and the current chunk. A source/target/audio pair counts as one temporal chunk. Prefix/reference tokens are separate. IDs remain absolute: at chunk 21, ID 3 is evicted; at chunk 29, retained IDs are 0,1,2,12,...,29.
+Current defaults: `zing_window_chunks=21`, `zing_sink_chunks=2`, `zing_rope_position_mode="block_relative"`, `zing_rope_max_frame_gap=12`: two sink chunks, eighteen recent chunks and the current chunk. A source/target/audio pair counts as one temporal chunk. Prefix/reference tokens are separate. With fixed initial S2, IDs remain absolute: at chunk 21, ID 2 is evicted; at chunk 29, retained IDs are 0,1,11,...,29. Request and KV pool startup window/sink settings must match. Explicit deployment profiles keep their configured values, including historical S3.
 
-Both scalar 5 and repeating [1,2,2] chunk plans preserve checkpoint geometry. GPU acceptance uses [1,2,2] with the AR checkpoint; it does not establish DMD quality.
+The current model uses unsplit `[3,2]`: two adjacent chunks contain five latents. The historical GPU acceptance below uses repeating `[1,2,2]` with the AR checkpoint and window21/sink3; its counts and results are unchanged. It does not establish DMD quality or validate the current unsplit S2 configuration.
 
 ## Positions and ownership
 
@@ -18,7 +18,7 @@ Explicit reference configuration: `zing_window_chunks=null`, `zing_sink_chunks=0
 
 The incremental position grid materializes only the current span, preserving sequential FP64 rounding. Arithmetic remains O(absolute offset); this is not a constant-time infinite-session claim.
 
-History selection occurs before source execution. Any source, active, final or post-commit failure closes sampling state and disposes SourceReadySession; subsequent step, append and prompt updates are rejected. Caller RNG is preserved. Cursors advance only on success; cancellation and failure are not successful EOS.
+The historical #125 path selects history before source execution; the current default uses `after_step0` eviction. Dynamic sink changes apply at a completed native chunk boundary, as described in the dynamic Sink specification. Any source, active, final or post-commit failure closes sampling state and disposes SourceReadySession; subsequent step, append and prompt updates are rejected. Caller RNG is preserved. Cursors advance only on success; cancellation and failure are not successful EOS.
 
 | Owner | Bound |
 | --- | --- |
@@ -30,7 +30,7 @@ History selection occurs before source execution. Any source, active, final or p
 | Codec and network | Separate ownership and budgets; this feature does not prove their boundedness |
 | Finite sampler/adapter | Full finite source/noise/output/layout remain externally owned; only KV is bounded |
 
-## Acceptance
+## Historical acceptance (window21/sink3, AR [1,2,2])
 
 CPU 回归作业 `dlcxscv0qxiq0yc8`：325 passed，21.83 秒。代码固定为 `13f3ccb53b1a70aab6f8c9e2442d7506d451f4f0`。日志已从 OSS 回读，SHA256 为 `e67821b79a7d893606c9a246237c740bfe470dd6f20278bdaace30488aea457e`。
 

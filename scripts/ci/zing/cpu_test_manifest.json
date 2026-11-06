@@ -5661,7 +5661,16 @@
       "suite": "dit-pipeline-contracts",
       "status": "CPU_PASS",
       "approved": true,
-      "allowed_skips": [],
+      "allowed_skips": [
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_window.py::test_graph_source_metadata_merges_with_device_final[cuda-False]",
+          "reason": "CUDA"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_window.py::test_graph_source_metadata_merges_with_device_final[cuda-True]",
+          "reason": "CUDA"
+        }
+      ],
       "sources": [
         "main"
       ],

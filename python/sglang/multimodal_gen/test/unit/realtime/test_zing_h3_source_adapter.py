@@ -135,6 +135,43 @@ class PromptSocket:
         self.messages.append(msgspec.msgpack.decode(raw))
 
 
+def test_sink_events_are_latest_wins_without_overwriting_prompt(configured):
+    _enable_reference_updates(configured, split=False)
+    adapter, session = initialize()
+    assert adapter.ready["sink_updates"]
+    assert adapter.ready["input_budget"] == adapter.input_budget.metadata()
+    ws = PromptSocket()
+
+    async def run():
+        await adapter.ingest_wire_event(
+            ws,
+            session,
+            dict(type="event", kind="prompt", event_id=1, payload="new prompt"),
+            100,
+        )
+        for event_id, operation in [(2, "off"), (3, "refresh")]:
+            await adapter.ingest_wire_event(
+                ws,
+                session,
+                dict(
+                    type="event",
+                    kind="sink." + operation,
+                    event_id=event_id,
+                    payload={},
+                ),
+                100,
+            )
+        assert adapter._pending_prompt_command == dict(prompt="new prompt", event_id=1)
+        assert adapter._pending_sink_command == dict(operation="refresh", event_id=3)
+        assert session.request.prompt == "Render snow"
+        assert ws.messages[-1]["stage"] == "accepted"
+        # ACK does not claim that a generated block already uses the new sink.
+        assert adapter.ledger.event_id == 3
+        await adapter.close_conditioning(session)
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("split", [False, True])
 def test_reference_capability_requires_supported_deployment(configured, split):
     adapter, _ = initialize()
@@ -727,7 +764,7 @@ def test_window_is_frozen_from_deployment_only(configured, monkeypatch, window):
         SimpleNamespace(prompt="original prompt"),
         17,
     )
-    expected = window or {"window_chunks": 21, "sink_chunks": 3}
+    expected = window or {"window_chunks": 21, "sink_chunks": 2}
     assert params.zing_window_chunks == expected["window_chunks"]
     assert params.zing_sink_chunks == expected["sink_chunks"]
     with pytest.raises(ValueError):

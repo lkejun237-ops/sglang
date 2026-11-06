@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.streaming_noise import (
     indexed_video_noise,
 )
+from sglang.multimodal_gen.runtime.realtime.zing_window import ZingWindowPolicy
 from sglang.multimodal_gen.test.unit.test_zing_h3_chunks import (
     _long_request,
     fixture_provenance,
@@ -75,6 +76,51 @@ def test_reference_payload_is_atomic_bounded_and_snapshotted(model):
         task = h.worker.queue.popleft()
         assert torch.all(task["inputs"]["visual"]["r"] == 1)
         h.worker.close()
+
+    asyncio.run(run())
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("model", ["cpu"], indirect=True)
+def test_external_sink_control_and_prompt_share_the_original_session(model):
+    h = Harness(model, frames=15, joint_forward="cross_chunk")
+    h.packer.split_first_latent = False
+    h.bridge.plan = h.packer.chunk_plan
+    original = h.sampler
+
+    def sampler():
+        value = original()
+        value.window_policy = ZingWindowPolicy(6, 2)
+        return value
+
+    h.sampler = sampler
+
+    async def run():
+        await h.prompt(10)
+        await h.drain_ready()
+        for start, end in [(0, 3), (3, 5)]:
+            await h.source(start, end)
+            await h.drain_ready()
+        await h.prompt(12)
+        await h.put("sink.update", operation="off", event_id=11)
+        await h.drain_ready()
+        await h.source(5, 8)
+        await h.drain_ready()
+        result = h.results[-1]
+        assert (result.prompt_event_id, result.sink_event_id, result.sink_chunks) == (
+            12,
+            11,
+            0,
+        )
+        await h.put("sink.update", operation="refresh", event_id=13)
+        await h.drain_ready()
+        await h.source(8, 10)
+        await h.drain_ready()
+        result = h.results[-1]
+        assert (result.sink_event_id, result.sink_chunk_ids) == (13, (1, 2))
+        assert h.worker.control_tasks == h.worker.condition_bytes == 0
+        h.worker.close()
+        assert h.worker.state.closed
 
     asyncio.run(run())
 

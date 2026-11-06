@@ -22,6 +22,8 @@ from .zing_h3_source_adapter import ZingH3SourceStreamAdapter
 
 
 class ZingSourceEncoderAdapter(ZingH3SourceStreamAdapter):
+    supports_sink_updates = False
+
     def _initialize_source_admission(self, session, limits):
         # Inputs already belong to this process; remote prefetch IPC would
         # duplicate delivery and wait for a peer which does not exist here.
@@ -87,7 +89,10 @@ class ZingSourceEncoderAdapter(ZingH3SourceStreamAdapter):
         # After S0 has initialized Qwen, a prompt event can run even while the
         # source producer is idle. The original adapter keeps its own policy.
         return (
-            self._pending_prompt_command is not None
+            (
+                self._pending_prompt_command is not None
+                or getattr(self, "_pending_sink_command", None) is not None
+            )
             and self.dispatched_source_frames > 0
             and not self.end_dispatched
         )

@@ -8,6 +8,8 @@ description: "供 Codex 与部署同学使用的 H100/H200/B300 部署决策、�
 下面是已有部署经验，只有对应版本、输入和配置的实测结论；
 实验补丁、显存快照、未验收画质均单独标注。新部署先选择一行，再沿证据入口取得原配置。
 
+2026-11-03 动态 Sink 实现基于 `0a4623e129`：缺省 Sink 对齐为两个原生块（unsplit `[3,2]` 下为 5 latent）。显式历史 profile 的 S3 保持原值；启用 `sink.off` / `sink.refresh` 需将 profile 与 KV pool 的启动 Sink 同设为 2（或以 off 启动时同设为 0），并满足 W≥4。仅调整策略与压紧已有 KV，允许在边界单独完成 deferred final，相关停顿和 forward 调用需实测。W6/S2 的 `after_step0` 预分配峰值不因锚点减少而自动下降，不能据此声称解决 736 OOM。冻结运行版本 `d87d75fb16` 已完成 H100 SP2 eager 与 B300 SP1 的 832×480 / 1280×736 功能验证（B300 480 开启 Graph、736 采用 eager）；单次 off/refresh 各多 1 次 deferred-final forward，source/prefix 计算次数不增加。完整产品性能矩阵未测；2026-11-06 整合 `main@b9e4bc95fc`（含共享静态 KV 容量、独立服务收尾及 VAE 优化）后的 sink 组合尚未重跑 GPU，CPU 集成回归以本次提交的 PR checks 为准。源码身份、原始回执、视频及显存口径见 [动态 Sink 验收记录](specs/dynamic-window-sink.validation.zh-CN.md)。
+
 ## VAE 可选执行优化（2026-11-03）
 
 当前 H3 渐进 Encoder 与 26 层 EMA BF16 Lynn

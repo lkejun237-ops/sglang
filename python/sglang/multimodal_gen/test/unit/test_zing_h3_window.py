@@ -20,6 +20,136 @@ def test_invalid_window(window, sink):
         ZingWindowPolicy(window, sink)
 
 
+@torch.no_grad()
+def test_sink_refresh_and_off_preserve_real_source_target_rows():
+    plan = ChunkPlan([3, 2], False)
+    cache = ZingH3KVCache(
+        1, window_policy=ZingWindowPolicy(5, 2), window_eviction_timing="after_step0"
+    )
+    for i in range(10):
+        _commit(cache, plan.chunk(i), delayed=True)
+    cache.update_sink("refresh", current_id=10)
+    assert [c.temporal_chunk_id for c in cache.committed] == [8, 9]
+    assert sum(c.frames for c in cache.committed) == 5
+    for chunk in cache.committed:
+        k, v = chunk.layers[0]
+        assert k.shape[0] == 4  # Both source and target survived compaction.
+        assert (k == chunk.temporal_chunk_id).all()
+        assert (v == 0).all()
+    for i in (10, 11, 12):
+        _commit(cache, plan.chunk(i), delayed=True)
+    assert [c.temporal_chunk_id for c in cache.committed] == [8, 9, 10, 11, 12]
+    cache.update_sink("off", current_id=13)
+    assert [c.temporal_chunk_id for c in cache.committed] == [10, 11, 12]
+    for i in (13, 14):
+        _commit(cache, plan.chunk(i), delayed=True)
+    assert [c.temporal_chunk_id for c in cache.committed] == [10, 11, 12, 13, 14]
+    _commit(cache, plan.chunk(15), delayed=True)
+    assert [c.temporal_chunk_id for c in cache.committed] == [11, 12, 13, 14, 15]
+    before = cache.committed.copy()
+    cache.update_sink("off", current_id=16)
+    assert cache.committed == before
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("count", [0, 1, 2])
+def test_sink_refresh_before_history_fills(count):
+    plan = ChunkPlan([3, 2], False)
+    cache = ZingH3KVCache(
+        1, window_policy=ZingWindowPolicy(5, 0), window_eviction_timing="after_step0"
+    )
+    for i in range(count):
+        _commit(cache, plan.chunk(i), delayed=True)
+    cache.update_sink("refresh", current_id=count)
+    assert cache.window_policy == ZingWindowPolicy(5, 2)
+    for i in range(count, 9):
+        _commit(cache, plan.chunk(i), delayed=True)
+    assert [c.temporal_chunk_id for c in cache.committed] == [0, 1, 6, 7, 8]
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("pooled", [False, True])
+@pytest.mark.parametrize(
+    "metadata_device",
+    [
+        "meta",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA"),
+        ),
+    ],
+)
+def test_graph_source_metadata_merges_with_device_final(pooled, metadata_device):
+    from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+        allocate_layer_stores,
+    )
+
+    storage = (
+        allocate_layer_stores(
+            8,
+            num_layers=1,
+            local_heads=1,
+            head_dim=2,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        if pooled
+        else None
+    )
+    cache = ZingH3KVCache(
+        1,
+        storage=storage,
+        window_policy=ZingWindowPolicy(5, 2),
+        window_eviction_timing="after_step0",
+    )
+    positions = torch.tensor([[0, 0, 0], [1, 0, 0]], dtype=torch.float64)
+    source, target = torch.full((2,), 1), torch.full((2,), 2)
+
+    def layers(k, v):
+        return (
+            (
+                torch.full((2, 1, 2), k, dtype=torch.float32),
+                torch.full((2, 1, 2), v, dtype=torch.float32),
+            ),
+        )
+
+    cache.begin_chunk(2)
+    cache.update(
+        positions, source, "source", 2, layers(1.0, 2.0), validation=(positions, source)
+    )
+    # Meta makes an accidental device read fail on CPU CI. Production supplies
+    # CUDA positions here after the preceding source was published by a graph.
+    device_positions = positions.to(metadata_device)
+    cache.update(device_positions, target, "active", 2, validation=(positions, target))
+    cache.complete_step0_and_evict(2)
+    cache.update(
+        device_positions,
+        target,
+        "final",
+        2,
+        layers(3.0, 4.0),
+        validation=(positions, target),
+    )
+    chunk = cache.committed[0]
+    expected_positions = torch.cat((positions, positions))
+    assert torch.equal(chunk.positions, expected_positions)
+    assert torch.equal(chunk.host_positions, expected_positions)
+    k, v = chunk.layers[0]
+    assert torch.equal(k[:, 0, 0], torch.tensor([1.0, 1.0, 3.0, 3.0]))
+    assert torch.equal(v[:, 0, 0], torch.tensor([2.0, 2.0, 4.0, 4.0]))
+    cache.update_sink("refresh", current_id=1)
+    assert cache.committed == [chunk]
+    cache.update_sink("off", current_id=1)
+    assert not cache.committed and cache.pending_source is None and cache.active is None
+
+
+@pytest.mark.parametrize("field", ["sink_start", "min_chunk_id"])
+@pytest.mark.parametrize("value", [-1, True, 0.5])
+def test_sink_anchor_metadata_requires_nonnegative_integers(field, value):
+    with pytest.raises(ValueError):
+        ZingWindowPolicy(5, 2, **{field: value})
+
+
 def _commit(cache, chunk, *, delayed=False):
     n = chunk.end - chunk.start
     # Fractional visual positions and interleaved audio rows remain absolute.

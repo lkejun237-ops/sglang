@@ -134,6 +134,25 @@ JSON 的正式字段为 `prompt_switch_ttff_ms`（此前名为 `prompt_update_la
 无更新时分布样本数为 0，不代表零延迟。HTML 保留正式轮的逐事件状态，包括失败会话。
 旧报告仍可按逐事件 `latency_ms` 展示相同计时口径。
 
+## Sink 切换回执
+
+连续 source 入口使用 `bench_streaming_source.py --sink-updates sink.json`，可同时传
+`--prompt-updates`。例如：
+
+```json
+[{"source_frame_start":348,"operation":"off"},{"source_frame_start":480,"operation":"refresh"}]
+```
+
+帧位置表示客户端提交 source 的发送边界；实际生效以输出 header 的 `sink_event_id`
+为准。部署通过 ready 的 `sink_updates` 声明支持；ACK 的 `accepted` 只表示已接纳。
+同一 source 帧可安排多个操作，尚未生效的操作采用 latest-wins。
+
+每次请求目录的 `sink-updates.json` 保存发送位置、实际生效的 `output_frame_start`、
+`sink_chunks`、全局 `sink_chunk_ids` 及 `applied / superseded / not_observed / interrupted`
+状态；`events.jsonl` 中的输出 `source_alignment` 可用于回查被选中块对应的原视频区间。
+失败请求也保留已发送操作的回执。完整行为约定见
+[动态 Sink 设计](../../docs/docs/sglang-diffusion/zing/specs/dynamic-window-sink.zh-CN.md)。
+
 ## 当前默认采样口径
 
 新测试统一使用 **前三个 target block 各四步 `[1000,750,500,250]`，后续每个

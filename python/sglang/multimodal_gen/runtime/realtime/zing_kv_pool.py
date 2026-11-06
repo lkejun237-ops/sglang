@@ -177,7 +177,7 @@ class ZingKVPoolConfig:
     max_target_area: int = 1280 * 736
     max_target_long_edge: int = 1280
     window_chunks: int = 21
-    sink_chunks: int = 3
+    sink_chunks: int = 2
     rope_position_mode: str = "block_relative"
     rope_max_frame_gap: int = 12
     window_eviction_timing: str = "after_step0"

@@ -144,6 +144,8 @@ def _source_sampling_schedule(args, profile):
 
 
 class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
+    supports_sink_updates = True
+
     def create_state(self):
         return None  # Initialized atomically after negotiation validation.
 
@@ -154,6 +156,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         self._pending_reference_upload = None
         self._inflight_reference_uploads = []
         self._pending_prompt_command = self._selected_prompt_command = None
+        self._pending_sink_command = None
         self.prompt_prefetch = None
         self.conditioning_prefetch_endpoint = None
         self.initial_prompt = request.prompt
@@ -307,7 +310,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         )
         # Only the server deployment profile selects the window; clients cannot override 21/3.
         window = profile.get(
-            "source_attention_window", {"window_chunks": 21, "sink_chunks": 3}
+            "source_attention_window", {"window_chunks": 21, "sink_chunks": 2}
         )
         require(
             isinstance(window, dict)
@@ -319,6 +322,13 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             "The deployed model is not configured for streaming.",
         )
         self.source_attention_window = dict(window)
+        self.sink_updates = (
+            self.supports_sink_updates
+            and self.joint_plan.lengths == (3, 2)
+            and not self.joint_plan.split_first_latent
+            and window["window_chunks"] >= 4
+            and window["sink_chunks"] in (0, 2)
+        )
         source = getattr(request, "source_stream", None)
         target_width, target_height = map(int, request.size.split("x"))
         fps = int(runtime["h3_media_config"]["fps"])
@@ -566,6 +576,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             "max_pending_source_frames": limits.pending_frames,
             "max_pending_source_bytes": limits.pending_bytes,
             "max_references": self.max_references,
+            "sink_updates": self.sink_updates,
             "input_budget": self.input_budget.metadata(),
             "prompt_reference_updates": self.reference_updates,
             "max_reference_bytes": reference_limits.reference_bytes,
@@ -689,9 +700,29 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             self.available.set()
         elif kind == "prompt":
             await self._ingest_prompt_event(ws, session, data, event_id, payload)
+        elif kind in {"sink.off", "sink.refresh"}:
+            require(self.sink_updates, "This deployment does not support sink updates.")
+            require(payload == {}, "Please send an empty sink update payload.")
+            self.ledger.validate_event_id(event_id)
+            require(not self.ledger.ended, "The source stream has ended.")
+            self.ledger.event_id = event_id
+            self._pending_sink_command = dict(
+                operation=kind.split(".")[1], event_id=event_id
+            )
+            self.available.set()
+            await ws.send_bytes(
+                msgspec.msgpack.encode(
+                    dict(
+                        type="control_ack",
+                        kind=kind,
+                        event_id=event_id,
+                        stage="accepted",
+                    )
+                )
+            )
         else:
             raise ValueError(
-                "This session supports source frames and prompt updates only."
+                "This session supports source frames, prompt and sink updates only."
             )
         session.mark_client_activity()
         return True
@@ -784,7 +815,11 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             )
 
     def has_control_work(self):
-        return False
+        return (
+            getattr(self, "_pending_sink_command", None) is not None
+            and self.dispatched_source_frames > 0
+            and not self.end_dispatched
+        )
 
     async def wait_for_next_chunk(self, session):
         # The first accepted frame supplies Qwen's source presentation;
@@ -814,7 +849,10 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                 if self.ledger.closed:
                     reason = "cancelled"
                     raise asyncio.CancelledError("Source session has closed")
-                if self._pending_prompt_command is not None:
+                if (
+                    self._pending_prompt_command is not None
+                    or getattr(self, "_pending_sink_command", None) is not None
+                ):
                     reason = "prompt"
                     break
                 if self.end is not None:
@@ -1032,6 +1070,9 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
 
     def prepare_next_request(self, session, server_args, chunk):
         batch = super().prepare_next_request(session, server_args, chunk)
+        if getattr(self, "_pending_sink_command", None) is not None:
+            batch.extra["zing_sink_update"] = self._pending_sink_command
+            self._pending_sink_command = None
         if self._selected_prompt_command is not None:
             batch.extra["zing_prompt_update"] = self._selected_prompt_command
             self._selected_prompt_command = None
@@ -1180,6 +1221,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             self.pending.clear()
             self.available.set()
             self._pending_prompt_command = self._selected_prompt_command = None
+            self._pending_sink_command = None
             self.reference_items.clear()
             self.reference_ids.clear()
             self.source_preview_sha256 = None

@@ -1158,6 +1158,8 @@ def _run_ready_chunks(
     use_step=False,
     reference=False,
     split_first_latent=True,
+    sink_updates=None,
+    sink_trace=None,
 ):
     """Exercise the production streaming iterator, including source pauses."""
     from sglang.multimodal_gen.runtime.models.dits import zing_h3_denoise_graph
@@ -1199,8 +1201,8 @@ def _run_ready_chunks(
             if initial_steps is not None
             else STEPS
         ),
-        window_chunks=3,
-        sink_chunks=1,
+        window_chunks=6 if sink_updates else 3,
+        sink_chunks=2 if sink_updates else 1,
         window_eviction_timing="after_step0",
         rope_position_mode="block_relative",
         joint_forward=joint_forward,
@@ -1241,6 +1243,9 @@ def _run_ready_chunks(
     events = []
     try:
         for batch_index, count in enumerate(batches):
+            if sink_updates and batch_index in sink_updates:
+                for operation in sink_updates[batch_index]:
+                    session.update_sink(operation, 200 + batch_index)
             if prompt_updates and batch_index in prompt_updates:
                 size = prompt_updates[batch_index]
                 session.update_prompt(
@@ -1272,6 +1277,17 @@ def _run_ready_chunks(
                     else session.drain_ready()
                 )
                 for result in drain:
+                    if sink_trace is not None:
+                        sink_trace.append(
+                            (
+                                result.chunk.start,
+                                result.chunk.end,
+                                result.prompt_event_id,
+                                result.sink_event_id,
+                                result.sink_chunks,
+                                result.sink_chunk_ids,
+                            )
+                        )
                     outputs.append(result.visual.clone())
                     events.append(result.prompt_event_id)
                     cache = session.cache
@@ -1319,6 +1335,114 @@ def _run_ready_chunks(
     finally:
         session.dispose()
     return torch.cat(outputs, 2), snapshots, rng_states, boundary, graphs, events
+
+
+@pytest.mark.parametrize("defer_final", [False, True])
+def test_sink_controls_mix_with_prompt_cross_chunk_and_graph_replay(
+    model, monkeypatch, defer_final
+):
+    options = dict(
+        batches=(1,) * 18,
+        known_eos=False,
+        split_first_latent=False,
+        defer_final=defer_final,
+        sink_updates={
+            3: ["off"],
+            5: ["refresh"],
+            8: ["refresh", "off"],
+            10: ["refresh"],
+            13: ["off"],
+        },
+        prompt_updates={3: 9, 8: 9, 13: 9},
+    )
+    trace = []
+    serial = _run_ready_chunks(model, monkeypatch, sink_trace=trace, **options)
+    recorded = []
+    fixed = _run_ready_chunks(
+        model, monkeypatch, backend="eager", sink_trace=recorded, **options
+    )
+    backend = RecordingGraphBackend()
+    replay_trace = []
+    replay = _run_ready_chunks(
+        model, monkeypatch, backend=backend, sink_trace=replay_trace, **options
+    )
+    assert trace == recorded == replay_trace
+    torch.testing.assert_close(serial[0], fixed[0], rtol=0.02, atol=0.02)
+    assert torch.equal(fixed[0], replay[0])
+    for a, b in zip(fixed[2], replay[2], strict=True):
+        assert (a is None and b is None) or torch.equal(a, b)
+    # At latent 8 the prompt is not ready, but off must already take effect.
+    assert trace[3][0:5] == (8, 10, None, 203, 0)
+    assert trace[4][2] == 103
+    # Refresh at the next complete boundary includes the latest generated block.
+    assert trace[5][3:] == (205, 2, (3, 4))
+    # Latest-wins off remains off through the following prompt epoch reset.
+    assert trace[8][3:] == (208, 0, ())
+    assert trace[9][4:] == (0, ())
+    assert trace[10][3:] == (210, 2, (8, 9))
+    assert trace[13][3:] == (213, 0, ())
+
+
+@pytest.mark.parametrize("operation", ["off", "refresh"])
+@pytest.mark.parametrize("use_step", [False, True])
+def test_sink_before_first_chunk_preserves_initial_prefix_joint(
+    model, monkeypatch, operation, use_step
+):
+    options = dict(
+        batches=(1, 1, 1),
+        split_first_latent=False,
+        sink_updates={0: [operation]},
+        use_step=use_step,
+    )
+    monkeypatch.setenv("SGLANG_ZING_INITIAL_PREFIX_JOINT", "0")
+    expected_trace = []
+    expected = _run_ready_chunks(
+        model, monkeypatch, sink_trace=expected_trace, **options
+    )
+    monkeypatch.setenv("SGLANG_ZING_INITIAL_PREFIX_JOINT", "1")
+    metrics = []
+
+    def observe(session, *_):
+        if session.sampler is not None:
+            metrics.append(dict(session.sampler._forward_counts))
+
+    actual_trace = []
+    actual = _run_ready_chunks(
+        model,
+        monkeypatch,
+        sink_trace=actual_trace,
+        yield_hook=observe,
+        **options,
+    )
+    assert actual_trace == expected_trace
+    assert actual_trace[0][3:] == (
+        200,
+        0 if operation == "off" else 2,
+        () if operation == "off" else (0,),
+    )
+    assert metrics[-1]["initial_joint"] == 1 and metrics[-1]["prefix"] == 0
+    torch.testing.assert_close(actual[0], expected[0], rtol=0.02, atol=0.02)
+    for got, want in zip(actual[1], expected[1], strict=True):
+        assert got[0] == want[0]
+        assert [(c[0], c[1]) for c in got[1]] == [(c[0], c[1]) for c in want[1]]
+        for (gk, gv), (wk, wv) in zip(got[2], want[2], strict=True):
+            torch.testing.assert_close(gk, wk, rtol=0.02, atol=0.02)
+            torch.testing.assert_close(gv, wv, rtol=0.02, atol=0.02)
+
+
+def test_sink_cross_chunk_queue_drains_before_refresh(model, monkeypatch):
+    trace = []
+    _run_ready_chunks(
+        model,
+        monkeypatch,
+        batches=(2,) * 9,
+        known_eos=False,
+        split_first_latent=False,
+        sink_updates={2: ["refresh"], 4: ["off"]},
+        sink_trace=trace,
+    )
+    assert trace[4][3:] == (202, 2, (2, 3))
+    assert trace[8][3:] == (204, 0, ())
 
 
 def test_source_ready_whole_chunk_three_routes_replay_and_match_eager(
@@ -3166,3 +3290,35 @@ def test_unsplit_prompt_prefix_joins_both_history_blocks(model, monkeypatch, cac
     assert metrics[-1]["forward_counts"]["prompt_joint"] == 2
     if cached:
         assert receipts
+
+
+def test_sink_controls_preserve_cached_prompt_prefix(model, monkeypatch):
+    options = dict(
+        batches=(1,) * 8,
+        prompt_updates={3: 9, 5: 6},
+        sink_updates={1: ["off"], 3: ["refresh"], 5: ["off"]},
+        split_first_latent=False,
+        defer_final=True,
+        prompt_joint=True,
+    )
+    expected_trace = []
+    expected = _run_ready_chunks(
+        model, monkeypatch, backend="eager", sink_trace=expected_trace, **options
+    )
+    actual_trace, receipts, metrics = [], [], []
+    actual = _run_ready_chunks(
+        model,
+        monkeypatch,
+        backend=RecordingGraphBackend(),
+        prefix_loader_factory=_cached_prefix_writer(receipts),
+        sink_trace=actual_trace,
+        yield_hook=lambda session, drain, count: metrics.append(session.metrics),
+        **options,
+    )
+    assert actual_trace == expected_trace
+    torch.testing.assert_close(actual[0], expected[0], rtol=1e-5, atol=1e-6)
+    assert [row[0] for row in receipts] == [None, 103, 105]
+    assert metrics[-1]["cached_prefix_hits"] == 3
+    assert metrics[-1]["forward_counts"]["prefix"] == 0
+    assert actual_trace[3][3:] == (203, 2, (1, 2))
+    assert actual_trace[6][2:5] == (105, 205, 0)

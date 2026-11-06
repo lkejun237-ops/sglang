@@ -1,6 +1,6 @@
 # Zing temporal chunk 与 full-history 状态接口
 
-> 当前默认已改为 21-chunk window（3 sink）与 block_relative RoPE，详见 [窗口配置](temporal-window.zh-CN.md)。本文 full-history 数值参考需显式设置 `zing_window_chunks=null, zing_sink_chunks=0, zing_rope_position_mode="absolute"`；下述历史验收不代表相对 RoPE 已通过。
+> 当前默认是 21-chunk window（2 sink）与 block_relative RoPE，请求与 KV pool 的启动 window/sink 必须一致，详见 [窗口配置](temporal-window.zh-CN.md)。本文 full-history 数值参考需显式设置 `zing_window_chunks=null, zing_sink_chunks=0, zing_rope_position_mode="absolute"`；下述历史验收保留原版本与分块配置，不作为当前 unsplit `[3,2]` / S2 的验收结论，也不代表相对 RoPE 已通过。
 
 这是 #113 的 worker 接口与后续集成约束，不是已上线的 v1 source-stream 能力。
 保留 #103 的有限视频生产路径；新的 `SourceReadySession` 只接受冻结 latent/noise，

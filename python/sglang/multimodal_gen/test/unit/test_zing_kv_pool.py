@@ -48,7 +48,7 @@ def _request(h=480, w=832, *, source=True, prefix=1000, **overrides):
         source_shape=(h, w) if source else None,
         prefix_rows=prefix,
         window_chunks=21,
-        sink_chunks=3,
+        sink_chunks=2,
         rope_position_mode="block_relative",
         rope_max_frame_gap=12,
     )

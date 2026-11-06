@@ -24,7 +24,11 @@ import websockets
 from bench_client import calculate_metrics, distribution
 from benchmark_artifacts import TIMING_SCOPE, MediaCapture, check_retention
 from continuous_source_input import open_source, source_dimensions
-from continuous_source_media import load_prompt_updates, reference_payload
+from continuous_source_media import (
+    load_prompt_updates,
+    load_sink_updates,
+    reference_payload,
+)
 from decoder_output_client import (
     ThreadCredit,
     consume_source_credit,
@@ -141,6 +145,8 @@ async def exchange(
         else CLIENT_TIMING
     )
     prompt_updates = deque(load_prompt_updates(args.prompt_updates))
+    sink_updates = deque(load_sink_updates(getattr(args, "sink_updates", None)))
+    sink_results = {}
     message_budget = getattr(args, "max_message_bytes", DEFAULT_MESSAGE_BYTES)
     SourceTransportBudget(message_bytes=message_budget)
     source_width, source_height = source_dimensions(args)
@@ -309,6 +315,8 @@ async def exchange(
         elif decoder_url:
             raise ValueError("The service did not negotiate direct Decoder output")
         record("ready", message=ready)
+        if sink_updates and not ready.get("sink_updates"):
+            raise ValueError("The service did not negotiate sink updates")
         needs_reference_updates = any(
             "references" in update for update in prompt_updates
         )
@@ -401,6 +409,26 @@ async def exchange(
                         reference_assets=reference_assets,
                     )
                     await send(event)
+                while (
+                    sink_updates
+                    and sink_updates[0]["source_frame_start"] == state["submitted"]
+                ):
+                    update = sink_updates.popleft()
+                    state["event_id"] += 1
+                    event = dict(
+                        type="event",
+                        kind="sink." + update["operation"],
+                        event_id=state["event_id"],
+                        payload={},
+                    )
+                    sink_results[event["event_id"]] = dict(
+                        update,
+                        event_id=event["event_id"],
+                        status="pending",
+                        submitted_seconds=time.monotonic() - started,
+                    )
+                    record("sink_send", **sink_results[event["event_id"]])
+                    await send(event)
                 count = min(
                     packet_frames,
                     args.batch_pattern[pattern_index % len(args.batch_pattern)],
@@ -409,6 +437,11 @@ async def exchange(
                     count = min(
                         count,
                         prompt_updates[0]["source_frame_start"] - state["submitted"],
+                    )
+                if sink_updates:
+                    count = min(
+                        count,
+                        sink_updates[0]["source_frame_start"] - state["submitted"],
                     )
                 pattern_index += 1
                 data = await read_source(count * frame_bytes)
@@ -510,6 +543,8 @@ async def exchange(
             expected = getattr(args, "expected_frames", None)
             if prompt_updates:
                 raise ValueError("Source ended before all scheduled prompt updates")
+            if sink_updates:
+                raise ValueError("Source ended before all scheduled sink updates")
             if state["submitted"] == 0 or (
                 expected is not None and state["submitted"] != expected
             ):
@@ -635,6 +670,21 @@ async def exchange(
                         wire_received = time.monotonic()
                     now = time.monotonic()
                     start, count = message["output_frame_start"], message["num_frames"]
+                    sink = sink_results.get(message.get("sink_event_id"))
+                    if sink is not None and sink["status"] == "pending":
+                        sink.update(
+                            status="applied",
+                            output_frame_start=start,
+                            received_seconds=now - started,
+                            sink_chunks=message.get("sink_chunks"),
+                            sink_chunk_ids=message.get("sink_chunk_ids"),
+                        )
+                        for older in sink_results.values():
+                            if (
+                                older["event_id"] < sink["event_id"]
+                                and older["status"] == "pending"
+                            ):
+                                older["status"] = "superseded"
                     if (
                         start != state["received"]
                         or count < 1
@@ -926,6 +976,15 @@ async def exchange(
             (output / "prompt-updates.json").write_text(
                 json.dumps(prompt_metrics, indent=2)
             )
+            if sink_results:
+                for update in sink_results.values():
+                    if update["status"] == "pending":
+                        update["status"] = (
+                            "not_observed" if state["completed"] else "interrupted"
+                        )
+                (output / "sink-updates.json").write_text(
+                    json.dumps(list(sink_results.values()), indent=2) + "\n"
+                )
         elapsed = time.monotonic() - started
         if output_sink is not None:
             summary = dict(
@@ -1032,6 +1091,9 @@ def parser():
     parser.add_argument(
         "--prompt-updates",
         help="JSON list of prompt updates at source frame positions, with optional complete reference lists",
+    )
+    parser.add_argument(
+        "--sink-updates", help="JSON off/refresh events at source frame positions"
     )
 
     parser.add_argument("--max-message-bytes", type=int, default=DEFAULT_MESSAGE_BYTES)

@@ -231,7 +231,7 @@ def test_block_sampler_runs_cfg_and_tail(model, solver, with_audio):
         assert sound.shape == audio.shape and torch.isfinite(sound).all()
     assert sampler.last_run_metrics == {
         "window_chunks": 21,
-        "sink_chunks": 3,
+        "sink_chunks": 2,
         "rope_position_mode": "block_relative",
         "rope_max_frame_gap": 12,
         "block_spans": [

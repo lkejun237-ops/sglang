@@ -263,6 +263,8 @@ async def benchmark(cases, args):
                     )
                     if prompt_updates:
                         command.extend(["--prompt-updates", str(prompt_updates)])
+                    if getattr(args, "sink_updates", None):
+                        command.extend(["--sink-updates", str(args.sink_updates)])
                     result = {
                         "request_id": request_id,
                         "label": case["label"],
@@ -503,6 +505,9 @@ def main():
         help="Allow warmup and measured requests to populate an enabled Block0 cache",
     )
     parser.add_argument("--no-stage-timing", action="store_true")
+    parser.add_argument(
+        "--sink-updates", type=Path, help="Ordered sink off/refresh events"
+    )
     parser.add_argument(
         "--width",
         type=int,

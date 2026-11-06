@@ -15,6 +15,8 @@ from .zing_source_encoder_adapter import ZingSourceEncoderAdapter
 
 
 class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
+    supports_sink_updates = True
+
     async def on_init(self, session, request, *, prefill=False):
         import asyncio
 

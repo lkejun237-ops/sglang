@@ -2,6 +2,8 @@
 
 基于主线 `df69ad4265` 梳理最近合入的优化。下表环境变量均省略
 `SGLANG_ZING_` 前缀（单独注明者除外）。显式设置仍优先于默认值。
+Window/Sink 默认值于 2026-11-03 更新为 `21/2`，对应当前 unsplit `[3,2]`
+模型的 5-latent 锚点；历史 W6/S3、旧 split-first 的测量仍保留各自配置。
 
 Source 流水线默认采用 quantum=1、cross_chunk、async output、defer-final、
 prompt-joint，Zing 校验后的 realtime 会话容量为 1（公共默认保持 8）。remote Qwen 默认 conditioning prefetch，
@@ -117,12 +119,15 @@ UTF-8 prompt 最多 65536 字节、Qwen condition 最多 16384 行、参考图�
 | 窗口字段 | 默认值 |
 | --- | --- |
 | `zing_kv_pool_window_chunks` | `21` |
-| `zing_kv_pool_sink_chunks` | `3` |
+| `zing_kv_pool_sink_chunks` | `2` |
 | `zing_kv_pool_rope_position_mode` | `block_relative` |
 | `zing_kv_pool_rope_max_frame_gap` | `12` |
 
-当前请求默认 window21 / sink3、block_relative、max_frame_gap=12；
+当前请求默认 window21 / sink2、block_relative、max_frame_gap=12；
 解码模式仍为 `stable`。修改窗口或改为 stateful 解码会改变请求语义，不属于纯算子开关。
+请求与 KV pool 的启动 window/sink 必须一致。显式历史 S3 profile 保留原值；
+动态 `sink.off` / `sink.refresh` 仅支持 unsplit `[3,2]`、W≥4 和启动 S0/S2，
+详见 [动态 Sink 规格](dynamic-window-sink.zh-CN.md)。
 
 选择 prompt/reference 预算时，可参考 [H200 两卡输入预算](/docs/sglang-diffusion/zing/prompt-reference-budgets)。
 该页基于历史 W6/S3、拆分首块、Graph 关闭的 DiT 实测；25.6k 是约20 FPS 的估算边界，
