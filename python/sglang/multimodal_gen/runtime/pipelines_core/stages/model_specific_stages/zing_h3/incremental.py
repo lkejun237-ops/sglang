@@ -190,6 +190,7 @@ class SourceReadySession:
         self.ended = self.closed = False
         self.draining = False
         self._drain_tensors = []
+        self._drain_continuation = None
         self.audio_enabled = None
         self.device = None
         sampler._forward_counts = dict.fromkeys(
@@ -1055,13 +1056,19 @@ class SourceReadySession:
         return self._finish(ready, current, prompt, origin)
 
     @torch.no_grad()
-    def drain_ready(self):
-        """Drain a finite ready batch, committing each result before yielding.
+    def drain_ready(self, *, max_outputs=None):
+        """Drain ready chunks, committing each result before yielding.
 
-        Lookahead never survives this synchronous iterator. The caller must
-        close it on decoder failure/cancellation; abandoned work closes the
-        session, including a next target whose step0 may already be active.
+        The caller must close this synchronous iterator on decoder failure or
+        cancellation; abandoned work closes the session, including a next
+        target whose step0 may already be active. When ``max_outputs`` stops a
+        bounded drain cleanly after a cross-chunk lookahead, the continuation
+        is retained for the next ``drain_ready`` call.
         """
+        if max_outputs is not None and (
+            type(max_outputs) is not int or max_outputs < 1
+        ):
+            raise ValueError("max_outputs must be a positive integer")
         if self.closed or self.draining:
             raise ValueError("The source-ready session is closed or draining")
         self.draining = True
@@ -1069,13 +1076,21 @@ class SourceReadySession:
         try:
             self._agree_ready_route("drain_entry")
             if not self.pending:
+                self._drain_continuation = None
                 finished = True
                 return
-            self._activate_pending_prompt(self.pending[0], defer_prefix=True)
-            prompt = self.prompt
-            current, origin = self._prepare(self.pending[0], prompt, self.media_origin)
             sampler = self.sampler
-            first = None
+            if self._drain_continuation is not None:
+                current, first, prompt, origin = self._drain_continuation
+                self._drain_continuation = None
+            else:
+                self._activate_pending_prompt(self.pending[0], defer_prefix=True)
+                prompt = self.prompt
+                current, origin = self._prepare(
+                    self.pending[0], prompt, self.media_origin
+                )
+                first = None
+            emitted = 0
             while True:
                 # This vote also covers a warm prediction and sequential modes.
                 # A drained peer cannot return while another prepares next ready.
@@ -1163,13 +1178,16 @@ class SourceReadySession:
                                 sampler._forward(final, self.cache, "final")
                         final = packs = None
                     defer_final = (
-                        self.defer_final and not self.ended and len(self.pending) == 1
+                        self.defer_final
+                        and (not self.ended or len(self.pending) > 1)
+                        and (len(self.pending) == 1 or max_outputs == 1)
                     )
                     if graph_eligible:
                         if first is None:
                             first = graphs.recovery(sampler, current)
                         if (
-                            len(self.pending) > 1
+                            not defer_final
+                            and len(self.pending) > 1
                             and self.pending_prompt is None
                             and self.pending_sink is None
                         ):
@@ -1191,7 +1209,8 @@ class SourceReadySession:
                             else (sampler.video_scheduler, sampler.audio_scheduler)
                         )
                         lookahead = (
-                            sampler.joint_forward == "cross_chunk"
+                            not defer_final
+                            and sampler.joint_forward == "cross_chunk"
                             and len(self.pending) > 1
                             and self.pending_prompt is None
                             and self.pending_sink is None
@@ -1249,12 +1268,18 @@ class SourceReadySession:
                     if first is not None:
                         self._drain_tensors.extend(v for v in first if v is not None)
                 yield result
+                emitted += 1
                 if self.closed:
+                    break
+                if max_outputs is not None and emitted >= max_outputs:
+                    if current is not None:
+                        self._drain_continuation = current, first, prompt, origin
                     break
             finished = True
         finally:
             self.draining = False
-            self._drain_tensors = []
+            if self._drain_continuation is None:
+                self._drain_tensors = []
             if not finished:
                 self.dispose()
 
@@ -1330,11 +1355,14 @@ class SourceReadySession:
             self.adaln_lease.close()
             self.adaln_lease = None
         self._drain_tensors = []
+        self._drain_continuation = None
         self._pending_prefix = None
         self.pending.clear()
         self.pending_bytes = 0
         self.pending_spans = 0
         self.rng.dispose()
+        if self.sampler is not None:
+            self.sampler.processor._prefix_memo = None
         self.inputs = self.prompt = self.pending_prompt = self.applied_prompt = None
         self.pending_sink = None
         self.recent_visual = self.sampler = None
@@ -1343,3 +1371,5 @@ class SourceReadySession:
         self.prepare_prompt_prefix = None
         self._cached_prefix_ready = False
         self.closed = True
+        if self.device is not None and self.device.type == "cuda":
+            torch.cuda.empty_cache()

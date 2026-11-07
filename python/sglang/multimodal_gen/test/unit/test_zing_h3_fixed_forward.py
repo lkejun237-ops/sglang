@@ -909,6 +909,44 @@ def test_cross_graph_prefix_requires_all_layers_and_exact_coordinates(
     )
 
 
+def test_plan_host_inputs_use_pinned_asynchronous_copies(monkeypatch):
+    from sglang.multimodal_gen.runtime.models.dits import zing_h3_cache
+
+    # A pageable host-to-device copy synchronizes the stream, which would make
+    # planning wait for the previous graph. Every host-built input is staged.
+    staged = []
+
+    def record(tensor, device):
+        assert tensor.device.type == "cpu"
+        staged.append(tuple(tensor.shape))
+        return tensor
+
+    monkeypatch.setattr(zing_h3_cache, "_host_to_device", record)
+    monkeypatch.delenv("SGLANG_ZING_HISTORY_ROPE_LIVE_ROWS", raising=False)
+    current = torch.arange(12).reshape(4, 3)
+    ZingFixedForwardKVPlan(
+        _fake_cache(1, 32, (3, 4)), current, ends=(2, 4), clean_rows=2
+    )
+    assert sorted(staged) == sorted([(4, 3), (1,), (32, 3), (2,), (2,), (2,), (2,)])
+
+
+def test_host_to_device_copies_from_pinned_memory_without_blocking():
+    from unittest.mock import MagicMock
+
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import (
+        _host_to_device,
+    )
+
+    host = MagicMock()
+    host.device = torch.device("cpu")
+    _host_to_device(host, torch.device("cuda", 0))
+    host.pin_memory.return_value.to.assert_called_once_with(
+        torch.device("cuda", 0), non_blocking=True
+    )
+    cpu = torch.ones(2)
+    assert _host_to_device(cpu, torch.device("cpu")) is cpu
+
+
 def test_plan_admission_covers_every_row_written_into_the_slot():
     from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
         ZingKVCapacityError,
@@ -1004,3 +1042,89 @@ def test_target_geometry_separates_fixed_forward_signatures(model):
     assert signature((15, 26)) == legacy
     assert signature((40, 23)) == legacy
     assert signature((23, 40)) != legacy
+
+
+def test_adaln_table_project_plan_caches_concatenated_layer_projections():
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_adaln_table import (
+        ZingAdalnTable,
+    )
+
+    adaln = ZingAdalnTable.__new__(ZingAdalnTable)
+    adaln.device = torch.device("cpu")
+    adaln.ready = None
+    adaln.hits = 0
+    adaln._plan_cache = {}
+    adaln.values = {
+        f"batch.{b}.slot.{slot}": torch.randn(
+            4, (2 if slot == "final" else 6) * 8, dtype=torch.bfloat16
+        )
+        for b in range(3)
+        for slot in (0, 1, "final")
+    }
+    first = adaln.project_plan([0, 2], 2)
+    second = adaln.project_plan([0, 2], 2)
+    assert first is second
+    assert adaln.hits == 12
+    for slot in (0, 1, "final"):
+        parts = [adaln.project(slot, None, None, idx) for idx in (0, 2)]
+        for i, values in enumerate(zip(*parts)):
+            torch.testing.assert_close(
+                first[f"projection.{slot}.{i}"], torch.cat(values)
+            )
+
+
+@torch.no_grad()
+def test_planning_copy_store_chunk_skips_layer_tensor_views():
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
+    from sglang.multimodal_gen.runtime.realtime.zing_window import ZingWindowPolicy
+
+    storage = _fake_cache(2, 32, ()).storage
+    cache = ZingH3KVCache(
+        2,
+        storage=storage,
+        rope_position_mode="block_relative",
+        window_policy=ZingWindowPolicy(3, 1),
+    )
+    positions = torch.tensor([[0, 0, 0], [0, 1, 0]])
+    blocks = torch.zeros(2, dtype=torch.long)
+    cache.update(
+        positions,
+        blocks,
+        "prefix",
+        0,
+        [
+            (
+                torch.zeros(2, 2, 8, dtype=torch.bfloat16),
+                torch.zeros(2, 2, 8, dtype=torch.bfloat16),
+            )
+            for _ in storage
+        ],
+        validation=(positions, blocks),
+    )
+    shadow = cache.planning_copy()
+    src_pos = torch.tensor([[1, 0, 0], [1, 1, 0]])
+    src_blk = torch.ones(2, dtype=torch.long)
+    before = [(s.k.clone(), s.v.clone()) for s in storage]
+    shadow.update(
+        src_pos,
+        src_blk,
+        "source",
+        1,
+        [
+            (
+                torch.ones(2, 2, 8, dtype=torch.bfloat16),
+                torch.ones(2, 2, 8, dtype=torch.bfloat16),
+            )
+            for _ in storage
+        ],
+        validation=(src_pos, src_blk),
+    )
+    # Planning publishes lazy ranges without materializing per-layer views or
+    # writing source data into the live cache's authoritative store.
+    assert shadow.pending_source.offset == 2
+    assert shadow.pending_source.layers._views == {}
+    assert shadow._length == 4
+    assert cache.pending_source is None and cache._length == 2
+    for store, (keys, values) in zip(storage, before, strict=True):
+        torch.testing.assert_close(store.k, keys, rtol=0, atol=0)
+        torch.testing.assert_close(store.v, values, rtol=0, atol=0)

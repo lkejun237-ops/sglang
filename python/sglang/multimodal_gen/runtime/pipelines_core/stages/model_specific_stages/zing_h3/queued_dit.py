@@ -7,6 +7,7 @@ All methods belong to one event loop; model calls remain single-writer.
 """
 
 import asyncio
+from contextlib import closing
 
 import torch
 
@@ -328,8 +329,9 @@ class QueuedDiTSession:
                     provenance=chunk.provenance,
                     final=chunk.final,
                 )
-                result = self.state.step()
-                await self.on_output(result)
+                with closing(self.state.drain_ready(max_outputs=1)) as outputs:
+                    for result in outputs:
+                        await self.on_output(result)
             else:
                 if not self.state.ended:
                     self.state.finish()

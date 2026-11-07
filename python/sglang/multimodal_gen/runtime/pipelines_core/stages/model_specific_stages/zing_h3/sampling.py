@@ -534,7 +534,25 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         Absolute coordinate values may produce a joint RoPE fallback; they do
         not change communication shapes, so preserve that supported fallback.
         """
-        host = self._layout_index(pos).host
+        index = self._layout_index(pos)
+        shape_sig = tuple(
+            (name, tuple(pos[name].shape))
+            for name in (
+                "clean_visual",
+                "clean_audio",
+                "visual",
+                "audio",
+                "x",
+                "audio_x",
+                "context",
+            )
+            if name in pos
+        )
+        cache_key = (source, target, shape_sig)
+        cached = getattr(index, "_collective_signatures", None)
+        if cached is not None and cache_key in cached:
+            return cached[cache_key]
+        host = index.host
         blocks, roles, positions = (
             host[k] for k in ("block_idx", "row_role", "position_ids")
         )
@@ -549,24 +567,17 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
                     tuple(int(current[:, axis].unique().numel()) for axis in range(3)),
                 )
             )
-        return (
+        result = (
             tuple(blocks[selected].tolist()),
             tuple(roles[selected].tolist()),
             tuple(geometry),
-            tuple(
-                (name, tuple(pos[name].shape))
-                for name in (
-                    "clean_visual",
-                    "clean_audio",
-                    "visual",
-                    "audio",
-                    "x",
-                    "audio_x",
-                    "context",
-                )
-                if name in pos
-            ),
+            shape_sig,
         )
+        if cached is None:
+            cached = {}
+            index._collective_signatures = cached
+        cached[cache_key] = result
+        return result
 
     def _agree_sp_policy(self):
         """Every real SP rank agrees the policy before any policy-specific votes."""

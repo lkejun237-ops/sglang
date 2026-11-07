@@ -345,45 +345,116 @@ class ZingH3Packer:
         if target_audio is not None:
             self._validate_audio(target_audio)
         context, context_roles = encoded["context"], encoded["row_role"]
-        if (
-            context.ndim != 2
-            or context_roles.ndim != 1
-            or context.shape[0] != context_roles.shape[0]
-            or not torch.all(
-                (context_roles == int(H3RowRole.CONDITION_TEXT))
-                | (context_roles == int(H3RowRole.CONDITION_VISUAL))
+        prefix_key = None
+        if not torch.is_grad_enabled():
+            prefix_key = (
+                id(context),
+                None if torch.is_inference(context) else context._version,
+                tuple(context.shape),
+                context.dtype,
+                context.device,
+                id(context_roles),
+                None if torch.is_inference(context_roles) else context_roles._version,
+                tuple(context_roles.shape),
+                context_roles.dtype,
+                context_roles.device,
+                tuple(
+                    (c.get("content_id"), c.get("role"), tuple(sorted(c.keys())))
+                    for c in conditions
+                ),
+                tuple(
+                    (m.get("id"), m.get("type"), tuple(sorted(m.keys())))
+                    for m in media_items
+                ),
+                tuple(
+                    (
+                        k,
+                        id(v),
+                        None if torch.is_inference(v) else v._version,
+                        tuple(v.shape),
+                        v.dtype,
+                        v.device,
+                    )
+                    for k, v in sorted(reference_visual.items())
+                    if v is not None
+                ),
+                tuple(
+                    (
+                        k,
+                        id(v),
+                        None if torch.is_inference(v) else v._version,
+                        tuple(v.shape),
+                        v.dtype,
+                        v.device,
+                    )
+                    for k, v in sorted(reference_audio.items())
+                    if v is not None
+                ),
+                tuple(target_visual.shape[3:]),
             )
-        ):
-            raise ValueError(
-                "H3 context row_role must align with context and contain only condition roles"
+        memo = getattr(self, "_prefix_memo", None)
+        if prefix_key is not None and memo is not None and memo[0] == prefix_key:
+            _, _, base_segments, target_origin = memo
+            segments = [
+                {**s, "positions": s["positions"].clone()} for s in base_segments
+            ]
+        else:
+            if (
+                context.ndim != 2
+                or context_roles.ndim != 1
+                or context.shape[0] != context_roles.shape[0]
+                or not torch.all(
+                    (context_roles == int(H3RowRole.CONDITION_TEXT))
+                    | (context_roles == int(H3RowRole.CONDITION_VISUAL))
+                )
+            ):
+                raise ValueError(
+                    "H3 context row_role must align with context and contain only condition roles"
+                )
+            # 官方 H3 对完整 Qwen context（含 vision rows）统一使用 (row_index,0,0)，role 不参与 position 生成。
+            condition_positions = torch.zeros(context.shape[0], 3, dtype=torch.float64)
+            condition_positions[:, 0] = torch.arange(
+                context.shape[0], dtype=torch.float64
             )
-        # 官方 H3 对完整 Qwen context（含 vision rows）统一使用 (row_index,0,0)，role 不参与 position 生成。
-        condition_positions = torch.zeros(context.shape[0], 3, dtype=torch.float64)
-        condition_positions[:, 0] = torch.arange(context.shape[0], dtype=torch.float64)
-        segments = [
-            self._segment("context", context, condition_positions, context_roles, 0)
-        ]
-        condition_ids = [condition["content_id"] for condition in conditions]
-        if any(condition.get("role") != "reference" for condition in conditions):
-            raise ValueError("H3 schema-v4 conditions only support reference")
-        if len(set(condition_ids)) != len(condition_ids) or condition_ids != [
-            media["id"] for media in media_items if media["id"] in set(condition_ids)
-        ]:
-            raise ValueError(
-                "H3 conditions must be a unique subset of user media in the same order"
-            )
-        media_by_id = {media["id"]: media for media in media_items}
-        # reference 按用户声明顺序推进共同时间原点；音视频 reference 同时存在时取较长跨度。
-        target_origin = float(context.shape[0])
-        for condition in conditions:
-            target_origin = self._append_reference_segments(
-                segments,
-                media_by_id[condition["content_id"]],
-                reference_visual,
-                reference_audio,
-                target_visual.shape[3:],
-                target_origin,
-            )
+            segments = [
+                self._segment("context", context, condition_positions, context_roles, 0)
+            ]
+            condition_ids = [condition["content_id"] for condition in conditions]
+            if any(condition.get("role") != "reference" for condition in conditions):
+                raise ValueError("H3 schema-v4 conditions only support reference")
+            if len(set(condition_ids)) != len(condition_ids) or condition_ids != [
+                media["id"]
+                for media in media_items
+                if media["id"] in set(condition_ids)
+            ]:
+                raise ValueError(
+                    "H3 conditions must be a unique subset of user media in the same order"
+                )
+            media_by_id = {media["id"]: media for media in media_items}
+            # reference 按用户声明顺序推进共同时间原点；音视频 reference 同时存在时取较长跨度。
+            target_origin = float(context.shape[0])
+            for condition in conditions:
+                target_origin = self._append_reference_segments(
+                    segments,
+                    media_by_id[condition["content_id"]],
+                    reference_visual,
+                    reference_audio,
+                    target_visual.shape[3:],
+                    target_origin,
+                )
+            if prefix_key is not None:
+                held = (
+                    context,
+                    context_roles,
+                    *reference_visual.values(),
+                    *reference_audio.values(),
+                )
+                self._prefix_memo = (
+                    prefix_key,
+                    held,
+                    tuple({**s, "positions": s["positions"].clone()} for s in segments),
+                    target_origin,
+                )
         if encoded.get("media_origin") is not None:
             shift = encoded["media_origin"] - target_origin
             for segment in segments:
@@ -621,7 +692,8 @@ class ZingH3Packer:
         if (
             positions.shape != (cursor, 3)
             or roles.shape != (cursor,)
-            or not set(roles.tolist()) <= {int(role) for role in H3RowRole}
+            or not set(torch.unique(roles).tolist())
+            <= {int(role) for role in H3RowRole}
         ):
             raise ValueError("H3 packed structural tensors are not row-aligned")
         context_roles = torch.tensor(

@@ -18,6 +18,25 @@ from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
 from sglang.multimodal_gen.runtime.realtime.zing_window import ZingWindowPolicy
 
 
+def _host_to_device(tensor, device):
+    """Copy a host-built plan tensor without a pageable-copy stream sync.
+
+    ``tensor.to(cuda)`` and ``torch.tensor(..., device=cuda)`` from pageable
+    memory synchronize the current stream, so planning the next forward would
+    wait for every queued forward (for example the previous CUDA graph) before
+    the host could continue. The pinned staging block comes from the caching
+    host allocator, which keeps it alive until the asynchronous copy has run;
+    stream order still places the copy after the queued work that it follows.
+    Same contract as ``zing_h3.host_to_device`` (not imported: circular).
+    """
+    device = torch.device(device)
+    if tensor.device == device:
+        return tensor
+    if device.type != "cuda" or tensor.device.type != "cpu":
+        return tensor.to(device)
+    return tensor.pin_memory().to(device, non_blocking=True)
+
+
 class ZingFixedKVWorkspace:
     """Device execution metadata over one authoritative pooled K/V store.
 
@@ -124,10 +143,23 @@ class ZingFixedForwardKVPlan:
     def __init__(
         self, cache, current_positions, *, ends, clean_rows, prefix=False, after=None
     ):
-        self.stores = tuple((s.k, s.v) for s in cache.storage)
-        # Addressed separately from ``stores``: graph keys and signatures need
-        # its address, while restore snapshots and chunk layers do not.
-        self.rotated = tuple(s.rotated_k for s in cache.storage)
+        pool_info = getattr(cache, "_fixed_pool_info", None)
+        if pool_info is None or pool_info[0] is not cache.storage:
+            stores = tuple((s.k, s.v) for s in cache.storage)
+            rotated = tuple(s.rotated_k for s in cache.storage)
+            store_sig = tuple(
+                (
+                    value.data_ptr(),
+                    (tuple(value.shape), value.stride(), value.dtype, value.device),
+                )
+                for value in (
+                    *(value for pair in stores for value in pair),
+                    *rotated,
+                )
+            )
+            pool_info = (cache.storage, stores, rotated, store_sig)
+            cache._fixed_pool_info = pool_info
+        _, self.stores, self.rotated, self.store_signature = pool_info
         self.capacity = cache.capacity
         self.rows = current_positions.shape[0]
         self.clean_rows, self.ends = clean_rows, tuple(ends)
@@ -168,28 +200,30 @@ class ZingFixedForwardKVPlan:
             else after.rotated_positions
         )
         device = self.stores[0][0].device
+        # Host-built plan inputs use pinned asynchronous copies: this plan is
+        # usually built while the previous forward's graph is still running.
         tensors = dict(
-            current_positions=mapped.to(device),
+            current_positions=_host_to_device(mapped, device),
             write_rows=torch.arange(
                 cache._length, cache._length + self.rows, device=device
             ),
         )
         if self.rotates_history:
             if os.environ.get("SGLANG_ZING_HISTORY_ROPE_LIVE_ROWS", "1") == "1":
-                tensors["history_live_rows"] = torch.tensor(
-                    [history], dtype=torch.int32, device=device
+                tensors["history_live_rows"] = _host_to_device(
+                    torch.tensor([history], dtype=torch.int32), device
                 )
             pad_rows = self.capacity - history
-            tensors["positions"] = torch.cat(
-                (historical, historical.new_zeros(pad_rows, 3))
-            ).to(device)
+            tensors["positions"] = _host_to_device(
+                torch.cat((historical, historical.new_zeros(pad_rows, 3))), device
+            )
         previous = 0
         for branch, stop in enumerate(self.ends):
-            tensors[f"cu_k.{branch}"] = torch.tensor(
-                [0, history + stop], dtype=torch.int32, device=device
+            tensors[f"cu_k.{branch}"] = _host_to_device(
+                torch.tensor([0, history + stop], dtype=torch.int32), device
             )
-            tensors[f"cu_q.{branch}"] = torch.tensor(
-                [0, stop - previous], dtype=torch.int32, device=device
+            tensors[f"cu_q.{branch}"] = _host_to_device(
+                torch.tensor([0, stop - previous], dtype=torch.int32), device
             )
             previous = stop
         self.tensors = tensors
@@ -225,10 +259,9 @@ class ZingFixedForwardKVPlan:
             publications[layer] = tuple(ranges)
             cache._rotated_stores[layer] = self.rotated[layer]
         self.reused_history_rows = reused
-        self.tensors["history_rope_range"] = torch.tensor(
-            [reused, self.write_start],
-            dtype=torch.int32,
-            device=self.stores[0][0].device,
+        self.tensors["history_rope_range"] = _host_to_device(
+            torch.tensor([reused, self.write_start], dtype=torch.int32),
+            self.stores[0][0].device,
         )
         # Prospective state only: the owner unpublishes the real cache before
         # execution and publishes this shadow after successful completion.
@@ -1116,8 +1149,32 @@ class ZingH3KVCache:
             )
 
     def _raw_chunk_signature(self, layer, chunk, identity, start, end):
-        value = chunk.layers[layer][0]
         store = self._stores[layer][0]
+        if (
+            isinstance(chunk.layers, _StoreLayerViews)
+            and chunk.layers._stores[layer][0] is store
+        ):
+            begin, stop, _ = slice(chunk.layers._start, chunk.layers._stop).indices(
+                store.shape[0]
+            )
+            rows = max(0, stop - begin)
+            address = (
+                store.data_ptr()
+                + (begin + start) * store.stride(0) * store.element_size()
+                if rows
+                else 0
+            )
+            return (
+                identity,
+                self._raw_write_epochs.get(layer, 0),
+                address,
+                end - start,
+                tuple(store.shape[1:]),
+                store.stride(),
+                store.dtype,
+                store.device,
+            )
+        value = chunk.layers[layer][0]
         owned = value.untyped_storage().data_ptr() == store.untyped_storage().data_ptr()
         # Cache-owned parts can acquire a new parent view when source/target are
         # merged. Content epoch and physical range remain unchanged in that case.
@@ -1694,21 +1751,20 @@ class ZingH3KVCache:
         """Commit raw or post-RoPE K, reusing V already written into scratch."""
         offset = self._length
         rows = positions.shape[0]
+        bookkeeping_only = getattr(self, "_bookkeeping_only", False)
         for layer, (k, v) in enumerate(layers):
             keys, values = self._reserve_store(layer, offset + rows, k, v)
             # A clean forward already wrote these rows into the scratch tail, at
             # the offset they commit to; copying them onto themselves is waste.
             # A store grown since then moves the destination, so the check is on
             # the address, not on the phase.
-            for source, destination in (
-                (k, keys[offset : offset + rows]),
-                (v, values[offset : offset + rows]),
-            ):
-                if (
-                    not getattr(self, "_bookkeeping_only", False)
-                    and source.data_ptr() != destination.data_ptr()
+            if not bookkeeping_only:
+                for source, destination in (
+                    (k, keys[offset : offset + rows]),
+                    (v, values[offset : offset + rows]),
                 ):
-                    destination.copy_(source)
+                    if source.data_ptr() != destination.data_ptr():
+                        destination.copy_(source)
             self._mark_raw_store(layer)
         self._length = offset + rows
         self._chunk_plan = None

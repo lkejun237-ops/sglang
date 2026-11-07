@@ -10210,6 +10210,26 @@
         {
           "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_queued_dit.py::test_control_backpressure_and_output_failure_release_state[cuda]",
           "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_queued_dit.py::test_queued_session_uses_chunk_graphs_and_defer_final[cuda-False]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_queued_dit.py::test_queued_session_uses_chunk_graphs_and_defer_final[cuda-True]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_queued_dit.py::test_session_exit_releases_shared_packer_prefix_memo[cuda-eos]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_queued_dit.py::test_session_exit_releases_shared_packer_prefix_memo[cuda-cancel]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_queued_dit.py::test_session_exit_releases_shared_packer_prefix_memo[cuda-output_failure]",
+          "reason": "CUDA is required for the GPU queue regression"
         }
       ],
       "sources": [

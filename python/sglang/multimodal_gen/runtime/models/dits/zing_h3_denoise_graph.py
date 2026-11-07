@@ -8,7 +8,7 @@ outside the graph pool and refreshed before every replay.
 """
 
 import collections
-import json
+import os
 from contextlib import ExitStack
 
 import torch
@@ -108,6 +108,7 @@ class CudaGraphBackend:
                         else "Zing denoise graph warm-up failed on a peer rank"
                     ) from warmup_error
                 current.wait_stream(stream)
+                torch.cuda.empty_cache()
                 if self._pool is None:
                     self._pool = torch.cuda.graph_pool_handle()
                 cleanup.enter_context(defer_cyclic_gc())
@@ -390,11 +391,16 @@ class ZingChunkGraphs:
         key = (kind, signatures, addresses, shapes)
         entry = self.graphs.get(key)
         first = key not in self._seen
+        capture_kind = self.capture_enabled and (
+            not isinstance(self.backend, CudaGraphBackend)
+            or kind in ("steady", "resume", "deferred")
+            or os.environ.get("SGLANG_ZING_CHUNK_GRAPH_BOUNDARY", "0") == "1"
+        )
         route = (
             ROUTE_REPLAY
             if entry is not None
             else ROUTE_WARMUP
-            if first
+            if first or not capture_kind
             else ROUTE_CAPTURE
         )
         if self.coordinator is not None and not self.coordinator.agree(route):
@@ -406,33 +412,20 @@ class ZingChunkGraphs:
         self._seen.move_to_end(key)
         while len(self._seen) > 4 * self.max_graphs:
             self._seen.popitem(last=False)
-        if not self.capture_enabled or first:
-            self.routes[(kind, "eager" if not self.capture_enabled else "warmup")] += 1
+        if not capture_kind or first:
+            self.routes[(kind, "eager" if not capture_kind else "warmup")] += 1
             return execute(tensors)
         if entry is None:
             static = {name: tensor.clone() for name, tensor in tensors.items()}
             flat = self._capture_store_views(plans, stores, rotated)
-            logger.info(
-                "ZING_CHUNK_GRAPH_SNAPSHOT_JSON %s",
-                json.dumps(
-                    {
-                        "kind": kind,
-                        "snapshot_bytes": sum(
-                            t.numel() * t.element_size() for t in flat
-                        ),
-                        "store_bytes": sum(
-                            t.numel() * t.element_size()
-                            for pair in stores
-                            for t in pair
-                        ),
-                    }
-                ),
+            saved = tuple(
+                value.to("cpu", copy=True) if value.is_cuda else value.clone()
+                for value in flat
             )
-            saved = tuple(value.clone() for value in flat)
 
             def restore():
-                if flat:
-                    torch._foreach_copy_(list(flat), list(saved))
+                for target, source in zip(flat, saved, strict=True):
+                    target.copy_(source)
 
             def capture():
                 # Production capture calls this eagerly once, then under capture.
@@ -607,8 +600,12 @@ class ZingChunkGraphs:
             after=after,
         )
         if isinstance(transaction, PrefixJointTransaction):
-            kv.tensors["current_positions"] = transaction.mapped_positions.to(
-                packed["x"].device
+            from sglang.multimodal_gen.runtime.models.dits.zing_h3 import (
+                host_to_device,
+            )
+
+            kv.tensors["current_positions"] = host_to_device(
+                transaction.mapped_positions, packed["x"].device
             )
         model = sampler.generator
         if (

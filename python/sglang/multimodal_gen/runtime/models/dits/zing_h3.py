@@ -1708,6 +1708,57 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             if metadata is not None:
                 metadata.clear()
 
+    def _prepare_fixed_projections(
+        self, unique_t, device_t, projection_cache, *, joint, group_sizes
+    ):
+        """Resolve all fixed-forward AdaLN projections before graph capture."""
+        time_groups = unique_t.split(group_sizes or 1) if joint else (unique_t,)
+        slots = [
+            *((i, b.adaln_proj) for i, b in enumerate(self.blocks)),
+            ("final", self.final_layer.adaln_proj),
+        ]
+        if (
+            self.adaln_table is not None
+            and type(projection_cache).project is ZingAdalnTable.project
+            and "project" not in projection_cache.__dict__
+        ):
+            keys = tuple(projection_cache.lookup(t) for t in time_groups)
+            if any(module is not None for _, module in slots):
+                raise ValueError(
+                    "Zing weights-free mode must not retain projection modules"
+                )
+            return projection_cache.project_plan(keys, len(self.blocks))
+        projections = {}
+        device_groups = device_t.split(group_sizes or 1) if joint else (device_t,)
+        embeddings = (
+            [None] * len(time_groups)
+            if self.adaln_table is not None
+            else [
+                F.silu(self.time_embedder(t.float())).bfloat16() for t in device_groups
+            ]
+        )
+        keys = [
+            projection_cache.lookup(t)
+            if self.adaln_table is not None
+            else projection_cache.begin(
+                t,
+                embedding,
+                self.time_embedder,
+                self._cache_weight_generation,
+            )
+            for t, embedding in zip(time_groups, embeddings, strict=True)
+        ]
+        for slot, module in slots:
+            parts = [
+                projection_cache.project(slot, module, embedding, key)
+                for embedding, key in zip(embeddings, keys, strict=True)
+            ]
+            for i, values in enumerate(zip(*parts)):
+                projections[f"projection.{slot}.{i}"] = (
+                    values[0] if len(parts) == 1 else torch.cat(values)
+                )
+        return projections
+
     @torch.no_grad()
     def prepare_fixed_forward(
         self,
@@ -1843,7 +1894,11 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             tensors["layout." + name] = getattr(layout, name)
         tensors.update({"kv." + name: value for name, value in kv_plan.tensors.items()})
         # Initialize the embedder's immutable frequency buffer outside capture.
-        self.time_embedder(tensors["unique_t"].float())
+        if (
+            self.time_embedder._frequency_cache is None
+            or self.time_embedder._frequency_cache.device != device
+        ):
+            self.time_embedder(tensors["unique_t"].float())
         # Resolve small modulation outputs before capture. Replay copies these
         # tensors just like latent inputs; it never runs Python cache operations.
         projection_cache = self.adaln_table or projection_cache
@@ -1851,35 +1906,15 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         if precomputed_projections:
             if self.adaln_table is not None and packed["audio_x"].shape[0]:
                 raise ValueError("Zing weights-free AdaLN supports video requests only")
-            time_groups = unique_t.split(group_sizes or 1) if joint else (unique_t,)
-            device_groups = (
-                tensors["unique_t"].split(group_sizes or 1)
-                if joint
-                else (tensors["unique_t"],)
-            )
-            embeddings = [
-                F.silu(self.time_embedder(t.float())).bfloat16() for t in device_groups
-            ]
-            keys = [
-                projection_cache.lookup(t)
-                if self.adaln_table is not None
-                else projection_cache.begin(
-                    t, embedding, self.time_embedder, self._cache_weight_generation
+            tensors.update(
+                self._prepare_fixed_projections(
+                    unique_t,
+                    tensors["unique_t"],
+                    projection_cache,
+                    joint=joint,
+                    group_sizes=group_sizes,
                 )
-                for t, embedding in zip(time_groups, embeddings, strict=True)
-            ]
-            for slot, module in [
-                *((i, b.adaln_proj) for i, b in enumerate(self.blocks)),
-                ("final", self.final_layer.adaln_proj),
-            ]:
-                parts = [
-                    projection_cache.project(slot, module, embedding, key)
-                    for embedding, key in zip(embeddings, keys, strict=True)
-                ]
-                for i, values in enumerate(zip(*parts)):
-                    tensors[f"projection.{slot}.{i}"] = (
-                        values[0] if len(parts) == 1 else torch.cat(values)
-                    )
+            )
         optimized_fixed_480p = validated_fixed_480p(
             host,
             device,
@@ -2004,7 +2039,8 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             kv_plan.rotates_history,
             optimized_fixed_480p,
             target_fixed_736p,
-            tuple(
+            getattr(kv_plan, "store_signature", None)
+            or tuple(
                 (value.data_ptr(), _tensor_layout(value))
                 for value in (
                     *(value for pair in kv_plan.stores for value in pair),
@@ -2257,7 +2293,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                 fixed,
                 index,
                 options.fixed_tensors,
-                default=options.optimized_fixed_480p,
+                default=True,
             )
         if fused_q is None:
             q = apply_current_rope(q, inputs.rope)

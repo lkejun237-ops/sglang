@@ -196,7 +196,7 @@ CURRENT_KV_ROUTES = collections.Counter()
 def use_current_qknorm_rope_kv(module, q, coefficients):
     """Choose before SP, without depending on a rank's local token count."""
     return (
-        os.environ.get("SGLANG_ZING_FUSED_QKNORM_ROPE_KV", "0") == "1"
+        os.environ.get("SGLANG_ZING_FUSED_QKNORM_ROPE_KV", "1") == "1"
         and not torch.is_grad_enabled()
         and not torch.compiler.is_compiling()
         and q.is_cuda
@@ -343,7 +343,7 @@ def validated_fixed_480p(host, device, *, sp_size, heads, head_dim, backend, aud
             torch.unique(positions[:, 0]).numel() == 15
             and torch.unique(positions[:, 1]).numel() == 26
             and torch.unique(positions, dim=0).shape[0] == 390
-            and host.row_role.numel() in (390, 780, 1170, 1560, 2340, 2730)
+            and host.row_role.numel() in (390, 780, 1170, 1560, 1950, 2340, 2730, 3120)
             and bool(visual.all())
         )
     return host.derived[key]

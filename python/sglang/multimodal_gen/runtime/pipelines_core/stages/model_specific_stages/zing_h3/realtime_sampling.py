@@ -98,12 +98,17 @@ class ZingH3RealtimeSampler(ZingH3Sampler):
             )
 
     def prepare_schedules(self, device):
+        target = torch.device(device)
         pairs = [self.regular_schedulers]
         if self.initial_schedulers is not None:
             pairs.append(self.initial_schedulers)
         for pair in pairs:
             for schedule, modality in zip(pair, ("video", "audio")):
-                schedule.to(device)
+                if (
+                    schedule.sigmas.device != target
+                    or schedule.timesteps.device != target
+                ):
+                    schedule.to(device)
                 schedule.diagnostic_modality = modality
 
     def schedules_for(self, state):
@@ -130,31 +135,61 @@ class ZingH3RealtimeSampler(ZingH3Sampler):
         schedules = [self.regular_schedulers[0]]
         if self.initial_schedulers is not None:
             schedules.append(self.initial_schedulers[0])
-        plans = [
-            video_plan(
-                self.solver,
-                schedule.timesteps.cpu(),
-                self.ar_condition_timestep,
-                self.reference_visual_timestep,
-                sigmas=schedule.sigmas.cpu(),
+        schedule_key = (
+            self.solver,
+            self.ar_condition_timestep,
+            self.reference_visual_timestep,
+            self.initial_block_count,
+            tuple(
+                (
+                    id(s.timesteps),
+                    None if torch.is_inference(s.timesteps) else s.timesteps._version,
+                    id(s.sigmas),
+                    None if torch.is_inference(s.sigmas) else s.sigmas._version,
+                )
+                for s in schedules
+            ),
+        )
+        memo = getattr(self, "_adaln_schedule_memo", None)
+        if memo is not None and memo[0] == schedule_key:
+            plan, timesteps = memo[2]
+        else:
+            plans = [
+                video_plan(
+                    self.solver,
+                    schedule.timesteps.cpu(),
+                    self.ar_condition_timestep,
+                    self.reference_visual_timestep,
+                    sigmas=schedule.sigmas.cpu(),
+                )
+                for schedule in schedules
+            ]
+            plan = (
+                initial_blocks_plan(*plans, self.initial_block_count)
+                if self.initial_block_count
+                else plans[0]
             )
-            for schedule in schedules
-        ]
-        plan = (
-            initial_blocks_plan(*plans, self.initial_block_count)
-            if self.initial_block_count
-            else plans[0]
-        )
-        timesteps = sorted(
-            {t for schedule in schedules for t in self._host_list(schedule.timesteps)}
-        )
+            timesteps = sorted(
+                {
+                    t
+                    for schedule in schedules
+                    for t in self._host_list(schedule.timesteps)
+                }
+            )
+            self._adaln_schedule_memo = (
+                schedule_key,
+                tuple((s.timesteps, s.sigmas) for s in schedules),
+                (plan, timesteps),
+            )
         batches = []
 
         def add(roles, *, video_t=1, final=False):
             if roles.numel():
                 batches.append(
                     torch.unique(
-                        self._block_timesteps(roles, video_t=video_t, final=final),
+                        self._block_timesteps(
+                            torch.unique(roles), video_t=video_t, final=final
+                        ),
                         sorted=True,
                     )
                 )

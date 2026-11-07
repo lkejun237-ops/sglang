@@ -2,6 +2,8 @@
 """Queue integration using the original tiny DiT, sampler and KV implementation."""
 
 import asyncio
+import gc
+import weakref
 from copy import copy
 
 import pytest
@@ -126,7 +128,16 @@ def test_external_sink_control_and_prompt_share_the_original_session(model):
 
 
 class Harness:
-    def __init__(self, model, frames=13, *, joint_forward="off", **options):
+    def __init__(
+        self,
+        model,
+        frames=13,
+        *,
+        joint_forward="off",
+        defer_final=False,
+        pooled_kv=False,
+        **options,
+    ):
         self.packer, self.inputs, _, _ = _long_request(model, [3, 2], frames)
         device = next(model.parameters()).device
         self.inputs.positive = {
@@ -135,6 +146,8 @@ class Harness:
         self.inputs.source_visual = self.inputs.source_visual.to(device)
         self.model = model
         self.joint_forward = joint_forward
+        self.defer_final = defer_final
+        self.pooled_kv = pooled_kv
         self.results = []
         self.rebuilds = []
         self.bridge = SourceChunkBridge(
@@ -159,7 +172,14 @@ class Harness:
                 return original(inputs, condition, recent, cache)
 
             sampler.rebuild_prompt_prefix = rebuild
-            return self.session(sampler, inputs, event, version)
+            return self.session(
+                sampler,
+                inputs,
+                event,
+                version,
+                defer_final=self.defer_final,
+                pooled_kv=self.pooled_kv,
+            )
 
         async def output(result):
             self.results.append(result)
@@ -186,7 +206,28 @@ class Harness:
         )
 
     @staticmethod
-    def session(sampler, inputs, event=10, version=1):
+    def session(
+        sampler, inputs, event=10, version=1, *, defer_final=False, pooled_kv=False
+    ):
+        acquire_storage = None
+        if pooled_kv:
+            from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+                allocate_layer_stores,
+            )
+
+            device = next(sampler.generator.parameters()).device
+            arch = sampler.generator.arch
+
+            def acquire_storage(positive, ready):
+                return allocate_layer_stores(
+                    2048,
+                    num_layers=len(sampler.generator.blocks),
+                    local_heads=arch.num_attention_heads,
+                    head_dim=arch.attention_head_dim,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+
         return SourceReadySession(
             sampler,
             inputs,
@@ -195,6 +236,8 @@ class Harness:
             max_pending_bytes=1 << 20,
             initial_prompt_event_id=event,
             initial_prompt_version=version,
+            defer_final=defer_final,
+            acquire_storage=acquire_storage,
         )
 
     async def put(self, kind, **fields):
@@ -401,3 +444,133 @@ def test_control_backpressure_and_output_failure_release_state(model):
         assert h.worker.state.inputs is None and not h.bridge.buffered_latents
 
     asyncio.run(run())
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("defer_final", [False, True])
+def test_queued_session_uses_chunk_graphs_and_defer_final(model, defer_final):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+        ZingChunkGraphs,
+    )
+
+    model.chunk_graphs = ZingChunkGraphs(capture_enabled=False)
+    h = Harness(
+        model,
+        frames=8,
+        joint_forward="cross_chunk",
+        defer_final=defer_final,
+        pooled_kv=True,
+    )
+
+    async def run():
+        await h.prompt(10)
+        await h.drain_ready()
+        for start, end in ((0, 5), (5, 8)):
+            await h.source(start, end)
+            await h.drain_ready()
+        await h.put("source.end", latent_frames=8)
+        await asyncio.wait_for(h.worker.run(), 10)
+
+    asyncio.run(run())
+    assert h.worker.complete
+    routes = dict(model.chunk_graphs.routes)
+    assert routes.get(("init", "eager"), 0) == 1
+    if defer_final:
+        assert routes.get(("deferred", "eager"), 0) == 4
+        assert routes.get(("resume", "eager"), 0) == 3
+        assert routes.get(("recovery", "eager"), 0) == 0
+    else:
+        assert routes.get(("finish", "eager"), 0) == 4
+        assert routes.get(("recovery", "eager"), 0) == 3
+
+
+def test_dit_worker_defer_final_policy(monkeypatch):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        dit_worker,
+    )
+
+    parser = dit_worker.argument_parser()
+    assert parser.parse_args(["--model", "/tmp/m"]).zing_source_defer_final is None
+    assert (
+        parser.parse_args(
+            ["--model", "/tmp/m", "--zing-source-defer-final"]
+        ).zing_source_defer_final
+        is True
+    )
+    assert (
+        parser.parse_args(
+            ["--model", "/tmp/m", "--no-zing-source-defer-final"]
+        ).zing_source_defer_final
+        is False
+    )
+    with pytest.raises(ValueError, match="Invalid DiT session geometry or seed"):
+        dit_worker.create_link_session(
+            None,
+            None,
+            {"seed": 1, "width": 832, "height": 480, "fps": 16},
+            None,
+            defer_final="invalid",
+        )
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("exit_kind", ["eos", "cancel", "output_failure"])
+def test_session_exit_releases_shared_packer_prefix_memo(model, exit_kind):
+    h = Harness(model, frames=5)
+
+    async def run():
+        await h.prompt(10)
+        await h.drain_ready()
+        await h.source(0, 1)
+        await h.drain_ready()
+        assert h.packer._prefix_memo is not None
+        context = weakref.ref(h.packer._prefix_memo[1][0])
+
+        if exit_kind == "eos":
+            await h.source(1, 5)
+            await h.put("source.end", latent_frames=5)
+            await asyncio.wait_for(h.worker.run(), 10)
+            assert h.worker.complete
+        elif exit_kind == "cancel":
+            task = asyncio.create_task(h.worker.run())
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+
+            async def failed(_):
+                assert not h.worker.state.ended
+                assert h.packer._prefix_memo is not None
+                raise RuntimeError("Output disconnected")
+
+            h.worker.on_output = failed
+            await h.source(1, 3)
+            with pytest.raises(RuntimeError, match="Output disconnected"):
+                await h.worker.run()
+        assert h.worker.closed and h.worker.state.inputs is None
+        assert h.packer._prefix_memo is None
+        h.worker.close()  # Repeated cleanup must be harmless.
+        return context
+
+    context = asyncio.run(run())
+    gc.collect()
+    assert context() is None
+
+    # The deployment retains this same packer for the next session.
+    inputs = copy(h.inputs)
+    inputs.positive = h.condition(20)
+    session = h.session(h.sampler(), inputs, event=20)
+    try:
+        source = inputs.source_visual[:, :, :1]
+        session.append(
+            source,
+            torch.zeros_like(source),
+            provenance=fixture_provenance(1, 1, 0, 1),
+            final=True,
+        )
+        assert session.step().prompt_event_id == 20
+        assert session.complete and session.closed
+        assert h.packer._prefix_memo is None
+    finally:
+        session.dispose()

@@ -48,14 +48,17 @@ def _initialize_service_descriptor(ports, parallel, *, timeout, startup_failure=
     return descriptor
 
 
-def create_link_session(sampler, codecs, init, output, *, stage=None):
+def create_link_session(
+    sampler, codecs, init, output, *, stage=None, defer_final=False
+):
     from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
         Provenance,
         SourceSpan,
     )
 
     if (
-        type(init.get("seed")) is not int
+        type(defer_final) is not bool
+        or type(init.get("seed")) is not int
         or init["seed"] < 0
         or any(
             type(init.get(k)) is not int or init[k] < 1
@@ -198,6 +201,7 @@ def create_link_session(sampler, codecs, init, output, *, stage=None):
             initial_prompt_event_id=event,
             initial_prompt_version=version,
             acquire_storage=acquire_storage if kv_pool is not None else None,
+            defer_final=defer_final,
         )
 
         cache = None if stage is None else stage.block0_cache
@@ -293,7 +297,7 @@ def create_link_session(sampler, codecs, init, output, *, stage=None):
     return worker
 
 
-def main():
+def argument_parser():
     from sglang.multimodal_gen.configs.zing_sampling import parse_noise_grid
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -324,6 +328,12 @@ def main():
         help="Override the deployment profile's joint-forward policy",
     )
     parser.add_argument(
+        "--zing-source-defer-final",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Defer single-chunk final KV commit into the next chunk's resume step",
+    )
+    parser.add_argument(
         "--quantization",
         help="Use the original transformer loader's quantization method (e.g. fp8)",
     )
@@ -338,6 +348,11 @@ def main():
     parser.add_argument("--zing-block0-cache-gc-interval-s", type=float, default=60.0)
     parser.add_argument("--zing-block0-cache-gc-stale-s", type=float, default=600.0)
     parser.add_argument("--zing-block0-cache-gc-low-watermark", type=float, default=0.9)
+    return parser
+
+
+def main():
+    parser = argument_parser()
     cli = parser.parse_args()
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -513,11 +528,22 @@ def main():
                 ),
             )
             stage.deployment_sampling = schedule
+            if cli.zing_source_defer_final is not None:
+                defer_final = cli.zing_source_defer_final
+            elif "SGLANG_ZING_SOURCE_DEFER_FINAL" in os.environ:
+                defer_final = os.environ["SGLANG_ZING_SOURCE_DEFER_FINAL"] == "1"
+            else:
+                defer_final = (
+                    params.zing_joint_forward == "cross_chunk"
+                    and params.zing_window_eviction_timing == "after_step0"
+                    and float(params.guidance_scale) == 1.0
+                )
             print(
                 "DIT_SAMPLING_POLICY "
                 + json.dumps(
                     dict(
                         joint_forward=params.zing_joint_forward,
+                        source_defer_final=defer_final,
                         **{
                             key: schedule.get(key)
                             for key in (
@@ -538,7 +564,14 @@ def main():
 
             def create(init, output):
                 sampler = stage._build_realtime_sampler(params)
-                return create_link_session(sampler, codecs, init, output, stage=stage)
+                return create_link_session(
+                    sampler,
+                    codecs,
+                    init,
+                    output,
+                    stage=stage,
+                    defer_final=defer_final,
+                )
 
             from .dit_preparation import DiTPreparation
 

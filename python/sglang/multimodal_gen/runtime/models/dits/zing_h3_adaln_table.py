@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Immutable, fixed-version Zing AdaLN tables (no online build or fallback)."""
 
+import functools
 import hashlib
 import itertools
 import json
@@ -35,7 +36,7 @@ def tensor_description(value):
     )
 
 
-def batch_description(values):
+def _validate_batch_values(values):
     if (
         values.dtype != torch.float32
         or values.ndim != 1
@@ -47,12 +48,30 @@ def batch_description(values):
         raise ValueError(
             "Zing AdaLN requires a sorted unique FP32 timestep batch in [0, 1]"
         )
-    return tensor_description(values) | {"raw_hex": tensor_bytes(values).hex()}
+
+
+def batch_description(values):
+    _validate_batch_values(values)
+    raw = tensor_bytes(values)
+    return dict(
+        dtype=str(values.dtype),
+        shape=list(values.shape),
+        sha256=hashlib.sha256(raw).hexdigest(),
+        raw_hex=raw.hex(),
+    )
 
 
 def batch_key(values):
-    description = batch_description(values)
-    return (description["dtype"], tuple(description["shape"]), description["raw_hex"])
+    _validate_batch_values(values)
+    return (str(values.dtype), tuple(values.shape), tensor_bytes(values).hex())
+
+
+@functools.lru_cache(maxsize=8)
+def _cuda_device_contract(device):
+    return (
+        list(torch.cuda.get_device_capability(device)),
+        torch.cuda.get_device_name(device),
+    )
 
 
 def arithmetic_contract(device):
@@ -71,10 +90,8 @@ def arithmetic_contract(device):
         deterministic=torch.are_deterministic_algorithms_enabled(),
     )
     if device.type == "cuda":
-        result.update(
-            capability=list(torch.cuda.get_device_capability(device)),
-            gpu=torch.cuda.get_device_name(device),
-        )
+        capability, gpu = _cuda_device_contract(device)
+        result.update(capability=list(capability), gpu=gpu)
     return result
 
 
@@ -399,6 +416,7 @@ class ZingAdalnTable:
         self._verified_embedder = None
         self.device = None
         self.ready = None
+        self._plan_cache = {}
         self.active_plans = self.hits = 0
         self._lock = threading.RLock()
 
@@ -484,6 +502,33 @@ class ZingAdalnTable:
         self.hits += 1
         value = self.values[f"batch.{batch_index}.slot.{slot}"]
         return tuple(value.chunk(2 if slot == "final" else 6, dim=-1))
+
+    def project_plan(self, batch_indices, num_layers):
+        """Resolve and cache all slot projections for a fixed timestep batch tuple."""
+        if self.device is None:
+            raise ValueError(
+                "Zing AdaLN table requires complete-plan admission before inference"
+            )
+        self.wait_ready()
+        slots = (*range(num_layers), "final")
+        self.hits += len(slots) * len(batch_indices)
+        key = (tuple(batch_indices), num_layers)
+        cached = self._plan_cache.get(key)
+        if cached is not None:
+            return cached
+        resolved = {}
+        for slot in slots:
+            chunks = 2 if slot == "final" else 6
+            parts = [
+                self.values[f"batch.{idx}.slot.{slot}"].chunk(chunks, dim=-1)
+                for idx in batch_indices
+            ]
+            for i, values in enumerate(zip(*parts)):
+                resolved[f"projection.{slot}.{i}"] = (
+                    values[0] if len(parts) == 1 else torch.cat(values)
+                )
+        self._plan_cache[key] = resolved
+        return resolved
 
     def stats(self):
         return dict(
