@@ -560,6 +560,18 @@ def test_idle_queue_releases_completed_device_results(monkeypatch, abandoned):
         entered, release = threading.Event(), threading.Event()
         disconnected = asyncio.Event()
         references = []
+        loop = asyncio.get_running_loop()
+        released = asyncio.Event()
+        released_count = 0
+
+        def record_release():
+            nonlocal released_count
+            released_count += 1
+            if released_count == 2:
+                released.set()
+
+        def tensor_released(reference):
+            loop.call_soon_threadsafe(record_release)
 
         class Encoder:
             gpu_id = 0
@@ -569,7 +581,9 @@ def test_idle_queue_releases_completed_device_results(monkeypatch, abandoned):
                 if abandoned:
                     assert release.wait(5)
                 result = condition()
-                references.extend(weakref.ref(tensor) for tensor in result.values())
+                references.extend(
+                    weakref.ref(tensor, tensor_released) for tensor in result.values()
+                )
                 return result
 
         service.encoder = service.queue.encoder = Encoder()
@@ -598,8 +612,11 @@ def test_idle_queue_releases_completed_device_results(monkeypatch, abandoned):
             while service.flights and time.monotonic() < until:
                 await asyncio.sleep(0.001)
             assert not service.flights
-            await asyncio.sleep(0)
             gc.collect()
+            # Publishing a Future can wake the event loop before its executor
+            # thread finishes releasing temporaries. Wait for actual tensor
+            # destruction, while the service remains open and idle.
+            await asyncio.wait_for(released.wait(), 5)
             assert len(references) == 2 and all(ref() is None for ref in references)
             assert service.cache.current_bytes == 0 and service.nccl.pending is None
             assert all(n == 0 for n in service.ledger.snapshot()["global"].values())

@@ -64,6 +64,8 @@ class MediaCapture:
         expected_frames,
         mode="representative",
         ffmpeg="ffmpeg",
+        *,
+        retention_budget_bytes=DEFAULT_RETENTION_BYTES,
     ):
         if mode not in ("metrics", "representative", "raw"):
             raise ValueError("Invalid media mode")
@@ -71,6 +73,12 @@ class MediaCapture:
             expected_frames is not None and expected_frames < 1
         ):
             raise ValueError("Media dimensions and frame count must be positive")
+        if (
+            type(retention_budget_bytes) is not int
+            or retention_budget_bytes <= 64 << 20
+        ):
+            raise ValueError("Media retention budget must exceed 64 MiB")
+        self.retention_budget_bytes = retention_budget_bytes
         self.output = Path(output)
         self.width, self.height = width, height
         self.expected_frames = expected_frames
@@ -105,7 +113,7 @@ class MediaCapture:
             raise ValueError("Incomplete RGB frame in media capture")
         if self.raw is not None and self.bytes + len(
             payload
-        ) > DEFAULT_RETENTION_BYTES - (64 << 20):
+        ) > self.retention_budget_bytes - (64 << 20):
             raise RuntimeError("Raw output exceeds the experiment retention budget")
         start = self.bytes // self.frame_bytes
         end = start + len(payload) // self.frame_bytes
@@ -182,6 +190,7 @@ class MediaCapture:
             self.frames.clear()
             self.receipt = {
                 "mode": self.mode,
+                "retention_budget_bytes": self.retention_budget_bytes,
                 "artifact_helper_sha256": hashlib.sha256(
                     Path(__file__).read_bytes()
                 ).hexdigest(),

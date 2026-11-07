@@ -14,7 +14,7 @@ import pathlib
 import subprocess
 import sys
 from dataclasses import replace
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -568,6 +568,7 @@ def test_failed_warmup_runs_eager_and_keeps_graphs(model, monkeypatch):
 # Runs in a child process: a failed CUDA capture leaves the default generator
 # in capture mode, which would break every later CUDA test in this process.
 _INVALIDATED_CAPTURE = """
+import gc
 import torch
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
     CudaGraphBackend,
@@ -596,6 +597,7 @@ else:
 assert len(calls) == 2, calls
 assert torch.cuda.current_stream() == before
 assert backend.capturing is False
+assert gc.isenabled(), "Automatic GC must be restored after a failed capture"
 print("INVALIDATED_CAPTURE_OK")
 """
 
@@ -3290,6 +3292,103 @@ def test_unsplit_prompt_prefix_joins_both_history_blocks(model, monkeypatch, cac
     assert metrics[-1]["forward_counts"]["prompt_joint"] == 2
     if cached:
         assert receipts
+
+
+@pytest.fixture
+def private_capture_stream_driver(monkeypatch):
+    from sglang.multimodal_gen.runtime.utils import zing_capture_stream as module
+
+    calls = SimpleNamespace(created=[], destroyed=[], error=0)
+
+    def create(flags):
+        assert flags == 1
+        handle = 1000 + len(calls.created)
+        calls.created.append(handle)
+        return calls.error, handle
+
+    driver = SimpleNamespace(
+        CUstream_flags=SimpleNamespace(CU_STREAM_NON_BLOCKING=1),
+        CUresult=SimpleNamespace(CUDA_SUCCESS=0),
+        cuStreamCreate=create,
+        cuStreamDestroy=lambda handle: calls.destroyed.append(handle),
+    )
+    cuda = ModuleType("cuda")
+    bindings = ModuleType("cuda.bindings")
+    cuda.bindings = bindings
+    bindings.driver = driver
+    monkeypatch.setitem(sys.modules, "cuda", cuda)
+    monkeypatch.setitem(sys.modules, "cuda.bindings", bindings)
+    monkeypatch.setitem(sys.modules, "cuda.bindings.driver", driver)
+    monkeypatch.setattr(module, "_streams", {})
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "ExternalStream",
+        lambda handle, device: SimpleNamespace(cuda_stream=handle, device=device),
+    )
+
+    def pooled_stream_is_not_private(*args, **kwargs):
+        raise AssertionError("A pooled stream cannot be reserved for capture")
+
+    monkeypatch.setattr(torch.cuda, "Stream", pooled_stream_is_not_private)
+    return module, calls
+
+
+def test_private_capture_stream_is_bounded_and_not_a_pooled_wrapper(
+    private_capture_stream_driver, monkeypatch
+):
+    module, calls = private_capture_stream_driver
+    first = module.capture_stream()
+    assert all(module.capture_stream() is first for _ in range(256))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+    second = module.capture_stream()
+    assert second is not first
+    assert (first.device, second.device) == (0, 1)
+    assert calls.created == [1000, 1001]
+    assert not calls.destroyed  # Graph/workspace lifetime is the process lifetime.
+
+
+def test_private_capture_stream_creation_failure_does_not_publish_a_handle(
+    private_capture_stream_driver,
+):
+    module, calls = private_capture_stream_driver
+    calls.error = 2
+    with pytest.raises(RuntimeError, match="Cannot create private Zing capture stream"):
+        module.capture_stream()
+    assert not module._streams
+    calls.error = 0
+    assert module.capture_stream().cuda_stream == 1001
+    assert not calls.destroyed
+
+
+def test_decoder_stream_reuses_its_own_nonpooled_device_stream(
+    private_capture_stream_driver, monkeypatch
+):
+    module, calls = private_capture_stream_driver
+    capture = module.capture_stream()
+    decoder = module.decoder_stream()
+    assert decoder is not capture
+    assert all(module.decoder_stream() is decoder for _ in range(256))
+    assert module.capture_stream() is capture
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+    assert module.decoder_stream().device == 1
+    assert calls.created == [1000, 1001, 1002]
+    assert not calls.destroyed
+
+
+def test_private_capture_stream_wrapper_failure_releases_unpublished_handle(
+    private_capture_stream_driver, monkeypatch
+):
+    module, calls = private_capture_stream_driver
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("External stream wrapper failed")
+
+    monkeypatch.setattr(torch.cuda, "ExternalStream", fail)
+    with pytest.raises(RuntimeError, match="External stream wrapper failed"):
+        module.capture_stream()
+    assert not module._streams
+    assert calls.destroyed == [1000]
 
 
 def test_sink_controls_preserve_cached_prompt_prefix(model, monkeypatch):

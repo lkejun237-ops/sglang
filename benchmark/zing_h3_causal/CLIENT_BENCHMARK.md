@@ -57,6 +57,67 @@ source-to-output 延迟、tail drain、credit wait、播放停顿，以及有 pr
 **Prompt-switch TTFF**。有限输入与连续 source 分开比较。保存命令、源码 SHA、配置、预热/正式次数、失败与未执行数、
 原始 JSON 和报告；未采到的指标标为未测。
 
+## 默认卡顿回归
+
+连续 source benchmark 默认在每请求回执中保存 `stall_check`，检查完整帧交付与固定
+250 ms 首包缓冲下的播放欠载。它只判断交付现象，`dit_verdict=not_evaluated`；
+供满模式的欠载不能直接归因 DiT。完整门槛和证据要求见
+[serving-stall-v1](../../docs/docs/sglang-diffusion/zing/specs/serving-stall-regression.md)。
+
+在**本轮独占测试实例**上运行两档完整 S1 和长会话 S2：
+
+```bash
+python3 benchmark/zing_h3_causal/run_stall_regression.py \
+  --media-root /data/product-media --frozen-inputs /data/FROZEN_RGB.json \
+  --output-dir /data/serving-stall-run
+```
+
+默认四条真实请求，832×480、1280×736 各预热一次、正式三次；长会话另做三次
+24 FPS paced 请求。冻结清单以派生 case ID 索引，记录 `path/width/height/frames/bytes/sha256`；
+读取并核验在请求计时外执行，完整原始帧数、prompt 和更新边界不变。
+736 输入明确标记为原素材的 bilinear 派生，另存转换命令与哈希。
+`--archive-delivery` 可传入私有、限定对象的签名 PUT/HEAD 清单，在请求间分片归档
+原始 RGB，校验上传与回读后仅释放已验证的本轮文件。签名清单不入库、不进入报告。
+
+此入口完成不等于整个规范验收：D1 的完整 DiT replay、冷重启、取消恢复及阶段归因
+独立记录。每轮失败与未测项保留，禁止仅凭进程退出码或平均 FPS 判通过。
+
+完整默认编排使用 `run_isolated_stall_suite.py --config /data/runner-config.json`。
+配置示例、零 GPU 准备及最终读回步骤见 [完整卡顿回归复现说明](STALL_REGRESSION.md)。
+该完整套件的正式轮使用完整 RGB 哈希与原始事件的 `metrics` 口径；独立诊断轮
+保留完整 RGB，显式声明 64 GiB 单请求临时预算后归档。普通 benchmark 的默认
+2 GiB 上限保持不变，不能混用两种写盘方式的性能结果。
+配置必须来自零 GPU 准备回执，固定源码、模型、两档 RGB 清单、conditioning profile、
+pipeline、隔离端口与分配设备；不能将产品实例地址填入该配置。入口依次执行
+两档各三次进程冷重启及暖请求、真实 CUDA Graph/GC 安全检查、独立 capture、S1/S2、独立阶段诊断、单活跃会话拒绝与
+断连恢复、两档完整 DiT 回放及常驻耐久。耐久每档三轮，每轮所有 rank 至少 600 秒
+有效会话工作，串行重复完整原 case；会话间回执写盘和协调不计入工作时长，不能
+将其声称为更长的单一自然上下文。首个冷请求必须先于 capture；单独的 capture 进程也会
+预热后续进程共用的磁盘编译缓存。首个容器内推理与已运行过同档输入后的进程冷启动
+分组报告，不能将两种缓存前置条件混作同条件收益。工具不清理共享编译缓存。
+它只清理自己启动的进程；每次回放沿用生产 KV 池容量和合法历史淘汰策略。
+`--archive-dir` 支持私有 OSS 挂载目录，按块回读哈希校验后释放本轮 RGB。
+挂载目录的中断写入保留为临时对象，完整写入后才发布到内容哈希路径；原始文件在
+校验前保留。挂载内回读不代替独立远端验证，最终报告需另端 GET 核对每块与完整文件
+的 SHA256，并保留失败／中断样本及重组清单。
+独立验证按实际对象路径和有序分块组合记账；相同 SHA 位于不同路径的副本分别回读，
+不以内容去重代替逐对象校验。运行中快照与全部写入停止后的最终核对分开保存。
+完整编排的 `phase=complete` 仍只代表数据采集完成，须检查所有请求、rank、阶段、
+生命周期和原始归档，分别给出交付、DiT 与证据完整性结论。
+
+默认各组件使用独立卡。只有显式声明 `allow_shared_role_devices=true` 和
+`role_devices` 时才允许测试共享卡布局；例如两卡 SP2 的
+`{"dit":[0,1],"encoder":[1],"decoder":[1]}`。NCCL 传输的对端不能与 DiT leader
+使用同一张卡，因此共享角色集中在非 leader 卡上。这种布局仍运行完整模型，
+但实例指标包含组件间的 GPU 竞争，不能替代专卡部署的性能验收。DiT 独立回放前
+会停止 Encoder/Qwen/Decoder。报告保留实际卡数、GPU UUID 与每个组件的卡映射。
+共享布局在会话结束和 Qwen 编码结束后归还闲置 allocator 缓存，并记录前后读数；
+该策略计入共享布局结果，不能与专卡默认策略混称同条件。隔离入口显式绑定配置中的
+Encoder/Decoder 端口，不沿用模型 profile 内的固定端口；端口组应避开系统自动临时
+端口范围，并在启动各角色前核验占用。端口启动失败与运行中的模型卡顿分别记录。
+分配前须核验拓扑：空闲卡总数不代表存在可调度的两卡或四卡组合；不得为凑卡停止
+其他实验或借用产品 demo 资源。
+
 ## 固定 case 预热和缓存 TTFF 对照
 
 常驻服务启动后，可用现有固定 case 和正常请求预热 Qwen、参考图预处理及 VAE latent：

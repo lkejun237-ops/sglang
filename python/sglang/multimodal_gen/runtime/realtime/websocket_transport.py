@@ -91,9 +91,15 @@ async def _close_realtime_websocket(
     *,
     code: int,
     reason: str,
+    drain_input: bool = False,
 ) -> None:
     try:
-        await websocket.close(code=code, reason=reason)
+        if drain_input:
+            from .stage_profile_delivery import close_with_input_drain
+
+            await close_with_input_drain(websocket, code=code, reason=reason)
+        else:
+            await websocket.close(code=code, reason=reason)
     except (RuntimeError, WebSocketDisconnect):
         pass
 

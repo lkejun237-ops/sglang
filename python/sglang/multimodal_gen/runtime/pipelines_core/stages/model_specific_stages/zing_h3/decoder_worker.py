@@ -254,8 +254,12 @@ class _DecodeService:
         stream = None
         if self.device.type == "cuda":
             # The current device and stream are per thread.
+            from sglang.multimodal_gen.runtime.utils.zing_capture_stream import (
+                decoder_stream,
+            )
+
             torch.cuda.set_device(self.device)
-            stream = torch.cuda.Stream(device=self.device)
+            stream = decoder_stream()
 
         async def process(tasks):
             nonlocal index

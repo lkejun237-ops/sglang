@@ -9,6 +9,7 @@ import traceback
 import uuid
 from pathlib import Path
 
+from analyze_stream_stalls import analyze_events
 from bench_client import (
     append_jsonl,
     calculate_metrics,
@@ -16,7 +17,7 @@ from bench_client import (
     summarize,
     write_json,
 )
-from benchmark_artifacts import TIMING_SCOPE, check_retention
+from benchmark_artifacts import DEFAULT_RETENTION_BYTES, TIMING_SCOPE, check_retention
 from build_streaming_report import build_report, load_received_profiles
 from case_sets import DEFAULT_CASE_SET, load_case_set
 from continuous_source_client import CLIENT_TIMING
@@ -172,7 +173,9 @@ async def benchmark(cases, args):
         "cache_write": getattr(args, "cache_write", False),
         "media_mode": getattr(args, "media_mode", "representative"),
         "artifact_timing_scope": TIMING_SCOPE,
-        "retention_budget_bytes": 2 << 30,
+        "retention_budget_bytes": getattr(
+            args, "retention_budget_bytes", DEFAULT_RETENTION_BYTES
+        ),
         "warmup_runs": args.warmup_runs,
         "measured_runs": args.measured_runs,
         "seed": args.seed,
@@ -204,6 +207,12 @@ async def benchmark(cases, args):
                     request_id = uuid.uuid4().hex
                     output = args.output_dir / case["label"] / f"{phase}-{index}"
                     command = [
+                        "--retention-budget-bytes",
+                        str(
+                            getattr(
+                                args, "retention_budget_bytes", DEFAULT_RETENTION_BYTES
+                            )
+                        ),
                         "--media-mode",
                         (
                             getattr(args, "media_mode", "representative")
@@ -214,8 +223,8 @@ async def benchmark(cases, args):
                         ),
                         "--url",
                         args.url,
-                        "--source-video",
-                        case["source_video"],
+                        "--source-rgb" if "source_rgb" in case else "--source-video",
+                        case.get("source_rgb", case["source_video"]),
                         "--output",
                         str(output),
                         "--prompt",
@@ -278,6 +287,7 @@ async def benchmark(cases, args):
                         "metrics": {},
                         "icl_values_seconds": [],
                         "media_path": None,
+                        "events_path": str(output / "events.jsonl"),
                         "input_mode": config["input_mode"],
                         "timing_origin": config["timing_origin"],
                         "expected_frames": case["frames"],
@@ -389,6 +399,22 @@ async def benchmark(cases, args):
                             + "events: "
                             + type(receipt_error).__name__
                         )
+                    try:
+                        result["stall_check"] = analyze_events(
+                            [
+                                json.loads(line)
+                                for line in (output / "events.jsonl")
+                                .read_text()
+                                .splitlines()
+                                if line
+                            ]
+                        )
+                    except (OSError, ValueError, KeyError, TypeError) as exc:
+                        result["stall_check"] = {
+                            "status": "insufficient_evidence",
+                            "dit_verdict": "not_evaluated",
+                            "error": type(exc).__name__,
+                        }
                     result["chunk_count"] = len(chunks)
                     result["output_frames"] = sum(
                         chunk["num_frames"] for chunk in chunks
@@ -480,7 +506,10 @@ async def benchmark(cases, args):
             args.output_dir / "results.html",
             json_output=args.output_dir / "report.json",
         )
-        check_retention(args.output_dir)
+        check_retention(
+            args.output_dir,
+            budget=getattr(args, "retention_budget_bytes", DEFAULT_RETENTION_BYTES),
+        )
     return summary
 
 
@@ -495,6 +524,11 @@ def main():
         "--case-set", help=f"Named collection or JSON file; default: {DEFAULT_CASE_SET}"
     )
     parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument(
+        "--source-rgb-manifest",
+        type=Path,
+        help="Frozen RGB identities keyed by derived case ID; verified before request timing",
+    )
     parser.add_argument("--decoder-url", help="Separate Decoder output WebSocket URL")
     parser.add_argument("--media-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -541,6 +575,12 @@ def main():
         choices=("metrics", "representative", "raw"),
         default="representative",
     )
+    parser.add_argument(
+        "--retention-budget-bytes",
+        type=int,
+        default=DEFAULT_RETENTION_BYTES,
+        help="Explicit total output limit; defaults to 2 GiB.",
+    )
     args = parser.parse_args()
     if args.prewarm_only:
         args.measured_runs = 0
@@ -550,8 +590,11 @@ def main():
         or (args.prewarm_only and args.warmup_runs < 1)
         or min(args.batch_pattern) < 1
         or args.timeout <= 0
+        or args.retention_budget_bytes <= 64 << 20
     ):
-        parser.error("Invalid repetition count, source batch size or timeout")
+        parser.error(
+            "Invalid repetition count, source batch size, timeout or retention budget"
+        )
     args.output_dir.mkdir(parents=True, exist_ok=False)
     if args.case_set or args.case in (None, "all"):
         collection = load_case_set(args.case_set or DEFAULT_CASE_SET)
@@ -590,6 +633,10 @@ def main():
         ]
     except ValueError as exc:
         parser.error(str(exc))
+    if args.source_rgb_manifest:
+        from frozen_rgb import bind_frozen_sources
+
+        cases = bind_frozen_sources(cases, args.source_rgb_manifest)
     for case in cases:
         write_json(
             args.output_dir / "cases" / case["label"] / "streaming-case.json", case

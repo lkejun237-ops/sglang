@@ -1818,6 +1818,7 @@ def run_scheduler_process(
     assert result_pipes_from_slaves is not None
     from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 
+    static_gc = None
     try:
         scheduler = Scheduler(
             server_args,
@@ -1827,6 +1828,20 @@ def run_scheduler_process(
             result_pipes_from_slaves=result_pipes_from_slaves,
             local_rank=local_rank,
         )
+        prepare_serving = getattr(
+            getattr(scheduler.worker, "pipeline", None),
+            "prepare_static_gc_for_serving",
+            None,
+        )
+        if prepare_serving is not None:
+            static_gc = prepare_serving()
+            if static_gc is not None:
+                logger.info(
+                    "ZING_STATIC_GC_READY_JSON %s", json.dumps(static_gc.receipt)
+                )
+        # A bound startup hook must not keep the pipeline alive past the
+        # scheduler's existing model/graph cleanup below.
+        del prepare_serving
         logger.info(f"Worker {rank}: Scheduler loop started.")
         pipe_writer.send(
             {
@@ -1859,6 +1874,8 @@ def run_scheduler_process(
                 close_persistent_decoder_bridges()
             except Exception:
                 pass
+        if static_gc is not None:
+            static_gc.close()
         gc.collect()
         if torch.cuda.is_initialized():
             torch.cuda.empty_cache()

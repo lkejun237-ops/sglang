@@ -210,6 +210,40 @@ def batch(state, start, count, sequence, *, final=False):
     )
 
 
+@pytest.mark.parametrize("operation", ["off", "refresh"])
+@pytest.mark.parametrize("capture_enabled", [False, True])
+def test_sink_updates_require_a_replayable_capture_contract(
+    monkeypatch, operation, capture_enabled
+):
+    state, stage = session(ChunkPlan([3, 2]))
+    sampler = state.sampler
+    updates, completed = [], []
+    monkeypatch.setattr(
+        sampler,
+        "update_sink",
+        lambda operation, event_id: updates.append((operation, event_id)),
+        raising=False,
+    )
+    if capture_enabled:
+        state.component_capture = NS(finish=lambda: completed.append(True))
+    request = batch(state, 0, 0, 0)
+    request.extra["zing_sink_update"] = dict(operation=operation, event_id=7)
+    try:
+        if capture_enabled:
+            with pytest.raises(
+                ValueError,
+                match="Component capture does not support dynamic sink updates",
+            ):
+                state.run(stage, request)
+            assert updates == [] and completed == []
+            assert sampler.closed
+        else:
+            state.run(stage, request)
+            assert updates == [(operation, 7)]
+    finally:
+        state.dispose()
+
+
 @pytest.mark.parametrize("finish", ["dispose", "eos"])
 def test_dispose_logs_paged_block0_capacity_and_releases_state(monkeypatch, finish):
     import json
@@ -775,6 +809,9 @@ def test_joint_ready_worker_batches_without_crossing_command_boundary(
             self.max_pending_bytes = queue_bytes
             self.pending_bytes = 0
             self.batches = []
+            # This queue-only sampler has no conditioning snapshot. The capture
+            # double still accepts the optional snapshot used by the real sampler.
+            self.prompt = None
 
         def append(self, source, noise, *, provenance, final):
             chunk = self.plan.chunk(self.index + len(self.pending))
@@ -808,7 +845,7 @@ def test_joint_ready_worker_batches_without_crossing_command_boundary(
     captured = []
     if capture:
         state.component_capture = NS(
-            append=lambda chunk, result: captured.append(
+            append=lambda chunk, result, *, prompt=None: captured.append(
                 (chunk.chunk, result.chunk, chunk.final)
             ),
             append_source=lambda *args: None,

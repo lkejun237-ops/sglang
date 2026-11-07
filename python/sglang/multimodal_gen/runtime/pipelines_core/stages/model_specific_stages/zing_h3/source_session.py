@@ -333,7 +333,15 @@ class ZingSourceStreamState(BaseRealtimeState):
             self._start_conditioning_prefetch(stage, batch, endpoint, command)
         capture_dir = os.environ.get("SGLANG_ZING_COMPONENT_CAPTURE_DIR")
         decoder_policy = batch.extra["zing_source_command"].get("decoder")
-        if capture_dir and decoder_policy and "remote" in decoder_policy:
+        capture_scope = os.environ.get("SGLANG_ZING_COMPONENT_CAPTURE_SCOPE", "full")
+        if capture_dir and capture_scope not in ("full", "dit"):
+            raise ValueError("Component capture scope must be full or dit")
+        if (
+            capture_dir
+            and capture_scope == "full"
+            and decoder_policy
+            and "remote" in decoder_policy
+        ):
             raise ValueError("Component capture requires the local decoder")
         self.decoder = create_decoder(
             stage.codecs,
@@ -358,7 +366,26 @@ class ZingSourceStreamState(BaseRealtimeState):
                 params,
                 self.bridge.seed,
                 batch.realtime_session_id,
+                scope=capture_scope,
+                replay_policy=dict(
+                    work_quantum=self.work_quantum,
+                    schedule=dict(
+                        solver=sampler.solver
+                        if hasattr(sampler, "solver")
+                        else params.zing_solver,
+                        denoising_step_list=sampler.denoising_step_list,
+                        initial_denoising_step_list=sampler.initial_denoising_step_list,
+                        initial_block_count=sampler.initial_block_count,
+                    ),
+                    defer_final=defer_final,
+                    prompt_joint=prompt_joint,
+                    initial_prompt_event_id=batch.realtime_event_id,
+                    initial_prompt_version=getattr(
+                        batch, "realtime_prompt_version", None
+                    ),
+                ),
             )
+            self.component_capture.remember_prompt(self.sampler.prompt)
 
     @torch.no_grad()
     def prefill(
@@ -778,6 +805,8 @@ class ZingSourceStreamState(BaseRealtimeState):
                 getattr(batch, "realtime_prompt_version", None),
                 **kwargs,
             )
+            if self.component_capture is not None:
+                self.component_capture.remember_prompt(self.sampler.pending_prompt)
             self.prompt, self.prompt_event = update
             self.failed_update = None
         return notice
@@ -828,6 +857,10 @@ class ZingSourceStreamState(BaseRealtimeState):
             self._fill_block0_after_output()
             sink_command = batch.extra.get("zing_sink_update")
             if sink_command is not None:
+                if self.component_capture is not None:
+                    raise ValueError(
+                        "Component capture does not support dynamic sink updates"
+                    )
                 self.sampler.update_sink(
                     sink_command["operation"], sink_command["event_id"]
                 )
@@ -1236,7 +1269,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                 output_latent_range=[result.chunk.start, result.chunk.end],
             )
             if self.component_capture is not None:
-                self.component_capture.append(chunk, result)
+                self.component_capture.append(chunk, result, prompt=self.sampler.prompt)
             self.blocks.append(
                 {
                     "block_idx": result.chunk.chunk_id,
@@ -1373,7 +1406,9 @@ class ZingSourceStreamState(BaseRealtimeState):
                     )
                     self.dispatch_steps += 1
                     if self.component_capture is not None:
-                        self.component_capture.append(capture_chunk, result)
+                        self.component_capture.append(
+                            capture_chunk, result, prompt=self.sampler.prompt
+                        )
                         del capture_chunk
                     self.blocks.append(
                         {

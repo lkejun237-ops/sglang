@@ -10,6 +10,44 @@ description: "供 Codex 与部署同学使用的 H100/H200/B300 部署决策、�
 
 2026-11-03 动态 Sink 实现基于 `0a4623e129`：缺省 Sink 对齐为两个原生块（unsplit `[3,2]` 下为 5 latent）。显式历史 profile 的 S3 保持原值；启用 `sink.off` / `sink.refresh` 需将 profile 与 KV pool 的启动 Sink 同设为 2（或以 off 启动时同设为 0），并满足 W≥4。仅调整策略与压紧已有 KV，允许在边界单独完成 deferred final，相关停顿和 forward 调用需实测。W6/S2 的 `after_step0` 预分配峰值不因锚点减少而自动下降，不能据此声称解决 736 OOM。冻结运行版本 `d87d75fb16` 已完成 H100 SP2 eager 与 B300 SP1 的 832×480 / 1280×736 功能验证（B300 480 开启 Graph、736 采用 eager）；单次 off/refresh 各多 1 次 deferred-final forward，source/prefix 计算次数不增加。完整产品性能矩阵未测；2026-11-06 整合 `main@b9e4bc95fc`（含共享静态 KV 容量、独立服务收尾及 VAE 优化）后的 sink 组合尚未重跑 GPU，CPU 集成回归以本次提交的 PR checks 为准。源码身份、原始回执、视频及显存口径见 [动态 Sink 验收记录](specs/dynamic-window-sink.validation.zh-CN.md)。
 
+## 实例卡顿回归接入（2026-11-07）
+
+默认接入 [serving-stall-v1](/docs/sglang-diffusion/zing/specs/serving-stall-regression)：
+832×480／1280×736、四条真实产品 case、冷重启、动态条件、单活跃会话生命周期、
+完整 DiT 回放，以及每档三轮、每轮各 rank 至少 600 秒有效完整会话工作的常驻耐久。
+复用现有录像时，正常 EOS／释放后开启下一会话，不拼接长上下文。
+完整 E1+SP4+D1 测试现在允许显式申请六卡，使用已有碎片主机的六张未分配卡；
+旧八卡分配结果仍保留八卡资源成本。该六卡调度组合当前尚未完成 GPU 验证，
+不得从原八卡分配直接外推其性能或显存结果。
+
+冻结工具 `55b707eb`／生产 runtime tree `6416ecd5` 的 R69 在 B300 同八卡分配使用
+E1+SP4+D1 六张活跃卡；两档 Source VAE 均按生产 resize 编码832×480，736入口／
+输出为1280×736。74个普通请求全部成功且完整交付，双档单会话拒绝、断连与恢复通过。
+15921帧、24FPS供流、250ms播放缓冲的三轮中，480未检出>250ms播放停顿；736分别
+检出1／1／2次，均无>1秒严重停顿。首次换图准备仍需737–924ms，不能宣称736稳定
+实时通过或归因reference VAE重编码。480完整DiT三轮数据已采，但预热与native输出
+逐位比较失败，严格耐久门禁终止；另立诊断收集双档耐久，不将数值FAIL转成PASS。
+
+候选在ready前collect/freeze静态堆，新会话仍自动GC，退出解冻；捕获时暂缓cyclic GC，
+使用进程／设备专有的非池化capture stream。测试EOS复用已有Encoder／Decoder持久
+连接。资源清理、listener退出后消费终态输入，profile ACK与close各自独占接收，
+避免迟到心跳阻塞有界队列。历史SP2静态GC专项显著降低GC长尾，但整轮耗时仅变化
+-0.35%／-0.27%，不能外推稳定吞吐收益；736短请求D2相对D1仍未证明24FPS容量，
+不推荐据此改为D2。
+
+上述完整结果使用显式历史S3 profile，未覆盖新主线`526662ade6`的缺省S2或动态sink。
+本PR整合该主线后的GPU组合当前未验证；冻结R70耐久、R71同卡`main@b9e4bc95fc`
+对照及R74完整DiT补测保持原版本继续执行，不能冒称新缺省验收。完整条件、逐组件
+性能／显存、原始数据、失败与未执行项及报告统一回查[PR #580](https://github.com/seedleap/sglang/pull/580)。
+
+R69同一Decoder进程在736三次完整供流会话后，allocated约4.875GiB回落，而reserved
+每次增加约5.49GiB，后续诊断结束达264.086GiB。这是allocator缓存高水位线索，不能
+直接称为活跃张量泄漏或既有输出停顿的原因。新增候选在原有跨lane step gate下复用
+进程／设备私有Decoder CUDA stream，与capture stream分离，保留每会话线程和状态、
+输入event等待及取消／quarantine语义。它只针对多stream缓存累积；cuDNN线程缓存等
+其他因素仍需检查。480／736同条件前后GPU对照与整体三组件复测当前未完成，
+速度和显存收益未验证，不据此修改产品demo。
+
 ## VAE 可选执行优化（2026-11-03）
 
 当前 H3 渐进 Encoder 与 26 层 EMA BF16 Lynn

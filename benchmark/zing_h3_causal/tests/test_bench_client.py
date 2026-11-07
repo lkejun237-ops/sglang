@@ -435,6 +435,8 @@ async def streaming_peer(
     prompt_modes=None,
     max_references=21,
     first_payload_delay=0,
+    profile_delay=0.03,
+    profile_drains=False,
 ):
     """Protocol peer: echo bytes, with bounded credit; it is not a model."""
     import asyncio
@@ -477,7 +479,19 @@ async def streaming_peer(
                 return
             await send(dict(type="session.completed", output_frames=frames))
             if init.get("return_stage_timing"):
-                await asyncio.sleep(0.03)
+                if profile_drains:
+                    from types import SimpleNamespace
+
+                    from sglang.multimodal_gen.runtime.realtime.stage_profile_delivery import (
+                        collect_profile_with_input_drain,
+                    )
+
+                    await collect_profile_with_input_drain(
+                        SimpleNamespace(receive_bytes=ws.recv),
+                        asyncio.sleep(profile_delay),
+                    )
+                else:
+                    await asyncio.sleep(profile_delay)
                 await send(
                     dict(
                         type="profile_result",
@@ -493,6 +507,18 @@ async def streaming_peer(
                         assert ack["session_id"] == "test-session"
                         observations.append(ack)
                         break
+                if profile_drains:
+                    from types import SimpleNamespace
+
+                    from sglang.multimodal_gen.runtime.realtime.stage_profile_delivery import (
+                        close_with_input_drain,
+                    )
+
+                    await close_with_input_drain(
+                        SimpleNamespace(receive=ws.recv, close=ws.close),
+                        code=1000,
+                        reason="generation complete",
+                    )
             return
         if message["kind"] == "prompt":
             mode = (prompt_modes or {}).get(message["payload"], "apply")
@@ -1838,3 +1864,101 @@ def test_streaming_client_rejects_invalid_source_dimensions_before_io(
     with pytest.raises(ValueError, match="[Ss]ource"):
         asyncio.run(run(args))
     assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "bad_heartbeat,server_drains", [(False, False), (True, False), (True, True)]
+)
+def test_completed_output_profile_wait_with_bounded_websocket_queue(
+    tmp_path, monkeypatch, bad_heartbeat, server_drains
+):
+    import asyncio
+    from builtins import ExceptionGroup
+
+    import continuous_source_client as client
+    import websockets
+
+    source = tmp_path / "one-frame.rgb"
+    source.write_bytes(bytes(range(12)))
+    original = client.keep_source_heartbeat
+
+    async def heartbeat(send, state, *, split_output):
+        if bad_heartbeat:
+            while True:
+                await asyncio.sleep(0.01 if server_drains else 0.05)
+                try:
+                    await send(dict(type="event", kind="heartbeat"))
+                except websockets.exceptions.ConnectionClosedOK:
+                    return
+        else:
+            await original(send, state, split_output=split_output, interval=0.05)
+
+    monkeypatch.setattr(client, "keep_source_heartbeat", heartbeat)
+
+    observations = []
+
+    async def scenario():
+        async with websockets.serve(
+            lambda ws: streaming_peer(
+                ws, observations, profile_delay=1, profile_drains=server_drains
+            ),
+            "127.0.0.1",
+            0,
+            max_queue=1,
+            ping_interval=0.05,
+            ping_timeout=0.25,
+        ) as server:
+
+            async def request(name):
+                args = client.parser().parse_args(
+                    [
+                        "--url",
+                        f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
+                        "--source-rgb",
+                        str(source),
+                        "--width",
+                        "2",
+                        "--height",
+                        "2",
+                        "--expected-frames",
+                        "1",
+                        "--prompt",
+                        "test",
+                        "--output",
+                        str(tmp_path / name),
+                        "--media-mode",
+                        "metrics",
+                        "--receive-stage-timing",
+                        "--timeout",
+                        "5",
+                    ]
+                )
+                return await client.run(args)
+
+            if bad_heartbeat and not server_drains:
+                with pytest.raises(ExceptionGroup) as caught:
+                    await request("failed")
+                assert "keepalive ping timeout" in str(caught.value.exceptions[0])
+            else:
+                for name in ["first", "next"]:
+                    result = await request(name)
+                    assert result["completed"] and result["received"] == 1
+                    assert (tmp_path / name / "profile.json").exists()
+                assert (
+                    len(
+                        [
+                            row
+                            for row in observations
+                            if row.get("type") == "profile_ack"
+                        ]
+                    )
+                    == 2
+                )
+
+    try:
+        asyncio.run(scenario())
+    except BaseException as exc:
+        exc.add_note(
+            f"Profile ACKs observed: {sum(row.get('type') == 'profile_ack' for row in observations)}; last message types: {[(row.get('type'), row.get('kind')) for row in observations[-8:]]}"
+        )
+        raise

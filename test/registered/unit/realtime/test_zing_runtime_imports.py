@@ -55,6 +55,8 @@ def test_session_stage_profile_is_relayed_after_cleanup_before_close(
     from sglang.multimodal_gen.runtime.utils import zing_stage_timing
 
     events = []
+    profile_sent = asyncio.Event()
+    early_ack_received = False
     session = SimpleNamespace(
         id="s", next_chunk_index=2, request=SimpleNamespace(return_stage_timing=True)
     )
@@ -80,8 +82,15 @@ def test_session_stage_profile_is_relayed_after_cleanup_before_close(
     async def send(payload):
         assert msgspec.msgpack.decode(payload)["status"] == "complete"
         events.append("profile")
+        profile_sent.set()
 
     async def receive():
+        nonlocal early_ack_received
+        if not profile_sent.is_set() and not early_ack_received:
+            early_ack_received = True
+            events.append("early_ack")
+            return msgspec.msgpack.encode(dict(type="profile_ack", session_id="s"))
+        await profile_sent.wait()
         events.append("ack")
         return msgspec.msgpack.encode(dict(type="profile_ack", session_id="s"))
 
@@ -90,6 +99,7 @@ def test_session_stage_profile_is_relayed_after_cleanup_before_close(
         events.append("remove")
 
     async def close(*args, **kwargs):
+        assert kwargs["drain_input"] is True
         events.append("close")
 
     monkeypatch.delenv("SGLANG_ZING_STAGE_TIMING", raising=False)
@@ -112,7 +122,15 @@ def test_session_stage_profile_is_relayed_after_cleanup_before_close(
             (1000, "generation complete"),
         )
     )
-    assert events == ["cleanup", "collect", "profile", "ack", "remove", "close"]
+    assert events == [
+        "cleanup",
+        "collect",
+        "early_ack",
+        "profile",
+        "ack",
+        "remove",
+        "close",
+    ]
 
 
 @pytest.mark.parametrize("legacy_mode", [None, "off", "host", "cuda"])
@@ -130,6 +148,7 @@ def test_unrequested_stage_profile_skips_collection(monkeypatch, legacy_mode):
         events.append("cleanup")
 
     async def close(*args, **kwargs):
+        assert kwargs["drain_input"] is True
         events.append("close")
 
     async def forbidden(*args, **kwargs):

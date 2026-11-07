@@ -58,8 +58,10 @@ def load(path):
 def validate(root):
     root = Path(root)
     manifest = json.loads((root / "COMPLETE.json").read_text())
-    if manifest.get("schema_version") != 2:
-        raise ValueError("Capture schema 2 is required")
+    if manifest.get("schema_version") not in (2, 3):
+        raise ValueError("Capture schema 2 or 3 is required")
+    if manifest.get("capture_scope", "full") != "full":
+        raise ValueError("Full component comparison requires a local Decoder capture")
     for key in ("chunks", "sources", "input_frames", "decoder_frames"):
         if type(manifest.get(key)) is not int or manifest[key] <= 0:
             raise ValueError(f"Missing or invalid capture count: {key}")

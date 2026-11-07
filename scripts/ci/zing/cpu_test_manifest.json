@@ -1216,56 +1216,31 @@
       "sources": [
         "main"
       ],
-      "reason": "Two fresh local Linux Python 3.11 CPU process trials passed against the pinned suite recipe after PR #283 session profile relay integration with the supported CPU platform override.",
+      "reason": "Import-only ExceptionGroup binding verified by two fresh Linux zero-GPU trials: 123 passed each, no skips. Independent R5 original log/hash/JUnit/source verification; GPU behavior unchanged.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "4084e45272f24c1da42bff01b9a5cf473d2dddbff8ced4d7dcb95f673f9e8cb3",
-        "receipt": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/taeh3-contracts/receipt.json",
-        "receipt_sha256": "a0eebfbcd5efa6a1ac39f084b54507dc706397ed7592fbc76b303d911a24e43b",
+        "source_sha256": "82bbccec9c383546c1ff41dd44272ab6f73328ccea5001d707971d6d49cb360b",
+        "tested_head": "42b0c04a284fdb4335dca7fc4c3186c9bd5030e3",
+        "receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/serving-stall-20261105/CPU_R72_123_X2_INDEPENDENT_VERIFICATION.json",
+        "receipt_sha256": "7726a0fcbba64a0016dc2ea96504becb07b667284fc963726276a80e54d530e3",
+        "source_receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/serving-stall-20261105/cpu-r72-client-import-42b0c04a/CPU_READY.json",
+        "source_receipt_sha256": "096553e00596244643aac123c3c5af132a9a92e0f6b9c1ffcf8cc5aa44ad718d",
         "trials": [
           {
             "trial": 1,
-            "passed": 24,
-            "collected": 24,
+            "passed": 123,
             "skipped": 0,
-            "duration_seconds": 0.38975877400662284,
-            "exit_code": 0,
-            "log_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/taeh3-contracts/cpu-0-trial-1.log",
-            "junit_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/taeh3-contracts/cpu-0-trial-1.xml"
+            "log_sha256": "b55c5fc0386ae139d98586c85c388be7db316c2d9cd5d1545692111993e7070a",
+            "junit_sha256": "91dc0c6eb2b0d75fbb6c2e77f02665032f39f0676001c533919678a693262b6e"
           },
           {
             "trial": 2,
-            "passed": 24,
-            "collected": 24,
+            "passed": 123,
             "skipped": 0,
-            "duration_seconds": 0.35203892199206166,
-            "exit_code": 0,
-            "log_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/taeh3-contracts/cpu-0-trial-2.log",
-            "junit_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/taeh3-contracts/cpu-0-trial-2.xml"
+            "log_sha256": "644f0882014dc28cf0f85bad211df6bc084c00ec68ecd657dd7af5b3e7395585",
+            "junit_sha256": "1a3e444e85d8d1469b18c22b55fb59b58f69aa7aa2d287ff264b4881c45606f6"
           }
-        ],
-        "environment": {
-          "python": "3.11.15",
-          "platform": "Linux-6.6.114.1-microsoft-standard-WSL2-x86_64-with-glibc2.35"
-        },
-        "environment_recipe": {
-          "python_version": "3.11",
-          "requirements_sha256": {
-            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
-            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
-          }
-        },
-        "manifest_sha256": "683dc16f6843087df50c8f457fb286686bbb0a071e19758b2843a92f8438dcef",
-        "tooling_sha256": {
-          "check_python.py": "a22e6bde47103b7e2ffa065b137441794a64c9b622822e7301aa8d938e32cada",
-          "common.py": "91033550acb81ced696837a02f40cad5620ac2601d8109cb831c29d9eeb39978",
-          "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
-          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
-          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
-          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
-          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
-        },
-        "candidate_fingerprint": "8c67a5aacff8e2ff948ff54cf5d067a6907dece145928cd81dc35c8596e9a994"
+        ]
       }
     },
     {
@@ -1318,37 +1293,41 @@
       "sources": [
         "main"
       ],
-      "reason": "Two fresh Alibaba Linux CPU process trials passed after main integration.",
+      "reason": "Two fixed Linux CPU trials in run 42133874314 passed this exact test file without skips; the pull-request merge checkout is recorded separately from tested head 4ae004da.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "ee0cc96a3c53e1af2113f0eddc87e6e7cb16a0be3b1cfb32a05b5a897747647b",
-        "receipt": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/benchmark-contracts-0/receipt.json",
-        "receipt_sha256": "7f7c22a75da7f55fdc47d3f8b4a7c9d63b2aa2de462bb7654b2011f2ed4f38e2",
+        "source_sha256": "3ebf9589f5c7ee1bc5bbc569ff10706973f31ac0aeeaf9372fba75c81eabd8db",
+        "receipt": "https://github.com/seedleap/sglang/actions/runs/42133874314",
+        "artifact_name": "zing-benchmark-contracts-shard-0-42133874314-1-d327b94fcd236f30bc76b5345be004be5d023d33",
+        "receipt_sha256": "2d16bc4a6a4abaf11c6d5e408dec3dee83cdbd879707ae8f5f9dac9a6bb29957",
+        "tested_head": "4ae004da0fd6c661052573fae25624da2b8c5253",
+        "checkout_sha": "d327b94fcd236f30bc76b5345be004be5d023d33",
         "trials": [
           {
             "trial": 1,
-            "passed": 15,
-            "collected": 15,
+            "passed": 19,
+            "collected": 19,
             "skipped": 0,
-            "duration_seconds": 18.848289335146546,
+            "duration_seconds": 10.90027114199998,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/benchmark-contracts-0/cpu-17-trial-1.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/benchmark-contracts-0/cpu-17-trial-1.xml"
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/cpu-suite/cpu-18-trial-1.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/cpu-suite/cpu-18-trial-1.xml"
           },
           {
             "trial": 2,
-            "passed": 15,
-            "collected": 15,
+            "passed": 19,
+            "collected": 19,
             "skipped": 0,
-            "duration_seconds": 18.9536597491242,
+            "duration_seconds": 11.358909109999956,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/benchmark-contracts-0/cpu-17-trial-2.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/benchmark-contracts-0/cpu-17-trial-2.xml"
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/cpu-suite/cpu-18-trial-2.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/cpu-suite/cpu-18-trial-2.xml"
           }
         ],
         "environment": {
-          "python": "3.11.12",
-          "platform": "Linux-6.6.102-001.8.100.kangaroo.al8.x86_64-x86_64-with-glibc2.39"
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
+          "torch": "2.8.0+cpu"
         },
         "environment_recipe": {
           "python_version": "3.11",
@@ -1356,16 +1335,6 @@
             "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
             "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
           }
-        },
-        "manifest_sha256": "4abd3c0a8465905e4340d8303ec04f1ae88cb15e6885b98d93f6b919731b44cf",
-        "tooling_sha256": {
-          "check_python.py": "a22e6bde47103b7e2ffa065b137441794a64c9b622822e7301aa8d938e32cada",
-          "common.py": "2edda6b9e4e6f372d70851a47d065dd99eaf436fcc6d8714b9609b72aa13311f",
-          "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
-          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
-          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
-          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
-          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
         }
       }
     },
@@ -1437,55 +1406,34 @@
       "sources": [
         "main"
       ],
-      "reason": "Two fresh Alibaba Linux CPU process trials passed after main integration.",
+      "reason": "Two Linux zero-GPU trials passed with no skips after terminal close input-drain fix; six original logs/JUnit independently read by separate CPU pod and verified.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "be5e2402c96048b92f375be5f0f5f4ca6a7405a94069af5ce596be3dfa15e749",
-        "receipt": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/benchmark-contracts-0/receipt.json",
-        "receipt_sha256": "7f7c22a75da7f55fdc47d3f8b4a7c9d63b2aa2de462bb7654b2011f2ed4f38e2",
+        "source_sha256": "8f244a7f5168bc49bc2a0aeb6f002a0ae69f1bd719a80d353cc44e37d3be2d99",
+        "tested_head": "f9de640a235ead1dea8f273245f65fcf1a42d342",
+        "receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/serving-stall-20261105/CPU_R57_230_X2_AND_PROBE_INSTALL_INDEPENDENT_VERIFICATION.json",
+        "receipt_sha256": "3078e37ad2225edc502102d30950d499e763fa621e28479f7e6c74e4b495c3cf",
+        "source_receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/serving-stall-20261105/b300-r57-graph-close-f9de640a/CPU_READY.json",
+        "source_receipt_sha256": "b58ff41a82a7701c9255af9a4f272c4f7bc1c2ad879ec7a20976e1fbabed7672",
         "trials": [
           {
             "trial": 1,
-            "passed": 5,
-            "collected": 5,
+            "passed": 10,
+            "combined_passed": 230,
             "skipped": 0,
-            "duration_seconds": 1.0030175021383911,
-            "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/benchmark-contracts-0/cpu-18-trial-1.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/benchmark-contracts-0/cpu-18-trial-1.xml"
+            "log_sha256": "a86e107ca1d6d06c6e149b8e4509122c3585a8ee75c33292525dca6f880efa3e",
+            "junit_sha256": "92c3b48f76d4b971c5178ff5850469610a6918ca3e62e8769c6b41c5ea2316a1"
           },
           {
             "trial": 2,
-            "passed": 5,
-            "collected": 5,
+            "passed": 10,
+            "combined_passed": 230,
             "skipped": 0,
-            "duration_seconds": 0.8887640540488064,
-            "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/benchmark-contracts-0/cpu-18-trial-2.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/benchmark-contracts-0/cpu-18-trial-2.xml"
+            "log_sha256": "27cc2f3db9205f7cf4c8afce8c1b9105125b21a387358cf7a941eca45e9cba96",
+            "junit_sha256": "9b44c8e6416d6e03401d0d386d06acb0a8f448a2f5bdd3ed543bb6a48498db0f"
           }
         ],
-        "environment": {
-          "python": "3.11.12",
-          "platform": "Linux-6.6.102-001.8.100.kangaroo.al8.x86_64-x86_64-with-glibc2.39"
-        },
-        "environment_recipe": {
-          "python_version": "3.11",
-          "requirements_sha256": {
-            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
-            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
-          }
-        },
-        "manifest_sha256": "4abd3c0a8465905e4340d8303ec04f1ae88cb15e6885b98d93f6b919731b44cf",
-        "tooling_sha256": {
-          "check_python.py": "a22e6bde47103b7e2ffa065b137441794a64c9b622822e7301aa8d938e32cada",
-          "common.py": "2edda6b9e4e6f372d70851a47d065dd99eaf436fcc6d8714b9609b72aa13311f",
-          "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
-          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
-          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
-          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
-          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
-        }
+        "scope": "CPU contracts only; real GPU terminal profile and lifecycle validation remains separate"
       }
     },
     {
@@ -1766,37 +1714,41 @@
       "sources": [
         "main"
       ],
-      "reason": "Two fresh local Linux Python 3.11 CPU process trials passed against the pinned suite recipe after PR #283 session profile relay integration with the supported CPU platform override.",
+      "reason": "Two fixed Linux CPU trials in run 42133874314 passed this exact test file without skips; the pull-request merge checkout is recorded separately from tested head 4ae004da.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "eba13154411d83be4a40a46d7f6847f4f7fb8a6138e3d1b1c8d826392f3b4656",
-        "receipt": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/benchmark-contracts/receipt.json",
-        "receipt_sha256": "9440f27e8d8c91b029d4c77a4ca1f049e3fa012211b446cc2d4221d35ae11f75",
+        "source_sha256": "c1334930852a379568610503ff592fb5caa53d2637e1c181a9f95ebf72f4153d",
+        "receipt": "https://github.com/seedleap/sglang/actions/runs/42133874314",
+        "artifact_name": "zing-benchmark-contracts-shard-0-42133874314-1-d327b94fcd236f30bc76b5345be004be5d023d33",
+        "receipt_sha256": "2d16bc4a6a4abaf11c6d5e408dec3dee83cdbd879707ae8f5f9dac9a6bb29957",
+        "tested_head": "4ae004da0fd6c661052573fae25624da2b8c5253",
+        "checkout_sha": "d327b94fcd236f30bc76b5345be004be5d023d33",
         "trials": [
           {
             "trial": 1,
-            "passed": 9,
-            "collected": 9,
+            "passed": 37,
+            "collected": 37,
             "skipped": 0,
-            "duration_seconds": 0.46086880899383686,
+            "duration_seconds": 0.5320133609999971,
             "exit_code": 0,
-            "log_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/benchmark-contracts/cpu-1-trial-1.log",
-            "junit_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/benchmark-contracts/cpu-1-trial-1.xml"
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/cpu-suite/cpu-28-trial-1.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/cpu-suite/cpu-28-trial-1.xml"
           },
           {
             "trial": 2,
-            "passed": 9,
-            "collected": 9,
+            "passed": 37,
+            "collected": 37,
             "skipped": 0,
-            "duration_seconds": 0.36846126400632784,
+            "duration_seconds": 0.5040628020000213,
             "exit_code": 0,
-            "log_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/benchmark-contracts/cpu-1-trial-2.log",
-            "junit_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/benchmark-contracts/cpu-1-trial-2.xml"
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/cpu-suite/cpu-28-trial-2.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/cpu-suite/cpu-28-trial-2.xml"
           }
         ],
         "environment": {
-          "python": "3.11.15",
-          "platform": "Linux-6.6.114.1-microsoft-standard-WSL2-x86_64-with-glibc2.35"
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
+          "torch": "2.8.0+cpu"
         },
         "environment_recipe": {
           "python_version": "3.11",
@@ -1804,18 +1756,7 @@
             "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
             "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
           }
-        },
-        "manifest_sha256": "683dc16f6843087df50c8f457fb286686bbb0a071e19758b2843a92f8438dcef",
-        "tooling_sha256": {
-          "check_python.py": "a22e6bde47103b7e2ffa065b137441794a64c9b622822e7301aa8d938e32cada",
-          "common.py": "91033550acb81ced696837a02f40cad5620ac2601d8109cb831c29d9eeb39978",
-          "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
-          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
-          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
-          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
-          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
-        },
-        "candidate_fingerprint": "8c67a5aacff8e2ff948ff54cf5d067a6907dece145928cd81dc35c8596e9a994"
+        }
       }
     },
     {
@@ -2127,42 +2068,34 @@
       "sources": [
         "conditioning"
       ],
-      "reason": "Two targeted CPU regression trials passed after defaulting deployment entry points to NCCL: 173 primary cases and 27 subtests each, zero skips. Includes both endpoint startup and explicit HTTP compatibility.",
+      "reason": "Two Linux zero-GPU trials passed all44 NCCL conditioning controls without skips; cross-thread destruction event preserves idle ownership and send-lifetime checks. Five original log/JUnit files independently read by R5.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "7ad7ea88015c33acabb19e3caf764d9c4e10e8bdbb6b4dd7da67398e2fa2b61b",
-        "receipt": "D:\\qwen-nccl-prefetch-20261028\\nccl-default-validation-receipt.json",
-        "receipt_sha256": "8a0ec3f6271b923c21b52dc668f25b3da2b3664ab92f9a8bc07e3bc5ca5b0d44",
+        "source_sha256": "c8736bbcb526f1acc3da058bec4221c52b24b8b38224aa858ae6e69c925bbf44",
+        "tested_head": "c04eaf3e1f7233389457e60aa25803c657c6440e",
+        "receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/serving-stall-20261105/CPU_R66_44_X2_INDEPENDENT_VERIFICATION.json",
+        "receipt_sha256": "c7d636aef0fb91204e7fc9eb27d04cfc1b3884f23ac7c5222043e44f9da03593",
+        "source_receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/serving-stall-20261105/cpu-r66-conditioning-release-c04eaf3e/CPU_READY.json",
+        "source_receipt_sha256": "8023753a9f33b3e5c1f0b4703daaadabb213162d17332856e66ac488c0df431c",
         "trials": [
           {
             "trial": 1,
-            "passed": 173,
-            "collected": 173,
-            "subtests_passed": 27,
+            "passed": 44,
+            "combined_passed": 44,
             "skipped": 0,
-            "exit_code": 0,
-            "duration_seconds": 47.26,
-            "log_path": "D:\\qwen-nccl-prefetch-20261028\\nccl-default-1.log",
-            "junit_path": "D:\\qwen-nccl-prefetch-20261028\\nccl-default-1.xml"
+            "log_sha256": "f17df8e64fe94bf5b6ca7c250da849214910002270dba862768550245eeac124",
+            "junit_sha256": "b7d9f0cfd76825b49c62a14d5896bb315d422da289d5ffc917dd29dea300742d"
           },
           {
             "trial": 2,
-            "passed": 173,
-            "collected": 173,
-            "subtests_passed": 27,
+            "passed": 44,
+            "combined_passed": 44,
             "skipped": 0,
-            "exit_code": 0,
-            "duration_seconds": 43.39,
-            "log_path": "D:\\qwen-nccl-prefetch-20261028\\nccl-default-2.log",
-            "junit_path": "D:\\qwen-nccl-prefetch-20261028\\nccl-default-2.xml"
+            "log_sha256": "a2a9c7ba13931ca40568328a959ec71d5ad1949a44d23f4dd0bc14fe66459253",
+            "junit_sha256": "da8fc498fef53b565f78c546cd310d07318ada1a2a0386782779a0b9ada15338"
           }
         ],
-        "environment": {
-          "python": "3.12.3",
-          "platform": "WSL Linux",
-          "torch": "2.14.1+cpu",
-          "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": "cpu"
-        }
+        "scope": "CPU lifecycle contracts only; earlier failed CI originals retained separately"
       }
     },
     {
@@ -3274,37 +3207,41 @@
       "sources": [
         "main"
       ],
-      "reason": "Two fresh Alibaba Linux CPU process trials passed after main integration.",
+      "reason": "Two fixed Linux CPU trials in run 42133874314 passed this exact test file without skips; the pull-request merge checkout is recorded separately from tested head 4ae004da.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "3d78bfeb326c7281fc8c587969d85785e3470c28c9b86105cd3a521e48e9ff57",
-        "receipt": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-0/receipt.json",
-        "receipt_sha256": "7833f56bd52ba3f30285823f41dd664af286d353b8d29e125d711c973b69a870",
+        "source_sha256": "e27f52252a2951f4290b347b664f8415487d74bedfd0e112e198fb8d46da8ca2",
+        "receipt": "https://github.com/seedleap/sglang/actions/runs/42133874314",
+        "artifact_name": "zing-dit-pipeline-contracts-shard-0-42133874314-1-d327b94fcd236f30bc76b5345be004be5d023d33",
+        "receipt_sha256": "35ff7e07fc1bc47a82d256c1c98e62e7838fe72b65ddd7b8a90d9a18e7472d22",
+        "tested_head": "4ae004da0fd6c661052573fae25624da2b8c5253",
+        "checkout_sha": "d327b94fcd236f30bc76b5345be004be5d023d33",
         "trials": [
           {
             "trial": 1,
-            "passed": 3,
-            "collected": 3,
+            "passed": 4,
+            "collected": 4,
             "skipped": 0,
-            "duration_seconds": 18.778339826967567,
+            "duration_seconds": 11.03657285700001,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-0/cpu-1-trial-1.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-0/cpu-1-trial-1.xml"
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/cpu-suite/cpu-3-trial-1.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/cpu-suite/cpu-3-trial-1.xml"
           },
           {
             "trial": 2,
-            "passed": 3,
-            "collected": 3,
+            "passed": 4,
+            "collected": 4,
             "skipped": 0,
-            "duration_seconds": 20.66678680293262,
+            "duration_seconds": 11.407978455000034,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-0/cpu-1-trial-2.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-0/cpu-1-trial-2.xml"
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/cpu-suite/cpu-3-trial-2.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/cpu-suite/cpu-3-trial-2.xml"
           }
         ],
         "environment": {
-          "python": "3.11.12",
-          "platform": "Linux-6.6.102-001.8.100.kangaroo.al8.x86_64-x86_64-with-glibc2.39"
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
+          "torch": "2.8.0+cpu"
         },
         "environment_recipe": {
           "python_version": "3.11",
@@ -3312,16 +3249,6 @@
             "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
             "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
           }
-        },
-        "manifest_sha256": "4abd3c0a8465905e4340d8303ec04f1ae88cb15e6885b98d93f6b919731b44cf",
-        "tooling_sha256": {
-          "check_python.py": "a22e6bde47103b7e2ffa065b137441794a64c9b622822e7301aa8d938e32cada",
-          "common.py": "2edda6b9e4e6f372d70851a47d065dd99eaf436fcc6d8714b9609b72aa13311f",
-          "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
-          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
-          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
-          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
-          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
         }
       }
     },
@@ -3955,37 +3882,41 @@
       "sources": [
         "main"
       ],
-      "reason": "Two fresh Alibaba Linux CPU process trials passed after main integration.",
+      "reason": "Two fixed Linux CPU trials in run 42165084221 passed 192 graph contracts with the same four explicitly allowed CUDA skips; real invalidated-capture stream/GC restoration was separately exercised on GPU.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "18e27680ab7157497d75cbcd70500a51461b6f366a90c0ef3e85301ade621704",
-        "receipt": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-1/receipt.json",
-        "receipt_sha256": "8713fedd8775a1b331f93351ad592908a13b8f4ab7d23fef0a47bfc033765639",
+        "source_sha256": "772bbbec0391115861e71f183a71417f9bf4dd546034db6c7cb0b569a9e0f857",
+        "receipt": "https://github.com/seedleap/sglang/actions/runs/42165084221",
+        "artifact_name": "zing-dit-pipeline-contracts-shard-2-42165084221-1-0764be413b46664be21739534ab452840bd19675",
+        "receipt_sha256": "8694194709eb9e1f556cce9ee976cc2d6f227df906e8bf6c30a714094106ea0a",
+        "tested_head": "9060b4b6dccc764149fda9fdfe49e937201edd34",
+        "checkout_sha": "0764be413b46664be21739534ab452840bd19675",
         "trials": [
           {
             "trial": 1,
-            "passed": 25,
-            "collected": 27,
-            "skipped": 2,
-            "duration_seconds": 27.19272109004669,
+            "passed": 192,
+            "collected": 196,
+            "skipped": 4,
+            "duration_seconds": 107.14429285200004,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-1/cpu-1-trial-1.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-1/cpu-1-trial-1.xml"
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/cpu-suite/cpu-5-trial-1.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/cpu-suite/cpu-5-trial-1.xml"
           },
           {
             "trial": 2,
-            "passed": 25,
-            "collected": 27,
-            "skipped": 2,
-            "duration_seconds": 26.73048057896085,
+            "passed": 192,
+            "collected": 196,
+            "skipped": 4,
+            "duration_seconds": 107.37446325999997,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-1/cpu-1-trial-2.log",
-            "junit_path": "/cpfs/world-model/sglang/issue277-cpu-ci/20261012-01a12e03/main-validation/dit-triage-1/cpu-1-trial-2.xml"
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/cpu-suite/cpu-5-trial-2.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/cpu-suite/cpu-5-trial-2.xml"
           }
         ],
         "environment": {
-          "python": "3.11.12",
-          "platform": "Linux-6.6.102-001.8.100.kangaroo.al8.x86_64-x86_64-with-glibc2.39"
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
+          "torch": "2.8.0+cpu"
         },
         "environment_recipe": {
           "python_version": "3.11",
@@ -3993,16 +3924,6 @@
             "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
             "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
           }
-        },
-        "manifest_sha256": "4abd3c0a8465905e4340d8303ec04f1ae88cb15e6885b98d93f6b919731b44cf",
-        "tooling_sha256": {
-          "check_python.py": "a22e6bde47103b7e2ffa065b137441794a64c9b622822e7301aa8d938e32cada",
-          "common.py": "2edda6b9e4e6f372d70851a47d065dd99eaf436fcc6d8714b9609b72aa13311f",
-          "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
-          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
-          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
-          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
-          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
         }
       }
     },
@@ -4195,60 +4116,37 @@
       "sources": [
         "main"
       ],
-      "reason": "Layout strategies and explicit warmup-before-ready admission tests passed two fresh Linux Python 3.11 / pinned CPU-recipe trials; source hashes, complete case identities and JUnit checked; no skips.",
+      "reason": "Two actual Linux CPU trials passed all15 Encoder lifecycle/loader cases, no skips; full raw logs/JUnit independently read and SHA-verified against frozen readiness. GPU behavior remains separate.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "c3ca2f27b7097a7b25ee8840b1156bffae08f669c3f4bd427dd1a2a8c9dadca9",
-        "receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/encoder-warmup-strategy-20261022-r1/readback/triage/receipt.json",
-        "receipt_sha256": "824979d9eaae66042432fb1853570d4923d0642388bde4cf72f2c5e3cbbe8aa9",
+        "source_sha256": "2534bf0472d46bdc7b61e9d99cb7d3ad117d6bcb61338045d22854947fb1dca9",
+        "receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/serving-stall-20261105/cpu-controller-20261106-r3/096-immutable-preflight.json",
+        "receipt_sha256": "7a8cc5fe73211b364ff9108bd56c2a24f9a2690ed38cd20eaf0a204dadf9df86",
+        "tested_head": "ed4398a07714968113751d2b2e1cc172ed2611c3",
         "trials": [
           {
             "trial": 1,
-            "passed": 10,
-            "collected": 10,
+            "passed": 15,
+            "collected": 15,
             "skipped": 0,
-            "duration_seconds": 13.791853188999994,
             "exit_code": 0,
-            "log_path": "/mnt/oss/world-model/sglang/evals/encoder-warmup-strategy-20261022-r1/readback/triage/cpu-0-trial-1.log",
-            "junit_path": "/mnt/oss/world-model/sglang/evals/encoder-warmup-strategy-20261022-r1/readback/triage/cpu-0-trial-1.xml"
+            "junit_sha256": "3f135cc4e3c66c3732c0b79de1679d025d8782efdc5d6fbe719e0b8b498bb68c",
+            "log_sha256": "fa864e7cbdf8951e7abc4cd751b78a3025f1eab034420329e4f961d333fb9d6d"
           },
           {
             "trial": 2,
-            "passed": 10,
-            "collected": 10,
+            "passed": 15,
+            "collected": 15,
             "skipped": 0,
-            "duration_seconds": 6.522227923000003,
             "exit_code": 0,
-            "log_path": "/mnt/oss/world-model/sglang/evals/encoder-warmup-strategy-20261022-r1/readback/triage/cpu-0-trial-2.log",
-            "junit_path": "/mnt/oss/world-model/sglang/evals/encoder-warmup-strategy-20261022-r1/readback/triage/cpu-0-trial-2.xml"
+            "junit_sha256": "272fbd6a93a46ef4d51fe82e62e6c87f0b92c7472295f7e005ac6124528dabc2",
+            "log_sha256": "e4ba5cb3f4e9bee6f4f6c5f47ca299ae713947f3d3bf84822bf90980a600c178"
           }
         ],
         "environment": {
-          "python": "3.11.16",
-          "platform": "Linux-6.6.102-001.8.100.kangaroo.al8.x86_64-x86_64-with-glibc2.39"
-        },
-        "environment_recipe": {
-          "python_version": "3.11",
-          "requirements_sha256": {
-            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
-            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
-          }
-        },
-        "manifest_sha256": "411747a2acadccca5a215472bd20f951165a572b42fb7d2dd334c84f76d6eb00",
-        "tooling_sha256": {
-          "check_python.py": "edced74edc439191f8ff97373e71fbb50d1469cff016c7163f0cb80d93ede73b",
-          "common.py": "52128fc66405da6918eecb98a73d76f322aa3fbe6fec9b55c0a3ff9924cb8f4b",
-          "run_cpu_tests.py": "a06607bb9ba3734c605194d274c9dc35b2b52555470b912b9af69bc18ccdb60d",
-          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
-          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
-          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
-          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
-        },
-        "job_id": "dlc19njci3xefe2v",
-        "source_snapshot_sha": "e109c3b5141d36a8efbf5f7a45a3db3af3949f93",
-        "checkout_sha": "3366e96b3669152d0e39f5163c7168fe912fe1cd",
-        "candidate_fingerprint": "6a469b99488d8a2cc7f43fce3d31be306037e0285b9fa73cdea91ca66a7b9f43",
-        "checkout_note": "Synthetic local Git snapshot of the frozen base archive; candidate overlays are identified by SOURCE.json and the receipt fingerprint."
+          "recipe": "Actual zero-GPU PAI container; CUDA_VISIBLE_DEVICES empty",
+          "image": "zing-thailand-registry-vpc.ap-southeast-7.cr.aliyuncs.com/zing/sglang@sha256:894eb66a6f96755d439e07045c27dac2dd5087d7caa5ea5f4d534bf7a500740a"
+        }
       }
     },
     {
@@ -7720,59 +7618,37 @@
       "sources": [
         "main"
       ],
-      "reason": "Two fresh local Linux Python 3.11 CPU process trials passed against the pinned suite recipe after PR #283 session profile relay integration with the supported CPU platform override.",
+      "reason": "Two Linux zero-GPU trials passed with no skips after terminal close input-drain fix; six original logs/JUnit independently read by separate CPU pod and verified.",
       "dependencies": [
         "requirements-cpu.txt",
         "requirements-torch.txt"
       ],
       "trial_evidence": {
-        "source_sha256": "e793fc999df00e6f04d49cf8a7158eb34ef11ae5fb7a9769a33c1f7aaedff027",
-        "receipt": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/realtime-contracts/receipt.json",
-        "receipt_sha256": "686c88ed1ed89cbf81ec6eb93e3732a08ca885753359f19e99d00a2431971684",
+        "source_sha256": "e86f30621ea1a22715c7c85ca37ac8db386929b3174aa6cb6050743911f96e4c",
+        "tested_head": "f9de640a235ead1dea8f273245f65fcf1a42d342",
+        "receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/serving-stall-20261105/CPU_R57_230_X2_AND_PROBE_INSTALL_INDEPENDENT_VERIFICATION.json",
+        "receipt_sha256": "3078e37ad2225edc502102d30950d499e763fa621e28479f7e6c74e4b495c3cf",
+        "source_receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/serving-stall-20261105/b300-r57-graph-close-f9de640a/CPU_READY.json",
+        "source_receipt_sha256": "b58ff41a82a7701c9255af9a4f272c4f7bc1c2ad879ec7a20976e1fbabed7672",
         "trials": [
           {
             "trial": 1,
-            "passed": 3,
-            "collected": 3,
+            "passed": 6,
+            "combined_passed": 230,
             "skipped": 0,
-            "duration_seconds": 13.978849104998517,
-            "exit_code": 0,
-            "log_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/realtime-contracts/cpu-0-trial-1.log",
-            "junit_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/realtime-contracts/cpu-0-trial-1.xml"
+            "log_sha256": "a86e107ca1d6d06c6e149b8e4509122c3585a8ee75c33292525dca6f880efa3e",
+            "junit_sha256": "92c3b48f76d4b971c5178ff5850469610a6918ca3e62e8769c6b41c5ea2316a1"
           },
           {
             "trial": 2,
-            "passed": 3,
-            "collected": 3,
+            "passed": 6,
+            "combined_passed": 230,
             "skipped": 0,
-            "duration_seconds": 14.798938406995148,
-            "exit_code": 0,
-            "log_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/realtime-contracts/cpu-0-trial-2.log",
-            "junit_path": "/home/ss80194/work/sglang-zing/exports/issue283-profile-relay-20261013/realtime-contracts/cpu-0-trial-2.xml"
+            "log_sha256": "27cc2f3db9205f7cf4c8afce8c1b9105125b21a387358cf7a941eca45e9cba96",
+            "junit_sha256": "9b44c8e6416d6e03401d0d386d06acb0a8f448a2f5bdd3ed543bb6a48498db0f"
           }
         ],
-        "environment": {
-          "python": "3.11.15",
-          "platform": "Linux-6.6.114.1-microsoft-standard-WSL2-x86_64-with-glibc2.35"
-        },
-        "environment_recipe": {
-          "python_version": "3.11",
-          "requirements_sha256": {
-            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
-            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
-          }
-        },
-        "manifest_sha256": "7ec804a7c5d1f48cf1b626c9f0099d089c16663ff8d28bdb7fbcc07aebec1a6d",
-        "tooling_sha256": {
-          "check_python.py": "a22e6bde47103b7e2ffa065b137441794a64c9b622822e7301aa8d938e32cada",
-          "common.py": "91033550acb81ced696837a02f40cad5620ac2601d8109cb831c29d9eeb39978",
-          "run_cpu_tests.py": "269ecd6435cb960dd64bdba2ae78994524901dbed4610f90fd571ff6dc2e4d3b",
-          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
-          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
-          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
-          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
-        },
-        "candidate_fingerprint": "f4e77ce3817e37819a30ffc5d774dc1b5d4ed8267ac5cef4cc8a2e7364bfd8bd"
+        "scope": "CPU contracts only; real GPU terminal profile and lifecycle validation remains separate"
       }
     },
     {
@@ -8480,43 +8356,34 @@
       "sources": [
         "conditioning"
       ],
-      "reason": "Two complete conditioning CPU default-suite trials passed after the pipeline CLI changes; both 1876 primary cases and 59 subtests passed with no skips.",
+      "reason": "Two Linux zero-GPU trials passed all39 prefetch controls without skips. Real delivery/cache reuse and strict controlled latest pending replacement both passed; five original log/JUnit files independently read by R5.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "f110dfe732d5fe941734842e606714524f4bdf2bff412bcd898b6a18c530e764",
-        "receipt": "D:\\qwen-nccl-prefetch-20261028\\pipeline-validation-receipt.json",
-        "receipt_sha256": "6aab4dcb470fac636183c2796a91f927732289c08c9ebcaeb68664f1b0995571",
+        "source_sha256": "b1de65724816209018eb4faf915ac44183875c0ecc03d19cf32ae9f2d62bdd2f",
+        "tested_head": "e5ca7594b717c361b96cb104cdd0fe782473ad28",
+        "receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/serving-stall-20261105/CPU_R68_39_X2_INDEPENDENT_VERIFICATION.json",
+        "receipt_sha256": "6003483ae1ce9374fc4821bbc7193da023e4bf3852965fcda17bdcb167c42c84",
+        "source_receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/serving-stall-20261105/cpu-r68-prefetch-delivery-e5ca7594/CPU_READY.json",
+        "source_receipt_sha256": "0214ac1ad044c7afe176ef075cc5e90db109afb4683da91d071c49e6bae19cae",
         "trials": [
           {
             "trial": 1,
-            "full_suite_passed": 1876,
-            "full_suite_collected": 1876,
-            "full_suite_subtests_passed": 59,
-            "full_suite_skipped": 0,
-            "exit_code": 0,
-            "duration_seconds": 363.41,
-            "log_path": "D:\\qwen-nccl-prefetch-20261028\\pipeline-full-1.log",
-            "junit_path": "D:\\qwen-nccl-prefetch-20261028\\pipeline-full-1.xml"
+            "passed": 39,
+            "combined_passed": 39,
+            "skipped": 0,
+            "log_sha256": "dee84e4039c66f5bbf27afe6a170d42689937b9a22ab1bf8add815b9e6f21310",
+            "junit_sha256": "89a732438fd84da04909deeca3b9c7109af76330d2fae76f500149323e2eaa1d"
           },
           {
             "trial": 2,
-            "full_suite_passed": 1876,
-            "full_suite_collected": 1876,
-            "full_suite_subtests_passed": 59,
-            "full_suite_skipped": 0,
-            "exit_code": 0,
-            "duration_seconds": 413.6,
-            "log_path": "D:\\qwen-nccl-prefetch-20261028\\pipeline-full-2.log",
-            "junit_path": "D:\\qwen-nccl-prefetch-20261028\\pipeline-full-2.xml"
+            "passed": 39,
+            "combined_passed": 39,
+            "skipped": 0,
+            "log_sha256": "7b995110e5d08371b212df1bc24b8413dba06c61ea21cc078701d9f12c1c0d62",
+            "junit_sha256": "adaf799c7659c887df4192abee2d7470c0122d6e813dec7f2c0444164e04c989"
           }
         ],
-        "environment": {
-          "python": "3.12.3",
-          "platform": "WSL Linux",
-          "torch": "2.14.1+cpu",
-          "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": "cpu"
-        },
-        "environment_lock_sha256": "5f7d2b06884bcdfa76f2bbc3da82fbdbcb29f12a06c60a6265e7feacfb2fe765"
+        "scope": "CPU/real IPC fixture contracts only; earlier failed CI originals retained separately"
       }
     },
     {
@@ -10884,6 +10751,124 @@
       }
     },
     {
+      "path": "benchmark/zing_h3_causal/tests/test_frozen_rgb.py",
+      "suite": "benchmark-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two fixed Linux CPU process trials passed in PR #580 candidate run 41983098284.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "6880d8021a5268d97d1d6aa48c92066b1047642b6d8fa5b8e8d622e3639eeb69",
+        "receipt": "https://github.com/seedleap/sglang/actions/runs/41983098284",
+        "receipt_sha256": "c55b98b58b666d81204b877556c6896f960c6b01ed8f4e7f8682ce9f98a726d3",
+        "tested_head": "25f3d13ab4898ef12f220681935c680eaaed00bc",
+        "checkout_sha": "af14319bf6e0f6918794ee4520313545667185e2",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 1,
+            "collected": 1,
+            "skipped": 0,
+            "duration_seconds": 0.34448309499998686,
+            "exit_code": 0,
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/stall-candidate/cpu-1-trial-1.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/stall-candidate/cpu-1-trial-1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 1,
+            "collected": 1,
+            "skipped": 0,
+            "duration_seconds": 0.35142546999998103,
+            "exit_code": 0,
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/stall-candidate/cpu-1-trial-2.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/stall-candidate/cpu-1-trial-2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
+          "torch": "2.8.0+cpu"
+        },
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          }
+        }
+      }
+    },
+    {
+      "path": "benchmark/zing_h3_causal/tests/test_stall_archive.py",
+      "suite": "benchmark-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two fixed Linux CPU trials in run 42100767044 passed all four archive byte-integrity, corruption and interrupted-upload retry contracts without skips. Mounted OSS atomic rename was independently GET-verified as a separate small-object check.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "d6cf9a51afbad6a735b138f6788d48ff16e58d93eac520bb2c708d88ea9bf6a5",
+        "receipt": "https://github.com/seedleap/sglang/actions/runs/42100767044",
+        "artifact_name": "zing-benchmark-contracts-shard-0-42100767044-1-346511a6344ad2a30d58f8d12f88ad34cec3f85d",
+        "receipt_sha256": "8b28bd16e080f6486ac9bbb8477c258aa7127d7e3e2141f1c9e9506f45720fe1",
+        "tested_head": "346511a6344ad2a30d58f8d12f88ad34cec3f85d",
+        "checkout_sha": "346511a6344ad2a30d58f8d12f88ad34cec3f85d",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 4,
+            "collected": 4,
+            "skipped": 0,
+            "duration_seconds": 1.2972336920000203,
+            "exit_code": 0,
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/cpu-suite/cpu-38-trial-1.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/cpu-suite/cpu-38-trial-1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 4,
+            "collected": 4,
+            "skipped": 0,
+            "duration_seconds": 1.2723146499999984,
+            "exit_code": 0,
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/cpu-suite/cpu-38-trial-2.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/cpu-suite/cpu-38-trial-2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
+        },
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          }
+        }
+      }
+    },
+    {
+      "path": "benchmark/zing_h3_causal/tests/test_stream_stalls.py",
+      "suite": "benchmark-contracts",
+      "status": "UNRUN",
+      "approved": false,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Six-card dedicated allocation adds two CPU contracts; new Linux zero-GPU two-trial evidence is pending. Previous 88-contract evidence is retained in the task artifacts and is not approval for the changed source.",
+      "dependencies": []
+    },
+    {
       "path": "python/sglang/multimodal_gen/test/unit/realtime/test_zing_nccl.py",
       "suite": "realtime-contracts",
       "status": "CPU_PASS",
@@ -11309,6 +11294,190 @@
           "python": "3.11.15",
           "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39"
         }
+      }
+    },
+    {
+      "path": "benchmark/zing_h3_causal/tests/test_main_stall_collection.py",
+      "suite": "benchmark-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two fresh Linux zero-GPU trials passed, no skips; R5 independently read/hash/JUnit checked original files. Unit orchestration only, no distributed/GPU acceptance.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "d50ed76553e515eb863aef937f2d6c889445ae58dbae712567c71c6a4dbc5749",
+        "tested_head": "a8cc4be432fe499d76c43e8759564deb532b7c92",
+        "receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/serving-stall-20261105/CPU_R70_257_X2_INDEPENDENT_VERIFICATION.json",
+        "receipt_sha256": "cc41a1aa9ca0f6e96b0cce2d64bc71fa8bc21f19f4d50e32e6553c42cd5d0398",
+        "source_receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/serving-stall-20261105/b300-r70-dit-resident-a8cc4be4/CPU_READY.json",
+        "source_receipt_sha256": "3b9f4559174b7f896fe829cf2451e08fd4bff1dafeb98cd22a8faf2cca89ab94",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 5,
+            "combined_passed": 257,
+            "skipped": 0,
+            "log_sha256": "f408ce63b489a278b927364f74b2f5ff3b7a23d4f0fe3ba8c1a646397f2103b8",
+            "junit_sha256": "10df5ccc52b2505c767f8d47162d3f231f2e04605f9e208a09c6576f89554713"
+          },
+          {
+            "trial": 2,
+            "passed": 5,
+            "combined_passed": 257,
+            "skipped": 0,
+            "log_sha256": "603ea8f593c18b774ff0628053fc2091912dacf97fac5dade03d00df457e245e",
+            "junit_sha256": "20dc924563d2b782799822e27f348d4e200c57a1c5f6abf3816e04db7fa27624"
+          }
+        ]
+      }
+    },
+    {
+      "path": "benchmark/zing_h3_causal/tests/test_replay_collection_decision.py",
+      "suite": "benchmark-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two fresh Linux zero-GPU trials passed16 contracts without skips; independent R5 original byte/hash/JUnit and committed source verification. Default600-second soak remains unchanged; no GPU acceptance inferred.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "f66592befa5cdf2eb2a577d3e0bd542839677f9e8a4e8f1b8d0f0726740bee31",
+        "tested_head": "433cf424883d992ab5d94f02df734e4e1cc83ced",
+        "receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/serving-stall-20261105/CPU_R74_263_X2_INDEPENDENT_VERIFICATION.json",
+        "receipt_sha256": "db4d36d3a7b58e7e2496a493b1772cb42cca6b660f2fcf51a3cb1b37f54fc2b2",
+        "source_receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/serving-stall-20261105/b300-r74-full-dit-433cf424/CPU_READY.json",
+        "source_receipt_sha256": "aea1e8294caa7744366115158e9ade044ebe96dcf2d81da4b8258c031a82b7f4",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 16,
+            "combined_passed": 263,
+            "skipped": 0,
+            "log_sha256": "c2b80b6c0e2111dc8e9bef79675130969063bc4a6a72656199a5613cefe82922",
+            "junit_sha256": "2cc70ba64690383a612cc109ad2af44fc30eb4d80d3fb03588e862bb221c8c67"
+          },
+          {
+            "trial": 2,
+            "passed": 16,
+            "combined_passed": 263,
+            "skipped": 0,
+            "log_sha256": "74eb7a8c174c7d00ed63e1d9f599324097a0a7b659b64514c2323e7e702087e2",
+            "junit_sha256": "921076cad9cc1124e2641cefa3636fbd31870507ccd78bef1987835b92ec7761"
+          }
+        ]
+      }
+    },
+    {
+      "path": "benchmark/zing_h3_causal/tests/test_decoder_resident.py",
+      "suite": "benchmark-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Four output ownership failure/success contracts passed in two zero-GPU Linux trials; independent fresh R5 actual imports and exact original byte/hash/JUnit verification. No GPU acceptance inferred.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "8040021cc57b16deeff03efc18ceba51eaf42c940989b00e3b06432e2181c472",
+        "tested_head": "6df2d742f94e366cb2cd4b1f5a1c8c74a24d1192",
+        "receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/serving-stall-20261105/CPU_R76_8_X2_INDEPENDENT_VERIFICATION.json",
+        "receipt_sha256": "33ebf3acc3f7271bdf7d0a65053e95a7883e656158634950b4d2efa719349b36",
+        "source_receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/serving-stall-20261105/decoder-resident-r76-6df2d742/CPU_READY.json",
+        "source_receipt_sha256": "139c5510dd914f7649d5b4b461e8bfa86d9c9973f7d903359f2d8e84a7366153",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 4,
+            "combined_passed": 8,
+            "skipped": 0,
+            "nodeids": [
+              "test_output_ownership_success_uses_consumer_ack",
+              "test_output_ownership_submit_failure_reclaims_unpublished_slot",
+              "test_output_ownership_consumer_failure_cancels_without_second_publish",
+              "test_output_ownership_reserve_failure_has_no_reference_to_cancel"
+            ],
+            "log_sha256": "f03c11c4f7aa30c7bc05e33f7b53bc1a540bb8cfbe09fd67e8b96729f7bcd274",
+            "junit_sha256": "507293902edae87fa2f9488f8b6aa848bb42d2a2e04a8710fcc6d3c2fdc1d618"
+          },
+          {
+            "trial": 2,
+            "passed": 4,
+            "combined_passed": 8,
+            "skipped": 0,
+            "nodeids": [
+              "test_output_ownership_success_uses_consumer_ack",
+              "test_output_ownership_submit_failure_reclaims_unpublished_slot",
+              "test_output_ownership_consumer_failure_cancels_without_second_publish",
+              "test_output_ownership_reserve_failure_has_no_reference_to_cancel"
+            ],
+            "log_sha256": "91d38eec16cbd453478df47c4c18de91d3ce1243e9e2307e004f9f528dce1b82",
+            "junit_sha256": "52f7ea0907e643c577017bea89d98e5f7040e2565154cf00f91699063bbef153"
+          }
+        ]
+      }
+    },
+    {
+      "path": "benchmark/zing_h3_causal/tests/test_owned_process.py",
+      "suite": "benchmark-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Thirteen ownership and standalone-entry contracts passed in two trials on each of two independent Linux zero-GPU jobs; all101-case original/fresh logs, JUnit and source hashes independently verified. Real subreaper, orphan, signal, unrelated-process safety and copied CLI startup exercised; no GPU acceptance.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "ec26b8f6813664f8573927a372a3c877cef9b3700bf634648f15ca803fc0b642",
+        "tested_head": "a53f5c8722c92eac350f24a2251250570b703217",
+        "receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/serving-stall-20261105/CPU_R80_101_X4_INDEPENDENT_VERIFICATION.json",
+        "receipt_sha256": "d0a1d8535763858c0ebd3bf55ac57a9ea20da1cd8c1ae883e99f023060df7c82",
+        "source_receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/serving-stall-20261105/owned-process-r80-a53f5c87/CPU_READY.json",
+        "source_receipt_sha256": "732677b65d0ce4c5bcd9cc86db01b610a23ab475081aabb150a55c8350b66f87",
+        "trials": [
+          {
+            "source": "producer",
+            "trial": 1,
+            "passed": 13,
+            "combined_passed": 101,
+            "skipped": 0,
+            "log_sha256": "5550ab5ee57beb768d1b5a8c68efd95675ee149733f46f7ccb0834f15ff0839d",
+            "junit_sha256": "331fa28f0d57808c9abaae4a923d109203d8fb3e03187e6ae0fac1c71d7174a4"
+          },
+          {
+            "source": "producer",
+            "trial": 2,
+            "passed": 13,
+            "combined_passed": 101,
+            "skipped": 0,
+            "log_sha256": "79298fe8ce145937a18053755f58089ab1dd2785f387ecea771306fbfe22b177",
+            "junit_sha256": "c8eac3fa1bba9b4109faa9ba033d495b06c8154f4d3dd0e29c303e4a21b23a3e"
+          },
+          {
+            "source": "fresh-reader",
+            "trial": 1,
+            "passed": 13,
+            "combined_passed": 101,
+            "skipped": 0,
+            "log_sha256": "e3dc39e248b8fcac8092f7b60ec328492f7588225889014eea44638532d621e8",
+            "junit_sha256": "2e9c0b081660dfea8c5ef3ef2102f6863683157dd2491410fbc09783654b926d"
+          },
+          {
+            "source": "fresh-reader",
+            "trial": 2,
+            "passed": 13,
+            "combined_passed": 101,
+            "skipped": 0,
+            "log_sha256": "6ff2de129005381d39c5ce474c059fabbabc11de94b4865cad4b832b7c55b17d",
+            "junit_sha256": "c18b73fc273fae50efc020210279be5e00ac577123853236cdec6a012a84805a"
+          }
+        ]
       }
     }
   ],

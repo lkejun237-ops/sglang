@@ -287,5 +287,13 @@ class ZingH3CausalPipeline(ComposedPipelineBase):
         )
         self.add_stage(stage)
 
+    def prepare_static_gc_for_serving(self):
+        """Called by the worker after loading, before publishing readiness."""
+        from sglang.multimodal_gen.runtime.utils.zing_static_gc import (
+            prepare_static_gc,
+        )
+
+        return prepare_static_gc("Zing DiT worker")
+
 
 EntryClass = ZingH3CausalPipeline

@@ -8,8 +8,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.component_capture import (
     ComponentCapture,
+    pool_metadata,
 )
 
 
@@ -25,6 +27,38 @@ def writer(tmp_path, inputs=None):
         config=SimpleNamespace(dit_config=SimpleNamespace(arch_config={})),
     )
     return ComponentCapture(tmp_path, stage, inputs or {}, {}, 42, "session")
+
+
+def test_pool_capture_reconstructs_capacity_and_runtime_admission_policy():
+    from sglang.multimodal_gen.runtime.realtime.zing_chunk_plan import ChunkPlan
+    from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+        ZingKVGeometry,
+        ZingKVPoolConfig,
+        ZingKVPoolPlan,
+    )
+
+    geometry = ZingKVGeometry(16, (1, 2, 2), 480, ChunkPlan((3, 2)))
+    plan = ZingKVPoolPlan.build(
+        ZingKVPoolConfig(),
+        geometry,
+        token_capacity=50000,
+        runtime_budget_bytes=12 << 30,
+        local_hidden_width=2048,
+        prefix_hidden_width=4096,
+    )
+    stage = SimpleNamespace(
+        kv_pool=SimpleNamespace(plan=plan), config=SimpleNamespace(dit_precision="bf16")
+    )
+    receipt = pool_metadata(stage)
+    assert receipt["schema_version"] == 2
+    assert "pool_size" not in receipt["config"]  # init=False is not a constructor arg.
+    restored = ZingKVPoolPlan.build(
+        ZingKVPoolConfig(**receipt["config"]),
+        geometry,
+        token_capacity=receipt["slot_rows"],
+        **receipt["runtime_policy"],
+    )
+    assert restored == plan
 
 
 def test_capture_owns_tensor_snapshot_without_mutating_inputs(tmp_path):
@@ -56,7 +90,8 @@ def test_capture_complete_receipt_matches_saved_components(tmp_path):
     assert not (capture.root / "COMPLETE.json").exists()
     capture.finish()
     assert json.loads((capture.root / "COMPLETE.json").read_text()) == {
-        "schema_version": 2,
+        "schema_version": 3,
+        "capture_scope": "full",
         "chunks": 1,
         "sources": 1,
         "input_frames": 1,

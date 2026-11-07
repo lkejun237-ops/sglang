@@ -53,18 +53,71 @@ def map_tensors(value, transform):
     if isinstance(value, dict):
         return {k: map_tensors(v, transform) for k, v in value.items()}
     if isinstance(value, tuple):
-        return tuple(map_tensors(v, transform) for v in value)
+        items = tuple(map_tensors(v, transform) for v in value)
+        return type(value)(*items) if hasattr(value, "_fields") else items
     if isinstance(value, list):
         return [map_tensors(v, transform) for v in value]
     return value
 
 
+def pool_metadata(stage):
+    pool = getattr(stage, "kv_pool", None)
+    if pool is None:
+        return None
+    plan = pool.plan
+    return dict(
+        schema_version=2,
+        config={
+            field.name: getattr(plan.config, field.name)
+            for field in dataclasses.fields(plan.config)
+            if field.init
+        },
+        runtime_policy={
+            name: getattr(plan, name)
+            for name in (
+                "runtime_budget_bytes",
+                "local_hidden_width",
+                "prefix_hidden_width",
+            )
+        },
+        geometry={
+            name: getattr(plan.geometry, name)
+            for name in (
+                "spatial_ratio",
+                "patch_size",
+                "max_short_edge",
+                "time_span_period",
+            )
+        },
+        slot_rows=plan.slot_rows,
+        dtype=stage.config.dit_precision,
+        world_size=torch.distributed.get_world_size()
+        if torch.distributed.is_initialized()
+        else 1,
+    )
+
+
 class ComponentCapture:
-    def __init__(self, root, stage, inputs, params, seed, session_id):
+    def __init__(
+        self,
+        root,
+        stage,
+        inputs,
+        params,
+        seed,
+        session_id,
+        *,
+        replay_policy=None,
+        scope="full",
+    ):
+        if scope not in ("full", "dit"):
+            raise ValueError("Component capture scope must be full or dit")
+        self.scope = scope
         self.root = Path(root) / session_id
         self.root.mkdir(parents=True, exist_ok=False)
         self.count = 0
         self.source_count = 0
+        self.prompt_events = {}
         self.frames = {"input": [], "decoder": []}
         inputs = copy(inputs)
         if hasattr(inputs, "condition_media"):
@@ -80,6 +133,9 @@ class ComponentCapture:
                 seed=seed,
                 runtime=stage.runtime,
                 arch=stage.config.dit_config.arch_config,
+                replay_policy=replay_policy,
+                capture_scope=scope,
+                kv_pool=pool_metadata(stage),
             ),
         )
 
@@ -88,10 +144,27 @@ class ComponentCapture:
             map_tensors(value, lambda t: t.detach().cpu().clone()), self.root / name
         )
 
-    def append(self, chunk, result):
+    def remember_prompt(self, prompt):
+        key = (prompt.event_id, prompt.prompt_version)
+        if key not in self.prompt_events:
+            name = f"prompt-{len(self.prompt_events):05d}.pt"
+            self.save(name, prompt)
+            self.prompt_events[key] = name
+        return self.prompt_events[key]
+
+    def append(self, chunk, result, *, prompt=None):
+        if prompt is not None:
+            self.remember_prompt(prompt)
+        key = (
+            getattr(result, "prompt_event_id", None),
+            getattr(result, "prompt_version", None),
+        )
+        prompt_file = self.prompt_events.get(key)
+        if hasattr(result, "prompt_event_id") and prompt_file is None:
+            raise ValueError("Captured result has no matching prompt snapshot")
         self.save(
             f"chunk-{self.count:05d}.pt",
-            dict(chunk=chunk, expected_visual=result.visual),
+            dict(chunk=chunk, expected_visual=result.visual, prompt_file=prompt_file),
         )
         self.count += 1
 
@@ -137,7 +210,8 @@ class ComponentCapture:
         (self.root / "COMPLETE.json").write_text(
             json.dumps(
                 dict(
-                    schema_version=2,
+                    schema_version=3,
+                    capture_scope=self.scope,
                     chunks=self.count,
                     sources=self.source_count,
                     input_frames=len(self.frames["input"]),

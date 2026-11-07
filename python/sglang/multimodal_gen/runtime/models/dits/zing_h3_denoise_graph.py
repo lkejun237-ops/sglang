@@ -9,6 +9,7 @@ outside the graph pool and refreshed before every replay.
 
 import collections
 import json
+from contextlib import ExitStack
 
 import torch
 import torch.distributed as dist
@@ -17,6 +18,8 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a impo
     nccl_during_capture,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.zing_capture_stream import capture_stream
+from sglang.multimodal_gen.runtime.utils.zing_static_gc import defer_cyclic_gc
 
 logger = init_logger(__name__)
 
@@ -67,8 +70,8 @@ class CudaGraphBackend:
     def __init__(self):
         self.capturing = False
         self._pool = None
-        # One side stream for every capture: graphs bake in per-stream state
-        # such as the cuBLAS workspace, and pooled streams would scatter it.
+        # Graphs bake in per-stream state such as the cuBLAS workspace. The
+        # process-owned stream cannot alias a later pooled RPC/decoder stream.
         self._stream = None
 
     def supports(self, device):
@@ -83,47 +86,50 @@ class CudaGraphBackend:
         """
         current = torch.cuda.current_stream()
         if self._stream is None:
-            self._stream = torch.cuda.Stream()
+            self._stream = capture_stream()
         stream = self._stream
         stream.wait_stream(current)
-        try:
-            # Lazy initialization (cuBLAS workspaces, Triton and FA4 compilation)
-            # must happen on the capture stream before capturing.
-            warmup_error = None
+        # Restore the caller stream before automatic finalizers can run again.
+        with ExitStack() as cleanup:
             try:
-                with torch.cuda.stream(stream):
-                    fn()
-            except Exception as error:
-                warmup_error = error
-            warmed_everywhere = warmed(warmup_error is None) if warmed else True
-            if warmup_error is not None or not warmed_everywhere:
-                raise GraphWarmupError(
-                    "Zing denoise graph warm-up failed"
-                    if warmup_error is not None
-                    else "Zing denoise graph warm-up failed on a peer rank"
-                ) from warmup_error
-            current.wait_stream(stream)
-            if self._pool is None:
-                self._pool = torch.cuda.graph_pool_handle()
-            graph = torch.cuda.CUDAGraph()
-            self.capturing = True
-            # Other threads (decoders, encoders) keep using CUDA meanwhile.
-            with (
-                nccl_during_capture(),
-                torch.cuda.graph(
-                    graph,
-                    pool=self._pool,
-                    stream=stream,
-                    capture_error_mode="thread_local",
-                ),
-            ):
-                outputs = fn()
-        finally:
-            self.capturing = False
-            # torch.cuda.graph.__exit__ leaves the capture stream current when
-            # capture_end raises on an invalidated capture.
-            torch.cuda.set_stream(current)
-            current.wait_stream(stream)
+                # Lazy initialization (cuBLAS workspaces, Triton and FA4 compilation)
+                # must happen on the capture stream before capturing.
+                warmup_error = None
+                try:
+                    with torch.cuda.stream(stream):
+                        fn()
+                except Exception as error:
+                    warmup_error = error
+                warmed_everywhere = warmed(warmup_error is None) if warmed else True
+                if warmup_error is not None or not warmed_everywhere:
+                    raise GraphWarmupError(
+                        "Zing denoise graph warm-up failed"
+                        if warmup_error is not None
+                        else "Zing denoise graph warm-up failed on a peer rank"
+                    ) from warmup_error
+                current.wait_stream(stream)
+                if self._pool is None:
+                    self._pool = torch.cuda.graph_pool_handle()
+                cleanup.enter_context(defer_cyclic_gc())
+                graph = torch.cuda.CUDAGraph()
+                self.capturing = True
+                # Other threads (decoders, encoders) keep using CUDA meanwhile.
+                with (
+                    nccl_during_capture(),
+                    torch.cuda.graph(
+                        graph,
+                        pool=self._pool,
+                        stream=stream,
+                        capture_error_mode="thread_local",
+                    ),
+                ):
+                    outputs = fn()
+            finally:
+                self.capturing = False
+                # torch.cuda.graph.__exit__ leaves the capture stream current when
+                # capture_end raises on an invalidated capture.
+                torch.cuda.set_stream(current)
+                current.wait_stream(stream)
         return graph, outputs
 
     def replay(self, graph):

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from compare_encoder_overlap_capture import compare
+
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.component_capture import (
     ComponentCapture,
 )
@@ -177,3 +178,94 @@ def test_old_media_capture_cannot_pass_without_identity(tmp_path):
     result = compare(*roots)
     assert result["status"] == "failed"
     assert "recapture required" in result["error"]
+
+
+def test_dit_capture_cannot_certify_decoder_parity(tmp_path):
+    import json
+
+    root = capture(tmp_path / "dit")
+    manifest = json.loads((root / "COMPLETE.json").read_text())
+    manifest.update(capture_scope="dit")
+    (root / "COMPLETE.json").write_text(json.dumps(manifest))
+    assert compare(root, root)["status"] == "failed"
+
+
+def test_capture_preserves_namedtuple_prompt_identity():
+    from collections import namedtuple
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.component_capture import (
+        map_tensors,
+    )
+
+    Prompt = namedtuple("Prompt", "condition event_id prompt_version")
+    value = Prompt({"text": torch.ones(1)}, "event", 2)
+    mapped = map_tensors(value, lambda t: t + 1)
+    assert isinstance(mapped, Prompt)
+    assert mapped.event_id == "event" and mapped.prompt_version == 2
+    assert mapped.condition["text"].item() == 2
+    assert value.condition["text"].item() == 1
+
+
+def test_capture_retains_production_pool_geometry_and_capacity():
+    from dataclasses import dataclass
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.component_capture import (
+        pool_metadata,
+    )
+
+    @dataclass
+    class Config:
+        pool_size: int = 1
+
+    geometry = SimpleNamespace(
+        spatial_ratio=8, patch_size=(1, 2, 2), max_short_edge=736, time_span_period=2
+    )
+    stage = SimpleNamespace(
+        kv_pool=SimpleNamespace(
+            plan=SimpleNamespace(
+                config=Config(),
+                geometry=geometry,
+                slot_rows=1234,
+                runtime_budget_bytes=12 << 30,
+                local_hidden_width=2048,
+                prefix_hidden_width=4096,
+            )
+        ),
+        config=SimpleNamespace(dit_precision="bf16"),
+    )
+    receipt = pool_metadata(stage)
+    assert receipt["slot_rows"] == 1234 and receipt["config"] == {"pool_size": 1}
+    assert receipt["schema_version"] == 2
+    assert receipt["runtime_policy"] == {
+        "runtime_budget_bytes": 12 << 30,
+        "local_hidden_width": 2048,
+        "prefix_hidden_width": 4096,
+    }
+    assert receipt["geometry"]["spatial_ratio"] == 8
+    assert receipt["geometry"]["patch_size"] == (1, 2, 2)
+    assert receipt["dtype"] == "bf16" and receipt["world_size"] == 1
+
+
+def test_final_result_keeps_prompt_after_sampler_disposes_it(tmp_path):
+    stage = SimpleNamespace(
+        runtime={}, config=SimpleNamespace(dit_config=SimpleNamespace(arch_config={}))
+    )
+    writer = ComponentCapture(tmp_path, stage, {}, {}, 42, "last")
+    prompt = SimpleNamespace(
+        event_id="changed",
+        prompt_version=2,
+        condition={"text": torch.ones(1)},
+        inputs=None,
+    )
+    writer.remember_prompt(prompt)
+    # SourceReadySession disposes its prompt immediately after the final result.
+    writer.append(
+        SimpleNamespace(),
+        SimpleNamespace(
+            visual=torch.ones(1), prompt_event_id="changed", prompt_version=2
+        ),
+        prompt=None,
+    )
+    chunk = torch.load(tmp_path / "last/chunk-00000.pt", weights_only=False)
+    snapshot = torch.load(tmp_path / "last" / chunk["prompt_file"], weights_only=False)
+    assert snapshot.event_id == "changed" and snapshot.prompt_version == 2

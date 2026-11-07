@@ -372,9 +372,9 @@ def main():
 
     args = ServerArgs.from_kwargs(
         model_path=str(cli.model),
-        pipeline_config_path=str(cli.pipeline_config_path)
-        if cli.pipeline_config_path
-        else None,
+        pipeline_config_path=(
+            str(cli.pipeline_config_path) if cli.pipeline_config_path else None
+        ),
         num_gpus=world_size,
         quantization=cli.quantization,
         sp_degree=cli.sp_degree,
@@ -412,6 +412,7 @@ def main():
     )
     set_global_server_args(args)
     link = None
+    static_gc = None
     with tempfile.TemporaryDirectory(prefix="zing-dit-tp1-") as rendezvous:
         http = None
         ports = None
@@ -560,6 +561,11 @@ def main():
                 create_session=create,
                 codecs=codecs,
             )
+            from sglang.multimodal_gen.runtime.utils.zing_static_gc import (
+                prepare_static_gc,
+            )
+
+            static_gc = prepare_static_gc("Zing standalone DiT worker")
             if leader:
                 http.connections = groups.manager
                 groups.manager.install(http.app)
@@ -581,6 +587,8 @@ def main():
                 http.close()
             if link is not None:
                 link.close()
+            if static_gc is not None:
+                static_gc.close()
             cleanup_dist_env_and_memory()
 
 

@@ -2048,6 +2048,9 @@ async def _cleanup_realtime_session(
 async def _send_stage_profile(
     websocket, session_id, dispatch_count, generation_id=None, continuous=False
 ):
+    from sglang.multimodal_gen.runtime.realtime.stage_profile_delivery import (
+        collect_profile_with_input_drain,
+    )
     from sglang.multimodal_gen.runtime.utils.zing_stage_timing import (
         collect_continuous_profile,
         collect_profile,
@@ -2059,15 +2062,16 @@ async def _send_stage_profile(
     try:
         ranks = list(range(get_global_server_args().num_gpus))
         if continuous:
-            profile = await collect_continuous_profile(directory, session_id, ranks)
+            collection = collect_continuous_profile(directory, session_id, ranks)
         else:
-            profile = await collect_profile(
+            collection = collect_profile(
                 directory,
                 session_id,
                 ranks,
                 dispatch_count,
                 generation_id=generation_id,
             )
+        profile = await collect_profile_with_input_drain(websocket, collection)
     except Exception:
         logger.exception("Failed to collect session stage profile")
         profile = {
@@ -2163,7 +2167,11 @@ async def _cleanup_realtime_session_then_close(
             except (WebSocketDisconnect, RuntimeError, OSError):
                 logger.info("Client disconnected before stage profile delivery")
             finally:
-                await _close_realtime_websocket(websocket, code=code, reason=reason)
+                # Cleanup has joined the sole session listener. Late terminal
+                # messages must not block transport CLOSE/PONG processing.
+                await _close_realtime_websocket(
+                    websocket, code=code, reason=reason, drain_input=True
+                )
     finally:
         if renewal is not None:
             renewal.cancel()

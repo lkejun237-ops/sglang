@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.utils.zing_stage_timing import (
     stage_span,
     trace_for_ids,
 )
+from sglang.multimodal_gen.runtime.utils.zing_static_gc import prepare_static_gc
 
 EncoderCommandControl = RoleCommandControl
 EncoderControlError = RoleControlError
@@ -138,6 +139,7 @@ def main():
     last_released = None
     quarantined = False
     draining = False
+    static_gc = None
     try:
         from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.parallel_encoder import (
             create_encoder_cache,
@@ -156,6 +158,7 @@ def main():
             )
             codecs = load_encoder(args.model)
             codecs.warmup_encoder()
+            static_gc = prepare_static_gc("Zing Encoder worker")
             if rank == 0:
                 context = zmq.Context()
                 socket = context.socket(zmq.REP)
@@ -173,6 +176,7 @@ def main():
                     "encoder_service_ready": True,
                     "rank": rank,
                     "world": control.world_size,
+                    "static_gc": static_gc.receipt if static_gc is not None else None,
                 }
             ),
             flush=True,
@@ -739,14 +743,18 @@ def main():
     finally:
         # Local tensor/cache disposal is safe; do not issue another collective
         # or a synchronizing NCCL shutdown after communication has failed.
-        for entry in list(sessions.values()):
-            sess = entry.get("session")
-            if sess is not None and not getattr(sess, "closed", False):
-                sess.dispose()
-        if socket is not None:
-            socket.close()
-        if context is not None:
-            context.term()
+        try:
+            for entry in list(sessions.values()):
+                sess = entry.get("session")
+                if sess is not None and not getattr(sess, "closed", False):
+                    sess.dispose()
+            if socket is not None:
+                socket.close()
+            if context is not None:
+                context.term()
+        finally:
+            if static_gc is not None:
+                static_gc.close()
 
 
 if __name__ == "__main__":

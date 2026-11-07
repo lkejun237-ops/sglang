@@ -22,7 +22,12 @@ from pathlib import Path
 import msgpack
 import websockets
 from bench_client import calculate_metrics, distribution
-from benchmark_artifacts import TIMING_SCOPE, MediaCapture, check_retention
+from benchmark_artifacts import (
+    DEFAULT_RETENTION_BYTES,
+    TIMING_SCOPE,
+    MediaCapture,
+    check_retention,
+)
 from continuous_source_input import open_source, source_dimensions
 from continuous_source_media import (
     load_prompt_updates,
@@ -72,14 +77,26 @@ async def connection_preserving_error(connector):
         await connector.__aexit__(None, None, None)
 
 
-def websocket_options(*, profile, timeout, message_budget=DEFAULT_MESSAGE_BYTES):
+def websocket_options(
+    *, profile, timeout, message_budget=DEFAULT_MESSAGE_BYTES, stage_timing=False
+):
     return dict(
         max_size=message_budget,
         max_queue=1,
         compression=None,
         # Total request timeout remains bounded independently of keepalive.
-        ping_timeout=timeout if profile else 20,
+        ping_timeout=timeout if profile or stage_timing else 20,
     )
+
+
+async def keep_source_heartbeat(send, state, *, split_output, interval=5):
+    while True:
+        await asyncio.sleep(interval)
+        if state.get("input_completed") or (
+            not split_output and state.get("completed")
+        ):
+            return
+        await send(dict(type="event", kind="heartbeat"))
 
 
 async def run(args, *, output_sink=None):
@@ -98,6 +115,9 @@ async def run(args, *, output_sink=None):
             args.expected_frames,
             getattr(args, "media_mode", "representative"),
             args.ffmpeg,
+            retention_budget_bytes=getattr(
+                args, "retention_budget_bytes", DEFAULT_RETENTION_BYTES
+            ),
         )
     )
     try:
@@ -127,7 +147,10 @@ async def run(args, *, output_sink=None):
             if capture is not None:
                 receipt = await asyncio.to_thread(capture.finish)
         finally:
-            check_retention(output)
+            check_retention(
+                output,
+                budget=getattr(args, "retention_budget_bytes", DEFAULT_RETENTION_BYTES),
+            )
     if capture is not None:
         summary.update(
             media=receipt, media_path=receipt["media_path"], media_mode=capture.mode
@@ -224,6 +247,7 @@ async def exchange(
                 args.url,
                 **websocket_options(
                     profile=args.profile,
+                    stage_timing=getattr(args, "receive_stage_timing", False),
                     timeout=args.timeout,
                     message_budget=message_budget,
                 ),
@@ -858,13 +882,6 @@ async def exchange(
             # A normal server close follows scheduler cleanup. Wait for it before
             # the next serial request; receipt of all RGB alone is not release.
 
-        async def heartbeat():
-            while True:
-                await asyncio.sleep(5)
-                if state.get("input_completed"):
-                    return
-                await send(dict(type="event", kind="heartbeat"))
-
         output_thread = None
         try:
             if split_output:
@@ -880,6 +897,7 @@ async def exchange(
                         decoder_url,
                         websocket_options(
                             profile=args.profile,
+                            stage_timing=getattr(args, "receive_stage_timing", False),
                             timeout=args.timeout,
                             message_budget=message_budget,
                         ),
@@ -887,7 +905,9 @@ async def exchange(
                     )
                 )
             async with asyncio.TaskGroup() as group:
-                h = group.create_task(heartbeat())
+                h = group.create_task(
+                    keep_source_heartbeat(send, state, split_output=split_output)
+                )
                 producer = group.create_task(produce())
                 receiver = group.create_task(
                     receive(ws, channel="input" if split_output else "combined")
@@ -1110,6 +1130,12 @@ def parser():
         choices=("metrics", "representative", "raw"),
         default="representative",
     )
+    parser.add_argument(
+        "--retention-budget-bytes",
+        type=int,
+        default=DEFAULT_RETENTION_BYTES,
+        help="Explicit on-disk limit; full raw regression requires a larger bounded budget.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--paced", action="store_true")
     parser.add_argument(
@@ -1138,8 +1164,11 @@ def main():
     if (
         min(args.width, args.height, *args.batch_pattern) < 1
         or args.startup_buffer_seconds < 0
+        or args.retention_budget_bytes <= 64 << 20
     ):
-        cli.error("Dimensions, batch lengths and startup buffering must be valid")
+        cli.error(
+            "Dimensions, batch lengths, startup buffering and retention budget must be valid"
+        )
     try:
         source_dimensions(args)
     except ValueError as exc:

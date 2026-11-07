@@ -183,19 +183,33 @@ def test_changed_media_never_reuses_stale_result(channel):
     assert client.deadlines[0] is None and client.deadlines[1] is not None
 
 
-def test_only_latest_waiting_event_is_encoded(channel):
+def test_latest_delivered_event_is_cached_and_reused(channel):
     socket, prefetch, client = channel
+    received_latest = threading.Event()
+    original_prepare = prefetch.prepare
+
+    def prepare(command):
+        result = original_prepare(command)
+        if command["prompt"] == "C":
+            received_latest.set()
+        return result
+
+    prefetch.prepare = prepare
     client.release.clear()
     send(socket, "A")
     assert client.started.wait(5)
     send(socket, "B")
     send(socket, "C")
-    # Let the private transport deliver both while the first encode is held.
-    time.sleep(0.1)
     client.release.set()
-    wait_for(lambda: prefetch.encodes == 2)
-    assert [c[0] for c in client.calls] == ["A", "C"]
+    assert received_latest.wait(5)
+    wait_for(lambda: prefetch.cached is not None and prefetch.cached[0] == "Cactive")
+    # send(C) does not acknowledge delivery. B can start before C arrives;
+    # sender-side pending replacement has a separate controlled publisher test.
+    calls = [c[0] for c in client.calls]
+    assert calls in (["A", "C"], ["A", "B", "C"])
+    encodes = prefetch.encodes
     assert prefetch.encode("C", "active", input_digest="Cactive")["context"] == "C"
+    assert prefetch.encodes == encodes == len(client.calls) and prefetch.hits == 1
 
 
 def test_receiver_failure_does_not_poison_boundary(channel):

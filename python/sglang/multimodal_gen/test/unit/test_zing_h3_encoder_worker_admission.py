@@ -13,8 +13,22 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 
-@pytest.mark.parametrize("close_op", ["close", "abort", "quarantine", "warmup_failure"])
-@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize(
+    "rank,close_op",
+    [
+        (rank, op)
+        for rank in [0, 1]
+        for op in [
+            "close",
+            "abort",
+            "quarantine",
+            "warmup_failure",
+            "gc_failure",
+            "bind_failure",
+        ]
+        if op != "bind_failure" or rank == 0
+    ],
+)
 def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, close_op):
     # Extract the actual main loop, avoiding unrelated CUDA platform imports on
     # CPU-only hosts. No alternate implementation of its admission logic.
@@ -71,6 +85,7 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
 
     replies, ports, sessions, barriers = [], [], [], []
     startup = []
+    gc_closed = []
 
     def warmup():
         startup.append("warmup")
@@ -78,10 +93,27 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
             raise RuntimeError("Injected encoder warmup failure")
 
     def bind(address):
-        assert startup == ["warmup"]
+        assert startup == ["warmup", "freeze"]
+        if close_op == "bind_failure":
+            raise RuntimeError("Injected encoder bind failure")
+
+    def freeze(context):
+        assert context == "Zing Encoder worker"
+        assert startup == ["warmup"] and not sessions
+        startup.append("freeze")
+        if close_op == "gc_failure":
+            raise RuntimeError("Injected encoder GC preparation failure")
+
+        def close():
+            assert all(session.closed for session in sessions)
+            gc_closed.append(True)
+
+        return SimpleNamespace(close=close, receipt=dict(enabled=True, context=context))
 
     def emit(value, **kwargs):
-        if json.loads(value).get("encoder_service_ready"):
+        row = json.loads(value)
+        if row.get("encoder_service_ready"):
+            assert row["static_gc"] == dict(enabled=True, context="Zing Encoder worker")
             startup.append("ready")
 
     socket = SimpleNamespace(
@@ -207,22 +239,32 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
         H3ProgressiveEncoderSession=Session,
         bridge_group=lambda *a, **kw: object(),
         print=emit,
+        prepare_static_gc=freeze,
     )
     exec(
         compile(ast.Module(body=[main], type_ignores=[]), str(path), "exec"), namespace
     )
-    if close_op == "warmup_failure":
+    if close_op in {"warmup_failure", "gc_failure", "bind_failure"}:
         with pytest.raises(
             control.EncoderControlError, match="participating rank"
         ) as err:
             namespace["main"]()
-        assert str(err.value.__cause__) == "Injected encoder warmup failure"
-        assert startup == ["warmup"]
+        reason = {
+            "warmup_failure": "warmup",
+            "gc_failure": "GC preparation",
+            "bind_failure": "bind",
+        }[close_op]
+        assert str(err.value.__cause__) == f"Injected encoder {reason} failure"
+        assert startup == (
+            ["warmup"] if close_op == "warmup_failure" else ["warmup", "freeze"]
+        )
+        assert gc_closed == ([True] if close_op == "bind_failure" and rank == 0 else [])
         assert not replies and not ports and not sessions
         return
     with pytest.raises(StopLoop):
         namespace["main"]()
-    assert startup == ["warmup", "ready"]
+    assert startup == ["warmup", "freeze", "ready"]
+    assert gc_closed == [True]
     if close_op == "quarantine":
         assert len(sessions) == 1 and sessions[0].closed
         assert len(barriers) == 1

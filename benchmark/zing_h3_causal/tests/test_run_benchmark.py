@@ -503,6 +503,33 @@ def test_metrics_hash_every_byte_without_raw_or_video(tmp_path):
     assert not list(tmp_path.glob("*.rgb")) and not list(tmp_path.glob("*.mp4"))
 
 
+def test_explicit_raw_budget_keeps_verified_partial_output_on_overflow(tmp_path):
+    budget = (64 << 20) + 24
+    capture = MediaCapture(tmp_path, 2, 2, 3, "raw", retention_budget_bytes=budget)
+    payload = bytes(range(24))
+    assert capture.write(payload) == 24
+    with pytest.raises(RuntimeError, match="retention budget"):
+        capture.write(bytes(12))
+    receipt = capture.finish()
+    assert capture.path.read_bytes() == payload
+    assert receipt["output_sha256"] == hashlib.sha256(payload).hexdigest()
+    assert receipt["output_frames"] == 2
+    assert receipt["retention_budget_bytes"] == budget
+
+
+def test_media_default_retention_budget_remains_two_gib(tmp_path):
+    capture = MediaCapture(tmp_path, 2, 2, 1, "metrics")
+    capture.write(bytes(12))
+    assert capture.finish()["retention_budget_bytes"] == 2 << 30
+
+
+@pytest.mark.parametrize("budget", [0, -1, 64 << 20, True])
+def test_invalid_media_budget_fails_before_creating_raw_file(tmp_path, budget):
+    with pytest.raises(ValueError, match="retention budget"):
+        MediaCapture(tmp_path, 2, 2, 1, "raw", retention_budget_bytes=budget)
+    assert not (tmp_path / "output.rgb").exists()
+
+
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="FFmpeg required")
 def test_representative_samples_across_entire_delivery_and_encodes_afterwards(tmp_path):
     capture = MediaCapture(tmp_path, 8, 8, 240)
