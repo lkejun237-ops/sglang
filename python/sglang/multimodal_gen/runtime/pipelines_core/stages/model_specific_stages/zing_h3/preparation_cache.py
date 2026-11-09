@@ -131,7 +131,7 @@ class PreparationEntry:
     request: object
     positions: torch.Tensor
     model_signature: object
-    data: PagedKV
+    data: object
     force: bool = False
     log_context: dict | None = None
     fill_started: float | None = None
@@ -155,10 +155,19 @@ class PrefixRestore:
     ready_at_consumer: bool | None = None
     lead_ms: float | None = None
 
+    def wait(self):
+        if self.end is not None:
+            self.end.synchronize()
+
+    @property
+    def cuda_ms(self):
+        return None if self.end is None else self.begin.elapsed_time(self.end)
+
     def commit(self, cache):
-        self.ready_at_consumer = self.end.query()
+        self.ready_at_consumer = self.end is None or self.end.query()
         self.lead_ms = (time.perf_counter() - self.started) * 1000
-        torch.cuda.current_stream(self.positions.device).wait_event(self.end)
+        if self.end is not None:
+            torch.cuda.current_stream(self.positions.device).wait_event(self.end)
         # L2 entries have no process-local parameter identities. The first
         # consuming model forward binds its current signature (after lazy buffer
         # initialization); subsequent forwards retain the usual mutation guard.
@@ -200,6 +209,146 @@ def _block0_geometry(entry):
 
 
 class Block0PreparationCache:
+    """Block0 provider interface and shared SP management request adapter.
+
+    Constructing the interface selects an implementation while retaining the
+    existing caller API. Only the local implementation owns pages and disk IO.
+    """
+
+    def __new__(cls, *args, backend="local", **kwargs):
+        if cls is Block0PreparationCache:
+            if backend == "local":
+                impl = LocalPagedBackend
+            elif backend == "mooncake":
+                from .mooncake_cache import MooncakeBackend
+
+                impl = MooncakeBackend
+            else:
+                raise ValueError("Unknown Block0 cache backend")
+            return object.__new__(impl)
+        return object.__new__(cls)
+
+    def lookup(self, key, *, allow_disk=False, protected=()):
+        raise NotImplementedError
+
+    def restore(self, cache, entry):
+        raise NotImplementedError
+
+    def can_store(self, rows):
+        raise NotImplementedError
+
+    def fill(
+        self,
+        key,
+        inputs,
+        conditioning_identity,
+        request,
+        cache,
+        *,
+        force=False,
+        required=True,
+    ):
+        raise NotImplementedError
+
+    def finish_fill(self):
+        raise NotImplementedError
+
+    def may_contain(self, key):
+        raise NotImplementedError
+
+    def register(self, key, game_id=None, group_id=None):
+        raise NotImplementedError
+
+    def select_keys(self, game_id, group_id=None, cache_key=None):
+        raise NotImplementedError
+
+    def status(self, keys=None):
+        raise NotImplementedError
+
+    def manage(self, operation, keys):
+        raise NotImplementedError
+
+    def control(self, request, *, busy):
+        """Select once on SP rank zero, then execute the same operation everywhere."""
+        with cache_scope(
+            getattr(request, "log_context", None),
+            game_id=request.game_id,
+            group_id=request.group_id,
+        ):
+            started = time.perf_counter()
+            level = logging.DEBUG if request.operation == "status" else logging.INFO
+            cache_event(
+                request.operation,
+                "started",
+                cache_key=request.cache_key,
+                rank=self.log_rank,
+                level=level,
+            )
+            try:
+                value = self._control(request, busy=busy)
+            except Exception as exc:
+                cache_event(
+                    request.operation,
+                    "failed",
+                    cache_key=request.cache_key,
+                    rank=self.log_rank,
+                    started=started,
+                    reason=type(exc).__name__,
+                    level=logging.WARNING,
+                )
+                raise
+            missing = sum(
+                item["status"] == "missing" for item in value.get("results", [])
+            )
+            code = value.get("code")
+            partial = (
+                request.operation == "preload"
+                and not code
+                and not value.get("all_ready")
+            )
+            cache_event(
+                request.operation,
+                "rejected" if code else "partial" if partial else "completed",
+                cache_key=request.cache_key,
+                rank=self.log_rank,
+                started=started,
+                reason=code or ("not_all_ready" if partial else None),
+                level=logging.WARNING if code or partial else level,
+                selected_count=len(value.get("results", value.get("selected", []))),
+                missing_count=missing,
+            )
+            return value
+
+    def _control(self, request, *, busy):
+        from sglang.multimodal_gen.runtime.conditioning.worker import broadcast_receipt
+
+        busy = any(coordinate_validation(busy))
+        if request.operation != "status" and busy:
+            return {"code": "cache_busy"}
+        selection = None
+        if self.log_rank == 0:
+            try:
+                if request.game_id is not None:
+                    keys = self.select_keys(
+                        request.game_id, request.group_id, request.cache_key
+                    )
+                elif request.operation == "status" and request.group_id is None:
+                    keys = None if request.cache_key is None else [request.cache_key]
+                else:
+                    raise ValueError("A cache selection requires a game ID")
+                selection = {"keys": keys}
+            except ValueError:
+                selection = {"code": "invalid_cache_selection"}
+            except Exception:
+                logger.warning("Block0 business index is unavailable", exc_info=True)
+                selection = {"code": "cache_unavailable"}
+        selection = broadcast_receipt(selection)
+        if "code" in selection:
+            return selection
+        return dict(self.manage(request.operation, selection["keys"]), busy=busy)
+
+
+class LocalPagedBackend(Block0PreparationCache):
     """A bounded pinned LRU; the existing GPU pool remains the only KV owner.
 
     One session writes this cache. Transfers share one stream, so a reused CPU
@@ -208,9 +357,19 @@ class Block0PreparationCache:
     published L1 entry is written back to disk on a daemon thread.
     """
 
-    def __init__(self, pool, *, max_bytes, identity, disk_cache, page_rows=PAGE_ROWS):
+    def __init__(
+        self,
+        pool,
+        *,
+        max_bytes,
+        identity,
+        disk_cache,
+        page_rows=PAGE_ROWS,
+        backend="local",
+    ):
         if type(max_bytes) is not int or max_bytes < 1:
             raise ValueError("Block0 cache byte budget must be a positive integer")
+        self.backend = "local"
         self.mode = "on"
         self.identity = identity
         self.entries = OrderedDict()
@@ -568,6 +727,7 @@ class Block0PreparationCache:
                 entries=len(self.entries),
             )
             self._persist(entry)
+            return entry
 
     def _persist(self, entry):
         disk = self.disk_cache
@@ -679,87 +839,6 @@ class Block0PreparationCache:
                 reason=type(exc).__name__,
                 level=logging.WARNING,
             )
-
-    def control(self, request, *, busy):
-        """Select once on SP rank zero, then execute the same operation everywhere."""
-        with cache_scope(
-            getattr(request, "log_context", None),
-            game_id=request.game_id,
-            group_id=request.group_id,
-        ):
-            started = time.perf_counter()
-            level = logging.DEBUG if request.operation == "status" else logging.INFO
-            cache_event(
-                request.operation,
-                "started",
-                cache_key=request.cache_key,
-                rank=self.log_rank,
-                level=level,
-            )
-            try:
-                value = self._control(request, busy=busy)
-            except Exception as exc:
-                cache_event(
-                    request.operation,
-                    "failed",
-                    cache_key=request.cache_key,
-                    rank=self.log_rank,
-                    started=started,
-                    reason=type(exc).__name__,
-                    level=logging.WARNING,
-                )
-                raise
-            missing = sum(
-                item["status"] == "missing" for item in value.get("results", [])
-            )
-            code = value.get("code")
-            partial = (
-                request.operation == "preload"
-                and not code
-                and not value.get("all_ready")
-            )
-            cache_event(
-                request.operation,
-                "rejected" if code else "partial" if partial else "completed",
-                cache_key=request.cache_key,
-                rank=self.log_rank,
-                started=started,
-                reason=code or ("not_all_ready" if partial else None),
-                level=logging.WARNING if code or partial else level,
-                selected_count=len(value.get("results", value.get("selected", []))),
-                missing_count=missing,
-            )
-            return value
-
-    def _control(self, request, *, busy):
-        from sglang.multimodal_gen.runtime.conditioning.worker import broadcast_receipt
-
-        from .cache_index import CacheIndex
-
-        busy = any(coordinate_validation(busy))
-        if request.operation != "status" and busy:
-            return {"code": "cache_busy"}
-        selection = None
-        if self.disk_cache.local_rank == 0:
-            try:
-                if request.game_id is not None:
-                    keys = CacheIndex(self.disk_cache.cache_dir).select(
-                        request.game_id, request.group_id, request.cache_key
-                    )
-                elif request.operation == "status" and request.group_id is None:
-                    keys = None if request.cache_key is None else [request.cache_key]
-                else:
-                    raise ValueError("A cache selection requires a game ID")
-                selection = {"keys": keys}
-            except ValueError:
-                selection = {"code": "invalid_cache_selection"}
-            except OSError:
-                logger.warning("Block0 business index is unavailable", exc_info=True)
-                selection = {"code": "cache_unavailable"}
-        selection = broadcast_receipt(selection)
-        if "code" in selection:
-            return selection
-        return dict(self.manage(request.operation, selection["keys"]), busy=busy)
 
     def status(self, keys=None):
         snapshots = coordinate_validation(
@@ -882,6 +961,21 @@ class Block0PreparationCache:
                 raise ValueError("Unknown Block0 cache operation")
         return dict(self.status(keys), results=results)
 
+    @property
+    def cpu_capacity_bytes(self):
+        return self.pages.numel() * self.pages.element_size()
+
+    @property
+    def entry_count(self):
+        return len(self.entries)
+
+    def select_keys(self, game_id, group_id=None, cache_key=None):
+        from .cache_index import CacheIndex
+
+        return CacheIndex(self.disk_cache.cache_dir).select(
+            game_id, group_id, cache_key
+        )
+
 
 def fill_prepared_prefix(
     stage,
@@ -937,8 +1031,7 @@ def fill_prepared_prefix(
                 state.cache,
                 force=force,
             )
-            cache.finish_fill()
-            return cache.entries.get(key)
+            return cache.finish_fill()
         finally:
             try:
                 if state is not None:

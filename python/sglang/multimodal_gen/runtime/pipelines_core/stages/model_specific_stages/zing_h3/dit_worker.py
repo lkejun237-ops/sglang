@@ -341,6 +341,10 @@ def argument_parser():
     parser.add_argument(
         "--zing-block0-cache-mode", choices=("on", "off"), default="off"
     )
+    parser.add_argument(
+        "--zing-block0-cache-backend", choices=("local", "mooncake"), default="local"
+    )
+    parser.add_argument("--zing-block0-mooncake-config")
     parser.add_argument("--zing-block0-cache-host-gb", type=float)
     parser.add_argument("--zing-block0-cache-dir")
     parser.add_argument("--zing-block0-cache-disk-gb", type=float)
@@ -412,6 +416,7 @@ def main():
             name: value
             for name, value in vars(cli).items()
             if name.startswith("zing_block0_cache_")
+            or name == "zing_block0_mooncake_config"
         },
         # Preserve explicit CLI/profile precedence from the original entrypoint.
         **{

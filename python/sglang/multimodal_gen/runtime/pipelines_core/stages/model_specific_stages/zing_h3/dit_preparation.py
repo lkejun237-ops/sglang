@@ -114,7 +114,7 @@ class DiTPreparation:
                 return {
                     "cache_key": existing.key,
                     "hit": True,
-                    "entries": len(cache.entries),
+                    "entries": cache.entry_count,
                     "evictions": cache.evictions,
                 }
             if arguments.get("inputs") is None:
@@ -148,6 +148,8 @@ class DiTPreparation:
                 source_shape=tuple(arguments["source_shape"]),
                 force=arguments.get("force", False),
             )
+            if entry is None:
+                return {"code": "cache_unavailable"}
             cache.register(
                 entry.key,
                 game_id=arguments.get("game_id"),
@@ -156,11 +158,13 @@ class DiTPreparation:
             return {
                 "cache_key": entry.key,
                 "hit": False,
-                "entries": len(cache.entries),
+                "entries": cache.entry_count,
                 "evictions": cache.evictions,
             }
         if operation not in ("list_entries", "delete_entries"):
             return {"code": "invalid_cache_selection"}
+        if getattr(cache, "backend", "local") == "mooncake":
+            return {"code": "cache_operation_unsupported"}
         from sglang.multimodal_gen.runtime.distributed.parallel_state import (
             get_world_group,
         )

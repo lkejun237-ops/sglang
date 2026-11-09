@@ -13,6 +13,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
     source_session,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.preparation_cache import (
+    PrefixRestore,
     preparation_key,
 )
 from sglang.multimodal_gen.test.unit.realtime.test_zing_preparation_cache import inputs
@@ -753,27 +754,33 @@ def test_disk_cache_rejects_invalid_root_at_startup(tmp_path, monkeypatch):
         )
 
 
-def test_dispose_drains_transfers_before_releasing_gpu_slot():
+@pytest.mark.parametrize("has_event", [False, True])
+def test_dispose_drains_transfers_before_releasing_gpu_slot(has_event):
     state = source_session.ZingSourceStreamState()
     actions = []
     state.block0_cache = NS(
         finish_fill=lambda: actions.append("fill"),
         mode="overlap",
-        pages=torch.empty(0),
-        entries={},
+        cpu_capacity_bytes=0,
+        entry_count=0,
         hits=0,
         misses=0,
         evictions=0,
     )
-    state.block0_restore = NS(
-        end=NS(synchronize=lambda: actions.append("restore")),
+    state.block0_restore = PrefixRestore(
+        entry=None,
+        end=NS(synchronize=lambda: actions.append("restore")) if has_event else None,
         begin=NS(elapsed_time=lambda _: 0),
+        positions=None,
+        blocks=None,
+        views=[],
         submit_ms=0,
+        started=0,
         ready_at_consumer=False,
         lead_ms=0,
     )
     state._dispose_states = lambda: actions.append("states")
     state.kv_lease = NS(release=lambda: actions.append("release"))
     state.dispose()
-    assert actions == ["fill", "restore", "states", "release"]
+    assert actions == ["fill", *(["restore"] if has_event else []), "states", "release"]
     assert state.kv_lease is None and state.block0_cache is None

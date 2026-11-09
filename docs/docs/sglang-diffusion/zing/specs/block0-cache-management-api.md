@@ -1,6 +1,6 @@
 ---
 title: "Block0 缓存管理 API 与部署契约"
-description: "实例级 L1 preload/unload/status、同机共享 NVMe L2 管理接口、HTTP 状态码、返回结构与部署红线。"
+description: "默认 local 与可选 Mooncake 后端的缓存管理行为对比、preload/unload/status、L2 管理接口及部署契约。"
 ---
 
 # Block0 缓存管理 API 与部署契约
@@ -8,12 +8,59 @@ description: "实例级 L1 preload/unload/status、同机共享 NVMe L2 管理�
 2026-11-02 分页变更：管理响应删除 `capacity`，统一报告页数与字节容量；中台需同步修改。
 页预算取代固定条目上限，接口字段见下文。设计与验证边界见 [分页方案](/docs/sglang-diffusion/zing/plans/BLOCK0_PAGED_L1)。
 
-本文定义 Zing H3 受管 Block0 前缀缓存（PR #467，schema `zing-block0-v3`、`disk_format=4`）的外部接口契约、HTTP 状态码、完整返回值结构、结构化日志与部署边界。
+本文定义 Zing H3 受管 Block0 前缀缓存的外部接口契约（原版 local 沿用 PR #467 的 schema `zing-block0-v3`、`disk_format=4`；Mooncake 使用独立的内存对象协议，不读取这些磁盘格式）、HTTP 状态码、完整返回值结构、结构化日志与部署边界。
 设计背景与验证记录见[确认方案](/docs/sglang-diffusion/zing/plans/BLOCK0_CACHE_MANAGEMENT_SHARED_L2)，串行预热协议见[prefill WebSocket 契约](/docs/sglang-diffusion/zing/specs/block0-prefill-websocket)。
 
 ---
 
 ## 1. 架构与读写行为总览
+
+### 1.1 后端选择与 API 行为对比
+
+**Mooncake 路径暂时默认关闭，业务适配与启用尚未确认。** 默认后端为 `local`，保留原版实例私有 pinned L1、磁盘 L2 和文件业务索引。Mooncake 是可选后端，需将以下参数追加到服务启动命令中显式选择；HTTP 请求不切换后端：
+
+```bash
+--zing-block0-cache-mode on \
+--zing-block0-cache-backend mooncake \
+--zing-block0-mooncake-config /path/client.json
+```
+
+Mooncake 由独立 Store 持有共享 pinned 内存，同模型、SP 布局和 namespace 的兼容实例可复用缓存。**当前 Mooncake 后端仅使用共享内存 L1，不启用 L2，也不读取、写入或清理原版 L2 文件。** Master/Store 与客户端配置见[部署说明](/docs/sglang-diffusion/zing/deployment_zing_h3)。
+
+| 接口或行为 | 原版 `local`（默认） | `mooncake`（可选） |
+| --- | --- | --- |
+| 正常视频会话，`cache_write=false`（默认） | 只查本实例 L1；未命中重算，不写回 L1/L2 | 只查共享 L1；未命中重算，不写回共享缓存 |
+| 正常视频会话，`cache_write=true` | 重算产生新前缀后写入本实例 L1，后台异步落盘 L2；携带业务标签时登记关联 | 重算产生新前缀后尝试写入共享 L1；携带业务标签时登记共享关联，无落盘阶段 |
+| `WS /v1/realtime_video/prefill`，`force=false` | 依次尝试本实例 L1、L2；均未命中则重算，填充 L1 并异步落盘 L2 | 尝试共享 L1；未命中则重算并发布共享条目，所有 SP 分片成功后才发布 manifest |
+| `prefill`，`force=true` | 跳过命中，重算并替换本实例 L1，后台覆盖 L2 | 跳过命中并重算；同 key 内容一致，已存在的不可变对象可复用，不引入内容版本覆盖语义 |
+| `POST /v1/zing/cache/preload` | 复用本实例 L1，或从 L2 加载到本实例 L1；缺失返回 `missing`，不重算 | 检查共享条目完整性；存在返回 `ready`，缺失返回 `missing`。不从盘加载、不重算，不提供常驻保证 |
+| `POST /v1/zing/cache/unload` | 仅卸载本实例 L1，等待该条目写盘与 DMA 完成；保留 L2 和业务索引 | **删除共享条目的 manifest、conditions 和所有 SP rank 的 KV 分片，影响共享它的所有实例**；保留业务关联键，读租约未结束或无法安全删除时可返回 `409 cache_busy`，不强删 |
+| `GET /v1/zing/cache/status` | 查询本实例 L1 的驻留状态及页池容量 | 查询当前兼容 namespace 中共享条目的完整可用状态；返回 `backend="mooncake"`、`scope="shared"`，`budget_bytes` / `reserved_bytes` 为 `null`，不返回页池字段 |
+| `GET /v1/zing/cache` | 列出 L2 磁盘条目及容量快照 | `HTTP 501`，`cache_operation_unsupported`；不改作共享内存列表接口 |
+| `DELETE /v1/zing/cache/entries/{cache_key}` | 仅删除该 key 的 L2 文件，保留各实例已有 L1 和业务索引 | `HTTP 501`，`cache_operation_unsupported`；删除共享条目使用 `unload` |
+| `POST /v1/zing/cache/clear` | 仅清空配置目录中的 L2 条目，保留各实例已有 L1 和业务索引 | `HTTP 501`，`cache_operation_unsupported`；当前没有清空整个共享池的 HTTP 接口 |
+| Worker 重启 | 本实例 L1 消失；已成功落盘的数据可通过 preload/prefill 从 L2 恢复 | Store 数据与 Master 元数据仍在时可复用；本期没有 L2 恢复路径 |
+| 满池与淘汰 | 按实际行数占页，整条 LRU 淘汰；preload 总页需求超限可返回 `cache_capacity_exceeded` | 使用 Mooncake 原生 group、读租约和水位策略，可能批量超量淘汰或写入失败；分组是 best-effort，不保证精确保留条目数 |
+
+两种后端都保留相同的业务选择器，以及“有实时会话时拒绝 preload/unload、允许 status”的规则。Mooncake 的 `ready` 表示检查时完整可用；status 会通过 SDK 读取并可能刷新读租约，随后 unload 仍可能暂时返回 `busy`。普通生成中的缓存写入失败不使生成失败，显式 prefill 写入失败会报告失败。
+
+原版没有同时删除 L1 和 L2 的单一接口。需要两层都删除时，先对持有该 key 的实例完成 `unload`，再调用 L2 `DELETE`；这不是跨实例原子失效操作。Mooncake 的 `unload` 虽沿用旧名称，当前承担的是共享条目的删除作用；它不会清理迁移前留下的 L2 文件。
+
+### 业务接入待确认项
+
+本 PR 提供可显式启用的后端，不包含中台、持久化流程或部署平台的自动适配。以下差异需由业务方确认后再启用 Mooncake，不能把旧接口调用成功当作兼容验收：
+
+- **L2 与持久化**：不落盘、无 SSD offload、无持久化写回或重启后磁盘恢复；`cache-dir`、host/disk budget 和 L2 GC 参数不用于 Mooncake。旧 L2 文件不迁移、不清理。若业务仍需离线预热结果长期保存，继续使用 `local`，另行确认迁移方案。
+- **管理操作**：L2 list/delete/clear 明确返回 `501 cache_operation_unsupported`。不自动改写为共享内存清空或删除。`preload` 缺失时仍返回 missing；需由业务决定是否通过 prefill 重算补热。
+- **共享删除范围**：Mooncake 的 unload 影响该 namespace 内所有共享实例；需确认业务权限、调度和重试策略，不能沿用“仅释放本实例内存”的假设。普通读租约未结束时可返回 busy，服务不强删。
+- **就绪与恢复**：Worker 重启可在 Store/Master 仍持有数据与元数据时复用；Store/Master 丢失或条目淘汰后没有磁盘恢复路径。业务索引也是易失缓存，关联登记采用 best-effort，失败会记录 index_bind failed；prefill.completed 不承诺索引长期存在。调用方应保留预期 key/场景清单，并处理 missing、空选择和重新预热。
+- **响应字段**：Mooncake 不提供页池字段，budget_bytes/reserved_bytes 为 null；status 的 used_bytes 仅是本次选中且完整的 KV 字节数，不含 conditions/索引，也不是 Store 全局占用。prefill 的 entries 是本客户端已知 key 数的 CPU 本地提示，可能包含已被原生淘汰的 key，不是共享池总条目数或就绪数；evictions 不包含原生 Store 淘汰，不能据其为 0 判断没有淘汰。
+
+共同的 WebSocket 请求字段、业务标签校验和实时会话 busy 规则沿用；不新增 pin/unpin、常驻承诺或客户端兼容兜底。业务确认后再单独提交适配与开启配置。
+
+**下文的页池容量、分页响应示例和磁盘部署契约适用于 `local`。Mooncake 的接口差异以本节为准；通用请求字段和业务标签规则继续适用。**
+
+### 1.2 原版 local 的双层读写流程
 
 Block0 缓存采用 **“实例独占 L1（Host Pinned Memory） + 同机共享 L2（本地 NVMe 磁盘） + 业务标签索引（`game_id` / `group_id`）”** 的双层受管架构：
 
@@ -61,7 +108,7 @@ Block0 缓存采用 **“实例独占 L1（Host Pinned Memory） + 同机共享 
 
 - **为什么查不到游戏或磁盘缺文件时返回 `HTTP 200` 而不是 `404`？**
   1. `preload` / `unload` / `status` 是**按业务标签集合选择器执行的批处理操作**（一个 `game_id` 下往往关联多个 `cache_key`，可能 10 个里有 8 个 `ready`、2 个 `missing`）。HTTP 状态码无法同时表达部分成功与部分缺失，因此请求被服务端成功执行时统一返回 `HTTP 200 OK`，由响应体顶层的 **`"all_ready": true/false`** 和逐项 **`"status": "ready" | "missing" | "unloaded"`** 表达业务就绪态。
-  2. `DELETE /v1/zing/cache/entries/{cache_key}` 遵循幂等清理语义，均返回 `HTTP 200 OK`，通过响应体区分 `"deleted": [...]` 与 `"missing": [...]`。
+  2. `local` 后端的 `DELETE /v1/zing/cache/entries/{cache_key}` 遵循幂等清理语义，均返回 `HTTP 200 OK`，通过响应体区分 `"deleted": [...]` 与 `"missing": [...]`。Mooncake 后端不支持这些 L2 管理操作，返回 `HTTP 501`、`{"detail": {"code": "cache_operation_unsupported"}}`。
 - **HTTP 非 200 状态码用于整次请求被拒绝或服务异常**。响应体有两种结构，调用方需要分别处理：
   - 业务错误：`detail` 为对象，通过 `detail.code` 判断错误码。
   - FastAPI/Pydantic 参数校验错误：`detail` 为列表，包含 `loc`、`type`、`msg` 等字段，没有统一的 `detail.code`。例如缺少 `game_id`、请求体含额外字段，或 Query 中的 key/分页参数不合法。
@@ -182,7 +229,7 @@ Block0 缓存采用 **“实例独占 L1（Host Pinned Memory） + 同机共享 
 
 ### 4.3 显式预加载到实例 L1：`POST /v1/zing/cache/preload`
 
-将指定游戏/分组/单键的缓存从共享 L2 磁盘同步加载到**当前目标实例的 L1 内存**中。不触发模型重算。
+`local` 后端将指定游戏/分组/单键的缓存从共享 L2 磁盘同步加载到**当前目标实例的 L1 内存**中。不触发模型重算。Mooncake 后端仅检查共享条目完整性，行为与响应差异见 1.1 节。
 
 #### 请求体（JSON）
 
@@ -263,7 +310,7 @@ Block0 缓存采用 **“实例独占 L1（Host Pinned Memory） + 同机共享 
 
 ### 4.4 显式从实例 L1 卸载：`POST /v1/zing/cache/unload`
 
-将指定游戏/分组/单键从**当前实例 L1** 中移除并归还页面，**不删除 L2 磁盘文件和业务索引**。
+`local` 后端将指定游戏/分组/单键从**当前实例 L1** 中移除并归还页面，**不删除 L2 磁盘文件和业务索引**。Mooncake 后端会删除共享条目、影响所有共享实例，行为与响应差异见 1.1 节。
 
 #### 请求体（JSON）
 
@@ -309,7 +356,7 @@ Block0 缓存采用 **“实例独占 L1（Host Pinned Memory） + 同机共享 
 
 ### 4.5 查询实例 L1 驻留状态：`GET /v1/zing/cache/status`
 
-只读查询当前目标实例的 L1 真实驻留状态，**不抢占活跃会话，实例在生成视频期间（`busy=true`）也可正常返回 `HTTP 200`**。
+`local` 后端查询当前目标实例的 L1 真实驻留状态，Mooncake 后端查询共享条目的完整可用状态（响应差异见 1.1 节）。**不抢占活跃会话，实例在生成视频期间（`busy=true`）也可正常返回 `HTTP 200`**。
 
 #### Query 参数（全部可选）
 

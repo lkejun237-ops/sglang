@@ -10879,14 +10879,62 @@
     {
       "path": "benchmark/zing_h3_causal/tests/test_stream_stalls.py",
       "suite": "benchmark-contracts",
-      "status": "UNRUN",
-      "approved": false,
+      "status": "CPU_PASS",
+      "approved": true,
       "allowed_skips": [],
       "sources": [
         "main"
       ],
-      "reason": "Six-card dedicated allocation adds two CPU contracts; new Linux zero-GPU two-trial evidence is pending. Previous 88-contract evidence is retained in the task artifacts and is not approval for the changed source.",
-      "dependencies": []
+      "reason": "Two fixed Linux CPU trials in GitHub Actions run 42386504654 passed all 90 stream-stall contracts, including the six-device allocation additions, with zero failures, errors, skips or incomplete cases. Test source and pinned environment recipe hashes match this checkout; no runtime/test behavior or CI gate is changed.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "70d292c9b968af0d9161b96a4fd98a37241e11c8ed1c6784b7c25b63add5d596",
+        "receipt": "https://github.com/seedleap/sglang/actions/runs/42386504654",
+        "artifact_name": "zing-stream-stalls-admission-42386504654-27832b2a0a7177d695b09311cd33ce6bddd1a9cc",
+        "artifact_id": 13579408263,
+        "artifact_sha256": "1b925e41aed9361b9a278c8fda7d2906ba223ea36aa441f6130e702ac8b64e66",
+        "receipt_sha256": "6611cd1f6e30fe9df80eed0768b3649e0d01dfa2f2b0547997de177db9dc745a",
+        "tested_head": "27832b2a0a7177d695b09311cd33ce6bddd1a9cc",
+        "checkout_sha": "27832b2a0a7177d695b09311cd33ce6bddd1a9cc",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 90,
+            "collected": 90,
+            "skipped": 0,
+            "duration_seconds": 4.083529990999978,
+            "exit_code": 0,
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/admission/cpu-0-trial-1.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/admission/cpu-0-trial-1.xml",
+            "log_sha256": "d7c770b8726ddd7ddb761747737ffdaeb7ba781d2a374aa62f18b84351904170",
+            "junit_sha256": "ba7afb30a4bb8c67c9ad60d55a25dd464a53c050f75c666f278a2199d8259e4d"
+          },
+          {
+            "trial": 2,
+            "passed": 90,
+            "collected": 90,
+            "skipped": 0,
+            "duration_seconds": 2.6827214430000197,
+            "exit_code": 0,
+            "log_path": "/home/runner/work/sglang/sglang/artifacts/admission/cpu-0-trial-2.log",
+            "junit_path": "/home/runner/work/sglang/sglang/artifacts/admission/cpu-0-trial-2.xml",
+            "log_sha256": "848263302143a99938ec7b6ab1ef375924c08516231c0a8d5e9b97d41e521720",
+            "junit_sha256": "d00a67b31044f19cc9b6059d4d0cde9fc36a89261192d72ef0ee664ee4c6b5fa"
+          }
+        ],
+        "environment": {
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
+          "torch": "2.8.0+cpu"
+        },
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          }
+        }
+      }
     },
     {
       "path": "python/sglang/multimodal_gen/test/unit/realtime/test_zing_nccl.py",
@@ -11498,6 +11546,25 @@
             "junit_sha256": "c18b73fc273fae50efc020210279be5e00ac577123853236cdec6a012a84805a"
           }
         ]
+      }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/realtime/test_zing_mooncake_cache.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "dependencies": [],
+      "reason": "PAI CPU job dlc1yh52x7gsddw9 passed 875 cache, paging, API and lifecycle cases with zero skips. Added post-publication checks for early/late bindings, deterministic early-index eviction/rebind, no lease refresh for unpublished groups, and missing-shard failure without shared-key rollback. Existing contracts cover native groups and real Gloo agreement. Does not require the Mooncake wheel or a GPU.",
+      "trial_evidence": {
+        "source_sha256": "c313caa884d6e4a8f1e8f0d4cf7dae8c3827e891045e1c23f328c4ed7eeda8eb",
+        "job_id": "dlc1yh52x7gsddw9",
+        "receipt": "/cpfs/world-model/sglang/evals/block0-mooncake-postcheck-20261107-r3/CPU_RESULT.json",
+        "log_path": "/cpfs/world-model/sglang/evals/block0-mooncake-postcheck-20261107-r3/pytest.log",
+        "junit_path": "/cpfs/world-model/sglang/evals/block0-mooncake-postcheck-20261107-r3/junit.xml"
       }
     }
   ],

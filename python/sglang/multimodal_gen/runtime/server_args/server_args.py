@@ -484,6 +484,9 @@ class ServerArgs(DisaggServerArgsMixin):
     # Only used when a Zing GPU KV pool is configured. GB means 10**9 bytes;
     # the host budget covers all SP ranks in this deployment, not each rank.
     zing_block0_cache_mode: str = "on"
+    # Mooncake remains opt-in until business L2/persistence users have migrated.
+    zing_block0_cache_backend: str = "local"
+    zing_block0_mooncake_config: str | None = None
     zing_block0_cache_host_gb: float | None = None
     zing_block0_cache_dir: str | None = None
     zing_block0_cache_disk_gb: float | None = None
@@ -2146,6 +2149,17 @@ class ServerArgs(DisaggServerArgsMixin):
             choices=("on", "off"),
             default=ServerArgs.zing_block0_cache_mode,
             help="Enable Block0 CPU/disk caching when a Zing GPU KV pool exists (default: on).",
+        )
+        parser.add_argument(
+            "--zing-block0-cache-backend",
+            choices=("local", "mooncake"),
+            default=ServerArgs.zing_block0_cache_backend,
+            help="Block0 storage implementation (default: local). Mooncake is experimental, opt-in and memory-only; it has no L2/persistence fallback.",
+        )
+        parser.add_argument(
+            "--zing-block0-mooncake-config",
+            default=None,
+            help="Mooncake client JSON config; required only for the mooncake backend.",
         )
         parser.add_argument(
             "--zing-block0-cache-host-gb",

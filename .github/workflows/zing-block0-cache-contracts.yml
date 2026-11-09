@@ -54,6 +54,7 @@ jobs:
             --file python/sglang/multimodal_gen/test/unit/realtime/test_zing_paged_cache.py \
             --file python/sglang/multimodal_gen/test/unit/realtime/test_zing_block0_cache_contract.py \
             --file python/sglang/multimodal_gen/test/unit/realtime/test_zing_preparation_cache.py \
+            --file python/sglang/multimodal_gen/test/unit/realtime/test_zing_mooncake_cache.py \
             --file python/sglang/multimodal_gen/test/unit/realtime/test_zing_prompt_switch_cache.py \
             --file python/sglang/multimodal_gen/test/unit/test_zing_kv_pool_runtime.py \
             --file python/sglang/multimodal_gen/test/unit/test_zing_lynn_startup_warmup.py \

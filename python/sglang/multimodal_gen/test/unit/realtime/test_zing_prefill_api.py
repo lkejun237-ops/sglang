@@ -301,9 +301,7 @@ def test_worker_prefill_never_enters_source_generation(monkeypatch, force):
     )
 
     stage = object.__new__(ZingH3GenerationStage)
-    stage.block0_cache = NS(
-        hits=0, entries={"key": object()}, evictions=2, register=Mock()
-    )
+    stage.block0_cache = NS(hits=0, entry_count=1, evictions=2, register=Mock())
     stage._build_request = lambda _: dict(prompt="scene")
     seen = []
 
@@ -371,11 +369,15 @@ def test_internal_prefill_miss_then_hit_runs_only_prefix_and_releases_lease(capl
 
     events, entries = [], {}
     generator = torch.nn.Linear(1, 1)
+
+    def finish_fill():
+        events.append("fill-done")
+        return next(reversed(entries.values()), None)
+
     cache = NS(
         identity={"model": {"dit": "fixture"}, "layout": {"sp": 1}},
         lookup=lambda key, **kwargs: entries.get(key),
-        entries=entries,
-        finish_fill=lambda: events.append("fill-done"),
+        finish_fill=finish_fill,
     )
 
     def fill(key, *args, force=False):

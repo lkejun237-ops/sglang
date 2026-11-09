@@ -421,6 +421,8 @@ class ZingSourceStreamState(BaseRealtimeState):
                     trace=trace,
                     force=force,
                 )
+                if entry is None:
+                    raise ValueError("Block0 prefill did not publish a cache entry")
             except Exception as exc:
                 cache_event(
                     "prefill",
@@ -1506,7 +1508,7 @@ class ZingSourceStreamState(BaseRealtimeState):
                 self.block0_cache.finish_fill()
                 transfer = self.block0_restore
                 if transfer is not None:
-                    transfer.end.synchronize()
+                    transfer.wait()
                 logger.info(
                     "zing_block0_cache %s",
                     json.dumps(
@@ -1516,24 +1518,21 @@ class ZingSourceStreamState(BaseRealtimeState):
                             hit=self.block0_entry is not None,
                             prepare_bypassed=self.block0_entry is not None,
                             lookup_host_ms=self.block0_lookup_ms,
-                            restore_submit_host_ms=(
-                                None if transfer is None else transfer.submit_ms
-                            ),
-                            restore_cuda_ms=(
-                                None
-                                if transfer is None
-                                else transfer.begin.elapsed_time(transfer.end)
-                            ),
-                            ready_at_consumer=(
-                                None if transfer is None else transfer.ready_at_consumer
-                            ),
-                            restore_lead_host_ms=(
-                                None if transfer is None else transfer.lead_ms
-                            ),
-                            cpu_capacity_bytes=self.block0_cache.pages.numel()
-                            * self.block0_cache.pages.element_size(),
-                            ready=bool(self.block0_cache.entries),
-                            entries=len(self.block0_cache.entries),
+                            restore_submit_host_ms=None
+                            if transfer is None
+                            else transfer.submit_ms,
+                            restore_cuda_ms=None
+                            if transfer is None
+                            else transfer.cuda_ms,
+                            ready_at_consumer=None
+                            if transfer is None
+                            else transfer.ready_at_consumer,
+                            restore_lead_host_ms=None
+                            if transfer is None
+                            else transfer.lead_ms,
+                            cpu_capacity_bytes=self.block0_cache.cpu_capacity_bytes,
+                            ready=bool(self.block0_cache.entry_count),
+                            entries=self.block0_cache.entry_count,
                             evictions=self.block0_cache.evictions,
                             hits=self.block0_cache.hits,
                             misses=self.block0_cache.misses,

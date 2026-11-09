@@ -196,6 +196,73 @@ H100 目标（实际 L20Z）的限时单卡 H2D／L2→L1 组件执行与结果�
 480/736 端到端及 Encoder/DiT/Decoder 性能显存矩阵仍未验证。
 候选保持 Draft，完整验收项与组件入口见[分页方案](/docs/sglang-diffusion/zing/plans/BLOCK0_PAGED_L1)。
 
+## Block0 Mooncake 后端候选（默认关闭）
+
+**本 PR 只提供可选后端，业务适配与上线启用尚未确认。** 默认
+`--zing-block0-cache-backend local`，保留原版 pinned 页池、磁盘 L2、文件索引和既有配置。
+安装 Mooncake 或提供客户端 JSON 均不会自动切换后端；现有部署不修改。
+业务行为差异和待确认清单见[缓存管理契约](/docs/sglang-diffusion/zing/specs/block0-cache-management-api#业务接入待确认项)。
+
+在已启用 `--mem-fraction-static` 的有效运行配方上，实验部署须显式追加：
+
+```bash
+--zing-block0-cache-mode on \
+--zing-block0-cache-backend mooncake \
+--zing-block0-mooncake-config /path/client.json
+```
+
+Mooncake 由独立 Master/Store 管理共享 pinned L1；Worker 只在启动时注册 GPU KV storage，
+不创建应用侧 CPU KV 池或 staging。客户端 `global_segment_size=0`，另留默认 64 MiB SDK
+元数据工作区（`metadata_buffer_bytes`，正整数），只传 conditions、manifest 和索引。
+真实 conditions 超出工作区时写入会失败，不会自动扩容；当前真实大 conditions 尚未验收。
+
+```json
+{
+  "master_server_address": "master:50051",
+  "master_http_url": "http://master:9003",
+  "metadata_server": "P2PHANDSHAKE",
+  "metadata_buffer_bytes": 67108864,
+  "protocol": "tcp",
+  "namespace": "zing_b0"
+}
+```
+
+`master_http_url` 指向 Master 管理端口（`--metrics_port`），不是 TransferEngine 的
+`http_metadata_server_port`。Master 使用 `--enable_offload=false`，Store 禁用 SSD offload，
+不配置持久化路径。Store 的 `global_segment_size` 为共享池预算，`local_buffer_size` 可为 0。
+设置 `MC_STORE_PIN_MEMORY_MAX_BYTES` 至少等于整池预算，并核对 Store 日志 `size=pinned`。
+GPU 指针直传要求 Store 可见 CUDA driver/device、memlock 足够；RDMA 还需设备及权限。
+客户端和 Store 的 `protocol` 同时改为 rdma，且不能残留 `MC_FORCE_TCP=1`；以实际传输日志为准。
+
+**Mooncake 不使用 L2，不读取/写入/迁移/清理旧磁盘缓存，也没有持久化恢复。**
+L2 list/delete/clear 返回 HTTP 501；preload 只检查共享完整性；unload 删除共享条目并影响所有
+共享实例，读租约未结束时返回 busy，不强删。Store/Master 丢失或条目淘汰后由业务按需补热。
+原生 group 由模型/SP namespace + cache_key 决定，跨全部 rank 的 KV、conditions、manifest
+和关联键一致；保留 KV 预检查、manifest 最后发布和发布后整组检查。早绑定索引在本次填充中
+暂存并在发布前幂等补回；晚绑定在写完后补查。读端仍逐层核对精确字节数；不新增 pin/unpin。
+`:g2:` namespace/v2 manifest 隔离旧未分组对象，业务索引仍为易失缓存。
+
+验证证据按受测源码区分，组件数字不代表服务收益：
+
+| 受测版本/作业 | 条件 | 结果与边界 |
+| --- | --- | --- |
+| 11-06 分组版，`dlc14xgiyz3ae7s5` | 两张 L20D/SM10.3，16 CPU/64 GiB，Mooncake 0.3.13 | TCP/RDMA 跨进程及重启复用、payload/guard、满池、SP/NCCL、读错收敛、发布前真实 SIGKILL 六组通过。此版本尚无发布后补查。 |
+| 同轮单卡完整命中 | 50 层 BF16、12288 行、8.808 GB；每臂预热 2、正式 n=5；host timing，校验在计时外 | RDMA 中位/P95 108.28/110.84 ms，同卡 local 160.35/160.39 ms；TCP 2474.65/2512.87 ms，同卡 local 160.58/160.66 ms。仅机内组件对照，未隔离 NUMA/SDK 等贡献。 |
+| 11-07 发布后补查，`dlc1yh52x7gsddw9` | 8 CPU/16 GiB/**0 GPU**；真实 256 MiB Store，每条 12 MiB KV，索引先/后写各 3 对 A/B | 875 项回归与 12 单元通过；完整 KV 保留数 14/16→18，修改后索引也完整。198 次实际命中全量校验通过、KV 残片 0；补回早绑定索引在填充期间被淘汰的竞态。 |
+
+可复用 GPU 组件入口为 `benchmark/zing_h3_causal/bench_block0_mooncake.py`；原始数据见
+`exports/block0-mooncake-grouping-20261106-r2/` 与
+`exports/block0-mooncake-postcheck-20261107-r3/REPORT.md`，作业号和冻结源码 SHA 可回查。
+供仓库读者复查的私有归档（含报告、原始回执、源码清单和 A/B 对照脚本）：
+`oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/block0-mooncake-pr-20261107-r1/historical-evidence.tar.gz`。
+已上传并下载比对，SHA256 为 `d46cf582629841702598d3595fd46afc8215540ce9fd4702792fac5598d86645`；
+归档保留原受测版本，不包含本 PR 后续主干兼容修正。
+本 PR 对齐最新 main 的物理 slot_rows 与可选写回接口后，以 PR CPU CI 为当前兼容性证据；
+上述 GPU/CPU 实验保留原受测版本边界。**当前 main 组合的 GPU、跨机 RDMA、真实大 conditions、
+480/736 E2E 与 Encoder/DiT/Decoder 的性能和常驻/请求峰值显存均未验收**；对应 TTFF/FPS/TPOC/ICL
+与连续 source 的播放/尾排空指标没有本 PR 的有效数据。待业务适配确认和独立测试窗口后，
+按真实产品集合及完整组件矩阵补验，不在本 PR 自动启用或替业务做兼容转换。
+
 ## 736p 部署性能更新（2026-10-30）
 
 以下均为 **1280×736 输出**，全程与首包后 FPS 分列。历史 1312×736/SP4/W21

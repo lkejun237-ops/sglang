@@ -36,6 +36,18 @@ def startup_config(args):
         raise ValueError("Zing Block0 cache mode must be on or off")
     if mode == "off":
         return None
+    backend = getattr(args, "zing_block0_cache_backend", "local")
+    if backend == "mooncake":
+        path = getattr(args, "zing_block0_mooncake_config", None)
+        if not path:
+            raise ValueError("Mooncake Block0 caching requires a client config file")
+        with open(path, encoding="utf-8") as handle:
+            config = json.load(handle)
+        if not isinstance(config, dict):
+            raise ValueError("Mooncake client config must be a JSON object")
+        return {"backend": backend, "config": config}
+    if backend != "local":
+        raise ValueError("Unknown Block0 cache backend")
     host = budget_bytes(args.zing_block0_cache_host_gb, "--zing-block0-cache-host-gb")
     disk = budget_bytes(args.zing_block0_cache_disk_gb, "--zing-block0-cache-disk-gb")
     root = args.zing_block0_cache_dir

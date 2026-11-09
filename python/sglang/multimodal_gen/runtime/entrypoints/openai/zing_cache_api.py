@@ -32,7 +32,10 @@ def _manager(root):
 
 
 def _call(operation, **kwargs):
-    root = getattr(get_global_server_args(), "zing_block0_cache_dir", None)
+    args = get_global_server_args()
+    if getattr(args, "zing_block0_cache_backend", "local") == "mooncake":
+        raise HTTPException(501, detail={"code": "cache_operation_unsupported"})
+    root = getattr(args, "zing_block0_cache_dir", None)
     if not root:
         cache_event(
             "management_request",
@@ -60,7 +63,8 @@ async def _disk_call(request, operation, **arguments):
     if client is not None and hasattr(client, "cache_disk"):
         value = await client.cache_disk(operation, **arguments)
         if value.get("code"):
-            raise HTTPException(503, detail=value)
+            status = 501 if value["code"] == "cache_operation_unsupported" else 503
+            raise HTTPException(status, detail=value)
         return value
     return _call(operation, **arguments)
 

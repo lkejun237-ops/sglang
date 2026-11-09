@@ -170,7 +170,12 @@ class ZingH3GenerationStage(PipelineStage):
         except Exception as exc:
             config_error = str(exc)
         receipts = coordinate_validation(
-            (config_error, None if block0 is None else (*block0[:2], str(block0[2])))
+            (
+                config_error,
+                block0
+                if isinstance(block0, dict) or block0 is None
+                else (*block0[:2], str(block0[2])),
+            )
         )
         if any(error is not None for error, _ in receipts) or any(
             value != receipts[0] for value in receipts
@@ -316,32 +321,43 @@ class ZingH3GenerationStage(PipelineStage):
             from .disk_cache import Block0DiskCache
             from .preparation_cache import Block0PreparationCache
 
-            host_bytes, disk_bytes, root = block0
             identity = build_identity(self, server_args, device=layout["device"])
             owner = error = None
+            disk = None
             try:
-                disk = Block0DiskCache(
-                    root,
-                    max_bytes=disk_bytes,
-                    identity=identity,
-                    rank=get_sp_parallel_rank(),
-                    world_size=identity["sp"]["size"],
-                    gc_interval=getattr(
-                        server_args, "zing_block0_cache_gc_interval_s", 60.0
-                    ),
-                    gc_stale_seconds=getattr(
-                        server_args, "zing_block0_cache_gc_stale_s", 600.0
-                    ),
-                    gc_low_watermark=getattr(
-                        server_args, "zing_block0_cache_gc_low_watermark", 0.9
-                    ),
-                )
-                owner = Block0PreparationCache(
-                    pool,
-                    max_bytes=host_bytes // identity["sp"]["size"],
-                    identity=identity,
-                    disk_cache=disk,
-                )
+                if isinstance(block0, dict):
+                    owner = Block0PreparationCache(
+                        pool,
+                        backend="mooncake",
+                        identity=identity,
+                        config=block0["config"],
+                        rank=get_sp_parallel_rank(),
+                        world_size=identity["sp"]["size"],
+                    )
+                else:
+                    host_bytes, disk_bytes, root = block0
+                    disk = Block0DiskCache(
+                        root,
+                        max_bytes=disk_bytes,
+                        identity=identity,
+                        rank=get_sp_parallel_rank(),
+                        world_size=identity["sp"]["size"],
+                        gc_interval=getattr(
+                            server_args, "zing_block0_cache_gc_interval_s", 60.0
+                        ),
+                        gc_stale_seconds=getattr(
+                            server_args, "zing_block0_cache_gc_stale_s", 600.0
+                        ),
+                        gc_low_watermark=getattr(
+                            server_args, "zing_block0_cache_gc_low_watermark", 0.9
+                        ),
+                    )
+                    owner = Block0PreparationCache(
+                        pool,
+                        max_bytes=host_bytes // identity["sp"]["size"],
+                        identity=identity,
+                        disk_cache=disk,
+                    )
             except Exception as exc:
                 error = str(exc)
             errors = coordinate_validation(error)
@@ -349,19 +365,21 @@ class ZingH3GenerationStage(PipelineStage):
                 raise ValueError(f"Block0 startup failed: {errors}")
             self.block0_cache = owner
             # Global rank zero gives one collector even with multiple SP/DP groups.
-            if getattr(server_args, "zing_block0_cache_gc", False) and (
-                not torch.distributed.is_initialized()
-                or torch.distributed.get_rank() == 0
+            if (
+                disk is not None
+                and getattr(server_args, "zing_block0_cache_gc", False)
+                and (
+                    not torch.distributed.is_initialized()
+                    or torch.distributed.get_rank() == 0
+                )
             ):
                 disk.start_gc()
             logger.info(
-                "Zing Block0 cache ready: model=%s layout=%s pinned_bytes_per_rank=%d pages=%d root=%s disk_bytes=%d",
+                "Zing Block0 cache ready: backend=%s model=%s layout=%s pinned_bytes_per_rank=%d",
+                owner.backend,
                 identity["zing_config"].get("checkpoint_sha256"),
                 identity["sp"],
-                owner.pages.numel() * owner.pages.element_size(),
-                owner.total_pages,
-                root,
-                disk.max_bytes,
+                owner.cpu_capacity_bytes,
             )
 
     def kv_request(self, sampler, inputs, layout, *, source_shape, total_frames):
@@ -796,7 +814,7 @@ class ZingH3GenerationStage(PipelineStage):
                     "zing_prefill": dict(
                         cache_key=entry.key,
                         hit=self.block0_cache.hits > hits,
-                        entries=len(self.block0_cache.entries),
+                        entries=self.block0_cache.entry_count,
                         evictions=self.block0_cache.evictions,
                     )
                 },
