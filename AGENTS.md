@@ -68,6 +68,15 @@
 存储和协议身份。它不替代本仓库 H3 部署决策、Whitebox 发布与验收要求，也不授权部署、
 重启共享作业或更改活跃会话；源码、实际部署与端到端验收分别记录。
 
+## SGLang 发布与跨仓库排查入口
+
+- SGLang 负责可执行发布代码、模型策略与接口合同；[world-model-all-in-one 知识库](https://github.com/seedleap/world-model-all-in-one)负责环境目录、带时间的现场观测、排查和运维交接。发布命令以本仓库 [deploy/whitebox](deploy/whitebox/README.md) 和[发布手册](docs/docs/sglang-diffusion/zing/plans/whitebox-manual-releases.mdx)为准，不在知识库复制第二套实现；当前目录名描述 Whitebox 集成，不代表通用 SGLang 部署 API。
+- 每次先确定 `prod-shanghai`、`prod-thailand` 或 `test-shanghai-copy`，再选择 region；上海正式与副本同属 `cn-shanghai`，不能仅按地域判定目标。机器与路由从[环境目录](https://github.com/seedleap/world-model-all-in-one/blob/main/wiki/platform/environments.md)定位后重新核实。
+- 启动前区分同机四卡完整组与 standalone DiT 复用 Encoder/Decoder 的拓扑；后者不调用完整组 launcher，不据此重启既有角色。SGLang 发布固定 main 可达 SHA，SDK 固定 dev 可达 SHA；分别核对各仓库来源和实际运行身份。
+- 只读排查复用知识库的 [Coordinator](https://github.com/seedleap/world-model-all-in-one/blob/main/.agents/skills/whitebox-coordinator-ops/SKILL.md)、[Room](https://github.com/seedleap/world-model-all-in-one/blob/main/.agents/skills/whitebox-room-ops/SKILL.md)、[SGLang](https://github.com/seedleap/world-model-all-in-one/blob/main/.agents/skills/whitebox-sglang-ops/SKILL.md) skills 与 [whiteboxctl](https://github.com/seedleap/world-model-all-in-one/blob/main/whitebox_ops/README.md)。跨仓库使用时定位本人可访问的 checkout 并显式读取对应 SKILL.md，不假设其他项目的 skill 自动加载。
+- 本仓库 `deploy/whitebox/release.py` 是发布身份校验；知识库 `whitebox_ops/cli.py`、`whitebox_ops/evidence.py` 是带时间的组件观测，清单格式与覆盖范围不同。部分组件 PASS 不代表完整组发布或业务验收通过。
+- 用同一 release/trace 关联源码 SHA、镜像 digest、配置摘要、实例与观测时间；分别记录已合并、已构建、已部署、身份核验和业务验收状态。排查经验与脱敏证据按知识库约定回写，历史快照不因源码合并而重标；引用文档不增加线上操作权限。
+
 ## 部署会话模型
 
 - 用户于 2026-11-03 确认分离服务池：每个逻辑 Model Slot/Encoder–DiT–Decoder 通信组只属于一个玩家，每个 service 同时最多一个活跃会话。DiT 的 SP ranks 合起来是一个 service；Encoder/Decoder 进程可通过多个独立 service 共享模型，受进程总预算约束。这是对下述旧“部署实例”口径的细化，不允许同一个 service 并发承载多个玩家，也不恢复已停用的旧多 DiT shared API 路由。
