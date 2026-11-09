@@ -2,10 +2,13 @@
 """Lifecycle commands on the original DiT model owner, with existing I/O queues."""
 
 import asyncio
+import logging
 from concurrent.futures import Future
 from queue import Empty, Queue
 
 from .worker_connections import ServiceConnections, endpoint
+
+logger = logging.getLogger(__name__)
 
 
 class DiTGroups:
@@ -138,6 +141,7 @@ class DiTGroups:
                     topology[role]["service_id"] for role in ("encoder", "dit")
                 ],
             ),
+            timeout_s=self.timeout,
             cleanup_timeout=self.timeout,
         )
         self.link.start()
@@ -264,15 +268,18 @@ class DiTGroups:
                     command = self.parallel.broadcast_object(command)
                 if command is not None:
                     kind, args = command
+                    logger.info("DiT group command starting: %s", kind)
                     try:
                         if kind == "build":
                             self.build(*args)
                         else:
                             await self.destroy(force=kind == "rollback")
                     except Exception as exc:  # noqa: BLE001 - report worker failure to owner
+                        logger.exception("DiT group command failed: %s", kind)
                         if future is not None:
                             future.set_exception(exc)
                     else:
+                        logger.info("DiT group command completed: %s", kind)
                         if future is not None:
                             future.set_result(None)
                     continue
@@ -283,6 +290,9 @@ class DiTGroups:
                         elif self.link.poll():
                             self.service.queue.append(self.link.receive())
                     except Exception:  # noqa: BLE001 - worker failure cleanup
+                        # Preserve the initiating error before teardown can
+                        # replace it with a peer disconnect or NCCL timeout.
+                        logger.exception("DiT model or transport operation failed")
                         # A failed model invocation cannot be treated as a clean
                         # transport disconnect. Keep the worker unavailable even
                         # when host-side resource release succeeds.

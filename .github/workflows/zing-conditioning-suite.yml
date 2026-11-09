@@ -45,6 +45,8 @@ jobs:
           python -m pip install --index-url https://download.pytorch.org/whl/cpu -r torch.txt
           python -m pip install -r deps.txt triton==3.8.0
       - name: Prepare media tooling
+        timeout-minutes: 8
+        shell: bash
         run: |
           # imageio-ffmpeg is pinned in requirements-cpu.txt and ships a static
           # ffmpeg; apt-get update is the slow path on these runners.

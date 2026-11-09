@@ -236,6 +236,7 @@ def test_actual_producer_recovers_unknown_ack_and_marks_data_failure(
         )
     )
     session = SimpleNamespace(
+        peer=remote_encoder.EncoderPeer(),
         timeout=1,
         port=31001,
         token="old",

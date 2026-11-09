@@ -1,0 +1,20 @@
+{
+  "coordinator_url": "http://whitebox-coordinator:18081",
+  "room_url": "http://whitebox-room:8092",
+  "owner_id": "replace-room-owner",
+  "redis_host": "replace-redis-host",
+  "redis_port": "6379",
+  "redis_prefix": "replace-region-prefix",
+  "platform_url": "https://world-test-platform.loopit.com.cn",
+  "gateway_url": "https://replace-region-gateway.example.com",
+  "oss_bucket": "replace-region-bucket",
+  "oss_prefix": "white_box_game_record/replace-region/",
+  "rtc_public_ip": "192.0.2.1",
+  "rtc_public_port": "443",
+  "routing_revision": "replace-existing-routing-revision",
+  "worker_id": "replace-existing-worker-id",
+  "availability_zone": "replace-existing-zone",
+  "advertise_ip": "10.0.0.1",
+  "asset_root": "/opt/whitebox/assets",
+  "state_root": "/var/lib/sglang/whitebox-model"
+}

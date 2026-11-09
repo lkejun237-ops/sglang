@@ -5,7 +5,9 @@ import hashlib
 import logging
 import threading
 import time
+import weakref
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -14,11 +16,17 @@ import torch
 
 from sglang.multimodal_gen.runtime.conditioning.worker import coordinate_validation
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.shared_capacity import (
+    CapacityUnavailable,
+    SharedCapacity,
+    retain_until_exit,
+)
 
 from .block0_identity import fingerprint
 from .cache_logging import cache_event, cache_scope, log_context
 from .media_input import _local_media
 from .paged_kv import PAGE_ROWS, PagedKV
+from .storage_payload import serialization_bound
 
 logger = init_logger(__name__)
 
@@ -84,6 +92,16 @@ def preparation_key(codecs, request, preview, config, identity):
             preview["frames"].contiguous().numpy().tobytes()
         ).hexdigest(),
     )
+    if preview is not None:
+        frames = preview["frames"]
+        if tuple(frames.shape) != (3, 1, config["height"], config["width"]):
+            # white_box S0 v2 accepts native-sized conditioning previews. Equal
+            # bytes with different geometry are different model inputs. Keep
+            # main's key unchanged for its fixed-size preview contract.
+            identity["s0_geometry"] = {
+                "shape": list(frames.shape),
+                "dtype": str(frames.dtype),
+            }
     # Reference resizing changes the effective model inputs even when the
     # encoded images and exported checkpoint stay the same.
     reference_resize = getattr(codecs, "reference_resize", None)
@@ -136,6 +154,7 @@ class PreparationEntry:
     log_context: dict | None = None
     fill_started: float | None = None
     disk_task: threading.Event | None = None
+    auxiliary_bytes: int = 0
 
     @property
     def page_ids(self):
@@ -366,6 +385,8 @@ class LocalPagedBackend(Block0PreparationCache):
         disk_cache,
         page_rows=PAGE_ROWS,
         backend="local",
+        capacity_dir=None,
+        host_total_bytes=None,
     ):
         if type(max_bytes) is not int or max_bytes < 1:
             raise ValueError("Block0 cache byte budget must be a positive integer")
@@ -374,6 +395,8 @@ class LocalPagedBackend(Block0PreparationCache):
         self.identity = identity
         self.entries = OrderedDict()
         self.pending = None
+        self.last_lookup = {}
+        self._promotion_metrics = {}
         self.hits = self.misses = self.evictions = 0
         self.disk_cache = disk_cache
         if type(page_rows) is not int or page_rows < 1:
@@ -387,18 +410,82 @@ class LocalPagedBackend(Block0PreparationCache):
         self.page_bytes = (
             len(stores) * 2 * page_rows * first[0].numel() * first.element_size()
         )
-        self.total_pages = max_bytes // self.page_bytes
+        if (capacity_dir is None) != (host_total_bytes is None):
+            raise ValueError(
+                "Shared host cache capacity requires its directory and total"
+            )
+        self._host_lease = None
+        self.auxiliary_limit = max_bytes // 20 if capacity_dir is not None else None
+        arena_bytes = max_bytes - (self.auxiliary_limit or 0)
+        self.total_pages = arena_bytes // self.page_bytes
         if self.total_pages < 1:
             raise ValueError("Block0 host budget cannot hold one pinned KV page")
         self.max_bytes = max_bytes
-        self.pages = torch.empty(
-            (len(stores), 2, self.total_pages, page_rows, *first.shape[1:]),
-            dtype=first.dtype,
-            device="cpu",
-            pin_memory=True,
-        )
+        if capacity_dir is not None:
+            self._host_lease = SharedCapacity(capacity_dir).reserve(
+                "host-cache", max_bytes, host_total_bytes
+            )
+        try:
+            self.pages = torch.empty(
+                (len(stores), 2, self.total_pages, page_rows, *first.shape[1:]),
+                dtype=first.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+        except BaseException:
+            if self._host_lease is not None:
+                self._host_lease.close()
+            raise
+        if self._host_lease is not None:
+            # External restores/entries can retain this arena after close().
+            # Release the machine quota only when the arena itself is gone.
+            if self.pages.is_pinned():
+                retain_until_exit(self._host_lease)
+            else:
+                weakref.finalize(self.pages, self._host_lease.close)
         self.stream = torch.cuda.Stream(device=first.device)
         self.free_pages = [True] * self.total_pages
+        self._disk_slots = threading.BoundedSemaphore(2)
+        self._disk_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="zing-block0-disk"
+        )
+        self.closed = False
+
+    def _admit_auxiliary(self, size, *, protected=()):
+        if self.auxiliary_limit is None:
+            return
+        if size > self.auxiliary_limit:
+            raise CapacityUnavailable(
+                "Conditioning snapshot exceeds the L1 auxiliary budget"
+            )
+        while (
+            sum(e.auxiliary_bytes for e in self.entries.values()) + size
+            > self.auxiliary_limit
+        ):
+            key = next(
+                (
+                    k
+                    for k, e in self.entries.items()
+                    if k not in protected
+                    and (e.disk_task is None or e.disk_task.is_set())
+                ),
+                None,
+            )
+            if key is None:
+                raise CapacityUnavailable("L1 snapshot pages are still in use")
+            self._release(key)
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.finish_fill()
+        self._disk_executor.shutdown(wait=True)
+        self.stream.synchronize()
+        self.entries.clear()
+        self.pages = None
+        if self.disk_cache is not None:
+            self.disk_cache.close()
 
     def may_contain(self, key):
         """CPU-only hint for speculative work; lookup remains authoritative.
@@ -426,6 +513,7 @@ class LocalPagedBackend(Block0PreparationCache):
 
     def _lookup(self, key, *, allow_disk, protected):
         started = time.perf_counter()
+        self._promotion_metrics = {}
         self.finish_fill()
         local = self.entries.get(key)
         tier = "l1"
@@ -442,6 +530,22 @@ class LocalPagedBackend(Block0PreparationCache):
         hit = local is not None and all(
             digest == key and rows == local_rows for digest, rows in votes
         )
+        self.last_lookup = {
+            "cache_result": tier + "_hit" if hit else "miss",
+            "local_layer": tier,
+            "lookup_host_ms": (time.perf_counter() - started) * 1000,
+            "disk_allowed": allow_disk,
+            "miss_reason": None
+            if hit
+            else (
+                "sp_key_mismatch"
+                if any(digest != key for digest, _ in votes)
+                else "partial_rank_miss"
+                if any(ready for _, ready in votes)
+                else self._promotion_metrics.get("miss_reason", "not_resident")
+            ),
+            "storage": dict(self._promotion_metrics),
+        }
         self.hits += int(hit)
         self.misses += int(not hit)
         if hit:
@@ -471,8 +575,8 @@ class LocalPagedBackend(Block0PreparationCache):
 
     def _release(self, key):
         entry = self.entries[key]
-        if entry.disk_task is not None:
-            entry.disk_task.wait()
+        if entry.disk_task is not None and not entry.disk_task.is_set():
+            raise CapacityUnavailable("L1 pages are still owned by a disk writer")
         # Keep ownership until both CPU readers and DMA have retired. This also
         # makes free pages safe for synchronous disk IO, not just queued DMA.
         self.stream.synchronize()
@@ -496,8 +600,23 @@ class LocalPagedBackend(Block0PreparationCache):
         if key in self.entries:
             self._release(key)
         while self.free_pages.count(True) < needed:
-            old_key = next((k for k in self.entries if k not in protected), None)
+            old_key = next(
+                (
+                    k
+                    for k, e in self.entries.items()
+                    if k not in protected
+                    and (e.disk_task is None or e.disk_task.is_set())
+                ),
+                None,
+            )
             if old_key is None:
+                if any(
+                    e.disk_task is not None and not e.disk_task.is_set()
+                    for e in self.entries.values()
+                ):
+                    raise CapacityUnavailable(
+                        "L1 pages are still owned by disk writers"
+                    )
                 raise ValueError(
                     "Block0 preload selection exceeds the pinned page budget"
                 )
@@ -518,6 +637,7 @@ class LocalPagedBackend(Block0PreparationCache):
 
     def _promote_from_disk(self, key, *, protected=()):
         disk = self.disk_cache
+        cached = None
         try:
             # A failed disk lookup must not leave an old shard looking ready
             # after another rank reloads to the same row count.
@@ -525,7 +645,20 @@ class LocalPagedBackend(Block0PreparationCache):
                 self._release(key)
             if disk is None or not disk.is_enabled():
                 return None
-            cached = disk.lookup(key, disk.local_rank)
+            read_started = time.perf_counter()
+            if self.auxiliary_limit is None:
+                cached = disk.lookup(key, disk.local_rank)
+            else:
+                cached = disk.lookup(
+                    key,
+                    disk.local_rank,
+                    admit_conditions=lambda size: self._admit_auxiliary(
+                        size, protected=protected
+                    ),
+                )
+            self._promotion_metrics["conditions_read_host_ms"] = (
+                time.perf_counter() - read_started
+            ) * 1000
             if cached is None:
                 return None
             conditions = cached.conditions
@@ -566,12 +699,19 @@ class LocalPagedBackend(Block0PreparationCache):
                     level=logging.WARNING,
                 )
                 return None
+            auxiliary = serialization_bound(conditions)
+            self._admit_auxiliary(auxiliary, protected=protected)
             data = self._take_pages(key, rows, protected=protected)
             try:
                 # A disk read runs on the CPU, outside the DMA stream. Fence
                 # earlier H2D reads before overwriting the reused pinned slot.
                 self.stream.synchronize()
+                read_started = time.perf_counter()
                 disk.load_kv_into(cached, data)
+                self._promotion_metrics["kv_read_host_ms"] = (
+                    time.perf_counter() - read_started
+                ) * 1000
+                self._promotion_metrics["kv_bytes"] = data.numel() * data.element_size()
             except BaseException:
                 self._return_pages(data.page_ids)
                 raise
@@ -586,9 +726,11 @@ class LocalPagedBackend(Block0PreparationCache):
                 None,
                 data,
             )
+            entry.auxiliary_bytes = auxiliary
             self.entries[key] = entry
             return entry
         except Exception as exc:
+            self._promotion_metrics["miss_reason"] = "promotion_error"
             cache_event(
                 "l2_read",
                 "failed",
@@ -598,6 +740,9 @@ class LocalPagedBackend(Block0PreparationCache):
                 level=logging.WARNING,
             )
             return None
+        finally:
+            if cached is not None:
+                cached.close()
 
     def restore(self, cache, entry):
         started = time.perf_counter()
@@ -663,9 +808,30 @@ class LocalPagedBackend(Block0PreparationCache):
                 reason="host_budget",
             )
             return False
-        snapshot = inputs_on(inputs, "cpu", snapshot=True)
-        positions = prefix.positions.detach().cpu().clone()
-        data = self._take_pages(key, rows)
+        auxiliary = serialization_bound(
+            {
+                "inputs": inputs,
+                "request": request,
+                "positions": prefix.positions,
+                "identity": conditioning_identity,
+            },
+            deduplicate=False,
+        )
+        try:
+            self._admit_auxiliary(auxiliary, protected={key})
+            snapshot = inputs_on(inputs, "cpu", snapshot=True)
+            positions = prefix.positions.detach().cpu().clone()
+            data = self._take_pages(key, rows)
+        except CapacityUnavailable:
+            cache_event(
+                "l1_fill",
+                "skipped",
+                cache_key=key,
+                rank=self.log_rank,
+                reason="capacity_busy",
+                level=logging.WARNING,
+            )
+            return False
         entry = PreparationEntry(
             key,
             snapshot,
@@ -678,6 +844,7 @@ class LocalPagedBackend(Block0PreparationCache):
             log_context(),
             started,
         )
+        entry.auxiliary_bytes = auxiliary
         # Own the pages even if event construction or a later copy submission
         # fails. A failed drain must never return still-active pages to the pool.
         self.pending = (entry, None)
@@ -731,10 +898,23 @@ class LocalPagedBackend(Block0PreparationCache):
 
     def _persist(self, entry):
         disk = self.disk_cache
-        if disk is None or not disk.is_enabled():
+        if disk is None or not disk.is_enabled() or self.closed:
+            return
+        if entry.disk_task is not None and not entry.disk_task.is_set():
             return
         done = threading.Event()
         entry.disk_task = done
+        if not self._disk_slots.acquire(blocking=False):
+            done.set()
+            cache_event(
+                "l2_write",
+                "failed",
+                cache_key=entry.key,
+                rank=self.log_rank,
+                reason="writer_capacity",
+                level=logging.WARNING,
+            )
+            return
 
         def write():
             # ContextVars do not cross threads; keep only the metadata snapshot.
@@ -766,23 +946,28 @@ class LocalPagedBackend(Block0PreparationCache):
                     )
                 finally:
                     done.set()
+                    self._disk_slots.release()
 
         try:
-            threading.Thread(
-                target=write,
-                name=f"zing-block0-disk-{entry.key[:12]}",
-                daemon=True,
-            ).start()
+            self._disk_executor.submit(write)
         except Exception:
+            self._disk_slots.release()
             done.set()
             logger.warning("Block0 disk writer could not start", exc_info=True)
 
     def _write_disk(self, entry):
         disk = self.disk_cache
-        rank = disk.local_rank
         tmp = disk.new_tmp_dir(entry.key)
         if tmp is None:
             return
+        try:
+            return self._write_disk_reserved(entry, tmp)
+        finally:
+            disk.discard_tmp(tmp)
+
+    def _write_disk_reserved(self, entry, tmp):
+        disk = self.disk_cache
+        rank = disk.local_rank
         conditions = {
             "inputs": entry.inputs,
             "conditioning_identity": entry.conditioning_identity,
@@ -795,6 +980,15 @@ class LocalPagedBackend(Block0PreparationCache):
             "geometry": _block0_geometry(entry),
             "prompt_preview": _prompt_preview(entry.request),
         }
+        if disk.budget is not None:
+            from .block0_conditions import encode_conditions
+
+            size = entry.data.numel() * entry.data.element_size() + serialization_bound(
+                encode_conditions(conditions)
+            )
+            if not disk.reserve_write(entry.key, tmp, size):
+                disk.discard_tmp(tmp)
+                return None
         path = disk.save_rank_kv(entry.key, rank, entry.data, tmp)
         if path is None:
             disk.discard_tmp(tmp)
@@ -802,6 +996,24 @@ class LocalPagedBackend(Block0PreparationCache):
         return disk.commit_entry(
             entry.key, conditions, manifest, {rank: path}, tmp, force=entry.force
         )
+
+    def ensure_disk(self, entry):
+        """Reuse native persistence if an explicit receipt lost its L2 copy.
+
+        This adds no storage locks or KV scan. Same-key files retain the native
+        publication contract; active writers keep their page ownership.
+        """
+        disk = self.disk_cache
+        if disk is None:
+            return entry
+        complete = (
+            disk._valid_manifest(disk._entry_dir(entry.key), entry.key) is not None
+        )
+        busy = entry.disk_task is not None and not entry.disk_task.is_set()
+        votes = coordinate_validation((complete, busy))
+        if not all(v[0] for v in votes) and not any(v[1] for v in votes):
+            self._persist(entry)
+        return entry
 
     def wait_for_disk(self):
         """Wait for in-flight L2 writes; used by shutdown and deterministic tests."""
@@ -819,7 +1031,9 @@ class LocalPagedBackend(Block0PreparationCache):
         from .cache_index import CacheIndex
 
         try:
-            CacheIndex(self.disk_cache.cache_dir).bind(game_id, group_id, key)
+            CacheIndex(self.disk_cache.cache_dir, budget=self.disk_cache.budget).bind(
+                game_id, group_id, key
+            )
             cache_event(
                 "index_bind",
                 "completed",
@@ -828,7 +1042,7 @@ class LocalPagedBackend(Block0PreparationCache):
                 game_id=game_id,
                 group_id=group_id,
             )
-        except OSError as exc:
+        except (OSError, CapacityUnavailable) as exc:
             cache_event(
                 "index_bind",
                 "failed",
@@ -915,6 +1129,15 @@ class LocalPagedBackend(Block0PreparationCache):
             return self.status(keys)
         self.finish_fill()
         keys = list(dict.fromkeys(keys))
+        if operation == "unload":
+            busy = any(
+                key in self.entries
+                and self.entries[key].disk_task is not None
+                and not self.entries[key].disk_task.is_set()
+                for key in keys
+            )
+            if any(coordinate_validation(busy)):
+                return {"code": "cache_busy"}
         protected = set()
         if operation == "preload":
             rows, needed, total = self._preload_plan(keys)

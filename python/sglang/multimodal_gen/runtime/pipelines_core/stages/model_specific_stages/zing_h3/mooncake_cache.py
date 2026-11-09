@@ -75,6 +75,7 @@ class MooncakeBackend(prep.Block0PreparationCache):
         self.log_rank = rank
         self.world_size = world_size
         self.hits = self.misses = self.evictions = 0
+        self.last_lookup = {}
         self.write_failures = 0
         self.pending = None
         self._pending_indices = set()
@@ -330,6 +331,15 @@ class MooncakeBackend(prep.Block0PreparationCache):
         rows = None if entry is None else int(entry.positions.shape[0])
         votes = prep.coordinate_validation((key, rows, error))
         hit = entry is not None and all(v == (key, rows, None) for v in votes)
+        self.last_lookup = {
+            "cache_result": "l1_hit" if hit else "miss",
+            "local_layer": "l1",
+            "backend": self.backend,
+            "lookup_host_ms": (time.perf_counter() - started) * 1000,
+            "disk_allowed": False,
+            "miss_reason": None if hit else error or "not_resident",
+            "storage": {},
+        }
         self.hits += int(hit)
         self.misses += int(not hit)
         if hit:

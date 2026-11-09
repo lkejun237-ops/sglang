@@ -135,9 +135,21 @@ class PromptSocket:
         self.messages.append(msgspec.msgpack.decode(raw))
 
 
-def test_sink_events_are_latest_wins_without_overwriting_prompt(configured):
+@pytest.mark.parametrize("ordered", [False, True])
+def test_sink_events_are_latest_wins_without_overwriting_prompt(configured, ordered):
     _enable_reference_updates(configured, split=False)
-    adapter, session = initialize()
+    if ordered:
+        configured.pipeline_config.decoder_type = "lynn_streaming"
+    adapter, session = initialize(
+        **(
+            {
+                "source_prompt_protocol": "ordered-boundary-v2",
+                "source_condition_switch_protocol": "clip-barrier-v1",
+            }
+            if ordered
+            else {}
+        )
+    )
     assert adapter.ready["sink_updates"]
     assert adapter.ready["input_budget"] == adapter.input_budget.metadata()
     ws = PromptSocket()
@@ -146,9 +158,25 @@ def test_sink_events_are_latest_wins_without_overwriting_prompt(configured):
         await adapter.ingest_wire_event(
             ws,
             session,
-            dict(type="event", kind="prompt", event_id=1, payload="new prompt"),
+            dict(
+                type="event",
+                kind="prompt.update" if ordered else "prompt",
+                event_id=1,
+                payload=(
+                    dict(
+                        text="new prompt",
+                        version=2,
+                        min_source_frame=0,
+                        policy="at_or_after",
+                        source_policy="skip_during_switch",
+                    )
+                    if ordered
+                    else "new prompt"
+                ),
+            ),
             100,
         )
+        before = dict(adapter._pending_prompt_command)
         for event_id, operation in [(2, "off"), (3, "refresh")]:
             await adapter.ingest_wire_event(
                 ws,
@@ -161,7 +189,7 @@ def test_sink_events_are_latest_wins_without_overwriting_prompt(configured):
                 ),
                 100,
             )
-        assert adapter._pending_prompt_command == dict(prompt="new prompt", event_id=1)
+        assert adapter._pending_prompt_command == before
         assert adapter._pending_sink_command == dict(operation="refresh", event_id=3)
         assert session.request.prompt == "Render snow"
         assert ws.messages[-1]["stage"] == "accepted"
@@ -334,6 +362,14 @@ def test_reference_memory_cleanup_releases_initial_pending_and_inflight(
     )
     adapter, session = initialize(references=[_reference("initial")])
     ws = PromptSocket()
+    # The API pool is process-wide; other tests/sessions may still own ingress.
+    other_tenants = {
+        tenant: charges
+        for tenant, charges in session.conditioning_resources.ledger.snapshot()[
+            "tenants"
+        ].items()
+        if tenant != session.id
+    }
 
     async def run():
         for event_id in (1, 2):
@@ -365,7 +401,12 @@ def test_reference_memory_cleanup_releases_initial_pending_and_inflight(
         assert session._api_media_reservations == []
         assert adapter._pending_reference_upload is None
         assert adapter._inflight_reference_uploads == []
-        assert session.conditioning_resources.ledger.snapshot()["global"]["ram"] == 0
+        snapshot = session.conditioning_resources.ledger.snapshot()
+        assert session.id not in snapshot["tenants"]
+        assert snapshot["tenants"] == other_tenants
+        assert snapshot["global"]["ram"] == sum(
+            row["ram"] for row in other_tenants.values()
+        )
 
     asyncio.run(run())
 
@@ -443,11 +484,13 @@ def test_early_reference_event_dispatch_preserves_initial_epoch(
             {}
             if mode == "text"
             else {
-                "references": None
-                if mode == "invalid"
-                else []
-                if mode == "clear"
-                else [_reference()]
+                "references": (
+                    None
+                    if mode == "invalid"
+                    else []
+                    if mode == "clear"
+                    else [_reference()]
+                )
             }
         )
         await adapter.ingest_wire_event(
@@ -2116,6 +2159,643 @@ def test_reference_count_cli_does_not_add_setting_to_other_models():
     assert not hasattr(config, "zing_reference_max_images")
 
 
+def test_ordered_reference_switch_fences_source_and_dispatches_without_future_rgb(
+    configured,
+):
+    _enable_reference_updates(configured)
+    configured.pipeline_config.decoder_type = "lynn_streaming"
+    adapter, session = initialize(
+        source_prompt_protocol="ordered-boundary-v2",
+        source_condition_switch_protocol="clip-barrier-v1",
+    )
+    socket = PromptSocket()
+
+    async def run():
+        await adapter.ingest_wire_event(
+            socket,
+            session,
+            dict(
+                type="event",
+                kind="prompt.update",
+                event_id=1,
+                payload=dict(
+                    text="updated",
+                    version=2,
+                    min_source_frame=0,
+                    policy="at_or_after",
+                    source_policy="skip_during_switch",
+                    references=[_reference()],
+                ),
+            ),
+            2048,
+        )
+        assert socket.messages[-1]["state"] == "accepted"
+        assert socket.messages[-1]["source_frame_index"] == 17
+        assert adapter.public_prompt_version == 1
+        assert not adapter._condition_control_ready()
+        # Old input is still attributed to the original condition while draining B.
+        inputs = adapter.sample_chunk_inputs(session, None, None, 17)
+        assert (
+            inputs.prompt == "Render snow"
+            and adapter._pending_reference_upload is not None
+        )
+        await adapter.ingest_wire_event(
+            socket,
+            session,
+            dict(
+                type="event",
+                kind="source.append",
+                event_id=2,
+                payload=dict(
+                    client_seq=0,
+                    source_frame_start=0,
+                    num_frames=17,
+                    pts_us=0,
+                    data=bytes(17 * 32 * 32 * 3),
+                ),
+            ),
+            17 * 32 * 32 * 3 + 200,
+        )
+        with pytest.raises(ValueError, match="wait"):
+            await adapter.ingest_wire_event(
+                socket,
+                session,
+                dict(
+                    type="event",
+                    kind="source.append",
+                    event_id=3,
+                    payload=dict(
+                        client_seq=1,
+                        source_frame_start=17,
+                        num_frames=1,
+                        pts_us=708333,
+                        data=bytes(32 * 32 * 3),
+                    ),
+                ),
+                32 * 32 * 3 + 200,
+            )
+        adapter.pending.clear()
+        adapter.pending_frames = 0
+        adapter.dispatched_source_frames = 17
+        adapter.committed_source_frames = 17
+        adapter.more_work = False
+        assert adapter._condition_control_ready()
+        await asyncio.wait_for(adapter.wait_for_next_chunk(session), 0.1)
+        inputs = adapter.sample_chunk_inputs(session, None, None, 17)
+        assert inputs.prompt == "updated" and adapter.public_prompt_version == 2
+        command = adapter._selected_prompt_command
+        assert (
+            command["source_boundary"] == 17
+            and command["references"][0]["id"] == "<Picture 1>"
+        )
+        assert (
+            adapter._pending_reference_upload is None
+            and adapter._inflight_reference_uploads
+        )
+        await adapter.close_conditioning(session)
+        adapter.clear_state(session)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "decoder_type", [None, "lynn_streaming", "taeh3", "official_h3"]
+)
+def test_ready_negotiates_proven_source_release_only_for_lynn(configured, decoder_type):
+    configured.pipeline_config.decoder_type = decoder_type
+    adapter, session = initialize()
+    expected = "valid-source-frames-v1" if decoder_type == "lynn_streaming" else None
+    assert (
+        adapter.session_ready_message(session).get("source_output_release_protocol")
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "grid", [[1000, 750, 500, 250], [1000, 500], [1000, 750], [1000]]
+)
+@pytest.mark.parametrize("explicit", [False, True])
+def test_step_count_comes_from_trusted_profile(configured, monkeypatch, grid, explicit):
+    from pathlib import Path
+
+    path = Path(configured.model_path) / "zing_realtime_profile.json"
+    profile = json.loads(path.read_text())
+    profile["denoising_step_list"] = grid
+    profile["source_attention_window"] = {"window_chunks": 6, "sink_chunks": 3}
+    path.write_text(json.dumps(profile))
+    adapter, session = initialize(
+        **({"num_inference_steps": len(grid)} if explicit else {})
+    )
+    received = {}
+
+    def build(*args, **kwargs):
+        received.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(source, "build_realtime_sampling_params", build)
+    params = adapter.build_sampling_params(
+        session,
+        None,
+        SimpleNamespace(request_id="test"),
+        SimpleNamespace(prompt="original prompt"),
+        17,
+    )
+    assert received["num_inference_steps"] == len(grid)
+    assert params.zing_denoising_step_list == grid
+    assert params.zing_window_chunks == 6
+    assert adapter.ready["num_inference_steps"] == len(grid)
+    assert session.request.num_inference_steps == len(grid)
+    with pytest.raises(ValueError, match="requested step count"):
+        initialize(num_inference_steps=4 if len(grid) == 2 else 2)
+    with pytest.raises(ValueError):
+        initialize(zing_denoising_step_list=[1000, 500])
+    adapter.dispose(session)
+
+
+@pytest.mark.parametrize("grid", [[750], [1000, 1000], [1000, 0]])
+def test_invalid_deployment_noise_grid_is_rejected(configured, grid):
+    from pathlib import Path
+
+    path = Path(configured.model_path) / "zing_realtime_profile.json"
+    profile = json.loads(path.read_text())
+    profile["denoising_step_list"] = grid
+    path.write_text(json.dumps(profile))
+    with pytest.raises(ValueError, match="noise grids"):
+        initialize()
+
+
+@pytest.mark.parametrize(
+    "lengths,split,dispatched,pending,target,missing",
+    [
+        ([1, 2, 2], False, 0, 1, 1, 0),
+        ([1, 2, 2], False, 1, 8, 8, 0),
+        ([1, 2, 2], False, 9, 3, 8, 5),
+        ([3, 2], True, 0, 1, 1, 0),
+        ([3, 2], True, 9, 8, 8, 0),
+        ([3, 2], True, 17, 1, 9, 8),
+        ([3, 2], True, 26, 8, 8, 0),
+        ([3, 2], True, 34, 9, 9, 0),
+    ],
+)
+def test_one_block_wait_uses_only_current_codec_dependency(
+    configured, lengths, split, dispatched, pending, target, missing
+):
+    adapter, _ = initialize()
+    adapter.source_work_quantum = 1
+    adapter.source_encoder = {"mode": "progressive"}
+    adapter.joint_plan = source.ChunkPlan(lengths, split)
+    adapter.dispatched_source_frames = dispatched
+    adapter.pending_frames = pending
+    frames, budget = adapter._joint_wait_target()
+    assert frames == target
+    assert budget == pytest.approx(missing * 1000 / 24)
+
+
+def test_one_block_ready_input_does_not_wait_for_future_credit(configured, monkeypatch):
+    adapter, session = initialize()
+    adapter.source_work_quantum = 1
+    adapter.source_encoder = {"mode": "progressive"}
+    adapter.joint_plan = source.ChunkPlan([3, 2], True)
+    adapter.dispatched_source_frames = 9
+    adapter.pending_frames = 8
+
+    async def unexpected_wait():
+        raise AssertionError(
+            "Current block is ready; future inputs need its output credit"
+        )
+
+    monkeypatch.setattr(adapter.available, "wait", unexpected_wait)
+    asyncio.run(adapter.wait_for_next_chunk(session))
+    assert adapter.joint_wait["reason"] == "ready"
+    assert adapter.joint_wait["target_frames"] == 8
+
+
+def test_one_block_wait_still_requires_complete_current_input(configured):
+    adapter, session = initialize()
+    adapter.source_work_quantum = 1
+    adapter.source_encoder = {"mode": "progressive"}
+    adapter.joint_plan = source.ChunkPlan([3, 2], True)
+    adapter.dispatched_source_frames = 9
+    adapter.pending_frames = 7
+
+    async def run():
+        task = asyncio.create_task(adapter.wait_for_next_chunk(session))
+        await asyncio.sleep(0)
+        assert not task.done()
+        adapter.pending_frames = 8
+        adapter.available.set()
+        await asyncio.wait_for(task, 0.2)
+
+    asyncio.run(run())
+    assert adapter.joint_wait["reason"] == "ready"
+    assert adapter.joint_wait["target_frames"] == 8
+
+
+@pytest.mark.parametrize("quantum", [0, 1])
+@pytest.mark.parametrize(
+    "dispatched,pending,target",
+    [(0, 1, 1), (1, 8, 8), (9, 8, 8), (17, 9, 9), (26, 8, 8)],
+)
+def test_remote_progressive_wait_targets_one_runnable_block(
+    configured, monkeypatch, quantum, dispatched, pending, target
+):
+    configured.disagg_decoder_port = 31002
+    monkeypatch.setenv("SGLANG_ZING_REMOTE_DECODE_PROGRESSIVE", "1")
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", str(quantum))
+    adapter, session = initialize()
+    assert adapter.remote_progressive and adapter.source_work_quantum == quantum
+    adapter.source_encoder = {"mode": "progressive"}
+    adapter.joint_plan = source.ChunkPlan([3, 2], True)
+    adapter.dispatched_source_frames = dispatched
+    adapter.pending_frames = pending
+    adapter.profile.update(joint_forward="cross_chunk", joint_wait_ms=50)
+
+    async def unexpected_wait():
+        raise AssertionError("A runnable progressive block must not wait for lookahead")
+
+    monkeypatch.setattr(adapter.available, "wait", unexpected_wait)
+    asyncio.run(adapter.wait_for_next_chunk(session))
+    assert adapter.joint_wait["reason"] == "ready"
+    assert adapter.joint_wait["target_frames"] == target
+
+
+def test_remote_progressive_wait_wakes_on_current_input_not_future_input(
+    configured, monkeypatch
+):
+    configured.disagg_decoder_port = 31002
+    monkeypatch.setenv("SGLANG_ZING_REMOTE_DECODE_PROGRESSIVE", "1")
+    adapter, session = initialize()
+    adapter.source_encoder = {"mode": "progressive"}
+    adapter.joint_plan = source.ChunkPlan([3, 2], True)
+    adapter.dispatched_source_frames = 9
+    adapter.pending_frames = 7
+    adapter.profile.update(joint_forward="cross_chunk", joint_wait_ms=50)
+
+    async def run():
+        task = asyncio.create_task(adapter.wait_for_next_chunk(session))
+        try:
+            await asyncio.sleep(0)
+            assert not task.done(), "Seven frames cannot satisfy an eight-frame block"
+            adapter.pending_frames = 8
+            adapter.available.set()
+            await asyncio.wait_for(task, 0.2)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+    assert adapter.joint_wait["reason"] == "ready"
+    assert adapter.joint_wait["target_frames"] == 8
+
+
+def test_nonprogressive_remote_keeps_joint_collection(configured, monkeypatch):
+    configured.disagg_decoder_port = 31002
+    monkeypatch.setenv("SGLANG_ZING_REMOTE_DECODE_PROGRESSIVE", "0")
+    adapter, _ = initialize()
+    assert not adapter.remote_progressive
+    adapter.source_encoder = {"mode": "progressive"}
+    adapter.joint_plan = source.ChunkPlan([3, 2], True)
+    adapter.dispatched_source_frames = 9
+    adapter.pending_frames = 8
+    assert adapter._joint_wait_target()[0] == 17
+
+
+def test_clip_barrier_rejects_strict_and_unnegotiated_updates(configured):
+    _enable_reference_updates(configured)
+    configured.pipeline_config.decoder_type = "lynn_streaming"
+    adapter, session = initialize(
+        source_prompt_protocol="ordered-boundary-v2",
+        source_condition_switch_protocol="clip-barrier-v1",
+    )
+    socket = PromptSocket()
+
+    async def run():
+        for event_id, policy in [
+            (1, {}),
+            (2, {"source_policy": "skip_during_switch", "policy": "strict"}),
+        ]:
+            await adapter.ingest_wire_event(
+                socket,
+                session,
+                dict(
+                    type="event",
+                    kind="prompt.update",
+                    event_id=event_id,
+                    payload=dict(
+                        text="changed",
+                        version=2,
+                        min_source_frame=0,
+                        policy="at_or_after",
+                    )
+                    | policy,
+                ),
+                256,
+            )
+            assert socket.messages[-1]["state"] == "rejected"
+            assert (
+                adapter._pending_prompt_command is None
+                and adapter._source_switch_end is None
+            )
+
+    asyncio.run(run())
+
+
+def test_ready_continuation_reports_no_repeated_source_wait(configured):
+    adapter, session = initialize()
+    adapter.more_work = True
+    adapter.joint_wait = dict(actual_ms=300, budget_ms=333, target_frames=17)
+    asyncio.run(asyncio.wait_for(adapter.wait_for_next_chunk(session), 0.1))
+    assert adapter.joint_wait == dict(
+        actual_ms=0.0,
+        budget_ms=0.0,
+        target_frames=0,
+        policy="continuation",
+        reason="continuation",
+    )
+    adapter.clear_state(session)
+
+
+def test_startup_requires_explicit_worker_opt_in(configured, monkeypatch):
+    monkeypatch.delenv("SGLANG_ZING_SOURCE_PREPARE", raising=False)
+    with pytest.raises(ValueError, match="early preparation"):
+        initialize(source_prepare_protocol="whitebox-startup-prepare-v2", seed=42)
+    adapter, _ = initialize()
+    assert "source_prepare_protocol" not in adapter.ready
+
+
+def test_prepare_attach_accepts_independent_preview_and_preserves_video_sequence(
+    configured, monkeypatch
+):
+    from sglang.multimodal_gen.runtime.realtime.source_prepare import (
+        V2_PROTOCOL as PROTOCOL,
+    )
+    from sglang.multimodal_gen.runtime.realtime.source_prepare import (
+        condition_fingerprint,
+    )
+
+    monkeypatch.setenv("SGLANG_ZING_SOURCE_PREPARE", "1")
+    adapter, session = initialize(
+        source_prepare_protocol=PROTOCOL,
+        seed=17,
+        source_prompt_protocol="ordered-boundary-v2",
+    )
+    width, height = 960, 540
+    rgb = bytes([17]) * width * height * 3
+    cli_rgb = bytes(32 * 32 * 3)
+    identity = dict(
+        preparation_id="prepare-1",
+        source_session_id="source-1",
+        source_epoch="epoch-1",
+        worker_epoch="worker-1",
+        condition_fingerprint=condition_fingerprint(
+            rgb=rgb,
+            protocol=PROTOCOL,
+            preview_width=width,
+            preview_height=height,
+            prompt=session.request.prompt,
+            references=[],
+            seed=17,
+            source_stream=session.request.source_stream,
+            profile_sha256=adapter.ready["source_prepare_profile_sha256"],
+        ),
+    )
+    ws = PromptSocket()
+    # Keep the real control context/counters, replacing only heavyweight request construction.
+    monkeypatch.setattr(
+        source.BaseRealtimeModelAdapter,
+        "prepare_next_request",
+        lambda self, session, args, chunk: SimpleNamespace(
+            extra={}, block_idx=chunk.index
+        ),
+    )
+
+    async def event(kind, payload):
+        await adapter.ingest_wire_event(
+            ws,
+            session,
+            dict(type="event", kind=kind, event_id=1, payload=payload),
+            4096,
+        )
+
+    async def dispatch(kind):
+        await adapter.wait_for_next_chunk(session)
+        chunk = session.new_chunk(control_only=adapter.is_control_work(session))
+        batch = adapter.prepare_next_request(session, configured, chunk)
+        assert batch.extra["zing_source_command"]["appends"] == []
+        assert batch.realtime_prompt_version == 1
+        command = batch.extra["zing_source_command"]
+        assert (command["config"]["width"], command["config"]["height"]) == (32, 32)
+        assert command["source_geometry"] == source.asdict(adapter.source_geometry)
+        if kind == "prepare":
+            assert (command["startup"]["width"], command["startup"]["height"]) == (
+                960,
+                540,
+            )
+        assert batch.extra["zing_source_command"]["startup"]["op"] == kind
+        receipt = dict(
+            type="source.prepared" if kind == "prepare" else "source.attached",
+            identity=identity,
+        )
+        result = SimpleNamespace(usage={"zing_startup_ready": receipt})
+        adapter.on_chunk_complete(session, result)
+        stats = await adapter.send_output(ws, session, result, batch)
+        assert stats["num_frames"] == 0
+        assert (
+            session.generate_chunk_cnt
+            == session.next_chunk_index
+            == adapter.ledger.accepted_frames
+            == 0
+        )
+
+    async def run():
+        try:
+            await event(
+                "source.prepare",
+                dict(identity=identity, rgb=rgb, width=width, height=height),
+            )
+            command = adapter.startup_command
+            for bad in [
+                dict(width=0, height=height, rgb=rgb),
+                dict(width=height, height=width, rgb=rgb),
+                dict(width=width, height=height, rgb=rgb[:-3]),
+                dict(width=width, height=height, rgb=b"\x02" + rgb[1:]),
+            ]:
+                with pytest.raises(ValueError):
+                    await event("source.prepare", dict(identity=identity, **bad))
+                assert adapter.startup_command is command
+            await event(
+                "source.prepare",
+                dict(identity=identity, rgb=rgb, width=width, height=height),
+            )
+            assert adapter.startup_command is command
+            await dispatch("prepare")
+            await event(
+                "source.prepare",
+                dict(identity=identity, rgb=rgb, width=width, height=height),
+            )
+            assert (
+                adapter.startup_command is None
+                and ws.messages[-1]["type"] == "source.prepared"
+            )
+            payload = dict(
+                client_seq=0, source_frame_start=0, num_frames=1, pts_us=0, data=cli_rgb
+            )
+            with pytest.raises(ValueError, match="attachment"):
+                await event("source.append", payload)
+            with pytest.raises(ValueError, match="identity"):
+                await event(
+                    "source.attach",
+                    dict(identity={**identity, "worker_epoch": "stale"}),
+                )
+            await event("source.attach", dict(identity=identity))
+            await dispatch("attach")
+            await event("source.attach", dict(identity=identity))
+            assert adapter.startup_command is None
+            await event("source.append", payload)
+            assert adapter.ledger.accepted_frames == 1
+            assert adapter.source_preview_bytes == rgb
+            chunk = session.new_chunk()
+            assert chunk.index == 0 and not chunk.control_only
+        finally:
+            reservation = adapter._s0_reservation
+            await adapter.close_conditioning(session)
+            assert reservation.released
+
+    asyncio.run(run())
+
+
+def test_prepare_wait_deadline_not_extended_by_heartbeat(configured, monkeypatch):
+    monkeypatch.setenv("SGLANG_ZING_SOURCE_PREPARE", "1")
+    adapter, session = initialize(
+        source_prepare_protocol="whitebox-startup-prepare-v2", seed=42
+    )
+    adapter.startup_deadline = 0
+
+    async def run():
+        await adapter.ingest_wire_event(
+            PromptSocket(), session, {"kind": "heartbeat"}, 20
+        )
+        with pytest.raises(TimeoutError):
+            await adapter.wait_for_next_chunk(session)
+        assert session.generate_chunk_cnt == 0
+
+    asyncio.run(run())
+
+
+def test_v2_prepare_preserves_native_preview_and_accepts_independent_video_zero(
+    configured, monkeypatch
+):
+    from sglang.multimodal_gen.runtime.realtime.source_prepare import (
+        V2_PROTOCOL,
+        condition_fingerprint,
+    )
+
+    monkeypatch.setenv("SGLANG_ZING_SOURCE_PREPARE", "1")
+    adapter, session = initialize(
+        source_prepare_protocol=V2_PROTOCOL,
+        seed=17,
+        source_prompt_protocol="ordered-boundary-v2",
+    )
+    assert adapter.ready["source_prepare_protocol"] == V2_PROTOCOL
+    rgb = bytes([1, 2, 3]) * 16 * 48
+    identity = dict(
+        preparation_id="prepare-v2",
+        source_session_id="source",
+        source_epoch="epoch",
+        worker_epoch="worker",
+        condition_fingerprint=condition_fingerprint(
+            rgb=rgb,
+            preview_width=16,
+            preview_height=48,
+            protocol=V2_PROTOCOL,
+            prompt=session.request.prompt,
+            references=[],
+            seed=17,
+            source_stream=session.request.source_stream,
+            profile_sha256=adapter.ready["source_prepare_profile_sha256"],
+        ),
+    )
+    ws = PromptSocket()
+    monkeypatch.setattr(
+        source.BaseRealtimeModelAdapter,
+        "prepare_next_request",
+        lambda self, session, args, chunk: SimpleNamespace(
+            extra={}, block_idx=chunk.index
+        ),
+    )
+
+    async def event(kind, payload):
+        wire = msgspec.msgpack.encode(
+            dict(type="event", kind=kind, event_id=1, payload=payload)
+        )
+        await adapter.ingest_wire_event(
+            ws, session, msgspec.msgpack.decode(wire), len(wire)
+        )
+
+    async def dispatch(kind):
+        await adapter.wait_for_next_chunk(session)
+        chunk = session.new_chunk(control_only=adapter.is_control_work(session))
+        batch = adapter.prepare_next_request(session, configured, chunk)
+        startup = batch.extra["zing_source_command"]["startup"]
+        assert startup["protocol"] == V2_PROTOCOL and startup["op"] == kind
+        if kind == "prepare":
+            assert startup["rgb"] == rgb and (startup["width"], startup["height"]) == (
+                16,
+                48,
+            )
+        assert batch.extra["zing_source_command"]["appends"] == []
+        result = SimpleNamespace(
+            usage={
+                "zing_startup_ready": dict(
+                    type="source.prepared" if kind == "prepare" else "source.attached",
+                    identity=identity,
+                )
+            }
+        )
+        adapter.on_chunk_complete(session, result)
+        await adapter.send_output(ws, session, result, batch)
+        assert (
+            session.generate_chunk_cnt
+            == session.next_chunk_index
+            == adapter.ledger.accepted_frames
+            == 0
+        )
+
+    async def run():
+        try:
+            payload = dict(identity=identity, rgb=rgb, width=16, height=48)
+            with pytest.raises(ValueError):
+                await event("source.prepare", {**payload, "width": 16_777_217})
+            assert adapter._s0_reservation is None and adapter.startup_command is None
+            await event("source.prepare", payload)
+            with pytest.raises(ValueError):
+                await event("source.prepare", {**payload, "width": 24, "height": 32})
+            await dispatch("prepare")
+            await event("source.attach", dict(identity=identity))
+            await dispatch("attach")
+            native = bytes(32 * 32 * 3)
+            await event(
+                "source.append",
+                dict(
+                    client_seq=0,
+                    source_frame_start=0,
+                    num_frames=1,
+                    pts_us=0,
+                    data=native,
+                ),
+            )
+            assert adapter.ledger.accepted_frames == 1
+            # First live pixels cannot overwrite the immutable condition's
+            # replay identity, even though v2 deliberately permits them to differ.
+            await event("source.prepare", payload)
+            assert ws.messages[-1]["type"] == "source.prepared"
+            assert adapter.source_preview_sha256 == hashlib.sha256(rgb).hexdigest()
+        finally:
+            await adapter.close_conditioning(session)
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("enabled", [None, True, False])
 def test_prompt_prefetch_publishes_before_dispatch_and_closes(
     configured, monkeypatch, enabled
@@ -2173,18 +2853,21 @@ def test_prompt_prefetch_publishes_before_dispatch_and_closes(
 
 
 @pytest.mark.parametrize("remote,quantum", [(False, "1"), (True, "0"), (True, "1")])
+@pytest.mark.parametrize("progressive", [False, True])
 def test_source_decoder_overlap_requires_dedicated_single_block_path(
-    configured, monkeypatch, remote, quantum
+    configured, monkeypatch, remote, quantum, progressive
 ):
     configured.zing_source_decoder_overlap = True
     configured.disagg_decoder_port = 8098 if remote else None
     monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", quantum)
+    monkeypatch.setenv("SGLANG_ZING_REMOTE_DECODE_PROGRESSIVE", str(int(progressive)))
     if not remote or quantum != "1":
         with pytest.raises(ValueError, match="dedicated decoder and source quantum 1"):
             initialize()
     else:
         adapter, session = initialize()
         assert adapter.source_decoder_overlap is True
+        assert adapter.remote_progressive is progressive
         assert adapter.profile["source_decoder"] == {"remote": {"port": 8098}}
         adapter.clear_state(session)
 
@@ -2380,6 +3063,12 @@ def test_adapter_init_applies_disagg_role_policies(configured):
     asyncio.run(adapter.close_conditioning(session))
 
 
+def test_unknown_prepare_version_is_rejected(configured, monkeypatch):
+    monkeypatch.setenv("SGLANG_ZING_SOURCE_PREPARE", "1")
+    with pytest.raises(ValueError, match="source_prepare_protocol"):
+        initialize(source_prepare_protocol="unknown-v3", seed=42)
+
+
 @pytest.mark.parametrize("quantum", [0, 1])
 def test_cli_source_policy_reaches_worker_command(configured, monkeypatch, quantum):
     configured.disagg_encoder_port = 31005
@@ -2417,6 +3106,27 @@ def test_cli_source_policy_reaches_worker_command(configured, monkeypatch, quant
         assert profile_path.read_bytes() == original
     finally:
         adapter.clear_state(session)
+
+
+@pytest.mark.parametrize("progressive", [False, True])
+def test_cli_defer_final_preserves_remote_progressive_q0(
+    configured, monkeypatch, progressive
+):
+    configured.disagg_decoder_port = 31007
+    configured.zing_source_work_quantum = 0
+    configured.zing_source_defer_final = True
+    monkeypatch.setenv("SGLANG_ZING_REMOTE_DECODE_PROGRESSIVE", str(int(progressive)))
+    if not progressive:
+        with pytest.raises(ValueError, match="requires work quantum 1"):
+            initialize()
+    else:
+        adapter, session = initialize()
+        try:
+            assert adapter.remote_progressive
+            assert adapter.source_defer_final
+            assert adapter.source_work_quantum == 0
+        finally:
+            adapter.clear_state(session)
 
 
 @pytest.mark.parametrize("remote_codecs", [False, True])
@@ -2564,6 +3274,48 @@ def test_cli_joint_forward_overrides_profile(configured, monkeypatch, mode):
         assert json.loads(profile_path.read_text()) == profile
     finally:
         adapter.clear_state(session)
+
+
+@pytest.mark.parametrize("mode", ["startup", "prefill"])
+@pytest.mark.parametrize("source_size", [(832, 480), (1280, 736)])
+def test_control_batches_keep_generation_geometry(
+    configured, monkeypatch, mode, source_size
+):
+    from sglang.multimodal_gen.runtime.realtime.source_prepare import PROTOCOL
+
+    monkeypatch.setenv("SGLANG_ZING_SOURCE_PREPARE", "1")
+    width, height = source_size
+    adapter, session = initialize(
+        size="1280x736",
+        source_stream=dict(format="rgb24", width=width, height=height, fps=24),
+        source_prepare_protocol=PROTOCOL,
+        seed=42,
+    )
+    monkeypatch.setattr(
+        source.BaseRealtimeModelAdapter,
+        "prepare_next_request",
+        lambda self, session, args, chunk: SimpleNamespace(
+            extra={}, block_idx=chunk.index
+        ),
+    )
+    if mode == "startup":
+        adapter.startup_identity = {"preparation_id": "geometry-regression"}
+        adapter.startup_command = {"op": "prepare"}
+        batch = adapter.prepare_next_request(
+            session, configured, session.new_chunk(control_only=True)
+        )
+    else:
+        batch = adapter.prepare_prefill_request(
+            session, configured, bytes(width * height * 3)
+        )
+    assert batch.extra["zing_source_command"]["source_geometry"] == dict(
+        input_height=height,
+        input_width=width,
+        encoded_height=480,
+        encoded_width=832,
+        target_height=736,
+        target_width=1280,
+    )
 
 
 @pytest.mark.parametrize(

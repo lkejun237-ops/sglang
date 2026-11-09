@@ -60,7 +60,9 @@ class AsyncRawRGBFrameMaterializer:
         self._pool_lock = threading.Lock()
         self._host_pool: list[torch.Tensor] = []
         self._outstanding_lock = threading.Lock()
+        self._outstanding_changed = threading.Condition(self._outstanding_lock)
         self._outstanding_refs: dict[str, dict[str, Any]] = {}
+        self._failed_copies = {}
         self._copy_streams: dict[int, torch.cuda.Stream] = {}
         self._closed = False
         self._executor = ThreadPoolExecutor(
@@ -178,11 +180,19 @@ class AsyncRawRGBFrameMaterializer:
                 "bytes_per_frame": width * height * channels,
             }
         except Exception:
-            if reference is not None:
-                with self._outstanding_lock:
-                    self._outstanding_refs.pop(reference["path"], None)
             if copy_done is not None:
-                copy_done.synchronize()
+                try:
+                    copy_done.synchronize()
+                except Exception:
+                    if reference is not None:
+                        with self._outstanding_changed:
+                            self._outstanding_refs[reference["path"]] = reference
+                            self._failed_copies[reference["path"]] = (
+                                device_frames,
+                                host_frames,
+                            )
+                            self._outstanding_changed.notify_all()
+                    raise
             if reference is not None:
                 discard_async_shared_memory_payload(
                     reference,
@@ -190,6 +200,10 @@ class AsyncRawRGBFrameMaterializer:
                 )
             if host_frames is not None:
                 self._release_host_buffer(host_frames)
+            if reference is not None:
+                with self._outstanding_changed:
+                    self._outstanding_refs.pop(reference["path"], None)
+                    self._outstanding_changed.notify_all()
             self._slots.release()
             raise
 
@@ -216,8 +230,10 @@ class AsyncRawRGBFrameMaterializer:
         host_frames: torch.Tensor,
         reference: dict[str, Any],
     ) -> None:
+        copy_complete = False
         try:
             copy_done.synchronize()
+            copy_complete = True
             publish_async_shared_memory_payload(
                 reference,
                 host_frames.numpy(),
@@ -234,32 +250,43 @@ class AsyncRawRGBFrameMaterializer:
             except Exception:
                 logger.exception("failed to publish raw RGB materialization error")
         finally:
-            # Holding device_frames until the event completes prevents the caching
-            # allocator from reusing its storage while the copy stream is reading it.
-            del device_frames
-            self._release_host_buffer(host_frames)
-            try:
-                terminal = wait_for_async_shared_memory_terminal(
-                    reference,
-                    root=self._shared_memory_dir,
-                )
-                if terminal == "owner_timeout":
-                    logger.warning(
-                        "async raw RGB reference expired without consumer ACK: "
-                        "request_id=%s chunk_idx=%s",
-                        reference.get("request_id"),
-                        reference.get("chunk_index"),
+            if not copy_complete:
+                # A failed CUDA event is not proof the copy stopped. Retain its
+                # buffers and staging slot; cleanup must quarantine this owner.
+                with self._outstanding_changed:
+                    self._failed_copies[reference["path"]] = (
+                        device_frames,
+                        host_frames,
                     )
-            except Exception:
-                logger.exception("failed to reclaim async raw RGB reference")
-                discard_async_shared_memory_payload(
-                    reference,
-                    root=self._shared_memory_dir,
-                )
-            finally:
-                with self._outstanding_lock:
-                    self._outstanding_refs.pop(reference["path"], None)
-                self._slots.release()
+                    self._outstanding_changed.notify_all()
+            else:
+                # Holding device_frames until the event completes prevents the caching
+                # allocator from reusing its storage while the copy stream is reading it.
+                del device_frames
+                self._release_host_buffer(host_frames)
+                try:
+                    terminal = wait_for_async_shared_memory_terminal(
+                        reference,
+                        root=self._shared_memory_dir,
+                    )
+                    if terminal == "owner_timeout":
+                        logger.warning(
+                            "async raw RGB reference expired without consumer ACK: "
+                            "request_id=%s chunk_idx=%s",
+                            reference.get("request_id"),
+                            reference.get("chunk_index"),
+                        )
+                except Exception:
+                    logger.exception("failed to reclaim async raw RGB reference")
+                    discard_async_shared_memory_payload(
+                        reference,
+                        root=self._shared_memory_dir,
+                    )
+                finally:
+                    with self._outstanding_changed:
+                        self._outstanding_refs.pop(reference["path"], None)
+                        self._outstanding_changed.notify_all()
+                    self._slots.release()
 
     def snapshot(self) -> dict[str, int]:
         with self._outstanding_lock:
@@ -283,6 +310,9 @@ class AsyncRawRGBFrameMaterializer:
         self,
         session_id: str,
         generation_id: str | None = None,
+        *,
+        wait: bool = False,
+        timeout_s: float = 85,
     ) -> None:
         """Cancel producer-owned refs for a released realtime session."""
         with self._outstanding_lock:
@@ -300,6 +330,27 @@ class AsyncRawRGBFrameMaterializer:
                 reference,
                 root=self._shared_memory_dir,
             )
+        if wait:
+            deadline = time.monotonic() + timeout_s
+            with self._outstanding_changed:
+                while True:
+                    pending = [
+                        path
+                        for path, reference in self._outstanding_refs.items()
+                        if reference.get("session_id") == session_id
+                        and (
+                            generation_id is None
+                            or reference.get("generation_id") == generation_id
+                        )
+                    ]
+                    if any(path in self._failed_copies for path in pending):
+                        raise RuntimeError("Raw RGB copy completion is unconfirmed")
+                    if not pending:
+                        return
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("Raw RGB cleanup deadline exceeded")
+                    self._outstanding_changed.wait(timeout=remaining)
 
     def close(self) -> None:
         """Drain background copies and release cached pinned host buffers."""
@@ -373,12 +424,83 @@ def materialize_async_raw_rgb_frame_batches(
         raise
 
 
+def raw_rgb_sequence_parts(reference: dict[str, Any]) -> list[dict[str, Any]]:
+    """Validate one bounded decoder dispatch split into independently ready parts."""
+    parts = reference.get("parts")
+    if (
+        reference.get("kind") != "raw_rgb24_sequence"
+        or reference.get("version") != 1
+        or not isinstance(parts, list)
+        or not 1 <= len(parts) <= 64
+    ):
+        raise ValueError("invalid asynchronous raw RGB sequence")
+    if (
+        any(
+            type(reference.get(k)) is not int or reference[k] <= 0
+            for k in ("width", "height", "channels", "num_bytes")
+        )
+        or reference["channels"] != 3
+        or reference["num_bytes"] > 128 << 20
+    ):
+        raise ValueError("invalid asynchronous raw RGB sequence geometry")
+    keys = (
+        "request_id",
+        "chunk_index",
+        "session_id",
+        "generation_id",
+        "width",
+        "height",
+        "channels",
+    )
+    counts, paths = [], set()
+    for part in parts:
+        if (
+            not isinstance(part, dict)
+            or part.get("kind") != "raw_rgb24_frames"
+            or part.get("version") != 1
+            or any(part.get(key) != reference.get(key) for key in keys)
+            or not isinstance(part.get("batch_num_frames"), list)
+            or len(part["batch_num_frames"]) != 1
+            or type(part["batch_num_frames"][0]) is not int
+            or not 1 <= part["batch_num_frames"][0] <= 4
+            or not isinstance(part.get("path"), str)
+            or part["path"] in paths
+        ):
+            raise ValueError("invalid asynchronous raw RGB sequence part")
+        paths.add(part["path"])
+        counts.append(part["batch_num_frames"][0])
+        size = part.get("width", 0) * part.get("height", 0) * part.get("channels", 0)
+        if (
+            size <= 0
+            or part.get("channels") != 3
+            or part.get("num_bytes") != counts[-1] * size
+        ):
+            raise ValueError("asynchronous raw RGB part byte length is inconsistent")
+    if reference.get("batch_num_frames") != [sum(counts)] or reference.get(
+        "num_bytes"
+    ) != sum(p["num_bytes"] for p in parts):
+        raise ValueError("asynchronous raw RGB sequence length is inconsistent")
+    return parts
+
+
 def cancel_async_raw_rgb_frame_reference(
     reference: dict[str, Any] | None,
     *,
     shared_memory_dir: str | None = None,
 ) -> bool:
     """Cancel an unconsumed raw-frame reference and return producer credit."""
+    if reference and reference.get("kind") == "raw_rgb24_sequence":
+        cancelled, error = False, None
+        for part in reference.get("parts", []):
+            try:
+                cancelled |= cancel_async_shared_memory_payload(
+                    part, root=shared_memory_dir
+                )
+            except Exception as exc:
+                error = error or exc
+        if error is not None:
+            raise error
+        return cancelled
     return cancel_async_shared_memory_payload(reference, root=shared_memory_dir)
 
 

@@ -356,7 +356,10 @@ def test_prefill_route_reuses_one_websocket_for_two_cases(service, monkeypatch):
                 assert msgspec.msgpack.decode(ws.receive_bytes())["request_id"] == name
 
 
-def test_internal_prefill_miss_then_hit_runs_only_prefix_and_releases_lease(caplog):
+@pytest.mark.parametrize("persist", [False, True])
+def test_internal_prefill_miss_then_hit_runs_only_prefix_and_releases_lease(
+    caplog, persist
+):
     caplog.set_level(logging.DEBUG)
     from contextlib import contextmanager
 
@@ -422,7 +425,11 @@ def test_internal_prefill_miss_then_hit_runs_only_prefix_and_releases_lease(capl
         kv_pool=NS(acquire=lambda *args: lease),
         kv_request=lambda *a, **kw: object(),
     )
-    batch = NS(extra={}, sampling_params=NS(), session=RealtimeSession())
+    batch = NS(
+        extra={"zing_prefill": {"persist": persist}},
+        sampling_params=NS(),
+        session=RealtimeSession(),
+    )
     state = ZingSourceStreamState()
     first = state.prefill(
         dict(prompt="scene"),
@@ -460,6 +467,7 @@ def test_internal_prefill_miss_then_hit_runs_only_prefix_and_releases_lease(capl
     assert codecs.prepare.call_count == 2
     assert ("force", True) in events and "prefix" in events
     assert state.pixels is state.decoder is None
+
     values = [
         json.loads(r.getMessage().removeprefix("zing_cache_event "))
         for r in caplog.records
@@ -474,6 +482,49 @@ def test_internal_prefill_miss_then_hit_runs_only_prefix_and_releases_lease(capl
     assert prefill[-2]["reason"] == "force_recompute"
     assert all(v["l2_persisted"] is None for v in prefill if v["result"] == "completed")
     assert all(v["event"] != "l2_write" for v in values)
+
+
+def test_persistence_progress_only_after_cleanup_and_private_descriptor_hidden(
+    service, monkeypatch
+):
+    service[0].zing_block0_cache_dir = "/test-root"
+
+    async def exercise():
+        ws = Socket()
+        states = []
+        descriptor = {"internal": "private-path"}
+
+        async def run(*args):
+            states.append("cleanup-ack")
+            return dict(
+                type="prefill.completed",
+                request_id="case-a",
+                session_id="session",
+                cache_key="key",
+                _disk_descriptor=descriptor,
+            )
+
+        async def read(root, value, timeout):
+            assert states == ["cleanup-ack"]
+            assert value == descriptor
+            return {"state": "persisted", "kv_bytes": 8}
+
+        monkeypatch.setattr(prefill, "run_prefill_case", run)
+        monkeypatch.setattr(prefill, "_persistence_read", read)
+        task = asyncio.create_task(prefill.prefill_websocket(ws))
+        await ws.receive()
+        ws.submit({**payload(), "persist": True})
+        ready = await ws.receive()
+        saved = await ws.receive()
+        assert ready["type"] == "prefill.memory_ready"
+        assert saved["type"] == "prefill.persisted"
+        assert "_disk_descriptor" not in ready and "private-path" not in str(saved)
+        assert saved["prefill_to_persisted_ms"] >= saved["prefill_to_memory_ms"]
+        ws.incoming.put_nowait(None)
+        await task
+        assert prefill._PERSISTENCE_WATCHERS == 0
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("value", [None, 0, 1, "true", [], {}])
@@ -666,6 +717,12 @@ def test_l1_api_busy_status_and_cancel_drain_preserve_admission(service, monkeyp
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("bad", [0, -1, 301, True, float("nan")])
+def test_invalid_persistence_timeout_is_rejected(bad):
+    with pytest.raises(prefill.PrefillRequestError):
+        prefill.parse_prefill({**payload(), "persist": True, "persist_timeout_s": bad})
+
+
 def test_cache_management_routes_validate_and_forward_selectors(service, monkeypatch):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
@@ -755,3 +812,158 @@ def test_cache_control_selects_index_and_rejects_busy_mutation(tmp_path, cpu_dma
     ]
     assert CacheIndex(tmp_path).select("game") == [key]
     assert owner.disk_cache.lookup(key) is not None
+
+
+@pytest.mark.parametrize("released", [True, False])
+def test_managed_prefill_receipt_follows_real_admission_release(
+    service, monkeypatch, released
+):
+    _, controller = service
+    events = []
+    monkeypatch.setattr(source, "build_realtime_sampling_params", lambda *a, **kw: NS())
+
+    def prepare(adapter, session, args, chunk):
+        params = adapter.build_sampling_params(
+            session, args, chunk, source.RealtimeChunkInputs(session.request.prompt), 17
+        )
+        return NS(extra={}, sampling_params=params)
+
+    monkeypatch.setattr(
+        source.BaseRealtimeModelAdapter, "prepare_next_request", prepare
+    )
+
+    async def forward(batch, **kw):
+        return [], OutputBatch(
+            output=[],
+            usage={"zing_prefill": {"cache_key": "managed-key", "hit": False}},
+        )
+
+    async def gpu_cleanup(session_id, **kw):
+        events.append("gpu-cleanup")
+        return released
+
+    original_release = controller.release
+
+    async def admission_release(lease):
+        await original_release(lease)
+        events.append("admission-release")
+
+    monkeypatch.setattr(api, "_process_realtime_generation_batch", forward)
+    monkeypatch.setattr(api, "_release_scheduler_realtime_session", gpu_cleanup)
+    monkeypatch.setattr(controller, "release", admission_release)
+
+    def cleaned(session_id, generation_id):
+        assert events[-1] == "admission-release"
+        assert (session_id, generation_id) == ("managed-child", "managed-generation")
+        events.append("managed-receipt")
+
+    async def exercise():
+        ws = Socket()
+        ws.scope = {
+            "role_pool_claim": {
+                "session_id": "managed-child",
+                "generation_id": "managed-generation",
+                "user_id": "managed-user",
+            },
+            "role_pool_service": NS(
+                child_started=lambda *_: None, child_cleaned=cleaned
+            ),
+        }
+        data = payload()
+        operation = prefill.run_prefill_case(
+            ws, data, len(msgspec.msgpack.encode(data)), "untrusted-connection-id"
+        )
+        if released:
+            receipt = await operation
+            assert receipt["session_id"] == "managed-child"
+            assert events == ["gpu-cleanup", "admission-release", "managed-receipt"]
+        else:
+            with pytest.raises(RuntimeError, match="cleanup"):
+                await operation
+            assert events == ["gpu-cleanup"]
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("backend", ["l1_only", "mooncake", "local_disk"])
+def test_worker_prefill_receipt_keeps_memory_success_without_optional_disk(
+    monkeypatch, backend
+):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        source_session,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.block0_telemetry import (
+        Block0Telemetry,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.stage import (
+        ZingH3GenerationStage,
+    )
+
+    stage = object.__new__(ZingH3GenerationStage)
+    cache = NS(hits=0, entry_count=1, evictions=0, register=Mock(), backend=backend)
+    if backend != "mooncake":
+        cache.disk_cache = (
+            None
+            if backend == "l1_only"
+            else NS(identity={"checkpoint": "fixture"}, sp_world_size=1)
+        )
+    stage.block0_cache = cache
+    stage._build_request = lambda _: dict(prompt="scene")
+
+    def computed(state, request, **kwargs):
+        state.block0_telemetry = Block0Telemetry()
+        state.block0_telemetry.finish()
+        return NS(key="a" * 64)
+
+    monkeypatch.setattr(source_session.ZingSourceStreamState, "prefill", computed)
+    batch = NS(
+        session=object(),
+        extra={
+            "zing_prefill": {"source_frame": bytes(32 * 32 * 3), "persist": False},
+            "zing_source_command": {"config": {"width": 32, "height": 32, "fps": 24}},
+        },
+    )
+    result = stage._forward_realtime(batch, None).usage["zing_prefill"]
+    assert result["cache_key"] == "a" * 64 and result["entries"] == 1
+    assert "timings" in result and len(result["rank_timings"]) == 1
+    if backend == "local_disk":
+        assert result["_disk_descriptor"]["schema"] == "zing-block0-v3"
+    else:
+        assert result["_disk_descriptor"] is None
+    cache.register.assert_called_once()
+
+
+@pytest.mark.parametrize("managed", [False, True])
+def test_unavailable_persistence_keeps_memory_ready_and_socket_reusable(
+    service, monkeypatch, managed
+):
+    async def computed(*args):
+        return dict(
+            type="prefill.completed",
+            request_id="case-a",
+            cache_key="a" * 64,
+            _disk_descriptor=None,
+        )
+
+    monkeypatch.setattr(prefill, "run_prefill_case", computed)
+
+    async def exercise():
+        ws = Socket()
+        if managed:
+            ws.scope["role_pool_service"] = object()
+        task = asyncio.create_task(prefill.prefill_websocket(ws))
+        await ws.receive()
+        ws.submit({**payload(), "persist": True})
+        ready = await ws.receive()
+        failed = await ws.receive()
+        assert ready["type"] == "prefill.memory_ready"
+        assert failed["code"] == "CACHE_PERSISTENCE_UNAVAILABLE"
+        assert failed["memory_ready"] is True and failed["fatal"] is False
+        assert "_disk_descriptor" not in ready
+        ws.submit(payload())
+        assert (await ws.receive())["type"] == "prefill.completed"
+        ws.incoming.put_nowait(None)
+        await task
+        assert prefill._PERSISTENCE_WATCHERS == 0
+
+    asyncio.run(exercise())

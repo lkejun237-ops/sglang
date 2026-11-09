@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import time
+from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypedDict
 
@@ -22,6 +23,7 @@ from sglang.multimodal_gen.runtime.utils.realtime_video import (
     WEBP_FRAME_CONTENT_TYPE,
     cancel_async_raw_rgb_frame_reference,
     materialize_async_raw_rgb_frame_batches,
+    raw_rgb_sequence_parts,
 )
 
 if TYPE_CHECKING:
@@ -466,6 +468,10 @@ class RawRGBRealtimeOutputAdapter:
         content_type = result.raw_frame_content_type
         shared_memory_ref = getattr(result, "raw_frame_shared_memory_ref", None)
         if result.raw_frame_batches is None and shared_memory_ref is not None:
+            if shared_memory_ref.get("kind") == "raw_rgb24_sequence":
+                return await self._send_sequence(
+                    ws, session, result, batch, shared_memory_ref
+                )
             try:
                 _validate_async_raw_frame_reference(shared_memory_ref, session, batch)
             except Exception:
@@ -527,6 +533,63 @@ class RawRGBRealtimeOutputAdapter:
         )
         stats["frame_shape"] = _frame_shape_from_metadata(frame_metadata)
         return stats
+
+    async def _send_sequence(self, ws, session, result, batch, reference):
+        """Forward each decoded latent as soon as its existing SHM marker is ready."""
+        from sglang.multimodal_gen.runtime.realtime.zing_contracts import PixelRange
+
+        stats = empty_frame_send_stats(result.raw_frame_content_type)
+        try:
+            _validate_async_raw_frame_reference(reference, session, batch)
+            parts = raw_rgb_sequence_parts(reference)
+            blocks = getattr(batch, "extra", {}).get("zing_source_output_blocks")
+            if (
+                not blocks
+                or sum(b["provenance"].pixels.count for b in blocks)
+                != reference["batch_num_frames"][0]
+            ):
+                raise ValueError("Progressive RGB requires complete source alignment")
+            cursor = blocks[0]["provenance"].pixels.start
+            for block in blocks:
+                if block["provenance"].pixels.start != cursor:
+                    raise ValueError(
+                        "Progressive RGB source alignment is not contiguous"
+                    )
+                cursor = block["provenance"].pixels.end
+            cursor = blocks[0]["provenance"].pixels.start
+            for part in parts:
+                end = cursor + part["batch_num_frames"][0]
+                selected = []
+                for block in blocks:
+                    provenance = block["provenance"]
+                    start, stop = (
+                        max(cursor, provenance.pixels.start),
+                        min(end, provenance.pixels.end),
+                    )
+                    if stop > start:
+                        sliced = provenance.slice(PixelRange(start, stop))
+                        selected.append(
+                            {**block, **sliced.metadata(), "provenance": sliced}
+                        )
+                partial_batch, partial_result = copy(batch), copy(result)
+                partial_batch.extra = {
+                    **batch.extra,
+                    "zing_source_output_blocks": selected,
+                }
+                partial_result.raw_frame_shared_memory_ref = part
+                partial_result.raw_frame_batches = None
+                partial = await self.send(ws, session, partial_result, partial_batch)
+                for key, value in partial.items():
+                    if key in {"frame_shape", "content_type"}:
+                        stats[key] = value
+                    else:
+                        stats[key] += value
+                cursor = end
+            return stats
+        finally:
+            # Also cancels not-yet-published parts on disconnect or a failed slice.
+            result.raw_frame_shared_memory_ref = None
+            cancel_async_raw_rgb_frame_reference(reference)
 
     async def _send_frame_batches(
         self,

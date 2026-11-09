@@ -2,6 +2,7 @@
 """Native Zing Qwen conditioning without VAE preprocessing or generation."""
 
 import numpy as np
+
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.presentation import (
     minimax_h3_ref2va_video_presentation,
 )
@@ -9,10 +10,30 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from .contract import ConditionError
 
 
+def validate_prompt_token_budget(tokenizer, prompt, max_tokens):
+    """Count only verbatim prompt tokens before media preprocessing or GPU work."""
+    if max_tokens is None:
+        return
+    if type(max_tokens) is not int or max_tokens <= 0:
+        raise ConditionError("CONDITION_INVALID", "Invalid prompt token budget")
+    if len(tokenizer(prompt, add_special_tokens=False)["input_ids"]) > max_tokens:
+        raise ConditionError(
+            "CONDITION_INVALID", "Prompt tokens exceed the encoder budget"
+        )
+
+
 def encode_condition(
-    modules, runtime, prompt, media, max_rows=None, *, presentation_fn=None
+    modules,
+    runtime,
+    prompt,
+    media,
+    max_rows=None,
+    *,
+    presentation_fn=None,
+    max_prompt_tokens=None,
 ):
     tokenizer, processor = modules["tokenizer"], modules["processor"]
+    validate_prompt_token_budget(tokenizer, prompt, max_prompt_tokens)
     features, labels, images, videos, timestamps = {}, [], [], [], []
     counts = {"image": 0, "video": 0, "audio": 0}
     for item in media:

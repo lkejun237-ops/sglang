@@ -22,6 +22,7 @@ def pipeline(monkeypatch):
         cancelled=[],
         results=[],
         progress_indices=set(),
+        condition_ready_indices=set(),
         progress_steps=0,
         progress_completed=asyncio.Event(),
         third_started=asyncio.Event(),
@@ -44,6 +45,9 @@ def pipeline(monkeypatch):
     class Adapter:
         source_work_quantum = 1
         source_decoder_overlap = True
+
+        def is_control_work(self, session):
+            return False
 
         async def wait_for_next_chunk(self, session):
             if session.next_chunk_index and state.block_input:
@@ -93,6 +97,15 @@ def pipeline(monkeypatch):
                 "zing_source_consumed_end": batch.block_idx + 1,
                 "zing_source_dispatch_steps": state.progress_steps,
             }
+            if batch.block_idx in state.condition_ready_indices:
+                result.usage["zing_condition_ready"] = {
+                    "type": "control_ack",
+                    "kind": "prompt.update",
+                    "state": "kv_ready",
+                    "prompt_version": 2,
+                    "source_frame_index": 17,
+                    "event_id": 1,
+                }
         state.results.append(result)
         return None, result
 
@@ -322,4 +335,62 @@ def test_terminal_and_real_output_are_never_discarded_as_progress(terminal):
     # next-result budget and must not allow unbounded model work ahead.
     result.usage.pop("zing_realtime_blocks")
     result.usage["zing_source_dispatch_steps"] = 1
+    assert not realtime_video_api._is_source_progress_only(adapter, result)
+
+
+def test_condition_ready_with_no_rgb_is_delivered_after_previous_output(pipeline):
+    async def run():
+        p = pipeline
+        p.progress_indices = {1}
+        p.condition_ready_indices = {1}
+        task = asyncio.create_task(
+            realtime_video_api._generate_loop_local(SimpleNamespace(), p.session)
+        )
+        try:
+            await asyncio.wait_for(p.second_completed.wait(), 2)
+            await asyncio.sleep(0)
+            # The control receipt owns an output slot even without new pixels.
+            assert p.started == [0, 1] and p.sent == []
+            p.output_release.set()
+            await asyncio.wait_for(task, 2)
+            assert p.sent == [(0, 0), (1, 0), (2, 0)]
+            assert not p.errors and not p.cancelled and not p.session.active_chunks
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_condition_ready_is_not_suppressed_as_source_progress():
+    adapter = SimpleNamespace(source_decoder_overlap=True)
+    usage = {"zing_source_consumed_end": 17, "zing_source_dispatch_steps": 0}
+    result = OutputBatch(usage=usage, raw_frame_batches=[])
+    assert realtime_video_api._is_source_progress_only(adapter, result)
+    result.usage["zing_condition_ready"] = {
+        "type": "control_ack",
+        "kind": "prompt.update",
+        "state": "kv_ready",
+        "prompt_version": 2,
+        "source_frame_index": 17,
+        "event_id": 1,
+    }
+    assert not realtime_video_api._is_source_progress_only(adapter, result)
+
+
+@pytest.mark.parametrize("receipt_type", ["source.prepared", "source.attached"])
+def test_startup_receipts_are_not_suppressed_as_source_progress(receipt_type):
+    adapter = SimpleNamespace(source_decoder_overlap=True)
+    result = OutputBatch(
+        raw_frame_batches=[],
+        usage={
+            "zing_source_consumed_end": 0,
+            "zing_source_complete": False,
+            "zing_realtime_blocks": [],
+            "zing_startup_ready": {
+                "type": receipt_type,
+                "identity": {"preparation_id": "startup-control"},
+            },
+        },
+    )
     assert not realtime_video_api._is_source_progress_only(adapter, result)

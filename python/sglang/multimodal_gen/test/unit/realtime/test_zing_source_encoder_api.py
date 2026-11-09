@@ -2,6 +2,7 @@
 
 import asyncio
 from types import SimpleNamespace
+from types import SimpleNamespace as NS
 
 import pytest
 import torch
@@ -13,6 +14,9 @@ from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeVideoGenerationsRequest,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.zing_encoder_dit_adapter import (
+    ZingEncoderDiTAdapter,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.zing_source_encoder_adapter import (
     ZingSourceEncoderAdapter,
 )
@@ -22,6 +26,12 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session 
 from sglang.multimodal_gen.runtime.entrypoints.zing_source_encoder_server import (
     EncoderConditioning,
     SourceEncoderExecutor,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.dit_link import (
+    DiTLinkClient,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.queued_dit import (
+    QueuedDiTSession,
 )
 from sglang.multimodal_gen.runtime.realtime.polling_task_queue import PollingTaskQueue
 
@@ -479,6 +489,51 @@ def test_eos_drains_tail_and_release_allows_fresh_session():
     worker.forward(ReleaseRealtimeSessionReq(session_id="s"))
     again = worker.forward(batch(0, 0, 1, end=True, session="next"))
     assert again.realtime_handoff["source_moments"][0]["latent_start"] == 0
+
+
+@pytest.mark.parametrize("rollback", [False, True])
+def test_next_player_starts_at_zero_after_group_closes_completed_link(rollback):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from fastapi import FastAPI
+    from test_worker_connections import topology
+
+    from sglang.multimodal_gen.runtime.realtime.worker_group_encoder import (
+        install_encoder_group,
+    )
+
+    async def run():
+        worker, _ = executor()
+        worker.forward(batch(0, 0, 16))
+        old_buffer = worker.encoder
+        # DiT EOS/cancellation may clear the link owner before group cleanup.
+        # The next input WS therefore cannot rely on another per-owner release.
+        worker.dit_link = NS(owner=None, disconnect=lambda: None)
+        worker.conditioning = NS(dispose=lambda: None)
+        worker._dit_committed_frames = 900
+        worker._dit_latents = 225
+        worker._dit_final_frames = 900
+        worker.startup_preparation = None
+        worker.startup_attached = True
+        app = FastAPI()
+        app.state.realtime_execution_client = object()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            controller = install_encoder_group(
+                app, worker, pool, topology()["encoder"], None
+            )
+            controller.group, controller.state = "old-group", "connected"
+            await controller.destroy({"worker_group_id": "old-group"}, abort=rollback)
+            await controller.operation
+        assert old_buffer.disposed and worker.owner is None
+        worker.conditioning = None  # source-only codec fixture for the new owner
+        fresh = worker.forward(batch(0, 0, 1, session="next"))
+        assert fresh.usage["zing_source_committed_end"] == 0
+        assert worker._dit_latents == 0 and worker._dit_final_frames is None
+        assert worker.startup_preparation is None and not worker.startup_attached
+        assert worker.owner == ("next", "g")
+        worker.forward(ReleaseRealtimeSessionReq(session_id="next"))
+
+    asyncio.run(run())
 
 
 def test_wrong_owner_and_generation_cannot_touch_live_cache():
@@ -1367,6 +1422,95 @@ def test_encoder_services_load_once_and_keep_admission_and_conditions_private(
     assert calls == ["qwen", "vae", "warmup"]
 
 
+def test_encoder_business_app_enforces_claim_and_reports_unstarted_child_cleanup(
+    monkeypatch, tmp_path
+):
+    import base64
+    import json
+    import threading
+
+    from fastapi import WebSocket
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    from sglang.multimodal_gen.runtime.entrypoints.zing_source_encoder_server import (
+        create_apps,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        encoder_worker,
+    )
+
+    # Construct the real business app without entering its CUDA model lifespan.
+    monkeypatch.setattr(
+        encoder_worker,
+        "initialize_runtime_imports",
+        lambda: (
+            SimpleNamespace(
+                realtime_session_max_lifetime_s=600.0,
+                from_kwargs=lambda **_: SimpleNamespace(
+                    realtime_session_lease_ttl_s=60
+                ),
+            ),
+            lambda _: None,
+        ),
+    )
+    app = create_apps(tmp_path, service_count=1)[0][0]
+    receipts = []
+    children, sockets = {}, set()
+
+    def attach(claim, task):
+        sockets.add(task)
+        children[claim["session_id"]] = dict(
+            generation_id=claim["generation_id"], state="connected"
+        )
+
+    def cleaned(session_id, generation_id):
+        receipts.append((session_id, generation_id))
+        children.pop(session_id)
+
+    claim = dict(session_id="signed-child", generation_id="signed-generation")
+
+    def business(body, token):
+        assert body == claim and token == "signed-claim-token"
+        return body
+
+    managed = SimpleNamespace(
+        process=SimpleNamespace(lock=threading.RLock()),
+        children=children,
+        sockets=sockets,
+        business=business,
+        attach_socket=attach,
+        child_cleaned=cleaned,
+    )
+    # The real lifespan attaches this controller after app construction.
+    app.state.worker_connections = SimpleNamespace(
+        service={"role": "encoder"}, managed=managed
+    )
+
+    @app.websocket("/probe")
+    async def probe(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_json(websocket.scope["role_pool_claim"])
+        await websocket.close()
+
+    client = TestClient(app)
+    for endpoint in ("/v1/realtime_video/generate", "/v1/realtime_video/prefill"):
+        with pytest.raises(WebSocketDisconnect) as rejected:
+            with client.websocket_connect(endpoint):
+                pytest.fail("Unauthenticated business socket was accepted")
+        assert rejected.value.code == 1008
+    headers = {
+        "Authorization": "Bearer signed-claim-token",
+        "X-Role-Pool-Claim": base64.urlsafe_b64encode(json.dumps(claim).encode())
+        .decode()
+        .rstrip("="),
+    }
+    with client.websocket_connect("/probe", headers=headers) as ws:
+        assert ws.receive_json() == claim
+    assert receipts == [("signed-child", "signed-generation")]
+    assert not children and not sockets
+
+
 @pytest.mark.parametrize(
     "failure", ["condition", "model", "cuda", "cuda_after_forward"]
 )
@@ -1479,3 +1623,401 @@ def test_early_connection_rejection_cleanup_preserves_existing_adapter(configure
         assert app.state.connection_adapter is active
 
     asyncio.run(run())
+
+
+def test_direct_decoder_receipts_only_return_input_progress(configured):  # noqa: F811
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.zing_encoder_dit_adapter import (
+        ZingEncoderDiTAdapter,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+    from sglang.multimodal_gen.runtime.realtime.zing_contracts import PixelRange
+
+    async def run():
+        adapter, session, socket = (
+            ZingEncoderDiTAdapter(),
+            GenerateSession(),
+            PromptSocket(),
+        )
+        session.set_adapter(adapter)
+
+        async def open_dit(message):
+            return [
+                dict(
+                    type="session.opened",
+                    output_kind="rgb",
+                    output_attachment={"token": "t"},
+                )
+            ]
+
+        session.execution_client = SimpleNamespace(open_dit=open_dit)
+        request = RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="test",
+            size="32x32",
+            zing_realtime_api_version=1,
+            source_stream=dict(format="rgb24", width=32, height=32, fps=24),
+        )
+        await adapter.on_init(session, request)
+        session.set_request(request)
+        try:
+            assert adapter.ready["output_transport"] == "decoder_websocket"
+            await adapter.ingest_wire_event(
+                socket,
+                session,
+                dict(
+                    type="event",
+                    kind="source.append",
+                    event_id=1,
+                    payload=dict(
+                        client_seq=0,
+                        source_frame_start=0,
+                        num_frames=1,
+                        pts_us=0,
+                        data=bytes(3072),
+                    ),
+                ),
+                3200,
+            )
+            await adapter.ingest_wire_event(
+                socket,
+                session,
+                dict(
+                    type="event",
+                    kind="source.end",
+                    event_id=2,
+                    payload=dict(source_frame_end=1),
+                ),
+                100,
+            )
+            adapter._take_source_input()
+            provenance = adapter.ledger.provenance_for(PixelRange(0, 1), 1)
+            result = OutputBatch(
+                realtime_handoff={
+                    "dit_latents": [
+                        dict(
+                            type="decoder.output_queued",
+                            session_id=session.id,
+                            generation_id=session.generation_id,
+                            latent_start=0,
+                            latent_end=1,
+                            **provenance.metadata(),
+                        )
+                    ]
+                },
+                usage=dict(zing_source_consumed_end=1, zing_source_complete=True),
+            )
+            stats = await adapter.send_output(
+                socket, session, result, SimpleNamespace()
+            )
+            assert stats["num_frames"] == 0
+            assert socket.messages[-1]["type"] == "input.completed"
+            assert not any(
+                m["type"]
+                in (
+                    "frame_batch",
+                    "frame_batch_header",
+                    "session.completed",
+                    "source.consumed",
+                )
+                for m in socket.messages
+            )
+        finally:
+            adapter.dispose(session)
+
+    asyncio.run(run())
+
+
+def test_split_encoder_dispatches_barrier_without_waiting_for_future_source():
+    adapter = ZingEncoderDiTAdapter()
+    adapter.startup_enabled = False
+    adapter._pending_prompt_command = dict(source_boundary=34)
+    adapter._pending_sink_command = None
+    adapter.condition_switch_protocol = "clip-barrier-v1"
+    adapter.end = None
+    adapter.end_dispatched = adapter.more_work = False
+    adapter.pending = []
+    adapter.input_arranger = NS(buffered_frames=0)
+    adapter.ledger = NS(accepted_frames=34)
+    adapter.dispatched_source_frames = 34
+    adapter.committed_source_frames = 17
+    # The DiT owns the true committed watermark and checks it after ordered
+    # drain. Waiting for another Encoder data dispatch would deadlock at B.
+    assert adapter.has_control_work()
+    adapter.input_arranger.buffered_frames = 1
+    assert not adapter.has_control_work()
+    adapter.input_arranger.buffered_frames = 0
+    adapter.dispatched_source_frames = 26
+    assert not adapter.has_control_work()
+    adapter.dispatched_source_frames = 34
+    adapter.ledger.accepted_frames = 35
+    assert not adapter.has_control_work()
+
+
+@pytest.mark.parametrize("buffered,accepted", [(0, 34), (1, 34), (0, 33)])
+def test_queue_rebuilds_only_after_exact_source_drain(buffered, accepted):
+    async def exercise():
+        calls = []
+
+        class State:
+            next_chunk_size = 2
+
+            def discard_pending_prompt(self):
+                calls.append("discard")
+
+            def update_prompt(self, condition, event, version, **kwargs):
+                calls.append(("update", event, version))
+
+            def activate_prompt_at_source_boundary(self, boundary):
+                calls.append(("rebuild", boundary))
+                return dict(event_id=7, prompt_version=2, source_frame_index=boundary)
+
+            def dispose(self):
+                calls.append("dispose")
+
+        bridge = NS(
+            clip_frames=17,
+            accepted_pixels=accepted,
+            buffered_latents=buffered,
+            ended=False,
+            ready_for=lambda count: False,
+            dispose=lambda: calls.append("bridge_dispose"),
+        )
+        worker = QueuedDiTSession(
+            session_id="session",
+            generation_id="generation",
+            create_session=None,
+            bridge=bridge,
+            sample_moments=None,
+            on_output=None,
+            confirm_condition_ready=lambda value: calls.append(("gpu_confirm", value)),
+        )
+        worker.initial_received = True
+        worker.state = State()
+        await worker.put(
+            dict(
+                type="conditioning",
+                session_id="session",
+                generation_id="generation",
+                event_id=7,
+                prompt_version=2,
+                source_boundary=34,
+                tensors=dict(
+                    context=torch.zeros(1, 2),
+                    row_role=torch.zeros(1, dtype=torch.int64),
+                ),
+            )
+        )
+        if buffered or accepted != 34:
+            with pytest.raises(ValueError, match="not drained"):
+                await worker.queue.run_once()
+            assert worker.closed and worker.condition_ready is None
+            assert not any(
+                isinstance(x, tuple) and x[0] == "gpu_confirm" for x in calls
+            )
+        else:
+            await worker.queue.run_once()
+            assert worker.condition_ready == dict(
+                event_id=7, prompt_version=2, source_frame_index=34
+            )
+            assert calls[-2][0] == "rebuild" and calls[-1][0] == "gpu_confirm"
+            assert not worker.closed
+            worker.close()
+
+    asyncio.run(exercise())
+
+
+def test_async_link_waits_for_barrier_processed_and_returns_ready():
+    class Channel:
+        def send(self, message):
+            self.sent = message
+            identity = dict(session_id="s", generation_id="g", transfer_id=0)
+            self.replies = [
+                dict(
+                    type="conditioning.ready",
+                    **identity,
+                    event_id=4,
+                    prompt_version=2,
+                    source_frame_index=17,
+                ),
+                dict(type="input.processed", transfer_id=0),
+            ]
+
+        def receive(self):
+            return self.replies.pop(0)
+
+        def poll(self):
+            return False
+
+    channel = Channel()
+    link = DiTLinkClient(channel)
+    link.owner, link.async_inputs = ("s", "g"), True
+    result = link.send("conditioning", event_id=4, source_boundary=17)
+    assert channel.sent["source_boundary"] == 17
+    assert result[0]["type"] == "conditioning.ready"
+    assert not channel.replies
+
+
+def test_encoder_startup_uses_exact_preview_and_waits_for_dit_confirmation():
+    from sglang.multimodal_gen.runtime.entrypoints.zing_source_encoder_server import (
+        SourceEncoderExecutor,
+    )
+    from sglang.multimodal_gen.runtime.realtime.source_prepare import V2_PROTOCOL
+
+    calls = []
+
+    class Conditions:
+        def forward(self, batch, on_condition):
+            calls.append(batch.extra["zing_source_command"]["startup"]["rgb"])
+            on_condition("conditioning", event_id=None, prompt_version=1)
+
+        def dispose(self):
+            pass
+
+    class Link:
+        async_inputs = True
+
+        def collect(self):
+            return []
+
+        def send(self, kind, **fields):
+            assert kind == "conditioning"
+            assert fields["source_prepare"]["protocol"] == V2_PROTOCOL
+            return [
+                {
+                    "type": "conditioning.prepared",
+                    "preparation": fields["source_prepare"],
+                }
+            ]
+
+    executor = SourceEncoderExecutor(None, conditioning=Conditions(), dit_link=Link())
+    executor.owner = ("session", "generation")
+    identity = dict(
+        preparation_id="prepare",
+        source_session_id="source",
+        source_epoch="epoch",
+        worker_epoch="worker",
+        condition_fingerprint="a" * 64,
+    )
+    startup = dict(
+        op="prepare",
+        protocol=V2_PROTOCOL,
+        identity=identity,
+        width=4,
+        height=8,
+        rgb=b"x" * (4 * 8 * 3),
+    )
+    command = dict(
+        config={"width": 4, "height": 4}, appends=[], end=None, startup=startup
+    )
+    batch = NS(
+        extra={"zing_source_command": command},
+        block_idx=0,
+        realtime_session_id="session",
+        realtime_generation_id="generation",
+        request_id="request",
+    )
+    result = executor.forward([batch])
+    assert result.usage["zing_startup_ready"] == dict(
+        type="source.prepared", identity=identity, level="condition"
+    )
+    assert executor.command_index == 0 and executor._dit_latents == 0
+    executor.forward([batch])
+    assert len(calls) == 1  # An exact duplicate does not re-encode or re-open DiT.
+    command["startup"] = dict(op="attach", protocol=V2_PROTOCOL, identity=identity)
+    assert (
+        executor.forward([batch]).usage["zing_startup_ready"]["type"]
+        == "source.attached"
+    )
+    assert executor.startup_attached
+    command["startup"] = dict(startup, width=8, height=4)
+    with pytest.raises(ValueError, match="pixels changed"):
+        executor.forward([batch])
+
+
+def test_encoder_startup_cannot_ack_an_unconfirmed_dit():
+    from sglang.multimodal_gen.runtime.entrypoints.zing_source_encoder_server import (
+        SourceEncoderExecutor,
+    )
+    from sglang.multimodal_gen.runtime.realtime.source_prepare import V2_PROTOCOL
+
+    executor = SourceEncoderExecutor(
+        None, conditioning=NS(forward=lambda *a, **k: None)
+    )
+    command = dict(
+        config={"width": 4, "height": 4},
+        appends=[],
+        end=None,
+        startup=dict(
+            op="prepare",
+            protocol=V2_PROTOCOL,
+            width=4,
+            height=4,
+            rgb=bytes(48),
+            identity=dict(
+                preparation_id="p",
+                source_session_id="s",
+                source_epoch="e",
+                worker_epoch="w",
+                condition_fingerprint="b" * 64,
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="did not confirm"):
+        executor._forward_startup(NS(), command, lambda *a, **k: None, [])
+
+
+def test_standalone_prefill_reports_l2_lookup_without_claiming_gpu_restore(monkeypatch):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        preparation_cache,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.dit_preparation import (
+        DiTPreparation,
+    )
+
+    monkeypatch.setattr(preparation_cache, "coordinate_validation", lambda v: [v, v])
+    entry = NS(key="b" * 64)
+    cache = NS(
+        lookup=lambda key, **kw: entry,
+        last_lookup=dict(
+            cache_result="l2_hit", lookup_host_ms=3.5, storage={"kv_read_host_ms": 2.0}
+        ),
+        register=lambda *a, **kw: None,
+        disk_cache=None,
+        entry_count=1,
+        evictions=0,
+    )
+    owner = DiTPreparation(
+        NS(block0_cache=cache, admit_cached_preparation=lambda entry: None),
+        lambda: pytest.fail("cache hit must not run sampler"),
+    )
+    result = owner.control("prefill", {"cache_key": entry.key}, busy=False)
+    assert result["hit"] is True
+    assert result["timings"]["cache_result"] == "l2_hit"
+    assert result["timings"]["stages"]["restore"]["status"] == "skipped"
+    assert (
+        result["timings"]["stages"]["block0_prepare_and_l1_fill"]["status"] == "skipped"
+    )
+    assert len(result["rank_timings"]) == 2
+
+
+def test_expected_prefill_capacity_rejection_does_not_poison_encoder_group(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+    from sglang.multimodal_gen.runtime.entrypoints.zing_source_encoder_server import (
+        EncoderClient,
+    )
+
+    failed = []
+
+    def forward(_):
+        raise ConditionError(
+            "CONDITION_BUSY", "Prefix publication is waiting for capacity"
+        )
+
+    executor = NS(
+        forward=forward, connection_controller=NS(failed=lambda: failed.append(True))
+    )
+    client = EncoderClient(executor, None)
+    with pytest.raises(ConditionError, match="waiting for capacity"):
+        client._forward([])
+    assert not failed

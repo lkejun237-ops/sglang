@@ -301,7 +301,19 @@ def verify_runtime_receipt(profile, receipt, *, allow_test=False):
 class NativeConditionEncoder:
     receipt_validation = "NATIVE_MEASURED"
 
-    def __init__(self, model_path, profile, *, max_rows=16384, gpu_id=0):
+    def __init__(
+        self,
+        model_path,
+        profile,
+        *,
+        max_rows=16384,
+        gpu_id=0,
+        max_prompt_tokens=None,
+    ):
+        if max_prompt_tokens is not None and (
+            type(max_prompt_tokens) is not int or max_prompt_tokens <= 0
+        ):
+            raise ValueError("Prompt token budget must be a positive integer")
         # Check again when loading a saved profile: the process environment may
         # differ from the one that built it. Reject before CUDA/weight loading.
         _require_profiled_execution(profile.document["numerical_environment"])
@@ -458,6 +470,7 @@ class NativeConditionEncoder:
                 "CONDITION_PROFILE_MISMATCH", "Native assets changed while loading"
             )
         self.max_rows, self.gpu_id = max_rows, gpu_id
+        self.max_prompt_tokens = max_prompt_tokens
 
     def __call__(self, condition_input):
         return {
@@ -488,6 +501,7 @@ class NativeConditionEncoder:
                     condition_input.prompt,
                     condition_input.media,
                     self.max_rows,
+                    max_prompt_tokens=self.max_prompt_tokens,
                 )
                 return {
                     name: tensor.detach().contiguous()

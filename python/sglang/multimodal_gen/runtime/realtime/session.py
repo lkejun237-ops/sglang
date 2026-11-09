@@ -27,6 +27,7 @@ class RealtimeSession:
 
     def __init__(self) -> None:
         self._states: dict[type[BaseRealtimeState], BaseRealtimeState] = {}
+        self._disposing = False
 
     @staticmethod
     def resolve_session_id(req: Any) -> str | None:
@@ -39,6 +40,8 @@ class RealtimeSession:
         self, state_cls: type[BaseRealtimeState]
     ) -> BaseRealtimeState:
         """returns the BaseRealtimeState instance hold by the current RealtimeSession"""
+        if self._disposing:
+            raise RuntimeError("Realtime session cleanup is pending")
         state = self._states.get(state_cls)
         if state is None:
             state = state_cls()
@@ -49,22 +52,23 @@ class RealtimeSession:
         return self._states.get(state_cls)
 
     def dispose(self) -> None:
-        """Dispose every state even if one fails, then return pooled leases."""
+        """Retain failed owners and their lease until cleanup can be confirmed."""
+        self._disposing = True
         first_error = None
-        try:
-            for state in list(self._states.values()):
-                try:
-                    state.dispose()
-                except Exception as error:
-                    first_error = first_error or error
-            self._states.clear()
-        finally:
-            # States release their own lease; this only guards a failed dispose.
-            lease = getattr(self, "zing_kv_lease", None)
-            if lease is not None:
-                lease.release()
+        for key, state in list(self._states.items()):
+            try:
+                state.dispose()
+            except Exception as error:
+                first_error = first_error or error
+            else:
+                self._states.pop(key, None)
         if first_error is not None:
             raise first_error
+        # A failure may mean a remote role or CUDA work still uses the pool.
+        # Returning that lease from finally would admit a new owner too early.
+        lease = getattr(self, "zing_kv_lease", None)
+        if lease is not None:
+            lease.release()
 
 
 class RealtimeSessionCache:
@@ -82,6 +86,7 @@ class RealtimeSessionCache:
         self._clock = clock
         self._sessions: OrderedDict[str, RealtimeSession] = OrderedDict()
         self._last_seen: dict[str, float] = {}
+        self._preparations: dict[str, tuple[str, str]] = {}
 
     def _dispose_session(
         self, session_id: str, session: RealtimeSession | None
@@ -96,12 +101,15 @@ class RealtimeSessionCache:
                 session_id,
                 e,
             )
+            raise
+        self._preparations.pop(session_id, None)
 
     def release(self, session_id: str) -> bool:
-        session = self._sessions.pop(session_id, None)
-        self._last_seen.pop(session_id, None)
+        session = self._sessions.get(session_id)
         released = session is not None
         self._dispose_session(session_id, session)
+        self._sessions.pop(session_id, None)
+        self._last_seen.pop(session_id, None)
         logger.info(
             "Realtime session release: session_id=%s released=%s",
             session_id,
@@ -129,9 +137,7 @@ class RealtimeSessionCache:
             if now - last_seen >= self.stale_after_s
         ]
         for session_id in stale:
-            session = self._sessions.pop(session_id, None)
-            self._last_seen.pop(session_id, None)
-            self._dispose_session(session_id, session)
+            self.release(session_id)
             logger.warning(
                 "Reclaimed stale realtime session cache entry: session_id=%s",
                 session_id,
@@ -145,6 +151,33 @@ class RealtimeSessionCache:
         now = self._clock()
         self._prune_stale(now)
 
+        extra = getattr(req, "extra", None) or {}
+        preparation = extra.get("realtime_preparation_id")
+        binding = None
+        if preparation is not None:
+            generation = getattr(req, "realtime_generation_id", None)
+            if (
+                not isinstance(preparation, str)
+                or not preparation
+                or not isinstance(generation, str)
+                or not generation
+            ):
+                raise ValueError("Invalid realtime preparation identity")
+            binding = (generation, preparation)
+            if session_id in self._sessions:
+                if self._preparations.get(session_id) != binding:
+                    raise ValueError("Realtime preparation identity changed")
+            elif (
+                extra.get("zing_source_command", {}).get("startup", {}).get("op")
+                != "prepare"
+                or req.block_idx != 0
+            ):
+                raise ValueError("Missing realtime preparation state")
+        elif session_id in self._preparations:
+            raise ValueError(
+                "Prepared realtime state requires its preparation identity"
+            )
+
         if session_id not in self._sessions:
             if req.block_idx > 0:
                 raise ValueError(
@@ -157,7 +190,9 @@ class RealtimeSessionCache:
                     f"active={len(self._sessions)} max={self.max_sessions}"
                 )
             self._sessions[session_id] = req.session or RealtimeSession()
-        elif req.block_idx == 0:
+            if binding is not None:
+                self._preparations[session_id] = binding
+        elif req.block_idx == 0 and binding is None:
             old_session = self._sessions[session_id]
             new_session = req.session or RealtimeSession()
             if old_session is not new_session:

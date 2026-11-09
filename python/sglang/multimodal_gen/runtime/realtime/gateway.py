@@ -6,10 +6,13 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import logging
 import time
 from collections import deque
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from typing import Any, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import msgspec.msgpack
@@ -18,6 +21,8 @@ from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import (
     ProtocolViolation,
     decode_message,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class OutputProtocolError(ProtocolViolation):
@@ -32,11 +37,21 @@ class OutputRouteClosed(RuntimeError):
     pass
 
 
+class OutputDeliveryDetached(RuntimeError):
+    """The browser delivery side stopped while the source route stays open."""
+
+
 class AdmissionQueueFull(RuntimeError):
     reason = "ADMISSION_QUEUE_FULL"
 
     def __init__(self) -> None:
         super().__init__(self.reason)
+
+
+class OutputRecorder(Protocol):
+    """Fail-open observer for output messages accepted by a route."""
+
+    def offer(self, message: dict[str, Any]) -> None: ...
 
 
 class BrowserPlaybackAckWindow:
@@ -249,6 +264,15 @@ def build_denoiser_url(
         gateway_output_token=output_token,
         trace_id=trace_id,
     )
+    if not vae_url:
+        query["gateway_decode_mode"] = "local"
+        for name in (
+            "realtime_vae_worker_url",
+            "realtime_vae_worker_epoch",
+            "gateway_output_url",
+            "gateway_output_token",
+        ):
+            query.pop(name, None)
     return urlunsplit(
         (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
     )
@@ -263,6 +287,11 @@ class GatewayOutputRoute:
     max_queue_bytes: int
     max_queue_messages: int
     trace_id: str = ""
+    recorder: OutputRecorder | None = None
+    on_browser_detach: Callable[[str, float], None] | None = field(
+        default=None,
+        repr=False,
+    )
     _queue: deque[_QueuedOutput | None] = field(init=False)
     _queue_ready: asyncio.Event = field(init=False)
     _queue_drained: asyncio.Event = field(init=False)
@@ -276,6 +305,15 @@ class GatewayOutputRoute:
     _seen_chunks: set[int] = field(default_factory=set, init=False)
     _output_closed: asyncio.Event = field(init=False)
     _chunk_completed: dict[int, asyncio.Event] = field(default_factory=dict, init=False)
+    _final_completed: asyncio.Event = field(init=False)
+    _final_chunk_index: int | None = field(default=None, init=False)
+    _final_completed_at: float | None = field(default=None, init=False)
+    _pending_recording_final: dict[str, Any] | None = field(default=None, init=False)
+    _queue_drained_at: float | None = field(default=None, init=False)
+    _delivery_failed: bool = field(default=False, init=False)
+    _browser_detach_allowed: bool = field(default=False, init=False)
+    _browser_detached: bool = field(default=False, init=False)
+    _browser_detach_reason: str = field(default="", init=False)
     dropped_messages: int = field(default=0, init=False)
     dropped_frames: int = field(default=0, init=False)
     bound: bool = field(default=False, init=False)
@@ -288,6 +326,7 @@ class GatewayOutputRoute:
         self._queue_drained.set()
         self._output_closed = asyncio.Event()
         self._output_closed.set()
+        self._final_completed = asyncio.Event()
 
     def bind_output(self) -> None:
         self.bound = True
@@ -306,12 +345,114 @@ class GatewayOutputRoute:
         event = self._chunk_completed.setdefault(chunk_index, asyncio.Event())
         await event.wait()
 
+    async def wait_until_final_completed(self) -> None:
+        """Wait for a validated final media completion marker.
+
+        Closing or force-unregistering the route deliberately does not satisfy
+        this barrier. A normal session may complete only after the VAE has
+        emitted its real final marker.
+        """
+        await self._final_completed.wait()
+
+    @property
+    def final_completed(self) -> bool:
+        return self._final_completed.is_set()
+
+    @property
+    def final_chunk_index(self) -> int | None:
+        return self._final_chunk_index
+
+    @property
+    def final_completed_at(self) -> float | None:
+        """Monotonic time when the validated final marker was accepted."""
+        return self._final_completed_at
+
+    @property
+    def queue_drained_at(self) -> float | None:
+        """Monotonic time when all accepted output reached the browser."""
+        return self._queue_drained_at
+
+    @property
+    def browser_detached(self) -> bool:
+        """Whether browser delivery ended without closing the source route."""
+        return self._browser_detached
+
+    @property
+    def browser_detach_reason(self) -> str:
+        return self._browser_detach_reason
+
+    def commit_recording_final(self) -> bool:
+        """Seal recording only after the Gateway accepts business completion."""
+        if self.closed:
+            raise OutputRouteClosed("output route is closed")
+        if not self._final_completed.is_set():
+            raise OutputProtocolError("final completion has not been accepted")
+        if self._pending_recording_final is None:
+            return False
+        final = self._pending_recording_final
+        self._pending_recording_final = None
+        self._offer_recording(final)
+        return True
+
+    def allow_browser_detach(self) -> None:
+        """Allow browser backpressure to fail open after play has started."""
+        if self.closed:
+            raise OutputRouteClosed("output route is closed")
+        self._browser_detach_allowed = True
+
+    def detach_browser(self, reason: str) -> bool:
+        """Stop browser delivery while preserving validation and recording."""
+        if self.closed or self._browser_detached or not self._browser_detach_allowed:
+            return False
+
+        metrics = self.queue_metrics()
+        self._browser_detached = True
+        self._browser_detach_reason = reason
+        self._delivery_failed = True
+        self._queue_drained_at = None
+        detached_at = asyncio.get_running_loop().time()
+        if self.on_browser_detach is not None:
+            try:
+                self.on_browser_detach(reason, detached_at)
+            except Exception:
+                # Diagnostics are fail-open. A log or Counter failure must not
+                # restore browser backpressure to the source media route.
+                logger.exception(
+                    "Gateway browser detach observer failed session_id=%s trace_id=%s",
+                    self.session_id,
+                    self.trace_id,
+                )
+        while self._queue:
+            output = self._queue.popleft()
+            if output is None:
+                continue
+            self._queued_messages -= 1
+            self._queued_media_frames -= output.frame_count
+            self._queued_bytes -= len(output.wire)
+            self._finish_task(delivered=False)
+        # Wake a consumer that is waiting on an empty queue. The source route
+        # remains bound so VAE output can still be validated and recorded.
+        self._queue_ready.set()
+        logger.warning(
+            "Gateway browser delivery detached session_id=%s trace_id=%s "
+            "reason=%s queue_messages=%s queue_bytes=%s oldest_frame_age_ms=%s",
+            self.session_id,
+            self.trace_id,
+            reason,
+            metrics["gateway_queue_messages"],
+            metrics["gateway_queue_bytes"],
+            metrics["gateway_oldest_frame_age_ms"],
+        )
+        return True
+
     def token_matches(self, token: str) -> bool:
         return hmac.compare_digest(self.token, token)
 
     async def put(self, wire: bytes) -> None:
         if self.closed:
             raise OutputRouteClosed("output route is closed")
+        if self._final_completed.is_set():
+            raise OutputProtocolError("output received after final completion")
         message = decode_message(wire)
         message_type = message.get("type")
         if message_type not in {
@@ -333,6 +474,7 @@ class GatewayOutputRoute:
                     enqueued_at=time.monotonic(),
                 )
             )
+            self._offer_recording(message)
             return
         if message_type == "media_payload":
             sequence = int(message.get("sequence", -1))
@@ -352,6 +494,7 @@ class GatewayOutputRoute:
                     enqueued_at=time.monotonic(),
                 )
             )
+            self._offer_recording(message)
             return
         if message_type == "media_encode_timing":
             self._append_output(
@@ -362,6 +505,7 @@ class GatewayOutputRoute:
                     enqueued_at=time.monotonic(),
                 )
             )
+            self._offer_recording(message)
             return
 
         chunk_index = int(message.get("chunk_index", -1))
@@ -376,6 +520,9 @@ class GatewayOutputRoute:
             completed = self._chunk_completed.setdefault(chunk_index, asyncio.Event())
             if completed.is_set():
                 raise OutputProtocolError("duplicate completion")
+            is_final_chunk = message.get("is_final_chunk") is True
+            if is_final_chunk and chunk_index < self._last_chunk_index:
+                raise OutputProtocolError("final completion is not the last chunk")
             # Control markers are tiny and are not counted against the media
             # frame capacity. They must survive media shedding because the
             # upstream VAE uses them to release decode credit.
@@ -388,6 +535,17 @@ class GatewayOutputRoute:
                 )
             )
             completed.set()
+            if is_final_chunk:
+                self._final_chunk_index = chunk_index
+                self._final_completed_at = asyncio.get_running_loop().time()
+                self._final_completed.set()
+                if self.recorder is not None:
+                    # The source fact is accepted immediately, but recording
+                    # must not publish an early/truncated final before the
+                    # Gateway finish arbiter accepts the business outcome.
+                    self._pending_recording_final = message
+            else:
+                self._offer_recording(message)
             return
 
         if message_type == "media_batch":
@@ -403,6 +561,7 @@ class GatewayOutputRoute:
                     enqueued_at=time.monotonic(),
                 )
             )
+            self._offer_recording(message)
             return
 
         frame_batch_index = int(message.get("frame_batch_index", -1))
@@ -431,6 +590,21 @@ class GatewayOutputRoute:
         self._seen_chunks.add(chunk_index)
         if message.get("is_final_frame_batch") is True:
             self._chunk_completed.setdefault(chunk_index, asyncio.Event()).set()
+        self._offer_recording(message)
+
+    def _offer_recording(self, message: dict[str, Any]) -> None:
+        if self.recorder is None:
+            return
+        try:
+            self.recorder.offer(message)
+        except Exception:
+            # The recorder is a best-effort observer. It can fail its own state,
+            # but it cannot reject or delay an already accepted browser output.
+            logger.exception(
+                "Gateway output recorder hook failed session_id=%s trace_id=%s",
+                self.session_id,
+                self.trace_id,
+            )
 
     def _put_media_latest(self, output: _QueuedOutput) -> None:
         # Never propagate browser/network backpressure into the VAE worker.
@@ -448,29 +622,39 @@ class GatewayOutputRoute:
     def _append_output(self, output: _QueuedOutput) -> None:
         if self.closed:
             raise OutputRouteClosed("output route is closed")
-        self._raise_if_queue_limit_exceeded(output)
+        if self._browser_detached:
+            return
+        if not self._ensure_queue_capacity(output):
+            return
         self._queue.append(output)
         self._queued_messages += 1
         self._unfinished_tasks += 1
         self._queue_drained.clear()
+        self._queue_drained_at = None
         self._queued_media_frames += output.frame_count
         self._queued_bytes += len(output.wire)
         self._queue_ready.set()
 
-    def _raise_if_queue_limit_exceeded(self, output: _QueuedOutput) -> None:
+    def _ensure_queue_capacity(self, output: _QueuedOutput) -> bool:
         projected_messages = self._queued_messages + 1
         projected_bytes = self._queued_bytes + len(output.wire)
         if self.max_queue_messages > 0 and projected_messages > self.max_queue_messages:
+            if self.detach_browser("queue_message_limit"):
+                return False
             self._close_now()
             raise OutputBackpressureError("Gateway output queue message limit exceeded")
         if self.max_queue_bytes > 0 and projected_bytes > self.max_queue_bytes:
+            if self.detach_browser("queue_byte_limit"):
+                return False
             self._close_now()
             raise OutputBackpressureError("Gateway output queue byte limit exceeded")
+        return True
 
     def _close_now(self) -> None:
         if self.closed:
             return
         self.closed = True
+        self._pending_recording_final = None
         self.unbind_output()
         for event in self._chunk_completed.values():
             event.set()
@@ -523,10 +707,13 @@ class GatewayOutputRoute:
             "gateway_queue_capacity_frames": self.queue_depth,
             "gateway_queue_capacity_messages": self.max_queue_messages,
             "gateway_queue_capacity_bytes": self.max_queue_bytes,
+            "gateway_browser_detached": int(self._browser_detached),
         }
 
     async def get_output(self) -> _QueuedOutput:
         while True:
+            if self._browser_detached:
+                raise OutputDeliveryDetached("browser output delivery is detached")
             if self._queue:
                 output = self._queue.popleft()
                 if not self._queue:
@@ -547,14 +734,21 @@ class GatewayOutputRoute:
     async def get(self) -> bytes:
         return (await self.get_output()).wire
 
-    def task_done(self) -> None:
-        self._finish_task()
+    def task_done(self, *, delivered: bool = True) -> None:
+        self._finish_task(delivered=delivered)
 
-    def _finish_task(self) -> None:
+    def _finish_task(self, *, delivered: bool = True) -> None:
         if self._unfinished_tasks <= 0:
             raise ValueError("task_done() called too many times")
+        if not delivered:
+            self._delivery_failed = True
         self._unfinished_tasks -= 1
         if self._unfinished_tasks == 0:
+            # Forced close discards queued output. It wakes join() for cleanup,
+            # but must not manufacture the successful browser-drain fact used
+            # by the graceful-finish arbiter.
+            if not self.closed and not self._delivery_failed:
+                self._queue_drained_at = asyncio.get_running_loop().time()
             self._queue_drained.set()
 
     async def join(self) -> None:
@@ -597,6 +791,8 @@ class GatewayOutputRegistry:
         *,
         token: str,
         trace_id: str = "",
+        recorder: OutputRecorder | None = None,
+        on_browser_detach: Callable[[str, float], None] | None = None,
     ) -> GatewayOutputRoute:
         if not session_id or not generation_id or not token:
             raise OutputProtocolError("output route identity is required")
@@ -612,6 +808,8 @@ class GatewayOutputRegistry:
                 max_queue_bytes=self.max_queue_bytes,
                 max_queue_messages=self.max_queue_messages,
                 trace_id=trace_id,
+                recorder=recorder,
+                on_browser_detach=on_browser_detach,
             )
             self._routes[session_id] = route
             return route

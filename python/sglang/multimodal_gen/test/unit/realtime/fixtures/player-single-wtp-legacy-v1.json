@@ -1,0 +1,579 @@
+{
+  "provenance": {
+    "wtpSourceSha": "0fdd2e9aad428f39c11b0e8d5757d02b16b157c4",
+    "sdkSourceSha": "69294ddaa349e454d132b77b722d207a610a519f",
+    "fixture": "Real WTP publication/hash/receipt owner with synthetic prior SDK verification records; actual public SDK config/init/parser; external SG peer mocked; no native sealing/live-world/GPU/ICE acceptance"
+  },
+  "legacy": true,
+  "scope": {
+    "status": "verified",
+    "scope": "world-frozen-publication",
+    "world": {
+      "sourceId": "source-original",
+      "worldId": "world-original",
+      "attempt": 2,
+      "publicationId": "publication-attempt-2",
+      "platformRunId": "run-original",
+      "sdkRunId": "sdk-agent-run-original"
+    },
+    "bindingSha256": "6406228deaaf1011415e4c21f09d3c390dfe693c297f39e73dd4d76f0efaa19f",
+    "runtime": {
+      "sourceSha": "e0cf37beb1fc9b02e1053260622b3b9b12a503ef",
+      "runtimeHash": "bb8a43d93cf2362c10a12be42fb58a9ffc9e3c3b476d7cae97e3ab6e1c9045c6",
+      "runtimeManifestSha256": "7816fa65a1a4f3aba447590b6c0ad67f2d4c5ef14f562aa24c0ec42ea05a49d1",
+      "worldBuildHash": "ca8a2a563b00305834da3757f5b71c58c9b30e0406f867e3fa56b072a4049e6e",
+      "sourceHash": "8bf713d30fabb3fe07eebc01bee6d6d9587b21af55ebbc76292d6f306ec84ae1"
+    },
+    "evidence": {
+      "receiptSha256": "fdfc35cd37689bd9347275b15ea1121d4da1aecc74c4b2c0cfce657059eb8931",
+      "archiveSha256": "040a1170825ade3ff37b189dd280153ecfafb99ee929d1cbebb40fe135afdf26"
+    },
+    "publication": {
+      "registryId": "fixture-assets",
+      "snapshotId": "9c33478e9798d85fe968a98af50b56ed90405db94b84d2c8f182fa8909508f30",
+      "assetPolicySha256": "2aabb15fc533a8bfb545f95489c2b772babd7d858f156a31dff9bd5ed432512a",
+      "catalogSha256": "693bae1d5f943e652a1d0fc0962b553c3d890230b41afcdf4b29602fd325bcdb",
+      "bundleSha256": "5998e6d942bd1f91985747b358ede8e2c796dfd9b9551a4d98a1092d2dac4fd6",
+      "sdkCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "assetCount": 2
+    },
+    "roots": [
+      {
+        "assetId": "animal.synthetic-ground",
+        "version": "1.0.0",
+        "manifestDigest": "ab01b391cac89abed6ad5661266ce174cf73a9f76267e281dad67c79e02d7b16"
+      },
+      {
+        "assetId": "vehicle.synthetic-cart",
+        "version": "1.0.0",
+        "manifestDigest": "7233d9911a8ed5bc70953e1816a282cdc83cfa85c8863ebd83df442e754aa9dc"
+      }
+    ],
+    "policy": {
+      "schemaVersion": 1,
+      "assetPolicySha256": "2aabb15fc533a8bfb545f95489c2b772babd7d858f156a31dff9bd5ed432512a",
+      "allowedAssetIds": [
+        "animal.synthetic-ground",
+        "vehicle.synthetic-cart"
+      ],
+      "allowCustomAssets": true,
+      "deniedResourceSha256": []
+    }
+  },
+  "requests": [
+    {
+      "schemaVersion": 1,
+      "action": "start",
+      "singlePlayerOperation": {
+        "operationId": "op-9762d60c2ba83333253b03328f1686dcce51a5d7c06e0b4a810f3937820faaae",
+        "parametersSha256": "81639d706b47a7789556d9173c34010ffeec7e121750fb8321ec9eac553e6246",
+        "caller": {
+          "serviceId": "wtp",
+          "subject": "public-player:original"
+        },
+        "frozenPublication": {
+          "status": "verified",
+          "scope": "world-frozen-publication",
+          "world": {
+            "sourceId": "source-original",
+            "worldId": "world-original",
+            "attempt": 2,
+            "publicationId": "publication-attempt-2",
+            "platformRunId": "run-original",
+            "sdkRunId": "sdk-agent-run-original"
+          },
+          "bindingSha256": "6406228deaaf1011415e4c21f09d3c390dfe693c297f39e73dd4d76f0efaa19f",
+          "runtime": {
+            "sourceSha": "e0cf37beb1fc9b02e1053260622b3b9b12a503ef",
+            "runtimeHash": "bb8a43d93cf2362c10a12be42fb58a9ffc9e3c3b476d7cae97e3ab6e1c9045c6",
+            "runtimeManifestSha256": "7816fa65a1a4f3aba447590b6c0ad67f2d4c5ef14f562aa24c0ec42ea05a49d1",
+            "worldBuildHash": "ca8a2a563b00305834da3757f5b71c58c9b30e0406f867e3fa56b072a4049e6e",
+            "sourceHash": "8bf713d30fabb3fe07eebc01bee6d6d9587b21af55ebbc76292d6f306ec84ae1"
+          },
+          "evidence": {
+            "receiptSha256": "fdfc35cd37689bd9347275b15ea1121d4da1aecc74c4b2c0cfce657059eb8931",
+            "archiveSha256": "040a1170825ade3ff37b189dd280153ecfafb99ee929d1cbebb40fe135afdf26"
+          },
+          "publication": {
+            "registryId": "fixture-assets",
+            "snapshotId": "9c33478e9798d85fe968a98af50b56ed90405db94b84d2c8f182fa8909508f30",
+            "assetPolicySha256": "2aabb15fc533a8bfb545f95489c2b772babd7d858f156a31dff9bd5ed432512a",
+            "catalogSha256": "693bae1d5f943e652a1d0fc0962b553c3d890230b41afcdf4b29602fd325bcdb",
+            "bundleSha256": "5998e6d942bd1f91985747b358ede8e2c796dfd9b9551a4d98a1092d2dac4fd6",
+            "sdkCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "assetCount": 2
+          },
+          "roots": [
+            {
+              "assetId": "animal.synthetic-ground",
+              "version": "1.0.0",
+              "manifestDigest": "ab01b391cac89abed6ad5661266ce174cf73a9f76267e281dad67c79e02d7b16"
+            },
+            {
+              "assetId": "vehicle.synthetic-cart",
+              "version": "1.0.0",
+              "manifestDigest": "7233d9911a8ed5bc70953e1816a282cdc83cfa85c8863ebd83df442e754aa9dc"
+            }
+          ],
+          "policy": {
+            "schemaVersion": 1,
+            "assetPolicySha256": "2aabb15fc533a8bfb545f95489c2b772babd7d858f156a31dff9bd5ed432512a",
+            "allowedAssetIds": [
+              "animal.synthetic-ground",
+              "vehicle.synthetic-cart"
+            ],
+            "allowCustomAssets": true,
+            "deniedResourceSha256": []
+          }
+        },
+        "frozenLaunchParameters": {
+          "transport": "webrtc-rtp",
+          "initMsgpackBase64": "iqR0eXBlpGluaXSod2hpdGVib3iDr3NjZW5lX3JlbmRlcmluZ4OpYW50aWFsaWFzwqV1bmxpdMKnc2hhZG93c8Kod29ybGRfaWSud29ybGQtb3JpZ2luYWypc291cmNlX2lkr3NvdXJjZS1vcmlnaW5hbKZwcm9tcHS2T3JpZ2luYWwgYXV0aG9yIHByb21wdKpyZWZlcmVuY2VzkKRzZWVkKqtyZW5kZXJfbW9kZah3aGl0ZWJveLZpbnB1dF9yZWNlaXB0X3Byb3RvY29srnN0YXRlLWRlbHRhLXYxsGNvbnRyb2xfcHJvdG9jb2yyd2hpdGVib3gtcmVuZGVyLXYysHNvdXJjZV9vcGVyYXRpb26mY3JlYXRlp3N0YXJ0dXCEqHByb3RvY29su3doaXRlYm94LXN0YXJ0dXAtcHJlcGFyZS12MqpyZXF1ZXN0X2lk2SA4ODcwM2ExMTM0NGQ0ZjAxODgwNmMxZjEzMTdkODM5ZaZpbnRlbnSlbW9kZWyuaW5pdGlhbF9yZW5kZXKDpnByb21wdLZPcmlnaW5hbCBhdXRob3IgcHJvbXB0pHNlZWQqqnJlZmVyZW5jZXOQ",
+          "publicationIdentity": {
+            "sourceId": "source-original",
+            "worldId": "world-original",
+            "attempt": 2,
+            "publicationId": "publication-attempt-2",
+            "sourceManifestSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "renditionInputSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "manifestSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          }
+        }
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "action": "getOperation",
+      "singlePlayerOperation": {
+        "operationId": "op-9762d60c2ba83333253b03328f1686dcce51a5d7c06e0b4a810f3937820faaae",
+        "parametersSha256": "81639d706b47a7789556d9173c34010ffeec7e121750fb8321ec9eac553e6246",
+        "caller": {
+          "serviceId": "wtp",
+          "subject": "public-player:original"
+        },
+        "frozenPublication": {
+          "status": "verified",
+          "scope": "world-frozen-publication",
+          "world": {
+            "sourceId": "source-original",
+            "worldId": "world-original",
+            "attempt": 2,
+            "publicationId": "publication-attempt-2",
+            "platformRunId": "run-original",
+            "sdkRunId": "sdk-agent-run-original"
+          },
+          "bindingSha256": "6406228deaaf1011415e4c21f09d3c390dfe693c297f39e73dd4d76f0efaa19f",
+          "runtime": {
+            "sourceSha": "e0cf37beb1fc9b02e1053260622b3b9b12a503ef",
+            "runtimeHash": "bb8a43d93cf2362c10a12be42fb58a9ffc9e3c3b476d7cae97e3ab6e1c9045c6",
+            "runtimeManifestSha256": "7816fa65a1a4f3aba447590b6c0ad67f2d4c5ef14f562aa24c0ec42ea05a49d1",
+            "worldBuildHash": "ca8a2a563b00305834da3757f5b71c58c9b30e0406f867e3fa56b072a4049e6e",
+            "sourceHash": "8bf713d30fabb3fe07eebc01bee6d6d9587b21af55ebbc76292d6f306ec84ae1"
+          },
+          "evidence": {
+            "receiptSha256": "fdfc35cd37689bd9347275b15ea1121d4da1aecc74c4b2c0cfce657059eb8931",
+            "archiveSha256": "040a1170825ade3ff37b189dd280153ecfafb99ee929d1cbebb40fe135afdf26"
+          },
+          "publication": {
+            "registryId": "fixture-assets",
+            "snapshotId": "9c33478e9798d85fe968a98af50b56ed90405db94b84d2c8f182fa8909508f30",
+            "assetPolicySha256": "2aabb15fc533a8bfb545f95489c2b772babd7d858f156a31dff9bd5ed432512a",
+            "catalogSha256": "693bae1d5f943e652a1d0fc0962b553c3d890230b41afcdf4b29602fd325bcdb",
+            "bundleSha256": "5998e6d942bd1f91985747b358ede8e2c796dfd9b9551a4d98a1092d2dac4fd6",
+            "sdkCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "assetCount": 2
+          },
+          "roots": [
+            {
+              "assetId": "animal.synthetic-ground",
+              "version": "1.0.0",
+              "manifestDigest": "ab01b391cac89abed6ad5661266ce174cf73a9f76267e281dad67c79e02d7b16"
+            },
+            {
+              "assetId": "vehicle.synthetic-cart",
+              "version": "1.0.0",
+              "manifestDigest": "7233d9911a8ed5bc70953e1816a282cdc83cfa85c8863ebd83df442e754aa9dc"
+            }
+          ],
+          "policy": {
+            "schemaVersion": 1,
+            "assetPolicySha256": "2aabb15fc533a8bfb545f95489c2b772babd7d858f156a31dff9bd5ed432512a",
+            "allowedAssetIds": [
+              "animal.synthetic-ground",
+              "vehicle.synthetic-cart"
+            ],
+            "allowCustomAssets": true,
+            "deniedResourceSha256": []
+          }
+        },
+        "frozenLaunchParameters": {
+          "transport": "webrtc-rtp",
+          "initMsgpackBase64": "iqR0eXBlpGluaXSod2hpdGVib3iDr3NjZW5lX3JlbmRlcmluZ4OpYW50aWFsaWFzwqV1bmxpdMKnc2hhZG93c8Kod29ybGRfaWSud29ybGQtb3JpZ2luYWypc291cmNlX2lkr3NvdXJjZS1vcmlnaW5hbKZwcm9tcHS2T3JpZ2luYWwgYXV0aG9yIHByb21wdKpyZWZlcmVuY2VzkKRzZWVkKqtyZW5kZXJfbW9kZah3aGl0ZWJveLZpbnB1dF9yZWNlaXB0X3Byb3RvY29srnN0YXRlLWRlbHRhLXYxsGNvbnRyb2xfcHJvdG9jb2yyd2hpdGVib3gtcmVuZGVyLXYysHNvdXJjZV9vcGVyYXRpb26mY3JlYXRlp3N0YXJ0dXCEqHByb3RvY29su3doaXRlYm94LXN0YXJ0dXAtcHJlcGFyZS12MqpyZXF1ZXN0X2lk2SA4ODcwM2ExMTM0NGQ0ZjAxODgwNmMxZjEzMTdkODM5ZaZpbnRlbnSlbW9kZWyuaW5pdGlhbF9yZW5kZXKDpnByb21wdLZPcmlnaW5hbCBhdXRob3IgcHJvbXB0pHNlZWQqqnJlZmVyZW5jZXOQ",
+          "publicationIdentity": {
+            "sourceId": "source-original",
+            "worldId": "world-original",
+            "attempt": 2,
+            "publicationId": "publication-attempt-2",
+            "sourceManifestSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "renditionInputSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "manifestSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          }
+        }
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "action": "getAttachment",
+      "singlePlayerOperation": {
+        "operationId": "op-9762d60c2ba83333253b03328f1686dcce51a5d7c06e0b4a810f3937820faaae",
+        "parametersSha256": "81639d706b47a7789556d9173c34010ffeec7e121750fb8321ec9eac553e6246",
+        "caller": {
+          "serviceId": "wtp",
+          "subject": "public-player:original"
+        },
+        "frozenPublication": {
+          "status": "verified",
+          "scope": "world-frozen-publication",
+          "world": {
+            "sourceId": "source-original",
+            "worldId": "world-original",
+            "attempt": 2,
+            "publicationId": "publication-attempt-2",
+            "platformRunId": "run-original",
+            "sdkRunId": "sdk-agent-run-original"
+          },
+          "bindingSha256": "6406228deaaf1011415e4c21f09d3c390dfe693c297f39e73dd4d76f0efaa19f",
+          "runtime": {
+            "sourceSha": "e0cf37beb1fc9b02e1053260622b3b9b12a503ef",
+            "runtimeHash": "bb8a43d93cf2362c10a12be42fb58a9ffc9e3c3b476d7cae97e3ab6e1c9045c6",
+            "runtimeManifestSha256": "7816fa65a1a4f3aba447590b6c0ad67f2d4c5ef14f562aa24c0ec42ea05a49d1",
+            "worldBuildHash": "ca8a2a563b00305834da3757f5b71c58c9b30e0406f867e3fa56b072a4049e6e",
+            "sourceHash": "8bf713d30fabb3fe07eebc01bee6d6d9587b21af55ebbc76292d6f306ec84ae1"
+          },
+          "evidence": {
+            "receiptSha256": "fdfc35cd37689bd9347275b15ea1121d4da1aecc74c4b2c0cfce657059eb8931",
+            "archiveSha256": "040a1170825ade3ff37b189dd280153ecfafb99ee929d1cbebb40fe135afdf26"
+          },
+          "publication": {
+            "registryId": "fixture-assets",
+            "snapshotId": "9c33478e9798d85fe968a98af50b56ed90405db94b84d2c8f182fa8909508f30",
+            "assetPolicySha256": "2aabb15fc533a8bfb545f95489c2b772babd7d858f156a31dff9bd5ed432512a",
+            "catalogSha256": "693bae1d5f943e652a1d0fc0962b553c3d890230b41afcdf4b29602fd325bcdb",
+            "bundleSha256": "5998e6d942bd1f91985747b358ede8e2c796dfd9b9551a4d98a1092d2dac4fd6",
+            "sdkCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "assetCount": 2
+          },
+          "roots": [
+            {
+              "assetId": "animal.synthetic-ground",
+              "version": "1.0.0",
+              "manifestDigest": "ab01b391cac89abed6ad5661266ce174cf73a9f76267e281dad67c79e02d7b16"
+            },
+            {
+              "assetId": "vehicle.synthetic-cart",
+              "version": "1.0.0",
+              "manifestDigest": "7233d9911a8ed5bc70953e1816a282cdc83cfa85c8863ebd83df442e754aa9dc"
+            }
+          ],
+          "policy": {
+            "schemaVersion": 1,
+            "assetPolicySha256": "2aabb15fc533a8bfb545f95489c2b772babd7d858f156a31dff9bd5ed432512a",
+            "allowedAssetIds": [
+              "animal.synthetic-ground",
+              "vehicle.synthetic-cart"
+            ],
+            "allowCustomAssets": true,
+            "deniedResourceSha256": []
+          }
+        },
+        "frozenLaunchParameters": {
+          "transport": "webrtc-rtp",
+          "initMsgpackBase64": "iqR0eXBlpGluaXSod2hpdGVib3iDr3NjZW5lX3JlbmRlcmluZ4OpYW50aWFsaWFzwqV1bmxpdMKnc2hhZG93c8Kod29ybGRfaWSud29ybGQtb3JpZ2luYWypc291cmNlX2lkr3NvdXJjZS1vcmlnaW5hbKZwcm9tcHS2T3JpZ2luYWwgYXV0aG9yIHByb21wdKpyZWZlcmVuY2VzkKRzZWVkKqtyZW5kZXJfbW9kZah3aGl0ZWJveLZpbnB1dF9yZWNlaXB0X3Byb3RvY29srnN0YXRlLWRlbHRhLXYxsGNvbnRyb2xfcHJvdG9jb2yyd2hpdGVib3gtcmVuZGVyLXYysHNvdXJjZV9vcGVyYXRpb26mY3JlYXRlp3N0YXJ0dXCEqHByb3RvY29su3doaXRlYm94LXN0YXJ0dXAtcHJlcGFyZS12MqpyZXF1ZXN0X2lk2SA4ODcwM2ExMTM0NGQ0ZjAxODgwNmMxZjEzMTdkODM5ZaZpbnRlbnSlbW9kZWyuaW5pdGlhbF9yZW5kZXKDpnByb21wdLZPcmlnaW5hbCBhdXRob3IgcHJvbXB0pHNlZWQqqnJlZmVyZW5jZXOQ",
+          "publicationIdentity": {
+            "sourceId": "source-original",
+            "worldId": "world-original",
+            "attempt": 2,
+            "publicationId": "publication-attempt-2",
+            "sourceManifestSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "renditionInputSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "manifestSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          }
+        }
+      }
+    }
+  ],
+  "wireRequests": [
+    {
+      "body": {
+        "schemaVersion": 1,
+        "action": "start",
+        "singlePlayerOperation": {
+          "operationId": "op-9762d60c2ba83333253b03328f1686dcce51a5d7c06e0b4a810f3937820faaae",
+          "parametersSha256": "81639d706b47a7789556d9173c34010ffeec7e121750fb8321ec9eac553e6246",
+          "caller": {
+            "serviceId": "wtp",
+            "subject": "public-player:original"
+          },
+          "frozenPublication": {
+            "status": "verified",
+            "scope": "world-frozen-publication",
+            "world": {
+              "sourceId": "source-original",
+              "worldId": "world-original",
+              "attempt": 2,
+              "publicationId": "publication-attempt-2",
+              "platformRunId": "run-original",
+              "sdkRunId": "sdk-agent-run-original"
+            },
+            "bindingSha256": "6406228deaaf1011415e4c21f09d3c390dfe693c297f39e73dd4d76f0efaa19f",
+            "runtime": {
+              "sourceSha": "e0cf37beb1fc9b02e1053260622b3b9b12a503ef",
+              "runtimeHash": "bb8a43d93cf2362c10a12be42fb58a9ffc9e3c3b476d7cae97e3ab6e1c9045c6",
+              "runtimeManifestSha256": "7816fa65a1a4f3aba447590b6c0ad67f2d4c5ef14f562aa24c0ec42ea05a49d1",
+              "worldBuildHash": "ca8a2a563b00305834da3757f5b71c58c9b30e0406f867e3fa56b072a4049e6e",
+              "sourceHash": "8bf713d30fabb3fe07eebc01bee6d6d9587b21af55ebbc76292d6f306ec84ae1"
+            },
+            "evidence": {
+              "receiptSha256": "fdfc35cd37689bd9347275b15ea1121d4da1aecc74c4b2c0cfce657059eb8931",
+              "archiveSha256": "040a1170825ade3ff37b189dd280153ecfafb99ee929d1cbebb40fe135afdf26"
+            },
+            "publication": {
+              "registryId": "fixture-assets",
+              "snapshotId": "9c33478e9798d85fe968a98af50b56ed90405db94b84d2c8f182fa8909508f30",
+              "assetPolicySha256": "2aabb15fc533a8bfb545f95489c2b772babd7d858f156a31dff9bd5ed432512a",
+              "catalogSha256": "693bae1d5f943e652a1d0fc0962b553c3d890230b41afcdf4b29602fd325bcdb",
+              "bundleSha256": "5998e6d942bd1f91985747b358ede8e2c796dfd9b9551a4d98a1092d2dac4fd6",
+              "sdkCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "assetCount": 2
+            },
+            "roots": [
+              {
+                "assetId": "animal.synthetic-ground",
+                "version": "1.0.0",
+                "manifestDigest": "ab01b391cac89abed6ad5661266ce174cf73a9f76267e281dad67c79e02d7b16"
+              },
+              {
+                "assetId": "vehicle.synthetic-cart",
+                "version": "1.0.0",
+                "manifestDigest": "7233d9911a8ed5bc70953e1816a282cdc83cfa85c8863ebd83df442e754aa9dc"
+              }
+            ],
+            "policy": {
+              "schemaVersion": 1,
+              "assetPolicySha256": "2aabb15fc533a8bfb545f95489c2b772babd7d858f156a31dff9bd5ed432512a",
+              "allowedAssetIds": [
+                "animal.synthetic-ground",
+                "vehicle.synthetic-cart"
+              ],
+              "allowCustomAssets": true,
+              "deniedResourceSha256": []
+            }
+          },
+          "frozenLaunchParameters": {
+            "transport": "webrtc-rtp",
+            "initMsgpackBase64": "iqR0eXBlpGluaXSod2hpdGVib3iDr3NjZW5lX3JlbmRlcmluZ4OpYW50aWFsaWFzwqV1bmxpdMKnc2hhZG93c8Kod29ybGRfaWSud29ybGQtb3JpZ2luYWypc291cmNlX2lkr3NvdXJjZS1vcmlnaW5hbKZwcm9tcHS2T3JpZ2luYWwgYXV0aG9yIHByb21wdKpyZWZlcmVuY2VzkKRzZWVkKqtyZW5kZXJfbW9kZah3aGl0ZWJveLZpbnB1dF9yZWNlaXB0X3Byb3RvY29srnN0YXRlLWRlbHRhLXYxsGNvbnRyb2xfcHJvdG9jb2yyd2hpdGVib3gtcmVuZGVyLXYysHNvdXJjZV9vcGVyYXRpb26mY3JlYXRlp3N0YXJ0dXCEqHByb3RvY29su3doaXRlYm94LXN0YXJ0dXAtcHJlcGFyZS12MqpyZXF1ZXN0X2lk2SA4ODcwM2ExMTM0NGQ0ZjAxODgwNmMxZjEzMTdkODM5ZaZpbnRlbnSlbW9kZWyuaW5pdGlhbF9yZW5kZXKDpnByb21wdLZPcmlnaW5hbCBhdXRob3IgcHJvbXB0pHNlZWQqqnJlZmVyZW5jZXOQ",
+            "publicationIdentity": {
+              "sourceId": "source-original",
+              "worldId": "world-original",
+              "attempt": 2,
+              "publicationId": "publication-attempt-2",
+              "sourceManifestSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "renditionInputSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "manifestSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            }
+          }
+        }
+      },
+      "rawBodyUtf8": "{\"schemaVersion\":1,\"action\":\"start\",\"singlePlayerOperation\":{\"operationId\":\"op-9762d60c2ba83333253b03328f1686dcce51a5d7c06e0b4a810f3937820faaae\",\"parametersSha256\":\"81639d706b47a7789556d9173c34010ffeec7e121750fb8321ec9eac553e6246\",\"caller\":{\"serviceId\":\"wtp\",\"subject\":\"public-player:original\"},\"frozenPublication\":{\"status\":\"verified\",\"scope\":\"world-frozen-publication\",\"world\":{\"sourceId\":\"source-original\",\"worldId\":\"world-original\",\"attempt\":2,\"publicationId\":\"publication-attempt-2\",\"platformRunId\":\"run-original\",\"sdkRunId\":\"sdk-agent-run-original\"},\"bindingSha256\":\"6406228deaaf1011415e4c21f09d3c390dfe693c297f39e73dd4d76f0efaa19f\",\"runtime\":{\"sourceSha\":\"e0cf37beb1fc9b02e1053260622b3b9b12a503ef\",\"runtimeHash\":\"bb8a43d93cf2362c10a12be42fb58a9ffc9e3c3b476d7cae97e3ab6e1c9045c6\",\"runtimeManifestSha256\":\"7816fa65a1a4f3aba447590b6c0ad67f2d4c5ef14f562aa24c0ec42ea05a49d1\",\"worldBuildHash\":\"ca8a2a563b00305834da3757f5b71c58c9b30e0406f867e3fa56b072a4049e6e\",\"sourceHash\":\"8bf713d30fabb3fe07eebc01bee6d6d9587b21af55ebbc76292d6f306ec84ae1\"},\"evidence\":{\"receiptSha256\":\"fdfc35cd37689bd9347275b15ea1121d4da1aecc74c4b2c0cfce657059eb8931\",\"archiveSha256\":\"040a1170825ade3ff37b189dd280153ecfafb99ee929d1cbebb40fe135afdf26\"},\"publication\":{\"registryId\":\"fixture-assets\",\"snapshotId\":\"9c33478e9798d85fe968a98af50b56ed90405db94b84d2c8f182fa8909508f30\",\"assetPolicySha256\":\"2aabb15fc533a8bfb545f95489c2b772babd7d858f156a31dff9bd5ed432512a\",\"catalogSha256\":\"693bae1d5f943e652a1d0fc0962b553c3d890230b41afcdf4b29602fd325bcdb\",\"bundleSha256\":\"5998e6d942bd1f91985747b358ede8e2c796dfd9b9551a4d98a1092d2dac4fd6\",\"sdkCommit\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"assetCount\":2},\"roots\":[{\"assetId\":\"animal.synthetic-ground\",\"version\":\"1.0.0\",\"manifestDigest\":\"ab01b391cac89abed6ad5661266ce174cf73a9f76267e281dad67c79e02d7b16\"},{\"assetId\":\"vehicle.synthetic-cart\",\"version\":\"1.0.0\",\"manifestDigest\":\"7233d9911a8ed5bc70953e1816a282cdc83cfa85c8863ebd83df442e754aa9dc\"}],\"policy\":{\"schemaVersion\":1,\"assetPolicySha256\":\"2aabb15fc533a8bfb545f95489c2b772babd7d858f156a31dff9bd5ed432512a\",\"allowedAssetIds\":[\"animal.synthetic-ground\",\"vehicle.synthetic-cart\"],\"allowCustomAssets\":true,\"deniedResourceSha256\":[]}},\"frozenLaunchParameters\":{\"transport\":\"webrtc-rtp\",\"initMsgpackBase64\":\"iqR0eXBlpGluaXSod2hpdGVib3iDr3NjZW5lX3JlbmRlcmluZ4OpYW50aWFsaWFzwqV1bmxpdMKnc2hhZG93c8Kod29ybGRfaWSud29ybGQtb3JpZ2luYWypc291cmNlX2lkr3NvdXJjZS1vcmlnaW5hbKZwcm9tcHS2T3JpZ2luYWwgYXV0aG9yIHByb21wdKpyZWZlcmVuY2VzkKRzZWVkKqtyZW5kZXJfbW9kZah3aGl0ZWJveLZpbnB1dF9yZWNlaXB0X3Byb3RvY29srnN0YXRlLWRlbHRhLXYxsGNvbnRyb2xfcHJvdG9jb2yyd2hpdGVib3gtcmVuZGVyLXYysHNvdXJjZV9vcGVyYXRpb26mY3JlYXRlp3N0YXJ0dXCEqHByb3RvY29su3doaXRlYm94LXN0YXJ0dXAtcHJlcGFyZS12MqpyZXF1ZXN0X2lk2SA4ODcwM2ExMTM0NGQ0ZjAxODgwNmMxZjEzMTdkODM5ZaZpbnRlbnSlbW9kZWyuaW5pdGlhbF9yZW5kZXKDpnByb21wdLZPcmlnaW5hbCBhdXRob3IgcHJvbXB0pHNlZWQqqnJlZmVyZW5jZXOQ\",\"publicationIdentity\":{\"sourceId\":\"source-original\",\"worldId\":\"world-original\",\"attempt\":2,\"publicationId\":\"publication-attempt-2\",\"sourceManifestSha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"renditionInputSha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"manifestSha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}}}}",
+      "authorization": "Bearer eyJ2IjozLCJhdWQiOiJ3aGl0ZWJveC1zaW5nbGUtY29udHJvbCIsInNjb3BlIjoic2luZ2xlLXBsYXllci1jb250cm9sIiwic2VydmljZV9pZCI6Ind0cCIsInN1YiI6InB1YmxpYy1wbGF5ZXI6b3JpZ2luYWwiLCJhY3Rpb24iOiJzdGFydCIsInJlcXVlc3Rfc2hhMjU2IjoiZjYxYjQ1NzY2MWYyMTQ0MWUwOWJiN2JjZDk4MWIyMzFhYTM1Mzk2MDNkMDQ4MzVmMmNkMWRlN2I1ZDg5MGU0OSIsIm9yaWdpbiI6bnVsbCwiaWF0IjoxNzkzMjI3NTUyLCJleHAiOjE3OTMyMjc2NzIsImp0aSI6IjhjNmNhY2IxZjczNDZlY2Q5ZjBjMDUwMzk0MDYwZWI1In0.hTkZl1uQoM7SJk-Sp0e8o9TZA65ebL8Xrc7tUJxGyAI"
+    },
+    {
+      "body": {
+        "schemaVersion": 1,
+        "action": "getOperation",
+        "singlePlayerOperation": {
+          "operationId": "op-9762d60c2ba83333253b03328f1686dcce51a5d7c06e0b4a810f3937820faaae",
+          "parametersSha256": "81639d706b47a7789556d9173c34010ffeec7e121750fb8321ec9eac553e6246",
+          "caller": {
+            "serviceId": "wtp",
+            "subject": "public-player:original"
+          },
+          "frozenPublication": {
+            "status": "verified",
+            "scope": "world-frozen-publication",
+            "world": {
+              "sourceId": "source-original",
+              "worldId": "world-original",
+              "attempt": 2,
+              "publicationId": "publication-attempt-2",
+              "platformRunId": "run-original",
+              "sdkRunId": "sdk-agent-run-original"
+            },
+            "bindingSha256": "6406228deaaf1011415e4c21f09d3c390dfe693c297f39e73dd4d76f0efaa19f",
+            "runtime": {
+              "sourceSha": "e0cf37beb1fc9b02e1053260622b3b9b12a503ef",
+              "runtimeHash": "bb8a43d93cf2362c10a12be42fb58a9ffc9e3c3b476d7cae97e3ab6e1c9045c6",
+              "runtimeManifestSha256": "7816fa65a1a4f3aba447590b6c0ad67f2d4c5ef14f562aa24c0ec42ea05a49d1",
+              "worldBuildHash": "ca8a2a563b00305834da3757f5b71c58c9b30e0406f867e3fa56b072a4049e6e",
+              "sourceHash": "8bf713d30fabb3fe07eebc01bee6d6d9587b21af55ebbc76292d6f306ec84ae1"
+            },
+            "evidence": {
+              "receiptSha256": "fdfc35cd37689bd9347275b15ea1121d4da1aecc74c4b2c0cfce657059eb8931",
+              "archiveSha256": "040a1170825ade3ff37b189dd280153ecfafb99ee929d1cbebb40fe135afdf26"
+            },
+            "publication": {
+              "registryId": "fixture-assets",
+              "snapshotId": "9c33478e9798d85fe968a98af50b56ed90405db94b84d2c8f182fa8909508f30",
+              "assetPolicySha256": "2aabb15fc533a8bfb545f95489c2b772babd7d858f156a31dff9bd5ed432512a",
+              "catalogSha256": "693bae1d5f943e652a1d0fc0962b553c3d890230b41afcdf4b29602fd325bcdb",
+              "bundleSha256": "5998e6d942bd1f91985747b358ede8e2c796dfd9b9551a4d98a1092d2dac4fd6",
+              "sdkCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "assetCount": 2
+            },
+            "roots": [
+              {
+                "assetId": "animal.synthetic-ground",
+                "version": "1.0.0",
+                "manifestDigest": "ab01b391cac89abed6ad5661266ce174cf73a9f76267e281dad67c79e02d7b16"
+              },
+              {
+                "assetId": "vehicle.synthetic-cart",
+                "version": "1.0.0",
+                "manifestDigest": "7233d9911a8ed5bc70953e1816a282cdc83cfa85c8863ebd83df442e754aa9dc"
+              }
+            ],
+            "policy": {
+              "schemaVersion": 1,
+              "assetPolicySha256": "2aabb15fc533a8bfb545f95489c2b772babd7d858f156a31dff9bd5ed432512a",
+              "allowedAssetIds": [
+                "animal.synthetic-ground",
+                "vehicle.synthetic-cart"
+              ],
+              "allowCustomAssets": true,
+              "deniedResourceSha256": []
+            }
+          },
+          "frozenLaunchParameters": {
+            "transport": "webrtc-rtp",
+            "initMsgpackBase64": "iqR0eXBlpGluaXSod2hpdGVib3iDr3NjZW5lX3JlbmRlcmluZ4OpYW50aWFsaWFzwqV1bmxpdMKnc2hhZG93c8Kod29ybGRfaWSud29ybGQtb3JpZ2luYWypc291cmNlX2lkr3NvdXJjZS1vcmlnaW5hbKZwcm9tcHS2T3JpZ2luYWwgYXV0aG9yIHByb21wdKpyZWZlcmVuY2VzkKRzZWVkKqtyZW5kZXJfbW9kZah3aGl0ZWJveLZpbnB1dF9yZWNlaXB0X3Byb3RvY29srnN0YXRlLWRlbHRhLXYxsGNvbnRyb2xfcHJvdG9jb2yyd2hpdGVib3gtcmVuZGVyLXYysHNvdXJjZV9vcGVyYXRpb26mY3JlYXRlp3N0YXJ0dXCEqHByb3RvY29su3doaXRlYm94LXN0YXJ0dXAtcHJlcGFyZS12MqpyZXF1ZXN0X2lk2SA4ODcwM2ExMTM0NGQ0ZjAxODgwNmMxZjEzMTdkODM5ZaZpbnRlbnSlbW9kZWyuaW5pdGlhbF9yZW5kZXKDpnByb21wdLZPcmlnaW5hbCBhdXRob3IgcHJvbXB0pHNlZWQqqnJlZmVyZW5jZXOQ",
+            "publicationIdentity": {
+              "sourceId": "source-original",
+              "worldId": "world-original",
+              "attempt": 2,
+              "publicationId": "publication-attempt-2",
+              "sourceManifestSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "renditionInputSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "manifestSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            }
+          }
+        }
+      },
+      "rawBodyUtf8": "{\"schemaVersion\":1,\"action\":\"getOperation\",\"singlePlayerOperation\":{\"operationId\":\"op-9762d60c2ba83333253b03328f1686dcce51a5d7c06e0b4a810f3937820faaae\",\"parametersSha256\":\"81639d706b47a7789556d9173c34010ffeec7e121750fb8321ec9eac553e6246\",\"caller\":{\"serviceId\":\"wtp\",\"subject\":\"public-player:original\"},\"frozenPublication\":{\"status\":\"verified\",\"scope\":\"world-frozen-publication\",\"world\":{\"sourceId\":\"source-original\",\"worldId\":\"world-original\",\"attempt\":2,\"publicationId\":\"publication-attempt-2\",\"platformRunId\":\"run-original\",\"sdkRunId\":\"sdk-agent-run-original\"},\"bindingSha256\":\"6406228deaaf1011415e4c21f09d3c390dfe693c297f39e73dd4d76f0efaa19f\",\"runtime\":{\"sourceSha\":\"e0cf37beb1fc9b02e1053260622b3b9b12a503ef\",\"runtimeHash\":\"bb8a43d93cf2362c10a12be42fb58a9ffc9e3c3b476d7cae97e3ab6e1c9045c6\",\"runtimeManifestSha256\":\"7816fa65a1a4f3aba447590b6c0ad67f2d4c5ef14f562aa24c0ec42ea05a49d1\",\"worldBuildHash\":\"ca8a2a563b00305834da3757f5b71c58c9b30e0406f867e3fa56b072a4049e6e\",\"sourceHash\":\"8bf713d30fabb3fe07eebc01bee6d6d9587b21af55ebbc76292d6f306ec84ae1\"},\"evidence\":{\"receiptSha256\":\"fdfc35cd37689bd9347275b15ea1121d4da1aecc74c4b2c0cfce657059eb8931\",\"archiveSha256\":\"040a1170825ade3ff37b189dd280153ecfafb99ee929d1cbebb40fe135afdf26\"},\"publication\":{\"registryId\":\"fixture-assets\",\"snapshotId\":\"9c33478e9798d85fe968a98af50b56ed90405db94b84d2c8f182fa8909508f30\",\"assetPolicySha256\":\"2aabb15fc533a8bfb545f95489c2b772babd7d858f156a31dff9bd5ed432512a\",\"catalogSha256\":\"693bae1d5f943e652a1d0fc0962b553c3d890230b41afcdf4b29602fd325bcdb\",\"bundleSha256\":\"5998e6d942bd1f91985747b358ede8e2c796dfd9b9551a4d98a1092d2dac4fd6\",\"sdkCommit\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"assetCount\":2},\"roots\":[{\"assetId\":\"animal.synthetic-ground\",\"version\":\"1.0.0\",\"manifestDigest\":\"ab01b391cac89abed6ad5661266ce174cf73a9f76267e281dad67c79e02d7b16\"},{\"assetId\":\"vehicle.synthetic-cart\",\"version\":\"1.0.0\",\"manifestDigest\":\"7233d9911a8ed5bc70953e1816a282cdc83cfa85c8863ebd83df442e754aa9dc\"}],\"policy\":{\"schemaVersion\":1,\"assetPolicySha256\":\"2aabb15fc533a8bfb545f95489c2b772babd7d858f156a31dff9bd5ed432512a\",\"allowedAssetIds\":[\"animal.synthetic-ground\",\"vehicle.synthetic-cart\"],\"allowCustomAssets\":true,\"deniedResourceSha256\":[]}},\"frozenLaunchParameters\":{\"transport\":\"webrtc-rtp\",\"initMsgpackBase64\":\"iqR0eXBlpGluaXSod2hpdGVib3iDr3NjZW5lX3JlbmRlcmluZ4OpYW50aWFsaWFzwqV1bmxpdMKnc2hhZG93c8Kod29ybGRfaWSud29ybGQtb3JpZ2luYWypc291cmNlX2lkr3NvdXJjZS1vcmlnaW5hbKZwcm9tcHS2T3JpZ2luYWwgYXV0aG9yIHByb21wdKpyZWZlcmVuY2VzkKRzZWVkKqtyZW5kZXJfbW9kZah3aGl0ZWJveLZpbnB1dF9yZWNlaXB0X3Byb3RvY29srnN0YXRlLWRlbHRhLXYxsGNvbnRyb2xfcHJvdG9jb2yyd2hpdGVib3gtcmVuZGVyLXYysHNvdXJjZV9vcGVyYXRpb26mY3JlYXRlp3N0YXJ0dXCEqHByb3RvY29su3doaXRlYm94LXN0YXJ0dXAtcHJlcGFyZS12MqpyZXF1ZXN0X2lk2SA4ODcwM2ExMTM0NGQ0ZjAxODgwNmMxZjEzMTdkODM5ZaZpbnRlbnSlbW9kZWyuaW5pdGlhbF9yZW5kZXKDpnByb21wdLZPcmlnaW5hbCBhdXRob3IgcHJvbXB0pHNlZWQqqnJlZmVyZW5jZXOQ\",\"publicationIdentity\":{\"sourceId\":\"source-original\",\"worldId\":\"world-original\",\"attempt\":2,\"publicationId\":\"publication-attempt-2\",\"sourceManifestSha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"renditionInputSha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"manifestSha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}}}}",
+      "authorization": "Bearer eyJ2IjozLCJhdWQiOiJ3aGl0ZWJveC1zaW5nbGUtY29udHJvbCIsInNjb3BlIjoic2luZ2xlLXBsYXllci1jb250cm9sIiwic2VydmljZV9pZCI6Ind0cCIsInN1YiI6InB1YmxpYy1wbGF5ZXI6b3JpZ2luYWwiLCJhY3Rpb24iOiJnZXRPcGVyYXRpb24iLCJyZXF1ZXN0X3NoYTI1NiI6IjRlMTE0NGNiNzk0MTFkNmM3ZjJhNDAzNmU0MjVjZmZkN2U0OGE0OGM0NjgwMDE0ODU2NzY0NDM3MDY3ODAxMmYiLCJvcmlnaW4iOm51bGwsImlhdCI6MTc5MzIyNzU1MiwiZXhwIjoxNzkzMjI3NjcyLCJqdGkiOiI4ZjNhMWU2ZTlkYjIxNzlhMmRlMWY4ZjBmOWM3NjRjNiJ9.g9-07pV5zA3qZGEkWea20usEnN87dxq54ffxwmtN2mU"
+    },
+    {
+      "body": {
+        "schemaVersion": 1,
+        "action": "getAttachment",
+        "singlePlayerOperation": {
+          "operationId": "op-9762d60c2ba83333253b03328f1686dcce51a5d7c06e0b4a810f3937820faaae",
+          "parametersSha256": "81639d706b47a7789556d9173c34010ffeec7e121750fb8321ec9eac553e6246",
+          "caller": {
+            "serviceId": "wtp",
+            "subject": "public-player:original"
+          },
+          "frozenPublication": {
+            "status": "verified",
+            "scope": "world-frozen-publication",
+            "world": {
+              "sourceId": "source-original",
+              "worldId": "world-original",
+              "attempt": 2,
+              "publicationId": "publication-attempt-2",
+              "platformRunId": "run-original",
+              "sdkRunId": "sdk-agent-run-original"
+            },
+            "bindingSha256": "6406228deaaf1011415e4c21f09d3c390dfe693c297f39e73dd4d76f0efaa19f",
+            "runtime": {
+              "sourceSha": "e0cf37beb1fc9b02e1053260622b3b9b12a503ef",
+              "runtimeHash": "bb8a43d93cf2362c10a12be42fb58a9ffc9e3c3b476d7cae97e3ab6e1c9045c6",
+              "runtimeManifestSha256": "7816fa65a1a4f3aba447590b6c0ad67f2d4c5ef14f562aa24c0ec42ea05a49d1",
+              "worldBuildHash": "ca8a2a563b00305834da3757f5b71c58c9b30e0406f867e3fa56b072a4049e6e",
+              "sourceHash": "8bf713d30fabb3fe07eebc01bee6d6d9587b21af55ebbc76292d6f306ec84ae1"
+            },
+            "evidence": {
+              "receiptSha256": "fdfc35cd37689bd9347275b15ea1121d4da1aecc74c4b2c0cfce657059eb8931",
+              "archiveSha256": "040a1170825ade3ff37b189dd280153ecfafb99ee929d1cbebb40fe135afdf26"
+            },
+            "publication": {
+              "registryId": "fixture-assets",
+              "snapshotId": "9c33478e9798d85fe968a98af50b56ed90405db94b84d2c8f182fa8909508f30",
+              "assetPolicySha256": "2aabb15fc533a8bfb545f95489c2b772babd7d858f156a31dff9bd5ed432512a",
+              "catalogSha256": "693bae1d5f943e652a1d0fc0962b553c3d890230b41afcdf4b29602fd325bcdb",
+              "bundleSha256": "5998e6d942bd1f91985747b358ede8e2c796dfd9b9551a4d98a1092d2dac4fd6",
+              "sdkCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "assetCount": 2
+            },
+            "roots": [
+              {
+                "assetId": "animal.synthetic-ground",
+                "version": "1.0.0",
+                "manifestDigest": "ab01b391cac89abed6ad5661266ce174cf73a9f76267e281dad67c79e02d7b16"
+              },
+              {
+                "assetId": "vehicle.synthetic-cart",
+                "version": "1.0.0",
+                "manifestDigest": "7233d9911a8ed5bc70953e1816a282cdc83cfa85c8863ebd83df442e754aa9dc"
+              }
+            ],
+            "policy": {
+              "schemaVersion": 1,
+              "assetPolicySha256": "2aabb15fc533a8bfb545f95489c2b772babd7d858f156a31dff9bd5ed432512a",
+              "allowedAssetIds": [
+                "animal.synthetic-ground",
+                "vehicle.synthetic-cart"
+              ],
+              "allowCustomAssets": true,
+              "deniedResourceSha256": []
+            }
+          },
+          "frozenLaunchParameters": {
+            "transport": "webrtc-rtp",
+            "initMsgpackBase64": "iqR0eXBlpGluaXSod2hpdGVib3iDr3NjZW5lX3JlbmRlcmluZ4OpYW50aWFsaWFzwqV1bmxpdMKnc2hhZG93c8Kod29ybGRfaWSud29ybGQtb3JpZ2luYWypc291cmNlX2lkr3NvdXJjZS1vcmlnaW5hbKZwcm9tcHS2T3JpZ2luYWwgYXV0aG9yIHByb21wdKpyZWZlcmVuY2VzkKRzZWVkKqtyZW5kZXJfbW9kZah3aGl0ZWJveLZpbnB1dF9yZWNlaXB0X3Byb3RvY29srnN0YXRlLWRlbHRhLXYxsGNvbnRyb2xfcHJvdG9jb2yyd2hpdGVib3gtcmVuZGVyLXYysHNvdXJjZV9vcGVyYXRpb26mY3JlYXRlp3N0YXJ0dXCEqHByb3RvY29su3doaXRlYm94LXN0YXJ0dXAtcHJlcGFyZS12MqpyZXF1ZXN0X2lk2SA4ODcwM2ExMTM0NGQ0ZjAxODgwNmMxZjEzMTdkODM5ZaZpbnRlbnSlbW9kZWyuaW5pdGlhbF9yZW5kZXKDpnByb21wdLZPcmlnaW5hbCBhdXRob3IgcHJvbXB0pHNlZWQqqnJlZmVyZW5jZXOQ",
+            "publicationIdentity": {
+              "sourceId": "source-original",
+              "worldId": "world-original",
+              "attempt": 2,
+              "publicationId": "publication-attempt-2",
+              "sourceManifestSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "renditionInputSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "manifestSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            }
+          }
+        }
+      },
+      "rawBodyUtf8": "{\"schemaVersion\":1,\"action\":\"getAttachment\",\"singlePlayerOperation\":{\"operationId\":\"op-9762d60c2ba83333253b03328f1686dcce51a5d7c06e0b4a810f3937820faaae\",\"parametersSha256\":\"81639d706b47a7789556d9173c34010ffeec7e121750fb8321ec9eac553e6246\",\"caller\":{\"serviceId\":\"wtp\",\"subject\":\"public-player:original\"},\"frozenPublication\":{\"status\":\"verified\",\"scope\":\"world-frozen-publication\",\"world\":{\"sourceId\":\"source-original\",\"worldId\":\"world-original\",\"attempt\":2,\"publicationId\":\"publication-attempt-2\",\"platformRunId\":\"run-original\",\"sdkRunId\":\"sdk-agent-run-original\"},\"bindingSha256\":\"6406228deaaf1011415e4c21f09d3c390dfe693c297f39e73dd4d76f0efaa19f\",\"runtime\":{\"sourceSha\":\"e0cf37beb1fc9b02e1053260622b3b9b12a503ef\",\"runtimeHash\":\"bb8a43d93cf2362c10a12be42fb58a9ffc9e3c3b476d7cae97e3ab6e1c9045c6\",\"runtimeManifestSha256\":\"7816fa65a1a4f3aba447590b6c0ad67f2d4c5ef14f562aa24c0ec42ea05a49d1\",\"worldBuildHash\":\"ca8a2a563b00305834da3757f5b71c58c9b30e0406f867e3fa56b072a4049e6e\",\"sourceHash\":\"8bf713d30fabb3fe07eebc01bee6d6d9587b21af55ebbc76292d6f306ec84ae1\"},\"evidence\":{\"receiptSha256\":\"fdfc35cd37689bd9347275b15ea1121d4da1aecc74c4b2c0cfce657059eb8931\",\"archiveSha256\":\"040a1170825ade3ff37b189dd280153ecfafb99ee929d1cbebb40fe135afdf26\"},\"publication\":{\"registryId\":\"fixture-assets\",\"snapshotId\":\"9c33478e9798d85fe968a98af50b56ed90405db94b84d2c8f182fa8909508f30\",\"assetPolicySha256\":\"2aabb15fc533a8bfb545f95489c2b772babd7d858f156a31dff9bd5ed432512a\",\"catalogSha256\":\"693bae1d5f943e652a1d0fc0962b553c3d890230b41afcdf4b29602fd325bcdb\",\"bundleSha256\":\"5998e6d942bd1f91985747b358ede8e2c796dfd9b9551a4d98a1092d2dac4fd6\",\"sdkCommit\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"assetCount\":2},\"roots\":[{\"assetId\":\"animal.synthetic-ground\",\"version\":\"1.0.0\",\"manifestDigest\":\"ab01b391cac89abed6ad5661266ce174cf73a9f76267e281dad67c79e02d7b16\"},{\"assetId\":\"vehicle.synthetic-cart\",\"version\":\"1.0.0\",\"manifestDigest\":\"7233d9911a8ed5bc70953e1816a282cdc83cfa85c8863ebd83df442e754aa9dc\"}],\"policy\":{\"schemaVersion\":1,\"assetPolicySha256\":\"2aabb15fc533a8bfb545f95489c2b772babd7d858f156a31dff9bd5ed432512a\",\"allowedAssetIds\":[\"animal.synthetic-ground\",\"vehicle.synthetic-cart\"],\"allowCustomAssets\":true,\"deniedResourceSha256\":[]}},\"frozenLaunchParameters\":{\"transport\":\"webrtc-rtp\",\"initMsgpackBase64\":\"iqR0eXBlpGluaXSod2hpdGVib3iDr3NjZW5lX3JlbmRlcmluZ4OpYW50aWFsaWFzwqV1bmxpdMKnc2hhZG93c8Kod29ybGRfaWSud29ybGQtb3JpZ2luYWypc291cmNlX2lkr3NvdXJjZS1vcmlnaW5hbKZwcm9tcHS2T3JpZ2luYWwgYXV0aG9yIHByb21wdKpyZWZlcmVuY2VzkKRzZWVkKqtyZW5kZXJfbW9kZah3aGl0ZWJveLZpbnB1dF9yZWNlaXB0X3Byb3RvY29srnN0YXRlLWRlbHRhLXYxsGNvbnRyb2xfcHJvdG9jb2yyd2hpdGVib3gtcmVuZGVyLXYysHNvdXJjZV9vcGVyYXRpb26mY3JlYXRlp3N0YXJ0dXCEqHByb3RvY29su3doaXRlYm94LXN0YXJ0dXAtcHJlcGFyZS12MqpyZXF1ZXN0X2lk2SA4ODcwM2ExMTM0NGQ0ZjAxODgwNmMxZjEzMTdkODM5ZaZpbnRlbnSlbW9kZWyuaW5pdGlhbF9yZW5kZXKDpnByb21wdLZPcmlnaW5hbCBhdXRob3IgcHJvbXB0pHNlZWQqqnJlZmVyZW5jZXOQ\",\"publicationIdentity\":{\"sourceId\":\"source-original\",\"worldId\":\"world-original\",\"attempt\":2,\"publicationId\":\"publication-attempt-2\",\"sourceManifestSha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"renditionInputSha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"manifestSha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}}}}",
+      "authorization": "Bearer eyJ2IjozLCJhdWQiOiJ3aGl0ZWJveC1zaW5nbGUtY29udHJvbCIsInNjb3BlIjoic2luZ2xlLXBsYXllci1jb250cm9sIiwic2VydmljZV9pZCI6Ind0cCIsInN1YiI6InB1YmxpYy1wbGF5ZXI6b3JpZ2luYWwiLCJhY3Rpb24iOiJnZXRBdHRhY2htZW50IiwicmVxdWVzdF9zaGEyNTYiOiI4NmVmZGNhYzIzNzAyY2ZlNTY4MDc5YmM1N2I3NDc4NmYwMjA3MzI3OGJlZTlmNThjNjA3ODA5MTVjOTg0YzAzIiwib3JpZ2luIjpudWxsLCJpYXQiOjE3OTMyMjc1NTIsImV4cCI6MTc5MzIyNzY3MiwianRpIjoiYjhiNmVjYThhM2QxMTM1NmIyYzIyNTBlYTg1MTVlZTgifQ.UNkMSPHxASPT3yAVDENGuYRZfQnD2bhuoujHmRfLgQ0"
+    }
+  ],
+  "attachment": {
+    "expiresAt": 1793227612,
+    "transport": "webrtc-rtp",
+    "message": {
+      "type": "resume",
+      "control_protocol": "whitebox-render-v2",
+      "whitebox": {
+        "source_id": "source-original",
+        "world_id": "world-original",
+        "game_id": "11111111111111111111111111111111"
+      },
+      "source_session_id": "22222222222222222222222222222222",
+      "source_epoch": "original-source-epoch",
+      "owner_epoch": "original-owner-epoch",
+      "connection_generation": 0,
+      "control_sequence": 0,
+      "resume_user_id": "public-player:original",
+      "player_authorization": "fixture-original-private-short-capability"
+    }
+  }
+}

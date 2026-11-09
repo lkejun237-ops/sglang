@@ -29,6 +29,33 @@ def budget_bytes(value, name):
     return int(value * 10**9)
 
 
+def host_capacity(args):
+    directory = getattr(args, "zing_block0_cache_capacity_dir", None)
+    total = getattr(args, "zing_block0_cache_host_total_gb", None)
+    total = None if total is None else budget_bytes(total, "host total")
+    inherited = os.environ.get("SGLANG_CACHE_CAPACITY_DIR")
+    if inherited is not None:
+        planned = int(os.environ["SGLANG_CACHE_HOST_TOTAL_BYTES"])
+        quota = int(os.environ["SGLANG_CACHE_INSTANCE_HOST_BYTES"])
+        if (
+            directory is not None
+            and Path(directory).resolve() != Path(inherited).resolve()
+        ):
+            raise ValueError("Instance cannot bypass its machine capacity directory")
+        if total is not None and total != planned:
+            raise ValueError(
+                "Instance machine cache budget differs from its launch plan"
+            )
+        if budget_bytes(args.zing_block0_cache_host_gb, "host cache") > quota:
+            raise ValueError("Instance L1 exceeds its admitted launch plan")
+        directory, total = inherited, planned
+    if (directory is None) != (total is None):
+        raise ValueError(
+            "Host cache admission requires both capacity directory and machine total"
+        )
+    return directory, total
+
+
 def startup_config(args):
     """Called only after pool admission; disabled caches need no disk/host args."""
     mode = getattr(args, "zing_block0_cache_mode", "on")
@@ -59,9 +86,47 @@ def startup_config(args):
     # mounts and creates its cache root before starting the worker.
     if Path(root).resolve() == Path("/"):
         raise ValueError("The Block0 cache root cannot be the filesystem root")
-    if not storage_mounted(Path(root).resolve()):
+    storage = getattr(args, "zing_block0_cache_storage", "mounted")
+    if storage not in {"mounted", "local"}:
+        raise ValueError("Block0 storage must be mounted or local")
+    if storage == "mounted" and not storage_mounted(Path(root).resolve()):
         raise ValueError("Block0 storage must be mounted before the worker starts")
+    capacity, total = host_capacity(args)
+    if total is not None and total < host:
+        raise ValueError("Instance L1 budget exceeds the machine cache budget")
+    reserve = getattr(args, "zing_block0_cache_min_free_gb", 0)
+    if (
+        isinstance(reserve, bool)
+        or not isinstance(reserve, (int, float))
+        or not math.isfinite(reserve)
+        or reserve < 0
+    ):
+        raise ValueError("Disk reserve must be finite and nonnegative")
+    budget_bytes(getattr(args, "zing_block0_cache_inflight_gb", 128), "disk inflight")
+    writers = getattr(args, "zing_block0_cache_max_writers", 2)
+    if type(writers) is not int or not 1 <= writers <= 64:
+        raise ValueError("Disk writer count must be in 1..64")
     return host, disk, Path(root).resolve()
+
+
+def capacity_config(args):
+    """SP ranks must agree on admission domains and policies before allocating."""
+    directory, total = host_capacity(args)
+    root = (
+        getattr(args, "zing_block0_cache_budget_root", None)
+        or args.zing_block0_cache_dir
+    )
+    return (
+        None if directory is None else str(Path(directory).resolve()),
+        total,
+        str(Path(root).resolve()),
+        getattr(args, "zing_block0_cache_min_free_gb", 0),
+        getattr(args, "zing_block0_cache_inflight_gb", 128),
+        getattr(args, "zing_block0_cache_max_writers", 2),
+        getattr(args, "zing_block0_cache_gc_high_watermark", 1.0),
+        getattr(args, "zing_block0_cache_gc_low_watermark", 0.9),
+        getattr(args, "zing_block0_cache_gc_stale_s", 600.0),
+    )
 
 
 def storage_mounted(root):

@@ -9,6 +9,8 @@ description: "默认 local 与可选 Mooncake 后端的缓存管理行为对比�
 页预算取代固定条目上限，接口字段见下文。设计与验证边界见 [分页方案](/docs/sglang-diffusion/zing/plans/BLOCK0_PAGED_L1)。
 
 本文定义 Zing H3 受管 Block0 前缀缓存的外部接口契约（原版 local 沿用 PR #467 的 schema `zing-block0-v3`、`disk_format=4`；Mooncake 使用独立的内存对象协议，不读取这些磁盘格式）、HTTP 状态码、完整返回值结构、结构化日志与部署边界。
+2026-11-06 容量修复候选保持上述协议、key 和格式；新增同机共享容量目录、写前预留及活跃读写保护。
+上述容量策略适用于 local 后端；本次与 Mooncake 的合并组合尚未部署验收。启用机器 L1 预算后，5% 额度保留给条件快照，以下历史 KV 页数示例应按 95% 重新计算。
 设计背景与验证记录见[确认方案](/docs/sglang-diffusion/zing/plans/BLOCK0_CACHE_MANAGEMENT_SHARED_L2)，串行预热协议见[prefill WebSocket 契约](/docs/sglang-diffusion/zing/specs/block0-prefill-websocket)。
 
 ---
@@ -90,7 +92,7 @@ Block0 缓存采用 **“实例独占 L1（Host Pinned Memory） + 同机共享 
 | 层级 | 配置参数 | 默认值与示例配置 | 按上述布局估算的完整条目数 | 满容后的淘汰与边界行为 |
 | --- | --- | --- | --- | --- |
 | **L1 内存缓存** | `--zing-block0-cache-host-gb` | **无，启用缓存时必填**；示例 `800`（整实例十进制 GB，SP=2 下每 rank 400 GB） | **每 rank 272 页（2048 行/页）** | **按实际行数占页，整条 LRU 淘汰**：页不足时逐条淘汰至足够；单次 `preload` 的有效 key 总页需求超过实例总页数时，在加载前返回 `HTTP 409 / cache_capacity_exceeded`。L2 缺失的 key 不计需求页；已在全部 SP rank 的 L1 hit 即使 L2 已删仍可复用。 |
-| **L2 磁盘缓存** | `--zing-block0-cache-disk-gb` | **无，启用缓存时必填**；示例 `4000`（十进制 GB，清理高水位） | 高水位 **≈ 227 条**<br/>低水位(`0.9`) **≈ 204 条** | **周期性后台 GC**：开启 `--zing-block0-cache-gc` 的实例每 60 秒扫描一次元数据：先清理超时未完成的临时文件（默认 `600s`），若总占用超过高水位，按 `.access` 的近似 LRU 顺序删除磁盘条目直至降至低水位（默认 `90%`）。 |
+| **L2 磁盘缓存** | `--zing-block0-cache-disk-gb` | **无，启用缓存时必填**；示例 `4000`（十进制 GB，受管准入上限） | 高水位 **≈ 227 条**<br/>低水位(`0.9`) **≈ 204 条** | **写前预留 + 周期 GC**：总量、在途字节、真实余量任一不足则跳过落盘。GC 每 60 秒选一个回收者，保护活跃读写；清理超过 `600s` 的无拥有者残留，按近似 LRU 从高水位回收到低水位（通用默认 `100% → 90%`）。 |
 
 ---
 
@@ -447,7 +449,7 @@ Block0 缓存采用 **“实例独占 L1（Host Pinned Memory） + 同机共享 
 
 | 字段名 | 类型 | 说明 |
 | --- | --- | --- |
-| `max_bytes` | `int \| null` | 配置的磁盘清理高水位字节数 |
+| `max_bytes` | `int \| null` | 配置的受管磁盘准入预算字节数；GC 高水位为该值乘高水位比例 |
 | `root_entries` | `int \| null` | 快照采样时整个缓存根目录下的条目总数 |
 | `root_bytes` | `int \| null` | 快照采样时整个缓存根目录占用的总字节数（含临时文件） |
 | `sampled_at` | `float \| null` | 快照采样的 Unix 时间戳（秒）。**若当前尚无任何 GC 采样快照，则为 `null`，且上述容量字段也为 `null`（不可将 `null` 当作 `0`）** |
@@ -547,10 +549,11 @@ zing_cache_event {"operation_id":"wasteland-480-a","session_id":"...","game_id":
 
 ### 6.1 三条部署红线
 
-1. **每个共享磁盘目录必须且只需 1 个实例开启 `--zing-block0-cache-gc`**
-   - 同一台物理机共用同一个 `--zing-block0-cache-dir` 的多个实例中，**必须指定 1 个实例加上 `--zing-block0-cache-gc`**（内部仅 `local_rank == 0` 启动后台 GC 线程）。
+1. **同盘共享一份容量策略，至少一个实例开启 `--zing-block0-cache-gc`**
+   - 多个实例可同时开启 GC，内核锁保证每轮只有一个回收者；原回收者退出后其他实例可接替。
    - 若所有实例均未开启 GC：磁盘满后不会自动淘汰旧条目，容量快照也不再更新。新目录尚无快照时，`GET /v1/zing/cache` 的 `sampled_at` / `root_bytes` 为 `null`；已有快照则可能持续返回旧值。
-   - 物理磁盘需预留 10%–15% 余量（如 4.5 TB 分区配置 `--zing-block0-cache-disk-gb 4000`），承载并发写入临时文件；即使极端写满，`OSError` 也会被捕获并降级为 L2 写入跳过，**不会导致推理进程崩溃**。
+   - 写前检查总预算、在途预算、写入组数量和文件系统余量；运行中逐块检查余量。L2 预算耗尽/写满只跳过持久化，已有 L1 保留；启动时 L2 元数据发生 I/O 故障可降级为 L1，错误的容量配置仍拒绝启动。
+   - GC 和手动删除都保护活跃读写引用。手动删除受保护 key 在原 `failed` 数组中返回 `entry_busy`；L1 写盘未完成时卸载返回已有的 `409 cache_busy`，不提前归还页。
 2. **严禁直接挂载 OSS / S3 FUSE（如 ossfs）或跨机 NAS（CPFS/NFS）作为 `--zing-block0-cache-dir`**
    - 当前 L2 存储引擎针对**同机本地 NVMe（ext4/xfs）**设计：每个条目包含多层目录、`.access` 访问时间戳 `touch()`、`index/<game_id>/<group_id>/<key>.json` 小文件，以及依赖本地 POSIX 语义的临时文件写完后 `os.replace` 原子替换与 `rglob` 目录树遍历。
    - 对象存储 FUSE 挂载不支持真正的原子覆盖写，且高频元数据 `stat`/`utime` 会触发严重延迟甚至 I/O 报错。若后续需接入 OSS 冷备，需另行通过独立 PR 实现“单键归档打包 + 本地 NVMe 落盘中转”，**禁止在部署层直接将缓存目录指向 OSS 挂载点**。
@@ -568,7 +571,7 @@ zing_cache_event {"operation_id":"wasteland-480-a","session_id":"...","game_id":
 比例的含义、容量计算和验证状态见
 [容量契约](/docs/sglang-diffusion/zing/specs/PERFORMANCE_DEFAULTS#预分配-kv-池的容量字段)。
 未设置 KV pool 时，Worker 不会创建 Block0 cache owner，仅传 cache 参数不能启用缓存。
-若沿用 Encoder/Decoder 分卡部署，保留 recipe 中的角色参数，并为两个实例分配互不重叠的 GPU。
+若沿用 Encoder/Decoder 分卡部署，保留 recipe 中的角色参数。默认示例采用不同 GPU；同 GPU 多实例必须先取得完整实例峰值显存测量，再使用第 6.4 节的容量准入，不能仅调大会话上限。
 
 先创建位于已挂载本地 NVMe 下的缓存目录。下方 800/4000 仅为容量示例：两个实例各 800 GB
 将合计预分配约 1.6 TB pinned 内存，部署方须按可用主机内存与模型占用调整预算。
@@ -578,6 +581,8 @@ zing_cache_event {"operation_id":"wasteland-480-a","session_id":"...","game_id":
 MODEL_PATH=/models/zing-h3
 PIPELINE_CONFIG_PATH=/models/zing-h3/pipeline.json
 CACHE_DIR=/mnt/nvme0/zing-block0-cache
+CAPACITY_DIR=/var/lib/sglang/capacity
+
 # 使用该硬件与输入集合实测通过的比例；当前迁移版本尚无推荐值。
 : "${MEM_FRACTION_STATIC:?Set the validated static memory fraction}"
 
@@ -590,13 +595,17 @@ CUDA_VISIBLE_DEVICES=0,1 sglang serve \
   --zing-block0-cache-mode on \
   --zing-block0-cache-dir "$CACHE_DIR" \
   --zing-block0-cache-host-gb 800 \
+  --zing-block0-cache-capacity-dir "$CAPACITY_DIR" \
+  --zing-block0-cache-host-total-gb 1600 \
+  --zing-block0-cache-budget-root "$CACHE_DIR" \
+  --zing-block0-cache-min-free-gb 256 \
   --zing-block0-cache-disk-gb 4000 \
   --zing-block0-cache-gc \
   --zing-block0-cache-gc-interval-s 60 \
   --zing-block0-cache-gc-stale-s 600 \
   --zing-block0-cache-gc-low-watermark 0.9
 
-# 在另一终端启动实例 1：共享 NVMe，不开启 GC。
+# 在另一终端启动实例 1：共享 NVMe，也可接替 GC。
 CUDA_VISIBLE_DEVICES=2,3 sglang serve \
   --model-path "$MODEL_PATH" --pipeline-config-path "$PIPELINE_CONFIG_PATH" \
   --mem-fraction-static "$MEM_FRACTION_STATIC" \
@@ -605,7 +614,12 @@ CUDA_VISIBLE_DEVICES=2,3 sglang serve \
   --zing-block0-cache-mode on \
   --zing-block0-cache-dir "$CACHE_DIR" \
   --zing-block0-cache-host-gb 800 \
-  --zing-block0-cache-disk-gb 4000
+  --zing-block0-cache-capacity-dir "$CAPACITY_DIR" \
+  --zing-block0-cache-host-total-gb 1600 \
+  --zing-block0-cache-budget-root "$CACHE_DIR" \
+  --zing-block0-cache-min-free-gb 256 \
+  --zing-block0-cache-disk-gb 4000 \
+  --zing-block0-cache-gc
 ```
 
 ### 6.3 中台标准调用闭环
@@ -614,5 +628,70 @@ CUDA_VISIBLE_DEVICES=2,3 sglang serve \
 2. **开局前装载 L1**：选定目标空闲实例，调用 `POST /v1/zing/cache/preload`（传 `{"game_id": "...", "group_id": "..."}`），检查返回 `HTTP 200` 且 **`"all_ready": true`**（`missing` 也可能来自未完成、损坏或不兼容的 L2；先检查日志并按需重试或补热）。若在仍持有该 key 的原实例补写 L2，使用 `force=true`；默认 `force=false` 命中 L1 后不会重新写盘。也可在没有该 L1 条目的目标实例执行 `prefill`。
 3. **接入玩家流量**：将玩家视频会话定向路由至该实例（默认 `cache_write=false`，Block0 只查 L1、不读取 L2；未命中则重算）。
 4. **切关/退房轮换**：`preload` / `unload` 要求实例空闲。需在同一视频会话内切关时，提前装载所需分组并保证能同时驻留；要动态装载或卸载，则先结束当前会话并等待释放，再调用 `preload` / `unload`，完成后重新接入视频会话。活跃会话期间调用会返回 `409 cache_busy`。
+
+### 6.4 机器容量与多实例启动
+
+所有实例使用同一份本机 `--zing-block0-cache-capacity-dir`，并配置相同
+`--zing-block0-cache-host-total-gb`。每个实例的 `--zing-block0-cache-host-gb`
+仍是整个 SP 组额度。运行时先取得机器额度，再分配各 rank 的锁页内存。
+会话结束只归还玩家 Slot/动态状态，可复用前缀继续缓存；条目卸载只归还实例内的页，
+不声称 PyTorch 已向系统释放锁页内存。进程退出后才允许其他实例使用这部分机器额度。
+
+L2 的 `--zing-block0-cache-budget-root` 是专用缓存父目录，不能为 `/`、不能跨文件系统。
+不同模型可以各用一个子目录；各实例也可以共用同一模型子目录。子目录之间不能嵌套。
+统一配置以下参数，任何冲突都拒绝继续使用该容量域：
+
+| 参数 | 通用默认 | whitebox 模板 |
+| --- | --- | --- |
+| `--zing-block0-cache-disk-gb` | 必填；受管写入上限 | 700 GB |
+| `--zing-block0-cache-min-free-gb` | 0 | 128 GB |
+| `--zing-block0-cache-inflight-gb` | 128 GB，且不超过总量 | 128 GB |
+| `--zing-block0-cache-max-writers` | 2 个不同的 namespace/key 组 | 2 |
+| `--zing-block0-cache-gc-high-watermark` | 1.0 | 0.9 |
+| `--zing-block0-cache-gc-low-watermark` | 0.9 | 0.8 |
+
+同一个 key 的 SP rank 分别预留字节，但共用一个写入组名额；每 rank 也最多保留两个后台写任务。
+磁盘总量按逻辑文件大小计量，包含已写部分、旧版本、未完成条目；同时检查真实文件系统余量。
+GC 只删除已登记目录内可识别的闲置条目和过期孤儿临时目录，不自动删除未知历史资产。
+全域观测文件为 `<budget-root>/.capacity/usage.json`；原查询 API 继续返回本 namespace 的快照，
+不是整个物理磁盘实时使用量。没有删除成功的字节仍会被下一次计量计入。
+
+可选启动工具 `deploy/whitebox/instance_capacity.py` 在加载模型前检查实测显存预算、
+驱动实际空闲显存以及整机 L1 规划。策略 JSON 的结构如下，数字仅作结构示例，
+不能代替目标模型/分辨率/硬件的峰值测量：
+
+```json
+{
+  "capacity_dir": "/var/lib/sglang/capacity",
+  "host_cache_bytes": 416000000000,
+  "gpu_bytes": {"GPU-actual-uuid": 80000000000},
+  "instances": {
+    "player-worker-0": {
+      "host_cache_bytes": 208000000000,
+      "gpu_bytes": {"GPU-actual-uuid": 36000000000}
+    },
+    "player-worker-1": {
+      "host_cache_bytes": 208000000000,
+      "gpu_bytes": {"GPU-actual-uuid": 36000000000}
+    }
+  }
+}
+```
+
+调用形式为 `python deploy/whitebox/instance_capacity.py --policy /etc/sglang/capacity.json
+--instance player-worker-0 -- <前台 GPU Worker 命令及参数>`。用真实 GPU UUID 替换示例值，
+为每个实例设置独立端口和角色地址，保持每 Worker 单玩家。运行环境需能导入项目的 `sglang` 包。
+应包装持有 GPU 的前台 Worker/torchrun 进程组；命令不能 daemonize、另建 session 或脱离进程组。
+不要直接包装会为每个角色另建 session 的 `model_service.py`，应在各 GPU 角色入口分别接入。
+该工具不会限制 CUDA 分配器，也不能约束绕过工具的其他任务。
+
+正常退出时等整个进程组结束再归还额度。监督进程异常死亡会留下 `.instance` 隔离记录，
+后续启动拒绝把对应 GPU 当作已经释放；由操作员核实原进程组和 GPU 归属后恢复，不能按 TTL 删除。
+容量策略文件不可在线改写：调整额度须停止该容量域全部拥有者并核验释放后迁移策略，
+不可另换空目录绕过仍活跃的预算。容量目录必须在本机容器间共享，不能使用每个容器私有的同名路径。
+
+审查入口依次为 `shared_capacity.py`、`storage_budget.py`、`disk_cache.py`、`preparation_cache.py`
+以及两个启动入口。CPU 测试覆盖活进程不可抢占、崩溃残留、写满、读写引用保护、有界队列和原缓存兼容。
+GPU 分配、SP 通信、实际多实例并发性能与线上试玩未测；本次不部署。
 
 自动缓存写入遇到前缀超过 L1 host 页预算时跳过该条缓存，当前生成继续；显式预填充返回 `cache_capacity_exceeded`。这不会扩大 GPU 容量，也不会驱逐原有缓存来尝试存放无法容纳的条目。

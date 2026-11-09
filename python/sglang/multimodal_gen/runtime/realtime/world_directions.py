@@ -62,7 +62,7 @@ class DirectionCoordinator:
         *,
         baseline: str,
         schedule: list[tuple[int, str]],
-        rewrite: Callable[[str, str], Awaitable[tuple[str, str]]],
+        rewrite: Callable[[int | None, str, str], Awaitable[tuple[str, str]]],
         dispatch: Callable[[str, int | None], Awaitable[None]],
         notify: Callable[[Any, str], Awaitable[None]],
         revert_delay_s: float = DEFAULT_REVERT_DELAY_S,
@@ -70,7 +70,9 @@ class DirectionCoordinator:
         self._baseline = baseline
         self._schedule = sorted(schedule)  # [(target_chunk, prompt)] ascending
         self._pos = 0
-        self._rewrite = rewrite  # async (raw_text, baseline) -> (full_prompt, type)
+        # The event id crosses the rewrite boundary so world-service can make
+        # primary/comparison requests for one player action idempotent.
+        self._rewrite = rewrite
         self._dispatch = dispatch  # async (full_prompt, event_id|None, kind) -> engine
         self._notify = notify  # async (event_id, status) -> direction_status
         self._revert_delay_s = revert_delay_s
@@ -146,7 +148,7 @@ class DirectionCoordinator:
         self._gen += 1
         gen = self._gen
         try:
-            prompt, change_type = await self._rewrite(text, self._baseline)
+            prompt, change_type = await self._rewrite(event_id, text, self._baseline)
         except asyncio.CancelledError:
             raise
         except Exception:

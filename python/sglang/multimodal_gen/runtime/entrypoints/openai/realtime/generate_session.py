@@ -38,6 +38,7 @@ class RealtimeChunkContext:
     request_id: str
     action_version: int = 0
     prompt_version: int = 0
+    control_only: bool = False
 
 
 class GenerateSession:
@@ -249,7 +250,13 @@ class GenerateSession:
         *,
         action_version: int | None = None,
         prompt_version: int | None = None,
+        control_only: bool = False,
     ) -> RealtimeChunkContext:
+        if self.active_chunks and (
+            control_only
+            or any(chunk.control_only for chunk in self.active_chunks.values())
+        ):
+            raise RuntimeError("Control work requires an idle realtime dispatch owner")
         if len(self.active_chunks) >= self.max_inflight_chunks:
             if self.max_inflight_chunks == 1:
                 raise RuntimeError("previous realtime chunk is still active")
@@ -261,6 +268,7 @@ class GenerateSession:
             generation_id=self.generation_id,
             index=self.next_chunk_index,
             request_id=f"{self.id}_{uuid4().hex}",
+            control_only=control_only,
             action_version=(
                 self.action_version if action_version is None else action_version
             ),
@@ -268,7 +276,10 @@ class GenerateSession:
                 self.prompt_version if prompt_version is None else prompt_version
             ),
         )
-        self.next_chunk_index += 1
+        # Preparation uses the same scheduler/session but no video sequence.
+        # It is serialized with source work and gets a fresh RPC request ID.
+        if not control_only:
+            self.next_chunk_index += 1
         self.active_chunks[chunk.index] = chunk
         return chunk
 
@@ -288,6 +299,8 @@ class GenerateSession:
         if active != chunk:
             raise RuntimeError(f"realtime chunk {chunk.index} is not active")
         self.active_batches.pop(chunk.index, None)
+        if chunk.control_only:
+            return
         self._completed_chunks.add(chunk.index)
         while self.generate_chunk_cnt in self._completed_chunks:
             self._completed_chunks.remove(self.generate_chunk_cnt)

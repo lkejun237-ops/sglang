@@ -1,0 +1,488 @@
+{
+  "date": "2026-10-31",
+  "scope": "single-player actual WTP React Playtest with task-private route/auth/storage/admission fixtures; real Creator delivery, CLI, SGLang journal and GPU; not formal external Console /play or deployed-platform acceptance",
+  "testedSources": {
+    "sdkBase": "e3c1fc9132274bcb1bb5b45f04a96d6284499caa",
+    "sdkConsumerSha256": "5f5a4b7cd9f4d4dd0a3312c88dc22b9cad02e73a057bc2a403e218b644defcab",
+    "sglangBase": "a2aca6da95651be91f697c9c266ee18a0cd03a49",
+    "sglangRenderSourceSha256": "8ae4f5f7ed1cbda345b3e4e2252cff237c2b4dcd1200e937ea64d5f9c66eacb0",
+    "wtp": "8241de0361b64f61e5bdc3a25b7cb5f18621bf77",
+    "runtimeSha256": "4fce263390d2263e72f9e9069745b145771f1114f62eb027ac9ba756033ce949"
+  },
+  "artifact": {
+    "deliveryRevision": "235ce0ea7dc40a33297bb9035afb15abe9b6ae9018ce8c2db959c650570c1dd0",
+    "nativeWorldBuildHash": "3f8631435c958310a1a6062de418b390eb5e808a66204678778051c624e3cb3c",
+    "cdnCliWorldBuildHash": "2b72c657460fd3f7befb07381bfdb44d142147dc215b8550307d5793a56bc0ad",
+    "archiveSha256": "eccd6b5df6fdc1ff8884d513201e1297e016c6094fb28dcf6db1784c8f7ce7ee",
+    "assetMode": "fixed local legacy assets; explicitly authorized for acceptance",
+    "modelContextConfigHash": "67b7d3619107ba8e74548b5e6f964327217776814ffd6887cc6e8a114323eacb",
+    "referenceImages": [
+      {
+        "picture": 1,
+        "resource": "model/images/hall.png",
+        "sha256": "bd1dc366ad65a3d3d12acc03b39ff559e4df03d025c464b92889b3f3e1257f96"
+      },
+      {
+        "picture": 2,
+        "resource": "model/images/hall-layout.png",
+        "sha256": "c5a4bb3a49f6bf54f60ce5cfd0b0830e79661b73f005fea48d62a9a7db4018ad"
+      }
+    ],
+    "orderedReferencePolicy": "day uses Picture 1; night appends Picture 2; returning to day removes Picture 2 without renumbering Picture 1"
+  },
+  "model": {
+    "revision": "whitebox-sh-s0v2-main-bf347fa610-r1",
+    "width": 832,
+    "height": 480,
+    "requestedFps": 24,
+    "seed": 42,
+    "workerSourceShaVerified": false,
+    "weightBytesVerified": false
+  },
+  "runs": [
+    {
+      "id": "priority-p1",
+      "status": "passed",
+      "stages": 17,
+      "modelFrames": 1500,
+      "modelInitializations": 2,
+      "requiredOnsetsSubmittedExactlyOnce": 4,
+      "elapsedSeconds": 106.019,
+      "coverage": [
+        "weather/outfit composition",
+        "manual text/clear",
+        "ordered dynamic reference addition/removal",
+        "temporary override/end",
+        "door repeated required occurrences",
+        "control reconnect",
+        "explicit new segment",
+        "final white shirt manual visual review"
+      ]
+    },
+    {
+      "id": "priority-p2",
+      "status": "faults_passed_soak_budget_terminated",
+      "browserOverallStatus": "failed",
+      "modelFrames": 4124,
+      "modelInitializations": 1,
+      "elapsedSeconds": 200.661,
+      "playBudgetSeconds": 180,
+      "terminationCode": "BINDING_BUDGET_EXHAUSTED",
+      "coverage": [
+        "accepted receipt loss then real CLI control disconnect; original request once",
+        "corrupted reference hash rejected before commit; old condition retained",
+        "return through applied baseline re-arms identical failed payload",
+        "withdrawal then cancellation-resistant reference IO completion; late condition never committed"
+      ],
+      "fiveMinuteStabilityPassed": false
+    },
+    {
+      "id": "priority-p3",
+      "status": "passed",
+      "stages": 5,
+      "modelFrames": 361,
+      "modelInitializations": 2,
+      "elapsedSeconds": 41.725,
+      "cancelToVerifiedReleaseMs": 2895,
+      "coverage": [
+        "required onset accepted receipt loss; original request once",
+        "real source send held; drain returns to ordered queue",
+        "cancel admitted while dispatch blocked",
+        "same source explicit new segment; persistent state retained; onset not replayed",
+        "game event after reentry"
+      ]
+    },
+    {
+      "id": "priority-p4",
+      "status": "passed",
+      "stages": 12,
+      "modelFrames": 8043,
+      "modelInitializations": 1,
+      "elapsedSeconds": 360.245,
+      "soakSeconds": 340.05,
+      "completeSampleWindows": 10,
+      "sampleWindowSeconds": 30,
+      "periodicEvents": 10,
+      "playBudgetSeconds": 600,
+      "budgetSource": "existing configured_render_play_seconds(); test process environment only",
+      "fps": {
+        "min": 23.490904744585368,
+        "max": 24.267810245683762,
+        "mean": 23.936109608093556
+      },
+      "maxWindowDisplayGapP95Ms": 63.5,
+      "eventToPresentedMedianMs": 3982.5,
+      "eventToPresentedMinMs": 3946,
+      "eventToPresentedMaxMs": 4078,
+      "timingScope": "click through matching presented version, UI readiness and screenshot; not pure model timing",
+      "processMetrics": {
+        "pythonRssBytes": {
+          "first": 94629888,
+          "last": 417718272,
+          "max": 417718272
+        },
+        "cliRssBytes": {
+          "first": 622788608,
+          "last": 642883584,
+          "max": 642936832
+        },
+        "sourceQueueBytes": {
+          "first": null,
+          "last": 0,
+          "max": 3077
+        }
+      },
+      "processMetricsScope": "Python harness retains diagnostics; CLI Node main process RSS only; timings include click, matching visible frame and screenshot",
+      "eventToPresentedSampleCount": 10
+    }
+  ],
+  "cleanup": {
+    "allCliExitCodes": 0,
+    "allWireErrors": [],
+    "allCleanupErrors": [],
+    "activeModelSessions": 0,
+    "queuedModelSessions": 0,
+    "freeModelSlots": 1,
+    "ownedListenersRemaining": 0,
+    "workbenchTaskSourceOverlaysRestored": true
+  },
+  "currentIntegrationCpuOnly": {
+    "sdkBase": "7c994c4b46c26fbeb43badf3f1670686cdfd2f9d",
+    "sglangBase": "92939d91fe75fd06a2890cbf81fbf131d1e9851f",
+    "sdkConsumerTests": 54,
+    "sglangEndLifecycleTests": 10,
+    "sglangDeselectedTests": 23,
+    "gpuRevalidatedAfterPrefillMerge": false,
+    "prepublicationChecks": {
+      "sdkStreamHostTypecheck": "passed",
+      "sdkTargetedEslint": "passed",
+      "sdkTestCensus": "passed (inventory, not test execution)",
+      "sdkCreatorPrebuild": "passed",
+      "creatorPrebuiltRuntimeSha256": "4fce263390d2263e72f9e9069745b145771f1114f62eb027ac9ba756033ce949",
+      "introducedDocumentTargetsChecked": 7,
+      "pythonAst": "passed",
+      "gitDiffCheck": "passed",
+      "mintlifySiteValidation": "not run: mint CLI is not installed; introduced targets checked locally"
+    }
+  },
+  "evidence": {
+    "archiveSha256": "1b144babd7f7676aafeaf3cd5c885900cf7c1cc22f58634da4dcd4ab70a285f0",
+    "archiveBytes": 137804792,
+    "manifestFiles": 136,
+    "taskProject": "SDK .world-projects/model-context-playthrough-20261031",
+    "report": "ACCEPTANCE-priority-20261031.md",
+    "rawArtifactsTrackedInGit": false,
+    "originalArtifactMedianNote": "Original verifier stored sorted sample index 5 as median (3992 ms). True median of the ten archived samples is 3982.5 ms; raw archive is unchanged."
+  },
+  "notCoveredAtPriorityCheckpoint": [
+    "shared online publication/auth/storage/admission and deployed pins",
+    "trusted protocol visible (capability false; applied-only contract remains supported)",
+    "real World.reset while image preparation is pending",
+    "Room process crash/persistent journal recovery",
+    "hour-scale stability and memory leak attribution",
+    "480/736 matched baseline/candidate performance and per-stage GPU memory",
+    "worker condition tensor fingerprints",
+    "original ZingShow/Dream input and visual equivalence",
+    "multiplayer (deferred by user)"
+  ],
+  "notCovered": [
+    "shared online publication/auth/storage/admission and deployed pins",
+    "trusted protocol visible (capability false; applied-only contract remains supported)",
+    "480/736 matched baseline/candidate performance and per-stage GPU memory",
+    "worker condition tensor fingerprints",
+    "original ZingShow/Dream input and visual equivalence",
+    "multiplayer (deferred by user)",
+    "GPU reset on the rebuilt4d98 runtime (real native World regression passed separately)",
+    "automatic Room/CLI/GPU resurrection after a process crash (unsupported by contract)",
+    "hour-scale leak proof and exact native/allocator RSS attribution beyond the requested ten-minute run",
+    "Prefill mode GPU acceptance (ten-minute run uses WHITEBOX_BOUND_COMPUTE=0)"
+  ],
+  "localGapFollowUp": {
+    "status": "passed",
+    "elapsedMs": 600008,
+    "elapsedProcessSeconds": 626.557,
+    "modelFrames": 13950,
+    "modelLeases": 1,
+    "windows": 18,
+    "fps": {
+      "first": 23.740609450700696,
+      "last": 22.1799601310634,
+      "min": 22.064665446140758,
+      "max": 24.100363156157147
+    },
+    "maxWindowGapP95Ms": 64,
+    "eventToReadyScreenshotMs": {
+      "median": 3966,
+      "max": 4211
+    },
+    "phases": {
+      "model.request_prepare_ms": {
+        "count": 1598,
+        "medianMs": 0.447,
+        "p95Ms": 0.557,
+        "maxMs": 1.313
+      },
+      "model.scheduler_forward_ms": {
+        "count": 1598,
+        "medianMs": 351.187,
+        "p95Ms": 449.55,
+        "maxMs": 922.212
+      },
+      "model.chunk_total_ms": {
+        "count": 1598,
+        "medianMs": 481.8315,
+        "p95Ms": 635.063,
+        "maxMs": 1004.84
+      },
+      "model.output_pace_ms": {
+        "count": 1598,
+        "medianMs": 0.0,
+        "p95Ms": 0.0,
+        "maxMs": 0.0
+      },
+      "model.transport_encode_ms": {
+        "count": 1598,
+        "medianMs": 1.4035,
+        "p95Ms": 1.984,
+        "maxMs": 2.956
+      },
+      "model.transport_write_ms": {
+        "count": 1598,
+        "medianMs": 16.784,
+        "p95Ms": 35.032,
+        "maxMs": 93.638
+      },
+      "model.h3_input_copy_host_ms": {
+        "count": 1424,
+        "medianMs": 1.1135000000000002,
+        "p95Ms": 2.937,
+        "maxMs": 4.634
+      },
+      "model.h3_encoder_host_ms": {
+        "count": 1464,
+        "medianMs": 65.47200000000001,
+        "p95Ms": 183.851,
+        "maxMs": 421.206
+      },
+      "model.h3_bridge_host_ms": {
+        "count": 1598,
+        "medianMs": 0.822,
+        "p95Ms": 1.321,
+        "maxMs": 2.37
+      },
+      "model.h3_dit_host_ms": {
+        "count": 1598,
+        "medianMs": 233.2495,
+        "p95Ms": 269.651,
+        "maxMs": 787.802
+      },
+      "model.h3_decoder_host_ms": {
+        "count": 1598,
+        "medianMs": 3.737,
+        "p95Ms": 4.441,
+        "maxMs": 6.261
+      },
+      "path.input_admission_wait_ms": {
+        "count": 13950,
+        "medianMs": 0.05849348963238299,
+        "p95Ms": 0.08641899330541492,
+        "maxMs": 1634.2823849990964
+      },
+      "path.source_to_raw_output_ms": {
+        "count": 13950,
+        "medianMs": 976.576267494238,
+        "p95Ms": 1241.8072700093035,
+        "maxMs": 2519.505534990458
+      },
+      "path.source_to_selection_ms": {
+        "count": 13950,
+        "medianMs": 7.702710499870591,
+        "p95Ms": 32.84597399760969,
+        "maxMs": 1494.1741469956469
+      },
+      "path.selection_to_dispatch_ms": {
+        "count": 13950,
+        "medianMs": 10.98904998798389,
+        "p95Ms": 21.107239997945726,
+        "maxMs": 1460.2745590091217
+      },
+      "path.dispatch_to_raw_output_ms": {
+        "count": 13950,
+        "medianMs": 954.1134615137707,
+        "p95Ms": 1221.5807469910942,
+        "maxMs": 2503.263035992859
+      }
+    },
+    "modelTimingMessages": 1598,
+    "sessionTimings": [
+      {
+        "stage": "client.client_render_wait",
+        "count": 13950,
+        "errors": 0,
+        "mean_ms": 9.92083154115412,
+        "min_ms": 2.5999999940395355,
+        "max_ms": 51.80000001192093,
+        "last_ms": 10.199999988079071,
+        "age_ms": 4862.263693998102,
+        "p95_ms": 17.400000005960464,
+        "p95_window": 512
+      },
+      {
+        "stage": "client.client_video_decode",
+        "count": 13950,
+        "errors": 0,
+        "mean_ms": 2.9010107526065627,
+        "min_ms": 1,
+        "max_ms": 44.79999998211861,
+        "last_ms": 1.4000000059604645,
+        "age_ms": 4905.26055402006,
+        "p95_ms": 10.099999994039536,
+        "p95_window": 512
+      }
+    ],
+    "pythonRss": {
+      "first": 140730368,
+      "last": 645906432,
+      "min": 140730368,
+      "max": 647639040
+    },
+    "pythonTraced": {
+      "first": 40140661,
+      "last": 186832092,
+      "min": 40140661,
+      "max": 200509054
+    },
+    "cliTreeRss": {
+      "first": 1967890432,
+      "last": 2058919936,
+      "min": 1912668160,
+      "max": 2269356032
+    },
+    "sourceQueueBytes": {
+      "first": 0,
+      "last": 0,
+      "min": 0,
+      "max": 3070
+    },
+    "collectorTotals": {
+      "frameTimes": {
+        "retained": 4096,
+        "total": 14484
+      },
+      "mediaRows": {
+        "retained": 256,
+        "total": 13950
+      },
+      "feedback": {
+        "retained": 625,
+        "total": 625
+      },
+      "modelMedia": {
+        "retained": 4096,
+        "total": 13950
+      }
+    },
+    "capacityAfter": {
+      "observed_at": 1793457228.2010262,
+      "roles": {
+        "denoiser": {
+          "waiting_sessions": 0,
+          "active_sessions": 0,
+          "queued_sessions": 0,
+          "free_slots": 1,
+          "draining_workers": 0
+        },
+        "vae": {
+          "waiting_sessions": 0,
+          "active_sessions": 0,
+          "queued_sessions": 0,
+          "free_slots": 0,
+          "draining_workers": 0
+        }
+      }
+    },
+    "remainingListeners": [],
+    "samplingLimits": [
+      "Each browser window retains at most the existing latest 512 presented entries; FPS is a trailing sample, not all-frame full-window throughput.",
+      "Tracemalloc, GC and snapshots perturb timing and RSS.",
+      "Normal world-driven mode; WHITEBOX_BOUND_COMPUTE=0; not Prefill acceptance.",
+      "GPU run uses frozen runtime4fce and predates the World.reset release fix. Reset fix verified separately in real World regression and rebuilt runtime4d98."
+    ],
+    "testedSources": {
+      "worldkit": "7386ddaf03cb0b1eaaa70bff0dca638d7edbb7d8",
+      "sglang": "b4cc51e2c519f8ba814936cf8adc987c3e632516",
+      "world-test-platform": "7808e33885fa9ef0021bdd1cc9069b75cf96837c"
+    },
+    "artifact": {
+      "deliveryRevision": "235ce0ea7dc40a33297bb9035afb15abe9b6ae9018ce8c2db959c650570c1dd0",
+      "nativeWorldBuildHash": "3f8631435c958310a1a6062de418b390eb5e808a66204678778051c624e3cb3c",
+      "cdnCliWorldBuildHash": "2b72c657460fd3f7befb07381bfdb44d142147dc215b8550307d5793a56bc0ad",
+      "archiveSha256": "eccd6b5df6fdc1ff8884d513201e1297e016c6094fb28dcf6db1784c8f7ce7ee",
+      "assetMode": "fixed local legacy assets; explicitly authorized for acceptance",
+      "modelContextConfigHash": "67b7d3619107ba8e74548b5e6f964327217776814ffd6887cc6e8a114323eacb",
+      "referenceImages": [
+        {
+          "picture": 1,
+          "resource": "model/images/hall.png",
+          "sha256": "bd1dc366ad65a3d3d12acc03b39ff559e4df03d025c464b92889b3f3e1257f96"
+        },
+        {
+          "picture": 2,
+          "resource": "model/images/hall-layout.png",
+          "sha256": "c5a4bb3a49f6bf54f60ce5cfd0b0830e79661b73f005fea48d62a9a7db4018ad"
+        }
+      ],
+      "orderedReferencePolicy": "day uses Picture 1; night appends Picture 2; returning to day removes Picture 2 without renumbering Picture 1"
+    },
+    "archive": {
+      "bytes": 263992576,
+      "sha256": "70d40b899c631bf3078c14913b8bdd8170d880645aef8d688a363dbb29d8196d"
+    },
+    "worldReset": {
+      "scope": "real World, PNG filesystem, deferred model peer, old receipts fenced, fresh registration commits",
+      "regressionTestsPassed": 82,
+      "runtimeHash": "4d98b15fb99c6a7ae15604969336354af7180f3c465780ee71455de0bcfaeb69",
+      "gpuRunIncludesFix": false
+    },
+    "roomCrash": {
+      "scope": "real RenderHost process SIGKILL/restart, SQLite and original HTTP route; deterministic model records, no GPU lease",
+      "phases": [
+        "accepted",
+        "applied"
+      ],
+      "journalTestsPassed": 37,
+      "workerBoundaryDeselected": 1,
+      "preparationCloseTestsPassed": 16,
+      "otherConditionsDeselected": 72
+    },
+    "limits": [
+      "not shared deployed WTP acceptance",
+      "not a pure performance benchmark; tracemalloc and GC perturb timing/RSS"
+    ]
+  },
+  "raw_evidence": {
+    "index": "history/20261109-evidence-index.json",
+    "archive_uri": "oss://leap-worldmodel-thailand-single-az/reports/whitebox-pr647-history-20261109/81644ce8ea4812ea7223a4eda4b044c8f9aaa6962115b5c606822c4fddcdf4ab/originals.tar.gz",
+    "archive_sha256": "81644ce8ea4812ea7223a4eda4b044c8f9aaa6962115b5c606822c4fddcdf4ab",
+    "member": "benchmark/whitebox/model-context-20261031-summary.json",
+    "member_sha256": "4deff81a58e9f19ecb874c5111cf967afb6423b1678958f3ed27d5a51cc21c15",
+    "externalized_json_pointers": [
+      "/runs/0/stageEvidence",
+      "/runs/0/requiredOnsetIds",
+      "/runs/1/stageEvidence",
+      "/runs/2/stageEvidence",
+      "/runs/3/stageEvidence",
+      "/localGapFollowUp/versions",
+      "/localGapFollowUp/eventToReadyScreenshotMs/samples",
+      "/localGapFollowUp/allocations",
+      "/runs/3/eventToPresentedSamplesMs"
+    ],
+    "format": "original UTF-8 JSON member; byte-preserving tar+gzip",
+    "access": "Private OSS object; authenticated team OSS read permission required. No signed URL in Git.",
+    "archive_bytes": 37123,
+    "member_bytes": 51665
+  },
+  "outcome_notes": {
+    "priority-p2": "Overall browser result FAILED: the soak ended at the fixture play budget. Fault subchecks passed; the original status string is preserved unchanged. See MODEL-CONTEXT-20261031.md."
+  }
+}

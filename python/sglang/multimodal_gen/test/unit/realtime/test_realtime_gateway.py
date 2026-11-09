@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.realtime.gateway import (
     BrowserPlaybackAckWindow,
     GatewayOutputRegistry,
     OutputBackpressureError,
+    OutputDeliveryDetached,
     OutputProtocolError,
     OutputRouteClosed,
     build_denoiser_url,
@@ -55,7 +56,9 @@ def _frame(
     )
 
 
-def _media_complete(chunk: int, *, generation: str = "g") -> bytes:
+def _media_complete(
+    chunk: int, *, generation: str = "g", is_final_chunk: bool = False
+) -> bytes:
     return encode_message(
         "media_chunk_complete",
         session_id="s",
@@ -63,6 +66,7 @@ def _media_complete(chunk: int, *, generation: str = "g") -> bytes:
         request_id=f"r{chunk}",
         chunk_index=chunk,
         num_frames=1,
+        is_final_chunk=is_final_chunk,
     )
 
 
@@ -182,6 +186,73 @@ def test_gateway_output_route_uses_media_completion_as_authoritative_marker():
     asyncio.run(run())
 
 
+def test_gateway_output_route_final_barrier_requires_real_unique_final_marker():
+    async def run():
+        registry = GatewayOutputRegistry(queue_depth=3)
+        route = await registry.register("s", "g", token="secret")
+        final_waiter = asyncio.create_task(route.wait_until_final_completed())
+
+        await route.put(_frame(0, 0))
+        await route.put(_media_complete(0))
+        await asyncio.sleep(0)
+        assert not final_waiter.done()
+        assert not route.final_completed
+
+        await route.put(_frame(1, 0))
+        final = _media_complete(1, is_final_chunk=True)
+        await route.put(final)
+        await final_waiter
+        assert route.final_completed
+        assert route.final_chunk_index == 1
+        assert route.final_completed_at is not None
+
+        with pytest.raises(OutputProtocolError, match="after final"):
+            await route.put(final)
+        with pytest.raises(OutputProtocolError, match="after final"):
+            await route.put(_frame(2, 0))
+
+    asyncio.run(run())
+
+
+def test_gateway_output_route_drain_fact_requires_successful_browser_delivery():
+    async def run():
+        registry = GatewayOutputRegistry(queue_depth=3)
+        route = await registry.register("s", "g", token="secret")
+        frame = _frame(0, 0)
+        final = _media_complete(0, is_final_chunk=True)
+
+        await route.put(frame)
+        await route.put(final)
+        assert route.final_completed_at is not None
+        assert await route.get() == frame
+        route.task_done()
+        assert await route.get() == final
+        route.task_done(delivered=False)
+        await route.join()
+
+        assert route.queue_drained_at is None
+
+    asyncio.run(run())
+
+
+def test_gateway_output_route_force_close_does_not_fake_final_completion():
+    async def run():
+        registry = GatewayOutputRegistry(queue_depth=3)
+        route = await registry.register("s", "g", token="secret")
+        final_waiter = asyncio.create_task(route.wait_until_final_completed())
+
+        await registry.unregister("s", "g", token="secret")
+        await asyncio.sleep(0)
+
+        assert route.closed
+        assert not route.final_completed
+        assert not final_waiter.done()
+        final_waiter.cancel()
+        await asyncio.gather(final_waiter, return_exceptions=True)
+
+    asyncio.run(run())
+
+
 def test_gateway_output_route_prioritizes_media_completion_under_backpressure():
     async def run():
         registry = GatewayOutputRegistry(queue_depth=1, enqueue_timeout_s=0.5)
@@ -287,6 +358,50 @@ def test_gateway_output_route_passes_h264_without_dropping_muxed_payloads():
     asyncio.run(run())
 
 
+def test_gateway_output_route_keeps_forwarding_when_recording_hook_fails():
+    class BrokenRecorder:
+        def __init__(self):
+            self.types = []
+
+        def offer(self, message):
+            self.types.append(message["type"])
+            if message["type"] == "media_payload":
+                raise RuntimeError("injected recorder failure")
+
+    async def run():
+        recorder = BrokenRecorder()
+        registry = GatewayOutputRegistry(queue_depth=4)
+        route = await registry.register("s", "g", token="secret", recorder=recorder)
+        init = _h264_message("media_init", codec="h264", width=8, height=8)
+        payload = _h264_message(
+            "media_payload", sequence=0, codec="h264", payload=b"video"
+        )
+        completion = _h264_message(
+            "media_chunk_complete",
+            request_id="r0",
+            chunk_index=0,
+            num_frames=1,
+            media_transport="h264",
+            is_final_chunk=True,
+        )
+
+        for wire in (init, payload, completion):
+            await asyncio.wait_for(route.put(wire), timeout=0.05)
+
+        assert recorder.types == ["media_init", "media_payload"]
+        assert route.commit_recording_final()
+        assert recorder.types == [
+            "media_init",
+            "media_payload",
+            "media_chunk_complete",
+        ]
+        for expected in (init, payload, completion):
+            assert await route.get() == expected
+            route.task_done()
+
+    asyncio.run(run())
+
+
 def test_gateway_output_route_closes_h264_slow_consumer_before_unbounded_growth():
     async def run():
         init = _h264_message("media_init", codec="h264", width=8, height=8)
@@ -349,6 +464,142 @@ def test_gateway_output_route_closes_h264_small_payload_flood_by_message_count()
             await route.put(payload1)
         assert route.closed
         assert route.queue_metrics()["gateway_queue_messages"] == 0
+
+    asyncio.run(run())
+
+
+def test_gateway_output_route_detaches_browser_but_keeps_recording_h264():
+    class Recorder:
+        def __init__(self):
+            self.messages = []
+
+        def offer(self, message):
+            self.messages.append(message)
+
+    async def run():
+        recorder = Recorder()
+        detach_observations = []
+        registry = GatewayOutputRegistry(
+            queue_depth=64,
+            max_queue_bytes=1024 * 1024,
+            max_queue_messages=2,
+        )
+        route = await registry.register(
+            "s",
+            "g",
+            token="secret",
+            recorder=recorder,
+            on_browser_detach=lambda reason, observed_at: detach_observations.append(
+                (reason, observed_at)
+            ),
+        )
+        init = _h264_message("media_init", codec="h264", width=8, height=8)
+        payloads = [
+            _h264_message(
+                "media_payload",
+                sequence=sequence,
+                codec="h264",
+                payload=f"payload-{sequence}".encode(),
+            )
+            for sequence in range(4)
+        ]
+        final = _h264_message(
+            "media_chunk_complete",
+            request_id="r0",
+            chunk_index=0,
+            num_frames=4,
+            media_transport="h264",
+            is_final_chunk=True,
+        )
+
+        await route.put(init)
+        await route.put(payloads[0])
+        route.allow_browser_detach()
+
+        # This payload exceeds the old hard message limit. Once playback has
+        # started it detaches only the presentation side; every later payload
+        # and the authoritative final still pass validation and recording.
+        for wire in (*payloads[1:], final):
+            await route.put(wire)
+
+        await asyncio.wait_for(route.wait_until_final_completed(), timeout=0.05)
+        assert not any(
+            message.get("is_final_chunk") is True for message in recorder.messages
+        )
+        assert route.commit_recording_final()
+        assert not route.commit_recording_final()
+        await asyncio.wait_for(route.join(), timeout=0.05)
+        assert route.browser_detached
+        assert route.browser_detach_reason == "queue_message_limit"
+        assert len(detach_observations) == 1
+        assert detach_observations[0][0] == "queue_message_limit"
+        assert isinstance(detach_observations[0][1], float)
+        assert not route.detach_browser("later_reason")
+        assert len(detach_observations) == 1
+        assert not route.closed
+        assert route.final_completed
+        assert route.queue_drained_at is None
+        assert route.queue_metrics()["gateway_queue_messages"] == 0
+        assert route.queue_metrics()["gateway_queue_bytes"] == 0
+        assert [message["type"] for message in recorder.messages] == [
+            "media_init",
+            "media_payload",
+            "media_payload",
+            "media_payload",
+            "media_payload",
+            "media_chunk_complete",
+        ]
+        with pytest.raises(OutputDeliveryDetached):
+            await route.get_output()
+
+    asyncio.run(run())
+
+
+def test_gateway_output_route_detach_waits_for_the_inflight_delivery_task():
+    async def run():
+        registry = GatewayOutputRegistry(
+            queue_depth=64,
+            max_queue_bytes=1024 * 1024,
+            max_queue_messages=4,
+        )
+        route = await registry.register("s", "g", token="secret")
+        init = _h264_message("media_init", codec="h264", width=8, height=8)
+        payload = _h264_message(
+            "media_payload", sequence=0, codec="h264", payload=b"video"
+        )
+        await route.put(init)
+        await route.put(payload)
+
+        inflight = await route.get_output()
+        assert inflight.wire == init
+        route.allow_browser_detach()
+        assert route.detach_browser("test_inflight")
+
+        drain_waiter = asyncio.create_task(route.join())
+        await asyncio.sleep(0)
+        assert not drain_waiter.done()
+        assert route.queue_metrics()["gateway_queue_messages"] == 0
+        assert route.queue_metrics()["gateway_queue_bytes"] == 0
+
+        route.task_done(delivered=False)
+        await asyncio.wait_for(drain_waiter, timeout=0.05)
+        assert route.queue_drained_at is None
+
+    asyncio.run(run())
+
+
+def test_gateway_output_route_detach_wakes_an_idle_browser_consumer():
+    async def run():
+        registry = GatewayOutputRegistry(queue_depth=4)
+        route = await registry.register("s", "g", token="secret")
+        route.allow_browser_detach()
+        consumer = asyncio.create_task(route.get_output())
+        await asyncio.sleep(0)
+        assert not consumer.done()
+
+        assert route.detach_browser("test_idle")
+        with pytest.raises(OutputDeliveryDetached):
+            await asyncio.wait_for(consumer, timeout=0.05)
 
     asyncio.run(run())
 

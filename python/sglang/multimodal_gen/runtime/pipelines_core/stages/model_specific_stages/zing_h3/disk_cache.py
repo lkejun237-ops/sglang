@@ -9,17 +9,20 @@ import shutil
 import threading
 import time
 import uuid
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.shared_capacity import CapacityUnavailable
 
 from .block0_conditions import CONDITIONS_SCHEMA, decode_conditions, encode_conditions
 from .block0_identity import SCHEMA
 from .cache_logging import cache_event, cache_scope
 from .paged_kv import kv_slices
+from .storage_budget import StorageBudget, tree_bytes
 
 logger = init_logger(__name__)
 DISK_FORMAT = 4
@@ -43,7 +46,7 @@ def _read_json(path):
         return json.load(handle)
 
 
-def _write_kv(path, tensor):
+def _write_kv(path, tensor, *, before_chunk=None):
     """Write the logical (layer, K/V, rows, ...) tensor as raw bytes.
 
     Each layer/KV slice is contiguous for the pinned slot layout, so this
@@ -52,6 +55,8 @@ def _write_kv(path, tensor):
     with open(path, "wb") as handle:
         for value in kv_slices(tensor):
             value = value.contiguous().reshape(-1)
+            if before_chunk is not None:
+                before_chunk(value.numel() * value.element_size())
             value.view(torch.uint8).numpy().tofile(handle)
 
 
@@ -88,6 +93,11 @@ class DiskEntry:
     manifest: dict
     rank: int
     conditions: dict
+    capacity_lease: object = None
+
+    def close(self):
+        if self.capacity_lease is not None:
+            self.capacity_lease.close()
 
     def load_conditions(self):
         return self.conditions
@@ -117,6 +127,11 @@ class Block0DiskCache:
         gc_interval=60.0,
         gc_stale_seconds=600.0,
         gc_low_watermark=0.9,
+        budget_root=None,
+        min_free_bytes=0,
+        max_inflight_bytes=128_000_000_000,
+        max_writers=2,
+        gc_high_watermark=1.0,
     ):
         if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 1):
             raise ValueError("Block0 disk byte budget must be positive")
@@ -143,6 +158,24 @@ class Block0DiskCache:
         self.gc_low_watermark = gc_low_watermark
         self._gc_stop = threading.Event()
         self._gc_thread = None
+        if not 0 < gc_low_watermark <= gc_high_watermark <= 1:
+            raise ValueError("Invalid cache collection watermarks")
+        self.gc_high_watermark = gc_high_watermark
+        self.budget = (
+            None
+            if budget_root is None
+            else StorageBudget(
+                budget_root,
+                self.cache_dir,
+                limit=max_bytes,
+                reserve=min_free_bytes,
+                inflight=min(max_inflight_bytes, max_bytes),
+                writers=max_writers,
+                collection=(gc_high_watermark, gc_low_watermark, gc_stale_seconds),
+            )
+        )
+        self._writes = {}
+        self.last_write_failure = None
         # Do not probe writes here: a full quota must not prevent L1 startup.
 
     def is_enabled(self):
@@ -176,9 +209,32 @@ class Block0DiskCache:
             logger.warning("Block0 disk staging failed: %s", exc)
             return None
 
+    def reserve_write(self, key, tmp_dir, byte_count):
+        if self.budget is None:
+            return True
+        try:
+            lease = self.budget.reserve_write(key, tmp_dir, byte_count)
+            self._writes[str(tmp_dir)] = lease
+            self.last_write_failure = None
+            return True
+        except (CapacityUnavailable, OSError, ValueError) as exc:
+            self.last_write_failure = type(exc).__name__
+            return False
+
     def discard_tmp(self, tmp_dir):
         if tmp_dir is not None and self._under_root(tmp_dir):
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            # Unlink before releasing its reservation; a failed cleanup is still
+            # charged by the next full-root scan, never reported as free space.
+            try:
+                shutil.rmtree(tmp_dir)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.warning("Block0 staging cleanup failed", exc_info=True)
+            finally:
+                lease = self._writes.pop(str(tmp_dir), None)
+                if lease is not None:
+                    lease.close()
 
     @staticmethod
     def _manifest(folder):
@@ -258,23 +314,35 @@ class Block0DiskCache:
             # failures. Every SP rank must reach the preload plan collective.
             return None
 
-    def lookup(self, key, rank=None):
+    def lookup(self, key, rank=None, *, admit_conditions=None):
         rank = self.local_rank if rank is None else rank
         if not self._safe_key(key) or not 0 <= rank < self.sp_world_size:
             return None
+        lease = None
         try:
+            if self.budget is not None:
+                lease = self.budget.pin(key)
             folder = self._entry_dir(key)
             manifest = self._valid_manifest(folder, key)
             if manifest is None:
                 return None
+            conditions_path = folder / f"rank-{rank}" / "conditions.pt"
+            if admit_conditions is not None:
+                # Reserve room before materializing another CPU snapshot. The
+                # deserialized shape is checked again before L1 publication.
+                admit_conditions(conditions_path.stat().st_size + (1 << 20))
             conditions = decode_conditions(
                 torch.load(
-                    folder / f"rank-{rank}" / "conditions.pt",
+                    conditions_path,
                     map_location="cpu",
                     weights_only=True,
                 )
             )
-            return DiskEntry(key, folder, manifest, rank, conditions)
+            entry = DiskEntry(key, folder, manifest, rank, conditions, lease)
+            if lease is not None:
+                weakref.finalize(entry, lease.close)
+                lease = None
+            return entry
         except Exception as exc:
             cache_event(
                 "l2_lookup",
@@ -285,6 +353,9 @@ class Block0DiskCache:
                 level=logging.WARNING,
             )
             return None
+        finally:
+            if lease is not None:
+                lease.close()
 
     def _touch(self, entry):
         # Touch only an existing marker, never resurrect an evicted directory.
@@ -300,16 +371,27 @@ class Block0DiskCache:
         if info["shape"] != list(target.shape) or info["dtype"] != str(target.dtype):
             raise ValueError("Block0 disk KV shape/dtype differs from the L1 slot")
         # The open file owns its inode through concurrent replacement/unlink.
-        result = entry.load_kv_into(target)
-        self._touch(entry)
-        return result
+        try:
+            result = entry.load_kv_into(target)
+            self._touch(entry)
+            return result
+        finally:
+            entry.close()
 
     def save_rank_kv(self, key, rank, kv_tensor, tmp_dir):
         if not self._safe_key(key) or tmp_dir is None or not self._under_root(tmp_dir):
             return None
+        if self.budget is not None and str(tmp_dir) not in self._writes:
+            # Direct tooling callers must also reserve before writing raw KV.
+            size = kv_tensor.numel() * kv_tensor.element_size() + (1 << 20)
+            if not self.reserve_write(key, tmp_dir, size):
+                return None
         try:
             path = Path(tmp_dir) / f"block0_kv_rank_{rank}.bin"
-            _write_kv(path, kv_tensor)
+            if self.budget is None:
+                _write_kv(path, kv_tensor)
+            else:
+                _write_kv(path, kv_tensor, before_chunk=self.budget.require_free_space)
             _dump_json(
                 Path(tmp_dir) / f"kvmeta-{rank}.json",
                 {"shape": list(kv_tensor.shape), "dtype": str(kv_tensor.dtype)},
@@ -338,7 +420,25 @@ class Block0DiskCache:
                 if not 0 <= rank < self.sp_world_size or not self._under_root(source):
                     raise ValueError("Invalid Block0 rank staging file")
                 conditions = tmp / f"conditions-{rank}.pt"
-                torch.save(encode_conditions(conditions_dict), conditions)
+                encoded = encode_conditions(conditions_dict)
+                if self.budget is not None:
+                    from .storage_payload import serialization_bound
+
+                    lease = self._writes.get(str(tmp_dir))
+                    required = Path(source).stat().st_size + serialization_bound(
+                        encoded
+                    )
+                    if (
+                        lease is None
+                        or lease.value["key"] != key
+                        or required > lease.value["bytes"]
+                    ):
+                        raise CapacityUnavailable(
+                            "Conditions exceed reserved write size"
+                        )
+                if self.budget is not None:
+                    self.budget.require_free_space(serialization_bound(encoded))
+                torch.save(encoded, conditions)
                 info = dict(
                     _read_json(tmp / f"kvmeta-{rank}.json"),
                     kv_bytes=Path(source).stat().st_size,
@@ -436,7 +536,16 @@ class Block0DiskCache:
         }
 
     def collect(self):
-        """One best-effort GC pass; only the designated collector calls this."""
+        """One collector per shared disk domain, elected by a kernel lock."""
+        if self.budget is not None:
+            with self.budget.collector() as elected:
+                if not elected:
+                    return {"collector": False}
+                with self.budget.state.locked():
+                    return self._collect_domain()
+        return self._collect_logged()
+
+    def _collect_logged(self):
         with cache_scope():
             started = time.perf_counter()
             activity = dict(
@@ -481,6 +590,92 @@ class Block0DiskCache:
                 **activity,
             )
             return usage
+
+    def _collect_domain(self):
+        budget = self.budget
+        protected = budget.protected()
+        candidates, failed = [], []
+        now = time.time()
+        deleted = 0
+        for root in budget.roots():
+            view = Block0DiskCache(root, max_bytes=self.max_bytes)
+            for folder in view.tmp_root.glob("*"):
+                # A live owner is protected by its locked staging record, not mtime.
+                owners = budget.state.owners()
+                active = {r.get("staging") for r in owners if r["resource"] == "disk"}
+                if str(folder) in active or folder.is_symlink():
+                    continue
+                size, modified = view._measure(folder)
+                if now - modified >= self.gc_stale_seconds:
+                    try:
+                        shutil.rmtree(folder)
+                        deleted += 1
+                    except OSError:
+                        failed.append(str(folder))
+            for entry in view._scan():
+                if (str(root), entry["key"]) in protected:
+                    continue
+                folder = root / entry["dir"]
+                if not entry["complete"]:
+                    if now - entry["modified_at"] >= self.gc_stale_seconds:
+                        try:
+                            shutil.rmtree(folder)
+                            deleted += 1
+                        except OSError:
+                            failed.append(str(folder))
+                else:
+                    candidates.append(
+                        (entry["last_accessed_at"], str(folder), entry["size_bytes"])
+                    )
+        used = tree_bytes(budget.root, exclude=budget.state.root)
+        st = os.statvfs(budget.root)
+        free = st.f_bavail * st.f_frsize
+        pressure = (
+            used >= self.max_bytes * self.gc_high_watermark or free < budget.reserve
+        )
+        if pressure:
+            for _, name, size in sorted(candidates):
+                if (
+                    used <= self.max_bytes * self.gc_low_watermark
+                    and free >= budget.reserve
+                ):
+                    break
+                folder = Path(name)
+                if folder.is_symlink():
+                    failed.append(name)
+                    continue
+                try:
+                    shutil.rmtree(folder)
+                    deleted += 1
+                    used -= size
+                except OSError:
+                    failed.append(name)
+                st = os.statvfs(budget.root)
+                free = st.f_bavail * st.f_frsize
+        usage = dict(
+            version=DISK_FORMAT,
+            max_bytes=self.max_bytes,
+            sampled_at=now,
+            root_bytes=tree_bytes(budget.root, exclude=budget.state.root),
+            free_bytes=free,
+            protected_entries=len(protected),
+            deleted_count=deleted,
+            failed=failed,
+            collector=True,
+        )
+        # Include compatible roots in one authoritative domain summary. The old
+        # per-root list endpoint still gets a local entry view.
+        _dump_json(budget.state.root / "usage.json", usage)
+        entries = self._scan()
+        local = dict(
+            usage,
+            entries=entries,
+            root_entries=len(entries),
+            root_bytes=sum(e["size_bytes"] for e in entries),
+            temporary_bytes=tree_bytes(self.tmp_root),
+        )
+        _dump_json(self.usage_path, local)
+        return usage
 
     def _collect(self, activity):
         if self.max_bytes is None:
@@ -660,7 +855,16 @@ class Block0DiskCache:
                 cache_key=keys[0] if keys and len(keys) == 1 else None,
             )
             try:
-                value = self._delete_entries(keys=keys)
+                if self.budget is None:
+                    self.budget = StorageBudget.existing(self.cache_dir)
+                if self.budget is None:
+                    value = self._delete_entries(keys=keys)
+                else:
+                    with self.budget.state.locked():
+                        self.budget.roots()
+                        value = self._delete_entries(
+                            keys=keys, protected=self.budget.protected()
+                        )
             except Exception as exc:
                 cache_event(
                     event,
@@ -687,7 +891,7 @@ class Block0DiskCache:
             )
             return value
 
-    def _delete_entries(self, *, keys=None):
+    def _delete_entries(self, *, keys=None, protected=()):
         if keys is not None and (
             not isinstance(keys, (list, tuple))
             or not all(self._safe_key(k) for k in keys)
@@ -700,6 +904,9 @@ class Block0DiskCache:
             if keys is not None and key not in keys:
                 continue
             found.add(key)
+            if (str(self.cache_dir.resolve()), key) in protected:
+                failed.append({"key": key, "code": "entry_busy"})
+                continue
             try:
                 size, _ = self._measure(folder)
                 shutil.rmtree(folder)

@@ -54,6 +54,9 @@ class ServiceConnections:
         self.last_destroyed = None
         self.operation = None
         self.loop = None
+        from .role_pool.reporting import attach_managed_service
+
+        self.managed = attach_managed_service(self)
 
     def query(self, *, reserve=True):
         with self.lock:
@@ -311,7 +314,7 @@ class ServiceConnections:
             ), 503
         return dict(success=True, state="quiesced", worker_group_id=group), 200
 
-    async def destroy(self, payload):
+    async def destroy(self, payload, *, abort=False):
         group = payload.get("worker_group_id") if isinstance(payload, dict) else None
         if not isinstance(group, str) or not group:
             raise ConnectionRejected(
@@ -334,18 +337,20 @@ class ServiceConnections:
             pending_quiesce = self.operation if self.state == "quiescing" else None
             if self.state in ("connected", "quiesced"):
                 self.state = "draining"
-                self.operation = asyncio.create_task(self._destroy(group))
+                self.operation = asyncio.create_task(self._destroy(group, abort=abort))
         if pending_quiesce is not None:
             result = await asyncio.shield(pending_quiesce)
             if result[1] != 200:
                 return result
-            return await self.destroy(payload)
+            return await self.destroy(payload, abort=abort)
         return dict(success=True, state="cleaning", worker_group_id=group), 202
 
-    async def _destroy(self, group):
+    async def _destroy(self, group, *, abort=False):
         try:
             with self.cleanup_guard():
-                await self._call(self.destroy_callback)
+                await self._call(
+                    self.rollback_callback if abort else self.destroy_callback
+                )
         except Exception:
             logging.exception("Worker group destruction failed")
             with self.lock:
@@ -427,9 +432,15 @@ def install_connection_routes(app):
             503,
         )
 
+    from .role_pool.native_http import install_managed_routes
+
+    install_managed_routes(app)
+
     @app.get("/get_connection_status")
     async def query(reserve: bool = True):
         controller = getattr(app.state, "worker_connections", None)
+        if controller is not None and controller.managed is not None:
+            return response(dict(code="MANAGED_CONTROL_REQUIRED"), 403)
         return (
             unavailable()
             if controller is None
@@ -440,6 +451,8 @@ def install_connection_routes(app):
         controller = getattr(app.state, "worker_connections", None)
         if controller is None:
             return unavailable()
+        if controller.managed is not None:
+            return response(dict(code="MANAGED_CONTROL_REQUIRED"), 403)
         try:
             payload = await request.json()
         except ValueError:

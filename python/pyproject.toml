@@ -216,6 +216,7 @@ killall_sglang = "sglang.cli.killall:main"
 [tool.setuptools.package-data]
 "sglang" = [
   "srt/**/*",
+  "multimodal_gen/runtime/realtime/whitebox/*.mjs",
   "kernels/**/*",
   "multimodal_gen/apps/realtime_webui/**/*"
 ]

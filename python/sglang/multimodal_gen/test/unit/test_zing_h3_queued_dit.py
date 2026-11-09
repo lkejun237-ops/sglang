@@ -134,11 +134,13 @@ class Harness:
         frames=13,
         *,
         joint_forward="off",
+        split_first_latent=True,
         defer_final=False,
         pooled_kv=False,
         **options,
     ):
         self.packer, self.inputs, _, _ = _long_request(model, [3, 2], frames)
+        self.packer.split_first_latent = split_first_latent
         device = next(model.parameters()).device
         self.inputs.positive = {
             k: v.to(device) for k, v in self.inputs.positive.items()
@@ -444,6 +446,91 @@ def test_control_backpressure_and_output_failure_release_state(model):
         assert h.worker.state.inputs is None and not h.bridge.buffered_latents
 
     asyncio.run(run())
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("split_first_latent", [False, True])
+def test_native_queue_uses_chunk_graphs_with_after_step0_eviction(
+    split_first_latent,
+):
+    from sglang.multimodal_gen.runtime.models.dits.zing_h3_denoise_graph import (
+        ZingChunkGraphs,
+    )
+    from sglang.multimodal_gen.test.unit.test_zing_h3_denoise_graph import (
+        RecordingGraphBackend,
+        _storage,
+    )
+
+    # The recording backend checks CPU replay semantics, so it must not add
+    # synthetic CUDA cases to the queue suite's approved hardware skip set.
+    model = model_fixture.__wrapped__().to("cpu")
+
+    class PooledHarness(Harness):
+        def sampler(self):
+            return ZingH3Sampler(
+                self.model,
+                self.packer,
+                solver="few_step",
+                denoising_step_list=[1000, 500],
+                window_chunks=3,
+                sink_chunks=1,
+                window_eviction_timing="after_step0",
+                rope_position_mode="block_relative",
+                joint_forward="cross_chunk",
+            )
+
+        def session(
+            self,
+            sampler,
+            inputs,
+            event=10,
+            version=1,
+            *,
+            defer_final=False,
+            pooled_kv=False,
+        ):
+            assert pooled_kv
+            storage = _storage(self.model)
+            return SourceReadySession(
+                sampler,
+                inputs,
+                seed=7,
+                max_pending_chunks=1,
+                max_pending_bytes=1 << 20,
+                acquire_storage=lambda *_: storage,
+                initial_prompt_event_id=event,
+                initial_prompt_version=version,
+                defer_final=defer_final,
+            )
+
+    def run(graphs):
+        model.chunk_graphs = graphs
+        torch.manual_seed(91)
+        h = PooledHarness(
+            model, frames=43, split_first_latent=split_first_latent, pooled_kv=True
+        )
+
+        async def request():
+            await h.prompt(10)
+            for start in range(0, 43, 5):
+                await h.source(start, min(start + 5, 43))
+                await h.drain_ready()
+            await h.put("source.end", latent_frames=43)
+            await asyncio.wait_for(h.worker.run(), 10)
+
+        asyncio.run(request())
+        assert h.worker.complete and h.worker.closed
+        assert not h.worker.state.draining and h.worker.state.inputs is None
+        assert not h.bridge.buffered_latents
+        return torch.cat([result.visual for result in h.results], 2)
+
+    expected = run(ZingChunkGraphs(capture_enabled=False))
+    backend = RecordingGraphBackend()
+    graphs = ZingChunkGraphs(backend=backend)
+    actual = run(graphs)
+    assert backend.captures > 0
+    assert graphs.routes[("finish", "replay")] > 0, graphs.routes
+    assert torch.equal(actual, expected)
 
 
 @torch.no_grad()

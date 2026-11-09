@@ -227,7 +227,14 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         return packs, float(host["position_ids"][target][0, 0]), chunks[-1].end
 
     def rebuild_prompt_prefix(
-        self, inputs, condition, visual_prefix, cache, *, restore_prefix=None
+        self,
+        inputs,
+        condition,
+        visual_prefix,
+        cache,
+        *,
+        restore_prefix=None,
+        reuse_prefix=False,
     ):
         """Replace all logical KV with a new condition and clean latent prefix."""
         prefix_inputs = copy(inputs)
@@ -236,10 +243,15 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         layout, chunks = self.processor.pack_prompt_switch_prefix(
             prefix_inputs, condition, visual_prefix
         )
-        cache.clear()
-        if restore_prefix is not None:
+        if reuse_prefix:
+            if restore_prefix is not None:
+                raise ValueError("Resident reuse cannot also restore a CPU prefix")
+            cache.reset_history_keep_prefix()
+        else:
+            cache.clear()
+        if not reuse_prefix and restore_prefix is not None:
             restore_prefix(cache)
-        elif bool((layout["block_idx"] == 0).any()):
+        elif not reuse_prefix and bool((layout["block_idx"] == 0).any()):
             self._forward(
                 self._select_block(layout, 0, phase="prefix", video_t=1.0, audio_t=1.0),
                 cache,

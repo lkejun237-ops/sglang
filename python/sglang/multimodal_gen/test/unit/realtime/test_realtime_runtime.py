@@ -1252,6 +1252,9 @@ def test_generate_loop_overlaps_send_with_next_generation(monkeypatch):
     events = []
 
     class _Adapter:
+        def is_control_work(self, session):
+            return False
+
         async def wait_for_next_chunk(self, session):
             del session
 
@@ -1467,17 +1470,46 @@ def test_async_raw_frame_enqueue_metric_reaches_chunk_telemetry_without_promethe
     assert sent_messages[0]["raw_frame_async_enqueue_ms"] == 1.25
 
 
-def test_local_loop_keeps_async_output_ownership_through_metric_observation():
-    source = inspect.getsource(realtime_video_api._generate_loop_local)
+def test_local_loop_cleans_owned_async_output_when_metric_observation_fails(
+    monkeypatch,
+):
+    from unittest.mock import AsyncMock, Mock
 
-    ownership = source.index("current_result = result")
-    observe = source.index("_observe_realtime_result_stage_metrics(result")
-    register_cleanup = source.index("pending_send_task.add_done_callback(")
-    # The progress-only branch also clears current_result, but transfers no
-    # output. Check the asynchronous send branch's actual ownership transfer.
-    send = source.index("pending_send_task = asyncio.create_task(", ownership)
-    transfer = source.index("current_result = None", send)
-    assert ownership < observe < register_cleanup < transfer
+    result = OutputBatch(raw_frame_shared_memory_ref={"path": "owned-reference"})
+    cancel = Mock()
+    monkeypatch.setattr(
+        realtime_video_api, "get_global_server_args", lambda: SimpleNamespace()
+    )
+    monkeypatch.setattr(
+        realtime_video_api,
+        "process_generation_batch",
+        AsyncMock(return_value=(None, result)),
+    )
+    monkeypatch.setattr(realtime_video_api, "_cancel_unconsumed_output_ref", cancel)
+    monkeypatch.setattr(
+        realtime_video_api,
+        "_observe_realtime_result_stage_metrics",
+        Mock(side_effect=RuntimeError("metric observer failed")),
+    )
+    session = GenerateSession()
+    session.set_request(
+        RealtimeVideoGenerationsRequest(type="init", prompt="walk", max_chunks=1)
+    )
+    session.adapter = SimpleNamespace(
+        wait_for_next_chunk=AsyncMock(),
+        prepare_conditioning=AsyncMock(),
+        is_control_work=lambda _: False,
+        prepare_next_request=lambda s, args, chunk: SimpleNamespace(
+            block_idx=chunk.index, request_id=chunk.request_id, condition_inputs={}
+        ),
+        session_ready_message=lambda _: {},
+    )
+    asyncio.run(
+        realtime_video_api._generate_loop_local(
+            SimpleNamespace(send_bytes=AsyncMock()), session
+        )
+    )
+    cancel.assert_called_once_with(result=result)
 
 
 def test_listen_generate_request_propagates_disconnect_without_error_write():

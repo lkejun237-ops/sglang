@@ -151,11 +151,9 @@ def _launch_server(server_args: ServerArgs, launch_http_server: bool = True):
 
     # Translate role lists from one snapshot of the caller's devices before
     # narrowing this process, so roles never depend on order.
-    # An independently launched DiT can select devices while both codec roles
-    # are external. It still needs the same mapping and pre-CUDA guard.
     if any(
-        getattr(server_args, role, None)
-        for role in ("encoder_gpus", "denoiser_gpus", "decoder_gpus")
+        getattr(server_args, name, None)
+        for name in ("encoder_gpus", "denoiser_gpus", "decoder_gpus")
     ):
         try:
             import torch
@@ -379,213 +377,43 @@ def launch_pool_disagg_server(
         )
     )
     if is_zing_streaming:
-        if len(getattr(server_args, "role_list", None) or ()) > 1:
-            raise ValueError("Multiple roles in role_list are not supported")
-
-        def _derive_denoiser_parallelism(base_args, dit_gpu_list):
-            n = len(dit_gpu_list)
-            tp = int(getattr(base_args, "tp_size", 1) or 1)
-            dp = int(getattr(base_args, "dp_size", 1) or 1)
-            cfg = int(getattr(base_args, "cfg_parallel_degree", 1) or 1)
-            ulysses = int(getattr(base_args, "ulysses_degree", 1) or 1)
-            ring = int(getattr(base_args, "ring_degree", 1) or 1)
-            if ulysses * ring * tp * dp * cfg != n:
-                if n == 1:
-                    ulysses, ring, sp = 1, 1, 1
-                else:
-                    denom = max(1, ring * tp * dp * cfg)
-                    if n % denom == 0:
-                        ulysses = n // denom
-                        sp = ulysses * ring
-                    else:
-                        ulysses, ring, sp = n, 1, n
-            else:
-                sp = ulysses * ring
-            return {
-                "num_gpus": n,
-                "ulysses_degree": ulysses,
-                "ring_degree": ring,
-                "sp_degree": sp,
-            }
-
-        # Legacy multi-DiT argument cloning; retained with its disabled launcher.
-        # def _apply_updates(target_args, updates):
-        # if dataclasses.is_dataclass(target_args):
-        # valid_fields = {
-        # f.name for f in dataclasses.fields(target_args) if f.init
-        # }
-        # filtered = {k: v for k, v in updates.items() if k in valid_fields}
-        # replaced = dataclasses.replace(target_args, **filtered)
-        # for k, v in updates.items():
-        # if k not in valid_fields:
-        # setattr(replaced, k, v)
-        # if hasattr(replaced, "_validate_disagg_gpu_roles"):
-        # replaced._validate_disagg_gpu_roles()
-        # return replaced
-        # import copy as _copy
-        #
-        # cloned = _copy.copy(target_args)
-        # for k, v in updates.items():
-        # setattr(cloned, k, v)
-        # return cloned
-        #
-        is_multi_pool = (
-            len(encoder_gpus or ()) > 1
-            or len(denoiser_gpus or ()) > 1
-            or len(decoder_gpus or ()) > 1
-        )
-        if is_multi_pool:
-            raise ValueError(
-                "The legacy shared-HTTP Zing pool launcher is disabled. "
-                "Start independent worker services and use HTTP worker groups."
-            )
-        if not is_multi_pool:
-
-            def _to_gpus_str(role_list):
-                if not role_list or not role_list[0]:
-                    return None
-                return ",".join(str(g) for g in role_list[0])
-
-            update_kwargs = {}
-            if encoder_gpus is not None:
-                update_kwargs["encoder_gpus"] = _to_gpus_str(encoder_gpus)
-            if denoiser_gpus is not None:
-                update_kwargs["denoiser_gpus"] = _to_gpus_str(denoiser_gpus)
-            if decoder_gpus is not None:
-                update_kwargs["decoder_gpus"] = _to_gpus_str(decoder_gpus)
-
-            if denoiser_gpus and denoiser_gpus[0]:
-                update_kwargs.update(
-                    _derive_denoiser_parallelism(server_args, denoiser_gpus[0])
+        for name, role_list in (
+            ("encoder_gpus", encoder_gpus),
+            ("denoiser_gpus", denoiser_gpus),
+            ("decoder_gpus", decoder_gpus),
+        ):
+            if role_list and len(role_list) > 1:
+                raise ValueError(
+                    f"Streaming Zing topology supports a single active session; "
+                    f"multiple {name} instances are not supported"
                 )
 
-            if dataclasses.is_dataclass(server_args):
-                valid_fields = {
-                    f.name for f in dataclasses.fields(server_args) if f.init
-                }
-                filtered_kwargs = {
-                    k: v for k, v in update_kwargs.items() if k in valid_fields
-                }
-                server_args = dataclasses.replace(server_args, **filtered_kwargs)
-                for k, v in update_kwargs.items():
-                    if k not in valid_fields:
-                        setattr(server_args, k, v)
-                if hasattr(server_args, "_validate_disagg_gpu_roles"):
-                    server_args._validate_disagg_gpu_roles()
-            else:
-                for k, v in update_kwargs.items():
-                    setattr(server_args, k, v)
-                if hasattr(server_args, "_validate_disagg_gpu_roles"):
-                    server_args._validate_disagg_gpu_roles()
+        def _to_gpus_str(role_list):
+            if not role_list or not role_list[0]:
+                return None
+            return ",".join(str(g) for g in role_list[0])
 
-            return launch_server(server_args, launch_http_server=launch_http_server)
+        update_kwargs = {}
+        if encoder_gpus is not None:
+            update_kwargs["encoder_gpus"] = _to_gpus_str(encoder_gpus)
+        if denoiser_gpus is not None:
+            update_kwargs["denoiser_gpus"] = _to_gpus_str(denoiser_gpus)
+        if decoder_gpus is not None:
+            update_kwargs["decoder_gpus"] = _to_gpus_str(decoder_gpus)
 
-        # Disabled legacy shared-HTTP multi-DiT launcher; keep the implementation.
-        # Its scheduler routing dropped the session owner before release completed
-        # and retried post-send timeouts on another DiT, risking incomplete cleanup
-        # and duplicate stateful execution. See scheduler_client.py and the worker
-        # Master documentation before considering re-enabling this path.
-        # caller_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-        # enc_dev_groups = [
-        # resolve_role_devices(",".join(str(g) for g in grp), caller=caller_visible)
-        # for grp in (encoder_gpus or [])
-        # if grp
-        # ]
-        # dec_dev_groups = [
-        # resolve_role_devices(",".join(str(g) for g in grp), caller=caller_visible)
-        # for grp in (decoder_gpus or [])
-        # if grp
-        # ]
-        # max_sessions = int(
-        # getattr(server_args, "disagg_max_sessions", None)
-        # or max(1, len(denoiser_gpus or ()))
-        # )
-        # if enc_dev_groups:
-        # server_args.encoder_gpus = ",".join(
-        # str(g) for grp in (encoder_gpus or []) for g in grp
-        # )
-        # if dec_dev_groups:
-        # server_args.decoder_gpus = ",".join(
-        # str(g) for grp in (decoder_gpus or []) for g in grp
-        # )
-        # role_processes = start_role_workers(
-        # server_args,
-        # encoder_devices=enc_dev_groups[0] if enc_dev_groups else None,
-        # decoder_devices=dec_dev_groups[0] if dec_dev_groups else None,
-        # encoder_device_groups=enc_dev_groups or None,
-        # decoder_device_groups=dec_dev_groups or None,
-        # max_sessions=max_sessions,
-        # )
-        # if role_processes:
-        # atexit.register(stop_role_workers, server_args, role_processes)
-    #
-    # all_processes = list(role_processes or [])
-    # base_port = int(getattr(server_args, "port", 30000) or 30000)
-    # base_sched = int(getattr(server_args, "scheduler_port", 31000) or 31000)
-    # base_master = int(getattr(server_args, "master_port", 32000) or 32000)
-    # dit_scheduler_ports = [
-    # base_sched + idx * 10 for idx in range(len(denoiser_gpus or []))
-    # ]
-    # if dit_scheduler_ports:
-    # server_args.scheduler_ports = list(dit_scheduler_ports)
-    # server_args.denoiser_scheduler_ports = list(dit_scheduler_ports)
-    #
-    # dit_processes = []
-    # for idx, dit_gpu_list in enumerate(denoiser_gpus or []):
-    # dit_gpus_str = ",".join(str(g) for g in dit_gpu_list)
-    # par_updates = _derive_denoiser_parallelism(server_args, dit_gpu_list)
-    # dit_updates = {
-    # **par_updates,
-    # "encoder_gpus": None,
-    # "decoder_gpus": None,
-    # "denoiser_gpus": dit_gpus_str,
-    # "disagg_encoder_port": getattr(
-    # server_args, "disagg_encoder_port", None
-    # ),
-    # "disagg_decoder_port": getattr(
-    # server_args, "disagg_decoder_port", None
-    # ),
-    # "disagg_encoder_ports": getattr(
-    # server_args, "disagg_encoder_ports", None
-    # ),
-    # "disagg_decoder_ports": getattr(
-    # server_args, "disagg_decoder_ports", None
-    # ),
-    # "disagg_max_sessions": max_sessions,
-    # "port": base_port + idx * 10,
-    # "scheduler_port": base_sched + idx * 10,
-    # "scheduler_ports": None,
-    # "master_port": base_master + idx * 10,
-    # }
-    # dit_args = _apply_updates(server_args, dit_updates)
-    # dit_devices = resolve_role_devices(dit_gpus_str, caller=caller_visible)
-    # assign_denoiser_visible_devices(dit_args, dit_devices)
-    # dit_procs = _launch_server(
-    # dit_args,
-    # launch_http_server=False,
-    # )
-    # if dit_procs:
-    # dit_processes.extend(dit_procs)
-    # all_processes.extend(dit_procs)
-    #
-    # if launch_http_server and dit_scheduler_ports:
-    # if getattr(server_args, "webui", False):
-    # http_server_process = mp.Process(
-    # target=_run_http_server_process,
-    # args=(server_args,),
-    # name="sglang-diffusion-webui",
-    # daemon=True,
-    # )
-    # http_server_process.start()
-    # all_processes.append(http_server_process)
-    # else:
-    # try:
-    # launch_http_server_only(server_args)
-    # finally:
-    # shutdown_scheduler_processes(server_args, dit_processes)
-    # stop_role_workers(server_args, role_processes)
-    # return all_processes
-    #
+        if denoiser_gpus and denoiser_gpus[0]:
+            update_kwargs["num_gpus"] = len(denoiser_gpus[0])
+
+        if dataclasses.is_dataclass(server_args):
+            server_args = dataclasses.replace(server_args, **update_kwargs)
+        else:
+            for k, v in update_kwargs.items():
+                setattr(server_args, k, v)
+            if hasattr(server_args, "_validate_disagg_gpu_roles"):
+                server_args._validate_disagg_gpu_roles()
+
+        return launch_server(server_args, launch_http_server=launch_http_server)
+
     configure_logger(server_args)
 
     num_encoders = len(encoder_gpus)

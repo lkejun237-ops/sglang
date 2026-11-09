@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
 from sglang.multimodal_gen.runtime.conditioning import native
 
 
@@ -20,9 +21,11 @@ def test_native_drains_selected_device_on_success_and_exception(monkeypatch, rai
     events = []
     encoder = object.__new__(native.NativeConditionEncoder)
     encoder.gpu_id, encoder.max_rows = 3, 10
+    encoder.max_prompt_tokens = None
     encoder.pipeline = SimpleNamespace(modules={}, zing_runtime={})
 
-    def encode(*args):
+    def encode(*args, **kwargs):
+        assert kwargs == {"max_prompt_tokens": None}
         events.append("encode")
         if raises:
             raise RuntimeError("private GPU error")

@@ -708,6 +708,7 @@ def test_legacy_multi_dit_pool_rejected_before_workers_start(
     topology = dict(encoder_gpus=[[0]], denoiser_gpus=[[1]], decoder_gpus=[[2]])
     topology[multiple_role + "_gpus"].append([3])
     with pytest.raises(
-        ValueError, match="legacy shared-HTTP Zing pool launcher is disabled"
+        ValueError,
+        match=f"single active session; multiple {multiple_role}_gpus instances",
     ):
         launcher.launch_pool_disagg_server(args, **topology)

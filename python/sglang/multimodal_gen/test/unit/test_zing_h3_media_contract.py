@@ -1910,9 +1910,11 @@ def test_unassigned_visual_media_rejected_before_qwen_or_vae(
     monkeypatch.setattr(codecs, "encode_condition", forbidden)
     with pytest.raises(
         ConditionError if external else ValueError,
-        match="Media normalization failed"
-        if external
-        else "target reference or source presentation",
+        match=(
+            "Media normalization failed"
+            if external
+            else "target reference or source presentation"
+        ),
     ):
         codecs.prepare(request, forbidden, conditioning=forbidden if external else None)
 
@@ -1923,6 +1925,37 @@ def test_request_cannot_claim_internal_source_origin(codecs, origin):
     request["messages"][0]["content"][1]["origin"] = origin
     with pytest.raises(ValueError, match="reserved for internal source presentation"):
         codecs._parse_inference_request(request)
+
+
+def test_native_960x540_s0_normalizes_only_condition_media_for_480_output(
+    codecs, monkeypatch
+):
+    from contextlib import nullcontext
+
+    codecs.max_short_edge = 480
+    codecs.max_area_config["source"] = 832 * 480
+    request = make_request("video", references=0, source=False)
+    request["messages"][1]["content"][0]["output"].update(width=832, height=480)
+    pixels = torch.full((3, 1, 540, 960), 17, dtype=torch.uint8)
+    preview = dict(
+        type="video", id="<Video 1>", frames=pixels, fps=24.0, clip=dict(start=0, end=0)
+    )
+    seen = []
+    monkeypatch.setattr(
+        codecs, "encode_condition", lambda prompt, media: seen.append(media) or {}
+    )
+    monkeypatch.setattr(
+        codecs,
+        "encode_visual",
+        lambda *_: pytest.fail("S0 must not enter reference/source VAE"),
+    )
+    result = codecs.prepare(request, lambda _: nullcontext(), source_preview=preview)
+    assert result.visual_shape[-2:] == (480 // 16, 832 // 16)
+    assert not result.conditions and result.source_visual is None
+    normalized = seen[0][0]
+    assert normalized["origin"] == "source_s0" and normalized["frames"].shape[1] == 1
+    assert normalized["frames"].shape[-2] * normalized["frames"].shape[-1] <= 832 * 480
+    assert pixels.shape == (3, 1, 540, 960) and torch.all(pixels == 17)
 
 
 @pytest.mark.parametrize(
@@ -1983,6 +2016,7 @@ def test_admission_copy_boundary_and_wire_pixels(monkeypatch, target, resize):
     if geometry is not None:
         expected = media_geometry._resize_frames(expected, *geometry.encoded_shape)
     session = SimpleNamespace(
+        peer=remote_encoder.EncoderPeer(),
         source_geometry=geometry,
         timeout=1,
         port=1,

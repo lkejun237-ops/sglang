@@ -1,0 +1,209 @@
+{
+  "evidence": "Actual WTP original room-content/create/admission producers and signed client; external SG transport mocked; no live media claim",
+  "requests": [
+    {
+      "action": "createRoom",
+      "cliFps": 24,
+      "createContext": {
+        "frozenPublication": {
+          "evidence": {
+            "archiveSha256": "07b9eb772e97b25e6ad89bb8e27fffc4972a95e11bdae92e5cdb9fd7fa5ff98a",
+            "receiptSha256": "5f9cfc35d4fe369b5b30d5fa05b905c333509a7896fec70c06033e090b217546"
+          },
+          "playConfiguration": {
+            "multiplayer": {
+              "maxPlayers": 2
+            },
+            "playMode": "multiplayer"
+          },
+          "publicationIdentity": {
+            "attempt": 1,
+            "manifestSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "publicationId": "p",
+            "renditionInputSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "sourceId": "s",
+            "sourceManifestSha256": "37f750ec49c83a68e177cccca1dd05f87e4c27235109b22545293433b78919c6",
+            "worldId": "w"
+          },
+          "runtime": {
+            "runtimeHash": "runtime",
+            "runtimeManifestSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "sourceSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "scope": "world-frozen-publication",
+          "status": "verified",
+          "world": {
+            "attempt": 1,
+            "platformRunId": "original-run",
+            "publicationId": "p",
+            "sdkRunId": "original-sdk-run",
+            "sourceId": "s",
+            "worldId": "w"
+          }
+        },
+        "operation": {
+          "kind": "createRoom",
+          "operationId": "op-88d754611cb190cbcd47d637322afa50c06ce7b2d8ad2721667d513ed010b43d",
+          "parametersSha256": "c39a7c7b26e9cfe1a7aa534bb0a93bfc7780a1d76c184c81108f663067976d9b",
+          "requestId": "original-room"
+        },
+        "schemaVersion": 1
+      },
+      "schemaVersion": 1,
+      "videoSpec": {
+        "fps": 24,
+        "height": 96,
+        "width": 160
+      }
+    },
+    {
+      "action": "admitPlayer",
+      "admission": {
+        "operationId": "op-5483860c56f99bf29cad01f0f8193a3fcf7a522a8911daad3f3c201bbf9cdf13",
+        "parametersSha256": "33522114c2eeec83a1348f76bff2513f18aef1611bac6a9fab486eb358d53aa5",
+        "requestId": "op-7019701cb80942cca2cae82c2cf51064a4d3eaf65ff05550e9ca16e2c8ab80fd"
+      },
+      "binding": {
+        "gameId": "c00506c6f264451197143b0c2cc7179e",
+        "ownerEpoch": "38c5aacf1d3149dbacc54a8bc4e7e229",
+        "publicationId": "p"
+      },
+      "mediaLaunch": {
+        "initMsgpackBase64": "iqR0eXBlpGluaXSod2hpdGVib3iDr3NjZW5lX3JlbmRlcmluZ4OpYW50aWFsaWFzwqV1bmxpdMKnc2hhZG93c8Kod29ybGRfaWShd6lzb3VyY2VfaWShc6Zwcm9tcHS5T3JpZ2luYWwgaW1tdXRhYmxlIHByb21wdKpyZWZlcmVuY2VzkKRzZWVkKqtyZW5kZXJfbW9kZah3aGl0ZWJveLZpbnB1dF9yZWNlaXB0X3Byb3RvY29srnN0YXRlLWRlbHRhLXYxsGNvbnRyb2xfcHJvdG9jb2yyd2hpdGVib3gtcmVuZGVyLXYysHNvdXJjZV9vcGVyYXRpb26mY3JlYXRlp3N0YXJ0dXCEqHByb3RvY29su3doaXRlYm94LXN0YXJ0dXAtcHJlcGFyZS12MqpyZXF1ZXN0X2lk2SBmZWU0ZGIyOGEyMDU0MWQxOGIzY2U4YTU1OTEzMjgxM6ZpbnRlbnSlbW9kZWyuaW5pdGlhbF9yZW5kZXKDpnByb21wdLlPcmlnaW5hbCBpbW11dGFibGUgcHJvbXB0pHNlZWQqqnJlZmVyZW5jZXOQ",
+        "publicationIdentity": {
+          "attempt": 1,
+          "manifestSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "publicationId": "p",
+          "renditionInputSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "sourceId": "s",
+          "sourceManifestSha256": "37f750ec49c83a68e177cccca1dd05f87e4c27235109b22545293433b78919c6",
+          "worldId": "w"
+        },
+        "transport": "webrtc-rtp"
+      },
+      "schemaVersion": 1
+    },
+    {
+      "action": "getAdmission",
+      "admission": {
+        "operationId": "op-5483860c56f99bf29cad01f0f8193a3fcf7a522a8911daad3f3c201bbf9cdf13",
+        "parametersSha256": "33522114c2eeec83a1348f76bff2513f18aef1611bac6a9fab486eb358d53aa5",
+        "requestId": "op-7019701cb80942cca2cae82c2cf51064a4d3eaf65ff05550e9ca16e2c8ab80fd"
+      },
+      "binding": {
+        "gameId": "c00506c6f264451197143b0c2cc7179e",
+        "ownerEpoch": "38c5aacf1d3149dbacc54a8bc4e7e229",
+        "publicationId": "p"
+      },
+      "mediaLaunch": {
+        "initMsgpackBase64": "iqR0eXBlpGluaXSod2hpdGVib3iDr3NjZW5lX3JlbmRlcmluZ4OpYW50aWFsaWFzwqV1bmxpdMKnc2hhZG93c8Kod29ybGRfaWShd6lzb3VyY2VfaWShc6Zwcm9tcHS5T3JpZ2luYWwgaW1tdXRhYmxlIHByb21wdKpyZWZlcmVuY2VzkKRzZWVkKqtyZW5kZXJfbW9kZah3aGl0ZWJveLZpbnB1dF9yZWNlaXB0X3Byb3RvY29srnN0YXRlLWRlbHRhLXYxsGNvbnRyb2xfcHJvdG9jb2yyd2hpdGVib3gtcmVuZGVyLXYysHNvdXJjZV9vcGVyYXRpb26mY3JlYXRlp3N0YXJ0dXCEqHByb3RvY29su3doaXRlYm94LXN0YXJ0dXAtcHJlcGFyZS12MqpyZXF1ZXN0X2lk2SBmZWU0ZGIyOGEyMDU0MWQxOGIzY2U4YTU1OTEzMjgxM6ZpbnRlbnSlbW9kZWyuaW5pdGlhbF9yZW5kZXKDpnByb21wdLlPcmlnaW5hbCBpbW11dGFibGUgcHJvbXB0pHNlZWQqqnJlZmVyZW5jZXOQ",
+        "publicationIdentity": {
+          "attempt": 1,
+          "manifestSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "publicationId": "p",
+          "renditionInputSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "sourceId": "s",
+          "sourceManifestSha256": "37f750ec49c83a68e177cccca1dd05f87e4c27235109b22545293433b78919c6",
+          "worldId": "w"
+        },
+        "transport": "webrtc-rtp"
+      },
+      "schemaVersion": 1
+    },
+    {
+      "action": "getPlayerMedia",
+      "controlSequence": 17,
+      "memberBinding": {
+        "admissionOperationId": "op-5483860c56f99bf29cad01f0f8193a3fcf7a522a8911daad3f3c201bbf9cdf13",
+        "gameId": "c00506c6f264451197143b0c2cc7179e",
+        "memberId": "e7b948f281c04e32b7db73020dcb3e4c",
+        "ownerEpoch": "38c5aacf1d3149dbacc54a8bc4e7e229",
+        "publicationId": "p"
+      },
+      "schemaVersion": 1
+    },
+    {
+      "action": "getPlayerMedia",
+      "memberBinding": {
+        "admissionOperationId": "op-5483860c56f99bf29cad01f0f8193a3fcf7a522a8911daad3f3c201bbf9cdf13",
+        "gameId": "c00506c6f264451197143b0c2cc7179e",
+        "memberId": "e7b948f281c04e32b7db73020dcb3e4c",
+        "ownerEpoch": "38c5aacf1d3149dbacc54a8bc4e7e229",
+        "publicationId": "p"
+      },
+      "schemaVersion": 1
+    },
+    {
+      "action": "leavePlayer",
+      "memberBinding": {
+        "admissionOperationId": "op-5483860c56f99bf29cad01f0f8193a3fcf7a522a8911daad3f3c201bbf9cdf13",
+        "gameId": "c00506c6f264451197143b0c2cc7179e",
+        "memberId": "e7b948f281c04e32b7db73020dcb3e4c",
+        "ownerEpoch": "38c5aacf1d3149dbacc54a8bc4e7e229",
+        "publicationId": "p"
+      },
+      "operation": {
+        "kind": "leave",
+        "operationId": "op-eff22b4dffeaeee6e694ba30fa72fc5a287db428796d8733c38d37c6fda7ecbb",
+        "parametersSha256": "59079bc6a811c4aafaec465ceb4504f464824a6bc348df7081c4c54db0ed8cc7",
+        "requestId": "op-e5151b52d97b7fefb00d41f19acbad8cafa8d587cc6cd4a5e80dca05fdf59be0"
+      },
+      "schemaVersion": 1
+    },
+    {
+      "action": "admitPlayer",
+      "admission": {
+        "operationId": "op-a196e5390996abd27828531d4959e6ecfa5490fbc60f6bf0e168e336cb201146",
+        "parametersSha256": "34b284213d42e7d9a8da54f4f172f781bd263deec6d981082d2956aa8eb3e9ea",
+        "requestId": "op-0b9e43b7dc039a9d700ae1f7dbdf69fafa8f5afbeb83eb8652d20f1005784d1e"
+      },
+      "binding": {
+        "gameId": "c00506c6f264451197143b0c2cc7179e",
+        "ownerEpoch": "38c5aacf1d3149dbacc54a8bc4e7e229",
+        "publicationId": "p"
+      },
+      "mediaLaunch": {
+        "initMsgpackBase64": "iqR0eXBlpGluaXSod2hpdGVib3iDr3NjZW5lX3JlbmRlcmluZ4OpYW50aWFsaWFzwqV1bmxpdMKnc2hhZG93c8Kod29ybGRfaWShd6lzb3VyY2VfaWShc6Zwcm9tcHS5T3JpZ2luYWwgaW1tdXRhYmxlIHByb21wdKpyZWZlcmVuY2VzkKRzZWVkKqtyZW5kZXJfbW9kZah3aGl0ZWJveLZpbnB1dF9yZWNlaXB0X3Byb3RvY29srnN0YXRlLWRlbHRhLXYxsGNvbnRyb2xfcHJvdG9jb2yyd2hpdGVib3gtcmVuZGVyLXYysHNvdXJjZV9vcGVyYXRpb26mY3JlYXRlp3N0YXJ0dXCEqHByb3RvY29su3doaXRlYm94LXN0YXJ0dXAtcHJlcGFyZS12MqpyZXF1ZXN0X2lk2SAyMDdhYzVhZmRlZDE0MzAxOWJmMDUxNmNhMmFiYzZhMqZpbnRlbnSlbW9kZWyuaW5pdGlhbF9yZW5kZXKDpnByb21wdLlPcmlnaW5hbCBpbW11dGFibGUgcHJvbXB0pHNlZWQqqnJlZmVyZW5jZXOQ",
+        "publicationIdentity": {
+          "attempt": 1,
+          "manifestSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "publicationId": "p",
+          "renditionInputSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "sourceId": "s",
+          "sourceManifestSha256": "37f750ec49c83a68e177cccca1dd05f87e4c27235109b22545293433b78919c6",
+          "worldId": "w"
+        },
+        "transport": "webrtc-rtp"
+      },
+      "schemaVersion": 1
+    },
+    {
+      "action": "getPlayerMedia",
+      "memberBinding": {
+        "admissionOperationId": "op-a196e5390996abd27828531d4959e6ecfa5490fbc60f6bf0e168e336cb201146",
+        "gameId": "c00506c6f264451197143b0c2cc7179e",
+        "memberId": "e7b948f281c04e32b7db73020dcb3e4c",
+        "ownerEpoch": "38c5aacf1d3149dbacc54a8bc4e7e229",
+        "publicationId": "p"
+      },
+      "schemaVersion": 1
+    },
+    {
+      "action": "leavePlayer",
+      "memberBinding": {
+        "admissionOperationId": "op-a196e5390996abd27828531d4959e6ecfa5490fbc60f6bf0e168e336cb201146",
+        "gameId": "c00506c6f264451197143b0c2cc7179e",
+        "memberId": "e7b948f281c04e32b7db73020dcb3e4c",
+        "ownerEpoch": "38c5aacf1d3149dbacc54a8bc4e7e229",
+        "publicationId": "p"
+      },
+      "operation": {
+        "kind": "leave",
+        "operationId": "op-0e1c7ed694ea62e259f142d0a56bd45a6fe68bfdc8c7045c5dd4598e812d3f64",
+        "parametersSha256": "1957aa09578dcfc6080e11ee1c43ae8b7a700b6c6c4e625f675f4414025fad31",
+        "requestId": "op-ae1a9696a9fd19583d882a47e6667b25bf802b08616d13020ff2bb9fad94addb"
+      },
+      "schemaVersion": 1
+    }
+  ]
+}

@@ -4,6 +4,9 @@
 import math
 from dataclasses import asdict, dataclass
 
+from sglang.multimodal_gen.configs.zing_h3_media_geometry import (
+    validate_h3_media_geometry,
+)
 from sglang.multimodal_gen.configs.zing_media import ZING_SOURCE_RESIZE
 
 SOURCE_RESIZE_VERSION = "h3-lanczos-v1"
@@ -96,11 +99,8 @@ def _select_h3_bucket(
     # 每条媒体独立选桶，候选始终不得超过自身原始尺寸。
     if min(height, width, multiple, max_short_edge, max_area) < 1:
         raise ValueError("H3 media geometry and max_area must be positive")
+    validate_h3_media_geometry(height, width, multiple=multiple)
     source_ratio = width / height
-    if not 0.25 <= source_ratio <= 4.0:
-        raise ValueError(
-            f"H3 supports image/video aspect ratios in [1:4,4:1], got {width}:{height}"
-        )
     candidates = set()
     max_height = min(height, max_area // multiple)
     for bucket_h in range(multiple, max_height + 1, multiple):

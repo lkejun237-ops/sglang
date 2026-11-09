@@ -1,0 +1,825 @@
+---
+title: "World model context admission"
+description: "Trusted Worldkit context preparation, original render journal submission, and verification boundaries."
+---
+
+This candidate extends the `white_box` baseline `bc1e5d18f6c2c176c507164ce4a5db057fb3958f`.
+It consumes `worldkit-model-context-v1`. Source changes do not publish a runtime,
+deploy a model, or authorize a GPU workload.
+
+## Owners and startup
+
+`CLIView` reads the existing authenticated control connection. Its bounded
+`CLIConditionChannel` worker processes context controls and exact native frame
+samples. `LocalRoomEngine` binds the handler to its original engine, including
+`MemberEngine`; a changed member, source, or logical consumer epoch is rejected.
+Direct browser prompt replacement, asset upload, and member input remain rejected.
+Player text uses the instruction relay below; it never becomes a second model writer. A declared
+context owner may request `render.context.start` through the authenticated member
+admission and ordered command queue. The original journal validates source scope,
+render revision and lifecycle-only fields; the command accepts no prompt, images
+or seed. It reserves a new identity only after the previous segment is terminal,
+its model resources are released, and its original condition operations have a
+known applied, failed or rejected result. Initial-condition execution uses the
+original `model_context_execution` evidence; the start operation's outer EOS is
+not application evidence. An unresolved result rejects with
+`RENDER_TRANSITION_IN_PROGRESS` inside the journal transaction, preserving the
+old reservation, revision and query identity. The next trusted full condition
+owns init; EOS and model errors never restart a segment automatically.
+After an explicit successor reservation and verified release of the previous
+context segment, that next trusted condition enables the existing bounded
+capacity admission wait, capped by the protocol's 10,000 ms limit. This covers
+the interval before a released worker's heartbeat reports its free slot. Initial
+context admission remains fail-fast; unknown release cannot reserve a successor.
+The wait keeps the original model-session/generation identity and cancellation
+cleanup, and does not retry a model commit or create another segment.
+
+Normal `render.end` freezes admission and unsent prompt dispatch at the original
+source-send boundary. It keeps source frames available for an already dispatched
+prompt for at most the configured `drain_seconds`, waiting for actual model output
+or a definite model rejection. This wait shares the existing stop deadline of
+`drain_seconds + 10` seconds, including acquisition of the dispatch lock; it does
+not extend the total cleanup bound. A blocked normal-end dispatch lock rejects
+with `RENDER_TRANSITION_IN_PROGRESS` before admission. The wait runs as one tracked
+control task, keeping the ordered Room command queue responsive to status,
+explicit cancel and source close. Identical pending requests share that wait;
+conflicting reuse of its request ID is rejected. Explicit cancel bypasses the
+lock and can terminate the blocked sender. A pending normal end revalidates its
+original revision at admission, so an intervening cancel rejects it as stale.
+Queued but unsent updates follow the existing `never_applied` stop settlement.
+Explicit
+cancel and model failure do not wait. On timeout, a sent update retains its
+original request/version as `SEGMENT_ENDED_UNCONFIRMED`; neither end nor restart
+fabricates application, failure or `never_applied` for that unknown execution.
+
+Explicit manual inference disable immediately switches to whitebox display,
+suspends new context admission and marks an active segment `draining`, preventing
+queued updates from being dispatched. If a prompt update was already dispatched,
+its source frames remain available until its original output/rejection settles,
+for at most `drain_seconds + 10` seconds. The same window first crosses the
+original source-send lock: a sender may already hold it while awaiting the model
+wire, before setting `pending_prompt`. An empty pending slot before that barrier
+is not proof that no request can be dispatched. Source frames remain available
+until the barrier and original outcome settle; a blocked barrier expires into
+normal child cancellation, preserving unsent versus unknown evidence. This
+condition-switch allowance is separate from the existing child-stop/release timeout; the shorter tail-only
+`drain_seconds` is insufficient for a real clip-barrier prompt switch. Failure
+cleanup still cancels immediately. Unsent updates settle as `never_applied`;
+expired dispatched updates remain unknown and continue to block a successor.
+Neither switching off nor verified compute release proves prompt application.
+The inference state stays `stopping` until child cleanup completes; a normal
+settled update can then be followed by an explicit re-enable on a fresh segment.
+
+`SourceSession` discovers the pinned descriptor before launching `PlayStartup`.
+A declared model-context source closes its **unlaunched** legacy preparation and
+waits for the first complete condition commit. This also applies to a trusted
+member source. An undeclared source launches its original `PlayStartup` once after
+source discovery. Opening the source before model admission changes startup
+parallelism; this candidate has no measured TTFF or startup latency result.
+The enclosing Room retains its existing admission and cleanup ownership.
+Closing legacy preparation preserves the original model display intent and
+startup request ID, but does not advertise its obsolete asset preparation path.
+The model wait budget runs until the current segment has actual decodable output;
+whitebox preview frames do not spend the model playback budget. The validated
+startup seed, or ordinary source init seed without a startup request, remains
+source-owned and is reused for explicit new segments. Conditions supply no seed.
+
+The existing `RenderJournal` reserves the segment, model-session and generation
+identities before subscription. First commit uses those same identities and
+allocates prompt version 1. Updates use the original journal CAS to allocate the
+next version. An already active manually controlled segment is not silently
+converted, replaced or restarted.
+
+## Player text instruction relay
+
+A declared source advertises `session.ready.capabilities.model_context` as
+`worldkit-model-context-v1` and `model_context_instruction: true`. Its initial
+`model_context_segment` contains the reserved `segment_id` and `segment_epoch`,
+including before the first model condition commits. Reattached ready messages and
+`source.status` read the current reservation rather than reusing the initial
+segment. Legacy sources keep their existing browser prompt/reference startup.
+
+The browser uses the existing scoped `command` envelope with either
+`op: "model.context.intervention"` or `op: "model.context.intervention.get"`.
+Both require `request_id`, `source_session_id`, `source_epoch`, `segment_id` and
+`segment_epoch`. A write additionally carries `expectedRevision` and `prompt`
+(plain text or `null` to clear). Unknown fields, including CLI consumer identities,
+references and image payloads, reject before transport. The same ordered queue
+admits these operations for an authenticated declared member source; its original
+input, asset and direct prompt restrictions remain in force.
+
+`SourceSession` validates the current journal scope and original Room/member
+engine before forwarding, and repeats those fences before publishing the reply.
+`CLIConditionChannel` sends only the current authenticated connection's epoch,
+subscribed `consumerEpoch`, current segment and original browser request ID:
+
+```json
+{
+  "type": "model.context.intervention",
+  "epoch": 1,
+  "consumerEpoch": "current-consumer-epoch",
+  "segmentId": "current-segment",
+  "requestId": "player-instruction-1",
+  "expectedRevision": 0,
+  "prompt": "Use cinematic lighting."
+}
+```
+
+The get request uses the same identities and omits `expectedRevision` and `prompt`.
+The Host owns bounded request deduplication, revision comparison, persistent
+instruction state, complete game-plus-instruction compilation and combined prompt
+budgets. The relay does not create a render journal operation or allocate a
+`promptVersion`. Game configuration remains the picture owner.
+
+CLI results use `model.context.intervention.result`, echo the four camel-case
+identities and contain `status`, `revision`, `prompt` and optional ASCII `code`.
+The relay checks that exact scope and emits the same event type to the browser,
+with its original `request_id`, source identity, `segment_id` and `segment_epoch`.
+Statuses are `accepted`, `duplicate`, `conflict`, `rejected` or `current`.
+`accepted` confirms the instruction state only; model `applied` and actual Player
+visibility remain separate evidence. This path makes no `visible` acknowledgement.
+
+An initial read waits for CLI subscription confirmation within the ten-second
+request budget. At most 16 requests can await replies. Timeout, reconnect,
+suspension and close release their waiters with the existing friendly
+`CONTROL_UNAVAILABLE` error. Late or mismatched results cannot update a later
+request. Lost replies never trigger an automatic write replay: the browser reads
+current state after reconnect, and an intentional retry retains the original ID.
+New source/consumer/segment identities cannot receive a previous scope's write.
+
+## Opt-in Prompt diagnostics on the test route
+
+A test Room with `WHITEBOX_PROMPT_DEBUG=1` advertises support in
+`session.attached`. The Player settings switch subscribes or unsubscribes on the
+current RTC connection without reconnecting. The `promptDebug=1` link parameter
+sets the initial switch state. The panel shows the compiled CLI Prompt, condition
+receipt and reference numbers. The same Room serves a selected reference as binary
+image data after checking its condition and SHA-256.
+
+The Room creates its debug queue only after the current authenticated RTC
+connection subscribes. Unsubscribe drops that connection’s queue and reference
+lookup. Without a subscription it does not serialize debug
+conditions or read debug reference bytes. Debug messages stay out of media,
+recordings and the control replay buffer.
+
+## Late Player UI replay
+
+A source may produce native captures before the Player attaches. For the existing
+`state-delta-v1` input-receipt negotiation, Room history replaces only adjacent,
+recognized `whitebox.states` capture observations that carry no new UI or input
+intent. The live subscriber still receives every control; the original source
+recording is written before replay compaction and remains complete.
+
+Only empty UI event sets or validated `ui.clock` observations qualify. Source,
+media generation, presentation, SDK/UI revision, dimensions, view, compiled model
+condition, latest input and display must match. Native frame/time, model control
+cursors and UI clocks must advance monotonically; a backward observation remains
+visible even after a subsequent clock recovers. Empty and clock-bearing runs are
+separate. Snapshot, commit, reset, new receipt, input change, business control,
+unknown field and malformed payload always preserve a replay boundary. Repeated
+latest input is an observation of an already accepted input, not a new action;
+its full value participates in the equality check.
+
+Replay retains original increasing control sequence IDs, including gaps for
+superseded observations. Resuming after such a cursor returns the retained latest
+observation. Actual byte-budget eviction still advances the existing history
+floor and rejects a cursor below it. Legacy clients, live controls, model journals,
+UI budgets and the wire protocol are unchanged.
+
+The owning CPU regressions cover a 700-capture startup burst, live/original input
+preservation, business and identity boundaries, malformed/backward clocks, receipt
+retention, resumed cursors and real byte-budget eviction. Both these tests and the
+existing receipt-delta tests run in the maintained AREA gate. Real Player
+acceptance additionally checks UI loading and actual viewport paint; received
+model bytes or an applied model receipt alone do not establish presentation.
+
+## Trusted member purpose selection
+
+The private Room member file keeps ordinary `session` and optional `modelSession`
+connections. `read_member_session(..., purpose="model-source")` selects the latter
+for internal member capture and resume. It resolves the current descriptor using
+the SDK's authenticated `readSession`, checks the original Room/player/render
+binding, and fails with `ROOM_MODEL_SESSION_REQUIRED` when a declared context has
+no model connection. An undeclared legacy source retains its ordinary transport.
+A model-purpose connection cannot be rewritten for a public origin.
+
+Model capture uses the existing spectator path because its capability has no input
+lease. `RoomMemberView.player_descriptor` retains the separate ordinary connection,
+validated against the same session, epoch, player binding and media identity.
+`PlayerTransport` authenticates public browser control and pixels against that
+ordinary descriptor; it rejects the model token as a browser relay credential.
+`public_session` explicitly selects the viewer purpose. Neither public responses
+nor model descriptors contain the private Room bootstrap token.
+
+For a member model attachment, `session.ready.engine.artifact` identifies the
+admission's frozen `mediaLaunch.publicationIdentity`, including its publication
+hashes and optional attempt. `MemberSource` projects that verified identity onto
+its borrowed model engine. The original SDK Room and player engine retain their
+archive hashes; session, epoch and player binding stay unchanged. An archive hash
+set cannot substitute for a publication identity: the public Player rejects it
+with `WHITEBOX_PUBLICATION_CHANGED`. The member media regression checks the model
+wire and the unchanged SDK archive owner together. Single-player engines do not
+use this projection.
+
+The original SDK player channel remains the input owner. Declared model capture
+rejects direct SG source input through the existing browser-owned-input contract;
+it does not open an extra controller connection. Undeclared local CLI input keeps
+its original path. A missing or rotated model capability cannot fall back to the
+ordinary player's permissions.
+
+## Prepare, commit and receipts
+
+`source_conditions.py` validates fixed identity, full prompt, ordered image
+closure and the SDK's UTF-8 netstring payload hash. Its shared fixture is
+`python/sglang/multimodal_gen/test/unit/realtime/fixtures/model-context-v1.json`.
+The fixture hash is
+`942c607049638bd272f79e0c9bff40b9baed6f445c207149cfacde339570b165`.
+Prompt strings containing a lone UTF-16 surrogate reject with
+`MODEL_CONTEXT_PROTOCOL_INVALID` before hashing or preparation; valid Unicode
+keeps its original UTF-8 bytes and UTF-16 code-unit length limit.
+
+Preparation asynchronously reads each scoped resource from the final trusted
+session/relay descriptor's same-origin resource route. It uses that descriptor's
+Bearer token, does not follow redirects, bounds each response, checks SHA-256,
+and uses `SourceAssets` for decoded image format, pixel and storage budgets.
+Only completion of the entire set emits `prepared`; it has no model version.
+The Whitebox H3 owner also checks fixed reference geometry using the same pure
+validation as the H3 media processor. Images smaller than its model grid or outside
+the supported 1:4 to 4:1 aspect-ratio range reject with `CONDITION_INVALID` before
+`prepared`, preserving the applied journal condition. Valid images need not be
+grid-aligned; their immutable bytes and hashes stay unchanged, and the processor
+still selects its bucket under runtime area/edge budgets. CPU admission does not
+import PyTorch or invoke a model.
+Downloads do not block the control socket or its input/UI messages.
+Once an asset commit starts, preparation cancellation is deferred until its image
+and metadata commit finish under the same resource lock. Withdrawal control still
+returns immediately and emits no `prepared` for the withdrawn condition. Repeated
+cancellation cannot release the lock early. Disk images publish by atomic rename,
+and failed writes remove their
+temporary files, so a later candidate can safely reuse or retry the same image.
+The adapter owns every outstanding preparation, including withdrawn uploads whose
+atomic commit still runs after a successor starts. Close awaits all of them
+before source asset memory is released. A queued receipt still awaiting transport
+cannot create a preparation after close.
+
+### Optional startup prewarm
+
+Room enables startup prewarm with `WHITEBOX_MODEL_CONTEXT_PREWARM=1`. It requires
+an explicit single-player inference start, bound compute, and an active Host
+subscription advertising `worldkit-model-context-prewarm-v1`.
+
+Room sends a window over the authenticated source control channel. Each window
+can start one candidate on the original model binding. Room waits up to five
+seconds for the decision, verified references, capture, and compute. The
+original startup deadline also bounds the wait. If compute reaches that
+window deadline, Room cancels the child and checks release before preparing the
+formal condition. Unconfirmed release fails the opening.
+
+Room pins one native capture that meets both conditions. Capture and World input
+continue while the child runs. The formal condition remains queued and can be
+withdrawn. After successful cleanup, its prepared receipt can include the
+exact capture marker as `startupEffective`. Host recompiles the current
+condition before accepting that marker. Room verifies the marker at commit and
+passes the pinned frame to the original render start. If the committed boundary
+has moved past the pinned frame, render start selects its normal first frame.
+Same-segment updates keep the original prompt submission path.
+
+A reserved successor after genuine segment release can open a new window.
+The original journal authorizes that handoff. Candidate preparation never
+creates a new segment.
+
+Managed single-player RTC clients opt in to prewarm observation on their
+current connection generation. Room advertises only the observation protocol
+acknowledged by the actual source subscription. A static CLI descriptor or an
+empty plan store is not proof that the sealed World supports plans. When manual
+inference starts after attachment, the source may negotiate late; Room then adds
+the scoped capability fields to the existing `source.status` message. The retained
+source store preserves that protocol and evidence through inference-off and
+same-source reconnect. Player subscribes to that one channel and rejects an
+ambiguous dual advertisement without failing playback.
+
+Room retains a bounded summary of the current window, then replays it when the
+observer attaches. Observations stay out of
+the required-control history and give way when the attachment queue is full.
+Preparation and persistence report separately. A formal cache result requires
+the journal request for a same-segment update with matching condition content,
+plus the actual worker cache receipt for its prompt version. Player compares
+its key with the preparation key to confirm reuse.
+
+CPU suites use a simulated Worker to verify the bound child, pinned capture,
+release, same-segment prompt update and scoped observer receipt. A real model
+session is needed to measure actual cache hits and visual impact.
+
+
+#### Negotiated candidate plans
+
+`worldkit-model-context-prewarm-plan-v1` is an independent Host capability.
+The authenticated native descriptor declares `prewarmPlanProtocol`; the active
+subscription separately acknowledges the same literal. Room then
+sends `model.context.prewarm.plan.window`; old Hosts retain the single-candidate
+window above. A reconnect that loses plan capability cannot replay plan facts.
+The strict SDK contract owns the wire schema; the shared fixture is
+`python/sglang/multimodal_gen/test/unit/realtime/fixtures/prewarm-plan-v1.json`.
+
+Dynamic member plans reuse the original member admission, source epoch, control
+grant and view. They require manual inference and the authenticated descriptor.
+A paused capability probe cannot authorize compute. The active subscription must
+acknowledge the plan before the startup gate opens. Frozen `memberPrefill` keeps
+its signed allowlist and still rejects dynamic World conditions.
+
+Each member owns its own plan and pinned frame. `start_startup` never calls the
+shared World's capture hold/resume. Other members continue simulation, inputs
+and capture while one member waits or cancels. Existing member checks fence
+source replacement and leaving; original retirement still owns source closure.
+Historical candidate inputs remain immutable. The selected F0 must satisfy the
+captured condition and formal condition boundaries; formal startup reuses that
+exact frame. Later formal events compile current state and may miss the cache.
+Member plan observations use the same source, consumer and connection generation.
+They do not advertise multiplayer `first-presented` or grant browser compute.
+
+One plan retains up to 32 unique business IDs; each entry is immutable. Entries carry compiled
+conditions and their original references. Room resolves each entry with the
+existing resource validator. All entries reuse the first verified F0 and the
+same model binding. Room calls the existing `ControlPrefill.start_startup` one
+entry at a time; native child release must finish before the next entry starts.
+No Worker cache algorithm or cache-key input changes.
+
+The Host supplies `budgetMs` (default 10000, maximum 120000) and `waitFor`
+(`memory-ready` or `persisted`). Room measures the budget from the original
+window opening and clamps it to the opening deadline, retaining cleanup margin.
+A missing initial decision waits at most five seconds. Repeated messages neither
+restart the budget nor create a new native request. Zero budget dispatches no
+work; an empty zero-budget plan completes explicitly.
+
+Appendable plans require the independent
+`prewarmAppendProtocol: worldkit-model-context-prewarm-append-v1` in both the
+trusted native descriptor and active subscription. Room echoes it in
+`plan.window`. Only then may the Host send initial `mode: "appendable"`.
+Fixed plans omit `mode` and still finish when the queue drains. An appendable
+empty queue waits on a change event until append, finish or the original deadline.
+It never polls, extends the budget, selects a new F0 or changes the pinned seed.
+
+`plan.append` carries the same envelope, window and plan identity, a new
+`decisionRevision`, and 1–32 complete compiled entries. It has no new budget.
+Batch validation precedes mutation; duplicate IDs and a history exceeding 32
+entries reject the entire batch. Cancelled entries still count. Rejected controls
+do not overwrite earlier results or finish the original plan. Each appended item
+receipt retains its append revision. Reconnection replays the initial plan and
+ordered controls; Room compares bounded canonical message digests by revision.
+Exact replay dispatches nothing; conflicting revision content fails validation.
+Finish and deadline return `skipped/window-closed` for valid late append entries;
+these identities also count toward the bounded history. Permission and Worker fences remain active
+at receipt and asynchronous preparation boundaries. CPU tests cover this contract;
+GPU cache hit rate and visual behavior remain unverified for this extension.
+
+`plan.cancel` invalidates one entry. `plan.finish` stops new dispatches and
+cancels/drains the active child. Both retain earlier compute facts. A timeout or
+finish skips remaining entries; a verified per-entry failure may continue the
+queue. Unknown cleanup fails the startup gate with `RELEASE_UNKNOWN`.
+Plan replacement within a window is unsupported. The Host finishes the previous
+plan; a fresh preparation window owns the next plan and deadline.
+
+Every item receipt retains plan, candidate and original native request identity.
+`memory-ready` completes one compute, while `finished` closes the plan gate.
+Late `persisted` and `persistence-failed` remain associated with their original
+item, including an invalidated item. Disk failure and an expired persistence wait retain earlier memory-ready facts and
+cache keys. A `skipped` budget receipt is stored separately from compute and disk
+results; it ends the wait without declaring disk failure. Late disk results remain valid. A changed Worker binding rejects replay and late callbacks.
+The frozen plan condition owns candidate admission and the pinned F0. A subsequent
+formal condition may replace the initial one within the same source and segment. A new lifecycle cannot reuse
+the prior lifecycle’s F0; its formal preparation selects the eligible source frame. Its own preparation, request identity, Worker and native cleanup checks
+still gate render start; replacing it never retargets the frozen plan.
+The current formal condition and journal still own the eventual render start;
+finishing a plan does not commit a gameplay event or claim first presentation.
+
+Player observation uses the independent capability
+`model_prewarm_plan_observation: worldkit-model-prewarm-plan-v1`. Clients subscribe
+with `{version:2,type:"model.context.prewarm.plan.observe"}`. Events use
+`model.context.prewarm.plan.observation`, the existing source/connection/window
+scope, plus `plan_id`, `plan_revision`, `candidate_id` and `candidate_revision`.
+The Room retains separate prepare, intent and persistence facts for at most 32
+items. Replays preserve all items without including prompts or references.
+An actual formal `model.cache` receipt counts once per journal request, even if
+several business entries compiled to identical input. Readiness is never a hit.
+
+CPU tests cover fixed F0, serial dispatch, cancellation, deadline, cleanup,
+replay, Worker fencing and late persistence. They do not establish native GPU
+cache hits, persistence latency, eviction behavior or visible first frames.
+No production/default Room deployment accompanies this source change.
+
+
+A condition commit fixes the original identity, payload hash and native source
+boundary. The original render journal owns request deduplication, conflict
+rejection, prompt versions, and query results. A lost reply queries that same
+operation; it does not create a retry request. Withdrawal cancels preparation
+only. Committed work is reconciled rather than cancelled. `accepted` is original
+journal admission; `applied` is observed model output. Initial condition execution evidence stays
+in the original start operation independently of segment lifetime: a later EOS,
+cancellation or failure cannot undo already proven application. Reconciliation
+preserves and verifies the original request ID and prompt version when supplied.
+The adapter never claims the general `visible` phase. The opening
+presentation receipt below has its own scope and capability.
+
+Normal journal admission retains its 1024-operation count limit. At count
+saturation, one extra bounded record is available only to `render.end`, so content
+history cannot block the final stop. Duplicate ends return the same original
+operation, and a second new end cannot grow the journal further. Existing request
+history and the journal byte limit remain unchanged. A new source gets its own
+journal rather than clearing the exhausted source's history.
+
+A definite, non-retryable submission error without an original journal operation
+emits `rejected` and frees the candidate for a new condition. Replaying or querying
+that candidate retains its rejection reason and allocates no request or version.
+The journal is queried before classifying a submission error: an operation already
+admitted by CAS remains authoritative even when the reply failed. Transport and
+retryable errors without an operation remain `unknown`, including duplicate commit
+and reconciliation; they do not resubmit or report `queued`.
+
+### Opening model presentation
+
+Managed single-player RTC can negotiate
+`worldkit-model-context-first-presented-v1`. The Player sends the literal in
+`rtc.offer.model_context_first_presented`. Room echoes it on the attachment
+before the Host is active, so a Player can enable inference later. Frame offers
+wait for an active Host subscription with the same `firstPresentedProtocol`.
+An opted-in World declares the literal in its pinned model context descriptor.
+Room rejects manual inference enable with `MODEL_PRESENTATION_UNSUPPORTED` if
+the current Player attachment did not negotiate it. Room also checks both
+capabilities before submitting the opening condition. Ordinary Worlds retain
+the existing startup path.
+
+Room adds a short opaque `first_presentation_offer` to exact model RTP frame
+metadata. It uses the current applied and accepted condition, native source
+frame, synchronized HUD revision and active display. An updated condition may
+replace an opening condition before display. Each attachment retains at most
+128 offers, each valid for three seconds from mapping. The browser confirms
+only after presenting the matching model pixels and HUD. It sends
+`model.context.presentation.confirm` with the offer, connection generation,
+HUD revision and original Room command scope. Whitebox and stale offers cannot
+confirm an opening. A stale offer can be replaced by fresh mapped evidence.
+
+Room persists the confirmation against the original condition operation.
+The Host receives `model.condition.receipt` with phase `first-presented` and
+the condition's committed lifecycle. A same-segment prompt change keeps
+the original confirmation eligible for reconciliation within that lifecycle.
+Room accepts the browser command after validating its offer. It completes the
+operation when the Host accepts the original request and condition, or confirms
+it as a duplicate. Host `stale` or `history-unavailable` rejects that operation
+and allows a newer applied condition to try. A new lifecycle requires a newly
+applied condition. Retries use bounded background work on the original source
+channel and never hold media delivery. If the Host reply stays unknown, Room
+reports failure on the original browser operation and permits fresh evidence for
+the same condition. The authoritative game still owns the decision to begin play.
+
+Disabling inference or changing the lifecycle before the Host acknowledges
+rejects the pending browser confirmation with `MODEL_PRESENTATION_STALE`, even
+when delivery has already become ineligible. A late success cannot complete that
+confirmation. Settlement retains the original request and condition identity;
+it does not undo the condition's proven `applied` result.
+
+Source-control reconnection temporarily clears delivery capability while the
+same consumer resubscribes. This does not invalidate the original confirmation:
+Room retains it within the existing bounded retry budget and replays it once
+capability returns. An exhausted budget fails an otherwise current confirmation
+with `MODEL_PRESENTATION_UNCONFIRMED`, permitting fresh evidence for the same
+condition. Success still requires negotiated capability and the current identity.
+
+Final journal settlement has three background attempts, with one- and two-second
+retry delays. Each attempt retains the original browser confirmation ID and
+rechecks its journal result, including a write whose reply was lost. It cannot
+settle a newer confirmation for the same condition. If storage remains
+unavailable, the result stays unknown; a later `operation.get` for the accepted
+confirmation rearms bounded background reconciliation without admitting another
+model condition or delaying the status response.
+
+The implementation is a paired release candidate. CPU tests cover offer
+expiry, replacement and receipt replay. Paired browser validation, including
+delayed first display with synchronized HUD, and real-model acceptance remain
+pending.
+
+### Native reset requires explicit inference retry
+
+An authenticated native `source.reset` must pass the existing monotonic SDK
+source-epoch checks before it retires the previous model-context consumer.
+The Room first invalidates any active startup prewarm window synchronously,
+before its source checks and receipt writer become stale. This suppresses old
+preparation feedback without rewriting a pre-existing cleanup failure; the
+original prewarm task still owns bounded child cleanup and release. The independent
+retirement task selects SDK preview delivery so fresh whitebox pixels do not wait
+for a retired model mapping. When startup has no segment yet, it cancels the old
+enable waiter and uses ordinary disable/release before exposing explicit retry.
+Unknown release and a previous retirement failure still block recovery.
+Manual opening ownership does not depend on a prewarm object or an empty
+`current_segment`: reset also retires binding startup and a journal-admitted
+successor while an old terminal pointer remains. An already reserved, unstarted
+successor is reused only after the original segment is terminal and released.
+Enable requests retain the native source generation observed before their journal
+CAS; a reset during receipt/status delivery rejects late dispatch through the
+original inference journal. New enables wait for retirement outside the inference
+lock. Cleanup display writes compare the retired inference revision and source
+generation, preserving newer accepted intent even before dispatch. Original
+explicit disable/cleanup remains available after a failed retirement.
+Original generation is also checked when an enable resumes after binding/prewarm
+waits and immediately before successor subscription. Preview sending runs
+independently of owner cleanup; a blocked transport cannot restore retired model
+admission or retain its resources. Native-reset cleanup relies on its independent
+preview sender and never repeats a blocking preview send before settling the
+original command; ordinary disable keeps its pause/drain ordering. Cleanup failure
+wins over simultaneous preview failure, and cancellation collects the preview task.
+Native-reset recovery status uses the source's existing owned control task, rather
+than gating retirement on its outgoing queue. Close can stop the outgoing reader
+while reset is pending; original cleanup still completes, and source teardown
+collects the pending notification. Unknown release continues to quarantine the
+original resource. Non-reset recovery retains its ordered status path.
+Retired opening tasks retain their original inference request ID and revision.
+Retirement settles that command through the original journal before returning,
+including when release is unknown; the original cleanup error still wins.
+Already terminal commands retain their outcome, and revision CAS preserves newer
+accepted intent. Only result/status delivery runs in the existing owned control
+task, so a full outgoing queue cannot hold cleanup open. A terminal
+`operation.result` lets Player remove the original pending configure command;
+this control result does not resolve unknown model application or resource release.
+The Room immediately fences old model delivery and retires its adapter on an
+independent task; the shared SDK control reader continues processing preview UI
+and input. Retired adapters cannot emit receipts into the new source generation.
+Handoff retains its original source generation across adapter cleanup and sample
+retirement waits. A retired control task cannot reinstall its adapter or advance
+the new source cursor, checkpoint or acknowledgement.
+The control worker also retains each dequeued item's source generation. After
+retirement, a late failure cannot reject a fresh subscription probe or suspend
+the new source. Same-generation identity and resource-release errors retain
+their original handling.
+Preparation completion observes task exceptions when releasing task ownership.
+An exact stale-source rejection is expected after retirement and cannot emit into
+the successor; other preparation task failures remain visible in server logs.
+The original journal retains its admission and execution outcomes. Reset alone
+cannot resolve an unknown application. Before explicit retry, the original
+segment must finish cancellation and report a terminal state with resources
+confirmed released (or never allocated). The journal then records
+`model_context_retirement` for unresolved operations in that segment and its
+older SDK source epoch. Retirement and successor admission share the same
+execution-outcome predicate: applied, failed, rejected or cancelled application
+needs no exemption, even when the start operation's outer lifecycle has ended.
+Confirmed historical records stay unchanged; proof growth follows unresolved
+work instead of the full history. Existing journal limits, reserved cleanup
+headroom and original CAS remain unchanged.
+Unknown application stays unknown; applied results stay applied. This retirement
+allows a fresh SDK source to start without replaying the old request. Missing
+release evidence, mismatched source/segment, and ordinary cancellation without an
+authenticated source reset still block recovery under the original journal guard.
+
+Reset does not enable inference. A subsequent explicit enable waits for original
+adapter retirement, replaces the old control/media transport, and requests a new
+paused subscription before opening delivery with a fresh consumer and adapter.
+Ordinary subscription acknowledgements still reject unexpected consumer changes;
+a transport reconnect alone never resets logical condition history. CPU tests
+cover reset/retry ordering and stale receipt isolation; browser and real-model
+acceptance remain separate checks.
+
+### Uncertain submission blocks the source candidate
+
+If awaited submission raises a transport error or a retryable error such as
+`CONTROL_UNAVAILABLE`, and the subsequent original-journal query finds no
+operation, the adapter retains the candidate as `committed`. Its receipt is
+`unknown`, without a fabricated `requestId` or `promptVersion`. The exception
+handler does not log a separate submission failure or emit a terminal receipt.
+Replaying the same condition, committing it again, withdrawing it, or reconciling
+it queries the same identity and keeps returning `unknown` while the operation
+is absent. This blocks the entire per-consumer source candidate, including
+unrelated later game conditions; it does not block only the failed field.
+
+The Host may still accept a manual text instruction and advance its instruction
+revision while this candidate is unresolved. That `accepted` result records
+instruction state only. The newly compiled game-plus-instruction condition
+cannot pass the blocked candidate, so the result proves neither delivery nor
+model application. After channel suspension, new intervention requests instead
+fail with `CONTROL_UNAVAILABLE` until explicit recovery.
+
+A different condition presented to the blocked adapter raises
+`MODEL_CONTEXT_BACKPRESSURE`. The channel worker logs `Model context control
+failed`, suspends model delivery, requests `model.context.preview`, and publishes
+`context_recovery_required` with that code through `SourceSession`. Whitebox
+preview continues. Do not diagnose the initial missing-operation case from a
+terminal failure receipt: its evidence is the original `unknown` receipt, the
+candidate identity and the original journal query; the backpressure log appears
+only if a later control actually hits the blocked candidate.
+
+This preserves safety against duplicate model commits and invented application
+results, but sacrifices liveness: repeated reconciliation cannot resolve a
+permanently absent operation. A transport reconnect retains the same adapter and
+candidate; it is not a reset or a resubmission. Recovery first queries the
+original journal and uses any genuine admission or execution evidence that
+arrives there. An original `accepted` result identifies admission but does not
+release the candidate; original `applied`, `failed` or `rejected` outcomes release
+it in place. An explicit successor segment additionally requires the previous
+segment to be terminal, its resources released and the Host's committed
+candidate settled; `render.context.start` cannot manufacture that settlement,
+and recorded unknown execution rejects with `RENDER_TRANSITION_IN_PROGRESS`.
+
+If no original operation ever becomes available, this implementation has no
+automatic in-place recovery. Close the source through its normal owner, complete
+its model/lease cleanup, and explicitly open a fresh source lifecycle with new
+identities to resume. Keep the old journal as unresolved evidence; opening a new
+source does not prove that the old condition failed or was `never_applied`.
+Do not clear the candidate, mint a retry identity, blindly resubmit, or convert
+the missing query into `failed`, `rejected` or `never_applied`.
+
+### Reference capacity
+
+References are complete ordered sets; `[]` clears them. The adapter may omit the
+legacy update's references only when the ordered set is unchanged. A changed set
+requires the negotiated clip barrier and reference-update capability, otherwise
+preparation rejects with `REFERENCE_UPDATE_UNSUPPORTED`. No automatic model or
+segment replacement is performed. Initial reference capacity is the configured
+`WHITEBOX_INITIAL_REFERENCE_CAPACITY` (default 20) before model negotiation.
+Later conditions obey the selected model's negotiated capacity. The separate
+`WHITEBOX_DEFAULT_REFERENCE_CAPACITY` (default 3) remains the routing threshold
+for `WHITEBOX_LARGE_REFERENCE_MODEL_REVISION` and the normal-model clamp; raising
+initial admission must not send a large reference set to the normal-model route.
+Preparation enforces the smaller of the protocol ceiling of 21 images and the
+current model reference capacity. The declared context capability does not
+advertise that model-specific capacity, so a Creator-side total budget of at
+most 21 images does not guarantee admission by a model with a lower limit.
+
+## Source boundaries and recovery
+
+Native `FrameIdentity` remains untouched. The CLI channel gates pixels against
+exact sample identity, snapshot metadata and contiguous context controls.
+`desired: null` carries execution-only state and creates no frame mapping.
+Checkpoint recovery consumes its original condition and journal queries;
+committed queries never recreate an absent model operation. ACK and disconnect
+carry the independently subscribed logical `consumerEpoch`. A recovery floor
+retires exact old sample identities in a bounded set and wakes pending readers.
+The native CLI reader discards those in-flight pixels and returns their credit
+only within the same media generation and transport. A held frame from an old
+socket cannot replenish the replacement socket's independently granted window.
+An unmatched pixel still waits for its exact sample; the barrier does not guess
+its identity or admit it without proof.
+
+A newly joined native pixel socket may consume one credit replaying the broker's
+retained packet. Only its first packet may repeat the last delivered complete
+`FrameIdentity` exactly. The reader retains one immutable identity, discards that
+bootstrap before model/UI admission, and returns its consumed credit without
+advancing the source clock. Same-socket duplicates, a second bootstrap duplicate,
+and any changed or regressed identity retain the ordinary rejection rules.
+
+When you close a source, its capture stages are cancelled and drained before the
+borrowed CLI context channel closes. A pending sample wait therefore cannot turn
+normal cancellation or completion into `MODEL_CONTEXT_STALE_SOURCE` failure during
+segment teardown. Active source-identity errors still fail their original stage;
+engine and archive cleanup failures still propagate through the existing owners.
+
+An explicit player finish also wakes pending CLI media and context-sample reads
+before retiring their channel. Both native-pixel and legacy readers terminate
+normally without waiting for another socket packet. A model child ending during
+this requested player shutdown does not publish `MODEL_UNAVAILABLE`; unexpected
+active child termination and independent transport/reset errors keep their
+existing failure paths. Already completed control-task errors are checked before
+the finish signal can convert a pending read to normal EOF. This includes reset,
+producer failure and control-transport failure arriving in the same event-loop
+turn as finish. A completed media transport failure also survives cancellation
+of its capture waiter, including cancellation during waiter cleanup; an ordinary
+`ConnectionClosedOK` remains a graceful finish. `RoomPipeline._run` stops consuming on `session.completed`
+and closes the original owner. A test consumer that keeps reading after that
+terminal message can mistake teardown cancellation for a source failure and is
+not an equivalent exit test. Source completion and verified model/SDK cleanup
+must still be checked separately.
+
+Host model errors, invalid model controls and model-control backpressure suspend
+only the model route. The recovery callback fences model publishing before waking
+pending sample readers; whitebox pixels continue without invented context mapping.
+The channel reports a bounded ASCII code and requests preview mode on the same
+connection. The consumed control cursor and original journal remain authoritative
+for an explicit lifecycle recovery.
+
+Initial subscription and subscription after a transport reconnect share a
+30-second confirmation budget. Expiry reports
+`MODEL_CONTEXT_SUBSCRIPTION_TIMEOUT` through the existing
+`context_recovery_required` status and suspends only model delivery. The source
+keeps producing preview pixels without model-context sample metadata; late
+subscription messages cannot reopen model admission. Control-stream failures,
+source termination and caller cancellation retain their original behavior and
+are not classified as model subscription timeouts. Explicit lifecycle recovery
+still uses the original journal and fixed identities. Waiting for a mapped native sample also observes the same control task: a source reset or terminal control result wins before that sample can release pixels. The sample's own deadline and caller cancellation remain unchanged.
+
+Control sequences span segment handoff. Consumed replay records first validate
+their immutable source/consumer identity and then deduplicate; old-segment
+records neither replace the current adapter nor query through it. An unconsumed
+record must still match the current or explicitly requested segment. A sequence
+gap requests the missing prefix before changing adapters or retiring samples.
+
+`SegmentSource`, `RenderSegment._condition_controls`, and
+`SourceSession.before_segment_source` compare the native source session,
+presentation, SDK epoch, source frame/time and simulation tick. Their existing
+selection owner supplies the actual model `min_source_frame`; a CLI frame number
+is never copied into it. Later updates wait for evidence of initial model output.
+
+After an update is proven `never_applied`, a new complete trusted condition uses
+the original journal's current applied version as its recovery base inside the
+same CAS that allocates its next accepted version. Failed versions remain in the
+original history, and their onset occurrences are not replayed. Legacy manual
+prompt commands still require an explicit matching `base_applied_prompt_version`.
+The ordered reference comparison also returns to the last applied image set, so
+a fresh complete condition resends images from a failed replacement when needed.
+
+## Verification and limits
+
+CPU tests also cover the actual browser-command/CLI-channel relay, all reply
+statuses, strict scope and result fields, first-subscription ordering, timeout
+without write replay, reconnect/close cleanup, member ordered admission and
+Room-engine replacement. These cases and the existing source-condition tests are
+registered in the maintained AREA CPU gate.
+
+CPU tests cover shared Unicode bytes/hash, preparation/withdrawal, image hashes,
+ordered image replacement and empty clears, conflicts and original query replay,
+complete-condition recovery after a definite prompt failure, terminal admission
+rejection, uncertain commit reconciliation, post-CAS reply failure,
+logical epoch rejection, exact samples, checkpoint restoration, final relay auth,
+redirect refusal, and the actual CLI/Room binding. A real SourceSession and
+RenderSegment with the existing CPU mock model prove init, applied version 1,
+ordered update, applied version 2, one model lease and final release.
+Existing startup/member tests retain cancellation, fallback and cleanup checks;
+source-first test synchronization follows descriptor discovery. Regression tests
+also exercise model-only error degradation with an in-flight pixel, bounded queue
+backpressure, replay and gaps across segment handoff, member admission through the
+actual ordered queue, withdrawn upload cleanup, close during a queued receipt,
+startup ready/display metadata, model wait/play accounting, and nondefault seed
+retention through both initial and explicit post-EOS model initialization.
+End/restart regressions cover a dispatched prompt settling during bounded drain,
+timeout/cancel preserving unknown, the dispatch-lock race, late readiness that
+must not reopen admission, and initial/update uncertainty rejecting a restart
+without changing the original journal identity. A real in-memory coordinator
+also proves explicit restart across a verified-release/busy-heartbeat interval,
+wait cancellation cleanup, initial capacity fail-fast and unknown-release fencing.
+
+The paired SDK supplies the member model-purpose capability. Focused tests execute
+the helper subprocess with the actual SDK parser and authenticated session read,
+plus real local control/pixel relay sockets. Those tests cover purpose selection,
+missing capabilities, current private credentials, binding checks, spectator
+startup, ordinary browser input and rejection of model credentials at public relay.
+They do not alone establish combined SDK member/browser/model acceptance.
+The opt-in `test_whitebox_room_real_cli.py` case `trusted-model-members` uses
+`WHITEBOX_TEST_CLI_SDK` to select a locally installed compatible SDK checkout;
+its sealed Room, authority/replica and native capture are real. By default model
+workers and the local MemberEngine registry bridge are CPU fixtures. The gate
+seals a 128×128 PNG with the Creator archive and verifies its authenticated CLI
+resource read, SHA-256, image decode, prompt picture index, and rejection of the
+ordinary player credential. The image must satisfy H3's non-upscaling geometry
+buckets; a 1×1 resource is valid transport data but is not a valid H3 reference.
+The CPU variant verifies both players' private prompts and independent segments.
+
+Set `WHITEBOX_TEST_GPU_COORDINATOR_URL` and
+`WHITEBOX_TEST_GPU_MODEL_REVISION` to opt into the existing GPU service. Run where
+the coordinator-advertised worker endpoint is reachable. This variant uses one
+832×480 model view, original fenced session/generation leases and real model
+output. It verifies initial application, a later required occurrence, the original
+applied request/version and the SDK-authored confirmation. Actual model init and
+prompt-update inputs are retained with text/reference hashes: the later applied
+prompt must keep both independent persistent slots and the original picture order.
+The gate then checks two-player public pixel relay/isolation and complete cleanup.
+The native pixel client uses
+the production wire budget. Cleanup requires confirmed worker release first;
+capacity also includes the last five-second heartbeat, so the gate waits at most
+ten seconds for that separate observation to converge.
+
+The earlier event/context GPU gate passed with its paired SDK runtime and existing
+model service; this establishes the event/context feedback loop, not visual
+quality or the 480/736 performance matrix. It does not deploy or restart a model.
+The extended real-CLI gate also exercises instruction write, duplicate and conflicting
+ID reuse, stale revision, two-consumer isolation in CPU mode, actual CLI transport
+reconnect/read and null clear. It waits for original journal application of the
+complete prompt before claiming model application; GPU mode additionally checks
+the actual model wire. This new instruction coverage must be rerun against the
+frozen paired SDK before it is treated as current real-model evidence. The manual
+gate is skipped unless `WHITEBOX_TEST_CLI_SDK` is explicitly supplied.
+The torch-importing worker boundary case remains unavailable in the CPU-only
+environment and is not counted as passing.
+
+Run the owning CPU tests with `SGLANG_LIGHTWEIGHT_RUNTIME=1 PYTHONPATH=python` and
+`python -m pytest --confcutdir=python/sglang/multimodal_gen/test/unit/realtime`.
+Select `test_whitebox_source_conditions.py`, the existing render/control/CLI
+contracts, and startup/member lifecycle tests. The only unavailable worker case
+is `test_worker_prompt_boundary_includes_admitted_prefetch`; do not stub torch
+or alter production imports to manufacture a pass.
+
+### Pending-pixel snapshot retention
+
+The CLI condition channel retains each snapshot mapping referenced by an admitted,
+unconsumed sample, together with its latest mapping. Control progress only evicts
+unused history. If all bounded entries are still referenced, it reports
+`MODEL_CONTEXT_BACKPRESSURE`; it never silently discards a pixel's identity proof
+or replaces it with the latest context. Normal pixel consumption makes the old
+mapping eligible for retirement; explicit checkpoint/empty-state barriers retain
+their existing sample retirement semantics.
+
+
+## Scoped GPU regression record
+
+The [2026-10-31 acceptance record](https://github.com/seedleap/sglang/blob/codex/world-model-harness-20261030/benchmark/whitebox/MODEL-CONTEXT-20261031.md)
+contains exact SDK/SGLang overlay hashes, WTP/delivery/model identities,17-stage
+composition, accepted-result loss, failed-reference rearming, withdrawn late IO,
+blocked end/cancel/reentry, and a340.05s single-lease run with8043 output frames.
+It labels private fixtures, the earlier180s budget termination and unmeasured
+480/736/per-stage performance. Those historical GPU results predate the current
+Prefill merge; they do not establish GPU acceptance of that merged path, formal
+external Console playback or shared online deployment.

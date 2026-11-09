@@ -1,0 +1,658 @@
+{
+  "messages": [
+    {
+      "protocol": "worldkit-model-context-v1",
+      "source": {
+        "sessionId": "session",
+        "epoch": 1,
+        "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "worldId": "world",
+        "sourceEpoch": "world-epoch",
+        "presentationId": "presentation",
+        "sdkEpoch": 1
+      },
+      "audience": {
+        "consumerId": "consumer",
+        "consumerEpoch": "consumer-epoch",
+        "playerId": "player",
+        "viewId": "view"
+      },
+      "segmentId": "segment",
+      "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "compilerVersion": 1,
+      "windowId": "plan-window",
+      "type": "model.context.prewarm.plan.window",
+      "openingRevision": 1,
+      "remainingMs": 10000
+    },
+    {
+      "protocol": "worldkit-model-context-v1",
+      "source": {
+        "sessionId": "session",
+        "epoch": 1,
+        "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "worldId": "world",
+        "sourceEpoch": "world-epoch",
+        "presentationId": "presentation",
+        "sdkEpoch": 1
+      },
+      "audience": {
+        "consumerId": "consumer",
+        "consumerEpoch": "consumer-epoch",
+        "playerId": "player",
+        "viewId": "view"
+      },
+      "segmentId": "segment",
+      "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "compilerVersion": 1,
+      "windowId": "plan-window",
+      "decisionRevision": 1,
+      "planId": "plan-1",
+      "planRevision": 1,
+      "type": "model.context.prewarm.plan",
+      "budgetMs": 10000,
+      "waitFor": "memory-ready",
+      "entries": [
+        {
+          "lifecycle": {
+            "lifecycleId": "visit",
+            "generation": 1
+          },
+          "prompt": "\u5929\u4f7f arrives \ud83d\ude00\n\"rain\"",
+          "references": [
+            {
+              "alias": "angel",
+              "picture": 1,
+              "format": "png",
+              "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+              "resource": {
+                "sessionId": "session",
+                "epoch": 1,
+                "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "compilerVersion": 1,
+                "resource": "angel",
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+              }
+            },
+            {
+              "alias": "hero",
+              "picture": 2,
+              "format": "png",
+              "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+              "resource": {
+                "sessionId": "session",
+                "epoch": 1,
+                "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "compilerVersion": 1,
+                "resource": "hero",
+                "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+              }
+            }
+          ],
+          "id": "opening",
+          "candidateRevision": 1,
+          "eventId": "opening",
+          "targetHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "contentHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "effective": {
+            "sourceFrameId": 1,
+            "sourceTimeUs": 1000,
+            "simulationTick": 1,
+            "policy": "at-or-after"
+          }
+        },
+        {
+          "lifecycle": {
+            "lifecycleId": "visit",
+            "generation": 1
+          },
+          "prompt": "\u5929\u4f7f arrives \ud83d\ude00\n\"rain\"",
+          "references": [
+            {
+              "alias": "angel",
+              "picture": 1,
+              "format": "png",
+              "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+              "resource": {
+                "sessionId": "session",
+                "epoch": 1,
+                "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "compilerVersion": 1,
+                "resource": "angel",
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+              }
+            },
+            {
+              "alias": "hero",
+              "picture": 2,
+              "format": "png",
+              "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+              "resource": {
+                "sessionId": "session",
+                "epoch": 1,
+                "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "compilerVersion": 1,
+                "resource": "hero",
+                "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+              }
+            }
+          ],
+          "id": "choice",
+          "candidateRevision": 1,
+          "eventId": "opening",
+          "targetHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "contentHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "effective": {
+            "sourceFrameId": 1,
+            "sourceTimeUs": 1000,
+            "simulationTick": 1,
+            "policy": "at-or-after"
+          }
+        }
+      ]
+    },
+    {
+      "protocol": "worldkit-model-context-v1",
+      "source": {
+        "sessionId": "session",
+        "epoch": 1,
+        "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "worldId": "world",
+        "sourceEpoch": "world-epoch",
+        "presentationId": "presentation",
+        "sdkEpoch": 1
+      },
+      "audience": {
+        "consumerId": "consumer",
+        "consumerEpoch": "consumer-epoch",
+        "playerId": "player",
+        "viewId": "view"
+      },
+      "segmentId": "segment",
+      "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "compilerVersion": 1,
+      "windowId": "plan-window",
+      "decisionRevision": 2,
+      "planId": "plan-1",
+      "planRevision": 1,
+      "type": "model.context.prewarm.plan.cancel",
+      "id": "choice",
+      "candidateRevision": 1,
+      "reason": "AUTHOR_CANCELLED"
+    },
+    {
+      "protocol": "worldkit-model-context-v1",
+      "source": {
+        "sessionId": "session",
+        "epoch": 1,
+        "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "worldId": "world",
+        "sourceEpoch": "world-epoch",
+        "presentationId": "presentation",
+        "sdkEpoch": 1
+      },
+      "audience": {
+        "consumerId": "consumer",
+        "consumerEpoch": "consumer-epoch",
+        "playerId": "player",
+        "viewId": "view"
+      },
+      "segmentId": "segment",
+      "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "compilerVersion": 1,
+      "windowId": "plan-window",
+      "decisionRevision": 3,
+      "planId": "plan-1",
+      "planRevision": 1,
+      "type": "model.context.prewarm.plan.finish",
+      "reason": "AUTHOR_FINISHED"
+    },
+    {
+      "protocol": "worldkit-model-context-v1",
+      "source": {
+        "sessionId": "session",
+        "epoch": 1,
+        "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "worldId": "world",
+        "sourceEpoch": "world-epoch",
+        "presentationId": "presentation",
+        "sdkEpoch": 1
+      },
+      "audience": {
+        "consumerId": "consumer",
+        "consumerEpoch": "consumer-epoch",
+        "playerId": "player",
+        "viewId": "view"
+      },
+      "segmentId": "segment",
+      "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "compilerVersion": 1,
+      "windowId": "plan-window",
+      "decisionRevision": 1,
+      "planId": "plan-1",
+      "planRevision": 1,
+      "type": "model.context.prewarm.plan.result",
+      "id": "opening",
+      "candidateRevision": 1,
+      "phase": "accepted",
+      "requestId": "original"
+    },
+    {
+      "protocol": "worldkit-model-context-v1",
+      "source": {
+        "sessionId": "session",
+        "epoch": 1,
+        "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "worldId": "world",
+        "sourceEpoch": "world-epoch",
+        "presentationId": "presentation",
+        "sdkEpoch": 1
+      },
+      "audience": {
+        "consumerId": "consumer",
+        "consumerEpoch": "consumer-epoch",
+        "playerId": "player",
+        "viewId": "view"
+      },
+      "segmentId": "segment",
+      "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "compilerVersion": 1,
+      "windowId": "plan-window",
+      "decisionRevision": 1,
+      "planId": "plan-1",
+      "planRevision": 1,
+      "type": "model.context.prewarm.plan.result",
+      "id": "opening",
+      "candidateRevision": 1,
+      "phase": "computing",
+      "requestId": "original"
+    },
+    {
+      "protocol": "worldkit-model-context-v1",
+      "source": {
+        "sessionId": "session",
+        "epoch": 1,
+        "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "worldId": "world",
+        "sourceEpoch": "world-epoch",
+        "presentationId": "presentation",
+        "sdkEpoch": 1
+      },
+      "audience": {
+        "consumerId": "consumer",
+        "consumerEpoch": "consumer-epoch",
+        "playerId": "player",
+        "viewId": "view"
+      },
+      "segmentId": "segment",
+      "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "compilerVersion": 1,
+      "windowId": "plan-window",
+      "decisionRevision": 1,
+      "planId": "plan-1",
+      "planRevision": 1,
+      "type": "model.context.prewarm.plan.result",
+      "id": "opening",
+      "candidateRevision": 1,
+      "phase": "memory-ready",
+      "requestId": "original"
+    },
+    {
+      "protocol": "worldkit-model-context-v1",
+      "source": {
+        "sessionId": "session",
+        "epoch": 1,
+        "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "worldId": "world",
+        "sourceEpoch": "world-epoch",
+        "presentationId": "presentation",
+        "sdkEpoch": 1
+      },
+      "audience": {
+        "consumerId": "consumer",
+        "consumerEpoch": "consumer-epoch",
+        "playerId": "player",
+        "viewId": "view"
+      },
+      "segmentId": "segment",
+      "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "compilerVersion": 1,
+      "windowId": "plan-window",
+      "decisionRevision": 1,
+      "planId": "plan-1",
+      "planRevision": 1,
+      "type": "model.context.prewarm.plan.result",
+      "id": "opening",
+      "candidateRevision": 1,
+      "phase": "persisted",
+      "requestId": "original"
+    },
+    {
+      "protocol": "worldkit-model-context-v1",
+      "source": {
+        "sessionId": "session",
+        "epoch": 1,
+        "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "worldId": "world",
+        "sourceEpoch": "world-epoch",
+        "presentationId": "presentation",
+        "sdkEpoch": 1
+      },
+      "audience": {
+        "consumerId": "consumer",
+        "consumerEpoch": "consumer-epoch",
+        "playerId": "player",
+        "viewId": "view"
+      },
+      "segmentId": "segment",
+      "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "compilerVersion": 1,
+      "windowId": "plan-window",
+      "decisionRevision": 1,
+      "planId": "plan-1",
+      "planRevision": 1,
+      "type": "model.context.prewarm.plan.result",
+      "id": "opening",
+      "candidateRevision": 1,
+      "phase": "persistence-failed",
+      "requestId": "original",
+      "reason": "DISK_WRITE_FAILED"
+    },
+    {
+      "protocol": "worldkit-model-context-v1",
+      "source": {
+        "sessionId": "session",
+        "epoch": 1,
+        "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "worldId": "world",
+        "sourceEpoch": "world-epoch",
+        "presentationId": "presentation",
+        "sdkEpoch": 1
+      },
+      "audience": {
+        "consumerId": "consumer",
+        "consumerEpoch": "consumer-epoch",
+        "playerId": "player",
+        "viewId": "view"
+      },
+      "segmentId": "segment",
+      "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "compilerVersion": 1,
+      "windowId": "plan-window",
+      "type": "model.context.prewarm.plan.window",
+      "openingRevision": 1,
+      "remainingMs": 10000,
+      "prewarmAppendProtocol": "worldkit-model-context-prewarm-append-v1"
+    },
+    {
+      "protocol": "worldkit-model-context-v1",
+      "source": {
+        "sessionId": "session",
+        "epoch": 1,
+        "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "worldId": "world",
+        "sourceEpoch": "world-epoch",
+        "presentationId": "presentation",
+        "sdkEpoch": 1
+      },
+      "audience": {
+        "consumerId": "consumer",
+        "consumerEpoch": "consumer-epoch",
+        "playerId": "player",
+        "viewId": "view"
+      },
+      "segmentId": "segment",
+      "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "compilerVersion": 1,
+      "windowId": "plan-window",
+      "decisionRevision": 1,
+      "planId": "plan-1",
+      "planRevision": 1,
+      "type": "model.context.prewarm.plan",
+      "budgetMs": 10000,
+      "waitFor": "memory-ready",
+      "entries": [
+        {
+          "lifecycle": {
+            "lifecycleId": "visit",
+            "generation": 1
+          },
+          "prompt": "\u5929\u4f7f arrives \ud83d\ude00\n\"rain\"",
+          "references": [
+            {
+              "alias": "angel",
+              "picture": 1,
+              "format": "png",
+              "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+              "resource": {
+                "sessionId": "session",
+                "epoch": 1,
+                "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "compilerVersion": 1,
+                "resource": "angel",
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+              }
+            },
+            {
+              "alias": "hero",
+              "picture": 2,
+              "format": "png",
+              "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+              "resource": {
+                "sessionId": "session",
+                "epoch": 1,
+                "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "compilerVersion": 1,
+                "resource": "hero",
+                "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+              }
+            }
+          ],
+          "id": "opening",
+          "candidateRevision": 1,
+          "eventId": "opening",
+          "targetHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "contentHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "effective": {
+            "sourceFrameId": 1,
+            "sourceTimeUs": 1000,
+            "simulationTick": 1,
+            "policy": "at-or-after"
+          }
+        },
+        {
+          "lifecycle": {
+            "lifecycleId": "visit",
+            "generation": 1
+          },
+          "prompt": "\u5929\u4f7f arrives \ud83d\ude00\n\"rain\"",
+          "references": [
+            {
+              "alias": "angel",
+              "picture": 1,
+              "format": "png",
+              "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+              "resource": {
+                "sessionId": "session",
+                "epoch": 1,
+                "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "compilerVersion": 1,
+                "resource": "angel",
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+              }
+            },
+            {
+              "alias": "hero",
+              "picture": 2,
+              "format": "png",
+              "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+              "resource": {
+                "sessionId": "session",
+                "epoch": 1,
+                "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "compilerVersion": 1,
+                "resource": "hero",
+                "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+              }
+            }
+          ],
+          "id": "choice",
+          "candidateRevision": 1,
+          "eventId": "opening",
+          "targetHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "contentHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "effective": {
+            "sourceFrameId": 1,
+            "sourceTimeUs": 1000,
+            "simulationTick": 1,
+            "policy": "at-or-after"
+          }
+        }
+      ],
+      "mode": "appendable"
+    },
+    {
+      "protocol": "worldkit-model-context-v1",
+      "source": {
+        "sessionId": "session",
+        "epoch": 1,
+        "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "worldId": "world",
+        "sourceEpoch": "world-epoch",
+        "presentationId": "presentation",
+        "sdkEpoch": 1
+      },
+      "audience": {
+        "consumerId": "consumer",
+        "consumerEpoch": "consumer-epoch",
+        "playerId": "player",
+        "viewId": "view"
+      },
+      "segmentId": "segment",
+      "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "compilerVersion": 1,
+      "windowId": "plan-window",
+      "decisionRevision": 4,
+      "planId": "plan-1",
+      "planRevision": 1,
+      "type": "model.context.prewarm.plan.append",
+      "entries": [
+        {
+          "lifecycle": {
+            "lifecycleId": "visit",
+            "generation": 1
+          },
+          "prompt": "\u5929\u4f7f arrives \ud83d\ude00\n\"rain\"",
+          "references": [
+            {
+              "alias": "angel",
+              "picture": 1,
+              "format": "png",
+              "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+              "resource": {
+                "sessionId": "session",
+                "epoch": 1,
+                "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "compilerVersion": 1,
+                "resource": "angel",
+                "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+              }
+            },
+            {
+              "alias": "hero",
+              "picture": 2,
+              "format": "png",
+              "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+              "resource": {
+                "sessionId": "session",
+                "epoch": 1,
+                "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "compilerVersion": 1,
+                "resource": "hero",
+                "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+              }
+            }
+          ],
+          "id": "appended",
+          "candidateRevision": 1,
+          "eventId": "opening",
+          "targetHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "contentHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "effective": {
+            "sourceFrameId": 1,
+            "sourceTimeUs": 1000,
+            "simulationTick": 1,
+            "policy": "at-or-after"
+          }
+        }
+      ]
+    },
+    {
+      "protocol": "worldkit-model-context-v1",
+      "source": {
+        "sessionId": "session",
+        "epoch": 1,
+        "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "worldId": "world",
+        "sourceEpoch": "world-epoch",
+        "presentationId": "presentation",
+        "sdkEpoch": 1
+      },
+      "audience": {
+        "consumerId": "consumer",
+        "consumerEpoch": "consumer-epoch",
+        "playerId": "player",
+        "viewId": "view"
+      },
+      "segmentId": "segment",
+      "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "compilerVersion": 1,
+      "windowId": "plan-window",
+      "decisionRevision": 1,
+      "planId": "plan-1",
+      "planRevision": 1,
+      "type": "model.context.prewarm.plan",
+      "budgetMs": 10000,
+      "waitFor": "memory-ready",
+      "entries": [],
+      "mode": "appendable"
+    },
+    {
+      "protocol": "worldkit-model-context-v1",
+      "source": {
+        "sessionId": "session",
+        "epoch": 1,
+        "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "worldId": "world",
+        "sourceEpoch": "world-epoch",
+        "presentationId": "presentation",
+        "sdkEpoch": 1
+      },
+      "audience": {
+        "consumerId": "consumer",
+        "consumerEpoch": "consumer-epoch",
+        "playerId": "player",
+        "viewId": "view"
+      },
+      "segmentId": "segment",
+      "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "compilerVersion": 1,
+      "windowId": "plan-window",
+      "decisionRevision": 3,
+      "planId": "plan-1",
+      "planRevision": 1,
+      "type": "model.context.prewarm.plan.result",
+      "phase": "finished"
+    }
+  ]
+}

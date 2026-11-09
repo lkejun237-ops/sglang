@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
 )
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.shared_capacity import CapacityUnavailable
 
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/zing/cache", tags=["Zing cache"])
@@ -53,7 +54,7 @@ def _call(operation, **kwargs):
             "Block0 cache management configuration is invalid", exc_info=True
         )
         raise HTTPException(503, detail={"code": "cache_unavailable"}) from None
-    except OSError:
+    except (OSError, CapacityUnavailable):
         logger.warning("Block0 cache management storage is unavailable", exc_info=True)
         raise HTTPException(503, detail={"code": "cache_unavailable"}) from None
 

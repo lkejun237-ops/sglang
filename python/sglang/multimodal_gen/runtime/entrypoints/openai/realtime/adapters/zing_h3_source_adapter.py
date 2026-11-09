@@ -32,6 +32,17 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter 
     RealtimeChunkInputs,
     build_realtime_sampling_params,
 )
+from sglang.multimodal_gen.runtime.realtime.source_prepare import (
+    PROTOCOL as PREPARE_PROTOCOL,
+)
+from sglang.multimodal_gen.runtime.realtime.source_prepare import (
+    STARTUP_SECONDS,
+    V2_PROTOCOL,
+    condition_fingerprint,
+    preparation_identity,
+    rgb_digest,
+    validate_preview_rgb,
+)
 from sglang.multimodal_gen.runtime.realtime.source_transport import (
     PENDING_BATCHES,
     SourceTransportBudget,
@@ -151,6 +162,12 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
 
     async def on_init(self, session, request, *, prefill=False):
         self.init_started_ns = time.time_ns()
+        self.startup_protocol = request.source_prepare_protocol
+        self.startup_enabled = self.startup_protocol is not None
+        self.startup_phase = "waiting" if self.startup_enabled else None
+        self.startup_identity = self.startup_command = None
+        self.startup_deadline = time.monotonic() + STARTUP_SECONDS
+        self.worker_initialized = False
         self._source_reservations, self._inflight_reservations = {}, []
         self._s0_reservation = None
         self._pending_reference_upload = None
@@ -160,6 +177,17 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         self.prompt_prefetch = None
         self.conditioning_prefetch_endpoint = None
         self.initial_prompt = request.prompt
+        require(
+            not self.startup_enabled
+            or os.environ.get("SGLANG_ZING_SOURCE_PREPARE") == "1",
+            "This worker does not support early preparation.",
+        )
+        require(
+            not self.startup_enabled
+            or type(request.seed) is int
+            and 0 <= request.seed < 2**32,
+            "Please provide a fixed model seed for early preparation.",
+        )
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.cache_index import (
             validate_labels,
         )
@@ -171,6 +199,13 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             group_id=request.group_id,
         )
         args = get_global_server_args()
+        idle_seconds = getattr(args, "realtime_session_idle_timeout_s", STARTUP_SECONDS)
+        require(
+            not self.startup_enabled
+            or idle_seconds == 0
+            or idle_seconds >= STARTUP_SECONDS,
+            "This worker's session timeout is too short for early preparation.",
+        )
         from ..conditioning import get_api_resources, validate_remote_request
 
         validate_remote_request(request, args)
@@ -308,7 +343,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             or request.guidance_scale == profile["guidance_scale"],
             "The requested guidance does not match this model.",
         )
-        # Only the server deployment profile selects the window; clients cannot override 21/3.
+        # Only the server deployment profile selects the window; clients cannot override it.
         window = profile.get(
             "source_attention_window", {"window_chunks": 21, "sink_chunks": 2}
         )
@@ -476,6 +511,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         self._s0_reservation = None
         self.pending_frames, self.end, self.end_dispatched = 0, None, False
         from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
+            remote_decode_progressive,
+            source_decode_quantum,
             source_work_quantum,
         )
 
@@ -492,8 +529,19 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             self.source_prompt_joint = (
                 os.environ.get("SGLANG_ZING_SOURCE_PROMPT_JOINT", "0") == "1"
             )
-        if self.source_defer_final and self.source_work_quantum != 1:
+        self.remote_progressive = (
+            bool(profile.get("source_decoder", {}).get("remote"))
+            and remote_decode_progressive()
+        )
+        if (
+            self.source_defer_final
+            and self.source_work_quantum != 1
+            and not self.remote_progressive
+        ):
             raise ValueError("Deferred source final currently requires work quantum 1")
+        self.source_decode_quantum = source_decode_quantum(
+            work_quantum=self.source_work_quantum
+        )
         self.source_decoder_overlap = getattr(args, "zing_source_decoder_overlap", None)
         if self.source_decoder_overlap is None:
             self.source_decoder_overlap = (
@@ -554,6 +602,30 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             )
         self.first_source_received_unix_ns = None
         self.prompt_event = None
+        self.ordered_prompts = (
+            getattr(request, "source_prompt_protocol", None) == "ordered-boundary-v2"
+        )
+        self.prompt_boundary = None
+        self.committed_source_frames = 0
+        self._source_switch_end = None
+        self.condition_switch_protocol = getattr(
+            request, "source_condition_switch_protocol", None
+        )
+        require(
+            self.condition_switch_protocol is None
+            or (
+                self.ordered_prompts
+                and self.reference_updates
+                and (
+                    getattr(args.pipeline_config, "decoder_type", None)
+                    == "lynn_streaming"
+                    or getattr(self, "external_condition_barrier", False)
+                )
+            ),
+            "This session does not support source condition switching.",
+        )
+        self.public_prompt_version = 1
+        self.prompt_inflight = None
         request.fps, request.num_inference_steps, request.guidance_scale = (
             fps,
             regular_steps,
@@ -583,6 +655,33 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             "max_reference_image_bytes": MAX_REFERENCE_IMAGE_BYTES,
             "max_reference_decoded_bytes": self.reference_max_decoded_bytes,
         }
+        if self.startup_enabled:
+            self.ready["source_prepare_protocol"] = self.startup_protocol
+            self.preparation_profile = hashlib.sha256(
+                json.dumps(
+                    dict(
+                        profile=profile,
+                        sampling_schedule=self.sampling_schedule,
+                        model_config_sha256=hashlib.sha256(config_bytes).hexdigest(),
+                        source_work_quantum=self.source_work_quantum,
+                        source_decode_quantum=self.source_decode_quantum,
+                        defer_final=self.source_defer_final,
+                        prompt_joint=self.source_prompt_joint,
+                        remote_progressive=self.remote_progressive,
+                    ),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            self.ready["source_prepare_profile_sha256"] = self.preparation_profile
+        if self.ordered_prompts:
+            self.ready["source_prompt_protocol"] = "ordered-boundary-v2"
+        if self.condition_switch_protocol:
+            self.ready["source_condition_switch_protocol"] = (
+                self.condition_switch_protocol
+            )
+        if getattr(args.pipeline_config, "decoder_type", None) == "lynn_streaming":
+            self.ready["source_output_release_protocol"] = "valid-source-frames-v1"
 
     def _initialize_source_admission(self, session, limits):
         """Initialize private source prefetch; ledger and Encoder still enforce capacity."""
@@ -648,26 +747,61 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             return False
         require(data.get("type") == "event", "Please send a valid streaming event.")
         event_id, payload = data.get("event_id"), data.get("payload")
+        if kind in {"source.prepare", "source.attach"}:
+            require(
+                type(event_id) is int and event_id > 0,
+                "Please provide a valid control sequence.",
+            )
+            await self._startup_control(ws, session, kind, payload)
+            session.mark_client_activity()
+            return True
+        if self.startup_enabled:
+            require(
+                self.startup_phase == "attached", "Please wait for source attachment."
+            )
         if kind == "source.append":
+            if (
+                self.startup_protocol == PREPARE_PROTOCOL
+                and self.ledger.accepted_frames == 0
+            ):
+                frame_bytes = self.config["width"] * self.config["height"] * 3
+                require(
+                    isinstance(payload, dict)
+                    and isinstance(payload.get("data"), bytes)
+                    and rgb_digest(payload["data"][:frame_bytes])
+                    == self.source_preview_sha256,
+                    "The initial source frame does not match its preparation.",
+                )
+            if self._source_switch_end is not None:
+                require(
+                    isinstance(payload, dict)
+                    and type(payload.get("source_frame_start")) is int
+                    and type(payload.get("num_frames")) is int
+                    and payload["source_frame_start"] + payload["num_frames"]
+                    <= self._source_switch_end,
+                    "Source input must wait for the condition switch to finish.",
+                )
             received_ns = time.time_ns()
             record = self.ledger.accept(
                 payload, event_id=event_id, message_bytes=message_bytes
             )
             if self.first_source_received_unix_ns is None:
                 self.first_source_received_unix_ns = received_ns
-                # Observe S0 without encoding it or creating a second transport.
-                # The worker reads it from the original accepted append bytes.
-                frame_bytes = self.config["width"] * self.config["height"] * 3
-                from ..conditioning import get_api_resources
+                if not self.startup_enabled:
+                    # Observe S0 without encoding it or creating a second transport.
+                    # The worker reads it from the original accepted append bytes.
+                    frame_bytes = self.config["width"] * self.config["height"] * 3
+                    from ..conditioning import get_api_resources
 
-                resources = get_api_resources(session)
-                self._s0_reservation = resources.ledger.reserve(
-                    resources.tenant, ram=frame_bytes, inflight=frame_bytes
-                )
-                self.source_preview_bytes = payload["data"][:frame_bytes]
-                self.source_preview_sha256 = hashlib.sha256(
-                    payload["data"][:frame_bytes]
-                ).hexdigest()
+                    resources = get_api_resources(session)
+                    if self._s0_reservation is None:
+                        self._s0_reservation = resources.ledger.reserve(
+                            resources.tenant, ram=frame_bytes, inflight=frame_bytes
+                        )
+                    self.source_preview_bytes = payload["data"][:frame_bytes]
+                    self.source_preview_sha256 = hashlib.sha256(
+                        payload["data"][:frame_bytes]
+                    ).hexdigest()
             # Only expose work after accepted is on the same serialized writer.
             await ws.send_bytes(msgspec.msgpack.encode(record.message()))
             from ..conditioning import take_message_reservation
@@ -698,7 +832,9 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             )
             self.end = dict(frame_end=self.ledger.accepted_frames, event_id=event_id)
             self.available.set()
-        elif kind == "prompt":
+        elif kind == "prompt.update" and self.ordered_prompts:
+            await self._ingest_ordered_prompt_event(ws, session, event_id, payload)
+        elif kind == "prompt" and not self.ordered_prompts:
             await self._ingest_prompt_event(ws, session, data, event_id, payload)
         elif kind in {"sink.off", "sink.refresh"}:
             require(self.sink_updates, "This deployment does not support sink updates.")
@@ -726,6 +862,102 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             )
         session.mark_client_activity()
         return True
+
+    async def _startup_control(self, ws, session, kind, payload):
+        require(self.startup_enabled, "Early preparation was not negotiated.")
+        require(isinstance(payload, dict), "Please provide a startup command.")
+        identity = preparation_identity(payload.get("identity"))
+        if self.startup_identity is not None:
+            require(
+                identity == self.startup_identity, "The startup identity has changed."
+            )
+        if kind == "source.prepare":
+            native_preview = self.startup_protocol == V2_PROTOCOL
+            fields = (
+                {"identity", "rgb", "width", "height"}
+                if native_preview
+                else {"identity", "rgb"}
+            )
+            require(set(payload) == fields, "Invalid preparation fields.")
+            rgb = payload["rgb"]
+            width = payload["width"] if native_preview else self.config["width"]
+            height = payload["height"] if native_preview else self.config["height"]
+            try:
+                validate_preview_rgb(rgb, width, height)
+            except ValueError as error:
+                raise ValueError("Please provide a valid starting image.") from error
+            fingerprint = condition_fingerprint(
+                rgb=rgb,
+                prompt=self.initial_prompt,
+                references=[
+                    {k: r[k] for k in ("id", "format", "payload")}
+                    for r in self.reference_items
+                ],
+                seed=session.request.seed,
+                source_stream=session.request.source_stream,
+                profile_sha256=self.preparation_profile,
+                protocol=self.startup_protocol,
+                preview_width=width,
+                preview_height=height,
+            )
+            require(
+                fingerprint == identity["condition_fingerprint"],
+                "The preparation inputs have changed.",
+            )
+            if self.startup_phase != "waiting":
+                require(
+                    rgb_digest(rgb) == self.source_preview_sha256,
+                    "The initial source frame has changed.",
+                )
+                receipt = (
+                    dict(type="source.prepared", identity=identity, level="condition")
+                    if self.worker_initialized
+                    else dict(type="source.prepare.accepted", identity=identity)
+                )
+                await ws.send_bytes(msgspec.msgpack.encode(receipt))
+                return
+            from ..conditioning import get_api_resources
+
+            resources = get_api_resources(session)
+            self._s0_reservation = resources.ledger.reserve(
+                resources.tenant, ram=len(rgb), inflight=len(rgb)
+            )
+            self.source_preview_bytes, self.source_preview_sha256 = rgb, rgb_digest(rgb)
+            self.startup_identity = identity
+            self.startup_phase = "preparing"
+            self.startup_command = dict(op="prepare", identity=identity, rgb=rgb)
+            if native_preview:
+                # Internal worker boundary: legacy omitted versions remain v1.
+                self.startup_command.update(
+                    protocol=self.startup_protocol, width=width, height=height
+                )
+            await ws.send_bytes(
+                msgspec.msgpack.encode(
+                    dict(type="source.prepare.accepted", identity=identity)
+                )
+            )
+        else:
+            require(set(payload) == {"identity"}, "Invalid attachment fields.")
+            require(
+                self.startup_phase in {"prepared", "attaching", "attached"},
+                "The model is not prepared.",
+            )
+            if self.startup_phase == "attached":
+                await ws.send_bytes(
+                    msgspec.msgpack.encode(
+                        dict(type="source.attached", identity=identity)
+                    )
+                )
+                return
+            if self.startup_phase == "prepared":
+                self.startup_command = dict(op="attach", identity=identity)
+                if self.startup_protocol == V2_PROTOCOL:
+                    self.startup_command["protocol"] = self.startup_protocol
+                self.startup_phase = "attaching"
+        self.available.set()
+
+    def is_control_work(self, session):
+        return self.startup_command is not None
 
     async def _ingest_prompt_event(self, ws, session, data, event_id, payload):
         """Supersede pending work, prepare one candidate, then reject or ACK."""
@@ -814,20 +1046,169 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                 )
             )
 
+    async def _ingest_ordered_prompt_event(self, ws, session, event_id, payload):
+        from ..conditioning import validate_remote_request
+
+        validate_remote_request(session.request, get_global_server_args())
+        self.ledger.validate_event_id(event_id)
+        self.ledger.event_id = event_id
+        upload = None
+        code = "EFFECTIVE_BOUNDARY_UNAVAILABLE"
+        try:
+            boundary = self._reserve_prompt(payload)
+            command = dict(
+                prompt=payload["text"],
+                event_id=event_id,
+                min_source_frame=boundary,
+                prompt_version=payload["version"],
+            )
+            if self.condition_switch_protocol:
+                command["source_boundary"] = boundary
+            if "references" in payload:
+                code = "CONDITION_INVALID"
+                require(
+                    self.reference_updates,
+                    "This session does not support reference updates.",
+                )
+                upload = await prepare_reference_upload(
+                    session,
+                    payload["references"],
+                    max_references=self.max_references,
+                    max_decoded_bytes=self.reference_max_decoded_bytes,
+                )
+                command["references"] = upload.items
+        except (
+            ValueError,
+            OSError,
+            SyntaxError,
+            Image.DecompressionBombError,
+            ConditionError,
+        ):
+            if upload is not None:
+                upload.release(session)
+            await ws.send_bytes(
+                msgspec.msgpack.encode(
+                    dict(
+                        type="control_ack",
+                        kind="prompt.update",
+                        event_id=event_id,
+                        state="rejected",
+                        code=code,
+                    )
+                )
+            )
+            return
+        self._pending_reference_upload = upload
+        self._pending_prompt_command = command
+        self.prompt_inflight, self.prompt_boundary = event_id, boundary
+        if self.condition_switch_protocol:
+            self._source_switch_end = boundary
+        self.available.set()
+        await ws.send_bytes(
+            msgspec.msgpack.encode(
+                dict(
+                    type="control_ack",
+                    kind="prompt.update",
+                    event_id=event_id,
+                    state="accepted",
+                    source_frame_index=boundary,
+                    prompt_version=payload["version"],
+                )
+            )
+        )
+
     def has_control_work(self):
-        return (
-            getattr(self, "_pending_sink_command", None) is not None
+        return self._condition_control_ready() or (
+            self._pending_sink_command is not None
             and self.dispatched_source_frames > 0
             and not self.end_dispatched
         )
 
+    def _condition_control_ready(self):
+        command = self._pending_prompt_command
+        if command is None or "source_boundary" not in command:
+            return False
+        boundary = command["source_boundary"]
+        return (
+            self.end is None
+            and not self.more_work
+            and not self.pending
+            and self.ledger.accepted_frames == boundary
+            and self.dispatched_source_frames == boundary
+            and self.committed_source_frames == boundary
+        )
+
+    def _reserve_prompt(self, payload):
+        """Reserve beyond all admitted work, including Encoder/joint lookahead.
+
+        RGB prefetch does not bind conditions. The accepted watermark is a
+        conservative upper bound on any DiT work already submitted by this
+        adapter. Native model blocks, rather than transport batches, define the
+        next admissible boundary. Room holds the bounded durable prompt queue;
+        this worker accepts one handoff until a nonempty output proves its use.
+        """
+        required = {"text", "version", "min_source_frame", "policy"}
+        if (
+            not isinstance(payload, dict)
+            or not required <= set(payload)
+            or set(payload) - required - {"references", "source_policy"}
+        ):
+            raise ValueError("Invalid prompt control")
+        from sglang.multimodal_gen.runtime.realtime.whitebox.render_contract import (
+            prompt_text,
+        )
+
+        prompt_text(payload["text"])
+        target, version = payload["min_source_frame"], payload["version"]
+        if (
+            self.prompt_inflight is not None
+            or type(target) is not int
+            or target < 0
+            or type(version) is not int
+            or version <= self.public_prompt_version
+            or payload["policy"] not in {"strict", "at_or_after"}
+        ):
+            raise ValueError("Invalid prompt boundary")
+        watermark = max(target, self.ledger.accepted_frames, 17)
+        if getattr(self, "condition_switch_protocol", None):
+            if (
+                payload.get("source_policy") != "skip_during_switch"
+                or payload["policy"] != "at_or_after"
+            ):
+                raise ValueError("The condition switch requires a complete source clip")
+            return ((watermark + self.clip - 1) // self.clip) * self.clip
+        if "source_policy" in payload:
+            raise ValueError("This session does not support source skipping")
+        chunk_id = self.joint_chunk_id
+        # Pixel boundaries use the same clip17/latent5 geometry as SourceBridge.
+        while True:
+            latent = self.joint_plan.chunk(chunk_id).start
+            clips, offset = divmod(latent, 5)
+            start = clips * 17 + (0 if offset == 0 else 1 + (offset - 1) * 4)
+            if start >= watermark:
+                break
+            chunk_id += 1
+        if payload["policy"] == "strict" and start != target:
+            raise ValueError("The exact boundary is unavailable")
+        return start
+
     async def wait_for_next_chunk(self, session):
+        if self.startup_enabled and self.startup_phase != "attached":
+            while self.startup_command is None:
+                if self.ledger.closed:
+                    raise asyncio.CancelledError("Source session has closed")
+                self.available.clear()
+                remaining = self.startup_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Source preparation deadline exceeded")
+                await asyncio.wait_for(self.available.wait(), remaining)
+            return
         # The first accepted frame supplies Qwen's source presentation;
         # subsequent codec readiness is independent of transport packet size.
         minimum = 1
         while (
             not self.more_work
-            and not self.has_control_work()
+            and not self._condition_control_ready()
             and self.pending_frames < minimum
             and (self.end is None or self.end_dispatched)
         ):
@@ -836,7 +1217,16 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             self.available.clear()
             await self.available.wait()
 
-        if self.more_work or self.has_control_work():
+        if self.more_work or self._condition_control_ready():
+            # This dispatch does not collect source. Do not repeat the previous
+            # dispatch's wait in the timing receipt for a resumed output block.
+            self.joint_wait = dict(
+                budget_ms=0.0,
+                target_frames=0,
+                policy="continuation",
+                actual_ms=0.0,
+                reason="continuation" if self.more_work else "condition_ready",
+            )
             return
         target, automatic_budget = self._joint_wait_target()
         configured_budget = self.profile.get("joint_wait_ms", "auto")
@@ -903,13 +1293,13 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             <= self.dispatched_source_frames
         ):
             self.joint_chunk_id += 1
-        # Start as soon as the first chunk is ready. Only later dispatches
-        # wait for the following chunk to enable cross-chunk joint execution.
-        target_chunk = self.joint_plan.chunk(
-            self.joint_chunk_id + (1 if self.dispatched_source_frames else 0)
-        )
+        # The first dispatch never waits for the next block. Progressive
+        # remote output continues to wait only for its current codec dependency.
+        single_output = self.source_work_quantum == 1 or self.remote_progressive
+        lookahead = 0 if single_output or not self.dispatched_source_frames else 1
+        required = self.joint_plan.chunk(self.joint_chunk_id + lookahead)
         target = min(
-            self.clip, dependency(target_chunk.end) - self.dispatched_source_frames
+            self.clip, dependency(required.end) - self.dispatched_source_frames
         )
         # Wait only for the missing source at its declared frame rate, with a
         # hard deadline. Interrupts and the dispatch/credit limits still win.
@@ -940,9 +1330,15 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         return self.clip
 
     def sample_chunk_inputs(self, session, server_args, chunk, chunk_size):
-        if self._pending_prompt_command is not None:
+        if self._pending_prompt_command is not None and (
+            "source_boundary" not in self._pending_prompt_command
+            or self._condition_control_ready()
+        ):
             command = self._pending_prompt_command
             session.request.prompt = command["prompt"]
+            self.public_prompt_version = command.get(
+                "prompt_version", self.public_prompt_version
+            )
             self.prompt_event = command["event_id"]
             self._selected_prompt_command = command
             self._pending_prompt_command = None
@@ -970,7 +1366,11 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         # Worker inputs persist after the first dispatch. Do not pickle the
         # initial encoded images again on every chunk; replacements travel only
         # in zing_prompt_update and the worker owns the active media snapshot.
-        initial_media = self.reference_items if session.generate_chunk_cnt == 0 else []
+        initial_media = (
+            self.reference_items
+            if session.generate_chunk_cnt == 0 and not self.worker_initialized
+            else []
+        )
         content = list(initial_media)
         content.append(dict(type="text", text=chunk_inputs.prompt))
         params.zing_request = dict(
@@ -1017,19 +1417,42 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         )
         return params
 
-    def prepare_prefill_request(self, session, server_args, source_frame):
-        require(
-            isinstance(source_frame, bytes)
-            and len(source_frame) == self.config["width"] * self.config["height"] * 3,
-            "Please provide exactly one RGB24 source frame for prefill.",
+    def prepare_prefill_request(
+        self,
+        session,
+        server_args,
+        source_frame,
+        *,
+        source_frame_size=None,
+        persist=False,
+    ):
+        geometry = (
+            source_frame_size
+            if source_frame_size is not None
+            else {"width": self.config["width"], "height": self.config["height"]}
         )
+        require(
+            isinstance(geometry, dict) and set(geometry) == {"width", "height"},
+            "Please provide a valid prefill frame size.",
+        )
+        try:
+            validate_preview_rgb(source_frame, geometry["width"], geometry["height"])
+        except ValueError as exc:
+            raise ValueError(
+                "Please provide exactly one valid RGB24 prefill frame."
+            ) from exc
         batch = super().prepare_next_request(session, server_args, session.new_chunk())
-        batch.extra["zing_prefill"] = dict(source_frame=source_frame)
+        batch.extra["zing_prefill"] = dict(
+            source_frame=source_frame, source_frame_size=dict(geometry), persist=persist
+        )
         batch.extra["zing_source_command"] = dict(
             **self.cache_options,
             config=self.config,
+            source_geometry=asdict(self.source_geometry),
             sampling_schedule=self.sampling_schedule,
             work_quantum=self.source_work_quantum,
+            decode_quantum=self.source_decode_quantum,
+            remote_progressive=self.remote_progressive,
             defer_final=self.source_defer_final,
             prompt_joint=self.source_prompt_joint,
         )
@@ -1070,6 +1493,32 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
 
     def prepare_next_request(self, session, server_args, chunk):
         batch = super().prepare_next_request(session, server_args, chunk)
+        if self.startup_enabled:
+            batch.extra["realtime_preparation_id"] = self.startup_identity[
+                "preparation_id"
+            ]
+        if self.ordered_prompts:
+            batch.realtime_prompt_version = self.public_prompt_version
+        if self.startup_command is not None:
+            require(chunk.control_only, "Startup work must use a control dispatch.")
+            batch.extra["zing_source_command"] = dict(
+                config=self.config,
+                source_geometry=asdict(self.source_geometry),
+                sampling_schedule=self.sampling_schedule,
+                work_quantum=self.source_work_quantum,
+                decode_quantum=self.source_decode_quantum,
+                remote_progressive=self.remote_progressive,
+                defer_final=self.source_defer_final,
+                prompt_joint=self.source_prompt_joint,
+                appends=[],
+                end=None,
+                encoder=self.source_encoder,
+                decoder=self.profile.get("source_decoder"),
+                startup=self.startup_command,
+                source_preview=True,
+            )
+            self.startup_command = None
+            return batch
         if getattr(self, "_pending_sink_command", None) is not None:
             batch.extra["zing_sink_update"] = self._pending_sink_command
             self._pending_sink_command = None
@@ -1102,6 +1551,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             sampling_schedule=self.sampling_schedule,
             async_output=self.profile.get("async_source_output", False),
             work_quantum=self.source_work_quantum,
+            decode_quantum=self.source_decode_quantum,
+            remote_progressive=self.remote_progressive,
             defer_final=self.source_defer_final,
             prompt_joint=self.source_prompt_joint,
             appends=appends,
@@ -1119,11 +1570,31 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             joint_wait=self.joint_wait,
             dispatch_unix_ns=time.time_ns(),
             measure_cuda=self.profile.get("measure_source_cuda", False),
+            prompt_boundary=self.prompt_boundary,
         )
         return batch
 
     def on_chunk_complete(self, session, result):
         super().on_chunk_complete(session, result)
+        receipt = (result.usage or {}).get("zing_startup_ready")
+        if receipt is not None:
+            require(
+                receipt.get("identity") == self.startup_identity,
+                "Invalid startup receipt.",
+            )
+            expected = (
+                "source.prepared"
+                if self.startup_phase == "preparing"
+                else "source.attached"
+            )
+            require(receipt.get("type") == expected, "Unexpected startup receipt.")
+            self.startup_phase = (
+                "prepared" if expected == "source.prepared" else "attached"
+            )
+            self.worker_initialized = True
+            self.available.set()
+            return
+
         if getattr(self, "_budget_reference_update", None) is not None:
             event_id, count = self._budget_reference_update
             if any(
@@ -1135,9 +1606,38 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         for upload in self._inflight_reference_uploads:
             upload.release(session)
         self._inflight_reference_uploads.clear()
+        committed = (result.usage or {}).get(
+            "zing_source_committed_end", self.committed_source_frames
+        )
+        require(
+            type(committed) is int
+            and self.committed_source_frames
+            <= committed
+            <= self.ledger.accepted_frames,
+            "Invalid committed source boundary.",
+        )
+        self.committed_source_frames = committed
+        if (result.usage or {}).get("zing_condition_ready") is not None:
+            self._source_switch_end = None
         more_work = (result.usage or {}).get("zing_source_more_work", False)
         require(type(more_work) is bool, "Invalid source continuation state.")
-        self.more_work = bool(self.source_work_quantum and more_work)
+        self.more_work = bool(
+            (self.source_work_quantum or getattr(self, "remote_progressive", False))
+            and more_work
+        )
+        if self.ordered_prompts:
+            usage = result.usage or {}
+            if any(
+                block.get("event_id", block.get("prompt_event_id"))
+                == self.prompt_inflight
+                and block.get("num_frames", 0) > 0
+                for block in usage.get("zing_realtime_blocks", [])
+            ):
+                self.prompt_inflight = None
+            notice = getattr(result, "conditioning_notice", None)
+            if notice and notice.get("event_id") == self.prompt_inflight:
+                self.prompt_inflight = None
+                self._source_switch_end = None
         if self.source_append_overlap:
             capacity = (result.usage or {}).get("zing_source_append_capacity_frames")
             require(
@@ -1165,6 +1665,11 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
 
     async def send_output(self, ws, session, result, batch):
         usage = result.usage or {}
+        if usage.get("zing_startup_ready") is not None:
+            from ..realtime_output_adapter import empty_frame_send_stats
+
+            await ws.send_bytes(msgspec.msgpack.encode(usage["zing_startup_ready"]))
+            return empty_frame_send_stats()
         blocks = usage.get("zing_realtime_blocks", [])
         source_blocks = []
         for metadata in blocks:
@@ -1184,6 +1689,23 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         sub_batch = copy(batch)
         sub_batch.extra = {**batch.extra, "zing_source_output_blocks": source_blocks}
         total = await super().send_output(ws, session, result, sub_batch)
+        from sglang.multimodal_gen.runtime.realtime.whitebox.cache_receipt import (
+            public_cache_receipt,
+        )
+
+        cache = public_cache_receipt(usage.get("zing_block0_cache"))
+        if cache is not None:
+            await ws.send_bytes(
+                msgspec.msgpack.encode(
+                    dict(
+                        type="model.cache",
+                        model_session_id=session.id,
+                        generation_id=session.generation_id,
+                        prompt_version=cache["prompt_version"],
+                        usage={"zing_block0_cache": cache},
+                    )
+                )
+            )
         for block in source_blocks:
             self.ledger.delivered(block["provenance"].pixels)
         if self.source_decoder_overlap:
@@ -1192,6 +1714,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             consumed = self.ledger.consume(usage["zing_source_consumed_end"])
             if consumed is not None:
                 await ws.send_bytes(msgspec.msgpack.encode(consumed))
+        if usage.get("zing_condition_ready") is not None:
+            await ws.send_bytes(msgspec.msgpack.encode(usage["zing_condition_ready"]))
         if usage.get("zing_source_complete"):
             await ws.send_bytes(msgspec.msgpack.encode(self.ledger.completed()))
         return total
@@ -1226,3 +1750,4 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             self.reference_ids.clear()
             self.source_preview_sha256 = None
             self.source_preview_bytes = None
+            self.startup_command = self.startup_identity = None

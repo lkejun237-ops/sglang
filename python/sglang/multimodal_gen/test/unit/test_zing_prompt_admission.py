@@ -22,7 +22,7 @@ def test_local_validation_failure_still_votes(monkeypatch, error):
     monkeypatch.setattr(
         worker,
         "coordinate_validation_decision",
-        lambda valid: votes.append(valid) or False,
+        lambda valid: votes.append(valid) or len(votes) > 1,
     )
 
     def validate():
@@ -30,7 +30,7 @@ def test_local_validation_failure_still_votes(monkeypatch, error):
 
     with pytest.raises(ConditionError) as rejected:
         coordinate_prompt_admission(validate)
-    assert votes == [False]
+    assert votes == [False, True]
     assert rejected.value.__cause__ is error
 
 
@@ -40,11 +40,11 @@ def test_peer_rejection_does_not_publish_candidate(monkeypatch):
     monkeypatch.setattr(
         worker,
         "coordinate_validation_decision",
-        lambda valid: votes.append(valid) or False,
+        lambda valid: votes.append(valid) or len(votes) > 1,
     )
     with pytest.raises(ConditionError):
         coordinate_prompt_admission(lambda: candidate)
-    assert votes == [True]
+    assert votes == [True, True]
 
 
 def test_accepted_candidate_is_returned_only_after_decision(monkeypatch):
@@ -63,14 +63,15 @@ def test_runtime_failure_is_not_reported_as_invalid_condition(monkeypatch):
     monkeypatch.setattr(
         worker,
         "coordinate_validation_decision",
-        lambda _: pytest.fail("Runtime faults require fault cleanup"),
+        lambda _: False,
     )
 
     def validate():
         raise RuntimeError("CUDA failure")
 
-    with pytest.raises(RuntimeError, match="CUDA failure"):
+    with pytest.raises(RuntimeError, match="Condition admission failed") as failed:
         coordinate_prompt_admission(validate)
+    assert str(failed.value.__cause__) == "CUDA failure"
 
 
 @pytest.mark.parametrize("size", [2, 4])

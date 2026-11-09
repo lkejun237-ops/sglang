@@ -1,11 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 """Startup-owned ports and TCPStore for service connection handshakes."""
 
+import logging
 import socket
 from datetime import timedelta
 
 from .worker_connections import service_descriptor
 from .worker_services import service_ports
+
+
+def coordinated_descriptor(parallel, prepare):
+    """Every SP peer observes leader setup failure before entering model work."""
+    result = None
+    if parallel is None or parallel.rank_in_group == 0:
+        try:
+            result = {"descriptor": prepare(), "error": None}
+        except Exception as error:
+            logging.getLogger(__name__).exception("Worker endpoint setup failed")
+            result = {"descriptor": None, "error": f"{type(error).__name__}: {error}"}
+    if parallel is not None:
+        result = parallel.broadcast_object(result)
+    if result["error"] is not None:
+        raise RuntimeError("Worker endpoint setup failed: " + result["error"])
+    return result["descriptor"]
 
 
 class ConnectionPorts:

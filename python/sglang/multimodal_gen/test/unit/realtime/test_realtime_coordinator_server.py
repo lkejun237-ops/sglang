@@ -114,3 +114,78 @@ def test_coordinator_cli_bounds_worker_reservation_calls(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["realtime_coordinator_server"])
 
     assert _parse_args().worker_reservation_timeout_s == 2.0
+
+
+def test_coordinator_cli_accepts_redis_backend_without_secret_on_args(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "realtime_coordinator_server",
+            "--backend=redis",
+            "--redis-host=redis.internal",
+            "--redis-port=6379",
+            "--redis-username=default",
+            "--redis-password-env=REDIS_PASSWORD",
+            "--redis-key-prefix=world-model-realtime",
+            "--routing-revision-alias=minwm=checkpoint-20260825",
+        ],
+    )
+
+    args = _parse_args()
+
+    assert args.backend == "redis"
+    assert args.redis_host == "redis.internal"
+    assert args.redis_password_env == "REDIS_PASSWORD"
+    assert args.routing_revision_alias == ["minwm=checkpoint-20260825"]
+
+
+def test_capacity_http_filters_model_pool_and_preserves_global_default():
+    from dataclasses import asdict
+
+    from test_realtime_coordinator import _heartbeat
+
+    coordinator = RealtimeCoordinator(
+        InMemoryCoordinatorStore(
+            ttl_s=60,
+            worker_ttl_s=30,
+            routing_revision_aliases={"public-model": ["checkpoint"]},
+        ),
+        wait_timeout_s=0,
+    )
+    client = TestClient(create_app(coordinator))
+    for worker_id, revision in [("matching", "checkpoint"), ("other", "other-model")]:
+        assert (
+            client.post(
+                "/v1/workers/heartbeat",
+                json=asdict(
+                    _heartbeat(
+                        worker_id,
+                        "denoiser",
+                        model_revision=revision,
+                        vae_fingerprint="local",
+                    )
+                ),
+            ).status_code
+            == 204
+        )
+    assert client.get("/v1/capacity").json()["roles"]["denoiser"]["free_slots"] == 2
+    scoped = client.get(
+        "/v1/capacity",
+        params={"model_revision": "public-model", "vae_fingerprint": "local"},
+    )
+    assert scoped.status_code == 200
+    assert scoped.json()["roles"]["denoiser"]["free_slots"] == 1
+    assert (
+        client.get(
+            "/v1/capacity",
+            params={"model_revision": "missing", "vae_fingerprint": "local"},
+        ).json()["roles"]["denoiser"]["free_slots"]
+        == 0
+    )
+    assert (
+        client.get(
+            "/v1/capacity", params={"model_revision": "public-model"}
+        ).status_code
+        == 400
+    )

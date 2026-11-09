@@ -4,11 +4,33 @@
 from __future__ import annotations
 
 import math
+import time
 from datetime import timedelta
 from typing import Sequence
 
 import torch
 import torch.distributed as dist
+
+
+def wait_bridge_probe(tensor: torch.Tensor, *, timeout_seconds: float) -> None:
+    """Confirm a startup probe on the CPU without synchronizing the whole GPU.
+
+    Call on the same thread/stream immediately after send/recv Work.wait().
+    Keep the probe tensor alive until the stream event proves completion.
+    This is a connection readiness boundary, not a per-frame transfer fence.
+    """
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("Bridge probe timeout must be finite and positive")
+    if not tensor.is_cuda:
+        return
+    event = torch.cuda.Event()
+    event.record(torch.cuda.current_stream(tensor.device))
+    deadline = time.monotonic() + timeout_seconds
+    while not event.query():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("NCCL bridge startup probe did not complete")
+        time.sleep(min(0.001, remaining))
 
 
 def create_bridge_group(

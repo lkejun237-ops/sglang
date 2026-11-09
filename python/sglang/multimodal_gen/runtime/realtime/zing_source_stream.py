@@ -264,4 +264,30 @@ def source_work_quantum(value=None):
         value = int(raw)
     if type(value) is not int or value not in (0, 1):
         raise ValueError("Source work quantum must be 0 or 1")
-    return value
+    return int(value)
+
+
+def source_decode_quantum(value=None, *, work_quantum=None):
+    """Trusted Lynn decode scheduling policy; never a client request field."""
+    import os
+
+    if value is None:
+        raw = os.environ.get("SGLANG_ZING_EXPERIMENTAL_DECODE_WORK_QUANTUM", "0")
+        if raw not in ("0", "1"):
+            raise ValueError("Source decode quantum must be 0 or 1")
+        value = int(raw)
+    if type(value) is not int or value not in (0, 1):
+        raise ValueError("Source decode quantum must be 0 or 1")
+    if value == 1 and source_work_quantum(work_quantum) != 1:
+        raise ValueError("Source decode quantum requires source work quantum 1")
+    return int(value)
+
+
+def remote_decode_progressive():
+    """Trusted opt-in output policy; retains the two-block DiT lookahead budget."""
+    import os
+
+    value = os.environ.get("SGLANG_ZING_REMOTE_DECODE_PROGRESSIVE", "0")
+    if value not in {"0", "1"}:
+        raise ValueError("Remote decode progressive policy must be 0 or 1")
+    return value == "1"

@@ -1,0 +1,256 @@
+---
+title: "Sink API 接入说明"
+description: "在现有玩家控制连接上开启、关闭和刷新 Sink，处理生效回执、幂等重试与状态恢复。"
+---
+
+Sink 为当前玩家的模型生成保留一组固定的历史注意力锚点。你可以在游戏过程中开启、关闭或刷新它，帮助模型持续参考选定的近期历史。它不冻结游戏画面，不暂停游戏时钟，也不保证某个物体、视角或画风一定保持不变。
+
+接口为现有 `whitebox-render-v2` 玩家控制连接上的 **`model.sink` 命令**，使用二进制 MessagePack。无需新建 HTTP 接口、WebSocket 或 Model Slot。Sink 默认关闭；收到 `completed` 且 `applied=true` 才能确认操作已在模型输出上生效。
+
+本文描述 SGLang `white_box` 提交 `4bd6e96225a8d3cfb1f99d521e2538c35fe410b4` 已包含的协议。不同环境是否可用，以当前 Segment 的能力和状态为准。
+
+## 三个操作的区别
+
+| `action` | 当前关闭时 | 当前开启时 |
+| --- | --- | --- |
+| `on` | 从最近已完成的历史建立锚点并开启 | 保持原锚点，不重新选取，返回 no-op |
+| `off` | 保持关闭，返回 no-op | 移除固定锚点，保留正常的近期历史窗口 |
+| `refresh` | 从最近已完成的历史建立锚点并开启 | 用最近已完成的历史替换原锚点，继续开启 |
+
+当前实现最多固定两个已完成的 native chunk；完整锚点对应五个 latent。它不表示两帧或两秒。历史不足时，锚点会随后续 chunk 完成逐步补齐，因此 `sink_chunks=2` 时，`sink_chunk_ids` 可能暂时少于两个。
+
+`refresh` 选择模型实际完成的历史，不保证精确对应用户点击按钮时浏览器显示的那一帧；它也不会找回已经淘汰的早期历史。不要把“再发一次 `on`”当成刷新，刷新必须使用 `refresh`。
+
+## 调用前提
+
+沿用现有试玩连接、鉴权和会话创建流程。RTC 与普通 WebSocket 的视频传输可以不同，Sink 控制消息仍走原玩家控制 WebSocket。
+
+发送前确认：
+
+1. 当前玩家仍持有有效的 `source_session_id` 和 `source_epoch`。
+2. 当前模型 Segment 已进入 `streaming`，并取得它的 `segment_id` 和 `segment_epoch`。
+3. 当前 Segment 的 `sink.supported === true`，且已收到实际 Sink 状态；初始化阶段的 `enabled: null` 不能当成关闭。
+4. 当前没有未完成的 Sink 操作、Prompt／参考图切换或 Segment 结束操作。
+
+能力来自实际 Worker 的 `ready.sink_updates`，不是前端自行开启的配置。你可以发送 `status.get`，从返回的 `source.status.segment` 检查：
+
+```json
+{
+  "state": "streaming",
+  "segment_id": "SEGMENT_ID",
+  "segment_epoch": "SEGMENT_EPOCH",
+  "sink": {
+    "supported": true,
+    "enabled": false,
+    "sink_chunks": 0,
+    "sink_chunk_ids": [],
+    "sink_event_id": null,
+    "pending_request_id": null
+  }
+}
+```
+
+以上是 `segment` 字段示例。能力字段缺失或为 `false` 时，不展示可操作的 Sink 控件。
+
+## 请求格式
+
+以下 JSON 用于说明 MessagePack 对象结构；不要直接把 JSON 文本写入控制连接。将示例中的四个会话标识替换为当前服务端返回的值。
+
+```json
+{
+  "version": 2,
+  "type": "command",
+  "op": "model.sink",
+  "request_id": "sink-on-001",
+  "source_session_id": "SOURCE_SESSION_ID",
+  "source_epoch": "SOURCE_EPOCH",
+  "segment_id": "SEGMENT_ID",
+  "segment_epoch": "SEGMENT_EPOCH",
+  "action": "on"
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `version` | integer | 使用现有版本 `2` |
+| `type` | string | 固定为 `command` |
+| `op` | string | 固定为 `model.sink` |
+| `request_id` | string | 本次逻辑操作的唯一 ID；建议使用 UUID |
+| `source_session_id`、`source_epoch` | string | 当前玩家源会话的身份及代次 |
+| `segment_id`、`segment_epoch` | string | 当前正在生成的模型 Segment 的身份及代次 |
+| `action` | string | 仅允许 `on`、`off`、`refresh` |
+
+`model.sink` 不接受 `expected_render_revision`、`sink_chunks`、`sink_chunk_ids`、Prompt、参考图、指定帧或缓存 key。不要直接复制 `render.start` 的所有字段到这个命令；额外字段会导致 `INVALID_COMMAND`。
+
+如果你已使用平台的 `WhiteboxClient`，它的 `control()` 会补充版本、请求 ID 和源会话身份：
+
+```javascript
+function requestSink(client, action) {
+  if (!["on", "off", "refresh"].includes(action)) {
+    throw new Error("Invalid Sink action.");
+  }
+  const segment = client.segment;
+  if (segment?.state !== "streaming" || segment?.sink?.supported !== true) {
+    throw new Error("Sink controls are not available for this segment.");
+  }
+  if (segment.sink.pending_request_id) {
+    throw new Error("Wait for the current model control to finish.");
+  }
+  return client.control("model.sink", {
+    segment_id: segment.segment_id,
+    segment_epoch: segment.segment_epoch,
+    action,
+  });
+}
+
+// 保存返回的 request_id，并在现有 onControl 回调中处理回执。
+const requestId = requestSink(client, "refresh");
+```
+
+这段函数是业务侧封装示例，不是新增的 SDK 方法。业务侧还应在发送后立即锁定控件，避免等待下一次状态快照期间重复点击。
+
+## 回执与生效时点
+
+非 no-op 操作先返回 `operation.result`：
+
+```json
+{
+  "version": 2,
+  "type": "operation.result",
+  "op": "model.sink",
+  "operation_id": "OPERATION_ID",
+  "request_id": "sink-on-001",
+  "source_session_id": "SOURCE_SESSION_ID",
+  "source_epoch": "SOURCE_EPOCH",
+  "segment_id": "SEGMENT_ID",
+  "segment_epoch": "SEGMENT_EPOCH",
+  "action": "on",
+  "state": "accepted",
+  "applied": false,
+  "noop": false
+}
+```
+
+`accepted` 只表示请求已受理。底层模型收到控制事件的 ACK，也不能证明画面已经使用了新 Sink。服务端观察到首个匹配该操作的模型 RGB 输出后，才发布完成回执：
+
+```json
+{
+  "version": 2,
+  "type": "operation.result",
+  "op": "model.sink",
+  "operation_id": "OPERATION_ID",
+  "request_id": "sink-on-001",
+  "source_session_id": "SOURCE_SESSION_ID",
+  "source_epoch": "SOURCE_EPOCH",
+  "segment_id": "SEGMENT_ID",
+  "segment_epoch": "SEGMENT_EPOCH",
+  "action": "on",
+  "state": "completed",
+  "applied": true,
+  "noop": false,
+  "native_event_id": 42,
+  "first_output_frame": 357,
+  "sink": {
+    "enabled": true,
+    "sink_chunks": 2,
+    "sink_chunk_ids": [38, 39],
+    "sink_event_id": 42
+  }
+}
+```
+
+回执还可能携带 `source_id`、`view_id`、`accepted_at`、`inference` 和 `control_sequence` 等现有公共字段。客户端应校验源会话、Segment 及请求身份，允许接收额外的服务端字段。
+
+| 字段或状态 | 客户端处理 |
+| --- | --- |
+| `accepted`、`dispatching` | 显示处理中，等待后续结果 |
+| `completed` 且 `applied=true` | 用返回的 `sink` 更新控件，解除该请求的处理中状态 |
+| `noop=true` | 目标状态本来就已成立；可直接完成，无需等待新帧 |
+| `native_event_id` | 该操作被发送到模型时使用的事件身份；no-op 不保证有此字段 |
+| `first_output_frame` | 首个证明操作生效的模型输出帧号；不表示浏览器已经呈现此帧 |
+| `reconciling` | 结果尚未确认，保留请求 ID，查询原操作 |
+| `cancelled` 且 `never_applied=true` | 操作在发送给模型前被取消，不会再生效 |
+
+no-op 不制造 `first_output_frame`。如果产品需要显示“用户已经看到新 Sink 画面”，还要在实际呈现回调中核对帧的 `rendering.sink.sink_event_id`；仅收到完成回执不能代替浏览器呈现证明。
+
+## 查询状态与结果恢复
+
+查询当前源会话和 Segment：
+
+```json
+{
+  "version": 2,
+  "type": "command",
+  "op": "status.get",
+  "request_id": "sink-status-001",
+  "source_session_id": "SOURCE_SESSION_ID",
+  "source_epoch": "SOURCE_EPOCH"
+}
+```
+
+查询某个原始 Sink 请求的结果：
+
+```json
+{
+  "version": 2,
+  "type": "command",
+  "op": "operation.get",
+  "request_id": "sink-query-001",
+  "source_session_id": "SOURCE_SESSION_ID",
+  "source_epoch": "SOURCE_EPOCH",
+  "operation_request_id": "sink-on-001"
+}
+```
+
+两者均返回 `source.status`。当前状态在 `segment.sink`；被查询操作在 `operation`。外层 `request_id` 是本次查询 ID，原操作 ID 是 `operation_request_id`／`operation.request_id`，不要混用。
+
+每次新的业务操作使用新 ID。相同 ID、相同内容的重试只重放原操作结果，可能携带 `duplicate=true`；相同 ID 换了内容会返回 `REQUEST_ID_CONFLICT`。这套幂等范围属于原源会话，不是跨玩家、跨 Segment 或永久保存的全局接口。
+
+如果回执丢失或返回 `SINK_UPDATE_UNKNOWN`，先查询原请求，**不要新建第二个 `refresh` 请求补偿**。当前段仍有效时，迟到的真实输出仍可能把原操作更新为 `completed`。重连成功后先查询当前状态；旧会话已失效时，结束旧会话并按正常流程重新开始，不能把旧请求搬到新玩家会话中。
+
+## 错误处理
+
+参数、身份或忙状态拒绝通常通过同连接的 `operation.rejected` 返回，不代表整个玩家连接必须结束：
+
+```json
+{
+  "type": "operation.rejected",
+  "request_id": "sink-on-002",
+  "code": "SINK_UPDATE_BUSY",
+  "content": "Wait for the current model control to finish.",
+  "retryable": true
+}
+```
+
+| `code` | 含义 | 处理方式 |
+| --- | --- | --- |
+| `SINK_UPDATE_BUSY` | 已有 Sink 或条件切换尚未完成，或正在结束当前段 | 等待原操作完成并刷新状态，避免连续重发 |
+| `MODEL_UNAVAILABLE` | 没有符合条件的正在生成的模型段 | 等待当前段进入 `streaming`，单纯 Prefill 阶段不能操作 |
+| `CAPABILITY_UNAVAILABLE` | 当前源或 Worker 不支持 Sink 控制 | 禁用控件，不用反复重试探测 |
+| `SOURCE_EPOCH_MISMATCH` | 源会话代次不匹配 | 按现有重连流程重新取得身份 |
+| `SEGMENT_EPOCH_MISMATCH` | Segment 已更换或旧请求过期 | 获取当前段身份，不向新段重放旧请求 |
+| `REQUEST_ID_CONFLICT` | 一个 ID 被用于不同内容 | 修正 ID 管理；新业务操作生成新 ID |
+| `INVALID_COMMAND` | 动作、字段或命令结构不合法 | 修正请求，检查是否混入其他控制命令的字段 |
+| `RENDER_TRANSITION_IN_PROGRESS` | 正在发生渲染状态切换 | 先获取当前状态，完成切换后再操作 |
+| `SINK_UPDATE_UNKNOWN` | 请求可能已发送，但还没有输出证明结果 | 保留原请求并查询；该码用于 `reconciling`，不能当作“未执行” |
+| `SEGMENT_ENDED` | 尚未发送的操作随段结束取消 | 结合 `cancelled`、`never_applied=true` 处理 |
+
+按稳定的 `code` 和实际 `retryable` 字段分支，不匹配 `content` 文案。等待模型输出使用服务端当前 Segment 的启动预算；客户端自己的等待超时也不代表操作没有执行。
+
+## 和 Prefill、Prompt、多人联机的关系
+
+- Prefill 预热初始条件；Sink 固定当前模型段的近期历史。二者不是同一种缓存，也不能相互替代。
+- Sink 不调用 Prefill、不新增模型连接，也不会释放或重新申请父 Slot。
+- 每个新 Segment 默认关闭 Sink。上一段开启过，不会自动传递到新段。
+- 同段 Prompt／参考图更新保留 Sink 的开关状态，锚点可能重建；更新期间不要并发发送 Sink。
+- 退出、结束 Segment 和真实故障仍沿用原生命周期。结果不明时不会强制释放 Slot，也不会自动重启整组模型。
+- 联机时只操作当前 PlayerSession 的模型上下文，不影响其他玩家的 Sink、输入身份或共享 World 时钟。
+- SDK 成员仍使用原有 SDK 输入授权协议；Sink 命令不会替代输入租约。需要同连接转发 SDK 输入时，使用已支持的 `sdk.control.open`／`sdk.control` 通道，不能在成员模型通道直接发送旧式 `kind=input`。
+
+## 接入检查
+
+上线客户端前，用同一玩家会话确认：默认关闭；`on` 生效；再次 `on` 为 no-op；`refresh` 取得新的原生事件身份；`off` 生效；状态查询可恢复结果；旧 Segment 身份被拒绝；退出后原 Slot 正常释放。
+
+播放器还应按会话协商出的 `source_stream` 和 `model_output` 分别处理画面尺寸。泰国的 832×480 源流可以对应 1280×736 模型输出；将两者当成同尺寸可能在首个模型画面到达时触发客户端错误，与 Sink 操作是否完成无关。
+
+参考：[Sink 协议说明](/docs/sglang-diffusion/zing_h3/specs/whitebox-sink-control)、[可选 Prefill 协议](/docs/sglang-diffusion/zing_h3/specs/whitebox-control-prefill)。

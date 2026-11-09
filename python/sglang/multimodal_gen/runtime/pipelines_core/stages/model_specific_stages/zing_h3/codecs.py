@@ -6,8 +6,9 @@ import json
 import math
 import os
 import threading
+import time
 import weakref
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import copy
 
 import torch
@@ -579,7 +580,9 @@ class ZingH3Codecs(ZingH3MediaInput):
         source_preview=None,
         conditioning=None,
         stage_trace=None,
+        preparation_metrics=None,
     ):
+        media_started = time.perf_counter()
         # Reuse decoded references for prompt refreshes; offline calls release them.
         if isinstance(request, dict) and "cache_uri" in request:
             raise ValueError(
@@ -656,7 +659,16 @@ class ZingH3Codecs(ZingH3MediaInput):
                 raise ConditionError(
                     "CONDITION_INVALID", "Media normalization failed"
                 ) from error
-            positive = conditioning(prompt, normalized_media)
+            if preparation_metrics is not None:
+                preparation_metrics.record(
+                    "media_prepare", (time.perf_counter() - media_started) * 1000
+                )
+            with (
+                preparation_metrics.measure("qwen_remote_prepare")
+                if preparation_metrics is not None
+                else nullcontext()
+            ):
+                positive = conditioning(prompt, normalized_media)
             if positive is None:
                 raise ConditionError(
                     "CONDITION_INVALID",
@@ -664,6 +676,10 @@ class ZingH3Codecs(ZingH3MediaInput):
                 )
         else:
             positive = None
+            if preparation_metrics is not None:
+                preparation_metrics.record(
+                    "media_prepare", (time.perf_counter() - media_started) * 1000
+                )
         request_id = stage_trace.identity["request_id"] if stage_trace else None
         measure_cuda = stage_trace is not None and stage_trace.measure_cuda
         if positive is None:
@@ -675,7 +691,14 @@ class ZingH3Codecs(ZingH3MediaInput):
                 input_ids=[f"{request_id}:payload"],
                 output_ids=[f"{request_id}:positive"],
             ) as span:
-                with use_component("text_encoder"):
+                with (
+                    (
+                        preparation_metrics.measure("qwen_prepare")
+                        if preparation_metrics is not None
+                        else nullcontext()
+                    ),
+                    use_component("text_encoder"),
+                ):
                     positive = self.encode_condition(prompt, normalized_media)
             handoff(span)
         visual, audio = {}, {}
@@ -696,7 +719,12 @@ class ZingH3Codecs(ZingH3MediaInput):
                         input_ids=[f"{request_id}:media:{item['id']}"],
                         output_ids=[f"{request_id}:reference:{item['id']}"],
                     ) as span:
-                        visual[item["id"]] = self.encode_reference(item)
+                        with (
+                            preparation_metrics.measure("reference_vae")
+                            if preparation_metrics is not None
+                            else nullcontext()
+                        ):
+                            visual[item["id"]] = self.encode_reference(item)
                     handoff(span)
                 if source is not None:
                     with stage_span(

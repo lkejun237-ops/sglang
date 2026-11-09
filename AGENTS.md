@@ -44,8 +44,33 @@
   H100 独立 K3s 节点缺少可关联的创建者身份时标为未知，不按任务名推断。
 - 使用前重新核验 GPU 占用和作业归属；机器清单不代表空闲，也不授权停止其他人的任务。
 
+## Worldkit 跨平台部署
+
+- Prefer the canonical Python/browser dependency stages. Never inherit a full
+  Room image followed by `rm -rf /app /opt/worldkit` as a dependency base:
+  deletion in a later layer retains the old bytes. An existing verified browser
+  filesystem may be extracted through `docker/whitebox-browser-dependencies.Dockerfile`,
+  whose final FROM scratch stage copies only the cleaned filesystem and retains
+  none of the old layers. Verify the resulting dependencies and complete image
+  gates. Preserve ordinary BuildKit cache imports and the exact source/SDK pin.
+- Before publishing CPU/Room images, run the layer-history gate in
+  `deploy/whitebox/image_storage.py` (also enforced by the manual builder and
+  registry verification). CPU control images contain no SDK COPY layer; Room
+  images contain one. Keep the native image tests and full source from SGLang main; pin Worldkit SDK to dev.
+- On shared runtime hosts, never use global `docker system prune`, delete
+  container writable layers, or stop Docker/Redis to reclaim space. Use an exact
+  reviewed image inventory, preserve all container references and rollback
+  images, and verify remote recovery before removing an unused image.
+
+涉及 Worldkit / WTP / Whitebox 集成的服务部署、模型或 Room runtime 发布前，必读
+[跨平台依赖、版本与协议变更自查](https://github.com/seedleap/worldkit-monorepo/blob/dev/docs/development/cross-platform-change-checklist.md)。
+共享协议或发布输入变更也使用该入口，沿实际生产者和消费者核对冻结 SDK、镜像、模型、
+存储和协议身份。它不替代本仓库 H3 部署决策、Whitebox 发布与验收要求，也不授权部署、
+重启共享作业或更改活跃会话；源码、实际部署与端到端验收分别记录。
+
 ## 部署会话模型
 
+- 用户于 2026-11-03 确认分离服务池：每个逻辑 Model Slot/Encoder–DiT–Decoder 通信组只属于一个玩家，每个 service 同时最多一个活跃会话。DiT 的 SP ranks 合起来是一个 service；Encoder/Decoder 进程可通过多个独立 service 共享模型，受进程总预算约束。这是对下述旧“部署实例”口径的细化，不允许同一个 service 并发承载多个玩家，也不恢复已停用的旧多 DiT shared API 路由。
 - 用户于 2026-10-10 明确确认：后续部署统一采用单活跃会话模型，一个部署实例同时只服务一个用户，不支持并发活跃会话。
 - 设计、实现、审查和验收均按此约束执行；不预先增加多会话容量配置、多 owner 状态或并发调度。已有活跃会话时拒绝第二个会话，且不得影响当前会话。
 - 保留 session/generation 身份校验，以及断连、取消、故障、EOS 后释放资源和下一会话可用性的测试；这些是单活跃会话生命周期保障。

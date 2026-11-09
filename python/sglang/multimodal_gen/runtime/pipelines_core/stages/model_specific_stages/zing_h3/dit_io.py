@@ -2,6 +2,7 @@
 """DiT-only communication owner, independent of the model consumption loop."""
 
 import json
+import math
 import threading
 import time
 from concurrent.futures import Future, TimeoutError
@@ -32,11 +33,15 @@ class DiTIOChannel:
         max_pending=10,
         poll_interval_s=0.005,
         on_failure=None,
+        timeout_s=120,
         cleanup_timeout=None,
     ):
         if max_pending < 1 or poll_interval_s <= 0:
             raise ValueError("DiT I/O queue and polling interval must be positive")
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("DiT I/O timeout must be finite and positive")
         self.factory = factory
+        self.timeout_s = timeout_s
         self.on_failure = on_failure
         self.cleanup_timeout = cleanup_timeout
         self.inbox = Queue(maxsize=max_pending)
@@ -54,7 +59,11 @@ class DiTIOChannel:
             raise RuntimeError("DiT I/O loop has already started")
         self.thread = Thread(target=self._run, name="zing-dit-io", daemon=True)
         self.thread.start()
-        self.ready.result()
+        try:
+            self.ready.result(timeout=self.timeout_s)
+        except BaseException:
+            self.stopping.set()
+            raise
         return self
 
     def _check(self):
@@ -218,8 +227,11 @@ class DiTIOChannel:
 
     def pause_receiving(self):
         self.pause_requested.set()
+        deadline = time.monotonic() + self.timeout_s
         while not self.pause_ack.wait(self.poll_interval_s):
             self._check()
+            if time.monotonic() >= deadline:
+                raise TimeoutError("DiT I/O pause was not confirmed")
 
     def abort(self):
         try:
@@ -247,7 +259,12 @@ class DiTIOChannel:
                 self.abort()
             self.stopping.set()
             if self.thread is not None:
-                self.thread.join()
+                self.thread.join(timeout=self.timeout_s)
+                if self.thread.is_alive():
+                    # Retain ownership while the external cleanup guard remains armed.
+                    raise TimeoutError(
+                        "DiT I/O owner did not exit; cleanup is unconfirmed"
+                    )
             if self.close_error is not None:
                 raise RuntimeError(
                     "Worker transport cleanup failed"

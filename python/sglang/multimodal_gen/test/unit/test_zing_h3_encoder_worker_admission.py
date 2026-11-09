@@ -41,12 +41,12 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
         x for x in tree.body if isinstance(x, ast.FunctionDef) and x.name == "main"
     )
     command_rows = [
-        dict(op="open", session="owner", bridge_port=1001, capacity_frames=51),
-        dict(op="open", session="intruder", bridge_port=1002, capacity_frames=51),
+        dict(op="open", session="owner", bridge_port=11001, capacity_frames=51),
+        dict(op="open", session="intruder", bridge_port=11002, capacity_frames=51),
         dict(op="abort", session="intruder"),
         dict(op="ping"),
         dict(op="close", session="owner"),
-        dict(op="open", session="intruder", bridge_port=1002, capacity_frames=51),
+        dict(op="open", session="intruder", bridge_port=11002, capacity_frames=51),
         dict(op="close", session="intruder"),
         dict(op="ping"),
     ]
@@ -61,14 +61,14 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
     if close_op == "quarantine":
         commands = iter(
             [
-                dict(op="open", session="owner", bridge_port=1001, capacity_frames=51),
+                dict(op="open", session="owner", bridge_port=11001, capacity_frames=51),
                 dict(op="abort", session="owner", require_restart=True),
                 *[
                     dict(op=op, session="owner")
                     for op in ("append", "finish", "pop", "close")
                 ],
                 dict(
-                    op="open", session="intruder", bridge_port=1002, capacity_frames=51
+                    op="open", session="intruder", bridge_port=11002, capacity_frames=51
                 ),
                 dict(op="ping"),
             ]
@@ -178,9 +178,14 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
         def parse_args(self):
             return SimpleNamespace(
                 model=Path("model"),
-                port=31001,
+                port=311001,
                 timeout_seconds=120,
                 startup_timeout_seconds=600,
+                max_sessions=1,
+                host="127.0.0.1",
+                peer_host="127.0.0.1",
+                auth_token_file=None,
+                node_binding_file=None,
             )
 
     dist = SimpleNamespace(
@@ -202,7 +207,14 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
     )
     control = importlib.util.module_from_spec(control_spec)
     control_spec.loader.exec_module(control)
+    peer_spec = importlib.util.spec_from_file_location(
+        "zing_encoder_peer_cpu", path.with_name("encoder_peer.py")
+    )
+    peer = importlib.util.module_from_spec(peer_spec)
+    peer_spec.loader.exec_module(peer)
     namespace = dict(
+        diagnostic_print=emit,
+        EncoderPeer=peer.EncoderPeer,
         EncoderCommandControl=control.EncoderCommandControl,
         EncoderControlError=control.EncoderControlError,
         logging=logging,
@@ -269,7 +281,7 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
         assert len(sessions) == 1 and sessions[0].closed
         assert len(barriers) == 1
         if rank == 0:
-            assert ports == [1001]
+            assert ports == [11001]
             assert all(r["code"] == "ENCODER_RESTART_REQUIRED" for r in replies[1:-1])
             assert replies[-1]["restart_required"] and replies[-1]["busy"]
         else:
@@ -278,7 +290,7 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
     assert len(sessions) == 2 and all(x.closed for x in sessions)
     assert len(barriers) == (3 if close_op == "close" else 1)
     if rank == 0:
-        assert ports == [1001, 1002]  # Rejected open never enters its bridge.
+        assert ports == [11001, 11002]  # Rejected open never enters its bridge.
         assert replies[1] == dict(
             ok=False,
             code="ENCODER_BUSY",

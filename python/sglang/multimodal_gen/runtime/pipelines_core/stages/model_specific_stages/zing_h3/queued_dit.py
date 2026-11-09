@@ -27,6 +27,7 @@ class QueuedDiTSession:
         on_output,
         validate_condition=None,
         prepare_condition=None,
+        confirm_condition_ready=None,
         release_storage=None,
         poll_interval_s=0.005,
         max_control_tasks=10,
@@ -41,6 +42,8 @@ class QueuedDiTSession:
         self.bridge, self.sample_moments = bridge, sample_moments
         self.on_output, self.validate_condition = on_output, validate_condition
         self.prepare_condition = prepare_condition
+        self.confirm_condition_ready = confirm_condition_ready
+        self.supports_condition_barrier = confirm_condition_ready is not None
         self.release_storage = release_storage
         self.max_control_tasks = max_control_tasks
         self.max_condition_bytes = max_condition_bytes
@@ -51,6 +54,8 @@ class QueuedDiTSession:
         self.last_sink_event_id = None
         self.state = None
         self.conditioning_notice = None
+        self.condition_ready = None
+        self.condition_prepared = None
         self._admission = asyncio.Lock()
         self.queue = PollingTaskQueue(
             self._process,
@@ -113,6 +118,42 @@ class QueuedDiTSession:
             self.control_tasks += 1
         elif kind in {"conditioning", "conditioning.cancel"}:
             cancelled = kind == "conditioning.cancel"
+            preparation = message.get("source_prepare")
+            if preparation is not None:
+                from sglang.multimodal_gen.runtime.realtime.source_prepare import (
+                    PROTOCOL,
+                    V2_PROTOCOL,
+                    preparation_identity,
+                )
+
+                if (
+                    cancelled
+                    or self.initial_received
+                    or not self.supports_condition_barrier
+                    or not isinstance(preparation, dict)
+                    or set(preparation)
+                    != {"identity", "protocol", "preview_sha256", "preview_size"}
+                    or preparation["protocol"] not in {PROTOCOL, V2_PROTOCOL}
+                    or not isinstance(preparation["preview_sha256"], str)
+                    or len(preparation["preview_sha256"]) != 64
+                    or not isinstance(preparation["preview_size"], list)
+                    or len(preparation["preview_size"]) != 2
+                    or any(
+                        type(v) is not int or v < 1 for v in preparation["preview_size"]
+                    )
+                ):
+                    raise ValueError("Invalid source preparation")
+                preparation_identity(preparation["identity"])
+            boundary = message.get("source_boundary")
+            if boundary is not None and (
+                cancelled
+                or not self.initial_received
+                or not self.supports_condition_barrier
+                or type(boundary) is not int
+                or boundary < self.bridge.clip_frames
+                or boundary % self.bridge.clip_frames
+            ):
+                raise ValueError("Invalid source condition barrier")
             if cancelled and not self.initial_received:
                 raise ValueError("Initial conditioning must precede cancellation")
             tensors = message.get("tensors", {})
@@ -288,6 +329,7 @@ class QueuedDiTSession:
                         if not task["initial"]:
                             self.state.discard_pending_prompt()
                         candidate = None
+                        task.pop("_reuse_gpu_prefix", None)
                         if self.prepare_condition is not None:
                             candidate = self.prepare_condition(task)
                         if self.validate_condition is not None:
@@ -298,19 +340,44 @@ class QueuedDiTSession:
                                 task.get("event_id"),
                                 task.get("prompt_version"),
                             )
+                            if task.get("source_prepare") is not None:
+                                self.confirm_condition_ready(task["source_prepare"])
+                                self.condition_prepared = task["source_prepare"]
                         else:
                             # The existing session rebuilds rolling prefix KV at the
                             # original safe boundary; it never runs Qwen here.
+                            reuse = task.get("_reuse_gpu_prefix", False)
                             self.state.update_prompt(
-                                task["tensors"],
+                                self.state.prompt.condition
+                                if reuse
+                                else task["tensors"],
                                 task["event_id"],
                                 task.get("prompt_version"),
                                 **(
-                                    {"inputs": candidate}
+                                    {"reuse_prefix": True}
+                                    if reuse
+                                    else {"inputs": candidate}
                                     if candidate is not None
                                     else {}
                                 ),
                             )
+                            boundary = task.get("source_boundary")
+                            if boundary is not None:
+                                # All earlier source messages have drained on this
+                                # single writer. Rebuild without waiting for a
+                                # future source frame: Room is fenced at B.
+                                if (
+                                    self.bridge.accepted_pixels != boundary
+                                    or self.bridge.buffered_latents
+                                ):
+                                    raise ValueError(
+                                        "The source condition barrier is not drained"
+                                    )
+                                ready = self.state.activate_prompt_at_source_boundary(
+                                    boundary
+                                )
+                                self.confirm_condition_ready(ready)
+                                self.condition_ready = ready
                 except ConditionError as exc:
                     if task["initial"]:
                         raise
@@ -329,6 +396,11 @@ class QueuedDiTSession:
                     provenance=chunk.provenance,
                     final=chunk.final,
                 )
+                # Use the same bounded execution path as the integrated source
+                # pipeline. step() bypasses whole-chunk CUDA graphs; its older
+                # per-forward graph route rejects after-step0 window eviction.
+                # Exhaust the iterator after delivering its one result, and
+                # close it explicitly if the output consumer fails or cancels.
                 with closing(self.state.drain_ready(max_outputs=1)) as outputs:
                     for result in outputs:
                         await self.on_output(result)

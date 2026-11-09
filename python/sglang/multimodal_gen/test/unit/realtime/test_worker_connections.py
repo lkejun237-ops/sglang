@@ -760,6 +760,10 @@ def test_encoder_initialization_is_ordered_before_quiesce_and_destroy(
                 target_width=32, target_height=32, receipt=lambda: {}
             )
             self.ready = {}
+            # Match the parent initialization contract without enabling either
+            # optional protocol in this lifecycle-only test.
+            self.condition_switch_protocol = None
+            self.startup_enabled = False
             self.end = None
             self.ledger = SimpleNamespace(closed=False, accepted_frames=0)
             self.ledger.dispose = lambda: setattr(self.ledger, "closed", True)

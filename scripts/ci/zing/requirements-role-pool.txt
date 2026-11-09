@@ -1,0 +1,12 @@
+# Control/data protocol tests only. No Torch/CUDA/model dependency.
+pytest==9.2.0
+pytest-asyncio==1.4.1.post1
+fastapi==0.162.0
+httpx==0.28.1
+websockets==17.4
+msgspec==0.22.0
+redis==8.1.0
+uvicorn==0.54.0
+prometheus-client==0.26.0
+pyzmq==27.2.0
+pillow==13.0.0

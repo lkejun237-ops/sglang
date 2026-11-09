@@ -11,11 +11,15 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_a
 )
 from sglang.multimodal_gen.runtime.realtime.zing_contracts import PixelRange, require
 
+from .zing_h3_source_adapter import ZingH3SourceStreamAdapter
 from .zing_source_encoder_adapter import ZingSourceEncoderAdapter
 
 
 class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
     supports_sink_updates = True
+    # The Encoder has no local Decoder config. Admission is completed against
+    # the real DiT handshake below; an old peer cannot silently skip the fence.
+    external_condition_barrier = True
 
     async def on_init(self, session, request, *, prefill=False):
         import asyncio
@@ -75,6 +79,26 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
                 ),
                 "dit_latents",
             )
+            if self.condition_switch_protocol:
+                require(
+                    any(
+                        value.get("source_condition_switch_protocol")
+                        == self.condition_switch_protocol
+                        for value in (opened or [])
+                        if value.get("type") == "session.opened"
+                    ),
+                    "The connected model does not support condition switching.",
+                )
+            if self.startup_enabled:
+                require(
+                    any(
+                        self.startup_protocol
+                        in value.get("source_prepare_protocols", [])
+                        for value in (opened or [])
+                        if value.get("type") == "session.opened"
+                    ),
+                    "The connected model does not support source preparation.",
+                )
             self.ready.update(output_kind=self.output_kind)
             self.output_attachment = next(
                 (
@@ -90,6 +114,40 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
                     output_attachment=self.output_attachment,
                 )
             self.latents_sent = 0
+
+    def _condition_control_ready(self):
+        command = self._pending_prompt_command
+        if command is None or "source_boundary" not in command:
+            return False
+        boundary = command["source_boundary"]
+        # Encoder dispatch is the local watermark. The ordered, synchronous
+        # DiT barrier drains all earlier messages and checks the true committed
+        # GPU boundary. Waiting for a future source batch here would deadlock
+        # Room, which has deliberately stopped at this complete codec clip.
+        return (
+            self.end is None
+            and not self.more_work
+            and not self.pending
+            and not self.input_arranger.buffered_frames
+            and self.ledger.accepted_frames == boundary
+            and self.dispatched_source_frames == boundary
+        )
+
+    def has_control_work(self):
+        if self.startup_enabled and self.startup_phase != "attached":
+            return self.startup_command is not None
+        if not self.condition_switch_protocol:
+            return super().has_control_work()
+        return self._condition_control_ready() or (
+            self._pending_sink_command is not None
+            and self.dispatched_source_frames > 0
+            and not self.end_dispatched
+        )
+
+    async def wait_for_next_chunk(self, session):
+        if self.startup_enabled and self.startup_phase != "attached":
+            return await ZingH3SourceStreamAdapter.wait_for_next_chunk(self, session)
+        return await super().wait_for_next_chunk(session)
 
     def clear_state(self, session):
         super().clear_state(session)
@@ -173,6 +231,11 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
 
     async def _send_connected_output(self, ws, session, result, batch):
         total = empty_frame_send_stats()
+        if result.usage.get("zing_startup_ready") is not None:
+            await ws.send_bytes(
+                msgspec.msgpack.encode(result.usage["zing_startup_ready"])
+            )
+            return total
         for notice in result.realtime_handoff.get("conditioning_notices", []):
             await ws.send_bytes(
                 msgspec.msgpack.encode(
@@ -260,6 +323,28 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
             consumed = self.ledger.consume(result.usage["zing_source_consumed_end"])
             if consumed is not None:
                 await ws.send_bytes(msgspec.msgpack.encode(consumed))
+        if result.usage.get("zing_condition_ready") is not None:
+            await ws.send_bytes(
+                msgspec.msgpack.encode(result.usage["zing_condition_ready"])
+            )
+        for report in result.realtime_handoff.get("cache_reports", []):
+            from sglang.multimodal_gen.runtime.realtime.whitebox.cache_receipt import (
+                public_cache_receipt,
+            )
+
+            public = public_cache_receipt(report)
+            if public is not None:
+                await ws.send_bytes(
+                    msgspec.msgpack.encode(
+                        dict(
+                            type="model.cache",
+                            model_session_id=session.id,
+                            generation_id=session.generation_id,
+                            prompt_version=public["prompt_version"],
+                            usage={"zing_block0_cache": public},
+                        )
+                    )
+                )
         if result.usage["zing_source_complete"]:
             completion = self.ledger.completed()
             if self.output_kind == "rgb":

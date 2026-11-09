@@ -1,0 +1,1793 @@
+// Dedicated CPU whitebox CI. Derived from the existing Beijing image pipeline.
+// Checkout/build/push/callback only; Loopit platform owns CD.
+String platformCommitSha() {
+    String commitSha = params.COMMIT_SHA?.trim()?.toLowerCase() ?: ''
+    if (commitSha && !(commitSha ==~ /(?:[0-9a-f]{40}|[0-9a-f]{64})/)) {
+        error('COMMIT_SHA 必须是完整的 40 或 64 位十六进制 Git commit SHA。')
+    }
+    return commitSha
+}
+
+void verifyPlatformSourceRevision(String branch, String commitSha) {
+    String actualCommit = sh(label: '读取实际 Git commit', returnStdout: true, script: 'git rev-parse HEAD').trim().toLowerCase()
+    if (!(actualCommit ==~ /(?:[0-9a-f]{40}|[0-9a-f]{64})/)) {
+        error("checkout 未解析出完整 Git commit SHA，实际为 ${actualCommit.take(80)}。")
+    }
+    if (!commitSha) {
+        return
+    }
+    if (actualCommit != commitSha) {
+        error("实际 checkout commit ${actualCommit} 与请求的 COMMIT_SHA ${commitSha} 不一致。")
+    }
+
+    int containmentStatus
+    withEnv([
+        "LOOPIT_EXPECTED_BRANCH=${branch}",
+        "LOOPIT_EXPECTED_COMMIT=${commitSha}"
+    ]) {
+        containmentStatus = sh(label: '校验 commit 属于所选分支', returnStatus: true, script: '''
+set +x
+git check-ref-format --branch "$LOOPIT_EXPECTED_BRANCH" >/dev/null 2>&1 || exit 2
+git rev-parse --verify "refs/remotes/origin/$LOOPIT_EXPECTED_BRANCH^{commit}" >/dev/null 2>&1 || exit 3
+git merge-base --is-ancestor "$LOOPIT_EXPECTED_COMMIT" "refs/remotes/origin/$LOOPIT_EXPECTED_BRANCH"
+''')
+    }
+    if (containmentStatus == 2) {
+        error("BRANCH_NAME ${branch} 不符合 Git 分支命名规则。")
+    }
+    if (containmentStatus == 3) {
+        error("远端分支 origin/${branch} 不存在，无法校验 COMMIT_SHA。")
+    }
+    if (containmentStatus != 0) {
+        error("COMMIT_SHA ${commitSha} 不属于所选分支 ${branch}。")
+    }
+}
+
+void callbackPlatform(String result) {
+    boolean successCallback = (result ?: 'SUCCESS').equalsIgnoreCase('SUCCESS')
+    String callbackUrl = params.LOOPIT_CLOUD_CALLBACK_URL?.trim()
+    if (!callbackUrl) {
+        String message = 'LOOPIT_CLOUD_CALLBACK_URL 为空，无法回调平台。'
+        if (successCallback) {
+            error(message)
+        }
+        echo message
+        return
+    }
+    withEnv([
+        "CALLBACK_URL=${callbackUrl}",
+        "CALLBACK_STATUS=${result ?: 'SUCCESS'}",
+        "CALLBACK_SERVICE_ID=${params.SERVICE_ID?.trim() ?: ''}",
+        "CALLBACK_LANE=${params.LANE?.trim() ?: 'default'}",
+        "CALLBACK_SERVICE_NAME=${params.SERVICE_NAME?.trim() ?: ''}",
+        "CALLBACK_JENKINS_JOB=${env.JOB_NAME ?: ''}",
+        "CALLBACK_BRANCH=${params.BRANCH_NAME?.trim() ?: 'main'}",
+        "CALLBACK_COMMIT_SHA=${env.GIT_SHA?.trim()?.toLowerCase() ?: ''}",
+        "CALLBACK_IMAGE=${env.IMAGE_REF ?: params.IMAGE ?: ''}",
+        "CALLBACK_INSPECT_IMAGE=${env.ECR_IMAGE_REF ?: env.IMAGE_REF ?: params.IMAGE ?: ''}",
+        "CALLBACK_IMAGE_DIGEST=${env.IMAGE_DIGEST ?: ''}",
+        "CALLBACK_THAILAND_ACR_ONLY=${env.THAILAND_ACR_ONLY ?: 'false'}",
+        "CALLBACK_BUILD_ID=${env.BUILD_NUMBER ?: ''}",
+        "CALLBACK_BUILD_URL=${env.BUILD_URL ?: ''}",
+        "CALLBACK_DURATION=${currentBuild.durationString ?: ''}",
+        'CALLBACK_PAYLOAD_FILE=.loopit-platform-callback.json'
+    ]) {
+        int prepareExitCode
+        container('aws') {
+            prepareExitCode = sh(label: '准备 Loopit 平台回调', returnStatus: true, script: '''
+set +x
+rm -f "$CALLBACK_PAYLOAD_FILE" "$CALLBACK_PAYLOAD_FILE.tmp"
+trap 'rm -f "$CALLBACK_PAYLOAD_FILE.tmp"' EXIT
+python3 - <<'PY'
+import json
+import os
+import re
+import subprocess
+import time
+import urllib.request
+
+
+DIGEST_PATTERN = re.compile(r'^sha256:[a-f0-9]{64}$')
+COMMIT_SHA_PATTERN = re.compile(r'^(?:[a-f0-9]{40}|[a-f0-9]{64})$')
+
+
+def resolve_ecr_image(image):
+    if not image:
+        return None
+    match = re.match(r'^[0-9]+\\.dkr\\.ecr\\.([a-z0-9-]+)\\.amazonaws\\.com/(.+)$', image)
+    if not match:
+        print('镜像不是标准 ECR 地址，跳过 ECR digest 和启动配置采集。')
+        return None
+    region, reference = match.groups()
+    expected_digest = None
+    if '@' in reference:
+        repository, expected_digest = reference.rsplit('@', 1)
+        expected_digest = expected_digest.lower()
+        image_id = 'imageDigest=' + expected_digest
+    else:
+        separator = reference.rfind(':')
+        if separator < 0:
+            repository, tag = reference, 'latest'
+        else:
+            repository, tag = reference[:separator], reference[separator + 1:]
+        image_id = 'imageTag=' + tag
+
+    manifest_response = None
+    for attempt in range(1, 6):
+        try:
+            candidate = json.loads(subprocess.check_output([
+                'aws', 'ecr', 'batch-get-image',
+                '--region', region,
+                '--repository-name', repository,
+                '--image-ids', image_id,
+                '--accepted-media-types',
+                'application/vnd.docker.distribution.manifest.v2+json',
+                'application/vnd.oci.image.manifest.v1+json',
+                '--output', 'json',
+            ], text=True, stderr=subprocess.DEVNULL))
+            if candidate.get('images'):
+                manifest_response = candidate
+                break
+        except (subprocess.CalledProcessError, json.JSONDecodeError):
+            pass
+        if attempt < 5:
+            time.sleep(attempt * 2)
+
+    if manifest_response is None:
+        raise RuntimeError('重试后 ECR 仍未返回镜像 manifest')
+    image_result = manifest_response['images'][0]
+    registry_digest = ((image_result.get('imageId') or {}).get('imageDigest') or '').lower()
+    if not DIGEST_PATTERN.fullmatch(registry_digest):
+        raise RuntimeError('ECR 返回的 Registry manifest digest 格式不正确')
+    if expected_digest and registry_digest != expected_digest:
+        raise RuntimeError('镜像引用中的 digest 与 ECR Registry manifest digest 不一致')
+    return {
+        'region': region,
+        'repository': repository,
+        'registryDigest': registry_digest,
+        'manifest': json.loads(image_result['imageManifest']),
+    }
+
+
+def inspect_ecr_image_config(resolved_image):
+    region = resolved_image['region']
+    repository = resolved_image['repository']
+    manifest = resolved_image['manifest']
+    config_digest = (manifest.get('config') or {}).get('digest')
+    if not config_digest:
+        raise RuntimeError('镜像 manifest 缺少 config digest')
+    layer_response = json.loads(subprocess.check_output([
+        'aws', 'ecr', 'get-download-url-for-layer',
+        '--region', region,
+        '--repository-name', repository,
+        '--layer-digest', config_digest,
+        '--output', 'json',
+    ], text=True))
+    with urllib.request.urlopen(layer_response['downloadUrl'], timeout=30) as response:
+        document = json.load(response)
+        image_config = document.get('config') or {}
+    target = os.environ.get('BUILD_TARGET')
+    if target in ('release', 'room'):
+        from deploy.whitebox.image_storage import validate_history
+        validate_history(document, 'room' if target == 'room' else 'cpu')
+    entrypoint = image_config.get('Entrypoint') or []
+    cmd = image_config.get('Cmd') or []
+    if not isinstance(entrypoint, list) or not isinstance(cmd, list):
+        raise RuntimeError('镜像 Entrypoint/Cmd 格式不正确')
+    return {
+        'entrypoint': [str(item) for item in entrypoint],
+        'cmd': [str(item) for item in cmd],
+    }
+
+
+status = (os.environ.get('CALLBACK_STATUS') or 'SUCCESS').lower()
+payload = {
+    'serviceId': os.environ.get('CALLBACK_SERVICE_ID') or None,
+    'serviceName': os.environ.get('CALLBACK_SERVICE_NAME') or None,
+    'jenkinsJob': os.environ.get('CALLBACK_JENKINS_JOB') or None,
+    'branch': os.environ.get('CALLBACK_BRANCH') or 'main',
+    'commitSha': os.environ.get('CALLBACK_COMMIT_SHA') or None,
+    'lane': os.environ.get('CALLBACK_LANE') or 'default',
+    'image': os.environ.get('CALLBACK_IMAGE') or None,
+    'imageDigest': os.environ.get('CALLBACK_IMAGE_DIGEST') or None,
+    'buildId': os.environ.get('CALLBACK_BUILD_ID') or None,
+    'buildUrl': os.environ.get('CALLBACK_BUILD_URL') or None,
+    'operator': 'jenkins',
+    'status': 'success' if status == 'success' else status,
+    'duration': os.environ.get('CALLBACK_DURATION') or '-',
+    'remark': 'Jenkins CI 已完成，CD 由 Loopit 平台执行。build=' + (os.environ.get('CALLBACK_BUILD_ID') or '-'),
+}
+if status == 'success':
+    try:
+        source_commit = (payload.get('commitSha') or '').lower()
+        if not COMMIT_SHA_PATTERN.fullmatch(source_commit):
+            raise RuntimeError('成功回调缺少完整的 Git commit SHA')
+        payload['commitSha'] = source_commit
+        resolved_image = resolve_ecr_image(os.environ.get('CALLBACK_INSPECT_IMAGE') or payload.get('image'))
+        if os.environ.get('CALLBACK_THAILAND_ACR_ONLY') == 'true':
+            with open('/build-secrets/verified-acr-image.json') as stream:
+                verified = json.load(stream)
+            if verified.get('digest') != payload.get('imageDigest') or verified.get('revision') != source_commit:
+                raise RuntimeError('ACR verification does not match the callback artifact')
+            payload['imageConfig'] = verified['imageConfig']
+        supplied_digest = (payload.get('imageDigest') or '').lower()
+        if supplied_digest and not DIGEST_PATTERN.fullmatch(supplied_digest):
+            raise RuntimeError('流水线提供的 imageDigest 格式不正确')
+        if supplied_digest:
+            payload['imageDigest'] = supplied_digest
+        if resolved_image is not None:
+            registry_digest = resolved_image['registryDigest']
+            if supplied_digest and supplied_digest != registry_digest:
+                raise RuntimeError('流水线提供的 imageDigest 与 ECR Registry manifest digest 不一致')
+            payload['imageDigest'] = registry_digest
+            print('已解析 Registry manifest digest：' + registry_digest[:19] + '...')
+            try:
+                payload['imageConfig'] = inspect_ecr_image_config(resolved_image)
+                print('已采集镜像 ENTRYPOINT/CMD。')
+            except Exception as error:
+                if os.environ.get('BUILD_TARGET') in ('release', 'room'):
+                    raise
+                print('镜像启动配置采集失败，本次仍继续回调：', error)
+    except Exception as error:
+        print('镜像 digest 解析失败，禁止发送成功回调：', error)
+        raise SystemExit(1)
+
+payload_path = os.environ['CALLBACK_PAYLOAD_FILE']
+temporary_path = payload_path + '.tmp'
+with open(temporary_path, 'w', encoding='utf-8') as handle:
+    json.dump({key: value for key, value in payload.items() if value is not None}, handle, ensure_ascii=False)
+os.chmod(temporary_path, 0o600)
+os.replace(temporary_path, payload_path)
+print('Loopit 平台回调数据已准备。')
+PY
+''')
+        }
+        if (prepareExitCode != 0) {
+            String message = "准备 Loopit 平台回调失败，退出码：${prepareExitCode}。"
+            if (successCallback) {
+                error(message)
+            }
+            echo message
+            return
+        }
+
+        int callbackExitCode
+        container('tools') {
+            callbackExitCode = sh(label: '回调 Loopit 平台', returnStatus: true, script: '''
+set +x
+node - <<'NODE'
+const fs = require('node:fs');
+
+const payloadPath = process.env.CALLBACK_PAYLOAD_FILE;
+const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+async function callback() {
+  const data = fs.readFileSync(payloadPath);
+  let lastError;
+  try {
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30000);
+      try {
+        const response = await fetch(process.env.CALLBACK_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: data,
+          signal: controller.signal,
+        });
+        const body = await response.text();
+        if (!response.ok) {
+          const error = new Error('平台回调返回 HTTP ' + response.status + '：' + body.slice(0, 300));
+          error.retryable = response.status >= 500;
+          throw error;
+        }
+        console.log(body.slice(0, 500));
+        return;
+      } catch (error) {
+        lastError = error;
+        if (error.retryable === false || attempt === 3) {
+          break;
+        }
+        console.log('平台回调暂时失败，准备第 ' + (attempt + 1) + ' 次尝试。');
+        await sleep(attempt * 1000);
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    throw lastError;
+  } finally {
+    fs.rmSync(payloadPath, { force: true });
+  }
+}
+
+callback().catch((error) => {
+  console.error(error.message);
+  process.exit(1);
+});
+NODE
+''')
+        }
+        if (callbackExitCode != 0) {
+            String message = "回调 Loopit 平台失败，退出码：${callbackExitCode}。"
+            if (successCallback) {
+                error(message)
+            }
+            echo message
+        }
+    }
+}
+
+void downloadPlatformDockerfile(String targetPath) {
+    String dockerfileUrl = params.LOOPIT_CLOUD_DOCKERFILE_URL?.trim()
+    String dockerfileToken = params.LOOPIT_CLOUD_DOCKERFILE_TOKEN?.toString()?.trim()
+    String repositoryPath = params.LOOPIT_CLOUD_DOCKERFILE_REPOSITORY_PATH?.trim()
+    if (repositoryPath && (dockerfileUrl || dockerfileToken)) {
+        error('Dockerfile 来源参数冲突：平台托管参数与仓库路径不能同时设置。')
+    }
+    if (!repositoryPath && !dockerfileUrl && !dockerfileToken) {
+        echo '平台 Dockerfile 参数尚未提供，本次继续使用 Pipeline 默认的仓库 Dockerfile。'
+        return
+    }
+    if (repositoryPath) {
+        container('tools') {
+            withEnv([
+                "REPOSITORY_DOCKERFILE_SOURCE=${repositoryPath}",
+                "REPOSITORY_DOCKERFILE_TARGET=${targetPath ?: ''}"
+            ]) {
+                sh(label: '准备仓库 Dockerfile', script: '''
+set +x
+node - <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+
+const workspace = fs.realpathSync(process.env.WORKSPACE);
+
+function relativePath(name) {
+  const text = process.env[name] || '';
+  if (!text || path.isAbsolute(text) || text.includes(String.fromCharCode(92)) || text.split('/').includes('..')) {
+    throw new Error('仓库 Dockerfile 路径不合法');
+  }
+  const resolved = path.resolve(workspace, text);
+  const relative = path.relative(workspace, resolved);
+  if (!relative || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) {
+    throw new Error('仓库 Dockerfile 路径超出工作区');
+  }
+  return { text, resolved };
+}
+
+const sourcePath = relativePath('REPOSITORY_DOCKERFILE_SOURCE');
+const targetPath = relativePath('REPOSITORY_DOCKERFILE_TARGET');
+const source = fs.realpathSync(sourcePath.resolved);
+const sourceRelative = path.relative(workspace, source);
+if (!sourceRelative || sourceRelative.startsWith('..' + path.sep) || path.isAbsolute(sourceRelative)) {
+  throw new Error('仓库 Dockerfile 路径超出工作区');
+}
+if (!fs.statSync(source).isFile()) {
+  throw new Error('仓库 Dockerfile 不是普通文件：' + sourcePath.text);
+}
+if (sourcePath.resolved !== targetPath.resolved) {
+  fs.mkdirSync(path.dirname(targetPath.resolved), { recursive: true });
+  const targetParent = fs.realpathSync(path.dirname(targetPath.resolved));
+  const targetParentRelative = path.relative(workspace, targetParent);
+  if (targetParentRelative.startsWith('..' + path.sep) || path.isAbsolute(targetParentRelative)) {
+    throw new Error('Dockerfile 目标路径超出工作区');
+  }
+  const target = path.join(targetParent, path.basename(targetPath.resolved));
+  const temporary = target + '.loopit-tmp';
+  fs.copyFileSync(source, temporary);
+  fs.chmodSync(temporary, 0o644);
+  fs.renameSync(temporary, target);
+}
+console.log('已使用仓库 Dockerfile：' + sourcePath.text + ' -> ' + targetPath.text);
+NODE
+''')
+            }
+        }
+        return
+    }
+    if (!dockerfileUrl || !dockerfileToken) {
+        error('平台 Dockerfile 下载参数不完整，请重新从 Loopit 平台触发构建。')
+    }
+    container('tools') {
+        withEnv([
+            "PLATFORM_DOCKERFILE_URL=${dockerfileUrl}",
+            "PLATFORM_DOCKERFILE_TOKEN=${dockerfileToken}",
+            "PLATFORM_DOCKERFILE_PATH=${targetPath ?: ''}"
+        ]) {
+            sh(label: '下载平台 Dockerfile', script: '''
+set +x
+node - <<'NODE'
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const targetText = process.env.PLATFORM_DOCKERFILE_PATH || '';
+if (!targetText || path.isAbsolute(targetText) || targetText.split(/[\\/]+/).includes('..')) {
+  throw new Error('Dockerfile 目标路径不合法');
+}
+
+const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+async function download() {
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+    try {
+      const response = await fetch(process.env.PLATFORM_DOCKERFILE_URL, {
+        headers: { Authorization: 'Bearer ' + process.env.PLATFORM_DOCKERFILE_TOKEN },
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        const error = new Error('平台 Dockerfile 下载返回 HTTP ' + response.status);
+        error.retryable = response.status >= 500;
+        throw error;
+      }
+      const content = Buffer.from(await response.arrayBuffer());
+      const expected = (response.headers.get('x-loopit-dockerfile-sha256') || '').toLowerCase();
+      if (content.length > 512 * 1024) {
+        throw new Error('平台 Dockerfile 超过 512 KiB');
+      }
+      const actual = crypto.createHash('sha256').update(content).digest('hex');
+      if (!expected || actual !== expected) {
+        throw new Error('平台 Dockerfile SHA256 校验失败');
+      }
+      fs.mkdirSync(path.dirname(targetText), { recursive: true });
+      const temporary = targetText + '.loopit-tmp';
+      // The downloader runs as root while rootless BuildKit runs as UID 1000 in
+      // another container sharing the workspace. Dockerfiles are build input,
+      // not credentials, so keep the verified copy readable by that container.
+      fs.writeFileSync(temporary, content, { mode: 0o644 });
+      fs.renameSync(temporary, targetText);
+      console.log('已下载平台 Dockerfile：' + targetText + ' sha256=' + actual.slice(0, 12));
+      return;
+    } catch (error) {
+      lastError = error;
+      if (error.retryable === false || attempt === 3) {
+        break;
+      }
+      console.log('平台 Dockerfile 下载暂时失败，准备第 ' + (attempt + 1) + ' 次尝试。');
+      await sleep(attempt * 1000);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  throw lastError;
+}
+
+download().catch((error) => {
+  console.error(error.message);
+  process.exit(1);
+});
+NODE
+''')
+        }
+    }
+}
+
+String sanitizeBuildCacheSegment(String value, int limit) {
+    String normalized = (value ?: '')
+        .toLowerCase()
+        .replaceAll(/[^a-z0-9._-]+/, '-')
+        .replaceAll(/^-+/, '')
+        .replaceAll(/-+$/, '')
+    return (normalized ?: 'default').take(limit)
+}
+
+void configureSharedBuildCache(Map config = [:]) {
+    String branch = config.branch?.toString()?.trim() ?: params.BRANCH_NAME?.trim() ?: 'main'
+    String fallbackBranch = config.fallbackBranch?.toString()?.trim() ?: 'main'
+    String scope = config.scope?.toString()?.trim() ?: env.JOB_NAME ?: params.SERVICE_NAME ?: 'image'
+    String registry = env.ECR_REGISTRY ?: '829115578968.dkr.ecr.us-east-1.amazonaws.com'
+    String repository = 'loopit-build-cache'
+    String scopeKey = sanitizeBuildCacheSegment(scope, 140)
+    String branchKey = sanitizeBuildCacheSegment(branch, 120)
+    String fallbackKey = sanitizeBuildCacheSegment(fallbackBranch, 120)
+
+    env.BUILD_CACHE_REPOSITORY = repository
+    env.BUILD_CACHE_BRANCH_REF = "${registry}/${repository}:buildcache-${scopeKey}-${branchKey}"
+    env.BUILD_CACHE_FALLBACK_REF = "${registry}/${repository}:buildcache-${scopeKey}-${fallbackKey}"
+    env.GOPROXY = 'https://proxy.golang.org|direct'
+    env.NPM_REGISTRY = 'https://registry.npmjs.org/'
+    env.PIP_INDEX_URL = 'https://pypi.org/simple/'
+    echo "Shared BuildKit cache: import ${env.BUILD_CACHE_BRANCH_REF} then ${env.BUILD_CACHE_FALLBACK_REF}; export ${env.BUILD_CACHE_BRANCH_REF}."
+}
+
+void prepareSharedBuildCache(Map config = [:]) {
+    configureSharedBuildCache(config)
+    (config.proxies ?: []).each { String ecosystem ->
+        configureLanguageProxy(ecosystem)
+    }
+
+    container('aws') {
+        sh label: 'Generate ECR config and shared cache imports', script: '''
+set +x
+set -eu
+mkdir -p /build-secrets/docker
+PW="$(aws ecr get-login-password --region "$AWS_REGION")"
+AUTH="$(printf 'AWS:%s' "$PW" | base64 | tr -d '\\n')"
+printf '{"auths":{"%s":{"auth":"%s"}}}\\n' "$ECR_REGISTRY" "$AUTH" > /build-secrets/docker/config.json
+unset PW AUTH
+chown 1000:1000 /build-secrets/docker/config.json
+chmod 600 /build-secrets/docker/config.json
+
+CACHE_IMPORT_FILE=/build-secrets/cache-imports
+: > "$CACHE_IMPORT_FILE"
+PREVIOUS_CACHE_REF=
+for CACHE_REF in "$BUILD_CACHE_BRANCH_REF" "$BUILD_CACHE_FALLBACK_REF"; do
+  if [ "$CACHE_REF" = "$PREVIOUS_CACHE_REF" ]; then
+    continue
+  fi
+  PREVIOUS_CACHE_REF="$CACHE_REF"
+  CACHE_TAG=${CACHE_REF##*:}
+  if aws ecr describe-images \
+    --region "$AWS_REGION" \
+    --repository-name "$BUILD_CACHE_REPOSITORY" \
+    --image-ids imageTag="$CACHE_TAG" >/dev/null 2>&1; then
+    printf '%s\\n' "$CACHE_REF" >> "$CACHE_IMPORT_FILE"
+    echo "BuildKit cache hit candidate: $CACHE_REF"
+  else
+    echo "BuildKit cache not found (cold source): $CACHE_REF"
+  fi
+done
+chown 1000:1000 "$CACHE_IMPORT_FILE"
+chmod 600 "$CACHE_IMPORT_FILE"
+'''
+    }
+}
+
+void addAcrRegistryAuth(Map config = [:]) {
+    String credentialId = config.credentialId?.toString()?.trim() ?: 'aliyun-acr-loopit-ops-cn'
+    String instanceId = config.instanceId?.toString()?.trim()
+    String registry = config.registry?.toString()?.trim()
+    String region = config.region?.toString()?.trim() ?: 'cn-beijing'
+    if (!instanceId || !registry) {
+        error('ACR instanceId and registry are required.')
+    }
+
+    container('aws') {
+        withCredentials([usernamePassword(
+            credentialsId: credentialId,
+            usernameVariable: 'ALIBABA_CLOUD_ACCESS_KEY_ID',
+            passwordVariable: 'ALIBABA_CLOUD_ACCESS_KEY_SECRET'
+        )]) {
+            withEnv([
+                "ACR_INSTANCE_ID=${instanceId}",
+                "ACR_REGISTRY=${registry}",
+                "ACR_REGION=${region}"
+            ]) {
+                sh label: 'Add temporary ACR login to BuildKit config', script: '''
+set +x
+set -eu
+python3 - <<'PY'
+import base64
+import datetime
+import hashlib
+import hmac
+import json
+import os
+import pathlib
+import urllib.parse
+import urllib.request
+import uuid
+
+
+def percent(value):
+    return urllib.parse.quote(str(value), safe='~-._')
+
+
+params = {
+    'AccessKeyId': os.environ['ALIBABA_CLOUD_ACCESS_KEY_ID'],
+    'Action': 'GetAuthorizationToken',
+    'Format': 'JSON',
+    'InstanceId': os.environ['ACR_INSTANCE_ID'],
+    'RegionId': os.environ['ACR_REGION'],
+    'SignatureMethod': 'HMAC-SHA1',
+    'SignatureNonce': str(uuid.uuid4()),
+    'SignatureVersion': '1.0',
+    'Timestamp': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+    'Version': '2018-12-01',
+}
+canonical = '&'.join('%s=%s' % (percent(key), percent(params[key])) for key in sorted(params))
+to_sign = 'GET&%2F&' + percent(canonical)
+secret = (os.environ['ALIBABA_CLOUD_ACCESS_KEY_SECRET'] + '&').encode()
+params['Signature'] = base64.b64encode(hmac.new(secret, to_sign.encode(), hashlib.sha1).digest()).decode()
+endpoint = 'https://cr.%s.aliyuncs.com/?%s' % (os.environ['ACR_REGION'], urllib.parse.urlencode(params))
+request = urllib.request.Request(endpoint, headers={'User-Agent': 'loopit-jenkins-acr-login'})
+with urllib.request.urlopen(request, timeout=30) as response:
+    token = json.load(response)
+
+username = token.get('TempUsername') or ''
+password = token.get('AuthorizationToken') or ''
+if not username or not password:
+    raise RuntimeError('ACR GetAuthorizationToken returned no temporary login')
+
+config_path = pathlib.Path('/build-secrets/docker/config.json')
+config = json.loads(config_path.read_text())
+config.setdefault('auths', {})[os.environ['ACR_REGISTRY']] = {
+    'auth': base64.b64encode((username + ':' + password).encode()).decode()
+}
+temporary = config_path.with_suffix('.tmp')
+temporary.write_text(json.dumps(config, separators=(',', ':')) + '\\n')
+temporary.replace(config_path)
+os.chmod(config_path, 0o600)
+PY
+chown 1000:1000 /build-secrets/docker/config.json
+'''
+            }
+        }
+    }
+}
+
+String imageTagForDualPush(String image) {
+    String reference = image?.trim()
+    if (!reference || reference.contains('@')) {
+        error('Dual-registry platform builds require an image tag, not an empty or digest reference.')
+    }
+    int slash = reference.lastIndexOf('/')
+    int colon = reference.lastIndexOf(':')
+    if (colon <= slash || colon == reference.length() - 1) {
+        error("Dual-registry platform image has no tag: ${reference}")
+    }
+    return reference.substring(colon + 1)
+}
+
+void captureBuildKitImageDigest(String metadataPath = '/build-secrets/image-metadata.json') {
+    container('aws') {
+        withEnv(["BUILDKIT_METADATA_PATH=${metadataPath}"]) {
+            env.IMAGE_DIGEST = sh(
+                label: 'Read immutable BuildKit image digest',
+                returnStdout: true,
+                script: '''
+set +x
+python3 - <<'PY'
+import json
+import os
+import re
+
+with open(os.environ['BUILDKIT_METADATA_PATH'], encoding='utf-8') as stream:
+    metadata = json.load(stream)
+digest = metadata.get('containerimage.digest') or ''
+if not re.fullmatch(r'sha256:[a-f0-9]{64}', digest):
+    raise SystemExit('BuildKit metadata did not contain a valid immutable image digest')
+print(digest)
+PY
+'''
+            ).trim()
+        }
+    }
+}
+
+void waitForRegistryImageDigest(Map config = [:]) {
+    String registry = config.registry?.toString()?.trim()
+    String image = config.image?.toString()?.trim()
+    String expectedDigest = config.expectedDigest?.toString()?.trim()?.toLowerCase()
+    int timeoutSeconds = (config.timeoutSeconds ?: 1800) as int
+    if (!registry || !image || !expectedDigest) {
+        error('Registry replication verification requires registry, image, and expectedDigest.')
+    }
+    if (!image.startsWith("${registry}/") || image.contains('@')) {
+        error("Registry replication verification image must be a tagged image under ${registry}.")
+    }
+    String repositoryAndTag = image.substring(registry.length() + 1)
+    int colon = repositoryAndTag.lastIndexOf(':')
+    if (colon <= 0 || colon == repositoryAndTag.length() - 1) {
+        error("Registry replication verification image has no tag: ${image}")
+    }
+    if (!(expectedDigest ==~ /sha256:[a-f0-9]{64}/)) {
+        error("Registry replication verification expected digest is invalid: ${expectedDigest.take(80)}")
+    }
+    if (timeoutSeconds < 1 || timeoutSeconds > 3600) {
+        error('Registry replication verification timeoutSeconds must be between 1 and 3600.')
+    }
+
+    container('aws') {
+        withEnv([
+            "REPLICATION_TARGET_REGISTRY=${registry}",
+            "REPLICATION_TARGET_REPOSITORY=${repositoryAndTag.substring(0, colon)}",
+            "REPLICATION_TARGET_TAG=${repositoryAndTag.substring(colon + 1)}",
+            "REPLICATION_EXPECTED_DIGEST=${expectedDigest}",
+            "REPLICATION_TIMEOUT_SECONDS=${timeoutSeconds}",
+            "REPLICATION_SOURCE_REVISION=${config.sourceRevision ?: ''}",
+        ]) {
+            sh label: 'Wait for replicated registry image digest', script: '''
+set +x
+set -eu
+python3 - <<'PY'
+import base64
+import json
+import os
+import pathlib
+import re
+import sys
+import time
+import hashlib
+import urllib.error
+import urllib.parse
+import urllib.request
+
+registry = os.environ['REPLICATION_TARGET_REGISTRY']
+repository = os.environ['REPLICATION_TARGET_REPOSITORY']
+tag = os.environ['REPLICATION_TARGET_TAG']
+expected = os.environ['REPLICATION_EXPECTED_DIGEST']
+timeout_seconds = int(os.environ['REPLICATION_TIMEOUT_SECONDS'])
+source_revision = os.environ.get('REPLICATION_SOURCE_REVISION') or ''
+
+config_path = pathlib.Path('/build-secrets/docker/config.json')
+config = json.loads(config_path.read_text(encoding='utf-8'))
+encoded_auth = config.get('auths', {}).get(registry, {}).get('auth', '')
+if not encoded_auth:
+    raise SystemExit('Target registry temporary authentication is missing from the BuildKit config')
+try:
+    base64.b64decode(encoded_auth, validate=True)
+except ValueError as error:
+    raise SystemExit('Target registry temporary authentication is malformed') from error
+
+manifest_url = 'https://%s/v2/%s/manifests/%s' % (
+    registry,
+    '/'.join(urllib.parse.quote(part, safe='') for part in repository.split('/')),
+    urllib.parse.quote(tag, safe=''),
+)
+accept = ', '.join([
+    'application/vnd.oci.image.index.v1+json',
+    'application/vnd.oci.image.manifest.v1+json',
+    'application/vnd.docker.distribution.manifest.list.v2+json',
+    'application/vnd.docker.distribution.manifest.v2+json',
+])
+user_agent = 'loopit-jenkins-registry-replication-verifier'
+
+
+def bearer_token():
+    request = urllib.request.Request(
+        manifest_url,
+        headers={'Accept': accept, 'User-Agent': user_agent},
+        method='HEAD',
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30):
+            raise SystemExit('Target registry unexpectedly accepted an unauthenticated manifest request')
+    except urllib.error.HTTPError as error:
+        if error.code != 401:
+            raise SystemExit(
+                'Target registry authentication challenge failed with HTTP %d' % error.code
+            )
+        challenge = error.headers.get('WWW-Authenticate') or ''
+
+    scheme, separator, raw_parameters = challenge.partition(' ')
+    if not separator or scheme.lower() != 'bearer':
+        raise SystemExit('Target registry did not return a Bearer authentication challenge')
+    parameters = {
+        match.group(1).lower(): match.group(2)
+        for match in re.finditer(r'([A-Za-z][A-Za-z0-9_-]*)="([^"]*)"', raw_parameters)
+    }
+    realm = parameters.get('realm') or ''
+    service = parameters.get('service') or ''
+    scope = parameters.get('scope') or ''
+    expected_scope = 'repository:%s:pull' % repository
+    parsed_realm = urllib.parse.urlsplit(realm)
+    realm_host = (parsed_realm.hostname or '').lower()
+    if (
+        parsed_realm.scheme != 'https'
+        or not realm_host.endswith('.aliyuncs.com')
+        or parsed_realm.username
+        or parsed_realm.password
+    ):
+        raise SystemExit('Target registry returned an untrusted Bearer authentication realm')
+    if not service or scope != expected_scope:
+        raise SystemExit('Target registry returned an unexpected Bearer authentication scope')
+
+    query = urllib.parse.parse_qsl(parsed_realm.query, keep_blank_values=True)
+    query.extend([('service', service), ('scope', scope)])
+    token_url = urllib.parse.urlunsplit(parsed_realm._replace(query=urllib.parse.urlencode(query)))
+    token_request = urllib.request.Request(
+        token_url,
+        headers={
+            'Authorization': 'Basic ' + encoded_auth,
+            'Accept': 'application/json',
+            'User-Agent': user_agent,
+        },
+    )
+    try:
+        with urllib.request.urlopen(token_request, timeout=30) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as error:
+        if error.code in (401, 403):
+            raise SystemExit(
+                'Target registry rejected temporary authentication with HTTP %d' % error.code
+            ) from error
+        raise
+    token = payload.get('token') or payload.get('access_token') or ''
+    if not token:
+        raise SystemExit('Target registry Bearer authentication returned no token')
+    return token
+
+
+token = bearer_token()
+headers = {
+    'Accept': accept,
+    'Authorization': 'Bearer ' + token,
+    'User-Agent': user_agent,
+}
+deadline = time.monotonic() + timeout_seconds
+attempt = 0
+while True:
+    attempt += 1
+    request = urllib.request.Request(manifest_url, headers=headers, method='HEAD')
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            actual = (response.headers.get('Docker-Content-Digest') or '').lower()
+        if not re.fullmatch(r'sha256:[a-f0-9]{64}', actual):
+            raise SystemExit('Replicated image response did not contain a valid Docker-Content-Digest')
+        if actual != expected:
+            raise SystemExit(
+                'Replicated image digest mismatch: expected %s, received %s' % (expected, actual)
+            )
+        if source_revision:
+            # Verify actual bytes, platform and source identity before CD. An
+            # HTTP header alone is not enough to establish the built artifact.
+            def verified_json(url, digest):
+                with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
+                    raw = response.read(4 * 1024 * 1024 + 1)
+                if len(raw) > 4 * 1024 * 1024 or 'sha256:' + hashlib.sha256(raw).hexdigest() != digest:
+                    raise SystemExit('ACR artifact bytes do not match the expected digest')
+                return json.loads(raw)
+            manifest = verified_json(manifest_url, expected)
+            config_digest = (manifest.get('config') or {}).get('digest', '')
+            if not re.fullmatch(r'sha256:[a-f0-9]{64}', config_digest):
+                raise SystemExit('ACR platform manifest is missing a valid config digest')
+            config_url = 'https://%s/v2/%s/blobs/%s' % (registry, repository, config_digest)
+            image_config = verified_json(config_url, config_digest)
+            if (image_config.get('os'), image_config.get('architecture')) != ('linux', 'amd64'):
+                raise SystemExit('ACR image platform must be linux/amd64')
+            runtime_config = image_config.get('config') or {}
+            if (runtime_config.get('Labels') or {}).get('org.opencontainers.image.revision') != source_revision:
+                raise SystemExit('ACR image source revision does not match the requested commit')
+            target = os.environ.get('BUILD_TARGET')
+            if target in ('release', 'room'):
+                from deploy.whitebox.image_storage import validate_history
+                try:
+                    validate_history(image_config, 'room' if target == 'room' else 'cpu')
+                except ValueError as error:
+                    raise SystemExit(str(error)) from error
+            result = {'digest': expected, 'revision': source_revision, 'imageConfig': {
+                'entrypoint': runtime_config.get('Entrypoint') or [],
+                'cmd': runtime_config.get('Cmd') or [],
+            }}
+            output = pathlib.Path('/build-secrets/verified-acr-image.json')
+            output.write_text(json.dumps(result))
+            output.chmod(0o600)
+        print('Replicated image is available with the expected digest after %d check(s).' % attempt)
+        break
+    except urllib.error.HTTPError as error:
+        if error.code in (401, 403):
+            raise SystemExit('Target registry rejected temporary authentication with HTTP %d' % error.code)
+        if error.code not in (404, 408, 429, 500, 502, 503, 504):
+            raise SystemExit('Target registry verification failed with HTTP %d' % error.code)
+    except urllib.error.URLError:
+        pass
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise SystemExit(
+            'Timed out after %d seconds waiting for the replicated image digest' % timeout_seconds
+        )
+    if attempt == 1 or attempt % 12 == 0:
+        print('Replicated image is not ready yet (check %d); waiting.' % attempt)
+        sys.stdout.flush()
+    time.sleep(min(5, remaining))
+PY
+'''
+        }
+    }
+}
+
+String configureLanguageProxy(String ecosystem) {
+    String selected = ecosystem?.trim()?.toLowerCase()
+    if (selected == 'go') {
+        String goProxy = 'http://nexus.nexus.svc.cluster.local:8081/repository/go-proxy|https://proxy.golang.org|direct'
+        env.GOPROXY = goProxy
+        echo 'Go proxy chain: internal Nexus, public upstream, then direct.'
+        return goProxy
+    }
+
+    Map endpoints = [
+        npm: [
+            proxy: 'http://nexus.nexus.svc.cluster.local:8081/repository/npm-proxy/',
+            upstream: 'https://registry.npmjs.org/',
+            checkPath: '-/ping',
+        ],
+        pypi: [
+            proxy: 'http://nexus.nexus.svc.cluster.local:8081/repository/pypi-proxy/simple/',
+            upstream: 'https://pypi.org/simple/',
+            checkPath: 'pip/',
+        ],
+    ]
+    Map endpoint = endpoints[selected]
+    if (endpoint == null) {
+        error("Unsupported language proxy ecosystem: ${ecosystem}")
+    }
+
+    int proxyStatus
+    container('aws') {
+        withEnv(["NEXUS_PROXY_CHECK_URL=${endpoint.proxy}${endpoint.checkPath}"]) {
+            proxyStatus = sh(label: "Check Nexus ${selected} proxy", returnStatus: true, script: '''
+set +x
+python3 - <<'PY'
+import os
+import urllib.request
+
+request = urllib.request.Request(
+    os.environ['NEXUS_PROXY_CHECK_URL'],
+    headers={'User-Agent': 'jenkins-language-proxy-preflight'},
+)
+try:
+    with urllib.request.urlopen(request, timeout=5) as response:
+        if response.status != 200:
+            raise RuntimeError('unexpected HTTP status %s' % response.status)
+except Exception as error:
+    print('Nexus language proxy preflight failed: %s' % error)
+    raise SystemExit(1)
+PY
+''')
+        }
+    }
+
+    String selectedEndpoint = proxyStatus == 0 ? endpoint.proxy : endpoint.upstream
+    if (selected == 'npm') {
+        env.NPM_REGISTRY = selectedEndpoint
+    } else {
+        env.PIP_INDEX_URL = selectedEndpoint
+        env.PIP_TRUSTED_HOST = proxyStatus == 0 ? 'nexus.nexus.svc.cluster.local' : ''
+    }
+    echo(proxyStatus == 0 ? "${selected} registry: internal Nexus proxy." : "${selected} registry: public upstream fallback because Nexus is unavailable.")
+    return selectedEndpoint
+}
+
+void configurePlatformDirectAcrPush(String requestedImage, String ecrRepository, String acrRepository) {
+    String tag = imageTagForDualPush(requestedImage)
+    String requestedRepository = requestedImage.substring(0, requestedImage.length() - tag.length() - 1)
+    if (!(requestedRepository in [ecrRepository, acrRepository])) {
+        error('Platform image does not use an approved repository')
+    }
+    env.IMAGE_REF = requestedImage
+    env.ECR_IMAGE_REF = ecrRepository?.trim() ? "${ecrRepository}:${tag}" : ''
+    env.ACR_IMAGE_REF = "${acrRepository}:${tag}"
+    env.ACR_DIRECT_PUSH = requestedRepository == acrRepository ? 'true' : 'false'
+    List<String> images = []
+    if (ecrRepository?.trim()) { images << env.ECR_IMAGE_REF }
+    if (env.ACR_DIRECT_PUSH == 'true') { images << env.ACR_IMAGE_REF }
+    env.BUILDKIT_IMAGE_OUTPUT = "type=image,\"name=${images.join(',')}\",push=true"
+}
+
+void prepareDirectAcrProxy() {
+    // Thailand uses its ACL-restricted public endpoint from the CI NAT.
+    // The Beijing-only dedicated-line proxy must not intercept this traffic.
+    if (env.ACR_DIRECT_PUSH != 'true' || env.ACR_REGION == 'ap-southeast-7') { return }
+    container('aws') {
+        sh label: 'Prepare dedicated-line ACR proxy', script: '''
+set +x
+set -eu
+python3 - <<'PY'
+import base64
+exec(compile(base64.b64decode('IiIiUHJlcGFyZSBhIHBlci1idWlsZCBsb2NhbCBwcm94eTsgY3JlZGVudGlhbHMgcmVtYWluIGluIHRoZSBwb2QncyBlbXB0eURpci4iIiIKaW1wb3J0IGhhc2hsaWIKaW1wb3J0IGlvCmltcG9ydCBqc29uCmltcG9ydCBvcwpmcm9tIHBhdGhsaWIgaW1wb3J0IFBhdGgKaW1wb3J0IHNvY2tldAppbXBvcnQgc3VicHJvY2VzcwppbXBvcnQgdGltZQppbXBvcnQgdXJsbGliLmVycm9yCmltcG9ydCB1cmxsaWIucmVxdWVzdAppbXBvcnQgemlwZmlsZQoKCmRlZiBhd3MoKmFyZ3MpOgogICAgcmV0dXJuIGpzb24ubG9hZHMoc3VicHJvY2Vzcy5jaGVja19vdXRwdXQoWydhd3MnLCphcmdzLCctLW91dHB1dCcsJ2pzb24nXSkpCgpyb290PVBhdGgoJy9idWlsZC1zZWNyZXRzL2Fjci1wcm94eScpO3Jvb3QubWtkaXIobW9kZT0wbzcwMCxleGlzdF9vaz1UcnVlKQpzZWNyZXQ9YXdzKCdzZWNyZXRzbWFuYWdlcicsJ2dldC1zZWNyZXQtdmFsdWUnLCctLXJlZ2lvbicsJ2FwLXNvdXRoZWFzdC0xJywnLS1zZWNyZXQtaWQnLCdzZWVkbGVhcC9hY3ItcHJveHkvY2xpZW50JykKcGFzc3dvcmQ9anNvbi5sb2FkcyhzZWNyZXRbJ1NlY3JldFN0cmluZyddKVsnc2dfcGFzc3dvcmQnXQppZiBub3QgaXNpbnN0YW5jZShwYXNzd29yZCxzdHIpIG9yIGxlbihwYXNzd29yZCk8MzI6cmFpc2UgU3lzdGVtRXhpdCgnUHJveHkgY3JlZGVudGlhbCBpbnZhbGlkJykKaW5zdGFuY2VzPWF3cygnZWMyJywnZGVzY3JpYmUtaW5zdGFuY2VzJywnLS1yZWdpb24nLCdhcC1zb3V0aGVhc3QtMScsJy0taW5zdGFuY2UtaWRzJywnaS0wZWE4ZTFlYzUwOTAxOWJjZCcpCmluc3RhbmNlPWluc3RhbmNlc1snUmVzZXJ2YXRpb25zJ11bMF1bJ0luc3RhbmNlcyddWzBdCmlmIGluc3RhbmNlWydTdGF0ZSddWydOYW1lJ10hPSdydW5uaW5nJzpyYWlzZSBTeXN0ZW1FeGl0KCdTaW5nYXBvcmUgcHJveHkgaW5zdGFuY2UgaXMgbm90IHJ1bm5pbmcnKQphZGRyZXNzPWluc3RhbmNlLmdldCgnUHVibGljSXBBZGRyZXNzJykKaWYgbm90IGFkZHJlc3M6cmFpc2UgU3lzdGVtRXhpdCgnU2luZ2Fwb3JlIHByb3h5IGluc3RhbmNlIGhhcyBubyByZWFjaGFibGUgcHVibGljIGVuZHBvaW50JykKZG9tYWlucz1bJ2Z1bGw6bG9vcGl0LXJlZ2lzdHJ5LWJqLXJlZ2lzdHJ5LmNuLWJlaWppbmcuY3IuYWxpeXVuY3MuY29tJywnZnVsbDpjci5jbi1iZWlqaW5nLmFsaXl1bmNzLmNvbScsJ2Z1bGw6ZG9ja2VyYXV0aC5jbi1iZWlqaW5nLmFsaXl1bmNzLmNvbScsJ2RvbWFpbjpvc3MtY24tYmVpamluZy5hbGl5dW5jcy5jb20nXQpjb25maWc9eydsb2cnOnsnbG9nbGV2ZWwnOid3YXJuaW5nJ30sJ2luYm91bmRzJzpbeyd0YWcnOididWlsZGtpdCcsJ2xpc3Rlbic6JzEyNy4wLjAuMScsJ3BvcnQnOjE4MTgwLCdwcm90b2NvbCc6J2h0dHAnLCdzZXR0aW5ncyc6e319XSwKICdvdXRib3VuZHMnOlt7J3RhZyc6J2RpcmVjdCcsJ3Byb3RvY29sJzonZnJlZWRvbScsJ3NldHRpbmdzJzp7fX0sCiB7J3RhZyc6J3ZpYS1zZycsJ3Byb3RvY29sJzonc2hhZG93c29ja3MnLCdzZXR0aW5ncyc6eydzZXJ2ZXJzJzpbeydhZGRyZXNzJzphZGRyZXNzLCdwb3J0JzoxNzQ0MywnbWV0aG9kJzonYWVzLTI1Ni1nY20nLCdwYXNzd29yZCc6cGFzc3dvcmR9XX19XSwKICdyb3V0aW5nJzp7J2RvbWFpblN0cmF0ZWd5JzonQXNJcycsJ3J1bGVzJzpbeyd0eXBlJzonZmllbGQnLCdkb21haW4nOmRvbWFpbnMsJ3BvcnQnOic0NDMnLCduZXR3b3JrJzondGNwJywnb3V0Ym91bmRUYWcnOid2aWEtc2cnfV19fQp3aXRoIHVybGxpYi5yZXF1ZXN0LnVybG9wZW4oJ2h0dHBzOi8vZ2l0aHViLmNvbS9YVExTL1hyYXktY29yZS9yZWxlYXNlcy9kb3dubG9hZC92MjUuMy42L1hyYXktbGludXgtNjQuemlwJyx0aW1lb3V0PTYwKSBhcyByZXNwb25zZToKIGRhdGE9cmVzcG9uc2UucmVhZCgxMDAqMTAyNCoxMDI0KQppZiBoYXNobGliLnNoYTI1NihkYXRhKS5oZXhkaWdlc3QoKSE9JzgyZDRiZTNhNWVkOGJkMjYyMWRmOWM5OTEzYzNhMjc2MWI4NmE0MmFlODQ4NWRhODM2Zjc0NDdmZjJlYzNkNGQnOnJhaXNlIFN5c3RlbUV4aXQoJ1Byb3h5IGJpbmFyeSBjaGVja3N1bSBtaXNtYXRjaCcpCmJpbmFyeT1yb290Lyd4cmF5JztiaW5hcnkud3JpdGVfYnl0ZXMoemlwZmlsZS5aaXBGaWxlKGlvLkJ5dGVzSU8oZGF0YSkpLnJlYWQoJ3hyYXknKSk7YmluYXJ5LmNobW9kKDBvNzAwKQpwYXRoPXJvb3QvJ2NvbmZpZy5qc29uJztwYXRoLndyaXRlX3RleHQoanNvbi5kdW1wcyhjb25maWcpKTtwYXRoLmNobW9kKDBvNjAwKQpjaGVjaz1zdWJwcm9jZXNzLnJ1bihbc3RyKGJpbmFyeSksJ3J1bicsJy10ZXN0JywnLWMnLHN0cihwYXRoKV0sY2FwdHVyZV9vdXRwdXQ9VHJ1ZSkKaWYgY2hlY2sucmV0dXJuY29kZTpyYWlzZSBTeXN0ZW1FeGl0KCdQcm94eSBjb25maWd1cmF0aW9uIHZhbGlkYXRpb24gZmFpbGVkJykKZm9yIHAgaW4gW2JpbmFyeSxwYXRoLHJvb3RdOm9zLmNob3duKHAsMTAwMCwxMDAwKQoocm9vdC8ncmVhZHknKS50b3VjaCgpCmZvciBpIGluIHJhbmdlKDEwMCk6CiB0cnk6CiAgd2l0aCBzb2NrZXQuY3JlYXRlX2Nvbm5lY3Rpb24oKCcxMjcuMC4wLjEnLDE4MTgwKSx0aW1lb3V0PS4yKTpicmVhawogZXhjZXB0IE9TRXJyb3I6dGltZS5zbGVlcCguMikKZWxzZTpyYWlzZSBTeXN0ZW1FeGl0KCdMb2NhbCBwcm94eSBkaWQgbm90IHN0YXJ0JykKb3BlbmVyPXVybGxpYi5yZXF1ZXN0LmJ1aWxkX29wZW5lcih1cmxsaWIucmVxdWVzdC5Qcm94eUhhbmRsZXIoeydodHRwcyc6J2h0dHA6Ly8xMjcuMC4wLjE6MTgxODAnfSkpCnRyeToKIG9wZW5lci5vcGVuKCdodHRwczovL2xvb3BpdC1yZWdpc3RyeS1iai1yZWdpc3RyeS5jbi1iZWlqaW5nLmNyLmFsaXl1bmNzLmNvbS92Mi8nLHRpbWVvdXQ9MzApCmV4Y2VwdCB1cmxsaWIuZXJyb3IuSFRUUEVycm9yIGFzIGU6CiBpZiBlLmNvZGUhPTQwMTpyYWlzZSBTeXN0ZW1FeGl0KCdBQ1IgcHJveHkgcHJlZmxpZ2h0IHVuZXhwZWN0ZWQgSFRUUCBzdGF0dXMnKQpwcmludCgnQUNSIHByb3h5IHJlYWR5OyByZWdpc3RyeSBUTFMgdmVyaWZpZWQgdGhyb3VnaCBTaW5nYXBvcmUgYW5kIE5pbmd4aWEnKQo='), 'acr_proxy_client.py', 'exec'))
+PY
+'''
+    }
+    env.HTTPS_PROXY = 'http://127.0.0.1:18180'
+    env.HTTP_PROXY = 'http://127.0.0.1:18180'
+    env.NO_PROXY = 'localhost,127.0.0.1,.svc,.cluster.local,169.254.169.254,169.254.170.2,169.254.170.23'
+}
+
+Map worldModelBuildSpecs() {
+    Map specs = [
+        'whitebox-control': [
+            serviceName: 'whitebox-gateway',
+            gitRepo: 'git@github.com:seedleap/sglang.git',
+            chinaAlias: false,
+            serviceAliases: ['whitebox-coordinator', 'whitebox-mock-worker'],
+            dockerfile: 'docker/whitebox.Dockerfile',
+            target: 'release',
+            tagPrefix: 'whitebox-control',
+            artifactPublisher: false,
+        ],
+        'whitebox-room': [
+            serviceName: 'whitebox-room',
+            gitRepo: 'git@github.com:seedleap/sglang.git',
+            dockerfile: 'docker/whitebox.Dockerfile',
+            target: 'room', tagPrefix: 'whitebox-room', artifactPublisher: false,
+        ],
+        'whitebox-ui': [
+            serviceName: 'world-test-platform-whitebox',
+            gitRepo: 'git@github.com:seedleap/world-test-platform.git',
+            dockerfile: 'Dockerfile.whitebox-lane',
+            target: '', tagPrefix: 'whitebox-ui', artifactPublisher: false,
+        ],
+    ]
+    // Separate Thailand jobs and callback targets; existing Beijing jobs retain
+    // their original allowlists and registry publication behavior.
+    specs['whitebox-th-control'] = [*:specs['whitebox-control'],
+        serviceName: 'whitebox-th-gateway', serviceAliases: ['whitebox-th-coordinator'],
+        registryProfile: 'thailand']
+    specs['whitebox-th-room'] = [*:specs['whitebox-room'],
+        serviceName: 'whitebox-th-room', registryProfile: 'thailand']
+    specs['whitebox-th-ui'] = [*:specs['whitebox-ui']]
+    return specs
+}
+
+Map worldModelBuildSpec() {
+    Map spec = worldModelBuildSpecs()[env.JOB_BASE_NAME]
+    if (spec == null) {
+        error("World Model CI 不允许未知 Job：${env.JOB_BASE_NAME}。")
+    }
+    return spec
+}
+
+boolean isWorldModelPlatformReleaseTag(String requestedTag, String platformTagPrefix) {
+    return requestedTag ==~ /${platformTagPrefix}-(?:[a-z0-9]{12}-)?[0-9]{14}(?:-[0-9a-f]{12})?/
+}
+
+void prepareWorldModelBuild() {
+    Map spec = worldModelBuildSpec()
+    String requestedBranch = params.BRANCH_NAME?.trim() ?: ''
+    if (!requestedBranch) {
+        error('World Model CI 构建分支不能为空。')
+    }
+
+    if (spec.tagPrefix != 'whitebox-ui' && requestedBranch != 'main') {
+        error('SGLang production images must be built from main.')
+    }
+    env.WHITEBOX_SOURCE_BRANCH = requestedBranch
+
+    String requestedService = params.SERVICE_NAME?.trim() ?: ''
+    List<String> allowedServices = [spec.serviceName]
+    if (spec.chinaAlias) {
+        // Keep aliases as java.lang.String: String.equals(GString) is false even
+        // when both values render identically in the validation error.
+        allowedServices << (spec.serviceName + '-cn')
+    }
+    if (spec.serviceAliases) {
+        allowedServices.addAll(spec.serviceAliases)
+    }
+    if (!(requestedService in allowedServices)) {
+        error(
+            "${env.JOB_BASE_NAME} 只允许回调服务 ${allowedServices.join(' 或 ')}" +
+            "，收到 ${requestedService ?: '<empty>'}。"
+        )
+    }
+
+    String gitSha = sh(label: '读取 Git SHA', returnStdout: true, script: 'git rev-parse HEAD').trim()
+    if (!(gitSha ==~ /[0-9a-f]{40}/)) {
+        error("SGLang checkout 未解析出完整 Git SHA，实际为 ${gitSha.take(80)}。")
+    }
+    String dirty = sh(label: '检查源码工作区', returnStdout: true, script: 'git status --porcelain').trim()
+    if (dirty) {
+        error("SGLang checkout 不是 clean commit：\n${dirty.take(1000)}")
+    }
+
+    env.GIT_SHA = gitSha
+    env.SHORT_SHA = gitSha.take(12)
+    env.DOCKERFILE_PATH = spec.dockerfile
+    env.BUILD_TARGET = spec.target
+    env.IMAGE_TAG_PREFIX = spec.tagPrefix
+    env.ARTIFACT_PUBLISHER_IMAGE = spec.artifactPublisher ? 'true' : 'false'
+    env.WORLD_MODEL_CACHE_TAG_PREFIXES = worldModelBuildSpecs().values()*.tagPrefix.unique().join(' ')
+
+    boolean thailand = spec.registryProfile == 'thailand'
+    env.THAILAND_ACR_ONLY = thailand ? 'true' : 'false'
+    env.ACR_REGION = thailand ? 'ap-southeast-7' : 'cn-beijing'
+    env.ACR_REGISTRY = 'loopit-registry-bj-registry.cn-beijing.cr.aliyuncs.com'
+    env.ACR_IMAGE_REPOSITORY = 'loopit-registry-bj-registry.cn-beijing.cr.aliyuncs.com/minwm/sglang-minwm-realtime'
+    env.ACR_INSTANCE_ID = 'cri-ghpj9pt8jwhxdk0e'
+    if (thailand) {
+        env.ACR_REGISTRY = 'lwdp-codex-th-registry.ap-southeast-7.cr.aliyuncs.com'
+        env.ACR_INSTANCE_ID = 'cri-mqlfg5m1ei9q84qx'
+        env.ACR_IMAGE_REPOSITORY = "${env.ACR_REGISTRY}/lwdp/whitebox-runtime"
+        env.RUNTIME_IMAGE_REPOSITORY = 'lwdp-codex-th-registry-vpc.ap-southeast-7.cr.aliyuncs.com/lwdp/whitebox-runtime'
+    }
+    String defaultRepository = thailand ? env.RUNTIME_IMAGE_REPOSITORY : env.ECR_IMAGE_REPOSITORY
+    String legacyImage = "${defaultRepository}:${spec.tagPrefix}-${gitSha}"
+    String requestedImage = params.IMAGE?.trim() ?: legacyImage
+    String requestedTag = imageTagForDualPush(requestedImage)
+    String requestedRepository = requestedImage.substring(0, requestedImage.length() - requestedTag.length() - 1)
+    List<String> allowedRepositories = thailand ? [env.RUNTIME_IMAGE_REPOSITORY] : [env.ECR_IMAGE_REPOSITORY, env.ACR_IMAGE_REPOSITORY]
+    if (!(requestedRepository in allowedRepositories)) {
+        error(
+            "World Model image must use an approved repository: ${allowedRepositories.join(', ')}"
+        )
+    }
+    String platformTagPrefix = requestedBranch
+        .toLowerCase()
+        .replaceAll('[^a-z0-9]+', '-')
+        .replaceAll('(^-+|-+$)', '')
+    if (!platformTagPrefix) {
+        platformTagPrefix = 'main'
+    }
+    boolean isPlatformReleaseTag = isWorldModelPlatformReleaseTag(requestedTag, platformTagPrefix)
+    boolean isLegacySourceTag = requestedTag == "${spec.tagPrefix}-${gitSha}"
+    if (!isPlatformReleaseTag && !isLegacySourceTag) {
+        error(
+            "World Model image tag 必须原样使用平台格式 ${platformTagPrefix}-<record-token>-YYYYMMDDHHMMSS" +
+            "（GitHub Webhook 可追加 12 位 commit SHA）；兼容旧平台 tag ${platformTagPrefix}-YYYYMMDDHHMMSS" +
+            " 和手工构建 tag ${spec.tagPrefix}-${gitSha}。"
+        )
+    }
+    if (thailand) {
+        // Push through the public endpoint, but keep the platform tag and CD
+        // callback on the VPC endpoint. Never publish a second ECR copy.
+        env.IMAGE_REF = requestedImage
+        env.ECR_IMAGE_REF = ''
+        env.ACR_IMAGE_REF = "${env.ACR_IMAGE_REPOSITORY}:${requestedTag}"
+        env.ACR_DIRECT_PUSH = 'true'
+        env.BUILDKIT_IMAGE_OUTPUT = "type=image,name=${env.ACR_IMAGE_REF},push=true"
+    } else {
+        configurePlatformDirectAcrPush(requestedImage, env.ECR_IMAGE_REPOSITORY, env.ACR_IMAGE_REPOSITORY)
+    }
+    currentBuild.displayName = "#${env.BUILD_NUMBER} ${spec.tagPrefix} ${env.SHORT_SHA}"
+    currentBuild.description = "CI only: ${spec.dockerfile}${spec.target ? " target=${spec.target}" : ''}"
+}
+
+String whiteboxBuildkitImage() {
+    return '829115578968.dkr.ecr.us-east-1.amazonaws.com/dockerhub/moby/buildkit:v0.17.2-rootless'
+}
+
+String whiteboxCacheRecipe(Map inputs) {
+    // BuildKit keys source COPY/RUN inputs itself. This identity only selects
+    // compatible trusted layer seeds, never a reusable final source artifact.
+    Map canonical = [schema: 1, dockerfileBase64: inputs.dockerfileBase64,
+        ignoreBase64: inputs.ignoreBase64, requirementsBase64: inputs.requirementsBase64,
+        target: inputs.target, platform: inputs.platform, baseImages: inputs.baseImages,
+        buildkit: inputs.buildkit, frontend: inputs.frontend,
+        sdkRevision: inputs.target == 'room' ? inputs.sdkRevision : '']
+    String result
+    // Keep canonical bytes out of both shell text and the build context. Use
+    // the existing container's hasher, without adding Jenkins signature grants.
+    dir(pwd(tmp: true) + '/whitebox-layer-recipe') {
+        try {
+            writeFile(file: 'canonical.json', text: groovy.json.JsonOutput.toJson(canonical), encoding: 'UTF-8')
+            container('aws') {
+                result = sh(label: 'Hash canonical Whitebox layer recipe', returnStdout: true, script: '''
+set -eu
+sha256sum canonical.json
+''').trim()
+            }
+            if (!(result ==~ /[a-f0-9]{64}  canonical\.json/)) { error('Invalid Whitebox recipe SHA256 output.') }
+        } finally {
+            deleteDir()
+        }
+    }
+    return result.take(64)
+}
+
+List<String> whiteboxEffectiveBaseImages(String dockerfile, Map buildArgs) {
+    Map arguments = [:]
+    Set stages = [] as Set
+    List<String> bases = []
+    dockerfile.replaceAll(/\\\r?\n/, '').readLines().each { line ->
+        def arg = line =~ /(?i)^\s*ARG\s+([A-Z_a-z][A-Z_a-z0-9]*)(?:=(.*))?\s*$/
+        if (arg.matches()) {
+            String name = arg[0][1]
+            arguments[name] = buildArgs.containsKey(name) ? buildArgs[name] : (arg[0][2] ?: '')
+        }
+        def from = line =~ /(?i)^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?\s*$/
+        if (from.matches()) {
+            String reference = from[0][1]
+            arguments.each { name, value ->
+                reference = reference.replace('\${' + name + '}', value.toString())
+                reference = reference.split('\\$' + name + '(?![A-Za-z0-9_])', -1).join(value.toString())
+            }
+            if (reference.contains('$')) { error('Unresolved Dockerfile base image argument in cache recipe.') }
+            if (!stages.contains(reference.toLowerCase()) && reference != 'scratch') { bases << reference }
+            if (from[0][2]) { stages << from[0][2].toLowerCase() }
+        }
+    }
+    return bases.unique()
+}
+
+void prepareWhiteboxCacheRecipe() {
+    env.WHITEBOX_CACHE_RECIPE = ''
+    env.WHITEBOX_CACHE_BRANCH = params.BRANCH_NAME?.trim() ?: ''
+    if (!(env.BUILD_TARGET in ['release', 'room'])) { return }
+    String dockerfileBase64 = readFile(file: env.DOCKERFILE_PATH, encoding: 'Base64')
+    String dockerfile = new String(dockerfileBase64.decodeBase64(), 'UTF-8')
+    String ignorePath = env.DOCKERFILE_PATH + '.dockerignore'
+    if (!fileExists(ignorePath)) { ignorePath = '.dockerignore' }
+    String syntaxLine = dockerfile.readLines().find { it ==~ /\s*#\s*syntax\s*=\s*\S+\s*/ }
+    String frontend = syntaxLine ? syntaxLine.replaceFirst(/\s*#\s*syntax\s*=\s*/, '').trim() : 'dockerfile.v0 (BuildKit builtin)'
+    env.WHITEBOX_CACHE_RECIPE = whiteboxCacheRecipe([
+        dockerfileBase64: dockerfileBase64,
+        ignoreBase64: fileExists(ignorePath) ? readFile(file: ignorePath, encoding: 'Base64') : '',
+        requirementsBase64: readFile(file: 'benchmark/whitebox/requirements.txt', encoding: 'Base64'),
+        target: env.BUILD_TARGET, platform: 'linux/amd64',
+        baseImages: whiteboxEffectiveBaseImages(dockerfile, [PYTHON_IMAGE:env.PYTHON_BASE_IMAGE, GPU_IMAGE:env.GPU_BASE_IMAGE]),
+        buildkit: whiteboxBuildkitImage(), frontend: frontend,
+        sdkRevision: env.BUILD_TARGET == 'room' ? readFile('benchmark/whitebox/sdk-revision.txt').trim() : '',
+    ])
+    echo "Whitebox layer recipe: ${env.WHITEBOX_CACHE_RECIPE}; source: ${env.GIT_SHA}."
+}
+
+List<String> selectWhiteboxCacheCandidates(Map expected, List<Map> records) {
+    List<String> candidates = []
+    records.take(20).each { record ->
+        if (candidates.size() < 3 && record.integrityVerified == true &&
+            record.repository == expected.repository && record.branch == 'main' &&
+            record.branch == expected.branch && record.target in ['release', 'room'] &&
+            record.target == expected.target && record.recipeSha256 == expected.recipeSha256 &&
+            record.platform == 'linux/amd64' && record.platform == expected.platform &&
+            record.sourceRevision ==~ /(?:[a-f0-9]{40}|[a-f0-9]{64})/ &&
+            record.digest ==~ /sha256:[a-f0-9]{64}/) {
+            String reference = "${record.repository}@${record.digest}"
+            if (!candidates.contains(reference)) { candidates << reference }
+        }
+    }
+    return candidates
+}
+
+void discoverWhiteboxCacheCandidates() {
+    if (!env.WHITEBOX_CACHE_RECIPE || env.WHITEBOX_CACHE_BRANCH != 'main' || env.IMAGE_ALREADY_EXISTS == 'true') { return }
+    try {
+        container('aws') {
+            // Only this scoped registry reader creates production integrity records;
+            // the metadata selector's boolean is not a caller-supplied trust proof.
+            String raw = sh(label: 'Verify bounded cross-commit inline cache candidates', returnStdout: true, script: '''
+set +x
+set -eu
+python3 - <<'PY'
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+
+
+def aws(*args):
+    return json.loads(subprocess.check_output(
+        ['aws', 'ecr', *args, '--region', os.environ['AWS_REGION'], '--output', 'json'],
+        text=True, stderr=subprocess.DEVNULL, timeout=30))
+
+
+def checked_json(raw, expected):
+    # Match the release verifier: validate actual manifest/config bytes, not
+    # just registry headers or metadata. This path uses the existing AWS ECR
+    # credential/URL owner; it adds no Bearer realm or alternate registry.
+    if len(raw) > 4 * 1024 * 1024 or 'sha256:' + hashlib.sha256(raw).hexdigest() != expected:
+        raise ValueError('Cache artifact bytes do not match the registry digest')
+    return json.loads(raw)
+
+
+records = []
+try:
+    registry = os.environ['ECR_REGISTRY']
+    repository = os.environ['ECR_REPOSITORY']
+    full_repository = os.environ['ECR_IMAGE_REPOSITORY']
+    account = os.environ['AWS_ACCOUNT_ID']
+    if (full_repository != registry + '/' + repository
+        or registry != account + '.dkr.ecr.' + os.environ['AWS_REGION'] + '.amazonaws.com'
+        or account != '829115578968' or repository != 'leap-world/minwm-realtime'):
+        raise ValueError('Cache repository is outside the existing ECR scope')
+    # AWS CLI applies this JSON query after pagination; only the 20 newest
+    # records enter artifact inspection. No tag is used after discovery.
+    details = aws('describe-images', '--repository-name', repository,
+                  '--filter', 'tagStatus=TAGGED',
+                  '--query', 'reverse(sort_by(imageDetails,&imagePushedAt))[:20]')
+    if isinstance(details, dict):
+        details = details.get('imageDetails', [])
+    inspected = set()
+    for detail in details[:20]:
+        if len(records) >= 3:
+            break
+        digest = ''
+        try:
+            digest = detail.get('imageDigest', '')
+            if not re.fullmatch(r'sha256:[a-f0-9]{64}', digest) or digest in inspected:
+                continue
+            inspected.add(digest)
+            response = aws('batch-get-image', '--repository-name', repository,
+                           '--image-ids', 'imageDigest=' + digest,
+                           '--accepted-media-types', 'application/vnd.docker.distribution.manifest.v2+json',
+                           'application/vnd.oci.image.manifest.v1+json')
+            images = response.get('images') or []
+            if len(images) != 1:
+                raise ValueError('Cache manifest is unavailable')
+            image = images[0]
+            if (image.get('registryId') != account or image.get('repositoryName') != repository
+                or (image.get('imageId') or {}).get('imageDigest') != digest):
+                raise ValueError('Cache response has a different repository or digest')
+            manifest = checked_json(image['imageManifest'].encode('utf-8'), digest)
+            config_digest = (manifest.get('config') or {}).get('digest', '')
+            if not re.fullmatch(r'sha256:[a-f0-9]{64}', config_digest):
+                raise ValueError('Cache manifest has no valid image config')
+            location = aws('get-download-url-for-layer', '--repository-name', repository,
+                           '--layer-digest', config_digest)
+            with urllib.request.urlopen(location['downloadUrl'], timeout=30) as blob:
+                config = checked_json(blob.read(4 * 1024 * 1024 + 1), config_digest)
+            labels = (config.get('config') or {}).get('Labels') or {}
+            revision = labels.get('org.opencontainers.image.revision', '')
+            branch = labels.get('org.worldkit.whitebox.cache.branch', '')
+            target = labels.get('org.worldkit.whitebox.cache.target', '')
+            recipe = labels.get('org.worldkit.whitebox.cache.recipe-sha256', '')
+            if ((config.get('os'), config.get('architecture')) != ('linux', 'amd64')
+                or not re.fullmatch(r'(?:[a-f0-9]{40}|[a-f0-9]{64})', revision)
+                or branch != 'main' or branch != os.environ['WHITEBOX_CACHE_BRANCH']
+                or target not in ('release', 'room') or target != os.environ['BUILD_TARGET']
+                or recipe != os.environ['WHITEBOX_CACHE_RECIPE']):
+                raise ValueError('Cache image labels or platform are not eligible')
+            records.append({'repository': full_repository, 'digest': digest,
+                            'sourceRevision': revision, 'branch': branch, 'target': target,
+                            'recipeSha256': recipe, 'platform': 'linux/amd64', 'integrityVerified': True})
+        except (Exception, SystemExit):
+            print('Whitebox layer cache miss: ineligible or unavailable artifact ' + str(digest)[:71], file=sys.stderr)
+except (Exception, SystemExit):
+    print('Whitebox layer cache miss: optional bounded discovery unavailable', file=sys.stderr)
+print(json.dumps(records))
+PY
+''').trim()
+            List<Map> records = (List<Map>) new groovy.json.JsonSlurperClassic().parseText(raw)
+            List<String> refs = selectWhiteboxCacheCandidates([
+                repository:env.ECR_IMAGE_REPOSITORY, branch:env.WHITEBOX_CACHE_BRANCH,
+                target:env.BUILD_TARGET, recipeSha256:env.WHITEBOX_CACHE_RECIPE, platform:'linux/amd64'], records)
+            if (refs) {
+                // References are fixed repository + validated hex digests; no tag
+                // can move between verification and the actual BuildKit import.
+                withEnv(["WHITEBOX_VERIFIED_CACHE_REFS=${refs.join('\n')}"]) {
+                    sh(label: 'Append verified layer candidates to BuildKit imports', script: '''
+set +x
+set -eu
+printf '%s\n' "$WHITEBOX_VERIFIED_CACHE_REFS" >> /build-secrets/world-model-cache-imports
+''')
+                }
+                refs.each { echo "Verified Whitebox layer candidate: ${it}" }
+            } else {
+                echo 'Whitebox layer cache miss: no eligible verified candidates.'
+            }
+        }
+    } catch (InterruptedException interrupted) {
+        throw interrupted
+    } catch (Exception lookupFailure) {
+        echo 'Whitebox layer cache miss: optional lookup failed; continuing with existing imports.'
+    }
+}
+
+void prepareWorldModelEcr() {
+    container('aws') {
+        sh(label: '校验 ECR 边界并生成 BuildKit 凭据', script: '''
+set +x
+set -eu
+account_id="$(aws sts get-caller-identity --query Account --output text)"
+if [ "$account_id" != "$AWS_ACCOUNT_ID" ]; then
+  echo "World Model CI AWS account 不匹配。" >&2
+  exit 1
+fi
+mutability="$(aws ecr describe-repositories \
+  --region "$AWS_REGION" \
+  --repository-names "$ECR_REPOSITORY" \
+  --query 'repositories[0].imageTagMutability' \
+  --output text)"
+if [ "$mutability" != IMMUTABLE ]; then
+  echo "ECR repository 必须启用 immutable tags，实际为 $mutability。" >&2
+  exit 1
+fi
+mkdir -p /build-secrets/docker
+password="$(aws ecr get-login-password --region "$AWS_REGION")"
+auth="$(printf 'AWS:%s' "$password" | base64 | tr -d '\n')"
+printf '{"auths":{"%s":{"auth":"%s"}}}\n' "$ECR_REGISTRY" "$auth" > /build-secrets/docker/config.json
+unset password auth
+chown 1000:1000 /build-secrets/docker/config.json
+chmod 600 /build-secrets/docker/config.json
+''')
+
+        String digest = sh(label: '检查 immutable image 是否已存在', returnStdout: true, script: '''
+set +x
+set -eu
+if [ "$THAILAND_ACR_ONLY" = true ]; then
+  exit 0
+fi
+tag="${ECR_IMAGE_REF##*:}"
+aws ecr describe-images \
+  --region "$AWS_REGION" \
+  --repository-name "$ECR_REPOSITORY" \
+  --image-ids "imageTag=$tag" \
+  --query 'imageDetails[0].imageDigest' \
+  --output text 2>/dev/null || true
+''').trim()
+        if (digest == 'None') {
+            digest = ''
+        }
+        if (digest && !(digest ==~ /sha256:[0-9a-f]{64}/)) {
+            error("ECR 返回的 image digest 格式不正确：${digest.take(80)}")
+        }
+        env.IMAGE_ALREADY_EXISTS = digest ? 'true' : 'false'
+        if (digest) {
+            env.IMAGE_DIGEST = digest
+            echo "复用已存在的 immutable image ${env.IMAGE_REF}@${digest}。"
+        }
+
+        sh(label: '发现可复用的 inline BuildKit cache', script: '''
+set +x
+set -eu
+cache_file=/build-secrets/world-model-cache-imports
+: > "$cache_file"
+if [ "$IMAGE_ALREADY_EXISTS" = true ]; then
+  exit 0
+fi
+for prefix in $WORLD_MODEL_CACHE_TAG_PREFIXES; do
+  tag="${prefix}-${GIT_SHA}"
+  if aws ecr describe-images \
+    --region "$AWS_REGION" \
+    --repository-name "$ECR_REPOSITORY" \
+    --image-ids "imageTag=$tag" >/dev/null 2>&1; then
+    printf '%s:%s\n' "$IMAGE_REPOSITORY" "$tag" >> "$cache_file"
+    echo "BuildKit inline cache candidate: ${IMAGE_REPOSITORY}:${tag}"
+  fi
+done
+chown 1000:1000 "$cache_file"
+chmod 600 "$cache_file"
+''')
+    }
+}
+
+void resolveWorldModelImageDigest() {
+    if (env.THAILAND_ACR_ONLY == 'true') {
+        captureBuildKitImageDigest()
+        return
+    }
+    container('aws') {
+        String digest = sh(label: '读取 World Model ECR digest', returnStdout: true, script: '''
+set -eu
+tag="${IMAGE_REF##*:}"
+attempt=0
+while [ "$attempt" -lt 12 ]; do
+  digest="$(aws ecr describe-images \
+    --region "$AWS_REGION" \
+    --repository-name "$ECR_REPOSITORY" \
+    --image-ids "imageTag=$tag" \
+    --query 'imageDetails[0].imageDigest' \
+    --output text 2>/dev/null || true)"
+  case "$digest" in
+    sha256:????????????????????????????????????????????????????????????????)
+      printf '%s' "$digest"
+      exit 0
+      ;;
+  esac
+  attempt=$((attempt + 1))
+  sleep 5
+done
+echo "无法从 ECR 读取 registry digest: $IMAGE_REF" >&2
+exit 1
+''').trim()
+        if (!(digest ==~ /sha256:[0-9a-f]{64}/)) {
+            error("ECR 返回的 registry digest 格式不正确：${digest.take(80)}")
+        }
+        env.IMAGE_DIGEST = digest
+        echo "World Model image digest: ${env.IMAGE_REF}@${digest}"
+    }
+}
+
+pipeline {
+    agent {
+        kubernetes {
+            defaultContainer 'jnlp'
+            yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    container.apparmor.security.beta.kubernetes.io/buildkit: unconfined
+spec:
+  serviceAccountName: jenkins-agent
+  volumes:
+    - name: build-secrets
+      emptyDir: {}
+  nodeSelector:
+    role: jenkins
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: jenkins
+      effect: NoSchedule
+  containers:
+    - name: jnlp
+      image: 829115578968.dkr.ecr.us-east-1.amazonaws.com/loopit-cloud-manager-api:mirror-jenkins-inbound-agent-3355-v388858a-47b-33-3-jdk21
+      imagePullPolicy: IfNotPresent
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "256Mi"
+    - name: aws
+      image: 829115578968.dkr.ecr.us-east-1.amazonaws.com/aws-cli/aws-cli@sha256:cead0c35cb7e678effed765d116d945a4923a6d73527a42e77f89ca0e8908448
+      imagePullPolicy: IfNotPresent
+      command: [sleep]
+      args: [infinity]
+      volumeMounts:
+        - name: build-secrets
+          mountPath: /build-secrets
+      resources:
+        requests:
+          cpu: "250m"
+          memory: "512Mi"
+        limits:
+          cpu: "2"
+          memory: "2Gi"
+    - name: tools
+      image: 829115578968.dkr.ecr.us-east-1.amazonaws.com/loopit-cloud-manager-api:mirror-node-22-bookworm-slim
+      imagePullPolicy: IfNotPresent
+      command: [sleep]
+      args: [infinity]
+      resources:
+        requests:
+          cpu: "50m"
+          memory: "128Mi"
+        limits:
+          cpu: "1"
+          memory: "512Mi"
+    - name: acr-proxy
+      image: 829115578968.dkr.ecr.us-east-1.amazonaws.com/aws-cli/aws-cli@sha256:cead0c35cb7e678effed765d116d945a4923a6d73527a42e77f89ca0e8908448
+      command: ["sh", "-c"]
+      args: ["while [ ! -f /build-secrets/acr-proxy/ready ]; do sleep 1; done; exec /build-secrets/acr-proxy/xray run -c /build-secrets/acr-proxy/config.json"]
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+      resources:
+        requests:
+          cpu: "50m"
+          memory: "64Mi"
+        limits:
+          cpu: "1"
+          memory: "256Mi"
+      volumeMounts:
+        - name: build-secrets
+          mountPath: /build-secrets
+
+    - name: buildkit
+      image: ${whiteboxBuildkitImage()}
+      imagePullPolicy: IfNotPresent
+      command: [sleep]
+      args: [infinity]
+      volumeMounts:
+        - name: build-secrets
+          mountPath: /build-secrets
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: Unconfined
+      resources:
+        requests:
+          cpu: "2"
+          memory: "2Gi"
+          ephemeral-storage: "8Gi"
+        limits:
+          cpu: "8"
+          memory: "8Gi"
+          ephemeral-storage: "16Gi"
+"""
+        }
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    environment {
+        AWS_ACCOUNT_ID = '829115578968'
+        AWS_REGION = 'us-east-2'
+        ECR_REGISTRY = '829115578968.dkr.ecr.us-east-2.amazonaws.com'
+        ECR_REPOSITORY = 'leap-world/minwm-realtime'
+        IMAGE_REPOSITORY = '829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-realtime'
+        ECR_IMAGE_REPOSITORY = '829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-realtime'
+        PYTHON_BASE_IMAGE = 'public.ecr.aws/docker/library/python@sha256:d657ab0ade19f404a6ccc883ab399540de667aff751748ce23c07330c5a89e64'
+        GPU_BASE_IMAGE = '829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-runtime@sha256:3fc2bb1e8aef10c53160c13ce00490ce48ed3be812f9c05da9d51a27da0be1b4'
+    }
+
+    stages {
+        stage('Checkout SGLang') {
+            steps {
+                sh '''
+git config --global filter.lfs.smudge "git-lfs smudge --skip -- %f"
+git config --global filter.lfs.process "git-lfs filter-process --skip"
+git config --global filter.lfs.required false
+'''
+                script {
+                    String branch = params.BRANCH_NAME?.trim() ?: ''
+                    String commitSha = platformCommitSha()
+                    if (!branch) {
+                        error('World Model CI 构建分支不能为空。')
+                    }
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: commitSha ?: "*/${branch}"]],
+                        extensions: [
+                            [$class: 'CleanBeforeCheckout'],
+                            [$class: 'CloneOption', noTags: true, shallow: !commitSha, depth: 1]
+                        ],
+                        userRemoteConfigs: [[
+                            url: worldModelBuildSpec().gitRepo,
+                            credentialsId: 'github-ssh-key'
+                        ]]
+                    ])
+                    verifyPlatformSourceRevision(branch, commitSha)
+                    prepareWorldModelBuild()
+                }
+            }
+        }
+
+        stage('Pinned CLI SDK') {
+            when { expression { env.BUILD_TARGET == 'room' } }
+            steps {
+                script {
+                    String sdkSha = readFile('benchmark/whitebox/sdk-revision.txt').trim()
+                    if (!(sdkSha ==~ /[0-9a-f]{40}/)) { error('Invalid CLI SDK revision') }
+                    dir('.whitebox-sdk') { deleteDir() }
+                    dir('.whitebox-sdk-checkout') {
+                        deleteDir()
+                        try {
+                            checkout([
+                                $class: 'GitSCM', branches: [[name: sdkSha]],
+                                extensions: [[$class: 'CleanBeforeCheckout']],
+                                userRemoteConfigs: [[url: 'git@github.com:seedleap/agent-whitebox-world-sdk.git', credentialsId: 'github-ssh-key']]
+                            ])
+                            withEnv(["WHITEBOX_SDK_REVISION=${sdkSha}", "WHITEBOX_SOURCE_BRANCH=${params.BRANCH_NAME?.trim() ?: ''}"]) {
+                                sh '''
+set -eu
+test "$(git rev-parse HEAD)" = "$WHITEBOX_SDK_REVISION"
+# GitSCM fetched both shared branches using the scoped checkout credential.
+# Validate locally; shell commands must not initiate an unauthenticated fetch.
+git merge-base --is-ancestor "$WHITEBOX_SDK_REVISION" origin/dev
+test -z "$(git status --porcelain)"
+archive="$(mktemp)"
+trap 'rm -f "$archive"' EXIT
+sh ../deploy/whitebox/room-sdk-archive.sh . "$WHITEBOX_SDK_REVISION" > "$archive"
+mkdir ../.whitebox-sdk
+tar -xf "$archive" -C ../.whitebox-sdk
+'''
+                            }
+                        } finally {
+                            deleteDir()
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Platform Dockerfile') {
+            steps {
+                script {
+                    downloadPlatformDockerfile(env.DOCKERFILE_PATH)
+                    prepareWhiteboxCacheRecipe()
+                }
+            }
+        }
+
+        stage('Source and Build Contract') {
+            steps {
+                sh '''
+set -eu
+git diff --check
+test -s "$DOCKERFILE_PATH"
+if [ "$IMAGE_TAG_PREFIX" = whitebox-ui ]; then
+  test -s server/whitebox-lane.mjs
+  test -s pnpm-lock.yaml
+else
+  test -s benchmark/whitebox/requirements.txt
+  test -s benchmark/whitebox/run_service.py
+fi
+# The release image depends on its checks stage: actual CPU tests run
+# during BuildKit. No model, shared Redis, OSS writes or Kubernetes CD here.
+'''
+            }
+        }
+
+        stage('Registry Preflight') {
+            steps {
+                script {
+                    prepareWorldModelEcr()
+                    discoverWhiteboxCacheCandidates()
+                    prepareDirectAcrProxy()
+                    if (env.ACR_DIRECT_PUSH == 'true') { addAcrRegistryAuth(instanceId: env.ACR_INSTANCE_ID, registry: env.ACR_REGISTRY, region: env.ACR_REGION) }
+                }
+            }
+        }
+
+        stage('Build and Push Immutable Image') {
+            when {
+                expression { env.IMAGE_ALREADY_EXISTS != 'true' }
+            }
+            steps {
+                container('buildkit') {
+                    sh '''
+set -eu
+export DOCKER_CONFIG=/build-secrets/docker
+export BUILDKITD_FLAGS=--oci-worker-no-process-sandbox
+dockerfile_dir="$(dirname "$DOCKERFILE_PATH")"
+dockerfile_name="$(basename "$DOCKERFILE_PATH")"
+set -- buildctl-daemonless.sh build \
+  --frontend dockerfile.v0 \
+  --local context="$WORKSPACE" \
+  --local dockerfile="$WORKSPACE/$dockerfile_dir" \
+  --opt filename="$dockerfile_name" \
+  --opt platform=linux/amd64 \
+  --opt build-arg:PYTHON_IMAGE="$PYTHON_BASE_IMAGE" \
+  --opt build-arg:GPU_IMAGE="$GPU_BASE_IMAGE" \
+  --opt build-arg:SOURCE_REVISION="$GIT_SHA" \
+  --opt label:org.opencontainers.image.revision="$GIT_SHA" \
+  --progress plain
+if [ -f benchmark/whitebox/sdk-revision.txt ]; then
+  sdk_sha="$(cat benchmark/whitebox/sdk-revision.txt)"
+  set -- "$@" --opt build-arg:WHITEBOX_SOURCE_SHA="$GIT_SHA" \
+    --opt build-arg:WHITEBOX_SDK_SHA="$sdk_sha" \
+    --opt build-arg:WHITEBOX_SOURCE_BRANCH="$WHITEBOX_SOURCE_BRANCH"
+fi
+if [ -n "$BUILD_TARGET" ]; then
+  set -- "$@" --opt target="$BUILD_TARGET"
+fi
+if [ -n "${WHITEBOX_CACHE_RECIPE:-}" ]; then
+  set -- "$@" \
+    --opt label:org.worldkit.whitebox.cache.branch="$WHITEBOX_CACHE_BRANCH" \
+    --opt label:org.worldkit.whitebox.cache.target="$BUILD_TARGET" \
+    --opt label:org.worldkit.whitebox.cache.recipe-sha256="$WHITEBOX_CACHE_RECIPE"
+fi
+while IFS= read -r cache_ref; do
+  if [ -n "$cache_ref" ]; then
+    set -- "$@" --import-cache "type=registry,ref=$cache_ref"
+  fi
+done < /build-secrets/world-model-cache-imports
+"$@" \
+  --export-cache type=inline \
+  --metadata-file /build-secrets/image-metadata.json \
+  --output "$BUILDKIT_IMAGE_OUTPUT"
+'''
+                }
+            }
+        }
+
+        stage('Reuse Immutable Image') {
+            when {
+                expression { env.IMAGE_ALREADY_EXISTS == 'true' }
+            }
+            steps {
+                echo "immutable image 已存在；跳过重复 push：${env.IMAGE_REF}@${env.IMAGE_DIGEST}"
+            }
+        }
+
+        stage('Resolve Registry Digest') {
+            steps {
+                script {
+                    resolveWorldModelImageDigest()
+                }
+            }
+        }
+
+        stage('Verify Regional ACR Image') {
+            when {
+                expression { env.ACR_DIRECT_PUSH == 'true' }
+            }
+            steps {
+                script {
+                    waitForRegistryImageDigest(
+                        registry: env.ACR_REGISTRY,
+                        image: env.ACR_IMAGE_REF,
+                        expectedDigest: env.IMAGE_DIGEST,
+                        timeoutSeconds: 60,
+                        sourceRevision: env.THAILAND_ACR_ONLY == 'true' ? env.GIT_SHA : '',
+                    )
+                }
+            }
+        }
+    }
+
+    post {
+        success { script { callbackPlatform('SUCCESS') } }
+        failure { script { callbackPlatform('FAILURE') } }
+        aborted { script { callbackPlatform('ABORTED') } }
+        unstable { script { callbackPlatform('UNSTABLE') } }
+        // Callback consumes the verified artifact; cleanup runs after all outcomes.
+        cleanup {
+            container('aws') {
+                sh label: '清理构建凭据', returnStatus: true, script: 'rm -rf /build-secrets/docker /build-secrets/world-model-cache-imports /build-secrets/image-metadata.json /build-secrets/verified-acr-image.json'
+            }
+        }
+    }
+}

@@ -59,7 +59,12 @@ def device_id_to_physical_device_id(device_id: int) -> int:
                 " more information."
             )
             raise RuntimeError(msg)
-        physical_device_id = device_ids[device_id]
+        physical_device_id = device_ids[device_id].strip()
+        if physical_device_id.startswith("GPU-"):
+            # NVML ignores CUDA_VISIBLE_DEVICES. Resolve the allocated UUID
+            # explicitly instead of treating a logical ordinal as a host index.
+            handle = pynvml.nvmlDeviceGetHandleByUUID(physical_device_id)
+            return int(pynvml.nvmlDeviceGetIndex(handle))
         return int(physical_device_id)
     else:
         return device_id

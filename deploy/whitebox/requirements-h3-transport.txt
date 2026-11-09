@@ -1,0 +1,4 @@
+# H3 GPU owner only. Compatible with python/pyproject.toml and SourceTransportBudget.
+# Install into the serving environment, not the separate CPU gateway image.
+uvicorn==0.39.0
+websockets==15.0.1

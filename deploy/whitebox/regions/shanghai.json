@@ -1,0 +1,5 @@
+{
+  "region": "cn-shanghai", "deployment": "whitebox-sh",
+  "gpu": {"capability": [9, 0], "minimum_memory_gib": 130},
+  "model": {"cache_dir": "/var/cache/sglang/block0/shanghai"}
+}

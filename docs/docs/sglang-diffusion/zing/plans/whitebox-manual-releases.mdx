@@ -1,0 +1,408 @@
+---
+title: "Whitebox 两地人工发布"
+description: "main 统一源码、上海与泰国配置，以及人工构建、启用和回滚的边界。"
+---
+
+`main` 是 SGLang 的上线源码分支。本仓库 PR CI 执行测试；平台 GitHub webhook/自动发布规则必须另行回读，不能仅凭仓库 CI 推断云端没有自动动作。
+运维人员分别选择构建时点和地区启用时点。上海和泰国可以运行同一源码的不同配置，也可以在人工滚动期间暂时运行不同已验证版本。
+
+本实现位于仓库 `deploy/whitebox/`。它准备配置、构建本地镜像、核对版本；不创建云资源、不调用发布 API。
+区域启用继续使用现有 Loopit/PAI/ECS 管理入口。
+
+## 源码与配置
+
+- `common.json`：公共模型、单活跃 Slot、采样、网络编码和三路归档策略。
+- `regions/shanghai.json`、`regions/thailand.json`：硬件要求、缓存路径和资源预算；不允许覆盖模型行为、时长或媒体策略。
+- `bindings.example.json`：站点地址、资源路径、owner、Redis 前缀等部署接线示例。复制到 Git 外填写；示例不能直接上线。
+- `benchmark/whitebox/sdk-revision.txt`：完整 SDK 提交 SHA，包含原生首帧 capture hold/resume 与恢复输入租约。
+- `release.py`：`plan`、`build`、`verify`，均无上线动作。
+- `model_service.py`：已分配四卡内部的 Encoder + Conditioning + SP2 DiT + Decoder 进程管理；不会申请或替换 GPU。
+
+| 项目 | 上海 | 泰国 |
+| --- | --- | --- |
+| GPU 配置 | H200，4 卡 | B300，4 卡 |
+| 输入／模型尺寸 | 832×480 | 832×480 |
+| 白模采集目标 | 30 FPS | 30 FPS |
+| 模型网络编码预算 | 2–4 Mbps | 2–4 Mbps |
+| 白模网络预算上限 | 1 Mbps | 1 Mbps |
+| 三路归档预算 | 各 4 Mbps | 各 4 Mbps |
+| 每玩家时长 | 1800 秒 | 1800 秒 |
+| L1／本地 L2 预算 | 416 GB／700 GB | 416 GB／700 GB |
+| AdaLN | resident | resident |
+| Source work quantum / prompt joint | 1 / false | 1 / false |
+| 窗口 / sink | 6 / 0 | 6 / 0 |
+
+码率是编码预算，不是每秒实际媒体吞吐保证；静止画面与拥塞仍可能低于目标。
+L1 的 416 GB 是容量预算，不保证任意输入都能容纳五组；单组大小取决于实际 prefix、图数和执行布局。
+不把这里的固定 480 配置外推到 source480/model736 或 720p。
+
+## 生成可审阅配置
+
+从当前生产配置读取准确地址和身份后，在本地执行：
+
+```bash
+python deploy/whitebox/release.py plan \
+  --region shanghai \
+  --bindings /private/release/shanghai-bindings.json \
+  --output /private/release/shanghai-release.json
+```
+
+泰国使用 `--region thailand` 和自己的 bindings。输出包含各角色托管环境变量、所需 Secret 名称、配置摘要和重启范围。
+`plan` 不连接任何服务，不覆盖已存在的输出文件。修改方案后使用新文件名。
+
+Secret 的值仍由原平台注入；JSON 不接受 Token/AK/SK。应用 `environments` 时，只更新其中托管的键，保留平台的其他鉴权、RTC 接线、WTP 绑定、探针、卷和日志配置。
+`WHITEBOX_RELEASE_BUNDLE` 默认挂载为 `/run/whitebox/release.json`，其内容为同一次生成的完整 bundle。
+
+## 人工构建
+
+先固定 Worldkit `dev` 上的完整 SDK SHA 并确认构建端可取到，再将对应 SGLang 变更合入 `main`；不要求先将 SDK 变更合入其 white_box 分支。
+SDK 源码合并不等于发布公共 World runtime/channel，也不改写已封存世界的 SDK 身份。
+
+```bash
+git fetch origin main
+python deploy/whitebox/release.py build \
+  --source <main完整提交SHA> \
+  --sdk-checkout /path/to/worldkit-monorepo \
+  --component room --tag <registry>/whitebox-room:<release>
+```
+
+`--component cpu` 构建 Coordinator/Gateway；`--component room` 构建 CPU Room；
+`--component model --base <CUDA依赖镜像>@sha256:<digest>` 构建模型运行镜像。
+H200/B300 可以使用不同的 CUDA/torch/kernel 依赖镜像，但都从同一完整 SGLang SHA 取源码。
+依赖镜像须与该版本原生扩展 ABI 兼容，首次切换必须验证；源码覆盖本身不证明兼容。
+
+工具只接受已进入本地新鲜 SGLang `origin/main` 历史的提交，并验证固定 SDK SHA 位于 Worldkit `origin/dev`；导出两份准确提交的 Git archive，
+不携带工作区脏改动、node_modules、凭证或容器内补丁。Room 构建执行首帧控制契约和现有镜像验收。
+构建不会 `push`，也不会自动启用任何地区；registry 推送和平台选择 digest 都是后续人工动作。
+实际运行镜像 digest 从平台读取，不能把 mutable tag 当作发布证据。
+
+Room 的 SDK 构建输入只排除 `asset-library/subjects` 和 `asset-library/tests`。
+手工构建和仓库 Jenkins 使用同一个归档脚本，保留 SDK 固定 SHA、依赖锁和 Room 校验。
+需要从外部向上海构建机传 SDK 时，在发送前按同一规则生成压缩包：
+
+```bash
+set -o pipefail
+python deploy/whitebox/release.py room-sdk-archive \
+  --source <main完整提交SHA> \
+  --sdk-checkout /path/to/worldkit-monorepo | gzip -n -1 > room-sdk.tar.gz
+shasum -a 256 room-sdk.tar.gz
+```
+
+在上海校验压缩包摘要后，解包到同一 SGLang 提交的构建上下文 `.whitebox-sdk/`，
+继续执行原 Room Dockerfile 的 `room` 目标及镜像验收。
+
+现有云平台可能保存独立 Dockerfile/Jenkins 定义。首次迁移时必须人工确认其使用仓库完整构建入口，
+删除旧的“只覆盖 whitebox 子目录”构建方式及 SDK 文件覆盖步骤。**只合并源码不会更改平台保存的构建定义。**
+
+## 模型启动与资产
+
+使用当前bundle生成新的 `asset_root` 视图与准备回执；原部署视图保留供完整回滚，不能拿旧回执冒充新bundle：
+
+```text
+PREP_COMPLETE.json
+model/zing_config.json
+model/zing_realtime_profile.json
+pipeline.json
+conditioning-profile.json
+worker.secret.json
+service.secret.json
+```
+
+权重、Lynn Decoder、表和所有配置引用路径须真实可访问。这里不复制或修改训练资产，不执行缓存清理，不改变缓存锁或 KV 校验逻辑。
+权重身份保持 1027 step10000 AR+DMD、`[3,2]`、`split_first_latent=false`。
+Conditioning profile 必须对应实际硬件、依赖和模型；迁移硬件时按原生 profile 工具重新准备，不能沿用其他 GPU 的数值环境声明。
+
+只查看角色命令（不启动进程）：
+
+```bash
+python deploy/whitebox/model_service.py --bundle /private/release/shanghai-release.json
+```
+
+人工排空会话后，在已获授权的同一四卡分配中，将 bundle 挂到约定路径，注入 `environments.model` 和现有 Secret：
+
+```bash
+python deploy/whitebox/model_service.py \
+  --bundle /run/whitebox/release.json --run \
+  --gpu-uuids GPU-a,GPU-b,GPU-c,GPU-d --retries 0
+```
+
+示例 UUID 必须替换为该作业实际分配并核准的四卡，顺序为 DiT0、DiT1、Encoder+Conditioning、Decoder。
+启动顺序是 Encoder、Conditioning、Decoder、DiT，全体 ready 后才发 worker 心跳。
+任一角色失败会保存失败状态并清理本次启动的子进程组，随后退出；不自动重启。运行中清理未知的玩家和 Worker 保持隔离，须人工核实后恢复。
+`SIGUSR1` 不重启健康服务；`SIGTERM` 清理本 launcher 的进程，不搜索或终止其他训练。
+平台外层也必须禁用自动模型重试。首次迁移须先完整停止旧服务 owner，否则新旧心跳、端口和角色会冲突。
+
+## 人工按地区启用与回滚
+
+1. 保存该地区当前源码、镜像 digest、托管环境变量、资产配置与所有启动命令；检查已有会话。
+2. 人工暂停新准入，等待当前会话结束；单 Slot 不增加其他卡做并行灰度。
+3. 选择新镜像 digest 和该地区 bundle。模型代码或模型参数变化须完整更新相关模型角色；仅 Room 编码参数变化可只重启 Room。
+4. 核对实际源码、GPU 归属、模型配置、缓存目录、健康与版本；做 Prefill miss/L1/L2、Prompt 热更新、真实视频、取消与下一会话验证。
+5. 通过后恢复新准入。失败时人工恢复原镜像和原配置，完整重启原模型 owner；保留缓存、录像与失败证据。
+
+这是未来上线流程，本次实现未执行上述线上动作。
+完整重启清空 L1；L2 可能因执行指纹变化而未命中。不要改名或移动 key 强行制造命中，保留原目录供回滚。
+
+## 新同事先确认的输入与两个运行方式
+
+本节的路径变量必须由本轮真实接线填写；未填值会停止命令，不猜机器或容量。
+`REGION=shanghai/thailand` 是策略/硬件选择，不能单独区分上海正式与副本。
+三套实际入口与观测边界见[配置对照记录](whitebox-effective-config-20261109.md)。
+
+| 输入 | 从哪里获得 | 验证 |
+| --- | --- | --- |
+| SGLang SHA | 新鲜 origin/main 中已合入的完整 SHA | git ancestry；镜像 release.json 与实际运行版本 |
+| SDK SHA | 该 SGLang 提交的 benchmark/whitebox/sdk-revision.txt | Worldkit origin/dev ancestry；Room 内实际文件 |
+| 镜像 digest | 构建回执及目标平台实际 imageID | 标签、历史发布记录或外层基础镜像不够 |
+| GPU UUID/capability/显存 | 已授权分配逐 rank 的 nvidia-smi/torch 实测 | 已有作业归属和空闲范围；不按产品名推算 |
+| 模型/Decoder/config SHA | 本轮模型资产清单，原始 zing_config.json 与 Decoder 字节 hash | [3,2]、split_first_latent=false、checkpoint 身份；全权重校验单列 |
+| bindings | 目标环境实际控制面/进程/路由 | 每个示例字段都有实际值；不得跨环境复用 |
+| Secret | 平台 Secret store 的现有受控注入 | 值不进入 Git、argv、报告或 shell history |
+| pool/compatibility/network_domain | 现有 Coordinator 与原 Encoder/Decoder 的已验证注册记录 | 三角色一致；不是任意命名字符串 |
+| capacity/profile_limits | 同模型/硬件/并行配置的实测预算 | service_count=1 不等于容量无穷或可以新增 GPU |
+
+### A. 同机四卡完整组：E1 + Conditioning + D1 + SP2 DiT
+
+只用于本轮已分配、准确归属的四张卡。以下命令不申请卡，不用于共享 role pool 的单 DiT 扩容。
+先在目标机器 Git 外准备新目录和 bundle；同一模型目录可以只读复用，但输出视图不能覆盖原模型。
+
+```bash
+: "${REGION:?shanghai or thailand}" "${BINDINGS:?private bindings JSON}"
+: "${BUNDLE:?new private bundle file}" "${MODEL_SOURCE:?verified export}"
+: "${ASSET_ROOT:?new private prepared view}" "${DECODER:?verified weights}"
+: "${MODEL_CONFIG_SHA:?zing_config.json SHA256}" "${DECODER_SHA:?decoder SHA256}"
+: "${LYNN_MODEL_DIR:?verified Lynn architecture directory}"
+python deploy/whitebox/release.py plan --region "$REGION" \
+  --bindings "$BINDINGS" --output "$BUNDLE"
+python deploy/whitebox/prepare_assets.py --bundle "$BUNDLE" \
+  --source "$MODEL_SOURCE" --decoder "$DECODER" --output "$ASSET_ROOT" \
+  --config-sha "$MODEL_CONFIG_SHA" --decoder-sha "$DECODER_SHA" \
+  --decoder-type lynn_streaming --decoder-model-dir "$LYNN_MODEL_DIR"
+```
+
+此四卡入口只支持当前原生Decoder服务接受的lynn_streaming；旧taeh3已退役，official_h3也不是该独立服务的可选项。准备器调用真实decoder schema校验后才写输出。
+当前公共策略为 resident，不传离线表。若未来修改公共策略使用 table，必须固定表
+manifest/字节身份，并通过混合采样拒绝测试；不能只在某地区挂一张表。
+准备器生成 `pipeline.json`、独立 realtime profile 和 `PREP_COMPLETE.json`，保留原模型字节。
+它不生成凭据，也不替代完整模型权重校验。
+
+Conditioning profile 用该版本原生 CLI 从同一模型构建；数值环境 JSON 来自相同部署的已审阅数值配置。
+
+```bash
+: "${NUMERICAL_ENVIRONMENT:?reviewed numerical environment JSON}"
+python -m sglang.multimodal_gen.runtime.conditioning.cli build-profile \
+  --model "$ASSET_ROOT/model" --numerical-environment "$NUMERICAL_ENVIRONMENT" \
+  --output "$ASSET_ROOT/conditioning-profile.json"
+python deploy/whitebox/model_service.py --bundle "$BUNDLE"
+# 仅在本次已获启用授权、原会话已排空、回滚完整版本已保存时执行：
+: "${GPU_UUIDS:?four approved GPU UUIDs, comma-separated}"
+python deploy/whitebox/model_service.py --bundle "$BUNDLE" \
+  --gpu-uuids "$GPU_UUIDS" --run
+```
+
+`asset_root` 必须与 bundle 一致。将当前版本验证过的 `service.secret.json` 与
+`worker.secret.json` 由平台以只读私有文件挂载到该目录。前者包括完整 `ResourceLimits`、
+`tokens` principal、native model_path/gpu_id 和结果传输配置；后者提供匹配 bearer token/
+租户/传输配置。用原生 `conditioning.cli.load_configuration` 验证，不从 README 发明 token
+或复用无关服务密钥。两者所有字段由该版本的 `conditioning/cli.py` 和客户端配置契约定义。
+
+启动顺序为 Encoder → Conditioning → Decoder → DiT → heartbeat；每一步等待 ready 后继续，
+就绪后所有进程并行工作。GPU 映射固定 Encoder=2、Conditioning=2、Decoder=3、DiT=0/1。
+端口来自命令计划：31001/31002/31003/30000，DiT scheduler/master 为31005/31006。
+此模式 heartbeat 注册的是一个模型组，不是三份玩家容量。默认每步 ready 最多600秒，
+不能把这个超时当作整组10分钟启动 SLA；当前没有这次候选的GPU启动计时证明。
+
+### B. 测试环境只新增 standalone DiT，复用原 Encoder/Decoder
+
+选 `test-shanghai-copy` 的现有 managed role pool。先只读核对原 Coordinator、Encoder、Decoder
+的进程/服务/boot epoch、compatibility、network_domain 和空闲预算。**不运行 A 的启动器，不
+重启已有三组件，不 bootstrap 现有 pool，不清理其他人的租约。** 缺少接线或授权 GPU 时停留在计划。
+
+每个新 DiT 进程使用自己的私有 `SGLANG_ROLE_POOL_WORKER_CONFIG`：
+`role=dit`、`service_count=1`，pool_id/control_epoch/coordinator_url/signing_secret_env/
+role_token_env/compatibility/network_domain 与既有池合同一致；hardware_ids 包含该 SP 组
+逐 rank 已分配 UUID，capacity/profiles/profile_limits 使用实际测得预算。完整 schema 见
+[Managed Role Pool](../specs/MANAGED_ROLE_POOL.md)，示例容量不是生产推荐值。
+
+```bash
+: "${ROLE_CONFIG:?private validated DiT role config}" "${DIT_GPU_UUIDS:?owned GPUs}"
+: "${SP:?1 or 2, matching visible GPUs}" "${MODEL_VIEW:?verified model view}"
+: "${PIPELINE:?DiT pipeline JSON}" "${ADVERTISE_HOST:?reachable private address}"
+: "${HTTP_PORT:?allocated management port}" "${TRANSPORT_PORT:?allocated transport port}"
+: "${RENDEZVOUS_PORT:?allocated rendezvous port}" "${MEM_FRACTION:?measured fraction}"
+: "${CACHE_DIR:?dedicated cache path}" "${CACHE_BUDGET_ROOT:?shared filesystem budget root}"
+: "${CAPACITY_DIR:?machine-wide host budget directory}"
+SGLANG_ROLE_POOL_WORKER_CONFIG="$ROLE_CONFIG" CUDA_VISIBLE_DEVICES="$DIT_GPU_UUIDS" \
+python -m torch.distributed.run --standalone --nproc-per-node="$SP" --module \
+  sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.dit_worker \
+  --model "$MODEL_VIEW" --pipeline-config-path "$PIPELINE" \
+  --sp-degree "$SP" --service-count 1 --advertise-host "$ADVERTISE_HOST" \
+  --http-port "$HTTP_PORT" --port "$TRANSPORT_PORT" --rendezvous-port "$RENDEZVOUS_PORT" \
+  --mem-fraction-static "$MEM_FRACTION" --zing-solver few_step \
+  --zing-denoising-step-list 1000,500 --zing-initial-block-count 3 \
+  --zing-initial-denoising-step-list 1000,750,500,250 --zing-source-defer-final \
+  --zing-block0-cache-mode on --zing-block0-cache-backend local \
+  --zing-block0-cache-storage local --zing-block0-cache-dir "$CACHE_DIR" \
+  --zing-block0-cache-host-gb 416 --zing-block0-cache-host-total-gb 416 \
+  --zing-block0-cache-disk-gb 700 --zing-block0-cache-capacity-dir "$CAPACITY_DIR" \
+  --zing-block0-cache-budget-root "$CACHE_BUDGET_ROOT" --zing-block0-cache-gc \
+  --zing-block0-cache-min-free-gb 128 --zing-block0-cache-inflight-gb 128 \
+  --zing-block0-cache-max-writers 2 --zing-block0-cache-gc-high-watermark 0.9 \
+  --zing-block0-cache-gc-low-watermark 0.8
+```
+
+此命令使用当前公共采样/cache 策略；必须先确认现有 Encoder/Decoder 与同一模型、窗口/S0、
+Decoder 和 profile 兼容，资源预算可容纳，才可提交。它不带 ServerArgs 独有的 quantum 等开关；
+原生 `dit_worker.argument_parser` 与 A 的解析器不同。source 编码由已有 Encoder 服务及请求
+profile 承担，不能靠给新 DiT 传一个未知 CLI 参数宣称整个池已切换配置。
+
+```bash
+: "${DIT_HTTP:?new DiT management URL}" "${ENCODER_HTTP:?existing service URL}"
+: "${DECODER_HTTP:?existing service URL}"
+curl --fail "$DIT_HTTP/health"
+curl --fail "$DIT_HTTP/get_connection_status?reserve=false"
+curl --fail "$ENCODER_HTTP/get_connection_status?reserve=false"
+curl --fail "$DECODER_HTTP/get_connection_status?reserve=false"
+```
+
+`get_connection_status` 缺省会预留资源，巡检必须带 `reserve=false`。managed 端点按既有鉴权
+提供相应凭据，不降级绕过。新 DiT 完成加载、注册并被 Coordinator 判为 READY 后，才通过正常
+玩家准入组装新组；不要手工调用另一玩家的 native build/destroy 接口。协议和签名 action 见
+[Worker API](../specs/WORKER_CONNECTION_API.md) 与 managed pool 文档。
+
+两种模式都分别检查 ready、首个真实模型帧、持续输入、取消确认、准确玩家/组资源释放、下一
+玩家接续；ready 不是首帧成功，注册记录不是 GPU 空闲证明。正式验收仍执行5个动态case、
+每玩家首个可见模型画面后180秒及既有性能/缓存/画质/联机要求。B 回滚只 drain/撤回本次新 DiT
+及其已确认归属的组，保留原 Encoder/Decoder/Coordinator、缓存与其他租约；A 回滚完整镜像、
+源码/SDK/config/资产身份，绝不通过覆盖几个文件或强删隔离状态完成。
+
+## 版本与配置对照的证据等级
+
+本轮固定 main `3a9236633cc35bfe618af8caa13c16180d294717`，以真实 CLI parser读取默认值；
+candidate 以已提交源码和公共策略生成命令后实际解析，两地一致性由回归测试检查。
+GPU/model依赖的 post-init 自动调整、逐rank内存预算和最终数值配置必须从模型初始化后日志取证；
+CPU parser值不能冒称GPU最终值。实测表、来源优先级及 unknown 字段见
+[配置对照记录](whitebox-effective-config-20261109.md)。
+
+现网采集必须包括平台实际imageID/digest、目标进程argv与白名单env、挂载bundle/pipeline/profile
+的SHA256、源码/SDK身份、逐rank硬件及初始化后配置日志。控制面lane字段属于期望配置；API自报
+版本也不是全源码校验。私有接线和凭据不得进入本手册。未采到的字段标unknown，不用shell环境替代。
+
+## CPU 镜像层与磁盘预算
+
+复用 BuildKit 的不可变依赖缓存，不以完整 Room 镜像执行
+`rm -rf /app /opt/worldkit` 后冒充精简基础镜像。删除只产生上层遮蔽，旧 SDK
+和运行源码仍占下层空间；随后 COPY SDK 会再占一份。使用仓库
+`docker/whitebox.Dockerfile` 的原始 Python、browser、SDK 多阶段依赖关系。
+Gateway/Coordinator 不继承 Room；完整运行源码仍来自准确 `main` 提交。
+
+已有、验证过的浏览器依赖可以通过
+`docker/whitebox-browser-dependencies.Dockerfile` 重新打包：传入固定 digest 的
+`DEPENDENCY_SOURCE`，清除 producer 的业务目录后，最终 `FROM scratch` 只复制其
+可见依赖文件系统，不继承旧镜像层。它只是 browser dependency root，不是可直接运行的
+服务。之后仍使用完整标准 Dockerfile、准确源码和精简后的固定 SDK，并通过全部镜像门禁。
+不要把这个 browser root 用作 Python control base；后者使用纯 Python 依赖，不需要浏览器。
+
+人工 `release.py build` 与 CI Registry 验证均检查真实镜像历史：CPU control
+没有 SDK COPY 层，Room 恰好一层，每个运行镜像恰好一次完整运行源码 COPY。
+检查失败不发送成功发布回调。历史检查约束受支持构建流程，不代替源码摘要、
+原生 CLI/编码测试或线上验收。单独检查本机已构建镜像：
+
+```bash
+python deploy/whitebox/image_storage.py --image registry/runtime@sha256:... --component room
+```
+
+在实际 Docker 主机上，拉取或构建前检查磁盘余量：
+
+```bash
+python3 deploy/whitebox/docker_storage.py check --incoming-gib 5 --reserve-gib 15
+```
+
+这里 `incoming-gib` 为候选镜像解包后的逻辑大小；保守要求保留空间加两倍候选大小，
+覆盖下载与解包峰值，不以共享层的预期命中抵消余量。工具仅操作本机 Docker Unix socket。
+独立临时构建机优先；不要在承载 Redis 的生产系统盘堆积构建上下文。
+
+生成精确镜像回收清单，默认不删除：
+
+```bash
+python3 deploy/whitebox/docker_storage.py plan \
+  --repository registry.example/whitebox/runtime \
+  --protect sha256:<需要保留的完整本机镜像ID> \
+  --age-hours 72 --target-free-gib 35 --output /private/image-plan.json
+```
+
+所有运行中和已停止容器引用的镜像及其祖先、显式 rollback、近期镜像、其他仓库、
+没有远端 digest 的本地构建产物均保留。规划时间是镜像创建时间，不代表最近使用时间；
+其他任务即将使用的旧镜像也应显式加入 `--protect`。核对本轮引用与回滚需求后执行：
+
+```bash
+python3 deploy/whitebox/docker_storage.py apply \
+  --plan /private/image-plan.json --plan-sha256 <plan命令打印的摘要> \
+  --receipt /private/image-cleanup-receipt.jsonl
+```
+
+清单有效期一小时；每次删除前再次核对 daemon 身份、容器引用、标签和远端不可变恢复
+凭据。只执行非强制 `docker image rm --no-prune <准确ID>`，达到目标余量即停止。
+不删除容器、卷、写层、录像或 Redis 数据，不做全局 prune。远端不可访问时保留镜像；
+失败/超时先核对原收据和镜像是否仍存在，不能重复使用同一收据盲目重试。
+引用保护可能使目标余量无法达到，此时明确报告不足，不扩大清理范围。
+
+Redis 在此链路承担租约/归属、隔离与清理回执存储，而非纯缓存。公开 Coordinator
+会保留尚未证明释放的玩家；分离池还固定 Redis `run_id`，重启后需要人工核对恢复。
+AOF 不替代这套恢复协议，但保留用于核对的状态；不要为了镜像占满盘而关闭持久化、
+清空 AOF 或把 `stop-writes-on-bgsave-error` 改掉。Docker 与 Redis 持久化应有独立容量域；
+迁移 Docker/Redis 的停机和数据操作须另行安排，不由此清理工具执行。
+
+## 查询实际版本
+
+Gateway、Room、Coordinator 和模型进程提供只读：
+
+```http
+GET /v1/whitebox/version
+```
+
+返回角色、源码 SHA、SDK SHA、地区与配置摘要，不返回 Secret、缓存内容或部署路径。
+配置摘要必须与挂载 bundle 以及该角色实际环境变量一致；不一致拒绝启动。
+身份在应用创建时冻结，之后修改清单文件不能让旧进程自称新版本。
+`unmanaged` 表示没有受管构建身份，`image_only` 表示仅有镜像源码身份，只有 `configured` 才通过清单核对。
+此接口的成功不是 GPU ready 或性能验收；仍需健康、真实输出和业务指标。
+
+人工从平台取得当前镜像 digest，并保存 Gateway/Coordinator/Room/Model 四个角色的版本响应：
+
+```json
+{
+  "gateway": {"platform_image": "registry/image@sha256:...", "version": {}},
+  "coordinator": {"platform_image": "registry/image@sha256:...", "version": {}},
+  "room": {"platform_image": "registry/image@sha256:...", "version": {}},
+  "model": {"platform_image": "registry/image@sha256:...", "version": {}}
+}
+```
+
+```bash
+python deploy/whitebox/release.py verify \
+  --bundle /private/release/shanghai-release.json \
+  --source <main完整SHA> --sdk <固定SDK完整SHA> \
+  --observations /private/release/shanghai-observed.json
+```
+
+该命令只比较已有证据，不查询或变更线上。它不会把版本匹配报告成 FPS、画质或延迟通过。
+
+## 本轮验证边界
+
+本轮允许本地开发与测试，明确禁止部署。已覆盖配置继承、非法参数、托管环境差异、无隐式构建／发布、
+Git archive 排除脏文件、固定版本查询，以及 SDK capture hold/resume、输入恢复、超时和重连。
+真实 H200/B300 启动、两地镜像构建、线上缓存命中、480/736 的 Encoder/DiT/Decoder 性能与显存、
+TTFF/E2E/FPS/TPOC/ICL、浏览器播放和画质均留待用户下达部署命令后验证。
+此前版本的结果不能作为此组合版本的验收。
+
+## 2026-11-09 review 修正
+
+SGLang 正式构建只接受远端 main 可达的准确提交，CPU/Room/模型镜像与运行身份
+统一声明 main。Worldkit SDK 继续固定远端 dev 的准确提交；WTP 自身分支约定不由
+SGLang 构建器改变。历史镜像和旧发布回执保留原身份，不通过修改 manifest 冒充新版本。
+
+四角色验收包含 Gateway、Coordinator、Room 和模型，缺少 Coordinator、旧源码 SHA
+或配置摘要不一致均失败。DiT 启动命令显式传递 source quantum 和相关布尔关闭值，
+避免 CLI 默认值覆盖显式的 0/false。两地默认统一 quantum=1、prompt-joint=false，
+共同启用 prefetch/async-output/decoder-overlap/defer-final；地区覆盖行为参数会被拒绝。
+CPU 参数解析验证不代替 GPU 480/736 性能、画质与逐组件延迟/显存对照，本次尚未部署。

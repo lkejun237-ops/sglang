@@ -73,6 +73,17 @@ def test_key_uses_contents_order_s0_and_request_settings(tmp_path):
     assert key() != original
 
 
+def test_s0_native_geometry_is_part_of_the_key():
+    pixels = torch.zeros(3, 1, 2, 6, dtype=torch.uint8)
+    config = dict(width=32, height=32, fps=30)
+    request = dict(prompt="scene")
+    a = preparation_key(NS(), request, dict(frames=pixels), config, {})
+    b = preparation_key(
+        NS(), request, dict(frames=pixels.reshape(3, 1, 3, 4)), config, {}
+    )
+    assert a != b
+
+
 def test_cpu_snapshot_retains_pixels_and_owns_prepared_tensors():
     source = inputs()
     frozen = inputs_on(source, "cpu", snapshot=True)

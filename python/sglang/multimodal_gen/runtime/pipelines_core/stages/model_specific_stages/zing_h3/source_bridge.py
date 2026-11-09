@@ -128,7 +128,13 @@ class SourceChunkBridge:
             or source_dependency_end < pixel_end
         ):
             raise ValueError(
-                "Source codec slice has inconsistent geometry or dependency"
+                "Source codec slice has inconsistent geometry or dependency: "
+                f"latent_start={latent_start}, accepted_latents={self.accepted_latents}, "
+                f"count={count}, clip_frames={self.clip_frames}, "
+                f"clip_latents={self.clip_latents}, ratio={self.ratio}, "
+                f"pixel_end={pixel_end}, accepted_pixels={self.accepted_pixels}, "
+                f"previous_end={previous_end}, nominal_end={nominal_ends[-1]}, "
+                f"source_dependency_end={source_dependency_end}"
             )
         # Only a final codec clip may be short; accepting another would change
         # the absolute latent-to-pixel mapping and silently corrupt alignment.

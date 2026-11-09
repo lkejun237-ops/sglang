@@ -52,10 +52,12 @@ class ZingSourceEncoderAdapter(ZingH3SourceStreamAdapter):
         )
         self.latents_sent = 0
 
-    def prepare_prefill_request(self, session, server_args, source_frame):
+    def prepare_prefill_request(self, session, server_args, source_frame, **kwargs):
         from dataclasses import asdict
 
-        batch = super().prepare_prefill_request(session, server_args, source_frame)
+        batch = super().prepare_prefill_request(
+            session, server_args, source_frame, **kwargs
+        )
         batch.extra["zing_source_command"]["source_geometry"] = asdict(
             self.source_geometry
         )

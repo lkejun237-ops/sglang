@@ -503,3 +503,44 @@ def test_source_decoder_requires_explicit_pixel_validity(model):
     assert decoder.accepted_latents == decoder.stream.latents_seen == 0
     assert decoder.pending is None
     decoder.dispose()
+
+
+@pytest.mark.parametrize("latent_count,valid", [(5, 17), (5, 14), (10, 34), (10, 32)])
+def test_source_decoder_single_latent_pop_is_bitwise_equal_and_drains_tail(
+    model, latent_count, valid
+):
+    latent = _latent(latent_count)
+    baseline = _source_decoder(model, capacity_latents=12)
+    progressive = _source_decoder(model, capacity_latents=12)
+    for decoder in (baseline, progressive):
+        _append_valid(decoder, latent, latent_start=0, valid_frame_end=valid)
+        decoder.finish(total_frames=valid)
+    expected = baseline.pop()
+    parts, spans = [], []
+    while progressive.ready:
+        part = progressive.pop(max_latents=1)
+        parts.append(part.values)
+        spans.append((part.start, part.end))
+        assert part.end - part.start <= 4
+        assert part.provenance.pixels.start == part.start
+        assert part.provenance.pixels.end == part.end
+    assert spans[0][0] == 0 and spans[-1][1] == valid
+    assert all(a[1] == b[0] for a, b in zip(spans, spans[1:]))
+    torch.testing.assert_close(torch.cat(parts, dim=2), expected.values, atol=0, rtol=0)
+    assert progressive.stream.latents_seen == latent_count
+    assert progressive.pop(max_latents=1) is None
+    if valid == 17:
+        assert [end - start for start, end in spans] == [1, 4, 4, 4, 4]
+    baseline.dispose()
+    progressive.dispose()
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, 1.5])
+def test_source_decoder_bad_quantum_does_not_advance_stream(model, bad):
+    decoder = _source_decoder(model)
+    _append_valid(decoder, _latent(3), latent_start=0, valid_frame_end=9)
+    with pytest.raises(ValueError, match="quantum"):
+        decoder.pop(max_latents=bad)
+    assert decoder.stream.latents_seen == 0
+    assert decoder.buffered_latents == 3 and decoder.emitted_frames == 0
+    decoder.dispose()

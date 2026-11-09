@@ -4,6 +4,8 @@
 
 本文 `exports/` 相对工作区 `/home/ss80194/work/sglang-zing`。下列 GPU 结果冻结于 `d87d75fb16`，本次 PR 的后续主线整合边界见下节。
 
+
+
 ## 2026-11-06 主线冲突修复
 
 合入 `main@b9e4bc95fc`，保留共享静态 KV 容量／准入、独立服务流控与取消收尾、unsplit prompt joint 和 VAE 优化。两处文本冲突分别保留部署文档双方新增记录、移除 Encoder 入口空行冲突；自动合并后仍在主线 `_forward_source()` 内传递 sink 控制，并保留首次联合 forward 前应用 pending sink 的顺序。

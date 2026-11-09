@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
     EncoderDiTChannel,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.dit_worker import (
+    argument_parser,
     create_link_session,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.packing import (
@@ -32,10 +33,51 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
 from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
     cpu_execution_options,
 )
-from sglang.multimodal_gen.test.unit.test_zing_h3_queued_dit import (  # noqa: F401
+from sglang.multimodal_gen.test.unit.test_zing_h3_queued_dit import (
     Harness,
-    model,
 )
+from sglang.multimodal_gen.test.unit.test_zing_h3_queued_dit import (  # noqa: F401
+    model as model_fixture,
+)
+
+model = model_fixture
+
+
+def test_dit_cache_storage_is_explicit_and_preserves_mount_validation(
+    tmp_path, monkeypatch
+):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        block0_identity,
+    )
+
+    monkeypatch.setattr(block0_identity, "storage_mounted", lambda _: False)
+    argv = [
+        "--model",
+        str(tmp_path),
+        "--zing-block0-cache-mode",
+        "on",
+        "--zing-block0-cache-host-gb",
+        "416",
+        "--zing-block0-cache-disk-gb",
+        "700",
+        "--zing-block0-cache-dir",
+        str(tmp_path),
+    ]
+    mounted = argument_parser().parse_args(argv)
+    assert mounted.zing_block0_cache_storage == "mounted"
+    with pytest.raises(ValueError, match="mounted before"):
+        block0_identity.startup_config(mounted)
+    local = argument_parser().parse_args(
+        argv + ["--zing-block0-cache-storage", "local"]
+    )
+    assert block0_identity.startup_config(local) == (
+        416 * 10**9,
+        700 * 10**9,
+        tmp_path.resolve(),
+    )
+    local.zing_block0_cache_dir = str(tmp_path / "missing")
+    with pytest.raises(ValueError, match="existing mounted directory"):
+        block0_identity.startup_config(local)
 
 
 def _echo_peer(port, backend):
@@ -919,8 +961,10 @@ def test_pool_rejection_is_nonfatal_and_discards_pending_prompt(model, cached):
 
 
 from sglang.multimodal_gen.test.unit.realtime.zing_cache_fixtures import (  # noqa: E402,F401
-    cpu_dma,
+    cpu_dma as cpu_dma_fixture,
 )
+
+cpu_dma = cpu_dma_fixture
 
 
 @torch.no_grad()
@@ -1055,6 +1099,179 @@ def test_cached_prefix_matches_uncached_queued_dit(model, cpu_dma, joint_forward
     actual = asyncio.run(run(True))
     assert len(actual) == len(baseline) > 0
     assert all(torch.equal(a, b) for a, b in zip(actual, baseline))
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("model", ["cpu"], indirect=True)
+@pytest.mark.parametrize("same_key", [True, False])
+def test_link_reuses_only_current_complete_condition_key(model, same_key):
+    h = Harness(model, split_first_latent=False)
+    codecs = SimpleNamespace(
+        target_fps=24,
+        spatial_ratio=1,
+        temporal_ratio=4,
+        vae_frames_per_chunk=17,
+        vae_latents_per_chunk=5,
+    )
+    codecs.sample_streaming_visual_moments = lambda v, **k: v
+    stage = pooled_stage(h, codecs)
+    stage.block0_cache = None
+    init = dict(session_id="s", generation_id="g", seed=7, width=2, height=2, fps=24)
+
+    async def run():
+        results = []
+
+        async def output(r):
+            results.append(r)
+
+        worker = create_link_session(h.sampler(), codecs, init, output, stage=stage)
+        worker.source_records = [[1, 0, 43]]
+
+        async def put(kind, **payload):
+            await worker.put(
+                dict(type=kind, session_id="s", generation_id="g", **payload)
+            )
+            while worker.queue:
+                await worker.queue.run_once()
+
+        async def source(a, b):
+            await put(
+                "source.moments",
+                tensor=h.inputs.source_visual[:, :, a:b],
+                latent_start=a,
+                latent_end=b,
+                pixel_end=(b // 5) * 17 + (0 if b % 5 == 0 else 1 + (b % 5 - 1) * 4),
+                source_dependency_end=43,
+                source_records=[[1, 0, 43]],
+                final_source_frames=43,
+            )
+
+        try:
+            await put(
+                "conditioning",
+                tensors=h.condition(10),
+                event_id=10,
+                prompt_version=1,
+                inputs=input_metadata(h),
+                cache_key="a" * 64,
+            )
+            await source(0, 3)
+            await source(3, 5)
+            prefix = worker.state.cache.prefix
+            before = [
+                (k.data_ptr(), v.data_ptr(), k.clone(), v.clone())
+                for k, v in prefix.layers
+            ]
+            await put(
+                "conditioning",
+                tensors=h.condition(10),
+                event_id=11,
+                prompt_version=2,
+                inputs=input_metadata(h),
+                cache_key=("a" if same_key else "b") * 64,
+                _reuse_gpu_prefix=True,
+            )  # Wire flag alone is not trusted.
+            assert worker.state.pending_prompt.reuse_prefix is same_key
+            await source(5, 8)
+            assert results[-1].prompt_event_id == 11 and results[-1].prompt_version == 2
+            assert worker.state.metrics.get("gpu_prefix_reuses", 0) == int(same_key)
+            if same_key:
+                assert worker.state.cache.prefix is prefix
+                for (k, v), (kp, vp, k0, v0) in zip(prefix.layers, before):
+                    assert k.data_ptr() == kp and v.data_ptr() == vp
+                    assert torch.equal(k, k0) and torch.equal(v, v0)
+        finally:
+            worker.close()
+        assert stage.kv_pool.available == 1
+
+    asyncio.run(run())
+
+
+def test_managed_dit_normalizes_platform_nccl_before_startup(tmp_path, monkeypatch):
+    import json
+    import os
+    import sys
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        dit_worker,
+        encoder_worker,
+    )
+
+    path = tmp_path / "worker.json"
+    path.write_text(
+        json.dumps(
+            dict(
+                role="dit",
+                service_count=1,
+                hardware_ids=["gpu-test"],
+                profile_limits={"480": {}},
+            )
+        )
+    )
+    monkeypatch.setenv("SGLANG_ROLE_POOL_WORKER_CONFIG", str(path))
+    monkeypatch.setenv("NCCL_MIN_NCHANNELS", "4")
+    monkeypatch.setenv("NCCL_MAX_NCHANNELS", "24")
+    monkeypatch.setenv("NCCL_MIN_CTAS", "4")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setattr(
+        sys, "argv", ["dit_worker", "--model", str(tmp_path), "--sp-degree", "2"]
+    )
+
+    class RuntimeBoundary(Exception):
+        pass
+
+    def initialize():
+        assert os.environ["NCCL_MIN_NCHANNELS"] == "2"
+        assert "NCCL_MAX_NCHANNELS" not in os.environ
+        assert "NCCL_MIN_CTAS" not in os.environ
+        raise RuntimeBoundary
+
+    monkeypatch.setattr(encoder_worker, "initialize_runtime_imports", initialize)
+    with pytest.raises(RuntimeBoundary):
+        dit_worker.main()
+
+
+@pytest.mark.parametrize("static", [False, True])
+def test_decoder_startup_normalizes_nccl_for_each_launch_mode(
+    static, tmp_path, monkeypatch
+):
+    import os
+    import sys
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        decoder_worker,
+    )
+    from sglang.multimodal_gen.runtime.realtime.role_pool import reporting
+
+    monkeypatch.setenv("NCCL_MIN_NCHANNELS", "4")
+    monkeypatch.setenv("NCCL_MAX_NCHANNELS", "24")
+    monkeypatch.setenv("NCCL_MIN_CTAS", "4")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "decoder_worker",
+            "--model",
+            str(tmp_path),
+            "--decoder-config",
+            "{}",
+            *(["--static-connection"] if static else []),
+        ],
+    )
+
+    class ConfigBoundary(Exception):
+        pass
+
+    def validate(role, count, *, static_connection=False):
+        assert role == "decoder" and count == 1 and static_connection == static
+        assert os.environ["NCCL_MIN_NCHANNELS"] == "2"
+        assert os.environ.get("NCCL_MAX_NCHANNELS") == None
+        assert os.environ.get("NCCL_MIN_CTAS") == None
+        raise ConfigBoundary
+
+    monkeypatch.setattr(reporting, "validate_worker_configuration", validate)
+    with pytest.raises(ConfigBoundary):
+        decoder_worker.main()
 
 
 def _startup_rank(rank, rendezvous, output, fail):

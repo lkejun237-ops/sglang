@@ -45,6 +45,35 @@ used only while Torch profiling is enabled, not during formal timing. Freeze the
 same dependencies for worker, service and client. Import checks alone do not
 prove production WebSocket version requirements are satisfied.
 
+## Same-node pods with separate GPU allocations
+
+Loopback remains the default. To retain an existing two-GPU DiT allocation,
+a one-GPU Encoder may run in a separate pod on the **same physical node**.
+This requires a trusted private VPC path and an absolute, mode-0600 file holding
+64 lowercase hex characters generated from 32 random bytes. Both pods must read
+the same token file. Never put the token value in profiles, arguments or logs.
+
+Start the Encoder with `--host <encoder-private-ip> --peer-host <dit-private-ip>
+--auth-token-file <path>`. Add `host`, `bridge_host` and `auth_token_file` to the
+consumer's existing `source_encoder.remote` object. Both addresses must be RFC1918
+IPv4 addresses. Control requests authenticate the deployment token and compare
+kernel boot identities before creating a session or NCCL bridge. The configured
+DiT address is the only accepted bridge target; cancellation uses the same peer.
+
+The scheduler must independently verify same-node placement and disjoint GPU
+allocations. This option does not grant access to unallocated or other users'
+GPU devices and does not add cross-node support. Preserve the existing model Job;
+restart only its model process after a verified Encoder readiness check. Test
+NCCL transport, clean cancellation, reconnect and GPU output equivalence on the
+actual deployment before claiming this topology validated. Shared memory/P2P
+availability depends on container isolation and must be measured.
+
+Encoder overlap and asynchronous RGB output are separate options. For Lynn,
+keep `async_source_output=false`; `source_encoder.remote.mode=overlap` and
+`cross_dispatch_prefetch=true` can still prefetch source encoding. The Whitebox
+regional launcher accepts `model.external_encoder` with these three private peer
+fields and counts three total GPUs while exposing only two to the DiT pod.
+
 ## Prepare inputs without a GPU
 
 Preparation uses the existing whitebox case manifest and asset verifier. The
@@ -153,3 +182,9 @@ Incremental Decoder and per-dispatch chunk yielding are separate features. This
 Encoder PR retains the original behavior and rejects incremental Decoder selection.
 Historical experiment details and one-off first-frame diagnostics remain at frozen
 Git revisions; they are not maintained benchmark entrypoints.
+
+### Sandboxed PAI pod identity
+
+Some PAI pods on the same scheduler node expose different `/proc/sys/kernel/random/boot_id` values. Do not override or copy this kernel value to make the check pass. For these deployments, `external_encoder.node_binding_file` and the worker's `--node-binding-file` may point to an absolute mode-0600 deployment file. The deployer must first query both actual PAI pod records and verify their exact node, immutable Pod UID, and private interface address. The file records `version: 1`, `verified_by: "pai-control-plane"`, `node_name`, and exactly two `pods` records with `pod_name`, `pod_uid`, `host`, and `node_name`.
+
+The runtime verifies its own pod name and local address against this file; the two peers authenticate both their random deployment token and a canonical hash of the complete binding. Wrong nodes, duplicate or replaced UIDs, unlisted pods, and changed peer addresses fail closed. This is trusted deployment configuration, never a browser/session parameter. Keep the original boot identity check when no binding is supplied. A binding must be regenerated and reverified after any pod replacement; it does not authorize another node or GPU allocation.

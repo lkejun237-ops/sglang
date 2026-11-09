@@ -355,7 +355,12 @@ def test_workers_use_role_command_control():
 # ==============================================================================
 
 
-def test_shm_publisher_reserve_success(monkeypatch):
+def test_shm_publisher_reserve_success(monkeypatch, tmp_path):
+    monkeypatch.setenv("SGLANG_REALTIME_VAE_SHM_DIR", str(tmp_path))
+    from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import (
+        reserve_async_shared_memory_payload as allocate,
+    )
+
     shm_mod = _load_shm_publisher()
     SharedMemoryFramePublisher = shm_mod.SharedMemoryFramePublisher
 
@@ -363,7 +368,7 @@ def test_shm_publisher_reserve_success(monkeypatch):
     monkeypatch.setattr(
         shm_mod,
         "reserve_async_shared_memory_payload",
-        lambda num_bytes: {"slot": 1, "num_bytes": num_bytes},
+        allocate,
     )
 
     ref = publisher.reserve(
@@ -375,6 +380,7 @@ def test_shm_publisher_reserve_success(monkeypatch):
     assert ref["height"] == 32
     assert ref["channels"] == 3
     assert ref["session_id"] == "sess_1"
+    publisher.close()
 
 
 def test_shm_publisher_reserve_oversized_rejected():
@@ -389,7 +395,12 @@ def test_shm_publisher_reserve_oversized_rejected():
         )
 
 
-def test_shm_publisher_slots_exhaustion_and_timeout(monkeypatch):
+def test_shm_publisher_slots_exhaustion_and_timeout(monkeypatch, tmp_path):
+    monkeypatch.setenv("SGLANG_REALTIME_VAE_SHM_DIR", str(tmp_path))
+    from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import (
+        reserve_async_shared_memory_payload as allocate,
+    )
+
     shm_mod = _load_shm_publisher()
     SharedMemoryFramePublisher = shm_mod.SharedMemoryFramePublisher
 
@@ -397,7 +408,7 @@ def test_shm_publisher_slots_exhaustion_and_timeout(monkeypatch):
     monkeypatch.setattr(
         shm_mod,
         "reserve_async_shared_memory_payload",
-        lambda num_bytes: {"slot": 1, "num_bytes": num_bytes},
+        allocate,
     )
 
     publisher.reserve(frames=1, width=32, height=32, identity={})
@@ -405,9 +416,15 @@ def test_shm_publisher_slots_exhaustion_and_timeout(monkeypatch):
 
     with pytest.raises(TimeoutError, match="slots are full"):
         publisher.reserve(frames=1, width=32, height=32, identity={})
+    publisher.close()
 
 
-def test_shm_publisher_slot_released_on_allocation_failure(monkeypatch):
+def test_shm_publisher_slot_released_on_allocation_failure(monkeypatch, tmp_path):
+    monkeypatch.setenv("SGLANG_REALTIME_VAE_SHM_DIR", str(tmp_path))
+    from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import (
+        reserve_async_shared_memory_payload as allocate,
+    )
+
     shm_mod = _load_shm_publisher()
     SharedMemoryFramePublisher = shm_mod.SharedMemoryFramePublisher
 
@@ -425,13 +442,19 @@ def test_shm_publisher_slot_released_on_allocation_failure(monkeypatch):
     monkeypatch.setattr(
         shm_mod,
         "reserve_async_shared_memory_payload",
-        lambda num_bytes: {"slot": 1, "num_bytes": num_bytes},
+        allocate,
     )
     ref = publisher.reserve(frames=1, width=32, height=32, identity={})
     assert ref["batch_num_frames"] == [1]
+    publisher.close()
 
 
-def test_shm_publisher_fail_releases_slot(monkeypatch):
+def test_shm_publisher_fail_releases_slot(monkeypatch, tmp_path):
+    monkeypatch.setenv("SGLANG_REALTIME_VAE_SHM_DIR", str(tmp_path))
+    from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import (
+        reserve_async_shared_memory_payload as allocate,
+    )
+
     shm_mod = _load_shm_publisher()
     SharedMemoryFramePublisher = shm_mod.SharedMemoryFramePublisher
 
@@ -444,13 +467,13 @@ def test_shm_publisher_fail_releases_slot(monkeypatch):
     monkeypatch.setattr(
         shm_mod,
         "wait_for_async_shared_memory_terminal",
-        lambda ref, timeout=None: None,
+        lambda ref, timeout_s=None: None,
         raising=False,
     )
     monkeypatch.setattr(
         shm_mod,
         "reserve_async_shared_memory_payload",
-        lambda num_bytes: {"slot": 1, "num_bytes": num_bytes},
+        allocate,
     )
 
     publisher = SharedMemoryFramePublisher(timeout_seconds=0.1, max_in_flight=1)

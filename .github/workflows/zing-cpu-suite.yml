@@ -48,6 +48,8 @@ jobs:
       - name: Record CPU capabilities
         run: lscpu
       - name: Prepare media tooling
+        timeout-minutes: 8
+        shell: bash
         run: |
           # imageio-ffmpeg is pinned in requirements-cpu.txt and ships a static
           # ffmpeg; apt-get update is the slow path on these runners.

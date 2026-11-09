@@ -133,6 +133,60 @@ def test_remote_queue_eos_and_disposal(monkeypatch, mode):
     session.dispose()
 
 
+def test_complete_clip_is_prefetched_before_consumer_and_stays_bounded(monkeypatch):
+    from sglang.multimodal_gen.runtime.distributed import parallel_state
+
+    monkeypatch.setattr(
+        parallel_state,
+        "get_world_group",
+        lambda: SimpleNamespace(
+            rank_in_group=0, ranks=[0], cpu_group=None, device_group=None
+        ),
+    )
+    monkeypatch.setattr(dist, "broadcast_object_list", lambda *a, **k: None)
+    monkeypatch.setattr(dist, "broadcast", lambda *a, **k: None)
+    monkeypatch.setattr(RemoteEncoderSession, "_produce", _fake_producer)
+    codecs = SimpleNamespace(
+        modules={"video_vae": SimpleNamespace(encoder=torch.nn.Linear(1, 1))}
+    )
+    session = RemoteEncoderSession(
+        codecs,
+        capacity_frames=34,
+        config=dict(port=31001, mode="overlap", timeout_seconds=1),
+    )
+    try:
+        # Supply two clips, but do not let DiT pop anything yet. All three
+        # slices of the first clip must be ready without unbounded lookahead.
+        session.append(torch.zeros(3, 34, 2, 2, dtype=torch.uint8), frame_start=0)
+        deadline = time.monotonic() + 1
+        while session.results.qsize() < 3 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        with session.results.mutex:
+            ready = list(session.results.queue)
+        assert [(r["start"], r["end"], r["dependency"]) for r, _ in ready] == [
+            (0, 1, 1),
+            (1, 3, 9),
+            (3, 5, 17),
+        ]
+        assert not session.permits.acquire(blocking=False)
+        # Five latent positions of FP32 moments; accepted input is still owned.
+        assert session.queue_snapshot()["result_bytes"] == 5 * 48 * 4
+        assert session.state_usage().retained_bytes == 34 * 3 * 2 * 2 + 5 * 48 * 4
+        item = session.pop()
+        assert (item.start, item.end, item.source_dependency_end) == (0, 1, 1)
+        deadline = time.monotonic() + 1
+        while session.results.qsize() < 3 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        with session.results.mutex:
+            refilled = list(session.results.queue)
+        assert [(r["start"], r["end"]) for r, _ in refilled] == [(1, 3), (3, 5), (5, 6)]
+        assert session.results.qsize() == 3
+    finally:
+        session.dispose()
+    assert not session.thread.is_alive()
+    assert session.state_usage().retained_bytes == 0
+
+
 def test_remote_worker_token_can_use_client_session_identity(monkeypatch):
     from sglang.multimodal_gen.runtime.distributed import parallel_state
 

@@ -2,9 +2,12 @@
 """Small independent game/group associations; KV entities live separately."""
 
 import base64
+import json
+from contextlib import nullcontext
 from pathlib import Path
 
 from .disk_cache import Block0DiskCache, _dump_json, _read_json
+from .storage_budget import StorageBudget
 
 
 def validate_labels(game_id=None, group_id=None):
@@ -24,8 +27,9 @@ def _component(value):
 
 
 class CacheIndex:
-    def __init__(self, root):
+    def __init__(self, root, *, budget=None):
         self.root = Path(root).resolve() / "index"
+        self.budget = budget
 
     def bind(self, game_id, group_id, cache_key):
         validate_labels(game_id, group_id)
@@ -38,11 +42,16 @@ class CacheIndex:
             / _component(game_id)
             / ("_" if group_id is None else _component(group_id))
         )
-        folder.mkdir(parents=True, exist_ok=True)
-        _dump_json(
-            folder / f"{cache_key}.json",
-            dict(game_id=game_id, group_id=group_id, cache_key=cache_key),
+        value = dict(game_id=game_id, group_id=group_id, cache_key=cache_key)
+        budget = self.budget or StorageBudget.existing(self.root.parent)
+        guard = (
+            nullcontext()
+            if budget is None
+            else budget.metadata_write(len(json.dumps(value).encode()) + 4096)
         )
+        with guard:
+            folder.mkdir(parents=True, exist_ok=True)
+            _dump_json(folder / f"{cache_key}.json", value)
 
     def select(self, game_id, group_id=None, cache_key=None):
         validate_labels(game_id, group_id)

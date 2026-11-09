@@ -15,6 +15,8 @@ from typing import Any, Iterator
 
 from prometheus_client import CONTENT_TYPE_LATEST, Histogram, generate_latest
 
+from sglang.multimodal_gen.runtime.realtime.whitebox.telemetry import CHUNK_FIELDS
+
 CRITICAL_PATH_BUCKETS = (
     0.0005,
     0.001,
@@ -65,8 +67,36 @@ VALID_STAGES = frozenset(
         "client_receive_queue",
         "client_video_decode",
         "client_render_wait",
+        "whitebox_engine_start",
+        "whitebox_engine_input",
+        "whitebox_engine_frame_wait",
+        "whitebox_source_credit_wait",
+        "whitebox_source_send",
+        "whitebox_ui_render",
+        "whitebox_recording_metadata",
+        "whitebox_playback_encode",
+        "whitebox_playback_queue",
+        "whitebox_recording_queue",
+        "whitebox_encode_whitebox",
+        "whitebox_encode_model",
+        "whitebox_encode_ui_rendered",
+        "whitebox_oss_upload",
+        "whitebox_lease_renew",
+        "whitebox_lease_release",
+        "whitebox_archive_finalize",
+        "whitebox_mock_capture_receive",
+        "whitebox_h3_source_to_output",
+        "whitebox_recording_backpressure",
+        "whitebox_recording_worker_queue",
+        "whitebox_recording_metadata_write",
+        "whitebox_mux_ui_rendered",
+        "whitebox_upload_worker_queue",
     )
 )
+
+# Fixed field names only; no session IDs or user-controlled metric labels.
+
+VALID_STAGES = VALID_STAGES | {"whitebox_h3_telemetry_" + name for name in CHUNK_FIELDS}
 
 CRITICAL_PATH_STAGE_SECONDS = Histogram(
     "world_model_critical_path_stage_duration_seconds",

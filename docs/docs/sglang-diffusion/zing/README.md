@@ -16,6 +16,8 @@
 | RoPE 与性能配置 | [Chunk RoPE reuse](specs/CHUNK_ROPE_REUSE.md)、[性能默认配置](specs/PERFORMANCE_DEFAULTS.md) |
 | AdaLN 导出与离线表 | [Split export](specs/SPLIT_ADALN_EXPORT.md)、[AdaLN table](specs/ADALN_TABLE.md)、[设计分析](plans/ISSUE_257_ANALYSIS.md) |
 | Conditioning 服务 | [RPC 使用与部署契约](specs/ISSUE_256_CONDITIONING_USAGE.md) |
+| 白膜与模型录像 | [独立 4 Mbps OSS 归档方案](plans/WHITEBOX_INDEPENDENT_4MBPS_OSS_ARCHIVE.zh.md) |
+| 上海 Prefill API 与共享 CPFS | [跨实例复用、落盘回执与阶段计时](plans/SHANGHAI_PREFILL_CPFS.zh.md) |
 | Block0 L1 分页 | [预分配页、生命周期与验收](/docs/sglang-diffusion/zing/plans/BLOCK0_PAGED_L1) |
 | Block0 完整准备缓存 | [单条目 CPU 缓存与提前恢复](plans/BLOCK0_CPU_CACHE.md)、[缓存管理 API 与部署契约](specs/block0-cache-management-api.md)、[串行 prefill 协议](specs/block0-prefill-websocket.md) |
 
@@ -24,3 +26,5 @@
 测试输入、复现工具和验收记录保留在 [Zing benchmark](../../../../benchmark/zing_h3_causal/README.md)。
 
 Block0 Cache 后续默认开关、容量与身份方案见 [默认缓存方案](plans/BLOCK0_CACHE_DEFAULTS.md)，验证状态见 [CPU 记录](/benchmark/zing_h3_causal/BLOCK0_CACHE_DEFAULTS_VALIDATION)。
+
+- [Managed 三角色服务池与试玩适配](specs/MANAGED_ROLE_POOL.md)：进程/服务注册、共享容量、动态建组、双 WS、验证释放及本地测试；GPU/线上验收另计。

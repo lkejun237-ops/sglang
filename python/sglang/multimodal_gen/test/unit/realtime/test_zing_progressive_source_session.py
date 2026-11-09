@@ -84,6 +84,7 @@ class SyntheticSampler:
         self.plan, self.index, self.calls = plan, 0, []
         self.sampler = NS(generator=None)
         self.ended = self.complete = self.closed = False
+        self.committed_pixel = 0
 
     def append(self, source, noise, *, provenance, final):
         self.value, self.provenance = source, provenance
@@ -103,6 +104,7 @@ class SyntheticSampler:
             prompt_version=None,
         )
         self.calls.append(result)
+        self.committed_pixel = result.provenance.pixels.end
         self.index += 1
         self.complete = self.ended
         return result
@@ -260,6 +262,8 @@ def test_dispose_logs_paged_block0_capacity_and_releases_state(monkeypatch, fini
     cache = Block0PreparationCache.__new__(Block0PreparationCache)
     cache.mode, cache.pending = "on", None
     cache.pages = torch.empty(2, 2, 3, 4, dtype=torch.bfloat16)
+    cache.page_rows, cache.total_pages = 2048, 0
+    cache.free_pages = []
     cache.entries = {}
     cache.evictions = cache.hits = cache.misses = 0
     state.block0_cache = cache
@@ -380,7 +384,7 @@ def test_worker_resizes_only_local_pixels_and_preserves_target_noise(remote):
     assert state.closed
 
 
-def test_prefetch_close_failure_still_releases_source_resources():
+def test_prefetch_close_failure_retains_pool_until_original_owner_drains():
     state, _ = session(ChunkPlan([1, 2, 2]))
     encoder, sampler, decoder = state.pixels, state.sampler, state.decoder
     releases = []
@@ -391,16 +395,19 @@ def test_prefetch_close_failure_still_releases_source_resources():
     owner = NS(close=fail_close)
     state.conditioning_prefetch = owner
     state.kv_lease = NS(release=lambda: releases.append("lease"))
-    with pytest.raises(RuntimeError, match="prefetch did not drain"):
+    with pytest.raises(RuntimeError, match="unconfirmed: conditioning"):
         state.dispose()
     assert state.closed and encoder.disposed and sampler.closed and decoder.closed
     assert state.pixels is state.bridge is state.ledger is state.inputs is None
     assert state.conditioning_prefetch is owner
+    assert state.kv_lease is not None and releases == []
+    owner.close = lambda: None
+    state.dispose()
     assert state.kv_lease is None and releases == ["lease"]
 
 
 @pytest.mark.parametrize("prefetch_fails", [False, True])
-def test_block0_fill_failure_still_closes_prefetch_and_releases_resources(
+def test_block0_fill_failure_attempts_other_cleanup_but_retains_pool(
     prefetch_fails,
 ):
     state, _ = session(ChunkPlan([1, 2, 2]))
@@ -420,14 +427,16 @@ def test_block0_fill_failure_still_closes_prefetch_and_releases_resources(
     state.block0_cache = NS(finish_fill=fail_fill)
     state.conditioning_prefetch = owner
     state.kv_lease = NS(release=lambda: events.append("lease"))
-    error = "prefetch did not drain" if prefetch_fails else "Block0 fill failed"
+    error = (
+        "unconfirmed: block0, conditioning" if prefetch_fails else "unconfirmed: block0"
+    )
     with pytest.raises(RuntimeError, match=error):
         state.dispose()
-    assert events == ["fill", "prefetch", "lease"]
+    assert events == ["fill", "prefetch"]
     assert state.closed and encoder.disposed and sampler.closed and decoder.closed
     assert state.pixels is state.bridge is state.ledger is state.inputs is None
     assert state.conditioning_prefetch is (owner if prefetch_fails else None)
-    assert state.block0_cache is state.kv_lease is None
+    assert state.block0_cache is not None and state.kv_lease is not None
 
 
 def test_continuous_source_path_emits_dit_and_decoder_stage_spans(monkeypatch):
@@ -892,6 +901,251 @@ def test_joint_ready_worker_batches_without_crossing_command_boundary(
         )
 
 
+def test_control_only_switch_rejects_a_peer_boundary_before_conditioning(monkeypatch):
+    from sglang.multimodal_gen.runtime.conditioning import worker
+
+    state, stage = session(ChunkPlan([3, 2], True))
+    state.run(stage, batch(state, 0, 17, 0))
+    control = batch(state, 17, 0, 1)
+    control.extra["zing_prompt_update"] = dict(
+        source_boundary=17, prompt="new", event_id=2
+    )
+
+    def forbidden(*_):
+        raise AssertionError("A disagreeing boundary must not prepare a new condition")
+
+    monkeypatch.setattr(state, "_update_prompt", forbidden)
+    monkeypatch.setattr(worker, "coordinate_validation", lambda value: [value, False])
+    sampler = state.sampler
+    with pytest.raises(ValueError, match="barrier"):
+        state.run(stage, control)
+    assert state.closed and state.sampler is None and sampler.closed
+
+
+@pytest.mark.parametrize("peer_matches", [True, False])
+def test_control_only_dispatch_returns_ready_without_future_source_and_checks_identity(
+    monkeypatch, peer_matches
+):
+    from sglang.multimodal_gen.runtime.conditioning import worker
+
+    state, stage = session(ChunkPlan([3, 2], True))
+    state.run(stage, batch(state, 0, 17, 0))
+    control = batch(state, 17, 0, 1)
+    control.extra["zing_prompt_update"] = dict(
+        source_boundary=17, prompt="new", event_id=2
+    )
+    monkeypatch.setattr(state, "_update_prompt", lambda *_: None)
+    state.sampler.device = torch.device("cpu")
+    state.sampler.activate_prompt_at_source_boundary = lambda end: dict(
+        event_id=2, prompt_version=2, source_frame_index=end
+    )
+
+    def agree(value):
+        return [
+            value,
+            (
+                value
+                if isinstance(value, bool) or peer_matches
+                else ("other-session", 2, 2, 17)
+            ),
+        ]
+
+    monkeypatch.setattr(worker, "coordinate_validation", agree)
+    if not peer_matches:
+        with pytest.raises(ValueError, match="confirmed"):
+            state.run(stage, control)
+        assert state.closed
+        return
+    result = state.run(stage, control)
+    assert result.raw_frame_batches == []
+    assert result.usage["zing_condition_ready"] == dict(
+        type="control_ack",
+        kind="prompt.update",
+        state="kv_ready",
+        event_id=2,
+        prompt_version=2,
+        source_frame_index=17,
+    )
+    assert (
+        result.usage["zing_source_committed_end"] == 17
+        and state.ledger.accepted_frames == 17
+    )
+    state.dispose()
+
+
+class IncrementalSyntheticDecoder:
+    """Dispatch/lifecycle fixture; actual Lynn equality is tested separately."""
+
+    def __init__(self, ledger):
+        self.ledger = ledger
+        self.accepted_latents = self.seen = self.end = self.valid = 0
+        self.ended = self.closed = self.drained = False
+        self.finishes = 0
+
+    @property
+    def buffered_latents(self):
+        return self.accepted_latents - self.seen
+
+    @property
+    def ready(self):
+        return bool(self.buffered_latents or (self.ended and not self.drained))
+
+    def append(self, latent, *, latent_start, valid_frame_end, **_):
+        assert latent_start == self.accepted_latents
+        self.accepted_latents += latent.shape[2]
+        self.valid = valid_frame_end
+
+    def finish(self, *, total_frames):
+        assert not self.ended and total_frames == self.valid
+        self.ended = True
+        self.finishes += 1
+
+    def pop(self, *, max_latents):
+        assert max_latents == 1
+        self.seen += min(1, self.buffered_latents)
+        clips, phase = divmod(self.seen, 5)
+        end = min(self.valid, clips * 17 + (1 + (phase - 1) * 4 if phase else 0))
+        start, self.end = self.end, end
+        self.drained = self.ended and not self.buffered_latents
+        return NS(
+            start=start,
+            end=end,
+            values=torch.zeros(1, 3, end - start, 1, 1),
+            provenance=(
+                self.ledger.provenance_for(PixelRange(start, end), self.valid)
+                if end > start
+                else None
+            ),
+        )
+
+    def dispose(self):
+        self.closed = True
+
+
+@pytest.mark.parametrize("frames", [1, 14, 17, 32, 34])
+def test_decode_quantum_returns_each_slice_before_more_compute_and_drains_eos(frames):
+    state, stage = session(ChunkPlan([3, 2], True))
+    state.work_quantum = state.decode_quantum = 1
+    decoder = state.decoder = IncrementalSyntheticDecoder(state.ledger)
+    encoder, sampler = state.pixels, state.sampler
+    outputs = []
+    first = True
+    for dispatch in range(40):
+        pending_before = decoder.buffered_latents
+        calls_before = len(sampler.calls)
+        command = batch(
+            state,
+            0 if first else frames,
+            min(frames, 17) if first else 0,
+            dispatch,
+            final=first and frames <= 17,
+        )
+        if first and frames > 17:
+            tail = batch(state, 17, frames - 17, 1, final=True)
+            command.extra["zing_source_command"]["appends"].extend(
+                tail.extra["zing_source_command"]["appends"]
+            )
+            command.extra["zing_source_command"]["end"] = tail.extra[
+                "zing_source_command"
+            ]["end"]
+        result = state.run(stage, command)
+        first = False
+        blocks = result.usage["zing_realtime_blocks"]
+        outputs.extend(blocks)
+        assert sum(x["num_frames"] for x in blocks) <= 4
+        assert result.usage["zing_source_decode_steps"] <= 1
+        if pending_before:
+            assert len(sampler.calls) == calls_before
+        if result.usage["zing_source_complete"]:
+            break
+        assert result.usage["zing_source_more_work"]
+    else:
+        pytest.fail("Decoder did not drain in bounded dispatches")
+    assert sum(x["num_frames"] for x in outputs) == frames
+    assert decoder.finishes == 1
+    assert state.closed and decoder.closed and encoder.disposed and sampler.closed
+    if frames == 17:
+        assert [x["num_frames"] for x in outputs] == [1, 4, 4, 4, 4]
+
+
+def test_decode_quantum_cancel_disposes_pending_latents():
+    state, stage = session(ChunkPlan([3, 2], True))
+    state.work_quantum = state.decode_quantum = 1
+    decoder = state.decoder = IncrementalSyntheticDecoder(state.ledger)
+    state.run(stage, batch(state, 0, 17, 0))
+    state.run(stage, batch(state, 17, 0, 1))
+    assert decoder.buffered_latents > 0
+    encoder, sampler = state.pixels, state.sampler
+    state.dispose()
+    assert state.closed and decoder.closed and encoder.disposed and sampler.closed
+
+
+@pytest.mark.parametrize("drain", [False, True])
+def test_decode_quantum_condition_switch_waits_for_previous_rgb(monkeypatch, drain):
+    from sglang.multimodal_gen.runtime.conditioning import worker
+
+    state, stage = session(ChunkPlan([3, 2], True))
+    state.work_quantum = state.decode_quantum = 1
+    state.decoder = IncrementalSyntheticDecoder(state.ledger)
+    result = state.run(stage, batch(state, 0, 17, 0))
+    state.run(stage, batch(state, 17, 0, 1))
+    if drain:
+        for index in range(2, 12):
+            result = state.run(stage, batch(state, 17, 0, index))
+            if not result.usage["zing_source_more_work"]:
+                break
+        else:
+            pytest.fail("Previous RGB did not drain")
+    control = batch(state, 17, 0, 20)
+    control.extra["zing_prompt_update"] = dict(
+        source_boundary=17, prompt="new", event_id=2
+    )
+    monkeypatch.setattr(worker, "coordinate_validation", lambda value: [value, value])
+    updates = []
+    monkeypatch.setattr(state, "_update_prompt", lambda *_: updates.append("updated"))
+    state.sampler.device = torch.device("cpu")
+    state.sampler.activate_prompt_at_source_boundary = lambda end: dict(
+        event_id=2, prompt_version=2, source_frame_index=end
+    )
+    if drain:
+        result = state.run(stage, control)
+        assert result.usage["zing_condition_ready"]["source_frame_index"] == 17
+        assert updates == ["updated"]
+        state.dispose()
+    else:
+        with pytest.raises(ValueError, match="barrier"):
+            state.run(stage, control)
+        assert updates == [] and state.closed
+
+
+@pytest.mark.parametrize(
+    "work,decode,valid",
+    [
+        ("1", "1", True),
+        ("0", "0", True),
+        ("1", "0", True),
+        ("0", "1", False),
+        ("1", "2", False),
+    ],
+)
+def test_decode_quantum_requires_trusted_bounded_dispatch(
+    monkeypatch, work, decode, valid
+):
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", work)
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_DECODE_WORK_QUANTUM", decode)
+    # Worker policy is now resolved from the first command, so API-provided
+    # settings can override this process's legacy environment fallback.
+    state, stage = session(ChunkPlan([1, 2, 2]))
+    request = batch(state, 0, 17, 0)
+    if valid:
+        state.run(stage, request)
+        assert state.decode_quantum == int(decode)
+    else:
+        with pytest.raises(ValueError, match="decode quantum"):
+            state.run(stage, request)
+    state.dispose()
+
+
 class SyntheticRemoteDecoder(SyntheticDecoder):
     """Publishes pixels elsewhere; the DiT only receives one reference."""
 
@@ -911,6 +1165,8 @@ class SyntheticRemoteDecoder(SyntheticDecoder):
 
     def finish(self, *, total_frames):
         self.total = total_frames
+        # The real remote stream also needs a final receipt after its last RGB.
+        self.ready = True
 
     def pop(self):
         self.pops += 1
@@ -924,17 +1180,23 @@ class SyntheticRemoteDecoder(SyntheticDecoder):
             frames=end - start,
             reference={"frames": end - start} if end > start else None,
             transport_metadata={"format": "rgb24"},
-            provenance=self.ledger.provenance_for(PixelRange(start, end), end),
+            provenance=(
+                self.ledger.provenance_for(PixelRange(start, end), end)
+                if end > start
+                else None
+            ),
         )
 
 
 @pytest.mark.parametrize("final", [False, True])
 @pytest.mark.parametrize("first_dispatch", [False, True])
+@pytest.mark.parametrize("local_decode_quantum", [0, 1])
 def test_remote_decoder_returns_one_reference_per_dispatch(
-    final, first_dispatch, monkeypatch
+    final, first_dispatch, local_decode_quantum, monkeypatch
 ):
     """The first and later dispatches bind identity after decoder initialization."""
     state, stage = session(ChunkPlan(1))
+    state.decode_quantum = local_decode_quantum
     ledger = state.ledger
     decoder = state.decoder = SyntheticRemoteDecoder(ledger)
     state.remote_decoder = True
@@ -974,6 +1236,481 @@ def test_remote_decoder_returns_one_reference_per_dispatch(
     )
     if not final:
         state.dispose()
+
+
+def test_progressive_output_drains_accepted_encoder_prefix_without_empty_dispatch(
+    monkeypatch,
+):
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", "0")
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_DECODE_WORK_QUANTUM", "0")
+    state, stage = session(ChunkPlan([3, 2], split_first_latent=True))
+    state.remote_progressive = True
+    state.run(stage, batch(state, 0, 1, 0))
+    result = state.run(stage, batch(state, 1, 17, 1))
+    assert result.usage["zing_source_dispatch_steps"] == 1
+    # Publish the current result first. Collect the next clip's prefix after
+    # the already-ready second AR block, without introducing an empty RPC.
+    assert state.pixels.ready
+    assert result.usage["zing_source_consumed_end"] == 17
+    assert result.usage["zing_source_more_work"]
+    result = state.run(stage, batch(state, 18, 0, 2))
+    assert result.usage["zing_source_dispatch_steps"] == 1
+    assert not result.usage["zing_source_more_work"]
+    assert not state.pixels.ready
+    assert result.usage["zing_source_consumed_end"] == 18
+    state.dispose()
+
+
+@pytest.mark.parametrize(
+    "protocol", ["whitebox-startup-prepare-v1", "whitebox-startup-prepare-v2"]
+)
+def test_startup_control_preserves_rng_and_source_positions_until_attach(
+    monkeypatch, protocol
+):
+    import random
+    from dataclasses import asdict
+
+    state = ZingSourceStreamState()
+    prepared, stage = session(ChunkPlan([1, 2, 2]))
+    initializations = []
+
+    def initialize(stage, batch, config, trace=None):
+        assert batch.extra["zing_source_command"]["appends"] == []
+        initializations.append(config)
+        state.__dict__.update(prepared.__dict__)
+
+    monkeypatch.setattr(state, "initialize", initialize)
+    identity = dict(
+        preparation_id="p",
+        source_session_id="s",
+        source_epoch="se",
+        worker_epoch="we",
+        condition_fingerprint="a" * 64,
+    )
+    config = dict(width=1, height=1, fps=24, limits=asdict(prepared.ledger.limits))
+
+    def control(op, **fields):
+        return NS(
+            realtime_session_id="synthetic",
+            block_idx=0,
+            extra={
+                "zing_source_command": dict(
+                    config=config,
+                    appends=[],
+                    end=None,
+                    startup=dict(op=op, identity=identity, protocol=protocol, **fields),
+                )
+            },
+            metrics=None,
+        )
+
+    preview = (
+        dict(rgb=bytes(3))
+        if protocol.endswith("v1")
+        else dict(rgb=bytes([17]) * 6, width=2, height=1)
+    )
+    cpu_rng = torch.get_rng_state().clone()
+    python_rng = random.getstate()
+    result = state.run(stage, control("prepare", **preview))
+    assert result.usage["zing_startup_ready"]["level"] == "condition"
+    assert (
+        state.command_index
+        == state.ledger.accepted_frames
+        == state.bridge.accepted_pixels
+        == state.sampler.index
+        == 0
+    )
+    assert state.pixels.accepted_frames == 0 and state.decoder.appends == []
+    assert (
+        torch.equal(torch.get_rng_state(), cpu_rng) and random.getstate() == python_rng
+    )
+    state.run(stage, control("prepare", **preview))
+    assert len(initializations) == 1
+    state.run(stage, control("attach"))
+    assert state.command_index == 0
+    sampler = state.sampler
+    first = state.run(stage, batch(state, 0, 1, 0, final=True))
+    assert first.usage["zing_source_complete"] and state.command_index == 1
+    assert len(sampler.calls) == 1
+
+
+def test_prepare_s0_has_identical_condition_media_to_original_first_append():
+    seen = []
+
+    def prepare(request, use, **kwargs):
+        seen.append(kwargs["source_preview"])
+        raise RuntimeError("condition boundary")
+
+    stage = NS(
+        _validate_sampling_params=lambda p: None,
+        _build_realtime_sampler=lambda p: NS(
+            window_policy=NS(window_chunks=21, sink_chunks=3),
+            rope_position_mode="block_relative",
+            rope_max_frame_gap=12,
+        ),
+        _build_request=lambda b: {"messages": []},
+        _conditioning_consumer=lambda b: None,
+        _use=lambda *a: nullcontext(),
+        codecs=NS(video_decoder_name="lynn_decoder", prepare=prepare),
+    )
+    rgb = bytes([17] * 3072)
+    for command in [
+        dict(source_preview=True, appends=[dict(payload=dict(data=rgb))]),
+        dict(
+            source_preview=True,
+            appends=[],
+            startup=dict(op="prepare", rgb=rgb, width=32, height=32),
+        ),
+    ]:
+        with pytest.raises(RuntimeError, match="condition boundary"):
+            ZingSourceStreamState().initialize(
+                stage,
+                NS(sampling_params=NS(), extra={"zing_source_command": command}),
+                dict(width=32, height=32, fps=24),
+            )
+    assert torch.equal(seen[0].pop("frames"), seen[1].pop("frames"))
+    assert seen[0] == seen[1] and seen[0]["origin"] == "source_s0"
+
+
+def test_v2_prepare_condition_tensor_keeps_native_dimensions_without_source_advance():
+    from sglang.multimodal_gen.runtime.realtime.source_prepare import V2_PROTOCOL
+
+    seen = []
+
+    def prepare(request, use, **kwargs):
+        seen.append(kwargs["source_preview"])
+        raise RuntimeError("condition boundary")
+
+    stage = NS(
+        _validate_sampling_params=lambda p: None,
+        _build_realtime_sampler=lambda p: NS(
+            window_policy=NS(window_chunks=21, sink_chunks=3),
+            rope_position_mode="block_relative",
+            rope_max_frame_gap=12,
+        ),
+        _build_request=lambda b: {"messages": []},
+        _conditioning_consumer=lambda b: None,
+        _use=lambda *a: nullcontext(),
+        codecs=NS(video_decoder_name="lynn_decoder", prepare=prepare),
+    )
+    rgb = bytes([17]) * 16 * 48 * 3
+    command = dict(
+        source_preview=True,
+        appends=[],
+        startup=dict(op="prepare", protocol=V2_PROTOCOL, rgb=rgb, width=16, height=48),
+    )
+    with pytest.raises(RuntimeError, match="condition boundary"):
+        ZingSourceStreamState().initialize(
+            stage,
+            NS(sampling_params=NS(), extra={"zing_source_command": command}),
+            dict(width=32, height=32, fps=24),
+        )
+    assert tuple(seen[0]["frames"].shape) == (3, 1, 48, 16)
+    assert torch.equal(
+        seen[0]["frames"], torch.full((3, 1, 48, 16), 17, dtype=torch.uint8)
+    )
+    assert seen[0]["id"] == "<Video 1>" and seen[0]["clip"] == dict(start=0, end=0)
+
+
+@pytest.mark.parametrize("change", ["protocol", "dimensions", "pixels", "oversize"])
+def test_v2_worker_rejects_changed_preparation_before_source_advance(
+    monkeypatch, change
+):
+    from dataclasses import asdict
+
+    from sglang.multimodal_gen.runtime.realtime.source_prepare import V2_PROTOCOL
+
+    state = ZingSourceStreamState()
+    prepared, stage = session(ChunkPlan([1, 2, 2]))
+    initialized = []
+
+    def initialize(stage, batch, config, trace=None):
+        initialized.append(config)
+        state.__dict__.update(prepared.__dict__)
+
+    monkeypatch.setattr(state, "initialize", initialize)
+    identity = dict(
+        preparation_id="p",
+        source_session_id="s",
+        source_epoch="se",
+        worker_epoch="we",
+        condition_fingerprint="a" * 64,
+    )
+    startup = dict(
+        op="prepare",
+        protocol=V2_PROTOCOL,
+        identity=identity,
+        rgb=bytes(6),
+        width=2,
+        height=1,
+    )
+    command = dict(
+        config=dict(width=1, height=1, fps=24, limits=asdict(prepared.ledger.limits)),
+        appends=[],
+        end=None,
+        startup=startup,
+    )
+    request = NS(
+        realtime_session_id="synthetic",
+        block_idx=0,
+        extra={"zing_source_command": command},
+        metrics=None,
+    )
+    if change != "oversize":
+        state.run(stage, request)
+    if change == "protocol":
+        startup["protocol"] = "whitebox-startup-prepare-v1"
+    elif change == "dimensions":
+        startup.update(width=1, height=2)
+    elif change == "pixels":
+        startup["rgb"] = bytes([1]) * 6
+    else:
+        startup.update(width=16_777_217, height=1)
+    with pytest.raises(ValueError):
+        state.run(stage, request)
+    assert state.command_index == 0 and state.closed
+    assert len(initialized) == (0 if change == "oversize" else 1)
+
+
+class ProgressiveJointSampler(SyntheticSampler):
+    """Bounded synthetic ready queue; exercises ordering, not model performance."""
+
+    def __init__(self, plan, events):
+        super().__init__(plan)
+        self.sampler.joint_forward = "cross_chunk"
+        self.sampler.last_run_metrics = {"joint_fallbacks": {}}
+        self.pending = []
+        self.max_pending_chunks = 2
+        self.max_pending_bytes = 1024
+        self.pending_bytes = 0
+        self.events = events
+
+    def append(self, source, noise, *, provenance, final):
+        self.pending.append(
+            NS(
+                source=source,
+                noise=noise,
+                provenance=provenance,
+                final=final,
+                chunk=self.plan.chunk(self.index + len(self.pending)),
+            )
+        )
+        self.pending_bytes += source.numel() * 8
+
+    def drain_ready(self, *, max_outputs=None):
+        emitted = 0
+        while self.pending and (max_outputs is None or emitted < max_outputs):
+            value = self.pending.pop(0)
+            self.pending_bytes -= value.source.numel() * 8
+            super().append(
+                value.source,
+                value.noise,
+                provenance=value.provenance,
+                final=value.final,
+            )
+            self.events.append(("dit", value.chunk.end))
+            emitted += 1
+            yield self.step()
+
+
+def progressive_remote_session(monkeypatch):
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", "0")
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_DECODE_WORK_QUANTUM", "0")
+    state, stage = session(ChunkPlan([3, 2], split_first_latent=True))
+    events = []
+    state.sampler = ProgressiveJointSampler(state.bridge.plan, events)
+    state.decoder = SyntheticRemoteDecoder(state.ledger)
+    state.remote_decoder = state.remote_progressive = True
+    encoder_pop, decoder_pop = state.pixels.pop, state.decoder.pop
+
+    def pop_source():
+        result = encoder_pop()
+        events.append(("encoder", result.end))
+        return result
+
+    def pop_output():
+        events.append(("decode", state.decoder.accepted_frames))
+        return decoder_pop()
+
+    monkeypatch.setattr(state.pixels, "pop", pop_source)
+    monkeypatch.setattr(state.decoder, "pop", pop_output)
+    return state, stage, events
+
+
+def run_remote(state, stage, start, count, *, final=False):
+    request = batch(state, start, count, state.ledger.sequence, final=final)
+    request.realtime_generation_id = "generation"
+    return state.run(stage, request)
+
+
+@pytest.mark.parametrize("prepared_start", [False, True])
+def test_progressive_joint_starts_current_dit_and_decoder_before_future_encoder(
+    monkeypatch,
+    prepared_start,
+):
+    state, stage, events = progressive_remote_session(monkeypatch)
+    if prepared_start:
+        from dataclasses import asdict
+
+        prepared = state
+        state = ZingSourceStreamState()
+        monkeypatch.setattr(
+            state, "initialize", lambda *args: state.__dict__.update(prepared.__dict__)
+        )
+        identity = dict(
+            preparation_id="p",
+            source_session_id="s",
+            source_epoch="se",
+            worker_epoch="we",
+            condition_fingerprint="a" * 64,
+        )
+        control = batch(prepared, 0, 0, 0)
+        control.realtime_generation_id = "generation"
+        command = control.extra["zing_source_command"]
+        command["appends"] = []
+        command["config"] = dict(
+            width=1, height=1, fps=24, limits=asdict(prepared.ledger.limits)
+        )
+        command["startup"] = dict(
+            op="prepare",
+            protocol="whitebox-startup-prepare-v2",
+            identity=identity,
+            rgb=bytes([17]) * 6,
+            width=2,
+            height=1,
+        )
+        state.run(stage, control)
+        assert state.ledger.accepted_frames == 0 and events == []
+        command["startup"] = dict(
+            op="attach", protocol="whitebox-startup-prepare-v2", identity=identity
+        )
+        state.run(stage, control)
+    run_remote(state, stage, 0, 1)
+    run_remote(state, stage, 1, 8)
+    events.clear()
+    # The current eight-frame block needs latent 3:5. Latent 5:6 is the
+    # following clip's prefix and must not delay this block's DiT or D1 submit.
+    result = run_remote(state, stage, 9, 9)
+    assert events.index(("dit", 5)) < events.index(("encoder", 6))
+    assert events.index(("decode", 17)) < events.index(("encoder", 6))
+    assert result.raw_frame_shared_memory_ref == {"frames": 8}
+    assert result.usage["zing_source_dispatch_steps"] == 1
+    assert result.usage["zing_source_consumed_end"] == 18
+    assert not result.usage["zing_source_more_work"]
+    assert not state.pixels.ready
+    if prepared_start:
+        tail = run_remote(state, stage, 18, 0, final=True)
+        assert tail.usage["zing_source_complete"]
+        assert tail.raw_frame_shared_memory_ref == {"frames": 1}
+        assert state.closed
+    else:
+        state.dispose()
+
+
+@pytest.mark.parametrize("frames", [1, 8, 9, 17, 18, 26, 34, 35])
+@pytest.mark.parametrize("packet_frames", [1, 17])
+@pytest.mark.parametrize("end_with_last_packet", [False, True])
+def test_progressive_joint_preserves_all_output_boundaries_and_eos(
+    monkeypatch, frames, packet_frames, end_with_last_packet
+):
+    state, stage, _ = progressive_remote_session(monkeypatch)
+    encoder, sampler, decoder = state.pixels, state.sampler, state.decoder
+    cursor = 0
+    results = []
+    while cursor < frames:
+        count = min(packet_frames, frames - cursor)
+        results.append(
+            run_remote(
+                state,
+                stage,
+                cursor,
+                count,
+                final=end_with_last_packet and cursor + count == frames,
+            )
+        )
+        cursor += count
+        while results[-1].usage["zing_source_more_work"]:
+            results.append(run_remote(state, stage, cursor, 0))
+    if not end_with_last_packet:
+        results.append(run_remote(state, stage, cursor, 0, final=True))
+    for _ in range(20):
+        if results[-1].usage["zing_source_complete"]:
+            break
+        assert results[-1].usage["zing_source_more_work"]
+        results.append(run_remote(state, stage, cursor, 0))
+    assert results[-1].usage["zing_source_complete"]
+    assert (
+        sum((r.raw_frame_shared_memory_ref or {}).get("frames", 0) for r in results)
+        == frames
+    )
+    assert all(r.usage["zing_source_dispatch_steps"] <= 1 for r in results)
+    expected = [call.provenance.pixels.end for call in sampler.calls]
+    assert [item["valid_frame_end"] for item in decoder.appends] == expected
+    assert expected == sorted(set(expected)) and expected[-1] == frames
+    assert state.closed and encoder.disposed and sampler.closed and decoder.closed
+
+
+def test_progressive_joint_failure_after_decoder_submission_releases_state(monkeypatch):
+    state, stage, events = progressive_remote_session(monkeypatch)
+    encoder, sampler, decoder = state.pixels, state.sampler, state.decoder
+    run_remote(state, stage, 0, 1)
+    run_remote(state, stage, 1, 8)
+    pop_source = encoder.pop
+
+    def fail_future_prefix():
+        if encoder.emitted_latents == 5:
+            assert ("decode", 17) in events
+            raise RuntimeError("Future source transfer failed")
+        return pop_source()
+
+    monkeypatch.setattr(encoder, "pop", fail_future_prefix)
+    with pytest.raises(RuntimeError, match="Future source transfer failed"):
+        run_remote(state, stage, 9, 9)
+    assert state.closed and encoder.disposed and sampler.closed and decoder.closed
+
+
+def test_prepare_native_preview_geometry_is_independent_of_source_stream():
+    seen = []
+
+    def prepare(request, use, **kwargs):
+        seen.append(kwargs["source_preview"])
+        raise RuntimeError("condition boundary")
+
+    stage = NS(
+        _validate_sampling_params=lambda p: None,
+        _build_realtime_sampler=lambda p: NS(
+            window_policy=NS(window_chunks=21, sink_chunks=3),
+            rope_position_mode="block_relative",
+            rope_max_frame_gap=12,
+        ),
+        _build_request=lambda b: {"messages": []},
+        _conditioning_consumer=lambda b: None,
+        _use=lambda *a: nullcontext(),
+        codecs=NS(video_decoder_name="lynn_decoder", prepare=prepare),
+    )
+    width, height = 960, 540
+    rgb = bytes([17, 23, 42]) * width * height
+    command = dict(
+        source_preview=True,
+        appends=[],
+        startup=dict(
+            op="prepare",
+            protocol="whitebox-startup-prepare-v2",
+            rgb=rgb,
+            width=width,
+            height=height,
+        ),
+    )
+    with pytest.raises(RuntimeError, match="condition boundary"):
+        ZingSourceStreamState().initialize(
+            stage,
+            NS(sampling_params=NS(), extra={"zing_source_command": command}),
+            dict(width=832, height=480, fps=24),
+        )
+    preview = seen[0]
+    assert preview["origin"] == "source_s0"
+    assert tuple(preview["frames"].shape) == (3, 1, 540, 960)
+    assert preview["frames"][:, 0, -1, -1].tolist() == [17, 23, 42]
 
 
 @pytest.mark.parametrize("quantum", [0, 1])
@@ -1087,3 +1824,143 @@ def test_block0_prefill_and_live_share_key_without_scheduling_policy(
         ZingSourceStreamState().prefill({}, stage=stage, batch=request, config=config)
     assert keys[3] == keys[0]
     assert disk_reads == [False, True, True, True]
+
+
+@pytest.mark.parametrize("progressive", [False, True])
+def test_s0_v2_and_prefill_share_native_preview_and_resolved_policy(
+    monkeypatch, progressive
+):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.source_session import (
+        source_preview,
+    )
+
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_SOURCE_WORK_QUANTUM", "invalid")
+    monkeypatch.setenv("SGLANG_ZING_EXPERIMENTAL_DECODE_WORK_QUANTUM", "invalid")
+    keys = []
+
+    class LookupBoundary(Exception):
+        pass
+
+    def lookup(key, *, allow_disk=False):
+        keys.append(key)
+        raise LookupBoundary()
+
+    stage = NS(
+        block0_cache=NS(lookup=lookup, identity={"model": {}, "layout": {}}),
+        _validate_sampling_params=lambda params: None,
+        _build_realtime_sampler=lambda params: NS(
+            joint_forward="cross_chunk",
+            window_policy=NS(window_chunks=6, sink_chunks=3),
+            rope_position_mode="block_relative",
+            rope_max_frame_gap=12,
+        ),
+        _build_request=lambda batch: {},
+        codecs=NS(video_decoder_name="lynn_decoder"),
+    )
+    config = dict(width=32, height=32, fps=30)
+    rgb = bytes([17, 23, 42]) * 48 * 24
+    command = dict(
+        work_quantum=0 if progressive else 1,
+        decode_quantum=0,
+        defer_final=False,
+        prompt_joint=False,
+        remote_progressive=progressive,
+        source_preview=True,
+        appends=[],
+        startup=dict(
+            op="prepare",
+            protocol="whitebox-startup-prepare-v2",
+            rgb=rgb,
+            width=48,
+            height=24,
+        ),
+    )
+    batch = NS(sampling_params=NS(), extra={"zing_source_command": command})
+    live, warmup = ZingSourceStreamState(), ZingSourceStreamState()
+    with pytest.raises(LookupBoundary):
+        live.initialize(stage, batch, config)
+    with pytest.raises(LookupBoundary):
+        warmup.prefill(
+            {},
+            stage=stage,
+            batch=batch,
+            config=config,
+            source_preview=source_preview({**config, "width": 48, "height": 24}, rgb),
+        )
+    assert keys[0] == keys[1]
+    assert live.policy == warmup.policy
+    assert live.policy["source_defer_final"] is progressive
+
+
+def test_same_prompt_omitted_references_skips_conditioning_and_cpu_cache(monkeypatch):
+    from sglang.multimodal_gen.runtime.conditioning import worker
+
+    monkeypatch.setattr(worker, "coordinate_validation", lambda v: [v])
+    state = ZingSourceStreamState()
+    condition = {
+        "context": torch.ones(3, 4),
+        "row_role": torch.zeros(3, dtype=torch.long),
+    }
+    live = NS(condition=condition, event_id=4)
+    updates = []
+    state.prompt, state.prompt_event = "same", 4
+    state.sampler = NS(
+        prompt=live,
+        applied_prompt=live,
+        cache=NS(prefix=object()),
+        discard_pending_prompt=lambda: None,
+        update_prompt=lambda *a, **kw: updates.append((a, kw)),
+    )
+
+    def forbidden(*_, **__):
+        raise AssertionError("Must not load or encode identical conditions")
+
+    state.block0_cache = NS(lookup=forbidden)
+    stage = NS(encode_condition_for_batch=forbidden)
+    batch = NS(
+        extra={"zing_prompt_update": dict(prompt="same", event_id=5)},
+        sampling_params=NS(prompt="same"),
+        realtime_event_id=5,
+        realtime_prompt_version=2,
+    )
+    assert state._update_prompt(stage, batch) is None
+    assert updates[0][0][0] is condition and updates[0][1]["reuse_prefix"] is True
+    assert state.prompt_event == 5
+
+
+@pytest.mark.parametrize("changed", ["text", "references", "pending", "rank"])
+def test_resident_reuse_never_hides_real_condition_change(monkeypatch, changed):
+    from sglang.multimodal_gen.runtime.conditioning import worker
+
+    def vote(v):
+        return [v, (False, v[1])] if changed == "rank" and isinstance(v, tuple) else [v]
+
+    monkeypatch.setattr(worker, "coordinate_validation", vote)
+    state = ZingSourceStreamState()
+    live = NS(condition={}, event_id=3 if changed == "pending" else 4)
+    state.prompt, state.prompt_event = "same", 4
+    state.sampler = NS(
+        prompt=live,
+        applied_prompt=live,
+        cache=NS(prefix=object()),
+        discard_pending_prompt=lambda: None,
+    )
+
+    class NormalPath(Exception):
+        pass
+
+    def normal(*a, **kw):
+        raise NormalPath()
+
+    state.block0_cache = NS(lookup=normal)
+    state._block0_update_key = lambda *a: ("key", {})
+    cmd = dict(prompt="different" if changed == "text" else "same", event_id=5)
+    if changed == "references":
+        cmd["references"] = []
+    batch = NS(
+        extra={"zing_prompt_update": cmd},
+        sampling_params=NS(prompt="same"),
+        realtime_event_id=5,
+    )
+    with pytest.raises(NormalPath):
+        state._update_prompt(NS(), batch)

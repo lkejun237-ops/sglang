@@ -3,9 +3,11 @@
 
 import ast
 import asyncio
+import logging
 import multiprocessing
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +19,58 @@ import torch.distributed as dist
 from sglang.multimodal_gen.runtime.realtime.worker_parallel import ParallelChannel
 
 TensorMetadata = namedtuple("TensorMetadata", "device dtype size")
+
+
+@pytest.mark.parametrize("completes", [True, False])
+def test_startup_probe_waits_for_stream_completion_with_a_deadline(
+    monkeypatch, completes
+):
+    from sglang.multimodal_gen.runtime.disaggregation.transport import nccl_bridge
+
+    clock = [0.0]
+    recorded = []
+    stream = object()
+
+    class Event:
+        def record(self, current):
+            recorded.append(current)
+
+        def query(self):
+            return completes and clock[0] >= 0.002
+
+    def sleep(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr(
+        nccl_bridge, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep)
+    )
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _: stream)
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda *_: pytest.fail("must not fence the entire GPU"),
+    )
+    probe = SimpleNamespace(is_cuda=True, device="cuda:0")
+    if completes:
+        nccl_bridge.wait_bridge_probe(probe, timeout_seconds=0.004)
+        assert clock[0] == 0.002
+    else:
+        with pytest.raises(TimeoutError, match="startup probe did not complete"):
+            nccl_bridge.wait_bridge_probe(probe, timeout_seconds=0.004)
+        assert clock[0] == 0.004
+    assert recorded == [stream]
+
+
+def test_cpu_bridge_probe_does_not_touch_cuda(monkeypatch):
+    from sglang.multimodal_gen.runtime.disaggregation.transport import nccl_bridge
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "Event",
+        lambda: pytest.fail("CPU probe must not allocate a CUDA event"),
+    )
+    nccl_bridge.wait_bridge_probe(torch.zeros(1), timeout_seconds=1)
 
 
 def coordinator(rank):
@@ -190,6 +244,63 @@ def exercise_progress_failure(channel):
         output.source_progress(1, [])
 
 
+def exercise_condition_admission_consensus(group):
+    from sglang.multimodal_gen.runtime.conditioning import worker
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+
+    # As with coordinator() above, execute the actual CPU function without
+    # importing the unrelated CUDA-only pipeline registration package.
+    path = (
+        Path(__file__).resolve().parents[3]
+        / "runtime/pipelines_core/stages/model_specific_stages/zing_h3/prompt_update.py"
+    )
+    function = next(
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name == "coordinate_prompt_admission"
+    )
+    namespace = {
+        "ConditionError": ConditionError,
+        "logger": logging.getLogger(__name__),
+    }
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"),
+        namespace,
+    )  # noqa: S102 - execute unchanged repository function
+    coordinate_prompt_admission = namespace["coordinate_prompt_admission"]
+
+    original = worker._sp_group
+    worker._sp_group = lambda: group
+    try:
+        for failure in ("row_role", "runtime", "capacity", "mixed"):
+
+            def admit():
+                if group.rank_in_group == 1:
+                    if failure in {"row_role", "mixed"}:
+                        raise ValueError("H3 context row_role must align with context")
+                    if failure == "runtime":
+                        raise RuntimeError("injected device failure")
+                    raise ConditionError("CONDITION_INVALID", "capacity exceeded")
+                if failure == "mixed":
+                    raise ConditionError("CONDITION_INVALID", "capacity exceeded")
+                return "accepted-on-rank-zero"
+
+            expected = RuntimeError if failure == "runtime" else ConditionError
+            message = (
+                "Condition validation failed on a DiT rank"
+                if failure != "runtime"
+                else "Condition admission failed on a model rank"
+            )
+            with pytest.raises(expected, match=message):
+                coordinate_prompt_admission(admit)
+            # Both ranks must finish admission failure before entering the next
+            # collective. A rank-local ValueError must not strand its peer.
+            dist.barrier(group=group.cpu_group)
+        assert coordinate_prompt_admission(lambda: "valid") == "valid"
+    finally:
+        worker._sp_group = original
+
+
 def _rank(rank, rendezvous):
     dist.init_process_group(
         "gloo",
@@ -200,6 +311,7 @@ def _rank(rank, rendezvous):
     )
     try:
         group = coordinator(rank)
+        exercise_condition_admission_consensus(group)
         local = LocalChannel() if rank == 0 else None
         channel = ParallelChannel(group, local)
         # HTTP pause is local and must not require a collective on the peer.
@@ -279,7 +391,7 @@ def test_single_rank_preserves_local_channel():
 
 @pytest.mark.parametrize("decoder_failed", [False, True])
 def test_dit_owner_preserves_failure_category_after_decoder_close(decoder_failed):
-    """Transport cleanup allows reuse; model failure still quarantines the worker."""
+    """Retain the initiating failure and quarantine after either fault category."""
     import threading
     from queue import Queue
 
@@ -297,7 +409,7 @@ def test_dit_owner_preserves_failure_category_after_decoder_close(decoder_failed
         for item in ast.parse(path.read_text()).body
         if isinstance(item, ast.ClassDef) and item.name == "DiTInputService"
     )
-    namespace = {"PollingTaskQueue": PollingTaskQueue}
+    namespace = {"PollingTaskQueue": PollingTaskQueue, "nullcontext": nullcontext}
     exec(
         compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace
     )
@@ -340,6 +452,13 @@ def test_dit_owner_preserves_failure_category_after_decoder_close(decoder_failed
         topology={},
     )
 
+    def quarantine():
+        owner.manager.restart_required = True
+        owner.manager.state = "failed"
+
+    owner.manager.quarantine = quarantine
+    owner.manager.cleanup_guard = nullcontext
+
     async def destroy(*, force):
         assert force
         owner.running = False
@@ -349,8 +468,8 @@ def test_dit_owner_preserves_failure_category_after_decoder_close(decoder_failed
     assert closed == [True]
     assert service.decoder is None
     assert service.transport_failed is decoder_failed
-    assert owner.manager.restart_required is (not decoder_failed)
-    assert owner.manager.state == ("idle" if decoder_failed else "failed")
+    assert owner.manager.restart_required is True
+    assert owner.manager.state == "failed"
 
 
 @pytest.mark.parametrize(

@@ -268,7 +268,7 @@ def _worker(
                 elif "encoder_step" in data:
                     event("operation_done", op=data["encoder_step"])
 
-            worker.print = capture_print
+            worker.diagnostic_print = capture_print
             with (
                 patch.dict("os.environ", {"LOCAL_RANK": str(rank)}),
                 patch.object(
@@ -400,7 +400,7 @@ class _Service:
 
     def open(self, owner="owner"):
         reply = self.request(
-            dict(op="open", session=owner, bridge_port=1001, capacity_frames=51)
+            dict(op="open", session=owner, bridge_port=11001, capacity_frames=51)
         )
         assert reply["ok"], reply
 

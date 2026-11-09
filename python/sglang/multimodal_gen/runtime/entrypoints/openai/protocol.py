@@ -172,6 +172,11 @@ class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
     game_id: Optional[str] = None
     group_id: Optional[str] = None
     type: Literal["init"]
+    source_prompt_protocol: Optional[Literal["ordered-boundary-v2"]] = None
+    source_condition_switch_protocol: Optional[Literal["clip-barrier-v1"]] = None
+    source_prepare_protocol: Optional[
+        Literal["whitebox-startup-prepare-v1", "whitebox-startup-prepare-v2"]
+    ] = None
     # Explicit realtime task selection. When omitted, model adapters may infer
     # I2V from first_frame presence for backwards compatibility.
     generation_mode: Optional[Literal["i2v", "t2v"]] = None

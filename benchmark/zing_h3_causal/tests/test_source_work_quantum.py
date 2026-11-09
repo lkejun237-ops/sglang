@@ -39,6 +39,7 @@ def methods(sampling_schedule=None):
         "_take_source_input",
         "prepare_next_request",
         "on_chunk_complete",
+        "_condition_control_ready",
     }
     cls.body = [n for n in cls.body if getattr(n, "name", None) in selected]
     cls.bases = [ast.Name(id="Base", ctx=ast.Load())]
@@ -65,8 +66,14 @@ def methods(sampling_schedule=None):
     )
     adapter = ns["ZingH3SourceStreamAdapter"]()
     adapter.__dict__.update(
+        startup_enabled=False,
+        startup_command=None,
         pending=deque(),
+        ordered_prompts=False,
+        prompt_boundary=None,
         pending_frames=0,
+        committed_source_frames=0,
+        _pending_prompt_command=None,
         _source_reservations={},
         _inflight_reservations=[],
         _selected_prompt_command=None,
@@ -76,6 +83,8 @@ def methods(sampling_schedule=None):
         end_dispatched=False,
         more_work=False,
         source_work_quantum=1,
+        source_decode_quantum=0,
+        remote_progressive=False,
         cache_options={"cache_write": False},
         source_defer_final=False,
         source_prompt_joint=False,
@@ -86,7 +95,7 @@ def methods(sampling_schedule=None):
         source_encoder={"mode": "progressive"},
         source_geometry=GeometryFixture(736, 1280, 480, 832, 736, 1280),
         available=asyncio.Event(),
-        ledger=NS(closed=False),
+        ledger=NS(closed=False, accepted_frames=0),
         config={},
         conditioning_prefetch_endpoint=None,
         max_message_bytes=1 << 20,

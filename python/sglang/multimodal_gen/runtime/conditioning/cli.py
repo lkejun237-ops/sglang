@@ -86,6 +86,11 @@ def load_configuration(args):
         raise ValueError(
             "Conditioning native model path and GPU must be explicitly configured"
         )
+    prompt_tokens = native.get("max_prompt_tokens")
+    if prompt_tokens is not None and (
+        type(prompt_tokens) is not int or prompt_tokens <= 0
+    ):
+        raise ValueError("Prompt token budget must be a positive integer")
     return config, DeploymentProfile.load(args.profile), limits
 
 
@@ -312,6 +317,7 @@ def main(argv=None):
         profile,
         max_rows=limits.max_condition_rows,
         gpu_id=native["gpu_id"],
+        max_prompt_tokens=native.get("max_prompt_tokens"),
     )
     # The first encode compiles kernels (~30 s on L20D), far above request_timeout_s.
     warm_encoder(encoder)

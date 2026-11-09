@@ -455,6 +455,7 @@ def _run_decoder_worker_script(commands, *, max_sessions: int = 2, service_cls=N
             close=lambda: None,
         ),
         _output_identity=_output_identity,
+        remote_decode_progressive=lambda: False,
         service_ports=importlib.import_module(
             "sglang.multimodal_gen.runtime.realtime.worker_services"
         ).service_ports,
@@ -776,6 +777,10 @@ def _run_encoder_worker_script(
                 timeout_seconds=120,
                 startup_timeout_seconds=600,
                 max_sessions=max_sessions,
+                host="127.0.0.1",
+                peer_host="127.0.0.1",
+                auth_token_file=None,
+                node_binding_file=None,
             )
 
     dist_kwargs = dict(
@@ -803,6 +808,9 @@ def _run_encoder_worker_script(
     import contextlib
 
     namespace = dict(
+        EncoderPeer=importlib.import_module(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.encoder_peer"
+        ).EncoderPeer,
         EncoderCommandControl=control.EncoderCommandControl,
         EncoderControlError=control.EncoderControlError,
         logging=logging,

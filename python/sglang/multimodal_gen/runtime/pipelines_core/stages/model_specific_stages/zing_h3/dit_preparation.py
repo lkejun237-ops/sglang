@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Adapt the existing Block0 owner to Encoder/DiT control messages."""
 
+import time
 from dataclasses import fields
 from types import SimpleNamespace
 
@@ -50,11 +51,16 @@ class DiTPreparation:
     def control(self, operation, arguments, *, busy):
         from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
 
-        try:
-            return self._control(operation, arguments, busy=busy)
-        except ConditionError as exc:
-            # Admission is a request result, not a failed worker/transport.
-            return {"code": exc.code}
+        from .cache_logging import cache_scope
+
+        arguments = dict(arguments)
+        context = arguments.pop("_trace", None)
+        with cache_scope(context):
+            try:
+                return self._control(operation, arguments, busy=busy)
+            except ConditionError as exc:
+                # Admission is a request result, not a failed worker/transport.
+                return {"code": exc.code}
 
     def _control(self, operation, arguments, *, busy):
         from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
@@ -85,8 +91,21 @@ class DiTPreparation:
                 self.stage.admit_cached_preparation(
                     entry, prompt_update=arguments["prompt_update"]
                 )
+            from .preparation_cache import coordinate_validation
+
+            lookup = (
+                {
+                    "cache_result": "miss",
+                    "miss_reason": "forced",
+                    "lookup_host_ms": None,
+                }
+                if arguments.get("force", False)
+                else dict(cache.last_lookup)
+            )
             return {
                 "hit": entry is not None,
+                "lookup": lookup,
+                "rank_lookups": coordinate_validation(lookup),
                 **(
                     {
                         "inputs": prepared_message(entry.inputs),
@@ -97,13 +116,53 @@ class DiTPreparation:
                 ),
             }
         if operation == "prefill":
+            from sglang.multimodal_gen.runtime.realtime.prefill_persistence import (
+                persistence_descriptor,
+            )
+
             if busy:
                 return {"code": "cache_busy"}
+            from .block0_telemetry import Block0Telemetry
+            from .preparation_cache import coordinate_validation
+
+            telemetry = Block0Telemetry()
+            began = time.perf_counter()
             existing = (
                 None
                 if arguments.get("force", False)
                 else cache.lookup(arguments["cache_key"], allow_disk=True)
             )
+            lookup = (
+                {
+                    "cache_result": "miss",
+                    "miss_reason": "forced",
+                    "lookup_host_ms": None,
+                }
+                if arguments.get("force", False)
+                else dict(cache.last_lookup)
+            )
+            telemetry.cache_result = lookup["cache_result"]
+            telemetry.lookup_details = lookup
+            telemetry.miss_reason = lookup.get("miss_reason")
+            if arguments.get("force", False):
+                telemetry.skip("cache_lookup")
+            else:
+                telemetry.record("cache_lookup", (time.perf_counter() - began) * 1000)
+
+            def timings():
+                telemetry.skip(
+                    "restore"
+                )  # Prefill publishes Host KV, not a live generation.
+                telemetry.finish()
+                snapshot = telemetry.snapshot()
+                return dict(
+                    timings=snapshot,
+                    rank_timings=[
+                        dict(rank=rank, **value)
+                        for rank, value in enumerate(coordinate_validation(snapshot))
+                    ],
+                )
+
             if existing is not None:
                 self.stage.admit_cached_preparation(existing)
                 cache.register(
@@ -111,11 +170,16 @@ class DiTPreparation:
                     game_id=arguments.get("game_id"),
                     group_id=arguments.get("group_id"),
                 )
+                telemetry.skip("block0_prepare_and_l1_fill")
                 return {
                     "cache_key": existing.key,
+                    "_disk_descriptor": persistence_descriptor(cache, existing)
+                    if getattr(cache, "disk_cache", None) is not None
+                    else None,
                     "hit": True,
                     "entries": cache.entry_count,
                     "evictions": cache.evictions,
+                    **timings(),
                 }
             if arguments.get("inputs") is None:
                 return {"code": "cache_unavailable"}
@@ -137,19 +201,24 @@ class DiTPreparation:
             if admitted is not None and not cache.can_store(admitted.prefix_rows):
                 return {"code": "cache_capacity_exceeded"}
             device = next(self.stage.modules["transformer"].parameters()).device
-            entry = fill_prepared_prefix(
-                self.stage,
-                sampler,
-                inputs_on(inputs, device),
-                owner=SimpleNamespace(),
-                key=arguments["cache_key"],
-                identity=arguments.get("conditioning_identity"),
-                request=arguments["request"],
-                source_shape=tuple(arguments["source_shape"]),
-                force=arguments.get("force", False),
-            )
-            if entry is None:
-                return {"code": "cache_unavailable"}
+            with telemetry.measure("block0_prepare_and_l1_fill"):
+                entry = fill_prepared_prefix(
+                    self.stage,
+                    sampler,
+                    inputs_on(inputs, device),
+                    owner=SimpleNamespace(),
+                    key=arguments["cache_key"],
+                    identity=arguments.get("conditioning_identity"),
+                    request=arguments["request"],
+                    source_shape=tuple(arguments["source_shape"]),
+                    force=arguments.get("force", False),
+                )
+            if not all(coordinate_validation(entry is not None)):
+                return {
+                    "code": "cache_capacity_busy"
+                    if cache.backend == "local"
+                    else "cache_unavailable"
+                }
             cache.register(
                 entry.key,
                 game_id=arguments.get("game_id"),
@@ -157,9 +226,13 @@ class DiTPreparation:
             )
             return {
                 "cache_key": entry.key,
+                "_disk_descriptor": persistence_descriptor(cache, entry)
+                if getattr(cache, "disk_cache", None) is not None
+                else None,
                 "hit": False,
                 "entries": cache.entry_count,
                 "evictions": cache.evictions,
+                **timings(),
             }
         if operation not in ("list_entries", "delete_entries"):
             return {"code": "invalid_cache_selection"}

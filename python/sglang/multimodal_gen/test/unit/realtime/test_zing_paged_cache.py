@@ -232,9 +232,11 @@ def test_failed_drain_keeps_pages_owned_until_recovery(cpu_dma, monkeypatch):
 
 
 @pytest.mark.parametrize("write_fails", [False, True])
-def test_reuse_waits_for_entry_writer_and_dma(cpu_dma, monkeypatch, write_fails):
+def test_reuse_rejects_busy_writer_then_fences_dma(cpu_dma, monkeypatch, write_fails):
+    from sglang.multimodal_gen.runtime.utils.shared_capacity import CapacityUnavailable
+
     cache = owner(pages=1)
-    writer_started, release_writer, waiting = (threading.Event() for _ in range(3))
+    writer_started, release_writer = (threading.Event() for _ in range(2))
     cache.disk_cache = NS(local_rank=0, is_enabled=lambda: True)
 
     def write(entry):
@@ -251,20 +253,14 @@ def test_reuse_waits_for_entry_writer_and_dma(cpu_dma, monkeypatch, write_fails)
     entry = cache.entries["a"]
     done = entry.disk_task
 
-    def wait():
-        waiting.set()
-        return done.wait(5)
-
-    entry.disk_task = NS(wait=wait)
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(cache._take_pages, "b", 3)
-        try:
-            assert waiting.wait(5)
-            assert not future.done()
-            assert list(cache.entries) == ["a"] and not any(cache.free_pages)
-        finally:
-            release_writer.set()
-        data = future.result(timeout=5)
+    try:
+        with pytest.raises(CapacityUnavailable):
+            cache._take_pages("b", 3)
+        assert list(cache.entries) == ["a"] and not any(cache.free_pages)
+    finally:
+        release_writer.set()
+    assert done.wait(5)
+    data = cache._take_pages("b", 3)
     assert data.page_ids == entry.page_ids
     cache.stream.synchronize.assert_called()
     # Caller now owns these pages until fill/preload publishes or releases them.

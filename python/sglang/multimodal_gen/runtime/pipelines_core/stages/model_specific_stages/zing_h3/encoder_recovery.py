@@ -10,7 +10,15 @@ import time
 import zmq
 
 
-def request_abort(port, token, timeout_seconds, *, require_restart=False):
+def request_abort(
+    port,
+    token,
+    timeout_seconds,
+    *,
+    require_restart=False,
+    host="127.0.0.1",
+    auth_fields=None,
+):
     context = zmq.Context()
     socket = context.socket(zmq.REQ)
     socket.setsockopt(zmq.LINGER, 0)
@@ -22,11 +30,16 @@ def request_abort(port, token, timeout_seconds, *, require_restart=False):
             raise zmq.Again()
         return max(1, int(remaining * 1000))
 
-    socket.connect(f"tcp://127.0.0.1:{port}")
+    socket.connect(f"tcp://{host}:{port}")
     try:
         socket.setsockopt(zmq.SNDTIMEO, remaining_ms())
         socket.send_json(
-            dict(op="abort", session=token, require_restart=require_restart)
+            dict(
+                op="abort",
+                session=token,
+                require_restart=require_restart,
+                **(auth_fields or {}),
+            )
         )
         socket.setsockopt(zmq.RCVTIMEO, remaining_ms())
         reply = socket.recv_json()

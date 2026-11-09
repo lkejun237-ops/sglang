@@ -382,6 +382,64 @@ def test_diagnostic_entry_count_never_calls_shared_store():
         b.close()
 
 
+def test_dit_prefill_hit_reports_shared_lookup_without_local_disk():
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.dit_preparation import (
+        DiTPreparation,
+    )
+
+    backend, source, _ = provider()
+    admitted = []
+    try:
+        entry = write(backend, source)
+        owner = DiTPreparation(
+            NS(block0_cache=backend, admit_cached_preparation=admitted.append),
+            lambda: pytest.fail("A cached prefill must not recompute"),
+        )
+        result = owner.control("prefill", {"cache_key": KEY}, busy=False)
+        assert result["hit"] is True
+        assert result["cache_key"] == entry.key
+        assert result["entries"] == 1
+        assert result["_disk_descriptor"] is None
+        assert admitted[0].key == entry.key
+        assert backend.last_lookup["cache_result"] == "l1_hit"
+        assert backend.last_lookup["backend"] == "mooncake"
+        assert backend.last_lookup["disk_allowed"] is False
+        assert backend.last_lookup["lookup_host_ms"] >= 0
+        assert backend.lookup(OTHER) is None
+        assert backend.last_lookup["cache_result"] == "miss"
+    finally:
+        backend.close()
+
+
+def test_shared_restore_report_and_dispose_do_not_require_cuda_events(caplog):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.block0_telemetry import (
+        Block0Telemetry,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.source_session import (
+        ZingSourceStreamState,
+    )
+
+    backend, source, _ = provider()
+    try:
+        entry = write(backend, source)
+        state = ZingSourceStreamState()
+        state.block0_cache = backend
+        state.block0_entry = entry
+        state.block0_key = entry.key
+        state.block0_prompt_version = 1
+        state.block0_telemetry = Block0Telemetry()
+        state.block0_restore = backend.restore(source, entry)
+        assert state.block0_restore.end is None
+        report = state._take_block0_report([{"prompt_version": 1}])
+        assert report["cache_key"] == entry.key
+        assert "restore" not in state.block0_telemetry.cuda
+        assert state._take_block0_report([{"prompt_version": 1}]) is None
+        state.dispose()
+        assert state.block0_cache is None
+    finally:
+        backend.close()
+
+
 def test_native_group_spans_ranks_and_business_bindings():
     store = MemoryStore()
     a, cache, _ = provider(store, world=2)
@@ -664,7 +722,11 @@ def test_independent_bindings_do_not_overwrite_shared_index():
         b.close()
 
 
-def test_explicit_dit_prefill_reports_unpublished_entry(monkeypatch):
+@pytest.mark.parametrize(
+    "backend, code",
+    [("local", "cache_capacity_busy"), ("mooncake", "cache_unavailable")],
+)
+def test_explicit_dit_prefill_reports_unpublished_entry(monkeypatch, backend, code):
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
         dit_preparation,
     )
@@ -672,7 +734,11 @@ def test_explicit_dit_prefill_reports_unpublished_entry(monkeypatch):
     monkeypatch.setattr(dit_preparation, "fill_prepared_prefix", lambda *a, **k: None)
     monkeypatch.setattr(dit_preparation, "prepared_inputs", lambda v: NS(positive={}))
     monkeypatch.setattr(dit_preparation, "inputs_on", lambda v, device: v)
-    cache = NS(lookup=lambda *a, **k: None)
+    cache = NS(
+        backend=backend,
+        lookup=lambda *a, **k: None,
+        last_lookup={"cache_result": "miss", "miss_reason": "not_resident"},
+    )
     transformer = NS(parameters=lambda: iter([torch.zeros(1)]))
     owner = dit_preparation.DiTPreparation(
         NS(
@@ -692,7 +758,7 @@ def test_explicit_dit_prefill_reports_unpublished_entry(monkeypatch):
             source_shape=[1, 1],
         ),
         busy=False,
-    ) == {"code": "cache_unavailable"}
+    ) == {"code": code}
 
 
 def test_integrated_prefill_reports_unpublished_entry(monkeypatch, caplog):

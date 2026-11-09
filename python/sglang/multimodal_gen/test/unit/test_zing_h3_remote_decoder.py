@@ -7,7 +7,6 @@ dispatch identity, and frames identical to the local stream decoder.
 """
 
 import ast
-import importlib
 import json
 import logging
 import threading
@@ -405,7 +404,7 @@ class _LoopExit(BaseException):
     """Ends the worker loop once the scripted commands are consumed."""
 
 
-def _loop_service(*, fail_on=None):
+def _loop_service(*, fail_on=None, transfer_events=None):
     class Service:
         def __init__(self, *args, **kwargs):
             self.width = self.height = 8
@@ -413,6 +412,10 @@ def _loop_service(*, fail_on=None):
 
         def check(self):
             pass
+
+        def wait_for_transfer(self):
+            if transfer_events is not None:
+                transfer_events.append("wait")
 
         def append(
             self, latent, *, latent_start, valid_frame_end, source_dependency_end
@@ -437,7 +440,14 @@ def _loop_service(*, fail_on=None):
 
 
 def _run_decoder_loop(
-    commands, *, fail_on=None, live=None, transport_events=None, service_count=1
+    commands,
+    *,
+    fail_on=None,
+    service_count=1,
+    live=None,
+    progressive=False,
+    transfer_events=None,
+    transport_events=None,
 ):
     """Run the worker control loop with fake devices and optional real ZMQ."""
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
@@ -515,7 +525,16 @@ def _run_decoder_loop(
         memory_reserved=lambda: 0,
         max_memory_allocated=lambda: 0,
     )
+
+    def receive(group, shape, dtype, device):
+        if transfer_events is not None:
+            transfer_events.append("receive")
+        return torch.zeros(shape, dtype=dtype)
+
+    from sglang.multimodal_gen.runtime.utils.bounded_process_log import diagnostic_print
+
     namespace = dict(
+        diagnostic_print=diagnostic_print,
         __doc__="test",
         argparse=SimpleNamespace(
             ArgumentParser=lambda **kw: SimpleNamespace(
@@ -542,18 +561,14 @@ def _run_decoder_loop(
         ),
         load_decoder=lambda config: None,
         bridge_group=lambda *a, **kw: object(),
-        receive_latent=lambda group, shape, dtype, device: torch.zeros(
-            shape, dtype=dtype
-        ),
-        _DecodeService=_loop_service(fail_on=fail_on),
+        receive_latent=receive,
+        _DecodeService=_loop_service(fail_on=fail_on, transfer_events=transfer_events),
         _OutputPublisher=lambda **kw: SimpleNamespace(
             reserve=lambda **kw: dict(frames=kw["frames"], **kw["identity"]),
             close=lambda: None,
         ),
         _output_identity=_output_identity,
-        service_ports=importlib.import_module(
-            "sglang.multimodal_gen.runtime.realtime.worker_services"
-        ).service_ports,
+        remote_decode_progressive=lambda: progressive,
         EncoderCommandControl=encoder_control.EncoderCommandControl,
         EncoderControlError=encoder_control.EncoderControlError,
     )
@@ -765,6 +780,37 @@ def test_decoder_loop_acknowledges_every_payload_free_op(session_field):
     assert replies[-1]["busy"] is False
 
 
+@pytest.mark.parametrize("missing", ["request_id", "generation_id", "chunk_index"])
+def test_decoder_loop_still_rejects_incomplete_dispatch_identity(missing):
+    output = dict(
+        op="output",
+        channel="$open",
+        frames=4,
+        request_id="request-1",
+        generation_id="generation-1",
+        chunk_index=0,
+    )
+    del output[missing]
+    replies, error = _run_decoder_loop(
+        [
+            dict(op="open", session="owner", bridge_port=1001, capacity_latents=40),
+            dict(
+                op="append",
+                channel="$open",
+                shape=[1, 24, 1, 2, 2],
+                dtype="float32",
+                latent_start=0,
+                valid_frame_end=4,
+                source_dependency_end=4,
+            ),
+            output,
+        ]
+    )
+    assert error is not None
+    assert [reply.get("ok") for reply in replies] == [True, True, False]
+    assert replies[-1]["code"] == "DECODER_RESTART_REQUIRED"
+
+
 @pytest.mark.parametrize("operation", ["close", "abort"])
 def test_decoder_releases_transport_before_release_ack_and_next_open(operation):
     """The next session must not inherit the previous session's group teardown."""
@@ -879,267 +925,107 @@ def test_decoder_loop_failed_append_ends_service_without_ok_reply():
     assert replies[-1]["code"] == "DECODER_RESTART_REQUIRED"
 
 
-def test_auto_output_append_publishes_without_output_command():
-    replies, error = _run_decoder_loop(
-        [
-            dict(
-                op="open",
-                session="auto",
-                bridge_port=1234,
-                capacity_latents=10,
-                auto_output=True,
-            ),
-            dict(
-                op="append",
-                channel="$open",
-                shape=[1, 24, 1, 1, 1],
-                dtype="float32",
-                latent_start=0,
-                valid_frame_end=1,
-                source_dependency_end=1,
-                request_id="req",
-                generation_id="gen",
-                chunk_index=0,
-            ),
-            dict(op="finish", channel="$open", total_frames=1),
-            dict(op="close", channel="$open"),
-        ]
-    )
-    assert error is None
-    assert all(r["ok"] for r in replies)
-    assert replies[1]["reference"] == dict(
-        frames=1,
-        session_id="auto",
-        request_id="req",
-        generation_id="gen",
-        chunk_index=0,
-    )
-
-
-@pytest.mark.parametrize("direct_output", [False, True])
-def test_auto_output_client_reuses_append_reply_without_output_rpc(
-    monkeypatch, model, direct_output
+def test_progressive_service_publishes_before_the_next_latent_finishes(
+    model, decode_group
 ):
-    decoder = _remote_decoder(monkeypatch, model.protocol)
-    decoder.auto_output = True
-    decoder.channel = "channel"
-    if direct_output:
-        decoder.output_attachment = {"token": "output-token"}
-        decoder.output_metadata = {"event_id": 7}
-    decoder.socket = _FakeSocket(
-        [
-            dict(
-                ok=True,
-                reference=None if direct_output else {"id": "rgb"},
-                metadata={"format": "rgb24"},
-                output_queued=direct_output,
-            ),
-            dict(ok=True),
-        ]
-    )
-    latent = _latent(1, seed=2, height=3, width=5)
-    frames = model.protocol.frame_count(1)
-    decoder.append(
-        latent, latent_start=0, valid_frame_end=frames, source_dependency_end=frames
-    )
-    output = decoder.pop()
-    assert output.reference == (None if direct_output else {"id": "rgb"})
-    if direct_output:
-        assert decoder.socket.sent[0]["output_metadata"] == {"event_id": 7}
-    assert [m["op"] for m in decoder.socket.sent] == ["append"]
-    assert decoder.socket.sent[0]["request_id"] == "request-1"
-    decoder.finish(total_frames=frames)
-    assert decoder.pop().reference is None
-    assert [m["op"] for m in decoder.socket.sent] == ["append", "finish"]
-
-
-def test_direct_decoder_data_never_receives_ack(monkeypatch, model):
-    decoder = _remote_decoder(monkeypatch, model.protocol)
-    decoder.auto_output = decoder.oneway = True
-    decoder.channel = "channel"
-    decoder.output_session = dict(generation_id="generation-1")
-    decoder.output_attachment = {"token": "output-token"}
-    decoder.output_metadata = {"event_id": 7}
-    decoder.socket = _FakeSocket([])  # Any receive during data transfer fails.
-    for start in (0, 1):
-        frames = model.protocol.frame_count(start + 1)
-        decoder.append(
-            _latent(1, seed=start, height=3, width=5),
-            latent_start=start,
-            valid_frame_end=frames,
-            source_dependency_end=frames,
-        )
-        assert decoder.pop().reference is None
-        decoder.source_progress(owned_frame_end=frames, source_records=[[1, 0, frames]])
-    assert [m["op"] for m in decoder.socket.sent] == [
-        "append",
-        "source_progress",
-        "append",
-        "source_progress",
-    ]
-    assert all(m["oneway"] for m in decoder.socket.sent)
-    decoder.socket.replies.append(dict(ok=True))
-    decoder.finish(total_frames=frames)
-    decoder.pop()
-    assert decoder.drained and not decoder.socket.replies
-
-
-def test_oneway_cancel_uses_the_same_ordered_command_stream(monkeypatch, model):
-    decoder = _remote_decoder(monkeypatch, model.protocol)
-    decoder.oneway = True
-    decoder.socket = _FakeSocket([dict(ok=True)])
-    socket = decoder.socket
-    closed = []
-    decoder.context = SimpleNamespace(
-        socket=lambda *a: pytest.fail("Cancel must not overtake data on a new peer"),
-        term=lambda: closed.append(True),
-    )
-    decoder.dispose()
-    assert socket.sent == [dict(op="abort", session=decoder.token)]
-    assert closed == [True] and decoder.closed and decoder.context is None
-
-
-def test_queue_driven_eos_follows_decode_and_releases_stream(model, decode_group):
-    publisher = _RecordingPublisher()
+    """Progress must be observable before the whole dispatch has decoded."""
     entered, release = threading.Event(), threading.Event()
-    publish = publisher.publish
-
-    def blocked_publish(reference, frames):
-        entered.set()
-        assert release.wait(10)
-        publish(reference, frames)
-
-    publisher.publish = blocked_publish
+    publisher = _RecordingPublisher()
+    publisher.publish_slice = lambda reference, index, frames: (
+        publisher.published.append((index, frames.clone()))
+    )
     service = _DecodeService(
         model,
-        capacity_latents=10,
+        capacity_latents=40,
         group=None,
         publisher=publisher,
         decode_group=decode_group,
         device=torch.device("cpu"),
-        queue_driven=True,
+        progressive=True,
     )
+    original = service._stream.push
+    calls = 0
+
+    def push(latent):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            entered.set()
+            assert release.wait(10)
+        return original(latent)
+
+    service._stream.push = push
+    latent = _latent(5, seed=19, height=3, width=5)
+    local = model.new_stream()
     try:
-        value = _latent(1, seed=3, height=3, width=5)
-        frames = model.protocol.frame_count(1)
         service.append(
-            value, latent_start=0, valid_frame_end=frames, source_dependency_end=frames
+            latent, latent_start=0, valid_frame_end=17, source_dependency_end=17
         )
-        service.submit(frames, {"dispatch": 0})
+        assert service.output_slices(17) == [1, 4, 4, 4, 4]
+        service.submit(17, {"dispatch": 0})
         assert entered.wait(10)
-        service.finish(frames)
-        assert not service._stream.closed
-        assert service._jobs.qsize() == 1 and service._jobs.maxsize == 10
+        assert len(publisher.published) == 1
+        assert publisher.published[0][1].shape[2] == 1
         release.set()
-        service.drain(10)
-        assert len(publisher.published) == 1 and service._stream.closed
-        assert not service.thread_alive
-        with pytest.raises(ValueError, match="closed"):
-            service.append(
-                value,
-                latent_start=1,
-                valid_frame_end=frames,
-                source_dependency_end=frames,
-            )
+        service.drain(30)
+        assert not publisher.failed
+        assert [x[1].shape[2] for x in publisher.published] == [1, 4, 4, 4, 4]
+        assert torch.equal(
+            torch.cat([x[1] for x in publisher.published], dim=2), local.push(latent)
+        )
     finally:
         release.set()
+        if service._thread.is_alive():
+            service.drain(30)
         service.dispose()
+        local.close()
 
 
-def test_dedicated_dit_uses_decoder_factory_without_loading_weights(
-    tmp_path, monkeypatch
+def test_progressive_publication_keeps_one_dispatch_slot_until_all_parts_end(
+    monkeypatch, tmp_path
 ):
-    from sglang.multimodal_gen.runtime.distributed import parallel_state
-    from sglang.multimodal_gen.runtime.models.vaes.lynn_streaming.temporal import (
-        TemporalProtocol,
-    )
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.dit_decoder import (
-        DiTDecoderOutput,
+    from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import (
+        acknowledge_async_shared_memory_payload,
+        cancel_async_shared_memory_payload,
     )
 
-    (tmp_path / "config.json").write_text(json.dumps(ARCHITECTURE))
-    codecs = SimpleNamespace(
-        modules={},
-        decoder=ADAPTER,
-        pipeline_config=SimpleNamespace(
-            resolve_decoder_spec=lambda: SimpleNamespace(
-                type="lynn_streaming",
-                model_dir=str(tmp_path),
-            )
-        ),
+    monkeypatch.setenv("SGLANG_REALTIME_VAE_SHM_DIR", str(tmp_path))
+    publisher = _OutputPublisher(timeout_seconds=0.1, max_in_flight=1)
+    identity = dict(session_id="s", generation_id="g", request_id="r", chunk_index=0)
+    reference = publisher.reserve(
+        frames=5, width=2, height=2, identity=identity, frame_slices=[1, 4]
     )
-    monkeypatch.setattr(parallel_state, "get_world_group", lambda: _FakeGroup())
-    monkeypatch.setattr(RemoteLynnDecoder, "_connect", lambda self: None)
-    monkeypatch.setattr(
-        torch, "load", lambda *a, **k: pytest.fail("DiT loaded decoder weights")
-    )
-    output = DiTDecoderOutput(codecs, {"session_id": "s"}, {"port": 31002})
     try:
-        assert isinstance(output.remote, RemoteLynnDecoder)
-        assert output.remote.token == "s" and output.remote.auto_output
-        assert output.remote.capacity_latents == 10
-        expected = TemporalProtocol(ARCHITECTURE)
-        for n in (1, 3, 5, 10):
-            assert output.remote.protocol.frame_count(n) == expected.frame_count(n)
-        assert codecs.modules == {}
+        publisher.publish_slice(reference, 0, torch.ones(1, 3, 1, 2, 2))
+        acknowledge_async_shared_memory_payload(reference["parts"][0])
+        with pytest.raises(TimeoutError, match="slots are full"):
+            publisher.reserve(frames=1, width=2, height=2, identity=identity)
+        cancel_async_shared_memory_payload(reference["parts"][1])
+        publisher.fail(reference, RuntimeError("cancelled before remaining decode"))
     finally:
-        output.close()
-    assert output.remote.closed
+        publisher.close()
+    assert not any(tmp_path.iterdir())
 
 
-def test_decoder_listeners_isolate_owners_even_with_equal_session_tokens():
+@pytest.mark.parametrize("progressive", [False, True])
+def test_d1_progressive_transfer_preserves_publication_before_next_receive(progressive):
+    events = []
     replies, error = _run_decoder_loop(
         [
+            dict(op="open", session="owner", bridge_port=1001, capacity_latents=40),
             dict(
-                op="open",
-                session="same",
-                bridge_port=1001,
-                capacity_latents=10,
-                _service_index=0,
+                op="append",
+                channel="$open",
+                shape=[1, 24, 1, 2, 2],
+                dtype="float32",
+                latent_start=0,
+                valid_frame_end=4,
+                source_dependency_end=4,
             ),
-            dict(
-                op="open",
-                session="same",
-                bridge_port=1002,
-                capacity_latents=10,
-                _service_index=1,
-            ),
-            dict(op="ping", _service_index=0),
-            dict(
-                op="open",
-                session="second",
-                bridge_port=1003,
-                capacity_latents=10,
-                _service_index=0,
-            ),
-            dict(op="close", channel="$open", _service_index=1),
-            dict(op="ping", _service_index=0),
-            dict(op="ping", _service_index=1),
+            dict(op="abort", session="owner"),
         ],
-        service_count=2,
+        progressive=progressive,
+        transfer_events=events,
     )
-    assert error is None
-    assert replies[0]["ok"] and replies[1]["ok"]
-    assert replies[2]["active_sessions"] == 1
-    assert replies[3]["code"] == "DECODER_BUSY"
-    assert replies[4]["ok"]
-    assert replies[5]["active_sessions"] == 1
-    assert replies[6]["active_sessions"] == 0
-
-
-def test_decoder_channel_from_other_listener_is_rejected():
-    replies, error = _run_decoder_loop(
-        [
-            dict(
-                op="open",
-                session="a",
-                bridge_port=1001,
-                capacity_latents=10,
-                _service_index=0,
-            ),
-            dict(op="finish", channel="$open", total_frames=1, _service_index=1),
-        ],
-        service_count=2,
-    )
-    assert error is not None
-    assert replies[0]["ok"] and not replies[-1]["ok"]
+    assert error is None and all(r["ok"] for r in replies)
+    assert events == (["wait", "receive"] if progressive else ["receive"])

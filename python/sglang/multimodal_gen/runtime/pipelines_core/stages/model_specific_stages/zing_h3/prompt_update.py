@@ -101,6 +101,18 @@ def coordinate_prompt_admission(admit):
         # plain ValueError and must not bypass the same rank-wide decision.
         logger.warning("Condition admission rejected locally", exc_info=True)
         error = exc
+    except Exception as exc:
+        # Every live rank must vote before cleanup or the next collective.
+        error = exc
+        logger.exception("Condition admission failed before rank consensus")
     if not coordinate_validation_decision(error is None):
-        raise ConditionError("CONDITION_INVALID", _CAPACITY_MESSAGE) from error
+        if not coordinate_validation_decision(
+            error is None or isinstance(error, ValueError)
+        ):
+            # Device/internal failures must quarantine, never look like a
+            # recoverable input/capacity rejection.
+            raise RuntimeError("Condition admission failed on a model rank") from error
+        raise ConditionError(
+            "CONDITION_INVALID", "Condition validation failed on a DiT rank"
+        ) from error
     return request

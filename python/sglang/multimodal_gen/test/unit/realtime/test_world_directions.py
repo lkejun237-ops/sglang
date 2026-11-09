@@ -19,6 +19,7 @@ class Harness:
         self.rewrite_error = None
         self.change_type = "persistent"
         self.rewrite_calls = 0
+        self.rewrite_args = []
         self.kinds = []  # transition used by each dispatch
         # Set to an asyncio.Lock to emulate the gateway upstream send lock: the
         # dispatch then yields for real, so two applies can interleave at the
@@ -37,8 +38,9 @@ class Harness:
             revert_delay_s=revert_delay_s,
         )
 
-    async def _rewrite(self, text, baseline):
+    async def _rewrite(self, event_id, text, baseline):
         self.rewrite_calls += 1
+        self.rewrite_args.append((event_id, text, baseline))
         # Latch the flag when the call starts, so a test flipping it between two
         # calls does not affect the one already in flight.
         error = self.rewrite_error
@@ -70,6 +72,7 @@ def test_persistent_submit_updates_baseline_and_carries_event_id():
         h = Harness()
         await h.coord.submit(7, "add rain")
         assert h.notified == [(7, "rewriting")]
+        assert h.rewrite_args == [(7, "add rain", "base")]
         assert h.dispatched == [("rw(add rain|base)", 7)]
         assert h.coord.baseline == "rw(add rain|base)"
 

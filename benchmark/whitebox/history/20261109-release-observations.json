@@ -1,0 +1,222 @@
+{
+  "observed_at": "2026-11-09T17:09:41.457112+08:00",
+  "main_sha": "3a9236633cc35bfe618af8caa13c16180d294717",
+  "candidate_implementation_sha": "8c9ace34a6ce30fea2ac5957514420053fb7747b",
+  "candidate_bindings": "synthetic bindings.example.json for reproducible CPU parsing; not live routing",
+  "model_hardware_post_init": "unknown; no model weight loading, CUDA initialization or live GPU collection in this review",
+  "main_cli_defaults": {
+    "zing_source_work_quantum": 1,
+    "zing_source_prompt_joint": true,
+    "zing_source_encoder_mode": null,
+    "zing_source_encoder_prefetch": null,
+    "zing_source_async_output": true,
+    "zing_source_decoder_overlap": null,
+    "zing_source_defer_final": true,
+    "mem_fraction_static": null,
+    "sp_degree": null,
+    "num_gpus": 1,
+    "zing_initial_block_count": 3,
+    "zing_denoising_step_list": null,
+    "zing_initial_denoising_step_list": null,
+    "zing_reference_max_images": null,
+    "realtime_session_lease_ttl_s": 60.0,
+    "realtime_session_idle_timeout_s": 60.0,
+    "realtime_session_max_lifetime_s": 600.0,
+    "zing_block0_cache_host_gb": null,
+    "zing_block0_cache_disk_gb": null,
+    "zing_block0_cache_gc": false,
+    "zing_block0_cache_min_free_gb": "not exposed by this parser revision"
+  },
+  "candidate_cli": {
+    "shanghai": {
+      "zing_source_work_quantum": 1,
+      "zing_source_prompt_joint": false,
+      "zing_source_encoder_mode": "overlap",
+      "zing_source_encoder_prefetch": true,
+      "zing_source_async_output": true,
+      "zing_source_decoder_overlap": true,
+      "zing_source_defer_final": true,
+      "mem_fraction_static": 0.8,
+      "sp_degree": 2,
+      "num_gpus": 2,
+      "zing_initial_block_count": 3,
+      "zing_denoising_step_list": [
+        1000,
+        500
+      ],
+      "zing_initial_denoising_step_list": [
+        1000,
+        750,
+        500,
+        250
+      ],
+      "zing_reference_max_images": 21,
+      "realtime_session_lease_ttl_s": 1200.0,
+      "realtime_session_idle_timeout_s": 1200.0,
+      "realtime_session_max_lifetime_s": 7200.0,
+      "zing_block0_cache_host_gb": 416.0,
+      "zing_block0_cache_disk_gb": 700.0,
+      "zing_block0_cache_gc": true,
+      "zing_block0_cache_min_free_gb": 128.0
+    },
+    "thailand": {
+      "zing_source_work_quantum": 1,
+      "zing_source_prompt_joint": false,
+      "zing_source_encoder_mode": "overlap",
+      "zing_source_encoder_prefetch": true,
+      "zing_source_async_output": true,
+      "zing_source_decoder_overlap": true,
+      "zing_source_defer_final": true,
+      "mem_fraction_static": 0.8,
+      "sp_degree": 2,
+      "num_gpus": 2,
+      "zing_initial_block_count": 3,
+      "zing_denoising_step_list": [
+        1000,
+        500
+      ],
+      "zing_initial_denoising_step_list": [
+        1000,
+        750,
+        500,
+        250
+      ],
+      "zing_reference_max_images": 21,
+      "realtime_session_lease_ttl_s": 1200.0,
+      "realtime_session_idle_timeout_s": 1200.0,
+      "realtime_session_max_lifetime_s": 7200.0,
+      "zing_block0_cache_host_gb": 416.0,
+      "zing_block0_cache_disk_gb": 700.0,
+      "zing_block0_cache_gc": true,
+      "zing_block0_cache_min_free_gb": 128.0
+    }
+  },
+  "qwen_main_env_defaults": {
+    "hf_rmsnorm": true,
+    "fused_mrope": true,
+    "fused_gate_up": true,
+    "text_fa4": true,
+    "vision_fa4": true,
+    "fp8": true
+  },
+  "qwen_candidate_env_resolution": {
+    "hf_rmsnorm": false,
+    "fused_mrope": false,
+    "fused_gate_up": false,
+    "text_fa4": false,
+    "vision_fa4": false,
+    "fp8": false
+  },
+  "gateway_versions": {
+    "prod-shanghai": {
+      "observed_at": "2026-11-09T16:53:44.465114+08:00",
+      "url": "https://whitebox-sh.loopit.me/whitebox/v1/whitebox/version",
+      "version": {
+        "role": "gateway",
+        "identity_status": "configured",
+        "source_sha": "b94033f08df7caf4bf017712b12fdd0c126dfa1f",
+        "sdk_sha": "689e81f718e22065877de9af589e6496c712f979",
+        "source_branch": "white_box",
+        "config_sha256": "b9d30d5623f584391bcf5e87d3bcede59da72f17852ad518720246c279d34f54",
+        "region": "cn-shanghai"
+      },
+      "evidence_level": "HTTP version self-report; process files/imageID not re-audited"
+    },
+    "prod-thailand": {
+      "observed_at": "2026-11-09T16:53:45.277542+08:00",
+      "url": "https://whitebox-th.loopit.me/whitebox/v1/whitebox/version",
+      "version": {
+        "role": "gateway",
+        "identity_status": "configured",
+        "source_sha": "2e0833d3e251341d5ef83110aaec9f3e40e5dce1",
+        "sdk_sha": "e65413e08443dd2f8991090e445a1805a494ef2c",
+        "source_branch": "white_box",
+        "config_sha256": "ab0b14e55757a1d4ea071302df8bc89759fd999433e772454ef0f8c1c1d55443",
+        "region": "ap-southeast-7"
+      },
+      "evidence_level": "HTTP version self-report; process files/imageID not re-audited"
+    },
+    "test-shanghai-copy": {
+      "observed_at": "2026-11-09T16:53:45.405581+08:00",
+      "url": "https://shcopy.world-test-platform.loopit.com.cn/whitebox/v1/whitebox/version",
+      "version": {
+        "role": "gateway",
+        "identity_status": "configured",
+        "source_sha": "af9ea3bf31268c9dfd8e4d1bc2b51636e46ec132",
+        "sdk_sha": "689e81f718e22065877de9af589e6496c712f979",
+        "source_branch": "white_box",
+        "config_sha256": "646058bdeb42725cd7a54d39be4509817dc6d907846b64c574028857d574a851",
+        "region": "cn-shanghai"
+      },
+      "evidence_level": "HTTP version self-report; process files/imageID not re-audited"
+    }
+  },
+  "thailand_platform": {
+    "whitebox-th-gateway": {
+      "id": "s-18ddd3cb7a4e30806f7643c23436fa32",
+      "image": "lwdp-codex-th-registry-vpc.ap-southeast-7.cr.aliyuncs.com/lwdp/whitebox-runtime@sha256:51ed8cab94deb3917c49a1d17342599dc94a63fb049f7972ee25c0952aa0a715",
+      "jenkinsJob": "loopit/world-model/whitebox-th-control",
+      "businessMonitoring": {
+        "metricsPort": 0
+      },
+      "status": "Healthy",
+      "evidence_level": "platform service/lane and Pod container image reference; runtime imageID and process argv unknown"
+    },
+    "whitebox-th-coordinator": {
+      "id": "s-18ddd3b858e4ce8e515e78aa00ad1b2a",
+      "image": "lwdp-codex-th-registry-vpc.ap-southeast-7.cr.aliyuncs.com/lwdp/whitebox-runtime@sha256:51ed8cab94deb3917c49a1d17342599dc94a63fb049f7972ee25c0952aa0a715",
+      "jenkinsJob": "loopit/world-model/whitebox-th-control",
+      "businessMonitoring": {
+        "metricsPort": 0
+      },
+      "status": "Healthy",
+      "evidence_level": "platform service/lane and Pod container image reference; runtime imageID and process argv unknown"
+    },
+    "whitebox-th-room": {
+      "id": "s-18ddd3cf30c287cca4c3b471d2465b16",
+      "image": "lwdp-codex-th-registry-vpc.ap-southeast-7.cr.aliyuncs.com/lwdp/whitebox-runtime@sha256:61e8bcf98f98d67f748f153d06f2a9a7f87450f6c9e3df18a999cfd712cdd2d9",
+      "jenkinsJob": "loopit/world-model/whitebox-th-room",
+      "businessMonitoring": {
+        "metricsPort": 0
+      },
+      "status": "Healthy",
+      "evidence_level": "platform service/lane and Pod container image reference; runtime imageID and process argv unknown"
+    }
+  },
+  "jenkins": {
+    "base_url": "https://jenkins.ops.loopit.me",
+    "room_job": "https://jenkins.ops.loopit.me/job/loopit/job/world-model/job/whitebox-th-room/",
+    "last_successful_build": {
+      "number": 43,
+      "url": "https://jenkins.ops.loopit.me/job/loopit/job/world-model/job/whitebox-th-room/43/",
+      "result": "SUCCESS",
+      "timestamp": 1793457070337,
+      "duration": 349486
+    },
+    "build_source_shas": [
+      "d76297aa4e6bca2ce6413cc8aa4be0d2e6c45152",
+      "d40a219e14813b62c564c7322af0325f367271eb"
+    ],
+    "installed_pipeline_source_sha": "unknown; both job config.xml requests returned HTTP403",
+    "warning": "last build and platform history do not attest current Pod image; recorded history image differs from live service image"
+  },
+  "grafana": {
+    "base_url": "https://log.ops.loopit.me",
+    "health": "HTTP200 JSON",
+    "whitebox_dashboard_search": "no visible match; not proof of global absence",
+    "whitebox_dashboard_uid": "unknown",
+    "whitebox_provisioning_or_import": "unknown",
+    "prometheus_datasource": {
+      "uid": "prometheus",
+      "type": "prometheus",
+      "isDefault": true
+    },
+    "component_business_monitoring": "metricsPort=0 on Thai Gateway/Coordinator/Room and monitor-agent default lane; other collectors unverified",
+    "up_query": {
+      "query": "up{namespace=\"whitebox-playtest\"}",
+      "status": "success",
+      "series_count": 0,
+      "interpretation": "No matching series returned at observation time; not an assertion of component health or global absence of collectors."
+    }
+  }
+}

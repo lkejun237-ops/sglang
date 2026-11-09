@@ -8,6 +8,7 @@ import sys
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.disk_cache import (
     Block0DiskCache,
 )
+from sglang.multimodal_gen.runtime.utils.shared_capacity import CapacityUnavailable
 
 
 def main(argv=None):
@@ -33,7 +34,7 @@ def main(argv=None):
             )
         else:
             result = cache.delete_entries(keys=getattr(args, "keys", None))
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, CapacityUnavailable) as exc:
         print(
             json.dumps({"code": "cache_management_failed", "message": str(exc)}),
             file=sys.stderr,

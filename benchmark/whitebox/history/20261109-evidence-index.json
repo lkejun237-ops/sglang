@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "original_git_commit": "bab95179a16b2eeac4d0d199e5c780a073b91c69",
+  "archive_uri": "oss://leap-worldmodel-thailand-single-az/reports/whitebox-pr647-history-20261109/81644ce8ea4812ea7223a4eda4b044c8f9aaa6962115b5c606822c4fddcdf4ab/originals.tar.gz",
+  "archive_sha256": "81644ce8ea4812ea7223a4eda4b044c8f9aaa6962115b5c606822c4fddcdf4ab",
+  "archive_bytes": 37123,
+  "format": "tar+gzip; member bytes unchanged",
+  "access": "Private OSS object; authenticated team OSS read permission required. No signed URL in Git.",
+  "objects": [
+    {
+      "path": "benchmark/whitebox/model-context-20261031-summary.json",
+      "bytes": 51665,
+      "sha256": "4deff81a58e9f19ecb874c5111cf967afb6423b1678958f3ed27d5a51cc21c15"
+    },
+    {
+      "path": "benchmark/whitebox/MODEL-CONTEXT-20261031.md",
+      "bytes": 14451,
+      "sha256": "758b002a405763d4b6892e74408bd98b0498b7c1fe0ac6fe6294b636229078eb"
+    },
+    {
+      "path": "benchmark/whitebox/deployment/loopit-plan.json",
+      "bytes": 13943,
+      "sha256": "7ebb7f4dc847430a18e56e62814936ae70c59524cdcf610bf6cdd58b450bf17d"
+    },
+    {
+      "path": "benchmark/whitebox/deployment/cli-lane-plan.json",
+      "bytes": 13482,
+      "sha256": "947daf3faf3618b0174925b582b5c644283ec0a705884556dbe5bfbc39cf931c"
+    },
+    {
+      "path": "deploy/whitebox/SHANGHAI-CPU-20261104.zh.md",
+      "bytes": 6918,
+      "sha256": "387353af0d8e68370a5ffea02d2216d4129d46b9173330e31aac63d3fe526f1b"
+    },
+    {
+      "path": "benchmark/whitebox/deployment/CLI-LANE-REVIEW.md",
+      "bytes": 7676,
+      "sha256": "1e2ff320448707d5ab28fcbffbc3c7e4b0d265305c49be786a5e5cc466095371"
+    },
+    {
+      "path": "benchmark/whitebox/deployment/RELEASE-REVIEW.md",
+      "bytes": 6578,
+      "sha256": "143df2685e90add4da7f6268d508561d98b6cc541e714266611bbf34d1481e23"
+    },
+    {
+      "path": "benchmark/whitebox/deployment/THAILAND-READINESS.md",
+      "bytes": 14594,
+      "sha256": "9406b4ec6f7399a2784805d2e830e839ee1dc82f8c2ded7220b246c9aa8f74df"
+    },
+    {
+      "path": "benchmark/whitebox/deployment/namespace.yaml",
+      "bytes": 205,
+      "sha256": "407f3636c9d390da395226d3551ae1d294cd0e9a847d203df7e953a17fd40761"
+    },
+    {
+      "path": "benchmark/whitebox/deployment/recordings-pvc.yaml",
+      "bytes": 339,
+      "sha256": "b3bbe194924aead5945bcf22dc4141fcf473bc0b15dfcef4c1a8573055de7da2"
+    },
+    {
+      "path": "benchmark/whitebox/deployment/room-recordings-pvc.yaml",
+      "bytes": 344,
+      "sha256": "cb20147b48a73254aa1878d3974cd10783b8482f13a644b76e2b81444d3df23b"
+    }
+  ],
+  "verification": "Authenticated OSS upload/download: archive SHA256 and all 11 member byte counts/SHA256 verified on 2026-11-09 Asia/Shanghai; bucket and object private."
+}

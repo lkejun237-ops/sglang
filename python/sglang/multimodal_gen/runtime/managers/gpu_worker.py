@@ -301,10 +301,49 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 }
             )
 
-        materializer = self._async_raw_frame_materializer
-        if materializer is not None:
-            materializer.cancel_session(session_id)
-        released = self._realtime_sessions.release(session_id)
+        released = False
+        failure = None
+        try:
+            materializer = self._async_raw_frame_materializer
+            if materializer is not None:
+                materializer.cancel_session(session_id, wait=True)
+            released = self._realtime_sessions.release(session_id)
+        except Exception as error:
+            failure = type(error).__name__
+            logger.exception("Realtime session cleanup remains unconfirmed")
+        # Every rank executes this control request. Report peer failure to the
+        # driver too; a clean SP0 cannot attest that another rank released KV.
+        outcomes = [
+            {
+                "rank": torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0,
+                "cleaned": failure is None,
+                "released": released,
+                "failure": failure,
+            }
+        ]
+        if torch.distributed.is_initialized():
+            for name in ("sp_cpu_group", "cfg_cpu_group", "tp_cpu_group"):
+                group = getattr(self, name, None)
+                if group is None or torch.distributed.get_world_size(group) <= 1:
+                    continue
+                gathered = [None] * torch.distributed.get_world_size(group)
+                torch.distributed.all_gather_object(gathered, outcomes, group=group)
+                outcomes = list(
+                    {item["rank"]: item for peer in gathered for item in peer}.values()
+                )
+        if not all(item["cleaned"] for item in outcomes):
+            return OutputBatch(
+                error="Realtime session cleanup is unconfirmed",
+                error_code="REALTIME_CLEANUP_UNCONFIRMED",
+                output={
+                    "session_id": session_id,
+                    "released": False,
+                    "cleanup_complete": False,
+                    "ranks": outcomes,
+                },
+            )
         if released:
             has_persistent_pool = any(
                 bool(getattr(stage, "realtime_kv_cache_pool_enabled", False))
@@ -312,7 +351,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             )
             if torch.cuda.is_initialized() and not has_persistent_pool:
                 torch.cuda.empty_cache()
-        return OutputBatch(output={"released": released, "session_id": session_id})
+        return OutputBatch(
+            output={
+                "released": any(item["released"] for item in outcomes),
+                "session_id": session_id,
+                "cleanup_complete": True,
+                "ranks": outcomes,
+            }
+        )
 
     def close_async_output_materializer(self) -> None:
         materializer = self._async_raw_frame_materializer

@@ -141,11 +141,16 @@ def test_migrated_business_checks_have_one_owner_in_the_new_workflow():
 def test_reusable_suites_are_all_gated_and_required_by_summary():
     workflows = ROOT / ".github/workflows"
     jobs = yaml.safe_load((workflows / "zing-ci.yml").read_text())["jobs"]
-    infrastructure = {"zing-changes", "zing-lint", "ci-tooling-contracts"}
+    infrastructure = {
+        "zing-changes",
+        "zing-lint",
+        "ci-tooling-contracts",
+        "area-contracts",
+    }
     assert set(jobs) == infrastructure | set(SUITES) | {"zing-ci"}
     assert set(jobs["zing-ci"]["needs"]) == infrastructure | set(SUITES)
     assert jobs["zing-ci"]["if"] == "always()"
-    for job_id in ("zing-lint", "ci-tooling-contracts"):
+    for job_id in ("zing-lint", "ci-tooling-contracts", "area-contracts"):
         assert "needs" not in jobs[job_id] and "if" not in jobs[job_id]
     for suite in SUITES:
         caller = jobs[suite]
@@ -339,3 +344,191 @@ def test_kernel_selector_contract(tmp_path):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
+
+
+def media_preparer():
+    import runpy
+
+    return runpy.run_path(str(ROOT / "scripts/ci/zing/prepare_media_tooling.py"))
+
+
+def test_media_mirror_rewrite_preserves_signed_source_identity(tmp_path):
+    helper = media_preparer()
+    path = write(
+        tmp_path,
+        "sources.list.d/ubuntu.sources",
+        """Types: deb
+URIs: http://azure.archive.ubuntu.com/ubuntu/
+Suites: noble noble-updates noble-security
+Components: main universe
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+""",
+    )
+    original = path.read_text()
+    assert helper["use_official_mirror"](tmp_path) == 1
+    assert path.read_text() == original.replace(
+        "http://azure.archive.ubuntu.com/ubuntu/", "https://archive.ubuntu.com/ubuntu/"
+    )
+    assert helper["use_official_mirror"](tmp_path) == 0
+    custom = write(
+        tmp_path, "sources.list", "deb https://example.invalid/ubuntu noble main\n"
+    )
+    assert helper["use_official_mirror"](tmp_path) == 0
+    assert custom.read_text() == "deb https://example.invalid/ubuntu noble main\n"
+
+
+def test_verified_media_tools_need_no_package_install(tmp_path):
+    from types import SimpleNamespace
+
+    calls = []
+
+    def run(args, **options):
+        calls.append((args, options))
+        return SimpleNamespace(stdout=" V....D libx264 H.264 encoder\n")
+
+    media_preparer()["prepare"](tmp_path, run)
+    assert all(args[0] != "apt-get" for args, _ in calls)
+    assert calls[-1][0] == ["ffmpeg", "-version"]
+    assert not list(tmp_path.iterdir())
+
+
+def test_media_install_has_deadlines_and_propagates_package_failure(tmp_path):
+    helper = media_preparer()
+    calls = []
+
+    def run(args, **options):
+        calls.append((args, options))
+        if args[0] == "ffprobe":
+            raise FileNotFoundError("not installed")
+        raise subprocess.CalledProcessError(100, args)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        helper["prepare"](tmp_path, run)
+    apt, options = calls[-1]
+    assert apt[0] == "apt-get" and apt[-1] == "update"
+    assert "Acquire::Retries=1" in apt and "Acquire::https::Timeout=20" in apt
+    assert options["check"] is True and options["timeout"] == 180
+    assert not any("allow-unauthenticated" in arg for arg in apt)
+
+
+@pytest.mark.parametrize(
+    "filename", ["zing-cpu-suite.yml", "zing-conditioning-suite.yml"]
+)
+@pytest.mark.parametrize("exit_code", [0, 17])
+def test_workflow_prepares_pinned_media_and_propagates_failure(
+    tmp_path, filename, exit_code
+):
+    workflow = yaml.safe_load((ROOT / ".github/workflows" / filename).read_text())
+    job = next(iter(workflow["jobs"].values()))
+    step = next(s for s in job["steps"] if s.get("name") == "Prepare media tooling")
+    assert step["timeout-minutes"] == 8
+    assert "continue-on-error" not in step
+    shell = step.get(
+        "shell",
+        job.get("defaults", {})
+        .get("run", {})
+        .get("shell", workflow.get("defaults", {}).get("run", {}).get("shell")),
+    )
+    assert shell in (None, "bash")
+    # Actions' implicit Linux shell is bash -e; explicit bash also enables
+    # pipefail. Do not grant the test stronger failure handling than production.
+    command = ["bash", "-e"]
+    if shell == "bash":
+        command.extend(["-o", "pipefail"])
+
+    binary = write(
+        tmp_path,
+        "pinned media/ffmpeg",
+        '#!/bin/sh\n[ "$1" = "-version" ] || exit 99\n'
+        f"echo pinned-media-fixture\nexit {exit_code}\n",
+    )
+    binary.chmod(0o755)
+    # Only the wheel's binary locator is a fixture. Execute the actual workflow
+    # shell and its filesystem/PATH handoff, including nonzero encoder exits.
+    provider = write(
+        tmp_path,
+        "provider/imageio_ffmpeg.py",
+        f"def get_ffmpeg_exe():\n    return {str(binary)!r}\n",
+    )
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    (tools / "python").symlink_to(sys.executable)
+    for name in ["apt-get", "sudo"]:
+        guard = write(tools, name, "#!/bin/sh\nexit 98\n")
+        guard.chmod(0o755)
+    runner = tmp_path / "runner"
+    github_path = tmp_path / "github-path"
+    result = subprocess.run(
+        [*command, "-c", step["run"]],
+        env={
+            **os.environ,
+            "PATH": str(tools) + os.pathsep + os.environ["PATH"],
+            "PYTHONPATH": str(provider.parent),
+            "RUNNER_TEMP": str(runner),
+            "GITHUB_PATH": str(github_path),
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == exit_code, result.stderr
+    assert result.stdout.strip() == "pinned-media-fixture"
+    assert (runner / "bin/ffmpeg").resolve() == binary
+    assert github_path.read_text().splitlines() == [str(runner / "bin")]
+
+
+def test_media_package_install_is_verified_before_business_can_start(tmp_path):
+    from types import SimpleNamespace
+
+    installed = False
+    calls = []
+
+    def run(args, **options):
+        nonlocal installed
+        calls.append((args, options))
+        if args[0] == "apt-get" and "install" in args:
+            installed = True
+        elif args[0] == "ffprobe" and not installed:
+            raise FileNotFoundError("not installed")
+        return SimpleNamespace(stdout=" V....D libx264 H.264 encoder\n")
+
+    media_preparer()["prepare"](tmp_path, run)
+    apt_calls = [(args, options) for args, options in calls if args[0] == "apt-get"]
+    assert len(apt_calls) == 2 and apt_calls[0][0][-1] == "update"
+    assert apt_calls[1][0][-3:] == ["install", "--yes", "ffmpeg"]
+    assert all(
+        options["check"] and options["timeout"] == 180 for _, options in apt_calls
+    )
+    assert [args[0] for args, _ in calls[-3:]] == ["ffprobe", "ffmpeg", "ffmpeg"]
+
+
+@pytest.mark.parametrize("scheme", ["mirror+file:", "mirror+file://"])
+def test_media_setup_resolves_hosted_runner_mirror_lists_without_touching_custom_uris(
+    tmp_path, scheme
+):
+    helper = media_preparer()
+    before = f"""Types: deb
+URIs: {scheme}/etc/apt/apt-mirrors.txt
+Suites: noble noble-updates noble-security
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+"""
+    path = write(tmp_path, "sources.list.d/runner.sources", before)
+    security = write(
+        tmp_path,
+        "sources.list.d/security.list",
+        f"deb {scheme}/etc/apt/apt-mirrors-security.txt noble-security main\n",
+    )
+    custom = write(
+        tmp_path,
+        "sources.list.d/custom.list",
+        "deb mirror+file:/etc/apt/custom.txt noble main\n",
+    )
+    assert helper["use_official_mirror"](tmp_path) == 2
+    assert path.read_text() == before.replace(
+        f"{scheme}/etc/apt/apt-mirrors.txt", "https://archive.ubuntu.com/ubuntu"
+    )
+    assert (
+        security.read_text()
+        == "deb https://security.ubuntu.com/ubuntu noble-security main\n"
+    )
+    assert custom.read_text() == "deb mirror+file:/etc/apt/custom.txt noble main\n"

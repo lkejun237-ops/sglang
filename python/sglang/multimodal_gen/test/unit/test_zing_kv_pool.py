@@ -589,3 +589,21 @@ def test_finite_audio_tail_beyond_the_slot_is_rejected():
     assert plan.admit(_request(480, 832, **kwargs)) < plan.slot_rows
     with pytest.raises(ZingKVPoolAdmissionError):
         plan.admit(_request(704, 1280, prefix=4096, **kwargs))
+
+
+@pytest.mark.parametrize("width", range(4, 22))
+@pytest.mark.parametrize("timing", ["before_source", "after_step0"])
+def test_off_boot_pool_covers_dynamic_two_chunk_anchor(width, timing):
+    # Both phases of the 3/2 plan are covered by peak_rows' period scan.
+    # An off deployment may turn on without replacing its fixed GPU slot.
+    geometry = _geometry([3, 2], False, short_edge=736)
+    kwargs = dict(
+        prefix_rows=4096,
+        rows_per_frame=920,
+        has_source=True,
+        window_eviction_timing=timing,
+    )
+    off = peak_rows(geometry, ZingWindowPolicy(width, 0), **kwargs)
+    on = peak_rows(geometry, ZingWindowPolicy(width, 2), **kwargs)
+    refreshed = peak_rows(geometry, ZingWindowPolicy(width, 2, 9, 9), **kwargs)
+    assert off >= on and off >= refreshed

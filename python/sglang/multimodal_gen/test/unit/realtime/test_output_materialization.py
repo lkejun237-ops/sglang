@@ -422,3 +422,53 @@ def test_session_release_cancels_materializer_owned_reference(tmp_path):
     materializer.close()
 
     assert list(tmp_path.iterdir()) == []
+
+
+def test_verified_cancel_waits_for_copy_event_and_retains_failed_buffers(tmp_path):
+    gate = threading.Event()
+    materializer = AsyncRawRGBFrameMaterializer(
+        max_in_flight=1, shared_memory_dir=str(tmp_path)
+    )
+    reference = reserve_async_shared_memory_payload(4, root=tmp_path)
+    reference.update(session_id="owner-a", generation_id="g")
+    materializer._outstanding_refs[reference["path"]] = reference
+    materializer._slots.acquire()
+
+    class Event:
+        def synchronize(self):
+            gate.wait()
+
+    producer = threading.Thread(
+        target=materializer._finish_copy,
+        args=(Event(), torch.zeros(1), torch.zeros(4, dtype=torch.uint8), reference),
+    )
+    producer.start()
+    with pytest.raises(TimeoutError, match="cleanup deadline"):
+        materializer.cancel_session("owner-a", wait=True, timeout_s=0.01)
+    assert reference["path"] in materializer._outstanding_refs
+    gate.set()
+    materializer.cancel_session("owner-a", wait=True, timeout_s=5)
+    producer.join(timeout=5)
+    assert not producer.is_alive() and not materializer._outstanding_refs
+    materializer.close()
+
+    failed = AsyncRawRGBFrameMaterializer(
+        max_in_flight=1, shared_memory_dir=str(tmp_path)
+    )
+    ref = reserve_async_shared_memory_payload(4, root=tmp_path)
+    ref.update(session_id="owner-b", generation_id="g")
+    failed._outstanding_refs[ref["path"]] = ref
+    failed._slots.acquire()
+
+    class FailedEvent:
+        def synchronize(self):
+            raise RuntimeError("simulated CUDA event failure")
+
+    device, host = torch.zeros(1), torch.zeros(4, dtype=torch.uint8)
+    failed._finish_copy(FailedEvent(), device, host, ref)
+    with pytest.raises(RuntimeError, match="completion is unconfirmed"):
+        failed.cancel_session("owner-b", wait=True, timeout_s=0.01)
+    assert failed._failed_copies[ref["path"]][0] is device
+    assert not failed._host_pool
+    assert not failed._slots.acquire(blocking=False)
+    failed.close()  # Only CPU tensors in this fault fixture.

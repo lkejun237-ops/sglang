@@ -110,6 +110,57 @@ def test_startup_failure_is_propagated_without_leaving_a_thread():
     assert not io.thread.is_alive()
 
 
+def test_blocked_startup_and_close_keep_unconfirmed_transport_owned():
+    unblock, closed = threading.Event(), threading.Event()
+
+    def connect():
+        unblock.wait()
+        return Transport(Queue(), [], closed)
+
+    io = DiTIOChannel(connect, timeout_s=0.03)
+    try:
+        with pytest.raises(TimeoutError):
+            io.start()
+        assert io.thread.is_alive() and io.stopping.is_set()
+        with pytest.raises(TimeoutError, match="cleanup is unconfirmed"):
+            io.close()
+        assert io.thread.is_alive() and not closed.is_set()
+    finally:
+        unblock.set()
+        io.thread.join(timeout=3)
+        io.close()
+    assert closed.is_set() and not io.thread.is_alive()
+
+
+def test_blocked_receive_cannot_claim_pause_or_clean_shutdown():
+    incoming, received, closed = Queue(), [], threading.Event()
+    entered, unblock = threading.Event(), threading.Event()
+
+    class Blocked(Transport):
+        def receive(self):
+            self.check_owner()
+            entered.set()
+            unblock.wait()
+            return super().receive()
+
+    io = DiTIOChannel(
+        lambda: Blocked(incoming, received, closed), timeout_s=0.03
+    ).start()
+    try:
+        incoming.put({"type": "source.moments"})
+        assert entered.wait(3)
+        with pytest.raises(TimeoutError, match="pause was not confirmed"):
+            io.pause_receiving()
+        with pytest.raises(TimeoutError, match="cleanup is unconfirmed"):
+            io.close()
+        assert io.transport is not None and not closed.is_set()
+    finally:
+        unblock.set()
+        io.thread.join(timeout=3)
+        io.close()
+    assert closed.is_set() and io.inbox.empty()
+
+
 @pytest.mark.parametrize("count", [0, 10])
 def test_idle_receiver_and_full_inbox_both_stop_without_peer_input(count):
     incoming, received, closed = Queue(), [], threading.Event()

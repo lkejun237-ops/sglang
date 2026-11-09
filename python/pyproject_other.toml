@@ -243,6 +243,7 @@ rust-extensions = ["multimodal"]
 [tool.setuptools.package-data]
 "sglang" = [
   "srt/**/*",
+  "multimodal_gen/runtime/realtime/whitebox/*.mjs",
   "kernels/**/*"
 ]
 

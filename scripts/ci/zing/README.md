@@ -17,6 +17,8 @@ python scripts/ci/zing/select_changes.py --base origin/main --head HEAD --output
 python scripts/ci/zing/check_python.py --base origin/main --head HEAD --output /tmp/zing-lint.json
 ```
 
+媒体工具由 `prepare_media_tooling.py` 准备：复用已验证支持 libx264 的 ffmpeg/ffprobe；需要安装时，仅把临时 runner 的 Azure Ubuntu 镜像 URI 改为官方 HTTPS archive，保留 suites、components 和 Signed-By。APT 每次请求超时20秒、重试1次，每个安装命令最多180秒，整个准备步骤最多8分钟；安装失败仍阻断业务测试。
+
 普通业务测试需要独立 Linux Python 3.11 环境、固定 CPU 轮子和 ffmpeg：
 
 ```sh
@@ -32,6 +34,21 @@ python scripts/ci/zing/run_cpu_tests.py --suite benchmark-contracts --trials 2 -
 分布式 progressive tiles 测试保留完整 34 项矩阵、真实 BF16/float64 运算和零容差比较；其 CNN 仅在最低空间分辨率保留一个残差块，降低无 BF16 加速 CPU 的执行成本。独立 progressive kernel 测试继续使用各层一个残差块的完整夹具。普通 workflow 记录 `lscpu`，排查超时时需区分慢计算和进程停滞。
 
 `conditioning-contracts` 使用独立 Linux Python 3.12 环境。按 workflow 的安装步骤读取 [conditioning 环境锁](../../../benchmark/zing_h3_causal/ISSUE_256_CPU_ENVIRONMENT.json)，安装 CPU Torch/torchvision 和附加固定依赖，再运行 `--suite conditioning-contracts --trials 2`。保留完整默认测试根和专用子进程 runner，不与普通套件混用环境或模块 stubs。checkout 必须包含清单配方引用的历史 Git 对象；GitHub 使用完整历史 checkout。
+
+## 持续 Whitebox owner 门禁
+
+`area-contracts` 通过 `run_area_tests.py` 的显式 `AREA_FILES` 对当前 Whitebox
+owner 执行两轮真实子进程，不复写普通套件的历史批准证据。包括
+`test_whitebox_source_encoding.py` 和 `test_whitebox_session_encoding.py`；这些
+`test_whitebox*` 文件不属于普通 manifest 的 `test_zing*` 自动发现范围。
+新增或移动此类 owner 时，同步 `AREA_FILES` 与
+`test/registered/unit/ci/test_worldkit_area_gate.py` 的入口断言，不能只本地跑测试。
+
+source codec 预检要求 CI 先用既有 `docker/whitebox.Dockerfile` 的 `rtc-builder`
+CPU stage 执行 Go 测试并产出本次源码的 Linux 原生发送器，再通过
+`WHITEBOX_TEST_RTC_BINARY` 传入 Python 子进程。PyAV 沿用 Whitebox 的固定依赖；
+缺 codec、缺发送器导致的 skip 不能通过此门禁。该流程不启动服务、不申请 GPU，
+也不构成部署或浏览器验收。
 
 ## 新增测试和更新清单
 

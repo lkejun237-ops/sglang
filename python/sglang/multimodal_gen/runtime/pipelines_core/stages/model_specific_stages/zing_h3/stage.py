@@ -162,21 +162,18 @@ class ZingH3GenerationStage(PipelineStage):
             coordinate_validation,
         )
 
-        from .block0_identity import startup_config
+        from .block0_identity import capacity_config, host_capacity, startup_config
 
-        block0 = config_error = None
+        block0 = config_error = admission = None
         try:
             block0 = startup_config(server_args)
+            if isinstance(block0, dict):
+                admission = block0
+            elif block0 is not None:
+                admission = (*block0[:2], str(block0[2]), capacity_config(server_args))
         except Exception as exc:
             config_error = str(exc)
-        receipts = coordinate_validation(
-            (
-                config_error,
-                block0
-                if isinstance(block0, dict) or block0 is None
-                else (*block0[:2], str(block0[2])),
-            )
-        )
+        receipts = coordinate_validation((config_error, admission))
         if any(error is not None for error, _ in receipts) or any(
             value != receipts[0] for value in receipts
         ):
@@ -336,33 +333,71 @@ class ZingH3GenerationStage(PipelineStage):
                     )
                 else:
                     host_bytes, disk_bytes, root = block0
-                    disk = Block0DiskCache(
-                        root,
-                        max_bytes=disk_bytes,
-                        identity=identity,
-                        rank=get_sp_parallel_rank(),
-                        world_size=identity["sp"]["size"],
-                        gc_interval=getattr(
-                            server_args, "zing_block0_cache_gc_interval_s", 60.0
-                        ),
-                        gc_stale_seconds=getattr(
-                            server_args, "zing_block0_cache_gc_stale_s", 600.0
-                        ),
-                        gc_low_watermark=getattr(
-                            server_args, "zing_block0_cache_gc_low_watermark", 0.9
-                        ),
-                    )
+                    try:
+                        disk = Block0DiskCache(
+                            root,
+                            max_bytes=disk_bytes,
+                            identity=identity,
+                            rank=get_sp_parallel_rank(),
+                            world_size=identity["sp"]["size"],
+                            budget_root=getattr(
+                                server_args, "zing_block0_cache_budget_root", None
+                            )
+                            or root,
+                            min_free_bytes=int(
+                                getattr(server_args, "zing_block0_cache_min_free_gb", 0)
+                                * 10**9
+                            ),
+                            max_inflight_bytes=int(
+                                getattr(
+                                    server_args, "zing_block0_cache_inflight_gb", 128
+                                )
+                                * 10**9
+                            ),
+                            max_writers=getattr(
+                                server_args, "zing_block0_cache_max_writers", 2
+                            ),
+                            gc_high_watermark=getattr(
+                                server_args, "zing_block0_cache_gc_high_watermark", 1.0
+                            ),
+                            gc_interval=getattr(
+                                server_args, "zing_block0_cache_gc_interval_s", 60.0
+                            ),
+                            gc_stale_seconds=getattr(
+                                server_args, "zing_block0_cache_gc_stale_s", 600.0
+                            ),
+                            gc_low_watermark=getattr(
+                                server_args, "zing_block0_cache_gc_low_watermark", 0.9
+                            ),
+                        )
+                    except OSError as exc:
+                        logger.warning(
+                            "Block0 L2 unavailable; continuing with L1: %s", exc
+                        )
+                        disk = None
                     owner = Block0PreparationCache(
                         pool,
                         max_bytes=host_bytes // identity["sp"]["size"],
                         identity=identity,
                         disk_cache=disk,
+                        capacity_dir=host_capacity(server_args)[0],
+                        host_total_bytes=host_capacity(server_args)[1],
                     )
             except Exception as exc:
                 error = str(exc)
             errors = coordinate_validation(error)
             if any(value is not None for value in errors):
+                if owner is not None:
+                    owner.close()
                 raise ValueError(f"Block0 startup failed: {errors}")
+            # Later persistence helpers contain SP collectives. Every rank must
+            # take the same L1-only path if any rank could not initialize L2.
+            if not isinstance(block0, dict) and not all(
+                coordinate_validation(disk is not None)
+            ):
+                if disk is not None:
+                    disk.close()
+                disk = owner.disk_cache = None
             self.block0_cache = owner
             # Global rank zero gives one collector even with multiple SP/DP groups.
             if (
@@ -792,18 +827,43 @@ class ZingH3GenerationStage(PipelineStage):
                 raise ValueError("Block0 prefill requires an enabled Block0 cache")
             config = batch.extra["zing_source_command"]["config"]
             data = batch.extra["zing_prefill"]["source_frame"]
+            preview_config = {
+                **config,
+                **batch.extra["zing_prefill"].get("source_frame_size", {}),
+            }
             hits = self.block0_cache.hits
+            prefill_state = ZingSourceStreamState()
             with set_forward_context(current_timestep=0, attn_metadata=None):
-                entry = ZingSourceStreamState().prefill(
+                entry = prefill_state.prefill(
                     self._build_request(batch),
                     stage=self,
                     batch=batch,
                     config=config,
-                    source_preview=source_preview(config, data),
+                    source_preview=source_preview(preview_config, data),
                     force=batch.extra["zing_prefill"].get("force", False),
                 )
             if entry is None:
                 raise ValueError("Block0 prefill did not publish a cache entry")
+            details = {}
+            if prefill_state.block0_telemetry is not None:
+                from sglang.multimodal_gen.runtime.realtime.prefill_persistence import (
+                    persistence_descriptor,
+                )
+
+                from .preparation_cache import coordinate_validation
+
+                per_rank = coordinate_validation(
+                    prefill_state.block0_telemetry.snapshot()
+                )
+                details = {
+                    "timings": prefill_state.block0_telemetry.snapshot(),
+                    "rank_timings": [
+                        dict(rank=rank, **value) for rank, value in enumerate(per_rank)
+                    ],
+                    "_disk_descriptor": persistence_descriptor(
+                        self.block0_cache, entry
+                    ),
+                }
             labels = batch.extra["zing_prefill"]
             self.block0_cache.register(
                 entry.key, labels.get("game_id"), labels.get("group_id")
@@ -816,6 +876,7 @@ class ZingH3GenerationStage(PipelineStage):
                         hit=self.block0_cache.hits > hits,
                         entries=self.block0_cache.entry_count,
                         evictions=self.block0_cache.evictions,
+                        **details,
                     )
                 },
             )

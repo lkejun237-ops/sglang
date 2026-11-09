@@ -583,6 +583,47 @@ class ZingH3KVCache:
         self.rope_reuse_stats = dict(rebuilt_rows=0, reused_rows=0, map_syncs=0)
         self.last_rope_reuse = None
 
+    def validate_prefix_reset(self):
+        prefix = self.prefix
+        if (
+            prefix is None
+            or prefix.offset != 0
+            or prefix.block != 0
+            or (
+                self.pending_source is not None
+                and (
+                    self.active is None
+                    or self.pending_source.block + 1 != self.active[0]
+                )
+            )
+            or self.eviction_target_block is not None
+            or len(self._stores) != self.num_layers
+        ):
+            raise ValueError(
+                f"Resident prefix reset requires complete static KV: offset={getattr(prefix, 'offset', None)} block={getattr(prefix, 'block', None)} source={self.pending_source is not None} eviction={self.eviction_target_block} layers={len(self._stores)}/{self.num_layers}"
+            )
+        for layer in self._stores:
+            self._observe_raw_store(layer)
+        return prefix
+
+    def reset_history_keep_prefix(self):
+        """Retire dynamic rows at a writer boundary without copying static KV.
+
+        Prefix rows are immutable and at offset zero in the existing leased
+        store. Revoke every derived position/graph publication; keep the raw
+        store/version guards and model signature so the next write is checked.
+        A deferred target final may be discarded just as in a normal rebuild.
+        """
+        prefix = self.validate_prefix_reset()
+        stores = self._stores
+        versions, epochs = self._raw_store_versions, self._raw_write_epochs
+        signature, layouts = self._model_signature, self.layer_layouts
+        self.clear()
+        self.prefix, self._stores = prefix, stores
+        self._raw_store_versions, self._raw_write_epochs = versions, epochs
+        self._model_signature, self.layer_layouts = signature, layouts
+        self._length = prefix.positions.shape[0]
+
     def _invalidate_rope(self, *, preserve_chunks=False):
         """Drop publications and chunk references, retaining reusable K capacity."""
         if not (self.chunk_rope_reuse and preserve_chunks):

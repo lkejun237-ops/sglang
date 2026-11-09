@@ -299,6 +299,9 @@ class BaseRealtimeModelAdapter:
     async def prepare_conditioning(self, session, server_args):
         """Finish API preparation before creating a chunk or consuming input."""
 
+    def is_control_work(self, session):
+        return False
+
     async def close_conditioning(self, session):
         """Release API staging after all dispatched worker RPCs drain."""
 

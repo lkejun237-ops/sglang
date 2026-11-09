@@ -106,10 +106,23 @@ class SourceLynnDecoder:
         self.dependency = max(self.dependency, source_dependency_end)
 
     @torch.no_grad()
-    def pop(self):
+    def pop(self, *, max_latents=None):
+        """Emit a legal temporal slice while retaining undecoded latents.
+
+        Splitting is before decode_step, not after full RGB materialization.
+        The unbounded default preserves existing callers and numerical order.
+        """
+        if max_latents is not None and (
+            type(max_latents) is not int or max_latents < 1
+        ):
+            raise ValueError("Decoder latent quantum must be positive")
         if not self.ready:
             return None
+        count = self.buffered_latents
+        take = count if max_latents is None else min(count, max_latents)
         end = self.valid_frames
+        if max_latents is not None:
+            end = min(end, self.protocol.frame_count(self.stream.latents_seen + take))
         pixels = (
             PixelRange(self.emitted_frames, end) if end > self.emitted_frames else None
         )
@@ -122,12 +135,12 @@ class SourceLynnDecoder:
             raise ValueError("Provenance must match decoded pixels and dependency")
         if self.pending is not None:
             try:
-                frames = self.stream.push(self.pending)
+                frames = self.stream.push(self.pending[:, :, :take])
             except BaseException:
                 # Partially written KV cannot be retried; the generation must be disposed.
                 self.closed = True
                 raise
-            self.pending = None
+            self.pending = self.pending[:, :, take:] if take < count else None
             self.held = (
                 frames if self.held is None else torch.cat((self.held, frames), dim=2)
             )
@@ -138,7 +151,7 @@ class SourceLynnDecoder:
         # Empty shape metadata supports an EOS pop after the last RGB was
         # already delivered; clone avoids retaining the decoded allocation.
         self.held = self.held[:, :, :0].clone()
-        if self.total_frames is not None:
+        if self.total_frames is not None and self.pending is None:
             self.stream.finish(self.total_frames)
             self.held, self.drained = None, True
         result = DecodedVideoSlice(

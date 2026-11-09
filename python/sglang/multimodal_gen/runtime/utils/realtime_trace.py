@@ -318,7 +318,8 @@ def _notify_realtime_trace_sinks(payload: dict[str, Any]) -> None:
     )
     with _TRACE_SINKS_LOCK:
         sinks = list(_TRACE_SINKS.get(exact_key, ()))
-        sinks.extend(_TRACE_SINKS.get((trace_id, None, None), ()))
+        if exact_key != (trace_id, None, None):
+            sinks.extend(_TRACE_SINKS.get((trace_id, None, None), ()))
     for sink in sinks:
         try:
             sink(dict(payload))

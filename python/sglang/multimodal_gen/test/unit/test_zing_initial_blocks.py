@@ -29,11 +29,12 @@ from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
 
 
 @pytest.mark.parametrize("count", [0, 3])
-def test_deployment_grids(count):
-    regular = parse_noise_grid("1000,500")
+@pytest.mark.parametrize("grid", [[1000, 500], [1000, 750]])
+def test_deployment_grids(count, grid):
+    regular = parse_noise_grid(grid)
     initial = parse_noise_grid("1000,750,500,250") if count else None
     validate_initial_blocks("few_step", regular, initial, count)
-    assert regular == [1000, 500]
+    assert regular == grid
 
 
 @pytest.mark.parametrize(
@@ -48,6 +49,7 @@ def test_deployment_grids(count):
         (0, None, None),
     ],
 )
+@pytest.mark.parametrize("regular_grid", [[1000, 750], [1000, 500]])
 @torch.no_grad()
 def test_source_ready_schedule_matches_worker_execution(
     configured,  # noqa: F811
@@ -56,6 +58,7 @@ def test_source_ready_schedule_matches_worker_execution(
     count,
     cli_steps,
     profile_count,
+    regular_grid,
 ):
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters import (
         zing_h3_source_adapter as source,
@@ -72,7 +75,9 @@ def test_source_ready_schedule_matches_worker_execution(
 
     configured.zing_solver = "few_step" if cli_steps else None
     configured.zing_denoising_step_list = (
-        [1000, 750, 500, 250][:cli_steps] if cli_steps else None
+        (regular_grid if cli_steps == 2 else [1000, 750, 500, 250][:cli_steps])
+        if cli_steps
+        else None
     )
     configured.zing_initial_block_count = count
     configured.zing_initial_denoising_step_list = (
@@ -184,6 +189,16 @@ def test_source_ready_schedule_matches_worker_execution(
         while state.index < len(state.spans):
             sampler.step(state)
         advertised = adapter.ready["sampling_schedule"]
+        assert [
+            item["noise_grid"] for item in sampler.last_run_metrics["block_schedules"]
+        ] == [
+            advertised["initial_denoising_step_list"]
+            if i < advertised["initial_block_count"]
+            else advertised["denoising_step_list"]
+            for i in range(5)
+        ]
+        if cli_steps == 2:
+            assert advertised["denoising_step_list"] == regular_grid
         expected = [
             len(advertised["initial_denoising_step_list"])
             if i < advertised["initial_block_count"]

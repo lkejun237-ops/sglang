@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import shutil
 import time
-from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -59,6 +58,12 @@ from sglang.multimodal_gen.runtime.realtime.critical_path_metrics import (
     observe_stage_seconds,
     result_from_exception,
 )
+from sglang.multimodal_gen.runtime.realtime.gateway_assignment import (
+    GatewayManagedConfig as _GatewayManagedConfig,
+)
+from sglang.multimodal_gen.runtime.realtime.gateway_assignment import (
+    parse_gateway_assignment,
+)
 from sglang.multimodal_gen.runtime.realtime.source_transport import (
     PROTOCOL_OVERHEAD_BYTES,
     SourceTransportBudget,
@@ -77,7 +82,6 @@ from sglang.multimodal_gen.runtime.realtime.websocket_transport import (
     _RealtimeWebSocketSendGroup as _RealtimeWebSocketSendGroup,
 )
 from sglang.multimodal_gen.runtime.realtime.websocket_transport import (
-    accept_realtime_websocket,
     cancel_realtime_tasks,
     wait_realtime_tasks,
 )
@@ -113,6 +117,9 @@ logger = init_logger(__name__)
 _REALTIME_CONTROL_REFRESH_TIMEOUT_S = 1.0
 router = APIRouter(prefix="/v1/realtime_video", tags=["realtime"])
 router.include_router(prefill_router)
+from .bound_video import router as bound_video_router
+
+router.include_router(bound_video_router)
 _REALTIME_RESULT_STAGE_MARKERS = ("vae", "denois")
 _RAW_FRAME_ASYNC_ENQUEUE_STAGE = "GPUWorker.raw_frame_async_enqueue"
 _ADMISSION_CONTROLLER: RealtimeAdmissionController | None = None
@@ -144,35 +151,8 @@ class _OrderedDecodeCoordinator:
         self.pending = None
 
 
-@dataclass(frozen=True, slots=True)
-class _GatewayManagedConfig:
-    session_id: str
-    generation_id: str
-    coordinator_token: str
-    worker_epoch: str
-    vae_worker_url: str
-    vae_worker_epoch: str
-    output_url: str
-    output_token: str
-
-
 def _gateway_managed_config(websocket: WebSocket) -> _GatewayManagedConfig | None:
-    query = websocket.query_params
-    if query.get("gateway_managed") != "1":
-        return None
-    fields = {
-        "session_id": query.get("session_id"),
-        "generation_id": query.get("generation_id"),
-        "coordinator_token": query.get("coordinator_token"),
-        "worker_epoch": query.get("worker_epoch"),
-        "vae_worker_url": query.get("realtime_vae_worker_url"),
-        "vae_worker_epoch": query.get("realtime_vae_worker_epoch"),
-        "output_url": query.get("gateway_output_url"),
-        "output_token": query.get("gateway_output_token"),
-    }
-    if not all(fields.values()):
-        raise AdmissionRejected("INVALID_GATEWAY_ASSIGNMENT")
-    return _GatewayManagedConfig(**fields)
+    return parse_gateway_assignment(websocket.query_params)
 
 
 async def _consume_gateway_reservation(
@@ -294,6 +274,9 @@ def _resolve_realtime_user_id(
     *,
     require_authenticated: bool = False,
 ) -> str:
+    claim = getattr(websocket, "scope", {}).get("role_pool_claim")
+    if claim is not None:
+        return claim["user_id"]
     principal = websocket.scope.get("user")
     if principal is not None:
         for name in ("sub", "id", "username"):
@@ -492,7 +475,12 @@ def _emit_realtime_result_stage_traces(
 
 
 def _collect_realtime_result_stage_metrics(result: Any) -> dict[str, float]:
-    collected: dict[str, float] = {}
+    from sglang.multimodal_gen.runtime.realtime.whitebox.telemetry import (
+        h3_host_durations,
+    )
+
+    # Host spans do not synchronize CUDA and must not be presented as GPU time.
+    collected: dict[str, float] = h3_host_durations(getattr(result, "usage", None))
     for stage_name, duration_ms, _ in _iter_realtime_result_stage_metrics(result):
         if stage_name.lower() == _RAW_FRAME_ASYNC_ENQUEUE_STAGE.lower():
             collected["raw_frame_async_enqueue_ms"] = round(duration_ms, 3)
@@ -558,6 +546,11 @@ async def _send_chunk_telemetry(
     stage_metrics: dict[str, float] | None = None,
     remote_result: Any | None = None,
 ) -> None:
+    # Preparation/attachment send their own control receipts. A media telemetry
+    # message after that receipt would remain queued for the next handshake,
+    # despite there being no video chunk or frame counter advancement.
+    if chunk.control_only:
+        return
     event_id = getattr(batch, "realtime_event_id", None)
     telemetry: dict[str, Any] = {
         "type": "chunk_telemetry",
@@ -1143,9 +1136,11 @@ async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
             )
 
             await write_error_msg(
-                exc.public_message
-                if isinstance(exc, ConditionError)
-                else "Video generation failed. Please start a new session.",
+                (
+                    exc.public_message
+                    if isinstance(exc, ConditionError)
+                    else "Video generation failed. Please start a new session."
+                ),
                 ws,
                 code=exc.code if isinstance(exc, ConditionError) else None,
                 fatal=True if isinstance(exc, ConditionError) else None,
@@ -1202,6 +1197,10 @@ def _is_source_progress_only(adapter, result):
     return (
         getattr(adapter, "source_decoder_overlap", False)
         and "zing_source_consumed_end" in usage
+        and usage.get("zing_startup_ready") is None
+        # A clip-barrier rebuild returns no RGB, but Room cannot resume source
+        # admission until send_output delivers this kv_ready control receipt.
+        and usage.get("zing_condition_ready") is None
         and not usage.get("zing_source_complete")
         and not usage.get("zing_source_dispatch_steps")
         and result.error is None
@@ -1284,7 +1283,7 @@ async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
             chunk_started = time.perf_counter()
 
             prepare_started = time.perf_counter()
-            chunk = session.new_chunk()
+            chunk = session.new_chunk(control_only=adapter.is_control_work(session))
             log_realtime_trace(
                 logger,
                 session,
@@ -1970,12 +1969,19 @@ async def _release_scheduler_realtime_session(
         if remaining <= 0:
             return False
         try:
-            await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 (execution_client or async_scheduler_client).forward(
                     ReleaseRealtimeSessionReq(session_id=session_id)
                 ),
                 timeout=remaining,
             )
+            # A returned OutputBatch is not necessarily a successful cleanup.
+            # In particular, SP peers can report an unconfirmed remote abort.
+            if getattr(result, "error", None):
+                return False
+            receipt = getattr(result, "output", None)
+            if isinstance(receipt, dict) and receipt.get("cleanup_complete") is False:
+                return False
             return True
         except Exception as exc:
             if (
@@ -2009,6 +2015,14 @@ async def _cleanup_realtime_session(
     scheduler_released = await _release_scheduler_realtime_session(
         session.id, **release_kwargs
     )
+    if not scheduler_released and (
+        getattr(getattr(session, "request", None), "source_prompt_protocol", None)
+        == "ordered-boundary-v2"
+        or getattr(session, "role_pool_service", None) is not None
+    ):
+        # Retain source/reference ownership and the consumed reservation. A
+        # transport timeout cannot prove Encoder, KV and CUDA cleanup finished.
+        raise RuntimeError("Render segment cleanup has not been confirmed")
     if session.adapter is not None:
         await session.adapter.close_conditioning(session)
     if session.input_temp_dir is not None:
@@ -2204,11 +2218,19 @@ async def _wait_for_initialization_or_watchdog(
 
 @router.websocket("/generate")
 async def generate(websocket: WebSocket):
-    """endpoint for creating a new realtime session"""
-    ws = await accept_realtime_websocket(websocket)
+    """Endpoint for an independently admitted realtime session."""
+    await generate_bound_child(websocket)
+
+
+async def generate_bound_child(websocket, binding=None):
+    """A child may borrow a reservation already owned by its control socket."""
+    await websocket.accept()
+    ws = _LockedRealtimeWebSocket(websocket)
     server_args = get_global_server_args()
     try:
-        gateway_config = _gateway_managed_config(websocket)
+        gateway_config = (
+            binding.gateway if binding else _gateway_managed_config(websocket)
+        )
         if gateway_config is None:
             user_id = _resolve_realtime_user_id(
                 websocket,
@@ -2224,6 +2246,13 @@ async def generate(websocket: WebSocket):
         session_id=gateway_config.session_id if gateway_config else None,
         generation_id=gateway_config.generation_id if gateway_config else None,
     )
+    claim = websocket.scope.get("role_pool_claim")
+    if claim is not None:
+        session = GenerateSession(
+            session_id=claim["session_id"], generation_id=claim["generation_id"]
+        )
+        session.role_pool_service = websocket.scope.get("role_pool_service")
+        session.role_pool_service.child_started(session.id, session.generation_id)
     session.execution_client = getattr(
         websocket.app.state, "realtime_execution_client", None
     )
@@ -2258,9 +2287,16 @@ async def generate(websocket: WebSocket):
     watchdog_task = None
     close_after_cleanup = None
     worker_reservations = None
-    worker_reservation_owner = uuid4().hex if gateway_config is not None else None
+    worker_reservation_owner = (
+        binding.owner_id
+        if binding
+        else (uuid4().hex if gateway_config is not None else None)
+    )
     try:
-        if gateway_config is not None:
+        if binding is not None:
+            binding.cleaned = False
+            worker_reservations = binding.registry
+        elif gateway_config is not None:
             worker_reservations = await _consume_gateway_reservation(
                 websocket,
                 gateway_config,
@@ -2417,6 +2453,9 @@ async def generate(websocket: WebSocket):
     finally:
 
         async def cleanup_session():
+            managed = getattr(session, "role_pool_service", None)
+            child_id, child_generation = session.id, session.generation_id
+            cleanup_complete = False
             try:
                 if watchdog_task is not None:
                     watchdog_task.cancel()
@@ -2434,14 +2473,26 @@ async def generate(websocket: WebSocket):
                     lease=lease,
                     lease_ttl_s=server_args.realtime_session_lease_ttl_s,
                 )
+                cleanup_complete = True
             finally:
-                if lease is not None and controller is not None:
-                    await controller.release(lease)
-                await _release_gateway_reservation(
-                    worker_reservations,
-                    gateway_config,
-                    owner_id=worker_reservation_owner,
-                )
+                if cleanup_complete:
+                    if lease is not None and controller is not None:
+                        await controller.release(lease)
+                    if binding is not None:
+                        binding.cleaned = True
+                    else:
+                        await _release_gateway_reservation(
+                            worker_reservations,
+                            gateway_config,
+                            owner_id=worker_reservation_owner,
+                        )
+                    if managed is not None:
+                        managed.child_cleaned(child_id, child_generation)
+                elif worker_reservations is not None and gateway_config is not None:
+                    await worker_reservations.quarantine(
+                        gateway_config.coordinator_token,
+                        owner_id=worker_reservation_owner,
+                    )
 
         await _drain_realtime_cleanup(cleanup_session())
 

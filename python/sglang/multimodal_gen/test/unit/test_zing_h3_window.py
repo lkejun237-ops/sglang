@@ -320,3 +320,59 @@ def test_default_delayed_cache_completes_manual_step0_before_final():
         assert cache.pending_source is cache.active is None
     cache.clear()
     assert cache.history(0) is None
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("pooled", [False, True])
+def test_history_reset_retains_prefix_storage_bytes_and_signature(pooled):
+    from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+        allocate_layer_stores,
+    )
+
+    storage = (
+        allocate_layer_stores(
+            64,
+            num_layers=1,
+            local_heads=1,
+            head_dim=2,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        if pooled
+        else None
+    )
+    cache = ZingH3KVCache(1, window_policy=ZingWindowPolicy(6, 0), storage=storage)
+    positions = torch.tensor([[0, 0, 0], [0, 0, 1]], dtype=torch.float64)
+    blocks = torch.zeros(2, dtype=torch.long)
+    cache.update(
+        positions,
+        blocks,
+        "prefix",
+        0,
+        [(torch.full((2, 1, 2), 7.0), torch.full((2, 1, 2), 11.0))],
+        validation=(positions, blocks),
+    )
+    signature = ("model", "precision", "layout")
+    cache.bind_model(signature)
+    plan = ChunkPlan([3, 2], False)
+    for i in range(4):
+        _commit(cache, plan.chunk(i), delayed=True)
+    prefix = cache.prefix
+    tensors = [
+        (k.data_ptr(), v.data_ptr(), k.clone(), v.clone()) for k, v in prefix.layers
+    ]
+    stores = cache._stores
+    cache.reset_history_keep_prefix()
+    assert (
+        cache.prefix is prefix
+        and cache._stores is stores
+        and cache._model_signature == signature
+    )
+    assert cache._length == 2 and not cache.committed and cache.last_block == 0
+    for pair, (kp, vp, k, v) in zip(prefix.layers, tensors):
+        assert pair[0].data_ptr() == kp and pair[1].data_ptr() == vp
+        assert torch.equal(pair[0], k) and torch.equal(pair[1], v)
+    _commit(cache, plan.chunk(0), delayed=True)
+    assert cache.committed and cache.prefix is prefix
+    assert torch.equal(prefix.layers[0][0], tensors[0][2])
+    assert torch.equal(prefix.layers[0][1], tensors[0][3])

@@ -1156,12 +1156,14 @@ def _run_ready_chunks(
     known_eos=True,
     prompt_joint=False,
     joint_forward="cross_chunk",
+    output_limit=None,
     prefix_loader_factory=None,
     use_step=False,
     reference=False,
     split_first_latent=True,
     sink_updates=None,
     sink_trace=None,
+    reuse_updates=False,
 ):
     """Exercise the production streaming iterator, including source pauses."""
     from sglang.multimodal_gen.runtime.models.dits import zing_h3_denoise_graph
@@ -1251,13 +1253,18 @@ def _run_ready_chunks(
             if prompt_updates and batch_index in prompt_updates:
                 size = prompt_updates[batch_index]
                 session.update_prompt(
-                    inputs.positive
+                    session.prompt.condition
+                    if reuse_updates and size is None
+                    else inputs.positive
                     if size is None
                     else {
                         "context": torch.randn(size, 12).bfloat16(),
                         "row_role": torch.tensor([0, 1, 0] * (size // 3)),
                     },
                     100 + batch_index,
+                    **(
+                        {"reuse_prefix": True} if reuse_updates and size is None else {}
+                    ),
                 )
             # Drain whenever a pending prompt blocks lookahead, including the
             # old cycle's final chunk before the new epoch can be planned.
@@ -1273,9 +1280,16 @@ def _run_ready_chunks(
                     )
                     cursor += 1
                     count -= 1
+
+                def bounded_drains():
+                    while session.pending:
+                        yield from session.drain_ready(max_outputs=output_limit)
+
                 drain = (
                     (session.step() for _ in range(len(session.pending)))
                     if use_step
+                    else bounded_drains()
+                    if output_limit is not None
                     else session.drain_ready()
                 )
                 for result in drain:
@@ -2720,6 +2734,41 @@ def test_online_prompt_joint_unsupported_route_keeps_serial_result(model, monkey
     assert metrics[-1]["forward_counts"].get("prompt_joint", 0) == 0
 
 
+@pytest.mark.parametrize("switch", [False, True])
+def test_bounded_pair_drain_defers_joint_lookahead_until_next_output(
+    model, monkeypatch, switch
+):
+    options = dict(
+        batches=(1,) + (2,) * 12,
+        initial_steps=STEPS,
+        steps=[1000, 500],
+        prompt_updates={7: 9} if switch else None,
+    )
+    baseline = _run_ready_chunks(model, monkeypatch, **options)
+    eager = _run_ready_chunks(
+        model, monkeypatch, defer_final=True, output_limit=1, **options
+    )
+    fixed = _run_ready_chunks(
+        model, monkeypatch, defer_final=True, output_limit=1, backend="eager", **options
+    )
+    backend = RecordingGraphBackend()
+    replay = _run_ready_chunks(
+        model, monkeypatch, defer_final=True, output_limit=1, backend=backend, **options
+    )
+    for actual in (eager, fixed, replay):
+        torch.testing.assert_close(actual[0], baseline[0], rtol=0.02, atol=0.02)
+        assert actual[5] == baseline[5]
+        for current, expected in zip(actual[2], baseline[2], strict=True):
+            assert (current is None and expected is None) or torch.equal(
+                current, expected
+            )
+    assert torch.equal(replay[0], fixed[0])
+    assert all(active is not None for _, active in replay[3][:-1])
+    assert replay[3][-1] == (None, None)
+    assert replay[4].routes[("resume", "replay")] > 0
+    assert replay[4].routes[("deferred", "replay")] > 0
+
+
 def _cached_prefix_writer(receipts, *, fail=None):
     """Fixture producer: compute donor KV, then publish it into the leased pool.
 
@@ -3079,7 +3128,7 @@ def test_block0_provider_routes_start_and_prompt_cycle(
                         "case-A",
                         prepared(inputs, prompt.condition),
                         "A",
-                        object(),
+                        {},
                         cache,
                     )
                     owner.finish_fill()
@@ -3105,7 +3154,7 @@ def test_block0_provider_routes_start_and_prompt_cycle(
                 {"prompt": key},
                 prepared(session.inputs, candidate.condition),
                 key,
-                object(),
+                {},
             )
             return state._prepare_block0_switch(candidate)
 
@@ -3116,7 +3165,7 @@ def test_block0_provider_routes_start_and_prompt_cycle(
                 "case-A",
                 prepared(session.inputs, session.prompt.condition),
                 "A",
-                object(),
+                {},
                 session.cache,
             )
             owners[0].finish_fill()
@@ -3555,3 +3604,44 @@ def test_sink_controls_preserve_cached_prompt_prefix(model, monkeypatch):
     assert metrics[-1]["forward_counts"]["prefix"] == 0
     assert actual_trace[3][3:] == (203, 2, (1, 2))
     assert actual_trace[6][2:5] == (105, 205, 0)
+
+
+@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("split", [False, True])
+@pytest.mark.parametrize("deferred", [False, True])
+def test_same_condition_resident_prefix_rebuild_matches_recomputed_prefix(
+    model, monkeypatch, graph, split, deferred
+):
+    monkeypatch.setattr(model.arch, "ar_condition_timestep", 0.875)
+    monkeypatch.setattr(model.arch, "reference_visual_timestep", 0.999)
+    options = dict(
+        batches=(1,) * 12,
+        prompt_updates={4: None, 8: None},
+        split_first_latent=split,
+        defer_final=deferred,
+        reference=True,
+    )
+    baseline = _run_ready_chunks(model, monkeypatch, **options)
+    metrics = []
+
+    def forbidden_restore(*_):
+        raise AssertionError("Same-condition update must not restore CPU prefix")
+
+    def observe(session, *_):
+        metrics.append(session.metrics)
+        session.prepare_prompt_prefix = lambda c: (
+            None if c.reuse_prefix else forbidden_restore()
+        )
+
+    actual = _run_ready_chunks(
+        model,
+        monkeypatch,
+        backend=RecordingGraphBackend() if graph else None,
+        reuse_updates=True,
+        yield_hook=observe,
+        **options,
+    )
+    torch.testing.assert_close(actual[0], baseline[0], rtol=1e-5, atol=1e-6)
+    assert actual[5] == baseline[5]
+    assert metrics[-1]["gpu_prefix_reuses"] == 2
+    assert metrics[-1]["forward_counts"]["prefix"] <= 1

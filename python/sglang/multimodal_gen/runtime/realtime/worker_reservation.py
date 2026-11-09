@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import time
 from dataclasses import dataclass, replace
@@ -51,6 +52,8 @@ class WorkerReservation:
     owner_id: str | None = None
     consumed_at: float | None = None
     runnable: bool = False
+    player_expires_at: float | None = None
+    cleanup_state: str = "reserved"
 
 
 class WorkerReservationRegistry:
@@ -79,6 +82,7 @@ class WorkerReservationRegistry:
         self._lifecycle: WorkerLifecycle = "ready"
         self._drain_deadline: float | None = None
         self._reservations: dict[str, WorkerReservation] = {}
+        self._release_receipts: dict[str, dict] = {}
         self._service_time_ms = 0.0
         self._completed_sessions = 0
         self._last_progress_at: float | None = None
@@ -94,12 +98,33 @@ class WorkerReservationRegistry:
     def _expire_locked(self, now: float) -> None:
         for token, reservation in list(self._reservations.items()):
             if not reservation.consumed and reservation.expires_at <= now:
-                self._reservations.pop(token, None)
+                if reservation.player_expires_at is None:
+                    self._reservations.pop(token, None)
+                else:
+                    self._reservations[token] = replace(
+                        reservation, cleanup_state="cleaned_pending_commit"
+                    )
+        for token, reservation in list(self._reservations.items()):
+            if (
+                reservation.consumed
+                and reservation.player_expires_at is not None
+                and now >= reservation.player_expires_at + 90
+                and reservation.cleanup_state
+                not in {"cleaned_pending_commit", "quarantined"}
+            ):
+                self._lifecycle = "failed"
+                self._reservations[token] = replace(
+                    reservation, runnable=False, cleanup_state="quarantined"
+                )
+        for token, receipt in list(self._release_receipts.items()):
+            if receipt["released_at"] + 86400 <= now:
+                del self._release_receipts[token]
         self._stale_consumed_reservations = 0
         if self.max_consumed_age_s > 0:
             for reservation in self._reservations.values():
                 if (
                     reservation.consumed_at is not None
+                    and reservation.player_expires_at is None
                     and now - reservation.consumed_at > self.max_consumed_age_s
                 ):
                     self._stale_consumed_reservations += 1
@@ -137,23 +162,35 @@ class WorkerReservationRegistry:
         generation_id: str,
         worker_epoch: str,
         ttl_s: float,
+        player_expires_at: float | None = None,
     ) -> WorkerReservation:
         if not token or not session_id or not generation_id:
             raise WorkerReservationRejected("INVALID_RESERVATION_IDENTITY")
-        if ttl_s <= 0:
+        if not math.isfinite(ttl_s) or ttl_s <= 0:
             raise WorkerReservationRejected("INVALID_RESERVATION_TTL")
+        if player_expires_at is not None and (
+            type(player_expires_at) not in (int, float)
+            or not math.isfinite(player_expires_at)
+        ):
+            raise WorkerReservationRejected("INVALID_PLAYER_DEADLINE")
         self._validate_epoch(worker_epoch)
         async with self._lock:
             now = self._clock()
             self._expire_locked(now)
             current = self._reservations.get(token)
+            if token in self._release_receipts:
+                raise WorkerReservationRejected("RESERVATION_RELEASED")
             if current is not None:
                 self._validate_identity(
                     current,
                     session_id=session_id,
                     generation_id=generation_id,
                 )
+                if current.player_expires_at != player_expires_at:
+                    raise WorkerReservationRejected("RESERVATION_IDENTITY_MISMATCH")
                 return current
+            if player_expires_at is not None and player_expires_at <= now:
+                raise WorkerReservationRejected("PLAYER_EXPIRED")
             if self._lifecycle == "draining":
                 raise WorkerReservationRejected("WORKER_DRAINING")
             if self._lifecycle == "failed":
@@ -166,6 +203,7 @@ class WorkerReservationRegistry:
                 generation_id=generation_id,
                 worker_epoch=worker_epoch,
                 expires_at=now + ttl_s,
+                player_expires_at=player_expires_at,
             )
             self._reservations[token] = reservation
             self._last_progress_at = now
@@ -196,12 +234,20 @@ class WorkerReservationRegistry:
             )
             if reservation.consumed:
                 raise WorkerReservationRejected("RESERVATION_ALREADY_CONSUMED")
+            if reservation.cleanup_state != "reserved":
+                raise WorkerReservationRejected("RESERVATION_CLOSING")
+            if (
+                reservation.player_expires_at is not None
+                and reservation.player_expires_at <= now
+            ):
+                raise WorkerReservationRejected("PLAYER_EXPIRED")
             reservation = replace(
                 reservation,
                 consumed=True,
                 owner_id=owner_id,
                 consumed_at=now,
                 runnable=False,
+                cleanup_state="active",
             )
             self._reservations[token] = reservation
             self._last_progress_at = reservation.consumed_at
@@ -224,6 +270,13 @@ class WorkerReservationRegistry:
             if reservation is None:
                 raise WorkerReservationRejected("RESERVATION_NOT_FOUND")
             self._validate_owner(reservation, owner_id=owner_id)
+            if reservation.cleanup_state != "active":
+                raise WorkerReservationRejected("RESERVATION_CLOSING")
+            if (
+                reservation.player_expires_at is not None
+                and reservation.player_expires_at <= now
+            ):
+                raise WorkerReservationRejected("PLAYER_EXPIRED")
             self._reservations[token] = replace(reservation, runnable=True)
             self._last_progress_at = now
 
@@ -246,6 +299,14 @@ class WorkerReservationRegistry:
             if reservation is None:
                 return
             self._validate_owner(reservation, owner_id=owner_id)
+            if reservation.player_expires_at is not None:
+                # Scheduler cleanup is only the model half of player cleanup.
+                # Keep capacity occupied until Coordinator commits SDK + model.
+                self._reservations[token] = replace(
+                    reservation, runnable=False, cleanup_state="cleaned_pending_commit"
+                )
+                self._last_progress_at = now
+                return
             self._reservations.pop(token, None)
             if reservation.consumed_at is not None:
                 elapsed_ms = max(0.0, (now - reservation.consumed_at) * 1000)
@@ -253,6 +314,141 @@ class WorkerReservationRegistry:
                 alpha = 1.0 / min(self._completed_sessions, 16)
                 self._service_time_ms += alpha * (elapsed_ms - self._service_time_ms)
             self._last_progress_at = now
+
+    async def player_deadline(self, token: str, *, owner_id: str) -> float | None:
+        async with self._lock:
+            reservation = self._reservations.get(token)
+            if reservation is None:
+                raise WorkerReservationRejected("RESERVATION_NOT_FOUND")
+            self._validate_owner(reservation, owner_id=owner_id)
+            return reservation.player_expires_at
+
+    async def finalize_release(
+        self,
+        token: str,
+        *,
+        session_id: str,
+        generation_id: str,
+        worker_epoch: str,
+        close_id: str,
+    ) -> dict:
+        """Commit a verified close; retries only acknowledge the same owner.
+
+        The authenticated Coordinator must first verify the SDK terminal receipt.
+        A missing reservation/404 never substitutes for the retained final receipt.
+        """
+        self._validate_epoch(worker_epoch)
+        if not isinstance(close_id, str) or not 1 <= len(close_id) <= 128:
+            raise WorkerReservationRejected("INVALID_CLOSE_ID")
+        identity = dict(
+            session_id=session_id,
+            generation_id=generation_id,
+            worker_epoch=worker_epoch,
+            close_id=close_id,
+        )
+        async with self._lock:
+            now = self._clock()
+            self._expire_locked(now)
+            receipt = self._release_receipts.get(token)
+            if receipt is not None:
+                if any(receipt[key] != value for key, value in identity.items()):
+                    raise WorkerReservationRejected("RESERVATION_IDENTITY_MISMATCH")
+                return dict(receipt)
+            reservation = self._reservations.get(token)
+            if reservation is None:
+                raise WorkerReservationRejected("RESERVATION_NOT_FOUND")
+            self._validate_identity(
+                reservation, session_id=session_id, generation_id=generation_id
+            )
+            if reservation.player_expires_at is None:
+                raise WorkerReservationRejected("PLAYER_RESERVATION_REQUIRED")
+            if reservation.cleanup_state != "cleaned_pending_commit":
+                raise WorkerReservationRejected("RELEASE_PENDING")
+            receipt = dict(**identity, state="released", released_at=now)
+            self._release_receipts[token] = receipt
+            self._reservations.pop(token)
+            while len(self._release_receipts) > 2048:
+                del self._release_receipts[next(iter(self._release_receipts))]
+            self._last_progress_at = now
+            return dict(receipt)
+
+    async def prepare_release(
+        self,
+        token: str,
+        *,
+        session_id: str,
+        generation_id: str,
+        worker_epoch: str,
+        close_id: str,
+        player_expires_at: float,
+    ) -> None:
+        """Fence a never-consumed reserve, including a late reserve HTTP retry."""
+        self._validate_epoch(worker_epoch)
+        if (
+            not token
+            or not session_id
+            or not generation_id
+            or not isinstance(close_id, str)
+            or not 1 <= len(close_id) <= 128
+            or type(player_expires_at) not in (int, float)
+            or not math.isfinite(player_expires_at)
+        ):
+            raise WorkerReservationRejected("INVALID_RESERVATION_IDENTITY")
+        async with self._lock:
+            receipt = self._release_receipts.get(token)
+            if receipt is not None:
+                if any(
+                    receipt[key] != value
+                    for key, value in dict(
+                        session_id=session_id,
+                        generation_id=generation_id,
+                        worker_epoch=worker_epoch,
+                        close_id=close_id,
+                    ).items()
+                ):
+                    raise WorkerReservationRejected("RESERVATION_IDENTITY_MISMATCH")
+                return
+            reservation = self._reservations.get(token)
+            if reservation is None:
+                # Positive never-created receipt, not a guessed HTTP 404. The
+                # tombstone also makes a delayed reserve of this token fail.
+                self._release_receipts[token] = dict(
+                    session_id=session_id,
+                    generation_id=generation_id,
+                    worker_epoch=worker_epoch,
+                    close_id=close_id,
+                    state="released",
+                    released_at=self._clock(),
+                )
+                while len(self._release_receipts) > 2048:
+                    del self._release_receipts[next(iter(self._release_receipts))]
+                return
+            self._validate_identity(
+                reservation, session_id=session_id, generation_id=generation_id
+            )
+            if reservation.player_expires_at != player_expires_at:
+                raise WorkerReservationRejected("RESERVATION_IDENTITY_MISMATCH")
+            if reservation.consumed:
+                if reservation.cleanup_state != "cleaned_pending_commit":
+                    raise WorkerReservationRejected("RELEASE_PENDING")
+            else:
+                self._reservations[token] = replace(
+                    reservation, cleanup_state="cleaned_pending_commit"
+                )
+
+    async def quarantine(self, token: str, *, owner_id: str) -> None:
+        async with self._lock:
+            reservation = self._reservations.get(token)
+            if reservation is None:
+                return
+            self._validate_owner(reservation, owner_id=owner_id)
+            # Retain the consumed owner until a verified cleanup or process
+            # replacement. A lease TTL is not evidence that CUDA work stopped.
+            self._lifecycle = "failed"
+            self._reservations[token] = replace(
+                reservation, runnable=False, cleanup_state="quarantined"
+            )
+            self._last_progress_at = self._clock()
 
     async def drain(self, deadline: float) -> None:
         if deadline <= 0:
@@ -339,6 +535,7 @@ def install_worker_reservation_routes(
                 generation_id=str(payload.get("generation_id") or ""),
                 worker_epoch=str(payload.get("worker_epoch") or ""),
                 ttl_s=float(payload.get("ttl_s") or 0),
+                player_expires_at=payload.get("player_expires_at"),
             )
         except (WorkerReservationRejected, TypeError, ValueError) as exc:
             reason = (
@@ -352,12 +549,44 @@ def install_worker_reservation_routes(
             ) from exc
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
+    @app.post("/v1/realtime_worker/reservations/{token}/finalize")
+    async def finalize_realtime_worker(token: str, payload: dict):
+        try:
+            return await registry.finalize_release(
+                token,
+                session_id=str(payload.get("session_id") or ""),
+                generation_id=str(payload.get("generation_id") or ""),
+                worker_epoch=str(payload.get("worker_epoch") or ""),
+                close_id=payload.get("close_id"),
+            )
+        except WorkerReservationRejected as exc:
+            raise HTTPException(status_code=409, detail={"reason": exc.reason}) from exc
+
+    @app.post(
+        "/v1/realtime_worker/reservations/{token}/prepare-release", status_code=204
+    )
+    async def prepare_realtime_worker_release(token: str, payload: dict):
+        try:
+            await registry.prepare_release(
+                token,
+                session_id=str(payload.get("session_id") or ""),
+                generation_id=str(payload.get("generation_id") or ""),
+                worker_epoch=str(payload.get("worker_epoch") or ""),
+                close_id=payload.get("close_id"),
+                player_expires_at=payload.get("player_expires_at"),
+            )
+        except WorkerReservationRejected as exc:
+            raise HTTPException(status_code=409, detail={"reason": exc.reason}) from exc
+        return Response(status_code=204)
+
     @app.delete(
         "/v1/realtime_worker/reservations/{token}",
         status_code=status.HTTP_204_NO_CONTENT,
     )
-    async def release_realtime_worker(token: str):
+    async def release_realtime_worker(token: str, worker_epoch: str | None = None):
         try:
+            if worker_epoch is not None:
+                registry._validate_epoch(worker_epoch)
             await registry.release(token)
         except WorkerReservationRejected as exc:
             raise HTTPException(

@@ -185,8 +185,11 @@ def test_sp_ranks_roll_back_a_partial_acquisition():
 
 
 class _FailingState(BaseRealtimeState):
+    fail = True
+
     def dispose(self):
-        raise RuntimeError("dispose failed")
+        if self.fail:
+            raise RuntimeError("dispose failed")
 
 
 class _OtherState(BaseRealtimeState):
@@ -196,16 +199,25 @@ class _OtherState(BaseRealtimeState):
         type(self).disposed = True
 
 
-def test_session_dispose_releases_the_lease_when_a_state_fails():
+def test_session_dispose_retains_the_lease_until_failed_state_is_cleaned():
     pool = ZingKVPool.allocate(_plan(1), **LAYOUT)
     session = RealtimeSession()
-    session.get_or_create_state(_FailingState)
+    failed = session.get_or_create_state(_FailingState)
     session.get_or_create_state(_OtherState)
     pool.acquire(session, _request())
     with pytest.raises(RuntimeError, match="dispose failed"):
         session.dispose()
-    assert _OtherState.disposed and pool.available == 1
+    assert _OtherState.disposed and pool.available == 0
     assert session.get_state(_OtherState) is None
+    assert session.get_state(_FailingState) is failed
+    with pytest.raises(ZingKVPoolAdmissionError):
+        pool.acquire(RealtimeSession(), _request())
+    failed.fail = False
+    session.dispose()
+    assert pool.available == 1
+    assert session.get_state(_FailingState) is None
+    session.dispose()
+    assert pool.available == 1
 
 
 @torch.no_grad()
@@ -545,6 +557,7 @@ def test_prompt_budget_rejection_preserves_live_pool_and_recovers(
                 sampling_params=SimpleNamespace(prompt=str(event_id)),
                 realtime_event_id=event_id,
                 realtime_prompt_version=event_id,
+                extra={"zing_source_command": {}},
             ),
         )
 
@@ -917,7 +930,9 @@ def test_disaggregated_cache_rejection_precedes_tensor_restore(
     candidate.source_visual = candidate.audio_shape = None
     candidate.pixel_frame_count = 1
     entry = SimpleNamespace(inputs=candidate, request=request)
-    stage.block0_cache = SimpleNamespace(lookup=lambda *args, **kwargs: entry)
+    stage.block0_cache = SimpleNamespace(
+        lookup=lambda *args, **kwargs: entry, last_lookup={"cache_result": "l1_hit"}
+    )
     owner = RealtimeSession()
     lease = (
         None
@@ -984,7 +999,9 @@ def test_disaggregated_prefill_rejection_precedes_tensor_restore(monkeypatch, li
         sample_rate=24000,
     )
     stage.block0_cache = SimpleNamespace(
-        lookup=lambda *a, **kw: None, can_store=lambda rows: False
+        lookup=lambda *a, **kw: None,
+        can_store=lambda rows: False,
+        last_lookup={"cache_result": "miss", "miss_reason": "not_resident"},
     )
     stage.packer = SimpleNamespace(
         visual_channels=2,

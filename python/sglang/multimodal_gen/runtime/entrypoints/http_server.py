@@ -428,6 +428,11 @@ def create_app(server_args: ServerArgs):
     """
     globally_suppress_loggers()
     app = FastAPI(lifespan=lifespan)
+    from sglang.multimodal_gen.runtime.realtime.release_identity import (
+        install_release_route,
+    )
+
+    install_release_route(app, "model")
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

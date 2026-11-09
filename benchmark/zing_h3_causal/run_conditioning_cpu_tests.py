@@ -109,6 +109,10 @@ core = sys.modules["sglang.multimodal_gen.runtime.pipelines_core"]
 core.ComposedPipelineBase = ComposedPipelineBase
 core.LoRAPipeline = ForbiddenLoRAPipeline
 core.build_pipeline = forbidden_gpu_loader
+# Match normal package imports so dotted monkeypatch paths reach the same
+# real leaf modules as imports through sys.modules.
+sys.modules["sglang.multimodal_gen.runtime"].pipelines_core = core
+core.stages = stages
 
 
 def attention_export(name):

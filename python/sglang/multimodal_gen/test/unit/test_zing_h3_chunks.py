@@ -18,11 +18,11 @@ from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
     Provenance,
     SourceSpan,
 )
-from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
+from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401  # noqa: F401
     cpu_execution_options,
 )
 from sglang.multimodal_gen.test.unit.test_zing_h3_model import model as model_fixture
-from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401
+from sglang.multimodal_gen.test.unit.test_zing_h3_model import (  # noqa: F401  # noqa: F401
     request,
 )
 
@@ -38,6 +38,68 @@ def fixture_provenance(source_id, dependency, start=0, end=1):
         (SourceSpan(source_id, start, start, end - start),),
         dependency,
     )
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("split", [False, True])
+def test_control_only_prompt_switch_keeps_global_cursors_and_requires_safe_boundary(
+    model,
+    split,
+):
+    packer, inputs, noise, _ = _long_request(model, [3, 2], frames=8)
+    packer.split_first_latent = split
+    sampler = ZingH3Sampler(
+        model, packer, solver="few_step", denoising_step_list=[1000, 500]
+    )
+    session = SourceReadySession(
+        sampler,
+        inputs,
+        seed=7,
+        max_pending_chunks=1,
+        max_pending_bytes=4096,
+        initial_prompt_version=1,
+    )
+    chunks = packer.prompt_switch_prefix_chunks()
+    assert [(c.start, c.end) for c in chunks] == (
+        [(0, 1), (1, 3), (3, 5)] if split else [(0, 3), (3, 5)]
+    )
+    for index, chunk in enumerate(chunks):
+        start, end = chunk.start, chunk.end
+        session.append(
+            inputs.source_visual[:, :, start:end],
+            noise[:, :, start:end],
+            provenance=fixture_provenance(index + 1, end, start, end),
+        )
+        assert list(session.drain_ready())[0].prompt_version == 1
+    condition = dict(
+        context=torch.randn(5, 12).bfloat16(), row_role=torch.zeros(5, dtype=torch.long)
+    )
+    session.update_prompt(condition, 42, 2)
+    before = (
+        session.next_chunk_id,
+        session.next_latent,
+        session.next_pixel,
+        session.rng.cpu_rng.clone(),
+    )
+    with pytest.raises(ValueError, match="boundary"):
+        session.activate_prompt_at_source_boundary(4)
+    assert not session.closed and session.prompt.event_id is None
+    ready = session.activate_prompt_at_source_boundary(5)
+    assert ready == dict(event_id=42, prompt_version=2, source_frame_index=5)
+    assert (session.next_chunk_id, session.next_latent, session.next_pixel) == before[
+        :3
+    ]
+    assert torch.equal(session.rng.cpu_rng, before[3])
+    assert session.next_chunk_size == 3 and session.pending_prompt is None
+    session.append(
+        inputs.source_visual[:, :, 5:8],
+        noise[:, :, 5:8],
+        provenance=fixture_provenance(4, 8, 5, 8),
+    )
+    result = list(session.drain_ready())[0]
+    assert result.prompt_version == 2 and result.prompt_event_id == 42
+    assert result.provenance.pixels.start == 5
+    session.dispose()
 
 
 @pytest.mark.parametrize("lengths", [5, [1, 2, 2], [3, 2]])
@@ -543,7 +605,7 @@ def test_reference_switch_rebuild_matches_fresh_cache(model, monkeypatch, ids, s
         )
         return session.step()
 
-    for _ in range(3 if split else 2):
+    for _ in packer.prompt_switch_prefix_chunks():
         assert step().prompt_event_id == 0
     candidate = copy(inputs)
     candidate.conditions = [

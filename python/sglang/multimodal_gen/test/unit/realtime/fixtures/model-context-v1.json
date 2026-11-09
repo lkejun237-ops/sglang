@@ -1,0 +1,350 @@
+{
+  "payload": {
+    "protocol": "worldkit-model-context-v1",
+    "source": {
+      "sessionId": "session",
+      "epoch": 1,
+      "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "worldId": "world",
+      "sourceEpoch": "world-epoch",
+      "presentationId": "presentation",
+      "sdkEpoch": 1
+    },
+    "audience": {
+      "consumerId": "consumer",
+      "consumerEpoch": "consumer-epoch",
+      "playerId": "player",
+      "viewId": "view"
+    },
+    "segmentId": "segment",
+    "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "compilerVersion": 1,
+    "lifecycle": {
+      "lifecycleId": "visit",
+      "generation": 1
+    },
+    "prompt": "天使 arrives 😀\n\"rain\"",
+    "references": [
+      {
+        "alias": "angel",
+        "picture": 1,
+        "format": "png",
+        "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "resource": {
+          "sessionId": "session",
+          "epoch": 1,
+          "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "compilerVersion": 1,
+          "resource": "angel",
+          "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      },
+      {
+        "alias": "hero",
+        "picture": 2,
+        "format": "png",
+        "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "resource": {
+          "sessionId": "session",
+          "epoch": 1,
+          "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "compilerVersion": 1,
+          "resource": "hero",
+          "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      }
+    ],
+    "onsetOccurrenceIds": [
+      "model-context:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    ],
+    "ongoingOccurrenceIds": [
+      "model-context:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    ]
+  },
+  "encoding": "25:worldkit-model-context-v17:session1:164:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa5:world11:world-epoch12:presentation1:18:consumer14:consumer-epoch6:player4:view7:segment64:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc1:15:visit1:126:天使 arrives 😀\n\"rain\"1:25:angel1:13:png64:11111111111111111111111111111111111111111111111111111111111111117:session1:164:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa64:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc1:15:angel64:11111111111111111111111111111111111111111111111111111111111111114:hero1:23:png64:22222222222222222222222222222222222222222222222222222222222222227:session1:164:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa64:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc1:14:hero64:22222222222222222222222222222222222222222222222222222222222222221:178:model-context:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd1:178:model-context:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "sha256": "942c607049638bd272f79e0c9bff40b9baed6f445c207149cfacde339570b165",
+  "messages": [
+    {
+      "protocol": "worldkit-model-context-v1",
+      "source": {
+        "sessionId": "session",
+        "epoch": 1,
+        "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "worldId": "world",
+        "sourceEpoch": "world-epoch",
+        "presentationId": "presentation",
+        "sdkEpoch": 1
+      },
+      "audience": {
+        "consumerId": "consumer",
+        "consumerEpoch": "consumer-epoch",
+        "playerId": "player",
+        "viewId": "view"
+      },
+      "segmentId": "segment",
+      "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "compilerVersion": 1,
+      "type": "model.context.snapshot",
+      "controlSequence": 1,
+      "baseControlSequence": 0,
+      "contextStateId": "context:fixture",
+      "contextRevision": 7,
+      "viewRevision": 4,
+      "compiledConditionId": null,
+      "desired": {
+        "protocol": "worldkit-model-context-v1",
+        "source": {
+          "sessionId": "session",
+          "epoch": 1,
+          "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "worldId": "world",
+          "sourceEpoch": "world-epoch",
+          "presentationId": "presentation",
+          "sdkEpoch": 1
+        },
+        "audience": {
+          "consumerId": "consumer",
+          "consumerEpoch": "consumer-epoch",
+          "playerId": "player",
+          "viewId": "view"
+        },
+        "segmentId": "segment",
+        "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "compilerVersion": 1,
+        "lifecycle": {
+          "lifecycleId": "visit",
+          "generation": 1
+        },
+        "prompt": "天使 arrives 😀\n\"rain\"",
+        "references": [
+          {
+            "alias": "angel",
+            "picture": 1,
+            "format": "png",
+            "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "resource": {
+              "sessionId": "session",
+              "epoch": 1,
+              "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "compilerVersion": 1,
+              "resource": "angel",
+              "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+            }
+          },
+          {
+            "alias": "hero",
+            "picture": 2,
+            "format": "png",
+            "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "resource": {
+              "sessionId": "session",
+              "epoch": 1,
+              "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "compilerVersion": 1,
+              "resource": "hero",
+              "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+            }
+          }
+        ],
+        "onsetOccurrenceIds": [
+          "model-context:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        ],
+        "ongoingOccurrenceIds": [
+          "model-context:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        ]
+      },
+      "executions": [],
+      "candidate": null,
+      "occurrenceCursor": 0,
+      "maxEvictedOccurrenceSequence": 0
+    },
+    {
+      "protocol": "worldkit-model-context-v1",
+      "source": {
+        "sessionId": "session",
+        "epoch": 1,
+        "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "worldId": "world",
+        "sourceEpoch": "world-epoch",
+        "presentationId": "presentation",
+        "sdkEpoch": 1
+      },
+      "audience": {
+        "consumerId": "consumer",
+        "consumerEpoch": "consumer-epoch",
+        "playerId": "player",
+        "viewId": "view"
+      },
+      "segmentId": "segment",
+      "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "compilerVersion": 1,
+      "lifecycle": {
+        "lifecycleId": "visit",
+        "generation": 1
+      },
+      "prompt": "天使 arrives 😀\n\"rain\"",
+      "references": [
+        {
+          "alias": "angel",
+          "picture": 1,
+          "format": "png",
+          "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+          "resource": {
+            "sessionId": "session",
+            "epoch": 1,
+            "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "compilerVersion": 1,
+            "resource": "angel",
+            "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+          }
+        },
+        {
+          "alias": "hero",
+          "picture": 2,
+          "format": "png",
+          "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+          "resource": {
+            "sessionId": "session",
+            "epoch": 1,
+            "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "compilerVersion": 1,
+            "resource": "hero",
+            "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        }
+      ],
+      "onsetOccurrenceIds": [
+        "model-context:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      ],
+      "ongoingOccurrenceIds": [
+        "model-context:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      ],
+      "type": "model.condition",
+      "conditionId": "condition:fixture",
+      "payloadHash": "942c607049638bd272f79e0c9bff40b9baed6f445c207149cfacde339570b165",
+      "stateFingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "controlSequence": 2,
+      "contextRevision": 7,
+      "viewRevision": 4,
+      "effective": {
+        "sourceFrameId": 420,
+        "sourceTimeUs": 17500000,
+        "simulationTick": 1050,
+        "policy": "at-or-after"
+      }
+    },
+    {
+      "protocol": "worldkit-model-context-v1",
+      "source": {
+        "sessionId": "session",
+        "epoch": 1,
+        "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "worldId": "world",
+        "sourceEpoch": "world-epoch",
+        "presentationId": "presentation",
+        "sdkEpoch": 1
+      },
+      "audience": {
+        "consumerId": "consumer",
+        "consumerEpoch": "consumer-epoch",
+        "playerId": "player",
+        "viewId": "view"
+      },
+      "segmentId": "segment",
+      "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "compilerVersion": 1,
+      "type": "model.condition.commit",
+      "controlSequence": 3,
+      "conditionId": "condition:fixture",
+      "payloadHash": "942c607049638bd272f79e0c9bff40b9baed6f445c207149cfacde339570b165",
+      "effective": {
+        "sourceFrameId": 420,
+        "sourceTimeUs": 17500000,
+        "simulationTick": 1050,
+        "policy": "at-or-after"
+      }
+    },
+    {
+      "protocol": "worldkit-model-context-v1",
+      "source": {
+        "sessionId": "session",
+        "epoch": 1,
+        "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "worldId": "world",
+        "sourceEpoch": "world-epoch",
+        "presentationId": "presentation",
+        "sdkEpoch": 1
+      },
+      "audience": {
+        "consumerId": "consumer",
+        "consumerEpoch": "consumer-epoch",
+        "playerId": "player",
+        "viewId": "view"
+      },
+      "segmentId": "segment",
+      "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "compilerVersion": 1,
+      "type": "model.condition.withdraw",
+      "controlSequence": 4,
+      "conditionId": "condition:another",
+      "payloadHash": "942c607049638bd272f79e0c9bff40b9baed6f445c207149cfacde339570b165",
+      "reason": "state-changed"
+    },
+    {
+      "protocol": "worldkit-model-context-v1",
+      "source": {
+        "sessionId": "session",
+        "epoch": 1,
+        "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "worldId": "world",
+        "sourceEpoch": "world-epoch",
+        "presentationId": "presentation",
+        "sdkEpoch": 1
+      },
+      "audience": {
+        "consumerId": "consumer",
+        "consumerEpoch": "consumer-epoch",
+        "playerId": "player",
+        "viewId": "view"
+      },
+      "segmentId": "segment",
+      "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "compilerVersion": 1,
+      "type": "model.condition.receipt",
+      "conditionId": "condition:fixture",
+      "payloadHash": "942c607049638bd272f79e0c9bff40b9baed6f445c207149cfacde339570b165",
+      "phase": "applied",
+      "requestId": "request:original",
+      "promptVersion": 12
+    },
+    {
+      "protocol": "worldkit-model-context-v1",
+      "source": {
+        "sessionId": "session",
+        "epoch": 1,
+        "gameBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "worldId": "world",
+        "sourceEpoch": "world-epoch",
+        "presentationId": "presentation",
+        "sdkEpoch": 1
+      },
+      "audience": {
+        "consumerId": "consumer",
+        "consumerEpoch": "consumer-epoch",
+        "playerId": "player",
+        "viewId": "view"
+      },
+      "segmentId": "segment",
+      "configHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "compilerVersion": 1,
+      "type": "model.context.resume",
+      "afterControlSequence": 3
+    }
+  ]
+}

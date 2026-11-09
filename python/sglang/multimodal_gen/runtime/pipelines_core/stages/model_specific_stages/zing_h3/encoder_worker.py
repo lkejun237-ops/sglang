@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.worker_control impor
     RoleCommandControl,
     RoleControlError,
 )
+from sglang.multimodal_gen.runtime.utils.bounded_process_log import diagnostic_print
 from sglang.multimodal_gen.runtime.utils.zing_stage_timing import (
     handoff,
     stage_span,
@@ -29,11 +30,13 @@ from sglang.multimodal_gen.runtime.utils.zing_stage_timing import (
 )
 from sglang.multimodal_gen.runtime.utils.zing_static_gc import prepare_static_gc
 
-EncoderCommandControl = RoleCommandControl
-EncoderControlError = RoleControlError
+from .encoder_peer import EncoderPeer
 from .encoder_recovery import abort_owner
 from .encoder_transport import bridge_group
 from .progressive_encoder import H3ProgressiveEncoderSession
+
+EncoderCommandControl = RoleCommandControl
+EncoderControlError = RoleControlError
 
 
 def initialize_runtime_imports():
@@ -104,13 +107,23 @@ def main():
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--timeout-seconds", type=int, default=120)
     parser.add_argument("--startup-timeout-seconds", type=int, default=600)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--peer-host", default="127.0.0.1")
+    parser.add_argument("--auth-token-file")
+    parser.add_argument("--node-binding-file")
     parser.add_argument("--max-sessions", type=int, default=1)
     args = parser.parse_args()
-    max_sessions = int(getattr(args, "max_sessions", None) or 1)
+    max_sessions = args.max_sessions
+    peer = EncoderPeer(
+        host=args.peer_host,
+        bridge_host=args.host,
+        auth_token_file=args.auth_token_file,
+        node_binding_file=args.node_binding_file,
+    )
     if (
         args.timeout_seconds <= 0
         or args.startup_timeout_seconds <= 0
-        or max_sessions <= 0
+        or max_sessions < 1
     ):
         raise ValueError("Encoder timeouts must be positive")
     ServerArgs, set_global_server_args = initialize_runtime_imports()
@@ -164,13 +177,13 @@ def main():
                 socket = context.socket(zmq.REP)
                 socket.setsockopt(zmq.LINGER, 0)
                 socket.setsockopt(zmq.SNDTIMEO, args.timeout_seconds * 1000)
-                socket.bind(f"tcp://127.0.0.1:{args.port}")
+                socket.bind(f"tcp://{peer.bridge_host}:{args.port}")
                 control.socket = socket
         except Exception as exc:
             logging.exception("Encoder startup failed on rank %s", rank)
             error = exc
         control.agree("startup", error=error, group=startup_group)
-        print(
+        diagnostic_print(
             json.dumps(
                 {
                     "encoder_service_ready": True,
@@ -184,6 +197,9 @@ def main():
         while True:
             command, payload = control.next()
             if command is None:
+                continue
+            if not peer.accepts(command):
+                control.reply(dict(ok=False, code="ENCODER_PEER_REJECTED"))
                 continue
             op = command["op"]
             started = time.time_ns()
@@ -382,7 +398,7 @@ def main():
                             raise ValueError("Invalid encoder bridge_port")
                         if rank == 0 and bridge_id not in bridges:
                             store = dist.TCPStore(
-                                "127.0.0.1",
+                                command.get("bridge_host", "127.0.0.1"),
                                 command["bridge_port"],
                                 2,
                                 False,
@@ -478,7 +494,7 @@ def main():
                                 sess_bridge = bridges[command["bridge_id"]]
                             else:
                                 store = dist.TCPStore(
-                                    "127.0.0.1",
+                                    command.get("bridge_host", "127.0.0.1"),
                                     command["bridge_port"],
                                     2,
                                     False,
@@ -705,7 +721,7 @@ def main():
                 "abort",
                 "ping",
             ) and reply.get("ok"):
-                print(
+                diagnostic_print(
                     json.dumps(
                         dict(
                             encoder_step=op,

@@ -1,0 +1,306 @@
+{
+  "schemaVersion": 1,
+  "note": "Input normalization at WTP HTTP boundary; canonical is the exact signed/init wire object. Noncanonical inputs must not pass wire validation unchanged.",
+  "valid": [
+    {
+      "name": "h264",
+      "input": {
+        "codec": "h264",
+        "bitrate": 1000000,
+        "gop": 24,
+        "vbvMs": 250,
+        "preset": "veryfast",
+        "quality": 18,
+        "intraRefresh": false
+      },
+      "canonical": {
+        "codec": "h264",
+        "bitrate": 1000000,
+        "gop": 24,
+        "vbvMs": 250,
+        "preset": "veryfast",
+        "quality": 18,
+        "intraRefresh": false
+      },
+      "inputIsCanonical": true
+    },
+    {
+      "name": "vp9",
+      "input": {
+        "codec": "vp9",
+        "bitrate": 1000000,
+        "gop": 24,
+        "vbvMs": 250,
+        "preset": "6",
+        "quality": 56,
+        "intraRefresh": false,
+        "minQp": 48
+      },
+      "canonical": {
+        "codec": "vp9",
+        "bitrate": 1000000,
+        "gop": 24,
+        "vbvMs": 250,
+        "preset": "6",
+        "quality": 56,
+        "intraRefresh": false,
+        "minQp": 48
+      },
+      "inputIsCanonical": true
+    },
+    {
+      "name": "av1",
+      "input": {
+        "codec": "av1",
+        "bitrate": 1000000,
+        "gop": 24,
+        "vbvMs": 100,
+        "preset": "10",
+        "quality": 56,
+        "intraRefresh": false,
+        "minQp": 48
+      },
+      "canonical": {
+        "codec": "av1",
+        "bitrate": 1000000,
+        "gop": 24,
+        "vbvMs": 100,
+        "preset": "10",
+        "quality": 56,
+        "intraRefresh": false,
+        "minQp": 48
+      },
+      "inputIsCanonical": true
+    },
+    {
+      "name": "h264-explicit-zero",
+      "input": {
+        "codec": "h264",
+        "bitrate": 1000000,
+        "gop": 24,
+        "vbvMs": 250,
+        "preset": "veryfast",
+        "quality": 18,
+        "intraRefresh": false,
+        "minQp": 0
+      },
+      "canonical": {
+        "codec": "h264",
+        "bitrate": 1000000,
+        "gop": 24,
+        "vbvMs": 250,
+        "preset": "veryfast",
+        "quality": 18,
+        "intraRefresh": false
+      },
+      "inputIsCanonical": false
+    },
+    {
+      "name": "vp9-missing-minimum",
+      "input": {
+        "codec": "vp9",
+        "bitrate": 1000000,
+        "gop": 24,
+        "vbvMs": 250,
+        "preset": "6",
+        "quality": 56,
+        "intraRefresh": false
+      },
+      "canonical": {
+        "codec": "vp9",
+        "bitrate": 1000000,
+        "gop": 24,
+        "vbvMs": 250,
+        "preset": "6",
+        "quality": 56,
+        "intraRefresh": false,
+        "minQp": 0
+      },
+      "inputIsCanonical": false
+    }
+  ],
+  "invalid": [
+    {
+      "name": "null",
+      "input": null
+    },
+    {
+      "name": "array",
+      "input": []
+    },
+    {
+      "name": "empty",
+      "input": {}
+    },
+    {
+      "name": "extra",
+      "input": {
+        "codec": "vp9",
+        "bitrate": 1000000,
+        "gop": 24,
+        "vbvMs": 250,
+        "preset": "6",
+        "quality": 56,
+        "intraRefresh": false,
+        "minQp": 48,
+        "extra": true
+      }
+    },
+    {
+      "name": "minimum-over-maximum",
+      "input": {
+        "codec": "vp9",
+        "bitrate": 1000000,
+        "gop": 24,
+        "vbvMs": 250,
+        "preset": "6",
+        "quality": 56,
+        "intraRefresh": false,
+        "minQp": 57
+      }
+    },
+    {
+      "name": "bool-minimum",
+      "input": {
+        "codec": "vp9",
+        "bitrate": 1000000,
+        "gop": 24,
+        "vbvMs": 250,
+        "preset": "6",
+        "quality": 56,
+        "intraRefresh": false,
+        "minQp": true
+      }
+    },
+    {
+      "name": "fraction-minimum",
+      "input": {
+        "codec": "vp9",
+        "bitrate": 1000000,
+        "gop": 24,
+        "vbvMs": 250,
+        "preset": "6",
+        "quality": 56,
+        "intraRefresh": false,
+        "minQp": 1.5
+      }
+    },
+    {
+      "name": "null-minimum",
+      "input": {
+        "codec": "vp9",
+        "bitrate": 1000000,
+        "gop": 24,
+        "vbvMs": 250,
+        "preset": "6",
+        "quality": 56,
+        "intraRefresh": false,
+        "minQp": null
+      }
+    },
+    {
+      "name": "negative-minimum",
+      "input": {
+        "codec": "vp9",
+        "bitrate": 1000000,
+        "gop": 24,
+        "vbvMs": 250,
+        "preset": "6",
+        "quality": 56,
+        "intraRefresh": false,
+        "minQp": -1
+      }
+    },
+    {
+      "name": "low-bitrate",
+      "input": {
+        "codec": "vp9",
+        "bitrate": 99999,
+        "gop": 24,
+        "vbvMs": 250,
+        "preset": "6",
+        "quality": 56,
+        "intraRefresh": false,
+        "minQp": 48
+      }
+    },
+    {
+      "name": "too-long-gop",
+      "input": {
+        "codec": "vp9",
+        "bitrate": 1000000,
+        "gop": 25,
+        "vbvMs": 250,
+        "preset": "6",
+        "quality": 56,
+        "intraRefresh": false,
+        "minQp": 48
+      }
+    },
+    {
+      "name": "low-vbv",
+      "input": {
+        "codec": "vp9",
+        "bitrate": 1000000,
+        "gop": 24,
+        "vbvMs": 49,
+        "preset": "6",
+        "quality": 56,
+        "intraRefresh": false,
+        "minQp": 48
+      }
+    },
+    {
+      "name": "bad-preset",
+      "input": {
+        "codec": "vp9",
+        "bitrate": 1000000,
+        "gop": 24,
+        "vbvMs": 250,
+        "preset": "99",
+        "quality": 56,
+        "intraRefresh": false,
+        "minQp": 48
+      }
+    },
+    {
+      "name": "string-quality",
+      "input": {
+        "codec": "vp9",
+        "bitrate": 1000000,
+        "gop": 24,
+        "vbvMs": 250,
+        "preset": "6",
+        "quality": "56",
+        "intraRefresh": false,
+        "minQp": 48
+      }
+    },
+    {
+      "name": "vp9-intra-refresh",
+      "input": {
+        "codec": "vp9",
+        "bitrate": 1000000,
+        "gop": 24,
+        "vbvMs": 250,
+        "preset": "6",
+        "quality": 56,
+        "intraRefresh": true,
+        "minQp": 48
+      }
+    },
+    {
+      "name": "h264-nonzero-minimum",
+      "input": {
+        "codec": "h264",
+        "bitrate": 1000000,
+        "gop": 24,
+        "vbvMs": 250,
+        "preset": "veryfast",
+        "quality": 18,
+        "intraRefresh": false,
+        "minQp": 1
+      }
+    }
+  ]
+}

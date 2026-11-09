@@ -1,0 +1,5 @@
+{
+  "region": "ap-southeast-7", "deployment": "whitebox-th",
+  "gpu": {"capability": [10, 3], "minimum_memory_gib": 240},
+  "model": {"cache_dir": "/var/cache/sglang/block0/thailand-480-restore4"}
+}

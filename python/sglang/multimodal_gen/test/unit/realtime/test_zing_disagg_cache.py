@@ -173,7 +173,20 @@ def test_encoder_cache_hit_skips_qwen_and_reference_preparation():
     )
     output, notice = encoder.forward(batch)
     assert notice is None and output["cache_hit"] is True
-    assert set(queries[1][1]) == {"cache_key", "prefill", "force", "prompt_update"}
+    assert set(queries[1][1]) == {
+        "cache_key",
+        "prefill",
+        "force",
+        "prompt_update",
+        "_trace",
+    }
+    assert set(queries[1][1]["_trace"]) <= {
+        "operation_id",
+        "session_id",
+        "event_id",
+        "game_id",
+        "group_id",
+    }
     assert len(queries[1][1]["cache_key"]) == 64
     assert torch.equal(encoder.inputs.visual["reference"], inputs.visual["reference"])
     assert encoder.inputs.condition_media[0]["frames"].device.type == "cpu"

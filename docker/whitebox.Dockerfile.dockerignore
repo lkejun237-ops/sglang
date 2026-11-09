@@ -1,0 +1,23 @@
+# Keep full source/tests available to projection and checks; runtime stages copy
+# only the projected tree. Acceptance helpers and the pinned SDK remain inputs.
+**
+!python/
+!python/sglang/
+!python/sglang/**
+!benchmark/
+!benchmark/whitebox/
+!benchmark/whitebox/**
+!deploy/
+!deploy/whitebox/
+!deploy/whitebox/**
+!docker/
+!docker/whitebox.Dockerfile
+!.whitebox-sdk/
+!.whitebox-sdk/**
+**/.git
+**/.codex-tmp
+**/node_modules
+**/__pycache__
+**/.pytest_cache
+**/.env
+**/.env.*

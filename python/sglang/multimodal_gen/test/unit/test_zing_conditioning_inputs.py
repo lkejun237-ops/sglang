@@ -81,11 +81,34 @@ def test_shared_encoder_statement_identity_matches_frozen_native(api, monkeypatc
     import inspect
 
     encode_condition = _cpu_encoder(monkeypatch)
+    assert (
+        inspect.signature(encode_condition).parameters["max_prompt_tokens"].default
+        is None
+    )
     function = ast.parse(inspect.getsource(encode_condition)).body[0]
+    # The optional budget preflight does not alter native encoding statements.
+    # Pin its exact invocation before normalizing it; token-budget contracts
+    # independently verify rejection before media preprocessing or GPU work.
+    preflight = [
+        item
+        for item in function.body
+        if isinstance(item, ast.Expr)
+        and isinstance(item.value, ast.Call)
+        and isinstance(item.value.func, ast.Name)
+        and item.value.func.id == "validate_prompt_token_budget"
+    ]
+    assert len(preflight) == 1
+    assert ast.dump(preflight[0], include_attributes=False) == ast.dump(
+        ast.parse(
+            "validate_prompt_token_budget(tokenizer, prompt, max_prompt_tokens)"
+        ).body[0],
+        include_attributes=False,
+    )
     body = [
         item
         for item in function.body
-        if not (isinstance(item, ast.If) and "max_rows" in ast.unparse(item.test))
+        if item is not preflight[0]
+        and not (isinstance(item, ast.If) and "max_rows" in ast.unparse(item.test))
     ]
     tree = ast.Module(body=body, type_ignores=[])
 

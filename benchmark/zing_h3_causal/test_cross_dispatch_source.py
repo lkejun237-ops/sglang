@@ -168,6 +168,9 @@ def test_real_ipc_prefetches_next_dispatch_and_credit_bounds(
     session.source_geometry = ns["SourceGeometry"](2, 2, 1, 1, 2, 2) if resize else None
     session.resize_host_ms = 0.0
     session.device, session.port, session.timeout = "cpu", port, 2
+    session.peer = SimpleNamespace(
+        host="127.0.0.1", bridge_host="127.0.0.1", fields=lambda: {}
+    )
     session.admission_endpoint = endpoint
     session.profile_dir, session.token = None, "private-generation"
     session.stage_timing_dir = None

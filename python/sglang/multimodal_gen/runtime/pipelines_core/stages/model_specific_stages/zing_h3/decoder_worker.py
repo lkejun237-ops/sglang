@@ -36,13 +36,17 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.worker_control impor
     RoleControlError,
 )
 from sglang.multimodal_gen.runtime.realtime.polling_task_queue import PollingTaskQueue
+from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
+    remote_decode_progressive,
+)
+from sglang.multimodal_gen.runtime.utils.bounded_process_log import diagnostic_print
 
 from .decoder_transport import bridge_group, receive_latent
+from .source_decoder import check_latent_append
 
 EncoderCommandControl = RoleCommandControl
 EncoderControlError = RoleControlError
 _OutputPublisher = SharedMemoryFramePublisher
-from .source_decoder import check_latent_append
 
 _DRAIN = object()
 
@@ -119,7 +123,9 @@ class _DecodeService:
         device,
         step_gate=None,
         queue_driven=False,
+        progressive=False,
     ):
+        self.progressive = progressive
         self.queue_driven = queue_driven
         self.protocol = module.protocol
         self.device = device
@@ -186,6 +192,18 @@ class _DecodeService:
         self.accepted_latents = count
         self.valid_frame_end = valid_frame_end
 
+    def output_slices(self, frames):
+        start = self.submitted_frames
+        counts = []
+        for latent_end in range(self.submitted_latents + 1, self.accepted_latents + 1):
+            end = min(self.valid_frame_end, self.protocol.frame_count(latent_end))
+            if end > start:
+                counts.append(end - start)
+                start = end
+        if sum(counts) != frames:
+            raise ValueError("Decoder slices do not match valid output frames")
+        return counts
+
     def submit(self, frames, reference):
         """Move the pending latents into one decode job without waiting for it."""
         pending = self.valid_frame_end - self.submitted_frames
@@ -194,6 +212,7 @@ class _DecodeService:
         ticket = self._step_gate.issue() if self._step_gate is not None else None
         job = dict(
             latents=self._pending,
+            slices=self.output_slices(frames) if self.progressive else None,
             frames=frames,
             reference=reference,
             done=threading.Event(),
@@ -276,20 +295,40 @@ class _DecodeService:
                     if "total_frames" in job:
                         self._stream.finish(job["total_frames"])
                     else:
+                        part_index = 0
                         for latent, ready in job["latents"]:
                             if ready is not None:
                                 ready.wait()
                                 latent.record_stream(stream)
-                            produced = self._stream.push(latent)
-                            self._held = (
-                                produced
-                                if self._held is None
-                                else torch.cat((self._held, produced), dim=2)
+                            pieces = (
+                                latent.split(1, dim=2)
+                                if job["slices"] is not None
+                                else [latent]
                             )
-                        decoded = self._take(job["frames"])
-                        if job["reference"] is not None:
-                            # Convert on the decode stream; the D2H waits for it.
-                            self.publisher.publish(job["reference"], decoded)
+                            for piece in pieces:
+                                produced = self._stream.push(piece)
+                                self._held = (
+                                    produced
+                                    if self._held is None
+                                    else torch.cat((self._held, produced), dim=2)
+                                )
+                                if job["slices"] is not None and part_index < len(
+                                    job["slices"]
+                                ):
+                                    decoded = self._take(job["slices"][part_index])
+                                    if job["reference"] is not None:
+                                        self.publisher.publish_slice(
+                                            job["reference"], part_index, decoded
+                                        )
+                                    part_index += 1
+                        if job["slices"] is None:
+                            decoded = self._take(job["frames"])
+                            if job["reference"] is not None:
+                                self.publisher.publish(job["reference"], decoded)
+                        elif part_index != len(job["slices"]):
+                            raise ValueError(
+                                "Decoder did not publish every valid slice"
+                            )
                     if self._tile_parallel and stream is not None:
                         stream.synchronize()
             except BaseException as exc:
@@ -471,10 +510,18 @@ def main():
         help="Base output WS port, separate from management HTTP",
     )
     args = parser.parse_args()
+
     from sglang.multimodal_gen.runtime.realtime.zing_nccl import configure_zing_nccl
 
     configure_zing_nccl()
 
+    from sglang.multimodal_gen.runtime.realtime.role_pool.reporting import (
+        validate_worker_configuration,
+    )
+
+    validate_worker_configuration(
+        "decoder", args.service_count, static_connection=args.static_connection
+    )
     if args.static_connection:
         args.http_port = args.output_port = None
     import uuid
@@ -551,6 +598,7 @@ def main():
         idle_group=idle_group,
         operation_group=control_group,
     )
+    progressive_output = remote_decode_progressive()
     module = publisher = service = bridge = store = token = channel = socket = (
         context
     ) = None
@@ -646,6 +694,11 @@ def main():
                     if output_port is not None:
                         app = FastAPI()
                         broker.install(app)
+                        from sglang.multimodal_gen.runtime.realtime.role_pool.native_http import (
+                            install_managed_transport,
+                        )
+
+                        install_managed_transport(app, manager)
                         lane["output_http"] = WorkerHTTPServer(
                             "decoder",
                             args.http_host,
@@ -701,7 +754,7 @@ def main():
                     and not any(c.restart_required for c in controllers)
                 )
                 lane["http"].ready = True
-        print(
+        diagnostic_print(
             json.dumps(
                 {
                     "decoder_service_ready": True,
@@ -1136,6 +1189,8 @@ def main():
                                 decode_group=decode_group,
                                 device=device,
                                 queue_driven=command.get("auto_output", False),
+                                progressive=progressive_output
+                                and not command.get("auto_output", False),
                             )
                             if rank == 0:
                                 bridge_id = command.get("bridge_id")
@@ -1255,7 +1310,7 @@ def main():
                         ):
                             raise ValueError("Invalid decoder latent shape")
                         dtype = getattr(torch, command["dtype"])
-                        if world > 1:
+                        if world > 1 or progressive_output:
                             preparation_error = None
                             try:
                                 service.wait_for_transfer()
@@ -1306,6 +1361,11 @@ def main():
                                     width=service.width,
                                     height=service.height,
                                     identity=_output_identity(command, session=token),
+                                    **(
+                                        {"frame_slices": service.output_slices(frames)}
+                                        if getattr(service, "progressive", False)
+                                        else {}
+                                    ),
                                 )
                                 metadata = dict(
                                     format="rgb24",
@@ -1449,7 +1509,7 @@ def main():
                 and reply
                 and reply.get("ok")
             ):
-                print(
+                diagnostic_print(
                     json.dumps(
                         dict(
                             decoder_step=op,

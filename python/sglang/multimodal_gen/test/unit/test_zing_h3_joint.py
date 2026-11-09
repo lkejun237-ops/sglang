@@ -852,3 +852,68 @@ def test_joint_sp_rope_conflict_and_unsupported_size_fall_back_before_joint_work
         finally:
             state.close()
     torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
+
+
+def test_bounded_output_drain_resumes_joint_lookahead_without_recomputing(model):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.incremental import (
+        SourceReadySession,
+    )
+    from sglang.multimodal_gen.test.unit.test_zing_h3_chunks import fixture_provenance
+
+    packer, inputs, _, _ = request(model, audio=False)
+    packer = type(packer)(
+        model.arch, num_frame_per_block=[3, 2], split_first_latent=True
+    )
+    inputs.visual_shape = (10, 2, 2)
+    inputs.source_visual = torch.randn(1, 2, 10, 2, 2)
+    noise = torch.randn_like(inputs.source_visual)
+    runs = []
+    for limit in (None, 1):
+        sampler = ZingH3Sampler(
+            model,
+            packer,
+            joint_forward="cross_chunk",
+            window_chunks=6,
+            sink_chunks=3,
+            solver="few_step",
+            denoising_step_list=[1000, 500],
+        )
+        session = SourceReadySession(
+            sampler,
+            inputs,
+            seed=51,
+            max_pending_chunks=20,
+            max_pending_bytes=1000000,
+            total_latent_frames=10,
+        )
+        try:
+            for chunk in packer.chunk_plan.chunks(10):
+                session.append(
+                    inputs.source_visual[:, :, chunk.start : chunk.end],
+                    noise[:, :, chunk.start : chunk.end],
+                    provenance=fixture_provenance(
+                        chunk.chunk_id + 1, 20, chunk.start, chunk.end
+                    ),
+                )
+            parts = []
+            while session.pending:
+                outputs = list(session.drain_ready(max_outputs=limit))
+                if limit is not None:
+                    assert len(outputs) == 1 and not session.draining
+                parts.extend(result.visual for result in outputs)
+                assert not session.closed
+            runs.append(
+                (
+                    torch.cat(parts, dim=2),
+                    session.rng.cpu_rng.clone(),
+                    dict(session.metrics["forward_counts"]),
+                )
+            )
+            assert session._drain_continuation is None
+            assert session.memory_snapshot()["execution_storage_bytes"] == 0
+        finally:
+            session.dispose()
+        assert all(value == 0 for value in session.memory_snapshot().values())
+    torch.testing.assert_close(runs[0][0], runs[1][0], rtol=0, atol=0)
+    assert torch.equal(runs[0][1], runs[1][1])
+    assert runs[0][2] == runs[1][2] and runs[1][2]["cross_chunk"] > 0

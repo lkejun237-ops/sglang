@@ -1,0 +1,194 @@
+{
+  "fixtureVersion": 1,
+  "evidence": "Fixed CPU contract vector from original SDK descriptor/native-v2 schemas. Not live model output or a deployed capability.",
+  "request": {
+    "schemaVersion": 1,
+    "action": "getPlayerMedia",
+    "memberBinding": {
+      "gameId": "11111111111111111111111111111111",
+      "ownerEpoch": "22222222222222222222222222222222",
+      "publicationId": "p",
+      "memberId": "alice",
+      "admissionOperationId": "admit-a"
+    }
+  },
+  "response": {
+    "status": "ready",
+    "kind": "sdk-session",
+    "memberBinding": {
+      "gameId": "11111111111111111111111111111111",
+      "ownerEpoch": "22222222222222222222222222222222",
+      "publicationId": "p",
+      "memberId": "alice",
+      "admissionOperationId": "admit-a"
+    },
+    "publication": {
+      "sourceId": "s",
+      "worldId": "w",
+      "publicationId": "p",
+      "sourceManifestSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "renditionInputSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "manifestSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "attempt": 7
+    },
+    "session": {
+      "protocolVersion": 1,
+      "sessionId": "render-alice",
+      "epoch": 3,
+      "worldId": "world",
+      "worldBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "uiBundleHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "baseUrl": "https://media.test",
+      "accessToken": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "accessMode": "capability",
+      "media": {
+        "kind": "pixels",
+        "pixelFormat": "rgb24",
+        "colorSpace": "srgb"
+      },
+      "playerBinding": {
+        "schemaVersion": 1,
+        "viewportId": "viewport-alice",
+        "viewportBindingRevision": 2,
+        "room": {
+          "protocolVersion": 1,
+          "roomId": "room",
+          "roomEpoch": 1,
+          "runtimeHash": "runtime",
+          "contentHash": "content"
+        },
+        "playerSessionId": "alice",
+        "connectionEpoch": 2,
+        "mode": "cloud",
+        "render": {
+          "sessionId": "render-alice",
+          "epoch": 3
+        }
+      },
+      "audience": {
+        "kind": "player",
+        "roomId": "room",
+        "roomEpoch": 1,
+        "playerSessionId": "alice",
+        "revision": 1
+      },
+      "width": 160,
+      "height": 90,
+      "fps": 24,
+      "status": "running",
+      "pixelState": {},
+      "ui": {
+        "catalog": {
+          "schemaVersion": 1,
+          "catalogId": "ui",
+          "components": {},
+          "actions": {}
+        },
+        "document": {
+          "schemaVersion": 1,
+          "catalogId": "ui",
+          "designViewport": {
+            "width": 32,
+            "height": 32
+          },
+          "spec": {
+            "root": "root",
+            "elements": {
+              "root": {
+                "type": "HudLayer",
+                "props": {},
+                "children": []
+              }
+            }
+          },
+          "transitions": {}
+        },
+        "stateSchema": {
+          "type": "object"
+        },
+        "moduleUrl": "https://media.test/v1/sessions/render-alice/ui/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/module.js",
+        "moduleSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "styles": []
+      }
+    },
+    "model": {
+      "status": "unavailable",
+      "reason": "MEMBER_MODEL_SOURCE_UNAVAILABLE"
+    }
+  },
+  "sourceEnvelope": {
+    "kind": "worldkit-pixel-frame",
+    "schemaVersion": 2,
+    "pixelFormat": "rgb24",
+    "colorSpace": "srgb",
+    "widthPixels": 160,
+    "heightPixels": 90,
+    "rowStrideBytes": 480,
+    "payloadBytes": 43200,
+    "worldBuildHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "uiBundleHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "input": {
+      "protocolVersion": 1,
+      "sessionId": "render-alice",
+      "epoch": 3,
+      "mediaGeneration": 7,
+      "outputFrameId": 19,
+      "outputPtsUs": 791666,
+      "uiRevision": 5,
+      "uiCompleteThroughUs": 800000,
+      "widthPixels": 160,
+      "heightPixels": 90,
+      "source": {
+        "presentationId": "viewport-alice",
+        "sdkEpoch": 11,
+        "sourceFrameId": 47,
+        "sourceTimeUs": 783333,
+        "simulationTick": 94,
+        "worldRevision": 2
+      }
+    }
+  },
+  "createContext": {
+    "schemaVersion": 1,
+    "operation": {
+      "operationId": "op-original",
+      "requestId": "request-original",
+      "kind": "createRoom",
+      "parametersSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "frozenPublication": {
+      "status": "verified",
+      "scope": "world-frozen-publication",
+      "world": {
+        "sourceId": "s",
+        "worldId": "w",
+        "publicationId": "p",
+        "attempt": 7,
+        "platformRunId": "platform-run",
+        "sdkRunId": "sdk-run"
+      },
+      "publicationIdentity": {
+        "sourceId": "s",
+        "worldId": "w",
+        "publicationId": "p",
+        "sourceManifestSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "renditionInputSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "manifestSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "attempt": 7
+      },
+      "playConfiguration": {
+        "playMode": "multiplayer",
+        "multiplayer": {
+          "maxPlayers": 2
+        }
+      }
+    }
+  },
+  "alternateInteractiveWorld": {
+    "sourceId": "s",
+    "worldId": "w",
+    "publicationId": "p",
+    "attempt": 7,
+    "interactiveImportId": "interactive-import"
+  }
+}

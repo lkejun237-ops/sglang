@@ -1,0 +1,37 @@
+name: Zing role pool contracts
+on:
+  pull_request:
+    paths:
+      - 'python/sglang/multimodal_gen/runtime/realtime/role_pool/**'
+      - 'python/sglang/multimodal_gen/runtime/realtime/worker_connections.py'
+      - 'python/sglang/multimodal_gen/runtime/realtime/whitebox/model_binding.py'
+      - 'python/sglang/multimodal_gen/runtime/realtime/whitebox/disaggregated_binding.py'
+      - 'python/sglang/multimodal_gen/runtime/entrypoints/realtime_coordinator_server.py'
+      - 'python/sglang/multimodal_gen/runtime/entrypoints/realtime_gateway_server.py'
+      - 'python/sglang/multimodal_gen/test/unit/realtime/test_role_pool*.py'
+      - 'python/sglang/multimodal_gen/test/unit/realtime/test_worker_connections.py'
+      - 'scripts/ci/zing/run_role_pool_tests.py'
+      - 'scripts/ci/zing/requirements-role-pool.txt'
+      - '.github/workflows/zing-role-pool-contracts.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r scripts/ci/zing/requirements-role-pool.txt
+      - name: Install local Redis for transactional tests
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+      - name: Run local role-pool contracts
+        run: python scripts/ci/zing/run_role_pool_tests.py -q --junitxml=role-pool.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: role-pool-local-contracts
+          path: role-pool.xml

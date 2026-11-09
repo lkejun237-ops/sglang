@@ -76,6 +76,42 @@ def test_lru_reuses_preallocated_slots_and_waits_for_fill(cpu_dma):
     assert owner.evictions == 1
 
 
+def test_live_fill_uses_kv_device_when_prefix_positions_are_cpu(cpu_dma, monkeypatch):
+    class DeviceTensor(torch.Tensor):
+        # Keep real CPU copy arithmetic while checking the CUDA API boundary.
+        @property
+        def device(self):
+            return torch.device("cuda:0")
+
+    owner = cpu_cache([NS(k=torch.zeros(8, 2, 3))], entries=1, rows=8)
+    cache = NS(
+        prefix=NS(
+            positions=torch.zeros(3, 3),
+            layers=[
+                (
+                    torch.ones(3, 2, 3).as_subclass(DeviceTensor),
+                    torch.full((3, 2, 3), 2.0).as_subclass(DeviceTensor),
+                )
+            ],
+        ),
+        _model_signature="model",
+    )
+
+    def current_stream(device):
+        if device.type != "cuda":
+            raise ValueError(f"Expected a cuda device, but got: {device}")
+        return cpu_dma[1]
+
+    monkeypatch.setattr(torch.cuda, "current_stream", current_stream)
+    owner.fill("live", inputs(), "condition", "request", cache)
+    assert owner.pending is not None
+    owner.finish_fill()
+    assert torch.equal(dense_kv(owner.entries["live"].data)[0, 0], torch.ones(3, 2, 3))
+    assert torch.equal(
+        dense_kv(owner.entries["live"].data)[0, 1], torch.full((3, 2, 3), 2.0)
+    )
+
+
 @pytest.mark.parametrize("budget", [0, -1, True, 1.5])
 def test_reject_invalid_byte_capacity(budget):
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.preparation_cache import (
@@ -763,6 +799,9 @@ def test_dispose_drains_transfers_before_releasing_gpu_slot(has_event):
         mode="overlap",
         cpu_capacity_bytes=0,
         entry_count=0,
+        page_rows=2048,
+        total_pages=0,
+        free_pages=[],
         hits=0,
         misses=0,
         evictions=0,

@@ -1,0 +1,188 @@
+---
+title: "Room 并行准备：独立尺寸 S0 条件图"
+description: "prepare v2 将 S0 条件图与 CLI 视频帧解耦，复用既有 Qwen 预处理和源帧时间轴。"
+---
+
+## 2026-10-29 版本边界补充
+
+共享接收端显式支持 `whitebox-startup-prepare-v1` 和 `whitebox-startup-prepare-v2`，
+下文原方案与回退说明保留为 v1 行为记录。V2 源码来自原实现
+`bf347fa6108f612240238e92781a5942d740fc32`，并保留后续 Room 的 21 张参考图路由；
+未整体移植该提交的性能或训练改动。
+
+- V2 S0 是原生尺寸的条件预览，不要求等于 source video 尺寸或真实首帧像素。
+  PNG 编码上限仍为 2 MiB，正整数宽高乘积不超过 16,777,216，解码前检查 IHDR，
+  保留原有不透明 8-bit RGB 与双 hash 验证。Room 不做 resize。
+- V2 fingerprint 使用 `condition-preview-rgb24-v2`，包含预览宽高和原 prompt、
+  seed、参考图、source stream、worker profile。`source.prepare` 显式携带
+  `width/height`；worker 条件 tensor 使用该尺寸，原视频 ledger/VAE 仍用输出尺寸。
+- 已协商的 worker ready 必须回显同一版本。V2 不接受 `fallback_policy`，S0 与真实
+  首帧不同不会重新占租约。原 SourceSession 固定的 CLI 首帧 hash 约束模型 frame zero。
+- Adapter 到原 worker 的内部 prepare/attach 命令携带 v2 版本；省略该内部字段的
+  既有调用保持 v1。V1 fingerprint、等尺寸/像素检查和显式一次回退不变。
+  重复 prepare 的版本、尺寸、像素均不可变化，prepare/attach 不推进 source 或 RNG。
+
+本候选只验证原 owner 的 CPU 契约及真实 Torch tensor/packing，模型计算使用测试 peer。
+未部署，未证明当前 GPU 进程源码、原生 ICE 或性能；480/736 的 Encoder/DiT/Decoder
+耗时、显存及完整 TTFF/E2E/FPS/TPOC/ICL 需独立同条件验收。
+
+CPU 检查边界：Room/member 60 通过、1 个缺少外部 Node SDK checkout 的用例跳过；source_prepare/schema/cache
+6 通过。使用 `--continue-on-collection-errors` 的有界 worker 检查执行了 12 个真实
+Torch source_session 用例并通过，另有 685 个未选；adapter 文件因 VLA→SRT 的
+`xgrammar` 导入缺失而收集失败，整体退出码 1。**adapter 执行与完整 worker gate
+仍未验证**，没有伪造依赖或将收集失败计为通过。
+
+## 范围与状态
+
+2026-10-27：本文描述本地代码中的 `whitebox-startup-prepare-v2`，尚未部署。
+上海已部署并验收的是 v1；v1 的 GPU/浏览器结果不是 v2 的性能或画质证据。
+[v1 契约历史](https://github.com/seedleap/sglang/blob/f2894cda2e0bef72533e5d2dee331bbc94147df4/docs/docs/sglang-diffusion/zing/plans/shanghai-model-startup-prepare.mdx)
+保留了原像素一致性和回退策略。
+
+本次仅解耦 S0 的尺寸与用途。CLI、SDK、共享世界时钟、source 输入尺寸、目标输出尺寸、
+采样配置、VAE/DiT 连续帧路径、真实帧 PTS 和录像配对保持原行为。每个模型 worker
+仍只承载一个活跃会话；多个 slot 使用独立 worker/epoch。
+
+## 两条启动路径
+
+| 请求 | 条件准备 | 实际模型视频输入 |
+| --- | --- | --- |
+| 提供 S0 | CLI 启动与 S0 条件准备并行 | 等 CLI 就绪，以固定的真实 CLI 帧开始，再选最新帧 |
+| 省略 S0 | 等 CLI 第一张真实视角帧，以它准备条件 | 仍使用同一张真实 CLI 帧开流，再选最新帧 |
+
+外部 S0 只作为 `<Video 1>` / `origin=source_s0` 的 Qwen 条件预览，既不是普通
+reference，也不是 source VAE 的第一张视频帧。S0 为 960×540、source/output 为
+832×480 是合法组合。Room 保留 S0 原尺寸，模型复用现有 source-presentation
+选桶和 resize；无需增加 Room 或前端的缩放策略。
+
+`model.prepared` 表示条件与会话状态已准备，不表示视频出帧。仍需等 CLI 真实帧、
+RTC 就绪以及同 preparation 的 attach；实际模型帧才计入 TTFF 和输出统计。
+prepare/attach 不推进 source、latent、AR 或 RNG 游标，也不写 source VAE 历史。
+
+## S0 编码与尺寸
+
+继续使用可选 `startup.initial_frame`，描述其真实 `width`、`height`：
+
+```json
+{
+  "protocol": "whitebox-startup-prepare-v2",
+  "request_id": "request-123",
+  "intent": "model",
+  "initial_frame": {
+    "format": "png",
+    "width": 960,
+    "height": 540,
+    "encoded_size": 12345,
+    "encoded_sha256": "<sha256 of PNG bytes>",
+    "rgb_sha256": "<sha256 of decoded native RGB24>"
+  },
+  "initial_render": {"prompt": "...", "seed": 42, "references": []}
+}
+```
+
+PNG 仍要求8位RGB或不透明RGBA、单帧、无ICC/EXIF声明；编码体不超过2 MiB，
+解码像素数不超过16,777,216。宽高必须为正整数，文件实际尺寸须与声明一致，
+文件SHA和原尺寸RGB SHA必须匹配。PNG头尺寸在分配像素内存前检查。
+解码后的RGB最多48 MiB，适配层仍服从协商的消息和内存预算。
+
+前端预取首帧，点击时已加载且合法就传；缺图、超限、加载失败或尚未完成则省略。
+前端只放开固定832×480限制，沿用原尺寸Canvas读取RGB，不改变图像比例。
+`initial_state_id`仍不支持；可选`world_revision`仍与实际CLI世界发布身份核对。
+v2不接受已移除的`fallback_policy`字段。
+
+## 模型协议
+
+内部 `source.prepare` 的 payload 为：
+
+```python
+{
+    "identity": identity,
+    "rgb": native_rgb_bytes,
+    "width": 960,
+    "height": 540,
+}
+```
+
+## 准备失败的诊断合同
+
+Room 在已建立的模型连接上执行 `init`、`source.prepare` 或 `source.attach` 收到错误、异常应答、断连或
+无法解码的响应时，返回 `MODEL_PREPARATION_FAILED`、`stage=model` 和当前 `trace_id`。
+合法的下游错误码保留在可选 `upstream_code`（仅限 96 字符 ASCII 标识符）；不把模型端的
+`INVALID_COMMAND` 当成玩家/白模输入错误。旧的 `INITIALIZATION_FAILED` 也明确归为模型初始化。
+
+公开 `content` 使用固定英文说明；原始异常正文、路径和输入不向浏览器透传。
+Room 服务日志记录 trace、prepare/attach 操作、下游码及有界错误正文，不记录整条帧/参考图消息。
+下游没有提供原因时，公开提示明确保留原因未知；不能从空闲 slot 推断准备成功，亦不能由此
+断言作品损坏。容量、CLI 启动、身份冲突及连接错误继续保留其原有代码和阶段。
+
+WTP 对接使用原 WS/RTC 可靠控制消息显示上述字段，无额外重试或资源申请。
+此诊断改动不修复模型准备本身；CPU 协议回归通过不代表线上 GPU 推理已验收。
+
+普通分段和连续模型会话也保留模型 `init` 与运行时错误的来源：初始化拒绝使用
+`MODEL_PREPARATION_FAILED`，渲染中的错误使用 `MODEL_FAILED`，阶段均为 `model`。
+下游错误正文只写有界服务日志；浏览器仅接收固定说明、合法 `upstream_code` 和 trace。
+分段终态的 `segment.error_code` 与原始 `render.start` / `render.replace` 的
+`operation.result.code` 保持一致，同时保留 `stage`、`trace_id` 和可选 `upstream_code`。
+
+资源清理失败不能覆盖已知主错误。主错误继续传播，额外记录
+`cleanup_code=RELEASE_UNKNOWN` 与实际 `resource_state`；没有主错误时，清理失败仍按
+`RELEASE_UNKNOWN` 报告。取消仍保持取消语义。容量错误的阶段为 `admission`；分段录像准备、
+编码器准备分别使用 `ARCHIVE_FAILED/archive`、`VIDEO_ENCODING_FAILED/encoding`。
+尚未明确归因的输出处理错误使用 `RENDER_OUTPUT_FAILED/rendering`，不推断为模型故障。
+控制执行中的服务端错误使用 `CONTROL_SERVICE_FAILED/control`，不改写成玩家输入错误。
+
+CPU 回归入口为 `test_whitebox_error_origins.py`，并覆盖现有 interactive、startup、render
+lifecycle 和 control queue 消费链。此范围没有穷举所有运行时、CLI、存储和浏览器失败；
+未知原因仍按对应边界报告，不能由错误类别推断具体 GPU 或作品根因。
+
+## 模型池容量范围
+
+Gateway 的 `/v1/slots` 使用自身固定的 `model_revision` 与 `vae_fingerprint` 查询
+Coordinator，避免把其他模型或不兼容 VAE 的空闲槽位显示为当前模型可用容量。
+Coordinator `/v1/capacity` 的两个同名查询参数必须同时提供且非空；不带参数时仍返回
+运维使用的全局池快照。模型别名、local decode 约束和可用 worker 判断复用 admission
+的现有实现，不创建新的调度或租约策略。
+
+模型范围内的有效预留租约、未确认释放和隔离状态不会因尚未出帧而算作空闲。
+`waiting_sessions` 仍是共享等待队列的全局计数，当前队列记录没有模型范围身份；
+其余 worker 负载按所选池聚合。此查询不是个人额度或白模 Room 准入承诺。
+对应 CPU 回归位于现有 Coordinator、Coordinator HTTP 和 Gateway HTTP 测试文件。
+
+## GPU prepare/attach
+
+S0的宽高与`source_stream.width/height`独立。适配层和模型执行层校验
+`len(rgb) == width * height * 3`，按S0尺寸创建条件Tensor，保持source ledger和
+目标输出几何不变。条件fingerprint同时包含S0字节哈希、S0宽高、prompt、seed、
+有序reference、source配置和模型profile摘要。
+
+保留以下保护：
+
+- prepare/attach 的 preparation/session/source/worker epoch 身份一致。
+- 同一准备请求重试必须保留原S0字节、尺寸和条件，不得偷偷换图。
+- attach完成前不能append；消息大小、内存账本和源帧顺序仍按原规则检查。
+- 实际视频第0帧必须是Room固定的真实CLI帧；此校验比较CLI帧哈希，而非外部S0。
+- 取消、断连、超时、释放未知和下一会话继续由现有生命周期处理。
+
+取消Room、适配层、模型执行层对“S0必须等于CLI首帧”的比较，且首次append不得覆盖
+已准备的S0。像素不同不会释放租约或重做准备；每次启动只取得一个模型租约。
+无S0时使用CLI帧的条件准备仍是合法的串行路径。
+
+## 帧与记录
+
+Room继续固定一张真实CLI帧Fk；CLI捕获、预览、共享世界继续运行。模型准备完成后
+发送Fk一次，再选择最新帧。Fk到下一帧的真实时间间隔保留，不伪造tick零、不改写PTS。
+外部S0不插入视频，不占源帧编号，不冒充CLI来源。
+
+startup receipt增加`condition_preview`（origin、width、height、rgb_sha256）和
+`cli_frame_rgb_sha256`，分别记录条件图与真正的视频起点。原source/worker身份、
+CLI proof、起始帧证据和配对归档继续保留。
+
+## 验证与发布边界
+
+本地回归覆盖有/无S0、960×540独立尺寸、不同CLI像素仍复用准备、Qwen预处理与
+输出几何分离、错误尺寸/内容/身份拒绝、零控制帧推进、取消/释放及真实CLI起点检查。
+前端覆盖原尺寸预取、超限预检、上传顺序和legacy无startup行为。
+
+本轮用户仅授权代码实现，不部署、不提交云作业、不修改现有slot。GPU/NCCL/性能、
+新语义下的真实RTC与画质尚未验证，不引用v1数据作为v2通过结论。未来部署须匹配
+前端、Room和worker的v2能力，不能将新请求发送给仅支持v1的worker。

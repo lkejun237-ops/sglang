@@ -1027,3 +1027,112 @@ def test_raw_rgb_realtime_output_adapter_can_send_jpeg_preview_frames():
     assert frame_payload.startswith(b"\xff\xd8")
     assert stats["num_batches"] == 1
     assert stats["num_frames"] == 1
+
+
+@pytest.mark.parametrize("cancel_after_first", [False, True])
+def test_progressive_rgb_is_sent_before_later_parts_are_ready(
+    monkeypatch, tmp_path, cancel_after_first
+):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.decoder_worker import (
+        _OutputPublisher,
+    )
+    from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
+        PixelRange,
+        Provenance,
+        SourceSpan,
+    )
+
+    monkeypatch.setenv(SHARED_MEMORY_DIR_ENV, str(tmp_path))
+    publisher = _OutputPublisher(timeout_seconds=5)
+    reference = publisher.reserve(
+        frames=5,
+        width=2,
+        height=1,
+        identity=dict(
+            request_id="req-0",
+            chunk_index=0,
+            session_id="session-1",
+            generation_id="generation-1",
+        ),
+        frame_slices=[1, 4],
+    )
+    provenance = Provenance(PixelRange(0, 5), (SourceSpan(1, 0, 0, 5),), 5)
+    batch = SimpleNamespace(
+        block_idx=0,
+        request_id="req-0",
+        width=2,
+        height=1,
+        enable_upscaling=False,
+        realtime_event_id=3,
+        realtime_prompt_version=2,
+        realtime_trace_id="trace-progressive",
+        realtime_output_format="raw",
+        fps=24,
+        realtime_preview_max_width=None,
+        output_compression=None,
+        extra={
+            "zing_source_output_blocks": [
+                dict(
+                    block_idx=0,
+                    request_id="req-0",
+                    event_id=3,
+                    prompt_version=2,
+                    provenance=provenance,
+                    **provenance.metadata(),
+                )
+            ]
+        },
+    )
+    result = OutputBatch(
+        raw_frame_shared_memory_ref=reference,
+        raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
+        raw_frame_metadata=dict(
+            format="rgb24", width=2, height=1, channels=3, bytes_per_frame=6
+        ),
+    )
+    session = SimpleNamespace(
+        id="session-1", generation_id="generation-1", trace_id="trace-progressive"
+    )
+
+    async def run():
+        class Socket:
+            def __init__(self):
+                self.payloads = []
+                self.first = asyncio.Event()
+
+            async def send_bytes(self, payload):
+                self.payloads.append(payload)
+                if len(_unpack_frame_batch_messages(self.payloads)) == 1:
+                    self.first.set()
+
+        ws = Socket()
+        task = asyncio.create_task(
+            RawRGBRealtimeOutputAdapter().send(ws, session, result, batch)
+        )
+        publisher.publish_slice(reference, 0, torch.zeros(1, 3, 1, 1, 2))
+        await asyncio.wait_for(ws.first.wait(), 2)
+        assert not task.done()  # Remaining latent has deliberately not decoded.
+        if cancel_after_first:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert all(Path(p["cancel_path"]).exists() for p in reference["parts"])
+            publisher.fail(reference, RuntimeError("cancelled"))
+        else:
+            publisher.publish_slice(reference, 1, torch.ones(1, 3, 4, 1, 2))
+            stats = await asyncio.wait_for(task, 2)
+            messages = _unpack_frame_batch_messages(ws.payloads)
+            assert [h["num_frames"] for h, _ in messages] == [1, 4]
+            assert [h["output_frame_start"] for h, _ in messages] == [0, 1]
+            assert all(
+                h["event_id"] == 3 and h["prompt_version"] == 2 for h, _ in messages
+            )
+            assert messages[0][1] == bytes(6) and messages[1][1] == bytes([255]) * 24
+            assert stats["num_frames"] == 5
+        assert result.raw_frame_shared_memory_ref is None
+
+    try:
+        asyncio.run(run())
+    finally:
+        publisher.close()
+    assert not any(tmp_path.iterdir())

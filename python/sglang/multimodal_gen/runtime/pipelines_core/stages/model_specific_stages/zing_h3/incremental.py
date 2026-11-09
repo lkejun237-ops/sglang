@@ -62,6 +62,8 @@ class PromptSnapshot(NamedTuple):
     event_id: int | str | None
     prompt_version: int | None
     inputs: H3InferenceInputs | None = None
+    reuse_prefix: bool = False
+    base_event_id: int | str | None = None
 
 
 class SourceReadySession:
@@ -189,6 +191,7 @@ class SourceReadySession:
         self.media_origin = None
         self.ended = self.closed = False
         self.draining = False
+        self._drain_continuation = None
         self._drain_tensors = []
         self._drain_continuation = None
         self.audio_enabled = None
@@ -229,10 +232,37 @@ class SourceReadySession:
             inputs,
         )
 
-    def update_prompt(self, condition, event_id, prompt_version=None, *, inputs=None):
+    def update_prompt(
+        self,
+        condition,
+        event_id,
+        prompt_version=None,
+        *,
+        inputs=None,
+        min_source_frame=None,
+        reuse_prefix=False,
+    ):
         if self.closed or self.draining:
             raise ValueError("The source-ready session is closed or draining")
-        candidate = self._snapshot(condition, event_id, prompt_version, inputs)
+        if reuse_prefix:
+            if (
+                condition is not self.prompt.condition
+                or inputs is not None
+                or self.applied_prompt is not self.prompt
+            ):
+                raise ValueError(
+                    "GPU prefix reuse must name the current applied condition"
+                )
+            candidate = PromptSnapshot(
+                condition, event_id, prompt_version, None, True, self.prompt.event_id
+            )
+        else:
+            candidate = self._snapshot(condition, event_id, prompt_version, inputs)
+        if min_source_frame is not None and (
+            type(min_source_frame) is not int or min_source_frame < self.committed_pixel
+        ):
+            raise ValueError("The prompt boundary is no longer available")
+        self.pending_prompt_source_frame = min_source_frame
         self.pending_prompt = candidate
 
     def discard_pending_prompt(self):
@@ -240,6 +270,7 @@ class SourceReadySession:
         if self.closed or self.draining:
             raise ValueError("The source-ready session is closed or draining")
         self.pending_prompt = None
+        self.pending_prompt_source_frame = None
 
     def update_sink(self, operation, event_id):
         """Latest-wins intent; previously queued chunks finish under the old policy."""
@@ -300,13 +331,18 @@ class SourceReadySession:
         )
 
     def _next_model_chunk(self):
+        boundary = getattr(self, "pending_prompt_source_frame", None) or 0
         if self.pending:
             # Drain queued work before planning the first block of a new epoch.
             if self.pending_prompt is not None or self.pending_sink is not None:
                 return None
             previous = self.pending[-1].model_chunk
             return self.plan.chunk(previous.chunk_id + 1)
-        if self.pending_prompt is not None and self.prompt_switch_ready:
+        if (
+            self.pending_prompt is not None
+            and self.prompt_switch_ready
+            and self.committed_pixel >= boundary
+        ):
             return self.plan.chunk(self.prompt_prefix_chunk_count)
         return self.plan.chunk(self.model_chunk_id)
 
@@ -330,17 +366,58 @@ class SourceReadySession:
         if (
             self.pending_prompt is None
             or not self.prompt_switch_ready
+            or self.committed_pixel
+            < (getattr(self, "pending_prompt_source_frame", None) or 0)
             or ready.chunk.start % 5 != 0
             or ready.model_chunk.chunk_id != self.prompt_prefix_chunk_count
             or ready.model_chunk.start != 5
         ):
             return
+        self._rebuild_pending_prompt(defer_prefix=defer_prefix)
+
+    def activate_prompt_at_source_boundary(self, boundary):
+        """Rebuild an admitted condition without needing a future source chunk.
+
+        The source adapter has fenced admission at a full codec clip. Only
+        already committed history is used; global source and RNG cursors stay
+        unchanged. A failed destructive rebuild closes the session.
+        """
+        if (
+            self.closed
+            or self.ended
+            or self.draining
+            or self.pending
+            or type(boundary) is not int
+            or boundary < 1
+            or self.committed_pixel != boundary
+            or self.next_pixel != boundary
+            or self.committed_latent != self.next_latent
+            or self.next_latent % 5 != 0
+            or self.pending_prompt is None
+            or not self.prompt_switch_ready
+        ):
+            raise ValueError("The condition switch boundary is not ready")
+        try:
+            self._rebuild_pending_prompt()
+        except BaseException:
+            self.dispose()
+            raise
+        return dict(
+            event_id=self.prompt.event_id,
+            prompt_version=self.prompt.prompt_version,
+            source_frame_index=boundary,
+        )
+
+    def _rebuild_pending_prompt(self, *, defer_prefix=False):
         if self.audio_enabled:
             raise ValueError("Prompt switching currently supports video-only sessions")
         candidate = self.pending_prompt
         policy = self.cache.window_policy
         count = policy.sink_chunks
-        if self._sink_ready(ready):
+        if (
+            self.pending_sink is not None
+            and self.committed_chunk_id > self.pending_sink[2]
+        ):
             operation, self.sink_event_id, _ = self.pending_sink
             count = 2 if operation == "refresh" else 0
             self.pending_sink = None
@@ -354,9 +431,56 @@ class SourceReadySession:
             if self.prepare_prompt_prefix is None
             else self.prepare_prompt_prefix(candidate)
         )
-        if (
+        reuse = candidate.reuse_prefix
+        error = None
+        if reuse:
+            try:
+                if (
+                    candidate.base_event_id != self.prompt.event_id
+                    or candidate.condition is not self.prompt.condition
+                ):
+                    raise ValueError(
+                        "Resident prefix condition changed before application"
+                    )
+                packs, _, _ = self.sampler.pack_prompt_prefix(
+                    inputs, candidate.condition, self.recent_visual
+                )
+                host = self.sampler._layout_index(packs[0]).host
+                prefix = self.cache.validate_prefix_reset()
+                if (
+                    prefix is None
+                    or prefix.host_positions is None
+                    or not torch.equal(prefix.host_positions, host["position_ids"])
+                ):
+                    raise ValueError(
+                        "Resident prefix geometry differs from the rebuilt layout"
+                    )
+            except Exception as exc:
+                error = exc
+        self.sampler._agree_sp_boundary(
+            self.cache,
+            0,
+            phase="resident_prefix_prepare",
+            ready_route=(reuse,),
+            precheck_error=error is not None,
+            local_error=error,
+        )
+        if error is not None:
+            raise error
+        if reuse:
+            origin, latent_end = self.sampler.rebuild_prompt_prefix(
+                inputs,
+                candidate.condition,
+                self.recent_visual,
+                self.cache,
+                reuse_prefix=True,
+            )
+            self.metrics["gpu_prefix_reuses"] = (
+                self.metrics.get("gpu_prefix_reuses", 0) + 1
+            )
+        elif (
             defer_prefix
-            and (self.prompt_joint or self.prefix_loader is not None)
+            and (self.prefix_loader is not None or self.prompt_joint)
             and (restore_prefix is None or self.sampler.joint_forward == "cross_chunk")
         ):
             prepared, error = None, None
@@ -396,7 +520,7 @@ class SourceReadySession:
                 self.cache,
                 **({"restore_prefix": restore_prefix} if restore_prefix else {}),
             )
-        if latent_end != ready.model_chunk.start:
+        if latent_end != 5:
             raise ValueError("Prompt-switch prefix does not meet the next model block")
         if candidate.inputs is not None:
             self.inputs = copy(candidate.inputs)
@@ -405,9 +529,10 @@ class SourceReadySession:
         self.prompt = self.applied_prompt = candidate
         if self.pending_prompt is candidate:
             self.pending_prompt = None
+            self.pending_prompt_source_frame = None
         self.media_origin = origin
-        self.model_chunk_id = ready.model_chunk.chunk_id
-        self.epoch_chunk_base = ready.chunk.chunk_id - ready.model_chunk.chunk_id
+        self.model_chunk_id = self.prompt_prefix_chunk_count
+        self.epoch_chunk_base = self.committed_chunk_id - self.prompt_prefix_chunk_count
 
     def _load_prefix(self, inputs, prompt, prefix, *, restore_prefix=None):
         """Consume an external writer's prefix at a quiescent session boundary.
@@ -541,7 +666,8 @@ class SourceReadySession:
                 )
                 sampler._forward(packed, cache, "final")
             reasons = self.metrics.setdefault("prompt_joint_fallbacks", {})
-            reasons["unsupported_layout"] = reasons.get("unsupported_layout", 0) + 1
+            if self.plan.split_first_latent:
+                reasons["unsupported_layout"] = reasons.get("unsupported_layout", 0) + 1
             return None
         error = None
         try:
@@ -781,6 +907,8 @@ class SourceReadySession:
             raise ValueError("The source-ready session is closed or draining")
         if self.defer_final:
             raise ValueError("Deferred final requires drain_ready execution")
+        if self._drain_continuation is not None:
+            raise ValueError("Prepared continuation requires drain_ready execution")
         try:
             self._agree_ready_route("step")
             if not self.pending:
@@ -1071,10 +1199,16 @@ class SourceReadySession:
             raise ValueError("max_outputs must be a positive integer")
         if self.closed or self.draining:
             raise ValueError("The source-ready session is closed or draining")
+        if max_outputs is not None and (
+            type(max_outputs) is not int or max_outputs < 1
+        ):
+            raise ValueError("Output limit must be a positive integer")
         self.draining = True
-        finished = False
+        finished, emitted = False, 0
         try:
-            self._agree_ready_route("drain_entry")
+            self._agree_ready_route(
+                "drain_entry", first_prediction=self._drain_continuation is not None
+            )
             if not self.pending:
                 self._drain_continuation = None
                 finished = True

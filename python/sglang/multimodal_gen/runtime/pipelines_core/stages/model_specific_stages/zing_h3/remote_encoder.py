@@ -28,13 +28,19 @@ from sglang.multimodal_gen.runtime.utils.zing_capture_stream import (  # noqa: F
     remote_encoder_stream,
 )
 
-logger = init_logger(__name__)
+from .encoder_peer import EncoderPeer
 from .encoder_recovery import request_abort
 from .encoder_transport import bridge_group, receive_moments
 from .media_geometry import SourceGeometry
 from .progressive_encoder import PROGRESSIVE_ENCODER_VERSION, EncoderStateUsage
 from .streaming_codecs import CodecSlice
 
+logger = init_logger(__name__)
+
+# A complete clip17 yields three progressive moment slices (1/2/2 latents).
+# Keep the final slice ahead of the consumer, without extending the input or
+# session budgets. Serial mode still grants only one operation on demand.
+ENCODER_RESULT_SLOTS = 3
 _PERSISTENT_ENCODER_BRIDGES: dict[int, tuple[str, Any, Any]] = {}
 _DYNAMIC_ENCODER_PORTS: list[int] | None = None
 
@@ -219,6 +225,18 @@ class RemoteEncoderSession:
         )
 
         self.codecs, self.config = codecs, dict(config)
+        self.peer = EncoderPeer(
+            **{
+                key: config[key]
+                for key in (
+                    "host",
+                    "bridge_host",
+                    "auth_token_file",
+                    "node_binding_file",
+                )
+                if key in config
+            }
+        )
         geometry = config.get("source_geometry")
         self.source_geometry = None if geometry is None else SourceGeometry(**geometry)
         self.resize_host_ms = 0.0
@@ -280,7 +298,7 @@ class RemoteEncoderSession:
         self.commands = queue.Queue(maxsize=capacity_frames + 1)
         # A clip boundary can leave an 8-frame slice followed by the new
         # clip's first frame. Admit the next 8 frames before either is popped.
-        result_slots = 3 if self.mode == "overlap" else 2
+        result_slots = ENCODER_RESULT_SLOTS if self.mode == "overlap" else 2
         self.results = queue.Queue(maxsize=result_slots)
         self.permits = threading.Semaphore(
             result_slots if self.mode == "overlap" else 0
@@ -456,7 +474,7 @@ class RemoteEncoderSession:
             socket.setsockopt(zmq.LINGER, 0)
             socket.setsockopt(zmq.RCVTIMEO, self.timeout * 1000)
             socket.setsockopt(zmq.SNDTIMEO, self.timeout * 1000)
-            socket.connect(f"tcp://127.0.0.1:{self.port}")
+            socket.connect(f"tcp://{self.peer.host}:{self.port}")
         admission = None
         if self.admission_endpoint:
             admission = context.socket(zmq.PULL)
@@ -471,7 +489,11 @@ class RemoteEncoderSession:
         def rpc(op, payload=None, **fields):
             nonlocal rpc_in_flight
             request = dict(
-                op=op, session=self.token, profile_dir=self.profile_dir, **fields
+                op=op,
+                session=self.token,
+                profile_dir=self.profile_dir,
+                **self.peer.fields(),
+                **fields,
             )
             parts = [json.dumps(request).encode()]
             if payload is not None:
@@ -500,7 +522,7 @@ class RemoteEncoderSession:
             )
             if not use_pool:
                 store = dist.TCPStore(
-                    "127.0.0.1",
+                    self.peer.bridge_host,
                     0,
                     2,
                     True,
@@ -510,6 +532,7 @@ class RemoteEncoderSession:
                 open_attempted = True
                 opened_reply = rpc(
                     "open",
+                    bridge_host=self.peer.bridge_host,
                     bridge_port=store.port,
                     capacity_frames=self.capacity_frames,
                     stage_timing_dir=self.stage_timing_dir,
@@ -590,6 +613,7 @@ class RemoteEncoderSession:
                                 op="bridge_open",
                                 session=self.token,
                                 bridge_id=bridge_id,
+                                bridge_host=self.peer.bridge_host,
                                 bridge_port=store.port,
                             )
                             rpc_in_flight = True
@@ -811,6 +835,8 @@ class RemoteEncoderSession:
                     self.token,
                     self.timeout,
                     require_restart=data_operation_active,
+                    host=self.peer.host,
+                    auth_fields=self.peer.fields(),
                 )
                 if not (
                     self.recovery.get("released")
@@ -883,7 +909,7 @@ class RemoteEncoderSession:
             self.buffered_frames, self.prefetched_frames - self._consumed
         )
         raw = retained_frames * 3 * math.prod(self.signature or (0, 0))
-        # Remote layer caches plus the two completed moments slots. The raw
+        # Remote layer caches plus the bounded completed moments slots. The raw
         # budget conservatively includes inputs already transferred remotely.
         with self.results.mutex:
             queued = sum(v.numel() * v.element_size() for _, v in self.results.queue)

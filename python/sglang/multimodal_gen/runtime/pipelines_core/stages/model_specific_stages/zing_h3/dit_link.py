@@ -10,6 +10,7 @@ import asyncio
 from contextlib import nullcontext
 
 from sglang.multimodal_gen.runtime.realtime.polling_task_queue import PollingTaskQueue
+from sglang.multimodal_gen.runtime.realtime.source_prepare import PROTOCOL, V2_PROTOCOL
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 from .source_bridge import source_pixel_end
@@ -124,7 +125,14 @@ class DiTLinkClient:
             generation_id=self.owner[1],
             **fields,
         )
-        if not self.async_inputs or kind in ("source.end", "session.cancel"):
+        if (
+            not self.async_inputs
+            or kind in ("source.end", "session.cancel")
+            or kind == "conditioning"
+            and fields.get("source_boundary") is not None
+            or kind == "conditioning"
+            and fields.get("source_prepare") is not None
+        ):
             return self.exchange(message)
         try:
             message["transfer_id"] = self.sequence
@@ -156,11 +164,11 @@ class DiTLinkClient:
 
     def release(self, session_id):
         if self.owner is not None and session_id == self.owner[0]:
-            try:
-                self.send("session.cancel")
-            finally:
-                self.owner = None
-                self.async_inputs = False
+            self.send("session.cancel")
+            # A failed cancel is still an owned, unconfirmed session. A retry
+            # must not become a no-op and falsely acknowledge GPU cleanup.
+            self.owner = None
+            self.async_inputs = False
 
     def disconnect(self):
         """Close this link without terminating the remote model worker."""
@@ -321,6 +329,20 @@ class DiTInputService:
                         item = self.decoder.output(result, self.current_message, item)
                     try:
                         self.channel.send(item)
+                        take = getattr(self.worker, "take_cache_report", None)
+                        report = (
+                            take(result.prompt_event_id) if take is not None else None
+                        )
+                        if report is not None:
+                            self.channel.send(
+                                dict(
+                                    type="model.cache",
+                                    session_id=identity[0],
+                                    generation_id=identity[1],
+                                    transfer_id=self.current_transfer,
+                                    usage={"zing_block0_cache": report},
+                                )
+                            )
                     except BaseException:
                         if item.get("reference") is not None:
                             from sglang.multimodal_gen.runtime.utils.realtime_video import (
@@ -343,6 +365,17 @@ class DiTInputService:
                             getattr(
                                 getattr(self.decoder, "remote", None), "oneway", False
                             )
+                        ),
+                        **(
+                            {
+                                "source_condition_switch_protocol": "clip-barrier-v1",
+                                "source_prepare_protocols": [
+                                    PROTOCOL,
+                                    V2_PROTOCOL,
+                                ],
+                            }
+                            if getattr(self.worker, "supports_condition_barrier", False)
+                            else {}
                         ),
                         **(
                             {"output_attachment": self.decoder.remote.output_attachment}
@@ -411,6 +444,24 @@ class DiTInputService:
                         session_id=self.owner[0],
                         generation_id=self.owner[1],
                         **notice,
+                    )
+                ready = getattr(self.worker, "condition_ready", None)
+                if ready is not None:
+                    self.worker.condition_ready = None
+                    reply(
+                        "conditioning.ready",
+                        session_id=self.owner[0],
+                        generation_id=self.owner[1],
+                        **ready,
+                    )
+                prepared = getattr(self.worker, "condition_prepared", None)
+                if prepared is not None:
+                    self.worker.condition_prepared = None
+                    reply(
+                        "conditioning.prepared",
+                        session_id=self.owner[0],
+                        generation_id=self.owner[1],
+                        preparation=prepared,
                     )
                 if self.worker.complete:
                     if self.decoder is not None:

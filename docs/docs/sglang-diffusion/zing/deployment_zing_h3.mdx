@@ -8,6 +8,111 @@ description: "供 Codex 与部署同学使用的 H100/H200/B300 部署决策、�
 下面是已有部署经验，只有对应版本、输入和配置的实测结论；
 实验补丁、显存快照、未验收画质均单独标注。新部署先选择一行，再沿证据入口取得原配置。
 
+## Whitebox 主线整合与 KV 配置迁移（2026-11-08，候选待验证）
+
+本轮将 `main@4e20c16008`（私有捕获 stream、边界图策略与共享 KV 预算）合入
+`white_box@af9ea3bf31`，保留同条件 GPU Prefix 复用、运维定时刷新、受管 Prefill
+和玩家生命周期接口。这是11月8日的历史整合记录；11月9日起正式发布使用远端 `main` 的完整 SHA 与固定 SDK，不从white_box部署。
+
+新版拒绝 `zing_kv_pool_size/max_target_area/max_target_long_edge/max_prefix_rows`
+四项旧容量字段。部署须移除这些字段，按显存预算提供 `mem_fraction_static`；不能
+把旧 JSON 原样用于新 runtime。每 Worker 单玩家、区域 source/target 分辨率、精度、
+Sink 策略及 L1/L2 预算仍按已冻结配置明确传入，不以合并变更自动扩容。
+
+本候选尚未完成 CPU 集成、GPU 或线上验收。主线历史 480/H100 结果不证明
+泰国 480 输入/736 输出、B300、FP8 的新组合通过；合并后的功能、画质和性能分别报告。
+
+## 相同条件刷新与 GPU Prefix 复用（2026-11-06，代码候选，未部署）
+
+基于 `white_box@8b7d81ac86` 整合新 Prefill 后，相同已生效 Prompt 且省略参考图更新时，
+原 `prompt.update` 可保留本会话 GPU 静态 Prefix，跳过条件编码与静态 KV 的 CPU→GPU
+恢复；最近五个生成 latent 的历史重建仍需计算。条件变化、显式参考图更新及身份不匹配
+继续走原路径；SP ranks 一致确认后才复用。该结果标记为 `resident_gpu_prefix`，不是 L1 hit。
+
+Room 运维配置支持 `interval_seconds=0` 关闭、`5` 表示生效后等待约五秒再于安全边界
+刷新当前条件；不增加客户端接口、模型 Slot 或共享世界暂停。Prefill、切段、真实条件
+更新和退出沿现有串行边界结算。完整配置及生命周期说明见
+[Condition 刷新契约](/docs/sglang-diffusion/zing_h3/specs/whitebox-condition-refresh)。
+
+本地 Room/Prefill 集成 258 项通过，缓存/源会话/CPU Graph 模拟及 Encoder–DiT 链路
+1013 项通过、18 项跳过；这些不是 CUDA Graph/SP 验收。480/736 的抗漂移画质、FPS、
+TTFF/E2E/TPOC/ICL，以及 Encoder（Qwen/reference/source）、DiT、Decoder 的分项耗时
+与显存尚未测量；需在获准的真实链路短测中核对，再按需补充同条件性能矩阵。
+不能从跳过静态恢复推断整体刷新没有停顿或长期画质已改善。
+
+## 多实例缓存容量修复（2026-11-06，代码候选，未部署）
+
+本次基于 `white_box@f389c2c3b8` 实现同机多实例 L1/L2 容量管理，保持每个 Worker
+最多一个活跃 PlayerSession。没有改变模型计算、缓存 key、磁盘格式或客户端接口。
+
+- L1：用同机共享的内核锁记录各 rank 预算；实例额度的 95% 用于分页 KV，5% 留给条件快照。
+  正在写盘或 DMA 使用的页不回收；空间暂不可用时跳过可选缓存填充，不阻塞当前推理等待磁盘。
+  条目卸载后页在实例内复用。PyTorch 可能保留锁页内存，因此整份实例预算在进程退出后才归还机器。
+- L2：同一文件系统共享预算，计入历史目录、临时文件和未完成写入；写前原子预留，后台写入有界。
+  多实例可开启 GC，每轮只有一个持锁回收者；活跃读写条目受保护，进程死亡留下的文件仍计费，
+  只有实际删除才释放磁盘占用。未登记的历史目录只计量、不自动删除。
+- 两地配置模板启用 GC，L2 总预算 700 GB，630 GB 开始回收、目标 560 GB，另保留 128 GB
+  文件系统空闲空间；在途写入总预算 128 GB，最多两个不同 key 写入组。以上均为十进制 GB。
+  L1 机器总预算保持 416 GB；新增实例必须在此总量内划分额度，不能每个实例各分配 416 GB。
+- 模型角色日志轮转为每角色 64 MiB × 4；有界队列持续排空子进程日志，磁盘错误只丢弃诊断。
+  这不替代其他应用日志或录像文件的保留策略。
+
+所有实例必须挂载同一份本机容量目录和 L2 根目录。软件预留只约束使用此实现的写入者；
+其他训练任务仍可消耗同盘空间，因此运行中每块写入也检查实际余量。配置冲突拒绝启动，
+不使用超时抢占活跃进程的预算。GPU 异常保留人工恢复，不自动重启整组模型。
+可选的 `deploy/whitebox/instance_capacity.py` 用实测显存 profile 做同 GPU 多实例启动准入，
+不是 GPU 调度器，也不会自动提高线上并发。参数与使用边界见
+[缓存管理部署契约](/docs/sglang-diffusion/zing/specs/block0-cache-management-api#64-机器容量与多实例启动)。
+
+本次仅完成本地 CPU 契约与真实进程/文件锁测试；CUDA 锁页分配、SP collective、同 GPU 多实例
+实测峰值、480/736 的 FPS/输入延迟/画质以及线上端到端均未验收。
+5% 条件快照预留会减少 L1 可用 KV 页数；新增文件计量和锁竞争可能影响 L2 读取/恢复时间，
+不能引用本页历史 GPU 数据声称本修复无性能退化。
+
+## Whitebox 三玩家录制预算（2026-11-04）
+
+`f8681136b2` 的 Room 录制进程上限为 6，三玩家配置的 9 会在启动时拒绝；
+原 96 MiB RGB 总预算也不足以同时保留三玩家各自源流及新旧段的全部 RGB 队列。
+本修复将进程硬上限扩为 9，并增加 `WHITEBOX_STREAM_ARCHIVE_RGB_BYTES`，
+默认仍为 96 MiB、允许 32–512 MiB。上海三路 832×480 目标配置为 9 进程和
+192 MiB RGB 总预算，保留每队列帧数/字节上限、单玩家模型绑定及归档故障隔离。
+两路过渡部署继续使用 6 进程和原 96 MiB，不将三路配置强塞给旧镜像。
+CPU 检查覆盖三玩家源流与新旧段共 15 个 RGB 队列、总预算耗尽和完整回收；
+本修复的真实三路录制、480/736 FPS/输入延迟以及 Encoder/DiT/Decoder
+分项性能和显存尚待验收，不能从预算检查推导通过。完整结果记录在本修复 PR。
+
+2026-11-09 上海 PAI OverlayFS：首次 Prefill 前后缓存目录的 `st_ino` 发生变化，
+导致 L2 的目录替换保护拒绝读写。StorageBudget 现在持有注册目录的打开句柄，
+在预算实例销毁时释放，保持运行期 inode 引用；实际目录替换仍拒绝，禁止自动改写旧登记。
+不支持将已失去全部打开引用的旧 OverlayFS 登记当作永久磁盘身份；重启后仍须校验。
+这是缓存文件系统兼容修复，不改变模型、容量和采样。CPU 回归与 GPU 复测状态见本次 PR；
+GPU 落盘和性能仍待实测，不能引用旧结果作为通过。
+
+独立 DiT 入口同时补齐已有的 `--zing-block0-cache-storage mounted|local`，
+默认仍要求真实挂载。PAI 作业使用已核对的本地磁盘时需显式选择 `local`，
+部署层在加载权重前创建目录、检查磁盘余量并调用原 `startup_config` 校验；
+不会以创建空目录冒充持久挂载。本地 L2 随作业退出可能丢失，迁移前需保全缓存，
+不能把旧作业的 OSS 备份说成新服务已召回的 L2。
+
+## 四卡人工发布的 FP8 配置（2026-11-04）
+
+同一发布配置支持 source `832×480`、target `1280×736`：CLI 和传入模型的
+source RGB 保持原始尺寸，独立 `model.width/height` 只控制模型输出；Room
+按对应尺寸编码、配对和归档，禁止将 source 放大后冒充原生高分辨率输入。
+736 配置同时需要扩大 GPU KV pool 的 target area/long edge；不能只修改网页标签。
+当前候选 CPU 混合尺寸与真实 H264 契约检查通过，step2000/FP8 的736 GPU性能、
+长期画质和浏览器验收尚待本轮发布后验证，历史736数据不作为本轮通过证据。
+
+正式 `deploy/whitebox` 策略可选择 `model.quantization="fp8"` 和
+`model.quantization_scope="ffn-attention"`；默认 `none` 及无该字段的历史 bundle
+保持 BF16。仅 DiT 追加 `--quantization fp8 --direct-gpu-weight-loading false`，
+Encoder/Qwen、Decoder、单玩家容量及原四卡布局不变，KV 不量化。
+CPU 回归覆盖参数、scope、配置摘要变化与旧 bundle 兼容。本次新 step002000
+模型和量化组合的 480/736 FPS、TTFF、画质及 Encoder/DiT/Decoder 分项耗时和显存
+尚待 GPU 验证；不沿用历史 736p 结果，也不将本轮 480p 外推为 736p 已验收。
+
+2026-11-03 动态 Sink 实现基于 `0a4623e129`：缺省 Sink 对齐为两个原生块（unsplit `[3,2]` 下为 5 latent）。显式历史 profile 的 S3 保持原值；启用 `sink.off` / `sink.refresh` 需将 profile 与 KV pool 的启动 Sink 同设为 2（或以 off 启动时同设为 0），并满足 W≥4。仅调整策略与压紧已有 KV，允许在边界单独完成 deferred final，相关停顿和 forward 调用需实测。W6/S2 的 `after_step0` 预分配峰值不因锚点减少而自动下降，不能据此声称解决 736 OOM。冻结运行版本 `d87d75fb16` 已完成 H100 SP2 eager 与 B300 SP1 的 832×480 / 1280×736 功能验证（B300 480 开启 Graph、736 采用 eager）；单次 off/refresh 各多 1 次 deferred-final forward，source/prefix 计算次数不增加。完整产品性能矩阵未测；提 PR 前整合 `main@a9a4b2f93e` 后的首次联合 forward + sink 组合尚未重跑 GPU，CPU 集成回归以 PR checks 为准。源码身份、原始回执、视频及显存口径见 [动态 Sink 验收记录](specs/dynamic-window-sink.validation.zh-CN.md)。
+
 2026-11-03 动态 Sink 实现基于 `0a4623e129`：缺省 Sink 对齐为两个原生块（unsplit `[3,2]` 下为 5 latent）。显式历史 profile 的 S3 保持原值；启用 `sink.off` / `sink.refresh` 需将 profile 与 KV pool 的启动 Sink 同设为 2（或以 off 启动时同设为 0），并满足 W≥4。仅调整策略与压紧已有 KV，允许在边界单独完成 deferred final，相关停顿和 forward 调用需实测。W6/S2 的 `after_step0` 预分配峰值不因锚点减少而自动下降，不能据此声称解决 736 OOM。冻结运行版本 `d87d75fb16` 已完成 H100 SP2 eager 与 B300 SP1 的 832×480 / 1280×736 功能验证（B300 480 开启 Graph、736 采用 eager）；单次 off/refresh 各多 1 次 deferred-final forward，source/prefix 计算次数不增加。完整产品性能矩阵未测；2026-11-06 整合 `main@b9e4bc95fc`（含共享静态 KV 容量、独立服务收尾及 VAE 优化）后的 sink 组合尚未重跑 GPU，CPU 集成回归以本次提交的 PR checks 为准。源码身份、原始回执、视频及显存口径见 [动态 Sink 验收记录](specs/dynamic-window-sink.validation.zh-CN.md)。
 
 ## 实例卡顿回归接入（2026-11-07）
@@ -186,17 +291,19 @@ host cache off；source 832×480，输出分别 832×480／1280×736，共享容
 按实际行数占页、整条 LRU 淘汰。管理接口删除 `capacity`，中台改用页数/字节字段。
 GPU KV 池和 L2 文件格式不变；这是 L1 预算利用率改动，不降低预分配预算或 GPU 常驻显存。
 本轮进一步改为同层页连续布局、占用表升序扫描和连续段 DMA；保持 2048 行页与单 copy stream。
-当前改动的完整 CPU CI、独立 D2H 微基准及逐页版同条件性能对照仍待执行。
-2026-11-02，`d71ce75fae`的 H100 单卡 H2D／L2→L1 组件回归通过：
-2855/4886/12288/40960 行 × 1024/2048 行页，共 8 格，每格预热 2 次、正式 5 次，尾部 guard 通过。
-这是 warm-cache 读取，不是冷 NVMe 或模型端到端性能结论；回执见下文独立 worker 缓存适配的证据目录。
-原 192 GiB 容器主存上限触发 OOMKilled，提高到 384 GiB 后同配置通过；没有 GPU OOM。
+当前改动的 CPU CI 与单卡 H2D/D2H 组件验证待执行，旧逐页版结果不作为本轮性能结论。
 `fa171b20ee` 的完整 CPU CI 与缓存专项均通过（run 41410737009 / 41410736946）。
 H100 目标（实际 L20Z）的限时单卡 H2D／L2→L1 组件执行与结果见 [PR #499](https://github.com/seedleap/sglang/pull/499)；
 480/736 端到端及 Encoder/DiT/Decoder 性能显存矩阵仍未验证。
 候选保持 Draft，完整验收项与组件入口见[分页方案](/docs/sglang-diffusion/zing/plans/BLOCK0_PAGED_L1)。
 
 ## Block0 Mooncake 后端候选（默认关闭）
+
+2026-11-09 的 `white_box` / `main` 合并保留 local 共享容量、L2 写前预留与 GC 保护，
+Mooncake 继续使用独立共享内存后端；启动配置、Prefill 回执和恢复监控按后端区分。
+local 页数统计不套用到 Mooncake，无 CUDA 恢复事件时不填 GPU 计时。
+本次组合只进行 CPU 合约回归，未部署；480/736 的同条件 E2E、Encoder/DiT/Decoder
+延迟、常驻/峰值显存及画质仍未验证，不能沿用下方历史实验数字宣称无退化。
 
 **本 PR 只提供可选后端，业务适配与上线启用尚未确认。** 默认
 `--zing-block0-cache-backend local`，保留原版 pinned 页池、磁盘 L2、文件索引和既有配置。
@@ -263,6 +370,71 @@ L2 list/delete/clear 返回 HTTP 501；preload 只检查共享完整性；unload
 与连续 source 的播放/尾排空指标没有本 PR 的有效数据。待业务适配确认和独立测试窗口后，
 按真实产品集合及完整组件矩阵补验，不在本 PR 自动启用或替业务做兼容转换。
 
+### Whitebox 恢复回执兼容（2026-11-03）
+
+`white_box` 的 `5d7e71a87a` 在独立 H100 四卡、832×480、三参考图下完成了
+Prefill、多组 L1 与本地 L2 预加载功能检查，但缓存命中后的首个 RGB 请求因旧监控
+读取原生 `PrefixRestore` 不具备的 `consumer_end` 而失败。本次仅改为读取原生
+H2D begin/end 事件；不增加 GPU 同步，也不伪造缺失的 consumer-wait 耗时。
+原生恢复对象的 L1/L2 回执、版本隔离和未完成 DMA 回归均由 CPU 合约验证；
+修复后的实际视频、480/736 性能/画质与逐组件显存仍待复测，不沿用之前的失败场次作为通过。
+
+## Whitebox 两地统一源码与人工发布（2026-11-02）
+
+2026-11-09，PR647候选：SGLang构建/运行/四角色验收统一使用main；Worldkit SDK仍为dev准确pin，
+World Test仍white_box。公共策略两地统一quantum=1、prompt-joint=false、source重叠/预取/异步/
+defer-final开启、AdaLN=resident、W6/S0及1800秒每玩家期限；地区仅保留硬件要求、路径与资源预算。
+四卡E1+Conditioning+SP2+D1资产准备只接受当前原生Decoder服务支持的lynn_streaming/bf16，
+通过真实配置schema验证后生成新view/receipt；旧TAEH3不再作为可启动候选。
+
+本轮离线证据包括发布/迁移契约、SDK准确pin capture/输入租约测试、Docker UID10001归档门禁，
+以及干净Git archive的实际runtime-source阶段构建；不是最终CPU/Room完整镜像或GPU启动证明。
+源码清理使用的实现快照与只读现场证据、模块范围、最终验证结果见
+[PR647清理与边界](/docs/sglang-diffusion/zing/plans/whitebox-pr647-cleanup)。
+
+完整PR仍保留Room/SDK桥接、玩家生命周期/role pool及缓存容量等运行时改动，并非只改部署脚本。
+同条件480和736的TTFF/E2E/FPS/TPOC/ICL、Encoder（Qwen/reference VAE/source VAE）/DiT/Decoder
+延迟中位数/P95及逐rank常驻/峰值显存、画质、真实注册/首帧/取消/下一会话仍未验证。
+当前任务没有新增GPU/部署/重启权限，准确待验证输入和命令见同一清单；这些缺口仍是整体合并验收边界。
+不沿用旧GPU实验或CPU绿作为最终候选通过，也不把上海原table→resident、泰国7200→1800秒等
+策略变化称作无性能/生命周期影响。操作入口见[人工发布手册](/docs/sglang-diffusion/zing/plans/whitebox-manual-releases)。
+
+## World model context 受信适配候选（2026-10-30）
+
+本候选以 `white_box` 的 `bc1e5d18f6c2` 为基线，协议和 owner 边界见
+[受信条件接入](/docs/sglang-diffusion/whitebox/specs/world-model-context)。
+SourceSession 先打开可信源取得 descriptor，再决定是否使用原 PlayStartup；声明
+modelContext 的源等待首个完整 commit 才初始化模型。这也改变了普通 source owner
+原先 CLI/模型并行预热的顺序，**当前版本启动延迟与 TTFF 未验证**，不能声称性能不变。
+模型模式保留原启动意图和 seed，实际首个可解码输出前只计等待预算；EOS 后的
+显式新段仍复用源 seed。模型条件错误与背压只降级模型通路，白模预览继续。
+本次仅完成 CPU mock 条件/启动/清理验证，未部署、未申请 GPU。
+480 与 736 两档的 TTFF/E2E/FPS/TPOC/ICL（中位数/P95、样本数）、Encoder（Qwen、
+参考图 VAE、source VAE）、DiT、Decoder 的耗时和常驻/峰值 allocated/reserved 显存
+及逐 rank A/B 均未测；需要按英伦 benchmark 在同 checkpoint、硬件、输入、精度及
+并行配置下补测完整 baseline/候选报告。下方历史结果仅属于各自固定版本。
+
+## 真正 720p Whitebox 适配边界（2026-10-30）
+
+公开 `720p` 为实际1280×720采集、播放和录制；Whitebox私有模型连接将底部复制补齐到
+1280×736，解码后逐帧裁回720，无缩放。480p保持832×480。协议、源/模型SHA和每Room
+不可变尺寸见[分辨率合同](../zing_h3/specs/whitebox-render-segments.md#public-source-and-private-model-resolution)。
+本轮仅有CPU协议、真实H.264/MP4尺寸与像素裁剪回归；未部署、未运行GPU。
+模型内部仍以736处理不构成性能等价证明：新增CPU复制/裁剪和主机缓冲尚无同条件A/B。
+当前源码480与736的TTFF、E2E、FPS、TPOC、ICL、source→output延迟及Encoder
+（Qwen/reference/source）、DiT、Decoder的中位数/P95与allocated/reserved常驻/峰值
+均未补测，不以历史GPU数据、另一分辨率或CPU通过替代。
+
+## S0 v2 共享接收端兼容候选（2026-10-29）
+
+本候选从原 `bf347fa6108f6` S0 v2 源码与后续 Room 行为恢复原生尺寸条件预览，
+显式保留 v1 消费者；不更换模型、kernel、视频时钟或原有单活跃会话 owner。
+边界与来源见[启动版本说明](plans/shanghai-model-startup-prepare.mdx)。CPU 契约和
+真实 Torch shape/packing 检查不等于 GPU 验收；本候选未部署，480/736 的完整
+TTFF/E2E/FPS/TPOC/ICL、Encoder/DiT/Decoder 中位数/P95 与各阶段显存均未实测。
+需固定 checkpoint、输入、硬件与配置独立补测；下文历史结果不证明本候选性能。
+12 个真实 Torch source_session 用例通过，但 adapter 用例仍因无关 SRT `xgrammar`
+依赖缺失而收集失败（有界测试整体退出码 1）；完整 worker CPU gate 尚未通过。
 ## 736p 部署性能更新（2026-10-30）
 
 以下均为 **1280×736 输出**，全程与首包后 FPS 分列。历史 1312×736/SP4/W21
@@ -385,6 +557,233 @@ Encoder、DiT、Decoder 性能及显存均未测。
 
 1280×736 在相同四卡/SP2/W6S3、单槽/prefix4096的 KV 池预分配时 OOM，未进入生成；480 的 W21/S3 预分配也 OOM。不得把480成功外推到736或W21。原始记录、组件时间和逐rank显存范围见 [PR #483](https://github.com/seedleap/sglang/pull/483)，配置与调用链见 [实现说明](plans/UNSPLIT_PROMPT_PREFIX.md)。
 
+## 同连接 Prefill（2026-10-31，上海已验收）
+
+Room 使用 `WHITEBOX_BOUND_COMPUTE=1` 将模型预留提升为 source 父会话所有权，
+Prefill 与视频段只借用可清理的计算上下文。模型原生缓存键、锁、读写、采样参数不变。
+需要配套模型 `/v1/realtime_video/bound` 及 CLI capture hold/resume；不能只更新 Room。
+旧客户端无 Prefill 的自动启动路径保留，多组条件共享同一真实视频 F0。
+接口与恢复约束见 [同连接 Prefill](../zing_h3/specs/whitebox-control-prefill)。
+
+上海同节点四卡 H200 已发布：模型 endpoint `bb72f98872`，Room `bc6a39a452`，
+冻结 CLI 的最小输入句柄修复 `dd5d8fc4d`。480 浏览器完成 S01/S02/S03 共 616.4 秒，
+9/9 预热达到 memory_ready 并落盘，3/3 场景初始条件实际 L2 命中且 key 一致；
+默认单组预热另测 L1 命中并持续试玩，显示约 23.6 FPS，4 次按键对应呈现帧约 1.26–1.28 秒。
+多场景已保存画质截图；这不是逐像素冷/热一致性证明。L2 lookup Host 实测约 1.80–2.85 秒，
+对应 CUDA restore 约 82–119 ms；不要将两者混作同一口径。普通无 Prefill 路径也通过真实浏览器对照。
+原生写回槽繁忙在已确认计算清理后最多重试两次；World.stop 后必须重新获取输入句柄。
+736、同条件完整性能 A/B、Encoder/DiT/Decoder 分项显存对照未测，不用本轮功能验收替代。
+详细版本、时间窗口与日志截断边界见上面的接口规格验收节；真实源时间戳未扣除加载暂停。
+
+## L1 容量扩展（2026-10-31，两地 480 功能验收）
+
+上海现有四卡 H200 / SP2 / 600 GiB 容器中，仅将 Block0 host budget 调到
+416 GB（十进制），得到五个逻辑槽；模型 endpoint 仍为 `bb72f98872`。
+五个不同条件写入后首个条件仍 L1 命中；本地 Dream Walk 两场景运行 683.6 秒，
+两次在线条件均 L1 命中且 key 与预热一致。工作集峰值约 537.9 GiB，未发生 OOM。
+这验证容量与可用性，不代表性能 A/B；1 秒采样日志只覆盖前 414.6 秒，
+两场景有效窗口平均呈现约 23.0 / 22.6 FPS。736 与组件显存对照未测。
+泰国同一四卡 B300 / 600 GiB 作业也完成 416 GB / 五槽验收：模型 API `47cc3d7d42`，
+Room `5950ea17af`，保持已有 BF16 480、码率、原生缓存读写和 GPU 参数。
+五个不同条件后首组仍 L1 命中；Dream Walk S01/S02 共 242.8 秒，2/2 正式渲染
+L1 命中且 key 匹配，模型呈现均值约 27.9 / 28.5 FPS。8 次按键对应可见模型帧
+P50/P95 为 1377/1826 ms；RTT 中位 147 ms，曾到 448 ms，存在短时帧率下探，
+不能据此宣称全部卡顿解决。两地均无新增 OOM，结束后释放自有会话。
+泰国 7200 秒有效试玩及 preparation 时间预算已恢复原行为，CLI 保留冻结 SDK 的
+capture hold/resume 与 input lease 修复。容量自动回退保留已验证绑定 API，只降低 host budget。
+证据入口：`prefill-capacity-regional-20261031/SUMMARY.json` 及两地验收报告；原生回执、
+浏览器日志、内存采样、失败尝试和截图分别保留。B300 的 L1 仍由 CPU 内存约束，
+不能用显存大小推导容量。本轮为容量/协议功能验收，未完成同条件性能 A/B 或 736 验收。
+
+## KV 读写回归 main（2026-10-30，候选未部署）
+
+按用户要求移除 Prefill 扩展新增的全量 KV SHA-256 与大文件强制 fsync；
+`_write_kv`、`_readinto`、`_read_kv`、`DiskEntry` 与 `main@b65640dd4b` AST 一致。
+保留主线大小/shape/身份/generation 校验、锁、LRU，以及公网 API 的鉴权/上传摘要/计时。
+135 项 CPU 回归通过，包括 BF16/FP32、非连续槽位、旧摘要元数据兼容和错误长度拒绝。
+
+后续本地盘部署新增显式 `--zing-block0-cache-storage local`，保留默认 mounted 的挂载
+缺失保护。部署先创建专用目录并按实际剩余容量设置磁盘预算；原缓存根目录不删除。
+包含本地模式的已有目录、禁止根路径和默认缺失挂载保护后，136 项 CPU 回归通过。
+本地模式不提供共享盘跨实例复用，也不将原 CPFS 缓存自动复制或更改身份后强制命中。
+
+上海现有 H200 容器旁路 CPU 读盘：832×480 的同一份真实 KV，50 层、SP2、
+每 rank 12,125 行 / 8,691,200,000 B。预分配且预触页 CPU 目标，两 rank 依次读完：
+热 CPFS 带校验单次 15.575 s；无校验三次中位数 4.136 s；本地可访问容器卷
+无校验三次中位数 3.143 s。后者未透出物理 NVMe 型号，不能标称 NVMe 裸盘结果。
+两路本地 O_DIRECT 读取合计 3.381 s（复用 8 MiB 对齐缓冲），不是 L1 promotion 或 H2D 时间。
+首次数据访问、热文件缓存和 O_DIRECT 口径分开，不能用首轮 53.586 s 与热轮相除宣称收益。
+
+这些是 IO 微基准，不包含 conditions、生产锁争用、分布式投票、L1 发布、GPU 恢复或
+首帧生成。没有本轮完整 480/736 Encoder/DiT/Decoder 性能、显存和浏览器结果，
+不外推稳态 FPS/按键延迟。冻结脚本及 `cpfs-results.json` / `local-results.json`
+保存在本轮 `prefill-restore-gap-20261030` 证据目录；详见
+[共享缓存 API 的版本边界](/docs/sglang-diffusion/zing/specs/shanghai-prefill-api)。
+
+## Block0 main 合并与上海 CPFS 方案（2026-10-29，历史准备状态）
+
+上海开发分支整合 `main@4adab592c6`，保留 S0 v2 与远端渐进输出；补齐原生预览尺寸的
+缓存 key、API→worker 调度字段，以及 prefill/live 的共同策略。当前本地 macOS CPU
+回归覆盖 19 个文件：1,609 passed、3 个 passing subtests、4 个 CUDA-only skipped。
+随后显式 deferred-final/渐进 q0 兼容补充回归 1,006 项通过（与主回归重叠，不相加）。
+本轮没有部署或 GPU/浏览器测试，不能沿用下方旧版数据作为本次性能与显存结果。
+
+上海 CPFS 已通过官方客户端挂载到 CPU/H100，实际读写、GPU 缓存命中和 H200 挂载验收仍在进行。
+公网 Gateway prefill、租约身份适配、按条目持久化回执和分阶段计时已实现，
+定向本地 CPU 回归 159 项通过；未部署，不能视为实际 GPU/CPFS 性能结果。
+480/736 同条件冷计算、L2/L1 命中及 Encoder/DiT/Decoder 性能、显存仍待测试。
+用户确认仅提供 API、不增加页面按钮，共享根目录不按 slot 隔离。
+锁机制按用户分工交由其他同事负责，本轮保持主线原实现，不新增目录锁或 Redis 缓存索引；
+正常读写与串行跨实例复用验收不代表跨主机并发写入安全。
+
+见[上海 Prefill API、共享 CPFS 与阶段计时方案](/docs/sglang-diffusion/zing/plans/SHANGHAI_PREFILL_CPFS.zh)。
+
+## main 性能功能与 S0 v2：上海发布验证（2026-10-28）
+
+本轮模型运行源码 `bf347fa6108f612240238e92781a5942d740fc32`，整合
+`main@387f693f30`、当前块优先调度 `e58fbcf9f6` 与独立尺寸 S0 v2。
+Room 运行源码 `345caedb1a`，保留发布期间已批准的 CLI `d40a219e`；Web/Node 为
+`cb95275`。Room 后续 SDK pin 合并不改变模型 Python，分别记录真实运行版本。
+使用用户指定的原上海四张 H200（实际 L20X / SM90），单活跃会话、Priority 9、非抢占，
+未创建其他 GPU 作业。BF16、E1 + SP2 + D1、W6/sink3、前三块四步、随后 `[1000,500]`，
+Qwen 六项执行选项保持关闭；不把合入代码等同于启用所有实验开关。
+
+自动分卡 launcher 首次启动被提前初始化 CUDA 的 LLM DeepGEMM import 拦截，已保存失败与回滚证据。
+实际发布使用主线独立 Encoder/Decoder worker 接口，在各 Python 进程 import 前固定设备：
+GPU 0/1 为 DiT，GPU 2 为 E1/Qwen，GPU 3 为 D1。不关闭 CUDA 初始化安全检查。
+启动脚本 `inputs-r2` 与模型源码分别冻结；原 DLC allocation 保留，进程守护恢复同一候选版本。
+整 Pod 重建入口仍属于旧 DLC 作业定义，尚未验证整个 Pod 重建后的新版自动恢复，不能将
+进程级原地更新称为集群滚动发布。
+
+两档分别两次预热、三次 720 帧 paced 正式请求（`30s-wasteland`），均完整返回并正常 EOS：
+
+| 实际尺寸 | 首包后 FPS 中位数（范围） | TTFF / E2E 中位数 | TPOC 中位数 | 每轮 ICL P95 的中位数 |
+| --- | --- | --- | --- | --- |
+| 832×480 | 21.160（21.023–21.199） | 3.502 / 37.481 s | 160.283 ms | 410.153 ms |
+| 1280×736 | 8.943（8.901–8.949） | 3.932 / 84.274 s | 379.225 ms | 988.824 ms |
+
+以上为模型同机回环 RGB 客户端口径，正式轮关闭阶段计时；不是 CLI 启动、浏览器呈现或按键延迟。
+736 功能通过，但不满足 24 FPS 试玩目标，常驻目标仍为 480。
+未跑当前版本与旧版的新鲜同条件 A/B，不以旧表计算本轮收益。
+另跑 Host 阶段诊断与 0.5 秒整卡 driver 显存采样，原始字段按角色/rank 保留。
+480 诊断是恢复服务后的首个请求，包含冷编译/Graph 准备；736 诊断在五次完整请求后执行，
+不能把这两轮诊断作为同状态对照，也不能用其耗时替换上表关闭计时的正式结果。
+Host 调用可包含等待与异步提交；远程 Decoder 客户端 span 不是 D1 CUDA 执行时间，
+Qwen 与 E1 共卡显存不能各自归因。CUDA 分段耗时、各组件独占 allocated/reserved 峰值、
+Qwen 准备阶段完整计时仍未验证，不填零或由其他版本外推。
+
+原尺寸 provided S0 与 late S0（真实首帧到达后 prepare）各 120 帧通过；另以
+960×540 独立预览搭配 832×480 实际 source 完成 120 帧，prepare/attach 前 accepted/consumed
+均为零，实际 source hash 不变。不同模式的短测缓存条件不同，不能据此计算提前可见收益。
+10 组真实浏览器对照尚未执行：本地浏览器控制仍被工具权限拦截，Mac 另报锁屏。
+浏览器首次可见、按键 P50/P95、CLI/decoded/presented FPS、UI 跳帧与三路归档的本版本验收
+均保留待测，不把原生 GPU 检查或旧版 RTC 结果当作本轮端到端通过。
+
+证据入口：`oss://leap-world-shanghai/world-model/sglang/deploy/whitebox-shanghai-20261023/s0-v2-20261027-r1/acceptance-native-20261028-r1/`。
+完整配置、失败、版本边界和准入保护见
+[上海整体发布与回归方案](/docs/sglang-diffusion/zing/plans/shanghai-main-performance-rollout)。
+
+## 外部 Player 按需模型席位（2026-11-02）
+
+本地候选新增[手动推理准入和清理协议](specs/WHITEBOX_CLIENT_UI_ACTIONS.zh.md#外部-player-按需推理)。
+外部单人/成员默认只运行原游戏与白模；明确确认后才由 SourceSession 的原模型 owner 申请席位。
+内部自动启动语义保留。CPU 协议、子段及父租约清理测试不代表 GPU 或在线席位验收。
+本轮未部署共享服务，480/736 的 TTFF、E2E、FPS、TPOC、ICL、Encoder/DiT/Decoder
+阶段耗时及显存同条件 A/B 均未测；历史 Harness/GPU 结果不能外推为该开关的性能结果。
+最终候选 SDK/CLI pin、正式分支可达性、生产镜像和真实任务接受状态须分别核对。
+
+## Harness 单人回归范围（2026-10-31）
+
+任务私有 Workbench 环境完成旧固定基线加两项精确源码覆盖的真实 GPU / 实际 WTP
+React Playtest 回归：17阶段组合1500帧；受理丢回执、坏图重试/撤销后晚到；阻塞取消
+与重入361帧；单租约340.05秒8043帧。10个30秒窗口均值23.94FPS，显示间隔P95最大63.5ms；
+事件到画面包含点击/UI ready/截图，中位数3982.5ms，不是纯模型阶段计时。
+完整身份、初次180秒预算终止、数据与未测项见
+[验收记录](https://github.com/seedleap/sglang/blob/codex/world-model-harness-20261030/benchmark/whitebox/MODEL-CONTEXT-20261031.md)。
+这些结果不代表最新合入的 `92939d91fe75fd06a2890cbf81fbf131d1e9851f` Prefill 路径、
+正式外部 Console / RTC、共享部署或480/736同条件性能矩阵通过；原有未验证项保留。
+
+## Worldkit CLI 适配验证边界（2026-10-24）
+
+本次适配候选基于 `27e987aa46`，实现与修复为 `7fe34851b1` / `b803907b5a`。
+Room 改用官方 CLI 的完整游戏缓存、常驻浏览器和会话超时，保留两个原生帧 credit；
+源码固定与部署参数见[适配说明](../whitebox/plans/2026-10-24-worldkit-cli-adaptation.md)。
+本地真实 World/Chromium、缓存复用、取消回收及 UI 读取已验证，当前只证明 CPU 侧集成。
+本候选的 **480/736 完整模型 TTFF、E2E、FPS、TPOC、ICL 和 Encoder/DiT/Decoder
+耗时及显存 A/B 均未验证**，本轮未申请 GPU 或部署服务。后续性能验收应按下方固定输入
+与英伦 benchmark 补测两档；不能把零下载、本地源码首帧或历史 GPU 数据外推为本次收益。
+SDK pin 已更新为共享 main/dev 一致的 `f4948b610543d596b377522e7cc8b1edc88ac67c`；
+其源码树与 SDK CI `40153176397` 的 19 项成功回执一致，包含 AREA author/Episode/Room 契约。
+SGLang 精确 pin 的 CI、镜像部署和实际试玩验收仍须分别完成；SDK 源码合入不改变各世界已有的冻结 runtime。
+
+新增[Room 缓存管理](../zing_h3/specs/whitebox-runtime-maintenance.md)为按需管理接口，
+复用同一 CLI/cache owner；重任务在活跃会话或加入期间被拒绝，开流先取消并清理后台重任务。
+该新增面的 480/736 完整模型速度、三部分显存及端到端呈现仍未实测，不据本地 HTTP/缓存
+契约和 UI 测试作性能保证；本轮不改变模型权重、kernel 或稳态逐帧路径。
+
+## 独立尺寸 S0 契约（2026-10-27）
+
+`whitebox-startup-prepare-v2` 将S0作为独立尺寸的Qwen条件预览，复用已有选桶/resize，
+不再要求与CLI第一帧逐像素相同。source视频与输出仍采用各自固定几何和真实PTS；
+保留准备身份、原图完整性、重复请求及实际CLI起点检查。
+[契约与本地验证边界](/docs/sglang-diffusion/zing/plans/shanghai-model-startup-prepare)。
+2026-10-27 的本地实现验证与 2026-10-28 的发布验证边界见本页首节。
+下节已部署 RTC 结果属于历史 v1，不外推为 v2 的验证或性能收益。
+
+## CLI 与模型并行准备：GPU 与双路径 RTC 已上线（2026-10-27）
+
+模型 `54282f323b` 的 R8 在同四张上海 H200 上串行比较 baseline `fbe6ca26c3`、
+候选 legacy、接口带 S0 的 prepare 和 CLI 帧到达后补传的 late prepare。
+固定 E1+SP2+D1、832×480 / 1280×736、两次预热后三次 720 帧 paced 正式请求；
+CLI、SDK 和世界时钟未修改。接口边界见[并行初始化说明](/docs/sglang-diffusion/zing/plans/shanghai-model-startup-prepare)。
+
+| 分辨率 | baseline FPS / ICL P95 | legacy FPS / ICL P95 | provided S0 FPS / ICL P95 | late S0 FPS / ICL P95 |
+| --- | --- | --- | --- | --- |
+| 832×480 | 20.743 / 498.002 ms | 20.716 / 410.629 ms | 20.615 / 416.891 ms | 20.640 / 412.208 ms |
+| 1280×736 | 8.013 / 1181.216 ms | 8.003 / 1181.261 ms | 8.006 / 1181.430 ms | 8.003 / 1179.981 ms |
+
+FPS 为首包后口径，各正式请求完整输出，两 DiT rank 均为零 capture / 516 replay。
+480 两条新路径达到同卡 baseline 97% 吞吐和 ICL P95 ≤450 ms 门槛；736 功能完成，
+但不满足该实时节奏门槛，不能作为 480 部署质量的替代证明。两秒模拟 CLI 等待的两种
+启动顺序与身份检查通过；这不是实际浏览器 TTFF 收益。独立阶段诊断与 bounded
+CUPTI profile 两档均完成，每 rank 仅采 dispatch 4–6，profile 不计入正式 FPS。
+完整原始结果入口：`oss://leap-world-shanghai/world-model/sglang/deploy/whitebox-shanghai-20261023/startup-deploy-20261026/prep-r8/gpu-results/`。
+分组件显存与阶段统计须从该入口逐项读回，尚未整理的项目不以零或旧版本数据代替。
+
+R3 的控制 telemetry 握手问题已修复。R5 曾在更换输入后的 init Graph capture 失败；
+`54282f323b` 延迟捕获窗口内的循环 GC，真实 CUDA 终结器负对照失败、修复版 replay
+成功，且 R8 完整输入切换通过；这仍不构成对 R5 原始驱动根因的独立证明。
+R7 同时启用两套 profiler 时发生主机 600 GiB cgroup OOM，未定位具体分配来源；
+R8 改为单 owner 有界采样后通过；
+它不是模型 VRAM 容量失败。
+
+首次真实 RTC 验收发现提前创建的订阅接管 native 回调，ICE candidate 被丢弃，连接
+超时且未出帧；已恢复原单 slot 入口并保留候选 GPU。Room 修复在协商结束前保留
+信令回调，连接成功后再交给订阅；真实订阅负对照复现，14 项生命周期回归通过。
+Room `3415bea829` 镜像 216 项回归通过，无 S0 真实 RTC 连续播放 260.1 秒。
+随后一次带 S0 的像素不匹配回退遇到容量拒绝；真实 Coordinator store 负对照证明，
+释放完成到心跳忙碌状态刷新的间隔可以触发零等待准入失败，但当时日志不能排除并发
+竞争。Room `7abe567a2d` 仅使这一次回退在原截止时间内等待至多 10 秒，首次准入仍
+立即拒绝繁忙容量，取消等待也已验证。R11 镜像 digest `3c8d3cdb` 使用实际 SDK
+`09a2b861`、原 tini entrypoint，218 项检查及最终 61 文件哈希核对通过。
+
+R11 两条真实浏览器路径已验收：provided S0 连续 300.022 秒 / 7028 个模型呈现帧，
+late S0 连续 208.100 秒 / 4868 帧；点击到源/模型首帧分别为 9.052/12.089 秒与
+6.497/8.528 秒。provided 初次 prepared6.785秒早于CLI8.551秒，
+使用未经resize的真实832×480 RTC解码fixture；有损RGB差异触发一次回退后成功。
+late 请求不带initial_frame，CLI真实帧到达后才prepare，prepare/attach身份一致。
+两种准备取消、手动stop释放和随后下一会话均通过；配对视频SHA及全量逐包PTS一致。
+首两帧间隔provided2.367050秒、late1.600555秒，保留固定首帧→最新帧的视觉边界。
+静止起始镜头的观察不外推为准备期间已有动作时无跳跃。
+
+官方上海页面已开启新协议并播放5分钟，点击到源/模型首帧12.693/15.465秒，
+7085对归档帧、CLI停止和slot释放均确认。缓存条件与历史不同，不能据此宣称确定的
+TTFF提升；完整RGB数值等价亦未证明。第二个新worker完成独立CPU冻结与两种720帧功能诊断，两个新流程slot已上线。
+最终两用户分别播放242.282秒和290.999秒，重叠242.282秒；不同worker/epoch、
+第三用户容量拒绝、A结束后B继续41.345秒均有实测证据，随后两路停止并归档完成，
+公开容量观察到free2。两个最终作业均Priority9、非抢占。按用户要求在两条API路径
+确认可用后结束测试，不再追加矩阵；功能诊断不替代上述正式性能结果。
+
 2026-11-02 本改动扩展 prompt joint，按 `split_first_latent` 选择历史布局。
 `false` 时 condition miss / cache off 联合 condition、history3、history2、source 和 target 首步（五分支）；
 condition hit 恢复 KV 后联合两个 history、source 和 target 首步（四分支）。
@@ -426,9 +825,8 @@ main 强制 fused1 **28.922（−4.12%）**、旧 `13cd4ca52a` 默认 **29.404�
 `521ade5a6e` 将新增优化限制到实际目标 1280×736，480p 保留 main 既有路径；
 Linux CPU 完整相关套件 1142 passed、4 项 CUDA 测试 skipped。r5 的 SP4 arm 在 CPU 准备
 被 offline AdaLN guard 拒绝；产物保留。r6 准备 main/SP2/table、gate/SP2/table、
-gate/SP2/resident、gate/SP4/resident 四臂，736 逆序优先、480 正序。
-后续 r7 已完成 SP4 的11次正式请求，见本页“736p 部署性能更新”；
-SP2 对照未执行，门限后同条件收益及完整 SP4 验收仍未验证。
+gate/SP2/resident、gate/SP4/resident 四臂，736 逆序优先、480 正序；尚未运行 GPU。
+门限后收益及 SP4 扩展尚未验证。
 {/* TODO: 补充目标分辨率门限后的同条件480/736、组件阶段和显存实测；不沿用门限前结果作为验收。 */}
 产品集合 480/736 全量 GPU 对照、组件 CUDA/显存及 DiT-only 吞吐待补；736 输入为全帧
 上采样到 1280×736，非原生采集。指标、缺项与原始证据见
@@ -482,6 +880,26 @@ L1 复用 #499 按实际 prefix 行数分页分配的实现。
 [测试 Master 说明](https://github.com/seedleap/sglang/blob/feat/zing-disagg-pooling-elastic-scaling-rebase/benchmark/zing_h3_causal/WORKER_GROUP_MASTER.md)。
 
 ## 独立 worker 的 SP2 接入（H100 480 已测）
+
+### 原生队列的整块 Graph 接入（2026-11-05，上海隔离 480 已测）
+
+独立 DiT 的 source 队列现在通过 `drain_ready(max_outputs=1)` 执行每个已就绪块，
+沿用已有整块 CUDA Graph 的准入、捕获、回放和 eager 回退。此前 `step()` 不进入
+整块 Graph；在 `after_step0` 淘汰策略下，旧的逐 forward Graph 也被拒绝，
+因此仅设置 `SGLANG_ZING_DENOISE_CUDA_GRAPH=1` 并不能使该原生队列使用 Graph。
+没有改变采样、KV 容量、窗口、输入额度、条件更新边界或默认的 deferred-final 策略。
+输出消费者失败或取消时显式关闭执行迭代器，继续沿用原会话清理。
+`white_box@27e2a40a7f21` 的完整镜像在 H100 Encoder/Decoder + H200 SP2 隔离链路
+完成 832×480 验证：FP8 FFN/attention、BF16 KV、prefix57344、W6/S3、4→2，参数不变。
+原 reference-switch 前720帧一次预热后两次正式均完整交付并正常释放，全程FPS
+**16.613/16.730**，首包后 **17.413/17.488**，TTFF **2.509/2.381s**；日志记录真实整块捕获。
+旧MAX2两轮全程11.241/12.457FPS、TTFF2.054/2.156s，因此吞吐观察到改善、首帧略慢。
+物理H200卡对改变，不作为严格同卡A/B。固定单组条件的720帧新旧完整RGB哈希一致；
+动态case部分条件实际生效位置不同，不能把其整段RGB差异当成纯数值误差。
+真实浏览器从首个模型画面起561秒，唯一模型帧平均 **19.106FPS**、白模29.848FPS，
+20次输入尝试、完整配对录像和正常退出有证据。末段存在相对白模的结构增补/漂移，
+画质不判通过；按键到最终绘制的独立逐次关联、三组件CUDA时间/峰值显存、736、多人与
+三Slot完整验收仍未覆盖。未切换正式入口。配置、比较限制与证据入口见 [PR #565](https://github.com/seedleap/sglang/pull/565)。
 
 2026-11-02，`7140d4cbdd13` + 冻结源码 `ab8b913ad554`：独立 DiT 以 torchrun 两进程、
 `--sp-degree 2` 复用原 Ulysses SP、模型加载和 KV 分片，仅 rank 0 对外建连。
@@ -564,12 +982,13 @@ prefill completed 仅说明本实例 L1 可用，L2 持久化看独立的 l2_wri
 
 部署时配置共享本地路径、每实例 L1 预算和磁盘容量水位，并关注：
 
-1. **指定 GC 实例**：同一目录只在一个实例添加 `--zing-block0-cache-gc`，其余实例默认关闭。
-2. **预留磁盘余量**：`--zing-block0-cache-disk-gb` 是清理高水位，低于分配给缓存的容量，并为临时文件、并发写入和同盘其他数据留余量；它不是硬配额。写满错误捕获后按 L2 写入失败处理。
+1. **启用 GC**：至少一个实例添加 `--zing-block0-cache-gc`；多个实例开启时由内核锁选出每轮回收者。
+2. **统一容量策略**：同盘实例使用相同预算根、上限、水位和空闲余量。`--zing-block0-cache-disk-gb`
+   是受管写入准入上限，不能约束绕过此实现的外部写入。写盘失败降级为 L2 未持久化。
 
-GC 根据 mtime 清理残留，超水位后按近似 LRU 淘汰；不做实时全局计数或空间预留。
+GC 只按年龄处理无活跃拥有者的残留；超水位后近似 LRU 淘汰无读写引用的已登记条目。
 可选参数 `--zing-block0-cache-gc-interval-s` 默认 60、`--zing-block0-cache-gc-stale-s` 默认 600、
-`--zing-block0-cache-gc-low-watermark` 默认 0.9。无须手工初始化共享预算文件。
+`--zing-block0-cache-gc-low-watermark` 默认 0.9；whitebox 模板采用上述 0.9/0.8 水位。共享预算文件由运行时创建。
 不兼容旧 #455/#467 中间版本进程混跑，两个实例统一升级；旧格式 miss 后重建。
 
 运行时 `e42b951c15` 的缓存专项两轮 362 项与完整 CPU CI 均通过。2026-10-30 上海同机 Samsung
@@ -847,6 +1266,114 @@ launcher 只做翻译与校验，不替用户分配：Denoiser 卡数必须等�
 并且分卡只能在单节点上使用。Role 不配置时保持单角色同卡模式。编码、解码能力及各自的进程入口彼此独立；
 会话协议不假设“一个角色一个进程”。共用 GPU 不等于合并进程，只有显式配置才会合并。
 现已支持通过 CLI（`--encoder-gpus` / `--denoiser-gpus` / `--decoder-gpus`）或 `launch_pool_disagg_server()` 统一声明与编排各角色卡位。
+
+## 独立 Decoder 渐进交付
+
+`SGLANG_ZING_REMOTE_DECODE_PROGRESSIVE=1` 将一个独立 Decoder dispatch 内的
+RGB 输出拆为 Lynn 的合法单 latent 切片（通常为 `1,4,4,4,4`），每片完成转换和
+D2H 后即可独立交付。默认 `0` 保留原有整批路径；所有 Decoder rank 必须一致。
+每个 dispatch 的共享内存总字节预算和两个在途槽保持不变，内部每片沿用原有
+ready/ACK/CANCEL 生命周期，所有片结束后才归还该 dispatch 的槽。
+帧范围、source alignment、条件版本和 EOS 仍按原有契约检查。
+源会话每完成一个 AR 输出块即归还此次 dispatch。cross_chunk 模式复用延期 final
+提交：当前 RGB 先交付，下一 dispatch 将前块 final 与本块 source/step0 联合计算，
+避免本块输出等待下一块的首步预测。待处理块和历史仍受原预算约束，两个 quantum
+配置不变；主动取消释放待处理状态、KV 和未消费 RGB 引用。
+已接受的 Encoder 尾部前缀在最后一个就绪 AR 块后收集，避免空 RPC，也避免第一块
+输出等待下一段前缀交接。单卡独立 Decoder 在接收下一份 latent 前完成当前发布。
+
+该模式不修改 DiT 的 `SOURCE_WORK_QUANTUM` 或 Lynn 本地路径的
+`DECODE_WORK_QUANTUM`，也不自动缩短 `joint_wait_ms` 的预算。
+2026-10-27 基于发布分支 `f2894cda2e` 的本地候选将渐进远端路径的输入等待目标
+对齐到本次可执行的一个 AR 块：当前块输入齐备即可唤醒，已到齐的后续输入仍可预取，
+非渐进的双块收集策略不变。worker 不再为填满 joint 队列而先阻塞收取下一片 Encoder；
+当前 DiT 完成后先提交独立 Decoder，再收集已接受的尾部前缀，保留原有 credit 和
+`more_work` 语义，不额外引入空 RPC。EOS 仍走最终一次解码回执，避免覆盖尾帧引用。
+
+该候选仅完成本地 CPU 调度、帧边界及生命周期回归；**未部署，当前候选的 480/736
+TTFF、E2E、FPS、TPOC、ICL、画质及 Encoder/DiT/Decoder 各项耗时与显存均未实测**。
+不把既有日志中的 50 ms 合并等待和约 70 ms 前置交接直接相加作为收益，也不把下面
+历史版本的 GPU 结果外推到本候选。待同机固定输入分项 A/B 后，再评估接收缓冲目标。
+回归入口：`test_zing_h3_source_adapter.py` 和 `test_zing_progressive_source_session.py`
+（`python/sglang/multimodal_gen/test/unit/realtime/`）；macOS 使用仓库的
+`benchmark/zing_h3_causal/run_conditioning_cpu_tests.py`，只替代不可用的 GPU 导入边界，
+不验证 CUDA kernel、NCCL、真实 Graph replay 或生产推理启动。
+
+2026-10-25，上海 L20X / SM90 四卡的运行源码 `fbe6ca26c3` 完成 **832×480**
+性能与浏览器功能验收。基于 main `a99560cf90` 与 white_box `b97241fd99`；发布分支
+`6cc6641555` 另合入并保留 #412，GPU 模型路径与实测源码相同，未部署 #412 的新 Room/SDK。
+配方为 E1+SP2+D1、BF16、W6/sink3、Graph，前三块 `[1000,750,500,250]`，
+之后 `[1000,500]`，两个 quantum 均为 `0`。以下同卡对照各预热两次、正式三次，
+每次完整交付 720 帧；诊断/profile 不计入正式性能。
+
+| 480 配方 | 首包后 FPS，中位数 | RGB 批间隔 P95 |
+| --- | ---: | ---: |
+| 原上海 `f8995495fa` | 19.757 | 834 ms |
+| 仅合 main `5c284aa2f4` | 20.451 | 810 ms |
+| 渐进交付 `fbe6ca26c3` | 20.747 | 414 ms |
+| 同候选 paced 输入 | 20.711 | 414 ms |
+| 选定 `joint_wait_ms=50`，paced | 20.325 | 437 ms |
+
+选定配置 TTFF 中位数 3.375 s。正式三轮两个 DiT rank 各有 516 次 Graph replay、
+0 次 capture；基线各为 390/0。独立 5 s 诊断中，稳态 AR 的 DiT CUDA P95 从约
+674 ms 降到 380 ms（每 rank 13 个输出 span）；source VAE CUDA 中位数/P95
+约 229/238 ms（22 个 span），参考 VAE 约 59/79 ms（每 rank 6 个 span）。
+Decoder 在 DiT 侧的 span 包含远端交接，不能冒称 D1 独占计算时间；Qwen 未单独计时。
+候选 DiT 请求峰值 allocated 约 68.20 GiB/rank、reserved 约 73.94 GiB/rank。
+正式轮 driver 采样最大值为 DiT 86.89/86.38 GiB、Encoder+Qwen 61.40 GiB、
+D1 29.19 GiB；这些整卡采样不是组件独占 allocator 峰值，逐 rank 明细见证据。
+
+同一海藻林游戏的 RTC/WS 均持续超过三分钟，确认按键、停止释放与下一会话。
+最终 Room 输入窗口为 **25 帧**、CLI 30 FPS，RTC 保留原生解码帧直接绘制。
+RTC/WS 实际 RGB 为 23.57/23.63 FPS、批间隔 P95 为 348/311 ms、
+source→原始 RGB 均值为 935/932 ms；RTC 超过 500 ms 的间隔为 0.545 次/min，
+此前同游戏上海记录为 48.56 次/min，选中源帧 PTS 间隔 P99 从 632 ms 降至 134 ms。
+历史对照不是同时运行的 A/B。17 帧窗口退化为 17.60 FPS/P95 633 ms，已拒绝；
+34 帧窗口虽达 22.2 FPS，但 source→RGB 约 1.39 s。WS 显示间隔 P95 约 46 ms；
+RTC 保留原生 freeze 计数，未导出逐帧呈现时间戳。截图仍可见生成主体重影/形变，
+本轮不宣称视觉质量或 RGB 数值等价已通过。
+
+**1280×736 已完成同卡对照，但不满足实时试玩门槛**。独立 test-only r8 使用相同
+checkpoint、六图视频输入、布局与采样；每组两次预热、三次正式，均完整交付 720 帧，
+没有 OOM 或容量失败。此前冷请求的零 capture 门槛误用已经由这轮正确预热的结果替代。
+
+| 736 配方 | 全程 / 首包后 FPS，中位数 | TTFF / E2E，中位数 | TPOC，中位数 | ICL P95 |
+| --- | ---: | ---: | ---: | ---: |
+| 原上海 `f8995495fa` | 7.979 / 8.331 | 3.937 / 90.239 s | 1.015 s | 1.991 s |
+| 渐进交付 `fbe6ca26c3`，wait50 | 7.689 / 7.985 | 3.583 / 93.644 s | 0.425 s | 1.181 s |
+
+候选吞吐为同卡基线的 95.84%，低于 97% 门槛；ICL P95 也高于 450 ms，
+因此上海入口保持已验收的 **832×480**。736 两个 DiT rank 在三次正式请求中各有
+516 replay/0 capture，基线各为 390/0；Graph 确有执行，不能将未达门槛归因为未开启。
+候选 DiT 诊断请求峰值 allocated 约 84.64 GiB/rank、reserved 约 90.53 GiB/rank；
+driver 采样最大值为 DiT 104.63/104.12 GiB、Encoder+Qwen 70.14 GiB、D1 56.84 GiB。
+独立阶段诊断与上述正式吞吐分开，逐 rank 中位数/P95、样本数、常驻/峰值及共享范围
+均在报告中；Qwen 独立计时、D1 纯计算及两者 allocator 峰值仍未采集，需独立遥测补测。
+736 未进行浏览器或画质验收。测试作业已结束释放，480 服务与泰国链路未因补测改动。
+完整两档指标、原始证据与限制入口：
+`oss://leap-world-shanghai/world-model/sglang/deploy/whitebox-shanghai-20261023/stutter-fix-20261024/acceptance-r11/final-acceptance.json`。
+
+## 上海双 slot 扩容验收（2026-10-26）
+
+上海现为**两个独立四卡实例，共8卡、两个用户slot**；每个GPU实例仍为单活跃会话。
+模型源码保持 `fbe6ca26c3`，沿用上述480p E1+SP2+D1、BF16/W6/Graph、4→2步、
+quantum0/0、progressive、wait50；新增实例2预热/3正式720帧得到首包后20.665 FPS、
+TTFF3.396 s、ICL P95423 ms，两DiT rank各516 replay/0capture。
+CPU双source补丁为 `8a835e6fdd`，发布合并 `1d694066d5`；保留现场已更新的
+management/SDK242基底，仅叠加必要文件，不能把合并HEAD视为整仓运行源码。
+Room仍为14CPU/24GiB，CLI30/input25，使用两个独立RTC端点和6个有界归档进程。
+
+两个独立测试身份经公开WebRTC入口同页播放重叠**261.97秒**。
+以共同浏览器时间窗映射各自输出帧范围，分别计算源内时钟：RGB吞吐23.395/23.380 FPS，
+为同条件单用户基线23.692 FPS的98.75%/98.68%；批间隔P95312/311 ms，
+source→raw均值909/908 ms。浏览器绘制回调23.279/23.231 FPS、间隔P9551/57 ms，
+不冒称OS合成器呈现时间。Room峰值10.10核/3.676 GiB，未达到原容器额度。
+按键身份隔离、第三人拒绝、关闭一人另一人继续、下一会话和精确测试源释放均通过。
+两用户的6段录像共871,243,264 bytes均读回SHA核验、全帧解码及帧数/PTS验证通过。
+该结果只说明480p性能、并发及生命周期；736保持前述不满足实时门槛结论，未新增736测试，
+未重采Encoder/DiT/Decoder分项性能或显存，也不宣称画质等价或初始化优化已经实现。
+完整证据：
+`oss://leap-world-shanghai/world-model/sglang/deploy/whitebox-shanghai-20261023/second-slot-20261026/acceptance-r2/final-acceptance.json`。
 
 ## H100/H200 Decoder 已验证范围
 
@@ -1274,7 +1801,7 @@ PR #414 将 `seedleap-kernels` 的前序融合算子接入 Zing H3 DiT 主循环
 
 ## Qwen预取与独立Decoder重叠
 
-新增 `--zing-conditioning-prefetch`（remote、单活跃会话）与 `--zing-source-decoder-overlap`（独立Decoder、source quantum=1、单活跃会话），均默认关闭。前者提前处理已收到的prompt/reference，后者允许上一块decode/send与下一DiT重叠，保留输出顺序、背压和显式interactive event grace。当前纯源码remote native profile仍要求六项H3 Qwen优化显式全关、BF16与torch_sdpa，配置见[专属设计文档](specs/qwen-prefetch.zh-CN.md)。
+新增 `--zing-conditioning-prefetch`（remote、单活跃会话）与 `--zing-source-decoder-overlap`（独立Decoder、source quantum=1、单活跃会话），均默认关闭。前者提前处理已收到的prompt/reference，后者允许上一块decode/send与下一DiT重叠，保留输出顺序、背压和显式interactive event grace。早期纯源码remote native profile要求六项H3 Qwen优化显式全关；当前合入#437后支持独立执行选项，变更时须重建并同步profile，见[remote执行契约](plans/QWEN_REMOTE_EXECUTION_OPTIONS.md)。预取与overlap的历史配置见[专属设计文档](specs/qwen-prefetch.zh-CN.md)。
 
 2026-10-25，`428cd48295`异步实现加T033七处部署兼容覆盖，在B300资源池实际L20D/CC10.3、Thai r10模型、832×480上测量：GPU0/1 DiT、GPU2 Encoder＋Qwen、GPU3 Lynn Decoder；三个异步与Qwen六项、prompt_joint开启，Graph关闭、W6/S3。三个案例首批后FPS为24.10/23.55/23.60，prompt到新RGB为1.244/1.470/1.393秒；诊断已观察Decoder与下一DiT部分重叠，仍有周期空泡和切换等待。完整阶段P50/P95、显存及可回查原始证据见同一设计文档。
 
@@ -1321,6 +1848,30 @@ RGB转换/回传另计两步1.604s、一步1.704s。
 回查 `oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/zing-736-source480-20261024/r5/b300/`，
 两子目录保存P95、原始请求、逐rank阶段计时及实际后台Decoder记录。
 上述数值仅验证2026-10-24冻结组合；合并当前main后尚未重新进行GPU性能或效果验收。
+H200两组结果尚未验收；480输出、请求峰值显存与完整画质未验证。
+旧 TAEH3 FP16、全程四步的 source480/target736 数据仅作历史证据，不作该 Lynn 配方验收。
+
+
+### 2026-10-30：非拆分首块的 source 兼容性
+
+`num_frame_per_block=[3,2]` 同时支持 `split_first_latent=true` 的 `1,2,2` 开头与
+`false` 的 `3,2` 开头。Prompt／参考图切换仍保留五个 clean latent，按当前 chunk
+plan 重建，并从对应的下一 block 继续，不重置全局 source/RNG 游标。非拆分布局的
+历史前缀使用串行重建；静态 Block0 的 L1/L2 恢复保持启用，普通 source/target
+cross-chunk 路径不变。该布局的联合 prefix Graph 优化未启用，不能套用拆分布局的
+五／六分支性能数据。新配置需重新核验实际出帧；736、长时切换与性能分位数未验证。
+
+### 2026-10-30: bound Prefill inputs (local candidate)
+
+The Room/client candidate binds a real RGB24 source snapshot and complete model
+inputs to a later render start; playback may begin after `memory_ready` while disk
+persistence continues. Model cache receipts are scoped to activated Prompt versions.
+CPU contract/regression coverage is available; this change has **not** been deployed
+or measured on GPUs. 480/736 baseline/candidate TTFF, E2E, FPS, TPOC, ICL, and
+Encoder/DiT/Decoder timing/memory are all pending; no prior hardware result is reused
+as evidence for this candidate. The cache execution fingerprint changes with model
+source, requiring new Prefill entries after rollout. Cache locks remain unchanged.
+See [the binding contract and validation boundary](./specs/whitebox-bound-prefill.md).
 H200两组速度回执见本页“736p 部署性能更新”；完整画质仍未验收。
 480输出、请求峰值显存与当前main的完整画质未验证。
 旧 TAEH3 FP16、全程四步的 source480/target736 数据仅作历史证据，不作该 Lynn 配方验收。
@@ -1360,6 +1911,46 @@ H200两组速度回执见本页“736p 部署性能更新”；完整画质仍�
 - **DiT 运行时在线扩缩容 1→2→1→2（Job `dlc1nnv9nqr137yw`，832×480）**：`DiT #0` 全程流式推理零中断（单流 14.66→14.68→14.71 FPS），在线 `set_max_sessions(2)` 热接入 `DiT #1` 后双流聚合 **26.54 FPS**（1.81×），在线下线 `#1` 并 `bridge_close` 回收 NCCL 通信组（`active_bridges: 2→1`），再次扩容重连聚合 **27.09 FPS**（1.85×），全程 0 失败。
 - **Encoder/Decoder 运行时在线热扩容与 `set_draining` 优雅摘流缩容（Job `dlc1lfsb2jtk9qgr`，832×480）**：`DiT #0` 常驻不重启，初始 `#0` 14.69 FPS；在途流期间热启动 `Enc#1` / `Dec#1`、原子更新 `SGLANG_DISAGG_POOL_REGISTRY` 并对 `#0` 开启 `set_draining(True)`，在途会话完整跑完排空至 `active_sessions=0`，后续会话自动建连迁移至 `#1`（12.05 FPS，3/3 零中断），最终在线 `bridge_close` 并终止 `#0` 进程后 `#1` 独立稳定服务（12.05 FPS，3/3 成功）。736 档在线扩缩容与跨机多节点池化尚未验证。
 
+### Managed role pool 适配与验证边界（2026-11-04）
+
+Managed Encoder/DiT/Decoder 启动统一使用 `NCCL_MIN_NCHANNELS=2`；启动器必须
+显式覆盖云平台注入的其他值。运行时在初始化 NCCL 前拒绝冲突配置，未设置时采用 2，
+`NCCL_MIN_CTAS` 若设置也必须为 2；集成式静态启动环境不受此检查影响。
+上海隔离实验发现 PAI 注入 4、H100 未设置时，同一跨机 communicator 分别创建
+4/2 个 P2P channel，出现输入张量错误和 RECV 超时。保持 NCCL `2.30.7`、仅将
+两端通道下限对齐为 2，四种张量的点对点校验与 E→DiT→SP2 连续 20 组校验通过。
+`BLOCKING_WAIT`、`LAUNCH_ORDER_IMPLICIT` 或仅换成 NCCL `2.29.7` 均未解决该复现。
+这仍是传输专项，未覆盖完整模型、三玩家、480/736 性能与显存；线上同机服务未改动。
+可回查入口：PR #538 的隔离验证记录。
+
+工作分支以 white_box `5d7e71a87a` 整合 main `0a4623e129`，为独立 Encoder/DiT/Decoder 增加服务注册、进程共享预算、三角色绑定与 Room 双 WS 适配。显式配置、旧扩展兼容边界、人工排空/恢复及本地测试入口见[Managed role pool 合同](/sglang-diffusion/zing/specs/MANAGED_ROLE_POOL)。默认仍关闭，不通过旧多 DiT shared API 入口启用。
+
+2026-11-04，在用户授权的隔离 H100 上完成 E1 + SP2 DiT + D1、832×480 的真实建组、双 WS、连续两段与浏览器验证。GPU 源码为 `552ff023fe3f`，Room/控制面最终为 `49356058f833`：17/18 帧连续子操作均正常 EOS 并释放；石厅场景超过三分钟、20 次独立输入，稳定显示约 24 FPS，输入回执到可见帧 P50/P95 为 1357/1410 ms；正常结束后录像 complete，父 Slot 在白模阶段保留，玩家退出后释放。归档入口为 `oss://leap-world-shanghai/world-model/sglang/evals/h100-rolepool-test-20261103-r1/`。
+
+这不是完整性能或生产验收：没有同条件旧版基线，复杂世界源端分别出现约 20、4、1 FPS；缺少 UI 的资产启动失败需人工清理，浏览器断连试验受到测试 Pod 到期干扰，未判通过。原生 Encoder 使用 `input.completed`，适配层必须等待独立 Decoder EOS 并校验帧计数，不能用输入 WS 关闭代替完整输出结束。常驻服务不得沿用实验的固定运行到期时间。
+
+H200 DiT + H100 Encoder/Decoder 的跨机三 Slot、736、完整 Prefill/L1/L2、联机与各组件同条件耗时/显存对照仍待验证。后续合入的源编码与启动清理变更仅有对应 CPU 回归，不能将上述历史 GPU 结果扩写为最新完整 head 的全量通过。
+
+2026-11-04，基于 `52552552428d` 的故障边界修复使普通条件校验异常也参与
+SP rank 的 CPU 共识，避免一侧退出、另一侧继续等待 collective。内部异常保持
+致命失败，不降级为可复用的容量拒绝。动态通信组的启动探针增加有截止时间的
+CUDA stream event 完成确认；该确认只在建组执行，不加到逐帧传输路径。
+DiT I/O 启动、暂停和关闭也有截止时间；线程未退出时保留所有权并报告清理未确认。
+两 rank Gloo 及相关 CPU 回归 36 项通过、14 项 CUDA 测试跳过，复现入口为
+`test/unit/realtime/test_worker_parallel.py`。这仅验证错误传播及生命周期边界；
+跨 H100/H200 NCCL、480/736 的 Encoder/DiT/Decoder 耗时和显存、FPS、TTFF
+以及真实 CUDA 清理均未验证，不能将此次修复称为跨机故障已解决。
+
+发布预检补齐了外部 Encoder/Decoder 已托管时的 DiT GPU 选择：仅设置
+`denoiser_gpus` 也必须在 CUDA 初始化前按调用方可见设备映射，不能直接继承全部卡。
+6 项独立启动测试和 26 项角色启动回归通过；这不代替跨机器 GPU 通信验收。
+
+GPU 镜像还须与项目依赖锁对齐：Lynn 使用 Diffusers `0.41.0` 的 MiniMax H3
+解码器，基础镜像中的 `0.37.0` 缺少该模块。`20ac831e` 首轮三个 Decoder
+因此在加载阶段退出，未承载玩家。镜像构建现在固定 Diffusers `0.41.0` 与
+Hugging Face Hub `1.33.0`，并直接导入 Lynn loader；仅检查 CLI `--help`
+不能覆盖这个延迟导入。更新依赖后的 GPU 与跨机验收仍须独立完成。
+
 ## Worker 通信生命周期修复验收（2026-11-04）
 
 本地修复覆盖连接完成确认、DiT 校验结果汇总和故障清理截止时间；接口语义与进程故障边界见 [Worker connection API](specs/WORKER_CONNECTION_API.md)。`connected` 需要本端 CUDA 完成及同次 bridge 的对端确认，三角色须配套升级。普通校验失败由 SP 主 rank 汇总后发布统一决定；通信故障后的 worker 保持隔离，不因本机清理成功而重新可用。
@@ -1374,6 +1965,14 @@ H200两组速度回执见本页“736p 部署性能更新”；完整画质仍�
 本轮没有同条件预热后 baseline，也未采逐组件/逐 rank 时延与显存；736、完整产品集合、长期稳定性和逐张量数值 diff 待独立补测，不由这些正常路径结果外推。不同输入、缓存状态或源码版本的 FPS 不作为修复收益对照。
 
 后续 abort/close 并发修正（验证快照 `8591d6e89d`）已通过固定 Linux CPU 环境两轮 DiT I/O 回归，每轮 15 项、无跳过；覆盖 abort 未返回时的并发 close/重复 abort、abort 抛错及关闭顺序。原 GPU 服务结果不能外推到此修正，当前版本的真实 NCCL 故障注入与退出/资源回收仍未验证。[CPU 回执](https://github.com/seedleap/sglang/actions/runs/41805829330)仅证明受控线程交错和 I/O 生命周期行为。
+
+The `white_box` integration of main `51685452b1` preserves managed role-pool
+channel policy and player lifecycle boundaries. Upgrade the participating
+Encoder, DiT and Decoder together: the connection-completion handshake requires
+both peers. CPU regression results do not establish cross-host model correctness
+or FPS. The earlier Shanghai `9b1a3754` browser attempt stopped after 17 model
+frames with a source-slice geometry error; sustained playback and performance of
+this integration remain unverified until the isolated canary completes.
 
 ## 独立 DiT Worker 整块 CUDA Graph、延后终步（`defer_final`）与零同步规划加速（2026-11-05）
 
@@ -1401,3 +2000,24 @@ H200两组速度回执见本页“736p 部署性能更新”；完整画质仍�
 后续 PR #596 review 修复将会话清理改为释放实际共享 `sampler.processor` 的前缀 memo，并保留合入 main 的服务启动失败广播路径。正常结束、取消、输出失败后的前缀释放及同一 packer 的下一会话复用已有 Linux CPU 回归；KV 规划回归核验惰性视图和正式存储不被写入。上述 GPU 指标仍属于 `1f06de8c76` / `d7b5f6477e`；合入 main 和清理修复后的版本尚未重新执行 GPU 性能及效果验证。
 
 PR #596 后续调用链核查：独立 `dit_worker` 通过 `DiTGroups → DiTLinkService → QueuedDiTSession → SourceReadySession → sampler/model` 执行，不经过 `GPUWorker.execute_forward()` 中的 `IPC_A2A.check_timeout()`。eager 的 SP2 attention 输出仍会尝试 IPC 交换，而整块 CUDA Graph 捕获明确走 NCCL。因此已撤回本 PR 的 IPC 超时标志跳读优化及其专用测试，不再将它归因于独立 worker 的性能收益；基础 IPC 交换与主线原有超时检查保持原实现。上述 GPU 消融仍是冻结版本的历史记录，移除该改动后的版本未重新执行 GPU 性能验证。
+
+### Managed split-service source controls
+
+The managed E/DiT/D source-control integration preserves the original Prefill,
+condition barrier, source prepare and Sink contracts; see
+[control ownership and validation boundaries](../zing_h3/specs/disaggregated-source-controls).
+The new control path has CPU protocol coverage; real SP2 timing, ten-entry L1/L2
+recall, periodic refresh and long-session visual acceptance are pending for this
+implementation. Historical standalone throughput does not establish these gates.
+Keep the same checkpoint, prefix/cache capacities and inference recipe when
+validating; do not infer runtime support by merely enabling the Room flags.
+
+### Encoder reuse after communication-group teardown (2026-11-09)
+
+A fresh source owner resets the Encoder's committed-frame watermark, latent/EOS
+cursors and source-preparation state, including when a completed DiT link has
+already dropped its owner before group destruction. This prevents a subsequent
+player's first chunk from inheriting the previous player's progress. CPU tests
+cover both normal destruction and rollback; production sequential-player replay
+and same-condition performance remain pending. No model, KV budget, sampling or
+transport setting changes are required.

@@ -3,6 +3,7 @@
 
 import asyncio
 import logging
+import time
 from uuid import uuid4
 
 import msgspec.msgpack
@@ -31,6 +32,45 @@ class PrefillRequestError(ValueError):
     pass
 
 
+_PERSISTENCE_WATCHERS = 0
+_PERSISTENCE_READS = set()
+
+
+def persistence_options(data):
+    if not isinstance(data, dict):
+        raise PrefillRequestError("Expected a prefill request")
+    enabled = data.get("persist", False)
+    timeout = data.get("persist_timeout_s", 180)
+    if (
+        type(enabled) is not bool
+        or type(timeout) not in (int, float)
+        or not 1 <= timeout <= 300
+    ):
+        raise PrefillRequestError("Invalid persistence options")
+    return enabled, float(timeout)
+
+
+async def _persistence_read(root, descriptor, timeout):
+    from sglang.multimodal_gen.runtime.realtime.prefill_persistence import (
+        inspect_persistence,
+    )
+
+    # Timed-out NFS calls may still own a thread. Keep counting them until the
+    # actual call returns, rather than creating unbounded abandoned reads.
+    if len(_PERSISTENCE_READS) >= 2:
+        return {"state": "pending"}
+    task = asyncio.create_task(asyncio.to_thread(inspect_persistence, root, descriptor))
+    _PERSISTENCE_READS.add(task)
+
+    def completed(value):
+        _PERSISTENCE_READS.discard(value)
+        if not value.cancelled():
+            value.exception()
+
+    task.add_done_callback(completed)
+    return await asyncio.wait_for(asyncio.shield(task), timeout)
+
+
 def _request_id(data):
     value = data.get("request_id") if isinstance(data, dict) else None
     return value if isinstance(value, str) and 1 <= len(value) <= 128 else None
@@ -47,11 +87,15 @@ def parse_prefill(data):
     if type(force) is not bool:
         raise PrefillRequestError("Prefill force must be a boolean")
     frame = values.pop("source_frame", None)
+    values.pop("source_frame_size", None)
+    persistence_options(values)
+    values.pop("persist", None)
+    values.pop("persist_timeout_s", None)
     values["type"] = "init"
     return RealtimeVideoGenerationsRequest.model_validate(values), frame
 
 
-async def run_prefill_case(ws, data, wire_size, session_id):
+async def run_prefill_case(ws, data, wire_size, session_id, *, binding=None):
     # Reuse the normal socket admission, sampler construction, scheduler RPC
     # ownership and cancellation-safe cleanup. No second task scheduler.
     from . import realtime_video_api as api
@@ -65,28 +109,64 @@ async def run_prefill_case(ws, data, wire_size, session_id):
     adapter = factory(args).for_request(request)
     if not isinstance(adapter, ZingH3SourceStreamAdapter):
         raise PrefillRequestError("The selected model does not support prefill")
-    session = GenerateSession(session_id=session_id)
-    session.execution_client = getattr(ws.app.state, "realtime_execution_client", None)
-    controller = getattr(
-        ws.app.state, "realtime_admission_controller", None
-    ) or api._get_admission_controller(args)
-    lease = await controller.admit(
-        api._resolve_realtime_user_id(ws),
-        session.id,
-        session.generation_id,
-        wait_for_capacity=False,
+    gateway = binding.gateway if binding else api._gateway_managed_config(ws)
+    session = GenerateSession(
+        session_id=gateway.session_id if gateway else session_id,
+        generation_id=gateway.generation_id if gateway else None,
     )
-    renewal = asyncio.create_task(
-        api._session_watchdog(
-            session,
-            controller,
-            lease,
-            idle_timeout_s=0,
-            max_lifetime_s=0,
-            lease_ttl_s=args.realtime_session_lease_ttl_s,
+    claim = ws.scope.get("role_pool_claim") if hasattr(ws, "scope") else None
+    if claim is not None:
+        session = GenerateSession(
+            session_id=claim["session_id"], generation_id=claim["generation_id"]
+        )
+        session.role_pool_service = ws.scope.get("role_pool_service")
+        session.role_pool_service.child_started(session.id, session.generation_id)
+    session.execution_client = getattr(ws.app.state, "realtime_execution_client", None)
+    controller = (
+        None
+        if gateway
+        else (
+            getattr(ws.app.state, "realtime_admission_controller", None)
+            or api._get_admission_controller(args)
         )
     )
+    lease = renewal = registry = None
+    reservation_owner = (
+        binding.owner_id if binding else (uuid4().hex if gateway else None)
+    )
     try:
+        if binding is not None:
+            binding.cleaned = False
+        if gateway:
+            session.coordinator_token = gateway.coordinator_token
+            if binding is not None:
+                registry = binding.registry
+            else:
+                registry = await api._consume_gateway_reservation(
+                    ws, gateway, owner_id=reservation_owner
+                )
+        else:
+            lease = await controller.admit(
+                api._resolve_realtime_user_id(
+                    ws,
+                    require_authenticated=getattr(
+                        args, "realtime_require_authenticated_user", False
+                    ),
+                ),
+                session.id,
+                session.generation_id,
+                wait_for_capacity=False,
+            )
+            renewal = asyncio.create_task(
+                api._session_watchdog(
+                    session,
+                    controller,
+                    lease,
+                    idle_timeout_s=0,
+                    max_lifetime_s=0,
+                    lease_ttl_s=args.realtime_session_lease_ttl_s,
+                )
+            )
         session._conditioning_init_reservation = get_api_resources(
             session, args
         ).reserve_api_message(wire_size)
@@ -96,7 +176,17 @@ async def run_prefill_case(ws, data, wire_size, session_id):
         if wire_size > adapter.max_message_bytes:
             raise PrefillRequestError("The prefill request exceeds its message budget")
         session.set_request(request)
-        batch = adapter.prepare_prefill_request(session, args, frame)
+        batch = adapter.prepare_prefill_request(
+            session,
+            args,
+            frame,
+            source_frame_size=data.get("source_frame_size"),
+            persist=data.get("persist", False),
+        )
+        if registry is not None:
+            await registry.mark_runnable(
+                gateway.coordinator_token, owner_id=reservation_owner
+            )
         batch.extra["zing_prefill"].update(
             operation_id=data["request_id"],
             force=data.get("force", False),
@@ -121,14 +211,32 @@ async def run_prefill_case(ws, data, wire_size, session_id):
     finally:
 
         async def cleanup():
+            managed = getattr(session, "role_pool_service", None)
+            child_id, child_generation = session.id, session.generation_id
+            released = False
             try:
                 released = await api._cleanup_realtime_session(session, None, None)
                 if not released:
                     raise RuntimeError("Prefill worker cleanup was not acknowledged")
             finally:
-                renewal.cancel()
-                await api._await_realtime_task(renewal)
-                await controller.release(lease)
+                if renewal is not None:
+                    renewal.cancel()
+                    await api._await_realtime_task(renewal)
+                if released:
+                    if lease is not None:
+                        await controller.release(lease)
+                    if binding is not None:
+                        binding.cleaned = True
+                    else:
+                        await api._release_gateway_reservation(
+                            registry, gateway, owner_id=reservation_owner
+                        )
+                    if managed is not None:
+                        managed.child_cleaned(child_id, child_generation)
+                elif registry is not None:
+                    await registry.quarantine(
+                        gateway.coordinator_token, owner_id=reservation_owner
+                    )
 
         # Success is sent only after worker/session resources and the lease
         # have been released. The long-lived cache remains on this worker.
@@ -157,10 +265,110 @@ async def prefill_websocket(ws: WebSocket):
 
     async def process(data, size):
         nonlocal active
+        global _PERSISTENCE_WATCHERS
         request_id = _request_id(data)
+        watching = False
         try:
+            persist, timeout = persistence_options(data)
+            if persist:
+                if _PERSISTENCE_WATCHERS >= 2:
+                    raise AdmissionRejected("PREFILL_STORAGE_BUSY")
+                _PERSISTENCE_WATCHERS += 1
+                watching = True
+            started = time.monotonic()
             receipt = await run_prefill_case(ws, data, size, session_id)
-            await send(receipt)
+            descriptor = receipt.pop("_disk_descriptor", None)
+            managed = (
+                ws.scope.get("role_pool_service") if hasattr(ws, "scope") else None
+            )
+            if persist and descriptor is None:
+                await send({**receipt, "type": "prefill.memory_ready"})
+                await send(
+                    dict(
+                        type="prefill.failed",
+                        request_id=request_id,
+                        code="CACHE_PERSISTENCE_UNAVAILABLE",
+                        content="Saving the cache is unavailable on this service.",
+                        memory_ready=True,
+                        fatal=False,
+                    )
+                )
+                return
+            if persist and managed is not None:
+                # The DiT owns L2; Room polls its authenticated, metadata-only
+                # endpoint off the GPU command loop. Never read Encoder disk.
+                await send(
+                    {
+                        **receipt,
+                        "type": "prefill.memory_ready",
+                        "_role_persistence_descriptor": descriptor,
+                    }
+                )
+            elif not persist:
+                await send(receipt)
+            else:
+                memory_ms = (time.monotonic() - started) * 1000
+                await send(
+                    {
+                        **receipt,
+                        "type": "prefill.memory_ready",
+                        "prefill_to_memory_ms": memory_ms,
+                    }
+                )
+                deadline = time.monotonic() + timeout
+                root = api.get_global_server_args().zing_block0_cache_dir
+                last_progress = time.monotonic()
+                while time.monotonic() < deadline:
+                    try:
+                        status = await _persistence_read(
+                            root,
+                            descriptor,
+                            max(0.01, min(10, deadline - time.monotonic())),
+                        )
+                    except asyncio.TimeoutError:
+                        status = {"state": "pending"}
+                    if status["state"] == "persisted":
+                        await send(
+                            {
+                                **receipt,
+                                "type": "prefill.persisted",
+                                "storage": status,
+                                "prefill_to_memory_ms": memory_ms,
+                                "prefill_to_persisted_ms": (time.monotonic() - started)
+                                * 1000,
+                            }
+                        )
+                        break
+                    if status["state"] == "failed":
+                        await send(
+                            dict(
+                                type="prefill.failed",
+                                request_id=request_id,
+                                code=status["code"],
+                                content="The cache could not be saved. Please try again later.",
+                                memory_ready=True,
+                                fatal=False,
+                            )
+                        )
+                        break
+                    if time.monotonic() - last_progress >= 5:
+                        await send(
+                            dict(type="prefill.persisting", request_id=request_id)
+                        )
+                        last_progress = time.monotonic()
+                    await asyncio.sleep(min(0.25, max(0, deadline - time.monotonic())))
+                else:
+                    await send(
+                        dict(
+                            type="prefill.failed",
+                            request_id=request_id,
+                            code="PREFILL_PERSISTENCE_TIMEOUT",
+                            content="Saving the cache has not been confirmed yet.",
+                            memory_ready=True,
+                            persistence_state="unknown",
+                            fatal=False,
+                        )
+                    )
         except AdmissionRejected:
             cache_event(
                 "prefill_request",
@@ -228,10 +436,22 @@ async def prefill_websocket(ws: WebSocket):
             )
             await ws.close(code=1011)
         finally:
+            if watching:
+                _PERSISTENCE_WATCHERS -= 1
             active = None
 
     try:
-        await send(dict(type="prefill.ready", max_message_bytes=maximum))
+        await send(
+            dict(
+                type="prefill.ready",
+                max_message_bytes=maximum,
+                capabilities={
+                    "persistence": True,
+                    "independent_preview": True,
+                    "timing_schema_version": 1,
+                },
+            )
+        )
         while True:
             try:
                 wire = await ws.receive_bytes()

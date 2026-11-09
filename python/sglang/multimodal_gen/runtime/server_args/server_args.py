@@ -490,10 +490,18 @@ class ServerArgs(DisaggServerArgsMixin):
     zing_block0_cache_host_gb: float | None = None
     zing_block0_cache_dir: str | None = None
     zing_block0_cache_disk_gb: float | None = None
+    zing_block0_cache_storage: str = "mounted"
     zing_block0_cache_gc: bool = False
     zing_block0_cache_gc_interval_s: float = 60.0
     zing_block0_cache_gc_stale_s: float = 600.0
     zing_block0_cache_gc_low_watermark: float = 0.9
+    zing_block0_cache_budget_root: str | None = None
+    zing_block0_cache_min_free_gb: float = 0.0
+    zing_block0_cache_inflight_gb: float = 128.0
+    zing_block0_cache_max_writers: int = 2
+    zing_block0_cache_gc_high_watermark: float = 1.0
+    zing_block0_cache_capacity_dir: str | None = None
+    zing_block0_cache_host_total_gb: float | None = None
     conditioning_service_url: str | None = None
     conditioning_config: str | None = field(default=None, repr=False)
     realtime_max_message_bytes: int = DEFAULT_MESSAGE_BYTES
@@ -2170,19 +2178,54 @@ class ServerArgs(DisaggServerArgsMixin):
         parser.add_argument(
             "--zing-block0-cache-dir",
             default=None,
-            help="Required with Block0 caching: an existing directory on mounted local storage (NVMe); same-host instances may share it.",
+            help="Required with Block0 caching: an existing cache directory; mounted storage is required unless --zing-block0-cache-storage=local.",
+        )
+        parser.add_argument(
+            "--zing-block0-cache-storage",
+            choices=("mounted", "local"),
+            default=ServerArgs.zing_block0_cache_storage,
+            help="mounted requires a separate storage mount; local explicitly permits the existing container/local filesystem and does not provide cross-instance sharing.",
         )
         parser.add_argument(
             "--zing-block0-cache-disk-gb",
             type=float,
             default=None,
-            help="Required with Block0 caching: shared-root GC high watermark in decimal GB (not a hard quota).",
+            help="Required with Block0 caching: shared-root admission budget in decimal GB, including temporary and legacy data. External writers still require a filesystem quota.",
         )
 
         parser.add_argument(
+            "--zing-block0-cache-budget-root",
+            default=None,
+            help="Shared local L2 budget root; all namespace/legacy bytes count, only registered entries are collectible.",
+        )
+        parser.add_argument(
+            "--zing-block0-cache-min-free-gb",
+            type=float,
+            default=0.0,
+            help="Filesystem free space reserved outside L2 writes, decimal GB.",
+        )
+        parser.add_argument(
+            "--zing-block0-cache-inflight-gb", type=float, default=128.0
+        )
+        parser.add_argument("--zing-block0-cache-max-writers", type=int, default=2)
+        parser.add_argument(
+            "--zing-block0-cache-gc-high-watermark", type=float, default=1.0
+        )
+        parser.add_argument(
+            "--zing-block0-cache-capacity-dir",
+            default=None,
+            help="Shared local machine admission directory, mounted identically in every instance.",
+        )
+        parser.add_argument(
+            "--zing-block0-cache-host-total-gb",
+            type=float,
+            default=None,
+            help="Total L1 cache budget across all ranks and instances on this machine, decimal GB.",
+        )
+        parser.add_argument(
             "--zing-block0-cache-gc",
             action="store_true",
-            help="Enable periodic shared-root GC in this instance only; enable in exactly one instance per root.",
+            help="Enable periodic shared-root GC; a kernel lock elects one collector per pass across instances.",
         )
         parser.add_argument(
             "--zing-block0-cache-gc-interval-s",

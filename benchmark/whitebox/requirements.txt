@@ -1,0 +1,18 @@
+# CPU control plane / mock worker. No CUDA, model weights or torch installation.
+av==17.1.0
+aiortc==1.15.0
+# 0.11.0 can trigger an ICE pair before aiortc supplies remote credentials.
+# Keep the verified DataChannel transport dependency; native RTP uses Pion.
+aioice==0.10.2
+boto3==1.43.111
+cryptography==50.0.2
+fastapi==0.143.0
+httpx==0.28.1
+msgspec==0.22.0
+numpy==2.5.4
+opentelemetry-api==1.45.1
+pillow==12.3.0
+prometheus-client==0.26.0
+redis==8.1.0
+uvicorn==0.54.0
+websockets==17.2
