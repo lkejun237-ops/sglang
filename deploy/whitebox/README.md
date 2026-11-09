@@ -116,6 +116,8 @@ Decoder overlap 和 defer-final；AdaLN=resident、W6/S0、每玩家期限1800�
 - 测试环境仅新增 standalone DiT、复用既有Encoder/Decoder：使用原生`dit_worker`及
   `SGLANG_ROLE_POOL_WORKER_CONFIG`。不得调用整组启动器或重启已有Encoder/Decoder/Coordinator。
   完整字段来源、命令与验收/回滚边界见上方唯一手册。
+- 独立源码归档、OSS 分发及三角色启动：见 [原生角色启动器](../sglang/README.md)。
+  managed Encoder/Decoder 的接线与验收边界见唯一手册 C 节；当前启动器不透传 pool 配置或 Secret。
 
 实际bindings、Secret、准备视图、plan和进程日志均在Git外。plan、资产准备和模型state输出
 会检查该边界；构建继续使用临时Git archive，不扩大共享.gitignore。

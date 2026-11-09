@@ -171,6 +171,15 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=2 --module \
 
 SP2 的两个 rank 共同构成一个 DiT service，仅 rank 0 对外通信。客户端 仍只查询并建连一个 DiT HTTP 地址，不需要提交两个 rank 的地址，也无需在 `build_group` 请求中重复指定 SP。
 
+### 3.2 源码准备与 managed pool
+
+不可变源码准备与独立角色启动见
+[原生角色启动器](https://github.com/seedleap/sglang/blob/main/deploy/sglang/README.md)；
+Whitebox 正式发布及 managed Encoder/Decoder 接线边界见
+[唯一发布手册](/docs/sglang-diffusion/zing/plans/whitebox-manual-releases)。
+managed pool 的租约与建组由 Coordinator 管理，使用其签名控制接口；本页原生 Master
+协议用于自行拥有的测试组，退出时保留借用角色。角色 ready 不代替注册、配组和生成验收。
+
 ## 4. 相关文档
 
 - [Worker 通信组接口协议](specs/WORKER_CONNECTION_API.md)：健康检查、查询预留、建组与销毁的请求／响应定义。

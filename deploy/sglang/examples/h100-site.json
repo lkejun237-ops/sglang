@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "image": "REQUIRES_VERIFIED_IMAGE@sha256:REQUIRES_DIGEST",
+  "namespace": "REQUIRES_EXISTING_NAMESPACE",
+  "volumes": [],
+  "volume_mounts": []
+}

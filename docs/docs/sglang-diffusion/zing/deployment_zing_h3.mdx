@@ -2147,3 +2147,14 @@ player's first chunk from inheriting the previous player's progress. CPU tests
 cover both normal destruction and rollback; production sequential-player replay
 and same-condition performance remain pending. No model, KV budget, sampling or
 transport setting changes are required.
+
+## 通用角色源码启动器（2026-11-09，当前版本未做 GPU 验证）
+
+[deploy/sglang 启动说明](../../../../deploy/sglang/README.md) 提供完整 commit 的 Git archive/摘要、
+OSS 内容寻址、本地安全解包和真实导入来源检查，以及上海 H100 K3s Encoder/Decoder 各一卡、
+上海 H200 PAI SP1 DiT 一卡的离线配置渲染。复用现有原生 worker，不依赖 Whitebox bundle/Room/SDK。
+模型固定为 1102 DMD step2000 generator（非 EMA），不能与本页旧模型结果混用。
+上海持久模型包和匹配 AdaLN table 路径/provenance 尚待核实，示例配置会阻断未填写的资产摘要。
+480 与 736 的当前版本整体及 Encoder/DiT/Decoder 耗时和显存均未测；H200 SP1 全常驻 736
+历史 OOM 仍是未关闭风险。CPU 归档/启动合同测试不能作为 GPU、跨节点 NCCL 或生成验收。
+完整配置、验证边界和提交命令仅维护在上述入口，不将渲染成功写作部署通过。

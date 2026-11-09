@@ -94,6 +94,14 @@ shasum -a 256 room-sdk.tar.gz
 现有云平台可能保存独立 Dockerfile/Jenkins 定义。首次迁移时必须人工确认其使用仓库完整构建入口，
 删除旧的“只覆盖 whitebox 子目录”构建方式及 SDK 文件覆盖步骤。**只合并源码不会更改平台保存的构建定义。**
 
+## 独立源码部署入口
+
+完整 commit 的归档、OSS 分发、摘要校验、本地解包、导入来源和运行回执统一使用
+[原生角色启动器](https://github.com/seedleap/sglang/blob/main/deploy/sglang/README.md)，
+不再在本手册维护另一套源码覆盖脚本。该入口还说明模型侧 transport 与 CPU 控制面依赖隔离、
+镜像构建身份与实际 runtime 身份的区别。正式 Whitebox 发布继续按上文构建完整 main 镜像，
+通过 bundle 和四角色版本核验；独立启动器的回执不替代正式发布验收。
+
 ## 模型启动与资产
 
 使用当前bundle生成新的 `asset_root` 视图与准备回执；原部署视图保留供完整回滚，不能拿旧回执冒充新bundle：
@@ -275,6 +283,32 @@ curl --fail "$DECODER_HTTP/get_connection_status?reserve=false"
 每玩家首个可见模型画面后180秒及既有性能/缓存/画质/联机要求。B 回滚只 drain/撤回本次新 DiT
 及其已确认归属的组，保留原 Encoder/Decoder/Coordinator、缓存与其他租约；A 回滚完整镜像、
 源码/SDK/config/资产身份，绝不通过覆盖几个文件或强删隔离状态完成。
+
+### C. 独立 Encoder/Decoder 与 managed pool 的边界
+
+独立角色的源码准备、平台渲染和原生 worker 启动使用上述启动器文档。
+当前启动器不透传 `SGLANG_ROLE_POOL_WORKER_CONFIG` 或 pool Secret；角色 `/health` ready
+不表示已注册 Coordinator。需要接入 managed pool 时，使用已授权的原生 worker 接线流程，
+在专用环境中显式提供角色配置和现有 Secret；不能仅给当前启动器的父进程设置该变量。
+
+managed Encoder/Decoder 沿用 B 的合同，配置分别声明 `role=encoder` 或 `role=decoder`、
+`service_count=1`，hardware_ids 对应本次分配的卡；capacity/profiles/profile_limits 来自该角色实测。
+pool_id/control_epoch/coordinator_url、签名与角色 token 引用、compatibility/network_domain
+须与既有 Coordinator 和配对角色核对，不能自行命名后宣称兼容；完整字段见
+[Managed Role Pool](../specs/MANAGED_ROLE_POOL.md)。每个 service 同时只服务一个玩家。
+
+Encoder 使用原生 `zing_source_encoder_server`，加载 Qwen、参考图/source VAE，保留输入几何、
+参考图预算、conditioning 和独立 pipeline 语义。Decoder 使用原生 `decoder_worker` 的
+单进程 torchrun 入口、独立 Lynn 架构/权重和 `decoder_config`。含输出 decoder_config 的 DiT
+pipeline 不能原样传给 Encoder；三角色模型、采样、协议及 profile 必须匹配。
+各独立 Encoder/Decoder 占一张已分配 GPU，管理、transport、rendezvous/output 端口按角色核对；
+平台须显式覆盖模型镜像默认的整组 ENTRYPOINT，不调用 A 的启动器重启借用角色。
+
+验收分别记录模型加载、角色 ready、注册及 Coordinator READY，再通过正常玩家准入配齐三角色，
+检查真实首帧、持续输入、取消、资源释放和下一玩家。managed 组与租约由 Coordinator 管理；
+自行拥有的原生测试组按自己的 owner 建组/销组，借用角色保持运行。
+回滚只 drain/撤回本次新增角色及其已确认归属的组，保留原角色、Coordinator、缓存和其他租约。
+新旧源码混配须验证模型、几何、采样、协议与收尾能力；健康或注册成功不等于配组生成通过。
 
 ## 版本与配置对照的证据等级
 

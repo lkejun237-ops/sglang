@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "image": "REQUIRES_VERIFIED_IMAGE@sha256:REQUIRES_DIGEST",
+  "job_spec": {
+    "Type": "Worker",
+    "PodCount": 1,
+    "QuotaId": "quota3l8bnv9a35n",
+    "RestartPolicy": "Never",
+    "ResourceConfig": {
+      "GPU": "1",
+      "CPU": "REQUIRES_VERIFIED_CPU",
+      "Memory": "REQUIRES_VERIFIED_MEMORY",
+      "SharedMemory": "REQUIRES_VERIFIED_SHM"
+    }
+  },
+  "data_sources": []
+}
