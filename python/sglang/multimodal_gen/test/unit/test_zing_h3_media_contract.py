@@ -1833,6 +1833,56 @@ def test_initial_normalization_failure_agrees_before_qwen(codecs, monkeypatch):
     assert receipts == [False]
 
 
+def test_prepare_decode_failure_and_compute_validation_agree_before_qwen(
+    codecs, monkeypatch
+):
+    from sglang.multimodal_gen.runtime.conditioning import worker
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+
+    monkeypatch.setattr(
+        codecs,
+        "_decode_media",
+        lambda *a, **kw: (_ for _ in ()).throw(OSError("corrupt source media")),
+    )
+    receipts = []
+    monkeypatch.setattr(
+        worker, "coordinate_validation", lambda ok: receipts.append(ok) or [ok, True]
+    )
+    with pytest.raises(ConditionError, match="Media normalization failed") as exc_info:
+        codecs.prepare(
+            make_request("video", source=True),
+            lambda _: pytest.fail("No model may run"),
+            conditioning=lambda *a: pytest.fail("Qwen must not run"),
+        )
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert receipts == [False]
+
+    receipts.clear()
+    monkeypatch.setattr(
+        codecs,
+        "_decode_media",
+        lambda item, **kw: dict(
+            item,
+            frames=torch.zeros(3, 1, 32, 32, dtype=torch.uint8),
+            fps=24.0,
+        ),
+    )
+    monkeypatch.setattr(
+        codecs,
+        "validate_compute_inputs",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            ConditionError("CONDITION_INVALID", "This video size is not supported")
+        ),
+    )
+    with pytest.raises(ConditionError, match="This video size is not supported"):
+        codecs.prepare(
+            make_request("video", source=False),
+            lambda _: pytest.fail("No model may run"),
+            conditioning=lambda *a: pytest.fail("Qwen must not run"),
+        )
+    assert receipts == [False]
+
+
 @pytest.mark.parametrize("kind", ["image", "video", "video_audio"])
 @pytest.mark.parametrize("external", [False, True])
 def test_unassigned_visual_media_rejected_before_qwen_or_vae(

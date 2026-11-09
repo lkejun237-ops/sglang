@@ -1,11 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """DiT-only communication owner, independent of the model consumption loop."""
 
+import json
+import threading
 import time
 from concurrent.futures import Future, TimeoutError
 from contextlib import nullcontext
 from queue import Empty, Full, Queue
 from threading import Event, Thread
+
+import torch
+
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 class DiTIOChannel:
@@ -105,10 +113,15 @@ class DiTIOChannel:
 
     def _run(self):
         pending = None
+        _active_stream_handle = None
         try:
             self.transport = self.factory()
             context = getattr(self.transport, "io_context", nullcontext)
             with context():
+                if getattr(torch.cuda, "is_available", lambda: False)():
+                    _active_stream_handle = getattr(
+                        torch.cuda.current_stream(), "cuda_stream", None
+                    )
                 self.ready.set_result(None)
                 while not self.stopping.is_set():
                     if self.pause_requested.is_set():
@@ -134,6 +147,29 @@ class DiTIOChannel:
                     else:
                         self.stopping.wait(self.poll_interval_s)
         except BaseException as exc:  # noqa: BLE001 - propagate thread failure to owner
+            try:
+                _cur_stream = _active_stream_handle
+                if (
+                    _cur_stream is None
+                    and getattr(torch.cuda, "is_available", lambda: False)()
+                ):
+                    _cur_stream = getattr(
+                        torch.cuda.current_stream(), "cuda_stream", None
+                    )
+                logger.exception(
+                    "ZING_DIT_IO_FIRST_ERROR_JSON %s",
+                    json.dumps(
+                        dict(
+                            thread_name=threading.current_thread().name,
+                            thread_id=threading.get_ident(),
+                            current_stream=_cur_stream,
+                            error_type=type(exc).__name__,
+                            error=str(exc),
+                        )
+                    ),
+                )
+            except Exception:
+                pass
             self.error = exc
         finally:
             self.stopping.set()

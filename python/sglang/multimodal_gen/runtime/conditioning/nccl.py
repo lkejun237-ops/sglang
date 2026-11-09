@@ -23,6 +23,9 @@ from sglang.multimodal_gen.runtime.tensor_bridge import (
     receive_into,
     send_tensor,
 )
+from sglang.multimodal_gen.runtime.utils.zing_capture_stream import (
+    conditioning_nccl_stream,
+)
 
 from .client import _network_loop
 from .contract import ConditionError, canonical_json, safe_json
@@ -525,7 +528,7 @@ class NcclReceiver:
         # later exchanges retain the normal operation timeout, not a short
         # first request's remaining connection budget.
         self.store.set_timeout(timedelta(seconds=client.timeout_s))
-        self.stream = torch.cuda.Stream(device=self.device)
+        self.stream = conditioning_nccl_stream(self.device)
 
     def encode(self, body, input_digest, device, *, deadline=None):
         deadline = (

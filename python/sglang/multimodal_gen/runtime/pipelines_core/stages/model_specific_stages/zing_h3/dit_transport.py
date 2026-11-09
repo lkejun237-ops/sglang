@@ -29,10 +29,20 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.nccl_bridge import (
 
 
 class EncoderDiTChannel:
-    def __init__(self, group, socket, *, rank, device, max_bytes=256 << 20):
+    def __init__(
+        self,
+        group,
+        socket,
+        *,
+        rank,
+        device,
+        max_bytes=256 << 20,
+        stream_key=None,
+    ):
         self.group, self.socket = group, socket
         self.peer, self.device = 1 - rank, device
         self.max_bytes = max_bytes
+        self.stream_key = self.peer if stream_key is None else stream_key
         self.sent = self.received = 0
         self.store = self.context = None
         self.aborted = False
@@ -42,9 +52,18 @@ class EncoderDiTChannel:
     def io_context(self):
         """DiT I/O owner only; Encoder's existing execution path is unchanged."""
         if torch.device(self.device).type == "cuda":
+            from sglang.multimodal_gen.runtime.utils.zing_capture_stream import (
+                dit_io_stream,
+            )
+
             with (
                 torch.cuda.device(self.device),
-                torch.cuda.stream(torch.cuda.Stream(device=self.device)),
+                torch.cuda.stream(
+                    dit_io_stream(
+                        device=self.device,
+                        key=getattr(self, "stream_key", self.peer),
+                    )
+                ),
             ):
                 yield
         else:
@@ -182,7 +201,13 @@ class EncoderDiTChannel:
                 initialization.device,
                 timeout=timeout,
             )
-            channel = cls(group, socket, rank=rank, device=device)
+            channel = cls(
+                group,
+                socket,
+                rank=rank,
+                device=device,
+                stream_key=f"{host if rank == 0 else bind_host}:{port}:{rank}",
+            )
             channel.store, channel.context = store, context
             return channel
         except BaseException:

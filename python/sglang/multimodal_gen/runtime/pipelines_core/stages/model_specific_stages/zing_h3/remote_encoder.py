@@ -23,6 +23,12 @@ import torch
 import torch.distributed as dist
 import zmq
 
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.zing_capture_stream import (  # noqa: F401
+    remote_encoder_stream,
+)
+
+logger = init_logger(__name__)
 from .encoder_recovery import request_abort
 from .encoder_transport import bridge_group, receive_moments
 from .media_geometry import SourceGeometry
@@ -329,8 +335,37 @@ class RemoteEncoderSession:
             self.accepted_frames, self.ended
         )
 
+    def _sync_leader_step(self, fn):
+        err_payload = None
+        caught = None
+        if self.leader:
+            try:
+                fn()
+            except BaseException as exc:
+                caught = exc
+                err_payload = (type(exc).__name__, str(exc))
+        group = getattr(self, "group", None)
+        if (
+            group is not None
+            and getattr(group, "world_size", 1) > 1
+            and getattr(group, "cpu_group", None) is not None
+        ):
+            payload = [err_payload]
+            dist.broadcast_object_list(
+                payload, src=group.ranks[0], group=group.cpu_group
+            )
+            err_payload = payload[0]
+        if caught is not None:
+            raise caught
+        if err_payload is not None:
+            err_type, err_msg = err_payload
+            if err_type == "ValueError":
+                raise ValueError(err_msg)
+            raise RuntimeError(err_msg)
+
     def append(self, pixels, *, frame_start):
-        self._open()
+        if self.disposed:
+            raise ValueError("Remote encoder is disposed")
         if (
             self.ended
             or type(frame_start) is not int
@@ -359,27 +394,38 @@ class RemoteEncoderSession:
             or retained > self.capacity_bytes
         ):
             raise ValueError("Remote encoder input capacity exceeded")
-        if self.leader and self.admission_endpoint:
-            self._check_admission(
-                frame_start,
-                pixels.permute(1, 2, 3, 0).contiguous().numpy().tobytes(),
-                "dispatch",
-            )
-        elif self.leader:
-            # One bounded copy owns the input until the encoder accepts it.
-            self.commands.put(
-                ("append", pixels.cpu().contiguous().clone(), frame_start),
-                timeout=self.timeout,
-            )
+
+        def _leader_append():
+            self._open()
+            if self.admission_endpoint:
+                self._check_admission(
+                    frame_start,
+                    pixels.permute(1, 2, 3, 0).contiguous().numpy().tobytes(),
+                    "dispatch",
+                )
+            else:
+                # One bounded copy owns the input until the encoder accepts it.
+                self.commands.put(
+                    ("append", pixels.cpu().contiguous().clone(), frame_start),
+                    timeout=self.timeout,
+                )
+
+        self._sync_leader_step(_leader_append)
         self.signature = signature
         self.accepted_frames += count
 
     def finish(self):
-        self._open()
+        if self.disposed:
+            raise ValueError("Remote encoder is disposed")
         if self.ended or self.accepted_frames == 0:
             raise ValueError("Remote encoder requires a nonempty unfinished stream")
-        if self.leader and not self.admission_endpoint:
-            self.commands.put(("finish", None, None), timeout=self.timeout)
+
+        def _leader_finish():
+            self._open()
+            if not self.admission_endpoint:
+                self.commands.put(("finish", None, None), timeout=self.timeout)
+
+        self._sync_leader_step(_leader_finish)
         self.ended = True
 
     def _check_admission(self, start, data, owner):
@@ -420,6 +466,7 @@ class RemoteEncoderSession:
         opened = open_attempted = False
         data_operation_active = False
         rpc_in_flight = False
+        stream = None
 
         def rpc(op, payload=None, **fields):
             nonlocal rpc_in_flight
@@ -440,7 +487,14 @@ class RemoteEncoderSession:
 
         try:
             torch.cuda.set_device(self.device)
-            stream = torch.cuda.Stream(device=self.device)
+            _enc_stream_fn = globals().get("remote_encoder_stream")
+            if (
+                _enc_stream_fn is not None
+                and getattr(torch.cuda, "is_available", lambda: False)()
+            ):
+                stream = _enc_stream_fn(self.device)
+            else:
+                stream = torch.cuda.Stream(device=self.device)
             source_encoding = (
                 None if self.source_geometry is None else self.source_geometry.receipt()
             )
@@ -715,6 +769,29 @@ class RemoteEncoderSession:
                         data_operation_active = False
                         self.results.put((reply, value), timeout=self.timeout)
         except BaseException as error:
+            try:
+                _log = globals().get("logger")
+                if _log is None:
+                    import logging as _logging
+
+                    _log = _logging.getLogger(__name__)
+                _log.exception(
+                    "ZING_REMOTE_ENCODER_FIRST_ERROR_JSON %s",
+                    json.dumps(
+                        dict(
+                            session=getattr(self, "token", None),
+                            thread_name=threading.current_thread().name,
+                            thread_id=threading.get_ident(),
+                            stream=getattr(stream, "cuda_stream", None),
+                            rpc_in_flight=rpc_in_flight,
+                            data_operation_active=data_operation_active,
+                            error_type=type(error).__name__,
+                            error=str(error),
+                        )
+                    ),
+                )
+            except Exception:
+                pass
             self.failure = error
         finally:
             if opened and self.failure is None and not rpc_in_flight:

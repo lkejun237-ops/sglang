@@ -155,6 +155,51 @@ def test_one_send_failure_notifies_lifecycle_once():
     assert failures == ["failed"]
 
 
+def test_dit_io_logs_first_error_json_on_exception(monkeypatch):
+    import contextlib
+    from types import SimpleNamespace
+
+    import torch
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        dit_io,
+    )
+
+    logged = []
+
+    class DummyLogger:
+        def exception(self, msg, *args):
+            logged.append(msg % args if args else msg)
+
+    monkeypatch.setattr(dit_io, "logger", DummyLogger(), raising=False)
+    active = [SimpleNamespace(cuda_stream=0)]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: active[0])
+
+    class ContextTransport(Transport):
+        @contextlib.contextmanager
+        def io_context(self):
+            active[0] = SimpleNamespace(cuda_stream=5555)
+            try:
+                yield
+            finally:
+                active[0] = SimpleNamespace(cuda_stream=0)
+
+    incoming, received, closed = Queue(), [], threading.Event()
+    io = DiTIOChannel(
+        lambda: ContextTransport(incoming, received, closed, fail="receive")
+    ).start()
+    try:
+        incoming.put({"type": "source.moments"})
+        assert closed.wait(3)
+    finally:
+        io.close()
+    assert any(
+        "ZING_DIT_IO_FIRST_ERROR_JSON" in entry and '"current_stream": 5555' in entry
+        for entry in logged
+    )
+
+
 @pytest.mark.parametrize("abort_fails", [False, True])
 @pytest.mark.parametrize("second_abort", [False, True])
 def test_transport_abort_claim_prevents_concurrent_shutdown(abort_fails, second_abort):

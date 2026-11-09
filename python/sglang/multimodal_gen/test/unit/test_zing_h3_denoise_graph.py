@@ -3331,7 +3331,141 @@ def private_capture_stream_driver(monkeypatch):
         raise AssertionError("A pooled stream cannot be reserved for capture")
 
     monkeypatch.setattr(torch.cuda, "Stream", pooled_stream_is_not_private)
+    monkeypatch.setattr(module, "_ORIG_CUDA_STREAM", pooled_stream_is_not_private)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "device",
+        lambda dev: collections.abc.Callable and __import__("contextlib").nullcontext(),
+    )
     return module, calls
+
+
+def test_background_io_private_streams_and_peer_isolation(
+    private_capture_stream_driver, monkeypatch
+):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.dit_transport import (
+        EncoderDiTChannel,
+    )
+
+    module, calls = private_capture_stream_driver
+    enc_stream = module.remote_encoder_stream("cuda:0")
+    cond_stream = module.conditioning_nccl_stream("cuda:0")
+    io_peer0 = module.dit_io_stream("cuda:0", key="peer0")
+    io_peer1 = module.dit_io_stream("cuda:0", key="peer1")
+    assert (
+        len(
+            {
+                enc_stream.cuda_stream,
+                cond_stream.cuda_stream,
+                io_peer0.cuda_stream,
+                io_peer1.cuda_stream,
+            }
+        )
+        == 4
+    )
+    assert module.remote_encoder_stream("cuda:0") is enc_stream
+    assert module.conditioning_nccl_stream("cuda:0") is cond_stream
+    assert module.dit_io_stream("cuda:0", key="peer0") is io_peer0
+    assert module.dit_io_stream("cuda:0", key="peer1") is io_peer1
+
+    # Verify two EncoderDiTChannel instances with rank=0 on different ports get distinct streams in io_context()
+    activated_streams = []
+    monkeypatch.setattr(
+        torch.cuda,
+        "stream",
+        lambda s: activated_streams.append(s) or __import__("contextlib").nullcontext(),
+    )
+    ch1 = EncoderDiTChannel(
+        object(), object(), rank=0, device="cuda:0", stream_key="127.0.0.1:29501:0"
+    )
+    ch2 = EncoderDiTChannel(
+        object(), object(), rank=0, device="cuda:0", stream_key="127.0.0.1:29502:0"
+    )
+    with ch1.io_context():
+        pass
+    with ch2.io_context():
+        pass
+    assert len(activated_streams) == 2
+    assert activated_streams[0].cuda_stream != activated_streams[1].cuda_stream
+
+    # Verify fallback when torch.cuda.Stream is monkeypatched by CPU unit tests
+    sentinel = object()
+    monkeypatch.setattr(torch.cuda, "Stream", lambda *a, **kw: sentinel)
+    assert module.remote_encoder_stream("cuda:0") is sentinel
+    assert module.dit_io_stream("cuda:0", key="peer2") is sentinel
+    assert module.conditioning_nccl_stream("cuda:0") is sentinel
+
+
+@pytest.mark.parametrize("fail_capture", [False, True])
+def test_cuda_graph_backend_logs_capture_event_json(monkeypatch, fail_capture):
+    import contextlib
+
+    from sglang.multimodal_gen.runtime.models.dits import (
+        zing_h3_denoise_graph as graph_mod,
+    )
+
+    events = []
+
+    class DummyLogger:
+        def info(self, msg, *args):
+            events.append(("info", msg % args if args else msg))
+
+        def error(self, msg, *args, **kwargs):
+            events.append(("error", msg % args if args else msg))
+
+        def exception(self, msg, *args, **kwargs):
+            events.append(("exception", msg % args if args else msg))
+
+    caller = SimpleNamespace(cuda_stream=1111, device=0, wait_stream=lambda other: None)
+    cap_stream = SimpleNamespace(
+        cuda_stream=2222, device=0, wait_stream=lambda other: None
+    )
+    monkeypatch.setattr(graph_mod, "logger", DummyLogger())
+    monkeypatch.setattr(graph_mod, "capture_stream", lambda: cap_stream)
+    monkeypatch.setattr(graph_mod, "nccl_during_capture", contextlib.nullcontext)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: caller)
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda s: None)
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: "pool")
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: SimpleNamespace())
+    monkeypatch.setattr(torch.cuda, "graph", lambda *a, **kw: contextlib.nullcontext())
+
+    backend = CudaGraphBackend()
+    calls = []
+
+    def fn():
+        calls.append(1)
+        if fail_capture and len(calls) == 2:
+            raise RuntimeError("injected stream capture failure")
+        return ("ok",)
+
+    if fail_capture:
+        with pytest.raises(RuntimeError, match="injected stream capture failure"):
+            backend.capture(fn)
+        assert any(
+            "ZING_GRAPH_CAPTURE_EVENT_JSON" in m and '"phase": "start"' in m
+            for _, m in events
+        )
+        assert any(
+            "ZING_GRAPH_CAPTURE_EVENT_JSON" in m
+            and '"phase": "failed"' in m
+            and "2222" in m
+            for _, m in events
+        )
+    else:
+        backend.capture(fn)
+        assert any(
+            "ZING_GRAPH_CAPTURE_EVENT_JSON" in m and '"phase": "start"' in m
+            for _, m in events
+        )
+        assert any(
+            "ZING_GRAPH_CAPTURE_EVENT_JSON" in m
+            and '"phase": "end"' in m
+            and "2222" in m
+            for _, m in events
+        )
 
 
 def test_private_capture_stream_is_bounded_and_not_a_pooled_wrapper(

@@ -381,55 +381,84 @@ class ZingH3Codecs(ZingH3MediaInput):
     def encode_visual(self, frames):
         from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 
-        model = self.modules["video_vae"]
-        device = next(model.parameters()).device
-        dtype = getattr(torch, self.runtime["vae_config"]["encode_dtype"])
-        # Only the encoder changes precision. Decoder weights remain FP32.
-        model.encoder.to(dtype=dtype)
-        model.quant_conv.to(dtype=dtype)
-        pixels = frames[None].to(device=device, dtype=dtype).div(255)
-        mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
-        std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
-        pixels = (pixels - mean) / std
-        count = pixels.shape[2]
-        if count != 1 and count % self.vae_frames_per_chunk:
-            pixels = torch.cat(
-                (
-                    pixels,
-                    pixels[:, :, -1:].expand(
-                        -1, -1, -count % self.vae_frames_per_chunk, -1, -1
+        encode_mode = self.runtime["vae_config"]["encode_mode"]
+        err_payload = None
+        caught = None
+        normalized = None
+        try:
+            model = self.modules["video_vae"]
+            device = next(model.parameters()).device
+            dtype = getattr(torch, self.runtime["vae_config"]["encode_dtype"])
+            # Only the encoder changes precision. Decoder weights remain FP32.
+            model.encoder.to(dtype=dtype)
+            model.quant_conv.to(dtype=dtype)
+            pixels = frames[None].to(device=device, dtype=dtype).div(255)
+            mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
+            std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
+            pixels = (pixels - mean) / std
+            count = pixels.shape[2]
+            if count != 1 and count % self.vae_frames_per_chunk:
+                pixels = torch.cat(
+                    (
+                        pixels,
+                        pixels[:, :, -1:].expand(
+                            -1, -1, -count % self.vae_frames_per_chunk, -1, -1
+                        ),
                     ),
-                ),
-                2,
-            )
-        with _visual_encode_policy(
-            self.runtime["vae_config"]["encode_mode"],
-            self.runtime["vae_config"].get("cudnn_benchmark_limit"),
-        ):
-            moments = torch.cat(
-                encode_clips(
-                    model,
-                    list(pixels.split(self.vae_frames_per_chunk, dim=2)),
-                    self.runtime["vae_config"]["encode_tile_batch_size"],
-                ),
-                2,
-            )
-            chunks, tail = divmod(count - 1, self.vae_frames_per_chunk)
-            length = (
-                chunks * self.vae_latents_per_chunk
-                + 1
-                + math.ceil(tail / self.temporal_ratio)
-            )
-            posterior = DiagonalGaussianDistribution(moments[:, :, :length])
-            generator = torch.Generator(device="cpu").manual_seed(
-                self.runtime["vae_config"]["posterior_seed"]
-            )
-            latent = posterior.sample(generator=generator).half().float()
-        mean, std = self._stats(self.va, latent)
-        normalized = ((latent - mean) / std).half()
-        return _replicated_visual_latent(
-            normalized, self.runtime["vae_config"]["encode_mode"]
-        )
+                    2,
+                )
+            with _visual_encode_policy(
+                encode_mode,
+                self.runtime["vae_config"].get("cudnn_benchmark_limit"),
+            ):
+                moments = torch.cat(
+                    encode_clips(
+                        model,
+                        list(pixels.split(self.vae_frames_per_chunk, dim=2)),
+                        self.runtime["vae_config"]["encode_tile_batch_size"],
+                    ),
+                    2,
+                )
+                chunks, tail = divmod(count - 1, self.vae_frames_per_chunk)
+                length = (
+                    chunks * self.vae_latents_per_chunk
+                    + 1
+                    + math.ceil(tail / self.temporal_ratio)
+                )
+                posterior = DiagonalGaussianDistribution(moments[:, :, :length])
+                generator = torch.Generator(device="cpu").manual_seed(
+                    self.runtime["vae_config"]["posterior_seed"]
+                )
+                latent = posterior.sample(generator=generator).half().float()
+            mean, std = self._stats(self.va, latent)
+            normalized = ((latent - mean) / std).half()
+        except BaseException as exc:
+            caught = exc
+            err_payload = (type(exc).__name__, str(exc))
+
+        if encode_mode == "performance" and torch.distributed.is_initialized():
+            from sglang.multimodal_gen.runtime.distributed import get_sp_group
+
+            sp_group = get_sp_group()
+            if (
+                getattr(sp_group, "world_size", 1) > 1
+                and getattr(sp_group, "cpu_group", None) is not None
+            ):
+                gathered = [None] * sp_group.world_size
+                torch.distributed.all_gather_object(
+                    gathered, err_payload, group=sp_group.cpu_group
+                )
+                if caught is not None:
+                    raise caught
+                for item in gathered:
+                    if item is not None:
+                        err_type, err_msg = item
+                        raise RuntimeError(
+                            f"Visual encoding failed on a peer SP rank ({err_type}): {err_msg}"
+                        )
+        if caught is not None:
+            raise caught
+        return _replicated_visual_latent(normalized, encode_mode)
 
     def encode_reference(self, item):
         cache = getattr(self, "reference_cache", None)
@@ -556,34 +585,6 @@ class ZingH3Codecs(ZingH3MediaInput):
             raise ValueError(
                 "Zing runtime accepts media messages, not pickled request caches"
             )
-        # 请求可局部覆盖 source/reference 面积；必须在解码前失败，且不改常驻配置。
-        max_area_config = _sample_max_area_config(self.max_area_config, request)
-        prompt, items, target, conditions, source = self._parse_inference_request(
-            request
-        )
-        audio_ids = {
-            c["content_id"] for c in conditions if "audio" in c["latent_modalities"]
-        }
-        reference_ids = {c["content_id"] for c in conditions}
-        media = [
-            (
-                self._decode_reference_image(item, max_area_config=max_area_config)
-                if item["type"] == "image" and item["id"] in reference_ids
-                else self._decode_media(item, need_audio=item["id"] in audio_ids)
-            )
-            for item in items
-        ]
-        if source_preview is not None:
-            # Internal decoded S0 from the accepted source command, never wire
-            # media or a URI. Keep it on the Qwen track, outside VAE conditions.
-            if any(item["type"] in {"video", "video_audio"} for item in items) or any(
-                item["id"] == source_preview["id"] for item in items
-            ):
-                raise ValueError("Source presentation conflicts with explicit media")
-            media.insert(0, dict(source_preview, origin="source_s0"))
-        source = (
-            None if source is None else self._decode_media(source, need_audio=False)
-        )
         if conditioning is not None and not callable(conditioning):
             raise ConditionError(
                 "CONDITION_INVALID",
@@ -598,6 +599,36 @@ class ZingH3Codecs(ZingH3MediaInput):
             )
         error = None
         try:
+            # 请求可局部覆盖 source/reference 面积；必须在解码前失败，且不改常驻配置。
+            max_area_config = _sample_max_area_config(self.max_area_config, request)
+            prompt, items, target, conditions, source = self._parse_inference_request(
+                request
+            )
+            audio_ids = {
+                c["content_id"] for c in conditions if "audio" in c["latent_modalities"]
+            }
+            reference_ids = {c["content_id"] for c in conditions}
+            media = [
+                (
+                    self._decode_reference_image(item, max_area_config=max_area_config)
+                    if item["type"] == "image" and item["id"] in reference_ids
+                    else self._decode_media(item, need_audio=item["id"] in audio_ids)
+                )
+                for item in items
+            ]
+            if source_preview is not None:
+                # Internal decoded S0 from the accepted source command, never wire
+                # media or a URI. Keep it on the Qwen track, outside VAE conditions.
+                if any(
+                    item["type"] in {"video", "video_audio"} for item in items
+                ) or any(item["id"] == source_preview["id"] for item in items):
+                    raise ValueError(
+                        "Source presentation conflicts with explicit media"
+                    )
+                media.insert(0, dict(source_preview, origin="source_s0"))
+            source = (
+                None if source is None else self._decode_media(source, need_audio=False)
+            )
             normalized_media, source, h, w, t, frames = self._normalize_inference_media(
                 media, source, conditions, target, max_area_config=max_area_config
             )
@@ -609,7 +640,7 @@ class ZingH3Codecs(ZingH3MediaInput):
                 source=source,
                 output_type=target["type"],
             )
-        except (ValueError, OSError) as exc:
+        except (ValueError, OSError, ConditionError) as exc:
             if conditioning is None:
                 raise
             error = exc
@@ -620,6 +651,8 @@ class ZingH3Codecs(ZingH3MediaInput):
 
             # Agree on CPU preparation before any rank enters Qwen/VAE collectives.
             if not all(coordinate_validation(error is None)):
+                if isinstance(error, ConditionError):
+                    raise error
                 raise ConditionError(
                     "CONDITION_INVALID", "Media normalization failed"
                 ) from error

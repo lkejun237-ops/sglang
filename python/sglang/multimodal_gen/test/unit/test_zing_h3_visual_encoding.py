@@ -80,3 +80,63 @@ def test_untiled_batch_limit_and_tail():
         assert torch.equal(result, clip * 2)
     with pytest.raises(ValueError, match="must be positive"):
         encode_clips(model, clips, 0)
+
+
+def test_encode_visual_performance_syncs_peer_rank_exception_before_broadcast(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+
+    import sglang.multimodal_gen.runtime.distributed as dist_mod
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        codecs as codecs_module,
+    )
+
+    codec = object.__new__(codecs_module.ZingH3Codecs)
+    codec.vae_frames_per_chunk = 17
+    codec.vae_latents_per_chunk = 5
+    codec.temporal_ratio = 4
+    codec.va = SimpleNamespace(latents_mean=[0.0], latents_std=[1.0])
+    codec.runtime = {
+        "vae_config": {
+            "encode_dtype": "float32",
+            "encode_mode": "performance",
+            "encode_tile_batch_size": 1,
+            "posterior_seed": 42,
+        }
+    }
+
+    class DummyVAE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = torch.nn.Linear(1, 1)
+            self.quant_conv = torch.nn.Linear(1, 1)
+
+    codec.modules = {"video_vae": DummyVAE()}
+    monkeypatch.setattr(
+        codecs_module,
+        "encode_clips",
+        lambda model, clips, batch_size: [torch.zeros(1, 4, 1, 2, 2)],
+    )
+
+    broadcast_called = []
+    fake_sp_group = SimpleNamespace(
+        world_size=2,
+        cpu_group="sp-cpu-group",
+        broadcast=lambda tensor, src=0: broadcast_called.append(True) or tensor,
+    )
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist_mod, "get_sp_group", lambda: fake_sp_group)
+
+    def fake_all_gather_object(out_list, obj, group=None):
+        out_list[0] = obj
+        out_list[1] = ("RuntimeError", "peer CUDA OOM during encode_clips")
+
+    monkeypatch.setattr(dist, "all_gather_object", fake_all_gather_object)
+
+    frames = torch.zeros(3, 1, 8, 8, dtype=torch.uint8)
+    with pytest.raises(RuntimeError, match="peer SP rank"):
+        codec.encode_visual(frames)
+    assert broadcast_called == []

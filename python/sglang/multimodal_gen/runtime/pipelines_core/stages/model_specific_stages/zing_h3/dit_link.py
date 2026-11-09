@@ -219,10 +219,41 @@ class DiTInputService:
         def reply(kind, **fields):
             self.channel.send(dict(type=kind, transfer_id=sequence, **fields))
 
+        def _sync_step_error(err=None):
+            group = getattr(self.channel, "group", None)
+            if group is None or getattr(group, "world_size", 1) <= 1:
+                if err is not None:
+                    raise err
+                return
+            local_payload = (
+                None
+                if err is None
+                else (type(err).__name__, getattr(err, "code", None), str(err))
+            )
+            errors = [
+                group.broadcast_object(
+                    local_payload if group.rank_in_group == rank else None,
+                    src=rank,
+                )
+                for rank in range(group.world_size)
+            ]
+            if err is not None:
+                raise err
+            for item in errors:
+                if item is not None:
+                    err_type, err_code, err_msg = item
+                    if err_type == "ConditionError":
+                        raise ConditionError(err_code or "CONDITION_INVALID", err_msg)
+                    raise RuntimeError(
+                        f"DiT rank operation failed ({err_type}): {err_msg}"
+                    )
+
         if kind == "cache.control":
             if self.owner is not None and identity != self.owner:
                 reply("input.rejected")
                 return
+            result = None
+            step_err = None
             try:
                 control = getattr(self.create_session, "cache_control", None)
                 result = (
@@ -234,6 +265,10 @@ class DiTInputService:
                         busy=self.owner is not None,
                     )
                 )
+            except BaseException as exc:
+                step_err = exc
+            try:
+                _sync_step_error(step_err)
             except BaseException:
                 reply("worker.error")
                 raise
@@ -343,20 +378,31 @@ class DiTInputService:
                     )
                     self.worker.source_records = message["source_records"]
                 if kind == "conditioning" and message.get("cache_hit"):
-                    expand = getattr(self.create_session, "cached_condition", None)
-                    if expand is None:
-                        raise ValueError("Cached conditioning is unavailable")
-                    message = expand(message, initial=initial_condition)
-                await self.worker.put(message)
-                while self.worker.queue:
-                    await self.worker.queue.run_once()
-                if self.decoder is not None and kind in (
-                    "source.moments",
-                    "source.end",
-                ):
-                    self.decoder.source_progress(
-                        self.worker.bridge.accepted_pixels, self.worker.source_records
-                    )
+                    expand_err = None
+                    try:
+                        expand = getattr(self.create_session, "cached_condition", None)
+                        if expand is None:
+                            raise ValueError("Cached conditioning is unavailable")
+                        message = expand(message, initial=initial_condition)
+                    except BaseException as exc:
+                        expand_err = exc
+                    _sync_step_error(expand_err)
+                step_err = None
+                try:
+                    await self.worker.put(message)
+                    while self.worker.queue:
+                        await self.worker.queue.run_once()
+                    if self.decoder is not None and kind in (
+                        "source.moments",
+                        "source.end",
+                    ):
+                        self.decoder.source_progress(
+                            self.worker.bridge.accepted_pixels,
+                            self.worker.source_records,
+                        )
+                except BaseException as exc:
+                    step_err = exc
+                _sync_step_error(step_err)
                 notice = getattr(self.worker, "conditioning_notice", None)
                 if notice is not None:
                     self.worker.conditioning_notice = None
@@ -396,7 +442,11 @@ class DiTInputService:
                 )
                 reply("input.processed")
                 return
-            logger.exception("DiT input processing failed")
+            import logging as _logging
+
+            (globals().get("logger") or _logging.getLogger(__name__)).exception(
+                "DiT input processing failed"
+            )
             # Teardown clears decoder; preserve the failure category for the
             # group owner before deciding whether model restart is required.
             remote = getattr(self.decoder, "remote", None)

@@ -351,3 +351,168 @@ def test_dit_owner_preserves_failure_category_after_decoder_close(decoder_failed
     assert service.transport_failed is decoder_failed
     assert owner.manager.restart_required is (not decoder_failed)
     assert owner.manager.state == ("idle" if decoder_failed else "failed")
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "cache_control_peer_error",
+        "cache_hit_expand_peer_condition_error",
+        "cache_hit_expand_peer_runtime_error",
+        "worker_step_peer_condition_error",
+        "worker_step_peer_runtime_error",
+    ],
+)
+def test_dit_input_service_syncs_step_errors_across_ranks_ast_compatible(boundary):
+    import logging
+    from contextlib import nullcontext
+
+    from sglang.multimodal_gen.runtime.realtime.polling_task_queue import (
+        PollingTaskQueue,
+    )
+
+    path = (
+        Path(__file__).resolve().parents[3]
+        / "runtime/pipelines_core/stages/model_specific_stages/zing_h3/dit_link.py"
+    )
+    node = next(
+        item
+        for item in ast.parse(path.read_text()).body
+        if isinstance(item, ast.ClassDef) and item.name == "DiTInputService"
+    )
+    namespace = {
+        "PollingTaskQueue": PollingTaskQueue,
+        "nullcontext": nullcontext,
+        "logger": logging.getLogger(__name__),
+    }
+    exec(
+        compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace
+    )
+
+    sent = []
+    put_called = []
+
+    def fake_broadcast_object(obj, src=0):
+        if src == 0:
+            return obj
+        if boundary == "cache_control_peer_error":
+            return ("RuntimeError", None, "peer rank 1 cache control failed")
+        if boundary in (
+            "cache_hit_expand_peer_condition_error",
+            "worker_step_peer_condition_error",
+        ):
+            return ("ConditionError", "CONDITION_INVALID", "peer rejected condition")
+        return ("RuntimeError", None, "peer rank 1 step failed")
+
+    group = SimpleNamespace(
+        rank_in_group=0,
+        world_size=2,
+        broadcast_object=fake_broadcast_object,
+    )
+    channel = SimpleNamespace(
+        group=group,
+        send=lambda msg: sent.append(msg),
+    )
+
+    class DummyCreateSession:
+        @staticmethod
+        def cache_control(op, args, *, busy):
+            return {"ok": True}
+
+        @staticmethod
+        def cached_condition(msg, *, initial):
+            return dict(msg, expanded=True)
+
+    service = namespace["DiTInputService"](channel, DummyCreateSession())
+    service.owner = ("sess", "gen")
+
+    async def fake_put(msg):
+        put_called.append(msg)
+
+    service.worker = SimpleNamespace(
+        closed=False,
+        complete=False,
+        initial_received=True,
+        put=fake_put,
+        queue=[],
+        state=SimpleNamespace(discard_pending_prompt=lambda: None),
+        close=lambda: None,
+    )
+
+    if boundary == "cache_control_peer_error":
+        service.queue.append(
+            dict(
+                type="cache.control",
+                transfer_id=0,
+                session_id="sess",
+                generation_id="gen",
+                operation="status",
+            )
+        )
+        with pytest.raises(RuntimeError, match="peer rank 1 cache control failed"):
+            asyncio.run(service.queue.run_once())
+        assert [m["type"] for m in sent] == ["worker.error"]
+    elif boundary == "cache_hit_expand_peer_condition_error":
+        service.queue.append(
+            dict(
+                type="conditioning",
+                transfer_id=0,
+                session_id="sess",
+                generation_id="gen",
+                event_id=7,
+                cache_hit=True,
+            )
+        )
+        asyncio.run(service.queue.run_once())
+        assert put_called == []
+        assert [m["type"] for m in sent] == [
+            "conditioning.rejected",
+            "input.processed",
+        ]
+        assert sent[0]["code"] == "CONDITION_INVALID"
+    elif boundary == "cache_hit_expand_peer_runtime_error":
+        service.queue.append(
+            dict(
+                type="conditioning",
+                transfer_id=0,
+                session_id="sess",
+                generation_id="gen",
+                event_id=7,
+                cache_hit=True,
+            )
+        )
+        with pytest.raises(RuntimeError, match="peer rank 1 step failed"):
+            asyncio.run(service.queue.run_once())
+        assert put_called == []
+        assert [m["type"] for m in sent] == ["worker.error"]
+    elif boundary == "worker_step_peer_condition_error":
+        service.queue.append(
+            dict(
+                type="conditioning",
+                transfer_id=0,
+                session_id="sess",
+                generation_id="gen",
+                event_id=8,
+            )
+        )
+        asyncio.run(service.queue.run_once())
+        assert len(put_called) == 1
+        assert [m["type"] for m in sent] == [
+            "conditioning.rejected",
+            "input.processed",
+        ]
+        assert sent[0]["code"] == "CONDITION_INVALID"
+    elif boundary == "worker_step_peer_runtime_error":
+        service.queue.append(
+            dict(
+                type="conditioning",
+                transfer_id=0,
+                session_id="sess",
+                generation_id="gen",
+                event_id=9,
+            )
+        )
+        with pytest.raises(RuntimeError, match="peer rank 1 step failed"):
+            asyncio.run(service.queue.run_once())
+        assert len(put_called) == 1
+        assert [m["type"] for m in sent] == ["worker.error"]

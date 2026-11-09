@@ -8,7 +8,9 @@ outside the graph pool and refreshed before every replay.
 """
 
 import collections
+import json
 import os
+import threading
 from contextlib import ExitStack
 
 import torch
@@ -114,17 +116,48 @@ class CudaGraphBackend:
                 cleanup.enter_context(defer_cyclic_gc())
                 graph = torch.cuda.CUDAGraph()
                 self.capturing = True
-                # Other threads (decoders, encoders) keep using CUDA meanwhile.
-                with (
-                    nccl_during_capture(),
-                    torch.cuda.graph(
-                        graph,
-                        pool=self._pool,
-                        stream=stream,
-                        capture_error_mode="thread_local",
-                    ),
-                ):
-                    outputs = fn()
+                event_base = dict(
+                    backend="CudaGraphBackend",
+                    pid=os.getpid(),
+                    thread_name=threading.current_thread().name,
+                    thread_id=threading.get_ident(),
+                    device=str(getattr(stream, "device", None)),
+                    capture_stream=getattr(stream, "cuda_stream", None),
+                    caller_stream=getattr(current, "cuda_stream", None),
+                )
+                logger.info(
+                    "ZING_GRAPH_CAPTURE_EVENT_JSON %s",
+                    json.dumps(dict(phase="start", **event_base)),
+                )
+                try:
+                    # Other threads (decoders, encoders) keep using CUDA meanwhile.
+                    with (
+                        nccl_during_capture(),
+                        torch.cuda.graph(
+                            graph,
+                            pool=self._pool,
+                            stream=stream,
+                            capture_error_mode="thread_local",
+                        ),
+                    ):
+                        outputs = fn()
+                except BaseException as exc:
+                    logger.exception(
+                        "ZING_GRAPH_CAPTURE_EVENT_JSON %s",
+                        json.dumps(
+                            dict(
+                                phase="failed",
+                                error_type=type(exc).__name__,
+                                error=str(exc),
+                                **event_base,
+                            )
+                        ),
+                    )
+                    raise
+                logger.info(
+                    "ZING_GRAPH_CAPTURE_EVENT_JSON %s",
+                    json.dumps(dict(phase="end", **event_base)),
+                )
             finally:
                 self.capturing = False
                 # torch.cuda.graph.__exit__ leaves the capture stream current when

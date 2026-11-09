@@ -339,3 +339,224 @@ def test_cleanup_in_finally_preserves_primary_error(monkeypatch):
             session.dispose()
     assert caught.value is primary and session.failure is failure and session.disposed
     assert not session.thread.is_alive()
+
+
+def test_remote_encoder_produce_logs_first_error_json(monkeypatch):
+    import contextlib
+    import threading
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        remote_encoder,
+    )
+
+    logged = []
+
+    class DummyLogger:
+        def exception(self, msg, *args):
+            logged.append(msg % args if args else msg)
+
+    monkeypatch.setattr(remote_encoder, "logger", DummyLogger(), raising=False)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda dev: None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "Stream",
+        lambda **kw: SimpleNamespace(cuda_stream=4242, synchronize=lambda: None),
+    )
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
+    monkeypatch.setattr(
+        remote_encoder,
+        "zmq",
+        SimpleNamespace(
+            Context=lambda: SimpleNamespace(
+                socket=lambda *a: SimpleNamespace(
+                    setsockopt=lambda *a: None,
+                    connect=lambda *a: None,
+                    send_multipart=lambda *a: (_ for _ in ()).throw(
+                        RuntimeError("injected zmq send error")
+                    ),
+                    close=lambda: None,
+                ),
+                term=lambda: None,
+            ),
+            REQ=1,
+            LINGER=2,
+            RCVTIMEO=3,
+            SNDTIMEO=4,
+        ),
+    )
+    monkeypatch.setattr(
+        remote_encoder,
+        "dist",
+        SimpleNamespace(TCPStore=lambda *a, **kw: SimpleNamespace(port=1234)),
+    )
+    monkeypatch.setattr(
+        remote_encoder,
+        "request_abort",
+        lambda *a, **kw: {"ok": True, "released": True},
+    )
+    session = SimpleNamespace(
+        peer=getattr(remote_encoder, "EncoderPeer", SimpleNamespace)(),
+        timeout=1,
+        port=31001,
+        token="sess-log-test",
+        device="cpu",
+        profile_dir=None,
+        stage_timing_dir=None,
+        remote_usage={},
+        source_geometry=None,
+        admission_endpoint=None,
+        accepted_frames=1,
+        capacity_frames=51,
+        capacity_bytes=1024,
+        failure=None,
+        recovery=None,
+        commands=queue.Queue(),
+        stop=threading.Event(),
+    )
+    RemoteEncoderSession._produce(session)
+    assert isinstance(session.failure, RuntimeError)
+    assert any("ZING_REMOTE_ENCODER_FIRST_ERROR_JSON" in entry for entry in logged)
+
+
+@pytest.mark.parametrize("op", ["append", "finish"])
+def test_remote_encoder_append_and_finish_sync_leader_failure_across_ranks(
+    monkeypatch, op
+):
+    from sglang.multimodal_gen.runtime.distributed import parallel_state
+
+    shared_payload = [None]
+
+    def fake_broadcast_object_list(obj_list, src=0, group=None):
+        if obj_list[0] is not None:
+            shared_payload[0] = obj_list[0]
+        else:
+            obj_list[0] = shared_payload[0]
+
+    monkeypatch.setattr(dist, "broadcast_object_list", fake_broadcast_object_list)
+    monkeypatch.setattr(RemoteEncoderSession, "_produce", lambda self: None)
+    codecs = SimpleNamespace(
+        modules={"video_vae": SimpleNamespace(encoder=torch.nn.Linear(1, 1))}
+    )
+
+    monkeypatch.setattr(
+        parallel_state,
+        "get_world_group",
+        lambda: SimpleNamespace(
+            rank_in_group=0,
+            ranks=[0, 1],
+            world_size=2,
+            cpu_group="cpu-group",
+            device_group=None,
+        ),
+    )
+    leader = RemoteEncoderSession(
+        codecs,
+        capacity_frames=34,
+        config=dict(port=31001, mode="overlap", timeout_seconds=1),
+    )
+
+    monkeypatch.setattr(
+        parallel_state,
+        "get_world_group",
+        lambda: SimpleNamespace(
+            rank_in_group=1,
+            ranks=[0, 1],
+            world_size=2,
+            cpu_group="cpu-group",
+            device_group=None,
+        ),
+    )
+    follower = RemoteEncoderSession(
+        codecs,
+        capacity_frames=34,
+        config=dict(port=31001, mode="overlap", timeout_seconds=1),
+    )
+
+    frames = torch.zeros(3, 1, 2, 2, dtype=torch.uint8)
+    if op == "finish":
+        leader.append(frames, frame_start=0)
+        follower.append(frames, frame_start=0)
+
+    leader.failure = RuntimeError("Injected leader background failure")
+
+    with pytest.raises(RuntimeError, match="Remote encoder failed"):
+        if op == "append":
+            leader.append(frames, frame_start=0)
+        else:
+            leader.finish()
+
+    with pytest.raises(RuntimeError, match="Remote encoder failed"):
+        if op == "append":
+            follower.append(frames, frame_start=0)
+        else:
+            follower.finish()
+
+    assert leader.accepted_frames == follower.accepted_frames
+    assert leader.ended == follower.ended
+    leader.failure = None
+    leader.dispose()
+    follower.dispose()
+
+
+def test_remote_encoder_append_syncs_leader_value_error_to_follower(monkeypatch):
+    from sglang.multimodal_gen.runtime.distributed import parallel_state
+
+    shared_payload = [None]
+
+    def fake_broadcast_object_list(obj_list, src=0, group=None):
+        if obj_list[0] is not None:
+            shared_payload[0] = obj_list[0]
+        else:
+            obj_list[0] = shared_payload[0]
+
+    monkeypatch.setattr(dist, "broadcast_object_list", fake_broadcast_object_list)
+    monkeypatch.setattr(RemoteEncoderSession, "_produce", lambda self: None)
+    codecs = SimpleNamespace(
+        modules={"video_vae": SimpleNamespace(encoder=torch.nn.Linear(1, 1))}
+    )
+
+    cfg = dict(
+        port=31001,
+        mode="overlap",
+        timeout_seconds=1,
+        cross_dispatch_prefetch=True,
+        admission_endpoint="ipc:///tmp/zing-test-admission",
+    )
+    monkeypatch.setattr(
+        parallel_state,
+        "get_world_group",
+        lambda: SimpleNamespace(
+            rank_in_group=0,
+            ranks=[0, 1],
+            world_size=2,
+            cpu_group="cpu-group",
+            device_group=None,
+        ),
+    )
+    leader = RemoteEncoderSession(codecs, capacity_frames=34, config=cfg)
+
+    monkeypatch.setattr(
+        parallel_state,
+        "get_world_group",
+        lambda: SimpleNamespace(
+            rank_in_group=1,
+            ranks=[0, 1],
+            world_size=2,
+            cpu_group="cpu-group",
+            device_group=None,
+        ),
+    )
+    follower = RemoteEncoderSession(codecs, capacity_frames=34, config=cfg)
+
+    leader.admission_digests[0] = ("prefetch", "mismatched-digest")
+    frames = torch.zeros(3, 1, 2, 2, dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="admission identity"):
+        leader.append(frames, frame_start=0)
+
+    with pytest.raises(ValueError, match="admission identity"):
+        follower.append(frames, frame_start=0)
+
+    assert leader.accepted_frames == follower.accepted_frames == 0
+    leader.dispose()
+    follower.dispose()
