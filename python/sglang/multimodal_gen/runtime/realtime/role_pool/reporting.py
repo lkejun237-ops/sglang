@@ -27,6 +27,10 @@ class ProcessReporter:
             control_epoch=config["control_epoch"],
             secret=os.environ[config["signing_secret_env"]],
         )
+        self.process.deployment = {
+            k: config[k]
+            for k in ("pool_id", "compatibility", "network_domain", "hardware_ids")
+        }
         self.stop = threading.Event()
         self.sequence = 0
         self.last_error = None

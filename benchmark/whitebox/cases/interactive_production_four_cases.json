@@ -1,0 +1,905 @@
+{
+  "schema_version": 1,
+  "name": "interactive-production-four-cases",
+  "description": "Four production WorldKit cases for chained SGLang verification (Session TTFF, Prompt Switch TTFF, Block 0 Cache hit/miss & persistence) via Room SourceSession + RecordedVideoEngine.",
+  "source_id": "interactive-production",
+  "oss_bucket": "leap-world-shanghai",
+  "oss_endpoint": "oss-cn-shanghai.aliyuncs.com",
+  "cases": [
+    {
+      "step": 1,
+      "case_id": "shanghai_drive_baseline",
+      "case_number": 4,
+      "title": "驾驶：上海行 (Static Baseline & Cold/Warm Prefill)",
+      "world_id": "interactive-production/world-ebd698bbf56a2efccf0aab2a3df8ac8b",
+      "recording_id": "0d256658d28949c8a3f6371df5c47541",
+      "created_at": "2026-11-06T09:42:02.616770+00:00",
+      "object_prefix": "white_box_game_record/test-whitebox-sh/streaming-v1/94c872397faa90f16feaef2cd43014ef/0345da519bdac4f0ca57872488a3ae91/streams/d99d17dcc4114415a681c41dd95c3246/segments/0d256658d28949c8a3f6371df5c47541/",
+      "video": {
+        "path": "whitebox.mp4",
+        "frames": 1049,
+        "width": 832,
+        "height": 480,
+        "fps": 24,
+        "codec": "h264",
+        "first_pts_us": 2691324,
+        "duration_us": 47210976
+      },
+      "start_boundary_actual": {
+        "source_frame_index": 23,
+        "source_pts_us": 1708345,
+        "start_frame_sha256": "b2a341fb73bbc5326d229b922ecb1d88e7f56dfa20777a0699f967bc2fbb1857"
+      },
+      "seed": 42,
+      "prompt": "subject_definitions:\n<Video 1>: Supplies the continuing source city geometry, road network, vehicle carrier, visibility, position, scale, motion, wheel movement, timing, occlusion and camera framing.\n<Picture 1>: Pure environment appearance reference for Shanghai Lujiazui in clear daylight: silver-blue curtain-wall glazing, pale stone podiums, dry charcoal asphalt, white road markings and pale granite sidewalks. It supplies materials and illumination rather than a fixed camera or street layout.\n<Subject 1>: Paired vehicle sheet <Picture 2> depicts one vehicle identity in front, left-profile and rear views. The upper row identifies the original pale-blue boxy sedan carrier; the lower row defines its metallic-blue Xiaomi SU7 Max appearance, black panoramic glazing, silver-and-black five-spoke wheels, red brake calipers and continuous red rear light bar.\n\nsummary:\n[video editing] Transform the source Shanghai city into a realistic daylight Lujiazui driving environment, replacing the original sedan carrier with one metallic-blue Xiaomi SU7 Max while preserving the continuing source road geometry, vehicle motion and camera.\n\nretention_analysis:\n<Video 1>: partially_preserved - retain building masses, landmark silhouettes, road and junction topology, curb height, lane boundaries, vehicle screen scale, ground contact, visibility, occlusion and continuous camera movement; replace proxy surfaces and outline colors with realistic materials.\n<Picture 1>: attribute_transfer - transfer glazing, masonry, asphalt, paving, daylight color and atmospheric depth while source geometry determines all spatial arrangements.\n<Subject 1>: partially_preserved - retain the source vehicle carrier, placement, screen scale, ground contact and motion while replacing its exterior with the blue SU7 identity shown in the lower reference row.\n\ndetailed_description:\nClear pale-blue daylight illuminates Shanghai's modern office district with warm neutral sunlight, soft cool shadows and restrained distance haze. Existing tower volumes receive silver-blue reflective curtain walls, fine window grids, brushed metal mullions and pale stone podium cladding. Existing architectural entrances receive recessed glass and stone details within their original surfaces. The road network remains dry charcoal asphalt with fine aggregate, subtle tire wear and white markings following the source painted segments. Raised sidewalks and existing plazas receive pale granite slabs, narrow joints and modest weathering. Curb lines, road widths, intersections, building corners and open routes preserve their source geometry. Existing river surfaces, whenever visible in the source, receive muted blue-green rippled water and sky reflections within their original shoreline. Colored proxy outlines become ordinary material edges. Daylight remains consistent across the continuing drive, with surface reflections responding naturally to the source view.\n\nWhenever the original pale-blue sedan carrier appears in <Video 1>, it is replaced by <Subject 1>, a metallic-blue Xiaomi SU7 Max with a smooth fastback body, black panoramic roof and glazing, flush door handles, a compact roof lidar unit, silver-and-black five-spoke wheels, red brake calipers, tapered headlamp housings, a continuous red rear halo light bar and black lower trim, fitted to the source vehicle's occupied space and grounded at its wheel contact points.\n\nAll visibility, placement, pose, scale, motion, timing, wheel movement, occlusion and camera/framing state is governed by the continuing <Video 1> source stream. The three columns depict one vehicle's identity rather than three instances; its visible face follows the source orientation. Source geometry governs turning, reversing, braking and any occlusion, while this appearance persists. The environment photograph supplies surface appearance only. Streets contain the entities present in the source. Reference-sheet layout, captions and comparison panels stay outside the scene; gameplay HUD remains the separate source overlay.\n\noverall_soundscape:\nN/A\n\nnon_diegetic_music:\nN/A",
+      "prompt_sha256": "219703dddbb1543ae2a11cd118ac33fdd6b1a3382bd2ef658e9450fd765af2d8",
+      "references_mapping": [
+        {
+          "asset_id": "sha256:0a56d6a5297c8880df26b44e65d2b82de36af7740476d3f964169dfb63260b13",
+          "id": "reference-0",
+          "role": "scene"
+        },
+        {
+          "asset_id": "sha256:3739f5f85a4ff76ce97a101e9a117cb6966eccd1553ac5d1e606fd0685cdf5ec",
+          "id": "reference-1",
+          "role": "scene"
+        }
+      ],
+      "objects": {
+        "whitebox.mp4": {
+          "bytes": 15937251,
+          "sha256": "d4818c3ab2230d80f332f5bc37583fe7d8c6741ffed3ca6d27244f622b562384"
+        },
+        "references/00.webp": {
+          "bytes": 403118,
+          "sha256": "0a56d6a5297c8880df26b44e65d2b82de36af7740476d3f964169dfb63260b13"
+        },
+        "references/01.webp": {
+          "bytes": 171160,
+          "sha256": "3739f5f85a4ff76ce97a101e9a117cb6966eccd1553ac5d1e606fd0685cdf5ec"
+        }
+      },
+      "historical_model_cache_receipts": [
+        {
+          "cache_key": "30b58490e23d4c75664a785debebaa5fc662ff55908945262cc4d5b5dc48e1f1",
+          "prompt_version": 1,
+          "cache_result": "l1_hit",
+          "miss_reason": null,
+          "timings": {
+            "elapsed_host_ms": 1514.322,
+            "stages": {
+              "cache_lookup": {
+                "host_ms": 2.648,
+                "status": "executed"
+              },
+              "qwen_prepare": {
+                "host_ms": null,
+                "status": "skipped"
+              },
+              "qwen_remote_prepare": {
+                "host_ms": null,
+                "status": "skipped"
+              },
+              "reference_vae": {
+                "host_ms": null,
+                "status": "skipped"
+              },
+              "block0_forward": {
+                "host_ms": null,
+                "status": "skipped"
+              }
+            }
+          }
+        }
+      ],
+      "historical_condition_switches": [],
+      "whitebox_frames": 1049,
+      "reference_count": 2,
+      "condition_switch_count": 0,
+      "condition_switches": []
+    },
+    {
+      "step": 2,
+      "case_id": "marvel_overdrive_rapid_switch",
+      "case_number": 3,
+      "title": "跑酷：MARVEL: OVERDRIVE (Same-Ref L1 Hit Rapid Switch & 12-Ref Stress)",
+      "world_id": "interactive-production/world-5aea1fa85352053de3e9130f454f739a",
+      "recording_id": "b8045d7b8b064756a0081fe4e19643c6",
+      "created_at": "2026-11-06T07:30:28.614991+00:00",
+      "object_prefix": "white_box_game_record/test-whitebox-sh/streaming-v1/5f7677058fbefa8dd45854185fa43e40/555d2e83809bd9540477c3f2f3ca33ae/streams/93e7f476728640ada60470a14248e330/segments/b8045d7b8b064756a0081fe4e19643c6/",
+      "video": {
+        "path": "whitebox.mp4",
+        "frames": 547,
+        "width": 832,
+        "height": 480,
+        "fps": 24,
+        "codec": "h264",
+        "first_pts_us": 2957839,
+        "duration_us": 25410466
+      },
+      "start_boundary_actual": {
+        "source_frame_index": 12,
+        "source_pts_us": 1035410,
+        "start_frame_sha256": "3ce6b16d81e243166e2e187298f1d7a1d9bbfe3deee0126216cb0eea1abf2158"
+      },
+      "seed": 42,
+      "prompt": "subject_definitions:\n<Video 1>: Supplies all source geometry, carriers, camera, pose, motion, visibility, timing and occlusion.\n<Picture 1>: Environment appearance reference for daylight New York architecture, asphalt, material wear and photographic exposure.\n<Subject 1>: Paired reference board <Picture 2> identifies the blue-clothed source player in the upper front/right/back row. The lower row contains supplied front standing, oblique standing and rear standing photographs, not an orthographic turnaround. The front photograph defines the red-and-navy textile suit; the rear image supplies back-emblem detail. The oblique image shows an alternate gold-armored suit and supplies silhouette only, not costume materials. Source video controls pose; photographic backgrounds are excluded.\n\nsummary:\n[video editing] Transform the source road runner into a photorealistic Spider-Man city pursuit within MARVEL: OVERDRIVE, with practical fabric and street materials. The continuing source video controls the game action and composition.\n\nretention_analysis:\n<Video 1>: partially_preserved - retain spatial geometry, traversable openings, source silhouettes, scale, motion, timing and camera while replacing proxy materials and identity.\n<Picture 1>: attribute_transfer - transfer lighting, weathering and architectural surfaces rather than reference composition or vehicle placement.\n<Subject 1>: partially_preserved - preserve the source player rig, footprint and action while replacing clothing with the supplied Spider-Man suit appearance.\n\ndetailed_description:\nRender the source street surfaces as worn asphalt with fine aggregate, repaired seams and painted road markings. Retain the source road layout and building masses, dressing their existing surfaces with brick, limestone, glass, restrained fire-escape detailing and weathered metal. Soft daylight fills the street canyon with warm sun patches, neutral shadows and balanced highlights. Cloth weave, enamel, concrete pores and brushed metal remain physically credible at the source viewing distance. The comic graphic treatment belongs to the existing UI overlay; the world remains photographic.\n\nWhenever the blue-clothed player proxy appears in <Video 1>, render <Subject 1> as a fully masked Spider-Man with red woven mask and torso panels, navy textile sides and legs, fine web seams, white lenses with black rims, a black chest spider and a red back spider emblem.\n\nAll visibility, placement, pose, scale, motion, timing and camera/framing state is governed by the continuing <Video 1> stream. Reference boards and their labels remain outside the rendered world.\n\noverall_soundscape:\nN/A\n\nnon_diegetic_music:\nN/A",
+      "prompt_sha256": "22aaf0414cb859173efeb64378699701a83d61f2db48a123d4c6330344b1bb25",
+      "references_mapping": [
+        {
+          "asset_id": "sha256:8e2d10cc14216d149fb689e1d16e11ffa21325e91bb2672f32b4c5dd39274d01",
+          "id": "reference-0",
+          "role": "scene"
+        },
+        {
+          "asset_id": "sha256:eed2f4ee2c9498fb4631726b560bfb3a2d58aee53486df151563fdf7c028e7a5",
+          "id": "reference-1",
+          "role": "scene"
+        }
+      ],
+      "objects": {
+        "whitebox.mp4": {
+          "bytes": 5989327,
+          "sha256": "005dab06933c3f9e0f040d8623292319be56229dfba28cf308da2ec5c3bf68ba"
+        },
+        "references/00.jpeg": {
+          "bytes": 464048,
+          "sha256": "8e2d10cc14216d149fb689e1d16e11ffa21325e91bb2672f32b4c5dd39274d01"
+        },
+        "references/01.jpeg": {
+          "bytes": 135643,
+          "sha256": "eed2f4ee2c9498fb4631726b560bfb3a2d58aee53486df151563fdf7c028e7a5"
+        },
+        "references/8e2d10cc14216d149fb689e1d16e11ffa21325e91bb2672f32b4c5dd39274d01.jpeg": {
+          "bytes": 464048,
+          "sha256": "8e2d10cc14216d149fb689e1d16e11ffa21325e91bb2672f32b4c5dd39274d01"
+        },
+        "references/eed2f4ee2c9498fb4631726b560bfb3a2d58aee53486df151563fdf7c028e7a5.jpeg": {
+          "bytes": 135643,
+          "sha256": "eed2f4ee2c9498fb4631726b560bfb3a2d58aee53486df151563fdf7c028e7a5"
+        }
+      },
+      "historical_model_cache_receipts": [
+        {
+          "cache_key": "d965da518f1767f8403f803ce14a00a8ee2dfbb76b33809c0f31b3fac46116d7",
+          "prompt_version": 1,
+          "cache_result": "l1_hit",
+          "miss_reason": null,
+          "timings": {
+            "elapsed_host_ms": 1505.04,
+            "stages": {
+              "cache_lookup": {
+                "host_ms": 3.067,
+                "status": "executed"
+              },
+              "qwen_prepare": {
+                "host_ms": null,
+                "status": "skipped"
+              },
+              "qwen_remote_prepare": {
+                "host_ms": null,
+                "status": "skipped"
+              },
+              "reference_vae": {
+                "host_ms": null,
+                "status": "skipped"
+              },
+              "block0_forward": {
+                "host_ms": null,
+                "status": "skipped"
+              }
+            }
+          }
+        },
+        {
+          "cache_key": "d965da518f1767f8403f803ce14a00a8ee2dfbb76b33809c0f31b3fac46116d7",
+          "prompt_version": 2,
+          "cache_result": "l1_hit",
+          "miss_reason": null,
+          "timings": {
+            "elapsed_host_ms": 944.682,
+            "stages": {
+              "cache_lookup": {
+                "host_ms": 0.432,
+                "status": "executed"
+              }
+            }
+          }
+        },
+        {
+          "cache_key": "d965da518f1767f8403f803ce14a00a8ee2dfbb76b33809c0f31b3fac46116d7",
+          "prompt_version": 3,
+          "cache_result": "l1_hit",
+          "miss_reason": null,
+          "timings": {
+            "elapsed_host_ms": 803.161,
+            "stages": {
+              "cache_lookup": {
+                "host_ms": 0.418,
+                "status": "executed"
+              }
+            }
+          }
+        }
+      ],
+      "historical_condition_switches": [
+        {
+          "prompt_version": 2,
+          "boundary": 510,
+          "previous_source": {
+            "source_frame_index": 675,
+            "source_pts_us": 25234490
+          },
+          "skipped_captures": 26,
+          "switch_host_ms": 1112.4045769684017,
+          "kv_ready": true,
+          "resumed_source_frame": 702,
+          "resumed_source_pts_us": 26134110,
+          "model_source_frame": 510
+        },
+        {
+          "prompt_version": 3,
+          "boundary": 544,
+          "previous_source": {
+            "source_frame_index": 736,
+            "source_pts_us": 27268385
+          },
+          "skipped_captures": 29,
+          "switch_host_ms": 1097.7856409735978,
+          "kv_ready": true,
+          "resumed_source_frame": 766,
+          "resumed_source_pts_us": 28267785,
+          "model_source_frame": 544
+        }
+      ],
+      "whitebox_frames": 547,
+      "reference_count": 2,
+      "condition_switch_count": 2,
+      "condition_switches": [
+        {
+          "prompt_version": 2,
+          "boundary": 510,
+          "prompt": "subject_definitions:\n<Video 1>: Supplies all source geometry, carriers, camera, pose, motion, visibility, timing and occlusion.\n<Picture 1>: Environment appearance reference for daylight New York architecture, asphalt, material wear and photographic exposure.\n<Subject 1>: Paired reference board <Picture 2> identifies the blue-clothed source player in the upper front/right/back row. The lower row contains supplied front standing, oblique standing and rear standing photographs, not an orthographic turnaround. The front photograph defines the red-and-navy textile suit; the rear image supplies back-emblem detail. The oblique image shows an alternate gold-armored suit and supplies silhouette only, not costume materials. Source video controls pose; photographic backgrounds are excluded.\n\nsummary:\n[video editing] Transform the source road runner into a photorealistic Spider-Man city pursuit within MARVEL: OVERDRIVE, with practical fabric and street materials. The continuing source video controls the game action and composition.\n\nretention_analysis:\n<Video 1>: partially_preserved - retain spatial geometry, traversable openings, source silhouettes, scale, motion, timing and camera while replacing proxy materials and identity.\n<Picture 1>: attribute_transfer - transfer lighting, weathering and architectural surfaces rather than reference composition or vehicle placement.\n<Subject 1>: partially_preserved - preserve the source player rig, footprint and action while replacing clothing with the supplied Spider-Man suit appearance.\n\ndetailed_description:\nRender the source street surfaces as worn asphalt with fine aggregate, repaired seams and painted road markings. Retain the source road layout and building masses, dressing their existing surfaces with brick, limestone, glass, restrained fire-escape detailing and weathered metal. Soft daylight fills the street canyon with warm sun patches, neutral shadows and balanced highlights. Cloth weave, enamel, concrete pores and brushed metal remain physically credible at the source viewing distance. The comic graphic treatment belongs to the existing UI overlay; the world remains photographic.\n\nWhenever the blue-clothed player proxy appears in <Video 1>, render <Subject 1> as a fully masked Spider-Man with red woven mask and torso panels, navy textile sides and legs, fine web seams, white lenses with black rims, a black chest spider and a red back spider emblem.\n\nAll visibility, placement, pose, scale, motion, timing and camera/framing state is governed by the continuing <Video 1> stream. Reference boards and their labels remain outside the rendered world.\n\noverall_soundscape:\nN/A\n\nnon_diegetic_music:\nN/A",
+          "prompt_sha256": "22aaf0414cb859173efeb64378699701a83d61f2db48a123d4c6330344b1bb25",
+          "references": [
+            {
+              "asset_id": "sha256:8e2d10cc14216d149fb689e1d16e11ffa21325e91bb2672f32b4c5dd39274d01",
+              "id": "reference-0",
+              "role": "scene"
+            },
+            {
+              "asset_id": "sha256:eed2f4ee2c9498fb4631726b560bfb3a2d58aee53486df151563fdf7c028e7a5",
+              "id": "reference-1",
+              "role": "scene"
+            }
+          ],
+          "source_policy": "skip_during_switch",
+          "historical_switch_host_ms": 1112.4045769684017,
+          "historical_skipped_captures": 26,
+          "historical_previous_source": {
+            "source_frame_index": 675,
+            "source_pts_us": 25234490
+          },
+          "historical_resumed_source_frame": 702
+        },
+        {
+          "prompt_version": 3,
+          "boundary": 544,
+          "prompt": "subject_definitions:\n<Video 1>: Supplies all source geometry, carriers, camera, pose, motion, visibility, timing and occlusion.\n<Picture 1>: Environment appearance reference for daylight New York architecture, asphalt, material wear and photographic exposure.\n<Subject 1>: Paired reference board <Picture 2> identifies the blue-clothed source player in the upper front/right/back row. The lower row contains supplied front standing, oblique standing and rear standing photographs, not an orthographic turnaround. The front photograph defines the red-and-navy textile suit; the rear image supplies back-emblem detail. The oblique image shows an alternate gold-armored suit and supplies silhouette only, not costume materials. Source video controls pose; photographic backgrounds are excluded.\n\nsummary:\n[video editing] Transform the source road runner into a photorealistic Spider-Man city pursuit within MARVEL: OVERDRIVE, with practical fabric and street materials. The continuing source video controls the game action and composition.\n\nretention_analysis:\n<Video 1>: partially_preserved - retain spatial geometry, traversable openings, source silhouettes, scale, motion, timing and camera while replacing proxy materials and identity.\n<Picture 1>: attribute_transfer - transfer lighting, weathering and architectural surfaces rather than reference composition or vehicle placement.\n<Subject 1>: partially_preserved - preserve the source player rig, footprint and action while replacing clothing with the supplied Spider-Man suit appearance.\n\ndetailed_description:\nRender the source street surfaces as worn asphalt with fine aggregate, repaired seams and painted road markings. Retain the source road layout and building masses, dressing their existing surfaces with brick, limestone, glass, restrained fire-escape detailing and weathered metal. Soft daylight fills the street canyon with warm sun patches, neutral shadows and balanced highlights. Cloth weave, enamel, concrete pores and brushed metal remain physically credible at the source viewing distance. The comic graphic treatment belongs to the existing UI overlay; the world remains photographic.\n\nWhenever the blue-clothed player proxy appears in <Video 1>, render <Subject 1> as a fully masked Spider-Man with red woven mask and torso panels, navy textile sides and legs, fine web seams, white lenses with black rims, a black chest spider and a red back spider emblem.\n\nAll visibility, placement, pose, scale, motion, timing and camera/framing state is governed by the continuing <Video 1> stream. Reference boards and their labels remain outside the rendered world.\n\noverall_soundscape:\nN/A\n\nnon_diegetic_music:\nN/A",
+          "prompt_sha256": "22aaf0414cb859173efeb64378699701a83d61f2db48a123d4c6330344b1bb25",
+          "references": [
+            {
+              "asset_id": "sha256:8e2d10cc14216d149fb689e1d16e11ffa21325e91bb2672f32b4c5dd39274d01",
+              "id": "reference-0",
+              "role": "scene"
+            },
+            {
+              "asset_id": "sha256:eed2f4ee2c9498fb4631726b560bfb3a2d58aee53486df151563fdf7c028e7a5",
+              "id": "reference-1",
+              "role": "scene"
+            }
+          ],
+          "source_policy": "skip_during_switch",
+          "historical_switch_host_ms": 1097.7856409735978,
+          "historical_skipped_captures": 29,
+          "historical_previous_source": {
+            "source_frame_index": 736,
+            "source_pts_us": 27268385
+          },
+          "historical_resumed_source_frame": 766
+        }
+      ],
+      "stress_recording": {
+        "world_id": "interactive-production/world-5aea1fa85352053de3e9130f454f739a",
+        "recording_id": "1f084a49dea14822a0b10faee3480607",
+        "created_at": "2026-11-05T12:01:18.186851+00:00",
+        "object_prefix": "white_box_game_record/test-whitebox-sh/streaming-v1/5f7677058fbefa8dd45854185fa43e40/9276929fb4e1a5389ba6c5b740b9445c/streams/6b2e5dcb328441118bd0de7cb11656b3/segments/1f084a49dea14822a0b10faee3480607/",
+        "video": {
+          "path": "whitebox.mp4",
+          "frames": 1454,
+          "width": 832,
+          "height": 480,
+          "fps": 24,
+          "codec": "h264",
+          "first_pts_us": 13741919,
+          "duration_us": 86343821
+        },
+        "start_boundary_actual": {
+          "source_frame_index": 122,
+          "source_pts_us": 4733195,
+          "start_frame_sha256": "30b093ea29a646dff9e8b7207a8260be82f16cfd4e6f847a8840cbb5d3e963b0"
+        },
+        "seed": 42,
+        "prompt": "subject_definitions:\n<Video 1>: Supplies all source geometry, carriers, camera, pose, motion, visibility, timing and occlusion.\n<Picture 1>: Environment appearance reference for daylight New York architecture, asphalt, material wear and photographic exposure.\n<Subject 1>: Paired reference board <Picture 2> identifies the blue-clothed source player in the upper front/right/back row. The lower row contains supplied front standing, oblique standing and rear standing photographs, not an orthographic turnaround. The front photograph defines the red-and-navy textile suit; the rear image supplies back-emblem detail. The oblique image shows an alternate gold-armored suit and supplies silhouette only, not costume materials. Source video controls pose; photographic backgrounds are excluded.\n<Subject 2>: Paired sheet <Picture 3>; upper row identifies the circular gray coin disc, lower row supplies a gold collectible coin with a raised red-enamel spider emblem, milled edge and fine web engraving.\n<Subject 3>: Paired sheet <Picture 4>; upper row identifies the red square magnet pickup icon, lower row supplies a compact silver web reclamation spool with red corners, a red magnetic ring and white filament visible within its face.\n<Subject 4>: Paired sheet <Picture 5>; upper row identifies the green square shoe pickup icon, lower row supplies a compact graphite web catapult amplifier with a green lens, silver tension coil and embossed upward chevron.\n<Subject 5>: Paired sheet <Picture 6>; upper row identifies the amber square double-score pickup icon, lower row supplies a gold and titanium dual-core OVERDRIVE badge with two amber cells and recessed spiderweb circuitry.\n<Subject 6>: Paired sheet <Picture 7>; upper row identifies the low solid barrier proxy, lower row supplies a worn concrete Damage Control road barrier with a flat landing surface and yellow-black warning paint.\n<Subject 7>: Paired sheet <Picture 8>; upper row identifies the two-post single horizontal rail proxy, lower row supplies a galvanized checkpoint rail with red-white reflective tape and an open passage beneath the bar.\n<Subject 8>: Paired sheet <Picture 9>; upper row identifies the tall two-post upper-panel proxy, lower row supplies a navy Damage Control shutter sign with yellow warning trim and a clear low passage underneath.\n<Subject 9>: Paired sheet <Picture 10>; upper row identifies the stationary elongated vehicle module, lower row supplies a navy Damage Control armored transport with armored glass, rubber tires, yellow agency stripes and a flat unobstructed roof.\n<Subject 10>: Paired sheet <Picture 11>; upper row identifies the solid triangular wedge proxy, lower row supplies a weathered steel loading ramp with diamond-plate tread and flush yellow-black edge paint.\n<Subject 11>: Paired sheet <Picture 12>; upper row identifies the oncoming elongated vehicle module identified by source movement and its headlight effects, lower row supplies a graphite Damage Control armored escort vehicle with white headlights, yellow agency markings and a flat roof.\nEach prop sheet shows one identity in front, right and back views. The player board has the distinct layout described above. The red, green and amber source pickups are single-sided flat billboards; their empty side and back panels represent the actual source geometry.\n\nsummary:\n[video editing] Transform the source road runner into a photorealistic Spider-Man city pursuit within MARVEL: OVERDRIVE, with practical fabric, street materials and Damage Control equipment. The continuing source video controls the game action and composition.\n\nretention_analysis:\n<Video 1>: partially_preserved - retain spatial geometry, traversable openings, source silhouettes, scale, motion, timing and camera while replacing proxy materials and identity.\n<Picture 1>: attribute_transfer - transfer lighting, weathering and architectural surfaces rather than reference composition or vehicle placement.\n<Subject 1>: partially_preserved - preserve the source player rig, footprint and action while replacing clothing with the supplied Spider-Man suit appearance.\n<Subject 2>: partially_preserved - retain carrier geometry and placement; transfer target surfaces.\n<Subject 3>: partially_preserved - retain carrier geometry and placement; transfer target surfaces.\n<Subject 4>: partially_preserved - retain carrier geometry and placement; transfer target surfaces.\n<Subject 5>: partially_preserved - retain carrier geometry and placement; transfer target surfaces.\n<Subject 6>: partially_preserved - retain carrier geometry and placement; transfer target surfaces.\n<Subject 7>: partially_preserved - retain carrier geometry and placement; transfer target surfaces.\n<Subject 8>: partially_preserved - retain carrier geometry and placement; transfer target surfaces.\n<Subject 9>: partially_preserved - retain carrier geometry and placement; transfer target surfaces.\n<Subject 10>: partially_preserved - retain carrier geometry and placement; transfer target surfaces.\n<Subject 11>: partially_preserved - retain carrier geometry and placement; transfer target surfaces.\n\ndetailed_description:\nRender the source street surfaces as worn asphalt with fine aggregate, repaired seams and painted road markings. Retain the source road layout and building masses, dressing their existing surfaces with brick, limestone, glass, restrained fire-escape detailing and weathered metal. Soft daylight fills the street canyon with warm sun patches, neutral shadows and balanced highlights. Cloth weave, enamel, concrete pores and brushed metal remain physically credible at the source viewing distance. The comic graphic treatment belongs to the existing UI overlay; the world remains photographic.\n\nWhenever the blue-clothed player proxy appears in <Video 1>, render <Subject 1> as a fully masked Spider-Man with red woven mask and torso panels, navy textile sides and legs, fine web seams, white lenses with black rims, a black chest spider and a red back spider emblem.\nWhenever the circular gray coin disc appears in <Video 1>, render <Subject 2> as a gold collectible coin with a raised red-enamel spider emblem, milled edge and fine web engraving.\nWhenever the red square magnet pickup icon appears in <Video 1>, render <Subject 3> as a compact silver web reclamation spool with red corners, a red magnetic ring and white filament visible within its face.\nWhenever the green square shoe pickup icon appears in <Video 1>, render <Subject 4> as a compact graphite web catapult amplifier with a green lens, silver tension coil and embossed upward chevron.\nWhenever the amber square double-score pickup icon appears in <Video 1>, render <Subject 5> as a gold and titanium dual-core OVERDRIVE badge with two amber cells and recessed spiderweb circuitry.\nWhenever the low solid barrier proxy appears in <Video 1>, render <Subject 6> as a worn concrete Damage Control road barrier with a flat landing surface and yellow-black warning paint.\nWhenever the two-post single horizontal rail proxy appears in <Video 1>, render <Subject 7> as a galvanized checkpoint rail with red-white reflective tape and an open passage beneath the bar.\nWhenever the tall two-post upper-panel proxy appears in <Video 1>, render <Subject 8> as a navy Damage Control shutter sign with yellow warning trim and a clear low passage underneath.\nWhenever the stationary elongated vehicle module appears in <Video 1>, render <Subject 9> as a navy Damage Control armored transport with armored glass, rubber tires, yellow agency stripes and a flat unobstructed roof.\nWhenever the solid triangular wedge proxy appears in <Video 1>, render <Subject 10> as a weathered steel loading ramp with diamond-plate tread and flush yellow-black edge paint.\nWhenever the oncoming elongated vehicle module identified by source movement and its headlight effects appears in <Video 1>, render <Subject 11> as a graphite Damage Control armored escort vehicle with white headlights, yellow agency markings and a flat roof.\n\nEach vehicle module follows its corresponding source carrier; multiple source modules remain separate vehicles with their original spacing. Vehicle roofs, barrier tops, slope surfaces and under-bar gaps retain the source collision silhouette. The three equipment pickups retain their compact camera-facing footprints, using shallow device-face relief. Existing red, green and amber source particles retain their timing and extent as restrained filament and energy highlights. Pickup disappearance, coin attraction and boosted movement come exclusively from source animation. All visibility, placement, pose, scale, motion, timing and camera/framing state is governed by the continuing <Video 1> stream. Absent carriers stay absent; reference boards and their labels remain outside the rendered world.\n\noverall_soundscape:\nN/A\n\nnon_diegetic_music:\nN/A",
+        "prompt_sha256": "e27c020cc5e3d13cd207fb9ceb2c0c05bf881067a3ce97368669e774f76da2e1",
+        "references_mapping": [
+          {
+            "asset_id": "sha256:8e2d10cc14216d149fb689e1d16e11ffa21325e91bb2672f32b4c5dd39274d01",
+            "id": "reference-0",
+            "role": "scene"
+          },
+          {
+            "asset_id": "sha256:eed2f4ee2c9498fb4631726b560bfb3a2d58aee53486df151563fdf7c028e7a5",
+            "id": "reference-1",
+            "role": "scene"
+          },
+          {
+            "asset_id": "sha256:063f1756255da574c37f4ef94da71c046b88829fe581ac00de874265101a5b4a",
+            "id": "reference-2",
+            "role": "scene"
+          },
+          {
+            "asset_id": "sha256:59f068b1f2124b9f80c70dd74bdbde7756759ba760208e0fe146b5c0005a7d90",
+            "id": "reference-3",
+            "role": "scene"
+          },
+          {
+            "asset_id": "sha256:c5ca2239697510a1f65a0c8cd920529751b8a4efa6c81eb0c704c413a8ddaca1",
+            "id": "reference-4",
+            "role": "scene"
+          },
+          {
+            "asset_id": "sha256:67c37b24998dd84f5585539c67472ad58bdbac3856eec657d9a4b60ae6937a8a",
+            "id": "reference-5",
+            "role": "scene"
+          },
+          {
+            "asset_id": "sha256:6463490ff12044c244e524ce1f354ec7cbb576bf3b17e624565b199c2afd59f8",
+            "id": "reference-6",
+            "role": "scene"
+          },
+          {
+            "asset_id": "sha256:bad94a2064422bad102cc91538ff597eceb53093ed8f99fbc60cd27bd0dd596f",
+            "id": "reference-7",
+            "role": "scene"
+          },
+          {
+            "asset_id": "sha256:72f0ef27cffa52f39feb552045372ca9509f79d3dc1a6d66cadb675410981dbc",
+            "id": "reference-8",
+            "role": "scene"
+          },
+          {
+            "asset_id": "sha256:aac7d67fd0738279b6a7921b24f384df843e17c316596070a9cdd7ead4e5a499",
+            "id": "reference-9",
+            "role": "scene"
+          },
+          {
+            "asset_id": "sha256:55e46d6ce5931a1d6122f806163db60617f35f2507dbb5b88206edeea41c59e1",
+            "id": "reference-10",
+            "role": "scene"
+          },
+          {
+            "asset_id": "sha256:8e3856a246892b2269122e6a665e1e079ea40744bd2016ec976d987d71b27958",
+            "id": "reference-11",
+            "role": "scene"
+          }
+        ],
+        "objects": {
+          "whitebox.mp4": {
+            "bytes": 19346236,
+            "sha256": "861169160a9594c35532c74d477c1063eaa1d1b190ad16801516a69a3de468c5"
+          },
+          "references/00.jpeg": {
+            "bytes": 464048,
+            "sha256": "8e2d10cc14216d149fb689e1d16e11ffa21325e91bb2672f32b4c5dd39274d01"
+          },
+          "references/01.jpeg": {
+            "bytes": 135643,
+            "sha256": "eed2f4ee2c9498fb4631726b560bfb3a2d58aee53486df151563fdf7c028e7a5"
+          },
+          "references/02.jpeg": {
+            "bytes": 164415,
+            "sha256": "063f1756255da574c37f4ef94da71c046b88829fe581ac00de874265101a5b4a"
+          },
+          "references/03.jpeg": {
+            "bytes": 179737,
+            "sha256": "59f068b1f2124b9f80c70dd74bdbde7756759ba760208e0fe146b5c0005a7d90"
+          },
+          "references/04.jpeg": {
+            "bytes": 150430,
+            "sha256": "c5ca2239697510a1f65a0c8cd920529751b8a4efa6c81eb0c704c413a8ddaca1"
+          },
+          "references/05.jpeg": {
+            "bytes": 206703,
+            "sha256": "67c37b24998dd84f5585539c67472ad58bdbac3856eec657d9a4b60ae6937a8a"
+          },
+          "references/06.jpeg": {
+            "bytes": 97223,
+            "sha256": "6463490ff12044c244e524ce1f354ec7cbb576bf3b17e624565b199c2afd59f8"
+          },
+          "references/07.jpeg": {
+            "bytes": 81305,
+            "sha256": "bad94a2064422bad102cc91538ff597eceb53093ed8f99fbc60cd27bd0dd596f"
+          },
+          "references/08.jpeg": {
+            "bytes": 118241,
+            "sha256": "72f0ef27cffa52f39feb552045372ca9509f79d3dc1a6d66cadb675410981dbc"
+          },
+          "references/09.jpeg": {
+            "bytes": 93544,
+            "sha256": "aac7d67fd0738279b6a7921b24f384df843e17c316596070a9cdd7ead4e5a499"
+          },
+          "references/10.jpeg": {
+            "bytes": 93170,
+            "sha256": "55e46d6ce5931a1d6122f806163db60617f35f2507dbb5b88206edeea41c59e1"
+          },
+          "references/11.jpeg": {
+            "bytes": 110287,
+            "sha256": "8e3856a246892b2269122e6a665e1e079ea40744bd2016ec976d987d71b27958"
+          }
+        },
+        "historical_model_cache_receipts": [
+          {
+            "cache_key": "e4d2c5a20922165545d38417a385b40ffb66639fe2302d4b04b1eb6d4067378a",
+            "prompt_version": 1,
+            "cache_result": "l1_hit",
+            "miss_reason": null,
+            "timings": {
+              "elapsed_host_ms": 1728.971,
+              "stages": {
+                "cache_lookup": {
+                  "host_ms": 5.951,
+                  "status": "executed"
+                },
+                "qwen_prepare": {
+                  "host_ms": null,
+                  "status": "skipped"
+                },
+                "qwen_remote_prepare": {
+                  "host_ms": null,
+                  "status": "skipped"
+                },
+                "reference_vae": {
+                  "host_ms": null,
+                  "status": "skipped"
+                },
+                "block0_forward": {
+                  "host_ms": null,
+                  "status": "skipped"
+                }
+              }
+            }
+          }
+        ],
+        "historical_condition_switches": []
+      }
+    },
+    {
+      "step": 3,
+      "case_id": "dark_horns_ref_expansion",
+      "case_number": 2,
+      "title": "魂系战斗：Dark Horns (3->6 Refs Expansion Switch Miss vs Hit A/B)",
+      "world_id": "interactive-production/world-d9968a8558554f7c21e2d6c4947eec50",
+      "recording_id": "5505ef1c0f214e96a206980eeb048d57",
+      "created_at": "2026-11-06T09:53:47.325751+00:00",
+      "object_prefix": "white_box_game_record/test-whitebox-sh/streaming-v1/c3bbc57b86d5117a74d0fa6f2dfe7580/52ddef71fd4ac22c02715e5588700a0d/streams/69739a7eb7b541e6aac3820d18984ce1/segments/5505ef1c0f214e96a206980eeb048d57/",
+      "video": {
+        "path": "whitebox.mp4",
+        "frames": 369,
+        "width": 832,
+        "height": 480,
+        "fps": 24,
+        "codec": "h264",
+        "first_pts_us": 3452159,
+        "duration_us": 43011726
+      },
+      "start_boundary_actual": {
+        "source_frame_index": 12,
+        "source_pts_us": 1142830,
+        "start_frame_sha256": "bb2586ef10515f7fe4aa5491e6430eb8276d877c797bf623aa38aa47755552f9"
+      },
+      "seed": 42,
+      "prompt": "subject_definitions:\n<Video 1>: Supplies the continuing source geometry, carrier identities, visibility, motion, timing, poses, camera and framing.\n<Picture 1>: Environment appearance reference for the descending exterior stairs, weathered Gothic gate masonry, amber braziers and a dense antique-gold fog curtain with dark ochre folds.\n<Subject 1>: Paired front, left-profile and back sheet <Picture 2> has the actual pale player whitebox in the top row and the rendered target in the bottom row; the bottom row depicts one human Pleasant Goat hero: white curled hair, short brown horns, human face, blue scarf and gold bell, ivory clothing and a weathered indigo wool-collared cloak.\n<Subject 2>: Paired front, edge and reverse weapon sheet <Picture 3> has the source whitebox sword in the top row and the rendered target in the bottom row; the bottom row depicts one broad two-handed steel greatsword with a thick slab blade, tapered point, blue leather grip, short curled sheep-horn bronze crossguard and compact bell-shaped pommel.\n\nsummary:\n[video editing] Transform the source courtyard into Dark Horns, a weathered stone approach outside the ritual arena featuring a white-haired human sheep-horned swordsman. Cool gray outdoor haze and warm amber brazier light illuminate weathered characters and wet stone. <Video 1> retains all spatial and motion control.\n\nretention_analysis:\n<Video 1>: partially_preserved - retain arena topology, steps, doorways, circular floor, carrier scale, attachment points, timing, visibility and camera; replace grayscale surfaces with the target materials.\n<Picture 1>: attribute_transfer - transfer surface materials, lighting family, layered decoration and atmospheric color while the source video supplies composition and traversable geometry.\n<Subject 1>: partially_preserved - retain player proportions, cape carrier and movement while replacing armor appearance with the human hero design.\n<Subject 2>: partially_preserved - retain hand attachment and strike timing while applying the broad greatsword design.\n\ndetailed_description:\nBroad large dark-gray stone slabs with smooth worn faces, widely spaced mortar seams and restrained damp sheen preserve the descending steps and landing. Large masonry blocks and quiet stone wall faces carry simple worn column bands, sparse shallow arch-border carving and subtle soot stains. Surface detail remains low-frequency and softly weathered, matching the interior floor; sparse candles and small edge debris leave broad unbroken stone areas. Amber braziers and wall torches cast localized warm pools and subtle reflections on wet paving. Cold gray outdoor haze softens distant walls. A dense opaque antique-gold fog curtain fills the source doorway, with vertically drifting smoky strands, dark ochre and brown folds, and soft golden wisps rolling at the threshold. The fog obscures the room beyond while its extent, opening state and occlusion follow the source gate. Side dressing stays on existing parapets and walls, preserving the descending route and free walking clearance.\n\nWhenever the smaller pale humanoid player carrier appears in <Video 1>, it is replaced by <Subject 1>, a lean realistic human swordsman with an expressive human face, white curled forelock, brown horns, blue neck scarf, gold bell and a frayed calf-length indigo cloak following the source cape motion.\nWhenever the weapon attached to the player hand appears in <Video 1>, it is replaced by <Subject 2>, a broad thick worn steel greatsword with a tapered point, long blue leather grip, compact sheep-horn bronze guard and bell-shaped pommel, following the source attachment and blade trajectory.\n\nAll visibility, placement, pose, scale, motion, timing, occlusion, weapon swings and camera/framing state is governed by the continuing <Video 1> source stream. The upper row of each paired subject sheet identifies the source carrier; the lower row supplies its rendered appearance. The three columns are views of one identity, not additional instances or fixed poses. Gameplay UI remains the separate source overlay.\n\noverall_soundscape:\nN/A\n\nnon_diegetic_music:\nN/A",
+      "prompt_sha256": "7b756ee8de9f154fc4f72a225f4e8747c1efd3bc93db56682a0225f383e43d18",
+      "references_mapping": [
+        {
+          "asset_id": "sha256:17e122f2467723bfb784c8fc833e54b52632c2a4aa247063551947895c4c52ca",
+          "id": "reference-0",
+          "role": "scene"
+        },
+        {
+          "asset_id": "sha256:ff07a554d98e838398a74a01f735a0867a1cc8b5695c9f1837edae9acab3fdba",
+          "id": "reference-1",
+          "role": "scene"
+        },
+        {
+          "asset_id": "sha256:25d8f1d0782af8bad9813eb37c27f559f93ccfb680143e7b12a34d041334fd81",
+          "id": "reference-2",
+          "role": "scene"
+        }
+      ],
+      "objects": {
+        "whitebox.mp4": {
+          "bytes": 5862863,
+          "sha256": "51f381a29f6fe00bfb653a1eccfed6187d3e1b3060b40be1313445dce8cb00f1"
+        },
+        "references/00.webp": {
+          "bytes": 255262,
+          "sha256": "17e122f2467723bfb784c8fc833e54b52632c2a4aa247063551947895c4c52ca"
+        },
+        "references/01.webp": {
+          "bytes": 266880,
+          "sha256": "ff07a554d98e838398a74a01f735a0867a1cc8b5695c9f1837edae9acab3fdba"
+        },
+        "references/02.webp": {
+          "bytes": 107068,
+          "sha256": "25d8f1d0782af8bad9813eb37c27f559f93ccfb680143e7b12a34d041334fd81"
+        },
+        "references/3ec4b2195c519455a0144f2f4bc5409ca380c3c7814c377604f95d8fa655be82.webp": {
+          "bytes": 300712,
+          "sha256": "3ec4b2195c519455a0144f2f4bc5409ca380c3c7814c377604f95d8fa655be82"
+        },
+        "references/b091a93e6c70d2e29b8435d72871cd82a063ba7dd3438e29bbd0b091668a1a32.webp": {
+          "bytes": 485804,
+          "sha256": "b091a93e6c70d2e29b8435d72871cd82a063ba7dd3438e29bbd0b091668a1a32"
+        },
+        "references/6b02c0851f23c5f0f2af95db8a8c37d9514525aafbf9cf91f1096cd8ec9475a2.webp": {
+          "bytes": 176138,
+          "sha256": "6b02c0851f23c5f0f2af95db8a8c37d9514525aafbf9cf91f1096cd8ec9475a2"
+        }
+      },
+      "historical_model_cache_receipts": [
+        {
+          "cache_key": "235223f2200820e55ba615209db4b6647932d65c4840f117da4175d1c3af7947",
+          "prompt_version": 1,
+          "cache_result": "l1_hit",
+          "miss_reason": null,
+          "timings": {
+            "elapsed_host_ms": 1508.998,
+            "stages": {
+              "cache_lookup": {
+                "host_ms": 4.909,
+                "status": "executed"
+              },
+              "qwen_prepare": {
+                "host_ms": null,
+                "status": "skipped"
+              },
+              "qwen_remote_prepare": {
+                "host_ms": null,
+                "status": "skipped"
+              },
+              "reference_vae": {
+                "host_ms": null,
+                "status": "skipped"
+              },
+              "block0_forward": {
+                "host_ms": null,
+                "status": "skipped"
+              }
+            }
+          }
+        },
+        {
+          "cache_key": "f9602c833c96be54764117d40f63fec605b6415dcc1a84fc71c37b5dc5ef4f03",
+          "prompt_version": 2,
+          "cache_result": "miss",
+          "miss_reason": "not_resident",
+          "timings": {
+            "elapsed_host_ms": 3682.223,
+            "stages": {
+              "cache_lookup": {
+                "host_ms": 0.449,
+                "status": "executed"
+              }
+            }
+          }
+        }
+      ],
+      "historical_condition_switches": [
+        {
+          "prompt_version": 2,
+          "boundary": 272,
+          "previous_source": {
+            "source_frame_index": 305,
+            "source_pts_us": 26729545
+          },
+          "skipped_captures": 27,
+          "switch_host_ms": 1943.5815310571343,
+          "kv_ready": true,
+          "resumed_source_frame": 333,
+          "resumed_source_pts_us": 28530605,
+          "model_source_frame": 272
+        }
+      ],
+      "whitebox_frames": 369,
+      "reference_count": 6,
+      "initial_reference_count": 3,
+      "condition_switch_count": 1,
+      "condition_switches": [
+        {
+          "prompt_version": 2,
+          "boundary": 272,
+          "prompt": "subject_definitions:\n<Video 1>: Supplies the continuing source geometry, carrier identities, visibility, motion, timing, poses, camera and framing.\n<Picture 1>: Environment appearance reference for worn circular stone paving, soot-dark carved Gothic walls and arched niches, warm wall torches, ivory candle clusters and cool gray atmospheric depth.\n\n<Subject 1>: Paired front, left-profile and back sheet <Picture 2> has the actual gray armored boss whitebox in the top row and the rendered target in the bottom row; the bottom row depicts one Niu Lai tyrant: massive ochre-furred bovine body, pink muzzle, dark horns, scarred muscular torso, ancient bronze bracers and ragged oxblood waist cloth.\n\n<Subject 2>: Paired front, edge and reverse weapon sheet <Picture 3> has the source whitebox axe in the top row and the rendered target in the bottom row; the bottom row depicts one massive asymmetrical royal axe with a broad dark iron crescent blade, smaller broken rear counter-blade, restrained bronze inlay and bovine crest, long leather-bound wooden haft and short red cloth. Each sheet pairs source identity above with target appearance below in corresponding columns; all three columns show one asset.\n\nsummary:\n[video editing] Transform the source courtyard into Dark Horns, a weathered Gothic stone ritual arena featuring a white-haired human sheep-horned swordsman and an ochre-furred bull tyrant. Warm amber torchlight and cool gray shadows illuminate weathered characters and wet stone. <Video 1> retains all spatial and motion control.\n\nretention_analysis:\n<Video 1>: partially_preserved - retain arena topology, steps, doorways, circular floor, carrier scale, attachment points, timing, visibility and camera; replace grayscale surfaces with the target materials.\n<Picture 1>: attribute_transfer - transfer surface materials, lighting family, layered decoration and atmospheric color while the source video supplies composition and traversable geometry.\n\n<Subject 1>: partially_preserved - retain boss scale, rig and motion while replacing armor appearance with the bull tyrant design.\n\n<Subject 2>: partially_preserved - retain weapon attachment and strike timing while applying the greataxe design.\n\ndetailed_description:\nLarge worn dark stone flags, gritty cracks, damp patches and shallow concentric carvings preserve the source circular combat floor and existing steps. Soot-dark masonry, carved column bands, eroded reliefs and recessed stone niches enrich existing perimeter walls. Weathered stone figures remain architectural reliefs within wall surfaces. Warm wall torches and clusters of ivory candles illuminate rough stone and pooled wax, with restrained reflections on damp paving. Cool gray overhead fill and fine smoky haze reveal depth without obscuring traversable surfaces. The central combat floor stays open, with peripheral dressing confined to existing supports and wall recesses. Existing door openings and the source fog barrier retain their geometry and visibility; the barrier takes on dense antique-gold smoke with dark ochre folds. Warm amber practical lights retain natural skin, fur and cloth colors against charcoal stone shadows.\n\nWhenever the larger gray armored boss carrier appears in <Video 1>, it is replaced by <Subject 1>, the same dominant yellow-furred bull tyrant with a heavy neck, broad pink muzzle, narrowed amber eyes, weathered horns, bronze bracers, old scars and battered waist armor.\n\nWhenever the weapon attached to the boss hand appears in <Video 1>, it is replaced by <Subject 2>, a massive dark iron royal axe with a dominant crescent blade, smaller broken rear blade, restrained bronze fittings and long bound wooden haft following the source grip, shaft direction and attack trajectory.\n\nAll visibility, placement, pose, scale, motion, timing, occlusion, weapon swings and camera/framing state is governed by the continuing <Video 1> source stream. The upper row of each paired subject sheet identifies the source carrier; the lower row supplies its rendered appearance. The three columns are views of one identity, not additional instances or fixed poses. Gameplay UI remains the separate source overlay.\n\noverall_soundscape:\nN/A\n\nnon_diegetic_music:\nN/A",
+          "prompt_sha256": "ca2268a1300145c7a1f40b53c1c6fb5908b9e4cba95cf8c8c9d2d5a5545b78fb",
+          "references": [
+            {
+              "asset_id": "sha256:17e122f2467723bfb784c8fc833e54b52632c2a4aa247063551947895c4c52ca",
+              "id": "reference-0",
+              "role": "scene"
+            },
+            {
+              "asset_id": "sha256:ff07a554d98e838398a74a01f735a0867a1cc8b5695c9f1837edae9acab3fdba",
+              "id": "reference-1",
+              "role": "scene"
+            },
+            {
+              "asset_id": "sha256:25d8f1d0782af8bad9813eb37c27f559f93ccfb680143e7b12a34d041334fd81",
+              "id": "reference-2",
+              "role": "scene"
+            },
+            {
+              "asset_id": "sha256:3ec4b2195c519455a0144f2f4bc5409ca380c3c7814c377604f95d8fa655be82",
+              "id": "reference-3",
+              "role": "scene"
+            },
+            {
+              "asset_id": "sha256:b091a93e6c70d2e29b8435d72871cd82a063ba7dd3438e29bbd0b091668a1a32",
+              "id": "reference-4",
+              "role": "scene"
+            },
+            {
+              "asset_id": "sha256:6b02c0851f23c5f0f2af95db8a8c37d9514525aafbf9cf91f1096cd8ec9475a2",
+              "id": "reference-5",
+              "role": "scene"
+            }
+          ],
+          "recorded_phase2_references": [
+            {
+              "id": "reference-0",
+              "asset_id": "sha256:3ec4b2195c519455a0144f2f4bc5409ca380c3c7814c377604f95d8fa655be82",
+              "sha256": "3ec4b2195c519455a0144f2f4bc5409ca380c3c7814c377604f95d8fa655be82",
+              "path": "references/3ec4b2195c519455a0144f2f4bc5409ca380c3c7814c377604f95d8fa655be82.webp"
+            },
+            {
+              "id": "reference-1",
+              "asset_id": "sha256:b091a93e6c70d2e29b8435d72871cd82a063ba7dd3438e29bbd0b091668a1a32",
+              "sha256": "b091a93e6c70d2e29b8435d72871cd82a063ba7dd3438e29bbd0b091668a1a32",
+              "path": "references/b091a93e6c70d2e29b8435d72871cd82a063ba7dd3438e29bbd0b091668a1a32.webp"
+            },
+            {
+              "id": "reference-2",
+              "asset_id": "sha256:6b02c0851f23c5f0f2af95db8a8c37d9514525aafbf9cf91f1096cd8ec9475a2",
+              "sha256": "6b02c0851f23c5f0f2af95db8a8c37d9514525aafbf9cf91f1096cd8ec9475a2",
+              "path": "references/6b02c0851f23c5f0f2af95db8a8c37d9514525aafbf9cf91f1096cd8ec9475a2.webp"
+            }
+          ],
+          "source_policy": "skip_during_switch",
+          "historical_switch_host_ms": 1943.5815310571343,
+          "historical_skipped_captures": 27,
+          "historical_previous_source": {
+            "source_frame_index": 305,
+            "source_pts_us": 26729545
+          },
+          "historical_resumed_source_frame": 333
+        }
+      ]
+    },
+    {
+      "step": 4,
+      "case_id": "wuxia_jiahao_multi_prefill",
+      "case_number": 1,
+      "title": "武侠格斗：功夫嘉豪 (Multi-Condition Prefill Plan & Cross-Segment Re-Prepare)",
+      "world_id": "interactive-production/world-399d32938504a32eb813d3efcc6d2728",
+      "recording_id": "f03d9c0dbd5e46a7819d298d495af73d",
+      "created_at": "2026-11-05T04:33:41.133728+00:00",
+      "object_prefix": "white_box_game_record/test-whitebox-sh/streaming-v1/ccd1126cd8cc0ce43538a454d4541aa2/1460752a3cae92700771a72791686d59/streams/5e9021ae2e904f1088f4b8042a68c7d5/segments/f03d9c0dbd5e46a7819d298d495af73d/",
+      "video": {
+        "path": "whitebox.mp4",
+        "frames": 1585,
+        "width": 832,
+        "height": 480,
+        "fps": 24,
+        "codec": "h264",
+        "first_pts_us": 5922824,
+        "duration_us": 70679156
+      },
+      "start_boundary_actual": {
+        "source_frame_index": 51,
+        "source_pts_us": 2399545,
+        "start_frame_sha256": "675319b8e4e8264ea7fe3290ba44b81a2701a65b0b4aa0f3c285e097449cf2d0"
+      },
+      "seed": 42,
+      "prompt": "subject_definitions:\n<Video 1>: Supplies the source carriers and all time-varying geometry, placement, scale, pose, motion, effects, timing, visibility, occlusion and camera/framing structure of the continuing game.\n<Picture 1>: Empty environment appearance study of the seclusion clearing, supplying cool smoky dusk, dark damp earth and embedded stone, charred timber, amber firelight and subdued distant haze. Its overview composition is for art review; the live source supplies the camera and visible instances.\n<Subject 1>: Paired sheet <Picture 2> identifies the same player swordsman in front, right and back views: the upper row is the actual source model, and the lower row supplies an adult East Asian man with weathered natural skin, tied charcoal-black hair, a frayed charcoal shoulder mantle and scarf, anatomical-left blackened iron shoulder armor, layered dark cloth and leather, muted oxblood waist fabric and worn dark boots.\n<Subject 2>: Paired sheet <Picture 3> identifies the same straight sword in broad-front, thin-edge and reverse views: the upper row is the actual source sword; the lower row supplies dark black-red forged steel, deep burgundy metal planes, restrained worn bevels, a matte black wrapped grip and carved black-iron guard and pommel.\n<Subject 3>: Paired six-view sheet <Picture 4> identifies one reusable timber-pyre design: the first two rows show actual source structure in front, right, back, left, top and bottom views; the last two rows show corresponding charred-wood appearance in the same order. These views describe one design shared by the three existing source frames. The structural sheet leaves the interior readable; separate source flame, smoke and spark carriers supply the live combustion.\n\nsummary:\n[video editing] Render the source seclusion clearing as grounded dark Chinese wuxia at smoky dusk, with a weathered swordsman, a black-red straight sword and three charred timber pyres around an open central practice area, while the continuing source video controls gameplay, motion, visibility and framing.\n\nretention_analysis:\n<Video 1>: partially_preserved - retain the level traversable ground, three-frame arrangement, structural openings, source actor and weapon geometry, collision relationships, effects motion, timing and camera while replacing proxy appearance and materials.\n<Picture 1>: attribute_transfer - transfer the earth and stone surface treatment, charcoal palette, warm local firelight and cool atmospheric haze; use source geometry and framing for the live scene.\n<Subject 1>: partially_preserved - preserve the source player's body scale, animation, attachment points and silhouette relationships while supplying the lower-row face, hair, garments and worn materials.\n<Subject 2>: partially_preserved - preserve source weapon length, grip contact, motion, visibility and scabbard relationship while supplying the lower-row black-red steel and dark ornamental fittings.\n<Subject 3>: partially_preserved - preserve each source frame's footprint, inward-leaning posts, square rails, vertical-wall X braces, open interior and seven-plank roof while supplying charred wood grain, ash and ember fissures.\n\ndetailed_description:\nThe broad level clearing has dark compacted earth, embedded flattened broken stone, fine ash, shallow damp sheen and restrained reflections around the existing fire bases. Cool gray-brown dusk and diffuse smoke provide atmospheric depth, with low-contrast distance fading into haze. Orange and amber firelight illuminates nearby ground and the inward faces of the existing timber. Charcoal-black wood, scorched brown grain, splintered edges and subtle ember-red fissures remain readable in the shadows. The three existing structures surround a spacious, continuous central practice area; the environment image supplies appearance, and the source layout supplies the navigable space.\n\nWhenever the source player swordsman appears in <Video 1>, it is rendered as <Subject 1>, with weathered East Asian facial features, tied dark hair, a charcoal scarf and frayed short mantle, left-shoulder black iron scales, layered dark cloth, worn leather and a muted oxblood waist accent. Whenever the source exposed straight sword appears in <Video 1>, it is rendered as <Subject 2>, with blackened steel planes carrying deep burgundy-red forged texture, narrow worn metallic edges, a dark wrapped grip and compact carved black-iron fittings. Whenever an existing red square-frustum timber frame appears in <Video 1>, it is rendered as an instance of <Subject 3>, with inward-leaning charred posts, square rails, vertical-wall diagonal braces and the same simple plank canopy. Source flame carriers become irregular orange-amber fire within the open frames; source smoke carriers become soft rolling charcoal-gray plumes, and source sparks become small warm embers following their source trajectories. The source scabbard retains its attachment and dark leather-covered appearance, with the blade's exposure governed by the source drawing and sheathing state. When the source drinking prop is visible, it has worn natural brown gourd skin and follows its source hand contact.\n\nAll visibility, placement, pose, scale, motion, timing, effects evolution, occlusion and camera/framing state is governed by the continuing <Video 1> source stream. Apply the pyre design only to its existing source instances; a view may contain any visible subset of the three. The empty scene study, static identity poses and six-view layouts serve as appearance references rather than scene contents, actor removal, additional instances or camera commands.\n\noverall_soundscape:\nN/A\n\nnon_diegetic_music:\nN/A",
+      "prompt_sha256": "94ee680da0911bc832b114cf5da9eddf4b015db02ccaf2e479dfe326b887f446",
+      "references_mapping": [
+        {
+          "asset_id": "sha256:f6a994dce211c3af43ea0680edece3ce42552dc73cfd0611e124fdf50ccd0a51",
+          "id": "reference-0",
+          "role": "scene"
+        },
+        {
+          "asset_id": "sha256:ef5b63651efe45011db1602b5e35492cafdf020da32c1fa244081e4a91ae150a",
+          "id": "reference-1",
+          "role": "scene"
+        },
+        {
+          "asset_id": "sha256:cd12053e5edb63fdf51136e7b61e00e47278d8b897bfda60f6827e89c4eff82c",
+          "id": "reference-2",
+          "role": "scene"
+        },
+        {
+          "asset_id": "sha256:e478491a27f893837c73f7e6909e631aaafc01a4eba5b6fc8bf45f343e6ddb69",
+          "id": "reference-3",
+          "role": "scene"
+        }
+      ],
+      "objects": {
+        "whitebox.mp4": {
+          "bytes": 20885398,
+          "sha256": "a705620dede9b8e57e17bfeabb9711e79edae7b5b595a894419e00c45759ba2b"
+        },
+        "references/00.webp": {
+          "bytes": 401274,
+          "sha256": "f6a994dce211c3af43ea0680edece3ce42552dc73cfd0611e124fdf50ccd0a51"
+        },
+        "references/01.webp": {
+          "bytes": 87776,
+          "sha256": "ef5b63651efe45011db1602b5e35492cafdf020da32c1fa244081e4a91ae150a"
+        },
+        "references/02.webp": {
+          "bytes": 34466,
+          "sha256": "cd12053e5edb63fdf51136e7b61e00e47278d8b897bfda60f6827e89c4eff82c"
+        },
+        "references/03.webp": {
+          "bytes": 248532,
+          "sha256": "e478491a27f893837c73f7e6909e631aaafc01a4eba5b6fc8bf45f343e6ddb69"
+        }
+      },
+      "historical_model_cache_receipts": [
+        {
+          "cache_key": "f370cac904b5f730a197ca7f9e3949e09ee95a6700089d219990395d5f701125",
+          "prompt_version": 1,
+          "cache_result": "l1_hit",
+          "miss_reason": null,
+          "timings": {
+            "elapsed_host_ms": 1543.852,
+            "stages": {
+              "cache_lookup": {
+                "host_ms": 2.969,
+                "status": "executed"
+              },
+              "qwen_prepare": {
+                "host_ms": null,
+                "status": "skipped"
+              },
+              "qwen_remote_prepare": {
+                "host_ms": null,
+                "status": "skipped"
+              },
+              "reference_vae": {
+                "host_ms": null,
+                "status": "skipped"
+              },
+              "block0_forward": {
+                "host_ms": null,
+                "status": "skipped"
+              }
+            }
+          }
+        }
+      ],
+      "historical_condition_switches": [],
+      "whitebox_frames": 1585,
+      "reference_count": 4,
+      "condition_switch_count": 0,
+      "condition_switches": [],
+      "secondary_recording": {
+        "world_id": "interactive-production/world-399d32938504a32eb813d3efcc6d2728",
+        "recording_id": "083738c8081b49c2bc11141aa8403ac3",
+        "created_at": "2026-11-05T13:31:06.647408+00:00",
+        "object_prefix": "white_box_game_record/test-whitebox-sh/streaming-v1/ccd1126cd8cc0ce43538a454d4541aa2/04b040664429673b920d8844c9d15b8f/streams/41371a390ac045f3a42e93c166caccda/segments/083738c8081b49c2bc11141aa8403ac3/",
+        "video": {
+          "path": "whitebox.mp4",
+          "frames": 127,
+          "width": 832,
+          "height": 480,
+          "fps": 24,
+          "codec": "h264",
+          "first_pts_us": 4032414,
+          "duration_us": 6890476
+        },
+        "start_boundary_actual": {
+          "source_frame_index": 10,
+          "source_pts_us": 1261740,
+          "start_frame_sha256": "dd57e160276f8405178d5e856d73e0af5ddb519edc50574ae8e64f73ca582a59"
+        },
+        "seed": 42,
+        "prompt": "subject_definitions:\n<Video 1>: Supplies the source carriers and all time-varying geometry, placement, scale, pose, motion, timing, visibility, occlusion and camera/framing structure of the continuing game.\n<Picture 1>: Empty environment appearance study of the seclusion clearing, supplying cool smoky dusk, matte dry sandy earth and sparse small pebbles, charred timber, amber firelight and dense, fiercely burning distant temple ruins and drifting pale ash. Its overview composition is for art review; the live source supplies the camera and visible instances.\n<Subject 1>: Paired sheet <Picture 2> identifies the source player in front, right-side and back views: the upper row contains the actual refreshed game model; the lower row supplies an adult East Asian swordsman with weathered natural skin, dark charcoal center-parted hair and a low tied ponytail, a frayed charcoal scarf and short mantle, anatomical-left blackened iron shoulder armor, layered dark cloth and worn leather, muted oxblood waist fabric and wrapped dark boots, wearing a broad weathered woven bamboo conical hat with an irregular damaged brim and dark chin cords. The three columns depict one identity.\n<Subject 2>: Paired six-view sheet <Picture 3> identifies one reusable timber-pyre design: the first two rows show actual source structure in front, right, back, left, top and bottom views; the last two rows show corresponding charred-wood appearance in the same order. These views describe one design shared by the three existing source frames. The structural sheet leaves the interior readable; separate source flame, smoke and spark carriers supply the live combustion.\n\nsummary:\n[video editing] Render the source seclusion clearing as grounded dark Chinese wuxia at smoky dusk, with a weathered swordsman with a dark attached scabbard and three charred timber pyres around an open central practice area, while the continuing source video controls gameplay, motion, visibility and framing.\n\nretention_analysis:\n<Video 1>: partially_preserved - retain the level traversable ground, three-frame arrangement, structural openings, source actor and weapon geometry, collision relationships, timing and camera while replacing proxy appearance and materials.\n<Picture 1>: attribute_transfer - transfer the dry sand and ash surface treatment, charcoal palette, warm local firelight, distant ruined architecture, sparse drifting pale ash and cool atmospheric haze; use source geometry and framing for the live scene.\n<Subject 1>: partially_preserved - retain source body proportions, pose, attachments and motion while transferring the selected lower-row face, hair, headwear and garment appearance.\n<Subject 2>: partially_preserved - preserve each source frame's footprint, inward-leaning posts, square rails, vertical-wall X braces, open interior and seven-plank roof while supplying charred wood grain, ash and ember fissures.\n\ndetailed_description:\nThe broad level clearing is predominantly flat, dry, compacted sandy earth in muted tan-gray and smoky umber, dusted with pale ash. Broad matte patches and subtle irregular scuffs define the surface, with sparse small pebbles and broken tile chips. Fine grains resolve near the camera and blend into quiet natural soil at distance; diffuse firelight warms the sand without wet sheen or mirror reflections. Well beyond the three-pyre clearing, a dense burned Chinese temple complex fills the distant skyline in overlapping layers: closely spaced timber halls, two- and three-story galleries, gate towers, fractured stone terraces, roofless sections and partially collapsed covered walkways. Interlocking broken curved eaves, exposed floor beams, soot-stained walls and empty windows remain legible through layered smoke, with narrow glimpses of distant hills above the roofs. Tall yellow-orange flames roar along broken roof ridges, burst through windows and climb exposed columns; several ruined buildings burn strongly at once. Bright yellow-white flame cores, red-hot rafters and rising brown-black smoke convey a vigorous architectural fire, with dark structure remaining visible between the flames. The buildings stay beyond the practice clearing, preserving the open center and routes between the three existing pyres. Fine matte gray-white ash drifts lazily through the air, with occasional larger curled flakes tumbling in weak eddies at varied depths. A few near-camera flakes are softly defocused; the distant dust remains fine and sparse. Firelight briefly warms their edges, distinct from the bright orange embers rising around the pyres. The ash is irregular, light and translucent enough to keep the ground and silhouettes readable. Orange and amber firelight illuminates nearby ground and the inward faces of the existing timber. Charcoal-black wood, scorched brown grain, splintered edges and subtle ember-red fissures remain readable in the shadows. The three existing structures surround a spacious, continuous central practice area; the environment image supplies appearance, and the source layout supplies the navigable space.\n\nWhenever the source player swordsman appears in <Video 1>, it is rendered as <Subject 1>, an adult East Asian swordsman with weathered natural skin, dark charcoal center-parted hair and a low tied ponytail, a frayed charcoal scarf and short mantle, anatomical-left blackened iron shoulder armor, layered dark cloth and worn leather, muted oxblood waist fabric and wrapped dark boots, wearing a broad weathered woven bamboo conical hat with an irregular damaged brim and dark chin cords. Whenever an existing red square-frustum timber frame appears in <Video 1>, it is rendered as an instance of <Subject 2>, with inward-leaning charred posts, square rails, vertical-wall diagonal braces and the same simple plank canopy. Source flame carriers become irregular orange-amber fire within the open frames; source smoke carriers become soft rolling charcoal-gray plumes, and source sparks become small warm embers following their source trajectories. The attached source scabbard has worn dark leather covering and restrained black-iron fittings.\n\nAll visibility, placement, pose, scale, motion, timing, occlusion and camera/framing state is governed by the continuing <Video 1> source stream. Apply the pyre design only to its existing source instances; a view may contain any visible subset of the three. The empty scene study, static identity poses and six-view layouts serve as appearance references rather than scene contents, actor removal, additional instances or camera commands.\n\noverall_soundscape:\nN/A\n\nnon_diegetic_music:\nN/A",
+        "prompt_sha256": "fbc73aca6812e7f12bb21ff59382855e1c9efc70308a2e6c7a8c1f185422600f",
+        "references_mapping": [
+          {
+            "asset_id": "sha256:ec7f6c67d1810c6b73a129347fb34458b65794e251281c95f055b05e818e36f4",
+            "id": "reference-0",
+            "role": "scene"
+          },
+          {
+            "asset_id": "sha256:383a63be469d82cd23dc422771c56da52651c09d18cb7d9a993998c94cd5a1a0",
+            "id": "reference-1",
+            "role": "scene"
+          },
+          {
+            "asset_id": "sha256:e478491a27f893837c73f7e6909e631aaafc01a4eba5b6fc8bf45f343e6ddb69",
+            "id": "reference-2",
+            "role": "scene"
+          }
+        ],
+        "objects": {
+          "whitebox.mp4": {
+            "bytes": 1805504,
+            "sha256": "9e9c20614583b2a593d5a5393e65130ed873c5020f6976a92f2343f445ddd8cd"
+          },
+          "references/00.webp": {
+            "bytes": 548644,
+            "sha256": "ec7f6c67d1810c6b73a129347fb34458b65794e251281c95f055b05e818e36f4"
+          },
+          "references/01.webp": {
+            "bytes": 95690,
+            "sha256": "383a63be469d82cd23dc422771c56da52651c09d18cb7d9a993998c94cd5a1a0"
+          },
+          "references/02.webp": {
+            "bytes": 248532,
+            "sha256": "e478491a27f893837c73f7e6909e631aaafc01a4eba5b6fc8bf45f343e6ddb69"
+          }
+        },
+        "historical_model_cache_receipts": [
+          {
+            "cache_key": "8cb37eebf6bb4b5c25063097cc025d4563a7cf80afbdbf6b759402e4038383b1",
+            "prompt_version": 1,
+            "cache_result": "l1_hit",
+            "miss_reason": null,
+            "timings": {
+              "elapsed_host_ms": 1507.113,
+              "stages": {
+                "cache_lookup": {
+                  "host_ms": 2.979,
+                  "status": "executed"
+                },
+                "qwen_prepare": {
+                  "host_ms": null,
+                  "status": "skipped"
+                },
+                "qwen_remote_prepare": {
+                  "host_ms": null,
+                  "status": "skipped"
+                },
+                "reference_vae": {
+                  "host_ms": null,
+                  "status": "skipped"
+                },
+                "block0_forward": {
+                  "host_ms": null,
+                  "status": "skipped"
+                }
+              }
+            }
+          }
+        ],
+        "historical_condition_switches": []
+      }
+    }
+  ],
+  "oss_bucket_aliases": [
+    "leap-worldmodel-shanghai"
+  ]
+}

@@ -1281,3 +1281,397 @@ def test_regional_deadline_counts_play_wait_and_absolute_lifetime(
         source.unbind.assert_not_awaited()  # End the player, not only its segment.
 
     asyncio.run(run())
+
+
+def test_recorded_video_engine_24fps_and_capture_control_hold_resume(tmp_path):
+    import av
+    import numpy as np
+
+    from sglang.multimodal_gen.runtime.realtime.whitebox.recorded_engine import (
+        RecordedVideoEngine,
+    )
+
+    mp4_path = tmp_path / "sample.mp4"
+    spec = VideoSpec(32, 32, 24)
+    container = av.open(str(mp4_path), mode="w")
+    try:
+        stream = container.add_stream("libx264", rate=spec.fps)
+        stream.width = spec.width
+        stream.height = spec.height
+        stream.pix_fmt = "yuv420p"
+        for idx in range(6):
+            arr = np.full((spec.height, spec.width, 3), 20 * (idx + 1), dtype=np.uint8)
+            vf = av.VideoFrame.from_ndarray(arr, format="rgb24")
+            for packet in stream.encode(vf):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    finally:
+        container.close()
+
+    async def run():
+        engine = RecordedVideoEngine(
+            spec,
+            mp4_path=mp4_path,
+            max_frames=4,
+            realtime_pacing=False,
+            fast_frame_delay_s=0.01,
+            session_id="cli-rec-1",
+            epoch=2,
+        )
+        it = engine.frames().__aiter__()
+        f0 = await anext(it)
+        assert f0.index == 0
+        assert f0.pts_us == 0
+        assert len(f0.rgb) == spec.frame_bytes
+        header0 = f0.provenance["cli_frame_header"]
+        assert header0 == {
+            "sessionId": "cli-rec-1",
+            "epoch": 2,
+            "mediaGeneration": 1,
+            "outputFrameId": 0,
+        }
+
+        held = await engine.capture_control("hold", "ctx-hold-0")
+        assert held == {
+            "frame": {
+                "sessionId": "cli-rec-1",
+                "epoch": 2,
+                "mediaGeneration": 1,
+                "outputFrameId": 0,
+            }
+        }
+
+        next_task = asyncio.create_task(anext(it))
+        await asyncio.sleep(0.03)
+        assert not next_task.done(), "Frame emission must stay paused while held"
+
+        resumed = await engine.capture_control("resume", "ctx-hold-0")
+        assert resumed["pausedMs"] >= 20.0
+        f1 = await asyncio.wait_for(next_task, timeout=2.0)
+        assert f1.index == 1
+        assert f1.pts_us == spec.pts(1)
+        assert f1.provenance["capture_pts_us"] > spec.pts(1)
+        assert f1.provenance["cli_frame_header"]["outputFrameId"] == 1
+
+        remaining = [f async for f in it]
+        assert [f.index for f in remaining] == [2, 3]
+        retired = await engine.retire()
+        assert retired["state"] == "retired"
+
+        engine_48 = RecordedVideoEngine(
+            spec,
+            mp4_path=mp4_path,
+            max_frames=3,
+            capture_fps=48,
+            realtime_pacing=False,
+            fast_frame_delay_s=0.0,
+        )
+        assert engine_48.metadata == {"capture_fps": 48, "model_fps": 24}
+        frames_48 = [f async for f in engine_48.frames()]
+        assert [f.pts_us for f in frames_48] == [spec.pts(0), spec.pts(1), spec.pts(2)]
+        assert [f.provenance["capture_pts_us"] for f in frames_48] == [
+            0,
+            1_000_000 // 48,
+            2_000_000 // 48,
+        ]
+        await engine_48.close()
+
+    asyncio.run(run())
+
+
+def test_recorded_video_engine_with_source_session_prefill_and_switch(
+    tmp_path, monkeypatch
+):
+    import importlib.util
+    from pathlib import Path
+
+    suite_path = (
+        Path(__file__).resolve().parents[6]
+        / "benchmark"
+        / "whitebox"
+        / "run_four_case_sglang_suite.py"
+    )
+    spec_mod = importlib.util.spec_from_file_location("wb_four_case_suite", suite_path)
+    assert spec_mod is not None and spec_mod.loader is not None
+    suite_mod = importlib.util.module_from_spec(spec_mod)
+    import sys
+
+    sys.modules["wb_four_case_suite"] = suite_mod
+    spec_mod.loader.exec_module(suite_mod)
+
+    from sglang.multimodal_gen.runtime.realtime.whitebox.async_recording import (
+        AsyncRecording,
+    )
+
+    add_references = AsyncRecording.add_references
+
+    async def slow_references(self, references, *, wait=False):
+        await asyncio.sleep(0.1)  # Deliberately cross an old 8 ms capture interval.
+        return await add_references(self, references, wait=wait)
+
+    monkeypatch.setattr(AsyncRecording, "add_references", slow_references)
+
+    enqueue = suite_mod.MockBoundWebSocket._enqueue
+
+    def delayed_persistence(self, message):
+        if message.get("type") == "prefill.persisted":
+            message = dict(message)
+            message.pop("prefill_to_persisted_ms", None)
+            asyncio.get_running_loop().call_later(0.03, enqueue, self, message)
+        else:
+            enqueue(self, message)
+
+    monkeypatch.setattr(suite_mod.MockBoundWebSocket, "_enqueue", delayed_persistence)
+
+    case_meta = {
+        "case_id": "unit_lifecycle_case",
+        "world_id": "world-lifecycle-unit",
+        "recording_id": "rec-lifecycle-unit",
+        "object_prefix": "whitebox/rec-lifecycle-unit/",
+        "seed": 42,
+        "video": {"width": 832, "height": 480, "fps": 24, "frames": 36},
+        "prompt": "Initial wuxia courtyard scene with <Video 1> and <Picture 1>.",
+        "references_mapping": [
+            {"id": "ref_0", "asset_id": "sha256:" + "a" * 64, "role": "scene"}
+        ],
+        "objects": {
+            "references/00.png": {"bytes": 128, "sha256": "a" * 64},
+        },
+        "condition_switches": [
+            {
+                "prompt_version": 2,
+                "boundary": 17,
+                "source_policy": "skip_during_switch",
+                "prompt": "Switched wuxia courtyard scene with snow and <Picture 1>.",
+                "references": [
+                    {"id": "ref_0", "asset_id": "sha256:" + "a" * 64, "role": "scene"}
+                ],
+            }
+        ],
+    }
+
+    async def run():
+        cache_store = suite_mod.MockSglangCacheStore()
+        res = await suite_mod._run_single_segment_flow(
+            case_id="unit_lifecycle_case",
+            recording_meta=case_meta,
+            media_root=tmp_path / "media",
+            spool_dir=tmp_path / "spool",
+            spec=VideoSpec(832, 480, 24),
+            mode="mock-worker",
+            cache_store=cache_store,
+            sglang_url=None,
+            max_frames_after_last_event=4,
+            full_frames=False,
+            preserve_switch_boundaries=False,
+            realtime_pacing=False,
+            pacing_speed=10.0,
+            repeat_warm_prefill=True,
+            prewarm_switch_conditions=True,
+        )
+        assert res["prepare"]["f0_source_frame_index"] == 0
+        assert res["prepare"]["primary_prefill"]["cache_result"] == "miss"
+        assert res["prepare"]["primary_prefill"]["prefill_to_persisted_ms"] >= 30
+        assert (
+            res["prepare"]["primary_prefill"]["persistence_timing_source"]
+            == "client_receipt"
+        )
+        assert res["prepare"]["warm_prefill"]["cache_result"] == "l1_hit"
+        assert res["whitebox_session_ttff_ms"] > 0
+        assert len(res["condition_switches"]) == 1
+        sw = res["condition_switches"][0]
+        assert sw["executed_boundary"] == 17
+        assert sw["kv_ready"] is True
+        assert sw["cache_receipt"]["cache_result"] == "l1_hit"
+        assert res["steady_state_flow"]["received_model_frames"] >= 21
+        control_actions = [
+            c[0] for c in res["steady_state_flow"]["capture_control_log"]
+        ]
+        assert control_actions == ["hold", "resume"]
+
+    asyncio.run(run())
+
+
+def test_four_case_sglang_suite_mock_worker_end_to_end(tmp_path):
+    import importlib.util
+    import json
+    import sys
+    from pathlib import Path
+
+    suite_path = (
+        Path(__file__).resolve().parents[6]
+        / "benchmark"
+        / "whitebox"
+        / "run_four_case_sglang_suite.py"
+    )
+    spec_mod = importlib.util.spec_from_file_location(
+        "wb_four_case_suite_e2e", suite_path
+    )
+    assert spec_mod is not None and spec_mod.loader is not None
+    suite_mod = importlib.util.module_from_spec(spec_mod)
+    sys.modules["wb_four_case_suite_e2e"] = suite_mod
+    spec_mod.loader.exec_module(suite_mod)
+
+    media_dir = tmp_path / "media"
+    out_dir = tmp_path / "out"
+    rc = suite_mod.main(
+        [
+            "run",
+            "--mode",
+            "mock-worker",
+            "--media-dir",
+            str(media_dir),
+            "--output-dir",
+            str(out_dir),
+            "--max-frames-after-last-event",
+            "4",
+            "--synthesize-fixtures",
+        ]
+    )
+    assert rc == 0
+    summary_path = out_dir / "summary.json"
+    report_path = out_dir / "REPORT.md"
+    assert summary_path.exists()
+    assert report_path.exists()
+    summary = json.loads(summary_path.read_text())
+    assert len(summary["cases"]) == 4
+    overview = summary["metrics_overview"]
+    assert overview["block0_cache"]["cold_prefill_to_memory_ms"] > 0
+    assert overview["block0_cache"]["warm_cache_result"] == "l1_hit"
+    assert overview["block0_cache"]["marvel_12ref_stress_prefill_ms"] > 0
+    assert overview["session_ttff"]["shanghai_drive_ttff_ms"] > 0
+    assert overview["session_ttff"]["marvel_overdrive_ttff_ms"] > 0
+    assert overview["session_ttff"]["dark_horns_ttff_ms"] > 0
+    assert overview["session_ttff"]["wuxia_jiahao_seg1_ttff_ms"] > 0
+    assert overview["session_ttff"]["wuxia_jiahao_seg2_ttff_ms"] > 0
+    assert len(overview["prompt_switch_ttff"]["marvel_rapid_switches"]) == 2
+    ab = overview["prompt_switch_ttff"]["dark_horns_ab_comparison"]
+    assert ab["unprefilled_miss"]["cache_receipt"]["cache_result"] == "miss"
+    assert ab["prefilled_hit"]["cache_receipt"]["cache_result"] == "l1_hit"
+
+
+def test_four_case_cache_evidence_and_direct_token_rejection(tmp_path):
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parents[6]
+        / "benchmark/whitebox/run_four_case_sglang_suite.py"
+    )
+    spec = importlib.util.spec_from_file_location("suite_evidence_test", path)
+    suite = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = suite
+    spec.loader.exec_module(suite)
+    for receipt in (None, {}, {"cache_result": "miss"}):
+        with pytest.raises(RuntimeError, match="CACHE_EXPECTATION_FAILED"):
+            suite._require_cache_result(receipt, {"l1_hit", "l2_hit"}, "warm")
+    with pytest.raises(ValueError, match="real reservation"):
+        suite._create_real_sglang_lease(
+            "ws://127.0.0.1:1", None, VideoSpec(), "test", {}
+        )
+    with pytest.raises(FileNotFoundError):
+        asyncio.run(
+            suite._run_single_segment_flow(
+                case_id="missing",
+                recording_meta={
+                    "recording_id": "missing",
+                    "objects": {"whitebox.mp4": {"bytes": 1, "sha256": "bad"}},
+                },
+                media_root=tmp_path,
+                spool_dir=tmp_path,
+                spec=VideoSpec(),
+                mode="real-sglang",
+                cache_store=suite.MockSglangCacheStore(),
+                sglang_url=None,
+                max_frames_after_last_event=1,
+                full_frames=False,
+                preserve_switch_boundaries=False,
+                realtime_pacing=True,
+                pacing_speed=1.0,
+            )
+        )
+
+
+def test_four_case_oss_alias_preserves_object_hash(tmp_path, monkeypatch):
+    import hashlib
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parents[6]
+        / "benchmark/whitebox/run_four_case_sglang_suite.py"
+    )
+    spec = importlib.util.spec_from_file_location("suite_oss_test", path)
+    suite = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = suite
+    spec.loader.exec_module(suite)
+    calls = []
+
+    def download(bucket, key, dest, endpoint, profile):
+        calls.append((bucket, key))
+        dest.write_bytes(b"wrong" if bucket == "leap-world-shanghai" else b"verified")
+
+    monkeypatch.setattr(suite, "_download_oss_object", download)
+    suite.prepare_recording_media(
+        dict(
+            recording_id="record",
+            object_prefix="archive/",
+            objects={
+                "whitebox.mp4": dict(
+                    bytes=8, sha256=hashlib.sha256(b"verified").hexdigest()
+                )
+            },
+        ),
+        tmp_path,
+        oss_bucket="leap-world-shanghai",
+        oss_bucket_aliases=("leap-worldmodel-shanghai",),
+        oss_endpoint="oss-cn-shanghai.aliyuncs.com",
+    )
+    assert calls == [
+        ("leap-world-shanghai", "archive/whitebox.mp4"),
+        ("leap-worldmodel-shanghai", "archive/whitebox.mp4"),
+    ]
+    assert (tmp_path / "record/whitebox.mp4").read_bytes() == b"verified"
+
+
+def test_four_case_gate_advances_from_ack_without_observation_race(monkeypatch):
+    import importlib.util
+    import sys
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+
+    path = (
+        Path(__file__).resolve().parents[6]
+        / "benchmark/whitebox/run_four_case_sglang_suite.py"
+    )
+    spec = importlib.util.spec_from_file_location("suite_gate_test", path)
+    suite = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = suite
+    spec.loader.exec_module(suite)
+    monkeypatch.setattr(suite.SourceSession, "segment_status", AsyncMock())
+    source = object.__new__(suite._ReplaySourceSession)
+    source.replay_boundaries = [17, 34]
+    segment = SimpleNamespace(
+        condition_switch=None,
+        model_source_allowed=lambda sent: True,
+        model_control=AsyncMock(return_value=True),
+        _notify_source_admission=AsyncMock(),
+    )
+
+    async def run():
+        await source.segment_status(segment, "initializing", phase="protocol_ready")
+        assert not segment.model_source_allowed(17)
+        # A complete switch may happen before capacity_available runs again.
+        ack = dict(
+            type="control_ack", kind="prompt.update", state="kv_ready", prompt_version=2
+        )
+        await segment.model_control(ack)
+        assert segment.model_source_allowed(17)
+        assert not segment.model_source_allowed(34)
+        await segment.model_control(ack)  # Duplicate cannot advance the next gate.
+        assert not segment.model_source_allowed(34)
+
+    asyncio.run(run())

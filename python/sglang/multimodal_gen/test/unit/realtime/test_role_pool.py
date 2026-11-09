@@ -1162,3 +1162,117 @@ def test_released_prefill_observes_disk_without_owning_or_mutating_next_player()
             )
 
     asyncio.run(run())
+
+
+def test_four_case_direct_pool_uses_native_fences_and_releases(monkeypatch):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[6] / "benchmark/whitebox"))
+    from four_case_role_pool import SuiteRolePool, current_pool
+
+    async def run():
+        # Actual ASGI Worker endpoints, signatures, reserve/build/renew and close.
+        values = [
+            declaration(role, role, capacity=1)
+            for role in ("encoder", "dit", "decoder")
+        ]
+        store = RolePoolStore(MemoryRecords(), "test", "control-1")
+        control, managers, client = await native_cluster(store, values)
+        for managed in managers.values():
+            managed.process.deployment = dict(
+                compatibility="model-v1",
+                network_domain="zone-a",
+                hardware_ids=[managed.service_id],
+            )
+        monkeypatch.setenv("SUITE_TEST_SECRET", SECRET)
+        workers = {v["role"]: v["services"][0]["endpoints"]["http"] for v in values}
+        async with client:
+            async with SuiteRolePool(
+                workers=workers,
+                revision="test-revision",
+                compatibility="model-v1",
+                profile="480",
+                network_domain="zone-a",
+                control_epoch="control-1",
+                signing_secret_env="SUITE_TEST_SECRET",
+                client=client,
+            ) as pool:
+                assert current_pool.get() is pool
+                await pool.wait_idle()
+                a = await pool.control("admit", request("suite"))
+                assert a["state"] == "bound"
+                assert all(m.state == "connected" for m in managers.values())
+                with pytest.raises(PoolError, match="SERVICE_OCCUPIED"):
+                    # A second authority cannot overwrite the first one's owner.
+                    manager = next(iter(managers.values()))
+                    manager.process.acquire(
+                        manager.service_id, "other-allocation", "480"
+                    )
+                result = await pool.control(
+                    "close",
+                    dict(
+                        admission_id=a["intent"]["admission_id"],
+                        allocation_id=a["allocation_id"],
+                        sdk_cleanup=sdk_receipt(a),
+                    ),
+                )
+                assert result["state"] == "released"
+                await pool.wait_idle()
+                assert all(m.state == "idle" for m in managers.values())
+            assert current_pool.get() is None
+        await control.shutdown()
+
+    asyncio.run(run())
+
+
+def test_four_case_remote_pool_routes_and_authenticates(monkeypatch):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[6] / "benchmark/whitebox"))
+    from four_case_role_pool import SuiteRolePool
+
+    calls = []
+
+    def respond(req):
+        calls.append(req)
+        if req.method == "GET":
+            assert req.url.params["model_revision"] == "test-revision"
+            return httpx.Response(200, json={"backend": "role_pool", "profile": "480"})
+        assert req.headers["Authorization"] == "Bearer test-room-token"
+        import json
+
+        body = json.loads(req.content)
+        assert body == {
+            "profile": "480",
+            "compatibility": "model-v1",
+            "network_domain": "test-shanghai-copy",
+        }
+        return httpx.Response(
+            200,
+            json={
+                "roles": {
+                    "model_group": {
+                        "free_slots": 1,
+                        "active_sessions": 0,
+                        "draining_workers": 0,
+                    }
+                }
+            },
+        )
+
+    async def run():
+        monkeypatch.setenv("SUITE_TEST_ROOM_TOKEN", "test-room-token")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            async with SuiteRolePool(
+                coordinator_url="http://127.0.0.1:18181",
+                revision="test-revision",
+                compatibility="model-v1",
+                room_token_env="SUITE_TEST_ROOM_TOKEN",
+                client=client,
+            ) as pool:
+                await pool.wait_idle()
+        assert len(calls) == 2
+
+    asyncio.run(run())

@@ -183,6 +183,10 @@ class ManagedService:
                     service=copy.deepcopy(self.native.service),
                     boot_epoch=self.process.boot_epoch,
                     control_epoch=self.process.credentials.epoch,
+                    capacity=copy.deepcopy(self.process.capacity),
+                    profiles=copy.deepcopy(self.process.profiles),
+                    profile_limits=copy.deepcopy(self.process.profile_limits),
+                    deployment=copy.deepcopy(getattr(self.process, "deployment", {})),
                 )
             self._identity(
                 body,
