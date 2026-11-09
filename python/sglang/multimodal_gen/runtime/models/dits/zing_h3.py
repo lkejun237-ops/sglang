@@ -232,6 +232,15 @@ _GRAPH_ROUTE_ENVS = (
     "SGLANG_ZING_FA4_FIXED",
     "SGLANG_ZING_FUSED_HISTORY_ROPE",
     "SGLANG_ZING_GROUPED_HISTORY_ROPE",
+    "SGLANG_ZING_SPARSE_ATTN_MODE",
+    "SGLANG_ZING_SPARSE_BUDGET_SCALE",
+    "SGLANG_ZING_SPARSE_MIN_CHUNK",
+    "SGLANG_ZING_SPARSE_VIRTUAL_MEAN",
+    "SGLANG_ZING_SPARSE_TRIAGE_SCORE",
+    "SGLANG_ZING_SPARSE_PRICE_PI",
+    "SGLANG_ZING_SPARSE_THREE_TIER",
+    "SGLANG_ZING_SPARSE_C_RF",
+    "SGLANG_ZING_SPARSE_ALPHA_TRIAGE",
 )
 
 
@@ -298,7 +307,11 @@ def _static_inputs(inputs, static):
 
 
 def _tensor_layout(tensor):
-    return tuple(tensor.shape), tensor.stride(), tensor.dtype, tensor.device
+    if hasattr(tensor, "shape"):
+        return tuple(tensor.shape), tensor.stride(), tensor.dtype, tensor.device
+    if isinstance(tensor, dict):
+        return tuple((k, _tensor_layout(v)) for k, v in sorted(tensor.items()))
+    return None
 
 
 def _numerics_mode():
@@ -1953,6 +1966,17 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
 
         def execute(static):
             kv_tensors = {name: static["kv." + name] for name in kv_plan.tensors}
+            ckv_by_layer = getattr(kv_plan, "compressed_kv_by_layer", None)
+            if ckv_by_layer is not None:
+                kv_tensors["compressed_kv_by_layer"] = ckv_by_layer
+            ckv = getattr(kv_plan, "compressed_kv", None)
+            if (
+                ckv is None
+                and getattr(kv_plan, "_compressed_kv_store", None) is not None
+            ):
+                ckv = kv_plan._compressed_kv_store.as_kernel_dict()
+            if ckv is not None:
+                kv_tensors["compressed_kv"] = ckv
             device_layout = dataclasses.replace(
                 layout,
                 **{name: static["layout." + name] for name in _GRAPH_LAYOUT_INPUTS},
@@ -2033,7 +2057,19 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             self.experimental_compiled_adaln,
             precomputed_projections,
             tuple(
-                (name, tuple(value.shape), value.dtype, value.device)
+                (
+                    name,
+                    tuple(value.shape)
+                    if hasattr(value, "shape")
+                    else tuple(
+                        (k, tuple(v.shape), v.dtype, v.device)
+                        for k, v in sorted(value.items())
+                    )
+                    if isinstance(value, dict)
+                    else (),
+                    getattr(value, "dtype", None),
+                    getattr(value, "device", None),
+                )
                 for name, value in sorted(tensors.items())
             ),
             kv_plan.rotates_history,
@@ -2307,41 +2343,63 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         else:
             q = fused_q
         keys, values = fixed.rotated[index], fixed.stores[index][1]
-        results, start = [], 0
-        for branch, stop in enumerate(options.fixed_kv.ends):
-            query = q[start:stop]
-            if self.experimental_attention_backend == "fa4":
-                result = _fixed_fa4_attention(
-                    query,
-                    keys,
-                    values,
-                    module.softmax_scale,
-                    _FixedFA4Metadata(options.fixed_tensors, branch),
-                    optimized=options.optimized_fixed_480p,
-                    target_736p=options.target_fixed_736p,
-                )
-            elif query.device.type == "cpu":
-                result = _cpu_varlen_attention(
-                    query,
-                    keys,
-                    values,
-                    options.fixed_tensors[f"cu_k.{branch}"],
-                    module.softmax_scale,
-                )
-            else:
-                valid = (
-                    torch.arange(keys.shape[0], device=keys.device)
-                    < options.fixed_tensors[f"cu_k.{branch}"][1]
-                )
-                result = F.scaled_dot_product_attention(
-                    query.transpose(0, 1)[None],
-                    keys.transpose(0, 1)[None],
-                    values.transpose(0, 1)[None],
-                    attn_mask=valid[None, None, None],
-                    scale=module.softmax_scale,
-                )[0].transpose(0, 1)
-            results.append(result)
-            start = stop
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3_sparse_attn import (
+            execute_fixed_block_sparse_branches,
+            get_sparse_mode,
+        )
+
+        sparse_mode = get_sparse_mode()
+        if sparse_mode != "dense" or getattr(
+            options.fixed_kv, "_sparse_branches", None
+        ):
+            results = execute_fixed_block_sparse_branches(
+                q,
+                keys,
+                values,
+                module.softmax_scale,
+                index,
+                options.fixed_kv,
+                options.fixed_tensors,
+                ulysses_rank=getattr(options, "ulysses_rank", 0),
+                optimized=options.optimized_fixed_480p,
+                target_736p=options.target_fixed_736p,
+            )
+        else:
+            results, start = [], 0
+            for branch, stop in enumerate(options.fixed_kv.ends):
+                query = q[start:stop]
+                if self.experimental_attention_backend == "fa4":
+                    result = _fixed_fa4_attention(
+                        query,
+                        keys,
+                        values,
+                        module.softmax_scale,
+                        _FixedFA4Metadata(options.fixed_tensors, branch),
+                        optimized=options.optimized_fixed_480p,
+                        target_736p=options.target_fixed_736p,
+                    )
+                elif query.device.type == "cpu":
+                    result = _cpu_varlen_attention(
+                        query,
+                        keys,
+                        values,
+                        options.fixed_tensors[f"cu_k.{branch}"],
+                        module.softmax_scale,
+                    )
+                else:
+                    valid = (
+                        torch.arange(keys.shape[0], device=keys.device)
+                        < options.fixed_tensors[f"cu_k.{branch}"][1]
+                    )
+                    result = F.scaled_dot_product_attention(
+                        query.transpose(0, 1)[None],
+                        keys.transpose(0, 1)[None],
+                        values.transpose(0, 1)[None],
+                        attn_mask=valid[None, None, None],
+                        scale=module.softmax_scale,
+                    )[0].transpose(0, 1)
+                results.append(result)
+                start = stop
         result = torch.cat(results)
         if splits is not None:
             result = _usp_output_all_to_all_varlen(result[None], splits, head_dim=2)[0]

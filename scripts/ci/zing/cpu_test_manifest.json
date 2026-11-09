@@ -12071,6 +12071,18 @@
           }
         }
       }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_h3_block_sparse_attn.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "CPU unit contracts verify Zing H3 4D block-sparse attention cosine-gated virtual sink eviction, multi-resolution (480p/736p) & Ulysses SP head sharding, mixed-latent M_q parity isolation, mid-stream prefix_joint reference switches, and ZingChunkGraphs shared-pool generation handling.",
+      "dependencies": []
     }
   ],
   "recipes": {

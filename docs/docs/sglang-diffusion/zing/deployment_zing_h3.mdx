@@ -1966,6 +1966,132 @@ Hugging Face Hub `1.33.0`，并直接导入 Lynn loader；仅检查 CLI `--help`
 
 后续 abort/close 并发修正（验证快照 `8591d6e89d`）已通过固定 Linux CPU 环境两轮 DiT I/O 回归，每轮 15 项、无跳过；覆盖 abort 未返回时的并发 close/重复 abort、abort 抛错及关闭顺序。原 GPU 服务结果不能外推到此修正，当前版本的真实 NCCL 故障注入与退出/资源回收仍未验证。[CPU 回执](https://github.com/seedleap/sglang/actions/runs/41805829330)仅证明受控线程交错和 I/O 生命周期行为。
 
+## 4D Block-Sparse Attention（CosGate v2，2026-10-30 Draft，PR #493）
+
+2026-10-30，基于 main `480b48c853`（PR 分支已同步至 `2242cc4fa7`，代码提交 `942b66992b`，配套算子库 `seedleap-kernels` PR [#10](https://github.com/seedleap/seedleap-kernels/pull/10) `c7e3d6d2e8`）：接入 4D 块稀疏注意力（`block_sparse_attention`）与余弦门控融合双 Query 路由器（`fused_dual_query_block_router`，默认关闭，由 `SGLANG_ZING_SPARSE_ATTN_MODE=dual_query_topk` 与 `SGLANG_ZING_SPARSE_BUDGET_SCALE=0.95|0.90` 显式开启）。每个 chunk 仅在 `source_t0` 执行单次池化路由，后续去噪步直接复用块索引：
+- **零硬编码 5 段候选块与双流几何解耦**：按 `KIND_TEXT=0`、`KIND_REF_VIS=1`、`KIND_SINK=2`、`KIND_WIN_SRC=3`、`KIND_WIN_FIN=4` 标记物理 KV 池；`source` 流完全由干净 `Q_src` 独立驱动，去噪流对 `WIN_SRC`（`0.65 Q_src + 0.35 Q_act`）与 `WIN_FIN`（`0.20 Q_src + 0.80 Q_act`）按信噪比解耦融合；
+- **StreamDiffusionV2 风格 `C^0` 平滑锚点虚拟驱逐**：仅对 `KIND_REF_VIS` 执行余弦门控校准以保留服装/NPC 特征；当 `KIND_SINK` 相对局部窗口余弦 Z-score 跌破阈值（`z_c < -0.35`）时按 `ev_sink = mu_w - (1.5 + 2.0 * d_sink) * std_w` 平滑压低路由分，消除 17s 走廊转弯首帧墙壁穿模，无需物理重写前缀 KV；
+- **`ZingChunkGraphs` 共享内存池世代生命周期加固**：捕获期临时关闭 Python 循环 GC、移除 `.pin_memory()` 与运行期池内单图驱逐（`max_graphs=16`，超限时整池排空重置 `_pool=None`），并将 `prefix_separate` 与 `_sparse_mode_epoch` 解耦，消除超长会话与高频 prompt/reference 切换下的 `cudaStreamCaptureStatusInvalidated` 与池复用冲突。
+
+### 上海 H200 实测结果（832×480，同次分配三臂对照）
+
+硬件与配置：上海 PAI-DLC H200 配额（实机驱动回报 `NVIDIA L20X`，SM90，143,771 MiB/卡，作业 `dlc1j2lxqjraqh9j`）；单活跃会话，`GPU0 = Remote Qwen + Dedicated Source VAE (E1)`、`GPU1 = DiT (SP1, FP8, weights-free AdaLN, W6/sink3, 4→2, ZingChunkGraphs ON, prompt_joint=1, block0_cache=off)`、`GPU2 = Dedicated Lynn Decoder (D1)`，连续 source `bench_streaming_source.py`（每组 `n=1` 完整会话，输出与输入均为 `832×480`）。Stage 0 同机通过 `seedleap-kernels` GPU 单测 `13/13`、`sglang` 单测 `16/16`、四组 `480p/736p × SP1/SP2` 算子与 Graph 重放自检（`cudagraph_max_abs_err = 0.0`），以及 `5s` 进程内确定性复跑（`exact_sha256_match = true`，`PSNR = 100.0 dB`）。
+
+| 832×480 case（帧数 / 动态更新） | 模式 | TTFF (s) | E2E (s) | 全程 / 首包后 FPS | TPOC P50/P95 (ms) | ICL P50/P95 (ms) | 全程 / 稳态 PSNR (dB) | SSIM / RGB MAE |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `5s`（120f / 0） | `dense` / `tau095` / `tau090` | 3.52 / 3.07 / 3.07 | 14.03 / 13.99 / 13.53 | 8.55 / 8.58 / 8.87 \| 11.32 / 10.91 / 11.38 | 700.8 / 727.4 / 697.2（P50=P95） | 556.9/1566.5 \| 519.8/1588.7 \| 512.9/1627.2 | — \| 50.14/29.70 \| 49.79/29.40 | — \| 0.9489/2.49 \| 0.9476/2.57 |
+| `30s-indoor`（720f / 0） | `dense` / `tau095` / `tau090` | 3.58 / 2.59 / 2.57 | 47.37 / **42.95 (-9.3%)** / **40.16 (-15.2%)** | 15.20 / 16.76 / 17.93 \| 16.42 / **17.81 (+8.5%)** / **19.13 (+16.5%)** | 515.3 / 474.9 / 442.2（P50=P95） | 526.1/619.4 \| 495.9/638.8 \| 461.5/505.2 | — \| 22.00/18.02（12–19s: **17.58**）\| 20.77/16.76 | — \| 0.5516/19.93 \| 0.5273/22.70 |
+| `product-few-images`（403f / 0） | `dense` / `tau095` / `tau090` | 2.66 / 2.06 / 2.07 | 26.81 / 26.30 / **23.78 (-11.3%)** | 15.03 / 15.32 / 16.95 \| 16.64 / 16.59 / **18.52 (+11.3%)** | 503.1 / 504.9 / 452.3（P50=P95） | 471.6/1279.0 \| 460.3/1346.4 \| 437.9/1153.7 | — \| 27.43/20.30 \| 26.31/19.08 | — \| 0.6470/16.25 \| 0.6251/18.86 |
+| `product-reference-switch`（764f / 6） | `dense` / `tau095` / `tau090` | 4.44 / **2.46 (-44.6%)** / 2.49 | 48.84 / 51.43 / 53.46 | 15.64 / 14.86 / 14.29 \| 17.18 / 15.58 / 14.97 | 493.4 / 544.0 / 566.3（P50=P95） | 443.3/1273.3 \| 457.3/1437.5 \| 432.7/1639.3 | — \| **29.38/25.91** \| 26.58/22.97 | — \| **0.8342/8.73** \| 0.8092/13.64 |
+| `30s-wasteland`（720f / 0） | `dense` / `tau095` / `tau090` | 4.52 / 3.27 / 3.28 | 52.85 / **47.56 (-10.0%)** / **42.56 (-19.5%)** | 13.62 / 15.14 / 16.92 \| 14.88 / **16.23 (+9.1%)** / **18.30 (+23.0%)** | 568.6 / 521.0 / 462.1（P50=P95） | 582.2/607.7 \| 531.8/1208.3 \| 485.1/561.3 | — \| 25.14/21.23 \| 24.25/20.32 | — \| 0.6620/12.01 \| 0.6220/13.14 |
+| `product-long-prompt`（6,247f / 4） | `dense` / `tau095` / `tau090` | 3.61 / 3.96 / 3.21 | 345.56 / 340.01 / **313.77 (-9.2%)** | 18.08 / 18.37 / 19.91 \| 18.27 / 18.59 / **20.11 (+10.1%)** | 465.2 / 457.2 / 422.5（P50=P95） | 510.5/541.8 \| 497.3/520.8 \| 461.8/489.3 | — \| 18.22/17.74 \| 17.62/17.14 | — \| 0.3580/21.65 \| 0.3472/23.75 |
+| `product-long-session`（15,921f / 3） | `dense` / `tau095` / `tau090` | 5.14 / **3.59 (-30.2%)** / **3.23 (-37.2%)** | 896.98 / **840.33 (-6.3%)** / **768.93 (-14.3%)** | 17.75 / 18.95 / 20.70 \| 17.85 / **19.03 (+6.6%)** / **20.79 (+16.5%)** | 476.2 / 446.7 / 408.8（P50=P95） | 488.0/558.9 \| 450.1/527.3 \| 421.3/484.6 | — \| **24.91/24.74** \| 21.34/21.16 | — \| **0.8109/10.12** \| 0.7308/16.24 |
+
+注：`product-reference-switch` 在短短 764 帧内含 6 次动态切图，每次新的候选块签名（`blk_kind_sig`）触发一次 Graph warmup+capture，摊销帧数不足导致 E2E 增加 `+5.3%`；在 15,921 帧（11 分钟）的 `product-long-session` 中，图捕获开销被完全摊销，`tau095` / `tau090` 分别节省 `56.65 s` / `128.05 s`，且 DiT 整卡驱动显存峰值从 `135,651 MiB` 降至 `116,967 MiB`（`-18,684 MiB`）。
+
+### 三组件阶段计时与逐卡显存（`30s-indoor` 独立诊断会话，Host 边界）
+
+服务就绪后整卡驱动常驻显存（`nvidia-smi`）：`GPU0 (Qwen + Source VAE 共卡) = 37,103 MiB`、`GPU1 (DiT rank0) = 105,935 MiB`、`GPU2 (Lynn Decoder) = 7,387 MiB`（预热后分别为 `46,175 / 109,231 / 17,753 MiB`）。阶段重叠并行，耗时不可相加为 E2E：
+
+| 组件 / 子项（所属卡与口径） | `dense_baseline` 中位数 / P95（样本量） | `sparse_tau095` 中位数 / P95（变化） | `sparse_tau090` 中位数 / P95（变化） | PyTorch `allocated`（峰值） / `reserved`（峰值）或整卡驱动峰值 |
+| --- | ---: | ---: | ---: | --- |
+| **Encoder — Qwen 条件准备**（`GPU0` 独立进程，`prepare_host_ms`，含 HTTP 条件请求与首块准备） | 1667.55 / 1667.55 ms (`n=1`, 冷缓存) | 739.76 / 739.76 ms (`n=1`, 热缓存) | 736.18 / 736.18 ms (`n=1`, 热缓存) | 与 Source VAE 共用 `GPU0`（未单独拆分 Qwen 独占显存）；`GPU0` 整卡驱动常驻 `37,103 MiB`，诊断会话整卡峰值 `45,843–46,291 MiB` |
+| **Encoder — 参考图 VAE**（`GPU1` DiT 进程内 `ConditioningCache`） | 85.50 / 85.75 ms (`n=3`, 首次未命中编码) | 2.79 / 2.96 ms (`n=3`, 缓存命中) | 2.78 / 2.93 ms (`n=3`, 缓存命中) | 计入 `GPU1` DiT 进程显存（不单独冒称组件独占） |
+| **Encoder — Source VAE**（`GPU0` 独立 `dedicated_source_encoder`，`profile` Host span） | 192.44 / 200.56 ms (`n=128`) | 192.50 / 200.78 ms (`+0.0%`, `n=128`) | 192.54 / 200.69 ms (`+0.1%`, `n=128`) | Source VAE 进程 `allocated` 中位 `3,934.3 MiB`（峰值 `7,817.8 MiB`），`reserved` `8,674.0 MiB`（三组一致） |
+| **DiT — 稳态去噪 chunk**（`GPU1` rank0，`block_index ≥ 6` Host span；全 `n=86` 块 `dit_host_ms` 见注） | **358.69** / 366.42 ms (`n=80`) | **339.49** / 375.66 ms (**`-5.4%`**, `n=80`) | **311.68** / 347.48 ms (**`-13.1%`**, `n=80`) | DiT 进程 `allocated` 中位 `104,991.7 → 104,942.5 → 104,943.1 MiB`（峰值 `109,175.7 → 109,196.8 → 109,197.4 MiB`），`reserved` 峰值 `117,840.0 → 115,866.0 → 115,866.0 MiB`；`GPU1` 整卡驱动在 15,921 帧长会话下从 `135,651 MiB` 降至 `116,967 MiB` |
+| **Decoder — Lynn**（`GPU2` 独立进程：DiT 提交 IPC span / worker `output` span） | IPC: 2.81 / 3.42 ms (`n=86`)；`output`: 2.32 / 2.92 ms (`n=82`) | IPC: 2.78 / 3.43 ms (`-1.1%`)；`output`: 2.34 / 2.96 ms (`n=86`) | IPC: 2.75 / 3.06 ms (`-2.1%`)；`output`: 2.32 / 2.55 ms (`n=86`) | Decoder 进程 `allocated` 中位 `4,921.0 → 4,926.9 → 4,958.9 MiB`（峰值 `7,724.7 → 7,756.7 → 7,788.7 MiB`），`reserved` 峰值 `44,322.0 → 49,016.0 → 53,710.0 MiB`；`GPU2` 整卡驱动常驻 `7,387 MiB`，7-case 全程上限 `83,469 MiB` |
+
+注：DiT 全 `n=86` 个产帧 chunk 的 `dit_host_ms` 中位数/P95 分别为 `360.90 / 388.39 ms`（`dense`）、`342.07 / 517.85 ms`（`tau095`，`-5.2%`，P95 含首见签名图捕获块）、`313.52 / 422.90 ms`（`tau090`，`-13.1%`）；本轮诊断为 `mode="host"`，未开启逐层 CUDA Event 以避免破坏 Graph 吞吐测量。
+
+### 验证边界与证据入口
+
+- **已验证范围**：`832×480`、`E1 + DiT1 (SP1, FP8) + D1`、`ZingChunkGraphs` 开启下的全部 7 个基准与产品 case（`5s`、`30s-indoor`、`product-few-images`、`product-reference-switch`、`30s-wasteland`、`product-long-prompt`、`product-long-session`）性能、画质关键帧与三组件计时/显存。
+- **当前版本未验证（明确不外推）**：**`1280×736` 端到端服务**与 **`SP>1`（如 `SP2`/`SP4`）多卡并行端到端服务**在 CosGate v2 当前提交下仅完成 Stage 0 单层算子/路由器与 CUDA Graph 自检（`736p_sp1` 单层 `router=0.988 ms, kernel=6.082 ms`；`736p_sp2` 单层 `router=0.563 ms, kernel=3.092 ms`，`cudagraph_max_abs_err=0.0`），端到端服务性能、显存与画质标为**当前版本未验证**（后续在 4 卡 `E1+SP2+D1` 环境中补测 `1280×736` 同条件三臂基准）。旧版 Step C（`dlc17mf28b45ow47`）的 `480p/736p` 结果仅保留历史版本边界。
+- **证据回查入口**：[PR #493](https://github.com/seedleap/sglang/pull/493)、[seedleap-kernels PR #10](https://github.com/seedleap/seedleap-kernels/pull/10)，原始汇总 JSON、日志、7-case 全量 MP4 与三联关键帧归档于 `oss://leap-world-shanghai/world-model/sglang/evals/attn-sparsity-h200-480p-20261028/cosgate_results/`。
+
+### 2D 近似正方形空间切分 + 全方差三层配额锚定路由与 `ZingCompressedKVStore`（2026-11-03 Rev 7，上海 H100 分离式池化双分辨率实测）
+
+2026-11-03，基于 `sglang` `main@772927dc45`（PR [#493](https://github.com/seedleap/sglang/pull/493) Rev 7）与 `seedleap-kernels` `main@04b851d`（PR [#10](https://github.com/seedleap/seedleap-kernels/pull/10) Rev 7），在上海 H100 独立灵骏节点（`e01-cn-2zd4xi8m505` / 实机 `NVIDIA L20Z` SM90，驱动总显存 `81,559 MiB/卡`）采用最新**分离式服务池化架构**（独立 `zing_source_encoder_server`、`dit_worker`、`decoder_worker` 进程 + `WorkerGroupMaster` 显式建组 + `bench_streaming_source.py` 连续流客户端，`keep_connections=True`）完成 **`832×480`（`E1+SP1+D1`）** 与 **`1280×736`（`E1+SP2+D1`）** 双分辨率同条件 A/B 基准测试（每臂 `1` 次预热 + `3` 次正式测量，输入为 `zing-product-case-20261029-few-images` 连续流 403 帧 / 48 个去噪 chunk）：
+
+- **`Frame2DSquarePartition` 二维近似正方形切分与象限主序（Quadrant-Major）**：消除跨行环绕伪影，`736p`（`23×40`）每帧切分为 `15` 个 2D tile（`10×64 + 5×56 = 920` tokens），`480p`（`15×26`）每帧切分为 `7` 个 2D tile（`4×52 + 61 + 61 + 60 = 390` tokens），每个 tile 内部按 `2×2` 象限重排为 4 个紧凑子块（`sub_n`），并在 Phase 1 / Phase 2 按 `block_valid_len` 精确加权（`+ math.log(sub_n)`）与掩码截断；
+- **`ZingCompressedKVStore` 与全方差定律（Law of Total Variance）**：将历史 KV 从基线 `49,152 Bytes/block/head`（`raw_k, v, rotated_k` BF16）压缩至 **`18,248 Bytes/block/head`（缩减 `-62.87%`）**，消除前向 `M_full × H × D` 动态 FP8 转化缓冲（`dynamic_fp8_scratch_bytes = 0`），并通过 $\tau_k^2 = \tau_{k,\text{between}}^2 + \tau_{k,\text{within}}^2$ 无偏恢复块内总方差；
+- **配额锚定三层路由（`sparse_095_triage`, `enable_three_tier=True`, `c_rf=12.0`）**：以 $\pi_{l,h,m} = S_{(K_{l,h})} / 12.0$ 将候选块动态划分为 `Refine`（64-token FP8 E4M3 WGMMA）、`Skim`（4-token 象限均值 BF16 精确加权 `log(sub_n)`）与 `Skip`（1-token 块均值 Virtual Tile，含方差补偿 $\alpha_b$）。
+
+#### 1. 端到端连续流指标对照（`bench_streaming_source.py`，`n=3` 正式测量，中位数 / P95）
+
+| 分辨率与拓扑 | 配置臂 | TTFF 中位数 / P95 (s) | E2E 中位数 / P95 (s) | 全程 FPS 中位数 / P95 | 首包后 FPS (Post-TTFF) 中位数 / P95 | TPOC 中位数 / P95 (s) | ICL 中位数 / P95 (s) | Source-to-Output 中位数 / P95 (s) | Tail Drain 中位数 / P95 (s) | Credit Wait 中位数 / P95 (s) | 播放停顿 Stall 中位数 / P95 (s) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **832×480**<br/>`E1 + SP1 + D1`<br/>(3 × H100) | `480p_baseline` (`FP8` Dense) | 1.6189 / 2.3676 | 20.9293 / 23.3641 | 19.2553 / 19.2769 | 20.4035 / 20.4272 | 0.4109 / 0.4467 | 0.3413 / 0.5913 | 3.3053 / 3.3078 | 3.1736 / 4.1656 | 16.8589 / 18.2989 | 2.3540 / 3.8508 |
+| **832×480**<br/>`E1 + SP1 + D1`<br/>(3 × H100) | `480p_candidate_rev7` (`sparse_095_triage`) | **1.5731** / 2.2921 (**`-2.83%`**) | **20.6853** / 24.1099 (**`-1.17%`**) | **19.4824** / 19.4978 (**`+1.18%`**) | **20.6150** / 20.6214 (**`+1.04%`**) | **0.4066** / 0.4642 (**`-1.05%`**) | **0.3167** / 0.9393 (**`-7.21%`**) | **3.2832** / 3.2854 (**`-0.67%`**) | **3.1552** / 4.1573 (**`-0.58%`**) | **16.6215** / 19.0521 (**`-1.41%`**) | **2.1411** / 4.6706 (**`-9.04%`**) |
+| **1280×736**<br/>`E1 + SP2 + D1`<br/>(4 × H100) | `736p_baseline` (`FP8` Dense) | 2.1228 / 3.0020 | 28.1310 / 31.4964 | 14.3258 / 14.3274 | 15.1382 / 15.1480 | 0.5538 / 0.6063 | 0.4480 / 0.8173 | 4.4629 / 4.4644 | 4.1737 / 5.3617 | 21.8778 / 24.0700 | 9.1157 / 11.3551 |
+| **1280×736**<br/>`E1 + SP2 + D1`<br/>(4 × H100) | `736p_candidate_rev7` (`sparse_095_triage`) | **2.0794** / 3.2202 (**`-2.04%`**) | **26.3380** / 31.2057 (**`-6.37%`**) | **15.3011** / 15.3186 (**`+6.81%`**) | **16.2416** / 16.2514 (**`+7.29%`**) | **0.5161** / 0.5954 (**`-6.81%`**) | **0.4186** / 1.2515 (**`-6.56%`**) | **4.1433** / 4.1638 (**`-7.16%`**) | **3.9131** / 5.0690 (**`-6.24%`**) | **20.3653** / 24.0621 (**`-6.91%`**) | **7.3532** / 10.8450 (**`-19.33%`**) |
+
+#### 2. 三组件（Encoder / DiT / Decoder）独立 CUDA Event 耗时与逐卡逐 Rank 显存（`n=3` 正式测量）
+
+各角色运行于独立隔离容器与物理 GPU（`GPU0 = Encoder`, `GPU1 = Decoder`, `GPU2/GPU3 = DiT rank0/rank1`）；阶段流水重叠执行，三组件耗时不直接相加为 E2E：
+
+| 分辨率与角色（物理卡 UUID） | 指标项 | `baseline` 中位数 / P95 (`n=3`) | `candidate_rev7` 中位数 / P95 (`n=3`) | 变化率 / 显存口径说明（PyTorch `allocated` / `reserved` MiB） |
+| --- | --- | ---: | ---: | --- |
+| **832×480 — Encoder**<br/>(`GPU0`: `GPU-6d5005a8...`) | 总 CUDA 耗时 (ms)<br/>├ Qwen3-VL (ms)<br/>├ 参考图 VAE (ms)<br/>└ Source VAE (ms) | 14998.26 / 15000.62<br/>181.02 / 183.00<br/>88.18 / 88.62<br/>14730.11 / 14731.09 | 14922.51 / 15329.96<br/>181.42 / 188.66<br/>88.62 / 88.73<br/>14652.47 / 15052.57 | `-0.51%`（同进程内 Qwen + 参考图 VAE + Source VAE 共享 `GPU0`）；常驻 `26,811.76 / 36,544.00 MiB`，请求峰值 `34,070.35 / 36,544.00 MiB` |
+| **832×480 — DiT (`SP=1`)**<br/>(`GPU2`: `GPU-6b33d443...`) | 全程 48-chunk CUDA (ms)<br/>稳态单 chunk 均值 (ms)<br/>KV 存储池单槽体积 (MiB) | 18722.66 / 21183.71<br/>383.35 / 405.84<br/>41,807.23 (`49,152 B/blk/hd`) | **18497.19** / 21939.90<br/>**381.37** / 403.89<br/>**15,544.05** (`18,248 B/blk/hd`) | 全程 **`-1.20%`**，KV 存储布局缩减 **`-62.82%`**（`20,386` rows / `319` blocks，动态 FP8 缓冲 `0 B`）；因当前 `ZingKVCachePool` 与 `ZingCompressedKVStore` 双池并存，进程常驻 `allocated` 为 `62,606.59 → 64,480.92 MiB`（`reserved` `67,020 → 68,092 MiB`），峰值 `70,649.24 → 72,046.38 MiB` |
+| **832×480 — Decoder**<br/>(`GPU1`: `GPU-be7f0e5b...`) | Lynn Streaming CUDA (ms) | 4257.67 / 4258.34 | 4241.60 / 4250.51 | `-0.38%`；独占 `GPU1` 常驻 `3,438.41 / 20,780.00 MiB`，请求峰值 `7,556.42 / 25,450.00 MiB` |
+| **1280×736 — Encoder**<br/>(`GPU0`: `GPU-6d5005a8...`) | 总 CUDA 耗时 (ms)<br/>├ Qwen3-VL (ms)<br/>├ 参考图 VAE (ms)<br/>└ Source VAE (ms) | 14990.44 / 15008.22<br/>286.80 / 292.37<br/>87.09 / 87.35<br/>14628.53 / 14629.70 | 14981.05 / 14993.53<br/>283.04 / 284.00<br/>87.55 / 88.39<br/>14613.16 / 14623.21 | `-0.06%`；共享 `GPU0` 常驻 `26,811.76 / 36,544.00 MiB`，请求峰值 `34,073.31 / 36,544.00 MiB` |
+| **1280×736 — DiT (`SP=2`)**<br/>(`GPU2`: `rank0`, `GPU3`: `rank1`) | 全程 48-chunk CUDA (ms)<br/>稳态单 chunk 均值 (ms)<br/>KV 存储池每 rank 体积 (MiB) | 25506.63 / 28854.14<br/>525.66 / 552.79<br/>40,468.07 (`49,152 B/blk/hd`) | **23696.52** / 28552.46<br/>**487.13** / 514.52<br/>**15,032.41** (`18,248 B/blk/hd`) | 全程 **`-7.10%`（节省 `1.81 s`）**，稳态单 chunk **`-7.33%`（`-38.53 ms/chunk`）**，每 rank KV 布局缩减 **`-62.85%`**（`39,466` rows / `617` blocks / `28` heads，动态 FP8 缓冲 `0 B`）；双池并存下 `rank0/rank1` 常驻 `allocated` `61,658.82/61,657.95 → 63,371.46/63,371.92 MiB`，峰值 `66,905.52/66,905.02 → 68,464.31/68,463.42 MiB` |
+| **1280×736 — Decoder**<br/>(`GPU1`: `GPU-be7f0e5b...`) | Lynn Streaming CUDA (ms) | 9613.77 / 9635.74 | 9621.21 / 9831.29 | `+0.08%`；独占 `GPU1` 常驻 `3,566.41 → 3,694.41 MiB`，请求峰值 `13,089.75 → 13,217.75 MiB`（`reserved` 峰值 `68,026 → 79,224 MiB`） |
+
+- **可回查入口**：完整四臂配置、启动命令、逐请求 JSONL、三组件遥测日志与汇总回执保存在上海 H100 节点 `/mnt/zing-nvme/zing-rev7-disagg-20261103-r1/stage2_receipt.json` 与 `/mnt/zing-nvme/zing-rev7-disagg-20261103-r1/stage3_receipt.json`。
+
+#### 3. Stage 3 四组 Whitebox 评测用例三组消融（Group A / B / C，832×480 `E1+SP2+D1`，2026-11-04）
+
+在同一上海 H100 节点（`e01-cn-2zd4xi8m505`，`GPU0=Encoder`, `GPU1=Decoder`, `GPU3/GPU5=DiT SP2`）对 4 个 whitebox 用例（`30s-wasteland`、`30s-town`、`30s-indoor` 各 720 帧，`30s-coast` 120 帧）执行三组同 seed 消融（`Group A`: BF16 Dense + BF16 Linear；`Group B`: `sparse_095_triage` + BF16 Linear；`Group C`: `sparse_095_triage` + `ffn-attention` FP8 Linear + `fused_pre_quant=1`）：
+
+- **三组整体性能与三组件（Encoder / DiT / Decoder）逐 Rank 显存（`n=4` 用例中位数 / P95）**：
+  - `Group A (BF16 Dense)`：TTFF `3.265 / 7.298 s`，E2E `35.504 / 37.539 s`，全程 FPS `19.32 / 20.86`，首包后 FPS `20.91 / 22.26`；
+    - **Encoder (`GPU0` 共享)**：总计 `26,970.5 / 27,209.5 ms`（`Qwen` `572.0 / 634.1 ms`、`参考图 VAE` `429.3 / 461.6 ms`、`Source VAE` `26,112.4 / 26,115.8 ms`），常驻/峰值 `allocated` `26,794.7 / 34,092.7 MiB`（`reserved` `34,584.0 / 34,584.0 MiB`）；
+    - **DiT (`SP2`: `GPU3 rank0` / `GPU5 rank1`)**：全程 `31,247.4 / 33,178.8 ms`（稳态 chunk 均值 `368.79 ms/chunk` = `184.39 ms/latent`，P95 `450.96 ms/chunk`），`rank0` 常驻/峰值 `allocated` `68,680.1 / 70,475.9 MiB`（`reserved` `71,576.0 / 71,576.0 MiB`），`rank1` 常驻/峰值 `allocated` `68,680.1 / 70,475.5 MiB`（`reserved` `71,512.0 / 71,514.0 MiB`）；
+    - **Decoder (`GPU1` 独占)**：Lynn Streaming `7,632.1 / 7,791.3 ms`，常驻/峰值 `allocated` `3,502.4 / 7,600.5 MiB`（`reserved` `27,996.0 / 32,242.0 MiB`）。
+  - `Group B (Attn-Only Rev 7)`：TTFF `3.209 / 10.779 s`，E2E `35.907 / 38.819 s`，全程 FPS `18.89 / 20.57`，首包后 FPS `20.37 / 21.94`；
+    - **Encoder (`GPU0` 共享)**：总计 `27,283.7 / 27,297.0 ms`（`Qwen` `628.8 / 736.5 ms`、`参考图 VAE` `462.7 / 1,831.3 ms`、`Source VAE` `26,203.7 / 26,552.6 ms`），常驻/峰值 `allocated` `26,794.7 / 34,092.7 MiB`（`reserved` `34,584.0 / 34,584.0 MiB`）；
+    - **DiT (`SP2`: `GPU3 rank0` / `GPU5 rank1`)**：全程 `31,579.1 / 34,432.9 ms`（稳态 chunk 均值 `371.17 ms/chunk` = `185.58 ms/latent`，P95 `571.42 ms/chunk`），`rank0` 常驻/峰值 `allocated` `69,395.4 / 71,191.1 MiB`（`reserved` `72,336.0 / 72,336.0 MiB`），`rank1` 常驻/峰值 `allocated` `69,395.4 / 71,190.7 MiB`（`reserved` `72,492.0 / 72,492.0 MiB`）；
+    - **Decoder (`GPU1` 独占)**：Lynn Streaming `7,594.7 / 7,674.5 ms`，常驻/峰值 `allocated` `3,438.4 / 7,536.5 MiB`（`reserved` `19,504.0 / 23,750.0 MiB`）。
+  - `Group C (Full Rev 7 + FP8 Linear)`：TTFF **`2.893 / 6.202 s (-11.4%)`**，E2E **`31.960 / 35.216 s (-10.0%)`**，全程 FPS **`20.96 / 23.18 (+8.5%)`**，首包后 FPS **`22.61 / 24.77 (+8.1%)`**；
+    - **Encoder (`GPU0` 共享)**：总计 `27,059.8 / 27,320.7 ms`（`Qwen` `575.9 / 630.6 ms`、`参考图 VAE` `430.1 / 462.9 ms`、`Source VAE` `26,199.5 / 26,233.9 ms`），常驻/峰值 `allocated` `26,794.7 / 34,092.7 MiB`（`reserved` `34,584.0 / 34,584.0 MiB`）；
+    - **DiT (`SP2`: `GPU3 rank0` / `GPU5 rank1`)**：全程 **`27,724.4 / 30,811.4 ms (-11.3%)`**（稳态 chunk 均值 **`328.83 ms/chunk (-10.8%)`** = **`164.42 ms/latent`**），`rank0` 常驻/峰值 `allocated` **`51,032.0 / 52,322.6 MiB`**（`reserved` `53,828.0 / 53,828.0 MiB`），`rank1` 常驻/峰值 `allocated` **`51,032.0 / 52,322.6 MiB`**（`reserved` `53,524.0 / 53,524.0 MiB`，较 Group A 直降 **`-17,648.1 MiB/rank`**）；
+    - **Decoder (`GPU1` 独占)**：Lynn Streaming `7,593.0 / 7,617.0 ms`，常驻/峰值 `allocated` `3,566.4 / 7,664.5 MiB`（`reserved` `36,488.0 / 40,734.0 MiB`）。
+- **逐用例视觉质量与长程滑窗驱逐稳定性（修复 `t=500` 滑窗驱逐步逆时间 RoPE 掩码后）**：
+  - **`30s-coast`（120 帧，轨迹锁相）**：`Group B` 全帧均值 `PSNR = 74.50 dB`（稀疏激活段 `f≥48` `33.26 dB`）、`SSIM = 0.9773`、`LPIPS = 0.01755`、尾段衰减 `1.06 dB`；`Group C` 全帧均值 `PSNR = 33.03 dB`（稀疏激活段 `32.54 dB`）、`SSIM = 0.9535`、`LPIPS = 0.03923`、`Chunk 3 R_flicker = 0.9857`、尾段衰减 `2.05 dB`。
+  - **`30s-wasteland / 30s-town / 30s-indoor`（720 帧，45 Chunks 开环自回归）**：全部 MP4 解码完整无报错，人工复核 `4/4 PASSED`（画面锐利、无块状伪影、无色彩曝光崩塌）；因 45 个开环自回归块累积 `~5–15 px` 镜头平移/步态相位差，逐像素同坐标 `PSNR` 分别为 `25.68 / 21.82 / 24.89 dB`（`Group B` 全帧，稀疏激活段 `17.83 / 13.72 / 17.01 dB`）与 `17.41 / 14.50 / 16.99 dB`（`Group C`）；进入滑窗驱逐区间（`u=9..44, f=144..719`）后，`30s-wasteland` 与 `30s-town` 的滑窗驱逐段 PSNR 衰减均为 **`0.00 dB`**（4 用例平均滑窗衰减 `Group B = 0.90 dB`、`Group C = 1.71 dB`）。
+
+#### 4. 上海 H200 `832×480`（单卡 DiT `SP=1`）分离部署 vs 普通部署 × `product-case-20261029` 全 18 格矩阵实测（2026-11-05，Jobs `dlcukd4i3l9ezpf5` & `dlc1f5vcwbpjs2vp`）
+
+在上海 PAI-DLC H200（`quota3l8bnv9a35n`，实机 `NVIDIA L20X` SM90，`143,771 MiB/卡`）对 **`832×480`（`480p`，单卡 DiT `SP=1`，`H_local = 56`，`zing_kv_pool_max_prefix_rows = 20480` / `slot_rows = 32,352` / `max_blocks_64 = 506`）** 完整实测了**分离部署 (`Disaggregated WorkerGroupMaster`: `GPU0=Enc, GPU1=DiT, GPU2=Dec`)** 与**普通部署 (`Standard launch_server.py`: `--encoder-gpus 0 --denoiser-gpus 1 --decoder-gpus 2`)** 下 **`Dense BF16`**、**`Dense FP8`** 与 **`SPEC Rev 7`（`sparse_095` + `ffn-attention` FP8 + `ZingCompressedKVStore` + `fused_pre_quant=1`）** 的 18 格全矩阵性能、三组件显存与 `product-case-20261029` 全部 4 个产品级用例画质：
+
+- **短序列 Product Case（`product-few-images` 403f & `product-reference-switch` 764f，每组 1 次预热 + 2 次正式测量）**：
+  - **分离部署 (`Disaggregated`)**：
+    - `product-few-images` (`403f`)：`Dense BF16` 全程/首包后 FPS 中位数 `16.51 / 17.59`（稳态 `Rep2` `17.26 / 17.96`，DiT 稳态 `440.14 ms/chunk`）；`Dense FP8` 中位数 `19.61 / 20.97`（`Rep2` `20.75 / 21.48`，DiT `364.46 ms/chunk`）；**`SPEC Rev 7`** 中位数 `19.44 / 20.60`，**稳态 `Rep2` 达 `21.30 / 21.95 FPS`（DiT 稳态 `356.30 ms/chunk` = `178.15 ms/latent`，较 `Dense BF16` 提速 `-19.0%`、FPS `+22.2%`，较 `Dense FP8` 快 `8.15 ms/chunk`）**，TTFF 中位数从 `1.588s`（BF16）/ `1.442s`（FP8）降至 **`1.327s`**。
+    - `product-reference-switch` (`764f`，6 次流中切图)：`Dense BF16` 中位数 `16.62 / 17.68 FPS`（DiT `445.51 ms/chunk`）；`Dense FP8` 中位数 `20.00 / 21.39 FPS`（DiT `364.01 ms/chunk`）；**`SPEC Rev 7` 中位数 `20.00 / 21.35 FPS`（`Rep2` `20.30 / 21.30 FPS`，DiT `366.46 ms/chunk`，较 `Dense BF16` FPS `+20.8%`），TTFF 中位数 `2.472s`（最快），ICL P50/P95 `426.9 / 650.5 ms`（优于 FP8 的 `438.4 / 704.5 ms`）**。
+  - **普通部署 (`Standard launch_server.py`)**：
+    - `product-few-images` (`403f`)：`Dense BF16` 中位数 `16.77 / 18.00 FPS`（`Rep2` `17.76 / 18.88`，DiT `441.47 ms/chunk`）；`Dense FP8` 中位数 `20.34 / 21.73 FPS`（`Rep2` `22.26 / 23.15`，DiT `359.17 ms/chunk`）；**`SPEC Rev 7` 中位数 `20.32 / 21.57 FPS`，稳态 `Rep2` 达 `22.93 / 23.82 FPS`（DiT 稳态 `348.77 ms/chunk` = `174.39 ms/latent`，较 `Dense BF16` 提速 `-21.0%`、FPS `+26.2%`，较 `Dense FP8` 快 `10.40 ms/chunk`）**，TTFF 中位数 **`1.323s`**。
+    - `product-reference-switch` (`764f`)：`Dense BF16` 中位数 `16.55 / 17.63 FPS`；`Dense FP8` 中位数 `20.51 / 22.04 FPS`；**`SPEC Rev 7` 中位数 `20.37 / 21.84 FPS`（`Rep2` `21.28 / 22.41 FPS`，TTFF `2.620s`，ICL P95 `646.6 ms` 最优）**。
+- **超长序列 Product Case（`product-long-prompt` 6,247f / 736 Chunks & `product-long-session` 15,921f / 1,874 Chunks，分离部署 vs 普通部署）**：
+  - **`product-long-prompt`（`6,247f`，4 次长 Prompt 更新，最大 Prefix `7,700` rows）**：
+    - **分离部署 (`Disaggregated`)**：`Dense BF16` TTFF `10.04s`，E2E `398.31s`，FPS `15.68 / 16.09`，DiT 稳态 `500.93 ms/chunk`（总 `374.05s`），Stall `127.81s`；`Dense FP8` TTFF `9.74s`，E2E `338.99s`，FPS `18.43 / 18.97`，DiT 稳态 `420.76 ms/chunk`（总 `314.99s`），Stall `68.79s`；**`SPEC Rev 7`** **TTFF `9.46s`，E2E `325.38s`（比 BF16 快 `72.93s / -18.3%`，比 FP8 快 `13.61s / -4.0%`），FPS `19.20 / 19.77`（vs BF16 `+22.4% / +22.9%`，vs FP8 `+4.2%`），DiT 稳态 `402.76 ms/chunk`（`-18.0 ms/chunk` vs FP8），Stall 降至 `55.46s`（`-56.6%`）**。
+    - **普通部署 (`Standard launch_server.py`)**：`Dense BF16` TTFF `23.30s`，E2E `401.13s`，FPS `15.57 / 16.53`，DiT 稳态均值 `505.57 ms/chunk`（`P50/P95: 521.72 / 555.24 ms`，总 `389.36s`），Enc CUDA `2.43s`，Dec CUDA `63.03s`，Stall `117.38s`；`Dense FP8` TTFF `10.06s`，E2E `323.51s`，FPS `19.31 / 19.93`，DiT 稳态均值 `417.37 ms/chunk`（`P50/P95: 416.23 / 461.98 ms`，总 `311.23s`），Stall `52.99s`；**`SPEC Rev 7` TTFF `9.78s`，E2E `312.33s`（比 BF16 快 `88.80s / -22.1%`，比 FP8 快 `11.18s / -3.5%`），FPS `20.00 / 20.64`（vs BF16 `+28.5% / +24.9%`，vs FP8 `+3.6%`），DiT 稳态均值 `401.30 ms/chunk`（`P95: 434.33 ms`，比 BF16 快 `-104.27 ms/chunk`，比 FP8 快 `-16.07 ms/chunk`），Stall 降至 `42.09s`（`-64.1%`）**。
+  - **`product-long-session`（`15,921f` = 11.1 分钟，18 次参考图切换，最大 Prefix `9,300` rows）**：
+    - **分离部署 (`Disaggregated`)**：`Dense BF16` TTFF `11.49s`，E2E `1031.51s`，FPS `15.44 / 15.61`，DiT 稳态 `517.00 ms/chunk`（总 `974.66s`），Stall `356.52s`；`Dense FP8` TTFF `11.42s`，E2E `882.66s`，FPS `18.04 / 18.27`，DiT 稳态 `437.79 ms/chunk`（总 `826.03s`），Stall `207.74s`；**`SPEC Rev 7`** **TTFF `10.55s`，E2E `842.02s`（比 BF16 快 `189.48s / -18.4%`，比 FP8 快 `40.64s / -4.6%`），FPS `18.91 / 19.15`（vs BF16 `+22.5% / +22.7%`，vs FP8 `+4.8%`），DiT 稳态 `416.68 ms/chunk`（`-21.1 ms/chunk` vs FP8），Stall 降至 `167.97s`（`-52.9%`）**。
+    - **普通部署 (`Standard launch_server.py`)**：`Dense BF16` TTFF `11.83s`，E2E `1001.55s`，FPS `15.90 / 16.09`，DiT 稳态均值 `524.00 ms/chunk`（`P50/P95: 556.66 / 572.48 ms`，总 `986.40s`），Enc CUDA `3.24s`，Dec CUDA `157.08s`，Stall `326.22s`；`Dense FP8` TTFF `11.49s`，E2E `837.61s`，FPS `19.01 / 19.27`，DiT 稳态均值 `436.59 ms/chunk`（`P50/P95: 465.25 / 478.01 ms`，总 `822.51s`），Stall `162.63s`；**`SPEC Rev 7` TTFF `10.33s`，E2E `790.67s`（比 BF16 快 `210.88s / -21.1%`，比 FP8 快 `46.94s / -5.6%`），FPS `20.14 / 20.40`（vs BF16 `+26.7% / +26.8%`，vs FP8 `+5.9%`），DiT 稳态均值 `412.14 ms/chunk`（`P95: 454.33 ms`，比 BF16 快 `-111.86 ms/chunk`，比 FP8 快 `-24.45 ms/chunk`），Stall 降至 `116.85s`（`-64.2%`）**。
+- **三组件逐卡显存与单卡 H200 共卡边界**：
+  - `GPU0 (Encoder + Qwen)`：PyTorch 常驻/峰值 `allocated` `49,992 / 57,295 MiB`（`reserved` `60,970 MiB`），整卡驱动 `68,813 ~ 73,967 MiB`；
+  - `GPU1 (DiT SP=1)`：`Dense BF16` 常驻/峰值 `allocated` `105,595 / 117,425 MiB`（驱动 `110,499 ~ 137,061 MiB`，普通部署 15,921f 下距 `143,771 MiB` OOM 仅余 `6.7 GiB`）$\to$ **`SPEC Rev 7` 常驻/峰值 `allocated` `86,780 / 91,152 MiB`（驱动 `94,321 ~ 117,313 MiB`，整卡净省 `-16.2 ~ -19.8 GiB`）**；其中 `ZingCompressedKVStore` 单槽体积从 `66,346.88 MiB` 缩减至 **`24,656.07 MiB`（`-62.84%`）**；
+  - `GPU2 (Lynn Decoder)`：常驻/峰值 `allocated` `3,342 / 7,588 MiB`（驱动 `13,023 ~ 31,689 MiB`）；
+  - **单张 H200 (`1 × H200`) 四进程共卡边界**：无 CPU Offload 下将 `Qwen (8.35 GiB) + Encoder (50.71 GiB) + Decoder (7.21 GiB) + DiT (73.26 GiB)` 共置于单张 `139.80 GiB` H200 时合计达 `139.53 GiB` 触发 `CUDA OOM`；因此 H200 上 `480p SP=1` 至少需 **2 张 H200（`GPU0: Enc+Qwen+Dec 共卡 ~100.5 GiB` + `GPU1: DiT SP=1 ~95 GiB`）** 或标准 3 卡池化拓扑。
+- **`product-case-20261029` 四大产品用例画质对比（`SPEC Rev 7` vs `Dense BF16` / `Dense FP8`）**：
+  - `product-few-images` (`403f`)：`Rev 7 vs Dense BF16` 全帧 `PSNR = 18.82 dB`、`SSIM = 0.5996`、`LPIPS = 0.2089`（全面优于 `Dense FP8 vs Dense BF16` 的 `17.63 dB` / `0.5225` / `0.2623`）；
+  - `product-reference-switch` (`764f`)：`Rev 7 vs Dense FP8` 全帧 `PSNR = 25.11 dB`（最低帧 `20.37 dB`）、`SSIM = 0.7831`、`LPIPS = 0.1285`、`MAE = 9.26`；`Rev 7 vs Dense BF16` `PSNR = 23.09 dB`、`LPIPS = 0.1566`；
+  - `product-long-prompt` (`6,247f`)：分离部署下 `Rev 7 vs Dense FP8` `PSNR = 16.53 dB`、`LPIPS = 0.2655`；普通部署下 `Rev 7 vs Dense BF16` `PSNR = 16.07 dB`、`MAE = 26.62`（优于 `Dense FP8 vs Dense BF16` 的 `15.92 dB` / `27.20`），736 个 Chunk 零崩坏；
+  - `product-long-session` (`15,921f`)：分离部署下 `Rev 7 vs Dense FP8` `PSNR = 22.05 dB`（最低 `20.01 dB`），`Rev 7 vs Dense BF16` `PSNR = 20.52 dB`、`LPIPS = 0.2101`（尾段衰减 `6.41 dB` 优于 `Dense FP8` 的 `7.18 dB`）；**普通部署下 `Rev 7 vs Dense BF16` 全序列 Mean `PSNR = 23.14 dB`（最低 `22.56 dB`）、`SSIM = 0.7710`、`LPIPS = 0.1623`、`MAE = 12.11`，全面优于 `Dense FP8 vs Dense BF16`（`PSNR = 21.47 dB`、`SSIM = 0.7344`、`LPIPS = 0.2204`、`MAE = 14.28`）达 `+1.67 dB` PSNR**。
+- **证据回查入口**：[团队 Review CDN 在线交互式对比报告（需办公网/VPN）](https://review-cdn.loopit.com.cn/reports/zing-block-sparse-attn-20261106/rev-01/index.html)，原始归档 `oss://leap-world-shanghai/world-model/sglang/evals/zing-rev7-h200-480p-sp1-product-20261105-r1/results/`（`FINAL_SUMMARY.json` + `STD_LONG_FINAL_SUMMARY.json` + 全量 MP4 视频 + 57 张三联关键帧对比图）。
+
 The `white_box` integration of main `51685452b1` preserves managed role-pool
 channel policy and player lifecycle boundaries. Upgrade the participating
 Encoder, DiT and Decoder together: the connection-completion handshake requires

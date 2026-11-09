@@ -20,6 +20,42 @@ def test_invalid_window(window, sink):
         ZingWindowPolicy(window, sink)
 
 
+def test_window_policy_active_sinks_validation_and_retains():
+    default_policy = ZingWindowPolicy(21, 3)
+    assert default_policy.effective_sinks() == (0, 1, 2)
+    for u in (0, 1, 2):
+        assert default_policy.is_sink(u)
+        assert default_policy.retains(u, current_id=50)
+    assert not default_policy.is_sink(3)
+    assert not default_policy.retains(3, current_id=50)
+
+    refreshed_step1 = ZingWindowPolicy(21, 3, active_sinks=(0, 2, 15))
+    assert refreshed_step1.effective_sinks() == (0, 2, 15)
+    assert refreshed_step1.is_sink(0)
+    assert not refreshed_step1.is_sink(1)
+    assert refreshed_step1.is_sink(2)
+    assert refreshed_step1.is_sink(15)
+    assert not refreshed_step1.retains(1, current_id=33)
+    assert refreshed_step1.retains(2, current_id=33)
+    assert refreshed_step1.retains(15, current_id=33)
+    # Local sliding window for current_id=33 keeps [33 - (21 - 3 - 1) = 16 .. 32].
+    assert not refreshed_step1.retains(14, current_id=33)
+    assert refreshed_step1.retains(16, current_id=33)
+
+    for bad_sinks in [
+        (0, 1),  # wrong length
+        (0, 1, 2, 3),  # wrong length
+        (1, 2, 3),  # first sink must be 0
+        (0, 5, 4),  # not strictly increasing
+        (0, 2, 2),  # duplicate
+        (-1, 0, 1),  # negative
+        (0, True, 2),  # bool not allowed
+        [0, 1, 2],  # must be tuple
+    ]:
+        with pytest.raises(ValueError):
+            ZingWindowPolicy(21, 3, active_sinks=bad_sinks)
+
+
 @torch.no_grad()
 def test_sink_refresh_and_off_preserve_real_source_target_rows():
     plan = ChunkPlan([3, 2], False)
@@ -320,6 +356,373 @@ def test_default_delayed_cache_completes_manual_step0_before_final():
         assert cache.pending_source is cache.active is None
     cache.clear()
     assert cache.history(0) is None
+
+
+@torch.no_grad()
+def test_rolling_scene_sink_refresh_two_step_parity_and_stability_guard(monkeypatch):
+    from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+        allocate_layer_stores,
+    )
+
+    monkeypatch.setenv("ZING_SPARSE_SINK_REFRESH", "1")
+    monkeypatch.setenv("ZING_SPARSE_SINK_REFRESH_COS_THR", "-0.35")
+    monkeypatch.setenv("ZING_SPARSE_SINK_REFRESH_CAND_MIN_Z", "0.0")
+    monkeypatch.setenv("ZING_SPARSE_SINK_REFRESH_STREAK", "16")
+    monkeypatch.setenv("ZING_SPARSE_SINK_REFRESH_COOLDOWN", "24")
+    monkeypatch.setenv("ZING_SPARSE_SINK_REFRESH_MAX_AGE", "60")
+    monkeypatch.setenv("ZING_SPARSE_SINK_REFRESH_MAX_ARMED_WAIT", "16")
+
+    def make_cache():
+        stores = allocate_layer_stores(
+            256,
+            num_layers=1,
+            local_heads=1,
+            head_dim=2,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        return ZingH3KVCache(
+            1,
+            window_policy=ZingWindowPolicy(21, 3),
+            window_eviction_timing="after_step0",
+            rope_position_mode="block_relative",
+            rope_max_frame_gap=12,
+            storage=stores,
+        )
+
+    base = make_cache()
+    refreshed = make_cache()
+    # Keep baseline disabled so we can compare exact row counts at every chunk.
+    base._sink_refresh_enabled = False
+    plan = ChunkPlan([3, 2])
+
+    def commit_step(cache, chunk, *, z_scene=None, z_cand=0.0):
+        frames = chunk.end - chunk.start
+        pos = torch.tensor(
+            [
+                [float(chunk.start + f), 0.0, float(col)]
+                for f in range(frames)
+                for col in (0, 1)
+            ],
+            dtype=torch.float64,
+        )
+        rows = pos.shape[0]
+        src_kv = (
+            torch.full((rows, 1, 2), -(chunk.chunk_id + 1.0)),
+            torch.full((rows, 1, 2), -(chunk.chunk_id + 101.0)),
+        )
+        tgt_kv = (
+            torch.full((rows, 1, 2), float(chunk.chunk_id + 1.0)),
+            torch.full((rows, 1, 2), float(chunk.chunk_id + 101.0)),
+        )
+        cache.begin_chunk(chunk.target_block)
+        cache.update(
+            pos, torch.full((rows,), chunk.source_block), "source", frames, (src_kv,)
+        )
+        cache.update(pos, torch.full((rows,), chunk.target_block), "active", frames)
+        if z_scene is not None:
+            cache.record_sink_refresh_signal(z_scene, z_cand)
+        cache.complete_step0_and_evict(chunk.target_block)
+        cache.update(
+            pos, torch.full((rows,), chunk.target_block), "final", frames, (tgt_kv,)
+        )
+        return tgt_kv
+
+    expected_targets = {}
+    for u in range(95):
+        chunk = plan.chunk(u)
+        # Chunks 0..2: initial sinks (0=target-only 3f, 1=target-only 2f, 2=target-only 3f)
+        if u < 3:
+            frames = chunk.end - chunk.start
+            pos = torch.tensor(
+                [
+                    [float(chunk.start + f), 0.0, float(col)]
+                    for f in range(frames)
+                    for col in (0, 1)
+                ],
+                dtype=torch.float64,
+            )
+            rows = pos.shape[0]
+            tgt_kv = (
+                torch.full((rows, 1, 2), float(u + 1.0)),
+                torch.full((rows, 1, 2), float(u + 101.0)),
+            )
+            for c_obj in (base, refreshed):
+                c_obj.begin_chunk(chunk.target_block)
+                c_obj.update(
+                    pos, torch.full((rows,), chunk.target_block), "active", frames
+                )
+                c_obj.complete_step0_and_evict(chunk.target_block)
+                c_obj.update(
+                    pos,
+                    torch.full((rows,), chunk.target_block),
+                    "final",
+                    frames,
+                    (tgt_kv,),
+                )
+            expected_targets[u] = tgt_kv
+            continue
+
+        commit_step(base, chunk)
+
+        # Inject scene change signals starting at u=24:
+        # At u=24..39 (16 chunks), z_scene=-1.0 triggers ARMED at u=39.
+        # At u=39 (odd, cand=21) and u=40 (even, cand=22), keep z_cand=-0.5 (< 0.0, panning unstable) -> stays ARMED!
+        # At u=41 (odd, cand=23), set z_cand=0.5 (>= 0.0, stable!) -> triggers STEP1_ODD -> active_sinks=(0, 2, 23)
+        # At u=42 (even, cand=24) -> completes STEP2_EVEN -> active_sinks=(0, 23, 24)
+        z_s, z_c = 0.5, 0.5
+        if 24 <= u <= 39:
+            z_s = -1.0
+            z_c = -0.5
+        elif u == 40:
+            z_s = -1.0
+            z_c = -0.5
+        elif u == 41:
+            z_s = -1.0
+            z_c = 0.5
+        expected_targets[u] = commit_step(refreshed, chunk, z_scene=z_s, z_cand=z_c)
+
+        # Invariant 1: Total live row count _length must be 100% identical to no-refresh baseline at every step!
+        assert refreshed._length == base._length, (
+            f"Row count mismatch at u={u}: {refreshed._length} != {base._length}"
+        )
+        # Invariant 2: All compaction spans are strictly monotonic and move left only (source >= dest)
+        dest = 0
+        for src_off, span_rows in refreshed._last_compaction_spans:
+            assert src_off >= dest, (
+                f"Compaction moved right at u={u}: {src_off} < {dest}"
+            )
+            dest += span_rows
+
+        if u in (39, 40):
+            # Panning stability guard holds promotion in ARMED state
+            assert refreshed._sink_refresh_state == "ARMED"
+            assert refreshed.window_policy.effective_sinks() == (0, 1, 2)
+        elif u == 41:
+            # Odd candidate u_cand = 41 - 18 = 23 promoted to slot 1, sorted active_sinks = (0, 2, 23)
+            assert refreshed._sink_refresh_state == "STEP1_ODD"
+            assert refreshed.window_policy.effective_sinks() == (0, 2, 23)
+            s_chunks = refreshed.committed[:3]
+            assert [c.temporal_chunk_id for c in s_chunks] == [0, 2, 23]
+            # Trimmed chunk 23 must have only its clean target rows (2 frames * 2 cols = 4 rows)
+            assert s_chunks[2].positions.shape[0] == 4
+            torch.testing.assert_close(
+                s_chunks[2].layers[0][0], expected_targets[23][0]
+            )
+            torch.testing.assert_close(
+                s_chunks[2].layers[0][1], expected_targets[23][1]
+            )
+        elif u == 42:
+            # Even candidate u_cand = 42 - 18 = 24 promoted to slot 2, sorted active_sinks = (0, 23, 24)
+            assert refreshed._sink_refresh_state == "COOLDOWN"
+            assert refreshed.window_policy.effective_sinks() == (0, 23, 24)
+            assert refreshed.stats["sink_refreshes"] == 1
+            s_chunks = refreshed.committed[:3]
+            assert [c.temporal_chunk_id for c in s_chunks] == [0, 23, 24]
+            assert [c.positions.shape[0] for c in s_chunks] == [6, 4, 6]
+            for s_u, s_c in zip((0, 23, 24), s_chunks):
+                torch.testing.assert_close(s_c.layers[0][0], expected_targets[s_u][0])
+                torch.testing.assert_close(s_c.layers[0][1], expected_targets[s_u][1])
+
+    # By u=94, max_age=60 from sink_u=23 (age >= 60 at u=83) must have triggered a second full cycle refresh!
+    assert refreshed.stats["sink_refreshes"] >= 2
+    assert refreshed.window_policy.effective_sinks()[0] == 0
+    assert refreshed.window_policy.effective_sinks()[1] > 23
+    refreshed.clear()
+    assert refreshed.window_policy.effective_sinks() == (0, 1, 2)
+    assert refreshed._sink_refresh_state == "COOLDOWN"
+
+
+@torch.no_grad()
+def test_rolling_scene_sink_refresh_auto_descriptor_on_6_chunk_window(monkeypatch):
+    from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+        allocate_layer_stores,
+    )
+
+    monkeypatch.setenv("ZING_SCENE_SINK_REFRESH", "1")
+    monkeypatch.setenv("ZING_SPARSE_SINK_REFRESH_COS_THR", "-0.35")
+    monkeypatch.setenv("ZING_SPARSE_SINK_REFRESH_CAND_MIN_Z", "0.0")
+    monkeypatch.setenv("ZING_SPARSE_SINK_REFRESH_STREAK", "16")
+    monkeypatch.setenv("ZING_SPARSE_SINK_REFRESH_COOLDOWN", "24")
+    monkeypatch.setenv("ZING_SPARSE_SINK_REFRESH_MAX_AGE", "60")
+
+    stores = allocate_layer_stores(
+        128,
+        num_layers=1,
+        local_heads=1,
+        head_dim=4,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    cache = ZingH3KVCache(
+        1,
+        window_policy=ZingWindowPolicy(6, 3),
+        window_eviction_timing="after_step0",
+        rope_position_mode="block_relative",
+        rope_max_frame_gap=12,
+        storage=stores,
+    )
+    for split_first in (False, True):
+        plan = ChunkPlan([3, 2], split_first_latent=split_first)
+        for initial_blocks in (3, 0):
+            cache.clear()
+            base_stores = allocate_layer_stores(
+                128,
+                num_layers=1,
+                local_heads=1,
+                head_dim=4,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+            )
+            base_cache = ZingH3KVCache(
+                1,
+                window_policy=ZingWindowPolicy(6, 3),
+                window_eviction_timing="after_step0",
+                rope_position_mode="block_relative",
+                rope_max_frame_gap=12,
+                storage=base_stores,
+            )
+            base_cache._sink_refresh_enabled = False
+            for u in range(50):
+                chunk = plan.chunk(u)
+                frames = chunk.end - chunk.start
+                pos = torch.tensor(
+                    [
+                        [float(chunk.start + f), 0.0, float(col)]
+                        for f in range(frames)
+                        for col in (0, 1)
+                    ],
+                    dtype=torch.float64,
+                )
+                rows = pos.shape[0]
+                if u < 20:
+                    vec = torch.tensor([1.0, 0.02 * (u % 3), 0.0, 0.0])
+                else:
+                    vec = torch.tensor([0.0, 1.0, 0.02 * (u % 3), 0.0])
+                tgt_k = vec.view(1, 1, 4).expand(rows, 1, 4).clone()
+                tgt_v = torch.full((rows, 1, 4), float(u))
+                for c_obj in (base_cache, cache):
+                    c_obj.begin_chunk(chunk.target_block)
+                    if u >= initial_blocks:
+                        src_k = (-vec).view(1, 1, 4).expand(rows, 1, 4).clone()
+                        src_v = torch.full((rows, 1, 4), -float(u))
+                        c_obj.update(
+                            pos,
+                            torch.full((rows,), chunk.source_block),
+                            "source",
+                            frames,
+                            ((src_k, src_v),),
+                        )
+                    c_obj.update(
+                        pos, torch.full((rows,), chunk.target_block), "active", frames
+                    )
+                    c_obj.complete_step0_and_evict(chunk.target_block)
+                    c_obj.update(
+                        pos,
+                        torch.full((rows,), chunk.target_block),
+                        "final",
+                        frames,
+                        ((tgt_k, tgt_v),),
+                    )
+                assert cache._length == base_cache._length, (
+                    f"Length mismatch at split={split_first}, init={initial_blocks}, u={u}: "
+                    f"{cache._length} != {base_cache._length}"
+                )
+
+            sinks = cache.window_policy.effective_sinks()
+            assert sinks[0] == 0
+            assert sinks[1] >= 20
+            if split_first:
+                assert sinks[1] % 2 == 0
+                assert sinks[2] == sinks[1] + 2
+            else:
+                assert sinks[1] % 2 == 1
+                assert sinks[2] == sinks[1] + 1
+
+    assert cache.stats["sink_refreshes"] == 4
+    assert len(cache._sink_refresh_all_history) == 4
+
+
+@torch.no_grad()
+def test_stationary_scene_never_triggers_false_sink_refresh(monkeypatch):
+    from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+        allocate_layer_stores,
+    )
+
+    monkeypatch.setenv("ZING_SCENE_SINK_REFRESH", "1")
+    monkeypatch.delenv("ZING_SPARSE_SINK_REFRESH_MAX_AGE", raising=False)
+
+    stores = allocate_layer_stores(
+        128,
+        num_layers=1,
+        local_heads=1,
+        head_dim=4,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    cache = ZingH3KVCache(
+        1,
+        window_policy=ZingWindowPolicy(6, 3),
+        window_eviction_timing="after_step0",
+        rope_position_mode="block_relative",
+        rope_max_frame_gap=12,
+        storage=stores,
+    )
+    plan = ChunkPlan([3, 2])
+    for u in range(110):
+        chunk = plan.chunk(u)
+        frames = chunk.end - chunk.start
+        pos = torch.tensor(
+            [
+                [float(chunk.start + f), 0.0, float(col)]
+                for f in range(frames)
+                for col in (0, 1)
+            ],
+            dtype=torch.float64,
+        )
+        rows = pos.shape[0]
+        if u < 80:
+            # Stationary room shot: tiny window jitter (std ~ 0.005) and positive sink similarity (~0.97)
+            vec = (
+                torch.tensor([1.0, 0.25, 0.0, 0.0])
+                if u < 3
+                else torch.tensor([1.0, 0.01 * (u % 3), 0.0, 0.0])
+            )
+        else:
+            # Genuine 180-degree camera turn at u >= 80
+            vec = torch.tensor([0.0, 1.0, 0.01 * (u % 3), 0.0])
+        tgt_k = vec.view(1, 1, 4).expand(rows, 1, 4).clone()
+        tgt_v = torch.full((rows, 1, 4), float(u))
+        cache.begin_chunk(chunk.target_block)
+        if u >= 3:
+            src_k = (-vec).view(1, 1, 4).expand(rows, 1, 4).clone()
+            src_v = torch.full((rows, 1, 4), -float(u))
+            cache.update(
+                pos,
+                torch.full((rows,), chunk.source_block),
+                "source",
+                frames,
+                ((src_k, src_v),),
+            )
+        cache.update(pos, torch.full((rows,), chunk.target_block), "active", frames)
+        cache.complete_step0_and_evict(chunk.target_block)
+        cache.update(
+            pos,
+            torch.full((rows,), chunk.target_block),
+            "final",
+            frames,
+            ((tgt_k, tgt_v),),
+        )
+        if u < 80:
+            assert cache.window_policy.effective_sinks() == (0, 1, 2), (
+                f"Stationary camera at u={u} falsely evicted opening sinks: "
+                f"{cache.window_policy.effective_sinks()}"
+            )
+            assert cache.stats.get("sink_refreshes", 0) == 0
+
+    assert cache.stats.get("sink_refreshes", 0) == 1
+    assert cache.window_policy.effective_sinks()[0] == 0
+    assert cache.window_policy.effective_sinks()[1] >= 80
 
 
 @torch.no_grad()

@@ -176,9 +176,21 @@ class ZingFixedForwardKVPlan:
             raise ValueError("Fixed Zing KV history must cover every live row")
         # Host-known write bounds for capture rollback; historical K/V are read-only.
         self.write_start = history
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3_sparse_attn import (
+            is_three_tier_enabled,
+        )
+
+        compressed_active = is_three_tier_enabled() or getattr(
+            cache, "_compressed_kv_enabled", False
+        )
         # Every row of this forward is written into the slot, clean or not.
         if cache._length + self.rows > self.capacity:
             raise ZingKVCapacityError("Fixed Zing KV plan exceeds slot capacity")
+        if compressed_active and cache.storage and len(cache.storage) > 0:
+            if self.rows > cache.storage[0].rows:
+                raise ZingKVCapacityError(
+                    f"Fixed Zing KV forward rows {self.rows} exceed scratch buffer capacity {cache.storage[0].rows}"
+                )
         mapped, historical = cache.attention_positions(
             current_positions, prefix=prefix, host_current=current_positions
         )
@@ -189,23 +201,30 @@ class ZingFixedForwardKVPlan:
             and after.rotated_positions is not None
             and torch.equal(after.rotated_positions, historical)
         )
-        self.rotates_history = historical is not None and not reusable
-        self.reused_history_rows = history if reusable else 0
+        self.rotates_history = (
+            (historical is not None and not reusable)
+            if not compressed_active
+            else False
+        )
+        self.reused_history_rows = (
+            history if (reusable and not compressed_active) else 0
+        )
         # Without history nothing is rotated and nothing carries over.
         self.rotated_positions = (
             None
-            if historical is None
+            if (historical is None or compressed_active)
             else historical
             if self.rotates_history
             else after.rotated_positions
         )
         device = self.stores[0][0].device
+        write_start = 0 if compressed_active else cache._length
         # Host-built plan inputs use pinned asynchronous copies: this plan is
         # usually built while the previous forward's graph is still running.
         tensors = dict(
             current_positions=_host_to_device(mapped, device),
             write_rows=torch.arange(
-                cache._length, cache._length + self.rows, device=device
+                write_start, write_start + self.rows, device=device
             ),
         )
         if self.rotates_history:
@@ -226,6 +245,61 @@ class ZingFixedForwardKVPlan:
                 torch.tensor([0, stop - previous], dtype=torch.int32), device
             )
             previous = stop
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3_sparse_attn import (
+            is_three_tier_enabled,
+        )
+
+        self._compressed_kv_stores = getattr(cache, "_compressed_kv_stores", None)
+        compressed_active = is_three_tier_enabled() or getattr(
+            cache, "_compressed_kv_enabled", False
+        )
+        if (
+            self._compressed_kv_stores is None
+            and compressed_active
+            and hasattr(cache, "get_compressed_kv_stores")
+        ):
+            if cache.storage and len(cache.storage) > 0:
+                s_k = cache.storage[0].k
+                self._compressed_kv_stores = cache.get_compressed_kv_stores(
+                    device=device,
+                    num_heads=s_k.shape[1] if s_k.ndim >= 3 else 28,
+                    head_dim=s_k.shape[2] if s_k.ndim >= 3 else 128,
+                )
+        self._compressed_kv_store = getattr(cache, "_compressed_kv_store", None)
+        if (
+            self._compressed_kv_stores is not None
+            and len(self._compressed_kv_stores) > 0
+            and compressed_active
+        ):
+            if (
+                any(
+                    s is not None and s.num_blocks == 0
+                    for s in self._compressed_kv_stores
+                )
+                and cache._length > 0
+                and hasattr(cache, "_sync_compressed_kv_store")
+            ):
+                cache._sync_compressed_kv_store(cache.committed)
+            self.compressed_kv_by_layer = [
+                s.as_kernel_dict() if s is not None else None
+                for s in self._compressed_kv_stores
+            ]
+            self.compressed_kv = (
+                self.compressed_kv_by_layer[0] if self.compressed_kv_by_layer else None
+            )
+            self._compressed_kv_store = self._compressed_kv_stores[0]
+        elif self._compressed_kv_store is not None:
+            if (
+                self._compressed_kv_store.num_blocks == 0
+                and cache._length > 0
+                and hasattr(cache, "_sync_compressed_kv_store")
+            ):
+                cache._sync_compressed_kv_store(cache.committed)
+            self.compressed_kv = self._compressed_kv_store.as_kernel_dict()
+            self.compressed_kv_by_layer = [self.compressed_kv]
+        else:
+            self.compressed_kv = None
+            self.compressed_kv_by_layer = None
         self.tensors = tensors
 
     def prepare_history_reuse(self, cache):
@@ -345,6 +419,8 @@ class ZingKVChunk:
     rope_parts: tuple = ()
     # CPU copy of positions; lets coordinate maps run without device reads.
     host_positions: torch.Tensor | None = None
+    # L2-normalized target key mean descriptor for rolling scene sink refresh.
+    descriptor: torch.Tensor | None = None
 
     @property
     def temporal_chunk_id(self):
@@ -529,6 +605,9 @@ class ZingH3KVCache:
                 )
             if len(storage) != num_layers:
                 raise ValueError("Zing pooled storage must provide every layer")
+            self._logical_capacity = getattr(storage[0], "logical_capacity", None)
+        else:
+            self._logical_capacity = None
         self.storage = storage
         # Main-store allocations/growth and compactions, counted apart from
         # derived RoPE/position metadata, which is never pooled.
@@ -536,8 +615,75 @@ class ZingH3KVCache:
             "store_allocations": 0,
             "rotated_allocations": 0,
             "compactions": 0,
+            "sink_refreshes": 0,
         }
+        self._sink_refresh_all_history = []
+        self._init_sink_refresh_config()
+        self._compressed_kv_store = None
+        self._compressed_kv_stores = None
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3_sparse_attn import (
+            is_three_tier_enabled,
+        )
+
+        if (
+            is_three_tier_enabled()
+            and self.storage is not None
+            and len(self.storage) > 0
+        ):
+            sample_k = self.storage[0].k
+            self.get_compressed_kv_stores(
+                device=sample_k.device,
+                num_heads=sample_k.shape[1] if sample_k.ndim >= 3 else 28,
+                head_dim=sample_k.shape[2] if sample_k.ndim >= 3 else 128,
+            )
         self.clear()
+
+    def _init_sink_refresh_config(self):
+        raw_flag = (
+            os.environ.get("ZING_SCENE_SINK_REFRESH")
+            or os.environ.get("SGLANG_ZING_SCENE_SINK_REFRESH")
+            or os.environ.get("ZING_SPARSE_SINK_REFRESH")
+            or os.environ.get("SGLANG_ZING_SPARSE_SINK_REFRESH")
+            or "auto"
+        )
+        env_flag = raw_flag.strip().lower()
+        if env_flag in ("1", "true", "on"):
+            enabled = True
+        elif env_flag in ("0", "false", "off"):
+            enabled = False
+        else:
+            raw_mode = (
+                os.environ.get("SGLANG_ZING_SPARSE_ATTN_MODE")
+                or os.environ.get("ZING_SPARSE_ATTN_MODE")
+                or "dense"
+            )
+            sparse_mode = raw_mode.strip().lower()
+            enabled = sparse_mode != "dense"
+        self._sink_refresh_enabled = bool(
+            enabled
+            and self.raw_store
+            and self.window_policy.window_chunks is not None
+            and self.window_policy.sink_chunks == 3
+        )
+        self._sink_refresh_cos_thr = float(
+            os.environ.get("ZING_SPARSE_SINK_REFRESH_COS_THR", "-0.35")
+        )
+        self._sink_refresh_cand_min_z = float(
+            os.environ.get("ZING_SPARSE_SINK_REFRESH_CAND_MIN_Z", "0.0")
+        )
+        self._sink_refresh_streak = int(
+            os.environ.get("ZING_SPARSE_SINK_REFRESH_STREAK", "16")
+        )
+        self._sink_refresh_cooldown = int(
+            os.environ.get("ZING_SPARSE_SINK_REFRESH_COOLDOWN", "24")
+        )
+        self._sink_refresh_max_age = int(
+            os.environ.get("ZING_SPARSE_SINK_REFRESH_MAX_AGE", "0")
+        )
+        self._sink_refresh_max_armed_wait = int(
+            os.environ.get("ZING_SPARSE_SINK_REFRESH_MAX_ARMED_WAIT", "16")
+        )
+        self._sink_signal_pinned = None
 
     @property
     def window_eviction_timing(self):
@@ -550,6 +696,25 @@ class ZingH3KVCache:
 
     @property
     def capacity(self):
+        if self.storage is None:
+            return None
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3_sparse_attn import (
+            is_three_tier_enabled,
+        )
+
+        if is_three_tier_enabled() or getattr(self, "_compressed_kv_enabled", False):
+            stores = getattr(self, "_compressed_kv_stores", None)
+            if stores and stores[0] is not None:
+                return stores[0].max_blocks * 64
+            single = getattr(self, "_compressed_kv_store", None)
+            if single is not None:
+                return single.max_blocks * 64
+            if getattr(self, "_logical_capacity", None) is not None:
+                return self._logical_capacity
+        return self.storage[0].rows
+
+    @property
+    def scratch_capacity(self):
         return None if self.storage is None else self.storage[0].rows
 
     def clear(self):
@@ -582,6 +747,141 @@ class ZingH3KVCache:
         self._chunk_plan = None
         self.rope_reuse_stats = dict(rebuilt_rows=0, reused_rows=0, map_syncs=0)
         self.last_rope_reuse = None
+        self._last_compaction_spans = ()
+        if self.window_policy.active_sinks is not None:
+            self.window_policy = ZingWindowPolicy(
+                self.window_policy.window_chunks,
+                self.window_policy.sink_chunks,
+                active_sinks=None,
+            )
+        self._sink_refresh_state = "COOLDOWN"
+        self._sink_refresh_last_chunk = 0
+        self._sink_low_sim_streak = 0
+        self._sink_armed_wait = 0
+        self._sink_last_z_scene = 0.0
+        self._sink_last_z_cand = 0.0
+        self._sink_signal_staged = False
+        self._sink_signal_manual = False
+        self._sink_refresh_history = []
+        self._sink_recent_descs = []
+        if getattr(self, "_compressed_kv_stores", None) is not None:
+            for store in self._compressed_kv_stores:
+                if store is not None:
+                    store.clear()
+        elif getattr(self, "_compressed_kv_store", None) is not None:
+            self._compressed_kv_store.clear()
+        if not getattr(self, "_bookkeeping_only", False):
+            try:
+                from sglang.multimodal_gen.runtime.models.dits.zing_h3_sparse_attn import (
+                    clear_sparse_caches,
+                )
+
+                clear_sparse_caches()
+            except Exception:
+                pass
+
+    def get_compressed_kv_store(
+        self,
+        layer_idx: int = 0,
+        device="cpu",
+        num_heads=16,
+        head_dim=128,
+        max_blocks=None,
+    ):
+        """Return or lazily initialize the resident ZingCompressedKVStore for layer_idx."""
+        self._compressed_kv_enabled = True
+        if getattr(self, "_compressed_kv_stores", None) is None:
+            self._compressed_kv_stores = [None] * max(1, self.num_layers)
+
+        if max_blocks is not None:
+            max_blks = int(max_blocks)
+        elif self.capacity is not None and self.capacity > 0:
+            max_blks = max(64, (int(self.capacity) + 63) // 64)
+            if (
+                getattr(self, "window_policy", None)
+                and self.window_policy.window_chunks is not None
+            ):
+                win_chunks = (
+                    int(self.window_policy.window_chunks)
+                    + max(0, int(self.window_policy.sink_chunks or 0))
+                    + 8
+                )
+                max_blks = max(max_blks, win_chunks * 2)
+        elif (
+            getattr(self, "window_policy", None)
+            and self.window_policy.window_chunks is not None
+        ):
+            win_chunks = (
+                int(self.window_policy.window_chunks)
+                + max(0, int(self.window_policy.sink_chunks or 0))
+                + 8
+            )
+            max_blks = min(512, max(64, win_chunks * 4))
+        else:
+            max_blks = 128
+        if layer_idx >= len(self._compressed_kv_stores):
+            self._compressed_kv_stores.extend(
+                [None] * (layer_idx + 1 - len(self._compressed_kv_stores))
+            )
+        if self._compressed_kv_stores[layer_idx] is None:
+            pooled_slot = (
+                self.storage[layer_idx]
+                if self.storage is not None and 0 <= layer_idx < len(self.storage)
+                else None
+            )
+            pooled_store = (
+                getattr(pooled_slot, "compressed_kv_store", None)
+                if pooled_slot is not None
+                else None
+            )
+            if (
+                pooled_store is not None
+                and getattr(pooled_store, "max_blocks", 0) >= max_blks
+                and getattr(pooled_store, "num_heads", None) == num_heads
+                and getattr(pooled_store, "head_dim", None) == head_dim
+            ):
+                pooled_store.clear()
+                self._compressed_kv_stores[layer_idx] = pooled_store
+            else:
+                from sglang.multimodal_gen.runtime.models.dits.zing_h3_sparse_attn import (
+                    ZingCompressedKVStore,
+                )
+
+                store = ZingCompressedKVStore(
+                    max_blocks=max_blks,
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    device=device,
+                )
+                self._compressed_kv_stores[layer_idx] = store
+                if pooled_slot is not None:
+                    try:
+                        pooled_slot.compressed_kv_store = store
+                    except Exception:
+                        pass
+        self._compressed_kv_store = self._compressed_kv_stores[0]
+        return self._compressed_kv_stores[layer_idx]
+
+    def get_compressed_kv_stores(
+        self,
+        device="cpu",
+        num_heads=16,
+        head_dim=128,
+        max_blocks=None,
+    ) -> list:
+        """Return or initialize resident ZingCompressedKVStore instances for all layers."""
+        stores = []
+        for layer_i in range(max(1, self.num_layers)):
+            stores.append(
+                self.get_compressed_kv_store(
+                    layer_idx=layer_i,
+                    device=device,
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    max_blocks=max_blocks,
+                )
+            )
+        return stores
 
     def validate_prefix_reset(self):
         prefix = self.prefix
@@ -805,13 +1105,41 @@ class ZingH3KVCache:
             yield chunk.positions
             if chunk.host_positions is not None:
                 yield chunk.host_positions
+            if chunk.descriptor is not None:
+                yield chunk.descriptor
             if not self.pooled:
                 for pair in chunk.layers:
                     yield from pair
+        for _, desc in getattr(self, "_sink_recent_descs", ()):
+            if desc is not None:
+                yield desc
         if not self.pooled:
             for pair in self._stores.values():
                 yield from pair
             yield from self._rotated_stores.values()
+        if getattr(self, "_compressed_kv_stores", None) is not None:
+            for store in self._compressed_kv_stores:
+                if store is not None:
+                    yield store.k_res_fp8
+                    yield store.v_res_fp8
+                    yield store.k_res_scale
+                    yield store.v_res_scale
+                    yield store.k_blk_mean
+                    yield store.v_blk_mean
+                    yield store.k_sub_mean_fp8
+                    yield store.v_sub_mean_fp8
+                    yield store.k_sub_scale
+                    yield store.v_sub_scale
+                    yield store.k_blk_mean_fp8
+                    yield store.v_blk_mean_fp8
+                    yield store.k_blk_scale
+                    yield store.v_blk_scale
+                    yield store.tau_k
+                    yield store.rho_kv
+                    yield store.block_valid_len
+                    yield store.block_delta_t
+                    yield store.block_is_shifted
+                    yield store.block_chunk_id
         yield from self._rope_coefficients.values()
         if self._effective_history_positions is not None:
             yield self._effective_history_positions
@@ -836,6 +1164,7 @@ class ZingH3KVCache:
         )
         shadow._bookkeeping_only = True
         shadow._attention_positions_memo = None
+        shadow._last_compaction_spans = ()
         return shadow
 
     def publish_plan(self, shadow):
@@ -847,8 +1176,228 @@ class ZingH3KVCache:
             # after planning. Acknowledge those versions before the next observer.
             for layer in shadow._stores:
                 shadow._mark_raw_store(layer)
+        prev_last_block = self.last_block
         self.__dict__.update(shadow.__dict__)
         self._bookkeeping_only = False
+        if self.last_block > prev_last_block:
+            self._stage_sink_refresh_signal_async()
+
+    def record_sink_refresh_signal(self, z_scene: float, z_cand: float = 0.0):
+        """Record precomputed or test-injected scene and candidate similarity z-scores."""
+        self._sink_last_z_scene = float(z_scene)
+        self._sink_last_z_cand = float(z_cand)
+        self._sink_signal_staged = False
+        self._sink_signal_manual = True
+
+    def _stage_sink_refresh_signal_async(self):
+        """Compute target chunk descriptor and stage (z_scene, z_cand) to pinned host memory."""
+        if (
+            not self._sink_refresh_enabled
+            or getattr(self, "_bookkeeping_only", False)
+            or self._sink_signal_manual
+            or not self.committed
+            or not self._stores
+        ):
+            return
+        rep_layer = self.num_layers // 2
+        store = self._stores.get(rep_layer)
+        if store is None:
+            return
+        keys = store[0]
+        # Avoid triggering custom __torch_function__ traps (e.g. DeviceOnly in host-sync tests).
+        if type(keys) is not torch.Tensor:
+            return
+        seen_ids = {uid for uid, _ in self._sink_recent_descs}
+        for chunk in self.committed:
+            if chunk.descriptor is None:
+                tgt_rows = (
+                    chunk.rope_parts[-1][1]
+                    if len(chunk.rope_parts) >= 2
+                    else chunk.positions.shape[0]
+                )
+                start = chunk.offset + (chunk.positions.shape[0] - tgt_rows)
+                stop = chunk.offset + chunk.positions.shape[0]
+                if 0 <= start < stop <= keys.shape[0]:
+                    vec = keys[start:stop].float().mean(dim=0).reshape(-1)
+                    chunk.descriptor = torch.nn.functional.normalize(
+                        vec, dim=0, eps=1e-6
+                    )
+            if chunk.descriptor is not None and chunk.temporal_chunk_id not in seen_ids:
+                self._sink_recent_descs.append(
+                    (chunk.temporal_chunk_id, chunk.descriptor)
+                )
+                seen_ids.add(chunk.temporal_chunk_id)
+        if len(self._sink_recent_descs) > 20:
+            self._sink_recent_descs = self._sink_recent_descs[-20:]
+        if len(self.committed) < 6 or self.committed[-1].descriptor is None:
+            return
+        s1_desc = self.committed[1].descriptor
+        s2_desc = self.committed[2].descriptor
+        cand_desc = self.committed[3].descriptor
+        curr_desc = self.committed[-1].descriptor
+        if s1_desc is None or s2_desc is None or cand_desc is None:
+            return
+        curr_id = self.committed[-1].temporal_chunk_id
+        win_descs = [
+            d
+            for uid, d in self._sink_recent_descs
+            if uid != curr_id and not self.window_policy.is_sink(uid) and d is not None
+        ][-16:]
+        if len(win_descs) < 2:
+            win_descs = [
+                c.descriptor for c in self.committed[3:-1] if c.descriptor is not None
+            ]
+        if len(win_descs) < 2:
+            return
+        hist_mat = torch.stack([s1_desc, s2_desc, cand_desc, *win_descs], dim=0)
+        sims = torch.mv(hist_mat, curr_desc)
+        win_sims = sims[3:]
+        win_mean = win_sims.mean()
+        win_std = win_sims.std(unbiased=False).clamp(min=0.05)
+        sink_mean = 0.5 * (sims[0] + sims[1])
+        raw_z_scene = (sink_mean - win_mean) / win_std
+        z_scene = torch.where(
+            (win_mean - sink_mean) >= 0.06,
+            raw_z_scene,
+            torch.maximum(raw_z_scene, torch.zeros_like(raw_z_scene)),
+        )
+        z_cand = (sims[2] - win_mean) / win_std
+        pair = torch.stack((z_scene, z_cand))
+        if pair.is_cuda:
+            if self._sink_signal_pinned is None:
+                with torch.inference_mode(False), torch.no_grad():
+                    self._sink_signal_pinned = torch.zeros(
+                        2, dtype=torch.float32, pin_memory=True
+                    )
+            self._sink_signal_pinned.copy_(pair, non_blocking=True)
+            self._sink_signal_staged = True
+        else:
+            self._sink_last_z_scene = float(pair[0].item())
+            self._sink_last_z_cand = float(pair[1].item())
+            self._sink_signal_staged = False
+
+    def _trim_chunk_to_target(self, chunk: ZingKVChunk):
+        """Strip the leading source half of a merged chunk in place so only clean target rows remain."""
+        if len(chunk.rope_parts) < 2:
+            return
+        tgt_id, tgt_rows = chunk.rope_parts[-1]
+        total_rows = chunk.positions.shape[0]
+        src_rows = total_rows - tgt_rows
+        if src_rows <= 0 or tgt_rows <= 0:
+            return
+        with torch.inference_mode(False), torch.no_grad():
+            chunk.positions = chunk.positions[src_rows:].detach().clone()
+            if chunk.host_positions is not None:
+                chunk.host_positions = chunk.host_positions[src_rows:].detach().clone()
+        chunk.offset += src_rows
+        chunk.rope_parts = ((tgt_id, tgt_rows),)
+        chunk.position_signature = self._tensor_signature(chunk.positions)
+        if self._stores and len(self._stores) == self.num_layers:
+            chunk.layers = self._chunk_layers(chunk.offset, tgt_rows)
+        elif chunk.layers:
+            chunk.layers = tuple((k[src_rows:], v[src_rows:]) for k, v in chunk.layers)
+
+    def _maybe_step_sink_refresh(self, target_block: int):
+        """Advance the parity-matched two-step rolling scene sink refresh state machine."""
+        if not self._sink_refresh_enabled:
+            return
+        window = self.window_policy.window_chunks
+        sinks = self.window_policy.sink_chunks
+        if window is None or sinks != 3 or len(self.committed) < window:
+            return
+        current_id = target_block // 2 - 1
+        if self._sink_signal_staged and self._sink_signal_pinned is not None:
+            self._sink_last_z_scene = float(self._sink_signal_pinned[0].item())
+            self._sink_last_z_cand = float(self._sink_signal_pinned[1].item())
+            self._sink_signal_staged = False
+        self._sink_signal_manual = False
+
+        cand = self.committed[3]
+        cand_id = cand.temporal_chunk_id
+
+        if self._sink_refresh_state == "STEP1_ODD":
+            s_even_old = self.committed[1]
+            even_rows = s_even_old.positions.shape[0]
+            cand_tgt_rows = (
+                cand.rope_parts[-1][1]
+                if len(cand.rope_parts) >= 2
+                else cand.positions.shape[0]
+            )
+            if cand_tgt_rows == even_rows or cand.positions.shape[0] == even_rows:
+                if cand_tgt_rows == even_rows and cand.positions.shape[0] != even_rows:
+                    self._trim_chunk_to_target(cand)
+                s_odd_new = self.committed[2].temporal_chunk_id
+                new_sinks = (0, s_odd_new, cand_id)
+                self.window_policy = ZingWindowPolicy(
+                    window, sinks, active_sinks=new_sinks
+                )
+                self._sink_refresh_state = "COOLDOWN"
+                self._sink_refresh_last_chunk = current_id
+                self._sink_low_sim_streak = 0
+                self._sink_armed_wait = 0
+                self.stats["sink_refreshes"] = self.stats.get("sink_refreshes", 0) + 1
+                self._sink_refresh_history.append((current_id, new_sinks))
+                self._sink_refresh_all_history.append(
+                    (
+                        current_id,
+                        new_sinks,
+                        round(self._sink_last_z_scene, 4),
+                        round(self._sink_last_z_cand, 4),
+                    )
+                )
+            return
+
+        if self._sink_refresh_state == "COOLDOWN":
+            if (
+                current_id - self._sink_refresh_last_chunk
+                >= self._sink_refresh_cooldown
+            ):
+                self._sink_refresh_state = "MONITOR"
+                self._sink_low_sim_streak = 0
+            else:
+                return
+
+        if self._sink_refresh_state == "MONITOR":
+            if self._sink_last_z_scene < self._sink_refresh_cos_thr:
+                self._sink_low_sim_streak += 1
+            else:
+                self._sink_low_sim_streak = 0
+            cur_sinks = self.window_policy.effective_sinks()
+            sink_age = current_id - max(cur_sinks[1], cur_sinks[2])
+            age_expired = (
+                self._sink_refresh_max_age > 0
+                and sink_age >= self._sink_refresh_max_age
+            )
+            if self._sink_low_sim_streak >= self._sink_refresh_streak or age_expired:
+                self._sink_refresh_state = "ARMED"
+                self._sink_armed_wait = 0
+
+        if self._sink_refresh_state == "ARMED":
+            stable = (
+                self._sink_last_z_cand >= self._sink_refresh_cand_min_z
+                or self._sink_armed_wait >= self._sink_refresh_max_armed_wait
+            )
+            s_odd_old = self.committed[1]
+            odd_rows = s_odd_old.positions.shape[0]
+            cand_tgt_rows = (
+                cand.rope_parts[-1][1]
+                if len(cand.rope_parts) >= 2
+                else cand.positions.shape[0]
+            )
+            if stable and (
+                cand_tgt_rows == odd_rows or cand.positions.shape[0] == odd_rows
+            ):
+                if cand_tgt_rows == odd_rows and cand.positions.shape[0] != odd_rows:
+                    self._trim_chunk_to_target(cand)
+                s_even_old_id = self.committed[2].temporal_chunk_id
+                new_sinks = (0, s_even_old_id, cand_id)
+                self.window_policy = ZingWindowPolicy(
+                    window, sinks, active_sinks=new_sinks
+                )
+                self._sink_refresh_state = "STEP1_ODD"
+                self._sink_armed_wait = 0
+            else:
+                self._sink_armed_wait += 1
 
     @property
     def cross_graph_rope_reuse(self):
@@ -893,6 +1442,7 @@ class ZingH3KVCache:
             self.eviction_target_block = None
 
     def _evict_committed(self, target_block):
+        self._maybe_step_sink_refresh(target_block)
         current_id = target_block // 2 - 1
         retained = [
             chunk
@@ -904,6 +1454,35 @@ class ZingH3KVCache:
             self._invalidate_rope(preserve_chunks=True)
             self._compact_store()
             self.stats["compactions"] += 1
+            self._sync_compressed_kv_store(retained)
+        else:
+            self._last_compaction_spans = tuple(
+                (c.offset, c.positions.shape[0]) for c in self._stored_chunks()
+            )
+
+    def _sync_compressed_kv_store(self, retained):
+        """Keep ZingCompressedKVStore blocks aligned with retained chunks after eviction."""
+        if getattr(self, "_compressed_kv_stores", None) is None:
+            if getattr(self, "_compressed_kv_store", None) is not None:
+                self._compressed_kv_stores = [self._compressed_kv_store]
+            else:
+                return
+        valid_chunk_ids = {c.temporal_chunk_id for c in retained}
+        if self.prefix is not None:
+            valid_chunk_ids.add(self.prefix.temporal_chunk_id)
+        if self.pending_source is not None:
+            valid_chunk_ids.add(self.pending_source.temporal_chunk_id)
+
+        for l_idx, store in enumerate(self._compressed_kv_stores):
+            if store is None or store.num_blocks == 0:
+                continue
+            blk_chunk = store.block_chunk_id[: store.num_blocks].cpu().tolist()
+            if any(cid != -999 and cid not in valid_chunk_ids for cid in blk_chunk):
+                # Pure compressed-domain in-place compaction: zero raw16 reliance & pointer invariant
+                store.compact_retained_chunks(valid_chunk_ids)
+
+        if self._compressed_kv_stores:
+            self._compressed_kv_store = self._compressed_kv_stores[0]
 
     def update_sink(self, operation, *, current_id):
         """Select existing clean chunks at a quiescent native block boundary."""
@@ -949,6 +1528,8 @@ class ZingH3KVCache:
         if not runs:
             return
         tensors = [tensor for pair in self._stores.values() for tensor in pair]
+        if not tensors:
+            return
         if _fused_compaction_rejection(tensors, runs) is None:
             _fused_move_rows(tensors, runs)
             return
@@ -964,10 +1545,12 @@ class ZingH3KVCache:
     def _compact_store(self):
         """Move live raw K/V to the front, using at most one chunk temporarily."""
         chunks = self._stored_chunks()
+        spans = tuple((c.offset, c.positions.shape[0]) for c in chunks)
+        self._last_compaction_spans = spans
         for layer in self._stores:
             self._observe_raw_store(layer)
         if not getattr(self, "_bookkeeping_only", False):
-            self.move_store_rows([(c.offset, c.positions.shape[0]) for c in chunks])
+            self.move_store_rows(spans)
         for layer in self._stores:
             self._mark_raw_store(layer)
         offset = 0
@@ -1781,6 +2364,8 @@ class ZingH3KVCache:
         return block
 
     def _chunk_layers(self, offset, rows):
+        if not self._stores or len(self._stores) < self.num_layers:
+            return ()
         stores = tuple(self._stores[i] for i in range(self.num_layers))
         if self.pooled:
             return _StoreLayerViews(stores, offset, offset + rows)
@@ -1792,26 +2377,65 @@ class ZingH3KVCache:
         """Commit raw or post-RoPE K, reusing V already written into scratch."""
         offset = self._length
         rows = positions.shape[0]
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3_sparse_attn import (
+            is_three_tier_enabled,
+        )
+
+        has_compressed_kv = (
+            getattr(self, "_compressed_kv_enabled", False) or is_three_tier_enabled()
+        )
         bookkeeping_only = getattr(self, "_bookkeeping_only", False)
-        for layer, (k, v) in enumerate(layers):
-            keys, values = self._reserve_store(layer, offset + rows, k, v)
-            # A clean forward already wrote these rows into the scratch tail, at
-            # the offset they commit to; copying them onto themselves is waste.
-            # A store grown since then moves the destination, so the check is on
-            # the address, not on the phase.
-            if not bookkeeping_only:
-                for source, destination in (
-                    (k, keys[offset : offset + rows]),
-                    (v, values[offset : offset + rows]),
-                ):
-                    if source.data_ptr() != destination.data_ptr():
-                        destination.copy_(source)
-            self._mark_raw_store(layer)
+        if not has_compressed_kv:
+            for layer, (k, v) in enumerate(layers):
+                keys, values = self._reserve_store(layer, offset + rows, k, v)
+                # A clean forward already wrote these rows into the scratch tail, at
+                # the offset they commit to; copying them onto themselves is waste.
+                # A store grown since then moves the destination, so the check is on
+                # the address, not on the phase.
+                if not bookkeeping_only:
+                    for source, destination in (
+                        (k, keys[offset : offset + rows]),
+                        (v, values[offset : offset + rows]),
+                    ):
+                        if source.data_ptr() != destination.data_ptr():
+                            destination.copy_(source)
+                self._mark_raw_store(layer)
         self._length = offset + rows
         self._chunk_plan = None
         chunk = ZingKVChunk(positions, block, (), frames, offset)
         chunk.position_signature = self._tensor_signature(positions)
-        chunk.layers = self._chunk_layers(offset, rows)
+        if not has_compressed_kv:
+            chunk.layers = self._chunk_layers(offset, rows)
+        else:
+            chunk.layers = ()
+
+        if not getattr(self, "_bookkeeping_only", False) and layers and len(layers) > 0:
+            if has_compressed_kv:
+                for l_idx, layer_pair in enumerate(layers):
+                    if not layer_pair or len(layer_pair) < 2:
+                        continue
+                    k_l, v_l = layer_pair[0], layer_pair[1]
+                    store_l = (
+                        self._compressed_kv_stores[l_idx]
+                        if getattr(self, "_compressed_kv_stores", None) is not None
+                        and l_idx < len(self._compressed_kv_stores)
+                        and self._compressed_kv_stores[l_idx] is not None
+                        else None
+                    )
+                    if store_l is None and hasattr(self, "get_compressed_kv_store"):
+                        store_l = self.get_compressed_kv_store(
+                            layer_idx=l_idx,
+                            device=k_l.device,
+                            num_heads=k_l.shape[1] if k_l.ndim >= 3 else 28,
+                            head_dim=k_l.shape[2] if k_l.ndim >= 3 else 128,
+                        )
+                    if store_l is not None:
+                        try:
+                            store_l.append_chunk(
+                                k_l, v_l, chunk_id=chunk.temporal_chunk_id
+                            )
+                        except Exception:
+                            pass
         return chunk
 
     def update(self, positions, block_idx, phase, frames, layers=None, validation=None):
@@ -1907,3 +2531,5 @@ class ZingH3KVCache:
             self.committed.append(chunk)
             self.last_block = block
             self.pending_source = self.active = self._active_reference = None
+            if not getattr(self, "_bookkeeping_only", False):
+                self._stage_sink_refresh_signal_async()

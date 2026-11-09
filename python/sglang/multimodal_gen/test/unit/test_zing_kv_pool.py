@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
     ZingKVPoolConfig,
     ZingKVPoolPlan,
     ZingKVRequest,
+    ZingLayerStore,
     cleaned_free_memory,
     peak_rows,
     token_capacity,
@@ -589,6 +590,39 @@ def test_finite_audio_tail_beyond_the_slot_is_rejected():
     assert plan.admit(_request(480, 832, **kwargs)) < plan.slot_rows
     with pytest.raises(ZingKVPoolAdmissionError):
         plan.admit(_request(704, 1280, prefix=4096, **kwargs))
+
+
+def test_pooled_layer_store_reuses_compressed_kv_store_across_sessions():
+    slot = ZingLayerStore(
+        k=torch.zeros(64, 4, 128, dtype=torch.bfloat16),
+        v=torch.zeros(64, 4, 128, dtype=torch.bfloat16),
+        rotated_k=torch.zeros(64, 4, 128, dtype=torch.bfloat16),
+    )
+    policy = ZingWindowPolicy(4, 1)
+    cache1 = ZingH3KVCache(
+        num_layers=1,
+        window_policy=policy,
+        rope_position_mode="block_relative",
+        storage=[slot],
+    )
+    store1 = cache1.get_compressed_kv_store(
+        layer_idx=0, num_heads=4, head_dim=128, device=torch.device("cpu")
+    )
+    store1.num_blocks = 7
+    assert slot.compressed_kv_store is store1
+
+    cache2 = ZingH3KVCache(
+        num_layers=1,
+        window_policy=policy,
+        rope_position_mode="block_relative",
+        storage=[slot],
+    )
+    store2 = cache2.get_compressed_kv_store(
+        layer_idx=0, num_heads=4, head_dim=128, device=torch.device("cpu")
+    )
+    assert store2 is store1
+    assert store2.num_blocks == 0
+    assert store2.k_res_fp8.data_ptr() == store1.k_res_fp8.data_ptr()
 
 
 @pytest.mark.parametrize("width", range(4, 22))

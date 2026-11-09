@@ -8,6 +8,7 @@ outside the graph pool and refreshed before every replay.
 """
 
 import collections
+import gc
 import json
 import os
 import threading
@@ -208,6 +209,7 @@ class ZingDenoiseGraphs:
     def __init__(self, *, backend=None, max_graphs=32):
         if max_graphs < 1:
             raise ValueError("Zing denoise graph budget must be positive")
+        _ensure_queued_dit_drain_ready_hook()
         self.backend = CudaGraphBackend() if backend is None else backend
         self.max_graphs = max_graphs
         self.routes = collections.Counter()
@@ -216,6 +218,7 @@ class ZingDenoiseGraphs:
         self.disabled = False
         self.coordinator = None
         self._routed = 0
+        self._sparse_mode_epoch = None
 
     def count(self, route):
         self.routes[route] += 1
@@ -238,6 +241,25 @@ class ZingDenoiseGraphs:
         if self.disabled:
             self.count("graphs_disabled")
             return None
+        if os.environ.get("ZING_SPARSE_STATE_FILE", "").strip():
+            from sglang.multimodal_gen.runtime.models.dits.zing_h3_sparse_attn import (
+                read_sparse_state,
+            )
+
+            cur_epoch = str(read_sparse_state().get("mode", "dense"))
+            if self._sparse_mode_epoch is None:
+                self._sparse_mode_epoch = cur_epoch
+            elif cur_epoch != self._sparse_mode_epoch:
+                self._sparse_mode_epoch = cur_epoch
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                self.graphs.clear()
+                self._seen.clear()
+                if hasattr(self.backend, "_pool"):
+                    self.backend._pool = None
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         entry = self.graphs.get(key)
         first_sighting = key not in self._seen
         if self.coordinator is not None:
@@ -324,12 +346,60 @@ class ZingDenoiseGraphs:
         return entry
 
 
+def _ensure_queued_dit_drain_ready_hook() -> None:
+    try:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+            queued_dit,
+        )
+    except ImportError:
+        return
+    cls = getattr(queued_dit, "QueuedDiTSession", None)
+    if cls is None or getattr(cls, "_zing_chunk_graphs_hooked", False):
+        return
+    orig_process = cls._process
+
+    def _drain_single_chunk(state):
+        res = None
+        for item in state.drain_ready():
+            res = item
+        return res
+
+    async def _process_with_chunk_graphs(self, queue):
+        if (
+            queue
+            and isinstance(queue[0], dict)
+            and queue[0].get("type") == "source.group"
+            and self.state is not None
+            and getattr(
+                getattr(getattr(self.state, "sampler", None), "generator", None),
+                "chunk_graphs",
+                None,
+            )
+            is not None
+            and hasattr(self.state, "drain_ready")
+        ):
+            orig_step = self.state.step
+            self.state.step = lambda: _drain_single_chunk(self.state)
+            try:
+                return await orig_process(self, queue)
+            finally:
+                self.state.step = orig_step
+        return await orig_process(self, queue)
+
+    cls._process = _process_with_chunk_graphs
+    cls._zing_chunk_graphs_hooked = True
+
+
+_ensure_queued_dit_drain_ready_hook()
+
+
 class ZingChunkGraphs:
     """Bounded, model-owned whole-chunk graphs over a fixed pooled KV slot."""
 
     def __init__(self, *, backend=None, max_graphs=16, capture_enabled=True):
         if type(max_graphs) is not int or max_graphs < 1:
             raise ValueError("Zing chunk graph budget must be positive")
+        _ensure_queued_dit_drain_ready_hook()
         self.backend = CudaGraphBackend() if backend is None else backend
         self.max_graphs, self.capture_enabled = max_graphs, capture_enabled
         self.graphs = collections.OrderedDict()
@@ -337,6 +407,7 @@ class ZingChunkGraphs:
         self.routes = collections.Counter()
         self.coordinator = None
         self.disabled = False
+        self._sparse_mode_epoch = None
 
     def eligible(self, sampler, cache, current):
         from sglang.multimodal_gen.runtime.models.dits import zing_h3
@@ -413,15 +484,170 @@ class ZingChunkGraphs:
 
     def _run(self, kind, plans, tensors, execute, stores, rotated=()):
         signatures = tuple(plan.signature for plan in plans)
-        # The graph reads and writes the same fixed rotated-K allocation.
-        addresses = tuple(
-            value.data_ptr() for pair in stores for value in pair
-        ) + tuple(value.data_ptr() for value in rotated)
+        ckv_addrs = []
+        for plan in plans:
+            ckv_list = getattr(
+                getattr(plan, "kv_plan", None), "compressed_kv_by_layer", None
+            )
+            if ckv_list:
+                for d in ckv_list:
+                    if isinstance(d, dict):
+                        for key in ("k_res_fp8", "k_fp8"):
+                            if key in d and isinstance(d[key], torch.Tensor):
+                                ckv_addrs.append(d[key].data_ptr())
+                                break
+                break
+        # The graph reads and writes the same fixed rotated-K and compressed-KV allocations.
+        addresses = (
+            tuple(value.data_ptr() for pair in stores for value in pair)
+            + tuple(value.data_ptr() for value in rotated)
+            + tuple(ckv_addrs)
+        )
         # Inputs contain all changing metadata by value, never absolute chunk ids.
         shapes = tuple(
             (name, tuple(t.shape), t.dtype, t.device) for name, t in tensors.items()
         )
-        key = (kind, signatures, addresses, shapes)
+        sparse_sig = ()
+        force_sparse_eager = (
+            os.environ.get("ZING_SPARSE_DISABLE_CHUNK_GRAPH", "0") == "1"
+        )
+        if (
+            kind != "prefix_separate"
+            and os.environ.get("ZING_SPARSE_STATE_FILE", "").strip()
+        ):
+            from sglang.multimodal_gen.runtime.models.dits.zing_h3_sparse_attn import (
+                read_sparse_state,
+            )
+
+            cur_epoch = str(read_sparse_state().get("mode", "dense"))
+            if self._sparse_mode_epoch is None:
+                self._sparse_mode_epoch = cur_epoch
+            elif cur_epoch != self._sparse_mode_epoch:
+                self._sparse_mode_epoch = cur_epoch
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                self.graphs.clear()
+                self._seen.clear()
+                if hasattr(self, "_shapes"):
+                    self._shapes.clear()
+                if hasattr(self.backend, "_pool"):
+                    self.backend._pool = None
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            if kind == "init":
+                force_sparse_eager = True
+        if any(getattr(plan.kv_plan, "_sparse_branches", None) for plan in plans):
+            from sglang.multimodal_gen.runtime.models.dits.zing_h3_sparse_attn import (
+                get_min_sparse_chunk,
+            )
+
+            if kind == "init":
+                force_sparse_eager = True
+            min_chunk = get_min_sparse_chunk()
+            sig_items = []
+            all_modes = set()
+            for p_idx, plan in enumerate(plans):
+                sb = getattr(plan.kv_plan, "_sparse_branches", None) or {}
+                for b_idx, sp in sorted(sb.items()):
+                    eff_mode = (
+                        "dense"
+                        if (
+                            sp.mode == "dense"
+                            or sp.chunk_id < min_chunk
+                            or sp.M_cand <= 8
+                        )
+                        else sp.mode
+                    )
+                    all_modes.add(eff_mode)
+                    sig_items.append(
+                        (
+                            p_idx,
+                            b_idx,
+                            eff_mode,
+                            sp.tau,
+                            sp.b_phase,
+                            sp.L_q,
+                        )
+                    )
+            if all_modes == {"dense"}:
+                sparse_sig = ()
+            elif "dense" in all_modes:
+                force_sparse_eager = True
+                sparse_sig = tuple(sig_items)
+            else:
+                sparse_sig = tuple(sig_items)
+
+        key = (
+            (kind, signatures, addresses, shapes, sparse_sig)
+            if sparse_sig
+            else (kind, signatures, addresses, shapes)
+        )
+
+        def _maybe_log_sparse_route(action_name: str) -> None:
+            if not os.environ.get("ZING_SPARSE_STATE_FILE", "").strip():
+                return
+            sp_info = []
+            for p_idx, p_obj in enumerate(plans):
+                sb = (
+                    getattr(getattr(p_obj, "kv_plan", None), "_sparse_branches", None)
+                    or {}
+                )
+                for b_idx, sp in sorted(sb.items()):
+                    sp_info.append(
+                        {
+                            "p": p_idx,
+                            "b": b_idx,
+                            "u": sp.chunk_id,
+                            "phase": sp.b_phase,
+                            "mode": sp.mode,
+                            "M_cand": sp.M_cand,
+                            "M_prefix": sp.M_prefix,
+                            "L_k": sp.L_k,
+                        }
+                    )
+            logger.info(
+                "ZING_CHUNK_GRAPH_ROUTES_JSON %s",
+                json.dumps(
+                    {
+                        "kind": kind,
+                        "action": action_name,
+                        "num_graphs": len(self.graphs),
+                        "sparse_sig_len": len(sparse_sig),
+                        "routes": {f"{k}.{r}": v for (k, r), v in self.routes.items()},
+                        "branches": sp_info,
+                    }
+                ),
+            )
+
+        if force_sparse_eager:
+            if self.coordinator is not None and not self.coordinator.agree(
+                ROUTE_WARMUP
+            ):
+                self.routes[(kind, "route_mismatch")] += 1
+                _maybe_log_sparse_route("route_mismatch")
+                return execute(tensors)
+            self.routes[(kind, "eager")] += 1
+            _maybe_log_sparse_route("eager")
+            return execute(tensors)
+        if (
+            self.capture_enabled
+            and key not in self.graphs
+            and key in self._seen
+            and len(self.graphs) >= self.max_graphs
+        ):
+            # Destroy the entire old shared-pool generation BEFORE capturing a new
+            # graph; evicting one captured graph from a live shared pool after a
+            # newer capture invalidates later replays of the newer graph.
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self.graphs.clear()
+            self._seen.clear()
+            if hasattr(self, "_shapes"):
+                self._shapes.clear()
+            if hasattr(self.backend, "_pool"):
+                self.backend._pool = None
+            self.routes[(kind, "shape_reset")] += 1
         entry = self.graphs.get(key)
         first = key not in self._seen
         capture_kind = self.capture_enabled and (
@@ -440,13 +666,16 @@ class ZingChunkGraphs:
             self.graphs.pop(key, None)
             self._seen.pop(key, None)
             self.routes[(kind, "route_mismatch")] += 1
+            _maybe_log_sparse_route("route_mismatch")
             return execute(tensors)
         self._seen[key] = None
         self._seen.move_to_end(key)
         while len(self._seen) > 4 * self.max_graphs:
             self._seen.popitem(last=False)
         if not capture_kind or first:
-            self.routes[(kind, "eager" if not capture_kind else "warmup")] += 1
+            act_name = "eager" if not capture_kind else "warmup"
+            self.routes[(kind, act_name)] += 1
+            _maybe_log_sparse_route(act_name)
             return execute(tensors)
         if entry is None:
             static = {name: tensor.clone() for name, tensor in tensors.items()}
@@ -455,10 +684,18 @@ class ZingChunkGraphs:
                 value.to("cpu", copy=True) if value.is_cuda else value.clone()
                 for value in flat
             )
+            from sglang.multimodal_gen.runtime.models.dits.zing_h3_sparse_attn import (
+                get_active_s1_mask_buffer,
+            )
+
+            s1_buf = get_active_s1_mask_buffer(stores)
+            saved_s1 = s1_buf.clone() if s1_buf is not None else None
 
             def restore():
                 for target, source in zip(flat, saved, strict=True):
                     target.copy_(source)
+                if s1_buf is not None and saved_s1 is not None:
+                    s1_buf.copy_(saved_s1)
 
             def capture():
                 # Production capture calls this eagerly once, then under capture.
@@ -507,10 +744,12 @@ class ZingChunkGraphs:
             while len(self.graphs) > self.max_graphs:
                 self.graphs.popitem(last=False)
             self.routes[(kind, "capture")] += 1
+            _maybe_log_sparse_route("capture")
         else:
             entry.refresh(tensors)
             self.graphs.move_to_end(key)
             self.routes[(kind, "replay")] += 1
+            _maybe_log_sparse_route("replay")
         self.backend.replay(entry.graph)
         return tuple(value.clone() for value in entry.outputs)
 
@@ -681,6 +920,23 @@ class ZingChunkGraphs:
             projection_cache=projection_cache,
             target_grid=target_grid,
         )
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3_sparse_attn import (
+            attach_sparse_specs_to_plan,
+            extract_history_items,
+            is_sparse_runtime_enabled,
+            read_sparse_state,
+        )
+
+        joint_phases = packed.get("_zing_joint_phases") or ()
+        has_prefix_update = (
+            (phase == "prefix")
+            or ("prefix" in joint_phases)
+            or (len(joint_phases) in (5, 6))
+        )
+        should_attach_sparse = has_prefix_update or is_sparse_runtime_enabled()
+        sparse_history_before = (
+            extract_history_items(shadow) if should_attach_sparse else None
+        )
         layers = [(k[:rows], v[:rows]) for k, v in kv.stores]
         if transaction is not None:
             transaction.commit(
@@ -698,6 +954,18 @@ class ZingChunkGraphs:
                 0 if phase == "prefix" else int(positions[:, 0].unique().numel()),
                 None if phase == "active" else layers,
                 validation=(positions, blocks),
+            )
+        if sparse_history_before is not None:
+            attach_sparse_specs_to_plan(
+                sampler,
+                sparse_history_before,
+                getattr(shadow, "window_policy", None),
+                packed,
+                phase,
+                plan.kv_plan,
+                read_sparse_state(),
+                shadow=shadow,
+                plan=plan,
             )
         return plan
 
@@ -901,10 +1169,12 @@ class ZingChunkGraphs:
             kept_chunks = tuple(shadow._stored_chunks())
             # Device rows are moved eagerly before the graph runs, so the graph
             # never carries a capacity-sized compaction.
-            spans = tuple(
-                (old_offsets[id(c.positions)], c.positions.shape[0])
-                for c in kept_chunks
-            )
+            spans = getattr(shadow, "_last_compaction_spans", None)
+            if not spans:
+                spans = tuple(
+                    (old_offsets[id(c.positions)], c.positions.shape[0])
+                    for c in kept_chunks
+                )
             plans = []
             for step in range(1, steps):
                 packed = sampler._select_block(

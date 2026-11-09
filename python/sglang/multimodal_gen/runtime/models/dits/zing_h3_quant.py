@@ -23,15 +23,18 @@ logger = logging.getLogger(__name__)
 def selected_linears(num_layers, scope, excludes=None):
     if excludes is None:
         excludes = ()
-    if scope not in {"ffn", "fc1", "interior-qkv-fc1", "ffn-attention"}:
+    if scope not in {"ffn", "fc1", "interior-qkv-fc1", "ffn-qkv", "ffn-attention"}:
         raise ValueError(
-            "SGLANG_ZING_QUANT_SCOPE must be ffn, fc1, interior-qkv-fc1 or ffn-attention"
+            "SGLANG_ZING_QUANT_SCOPE must be ffn, fc1, interior-qkv-fc1, "
+            "ffn-qkv or ffn-attention"
         )
     suffixes = ["mlp.fc1", "mlp.fc2"]
     if scope == "fc1":
         suffixes = ["mlp.fc1"]
     if scope == "interior-qkv-fc1":
         suffixes = ["mlp.fc1", "attn.qkv_proj"]
+    if scope == "ffn-qkv":
+        suffixes += ["attn.qkv_proj"]
     if scope == "ffn-attention":
         suffixes += ["attn.qkv_proj", "attn.out_proj"]
     candidates = {

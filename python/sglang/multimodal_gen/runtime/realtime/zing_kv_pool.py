@@ -19,6 +19,7 @@ CFG forwards run without a cache and are not counted.
 import gc
 import logging
 import math
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -54,6 +55,8 @@ class ZingLayerStore:
     k: torch.Tensor
     v: torch.Tensor
     rotated_k: torch.Tensor
+    logical_capacity: int | None = None
+    compressed_kv_store: object = None
 
     @property
     def rows(self) -> int:
@@ -65,7 +68,7 @@ class ZingLayerStore:
 
 
 def allocate_layer_stores(
-    rows, *, num_layers, local_heads, head_dim, dtype, device
+    rows, *, num_layers, local_heads, head_dim, dtype, device, logical_capacity=None
 ) -> list[ZingLayerStore]:
     """Allocate storage for a realtime session slot."""
     _positive_int("rows", rows)
@@ -83,6 +86,7 @@ def allocate_layer_stores(
             k,
             torch.zeros(shape, dtype=dtype, device=device),
             torch.zeros(shape, dtype=dtype, device=device),
+            logical_capacity=logical_capacity,
         )
         for k in keys
     ]
@@ -402,6 +406,50 @@ class ZingKVRequest:
     window_eviction_timing: str = "after_step0"
 
 
+def calculate_max_forward_rows(
+    config: ZingKVPoolConfig,
+    geometry: ZingKVGeometry,
+    *,
+    prefix_rows: int = 0,
+    prompt_prefix_frames: int = 5,
+    request: ZingKVRequest | None = None,
+    prompt_joint: bool = False,
+) -> int:
+    """Calculate maximum forward rows for a single fixed forward.
+
+    Covers block0 prefix/reference, target, source, previous-final, prompt
+    replay, and chunk length. When ``request`` is provided, uses the
+    request's exact geometry and ``request.prefix_rows``.
+    """
+    if request is not None:
+        max_target_rows = geometry.rows_per_frame(
+            request.target_height, request.target_width
+        )
+        max_source_rows = (
+            geometry.rows_per_frame(*request.source_shape)
+            if request.source_shape is not None
+            else 0
+        )
+        req_prefix_rows = max(prefix_rows, request.prefix_rows)
+        has_audio = bool(request.generates_audio)
+    else:
+        mh, mw = geometry.canvas_multiples
+        max_target_rows = config.max_target_area // (mh * mw)
+        max_source_rows = max_target_rows
+        req_prefix_rows = prefix_rows
+        has_audio = geometry.video_t_span is not None
+    chunk = max(geometry.chunk_plan.lengths)
+    cross_chunk_rows = chunk * (2 * max_target_rows + max_source_rows)
+    current_rows = chunk * (max_target_rows + max_source_rows)
+    replay_rows = prompt_prefix_frames * max_target_rows
+    prompt_joint_rows = current_rows + replay_rows
+    prefix_forward_rows = req_prefix_rows + (prompt_joint_rows if prompt_joint else 0)
+    audio_rows = 0
+    if has_audio and geometry.video_t_span is not None:
+        audio_rows = 2 * geometry.audio_frames(0, chunk, tail=True)
+    return max(cross_chunk_rows, prompt_joint_rows, prefix_forward_rows) + audio_rows
+
+
 @dataclass(frozen=True)
 class ZingKVPoolPlan:
     """Physical slot capacity derived once from the launch contract."""
@@ -412,6 +460,8 @@ class ZingKVPoolPlan:
     runtime_budget_bytes: int | None = None
     local_hidden_width: int | None = None
     prefix_hidden_width: int | None = None
+    scratch_rows: int | None = None
+    scratch_rows_explicit: bool = False
 
     @classmethod
     def build(
@@ -423,6 +473,8 @@ class ZingKVPoolPlan:
         runtime_budget_bytes: int | None = None,
         local_hidden_width: int | None = None,
         prefix_hidden_width: int | None = None,
+        scratch_rows: int | None = None,
+        prefix_rows: int = 0,
     ):
         _positive_int("token_capacity", token_capacity)
         widths = (local_hidden_width, prefix_hidden_width)
@@ -434,6 +486,16 @@ class ZingKVPoolPlan:
             _positive_int("runtime_budget_bytes", runtime_budget_bytes)
             _positive_int("local_hidden_width", local_hidden_width)
             _positive_int("prefix_hidden_width", prefix_hidden_width)
+        if type(prefix_rows) is not int or prefix_rows < 0:
+            raise ValueError("prefix_rows must be a nonnegative integer")
+        if scratch_rows is None:
+            scratch_rows = calculate_max_forward_rows(
+                config, geometry, prefix_rows=prefix_rows
+            )
+            scratch_rows_explicit = prefix_rows > 0
+        else:
+            _positive_int("scratch_rows", scratch_rows)
+            scratch_rows_explicit = True
         return cls(
             config,
             geometry,
@@ -441,6 +503,27 @@ class ZingKVPoolPlan:
             runtime_budget_bytes,
             local_hidden_width,
             prefix_hidden_width,
+            scratch_rows=scratch_rows,
+            scratch_rows_explicit=scratch_rows_explicit,
+        )
+
+    @staticmethod
+    def calculate_max_forward_rows(
+        config: ZingKVPoolConfig,
+        geometry: ZingKVGeometry,
+        *,
+        prefix_rows: int = 0,
+        prompt_prefix_frames: int = 5,
+        request: ZingKVRequest | None = None,
+        prompt_joint: bool = False,
+    ) -> int:
+        return calculate_max_forward_rows(
+            config,
+            geometry,
+            prefix_rows=prefix_rows,
+            prompt_prefix_frames=prompt_prefix_frames,
+            request=request,
+            prompt_joint=prompt_joint,
         )
 
     def slot_bytes(self, *, num_layers, local_heads, head_dim, element_size):
@@ -463,7 +546,12 @@ class ZingKVPoolPlan:
         ).validate_canvas(height, width)
 
     def admit(
-        self, request: ZingKVRequest, *, prompt_prefix_frames=0, prompt_joint=False
+        self,
+        request: ZingKVRequest,
+        *,
+        prompt_prefix_frames=0,
+        prompt_joint=False,
+        scratch_rows: int | None = None,
     ) -> int:
         """Validate a request against the contract and return its peak rows.
 
@@ -531,6 +619,35 @@ class ZingKVPoolPlan:
         )
         if rows > self.slot_rows:
             raise _unsupported(f"peak rows {rows} exceed slot rows {self.slot_rows}")
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3_sparse_attn import (
+            is_three_tier_enabled,
+        )
+
+        effective_scratch = scratch_rows
+        if effective_scratch is None and (
+            is_three_tier_enabled() or self.scratch_rows_explicit
+        ):
+            raw_scratch = os.environ.get("SGLANG_ZING_SPARSE_SCRATCH_ROWS")
+            plan_scratch = int(raw_scratch) if raw_scratch else self.scratch_rows
+            if plan_scratch is not None:
+                effective_scratch = min(self.slot_rows, plan_scratch)
+        if effective_scratch is not None:
+            required_scratch_rows = calculate_max_forward_rows(
+                c,
+                g,
+                request=request,
+                prompt_prefix_frames=prompt_prefix_frames,
+                prompt_joint=prompt_joint,
+            )
+            if (
+                request.prefix_rows > effective_scratch
+                or required_scratch_rows > effective_scratch
+            ):
+                raise _unsupported(
+                    f"forward rows {required_scratch_rows} "
+                    f"(prefix_rows={request.prefix_rows}) exceed scratch rows "
+                    f"{effective_scratch}"
+                )
         if self.runtime_budget_bytes is not None:
             # Prefix preparation and the joint source/target forward do not
             # scale with retained KV occupancy. A replacement can additionally
@@ -609,11 +726,40 @@ class ZingKVPool:
             ]
         )
         self._agree = agree
+        self._scratch_rows = None
+        self._compressed_active = False
 
     @classmethod
     def allocate(
         cls, plan, *, num_layers, local_heads, head_dim, dtype, device, **kwargs
     ):
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3_sparse_attn import (
+            is_three_tier_enabled,
+        )
+
+        scratch_rows = kwargs.pop("scratch_rows", None)
+        compressed_active = kwargs.pop("compressed_kv", None)
+        if compressed_active is None:
+            compressed_active = is_three_tier_enabled()
+
+        raw_scratch = os.environ.get("SGLANG_ZING_SPARSE_SCRATCH_ROWS")
+        if raw_scratch:
+            scratch_rows = int(raw_scratch)
+        elif scratch_rows is None and compressed_active:
+            scratch_rows = getattr(plan, "scratch_rows", None)
+            if scratch_rows is None:
+                config = getattr(plan, "config", None)
+                geometry = getattr(plan, "geometry", None)
+                if config is not None and geometry is not None:
+                    scratch_rows = calculate_max_forward_rows(config, geometry)
+                else:
+                    scratch_rows = min(plan.slot_rows, 512)
+
+        alloc_rows = (
+            min(plan.slot_rows, scratch_rows)
+            if (compressed_active and scratch_rows is not None)
+            else plan.slot_rows
+        )
         layout = dict(
             num_layers=num_layers,
             local_heads=local_heads,
@@ -622,10 +768,31 @@ class ZingKVPool:
             device=device,
         )
         slots = [
-            allocate_layer_stores(plan.slot_rows, **layout)
+            allocate_layer_stores(
+                alloc_rows,
+                logical_capacity=plan.slot_rows if compressed_active else alloc_rows,
+                **layout,
+            )
             for _ in range(plan.config.pool_size)
         ]
-        return cls(plan, slots, **kwargs)
+        pool = cls(plan, slots, **kwargs)
+        pool._scratch_rows = alloc_rows if compressed_active else None
+        pool._compressed_active = bool(compressed_active)
+        return pool
+
+    @property
+    def is_compressed(self) -> bool:
+        return bool(self._compressed_active)
+
+    @property
+    def scratch_rows(self) -> int | None:
+        return self._scratch_rows
+
+    @property
+    def physical_rows(self) -> int:
+        if self._pool._slots and self._pool._slots[0].kv_cache:
+            return self._pool._slots[0].kv_cache[0].rows
+        return self.plan.slot_rows
 
     @property
     def size(self):
@@ -650,7 +817,10 @@ class ZingKVPool:
         try:
             if held is not None and not held.released:
                 raise _unsupported("session already holds a Zing KV pool slot")
-            rows = self.plan.admit(request)
+            rows = self.plan.admit(
+                request,
+                scratch_rows=self._scratch_rows if self._compressed_active else None,
+            )
         except ZingKVPoolAdmissionError as rejected:
             error = rejected
         if error is None and self._pool.available:
