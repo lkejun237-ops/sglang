@@ -29,7 +29,7 @@ from .maintenance_process import finish_cleanup
 from .metrics import capture_stages, stage
 from .model_geometry import validate_room_spec
 from .player_idle import PlayerIdlePolicy, PlayerInputActivity, meaningful_input
-from .recording import ArchiveManager, json_line, write_manifest
+from .recording import ArchiveManager, json_line, room_event_max_bytes, write_manifest
 from .room_startup import (
     FactoryCleanupReceipt,
     MemberCleanupReceipt,
@@ -114,7 +114,10 @@ class RoomLog:
             if not self.failure:
                 try:
                     data = json_line(event).encode()
-                    if len(data) > 65536 or len(self.buffer) + len(data) > 8 << 20:
+                    if (
+                        len(data) > room_event_max_bytes(event)
+                        or len(self.buffer) + len(data) > 8 << 20
+                    ):
                         raise ValueError("Game event archive exceeds its memory budget")
                     self.buffer.extend(data)
                 except (ValueError, TypeError, RecursionError, MemoryError):
@@ -310,9 +313,11 @@ class RoomRuntime:
             self.spool,
             route,
             game_prefix(self.prefix, route["world_id"], game_id),
-            process=self.archives.processes,
+            # Live input and receipt correlation share this ordered log. Archive
+            # backpressure must fail recording, never consume the SDK send budget.
+            process=True,
             cpu=self.archives.recorder_cpu,
-            fail_open=getattr(self.archives, "fail_open", False),
+            fail_open=True,
             diskless=getattr(self.archives, "diskless", False),
         )
         await log.initialize()
@@ -544,6 +549,12 @@ class RoomRuntime:
                 render_lock=asyncio.Lock(),
                 trace_id=body["trace_id"],
             )
+            if (
+                "control_caller" not in room
+                and room["driver"].max_players == 1
+                and getattr(engine, "metadata", {}).get("project_input") is True
+            ):
+                entry["source_input"] = True
             self.players[stream_id] = entry
             room["players"].add(stream_id)
             room["ever_occupied"] = True
@@ -710,6 +721,12 @@ class RoomRuntime:
                 await entry["engine"].finish()
             return event
 
+    async def player_input_session(self, stream_id):
+        entry = self.player(stream_id, touch=False)
+        if not entry.get("source_input"):
+            raise ValueError("The player input session is unavailable")
+        return await self.player_transport.public_session({"stream_id": stream_id})
+
     async def ui_asset(self, stream_id, path):
         return await self.player(stream_id)["engine"].renderer.asset(path)
 
@@ -736,8 +753,24 @@ class RoomRuntime:
             message = json.loads(wire)
             if not isinstance(message, dict):
                 return
-            incoming = {"input.state", "input.action", "input.release"}
-            receipts = {"input.receipt", "action.receipt", "input.released"}
+            incoming = {
+                "input.state",
+                "input.action",
+                "input.release",
+                "input.semantic.open",
+                "input.semantic.applied",
+                "input.semantic.batch",
+                "input.semantic.cancel",
+            }
+            receipts = {
+                "input.receipt",
+                "action.receipt",
+                "input.released",
+                "input.semantic.binding",
+                "input.semantic.receipt",
+                "input.semantic.error",
+                "input.semantic.available",
+            }
             if message.get("type") not in (
                 incoming if direction == "to-sdk" else receipts
             ):
@@ -1209,6 +1242,8 @@ def create_app(runtime, token):
             with capture_stages() as spans:
                 if operation == "frame":
                     result = await runtime.next_frame(stream_id)
+                elif operation == "player_input_session":
+                    result = await runtime.player_input_session(stream_id)
                 elif operation == "ui_asset":
                     result = await runtime.ui_asset(stream_id, body["path"])
                 elif operation == "render":

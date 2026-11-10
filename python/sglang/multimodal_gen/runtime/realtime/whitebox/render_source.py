@@ -223,6 +223,10 @@ class SourceSession(InteractiveSession):
         is unavailable before opening the source, and a manual preparation must
         never race the first complete world-context commit.
         """
+        if getattr(self.engine, "metadata", {}).get("project_input"):
+            self.sdk_input_session = await self.engine.player_input_session()
+            if not isinstance(self.sdk_input_session.get("input"), dict):
+                raise RenderError("CAPABILITY_UNAVAILABLE")
         capability = getattr(self.engine, "model_context_capability", None)
         if capability is None:
             capability = getattr(self.engine, "descriptor", {}).get("modelContext")
@@ -416,6 +420,11 @@ class SourceSession(InteractiveSession):
             format="h264",
             video_stream=None,
             source_video_stream=self.source_playback.stream,
+            **(
+                {"sdk_input_session": self.sdk_input_session}
+                if getattr(self, "sdk_input_session", None) is not None
+                else {}
+            ),
             **(
                 {
                     "model_output": dict(

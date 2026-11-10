@@ -8,7 +8,7 @@ import queue
 import time
 from collections import deque
 
-from .recording import json_line
+from .recording import json_line, room_event_max_bytes
 
 
 def _journal(commands, replies, directory, manifest, cpu):
@@ -55,7 +55,11 @@ class AsyncRoomJournal:
             self.failure = "JOURNAL_INVALID_METADATA"
             self.wake.set()
             return
-        if size > 65536 or self.bytes + size > 8 * 1024**2 or len(self.queue) >= 128:
+        if (
+            size > room_event_max_bytes(event)
+            or self.bytes + size > 8 * 1024**2
+            or len(self.queue) >= 128
+        ):
             self.failure = "JOURNAL_QUEUE_FULL"
             self.wake.set()
             return

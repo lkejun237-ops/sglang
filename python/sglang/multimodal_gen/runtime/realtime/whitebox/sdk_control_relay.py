@@ -7,14 +7,21 @@ Packets are neither translated into legacy input nor replayed on reconnect.
 
 import asyncio
 import re
+import time
+from collections import deque
 from urllib.parse import urlencode
 
+from .control_input_policy import (
+    CONTROL_GAMEPLAY_MAX_AGE_SECONDS,
+    CONTROL_MAX_QUEUED_MESSAGES,
+    is_gameplay_message,
+)
 from .player_transport import MAX_VIEWER_CONTROL_BYTES, ws_url
 from .render_contract import RenderError
 
 
 class SDKControlRelay:
-    def __init__(self, pipeline, subscription, client_id):
+    def __init__(self, pipeline, subscription, client_id, *, clock=None):
         if not isinstance(client_id, str) or not re.fullmatch(
             r"[A-Za-z0-9_-]{1,128}", client_id
         ):
@@ -24,10 +31,13 @@ class SDKControlRelay:
             subscription,
             client_id,
         )
-        self.queue = asyncio.Queue(maxsize=64)
+        self.queue = asyncio.Queue(maxsize=CONTROL_MAX_QUEUED_MESSAGES)
         self.queued_bytes = 0
         self.socket = self.task = None
         self.closed = False
+        self.clock = clock or time.monotonic
+        self.queued_gameplay = deque()
+        self.queue_changed = asyncio.Event()
 
     def check(self):
         p, sub = self.pipeline, self.subscription
@@ -66,8 +76,13 @@ class SDKControlRelay:
             raise RenderError("LIMIT_EXCEEDED")
         if self.socket is None:
             raise RenderError("CONTROL_UNAVAILABLE", retryable=True)
+        gameplay = is_gameplay_message(payload)
         self.queued_bytes += size
-        self.queue.put_nowait((payload, size))
+        entered = self.clock() if gameplay else None
+        self.queue.put_nowait((payload, size, entered))
+        if entered is not None:
+            self.queued_gameplay.append(entered)
+            self.queue_changed.set()
 
     def stop(self):
         self.closed = True
@@ -122,17 +137,58 @@ class SDKControlRelay:
 
             async def send():
                 while True:
-                    payload, size = await self.queue.get()
+                    payload, size, entered = await self.queue.get()
                     self.queued_bytes -= size
+                    if entered is not None:
+                        self.queued_gameplay.popleft()
+                        self.queue_changed.set()
                     self.check()
-                    await asyncio.wait_for(self.socket.send(payload), 5)
-                    await observe("to-sdk", payload)
+                    timeout = 5
+                    if entered is not None:
+                        timeout = CONTROL_GAMEPLAY_MAX_AGE_SECONDS - (
+                            self.clock() - entered
+                        )
+                        if timeout <= 0:
+                            raise RenderError("CONTROL_INPUT_EXPIRED")
+
+                    # A stalled live socket cannot deliver a retired gameplay queue
+                    # later. Closing retires its original SDK lease; no resequencing.
+                    async def dispatch():
+                        # Register pending intent before a fast SDK receipt can arrive.
+                        await observe("to-sdk", payload)
+                        self.check()
+                        await self.socket.send(payload)
+
+                    # Keep dispatch in this task: Python 3.11 wait_for can
+                    # swallow cancellation when its child just completed.
+                    async with asyncio.timeout(timeout):
+                        await dispatch()
+
+            async def expire_queued_gameplay():
+                # A preceding handshake/archive await must not hide the oldest
+                # gameplay deadline. In-flight gameplay keeps its send budget.
+                while True:
+                    self.queue_changed.clear()
+                    if not self.queued_gameplay:
+                        await self.queue_changed.wait()
+                        continue
+                    remaining = CONTROL_GAMEPLAY_MAX_AGE_SECONDS - (
+                        self.clock() - self.queued_gameplay[0]
+                    )
+                    if remaining <= 0:
+                        raise RenderError("CONTROL_INPUT_EXPIRED")
+                    try:
+                        async with asyncio.timeout(remaining):
+                            await self.queue_changed.wait()
+                    except asyncio.TimeoutError:
+                        raise RenderError("CONTROL_INPUT_EXPIRED") from None
 
             async def receive():
                 while True:
                     self.check()
                     try:
-                        payload = await asyncio.wait_for(self.socket.recv(), 1)
+                        async with asyncio.timeout(1):
+                            payload = await self.socket.recv()
                     except asyncio.TimeoutError:
                         continue
                     if (
@@ -143,7 +199,10 @@ class SDKControlRelay:
                     await observe("from-sdk", payload)
                     self.emit(payload=payload)
 
-            tasks = [asyncio.create_task(send()), asyncio.create_task(receive())]
+            tasks = [
+                asyncio.create_task(work)
+                for work in (send(), receive(), expire_queued_gameplay())
+            ]
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 task.result()
@@ -164,3 +223,4 @@ class SDKControlRelay:
             while not self.queue.empty():
                 self.queue.get_nowait()
             self.queued_bytes = 0
+            self.queued_gameplay.clear()

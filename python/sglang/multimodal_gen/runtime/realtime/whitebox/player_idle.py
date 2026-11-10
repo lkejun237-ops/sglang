@@ -57,6 +57,7 @@ class PlayerInputActivity:
         self.pending = {}
         self.held = {}
         self.waiting = None
+        self.semantic_bindings = {}
 
     def start(self, now):
         if self.last_input is None:
@@ -88,9 +89,89 @@ class PlayerInputActivity:
             self.waiting = None
             self.touch(now)  # Full reaction time, once per completed foreground wait.
 
+    def observe_semantic(self, client, direction, message, now):
+        # The World is the semantic authority. Never interpret custom game fields
+        # or count handshake/neutral traffic as user activity.
+        kind = message.get("type")
+        generation = message.get("generation")
+
+        def integer(value, minimum=0):
+            return type(value) is int and minimum <= value <= 9007199254740991
+
+        binding = (message.get("epoch"), generation)
+        if direction == "from-sdk" and kind == "input.semantic.binding":
+            if message.get("clientId") != client or not integer(generation, 1):
+                return
+            current = self.semantic_bindings.get(client)
+            if (
+                current is not None
+                and current[0] == binding[0]
+                and generation < current[1]
+            ):
+                return
+            # Room observation already fences the SDK epoch. Only its binding
+            # may replace this client's authority, including a reset to gen 1.
+            if current != binding:
+                for key in list(self.pending):
+                    if key[:2] == (client, "semantic"):
+                        del self.pending[key]
+                self.semantic_bindings[client] = binding
+                while len(self.semantic_bindings) > 256:
+                    self.semantic_bindings.pop(next(iter(self.semantic_bindings)))
+            return
+
+        if direction == "to-sdk":
+            if kind in ("input.semantic.open", "input.semantic.cancel"):
+                if (
+                    kind == "input.semantic.cancel"
+                    and self.semantic_bindings.get(client) == binding
+                ):
+                    for key in list(self.pending):
+                        if key[:2] == (client, "semantic"):
+                            del self.pending[key]
+                return
+            if kind != "input.semantic.batch" or not integer(generation, 1):
+                return
+            batch = message.get("batch")
+            if (
+                not isinstance(batch, dict)
+                or not integer(batch.get("sequence"), 1)
+                or not integer(batch.get("stateRevision"))
+            ):
+                return
+            if self.semantic_bindings.get(client) != binding:
+                return
+            key = (client, "semantic", generation, batch["sequence"])
+            self.pending.setdefault(key, (now, batch["stateRevision"], None))
+            while len(self.pending) > 256:
+                self.pending.pop(next(iter(self.pending)))
+            return
+        if (
+            kind != "input.semantic.receipt"
+            or message.get("clientId") != client
+            or not integer(generation, 1)
+            or not integer(message.get("sequence"), 1)
+            or not integer(message.get("stateRevision"))
+            or not integer(message.get("simulationTick"))
+            or type(message.get("meaningful")) is not bool
+            or binding != self.semantic_bindings.get(client)
+        ):
+            return
+        key = (client, "semantic", generation, message["sequence"])
+        pending = self.pending.get(key)
+        if pending is not None and pending[1] == message["stateRevision"]:
+            del self.pending[key]
+            if message["meaningful"]:
+                self.touch(
+                    pending[0]
+                )  # Correlated original send time, never late receipt time.
+
     def observe(self, client, direction, message, now):
         """Only a matching SDK receipt confirms browser input, not raw traffic."""
         kind = message.get("type")
+        if isinstance(kind, str) and kind.startswith("input.semantic."):
+            self.observe_semantic(client, direction, message, now)
+            return
         if direction == "to-sdk":
             if kind == "input.state":
                 value = message.get("input")

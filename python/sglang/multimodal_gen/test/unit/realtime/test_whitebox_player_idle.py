@@ -25,6 +25,12 @@ def receipt(sequence, client="a"):
     return dict(type="input.receipt", clientSequence=sequence, clientId=client)
 
 
+def semantic_binding(generation=1, client="a", **fields):
+    return dict(
+        type="input.semantic.binding", clientId=client, generation=generation, **fields
+    )
+
+
 def test_input_before_first_frame_cannot_arm_or_backdate_idle_timer():
     activity = PlayerInputActivity()
     activity.touch(10)  # Legacy input path.
@@ -379,3 +385,236 @@ def test_idle_deadline_is_inclusive_without_elapsed_subtraction_rounding():
     deadline = activity.last_input + 60
     assert not activity.is_expired(math.nextafter(deadline, -math.inf), 60)
     assert activity.is_expired(deadline, 60)
+
+
+def test_semantic_activity_requires_matching_committed_receipt_and_original_send_time():
+    activity = PlayerInputActivity()
+    activity.start(0)
+    activity.observe("a", "from-sdk", semantic_binding(), 0)
+
+    def batch(sequence, generation=1):
+        return dict(
+            type="input.semantic.batch",
+            generation=generation,
+            batch=dict(
+                sequence=sequence, stateRevision=1, state={"custom": 0.5}, events=[]
+            ),
+        )
+
+    def consumed(sequence, meaningful=True, generation=1, **extra):
+        return dict(
+            type="input.semantic.receipt",
+            clientId="a",
+            generation=generation,
+            sequence=sequence,
+            stateRevision=1,
+            simulationTick=sequence,
+            meaningful=meaningful,
+            **extra,
+        )
+
+    for sequence in range(1, 90):
+        activity.observe("a", "to-sdk", batch(sequence), sequence)
+        activity.observe("a", "from-sdk", consumed(sequence), sequence + 0.1)
+    assert activity.last_input == 89
+    activity.observe("a", "to-sdk", batch(90), 90)
+    activity.observe("a", "from-sdk", consumed(90, False), 91)
+    assert activity.last_input == 89
+    activity.observe("a", "to-sdk", batch(91), 91)
+    activity.observe("a", "from-sdk", consumed(91), 140)
+    assert activity.last_input == 91
+    assert activity.is_expired(151, 60)
+    activity.observe("a", "from-sdk", consumed(91), 152)
+    assert activity.last_input == 91
+
+
+def test_semantic_handshake_old_generation_wrong_client_and_unknown_receipts_do_not_renew():
+    activity = PlayerInputActivity()
+    activity.start(0)
+    batch = dict(
+        type="input.semantic.batch",
+        generation=1,
+        batch=dict(sequence=1, stateRevision=3),
+    )
+    activity.observe("a", "to-sdk", batch, 20)
+    activity.observe("a", "from-sdk", dict(type="input.semantic.available"), 21)
+    assert activity.last_input == 0
+    for packet in [
+        dict(type="input.semantic.open"),
+        dict(type="input.semantic.applied", generation=2),
+    ]:
+        activity.observe("a", "to-sdk", packet, 30)
+    receipt = dict(
+        type="input.semantic.receipt",
+        clientId="a",
+        generation=1,
+        sequence=1,
+        stateRevision=3,
+        simulationTick=4,
+        meaningful=True,
+    )
+    activity.observe("a", "from-sdk", receipt, 31)
+    assert activity.last_input == 0
+    activity.observe("a", "from-sdk", semantic_binding(2), 39)
+    activity.observe("a", "to-sdk", {**batch, "generation": 2}, 40)
+    activity.observe("b", "from-sdk", {**receipt, "generation": 2}, 41)
+    activity.observe(
+        "a", "from-sdk", {**receipt, "generation": 2, "stateRevision": 4}, 41
+    )
+    assert activity.last_input == 0
+
+
+def test_native_archive_retains_all_semantic_envelopes_without_claiming_execution():
+    from types import SimpleNamespace as NS
+
+    async def run():
+        records = []
+
+        async def event(*args):
+            records.append(args)
+
+        entry = dict(
+            identity={},
+            game_id="g",
+            engine=NS(descriptor={"sessionId": "sdk", "epoch": 2}),
+        )
+        runtime = NS(
+            player=lambda *args, **kwargs: entry,
+            rooms={"g": {"log": NS(event=event, manifest={})}},
+        )
+        kinds = [("to-sdk", k) for k in ("open", "applied", "batch", "cancel")]
+        kinds += [("from-sdk", k) for k in ("binding", "receipt", "error", "available")]
+        for direction, kind in kinds:
+            wire = dict(type="input.semantic." + kind, epoch=2, generation=3)
+            await RoomRuntime.observe_player_control(
+                runtime, "s", "a", direction, json.dumps(wire)
+            )
+        assert len(records) == 8
+        assert [r[2]["message"]["type"] for r in records] == [
+            "input.semantic." + k for _, k in kinds
+        ]
+        assert all(
+            r[1] in ("viewer_input_observed", "viewer_input_receipt") for r in records
+        )
+        await RoomRuntime.observe_player_control(
+            runtime,
+            "s",
+            "a",
+            "from-sdk",
+            json.dumps(dict(type="input.semantic.receipt", epoch=1)),
+        )
+        assert len(records) == 8
+
+    asyncio.run(run())
+
+
+def test_semantic_reopen_allows_a_fresh_producer_generation_after_sdk_epoch_reset():
+    activity = PlayerInputActivity()
+    activity.start(0)
+
+    def batch(generation, epoch):
+        return dict(
+            type="input.semantic.batch",
+            epoch=epoch,
+            generation=generation,
+            batch=dict(sequence=1, stateRevision=0),
+        )
+
+    activity.observe("a", "from-sdk", semantic_binding(9, epoch=0), 1)
+    activity.observe("a", "to-sdk", batch(9, 0), 10)
+    activity.observe("a", "to-sdk", dict(type="input.semantic.open"), 11)
+    activity.observe("a", "from-sdk", semantic_binding(1, epoch=1), 12)
+    activity.observe("a", "to-sdk", batch(1, 1), 20)
+    activity.observe(
+        "a",
+        "from-sdk",
+        dict(
+            type="input.semantic.receipt",
+            epoch=1,
+            clientId="a",
+            generation=1,
+            sequence=1,
+            stateRevision=0,
+            simulationTick=3,
+            meaningful=True,
+        ),
+        21,
+    )
+    assert activity.last_input == 20
+
+
+def test_unconfirmed_semantic_messages_cannot_poison_the_current_sdk_binding():
+    activity = PlayerInputActivity()
+    activity.start(100)
+    activity.observe("a", "from-sdk", semantic_binding(epoch=3), 100)
+    batch = dict(
+        type="input.semantic.batch",
+        epoch=3,
+        generation=1,
+        batch=dict(sequence=1, stateRevision=1),
+    )
+    activity.observe("a", "to-sdk", {**batch, "generation": 2}, 101)
+    activity.observe("a", "to-sdk", dict(type="input.semantic.open"), 102)
+    activity.observe("a", "from-sdk", semantic_binding(2, client="other", epoch=3), 102)
+    activity.observe("a", "to-sdk", semantic_binding(2, epoch=3), 102)
+    activity.observe("a", "to-sdk", batch, 103)
+    activity.observe(
+        "a", "to-sdk", dict(type="input.semantic.cancel", epoch=3, generation=2), 103.01
+    )
+    consumed = dict(
+        type="input.semantic.receipt",
+        epoch=3,
+        clientId="a",
+        generation=1,
+        sequence=1,
+        stateRevision=1,
+        simulationTick=1,
+        meaningful=True,
+    )
+    activity.observe("a", "from-sdk", consumed, 103.1)
+    assert activity.last_input == 103
+    assert not activity.is_expired(162, 60)
+
+
+def test_duplicate_sdk_binding_preserves_pending_receipts_but_a_new_epoch_retires_them():
+    activity = PlayerInputActivity()
+    activity.start(0)
+    batch = dict(
+        type="input.semantic.batch",
+        epoch=1,
+        generation=1,
+        batch=dict(sequence=1, stateRevision=1),
+    )
+    consumed = dict(
+        type="input.semantic.receipt",
+        epoch=1,
+        clientId="a",
+        generation=1,
+        sequence=1,
+        stateRevision=1,
+        simulationTick=1,
+        meaningful=True,
+    )
+    activity.observe("a", "from-sdk", semantic_binding(epoch=1), 1)
+    activity.observe("a", "to-sdk", batch, 10)
+    activity.observe("a", "from-sdk", semantic_binding(epoch=1), 11)
+    activity.observe("a", "from-sdk", consumed, 12)
+    assert activity.last_input == 10
+    activity.observe(
+        "a", "to-sdk", {**batch, "batch": dict(sequence=2, stateRevision=2)}, 15
+    )
+    activity.observe("a", "from-sdk", semantic_binding(epoch=2), 16)
+    activity.observe(
+        "a", "from-sdk", {**consumed, "sequence": 2, "stateRevision": 2}, 17
+    )
+    assert activity.last_input == 10
+    activity.observe("a", "to-sdk", {**batch, "epoch": 2}, 20)
+    activity.observe("a", "from-sdk", consumed, 21)
+    assert activity.last_input == 10
+    activity.observe("a", "from-sdk", {**consumed, "epoch": 2}, 22)
+    assert activity.last_input == 20
+    activity.observe("a", "from-sdk", semantic_binding(2, epoch=2), 23)
+    activity.observe("a", "from-sdk", semantic_binding(1, epoch=2), 24)
+    activity.observe("a", "to-sdk", {**batch, "epoch": 2, "generation": 2}, 30)
+    activity.observe("a", "from-sdk", {**consumed, "epoch": 2, "generation": 2}, 31)
+    assert activity.last_input == 30

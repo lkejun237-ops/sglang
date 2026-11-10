@@ -10,6 +10,7 @@ import copy
 import hmac
 import os
 import re
+from collections import deque
 from dataclasses import dataclass
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
@@ -17,6 +18,11 @@ import httpx
 from fastapi import Header, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
 
+from .control_input_policy import (
+    CONTROL_GAMEPLAY_MAX_AGE_SECONDS,
+    CONTROL_MAX_QUEUED_MESSAGES,
+    is_gameplay_message,
+)
 from .native_pixels import MAX_HEADER, MAX_PIXELS
 from .room_control import frozen_publication_identity
 from .rooms import checked_id, checked_session_id, require_internal_token
@@ -141,26 +147,98 @@ def ws_url(base, path, params=""):
 
 async def relay(socket, upstream, *, live=None, channel="control", observe=None):
     maximum = MAX_VIEWER_CONTROL_BYTES if channel == "control" else MAX_WIRE_BYTES
+    loop = asyncio.get_running_loop()
+
+    async def read():
+        message = await socket.receive()
+        entered = loop.time()
+        if message["type"] == "websocket.disconnect":
+            return None
+        if live:
+            live()
+        payload = message.get("bytes")
+        if payload is None:
+            payload = message.get("text")
+        if not isinstance(payload, (str, bytes)):
+            raise ValueError("Invalid SDK transport message")
+        size = len(payload.encode() if isinstance(payload, str) else payload)
+        if size > maximum:
+            raise ValueError("Invalid SDK transport message")
+        return payload, size, entered
 
     async def to_sdk():
-        while True:
-            message = await socket.receive()
-            if message["type"] == "websocket.disconnect":
-                return
-            if live:
-                live()
-            payload = message.get("bytes")
-            if payload is None:
-                payload = message.get("text")
-            if (
-                not isinstance(payload, (str, bytes))
-                or len(payload.encode() if isinstance(payload, str) else payload)
-                > maximum
-            ):
-                raise ValueError("Invalid SDK transport message")
+        while (message := await read()) is not None:
+            payload = message[0]
             await upstream.send(payload)
             if observe and isinstance(payload, str):
                 await observe("to-sdk", payload)
+
+    # Read control ingress independently of handshake writes and archival work.
+    # Otherwise a batch waiting behind an applied ACK would acquire a fresh
+    # send deadline only after that stale ACK finally starts the SDK lease.
+    queue = asyncio.Queue(maxsize=CONTROL_MAX_QUEUED_MESSAGES)
+    gameplay = deque()
+    changed = asyncio.Event()
+    queued_bytes = 0
+
+    async def read_control():
+        nonlocal queued_bytes
+        while (message := await read()) is not None:
+            payload, size, entered = message
+            if queue.full() or queued_bytes + size > maximum:
+                raise ValueError("The SDK control queue exceeds its budget")
+            stamp = entered if is_gameplay_message(payload) else None
+            queued_bytes += size
+            queue.put_nowait((payload, size, stamp))
+            if stamp is not None:
+                gameplay.append(stamp)
+                changed.set()
+
+    async def send_control():
+        nonlocal queued_bytes
+        while True:
+            payload, size, entered = await queue.get()
+            queued_bytes -= size
+            if entered is not None:
+                gameplay.popleft()
+                changed.set()
+            if live:
+                live()
+
+            async def dispatch():
+                # Reserve receipt correlation before the peer can consume input.
+                # Observation alone never counts as gameplay activity.
+                if observe and isinstance(payload, str):
+                    await observe("to-sdk", payload)
+                if live:
+                    live()
+                await upstream.send(payload)
+
+            if entered is None:
+                await dispatch()
+            else:
+                remaining = CONTROL_GAMEPLAY_MAX_AGE_SECONDS - (loop.time() - entered)
+                if remaining <= 0:
+                    raise asyncio.TimeoutError("The SDK input expired in transit")
+                # Keep dispatch in this task so cancellation cannot race a
+                # completed wait_for child and strand relay teardown on 3.11.
+                async with asyncio.timeout(remaining):
+                    await dispatch()
+
+    async def expire_control():
+        while True:
+            changed.clear()
+            if not gameplay:
+                await changed.wait()
+                continue
+            remaining = CONTROL_GAMEPLAY_MAX_AGE_SECONDS - (loop.time() - gameplay[0])
+            if remaining <= 0:
+                raise asyncio.TimeoutError("The SDK input expired in transit")
+            try:
+                async with asyncio.timeout(remaining):
+                    await changed.wait()
+            except asyncio.TimeoutError:
+                raise asyncio.TimeoutError("The SDK input expired in transit") from None
 
     async def from_sdk():
         async for message in upstream:
@@ -173,7 +251,12 @@ async def relay(socket, upstream, *, live=None, channel="control", observe=None)
             else:
                 await socket.send_text(message)
 
-    tasks = [asyncio.create_task(to_sdk()), asyncio.create_task(from_sdk())]
+    outbound = (
+        (read_control(), send_control(), expire_control())
+        if channel == "control"
+        else (to_sdk(),)
+    )
+    tasks = [asyncio.create_task(work) for work in (*outbound, from_sdk())]
     try:
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
@@ -200,6 +283,51 @@ async def get_bytes(client, url, *, headers, maximum):
         )
 
 
+def input_asset_path(asset):
+    if (
+        not isinstance(asset, str)
+        or len(asset) > 256
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", asset)
+        or any(part in {"", ".", ".."} for part in asset.split("/"))
+    ):
+        raise ValueError("The player input resource is unavailable")
+    return asset
+
+
+def publish_input_session(session, public_origin):
+    """Project an existing scoped SDK grant; never publish the CLI admin token."""
+    public_origin = origin(public_origin)
+    private = origin(session["baseUrl"])
+    prefix = public_origin + "/v1/sessions/" + checked_session_id(session["sessionId"])
+    value = copy.deepcopy(session)
+    if (
+        session.get("input", {}).get("baseUrl")
+        != private + f"/v1/sessions/{session['sessionId']}/"
+    ):
+        raise ValueError("The player input resources have changed")
+    value["baseUrl"] = public_origin
+    value["input"]["baseUrl"] = prefix + "/"
+    # This descriptor owns only SDK control/UI/input resources. Whitebox's
+    # existing audio transport remains the owner, including private resource URLs.
+    value.pop("audio", None)
+
+    def rewrite(resource):
+        url = urlsplit(resource)
+        if (
+            url.scheme + "://" + url.netloc != private
+            or url.query
+            or url.fragment
+            or not url.path.startswith("/ui/" + session["uiBundleHash"] + "/")
+        ):
+            raise ValueError("The player UI resources have changed")
+        return prefix + url.path
+
+    value["ui"]["moduleUrl"] = rewrite(value["ui"]["moduleUrl"])
+    for style in value["ui"].get("styles", []):
+        style["url"] = rewrite(style["url"])
+    return value
+
+
 class PlayerTransport:
     def __init__(self, runtime, config):
         self.runtime, self.config = runtime, config
@@ -211,9 +339,9 @@ class PlayerTransport:
         if descriptor is None:
             descriptor = getattr(entry["engine"], "descriptor", None)
         if (
-            not admission
-            or admission.get("status") != "claimed"
-            or admission.get("leaving")
+            (not admission and not entry.get("source_input"))
+            or admission is not None
+            and (admission.get("status") != "claimed" or admission.get("leaving"))
             or not descriptor
             or descriptor.get("sessionId") != checked_session_id(session_id)
             or descriptor.get("accessMode") != "capability"
@@ -348,7 +476,9 @@ def install_player_runtime(app, token, runtime, *, config=None, client=None):
                 request.headers.get("x-worldkit-viewer-capability", ""),
             )
             config.require_member_origin(request.headers.get("origin"), entry)
-            session = await transport.public_session(entry["control_admission"])
+            session = await transport.public_session(
+                entry.get("control_admission") or {"stream_id": stream_id}
+            )
             return JSONResponse(
                 {**session, "status": "running"},
                 headers={"Cache-Control": "private, no-store"},
@@ -405,6 +535,54 @@ def install_player_runtime(app, token, runtime, *, config=None, client=None):
                             "X-Content-Type-Options": "nosniff",
                         },
                     )
+
+            if client is not None:
+                return await read(client)
+            async with httpx.AsyncClient(timeout=15, trust_env=False) as upstream:
+                return await read(upstream)
+        except (ValueError, KeyError, httpx.HTTPError):
+            raise HTTPException(404, "The player resource is unavailable") from None
+
+    @app.get(
+        "/internal/player-streams/{stream_id}/{session_id}/player-input/{asset:path}"
+    )
+    async def input_resource(
+        stream_id: str,
+        session_id: str,
+        asset: str,
+        request: Request,
+        authorization: str = Header(default=""),
+    ):
+        require_internal_token(token, authorization)
+        allowed(request)
+        try:
+            asset = input_asset_path(asset)
+            capability = request.headers.get("x-worldkit-viewer-capability", "")
+            entry, descriptor = transport.viewer(stream_id, session_id, capability)
+            config.require_member_origin(request.headers.get("origin"), entry)
+            if not isinstance(descriptor.get("input"), dict):
+                raise ValueError()
+            epoch = descriptor["epoch"]
+
+            async def read(upstream):
+                content_type, content = await get_bytes(
+                    upstream,
+                    descriptor["baseUrl"].rstrip("/")
+                    + f"/v1/sessions/{session_id}/player-input/{asset}",
+                    maximum=MAX_UI_BYTES,
+                    headers={"Authorization": "Bearer " + capability},
+                )
+                current, live = transport.viewer(stream_id, session_id, capability)
+                if current is not entry or live.get("epoch") != epoch:
+                    raise ValueError()
+                return Response(
+                    content,
+                    headers={
+                        "content-type": content_type,
+                        "Cache-Control": "private, no-store",
+                        "X-Content-Type-Options": "nosniff",
+                    },
+                )
 
             if client is not None:
                 return await read(client)
@@ -552,6 +730,46 @@ def install_player_gateway(app, proxy, *, config=None):
             )
         except (ValueError, KeyError, httpx.HTTPError):
             raise HTTPException(404, "The player is unavailable") from None
+
+    @app.options("/v1/sessions/{session_id}/player-input/{asset:path}")
+    async def input_preflight(session_id: str, asset: str, request: Request):
+        return await preflight(session_id, request)
+
+    @app.get("/v1/sessions/{session_id}/player-input/{asset:path}")
+    async def input_resource(session_id: str, asset: str, request: Request):
+        allowed(request)
+        authorization = request.headers.get("authorization", "")
+        if not re.fullmatch(r"Bearer [a-f0-9]{48}", authorization):
+            raise HTTPException(403, "The player request is unavailable")
+        try:
+            asset = input_asset_path(asset)
+            binding, base = await route(session_id)
+            content_type, content = await get_bytes(
+                proxy.client,
+                base
+                + f"/internal/player-streams/{binding['stream_id']}/{session_id}/player-input/{asset}",
+                maximum=MAX_UI_BYTES,
+                headers={
+                    "Authorization": "Bearer " + proxy.token,
+                    "Origin": request.headers.get("origin"),
+                    "X-Worldkit-Viewer-Capability": authorization[7:],
+                },
+            )
+            current, _ = await route(session_id)
+            if current != binding:
+                raise ValueError()
+            return Response(
+                content,
+                headers={
+                    "content-type": content_type,
+                    "access-control-allow-origin": request.headers.get("origin"),
+                    "Vary": "Origin",
+                    "Cache-Control": "private, no-store",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+        except (ValueError, KeyError, httpx.HTTPError):
+            raise HTTPException(404, "The player resource is unavailable") from None
 
     @app.get("/v1/sessions/{session_id}/ui/{ui_hash}/{asset:path}")
     async def ui(session_id: str, ui_hash: str, asset: str, request: Request):

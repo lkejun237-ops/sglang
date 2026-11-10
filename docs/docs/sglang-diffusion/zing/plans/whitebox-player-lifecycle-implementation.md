@@ -6,6 +6,15 @@ this document is a measured production result.
 
 ## Ownership and deadlines
 
+Custom-input recovery retains `input.semantic.available` alongside the binding,
+receipt and error envelopes in the existing native input archive. This SDK hint
+announces that a dedicated source has finished resuming capture admission; it
+does not renew gameplay activity or restore old input. The SDK control relay
+forwards it unchanged. Only an original send correlated with a meaningful
+committed receipt renews the player's gameplay activity; neutral recovery
+receipts still do not count as activity. SDK input lease recovery and model/player
+TTL remain independent.
+
 `WHITEBOX_BOUND_COMPUTE=1` uses one parent model connection per player. A managed
 assignment contains immutable `admitted_at` and `player_expires_at` Unix timestamps.
 `WHITEBOX_PLAYER_SESSION_TTL_SECONDS` is rendered from regional `play_seconds`:

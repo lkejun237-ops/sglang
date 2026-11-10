@@ -82,6 +82,9 @@ class LocalRoomEngine:
     async def finish(self):
         await self.note("finish", {})
 
+    async def player_input_session(self):
+        return await self.runtime.player_input_session(self.stream_id)
+
     async def ui_asset(self, path):
         return await self.runtime.ui_asset(self.stream_id, path)
 

@@ -19,6 +19,20 @@ from .metrics import stage
 logger = logging.getLogger(__name__)
 
 
+def room_event_max_bytes(event):
+    # SDK batches allow 64 KiB and binding declarations 128 KiB, before their
+    # transport and Room envelopes. Keep ordinary event and total queue budgets.
+    payload = event.get("payload")
+    message = payload.get("message") if isinstance(payload, dict) else None
+    if (
+        event.get("kind") in ("viewer_input_observed", "viewer_input_receipt")
+        and isinstance(message, dict)
+        and message.get("type") in ("input.semantic.batch", "input.semantic.binding")
+    ):
+        return 256 * 1024
+    return 64 * 1024
+
+
 def json_line(value: Any) -> str:
     return (
         json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))

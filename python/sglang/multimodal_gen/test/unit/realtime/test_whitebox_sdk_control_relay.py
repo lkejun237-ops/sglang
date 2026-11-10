@@ -168,3 +168,180 @@ def test_real_sdk_socket_preserves_input_lease_packet_and_member_credentials():
             assert relay.closed and relay.socket.close_code is not None
 
     asyncio.run(run())
+
+
+def test_sdk_tunnel_expires_gameplay_behind_a_live_stalled_socket_without_replaying():
+    async def run():
+        pipeline, sub, packets = fixture()
+        now = [0.0]
+        relay = SDKControlRelay(pipeline, sub, "client-a", clock=lambda: now[0])
+        incoming, sent = asyncio.Queue(), []
+        gate = asyncio.Event()
+
+        async def send(payload):
+            if payload == "{}":
+                await gate.wait()
+            sent.append(payload)
+
+        async def close():
+            pass
+
+        async def connect(*args, **kwargs):
+            return SimpleNamespace(send=send, recv=incoming.get, close=close)
+
+        relay.task = asyncio.create_task(relay.run(connect=connect))
+        await until(lambda: bool(packets))
+        relay.enqueue("{}")
+        await asyncio.sleep(0)
+        stale = '{"type":"input.semantic.batch","epoch":1,"generation":2,"batch":{"sequence":1}}'
+        relay.enqueue(stale)
+        now[0] = 0.201
+        gate.set()
+        await relay.task
+        assert sent == ["{}"]
+        assert relay.closed and relay.queued_bytes == 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "blocked,gameplay", [("send", True), ("archive", True), ("send", False)]
+)
+def test_sdk_tunnel_retires_queued_gameplay_without_releasing_blocked_handshake(
+    blocked, gameplay
+):
+    async def run():
+        pipeline, sub, packets = fixture()
+        relay = SDKControlRelay(pipeline, sub, "client-a")
+        started, release, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        incoming, sent = asyncio.Queue(), []
+
+        async def block():
+            started.set()
+            await release.wait()
+
+        async def send(payload):
+            if blocked == "send":
+                await block()
+            sent.append(payload)
+
+        async def observe(*_):
+            if blocked == "archive":
+                await block()
+
+        async def close():
+            closed.set()
+
+        async def connect(*_, **__):
+            return SimpleNamespace(send=send, recv=incoming.get, close=close)
+
+        pipeline.member_source.runtime.observe_player_control = observe
+        relay.task = asyncio.create_task(relay.run(connect=connect))
+        try:
+            await until(lambda: bool(packets))
+            relay.enqueue('{"type":"input.semantic.applied"}')
+            await asyncio.wait_for(started.wait(), 1)
+            batch = '{"type":"input.semantic.batch","generation":1,"batch":{"sequence":1,"stateRevision":1}}'
+            if gameplay:
+                relay.enqueue(batch)
+                await asyncio.wait_for(asyncio.shield(relay.task), 1)
+                assert closed.is_set() and relay.closed
+                assert not release.is_set() and batch not in sent
+                assert relay.queue.empty() and relay.queued_bytes == 0
+            else:
+                await asyncio.sleep(0.25)
+                assert not relay.closed and not closed.is_set()
+                release.set()
+                await until(lambda: bool(sent))
+        finally:
+            relay.stop()
+            await asyncio.wait_for(
+                asyncio.gather(relay.task, return_exceptions=True), 1
+            )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("send_fails", [False, True])
+def test_sdk_tunnel_correlates_fast_receipts_but_failed_sends_are_not_activity(
+    send_fails,
+):
+    import json
+
+    from sglang.multimodal_gen.runtime.realtime.whitebox.player_idle import (
+        PlayerInputActivity,
+    )
+
+    async def run():
+        pipeline, sub, packets = fixture()
+        activity = PlayerInputActivity()
+        activity.start(0)
+        activity.observe(
+            "client-a",
+            "from-sdk",
+            dict(type="input.semantic.binding", clientId="client-a", generation=1),
+            0,
+        )
+        incoming, forwarded = asyncio.Queue(), asyncio.Event()
+
+        async def observe(stream, client, direction, payload):
+            activity.observe(client, direction, json.loads(payload), 10)
+
+        pipeline.member_source.runtime.observe_player_control = observe
+
+        def offer(packet):
+            packets.append(packet)
+            if packet.get("payload"):
+                forwarded.set()
+
+        sub.offer_control = offer
+
+        async def send(payload):
+            if send_fails:
+                raise ConnectionError("fixture send failed")
+            incoming.put_nowait(
+                json.dumps(
+                    dict(
+                        type="input.semantic.receipt",
+                        clientId="client-a",
+                        generation=1,
+                        sequence=1,
+                        stateRevision=1,
+                        simulationTick=1,
+                        meaningful=True,
+                    )
+                )
+            )
+            await forwarded.wait()
+
+        async def close():
+            pass
+
+        async def connect(*args, **kwargs):
+            return SimpleNamespace(send=send, recv=incoming.get, close=close)
+
+        relay = SDKControlRelay(pipeline, sub, "client-a")
+        relay.task = asyncio.create_task(relay.run(connect=connect))
+        try:
+            await until(lambda: bool(packets))
+            relay.enqueue(
+                json.dumps(
+                    dict(
+                        type="input.semantic.batch",
+                        generation=1,
+                        batch=dict(sequence=1, stateRevision=1),
+                    )
+                )
+            )
+            if send_fails:
+                await asyncio.wait_for(relay.task, 1)
+                assert activity.last_input == 0
+            else:
+                await asyncio.wait_for(forwarded.wait(), 1)
+                assert activity.last_input == 10
+                assert not activity.pending
+        finally:
+            relay.stop()
+            await asyncio.gather(relay.task, return_exceptions=True)
+
+    asyncio.run(run())
