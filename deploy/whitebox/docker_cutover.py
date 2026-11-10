@@ -163,6 +163,7 @@ print(json.dumps(r))"""
             )
         )
         self.cli("cp", str(probe), container + ":" + base + "/probe.py")
+        self.cli("exec", "--user", "0", container, "chmod", "0444", base + "/probe.py")
         self.cli(
             "exec",
             "--user",
