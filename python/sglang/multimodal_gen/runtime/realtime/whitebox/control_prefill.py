@@ -492,21 +492,51 @@ class ControlPrefill:
                 references=references,
                 source_frame=geometry.pad_rgb(first[1][0].rgb),
                 persist=True,
+                record_model_inputs=True,
             )
             await self.receipt(dict(type="prefill.computing", request_id=request_id))
             for attempt in range(3):
                 remaining()
-                child = self.owner.model_binding.borrow(
-                    dict(model_session_id=uuid4().hex, generation_id=uuid4().hex),
-                    kind="prefill",
+                child_identity = dict(
+                    model_session_id=uuid4().hex, generation_id=uuid4().hex
                 )
+                child = self.owner.model_binding.borrow(child_identity, kind="prefill")
                 try:
                     async with child.open() as (ws, assignment):
-                        await ws.send(msgspec.msgpack.encode(init))
-                        timeout = remaining()
-                        message = msgspec.msgpack.decode(
-                            await asyncio.wait_for(ws.recv(), timeout)
+                        from .model_inputs import ModelInputCapture
+
+                        recording = getattr(self.owner, "recording", None)
+                        capture = (
+                            ModelInputCapture(
+                                recording,
+                                child_identity["model_session_id"],
+                                child_identity["generation_id"],
+                            )
+                            if recording is not None
+                            else None
                         )
+                        init["record_model_inputs"] = capture is not None
+                        if capture is not None:
+                            capture.sent(init)
+                        try:
+                            await ws.send(msgspec.msgpack.encode(init))
+                            # One accepted-input receipt may precede the result.
+                            # Use a single deadline; receipts cannot extend compute time.
+                            deadline = time.monotonic() + remaining()
+                            while True:
+                                timeout = deadline - time.monotonic()
+                                if timeout <= 0:
+                                    raise asyncio.TimeoutError()
+                                message = msgspec.msgpack.decode(
+                                    await asyncio.wait_for(ws.recv(), timeout)
+                                )
+                                if capture is not None:
+                                    capture.received(message)
+                                if message.get("type") != "model.input":
+                                    break
+                        finally:
+                            if capture is not None:
+                                capture.close()
                         if (
                             message.get("type") != "prefill.memory_ready"
                             or message.get("request_id") != request_id

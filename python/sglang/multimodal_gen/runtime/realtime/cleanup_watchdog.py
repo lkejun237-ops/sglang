@@ -44,6 +44,14 @@ class CleanupWatchdog:
         self.process = None
 
     def __enter__(self):
+        if os.getpid() == 1:
+            # A child in the same PID namespace cannot SIGKILL its init.
+            # Native role entrypoints use run_worker; fail closed if a custom
+            # launcher bypassed it rather than enter unbounded CUDA cleanup.
+            try:
+                os.write(2, b"Worker cleanup requires a supervised non-PID-1 worker.\n")
+            finally:
+                os._exit(70)
         self.deadline = time.monotonic() + self.timeout
         try:
             self.process = subprocess.Popen(
@@ -68,7 +76,12 @@ class CleanupWatchdog:
         except (BrokenPipeError, OSError):
             pass
         finally:
-            process.stdin.close()
+            # Buffered close can flush again after an earlier EPIPE. Preserve
+            # the original cleanup exception/deadline instead of masking it.
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
         if completed:
             # CUDA resources have already been released. Reap the lightweight
             # watcher without adding an unbounded wait to cleanup itself.

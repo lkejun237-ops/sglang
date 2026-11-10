@@ -1,0 +1,212 @@
+---
+title: "Adaptive source selection in Whitebox"
+description: "Feed a model segment without an added sampling timer; prefer even capture spacing only when input is sufficient."
+---
+
+This is an opt-in Room implementation, developed from `white_box@b82f4f018e`.
+The cadence-admission and bounded-PI implementation was deployed to the Shanghai
+test copy at `412589f5` with SDK `4c10ad26`. One 832×480 server-side session ran
+for 190 seconds after its first model packet, including two text-only condition
+updates and confirmed release. This is not browser/WebRTC acceptance or a
+controlled performance comparison. Long-session texture/geometry degradation
+was observed; image quality is not marked as passed. See the
+[deployment recipe](/docs/sglang-diffusion/zing/deployment_zing_h3) for evidence and
+unverified configurations. The current PR additionally inherits main's later
+#670 changes; that combined base has not been redeployed.
+
+## Scope and configuration
+
+Use `WHITEBOX_MODEL_SOURCE_SAMPLING=adaptive` on a Room with
+`WHITEBOX_RENDER_SEGMENTS=1`. The default is `latest`, including historical
+bundles without the new variable. Non-segmented legacy paths keep their existing
+latest-frame behavior. Enabling the policy does not change CLI FPS, model FPS,
+model weights, resolution, encoding, the SDK world clock or Slot ownership.
+
+For a future reviewed release, the existing policy compiler accepts this overlay:
+
+```json
+{
+  "media": {"cli_fps": 60},
+  "environment": {
+    "room": {"WHITEBOX_MODEL_SOURCE_SAMPLING": "adaptive"}
+  }
+}
+```
+
+60 FPS is a requested capture ceiling. The source may deliver fewer real frames.
+No live configuration or default capture rate is changed by this implementation.
+Publication still requires the complete frozen release bundle and normal release
+procedure; setting one environment variable does not bypass bundle validation.
+
+## Selection policy
+
+The source owner already retains a byte-bounded `SourceFrames` history for start
+boundaries and Prefill. Each model segment borrows at most its eight newest
+entries for one synchronous decision. The sampler keeps no RGB pool or task.
+Source preview and complete-source recording continue independently.
+
+The existing pair, encoder-credit and output-window gates remain authoritative.
+After they permit a source send, the selector follows these rules:
+
+1. Preserve the exact pinned F0 and the first capture satisfying a trusted context
+   boundary. During initial output warmup, use the ordinary latest capture.
+2. Prefer latest during a pending condition change or changed input evidence.
+   A persistent observed-input receipt is not a new control on every capture.
+   Unverified effective input still requires the latest pixels, but does not
+   bypass cadence admission indefinitely. Input messages and Prompt controls
+   continue on their existing independent path.
+3. If `sent - received` is below the existing minimum model-input window, supply
+   the short usable tail in capture order. Do not discard several usable real
+   captures in favor of one latest frame while the model needs input.
+4. With sufficient outstanding input and a healthy cadence estimate, defer an
+   ordinary capture whose timestamp precedes the next sampling opportunity.
+   Wait for a real capture, model progress or source stop, outside the source-send
+   lock. A new control may advance one opportunity; later updates coalesce until
+   that opportunity instead of creating an unlimited burst. Initial output,
+   condition boundaries, EOS and an input window below its floor bypass this gate.
+5. For an admitted capture, prefer a capture closest to the next
+   expected capture time. Candidate versions must exceed the consumed selection
+   cursor, have matching input evidence, and be no more than 100 ms old both in
+   Room observation time and relative to the newest capture timestamp. Ties
+   favor freshness. Large phase errors re-anchor to latest.
+6. With no eligible older candidate, select the admitted latest capture. After
+   prolonged backpressure, re-anchor to current capture time instead of catching
+   up missed opportunities in a burst. Never duplicate or predict a source frame.
+
+The minimum-input floor is the existing negotiated/profile-dependent pipeline
+requirement, not a newly assumed batch size. `sent - received` counts work not yet
+returned as model output; encoder consumption alone can release source storage
+before that work finishes and is not a reliable measure of available model work.
+
+## Cadence estimation and clocks
+
+Estimate cadence from validated raw model-output completions over windows of at
+least 500 ms. Exclude windows where input fell below the minimum-input floor
+while waiting for new source captures, or the completing batch had insufficient
+outstanding input. A normal completion/refill dip with captures already available
+does not count as starvation. A temporarily slow CLI must not become a permanent
+lower model rate. Ignore duplicate completion counters, abandon observation gaps over
+two seconds, and smooth healthy observations with an EWMA (80% prior, 20% new).
+This is an observed pipeline-completion cadence, not an independent GPU-capacity
+benchmark. It drives both ordinary admission and selection among existing captures.
+There is no fixed 24 FPS cap. Low-water input and healthy completion observations
+allow the policy to respond to demand; a source shortage is not filled with copies.
+
+The original capture timestamp, source identity, UI state and input evidence stay
+with the selected RGB. The native model's indexed `spec.pts(local)` protocol clock
+is unchanged. Prompt resume floors and timestamp discontinuities reset sampling
+history. Each new segment has its own estimator; different players do not share
+cursors, input state or sampling history.
+
+## Interaction, cancellation and limits
+
+Keyboard input continues through the existing immediate input path. An eligible
+Prompt update can reach the worker while no new capture is arriving; a request
+that explicitly targets a future source/context boundary still waits for that
+boundary under the original protocol. The sampler never changes its meaning to
+make a control request appear faster.
+
+Source stop/cancel retains the existing fence. EOS follows the existing latest
+tail behavior rather than replaying a backlog of historical captures. Parent Slot,
+child segment and shared CLI cleanup responsibilities do not change.
+
+There is no new playout queue, sleep, future-frame timer or change to RTP pacing.
+Cadence admission waits on capture/progress notifications and can change when
+model input is submitted; it is not a guarantee of unchanged model-visible latency.
+Choosing an older eligible capture can nevertheless add up to the configured
+100 ms freshness bound to source age. Control guards prefer latest, but a CPU
+contract test is not proof of unchanged visible input latency. In particular,
+unknown effective input after interaction conservatively stays on latest.
+
+Uniformity is best-effort. With only one available candidate, or where source
+timestamp quantization already determines the minimum variance, the result may
+be identical to latest. The implementation cannot create missing source frames,
+remove network congestion or guarantee a real model/render FPS.
+
+## Diagnostics and verification
+
+Model recording manifests gain `source_sampling` only when adaptive selection is
+active. It contains decision counts, reset and rate-observation counts, estimated
+completion period, maximum extra capture age and admission counts for early
+captures and control advances. Decisions are not accepted-frame
+counts or a substitute for actual input/output counters.
+
+The 2026-11-10 focused CPU suite covers 40 cases, including deferred-input
+control dispatch, progress/EOS wakeups, non-consuming pinned-F0 notifications,
+cancellation and 36 FPS capture against batched 18.6 FPS virtual model demand.
+In those virtual schedules, P95 selected-capture gaps fall from 250–472 ms to
+56–83 ms with unchanged steady consumer throughput. These are simulated capture
+intervals, not measured GPU output, browser presentation or user input latency.
+
+CPU tests cover fluctuating source rates, healthy completion windows versus source
+starvation, duplicate/batched observations, no-candidate waits, low-water tail
+feeding, pinned/context boundaries, input and Prompt dispatch, EOS/cancel and
+player isolation. A deterministic virtual schedule compares latest and adaptive
+selection at identical consumer opportunities; both retain the same number of
+unique samples. It is not a model or browser FPS benchmark.
+
+The 2026-11-05 local regression run completed with 301 passed and 10 skipped.
+The skipped immediate-capture codec cases require the native x264 bridge, which
+is unavailable in the local test environment. Existing WebSocket dependency
+deprecation warnings do not concern this sampling policy. The run also covered
+source conditions, Prefill/startup, player lifecycle and independent/streaming
+recording, beyond the focused command below.
+
+```bash
+PYTHONPATH=python SGLANG_LIGHTWEIGHT_RUNTIME=1 python -m pytest \
+  python/sglang/multimodal_gen/test/unit/realtime/test_whitebox_source_sampling.py \
+  python/sglang/multimodal_gen/test/unit/realtime/test_whitebox_render_lifecycle.py \
+  deploy/whitebox/test_release.py \
+  --confcutdir=python/sglang/multimodal_gen/test/unit/realtime -q
+```
+
+Before enabling a production release, compare latest/adaptive with the same
+world, actions, weights, source rates and hardware at 480 and 736 output sizes.
+Measure unique input/output/display FPS, capture spacing and age, input-to-visible
+latency, Prompt-to-first-new-condition frame, freezes, queue age, and
+Encoder/DiT/Decoder time and memory. Include source slowdowns and recovery,
+Prefill/segment changes and active controls. GPU performance, long-session image
+quality, recording playback and browser/multiplayer acceptance remain unmeasured
+for this candidate; neither the virtual schedule nor past deployments proves them.
+
+
+## Bounded PI and input renewal hints (2026-11-10 candidate)
+
+Known CLI held-key/button renewals without events still reach the SDK and retain
+all original sequences and receipts, but do not advance a separate sampling
+priority revision. Edges, pointer events, unknown envelopes, effective-input and
+source/context changes remain priority signals. Receipts for a newly dispatched
+state retain their own priority hint; repeated renewal receipts do not. This is
+not a promotion of observed input into effective-input proof. Semantic SDK
+commands and unknown receipt types remain opaque and conservative.
+
+A segment-local PI correction operates around the existing healthy completion
+period. It averages queue occupancy and oldest unfinished capture age over at
+least 500 ms. The soft target includes the protocol minimum plus half a minimum
+batch; it never replaces the hard native input/byte gates. Period scaling stays
+between 1.0 and 1.15, changes by at most 0.02 per update, and uses conditional
+integration with a bounded integral. It never drives faster than the measured
+base cadence. Low-water refill remains immediate and does not integrate error;
+startup, condition changes, invalid observations and long gaps reset the feedback.
+Priority borrowing is suspended while feedback reports an aging queue; SDK
+input dispatch never waits for this sampling decision. No derivative term is
+used because this measurement contains batch-completion discontinuities.
+
+The anti-windup approach follows the standard [conditional integration principle](https://www.mathworks.com/help/simulink/slref/anti-windup-control-using-a-pid-controller.html).
+These are conservative initial gains, not a stability proof for every workload.
+The manifest exposes `queue_feedback` (scale, integral, target, update count and
+maximum unfinished-frame age). A zero update count is observable and must not be
+reported as a controller successfully regulating that session.
+
+In a 36 FPS capture / 18.6 FPS virtual consumer with 34 credits, 9/17-frame
+batches and 0/5/36 Hz controls, the candidate preserves output count, keeps
+selected-capture P95 below 85 ms and does not increase virtual input P95. With
+25 credits, the larger batch can remain supply-constrained; the controller
+preserves the hard limit and may not obtain a healthy estimate. Those simulations
+are not GPU throughput or browser latency evidence. Keep the current live credit
+budget unless separately justified; the user performs browser acceptance.
+
+The candidate also incorporates the scoped PR664 input changes from 422fde26
+and pins the already-deployed SDK dev ancestor 4c10ad265a74cf2a5dc59a8d6445363b85771ce3.
+Its complete image replaces the prior test source/SDK bind overlays. Gateway,
+model workers and their weights remain outside this Room-only rollout.

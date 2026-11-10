@@ -84,6 +84,7 @@ class WhiteboxConfig:
     model_output_reserve_frames: int = 4
     model_subclip_admission: bool = False
     rtc_model_cadence: bool = False
+    model_source_sampling: str = "latest"
 
     @property
     def archive_encoding(self):
@@ -117,6 +118,8 @@ class WhiteboxConfig:
         )
 
     def __post_init__(self):
+        if self.model_source_sampling not in ("latest", "adaptive"):
+            raise ValueError("Unknown model source sampling policy")
         if self.model_target is not None:
             ModelGeometry(self.spec, self.model_target)
         if type(self.independent_archive) is not bool or any(
@@ -221,6 +224,11 @@ def from_environment(
         )
     if not engine or not ui:
         raise ValueError("WHITEBOX_ENGINE_FACTORY and WHITEBOX_UI_FACTORY are required")
+    sampling = os.environ.get("WHITEBOX_MODEL_SOURCE_SAMPLING", "latest")
+    if sampling == "adaptive" and (
+        not room or os.environ.get("WHITEBOX_RENDER_SEGMENTS") != "1"
+    ):
+        raise ValueError("Adaptive source sampling requires Room render segments")
     archive_encoding = os.environ.get("WHITEBOX_ARCHIVE_ENCODING", "independent-rgb-v2")
     if archive_encoding not in ("independent-rgb-v2", "playback-v1"):
         raise ValueError("Invalid archive encoding mode")
@@ -236,6 +244,7 @@ def from_environment(
     if (target_width is None) != (target_height is None):
         raise ValueError("Both model target dimensions must be configured")
     config = WhiteboxConfig(
+        model_source_sampling=sampling,
         model_target=(
             VideoSpec(int(target_width), int(target_height))
             if target_width is not None
@@ -459,6 +468,9 @@ class WhiteboxUpstream:
             self.received
         ) = 0
         self.input_sequence = -1
+        from .source_sampling import InputChangeTracker
+
+        self.sampling_inputs = InputChangeTracker()
         self.observed_input = {}
         self.input_events = []
         self.ended = self.closed = False
@@ -587,6 +599,7 @@ class WhiteboxUpstream:
                 raise WhiteboxDiagnostic("INVALID_CONTROL_MESSAGE", "validation")
             self.input_sequence = sequence
             if not self.ended:
+                self.sampling_inputs.observe(payload, sequence)
                 if len(self.input_events) >= 1024:
                     raise WhiteboxDiagnostic("CONTROL_QUEUE_FULL", "control")
                 self.input_events.append(

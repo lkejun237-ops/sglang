@@ -1592,4 +1592,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from sglang.multimodal_gen.runtime.realtime.worker_process import run_worker
+
+    run_worker(main)

@@ -551,7 +551,7 @@ def test_render_source_and_four_segments_use_independent_archive_workers(
         ),
     )
     lifecycle.test_source_survives_four_segments_and_ordered_prompt_updates(
-        tmp_path, "valid-source-frames-v1", True
+        tmp_path, "valid-source-frames-v1", True, "adaptive"
     )
     import json
 

@@ -90,6 +90,7 @@ class StreamingData:
             max_archive_bytes=settings["archive_bytes"],
         )
         self.objects = {}
+        self.model_input_assets = {}
         self.token_hash = None
         self.references = []
         self.last_frame = -1
@@ -225,6 +226,17 @@ class StreamingData:
                 # A condition switch may use this image after the worker ACK.
                 # Confirm its immutable object before returning that receipt.
                 self.objects[descriptor["path"]].finish()
+        elif kind == "model_input":
+            from .model_inputs import PATH, archive_model_input
+
+            if not hasattr(self, "model_inputs"):
+                self.model_inputs = TextObject(self.object(PATH))
+            archive_model_input(
+                *value,
+                self.blob,
+                lambda event: self.model_inputs.write(json_line(event)),
+                self.model_input_assets,
+            )
         elif kind == "state":
             self.source_states.write(json_line(value))
         elif kind == "pair":

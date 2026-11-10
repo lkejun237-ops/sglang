@@ -377,11 +377,12 @@ class StrictLeases:
 
 
 @pytest.mark.parametrize("capture_clock", [False, True])
+@pytest.mark.parametrize("sampling", ["latest", "adaptive"])
 @pytest.mark.parametrize(
     "release_protocol", [None, "valid-source-frames-v1", "clip-barrier-v1"]
 )
 def test_source_survives_four_segments_and_ordered_prompt_updates(
-    tmp_path, release_protocol, capture_clock
+    tmp_path, release_protocol, capture_clock, sampling
 ):
     async def run():
         spec = VideoSpec(32, 32)
@@ -418,6 +419,7 @@ def test_source_survives_four_segments_and_ordered_prompt_updates(
                 spec=spec,
                 room_owned=True,
                 capture_clock=capture_clock,
+                model_source_sampling=sampling,
                 startup_seconds=5,
                 drain_seconds=2,
             ),
@@ -508,6 +510,14 @@ def test_source_survives_four_segments_and_ordered_prompt_updates(
                     )
                 )
                 segment = source.current_segment
+                assert (segment.source_view.sampler is not None) == (
+                    sampling == "adaptive"
+                )
+                if sampling == "adaptive":
+                    assert (
+                        segment.recording.manifest["source_sampling"]["mode"]
+                        == "adaptive"
+                    )
                 first_media = next(
                     m
                     for m in messages

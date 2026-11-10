@@ -21,7 +21,13 @@ from datetime import datetime, timezone
 
 from .contracts import presentation_pts
 from .metrics import observe_duration
-from .recording import ArchiveManager, Recording, reference_descriptors, write_manifest
+from .recording import (
+    ArchiveManager,
+    Recording,
+    json_line,
+    reference_descriptors,
+    write_manifest,
+)
 
 
 def limit_child(cpu, memory_bytes=2 * 1024**3, file_bytes=2 * 1024**3):
@@ -60,6 +66,7 @@ def _worker(
 
     limit_child(cpu, memory_bytes, disk_bytes)
     recording = None
+    model_input_assets = {}
     disk_checked_at, disk_last_size = time.monotonic(), 0
     disk_free = None
     last_frame = -1
@@ -124,6 +131,21 @@ def _worker(
                 target = recording.directory / "ui_bundle" / name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(data)
+            elif kind == "model_input":
+                from .model_inputs import PATH, archive_model_input
+
+                def blob(name, data):
+                    target = recording.directory / name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(data)
+
+                def append(event):
+                    target = recording.directory / PATH
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with target.open("a") as output:
+                        output.write(json_line(event))
+
+                archive_model_input(*value, blob, append, model_input_assets)
             elif kind == "report":
                 token_hash, created_at = value
                 target = recording.directory.parent / ".reports"
@@ -612,6 +634,8 @@ class AsyncRecording:
             self._acknowledged.set()
 
     async def finish(self, outcome):
+        for capture in list(getattr(self, "model_input_captures", [])):
+            capture.close()
         self.accepting = False
         self.final_outcome = outcome
         self.manifest["recording_worker"] = self.statistics()

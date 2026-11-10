@@ -470,6 +470,8 @@ class StreamingRecording(AsyncRecording):
                 self.manager.publish_failure(self)
 
     async def finish(self, outcome):
+        for capture in list(getattr(self, "model_input_captures", [])):
+            capture.close()
         self.accepting = False
         self.final_outcome = outcome
         self.wake.set()

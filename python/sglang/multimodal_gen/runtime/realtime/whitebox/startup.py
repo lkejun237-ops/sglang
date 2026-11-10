@@ -445,6 +445,8 @@ class PlayStartup:
                         "source_condition_switch_protocol": "clip-barrier-v1",
                     }
                     init = self.geometry.model_init(init)
+                    init["record_model_inputs"] = True
+                    self.model_input_init = init
                     await self._model_send(init, "init")
                     self.ready = await self._model_reply("init")
                     if (

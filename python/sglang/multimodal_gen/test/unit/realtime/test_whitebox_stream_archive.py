@@ -703,7 +703,7 @@ def test_four_model_segments_and_prompt_updates_keep_playing_without_any_archive
         lambda **kw: StreamingArchiveManager(index_prefix="test", **kw),
     )
     lifecycle.test_source_survives_four_segments_and_ordered_prompt_updates(
-        tmp_path, "valid-source-frames-v1", True
+        tmp_path, "valid-source-frames-v1", True, "adaptive"
     )
     assert not list(tmp_path.rglob("*.mp4"))
     assert not list(tmp_path.rglob("*.jsonl"))

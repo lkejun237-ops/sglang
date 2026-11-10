@@ -10,6 +10,7 @@ import logging
 import os
 import time
 from dataclasses import replace
+from itertools import islice
 
 import msgspec
 
@@ -21,6 +22,7 @@ from .playback import H264PlaybackEncoder
 from .render_contract import RenderError, canonical
 from .reports import SessionReport
 from .sink_control import SinkControl
+from .source_sampling import AdaptiveSourceSampler
 
 
 class SegmentSource:
@@ -30,10 +32,24 @@ class SegmentSource:
         self.first = None
         self.start_after = source.latest.version
         self.context_boundary = None
+        self.sampler = (
+            AdaptiveSourceSampler()
+            if getattr(
+                getattr(source, "config", None), "model_source_sampling", "latest"
+            )
+            == "adaptive"
+            else None
+        )
+        self.sampling_fence = None
 
     @property
     def version(self):
         return self.first[0] - 1 if self.first is not None else self.start_after
+
+    def has_capture(self, after):
+        return self.context_boundary is None and (
+            self.first is not None or self.source.latest.version > after
+        )
 
     def select_start(self, boundary):
         if boundary == {"mode": "next_available"}:
@@ -48,6 +64,7 @@ class SegmentSource:
             return None
         if self.first is not None:
             first, self.first = self.first, None
+            self.sampling_fence = first[0]
             return first
         frame = asyncio.create_task(self.source.latest.get(after))
         stopped = asyncio.create_task(self.stopped.wait())
@@ -63,6 +80,7 @@ class SegmentSource:
 
                 if source_reached(result[1][0], self.context_boundary):
                     self.context_boundary = None
+                    self.sampling_fence = result[0]
                     break
                 # Keep the same stop fence while advancing past pre-boundary captures.
                 frame = asyncio.create_task(self.source.latest.get(result[0]))
@@ -80,6 +98,61 @@ class SegmentSource:
 
     def stop(self):
         self.stopped.set()
+
+    async def wait_for_capture(self, after):
+        """Observe availability without consuming a pinned/context boundary."""
+        if self.first is not None or self.stopped.is_set():
+            return
+        capture = asyncio.create_task(self.source.latest.get(after))
+        stopped = asyncio.create_task(self.stopped.wait())
+        try:
+            await asyncio.wait((capture, stopped), return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            capture.cancel()
+            stopped.cancel()
+            await asyncio.gather(capture, stopped, return_exceptions=True)
+
+    def select_model_source(self, latest, *, after, **demand):
+        if self.sampler is None:
+            return latest
+        inputs = getattr(self.source, "sampling_inputs", None)
+        control = dict(
+            control_sequence=(
+                inputs.revision,
+                inputs.acknowledged(
+                    (latest[1][0].observed_input or {}).get("receipts", [])
+                ),
+            )
+            if inputs is not None
+            else self.source.input_sequence,
+            semantic_control=inputs is not None,
+        )
+        pinned = self.sampling_fence == latest[0]
+        if pinned:
+            self.sampler.reset()
+            demand["startup"] = True
+            self.sampling_fence = None
+        demand["urgent"] = (
+            demand["urgent"] or self.source.latest.closed or self.stopped.is_set()
+        )
+        if not pinned and not self.sampler.admit(
+            latest,
+            after=after,
+            **control,
+            **{key: value for key, value in demand.items() if key != "now"},
+        ):
+            return None
+        return self.sampler.choose(
+            latest,
+            tuple(
+                islice(
+                    reversed(self.source.retained.frames), self.sampler.max_candidates
+                )
+            ),
+            after=after,
+            **control,
+            **demand,
+        )
 
 
 class RenderSegment(InteractiveSession):
@@ -221,12 +294,9 @@ class RenderSegment(InteractiveSession):
         )
 
     def model_output_references(self, message, references):
-        condition = self.prompt_by_event.get(message.get("event_id"))
-        return (
-            condition.get("reference_descriptors", references)
-            if condition
-            else references
-        )
+        # model_output_condition has selected this output event's actual media.
+        # A prompt-only update inherits those media, not the init reference list.
+        return self.active_reference_descriptors
 
     async def _notify_source_admission(self):
         async with self.model_admission_condition:

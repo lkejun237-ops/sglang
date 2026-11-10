@@ -162,6 +162,115 @@ lookup. Without a subscription it does not serialize debug
 conditions or read debug reference bytes. Debug messages stay out of media,
 recordings and the control replay buffer.
 
+## Archive accepted model inputs
+
+Room requests `record_model_inputs=true` on source generation and bound Prefill.
+The Zing model API captures validated input values after admission, including
+the final Prompt and the ordered reference images. This works for both the
+integrated adapter and the source-Encoder adapter used by a role pool. It does
+not capture an earlier browser instruction or recompile the CLI context.
+
+The opt-in protocol is `model-input-v1`. Existing clients omit the flag and keep
+their original messages. Accepted init, the first video source frame and Prompt
+updates attach a `model_input` receipt to `session.ready`, `source.accepted` and
+`control_ack` respectively. Prefill emits one `type=model.input` message after
+validation and before compute; a subsequent compute failure does not erase that
+accepted input. API validation failures produce no accepted-input receipt.
+
+The model returns text and SHA256/byte-count descriptors, not another copy of the
+image bytes. Room matches the receipt against the exact outgoing bytes and the
+model-session/generation identity. A mismatch is an archive failure, not proof
+that the model accepted the sender's candidate. Only verified bytes enter the
+existing asynchronous recording worker, which hashes them again before upload.
+The model process does not need OSS credentials or perform an OSS upload.
+
+Each recording gains the following objects under its existing `object_prefix`:
+
+```text
+model-inputs/events.jsonl
+model-inputs/assets/<sha256>.png
+model-inputs/assets/<sha256>.jpeg
+model-inputs/assets/<sha256>.webp
+model-inputs/assets/<sha256>.rgb24
+```
+
+The JSONL contains accepted inputs and output-proven effective snapshots.
+To read the complete Prompt/reference combination that actually generated frames,
+select `capture_stage=model_output_observed`: every such row directly contains
+the full ordered `references` list and its asset paths, including Prompt-only
+updates. You do not need to resolve `inherit` or select a preceding Prefill.
+
+| Field | Meaning |
+| --- | --- |
+| `capture_stage` | `model_api_accepted` for API acceptance; `model_output_observed` for the first validated model output using that condition. Neither proves browser presentation. |
+| `kind` | `init`, `prompt.update`, `prefill` or `source.first`. |
+| `model_session_id`, `generation_id` | Exact model execution scope. |
+| `event_id`, `request_id`, `prompt_version` | Applicable control or Prefill identity; absent where the API has no such field. |
+| `accepted_at_unix_ns` | Model-host wall-clock acceptance observation; not a synchronized cross-host latency measurement. |
+| `prompt`, `prompt_sha256` | Final input text and its UTF-8 content hash. |
+| `references` | Ordered descriptors containing original `id`, encoding, byte count, content hash and relative asset path. |
+| `references_mode` | `replace` or `inherit` preserves the submitted update semantics on acceptance rows. Output-proven rows use `resolved` and include the full effective image list; `input_references_mode` retains the original wire semantics. |
+| `first_output_frame`, `num_frames`, `observed_at_unix_ns` | First validated model output range and Room observation time for an effective snapshot. |
+| `seed`, `size`, `source_stream` | Accepted init/Prefill request settings. |
+| `source_frame` | Prefill RGB input or the first accepted video source frame, with exact bytes, dimensions, hash and path. |
+
+Image bytes retain their original PNG/JPEG/WebP encoding; the recorder does not
+resize or re-encode them. Repeated content uses one content-addressed asset within
+the recording, while reference aliases and order remain in every event. RGB24
+assets are headerless packed RGB; their dimensions are in `source_frame`.
+The normal source/model MP4 recording remains responsible for subsequent video
+frames. Early-start condition previews are not additional frame records here;
+the first accepted video frame is captured separately from Prefill RGB input.
+
+Generation input events live with the model segment. Prefill input events live
+with the player's source recording, including warmup candidates that are never
+used by a model segment. Prepared startup init is matched when the existing
+connection is handed to its segment. Calls that never obtain a recording, and
+standalone Prefill clients without this Room uploader, do not create these OSS
+objects automatically.
+
+`manifest.model_inputs` contains `path`, `accepted`, `applied`, `unconfirmed`,
+`unresolved_applied`, `failed` and `status`. `applied` counts complete effective
+snapshots. An observed output with no matching accepted input or verified image
+is marked incomplete; it is never assigned a guessed reference list. `confirmed` means the model receipts matched and were admitted to the
+archive queue; also require the enclosing `upload_status=complete` and the
+`objects` hashes before treating the objects as uploaded. An older model that
+does not return receipts yields `incomplete`, never a fabricated accepted input.
+Inputs rejected at API admission are not written as accepted events. An accepted
+candidate may later fail or be superseded: its acceptance row remains, but it
+has no output-proven row unless actual output confirms its use.
+
+Capture retains at most four pending inputs and 64 MiB of referenced bytes per
+model connection. Pending application matching retains at most 64 accepted-input
+metadata entries (2 MiB), four early output observations and 192 reference
+identities; it retains no additional image bytes. The existing archive queue,
+upload budget and object limit also apply. Missing receipts, capacity exhaustion and failed uploads remain
+explicit. Archive capture neither waits for cloud storage on the model input
+path nor changes Slot ownership, cancellation, model retry or training jobs.
+
+Effective snapshots use the condition selected by the actual model output event.
+A successful reference replacement becomes the active image set; subsequent
+Prompt-only updates keep it. A rejected candidate, an unrelated Prefill or an
+initial image list cannot overwrite that set. Explicit clearing stays empty on
+later Prompt-only updates. The archive worker requires each referenced asset to
+have passed byte/hash validation earlier in the same recording, and reuses it
+without another image upload. Output arriving before its API receipt waits in a
+bounded metadata queue for that exact receipt; lost confirmation remains explicit.
+
+The existing frame-level `inputs.jsonl`/`states.jsonl`, `condition_switches` and
+`model_cache_receipts` provide additional per-frame, switching and cache detail.
+This archive does not claim complete client/CLI business-event history.
+
+CPU validation covers real adapter acceptance, byte/order matching, inherited
+versus cleared reference lists, invalid input rejection, wrong identity/hash
+rejection, bounded pending state, Prefill followed by compute failure, and
+streaming upload/readback through an in-memory S3 implementation. Follow-up tests
+cover Prefill-to-generation scope, reference replacement followed by Prompt-only
+updates, rejected candidates, explicit clearing, out-of-order receipts and
+reuse of verified assets in complete effective snapshots. GPU latency,
+480/736 generation quality and live OSS delivery require deployment-time
+verification; source changes alone do not establish those results.
+
 ## Late Player UI replay
 
 A source may produce native captures before the Player attaches. For the existing

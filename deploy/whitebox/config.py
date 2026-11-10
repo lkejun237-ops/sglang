@@ -197,6 +197,12 @@ def validate(config):
             raise ValueError("Machine capacity directory must be absolute")
     integer(model["reference_max_images"], 1, 21, "reference_max_images")
     integer(media["cli_fps"], 1, 60, "cli_fps")
+    room = config["environment"]["room"]
+    sampling = room.get("WHITEBOX_MODEL_SOURCE_SAMPLING", "latest")
+    if sampling not in ("latest", "adaptive") or (
+        sampling == "adaptive" and room.get("WHITEBOX_RENDER_SEGMENTS") != "1"
+    ):
+        raise ValueError("Invalid Room model source sampling policy")
     for key, value in media.items():
         if key.endswith("_bps"):
             integer(value, 100000, 100000000, key)

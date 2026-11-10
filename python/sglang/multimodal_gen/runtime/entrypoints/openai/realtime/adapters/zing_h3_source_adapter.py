@@ -717,8 +717,37 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                 self.admission_socket = self.admission_context = None
                 raise
 
+    def input_receipt(self, session, kind, value, *, event_id=None, request_id=None):
+        if not getattr(getattr(session, "request", None), "record_model_inputs", False):
+            return {}
+        from sglang.multimodal_gen.runtime.realtime.model_input_recording import (
+            accepted_input,
+            input_snapshot,
+        )
+
+        return {
+            "model_input": accepted_input(
+                session,
+                input_snapshot(kind, value, event_id=event_id, request_id=request_id),
+            )
+        }
+
     def session_ready_message(self, session):
-        return self.ready
+        if not getattr(getattr(session, "request", None), "record_model_inputs", False):
+            return self.ready
+        if not hasattr(self, "_model_input_ready"):
+            self._model_input_ready = self.input_receipt(
+                session,
+                "init",
+                dict(
+                    prompt=self.initial_prompt,
+                    references=self.reference_items,
+                    seed=session.request.seed,
+                    size=session.request.size,
+                    source_stream=session.request.source_stream,
+                ),
+            )
+        return {**self.ready, **self._model_input_ready}
 
     async def _admit_source(self, op, payload):
         if self.admission_socket is None:
@@ -803,7 +832,23 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                         payload["data"][:frame_bytes]
                     ).hexdigest()
             # Only expose work after accepted is on the same serialized writer.
-            await ws.send_bytes(msgspec.msgpack.encode(record.message()))
+            acceptance = record.message()
+            if payload["source_frame_start"] == 0:
+                frame_bytes = self.config["width"] * self.config["height"] * 3
+                acceptance.update(
+                    self.input_receipt(
+                        session,
+                        "source.first",
+                        dict(
+                            source_frame=payload["data"][:frame_bytes],
+                            source_frame_index=0,
+                            width=self.config["width"],
+                            height=self.config["height"],
+                        ),
+                        event_id=event_id,
+                    )
+                )
+            await ws.send_bytes(msgspec.msgpack.encode(acceptance))
             from ..conditioning import take_message_reservation
 
             reservation = take_message_reservation(session)
@@ -1042,6 +1087,9 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                         stage="worker",
                         kind="prompt",
                         event_id=event_id,
+                        **self.input_receipt(
+                            session, "prompt.update", command, event_id=event_id
+                        ),
                     )
                 )
             )
@@ -1113,6 +1161,12 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                     state="accepted",
                     source_frame_index=boundary,
                     prompt_version=payload["version"],
+                    **self.input_receipt(
+                        session,
+                        "prompt.update",
+                        dict(command, version=payload["version"]),
+                        event_id=event_id,
+                    ),
                 )
             )
         )

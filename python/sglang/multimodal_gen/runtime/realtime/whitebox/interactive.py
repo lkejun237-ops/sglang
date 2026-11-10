@@ -756,6 +756,29 @@ class InteractiveSession(WhiteboxUpstream):
             output_spec = geometry.output
             init = geometry.model_init(init)
             startup = self.leases if getattr(self.leases, "is_startup", False) else None
+            from .model_inputs import ModelInputCapture
+
+            recording = getattr(self, "recording", None)
+            identity = (
+                getattr(assignment, "session_id", None),
+                getattr(assignment, "generation_id", None),
+            )
+            capture = self.model_inputs = (
+                ModelInputCapture(recording, *identity)
+                if recording is not None
+                and all(isinstance(v, str) and v for v in identity)
+                else None
+            )
+            if recording is not None and capture is None:
+                summary = recording.manifest.setdefault("model_inputs", {})
+                summary.update(
+                    status="incomplete",
+                    last_error="MODEL_INPUT_IDENTITY_UNAVAILABLE",
+                    failed=summary.get("failed", 0) + 1,
+                )
+            init["record_model_inputs"] = capture is not None
+            if capture is not None:
+                capture.sent(getattr(startup, "model_input_init", None) or init)
             if startup is not None:
                 ready = startup.ready
             else:
@@ -777,6 +800,8 @@ class InteractiveSession(WhiteboxUpstream):
                     raise model_preparation_error(
                         ready, trace_id=self.trace_id, operation="init"
                     )
+            if capture is not None:
+                capture.received(ready)
             spec = self.config.spec
             if (
                 ready.get("type") != "session.ready"
@@ -900,7 +925,22 @@ class InteractiveSession(WhiteboxUpstream):
 
             async def source():
                 nonlocal sent, cursor, ended
+                deferred = None
                 while True:
+                    if deferred is not None:
+                        from .source_sampling import wait_for_capture_or_progress
+
+                        version, progress = deferred
+                        started = time.perf_counter()
+                        await wait_for_capture_or_progress(
+                            self.latest, version, condition, lambda: received, progress
+                        )
+                        observe_duration(
+                            "source_cadence_wait",
+                            (time.perf_counter() - started) * 1000,
+                            self.trace_id,
+                        )
+                        deferred = None
                     blocked_ms = dict(
                         pair_capacity=0.0,
                         encoder_credit=0.0,
@@ -961,6 +1001,32 @@ class InteractiveSession(WhiteboxUpstream):
                     resume_after = max(cursor, getattr(self, "source_resume_after", 0))
                     self.dropped_before_model += resume_after - cursor
                     cursor = resume_after
+                    sampler = getattr(self.latest, "sampler", None)
+                    if sampler is not None:
+                        now = time.perf_counter()
+                        oldest = (
+                            pending[next(iter(submitted_timing))][1]
+                            if submitted_timing
+                            else None
+                        )
+                        sampler.feedback.observe(
+                            now,
+                            buffered=sent - received,
+                            reserve=self.config.minimum_model_input_frames,
+                            capacity=capacity,
+                            oldest_age=now - oldest if oldest is not None else None,
+                            period=sampler.period_us / 1_000_000
+                            if sampler.period_us is not None
+                            else None,
+                            enabled=received > 0
+                            and getattr(self, "pending_prompt", None) is None
+                            and getattr(self, "condition_switch", None) is None,
+                        )
+                        sampler.supply(
+                            sent - received,
+                            self.config.minimum_model_input_frames,
+                            available=self.latest.has_capture(cursor),
+                        )
                     item = await self.latest.get(cursor)
                     if item is None:
                         break
@@ -969,6 +1035,28 @@ class InteractiveSession(WhiteboxUpstream):
                             self, "source_resume_after", 0
                         ):
                             continue
+                        selector = getattr(self.latest, "select_model_source", None)
+                        if selector is not None:
+                            selected = selector(
+                                item,
+                                after=cursor,
+                                now=time.perf_counter(),
+                                buffered=sent - received,
+                                reserve=self.config.minimum_model_input_frames,
+                                startup=received == 0,
+                                urgent=getattr(self, "pending_prompt", None) is not None
+                                or getattr(self, "condition_switch", None) is not None,
+                            )
+                            if sampler is not None:
+                                self.recording.manifest["source_sampling"] = (
+                                    sampler.snapshot()
+                                )
+                            if selected is None:
+                                deferred = (item[0], received)
+                                # The next wait occurs outside source_send_lock;
+                                # control dispatch remains independent of captures.
+                                continue
+                            item = selected
                         version, (frame, captured) = item
                         self.dropped_before_model += max(0, version - cursor - 1)
                         cursor = version
@@ -1071,6 +1159,8 @@ class InteractiveSession(WhiteboxUpstream):
                             trace_id=self.trace_id,
                             operation="render.receive",
                         ) from error
+                    if capture is not None and isinstance(message, dict):
+                        capture.received(message)
                     if not isinstance(message, dict) or message.get("type") == "error":
                         raise model_error(
                             message, trace_id=self.trace_id, operation="render.receive"
@@ -1131,6 +1221,7 @@ class InteractiveSession(WhiteboxUpstream):
                             message["payload"], num_frames=count
                         )
                         output_received = time.perf_counter()
+                        input_at_completion = sent - received
                         (
                             output_prompt,
                             output_rendering,
@@ -1138,6 +1229,16 @@ class InteractiveSession(WhiteboxUpstream):
                             message, pending, selection, rendering
                         )
                         output_refs = self.model_output_references(message, refs)
+                        if capture is not None:
+                            capture.applied(
+                                message,
+                                output_prompt,
+                                output_refs,
+                                output_rendering.get(
+                                    "prompt_version",
+                                    1 if message.get("event_id") is None else None,
+                                ),
+                            )
                         self.raw_model_frames += count
                         for local in range(start, start + count):
                             if self.config.room_owned:
@@ -1201,6 +1302,17 @@ class InteractiveSession(WhiteboxUpstream):
                             async with condition:
                                 received = local + 1
                                 condition.notify_all()
+                        sampler = getattr(self.latest, "sampler", None)
+                        if sampler is not None:
+                            sampler.completed(
+                                received,
+                                output_received,
+                                buffered=input_at_completion,
+                                reserve=self.config.minimum_model_input_frames,
+                            )
+                            self.recording.manifest["source_sampling"] = (
+                                sampler.snapshot()
+                            )
                     elif kind == "chunk_telemetry":
                         durations = numeric_durations(message, CHUNK_FIELDS)
                         frames = message.get("num_frames")
@@ -1280,6 +1392,8 @@ class InteractiveSession(WhiteboxUpstream):
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
+                if capture is not None:
+                    capture.close()
 
     def model_source_allowed(self, sent):
         return True
@@ -1322,14 +1436,11 @@ class InteractiveSession(WhiteboxUpstream):
                 receipt = before_send(event_id)
                 if inspect.isawaitable(receipt):
                     await receipt
-            wire = msgspec.msgpack.encode(
-                dict(
-                    type="event",
-                    kind=kind,
-                    event_id=event_id,
-                    payload=payload,
-                )
-            )
+            message = dict(type="event", kind=kind, event_id=event_id, payload=payload)
+            capture = getattr(self, "model_inputs", None)
+            if capture is not None:
+                capture.sent(message)
+            wire = msgspec.msgpack.encode(message)
             try:
                 await ws.send(wire)
             except Exception as error:

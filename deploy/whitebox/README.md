@@ -41,6 +41,11 @@ daemon 或运行时配置，不接受 `host-gateway`。仅使用已核实地址�
 量化 KV、MXFP8 或 NVFP4。缺少这些字段的已有 bundle 继续使用 BF16 启动计划。
 配置校验通过不代表 GPU 速度或画质一致性已通过验证。
 
+A future opt-in Room release can combine `media.cli_fps: 60` with
+`environment.room.WHITEBOX_MODEL_SOURCE_SAMPLING: "adaptive"`. The compiler
+requires segmented Room mode; existing policies default to `latest`. This is a
+capture ceiling and best-effort timestamp selection, not a GPU FPS guarantee or
+an instruction to deploy. See the [selection contract](../../docs/docs/sglang-diffusion/zing/specs/whitebox-adaptive-source-sampling.mdx).
 ## 项目音频测试的发布输入
 
 项目音频发布通过 `benchmark/whitebox/sdk-revision.txt`，将 CLI/Stream Host 固定到

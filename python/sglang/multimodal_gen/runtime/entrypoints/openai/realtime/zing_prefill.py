@@ -183,6 +183,26 @@ async def run_prefill_case(ws, data, wire_size, session_id, *, binding=None):
             source_frame_size=data.get("source_frame_size"),
             persist=data.get("persist", False),
         )
+        if request.record_model_inputs:
+            values = dict(
+                prompt=request.prompt,
+                references=adapter.reference_items,
+                seed=request.seed,
+                size=request.size,
+                source_stream=request.source_stream,
+                source_frame=frame,
+                source_frame_size=data.get("source_frame_size"),
+            )
+            await ws.send_bytes(
+                msgspec.msgpack.encode(
+                    dict(
+                        type="model.input",
+                        **adapter.input_receipt(
+                            session, "prefill", values, request_id=data["request_id"]
+                        ),
+                    )
+                )
+            )
         if registry is not None:
             await registry.mark_runnable(
                 gateway.coordinator_token, owner_id=reservation_owner

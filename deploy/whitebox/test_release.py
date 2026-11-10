@@ -76,7 +76,7 @@ def test_invalid_model_policy_rejected(key, value):
 
 def test_unknown_fields_and_secret_binding_rejected():
     with pytest.raises(ValueError, match="Unknown field"):
-        overlay(load("shanghai"), {"modle": {}})
+        overlay(load("shanghai"), {"modle": {}})  # codespell:ignore modle
     with pytest.raises(ValueError, match="Invalid type"):
         overlay(load("shanghai"), {"play_seconds": True})
     b = bundle()["bindings"]
@@ -93,6 +93,27 @@ def test_bitrate_bound_and_digest_change():
         render(c, b)
     c["media"]["model_min_bps"] = 2100000
     assert render(c, b)["config_sha256"] != original
+
+
+def test_adaptive_source_sampling_is_explicit_and_allows_cli_60():
+    c = load("thailand")
+    assert c["environment"]["room"]["WHITEBOX_MODEL_SOURCE_SAMPLING"] == "latest"
+    selected = overlay(
+        c,
+        {
+            "media": {"cli_fps": 60},
+            "environment": {"room": {"WHITEBOX_MODEL_SOURCE_SAMPLING": "adaptive"}},
+        },
+    )
+    compiled = render(selected, bundle()["bindings"])
+    assert compiled["environments"]["room"]["WHITEBOX_CLI_FPS"] == "60"
+    assert (
+        compiled["environments"]["room"]["WHITEBOX_MODEL_SOURCE_SAMPLING"] == "adaptive"
+    )
+    assert "WHITEBOX_MODEL_SOURCE_SAMPLING" not in compiled["environments"]["model"]
+    selected["environment"]["room"]["WHITEBOX_RENDER_SEGMENTS"] = "0"
+    with pytest.raises(ValueError, match="sampling policy"):
+        render(selected, bundle()["bindings"])
 
 
 def test_model_736_preserves_native_480_source():
