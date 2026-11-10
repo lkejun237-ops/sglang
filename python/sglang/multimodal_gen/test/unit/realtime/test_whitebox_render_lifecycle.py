@@ -1390,7 +1390,7 @@ def test_recorded_video_engine_with_source_session_prefill_and_switch(
         Path(__file__).resolve().parents[6]
         / "benchmark"
         / "whitebox"
-        / "run_four_case_sglang_suite.py"
+        / "run_room_sglang_source_replay.py"
     )
     spec_mod = importlib.util.spec_from_file_location("wb_four_case_suite", suite_path)
     assert spec_mod is not None and spec_mod.loader is not None
@@ -1465,6 +1465,7 @@ def test_recorded_video_engine_with_source_session_prefill_and_switch(
             max_frames_after_last_event=4,
             full_frames=False,
             preserve_switch_boundaries=False,
+            flow_mode="deterministic",
             realtime_pacing=False,
             pacing_speed=10.0,
             repeat_warm_prefill=True,
@@ -1503,7 +1504,7 @@ def test_four_case_sglang_suite_mock_worker_end_to_end(tmp_path):
         Path(__file__).resolve().parents[6]
         / "benchmark"
         / "whitebox"
-        / "run_four_case_sglang_suite.py"
+        / "run_room_sglang_source_replay.py"
     )
     spec_mod = importlib.util.spec_from_file_location(
         "wb_four_case_suite_e2e", suite_path
@@ -1550,6 +1551,43 @@ def test_four_case_sglang_suite_mock_worker_end_to_end(tmp_path):
     assert ab["unprefilled_miss"]["cache_receipt"]["cache_result"] == "miss"
     assert ab["prefilled_hit"]["cache_receipt"]["cache_result"] == "l1_hit"
 
+    # Reuse customized valid references without requesting synthesis.
+    import hashlib
+
+    from PIL import Image
+
+    reference = next(p for p in media_dir.glob("*/references/*") if p.is_file())
+    Image.new("RGB", (128, 128), color=(254, 1, 2)).save(reference)
+    before = {
+        p: hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in media_dir.rglob("*")
+        if p.is_file()
+    }
+    assert (
+        suite_mod.main(
+            [
+                "run",
+                "--mode",
+                "mock-worker",
+                "--media-dir",
+                str(media_dir),
+                "--output-dir",
+                str(tmp_path / "reuse"),
+                "--max-frames-after-last-event",
+                "4",
+            ]
+        )
+        == 0
+    )
+    assert before == {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in before}
+    secondary = summary["cases"][-1]["secondary_segment"]
+    assert secondary["condition_recording_id"] != secondary["source_recording_id"]
+    assert "recording_id" not in secondary
+    report = report_path.read_text()
+    assert "同源换条件" in report
+    assert f"视频 `{secondary['source_recording_id']}`" in report
+    assert f"条件 `{secondary['condition_recording_id']}`" in report
+
 
 def test_four_case_cache_evidence_and_direct_token_rejection(tmp_path):
     import importlib.util
@@ -1558,7 +1596,7 @@ def test_four_case_cache_evidence_and_direct_token_rejection(tmp_path):
 
     path = (
         Path(__file__).resolve().parents[6]
-        / "benchmark/whitebox/run_four_case_sglang_suite.py"
+        / "benchmark/whitebox/run_room_sglang_source_replay.py"
     )
     spec = importlib.util.spec_from_file_location("suite_evidence_test", path)
     suite = importlib.util.module_from_spec(spec)
@@ -1602,7 +1640,7 @@ def test_four_case_oss_alias_preserves_object_hash(tmp_path, monkeypatch):
 
     path = (
         Path(__file__).resolve().parents[6]
-        / "benchmark/whitebox/run_four_case_sglang_suite.py"
+        / "benchmark/whitebox/run_room_sglang_source_replay.py"
     )
     spec = importlib.util.spec_from_file_location("suite_oss_test", path)
     suite = importlib.util.module_from_spec(spec)
@@ -1645,7 +1683,7 @@ def test_four_case_gate_advances_from_ack_without_observation_race(monkeypatch):
 
     path = (
         Path(__file__).resolve().parents[6]
-        / "benchmark/whitebox/run_four_case_sglang_suite.py"
+        / "benchmark/whitebox/run_room_sglang_source_replay.py"
     )
     spec = importlib.util.spec_from_file_location("suite_gate_test", path)
     suite = importlib.util.module_from_spec(spec)
@@ -1675,3 +1713,197 @@ def test_four_case_gate_advances_from_ack_without_observation_race(monkeypatch):
         assert not segment.model_source_allowed(34)
 
     asyncio.run(run())
+
+
+def test_four_case_cli_requires_only_three_worker_addresses(monkeypatch):
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parents[6]
+        / "benchmark/whitebox/run_room_sglang_source_replay.py"
+    )
+    spec = importlib.util.spec_from_file_location("suite_auto_cli_test", path)
+    suite = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = suite
+    spec.loader.exec_module(suite)
+    captured = {}
+
+    async def run(data, **kwargs):
+        captured.update(kwargs)
+        return {"cases": []}
+
+    monkeypatch.setattr(suite, "run_source_replay_suite", run)
+    assert (
+        suite.main(
+            [
+                "run",
+                "--encoder-url",
+                "http://e:1",
+                "--dit-url",
+                "http://t:2",
+                "--decoder-url",
+                "http://d:3",
+            ]
+        )
+        == 0
+    )
+    assert captured["mode"] == "real-sglang"
+    assert captured["synthesize_if_missing"] is False
+    assert all(
+        captured[k] is None
+        for k in (
+            "profile",
+            "compatibility",
+            "routing_revision",
+            "control_epoch",
+            "network_domain",
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "full_frames,expected_primary,expected_secondary", [(False, 4, 4), (True, 19, 9)]
+)
+def test_source_replay_modes_and_full_secondary_targets(
+    tmp_path, monkeypatch, full_frames, expected_primary, expected_secondary
+):
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parents[6]
+        / "benchmark/whitebox/run_room_sglang_source_replay.py"
+    )
+    spec = importlib.util.spec_from_file_location("source_replay_length_test", path)
+    suite = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = suite
+    spec.loader.exec_module(suite)
+
+    def no_test_gate(*args, **kwargs):
+        pytest.fail("Natural mode must instantiate the real SourceSession")
+
+    monkeypatch.setattr(suite, "_ReplaySourceSession", no_test_gate)
+    meta = dict(
+        recording_id="primary",
+        world_id="world-test",
+        prompt="test <Video 1> <Picture 1>",
+        video={"frames": 19},
+        objects={"references/00.png": {"sha256": "a" * 64}},
+        references_mapping=[
+            {"id": "ref-0", "asset_id": "sha256:" + "a" * 64, "role": "scene"}
+        ],
+        condition_switches=[],
+    )
+    if full_frames:
+        meta["condition_switches"] = [
+            dict(
+                prompt_version=2,
+                boundary=17,
+                prompt=meta["prompt"],
+                references=meta["references_mapping"],
+            )
+        ]
+    secondary = {**meta, "recording_id": "secondary", "video": {"frames": 9}}
+
+    import hashlib
+
+    from sglang.multimodal_gen.runtime.realtime.whitebox.recorded_engine import (
+        _iter_rgb24_via_pyav,
+    )
+
+    for rec_id, count, offset in (("primary", 19, 0), ("secondary", 9, 200)):
+        suite._synthesize_mp4(
+            tmp_path / rec_id / "whitebox.mp4", 32, 32, 24, count, offset
+        )
+    primary_hashes = {
+        hashlib.sha256(rgb).hexdigest()
+        for rgb in _iter_rgb24_via_pyav(tmp_path / "primary/whitebox.mp4", 32, 32)
+    }
+    secondary_hashes = {
+        hashlib.sha256(rgb).hexdigest()
+        for rgb in _iter_rgb24_via_pyav(tmp_path / "secondary/whitebox.mp4", 32, 32)
+    }
+
+    async def run():
+        result = await suite._run_single_segment_flow(
+            case_id="length-test",
+            recording_meta=meta,
+            media_root=tmp_path,
+            spool_dir=tmp_path / "spool",
+            spec=VideoSpec(32, 32),
+            mode="mock-worker",
+            cache_store=suite.MockSglangCacheStore(),
+            sglang_url=None,
+            max_frames_after_last_event=4,
+            full_frames=full_frames,
+            preserve_switch_boundaries=False,
+            flow_mode="natural",
+            realtime_pacing=False,
+            pacing_speed=1.0,
+            secondary_segment_recording=secondary,
+        )
+        assert result["flow_mode"] == "natural"
+        assert result["target_output_frames"] == expected_primary
+        assert result["secondary_segment"]["target_output_frames"] == expected_secondary
+        assert result["steady_state_flow"]["received_model_frames"] >= expected_primary
+        assert (
+            result["secondary_segment"]["received_model_frames"] >= expected_secondary
+        )
+        assert result["secondary_segment"]["source_recording_id"] == "primary"
+        assert result["secondary_segment"]["condition_recording_id"] == "secondary"
+        assert (
+            result["secondary_segment"]["input_kind"] == "same-source-condition-change"
+        )
+        f0 = result["secondary_segment"]["prepare"]["f0_source_frame_sha256"]
+        assert f0 in primary_hashes and f0 not in secondary_hashes
+
+    asyncio.run(run())
+
+
+def test_replay_explicit_synthesis_only_fills_missing_files(tmp_path):
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parents[6]
+        / "benchmark/whitebox/run_room_sglang_source_replay.py"
+    )
+    spec = importlib.util.spec_from_file_location("replay_synthesis_test", path)
+    suite = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = suite
+    spec.loader.exec_module(suite)
+    rec_dir = tmp_path / "rec"
+    (rec_dir / "references").mkdir(parents=True)
+    (rec_dir / "whitebox.mp4").write_bytes(b"existing video")
+    (rec_dir / "references/00.png").write_bytes(b"existing reference")
+    meta = dict(
+        case_id="case",
+        recording_id="rec",
+        object_prefix="archive/",
+        objects={"whitebox.mp4": {}, "references/00.png": {}, "references/01.png": {}},
+    )
+    receipt = suite.prepare_recording_media(
+        meta,
+        tmp_path,
+        oss_bucket="unused",
+        oss_endpoint="unused",
+        synthesize_fixtures=True,
+    )
+    assert (rec_dir / "whitebox.mp4").read_bytes() == b"existing video"
+    assert (rec_dir / "references/00.png").read_bytes() == b"existing reference"
+    assert receipt["synthesized_files"] == ["references/01.png"]
+    assert set(receipt["reused_files"]) == {"whitebox.mp4", "references/00.png"}
+    (rec_dir / "references/01.png").unlink()
+    with pytest.raises(FileNotFoundError, match="explicitly use --synthesize-fixtures"):
+        asyncio.run(
+            suite.run_source_replay_suite(
+                {"cases": [meta]},
+                media_root=tmp_path,
+                output_dir=tmp_path / "output",
+                mode="mock-worker",
+            )
+        )

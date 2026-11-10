@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Four-Case Chained SGLang Suite reusing Room SourceSession + RecordedVideoEngine."""
+"""Room-SGLang source replay integration test using the production Room pipeline."""
 
 from __future__ import annotations
 
@@ -247,6 +247,7 @@ def prepare_recording_media(
 
     verified_files: list[str] = []
     synthesized_files: list[str] = []
+    reused_files: list[str] = []
     prefix = recording_meta["object_prefix"].rstrip("/") + "/"
 
     for idx, (rel_path, meta) in enumerate(sorted(objects.items())):
@@ -288,16 +289,18 @@ def prepare_recording_media(
                 )
             verified_files.append(rel_path)
         else:
+            if dest.exists():
+                reused_files.append(rel_path)
+                continue
             if rel_path == "whitebox.mp4":
-                if not dest.exists():
-                    _synthesize_mp4(
-                        dest,
-                        width=width,
-                        height=height,
-                        fps=fps,
-                        num_frames=max(target_frames, 24),
-                        seed_offset=idx + 1,
-                    )
+                _synthesize_mp4(
+                    dest,
+                    width=width,
+                    height=height,
+                    fps=fps,
+                    num_frames=max(target_frames, 24),
+                    seed_offset=idx + 1,
+                )
                 synthesized_files.append(rel_path)
             elif rel_path.startswith("references/"):
                 fmt = _ref_format_from_rel_path(rel_path)
@@ -309,6 +312,7 @@ def prepare_recording_media(
         "directory": str(rec_dir),
         "verified_files": verified_files,
         "synthesized_files": synthesized_files,
+        "reused_files": reused_files,
     }
 
 
@@ -564,7 +568,7 @@ async def _wait_for_coordinator_idle(
     but store.candidates() requires ProcessReporter's next heartbeat (up to 2s)
     to transition observation['state'] back to 'idle'.
     """
-    from four_case_role_pool import current_pool
+    from source_replay_role_pool import current_pool
 
     pool = current_pool.get()
     if pool is not None:
@@ -692,7 +696,7 @@ def run_preflight_checks(
             )
 
     resolved_coord = _resolve_coordinator_url(sglang_url, coordinator_url)
-    from four_case_role_pool import current_pool
+    from source_replay_role_pool import current_pool
 
     service_and_cap = (
         {"status": "checked_by_role_pool_adapter"}
@@ -1290,7 +1294,7 @@ def _create_real_sglang_lease(
     except ImportError:
         ws_connect = websockets.connect
 
-    from four_case_role_pool import current_pool
+    from source_replay_role_pool import current_pool
 
     from sglang.multimodal_gen.runtime.realtime.whitebox.interactive import (
         create_model_leases,
@@ -1448,6 +1452,7 @@ async def _run_single_segment_flow(
     max_frames_after_last_event: int,
     full_frames: bool,
     preserve_switch_boundaries: bool,
+    flow_mode: str = "natural",
     realtime_pacing: bool,
     pacing_speed: float,
     capture_fps: int | None = None,
@@ -1459,6 +1464,8 @@ async def _run_single_segment_flow(
     stress_seed_override: int | None = None,
     secondary_seed_override: int | None = None,
 ) -> dict[str, Any]:
+    if flow_mode not in {"natural", "deterministic"}:
+        raise ValueError("Unknown replay flow mode")
     os.environ["WHITEBOX_BOUND_COMPUTE"] = "1"
     resolved_coord = _resolve_coordinator_url(sglang_url, coordinator_url)
     if mode == "real-sglang":
@@ -1556,7 +1563,10 @@ async def _run_single_segment_flow(
         make_segment_leases=_make_leases,
         sessions={},
     )
-    source = _ReplaySourceSession(
+    source_type = (
+        _ReplaySourceSession if flow_mode == "deterministic" else SourceSession
+    )
+    source = source_type(
         host,
         journal,
         source_epoch="epoch-1",
@@ -2033,7 +2043,7 @@ async def _run_single_segment_flow(
         for sw in mapped_switches:
             exec_boundary = int(sw["executed_boundary"])
             prev_frame_trigger = exec_boundary
-            await _wait_for(lambda: segment.selected_frames == prev_frame_trigger)
+            await _wait_for(lambda: segment.selected_frames >= prev_frame_trigger)
             sw_wall_start = time.perf_counter()
             version = int(sw["prompt_version"])
             await _send_cmd(
@@ -2070,7 +2080,10 @@ async def _run_single_segment_flow(
                 for row in segment.recording.manifest["condition_switches"]
                 if row.get("prompt_version") == version
             )
-            if manifest_sw["boundary"] != exec_boundary:
+            if (
+                flow_mode == "deterministic"
+                and manifest_sw["boundary"] != exec_boundary
+            ):
                 raise RuntimeError(
                     f"REPLAY_BOUNDARY_MISMATCH: expected {exec_boundary}, got {manifest_sw['boundary']}"
                 )
@@ -2099,10 +2112,14 @@ async def _run_single_segment_flow(
             )
 
         # Ensure steady-state tail frames are collected after the actual worker clip boundary
-        effective_target_frames = max(
-            target_segment_frames,
-            max((int(s["executed_boundary"]) for s in switch_metrics), default=0)
-            + max_frames_after_last_event,
+        effective_target_frames = (
+            target_segment_frames
+            if full_frames
+            else max(
+                target_segment_frames,
+                max((int(s["executed_boundary"]) for s in switch_metrics), default=0)
+                + max_frames_after_last_event,
+            )
         )
         await _wait_for(
             lambda: (
@@ -2180,9 +2197,11 @@ async def _run_single_segment_flow(
             assert seg2 is not None
             sec_first_time, _ = frame_batches_by_epoch[seg2.segment_epoch][0]
             sec_ttff_ms = round((sec_first_time - sec_start_wall) * 1000.0, 3)
-            sec_target_frames = min(
-                int(secondary_segment_recording["video"]["frames"]),
-                max_frames_after_last_event,
+            sec_total = int(secondary_segment_recording["video"]["frames"])
+            sec_target_frames = (
+                sec_total
+                if full_frames
+                else min(sec_total, max_frames_after_last_event)
             )
             await _wait_for(
                 lambda: (
@@ -2199,7 +2218,10 @@ async def _run_single_segment_flow(
             )
             await _wait_for(lambda: seg2.closed_event.is_set())
             secondary_result = {
-                "recording_id": secondary_segment_recording["recording_id"],
+                "condition_recording_id": secondary_segment_recording["recording_id"],
+                "input_kind": "same-source-condition-change",
+                "target_output_frames": sec_target_frames,
+                "source_recording_id": rec_id,
                 "seed": sec_seed,
                 "prepare": sec_prep,
                 "whitebox_session_ttff_ms": sec_ttff_ms,
@@ -2224,6 +2246,8 @@ async def _run_single_segment_flow(
         engine_obj = created_engines[0] if created_engines else None
         return {
             "case_id": case_id,
+            "flow_mode": flow_mode,
+            "target_output_frames": effective_target_frames,
             "world_id": recording_meta["world_id"],
             "recording_id": rec_id,
             "seed": primary_seed,
@@ -2243,6 +2267,10 @@ async def _run_single_segment_flow(
                 "received_model_frames": seg1_received,
                 "dropped_before_model": seg1_dropped,
                 "skipped_captures": sum(s["skipped_captures"] for s in switch_metrics),
+                "source_total_captured_frames": engine_obj.emitted_frames
+                if engine_obj
+                else None,
+                "source_loop_enabled": True,
                 "capture_control_log": (
                     list(engine_obj.control_log) if engine_obj else []
                 ),
@@ -2258,7 +2286,7 @@ async def _run_single_segment_flow(
             await _wait_for_coordinator_idle(resolved_coord, timeout_s=20.0)
 
 
-async def run_four_case_suite(
+async def run_source_replay_suite(
     suite_data,
     *,
     encoder_url=None,
@@ -2266,14 +2294,14 @@ async def run_four_case_suite(
     decoder_url=None,
     routing_revision=None,
     compatibility=None,
-    profile="480",
-    network_domain="test-shanghai-copy",
+    profile=None,
+    network_domain=None,
     room_token_env="WHITEBOX_ROOM_TOKEN",
     signing_secret_env="ROLE_POOL_SIGNING_SECRET",
     control_epoch=None,
     **kwargs,
 ):
-    from four_case_role_pool import SuiteRolePool
+    from source_replay_role_pool import SuiteRolePool
 
     urls = dict(encoder=encoder_url, dit=dit_url, decoder=decoder_url)
     explicit = any(urls.values())
@@ -2281,8 +2309,12 @@ async def run_four_case_suite(
         raise ValueError(
             "Provide all three Worker URLs or a Coordinator URL, exclusively"
         )
+    if explicit:
+        if kwargs.get("mode") not in {None, "real-sglang"}:
+            raise ValueError("Worker URLs cannot be used with mock-worker mode")
+        kwargs["mode"] = "real-sglang"
     if explicit or compatibility or routing_revision:
-        if (
+        if not explicit and (
             kwargs.get("mode") != "real-sglang"
             or not compatibility
             or not routing_revision
@@ -2306,11 +2338,11 @@ async def run_four_case_suite(
             control_epoch=control_epoch,
         ) as pool:
             await pool.wait_idle()
-            return await _run_four_case_suite(suite_data, **kwargs)
-    return await _run_four_case_suite(suite_data, **kwargs)
+            return await _run_source_replay_suite(suite_data, **kwargs)
+    return await _run_source_replay_suite(suite_data, **kwargs)
 
 
-async def _run_four_case_suite(
+async def _run_source_replay_suite(
     suite_data: dict[str, Any],
     *,
     media_root: Path,
@@ -2321,10 +2353,11 @@ async def _run_four_case_suite(
     max_frames_after_last_event: int = 18,
     full_frames: bool = False,
     preserve_switch_boundaries: bool = False,
+    flow_mode: str = "natural",
     realtime_pacing: bool = False,
     pacing_speed: float = 1.0,
     capture_fps: int | None = None,
-    synthesize_if_missing: bool = True,
+    synthesize_if_missing: bool = False,
     seed_base: int | None = None,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2340,6 +2373,19 @@ async def _run_four_case_suite(
                 None if full_frames else max_frames_after_last_event + 48
             ),
         )
+
+    if mode == "mock-worker" and not synthesize_if_missing:
+        missing = [
+            str(media_root / rec["recording_id"] / rel)
+            for _, rec in _iter_all_recording_metas(suite_data)
+            for rel in {"whitebox.mp4", *rec.get("objects", {})}
+            if not (media_root / rec["recording_id"] / rel).is_file()
+        ]
+        if missing:
+            raise FileNotFoundError(
+                "Mock media missing; prepare media or explicitly use --synthesize-fixtures: "
+                + missing[0]
+            )
 
     effective_seed_base = (
         int(seed_base)
@@ -2378,6 +2424,7 @@ async def _run_four_case_suite(
         max_frames_after_last_event=max_frames_after_last_event,
         full_frames=full_frames,
         preserve_switch_boundaries=preserve_switch_boundaries,
+        flow_mode=flow_mode,
         realtime_pacing=realtime_pacing,
         pacing_speed=pacing_speed,
         capture_fps=capture_fps,
@@ -2400,6 +2447,7 @@ async def _run_four_case_suite(
         max_frames_after_last_event=max_frames_after_last_event,
         full_frames=full_frames,
         preserve_switch_boundaries=preserve_switch_boundaries,
+        flow_mode=flow_mode,
         realtime_pacing=realtime_pacing,
         pacing_speed=pacing_speed,
         capture_fps=capture_fps,
@@ -2424,6 +2472,7 @@ async def _run_four_case_suite(
         max_frames_after_last_event=max_frames_after_last_event,
         full_frames=full_frames,
         preserve_switch_boundaries=preserve_switch_boundaries,
+        flow_mode=flow_mode,
         realtime_pacing=realtime_pacing,
         pacing_speed=pacing_speed,
         capture_fps=capture_fps,
@@ -2444,6 +2493,7 @@ async def _run_four_case_suite(
         max_frames_after_last_event=max_frames_after_last_event,
         full_frames=full_frames,
         preserve_switch_boundaries=preserve_switch_boundaries,
+        flow_mode=flow_mode,
         realtime_pacing=realtime_pacing,
         pacing_speed=pacing_speed,
         capture_fps=capture_fps,
@@ -2490,6 +2540,7 @@ async def _run_four_case_suite(
         max_frames_after_last_event=max_frames_after_last_event,
         full_frames=full_frames,
         preserve_switch_boundaries=preserve_switch_boundaries,
+        flow_mode=flow_mode,
         realtime_pacing=realtime_pacing,
         pacing_speed=pacing_speed,
         capture_fps=capture_fps,
@@ -2499,7 +2550,7 @@ async def _run_four_case_suite(
     )
 
     resolved_coord = _resolve_coordinator_url(sglang_url, coordinator_url)
-    from four_case_role_pool import current_pool
+    from source_replay_role_pool import current_pool
 
     pool = current_pool.get()
     post_suite_capacity = (
@@ -2520,6 +2571,9 @@ async def _run_four_case_suite(
     summary = {
         "schema_version": 1,
         "suite_name": suite_data["name"],
+        "test_kind": "room-sglang-source-replay",
+        "flow_mode": flow_mode,
+        "length_mode": "full-output-target" if full_frames else "short-output-target",
         "connection": (
             dict(
                 backend="role_pool",
@@ -2632,10 +2686,11 @@ def _render_report_md(summary: dict[str, Any]) -> str:
     flow = summary["metrics_overview"]["steady_state_flow"]
     pf_info = summary.get("preflight", {}).get("preconditions", {})
     post_info = summary.get("post_suite_verification", {})
+    secondary = summary["cases"][-1]["secondary_segment"]
     lines = [
-        "# Whitebox 四案例串联 SGLang 验证报告",
+        "# Room–SGLang 白膜供帧回放集成测试报告",
         "",
-        f"- 运行模式：`{summary['mode']}`（`seed_base={summary.get('seed_base')}`）",
+        f"- 运行模式：`{summary['mode']}`；供帧：`{summary['flow_mode']}`；长度：`{summary['length_mode']}`（`seed_base={summary.get('seed_base')}`）",
         "- 编排链路：`SourceSession` -> `ControlPrefill.prepare(hold F0)` -> `ControlPrefill.submit` -> `RenderSegment(start_boundary=F0)` -> `ControlPrefill.resume` -> `RenderSegment.switch` -> `render.end`",
         f"- 前置条件校验（Preflight 6 项）：`{summary.get('preflight', {}).get('status', 'unknown')}`；测试后租约释放核验：`all_leases_released={post_info.get('all_leases_released')}`",
         "",
@@ -2666,7 +2721,7 @@ def _render_report_md(summary: dict[str, Any]) -> str:
         f"| Step 2 跑酷：MARVEL: OVERDRIVE (`b8045d7b...`) | {ttff['marvel_overdrive_ttff_ms']} |",
         f"| Step 3 魂系战斗：Dark Horns (`5505ef1c...`) | {ttff['dark_horns_ttff_ms']} |",
         f"| Step 4 武侠格斗：功夫嘉豪 Seg 1 (`f03d9c0d...`) | {ttff['wuxia_jiahao_seg1_ttff_ms']} |",
-        f"| Step 4 武侠格斗：功夫嘉豪 Seg 2 (`083738c8...`) | {ttff['wuxia_jiahao_seg2_ttff_ms']} |",
+        f"| Step 4 功夫嘉豪 Seg 2（同源换条件；视频 `{secondary['source_recording_id']}`；条件 `{secondary['condition_recording_id']}`） | {ttff['wuxia_jiahao_seg2_ttff_ms']} |",
         "",
         "## 3. Prompt Switch TTFF 与 Dark Horns A/B 对照",
         "",
@@ -2780,7 +2835,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p_run = subparsers.add_parser(
         "run",
-        help="Run the 4-case chained suite via Room SourceSession + RecordedVideoEngine.",
+        help="Run Room-SGLang source replay integration using the selected recorded cases.",
     )
     p_run.add_argument(
         "--cases-json",
@@ -2803,7 +2858,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_run.add_argument(
         "--mode",
         choices=("mock-worker", "real-sglang"),
-        default="mock-worker",
+        default=None,
         help="Execution mode: built-in mock SGLang worker or real SGLang endpoint",
     )
     p_run.add_argument(
@@ -2824,8 +2879,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         )
     p_run.add_argument("--routing-revision")
     p_run.add_argument("--compatibility")
-    p_run.add_argument("--profile", default="480")
-    p_run.add_argument("--network-domain", default="test-shanghai-copy")
+    p_run.add_argument("--profile", help="Auto-discovered from direct Workers")
+    p_run.add_argument("--network-domain", help="Auto-discovered from direct Workers")
     p_run.add_argument("--control-epoch", help="Direct Workers' existing control epoch")
     p_run.add_argument("--signing-secret-env", default="ROLE_POOL_SIGNING_SECRET")
     p_run.add_argument("--room-token-env", default="WHITEBOX_ROOM_TOKEN")
@@ -2836,9 +2891,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Truncate segment frame count after last switch event for rapid regression",
     )
     p_run.add_argument(
+        "--flow-mode",
+        choices=("natural", "deterministic"),
+        default="natural",
+        help="natural: unmodified Room admission; deterministic: replay-only boundary gate",
+    )
+    p_run.add_argument(
         "--full-frames",
         action="store_true",
-        help="Run full historical frame counts without truncation",
+        help="Use historical output-frame counts for every segment, including secondary segments; wall time and capture counts may differ",
     )
     p_run.add_argument(
         "--preserve-switch-boundaries",
@@ -2905,8 +2966,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.subcommand == "run":
+        args.mode = args.mode or (
+            "real-sglang"
+            if any((args.encoder_url, args.dit_url, args.decoder_url))
+            else "mock-worker"
+        )
+        if args.synthesize_fixtures and args.mode != "mock-worker":
+            parser.error("--synthesize-fixtures is only available with mock-worker")
         summary = asyncio.run(
-            run_four_case_suite(
+            run_source_replay_suite(
                 suite_data,
                 media_root=args.media_dir,
                 output_dir=args.output_dir,
@@ -2926,10 +2994,11 @@ def main(argv: list[str] | None = None) -> int:
                 max_frames_after_last_event=args.max_frames_after_last_event,
                 full_frames=args.full_frames,
                 preserve_switch_boundaries=args.preserve_switch_boundaries,
+                flow_mode=args.flow_mode,
                 realtime_pacing=args.realtime_pacing,
                 pacing_speed=args.pacing_speed,
                 capture_fps=args.capture_fps,
-                synthesize_if_missing=(args.mode == "mock-worker"),
+                synthesize_if_missing=args.synthesize_fixtures,
                 seed_base=args.seed_base,
             )
         )

@@ -112,6 +112,15 @@ def install_managed_transport(app, native=None):
 def install_managed_routes(app):
     install_managed_transport(app)
 
+    @app.get("/managed/discovery")
+    async def discovery():
+        # Non-secret bootstrap only. Full identity still requires a signature.
+        native = getattr(app.state, "worker_connections", None)
+        managed = getattr(native, "managed", None)
+        if managed is None:
+            return JSONResponse({"code": "MANAGED_ROLE_UNAVAILABLE"}, status_code=503)
+        return {"control_epoch": managed.process.credentials.epoch}
+
     @app.post("/managed/{action}")
     async def managed_control(action: str, request: Request):
         native = getattr(app.state, "worker_connections", None)

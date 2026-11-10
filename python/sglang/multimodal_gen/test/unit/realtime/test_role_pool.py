@@ -1169,7 +1169,7 @@ def test_four_case_direct_pool_uses_native_fences_and_releases(monkeypatch):
     from pathlib import Path
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[6] / "benchmark/whitebox"))
-    from four_case_role_pool import SuiteRolePool, current_pool
+    from source_replay_role_pool import SuiteRolePool, current_pool
 
     async def run():
         # Actual ASGI Worker endpoints, signatures, reserve/build/renew and close.
@@ -1177,6 +1177,10 @@ def test_four_case_direct_pool_uses_native_fences_and_releases(monkeypatch):
             declaration(role, role, capacity=1)
             for role in ("encoder", "dit", "decoder")
         ]
+        for value in values:
+            value["profile_limits"]["480"].update(
+                source_sizes=[[832, 480]], target_sizes=[[832, 480]], max_references=12
+            )
         store = RolePoolStore(MemoryRecords(), "test", "control-1")
         control, managers, client = await native_cluster(store, values)
         for managed in managers.values():
@@ -1185,20 +1189,19 @@ def test_four_case_direct_pool_uses_native_fences_and_releases(monkeypatch):
                 network_domain="zone-a",
                 hardware_ids=[managed.service_id],
             )
-        monkeypatch.setenv("SUITE_TEST_SECRET", SECRET)
+        monkeypatch.setenv("ROLE_POOL_SIGNING_SECRET", SECRET)
         workers = {v["role"]: v["services"][0]["endpoints"]["http"] for v in values}
         async with client:
             async with SuiteRolePool(
                 workers=workers,
-                revision="test-revision",
-                compatibility="model-v1",
-                profile="480",
-                network_domain="zone-a",
-                control_epoch="control-1",
-                signing_secret_env="SUITE_TEST_SECRET",
                 client=client,
             ) as pool:
                 assert current_pool.get() is pool
+                assert pool.config["compatibility"] == "model-v1"
+                assert pool.config["network_domain"] == "zone-a"
+                assert pool.config["profile"] == "480"
+                assert pool.control_epoch == "control-1"
+                assert pool.revision == "model-v1"
                 await pool.wait_idle()
                 a = await pool.control("admit", request("suite"))
                 assert a["state"] == "bound"
@@ -1231,7 +1234,7 @@ def test_four_case_remote_pool_routes_and_authenticates(monkeypatch):
     from pathlib import Path
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[6] / "benchmark/whitebox"))
-    from four_case_role_pool import SuiteRolePool
+    from source_replay_role_pool import SuiteRolePool
 
     calls = []
 
@@ -1274,5 +1277,70 @@ def test_four_case_remote_pool_routes_and_authenticates(monkeypatch):
             ) as pool:
                 await pool.wait_idle()
         assert len(calls) == 2
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "compatibility",
+        "network_domain",
+        "control_epoch",
+        "profile_limits",
+        "ambiguous",
+        "wrong_secret",
+    ],
+)
+def test_four_case_auto_discovery_fails_before_admission(monkeypatch, mismatch):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[6] / "benchmark/whitebox"))
+    from source_replay_role_pool import SuiteRolePool
+
+    async def run():
+        values = [declaration(role, role) for role in ("encoder", "dit", "decoder")]
+        for value in values:
+            value["profile_limits"]["480"].update(
+                source_sizes=[[832, 480]], target_sizes=[[832, 480]], max_references=12
+            )
+        control, managers, client = await native_cluster(
+            RolePoolStore(MemoryRecords(), "test", "control-1"), values
+        )
+        for managed in managers.values():
+            managed.process.deployment = dict(
+                compatibility="model-v1",
+                network_domain="zone-a",
+                hardware_ids=[managed.service_id],
+            )
+        first = next(iter(managers.values())).process
+        if mismatch in {"compatibility", "network_domain"}:
+            first.deployment[mismatch] = "other"
+        elif mismatch == "control_epoch":
+            first.credentials = Credentials(SECRET, "other-epoch")
+        elif mismatch == "profile_limits":
+            first.profile_limits["480"]["max_references"] = 13
+        elif mismatch == "ambiguous":
+            for managed in managers.values():
+                managed.process.profiles["other"] = dict(
+                    managed.process.profiles["480"]
+                )
+                managed.process.profile_limits["other"] = dict(
+                    managed.process.profile_limits["480"]
+                )
+        monkeypatch.setenv(
+            "ROLE_POOL_SIGNING_SECRET",
+            "incorrect-secret-at-least-32-characters"
+            if mismatch == "wrong_secret"
+            else SECRET,
+        )
+        workers = {v["role"]: v["services"][0]["endpoints"]["http"] for v in values}
+        async with client:
+            with pytest.raises((ValueError, httpx.HTTPStatusError)):
+                async with SuiteRolePool(workers=workers, client=client):
+                    pytest.fail("Invalid metadata must not be admitted")
+            assert all(m.state == "idle" and m.owner is None for m in managers.values())
+        await control.shutdown()
 
     asyncio.run(run())

@@ -22,7 +22,7 @@ from sglang.multimodal_gen.runtime.realtime.whitebox.disaggregated_binding impor
     DisaggregatedModelLeases,
 )
 
-current_pool = ContextVar("four_case_pool", default=None)
+current_pool = ContextVar("source_replay_pool", default=None)
 
 
 class SuiteRolePool:
@@ -38,10 +38,10 @@ class SuiteRolePool:
         *,
         coordinator_url=None,
         workers=None,
-        revision,
-        compatibility,
-        profile="480",
-        network_domain="test-shanghai-copy",
+        revision=None,
+        compatibility=None,
+        profile=None,
+        network_domain=None,
         room_token_env="WHITEBOX_ROOM_TOKEN",
         signing_secret_env="ROLE_POOL_SIGNING_SECRET",
         control_epoch=None,
@@ -74,11 +74,7 @@ class SuiteRolePool:
         )
         try:
             if self.workers:
-                if not self.control_epoch:
-                    raise ValueError("Direct workers require --control-epoch")
-                self.credentials = Credentials(
-                    os.environ[self.signing_secret_env], self.control_epoch
-                )
+                identities = await self.discover_workers()
                 store = RolePoolStore(
                     MemoryRecords(), "suite-" + uuid4().hex, self.control_epoch
                 )
@@ -105,20 +101,9 @@ class SuiteRolePool:
                     base_url="http://in-memory.invalid",
                 )
                 for role, url in self.workers.items():
-                    identity = await self.worker_rpc(
-                        url, "identity", dict(control_epoch=self.control_epoch)
-                    )
+                    identity = identities[role]
                     deployment = identity["deployment"]
-                    for key in ("compatibility", "network_domain"):
-                        if deployment.get(key) != self.config[key]:
-                            raise ValueError(
-                                f"Worker deployment mismatch: {role}/{key}"
-                            )
                     service = identity["service"]
-                    if service["role"] != role:
-                        raise ValueError(f"Worker role mismatch: {role}")
-                    if self.config["profile"] not in identity["profiles"]:
-                        raise ValueError(f"Worker does not support profile: {role}")
                     self.identities[role] = (url, identity)
                     await store.register(
                         dict(
@@ -140,6 +125,10 @@ class SuiteRolePool:
                 self.heartbeat_task = asyncio.create_task(self.report())
                 self.controller.sweeper = asyncio.create_task(self.controller.run())
             else:
+                self.config["profile"] = self.config["profile"] or "480"
+                self.config["network_domain"] = (
+                    self.config["network_domain"] or "test-shanghai-copy"
+                )
                 # Fail before any admission when authentication is absent.
                 os.environ[self.config["room_token_env"]]
                 route = await self.client.get(
@@ -159,6 +148,73 @@ class SuiteRolePool:
         except BaseException:
             await self.shutdown()
             raise
+
+    async def discover_workers(self):
+        epochs = []
+        for url in self.workers.values():
+            response = await self.client.get(url.rstrip("/") + "/managed/discovery")
+            response.raise_for_status()
+            epochs.append(response.json()["control_epoch"])
+        if (
+            len(set(epochs)) != 1
+            or self.control_epoch
+            and self.control_epoch != epochs[0]
+        ):
+            raise ValueError("Worker control epochs do not match")
+        self.control_epoch = epochs[0]
+        secret = os.environ.get(self.signing_secret_env)
+        if not secret:
+            raise ValueError(
+                f"Configure {self.signing_secret_env} once on the test runner; signing secrets are never fetched from Workers"
+            )
+        self.credentials = Credentials(secret, self.control_epoch)
+        identities = {}
+        for role, url in self.workers.items():
+            identity = await self.worker_rpc(
+                url, "identity", {"control_epoch": self.control_epoch}
+            )
+            if (
+                identity["service"]["role"] != role
+                or identity["control_epoch"] != self.control_epoch
+            ):
+                raise ValueError(f"Worker identity mismatch: {role}")
+            identities[role] = identity
+        for key in ("compatibility", "network_domain"):
+            values = [i["deployment"][key] for i in identities.values()]
+            if (
+                len(set(values)) != 1
+                or self.config[key]
+                and self.config[key] != values[0]
+            ):
+                raise ValueError(f"Worker deployment mismatch: {key}")
+            self.config[key] = values[0]
+        common = set.intersection(*(set(i["profiles"]) for i in identities.values()))
+        if self.config["profile"]:
+            common &= {self.config["profile"]}
+        else:
+            common = {
+                p
+                for p in common
+                if all(
+                    [832, 480] in i["profile_limits"][p]["source_sizes"]
+                    and [832, 480] in i["profile_limits"][p]["target_sizes"]
+                    and i["profile_limits"][p]["max_references"] >= 12
+                    and i["profile_limits"][p]["max_fps"] >= 24
+                    for i in identities.values()
+                )
+            }
+        if len(common) != 1:
+            raise ValueError(
+                "Expected one common 832x480 profile; use --profile to resolve ambiguity"
+            )
+        profile = next(iter(common))
+        limits = [i["profile_limits"][profile] for i in identities.values()]
+        if any(value != limits[0] for value in limits):
+            raise ValueError("Worker profile limits do not match")
+        self.config["profile"] = profile
+        # Standalone mode has no routing table; compatibility identifies this model.
+        self.revision = self.revision or self.config["compatibility"]
+        return identities
 
     async def worker_rpc(self, url, action, body):
         token = self.credentials.sign(action, body, expires_at=time.time() + 10)
