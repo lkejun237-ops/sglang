@@ -395,7 +395,6 @@ def sdk_descriptor(base):
         "file-mode",
         "stale-binding",
         "missing-render",
-        "public-input",
     ],
 )
 def test_member_helper_uses_actual_sdk_read_session_and_checks_private_identity(
@@ -432,20 +431,6 @@ def test_member_helper_uses_actual_sdk_read_session_and_checks_private_identity(
             key: descriptor[key]
             for key in ["sessionId", "baseUrl", "accessToken", "accessMode"]
         }
-        if bad == "public-input":
-            descriptor["input"] = dict(
-                schemaVersion=1,
-                abiVersion="player-input/1",
-                manifest=dict(path="player-input/manifest.json", sha256="c" * 64),
-                adapters=[],
-                baseUrl=descriptor["baseUrl"] + "/v1/sessions/render-alice/",
-            )
-            descriptor["ui"]["moduleUrl"] = (
-                descriptor["baseUrl"]
-                + "/ui/"
-                + descriptor["uiBundleHash"]
-                + "/module.js"
-            )
         binding = copy.deepcopy(descriptor["playerBinding"])
         if bad == "render-session":
             binding["render"]["sessionId"] = "foreign"
@@ -495,37 +480,20 @@ def test_member_helper_uses_actual_sdk_read_session_and_checks_private_identity(
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(
                     json.dumps(
-                        dict(
-                            memberFile=str(file),
-                            uiRoot=str(tmp_path / "ui"),
-                            **(
-                                {"publicOrigin": "https://gateway.test"}
-                                if bad == "public-input"
-                                else {}
-                            ),
-                        )
+                        dict(memberFile=str(file), uiRoot=str(tmp_path / "ui"))
                     ).encode()
                 ),
                 15,
             )
-            if bad in (None, "public-input"):
+            if bad is None:
                 assert process.returncode == 0, stderr.decode()
                 result = json.loads(stdout)
                 assert (
                     result["epoch"] == 3
                 )  # Minimal SessionConnection deliberately has no epoch.
-                if bad == "public-input":
-                    assert (
-                        result["input"]["baseUrl"]
-                        == "https://gateway.test/v1/sessions/render-alice/"
-                    )
-                    assert (
-                        result["input"]["manifest"] == descriptor["input"]["manifest"]
-                    )
-                else:
-                    assert result["streams"]["pixels"]["url"].endswith(
-                        "/v1/sessions/render-alice/pixels"
-                    )
+                assert result["streams"]["pixels"]["url"].endswith(
+                    "/v1/sessions/render-alice/pixels"
+                )
                 assert result["playerBinding"]["connectionEpoch"] == 2
                 assert len(requests) == 1
                 assert "Authorization: Bearer " + "a" * 48 in requests[0]

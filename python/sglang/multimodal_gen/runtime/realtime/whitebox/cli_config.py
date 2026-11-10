@@ -4,9 +4,6 @@
 import re
 from pathlib import Path
 
-# Renew the source-owned viewer grant independently of gameplay/input leases.
-INPUT_SESSION_RENEW_SECONDS = 60
-
 
 def seconds(env, key, default, *, maximum=2147483, minimum=0):
     value = str(env.get(key, default))

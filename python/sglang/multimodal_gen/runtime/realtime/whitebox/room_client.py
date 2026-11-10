@@ -86,9 +86,6 @@ class RemoteEngine:
                 break
             yield EngineFrame(**value)
 
-    async def player_input_session(self):
-        return await self.rpc("player_input_session")
-
     async def ui_asset(self, path):
         return await self.rpc("ui_asset", {"path": path})
 
