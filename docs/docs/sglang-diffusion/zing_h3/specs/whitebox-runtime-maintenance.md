@@ -129,7 +129,7 @@ These tests are not GPU FPS, E2E presentation or multihour memory proof. Both 48
 and 736 model performance/memory remain unverified for this added management
 surface; no model kernel or steady frame path changed.
 
-Deployment requires the reviewed shared SDK pin, SGLang white_box merge and the
+Deployment requires the reviewed shared SDK pin, SGLang main merge and the
 existing Room/Gateway image builds. WTP's matching management Web is a separate
 shared-source deployment. A local passing UI or source merge is not deployed
 cache/stream acceptance.

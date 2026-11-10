@@ -20,7 +20,8 @@ An explicitly authorized isolated development test can build with
 `WHITEBOX_SOURCE_BRANCH=codex/<branch>` and start with
 `WHITEBOX_ALLOW_DEVELOPMENT_RELEASE=1`. The version endpoint preserves the actual
 branch/SHA and marks `release_scope=isolated_development_test`. Production defaults
-and the production release builder still require `white_box`; this test option
+and the production release builder require an exact `main`-reachable SGLang SHA
+and a reviewed `dev`-reachable SDK pin; this test option
 does not authorize deployment or changes to a shared lane.
 
 These files extend an existing Whitebox deployment; they are not a complete deployment manifest. Retain the current internal tokens, `WHITEBOX_ROOM_OWNERS`, `WHITEBOX_ROOM_OWNER_ID`, `WHITEBOX_ROOM_DRIVER`, `WHITEBOX_ROOM_COORDINATOR_URL`, `WHITEBOX_ROUTING_REVISION`, pinned CLI/SDK, media/ICE, storage and publication configuration. Use the existing [Whitebox deployment entry](/docs/sglang-diffusion/zing/deployment_zing_h3) and the repository `benchmark/whitebox/README.md` for those prerequisites.
@@ -239,4 +240,4 @@ Install a local `redis-server` to run the real Redis cases. Tests start their ow
 
 Read `contracts.py` and `store.py` first, then `scheduler.py` and `worker.py`, then `native_http.py` / `reporting.py`, and finally `whitebox/disaggregated_binding.py` plus `transport.py`. Tests cover registration granularity, budget contention, shared admission fencing, partial build/cleanup, shutdown authority, process drain/replacement, signed controls, replay protection, and split-channel ordering.
 
-The wider merged conditioning/Prefill/decoder/player-lifecycle suites remain required. Local CPU tests do not establish CUDA correctness, heterogeneous NCCL interoperability, per-player FPS/latency, or production readiness. Future release still requires exact `white_box` source/SDK identities, no hot patches, five current browser cases of at least 180 seconds per formal player, multiplayer interfaces, cache/recording coverage, and explicit reporting of every observed regression. This change does not authorize deployment.
+The wider merged conditioning/Prefill/decoder/player-lifecycle suites remain required. Local CPU tests do not establish CUDA correctness, heterogeneous NCCL interoperability, per-player FPS/latency, or production readiness. Future release still requires an exact `main`-reachable SGLang SHA and reviewed `dev`-reachable SDK pin, no hot patches, five current browser cases of at least 180 seconds per formal player, multiplayer interfaces, cache/recording coverage, and explicit reporting of every observed regression. This change does not authorize deployment.
