@@ -4,6 +4,8 @@ SGLang 的生产源码分支使用 `main`。本仓库 PR CI 执行测试；云�
 Worldkit CLI/Stream Host 使用其 `dev` 分支可达的不可变提交，无需先合入 SDK 的 `white_box` 分支。
 手工构建器和 Jenkins 都会校验提交的祖先关系；`sdk-revision.txt` 独立于 SGLang `main` 提交固定 SDK 的精确源码版本。
 
+已构建的准确 Docker 镜像可按[Room/Gateway 候选与切换](../../docs/docs/sglang-diffusion/zing/plans/docker-cutover.md)分阶段准备、空闲切换和回滚；私有配置必须绑定实际线路、完整授权角色和不可变身份。
+
 持续维护的操作流程和验证边界见
 [Whitebox 手工发布](../../docs/docs/sglang-diffusion/zing/plans/whitebox-manual-releases.mdx)。
 

@@ -1,0 +1,65 @@
+{
+  "docker_socket": "/var/run/docker.sock",
+  "authorized_roles": [
+    "room"
+  ],
+  "containers": [
+    {
+      "role": "room",
+      "old_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "old_name": "existing-room",
+      "candidate_name": "reviewed-room-candidate",
+      "image": "registry.example/room@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "old_source": "cccccccccccccccccccccccccccccccccccccccc",
+      "source": "dddddddddddddddddddddddddddddddddddddddd",
+      "old_sdk": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "sdk": "ffffffffffffffffffffffffffffffffffffffff",
+      "branch": "main",
+      "sdk_files": {
+        "packages/cli/src/main.ts": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "remove_mounts": [],
+      "health_url": "http://127.0.0.1:8092/healthz",
+      "version_url": "http://127.0.0.1:8092/v1/whitebox/version"
+    }
+  ],
+  "idle": {
+    "room_status": {
+      "url": "http://127.0.0.1:8092/internal/worlds/runtime",
+      "body": {
+        "operation": "status"
+      },
+      "token_role": "room",
+      "token_env": "WHITEBOX_INTERNAL_TOKEN"
+    },
+    "role_pools": [
+      {
+        "url": "http://127.0.0.1:18081/v1/role-pool/capacity",
+        "body": {
+          "profile": "REPLACE_WITH_EXISTING_PROFILE",
+          "network_domain": "REPLACE_WITH_EXISTING_DOMAIN"
+        },
+        "token_role": "room",
+        "token_env": "REPLACE_WITH_EXISTING_ROLE_TOKEN_ENV"
+      }
+    ],
+    "metrics": {
+      "url": "http://127.0.0.1:8092/metrics"
+    }
+  },
+  "nginx": {
+    "path": "/etc/nginx/conf.d/REPLACE.conf",
+    "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+    "pid_file": "/run/nginx.pid",
+    "marker": " location /whitebox/ {",
+    "paths": [
+      "/whitebox/v1/webrtc/play",
+      "/whitebox/v1/realtime_video/generate",
+      "/whitebox/v1/realtime_video/prefill",
+      "/v1/webrtc/play",
+      "/v1/realtime_video/generate",
+      "/v1/realtime_video/prefill"
+    ],
+    "drain_timeout_s": 30
+  }
+}
