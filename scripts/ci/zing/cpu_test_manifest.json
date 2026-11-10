@@ -12073,6 +12073,201 @@
       }
     },
     {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_h3_profile_launcher.py",
+      "suite": "realtime-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two complete fixed Linux CPU trials passed, including native worker CLI, role isolation and launcher lifecycle regressions. GPU fit, cross-host NCCL, video and performance remain unvalidated; no deployment.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "8fe5bdc85ab7e52b73e66171e2611ff0b8760926ab1cc32325b55122cc0afd19",
+        "source_revision": "f296bad4ce57368744b0d0d3905a3cc90e7cd96b",
+        "checkout_sha": "81fcbf9349828b2c024d649d696b6854050d7d6c",
+        "runtime_dependency_revision": "2f0e4c252a9831e061a6175bfba171999c46dea0",
+        "implementation_sha256": {
+          "python/sglang/multimodal_gen/tools/zing_h3_profile_launcher.py": "94f901178dc15e96b2f8bc975be87e2c139935d0d155332049f36e1b3ec6ecdb",
+          "python/sglang/multimodal_gen/tools/zing_h3_role_launcher.py": "39c509cc260debbd6e28051e6f3d03e5c539663c4b99881bf4b6bbe80ba6fd52",
+          "python/sglang/multimodal_gen/tools/zing_b300_launcher.py": "fbc4006c5d0858a8fb3b7b31c50a913706b461e80b2aedd858f246cde0dd0634",
+          "python/sglang/multimodal_gen/runtime/entrypoints/zing_source_encoder_server.py": "227af9e8617117444bb705bd8087d4609aa2725d2ae57583e07437e267f8210b",
+          "python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/zing_h3/dit_worker.py": "4fe445ea08ba39fa985120eb6a8c95b0f53abd956a9835ee5630e0076bc71670",
+          "python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/zing_h3/decoder_worker.py": "15a06ebf3c83959d374bb54cf868f77e11df9376a3e6ee3ba34ecd1e35976b5c"
+        },
+        "receipt": "https://github.com/seedleap/sglang/actions/runs/42646323911/artifacts/13688191581",
+        "receipt_path": "launcher-triage/receipt.json",
+        "receipt_file_sha256": "ad57ffee6d420fe9c2213045b10bc7a07e62c88790d61d8bd92f20d9dd59a02a",
+        "candidate_fingerprint": "ba99abc309ddb6f900e75de262d38e6c4c7a762d03f1f98db6a666cf4b0e1d59",
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "5b4b5a6b39bc8d729acbc53612527e881e24202c706f960773d6c8cf83014f48",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          }
+        },
+        "environment": {
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
+        },
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 42,
+            "collected": 42,
+            "skipped": 0,
+            "duration_seconds": 3.874561562000025,
+            "exit_code": 0,
+            "junit_path": "launcher-triage/cpu-1-trial-1.xml",
+            "junit_sha256": "d5f5a78453cb63a97c002d65c09c6e86cb5a1e11bd308b8f2c0d35ab3292f03b",
+            "log_sha256": "4e7829265ecce719744810667413ba82971db6f746ab554aa528e3733dd9b511"
+          },
+          {
+            "trial": 2,
+            "passed": 42,
+            "collected": 42,
+            "skipped": 0,
+            "duration_seconds": 4.370841566999985,
+            "exit_code": 0,
+            "junit_path": "launcher-triage/cpu-1-trial-2.xml",
+            "junit_sha256": "3a5d5b920f57c4ceaa2f2be0a5ef90c0504e52ba6ce0e8e0c0dc346a175da123",
+            "log_sha256": "06de2b8b9e4bdb8aeb9ab9e4ea9f97621e900ee8f5cc5e158534073d6ff6f958"
+          }
+        ]
+      }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_b300_launcher.py",
+      "suite": "realtime-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two complete fixed Linux CPU trials passed, including native worker CLI, role isolation and launcher lifecycle regressions. GPU fit, cross-host NCCL, video and performance remain unvalidated; no deployment.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "7cd984247f36c418197d42e726b3e167394a8c249db4e2bb7dad049a227a7c57",
+        "source_revision": "f296bad4ce57368744b0d0d3905a3cc90e7cd96b",
+        "checkout_sha": "81fcbf9349828b2c024d649d696b6854050d7d6c",
+        "runtime_dependency_revision": "2f0e4c252a9831e061a6175bfba171999c46dea0",
+        "implementation_sha256": {
+          "python/sglang/multimodal_gen/tools/zing_h3_profile_launcher.py": "94f901178dc15e96b2f8bc975be87e2c139935d0d155332049f36e1b3ec6ecdb",
+          "python/sglang/multimodal_gen/tools/zing_h3_role_launcher.py": "39c509cc260debbd6e28051e6f3d03e5c539663c4b99881bf4b6bbe80ba6fd52",
+          "python/sglang/multimodal_gen/tools/zing_b300_launcher.py": "fbc4006c5d0858a8fb3b7b31c50a913706b461e80b2aedd858f246cde0dd0634",
+          "python/sglang/multimodal_gen/runtime/entrypoints/zing_source_encoder_server.py": "227af9e8617117444bb705bd8087d4609aa2725d2ae57583e07437e267f8210b",
+          "python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/zing_h3/dit_worker.py": "4fe445ea08ba39fa985120eb6a8c95b0f53abd956a9835ee5630e0076bc71670",
+          "python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/zing_h3/decoder_worker.py": "15a06ebf3c83959d374bb54cf868f77e11df9376a3e6ee3ba34ecd1e35976b5c"
+        },
+        "receipt": "https://github.com/seedleap/sglang/actions/runs/42646323911/artifacts/13688191581",
+        "receipt_path": "launcher-triage/receipt.json",
+        "receipt_file_sha256": "ad57ffee6d420fe9c2213045b10bc7a07e62c88790d61d8bd92f20d9dd59a02a",
+        "candidate_fingerprint": "ba99abc309ddb6f900e75de262d38e6c4c7a762d03f1f98db6a666cf4b0e1d59",
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "5b4b5a6b39bc8d729acbc53612527e881e24202c706f960773d6c8cf83014f48",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          }
+        },
+        "environment": {
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
+        },
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 21,
+            "collected": 21,
+            "skipped": 0,
+            "duration_seconds": 4.123015632999994,
+            "exit_code": 0,
+            "junit_path": "launcher-triage/cpu-2-trial-1.xml",
+            "junit_sha256": "b6d1eaacaf3f22ddc3cbc6134ea70a5978561eea5bef8b8209c79329d33fd34c",
+            "log_sha256": "0ea893bda70c12145944ac0be291010432954eee0ad5da258b92954d5e33c7e3"
+          },
+          {
+            "trial": 2,
+            "passed": 21,
+            "collected": 21,
+            "skipped": 0,
+            "duration_seconds": 4.224925999000021,
+            "exit_code": 0,
+            "junit_path": "launcher-triage/cpu-2-trial-2.xml",
+            "junit_sha256": "c8852f498125ae51b4081b067b6842340903fb7eb7f2efdcf5421c043944dd48",
+            "log_sha256": "27ea060a9921ae2cf13ca8b21cda6340242c1fb406f21ad1de6c90f079393973"
+          }
+        ]
+      }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_h3_independent_launcher.py",
+      "suite": "realtime-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "dependencies": [],
+      "reason": "Two complete fixed Linux CPU trials passed, including native worker CLI, role isolation and launcher lifecycle regressions. GPU fit, cross-host NCCL, video and performance remain unvalidated; no deployment.",
+      "trial_evidence": {
+        "source_sha256": "37cc44efe1c6008398dcb6ad7daf5d367a0717bfa982819b6d6e67807e96947f",
+        "source_revision": "f296bad4ce57368744b0d0d3905a3cc90e7cd96b",
+        "checkout_sha": "81fcbf9349828b2c024d649d696b6854050d7d6c",
+        "runtime_dependency_revision": "2f0e4c252a9831e061a6175bfba171999c46dea0",
+        "implementation_sha256": {
+          "python/sglang/multimodal_gen/tools/zing_h3_profile_launcher.py": "94f901178dc15e96b2f8bc975be87e2c139935d0d155332049f36e1b3ec6ecdb",
+          "python/sglang/multimodal_gen/tools/zing_h3_role_launcher.py": "39c509cc260debbd6e28051e6f3d03e5c539663c4b99881bf4b6bbe80ba6fd52",
+          "python/sglang/multimodal_gen/tools/zing_b300_launcher.py": "fbc4006c5d0858a8fb3b7b31c50a913706b461e80b2aedd858f246cde0dd0634",
+          "python/sglang/multimodal_gen/runtime/entrypoints/zing_source_encoder_server.py": "227af9e8617117444bb705bd8087d4609aa2725d2ae57583e07437e267f8210b",
+          "python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/zing_h3/dit_worker.py": "4fe445ea08ba39fa985120eb6a8c95b0f53abd956a9835ee5630e0076bc71670",
+          "python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/zing_h3/decoder_worker.py": "15a06ebf3c83959d374bb54cf868f77e11df9376a3e6ee3ba34ecd1e35976b5c"
+        },
+        "receipt": "https://github.com/seedleap/sglang/actions/runs/42646323911/artifacts/13688191581",
+        "receipt_path": "launcher-triage/receipt.json",
+        "receipt_file_sha256": "ad57ffee6d420fe9c2213045b10bc7a07e62c88790d61d8bd92f20d9dd59a02a",
+        "candidate_fingerprint": "ba99abc309ddb6f900e75de262d38e6c4c7a762d03f1f98db6a666cf4b0e1d59",
+        "environment_recipe": {
+          "python_version": "3.11",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "5b4b5a6b39bc8d729acbc53612527e881e24202c706f960773d6c8cf83014f48",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          }
+        },
+        "environment": {
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
+        },
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 32,
+            "collected": 32,
+            "skipped": 0,
+            "duration_seconds": 4.327469693000012,
+            "exit_code": 0,
+            "junit_path": "launcher-triage/cpu-3-trial-1.xml",
+            "junit_sha256": "01868cfc31e99785ac589e7fef12e9a8002ac73f07afff660424bf0159e5a5be",
+            "log_sha256": "a4c5ee87c902889fb98b0a8fa160bb819a5d421043a2ad4bfbe88e2e335917b0"
+          },
+          {
+            "trial": 2,
+            "passed": 32,
+            "collected": 32,
+            "skipped": 0,
+            "duration_seconds": 4.1082643800000085,
+            "exit_code": 0,
+            "junit_path": "launcher-triage/cpu-3-trial-2.xml",
+            "junit_sha256": "5004c03b296bba3b909fd11a09652cb6bd7815fd86f1dd3dad4de5b2d28d7abf",
+            "log_sha256": "0d559453eabd56cc0f1e2226d3b9dc4833e1e7ac7eb2d7fe77cff64ef80b00ff"
+          }
+        ]
+      }
+    },
+    {
       "path": "python/sglang/multimodal_gen/test/unit/test_zing_h3_block_sparse_attn.py",
       "suite": "dit-pipeline-contracts",
       "status": "CPU_PASS",

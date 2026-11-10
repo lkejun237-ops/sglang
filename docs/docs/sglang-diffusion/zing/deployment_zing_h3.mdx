@@ -807,6 +807,142 @@ PR 保持草稿。736 按用户要求暂停。on 的独立阶段 CUDA/Host 与 p
 共用合法事务校验；`split_first_latent=false` 不关闭首次联合。
 `INITIAL_PREFIX_JOINT=0` 仍可恢复首次独立 condition 路径。
 合并版本仅补 CPU 组合回归，尚未重跑 GPU；上述性能数据保留原受测版本边界。
+## B300 / H200 统一 launcher
+
+2026-11-09：将 #471 的硬件/component 启动入口与 #492 的 B300 全组件监督启动合并，
+`zing_h3_profile_launcher` 与 `zing_b300_launcher` 共用 `COMMON_ENV` 和 `server_policy()`。
+W6/S0、缓存预算和角色布局沿用已核验的部署策略；按用户选择，两个入口默认 quantum=1，
+开启流水线重叠/prefetch、prompt-joint 和 Qwen 六项选项。这是新组合默认，不能称为线上旧快照
+已验证配置；实际线上服务未修改。上海独立 `launch.sh → dit_worker` 仍是另一入口。
+
+| 设置 | H200 配方 | B300 配方 |
+| --- | --- | --- |
+| server 默认角色 | DiT 0、1；Encoder/Qwen 2；Decoder 3 | 同左 |
+| 资产 | 准备好的 W6/S0，after_step0，AdaLN weights_free + table 路径 | 准备好的 W6/S0，after_step0，resident AdaLN |
+| Source quantum / Encoder mode | 1 / overlap | 同左 |
+| Encoder prefetch / async output / Decoder overlap / defer-final | 全开 | 同左 |
+| Prompt joint | 默认 CLI true，可显式 false | 同左 |
+| 会话 lease / idle / 最大寿命 | 1200 / 1200 / 7200 秒 | 1200 / 1200 / 7800 秒 |
+| 预热 / Encoder 布局 | off / replicate | 同左 |
+| Qwen 六项执行选项，含 FP8 | 默认全开，可显式环境覆盖 | 同左 |
+| KV 容量 | mem-fraction-static=0.8，不传退休的 size/max_* 字段 | 同左 |
+| Block0 Host / Disk / storage | 416 GB / 700 GB / local | 同左 |
+| L2 GC | 开启；reserve/inflight 各128 GB，writers=2，high/low=0.9/0.8 | 同左 |
+| 跨实例 Host 预算 / capacity dir | 416 GB / /var/lib/sglang/capacity | 同左 |
+
+算子融合、FA4、compiled AdaLN、denoise Graph 等仍受运行时硬件/shape/backend 准入；
+Qwen profile 必须按相同六项选项构建；旧六项全关的 profile 需要重建，不能直接复用。
+显式环境值和同名 CLI 参数仍优先，支持 `--flag=value`。实际运行前检查 pipeline/profile
+的 W6/S0、after_step0 和地域 AdaLN；校验失败会拒绝启动，不修改原始资产。
+
+```bash
+# 先在 Encoder 共卡设备启动 Qwen；--component conditioning -- build-profile 可复用选项。
+CUDA_VISIBLE_DEVICES=2 python -m sglang.multimodal_gen.tools.zing_h3_profile_launcher \
+  --profile b300 --resolution 480 --component conditioning -- \
+  serve --config "$CONDITIONING_SERVICE_CONFIG" --profile "$CONDITIONING_PROFILE" \
+  --host 127.0.0.1 --port 31002
+
+python -m sglang.multimodal_gen.tools.zing_h3_profile_launcher \
+  --profile b300 --resolution 480 --dry-run -- \
+  --model-path "$MODEL_PATH" --pipeline-config-path "$PIPELINE_CONFIG" \
+  --conditioning-service-url http://127.0.0.1:31002 \
+  --conditioning-expected-profile "$CONDITIONING_PROFILE" \
+  --conditioning-config "$CONDITIONING_CLIENT_CONFIG"
+```
+
+去掉 `--dry-run` 才启动。H200 server 配方选择 `--profile h200`，须提供匹配的 AdaLN 表；
+不能将 server CLI 直接传给线上独立 `dit_worker`。`--component dit` 仍仅启动 SP2 DiT/HTTP，
+复用 profile 中同机已就绪的 Encoder/Decoder；不负责创建通信组或注册线上路由。
+独立 `encoder` / `decoder` 模式默认用 torchrun 启动一张可见卡，可显式 `--worker-gpus N`；
+参数放在 `--` 后，如 `--model`、`--port`、Decoder 的 `--decoder-config`。
+这些独立模式不默认注入 DiT 开关；Decoder 静态连接可显式传 `--static-connection`。
+
+缓存路径可显式覆盖，GC budget-root 默认跟随该目录的父目录；多个实例必须共享总预算、
+capacity dir 和正确的 budget-root。缓存目录须预先挂载且具备容量，launcher 不申请资源。
+DiT 默认按冻结线上快照选择：H200 none、B300 native FP8（关闭direct GPU load，
+`SGLANG_ZING_QUANT_SCOPE=ffn-attention`）。#647 公共配置的默认仍是 none；B300显式传
+`--quantization none` 可保留该 DiT BF16 策略。Qwen FP8 默认开启；Lynn Decoder 仍为 BF16。
+
+`--resolution 736` 只选择快路径策略，不改请求尺寸，不证明 736 能力。默认线上输入是832×480；
+480/736 的整体与 Encoder/DiT/Decoder 性能、显存、画质和会话生命周期仍未完成本版本 GPU A/B。
+启动/配置 CPU 契约通过不等于 GPU ready 或 ≥20 FPS；历史记录保留各自源码和输入边界。
+
+## 独立角色模式：H100 Encoder/Decoder + H200 SP1 DiT
+
+`--mode independent` 复用 #647 的三个独立入口及既有 Worker 通信组协议。
+#647 已合入 main；本 PR 已同步主线并以 main 为目标。下述入口提供硬件策略覆盖，
+主线 `deploy/sglang` 的通用角色启动与部署渲染入口继续保留。
+三个角色和控制客户端使用兼容、冻结的同一运行版本，不能混用旧底层 Encoder worker 与独立输入服务。
+
+| 角色 | GPU 布局 | 实际入口 |
+| --- | --- | --- |
+| Encoder | 一张 H100，单进程 | `runtime.entrypoints.zing_source_encoder_server`，包含 Qwen、reference/source VAE |
+| Decoder | 另一张 H100，torchrun 1 rank | `zing_h3.decoder_worker`，动态连接，无 static-connection |
+| DiT | 一张 H200，SP1 | `zing_h3.dit_worker --sp-degree 1`；仅启动该角色，不创建本地编解码进程 |
+
+H100 只在独立 Encoder/Decoder 模式准入。这里的 H100 配方依据 SM90 和可见容量区间选择，
+不是商业 SKU 认证，也不代表模型已在该显存容量下验证能加载。保留显存/CC 回执；GPU fit 仍需实测。
+Encoder 默认合并 VAE 与 Qwen 六项选项；DiT 只注入自身算子选项，不把 Qwen/Encoder 开关塞给它；
+Decoder 继续使用原 checkpoint/decoder_config 与运行时融合准入。显式环境值仍可覆盖默认值。
+独立入口只接收原生 worker 支持的参数；defer-final 使用布尔开关，不传字符串 true/false。
+H200 DiT 默认 BF16，不向原生 worker 传 `--quantization none`；原生入口以省略该参数表示不启用在线量化。
+独立Encoder在本地执行Qwen，不额外启动remote conditioning RPC；quantum及未暴露的server调度
+选项由#647原入口管理，不把旧server全部开关转发或宣称逐项命中。
+
+下面假设两张 H100 位于同机，分别为已获分配的设备0/1；H200 为另一实例的已分配设备0。
+若分在不同H100实例，分别替换设备和对应IP。变量必须指向各节点已准备好的本地资产，
+不要求绝对路径相同；checkpoint、profile、采样、W6/S0及协议身份必须一致。
+
+```bash
+# H100主机：完整Encoder服务，不是旧source VAE底层worker。
+CUDA_VISIBLE_DEVICES=0 python -m sglang.multimodal_gen.tools.zing_h3_profile_launcher \
+  --mode independent --component encoder --profile h100 --resolution 480 -- \
+  --model "$ENCODER_MODEL" --pipeline-config-path "$ENCODER_PIPELINE" \
+  --advertise-host "$ENCODER_IP" --http-port 31000 --port 30000
+
+# H100主机另一张卡；JSON应包含Lynn checkpoint/model_dir及匹配的BF16/EMA配置。
+CUDA_VISIBLE_DEVICES=1 python -m sglang.multimodal_gen.tools.zing_h3_profile_launcher \
+  --mode independent --component decoder --profile h100 --resolution 480 -- \
+  --model "$DECODER_MODEL" --decoder-config "$DECODER_CONFIG_JSON" \
+  --advertise-host "$DECODER_IP" --http-port 36000
+
+# H200主机：SP1 DiT；pipeline保持已准备的AdaLN table和W6/S0，容量沿用mem-fraction-static。
+CUDA_VISIBLE_DEVICES=0 python -m sglang.multimodal_gen.tools.zing_h3_profile_launcher \
+  --mode independent --component dit --profile h200 --sp-degree 1 --resolution 480 -- \
+  --model "$DIT_MODEL" --pipeline-config-path "$DIT_PIPELINE" \
+  --advertise-host "$DIT_IP" --http-port 33000 \
+  --zing-block0-cache-dir "$DIT_CACHE_DIR" --timeout-seconds 300
+```
+
+在 `--` 前增加 `--dry-run` 只生成配置回执，不启动worker或建组。
+只向本角色暴露所用卡；实际exec前清除继承的RANK/WORLD_SIZE等分布式变量，保留CUDA可见设备选择。
+`--advertise-host` 必须是其他节点可访问的地址/部署DNS，拒绝loopback和通配地址；
+管理HTTP、输入输出WS、ZMQ/TCPStore及NCCL网络均须按既有协议可达，HTTP健康不代表张量链路可用。
+
+**Master是外部控制客户端，不是DiT，不需要额外GPU。** 启动器不主动配对服务，仍由上游或
+现有测试客户端查询三个service、取得预留并调用build_group。测试客户端例子如下：
+
+```bash
+python benchmark/zing_h3_causal/encoder_test_master.py \
+  --encoder-http "$ENCODER_IP:31000" --dit-http "$DIT_IP:33000" \
+  --decoder-http "$DECODER_IP:36000" --source-video "$SOURCE_VIDEO" \
+  --expected-frames 120 --width 832 --height 480 --prompt "$PROMPT" \
+  --output "$RESULT_DIR"
+```
+
+输入WS、输出WS和角色间端点使用查询响应，不自行推算。结束时仍按原协议先Encoder quiesce，
+再并行销毁三个角色的通信组；启动、建组、业务会话、拆组是不同验收阶段。
+完整说明见[独立部署接入](DISAGGREGATED_SERVING_GUIDE.md)、
+[Worker通信组协议](specs/WORKER_CONNECTION_API.md)和[Master测试入口](../../../../benchmark/zing_h3_causal/WORKER_GROUP_MASTER.md)。
+2026-11-09 / `f296bad4ce`：固定Linux环境两轮各129项通过（独立模式32、通用入口42、B300监督21、Worker连接协议34），无失败/跳过；[回执](https://github.com/seedleap/sglang/actions/runs/42646323911/artifacts/13688191581)。
+2026-11-09 / `087185f3a4`：上海 H100（L20Z/SM90）Encoder 与 Decoder 已实际加载并返回 ready。
+Encoder（Qwen FP8 + VAE，共进程共卡）就绪后的整卡 driver 采样为 28,867 MiB，Lynn BF16 Decoder 为 7,387 MiB；
+这是启动常驻采样，不是请求峰值或性能结果。两个探针 Pod 退出并删除后，目标两卡均回到 0 MiB、无计算进程。
+[原始配置、日志与回执](https://github.com/seedleap/sglang/pull/471)归档于
+`oss://leap-world-shanghai/world-model/sglang/evals/pr471-hybrid-acceptance-20261109/`。
+上述 GPU 证据仅对应 `087185f3a4`；同步主线后尚未重复 GPU 验收。验收当时 H200 的 8 卡已被现有 4 个作业分配，
+未停止或修改这些作业；H200 SP1 DiT 加载、跨机 NCCL、
+建组/视频/会话生命周期及 480/736 性能、请求峰值显存均未验收。总体验收仍未通过；没有部署到线上。
 
 ## 当前测试默认采样
 
@@ -818,6 +954,45 @@ PR 保持草稿。736 按用户要求暂停。on 的独立阶段 CUDA/Host 与 p
 profile/CLI 也可能覆盖默认值。下表全程四步和 4→1 等结果仍是各自配置的历史证据，
 不代表当前默认 4→2 的性能或画质；当前请求准备缓存的 H100 验证状态见下一节，
 画质尚未在本次变更中做人工验收。
+
+## B300 四卡全组件监督启动
+
+`scripts/zing/launch_b300.sh` 在同一PR内提供四卡 E1/Qwen + SP2 + D1 监督启动：
+前两卡DiT、第三卡Encoder/Qwen、第四卡Lynn，复用上一节统一默认值。
+此入口不切换线上路由，不替代 #647 的 heartbeat、worker epoch 和发布身份流程。
+
+- 请求 profile 与池同时 W6/S0、block-relative、gap12、after_step0。
+  即使原 export 使用 before_source，本地派生 profile 也同步到 after_step0，原文件不变。
+- resident AdaLN；KV 容量使用 `--mem-fraction-static 0.8`，移除退休的池 size/max_* 字段。
+- 前三块四步 `[1000,750,500,250]`，随后两步 `[1000,500]`；quantum=1、overlap/prefetch、
+  async output、Decoder overlap、defer-final、conditioning prefetch 开启；prompt-joint 默认开启。
+- Qwen 六项执行选项含FP8默认全开；profile 须按相同选项生成。Lynn BF16/EMA、静态连接。
+- Block0 Host416GB / Disk700GB，local storage；GC开启、reserve/inflight各128GB，writers=2，
+  high/low=0.9/0.8；Host共享总预算416GB，capacity-dir=/var/lib/sglang/capacity。
+  缓存位于新run-dir/block0-cache，GC budget-root为该run-dir；不要将不同root冒称共享磁盘预算。
+- 默认对齐冻结线上 B300 快照的 native FP8、scope=ffn-attention；可显式传
+  `--quantization none` 选择 #647 公共配置的 BF16 默认。仅DiT在线量化，关闭direct GPU load，
+  该选项不改变 Qwen 或 Decoder 的精度设置。
+
+```bash
+PYTHONPATH="$PWD/python" bash scripts/zing/launch_b300.sh \
+  --model-path /models/zing-serving --lynn-model-dir /models/lynn \
+  --conditioning-service-config /secure/service.json \
+  --conditioning-config /secure/client.json --conditioning-profile /models/qwen-profile.json \
+  --gpus 0,1,2,3 --run-dir /runs/zing-b300-r1 --dry-run
+```
+
+dry-run不初始化CUDA、不落盘、不输出认证内容；去掉后才启动。认证使用已有文件，
+service的native.gpu_id=0指隔离后的第三卡；双方result transport为NCCL。
+硬件门槛为四张CC10.3、每卡至少240GiB，继承CUDA_VISIBLE_DEVICES时不能越出分配范围。
+run-dir须为新目录且在原export外；保留原权重、配置和训练分块。端口占用或角色失败会退出并清理
+本次创建的进程组，不自动重启，不停止其他服务。
+
+默认线上输出832×480；本工具不改媒体resize。736必须另行冻结输入并验证，不因静态KV容量策略
+或Graph开关推断通过。旧六卡/SP4/736历史记录见PR #481，不作为当前四卡启动器的性能证据。
+当前实现仅有CPU契约验证，480/736整体及Encoder（Qwen/reference/source）、DiT、Decoder
+耗时/显存A/B、画质、NCCL/Graph及取消/断连/EOS后下一会话GPU验收均未完成。
+
 
 ## B300 SP2 736 输入布局与固定 Q attention（Draft）
 

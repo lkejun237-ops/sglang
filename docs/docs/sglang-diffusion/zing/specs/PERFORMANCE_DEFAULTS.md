@@ -1,5 +1,11 @@
 # Zing 性能优化默认配置
 
+B300/H200 部署现在可使用包内 `zing_h3_profile_launcher`，通过共用配置设置加速环境变量、
+默认开启 Qwen 六项执行选项及 prompt-joint，两种硬件均使用 quantum=1 与流水线重叠，并支持独立 Encoder/Decoder 的对应配置；
+配方、覆盖规则和当前未实测边界见
+[部署 launcher](../deployment_zing_h3.mdx#b300--h200-统一-launcher)。
+下表是历史源码默认值记录，不能替代 launcher 的有效环境回执。
+
 基于主线 `df69ad4265` 梳理最近合入的优化。下表环境变量均省略
 `SGLANG_ZING_` 前缀（单独注明者除外）。显式设置仍优先于默认值。
 Window/Sink 默认值于 2026-11-03 更新为 `21/2`，对应当前 unsplit `[3,2]`
