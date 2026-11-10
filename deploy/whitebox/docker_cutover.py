@@ -8,7 +8,7 @@ import argparse
 import copy
 import fcntl
 import hashlib
-import http.client
+import http.client as http_client
 import json
 import os
 from pathlib import Path
@@ -55,7 +55,7 @@ class Docker:
         self.socket = path
 
     def api(self, method, path, body=None):
-        connection = http.client.HTTPConnection("localhost", timeout=60)
+        connection = http_client.HTTPConnection("localhost", timeout=60)
         connection.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         connection.sock.settimeout(60)
         connection.sock.connect(self.socket)

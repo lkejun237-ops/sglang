@@ -582,3 +582,11 @@ def test_pid_file_whitelist_rejects_unreviewed_paths(path):
                 },
             }
         )
+
+
+def test_real_docker_api_uses_http_client_after_http_function_definition(monkeypatch):
+    import http.client
+    assert cutover.http_client is http.client
+    monkeypatch.setattr(cutover.http_client, 'HTTPConnection', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('reached-client')))
+    with pytest.raises(RuntimeError, match='reached-client'):
+        cutover.Docker('/var/run/docker.sock').api('GET','/containers/x/json')
