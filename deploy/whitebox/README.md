@@ -18,6 +18,13 @@ python benchmark/zing_h3_causal/run_conditioning_cpu_tests.py -q deploy/whitebox
 ```
 
 以上生成计划的命令不会启动服务。`build` 只构建本地镜像。
+下载受限时，`build --pip-index-url <公共HTTPS索引> --go-proxy <公共HTTPS代理>`
+可显式选择构建期下载源；URL 不得携带凭据、查询参数或片段。未设置保持原有源，
+不改变运行环境、依赖 pin、TLS/Go 校验和验证或镜像测试；先在实际构建机核验可达性，
+示例与阶段范围见上方手工发布入口。
+可重复的 `--build-host HOST:IP` 只转发构建期 `--add-host`，默认无映射；不改宿主机、
+daemon 或运行时配置，不接受 `host-gateway`。仅使用已核实地址并保留原 HTTPS Host/SNI
+和正常证书校验，具体镜像示例及验证边界同见手工发布入口。
 `model_service.py --run` 会在已经分配的四卡作业内启动所有模型角色；
 `plan`、`build`、合并 CI 和 `verify` 都不会调用它。
 

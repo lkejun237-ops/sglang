@@ -1,6 +1,7 @@
 FROM node:24-bookworm-slim AS node
 
 FROM python:3.14-slim-bookworm AS base
+ARG PIP_INDEX_URL
 ENV PYTHONUNBUFFERED=1 SGLANG_LIGHTWEIGHT_RUNTIME=1 PYTHONPATH=/app/python
 WORKDIR /app
 COPY benchmark/whitebox/requirements.txt /app/requirements.txt
@@ -31,6 +32,7 @@ RUN cc -O2 -Wall -Wextra -Werror -fPIC -shared /tmp/x264_bridge.c \
     PKG_CONFIG_PATH=/opt/whitebox-codec/lib/pkgconfig pkg-config --modversion x264 > /tmp/whitebox-codec-version.txt
 
 FROM golang:1.25-bookworm AS rtc-builder
+ARG GOPROXY
 WORKDIR /build
 COPY python/sglang/multimodal_gen/runtime/realtime/whitebox/rtc_sender /build
 RUN go test ./... && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o /tmp/whitebox-rtc .

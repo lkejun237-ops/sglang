@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import re
 import subprocess
@@ -10,6 +11,7 @@ import sys
 import tarfile
 import tempfile
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from config import load, render
 from docker_storage import check_headroom
@@ -18,6 +20,52 @@ from output_paths import outside_checkout
 
 REPO = Path(__file__).resolve().parents[2]
 RELEASE_ROLES = ("gateway", "coordinator", "room", "model")
+
+
+def mirror_url(value):
+    """Build arguments are visible metadata, so never accept URL credentials."""
+    try:
+        url = urlsplit(value)
+        valid = (
+            url.scheme == "https"
+            and url.hostname
+            and url.username is None
+            and url.password is None
+            and not url.query
+            and not url.fragment
+            and not any(c.isspace() or ord(c) < 32 or c in ",|" for c in value)
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise argparse.ArgumentTypeError("Use one credential-free HTTPS mirror URL")
+    return value
+
+
+def build_host(value):
+    """Only an explicit DNS hostname and literal IP for Docker's build scope."""
+    host, separator, address = value.partition(":")
+    if (
+        not separator
+        or len(host) > 253
+        or not re.fullmatch(
+            r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+            r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?",
+            host,
+        )
+    ):
+        raise argparse.ArgumentTypeError(
+            "Use HOST:IP with a DNS hostname and literal IP"
+        )
+    if address.startswith("[") and address.endswith("]"):
+        address = address[1:-1]
+    try:
+        ipaddress.ip_address(address)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "Use HOST:IP with a literal IPv4 or IPv6 address"
+        ) from error
+    return value
 
 
 def git(repo, *args):
@@ -145,6 +193,15 @@ def build(args):
         ]
         if args.component == "model":
             command += ["--build-arg", "MODEL_BASE_IMAGE=" + args.base]
+        for option, name in (
+            ("pip_index_url", "PIP_INDEX_URL"),
+            ("go_proxy", "GOPROXY"),
+        ):
+            value = getattr(args, option, None)
+            if value is not None:
+                command += ["--build-arg", name + "=" + mirror_url(value)]
+        for value in getattr(args, "build_hosts", None) or []:
+            command += ["--add-host", build_host(value)]
         if args.platform:
             command += ["--platform", args.platform]
         # No --push, registry login, cloud API or deployment hook.
@@ -226,6 +283,23 @@ def main():
     b.add_argument("--tag", required=True)
     b.add_argument("--base", help="Model dependency image pinned by digest")
     b.add_argument("--platform", default="linux/amd64")
+    b.add_argument(
+        "--pip-index-url",
+        type=mirror_url,
+        help="Optional public HTTPS Python package index; no credentials",
+    )
+    b.add_argument(
+        "--go-proxy",
+        type=mirror_url,
+        help="Optional public HTTPS Go module proxy; no credentials",
+    )
+    b.add_argument(
+        "--build-host",
+        dest="build_hosts",
+        action="append",
+        type=build_host,
+        help="Optional build-only HOST:IP mapping (repeatable; literal IP only)",
+    )
     b.add_argument(
         "--incoming-gib",
         type=float,

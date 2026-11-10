@@ -71,6 +71,22 @@ python deploy/whitebox/release.py build \
 H200/B300 可以使用不同的 CUDA/torch/kernel 依赖镜像，但都从同一完整 SGLang SHA 取源码。
 依赖镜像须与该版本原生扩展 ABI 兼容，首次切换必须验证；源码覆盖本身不证明兼容。
 
+构建机下载受限时，可显式添加 `--pip-index-url https://mirrors.aliyun.com/pypi/simple/`
+和 `--go-proxy https://goproxy.cn`。只使用不含凭据、查询参数或片段的公共 HTTPS 镜像；
+先在实际构建机只读核验可达性，不保证镜像下载速度。未设置时保持原有下载源。
+这两个参数只转发为 `PIP_INDEX_URL` / `GOPROXY` 构建参数，不写入运行时环境或发布身份，
+不关闭 TLS、Go 校验和验证或任何构建测试；Go 参数用于 Room 的 RTC 构建阶段。
+保留原始依赖版本、SDK pin、main/dev 祖先校验和镜像验收。
+
+需要构建期固定解析地址时，可重复使用 `--build-host HOST:IP`，只转发 Docker 原生
+`--add-host`；未设置则不添加映射，不修改宿主机、Docker daemon 或运行容器配置。
+只接受 DNS 主机名与字面 IPv4/IPv6，不接受 `host-gateway`。例如在已只读核实官方 ECS
+内网地址的阿里云构建机上，可显式使用 `--build-host mirrors.aliyun.com:100.100.2.148`；
+地址须在每次使用前按[阿里云官方 PyPI 镜像说明](https://developer.aliyun.com/mirror/pypi)
+和实际 DNS/HTTPS 响应重新核验，不将该示例当作跨环境默认值。
+下载 URL、HTTP Host 和 TLS SNI 仍使用证书覆盖的 `mirrors.aliyun.com`，保持正常证书校验，
+不添加 trusted-host、跳过 TLS 或关闭 Go 校验和验证。
+
 工具只接受已进入本地新鲜 SGLang `origin/main` 历史的提交，并验证固定 SDK SHA 位于 Worldkit `origin/dev`；导出两份准确提交的 Git archive，
 不携带工作区脏改动、node_modules、凭证或容器内补丁。Room 构建执行首帧控制契约和现有镜像验收。
 构建不会 `push`，也不会自动启用任何地区；registry 推送和平台选择 digest 都是后续人工动作。
