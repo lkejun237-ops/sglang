@@ -86,7 +86,10 @@ try {
         || asset.search || asset.hash) throw Error('ROOM_PUBLIC_UI_INVALID');
       return prefix + asset.pathname;
     };
+    if (session.input && session.input.baseUrl !== `${connection.baseUrl}/v1/sessions/${session.sessionId}/`)
+      throw Error('ROOM_PUBLIC_INPUT_INVALID');
     const published = parseSessionDescriptor({...session, baseUrl: publicOrigin,
+      ...(session.input ? {input: {...session.input, baseUrl: prefix + '/'}} : {}),
       ui: {...session.ui, moduleUrl: rewrite(session.ui.moduleUrl),
         styles: session.ui.styles.map(style => ({...style, url: rewrite(style.url)}))}});
     process.stdout.write(JSON.stringify(published) + '\n');

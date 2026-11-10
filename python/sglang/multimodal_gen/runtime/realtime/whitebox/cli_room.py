@@ -39,6 +39,7 @@ from .area_contract import (
     validate_area_descriptor,
 )
 from .cli_config import (
+    INPUT_SESSION_RENEW_SECONDS,
     game_cache_directory,
     resource_transport,
     startup_seconds,
@@ -541,6 +542,80 @@ class CLIRoom:
         self.service_ready = asyncio.Event()
         self.resident_service = False
         self.http_delete_confirmed = False
+        self.player_id = None
+        self.input_renew_task = None
+
+    @property
+    def project_input_source(self):
+        return self.descriptor is not None and self.descriptor.get("input") is not None
+
+    @property
+    def external_input(self):
+        return self.project_input_source
+
+    async def public_session(self, player_id, public_origin):
+        if (
+            not self.project_input_source
+            or self.view is None
+            or self.view.closed
+            or player_id != self.player_id
+        ):
+            raise ValueError("The player input session is unavailable")
+        import httpx
+
+        from .player_transport import publish_input_session
+
+        descriptor = self.descriptor
+        async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
+            response = await client.post(
+                descriptor["baseUrl"].rstrip("/")
+                + f"/v1/sessions/{descriptor['sessionId']}/input-session",
+                headers={"Authorization": "Bearer " + descriptor["accessToken"]},
+            )
+            response.raise_for_status()
+        session = response.json()
+        if (
+            self.view.closed
+            or any(
+                session.get(key) != descriptor.get(key)
+                for key in (
+                    "sessionId",
+                    "epoch",
+                    "worldBuildHash",
+                    "uiBundleHash",
+                    "input",
+                    "media",
+                    "width",
+                    "height",
+                    "fps",
+                )
+            )
+            or session.get("accessMode") != "capability"
+            or not re.fullmatch(r"[a-f0-9]{48}", session.get("accessToken", ""))
+        ):
+            raise ValueError("The player input session has changed")
+        self.view.player_descriptor = session
+        published = publish_input_session(session, public_origin)
+        if self.input_renew_task is None:
+            self.input_renew_task = asyncio.create_task(
+                self._renew_input_session(public_origin)
+            )
+        return published
+
+    async def _renew_input_session(self, public_origin):
+        try:
+            while self.view is not None and not self.view.closed:
+                await asyncio.sleep(INPUT_SESSION_RENEW_SECONDS)
+                if self.view.closed:
+                    return
+                await self.public_session(self.player_id, public_origin)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.getLogger(__name__).exception("CLI input grant renewal failed")
+            if self.view is not None:
+                self.view.end_reason = "PLAYER_INPUT_SESSION_EXPIRED"
+                await self.view.close()
 
     async def join(self, *, player_id, spec):
         if self.view is not None:
@@ -556,12 +631,19 @@ class CLIRoom:
             await view.close()
             raise
         self.view = view
+        self.player_id = player_id
         return view
 
     async def close(self):
         try:
-            if self.view:
-                await self.view.close()
+            try:
+                if self.input_renew_task is not None:
+                    self.input_renew_task.cancel()
+                    await asyncio.gather(self.input_renew_task, return_exceptions=True)
+                    self.input_renew_task = None
+            finally:
+                if self.view:
+                    await self.view.close()
         finally:
             try:
                 if self.process.returncode is None:
@@ -649,6 +731,15 @@ class CLIView:
         self.capture_wait = CaptureWait()
         self.room, self.descriptor, self.spec = room, room.descriptor, room.spec
         self.external_input = getattr(room, "external_input", False)
+        if getattr(room, "project_input_source", False):
+            grant = self.descriptor.get("inputSession")
+            if (
+                not isinstance(grant, dict)
+                or grant.get("accessMode") != "capability"
+                or grant.get("sessionId") != self.descriptor.get("sessionId")
+            ):
+                raise ValueError("The CLI input session is unavailable")
+            self.player_descriptor = grant
         self.control = self.media = self.control_task = self.renderer = None
         self.transport_generation = 0
         self.transport_lock = asyncio.Lock()
@@ -663,6 +754,7 @@ class CLIView:
         self.area_runtime = self.area_publication = None
         self.area_frames = OrderedDict()
         self.area_pending = {}
+        self._close_task = None
         self.closed = False
         self.end_reason = None
         self.finish_requested = asyncio.Event()
@@ -705,6 +797,11 @@ class CLIView:
             "capture_fps": self.descriptor.get("fps", self.spec.fps),
             "model_fps": self.spec.fps,
             "input_mapping": "receipt_evidence_only",
+            **(
+                {"project_input": True}
+                if getattr(room, "project_input_source", False)
+                else {}
+            ),
         }
 
     def _accept_area_transition(self, value):
@@ -1494,34 +1591,39 @@ class CLIView:
             )
 
     async def close(self):
-        if self.closed:
-            return
-        self.closed = True
-        self.stopped = True
-        if self.model_context is not None:
-            await self.model_context.close()
-        self.area_frames.clear()
-        for _, future in self.area_pending.values():
-            if not future.done():
-                future.set_exception(ConnectionError("AREA_PRESENTATION_UNKNOWN"))
-        if self.control_task:
-            self.control_task.cancel()
-            await asyncio.gather(self.control_task, return_exceptions=True)
+        # Renewal and Room retirement may request close concurrently. Cancelling
+        # either caller must not interrupt cleanup or make a later caller skip it.
+        if self._close_task is None:
+            self.closed = True
+            self.stopped = True
+            self._close_task = asyncio.create_task(self._close_resources())
+        await asyncio.shield(self._close_task)
+
+    async def _close_resources(self):
         try:
-            # The producer may still send media after the final requested frame.
-            # Closing both local sockets concurrently bounds a full receive queue
-            # and does not retain the H3 reservation for two default timeouts.
-            await asyncio.gather(
-                *(
-                    connection.close()
-                    for connection in (self.media, self.control)
-                    if connection is not None
-                ),
-                return_exceptions=True,
-            )
+            if self.model_context is not None:
+                await self.model_context.close()
         finally:
-            if self.renderer:
-                await self.renderer.close()
+            self.area_frames.clear()
+            for _, future in self.area_pending.values():
+                if not future.done():
+                    future.set_exception(ConnectionError("AREA_PRESENTATION_UNKNOWN"))
+            if self.control_task:
+                self.control_task.cancel()
+                await asyncio.gather(self.control_task, return_exceptions=True)
+            try:
+                # Drain both sockets even if model-context cleanup failed.
+                await asyncio.gather(
+                    *(
+                        connection.close()
+                        for connection in (self.media, self.control)
+                        if connection is not None
+                    ),
+                    return_exceptions=True,
+                )
+            finally:
+                if self.renderer:
+                    await self.renderer.close()
 
 
 class NativeCLIView(CLIView):

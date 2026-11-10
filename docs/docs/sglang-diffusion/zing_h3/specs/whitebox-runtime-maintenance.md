@@ -552,3 +552,105 @@ length/hash checks, matching the existing complete-world audio transport. This
 pin change does not upgrade frozen authored worlds or WTP task SDK identities.
 Image build, test-lane deployment and actual playback acceptance remain separate
 release steps; source integration alone does not establish remote audibility.
+
+### Project-defined input (`player-input/1`)
+
+The native SDK remains the semantic schema, authorization and consumption owner.
+Room's existing SDK relay preserves `input.semantic.open/applied/batch/cancel` and
+binding/receipt/error bytes, on its original generation-fenced control socket.
+Open/applied negotiate a lease; neither is gameplay activity. Gameplay packets
+(`input.state`, `input.action`, `input.semantic.batch`) have a 200ms relay residence
+and send budget. Expiry closes the old socket/lease; nothing is resequenced or
+replayed after backpressure. This budget is independent of the SDK's own queue and
+lease, and does not expire a slow initial binding negotiation.
+The public control relay reads ingress independently, retains at most 64 messages
+and 1 MiB, and timestamps gameplay on receipt. A queued gameplay deadline still
+expires while a preceding handshake send or archive observation is blocked. Sends
+use the remaining residence budget, including the observation before dispatch.
+Both control relays register pending intent before sending so a fast committed
+receipt cannot overtake its correlation record. This records an observed intent,
+not successful delivery: only a matching SDK receipt can count as activity.
+Both relays independently expire queued gameplay while an earlier handshake or
+archive write is blocked. A handshake without queued gameplay keeps its original
+negotiation timeout.
+Handshake-only negotiation and media forwarding
+remain outside that gameplay timer.
+
+Activity requires a matching SDK committed receipt: client, generation, sequence
+and state revision. Only the SDK's `meaningful:true` decision counts, using the
+original correlated send time; neutral renewal, cancellation, unmatched, duplicate
+and late receipts cannot extend that time. Effective sustained controls are
+confirmed by their SDK owner, without Room interpreting custom game fields.
+All seven semantic envelope types enter the existing viewer input archive with
+source/session/epoch identity. That network observation is not a complete World
+execution recording; exact replay uses committed SDK/Episode evidence.
+
+The existing public SDK session route also proxies only frozen `player-input/` resources, using the original viewer capability on both Gateway and Room hops. Session publication rewrites the input resource root to the public origin; no standalone CLI administrative token is published. Resource reads reject unsafe paths, wrong/revoked capabilities and a changed source epoch, use bounded reads and never follow redirects. This route is transport support, not a claim that replica/multiplayer semantic consumption is implemented.
+
+The ordinary single-player CLI now returns a separate scoped `inputSession` in
+ready when its sealed World declares input. The original CLIRoom publishes this
+session through its source route, and SourceSession forwards `sdk_input_session`
+on ready. The public Player attaches the same SDK input owner while retaining its
+original media and action owners. It does not fabricate a multiplayer binding or
+start another World. The CLI administrative token stays private. An input viewer
+cannot reset the original session or read private model-context resources.
+Its input-only public descriptor omits the separate SDK audio resource descriptor;
+audio continues through the original Whitebox audio owner. This permits audio and
+custom controls to coexist without publishing private loopback resource URLs.
+
+CLIRoom renews the same viewer grant every 60 seconds while the original view is
+alive, and cancels/drains that task on close. Renewal failure closes the view.
+Renewal teardown runs inside the original cleanup guarantees, so cancellation there
+still reaches view and CLI cleanup. View close callers share one shielded cleanup
+task: cancelling renewal cannot interrupt it, and Room retirement waits for that
+same task. Model-context cleanup failure still drains sockets and the UI renderer.
+A directly consumed CLI ready input grant is
+separately renewed by its original CLI owner until that stream ends.
+This administrative grant lifetime is independent of semantic observations,
+gameplay activity and the SDK's short input lease. Both the generic public control
+tunnel and SDKControlRelay share the 200ms gameplay send budget above; handshake
+messages are excluded. SDK input-resource reads are bounded to 32 MiB per resource,
+do not follow redirects and recheck the original viewer/epoch after reading.
+
+WTP accepts input-declared content only when the selected SDK facade exports the
+matching `PLAYER_INPUT_PROTOCOL`; an older facade returns
+`PLAYER_INPUT_UNSUPPORTED` before allocation. Local verification includes an actual
+CLI child process through the original Gateway/Room capability/resource/control
+routes to the original SDK World committed receipt. Public React/RTC fixture tests
+verify input-owner discovery on ready. These are source/protocol proofs, not a
+live GPU/model presentation or production deployment result. Multiplayer semantic
+World consumption remains unsupported.
+
+CPU verification uses the existing lightweight environment, without model imports:
+`SGLANG_LIGHTWEIGHT_RUNTIME=1 PYTHONPATH=python python -m pytest --confcutdir=python/sglang/multimodal_gen/test/unit/realtime -o asyncio_default_fixture_loop_scope=function -q python/sglang/multimodal_gen/test/unit/realtime/test_whitebox_player_idle.py python/sglang/multimodal_gen/test/unit/realtime/test_whitebox_sdk_control_relay.py python/sglang/multimodal_gen/test/unit/realtime/test_whitebox_player_transport.py python/sglang/multimodal_gen/test/unit/realtime/test_whitebox_cli_lifetime.py`.
+The paired SDK's `packages/cli/tests/player-input.browser.test.ts` additionally
+uses `WORLDKIT_PLAYER_INPUT_SGLANG` and `WORLDKIT_PLAYER_INPUT_PYTHON` to verify the
+actual cross-repository CLI tunnel. Use the existing shared Python environment;
+point `PYTHONPATH` at this selected source rather than installing another copy.
+This source support requires the paired SDK input protocol. It does not update a
+frozen SDK/browser pin, publish an image, or establish live model acceptance.
+
+### Live input archival and backpressure
+
+Room-owned game logs always use the existing bounded fail-open owner. Streaming
+Rooms retain their diskless memory journal; non-diskless Rooms use
+`AsyncRoomJournal` even when the media archive manager selects synchronous or
+strict recording. Direct offline `RoomLog` users keep their selected writer.
+Media recording configuration must not delay live SDK control.
+
+All Room events retain one original sequence and ordered journal. Existing
+limits remain 64 KiB per event, 128 pending events and 8 MiB queued bytes. Full
+or failed archival marks the recording failed through its original manifest,
+without waiting for disk or queue capacity on the input route. Normal finish
+still drains that owner, seals the original input file and reaps its child.
+
+Intent correlation still precedes forwarding, so an immediate SDK receipt can
+confirm it; raw input alone is not activity. Both relays retain their 200ms
+gameplay deadline: an actually stalled SDK send closes and retires its queue
+without replay. There is no unbounded per-packet task or parallel log writer.
+
+`test_whitebox_live_input_archive.py` covers both old manager modes, forwarding
+with a full archive, fast receipt correlation, real ordered journal finalization
+and explicit failed overflow manifests. Run it with the lightweight CPU pytest
+entry above. The existing control relay expiry tests verify the unchanged
+transport protection; these local tests do not measure production disk latency.

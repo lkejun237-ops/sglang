@@ -10,6 +10,7 @@ from fastapi import FastAPI
 
 from sglang.multimodal_gen.runtime.realtime.whitebox.player_transport import (
     MAX_WIRE_BYTES,
+    PlayerTransport,
     PlayerTransportConfig,
     install_player_gateway,
     install_player_runtime,
@@ -19,6 +20,170 @@ from sglang.multimodal_gen.runtime.realtime.whitebox.rooms import (
     RoomDirectory,
     new_id,
 )
+
+
+def test_ordinary_cli_input_publishes_a_scoped_session_without_room_admission(
+    monkeypatch,
+):
+    from sglang.multimodal_gen.runtime.realtime.whitebox import cli_room as cli_api
+    from sglang.multimodal_gen.runtime.realtime.whitebox.cli_room import (
+        CLIRoom,
+        NativeCLIView,
+    )
+    from sglang.multimodal_gen.runtime.realtime.whitebox.contracts import VideoSpec
+
+    monkeypatch.setattr(cli_api, "INPUT_SESSION_RENEW_SECONDS", 0.001)
+
+    async def run():
+        private = "http://127.0.0.1:65432"
+        manifest = {
+            "schemaVersion": 1,
+            "abiVersion": "player-input/1",
+            "manifest": {"path": "player-input/manifest.json", "sha256": "a" * 64},
+            "adapters": [],
+        }
+        grant = dict(
+            sessionId="sdk-input",
+            epoch=0,
+            baseUrl=private,
+            accessToken="b" * 48,
+            accessMode="capability",
+            worldBuildHash="c" * 64,
+            uiBundleHash="d" * 64,
+            width=32,
+            height=32,
+            fps=24,
+            media={"kind": "pixels", "pixelFormat": "rgb24", "colorSpace": "srgb"},
+            input={**manifest, "baseUrl": private + "/v1/sessions/sdk-input/"},
+            audio={"manifestUrl": private + "/v1/sessions/sdk-input/audio/manifest"},
+            ui={"moduleUrl": private + "/ui/" + "d" * 64 + "/module.js", "styles": []},
+        )
+        admin = {**grant, "accessToken": "e" * 48, "inputSession": grant}
+        admin.pop("accessMode")
+        room = CLIRoom(None, admin, VideoSpec(32, 32), None, "trace")
+        view = NativeCLIView(room)
+        room.view, room.player_id = view, "original"
+        assert view.external_input and view.metadata["project_input"] is True
+        assert view.player_descriptor is grant
+        with pytest.raises(ValueError, match="browser"):
+            await view.send_input(0, {"held_keys": ["KeyW"]})
+
+        renewals = 0
+        renewed = asyncio.Event()
+
+        def sdk(request):
+            nonlocal renewals
+            renewals += 1
+            if renewals >= 3:
+                renewed.set()
+            assert (
+                request.method == "POST"
+                and request.url.path == "/v1/sessions/sdk-input/input-session"
+            )
+            assert request.headers["authorization"] == "Bearer " + admin["accessToken"]
+            return httpx.Response(200, json=grant)
+
+        client = httpx.AsyncClient
+        monkeypatch.setattr(
+            httpx,
+            "AsyncClient",
+            lambda **kwargs: client(transport=httpx.MockTransport(sdk), **kwargs),
+        )
+        directory = RoomDirectory(MemoryRoomStore(), {"a": "http://room"})
+        game, stream, epoch = new_id(), new_id(), new_id()
+        await directory.resolve(game, "local-fixture/input", create=True)
+        await directory.touch(game, "a", epoch)
+        entry = dict(
+            game_id=game,
+            engine=view,
+            source_input=True,
+            identity={"player_id": "original"},
+        )
+        runtime = SimpleNamespace(
+            directory=directory,
+            owner_id="a",
+            epoch=epoch,
+            rooms={game: {"driver": room}},
+            player=lambda value, **_: (
+                entry if value == stream else (_ for _ in ()).throw(ValueError())
+            ),
+        )
+        transport = PlayerTransport(
+            runtime,
+            PlayerTransportConfig(
+                "https://gateway.test", "https://player.test", "https://wtp.test"
+            ),
+        )
+        session = await transport.public_session({"stream_id": stream})
+        await asyncio.wait_for(renewed.wait(), 1)
+        task = room.input_renew_task
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        before = renewals
+        await asyncio.sleep(0.01)
+        assert renewals == before  # Retirement cannot keep renewing a stale grant.
+        assert session["baseUrl"] == "https://gateway.test"
+        assert (
+            session["input"]["baseUrl"] == "https://gateway.test/v1/sessions/sdk-input/"
+        )
+        assert session["accessToken"] != admin["accessToken"]
+        assert "audio" not in session  # The original Whitebox owner serves audio.
+        assert "playerBinding" not in session and "control_admission" not in entry
+        assert (await directory.session_route("sdk-input"))["stream_id"] == stream
+        with pytest.raises(ValueError):
+            transport.viewer(stream, "sdk-input", admin["accessToken"])
+        with pytest.raises(ValueError):
+            await room.public_session("other-player", "https://gateway.test")
+        entry["source_input"] = False
+        with pytest.raises(ValueError):
+            transport.viewer(stream, "sdk-input", grant["accessToken"])
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["input.state", "input.action", "input.semantic.batch", "input.semantic.open"],
+)
+def test_public_control_relay_expires_blocked_gameplay_but_not_handshake(kind):
+    import json
+
+    from sglang.multimodal_gen.runtime.realtime.whitebox.player_transport import relay
+
+    async def run():
+        sent = []
+        waiting = asyncio.Event()
+        sent_complete = asyncio.Event()
+
+        class Browser:
+            received = False
+
+            async def receive(self):
+                if self.received:
+                    await sent_complete.wait()
+                    return {"type": "websocket.disconnect"}
+                self.received = True
+                return {"type": "websocket.receive", "text": json.dumps({"type": kind})}
+
+        class SDK:
+            async def send(self, value):
+                await asyncio.sleep(0.25)
+                sent.append(value)
+                sent_complete.set()
+
+            async def __aiter__(self):
+                await waiting.wait()
+                yield "unused"
+
+        if kind == "input.semantic.open":
+            await relay(Browser(), SDK())
+            assert len(sent) == 1
+        else:
+            with pytest.raises(TimeoutError):
+                await relay(Browser(), SDK())
+            assert sent == []
+
+    asyncio.run(run())
 
 
 def test_session_route_uses_existing_store_and_owner_epoch_fence():
@@ -382,6 +547,159 @@ def test_controlled_capture_observes_without_competing_for_browser_input():
     asyncio.run(run())
 
 
+async def verify_real_ordinary_input_cli(descriptor):
+    """Opt-in SDK CLI contract test: actual World/CLI sockets plus Gateway/Room
+    relay. The directory is local; no model, production session or GPU is used."""
+    import json
+    from contextlib import AsyncExitStack
+
+    from test_whitebox_rooms import server
+    from websockets.asyncio.client import connect
+
+    from sglang.multimodal_gen.runtime.realtime.whitebox.cli_room import (
+        CLIRoom,
+        NativeCLIView,
+    )
+    from sglang.multimodal_gen.runtime.realtime.whitebox.contracts import VideoSpec
+
+    room = CLIRoom(
+        None,
+        descriptor,
+        VideoSpec(descriptor["width"], descriptor["height"]),
+        None,
+        "input-contract",
+    )
+    view = NativeCLIView(room)
+    room.view, room.player_id = view, "original"
+    assert view.external_input and view.metadata["project_input"]
+    directory = RoomDirectory(MemoryRoomStore(), {"a": "http://unused"})
+    game, stream, epoch = new_id(), new_id(), new_id()
+    await directory.resolve(game, "local-fixture/input", create=True)
+    await directory.touch(game, "a", epoch)
+    entry = dict(
+        game_id=game, engine=view, source_input=True, identity={"player_id": "original"}
+    )
+    runtime = SimpleNamespace(
+        directory=directory,
+        owner_id="a",
+        epoch=epoch,
+        rooms={game: {"driver": room}},
+        player=lambda value, **_: (
+            entry if value == stream else (_ for _ in ()).throw(ValueError())
+        ),
+    )
+    async with AsyncExitStack() as stack:
+        room_app, gateway = FastAPI(), FastAPI()
+        room_url = await stack.enter_async_context(server(room_app))
+        gateway_url = await stack.enter_async_context(server(gateway))
+        client = await stack.enter_async_context(httpx.AsyncClient(trust_env=False))
+        config = PlayerTransportConfig(
+            gateway_url, "https://player.test", "https://wtp.test"
+        )
+        install_player_runtime(room_app, "internal", runtime, config=config)
+        install_player_gateway(
+            gateway,
+            SimpleNamespace(
+                directory=directory,
+                owners={"a": room_url},
+                token="internal",
+                client=client,
+            ),
+            config=config,
+        )
+        session = await runtime.player_transport.public_session({"stream_id": stream})
+        assert session["accessToken"] != descriptor["accessToken"]
+        assert session["input"]["manifest"] == descriptor["input"]["manifest"]
+        resource = session["input"]["baseUrl"] + session["input"]["manifest"]["path"]
+        response = await client.get(
+            resource,
+            headers={
+                "Origin": config.player_origin,
+                "Authorization": "Bearer " + session["accessToken"],
+            },
+        )
+        assert (
+            response.status_code == 200
+            and response.json()["abiVersion"] == "player-input/1"
+        )
+        wrong = await client.get(
+            resource,
+            headers={
+                "Origin": config.player_origin,
+                "Authorization": "Bearer " + descriptor["accessToken"],
+            },
+        )
+        assert wrong.status_code == 404
+        url = (
+            gateway_url.replace("http://", "ws://")
+            + f"/v1/sessions/{session['sessionId']}/control?clientId=cli-sg-contract&ui=0&clock=0"
+        )
+        async with connect(
+            url,
+            origin=config.player_origin,
+            subprotocols=[
+                "worldkit.stream.v1",
+                "worldkit.cap." + session["accessToken"],
+            ],
+        ) as control:
+
+            async def receive(kind):
+                async with asyncio.timeout(10):
+                    while True:
+                        value = json.loads(await control.recv())
+                        assert descriptor["accessToken"] not in json.dumps(value)
+                        assert session["accessToken"] not in json.dumps(value)
+                        if value.get("type") == kind:
+                            return value
+                        if value.get("type") in {"error", "producer.error"}:
+                            raise ValueError(
+                                "The CLI relay failed: " + str(value.get("code"))
+                            )
+
+            assert (await receive("session.ready"))["role"] == "controller"
+            await control.send(
+                json.dumps(
+                    dict(
+                        type="input.semantic.open",
+                        epoch=session["epoch"],
+                        abiVersion="player-input/1",
+                    )
+                )
+            )
+            binding = await receive("input.semantic.binding")
+            await control.send(
+                json.dumps(
+                    dict(
+                        type="input.semantic.applied",
+                        epoch=session["epoch"],
+                        generation=binding["generation"],
+                    )
+                )
+            )
+            await control.send(
+                json.dumps(
+                    dict(
+                        type="input.semantic.batch",
+                        epoch=session["epoch"],
+                        generation=binding["generation"],
+                        batch=dict(
+                            schemaVersion=1,
+                            sequence=1,
+                            stateRevision=1,
+                            state={"power": 0.5},
+                            events=[],
+                        ),
+                    )
+                )
+            )
+            receipt = await receive("input.semantic.receipt")
+            assert receipt["sequence"] == 1 and receipt["meaningful"] is True
+            assert (
+                receipt["clientId"] == "cli-sg-contract"
+                and receipt["simulationTick"] > 0
+            )
+
+
 async def verify_real_public_players(room, alice, bob):
     """Called by the opt-in real sealed CLI test; substitutes no SDK transport."""
     import json
@@ -703,5 +1021,267 @@ def test_browser_input_observation_uses_original_room_log_and_receipt_identity()
             json.dumps({"type": "input.release", "epoch": 2}),
         )
         assert log.manifest["viewer_input_archive_status"] == "failed"
+
+    asyncio.run(run())
+
+
+def test_sealed_input_resources_cross_gateway_room_with_exact_viewer_capability():
+    async def run():
+        capability = "a" * 48
+        stream = "1" * 32
+        entry = dict(
+            game_id="2" * 32,
+            identity={"player_id": "p"},
+            control_admission={"status": "claimed"},
+        )
+        descriptor = dict(
+            sessionId="sdk-a",
+            epoch=2,
+            accessMode="capability",
+            accessToken=capability,
+            baseUrl="http://127.0.0.1:65432",
+            input={"abiVersion": "player-input/1"},
+        )
+        entry["engine"] = SimpleNamespace(descriptor=descriptor)
+        config = PlayerTransportConfig(
+            "https://gateway.test", "https://player.test", "https://wtp.test"
+        )
+        calls = []
+
+        def sdk(request):
+            calls.append(request)
+            assert request.headers["authorization"] == "Bearer " + capability
+            assert "cookie" not in request.headers
+            assert request.url.path.startswith("/v1/sessions/sdk-a/player-input/")
+            if request.url.path.endswith("/retired.js"):
+                descriptor["epoch"] += 1
+            return httpx.Response(
+                200,
+                content=b"frozen bytes",
+                headers={"content-type": "application/octet-stream"},
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(sdk)) as upstream:
+            runtime = SimpleNamespace(
+                player=lambda sid, **_: (
+                    entry if sid == stream else (_ for _ in ()).throw(ValueError())
+                )
+            )
+            room = FastAPI()
+            install_player_runtime(
+                room, "internal", runtime, config=config, client=upstream
+            )
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(room), base_url="http://room"
+            ) as room_client:
+
+                async def session_route(session_id):
+                    if session_id != "sdk-a":
+                        raise ValueError()
+                    return {"owner_id": "owner", "stream_id": stream, "epoch": 2}
+
+                proxy = SimpleNamespace(
+                    client=room_client,
+                    token="internal",
+                    owners={"owner": "http://room"},
+                    directory=SimpleNamespace(session_route=session_route),
+                )
+                gateway = FastAPI()
+                install_player_gateway(gateway, proxy, config=config)
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(gateway),
+                    base_url=config.public_origin,
+                ) as browser:
+                    headers = {
+                        "origin": config.player_origin,
+                        "authorization": "Bearer " + capability,
+                    }
+                    for asset in [
+                        "manifest.json",
+                        "module.js",
+                        "worker.js",
+                        "hands.wasm",
+                        "model.task",
+                    ]:
+                        response = await browser.get(
+                            "/v1/sessions/sdk-a/player-input/" + asset, headers=headers
+                        )
+                        assert (
+                            response.status_code == 200
+                            and response.content == b"frozen bytes"
+                        )
+                        assert (
+                            response.headers["access-control-allow-origin"]
+                            == config.player_origin
+                        )
+                    assert len(calls) == 5
+                    path = "/v1/sessions/sdk-a/player-input/module.js"
+                    assert (
+                        await browser.get(
+                            path, headers={"origin": config.player_origin}
+                        )
+                    ).status_code == 403
+                    assert (
+                        await browser.get(
+                            path,
+                            headers={**headers, "authorization": "Bearer " + "b" * 48},
+                        )
+                    ).status_code == 404
+                    assert (
+                        await browser.get(
+                            path, headers={**headers, "origin": "https://evil.test"}
+                        )
+                    ).status_code == 403
+                    assert (
+                        await browser.get(
+                            path.replace("sdk-a", "sdk-b"), headers=headers
+                        )
+                    ).status_code == 404
+                    assert (
+                        await browser.get(
+                            path.replace("module.js", "%252e%252e/source.ts"),
+                            headers=headers,
+                        )
+                    ).status_code == 404
+                    preflight = await browser.options(
+                        path,
+                        headers={
+                            "origin": config.player_origin,
+                            "access-control-request-method": "GET",
+                            "access-control-request-headers": "authorization",
+                        },
+                    )
+                    assert preflight.status_code == 204
+                    entry["control_admission"]["leaving"] = True
+                    assert (await browser.get(path, headers=headers)).status_code == 404
+                    assert len(calls) == 5
+                    entry["control_admission"]["leaving"] = False
+                    assert (
+                        await browser.get(
+                            path.replace("module.js", "retired.js"), headers=headers
+                        )
+                    ).status_code == 404
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("blocked", ["handshake-send", "archive"])
+def test_public_control_queue_expires_behind_handshake_and_observation(blocked):
+    import json
+
+    from sglang.multimodal_gen.runtime.realtime.whitebox.player_transport import relay
+
+    async def run():
+        messages = asyncio.Queue()
+        for kind in ["input.semantic.applied", "input.semantic.batch"]:
+            messages.put_nowait(
+                {"type": "websocket.receive", "text": json.dumps({"type": kind})}
+            )
+        started, release, never = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        sent = []
+
+        async def block():
+            started.set()
+            await release.wait()
+
+        class Browser:
+            async def receive(self):
+                return await messages.get()
+
+        class SDK:
+            async def send(self, payload):
+                kind = json.loads(payload)["type"]
+                if kind == "input.semantic.applied" and blocked == "handshake-send":
+                    await block()
+                sent.append(kind)
+                if kind == "input.semantic.batch":
+                    messages.put_nowait({"type": "websocket.disconnect"})
+
+            async def __aiter__(self):
+                await never.wait()
+                yield "unused"
+
+        async def observe(direction, payload):
+            if (
+                blocked == "archive"
+                and direction == "to-sdk"
+                and json.loads(payload)["type"] == "input.semantic.applied"
+            ):
+                await block()
+
+        task = asyncio.create_task(relay(Browser(), SDK(), observe=observe))
+        try:
+            await asyncio.wait_for(started.wait(), 1)
+            await asyncio.sleep(0.22)
+            release.set()
+            with pytest.raises(asyncio.TimeoutError, match="input"):
+                await asyncio.wait_for(task, 1)
+            assert "input.semantic.batch" not in sent
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_public_control_records_intent_before_an_immediate_committed_receipt():
+    import json
+
+    from sglang.multimodal_gen.runtime.realtime.whitebox.player_idle import (
+        PlayerInputActivity,
+    )
+    from sglang.multimodal_gen.runtime.realtime.whitebox.player_transport import relay
+
+    async def run():
+        activity = PlayerInputActivity()
+        activity.start(0)
+        incoming, receipts = asyncio.Queue(), asyncio.Queue()
+        observed = asyncio.Event()
+        batch = dict(
+            type="input.semantic.batch",
+            generation=1,
+            batch=dict(sequence=1, stateRevision=1),
+        )
+        receipt = dict(
+            type="input.semantic.receipt",
+            clientId="c",
+            generation=1,
+            sequence=1,
+            stateRevision=1,
+            simulationTick=1,
+            meaningful=True,
+        )
+        incoming.put_nowait(dict(type="websocket.receive", text=json.dumps(batch)))
+
+        class Browser:
+            async def receive(self):
+                return await incoming.get()
+
+            async def send_text(self, payload):
+                observed.set()
+
+        class SDK:
+            async def send(self, payload):
+                receipts.put_nowait(json.dumps(receipt))
+                # A peer may consume input before a flow-controlled send returns.
+                await observed.wait()
+
+            async def __aiter__(self):
+                while True:
+                    yield await receipts.get()
+
+        async def observe(direction, payload):
+            activity.observe("c", direction, json.loads(payload), 10)
+
+        task = asyncio.create_task(relay(Browser(), SDK(), observe=observe))
+        try:
+            await asyncio.wait_for(observed.wait(), 1)
+            await asyncio.sleep(0)
+            assert activity.last_input == 10
+            assert not activity.pending
+            assert not activity.is_expired(60, 60)
+        finally:
+            incoming.put_nowait(dict(type="websocket.disconnect"))
+            await task
 
     asyncio.run(run())
