@@ -155,6 +155,10 @@ Room 实际加载的模块和插件，不能将未启用的模型代码一并声
 bindings、Secret、SDK pin 与挂载；配置沿用前逐项核对原 bundle 指纹、地域与 release-owned
 环境，不以新 plan 隐式推进模型策略。源码身份和镜像通过不代表线上会话已排空。
 
+原 `test_whitebox.py` 的六种同步/进程录制与推理步数组合严格校验七个归档对象，
+包括两个 sidecar；视频帧、opaque states 和发布顺序断言继续保留。它由正式镜像
+`docker/whitebox.Dockerfile` 的 CPU checks 执行；sidecar 语义和摘要另由下述专项回归覆盖。
+
 本地合同回归：`test_whitebox_report_context.py` 与 `test_whitebox_render_reports.py`
 覆盖错能力、他人段、超 64 段精确选择、保留索引、稳定定位、VFR 与 hash 校验、pending
 归档、任意路径拒绝和 owner 查询转发。真实 WTP 提交、对象播放与点击定位仍需配套端到端

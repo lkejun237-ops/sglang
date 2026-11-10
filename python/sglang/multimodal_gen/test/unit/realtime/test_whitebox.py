@@ -464,6 +464,8 @@ def test_pipeline_encodes_three_aligned_videos_and_preserves_opaque_states(
             "ui_rendered.mp4",
             "inputs.jsonl",
             "states.jsonl",
+            "report-frames.jsonl",
+            "output-contexts.jsonl",
         }
         for name, luminance in [("whitebox", 20), ("model", 100), ("ui_rendered", 200)]:
             with av.open(str(directory / (name + ".mp4"))) as container:
