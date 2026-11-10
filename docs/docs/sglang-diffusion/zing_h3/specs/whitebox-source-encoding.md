@@ -69,8 +69,8 @@ booleans in integer fields and fractional numbers fail. Cross-language examples
 are frozen in
 [`source-encoding-contract.json`](../../../../../python/sglang/multimodal_gen/test/unit/realtime/fixtures/source-encoding-contract.json).
 
-Overrides apply only to a new `whitebox-render-v2` native RTC source at 832×480,
-using the existing `create` or manual `create.manual` lifecycle. AREA, existing
+Overrides apply only to a new `whitebox-render-v2` native RTC source at 832×480
+or 1280×720 (`whitebox.resolution: "480p"` or `"720p"`), using the existing `create` or manual `create.manual` lifecycle. AREA, existing
 Room/source joins and WebSocket media reject an override. Default calls retain
 their existing resolution and transport support. Admission checks run before
 source allocation or replacing an attachment.
@@ -108,7 +108,9 @@ quantities; a nominal 30 FPS does not establish 30 presented frames/s.
 Before reserving a new explicit source, Room checks the selected native binary's
 `--capabilities` (`native-video-rtp-v1`, `sessionSourceEncoding:true`, selected
 source codec and H.264 model support). It then encodes and decodes three real
-832×480 AUs. H.264's probe also freezes its actual SPS profile for negotiation.
+AUs at the selected source width, height and encoder rate. H.264's probe also
+freezes its actual SPS profile for negotiation. Each new explicit session probes
+again; there is no success cache that can reuse a 480p proof for 720p.
 The two subprocess limits are 5 and 15 seconds. Probes run off the event loop,
 outside the host admission lock, one at a time; cancellation retains that bound
 until the subprocess work finishes. Probe failure refuses the candidate without
@@ -117,8 +119,12 @@ starting a World, CLI, model or listener. CPU probes do not acquire a GPU.
 The native sender receives `--source-codec` and, for H.264, the verified
 `--source-h264-profile` only for an explicit override. With omission, its original
 arguments and defaults remain unchanged. The new sender must be deployed with
-the matching Python implementation. No TTL, reference-frame protection, credit,
-pacer-floor or resolution change is part of this feature.
+the matching Python implementation. The resolution selection does not reset or disable codec, bitrate, GOP, QP, VBV,
+preset or intra-refresh settings. The existing transport envelope remains: 720p
+accepts at most 30 FPS; 36/60 FPS fails before probing or allocation. H.264 uses
+the selected rate at 720p and retains the existing 60-FPS hint at 480p. VP9 keeps
+profile 0; AV1 keeps profile 0, level-idx 5, tier 0. Model H.264 negotiation and
+model geometry are unchanged.
 
 Managed single-player launch runs the same native reservation and bounded
 preflight before its detached source allocation. It stores the verified H.264
@@ -172,8 +178,16 @@ and issue explicitly bound candidate tickets. No environment switch is required.
 An older Room still enforcing the removed switch will reject explicit selections,
 so update the backend before WTP. Roll back the matched images to undo this
 change; the removed switch is not a rollback control. Confirm each actual Room image,
-software codec library, native binary and WTP client together. Formal 480p
+software codec library, native binary and WTP client together. Formal 480p and 720p
 source playback, input, model H.264 start/stop, reconnect, authorization failures
 and the next session's unchanged default all require deployment acceptance.
 This implementation and CPU evidence do not establish production playability,
 current online encoder parameters, all-scene quality or stable browser FPS.
+
+
+The 720p override requires the compatible Python admission/probe code in both
+Gateway and Room, plus SDK/WTP clients that allow resolution and encoding together.
+The existing session-source-codec native sender is compatible; no Go protocol
+change is required. Upgrade an older native binary lacking
+`sessionSourceEncoding` before enabling overrides. CPU encode/decode evidence
+does not validate 720p model output, GPU latency/memory or browser playability.

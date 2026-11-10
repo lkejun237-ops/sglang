@@ -153,8 +153,6 @@ async def reserve_rtc(host, body):
             selected = check_source_encoding_scope(
                 message, transport="webrtc-rtp", existing_room=room is not None
             )
-            if selected is not None and (spec.width, spec.height) != (832, 480):
-                raise ValueError("Session source encoding requires 480p")
         except ValueError:
             raise WhiteboxDiagnostic("RTC_CODEC_UNSUPPORTED", "validation") from None
         driver = (room or {}).get("driver")
@@ -191,7 +189,13 @@ async def reserve_rtc(host, body):
                         else fps
                     )
                     probe = asyncio.create_task(
-                        asyncio.to_thread(preflight_source_encoding, selected, nominal)
+                        asyncio.to_thread(
+                            preflight_source_encoding,
+                            selected,
+                            nominal,
+                            width=spec.width,
+                            height=spec.height,
+                        )
                     )
                     try:
                         body["source_encoding_profile"] = await asyncio.shield(probe)

@@ -84,19 +84,21 @@ def source_gop(config):
     )
 
 
-def _encoder_probe(settings, fps):
+def _encoder_probe(settings, fps, width=832, height=480):
     import av
 
     from .contracts import VideoSpec
     from .playback import create_source_playback_encoder
 
     encoder = create_source_playback_encoder(
-        VideoSpec(832, 480), settings=settings, capture_clock=True, capture_fps=fps
+        VideoSpec(width, height), settings=settings, capture_clock=True, capture_fps=fps
     )
     try:
         packets = []
         for i in range(3):
-            packets.extend(encoder.push(i, bytes(832 * 480 * 3), i * 1_000_000 // fps))
+            packets.extend(
+                encoder.push(i, bytes(width * height * 3), i * 1_000_000 // fps)
+            )
         packets.extend(encoder.drain())
         decoder = av.CodecContext.create(
             "libdav1d" if settings["codec"] == "av1" else settings["codec"], "r"
@@ -106,7 +108,9 @@ def _encoder_probe(settings, fps):
         for _, packet in packets:
             frames.extend(decoder.decode(av.Packet(packet["payload"])))
         frames.extend(decoder.decode(None))
-        if len(frames) != 3 or any((f.width, f.height) != (832, 480) for f in frames):
+        if len(frames) != 3 or any(
+            (f.width, f.height) != (width, height) for f in frames
+        ):
             raise ValueError("The source codec probe failed")
         return {
             "profileLevelId": encoder.stream["codec"][5:]
@@ -117,7 +121,7 @@ def _encoder_probe(settings, fps):
         encoder.close()
 
 
-def preflight_source_encoding(settings, fps, executable=None):
+def preflight_source_encoding(settings, fps, executable=None, *, width=832, height=480):
     """No listener, Room, CLI or model; bounded real encode/decode and binary check."""
     executable = executable or os.environ.get(
         "WHITEBOX_NATIVE_RTC_BINARY", "/app/whitebox-rtc"
@@ -136,10 +140,18 @@ def preflight_source_encoding(settings, fps, executable=None):
     script = (
         "import json,sys; from sglang.multimodal_gen.runtime.realtime.whitebox."
         "session_encoding import _encoder_probe; "
-        "print(json.dumps(_encoder_probe(json.loads(sys.argv[1]),int(sys.argv[2]))))"
+        "print(json.dumps(_encoder_probe(json.loads(sys.argv[1]),int(sys.argv[2]),int(sys.argv[3]),int(sys.argv[4]))))"
     )
     result = subprocess.run(
-        [sys.executable, "-c", script, json.dumps(settings), str(fps)],
+        [
+            sys.executable,
+            "-c",
+            script,
+            json.dumps(settings),
+            str(fps),
+            str(width),
+            str(height),
+        ],
         env={**os.environ, "SGLANG_LIGHTWEIGHT_RUNTIME": "1"},
         check=True,
         capture_output=True,

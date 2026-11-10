@@ -1645,6 +1645,16 @@ joint FPS 约 +1.5%–1.6%，三分支 kernel 无端到端收益；六分支外�
 完整阶段性能和独立显存尚未验收，不能作为默认部署建议。
 范围、测试及原始证据入口见[联合优化设计](/docs/sglang-diffusion/zing/plans/SOURCE_DEFERRED_FINAL)。
 
+### 2026-11-10：原生 RTC 源分辨率与会话编码共同选择
+
+原生 RTC 新源允许 `whitebox.resolution=720p`（1280×720）与显式
+`source_encoding` 同时使用，480p 保留 832×480。CPU 预检按所选尺寸与编码帧率
+真实编解码，不改变编码参数或模型几何策略；720p 仍限制在 30 FPS 以内。
+Gateway、Room Python 与客户端需要匹配升级，既有支持 session source encoding
+的 native sender 协议保持兼容。当前版本的 480/736 GPU 性能、显存与效果未新增验证，
+720p 浏览器/模型端到端验收也未执行，不以本次 CPU 结果外推。
+合同与验证入口见[会话源编码](../zing_h3/specs/whitebox-source-encoding.md)。
+
 ## 视频固定 480p 编码与参考图的可选缩放
 
 实时 source 始终按短边 ≤480、面积 ≤399360 编码，不提供关闭选项，小输入不放大；

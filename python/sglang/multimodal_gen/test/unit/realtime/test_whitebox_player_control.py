@@ -466,19 +466,22 @@ def test_gateway_lost_reply_reconciles_original_directory_and_owner(
 
 
 @pytest.mark.parametrize(
-    "transport,producer,codec",
+    "transport,producer,codec,resolution",
     [
-        ("websocket", None, None),
-        ("webrtc-rtp", None, None),
-        ("webrtc-rtp", "canonical", None),
-        ("webrtc-rtp", "legacy", None),
-        ("webrtc-rtp", None, "h264"),
-        ("webrtc-rtp", None, "vp9"),
-        ("webrtc-rtp", None, "av1"),
+        ("websocket", None, None, None),
+        ("webrtc-rtp", None, None, None),
+        ("webrtc-rtp", "canonical", None, None),
+        ("webrtc-rtp", "legacy", None, None),
+        ("webrtc-rtp", None, "h264", "480p"),
+        ("webrtc-rtp", None, "vp9", "480p"),
+        ("webrtc-rtp", None, "av1", "480p"),
+        ("webrtc-rtp", None, "h264", "720p"),
+        ("webrtc-rtp", None, "vp9", "720p"),
+        ("webrtc-rtp", None, "av1", "720p"),
     ],
 )
 def test_real_original_source_factory_and_native_rtc_attachment_without_reinit(
-    tmp_path, monkeypatch, transport, producer, codec
+    tmp_path, monkeypatch, transport, producer, codec, resolution
 ):
     import importlib
     import json
@@ -555,7 +558,13 @@ def test_real_original_source_factory_and_native_rtc_attachment_without_reinit(
 
     async def run():
         monkeypatch.setenv("WHITEBOX_NATIVE_RTC_ENABLED", "1")
-        spec = VideoSpec(832, 480) if codec else VideoSpec(32, 32)
+        spec = (
+            VideoSpec(1280, 720)
+            if resolution == "720p"
+            else VideoSpec(832, 480)
+            if codec
+            else VideoSpec(32, 32)
+        )
         engine = Engine(spec)
         engine.renderer = BrowserUI()
         joins = []
@@ -580,7 +589,9 @@ def test_real_original_source_factory_and_native_rtc_attachment_without_reinit(
                 base64.b64decode(op["frozenLaunchParameters"]["initMsgpackBase64"])
             )
             init.update(source_operation="create.manual", inference_control="manual")
-            init["whitebox"]["source_encoding"] = selected
+            init["whitebox"].update(
+                source_encoding=selected, resolution=resolution, cli_fps=30
+            )
             op["frozenLaunchParameters"]["initMsgpackBase64"] = base64.b64encode(
                 msgspec.msgpack.encode(init)
             ).decode()
@@ -677,10 +688,11 @@ def test_real_original_source_factory_and_native_rtc_attachment_without_reinit(
 
         probes = []
 
-        def preflight(value, fps):
+        def preflight(value, fps, *, width, height):
             assert not owner.sessions and not runtime.rooms and not joins
             assert not owner.lock.locked()
             assert value == selected
+            assert (width, height) == (spec.width, spec.height)
             probes.append((copy.deepcopy(value), fps))
             return "42c029" if codec == "h264" else None
 
@@ -792,7 +804,9 @@ def test_real_original_source_factory_and_native_rtc_attachment_without_reinit(
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("failure", ["probe", "websocket", "720p", "attach", "cancel"])
+@pytest.mark.parametrize(
+    "failure", ["probe", "websocket", "720p60", "attach", "cancel"]
+)
 def test_managed_encoding_rejection_or_interruption_releases_preparation(
     tmp_path, monkeypatch, failure
 ):
@@ -813,14 +827,14 @@ def test_managed_encoding_rejection_or_interruption_releases_preparation(
         )
         init.update(source_operation="create.manual", inference_control="manual")
         init["whitebox"]["source_encoding"] = settings("h264")
-        if failure == "720p":
-            init["whitebox"]["resolution"] = "720p"
+        if failure == "720p60":
+            init["whitebox"].update(resolution="720p", cli_fps=60)
         op["frozenLaunchParameters"]["initMsgpackBase64"] = base64.b64encode(
             msgspec.msgpack.encode(init)
         ).decode()
         probes, attaches = [], []
 
-        def preflight(*args):
+        def preflight(*args, **kwargs):
             assert not owner.sessions and not owner.runtime.rooms
             assert not owner.lock.locked()
             probes.append(args)

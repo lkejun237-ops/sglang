@@ -16,16 +16,17 @@ from sglang.multimodal_gen.runtime.realtime.whitebox.source_encoding import (
 )
 
 
+@pytest.mark.parametrize("width,height", [(832, 480), (1280, 720)])
 @pytest.mark.parametrize(
     "codec,min_qp",
     [("h264", 0), ("vp9", 0), ("vp9", 48), ("av1", 0), ("av1", 32)],
 )
 def test_source_codecs_are_elementary_decodable_and_recover_after_forced_key(
-    codec, min_qp
+    codec, min_qp, width, height
 ):
     if encoder_implementation(codec) not in av.codecs_available:
         pytest.skip("Configured software codec is unavailable")
-    spec = VideoSpec(832, 480)
+    spec = VideoSpec(width, height)
     encoder = create_source_playback_encoder(
         spec,
         settings=dict(
@@ -60,7 +61,9 @@ def test_source_codecs_are_elementary_decodable_and_recover_after_forced_key(
             encoder.set_target_bitrate(700000)
         if i == 9:
             encoder.request_keyframe()
-        rgb = np.full((480, 832, 3), [10 + i * 5, 100, 180], dtype=np.uint8).tobytes()
+        rgb = np.full(
+            (height, width, 3), [10 + i * 5, 100, 180], dtype=np.uint8
+        ).tobytes()
         outputs.extend(encoder.push(i, rgb, i * 33333))
     outputs.extend(encoder.drain())
     assert [i for i, _ in outputs] == list(range(14))
@@ -88,7 +91,7 @@ def test_source_codecs_are_elementary_decodable_and_recover_after_forced_key(
         frames.extend(decoder.decode(av.Packet(m["payload"])))
     frames.extend(decoder.decode(None))
     assert len(frames) == 14
-    assert all((f.width, f.height) == (832, 480) for f in frames)
+    assert all((f.width, f.height) == (width, height) for f in frames)
     encoder.close()
 
 
