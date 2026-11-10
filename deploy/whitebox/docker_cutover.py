@@ -132,6 +132,164 @@ print(json.dumps(r))"""
             )
         )
 
+    def archive_probe(self, container, spec):
+        probe = Path(__file__).with_name("docker_idle_probe.py")
+        require(sha(probe.read_bytes()) == spec["probe_sha256"], "Probe source changed")
+        nonce = os.urandom(24).hex()
+        base = "/tmp/whitebox-cutover-probe-v1"
+        setup = """import json,os,sys
+from pathlib import Path
+assert sys.version_info[:2] == (3,14)
+module=b'sglang.multimodal_gen.runtime.entrypoints.whitebox_room_server'
+rows=[p for p in Path('/proc').iterdir() if p.name.isdigit() and module in (p/'cmdline').read_bytes().split(b'\\0')]
+assert len(rows)==1
+p=rows[0]; uid=p.stat().st_uid;gid=p.stat().st_gid
+base=Path(sys.argv[1]);base.mkdir(mode=0o700);os.chown(base,uid,gid)
+r=json.loads(sys.argv[2]);r.update(pid=int(p.name),starttime=(p/'stat').read_text().rsplit(')',1)[1].split()[19])
+f=base/'request.json';f.write_text(json.dumps(r));f.chmod(0o600);os.chown(f,uid,gid)
+print(json.dumps(r))"""
+        request = {"nonce": nonce, "owner_id": spec["owner_id"]}
+        binding = json.loads(
+            self.cli(
+                "exec",
+                "--user",
+                "0",
+                container,
+                "python",
+                "-c",
+                setup,
+                base,
+                json.dumps(request),
+            )
+        )
+        self.cli("cp", str(probe), container + ":" + base + "/probe.py")
+        self.cli(
+            "exec",
+            "--user",
+            "0",
+            "--privileged",
+            container,
+            "python",
+            "-c",
+            "import sys;sys.remote_exec(int(sys.argv[1]),sys.argv[2])",
+            str(binding["pid"]),
+            base + "/probe.py",
+        )
+        result = None
+        try:
+            for attempt in range(100):
+                result = json.loads(
+                    self.cli(
+                        "exec",
+                        "--user",
+                        "0",
+                        container,
+                        "python",
+                        "-c",
+                        "from pathlib import Path;import sys; p=Path(sys.argv[1]);print(p.read_text() if p.exists() else 'null')",
+                        base + "/result.json",
+                    )
+                )
+                if result is not None:
+                    break
+                time.sleep(0.1)
+            require(result is not None, "Interpreter probe did not complete")
+            current = (
+                self.cli(
+                    "exec",
+                    "--user",
+                    "0",
+                    container,
+                    "python",
+                    "-c",
+                    "from pathlib import Path;import sys;print(Path('/proc/'+sys.argv[1]+'/stat').read_text().rsplit(')',1)[1].split()[19])",
+                    str(binding["pid"]),
+                )
+                .decode()
+                .strip()
+            )
+            require(current == binding["starttime"], "Interpreter process changed")
+            validate_archive_probe(result, binding, spec)
+            return result
+        finally:
+            # A delayed remote script must still find its exact input. Keep the
+            # exclusive directory on timeout for explicit reconciliation.
+            if isinstance(result, dict) and result.get("nonce") == nonce:
+                self.cli("exec", "--user", "0", container, "rm", "-r", base)
+
+
+def validate_archive_probe(value, binding, spec):
+    require(not value.get("error"), "Archive probe could not inspect the owner")
+    require(
+        all(value.get(k) == binding[k] for k in ("nonce", "pid", "starttime")),
+        "Archive probe process identity mismatch",
+    )
+    require(
+        value.get("schema_version") == 1
+        and value.get("main_thread") is True
+        and value.get("gil") is True
+        and value.get("python", [])[:2] == [3, 14]
+        and value.get("probe_sha256") == spec["probe_sha256"]
+        and value.get("manager_count") == value.get("runtime_count") == 1,
+        "Archive probe identity or interpreter is unsupported",
+    )
+    require(
+        abs(time.time() - value["observed_at"]) < 30, "Archive probe evidence is stale"
+    )
+    expected = {
+        "active",
+        "tasks",
+        "status_pending",
+        "io_active",
+        "upload_pending",
+        "rgb_used",
+        "unfinished_manager_tasks",
+        "recovery",
+        "upload_pool",
+        *(
+            "runtime_" + k
+            for k in (
+                "rooms",
+                "players",
+                "pending_startups",
+                "join_attempts",
+                "retiring",
+                "retiring_players",
+                "player_closures",
+            )
+        ),
+        *(
+            "recording_" + k
+            for k in (
+                "open",
+                "unfinished",
+                "pending",
+                "items",
+                "pending_bytes",
+                "upload_buffer_bytes",
+                "object_buffer_bytes",
+                "ui_bytes",
+                "ui_tasks",
+                "rgb_slots",
+                "alive_processes",
+            )
+        ),
+    }
+    counters = value.get("counters", {})
+    require(set(counters) == expected, "Archive probe fields are incomplete")
+    require(
+        all(type(v) is int and v >= 0 for v in counters.values()),
+        "Unknown archive counter",
+    )
+    require(
+        all(v == 0 for k, v in counters.items() if k != "rgb_used"),
+        "Archives are still busy",
+    )
+    require(
+        counters["rgb_used"] == 0 or spec.get("allow_orphaned_rgb_budget") is True,
+        "Residual archive RGB budget needs explicit review",
+    )
+
 
 def environment(old):
     return dict(value.split("=", 1) for value in old["Config"]["Env"])
@@ -317,7 +475,14 @@ def idle(config, engine, snapshots):
     require(spec["role_pools"], "Role pool evidence missing")
     for endpoint in spec["role_pools"]:
         validate_pool(read(endpoint))
-    validate_metrics(read(spec["metrics"], raw=True))
+    require(
+        ("metrics" in spec) != ("manager_probe" in spec),
+        "Exactly one recording evidence owner is required",
+    )
+    if "manager_probe" in spec:
+        engine.archive_probe(snapshots["room"]["Id"], spec["manager_probe"])
+    else:
+        validate_metrics(read(spec["metrics"], raw=True))
 
 
 def gated_text(config, original):

@@ -37,7 +37,8 @@
         "url": "http://127.0.0.1:18081/v1/role-pool/capacity",
         "body": {
           "profile": "REPLACE_WITH_EXISTING_PROFILE",
-          "network_domain": "REPLACE_WITH_EXISTING_DOMAIN"
+          "network_domain": "REPLACE_WITH_EXISTING_DOMAIN",
+          "compatibility": "REPLACE_WITH_EXISTING_COMPATIBILITY"
         },
         "token_role": "room",
         "token_env": "REPLACE_WITH_EXISTING_ROLE_TOKEN_ENV"
