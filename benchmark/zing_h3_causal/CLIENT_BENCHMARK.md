@@ -9,6 +9,12 @@ benchmark，不将 token 指标或视频任务轮询直接套到 Zing。
 
 ## 默认测试模型（2026-10-30 起）
 
+2026-11-06 新增可显式选择的 **1102 DMD step2000 generator** 候选，精确 OSS 路径、
+配置摘要、导出步骤和验证状态见 [模型版本登记](../../docs/docs/sglang-diffusion/zing/specs/MODEL_VERSIONS.md)。
+用户确认该模型已在泰国部署并有配套 serving 与 AdaLN 资产，版本登记已列出历史盘点中的
+serving 路径；后续优先复用并核对模型/table/runtime 身份。本次未独立验收该组合的 GPU
+效果与性能；它尚未替换下述默认模型，旧模型结果不改标为新版。
+
 后续测试固定使用 **1027 的 step 010000 AR + DMD diff** 模型，配置为
 `num_frame_per_block=[3,2]`、`split_first_latent=false`。原始 checkpoint 的 SHA256 为
 `89c3a67d77214e57d810e6a4e5554c7c919ae929db0174e6439dfadb53a1d731`。

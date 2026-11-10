@@ -504,6 +504,13 @@ H200 BF16/FP8 回执根为 `oss://leap-world-shanghai/world-model/sglang/evals/z
 
 ## 当前测试模型：1027 step 010000
 
+2026-11-06 登记了 11 月发布的 **1102 DMD step2000 generator**，可作为后续测试的显式候选。
+发布消息、精确 OSS 对象、配置摘要、导出前置条件及验收缺口见
+[模型版本登记](specs/MODEL_VERSIONS.md)。用户确认克君已在泰国部署并有 serving 与配套
+AdaLN 资产；后续优先复用登记中的现成路径，核对模型、table manifest 与实际 runtime。
+本次未独立完成该组合的 480/736 GPU 验收，不把资产存在等同于当前版本已验收。
+下述 1027 模型继续作为默认和对照；新版性能及 Encoder/DiT/Decoder 显存均未验证。
+
 2026-10-30 起默认测试模型为 **AR + DMD diff，1027 step 010000**。训练配置及后续 serving
 配置均应保持 `num_frame_per_block=[3,2]`、`split_first_latent=false`，不静默回退旧模型或旧首块行为。
 

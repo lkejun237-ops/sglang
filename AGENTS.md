@@ -86,6 +86,12 @@
 
 ## Zing PR 性能验证
 
+- 测试模型版本与精确原始路径见 `docs/docs/sglang-diffusion/zing/specs/MODEL_VERSIONS.md`。
+  2026-11-06 已登记 1102 DMD step2000 generator；用户确认克君已在泰国部署并有配套
+  serving 与 AdaLN 资产，后续测试优先复用。路径和证据见版本登记，使用前核对实际
+  模型、table manifest 与 runtime；本次尚未独立完成该组合的 GPU 验收。
+  原 1027 step10000 默认模型保留作对照，不将旧结果改标为新版。
+
 - Codex 与部署同学以 `docs/docs/sglang-diffusion/zing/deployment_zing_h3.mdx` 作为
   H100/H200/B300 部署决策入口。对 Zing H3 性能或显存有影响的 PR，必须在同一 PR
   更新该文档受影响的策略、结果或验证状态；未实测时明确标为当前版本未验证，旧证据保留版本边界。
