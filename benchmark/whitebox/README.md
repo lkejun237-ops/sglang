@@ -552,11 +552,17 @@ do not raise capacity based only on the number of installed GPUs.
 
 ## Recording package
 
+For the capability-scoped play-report context and artifact access API, including
+exact segment selection and archive-frame mapping limits, see the
+[owning contract](../../docs/docs/sglang-diffusion/zing/specs/WHITEBOX_CLIENT_UI_ACTIONS.zh.md#游玩投诉证据读取).
+
 ```text
 whitebox/<recording_id>/
   manifest.json
   inputs.jsonl
   states.jsonl
+  report-frames.jsonl    # compact archive/source-frame → actual per-stream PTS
+  output-contexts.jsonl  # actual model-output prompt/reference transitions
   whitebox.mp4
   model.mp4
   ui_rendered.mp4

@@ -36,6 +36,10 @@ def test_area_gate_runs_real_child_receipts_and_requires_aggregate_success(
         "test_bound_video.py",
         "test_whitebox_source_encoding.py",
         "test_whitebox_session_encoding.py",
+        "test_whitebox_report_context.py",
+        "test_whitebox_report_timeline.py",
+        "test_whitebox_stream_archive.py",
+        "test_whitebox_recording_process.py",
     } <= {Path(name).name for name in roots}
     assert not any(name.endswith("test_whitebox_cli_integration.py") for name in roots)
     (tmp_path / "test").mkdir()

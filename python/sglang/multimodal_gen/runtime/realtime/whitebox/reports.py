@@ -333,6 +333,9 @@ class Reports:
 
     def install(self, app):
         from .client_recording import ClientRecordings
+        from .report_context import install_report_context
+
+        install_report_context(app, self)
 
         @app.get("/v1/whitebox/recordings/{recording_id}/segments/{segment_id}/inputs")
         async def segment_inputs(

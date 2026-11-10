@@ -378,6 +378,7 @@ class RoomProxy:
             outgoing = self.client.build_request(
                 request.method,
                 origin.rstrip("/") + path,
+                params=list(request.query_params.multi_items()),
                 content=bytes(data),
                 headers={
                     key: request.headers[key]

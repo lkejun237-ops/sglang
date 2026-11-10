@@ -44,6 +44,15 @@ owner 执行两轮真实子进程，不复写普通套件的历史批准证据�
 新增或移动此类 owner 时，同步 `AREA_FILES` 与
 `test/registered/unit/ci/test_worldkit_area_gate.py` 的入口断言，不能只本地跑测试。
 
+游玩投诉的 context、配对视频/Prompt 时间线及原归档消费者分别由
+`test_whitebox_report_context.py`、`test_whitebox_report_timeline.py`、
+`test_whitebox_stream_archive.py` 和 `test_whitebox_recording_process.py` 持续覆盖，
+包括新增两个元数据 sidecar 后的精确八对象上传集合及 manifest 最后发布；
+沿相同 `execute_pytest` 子进程入口逐文件执行
+两轮。它们复用 AREA 已安装的 PyAV/libx264、boto3、FastAPI/httpx、msgspec、NumPy 与
+Pillow，使用内存/本地 HTTP 存储夹具，不需要模型权重、GPU 或真实 OSS 凭据。
+本地只复跑这些文件不代表整个 AREA 或固定 Linux CI 已验收；以完整 GitHub job 回执为准。
+
 source codec 预检要求 CI 先用既有 `docker/whitebox.Dockerfile` 的 `rtc-builder`
 CPU stage 执行 Go 测试并产出本次源码的 Linux 原生发送器，再通过
 `WHITEBOX_TEST_RTC_BINARY` 传入 Python 子进程。PyAV 沿用 Whitebox 的固定依赖；

@@ -292,6 +292,7 @@ def test_version_identity_is_frozen_and_never_returns_credentials(
     f.write_text(json.dumps({**m, "source_sha": "d" * 40}))
     result = TestClient(app).get("/v1/whitebox/version").json()
     assert result["source_sha"] == "a" * 40
+    assert result["source_branch"] == "main"
     assert result["identity_status"] == "configured"
     assert "must-not-be-returned" not in json.dumps(result)
     monkeypatch.setenv("WHITEBOX_MODEL_MIN_BITRATE", "100000")

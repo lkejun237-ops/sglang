@@ -268,7 +268,20 @@ def test_real_streamed_video_preserves_pixels_absolute_pts_and_inputs_without_di
         result = data.finish("completed", manifest)
         assert result["recording_status"] == result["upload_status"] == "complete"
         assert result["archive_storage"] == STORAGE
+        report_index = [
+            json.loads(line)
+            for line in client.objects[
+                ("b", manifest["object_prefix"] + "report-frames.jsonl")
+            ][0].splitlines()
+        ]
+        assert [row["archive_pts_us"]["model"] for row in report_index] == expected_pts
+        assert [
+            row["archive_pts_us"]["whitebox"] for row in report_index
+        ] == expected_pts
         for name in ["whitebox", "model"]:
+            assert result["videos"][name]["first_pts_us"] == expected_pts[0]
+            assert result["videos"][name]["playback_time_origin_us"] == 0
+            assert result["videos"][name]["playback_timeline"] == "mp4_preserved_pts_v1"
             raw = client.objects[("b", manifest["object_prefix"] + name + ".mp4")][0]
             with av.open(io.BytesIO(raw)) as movie:
                 frames = list(movie.decode(video=0))

@@ -2,6 +2,170 @@
 
 适用：`whitebox-render-v2` / `native-h264-rtp-v1`。媒体通过 WebRTC RTP，控制消息仍通过 `/whitebox/v1/webrtc/play` 的可靠 WebSocket，以 MessagePack 二进制发送。WS 媒体入口与 RTC 媒体入口共用 Room 的游戏控制实现。
 
+## 游玩投诉证据读取
+
+投诉主表、reportId、处理权限与管理页面由 WTP 负责。SGLang 不写投诉数据库，不把
+reportId 当作 recordingId、traceId 或新的会话，也不改变录制、编码和模型默认值。
+`reports.py` 的原录制 owner 安装以下只读接口；这与原 recording status 使用同一份
+`Authorization: Bearer <report_token>` 能力，错误能力返回 404。
+
+| 方法与路径 | 行为 |
+| --- | --- |
+| `GET /v1/whitebox/recordings/{recording_id}/context` | 返回无签名 URL、无 token 的有界证据快照 |
+| `GET /v1/whitebox/recordings/{recording_id}/context/artifact-access?artifact_id=states` | 鉴权后签发指定证据的 15 分钟访问 URL |
+| `GET /v1/whitebox/recordings/{recording_id}/context/timeline` | 精确模型段的有界实际输出 Prompt/参考图时间线 |
+
+Gateway 对应入口为 `/v1/whitebox/owners/{owner_id}/recordings/{recording_id}/...`，
+只转发到配置的 owner，保留查询参数和原 Bearer。仅有一个 owner 时原兼容入口仍可用。
+两个响应均使用 `Cache-Control: private, no-store`，不得把 artifact-access 响应持久化为
+稳定证据位置。接口不接收 URL、bucket、object key 或磁盘路径作为抓取目标。
+
+`context` 可传 `segment_id=<精确模型段 recordingId>`；也支持 `segment_epoch`，只在父
+manifest 中唯一匹配该 epoch 的 entry；同时传两者时必须一致。必须在父 source manifest
+的 render_segments 中，并同时匹配 source_session_id、source_epoch 和对象前缀。
+选择器不受旧 status 接口最后 64 段展示上限限制。未传时仅返回 source，不猜测最新段；
+指定他人或不存在的段返回 404，不回退到其他段。已结束的录制沿原能力索引读取本地保留
+manifest 或 diskless 对象归档；没有保留的索引/manifest 不会重建、恢复或续租会话。
+
+响应 `schema_version=1`，包含 `recording_id`、`observed_at_ms`、`identity`、`source`、
+精确选中的 `segments`、`mapping` 和有界 `timings`。每个 source/segment 包含：
+
+- `identity`：manifest 已记录的 world/trace/source/epoch/segment 身份，以及已存在的
+  multiplayer game/player/stream/user/owner 身份；缺少字段不伪造。
+- `identity_provenance=archive_manifest`；`deployment` 只返回白名单元数据，
+  `deployment_provenance=recorded_manifest_metadata`。配置与历史 manifest 不是当前
+  实例运行身份的独立证明，也不是 WTP 用户/operation 关联的授权凭据。
+- 原 `recording_status`、`upload_status`、`dataset_status`、timeline 和客户端 UI 状态。
+- `artifacts[]`：`artifact_id`、role、recording_id、availability、`locator`、可用时的
+  bytes/sha256、`access={artifact_id,segment_id}`。locator 保存 provider/bucket/region/
+  object_key；不返回存储端点、凭据或签名 URL。availability 依据归档 manifest/receipt，
+  不代表本次已对全部对象执行 HEAD 验证。输入和状态未完整归档时保留 pending/unavailable。
+  需要客户端 UI 录像但 receipt 尚未完成时，也返回独立 pending artifact，其 locator 为 null，
+  不能因为该文件未出现就把整场证据标记为完整。
+- artifact ID 支持 manifest、inputs、states、`video:whitebox`、`video:model`、
+  `video:ui_rendered`、已验证独立上传的 `client_ui`，以及至多 64 个 reference。
+  artifact-access 也可传相同 segment_id，未归档返回 409，无签名器返回 503。
+
+可选 `frame_index` 明确表示**归档帧号**，配合 `stream=whitebox|model`；它不是 CLI
+源帧、模拟 tick 或提交时间。或者单独传 `source_frame_index`，从 states 的 source provenance
+精确匹配；存在多个对应归档帧时标记 ambiguous，不擅自选择。两个 frame selector 不能同时传。
+新录制由原 archive writer 同步生成小型 `report-frames.jsonl`，manifest 的
+`report_frames={path,format:report_frame_index_v1}` 声明它，并由原对象清单记录大小/SHA256。
+每行只有 schema_version、归档 frame、可用的 source_frame_index 与逐流 archive_pts_us；
+不包含 opaque states、输入、图像或第二份播放队列。五分钟会话无需扫描完整游戏状态。
+reader 优先读取该有界索引，旧包才回退 states。仅当对应视频有实际 `first_pts_us`、
+明确的 `playback_timeline=mp4_preserved_pts_v1` 与 `playback_time_origin_us=0`，
+且有不超过 8 MiB、大小和 SHA256 均匹配的索引/旧 states 时，按实际逐流 archive_pts_us 返回
+`mapping={status:mapped,recording_id,artifact_id,frame_index,pts_us,seek_seconds,method,
+precision,index_path,index_sha256}`。新 streaming/disk worker 在实际 mux 边界记录逐流 archive_pts_us，
+区分 source_frame 的 capture PTS 与 pair/独立录制的 presentation PTS；视频 first_pts_us
+来自 mux 首个实际 packet。playback_time_origin_us 表示 HTMLVideo currentTime=0 对应的
+归档 PTS；当前 H264MuxFile 保留非零 PTS/edit list，故该值为 0，不能填首帧 PTS。
+seek_seconds=(实际归档 PTS-playback_time_origin_us)/1e6，当前等于实际绝对 PTS 秒数。
+例如首帧 PTS=12.0s、投诉帧 PTS=12.49s，浏览器必须跳到 12.49s；减首帧得到 0.49s
+会被浏览器夹到 12.0s，错误地显示第一帧。不使用帧号/24，也不假设每个 MP4 从首帧归零。
+旧包缺少明确 playback marker 时返回 archive_playback_timeline_unknown；即使有 first_pts_us
+也不生成看似精确的跳转。旧独立编码 v2 只有同时具备明确 playback 合同与视频起点时，
+才可用其原 presentation_pts_us。帧不存在、文件过大或不完整同样返回明确 reason。
+本地 CPU 回归覆盖实际 mux/解码 PTS 与 HTTP 响应；Google Chrome 对当前普通 MP4 和
+streaming fragmented MP4 的隔离非零起点素材均已确认上述 currentTime 语义，使用支持
+HTTP 206 Range 的本地读取，并等待 canplaythrough 与呈现后检查对应帧颜色。不同浏览器、
+真实 WTP/CDN 与用户整场点击仍需联合验收。
+输出快照上限 256 KiB；磁盘与对象读取沿原有有界 IO，不扫描整场日志或读取原始状态到响应中。
+
+### 同一模型段的白模与模型画面对比
+
+一个 `render_segment` 已有两条录像：whitebox 保存该段每个模型输出实际配对的源帧，model
+保存对应模型画面。对比应选择**同一个段**的 `video:whitebox` 与 `video:model`，不能拿父
+source 的完整预览录像按相同 currentTime 冒充一一对应。原配对 owner 在相同归档 frame 和
+实际 PTS 下写入两条录像；独立编码的 pair owner 也在写入前核对两边实际 PTS。
+
+`context.source.comparison` 与每个 `context.segments[].comparison` 提供：
+
+```text
+schema_version: 1
+recording_id, source_session_id, source_epoch, segment_id, segment_epoch
+source_artifact_id: video:whitebox
+model_artifact_id: video:model
+status: aligned | pending | unavailable
+method: shared_recording_frame_index_and_pts    # 仅 aligned 时
+frames, first_pts_us, last_pts_us
+first_playback_seconds, last_playback_seconds
+playback_timeline: mp4_preserved_pts_v1
+playback_time_origin_us: 0
+index_sha256
+reason                                             # 未证明对应关系时
+```
+
+aligned 必须同时具备精确父/子身份、完整归档、两条视频对象的 receipt、相同有效帧数及明确
+播放时间合同；读取并验证整个有界小索引的大小/SHA256 后，逐帧核对连续归档 frame 与两条
+实际 PTS 相等且严格递增，并匹配 manifest 首帧 PTS。共同的非零起点和共同时间空隙允许存在；
+PTS 不同、缺轨、数量不符、部分归档或缺少证明材料时明确不可同步，不用“帧数相同”替代证据。
+这项验证读取 manifest/小索引，不重新下载或解码整条视频，也不独立证明 CDN 对象未被外部修改。
+消费者据此鉴权取得这两个 artifact 的临时 URL，同步播放、暂停和跳转；浏览器调度与实际
+解码仍需播放器纠偏和验收。不同模型段不能只凭相同 currentTime 自动合并为一条轨道。
+
+### 实际输出的 Prompt 与参考图时间线
+
+`timeline` 复用父录制 Bearer、精确 segment_id 或唯一 segment_epoch；不默认选最新模型段。
+查询字段为 `from_seconds`（默认 0）、`to_seconds`（默认 from+300）、`limit`（默认64、最大128）。
+时间必须有限、非负，且 `0 < to-from <= 300`。`recording_id` 是实际选中段，
+`source_recording_id` 是原父录制；响应带完整 source/segment identity 供消费者复核。
+
+响应 `schema_version=1`、`semantic=model_output_applied`，包含 status、window、coverage、
+events、includes_prior_context、truncated、next_from_seconds 与可用时的 provenance/index_sha256。
+每个 event 保存 frame_index、source_frame_index、实际 playback_seconds，
+`prompt={text,sha256,version?}` 和 `references=[{id,sha256,artifact_id?}]`。
+参考图 artifact 只根据本段已归档对象的实际哈希匹配，不返回任意 URL、对象端点或能力凭据。
+参考图对象有有效 SHA256/正大小 receipt 时，png/jpeg/jpg/webp 扩展名可提供白名单 content_type，
+provenance 为 archive_reference_extension；未知格式和 SVG 不提供可内嵌图片类型。
+原接入 owner 负责图像内容与格式校验，本只读投影不重新下载图像或把后缀当作独立解码验收。
+Prompt 是用户原文，响应不复制包含服务凭据的完整 init、输入或日志。
+
+新归档在原 metadata writer 中生成 `output-contexts.jsonl`，只在实际输出 Prompt/有序参考图/
+版本改变时记录，不因键盘输入变化重复长 Prompt。manifest 用
+`output_contexts={path,format:model_output_context_v1,frames}` 声明其格式和已处理输出帧数。
+counter 必须等于实际 model 视频帧数，且每个事件必须精确匹配已核验帧索引的 frame/源帧/PTS。
+实际语义来自 `RenderSegment.model_output_condition` 按模型输出 event_id 选中的条件；
+“请求已接受”不生成已应用事件。缺失或无效输出上下文、范围外帧、错误 PTS、部分归档、
+不完整覆盖都返回 unavailable，不能向后沿用上一条 Prompt 冒充已知状态。
+
+旧包只允许回退读取不超过8 MiB且大小/哈希均匹配的 inputs，并要求它的区间从0连续覆盖
+实际全部模型帧，再按 start_frame 关联小帧索引的真实模型 PTS。旧 inputs 的 start_time_us 是
+capture 时间，不能直接作为模型录像时间；只有 accepted metadata 或 opaque states 的旧包
+不能推出应用时间线。每个索引/上下文对象读取上限8 MiB，响应预算128 KiB，不读整场大 states。
+
+窗口返回 from 时刻已经应用的最后一条上下文，以及 `from < playback_seconds <= to` 的
+后续变化；包含 to 时刻和共同末帧发生的上下文切换，避免末帧误显示上一条 Prompt。没有已知先前输出时
+不填充 Prompt。coverage 表示真实归档帧 PTS 的首/末边界，窗口超过末帧不继续传播上一条
+上下文。达到事件/字节预算时返回 truncated 和第一条未返回事件的 next_from_seconds，
+消费者可按窗口重读并按 frame_index 去重。时间线按需读取，不在普通列表或每次状态轮询中
+下载。真实多段切换、参考图预览和双视频同步仍需 WTP/播放器联合验收。
+
+集成边界：WTP 必须从原受信 launch/control owner 取得并安全保留原录制 capability，
+核对原 operation/subject 与返回身份；不能将浏览器任填的 scope 升格为服务端核验。
+本接口没有新增通用服务身份读取或 direct-play scope receipt。无法取得既有 capability
+的旧 direct-play 路径仍可保存用户投诉，但应标注证据关联不完整，不得开放跨用户读取。
+能力不得进入普通 report JSON、日志或前端管理详情。保留期限仍遵循原归档，引用不自动 pin。
+
+发布时分别记录构建工具与运行源码的精确 SHA。使用现行 `main` 正式构建工具，验证运行
+源码可达新鲜 `origin/main`、内嵌 SDK 可达 `origin/dev`，再导出完整归档；不运行历史
+`white_box` 构建器或绕过镜像原生检查与层历史门禁。仅更新 CPU 组件时，还须核对 Gateway、
+Room 实际加载的模块和插件，不能将未启用的模型代码一并声明为已发布。保留经核对的实际
+bindings、Secret、SDK pin 与挂载；配置沿用前逐项核对原 bundle 指纹、地域与 release-owned
+环境，不以新 plan 隐式推进模型策略。源码身份和镜像通过不代表线上会话已排空。
+
+本地合同回归：`test_whitebox_report_context.py` 与 `test_whitebox_render_reports.py`
+覆盖错能力、他人段、超 64 段精确选择、保留索引、稳定定位、VFR 与 hash 校验、pending
+归档、任意路径拒绝和 owner 查询转发。真实 WTP 提交、对象播放与点击定位仍需配套端到端
+验收；源码实现和 CPU 回归不代表线上已部署或完成产品验收。
+`test_whitebox_report_timeline.py` 另用实际模型输出条件选择、真实双轨编码/归档，覆盖非零
+起点、共同空隙、PTS/轨道不匹配、延迟应用的 Prompt、已知覆盖、旧包缺失、分页及权限边界。
+context、timeline、原 `test_whitebox_stream_archive.py` 与 `test_whitebox_recording_process.py`
+均登记在维护中的 `scripts/ci/zing/run_area_tests.py`，通过原 `execute_pytest` 隔离入口执行两轮；
+后者严格检查包含两个新 sidecar 的八对象上传集合及 manifest 最后发布。入口断言由
+`test/registered/unit/ci/test_worldkit_area_gate.py` 维护，不改写历史 CPU 批准 manifest。
+
 ## 外部 Player 按需推理
 
 2026-11-02 本地候选实现。外部单人和成员 Player 由受信 WTP 冻结以下 init 字段：

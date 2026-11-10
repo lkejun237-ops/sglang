@@ -97,6 +97,8 @@ class StreamingData:
             None, self.spec, file=TextObject(self.object("inputs.jsonl"))
         )
         self.states = TextObject(self.object("states.jsonl"))
+        self.report_frames = TextObject(self.object("report-frames.jsonl"))
+        self.output_contexts = TextObject(self.object("output-contexts.jsonl"))
         self.source_states = TextObject(self.object("source-states.jsonl"))
         names = ("whitebox",) if kwargs.get("source_only") else ("whitebox", "model")
         self.encoders = {
@@ -230,14 +232,21 @@ class StreamingData:
             pts = presentation_pts(frame)
             self.encoders["whitebox"].append(frame.index, source, pts)
             self.encoders["model"].append(frame.index, encoded, pts)
-            Recording.aligned_metadata(self, frame, prompt)
+            Recording.aligned_metadata(
+                self, frame, prompt, archive_pts_us={"whitebox": pts, "model": pts}
+            )
             self.last_frame = frame.index
         elif kind == "source_frame":
             frame, encoded = value
             self.encoders["whitebox"].append(
                 frame.index, encoded, frame.provenance["capture_pts_us"]
             )
-            Recording.aligned_metadata(self, frame, "")
+            Recording.aligned_metadata(
+                self,
+                frame,
+                "",
+                archive_pts_us={"whitebox": frame.provenance["capture_pts_us"]},
+            )
             self.last_frame = frame.index
         elif kind == "video":
             name, index, encoded, pts = value
@@ -250,7 +259,10 @@ class StreamingData:
             raise ValueError("Unsupported streaming archive operation")
 
     def record_metadata(self, frame, prompt):
-        Recording.aligned_metadata(self, frame, prompt)
+        pts = presentation_pts(frame)
+        Recording.aligned_metadata(
+            self, frame, prompt, archive_pts_us={name: pts for name in self.encoders}
+        )
 
     def reference_receipts(self):
         complete, self.reference_ready = self.reference_ready, []
@@ -301,6 +313,11 @@ class StreamingData:
             mux.close()
         self.inputs.close()
         self.states.close()
+        self.report_frames.close()
+        self.output_contexts.close()
+        self.manifest["output_contexts"]["frames"] = getattr(
+            self, "_output_context_frames", 0
+        )
         self.source_states.close()
         counts = {name: mux.count for name, mux in self.encoders.items()}
         complete = (
@@ -354,6 +371,9 @@ class StreamingData:
                 "codec": "h264",
                 "container": "mp4",
                 "fragmented": True,
+                "first_pts_us": mux.first_pts_us,
+                "playback_timeline": "mp4_preserved_pts_v1",
+                "playback_time_origin_us": 0,
                 "pixel_format": "yuv420p",
                 "encoder": {
                     "name": "libx264",

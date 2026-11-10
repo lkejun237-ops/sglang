@@ -235,7 +235,20 @@ def test_upload_uses_separate_process_and_publishes_manifest_last(
         assert manager.upload_pending == 0
         assert uploads[-1][0].endswith("/manifest.json")
         assert json.loads(uploads[-1][1])["upload_status"] == "complete"
-        assert len(uploads) == 6
+        assert len(uploads) == 8
+        assert {key for key, _ in uploads} == {
+            "/local-test/test/local/" + name
+            for name in (
+                "manifest.json",
+                "inputs.jsonl",
+                "states.jsonl",
+                "report-frames.jsonl",
+                "output-contexts.jsonl",
+                "whitebox.mp4",
+                "model.mp4",
+                "ui_rendered.mp4",
+            )
+        }
 
     try:
         asyncio.run(run())

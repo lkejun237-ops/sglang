@@ -93,7 +93,11 @@ def _worker(
                 pts = presentation_pts(frame)
                 recording.encoders["whitebox"].append(frame.index, source, pts)
                 recording.encoders["model"].append(frame.index, encoded, pts)
-                recording.aligned_metadata(replace(frame, rgb=b""), prompt)
+                recording.aligned_metadata(
+                    replace(frame, rgb=b""),
+                    prompt,
+                    archive_pts_us={"whitebox": pts, "model": pts},
+                )
                 last_frame = frame.index
             elif kind == "source_frame":
                 frame, encoded = value
@@ -102,7 +106,11 @@ def _worker(
                 recording.encoders["whitebox"].append(
                     frame.index, encoded, frame.provenance["capture_pts_us"]
                 )
-                recording.aligned_metadata(replace(frame, rgb=b""), "")
+                recording.aligned_metadata(
+                    replace(frame, rgb=b""),
+                    "",
+                    archive_pts_us={"whitebox": frame.provenance["capture_pts_us"]},
+                )
                 last_frame = frame.index
             elif kind == "state":
                 recording.source_state(value)
@@ -298,6 +306,14 @@ class AsyncRecording:
             ),
             inputs={"path": "inputs.jsonl", "format": "effective_intervals_v1"},
             states={"path": "states.jsonl", "format": "opaque_frame_envelope_v1"},
+            report_frames={
+                "path": "report-frames.jsonl",
+                "format": "report_frame_index_v1",
+            },
+            output_contexts={
+                "path": "output-contexts.jsonl",
+                "format": "model_output_context_v1",
+            },
             client_ui={
                 "owner": "browser",
                 "receipt_path": "ui-recording.json",

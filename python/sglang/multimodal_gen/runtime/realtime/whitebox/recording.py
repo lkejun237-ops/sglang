@@ -147,6 +147,7 @@ class H264MuxFile:
         self.count = 0
         self.keyframes = 0
         self.payload_bytes = 0
+        self.first_pts_us = None
         self.pending_packet = None
         self.duration_provisional = None
         self.closed = False
@@ -215,6 +216,8 @@ class H264MuxFile:
             else encoded.get("duration_us", self.spec.pts(1)) * scale // 1_000_000
         )
         packet.time_base = self.time_base
+        if self.first_pts_us is None:
+            self.first_pts_us = int(packet.pts * self.time_base * 1_000_000)
         packet.is_keyframe = encoded["keyframe"]
         if self.pending_packet is not None:
             duration = packet.pts - self.pending_packet.pts
@@ -484,6 +487,8 @@ class Recording:
         directory.mkdir(parents=True, exist_ok=False)
         self.inputs = InputIntervals(directory / "inputs.jsonl", spec)
         self.states = (directory / "states.jsonl").open("w")
+        self.report_frames = (directory / "report-frames.jsonl").open("w")
+        self.output_contexts = (directory / "output-contexts.jsonl").open("w")
         self.references = []
         for index, reference in enumerate(references):
             path = f"references/{index:02d}.{reference['format']}"
@@ -550,6 +555,14 @@ class Recording:
             ),
             inputs={"path": "inputs.jsonl", "format": "effective_intervals_v1"},
             states={"path": "states.jsonl", "format": "opaque_frame_envelope_v1"},
+            report_frames={
+                "path": "report-frames.jsonl",
+                "format": "report_frame_index_v1",
+            },
+            output_contexts={
+                "path": "output-contexts.jsonl",
+                "format": "model_output_context_v1",
+            },
         )
         if self.browser_ui:
             self.manifest["client_ui"] = {
@@ -608,7 +621,7 @@ class Recording:
             await task
             raise
 
-    def aligned_metadata(self, frame: EngineFrame, prompt: str):
+    def aligned_metadata(self, frame: EngineFrame, prompt: str, *, archive_pts_us=None):
         inputs = dict(frame.effective_input or {})
         if frame.effective_input is None:
             self.manifest["quality"]["unknown_input_frames"] += 1
@@ -631,6 +644,11 @@ class Recording:
                     pts_us=capture_pts(frame),
                     model_pts_us=frame.pts_us,
                     presentation_pts_us=presentation_pts(frame),
+                    **(
+                        {"archive_pts_us": archive_pts_us}
+                        if archive_pts_us is not None
+                        else {}
+                    ),
                     states=frame.states,
                     **(
                         {"rendering": frame.rendering}
@@ -642,6 +660,51 @@ class Recording:
             )
         )
         self.states.flush()
+        self.report_frames.write(
+            json_line(
+                dict(
+                    schema_version=1,
+                    frame=frame.index,
+                    source_frame_index=(frame.provenance or {}).get(
+                        "source_frame_index"
+                    ),
+                    archive_pts_us=archive_pts_us or {},
+                )
+            )
+        )
+        self.report_frames.flush()
+        if archive_pts_us is not None and "model" in archive_pts_us:
+            references = [
+                {key: ref[key] for key in ("id", "sha256") if key in ref}
+                for ref in inputs["references"]
+            ]
+            context = dict(
+                prompt=dict(
+                    text=prompt, sha256=hashlib.sha256(prompt.encode()).hexdigest()
+                ),
+                references=references,
+            )
+            if type((frame.rendering or {}).get("prompt_version")) is int:
+                context["prompt"]["version"] = frame.rendering["prompt_version"]
+            # This is called after model_output_condition/event_id selected the
+            # actual output prompt, never when a request was merely accepted.
+            if context != getattr(self, "_last_output_context", None):
+                self.output_contexts.write(
+                    json_line(
+                        dict(
+                            schema_version=1,
+                            frame=frame.index,
+                            source_frame_index=(frame.provenance or {}).get(
+                                "source_frame_index"
+                            ),
+                            archive_pts_us=archive_pts_us,
+                            **context,
+                        )
+                    )
+                )
+                self.output_contexts.flush()
+                self._last_output_context = context
+            self._output_context_frames = getattr(self, "_output_context_frames", 0) + 1
 
     async def write_metadata(self, frame: EngineFrame, prompt: str):
         # A cancelled coroutine must not leave a thread writing into files that
@@ -670,6 +733,11 @@ class Recording:
             )
         self.inputs.close()
         self.states.close()
+        self.report_frames.close()
+        self.output_contexts.close()
+        self.manifest["output_contexts"]["frames"] = getattr(
+            self, "_output_context_frames", 0
+        )
         counts = {name: encoder.count for name, encoder in self.encoders.items()}
         primary = "whitebox" if self.source_only else "model"
         complete = (
@@ -705,6 +773,15 @@ class Recording:
                 codec="h264",
                 container="mp4",
                 pixel_format="yuv420p",
+                **(
+                    {
+                        "first_pts_us": self.encoders[name].first_pts_us,
+                        "playback_timeline": "mp4_preserved_pts_v1",
+                        "playback_time_origin_us": 0,
+                    }
+                    if isinstance(self.encoders[name], H264MuxFile)
+                    else {}
+                ),
                 encoder={
                     "name": "libx264",
                     "preset": "veryfast",
