@@ -478,6 +478,10 @@ def test_gateway_lost_reply_reconciles_original_directory_and_owner(
         ("webrtc-rtp", None, "h264", "720p"),
         ("webrtc-rtp", None, "vp9", "720p"),
         ("webrtc-rtp", None, "av1", "720p"),
+        ("webrtc-rtp", None, "h264-default", "720p"),
+        ("webrtc-rtp", None, "h264-default", "deployment720"),
+        ("webrtc-rtp", None, "h264-default", "deployment720-env"),
+        ("webrtc-rtp", None, None, "deployment480"),
     ],
 )
 def test_real_original_source_factory_and_native_rtc_attachment_without_reinit(
@@ -560,9 +564,9 @@ def test_real_original_source_factory_and_native_rtc_attachment_without_reinit(
         monkeypatch.setenv("WHITEBOX_NATIVE_RTC_ENABLED", "1")
         spec = (
             VideoSpec(1280, 720)
-            if resolution == "720p"
+            if resolution in {"720p", "deployment720", "deployment720-env"}
             else VideoSpec(832, 480)
-            if codec
+            if codec or resolution == "deployment480"
             else VideoSpec(32, 32)
         )
         engine = Engine(spec)
@@ -584,13 +588,15 @@ def test_real_original_source_factory_and_native_rtc_attachment_without_reinit(
                 SinglePlayerCapabilities,
             )
 
-            selected = settings(codec)
+            selected = settings("h264" if codec == "h264-default" else codec)
             init = msgspec.msgpack.decode(
                 base64.b64decode(op["frozenLaunchParameters"]["initMsgpackBase64"])
             )
             init.update(source_operation="create.manual", inference_control="manual")
             init["whitebox"].update(
-                source_encoding=selected, resolution=resolution, cli_fps=30
+                source_encoding=selected,
+                resolution="720p" if spec.width == 1280 else resolution,
+                cli_fps=60 if spec.width == 1280 else 30,
             )
             op["frozenLaunchParameters"]["initMsgpackBase64"] = base64.b64encode(
                 msgspec.msgpack.encode(init)
@@ -630,6 +636,16 @@ def test_real_original_source_factory_and_native_rtc_attachment_without_reinit(
                 )
                 == op["caller"]
             )
+        if codec == "h264-default":
+            del init["whitebox"]["source_encoding"]
+            if resolution in {"deployment720", "deployment720-env"}:
+                del init["whitebox"]["resolution"]
+            if resolution == "deployment720-env":
+                del init["whitebox"]["cli_fps"]
+                monkeypatch.setenv("WHITEBOX_CLI_FPS", "60")
+            op["frozenLaunchParameters"]["initMsgpackBase64"] = base64.b64encode(
+                msgspec.msgpack.encode(init)
+            ).decode()
         original = copy.deepcopy(op)
 
         class Driver:
@@ -686,6 +702,8 @@ def test_real_original_source_factory_and_native_rtc_attachment_without_reinit(
         )
         from sglang.multimodal_gen.runtime.realtime.whitebox import session_encoding
 
+        if codec == "h264-default":
+            selected = session_encoding.default_source_encoding(config)
         probes = []
 
         def preflight(value, fps, *, width, height):
@@ -693,8 +711,10 @@ def test_real_original_source_factory_and_native_rtc_attachment_without_reinit(
             assert not owner.lock.locked()
             assert value == selected
             assert (width, height) == (spec.width, spec.height)
+            if resolution in {"deployment720", "deployment720-env"}:
+                assert fps == 60
             probes.append((copy.deepcopy(value), fps))
-            return "42c029" if codec == "h264" else None
+            return "42c029" if codec in {"h264", "h264-default"} else None
 
         monkeypatch.setattr(session_encoding, "preflight_source_encoding", preflight)
         control = SinglePlayerControl(owner)
@@ -717,10 +737,12 @@ def test_real_original_source_factory_and_native_rtc_attachment_without_reinit(
             )
             if codec:
                 assert len(probes) == 1
-                assert pipeline.session.config.source_encoding == selected
+                assert pipeline.session.config.source_encoding == (
+                    None if codec == "h264-default" else selected
+                )
                 assert config.source_encoding is None
                 assert pipeline.rtc_source_profile == (
-                    "42c029" if codec == "h264" else None
+                    "42c029" if codec in {"h264", "h264-default"} else None
                 )
                 assert runtime.rtc_preparation is None
                 assert pipeline.init["source_operation"] == "create.manual"
@@ -739,7 +761,7 @@ def test_real_original_source_factory_and_native_rtc_attachment_without_reinit(
             attach = (await control.get_attachment(op))["attachment"]
             body = dict(user_id=op["caller"]["subject"], message=attach["message"])
             if transport == "webrtc-rtp":
-                if codec:
+                if codec and codec != "h264-default":
                     changed_body = copy.deepcopy(body)
                     changed_body["message"]["whitebox"]["source_encoding"]["gop"] = 12
                     subscriber = object()
@@ -754,9 +776,14 @@ def test_real_original_source_factory_and_native_rtc_attachment_without_reinit(
                 if codec:
                     assert len(probes) == 1  # Attachment reuses frozen admission.
                     receipt = pipeline.ready_message()
-                    assert receipt["source_encoding"] == selected
-                    receipt["source_encoding"]["gop"] = 1
-                    assert pipeline.session.config.source_encoding == selected
+                    if codec == "h264-default":
+                        assert "source_encoding" not in receipt
+                        assert pipeline.session.config.source_encoding is None
+                        assert pipeline.rtc_source_profile == "42c029"
+                    else:
+                        assert receipt["source_encoding"] == selected
+                        receipt["source_encoding"]["gop"] = 1
+                        assert pipeline.session.config.source_encoding == selected
                 # Reservation/authorization only; no native peer or ICE claim.
                 release_reconnect_preparation(pipeline, reservation)
                 runtime.rtc_preparation = None
@@ -805,7 +832,7 @@ def test_real_original_source_factory_and_native_rtc_attachment_without_reinit(
 
 
 @pytest.mark.parametrize(
-    "failure", ["probe", "websocket", "720p60", "attach", "cancel"]
+    "failure", ["probe", "websocket", "invalid_fps", "attach", "cancel"]
 )
 def test_managed_encoding_rejection_or_interruption_releases_preparation(
     tmp_path, monkeypatch, failure
@@ -827,8 +854,8 @@ def test_managed_encoding_rejection_or_interruption_releases_preparation(
         )
         init.update(source_operation="create.manual", inference_control="manual")
         init["whitebox"]["source_encoding"] = settings("h264")
-        if failure == "720p60":
-            init["whitebox"].update(resolution="720p", cli_fps=60)
+        if failure == "invalid_fps":
+            init["whitebox"].update(resolution="720p", cli_fps=61)
         op["frozenLaunchParameters"]["initMsgpackBase64"] = base64.b64encode(
             msgspec.msgpack.encode(init)
         ).decode()

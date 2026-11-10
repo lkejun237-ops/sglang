@@ -84,6 +84,24 @@ def source_gop(config):
     )
 
 
+def default_source_encoding(config):
+    """Mirror the existing paired source encoder without adding a signed override."""
+    from .source_encoding import default_preset, default_quality
+
+    return validate_source_encoding(
+        dict(
+            codec="h264",
+            bitrate=config.source_max_bitrate,
+            gop=config.playback_gop if config.room_owned else min(config.spec.fps, 24),
+            vbvMs=250,
+            preset=default_preset("h264"),
+            quality=default_quality("h264"),
+            intraRefresh=config.source_intra_refresh,
+            minQp=0,
+        )
+    )
+
+
 def _encoder_probe(settings, fps, width=832, height=480):
     import av
 

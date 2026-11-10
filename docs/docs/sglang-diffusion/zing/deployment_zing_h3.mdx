@@ -1705,11 +1705,25 @@ joint FPS 约 +1.5%–1.6%，三分支 kernel 无端到端收益；六分支外�
 
 原生 RTC 新源允许 `whitebox.resolution=720p`（1280×720）与显式
 `source_encoding` 同时使用，480p 保留 832×480。CPU 预检按所选尺寸与编码帧率
-真实编解码，不改变编码参数或模型几何策略；720p 仍限制在 30 FPS 以内。
+真实编解码，不改变编码参数或模型几何策略。该次提交仍限制720p在30 FPS以内；
+后续2026-11-11源码修复取消此限制，见下一节。
 Gateway、Room Python 与客户端需要匹配升级，既有支持 session source encoding
 的 native sender 协议保持兼容。当前版本的 480/736 GPU 性能、显存与效果未新增验证，
 720p 浏览器/模型端到端验收也未执行，不以本次 CPU 结果外推。
 合同与验证入口见[会话源编码](../zing_h3/specs/whitebox-source-encoding.md)。
+
+### 2026-11-11：源采集统一使用1–60 FPS合同
+
+取消原生 RTC 对720p所有编码套用H.264 Level 3.1宏块上限，以及Session中的
+二次拒绝。VP9/AV1按真实软件编码能力预检；H.264使用实际SPS进行原生协商。
+未显式选择编码的720p高帧率同样预检既有paired source编码设置并冻结SPS，
+不向签名请求补入override；480p原有默认与60-FPS H.264 hint保持。
+模型几何、模型码率、native immediate模型编码器及模型协商均未修改；
+不将源采集60 FPS等同于模型或浏览器60 FPS，不自动回退模型编码路径。
+CPU覆盖实际1280×720、36/60 FPS三编码编解码和原生TCP协商/元素AU回传；
+命令、环境与结果见[CPU验证记录](../../../../benchmark/whitebox/rtc-source-high-fps-20261111.md)。
+当前版本480/736 GPU性能、显存、模型效果和浏览器端到端均未新增验证；
+这些CPU结果不替代线上验收，也不授权重启模型、Coordinator或申请GPU。
 
 ## 视频固定 480p 编码与参考图的可选缩放
 

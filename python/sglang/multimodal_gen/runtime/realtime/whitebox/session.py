@@ -418,14 +418,6 @@ class WhiteboxUpstream:
         if type(fps) is not int or not 1 <= fps <= 60:
             raise ValueError("CLI capture FPS must be between 1 and 60")
         hint = capture_rate_hint(spec, fps) if codec == "h264" else fps
-        if (
-            codec == "h264"
-            and getattr(self, "rtc_level31", False)
-            and not level31_supports(spec, hint)
-        ):
-            from .diagnostics import WhiteboxDiagnostic
-
-            raise WhiteboxDiagnostic("RTC_CODEC_UNSUPPORTED", "validation")
         return hint
 
     def __init__(

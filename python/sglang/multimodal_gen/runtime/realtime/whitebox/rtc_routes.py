@@ -69,11 +69,6 @@ class RTCRenderPipeline(RenderPipeline):
         )
         return sub
 
-    def create_session(self, **kwargs):
-        session = super().create_session(**kwargs)
-        session.rtc_level31 = True
-        return session
-
     async def close(self, reason=None):
         try:
             await super().close(reason)
@@ -118,8 +113,8 @@ class RTCStartCancelled(Exception):
 
 
 def validate_rtc_capture(spec, fps):
-    """Reject unsupported real bitstreams before touching a source attachment."""
-    if not level31_supports(spec, fps):
+    """Validate the public capture contract independently of codec levels."""
+    if type(fps) is not int or not 1 <= fps <= 60:
         raise WhiteboxDiagnostic("RTC_CODEC_UNSUPPORTED", "validation")
 
 
@@ -166,6 +161,12 @@ async def reserve_rtc(host, body):
                 spec, os.environ, room.get("cli_fps") if room else world.get("cli_fps")
             )
         validate_rtc_capture(spec, fps)
+        # Legacy default H.264 keeps its old negotiation only inside its known
+        # envelope. Larger rates need the actual paired encoder SPS too.
+        if selected is None and not level31_supports(spec, fps):
+            from .session_encoding import default_source_encoding
+
+            selected = default_source_encoding(host.config)
         if selected is not None:
             if (
                 len(host.sessions) + len(getattr(host, "peer_sessions", {}))
@@ -387,14 +388,15 @@ def install_rtc_routes(host, app, token, *, peer_factory=NativeRTC):
                 "codec", "h264"
             )
             peer_options = {}
-            if explicit:
+            profile = (
+                previous_pipeline.rtc_source_profile
+                if previous_pipeline is not None
+                else body.get("source_encoding_profile")
+            )
+            if explicit or profile is not None:
                 peer_options["source_codec"] = codec
                 if codec == "h264":
-                    peer_options["source_h264_profile"] = (
-                        previous_pipeline.rtc_source_profile
-                        if previous_pipeline is not None
-                        else body["source_encoding_profile"]
-                    )
+                    peer_options["source_h264_profile"] = profile
             peer = peer_factory(signal, **peer_options)
             if previous_pipeline is None and body["message"].get("startup") is not None:
                 pipeline, sub = await host.attach(

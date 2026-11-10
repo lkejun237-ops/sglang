@@ -766,10 +766,8 @@ def test_session_capture_hint_prefers_actual_source_rate(
     assert session.capture_rate_hint() == 60
 
 
-@pytest.mark.parametrize(
-    "requested,environment", [(31, None), (60, None), (None, "31"), (None, "60")]
-)
-def test_rtc_high_rate_rejected_before_reservation_or_source_work(
+@pytest.mark.parametrize("requested,environment", [(61, None), (None, "61")])
+def test_rtc_invalid_rate_rejected_before_reservation_or_source_work(
     monkeypatch, requested, environment
 ):
     from unittest.mock import AsyncMock
@@ -801,8 +799,8 @@ def test_rtc_high_rate_rejected_before_reservation_or_source_work(
         )
         with pytest.raises(ValueError) as failure:
             await reserve_rtc(host, body)
-        assert failure.value.code == "RTC_CODEC_UNSUPPORTED"
-        assert failure.value.stage == "validation"
+        if requested is not None:
+            assert failure.value.code == "INVALID_CLI_FPS"
         assert host.runtime.rtc_preparation is None and host.runtime.rooms == {}
         host.coordinator.admit.assert_not_called()
 
@@ -810,7 +808,7 @@ def test_rtc_high_rate_rejected_before_reservation_or_source_work(
 
 
 @pytest.mark.parametrize("kind", ["resume", "source.bind"])
-def test_rtc_high_rate_resume_keeps_current_media_and_room(kind):
+def test_rtc_invalid_rate_resume_keeps_current_media_and_room(kind):
     from unittest.mock import AsyncMock, Mock
 
     from sglang.multimodal_gen.runtime.realtime.whitebox.rtc_routes import reserve_rtc
@@ -834,7 +832,7 @@ def test_rtc_high_rate_resume_keeps_current_media_and_room(kind):
             session=NS(
                 source_epoch="source",
                 config=NS(spec=VideoSpec(1280, 720)),
-                capture_rate_hint=lambda: 60,
+                capture_rate_hint=lambda: 61,
             ),
         )
         room = {"spec": pipeline.session.config.spec}
@@ -934,13 +932,22 @@ def test_rtc_existing_room_uses_confirmed_descriptor_rate(
     from sglang.multimodal_gen.runtime.realtime.whitebox.rtc_routes import reserve_rtc
 
     monkeypatch.setenv("WHITEBOX_CLI_FPS", environment)
+    from sglang.multimodal_gen.runtime.realtime.whitebox import session_encoding
+
+    probes = []
+
+    def probe(settings, rate, **geometry):
+        probes.append(rate)
+        return "42c020"
+
+    monkeypatch.setattr(session_encoding, "preflight_source_encoding", probe)
 
     async def run():
         room = dict(
             spec=VideoSpec(1280, 720), cli_fps=None, driver=NS(descriptor={"fps": fps})
         )
         host = NS(
-            config=NS(spec=VideoSpec(832, 480)),
+            config=WhiteboxConfig(engine_factory=None, ui_factory=None, spool=None),
             runtime=NS(rooms={"b" * 32: room}, rtc_preparation=None),
             lock=asyncio.Lock(),
             sessions={},
@@ -956,17 +963,9 @@ def test_rtc_existing_room_uses_confirmed_descriptor_rate(
                 whitebox=dict(world_id="world", game_id="b" * 32),
             ),
         )
-        if fps <= 30:
-            reservation, pipeline = await reserve_rtc(host, body)
-            assert pipeline is None and host.runtime.rtc_preparation == reservation
-        else:
-            with pytest.raises(ValueError) as failure:
-                await reserve_rtc(host, body)
-            assert (
-                failure.value.code == "RTC_CODEC_UNSUPPORTED"
-                and failure.value.stage == "validation"
-            )
-            assert host.runtime.rtc_preparation is None
+        reservation, pipeline = await reserve_rtc(host, body)
+        assert pipeline is None and host.runtime.rtc_preparation == reservation
+        assert probes == ([fps] if fps > 30 else [])
         assert host.runtime.rooms["b" * 32] is room
         assert room["driver"].descriptor["fps"] == fps and room["cli_fps"] is None
         host.coordinator.admit.assert_not_called()
@@ -1031,3 +1030,15 @@ def test_real_session_source_model_and_paired_archive_use_pinned_capture_rate(
         assert engine.closed
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("codec", ["h264", "vp9", "av1"])
+@pytest.mark.parametrize("fps", [36, 60])
+def test_rtc_session_high_rate_is_not_level31_limited(tmp_path, codec, fps):
+    session = object.__new__(InteractiveSession)
+    session.config = WhiteboxConfig(
+        engine_factory=None, ui_factory=None, spool=tmp_path, spec=VideoSpec(1280, 720)
+    )
+    session.engine = NS(metadata={"capture_fps": fps})
+    session.rtc_level31 = True
+    assert session.capture_rate_hint(codec) == fps

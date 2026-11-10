@@ -253,12 +253,21 @@ class SinglePlayerControl:
                 message=init,
             )
             transport = operation["frozenLaunchParameters"]["transport"]
-            if transport == "webrtc-rtp" and "source_encoding" in init["whitebox"]:
+            if transport == "webrtc-rtp":
+                from .model_geometry import session_source_spec
                 from .rtc_routes import reserve_rtc
 
-                # Managed sources start before their media attachment. Reuse
-                # native admission now, before the source/CLI/model can start.
-                preparation, _ = await reserve_rtc(self.host, body)
+                source_spec = session_source_spec(
+                    init["whitebox"], self.host.config.spec, self.host.runtime.rooms
+                )
+                if "source_encoding" in init["whitebox"] or (
+                    source_spec.width,
+                    source_spec.height,
+                ) == (1280, 720):
+                    # Resolve omitted resolution from the deployment/Room before
+                    # allocating a source. Native admission freezes its actual
+                    # capture rate and SPS for the later media attachment.
+                    preparation, _ = await reserve_rtc(self.host, body)
 
             async def reserved(value):
                 nonlocal pipeline
@@ -266,7 +275,7 @@ class SinglePlayerControl:
                 if preparation is not None:
                     # No native peer exists yet. Freeze the verified SPS for
                     # the first attachment and subsequent reconnects.
-                    pipeline.rtc_source_profile = body["source_encoding_profile"]
+                    pipeline.rtc_source_profile = body.get("source_encoding_profile")
                 pipeline.single_player_operation = key
                 pipeline.session.expected_publication = copy.deepcopy(
                     operation["frozenLaunchParameters"]["publicationIdentity"]

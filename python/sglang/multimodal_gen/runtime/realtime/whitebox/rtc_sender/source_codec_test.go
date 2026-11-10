@@ -20,12 +20,17 @@ import (
 // These AUs were emitted by the real Room software encoders. Receive through
 // ICE/DTLS/SRTP and reconstruct elementary bytes with the matching RTP depayer.
 func TestSourceCodecsNegotiateAndCarryElementaryAUOverTCP(t *testing.T) {
-	raw, err := os.ReadFile("testdata/source-codec-au.json")
+	fixturePath := os.Getenv("WHITEBOX_SOURCE_CODEC_FIXTURE")
+	if fixturePath == "" {
+		fixturePath = "testdata/source-codec-au.json"
+	}
+	raw, err := os.ReadFile(fixturePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var fixtures struct {
 		AccessUnits map[string][]byte `json:"accessUnits"`
+		H264Profile string            `json:"h264Profile"`
 	}
 	if err = json.Unmarshal(raw, &fixtures); err != nil {
 		t.Fatal(err)
@@ -38,6 +43,9 @@ func TestSourceCodecsNegotiateAndCarryElementaryAUOverTCP(t *testing.T) {
 			if name == "h264-high" {
 				name = "h264"
 				sourceProfile = "42c029"
+				if fixtures.H264Profile != "" {
+					sourceProfile = fixtures.H264Profile
+				}
 			}
 			t.Setenv("WHITEBOX_SOURCE_H264_PROFILE_LEVEL_ID", sourceProfile)
 			t.Setenv("WHITEBOX_LOCAL_TEST", "1")

@@ -38,7 +38,7 @@ MESSAGES = {
     "CONTROL_QUEUE_FULL": "Game controls are arriving too quickly. Please reconnect and try again.",
     "INVALID_CONTROL_MESSAGE": "A game control could not be processed. Please check the client controls before reconnecting.",
     "RTC_UNAVAILABLE": "WebRTC is unavailable. Please choose WebSocket before starting.",
-    "RTC_CODEC_UNSUPPORTED": "This resolution and capture rate are not supported over WebRTC. Choose 30 FPS or less, or use WebSocket.",
+    "RTC_CODEC_UNSUPPORTED": "The selected video encoder could not start. Try different video settings or reconnect.",
     "RTC_AUTHORIZATION_FAILED": "Please sign in and verify access to this world before starting WebRTC.",
     "RTC_CONNECTION_FAILED": "The WebRTC connection could not be established. Please try again or choose WebSocket.",
     "RTC_DISCONNECTED": "The video connection was lost. Please reconnect.",

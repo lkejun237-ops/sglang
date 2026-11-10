@@ -190,7 +190,10 @@ def test_preflight_checks_new_native_capability_before_codec_probe(monkeypatch):
     assert calls == [["/test/binary", "--capabilities"]]
 
 
-@pytest.mark.parametrize("width,height,fps", [(832, 480, 30), (1280, 720, 30)])
+@pytest.mark.parametrize(
+    "width,height,fps",
+    [(832, 480, 30), (1280, 720, 30), (1280, 720, 36), (1280, 720, 60)],
+)
 @pytest.mark.parametrize("codec", ["h264", "vp9", "av1"])
 def test_actual_selected_encoder_preflight_decodes_three_aus(codec, width, height, fps):
     import av
@@ -251,7 +254,10 @@ def test_upstream_manual_source_create_is_preserved():
     )
 
 
-@pytest.mark.parametrize("width,height,fps", [(832, 480, 60), (1280, 720, 30)])
+@pytest.mark.parametrize(
+    "width,height,fps",
+    [(832, 480, 60), (1280, 720, 30), (1280, 720, 36), (1280, 720, 60)],
+)
 def test_real_binary_and_software_preflight(width, height, fps):
     import os
     from pathlib import Path
@@ -267,7 +273,7 @@ def test_real_binary_and_software_preflight(width, height, fps):
     for codec in ["h264", "vp9", "av1"]:
         profile = selected.preflight_source_encoding(
             settings(codec),
-            fps if codec == "h264" else 30,
+            fps if height == 720 or codec == "h264" else 30,
             str(binary),
             width=width,
             height=height,
@@ -572,7 +578,10 @@ def test_ready_receipt_is_server_owned_and_omitted_on_default(monkeypatch):
 
 
 @pytest.mark.parametrize("echo", [False, True])
-def test_early_h264_resume_uses_frozen_profile_before_encoder_ready(monkeypatch, echo):
+@pytest.mark.parametrize("explicit", [False, True])
+def test_early_h264_resume_uses_frozen_profile_before_encoder_ready(
+    monkeypatch, echo, explicit
+):
     import asyncio
 
     import msgspec
@@ -594,7 +603,9 @@ def test_early_h264_resume_uses_frozen_profile_before_encoder_ready(monkeypatch,
     monkeypatch.setattr(selected, "preflight_source_encoding", unexpected)
     monkeypatch.setattr(RenderPipeline, "__init__", lambda *args, **kwargs: None)
     previous = RTCRenderPipeline(peer=SimpleNamespace(source_h264_profile="42c029"))
-    previous.init = {"whitebox": {"source_encoding": settings("h264")}}
+    previous.init = {
+        "whitebox": {"source_encoding": settings("h264")} if explicit else {}
+    }
     previous.closed = False
     previous.closing = False
     previous.terminal = None
@@ -605,7 +616,8 @@ def test_early_h264_resume_uses_frozen_profile_before_encoder_ready(monkeypatch,
         source_epoch="source",
         source_playback=None,
         config=SimpleNamespace(
-            spec=VideoSpec(832, 480), source_encoding=settings("h264")
+            spec=VideoSpec(1280, 720),
+            source_encoding=settings("h264") if explicit else None,
         ),
         capture_rate_hint=lambda: 60,
     )
@@ -644,7 +656,7 @@ def test_early_h264_resume_uses_frozen_profile_before_encoder_ready(monkeypatch,
     app = FastAPI()
     install_rtc_routes(host, app, "internal-only", peer_factory=Peer)
     world = {"game_id": previous.game_id}
-    if echo:
+    if echo and explicit:
         world["source_encoding"] = settings("h264")
     with TestClient(app) as client:
         with client.websocket_connect(
@@ -790,42 +802,61 @@ def test_live_feedback_reads_session_source_ceiling_and_preserves_host(monkeypat
 
 
 @pytest.mark.parametrize("fps", [36, 60])
-@pytest.mark.parametrize("codec", ["h264", "vp9", "av1"])
-def test_720p_rate_over_transport_envelope_fails_before_probe(monkeypatch, codec, fps):
+@pytest.mark.parametrize("codec", ["h264", "vp9", "av1", None])
+def test_720p_high_rate_probes_actual_codec_before_reservation(monkeypatch, codec, fps):
     import asyncio
-
-    from sglang.multimodal_gen.runtime.realtime.whitebox.contracts import VideoSpec
-    from sglang.multimodal_gen.runtime.realtime.whitebox.diagnostics import (
-        WhiteboxDiagnostic,
-    )
     from sglang.multimodal_gen.runtime.realtime.whitebox.rtc_routes import reserve_rtc
 
-    def unexpected(*args, **kwargs):
-        raise AssertionError("Unsupported rate must not probe")
+    calls = []
 
-    monkeypatch.setattr(selected, "preflight_source_encoding", unexpected)
+    def probe(value, rate, *, width, height):
+        calls.append((value, rate, width, height))
+        return "42c020" if value["codec"] == "h264" else None
+
+    monkeypatch.setattr(selected, "preflight_source_encoding", probe)
 
     async def scenario():
         host = SimpleNamespace(
-            config=SimpleNamespace(spec=VideoSpec(832, 480)),
+            config=WhiteboxConfig(engine_factory=None, ui_factory=None, spool=None),
             runtime=SimpleNamespace(rooms={}),
+            lock=asyncio.Lock(),
+            sessions={},
+            max_sessions=1,
         )
+        world = dict(resolution="720p", cli_fps=fps)
+        if codec is not None:
+            world["source_encoding"] = settings(codec)
         body = dict(
             user_id="user",
             message=dict(
                 type="init",
                 source_operation="create",
                 control_protocol="whitebox-render-v2",
-                whitebox=dict(
-                    resolution="720p", source_encoding=settings(codec), cli_fps=fps
-                ),
+                whitebox=world,
             ),
         )
-        with pytest.raises(WhiteboxDiagnostic):
-            await reserve_rtc(host, body)
-        assert not getattr(host.runtime, "rtc_preparation", None)
+        reservation, previous = await reserve_rtc(host, body)
+        assert reservation == host.runtime.rtc_preparation and previous is None
+        assert len(calls) == 1
+        assert calls[0][0]["codec"] == (codec or "h264")
+        assert calls[0][1:] == (fps, 1280, 720)
+        assert ("source_encoding" in world) == (codec is not None)
+        assert body["source_encoding_profile"] == (
+            "42c020" if codec in (None, "h264") else None
+        )
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fps", [0, 61, True, 30.0])
+def test_rtc_capture_validates_public_rate_contract(fps):
+    from sglang.multimodal_gen.runtime.realtime.whitebox.contracts import VideoSpec
+    from sglang.multimodal_gen.runtime.realtime.whitebox.rtc_routes import (
+        validate_rtc_capture,
+    )
+
+    with pytest.raises(ValueError):
+        validate_rtc_capture(VideoSpec(1280, 720), fps)
 
 
 def test_preflight_subprocess_uses_each_requested_geometry_and_rate(monkeypatch):
@@ -856,3 +887,57 @@ def test_preflight_subprocess_uses_each_requested_geometry_and_rate(monkeypatch)
         )
         assert calls[-1][-3:] == [str(fps), str(width), str(height)]
     assert len(calls) == 6
+
+
+def test_initial_default_high_rate_passes_real_sps_to_native_peer(monkeypatch):
+    import asyncio
+    import msgspec
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from sglang.multimodal_gen.runtime.realtime.whitebox.rtc_routes import (
+        install_rtc_routes,
+    )
+
+    effective = selected.default_source_encoding(
+        WhiteboxConfig(engine_factory=None, ui_factory=None, spool=None)
+    )
+    profile = selected._encoder_probe(effective, 60, 1280, 720)["profileLevelId"]
+    assert int(profile[-2:], 16) > 31
+    calls = []
+    monkeypatch.setattr(
+        selected, "preflight_source_encoding", lambda *args, **kwargs: profile
+    )
+
+    def peer(callback, **options):
+        calls.append(options)
+        raise RuntimeError("Test stops before native allocation")
+
+    host = SimpleNamespace(
+        config=WhiteboxConfig(engine_factory=None, ui_factory=None, spool=None),
+        runtime=SimpleNamespace(rooms={}, rtc_preparation=None),
+        lock=asyncio.Lock(),
+        sessions={},
+        max_sessions=1,
+    )
+    app = FastAPI()
+    install_rtc_routes(host, app, "internal-only", peer_factory=peer)
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/internal/render-rtc", headers={"authorization": "Bearer internal-only"}
+        ) as ws:
+            ws.send_bytes(
+                msgspec.msgpack.encode(
+                    dict(
+                        user_id="user",
+                        message=dict(
+                            type="init",
+                            source_operation="create",
+                            control_protocol="whitebox-render-v2",
+                            whitebox=dict(resolution="720p", cli_fps=60),
+                        ),
+                    )
+                )
+            )
+            assert msgspec.msgpack.decode(ws.receive_bytes())["type"] == "error"
+    assert calls == [dict(source_codec="h264", source_h264_profile=profile)]
+    assert host.runtime.rtc_preparation is None

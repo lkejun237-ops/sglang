@@ -120,9 +120,11 @@ The native sender receives `--source-codec` and, for H.264, the verified
 `--source-h264-profile` only for an explicit override. With omission, its original
 arguments and defaults remain unchanged. The new sender must be deployed with
 the matching Python implementation. The resolution selection does not reset or disable codec, bitrate, GOP, QP, VBV,
-preset or intra-refresh settings. The existing transport envelope remains: 720p
-accepts at most 30 FPS; 36/60 FPS fails before probing or allocation. H.264 uses
-the selected rate at 720p and retains the existing 60-FPS hint at 480p. VP9 keeps
+preset or intra-refresh settings. Source capture uses the common integer 1–60
+FPS contract at both resolutions. VP9 and AV1 are not constrained by H.264
+macroblock limits. H.264 uses the selected rate at 720p and retains the existing
+60-FPS hint at 480p. The software encoder selects its actual SPS profile/level;
+native negotiation uses the verified value, without forcing Level 3.1. VP9 keeps
 profile 0; AV1 keeps profile 0, level-idx 5, tier 0. Model H.264 negotiation and
 model geometry are unchanged.
 
@@ -191,3 +193,22 @@ The existing session-source-codec native sender is compatible; no Go protocol
 change is required. Upgrade an older native binary lacking
 `sessionSourceEncoding` before enabling overrides. CPU encode/decode evidence
 does not validate 720p model output, GPU latency/memory or browser playability.
+
+
+When `source_encoding` is omitted, 480p retains its existing encoder and native
+arguments. A default H.264 source outside the historical Level 3.1 envelope
+(such as 720p at 36/60 FPS) probes the existing paired source settings before
+allocation and freezes the actual SPS for initial attachment and reconnect.
+This internal probe does not add an override to signed requests or ready DTOs.
+An unavailable encoder or incompatible native binary fails admission; no codec
+or rate fallback is implied. Model geometry, bitrate, native immediate encoder,
+and model negotiation are unchanged by the source-capture rate change.
+
+CPU regression evidence covers real 1280×720 encode/decode at 36 and 60 FPS for
+H.264, VP9 and AV1. The optional native transport fixture input
+`WHITEBOX_SOURCE_CODEC_FIXTURE` lets the existing TCP negotiation/elementary-AU
+roundtrip test consume freshly generated AUs and their real H.264 SPS. See
+[the high-rate CPU validation record](../../../../../benchmark/whitebox/rtc-source-high-fps-20261111.md).
+These checks do not establish browser throughput, GPU/model performance or
+production deployment acceptance. GOP remains capped at 24 by the existing
+source-encoding contract; this change does not extend that separate policy.
