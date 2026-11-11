@@ -113,8 +113,25 @@ def test_shared_encoder_statement_identity_matches_frozen_native(api, monkeypatc
     tree = ast.Module(body=body, type_ignores=[])
 
     class DefaultPresentation(ast.NodeTransformer):
+        def visit_Assign(self, node):
+            # Optional task metadata does not alter the legacy no-cache call.
+            if any(
+                isinstance(t, ast.Name) and t.id == "cache_kwargs" for t in node.targets
+            ):
+                return None
+            return self.generic_visit(node)
+
         def visit_Call(self, node):
             self.generic_visit(node)
+            node.keywords = [
+                k
+                for k in node.keywords
+                if not (
+                    k.arg is None
+                    and isinstance(k.value, ast.Name)
+                    and k.value.id == "cache_kwargs"
+                )
+            ]
             # Per-call dependency injection leaves the default native function
             # unchanged; its behavior is also verified independently below.
             if (
@@ -211,11 +228,13 @@ def test_native_encoder_six_images_video_sampling_padding_and_token_cap(
         ),
     )
     media = [video] + [image(i) | {"id": f"i{i}"} for i in range(1, 7)]
-    result = encode_condition(modules, runtime, "  完整 prompt é  ", media)
+    result = encode_condition(
+        modules, runtime, "  \u5b8c\u6574 prompt e\u0301  ", media
+    )
     assert [int(i.flat[0]) for i in images.images] == [1, 2, 3, 4, 5, 6]
     assert [int(f.flat[0]) for f in videos.videos[0]] == [0, 4, 8, 8]
     assert videos.options["do_sample_frames"] is False
-    assert "  完整 prompt é  " in tokenizer.texts
+    assert "  \u5b8c\u6574 prompt e\u0301  " in tokenizer.texts
     assert result["context"].shape[0] == result["row_role"].shape[0]
     assert set(result["row_role"].tolist()) == {0, 1}
     before = encoder.calls

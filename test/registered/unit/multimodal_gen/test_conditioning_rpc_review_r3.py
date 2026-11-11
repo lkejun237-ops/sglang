@@ -18,17 +18,6 @@ import asyncio
 import time
 
 import pytest
-from sglang.multimodal_gen.runtime.conditioning import service as service_module
-from sglang.multimodal_gen.runtime.conditioning.contract import (
-    ConditionError,
-    canonical_json,
-)
-from sglang.multimodal_gen.runtime.conditioning.wire import (
-    decode_request,
-    encode_request,
-    unpack_message,
-)
-from sglang.test.ci.ci_register import register_cpu_ci
 from test_conditioning_rpc_core import (
     PREFIX,
     Encoder,
@@ -40,6 +29,18 @@ from test_conditioning_rpc_core import (
     media,
     request_body,
 )
+
+from sglang.multimodal_gen.runtime.conditioning import service as service_module
+from sglang.multimodal_gen.runtime.conditioning.contract import (
+    ConditionError,
+    canonical_json,
+)
+from sglang.multimodal_gen.runtime.conditioning.wire import (
+    decode_request,
+    encode_request,
+    unpack_message,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -86,7 +87,8 @@ def test_huge_deadline_wire_preserves_positive_integer():
         assert header["deadline_ms"] == HUGE_INTEGER
         assert type(header["deadline_ms"]) is int
         assert tensors == {}
-        decoded, items = decode_request(body, profile, app.limits)
+        request = decode_request(body, profile, app.limits)
+        decoded, items = request.header, request.media
         assert decoded == header
         assert items == []
     finally:

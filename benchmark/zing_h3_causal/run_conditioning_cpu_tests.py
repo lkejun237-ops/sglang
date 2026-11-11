@@ -58,6 +58,17 @@ def forbidden_gpu_loader(*args, **kwargs):
 
 fsdp.maybe_load_fsdp_model = forbidden_gpu_loader
 sys.modules[fsdp.__name__] = fsdp
+# Qwen's vision module imports the SRT GPU model solely for these components.
+# Keep the real Qwen backbone/encode_ids/cache code; CPU tests must never build
+# this visual tower or accidentally exercise a fake successful GPU forward.
+vision_components = types.ModuleType("sglang.srt.models.qwen3_vl")
+for name in (
+    "Qwen3_VisionMLP",
+    "Qwen3VLMoeVisionPatchMerger",
+    "Qwen3VLVisionPatchEmbed",
+):
+    setattr(vision_components, name, forbidden_gpu_loader)
+sys.modules[vision_components.__name__] = vision_components
 registry = types.ModuleType("sglang.multimodal_gen.registry")
 registry.get_pipeline_config_classes = forbidden_gpu_loader
 registry.get_model_info = forbidden_gpu_loader

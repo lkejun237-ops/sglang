@@ -390,6 +390,11 @@ def test_nccl_session_starts_device_prefetch_only_on_leader(rank, monkeypatch):
     def create(endpoint, **kwargs):
         assert kwargs["device"] == torch.device("cuda:2")
         assert kwargs["max_bytes"] == 1024
+        assert callable(kwargs["encode_request"])
+        assert (
+            kwargs["encode_request"]("rain", [], input_digest="digest", deadline=7)
+            == "shared-task"
+        )
         created.append(endpoint)
         return owner
 
@@ -409,6 +414,15 @@ def test_nccl_session_starts_device_prefetch_only_on_leader(rank, monkeypatch):
     )
     state = ZingSourceStreamState()
     conditioning_state = WorkerConditioningState()
+
+    def shared_encode(client, prompt, media, **kwargs):
+        assert client is provider.client and prompt == "rain"
+        assert kwargs == dict(
+            input_digest="digest", device=torch.device("cuda:2"), deadline=7
+        )
+        return "shared-task"
+
+    conditioning_state.encode_remote = shared_encode
     state._start_conditioning_prefetch(
         SimpleNamespace(conditioning_provider=provider),
         SimpleNamespace(
@@ -1091,3 +1105,31 @@ def test_cli_transport_overrides_both_endpoint_configs(
     provider = worker.RemoteConditioner.from_server_args(args)
     assert provider.client.result_transport == expected
     assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("status", [410, 500])
+def test_pretransfer_expiry_keeps_nccl_channel_recoverable(monkeypatch, status):
+    import httpx
+
+    from sglang.multimodal_gen.runtime.conditioning import nccl
+
+    client = ConditioningClient(
+        "http://localhost", "token", "a" * 64, result_transport="nccl"
+    )
+    receiver = NcclReceiver(client)
+    receiver.group, receiver.device = object(), torch.device("cuda:0")
+    original = httpx.AsyncClient
+    transport = httpx.MockTransport(lambda request: httpx.Response(status))
+    monkeypatch.setattr(
+        nccl.httpx,
+        "AsyncClient",
+        lambda **kwargs: original(transport=transport, **kwargs),
+    )
+    for _ in range(2):
+        with pytest.raises(ConditionError) as error:
+            receiver.encode(b"body", "digest", "cuda:0")
+        assert error.value.code == (
+            "CONDITION_TASK_EXPIRED" if status == 410 else "CONDITION_UNAVAILABLE"
+        )
+        assert receiver.failed is (status != 410)
+        assert receiver.pending is None

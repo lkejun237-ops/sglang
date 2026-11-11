@@ -49,3 +49,50 @@ def test_native_drains_selected_device_on_success_and_exception(monkeypatch, rai
     assert events[-1] == ("drain", 3), (
         "Native failure returned before selected-device CUDA drain"
     )
+
+
+@pytest.mark.parametrize("over_budget", [False, True])
+def test_native_prompt_budget_with_prefix_task(monkeypatch, over_budget):
+    from unittest.mock import Mock
+
+    from sglang.multimodal_gen.runtime.conditioning import encoder as encoder_module
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+    from sglang.multimodal_gen.runtime.conditioning.inputs import media_identity
+
+    cache = SimpleNamespace(clear=Mock())
+    task = SimpleNamespace(cache=cache)
+    forward = Mock(return_value=condition()["context"])
+    presentation = Mock(return_value=(torch.tensor([1, 2]), torch.tensor([0, 1])))
+    encoder = object.__new__(native.NativeConditionEncoder)
+    encoder.gpu_id, encoder.max_rows, encoder.max_prompt_tokens = 3, 10, 8
+    encoder.pipeline = SimpleNamespace(
+        modules={
+            "tokenizer": lambda text, **kwargs: {"input_ids": list(text)},
+            "processor": SimpleNamespace(image_processor=SimpleNamespace(merge_size=1)),
+            "text_encoder": SimpleNamespace(encode_ids=forward),
+        },
+        zing_runtime={},
+    )
+    monkeypatch.setattr(
+        encoder_module, "minimax_h3_ref2va_video_presentation", presentation
+    )
+    monkeypatch.setattr(torch.cuda, "set_device", Mock())
+    drain = Mock()
+    monkeypatch.setattr(torch.cuda, "synchronize", drain)
+    value = SimpleNamespace(prompt="a" * (9 if over_budget else 8), media=[], task=task)
+
+    if over_budget:
+        with pytest.raises(ConditionError, match="Prompt tokens"):
+            encoder.encode_device(value)
+        presentation.assert_not_called()
+        forward.assert_not_called()
+        cache.clear.assert_called_once_with()
+    else:
+        result = encoder.encode_device(value)
+        assert torch.equal(result["context"], condition()["context"])
+        assert forward.call_args.kwargs == {
+            "prefix_cache": cache,
+            "media_identity": media_identity([]),
+        }
+        cache.clear.assert_not_called()
+    drain.assert_called_once_with(3)

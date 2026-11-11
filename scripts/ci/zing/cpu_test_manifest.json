@@ -12278,6 +12278,67 @@
       ],
       "reason": "CPU unit contracts verify Zing H3 4D block-sparse attention cosine-gated virtual sink eviction, multi-resolution (480p/736p) & Ulysses SP head sharding, mixed-latent M_q parity isolation, mid-stream prefix_joint reference switches, and ZingChunkGraphs shared-pool generation handling.",
       "dependencies": []
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/conditioning/test_prefix_task.py",
+      "suite": "conditioning-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "conditioning"
+      ],
+      "reason": "Task lease and cancellation contracts passed in the B300-image CPU regression and the local PR regression; included in the complete conditioning recipe.",
+      "dependencies": []
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/conditioning/test_qwen_prefix.py",
+      "suite": "conditioning-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "conditioning"
+      ],
+      "reason": "Two fresh Linux CPU trials through the official conditioning CI runner passed all five real Qwen wrapper/cache contracts, without skips. Only unused GPU vision construction is isolated.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "9d73b8d5de2ccfc1c4ab51abeb5be30a9a3c91bb815024c424983e8e346c00d8",
+        "receipt": "D:/sglang400-review-fixes-20261110/qwen-ci/receipt.json",
+        "receipt_sha256": "646bdfdbf9b2cc558207c410adcda5c789deb66efa63758bfb3810d42f419e90",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 5,
+            "collected": 5,
+            "skipped": 0,
+            "duration_seconds": 32.85030673699998,
+            "exit_code": 0,
+            "log_path": "/mnt/d/sglang400-review-fixes-20261110/qwen-ci/conditioning-trial-1.log",
+            "junit_path": "/mnt/d/sglang400-review-fixes-20261110/qwen-ci/conditioning-trial-1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 5,
+            "collected": 5,
+            "skipped": 0,
+            "duration_seconds": 23.219350374999976,
+            "exit_code": 0,
+            "log_path": "/mnt/d/sglang400-review-fixes-20261110/qwen-ci/conditioning-trial-2.log",
+            "junit_path": "/mnt/d/sglang400-review-fixes-20261110/qwen-ci/conditioning-trial-2.xml"
+          }
+        ],
+        "environment": {
+          "executable": "/home/tyz/qwen-nccl-ci-venv/bin/python",
+          "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+          "python": "3.12.3",
+          "threads": {
+            "MKL_NUM_THREADS": "1",
+            "OMP_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1"
+          }
+        }
+      }
     }
   ],
   "recipes": {

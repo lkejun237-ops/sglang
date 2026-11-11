@@ -886,26 +886,37 @@ class ZingSourceStreamState(BaseRealtimeState):
                     raise ConditionError(
                         "CONDITION_BUSY", "Previous conditioning work has not drained"
                     )
+                condition = batch.session.get_or_create_state(WorkerConditioningState)
+                device = (
+                    torch.device("cuda", torch.cuda.current_device())
+                    if getattr(provider.client, "result_transport", "http") == "nccl"
+                    else None
+                )
+
+                def encode_request(prompt, media, *, input_digest, deadline=None):
+                    return condition.encode_remote(
+                        provider.client,
+                        prompt,
+                        media,
+                        input_digest=input_digest,
+                        device=device,
+                        deadline=deadline,
+                    )
+
                 self.conditioning_prefetch = ConditioningPrefetch(
                     endpoint,
                     prepare=prepare,
                     identity=identity,
                     client=provider.client,
                     max_bytes=command["conditioning_prefetch_max_bytes"],
-                    device=(
-                        torch.device("cuda", torch.cuda.current_device())
-                        if getattr(provider.client, "result_transport", "http")
-                        == "nccl"
-                        else None
-                    ),
+                    device=device,
+                    encode_request=encode_request,
                     should_prefetch=(
                         should_prefetch if self.block0_cache is not None else None
                     ),
                 )
                 provider._prefetch_owner = self.conditioning_prefetch
-                batch.session.get_or_create_state(
-                    WorkerConditioningState
-                ).prefetch = self.conditioning_prefetch
+                condition.prefetch = self.conditioning_prefetch
             except Exception:
                 logger.exception("Conditioning prefetch startup failed")
                 receipt = {"ok": False}

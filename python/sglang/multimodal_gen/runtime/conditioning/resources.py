@@ -25,6 +25,8 @@ class ResourceLimits:
     max_inflight_bytes_per_tenant: int | None = None
     cache_bytes: int = 256 << 20
     cache_bytes_per_tenant: int = 256 << 20
+    prefix_cache_bytes: int = 4 << 30
+    prefix_task_idle_s: int = 1800
     max_request_bytes: int | None = None
     max_response_bytes: int | None = None
     max_input_bytes: int | None = None

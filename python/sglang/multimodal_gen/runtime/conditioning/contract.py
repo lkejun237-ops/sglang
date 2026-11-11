@@ -22,6 +22,7 @@ MAX_MANIFEST_BYTES = 65536
 MAX_HEADER_BYTES = 65536
 _HEX = re.compile(r"^[0-9a-f]{64}$")
 _PUBLIC = {
+    "CONDITION_TASK_EXPIRED": "Please try preparing this request again.",
     "CONDITION_PROMPT_TOO_LONG": "The prompt is too long. Please shorten it.",
     "CONDITION_REFERENCE_LIMIT": "There are too many reference images. Please use fewer images.",
     "CONDITION_BUDGET_EXCEEDED": "The estimated input size exceeds the limit. Please shorten the prompt or use fewer reference images.",
@@ -52,6 +53,7 @@ class ConditionError(ValueError):
         if type(detail) is not str or any(ord(c) > 127 for c in detail):
             raise ValueError("Conditioning error details must be English ASCII")
         defaults = {
+            "CONDITION_TASK_EXPIRED": 410,
             "CONDITION_UNAUTHORIZED": 401,
             "CONDITION_PROFILE_MISMATCH": 409,
             "CONDITION_BUSY": 429,

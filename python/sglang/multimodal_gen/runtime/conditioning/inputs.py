@@ -83,18 +83,7 @@ def hash_frame(frames):
     return sha256(frames.contiguous().numpy().tobytes())
 
 
-def content_identity(
-    prompt,
-    media,
-    profile_id,
-    preprocess_version=PREPROCESS_VERSION,
-    *,
-    item_hashes=None,
-):
-    validate_prompt(prompt)
-    _digest(profile_id, "profile")
-    if type(preprocess_version) is not str or not preprocess_version:
-        _invalid("Invalid preprocess version")
+def _media_items(media, item_hashes):
     media = validate_condition_media(media)
     if item_hashes is not None and (
         type(item_hashes) not in (list, tuple) or len(item_hashes) != len(media)
@@ -109,6 +98,31 @@ def content_identity(
         items.append(
             dict(type=item["type"], shape=list(item["frames"].shape), sha256=digest)
         )
+    return items
+
+
+def media_identity(media, *, item_hashes=None):
+    """Ordered media identity, independent of prompt and task handle.
+
+    Supplied hashes must come from trusted local pixels, never a remote header.
+    The service profile binds model/preprocessing configuration separately.
+    """
+    return sha256(canonical_json(dict(items=_media_items(media, item_hashes))))
+
+
+def content_identity(
+    prompt,
+    media,
+    profile_id,
+    preprocess_version=PREPROCESS_VERSION,
+    *,
+    item_hashes=None,
+):
+    validate_prompt(prompt)
+    _digest(profile_id, "profile")
+    if type(preprocess_version) is not str or not preprocess_version:
+        _invalid("Invalid preprocess version")
+    items = _media_items(media, item_hashes)
     return sha256(
         canonical_json(
             dict(

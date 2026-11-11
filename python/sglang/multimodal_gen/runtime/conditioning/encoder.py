@@ -30,6 +30,8 @@ def encode_condition(
     max_rows=None,
     *,
     presentation_fn=None,
+    prefix_cache=None,
+    media_identity=None,
     max_prompt_tokens=None,
 ):
     tokenizer, processor = modules["tokenizer"], modules["processor"]
@@ -105,5 +107,10 @@ def encode_condition(
         raise ConditionError(
             "CONDITION_INVALID", "Condition token rows exceed the encoder budget"
         )
-    context = modules["text_encoder"].encode_ids(ids, **features)
+    cache_kwargs = (
+        {"prefix_cache": prefix_cache, "media_identity": media_identity}
+        if prefix_cache is not None
+        else {}
+    )
+    context = modules["text_encoder"].encode_ids(ids, **features, **cache_kwargs)
     return {"context": context, "row_role": (tags == 0).long().to(context.device)}

@@ -88,6 +88,8 @@ def _code_identity():
         / "pipelines_core/stages/model_specific_stages/minimax_h3/presentation.py"
     )
     files["native_presentation"] = _file_hash(presentation)
+    for name in ("minimax_h3_qwen3vl.py", "qwen3vl.py", "qwen_prefix.py"):
+        files[name] = _file_hash(root.parent / "models/encoders" / name)
     return "conditioning-code-sha256:" + sha256(canonical_json(files))
 
 
@@ -472,6 +474,14 @@ class NativeConditionEncoder:
         self.max_rows, self.gpu_id = max_rows, gpu_id
         self.max_prompt_tokens = max_prompt_tokens
 
+    @staticmethod
+    def create_prefix_cache(max_bytes):
+        from sglang.multimodal_gen.runtime.models.encoders.qwen_prefix import (
+            QwenPrefixCache,
+        )
+
+        return QwenPrefixCache(max_bytes)
+
     def __call__(self, condition_input):
         return {
             name: tensor.to("cpu")
@@ -487,6 +497,16 @@ class NativeConditionEncoder:
         )
 
         from .encoder import encode_condition
+        from .inputs import media_identity
+
+        task = getattr(condition_input, "task", None)
+        # RPC validation already hashes the pixels. Local callers without that
+        # metadata still compute identity from content, never shape/address alone.
+        media_digest = None
+        if task is not None:
+            media_digest = getattr(condition_input, "media_identity", None)
+            if media_digest is None:
+                media_digest = media_identity(condition_input.media)
 
         torch.cuda.set_device(self.gpu_id)
         try:
@@ -502,11 +522,20 @@ class NativeConditionEncoder:
                     condition_input.media,
                     self.max_rows,
                     max_prompt_tokens=self.max_prompt_tokens,
+                    **(
+                        {"prefix_cache": task.cache, "media_identity": media_digest}
+                        if task
+                        else {}
+                    ),
                 )
                 return {
                     name: tensor.detach().contiguous()
                     for name, tensor in result.items()
                 }
+        except BaseException:
+            if task is not None:
+                task.cache.clear()
+            raise
         finally:
             # A failed Python forward can still leave kernels enqueued. Always
             # drain this encoder's selected device before the future completes.

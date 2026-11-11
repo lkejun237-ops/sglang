@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""One bounded authenticated RPC, with no session or artifact ownership."""
+"""Bounded authenticated RPC and optional task-local prefix cache leases."""
 
 import asyncio
 import concurrent.futures
@@ -177,6 +177,7 @@ class ConditioningClient:
         clock=time.monotonic,
         sleep=time.sleep,
         jitter=random.random,
+        prefix_reuse=True,
     ):
         url = validate_service_url(url)
         if type(token) is not str or not token or any(c in token for c in "\r\n"):
@@ -232,6 +233,10 @@ class ConditioningClient:
         self.retry_initial_s, self.retry_max_s = retry_initial_s, retry_max_s
         self.clock, self.sleep, self.jitter = clock, sleep, jitter
         self.transport = transport or self._transport
+        if type(prefix_reuse) is not bool:
+            raise ConditionError("CONDITION_INVALID", "prefix_reuse must be boolean")
+        self.prefix_reuse = prefix_reuse
+        self.supports_prefix_tasks = False
 
     def _transport(self, method, path, body, timeout):
         deadline = self.clock() + timeout
@@ -335,6 +340,7 @@ class ConditioningClient:
                     400: "CONDITION_INVALID",
                     401: "CONDITION_UNAUTHORIZED",
                     409: "CONDITION_PROFILE_MISMATCH",
+                    410: "CONDITION_TASK_EXPIRED",
                     413: "CONDITION_INVALID",
                     429: "CONDITION_BUSY",
                     503: "CONDITION_UNAVAILABLE",
@@ -365,13 +371,40 @@ class ConditioningClient:
             raise ConditionError(
                 "CONDITION_PROFILE_MISMATCH", "Conditioning deployment profile differs"
             )
-
         if document.get("result_transport", "http") != self.result_transport:
             raise ConditionError(
                 "CONDITION_INVALID", "Conditioning result transports differ"
             )
+        self.supports_prefix_tasks = (
+            self.prefix_reuse and document.get("task_prefix_cache_v1") is True
+        )
 
-    def encode_device(self, prompt, media, *, input_digest, device, deadline=None):
+    def open_task(self, nonce, *, deadline=None):
+        from .prefix_task import validate_task_id
+
+        validate_task_id(nonce)
+        body = self._request(
+            "POST",
+            "/v1/conditioning/tasks/" + nonce,
+            None,
+            self.clock() + self.timeout_s if deadline is None else deadline,
+        )
+        return validate_task_id(safe_json(body).get("task_handle"))
+
+    def release_task(self, handle):
+        from .prefix_task import validate_task_id
+
+        validate_task_id(handle)
+        self._request(
+            "DELETE",
+            "/v1/conditioning/tasks/" + handle,
+            None,
+            self.clock() + self.timeout_s,
+        )
+
+    def encode_device(
+        self, prompt, media, *, input_digest, device, task_handle=None, deadline=None
+    ):
         from .nccl import NcclReceiver
         from .wire import encode_request
 
@@ -390,6 +423,7 @@ class ConditioningClient:
             self.profile_id,
             max(1, int(remaining * 1000)),
             input_digest=input_digest,
+            task_handle=task_handle,
         )
         if len(body) > self.max_request_bytes:
             raise ConditionError(
@@ -418,7 +452,7 @@ class ConditioningClient:
                 "CONDITION_INVALID", "Conditioning request exceeds the byte limit"
             )
 
-    def encode(self, prompt, media, *, input_digest, deadline=None):
+    def encode(self, prompt, media, *, input_digest, task_handle=None, deadline=None):
         from .wire import decode_response, encode_request
 
         deadline = (
@@ -433,6 +467,7 @@ class ConditioningClient:
             self.profile_id,
             int(self.timeout_s * 1000),
             input_digest=input_digest,
+            task_handle=task_handle,
         )
         if len(body) > self.max_request_bytes:
             raise ConditionError(

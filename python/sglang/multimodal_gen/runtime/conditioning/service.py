@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Authenticated, bounded, session-free conditioning RPC service."""
+"""Authenticated conditioning RPC with an optional single task prefix cache."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 from .cache import ConditioningCache, tensor_bytes
 from .contract import ConditionError, _tensor_spec, canonical_json, safe_json
+from .prefix_task import SinglePrefixTask
 from .resources import AdmissionLedger, BoundedExecutor, ResourceLimits
 from .wire import decode_request, pack_message
 
@@ -109,6 +110,9 @@ class EncodeQueue:
             torch.inference_mode(),
             set_forward_context(current_timestep=0, attn_metadata=None),
         ):
+            task = getattr(value, "task", None)
+            if task is not None and task.closed:
+                raise ConditionError("CONDITION_TASK_EXPIRED")
             if self.keep_device:
                 condition = self.encoder.encode_device(value)
             else:
@@ -117,12 +121,15 @@ class EncodeQueue:
                     name: tensor.detach().to("cpu").contiguous()
                     for name, tensor in condition.items()
                 }
+            if task is not None and task.closed:
+                raise ConditionError("CONDITION_TASK_EXPIRED")
             _tensor_spec(condition, self.limits.max_condition_rows)
             if tensor_bytes(condition) > self.limits.max_condition_bytes:
                 raise ConditionError(
                     "CONDITION_INVALID", "Condition exceeds the output byte budget"
                 )
-            self.cache.put(key, condition)
+            if task is None:
+                self.cache.put(key, condition)
             return condition
 
     async def _run(self):
@@ -250,6 +257,16 @@ class ConditioningService:
             clock,
             keep_device=self.nccl is not None,
         )
+        self.prefix_tasks = (
+            SinglePrefixTask(
+                lambda: encoder.create_prefix_cache(self.limits.prefix_cache_bytes),
+                self.queue.pool,
+                self.limits.prefix_task_idle_s,
+                clock,
+            )
+            if hasattr(encoder, "create_prefix_cache")
+            else None
+        )
         self._closed = False
         self._requests = set()
         self._close_task = None
@@ -330,6 +347,7 @@ class ConditioningService:
                         result_transport="nccl" if self.nccl else "http",
                         profile_id=self.profile.profile_id,
                         preprocess_version=self.profile.document["preprocess_version"],
+                        task_prefix_cache_v1=self.prefix_tasks is not None,
                         tensor_contract={
                             "context_dtype": "BF16",
                             "width": 5120,
@@ -339,6 +357,17 @@ class ConditioningService:
                 )
             if path == PREFIX + "/stats" and method == "GET":
                 return await self._json(send, 200, self._stats_snapshot(principal))
+            if self.prefix_tasks is not None and path.startswith(PREFIX + "/tasks/"):
+                if method in ("POST", "DELETE"):
+                    self._requests.add(task)
+                    return await self._task_request(
+                        principal["tenant"],
+                        method,
+                        path.removeprefix(PREFIX + "/tasks/"),
+                        receive,
+                        send,
+                    )
+
             if self.nccl is not None and path in {
                 PREFIX + "/encode",
                 PREFIX + "/bridge/open",
@@ -412,6 +441,63 @@ class ConditioningService:
             )
         finally:
             self._requests.discard(task)
+
+    async def _task_request(self, tenant, method, task_id, receive, send):
+        reservations = [self.ledger.reserve(tenant, slots=1)]
+        deadline = self.clock() + self.limits.request_timeout_s
+        watcher = releasing = None
+        try:
+            try:
+                await asyncio.wait_for(
+                    self._read_body(receive, 0, tenant, reservations),
+                    max(0, deadline - self.clock()),
+                )
+            except asyncio.TimeoutError:
+                raise _Disconnected() from None
+            watcher = asyncio.create_task(self._disconnect(receive))
+            if method == "POST":
+                response = {"task_handle": self.prefix_tasks.open(tenant, task_id)}
+            else:
+                releasing = asyncio.create_task(
+                    self.prefix_tasks.release(tenant, task_id)
+                )
+                done, _ = await asyncio.wait(
+                    [releasing, watcher],
+                    timeout=max(0, deadline - self.clock()),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if watcher in done:
+                    watcher.result()
+                if releasing not in done:
+                    raise _Disconnected()
+                releasing.result()
+                response = {"released": True}
+            await self._send_response(
+                send,
+                canonical_json(response),
+                watcher,
+                deadline,
+                content_type=b"application/json",
+            )
+        except ConditionError as error:
+            await self._send_response(
+                send,
+                canonical_json({"code": error.code, "message": error.public_message}),
+                watcher,
+                deadline,
+                status=error.status,
+                content_type=b"application/json",
+            )
+        finally:
+            try:
+                if releasing is not None:
+                    # SinglePrefixTask.release shields the underlying drain.
+                    await self._cancel_and_drain(releasing)
+                if watcher is not None:
+                    await self._cancel_and_drain(watcher)
+            finally:
+                for reservation in reversed(reservations):
+                    reservation.release()
 
     async def _open_bridge(self, tenant, headers, receive, send):
         size = self._body_length(headers)
@@ -609,6 +695,7 @@ class ConditioningService:
     async def _encode(self, tenant, headers, receive, send, *, bridge_id=None):
         expected = self._body_length(headers)
         reservations, flight, watcher = [], None, None
+        prefix_task = None
         left_flight = False
         begun = self.clock()
         try:
@@ -618,12 +705,13 @@ class ConditioningService:
                     self._read_body(receive, expected, tenant, reservations),
                     self.limits.request_timeout_s,
                 )
-                header, media = await asyncio.wait_for(
+                decoded = await asyncio.wait_for(
                     self._cpu_run(decode_request, body, self.profile, self.limits),
                     max(0.001, self.limits.request_timeout_s - (self.clock() - begun)),
                 )
             except asyncio.TimeoutError:
                 raise ConditionError("CONDITION_TIMEOUT") from None
+            header, media = decoded.header, decoded.media
             budget = self.limits.request_timeout_s
             # Compare whole seconds before true division: huge positive JSON
             # integers must clamp without float conversion, and multiplying an
@@ -633,8 +721,16 @@ class ConditioningService:
             deadline = begun + budget
             if self.clock() >= deadline:
                 raise ConditionError("CONDITION_TIMEOUT")
-            key = (tenant, header["input_digest"])
-            cached_size = self.cache.entry_size(key)
+            if "task_handle" in header:
+                if self.prefix_tasks is None:
+                    raise ConditionError("CONDITION_INVALID")
+                prefix_task = self.prefix_tasks.acquire(tenant, header["task_handle"])
+            key = (
+                (tenant, header["input_digest"])
+                if prefix_task is None
+                else (tenant, prefix_task.handle, header["input_digest"])
+            )
+            cached_size = self.cache.entry_size(key) if prefix_task is None else None
             status, encode_ms, queue_ms = "hit", 0, 0
             output_charge = (
                 cached_size
@@ -652,6 +748,8 @@ class ConditioningService:
             # it waits. Stop before funding a miss or joining/starting native work.
             if self.clock() >= deadline:
                 raise ConditionError("CONDITION_TIMEOUT")
+            if prefix_task is not None and prefix_task.closed:
+                raise ConditionError("CONDITION_TASK_EXPIRED")
             if (
                 condition is None
                 and output_charge < self.limits.output_reservation_bytes
@@ -667,7 +765,13 @@ class ConditioningService:
                 if flight is None:
                     status = "miss"
                     flight = self.queue.enqueue(
-                        key, SimpleNamespace(prompt=header["prompt"], media=media)
+                        key,
+                        SimpleNamespace(
+                            prompt=header["prompt"],
+                            media=media,
+                            media_identity=decoded.media_identity,
+                            task=prefix_task,
+                        ),
                     )
                 else:
                     status = "joined"
@@ -697,6 +801,8 @@ class ConditioningService:
                 output_reservation.reduce(inflight=tensor_bytes(condition))
             else:
                 self._stats[tenant]["hit"] += 1
+            if prefix_task is not None and prefix_task.closed:
+                raise ConditionError("CONDITION_TASK_EXPIRED")
             if self.nccl is not None:
                 control_bytes = await self._send_nccl(
                     send,
@@ -723,6 +829,8 @@ class ConditioningService:
             )
             if self.clock() >= deadline:
                 raise ConditionError("CONDITION_TIMEOUT")
+            if prefix_task is not None and prefix_task.closed:
+                raise ConditionError("CONDITION_TASK_EXPIRED")
             if len(response) > self.limits.max_response_bytes:
                 raise ConditionError(
                     "CONDITION_INVALID", "RPC response exceeds the byte budget"
@@ -750,6 +858,8 @@ class ConditioningService:
                 content_type=b"application/json",
             )
         finally:
+            if prefix_task is not None:
+                self.prefix_tasks.leave(prefix_task)
             if flight is not None:
                 if flight.state == "running" and flight.waiters == (
                     0 if left_flight else 1
@@ -885,6 +995,9 @@ class ConditioningService:
         for task in requests:
             task.cancel()
         await asyncio.gather(*requests, return_exceptions=True)
+        if self.prefix_tasks is not None:
+            await self.prefix_tasks.close()
+
         if self.nccl is not None and hasattr(self.nccl, "close"):
             self.nccl.close()
         await self.queue.close()

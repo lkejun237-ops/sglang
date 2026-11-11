@@ -35,6 +35,13 @@ GROUP_PREFIX = "zing-conditioning-bridge"
 NAMES = ("context", "row_role")
 
 
+class _TaskExpiredBeforeTransfer(ConditionError):
+    """HTTP 410 before metadata: neither peer has started tensor transfer."""
+
+    def __init__(self):
+        super().__init__("CONDITION_TASK_EXPIRED")
+
+
 def result_shapes(
     metadata, *, profile_id, input_digest, bridge_id, max_rows, max_bytes
 ):
@@ -558,6 +565,10 @@ class NcclReceiver:
                 )
             self._remaining(deadline)
             return self._exchange(body, input_digest, deadline)
+        except _TaskExpiredBeforeTransfer:
+            # The service rejected the lease before emitting any NCCL metadata.
+            # Only this explicit pre-transfer response permits lease recovery.
+            raise
         except BaseException:
             self.failed = True
             raise
@@ -631,6 +642,8 @@ class NcclReceiver:
             async with http.stream(
                 "POST", client.url + PREFIX + "/encode", content=body, headers=headers
             ) as response:
+                if response.status_code == 410:
+                    raise _TaskExpiredBeforeTransfer()
                 if response.status_code != 200:
                     raise ConditionError(
                         "CONDITION_UNAVAILABLE", "NCCL encode request rejected"

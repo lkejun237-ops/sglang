@@ -12,11 +12,16 @@ if __name__ == "__main__":
     )
     arguments = ["-x" if value == "-f" else value for value in sys.argv[1:]]
     sys.argv = [str(runner), str(test_file), *arguments]
-    runpy.run_path(str(runner), run_name="__main__")
+    # Prepare the CPU import boundaries without starting a nested test run.
+    runpy.run_path(str(runner))
+    import pytest
+
+    raise SystemExit(pytest.main([str(test_file), *arguments]))
 
 from types import SimpleNamespace
 
 import torch
+
 from sglang.multimodal_gen.runtime.conditioning.client import ConditioningClient
 from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
 from sglang.multimodal_gen.runtime.conditioning.inputs import content_identity

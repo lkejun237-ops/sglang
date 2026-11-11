@@ -2,6 +2,8 @@
 """Worker conditioners with CPU consensus before any GPU broadcast."""
 
 import logging
+import threading
+import uuid
 from pathlib import Path
 
 import torch
@@ -27,16 +29,82 @@ class WorkerConditioningState(BaseRealtimeState):
     def __init__(self):
         self.identity = self.positive = None
         self.media_hashes = {}
+        self.task_nonce = uuid.uuid4().hex
+        self.task_handle = self.task_client = None
+        self.disposed = False
         self.prefetch = None
+        self._task_lock = threading.Lock()
+
+    def encode_remote(
+        self, client, prompt, media, *, input_digest, device=None, deadline=None
+    ):
+        """Serialize session lease ownership across foreground and prefetch RPCs."""
+        deadline = (
+            min(deadline, client.clock() + client.timeout_s)
+            if deadline is not None
+            else client.clock() + client.timeout_s
+        )
+        if not self._task_lock.acquire(timeout=max(0, deadline - client.clock())):
+            raise ConditionError("CONDITION_TIMEOUT")
+        try:
+            if self.disposed:
+                raise ConditionError("CONDITION_TASK_EXPIRED")
+            if client.clock() >= deadline:
+                raise ConditionError("CONDITION_TIMEOUT")
+            encode = client.encode
+            kwargs = dict(input_digest=input_digest, deadline=deadline)
+            if getattr(client, "result_transport", "http") == "nccl":
+                encode = client.encode_device
+                kwargs["device"] = device
+            if not getattr(client, "supports_prefix_tasks", False):
+                return encode(prompt, media, **kwargs)
+            if self.task_handle is None:
+                self.task_handle = client.open_task(self.task_nonce, deadline=deadline)
+                self.task_client = client
+            kwargs["task_handle"] = self.task_handle
+            try:
+                return encode(prompt, media, **kwargs)
+            except ConditionError as error:
+                if error.code != "CONDITION_TASK_EXPIRED":
+                    raise
+                # Recover optimization state only; never retry an ambiguous NCCL transfer.
+                self.task_handle = client.open_task(self.task_nonce, deadline=deadline)
+                kwargs["task_handle"] = self.task_handle
+                return encode(prompt, media, **kwargs)
+        finally:
+            self._task_lock.release()
 
     def dispose(self):
+        self.disposed = True
         try:
+            # Drain background encoding before releasing task state.
             if self.prefetch is not None:
                 self.prefetch.close()
                 self.prefetch = None
         finally:
             self.identity = self.positive = None
             self.media_hashes.clear()
+            # A failed prefetch join must not release a lease while its RPC can
+            # still register or replace the handle. Keep it for retry/idle expiry
+            # if the bounded drain fails.
+            timeout = getattr(self.task_client, "timeout_s", 10)
+            if not self._task_lock.acquire(timeout=timeout):
+                raise RuntimeError("Conditioning task did not drain before cleanup")
+            try:
+                client, handle = self.task_client, self.task_handle
+                self.task_client = self.task_handle = None
+                if handle is not None:
+                    try:
+                        client.release_task(handle)
+                    except Exception:
+                        # The bounded RPC may fail during shutdown; the server's idle
+                        # lease is the crash recovery path. Never retain GPU features
+                        # in the worker merely because remote cleanup failed.
+                        logger.exception(
+                            "Conditioning task release failed; awaiting lease expiry"
+                        )
+            finally:
+                self._task_lock.release()
 
 
 def _identity(prompt, media, profile_id, state, preprocess_version):
@@ -239,6 +307,7 @@ class RemoteConditioner:
                 ),
                 retry_initial_s=config.get("retry_initial_s", 0.05),
                 retry_max_s=config.get("retry_max_s", 0.5),
+                prefix_reuse=config.get("prefix_reuse", True),
             )
             receipt = {"ok": True, "digest": profile.profile_id, "cached": False}
         except Exception as exc:
@@ -278,8 +347,11 @@ class RemoteConditioner:
         )
 
     def __call__(self, prompt, media, *, device, state=None):
+        persistent = state is not None
         state = state if state is not None else WorkerConditioningState()
         try:
+            if state.disposed:
+                raise ConditionError("CONDITION_TASK_EXPIRED")
             if self.validate_input is not None:
                 self.validate_input(prompt, media)
             digest = _identity(
@@ -313,8 +385,15 @@ class RemoteConditioner:
         positive = announcement = None
         if self.rank == 0:
             try:
+                use_prefix = persistent and getattr(
+                    self.client, "supports_prefix_tasks", False
+                )
                 if state.prefetch is not None:
                     positive = state.prefetch.encode(prompt, media, input_digest=digest)
+                elif use_prefix:
+                    positive = state.encode_remote(
+                        self.client, prompt, media, input_digest=digest, device=device
+                    )
                 elif getattr(self.client, "result_transport", "http") == "nccl":
                     positive = self.client.encode_device(
                         prompt, media, input_digest=digest, device=device

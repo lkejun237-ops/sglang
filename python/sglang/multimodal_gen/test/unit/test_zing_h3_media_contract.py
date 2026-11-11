@@ -675,7 +675,8 @@ def test_reference_480p_shared_by_qwen_vae_and_prompt_refresh(
         body = encode_request(
             prompt, media, profile.profile_id, input_digest=input_digest
         )
-        header, decoded = decode_request(body, profile, ResourceLimits())
+        request = decode_request(body, profile, ResourceLimits())
+        header, decoded = request.header, request.media
         assert header["input_digest"] == content_identity(
             prompt, media, profile.profile_id
         )

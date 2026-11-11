@@ -111,7 +111,7 @@ class ZingH3GenerationStage(PipelineStage):
         state = (
             session.get_or_create_state(WorkerConditioningState)
             if session is not None
-            else WorkerConditioningState()
+            else None
         )
         if self.conditioning_mode == "local":
             result = self.local_conditioner(prompt, media, state=state)

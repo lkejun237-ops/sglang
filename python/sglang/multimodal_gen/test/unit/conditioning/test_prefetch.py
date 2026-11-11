@@ -485,3 +485,68 @@ def test_nccl_background_failure_is_not_retried_on_the_poisoned_channel(channel)
         prefetch.encode("new", "active", input_digest="newactive")
     assert error.value.code == "CONDITION_UNAVAILABLE"
     assert len(exchanges) == 1
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_prefetch_and_boundary_share_session_prefix_lease(channel, expired):
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+    from sglang.multimodal_gen.runtime.conditioning.worker import (
+        WorkerConditioningState,
+    )
+
+    socket, prefetch, client = channel
+    state = WorkerConditioningState()
+    state.prefetch = prefetch
+    client.supports_prefix_tasks = True
+    opened, handles, released = [], [], []
+
+    def open_task(nonce, *, deadline=None):
+        assert deadline is not None
+        opened.append(nonce)
+        return str(len(opened))
+
+    client.open_task = open_task
+    client.release_task = released.append
+    original = (
+        client.encode_device if client.result_transport == "nccl" else client.encode
+    )
+
+    def encode(*args, task_handle=None, **kwargs):
+        handles.append(task_handle)
+        if expired and len(handles) == 2:
+            raise ConditionError("CONDITION_TASK_EXPIRED")
+        return original(*args, **kwargs)
+
+    if client.result_transport == "nccl":
+        client.encode_device = encode
+    else:
+        client.encode = encode
+    prefetch.encode_request = lambda prompt, media, **kwargs: state.encode_remote(
+        client, prompt, media, device=prefetch.device, **kwargs
+    )
+    # Seed the same task through the foreground path, then encode an update early.
+    state.encode_remote(
+        client,
+        "initial",
+        "active",
+        input_digest="initialactive",
+        device=prefetch.device,
+    )
+    send(socket, "new")
+    wait_for(lambda: prefetch.encodes == 1)
+    assert (
+        prefetch.encode("new", "active", input_digest="newactive")["context"] == "new"
+    )
+    assert prefetch.hits == 1 and len(client.calls) == 2
+    # Changed references go through the same task; service identity invalidates KV.
+    assert (
+        prefetch.encode("other", "changed-media", input_digest="otherchanged")[
+            "row_role"
+        ]
+        == "changed-media"
+    )
+    assert opened == [state.task_nonce] * (2 if expired else 1)
+    assert handles == (["1", "1", "2", "2"] if expired else ["1", "1", "1"])
+    state.dispose()
+    assert released == (["2"] if expired else ["1"])
+    assert prefetch.encode_request is None and not prefetch.thread.is_alive()

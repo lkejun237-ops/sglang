@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import struct
+from dataclasses import dataclass
 
 from safetensors.torch import load, save
 
@@ -20,6 +21,8 @@ from .contract import (
 from .inputs import (
     PREPROCESS_VERSION,
     content_identity,
+    hash_frame,
+    media_identity,
     validate_condition_media,
     validate_prompt,
 )
@@ -77,6 +80,7 @@ def encode_request(
     input_digest=None,
     item_hashes=None,
     preprocess_version=PREPROCESS_VERSION,
+    task_handle=None,
 ):
     validate_prompt(prompt)
     media = validate_condition_media(media)
@@ -97,9 +101,18 @@ def encode_request(
                 for i, item in enumerate(media)
             ],
             deadline_ms=deadline_ms,
+            **({"task_handle": task_handle} if task_handle is not None else {}),
         ),
         {f"media_{i}": item["frames"] for i, item in enumerate(media)},
     )
+
+
+@dataclass(frozen=True)
+class DecodedRequest:
+    header: dict
+    media: list
+    # Server-derived metadata, deliberately separate from the untrusted header.
+    media_identity: str | None
 
 
 def decode_request(body, profile, limits):
@@ -115,11 +128,15 @@ def decode_request(body, profile, limits):
         "deadline_ms",
     }
     if (
-        set(header) != required
+        set(header) not in (required, required | {"task_handle"})
         or type(header["schema_version"]) is not int
         or header["schema_version"] != 1
     ):
         _invalid("Unsupported RPC request schema")
+    if "task_handle" in header:
+        from .prefix_task import validate_task_id
+
+        validate_task_id(header["task_handle"])
     from .contract import ConditionError
 
     if header["profile_id"] != profile.profile_id:
@@ -155,11 +172,13 @@ def decode_request(body, profile, limits):
         max_input_bytes=limits.max_input_bytes,
         max_decoded_pixels=limits.max_decoded_pixels,
     )
+    item_hashes = [hash_frame(item["frames"]) for item in media]
     digest = content_identity(
         header["prompt"],
         media,
         profile.profile_id,
         profile.document["preprocess_version"],
+        item_hashes=item_hashes,
     )
     if digest != header["input_digest"]:
         _invalid("RPC input digest does not match its content")
@@ -169,7 +188,13 @@ def decode_request(body, profile, limits):
     media = [
         dict(item, fps=240.0) if item["type"] == "video" else item for item in media
     ]
-    return header, media
+    return DecodedRequest(
+        header,
+        media,
+        media_identity(media, item_hashes=item_hashes)
+        if "task_handle" in header
+        else None,
+    )
 
 
 def validate_response(

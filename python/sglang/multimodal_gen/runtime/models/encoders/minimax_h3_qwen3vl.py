@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLModel
+from sglang.multimodal_gen.runtime.models.encoders.qwen_prefix import QwenPrefixCache
 from sglang.multimodal_gen.runtime.weights.source import (
     materialize_weight,
     resolve_weight,
@@ -174,7 +175,9 @@ class MiniMaxH3ConditioningProjection(nn.Module):
             )
         self.layers = nn.ModuleList(layers)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, *, token_offset: int = 0
+    ) -> torch.Tensor:
         if int(hidden_states.shape[-1]) != self.input_dim:
             raise ValueError(
                 f"H3 conditioning projection expects width {self.input_dim}, "
@@ -193,7 +196,11 @@ class MiniMaxH3ConditioningProjection(nn.Module):
         if projected is None:
             raise RuntimeError("H3 conditioning projection produced no output")
         output = projected * self.std_out + self.mean_out
-        if self.sink_out is not None and int(output.shape[-2]) > 0:
+        if (
+            token_offset == 0
+            and self.sink_out is not None
+            and int(output.shape[-2]) > 0
+        ):
             output[..., 0, :] = self.sink_out
         return output
 
@@ -359,8 +366,10 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
         image_grid_thw: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
         video_grid_thw: torch.Tensor | None = None,
+        prefix_cache: QwenPrefixCache | None = None,
+        media_identity: str | None = None,
     ) -> torch.Tensor:
-        if input_ids.dim() != 1:
+        if input_ids.dim() != 1 or input_ids.numel() == 0:
             raise ValueError(f"input_ids must be 1-D, got {list(input_ids.shape)}")
         if (pixel_values is None) != (image_grid_thw is None):
             raise ValueError("pixel_values and image_grid_thw must be given together")
@@ -380,40 +389,129 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
             if video_grid_thw is not None
             else None
         )
-        position_ids = None
-        if host_image_grid_thw is not None or host_video_grid_thw is not None:
-            position_ids, _ = self.model.get_rope_index(
-                host_ids,
-                host_image_grid_thw,
-                host_video_grid_thw,
-                attention_mask=torch.ones_like(host_ids),
+        # Always derive positions from the complete new input, including the
+        # text-only case. Never depend on Qwen3VLModel's mutable rope_deltas.
+        position_ids, _ = self.model.get_rope_index(
+            host_ids,
+            host_image_grid_thw,
+            host_video_grid_thw,
+            attention_mask=torch.ones_like(host_ids),
+        )
+        prefix = 0
+        if prefix_cache is not None:
+            config = self.model.language_model.config
+            kv_width = int(config.num_key_value_heads) * int(
+                getattr(config, "head_dim", None)
+                or config.hidden_size // config.num_attention_heads
             )
+            # Native service uses TP1/BF16. Include projected features and host
+            # token/position metadata; allocator/transient peaks are measured
+            # separately, not advertised as this retained-state budget.
+            required = host_ids.numel() * (
+                2 * self.selected_lm_layer * kv_width * 2 + self.hidden_dim * 2 + 32
+            )
+            has_media = image_grid_thw is not None or video_grid_thw is not None
+            if required > prefix_cache.max_bytes or (
+                has_media and media_identity is None
+            ):
+                prefix_cache.clear()
+                prefix_cache.reason = (
+                    "budget" if required > prefix_cache.max_bytes else "media_identity"
+                )
+                prefix_cache.reused_rows, prefix_cache.encoded_rows = (
+                    0,
+                    host_ids.numel(),
+                )
+                prefix_cache = None
+            else:
+                prefix = prefix_cache.prefix_length(
+                    self, host_ids, position_ids, media_identity
+                )
+                # DeepStack vision features are injected at early LM layers.
+                # A partial visual block cannot be resumed using text-only KV.
+                suffix = host_ids[..., prefix:]
+                if (
+                    (suffix == self.image_token_id) | (suffix == self.video_token_id)
+                ).any():
+                    prefix = 0
+                prefix_cache.reused_rows = prefix
+                prefix_cache.encoded_rows = host_ids.numel() - prefix
+                prefix_cache.reason = "prefix" if prefix else "cold_or_changed"
+                if prefix == host_ids.numel():
+                    try:
+                        if prefix < prefix_cache.ids.numel():
+                            prefix_cache.kv.crop(prefix)
+                            prefix_cache.ids = host_ids.clone()
+                            prefix_cache.positions = position_ids.clone()
+                            # Compact a shortened result instead of retaining its tail.
+                            prefix_cache.context = prefix_cache.context[:prefix].clone()
+                        # Consumers cannot mutate cached projected features.
+                        return prefix_cache.context.clone()
+                    except BaseException:
+                        prefix_cache.clear()
+                        raise
+                if not prefix:
+                    prefix_cache.clear()
         ids = host_ids.to(self.device)
         call_kwargs: dict[str, Any] = {
-            "input_ids": ids,
+            "input_ids": ids[:, prefix:],
             "attention_mask": torch.ones_like(ids),
+            "position_ids": position_ids[..., prefix:].to(self.device),
         }
-        if position_ids is not None:
-            call_kwargs["position_ids"] = position_ids.to(self.device)
-        if pixel_values is not None:
+        if pixel_values is not None and prefix == 0:
             call_kwargs["pixel_values"] = pixel_values.to(self.device, torch.bfloat16)
             call_kwargs["image_grid_thw"] = host_image_grid_thw
-        if pixel_values_videos is not None:
+        if pixel_values_videos is not None and prefix == 0:
             call_kwargs["pixel_values_videos"] = pixel_values_videos.to(
                 self.device, torch.bfloat16
             )
             call_kwargs["video_grid_thw"] = host_video_grid_thw
 
-        hidden = self(**call_kwargs).last_hidden_state[0]
-        if self.conditioning_projection is not None:
-            hidden = self.conditioning_projection(hidden)
-        hidden = hidden.to(torch.bfloat16)
-        expected_shape = [int(ids.shape[1]), self.hidden_dim]
-        if list(hidden.shape) != expected_shape:
-            raise ValueError(
-                f"unexpected hidden shape {list(hidden.shape)}, "
-                f"expected {expected_shape}"
-            )
+        try:
+            if prefix:
+                prefix_cache.kv.crop(prefix)
+            if prefix_cache is None:
+                hidden = self(**call_kwargs).last_hidden_state[0]
+            else:
+                outputs = self.model(
+                    **call_kwargs,
+                    past_key_values=prefix_cache.kv,
+                    cache_position=torch.arange(
+                        prefix, ids.shape[1], device=self.device
+                    ),
+                    use_cache=True,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                    return_dict=True,
+                )
+                hidden = outputs.last_hidden_state[0]
+            if self.conditioning_projection is not None:
+                hidden = self.conditioning_projection(hidden, token_offset=prefix)
+            hidden = hidden.to(torch.bfloat16)
+            if prefix:
+                hidden = torch.cat((prefix_cache.context[:prefix], hidden), dim=0)
+            expected_shape = [int(ids.shape[1]), self.hidden_dim]
+            if list(hidden.shape) != expected_shape:
+                raise ValueError(
+                    f"unexpected hidden shape {list(hidden.shape)}, expected {expected_shape}"
+                )
+            if prefix_cache is not None:
+                prefix_cache.encoder = self
+                prefix_cache.media_identity = media_identity
+                prefix_cache.ids, prefix_cache.positions = (
+                    host_ids.clone(),
+                    position_ids.clone(),
+                )
+                prefix_cache.kv, prefix_cache.context = (
+                    outputs.past_key_values,
+                    hidden.clone(),
+                )
+        except BaseException:
+            # DynamicCache updates in place, layer by layer. A failed suffix
+            # forward must never leave a partially updated cache reusable.
+            if prefix_cache is not None:
+                prefix_cache.clear()
+            raise
         return hidden
 
     def load_weights(

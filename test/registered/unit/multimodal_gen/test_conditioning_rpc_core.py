@@ -21,6 +21,7 @@ import inspect
 import json
 import struct
 import threading
+import uuid
 from dataclasses import fields, replace
 from types import SimpleNamespace
 
@@ -309,6 +310,223 @@ def assert_ok(response):
 def assert_idle(app):
     snapshot = app.ledger.snapshot()["global"]
     assert snapshot["slots"] == snapshot["inflight"] == 0
+
+
+@pytest.mark.parametrize("method", ["POST", "DELETE"])
+@pytest.mark.parametrize("leave", ["deadline", "disconnect"])
+def test_task_response_releases_slot_on_stalled_send(method, leave):
+    class TaskEncoder(Encoder):
+        def create_prefix_cache(self, max_bytes):
+            return {}
+
+    async def run():
+        _, app, client, _ = components(
+            encoder=TaskEncoder(), configured_limits=limits(request_timeout_s=0.03)
+        )
+        task_id = uuid.uuid4().hex
+        if method == "DELETE":
+            task_id = app.prefix_tasks.open("tenant", task_id)
+        started, disconnected = asyncio.Event(), asyncio.Event()
+        consumed = False
+
+        async def receive():
+            nonlocal consumed
+            if not consumed:
+                consumed = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            await disconnected.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            started.set()
+            await asyncio.Future()
+
+        request = asyncio.create_task(
+            app(
+                {
+                    "type": "http",
+                    "method": method,
+                    "path": PREFIX + "/tasks/" + task_id,
+                    "headers": [(b"authorization", b"Bearer secret")],
+                },
+                receive,
+                send,
+            )
+        )
+        try:
+            await asyncio.wait_for(started.wait(), 1)
+            assert app.ledger.snapshot()["global"]["slots"] == 1
+            if leave == "disconnect":
+                disconnected.set()
+            await asyncio.wait_for(request, 1)
+            assert_idle(app)
+            assert not app._requests
+        finally:
+            request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
+            await client.aclose()
+            await app.close()
+
+    asyncio.run(run())
+
+
+def test_task_rpc_hashes_pixels_once_through_native_and_rejects_forgery(monkeypatch):
+    from sglang.multimodal_gen.runtime.conditioning import native, wire
+
+    class TextEncoder(Encoder):
+        identities = []
+
+        def encode_ids(self, ids, *, prefix_cache, media_identity, **features):
+            assert prefix_cache is not None
+            self.identities.append(media_identity)
+            return super().encode_ids(ids, **features)
+
+    text_encoder = TextEncoder()
+    encoder = object.__new__(native.NativeConditionEncoder)
+    encoder.gpu_id, encoder.max_rows, encoder.max_prompt_tokens = 0, 512, None
+    encoder.pipeline = SimpleNamespace(
+        modules=text_encoder.modules, zing_runtime=text_encoder.runtime
+    )
+    monkeypatch.setattr(torch.cuda, "set_device", lambda _: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _: None)
+    items = [media(1), media(2)]
+    variants = [
+        items,
+        items,  # Only the prompt changes.
+        [media(3), items[1]],  # Same shape, different pixels.
+        list(reversed(items)),
+        [dict(items[0], type="video", fps=24), items[1]],
+        [dict(item, frames=item["frames"].reshape(3, 1, 4, 2)) for item in items],
+    ]
+    expected = [inputs.media_identity(value) for value in variants]
+    assert expected[0] == expected[1] and len(set(expected)) == 5
+    hashes = []
+    original = inputs.hash_frame
+
+    def counted(frames):
+        hashes.append(tuple(frames.shape))
+        return original(frames)
+
+    monkeypatch.setattr(inputs, "hash_frame", counted)
+    monkeypatch.setattr(wire, "hash_frame", counted)
+
+    async def run():
+        p, app, client, _ = components(encoder=encoder)
+        try:
+            opened = await client.post(PREFIX + "/tasks/" + uuid.uuid4().hex)
+            assert opened.status_code == 200
+            handle = opened.json()["task_handle"]
+            client.headers["Content-Type"] = "application/octet-stream"
+            for i, variant in enumerate(variants):
+                response = await client.post(
+                    PREFIX + "/encode",
+                    content=request_body(
+                        f"event {i}",
+                        variant,
+                        p.profile_id,
+                        overrides={"task_handle": handle},
+                    ),
+                )
+                assert_ok(response)
+                assert len(hashes) == (i + 1) * 2
+            assert text_encoder.identities == expected
+            # Changed pixels with an old request digest cannot enter native.
+            tampered = await client.post(
+                PREFIX + "/encode",
+                content=request_body(
+                    "event 0",
+                    variants[2],
+                    p.profile_id,
+                    digest=reference_digest("event 0", items, p.profile_id),
+                    overrides={"task_handle": handle},
+                ),
+            )
+            assert tampered.status_code == 400
+            forged = await client.post(
+                PREFIX + "/encode",
+                content=request_body(
+                    "event 0",
+                    items,
+                    p.profile_id,
+                    overrides={"task_handle": handle, "media_identity": expected[0]},
+                ),
+            )
+            assert forged.status_code == 400
+            assert text_encoder.identities == expected
+        finally:
+            await client.aclose()
+            await app.close()
+        assert_idle(app)
+
+    asyncio.run(run())
+
+
+def test_task_rpc_owns_prefix_state_and_rejects_stale_or_foreign_handles():
+    class TaskEncoder(Encoder):
+        def __init__(self):
+            super().__init__()
+            self.states = []
+
+        def create_prefix_cache(self, max_bytes):
+            return {}
+
+        def __call__(self, value):
+            if value.task is not None:
+                self.states.append(value.task.cache)
+                value.task.cache["last_prompt"] = value.prompt
+            return super().__call__(value)
+
+    async def run():
+        p, app, client, encoder = components(encoder=TaskEncoder())
+        try:
+            nonce = uuid.uuid4().hex
+            first = await client.post(PREFIX + "/tasks/" + nonce)
+            assert first.status_code == 200
+            handle = first.json()["task_handle"]
+            assert (
+                await client.post(PREFIX + "/tasks/" + nonce)
+            ).json() == first.json()
+            assert (
+                await client.post(PREFIX + "/tasks/" + uuid.uuid4().hex)
+            ).status_code == 429
+            for prompt in ("event: na", "event: rain"):
+                assert_ok(
+                    await encode(
+                        client, p, prompt=prompt, overrides={"task_handle": handle}
+                    )
+                )
+            assert encoder.states[0] is encoder.states[1]
+            assert (
+                app.cache.current_bytes == 0
+            )  # task outputs never enter the shared CPU LRU
+            other = await client.post(
+                PREFIX + "/encode",
+                content=request_body(
+                    "event: rain", [], p.profile_id, overrides={"task_handle": handle}
+                ),
+                headers={
+                    "Authorization": "Bearer second",
+                    "Content-Type": "application/octet-stream",
+                },
+            )
+            assert other.status_code == 410
+            assert (await client.delete(PREFIX + "/tasks/" + handle)).status_code == 200
+            assert encoder.states[0] == {}
+            stale = await encode(client, p, overrides={"task_handle": handle})
+            assert stale.status_code == 410
+            second = (await client.post(PREFIX + "/tasks/" + uuid.uuid4().hex)).json()[
+                "task_handle"
+            ]
+            assert second != handle
+            await client.delete(PREFIX + "/tasks/" + handle)
+            assert_ok(await encode(client, p, overrides={"task_handle": second}))
+            assert encoder.states[-1] is not encoder.states[0]
+            assert_idle(app)
+        finally:
+            await client.aclose()
+            await app.close()
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("count", [0, 1, 10, 22, 33, 100])

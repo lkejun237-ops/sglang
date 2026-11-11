@@ -26,6 +26,7 @@ from types import SimpleNamespace as NS
 
 import pytest
 import torch
+
 from sglang.multimodal_gen.runtime.conditioning.client import ConditioningClient
 from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
 
@@ -68,19 +69,19 @@ def test_real_socket_header_deadline():
 
 @pytest.mark.parametrize("fps", [5e-324, 1e-12, 24.0, 240.0])
 def test_positive_fps_has_bounded_equivalent_original_forward(fps):
+    from test_conditioning_rpc_core import Encoder, limits, media, profile
+
     from sglang.multimodal_gen.runtime.conditioning.wire import (
         decode_request,
         encode_request,
     )
-    from test_conditioning_rpc_core import Encoder, limits, media, profile
 
     p = profile()
     items = [{**media(7, "video"), "fps": fps}]
     # The wire retains the caller's legal FPS; the remote boundary must make
     # its equivalent single-frame native sampling bounded.
-    header, validated = decode_request(
-        encode_request("p", items, p.profile_id), p, limits()
-    )
+    request = decode_request(encode_request("p", items, p.profile_id), p, limits())
+    header, validated = request.header, request.media
     assert header["media"][0]["fps"] == fps
     reference = Encoder()(NS(prompt="p", media=[media(7, "video")]))
     context = multiprocessing.get_context("fork")

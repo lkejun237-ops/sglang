@@ -96,11 +96,13 @@ class ConditioningPrefetch:
         max_bytes,
         device=None,
         should_prefetch=None,
+        encode_request=None,
     ):
         if not isinstance(endpoint, str) or not endpoint.startswith("ipc:///"):
             raise ValueError("Conditioning prefetch requires a private local endpoint")
         self.prepare, self.identity, self.client = prepare, identity, client
         self.should_prefetch = should_prefetch
+        self.encode_request = encode_request
         if getattr(client, "result_transport", "http") == "nccl" and device is None:
             raise ValueError("NCCL prefetch requires the DiT leader device")
         self.device = device
@@ -143,6 +145,10 @@ class ConditioningPrefetch:
             self.lock.release()
 
     def _encode(self, prompt, media, *, input_digest, deadline=None):
+        if self.encode_request is not None:
+            return self.encode_request(
+                prompt, media, input_digest=input_digest, deadline=deadline
+            )
         if getattr(self.client, "result_transport", "http") == "nccl":
             return self.client.encode_device(
                 prompt,
@@ -215,4 +221,4 @@ class ConditioningPrefetch:
                 "Conditioning prefetch did not drain before session cleanup"
             )
         self.cached = self.prepare = self.identity = None
-        self.should_prefetch = None
+        self.should_prefetch = self.encode_request = None

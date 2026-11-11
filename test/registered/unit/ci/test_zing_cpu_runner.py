@@ -1,5 +1,6 @@
 """Real pytest children, strict receipts, timeout cleanup and isolation."""
 
+import ast
 import hashlib
 import json
 import os
@@ -913,6 +914,50 @@ def test_tooling_rejects_false_green_and_retains_evidence(tmp_path, bad):
     assert any(
         r["path"] == path and r["status"] == "FAILED" for r in receipt["results"]
     )
+
+
+@pytest.mark.parametrize("name", ["api", "response_validation", "worker"])
+@pytest.mark.parametrize("outcome,exit_code", [("pass", 0), ("fail", 1), ("empty", 5)])
+def test_conditioning_direct_entrypoint_preserves_pytest_exit(
+    tmp_path, name, outcome, exit_code
+):
+    relative = f"test/registered/unit/multimodal_gen/test_conditioning_rpc_{name}.py"
+    tree = ast.parse((ROOT / relative).read_text(encoding="utf-8"))
+    entrypoint = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test).replace("'", '"') == '__name__ == "__main__"'
+    )
+    # Execute the real entry block in a subprocess. Only the heavy environment
+    # bootstrap is replaced; pytest collection, assertions and exit are real.
+    write(
+        tmp_path,
+        "benchmark/zing_h3_causal/run_conditioning_cpu_tests.py",
+        "import os\nos.environ['CONDITIONING_BOOTSTRAPPED'] = '1'\n"
+        "if __name__ == '__main__':\n    raise AssertionError('nested pytest run')\n",
+    )
+    test_file = write(
+        tmp_path,
+        relative,
+        ast.unparse(entrypoint) + "\n"
+        "import os\n"
+        "def test_probe():\n"
+        "    assert os.environ['CONDITIONING_BOOTSTRAPPED'] == '1'\n"
+        f"    assert {outcome != 'fail'}\n",
+    )
+    arguments = ["-q", "-f"]
+    if outcome == "empty":
+        arguments += ["-k", "no_such_test"]
+    result = subprocess.run(
+        [sys.executable, str(test_file), *arguments],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert result.returncode == exit_code, result.stdout + result.stderr
+    assert {0: "1 passed", 1: "1 failed", 5: "1 deselected"}[exit_code] in result.stdout
 
 
 if __name__ == "__main__":

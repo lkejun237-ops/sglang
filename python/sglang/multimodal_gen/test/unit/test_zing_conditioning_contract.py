@@ -110,7 +110,8 @@ def test_rpc_media_capacity_is_configurable_not_capped_at_22(api, profile, max_m
         for i in range(max_media)
     ]
     body = encode_request("prompt", media, profile.profile_id)
-    header, decoded = decode_request(body, profile, ResourceLimits(max_media=max_media))
+    request = decode_request(body, profile, ResourceLimits(max_media=max_media))
+    header, decoded = request.header, request.media
     assert len(decoded) == max_media
     assert header["input_digest"] == content_identity(
         "prompt", media, profile.profile_id
