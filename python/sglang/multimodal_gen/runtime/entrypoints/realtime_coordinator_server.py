@@ -139,13 +139,33 @@ def create_app(
 
         if not isinstance(coordinator.store, RedisCoordinatorStore):
             raise ValueError("Distributed rooms require the existing Redis coordinator")
+        room_store = RedisRoomStore(
+            coordinator.store._get_client,
+            os.environ.get("WHITEBOX_ROOM_KEY_PREFIX", "whitebox:rooms:v1:"),
+        )
+        registry = None
+        if os.environ.get("WHITEBOX_DYNAMIC_ROOMS") == "1":
+            from sglang.multimodal_gen.runtime.realtime.whitebox.room_registration import (
+                install_registry_routes,
+            )
+            from sglang.multimodal_gen.runtime.realtime.whitebox.room_registry import (
+                RoomRegistry,
+            )
+
+            registry = RoomRegistry(
+                room_store, os.environ["WHITEBOX_ROOM_POOL_COMPATIBILITY"]
+            )
+            install_registry_routes(
+                app,
+                registry,
+                room_token or os.environ.get("WHITEBOX_INTERNAL_TOKEN"),
+                os.environ.get("WHITEBOX_ROOM_ADMIN_TOKEN"),
+            )
         room_directory = RoomDirectory(
-            RedisRoomStore(
-                coordinator.store._get_client,
-                os.environ.get("WHITEBOX_ROOM_KEY_PREFIX", "whitebox:rooms:v1:"),
-            ),
+            room_store,
             json.loads(owners),
             max_seconds=int(os.environ.get("WHITEBOX_GAME_SECONDS", "3600")),
+            registry=registry,
         )
     if room_directory is not None:
         from sglang.multimodal_gen.runtime.realtime.whitebox.rooms import (

@@ -71,6 +71,9 @@ ENV WHITEBOX_ALLOW_DEVELOPMENT_RELEASE=$WHITEBOX_TEST_ALLOW_DEVELOPMENT_RELEASE
 # Keep this test dependency out of the Python-only control-plane runtime.
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 RUN node --version
+# Disposable Redis is a checks-only dependency, never part of the runtime.
+RUN --mount=type=bind,source=deploy/whitebox/debian_main_mirror.py,target=/tmp/debian_main_mirror.py,readonly \
+    python /tmp/debian_main_mirror.py -- sh -ec 'apt-get update && apt-get install -y --no-install-recommends redis-server && rm -rf /var/lib/apt/lists/*'
 COPY python/sglang/multimodal_gen/test /app/python/sglang/multimodal_gen/test
 COPY docker/whitebox.Dockerfile /app/docker/whitebox.Dockerfile
 COPY deploy/whitebox /app/deploy/whitebox
@@ -101,6 +104,7 @@ RUN pip install --no-cache-dir pytest==9.0.2 pyzmq==27.2.0 && \
       python/sglang/multimodal_gen/test/unit/realtime/test_whitebox_recording_process.py \
       python/sglang/multimodal_gen/test/unit/realtime/test_whitebox_compositor.py \
       python/sglang/multimodal_gen/test/unit/realtime/test_whitebox_rooms.py \
+      python/sglang/multimodal_gen/test/unit/realtime/test_whitebox_room_registry.py \
       python/sglang/multimodal_gen/test/unit/realtime/test_whitebox_native.py \
       python/sglang/multimodal_gen/test/unit/realtime/test_whitebox_client_recording.py \
       python/sglang/multimodal_gen/test/unit/realtime/test_realtime_coordinator.py \
@@ -110,6 +114,7 @@ RUN pip install --no-cache-dir pytest==9.0.2 pyzmq==27.2.0 && \
       python/sglang/multimodal_gen/test/unit/realtime/test_world_gateway_metrics.py \
       --confcutdir=python/sglang/multimodal_gen/test/unit/realtime -q && \
     python -m pytest deploy/whitebox/test_prepare_assets.py \
+      deploy/whitebox/test_room_instance.py \
       deploy/whitebox/test_gpu_guard.py \
       deploy/whitebox/test_encoder_peer.py \
       deploy/whitebox/test_debian_main_mirror.py \
@@ -200,6 +205,10 @@ USER whitebox
 RUN WHITEBOX_TEST_CLI_SDK=/opt/worldkit python -m pytest \
       python/sglang/multimodal_gen/test/unit/realtime/test_whitebox_cli_integration.py \
       python/sglang/multimodal_gen/test/unit/realtime/test_whitebox_runtime_management.py \
+      --confcutdir=python/sglang/multimodal_gen/test/unit/realtime -p no:cacheprovider -q && \
+    WHITEBOX_TEST_CLI_SDK=/opt/worldkit python -m pytest \
+      python/sglang/multimodal_gen/test/unit/realtime/test_whitebox_room_registry.py \
+      -k native_cli_keeps_running \
       --confcutdir=python/sglang/multimodal_gen/test/unit/realtime -p no:cacheprovider -q && \
     touch /tmp/whitebox-cli-passed
 RUN WHITEBOX_REQUIRE_NATIVE_X264=1 python -m pytest \

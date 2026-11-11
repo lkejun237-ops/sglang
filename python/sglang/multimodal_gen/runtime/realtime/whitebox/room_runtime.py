@@ -1095,6 +1095,16 @@ class RoomRuntime:
             except BaseException:
                 complete = False
         if complete:
+            if room.get("route", {}).get("dynamic_owner"):
+                try:
+                    await self.directory.release_room(
+                        game_id, self.owner_id, self.epoch
+                    )
+                except Exception:
+                    logging.getLogger(__name__).warning(
+                        "Room capacity release remains unconfirmed: game_id=%s", game_id
+                    )
+                    return False
             if control_record is not None:
                 control_record["room_cleanup_complete"] = True
                 try:
@@ -1145,6 +1155,9 @@ def create_app(runtime, token):
         await runtime.close()
 
     app = FastAPI(title="Whitebox Game Runtime", lifespan=lifespan)
+    from .room_registration import install_owner_registration
+
+    install_owner_registration(app, runtime, token)
     from sglang.multimodal_gen.runtime.realtime.release_identity import (
         install_release_route,
     )

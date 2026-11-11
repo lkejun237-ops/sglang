@@ -48,6 +48,17 @@ def control_operation_key(caller, operation_id):
     )
 
 
+async def resolve_owner(proxy, ident, epoch=None):
+    import os
+
+    if os.environ.get("WHITEBOX_DYNAMIC_ROOMS") == "1":
+        return await proxy.directory.owner_origin(ident, epoch)
+    value = proxy.owners.get(ident)
+    if value is None:
+        raise ValueError("ROOM_ROUTE_UNAVAILABLE")
+    return value.rstrip("/")
+
+
 class MemoryRoomStore:
     """Single-process development/test store. Production uses RedisRoomStore."""
 
@@ -76,7 +87,7 @@ class RedisRoomStore:
     # its existing route in the same command; no global lock or hot counter.
     SCRIPT = """
 local current = redis.call('GET', KEYS[1])
-if #KEYS == 2 and redis.call('GET', KEYS[2]) ~= ARGV[4] then
+if #KEYS == 2 and (redis.call('GET', KEYS[2]) or '') ~= ARGV[4] then
   return 0
 end
 if (not current and ARGV[1] == '') or current == ARGV[1] then
@@ -106,17 +117,28 @@ return 0
         arguments = [old or "", new, retention]
         if expected_route is not None:
             keys.append(self.prefix + expected_route[0])
-            arguments.append(expected_route[1])
+            arguments.append(expected_route[1] or "")
         return bool(await client.eval(self.SCRIPT, len(keys), *keys, *arguments))
 
 
 class RoomDirectory:
     def __init__(
-        self, store, owners, *, max_seconds=3600, lease_seconds=30, clock=time.time
+        self,
+        store,
+        owners,
+        *,
+        max_seconds=3600,
+        lease_seconds=30,
+        clock=time.time,
+        registry=None,
     ):
         from urllib.parse import urlsplit
 
-        if not owners or max_seconds <= lease_seconds or lease_seconds < 3:
+        if (
+            (not owners and registry is None)
+            or max_seconds <= lease_seconds
+            or lease_seconds < 3
+        ):
             raise ValueError("Invalid room directory settings")
         for name, url in owners.items():
             parsed = urlsplit(url)
@@ -132,18 +154,45 @@ class RoomDirectory:
             ):
                 raise ValueError("Runtime owners require direct HTTP origins")
         self.store, self.owners = store, dict(owners)
+        self.registry = registry
         self.max_seconds, self.lease_seconds, self.clock = (
             max_seconds,
             lease_seconds,
             clock,
         )
 
-    async def resolve(self, game_id, world_id, *, create=False):
+    async def owner_origin(self, ident, epoch=None):
+        if self.registry is not None:
+            row = await self.registry.inspect(ident, epoch)
+            if row["state"] == "removed" or row["lease_until"] <= self.clock():
+                raise ValueError("The Room owner is unavailable")
+            return row["owner_url"]
+        if ident not in self.owners:
+            raise ValueError("The Room owner is unavailable")
+        return self.owners[ident].rstrip("/")
+
+    async def release_room(self, game_id, ident, epoch):
+        route = await self.lookup(game_id)
+        if route is None or route["owner_id"] != ident or route["owner_epoch"] != epoch:
+            raise ValueError("The original Room owner is unavailable")
+        if route["status"] != "ended":
+            raise ValueError("The original Room cleanup is unconfirmed")
+        if route.get("dynamic_owner"):
+            await self.registry.finish(route)
+        return {"released": True}
+
+    async def resolve(self, game_id, world_id, *, create=False, views=1):
         checked_id(game_id)
         if not isinstance(world_id, str) or not world_id or len(world_id) > 256:
             raise ValueError("Invalid world identifier")
         old = await self.store.get(game_id)
-        if old is None and create:
+        if old is None and create and self.registry is not None:
+            room = await self.registry.reserve(
+                game_id, world_id, views, self.lease_seconds
+            )
+            await self.store.cas(game_id, None, json.dumps(room), 120)
+            old = await self.store.get(game_id)
+        if old is None and create and self.registry is None:
             owner = max(
                 self.owners,
                 key=lambda key: hashlib.sha256((game_id + ":" + key).encode()).digest(),
@@ -236,6 +285,12 @@ class RoomDirectory:
                 value["game_id"],
                 world["sourceId"] + "/" + world["worldId"],
                 create=True,
+                views=1
+                if single
+                else context["frozenPublication"]
+                .get("playConfiguration", {})
+                .get("multiplayer", {})
+                .get("maxPlayers", 1),
             )
             if single:
                 # Persist the original route before dispatch. Its tombstone
@@ -392,11 +447,24 @@ class RoomDirectory:
         for _ in range(20):
             old = await self.store.get(game_id)
             if old is None:
-                raise ValueError("The game was not found")
-            room = json.loads(old)
-            self.validate(room)
+                if not end or self.registry is None:
+                    raise ValueError("The game was not found")
+                # Reconstruct only a terminal receipt from the exact retained
+                # reservation after real cleanup; never a live execution route.
+                room = await self.registry.original_route(game_id, owner_id, epoch)
+            else:
+                room = json.loads(old)
             if room["owner_id"] != owner_id or room["owner_epoch"] not in {None, epoch}:
                 raise ValueError("The game owner has changed")
+            if end and room.get("dynamic_owner"):
+                # Exact original cleanup can complete after a routing lease
+                # expires. This acknowledges retirement, never resumes a game.
+                if room["status"] == "ended":
+                    return room
+            else:
+                self.validate(room)
+            if room.get("dynamic_owner") and room["status"] == "starting" and not end:
+                await self.registry.claim(game_id, owner_id, epoch)
             room.update(
                 owner_epoch=epoch,
                 status="ended" if end else "active",
@@ -404,7 +472,10 @@ class RoomDirectory:
                 lease_until=self.clock() + self.lease_seconds,
             )
             if await self.store.cas(
-                game_id, old, json.dumps(room), 86400 if end else 0
+                game_id,
+                old,
+                json.dumps(room),
+                86400 if end else (120 if room.get("dynamic_owner") else 0),
             ):
                 return room
         raise ValueError("The game directory is busy")
@@ -416,6 +487,30 @@ def require_internal_token(expected, actual):
 
 
 def install_room_routes(app, directory, token):
+    @app.post("/v1/whitebox/rooms/owner-origin")
+    async def owner_origin(body: dict, authorization: str = Header(default="")):
+        require_internal_token(token, authorization)
+        try:
+            return {
+                "origin": await directory.owner_origin(
+                    body["owner_id"], body.get("owner_epoch")
+                )
+            }
+        except (KeyError, ValueError, TypeError):
+            raise HTTPException(409, "The Room owner is unavailable") from None
+
+    @app.post("/v1/whitebox/rooms/release-room")
+    async def release_room(body: dict, authorization: str = Header(default="")):
+        require_internal_token(token, authorization)
+        try:
+            return await directory.release_room(
+                body["game_id"], body["owner_id"], body["owner_epoch"]
+            )
+        except (KeyError, ValueError, TypeError):
+            raise HTTPException(
+                409, "The original Room cleanup is unavailable"
+            ) from None
+
     @app.post("/v1/whitebox/rooms/resolve")
     async def resolve(body: dict, authorization: str = Header(default="")):
         require_internal_token(token, authorization)
@@ -530,6 +625,17 @@ class HTTPRoomDirectory:
     async def resolve(self, game_id, world_id, *, create=False):
         return await self._post(
             "resolve", dict(game_id=game_id, world_id=world_id, create=create)
+        )
+
+    async def owner_origin(self, ident, epoch=None):
+        result = await self._post(
+            "owner-origin", dict(owner_id=ident, owner_epoch=epoch)
+        )
+        return result["origin"]
+
+    async def release_room(self, game_id, ident, epoch):
+        return await self._post(
+            "release-room", dict(game_id=game_id, owner_id=ident, owner_epoch=epoch)
         )
 
     async def touch(self, game_id, owner_id, epoch, *, end=False):

@@ -30,7 +30,7 @@ from .render_contract import (
     source_create_matches,
 )
 from .room_control import RoomControlCapabilities, exact, identities
-from .rooms import checked_id, require_internal_token
+from .rooms import checked_id, require_internal_token, resolve_owner
 from .rtc_auth import RTCCapabilities
 
 PUBLIC_STARTUP_FAILURE_CODES = frozenset(
@@ -706,7 +706,9 @@ def install_gateway_single_player_control(app, proxy, *, verifier=None):
             )
             if route is None:
                 return JSONResponse(unknown, headers={"Cache-Control": "no-store"})
-            origin = proxy.owners.get(route["owner_id"])
+            origin = await resolve_owner(
+                proxy, route["owner_id"], route.get("owner_epoch")
+            )
             if origin is None or origin.rstrip("/") != route["owner_url"].rstrip("/"):
                 raise ValueError()
             response = await proxy.client.post(

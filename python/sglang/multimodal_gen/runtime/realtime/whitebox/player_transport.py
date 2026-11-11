@@ -25,7 +25,7 @@ from .control_input_policy import (
 )
 from .native_pixels import MAX_HEADER, MAX_PIXELS
 from .room_control import frozen_publication_identity
-from .rooms import checked_id, checked_session_id, require_internal_token
+from .rooms import checked_id, checked_session_id, require_internal_token, resolve_owner
 
 MAX_UI_BYTES = 32 * 1024 * 1024
 MAX_WIRE_BYTES = MAX_PIXELS + MAX_HEADER + 4
@@ -674,9 +674,11 @@ def install_player_gateway(app, proxy, *, config=None):
 
     async def route(session_id):
         binding = await proxy.directory.session_route(checked_session_id(session_id))
-        if binding is None or binding["owner_id"] not in proxy.owners:
+        if binding is None:
             raise ValueError()
-        return binding, proxy.owners[binding["owner_id"]].rstrip("/")
+        return binding, await resolve_owner(
+            proxy, binding["owner_id"], binding.get("owner_epoch")
+        )
 
     @app.options("/v1/sessions/{session_id}")
     async def preflight(session_id: str, request: Request):

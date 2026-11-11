@@ -707,3 +707,25 @@ RUN python -c 'import os,pathlib,subprocess; p=pathlib.Path("/app/sglang/nested"
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+
+
+def test_dynamic_room_pool_is_explicit_and_only_adds_runtime_wiring():
+    bindings = json.loads((ROOT / "bindings.example.json").read_text())
+    static = render(load("shanghai"), bindings)
+    dynamic = render(
+        load("shanghai"), {**bindings, "room_pool_compatibility": "tested-room-pool-v1"}
+    )
+    assert "WHITEBOX_DYNAMIC_ROOMS" not in static["environments"]["room"]
+    for role in ("gateway", "coordinator", "room"):
+        assert dynamic["environments"][role]["WHITEBOX_DYNAMIC_ROOMS"] == "1"
+    assert dynamic["environments"]["model"] == static["environments"]["model"] | {
+        "WHITEBOX_RELEASE_CONFIG_SHA256": dynamic["config_sha256"]
+    }
+    assert (
+        dynamic["environments"]["room"]["WHITEBOX_ROOM_ADVERTISE_URL"]
+        == bindings["room_url"]
+    )
+    assert "WHITEBOX_ROOM_ADMIN_TOKEN" in dynamic["required_secret_keys"]["coordinator"]
+    assert (
+        "WHITEBOX_ROOM_ADMIN_TOKEN" not in static["required_secret_keys"]["coordinator"]
+    )

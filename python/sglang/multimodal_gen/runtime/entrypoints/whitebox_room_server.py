@@ -159,6 +159,7 @@ def main():
                 connect,
                 max_sources=source_capacity,
             )
+            runtime.render_host = render_host
             render_host.lock = pipelines.lock
             render_host.peer_sessions = pipelines.sessions
             pipelines.peer_sessions = render_host.sessions

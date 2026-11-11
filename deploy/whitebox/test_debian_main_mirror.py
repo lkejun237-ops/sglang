@@ -127,8 +127,8 @@ def test_official_build_wraps_every_apt_consumer_without_copying_helper():
 
     dockerfile = Path(__file__).resolve().parents[2] / "docker/whitebox.Dockerfile"
     text = dockerfile.read_text()
-    assert text.count("source=deploy/whitebox/debian_main_mirror.py") == 4
-    assert text.count("python /tmp/debian_main_mirror.py -- sh -ec") == 4
+    assert text.count("source=deploy/whitebox/debian_main_mirror.py") == 5
+    assert text.count("python /tmp/debian_main_mirror.py -- sh -ec") == 5
     assert "COPY deploy/whitebox/debian_main_mirror.py" not in text
     assert "FROM python:3.14-slim-bookworm AS base" in text
 

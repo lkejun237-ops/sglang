@@ -135,3 +135,7 @@ Decoder overlap 和 defer-final；AdaLN=resident、W6/S0、每玩家期限1800�
 
 实际bindings、Secret、准备视图、plan和进程日志均在Git外。plan、资产准备和模型state输出
 会检查该边界；构建继续使用临时Git archive，不扩大共享.gitignore。
+
+## 手动增加 Room 实例
+
+可选 `room_pool_compatibility` 启用动态 owner 目录。`room_instance.py` 生成新实例的独立启动输入，`room_pool.py` 执行显式登记、检查、排空与移除；均不会重启其他服务。首次启用需要正常升级，新实例必须使用独立身份、数据目录和媒体端点。见 [Room 手动扩容](../../docs/docs/sglang-diffusion/zing/plans/whitebox-room-manual-expansion.md)。

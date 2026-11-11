@@ -15,7 +15,7 @@ import httpx
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from .rooms import checked_id
+from .rooms import checked_id, resolve_owner
 from .rtc_auth import RTCCapabilities
 
 MAX_CONTROL_BYTES = 256 * 1024
@@ -360,7 +360,9 @@ def install_gateway_room_control(app, proxy, *, verifier=None):
                 ):
                     raise ValueError("Invalid original owner retirement result")
                 return JSONResponse(result, headers={"Cache-Control": "no-store"})
-            origin = proxy.owners.get(route["owner_id"])
+            origin = await resolve_owner(
+                proxy, route["owner_id"], route.get("owner_epoch")
+            )
             if origin is None or origin.rstrip("/") != route["owner_url"].rstrip("/"):
                 raise ValueError()
             if body["action"] == "getOperation" and route.get("status") == "ended":

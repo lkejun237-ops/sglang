@@ -19,7 +19,8 @@ from .rooms import HTTPRoomDirectory, MemoryRoomStore, RoomDirectory, checked_id
 class RoomProxy:
     def __init__(self, directory, owners, token, client, connect):
         # Reuse strict origin validation; callers never choose an upstream URL.
-        RoomDirectory(MemoryRoomStore(), owners)
+        if owners or os.environ.get("WHITEBOX_DYNAMIC_ROOMS") != "1":
+            RoomDirectory(MemoryRoomStore(), owners)
         self.directory, self.owners, self.token = directory, owners, token
         self.client, self.connect = client, connect
 
@@ -36,6 +37,15 @@ class RoomProxy:
             client,
             connect,
         )
+
+    async def owner_origin(self, ident, epoch=None):
+        # Resolve through the authenticated Coordinator, never a browser URL.
+        if os.environ.get("WHITEBOX_DYNAMIC_ROOMS") == "1":
+            return await self.directory.owner_origin(ident, epoch)
+        origin = self.owners.get(ident)
+        if origin is None:
+            raise ValueError("ROOM_ROUTE_UNAVAILABLE")
+        return origin.rstrip("/")
 
     async def close(self):
         await self.client.aclose()
@@ -190,7 +200,9 @@ class RoomProxy:
                 else checked_id(world.get("game_id"))
             )
             route = await self.directory.resolve(game_id, world_id, create=create)
-            origin = self.owners.get(route["owner_id"])
+            origin = await self.owner_origin(
+                route["owner_id"], route.get("owner_epoch")
+            )
             if origin is None or origin.rstrip("/") != route["owner_url"].rstrip("/"):
                 raise ValueError("ROOM_ROUTE_UNAVAILABLE")
             message["whitebox"] = dict(world, game_id=game_id)
@@ -310,7 +322,10 @@ class RoomProxy:
                 checked_id(source_id)
             except ValueError:
                 raise HTTPException(404)
-            origin = self.owners.get(owner_id)
+            try:
+                origin = await self.owner_origin(owner_id)
+            except (ValueError, httpx.HTTPError):
+                raise HTTPException(404) from None
             if not origin or not request.headers.get("authorization", "").startswith(
                 "Bearer "
             ):
@@ -362,7 +377,10 @@ class RoomProxy:
                 checked_id(recording_id)
             except ValueError:
                 raise HTTPException(404)
-            origin = self.owners.get(owner_id)
+            try:
+                origin = await self.owner_origin(owner_id)
+            except (ValueError, httpx.HTTPError):
+                raise HTTPException(404) from None
             if not origin or any(part in {".", ".."} for part in suffix.split("/")):
                 raise HTTPException(404)
             if not request.headers.get("authorization", "").startswith("Bearer "):

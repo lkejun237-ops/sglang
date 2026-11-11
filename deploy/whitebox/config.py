@@ -67,6 +67,8 @@ BINDINGS = {
     "asset_root",
     "state_root",
 }
+OPTIONAL_BINDINGS = {"room_pool_compatibility"}
+
 SECRET_KEYS = {
     "coordinator": ["WHITEBOX_INTERNAL_TOKEN", "REDIS_PASSWORD"],
     "gateway": [
@@ -258,7 +260,9 @@ def validate(config):
                 or "\n" in value
             ):
                 raise ValueError(f"Invalid environment entry for {role}")
-            if key in {k for keys in SECRET_KEYS.values() for k in keys}:
+            if key in {k for keys in SECRET_KEYS.values() for k in keys} | {
+                "WHITEBOX_ROOM_ADMIN_TOKEN"
+            }:
                 raise ValueError(
                     "Credentials must be supplied by the platform secret store"
                 )
@@ -266,9 +270,9 @@ def validate(config):
 
 
 def validate_bindings(values):
-    if set(values) != BINDINGS:
+    if not BINDINGS <= set(values) or set(values) - BINDINGS - OPTIONAL_BINDINGS:
         raise ValueError(
-            f"Bindings differ: missing={sorted(BINDINGS - set(values))}, unknown={sorted(set(values) - BINDINGS)}"
+            f"Bindings differ: missing={sorted(BINDINGS - set(values))}, unknown={sorted(set(values) - BINDINGS - OPTIONAL_BINDINGS)}"
         )
     if any(
         not isinstance(v, str) or not v or any(c in v for c in "\n\r\0")
@@ -367,6 +371,15 @@ def render(config, bindings):
         envs["model"]["SGLANG_ZING_QUANT_SCOPE"] = c["model"].get(
             "quantization_scope", "ffn-attention"
         )
+    required_secrets = copy.deepcopy(SECRET_KEYS)
+    if b.get("room_pool_compatibility"):
+        for role in ("gateway", "coordinator", "room"):
+            envs[role]["WHITEBOX_DYNAMIC_ROOMS"] = "1"
+            envs[role]["WHITEBOX_ROOM_POOL_COMPATIBILITY"] = b[
+                "room_pool_compatibility"
+            ]
+        envs["room"]["WHITEBOX_ROOM_ADVERTISE_URL"] = b["room_url"]
+        required_secrets["coordinator"].append("WHITEBOX_ROOM_ADMIN_TOKEN")
     profile_meta = _load_profile_launcher().policy_source_metadata()
     hardware_profile = "b300" if c["gpu"]["capability"] == [10, 3] else "h200"
     return {
@@ -380,7 +393,7 @@ def render(config, bindings):
             "resolution": str(c["model"]["height"]),
         },
         "environments": envs,
-        "required_secret_keys": SECRET_KEYS,
+        "required_secret_keys": required_secrets,
         "policy": c,
         "bindings": b,
         "activation": "manual_only",
