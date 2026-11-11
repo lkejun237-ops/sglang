@@ -109,6 +109,7 @@ class ZingSourceEncoderAdapter(ZingH3SourceStreamAdapter):
         await self.pending.wait_ready()
 
     def source_input_required_end(self):
+        accepted = self.dispatched_source_frames + self.pending_frames
         if (
             self.end is not None
             or self.more_work
@@ -116,11 +117,11 @@ class ZingSourceEncoderAdapter(ZingH3SourceStreamAdapter):
             or self.has_control_work()
             or (self.startup_enabled and self.startup_phase != "attached")
         ):
-            return self.ledger.accepted_frames
+            return accepted
         # The staged input endpoint owns the exact 1/8/8 assembler state.
         # Ownership credits from later stages are not readiness evidence.
         return (
-            self.ledger.accepted_frames
+            accepted
             - self.input_arranger.buffered_frames
             + (1, 8, 8)[self.input_arranger.group_index]
         )

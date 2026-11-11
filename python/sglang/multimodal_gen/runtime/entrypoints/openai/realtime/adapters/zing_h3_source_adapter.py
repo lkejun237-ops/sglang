@@ -775,7 +775,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             or self._condition_control_ready()
             or (self.startup_enabled and self.startup_phase != "attached")
         ):
-            return self.ledger.accepted_frames
+            return self.dispatched_source_frames + self.pending_frames
         target, _ = self._joint_wait_target()
         return self.dispatched_source_frames + target
 
@@ -791,7 +791,12 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             # insert streaming telemetry into that request-response exchange.
             return None
         required = self.source_input_required_end()
-        accepted = self.ledger.accepted_frames
+        # Ingress advances the ledger before awaiting the serialized acceptance
+        # write. Scheduling can observe that suspension before the append is
+        # published to pending. Describe only the source input exposed to work;
+        # otherwise an in-progress acknowledgement produces a torn snapshot
+        # where queued != accepted - dispatched and aborts a healthy session.
+        accepted = self.dispatched_source_frames + self.pending_frames
         waiting = waiting_for_input and accepted < required
         now = time.monotonic()
         if waiting and self._source_wait_started is None:

@@ -2387,3 +2387,112 @@ def test_native_source_demand_tracks_input_groups_without_releasing_ownership(
             adapter.dispose(session)
 
     asyncio.run(run())
+
+
+def test_source_demand_remains_consistent_while_acceptance_write_is_blocked(
+    configured,  # noqa: F811
+):
+    from sglang.multimodal_gen.runtime.realtime.whitebox.source_sampling import (
+        AdaptiveSourceSampler,
+    )
+    from sglang.multimodal_gen.runtime.realtime.zing_chunk_plan import ChunkPlan
+    from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
+        progressive_source_flow,
+    )
+
+    async def run():
+        adapter, session = ZingEncoderDiTAdapter(), GenerateSession()
+        session.set_adapter(adapter)
+        flow = progressive_source_flow(ChunkPlan([3, 2]), progressive_output=True)
+
+        async def open_dit(message):
+            return [
+                dict(
+                    type="session.opened",
+                    output_kind="rgb",
+                    source_output_release_protocol="valid-source-frames-v1",
+                    source_flow=flow,
+                )
+            ]
+
+        session.execution_client = SimpleNamespace(open_dit=open_dit)
+        request = RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="test",
+            size="32x32",
+            zing_realtime_api_version=1,
+            source_stream=dict(format="rgb24", width=32, height=32, fps=24),
+            source_demand_protocol="source-demand-v1",
+        )
+        await adapter.on_init(session, request)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        class BlockedAcceptance(PromptSocket):
+            async def send_bytes(self, raw):
+                entered.set()
+                await release.wait()
+                await super().send_bytes(raw)
+
+        socket = BlockedAcceptance()
+        sampler = AdaptiveSourceSampler()
+        sampler.configure_native(
+            adapter.session_ready_message(session),
+            session_id=session.id,
+            generation_id=session.generation_id,
+            capacity=25,
+        )
+        append = None
+        try:
+            sampler.model_demand(adapter.source_demand_message(session), sent=0, now=0)
+            payload = dict(
+                client_seq=0,
+                source_frame_start=0,
+                num_frames=1,
+                pts_us=0,
+                data=bytes(32 * 32 * 3),
+            )
+            append = asyncio.create_task(
+                adapter.ingest_wire_event(
+                    socket,
+                    session,
+                    dict(
+                        type="event", kind="source.append", event_id=1, payload=payload
+                    ),
+                    len(payload["data"]) + 256,
+                )
+            )
+            await asyncio.wait_for(entered.wait(), 1)
+            assert adapter.ledger.accepted_frames == 1
+            assert adapter.pending_frames == adapter.dispatched_source_frames == 0
+            # A scheduling observation during socket backpressure must either
+            # coalesce the unchanged state or remain valid for the real consumer.
+            pending = adapter.source_demand_message(session)
+            if pending is not None:
+                sampler.model_demand(pending, sent=1, now=1)
+            assert sampler.native_accepted == sampler.native_queued == 0
+            assert sampler.native_required == 1
+            assert not socket.messages
+            adapter.more_work = True
+            ready_work = adapter.source_demand_message(session)
+            assert not ready_work["waiting_for_source"]
+            assert ready_work["required_source_frame_end"] == 0
+            sampler.model_demand(ready_work, sent=1, now=1.5)
+            adapter.more_work = False
+            release.set()
+            await asyncio.wait_for(append, 1)
+            published = adapter.source_demand_message(session)
+            assert published["accepted_source_frame_end"] == 1
+            assert published["queued_source_frames"] == 1
+            sampler.model_demand(published, sent=1, now=2)
+            adapter._take_source_input()
+            dispatched = adapter.source_demand_message(session)
+            sampler.model_demand(dispatched, sent=1, now=3)
+            assert sampler.native_dispatched == 1 and sampler.native_queued == 0
+            assert adapter.ledger.consumed_frames == 0
+        finally:
+            release.set()
+            if append is not None and not append.done():
+                await append
+            adapter.dispose(session)
+
+    asyncio.run(run())
