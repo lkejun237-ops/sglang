@@ -84,3 +84,28 @@ def test_control_failure_still_ends_a_held_media_read():
             )
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("started", [False, True])
+def test_frame_timeout_distinguishes_startup_from_running_source(started):
+    from sglang.multimodal_gen.runtime.realtime.whitebox.diagnostics import (
+        WhiteboxDiagnostic,
+        public_error,
+    )
+
+    async def run():
+        state = CaptureWait(frame_seconds=0.001)
+        with pytest.raises(ValueError) as caught:
+            await state.receive(asyncio.Event().wait(), started=started)
+        if started:
+            assert isinstance(caught.value, WhiteboxDiagnostic)
+            diagnostic = public_error(
+                caught.value, "trace", default="ROOM_PIPELINE_FAILED"
+            )
+            assert diagnostic["code"] == "SOURCE_FRAME_TIMEOUT"
+            assert diagnostic["stage"] == "source"
+        else:
+            assert type(caught.value) is ValueError
+            assert str(caught.value) == "The CLI stream did not become ready"
+
+    asyncio.run(run())

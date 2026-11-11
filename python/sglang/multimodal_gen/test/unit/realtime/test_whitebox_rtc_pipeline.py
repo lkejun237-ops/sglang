@@ -234,6 +234,56 @@ def test_failed_handoff_releases_credits_without_emitting_successful_eos():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize(
+    "code", ["RTC_MEDIA_FAILURE", "RTC_MEDIA_TIMEOUT", "secret /path/file", "A" * 97]
+)
+def test_native_media_failure_preserves_safe_upstream_code_through_handoff(code):
+    import json
+
+    from sglang.multimodal_gen.runtime.realtime.whitebox.native_rtc import (
+        HEADER,
+        NativeRTC,
+    )
+
+    async def run():
+        sub, peer, owner = make_sub()
+        native = NativeRTC(lambda _: None)
+        stream = asyncio.StreamReader()
+        native.process = NS(stdout=stream)
+        reader = asyncio.create_task(native._read())
+        try:
+            sub.offer_media(media("model", 0))
+            await until(lambda: len(peer.calls) == 1)
+            # Route the real IPC error into the future awaited by send_frame.
+            native.pending[1] = peer.calls[0][1]
+            payload = json.dumps(dict(type="error", id=1, code=code)).encode()
+            stream.feed_data(HEADER.pack(len(payload), 0) + payload)
+            await until(lambda: sub.media_task.done())
+            message = msgspec.msgpack.decode(await sub.recv())
+            assert message["type"] == "error"
+            assert message["code"] == "RTC_MEDIA_STALLED"
+            assert message["reconnectable"] is True
+            assert message["content"] == (
+                "The video connection could not keep up. Please reconnect."
+            )
+            if code.startswith("RTC_"):
+                assert message["upstream_code"] == code
+            else:
+                assert "upstream_code" not in message
+            assert "secret" not in str(message)
+            assert "/path" not in str(message)
+            # A media attachment failure must still allow source reconnection.
+            assert owner.terminal is None
+            assert not sub.handoffs and sub.failed["model"] == 1
+        finally:
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+            sub.stop("done")
+            await sub.wait_closed()
+
+    asyncio.run(run())
+
+
 def test_source_and_raw_model_counts_are_separate_from_encoded_handoff():
     async def run():
         sub, peer, owner = make_sub()

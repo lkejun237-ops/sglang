@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 
 from .area_contract import AREA_PROTOCOL, read_area_frame, read_area_receipt
 from .interactive import create_model_leases
+from .player_control import PUBLIC_SINGLE_PLAYER_FAILURE_CODES
 from .render_contract import (
     PROTOCOL,
     RenderError,
@@ -373,15 +374,16 @@ class RenderPipeline(RoomPipeline):
             relay.stop()
             if relay.task is not None:
                 await asyncio.gather(relay.task, return_exceptions=True)
-        terminal = self.terminal or {}
-        failing = (
+        pre_code = (self.terminal or {}).get("code") or (
+            reason if isinstance(reason, str) else None
+        )
+        can_record_failure = (
             hasattr(self, "single_player_operation")
             and not self.closed
             and not getattr(self, "closing", False)
-            and terminal.get("code")
-            in {"WTP_PLAYABLE_PUBLICATION_CHANGED", "PLAYER_IDLE_TIMEOUT"}
+            and reason not in {"PLAYER_CANCELLED", "PLAYER_START_FAILED"}
         )
-        if not failing:
+        if not (can_record_failure and pre_code in PUBLIC_SINGLE_PLAYER_FAILURE_CODES):
             await super().close(reason)
             return
         control, key = self.host.single_player_control, self.single_player_operation
@@ -392,8 +394,18 @@ class RenderPipeline(RoomPipeline):
             await super().close(reason)
         finally:
             try:
-                if self.closed:
-                    await control.source_failed(key, terminal["code"])
+                terminal = self.terminal or {}
+                final_code = terminal.get("code") or pre_code
+                if self.closed and final_code in PUBLIC_SINGLE_PLAYER_FAILURE_CODES:
+                    logging.getLogger(__name__).info(
+                        "Single-player terminal failure operation_key=%s session_id=%s "
+                        "failure_code=%s upstream_code=%s",
+                        key,
+                        self.session_id,
+                        final_code,
+                        terminal.get("upstream_code"),
+                    )
+                    await control.source_failed(key, final_code)
             finally:
                 control.pending_source_failures.discard(key)
 

@@ -9,6 +9,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import struct
 
 HEADER = struct.Struct("!II")
@@ -208,11 +209,15 @@ class NativeRTC:
                                 message.get("code"),
                                 request_id,
                             )
-                            future.set_exception(
-                                RuntimeError(
-                                    "The media endpoint could not complete this operation"
-                                )
+                            error = RuntimeError(
+                                "The media endpoint could not complete this operation"
                             )
+                            code = message.get("code")
+                            if isinstance(code, str) and re.fullmatch(
+                                r"[A-Za-z][A-Za-z0-9_.:-]{0,95}", code
+                            ):
+                                error.upstream_code = code
+                            future.set_exception(error)
                         else:
                             future.set_result(message)
                 else:

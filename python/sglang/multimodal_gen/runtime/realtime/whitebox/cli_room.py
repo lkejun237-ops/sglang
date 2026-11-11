@@ -70,6 +70,13 @@ MODEL_CONTEXT_SUBSCRIPTION_SECONDS = 30
 CLI_CONTRACT_REVISION = "dcf702e90092f90dbd230c058740f54925ee095f"
 
 
+def _recovery_error(code):
+    error = ConnectionError(code)
+    error.code = code
+    error.stage = "source"
+    return error
+
+
 def capture_fps(spec, env, requested=None):
     requested = cli_fps_override(requested)
     value = (
@@ -1028,7 +1035,7 @@ class CLIView:
         the contiguous control prefix and queries its original pending request.
         """
         if self.model_context is None or self.closed or self.stopped:
-            raise ConnectionError("MODEL_CONTEXT_RECOVERY_UNAVAILABLE")
+            raise _recovery_error("MODEL_CONTEXT_RECOVERY_UNAVAILABLE")
         async with self.transport_lock:
             if generation != self.transport_generation:
                 return
@@ -1058,8 +1065,8 @@ class CLIView:
                             await asyncio.sleep(delay)
                             delay = min(1, delay * 2)
             except TimeoutError as error:
-                raise ConnectionError("MODEL_CONTEXT_RECOVERY_EXPIRED") from error
-            raise ConnectionError("MODEL_CONTEXT_RECOVERY_UNAVAILABLE")
+                raise _recovery_error("MODEL_CONTEXT_RECOVERY_EXPIRED") from error
+            raise _recovery_error("MODEL_CONTEXT_RECOVERY_UNAVAILABLE")
 
     async def _control_transport(self):
         while not self.closed and not self.stopped:
@@ -1366,7 +1373,10 @@ class CLIView:
         index = 0
         while not self.stopped:
             wire = await self._wait_or_error(
-                self.capture_wait.receive(self.media.recv()), timeout=None
+                self.capture_wait.receive(
+                    self.media.recv(), started=self.ready.is_set()
+                ),
+                timeout=None,
             )
             if self.finish_requested.is_set() or self.end_reason is not None:
                 return
@@ -1776,7 +1786,10 @@ class NativeCLIView(CLIView):
                     continue
             try:
                 wire = await self._wait_or_error(
-                    self.capture_wait.receive(self.media.recv()), timeout=None
+                    self.capture_wait.receive(
+                        self.media.recv(), started=self.ready.is_set()
+                    ),
+                    timeout=None,
                 )
             except (OSError, ConnectionClosed):
                 if self.model_context is None:

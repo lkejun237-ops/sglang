@@ -8,6 +8,8 @@ from types import SimpleNamespace as NS
 import msgspec
 import pytest
 
+from sglang.multimodal_gen.runtime.realtime.role_pool.contracts import PoolError
+from sglang.multimodal_gen.runtime.realtime.whitebox.cli_room import _recovery_error
 from sglang.multimodal_gen.runtime.realtime.whitebox.contracts import VideoSpec
 from sglang.multimodal_gen.runtime.realtime.whitebox.diagnostics import (
     WhiteboxDiagnostic,
@@ -624,5 +626,81 @@ def test_primary_failure_keeps_cleanup_status_after_cancelled_generation(
             assert segment.resource_state == "release_unknown"
         finally:
             await archives.close()
+
+    asyncio.run(run())
+
+
+def test_pool_code_is_metadata_without_changing_render_failure_contract():
+    result = public_error(
+        PoolError("GROUP_UNAVAILABLE"),
+        "trace",
+        default="RENDER_FAILED",
+        stage="rendering",
+    )
+    assert result["code"] == "RENDER_FAILED"
+    assert result["upstream_code"] == "GROUP_UNAVAILABLE"
+    assert result["stage"] == "rendering"
+
+
+@pytest.mark.parametrize("code", [None, "secret /path/file", "lowercase", "A" * 97])
+def test_arbitrary_exception_text_and_unreviewed_codes_stay_private(code):
+    error = ValueError("secret /path/file")
+    if code is not None:
+        error.code = code
+    result = public_error(error, "trace", default="RENDER_FAILED")
+    assert result["code"] == "RENDER_FAILED"
+    assert "upstream_code" not in result
+    assert "secret" not in str(result)
+    assert "/path" not in str(result)
+
+
+@pytest.mark.parametrize(
+    "code", ["MODEL_CONTEXT_RECOVERY_UNAVAILABLE", "MODEL_CONTEXT_RECOVERY_EXPIRED"]
+)
+def test_recovery_errors_remain_connection_errors_with_public_source_code(code):
+    error = _recovery_error(code)
+    assert isinstance(error, (OSError, ConnectionError))
+    result = public_error(error, "trace", default="ROOM_PIPELINE_FAILED")
+    assert result["code"] == code
+    assert result["stage"] == "source"
+
+
+@pytest.mark.parametrize(
+    "code", ["RTC_MEDIA_FAILURE", "RTC_MEDIA_TIMEOUT", "secret /path/file", "A" * 97]
+)
+def test_native_rtc_preserves_only_safe_peer_code(code):
+    import asyncio
+    import json
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.runtime.realtime.whitebox.native_rtc import (
+        HEADER,
+        NativeRTC,
+    )
+
+    async def run():
+        peer = NativeRTC(lambda _: None)
+        stream = asyncio.StreamReader()
+        peer.process = SimpleNamespace(stdout=stream)
+        future = asyncio.get_running_loop().create_future()
+        peer.pending[1] = future
+        payload = json.dumps(dict(type="error", id=1, code=code)).encode()
+        stream.feed_data(HEADER.pack(len(payload), 0) + payload)
+        reader = asyncio.create_task(peer._read())
+        try:
+            with pytest.raises(RuntimeError) as caught:
+                await asyncio.wait_for(future, 1)
+            assert (
+                str(caught.value)
+                == "The media endpoint could not complete this operation"
+            )
+            result = public_error(caught.value, "trace", default="RENDER_FAILED")
+            if code.startswith("RTC_"):
+                assert result["upstream_code"] == code
+            else:
+                assert "upstream_code" not in result
+        finally:
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
 
     asyncio.run(run())

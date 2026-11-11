@@ -4,6 +4,8 @@
 import asyncio
 import time
 
+from .diagnostics import WhiteboxDiagnostic
+
 
 class CaptureWait:
     def __init__(self, *, frame_seconds=15, hold_seconds=300, clock=time.monotonic):
@@ -48,7 +50,7 @@ class CaptureWait:
         self.resumed_at = self.clock()
         self._notify()
 
-    async def receive(self, operation):
+    async def receive(self, operation, *, started=False):
         task = asyncio.create_task(operation)
         deadline = self.clock() + self.frame_seconds
         changed = None
@@ -74,6 +76,8 @@ class CaptureWait:
                 changed = None
                 if event.is_set():
                     continue  # A hold/resume also affects an already pending read.
+                if started:
+                    raise WhiteboxDiagnostic("SOURCE_FRAME_TIMEOUT", "source")
                 raise ValueError("The CLI stream did not become ready")
         finally:
             pending = [item for item in (task, changed) if item is not None]

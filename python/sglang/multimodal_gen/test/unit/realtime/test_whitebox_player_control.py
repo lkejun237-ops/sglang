@@ -565,9 +565,11 @@ def test_real_original_source_factory_and_native_rtc_attachment_without_reinit(
         spec = (
             VideoSpec(1280, 720)
             if resolution in {"720p", "deployment720", "deployment720-env"}
-            else VideoSpec(832, 480)
-            if codec or resolution == "deployment480"
-            else VideoSpec(32, 32)
+            else (
+                VideoSpec(832, 480)
+                if codec or resolution == "deployment480"
+                else VideoSpec(32, 32)
+            )
         )
         engine = Engine(spec)
         engine.renderer = BrowserUI()
@@ -1044,7 +1046,19 @@ def test_idle_reason_survives_source_retirement_but_unknown_codes_stay_private(
     asyncio.run(run())
 
 
-def test_actual_source_close_persists_idle_reason_after_cleanup(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "failure_code,reason_only",
+    [
+        ("PLAYER_IDLE_TIMEOUT", False),
+        ("RECONNECT_EXPIRED", True),
+        ("SOURCE_FRAME_TIMEOUT", False),
+        ("MODEL_CONTEXT_RECOVERY_UNAVAILABLE", False),
+        ("MODEL_CONTEXT_RECOVERY_EXPIRED", False),
+    ],
+)
+def test_actual_source_close_persists_runtime_reason_after_cleanup(
+    tmp_path, monkeypatch, failure_code, reason_only
+):
     from sglang.multimodal_gen.runtime.realtime.whitebox.room_pipeline import (
         RoomPipeline,
     )
@@ -1060,18 +1074,24 @@ def test_actual_source_close_persists_idle_reason_after_cleanup(tmp_path, monkey
         pipeline = actual_pipeline.__new__(actual_pipeline)
         pipeline.__dict__.update(original.__dict__)
         pipeline.single_player_operation = key
-        pipeline.terminal = dict(type="error", code="PLAYER_IDLE_TIMEOUT")
+        pipeline.terminal = (
+            None if reason_only else dict(type="error", code=failure_code)
+        )
         owner.sessions[pipeline.session_id] = pipeline
         entered, release = asyncio.Event(), asyncio.Event()
 
         async def close_source(self, reason=None):
+            if self.terminal is None and reason:
+                self.terminal = dict(type="error", code=reason)
             owner.sessions.pop(self.session_id, None)
             entered.set()
             await release.wait()
             self.closed = True
 
         monkeypatch.setattr(RoomPipeline, "close", close_source)
-        closing = asyncio.create_task(pipeline.close("DISCONNECTED"))
+        closing = asyncio.create_task(
+            pipeline.close(failure_code if reason_only else "DISCONNECTED")
+        )
         await entered.wait()
         assert key in control.pending_source_failures
         assert (await control.get_operation(op))["state"] in {"starting", "ready"}
@@ -1084,7 +1104,10 @@ def test_actual_source_close_persists_idle_reason_after_cleanup(tmp_path, monkey
         await closing
         result = await control.get_attachment(op)
         assert result["state"] == "failed"
-        assert result["failureCode"] == "PLAYER_IDLE_TIMEOUT"
+        assert result["failureCode"] == failure_code
+        operation_result = await control.get_operation(op)
+        assert operation_result["state"] == "failed"
+        assert operation_result["failureCode"] == failure_code
         assert key not in control.pending_source_failures
         await owner.close()
 
@@ -1729,5 +1752,50 @@ def test_retired_source_close_requires_original_durable_release(
                 assert stored["state"] != "cancelled"
         finally:
             await owner.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("reason", ["PLAYER_CANCELLED", "PLAYER_START_FAILED"])
+def test_controlled_close_does_not_overwrite_cancellation(
+    tmp_path, monkeypatch, reason
+):
+    from sglang.multimodal_gen.runtime.realtime.whitebox.room_pipeline import (
+        RoomPipeline,
+    )
+
+    actual_pipeline = render_host.RenderPipeline
+
+    async def run():
+        owner, control = host(tmp_path, monkeypatch)
+        op = operation()
+        await control.start(op)
+        key, row = await control._read(op)
+        original = owner.sessions[row["execution"]["sourceSessionId"]]
+        pipeline = actual_pipeline.__new__(actual_pipeline)
+        pipeline.__dict__.update(original.__dict__)
+        pipeline.single_player_operation = key
+        pipeline.terminal = dict(type="error", code="SOURCE_FRAME_TIMEOUT")
+        owner.sessions[pipeline.session_id] = pipeline
+
+        async def close_source(self, reason=None):
+            assert key not in control.pending_source_failures
+            self.closed = True
+            owner.sessions.pop(self.session_id, None)
+
+        monkeypatch.setattr(RoomPipeline, "close", close_source)
+        # Use the actual close wrapper while the control owns cancellation.
+        original_close = pipeline.close
+
+        async def controlled_close(_reason=None):
+            await original_close(reason)
+
+        pipeline.close = controlled_close
+        assert (await control.close(op))["state"] == "cancelled"
+        for query in (control.get_operation, control.get_attachment):
+            result = await query(op)
+            assert result["state"] == "cancelled"
+            assert "failureCode" not in result
+        await owner.close()
 
     asyncio.run(run())

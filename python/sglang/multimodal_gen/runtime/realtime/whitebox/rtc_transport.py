@@ -15,7 +15,7 @@ from collections import deque
 
 import msgspec
 
-from .diagnostics import WhiteboxDiagnostic
+from .diagnostics import WhiteboxDiagnostic, public_error
 from .opening_presentation import OpeningPresentationOffers
 from .render_contract import RenderError
 from .rooms import new_id
@@ -504,15 +504,16 @@ class RTCSubscription:
                     pass  # Expire unsubmitted AUs even if both producers are idle.
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as error:
             self.media_failed = True
+            failure = WhiteboxDiagnostic("RTC_MEDIA_STALLED", "transport")
+            failure.upstream_code = getattr(error, "upstream_code", None)
             self.offer_control(
-                {
-                    "type": "error",
-                    "code": "RTC_MEDIA_STALLED",
-                    "content": "The video connection could not keep up. Please reconnect.",
-                    "reconnectable": True,
-                }
+                dict(
+                    type="error",
+                    **public_error(failure, getattr(self.owner, "trace_id", None)),
+                    reconnectable=True,
+                )
             )
         finally:
             for task in self.handoffs:

@@ -43,6 +43,27 @@ PUBLIC_STARTUP_FAILURE_CODES = frozenset(
     }
 )
 
+PUBLIC_RUNTIME_FAILURE_CODES = frozenset(
+    {
+        "PLAYER_IDLE_TIMEOUT",
+        "RECONNECT_EXPIRED",
+        "RTC_MEDIA_STALLED",
+        "RTC_CONNECTION_FAILED",
+        "SOURCE_FRAME_TIMEOUT",
+        "MODEL_CONTEXT_RECOVERY_UNAVAILABLE",
+        "MODEL_CONTEXT_RECOVERY_EXPIRED",
+        "MODEL_PREPARATION_FAILED",
+        "MODEL_FAILED",
+        "MODEL_STARTUP_TIMEOUT",
+        "CLI_STARTUP_FAILED",
+        "STREAM_STARTUP_FAILED",
+        "ROOM_PIPELINE_FAILED",
+    }
+)
+PUBLIC_SINGLE_PLAYER_FAILURE_CODES = (
+    PUBLIC_STARTUP_FAILURE_CODES | PUBLIC_RUNTIME_FAILURE_CODES
+)
+
 ACTIONS = {"start", "getOperation", "getAttachment", "close"}
 RETENTION = 7 * 86400
 TERMINAL_STATES = {"cancelled", "failed", "expired", "lost"}
@@ -196,8 +217,7 @@ class SinglePlayerControl:
         if (
             row
             and result["state"] == "failed"
-            and row.get("failureCode")
-            in PUBLIC_STARTUP_FAILURE_CODES | {"PLAYER_IDLE_TIMEOUT"}
+            and row.get("failureCode") in PUBLIC_SINGLE_PLAYER_FAILURE_CODES
         ):
             result["failureCode"] = row["failureCode"]
         return result
@@ -324,15 +344,17 @@ class SinglePlayerControl:
             code = getattr(error, "code", None)
             failure = (
                 {"failureCode": code}
-                if isinstance(code, str) and code in PUBLIC_STARTUP_FAILURE_CODES
+                if isinstance(code, str) and code in PUBLIC_SINGLE_PLAYER_FAILURE_CODES
                 else {}
             )
             await self._update(
                 key,
                 lambda row: row.update(
-                    state="cancelled"
-                    if row["state"] in {"cancelling", "cancelled"}
-                    else "failed",
+                    state=(
+                        "cancelled"
+                        if row["state"] in {"cancelling", "cancelled"}
+                        else "failed"
+                    ),
                     **failure,
                 ),
             )

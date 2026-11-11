@@ -34,6 +34,10 @@ def _emit_player_failure(event):
 
 
 MESSAGES = {
+    "SOURCE_FRAME_TIMEOUT": "The world source stopped producing frames for 15 seconds. Please restart the session.",
+    "RECONNECT_EXPIRED": "The play session ended after waiting for the client connection to recover.",
+    "MODEL_CONTEXT_RECOVERY_UNAVAILABLE": "The world source stopped because model context recovery was unavailable.",
+    "MODEL_CONTEXT_RECOVERY_EXPIRED": "The world source did not reconnect within the model context recovery window.",
     "ARCHIVE_CAPACITY_UNAVAILABLE": "Recording is temporarily unavailable. Please try again shortly.",
     "CONTROL_QUEUE_FULL": "Game controls are arriving too quickly. Please reconnect and try again.",
     "INVALID_CONTROL_MESSAGE": "A game control could not be processed. Please check the client controls before reconnecting.",
@@ -110,10 +114,19 @@ def public_error(error, trace_id, *, default="ROOM_SESSION_LOST", stage="source"
 
     from .render_contract import MESSAGES as RENDER_MESSAGES
 
+    raw_code = getattr(error, "code", None)
+    upstream_code = getattr(error, "upstream_code", None)
     code = getattr(error, "code", getattr(error, "reason", default))
     if not isinstance(code, str) or (
         code not in MESSAGES and code not in RENDER_MESSAGES
     ):
+        if (
+            upstream_code is None
+            and isinstance(raw_code, str)
+            and re.fullmatch(r"[A-Z][A-Z0-9_.:-]{0,95}", raw_code)
+            and raw_code != default
+        ):
+            upstream_code = raw_code
         code = default
     phase = getattr(error, "stage", None) or (
         "admission"
@@ -138,7 +151,6 @@ def public_error(error, trace_id, *, default="ROOM_SESSION_LOST", stage="source"
         ),
     )
 
-    upstream_code = getattr(error, "upstream_code", None)
     if isinstance(upstream_code, str) and re.fullmatch(
         r"[A-Za-z][A-Za-z0-9_.:-]{0,95}", upstream_code
     ):
@@ -176,9 +188,11 @@ def model_error(message, *, trace_id, operation, code="MODEL_FAILED"):
         trace_id,
         operation,
         error.upstream_code,
-        peer.get("type", "unknown")[:128]
-        if isinstance(peer.get("type", "unknown"), str)
-        else "invalid",
+        (
+            peer.get("type", "unknown")[:128]
+            if isinstance(peer.get("type", "unknown"), str)
+            else "invalid"
+        ),
         detail[:2048] if isinstance(detail, str) else None,
     )
     return error
@@ -246,10 +260,12 @@ def log_player_failure(
         def failure(value, depth=0):
             value_code = getattr(value, "code", None) or getattr(value, "reason", None)
             result = {
-                "code": value_code
-                if isinstance(value_code, str)
-                and re.fullmatch(r"[A-Z][A-Z0-9_]{1,95}", value_code)
-                else "UNCLASSIFIED_FAILURE",
+                "code": (
+                    value_code
+                    if isinstance(value_code, str)
+                    and re.fullmatch(r"[A-Z][A-Z0-9_]{1,95}", value_code)
+                    else "UNCLASSIFIED_FAILURE"
+                ),
                 "type": type(value).__name__,
             }
             cause = getattr(value, "__cause__", None)
