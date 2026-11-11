@@ -202,7 +202,7 @@ class ZingH3Codecs(ZingH3MediaInput):
         else:
             model._progressive_encoder_weights = {}
 
-    def warmup_encoder(self):
+    def warmup_source_vae(self):
         """Warm prepared source tile kernels before the caller advertises ready."""
         model = self.modules["video_vae"]
         layouts = getattr(model, "_progressive_encoder_layouts", None)

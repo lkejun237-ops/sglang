@@ -24,9 +24,9 @@ channels-last 通常有利于支持它的 cuDNN Conv3d，特别是低精度卷�
 
 普通 diffusion 服务使用 `--warmup-mode server` 在启动时执行合成请求，`--warmup-mode request` 在首个真实请求前插入预热，`off` 关闭通用请求预热；`--enable-torch-compile` 在未指定模式时默认选择 server。入口是 `server_warmup.py` 与 `warmup_request_builder.py`。
 
-当前 realtime adapter（包含 Zing）被 `should_run_synthetic_server_warmup` 排除，通用合成请求不覆盖 source 会话。本 PR 将权重准备与执行预热拆开：`prepare_visual_encoder_weights()` 只准备精度、权重副本和布局策略；`warmup_encoder()` 使用临时 replicated cache 预热默认 tile 的 1／8 帧，在 finally 中清理缓存，成功后同步 CUDA。
+当前 realtime adapter（包含 Zing）被 `should_run_synthetic_server_warmup` 排除，通用合成请求不覆盖 source 会话。本 PR 将权重准备与执行预热拆开：`prepare_visual_encoder_weights()` 只准备精度、权重副本和布局策略；`warmup_source_vae()` 使用临时 replicated cache 预热默认 tile 的 1／8 帧，在 finally 中清理缓存，成功后同步 CUDA。
 
-独立 Encoder worker 的顺序是 `load_encoder → warmup_encoder → 绑定控制端口 → startup rank 协商 → encoder_service_ready`。预热异常沿已有启动失败路径传播，各 rank 不宣告 ready；完整模型 stage 也显式调用同一方法，保留原有预热行为。这段组件预热不受通用 `--warmup-mode` 控制，也不保证覆盖所有运行时形状；它尚未接入 SGLang disaggregation role 的通用生命周期。
+独立 Encoder worker 的顺序是 `load_encoder → warmup_source_vae → 绑定控制端口 → startup rank 协商 → encoder_service_ready`。预热异常沿已有启动失败路径传播，各 rank 不宣告 ready；完整模型 stage 也显式调用同一方法，保留原有预热行为。这段组件预热不受通用 `--warmup-mode` 控制，也不保证覆盖所有运行时形状；它尚未接入 SGLang disaggregation role 的通用生命周期。
 
 ## 验证标准与当前限制
 

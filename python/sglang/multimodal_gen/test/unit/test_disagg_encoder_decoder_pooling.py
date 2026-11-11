@@ -421,6 +421,9 @@ def _run_decoder_worker_script(commands, *, max_sessions: int = 2, service_cls=N
     )
     namespace = dict(
         __doc__="test",
+        __name__="sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.decoder_worker",
+        __package__="sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3",
+        diagnostic_print=lambda *a, **kw: None,
         argparse=SimpleNamespace(
             ArgumentParser=lambda **kw: SimpleNamespace(
                 add_argument=lambda *a, **k: None, parse_args=lambda: args
@@ -466,6 +469,11 @@ def _run_decoder_worker_script(commands, *, max_sessions: int = 2, service_cls=N
         compile(ast.Module(body=[main], type_ignores=[]), str(path), "exec"), namespace
     )
     with (
+        # This harness replaces model loading with None and tests transport
+        # ownership. The real startup decode is covered by codec warmup tests.
+        patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.codec_warmup.warmup_decoder"
+        ) as warmup,
         patch(
             "sglang.multimodal_gen.runtime.realtime.worker_services.ServiceCommandSockets",
             lambda *args, **kwargs: socket,
@@ -473,6 +481,10 @@ def _run_decoder_worker_script(commands, *, max_sessions: int = 2, service_cls=N
         pytest.raises(_LoopExit),
     ):
         namespace["main"]()
+    warmup.assert_called_once()
+    assert warmup.call_args.args == (None,)
+    assert warmup.call_args.kwargs["group"] is None
+    assert callable(warmup.call_args.kwargs["agree"])
     return replies, tcp_store_ports, services_created
 
 
@@ -814,6 +826,8 @@ def _run_encoder_worker_script(
         EncoderCommandControl=control.EncoderCommandControl,
         EncoderControlError=control.EncoderControlError,
         logging=logging,
+        diagnostic_print=lambda *a, **kw: None,
+        prepare_static_gc=lambda *a, **kw: None,
         abort_owner=recovery.abort_owner,
         math=__import__("math"),
         trace_for_ids=lambda *a, **kw: None,
@@ -852,7 +866,7 @@ def _run_encoder_worker_script(
         timedelta=timedelta,
         load_encoder=lambda root: SimpleNamespace(
             modules={"video_vae": object()},
-            warmup_encoder=lambda: None,
+            warmup_source_vae=lambda: None,
             runtime={
                 "vae_config": {"encode_mode": "performance", "encode_dtype": "bfloat16"}
             },

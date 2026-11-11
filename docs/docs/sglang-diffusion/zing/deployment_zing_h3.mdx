@@ -8,6 +8,36 @@ description: "供 Codex 与部署同学使用的 H100/H200/B300 部署决策、�
 下面是已有部署经验，只有对应版本、输入和配置的实测结论；
 实验补丁、显存快照、未验收画质均单独标注。新部署先选择一行，再沿证据入口取得原配置。
 
+## 独立 Worker 启动预热（2026-11-11，Encoder / DiT SP2 / Decoder 启动验证通过）
+
+基于 main `2dfb1aa538`：Encoder 在已有 Source VAE 预热后执行一次无参考图的 Qwen 文本编码；
+DiT 在本地回放一个 832×480、T=1 的模拟 source 输入与 EOS，执行当前部署配置的完整去噪流程；
+Decoder 独立解码一个同尺寸的模拟 latent。各角色复用已加载模型，在预热完成后进入就绪状态，
+不需要角色间建组或录制数据。Encoder 按单 service 运行；Decoder 的多个 service 共享一次模型预热，DiT 的全部 SP ranks 一起执行。
+
+预热请求结束后归还请求占用的 KV 槽位、关闭解码 stream；模型权重、静态资源池与已编译算子继续驻留。
+仅覆盖这次最小请求，不代表其他分辨率、DiT 常规 T=3/2 或 Decoder 后续历史阶段的编译形状均已预热。
+`2fbc947957` 在上海 H100 单卡、1027 AR+DMD step10000、Qwen FP8、PyTorch 2.13/CUDA 13.0 下完成一次
+Encoder 启动验证：Source VAE 的 256×256、1/8 帧各执行一次，Qwen 无参考图文本编码一次，输出 `[6,5120]`；
+`/health` 在预热完成后由 503 转为 200。观察到预热约 34.05 秒（Source VAE 9.97 秒、Qwen 24.08 秒），
+包含调用观察与首次编译开销，不是同条件性能比较。进程退出码 0，测试卡驱动显存归零、无计算进程，临时 Pod/凭据已清理。
+原始回执与日志：`oss://leap-world-shanghai/world-model/benchmarks/encoder-warmup/2fbc9479573f886eec36d0fae3ef752b236ee75e/r4/results.tar.gz`。
+`f4ac723de2` 在同一 H100 型号与模型资产下完成 Decoder 启动验证：一个模型进程启动三个 service，
+共享一次 Lynn BF16 解码预热；输入 latent `[1,24,1,30,52]`，输出有限值 RGB `[1,3,1,480,832]`。
+三个 service 均在预热完成后从 503 转为 200，stream 已关闭并释放状态。观察耗时约 9.21 秒，
+包含调用观察与首次编译开销，不是性能比较。测试控制中断后进程退出码 0，测试卡显存归零、无计算进程，临时 Pod/凭据已清理。
+原始回执与日志：`oss://leap-world-shanghai/world-model/benchmarks/decoder-warmup/f4ac723de2085bbc2dc1d1b2a73e7294f8c41d45/r1/results.tar.gz`。
+`028c2db3b6` 在上海双 H100 上以 1027 AR+DMD step10000、BF16、SP2、W6/S3、静态显存比例 0.85
+和历史 `weights_free` AdaLN 配方通过启动验证。离线表与 22 个 checkpoint 分片的 SHA256 全部匹配。
+两个 rank 均完成 832×480、T=1 预热，输出各一个有限值 latent `[1,24,1,30,52]`，释放请求及 KV 槽位，
+`/health` 在两个 rank 完成后从 503 转为 200。观察耗时约 61.69 秒，包含首次算子编译和观测开销。
+测试控制中断后两个 rank 与 launcher 均退出 0。退出时日志有 CUDA IPC 张量释放警告，随后核实两卡均为 0 MiB、
+无计算进程，临时 Pod 和凭据已清理。此前误用 `resident` AdaLN 的两轮均在权重加载时 OOM，未进入预热。
+原始回执、配置及日志：`oss://leap-world-shanghai/world-model/benchmarks/dit-warmup/028c2db3b60d26f3f5153ffaabaf58901501cd0c/r3/results.tar.gz`。
+本轮未测同条件 baseline、480/736 全链路性能及三角色分项耗时、
+常驻与峰值显存；上述启动验证不代表首请求性能收益。
+后续验证沿用 [benchmark 入口](https://github.com/seedleap/sglang/blob/main/benchmark/zing_h3_causal/CLIENT_BENCHMARK.md)，并检查预热后的首个正常请求及其资源释放。
+
 ## Whitebox 自适应、录制与清理整合验证（2026-11-10）
 
 上海副本以 `412589f5` / SDK `4c10ad26` 完整镜像验证自适应供帧、有界PI、模型输入录制与

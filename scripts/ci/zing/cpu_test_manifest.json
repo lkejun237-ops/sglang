@@ -7,6 +7,108 @@
   },
   "tests": [
     {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_codec_warmup.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two pinned Linux CPU trials completed with exact source and JUnit coverage.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "f3cbca37600b1b04fcfcd9db0fdbfcec04b14c9d1782236570256d3cc6f05f3d",
+        "tested_head": "72e39a6a6028e72349f1885ca32dc1d7480ede4f",
+        "receipt": "dit-pipeline-contracts/receipt.json",
+        "receipt_sha256": "eea2e594c8382e636b7704c270b6cc401b32b2f101e1b11d692713151fa52955",
+        "workflow_run": "https://github.com/seedleap/sglang/actions/runs/43008628126",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 11,
+            "collected": 11,
+            "skipped": 0,
+            "duration_seconds": 34.43507803999999,
+            "exit_code": 0,
+            "log_path": "dit-pipeline-contracts/cpu-0-trial-1.log",
+            "junit_path": "dit-pipeline-contracts/cpu-0-trial-1.xml",
+            "log_sha256": "cd7ea8c7ceea6eec55417aa3ca05f743351370e387e1be64a99bf1c4975398dd",
+            "junit_sha256": "4813f081b5eaa650c3135c2017b6520f193fbc956f414847cfaea61ae8687167"
+          },
+          {
+            "trial": 2,
+            "passed": 11,
+            "collected": 11,
+            "skipped": 0,
+            "duration_seconds": 12.192437205999965,
+            "exit_code": 0,
+            "log_path": "dit-pipeline-contracts/cpu-0-trial-2.log",
+            "junit_path": "dit-pipeline-contracts/cpu-0-trial-2.xml",
+            "log_sha256": "db0c14b34f877c15295bde33e16c2ea64e25a18768292e76f11d2abbf37564f7",
+            "junit_sha256": "fe45accd38606b9f46c065ae89a4f7753ea500affe6054e20d94e81c65e588a8"
+          }
+        ],
+        "environment": {
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
+        },
+        "manifest_sha256": "19aac99d7f9e7e3075f075da9f4832c3166e9f79bb3a4efcf00998e3182ce448"
+      }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_dit_startup_warmup.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two pinned Linux CPU trials completed with exact source and JUnit coverage.",
+      "dependencies": [
+        "python/sglang/multimodal_gen/test/unit/test_zing_h3_model.py"
+      ],
+      "trial_evidence": {
+        "source_sha256": "0d652e8a8b1ac16eec37db53829ee557196859f8c8fdeb09b7de7025d6481ce4",
+        "tested_head": "72e39a6a6028e72349f1885ca32dc1d7480ede4f",
+        "receipt": "dit-pipeline-contracts/receipt.json",
+        "receipt_sha256": "eea2e594c8382e636b7704c270b6cc401b32b2f101e1b11d692713151fa52955",
+        "workflow_run": "https://github.com/seedleap/sglang/actions/runs/43008628126",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 7,
+            "collected": 7,
+            "skipped": 0,
+            "duration_seconds": 13.205319873999997,
+            "exit_code": 0,
+            "log_path": "dit-pipeline-contracts/cpu-1-trial-1.log",
+            "junit_path": "dit-pipeline-contracts/cpu-1-trial-1.xml",
+            "log_sha256": "05480cc55694b346e35b4e132fe14990e06f5436eb6c0369c61968aaccb10671",
+            "junit_sha256": "141a34e2b7ba1e78622fda6cfd30b05134030768109b79e62c928997ed736060"
+          },
+          {
+            "trial": 2,
+            "passed": 7,
+            "collected": 7,
+            "skipped": 0,
+            "duration_seconds": 12.762938863000045,
+            "exit_code": 0,
+            "log_path": "dit-pipeline-contracts/cpu-1-trial-2.log",
+            "junit_path": "dit-pipeline-contracts/cpu-1-trial-2.xml",
+            "log_sha256": "0ddd5729804387cc7e1f24202ddbb833ae85641a942556c7c7b1a329b6fc0508",
+            "junit_sha256": "e16f8c12e2c98962f9b8ae7d6e7fbe092dcb6444dddef1b42321abd232002410"
+          }
+        ],
+        "environment": {
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
+        },
+        "manifest_sha256": "19aac99d7f9e7e3075f075da9f4832c3166e9f79bb3a4efcf00998e3182ce448"
+      }
+    },
+    {
       "path": "benchmark/zing_h3_causal/issue269/tests/test_audit_historical.py",
       "suite": "benchmark-contracts",
       "status": "CPU_PASS",
@@ -4469,67 +4571,45 @@
       "sources": [
         "main"
       ],
-      "reason": "Two complete Linux CPU trials passed for this test source after white_box/main integration; only explicit CUDA-only skips remain.",
+      "reason": "Two pinned Linux CPU trials completed with exact source and JUnit coverage.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "8c10c6d5719ea6c9b4e62f24060a348aac571f0d42c3b5009fc9a74bfc2439d6",
-        "tested_head": "0dc02e326b469b02d2bd30ed5d958ac2af2afbd1",
-        "receipt": "/Users/kejun/.codex/tmp/merge-main-whitebox-thailand-20261108/cpu-evidence-r4/ordinary-r4-ceac/receipt.json",
-        "receipt_sha256": "f844b079efd24267f131786c9eed3096e04147b532cd8a4c9641fb7808222975",
-        "archive": "oss://leap-world-shanghai/world-model/whitebox-releases/main-whitebox-thailand-20261108/cpu-evidence-r4.tgz",
-        "archive_sha256": "11efe6006cfa80fabbe00010af416548ce7bc9ab42a1250f0d6df7601e9062f9",
+        "source_sha256": "2a809ec39890053e2dab672cbc069ef181a69c350f60a6767242be9d143f1412",
+        "tested_head": "72e39a6a6028e72349f1885ca32dc1d7480ede4f",
+        "receipt": "realtime-contracts/receipt.json",
+        "receipt_sha256": "559aca470200da60fe1fc9053a09cf9994eb879cb87140b2fd346375d2c7d2a5",
+        "workflow_run": "https://github.com/seedleap/sglang/actions/runs/43008628126",
         "trials": [
           {
             "trial": 1,
-            "passed": 46,
-            "collected": 46,
+            "passed": 48,
+            "collected": 48,
             "skipped": 0,
-            "duration_seconds": 11.273851028003264,
+            "duration_seconds": 13.602863664999973,
             "exit_code": 0,
-            "log_path": "ordinary-r4-ceac/cpu-2-trial-1.log",
-            "junit_path": "ordinary-r4-ceac/cpu-2-trial-1.xml",
-            "log_sha256": "33638579d48cf7f90652b65fa41ea65bebe2965a8062f7fc9cd18915b705195d",
-            "junit_sha256": "36425fdba95051e310fe4f1cd344f7aec2b892404e05249cacb8bd3d0b73a988"
+            "log_path": "realtime-contracts/cpu-0-trial-1.log",
+            "junit_path": "realtime-contracts/cpu-0-trial-1.xml",
+            "log_sha256": "a648c7c061e3f35184b5e9fd698378e8d0ab8247bfce679c0dce404aa0f3f176",
+            "junit_sha256": "300254fb09faf17a37f62d16dd9d61424ffc3d87e53ec08d7fff6167d2a32314"
           },
           {
             "trial": 2,
-            "passed": 46,
-            "collected": 46,
+            "passed": 48,
+            "collected": 48,
             "skipped": 0,
-            "duration_seconds": 11.49620308401063,
+            "duration_seconds": 12.756554067999957,
             "exit_code": 0,
-            "log_path": "ordinary-r4-ceac/cpu-2-trial-2.log",
-            "junit_path": "ordinary-r4-ceac/cpu-2-trial-2.xml",
-            "log_sha256": "45cb793094047df6ae83cd767f00357bf5f14c05f16e8316854db00f141d69a4",
-            "junit_sha256": "76f1e31fa4074cd256d92fb7cce1dfac6bdd74a6daed38b607269bb6faa86073"
+            "log_path": "realtime-contracts/cpu-0-trial-2.log",
+            "junit_path": "realtime-contracts/cpu-0-trial-2.xml",
+            "log_sha256": "575bb9e314e6db6bd488f7fe82b55eaf111c314bc9b5f45e2ff53edfd79079ae",
+            "junit_sha256": "7537c330f49cb9fb4b056a022928717ecd428dfaed549fa06d587cf28a7d2a1b"
           }
         ],
         "environment": {
-          "python": "3.11.14",
-          "platform": "Linux-5.10.134-19.8.al8.x86_64-x86_64-with-glibc2.39"
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
         },
-        "manifest_sha256": "39297100e5a6269f8c19f428c15f6cd0c564b23aa2d9875cd1d6d9dc29c34677",
-        "tooling_sha256": {
-          "check_python.py": "edced74edc439191f8ff97373e71fbb50d1469cff016c7163f0cb80d93ede73b",
-          "check_room_init.py": "d60e4851901eb5e0bfac7e78b7618fcc483616707a90b1cf135787bff00935d3",
-          "common.py": "52128fc66405da6918eecb98a73d76f322aa3fbe6fec9b55c0a3ff9924cb8f4b",
-          "prepare_media_tooling.py": "27dcceabd6c24076929108bc9c72431a64a22764a770cc222049619ec6912139",
-          "run_area_tests.py": "b3b4feead224895cf66df953faea5c3c98ec095e165bba1180b87d10c494a3f2",
-          "run_cpu_tests.py": "f5981aec18cde4485454b14e473453533fd57bc98aa1af8631fc9148c3be479f",
-          "run_prefill_tests.py": "2e283c138b1ad5fa606df9db2658677779505173987b6a09ea52547c4ed6f489",
-          "run_role_pool_tests.py": "2061f12b5ea32240f96579d55f408673f779bf1d3df84a162b12b641f0091d90",
-          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
-          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
-          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
-          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
-        },
-        "environment_recipe": {
-          "python_version": "3.11",
-          "requirements_sha256": {
-            "scripts/ci/zing/requirements-cpu.txt": "5b4b5a6b39bc8d729acbc53612527e881e24202c706f960773d6c8cf83014f48",
-            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
-          }
-        }
+        "manifest_sha256": "19aac99d7f9e7e3075f075da9f4832c3166e9f79bb3a4efcf00998e3182ce448"
       }
     },
     {
@@ -5015,67 +5095,45 @@
       "sources": [
         "main"
       ],
-      "reason": "Two complete Linux CPU trials passed for this test source after white_box/main integration; only explicit CUDA-only skips remain.",
+      "reason": "Two pinned Linux CPU trials completed with exact source and JUnit coverage.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "f134f2202d8a8330b55a7ed2944212baebf3157989e28140886cef7d070e27c3",
-        "tested_head": "0dc02e326b469b02d2bd30ed5d958ac2af2afbd1",
-        "receipt": "/Users/kejun/.codex/tmp/merge-main-whitebox-thailand-20261108/cpu-evidence-r4/ordinary-r4-ceac/receipt.json",
-        "receipt_sha256": "f844b079efd24267f131786c9eed3096e04147b532cd8a4c9641fb7808222975",
-        "archive": "oss://leap-world-shanghai/world-model/whitebox-releases/main-whitebox-thailand-20261108/cpu-evidence-r4.tgz",
-        "archive_sha256": "11efe6006cfa80fabbe00010af416548ce7bc9ab42a1250f0d6df7601e9062f9",
+        "source_sha256": "c7e0bd03712c53fe0327e8b87a8c06d17bd1e691ffd9e64bf7ea2b7967ee1117",
+        "tested_head": "72e39a6a6028e72349f1885ca32dc1d7480ede4f",
+        "receipt": "dit-pipeline-contracts/receipt.json",
+        "receipt_sha256": "eea2e594c8382e636b7704c270b6cc401b32b2f101e1b11d692713151fa52955",
+        "workflow_run": "https://github.com/seedleap/sglang/actions/runs/43008628126",
         "trials": [
           {
             "trial": 1,
             "passed": 31,
             "collected": 48,
             "skipped": 17,
-            "duration_seconds": 62.103529423009604,
+            "duration_seconds": 98.041364332,
             "exit_code": 0,
-            "log_path": "ordinary-r4-ceac/cpu-3-trial-1.log",
-            "junit_path": "ordinary-r4-ceac/cpu-3-trial-1.xml",
-            "log_sha256": "63ce774a78f8d3923687358b47fbece3e955926ad0f49013b6169d28959866b2",
-            "junit_sha256": "b4cefc3ac4ea7229a018f0b9cd8791037d2c51f4866e9b9bd704b0566f59e958"
+            "log_path": "dit-pipeline-contracts/cpu-2-trial-1.log",
+            "junit_path": "dit-pipeline-contracts/cpu-2-trial-1.xml",
+            "log_sha256": "3b7ae65f988913b79a49fd67298da8fd604b605328e839258025e98a3d516378",
+            "junit_sha256": "5ab8ea2b14073bed2726bd607fb38ed1fa6c4405d854f6aec24050d00210dee2"
           },
           {
             "trial": 2,
             "passed": 31,
             "collected": 48,
             "skipped": 17,
-            "duration_seconds": 60.917569700977765,
+            "duration_seconds": 97.58327995899998,
             "exit_code": 0,
-            "log_path": "ordinary-r4-ceac/cpu-3-trial-2.log",
-            "junit_path": "ordinary-r4-ceac/cpu-3-trial-2.xml",
-            "log_sha256": "633baf43c62635f9c66de2a3e8c2bcadfdc793dd00bee593083c0a352daad42c",
-            "junit_sha256": "531aa651c6784e7eacb7e24e46edffd8f56ddb6f7e26f4f8a47d2b0275b39fe0"
+            "log_path": "dit-pipeline-contracts/cpu-2-trial-2.log",
+            "junit_path": "dit-pipeline-contracts/cpu-2-trial-2.xml",
+            "log_sha256": "c29fefd853c89fec153c71362d5000bb2dffcd56102099bc2a45f8f6feacb05d",
+            "junit_sha256": "6115574eca6ae8894e5d0ef6d7d0d4aa5b1345f43d7c6bacf192fe471546b01d"
           }
         ],
         "environment": {
-          "python": "3.11.14",
-          "platform": "Linux-5.10.134-19.8.al8.x86_64-x86_64-with-glibc2.39"
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
         },
-        "manifest_sha256": "39297100e5a6269f8c19f428c15f6cd0c564b23aa2d9875cd1d6d9dc29c34677",
-        "tooling_sha256": {
-          "check_python.py": "edced74edc439191f8ff97373e71fbb50d1469cff016c7163f0cb80d93ede73b",
-          "check_room_init.py": "d60e4851901eb5e0bfac7e78b7618fcc483616707a90b1cf135787bff00935d3",
-          "common.py": "52128fc66405da6918eecb98a73d76f322aa3fbe6fec9b55c0a3ff9924cb8f4b",
-          "prepare_media_tooling.py": "27dcceabd6c24076929108bc9c72431a64a22764a770cc222049619ec6912139",
-          "run_area_tests.py": "b3b4feead224895cf66df953faea5c3c98ec095e165bba1180b87d10c494a3f2",
-          "run_cpu_tests.py": "f5981aec18cde4485454b14e473453533fd57bc98aa1af8631fc9148c3be479f",
-          "run_prefill_tests.py": "2e283c138b1ad5fa606df9db2658677779505173987b6a09ea52547c4ed6f489",
-          "run_role_pool_tests.py": "2061f12b5ea32240f96579d55f408673f779bf1d3df84a162b12b641f0091d90",
-          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
-          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
-          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
-          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
-        },
-        "environment_recipe": {
-          "python_version": "3.11",
-          "requirements_sha256": {
-            "scripts/ci/zing/requirements-cpu.txt": "5b4b5a6b39bc8d729acbc53612527e881e24202c706f960773d6c8cf83014f48",
-            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
-          }
-        }
+        "manifest_sha256": "19aac99d7f9e7e3075f075da9f4832c3166e9f79bb3a4efcf00998e3182ce448"
       }
     },
     {
@@ -6283,62 +6341,47 @@
       "sources": [
         "main"
       ],
-      "reason": "Layout strategies and explicit warmup-before-ready admission tests passed two fresh Linux Python 3.11 / pinned CPU-recipe trials; source hashes, complete case identities and JUnit checked; no skips.",
+      "reason": "Two pinned Linux CPU trials completed with exact source and JUnit coverage.",
       "dependencies": [
         "python/sglang/multimodal_gen/test/unit/test_zing_h3_progressive_kernel.py"
       ],
       "trial_evidence": {
-        "source_sha256": "207d0d7ff22729363fa72d68d520e48a09d7438dfab86257acc763af76b32e55",
-        "receipt": "oss://leap-worldmodel-thailand-single-az/world-model/sglang/evals/encoder-warmup-strategy-20261022-r1/readback/triage/receipt.json",
-        "receipt_sha256": "824979d9eaae66042432fb1853570d4923d0642388bde4cf72f2c5e3cbbe8aa9",
+        "source_sha256": "19807b6513e9e6d4bbad7cc2337b9a0493c899b989f0b48d1b4aa742b5260bd2",
+        "tested_head": "72e39a6a6028e72349f1885ca32dc1d7480ede4f",
+        "receipt": "dit-pipeline-contracts/receipt.json",
+        "receipt_sha256": "eea2e594c8382e636b7704c270b6cc401b32b2f101e1b11d692713151fa52955",
+        "workflow_run": "https://github.com/seedleap/sglang/actions/runs/43008628126",
         "trials": [
           {
             "trial": 1,
             "passed": 67,
             "collected": 67,
             "skipped": 0,
-            "duration_seconds": 32.986101538000014,
+            "duration_seconds": 15.798670299000037,
             "exit_code": 0,
-            "log_path": "/mnt/oss/world-model/sglang/evals/encoder-warmup-strategy-20261022-r1/readback/triage/cpu-1-trial-1.log",
-            "junit_path": "/mnt/oss/world-model/sglang/evals/encoder-warmup-strategy-20261022-r1/readback/triage/cpu-1-trial-1.xml"
+            "log_path": "dit-pipeline-contracts/cpu-3-trial-1.log",
+            "junit_path": "dit-pipeline-contracts/cpu-3-trial-1.xml",
+            "log_sha256": "ac45a7f690411118824234523f0d9e8d49f001174cc0ddd30cd47bc42fb34288",
+            "junit_sha256": "aabee9ab4bced1b7dbabff28f8f7b226f982449a9ea2e8d0e5c7f5eace278eb4"
           },
           {
             "trial": 2,
             "passed": 67,
             "collected": 67,
             "skipped": 0,
-            "duration_seconds": 23.664497998,
+            "duration_seconds": 15.910032833999992,
             "exit_code": 0,
-            "log_path": "/mnt/oss/world-model/sglang/evals/encoder-warmup-strategy-20261022-r1/readback/triage/cpu-1-trial-2.log",
-            "junit_path": "/mnt/oss/world-model/sglang/evals/encoder-warmup-strategy-20261022-r1/readback/triage/cpu-1-trial-2.xml"
+            "log_path": "dit-pipeline-contracts/cpu-3-trial-2.log",
+            "junit_path": "dit-pipeline-contracts/cpu-3-trial-2.xml",
+            "log_sha256": "9a4412ca12184b26f3a06c9ecfc60cf153e505ca32400a9e8a37a35096e9c638",
+            "junit_sha256": "486c4326882fa0461f56149a86eccf3fc962b8916942b36947497940c42ca4ec"
           }
         ],
         "environment": {
-          "python": "3.11.16",
-          "platform": "Linux-6.6.102-001.8.100.kangaroo.al8.x86_64-x86_64-with-glibc2.39"
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
         },
-        "environment_recipe": {
-          "python_version": "3.11",
-          "requirements_sha256": {
-            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
-            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
-          }
-        },
-        "manifest_sha256": "411747a2acadccca5a215472bd20f951165a572b42fb7d2dd334c84f76d6eb00",
-        "tooling_sha256": {
-          "check_python.py": "edced74edc439191f8ff97373e71fbb50d1469cff016c7163f0cb80d93ede73b",
-          "common.py": "52128fc66405da6918eecb98a73d76f322aa3fbe6fec9b55c0a3ff9924cb8f4b",
-          "run_cpu_tests.py": "a06607bb9ba3734c605194d274c9dc35b2b52555470b912b9af69bc18ccdb60d",
-          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
-          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
-          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
-          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
-        },
-        "job_id": "dlc19njci3xefe2v",
-        "source_snapshot_sha": "e109c3b5141d36a8efbf5f7a45a3db3af3949f93",
-        "checkout_sha": "3366e96b3669152d0e39f5163c7168fe912fe1cd",
-        "candidate_fingerprint": "6a469b99488d8a2cc7f43fce3d31be306037e0285b9fa73cdea91ca66a7b9f43",
-        "checkout_note": "Synthetic local Git snapshot of the frozen base archive; candidate overlays are identified by SOURCE.json and the receipt fingerprint."
+        "manifest_sha256": "19aac99d7f9e7e3075f075da9f4832c3166e9f79bb3a4efcf00998e3182ce448"
       }
     },
     {
@@ -6410,67 +6453,45 @@
       "sources": [
         "main"
       ],
-      "reason": "Two complete Linux CPU trials passed for this test source after white_box/main integration; only explicit CUDA-only skips remain.",
+      "reason": "Two pinned Linux CPU trials completed with exact source and JUnit coverage.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "45ccf462031243e5c55c5c8d53f52797e678dd25d5917eb55bb8a5b7be2e5b8b",
-        "tested_head": "e5b50be82965ecfaa0c4209b9aac047f89ac8bfa",
-        "receipt": "/Users/kejun/.codex/tmp/merge-main-whitebox-thailand-20261108/cpu-evidence-r4/ordinary-r2-1/receipt.json",
-        "receipt_sha256": "cf23b1086e685354b401bbdc3dd6c9ce66be06922d0d186e929c638eebf5d508",
-        "archive": "oss://leap-world-shanghai/world-model/whitebox-releases/main-whitebox-thailand-20261108/cpu-evidence-r4.tgz",
-        "archive_sha256": "11efe6006cfa80fabbe00010af416548ce7bc9ab42a1250f0d6df7601e9062f9",
+        "source_sha256": "a859989e4e823424ab3b3f9c620a0479b0e475534c5b55cc9596b7ebd144947f",
+        "tested_head": "72e39a6a6028e72349f1885ca32dc1d7480ede4f",
+        "receipt": "dit-pipeline-contracts/receipt.json",
+        "receipt_sha256": "eea2e594c8382e636b7704c270b6cc401b32b2f101e1b11d692713151fa52955",
+        "workflow_run": "https://github.com/seedleap/sglang/actions/runs/43008628126",
         "trials": [
           {
             "trial": 1,
             "passed": 15,
             "collected": 15,
             "skipped": 0,
-            "duration_seconds": 10.069433477998246,
+            "duration_seconds": 12.184188436999989,
             "exit_code": 0,
-            "log_path": "ordinary-r2-1/cpu-39-trial-1.log",
-            "junit_path": "ordinary-r2-1/cpu-39-trial-1.xml",
-            "log_sha256": "2f5ecb265ec7b08679c96820c53af673663fea76a5db15fee0949791f1513a72",
-            "junit_sha256": "e4f8eee4562d5426bd273d88c6634fa5fa35d4ee73b148d4f651f3ce28298815"
+            "log_path": "dit-pipeline-contracts/cpu-4-trial-1.log",
+            "junit_path": "dit-pipeline-contracts/cpu-4-trial-1.xml",
+            "log_sha256": "f596c09485dc59afb57838951e04c835efdaf544fb7c35e4e1b7ade7fd8b6499",
+            "junit_sha256": "6f5bb2f1d3e692bd863c6fed49229a59bcb5e66e342dbc28bb6e15f20ea14bc2"
           },
           {
             "trial": 2,
             "passed": 15,
             "collected": 15,
             "skipped": 0,
-            "duration_seconds": 10.40907224098919,
+            "duration_seconds": 12.378527376000022,
             "exit_code": 0,
-            "log_path": "ordinary-r2-1/cpu-39-trial-2.log",
-            "junit_path": "ordinary-r2-1/cpu-39-trial-2.xml",
-            "log_sha256": "f65d2719b10d7aa078b2c343681e7434885e6e48a3c7d6612271b5e8cbc7c439",
-            "junit_sha256": "c94be06458c1ad7c95c57f37e8363a7864d7475d04dad9b548690085b995df12"
+            "log_path": "dit-pipeline-contracts/cpu-4-trial-2.log",
+            "junit_path": "dit-pipeline-contracts/cpu-4-trial-2.xml",
+            "log_sha256": "087dc2320949de64c3b43521f2c3a8f8ffd69b3b4228bfb6fb79ba33f9a853bf",
+            "junit_sha256": "c3c47d6ce399e7a7644a126dac10402530174a0d7f62685effcec2fd78acd032"
           }
         ],
         "environment": {
-          "python": "3.11.14",
-          "platform": "Linux-5.10.134-19.8.al8.x86_64-x86_64-with-glibc2.39"
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
         },
-        "manifest_sha256": "192f23c16420b9ed686e82d17a83c1cb41ae93842274fa2a2f9add04e1c221da",
-        "tooling_sha256": {
-          "check_python.py": "edced74edc439191f8ff97373e71fbb50d1469cff016c7163f0cb80d93ede73b",
-          "check_room_init.py": "d60e4851901eb5e0bfac7e78b7618fcc483616707a90b1cf135787bff00935d3",
-          "common.py": "52128fc66405da6918eecb98a73d76f322aa3fbe6fec9b55c0a3ff9924cb8f4b",
-          "prepare_media_tooling.py": "27dcceabd6c24076929108bc9c72431a64a22764a770cc222049619ec6912139",
-          "run_area_tests.py": "b3b4feead224895cf66df953faea5c3c98ec095e165bba1180b87d10c494a3f2",
-          "run_cpu_tests.py": "f5981aec18cde4485454b14e473453533fd57bc98aa1af8631fc9148c3be479f",
-          "run_prefill_tests.py": "2e283c138b1ad5fa606df9db2658677779505173987b6a09ea52547c4ed6f489",
-          "run_role_pool_tests.py": "2061f12b5ea32240f96579d55f408673f779bf1d3df84a162b12b641f0091d90",
-          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
-          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
-          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
-          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
-        },
-        "environment_recipe": {
-          "python_version": "3.11",
-          "requirements_sha256": {
-            "scripts/ci/zing/requirements-cpu.txt": "5b4b5a6b39bc8d729acbc53612527e881e24202c706f960773d6c8cf83014f48",
-            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
-          }
-        }
+        "manifest_sha256": "19aac99d7f9e7e3075f075da9f4832c3166e9f79bb3a4efcf00998e3182ce448"
       }
     },
     {
@@ -7492,50 +7513,45 @@
       "sources": [
         "main"
       ],
-      "reason": "Two fixed-environment DSW CPU trials on main 91da72b1af passed all 10 dedicated-decoder contracts as part of the composed 115-file Zing regression (5199 passed, 0 failed, 169 reviewed CUDA-only skips). The earlier pre-fix run failed only the successful-operation acknowledgement contract. GPU and distributed execution remain unverified.",
+      "reason": "Two pinned Linux CPU trials completed with exact source and JUnit coverage.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "9302de28338cafd487272a7f9e3dc480f60e4fef503b40fb49959133340fdb32",
-        "worker_sha256": "480f8d1380bc03af6907244c46b4ad32266538cebfdcd0573be635f300186639",
-        "receipt": "/cpfs/world-model/sglang/decoder-split/20261022-cpu-main91da72b1af/runs/final-round-2.json",
-        "receipt_sha256": "53c1bdb178f02ca3b4b9a25dd3b85f7d67dd5e3cb1882f0b99ee7bf26d378eda",
+        "source_sha256": "bebf982e568c27d05a80ab2d68baa12fee9b678137b166ccfe86772f5affee95",
+        "tested_head": "72e39a6a6028e72349f1885ca32dc1d7480ede4f",
+        "receipt": "dit-pipeline-contracts/receipt.json",
+        "receipt_sha256": "eea2e594c8382e636b7704c270b6cc401b32b2f101e1b11d692713151fa52955",
+        "workflow_run": "https://github.com/seedleap/sglang/actions/runs/43008628126",
         "trials": [
           {
             "trial": 1,
-            "passed": 10,
-            "collected": 10,
+            "passed": 24,
+            "collected": 24,
             "skipped": 0,
-            "duration_seconds": 20.903,
+            "duration_seconds": 14.244160519000047,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/decoder-split/20261022-cpu-main91da72b1af/runs/isolated-round-1/logs/dit-pipeline-contracts__python__sglang__multimodal_gen__test__unit__test_zing_h3_remote_decoder.log",
-            "junit_path": "/cpfs/world-model/sglang/decoder-split/20261022-cpu-main91da72b1af/runs/isolated-round-1/junit/dit-pipeline-contracts__python__sglang__multimodal_gen__test__unit__test_zing_h3_remote_decoder.xml"
+            "log_path": "dit-pipeline-contracts/cpu-5-trial-1.log",
+            "junit_path": "dit-pipeline-contracts/cpu-5-trial-1.xml",
+            "log_sha256": "92e35b929ab8dc3ec87a8b0953fd92b17f88a42cf5a40c85d681045c7ee3602d",
+            "junit_sha256": "63ce6f36b417a1fbc67cd743270a7820180bfba8716ab812993377a99669fa5d"
           },
           {
             "trial": 2,
-            "passed": 10,
-            "collected": 10,
+            "passed": 24,
+            "collected": 24,
             "skipped": 0,
-            "duration_seconds": 24.387,
+            "duration_seconds": 14.115048194999986,
             "exit_code": 0,
-            "log_path": "/cpfs/world-model/sglang/decoder-split/20261022-cpu-main91da72b1af/runs/ordinary-round-2/logs/dit-pipeline-contracts__python__sglang__multimodal_gen__test__unit__test_zing_h3_remote_decoder.log",
-            "junit_path": "/cpfs/world-model/sglang/decoder-split/20261022-cpu-main91da72b1af/runs/ordinary-round-2/junit/dit-pipeline-contracts__python__sglang__multimodal_gen__test__unit__test_zing_h3_remote_decoder.xml"
+            "log_path": "dit-pipeline-contracts/cpu-5-trial-2.log",
+            "junit_path": "dit-pipeline-contracts/cpu-5-trial-2.xml",
+            "log_sha256": "e76958f0513b921187137b3252f44be876125abfc238eec9b97cae98c2f3c532",
+            "junit_sha256": "f99c6a5f558264d97e7ca1182faab57c02d2dc93dc1f37572437e7587254be68"
           }
         ],
         "environment": {
-          "python": "3.11.12",
-          "torch": "2.8.0+cpu",
-          "extra_pythonpath": [
-            "/root/py311-extra",
-            "/root/py311-av"
-          ]
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
         },
-        "environment_recipe": {
-          "python_version": "3.11",
-          "requirements_sha256": {
-            "scripts/ci/zing/requirements-cpu.txt": "e7488543169e3aae555092aa59dcec39310ae6f458f5b21117fc1f31f910b3f5",
-            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
-          }
-        }
+        "manifest_sha256": "19aac99d7f9e7e3075f075da9f4832c3166e9f79bb3a4efcf00998e3182ce448"
       }
     },
     {
@@ -10542,42 +10558,45 @@
       "sources": [
         "main"
       ],
-      "reason": "Two fresh DSW Linux CPU conditioning-runner trials passed all nine cases after fixture bootstrap synchronization; exact pinned CI environment remains GitHub validation.",
+      "reason": "Two pinned Linux CPU trials completed with exact source and JUnit coverage.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "6371154549a4eb552d6f93f8e097c4ab47d1d6629f2e3b79e1509e51154f5d83",
-        "receipt": "/cpfs/world-model/sglang/evals/h3-encoder-ci-333-startup-20261016/receipt.json",
-        "receipt_sha256": "0d81f5c1adbc5805b6fed86ae8c7f51eac1acf16200f7ee9b84c58f1a93b3278",
+        "source_sha256": "00561faa0bcd8080e4b204842616b6eda497b2a68d2467e7444d47d02d8796f7",
+        "tested_head": "72e39a6a6028e72349f1885ca32dc1d7480ede4f",
+        "receipt": "conditioning-contracts/receipt.json",
+        "receipt_sha256": "d70f1de50164133d588dab3d9cd5e3dd6e1df1fb1d1c1453349201bfa1c1aee3",
+        "workflow_run": "https://github.com/seedleap/sglang/actions/runs/43008628126",
         "trials": [
           {
             "trial": 1,
-            "exit_code": 0,
-            "tests": 9,
-            "failures": 0,
-            "errors": 0,
+            "passed": 9,
+            "collected": 9,
             "skipped": 0,
-            "duration_seconds": 93.93381189089268,
-            "log_path": "/cpfs/world-model/sglang/evals/h3-encoder-ci-333-startup-20261016/green-2.log",
-            "junit_path": "/cpfs/world-model/sglang/evals/h3-encoder-ci-333-startup-20261016/green-2.xml"
+            "duration_seconds": 233.08532177600003,
+            "exit_code": 0,
+            "log_path": "conditioning-contracts/conditioning-trial-1.log",
+            "junit_path": "conditioning-contracts/conditioning-trial-1.xml",
+            "log_sha256": "35f059cfa63d0cd6f737d7901a4acd6b19b9465b302a95484d3f13857af62fc4",
+            "junit_sha256": "4c3912259d7ff5d361871f22a177ba298c73c65bbfb09b4350d048ee4dd8a3b7"
           },
           {
             "trial": 2,
-            "exit_code": 0,
-            "tests": 9,
-            "failures": 0,
-            "errors": 0,
+            "passed": 9,
+            "collected": 9,
             "skipped": 0,
-            "duration_seconds": 93.9247104730457,
-            "log_path": "/cpfs/world-model/sglang/evals/h3-encoder-ci-333-startup-20261016/green-3.log",
-            "junit_path": "/cpfs/world-model/sglang/evals/h3-encoder-ci-333-startup-20261016/green-3.xml"
+            "duration_seconds": 233.66955931600006,
+            "exit_code": 0,
+            "log_path": "conditioning-contracts/conditioning-trial-2.log",
+            "junit_path": "conditioning-contracts/conditioning-trial-2.xml",
+            "log_sha256": "0716fa4a24628e3d693a13a409613ceaf6dbb24d013faaa970375684175b04df",
+            "junit_sha256": "a2376babbf7f76219ddd884cc8394ebfa33c01e3aaab2cd0197e2d71010a9961"
           }
         ],
         "environment": {
-          "python": "3.12.3 (main, Jul 15 2026, 23:46:41) [GCC 13.3.0]",
-          "torch": "2.14.1+cpu",
-          "pytest": "9.1.1"
+          "python": "3.12.16",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
         },
-        "recipe_deviation": "DSW conditioning runner with CI flags; initial full suite attempts stopped at missing av (14 passed, 1 failed each); complete dependency lock not asserted; GitHub CI validates exact recipe"
+        "manifest_sha256": "19aac99d7f9e7e3075f075da9f4832c3166e9f79bb3a4efcf00998e3182ce448"
       }
     },
     {

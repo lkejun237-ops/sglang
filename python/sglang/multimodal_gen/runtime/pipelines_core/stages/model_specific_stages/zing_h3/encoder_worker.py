@@ -170,7 +170,7 @@ def main():
                 )
             )
             codecs = load_encoder(args.model)
-            codecs.warmup_encoder()
+            codecs.warmup_source_vae()
             static_gc = prepare_static_gc("Zing Encoder worker")
             if rank == 0:
                 context = zmq.Context()

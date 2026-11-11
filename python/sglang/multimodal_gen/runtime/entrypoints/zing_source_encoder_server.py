@@ -1086,7 +1086,11 @@ def create_apps(
                 codecs.compute_plan = ZingComputeLimits(
                     (codecs.canvas_multiple,) * 2, codecs.max_short_edge
                 )
-                codecs.warmup_encoder()
+                from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.codec_warmup import (
+                    warmup_encoder,
+                )
+
+                warmup_encoder(codecs)
                 if connection_ports is not None:
                     connection_ports.initialize_stores()
                 for peer in peers:

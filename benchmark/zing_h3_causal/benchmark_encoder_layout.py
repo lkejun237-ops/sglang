@@ -232,7 +232,7 @@ def main():
         torch.cuda.synchronize()
         start = time.perf_counter()
         codecs.prepare_visual_encoder_weights()
-        codecs.warmup_encoder()
+        codecs.warmup_source_vae()
         torch.cuda.synchronize()
         prep_ms = 1000 * (time.perf_counter() - start)
         assert originals == {

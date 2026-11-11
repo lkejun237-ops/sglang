@@ -87,7 +87,7 @@ class ZingH3GenerationStage(PipelineStage):
         # A source-only request may never call encode_visual for a reference.
         if not external_inputs:
             self.codecs.prepare_visual_encoder_weights()
-            self.codecs.warmup_encoder()
+            self.codecs.warmup_source_vae()
         rope = runtime["rope_config"]
         self.packer = ZingH3Packer(
             config.dit_config.arch_config,

@@ -1374,9 +1374,17 @@ def test_encoder_services_load_once_and_keep_admission_and_conditions_private(
         calls.append("vae")
         return SimpleNamespace(modules={"video_vae": object()}, va=object(), runtime={})
 
+    def text_warmup(prompt, media):
+        assert prompt and media == []
+        calls.append("text_warmup")
+        return {
+            "context": torch.ones(3, 8),
+            "row_role": torch.zeros(3, dtype=torch.long),
+        }
+
     shared_codecs = SimpleNamespace(
-        warmup_encoder=lambda: calls.append("warmup"),
-        encode_condition=lambda *a: None,
+        warmup_source_vae=lambda: calls.append("source_vae_warmup"),
+        encode_condition=text_warmup,
         canvas_multiple=32,
         max_short_edge=768,
     )
@@ -1420,7 +1428,7 @@ def test_encoder_services_load_once_and_keep_admission_and_conditions_private(
                 )
 
     asyncio.run(run())
-    assert calls == ["qwen", "vae", "warmup"]
+    assert calls == ["qwen", "vae", "source_vae_warmup", "text_warmup"]
 
 
 def test_encoder_business_app_enforces_claim_and_reports_unstarted_child_cleanup(

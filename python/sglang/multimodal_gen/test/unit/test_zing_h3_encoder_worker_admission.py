@@ -240,7 +240,7 @@ def test_busy_open_preserves_owner_and_all_ranks_recover(monkeypatch, rank, clos
         timedelta=timedelta,
         load_encoder=lambda root: SimpleNamespace(
             modules={"video_vae": object()},
-            warmup_encoder=warmup,
+            warmup_source_vae=warmup,
             runtime={
                 "vae_config": {"encode_mode": "performance", "encode_dtype": "bfloat16"}
             },

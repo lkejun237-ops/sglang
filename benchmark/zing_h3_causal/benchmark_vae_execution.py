@@ -95,7 +95,7 @@ def encoder(args):
         .contiguous()
     )
     codecs.prepare_visual_encoder_weights()
-    codecs.warmup_encoder()
+    codecs.warmup_source_vae()
 
     def run(capture=False):
         cache = CausalEncoderCache(

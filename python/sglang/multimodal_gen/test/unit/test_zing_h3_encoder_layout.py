@@ -318,10 +318,10 @@ def test_explicit_warmup_is_separate_and_cleans_temporary_cache(
     assert events == []  # Preparing weights must not run inference or synchronize.
     if fail_frame:
         with pytest.raises(RuntimeError, match="Injected tile warmup"):
-            ZingH3Codecs.warmup_encoder(codecs)
+            ZingH3Codecs.warmup_source_vae(codecs)
         assert events[-1] == "clear" and "sync" not in events
     else:
-        ZingH3Codecs.warmup_encoder(codecs)
+        ZingH3Codecs.warmup_source_vae(codecs)
         assert events == [
             "construct",
             1,
@@ -349,4 +349,4 @@ def test_encoder_warmup_skips_unprepared_or_native_layout(monkeypatch, prepared)
         pytest.fail("Native CPU encoder must not enter CUDA warmup")
 
     monkeypatch.setattr(torch.cuda, "synchronize", unexpected_sync)
-    ZingH3Codecs.warmup_encoder(codecs)
+    ZingH3Codecs.warmup_source_vae(codecs)

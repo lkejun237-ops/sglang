@@ -745,6 +745,15 @@ def main():
             logging.exception("Decoder startup failed on rank %s", rank)
             error = exc
         control.agree("startup", error=error, group=startup_group)
+        from .codec_warmup import warmup_decoder
+
+        warmup_decoder(
+            module,
+            group=tile_group,
+            agree=lambda stage, value, **kwargs: control.agree(
+                stage, value, group=startup_group, **kwargs
+            ),
+        )
         controllers = [lane["connections"] for lane in lanes if "connections" in lane]
         for lane in lanes:
             if lane["http"] is not None:

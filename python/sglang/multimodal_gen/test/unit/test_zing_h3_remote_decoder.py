@@ -536,6 +536,7 @@ def _run_decoder_loop(
     namespace = dict(
         diagnostic_print=diagnostic_print,
         __doc__="test",
+        __package__="sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3",
         argparse=SimpleNamespace(
             ArgumentParser=lambda **kw: SimpleNamespace(
                 add_argument=lambda *a, **k: None, parse_args=lambda: args
@@ -644,9 +645,14 @@ def _run_decoder_loop(
             listener.bind(None)
             return listener
 
-        with patch(
-            "sglang.multimodal_gen.runtime.realtime.worker_services.ServiceCommandSockets",
-            command_sockets,
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.realtime.worker_services.ServiceCommandSockets",
+                command_sockets,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.codec_warmup.warmup_decoder"
+            ),
         ):
             namespace["main"]()
     except _LoopExit:

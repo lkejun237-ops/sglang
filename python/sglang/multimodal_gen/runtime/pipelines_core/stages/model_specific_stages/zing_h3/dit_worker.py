@@ -739,6 +739,10 @@ def main():
             create.cache_control = preparation.control
             create.cached_condition = preparation.cached_condition
 
+            from .dit_warmup import warmup_dit
+
+            warmup_dit(model, codecs, create, parallel=parallel)
+
             from sglang.multimodal_gen.runtime.realtime.worker_group_dit import (
                 DiTGroups,
             )

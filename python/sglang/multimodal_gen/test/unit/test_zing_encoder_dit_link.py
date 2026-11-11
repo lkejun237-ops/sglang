@@ -840,7 +840,7 @@ def test_stage_initialization_preserves_encoder_startup_unless_inputs_are_extern
     calls = []
     codecs = SimpleNamespace(
         prepare_visual_encoder_weights=lambda: calls.append("prepare"),
-        warmup_encoder=lambda: calls.append("warmup"),
+        warmup_source_vae=lambda: calls.append("warmup"),
     )
     monkeypatch.setattr(base, "get_global_server_args", lambda: None)
     monkeypatch.setattr(module, "ZingH3Codecs", lambda *a, **kw: codecs)
