@@ -2235,3 +2235,155 @@ def test_encoder_client_cache_disk_delete_entries_guards_busy_and_delegates():
     assert calls == [
         ("delete_entries", {"keys": [key_a]}),
     ]
+
+
+@pytest.mark.parametrize("advertise", [False, True])
+def test_independent_input_forwards_verified_decoder_flow(configured, advertise):
+    from sglang.multimodal_gen.runtime.realtime.zing_chunk_plan import ChunkPlan
+    from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
+        progressive_source_flow,
+    )
+
+    async def run():
+        adapter, session = ZingEncoderDiTAdapter(), GenerateSession()
+        session.set_adapter(adapter)
+        capabilities = {
+            "source_output_release_protocol": "valid-source-frames-v1",
+            "source_flow": progressive_source_flow(
+                ChunkPlan([3, 2], split_first_latent=False),
+                progressive_output=True,
+            ),
+        }
+
+        async def open_dit(message):
+            return [
+                dict(
+                    type="session.opened",
+                    output_kind="rgb",
+                    **(capabilities if advertise else {}),
+                )
+            ]
+
+        session.execution_client = SimpleNamespace(open_dit=open_dit)
+        request = RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="test",
+            size="32x32",
+            zing_realtime_api_version=1,
+            source_stream=dict(format="rgb24", width=32, height=32, fps=24),
+        )
+        try:
+            await adapter.on_init(session, request)
+            if advertise:
+                assert adapter.ready["source_flow"] == capabilities["source_flow"]
+                assert (
+                    adapter.ready["source_output_release_protocol"]
+                    == "valid-source-frames-v1"
+                )
+            else:
+                assert "source_flow" not in adapter.ready
+                assert "source_output_release_protocol" not in adapter.ready
+        finally:
+            adapter.dispose(session)
+
+    asyncio.run(run())
+
+
+def test_native_source_demand_tracks_input_groups_without_releasing_ownership(
+    configured,
+):
+    from sglang.multimodal_gen.runtime.realtime.zing_chunk_plan import ChunkPlan
+    from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
+        progressive_source_flow,
+    )
+
+    async def run():
+        adapter, session, socket = (
+            ZingEncoderDiTAdapter(),
+            GenerateSession(),
+            PromptSocket(),
+        )
+        session.set_adapter(adapter)
+
+        async def open_dit(message):
+            return [
+                dict(
+                    type="session.opened",
+                    output_kind="rgb",
+                    source_output_release_protocol="valid-source-frames-v1",
+                    source_flow=progressive_source_flow(
+                        ChunkPlan([3, 2]), progressive_output=True
+                    ),
+                )
+            ]
+
+        session.execution_client = SimpleNamespace(open_dit=open_dit)
+        request = RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="test",
+            size="32x32",
+            zing_realtime_api_version=1,
+            source_stream=dict(format="rgb24", width=32, height=32, fps=24),
+            source_demand_protocol="source-demand-v1",
+        )
+        await adapter.on_init(session, request)
+        try:
+            ready = adapter.session_ready_message(session)
+            assert ready["source_demand_protocol"] == "source-demand-v1"
+            assert ready["generation_id"] == session.generation_id
+            adapter.startup_enabled = True
+            adapter.startup_phase = "prepared"
+            assert adapter.source_demand_message(session) is None
+            adapter.startup_phase = "attached"
+            demand = adapter.source_demand_message(session)
+            assert (
+                demand["required_source_frame_end"] == 1
+                and demand["waiting_for_source"]
+            )
+
+            async def append(seq, start, count):
+                data = bytes(32 * 32 * 3 * count)
+                await adapter.ingest_wire_event(
+                    socket,
+                    session,
+                    dict(
+                        type="event",
+                        kind="source.append",
+                        event_id=seq + 1,
+                        payload=dict(
+                            client_seq=seq,
+                            source_frame_start=start,
+                            num_frames=count,
+                            pts_us=start * 1_000_000 // 24,
+                            data=data,
+                        ),
+                    ),
+                    len(data) + 256,
+                )
+
+            await append(0, 0, 1)
+            assert not adapter.source_demand_message(session)["waiting_for_source"]
+            appends, _ = adapter._take_source_input()
+            assert sum(v["payload"]["num_frames"] for v in appends) == 1
+            demand = adapter.source_demand_message(session)
+            assert demand["required_source_frame_end"] == 9
+            await append(1, 1, 3)
+            demand = adapter.source_demand_message(session)
+            assert demand["accepted_source_frame_end"] == 4
+            assert demand["queued_source_frames"] == 3
+            assert (
+                demand["required_source_frame_end"] == 9
+                and demand["waiting_for_source"]
+            )
+            await append(2, 4, 5)
+            assert not adapter.source_demand_message(session)["waiting_for_source"]
+            adapter._take_source_input()
+            assert (
+                adapter.source_demand_message(session)["required_source_frame_end"]
+                == 17
+            )
+            assert adapter.ledger.consumed_frames == 0  # Demand is not memory credit.
+        finally:
+            adapter.dispose(session)
+
+    asyncio.run(run())

@@ -108,6 +108,23 @@ class ZingSourceEncoderAdapter(ZingH3SourceStreamAdapter):
     async def wait_for_next_chunk(self, session):
         await self.pending.wait_ready()
 
+    def source_input_required_end(self):
+        if (
+            self.end is not None
+            or self.more_work
+            or self.pending
+            or self.has_control_work()
+            or (self.startup_enabled and self.startup_phase != "attached")
+        ):
+            return self.ledger.accepted_frames
+        # The staged input endpoint owns the exact 1/8/8 assembler state.
+        # Ownership credits from later stages are not readiness evidence.
+        return (
+            self.ledger.accepted_frames
+            - self.input_arranger.buffered_frames
+            + (1, 8, 8)[self.input_arranger.group_index]
+        )
+
     @staticmethod
     async def _process_encoder_batch(queue, batch, execution_client):
         from ..realtime_video_api import _process_realtime_generation_batch

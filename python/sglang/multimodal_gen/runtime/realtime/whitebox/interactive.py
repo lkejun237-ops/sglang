@@ -749,6 +749,7 @@ class InteractiveSession(WhiteboxUpstream):
                 self.upstream.init,
                 prompt=selection["prompt"],
                 references=selection["references"],
+                source_demand_protocol="source-demand-v1",
             )
             geometry = self.model_geometry
             model_spec = geometry.model
@@ -837,7 +838,7 @@ class InteractiveSession(WhiteboxUpstream):
                 raise ValueError(
                     "Subclip admission requires proven source-frame release"
                 )
-            minimum_capacity = self.config.minimum_model_input_frames
+            minimum_capacity = self.config.negotiated_minimum_model_input_frames(ready)
             if capacity < minimum_capacity:
                 raise ValueError("Model source budget is too small.")
             # One reservation survives source encoding, H3, output queuing and
@@ -865,6 +866,11 @@ class InteractiveSession(WhiteboxUpstream):
                     source_output_release_protocol=ready.get(
                         "source_output_release_protocol", "conservative-tail"
                     ),
+                    **(
+                        {"source_flow": ready["source_flow"]}
+                        if "source_flow" in ready
+                        else {}
+                    ),
                     reserved_bytes_per_frame=pair_bytes,
                     max_bytes=self.config.pairing_max_bytes,
                     max_age_seconds=self.pairing_age_budget(),
@@ -887,7 +893,22 @@ class InteractiveSession(WhiteboxUpstream):
             if startup is not None:
                 await startup.attach()
                 self.model_wire_sequence = startup.event_sequence
-            sent = accepted = consumed = received = 0
+            sent = accepted = consumed = received = demand_version = 0
+            sampler = getattr(self.latest, "sampler", None)
+            if sampler is not None:
+                if ready.get("source_demand_protocol") == "source-demand-v1" and any(
+                    ready.get(key) != getattr(assignment, key, None)
+                    for key in ("session_id", "generation_id")
+                ):
+                    raise ValueError(
+                        "Source demand identity does not match the model assignment"
+                    )
+                sampler.configure_native(
+                    ready,
+                    session_id=ready.get("session_id"),
+                    generation_id=ready.get("generation_id"),
+                    capacity=capacity,
+                )
             submitted_timing = {}
             telemetry_received = 0
             ended = False
@@ -933,7 +954,11 @@ class InteractiveSession(WhiteboxUpstream):
                         version, progress = deferred
                         started = time.perf_counter()
                         await wait_for_capture_or_progress(
-                            self.latest, version, condition, lambda: received, progress
+                            self.latest,
+                            version,
+                            condition,
+                            lambda: (received, demand_version),
+                            progress,
                         )
                         observe_duration(
                             "source_cadence_wait",
@@ -1009,10 +1034,11 @@ class InteractiveSession(WhiteboxUpstream):
                             if submitted_timing
                             else None
                         )
-                        sampler.feedback.observe(
+                        sampler.observe_queue(
                             now,
+                            sent=sent,
                             buffered=sent - received,
-                            reserve=self.config.minimum_model_input_frames,
+                            reserve=minimum_capacity,
                             capacity=capacity,
                             oldest_age=now - oldest if oldest is not None else None,
                             period=sampler.period_us / 1_000_000
@@ -1024,7 +1050,7 @@ class InteractiveSession(WhiteboxUpstream):
                         )
                         sampler.supply(
                             sent - received,
-                            self.config.minimum_model_input_frames,
+                            minimum_capacity,
                             available=self.latest.has_capture(cursor),
                         )
                     item = await self.latest.get(cursor)
@@ -1042,17 +1068,18 @@ class InteractiveSession(WhiteboxUpstream):
                                 after=cursor,
                                 now=time.perf_counter(),
                                 buffered=sent - received,
-                                reserve=self.config.minimum_model_input_frames,
+                                reserve=minimum_capacity,
                                 startup=received == 0,
                                 urgent=getattr(self, "pending_prompt", None) is not None
-                                or getattr(self, "condition_switch", None) is not None,
+                                or getattr(self, "condition_switch", None) is not None
+                                or (sampler is not None and sampler.needs_input(sent)),
                             )
                             if sampler is not None:
                                 self.recording.manifest["source_sampling"] = (
                                     sampler.snapshot()
                                 )
                             if selected is None:
-                                deferred = (item[0], received)
+                                deferred = (item[0], (received, demand_version))
                                 # The next wait occurs outside source_send_lock;
                                 # control dispatch remains independent of captures.
                                 continue
@@ -1149,7 +1176,12 @@ class InteractiveSession(WhiteboxUpstream):
                 )
 
             async def outputs():
-                nonlocal accepted, consumed, received, telemetry_received
+                nonlocal \
+                    accepted, \
+                    consumed, \
+                    received, \
+                    telemetry_received, \
+                    demand_version
                 while True:
                     try:
                         message = msgspec.msgpack.decode(await ws.recv())
@@ -1175,6 +1207,22 @@ class InteractiveSession(WhiteboxUpstream):
                         ):
                             raise ValueError("Invalid source acknowledgement.")
                         accepted = message["source_frame_end"]
+                    elif kind == "source.demand":
+                        if ready.get(
+                            "source_demand_protocol"
+                        ) != "source-demand-v1" or any(
+                            message.get(k) != ready.get(k)
+                            for k in ("session_id", "generation_id")
+                        ):
+                            raise ValueError("Unexpected source demand identity")
+                        sampler = getattr(self.latest, "sampler", None)
+                        if sampler is not None:
+                            sampler.model_demand(
+                                message, sent=sent, now=time.perf_counter()
+                            )
+                        async with condition:
+                            demand_version += 1
+                            condition.notify_all()
                     elif kind == "source.consumed":
                         end = message["source_frame_end"]
                         if (
@@ -1308,7 +1356,10 @@ class InteractiveSession(WhiteboxUpstream):
                                 received,
                                 output_received,
                                 buffered=input_at_completion,
-                                reserve=self.config.minimum_model_input_frames,
+                                reserve=minimum_capacity,
+                                learning_allowed=not ended
+                                and getattr(self, "pending_prompt", None) is None
+                                and getattr(self, "condition_switch", None) is None,
                             )
                             self.recording.manifest["source_sampling"] = (
                                 sampler.snapshot()

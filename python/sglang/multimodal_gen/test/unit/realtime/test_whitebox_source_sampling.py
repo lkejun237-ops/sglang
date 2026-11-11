@@ -668,6 +668,9 @@ def simulate_batched_consumer(
                     oldest_age=now - queue[0][1][1] if queue else None,
                     period=sampler.period_us / 1_000_000 if sampler.period_us else None,
                     enabled=received > 0,
+                    queued_source_frames=max(
+                        0, sent - received - (batch if computing else 0)
+                    ),
                 )
             demand = dict(
                 after=cursor,
@@ -895,7 +898,7 @@ def test_semantic_priority_keeps_effective_context_and_action_fences():
     assert s.control_changed(s.input_identity(changed[1][0]), 1, True)
 
 
-def test_pi_has_bounded_slew_and_anti_windup_and_freezes_at_protocol_fences():
+def test_native_queue_p_correction_is_bounded_and_has_no_integrator():
     from sglang.multimodal_gen.runtime.realtime.whitebox.source_sampling import (
         QueueFeedback,
     )
@@ -906,6 +909,7 @@ def test_pi_has_bounded_slew_and_anti_windup_and_freezes_at_protocol_fences():
         q.observe(
             i * 0.05,
             buffered=34,
+            queued_source_frames=34,
             reserve=18,
             capacity=34,
             oldest_age=3,
@@ -913,13 +917,14 @@ def test_pi_has_bounded_slew_and_anti_windup_and_freezes_at_protocol_fences():
             enabled=True,
         )
         scales.append(q.scale)
-    assert q.updates > 40 and 1 < q.scale <= 1.15
+    assert q.updates > 40 and 1 < q.scale <= 1.05
     assert max(abs(b - a) for a, b in zip(scales, scales[1:])) <= 0.02000001
-    assert abs(q.integral) <= 0.06
+    assert q.integral == 0
     for i in range(1001, 1201):
         q.observe(
             i * 0.05,
             buffered=18,
+            queued_source_frames=18,
             reserve=18,
             capacity=34,
             oldest_age=0.1,
@@ -962,9 +967,7 @@ def test_pi_queue_limit_does_not_block_starved_input_or_control_dispatch():
 
 @pytest.mark.parametrize("batch", [9, 17])
 @pytest.mark.parametrize("controls_hz", [0, 5, 36])
-def test_pi_keeps_batch_throughput_and_improves_or_preserves_model_age(
-    batch, controls_hz
-):
+def test_native_queue_feedback_keeps_batch_throughput_and_model_age(batch, controls_hz):
     baseline = simulate_batched_consumer(
         adaptive=True, batch=batch, controls_hz=controls_hz
     )
@@ -979,7 +982,7 @@ def test_pi_keeps_batch_throughput_and_improves_or_preserves_model_age(
     assert candidate["gap_p95"] < 0.085
     assert candidate["input_p95"] <= baseline["input_p95"] + 1e-6
     assert candidate["source_delay_p95"] <= baseline["source_delay_p95"] + 1e-6
-    assert candidate["pi_updates"] > 0
+    assert 1 <= candidate["pi_scale"] <= 1.05
     assert (
         candidate["high_water"] <= 34
         and candidate["unique"]
@@ -1023,3 +1026,202 @@ def test_new_state_receipt_advances_priority_but_renewal_receipt_does_not():
     for seq in range(3, 2050):
         t.observe({"held_keys": []}, seq)
     assert len(t.receipt_revisions) == 1024
+
+
+def native_demand(
+    sampler,
+    *,
+    now,
+    sent=65,
+    accepted=None,
+    required=None,
+    queued=9,
+    waiting=False,
+    waited=0,
+):
+    accepted = sent if accepted is None else accepted
+    required = accepted if required is None else required
+    message = dict(
+        type="source.demand",
+        protocol="source-demand-v1",
+        session_id="model",
+        generation_id="generation",
+        sequence=sampler.native_sequence + 1,
+        accepted_source_frame_end=accepted,
+        required_source_frame_end=required,
+        dispatched_source_frame_end=accepted - queued,
+        queued_source_frames=queued,
+        waiting_for_source=waiting,
+        input_wait_ms=waited,
+    )
+    sampler.model_demand(message, sent=sent, now=now)
+    return message
+
+
+def native_trained():
+    sampler = AdaptiveSourceSampler()
+    sampler.configure_native(
+        {
+            "source_demand_protocol": "source-demand-v1",
+            "source_flow": {
+                "protocol": "clip17-source-flow-v1",
+                "input_groups": [1, 8, 8],
+            },
+        },
+        session_id="model",
+        generation_id="generation",
+        capacity=25,
+    )
+    sampler.admit(item(1, 0), after=0, buffered=0, reserve=9, startup=True)
+    native_demand(sampler, now=0, sent=25)
+    sampler.completed(0, 0, buffered=25, reserve=9)
+    sampler.admit(item(73, 2_000_000), after=1, buffered=25, reserve=9)
+    native_demand(sampler, now=2)
+    sampler.completed(40, 2, buffered=25, reserve=9)
+    assert sampler.period_us == pytest.approx(50_000)
+    assert not sampler.measuring
+    choose(sampler, [item(73, 2_000_000)], after=0)
+    return sampler
+
+
+def test_own_admission_wait_cannot_teach_a_slower_model_capacity():
+    s = native_trained()
+    assert not s.admit(
+        item(74, 2_027_778), after=73, buffered=20, reserve=9, control_sequence=-1
+    )
+    native_demand(s, now=3.5, sent=85)
+    s.completed(60, 3.5, buffered=25, reserve=9)
+    assert s.period_us == pytest.approx(50_000)
+    assert s.counts["capacity_samples_rejected"] == 1
+
+
+def test_native_input_wait_overrides_an_apparently_full_pipeline():
+    s = native_trained()
+    native_demand(s, now=2.01, sent=65, required=70, queued=0, waiting=True)
+    assert s.needs_input(65)
+    assert s.admit(
+        item(74, 2_027_778), after=73, buffered=25, reserve=9, urgent=s.needs_input(65)
+    )
+    native_demand(s, now=3.2, sent=70, queued=5, waited=1000)
+    s.completed(48, 3.2, buffered=22, reserve=9)
+    assert s.period_us == pytest.approx(50_000)
+    assert not s.needs_input(70)
+    assert s.feedback.scale == 1
+
+
+def test_a_fully_supplied_slowdown_can_update_capacity_and_eos_cannot():
+    s = native_trained()
+    native_demand(s, now=3, sent=81)
+    s.completed(56, 3, buffered=25, reserve=9)
+    assert s.period_us > 50_000
+    before = s.period_us
+    s.completed(57, 6, buffered=1, reserve=9, learning_allowed=False)
+    assert s.period_us == before and s.anchor is None
+
+
+def test_unknown_native_supply_uses_bounded_latest_without_learning():
+    s = AdaptiveSourceSampler()
+    s.configure_native({}, session_id=None, generation_id=None, capacity=25)
+    s.completed(0, 0, buffered=25, reserve=9)
+    s.completed(100, 2, buffered=25, reserve=9)
+    assert s.period_us is None
+    assert s.snapshot()["effective_mode"] == "latest_unverified_supply"
+
+
+def test_native_demand_rejects_other_generations_and_regressing_evidence():
+    s = native_trained()
+    message = native_demand(s, now=3, sent=70)
+    for change in [
+        {"generation_id": "other"},
+        {"sequence": message["sequence"]},
+        {"accepted_source_frame_end": 69},
+        {"queued_source_frames": 26},
+        {"required_source_frame_end": 100},
+        {"input_wait_ms": float("nan")},
+        {"waiting_for_source": True},
+    ]:
+        with pytest.raises(ValueError, match="Invalid native source demand"):
+            s.model_demand(
+                dict(message, sequence=message["sequence"] + 1, **change)
+                if "sequence" not in change
+                else dict(message, **change),
+                sent=70,
+                now=3.1,
+            )
+
+
+def test_new_generation_discards_previous_native_demand_and_sequence():
+    s = native_trained()
+    s.configure_native(
+        {
+            "source_demand_protocol": "source-demand-v1",
+            "source_flow": {
+                "protocol": "clip17-source-flow-v1",
+                "input_groups": [1, 8, 8],
+            },
+        },
+        session_id="next",
+        generation_id="next",
+        capacity=25,
+    )
+    assert s.native_sequence == s.native_required == 0
+    assert s.native_seen is None and s.period_us is None
+
+
+@pytest.mark.parametrize("cadence_deferred", [False, True])
+def test_segmented_native_demand_preserves_independent_controls(
+    tmp_path, monkeypatch, cadence_deferred
+):
+    from test_whitebox_render_lifecycle import OrderedWorker
+
+    emit = OrderedWorker.emit
+    configured = []
+    configure = AdaptiveSourceSampler.configure_native
+
+    async def native_emit(worker, message):
+        if message["type"] == "session.ready":
+            message.update(
+                session_id="model",
+                generation_id="generation",
+                source_demand_protocol="source-demand-v1",
+                source_flow=dict(
+                    protocol="clip17-source-flow-v1",
+                    input_groups=[1, 8, 8],
+                    first_output_input_frames=9,
+                    progressive_output=True,
+                ),
+            )
+        await emit(worker, message)
+        if message["type"] == "source.accepted":
+            end = message["source_frame_end"]
+            await emit(
+                worker,
+                dict(
+                    type="source.demand",
+                    protocol="source-demand-v1",
+                    session_id="model",
+                    generation_id="generation",
+                    sequence=end,
+                    accepted_source_frame_end=end,
+                    dispatched_source_frame_end=end,
+                    required_source_frame_end=end + 1,
+                    queued_source_frames=0,
+                    waiting_for_source=False,
+                    input_wait_ms=0.0,
+                ),
+            )
+
+    def capture_configuration(sampler, ready, **kwargs):
+        configure(sampler, ready, **kwargs)
+        configured.append(sampler)
+
+    monkeypatch.setattr(OrderedWorker, "emit", native_emit)
+    monkeypatch.setattr(
+        AdaptiveSourceSampler, "configure_native", capture_configuration
+    )
+    test_real_source_control_dispatch_does_not_wait_for_new_captures(
+        tmp_path, cadence_deferred
+    )
+    assert len(configured) == 1
+    assert configured[0].snapshot()["native_source_demand"]["negotiated"]
+    assert configured[0].native_sequence > 0

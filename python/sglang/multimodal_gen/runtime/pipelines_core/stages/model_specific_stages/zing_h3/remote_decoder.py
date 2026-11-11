@@ -198,6 +198,7 @@ class RemoteLynnDecoder:
         ):
             raise ValueError("One-way decoding requires direct output")
         self.output_attachment = None
+        self.output_capabilities = {}
         self.output_metadata = None
         if type(self.auto_output) is not bool:
             raise ValueError("Invalid decoder auto-output mode")
@@ -273,12 +274,23 @@ class RemoteLynnDecoder:
                 output_session=self.output_session,
             )
             self.channel = opened["channel"]
-            self.output_attachment = opened.get("output_attachment")
-            self.oneway = self.oneway and bool(
-                self.output_attachment and opened.get("oneway_supported")
-            )
+            self._opened(opened)
         except BaseException as error:
             self.failure = error
+
+    def _opened(self, reply):
+        self.output_attachment = reply.get("output_attachment")
+        self.oneway = self.oneway and bool(
+            self.output_attachment and reply.get("oneway_supported")
+        )
+        # An old or unrecognized peer cannot acquire a newer release contract
+        # merely because the local launcher enables progressive decoding.
+        self.output_capabilities = {}
+        if reply.get("source_output_release_protocol") == "valid-source-frames-v1":
+            self.output_capabilities = dict(
+                source_output_release_protocol="valid-source-frames-v1",
+                progressive_output=reply.get("progressive_output") is True,
+            )
 
     def _command_socket(self, context):
         if self.oneway:
@@ -377,10 +389,7 @@ class RemoteLynnDecoder:
                     ),
                 )
                 self.channel = opened["channel"]
-                self.output_attachment = opened.get("output_attachment")
-                self.oneway = self.oneway and bool(
-                    self.output_attachment and opened.get("oneway_supported")
-                )
+                self._opened(opened)
                 self.bridge = bridge_group(store, 0, timeout_seconds=self.timeout)
             except BaseException as error:
                 # Reported by the first pop on every DiT rank, like a later failure.
@@ -444,10 +453,7 @@ class RemoteLynnDecoder:
                     )
                     reply = socket.recv_json()
                     if isinstance(reply, dict) and reply.get("ok"):
-                        self.output_attachment = reply.get("output_attachment")
-                        self.oneway = self.oneway and bool(
-                            self.output_attachment and reply.get("oneway_supported")
-                        )
+                        self._opened(reply)
                         self.port = cand_port
                         self.socket = socket
                         self.store = store

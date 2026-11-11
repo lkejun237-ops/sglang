@@ -22,6 +22,32 @@ from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
 )
 
 
+def progressive_source_dependency(latent_end):
+    """Required real pixels for the clip17 encoder's 1/2/2 latent groups."""
+    if type(latent_end) is not int or latent_end < 1:
+        raise ValueError("Source latent boundary must be positive")
+    clips, last = divmod(latent_end - 1, 5)
+    return clips * 17 + (1 if last == 0 else 9 if last < 3 else 17)
+
+
+def next_progressive_source_end(source_end):
+    """The next complete encoder group; accepting pixels is not an AR output."""
+    if type(source_end) is not int or source_end < 0:
+        raise ValueError("Source boundary must be nonnegative")
+    clips, offset = divmod(source_end, 17)
+    return clips * 17 + next(end for end in (1, 9, 17) if end > offset)
+
+
+def progressive_source_flow(plan, *, progressive_output):
+    """Native dependencies, separate from Room inventory and memory limits."""
+    return dict(
+        protocol="clip17-source-flow-v1",
+        input_groups=[1, 8, 8],
+        first_output_input_frames=progressive_source_dependency(plan.chunk(0).end),
+        progressive_output=bool(progressive_output),
+    )
+
+
 def default_source_encoder():
     """Return a fresh trusted profile for the built-in progressive encoder."""
     return {

@@ -1198,8 +1198,7 @@ def main():
                                 decode_group=decode_group,
                                 device=device,
                                 queue_driven=command.get("auto_output", False),
-                                progressive=progressive_output
-                                and not command.get("auto_output", False),
+                                progressive=progressive_output,
                             )
                             if rank == 0:
                                 bridge_id = command.get("bridge_id")
@@ -1266,7 +1265,12 @@ def main():
                                 new_token,
                                 new_channel,
                             )
-                            reply = dict(ok=True, channel=new_channel)
+                            reply = dict(
+                                ok=True,
+                                channel=new_channel,
+                                source_output_release_protocol="valid-source-frames-v1",
+                                progressive_output=service.progressive,
+                            )
                             if output_session is not None:
                                 reply["oneway_supported"] = True
                                 reply["output_attachment"] = dict(

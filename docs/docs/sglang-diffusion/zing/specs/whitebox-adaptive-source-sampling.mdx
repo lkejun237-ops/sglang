@@ -3,16 +3,16 @@ title: "Adaptive source selection in Whitebox"
 description: "Feed a model segment without an added sampling timer; prefer even capture spacing only when input is sufficient."
 ---
 
-This is an opt-in Room implementation, developed from `white_box@b82f4f018e`.
-The cadence-admission and bounded-PI implementation was deployed to the Shanghai
-test copy at `412589f5` with SDK `4c10ad26`. One 832×480 server-side session ran
-for 190 seconds after its first model packet, including two text-only condition
-updates and confirmed release. This is not browser/WebRTC acceptance or a
-controlled performance comparison. Long-session texture/geometry degradation
-was observed; image quality is not marked as passed. See the
-[deployment recipe](/docs/sglang-diffusion/zing/deployment_zing_h3) for evidence and
-unverified configurations. The current PR additionally inherits main's later
-#670 changes; that combined base has not been redeployed.
+The current implementation uses native source demand to distinguish input
+shortage from pipeline work in progress. Standalone Encoder–DiT–Decoder groups
+and the integrated entry point share progressive input/output contracts. The
+candidate is based on `main@4229aa4df5`; GPU and browser results must be recorded
+for the actual deployed revision, not inferred from CPU tests.
+
+Historical baseline: the previous cadence/PI implementation was deployed to the
+Shanghai copy at `412589f5` with SDK `4c10ad26`. Its 190-second server session
+proved generation and release, not browser acceptance or absence of performance
+and image-quality regression. Historical results below retain that boundary.
 
 ## Scope and configuration
 
@@ -55,9 +55,11 @@ After they permit a source send, the selector follows these rules:
    Unverified effective input still requires the latest pixels, but does not
    bypass cadence admission indefinitely. Input messages and Prompt controls
    continue on their existing independent path.
-3. If `sent - received` is below the existing minimum model-input window, supply
-   the short usable tail in capture order. Do not discard several usable real
-   captures in favor of one latest frame while the model needs input.
+3. Supply the native next-group dependency before ordinary cadence admission.
+   A model can need input even while its total in-flight count is high. The
+   negotiated first-output minimum remains a separate safety floor. Existing
+   usable history may refill that floor only within the same input/context
+   identity and freshness bounds.
 4. With sufficient outstanding input and a healthy cadence estimate, defer an
    ordinary capture whose timestamp precedes the next sampling opportunity.
    Wait for a real capture, model progress or source stop, outside the source-send
@@ -78,25 +80,58 @@ requirement, not a newly assumed batch size. `sent - received` counts work not y
 returned as model output; encoder consumption alone can release source storage
 before that work finishes and is not a reliable measure of available model work.
 
-## Cadence estimation and clocks
+## Native flow and cadence estimation
 
-Estimate cadence from validated raw model-output completions over windows of at
-least 500 ms. Exclude windows where input fell below the minimum-input floor
-while waiting for new source captures, or the completing batch had insufficient
-outstanding input. A normal completion/refill dip with captures already available
-does not count as starvation. A temporarily slow CLI must not become a permanent
-lower model rate. Ignore duplicate completion counters, abandon observation gaps over
-two seconds, and smooth healthy observations with an EWMA (80% prior, 20% new).
-This is an observed pipeline-completion cadence, not an independent GPU-capacity
-benchmark. It drives both ordinary admission and selection among existing captures.
-There is no fixed 24 FPS cap. Low-water input and healthy completion observations
-allow the policy to respond to demand; a source shortage is not filled with copies.
+`source_flow` declares the clip17 encoder groups (`1/8/8`), the source dependency
+of the actual first AR block, and progressive output support. The current unsplit
+`[3,2]` plan needs nine real source frames for its first output. This minimum is
+not an inventory target or a batch that Room must collect before sending.
+Independent Decoder open replies propagate the actual release/output capabilities
+through DiT and Encoder. Room requires the valid-source release contract before
+using the negotiated minimum; old peers retain their legacy capacity checks.
 
-The original capture timestamp, source identity, UI state and input evidence stay
-with the selected RGB. The native model's indexed `spec.pts(local)` protocol clock
-is unchanged. Prompt resume floors and timestamp discontinuities reset sampling
-history. Each new segment has its own estimator; different players do not share
-cursors, input state or sampling history.
+Room requests `source_demand_protocol="source-demand-v1"`. A capable input owner
+reports `source.demand` with session/generation identity, a strictly increasing
+sequence, accepted and dispatched source ends, the next required source end,
+queued source frames, whether it is actually waiting for source, and cumulative
+source-wait milliseconds. A future dependency reported during compute is distinct
+from an idle input wait. These observations do not release memory credit:
+`source.consumed` still means ownership transfer, not GPU completion.
+
+Streaming demand is suppressed until startup preparation/attachment finishes, so
+it cannot displace an ordered startup reply. Condition, pause and EOS controls
+keep their own ordering. Native input waits wake for complete encoder dependencies
+or controls rather than dispatching an incomplete group on a fixed collection
+timeout. Existing clients that do not opt into demand receive no new event type.
+
+Each segment starts with bounded latest supply to observe attainable pipeline
+cadence independently of a soft admission gate. A probe spans at least two
+seconds after its first output anchor. Capture version/PTS progress must show
+source headroom; a source-limited run does not lower the model estimate. The
+probe preserves the same frame/byte/age limits as normal operation.
+
+Steady observations span at least one second. Own admission deferrals and native
+source waits invalidate downward learning. Healthy supplied observations retain
+an 80/20 EWMA; a faster observed completion rate can improve the estimate even
+while demand recovery is active. Two rejected windows more than 10% slower than
+the estimate, with source headroom, trigger another bounded-latest probe. This
+permits real slowdowns and recovery without locking the fastest rate forever or
+resetting Prompt/cache every five seconds. Pause, condition barriers and EOS are
+excluded from normal learning. Native observation windows exceeding four seconds
+are abandoned rather than interpreted as normal throughput.
+
+The small queue correction is proportional only: no integral or derivative. Its
+target is one maximum native encoder group (eight frames for this contract), not
+the first-output minimum and not `sent-received`. It uses reported unprocessed
+source plus newly submitted input, is disabled without fresh demand, and can
+increase the measured period by at most 5%. Input shortage removes the correction.
+Total unfinished-frame age remains a diagnostic, not evidence of queued input.
+
+Older workers without negotiated demand use bounded latest supply and report
+`effective_mode="latest_unverified_supply"`. A measured segment reports `adaptive`
+or `adaptive_probe`. The original source timestamp, pixels, UI/input identity and
+native indexed model clock remain distinct and unchanged. There is no fixed
+24-FPS cap, frame duplication or global state shared between players.
 
 ## Interaction, cancellation and limits
 
@@ -128,7 +163,9 @@ remove network congestion or guarantee a real model/render FPS.
 Model recording manifests gain `source_sampling` only when adaptive selection is
 active. It contains decision counts, reset and rate-observation counts, estimated
 completion period, maximum extra capture age and admission counts for early
-captures and control advances. Decisions are not accepted-frame
+captures and control advances. It also exposes effective mode, native demand
+watermarks and wait totals, rejected capacity samples/probes, and bounded-P queue
+correction. A capture-slow probe or fallback is not claimed as active regulation. Decisions are not accepted-frame
 counts or a substitute for actual input/output counters.
 
 The 2026-11-10 focused CPU suite covers 40 cases, including deferred-input
@@ -165,48 +202,43 @@ world, actions, weights, source rates and hardware at 480 and 736 output sizes.
 Measure unique input/output/display FPS, capture spacing and age, input-to-visible
 latency, Prompt-to-first-new-condition frame, freezes, queue age, and
 Encoder/DiT/Decoder time and memory. Include source slowdowns and recovery,
-Prefill/segment changes and active controls. GPU performance, long-session image
-quality, recording playback and browser/multiplayer acceptance remain unmeasured
-for this candidate; neither the virtual schedule nor past deployments proves them.
+Prefill/segment changes and active controls. The isolated 480 server-side results and observed costs are recorded below.
+736, browser/multiplayer acceptance and component peak-memory measurements remain
+unmeasured; neither the virtual schedule nor past deployments proves them.
 
 
-## Bounded PI and input renewal hints (2026-11-10 candidate)
+## Input renewal hints and historical PI
 
-Known CLI held-key/button renewals without events still reach the SDK and retain
-all original sequences and receipts, but do not advance a separate sampling
-priority revision. Edges, pointer events, unknown envelopes, effective-input and
-source/context changes remain priority signals. Receipts for a newly dispatched
-state retain their own priority hint; repeated renewal receipts do not. This is
-not a promotion of observed input into effective-input proof. Semantic SDK
-commands and unknown receipt types remain opaque and conservative.
+Known held-key/button renewals still reach the SDK with every original sequence
+and receipt. They do not create a new sampling priority revision. Edges, pointer
+events, unknown envelopes, effective-input and context changes remain freshness
+signals; observed receipts are not proof that an input is already visible.
 
-A segment-local PI correction operates around the existing healthy completion
-period. It averages queue occupancy and oldest unfinished capture age over at
-least 500 ms. The soft target includes the protocol minimum plus half a minimum
-batch; it never replaces the hard native input/byte gates. Period scaling stays
-between 1.0 and 1.15, changes by at most 0.02 per update, and uses conditional
-integration with a bounded integral. It never drives faster than the measured
-base cadence. Low-water refill remains immediate and does not integrate error;
-startup, condition changes, invalid observations and long gaps reset the feedback.
-Priority borrowing is suspended while feedback reports an aging queue; SDK
-input dispatch never waits for this sampling decision. No derivative term is
-used because this measurement contains batch-completion discontinuities.
+The 2026-11-10 implementation used a PI correction on total in-flight frames,
+with a target derived from the minimum input floor and a scale up to 1.15. The
+current implementation replaces that feedback with native source demand and a
+small queue-only P correction. A bounded multiplier did not bound overall
+slowdown when completion-rate estimation also learned the input wait introduced
+by the controller itself. Historical virtual/production measurements of that PI
+are not acceptance evidence for the replacement.
 
-The anti-windup approach follows the standard [conditional integration principle](https://www.mathworks.com/help/simulink/slref/anti-windup-control-using-a-pid-controller.html).
-These are conservative initial gains, not a stability proof for every workload.
-The manifest exposes `queue_feedback` (scale, integral, target, update count and
-maximum unfinished-frame age). A zero update count is observable and must not be
-reported as a controller successfully regulating that session.
+The native regression suite includes fixed-cost three-stage pipelines, genuine
+capacity changes, slow/absent supply, generation fences, independent controls,
+progressive publication before later latents finish, and source ownership/EOS
+checks. It does not estimate real GPU gains. Run matched latest/adaptive trials
+on the actual 480 and 736 deployments before making throughput, latency, memory
+or quality claims. Browser acceptance remains separate from server generation.
 
-In a 36 FPS capture / 18.6 FPS virtual consumer with 34 credits, 9/17-frame
-batches and 0/5/36 Hz controls, the candidate preserves output count, keeps
-selected-capture P95 below 85 ms and does not increase virtual input P95. With
-25 credits, the larger batch can remain supply-constrained; the controller
-preserves the hard limit and may not obtain a healthy estimate. Those simulations
-are not GPU throughput or browser latency evidence. Keep the current live credit
-budget unless separately justified; the user performs browser acceptance.
 
-The candidate also incorporates the scoped PR664 input changes from 422fde26
-and pins the already-deployed SDK dev ancestor 4c10ad265a74cf2a5dc59a8d6445363b85771ce3.
-Its complete image replaces the prior test source/SDK bind overlays. Gateway,
-model workers and their weights remain outside this Room-only rollout.
+## Isolated validation, 2026-11-12
+
+Three 190-second real CLI/model sessions at 832×480 and CLI36 exercised the same
+H100 Encoder/Decoder and H200 SP2 group. Native demand and the progressive release
+handshake were observed, with successful release and subsequent sessions. Whole-
+window model FPS was26.295 (first adaptive),27.247 (latest),26.126 (warm adaptive).
+The warm adaptive repeat was4.1% slower and had higher source-to-raw/input P95;
+this is not an unconditional speed or latency gain. Both modes showed previously
+observed long-session quality deterioration. See the
+[validation report](../../../../../benchmark/whitebox/unified_progressive_validation_20261112.md)
+for startup effects, missing input samples, source/image identities and untested
+736/browser/cache/multiplayer boundaries. Production was not changed.

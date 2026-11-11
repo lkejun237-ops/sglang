@@ -65,11 +65,10 @@ class InputChangeTracker:
 
 
 class QueueFeedback:
-    """Small PI correction around measured completion cadence, not a hard gate.
+    """Small P correction for reported *unprocessed source*, never total in-flight.
 
-    Time-average a half-second window to avoid chasing batch completion jumps.
-    Low-water, startup, condition and supply fences freeze/reset the integrator.
-    All limits are dimensionless; hard native frame/byte credits stay separate.
+    No integral or derivative: a stale/missing native observation cannot slow
+    admission, and starvation immediately removes the correction.
     """
 
     def __init__(self):
@@ -79,77 +78,56 @@ class QueueFeedback:
 
     def freeze(self):
         self.scale = 1.0
-        self.integral = 0.0
+        self.integral = 0.0  # Kept in archived diagnostics; no integrator is run.
         self.last = None
-        self.last_seen = None
-        self.elapsed = self.queue_area = self.age_area = 0.0
         self.error = 0.0
         self.target = None
 
     def suspend(self):
-        # Do not integrate a low-water/source wait, but retain the correction
-        # across ordinary batch refill dips. Long gaps invalidate it below.
-        self.last = None
+        self.freeze()
 
-    def observe(self, now, *, buffered, reserve, capacity, oldest_age, period, enabled):
+    def observe(
+        self,
+        now,
+        *,
+        buffered,
+        reserve,
+        capacity,
+        oldest_age,
+        period,
+        enabled,
+        queued_source_frames=None,
+    ):
+        if oldest_age is not None and math.isfinite(oldest_age):
+            self.max_oldest_age = max(self.max_oldest_age, oldest_age)
         if (
             not enabled
             or period is None
-            or oldest_age is None
-            or not all(math.isfinite(v) for v in (now, oldest_age, period))
-            or period <= 0
-            or oldest_age < 0
+            or queued_source_frames is None
             or capacity <= reserve
+            or not math.isfinite(now)
         ):
             self.freeze()
             return
-        if self.last_seen is not None and now - self.last_seen > 2.0:
-            self.freeze()
-        self.last_seen = now
-        if buffered < reserve:
-            self.suspend()
+        self.target = max(1, reserve)
+        if queued_source_frames <= self.target:
+            self.scale = 1.0
+            self.error = 0.0
+            self.last = now
             return
-        self.max_oldest_age = max(self.max_oldest_age, oldest_age)
-        self.target = min(capacity, reserve + max(2, (reserve - 1) / 2))
-        old, self.last = self.last, (now, buffered, oldest_age)
-        if old is None:
+        if self.last is not None and 0 <= now - self.last < 0.5:
             return
-        dt = now - old[0]
-        if not 0 < dt <= 0.25:
-            self.freeze()
-            return
-        self.elapsed += dt
-        self.queue_area += old[1] * dt
-        self.age_area += min(old[2] + dt / 2, 10 * period * capacity) * dt
-        if self.elapsed < 0.5:
-            return
-        queue = self.queue_area / self.elapsed
-        age = self.age_area / self.elapsed
-        queue_error = (queue - self.target) / max(1, reserve)
-        age_error = max(0.0, age / (self.target * period) - 1.0)
-        error = max(-1.0, min(1.0, queue_error + 0.5 * age_error))
-        self.error = 0.0 if abs(error) < 0.05 else error
-        candidate = max(
-            -0.06, min(0.06, self.integral + 0.04 * self.error * self.elapsed)
-        )
-        raw = 1.0 + 0.12 * self.error + candidate
-        # Conditional integration: do not accumulate error into saturation.
-        if (
-            1.0 <= raw <= 1.15
-            or (raw > 1.15 and self.error < 0)
-            or (raw < 1.0 and self.error > 0)
-        ):
-            self.integral = candidate
-        desired = max(1.0, min(1.15, 1.0 + 0.12 * self.error + self.integral))
-        self.scale += max(-0.02, min(0.02, desired - self.scale))
+        self.last = now
+        self.error = min(1.0, (queued_source_frames - self.target) / self.target)
+        desired = 1.0 + 0.05 * self.error
+        self.scale += max(-0.02, min(0.01, desired - self.scale))
         self.updates += 1
-        self.elapsed = self.queue_area = self.age_area = 0.0
 
     def snapshot(self):
         return dict(
-            kind="bounded_pi",
+            kind="bounded_p_native_source",
             period_scale=self.scale,
-            integral=self.integral,
+            integral=0.0,
             error=self.error,
             target_frames=self.target,
             updates=self.updates,
@@ -187,6 +165,125 @@ class AdaptiveSourceSampler:
         self.last_deferred_version = None
         self.admission_counts = Counter()
         self.feedback = QueueFeedback()
+        self.native = None
+        self.native_required = 0
+        self.native_accepted = self.native_queued = self.native_sequence = 0
+        self.native_dispatched = 0
+        self.native_waiting = False
+        self.native_wait_ms = 0.0
+        self.native_seen = None
+        self.measuring = False
+        self.slow_windows = 0
+        self.capture_sample = None
+        self.capture_period_us = None
+
+    def configure_native(self, ready, *, session_id, generation_id, capacity):
+        enabled = ready.get("source_demand_protocol") == "source-demand-v1"
+        flow = ready.get("source_flow")
+        if enabled and (
+            any(not isinstance(v, str) or not v for v in (session_id, generation_id))
+            or type(capacity) is not int
+            or capacity < 1
+            or not isinstance(flow, dict)
+            or flow.get("protocol") != "clip17-source-flow-v1"
+            or flow.get("input_groups") != [1, 8, 8]
+        ):
+            raise ValueError("Invalid source demand identity")
+        self.native = dict(
+            enabled=enabled,
+            session_id=session_id,
+            generation_id=generation_id,
+            capacity=capacity,
+            input_quantum=max(flow["input_groups"]) if enabled else None,
+        )
+        self.native_required = self.native_accepted = self.native_queued = 0
+        self.native_dispatched = 0
+        self.native_sequence = 0
+        self.native_waiting = False
+        self.native_wait_ms = 0.0
+        self.native_seen = None
+        self.reset()
+
+    def model_demand(self, message, *, sent, now):
+        if self.native is None or not self.native["enabled"]:
+            raise ValueError("Source demand was not negotiated")
+        fields = [
+            message.get(k)
+            for k in (
+                "sequence",
+                "accepted_source_frame_end",
+                "required_source_frame_end",
+                "queued_source_frames",
+                "dispatched_source_frame_end",
+            )
+        ]
+        seq, accepted, required, queued, dispatched = fields
+        waited = message.get("input_wait_ms")
+        waiting = message.get("waiting_for_source")
+        if (
+            message.get("protocol") != "source-demand-v1"
+            or any(
+                message.get(k) != self.native[k]
+                for k in ("session_id", "generation_id")
+            )
+            or any(type(v) is not int for v in fields)
+            or seq <= self.native_sequence
+            or not self.native_accepted <= accepted <= sent
+            or not self.native_dispatched <= dispatched <= accepted
+            or not 0 <= required <= sent + self.native["capacity"]
+            or not 0 <= queued <= min(accepted, self.native["capacity"])
+            or queued != accepted - dispatched
+            or type(waiting) is not bool
+            or (waiting and accepted >= required)
+            or type(waited) not in (int, float)
+            or not math.isfinite(waited)
+            or waited < self.native_wait_ms
+        ):
+            raise ValueError("Invalid native source demand")
+        if waiting or waited > self.native_wait_ms:
+            self.fed = False
+            self.feedback.freeze()
+            self.counts["native_source_waits"] += 1
+        self.native_sequence, self.native_accepted = seq, accepted
+        self.native_dispatched = dispatched
+        self.native_required, self.native_queued = required, queued
+        self.native_waiting, self.native_wait_ms, self.native_seen = (
+            waiting,
+            waited,
+            now,
+        )
+
+    def native_healthy(self, now):
+        return (
+            self.native is not None
+            and self.native["enabled"]
+            and self.native_seen is not None
+            and not self.native_waiting
+            and 0
+            <= now - self.native_seen
+            <= max(2.0, 2 * self.native["capacity"] * (self.period_us or 0) / 1_000_000)
+        )
+
+    def needs_input(self, sent):
+        return self.native is not None and self.native_required > sent
+
+    def observe_queue(self, now, *, sent, **kwargs):
+        healthy = self.native_healthy(now)
+        if healthy:
+            # The source queue target is one native encoder group, independent
+            # of the AR first-output minimum or total pipeline in-flight count.
+            kwargs = {**kwargs, "reserve": self.native["input_quantum"]}
+        self.feedback.observe(
+            now,
+            **kwargs,
+            queued_source_frames=(
+                self.native_queued + max(0, sent - self.native_accepted)
+                if healthy
+                else None
+            ),
+        )
+        if self.native is not None and not healthy:
+            self.fed = False
 
     def reset(self):
         self.period_us = self.next_pts = self.last_pts = self.last_version = None
@@ -197,6 +294,9 @@ class AdaptiveSourceSampler:
         self.last_deferred_version = None
         self.counts["resets"] += 1
         self.feedback.freeze()
+        self.measuring = self.native is not None and self.native["enabled"]
+        self.slow_windows = 0
+        self.capture_sample = self.capture_period_us = None
 
     def control_changed(self, identity, sequence, semantic_control=False):
         if semantic_control and self.last_input is not None:
@@ -246,6 +346,21 @@ class AdaptiveSourceSampler:
         pts = capture_pts(frame)
         if version <= after:
             return False
+        if self.capture_sample is None or version > self.capture_sample[0]:
+            if self.capture_sample is not None and pts > self.capture_sample[1]:
+                measured = (pts - self.capture_sample[1]) / (
+                    version - self.capture_sample[0]
+                )
+                self.capture_period_us = (
+                    measured
+                    if self.capture_period_us is None
+                    else 0.8 * self.capture_period_us + 0.2 * measured
+                )
+            self.capture_sample = (version, pts)
+        if self.native is not None and not self.native["enabled"]:
+            return True  # Old peers keep bounded latest, not unobserved feedback.
+        if self.measuring:
+            return True  # Bounded latest is an independent capacity probe.
         identity = self.input_identity(frame)
         reset = self.last_version is not None and (
             after != self.last_version
@@ -279,14 +394,20 @@ class AdaptiveSourceSampler:
         if version != self.last_deferred_version:
             self.admission_counts["early_captures"] += 1
             self.last_deferred_version = version
+        # A completion window shaped by our own admission gate is not an
+        # independent measurement of a slower model. It may still prove a
+        # faster sustainable rate, but must not ratchet capacity downward.
+        self.fed = False
         return False
 
     def supply(self, buffered, reserve, *, available=False):
+        if self.native is not None:
+            return  # Native readiness, not total GPU in-flight, owns this fence.
         if buffered < reserve and not available:
             self.fed = False
             self.feedback.suspend()
 
-    def completed(self, end, now, *, buffered, reserve):
+    def completed(self, end, now, *, buffered, reserve, learning_allowed=True):
         """Observe a batch with its input still counted in `buffered`.
 
         A normal completion/refill dip is not starvation. Source waits below the
@@ -295,26 +416,76 @@ class AdaptiveSourceSampler:
         if self.last_completed is not None and end <= self.last_completed:
             return
         self.last_completed = end
+        if self.native is not None and not self.native["enabled"]:
+            return
+        if not learning_allowed:
+            self.anchor = None
+            self.fed = False
+            self.feedback.freeze()
+            return
         self.supply(buffered, reserve)
         if self.anchor is not None:
             previous, started = self.anchor
             if end <= previous:
                 return  # Duplicate receipts do not invent a cadence sample.
             elapsed = now - started
-            if not self.fed or not 0 < elapsed <= self.reset_seconds:
+            if not 0 < elapsed <= max(self.reset_seconds, 4.0 if self.native else 0):
                 self.anchor = None
-            elif elapsed >= self.observation_seconds:
+            elif elapsed >= (
+                2.0
+                if self.measuring
+                else 1.0
+                if self.native
+                else self.observation_seconds
+            ):
                 measured = elapsed * 1_000_000 / (end - previous)
-                self.period_us = (
-                    measured
-                    if self.period_us is None
-                    else 0.8 * self.period_us + 0.2 * measured
+                healthy = self.fed and (self.native is None or self.native_healthy(now))
+                source_headroom = (
+                    self.capture_period_us is not None
+                    and self.capture_period_us < 0.9 * measured
                 )
-                self.counts["rate_observations"] += 1
+                if self.measuring and source_headroom:
+                    # Measure the attainable full pipeline with no soft
+                    # admission gate. Native credit/batch bubbles are part of
+                    # that capacity; a genuinely source-limited window is not.
+                    self.period_us = measured
+                    self.measuring = False
+                    self.slow_windows = 0
+                    self.counts["capacity_probes"] += 1
+                    self.counts["rate_observations"] += 1
+                elif not self.measuring and (
+                    healthy
+                    or (self.period_us is not None and measured < self.period_us)
+                ):
+                    self.period_us = (
+                        measured
+                        if self.period_us is None
+                        else 0.8 * self.period_us + 0.2 * measured
+                    )
+                    self.counts["rate_observations"] += 1
+                    self.slow_windows = 0
+                else:
+                    self.counts["capacity_samples_rejected"] += 1
+                    if (
+                        self.native is not None
+                        and not self.measuring
+                        and self.period_us is not None
+                        and source_headroom
+                        and measured > 1.1 * self.period_us
+                    ):
+                        self.slow_windows += 1
+                        if self.slow_windows >= 2:
+                            self.measuring = True
+                            self.feedback.freeze()
+                            self.counts["capacity_rechecks"] += 1
                 self.anchor = None
         if self.anchor is None:
             self.anchor = (end, now)
-            self.fed = buffered >= reserve
+            self.fed = (
+                self.native_healthy(now)
+                if self.native is not None
+                else buffered >= reserve
+            )
         else:
             self.supply(buffered, reserve)
 
@@ -382,6 +553,8 @@ class AdaptiveSourceSampler:
         )
         if startup:
             reason = "startup"
+        elif self.measuring:
+            reason = "capacity_probe"
         elif urgent or changed_input:
             reason = "control"
         elif buffered < reserve:
@@ -449,6 +622,23 @@ class AdaptiveSourceSampler:
     def snapshot(self):
         return dict(
             mode="adaptive",
+            effective_mode=(
+                "latest_unverified_supply"
+                if self.native is not None and not self.native["enabled"]
+                else "adaptive_probe"
+                if self.measuring
+                else "adaptive"
+            ),
+            native_source_demand=dict(
+                negotiated=self.native is not None and self.native["enabled"],
+                accepted_frame_end=self.native_accepted,
+                dispatched_frame_end=self.native_dispatched,
+                required_frame_end=self.native_required,
+                queued_source_frames=self.native_queued,
+                waiting_for_source=self.native_waiting,
+                input_wait_ms=self.native_wait_ms,
+                sequence=self.native_sequence,
+            ),
             selection_counts={
                 k: v
                 for k, v in self.counts.items()

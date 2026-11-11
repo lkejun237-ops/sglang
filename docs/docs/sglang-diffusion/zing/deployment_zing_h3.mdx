@@ -2523,3 +2523,10 @@ OSS 内容寻址、本地安全解包和真实导入来源检查，以及上海 
 `deploy/sglang/orchestrate.py` 与 `deploy/sglang/launch.py` 统一通过 `sglang.multimodal_gen.tools.zing_h3_profile_launcher --mode independent` → `zing_h3_role_launcher.py` 启动各独立角色，集成式 bundle 通过 `deploy/whitebox/model_service.py` 委托 `zing_h3_profile_launcher --mode integrated`，移除用户侧 `role_launcher` 分支。支持参数化 `target` 环境配置（覆盖 H100 Encoder/Decoder + H200 SP1 DiT，以及 B300 三角色拓扑）、Encoder/Decoder `create`/`reuse` 混合编排与多 service 单活跃会话、自动生成 `deployment.json`/`DEPLOYMENT.md` 及 `history`/`show`/`diff`/`rollback` 受控回滚（契约见 `deploy/sglang/ORCHESTRATION.md`）。
 - **已实测范围（`test-shanghai-copy`，`832×480`，`model1027`）**：基于 `d180d0071dc3` 完成 H100 新建 Encoder + H200 新建 SP1 DiT + H100 复用常驻 Decoder（`adaptive-test-decoder-20261109-r2`）实机部署（`deploy-20261110T115739Z-88e645ef`）、Coordinator 租约 `selftest`、原地 `attach`、4-Case 真实生成（4/4 PASS）、真实 Chromium 浏览器首帧/按键/换词/正常结束/取消/单会话互斥/断连恢复及受控回滚演练（`deploy-20261110T181155Z-b99af6d7`），复用 Decoder 全程保持原 `boot_epoch`。
 - **当前未验证边界**：`test-shanghai-copy` Coordinator 当前仅注册 `480` 档，故 `1280×736` 档在本环境阻塞未测（不以 480 外推）；B300 三角色拓扑与 `h200_sp2` 档本轮仅完成源码与离线单测验证，尚未执行 B300 实机 GPU 部署验收。完整实机回执与浏览器证据见 [上海 `test-shanghai-copy` 实机验收记录](../../../../benchmark/whitebox/sglang_shanghai_copy_20261110.md)。
+
+
+### 2026-11-12 统一渐进输入输出与需求供帧（上海副本专项）
+
+基于main `4229aa4df5` 的隔离候选接通独立Decoder的渐进分片，并经真实open回执将释放能力传至Room；clip17源依赖、首块最低输入与原生队列目标分开。新Room可请求 `source-demand-v1`，模型按实际输入需求报告进度；采样器排除自身等待造成的慢容量样本，使用有界latest重新测量和无积分的小幅P修正。旧peer缺少需求能力时回到有界latest，不宣称已完成自适应调节。契约见[自适应供帧](/docs/sglang-diffusion/zing/specs/whitebox-adaptive-source-sampling)。
+
+上海副本已以完整a7d61072镜像、SDK31ea27da、H100 E/D+H200 SP2、1027 BF16 W6/S0验证832×480、CLI36：三场首模型包后各190秒，A1/B1/A2模型26.295/27.247/26.126FPS，确认真实1/8/8输入、首块9帧依赖、渐进输出、native demand、退出释放及新会话接续。暖A2比latest吞吐低4.1%、源到raw P95高5.3%，不得宣称无退化；两模式均有既往也观察到的长时画质劣化。用户快速试玩反馈正常，不替代定时浏览器验收。736/B300、五case、Prompt/Prefill/cache/多人、三角色分项耗时与峰值显存未覆盖；未修改训练或正式环境。详见[本轮报告](../../../../benchmark/whitebox/unified_progressive_validation_20261112.md)，保留启动失败、预热与比较边界。

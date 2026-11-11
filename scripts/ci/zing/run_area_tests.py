@@ -21,6 +21,8 @@ AREA_FILES = [
         "test_whitebox_sdk_control_relay.py",
         "test_whitebox_render_lifecycle.py",
         "test_whitebox_source_sampling.py",
+        "test_whitebox_source_flow.py",
+        "test_whitebox_native_source_cadence.py",
         "test_whitebox_live_input_archive.py",
         "test_whitebox_room_pipeline.py",
         "test_whitebox_rtc_lifecycle.py",

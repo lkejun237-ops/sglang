@@ -407,6 +407,7 @@ class _LoopExit(BaseException):
 def _loop_service(*, fail_on=None, transfer_events=None):
     class Service:
         def __init__(self, *args, **kwargs):
+            self.progressive = kwargs.get("progressive", False)
             self.width = self.height = 8
             self.valid_frame_end = self.submitted_frames = self.buffered_latents = 0
 
@@ -931,8 +932,9 @@ def test_decoder_loop_failed_append_ends_service_without_ok_reply():
     assert replies[-1]["code"] == "DECODER_RESTART_REQUIRED"
 
 
+@pytest.mark.parametrize("queue_driven", [False, True])
 def test_progressive_service_publishes_before_the_next_latent_finishes(
-    model, decode_group
+    model, decode_group, queue_driven
 ):
     """Progress must be observable before the whole dispatch has decoded."""
     entered, release = threading.Event(), threading.Event()
@@ -948,6 +950,7 @@ def test_progressive_service_publishes_before_the_next_latent_finishes(
         decode_group=decode_group,
         device=torch.device("cpu"),
         progressive=True,
+        queue_driven=queue_driven,
     )
     original = service._stream.push
     calls = 0
@@ -1035,3 +1038,46 @@ def test_d1_progressive_transfer_preserves_publication_before_next_receive(progr
     )
     assert error is None and all(r["ok"] for r in replies)
     assert events == (["wait", "receive"] if progressive else ["receive"])
+
+
+@pytest.mark.parametrize("auto_output", [False, True])
+@pytest.mark.parametrize("progressive", [False, True])
+def test_decoder_open_reports_actual_release_and_progressive_capabilities(
+    auto_output, progressive
+):
+    replies, error = _run_decoder_loop(
+        [
+            dict(
+                op="open",
+                session="owner",
+                bridge_port=1001,
+                capacity_latents=40,
+                auto_output=auto_output,
+            ),
+            dict(op="close", channel="$open"),
+        ],
+        progressive=progressive,
+    )
+    assert error is None
+    assert replies[0]["source_output_release_protocol"] == "valid-source-frames-v1"
+    assert replies[0]["progressive_output"] is progressive
+
+
+def test_remote_capabilities_are_from_the_opened_peer_not_local_flags(monkeypatch):
+    from sglang.multimodal_gen.runtime.models.vaes.lynn_streaming.temporal import (
+        TemporalProtocol,
+    )
+
+    decoder = _remote_decoder(monkeypatch, TemporalProtocol(ARCHITECTURE))
+    decoder._opened({"output_attachment": {"token": "test"}, "oneway_supported": True})
+    assert decoder.output_capabilities == {}
+    decoder._opened(
+        {
+            "source_output_release_protocol": "valid-source-frames-v1",
+            "progressive_output": True,
+        }
+    )
+    assert decoder.output_capabilities == {
+        "source_output_release_protocol": "valid-source-frames-v1",
+        "progressive_output": True,
+    }

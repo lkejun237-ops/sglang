@@ -117,6 +117,22 @@ class WhiteboxConfig:
             else 17 + int(self.room_owned and self.capture_clock)
         )
 
+    def negotiated_minimum_model_input_frames(self, ready):
+        flow = ready.get("source_flow")
+        if flow is None:
+            return self.minimum_model_input_frames
+        if (
+            not isinstance(flow, dict)
+            or flow.get("protocol") != "clip17-source-flow-v1"
+            or flow.get("input_groups") != [1, 8, 8]
+            or type(flow.get("first_output_input_frames")) is not int
+            or not 1 <= flow["first_output_input_frames"] <= 120
+            or type(flow.get("progressive_output")) is not bool
+            or ready.get("source_output_release_protocol") != "valid-source-frames-v1"
+        ):
+            raise ValueError("Invalid negotiated source flow")
+        return flow["first_output_input_frames"]
+
     def __post_init__(self):
         if self.model_source_sampling not in ("latest", "adaptive"):
             raise ValueError("Unknown model source sampling policy")

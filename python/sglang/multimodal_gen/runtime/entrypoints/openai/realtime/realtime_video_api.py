@@ -974,7 +974,9 @@ async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
                 await coordinator.finish()
 
             wait_started = time.perf_counter()
+            await _send_source_demand(adapter, session, ws, waiting=True)
             await adapter.wait_for_next_chunk(session)
+            await _send_source_demand(adapter, session, ws)
             await adapter.prepare_conditioning(session, server_args)
             wait_ms = (time.perf_counter() - wait_started) * 1000.0
             log_realtime_trace(
@@ -992,6 +994,7 @@ async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
                 chunk = session.new_chunk()
                 batch = adapter.prepare_next_request(session, server_args, chunk)
                 session.bind_chunk_request(chunk, batch)
+                await _send_source_demand(adapter, session, ws)
             except BaseException as exc:
                 observe_stage_seconds(
                     "chunk_prepare",
@@ -1215,12 +1218,23 @@ def _is_source_progress_only(adapter, result):
     )
 
 
+async def _send_source_demand(adapter, session, ws, *, waiting=False):
+    observe = getattr(adapter, "source_demand_message", None)
+    message = (
+        observe(session, waiting_for_input=waiting) if observe is not None else None
+    )
+    if message is not None:
+        await ws.send_bytes(msgspec.msgpack.encode(message))
+
+
 async def _wait_for_source_input(adapter, session, pending_send_task, ws):
+    await _send_source_demand(adapter, session, ws, waiting=True)
     if pending_send_task is None or not getattr(
         adapter, "source_decoder_overlap", False
     ):
         await _flush_source_credit(ws, adapter)
         await adapter.wait_for_next_chunk(session)
+        await _send_source_demand(adapter, session, ws)
         return
     # A failed output cannot return source credit. Do not leave the next input
     # wait stranded behind that failure; the loop still owns the output task.
@@ -1235,6 +1249,7 @@ async def _wait_for_source_input(adapter, session, pending_send_task, ws):
             # credit. Release it before waiting on credit-dependent input.
             await _flush_source_credit(ws, adapter)
         await ready
+        await _send_source_demand(adapter, session, ws)
         if pending_send_task.done():
             pending_send_task.result()
     finally:
@@ -1302,6 +1317,7 @@ async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
                     chunk,
                 )
                 session.bind_chunk_request(chunk, batch)
+                await _send_source_demand(adapter, session, ws)
             except BaseException as exc:
                 observe_stage_seconds(
                     "chunk_prepare",

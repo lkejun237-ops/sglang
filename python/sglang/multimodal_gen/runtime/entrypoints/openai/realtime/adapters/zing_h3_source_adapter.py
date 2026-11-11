@@ -601,6 +601,11 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                 ),
             )
         self.first_source_received_unix_ns = None
+        self.source_demand_protocol = getattr(request, "source_demand_protocol", None)
+        self._source_demand_sequence = 0
+        self._source_demand_last = None
+        self._source_wait_started = None
+        self._source_wait_seconds = 0.0
         self.prompt_event = None
         self.ordered_prompts = (
             getattr(request, "source_prompt_protocol", None) == "ordered-boundary-v2"
@@ -637,6 +642,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             "type": "session.ready",
             "zing_realtime_api_version": 1,
             "session_id": session.id,
+            "generation_id": session.generation_id,
             "num_inference_steps": regular_steps,
             "sampling_schedule": self.sampling_schedule,
             "realtime_output_format": request.realtime_output_format,
@@ -682,6 +688,16 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             )
         if getattr(args.pipeline_config, "decoder_type", None) == "lynn_streaming":
             self.ready["source_output_release_protocol"] = "valid-source-frames-v1"
+            if self.source_encoder["mode"] == "progressive" and self.clip == 17:
+                from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
+                    progressive_source_flow,
+                )
+
+                self.ready["source_flow"] = progressive_source_flow(
+                    self.joint_plan,
+                    progressive_output=self.remote_progressive
+                    or self.source_decode_quantum == 1,
+                )
 
     def _initialize_source_admission(self, session, limits):
         """Initialize private source prefetch; ledger and Encoder still enforce capacity."""
@@ -733,8 +749,11 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         }
 
     def session_ready_message(self, session):
+        ready = dict(self.ready)
+        if getattr(self, "source_demand_protocol", None) and "source_flow" in ready:
+            ready["source_demand_protocol"] = self.source_demand_protocol
         if not getattr(getattr(session, "request", None), "record_model_inputs", False):
-            return self.ready
+            return ready
         if not hasattr(self, "_model_input_ready"):
             self._model_input_ready = self.input_receipt(
                 session,
@@ -747,7 +766,68 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                     source_stream=session.request.source_stream,
                 ),
             )
-        return {**self.ready, **self._model_input_ready}
+        return {**ready, **self._model_input_ready}
+
+    def source_input_required_end(self):
+        if (
+            self.end is not None
+            or self.more_work
+            or self._condition_control_ready()
+            or (self.startup_enabled and self.startup_phase != "attached")
+        ):
+            return self.ledger.accepted_frames
+        target, _ = self._joint_wait_target()
+        return self.dispatched_source_frames + target
+
+    def source_demand_message(self, session, *, waiting_for_input=True):
+        """Native input demand, not a claim that in-flight GPU work is finished."""
+        if (
+            not getattr(self, "source_demand_protocol", None)
+            or "source_flow" not in self.ready
+        ):
+            return None
+        if self.startup_enabled and self.startup_phase != "attached":
+            # Preparation/attachment have their own ordered replies. Do not
+            # insert streaming telemetry into that request-response exchange.
+            return None
+        required = self.source_input_required_end()
+        accepted = self.ledger.accepted_frames
+        waiting = waiting_for_input and accepted < required
+        now = time.monotonic()
+        if waiting and self._source_wait_started is None:
+            self._source_wait_started = now
+        elif not waiting and self._source_wait_started is not None:
+            self._source_wait_seconds += now - self._source_wait_started
+            self._source_wait_started = None
+        state = (
+            accepted,
+            required,
+            self.dispatched_source_frames,
+            self.pending_frames,
+            waiting,
+        )
+        if state == self._source_demand_last:
+            return None
+        self._source_demand_last = state
+        self._source_demand_sequence += 1
+        elapsed = self._source_wait_seconds + (
+            now - self._source_wait_started
+            if self._source_wait_started is not None
+            else 0.0
+        )
+        return dict(
+            type="source.demand",
+            protocol="source-demand-v1",
+            session_id=session.id,
+            generation_id=session.generation_id,
+            sequence=self._source_demand_sequence,
+            accepted_source_frame_end=accepted,
+            dispatched_source_frame_end=self.dispatched_source_frames,
+            required_source_frame_end=required,
+            queued_source_frames=self.pending_frames,
+            waiting_for_source=waiting,
+            input_wait_ms=elapsed * 1000,
+        )
 
     async def _admit_source(self, op, payload):
         if self.admission_socket is None:
@@ -1283,6 +1363,33 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             )
             return
         target, automatic_budget = self._joint_wait_target()
+        if (
+            getattr(self, "source_demand_protocol", None)
+            and "source_flow" in self.ready
+        ):
+            # A partial progressive group cannot produce the next codec result.
+            # Wait on real admission/control progress, not a fixed collection
+            # timer followed by an empty GPU dispatch. EOS still flushes tails.
+            started = time.monotonic()
+            while self.pending_frames < target:
+                if self.ledger.closed:
+                    raise asyncio.CancelledError("Source session has closed")
+                if (
+                    self.end is not None
+                    or self._pending_prompt_command is not None
+                    or getattr(self, "_pending_sink_command", None) is not None
+                ):
+                    break
+                self.available.clear()
+                await self.available.wait()
+            self.joint_wait = dict(
+                budget_ms=0.0,
+                target_frames=target,
+                policy="source_dependency",
+                actual_ms=(time.monotonic() - started) * 1000,
+                reason="ready" if self.pending_frames >= target else "control",
+            )
+            return
         configured_budget = self.profile.get("joint_wait_ms", "auto")
         budget = automatic_budget if configured_budget == "auto" else configured_budget
         started = time.monotonic()
@@ -1328,6 +1435,18 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             )
 
     def _joint_wait_target(self):
+        if (
+            getattr(self, "source_demand_protocol", None)
+            and "source_flow" in self.ready
+            and self.source_encoder["mode"] == "progressive"
+        ):
+            from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
+                next_progressive_source_end,
+            )
+
+            return next_progressive_source_end(
+                self.dispatched_source_frames
+            ) - self.dispatched_source_frames, 0.0
         if self.source_encoder["mode"] != "progressive":
             # Preserve first-pixel presentation while condition preparation runs.
             target = 1 if not self.dispatched_source_frames else self.clip
@@ -1338,9 +1457,9 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
 
         # The progressive clip17 codec emits at pixel watermarks 1/9/17,
         # yielding latent ends 1/3/5. AR chunks are a separate checkpoint plan.
-        def dependency(end):
-            clips, last = divmod(end - 1, 5)
-            return clips * 17 + (1 if last == 0 else 9 if last < 3 else 17)
+        from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
+            progressive_source_dependency as dependency,
+        )
 
         while (
             dependency(self.joint_plan.chunk(self.joint_chunk_id).end)

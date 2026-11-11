@@ -1182,18 +1182,21 @@ def test_both_streams_can_hold_one_second_at_target_bitrate(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "batch_frames,pipeline_overlap,input_frames",
+    "batch_frames,pipeline_overlap,input_frames,native_flow",
     [
-        (1, False, 18),
-        (17, False, 18),
-        (1, True, 18),
-        (17, True, 18),
-        (9, True, 9),
-        (4, True, 9),
+        (1, False, 18, False),
+        (17, False, 18, False),
+        (1, True, 18, False),
+        (17, True, 18, False),
+        (9, True, 9, False),
+        (4, True, 9, False),
+        (1, True, 25, True),
+        (4, True, 25, True),
+        (9, True, 25, True),
     ],
 )
 def test_capture_clock_stream_drains_all_preview_and_paired_frames(
-    tmp_path, monkeypatch, batch_frames, pipeline_overlap, input_frames
+    tmp_path, monkeypatch, batch_frames, pipeline_overlap, input_frames, native_flow
 ):
     """A continuous producer must keep the final VFR AU and its original identity."""
 
@@ -1205,6 +1208,38 @@ def test_capture_clock_stream_drains_all_preview_and_paired_frames(
     async def batched(self, message):
         if message["type"] == "session.ready":
             message["source_output_release_protocol"] = "valid-source-frames-v1"
+            if native_flow:
+                message.update(
+                    session_id="s1",
+                    generation_id="g1",
+                    source_demand_protocol="source-demand-v1",
+                    source_flow=dict(
+                        protocol="clip17-source-flow-v1",
+                        input_groups=[1, 8, 8],
+                        first_output_input_frames=9,
+                        progressive_output=True,
+                    ),
+                )
+        if message["type"] == "source.accepted" and native_flow:
+            await original(self, message)
+            end = message["source_frame_end"]
+            await original(
+                self,
+                dict(
+                    type="source.demand",
+                    protocol="source-demand-v1",
+                    session_id="s1",
+                    generation_id="g1",
+                    sequence=end,
+                    accepted_source_frame_end=end,
+                    dispatched_source_frame_end=end,
+                    required_source_frame_end=end + 1,
+                    queued_source_frames=0,
+                    waiting_for_source=False,
+                    input_wait_ms=0.0,
+                ),
+            )
+            return
         if message["type"] == "frame_batch":
             held.append(message)
             if len(held) < batch_frames:
@@ -1230,6 +1265,7 @@ def test_capture_clock_stream_drains_all_preview_and_paired_frames(
             model_input_frames=input_frames,
             pipeline_overlap=pipeline_overlap,
             model_subclip_admission=input_frames == 9,
+            model_source_sampling="latest",
         )
         rows = {"whitebox": [], "model": []}
         decoders = {name: av.CodecContext.create("h264", "r") for name in rows}
@@ -1298,6 +1334,12 @@ def test_capture_clock_stream_drains_all_preview_and_paired_frames(
             assert pairing["model_input_capacity"] == input_frames
             assert pairing["capacity"] == input_frames + (4 if pipeline_overlap else 0)
             assert pairing["high_water_frames"] <= pairing["capacity"]
+            if native_flow:
+                assert pairing["minimum_input_capacity"] == 9
+                assert pairing["source_flow"]["input_groups"] == [1, 8, 8]
+                assert (
+                    leases.opens[0].init["source_demand_protocol"] == "source-demand-v1"
+                )
         finally:
             await host.close()
             await host.runtime.close()

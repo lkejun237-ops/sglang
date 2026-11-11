@@ -3559,3 +3559,37 @@ def test_budget_cli_overrides_pipeline_json(tmp_path, monkeypatch, cli_override)
         50000 if cli_override else 8000
     )
     assert args.pipeline_config.zing_reference_max_images == 21
+
+
+@pytest.mark.parametrize("eos", [False, True])
+def test_native_demand_waits_for_dependency_or_eos_not_fixed_timeout(configured, eos):
+    adapter, session = initialize()
+    adapter.source_encoder = {"mode": "progressive"}
+    adapter.joint_plan = source.ChunkPlan([3, 2], False)
+    adapter.dispatched_source_frames = 9
+    adapter.pending_frames = 7
+    adapter.source_demand_protocol = "source-demand-v1"
+    adapter.ready["source_flow"] = {"protocol": "clip17-source-flow-v1"}
+    adapter.profile.update(joint_forward="cross_chunk", joint_wait_ms=1)
+
+    async def run():
+        task = asyncio.create_task(adapter.wait_for_next_chunk(session))
+        try:
+            await asyncio.sleep(0.02)
+            assert not task.done(), (
+                "An expired timer cannot make an incomplete native group executable"
+            )
+            if eos:
+                adapter.end = {"source_frame_end": 16}
+            else:
+                adapter.pending_frames = 8
+            adapter.available.set()
+            await asyncio.wait_for(task, 0.2)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            adapter.dispose(session)
+
+    asyncio.run(run())
+    assert adapter.joint_wait["policy"] == "source_dependency"
+    assert adapter.joint_wait["reason"] == ("control" if eos else "ready")

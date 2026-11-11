@@ -100,6 +100,20 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
                     "The connected model does not support source preparation.",
                 )
             self.ready.update(output_kind=self.output_kind)
+            for value in opened or []:
+                if value["type"] != "session.opened":
+                    continue
+                if (
+                    value.get("source_output_release_protocol")
+                    == "valid-source-frames-v1"
+                ):
+                    self.ready["source_output_release_protocol"] = value[
+                        "source_output_release_protocol"
+                    ]
+                    if self.source_encoder["mode"] == "progressive" and self.clip == 17:
+                        flow = value.get("source_flow")
+                        if flow is not None:
+                            self.ready["source_flow"] = flow
             self.output_attachment = next(
                 (
                     v.get("output_attachment")

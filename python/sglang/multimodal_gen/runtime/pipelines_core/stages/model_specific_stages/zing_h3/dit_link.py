@@ -370,11 +370,34 @@ class DiTInputService:
                 self.owner = identity
                 if self.create_decoder is not None:
                     self.decoder = self.create_decoder(message)
+                    capabilities = dict(
+                        getattr(
+                            getattr(self.decoder, "remote", None),
+                            "output_capabilities",
+                            {},
+                        )
+                    )
+                    bridge = getattr(self.worker, "bridge", None)
+                    if (
+                        capabilities
+                        and bridge is not None
+                        and (bridge.clip_frames, bridge.clip_latents, bridge.ratio)
+                        == (17, 5, 4)
+                    ):
+                        from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
+                            progressive_source_flow,
+                        )
+
+                        capabilities["source_flow"] = progressive_source_flow(
+                            bridge.plan,
+                            progressive_output=capabilities["progressive_output"],
+                        )
                     reply(
                         "session.opened",
                         session_id=identity[0],
                         generation_id=identity[1],
                         output_kind="rgb",
+                        **capabilities,
                         async_inputs=bool(
                             getattr(
                                 getattr(self.decoder, "remote", None), "oneway", False
