@@ -62,6 +62,51 @@ parent and child cleanup before reporting `disabled`; its World, input and UI
 remain alive, and a later enable selects a fresh source frame. CPU coverage does
 not establish deployed Room, GPU or visible-player behavior.
 
+### Exclusive source clock pause
+
+`session.ready.capabilities.source_pause=true` advertises an exclusive native-pixel
+CLI source. On its existing authenticated control connection, send `source.pause`
+or `source.resume` with a canonical UUID `pause_id` and the normal
+`type=command`, `version=2`, `request_id`, `source_session_id`, and `source_epoch`
+envelope. No CLI token is exposed to the browser. Shared/member Worlds and
+non-native sources reject this capability; a model inference toggle is unrelated.
+
+The normal `operation.result` first reports `accepted`. Only a confirmed engine
+hold completes with `source_pause={pause_id,state:"paused",maximum_pause_ms:300000}`.
+Resume completes with the same shape and `state:"running"`. `source.status` carries
+current `source_pause`, or `null` while no pause has been confirmed or an outcome
+is unconfirmed. Historical operation receipts remain historical: use current
+status after reconnect or when reconciling a lost reply. Identical request retries
+replay the journal result without repeating an engine operation. Reusing a released
+pause ID cannot acquire another hold. Resume of an unowned ID is a running no-op
+for that ID and never releases another pause or Prefill hold.
+
+The engine reuses the SDK capture hold: stop the original World tick, release
+input, drain in-flight capture, and publish exactly one fresh frame. Source/UI
+wall timestamps retain their original clock; buffered model output can still
+arrive. A feedback caller keeps its original click snapshot rather than replacing
+it with this later hold frame. This control does not change model inference,
+Prompt, archive clocks, session lifetime or model leases.
+
+A pending/held Prefill (including its first-frame, compute and recovery work) and
+a different pause ID conflict with `SOURCE_PAUSE_BUSY`. Both control owners
+reserve capture admission synchronously before journal or reply awaits, releasing
+only their own reservation on failure; neither may enter the other owner’s hold.
+A held or pending source pause rejects a new `render.prepare`. Only a confirmed
+pause suppresses the original input-idle owner. Detach, connection replacement,
+source close and the five-minute safety deadline release only the original
+pause/engine. A late hold receipt after cancellation is resumed rather than
+published as paused. Resume failure produces `SOURCE_PAUSE_UNCONFIRMED`; it never
+reports successful running or leaves indefinite idle suppression. The caller can
+retry resume using the original pause ID. Closing a feedback dialog must reconcile
+its pending pause and request this resume even after an unconfirmed pause result.
+No synthetic input, duplicated still frames or client `video.pause()` substitutes
+for a source pause.
+
+CPU coverage is maintained in `test_source_pause.py` and the existing Prefill,
+render-journal and lifecycle suites. This is not deployed Room/CLI, real Player,
+GPU, or shared-session acceptance.
+
 ### World-owned model conditions and recovery
 
 When `session.ready.world_driven` is true, the authenticated SDK source supplies

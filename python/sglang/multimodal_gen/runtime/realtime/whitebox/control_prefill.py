@@ -139,6 +139,13 @@ class ControlPrefill:
         return state
 
     async def prepare(self, command):
+        pause = getattr(self.owner, "source_pause", None)
+        if pause is None:
+            return await self._prepare(command)
+        with pause.reserve_prefill():
+            return await self._prepare(command)
+
+    async def _prepare(self, command):
         """Explicit context boundary; a future real frame becomes video F0."""
         state = await self.available()
         self.owner.journal.require_revision(state, command)

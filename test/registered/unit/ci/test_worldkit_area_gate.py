@@ -32,6 +32,7 @@ def test_area_gate_runs_real_child_receipts_and_requires_aggregate_success(
         "test_whitebox_player_media.py",
         "test_whitebox_native.py",
         "test_control_prefill.py",
+        "test_source_pause.py",
         "test_whitebox_model_inputs.py",
         "test_whitebox_model_binding.py",
         "test_bound_video.py",

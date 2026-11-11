@@ -52,6 +52,7 @@ AREA_FILES = [
         "test_whitebox_player_control.py",
         "test_whitebox_owner_retirement.py",
         "test_control_prefill.py",
+        "test_source_pause.py",
         "test_whitebox_model_inputs.py",
         "test_whitebox_capture_wait.py",
         "test_whitebox_player_idle.py",

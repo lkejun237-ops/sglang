@@ -171,6 +171,9 @@ class RenderPipeline(RoomPipeline):
         )
 
     def create_subscription(self):
+        pause = getattr(self.session, "source_pause", None)
+        if self.generation > 1 and pause is not None:
+            pause.invalidate()
         self.session.resolve_area_offer = self.resolve_area_offer
         return RenderSubscription(self, self.generation)
 
@@ -490,6 +493,9 @@ class RenderPipeline(RoomPipeline):
         if self.subscription is not sub:
             return
         self.subscription = None
+        pause = getattr(self.session, "source_pause", None)
+        if pause is not None:
+            pause.invalidate()
         relay = getattr(self, "sdk_control_relay", None)
         if relay is not None:
             relay.stop()
@@ -561,6 +567,8 @@ class RenderPipeline(RoomPipeline):
                 "operation.get",
                 "display.configure",
                 "model.inference.configure",
+                "source.pause",
+                "source.resume",
                 "model.sink",
             }
             member_prefill = getattr(self.session, "member_prefill", None)

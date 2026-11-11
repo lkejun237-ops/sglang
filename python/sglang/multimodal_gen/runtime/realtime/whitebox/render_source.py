@@ -115,6 +115,9 @@ class SourceSession(InteractiveSession):
         self._sdk_retire_task = self._source_close_task = None
         self.close_requested = False
         self.player_finish_task = None
+        from .source_pause import SourcePause
+
+        self.source_pause = SourcePause(self)
 
     @property
     def binding_lifetime_seconds(self):
@@ -457,6 +460,7 @@ class SourceSession(InteractiveSession):
             capabilities=dict(
                 protocol=PROTOCOL,
                 render_segments=True,
+                source_pause=self.source_pause.supported,
                 model_inference_control=self.inference.manual
                 and self.member_prefill is None,
                 model_context_instruction=self.inference.manual
@@ -1079,6 +1083,10 @@ class SourceSession(InteractiveSession):
             playable = (
                 self.source_state_value == "ready"
                 and not (
+                    getattr(self, "source_pause", None) is not None
+                    and self.source_pause.active
+                )
+                and not (
                     self.control_prefill is not None
                     and not self.control_prefill.resumed
                 )
@@ -1243,7 +1251,11 @@ class SourceSession(InteractiveSession):
                 await self.context_intervention(command, state)
                 return
             previous = state["operations"].get(request_id)
-            if previous and command.get("op") != "model.inference.configure":
+            if previous and command.get("op") not in {
+                "model.inference.configure",
+                "source.pause",
+                "source.resume",
+            }:
                 if (
                     previous["payload_sha256"]
                     != hashlib.sha256(canonical(command)).hexdigest()
@@ -1265,6 +1277,17 @@ class SourceSession(InteractiveSession):
                 and op not in {"source.close", "status.get", "operation.get"}
             ):
                 raise RenderError("RENDER_TRANSITION_IN_PROGRESS")
+            if op in {"source.pause", "source.resume"}:
+                if self.binding_ended or self.close_requested:
+                    raise RenderError("INVALID_SOURCE")
+                await self.source_pause.command(command)
+                return
+            if (
+                op == "render.prepare"
+                and getattr(self, "source_pause", None) is not None
+                and self.source_pause.active
+            ):
+                raise RenderError("SOURCE_PAUSE_BUSY")
             if op == "model.inference.configure":
                 if not getattr(getattr(self, "inference", None), "manual", False):
                     raise RenderError("CAPABILITY_UNAVAILABLE")
@@ -1945,6 +1968,11 @@ class SourceSession(InteractiveSession):
                     connection_generation=getattr(self, "control_generation", None),
                     **self.source_identity(),
                     source_state=self.source_state_value,
+                    source_pause=(
+                        self.source_pause.snapshot()
+                        if getattr(self, "source_pause", None) is not None
+                        else None
+                    ),
                     inference=copy.deepcopy(state.get("inference")),
                     render_revision=state["render_revision"],
                     display_revision=state["display_revision"],
@@ -2685,6 +2713,12 @@ class SourceSession(InteractiveSession):
                 sdk = asyncio.create_task(self._sdk_cleanup_for(assignment))
         failures = []
         try:
+            pause = getattr(self, "source_pause", None)
+            if pause is not None:
+                try:
+                    await pause.close()
+                except Exception as error:
+                    failures.append(error)
             if getattr(self, "inference", None) is not None:
                 try:
                     await self.inference.close()

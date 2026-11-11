@@ -41,6 +41,8 @@ OCCUPIED_SEGMENTS = {
 }
 
 MESSAGES = {
+    "SOURCE_PAUSE_BUSY": "The game is already being prepared or paused. Please try again shortly.",
+    "SOURCE_PAUSE_UNCONFIRMED": "The game pause could not be confirmed. Check its status or resume the original pause.",
     "SINK_UPDATE_BUSY": "Wait for the current model control to finish.",
     "SINK_UPDATE_UNKNOWN": "The sink operation is unconfirmed. Query its original request.",
     "PLAYER_IDLE_TIMEOUT": "Your play session ended because there was no input. Please start again.",
@@ -407,7 +409,7 @@ class RenderJournal:
             return operation
 
         def cleanup(state):
-            return command.get("op") == "render.end" or (
+            return command.get("op") in {"render.end", "source.resume"} or (
                 command.get("op") == "model.inference.configure"
                 and command.get("enabled") is False
                 and state.get("inference", {}).get("state") != "disabled"
