@@ -33,6 +33,16 @@ from .room_control import RoomControlCapabilities, exact, identities
 from .rooms import checked_id, require_internal_token
 from .rtc_auth import RTCCapabilities
 
+PUBLIC_STARTUP_FAILURE_CODES = frozenset(
+    {
+        "CAPACITY_EXHAUSTED",
+        "STREAM_DELIVERY_UI_REQUIRED",
+        "STREAM_DELIVERY_UI_INVALID",
+        "STREAM_STARTUP_TIMEOUT",
+        "WTP_PLAYABLE_PUBLICATION_CHANGED",
+    }
+)
+
 ACTIONS = {"start", "getOperation", "getAttachment", "close"}
 RETENTION = 7 * 86400
 TERMINAL_STATES = {"cancelled", "failed", "expired", "lost"}
@@ -186,7 +196,8 @@ class SinglePlayerControl:
         if (
             row
             and result["state"] == "failed"
-            and row.get("failureCode") in {"CAPACITY_EXHAUSTED", "PLAYER_IDLE_TIMEOUT"}
+            and row.get("failureCode")
+            in PUBLIC_STARTUP_FAILURE_CODES | {"PLAYER_IDLE_TIMEOUT"}
         ):
             result["failureCode"] = row["failureCode"]
         return result
@@ -310,9 +321,10 @@ class SinglePlayerControl:
             logging.getLogger(__name__).warning(
                 "Single player launch interrupted: %s", type(error).__name__
             )
+            code = getattr(error, "code", None)
             failure = (
-                {"failureCode": error.code}
-                if isinstance(error, RenderError) and error.code == "CAPACITY_EXHAUSTED"
+                {"failureCode": code}
+                if isinstance(code, str) and code in PUBLIC_STARTUP_FAILURE_CODES
                 else {}
             )
             await self._update(

@@ -70,6 +70,8 @@ MESSAGES = {
     "WTP_REFERENCE_ORIGIN_MISMATCH": "Please open the world from its configured platform.",
     "STREAM_DOWNLOAD_TIMEOUT": "World resources took too long to download. Please try again.",
     "STREAM_NETWORK_FAILED": "The world resource connection was interrupted after several attempts. Please try again.",
+    "STREAM_DELIVERY_UI_REQUIRED": "This delivery is missing its required UI bundle.",
+    "STREAM_DELIVERY_UI_INVALID": "This delivery contains an invalid UI bundle.",
     "STREAM_STARTUP_TIMEOUT": "The world took too long to start. Please try again.",
     "STREAM_STARTUP_ABORTED": "World startup was cancelled or reached its time limit.",
     "STREAM_STARTUP_FAILED": "The world could not start. Please try again.",

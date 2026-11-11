@@ -1002,6 +1002,30 @@ def test_second_launch_preserves_original_single_active_capacity(tmp_path, monke
     asyncio.run(run())
 
 
+def test_cli_startup_error_is_exposed_without_leaking_unknown_codes(
+    tmp_path, monkeypatch
+):
+    from sglang.multimodal_gen.runtime.realtime.whitebox.diagnostics import (
+        WhiteboxDiagnostic,
+    )
+
+    async def run():
+        owner, control = host(tmp_path, monkeypatch)
+
+        async def fail(*args, **kwargs):
+            raise WhiteboxDiagnostic("STREAM_DELIVERY_UI_REQUIRED")
+
+        monkeypatch.setattr(owner, "attach", fail)
+        op = operation()
+        await control.start(op)
+        observed = await control.get_operation(op)
+        assert observed["state"] == "failed"
+        assert observed["failureCode"] == "STREAM_DELIVERY_UI_REQUIRED"
+        await owner.close()
+
+    asyncio.run(run())
+
+
 def test_idle_reason_survives_source_retirement_but_unknown_codes_stay_private(
     tmp_path, monkeypatch
 ):
