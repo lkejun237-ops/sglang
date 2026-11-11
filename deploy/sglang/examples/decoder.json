@@ -6,8 +6,16 @@
   "asset_receipt": "/REQUIRES_VERIFIED_SHANGHAI_ASSETS/assets.json",
   "asset_receipt_sha256": "REQUIRES_VERIFIED_ASSET_RECEIPT_SHA256",
   "decoder_config": "/REQUIRES_VERIFIED_SHANGHAI_ASSETS/decoder.json",
+  "profile": "auto",
+  "resolution": "480",
+  "service_count": 1,
   "environment": {
     "OMP_NUM_THREADS": "1"
   },
-  "startup_timeout": 900
+  "startup_timeout": 900,
+  "ports": {
+    "port": 37000,
+    "http_port": 36000,
+    "output_port": 38000
+  }
 }

@@ -2487,3 +2487,9 @@ OSS 内容寻址、本地安全解包和真实导入来源检查，以及上海 
 480 与 736 的当前版本整体及 Encoder/DiT/Decoder 耗时和显存均未测；H200 SP1 全常驻 736
 历史 OOM 仍是未关闭风险。CPU 归档/启动合同测试不能作为 GPU、跨节点 NCCL 或生成验收。
 完整配置、验证边界和提交命令仅维护在上述入口，不将渲染成功写作部署通过。
+
+### 跨机与单机三角色通用部署编排（2026-11-10/11，PR #657）
+
+`deploy/sglang/orchestrate.py` 与 `deploy/sglang/launch.py` 统一通过 `sglang.multimodal_gen.tools.zing_h3_profile_launcher --mode independent` → `zing_h3_role_launcher.py` 启动各独立角色，集成式 bundle 通过 `deploy/whitebox/model_service.py` 委托 `zing_h3_profile_launcher --mode integrated`，移除用户侧 `role_launcher` 分支。支持参数化 `target` 环境配置（覆盖 H100 Encoder/Decoder + H200 SP1 DiT，以及 B300 三角色拓扑）、Encoder/Decoder `create`/`reuse` 混合编排与多 service 单活跃会话、自动生成 `deployment.json`/`DEPLOYMENT.md` 及 `history`/`show`/`diff`/`rollback` 受控回滚（契约见 `deploy/sglang/ORCHESTRATION.md`）。
+- **已实测范围（`test-shanghai-copy`，`832×480`，`model1027`）**：基于 `d180d0071dc3` 完成 H100 新建 Encoder + H200 新建 SP1 DiT + H100 复用常驻 Decoder（`adaptive-test-decoder-20261109-r2`）实机部署（`deploy-20261110T115739Z-88e645ef`）、Coordinator 租约 `selftest`、原地 `attach`、4-Case 真实生成（4/4 PASS）、真实 Chromium 浏览器首帧/按键/换词/正常结束/取消/单会话互斥/断连恢复及受控回滚演练（`deploy-20261110T181155Z-b99af6d7`），复用 Decoder 全程保持原 `boot_epoch`。
+- **当前未验证边界**：`test-shanghai-copy` Coordinator 当前仅注册 `480` 档，故 `1280×736` 档在本环境阻塞未测（不以 480 外推）；B300 三角色拓扑与 `h200_sp2` 档本轮仅完成源码与离线单测验证，尚未执行 B300 实机 GPU 部署验收。完整实机回执与浏览器证据见 [上海 `test-shanghai-copy` 实机验收记录](../../../../benchmark/whitebox/sglang_shanghai_copy_20261110.md)。

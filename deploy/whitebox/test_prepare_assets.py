@@ -64,7 +64,8 @@ def test_prepare_preserves_source_and_freezes_shared_policy(serving_export):
         (serving_export["source"] / "zing_realtime_profile.json").read_text()
     ) == {"original": True}
     assert profile["denoising_step_list"] == policy["denoising_steps"]
-    assert profile["initial_block_count"] == 3
+    assert profile["initial_block_count"] == 0
+    assert "initial_denoising_step_list" not in profile
     assert profile["source_attention_window"] == {"window_chunks": 6, "sink_chunks": 0}
     assert pipeline["zing_kv_pool_window_chunks"] == 6
     assert pipeline["zing_kv_pool_sink_chunks"] == 0

@@ -313,6 +313,8 @@ class RolePoolStore:
             p = r[pk]
             if not p or p["manifest"]["boot_epoch"] != boot_epoch:
                 raise PoolError("PROCESS_EPOCH_MISMATCH")
+            if p["state"] in {"drained", "stopped", "retired"}:
+                return p, {}
             p["state"] = "draining"
             writes = {pk: p}
             self._ready_indices(p, writes)
@@ -742,10 +744,13 @@ class RolePoolStore:
 
         def retire(rows):
             p = rows[pk]
-            if p["manifest"]["boot_epoch"] != boot_epoch or p["state"] not in {
-                "drained",
-                "stopped",
-            }:
+            if not p or p["manifest"]["boot_epoch"] != boot_epoch:
+                raise PoolError("PROCESS_NOT_DRAINING")
+            if p["state"] == "retired":
+                if p.get("stop_receipt") != stop_receipt:
+                    raise PoolError("STOP_EVIDENCE_CHANGED")
+                return p, {}
+            if p["state"] not in {"drained", "stopped"}:
                 raise PoolError("PROCESS_NOT_DRAINING")
             if any(p["used"].values()) or any(
                 rows[k]["allocation_id"] is not None for k in sk
@@ -916,16 +921,18 @@ class RolePoolStore:
             p = rows[pk]
             if not p or p["manifest"]["boot_epoch"] != boot_epoch:
                 raise PoolError("PROCESS_EPOCH_MISMATCH")
-            if (
-                p["state"] not in {"failed", "draining", "drained", "stopped"}
-                and self.clock() - p["seen_at"] < self.worker_ttl
-            ):
-                raise PoolError("PROCESS_STILL_LIVE")
             if p.get("exit_evidence") and p["exit_evidence"] != {
                 "stop_receipt": stop_receipt,
                 "operator_id": operator_id,
             }:
                 raise PoolError("STOP_EVIDENCE_CHANGED")
+            if p["state"] == "retired":
+                return p, {}
+            if (
+                p["state"] not in {"failed", "draining", "drained", "stopped"}
+                and self.clock() - p["seen_at"] < self.worker_ttl
+            ):
+                raise PoolError("PROCESS_STILL_LIVE")
             p.update(
                 state="stopped",
                 exit_evidence={

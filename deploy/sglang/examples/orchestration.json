@@ -1,0 +1,164 @@
+{
+  "schema": 1,
+  "target": {
+    "environment": "test-shanghai-copy",
+    "region": "cn-shanghai",
+    "node_id": "e01-cn-2zd4xi8m505",
+    "h100_ip": "10.0.0.121",
+    "workspace_id": "1453237",
+    "quota_id": "quota3l8bnv9a35n",
+    "coordinator_url": "http://10.0.1.37:18181",
+    "pool_id": "adaptive-test-20261109",
+    "room_url": "http://10.0.1.34:8092",
+    "wtp_url": "https://shcopy.world-test-platform.loopit.com.cn",
+    "oss_prefix": "oss://leap-world-shanghai/sglang/orchestration"
+  },
+  "model_id": "model1027",
+  "roles": {
+    "encoder": {
+      "schema": 1,
+      "role": "encoder",
+      "model_id": "model1027",
+      "model": "/REQUIRES_VERIFIED_SHANGHAI_ASSETS/model",
+      "asset_receipt": "/REQUIRES_VERIFIED_SHANGHAI_ASSETS/assets.json",
+      "asset_receipt_sha256": "REQUIRES_VERIFIED_ASSET_RECEIPT_SHA256",
+      "environment": {
+        "OMP_NUM_THREADS": "1",
+        "NCCL_MIN_NCHANNELS": "2",
+        "NCCL_MIN_CTAS": "2"
+      },
+      "startup_timeout": 900,
+      "ports": {
+        "port": 30000,
+        "http_port": 31000,
+        "rendezvous_port": 32000
+      },
+      "profile": "auto",
+      "resolution": "480",
+      "service_count": 1,
+      "secret_files": {
+        "ROLE_POOL_SIGNING_KEY": "/REQUIRES_PLATFORM_SECRET_MOUNT/ROLE_POOL_SIGNING_KEY",
+        "ROLE_POOL_REGISTRATION_TOKEN": "/REQUIRES_PLATFORM_SECRET_MOUNT/ROLE_POOL_REGISTRATION_TOKEN"
+      }
+    },
+    "dit": {
+      "schema": 1,
+      "role": "dit",
+      "model_id": "model1027",
+      "model": "/REQUIRES_VERIFIED_SHANGHAI_ASSETS/model",
+      "asset_receipt": "/REQUIRES_VERIFIED_SHANGHAI_ASSETS/assets.json",
+      "asset_receipt_sha256": "REQUIRES_VERIFIED_ASSET_RECEIPT_SHA256",
+      "pipeline": "/REQUIRES_VERIFIED_SHANGHAI_ASSETS/dit-pipeline.json",
+      "environment": {
+        "OMP_NUM_THREADS": "1",
+        "NCCL_MIN_NCHANNELS": "2",
+        "NCCL_MIN_CTAS": "2"
+      },
+      "startup_timeout": 900,
+      "ports": {
+        "port": 34000,
+        "http_port": 33000,
+        "rendezvous_port": 35000
+      },
+      "profile": "auto",
+      "resolution": "480",
+      "service_count": 1,
+      "secret_files": {
+        "ROLE_POOL_SIGNING_KEY": "/REQUIRES_PLATFORM_SECRET_MOUNT/ROLE_POOL_SIGNING_KEY",
+        "ROLE_POOL_REGISTRATION_TOKEN": "/REQUIRES_PLATFORM_SECRET_MOUNT/ROLE_POOL_REGISTRATION_TOKEN"
+      }
+    },
+    "decoder": {
+      "schema": 1,
+      "role": "decoder",
+      "model_id": "model1027",
+      "model": "/REQUIRES_VERIFIED_SHANGHAI_ASSETS/model",
+      "asset_receipt": "/REQUIRES_VERIFIED_SHANGHAI_ASSETS/assets.json",
+      "asset_receipt_sha256": "REQUIRES_VERIFIED_ASSET_RECEIPT_SHA256",
+      "decoder_config": "/REQUIRES_VERIFIED_SHANGHAI_ASSETS/decoder.json",
+      "environment": {
+        "OMP_NUM_THREADS": "1",
+        "NCCL_MIN_NCHANNELS": "2",
+        "NCCL_MIN_CTAS": "2"
+      },
+      "startup_timeout": 900,
+      "ports": {
+        "port": 37000,
+        "http_port": 36000,
+        "output_port": 38000
+      },
+      "profile": "auto",
+      "resolution": "480",
+      "service_count": 1,
+      "secret_files": {
+        "ROLE_POOL_SIGNING_KEY": "/REQUIRES_PLATFORM_SECRET_MOUNT/ROLE_POOL_SIGNING_KEY",
+        "ROLE_POOL_REGISTRATION_TOKEN": "/REQUIRES_PLATFORM_SECRET_MOUNT/ROLE_POOL_REGISTRATION_TOKEN"
+      }
+    }
+  },
+  "sites": {
+    "h100": {
+      "schema": 1,
+      "image": "REQUIRES_VERIFIED_IMAGE@sha256:REQUIRES_DIGEST",
+      "namespace": "REQUIRES_EXISTING_NAMESPACE",
+      "volumes": [],
+      "volume_mounts": []
+    },
+    "h200": {
+      "schema": 1,
+      "image": "REQUIRES_VERIFIED_IMAGE@sha256:REQUIRES_DIGEST",
+      "job_spec": {
+        "Type": "Worker",
+        "PodCount": 1,
+        "QuotaId": "quota3l8bnv9a35n",
+        "RestartPolicy": "Never",
+        "ResourceConfig": {
+          "GPU": "1",
+          "CPU": "REQUIRES_VERIFIED_CPU",
+          "Memory": "REQUIRES_VERIFIED_MEMORY",
+          "SharedMemory": "REQUIRES_VERIFIED_SHM"
+        }
+      },
+      "data_sources": []
+    }
+  },
+  "route": "REQUIRES_EXISTING_COPY_CAPACITY_ROUTE",
+  "pool": {
+    "control_epoch": "REQUIRES_EXISTING_CONTROL_EPOCH",
+    "compatibility": "REQUIRES_EXISTING_COMPATIBILITY",
+    "network_domain": "REQUIRES_EXISTING_NETWORK_DOMAIN",
+    "capacity": {
+      "encoder": {
+        "REQUIRES_MEASURED_BUDGET": 1
+      },
+      "dit": {
+        "REQUIRES_MEASURED_BUDGET": 1
+      },
+      "decoder": {
+        "REQUIRES_MEASURED_BUDGET": 1
+      }
+    },
+    "profiles": {
+      "encoder": {
+        "480": {
+          "REQUIRES_MEASURED_BUDGET": 1
+        }
+      },
+      "dit": {
+        "480": {
+          "REQUIRES_MEASURED_BUDGET": 1
+        }
+      },
+      "decoder": {
+        "480": {
+          "REQUIRES_MEASURED_BUDGET": 1
+        }
+      }
+    },
+    "profile_limits": {
+      "480": {
+        "REQUIRES_MEASURED_PROFILE_LIMITS": true
+      }
+    }
+  }
+}

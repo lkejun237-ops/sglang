@@ -12,10 +12,38 @@ from uuid import uuid4
 import httpx
 
 from ..coordinator import SessionAssignment, WorkerSlot
-from ..role_pool.contracts import PoolError
+from ..role_pool.contracts import PoolError, digest
 from ..role_pool.transport import PooledBoundSocket
 from .interactive import ModelLeases
 from .render_contract import RenderError
+
+
+def _select_preferred_admission_id(preferred: dict, avoid: dict | None = None) -> str:
+    norm_preferred = {
+        r: (sid[0] if isinstance(sid, (list, tuple)) and sid else sid)
+        for r, sid in preferred.items()
+    }
+    avoid_map = {r: set((avoid or {}).get(r, ())) for r in norm_preferred}
+    for _ in range(50000):
+        candidate = uuid4().hex
+        ok = True
+        for role, target_sid in norm_preferred.items():
+            if not isinstance(target_sid, str) or not target_sid:
+                continue
+            target_hash = digest([candidate, target_sid])
+            if target_hash >= "20" + "f" * 62:
+                ok = False
+                break
+            if any(
+                target_hash >= digest([candidate, other_sid])
+                for other_sid in avoid_map.get(role, ())
+                if other_sid != target_sid
+            ):
+                ok = False
+                break
+        if ok:
+            return candidate
+    return uuid4().hex
 
 
 class DisaggregatedModelLeases(ModelLeases):
@@ -40,7 +68,20 @@ class DisaggregatedModelLeases(ModelLeases):
             if key not in routes:
                 raise RenderError("CAPABILITY_UNAVAILABLE")
             self.config = {**self.config, **routes[key]}
-        self.admission_id = uuid4().hex
+        preferred_raw = os.environ.get("WHITEBOX_PREFERRED_SERVICE_IDS", "")
+        avoid_raw = os.environ.get("WHITEBOX_AVOID_SERVICE_IDS", "")
+        self.preferred_service_ids = (
+            json.loads(preferred_raw) if preferred_raw else None
+        )
+        self.avoid_service_ids = json.loads(avoid_raw) if avoid_raw else None
+        self.admission_id = (
+            _select_preferred_admission_id(
+                self.preferred_service_ids, self.avoid_service_ids
+            )
+            if isinstance(self.preferred_service_ids, dict)
+            and self.preferred_service_ids
+            else uuid4().hex
+        )
         self.admission_created_at = time.time()
         self.player_id = self.session_id or uuid4().hex
         self.generation_id = self.generation_id or uuid4().hex
@@ -209,6 +250,40 @@ class DisaggregatedModelLeases(ModelLeases):
 
             async def admit_group():
                 deadline = time.monotonic() + self.config.get("startup_seconds", 480)
+                if (
+                    isinstance(self.preferred_service_ids, dict)
+                    and self.preferred_service_ids
+                ):
+                    wait_until = min(deadline, time.monotonic() + 10.0)
+                    cap_req = dict(
+                        profile=self.config["profile"],
+                        compatibility=self.config["compatibility"],
+                        network_domain=self.config["network_domain"],
+                    )
+                    while time.monotonic() < wait_until:
+                        try:
+                            cap_data = await self.control("capacity", cap_req)
+                            if not isinstance(cap_data, dict):
+                                break
+                            role_cap = cap_data.get("role_capacity")
+                            if not isinstance(role_cap, dict) or not role_cap:
+                                break
+                            if all(
+                                isinstance(role_cap.get(r), dict)
+                                and role_cap[r].get("free_slots", 0)
+                                >= max(
+                                    1,
+                                    role_cap[r].get("workers", 0)
+                                    - role_cap[r].get("active_sessions", 0)
+                                    - role_cap[r].get("draining_workers", 0),
+                                )
+                                for r in self.preferred_service_ids
+                                if r in role_cap
+                            ):
+                                break
+                        except Exception:
+                            break
+                        await asyncio.sleep(0.2)
                 while True:
                     try:
                         return await self.control("admit", request)

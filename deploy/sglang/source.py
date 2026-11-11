@@ -9,6 +9,9 @@ import tarfile
 import tempfile
 from pathlib import Path, PurePosixPath
 
+OSS_MOUNT = Path("/mnt/oss")
+SOURCE_CACHE = Path("/var/lib/sglang-orchestrate/cache")
+
 
 def digest(path):
     h = hashlib.sha256()
@@ -80,7 +83,7 @@ def prepare(repo, commit, output, oss_prefix):
     }
     with tarfile.open(archive) as tar:
         manifest["tools"] = {}
-        for name in ("launch.py", "source.py", "select_gpu.py"):
+        for name in ("launch.py", "source.py", "select_gpu.py", "orchestrate.py"):
             member = "deploy/sglang/" + name
             try:
                 stream = tar.extractfile(member)
@@ -127,13 +130,23 @@ def fetch(manifest, destination):
     uri = manifest["uri"]
     if not re.fullmatch(r"oss://[a-z0-9-]+/[A-Za-z0-9_./-]+", uri):
         raise ValueError("Invalid OSS URI")
-    with tempfile.TemporaryDirectory(prefix="sglang-download-") as tmp:
-        archive = Path(tmp) / "source.tar"
-        # Credentials are resolved by ossutil's normal workload identity/config chain.
-        subprocess.run(
-            ["ossutil", "cp", uri, str(archive)], check=True, stdout=subprocess.DEVNULL
-        )
-        unpack(archive, manifest["sha256"], destination)
+    key = uri.split("/", 3)[3]
+    if PurePosixPath(key).is_absolute() or ".." in PurePosixPath(key).parts:
+        raise ValueError("OSS key cannot traverse local mount paths")
+    candidates = (OSS_MOUNT / key, SOURCE_CACHE / manifest["sha256"] / "source.tar")
+    local = next((path for path in candidates if path.is_file()), None)
+    if local is not None:
+        # A present but corrupt candidate fails closed; never hide it with a download.
+        unpack(local, manifest["sha256"], destination)
+    else:
+        with tempfile.TemporaryDirectory(prefix="sglang-download-") as tmp:
+            archive = Path(tmp) / "source.tar"
+            subprocess.run(
+                ["ossutil", "cp", uri, str(archive)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            unpack(archive, manifest["sha256"], destination)
     write_json(
         destination.parent / "verified-source.json",
         {"commit": manifest["commit"], "archive_sha256": manifest["sha256"]},

@@ -474,7 +474,9 @@ class SinglePlayerControl:
         result = await self.get_operation(operation)
         if result["state"] not in {"ready", "starting"} or "execution" not in result:
             return result
-        pipeline = self.host.sessions[result["execution"]["sourceSessionId"]]
+        pipeline = self.host.sessions.get(result["execution"]["sourceSessionId"])
+        if pipeline is None:
+            return result
         # Do not let an early RTC attachment complete before the original init
         # creates its startup readiness events. Source-ready is not required.
         if not getattr(pipeline, "control_started", False):

@@ -238,6 +238,39 @@ class DiTPreparation:
             return {"code": "invalid_cache_selection"}
         if getattr(cache, "backend", "local") == "mooncake":
             return {"code": "cache_operation_unsupported"}
+        if operation == "delete_entries":
+            from .preparation_cache import coordinate_validation
+
+            if any(coordinate_validation(busy)):
+                return {"code": "cache_busy"}
+            target_keys = arguments.get("keys")
+            if target_keys is not None and (
+                not isinstance(target_keys, (list, tuple))
+                or any(
+                    not isinstance(k, str)
+                    or len(k) != 64
+                    or any(c not in "0123456789abcdef" for c in k)
+                    for k in target_keys
+                )
+            ):
+                return {"code": "invalid_cache_selection"}
+            resident_keys = list(getattr(cache, "entries", {}).keys())
+            all_resident = list(
+                dict.fromkeys(
+                    k
+                    for rank_keys in coordinate_validation(resident_keys)
+                    for k in rank_keys
+                )
+            )
+            evict_keys = (
+                [k for k in all_resident if k in target_keys]
+                if target_keys is not None
+                else all_resident
+            )
+            if hasattr(cache, "manage"):
+                unload = cache.manage("unload", evict_keys)
+                if isinstance(unload, dict) and unload.get("code"):
+                    return unload
         from sglang.multimodal_gen.runtime.distributed.parallel_state import (
             get_world_group,
         )

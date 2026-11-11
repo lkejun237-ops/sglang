@@ -1374,3 +1374,68 @@ def test_paged_status_counts_pending_bytes_and_aggregates_sp(cpu_dma, monkeypatc
     assert status["budget_bytes"] == status["reserved_bytes"] == 1536
     assert status["used_bytes"] == 384
     assert not status["all_ready"]
+
+
+def test_dit_preparation_delete_entries_respects_busy_and_l1_unload_errors(
+    tmp_path, cpu_dma, monkeypatch
+):
+    from sglang.multimodal_gen.runtime.distributed import parallel_state
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.dit_preparation import (
+        DiTPreparation,
+    )
+    from sglang.multimodal_gen.runtime.realtime import worker_parallel
+    from sglang.multimodal_gen.test.unit.realtime.test_zing_preparation_cache import (
+        inputs,
+    )
+    from sglang.multimodal_gen.test.unit.realtime.zing_cache_fixtures import cpu_cache
+
+    monkeypatch.setattr(parallel_state, "get_world_group", lambda: NS(world_size=1))
+    monkeypatch.setattr(
+        worker_parallel,
+        "ParallelChannel",
+        lambda _group: NS(leader_call=lambda fn: fn()),
+    )
+    owner = cpu_cache([NS(k=torch.zeros(8, 2, 2))], rows=8, entries=2, page_rows=4)
+    owner.disk_cache = disk(tmp_path)
+    key = "a" * 64
+    disk_commit(owner.disk_cache, key)
+    source = NS(
+        prefix=NS(
+            positions=torch.zeros(4, 3),
+            layers=[(torch.ones(4, 2, 2), torch.ones(4, 2, 2))],
+        ),
+        _model_signature="model",
+    )
+    owner.fill(key, inputs(), "condition", "request", source)
+    owner.finish_fill()
+    assert key in owner.entries
+
+    prep = DiTPreparation(NS(block0_cache=owner), lambda: None)
+
+    # 1. Busy session must reject delete_entries without unloading L1 or deleting L2.
+    assert prep.control("delete_entries", {"keys": [key]}, busy=True) == {
+        "code": "cache_busy"
+    }
+    assert key in owner.entries
+    assert owner.disk_cache.lookup(key) is not None
+
+    # 2. In-flight L1 disk_task (L1 unload failure) must abort before L2 deletion.
+    owner.entries[key].disk_task = threading.Event()
+    assert prep.control("delete_entries", {"keys": [key]}, busy=False) == {
+        "code": "cache_busy"
+    }
+    assert key in owner.entries
+    assert owner.disk_cache.lookup(key) is not None
+
+    # 3. Invalid key selection must reject before unloading L1.
+    owner.entries[key].disk_task.set()
+    assert prep.control("delete_entries", {"keys": ["../bad"]}, busy=False) == {
+        "code": "invalid_cache_selection"
+    }
+    assert key in owner.entries
+
+    # 4. Idle and ready: unloads L1 and deletes L2.
+    result = prep.control("delete_entries", {"keys": [key]}, busy=False)
+    assert result["deleted"] == [key]
+    assert key not in owner.entries
+    assert owner.disk_cache.lookup(key) is None

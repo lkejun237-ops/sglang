@@ -52,6 +52,20 @@ class DiTLinkClient:
                 if len(self.pending_results) > 128:
                     raise ValueError("DiT notifications exceed their bounded budget")
 
+    def has_output_notifications(self):
+        if self.failed or not self.async_inputs or self.owner is None:
+            return False
+        if self.pending_results:
+            return True
+        inbox = getattr(self.channel, "inbox", None)
+        if inbox is not None:
+            with inbox.mutex:
+                return any(
+                    isinstance(item, dict) and item.get("type") != "input.processed"
+                    for item in inbox.queue
+                )
+        return False
+
     def collect(self):
         if self.failed:
             raise RuntimeError("Encoder/DiT link requires restart")
@@ -454,6 +468,15 @@ class DiTInputService:
                         generation_id=self.owner[1],
                         **ready,
                     )
+                    take = getattr(self.worker, "take_cache_report", None)
+                    report = take(ready.get("event_id")) if take is not None else None
+                    if report is not None:
+                        reply(
+                            "model.cache",
+                            session_id=self.owner[0],
+                            generation_id=self.owner[1],
+                            usage={"zing_block0_cache": report},
+                        )
                 prepared = getattr(self.worker, "condition_prepared", None)
                 if prepared is not None:
                     self.worker.condition_prepared = None

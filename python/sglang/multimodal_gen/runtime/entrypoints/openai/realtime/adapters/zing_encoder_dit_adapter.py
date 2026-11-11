@@ -133,15 +133,30 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
             and self.dispatched_source_frames == boundary
         )
 
+    def _has_dit_output(self):
+        app = getattr(self, "connection_app", None)
+        client = getattr(getattr(app, "state", None), "realtime_execution_client", None)
+        link = getattr(getattr(client, "executor", None), "dit_link", None)
+        return (
+            link is not None
+            and self.dispatched_source_frames > 0
+            and not self.end_dispatched
+            and getattr(link, "has_output_notifications", lambda: False)()
+        )
+
     def has_control_work(self):
         if self.startup_enabled and self.startup_phase != "attached":
             return self.startup_command is not None
         if not self.condition_switch_protocol:
-            return super().has_control_work()
-        return self._condition_control_ready() or (
-            self._pending_sink_command is not None
-            and self.dispatched_source_frames > 0
-            and not self.end_dispatched
+            return super().has_control_work() or self._has_dit_output()
+        return (
+            self._condition_control_ready()
+            or self._has_dit_output()
+            or (
+                self._pending_sink_command is not None
+                and self.dispatched_source_frames > 0
+                and not self.end_dispatched
+            )
         )
 
     async def wait_for_next_chunk(self, session):

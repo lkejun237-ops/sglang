@@ -88,6 +88,12 @@ import pybase64
 import requests
 import torch
 import torch.distributed as dist
+
+if sys.platform == "darwin" and platform.machine() == "arm64":
+    from sglang._platform_stubs import install_platform_stubs as _install_platform_stubs
+
+    _install_platform_stubs()
+
 import triton
 from packaging import version as pkg_version
 from PIL import Image, ImageOps, UnidentifiedImageError

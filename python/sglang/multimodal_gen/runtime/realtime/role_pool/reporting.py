@@ -20,6 +20,7 @@ _LOCK = threading.RLock()
 class ProcessReporter:
     def __init__(self, config, process_id, role):
         self.config, self.process_id, self.role = config, process_id, role
+        self.role_token = os.environ[config["role_token_env"]]
         self.process = ProcessAuthority(
             capacity=config["capacity"],
             profiles=config["profiles"],
@@ -63,9 +64,7 @@ class ProcessReporter:
     def run(self):
         with httpx.Client(timeout=3, trust_env=False) as client:
             base = self.config["coordinator_url"].rstrip("/") + "/v1/role-pool/"
-            headers = {
-                "Authorization": "Bearer " + os.environ[self.config["role_token_env"]]
-            }
+            headers = {"Authorization": "Bearer " + self.role_token}
             registered = False
             while not self.stop.is_set():
                 try:
@@ -126,13 +125,36 @@ class ProcessReporter:
                 self.stop.wait(min(2, float(self.config.get("heartbeat_seconds", 2))))
 
 
+def attach_managed_service_config(native, config, *, cache_key=None):
+    if native.service["role"] == "dit" and int(os.getenv("RANK", "0")) != 0:
+        # SP ranks are one DiT service. Only the rank owning HTTP may register
+        # the shared descriptor/boot epoch; followers execute collectives only.
+        return None
+    expected_count = getattr(
+        native,
+        "process_service_count",
+        config.get("service_count") if isinstance(config, dict) else 1,
+    )
+    validate_worker_config_dict(config, native.service["role"], expected_count)
+    key = (
+        cache_key or json.dumps(config, sort_keys=True, separators=(",", ":")),
+        native.service["worker_id"],
+    )
+    with _LOCK:
+        reporter = _REGISTRY.get(key)
+        if reporter is None:
+            reporter = _REGISTRY[key] = ProcessReporter(
+                config, native.service["worker_id"], native.service["role"]
+            )
+        managed = ManagedService(native, reporter.process)
+    return managed
+
+
 def attach_managed_service(native):
     path = os.getenv("SGLANG_ROLE_POOL_WORKER_CONFIG")
     if not path:
         return None
     if native.service["role"] == "dit" and int(os.getenv("RANK", "0")) != 0:
-        # SP ranks are one DiT service. Only the rank owning HTTP may register
-        # the shared descriptor/boot epoch; followers execute collectives only.
         return None
     config = json.loads(Path(path).read_text())
     key = (str(Path(path).resolve()), native.service["worker_id"])
@@ -146,14 +168,13 @@ def attach_managed_service(native):
     return managed
 
 
-def validate_worker_configuration(role, service_count, *, static_connection=False):
-    path = os.getenv("SGLANG_ROLE_POOL_WORKER_CONFIG")
-    if not path:
-        return
-    config = json.loads(Path(path).read_text())
+def validate_worker_config_dict(
+    config, role, service_count, *, static_connection=False
+):
     if (
-        config["role"] != role
-        or config["service_count"] != service_count
+        not isinstance(config, dict)
+        or config.get("role") != role
+        or config.get("service_count") != service_count
         or static_connection
     ):
         raise ValueError(
@@ -177,3 +198,13 @@ def validate_worker_configuration(role, service_count, *, static_connection=Fals
             )
     os.environ.setdefault("NCCL_MIN_NCHANNELS", "2")
     logging.getLogger(__name__).info("Managed NCCL channel minimum: 2")
+
+
+def validate_worker_configuration(role, service_count, *, static_connection=False):
+    path = os.getenv("SGLANG_ROLE_POOL_WORKER_CONFIG")
+    if not path:
+        return
+    config = json.loads(Path(path).read_text())
+    validate_worker_config_dict(
+        config, role, service_count, static_connection=static_connection
+    )

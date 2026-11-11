@@ -9,7 +9,7 @@ import os
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from .contracts import PoolError, validate_business_message
+from .contracts import Credentials, PoolError, validate_business_message
 
 
 class ManagedTransport:
@@ -125,11 +125,94 @@ def install_managed_routes(app):
     async def managed_control(action: str, request: Request):
         native = getattr(app.state, "worker_connections", None)
         managed = getattr(native, "managed", None)
-        if managed is None:
-            return JSONResponse({"code": "MANAGED_ROLE_UNAVAILABLE"}, status_code=503)
         raw = await request.body()
         if len(raw) > 256 * 1024:
             return JSONResponse({"code": "CONTROL_TOO_LARGE"}, status_code=413)
+        if action == "attach":
+            if native is None:
+                return JSONResponse(
+                    {"code": "MANAGED_ROLE_UNAVAILABLE"}, status_code=503
+                )
+            try:
+                body = json.loads(raw)
+                token = request.headers.get("authorization", "").removeprefix("Bearer ")
+                config = body.get("worker_config")
+                if (
+                    not isinstance(config, dict)
+                    or config.get("signing_secret_env") != "ROLE_POOL_SIGNING_KEY"
+                    or config.get("role_token_env") != "ROLE_POOL_REGISTRATION_TOKEN"
+                    or body.get("control_epoch") != config.get("control_epoch")
+                ):
+                    raise ValueError("Invalid attach configuration")
+                secret = os.environ.get("ROLE_POOL_SIGNING_KEY", "")
+                role_token = os.environ.get("ROLE_POOL_REGISTRATION_TOKEN", "")
+                if not secret or not role_token:
+                    raise PoolError("MANAGED_SECRETS_MISSING", 503)
+                Credentials(secret, config["control_epoch"]).verify(
+                    token, "attach", body
+                )
+                from .contracts import identifier, vector
+                from .reporting import attach_managed_service_config
+
+                with native.lock:
+                    if native.managed is None:
+                        if (
+                            native.state != "idle"
+                            or native.restart_required
+                            or not native.ready()
+                        ):
+                            raise PoolError("WORKER_NOT_IDLE", 409)
+                        native.managed = attach_managed_service_config(native, config)
+                    else:
+                        expected_dep = {
+                            k: config[k]
+                            for k in (
+                                "pool_id",
+                                "compatibility",
+                                "network_domain",
+                                "hardware_ids",
+                            )
+                        }
+                        expected_capacity = vector(config["capacity"])
+                        expected_profiles = {
+                            identifier(k): vector(v)
+                            for k, v in config["profiles"].items()
+                        }
+                        if (
+                            native.managed.process.credentials.epoch
+                            != config["control_epoch"]
+                            or getattr(native.managed.process, "deployment", None)
+                            != expected_dep
+                            or native.managed.process.capacity != expected_capacity
+                            or native.managed.process.profiles != expected_profiles
+                            or native.managed.process.profile_limits
+                            != config["profile_limits"]
+                        ):
+                            raise PoolError("ALREADY_MANAGED", 409)
+                        if (
+                            native.state != "idle"
+                            or native.restart_required
+                            or not native.ready()
+                            or native.managed.state != "idle"
+                            or native.managed.owner is not None
+                        ):
+                            raise PoolError("WORKER_NOT_IDLE", 409)
+                    managed = native.managed
+                identity_body = {"control_epoch": config["control_epoch"]}
+                identity_token = managed.process.credentials.sign(
+                    "identity",
+                    identity_body,
+                    expires_at=managed.process.clock() + 30,
+                )
+                return await managed.command("identity", identity_body, identity_token)
+            except PoolError as exc:
+                return JSONResponse({"code": exc.code}, status_code=exc.status)
+            except (ValueError, TypeError, KeyError):
+                return JSONResponse(
+                    {"code": "INVALID_CONTROL_REQUEST"}, status_code=422
+                )
+        if managed is None:
+            return JSONResponse({"code": "MANAGED_ROLE_UNAVAILABLE"}, status_code=503)
         try:
             body = json.loads(raw)
             token = request.headers.get("authorization", "").removeprefix("Bearer ")

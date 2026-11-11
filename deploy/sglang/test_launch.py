@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent))
 import launch
 import select_gpu
@@ -237,12 +239,19 @@ class LaunchTests(unittest.TestCase):
                     argv, env = launch.command(
                         c, self.root, "10.0.0.2", "worker-fixture"
                     )
-                self.assertIn(launch.MODULES[role], argv)
+                with self.assertRaisesRegex(ValueError, "Unknown configuration field"):
+                    launch.validate_config({**c, "role_launcher": "native"})
+                with self.assertRaisesRegex(ValueError, "Unknown configuration field"):
+                    launch.validate_config({**c, "role_launcher": "profile"})
+                self.assertIn(
+                    "sglang.multimodal_gen.tools.zing_h3_profile_launcher", argv
+                )
+                self.assertEqual(argv[argv.index("--mode") + 1], "independent")
+                self.assertEqual(argv[argv.index("--component") + 1], role)
                 self.assertEqual(env["PYTHONPATH"], str(self.root / "python"))
                 self.assertNotIn("TOKEN", env)
                 self.assertEqual(argv[argv.index("--service-count") + 1], "1")
                 if role == "decoder":
-                    self.assertIn("torch.distributed.run", argv)
                     self.assertNotIn("--pipeline-config-path", argv)
                 if role == "dit":
                     self.assertEqual(argv[argv.index("--sp-degree") + 1], "1")
@@ -264,7 +273,7 @@ class LaunchTests(unittest.TestCase):
                     for a in node.args
                     if isinstance(a, ast.Constant) and isinstance(a.value, str)
                 }
-                index = argv.index(launch.MODULES[role])
+                index = argv.index("--")
                 for arg in argv[index + 1 :: 2]:
                     self.assertIn(arg, options)
 
@@ -364,3 +373,779 @@ class LaunchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.fixture
+def live_assets():
+    fixture = LaunchTests()
+    fixture.setUp()
+    try:
+        yield fixture
+    finally:
+        fixture.doCleanups()
+
+
+def runtime_manifest():
+    return dict(
+        schema=1,
+        commit="a" * 40,
+        sha256="b" * 64,
+        uri="oss://leap-world-shanghai/releases/"
+        + "a" * 40
+        + "/"
+        + "b" * 64
+        + "/source.tar",
+        tools={
+            n: source.digest(Path(__file__).with_name(n))
+            for n in ("launch.py", "source.py", "select_gpu.py")
+        },
+    )
+
+
+@pytest.mark.parametrize("location", ["mount", "cache"])
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_fetch_prefers_local_archive_and_still_checks_hash(
+    tmp_path, monkeypatch, location, corrupt
+):
+    archive = tmp_path / "source.tar"
+    with tarfile.open(archive, "w") as tar:
+        member = tarfile.TarInfo("file")
+        member.size = 7
+        tar.addfile(member, io.BytesIO(b"payload"))
+    manifest = runtime_manifest()
+    checksum = source.digest(archive)
+    manifest.update(
+        sha256=checksum,
+        uri="oss://leap-world-shanghai/" + "a" * 40 + "/" + checksum + "/source.tar",
+    )
+    mount, cache = tmp_path / "mount", tmp_path / "cache"
+    monkeypatch.setattr(source, "OSS_MOUNT", mount)
+    monkeypatch.setattr(source, "SOURCE_CACHE", cache)
+    candidate = (
+        mount / manifest["uri"].split("/", 3)[3]
+        if location == "mount"
+        else cache / checksum / "source.tar"
+    )
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(b"corrupt" if corrupt else archive.read_bytes())
+    with patch.object(
+        source.subprocess,
+        "run",
+        side_effect=AssertionError("No ossutil for local archives"),
+    ) as download:
+        if corrupt:
+            with pytest.raises(ValueError, match="SHA256 mismatch"):
+                source.fetch(manifest, tmp_path / "release/source")
+        else:
+            source.fetch(manifest, tmp_path / "release/source")
+            assert (tmp_path / "release/source/file").read_bytes() == b"payload"
+            assert (
+                json.loads((tmp_path / "release/verified-source.json").read_text())[
+                    "archive_sha256"
+                ]
+                == checksum
+            )
+        download.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "routes,pod_ip,expected",
+    [
+        (["10.0.0.122"], "22.69.1.2", "10.0.0.122"),
+        (["22.69.1.2", "10.0.0.122"], "22.69.1.2", "10.0.0.122"),
+        ([None, None], "22.69.1.2", "22.69.1.2"),
+        ([None, None], "127.0.0.1", None),
+        (["22.69.1.2", "22.69.1.2"], "22.69.1.2", None),
+        (["22.69.1.2", "22.69.1.2"], "10.0.0.123", "10.0.0.123"),
+    ],
+)
+def test_reachable_ip_prefers_vpc_routes(monkeypatch, routes, pod_ip, expected):
+    from unittest.mock import MagicMock, Mock
+
+    sockets = []
+    for address in routes:
+        sock = MagicMock()
+        connection = sock.__enter__.return_value
+        if address is None:
+            connection.connect.side_effect = OSError("No route")
+        else:
+            connection.getsockname.return_value = (address, 1234)
+        sockets.append(sock)
+    monkeypatch.setenv("POD_IP", pod_ip)
+    monkeypatch.setattr(launch.socket, "socket", Mock(side_effect=sockets))
+    if expected is None:
+        with pytest.raises(ValueError, match="usable advertise IP"):
+            launch.reachable_ip()
+    else:
+        assert launch.reachable_ip() == expected
+    sockets[0].__enter__.return_value.connect.assert_called_once_with(("10.0.1.37", 9))
+    if len(sockets) == 2:
+        sockets[1].__enter__.return_value.connect.assert_called_once_with(
+            ("10.0.0.121", 9)
+        )
+
+
+def test_verify_assets_follows_directory_symlinks_and_skips_sized_weights(
+    live_assets, monkeypatch
+):
+    fixture = live_assets
+    c = fixture.assets("encoder")
+    external = fixture.root / "external"
+    external.mkdir()
+    weights = external / "weights.safetensors"
+    weights.write_bytes(b"external weights")
+    alias = Path(c["model"]) / "text_encoder"
+    alias.symlink_to(external, target_is_directory=True)
+    with pytest.raises(ValueError, match="weight files must be covered"):
+        launch.verify_assets(c)
+    receipt = json.loads(Path(c["asset_receipt"]).read_text())
+    receipt["files"][str(alias / weights.name)] = dict(
+        bytes=weights.stat().st_size, sha256=source.digest(weights)
+    )
+    Path(c["asset_receipt"]).write_text(json.dumps(receipt))
+    c["asset_receipt_sha256"] = source.digest(c["asset_receipt"])
+    original = launch.digest
+
+    def checked_digest(path):
+        assert Path(path) != alias / weights.name, "Sized cold weights must not be read"
+        return original(path)
+
+    monkeypatch.setattr(launch, "digest", checked_digest)
+    launch.verify_assets(c)
+    weights.write_bytes(b"truncated")
+    with pytest.raises(ValueError, match="size mismatch"):
+        launch.verify_assets(c)
+
+
+def test_sized_config_entries_still_require_hash_match(live_assets):
+    c = live_assets.assets("encoder")
+    config = Path(c["model"]) / "zing_config.json"
+    receipt = json.loads(Path(c["asset_receipt"]).read_text())
+    receipt["files"][str(config)] = dict(bytes=2, sha256=source.digest(config))
+    Path(c["asset_receipt"]).write_text(json.dumps(receipt))
+    c["asset_receipt_sha256"] = source.digest(c["asset_receipt"])
+    launch.verify_assets(c)
+    config.write_text("[]")  # Same size; must not bypass the config hash.
+    with pytest.raises(ValueError, match="digest mismatch"):
+        launch.verify_assets(c)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"bytes": True, "sha256": "a" * 64},
+        {"bytes": 15, "sha256": "invalid"},
+        {"bytes": -1, "sha256": "a" * 64},
+    ],
+)
+def test_sized_asset_metadata_is_validated(live_assets, entry):
+    c = live_assets.assets("encoder")
+    receipt = json.loads(Path(c["asset_receipt"]).read_text())
+    receipt["files"][str(Path(c["model"]) / "model.safetensors")] = entry
+    Path(c["asset_receipt"]).write_text(json.dumps(receipt))
+    c["asset_receipt_sha256"] = source.digest(c["asset_receipt"])
+    with pytest.raises(ValueError):
+        launch.verify_assets(c)
+
+
+def test_stage_assets_copies_hot_files_and_links_peripherals(tmp_path):
+    src, dst = tmp_path / "mounted", tmp_path / "local"
+    contents = {
+        "model/transformer/part.safetensors": b"hot weights",
+        "model/zing_config.json": b"{}",
+        "model/model_index.json": b"{}",
+        "model/zing_realtime_profile.json": b'{"source_attention_window":{"window_chunks":99,"sink_chunks":2},"other":7}',
+        "model/EXPORT_COMPLETE.json": b"{}",
+        "model/text_encoder/weights.bin": b"cold weights",
+        "model/tokenizer/config.json": b"{}",
+        "lynn/weights.bin": b"lynn",
+        "adaln-table-unsplit/table.safetensors": b"table",
+        "adaln-table-unsplit/manifest.json": b"{}",
+    }
+    for name, data in contents.items():
+        path = src / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    c = dict(stage_from=str(src), model=str(dst / "model"))
+    from concurrent.futures import ThreadPoolExecutor
+
+    with patch.object(launch, "ThreadPoolExecutor", wraps=ThreadPoolExecutor) as pool:
+        launch.stage_assets(c)
+        pool.assert_called_once_with(max_workers=4)
+    for name in (
+        "model/transformer/part.safetensors",
+        "model/zing_config.json",
+        "model/model_index.json",
+        "model/EXPORT_COMPLETE.json",
+        "adaln-table-unsplit/table.safetensors",
+        "adaln-table-unsplit/manifest.json",
+    ):
+        assert (dst / name).read_bytes() == contents[name]
+        assert not (dst / name).is_symlink()
+    for name in ("model/text_encoder", "model/tokenizer", "lynn"):
+        assert (dst / name).is_symlink() and (dst / name).resolve() == src / name
+    profile = json.loads((dst / "model/zing_realtime_profile.json").read_text())
+    assert profile == dict(
+        source_attention_window=dict(window_chunks=6, sink_chunks=0), other=7
+    )
+    assert (src / "model/zing_realtime_profile.json").read_bytes() == contents[
+        "model/zing_realtime_profile.json"
+    ]
+    launch.stage_assets(
+        c
+    )  # Repeated startup preserves the source and the same symlink targets.
+
+
+def test_stage_assets_runs_before_verification(live_assets):
+    c = live_assets.assets("encoder")
+    c["stage_from"] = "/mounted/assets"
+    events = []
+
+    def verify(config):
+        events.append("verify")
+        raise ValueError("Stop before GPU startup")
+
+    with (
+        patch.object(
+            launch, "stage_assets", side_effect=lambda config: events.append("stage")
+        ),
+        patch.object(launch, "verify_assets", side_effect=verify),
+    ):
+        with pytest.raises(ValueError, match="Stop before GPU"):
+            launch.run(c, live_assets.root / "source", "a" * 40, "b" * 64)
+    assert events == ["stage", "verify"]
+
+
+@pytest.mark.parametrize("role", ["encoder", "decoder"])
+@pytest.mark.parametrize("policy", ["Never", "IfNotPresent", "Always"])
+def test_h100_render_image_policy_and_source_cache(live_assets, policy, role):
+    import shlex
+
+    c = live_assets.assets(role)
+    site = dict(
+        schema=1,
+        image="test@sha256:" + "c" * 64,
+        namespace="test",
+        volumes=[],
+        volume_mounts=[],
+        image_pull_policy=policy,
+    )
+    output = live_assets.root / "render"
+    if policy == "Always":
+        with pytest.raises(ValueError, match="pull policy"):
+            launch.render(c, runtime_manifest(), site, output)
+        return
+    launch.render(c, runtime_manifest(), site, output)
+    script = (output / "h100-node.sh").read_text()
+    tag_command = (
+        "/var/lib/rancher/k3s/data/current/bin/ctr -a /run/k3s/containerd/containerd.sock -n k8s.io images tag "
+        + shlex.quote(site["image"])
+        + " "
+        + shlex.quote("test:cached-" + "c" * 12)
+        + " >/dev/null 2>&1 || true\n"
+    )
+    assert script.count(tag_command) == 1
+    assert (
+        script.index("flock -n 9")
+        < script.index(tag_command)
+        < script.index("GPU_UUID=")
+    )
+    assert script.index(tag_command) < script.index("kubectl create")
+    line = next(line for line in script.splitlines() if line.startswith("POD_JSON="))
+    pod = json.loads(shlex.split(line[len("POD_JSON=") :])[0])
+    assert pod["spec"]["hostNetwork"] is True
+    assert pod["spec"]["dnsPolicy"] == "ClusterFirstWithHostNet"
+    container = pod["spec"]["containers"][0]
+    assert container["image"] == site["image"]
+    assert container["imagePullPolicy"] == policy
+    assert {
+        "name": "sglang-source-cache",
+        "mountPath": "/var/lib/sglang-orchestrate/cache",
+        "readOnly": True,
+    } in container["volumeMounts"]
+    assert (
+        pod["spec"]["volumes"][0]["hostPath"]["path"]
+        == "/var/lib/sglang-orchestrate/cache"
+    )
+
+
+def test_pai_image_config_is_preserved(live_assets):
+    c = live_assets.assets("dit")
+    image_config = {
+        "DockerRegistry": "registry.example",
+        "Username": "platform-reference",
+    }
+    site = dict(
+        schema=1,
+        image="test@sha256:" + "c" * 64,
+        job_spec=dict(
+            Type="Worker",
+            PodCount=1,
+            QuotaId="quota3l8bnv9a35n",
+            RestartPolicy="Never",
+            ResourceConfig={"GPU": "1"},
+            ImageConfig=image_config,
+        ),
+        data_sources=[],
+    )
+    output = live_assets.root / "render"
+    launch.render(c, runtime_manifest(), site, output)
+    assert (
+        json.loads((output / "pai.json").read_text())["JobSpecs"][0]["ImageConfig"]
+        == image_config
+    )
+
+
+def test_live_environment_and_dit_options_are_forwarded(live_assets):
+    c = live_assets.assets("dit")
+    names = [
+        "NCCL_NET",
+        "CUBLAS_WORKSPACE_CONFIG",
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "CUDA_CACHE_PATH",
+        "TRITON_CACHE_DIR",
+        "TORCHINDUCTOR_CACHE_DIR",
+        "XDG_CACHE_HOME",
+        "HF_HUB_OFFLINE",
+        "TRANSFORMERS_OFFLINE",
+        "TOKENIZERS_PARALLELISM",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "SGLANG_DIFFUSION_STAGE_LOGGING",
+        "SGLANG_H3_QWEN_TEST",
+        "MINIMAX_H3_PROGRESSIVE_TEST",
+        "SGLANG_ZING_TEST",
+    ]
+    c["environment"] = {name: "1" for name in names}
+    c["dit_options"] = {
+        "zing_block0_cache_host_total_gb": 12,
+        "zing_block0_cache_budget_root": "/cache",
+        "zing_block0_cache_min_free_gb": 1,
+        "zing_block0_cache_inflight_gb": 2,
+        "zing_block0_cache_max_writers": 2,
+        "zing_block0_cache_gc_high_watermark": 0.9,
+        "zing_block0_cache_gc_low_watermark": 0.8,
+        "zing_block0_cache_capacity_dir": "/capacity",
+        "zing_source_joint_forward": "source_first",
+        "timeout_seconds": 300,
+    }
+    launch.validate_config(c)
+    argv, env = launch.command(c, live_assets.root, "10.0.0.122", "owned")
+    assert all(env[name] == "1" for name in names)
+    for key, value in c["dit_options"].items():
+        assert argv[argv.index("--" + key.replace("_", "-")) + 1] == str(value)
+
+
+def test_stage_assets_never_writes_through_a_shared_model_symlink(tmp_path):
+    src, dst = tmp_path / "mounted", tmp_path / "local"
+    (src / "model").mkdir(parents=True)
+    dst.mkdir()
+    (dst / "model").symlink_to(src / "model", target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        launch.stage_assets(dict(stage_from=str(src), model=str(dst / "model")))
+    assert not (src / "model/zing_realtime_profile.json").exists()
+
+
+def test_populated_h100_payload_stays_below_eflo_command_limit(live_assets):
+    import ast
+    import base64
+    import shlex
+    import zlib
+
+    c = live_assets.assets("encoder")
+    # Populate every serialized section to exercise the attachment payload budget.
+    c.update(
+        worker_config=dict(
+            schema=1,
+            role="encoder",
+            service_count=1,
+            coordinator_url="http://10.0.1.37:18181",
+            pool_id="adaptive-test-20261109",
+            control_epoch="test-epoch",
+            compatibility="model1027-test",
+            network_domain="shanghai-test",
+            capacity={"slots": 1},
+            profiles={"480": {"slots": 1}},
+            profile_limits={
+                "480": dict(
+                    source_sizes=[[832, 480]],
+                    target_sizes=[[832, 480]],
+                    max_fps=24,
+                    max_references=6,
+                    max_reference_bytes=1000000,
+                    max_reference_pixels=1000000,
+                    max_prompt_chars=10000,
+                    max_preview_pixels=1000000,
+                )
+            },
+            hardware_ids=["__ALLOCATED_GPU_UUID__"],
+            signing_secret_env="ROLE_POOL_SIGNING_KEY",
+            role_token_env="ROLE_POOL_REGISTRATION_TOKEN",
+        ),
+        environment={
+            "NCCL_MIN_NCHANNELS": "2",
+            "NCCL_MIN_CTAS": "2",
+            "NCCL_GRAPH_REGISTER": "0",
+            "SGLANG_ZING_SOURCE_PROMPT_JOINT": "1",
+            "SGLANG_H3_QWEN_TEST": "1",
+        },
+        dit_options={
+            "mem_fraction_static": 0.8,
+            "zing_denoising_step_list": "1000,500",
+            "zing_block0_cache_budget_root": "/cache",
+        },
+        secret_files={
+            "ROLE_POOL_SIGNING_KEY": "/secrets/signing-key",
+            "ROLE_POOL_REGISTRATION_TOKEN": "/secrets/registration-token",
+        },
+    )
+    site = dict(
+        schema=1,
+        image="test@sha256:" + "c" * 64,
+        namespace="test",
+        volumes=[],
+        volume_mounts=[],
+    )
+    output = live_assets.root / "render"
+    launch.render(c, runtime_manifest(), site, output)
+    script = (output / "h100-node.sh").read_text()
+    assert len(script) < 12000
+    assert len(script.encode()) < 12000
+    subprocess.run(["sh", "-n", str(output / "h100-node.sh")], check=True)
+    pod_line = next(
+        line for line in script.splitlines() if line.startswith("POD_JSON=")
+    )
+    pod_text = shlex.split(pod_line[len("POD_JSON=") :])[0]
+    pod = json.loads(pod_text)
+    assert pod_text == json.dumps(pod, separators=(",", ":"))
+    command = pod["spec"]["containers"][0]["command"]
+    config = json.loads(command[command.index("--config") + 1])
+    for key in ("worker_config", "environment", "dit_options", "secret_files"):
+        assert config[key] == c[key]
+    selector_line = next(
+        line for line in script.splitlines() if line.startswith("GPU_UUID=")
+    )
+    selector = shlex.split(selector_line[len("GPU_UUID=$(") : -1])[2]
+    for code, filename in ((command[2], "source.py"), (selector, "select_gpu.py")):
+        tree = ast.parse(code, feature_version=(3, 6))
+        payload = next(
+            node.args[0].value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "b64decode"
+        )
+        assert (
+            zlib.decompress(base64.b64decode(payload))
+            == Path(launch.__file__).with_name(filename).read_bytes()
+        )
+        namespace = {"__name__": "payload_test"}
+        exec(
+            code, namespace
+        )  # Decode/compile the real payload without running either entrypoint.
+        assert ("fetch" if filename == "source.py" else "select") in namespace
+
+
+@pytest.fixture
+def exited_launcher(live_assets):
+    """Exercise real run()/save() without loading CUDA or starting a worker."""
+    from unittest.mock import Mock
+
+    source.write_json(
+        live_assets.root / "verified-source.json",
+        dict(commit="a" * 40, archive_sha256="b" * 64),
+    )
+
+    def run(config, before_spawn=lambda: None, runtime=None):
+        child = Mock(pid=1234)
+        child.poll.return_value = 7
+
+        def spawn(*args, **kwargs):
+            before_spawn()
+            return child
+
+        with (
+            patch.object(launch, "reachable_ip", return_value="10.0.0.122"),
+            patch.object(launch, "probe_source", return_value=runtime or {}),
+            patch.object(launch.subprocess, "check_output", return_value="GPU-fixture"),
+            patch.object(launch.subprocess, "Popen", side_effect=spawn),
+            patch.object(launch.socket, "socket"),
+            patch.object(launch.signal, "signal"),
+            patch.object(launch.os, "killpg"),
+        ):
+            with pytest.raises(RuntimeError, match="before becoming healthy"):
+                launch.run(config, live_assets.root / "source", "a" * 40, "b" * 64)
+        return json.loads((live_assets.root / "receipt.json").read_text())
+
+    return run
+
+
+@pytest.mark.parametrize(
+    "role,storage,created",
+    [
+        ("dit", "local", True),
+        ("dit", "mounted", False),
+        ("dit", None, False),
+        ("encoder", "local", False),
+    ],
+)
+def test_local_dit_cache_directories_created_before_spawn(
+    live_assets, exited_launcher, role, storage, created
+):
+    c = live_assets.assets(role)
+    keys = (
+        "zing_block0_cache_dir",
+        "zing_block0_cache_budget_root",
+        "zing_block0_cache_capacity_dir",
+    )
+    c["dit_options"] = {key: str(live_assets.root / "cache" / key) for key in keys}
+    if storage is not None:
+        c["dit_options"]["zing_block0_cache_storage"] = storage
+
+    def check_directories():
+        assert all(Path(c["dit_options"][key]).is_dir() == created for key in keys)
+
+    exited_launcher(c, check_directories)
+    check_directories()
+
+
+def test_large_receipt_keeps_full_disk_copy_and_parseable_log_line(
+    live_assets, exited_launcher, capsys
+):
+    import orchestrate
+
+    c = live_assets.assets("dit")
+    c["environment"] = {"SGLANG_ZING_TEST": "x" * 4000}
+    full = exited_launcher(c)
+    lines = capsys.readouterr().out.splitlines()
+    records = [json.loads(line) for line in lines]
+    assert records[-2] == full
+    assert len(lines[-2]) > 1800
+    expected = {
+        key: value
+        for key, value in full.items()
+        if key not in {"adaln", "argv", "environment"}
+    }
+    assert records[-1] == expected
+    assert lines[-1] == json.dumps(expected, separators=(",", ":"))
+    assert len(lines[-1].encode()) < 2048
+    assert all(key in full for key in ("adaln", "argv", "environment"))
+    # Reproduce PAI's truncation of each individual line, not of the entire log response.
+    truncated = "\n".join(
+        line.encode()[:2048].decode(errors="ignore") for line in lines
+    )
+    assert orchestrate.last_receipt(truncated, "dit") == expected
+
+
+@pytest.mark.parametrize("role", ["encoder", "dit", "decoder"])
+def test_preflight_enables_address_reuse_before_binding(
+    live_assets, exited_launcher, role
+):
+    from unittest.mock import call
+
+    c = live_assets.assets(role)
+
+    def check_preflight():
+        listener = launch.socket.socket.return_value.__enter__.return_value
+        expected = []
+        for port in launch.role_ports(c).values():
+            expected.extend(
+                [
+                    call.setsockopt(
+                        launch.socket.SOL_SOCKET, launch.socket.SO_REUSEADDR, 1
+                    ),
+                    call.bind(("0.0.0.0", port)),
+                ]
+            )
+        assert listener.method_calls == expected
+
+    exited_launcher(c, check_preflight)
+
+
+def test_managed_receipt_log_stays_under_pai_line_limit(
+    live_assets, exited_launcher, capsys
+):
+    import orchestrate
+
+    c = live_assets.assets("dit")
+    c["worker_config"] = dict(
+        schema=1,
+        role="dit",
+        service_count=1,
+        coordinator_url="http://10.0.1.37:18181",
+        pool_id="adaptive-test-20261109",
+        control_epoch="test-control-epoch",
+        compatibility="model1027-test",
+        network_domain="shanghai-test",
+        capacity={"slots": 1},
+        profiles={"480": {"slots": 1}},
+        profile_limits={
+            "480": dict(
+                source_sizes=[[832, 480]],
+                target_sizes=[[832, 480]],
+                max_fps=24,
+                max_references=6,
+                max_reference_bytes=1000000,
+                max_reference_pixels=1000000,
+                max_prompt_chars=10000,
+                max_preview_pixels=1000000,
+            )
+        },
+        hardware_ids=["__ALLOCATED_GPU_UUID__"],
+        signing_secret_env="ROLE_POOL_SIGNING_KEY",
+        role_token_env="ROLE_POOL_REGISTRATION_TOKEN",
+    )
+    runtime = {
+        "sglang": {
+            "path": "/tmp/verified-source/python/sglang/__init__.py",
+            "sha256": "a" * 64,
+        },
+        "python": "v" * 500,
+        "torch": "2.9",
+        "cuda": "13.0",
+    }
+    full = exited_launcher(c, runtime=runtime)
+    lines = capsys.readouterr().out.splitlines()
+    assert json.loads(lines[-2]) == full
+    old_compact = {
+        key: value
+        for key, value in full.items()
+        if key not in {"adaln", "argv", "environment"}
+    }
+    assert len(json.dumps(old_compact, separators=(",", ":")).encode()) > 2048
+    omitted = {
+        "adaln",
+        "argv",
+        "environment",
+        "runtime",
+        "launcher_sha256",
+        "release_id",
+        "image_requested",
+        "image_actual",
+        "pipeline",
+        "decoder_config",
+        "model_path",
+    }
+    expected = {key: value for key, value in full.items() if key not in omitted}
+    assert json.loads(lines[-1]) == expected
+    assert len(lines[-1].encode()) < 1800
+    assert expected["worker_config"]["hardware_ids"] == ["GPU-fixture"]
+    assert all(key in full for key in omitted)
+    truncated = "\n".join(
+        line.encode()[:2048].decode(errors="ignore") for line in lines
+    )
+    assert orchestrate.last_receipt(truncated, "dit") == expected
+
+
+def test_stage_assets_skips_already_staged_weight_files_with_matching_size(tmp_path):
+    src, dst = tmp_path / "mounted", tmp_path / "local"
+    (src / "model/transformer").mkdir(parents=True)
+    (src / "model/transformer/part.safetensors").write_bytes(b"0123456789")
+    (src / "model/zing_config.json").write_bytes(b'{"v":1}')
+    c = dict(stage_from=str(src), model=str(dst / "model"))
+    launch.stage_assets(c)
+    copied = []
+    orig_copyfile = launch.shutil.copyfile
+
+    def tracked_copy(s, d, *args, **kwargs):
+        copied.append(Path(s).name)
+        return orig_copyfile(s, d, *args, **kwargs)
+
+    (src / "model/zing_config.json").write_bytes(b'{"v":2}')
+    with patch.object(launch.shutil, "copyfile", side_effect=tracked_copy):
+        launch.stage_assets(c)
+    assert "part.safetensors" not in copied
+    assert "zing_config.json" in copied
+    assert (dst / "model/zing_config.json").read_bytes() == b'{"v":2}'
+
+
+def test_b300_and_multi_service_role_contracts(live_assets, exited_launcher):
+    import shutil
+    from unittest.mock import call
+
+    for role in ("encoder", "decoder"):
+        if (live_assets.root / "model").exists():
+            shutil.rmtree(live_assets.root / "model")
+        c = live_assets.assets(role)
+        c.update(profile="b300", service_count=2)
+        launch.validate_config(c)
+        argv, _ = launch.command(c, live_assets.root, "10.0.0.121", f"{role}-w")
+        assert argv[argv.index("--profile") + 1] == "b300"
+        assert argv[argv.index("--service-count") + 1] == "2"
+        site = dict(
+            schema=1,
+            image="test@sha256:" + "c" * 64,
+            workspace_id="th-workspace",
+            job_spec=dict(
+                Type="Worker",
+                PodCount=1,
+                QuotaId="quota-b300",
+                RestartPolicy="Never",
+                ResourceConfig={"GPU": "1"},
+            ),
+            data_sources=[],
+        )
+        out = live_assets.root / f"b300-{role}"
+        launch.render(c, runtime_manifest(), site, out)
+        rendered_role = json.loads((out / "role.json").read_text())
+        assert rendered_role["hardware"] == {
+            "capability": [10, 3],
+            "minimum_memory_gib": 240,
+        }
+        pai = json.loads((out / "pai.json").read_text())
+        assert pai["WorkspaceId"] == "th-workspace"
+        assert pai["ResourceId"] == "quota-b300"
+
+    # Multi-service preflight binds every expanded port in the range.
+    shutil.rmtree(live_assets.root / "model")
+    enc = live_assets.assets("encoder")
+    enc["service_count"] = 2
+
+    def check_multi_preflight():
+        listener = launch.socket.socket.return_value.__enter__.return_value
+        expected = []
+        for port in (30000, 30001, 31000, 31001, 32000, 32001):
+            expected.extend(
+                [
+                    call.setsockopt(
+                        launch.socket.SOL_SOCKET, launch.socket.SO_REUSEADDR, 1
+                    ),
+                    call.bind(("0.0.0.0", port)),
+                ]
+            )
+        assert listener.method_calls == expected
+
+    exited_launcher(enc, check_multi_preflight)
+
+    # DiT rejects service_count != 1 and profile="h100".
+    shutil.rmtree(live_assets.root / "model")
+    dit = live_assets.assets("dit")
+    with pytest.raises(ValueError, match="service_count=1"):
+        launch.validate_config({**dit, "service_count": 2})
+    with pytest.raises(ValueError, match="DiT profile"):
+        launch.validate_config({**dit, "profile": "h100"})
+    # Overlapping expanded port ranges fail closed.
+    with pytest.raises(ValueError, match="overlapping"):
+        launch.validate_config(
+            {
+                **enc,
+                "service_count": 4,
+                "ports": {"port": 30000, "http_port": 30002, "rendezvous_port": 32000},
+            }
+        )
+
+
+def test_examples_reuse_profile_launcher_without_duplicate_acceleration_defaults():
+    examples_dir = Path(__file__).parent / "examples"
+    for name in ("encoder.json", "dit.json", "decoder.json"):
+        data = json.loads((examples_dir / name).read_text())
+        assert "role_launcher" not in data
+        assert data["profile"] == "auto"
+        assert "quantization" not in data
+        assert "dit_options" not in data
+    orch_data = json.loads((examples_dir / "orchestration.json").read_text())
+    for role, data in orch_data["roles"].items():
+        assert "role_launcher" not in data
+        assert data["profile"] == "auto"
+        assert "quantization" not in data
+        assert "dit_options" not in data

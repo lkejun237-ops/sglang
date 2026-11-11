@@ -1649,9 +1649,13 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             self.available.set()
             return
 
+        ready_condition = (result.usage or {}).get("zing_condition_ready")
         if getattr(self, "_budget_reference_update", None) is not None:
             event_id, count = self._budget_reference_update
-            if any(
+            if (
+                ready_condition is not None
+                and ready_condition.get("event_id") == event_id
+            ) or any(
                 block["event_id"] == event_id
                 for block in (result.usage or {}).get("zing_realtime_blocks", [])
             ):
@@ -1671,7 +1675,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             "Invalid committed source boundary.",
         )
         self.committed_source_frames = committed
-        if (result.usage or {}).get("zing_condition_ready") is not None:
+        if ready_condition is not None:
             self._source_switch_end = None
         more_work = (result.usage or {}).get("zing_source_more_work", False)
         require(type(more_work) is bool, "Invalid source continuation state.")
@@ -1681,7 +1685,10 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         )
         if self.ordered_prompts:
             usage = result.usage or {}
-            if any(
+            if (
+                ready_condition is not None
+                and ready_condition.get("event_id") == self.prompt_inflight
+            ) or any(
                 block.get("event_id", block.get("prompt_event_id"))
                 == self.prompt_inflight
                 and block.get("num_frames", 0) > 0

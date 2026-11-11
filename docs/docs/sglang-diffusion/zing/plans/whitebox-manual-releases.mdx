@@ -263,8 +263,8 @@ python -m torch.distributed.run --standalone --nproc-per-node="$SP" --module \
   --sp-degree "$SP" --service-count 1 --advertise-host "$ADVERTISE_HOST" \
   --http-port "$HTTP_PORT" --port "$TRANSPORT_PORT" --rendezvous-port "$RENDEZVOUS_PORT" \
   --mem-fraction-static "$MEM_FRACTION" --zing-solver few_step \
-  --zing-denoising-step-list 1000,500 --zing-initial-block-count 3 \
-  --zing-initial-denoising-step-list 1000,750,500,250 --zing-source-defer-final \
+  --zing-denoising-step-list 1000,500 --zing-initial-block-count 0 \
+  --zing-source-defer-final \
   --zing-block0-cache-mode on --zing-block0-cache-backend local \
   --zing-block0-cache-storage local --zing-block0-cache-dir "$CACHE_DIR" \
   --zing-block0-cache-host-gb 416 --zing-block0-cache-host-total-gb 416 \
@@ -319,6 +319,32 @@ Encoder 使用原生 `zing_source_encoder_server`，加载 Qwen、参考图/sour
 pipeline 不能原样传给 Encoder；三角色模型、采样、协议及 profile 必须匹配。
 各独立 Encoder/Decoder 占一张已分配 GPU，管理、transport、rendezvous/output 端口按角色核对；
 平台须显式覆盖模型镜像默认的整组 ENTRYPOINT，不调用 A 的启动器重启借用角色。
+
+```bash
+: "${PYTHON:?verified interpreter}" "${ROLE_CONFIG:?private Encoder role config}"
+: "${ROLE_GPU_UUIDS:?one assigned GPU}" "${MODEL_VIEW:?verified model view}"
+: "${HTTP_PORT:?management port}" "${TRANSPORT_PORT:?input WS port}"
+: "${RENDEZVOUS_PORT:?Encoder rendezvous port}" "${ADVERTISE_HOST:?reachable private address}"
+SGLANG_ROLE_POOL_WORKER_CONFIG="$ROLE_CONFIG" CUDA_VISIBLE_DEVICES="$ROLE_GPU_UUIDS" \
+"$PYTHON" -m sglang.multimodal_gen.runtime.entrypoints.zing_source_encoder_server \
+  --model "$MODEL_VIEW" --service-count 1 --advertise-host "$ADVERTISE_HOST" \
+  --http-port "$HTTP_PORT" --port "$TRANSPORT_PORT" --rendezvous-port "$RENDEZVOUS_PORT" \
+  --session-max-lifetime-s 1800
+```
+
+```bash
+: "${PYTHON:?verified interpreter}" "${ROLE_CONFIG:?private Decoder role config}"
+: "${ROLE_GPU_UUIDS:?one assigned GPU}" "${MODEL_VIEW:?verified model view}"
+: "${HTTP_PORT:?management port}" "${TRANSPORT_PORT:?Decoder ZMQ port}"
+: "${OUTPUT_PORT:?output WS port}" "${ADVERTISE_HOST:?reachable private address}"
+: "${DECODER_CONFIG_JSON:?validated Lynn JSON with mounted paths}"
+SGLANG_ROLE_POOL_WORKER_CONFIG="$ROLE_CONFIG" CUDA_VISIBLE_DEVICES="$ROLE_GPU_UUIDS" \
+"$PYTHON" -m torch.distributed.run --standalone --nproc-per-node=1 --module \
+  sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.decoder_worker \
+  --model "$MODEL_VIEW" --decoder-config "$DECODER_CONFIG_JSON" \
+  --service-count 1 --advertise-host "$ADVERTISE_HOST" \
+  --http-port "$HTTP_PORT" --port "$TRANSPORT_PORT" --output-port "$OUTPUT_PORT"
+```
 
 验收分别记录模型加载、角色 ready、注册及 Coordinator READY，再通过正常玩家准入配齐三角色，
 检查真实首帧、持续输入、取消、资源释放和下一玩家。managed 组与租约由 Coordinator 管理；

@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.entrypoints.zing_source_encoder_server import
     SourceEncoderExecutor,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.dit_link import (
+    DiTInputService,
     DiTLinkClient,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.queued_dit import (
@@ -2021,3 +2022,208 @@ def test_expected_prefill_capacity_rejection_does_not_poison_encoder_group(monke
     with pytest.raises(ConditionError, match="waiting for capacity"):
         client._forward([])
     assert not failed
+
+
+def test_condition_ready_clears_inflight_prompt_and_reference_budget():
+    adapter = ZingEncoderDiTAdapter()
+    adapter.startup_enabled = False
+    adapter.condition_switch_protocol = "zing_h3_source_condition_switch.v1"
+    adapter._pending_prompt_command = None
+    adapter._pending_sink_command = None
+    adapter.ordered_prompts = True
+    adapter.source_append_overlap = False
+    adapter.source_decoder_overlap = False
+    adapter.source_work_quantum = 0
+    adapter.prompt_inflight = 18
+    adapter._source_switch_end = 17
+    adapter._budget_reference_count = 2
+    adapter._budget_reference_update = (18, 6)
+    adapter._inflight_reference_uploads = []
+    adapter._inflight_reservations = []
+    adapter.committed_source_frames = 17
+    adapter.ledger = NS(accepted_frames=17)
+    result = NS(
+        usage={
+            "zing_source_committed_end": 17,
+            "zing_source_more_work": False,
+            "zing_realtime_blocks": [],
+            "zing_condition_ready": {
+                "type": "control_ack",
+                "kind": "prompt.update",
+                "state": "kv_ready",
+                "event_id": 18,
+                "prompt_version": 2,
+                "source_frame_index": 17,
+            },
+        },
+        conditioning_notice=None,
+    )
+    adapter.on_chunk_complete(NS(generate_chunk_completed=lambda: None), result)
+    assert adapter.prompt_inflight is None
+    assert adapter._source_switch_end is None
+    assert adapter._budget_reference_count == 6
+    assert adapter._budget_reference_update is None
+
+
+def test_dit_input_service_publishes_cache_report_on_conditioning_ready():
+    sent = []
+
+    class Channel:
+        def send(self, msg):
+            sent.append(msg)
+
+    class Worker:
+        closed = False
+        initial_received = True
+        complete = False
+        conditioning_notice = None
+        condition_prepared = None
+        condition_ready = dict(event_id=18, prompt_version=2, source_frame_index=17)
+        queue = []
+
+        async def put(self, message):
+            pass
+
+        def take_cache_report(self, event_id):
+            assert event_id == 18
+            return dict(
+                cache_key="a" * 64,
+                prompt_version=2,
+                cache_result="l1_hit",
+            )
+
+    service = DiTInputService(Channel(), lambda msg, out: None)
+    service.owner = ("s", "g")
+    service.worker = Worker()
+
+    async def exercise():
+        service.queue.append(
+            dict(
+                type="conditioning",
+                transfer_id=0,
+                session_id="s",
+                generation_id="g",
+                event_id=18,
+                prompt_version=2,
+                source_boundary=17,
+            )
+        )
+        await service.queue.run_once()
+
+    asyncio.run(exercise())
+    assert [m["type"] for m in sent] == [
+        "conditioning.ready",
+        "model.cache",
+        "input.processed",
+    ]
+    assert sent[1]["usage"]["zing_block0_cache"]["prompt_version"] == 2
+
+
+def test_encoder_dit_adapter_wakes_on_dit_output_notifications():
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
+        realtime_video_api,
+    )
+
+    class Channel:
+        def __init__(self):
+            import queue
+
+            self.inbox = queue.Queue()
+
+    channel = Channel()
+    link = DiTLinkClient(channel)
+    link.async_inputs = True
+    link.owner = ("s", "g")
+    assert not link.has_output_notifications()
+    channel.inbox.put({"type": "input.processed", "transfer_id": 1})
+    assert not link.has_output_notifications()
+    channel.inbox.put(
+        {
+            "type": "model.cache",
+            "usage": {"zing_block0_cache": {"prompt_version": 2}},
+        }
+    )
+    assert link.has_output_notifications()
+
+    adapter = ZingEncoderDiTAdapter()
+    adapter.startup_enabled = False
+    adapter.condition_switch_protocol = "zing_h3_source_condition_switch.v1"
+    adapter._pending_prompt_command = None
+    adapter._pending_sink_command = None
+    adapter.ordered_prompts = True
+    adapter.source_append_overlap = False
+    adapter.source_decoder_overlap = False
+    adapter.source_work_quantum = 0
+    adapter.pending = NS(items=[], control=False, has_control=lambda: False)
+    adapter.source_done = False
+    adapter.active_request = False
+    adapter.prompt_inflight = None
+    adapter.accepted_source_frames = 17
+    adapter.committed_source_frames = 17
+    adapter.dispatched_source_frames = 17
+    adapter.end_dispatched = False
+    adapter._source_switch_end = None
+    adapter.connection_app = NS(
+        state=NS(realtime_execution_client=NS(executor=NS(dit_link=link)))
+    )
+    assert adapter.has_control_work()
+
+    result = NS(
+        usage={
+            "zing_source_committed_end": 17,
+            "zing_source_more_work": False,
+            "zing_realtime_blocks": [],
+            "zing_dit_handoff": {
+                "cache_reports": [{"prompt_version": 2}],
+                "conditioning_notices": [],
+            },
+        },
+        conditioning_notice=None,
+    )
+    assert not realtime_video_api._is_source_progress_only(adapter, result)
+
+
+def test_encoder_client_cache_disk_delete_entries_guards_busy_and_delegates():
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace as NS
+
+    from sglang.multimodal_gen.runtime.entrypoints.zing_source_encoder_server import (
+        EncoderClient,
+    )
+
+    calls = []
+    key_a = "a" * 64
+
+    def fake_cache_query(operation, **kwargs):
+        calls.append((operation, kwargs))
+        if operation == "delete_entries":
+            return {
+                "deleted": [key_a],
+                "missing": [],
+                "failed": [],
+                "reclaimed_bytes": 1,
+            }
+        return {"ok": True}
+
+    executor = NS(
+        dit_link=object(),
+        owner=("session-1", "gen-1"),
+        connection_controller=NS(state="connected"),
+        _cache_query=fake_cache_query,
+    )
+
+    async def _run():
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            client = EncoderClient(executor, pool)
+            busy_res = await client.cache_disk("delete_entries", keys=[key_a])
+            assert busy_res == {"code": "cache_busy"}
+            assert calls == []
+            executor.owner = None
+            return await client.cache_disk("delete_entries", keys=[key_a])
+
+    res = asyncio.run(_run())
+    assert res["deleted"] == [key_a]
+    assert calls == [
+        ("delete_entries", {"keys": [key_a]}),
+    ]

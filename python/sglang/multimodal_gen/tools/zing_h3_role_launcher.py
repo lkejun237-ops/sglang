@@ -3,20 +3,35 @@
 
 from __future__ import annotations
 
+import importlib.util
 import ipaddress
 import sys
 from dataclasses import asdict
+from pathlib import Path
 
-from sglang.multimodal_gen.tools.zing_h3_profile_launcher import (
-    COMMON_ENV,
-    CONDITIONING_ENV,
-    DECODER_ENV,
-    ENCODER_ENV,
-    argument_value,
-    policy_arguments,
-    resolve_profile,
-    server_policy,
-)
+
+def _load_sibling_profile_launcher():
+    mod_name = "sglang.multimodal_gen.tools.zing_h3_profile_launcher"
+    if mod_name in sys.modules:
+        return sys.modules[mod_name]
+    path = Path(__file__).with_name("zing_h3_profile_launcher.py")
+    spec = importlib.util.spec_from_file_location(mod_name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_profile_mod = _load_sibling_profile_launcher()
+COMMON_ENV = _profile_mod.COMMON_ENV
+CONDITIONING_ENV = _profile_mod.CONDITIONING_ENV
+DECODER_ENV = _profile_mod.DECODER_ENV
+ENCODER_ENV = _profile_mod.ENCODER_ENV
+argument_value = _profile_mod.argument_value
+policy_arguments = _profile_mod.policy_arguments
+resolve_profile = _profile_mod.resolve_profile
+server_policy = _profile_mod.server_policy
 
 STAGES = (
     "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3."
@@ -29,6 +44,74 @@ DISTRIBUTED_ENV = (
     "MASTER_ADDR",
     "MASTER_PORT",
 )
+
+TOPOLOGY_WORKAROUNDS = {
+    "cross_host_sm90_h100_h200": {
+        "environment": {
+            "NCCL_MIN_NCHANNELS": "2",
+            "NCCL_MIN_CTAS": "2",
+        },
+        "nccl_version": "2.27.3+cuda12.9",
+        "topology": "cross-host K3s H100 (SM90, 80 GiB) <-> PAI-DLC H200 (SM90, 140 GiB)",
+        "reason": (
+            "Align cross-host SM90 PyNcclCommunicator channel/CTA count during "
+            "independent WorkerGroupMaster build_group handshake; not a host quota."
+        ),
+    }
+}
+
+SCOPED_MEMORY_POLICIES = {
+    "h200_model1027_480_bf16_sp1_block0_cache": {
+        "mem_fraction_static": "0.875",
+        "conditions": {
+            "model_id": "model1027",
+            "checkpoint_step": "global_step_010000",
+            "num_frame_per_block": [3, 2],
+            "split_first_latent": False,
+            "profile": "h200",
+            "resolution": "480",
+            "precision": "bf16",
+            "quantization": None,
+            "sp_degree": 1,
+            "zing_block0_cache_mode": "on",
+        },
+        "reason": (
+            "Measured static KV/cache reservation for model1027 832x480 BF16 SP1 "
+            "with resident L1 Block0 cache on a single 140 GiB H200; not a general H200 default."
+        ),
+    }
+}
+
+
+def resolve_topology_workaround(topology: str | None) -> dict:
+    if not topology:
+        return {}
+    if topology not in TOPOLOGY_WORKAROUNDS:
+        raise ValueError(f"Unknown topology workaround profile: {topology}")
+    return dict(TOPOLOGY_WORKAROUNDS[topology])
+
+
+def resolve_scoped_dit_memory_fraction(
+    *,
+    profile: str,
+    resolution: str,
+    sp_degree: int,
+    quantization: str | None,
+    cache_mode: str,
+    model_id: str | None = None,
+) -> str:
+    scoped = SCOPED_MEMORY_POLICIES["h200_model1027_480_bf16_sp1_block0_cache"]
+    cond = scoped["conditions"]
+    if (
+        model_id == cond["model_id"]
+        and profile == cond["profile"]
+        and resolution == cond["resolution"]
+        and sp_degree == cond["sp_degree"]
+        and quantization in (None, "none")
+        and cache_mode == cond["zing_block0_cache_mode"]
+    ):
+        return scoped["mem_fraction_static"]
+    return server_policy(profile)["--mem-fraction-static"]
 
 
 def build_role_contract(
@@ -94,8 +177,12 @@ def build_role_contract(
             "Independent workers do not accept server/static options: "
             + ", ".join(sorted(forbidden))
         )
-    if argument_value(arguments, "--service-count") not in (None, "1"):
-        raise ValueError("This recipe starts one service per role")
+    service_count = argument_value(arguments, "--service-count")
+    if service_count is not None:
+        if not service_count.isdigit() or int(service_count) < 1:
+            raise ValueError("--service-count must be a positive integer")
+        if component == "dit" and int(service_count) != 1:
+            raise ValueError("This recipe starts one service per role for DiT")
     if argument_value(arguments, "--max-sessions") not in (None, "1"):
         raise ValueError("This recipe supports one active session per service")
     host = argument_value(arguments, "--advertise-host")
@@ -130,7 +217,7 @@ def build_role_contract(
             if k not in ENCODER_ENV and k not in CONDITIONING_ENV
         }
         # SP1 uses the runtime's guarded attention/RoPE paths, not SP2 fixed-shape admission.
-        if profile == "b300":
+        if profile == "b300" or argument_value(arguments, "--quantization") == "fp8":
             env["SGLANG_ZING_QUANT_SCOPE"] = "ffn-attention"
         env["SGLANG_ZING_FA4_FIXED"] = "0"
         env["SGLANG_ZING_FUSED_CURRENT_ROPE_KV"] = "0"
@@ -154,6 +241,13 @@ def build_role_contract(
                 }
             }
         )
+        effective_initial_blocks = argument_value(
+            arguments, "--zing-initial-block-count"
+        )
+        if effective_initial_blocks is None:
+            effective_initial_blocks = defaults.get("--zing-initial-block-count")
+        if effective_initial_blocks == "0":
+            defaults.pop("--zing-initial-denoising-step-list", None)
         if argument_value(arguments, "--sp-degree") not in (None, str(sp_degree)):
             raise ValueError("Worker --sp-degree must match launcher --sp-degree")
         # Native workers use None for BF16; the integrated launcher sentinel

@@ -64,7 +64,17 @@ async def _disk_call(request, operation, **arguments):
     if client is not None and hasattr(client, "cache_disk"):
         value = await client.cache_disk(operation, **arguments)
         if value.get("code"):
-            status = 501 if value["code"] == "cache_operation_unsupported" else 503
+            code = value["code"]
+            status = (
+                409
+                if code
+                in {"cache_busy", "cache_capacity_exceeded", "connection_not_ready"}
+                else 422
+                if code == "invalid_cache_selection"
+                else 501
+                if code == "cache_operation_unsupported"
+                else 503
+            )
             raise HTTPException(status, detail=value)
         return value
     return _call(operation, **arguments)

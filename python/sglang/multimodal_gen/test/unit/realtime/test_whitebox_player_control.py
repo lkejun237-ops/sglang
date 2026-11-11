@@ -1051,6 +1051,11 @@ def test_actual_source_close_persists_idle_reason_after_cleanup(tmp_path, monkey
         await entered.wait()
         assert key in control.pending_source_failures
         assert (await control.get_operation(op))["state"] in {"starting", "ready"}
+        attachment = await control.get_attachment(op)
+        assert attachment["state"] in {"starting", "ready"}
+        assert attachment["execution"] == row["execution"]
+        assert "attachment" not in attachment
+        assert len(Pipeline.created) == 1
         release.set()
         await closing
         result = await control.get_attachment(op)

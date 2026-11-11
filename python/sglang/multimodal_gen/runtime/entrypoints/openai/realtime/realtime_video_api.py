@@ -1194,6 +1194,7 @@ async def _flush_source_credit(ws, adapter):
 
 def _is_source_progress_only(adapter, result):
     usage = result.usage or {}
+    handoff = getattr(result, "realtime_handoff", None) or {}
     return (
         getattr(adapter, "source_decoder_overlap", False)
         and "zing_source_consumed_end" in usage
@@ -1201,6 +1202,8 @@ def _is_source_progress_only(adapter, result):
         # A clip-barrier rebuild returns no RGB, but Room cannot resume source
         # admission until send_output delivers this kv_ready control receipt.
         and usage.get("zing_condition_ready") is None
+        and not handoff.get("cache_reports")
+        and not handoff.get("conditioning_notices")
         and not usage.get("zing_source_complete")
         and not usage.get("zing_source_dispatch_steps")
         and result.error is None

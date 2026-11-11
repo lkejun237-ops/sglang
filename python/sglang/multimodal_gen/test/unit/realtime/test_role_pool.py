@@ -1281,6 +1281,177 @@ def test_four_case_remote_pool_routes_and_authenticates(monkeypatch):
     asyncio.run(run())
 
 
+def test_hot_attach_endpoint_attaches_isolated_worker_and_fences_legacy_routes(
+    monkeypatch,
+):
+    from fastapi import FastAPI
+
+    from sglang.multimodal_gen.runtime.realtime.worker_connections import (
+        ServiceConnections,
+        service_descriptor,
+    )
+
+    monkeypatch.delenv("SGLANG_ROLE_POOL_WORKER_CONFIG", raising=False)
+    monkeypatch.setenv("ROLE_POOL_SIGNING_KEY", "s" * 32)
+    monkeypatch.setenv("ROLE_POOL_REGISTRATION_TOKEN", "r" * 32)
+    monkeypatch.setenv("NCCL_MIN_NCHANNELS", "2")
+    monkeypatch.setenv("NCCL_MIN_CTAS", "2")
+
+    app = FastAPI()
+    service = service_descriptor(
+        "encoder",
+        "encoder-hot",
+        0,
+        "10.0.0.121",
+        http=31000,
+        input_ws=30000,
+        rendezvous=32000,
+    )
+    native = ServiceConnections(
+        service,
+        ready=lambda: True,
+        build=lambda g, t: None,
+        destroy=lambda g: None,
+        rollback=lambda g: None,
+    )
+    assert native.managed is None
+    native.install(app)
+
+    worker_cfg = dict(
+        schema=1,
+        role="encoder",
+        service_count=1,
+        coordinator_url="http://127.0.0.1:9",
+        pool_id="adaptive-test-20261109",
+        control_epoch="epoch-hot",
+        compatibility="compat-hot",
+        network_domain="shanghai-vpc",
+        capacity={"slots": 1},
+        profiles={"480": {"slots": 1}},
+        profile_limits=declaration("encoder", "encoder-hot")["profile_limits"],
+        hardware_ids=["GPU-hot-1"],
+        signing_secret_env="ROLE_POOL_SIGNING_KEY",
+        role_token_env="ROLE_POOL_REGISTRATION_TOKEN",
+    )
+
+    async def run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://10.0.0.121:31000"
+        ) as client:
+            # Before hot-attach, legacy unauthenticated status works and managed identity is 503.
+            assert (
+                await client.get("/get_connection_status?reserve=false")
+            ).status_code == 200
+            assert (await client.post("/managed/identity", json={})).status_code == 503
+
+            # Unsigned attach is rejected with 403.
+            body = {"control_epoch": "epoch-hot", "worker_config": worker_cfg}
+            assert (await client.post("/managed/attach", json=body)).status_code == 403
+
+            # Signed attach activates ManagedService in-process without restarting.
+            creds = Credentials("s" * 32, "epoch-hot")
+            token = creds.sign("attach", body, expires_at=time.time() + 30)
+            resp = await client.post(
+                "/managed/attach",
+                json=body,
+                headers={"Authorization": "Bearer " + token},
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["service"]["worker_id"] == "encoder-hot"
+            assert data["deployment"]["hardware_ids"] == ["GPU-hot-1"]
+            assert native.managed is not None
+
+            # Legacy unauthenticated admission is now fenced (403).
+            assert (await client.get("/get_connection_status")).status_code == 403
+
+            # Idempotent retry of identical attach returns the same boot_epoch.
+            resp_retry = await client.post(
+                "/managed/attach",
+                json=body,
+                headers={"Authorization": "Bearer " + token},
+            )
+            assert resp_retry.status_code == 200
+            assert resp_retry.json()["boot_epoch"] == data["boot_epoch"]
+
+            # Conflicting re-attach with different hardware_ids or capacity is rejected (409).
+            conflict_cfg = {**worker_cfg, "hardware_ids": ["GPU-other"]}
+            conflict_body = {
+                "control_epoch": "epoch-hot",
+                "worker_config": conflict_cfg,
+            }
+            conflict_token = creds.sign(
+                "attach", conflict_body, expires_at=time.time() + 30
+            )
+            resp_conflict = await client.post(
+                "/managed/attach",
+                json=conflict_body,
+                headers={"Authorization": "Bearer " + conflict_token},
+            )
+            assert resp_conflict.status_code == 409
+
+            cap_conflict_body = {
+                "control_epoch": "epoch-hot",
+                "worker_config": {**worker_cfg, "capacity": {"slots": 2}},
+            }
+            cap_conflict_token = creds.sign(
+                "attach", cap_conflict_body, expires_at=time.time() + 30
+            )
+            resp_cap_conflict = await client.post(
+                "/managed/attach",
+                json=cap_conflict_body,
+                headers={"Authorization": "Bearer " + cap_conflict_token},
+            )
+            assert resp_cap_conflict.status_code == 409
+
+            # Re-attach when managed service is busy is rejected (409 WORKER_NOT_IDLE).
+            native.managed.state = "reserved"
+            resp_busy = await client.post(
+                "/managed/attach",
+                json=body,
+                headers={"Authorization": "Bearer " + token},
+            )
+            assert resp_busy.status_code == 409
+            assert resp_busy.json()["code"] == "WORKER_NOT_IDLE"
+            native.managed.state = "idle"
+
+    from sglang.multimodal_gen.runtime.realtime.role_pool import reporting
+
+    try:
+        asyncio.run(run())
+    finally:
+        for reporter in list(reporting._REGISTRY.values()):
+            reporter.stop.set()
+
+
+def test_store_confirm_stopped_and_retire_process_are_idempotent_on_retry():
+    async def run():
+        store = RolePoolStore(MemoryRecords(), "test", "control-1")
+        await store.initialize()
+        decl = declaration("encoder", "enc-1")
+        await store.register(decl)
+        await store.drain("enc-1", "enc-1-boot")
+        await store.confirm_stopped(
+            "enc-1", "enc-1-boot", "receipt-1", "orchestrate-down"
+        )
+        # Retrying confirm_stopped with the same receipt succeeds idempotently.
+        await store.confirm_stopped(
+            "enc-1", "enc-1-boot", "receipt-1", "orchestrate-down"
+        )
+        await store.retire_process("enc-1", "enc-1-boot", "receipt-1")
+        # Retrying confirm_stopped and retire_process after retirement with the same receipt succeeds.
+        await store.confirm_stopped(
+            "enc-1", "enc-1-boot", "receipt-1", "orchestrate-down"
+        )
+        retired = await store.retire_process("enc-1", "enc-1-boot", "receipt-1")
+        assert retired["state"] == "retired"
+        with pytest.raises(PoolError, match="STOP_EVIDENCE_CHANGED"):
+            await store.retire_process("enc-1", "enc-1-boot", "different-receipt")
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize(
     "mismatch",
     [

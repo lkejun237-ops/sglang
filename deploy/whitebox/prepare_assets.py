@@ -124,6 +124,7 @@ def prepare(
     if (
         runtime.get("num_frame_per_block") != [3, 2]
         or runtime.get("split_first_latent") is not False
+        or m["initial_blocks"] != 0
         or runtime.get("checkpoint_sha256") != m["checkpoint_sha256"]
         or runtime.get("causal") is not True
         or runtime.get("h3_media_config", {}).get("fps") != 24
@@ -143,7 +144,11 @@ def prepare(
     profile = {
         "solver": "few_step",
         "denoising_step_list": list(m["denoising_steps"]),
-        "initial_denoising_step_list": list(m["initial_steps"]),
+        **(
+            {"initial_denoising_step_list": list(m["initial_steps"])}
+            if m["initial_blocks"] > 0
+            else {}
+        ),
         "initial_block_count": m["initial_blocks"],
         "source_attention_window": {
             "window_chunks": m["window_chunks"],

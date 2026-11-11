@@ -408,8 +408,8 @@ def test_shared_enabled_pipeline_defaults(profile, quantum, overlap):
     assert value("--warmup-mode") == "off"
     assert value("--dist-timeout") == "600"
     assert value("--zing-source-encoder-mode") == "overlap"
-    assert value("--zing-initial-block-count") == "3"
-    assert value("--zing-initial-denoising-step-list") == "1000,750,500,250"
+    assert value("--zing-initial-block-count") == "0"
+    assert "--zing-initial-denoising-step-list" not in command
     assert value("--zing-reference-max-images") == "21"
     assert value("--encoder-parallel") == "replicate"
     assert value("--mem-fraction-static") == "0.8"
@@ -475,3 +475,27 @@ def test_pr647_hardware_memory_gate_uses_gib(profile, minimum):
     assert launcher.resolve_profile("auto", [gpu(profile, memory=minimum)]) == profile
     with pytest.raises(ValueError, match="No B300/H200 recipe"):
         launcher.resolve_profile("auto", [gpu(profile, memory=minimum - 1)])
+
+
+def test_policy_source_metadata_and_b300_forwarder():
+    meta = launcher.policy_source_metadata()
+    assert meta["schema_version"] == "zing-h3-acceleration/v1"
+    assert (
+        meta["launcher_module"]
+        == "sglang.multimodal_gen.tools.zing_h3_profile_launcher"
+    )
+    assert (
+        meta["role_launcher_module"]
+        == "sglang.multimodal_gen.tools.zing_h3_role_launcher"
+    )
+    assert len(meta["policy_source_sha256"]) == 64
+
+    b300_path = Path(__file__).resolve().parents[2] / "tools/zing_b300_launcher.py"
+    b300_spec = importlib.util.spec_from_file_location(
+        "zing_b300_forwarder_under_test", b300_path
+    )
+    b300 = importlib.util.module_from_spec(b300_spec)
+    b300_spec.loader.exec_module(b300)
+    assert b300.build_plan.__code__ == launcher.b300_build_plan.__code__
+    assert b300._b300_serve.__code__ == launcher.b300_serve.__code__
+    assert b300.parser.__code__ == launcher.b300_parser.__code__

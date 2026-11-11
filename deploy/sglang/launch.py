@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -15,11 +16,123 @@ import sys
 import time
 import urllib.request
 import uuid
+import zlib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from source import digest, prepare, sha, validate_manifest, write_json
 
 MODEL_ID = "zing-h3-dmd-1102-step2000-generator"
+MODEL_IDS = {MODEL_ID, "model1027"}
+SECRET_ENV = {"ROLE_POOL_SIGNING_KEY", "ROLE_POOL_REGISTRATION_TOKEN"}
+ROLE_PORTS = {
+    "encoder": {"port": 30000, "http_port": 31000, "rendezvous_port": 32000},
+    "dit": {"http_port": 33000, "port": 34000, "rendezvous_port": 35000},
+    "decoder": {"http_port": 36000, "port": 37000, "output_port": 38000},
+}
+HARDWARE_PROFILES = {
+    "h100": {"capability": [9, 0], "minimum_memory_gib": 75},
+    "h200": {"capability": [9, 0], "minimum_memory_gib": 130},
+    "b300": {"capability": [10, 3], "minimum_memory_gib": 240},
+}
+DIT_OPTIONS = {
+    "mem_fraction_static",
+    "zing_denoising_step_list",
+    "zing_solver",
+    "zing_initial_denoising_step_list",
+    "zing_initial_block_count",
+    "zing_block0_cache_mode",
+    "zing_block0_cache_backend",
+    "zing_block0_cache_dir",
+    "zing_block0_cache_host_gb",
+    "zing_block0_cache_storage",
+    "zing_block0_cache_disk_gb",
+    "zing_block0_cache_host_total_gb",
+    "zing_block0_cache_budget_root",
+    "zing_block0_cache_min_free_gb",
+    "zing_block0_cache_inflight_gb",
+    "zing_block0_cache_max_writers",
+    "zing_block0_cache_gc_high_watermark",
+    "zing_block0_cache_gc_low_watermark",
+    "zing_block0_cache_capacity_dir",
+    "zing_source_joint_forward",
+    "timeout_seconds",
+}
+UNSUPPORTED_DIT_OPTIONS = {
+    "zing_block0_cache_steps",
+    "zing_block0_cache_lv_threshold",
+    "zing_block0_cache_require_same_condition",
+}
+
+
+def allowed_env(key):
+    return key in ENV_ALLOW or key.startswith(
+        ("SGLANG_ZING_", "SGLANG_H3_QWEN_", "MINIMAX_H3_PROGRESSIVE_")
+    )
+
+
+def role_ports(c):
+    ports = {**ROLE_PORTS[c["role"]], **c.get("ports", {})}
+    if (
+        set(ports) != set(ROLE_PORTS[c["role"]])
+        or any(type(p) is not int or not 1024 <= p <= 65535 for p in ports.values())
+        or len(set(ports.values())) != len(ports)
+    ):
+        raise ValueError("Invalid or overlapping role ports")
+    return ports
+
+
+def role_service_count(c):
+    count = c.get("service_count", 1)
+    if type(count) is not int or count < 1:
+        raise ValueError("service_count must be a positive integer")
+    if c.get("role") == "dit" and count != 1:
+        raise ValueError("DiT supports only service_count=1")
+    return count
+
+
+def role_port_ranges(c):
+    count = role_service_count(c)
+    bases = role_ports(c)
+    ranges = {}
+    used = set()
+    for name, base in bases.items():
+        if base + count - 1 > 65535:
+            raise ValueError("Invalid or overlapping role ports")
+        values = list(range(base, base + count))
+        if used & set(values):
+            raise ValueError("Invalid or overlapping role ports")
+        used.update(values)
+        ranges[name] = values
+    return ranges
+
+
+def role_allocated_ports(c):
+    return [port for values in role_port_ranges(c).values() for port in values]
+
+
+def role_hardware(c):
+    profile = c.get("profile")
+    if profile in HARDWARE_PROFILES:
+        expected = dict(HARDWARE_PROFILES[profile])
+    else:
+        expected = dict(HARDWARE_PROFILES["h200" if c["role"] == "dit" else "h100"])
+    if c.get("hardware") is not None:
+        hw = c["hardware"]
+        if (
+            not isinstance(hw, dict)
+            or set(hw) - {"capability", "minimum_memory_gib"}
+            or hw.get("capability") not in ([9, 0], [10, 3])
+            or type(hw.get("minimum_memory_gib")) is not int
+            or hw["minimum_memory_gib"] < 1
+        ):
+            raise ValueError("Invalid role hardware gate")
+        if profile in HARDWARE_PROFILES and hw != expected:
+            raise ValueError("Hardware gate conflicts with role profile")
+        return dict(hw)
+    return expected
+
+
 PREFIX = (
     "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3."
 )
@@ -29,8 +142,27 @@ MODULES = {
     "decoder": PREFIX + "decoder_worker",
 }
 PORTS = {"encoder": 31000, "dit": 33000, "decoder": 36000}
-# No inherited PYTHONPATH, PYTHONHOME, LD_PRELOAD, credential or arbitrary runtime overrides.
+# Runtime credentials are explicit and redacted; source and device allocation stay isolated.
 ENV_ALLOW = {
+    "SGLANG_ROLE_POOL_WORKER_CONFIG",
+    "ROLE_POOL_SIGNING_KEY",
+    "ROLE_POOL_REGISTRATION_TOKEN",
+    "NCCL_MIN_NCHANNELS",
+    "NCCL_MIN_CTAS",
+    "NCCL_GRAPH_REGISTER",
+    "NCCL_NET",
+    "CUBLAS_WORKSPACE_CONFIG",
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "CUDA_CACHE_PATH",
+    "TRITON_CACHE_DIR",
+    "TORCHINDUCTOR_CACHE_DIR",
+    "XDG_CACHE_HOME",
+    "HF_HUB_OFFLINE",
+    "TRANSFORMERS_OFFLINE",
+    "TOKENIZERS_PARALLELISM",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "SGLANG_DIFFUSION_STAGE_LOGGING",
     "PATH",
     "HOME",
     "LANG",
@@ -67,29 +199,102 @@ CONFIG_KEYS = {
     "environment",
     "startup_timeout",
     "hardware",
+    "ports",
+    "dit_options",
+    "profile",
+    "resolution",
+    "service_count",
+    "worker_config",
+    "secret_files",
+    "stage_from",
 }
 
 
 def load_config(path):
-    c = json.loads(Path(path).read_text())
+    return validate_config(json.loads(Path(path).read_text()))
+
+
+def validate_config(c):
     if (
         c.get("schema") != 1
         or set(c) - CONFIG_KEYS
         or c.get("role") not in MODULES
-        or c.get("model_id") != MODEL_ID
+        or c.get("model_id") not in MODEL_IDS
     ):
         raise ValueError("Unknown configuration field, role or model identity")
-    if set(c.get("environment", {})) - (
-        ENV_ALLOW
-        - {
-            "CUDA_VISIBLE_DEVICES",
-            "NVIDIA_VISIBLE_DEVICES",
-            "HOME",
-            "PATH",
-            "LD_LIBRARY_PATH",
-        }
-    ):
+    forbidden = {
+        "CUDA_VISIBLE_DEVICES",
+        "NVIDIA_VISIBLE_DEVICES",
+        "HOME",
+        "PATH",
+        "LD_LIBRARY_PATH",
+    }
+    if any(not allowed_env(k) or k in forbidden for k in c.get("environment", {})):
         raise ValueError("Environment key is not allowlisted")
+    if SECRET_ENV & c.get("environment", {}).keys():
+        raise ValueError(
+            "Secrets must be injected by the platform, never stored in role specs"
+        )
+    if set(c.get("secret_files", {})) - SECRET_ENV or any(
+        not Path(v).is_absolute() for v in c.get("secret_files", {}).values()
+    ):
+        raise ValueError("Secret files require known secret names and absolute paths")
+    if c.get("worker_config"):
+        w = c["worker_config"]
+        required = {
+            "role",
+            "service_count",
+            "coordinator_url",
+            "pool_id",
+            "control_epoch",
+            "compatibility",
+            "network_domain",
+            "capacity",
+            "profiles",
+            "profile_limits",
+            "hardware_ids",
+            "signing_secret_env",
+            "role_token_env",
+        }
+        if required - set(w) or set(w) - required - {"schema", "heartbeat_seconds"}:
+            raise ValueError("Unknown or incomplete worker agent configuration")
+        if (
+            w["signing_secret_env"] != "ROLE_POOL_SIGNING_KEY"
+            or w["role_token_env"] != "ROLE_POOL_REGISTRATION_TOKEN"
+        ):
+            raise ValueError(
+                "Worker agent secrets must use the supported platform environment names"
+            )
+        if w.get("role") != c["role"] or w.get("service_count") != role_service_count(
+            c
+        ):
+            raise ValueError("Worker agent role/service count mismatch")
+    role_port_ranges(c)
+    if c.get("profile") not in (None, "auto", "h100", "h200", "b300"):
+        raise ValueError("Unknown hardware profile")
+    if c["role"] == "dit" and c.get("profile") == "h100":
+        raise ValueError("DiT profile must be auto, h200 or b300")
+    if c.get("hardware") is not None:
+        role_hardware(c)
+    options = c.get("dit_options", {})
+    if not isinstance(options, dict) or any(
+        type(v) not in (str, float, int) for v in options.values()
+    ):
+        raise ValueError("DiT options must be string or numeric native CLI values")
+    if (
+        "mem_fraction_static" in options
+        and not 0 < float(options["mem_fraction_static"]) <= 1
+    ):
+        raise ValueError("Memory fraction must be in (0, 1]")
+    if set(options) & UNSUPPORTED_DIT_OPTIONS:
+        raise ValueError(
+            "Unsupported native DiT options: "
+            + ", ".join(sorted(set(options) & UNSUPPORTED_DIT_OPTIONS))
+        )
+    if set(options) - DIT_OPTIONS or (options and c["role"] != "dit"):
+        raise ValueError("Unknown or non-DiT options")
+    if c.get("resolution", "480") not in ("480", "736"):
+        raise ValueError("Resolution must be 480 or 736")
     if any(
         not isinstance(v, str) or "\x00" in v for v in c.get("environment", {}).values()
     ):
@@ -104,13 +309,107 @@ def load_config(path):
         raise ValueError("Decoder requires its own config")
     if c["role"] == "decoder" and c.get("pipeline"):
         raise ValueError("Decoder does not accept a pipeline")
-    for key in ("model", "asset_receipt"):
+    for key in (
+        "model",
+        "asset_receipt",
+        *(("stage_from",) if c.get("stage_from") else ()),
+    ):
         if not Path(c[key]).is_absolute():
             raise ValueError("Asset paths must be absolute")
     sha(c["asset_receipt_sha256"])
     if not 1 <= c.get("startup_timeout", 900) <= 3600:
         raise ValueError("Startup timeout must be in [1, 3600] seconds")
     return c
+
+
+def asset_files(model):
+    for directory, _, names in os.walk(model, followlinks=True):
+        for name in names:
+            path = Path(directory) / name
+            if path.is_file():
+                yield path
+
+
+def stage_assets(c):
+    """Copy hot serving assets locally; leave large peripheral components on the mount."""
+    source = Path(c["stage_from"])
+    destination = Path(c["model"]).parent
+    if destination.is_symlink() or Path(c["model"]).is_symlink():
+        raise ValueError("Staging destination cannot traverse a symlink")
+    if not (source / "model").is_dir() or Path(c["model"]).name != "model":
+        raise ValueError(
+            "Staging requires a source model directory and a destination named model"
+        )
+    if (
+        source.resolve() == destination.resolve()
+        or source.resolve().is_relative_to(destination.resolve())
+        or destination.resolve().is_relative_to(source.resolve())
+    ):
+        raise ValueError("Staging source and destination must not overlap")
+    selected = {
+        "transformer",
+        "zing_config.json",
+        "model_index.json",
+        "zing_realtime_profile.json",
+        "EXPORT_COMPLETE.json",
+    }
+    paths = []
+    for name in selected:
+        path = source / "model" / name
+        if path.is_dir():
+            paths.extend(asset_files(path))
+        elif path.is_file():
+            paths.append(path)
+    if (source / "adaln-table-unsplit").is_dir():
+        paths.extend(asset_files(source / "adaln-table-unsplit"))
+
+    def copy(path):
+        target = destination / path.relative_to(source)
+        # Do not follow a previous destination symlink back into shared storage.
+        if any(
+            parent.is_symlink()
+            for parent in (target, *target.parents)
+            if parent == destination or destination in parent.parents
+        ):
+            raise ValueError("Staging destination cannot traverse a symlink")
+        if (
+            path.suffix in {".safetensors", ".pt", ".bin"}
+            and not target.is_symlink()
+            and target.is_file()
+            and target.stat().st_size == path.stat().st_size
+        ):
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + ".tmp-" + uuid.uuid4().hex)
+        try:
+            shutil.copyfile(path, temporary)
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        list(executor.map(copy, paths))
+    model = destination / "model"
+    model.mkdir(parents=True, exist_ok=True)
+    for path in [p for p in (source / "model").iterdir() if p.name not in selected] + [
+        source / "lynn"
+    ]:
+        if not path.exists():
+            continue
+        target = (
+            model / path.name
+            if path.parent == source / "model"
+            else destination / "lynn"
+        )
+        if target.is_symlink() and target.resolve() == path.resolve():
+            continue
+        if target.exists() or target.is_symlink():
+            raise ValueError("Staging refuses to replace an existing peripheral asset")
+        target.symlink_to(path.resolve(), target_is_directory=path.is_dir())
+    profile = model / "zing_realtime_profile.json"
+    data = json.loads(profile.read_text()) if profile.exists() else {}
+    data["source_attention_window"] = {"window_chunks": 6, "sink_chunks": 0}
+    profile.write_text(json.dumps(data, indent=2) + "\n")
 
 
 def verify_assets(c):
@@ -120,14 +419,14 @@ def verify_assets(c):
     a = json.loads(path.read_text())
     if (
         a.get("schema") != 1
-        or a["model_id"] != MODEL_ID
+        or a["model_id"] != c["model_id"]
         or a["component"] != "generator"
         or a["ema"] is not False
         or Path(a["model"]).resolve() != Path(c["model"]).resolve()
     ):
         raise ValueError("Model identity or component mismatch")
     # Receipt is produced by the asset owner after verifying the original export.
-    # Hash every listed artifact, including all weight shards and external components.
+    # String entries are fully hashed; owner-supplied size entries avoid rereading cold weights.
     files = a["files"]
     if not files or any(not Path(p).is_absolute() for p in files):
         raise ValueError("Asset receipt requires absolute artifact paths")
@@ -137,13 +436,31 @@ def verify_assets(c):
         raise ValueError("Role config is not covered by asset receipt")
     weights = [
         p
-        for p in Path(c["model"]).rglob("*")
-        if p.is_file() and p.suffix in {".safetensors", ".pt", ".bin"}
+        for p in asset_files(c["model"])
+        if p.suffix in {".safetensors", ".pt", ".bin"}
     ]
     if not weights or any(str(p) not in files for p in weights):
         raise ValueError("Model weight files must be covered by asset receipt")
     for p, expected in files.items():
-        if digest(p) != sha(expected):
+        full_hash = True
+        if isinstance(expected, dict):
+            if (
+                set(expected) != {"bytes", "sha256"}
+                or type(expected["bytes"]) is not int
+                or expected["bytes"] < 0
+            ):
+                raise ValueError("Invalid sized asset receipt entry: " + p)
+            expected_hash = sha(expected["sha256"])
+            if Path(p).stat().st_size != expected["bytes"]:
+                raise ValueError("Asset size mismatch: " + p)
+            full_hash = p in required or Path(p).suffix.lower() in {
+                ".json",
+                ".yaml",
+                ".yml",
+            }
+        else:
+            expected_hash = sha(expected)
+        if full_hash and digest(p) != expected_hash:
             raise ValueError("Asset digest mismatch: " + p)
     if c["role"] == "dit":
         pipeline = json.loads(Path(c["pipeline"]).read_text())
@@ -169,7 +486,7 @@ def verify_assets(c):
             if (
                 not adaln.get("schedule")
                 or not adaln.get("cuda_provenance")
-                or adaln.get("model_id") != MODEL_ID
+                or adaln.get("model_id") != c["model_id"]
             ):
                 raise ValueError("AdaLN model/schedule/CUDA provenance is required")
         elif adaln["mode"] != "resident" or pipeline.get("zing_adaln_table_path"):
@@ -178,61 +495,94 @@ def verify_assets(c):
 
 
 def reachable_ip():
+    vpc = ipaddress.ip_network("10.0.0.0/8")
+    route_succeeded = False
+    for peer in ("10.0.1.37", "10.0.0.121"):
+        try:
+            # Kernel route selection only; UDP connect sends no packet.
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect((peer, 9))
+                address = ipaddress.ip_address(s.getsockname()[0])
+            route_succeeded = True
+            if address in vpc:
+                return str(address)
+        except OSError:
+            pass
     value = os.environ.get("POD_IP")
-    if not value:
-        # Kernel route selection only; UDP connect sends no packet.
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("10.0.0.121", 9))
-            value = s.getsockname()[0]
-    address = ipaddress.ip_address(value)
-    if address.is_loopback or address.is_unspecified or address.is_multicast:
-        raise ValueError("Platform did not provide a usable advertise IP")
-    return str(address)
+    if value:
+        address = ipaddress.ip_address(value)
+        if not (
+            address.is_loopback or address.is_unspecified or address.is_multicast
+        ) and (address in vpc or not route_succeeded):
+            return str(address)
+    raise ValueError("Platform did not provide a usable advertise IP")
 
 
 def command(c, source, host, worker_id):
     role = c["role"]
-    argv = [sys.executable, "-m"]
-    if role == "decoder":
-        argv += [
-            "torch.distributed.run",
-            "--standalone",
-            "--nproc-per-node=1",
-            "--module",
-        ]
-    argv += [
-        MODULES[role],
+    native_args = [
         "--model",
         c["model"],
         "--service-count",
-        "1",
+        str(role_service_count(c)),
         "--http-port",
-        str(PORTS[role]),
+        str(role_ports(c)["http_port"]),
         "--advertise-host",
         host,
         "--worker-id",
         worker_id,
     ]
+    for name, port in role_ports(c).items():
+        if name != "http_port":
+            native_args += ["--" + name.replace("_", "-"), str(port)]
     if c.get("pipeline"):
-        argv += ["--pipeline-config-path", c["pipeline"]]
+        native_args += ["--pipeline-config-path", c["pipeline"]]
     if role == "dit":
-        argv += ["--sp-degree", "1"]
+        native_args += ["--sp-degree", "1"]
+        for name, value in c.get("dit_options", {}).items():
+            native_args += ["--" + name.replace("_", "-"), str(value)]
         if c.get("quantization"):
-            argv += ["--quantization", c["quantization"]]
+            native_args += ["--quantization", c["quantization"]]
     if role == "decoder":
-        argv += [
+        native_args += [
             "--decoder-config",
             json.dumps(
                 json.loads(Path(c["decoder_config"]).read_text()), separators=(",", ":")
             ),
         ]
-    env = {k: v for k, v in os.environ.items() if k in ENV_ALLOW}
+    env = {k: v for k, v in os.environ.items() if allowed_env(k)}
     env.update(c.get("environment", {}))
+    for key, path in c.get("secret_files", {}).items():
+        env[key] = Path(path).read_text().strip()
+        if not env[key] or "\x00" in env[key]:
+            raise ValueError("Invalid platform secret file")
+    if c.get("worker_config"):
+        env["SGLANG_ROLE_POOL_WORKER_CONFIG"] = str(
+            source.parent / "role_pool_worker.json"
+        )
     env.update(
         PYTHONPATH=str(source / "python"),
         PYTHONNOUSERSITE="1",
         OMP_NUM_THREADS=env.get("OMP_NUM_THREADS", "1"),
     )
+    # #471 owns hardware policy and its native argv; no policy is copied here.
+    argv = [
+        sys.executable,
+        "-m",
+        "sglang.multimodal_gen.tools.zing_h3_profile_launcher",
+        "--mode",
+        "independent",
+        "--component",
+        role,
+        "--profile",
+        c.get("profile", "auto"),
+        "--resolution",
+        c.get("resolution", "480"),
+        "--sp-degree",
+        "1",
+        "--",
+        *native_args,
+    ]
     return argv, env
 
 
@@ -275,6 +625,8 @@ print(json.dumps(result))"""
 def run(c, source, commit, archive_sha):
     sha(commit, 40)
     sha(archive_sha)
+    if c.get("stage_from"):
+        stage_assets(c)
     assets = verify_assets(c)
     attestation = json.loads((source.parent / "verified-source.json").read_text())
     if attestation != {"commit": commit, "archive_sha256": archive_sha}:
@@ -283,13 +635,9 @@ def run(c, source, commit, archive_sha):
     worker_id = c["role"] + "-" + uuid.uuid4().hex
     argv, env = command(c, source, host, worker_id)
     imports = probe_source(source, env, c["role"], c.get("hardware"))
-    ports = {
-        "encoder": (30000, 31000, 32000),
-        "dit": (33000, 34000, 35000),
-        "decoder": (36000, 37000, 38000),
-    }
-    for port in ports[c["role"]]:
+    for port in role_allocated_ports(c):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind(("0.0.0.0", port))
     gpu = subprocess.check_output(
         [
@@ -300,8 +648,20 @@ def run(c, source, commit, archive_sha):
         env=env,
         text=True,
     ).strip()
+    worker_config = c.get("worker_config")
+    if worker_config:
+        worker_config = dict(worker_config)
+        allocated = re.findall(r"GPU-[A-Za-z0-9-]+", gpu)
+        if len(set(allocated)) != 1:
+            raise ValueError("Managed worker requires exactly one observed GPU UUID")
+        if worker_config["hardware_ids"] == ["__ALLOCATED_GPU_UUID__"]:
+            worker_config["hardware_ids"] = sorted(set(allocated))
+        if worker_config["hardware_ids"] != sorted(set(allocated)):
+            raise ValueError("Managed hardware identity differs from allocated GPU")
+        write_json(source.parent / "role_pool_worker.json", worker_config)
     receipt = {
         "schema": 1,
+        "worker_config": worker_config,
         "release_id": commit + "-" + archive_sha[:12],
         "launcher_sha256": digest(Path(__file__)),
         "boot_epoch": uuid.uuid4().hex,
@@ -314,7 +674,7 @@ def run(c, source, commit, archive_sha):
         "status": "starting",
         "commit": commit,
         "archive_sha256": archive_sha,
-        "model_id": MODEL_ID,
+        "model_id": c["model_id"],
         "asset_receipt_sha256": c["asset_receipt_sha256"],
         "model_path": c["model"],
         "pipeline": c.get("pipeline"),
@@ -323,10 +683,12 @@ def run(c, source, commit, archive_sha):
         "role": c["role"],
         "worker_id": worker_id,
         "ip": host,
-        "http": "http://" + host + ":" + str(PORTS[c["role"]]),
+        "http": "http://" + host + ":" + str(role_ports(c)["http_port"]),
         "argv": argv,
         "environment": {
-            k: v for k, v in env.items() if k not in {"HOME", "PATH", "LD_LIBRARY_PATH"}
+            k: v
+            for k, v in env.items()
+            if k not in {"HOME", "PATH", "LD_LIBRARY_PATH"} | SECRET_ENV
         },
         "runtime": imports,
         "gpu": gpu,
@@ -338,6 +700,15 @@ def run(c, source, commit, archive_sha):
         "pid": None,
     }
     output = source.parent / "receipt.json"
+    options = c.get("dit_options", {})
+    if c.get("role") == "dit" and options.get("zing_block0_cache_storage") == "local":
+        for key in (
+            "zing_block0_cache_dir",
+            "zing_block0_cache_budget_root",
+            "zing_block0_cache_capacity_dir",
+        ):
+            if options.get(key):
+                Path(options[key]).mkdir(parents=True, exist_ok=True)
     child = subprocess.Popen(argv, cwd=source, env=env, start_new_session=True)
     receipt["pid"] = child.pid
 
@@ -345,7 +716,27 @@ def run(c, source, commit, archive_sha):
         temporary = output.with_suffix(".tmp")
         temporary.write_text(json.dumps(receipt, indent=2) + "\n")
         temporary.replace(output)
-        print(json.dumps(receipt), flush=True)
+        line = json.dumps(receipt)
+        print(line, flush=True)
+        if len(line) > 1800:
+            omitted = {"adaln", "argv", "environment"}
+            if receipt.get("worker_config") is not None:
+                omitted.update(
+                    {
+                        "runtime",
+                        "launcher_sha256",
+                        "release_id",
+                        "image_requested",
+                        "image_actual",
+                        "pipeline",
+                        "decoder_config",
+                        "model_path",
+                    }
+                )
+            compact = {
+                key: value for key, value in receipt.items() if key not in omitted
+            }
+            print(json.dumps(compact, separators=(",", ":")), flush=True)
 
     def stop(signum, frame):
         if child.poll() is None:
@@ -373,7 +764,13 @@ def run(c, source, commit, archive_sha):
             time.sleep(1)
         else:
             raise RuntimeError("Worker startup health deadline exceeded")
-        code = child.wait()
+        while True:
+            try:
+                code = child.wait(timeout=15)
+                break
+            except subprocess.TimeoutExpired:
+                # Keep a bounded log tail useful to the cross-cluster receipt collector.
+                save()
         receipt.update(status="exited", exit_code=code)
         save()
         return code if code >= 0 else 128 - code
@@ -401,12 +798,12 @@ def run(c, source, commit, archive_sha):
 
 def bootstrap_command(manifest, config):
     payload = base64.b64encode(
-        Path(__file__).with_name("source.py").read_bytes()
+        zlib.compress(Path(__file__).with_name("source.py").read_bytes(), 9)
     ).decode()
     code = (
-        "import base64;exec(compile(base64.b64decode("
+        "import base64,zlib;exec(compile(zlib.decompress(base64.b64decode("
         + repr(payload)
-        + "),'<source-bootstrap>','exec'))"
+        + ")),'<source-bootstrap>','exec'))"
     )
     return [
         "/opt/sglang/bin/python",
@@ -423,11 +820,33 @@ def render(c, manifest, site, output):
     validate_manifest(manifest)
     if site.get("schema") != 1:
         raise ValueError("Unsupported site configuration schema")
+    is_pai = "job_spec" in site
+    if c["role"] == "dit" and not is_pai:
+        raise ValueError("DiT requires a PAI job_spec site")
     allowed = (
-        {"schema", "image", "namespace", "volumes", "volume_mounts"}
-        if c["role"] != "dit"
-        else {"schema", "image", "job_spec", "data_sources"}
+        {
+            "schema",
+            "image",
+            "namespace",
+            "volumes",
+            "volume_mounts",
+            "model_id",
+            "image_pull_policy",
+        }
+        if not is_pai
+        else {
+            "schema",
+            "image",
+            "job_spec",
+            "data_sources",
+            "model_id",
+            "workspace_id",
+        }
     )
+    if site.get("model_id", c["model_id"]) != c["model_id"]:
+        raise ValueError("Site and role model identity mismatch")
+    if site.get("image_pull_policy", "Never") not in {"Never", "IfNotPresent"}:
+        raise ValueError("Unsupported image pull policy")
     if set(site) - allowed:
         raise ValueError("Unknown site configuration field")
     for name in ("launch.py", "source.py", "select_gpu.py"):
@@ -441,15 +860,37 @@ def render(c, manifest, site, output):
         raise ValueError("A verified image digest is required")
     c = {
         **c,
-        "hardware": {
-            "capability": [9, 0],
-            "minimum_memory_gib": 130 if c["role"] == "dit" else 75,
-        },
+        "hardware": role_hardware(c),
     }
     output.mkdir(parents=True, exist_ok=False)
     argv = bootstrap_command(manifest, c)
     name = "sglang-" + c["role"] + "-" + uuid.uuid4().hex[:12]
-    if c["role"] in ("encoder", "decoder"):
+    if not is_pai:
+        cache = "/var/lib/sglang-orchestrate/cache"
+        volumes = list(site["volumes"])
+        mounts = list(site["volume_mounts"])
+        existing = next((m for m in mounts if m["mountPath"] == cache), None)
+        if existing:
+            volume = next((v for v in volumes if v["name"] == existing["name"]), {})
+            if (
+                not existing.get("readOnly")
+                or volume.get("hostPath", {}).get("path") != cache
+            ):
+                raise ValueError(
+                    "Source cache requires a matching read-only hostPath mount"
+                )
+        else:
+            if any(v["name"] == "sglang-source-cache" for v in volumes):
+                raise ValueError("Source cache volume name is already in use")
+            volumes.append(
+                {
+                    "name": "sglang-source-cache",
+                    "hostPath": {"path": cache, "type": "Directory"},
+                }
+            )
+            mounts.append(
+                {"name": "sglang-source-cache", "mountPath": cache, "readOnly": True}
+            )
         # Discovery and selection occur on the target node, never on the user's kube context.
         pod = {
             "apiVersion": "v1",
@@ -459,12 +900,13 @@ def render(c, manifest, site, output):
                 "nodeName": "world-model-b27mys7b-0000",
                 "runtimeClassName": "nvidia",
                 "hostNetwork": True,
+                "dnsPolicy": "ClusterFirstWithHostNet",
                 "restartPolicy": "Never",
                 "containers": [
                     {
                         "name": c["role"],
                         "image": site["image"],
-                        "imagePullPolicy": "Never",
+                        "imagePullPolicy": site.get("image_pull_policy", "Never"),
                         "command": argv,
                         "env": [
                             {"name": "SGLANG_IMAGE_DIGEST", "value": site["image"]},
@@ -485,10 +927,10 @@ def render(c, manifest, site, output):
                                 ]
                             ],
                         ],
-                        "volumeMounts": site["volume_mounts"],
+                        "volumeMounts": mounts,
                     }
                 ],
-                "volumes": site["volumes"],
+                "volumes": volumes,
             },
         }
         # Node local advisory lock prevents two invocations of this launcher selecting the same card.
@@ -497,16 +939,27 @@ set -eu
 exec 9>/tmp/sglang-role-allocation.lock
 flock -n 9
 """
+        repo, digest_ref = site["image"].split("@sha256:", 1)
+        cached_tag = repo + ":cached-" + digest_ref[:12]
+        script += (
+            "/var/lib/rancher/k3s/data/current/bin/ctr -a /run/k3s/containerd/containerd.sock -n k8s.io images tag "
+            + shlex.quote(site["image"])
+            + " "
+            + shlex.quote(cached_tag)
+            + " >/dev/null 2>&1 || true\n"
+        )
         selector = base64.b64encode(
-            Path(__file__).with_name("select_gpu.py").read_bytes()
+            zlib.compress(Path(__file__).with_name("select_gpu.py").read_bytes(), 9)
         ).decode()
         selector_code = (
-            "import base64;exec(compile(base64.b64decode("
+            "import base64,zlib;exec(compile(zlib.decompress(base64.b64decode("
             + repr(selector)
-            + "),'<gpu-selector>','exec'))"
+            + ")),'<gpu-selector>','exec'))"
         )
         script += "GPU_UUID=$(python3 -c " + shlex.quote(selector_code) + ")\n"
-        script += "POD_JSON=" + shlex.quote(json.dumps(pod)) + "\n"
+        script += (
+            "POD_JSON=" + shlex.quote(json.dumps(pod, separators=(",", ":"))) + "\n"
+        )
         script += """printf '%s' "$POD_JSON" | sed "s/__ALLOCATED_GPU_UUID__/$GPU_UUID/g" | kubectl create --dry-run=client -f - >/dev/null
 printf '%s' "$POD_JSON" | sed "s/__ALLOCATED_GPU_UUID__/$GPU_UUID/g" | kubectl create -f -
 """
@@ -530,17 +983,28 @@ printf '%s' "$POD_JSON" | sed "s/__ALLOCATED_GPU_UUID__/$GPU_UUID/g" | kubectl c
     else:
         # Explicit resource fields copied from a currently verified PAI specification.
         spec = site["job_spec"]
-        if set(spec) - {
-            "Type",
-            "PodCount",
-            "QuotaId",
-            "RestartPolicy",
-            "ResourceConfig",
-        } or (
-            spec.get("PodCount") != 1
+        workspace_id = site.get("workspace_id", "1453237")
+        quota_id = spec.get("QuotaId")
+        if (
+            set(spec)
+            - {
+                "Type",
+                "PodCount",
+                "QuotaId",
+                "RestartPolicy",
+                "ResourceConfig",
+                "ImageConfig",
+            }
+            or spec.get("PodCount") != 1
             or spec.get("ResourceConfig", {}).get("GPU") != "1"
             or spec.get("Type") != "Worker"
-            or spec.get("QuotaId") != "quota3l8bnv9a35n"
+            or not isinstance(quota_id, str)
+            or not quota_id
+            or (
+                c.get("profile") != "b300"
+                and workspace_id == "1453237"
+                and quota_id != "quota3l8bnv9a35n"
+            )
             or spec.get("RestartPolicy") != "Never"
         ):
             raise ValueError("PAI DiT requires one pod with exactly one GPU")
@@ -548,8 +1012,8 @@ printf '%s' "$POD_JSON" | sed "s/__ALLOCATED_GPU_UUID__/$GPU_UUID/g" | kubectl c
         job = {
             "DisplayName": name,
             "JobType": "PyTorchJob",
-            "WorkspaceId": "1453237",
-            "ResourceId": "quota3l8bnv9a35n",
+            "WorkspaceId": workspace_id,
+            "ResourceId": quota_id,
             "JobSpecs": [spec],
             "DataSources": site["data_sources"],
             "UserCommand": "export SGLANG_IMAGE_DIGEST="
@@ -566,16 +1030,77 @@ printf '%s' "$POD_JSON" | sed "s/__ALLOCATED_GPU_UUID__/$GPU_UUID/g" | kubectl c
             "name": name,
             "role": c["role"],
             "source": manifest,
-            "model_id": MODEL_ID,
+            "model_id": c["model_id"],
             "status": "rendered-not-submitted",
             "schema": 1,
         },
     )
 
 
+def generate_assets(config, extra_files, output):
+    """Hash local exports; original checkpoint provenance remains owner supplied."""
+    model = Path(config["model"])
+    files = {p.absolute() for p in asset_files(model)}
+    files.update(Path(p).resolve() for p in extra_files)
+    files.update(
+        Path(config[k]).resolve()
+        for k in ("pipeline", "decoder_config")
+        if config.get(k)
+    )
+    adaln = {"mode": "resident"}
+    if config.get("pipeline"):
+        pipeline = json.loads(Path(config["pipeline"]).read_text())
+        adaln["mode"] = pipeline.get("zing_adaln_mode", "weights_free")
+        if adaln["mode"] == "weights_free":
+            table = Path(pipeline["zing_adaln_table_path"]).resolve()
+            manifest = json.loads((table / "manifest.json").read_text())
+            files.update(
+                (table / name) for name in ("manifest.json", "table.safetensors")
+            )
+            adaln.update(
+                table=str(table),
+                model_id=config["model_id"],
+                schedule=manifest["schedule"],
+                cuda_provenance=manifest["arithmetic"],
+            )
+    receipt = dict(
+        schema=1,
+        model_id=config["model_id"],
+        component="generator",
+        ema=False,
+        model=str(model.resolve()),
+        files={str(p): digest(p) for p in sorted(files)},
+        adaln=adaln,
+    )
+    # Validate before publishing a new receipt, including all role-required assets.
+    temporary = output.with_name(output.name + ".tmp-" + uuid.uuid4().hex)
+    try:
+        write_json(temporary, receipt)
+        verify_assets(
+            {
+                **config,
+                "asset_receipt": str(temporary),
+                "asset_receipt_sha256": digest(temporary),
+            }
+        )
+        if output.exists():
+            raise FileExistsError(output)
+        write_json(output, receipt)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return {
+        "asset_receipt": str(output.resolve()),
+        "asset_receipt_sha256": digest(output),
+    }
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="action", required=True)
+    a = sub.add_parser("assets", help="Generate or verify local asset hashes")
+    a.add_argument("--config", type=Path, required=True)
+    a.add_argument("--output", type=Path)
+    a.add_argument("--extra-file", type=Path, action="append", default=[])
     a = sub.add_parser("prepare")
     a.add_argument("--repo", type=Path, default=Path("."))
     a.add_argument("--commit", required=True)
@@ -592,7 +1117,16 @@ def main():
     a.add_argument("--commit", required=True)
     a.add_argument("--archive-sha256", required=True)
     args = p.parse_args()
-    if args.action == "prepare":
+    if args.action == "assets":
+        c = load_config(args.config)
+        print(
+            json.dumps(
+                generate_assets(c, args.extra_file, args.output)
+                if args.output
+                else verify_assets(c)
+            )
+        )
+    elif args.action == "prepare":
         print(json.dumps(prepare(args.repo, args.commit, args.output, args.oss_prefix)))
     elif args.action == "render":
         render(

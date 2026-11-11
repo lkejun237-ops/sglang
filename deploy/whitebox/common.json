@@ -28,11 +28,9 @@
     ],
     "initial_steps": [
       1000,
-      750,
-      500,
-      250
+      500
     ],
-    "initial_blocks": 3,
+    "initial_blocks": 0,
     "reference_max_images": 21,
     "source_work_quantum": 1,
     "mem_fraction_static": 0.8,

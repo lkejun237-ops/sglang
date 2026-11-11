@@ -4,6 +4,9 @@
 单进程服务只允许一个活跃会话；通信组、签名连接、缓存和媒体协议仍由现有 worker 提供。
 本目录负责源码分发、启动和本角色的 readiness，不代替 Coordinator 注册、通信组建连或生成验收。
 
+跨机 `probe/up/selftest/attach/down` 入口、状态与权限边界见 [跨机编排](ORCHESTRATION.md)。
+默认离线；本轮只进行 CPU 单测，未执行任何云端操作。
+
 ## 稳定入口
 
 | 命令 | 输入 | 输出／动作 |
@@ -19,38 +22,10 @@
 本 PR 不构建新的镜像；基础镜像必须按 digest 核验依赖、ABI、ossutil 和资产挂载。
 旧 Whitebox Dockerfile 的 SDK 构建参数和 ENTRYPOINT 不是本入口的依赖。
 
-## 依赖环境与源码身份
+## 模型与资产边界
 
-`transport-deps`、`deps` 是历史实验使用的目录名，不是启动器要求的固定目录。
-当前启动器将 worker 的 `PYTHONPATH` 固定为已验证的 `source/python`，不继承外部依赖目录。
-需要的第三方包和原生扩展应预先安装到目标镜像的 `/opt/sglang/bin/python` 环境，固定版本与
-wheel/镜像摘要，并检查 ABI；不能仅设置旧实验的 `DEPS_DIR` 就认为本入口会加载它。
-
-H3 模型侧 transport 的精确 pin 可查
-[`requirements-h3-transport.txt`](../whitebox/requirements-h3-transport.txt)，当前为
-`uvicorn==0.39.0`、`websockets==15.0.1`；支持范围以
-[`SourceTransportBudget`](../../python/sglang/multimodal_gen/runtime/realtime/source_transport.py)
-和 [`python/pyproject.toml`](../../python/pyproject.toml) 为准。
-Gateway/Coordinator/Room 的 `benchmark/whitebox/requirements.txt` 以及控制面 CPU 测试的
-`scripts/ci/zing/requirements-role-pool.txt` 使用独立解释器环境，不能安装进 GPU 模型环境覆盖 transport。
-这里引用 Whitebox 的现有 pin 作为依赖核验入口，不引入 Whitebox bundle 或 SDK 运行依赖。
-
-镜像准入先在同镜像、同解释器、同源码路径做零 GPU 的真实导入、transport 版本、WebSocket 回环、
-Lynn loader 和角色 CLI 检查；CPU 测试的 platform stubs 不进入部署环境。
-这些检查与本启动器运行时的 GPU preflight 分开记录，均不能代替模型加载和三角色生成验收。
-`source/benchmark/zing_h3_causal` 仅供单独运行 Master/客户端时使用；worker 不需要该工具导入目录。
-
-镜像内 `release.json` 只描述构建时源码。当前 worker 环境白名单不保留
-`WHITEBOX_RELEASE_MANIFEST`，原生版本接口因此报告 `unmanaged`；保留镜像原 manifest，
-用运行回执中的实际 commit、源码包摘要和导入文件路径/hash 证明本次源码身份。
-实验记录另外保存依赖清单、pipeline/profile 身份和独立的 harness SHA；本入口不支持运行时
-overlay/hooks，需要改源码时先提交推送，再生成新源码包，避免回执与实际执行代码分离。
-Whitebox 正式发布仍使用完整 main 镜像、bundle 和四角色版本核验，不能拿本入口回执代替
-`release.py verify`；见[唯一发布手册](../../docs/docs/sglang-diffusion/zing/plans/whitebox-manual-releases.mdx)。
-
-## 固定模型与资产边界
-
-三角色均固定 `zing-h3-dmd-1102-step2000-generator`，即
+角色与 site 现在可选择 `model1027` 或 `zing-h3-dmd-1102-step2000-generator`，三角色不得混用身份。
+后者对应
 `h3-dmd-sp4-05-1102-ac3d5b28/global_step_002000/generator`，非 EMA。
 原始权重：
 
@@ -169,10 +144,10 @@ H200 site 的 `job_spec`/`data_sources` 从当前已核实的单卡配额规格�
 H100 通过 Eflo 在指定节点内执行脚本，不使用本机 kube context：
 
 ```sh
-aliyun eflo-controller RunCommand --profile shengdong --region cn-shanghai \
+aliyun eflo-controller RunCommand --profile <your-aliyun-profile> --region cn-shanghai \
   --body "$(cat /private/release/encoder-plan/eflo.json)" > /private/release/encoder-submit.json
 # 从返回 JSON 读取 InvokeId，再查同一个 invocation；不得只以请求受理为成功。
-aliyun eflo-controller DescribeInvocations --profile shengdong --region cn-shanghai \
+aliyun eflo-controller DescribeInvocations --profile <your-aliyun-profile> --region cn-shanghai \
   --InvokeId "$INVOKE_ID" --IncludeOutput true --ContentEncoding PlainText
 ```
 
@@ -186,11 +161,11 @@ H200 使用 PAI REST POST 入口（沿用现有 CLI 提交流程）：
 
 ```sh
 PAI_UA="AlibabaCloud-Agent-Skills/alibabacloud-pai-dlc-job/$(uuidgen | tr '[:upper:]' '[:lower:]')"
-aliyun pai-dlc POST /api/v1/jobs --profile shengdong --region cn-shanghai \
+aliyun pai-dlc POST /api/v1/jobs --profile <your-aliyun-profile> --region cn-shanghai \
   --user-agent "$PAI_UA" --header Content-Type=application/json \
   --body "$(cat /private/release/dit-plan/pai.json)" > /private/release/dit-submit.json
 # 从返回 JSON 读取 JobId；回读 JobSpecs/DataSources，与已冻结 pai.json 对账。
-aliyun pai-dlc GetJob --profile shengdong --region cn-shanghai \
+aliyun pai-dlc GetJob --profile <your-aliyun-profile> --region cn-shanghai \
   --user-agent "$PAI_UA" --JobId "$JOB_ID"
 ```
 
@@ -222,7 +197,7 @@ python3 -m unittest discover -s deploy/sglang -p 'test_*.py'
 
 所有公共 JSON 均使用 `schema: 1`。消费者必须拒绝其他 major schema；新增可选回执字段可忽略，
 role/site 配置及 source manifest 的未知键会拒绝。改变必填项、语义或命令名需提升 schema 并同步使用者；
-当前 v1 是固定上述 Zing H3 模型与上海配方，不能据“通用”二字外推为任意模型/任意云平台支持。
+当前 v1 支持上述两种 Zing H3 模型身份与上海配方，不能据“通用”二字外推为任意模型/任意云平台支持。
 
 | JSON | 必填字段 | 可选字段／语义 |
 | --- | --- | --- |
@@ -237,7 +212,7 @@ role/site 配置及 source manifest 的未知键会拒绝。改变必填项、�
 `hardware` 可指定 capability 数组和 minimum_memory_gib；上海 renderer 统一覆盖为固定配方门槛。
 role 中 model/asset_receipt 路径须为绝对路径，其余角色资产必须由文件hash清单覆盖；摘要必须为完整小写hex。
 环境键白名单见 `ENV_ALLOW`，配置端不能覆盖平台CUDA/NVIDIA分配、PATH/HOME/LD_LIBRARY_PATH；
-Secret从现有平台挂载供 bootstrap 的 ossutil 认证使用，不透传给模型worker，也不序列化进回执。
+OSS Secret 从现有平台挂载供 bootstrap 的 ossutil 认证使用；Worker Agent 的 signing/registration Secret 可由平台环境或 secret_files 注入，不序列化进回执。
 
 runtime 的 `boot_epoch` 是本次 launcher 的启动身份，`worker_boot_epoch` 目前为null，不能伪装成原生模型池epoch。
 `image_requested` 是渲染时指定的digest，`image_actual` 目前为null，必须由外层回读Pod的实际imageID/平台记录后关联；
@@ -259,7 +234,13 @@ world-model-all-in-one负责现场环境、观测和证据回写。开发验证�
 | prepare/render/run、归档校验、导入核验、原生worker argv、H100选卡、回执和失败退出 | 已实现；CPU合同测试通过 |
 | OSS上传 | 没有专用publish命令；外层调用既有ossutil并记录上传结果；容器下载/验hash已实现 |
 | 平台提交/查重/UNKNOWN对账、实际imageID与JobPod回读、回执长期归档 | 本PR提供请求文件与准确CLI；没有自动submit/inspect/rollback命令，由外层按授权执行 |
-| 模型池注册/签名接线、实际出帧、浏览器业务E2E | 独立验收层；不作为启动器ready含义，不由本PR伪造 |
+| 模型池注册/签名接线 | orchestrate.py 生成 Worker Agent 配置并核验注册身份；仅 CPU 测试，未实机验收 |
+| 实际出帧、浏览器业务E2E | 独立验收层；原生建组自测或 ready 不代表生成/业务通过 |
 | 上海1102 serving/table精确路径和model/schedule/CUDA provenance、480/736及SP1显存、OSS/Eflo/PAI实测 | 未验收；正式部署前须关闭对应缺口 |
 
 #17可以先完成skill设计；命令集成需对照本PR最终main SHA，底层缺口反馈本PR，不能在skill里发明不存在的publish/submit/verify命令。
+
+本轮新增 role 字段、环境前缀、端口、资产 hash 生成模式及 profile launcher 接线详见 [编排合同](ORCHESTRATION.md#配置输入)。
+`launch.py assets --config ROLE.json --output NEW_ASSETS.json --extra-file /absolute/external/weights`
+生成新的本地 hash 清单（允许多次 extra-file）；不传 output 则核验现有清单。
+生成时 role 的 asset_receipt_sha256 可先填 64 个 0，再用输出摘要冻结；这不代表原始导出来源已验证。

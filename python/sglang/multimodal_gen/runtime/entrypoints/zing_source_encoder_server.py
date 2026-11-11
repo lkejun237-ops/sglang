@@ -927,6 +927,11 @@ class EncoderClient:
                 controller is not None and controller.state != "connected"
             ):
                 raise HTTPException(409, detail={"code": "connection_not_ready"})
+            if (
+                operation == "delete_entries"
+                and getattr(self.executor, "owner", None) is not None
+            ):
+                return {"code": "cache_busy"}
             return self.executor._cache_query(operation, **arguments)
 
         return await asyncio.get_running_loop().run_in_executor(self.pool, call)

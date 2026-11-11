@@ -4,12 +4,31 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib.util
 import json
 import re
+import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent
+
+
+def _load_profile_launcher():
+    module_name = "_whitebox_zing_h3_profile_launcher"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+    path = (
+        ROOT.parents[1]
+        / "python/sglang/multimodal_gen/tools/zing_h3_profile_launcher.py"
+    )
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 REGIONS = {"shanghai": "cn-shanghai", "thailand": "ap-southeast-7"}
 ROLES = ("coordinator", "gateway", "room", "model")
 REGIONAL_FIELDS = {
@@ -348,10 +367,18 @@ def render(config, bindings):
         envs["model"]["SGLANG_ZING_QUANT_SCOPE"] = c["model"].get(
             "quantization_scope", "ffn-attention"
         )
+    profile_meta = _load_profile_launcher().policy_source_metadata()
+    hardware_profile = "b300" if c["gpu"]["capability"] == [10, 3] else "h200"
     return {
         "schema_version": 1,
         "region": c["region"],
         "config_sha256": digest,
+        "launch_profile": {
+            **profile_meta,
+            "mode": "integrated",
+            "profile": hardware_profile,
+            "resolution": str(c["model"]["height"]),
+        },
         "environments": envs,
         "required_secret_keys": SECRET_KEYS,
         "policy": c,

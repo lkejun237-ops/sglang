@@ -178,11 +178,16 @@ def test_server_or_static_protocol_options_are_rejected(option):
         contract("decoder", arguments=[option, "1"])
 
 
-def test_gpu_ranks_and_single_service_are_explicit():
+def test_gpu_ranks_and_service_count_boundaries():
     with pytest.raises(ValueError, match="exactly 1"):
         contract("encoder", gpus=[gpu(), gpu()])
     with pytest.raises(ValueError, match="one service"):
-        contract("encoder", arguments=["--service-count", "2"])
+        contract("dit", arguments=["--service-count", "2"])
+    with pytest.raises(ValueError, match="positive integer"):
+        contract("encoder", arguments=["--service-count", "0"])
+    for role in ("encoder", "decoder"):
+        multi = contract(role, arguments=["--service-count", "3"])
+        assert native_args(role, multi).service_count == 3
     with pytest.raises(ValueError, match="one active"):
         contract("decoder", arguments=["--max-sessions", "2"])
     with pytest.raises(ValueError, match="No B300/H200"):
@@ -192,6 +197,21 @@ def test_gpu_ranks_and_single_service_are_explicit():
     result = contract("dit", sp=2, gpus=[gpu("h200")] * 2)
     assert native_args("dit", result).sp_degree == 2
     assert result["command"][result["command"].index("--nproc-per-node") + 1] == "2"
+
+
+@pytest.mark.parametrize("role", ["encoder", "decoder", "dit"])
+def test_b300_three_role_topology_and_multi_service(role):
+    device = launcher.GPUInfo("B300", (10, 3), 274113, 148)
+    extra = ["--service-count", "2"] if role != "dit" else []
+    result = contract(role, gpus=[device], arguments=extra, profile="b300")
+    assert result["profile"] == "b300"
+    args = native_args(role, result)
+    assert args.service_count == (2 if role != "dit" else 1)
+    if role == "encoder":
+        assert args.session_max_lifetime_s == 7800
+    elif role == "dit":
+        assert args.quantization == "fp8"
+        assert result["environment"]["SGLANG_ZING_QUANT_SCOPE"] == "ffn-attention"
 
 
 def test_independent_main_exec_clears_inherited_ranks_and_preserves_gpu_selection(
@@ -316,6 +336,11 @@ def test_b300_independent_dit_keeps_native_quantization_scope():
     result = contract("dit", gpus=[device])
     assert native_args("dit", result).quantization == "fp8"
     assert result["environment"]["SGLANG_ZING_QUANT_SCOPE"] == "ffn-attention"
+    h200_fp8 = contract("dit", arguments=["--quantization", "fp8"])
+    assert native_args("dit", h200_fp8).quantization == "fp8"
+    assert h200_fp8["environment"]["SGLANG_ZING_QUANT_SCOPE"] == "ffn-attention"
+    assert native_args("dit", h200_fp8).zing_initial_block_count == 0
+    assert native_args("dit", h200_fp8).zing_initial_denoising_step_list is None
 
 
 @pytest.mark.parametrize(
@@ -337,3 +362,46 @@ def test_final_native_argument_value_controls_role_validation(
 def test_abbreviated_protocol_or_admission_options_are_rejected(option):
     with pytest.raises(ValueError, match="complete worker option names"):
         contract("decoder", arguments=[option, "1"])
+
+
+def test_topology_workaround_and_scoped_h200_memory_policy():
+    from sglang.multimodal_gen.tools import zing_h3_role_launcher as role_launcher
+
+    topo = role_launcher.resolve_topology_workaround("cross_host_sm90_h100_h200")
+    assert topo["environment"] == {"NCCL_MIN_NCHANNELS": "2", "NCCL_MIN_CTAS": "2"}
+    assert "2.27.3" in topo["nccl_version"]
+    assert role_launcher.resolve_topology_workaround(None) == {}
+    with pytest.raises(ValueError, match="Unknown topology"):
+        role_launcher.resolve_topology_workaround("unknown_topology")
+
+    # 0.875 applies only to exact model1027 + h200 + 480 + bf16 + sp1 + block0_cache=on.
+    assert (
+        role_launcher.resolve_scoped_dit_memory_fraction(
+            profile="h200",
+            resolution="480",
+            sp_degree=1,
+            quantization=None,
+            cache_mode="on",
+            model_id="model1027",
+        )
+        == "0.875"
+    )
+    base_params = dict(
+        profile="h200",
+        resolution="480",
+        sp_degree=1,
+        quantization=None,
+        cache_mode="on",
+        model_id="model1027",
+    )
+    for override in (
+        {"model_id": None},
+        {"model_id": "zing-h3-dmd-1102-step2000-generator"},
+        {"profile": "b300"},
+        {"resolution": "736"},
+        {"sp_degree": 2},
+        {"quantization": "fp8"},
+        {"cache_mode": "off"},
+    ):
+        params = {**base_params, **override}
+        assert role_launcher.resolve_scoped_dit_memory_fraction(**params) == "0.8"
