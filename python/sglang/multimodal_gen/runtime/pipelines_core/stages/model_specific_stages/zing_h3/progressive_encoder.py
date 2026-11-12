@@ -13,6 +13,10 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 
+from sglang.multimodal_gen.runtime.realtime.zing_component_metrics import (
+    component_timer,
+)
+
 if TYPE_CHECKING:
     from .streaming_codecs import CodecSlice
 
@@ -230,9 +234,18 @@ class H3ProgressiveEncoderSession:
         except Exception as exc:
             error = exc
         self.cache.agree("prepared", error=error)
-        with _visual_encode_policy(
-            self.encode_mode, self.cudnn_benchmark_limit
-        ) as encode_policy:
+        with (
+            component_timer(
+                "encoder",
+                operation="source",
+                frames=count,
+                height=frames.shape[-2],
+                width=frames.shape[-1],
+            ),
+            _visual_encode_policy(
+                self.encode_mode, self.cudnn_benchmark_limit
+            ) as encode_policy,
+        ):
             moments, states, work = self.cache.encode((pixels - mean) / std)
             self.cache.last_execution["encode_policy"] = dict(
                 encode_policy, encode_dtype=self.encode_dtype

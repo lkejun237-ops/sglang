@@ -139,6 +139,8 @@ class LaunchTests(unittest.TestCase):
             {"PYTHONPATH": "/image"},
             {"AWS_SECRET_ACCESS_KEY": "secret"},
             {"CUDA_VISIBLE_DEVICES": "all"},
+            {"WORLD_MODEL_METRIC_SERVICE": "wrong-role"},
+            {"PROMETHEUS_MULTIPROC_DIR": "/shared/stale"},
         ]:
             c["environment"] = env
             path.write_text(json.dumps(c))
@@ -233,7 +235,12 @@ class LaunchTests(unittest.TestCase):
                 c = self.assets(role)
                 with patch.dict(
                     os.environ,
-                    {"PYTHONPATH": "/image/source", "TOKEN": "private"},
+                    {
+                        "PYTHONPATH": "/image/source",
+                        "TOKEN": "private",
+                        "WORLD_MODEL_METRIC_SERVICE": "wrong-role",
+                        "PROMETHEUS_MULTIPROC_DIR": "/shared/stale",
+                    },
                     clear=True,
                 ):
                     argv, env = launch.command(
@@ -250,6 +257,12 @@ class LaunchTests(unittest.TestCase):
                 self.assertEqual(argv[argv.index("--component") + 1], role)
                 self.assertEqual(env["PYTHONPATH"], str(self.root / "python"))
                 self.assertNotIn("TOKEN", env)
+                self.assertEqual(env["WORLD_MODEL_METRIC_SERVICE"], role)
+                self.assertEqual(env["WORLD_MODEL_METRIC_LANE"], "default")
+                self.assertEqual(
+                    env["PROMETHEUS_MULTIPROC_DIR"],
+                    str(self.root.parent / "prometheus" / "worker-fixture"),
+                )
                 self.assertEqual(argv[argv.index("--service-count") + 1], "1")
                 if role == "decoder":
                     self.assertNotIn("--pipeline-config-path", argv)
@@ -1149,3 +1162,23 @@ def test_examples_reuse_profile_launcher_without_duplicate_acceleration_defaults
         assert data["profile"] == "auto"
         assert "quantization" not in data
         assert "dit_options" not in data
+
+
+def test_metrics_boot_isolation_and_receipt(live_assets, exited_launcher):
+    config = live_assets.assets("encoder")
+    config["service_count"] = 3
+    config["environment"] = {"WORLD_MODEL_METRIC_LANE": "test-lane"}
+    launch.validate_config(config)
+    first = exited_launcher(config)["metrics"]
+    directory = Path(first["multiprocess_dir"])
+    assert directory.is_dir()
+    marker = directory / "counter_123.db"
+    marker.write_bytes(b"live counter")
+    second = exited_launcher(config)["metrics"]
+    assert first["multiprocess_dir"] != second["multiprocess_dir"]
+    assert marker.read_bytes() == b"live counter"
+    assert first["service"] == "encoder"
+    assert first["lane"] == "test-lane"
+    assert first["enabled"] is True
+    # Shared-model services expose the same registry; advertise only the base HTTP.
+    assert first["url"] == "http://10.0.0.122:31000/metrics"

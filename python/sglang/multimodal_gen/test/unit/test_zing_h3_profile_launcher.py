@@ -499,3 +499,70 @@ def test_policy_source_metadata_and_b300_forwarder():
     assert b300.build_plan.__code__ == launcher.b300_build_plan.__code__
     assert b300._b300_serve.__code__ == launcher.b300_serve.__code__
     assert b300.parser.__code__ == launcher.b300_parser.__code__
+
+
+def test_role_metrics_environment_isolates_roles_and_restarts(tmp_path, monkeypatch):
+    monkeypatch.setattr(launcher.tempfile, "tempdir", str(tmp_path))
+    parent = {
+        "PROMETHEUS_MULTIPROC_DIR": "/unrelated/live",
+        "WORLD_MODEL_METRIC_SERVICE": "wrong-role",
+        "WORLD_MODEL_METRIC_LANE": "copy",
+    }
+    results = [
+        launcher.role_metrics_environment(role, parent)
+        for role in ("encoder", "dit", "decoder", "conditioning", "dit")
+    ]
+    assert len({env["PROMETHEUS_MULTIPROC_DIR"] for env in results}) == 5
+    assert [env["WORLD_MODEL_METRIC_SERVICE"] for env in results] == [
+        "encoder",
+        "dit",
+        "decoder",
+        "qwen_vlm",
+        "dit",
+    ]
+    assert all(env["WORLD_MODEL_METRIC_LANE"] == "copy" for env in results)
+    assert all(Path(env["PROMETHEUS_MULTIPROC_DIR"]).is_dir() for env in results)
+    assert parent["PROMETHEUS_MULTIPROC_DIR"] == "/unrelated/live"
+
+
+def test_independent_metrics_preserves_owned_directory_for_sp_ranks(tmp_path):
+    result = launcher.role_metrics_environment("dit", {}, directory=str(tmp_path))
+    assert result["PROMETHEUS_MULTIPROC_DIR"] == str(tmp_path)
+    assert result["WORLD_MODEL_METRIC_SERVICE"] == "dit"
+    assert result["WORLD_MODEL_METRIC_LANE"] == "default"
+
+
+def test_role_metrics_two_ranks_export_once_and_restart_empty(tmp_path, monkeypatch):
+    import os
+    import subprocess
+
+    monkeypatch.setattr(launcher.tempfile, "tempdir", str(tmp_path))
+    env = launcher.role_metrics_environment("dit", os.environ)
+    writer = """
+import os
+from prometheus_client import Counter
+Counter("deployment_probe_frames", "frames", ["service", "rank"]).labels(
+    os.environ["WORLD_MODEL_METRIC_SERVICE"], os.environ["RANK"]
+).inc(5)
+"""
+    reader = """
+from prometheus_client import CollectorRegistry, generate_latest, multiprocess
+registry = CollectorRegistry()
+multiprocess.MultiProcessCollector(registry)
+print(generate_latest(registry).decode())
+"""
+    for rank in ("0", "1"):
+        subprocess.run(
+            [sys.executable, "-c", writer],
+            env={**env, "RANK": rank},
+            check=True,
+            capture_output=True,
+        )
+    output = subprocess.check_output([sys.executable, "-c", reader], env=env, text=True)
+    assert 'deployment_probe_frames_total{rank="0",service="dit"} 5.0' in output
+    assert 'deployment_probe_frames_total{rank="1",service="dit"} 5.0' in output
+    restarted = launcher.role_metrics_environment("dit", env)
+    output = subprocess.check_output(
+        [sys.executable, "-c", reader], env=restarted, text=True
+    )
+    assert "deployment_probe_frames_total" not in output

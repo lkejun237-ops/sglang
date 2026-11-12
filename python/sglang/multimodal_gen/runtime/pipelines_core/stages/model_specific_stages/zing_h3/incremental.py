@@ -15,9 +15,11 @@ import torch
 
 from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import ZingH3KVCache
 from sglang.multimodal_gen.runtime.realtime.zing_chunk_plan import TemporalChunk
-from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
-    Provenance,
+from sglang.multimodal_gen.runtime.realtime.zing_component_metrics import (
+    ComponentTimer,
+    component_timer,
 )
+from sglang.multimodal_gen.runtime.realtime.zing_contracts import Provenance
 
 from .packing import H3InferenceInputs, H3RowRole
 from .realtime import ZingH3RealtimeState
@@ -130,6 +132,7 @@ class SourceReadySession:
         defer_final=False,
         prompt_joint=False,
         prefix_loader=None,
+        metric_geometry=None,
     ):
         if any(
             type(n) is not int or n < 1
@@ -181,6 +184,7 @@ class SourceReadySession:
             )
         self.plan = sampler.processor.chunk_plan
         self.inputs = copy(inputs)
+        self.metric_geometry = metric_geometry or {}
         self.inputs.source_visual = self.inputs.positive = None
         if hasattr(self.inputs, "condition_media"):
             self.inputs.condition_media = None
@@ -1209,7 +1213,11 @@ class SourceReadySession:
             self._agree_ready_route("step")
             if not self.pending:
                 return None  # Wait for source. Never repeat frames or advance RNG.
-            return self._step()
+            with component_timer("dit", **self.metric_geometry) as timer:
+                result = self._step()
+                if result.provenance is not None:
+                    timer.frames = result.provenance.pixels.count
+                return result
         except BaseException:
             self.dispose()
             raise
@@ -1507,6 +1515,7 @@ class SourceReadySession:
             raise ValueError("Output limit must be a positive integer")
         self.draining = True
         finished, emitted = False, 0
+        timer = None
         try:
             self._agree_ready_route(
                 "drain_entry", first_prediction=self._drain_continuation is not None
@@ -1515,6 +1524,7 @@ class SourceReadySession:
                 self._drain_continuation = None
                 finished = True
                 return
+            timer = ComponentTimer("dit", **self.metric_geometry)
             sampler = self.sampler
             if self._drain_continuation is not None:
                 current, first, prompt, origin = self._drain_continuation
@@ -1707,6 +1717,10 @@ class SourceReadySession:
                     )
                     if first is not None:
                         self._drain_tensors.extend(v for v in first if v is not None)
+                if result.provenance is not None:
+                    timer.frames = result.provenance.pixels.count
+                timer.finish()
+                timer = None
                 yield result
                 emitted += 1
                 if self.closed:
@@ -1715,8 +1729,12 @@ class SourceReadySession:
                     if current is not None:
                         self._drain_continuation = current, first, prompt, origin
                     break
+                timer = ComponentTimer("dit", **self.metric_geometry)
             finished = True
         finally:
+            if timer is not None and not finished:
+                # An unfinished iteration has no committed output frames.
+                timer.finish(error=RuntimeError("DiT iteration did not complete"))
             self.draining = False
             if self._drain_continuation is None:
                 self._drain_tensors = []

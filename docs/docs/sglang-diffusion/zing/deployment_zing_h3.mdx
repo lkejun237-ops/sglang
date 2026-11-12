@@ -8,6 +8,22 @@ description: "供 Codex 与部署同学使用的 H100/H200/B300 部署决策、�
 下面是已有部署经验，只有对应版本、输入和配置的实测结论；
 实验补丁、显存快照、未验收画质均单独标注。新部署先选择一行，再沿证据入口取得原配置。
 
+## 组件监控（2026-11-12，模型性能与线上接入未验证）
+
+部署启动器自动设置角色 service/lane 与每次启动独立的 Prometheus 多进程目录，
+同一 DiT 的 ranks 共用；独立部署回执提供 `metrics.url`。整组 supervisor 同样隔离
+角色及重启目录。复用旧服务不原地改配置；真实模型采集开销与线上抓取仍未验收。
+
+新增 Qwen VLM、Source/Reference Encoder、DiT、Lynn Decoder 的组件耗时和帧计数，
+Grafana 展示均值/P50/P95（ms）、处理 FPS 和吞吐 FPS。CUDA events 异步 query，
+每进程最多排队 128 个观测，不为采集增加 GPU 同步；CPU 合约已验证，
+已提供单卡采集器微基准；480/736 的真实模型整体与三组件性能/显存对照仍未完成，
+不声明零开销。有效处理帧计数独立于 CUDA 计时采样，Decoder 吞吐不含尾部 padding。
+独立角色沿用健康检查端口的 `/metrics`；部署启动器自动为各角色配置 multiprocess 目录。
+当前仅有 Grafana 只读权限，模型、采集器、线上面板均未更新。
+指标口径、抓取去重、Qwen profile 更新和上线验收见
+[组件监控契约](specs/COMPONENT_METRICS.md)。
+
 ## 逐帧耗时分解（2026-11-12，PR #690）
 
 PR #690 原始 B300 作业 `dlc1dszcwbnx2o97` 已核对成功日志与原始 JSON：

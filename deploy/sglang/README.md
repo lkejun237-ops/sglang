@@ -7,6 +7,16 @@
 跨机 `probe/up/selftest/attach/down` 入口、状态与权限边界见 [跨机编排](ORCHESTRATION.md)。
 默认离线；本轮只进行 CPU 单测，未执行任何云端操作。
 
+组件监控默认开启：`launch.py run` 自动固定角色 `WORLD_MODEL_METRIC_SERVICE`，
+允许角色 `environment.WORLD_MODEL_METRIC_LANE`（默认 `default`），并为每次 worker
+启动创建独立 `PROMETHEUS_MULTIPROC_DIR`。目录在 import probe/子进程启动前建立，
+不会继承或清空其他进程的采集目录；同一 DiT 的 ranks 共享本次目录。
+`receipt.json.metrics` 包含实际 `/metrics` URL、service、lane、目录和采集开关。
+同模型多 service 只抓 base HTTP 一次；旧服务的 `reuse` 不补写环境、不重启。
+历史目录随运行材料保留，仅在全部所属进程退出后回收。抓取侧另配 `region/pool`，
+`instance` 通常由 Prometheus target 自动添加；完整示例见
+[组件监控](../../docs/docs/sglang-diffusion/zing/specs/COMPONENT_METRICS.md)。
+
 ## 稳定入口
 
 | 命令 | 输入 | 输出／动作 |

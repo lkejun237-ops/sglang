@@ -96,7 +96,7 @@ def cached_codecs(codecs, monkeypatch):
     codecs.modules = {"video_vae": torch.nn.Linear(1, 1)}
     codecs.reference_encodes = []
 
-    def encode(frames):
+    def encode(frames, *, metric_operation="source"):
         codecs.reference_encodes.append(frames.clone())
         return frames.float().mean().reshape(1, 1, 1, 1, 1)
 
@@ -339,7 +339,9 @@ def test_init_and_reference_update_decode_file_bytes_in_memory(
     monkeypatch.setattr(
         codecs,
         "encode_visual",
-        lambda frames: frames.float().mean().reshape(1, 1, 1, 1, 1),
+        lambda frames, *, metric_operation="source": (
+            frames.float().mean().reshape(1, 1, 1, 1, 1)
+        ),
     )
 
     def condition(prompt, media):
@@ -384,7 +386,7 @@ def test_reference_snapshot_recomputes_all_and_preserves_nonreferences(
             "fps": 24.0,
         }
 
-    def encode(frames):
+    def encode(frames, *, metric_operation="source"):
         encoded.append(frames.clone())
         return torch.full((1, 2, 1, 2, 2), float(frames.float().mean()))
 
@@ -685,7 +687,7 @@ def test_reference_480p_shared_by_qwen_vae_and_prompt_refresh(
         )
         return encode(prompt, media)
 
-    def visual(pixels):
+    def visual(pixels, *, metric_operation="source"):
         calls.append("vae")
         vae.append(pixels)
         return torch.zeros(1, 2, 1, pixels.shape[-2] // 16, pixels.shape[-1] // 16)
@@ -817,7 +819,9 @@ def test_prepare_routes_reference_and_source_media(
     monkeypatch.setattr(codecs, "_decode_media", decode)
     monkeypatch.setattr(codecs, "encode_condition", condition)
     monkeypatch.setattr(
-        codecs, "encode_visual", lambda frames: torch.zeros(1, 2, 1, 2, 2)
+        codecs,
+        "encode_visual",
+        lambda frames, *, metric_operation="source": torch.zeros(1, 2, 1, 2, 2),
     )
     monkeypatch.setattr(codecs, "encode_audio", audio)
     result = codecs.prepare(
@@ -1189,7 +1193,9 @@ def test_stream_prompt_preserves_reference_order_without_extra_video(
     monkeypatch.setattr(
         codecs,
         "encode_visual",
-        lambda pixels: encoded.append(pixels) or torch.zeros(1, 2, 1, 2, 2),
+        lambda pixels, *, metric_operation="source": (
+            encoded.append(pixels) or torch.zeros(1, 2, 1, 2, 2)
+        ),
     )
     request = make_request("video", references=count, source=False)
     # Use deliberately non-sorted IDs and distinct pixels; preserve wire order.
@@ -1344,7 +1350,7 @@ def test_explicit_preview_does_not_enter_source_or_reference_vae(
         seen["media"] = media
         return {}
 
-    def visual(frames):
+    def visual(frames, *, metric_operation="source"):
         vae.append(frames.clone())
         return torch.zeros(1, 2, 1, 2, 2)
 
@@ -1499,7 +1505,7 @@ def test_in_memory_source_presentation_is_not_a_vae_reference(
 
     vae = []
 
-    def visual(frames):
+    def visual(frames, *, metric_operation="source"):
         vae.append(frames.clone())
         return torch.zeros(1, 2, 1, 2, 2)
 
@@ -1731,7 +1737,9 @@ def test_qwen_and_vae_share_normalized_reference_and_source_bucket(
     monkeypatch.setattr(
         codecs,
         "encode_visual",
-        lambda frames: vae.append(frames) or torch.zeros(1, 2, 1, 2, 2),
+        lambda frames, *, metric_operation="source": (
+            vae.append(frames) or torch.zeros(1, 2, 1, 2, 2)
+        ),
     )
     active = codecs.prepare(
         request,
@@ -1783,7 +1791,11 @@ def test_stream_preview_and_reference_replacement_reuse_normalized_media(
     )
     monkeypatch.setattr(codecs, "encode_condition", lambda p, m: qwen.append(m) or {})
     monkeypatch.setattr(
-        codecs, "encode_visual", lambda f: vae.append(f) or torch.zeros(1, 2, 1, 2, 2)
+        codecs,
+        "encode_visual",
+        lambda f, *, metric_operation="source": (
+            vae.append(f) or torch.zeros(1, 2, 1, 2, 2)
+        ),
     )
     active = codecs.prepare(
         request,

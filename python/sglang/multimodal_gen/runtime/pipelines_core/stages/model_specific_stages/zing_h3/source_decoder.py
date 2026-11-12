@@ -3,6 +3,9 @@
 
 import torch
 
+from sglang.multimodal_gen.runtime.realtime.zing_component_metrics import (
+    record_completed_frames,
+)
 from sglang.multimodal_gen.runtime.realtime.zing_contracts import PixelRange
 
 from .streaming_codecs import DecodedVideoSlice
@@ -158,6 +161,9 @@ class SourceLynnDecoder:
             values, self.emitted_frames, end, self.dependency, provenance
         )
         self.emitted_frames = end
+        record_completed_frames(
+            "decoder", count, width=values.shape[-1], height=values.shape[-2]
+        )
         return result
 
     def finish(self, *, total_frames):

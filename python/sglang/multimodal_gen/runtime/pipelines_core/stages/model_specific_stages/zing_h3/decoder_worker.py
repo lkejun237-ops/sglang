@@ -36,6 +36,9 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.worker_control impor
     RoleControlError,
 )
 from sglang.multimodal_gen.runtime.realtime.polling_task_queue import PollingTaskQueue
+from sglang.multimodal_gen.runtime.realtime.zing_component_metrics import (
+    record_completed_frames,
+)
 from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
     remote_decode_progressive,
 )
@@ -377,6 +380,10 @@ class _DecodeService:
                 error = exc
             try:
                 self._agree(index, error)
+                if "frames" in job:
+                    record_completed_frames(
+                        "decoder", job["frames"], width=self.width, height=self.height
+                    )
             except BaseException as exc:
                 self.failure = error or exc
                 if job["reference"] is not None:

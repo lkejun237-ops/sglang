@@ -364,6 +364,10 @@ class ZingSourceStreamState(BaseRealtimeState):
         self.sampler = SourceReadySession(
             sampler,
             self.inputs,
+            metric_geometry={
+                "height": self.inputs.visual_shape[1] * stage.codecs.spatial_ratio,
+                "width": self.inputs.visual_shape[2] * stage.codecs.spatial_ratio,
+            },
             seed=self.bridge.seed,
             max_pending_chunks=(
                 2 if getattr(sampler, "joint_forward", "off") == "cross_chunk" else 1

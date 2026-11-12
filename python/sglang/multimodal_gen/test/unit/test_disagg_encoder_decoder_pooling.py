@@ -328,6 +328,7 @@ def _run_decoder_worker_script(commands, *, max_sessions: int = 2, service_cls=N
 
     class FakeService:
         def __init__(self, *args, **kwargs):
+            self.progressive = kwargs.get("progressive", False)
             self.width = self.height = 8
             self.valid_frame_end = self.submitted_frames = self.buffered_latents = 0
             self.disposed = False
@@ -448,7 +449,7 @@ def _run_decoder_worker_script(commands, *, max_sessions: int = 2, service_cls=N
             lambda server_args: None,
         ),
         load_decoder=lambda config: None,
-        bridge_group=lambda *a, **kw: object(),
+        bridge_group=lambda *a, **kw: SimpleNamespace(abort=lambda: None),
         receive_latent=lambda group, shape, dtype, device: torch.zeros(
             shape, dtype=dtype
         ),
@@ -1746,6 +1747,7 @@ def test_decoder_worker_abort_drain_timeout_quarantines_without_releasing_or_des
 
     class StuckDecodeService:
         def __init__(self, *a, **kw):
+            self.progressive = kw.get("progressive", False)
             self.calls = getattr(StuckDecodeService, "_count", 0)
             StuckDecodeService._count = self.calls + 1
             self.valid_frame_end = 0

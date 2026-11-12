@@ -16,6 +16,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -483,6 +484,24 @@ def wait_http(
     raise TimeoutError("Owned role readiness timed out")
 
 
+def role_metrics_environment(role, environment, *, directory=None):
+    """Configure before importing prometheus; ranks share one role boot directory.
+
+    Integrated supervisors always allocate afresh, even if their parent inherited
+    a directory. Independent deploy may supply its own fresh, receipted directory.
+    Direct launcher users own the lifecycle of an explicitly supplied directory.
+    """
+    return {
+        **environment,
+        "WORLD_MODEL_METRIC_SERVICE": "qwen_vlm" if role == "conditioning" else role,
+        "WORLD_MODEL_METRIC_LANE": environment.get(
+            "WORLD_MODEL_METRIC_LANE", "default"
+        ),
+        "PROMETHEUS_MULTIPROC_DIR": directory
+        or tempfile.mkdtemp(prefix=f"zing-metrics-{role}-"),
+    }
+
+
 def supervise_integrated_group(
     plan: Mapping[str, Mapping],
     *,
@@ -535,6 +554,7 @@ def supervise_integrated_group(
                 env["CUDA_VISIBLE_DEVICES"] = ",".join(
                     expected[i] for i in item["devices"]
                 )
+                env = role_metrics_environment(role, env)
                 from sglang.multimodal_gen.runtime.utils.bounded_process_log import (
                     BoundedProcessLog,
                 )
@@ -960,7 +980,9 @@ def b300_serve(
             logs.append(log)
             process = subprocess.Popen(
                 role["command"],
-                env={**env, "CUDA_VISIBLE_DEVICES": role["devices"]},
+                env=role_metrics_environment(
+                    name, {**env, "CUDA_VISIBLE_DEVICES": role["devices"]}
+                ),
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
@@ -1316,6 +1338,12 @@ def main() -> None:
         for name in contract.get("environment_unset", ()):
             environment.pop(name, None)
         environment.update(contract["environment"])
+        if args.mode == "independent":
+            environment = role_metrics_environment(
+                args.component,
+                environment,
+                directory=environment.get("PROMETHEUS_MULTIPROC_DIR"),
+            )
         os.execvpe(contract["command"][0], contract["command"], environment)
 
 

@@ -6,6 +6,9 @@ import numpy as np
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.presentation import (
     minimax_h3_ref2va_video_presentation,
 )
+from sglang.multimodal_gen.runtime.realtime.zing_component_metrics import (
+    component_timer,
+)
 
 from .contract import ConditionError
 
@@ -38,12 +41,14 @@ def encode_condition(
     validate_prompt_token_budget(tokenizer, prompt, max_prompt_tokens)
     features, labels, images, videos, timestamps = {}, [], [], [], []
     counts = {"image": 0, "video": 0, "audio": 0}
+    sampled_frames = 0
     for item in media:
         kind = item["type"]
         if kind in {"audio", "video_audio"}:
             counts["audio"] += 1
             labels.append(("audio", counts["audio"]))
         if kind == "image":
+            sampled_frames += 1
             counts["image"] += 1
             labels.append(("image", counts["image"]))
             images.append(item["frames"][:, 0].permute(1, 2, 0).numpy())
@@ -58,6 +63,7 @@ def encode_condition(
                     indices.append(round(cursor))
                 cursor += source_fps / fps
             frames = [item["frames"][:, i].permute(1, 2, 0).numpy() for i in indices]
+            sampled_frames += len(frames)
             # Rounding and deduplication can change the effective sample rate.
             ts = [i / source_fps for i in indices]
             temporal_patch = processor.video_processor.temporal_patch_size
@@ -112,5 +118,7 @@ def encode_condition(
         if prefix_cache is not None
         else {}
     )
-    context = modules["text_encoder"].encode_ids(ids, **features, **cache_kwargs)
+    # Count actual sampled inputs before temporal padding, not generated frames.
+    with component_timer("qwen_vlm", frames=sampled_frames):
+        context = modules["text_encoder"].encode_ids(ids, **features, **cache_kwargs)
     return {"context": context, "row_role": (tags == 0).long().to(context.device)}

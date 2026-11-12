@@ -338,6 +338,15 @@ class ConditioningService:
             if self._closed:
                 raise ConditionError("CONDITION_UNAVAILABLE")
             path, method = scope["path"], scope["method"]
+            if path == "/metrics" and method == "GET":
+                from sglang.multimodal_gen.runtime.realtime.critical_path_metrics import (
+                    prometheus_content_type,
+                    prometheus_latest,
+                )
+
+                return await self._response(
+                    send, 200, prometheus_latest(), prometheus_content_type().encode()
+                )
             if path == PREFIX + "/profile" and method == "GET":
                 return await self._json(
                     send,

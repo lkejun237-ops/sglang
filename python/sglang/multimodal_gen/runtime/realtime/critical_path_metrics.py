@@ -385,6 +385,12 @@ def observe_coordinator_capacity_reservation_seconds(
 
 
 def prometheus_latest() -> bytes:
+    if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+        from prometheus_client import CollectorRegistry, multiprocess
+
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        return generate_latest(registry)
     return generate_latest()
 
 

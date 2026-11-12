@@ -88,6 +88,29 @@ python3 deploy/sglang/orchestrate.py attach --aliyun-profile shengdong \
   --state /private/deploy/live/state.json --execute --yes
 ```
 
+## 组件监控核验（新建与复用分别记录）
+
+- 新建角色由 `launch.py` 自动设置 `WORLD_MODEL_METRIC_SERVICE=encoder|dit|decoder`；
+  内嵌 Qwen 保持 `service="encoder", component="qwen_vlm"`。
+  可在角色 `environment` 设置 `WORLD_MODEL_METRIC_LANE`，默认 `default`。
+  不手工覆盖 service 或 `PROMETHEUS_MULTIPROC_DIR`；启动器按 worker boot 分配新目录，
+  在导入 Prometheus 前创建，同一 DiT 的 ranks 共用，角色/实例/重启之间隔离。
+- `receipt.json.metrics` 给出本实例的 URL、service、lane、目录及开关；从实际回执取
+  `/metrics` 地址，不假定默认端口。一个共享模型的多 service 只抓 base HTTP 一次。
+  SP2 的 rank0 HTTP 可汇总同目录的 rank 样本；默认面板选择 rank0，不能将两个 rank
+  的逻辑帧数相加。本编排入口仍只支持 SP1，不因监控配置增加 SP2 部署能力。
+- 复用角色不改环境、不清目录、不重启；只读检查现有源码身份和 `/metrics`，缺少指标
+  或身份不明时标为“未验证/需后续发布”，不得把健康检查当作监控验收。
+- 发正常测试请求后核验组件样本、`service/lane/rank` 与分辨率；未触发的组件允许无样本。
+  检查 errors/dropped 的增量。分别记录端点可访问、有效样本、真实模型性能对照和线上
+  Grafana 接入状态；不要由其中一项推断其他项通过。
+- Prometheus 的 `region/pool` 是抓取配置标签，`instance` 通常由 target 自动添加，
+  模型不会自动发现它们。生成/检查抓取配置，确认抓取端网络可达；线上配置变更按授权执行。
+  不清理活跃目录；历史目录只在确认所有所属进程已退出后随本次运行目录回收。
+
+指标口径、ms/FPS 查询与抓取示例统一见
+`docs/docs/sglang-diffusion/zing/specs/COMPONENT_METRICS.md`，不在技能内复制第二套定义。
+
 ## 历史、回滚与交付
 
 - 使用 `history --history-dir ...`、`show --history-dir ... --deployment-id ...`、

@@ -113,7 +113,35 @@ def test_shared_encoder_statement_identity_matches_frozen_native(api, monkeypatc
     tree = ast.Module(body=body, type_ignores=[])
 
     class DefaultPresentation(ast.NodeTransformer):
+        def visit_With(self, node):
+            # Strip only the exact side-effect-free instrumentation wrapper;
+            # the native encoding statements keep their original fingerprint.
+            if (
+                len(node.items) == 1
+                and ast.unparse(node.items[0].context_expr)
+                == "component_timer('qwen_vlm', frames=sampled_frames)"
+            ):
+                assert node.items[0].optional_vars is None
+                self.generic_visit(node)
+                return node.body
+            return self.generic_visit(node)
+
+        def visit_AugAssign(self, node):
+            if isinstance(node.target, ast.Name) and node.target.id == "sampled_frames":
+                assert ast.unparse(node) in (
+                    "sampled_frames += 1",
+                    "sampled_frames += len(frames)",
+                )
+                return None
+            return self.generic_visit(node)
+
         def visit_Assign(self, node):
+            if any(
+                isinstance(t, ast.Name) and t.id == "sampled_frames"
+                for t in node.targets
+            ):
+                assert ast.unparse(node.value) == "0"
+                return None
             # Optional task metadata does not alter the legacy no-cache call.
             if any(
                 isinstance(t, ast.Name) and t.id == "cache_kwargs" for t in node.targets

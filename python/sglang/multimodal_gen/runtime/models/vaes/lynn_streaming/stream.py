@@ -5,6 +5,11 @@ import traceback
 
 import torch
 
+from sglang.multimodal_gen.runtime.realtime.zing_component_metrics import (
+    component_timer,
+    record_completed_frames,
+)
+
 
 class LynnStream:
     """Session-owned push/finish/close streaming interface.
@@ -53,18 +58,31 @@ class LynnStream:
             device = self.model.latent_mean.device
             latent = latent.to(device=device)
             outputs = []
-            with torch.autocast(device.type, dtype=self.model.compute_dtype):
+            with (
+                # The caller owns EOS trimming when frame_limit is unknown.
+                component_timer("decoder", completed_frames=0) as timer,
+                torch.autocast(device.type, dtype=self.model.compute_dtype),
+            ):
                 for z_t in latent.split(1, dim=2):
                     frames, self.state = self.model.decode_step(
                         z_t, self.state, self.group
                     )
                     outputs.append(frames)
                     self.latents_seen += 1
+                timer.frames = sum(output.shape[2] for output in outputs)
+                timer.resolution = f"{outputs[-1].shape[-1]}x{outputs[-1].shape[-2]}"
             result = torch.cat(outputs, dim=2).clamp_(0, 1)
             self.empty = result.new_empty((*result.shape[:2], 0, *result.shape[3:]))
             if self.frame_limit is not None:
                 result = result[:, :, : max(0, self.frame_limit - self.frames_emitted)]
             self.frames_emitted += result.shape[2]
+            if self.frame_limit is not None:
+                record_completed_frames(
+                    "decoder",
+                    result.shape[2],
+                    width=result.shape[-1],
+                    height=result.shape[-2],
+                )
             return result
         except BaseException as exc:
             self.close()

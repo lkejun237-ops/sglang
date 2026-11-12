@@ -12358,6 +12358,18 @@
           }
         }
       }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/realtime/test_zing_component_metrics.py",
+      "suite": "realtime-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Local CPU contract tests cover seconds/frame units, asynchronous CUDA-event polling with fakes (no GPU validation), cancellation, bounded drops, opt-out and HTTP exposition. GPU 480/736 and collection overhead remain unvalidated.",
+      "dependencies": []
     }
   ],
   "recipes": {

@@ -144,6 +144,7 @@ MODULES = {
 PORTS = {"encoder": 31000, "dit": 33000, "decoder": 36000}
 # Runtime credentials are explicit and redacted; source and device allocation stay isolated.
 ENV_ALLOW = {
+    "WORLD_MODEL_METRIC_LANE",
     "SGLANG_ROLE_POOL_WORKER_CONFIG",
     "ROLE_POOL_SIGNING_KEY",
     "ROLE_POOL_REGISTRATION_TOKEN",
@@ -564,6 +565,9 @@ def command(c, source, host, worker_id):
         PYTHONPATH=str(source / "python"),
         PYTHONNOUSERSITE="1",
         OMP_NUM_THREADS=env.get("OMP_NUM_THREADS", "1"),
+        WORLD_MODEL_METRIC_SERVICE=role,
+        WORLD_MODEL_METRIC_LANE=env.get("WORLD_MODEL_METRIC_LANE", "default"),
+        PROMETHEUS_MULTIPROC_DIR=str(source.parent / "prometheus" / worker_id),
     )
     # #471 owns hardware policy and its native argv; no policy is copied here.
     argv = [
@@ -634,6 +638,9 @@ def run(c, source, commit, archive_sha):
     host = reachable_ip()
     worker_id = c["role"] + "-" + uuid.uuid4().hex
     argv, env = command(c, source, host, worker_id)
+    # Unique boot identity: never reuse or clear another live worker's counters.
+    # Set before the import probe and before torchrun forks any ranks.
+    Path(env["PROMETHEUS_MULTIPROC_DIR"]).mkdir(parents=True, exist_ok=False)
     imports = probe_source(source, env, c["role"], c.get("hardware"))
     for port in role_allocated_ports(c):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
@@ -684,6 +691,17 @@ def run(c, source, commit, archive_sha):
         "worker_id": worker_id,
         "ip": host,
         "http": "http://" + host + ":" + str(role_ports(c)["http_port"]),
+        "metrics": {
+            "url": "http://"
+            + host
+            + ":"
+            + str(role_ports(c)["http_port"])
+            + "/metrics",
+            "service": c["role"],
+            "lane": env["WORLD_MODEL_METRIC_LANE"],
+            "multiprocess_dir": env["PROMETHEUS_MULTIPROC_DIR"],
+            "enabled": env.get("SGLANG_ZING_COMPONENT_METRICS", "1") != "0",
+        },
         "argv": argv,
         "environment": {
             k: v

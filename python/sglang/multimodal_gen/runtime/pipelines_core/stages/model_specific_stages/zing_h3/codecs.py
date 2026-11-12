@@ -26,6 +26,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.decoding import (
     _deterministic_audio_decode_context,
 )
+from sglang.multimodal_gen.runtime.realtime.zing_component_metrics import (
+    component_timer,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.zing_stage_timing import handoff, stage_span
 
@@ -379,7 +382,7 @@ class ZingH3Codecs(ZingH3MediaInput):
             presentation_fn=minimax_h3_ref2va_video_presentation,
         )
 
-    def encode_visual(self, frames):
+    def encode_visual(self, frames, *, metric_operation="source"):
         from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 
         encode_mode = self.runtime["vae_config"]["encode_mode"]
@@ -408,9 +411,18 @@ class ZingH3Codecs(ZingH3MediaInput):
                     ),
                     2,
                 )
-            with _visual_encode_policy(
-                encode_mode,
-                self.runtime["vae_config"].get("cudnn_benchmark_limit"),
+            with (
+                component_timer(
+                    "encoder",
+                    operation=metric_operation,
+                    frames=count,
+                    height=frames.shape[-2],
+                    width=frames.shape[-1],
+                ),
+                _visual_encode_policy(
+                    encode_mode,
+                    self.runtime["vae_config"].get("cudnn_benchmark_limit"),
+                ),
             ):
                 moments = torch.cat(
                     encode_clips(
@@ -464,7 +476,7 @@ class ZingH3Codecs(ZingH3MediaInput):
     def encode_reference(self, item):
         cache = getattr(self, "reference_cache", None)
         if item["type"] != "image" or cache is None or cache.max_bytes == 0:
-            return self.encode_visual(item["frames"])
+            return self.encode_visual(item["frames"], metric_operation="reference")
         from sglang.multimodal_gen.runtime.conditioning.worker import (
             coordinate_validation,
         )
@@ -495,7 +507,7 @@ class ZingH3Codecs(ZingH3MediaInput):
         # A partial hit must not skip encode_visual's replicated-latent broadcast.
         if all(receipt[1] for receipt in receipts):
             return cached["latent"].to(device=next(model.parameters()).device)
-        latent = self.encode_visual(frames)
+        latent = self.encode_visual(frames, metric_operation="reference")
         cache.put(key, {"latent": latent.detach().cpu()})
         return latent
 

@@ -1,0 +1,516 @@
+{
+  "uid": "zing-h3-components",
+  "title": "Zing H3 · 组件 FPS 与延迟",
+  "schemaVersion": 39,
+  "version": 1,
+  "tags": [
+    "sglang",
+    "zing-h3"
+  ],
+  "timezone": "browser",
+  "refresh": "15s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "数据源",
+        "type": "datasource",
+        "query": "prometheus",
+        "refresh": 1,
+        "current": {
+          "text": "Whitebox cn-shanghai native",
+          "value": "whitebox-sh-native"
+        }
+      },
+      {
+        "name": "region",
+        "label": "地域",
+        "type": "custom",
+        "query": "cn-shanghai,ap-southeast-7",
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "pool",
+        "label": "模型池",
+        "type": "custom",
+        "query": "zing-demo-shanghai-01,zing-demo-thailand-01,test-shanghai-copy",
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "measurement",
+        "label": "计时边界",
+        "type": "custom",
+        "query": "cuda,host",
+        "current": {
+          "text": "cuda",
+          "value": "cuda"
+        }
+      },
+      {
+        "name": "resolution",
+        "label": "实际宽×高",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(sglang_zing_component_duration_seconds_count, resolution)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Qwen VLM · latency (ms)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 9
+      },
+      "description": "Host 为调用返回耗时，CUDA 为当前 stream elapsed；不含输入等待、网络和播放。按 operation、实际分辨率、实例分开；只取 rank 0。 测量 encode_ids 前向；缓存命中跳过前向时无样本；完整请求 preprocessing/排队不包含在内。",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "min": 0,
+          "decimals": 2
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1000 * sum by (component, operation, resolution, instance) (rate(sglang_zing_component_duration_seconds_sum{component=\"qwen_vlm\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval])) / sum by (component, operation, resolution, instance) (rate(sglang_zing_component_duration_seconds_count{component=\"qwen_vlm\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval]))",
+          "legendFormat": "{{operation}} {{resolution}} {{instance}} · mean",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "1000 * histogram_quantile(0.5, sum by (le, component, operation, resolution, instance) (rate(sglang_zing_component_duration_seconds_bucket{component=\"qwen_vlm\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval])))",
+          "legendFormat": "{{operation}} {{resolution}} {{instance}} · P50",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "1000 * histogram_quantile(0.95, sum by (le, component, operation, resolution, instance) (rate(sglang_zing_component_duration_seconds_bucket{component=\"qwen_vlm\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval])))",
+          "legendFormat": "{{operation}} {{resolution}} {{instance}} · P95",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Qwen VLM · FPS",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 9
+      },
+      "description": "处理 FPS = 同批完成计时的像素帧数 / 组件执行秒数；吞吐 FPS = 独立有效处理帧计数 completed_frames_total 的每秒增量（不受 CUDA 计时丢样影响），包含业务空闲影响。CUDA 计时及配对计算帧在异步完成后更新；有效处理帧在成功返回/交付时更新。 Qwen 计采样媒体帧（单图算 1），不计 temporal padding；纯文本输入 FPS=0，延迟仍有效。Host 为调用返回耗时，CUDA 为当前 stream elapsed；不含输入等待、网络和播放。按 operation、实际分辨率、实例分开；只取 rank 0。 测量 encode_ids 前向；缓存命中跳过前向时无样本；完整请求 preprocessing/排队不包含在内。",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "fps",
+          "min": 0,
+          "decimals": 2
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (component, operation, resolution, instance) (rate(sglang_zing_component_frames_total{component=\"qwen_vlm\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval])) / sum by (component, operation, resolution, instance) (rate(sglang_zing_component_duration_seconds_sum{component=\"qwen_vlm\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval]))",
+          "legendFormat": "{{operation}} {{resolution}} {{instance}} · 处理 FPS",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (component, operation, resolution, instance) (rate(sglang_zing_component_completed_frames_total{component=\"qwen_vlm\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval]))",
+          "legendFormat": "{{operation}} {{resolution}} {{instance}} · 吞吐 FPS",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Encoder · latency (ms)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 12,
+        "h": 9
+      },
+      "description": "Host 为调用返回耗时，CUDA 为当前 stream elapsed；不含输入等待、网络和播放。按 operation、实际分辨率、实例分开；只取 rank 0。",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "min": 0,
+          "decimals": 2
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1000 * sum by (component, operation, resolution, instance) (rate(sglang_zing_component_duration_seconds_sum{component=\"encoder\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval])) / sum by (component, operation, resolution, instance) (rate(sglang_zing_component_duration_seconds_count{component=\"encoder\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval]))",
+          "legendFormat": "{{operation}} {{resolution}} {{instance}} · mean",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "1000 * histogram_quantile(0.5, sum by (le, component, operation, resolution, instance) (rate(sglang_zing_component_duration_seconds_bucket{component=\"encoder\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval])))",
+          "legendFormat": "{{operation}} {{resolution}} {{instance}} · P50",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "1000 * histogram_quantile(0.95, sum by (le, component, operation, resolution, instance) (rate(sglang_zing_component_duration_seconds_bucket{component=\"encoder\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval])))",
+          "legendFormat": "{{operation}} {{resolution}} {{instance}} · P95",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Encoder · FPS",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 9,
+        "w": 12,
+        "h": 9
+      },
+      "description": "处理 FPS = 同批完成计时的像素帧数 / 组件执行秒数；吞吐 FPS = 独立有效处理帧计数 completed_frames_total 的每秒增量（不受 CUDA 计时丢样影响），包含业务空闲影响。CUDA 计时及配对计算帧在异步完成后更新；有效处理帧在成功返回/交付时更新。Host 为调用返回耗时，CUDA 为当前 stream elapsed；不含输入等待、网络和播放。按 operation、实际分辨率、实例分开；只取 rank 0。",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "fps",
+          "min": 0,
+          "decimals": 2
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (component, operation, resolution, instance) (rate(sglang_zing_component_frames_total{component=\"encoder\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval])) / sum by (component, operation, resolution, instance) (rate(sglang_zing_component_duration_seconds_sum{component=\"encoder\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval]))",
+          "legendFormat": "{{operation}} {{resolution}} {{instance}} · 处理 FPS",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (component, operation, resolution, instance) (rate(sglang_zing_component_completed_frames_total{component=\"encoder\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval]))",
+          "legendFormat": "{{operation}} {{resolution}} {{instance}} · 吞吐 FPS",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "DiT · latency (ms)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 12,
+        "h": 9
+      },
+      "description": "Host 为调用返回耗时，CUDA 为当前 stream elapsed；不含输入等待、网络和播放。按 operation、实际分辨率、实例分开；只取 rank 0。 包含 source/target、denoise 和 commit；joint 模式的 lookahead 计入发起它的迭代，不是单个 kernel。",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "min": 0,
+          "decimals": 2
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1000 * sum by (component, operation, resolution, instance) (rate(sglang_zing_component_duration_seconds_sum{component=\"dit\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval])) / sum by (component, operation, resolution, instance) (rate(sglang_zing_component_duration_seconds_count{component=\"dit\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval]))",
+          "legendFormat": "{{operation}} {{resolution}} {{instance}} · mean",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "1000 * histogram_quantile(0.5, sum by (le, component, operation, resolution, instance) (rate(sglang_zing_component_duration_seconds_bucket{component=\"dit\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval])))",
+          "legendFormat": "{{operation}} {{resolution}} {{instance}} · P50",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "1000 * histogram_quantile(0.95, sum by (le, component, operation, resolution, instance) (rate(sglang_zing_component_duration_seconds_bucket{component=\"dit\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval])))",
+          "legendFormat": "{{operation}} {{resolution}} {{instance}} · P95",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "DiT · FPS",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 18,
+        "w": 12,
+        "h": 9
+      },
+      "description": "处理 FPS = 同批完成计时的像素帧数 / 组件执行秒数；吞吐 FPS = 独立有效处理帧计数 completed_frames_total 的每秒增量（不受 CUDA 计时丢样影响），包含业务空闲影响。CUDA 计时及配对计算帧在异步完成后更新；有效处理帧在成功返回/交付时更新。Host 为调用返回耗时，CUDA 为当前 stream elapsed；不含输入等待、网络和播放。按 operation、实际分辨率、实例分开；只取 rank 0。 包含 source/target、denoise 和 commit；joint 模式的 lookahead 计入发起它的迭代，不是单个 kernel。",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "fps",
+          "min": 0,
+          "decimals": 2
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (component, operation, resolution, instance) (rate(sglang_zing_component_frames_total{component=\"dit\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval])) / sum by (component, operation, resolution, instance) (rate(sglang_zing_component_duration_seconds_sum{component=\"dit\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval]))",
+          "legendFormat": "{{operation}} {{resolution}} {{instance}} · 处理 FPS",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (component, operation, resolution, instance) (rate(sglang_zing_component_completed_frames_total{component=\"dit\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval]))",
+          "legendFormat": "{{operation}} {{resolution}} {{instance}} · 吞吐 FPS",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Decoder · latency (ms)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 27,
+        "w": 12,
+        "h": 9
+      },
+      "description": "Host 为调用返回耗时，CUDA 为当前 stream elapsed；不含输入等待、网络和播放。按 operation、实际分辨率、实例分开；只取 rank 0。 解码计算帧包含上层后续丢弃的 EOS padding；不表示客户端有效输出帧。",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "min": 0,
+          "decimals": 2
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1000 * sum by (component, operation, resolution, instance) (rate(sglang_zing_component_duration_seconds_sum{component=\"decoder\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval])) / sum by (component, operation, resolution, instance) (rate(sglang_zing_component_duration_seconds_count{component=\"decoder\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval]))",
+          "legendFormat": "{{operation}} {{resolution}} {{instance}} · mean",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "1000 * histogram_quantile(0.5, sum by (le, component, operation, resolution, instance) (rate(sglang_zing_component_duration_seconds_bucket{component=\"decoder\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval])))",
+          "legendFormat": "{{operation}} {{resolution}} {{instance}} · P50",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "1000 * histogram_quantile(0.95, sum by (le, component, operation, resolution, instance) (rate(sglang_zing_component_duration_seconds_bucket{component=\"decoder\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval])))",
+          "legendFormat": "{{operation}} {{resolution}} {{instance}} · P95",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Decoder · FPS",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 27,
+        "w": 12,
+        "h": 9
+      },
+      "description": "处理 FPS = 同批完成计时的像素帧数 / 组件执行秒数；吞吐 FPS = 独立有效处理帧计数 completed_frames_total 的每秒增量（不受 CUDA 计时丢样影响），包含业务空闲影响。CUDA 计时及配对计算帧在异步完成后更新；有效处理帧在成功返回/交付时更新。Host 为调用返回耗时，CUDA 为当前 stream elapsed；不含输入等待、网络和播放。按 operation、实际分辨率、实例分开；只取 rank 0。 解码计算帧包含上层后续丢弃的 EOS padding；不表示客户端有效输出帧。 处理 FPS 使用原始解码计算帧（含 padding）；吞吐 FPS 使用裁剪后的有效帧。",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "fps",
+          "min": 0,
+          "decimals": 2
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (component, operation, resolution, instance) (rate(sglang_zing_component_frames_total{component=\"decoder\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval])) / sum by (component, operation, resolution, instance) (rate(sglang_zing_component_duration_seconds_sum{component=\"decoder\",measurement=\"$measurement\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval]))",
+          "legendFormat": "{{operation}} {{resolution}} {{instance}} · 处理 FPS",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (component, operation, resolution, instance) (rate(sglang_zing_component_completed_frames_total{component=\"decoder\",rank=\"0\",region=~\"$region\",pool=~\"$pool\",resolution=~\"$resolution\"}[$__rate_interval]))",
+          "legendFormat": "{{operation}} {{resolution}} {{instance}} · 吞吐 FPS",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "CUDA 计时丢样 · 每秒",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 36,
+        "w": 24,
+        "h": 7
+      },
+      "description": "队列满、CUDA 事件失败或超过 120 秒未完成会丢弃观测，不阻塞模型；丢样会影响统计代表性。",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (component, reason, instance) (rate(sglang_zing_component_timing_dropped_total{region=~\"$region\",pool=~\"$pool\"}[$__rate_interval]))",
+          "legendFormat": "{{component}} {{reason}} {{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    }
+  ]
+}

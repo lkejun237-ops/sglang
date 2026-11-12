@@ -7,7 +7,13 @@ import time
 
 
 def install_health_routes(app, state):
-    from fastapi.responses import JSONResponse
+    from fastapi.responses import JSONResponse, Response
+
+    from .critical_path_metrics import prometheus_content_type, prometheus_latest
+
+    @app.get("/metrics")
+    async def metrics():
+        return Response(prometheus_latest(), media_type=prometheus_content_type())
 
     @app.get("/liveness")
     async def liveness():

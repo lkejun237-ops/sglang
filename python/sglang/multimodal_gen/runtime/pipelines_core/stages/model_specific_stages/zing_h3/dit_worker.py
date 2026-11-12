@@ -224,6 +224,7 @@ def create_link_session(
         state = SourceReadySession(
             sampler,
             inputs,
+            metric_geometry={"width": init["width"], "height": init["height"]},
             seed=init["seed"],
             max_pending_chunks=1,
             max_pending_bytes=256 << 20,
