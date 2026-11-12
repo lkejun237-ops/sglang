@@ -10,6 +10,7 @@ AREA_FILES = [
     f"{AREA_ROOT}/{name}"
     for name in (
         "test_whitebox_area_handoff.py",
+        "test_frame_latency_breakdown.py",
         "test_whitebox_rtc_pipeline.py",
         "test_whitebox_source_encoding.py",
         "test_whitebox_session_encoding.py",

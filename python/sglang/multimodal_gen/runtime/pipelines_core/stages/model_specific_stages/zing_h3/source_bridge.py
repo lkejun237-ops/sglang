@@ -26,6 +26,7 @@ class SourceChunk:
     noise: torch.Tensor
     provenance: Provenance
     final: bool
+    input_timings: tuple | None = None
 
 
 class SourceChunkBridge:
@@ -79,6 +80,7 @@ class SourceChunkBridge:
         self.target_shape = target_shape
         self.values = None
         self.pixel_ends, self.dependencies = deque(), deque()
+        self.latent_timings = deque()
         self.accepted_latents = self.accepted_pixels = self.chunk_id = (
             self.emitted_pixels
         ) = 0
@@ -97,7 +99,15 @@ class SourceChunkBridge:
             else self.values.numel() * self.values.element_size()
         )
 
-    def append(self, source, *, latent_start, pixel_end, source_dependency_end):
+    def append(
+        self,
+        source,
+        *,
+        latent_start,
+        pixel_end,
+        source_dependency_end,
+        slice_timing=None,
+    ):
         if self.ended or self.closed:
             raise ValueError("Source bridge is closed")
         if source.ndim != 5 or not source.is_floating_point() or min(source.shape) < 1:
@@ -154,8 +164,37 @@ class SourceChunkBridge:
             if self.values is None
             else torch.cat((self.values, source.detach()), 2)
         )
-        self.pixel_ends.extend(min(pixel_end, end) for end in nominal_ends)
+        actual_ends = [min(pixel_end, end) for end in nominal_ends]
+        self.pixel_ends.extend(actual_ends)
         self.dependencies.extend([source_dependency_end] * count)
+        enc_map = {}
+        arrived_ns = None
+        sample_ms = 0.0
+        if isinstance(slice_timing, dict):
+            arrived_ns = slice_timing.get("arrived_ns")
+            sample_ms = float(slice_timing.get("sample_ms", 0.0) or 0.0)
+            for item in slice_timing.get("encoder_frame_timings") or ():
+                if isinstance(item, dict) and type(item.get("frame")) is int:
+                    enc_map[item["frame"]] = item
+        cur_px_start = self.accepted_pixels
+        for lat_end_px in actual_ends:
+            self.latent_timings.append(
+                None
+                if slice_timing is None
+                else dict(
+                    pixel_start=cur_px_start,
+                    pixel_end=lat_end_px,
+                    arrived_ns=arrived_ns,
+                    sample_ms=sample_ms,
+                    sample_events=slice_timing.get("sample_events"),
+                    encoder_frames={
+                        f: enc_map[f]
+                        for f in range(cur_px_start, lat_end_px)
+                        if f in enc_map
+                    },
+                )
+            )
+            cur_px_start = lat_end_px
         self.values, self.signature = owned, signature
         self.accepted_latents += count
         self.accepted_pixels = pixel_end
@@ -224,19 +263,27 @@ class SourceChunkBridge:
             dtype=torch.float32,
             version=STREAMING_NOISE_VERSION,
         )
+        next_values = (
+            self.values[:, :, count:].clone() if count < self.buffered_latents else None
+        )
+        popped_timings = []
+        for _ in range(count):
+            self.pixel_ends.popleft()
+            self.dependencies.popleft()
+            popped_timings.append(
+                self.latent_timings.popleft() if self.latent_timings else None
+            )
         result = SourceChunk(
             chunk,
             source,
             noise,
             provenance,
             self.ended and chunk.end == self.accepted_latents,
+            tuple(popped_timings)
+            if any(v is not None for v in popped_timings)
+            else None,
         )
-        self.values = (
-            self.values[:, :, count:].clone() if count < self.buffered_latents else None
-        )
-        for _ in range(count):
-            self.pixel_ends.popleft()
-            self.dependencies.popleft()
+        self.values = next_values
         self.chunk_id += 1
         self.emitted_pixels = pixel_end
         return result
@@ -245,5 +292,6 @@ class SourceChunkBridge:
         self.values = None
         self.pixel_ends.clear()
         self.dependencies.clear()
+        self.latent_timings.clear()
         self.provenance_for = None
         self.closed = True

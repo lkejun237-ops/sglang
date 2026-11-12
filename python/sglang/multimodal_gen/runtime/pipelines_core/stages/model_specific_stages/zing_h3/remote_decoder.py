@@ -10,6 +10,7 @@ tile job before bridge transfer; publisher capacity can also apply backpressure.
 import atexit
 import json
 import os
+import time
 import uuid
 from datetime import timedelta
 from pathlib import Path
@@ -505,11 +506,149 @@ class RemoteLynnDecoder:
             raise RuntimeError(self._failure_message())
         return reply
 
-    def append(self, latent, *, latent_start, source_dependency_end, valid_frame_end):
+    def _build_chunk_frame_timings(
+        self,
+        timing_ctx: dict,
+        *,
+        start_frame: int,
+        end_frame: int,
+        send_t0_ns: int,
+        send_done_ns: int,
+    ) -> list[dict]:
+        dit_start_ns = timing_ctx.get("dit_start_ns")
+        if type(dit_start_ns) is not int:
+            dit_start_ns = send_t0_ns
+        ev_dit_start = timing_ctx.get("ev_dit_start")
+        ev_dit_end = timing_ctx.get("ev_dit_end")
+        total_dit_plus_ret_ms = max(0.0, (send_done_ns - dit_start_ns) / 1e6)
+        if ev_dit_start is not None and ev_dit_end is not None:
+            ev_dit_end.synchronize()
+            raw_dit_proc_ms = min(
+                total_dit_plus_ret_ms,
+                max(0.0, float(ev_dit_start.elapsed_time(ev_dit_end))),
+            )
+            dit_return_ms = max(0.0, total_dit_plus_ret_ms - raw_dit_proc_ms)
+        else:
+            raw_dit_proc_ms = max(0.0, (send_t0_ns - dit_start_ns) / 1e6)
+            dit_return_ms = max(0.0, (send_done_ns - send_t0_ns) / 1e6)
+        by_frame: dict[int, dict] = {}
+        for lt in timing_ctx.get("input_timings") or ():
+            if not isinstance(lt, dict):
+                continue
+            p0 = lt.get("pixel_start")
+            p1 = lt.get("pixel_end")
+            if type(p0) is not int or type(p1) is not int:
+                continue
+            sample_ms = max(0.0, float(lt.get("sample_ms", 0.0) or 0.0))
+            arrived_ns = lt.get("arrived_ns")
+            dit_wait_ms = (
+                max(0.0, (dit_start_ns - arrived_ns) / 1e6 - sample_ms)
+                if type(arrived_ns) is int
+                else 0.0
+            )
+            # Events are local to this rank and precede the already synchronized
+            # DiT/send boundary. Reading them here adds no sampling-path wait.
+            # Keep Host sampling time for Host queue accounting; CUDA elapsed
+            # time belongs only in compute, not in a subtraction across clocks.
+            sample_events = lt.get("sample_events")
+            sample_compute_ms = (
+                max(0.0, float(sample_events[0].elapsed_time(sample_events[1])))
+                if sample_events is not None
+                else sample_ms
+            )
+            dit_proc_ms = raw_dit_proc_ms + sample_compute_ms
+            enc_frames = lt.get("encoder_frames") or {}
+            for frame_idx in range(max(start_frame, p0), min(end_frame, p1)):
+                row: dict[str, Any] = {
+                    "output_frame": frame_idx,
+                    "dit": {
+                        "wait_ms": round(dit_wait_ms, 3),
+                        "process_ms": round(dit_proc_ms, 3),
+                        "return_ms": round(dit_return_ms, 3),
+                    },
+                }
+                enc_raw = enc_frames.get(frame_idx)
+                if isinstance(enc_raw, dict):
+                    enc_stage = {
+                        k: round(max(0.0, float(enc_raw[k])), 3)
+                        for k in ("wait_ms", "process_ms", "return_ms")
+                        if type(enc_raw.get(k)) in (int, float)
+                    }
+                    if enc_stage:
+                        row["encoder"] = enc_stage
+                by_frame[frame_idx] = row
+        return [
+            by_frame.get(frame_idx)
+            or {
+                "output_frame": frame_idx,
+                "dit": {
+                    "wait_ms": 0.0,
+                    "process_ms": round(raw_dit_proc_ms, 3),
+                    "return_ms": round(dit_return_ms, 3),
+                },
+            }
+            for frame_idx in range(start_frame, end_frame)
+        ]
+
+    def _emit_chunk_timing(
+        self,
+        timing_ctx: dict,
+        *,
+        start_frame: int,
+        end_frame: int,
+        send_t0_ns: int,
+        send_done_ns: int,
+    ) -> None:
+        if not self.output_attachment or end_frame <= start_frame:
+            return
+        frame_timings = self._build_chunk_frame_timings(
+            timing_ctx,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            send_t0_ns=send_t0_ns,
+            send_done_ns=send_done_ns,
+        )
+        if not frame_timings:
+            return
+        fields = dict(
+            generation_id=self.output_session["generation_id"],
+            request_id=self.request_id,
+            chunk_index=self.chunk_index,
+            output_frame_start=start_frame,
+            num_frames=end_frame - start_frame,
+            frame_stage_breakdown=frame_timings,
+        )
+        if self.oneway:
+            self.socket.send_json(
+                dict(
+                    op="chunk_timing",
+                    channel=self.channel,
+                    oneway=True,
+                    **fields,
+                    **(
+                        {"worker_group_id": self.connection["group_id"]}
+                        if self.connection is not None
+                        else {}
+                    ),
+                )
+            )
+        else:
+            self._request("chunk_timing", **fields)
+
+    def append(
+        self,
+        latent,
+        *,
+        latent_start,
+        source_dependency_end,
+        valid_frame_end,
+        timing_ctx=None,
+    ):
         if self.closed or self.total_frames is not None:
             raise ValueError("Decoder stream is closed")
         if self.auto_output and self._pending_output is not None:
             raise ValueError("Consume the preceding decoder output before appending")
+        start_frame = self.emitted_frames
         count = check_latent_append(
             latent=latent,
             latent_start=latent_start,
@@ -529,6 +668,7 @@ class RemoteLynnDecoder:
         # A leader-only failure is reported by the next pop on every DiT rank;
         # raising here alone would strand the peer in its next SP collective.
         try:
+            send_t0_ns = time.perf_counter_ns()
             self.socket.send_json(
                 dict(
                     op="append",
@@ -567,12 +707,31 @@ class RemoteLynnDecoder:
                 # This is transport completion, not Decoder model completion.
                 if latent.is_cuda:
                     torch.cuda.current_stream(latent.device).synchronize()
+                if isinstance(timing_ctx, dict):
+                    self._emit_chunk_timing(
+                        timing_ctx,
+                        start_frame=start_frame,
+                        end_frame=valid_frame_end,
+                        send_t0_ns=send_t0_ns,
+                        send_done_ns=time.perf_counter_ns(),
+                    )
                 return
             reply = self.socket.recv_json()
             if not isinstance(reply, dict) or not reply.get("ok"):
                 raise RuntimeError("Decoder service rejected the latent")
             if self.auto_output:
                 self._pending_output = reply
+            if isinstance(timing_ctx, dict):
+                ev_dit_end = timing_ctx.get("ev_dit_end")
+                if ev_dit_end is not None:
+                    ev_dit_end.synchronize()
+                self._emit_chunk_timing(
+                    timing_ctx,
+                    start_frame=start_frame,
+                    end_frame=valid_frame_end,
+                    send_t0_ns=send_t0_ns,
+                    send_done_ns=time.perf_counter_ns(),
+                )
         except BaseException as error:
             self.failure = error
 

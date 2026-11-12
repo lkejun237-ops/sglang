@@ -51,6 +51,32 @@ _OutputPublisher = SharedMemoryFramePublisher
 _DRAIN = object()
 
 
+def _queue_chunk_timing(entry, command, timeout_seconds):
+    """Validate the generation and enqueue timing behind its RGB descriptor.
+
+    Called on rank zero only. This sideband carries no latent/RGB tensors and
+    does not submit another decode job.
+    """
+    direct_output = entry.get("output_session")
+    if (
+        direct_output is None
+        or command.get("generation_id") != direct_output.config["generation_id"]
+    ):
+        raise ValueError("Decoder chunk timing identity is invalid")
+    direct_output.put(
+        dict(
+            type="decoder.timing",
+            request_id=command.get("request_id"),
+            chunk_index=command.get("chunk_index"),
+            output_frame_start=command.get("output_frame_start"),
+            num_frames=command.get("num_frames"),
+            frame_stage_breakdown=command.get("frame_stage_breakdown"),
+        ),
+        timeout_seconds,
+        discard_if_stopped=True,
+    )
+
+
 def initialize_runtime_imports():
     """Load pipeline registration before server arguments import it cyclically."""
     import sglang.multimodal_gen.configs.pipeline_configs  # noqa: F401
@@ -204,11 +230,13 @@ class _DecodeService:
             raise ValueError("Decoder slices do not match valid output frames")
         return counts
 
-    def submit(self, frames, reference):
+    def submit(self, frames, reference, *, timing_state=None):
         """Move the pending latents into one decode job without waiting for it."""
         pending = self.valid_frame_end - self.submitted_frames
         if frames != pending:
             raise ValueError("Decoder output length does not match its frames")
+        if isinstance(timing_state, dict):
+            timing_state["submitted_mono_ns"] = time.perf_counter_ns()
         ticket = self._step_gate.issue() if self._step_gate is not None else None
         job = dict(
             latents=self._pending,
@@ -217,6 +245,7 @@ class _DecodeService:
             reference=reference,
             done=threading.Event(),
             ticket=ticket,
+            timing_state=timing_state,
         )
         self._pending = []
         self.submitted_latents = self.accepted_latents
@@ -286,6 +315,13 @@ class _DecodeService:
             ticket = job.get("ticket")
             if self._step_gate is not None and ticket is not None:
                 self._step_gate.enter(ticket)
+            timing_state = job.get("timing_state")
+            dec_start_ns = (
+                time.perf_counter_ns() if isinstance(timing_state, dict) else 0
+            )
+            if isinstance(timing_state, dict):
+                sub_ns = timing_state.get("submitted_mono_ns", dec_start_ns)
+                timing_state["wait_ms"] = max(0.0, (dec_start_ns - sub_ns) / 1e6)
             error = decoded = None
             try:
                 with (
@@ -331,6 +367,12 @@ class _DecodeService:
                             )
                     if self._tile_parallel and stream is not None:
                         stream.synchronize()
+                    if isinstance(timing_state, dict):
+                        dec_done_ns = time.perf_counter_ns()
+                        timing_state["process_ms"] = max(
+                            0.0, (dec_done_ns - dec_start_ns) / 1e6
+                        )
+                        timing_state["done_mono_ns"] = dec_done_ns
             except BaseException as exc:
                 error = exc
             try:
@@ -1302,6 +1344,7 @@ def main():
                     if op not in (
                         "append",
                         "output",
+                        "chunk_timing",
                         "source_progress",
                         "finish",
                         "close",
@@ -1390,8 +1433,18 @@ def main():
                                     ),
                                 )
                             submitted = False
+                            timing_state = (
+                                {}
+                                if direct_output is not None
+                                and direct_output.config.get(
+                                    "return_stage_timing", False
+                                )
+                                else None
+                            )
                             try:
-                                service.submit(frames, reference)
+                                service.submit(
+                                    frames, reference, timing_state=timing_state
+                                )
                                 submitted = True
                                 if direct_output is not None:
                                     direct_output.put(
@@ -1400,6 +1453,7 @@ def main():
                                             reference=reference,
                                             metadata=metadata,
                                             output_metadata=command["output_metadata"],
+                                            timing_state=timing_state,
                                         ),
                                         args.timeout_seconds,
                                         discard_if_stopped=True,
@@ -1422,6 +1476,9 @@ def main():
                         )
                         if direct_output is not None:
                             reply["output_queued"] = True
+                    elif op == "chunk_timing":
+                        if rank == 0:
+                            _queue_chunk_timing(entry, command, args.timeout_seconds)
                     elif op == "source_progress":
                         if rank == 0:
                             direct_output = entry.get("output_session")

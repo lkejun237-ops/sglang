@@ -8,6 +8,7 @@ class DiTDecoderOutput:
     def __init__(self, codecs, init, config, *, parallel=None):
         self.parallel = parallel
         self.provenance = None
+        self.timing_ctx = None
         self.remote = create_decoder(
             codecs,
             policy={
@@ -46,12 +47,16 @@ class DiTDecoderOutput:
             chunk_index=message["chunk_index"],
             generation_id=message["generation_id"],
         )
-        self.remote.append(
-            result.visual,
+        timing_ctx = getattr(self, "timing_ctx", None)
+        self.timing_ctx = None
+        append_kwargs = dict(
             latent_start=result.chunk.start,
             source_dependency_end=result.provenance.source_dependency_end,
             valid_frame_end=result.provenance.pixels.end,
         )
+        if timing_ctx is not None:
+            append_kwargs["timing_ctx"] = timing_ctx
+        self.remote.append(result.visual, **append_kwargs)
         decoded = self.remote.pop()
         return dict(
             {k: v for k, v in item.items() if k not in ("tensor", "format", "type")},

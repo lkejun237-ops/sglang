@@ -49,6 +49,9 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
                     session_id=session.id,
                     generation_id=session.generation_id,
                     async_inputs=True,
+                    return_stage_timing=bool(
+                        getattr(request, "return_stage_timing", False)
+                    ),
                     seed=request.seed
                     if request.seed is not None
                     else ZingH3SamplingParams.seed,

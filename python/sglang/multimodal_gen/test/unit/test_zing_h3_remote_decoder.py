@@ -425,7 +425,7 @@ def _loop_service(*, fail_on=None, transfer_events=None):
                 raise RuntimeError("injected append failure")
             self.valid_frame_end = valid_frame_end
 
-        def submit(self, frames, reference):
+        def submit(self, frames, reference, *, timing_state=None):
             self.submitted_frames += frames
 
         def finish(self, total_frames):

@@ -497,6 +497,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                 payload=item["payload"],
             )
             self.reference_items.append(descriptor)
+        self.return_stage_timing = bool(getattr(request, "return_stage_timing", False))
         self.source_preview_sha256 = None
         self.source_preview_bytes = None
         self.config = dict(
@@ -946,6 +947,9 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                     "Source input must wait for the condition switch to finish.",
                 )
             received_ns = time.time_ns()
+            received_mono_ns = (
+                time.perf_counter_ns() if self.return_stage_timing else None
+            )
             record = self.ledger.accept(
                 payload, event_id=event_id, message_bytes=message_bytes
             )
@@ -994,7 +998,12 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                 reservation.reduce(**reduced)
                 self._source_reservations[payload["client_seq"]] = reservation
             self.pending.append(
-                dict(payload=payload, event_id=event_id, message_bytes=message_bytes)
+                dict(
+                    payload=payload,
+                    event_id=event_id,
+                    message_bytes=message_bytes,
+                    received_mono_ns=received_mono_ns,
+                )
             )
             self.pending_frames += payload["num_frames"]
             self.available.set()

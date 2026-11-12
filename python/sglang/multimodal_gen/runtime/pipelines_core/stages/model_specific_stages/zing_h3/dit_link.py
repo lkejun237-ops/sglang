@@ -350,7 +350,19 @@ class DiTInputService:
                         **result.provenance.metadata(),
                     )
                     if self.decoder is not None:
-                        item = self.decoder.output(result, self.current_message, item)
+                        timing_ctx = getattr(
+                            self.worker, "last_output_timing_ctx", None
+                        )
+                        has_timing_slot = hasattr(self.decoder, "timing_ctx")
+                        if timing_ctx is not None and has_timing_slot:
+                            self.decoder.timing_ctx = timing_ctx
+                        try:
+                            item = self.decoder.output(
+                                result, self.current_message, item
+                            )
+                        finally:
+                            if timing_ctx is not None and has_timing_slot:
+                                self.decoder.timing_ctx = None
                     try:
                         self.channel.send(item)
                         take = getattr(self.worker, "take_cache_report", None)

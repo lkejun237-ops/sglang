@@ -358,6 +358,8 @@ class SourceEncoderExecutor:
         self._dit_final_frames = None
         self._dit_latents = 0
         self._dit_committed_frames = 0
+        self._enc_emitted_pixels = 0
+        self._enc_frame_wait_ms = {}
         self.owner = self.encoder = None
         self.command_index = 0
         self.consumed = 0
@@ -515,6 +517,8 @@ class SourceEncoderExecutor:
                 self._dit_final_frames = None
                 self._dit_latents = 0
                 self._dit_committed_frames = 0
+                self._enc_emitted_pixels = 0
+                self._enc_frame_wait_ms = {}
                 self.startup_preparation = None
                 self.startup_attached = False
             return OutputBatch(output=[])
@@ -544,6 +548,8 @@ class SourceEncoderExecutor:
             self._dit_final_frames = None
             self._dit_latents = 0
             self._dit_committed_frames = 0
+            self._enc_emitted_pixels = 0
+            self._enc_frame_wait_ms = {}
             self.startup_preparation = None
             self.startup_attached = False
             self.owner, self.command_index, self.consumed = owner, 0, 0
@@ -786,6 +792,39 @@ class SourceEncoderExecutor:
             ),
         )
 
+    def _collect_encoder_frame_timings(self, value, *, start_ns, send_overhead_ns):
+        """Complete the producer stream and attribute this dispatch to pixel frames.
+
+        The transport consumes the returned sync flag to avoid repeating this
+        handoff synchronization. process_ms is the dispatch Host/CUDA span,
+        excluding preceding send calls, not an independent per-frame kernel time.
+        """
+        import torch
+
+        stream_synced = False
+        if isinstance(value.values, torch.Tensor) and value.values.is_cuda:
+            torch.cuda.current_stream(value.values.device).synchronize()
+            stream_synced = True
+        enc_done_ns = time.perf_counter_ns()
+        enc_process_ms = max(0.0, (enc_done_ns - start_ns - send_overhead_ns) / 1e6)
+        clip_frames = getattr(self.codecs, "vae_frames_per_chunk", 17)
+        clip_latents = getattr(self.codecs, "vae_latents_per_chunk", 5)
+        temporal_ratio = getattr(self.codecs, "temporal_ratio", 4)
+        clip_idx, last_off = divmod(value.end - 1, clip_latents)
+        cur_px = clip_idx * clip_frames + 1 + last_off * temporal_ratio
+        if self._dit_final_frames is not None:
+            cur_px = min(cur_px, self._dit_final_frames)
+        frame_timings = [
+            dict(
+                frame=f_idx,
+                wait_ms=round(self._enc_frame_wait_ms.pop(f_idx, 0.0), 3),
+                process_ms=round(enc_process_ms, 3),
+            )
+            for f_idx in range(self._enc_emitted_pixels, cur_px)
+        ]
+        self._enc_emitted_pixels = max(self._enc_emitted_pixels, cur_px)
+        return frame_timings, stream_synced
+
     def _forward_source(self, batch, command, config, *, outputs_state):
         import torch
 
@@ -818,6 +857,9 @@ class SourceEncoderExecutor:
                     )
         geometry = command.get("source_geometry")
         condition = notice = None
+        timing_enabled = bool(batch.extra.get("return_stage_timing", False))
+        enc_start_ns = time.perf_counter_ns() if timing_enabled else 0
+        send_overhead_ns = 0
         with (
             torch.inference_mode(),
             set_forward_context(current_timestep=0, attn_metadata=None),
@@ -844,6 +886,17 @@ class SourceEncoderExecutor:
                 send_dit("sink.update", **sink_command)
             for item in command["appends"]:
                 payload = item["payload"]
+                arrived_ns = item.get("received_mono_ns")
+                f_start = payload.get("source_frame_start")
+                f_count = payload.get("num_frames")
+                if timing_enabled and type(f_start) is int and type(f_count) is int:
+                    wait_ms = (
+                        max(0.0, (enc_start_ns - arrived_ns) / 1e6)
+                        if type(arrived_ns) is int
+                        else 0.0
+                    )
+                    for f_idx in range(f_start, f_start + f_count):
+                        self._enc_frame_wait_ms[f_idx] = wait_ms
                 pixels = torch.frombuffer(bytearray(payload["data"]), dtype=torch.uint8)
                 pixels = pixels.reshape(
                     payload["num_frames"], config["height"], config["width"], 3
@@ -862,6 +915,16 @@ class SourceEncoderExecutor:
             while self.encoder.ready and len(outputs) < 10:
                 value = self.encoder.pop()
                 if self.dit_link is not None:
+                    frame_timings, stream_synced = None, False
+                    if timing_enabled:
+                        frame_timings, stream_synced = (
+                            self._collect_encoder_frame_timings(
+                                value,
+                                start_ns=enc_start_ns,
+                                send_overhead_ns=send_overhead_ns,
+                            )
+                        )
+                    send_t0 = time.perf_counter_ns() if timing_enabled else 0
                     send_dit(
                         "source.moments",
                         tensor=value.values,
@@ -870,7 +933,15 @@ class SourceEncoderExecutor:
                         source_dependency_end=value.source_dependency_end,
                         source_records=batch.extra["zing_dit_source_records"],
                         final_source_frames=self._dit_final_frames,
+                        **(
+                            {"encoder_frame_timings": frame_timings}
+                            if timing_enabled
+                            else {}
+                        ),
+                        **({"_stream_synced": True} if stream_synced else {}),
                     )
+                    if timing_enabled:
+                        send_overhead_ns += time.perf_counter_ns() - send_t0
                     self._dit_latents = value.end
                     # Retain the existing ten-slice dispatch bound.
                     outputs.append(None)

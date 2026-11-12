@@ -7,6 +7,8 @@ All methods belong to one event loop; model calls remain single-writer.
 """
 
 import asyncio
+import inspect
+import time
 from contextlib import closing
 
 import torch
@@ -32,11 +34,13 @@ class QueuedDiTSession:
         poll_interval_s=0.005,
         max_control_tasks=10,
         max_condition_bytes=256 << 20,
+        return_stage_timing=False,
     ):
         if not session_id or not generation_id:
             raise ValueError("DiT session identity is required")
         if max_control_tasks < 1 or max_condition_bytes < 1:
             raise ValueError("DiT queue budgets must be positive")
+        self.return_stage_timing = return_stage_timing
         self.identity = session_id, generation_id
         self.create_session = create_session
         self.bridge, self.sample_moments = bridge, sample_moments
@@ -57,6 +61,12 @@ class QueuedDiTSession:
         self.conditioning_notice = None
         self.condition_ready = None
         self.condition_prepared = None
+        self.last_output_timing_ctx = None
+        self._bridge_accepts_timing = (
+            "slice_timing" in inspect.signature(self.bridge.append).parameters
+            if hasattr(self.bridge, "append")
+            else False
+        )
         self._admission = asyncio.Lock()
         self.queue = PollingTaskQueue(
             self._process,
@@ -301,13 +311,39 @@ class QueuedDiTSession:
             ):
                 await asyncio.sleep(self.queue.poll_interval_s)
                 self._open()
+            arrived_ns = (
+                message.get("_dit_arrived_ns") if self.return_stage_timing else None
+            )
+            if self.return_stage_timing and type(arrived_ns) is not int:
+                arrived_ns = time.perf_counter_ns()
+            sample_events = None
+            if self.return_stage_timing and kind == "source.moments" and value.is_cuda:
+                sample_events = (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+                sample_events[0].record(torch.cuda.current_stream(value.device))
+            sample_t0 = time.perf_counter_ns() if self.return_stage_timing else 0
             with torch.no_grad():
                 source = (
                     self.sample_moments(value, latent_start=start)
                     if kind == "source.moments"
                     else value
                 )
-            task = dict(message, tensor=source)
+            sample_ms = (
+                max(0.0, (time.perf_counter_ns() - sample_t0) / 1e6)
+                if self.return_stage_timing
+                else 0.0
+            )
+            if sample_events is not None:
+                sample_events[1].record(torch.cuda.current_stream(value.device))
+            task = dict(
+                message,
+                tensor=source,
+                _dit_arrived_ns=arrived_ns,
+                _dit_sample_ms=sample_ms,
+                _dit_sample_events=sample_events,
+            )
         elif kind == "source.end":
             if (
                 not self.initial_received
@@ -335,11 +371,27 @@ class QueuedDiTSession:
             if kind == "source.end":
                 self.bridge.finish()
             else:
+                timing_kwargs = {}
+                if (
+                    self.return_stage_timing
+                    and self._bridge_accepts_timing
+                    and (
+                        "_dit_arrived_ns" in message
+                        or "encoder_frame_timings" in message
+                    )
+                ):
+                    timing_kwargs["slice_timing"] = dict(
+                        arrived_ns=message.get("_dit_arrived_ns"),
+                        sample_ms=message.get("_dit_sample_ms", 0.0),
+                        sample_events=message.get("_dit_sample_events"),
+                        encoder_frame_timings=message.get("encoder_frame_timings"),
+                    )
                 self.bridge.append(
                     message["tensor"],
                     latent_start=message["latent_start"],
                     pixel_end=message["pixel_end"],
                     source_dependency_end=message["source_dependency_end"],
+                    **timing_kwargs,
                 )
         # Select at most one frame task. A queued prompt must be consumed before
         # consulting next_chunk_size, since it can reset the model phase.
@@ -449,6 +501,16 @@ class QueuedDiTSession:
                     self.condition_bytes -= task["nbytes"]
             elif task["type"] == "source.group":
                 chunk = task["chunk"]
+                dit_start_ns = time.perf_counter_ns() if self.return_stage_timing else 0
+                input_timings = getattr(chunk, "input_timings", None)
+                ev_dit_start = None
+                if (
+                    input_timings is not None
+                    and isinstance(chunk.source, torch.Tensor)
+                    and chunk.source.is_cuda
+                ):
+                    ev_dit_start = torch.cuda.Event(enable_timing=True)
+                    ev_dit_start.record(torch.cuda.current_stream(chunk.source.device))
                 self.state.append(
                     chunk.source,
                     chunk.noise,
@@ -462,7 +524,29 @@ class QueuedDiTSession:
                 # close it explicitly if the output consumer fails or cancels.
                 with closing(self.state.drain_ready(max_outputs=1)) as outputs:
                     for result in outputs:
-                        await self.on_output(result)
+                        ev_dit_end = None
+                        visual = getattr(result, "visual", None)
+                        if (
+                            ev_dit_start is not None
+                            and isinstance(visual, torch.Tensor)
+                            and visual.is_cuda
+                        ):
+                            ev_dit_end = torch.cuda.Event(enable_timing=True)
+                            ev_dit_end.record(torch.cuda.current_stream(visual.device))
+                        self.last_output_timing_ctx = (
+                            dict(
+                                dit_start_ns=dit_start_ns,
+                                input_timings=input_timings,
+                                ev_dit_start=ev_dit_start,
+                                ev_dit_end=ev_dit_end,
+                            )
+                            if input_timings is not None
+                            else None
+                        )
+                        try:
+                            await self.on_output(result)
+                        finally:
+                            self.last_output_timing_ctx = None
             else:
                 if not self.state.ended:
                     self.state.finish()

@@ -695,7 +695,13 @@ def test_connected_encoder_sends_qwen_before_vae_and_keeps_native_tensors():
     "source,target",
     [((32, 32), (32, 32)), ((32, 32), (64, 64)), ((832, 480), (1280, 736))],
 )
-def test_connected_api_initializes_dit_before_any_source(configured, source, target):  # noqa: F811
+@pytest.mark.parametrize("timing_enabled", [False, True])
+def test_connected_api_initializes_dit_before_any_source(
+    configured,  # noqa: F811
+    source,
+    target,
+    timing_enabled,
+):
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.zing_encoder_dit_adapter import (
         ZingEncoderDiTAdapter,
     )
@@ -713,6 +719,7 @@ def test_connected_api_initializes_dit_before_any_source(configured, source, tar
         session.execution_client = SimpleNamespace(open_dit=open_dit)
         request = RealtimeVideoGenerationsRequest(
             type="init",
+            return_stage_timing=timing_enabled,
             prompt="first",
             size=f"{width}x{height}",
             seed=None,
@@ -728,6 +735,7 @@ def test_connected_api_initializes_dit_before_any_source(configured, source, tar
                 session_id=session.id,
                 generation_id=session.generation_id,
                 async_inputs=True,
+                return_stage_timing=timing_enabled,
                 seed=42,
                 width=width,
                 height=height,

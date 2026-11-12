@@ -3,10 +3,12 @@
 
 import json
 import math
+import os
 import threading
 import time
 from concurrent.futures import Future, TimeoutError
 from contextlib import nullcontext
+from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, Thread
 
@@ -40,6 +42,14 @@ class DiTIOChannel:
             raise ValueError("DiT I/O queue and polling interval must be positive")
         if not math.isfinite(timeout_s) or timeout_s <= 0:
             raise ValueError("DiT I/O timeout must be finite and positive")
+        # CLOCK_MONOTONIC can only be subtracted within the same clock domain.
+        # A private boot namespace may hide same-host identity: omit the metric
+        # rather than silently use unsynchronized cross-host wall clocks.
+        boot = Path("/proc/sys/kernel/random/boot_id")
+        try:
+            self.clock_domain = "boot:" + boot.read_text().strip()
+        except OSError:
+            self.clock_domain = f"process:{os.getpid()}"
         self.factory = factory
         self.timeout_s = timeout_s
         self.on_failure = on_failure
@@ -96,9 +106,14 @@ class DiTIOChannel:
 
     def send(self, message, *, on_wait=None):
         self._check()
+        if isinstance(message, dict) and "encoder_frame_timings" in message:
+            message["_encoder_return_start_ns"] = time.perf_counter_ns()
+            message["_encoder_return_clock"] = self.clock_domain
         prepare = getattr(self.transport, "prepare_send", None)
         if prepare is not None:
             prepare(message)
+        elif isinstance(message, dict):
+            message.pop("_stream_synced", None)
         done = Future()
         while True:
             self._check()
@@ -152,6 +167,26 @@ class DiTIOChannel:
                     ):
                         message = self.transport.receive()
                         self._finish_transfer(message)
+                        if isinstance(message, dict) and isinstance(
+                            message.get("encoder_frame_timings"), list
+                        ):
+                            recv_t1 = time.perf_counter_ns()
+                            start_ns = message.pop("_encoder_return_start_ns", None)
+                            clock = message.pop("_encoder_return_clock", None)
+                            message.pop("_encoder_outbox_wait_ms", None)
+                            enc_return_ms = (
+                                round((recv_t1 - start_ns) / 1e6, 3)
+                                if clock == self.clock_domain
+                                and type(start_ns) is int
+                                and start_ns <= recv_t1
+                                else None
+                            )
+                            for entry in message["encoder_frame_timings"]:
+                                if isinstance(entry, dict):
+                                    entry.pop("return_ms", None)
+                                    if enc_return_ms is not None:
+                                        entry["return_ms"] = enc_return_ms
+                            message["_dit_arrived_ns"] = recv_t1
                         self.inbox.put_nowait(message)
                     else:
                         self.stopping.wait(self.poll_interval_s)

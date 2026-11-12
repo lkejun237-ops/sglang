@@ -91,6 +91,8 @@ class EncoderDiTChannel:
     def prepare_send(self, message):
         # Runs on the model thread before transferring its output to the I/O
         # thread. Only this producer stream must have finished writing it.
+        if isinstance(message, dict) and message.pop("_stream_synced", False):
+            return
         self.finish_transfer(message)
 
     def adopt_received(self, message):

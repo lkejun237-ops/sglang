@@ -376,6 +376,7 @@ def create_link_session(
         session_id=init["session_id"],
         generation_id=init["generation_id"],
         bridge=bridge,
+        return_stage_timing=bool(init.get("return_stage_timing", False)),
         create_session=create,
         prepare_condition=prepare,
         confirm_condition_ready=confirm_condition_ready,

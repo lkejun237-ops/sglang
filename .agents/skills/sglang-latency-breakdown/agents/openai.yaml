@@ -1,0 +1,4 @@
+interface:
+  display_name: "SGLang 延迟分解实测与可视化"
+  short_description: "串联 SGLang 三角色延迟采集、数据核验与交互报告生成"
+  default_prompt: "使用 $sglang-latency-breakdown 对指定 SGLang 实例做延迟分解实测并生成报告；已有 JSON 时只重绘，明确区分真实 GPU 数据与 mock。"

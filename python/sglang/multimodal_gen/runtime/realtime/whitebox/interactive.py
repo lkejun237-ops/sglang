@@ -29,7 +29,11 @@ from .playback import H264PlaybackEncoder
 from .project_audio import public_ui_metadata
 from .recording import reference_descriptors
 from .session import WhiteboxUpstream
-from .telemetry import CHUNK_FIELDS, numeric_durations
+from .telemetry import (
+    CHUNK_FIELDS,
+    numeric_durations,
+    sanitize_frame_stage_breakdown,
+)
 
 log = logging.getLogger(__name__)
 
@@ -1315,6 +1319,10 @@ class InteractiveSession(WhiteboxUpstream):
                                         "input_admission_wait_ms": admission_wait_ms,
                                         # Gates can overlap. These values must not be summed.
                                         "input_capacity_blocked_ms": blocked_ms,
+                                        # Preserve the upstream WS packet boundary;
+                                        # Room may later emit one preview per frame.
+                                        "output_batch_start": start,
+                                        "output_batch_frames": count,
                                         "source_to_raw_output_ms": source_to_output_ms,
                                         "source_to_selection_ms": (
                                             selected_at - captured
@@ -1372,6 +1380,11 @@ class InteractiveSession(WhiteboxUpstream):
                             and 0 < frames <= 128
                             and received - frames == telemetry_received
                         ):
+                            frame_breakdown = sanitize_frame_stage_breakdown(
+                                message.get("frame_stage_breakdown"),
+                                start_frame=telemetry_received,
+                                num_frames=frames,
+                            )
                             # Diagnostic-only sideband: never delay already decoded
                             # pixels while waiting for chunk timings or a subscriber.
                             timing = dict(
@@ -1381,7 +1394,21 @@ class InteractiveSession(WhiteboxUpstream):
                                 source_frame_end=received,
                                 chunk_index=message.get("chunk_index"),
                                 durations=durations,
+                                **(
+                                    {"frame_stage_breakdown": frame_breakdown}
+                                    if frame_breakdown
+                                    else {}
+                                ),
                             )
+                            if frame_breakdown:
+                                retained_breakdown = self.recording.manifest.setdefault(
+                                    "frame_stage_breakdown", []
+                                )
+                                if (
+                                    len(retained_breakdown) + len(frame_breakdown)
+                                    <= 4096
+                                ):
+                                    retained_breakdown.extend(frame_breakdown)
                             try:
                                 self.outgoing.put_nowait(msgspec.msgpack.encode(timing))
                             except asyncio.QueueFull:

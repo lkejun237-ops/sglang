@@ -112,7 +112,8 @@ class ServiceCommandSockets:
         command["_service_index"] = self.selected
         self.oneway = self.router and command.get("oneway", False)
         if type(self.oneway) is not bool or (
-            self.oneway and command.get("op") not in ("append", "source_progress")
+            self.oneway
+            and command.get("op") not in ("append", "source_progress", "chunk_timing")
         ):
             raise ValueError("Invalid one-way worker operation")
         return [json.dumps(command).encode(), *parts[1:]]

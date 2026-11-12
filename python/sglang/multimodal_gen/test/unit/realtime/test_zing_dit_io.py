@@ -367,3 +367,35 @@ def test_fault_abort_precedes_io_stop_notification(abort_fails):
         assert closed.wait(3)
     finally:
         io.close()
+
+
+@pytest.mark.parametrize("same_clock", [True, False])
+def test_encoder_return_includes_receiver_backpressure(same_clock):
+    incoming, received, closed = Queue(), [], threading.Event()
+
+    class Sender(Transport):
+        def send(self, message):
+            incoming.put(dict(message))
+
+    tx = DiTIOChannel(lambda: Sender(Queue(), [], threading.Event())).start()
+    rx = DiTIOChannel(lambda: Transport(incoming, received, closed)).start()
+    try:
+        rx.pause_receiving()
+        if not same_clock:
+            tx.clock_domain = "different-host"
+        start = time.perf_counter_ns()
+        tx.send({"type": "source.moments", "encoder_frame_timings": [{"frame": 0}]})
+        # Metadata is already sent, but the receiver cannot accept it yet.
+        time.sleep(0.05)
+        rx.pause_requested.clear()
+        message = rx.receive()
+        timing = message["encoder_frame_timings"][0]
+        if same_clock:
+            assert 50 <= timing["return_ms"] <= (time.perf_counter_ns() - start) / 1e6
+        else:
+            assert "return_ms" not in timing
+        assert "_encoder_return_start_ns" not in message
+        assert "_encoder_return_clock" not in message
+    finally:
+        tx.close()
+        rx.close()

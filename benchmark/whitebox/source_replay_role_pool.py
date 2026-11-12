@@ -46,7 +46,9 @@ class SuiteRolePool:
         signing_secret_env="ROLE_POOL_SIGNING_SECRET",
         control_epoch=None,
         client=None,
+        video_size=(832, 480),
     ):
+        self.video_size = list(video_size)
         self.supplied_client = client
         self.control_client = None
         self.workers = workers
@@ -191,21 +193,23 @@ class SuiteRolePool:
         common = set.intersection(*(set(i["profiles"]) for i in identities.values()))
         if self.config["profile"]:
             common &= {self.config["profile"]}
-        else:
-            common = {
-                p
-                for p in common
-                if all(
-                    [832, 480] in i["profile_limits"][p]["source_sizes"]
-                    and [832, 480] in i["profile_limits"][p]["target_sizes"]
-                    and i["profile_limits"][p]["max_references"] >= 12
-                    and i["profile_limits"][p]["max_fps"] >= 24
-                    for i in identities.values()
+        common = {
+            p
+            for p in common
+            if all(
+                self.video_size in i["profile_limits"][p]["source_sizes"]
+                and self.video_size in i["profile_limits"][p]["target_sizes"]
+                and (
+                    bool(self.config["profile"])
+                    or i["profile_limits"][p]["max_references"] >= 12
                 )
-            }
+                and i["profile_limits"][p]["max_fps"] >= 24
+                for i in identities.values()
+            )
+        }
         if len(common) != 1:
             raise ValueError(
-                "Expected one common 832x480 profile; use --profile to resolve ambiguity"
+                f"Expected one common {self.video_size[0]}x{self.video_size[1]} profile; use --profile to resolve ambiguity"
             )
         profile = next(iter(common))
         limits = [i["profile_limits"][profile] for i in identities.values()]

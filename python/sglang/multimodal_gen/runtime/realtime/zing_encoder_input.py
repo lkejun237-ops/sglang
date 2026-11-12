@@ -6,6 +6,7 @@ original packet identity; a packet's memory reservation can be released only
 after the group containing its last frame has finished execution.
 """
 
+import time
 from collections import deque
 
 
@@ -30,6 +31,8 @@ class EncoderInputArranger:
                 tasks.append(self._take(self.buffered_frames))
             tasks.append(item)
             return tasks
+        if "received_mono_ns" not in item:
+            item = dict(item, received_mono_ns=time.perf_counter_ns())
         self.pending.append(item)
         self.buffered_frames += item["payload"]["num_frames"]
         tasks = []

@@ -8,6 +8,33 @@ description: "供 Codex 与部署同学使用的 H100/H200/B300 部署决策、�
 下面是已有部署经验，只有对应版本、输入和配置的实测结论；
 实验补丁、显存快照、未验收画质均单独标注。新部署先选择一行，再沿证据入口取得原配置。
 
+## 逐帧耗时分解（2026-11-12，PR #690）
+
+PR #690 原始 B300 作业 `dlc1dszcwbnx2o97` 已核对成功日志与原始 JSON：
+832×480、E1+DiT SP2+D1、2 step、16s 白膜，478 输出帧，TTFF 1194.627 ms。
+该数据来自修复前埋点；后续修复包含 Encoder 传输等待漏计、保留实测输出时间、缺失样本统计及 DiT 后验采样 CUDA 耗时漏计，
+详细计时现复用每会话 `return_stage_timing`，默认关闭，诊断工具以 `--stage-timing on/off` 选择；
+无需新增 Coordinator，隔离测试默认复用三地址直连建组。旧分项数据不能作为修复后版本的 GPU 验证。
+
+当前 `a1dd8ec9c2` 已完成 B300/L20D 四卡 E1+DiT SP2+D1 的短片诊断 A/B：
+同源码、模型路径、素材、2 step、初始块计数 0、FP8 DiT / BF16 Lynn，自然供帧；
+每档各预热 off/on 后，正式各 3 次。下表是请求统计值的中位数，FPS 是 Room 收帧口径，排除 prefill 与离线绘图。
+
+| 输入尺寸 | FPS off → on | source-to-output 中位 ms off → on | source-to-output P95 ms off → on |
+| --- | --- | --- | --- |
+| 832×480 | 28.154 → 28.216（+0.22%） | 501.548 → 498.561 | 656.775 → 655.128 |
+| 1280×736（派生诊断素材） | 16.137 → 15.741（−2.46%） | 851.532 → 860.205 | 1321.331 → 1374.962 |
+
+小样本、不同自适应选帧及慢样本均保留，不能宣称零开销或加速；开关同时启用既有 stage timing。
+GPU 作业 `dlc17ve8ej3b9apm` 完成 12/12 正式请求，但在停止三角色进程后的缓存清理保护处失败，
+最终 **Failed**；测量完成不代表整个工作流验收通过。当前脚本已改为分别报告测量与清理状态，未绕过保护。
+结果、显存采样口径、原始数据及未测项见
+[真实 GPU 对照报告](https://review-cdn.loopit.com.cn/reports/pr690-frame-latency-real/20261112-a1dd8ec9c2-ab-r2-v2/index.html)。
+正式产品 case、checkpoint/table manifest、Qwen/参考图 VAE/source VAE 独立分项与三角色
+allocated/reserved 常驻/真实峰值矩阵尚未完整验证，不用旧版或其他配置结果补齐。
+开发者接入已部署 Coordinator、隔离 Worker、分辨率选择与原始证据入口见
+[逐帧耗时分解使用说明](https://github.com/seedleap/sglang/blob/sglang_latency_breakdown_visualization/benchmark/whitebox/LATENCY_BREAKDOWN.md)。
+
 ## 独立 Worker 启动预热（2026-11-11，Encoder / DiT SP2 / Decoder 启动验证通过）
 
 基于 main `2dfb1aa538`：Encoder 在已有 Source VAE 预热后执行一次无参考图的 Qwen 文本编码；

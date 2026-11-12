@@ -342,7 +342,7 @@ def _run_decoder_worker_script(commands, *, max_sessions: int = 2, service_cls=N
         ):
             self.valid_frame_end = valid_frame_end
 
-        def submit(self, frames, reference):
+        def submit(self, frames, reference, *, timing_state=None):
             self.submitted_frames += frames
 
         def finish(self, total_frames):

@@ -185,6 +185,7 @@ class DecoderOutputBroker:
     def install(self, app):
         # Imports are local so mailbox lifecycle tests do not need GPU packages.
         import asyncio
+        import time
         from types import SimpleNamespace
 
         import msgspec.msgpack
@@ -236,6 +237,7 @@ class DecoderOutputBroker:
                 await ws.send_bytes(
                     msgspec.msgpack.encode(dict(type="output.ready", **identity))
                 )
+                last_decoder_timing = None
                 while True:
                     try:
                         item = session.take()
@@ -251,6 +253,64 @@ class DecoderOutputBroker:
                         return
                     if item["type"] == "source.consumed":
                         await ws.send_bytes(msgspec.msgpack.encode(item))
+                        continue
+                    if item["type"] == "decoder.timing":
+                        if not config.get("return_stage_timing", False):
+                            continue
+                        dec_info = last_decoder_timing or {}
+                        last_decoder_timing = None
+                        dec_stage = {
+                            "wait_ms": round(
+                                max(0.0, float(dec_info.get("wait_ms", 0.0))), 3
+                            ),
+                            "process_ms": round(
+                                max(0.0, float(dec_info.get("process_ms", 0.0))), 3
+                            ),
+                            "return_ms": round(
+                                max(0.0, float(dec_info.get("return_ms", 0.0))), 3
+                            ),
+                        }
+                        frames_breakdown = [
+                            dict(entry, decoder=dict(dec_stage))
+                            for entry in (item.get("frame_stage_breakdown") or ())
+                            if isinstance(entry, dict)
+                        ]
+                        num_frames = item.get("num_frames")
+                        if type(num_frames) is not int or num_frames < 1:
+                            num_frames = len(frames_breakdown)
+                        summary = {}
+                        if frames_breakdown:
+                            for role in ("encoder", "dit", "decoder"):
+                                for metric in ("wait_ms", "process_ms", "return_ms"):
+                                    vals = [
+                                        float(row[role][metric])
+                                        for row in frames_breakdown
+                                        if isinstance(row.get(role), dict)
+                                        and type(row[role].get(metric)) in (int, float)
+                                    ]
+                                    if vals:
+                                        summary[f"{role}_{metric}"] = round(
+                                            sum(vals) / len(vals), 3
+                                        )
+                        for extra_key in ("transport_encode_ms", "transport_write_ms"):
+                            if type(dec_info.get(extra_key)) in (int, float):
+                                summary[extra_key] = round(
+                                    max(0.0, float(dec_info[extra_key])), 3
+                                )
+                        await ws.send_bytes(
+                            msgspec.msgpack.encode(
+                                dict(
+                                    type="chunk_telemetry",
+                                    **identity,
+                                    request_id=item.get("request_id"),
+                                    chunk_index=item.get("chunk_index"),
+                                    output_frame_start=item.get("output_frame_start"),
+                                    num_frames=num_frames,
+                                    frame_stage_breakdown=frames_breakdown,
+                                    **summary,
+                                )
+                            )
+                        )
                         continue
                     meta = item["output_metadata"]
                     provenance = Provenance(
@@ -287,9 +347,10 @@ class DecoderOutputBroker:
                         raw_frame_shared_memory_ref=ref,
                         raw_frame_metadata=item["metadata"],
                     )
+                    stats = None
                     try:
                         async with ws.send_group():
-                            await adapter.send(
+                            stats = await adapter.send(
                                 ws,
                                 SimpleNamespace(
                                     id=config["session_id"],
@@ -301,6 +362,38 @@ class DecoderOutputBroker:
                             )
                     finally:
                         session.sent()
+                    if not config.get("return_stage_timing", False):
+                        continue
+                    sent_ns = time.perf_counter_ns()
+                    tstate = item.get("timing_state")
+                    stats_dict = stats if isinstance(stats, dict) else {}
+                    encode_ms = float(
+                        stats_dict.get("raw_payload_build_ms", 0.0)
+                        + stats_dict.get("msgpack_encode_ms", 0.0)
+                    )
+                    write_ms = float(stats_dict.get("ws_send_ms", 0.0))
+                    if isinstance(tstate, dict):
+                        done_ns = tstate.get("done_mono_ns")
+                        ret_ms = (
+                            max(0.0, (sent_ns - done_ns) / 1e6)
+                            if type(done_ns) is int
+                            else max(0.0, encode_ms + write_ms)
+                        )
+                        last_decoder_timing = dict(
+                            wait_ms=max(0.0, float(tstate.get("wait_ms", 0.0))),
+                            process_ms=max(0.0, float(tstate.get("process_ms", 0.0))),
+                            return_ms=ret_ms,
+                            transport_encode_ms=max(0.0, encode_ms),
+                            transport_write_ms=max(0.0, write_ms),
+                        )
+                    else:
+                        last_decoder_timing = dict(
+                            wait_ms=0.0,
+                            process_ms=0.0,
+                            return_ms=max(0.0, encode_ms + write_ms),
+                            transport_encode_ms=max(0.0, encode_ms),
+                            transport_write_ms=max(0.0, write_ms),
+                        )
 
             try:
                 message = msgspec.msgpack.decode(

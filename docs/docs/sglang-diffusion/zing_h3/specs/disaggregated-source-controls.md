@@ -64,3 +64,32 @@ configuration switch substitutes for the missing native protocol implementation.
 
 Current implementation work has CPU protocol evidence. GPU/SP2, real-game media
 and ten-entry resident-hit acceptance remain pending until recorded in the PR.
+
+## Request-scoped frame latency diagnostics
+
+`return_stage_timing` is the existing model init field, defaulting to `false`.
+The managed Encoder forwards its choice to the connected DiT and Decoder for
+that session. Detailed frame timing is opt-in: the disabled path does not record
+its sampling/denoising CUDA events or publish `chunk_timing` / `chunk_telemetry`.
+Changing it requires a new session, not a worker restart or an in-flight toggle.
+The flag also enables existing stage timing; comparisons must describe the cost
+of the whole switch rather than attributing every difference to CUDA events.
+
+The dedicated source group's data path is Room → Encoder → DiT → Decoder → Room.
+The Decoder process owns `DecoderOutputBroker`: it combines the DiT's timing
+sideband with local decode timing and sends `chunk_telemetry` on its output WS.
+Room receives and sanitizes it into `whitebox.model_timing`; Room does not send
+`chunk_telemetry`. This direct-output route predates frame timing. The legacy
+non-attached path instead returns a shared-memory reference through the DiT /
+Encoder output path. Neither is a claim about every community diffusion pipeline;
+a normal integrated pipeline returns its `OutputBatch` through GPUWorker /
+Scheduler / API. Timing this dedicated group does not validate that other route.
+
+CUDA event recording enqueues stream work; it is not a stream synchronize.
+The diagnostic implementation resolves elapsed times at transport completion
+boundaries and preserves tensor ownership synchronization even when disabled.
+The Host interval around metadata send, contiguous conversion, NCCL submission /
+wait and stream completion is a sender handoff latency, not isolated NCCL kernel
+or link-transfer time. `dit.return_ms` is a broader residual and should not be
+labelled pure network time. See the [replay guide](../../../../../benchmark/whitebox/LATENCY_BREAKDOWN.md)
+for measurement boundaries and same-code off/on experiments.
