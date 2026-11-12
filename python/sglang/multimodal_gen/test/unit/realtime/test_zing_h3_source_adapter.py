@@ -200,6 +200,79 @@ def test_sink_events_are_latest_wins_without_overwriting_prompt(configured, orde
     asyncio.run(run())
 
 
+def test_sink_auto_owns_its_slot_and_rejected_events_keep_the_cursor(
+    configured, monkeypatch
+):
+    """A rejected auto event must not consume event_id or clobber the manual slot."""
+    _enable_reference_updates(configured, split=False)
+    adapter, session = initialize()
+    assert adapter.ready["auto_sink_updates"] is adapter.ready["sink_updates"] is True
+
+    def prepare(self, session, args, chunk):
+        return SimpleNamespace(block_idx=0, extra={})
+
+    monkeypatch.setattr(
+        source.BaseRealtimeModelAdapter, "prepare_next_request", prepare
+    )
+    ws = PromptSocket()
+
+    async def run():
+        cursor = adapter.ledger.event_id
+        for payload in (
+            dict(enabled=True, interval_cycles=0),
+            dict(enabled=True, interval_cycles=True),
+            dict(enabled=True, interval_cycles=2, method="unknown"),
+            dict(enabled=False, interval_cycles=2),
+            dict(enabled=True, interval_cycles=2, extra="x"),
+        ):
+            with pytest.raises(ValueError):
+                await adapter.ingest_wire_event(
+                    ws,
+                    session,
+                    dict(type="event", kind="sink.auto", event_id=2, payload=payload),
+                    100,
+                )
+            assert adapter.ledger.event_id == cursor
+            assert adapter._pending_sink_auto_command is None
+        await adapter.ingest_wire_event(
+            ws,
+            session,
+            dict(
+                type="event",
+                kind="sink.auto",
+                event_id=2,
+                payload=dict(enabled=True, interval_cycles=2),
+            ),
+            100,
+        )
+        await adapter.ingest_wire_event(
+            ws,
+            session,
+            dict(
+                type="event",
+                kind="sink.refresh",
+                event_id=3,
+                payload=dict(method="rebuild"),
+            ),
+            100,
+        )
+        batch = adapter.prepare_next_request(session, configured, None)
+        assert batch.extra["zing_sink_auto"] == dict(
+            enabled=True, interval_cycles=2, method="copy", event_id=2
+        )
+        assert batch.extra["zing_sink_update"] == dict(
+            operation="refresh", method="rebuild", event_id=3
+        )
+        assert adapter._pending_sink_auto_command is None
+        assert adapter._pending_sink_command is None
+        assert ws.messages[-1] == dict(
+            type="control_ack", kind="sink.refresh", event_id=3, stage="accepted"
+        )
+        await adapter.close_conditioning(session)
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("split", [False, True])
 def test_reference_capability_requires_supported_deployment(configured, split):
     adapter, _ = initialize()

@@ -1483,7 +1483,8 @@ def test_pre_distributed_bind_failure_is_published_to_both_ranks(tmp_path, failu
             for process in processes:
                 process.start()
             for process in processes:
-                process.join(timeout=20)
+                # The join budget also includes each spawned rank's Python imports.
+                process.join(timeout=30)
                 assert not process.is_alive(), (
                     "A peer remained blocked after pre-bind failure"
                 )

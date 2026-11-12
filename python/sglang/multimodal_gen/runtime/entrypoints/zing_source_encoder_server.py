@@ -832,6 +832,11 @@ class SourceEncoderExecutor:
                         else {}
                     ),
                 )
+            sink_auto = batch.extra.get("zing_sink_auto")
+            if sink_auto is not None:
+                if self.dit_link is None:
+                    raise ValueError("Auto sink updates require a connected DiT worker")
+                send_dit("sink.auto", **sink_auto)
             sink_command = batch.extra.get("zing_sink_update")
             if sink_command is not None:
                 if self.dit_link is None:

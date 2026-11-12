@@ -337,6 +337,16 @@ class DiTInputService:
                         sink_event_id=getattr(result, "sink_event_id", None),
                         sink_chunks=getattr(result, "sink_chunks", 0),
                         sink_chunk_ids=getattr(result, "sink_chunk_ids", ()),
+                        sink_config_event_id=getattr(
+                            result, "sink_config_event_id", None
+                        ),
+                        sink_refresh_count=getattr(result, "sink_refresh_count", 0),
+                        sink_refresh_method=getattr(
+                            result, "sink_refresh_method", None
+                        ),
+                        sink_refresh_latent=getattr(
+                            result, "sink_refresh_latent", None
+                        ),
                         **result.provenance.metadata(),
                     )
                     if self.decoder is not None:

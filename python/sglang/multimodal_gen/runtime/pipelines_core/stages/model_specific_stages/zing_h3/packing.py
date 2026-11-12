@@ -9,6 +9,7 @@ model loading, device placement, codecs and sampling belong to SGLang.
 from __future__ import annotations
 
 import math
+from copy import copy
 from dataclasses import dataclass
 from enum import IntEnum
 from fractions import Fraction
@@ -278,6 +279,49 @@ class ZingH3Packer:
         )
         if not torch.equal(target_blocks.cpu(), expected_blocks):
             raise ValueError("Prompt-switch prefix target blocks are not consecutive")
+        return layout, chunks
+
+    def pack_sink_rebuild_prefix(
+        self,
+        inputs: H3InferenceInputs,
+        condition: dict[str, torch.Tensor],
+        source_prefix: torch.Tensor,
+        target_prefix: torch.Tensor,
+    ) -> tuple[dict[str, torch.Tensor], tuple[TemporalChunk, ...]]:
+        """Pack five paired clean source+target latents into local epoch blocks (1,2) and (3,4)."""
+        chunks = self.prompt_switch_prefix_chunks()
+        expected = self.PROMPT_SWITCH_PREFIX_FRAMES
+        self._validate_visual(source_prefix)
+        self._validate_visual(target_prefix)
+        if source_prefix.shape[2] != expected or target_prefix.shape[2] != expected:
+            raise ValueError(
+                f"Sink rebuild requires {expected} paired clean source and target latents"
+            )
+        prefix_inputs = copy(inputs)
+        prefix_inputs.positive = condition
+        prefix_inputs.source_visual = source_prefix
+        layout = self.pack_inference_layout(
+            prefix_inputs, condition, target_prefix, None
+        )
+        blocks, roles = layout["block_idx"], layout["row_role"]
+        source_blocks = blocks[roles == int(H3RowRole.SOURCE_VISUAL)].unique(
+            sorted=True
+        )
+        target_blocks = blocks[roles == int(H3RowRole.TARGET_VISUAL)].unique(
+            sorted=True
+        )
+        expected_source = torch.tensor(
+            [chunk.source_block for chunk in chunks], dtype=source_blocks.dtype
+        )
+        expected_target = torch.tensor(
+            [chunk.target_block for chunk in chunks], dtype=target_blocks.dtype
+        )
+        if not torch.equal(source_blocks.cpu(), expected_source) or not torch.equal(
+            target_blocks.cpu(), expected_target
+        ):
+            raise ValueError("Sink rebuild prefix blocks are not the paired epoch")
+        if bool((roles == int(H3RowRole.TARGET_AUDIO)).any()):
+            raise ValueError("Sink rebuild prefix must not include audio rows")
         return layout, chunks
 
     def pack_chunk(

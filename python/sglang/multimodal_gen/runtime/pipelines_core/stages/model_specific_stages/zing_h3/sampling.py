@@ -267,6 +267,48 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
         target = layout["row_role"] == int(H3RowRole.TARGET_VISUAL)
         return float(layout["position_ids"][target][0, 0]), chunks[-1].end
 
+    def rebuild_sink_prefix(
+        self,
+        inputs,
+        condition,
+        source_prefix,
+        target_prefix,
+        cache,
+    ):
+        """Keep resident block 0 prefix and rebuild paired [3, 2] clean source+target sink KV."""
+        # FP32 master latents match initialize/_prepare input projections.
+        source_prefix = source_prefix.float().clone()
+        target_prefix = target_prefix.float().clone()
+        layout, chunks = self.processor.pack_sink_rebuild_prefix(
+            inputs, condition, source_prefix, target_prefix
+        )
+        # reset_history_keep_prefix keeps block 0 resident, so the rebuilt epoch
+        # has the same row layout as a cold start without replaying Qwen.
+        cache.reset_history_keep_prefix()
+        for chunk in chunks:
+            # Packing already placed the clean source latents; only the target
+            # block reads latents written at commit time.
+            self._forward(
+                self._select_block(
+                    layout,
+                    chunk.source_block,
+                    phase="source",
+                    video_t=1.0,
+                    audio_t=None,
+                ),
+                cache,
+                "source",
+            )
+            self._commit_clean_prefix(
+                layout,
+                chunk.target_block,
+                target_prefix[:, :, chunk.start : chunk.end],
+                cache,
+            )
+        host = self._layout_index(layout).host
+        target = host["row_role"] == int(H3RowRole.TARGET_VISUAL)
+        return float(host["position_ids"][target][0, 0]), chunks[-1].end
+
     @torch.no_grad()
     def initialize(
         self, inputs, visual, audio=None, *, storage=None, acquire_storage=None

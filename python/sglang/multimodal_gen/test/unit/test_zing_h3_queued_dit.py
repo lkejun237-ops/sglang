@@ -127,6 +127,330 @@ def test_external_sink_control_and_prompt_share_the_original_session(model):
     asyncio.run(run())
 
 
+def _sink_harness(model, frames=30, *, defer_final=False, pooled_kv=False):
+    h = Harness(
+        model,
+        frames=frames,
+        joint_forward="cross_chunk",
+        defer_final=defer_final,
+        pooled_kv=pooled_kv,
+    )
+    h.packer.split_first_latent = False
+    h.bridge.plan = h.packer.chunk_plan
+    original = h.sampler
+
+    def sampler():
+        value = original()
+        value.window_policy = ZingWindowPolicy(6, 2)
+        return value
+
+    h.sampler = sampler
+    return h
+
+
+async def _drive(h, ranges):
+    for start, end in ranges:
+        await h.source(start, end)
+        await h.drain_ready()
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("model", ["cpu"], indirect=True)
+@pytest.mark.parametrize("defer_final", [False, True])
+def test_periodic_auto_sink_refresh_lands_on_cycle_boundaries(model, defer_final):
+    """Only a completed [3, 2] cycle moves the anchor, on both execution paths."""
+    h = _sink_harness(model, defer_final=defer_final)
+
+    async def run():
+        await h.prompt(10)
+        await h.drain_ready()
+        await h.put(
+            "sink.auto", enabled=True, interval_cycles=2, method="copy", event_id=2
+        )
+        await h.drain_ready()
+        await _drive(
+            h,
+            (
+                (0, 3),
+                (3, 5),
+                (5, 8),
+                (8, 10),
+                (10, 13),
+                (13, 15),
+                (15, 18),
+                (18, 20),
+                (20, 23),
+            ),
+        )
+        h.worker.close()
+
+    asyncio.run(run())
+    assert [r.sink_refresh_count for r in h.results] == [0, 0, 0, 0, 1, 1, 1, 1, 2]
+    assert [r.sink_refresh_latent for r in h.results] == [
+        None,
+        None,
+        None,
+        None,
+        10,
+        10,
+        10,
+        10,
+        20,
+    ]
+    assert {r.sink_config_event_id for r in h.results} == {2}
+    assert {r.sink_refresh_method for r in h.results if r.sink_refresh_count} == {
+        "copy"
+    }
+    assert h.results[4].sink_chunk_ids == (2, 3)
+    assert h.results[8].sink_chunk_ids == (6, 7)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("model", ["cpu"], indirect=True)
+def test_auto_sink_defers_the_half_cycle_to_the_pair_boundary(model):
+    """A refresh due mid-epoch finishes 13..15 instead of blocking the source."""
+    h = _sink_harness(model)
+
+    async def run():
+        await h.prompt(10)
+        await h.drain_ready()
+        await _drive(h, ((0, 3), (3, 5), (5, 8)))
+        assert h.worker.state.committed_latent == 8
+        await h.put("sink.update", operation="refresh", method="copy", event_id=20)
+        await h.put(
+            "sink.auto", enabled=True, interval_cycles=1, method="copy", event_id=21
+        )
+        await h.drain_ready()
+        await _drive(h, ((8, 10),))
+        assert h.results[-1].sink_refresh_count == 1
+        await _drive(h, ((10, 13),))
+        assert h.results[-1].sink_refresh_count == 1
+        await _drive(h, ((13, 15),))
+        assert h.results[-1].sink_refresh_count == 1
+        assert h.worker.state.committed_latent == 15
+        await _drive(h, ((15, 18),))
+        assert h.results[-1].sink_refresh_count == 2
+        assert h.worker.state.sink_anchor_latent == 15
+        h.worker.close()
+
+    asyncio.run(run())
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("model", ["cpu"], indirect=True)
+def test_auto_sink_pauses_in_s0_and_restarts_after_manual_refresh(model):
+    """S0 keeps the schedule but never refreshes until a manual refresh restores S2."""
+    h = _sink_harness(model)
+
+    async def run():
+        await h.prompt(10)
+        await h.drain_ready()
+        await h.put(
+            "sink.auto", enabled=True, interval_cycles=1, method="copy", event_id=2
+        )
+        await h.put("sink.update", operation="off", event_id=3)
+        await h.drain_ready()
+        await _drive(h, ((0, 3), (3, 5), (5, 8), (8, 10), (10, 13)))
+        assert [r.sink_refresh_count for r in h.results] == [0] * 5
+        assert {r.sink_chunks for r in h.results} == {0}
+        await h.put("sink.update", operation="refresh", method="copy", event_id=4)
+        await h.drain_ready()
+        await _drive(h, ((13, 15),))
+        assert h.results[-1].sink_event_id == 4
+        assert h.results[-1].sink_refresh_count == 1
+        assert h.results[-1].sink_chunks == 2
+        await _drive(h, ((15, 18), (18, 20), (20, 23)))
+        assert h.results[-1].sink_refresh_count == 2
+        assert h.worker.state.sink_anchor_latent == 20
+        h.worker.close()
+
+    asyncio.run(run())
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("model", ["cpu"], indirect=True)
+def test_env_auto_sink_seeds_the_session_and_disable_stops_it(model, monkeypatch):
+    """The env default refreshes without a wire event; a disable event stops it."""
+    monkeypatch.setenv("SGLANG_ZING_AUTO_SINK_CYCLES", "1")
+    monkeypatch.setenv("SGLANG_ZING_AUTO_SINK_METHOD", "copy")
+    h = _sink_harness(model)
+
+    async def run():
+        await h.prompt(10)
+        await h.drain_ready()
+        await _drive(h, ((0, 3), (3, 5), (5, 8)))
+        assert h.results[-1].sink_refresh_count == 1
+        assert h.results[-1].sink_config_event_id is None
+        await h.put("sink.auto", enabled=False, event_id=2)
+        await h.drain_ready()
+        await _drive(h, ((8, 10), (10, 13), (13, 15), (15, 18), (18, 20)))
+        assert {r.sink_refresh_count for r in h.results[2:]} == {1}
+        assert h.results[-1].sink_config_event_id == 2
+        h.worker.close()
+
+    asyncio.run(run())
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("model", ["cpu"], indirect=True)
+def test_prompt_switch_absorbs_a_due_auto_refresh_at_the_same_boundary(model):
+    """One boundary rebuilds once: the prompt epoch becomes the refresh anchor."""
+    h = _sink_harness(model)
+
+    async def run():
+        await h.prompt(10)
+        await h.drain_ready()
+        await h.put(
+            "sink.auto", enabled=True, interval_cycles=1, method="copy", event_id=2
+        )
+        await h.drain_ready()
+        await _drive(h, ((0, 3), (3, 5), (5, 8), (8, 10)))
+        assert h.results[-1].sink_refresh_count == 1
+        await h.prompt(11)
+        await h.drain_ready()
+        await _drive(h, ((10, 13),))
+        h.worker.close()
+
+    asyncio.run(run())
+    assert len(h.rebuilds) == 1
+    assert h.results[-1].prompt_event_id == 11
+    assert h.results[-1].sink_refresh_count == 1
+    assert h.worker.state.sink_anchor_latent == 10
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("model", ["cpu"], indirect=True)
+@pytest.mark.parametrize(
+    "target_grid", [(2, 2), (4, 6)], ids=["same-grid", "mixed-grid"]
+)
+def test_periodic_sink_rebuild_replays_the_paired_clean_window(model, target_grid):
+    """Rebuild must reproduce cold-start source+target KV, not a target-only prefix."""
+    cold = _sink_harness(model)
+    rebuilt = _sink_harness(model)
+    # Both sessions must decode the same source clip to compare their KV.
+    rebuilt.inputs.source_visual = cold.inputs.source_visual.clone()
+    for h in (cold, rebuilt):
+        frames = h.inputs.visual_shape[0]
+        channels = h.inputs.source_visual.shape[1]
+        h.inputs.visual_shape = (frames, *target_grid)
+        h.bridge.target_shape = (channels, *target_grid)
+    captured = {}
+
+    async def prepare(h):
+        await h.prompt(10)
+        await h.drain_ready()
+        await _drive(h, ((0, 3), (3, 5)))
+
+    def snapshot(cache):
+        return [
+            (
+                chunk.positions.clone(),
+                [(key.clone(), value.clone()) for key, value in chunk.layers],
+            )
+            for chunk in cache.committed
+        ]
+
+    async def run():
+        await prepare(cold)
+        cache = cold.worker.state.cache
+        captured["cold_snapshot"] = snapshot(cache)
+        captured["cold_rows"] = [chunk.positions.shape[0] for chunk in cache.committed]
+        await _drive(cold, ((5, 8),))
+        cold.worker.close()
+
+        await prepare(rebuilt)
+        session = rebuilt.worker.state
+        prefix_before = session.cache.prefix
+        original = session.sampler.rebuild_sink_prefix
+
+        def rebuild_sink_prefix(*args):
+            origin, latent_end = original(*args)
+            captured["prefix_kept"] = session.cache.prefix is prefix_before
+            captured["last_block"] = session.cache.last_block
+            captured["rows"] = [
+                chunk.positions.shape[0] for chunk in session.cache.committed
+            ]
+            captured["snapshot"] = snapshot(session.cache)
+            return origin, latent_end
+
+        session.sampler.rebuild_sink_prefix = rebuild_sink_prefix
+        await rebuilt.put(
+            "sink.update", operation="refresh", method="rebuild", event_id=7
+        )
+        await rebuilt.drain_ready()
+        await _drive(rebuilt, ((5, 8),))
+        rebuilt.worker.close()
+
+    asyncio.run(run())
+    assert captured["prefix_kept"] is True
+    assert captured["last_block"] == 4
+    assert captured["rows"] == captured["cold_rows"]
+    cold_snapshot = captured["cold_snapshot"]
+    assert len(captured["snapshot"]) == len(cold_snapshot) == 2
+    for (cold_positions, cold_layers), (positions, layers) in zip(
+        cold_snapshot, captured["snapshot"]
+    ):
+        torch.testing.assert_close(positions, cold_positions)
+        assert len(layers) == len(cold_layers)
+        for (key, value), (cold_key, cold_value) in zip(layers, cold_layers):
+            torch.testing.assert_close(key, cold_key)
+            torch.testing.assert_close(value, cold_value)
+    assert rebuilt.results[-1].sink_event_id == 7
+    assert rebuilt.results[-1].sink_refresh_method == "rebuild"
+    assert rebuilt.results[-1].sink_refresh_count == 1
+    torch.testing.assert_close(rebuilt.results[-1].visual, cold.results[-1].visual)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("model", ["cpu"], indirect=True)
+def test_pooled_sink_rebuild_keeps_cursors_continuous(model):
+    """Rebuild under pooled KV must not leak capacity or skip output cursors."""
+    h = _sink_harness(model, pooled_kv=True)
+
+    async def run():
+        await h.prompt(10)
+        await h.drain_ready()
+        await h.put(
+            "sink.auto", enabled=True, interval_cycles=1, method="rebuild", event_id=2
+        )
+        await h.drain_ready()
+        await _drive(
+            h,
+            (
+                (0, 3),
+                (3, 5),
+                (5, 8),
+                (8, 10),
+                (10, 13),
+                (13, 15),
+                (15, 18),
+                (18, 20),
+                (20, 23),
+            ),
+        )
+        h.worker.close()
+
+    asyncio.run(run())
+    assert [r.chunk.chunk_id for r in h.results] == list(range(9))
+    assert [(r.chunk.start, r.chunk.end) for r in h.results] == [
+        (0, 3),
+        (3, 5),
+        (5, 8),
+        (8, 10),
+        (10, 13),
+        (13, 15),
+        (15, 18),
+        (18, 20),
+        (20, 23),
+    ]
+    for previous, result in zip(h.results, h.results[1:]):
+        assert result.provenance.pixels.start == previous.provenance.pixels.end
+    assert [r.sink_refresh_count for r in h.results] == [0, 0, 1, 1, 2, 2, 3, 3, 4]
+    assert {r.sink_refresh_method for r in h.results if r.sink_refresh_count} == {
+        "rebuild"
+    }
+
+
 class Harness:
     def __init__(
         self,

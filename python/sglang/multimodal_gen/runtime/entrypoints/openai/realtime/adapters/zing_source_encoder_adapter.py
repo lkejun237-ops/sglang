@@ -94,6 +94,7 @@ class ZingSourceEncoderAdapter(ZingH3SourceStreamAdapter):
             (
                 self._pending_prompt_command is not None
                 or getattr(self, "_pending_sink_command", None) is not None
+                or getattr(self, "_pending_sink_auto_command", None) is not None
             )
             and self.dispatched_source_frames > 0
             and not self.end_dispatched

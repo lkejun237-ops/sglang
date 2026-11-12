@@ -541,6 +541,148 @@ def test_sink_refresh_waits_for_owned_queue_and_includes_deferred_last_picture(
     assert all(v == 0 for v in session.memory_snapshot().values())
 
 
+@torch.no_grad()
+def test_sink_control_validation_keeps_the_queued_intent(model):
+    """A rejected sink control must not replace the intent already queued."""
+    packer, inputs, _, _ = _long_request(model, [3, 2], frames=30)
+    packer.split_first_latent = False
+    sampler = ZingH3Sampler(
+        model,
+        packer,
+        solver="few_step",
+        denoising_step_list=[1000, 500],
+        window_chunks=6,
+        sink_chunks=2,
+        joint_forward="cross_chunk",
+    )
+    session = SourceReadySession(
+        sampler,
+        inputs,
+        seed=7,
+        max_pending_chunks=2,
+        max_pending_bytes=1 << 20,
+    )
+    try:
+        session.update_sink("refresh", 17, method="rebuild")
+        queued = session.pending_sink
+        assert queued.method == "rebuild"
+        for operation, method in (("off", "rebuild"), ("refresh", "unknown")):
+            with pytest.raises(ValueError):
+                session.update_sink(operation, 18, method=method)
+            assert session.pending_sink is queued
+        for interval in (0, True):
+            with pytest.raises(ValueError):
+                session.configure_auto_sink(True, interval_cycles=interval)
+        with pytest.raises(ValueError):
+            session.configure_auto_sink(False, interval_cycles=2)
+        assert session.auto_sink.enabled is False
+        session.configure_auto_sink(True, interval_cycles=2, method="copy", event_id=19)
+        assert session.auto_sink.interval_cycles == 2
+        assert session.sink_config_event_id == 19
+        assert session.sink_anchor_latent == session.committed_latent
+        assert session.pending_sink is queued
+    finally:
+        session.dispose()
+
+
+def _sink_session(model, *, max_pending_chunks=2, frames=30, pooled=False):
+    packer, inputs, noise, _ = _long_request(model, [3, 2], frames=frames)
+    packer.split_first_latent = False
+    sampler = ZingH3Sampler(
+        model,
+        packer,
+        solver="few_step",
+        denoising_step_list=[1000, 500],
+        window_chunks=6,
+        sink_chunks=2,
+        joint_forward="cross_chunk",
+    )
+    acquire_storage = None
+    if pooled:
+        from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import (
+            allocate_layer_stores,
+        )
+
+        arch = sampler.generator.arch
+        device = next(sampler.generator.parameters()).device
+
+        def acquire_storage(positive, ready):
+            return allocate_layer_stores(
+                2048,
+                num_layers=len(sampler.generator.blocks),
+                local_heads=arch.num_attention_heads,
+                head_dim=arch.attention_head_dim,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+
+    session = SourceReadySession(
+        sampler,
+        inputs,
+        seed=7,
+        max_pending_chunks=max_pending_chunks,
+        max_pending_bytes=1 << 20,
+        acquire_storage=acquire_storage,
+    )
+
+    def append():
+        start = session.next_latent
+        end = start + session.next_chunk_size
+        session.append(
+            inputs.source_visual[:, :, start:end],
+            noise[:, :, start:end],
+            provenance=fixture_provenance(1, end, start, end),
+        )
+
+    return session, append
+
+
+@torch.no_grad()
+def test_auto_sink_boundary_suppresses_cross_chunk_lookahead(model):
+    """Queued chunks finish under the old policy, and no lookahead crosses a
+    refresh boundary that a later auto cycle will claim."""
+    session, append = _sink_session(model, max_pending_chunks=3)
+    try:
+        for _ in range(3):
+            append()
+        # Configuring while three blocks are owned defers the schedule until
+        # they drain; the third block starts on the cycle boundary.
+        session.configure_auto_sink(True, interval_cycles=1, method="copy", event_id=2)
+        assert session.auto_sink.after_chunk_id == 2
+        results = list(session.drain_ready())
+        assert [r.chunk.chunk_id for r in results] == [0, 1, 2]
+        assert [r.sink_refresh_count for r in results] == [0, 0, 0]
+        assert session.sink_anchor_latent == 0
+        # Only the queued block before the boundary may look ahead; the boundary
+        # block must stay unprepared, which the fallback counter records.
+        assert session.metrics["joint_fallbacks"]["source_not_ready"] == 2
+    finally:
+        session.dispose()
+
+
+@torch.no_grad()
+def test_auto_sink_holds_planning_before_the_cold_cache_exists(model):
+    """A pooled session plans the first refresh boundary before it has a cache."""
+    session, append = _sink_session(model, max_pending_chunks=3, pooled=True)
+    try:
+        session.configure_auto_sink(True, interval_cycles=1, method="copy", event_id=2)
+        assert session.cache is None
+        assert session.next_chunk_size == 3
+        append()
+        assert session.next_chunk_size == 2
+        append()
+        assert session.next_chunk_size is None
+        results = list(session.drain_ready())
+        assert [r.sink_refresh_count for r in results] == [0, 0]
+        assert session.committed_latent == 5
+        append()
+        result = list(session.drain_ready())[0]
+        assert result.sink_refresh_count == 1
+        assert session.sink_anchor_latent == 5
+    finally:
+        session.dispose()
+
+
 def test_prompt_switch_rejects_unsupported_prefix_geometry(model):
     packer, inputs, _, _ = _long_request(model, 5, frames=5)
     sampler = ZingH3Sampler(model, packer, sigma_points=2)

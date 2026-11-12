@@ -5,6 +5,7 @@ Initial noise must be supplied from a frozen native run. Generating it online
 would change channel-major RNG assignment and needs a separate model contract.
 """
 
+import os
 from collections import deque
 from copy import copy
 from dataclasses import dataclass, replace
@@ -25,6 +26,14 @@ from .realtime_sampling import ZingH3RealtimeSampler, ZingH3RealtimeSamplingStat
 
 def _bytes(tensor):
     return 0 if tensor is None else tensor.numel() * tensor.element_size()
+
+
+# One [3, 2] native epoch. Periodic sink refreshes are anchored to these
+# boundaries, so the rebuilt history always starts at a clean cycle.
+_SINK_CYCLE_LATENTS = 5
+_SINK_METHODS = ("copy", "rebuild")
+AUTO_SINK_CYCLES_ENV = "SGLANG_ZING_AUTO_SINK_CYCLES"
+AUTO_SINK_METHOD_ENV = "SGLANG_ZING_AUTO_SINK_METHOD"
 
 
 @dataclass(frozen=True)
@@ -55,6 +64,33 @@ class ChunkResult:
     sink_event_id: int | str | None = None
     sink_chunks: int = 0
     sink_chunk_ids: tuple[int, ...] = ()
+    sink_config_event_id: int | str | None = None
+    sink_refresh_count: int = 0
+    sink_refresh_method: str | None = None
+    sink_refresh_latent: int | None = None
+
+
+@dataclass(frozen=True)
+class AutoSinkConfig:
+    """Periodic refresh schedule; a wire event supersedes the env default."""
+
+    enabled: bool = False
+    interval_cycles: int | None = None
+    method: str = "copy"
+    event_id: int | str | None = None
+    # Chunks already owned when the schedule was configured finish unrefreshed.
+    after_chunk_id: int = -1
+
+
+@dataclass(frozen=True)
+class PendingSinkIntent:
+    """One manual or automatic sink change waiting for a later chunk boundary."""
+
+    operation: str
+    method: str
+    event_id: int | str | None
+    after_chunk_id: int
+    is_auto: bool = False
 
 
 class PromptSnapshot(NamedTuple):
@@ -180,6 +216,14 @@ class SourceReadySession:
         self.pending_prompt = None
         self.pending_sink = None
         self.sink_event_id = None
+        self.auto_sink = AutoSinkConfig()
+        self.sink_config_event_id = None
+        self.sink_anchor_latent = 0
+        self.sink_refresh_count = 0
+        self.sink_refresh_method = None
+        self.sink_refresh_latent = None
+        # (latent_start, latent_end, clean source, clean target) for sink rebuild.
+        self.recent_paired = None
         self.epoch_chunk_base = 0
         self.applied_prompt = None
         self.restore_initial_prefix = None
@@ -211,6 +255,8 @@ class SourceReadySession:
             )
 
         self.metrics = sampler.last_run_metrics
+        if self._supports_dynamic_sink():
+            self._apply_env_auto_sink()
 
     def _new_cache(self, storage):
         sampler = self.sampler
@@ -272,54 +318,146 @@ class SourceReadySession:
         self.pending_prompt = None
         self.pending_prompt_source_frame = None
 
-    def update_sink(self, operation, event_id):
-        """Latest-wins intent; previously queued chunks finish under the old policy."""
-        if self.closed or self.draining:
-            raise ValueError("The source-ready session is closed or draining")
+    def _supports_dynamic_sink(self):
         policy = self.sampler.window_policy
-        if (
-            operation not in {"off", "refresh"}
-            or self.plan.lengths != (3, 2)
-            or self.plan.split_first_latent
-            or policy.window_chunks is None
-            or policy.window_chunks < 4
-            or policy.sink_chunks not in (0, 2)
-            or self.audio_enabled
-        ):
+        return (
+            self.plan.lengths == (3, 2)
+            and not self.plan.split_first_latent
+            and policy.window_chunks is not None
+            and policy.window_chunks >= 4
+            and policy.sink_chunks in (0, 2)
+            and not self.audio_enabled
+        )
+
+    def _require_dynamic_sink(self):
+        if not self._supports_dynamic_sink():
             raise ValueError(
                 "Dynamic sinks require unsplit [3,2] video, sink 0/2 and a window of at least four chunks"
             )
+
+    def update_sink(self, operation, event_id, method="copy"):
+        """Latest-wins intent; previously queued chunks finish under the old policy."""
+        if self.closed or self.draining:
+            raise ValueError("The source-ready session is closed or draining")
+        if operation not in {"off", "refresh"} or method not in _SINK_METHODS:
+            raise ValueError(
+                "Sink updates require an off or refresh operation with a copy or rebuild method"
+            )
+        if method == "rebuild" and operation != "refresh":
+            raise ValueError("Sink rebuild only applies to a refresh")
+        self._require_dynamic_sink()
         after = (
             self.pending[-1].chunk.chunk_id
             if self.pending
             else self.committed_chunk_id - 1
         )
-        self.pending_sink = (operation, event_id, after)
+        self.pending_sink = PendingSinkIntent(operation, method, event_id, after)
 
-    def _sink_ready(self, ready):
+    def configure_auto_sink(
+        self, enabled, *, interval_cycles=None, method="copy", event_id=None
+    ):
+        """Replace the periodic schedule and restart its cycle at this boundary."""
+        if self.closed or self.draining:
+            raise ValueError("The source-ready session is closed or draining")
+        if type(enabled) is not bool or method not in _SINK_METHODS:
+            raise ValueError(
+                "Auto sink requires a boolean switch and a copy or rebuild method"
+            )
+        if enabled:
+            if type(interval_cycles) is not int or interval_cycles < 1:
+                raise ValueError("Auto sink requires a positive cycle interval")
+        elif interval_cycles is not None:
+            raise ValueError("Disabling auto sink must not carry a cycle interval")
+        self._require_dynamic_sink()
+        after = (
+            self.pending[-1].chunk.chunk_id
+            if self.pending
+            else self.committed_chunk_id - 1
+        )
+        self.auto_sink = AutoSinkConfig(
+            enabled=enabled,
+            interval_cycles=interval_cycles if enabled else None,
+            method=method,
+            event_id=event_id,
+            after_chunk_id=after,
+        )
+        self.sink_config_event_id = event_id
+        self.sink_anchor_latent = self.committed_latent
+
+    def _apply_env_auto_sink(self):
+        """Seed the session default so a client can enable refresh out of band."""
+        method = (os.environ.get(AUTO_SINK_METHOD_ENV) or "copy").strip() or "copy"
+        if method not in _SINK_METHODS:
+            raise ValueError("Auto sink method must be copy or rebuild")
+        cycles = (os.environ.get(AUTO_SINK_CYCLES_ENV) or "").strip()
+        if cycles in {"", "0"}:
+            return
+        if not cycles.isdigit() or int(cycles) < 1:
+            raise ValueError("Auto sink cycles must be a positive integer")
+        self.auto_sink = AutoSinkConfig(
+            enabled=True,
+            interval_cycles=int(cycles),
+            method=method,
+            event_id=None,
+        )
+        self.sink_anchor_latent = 0
+
+    @property
+    def _auto_sink_due(self):
+        # S0 pauses the schedule: without a two-chunk sink there is no anchor
+        # to move, and a cold session has no cache yet.
+        interval = self.auto_sink.interval_cycles
         return (
-            self.pending_sink is not None
-            and ready.chunk.chunk_id > self.pending_sink[2]
+            self.auto_sink.enabled
+            and interval is not None
+            and self.cache is not None
+            and self.cache.window_policy.sink_chunks == 2
+            and self.committed_latent >= _SINK_CYCLE_LATENTS
+            and self.committed_chunk_id > self.auto_sink.after_chunk_id
+            and self.committed_latent - self.sink_anchor_latent
+            >= _SINK_CYCLE_LATENTS * interval
         )
 
+    def _sink_intent(self, ready):
+        """Sink change applied at this chunk's start, or None to keep the window."""
+        pending = self.pending_sink
+        if pending is not None and ready.chunk.chunk_id > pending.after_chunk_id:
+            # Rebuild waits for a full cycle boundary; copy and off apply here.
+            return None if pending.method == "rebuild" else pending
+        if (
+            self._auto_sink_due
+            and self.auto_sink.method == "copy"
+            and ready.chunk.start % _SINK_CYCLE_LATENTS == 0
+        ):
+            return PendingSinkIntent(
+                "refresh", "copy", None, ready.chunk.chunk_id - 1, is_auto=True
+            )
+        return None
+
     def _apply_pending_sink(self, ready, current):
-        if not self._sink_ready(ready):
+        intent = self._sink_intent(ready)
+        if intent is None:
             return
         sampler, cache = self.sampler, self.cache
         sampler._agree_sp_boundary(
             cache,
             ready.model_chunk.target_block,
             phase="sink_update",
-            ready_route=self.pending_sink,
+            ready_route=intent,
         )
         if cache.active is not None:
             # The latest delivered picture may still lack its clean final KV.
             final = sampler._deferred_final(cache, self.recent_visual, current.positive)
             sampler._forward(final, cache, "final")
-        operation, event_id, _ = self.pending_sink
-        cache.update_sink(operation, current_id=ready.model_chunk.chunk_id)
-        self.sink_event_id = event_id
-        self.pending_sink = None
+        cache.update_sink(intent.operation, current_id=ready.model_chunk.chunk_id)
+        if not intent.is_auto:
+            self.sink_event_id = intent.event_id
+            self.pending_sink = None
+        if intent.operation == "refresh":
+            self.sink_anchor_latent = ready.chunk.start
+            self.sink_refresh_count += 1
+            self.sink_refresh_method = "copy"
+            self.sink_refresh_latent = ready.chunk.start
 
     @property
     def prompt_switch_ready(self):
@@ -330,11 +468,161 @@ class SourceReadySession:
             and self.committed_latent % 5 == 0
         )
 
+    @property
+    def sink_rebuild_ready(self):
+        """A paired five-latent clean window ending exactly at this boundary."""
+        paired = self.recent_paired
+        window = self.prompt_switch_prefix_latent_frames
+        return (
+            self.cache is not None
+            and self.cache.prefix is not None
+            and self.applied_prompt is self.prompt
+            and paired is not None
+            and paired[0] == self.committed_latent - window
+            and paired[1] == self.committed_latent
+            and paired[2].shape[2] == window
+            and paired[3].shape[2] == window
+            and self.committed_latent >= window
+            and self.committed_latent % window == 0
+        )
+
+    def _sink_rebuild_intent(self):
+        """Rebuild intent that may run once the next chunk starts on a cycle boundary."""
+        intent = self.pending_sink
+        if intent is not None:
+            if (
+                intent.method == "rebuild"
+                and self.committed_chunk_id > intent.after_chunk_id
+            ):
+                return intent
+            return None
+        if self._auto_sink_due and self.auto_sink.method == "rebuild":
+            return PendingSinkIntent(
+                "refresh", "rebuild", None, self.committed_chunk_id, is_auto=True
+            )
+        return None
+
+    def _remember_paired(self, ready, visual):
+        """Keep the tail clean source+target latents a sink rebuild replays."""
+        if not self._supports_dynamic_sink() or ready.source is None:
+            self.recent_paired = None
+            return
+        count = ready.chunk.end - ready.chunk.start
+        source = ready.source.detach().float().clone()
+        target = visual.detach().float().clone()
+        if source.shape[2] != count or target.shape[2] != count:
+            self.recent_paired = None
+            return
+        previous = self.recent_paired
+        if previous is None or previous[1] != ready.chunk.start:
+            combined_source, combined_target = source, target
+        else:
+            combined_source = torch.cat((previous[2], source), dim=2)
+            combined_target = torch.cat((previous[3], target), dim=2)
+        keep = min(self.prompt_switch_prefix_latent_frames, combined_source.shape[2])
+        self.recent_paired = (
+            ready.chunk.end - keep,
+            ready.chunk.end,
+            combined_source[:, :, -keep:].clone(),
+            combined_target[:, :, -keep:].clone(),
+        )
+
+    def _activate_pending_sink_rebuild(self, ready):
+        """Replay the paired window as local epoch blocks 1..4 before packing."""
+        window = self.prompt_switch_prefix_latent_frames
+        if (
+            ready.chunk.start % _SINK_CYCLE_LATENTS
+            or ready.model_chunk.chunk_id != self.prompt_prefix_chunk_count
+            or ready.model_chunk.start != window
+            or not self.sink_rebuild_ready
+        ):
+            return
+        # A prompt switch already replayed its own epoch and absorbed the intent.
+        intent = self._sink_rebuild_intent()
+        if intent is None:
+            return
+        error = None
+        try:
+            _, _, source_prefix, target_prefix = self.recent_paired
+            layout, _ = self.sampler.processor.pack_sink_rebuild_prefix(
+                self.inputs, self.prompt.condition, source_prefix, target_prefix
+            )
+            host = self.sampler._layout_index(layout).host
+            prefix = self.cache.validate_prefix_reset()
+            block0_pos = host["position_ids"][host["block_idx"] == 0]
+            if (
+                prefix is None
+                or prefix.host_positions is None
+                or not torch.equal(prefix.host_positions, block0_pos)
+            ):
+                raise ValueError(
+                    "Resident prefix geometry differs from sink rebuild layout"
+                )
+        except Exception as exc:
+            error = exc
+        self.sampler._agree_sp_boundary(
+            self.cache,
+            0,
+            phase="sink_rebuild_prepare",
+            ready_route=(intent.is_auto, intent.event_id),
+            precheck_error=error is not None,
+            local_error=error,
+        )
+        if error is not None:
+            raise error
+        policy = self.cache.window_policy
+        self.cache.window_policy = replace(
+            policy, sink_chunks=2, sink_start=0, min_chunk_id=0, active_sinks=None
+        )
+        origin, latent_end = self.sampler.rebuild_sink_prefix(
+            self.inputs,
+            self.prompt.condition,
+            source_prefix,
+            target_prefix,
+            self.cache,
+        )
+        if latent_end != window:
+            raise ValueError("Sink rebuild prefix does not meet the next model block")
+        self.media_origin = origin
+        self.model_chunk_id = self.prompt_prefix_chunk_count
+        self.epoch_chunk_base = self.committed_chunk_id - self.prompt_prefix_chunk_count
+        self._pending_prefix = None
+        self._cached_prefix_ready = False
+        if not intent.is_auto:
+            self.sink_event_id = intent.event_id
+            self.pending_sink = None
+        self.sink_anchor_latent = ready.chunk.start
+        self.sink_refresh_count += 1
+        self.sink_refresh_method = "rebuild"
+        self.sink_refresh_latent = ready.chunk.start
+
+    def _auto_sink_blocks(self, tail_latent):
+        """True while queued work already reaches the next auto refresh threshold."""
+        interval = self.auto_sink.interval_cycles
+        if not self.auto_sink.enabled or interval is None:
+            return False
+        # A cold session has no cache yet; its first block still runs under the
+        # deployment policy, which is what the refresh will later restore.
+        sink_chunks = (
+            self.sampler.window_policy.sink_chunks
+            if self.cache is None
+            else self.cache.window_policy.sink_chunks
+        )
+        return (
+            sink_chunks == 2
+            and tail_latent >= _SINK_CYCLE_LATENTS
+            and tail_latent - self.sink_anchor_latent >= _SINK_CYCLE_LATENTS * interval
+        )
+
     def _next_model_chunk(self):
         boundary = getattr(self, "pending_prompt_source_frame", None) or 0
         if self.pending:
             # Drain queued work before planning the first block of a new epoch.
-            if self.pending_prompt is not None or self.pending_sink is not None:
+            if (
+                self.pending_prompt is not None
+                or self.pending_sink is not None
+                or self._auto_sink_blocks(self.pending[-1].chunk.end)
+            ):
                 return None
             previous = self.pending[-1].model_chunk
             return self.plan.chunk(previous.chunk_id + 1)
@@ -343,6 +631,10 @@ class SourceReadySession:
             and self.prompt_switch_ready
             and self.committed_pixel >= boundary
         ):
+            return self.plan.chunk(self.prompt_prefix_chunk_count)
+        # A due rebuild replans this cycle as the epoch chunk(2); a half cycle
+        # keeps producing native chunks until the pair window closes.
+        if self._sink_rebuild_intent() is not None and self.sink_rebuild_ready:
             return self.plan.chunk(self.prompt_prefix_chunk_count)
         return self.plan.chunk(self.model_chunk_id)
 
@@ -416,10 +708,11 @@ class SourceReadySession:
         count = policy.sink_chunks
         if (
             self.pending_sink is not None
-            and self.committed_chunk_id > self.pending_sink[2]
+            and self.committed_chunk_id > self.pending_sink.after_chunk_id
         ):
-            operation, self.sink_event_id, _ = self.pending_sink
-            count = 2 if operation == "refresh" else 0
+            intent = self.pending_sink
+            self.sink_event_id = intent.event_id
+            count = 2 if intent.operation == "refresh" else 0
             self.pending_sink = None
         # Chunk identities restart with the prompt epoch; only the on/off state survives.
         self.cache.window_policy = replace(
@@ -533,6 +826,9 @@ class SourceReadySession:
         self.media_origin = origin
         self.model_chunk_id = self.prompt_prefix_chunk_count
         self.epoch_chunk_base = self.committed_chunk_id - self.prompt_prefix_chunk_count
+        # The new epoch's first five latents are a fresh refresh anchor, so an
+        # auto refresh already due at this boundary is absorbed by the rebuild.
+        self.sink_anchor_latent = self.committed_latent
 
     def _load_prefix(self, inputs, prompt, prefix, *, restore_prefix=None):
         """Consume an external writer's prefix at a quiescent session boundary.
@@ -897,7 +1193,7 @@ class SourceReadySession:
                 self.cache is not None and self.cache.active is not None,
                 self.prompt_joint,
                 self.prefix_loader is not None,
-                self.pending_sink,
+                (self.pending_sink, self.auto_sink, self._auto_sink_due),
             ),
         )
 
@@ -1148,8 +1444,13 @@ class SourceReadySession:
                     ),
                 )
             ),
+            self.sink_config_event_id,
+            self.sink_refresh_count,
+            self.sink_refresh_method,
+            self.sink_refresh_latent,
         )
         self._remember_visual(current.visual)
+        self._remember_paired(ready, current.visual)
         self.pending.popleft()
         self.pending_bytes -= ready.nbytes
         self.pending_spans -= (
@@ -1169,6 +1470,7 @@ class SourceReadySession:
     def _step(self):
         ready = self.pending[0]
         self._activate_pending_prompt(ready, defer_prefix=True)
+        self._activate_pending_sink_rebuild(ready)
         prompt = self.prompt
         current, origin = self._prepare(ready, prompt, self.media_origin)
         with self.rng.random_stream(self.sampler.device, self.seed):
@@ -1219,6 +1521,7 @@ class SourceReadySession:
                 self._drain_continuation = None
             else:
                 self._activate_pending_prompt(self.pending[0], defer_prefix=True)
+                self._activate_pending_sink_rebuild(self.pending[0])
                 prompt = self.prompt
                 current, origin = self._prepare(
                     self.pending[0], prompt, self.media_origin
@@ -1235,6 +1538,7 @@ class SourceReadySession:
                     break
                 if current is None:
                     self._activate_pending_prompt(self.pending[0], defer_prefix=True)
+                    self._activate_pending_sink_rebuild(self.pending[0])
                     prompt, origin = self.prompt, self.media_origin
                     current, _ = self._prepare(self.pending[0], prompt, origin)
                 ready = self.pending[0]
@@ -1324,6 +1628,7 @@ class SourceReadySession:
                             and len(self.pending) > 1
                             and self.pending_prompt is None
                             and self.pending_sink is None
+                            and not self._auto_sink_blocks(ready.chunk.end)
                         ):
                             next_state, _ = self._prepare(
                                 self.pending[1], prompt, origin, previous=current
@@ -1348,6 +1653,7 @@ class SourceReadySession:
                             and len(self.pending) > 1
                             and self.pending_prompt is None
                             and self.pending_sink is None
+                            and not self._auto_sink_blocks(ready.chunk.end)
                         )
                         video, sound = sampler._sample_block(
                             current.visual,
@@ -1499,6 +1805,7 @@ class SourceReadySession:
             self.sampler.processor._prefix_memo = None
         self.inputs = self.prompt = self.pending_prompt = self.applied_prompt = None
         self.pending_sink = None
+        self.recent_paired = None
         self.recent_visual = self.sampler = None
         self.prefix_loader = None
         self.restore_initial_prefix = self.capture_initial_prefix = None

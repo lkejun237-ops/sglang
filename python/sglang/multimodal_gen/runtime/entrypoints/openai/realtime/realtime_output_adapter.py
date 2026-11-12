@@ -58,6 +58,10 @@ class RealtimeFrameBatchHeader(TypedDict, total=False):
     sink_event_id: int | str | None
     sink_chunks: int
     sink_chunk_ids: list[int]
+    sink_config_event_id: int | str | None
+    sink_refresh_count: int
+    sink_refresh_method: str | None
+    sink_refresh_latent: int | None
     frame_batch_index: int
     num_frame_batches: int
     is_final_frame_batch: bool
@@ -727,7 +731,15 @@ class RawRGBRealtimeOutputAdapter:
                 if block_prompt_version is not None:
                     header["prompt_version"] = block_prompt_version
                 if source_block is not None:
-                    for key in ("sink_event_id", "sink_chunks", "sink_chunk_ids"):
+                    for key in (
+                        "sink_event_id",
+                        "sink_chunks",
+                        "sink_chunk_ids",
+                        "sink_config_event_id",
+                        "sink_refresh_count",
+                        "sink_refresh_method",
+                        "sink_refresh_latent",
+                    ):
                         if key in source_block:
                             header[key] = source_block[key]
                 if trace_id:

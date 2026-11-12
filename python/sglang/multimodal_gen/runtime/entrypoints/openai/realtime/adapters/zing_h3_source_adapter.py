@@ -174,6 +174,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         self._inflight_reference_uploads = []
         self._pending_prompt_command = self._selected_prompt_command = None
         self._pending_sink_command = None
+        self._pending_sink_auto_command = None
         self.prompt_prefetch = None
         self.conditioning_prefetch_endpoint = None
         self.initial_prompt = request.prompt
@@ -655,6 +656,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             "max_pending_source_bytes": limits.pending_bytes,
             "max_references": self.max_references,
             "sink_updates": self.sink_updates,
+            "auto_sink_updates": self.sink_updates,
             "input_budget": self.input_budget.metadata(),
             "prompt_reference_updates": self.reference_updates,
             "max_reference_bytes": reference_limits.reference_bytes,
@@ -850,6 +852,54 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             parts.append(payload["data"])
         await asyncio.wait_for(self.admission_socket.send_multipart(parts), timeout=120)
 
+    def _sink_command(self, kind, payload, event_id):
+        """Normalize one sink control event without touching the stream cursor."""
+        if kind == "sink.off":
+            require(payload == {}, "Please send an empty sink off payload.")
+            return dict(operation="off", event_id=event_id)
+        if kind == "sink.refresh":
+            # An empty payload keeps the original command shape; consumers default
+            # the missing method to copy.
+            if payload == {}:
+                return dict(operation="refresh", event_id=event_id)
+            require(
+                isinstance(payload, dict)
+                and set(payload) == {"method"}
+                and payload["method"] in {"copy", "rebuild"},
+                "Please send a copy or rebuild sink method.",
+            )
+            return dict(
+                operation="refresh", method=payload["method"], event_id=event_id
+            )
+        require(isinstance(payload, dict), "Please send a valid auto sink event.")
+        enabled = payload.get("enabled")
+        require(type(enabled) is bool, "Auto sink requires a boolean switch.")
+        if not enabled:
+            require(
+                payload == {"enabled": False},
+                "Please only disable the auto sink schedule.",
+            )
+            return dict(
+                enabled=False, interval_cycles=None, method="copy", event_id=event_id
+            )
+        require(
+            set(payload) <= {"enabled", "interval_cycles", "method"},
+            "Auto sink does not accept extra fields.",
+        )
+        interval = payload.get("interval_cycles")
+        method = payload.get("method", "copy")
+        require(
+            type(interval) is int and interval >= 1,
+            "Auto sink requires a positive cycle interval.",
+        )
+        require(
+            method in {"copy", "rebuild"},
+            "Auto sink requires a copy or rebuild method.",
+        )
+        return dict(
+            enabled=True, interval_cycles=interval, method=method, event_id=event_id
+        )
+
     async def ingest_wire_event(self, ws, session, data, message_bytes):
         check(
             message_bytes <= self.max_message_bytes,
@@ -966,15 +1016,18 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             await self._ingest_ordered_prompt_event(ws, session, event_id, payload)
         elif kind == "prompt" and not self.ordered_prompts:
             await self._ingest_prompt_event(ws, session, data, event_id, payload)
-        elif kind in {"sink.off", "sink.refresh"}:
+        elif kind in {"sink.off", "sink.refresh", "sink.auto"}:
             require(self.sink_updates, "This deployment does not support sink updates.")
-            require(payload == {}, "Please send an empty sink update payload.")
+            # Validate the whole payload before the cursor moves, so a rejected
+            # event leaves event_id reusable for a corrected retry.
+            command = self._sink_command(kind, payload, event_id)
             self.ledger.validate_event_id(event_id)
             require(not self.ledger.ended, "The source stream has ended.")
             self.ledger.event_id = event_id
-            self._pending_sink_command = dict(
-                operation=kind.split(".")[1], event_id=event_id
-            )
+            if kind == "sink.auto":
+                self._pending_sink_auto_command = command
+            else:
+                self._pending_sink_command = command
             self.available.set()
             await ws.send_bytes(
                 msgspec.msgpack.encode(
@@ -1258,7 +1311,10 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
 
     def has_control_work(self):
         return self._condition_control_ready() or (
-            self._pending_sink_command is not None
+            (
+                self._pending_sink_command is not None
+                or self._pending_sink_auto_command is not None
+            )
             and self.dispatched_source_frames > 0
             and not self.end_dispatched
         )
@@ -1408,6 +1464,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                 if (
                     self._pending_prompt_command is not None
                     or getattr(self, "_pending_sink_command", None) is not None
+                    or getattr(self, "_pending_sink_auto_command", None) is not None
                 ):
                     reason = "prompt"
                     break
@@ -1697,6 +1754,11 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             )
             self.startup_command = None
             return batch
+        # Auto applies before the manual command so a same-batch refresh is
+        # anchored to the schedule it just switched to.
+        if getattr(self, "_pending_sink_auto_command", None) is not None:
+            batch.extra["zing_sink_auto"] = self._pending_sink_auto_command
+            self._pending_sink_auto_command = None
         if getattr(self, "_pending_sink_command", None) is not None:
             batch.extra["zing_sink_update"] = self._pending_sink_command
             self._pending_sink_command = None
@@ -1931,6 +1993,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             self.available.set()
             self._pending_prompt_command = self._selected_prompt_command = None
             self._pending_sink_command = None
+            self._pending_sink_auto_command = None
             self.reference_items.clear()
             self.reference_ids.clear()
             self.source_preview_sha256 = None

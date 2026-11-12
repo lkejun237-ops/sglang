@@ -1164,15 +1164,34 @@ class ZingSourceStreamState(BaseRealtimeState):
                     generation_id=batch.realtime_generation_id,
                 )
             self._fill_block0_after_output()
+            sink_auto = batch.extra.get("zing_sink_auto")
+            if sink_auto is not None:
+                if self.component_capture is not None:
+                    raise ValueError(
+                        "Component capture does not support dynamic sink updates"
+                    )
+                self.sampler.configure_auto_sink(
+                    sink_auto["enabled"],
+                    interval_cycles=sink_auto["interval_cycles"],
+                    method=sink_auto["method"],
+                    event_id=sink_auto["event_id"],
+                )
             sink_command = batch.extra.get("zing_sink_update")
             if sink_command is not None:
                 if self.component_capture is not None:
                     raise ValueError(
                         "Component capture does not support dynamic sink updates"
                     )
-                self.sampler.update_sink(
-                    sink_command["operation"], sink_command["event_id"]
-                )
+                if "method" in sink_command:
+                    self.sampler.update_sink(
+                        sink_command["operation"],
+                        sink_command["event_id"],
+                        sink_command["method"],
+                    )
+                else:
+                    self.sampler.update_sink(
+                        sink_command["operation"], sink_command["event_id"]
+                    )
             notice = None
             condition_ready = None
             applied = getattr(self.sampler, "applied_prompt", None)
@@ -1759,6 +1778,12 @@ class ZingSourceStreamState(BaseRealtimeState):
                     "sink_event_id": getattr(result, "sink_event_id", None),
                     "sink_chunks": getattr(result, "sink_chunks", 0),
                     "sink_chunk_ids": getattr(result, "sink_chunk_ids", ()),
+                    "sink_config_event_id": getattr(
+                        result, "sink_config_event_id", None
+                    ),
+                    "sink_refresh_count": getattr(result, "sink_refresh_count", 0),
+                    "sink_refresh_method": getattr(result, "sink_refresh_method", None),
+                    "sink_refresh_latent": getattr(result, "sink_refresh_latent", None),
                     "frame_end": result.provenance.pixels.end,
                 }
             )
@@ -1915,6 +1940,18 @@ class ZingSourceStreamState(BaseRealtimeState):
                             "sink_event_id": getattr(result, "sink_event_id", None),
                             "sink_chunks": getattr(result, "sink_chunks", 0),
                             "sink_chunk_ids": getattr(result, "sink_chunk_ids", ()),
+                            "sink_config_event_id": getattr(
+                                result, "sink_config_event_id", None
+                            ),
+                            "sink_refresh_count": getattr(
+                                result, "sink_refresh_count", 0
+                            ),
+                            "sink_refresh_method": getattr(
+                                result, "sink_refresh_method", None
+                            ),
+                            "sink_refresh_latent": getattr(
+                                result, "sink_refresh_latent", None
+                            ),
                             "frame_end": result.provenance.pixels.end,
                         }
                     )

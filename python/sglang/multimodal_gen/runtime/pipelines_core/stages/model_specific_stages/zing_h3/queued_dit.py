@@ -52,6 +52,7 @@ class QueuedDiTSession:
         self.complete = self.in_flight = False
         self.last_event_id = None
         self.last_sink_event_id = None
+        self.last_sink_auto_event_id = None
         self.state = None
         self.conditioning_notice = None
         self.condition_ready = None
@@ -97,6 +98,11 @@ class QueuedDiTSession:
                 raise ValueError(
                     "Sink update requires initialized conditioning and a valid operation"
                 )
+            method = message.get("method", "copy")
+            if method not in {"copy", "rebuild"} or (
+                message["operation"] == "off" and method != "copy"
+            ):
+                raise ValueError("Sink updates require a copy or rebuild method")
             event_id = message.get("event_id")
             if (
                 type(event_id) is not int
@@ -115,6 +121,37 @@ class QueuedDiTSession:
             # order. Wire admission validates global order; each pending kind
             # independently supersedes only its own older events here.
             self.last_sink_event_id = event_id
+            self.control_tasks += 1
+        elif kind == "sink.auto":
+            if not self.initial_received:
+                raise ValueError("Auto sink requires initialized conditioning")
+            enabled = message.get("enabled")
+            method = message.get("method", "copy")
+            interval = message.get("interval_cycles")
+            if type(enabled) is not bool or method not in {"copy", "rebuild"}:
+                raise ValueError(
+                    "Auto sink requires a boolean switch and a copy or rebuild method"
+                )
+            if enabled:
+                if type(interval) is not int or interval < 1:
+                    raise ValueError("Auto sink requires a positive cycle interval")
+            elif interval is not None:
+                raise ValueError("Disabling auto sink must not carry a cycle interval")
+            event_id = message.get("event_id")
+            if (
+                type(event_id) is not int
+                or event_id < 1
+                or (
+                    self.last_sink_auto_event_id is not None
+                    and event_id <= self.last_sink_auto_event_id
+                )
+            ):
+                raise ValueError("DiT control events must be strictly increasing")
+            while self.control_tasks >= self.max_control_tasks:
+                await asyncio.sleep(self.queue.poll_interval_s)
+                self._open()
+            task = dict(message)
+            self.last_sink_auto_event_id = event_id
             self.control_tasks += 1
         elif kind in {"conditioning", "conditioning.cancel"}:
             cancelled = kind == "conditioning.cancel"
@@ -288,7 +325,12 @@ class QueuedDiTSession:
     def _arrange(self, message):
         if message is not None:
             kind = message["type"]
-            if kind in {"conditioning", "conditioning.cancel", "sink.update"}:
+            if kind in {
+                "conditioning",
+                "conditioning.cancel",
+                "sink.update",
+                "sink.auto",
+            }:
                 return [message]
             if kind == "source.end":
                 self.bridge.finish()
@@ -316,7 +358,24 @@ class QueuedDiTSession:
         try:
             if task["type"] == "sink.update":
                 try:
-                    self.state.update_sink(task["operation"], task["event_id"])
+                    if "method" in task:
+                        self.state.update_sink(
+                            task["operation"],
+                            task["event_id"],
+                            task["method"],
+                        )
+                    else:
+                        self.state.update_sink(task["operation"], task["event_id"])
+                finally:
+                    self.control_tasks -= 1
+            elif task["type"] == "sink.auto":
+                try:
+                    self.state.configure_auto_sink(
+                        task["enabled"],
+                        interval_cycles=task.get("interval_cycles"),
+                        method=task.get("method", "copy"),
+                        event_id=task["event_id"],
+                    )
                 finally:
                     self.control_tasks -= 1
             elif task["type"] in {"conditioning", "conditioning.cancel"}:
