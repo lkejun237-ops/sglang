@@ -188,7 +188,7 @@ def test_spec_freezes_nccl_and_host_ports(spec, tmp_path):
         ("workspace_id", "other"),
     ],
 )
-def test_production_targets_rejected(spec, tmp_path, field, value):
+def test_pinned_copy_target_identity_cannot_drift(spec, tmp_path, field, value):
     spec["target"][field] = value
     with pytest.raises(ValueError, match="pinned"):
         orch.load_spec(write_spec(tmp_path, spec))
@@ -197,16 +197,75 @@ def test_production_targets_rejected(spec, tmp_path, field, value):
 @pytest.mark.parametrize(
     "url,role",
     [
-        ("http://10.0.0.145:33000", "dit"),
         ("http://10.0.1.33:28110", "encoder"),
-        ("http://10.0.0.121:28210", "decoder"),
+        ("http://10.0.0.121:33000", "dit"),
         ("http://127.0.0.1:33000", "dit"),
+        ("http://10.0.0.122", "dit"),
+        ("http://user:password@10.0.0.122:33000", "dit"),
         ("http://10.0.0.121:31000/path", "encoder"),
     ],
 )
 def test_endpoint_guard(url, role):
     with pytest.raises(ValueError):
         orch.validate_endpoint(url, role)
+
+
+@pytest.mark.parametrize(
+    "environment", ["prod", "production", "prod-shanghai", "prod-thailand"]
+)
+@pytest.mark.parametrize("h100_ip", ["10.0.0.145", "10.0.1.31", "10.0.1.33"])
+def test_production_spec_accepts_environment_pool_nodes_and_ports(
+    spec, tmp_path, environment, h100_ip
+):
+    spec["target"].update(
+        environment=environment,
+        pool_id="prod-model-pool",
+        h100_ip=h100_ip,
+        coordinator_url="http://10.0.1.31:28110",
+        room_url="http://10.0.1.33:28210",
+        wtp_url="https://prod.example.com",
+    )
+    spec["roles"]["encoder"]["ports"] = {"http_port": 28110}
+    spec["roles"]["decoder"]["ports"] = {"http_port": 28210}
+    checked = orch.load_spec(write_spec(tmp_path, spec))
+    assert checked["target"]["environment"] == environment
+    assert checked["target"]["pool_id"] == "prod-model-pool"
+    orch.validate_endpoint(
+        f"http://{h100_ip}:28110", "encoder", target=checked["target"]
+    )
+    orch.validate_endpoint(
+        f"http://{h100_ip}:28210", "decoder", target=checked["target"]
+    )
+
+
+@pytest.mark.parametrize("host", ["10.0.0.145", "10.0.1.31", "10.0.1.33"])
+@pytest.mark.parametrize("port", [28110, 28210])
+def test_pai_endpoint_accepts_production_addresses_and_ports(host, port):
+    orch.validate_endpoint(f"http://{host}:{port}", "dit")
+
+
+def test_production_reused_service_and_saved_state_are_accepted(state, tmp_path):
+    state["target"].update(
+        environment="prod-shanghai", pool_id="prod-model-pool", h100_ip="10.0.1.33"
+    )
+    state["spec"]["target"] = copy.deepcopy(state["target"])
+    state["spec"]["roles"]["encoder"] = {
+        "mode": "reuse",
+        "http": "http://10.0.1.33:28110",
+        "worker_id": "production-encoder",
+    }
+    state["spec"] = orch.validate_spec(state["spec"])
+    state["resources"]["encoder"] = orch.reused_resource(
+        state["run_id"],
+        state["spec"]["model_id"],
+        "encoder",
+        state["spec"]["existing_services"]["encoder"],
+    )
+    state_path = tmp_path / "production-state.json"
+    orch.save(state_path, state)
+    restored = orch.load_state(state_path)
+    assert restored["target"]["environment"] == "prod-shanghai"
+    assert orch.owned_roles(restored["spec"]) == ("dit", "decoder")
 
 
 @pytest.mark.parametrize(
@@ -835,7 +894,7 @@ def test_pool_verification_requires_exact_owned_manifest_not_aggregate_capacity(
         orch.verify_pool(state, tmp_path)
 
 
-def test_dit_hostname_cannot_bypass_production_guard():
+def test_role_endpoint_requires_ip_and_disallows_redirects():
     with pytest.raises(ValueError):
         orch.validate_endpoint("http://10.evil.example:33000", "dit")
     with pytest.raises(ValueError):

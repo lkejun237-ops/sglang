@@ -1,6 +1,6 @@
 """SGLang multi-role environment orchestration. Planning is offline; mutations require --execute.
 
-No local kube context, SSH aliases, production targets, or automatic create retries.
+No local kube context, SSH aliases, or automatic create retries.
 State files are private operator evidence, not a source of arbitrary shell commands.
 """
 
@@ -32,9 +32,6 @@ import launch
 from source import digest, prepare, validate_manifest
 
 ROLES = ("encoder", "dit", "decoder")
-FORBIDDEN_ENVIRONMENTS = {"prod", "production", "prod-shanghai", "prod-thailand"}
-FORBIDDEN_IPS = {"10.0.0.145", "10.0.1.31", "10.0.1.33"}
-FORBIDDEN_PORTS = {28110, 28210}
 TARGET = {
     "environment": "test-shanghai-copy",
     "region": "cn-shanghai",
@@ -97,14 +94,6 @@ def check_target(value):
     env_name = str(value.get("environment", "")).strip()
     if not env_name:
         raise ValueError("Target environment is required")
-    if (
-        env_name.lower() in FORBIDDEN_ENVIRONMENTS
-        or env_name.lower().startswith("prod")
-        or str(value.get("pool_id", "")).lower().startswith("prod")
-    ):
-        raise ValueError(
-            "Production targets are forbidden; only non-production environments are permitted (pinned check)"
-        )
     if env_name == "test-shanghai-copy":
         if {k: value.get(k) for k in TARGET} != TARGET:
             raise ValueError("Only the pinned test-shanghai-copy target is permitted")
@@ -128,14 +117,12 @@ def check_target(value):
             raise ValueError("Target oss_prefix must be an oss:// URI")
         for url_key in ("coordinator_url", "room_url", "wtp_url"):
             uri = urlsplit(value[url_key])
-            if uri.scheme not in ("http", "https") or not uri.hostname:
+            if uri.scheme not in ("http", "https") or not uri.hostname or uri.port == 0:
                 raise ValueError(f"Invalid target {url_key}")
-            if uri.hostname in FORBIDDEN_IPS or uri.port in FORBIDDEN_PORTS:
-                raise ValueError("Production endpoints are forbidden (pinned check)")
         h100_ip = value.get("h100_ip")
         if h100_ip is not None:
-            if not isinstance(h100_ip, str) or h100_ip in FORBIDDEN_IPS:
-                raise ValueError("Forbidden or invalid h100_ip (pinned check)")
+            if not isinstance(h100_ip, str):
+                raise ValueError("Invalid h100_ip")
             ipaddress.ip_address(h100_ip)
     if "topology_profile" in value and value["topology_profile"] is not None:
         _load_role_launcher().resolve_topology_workaround(value["topology_profile"])
@@ -507,8 +494,6 @@ def validate_spec(spec, isolated=True, launch_module=launch):
             raise ValueError("Mixed role or model identity")
         # Reuse the exact launcher validator without creating temporary config files.
         launch_module.validate_config(role_for_validation)
-        if set(allocated_ports_fn(role_for_validation)) & FORBIDDEN_PORTS:
-            raise ValueError("Production ports are forbidden")
         env = c.setdefault("environment", {})
         if workaround_env:
             for k, v in workaround_env.items():
@@ -1561,19 +1546,13 @@ def validate_endpoint(url, role, *, pai=None, target=None):
         raise ValueError("Invalid role HTTP endpoint")
     h100_ip = t.get("h100_ip")
     if not pai and h100_ip and uri.hostname != h100_ip:
-        raise ValueError("H100 endpoint is outside the test node")
+        raise ValueError("H100 endpoint is outside the configured node")
     if pai or not h100_ip:
         address = ipaddress.ip_address(uri.hostname or "")
-        forbidden = set(FORBIDDEN_IPS) | {"10.0.1.34", "10.0.1.37"}
-        if h100_ip:
-            forbidden.add(h100_ip)
-        if (
-            address not in ipaddress.ip_network("10.0.0.0/8")
-            or str(address) in forbidden
-        ):
-            raise ValueError("DiT endpoint is outside the test network")
-    if uri.port is None or uri.port in FORBIDDEN_PORTS:
-        raise ValueError("Production ports are forbidden")
+        if address not in ipaddress.ip_network("10.0.0.0/8") or str(address) == h100_ip:
+            raise ValueError("Role endpoint is outside the configured private network")
+    if uri.port is None:
+        raise ValueError("Role HTTP endpoint requires a port")
 
 
 class VPCUnreachable(OSError):

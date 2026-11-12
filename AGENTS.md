@@ -133,6 +133,11 @@
 
 SGLang 专用的 `sglang-pr-review` 在本仓库 `.agents/skills/sglang-pr-review/` 维护并提交，作为项目自有技能。跨项目复用的基础设施技能仍由 infra-skills 维护；下面的本地安装与 exclude 规则仅适用于从该仓库安装的副本。
 
+`sglang-env-deploy`（已授权目标环境的模型三角色部署/复用/回滚）和 `room-sglang-source-replay`
+（真实 Room 供帧回放集成测试）同样在本仓库 `.agents/skills/` 维护，与其消费的 CLI 和配置合同同步更新。
+部署流程优先使用这两个仓库自有入口；不在 infra-skills 复制一套 SGLang 启动器或部署编排 skill。
+镜像同步、跨地域迁移和 checkpoint 导出仍按需复用 infra-skills，不将这些步骤机械加入每次部署。
+
 ## 项目级 Infra Skills
 
 本项目直接使用 [seedleap/infra-skills](https://github.com/seedleap/infra-skills)

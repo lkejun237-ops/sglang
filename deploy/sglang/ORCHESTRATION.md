@@ -2,18 +2,18 @@
 
 ## 1. 职责与启动链边界
 
-`deploy/sglang/orchestrate.py` 负责非生产环境的三角色（Encoder / DiT / Decoder）只读探测、离线计划、创建或复用、隔离建组自测、Coordinator 角色池原地挂载、清理回收，以及持久化部署历史与受控回滚。
+`deploy/sglang/orchestrate.py` 负责已授权目标环境的三角色（Encoder / DiT / Decoder）只读探测、离线计划、创建或复用、隔离建组自测、Coordinator 角色池原地挂载、清理回收，以及持久化部署历史与受控回滚。
 
 - **独立三角色唯一启动链**：`orchestrate.py` → `launch.py` → `zing_h3_profile_launcher.py`（`--mode independent`）→ `zing_h3_role_launcher.py` → 原生角色 worker。
 - **单机集成式启动链**：`deploy/whitebox/release.py` → `deploy/whitebox/model_service.py` → `zing_h3_profile_launcher.py`（`--mode integrated`）。两条路径互不反调，硬件策略与进程监管统一由 `zing_h3_profile_launcher.py` 维护。
-- **安全边界**：拒绝任何 `prod*` 环境、正式网段节点（`10.0.0.145` / `10.0.1.31` / `10.0.1.33`）及正式管理端口（`28110` / `28210`）。支持 `H100 Encoder/Decoder + H200 DiT` 与 `B300 三角色` 拓扑。
+- **操作边界**：支持测试与生产环境，按明确授权的目标、模型池和 owned 资源执行；保留源码/实例身份、占用、活跃会话及 create/reuse 校验。生产环境不因名称、IP 或端口被拒绝；这不代表已完成生产实机验收。支持 `H100 Encoder/Decoder + H200 DiT` 与 `B300 三角色` 拓扑。
 - 详细架构设计见 [`docs/docs/sglang-diffusion/zing/plans/sglang-role-pool-orchestration.md`](../../docs/docs/sglang-diffusion/zing/plans/sglang-role-pool-orchestration.md)；实机运行记录与基准指标见 [`benchmark/whitebox/sglang_shanghai_copy_20261110.md`](../../benchmark/whitebox/sglang_shanghai_copy_20261110.md)。
 
 ## 2. 输入配置与产物
 
 ### 输入配置（`spec.json`）
 
-- `target`：环境标识（如 `test-shanghai-copy` 或非生产 B300/H100 测试环境）、`region`、`workspace_id`、`quota_id`、`coordinator_url`、`pool_id`、`room_url`、`wtp_url`、`oss_prefix`，以及可选的 `node_id`、`h100_ip`、`topology_profile`、`history_dir`。
+- `target`：环境标识（如 `test-shanghai-copy`、`prod-shanghai` 或 `prod-thailand`）、`region`、`workspace_id`、`quota_id`、`coordinator_url`、`pool_id`、`room_url`、`wtp_url`、`oss_prefix`，以及可选的 `node_id`、`h100_ip`、`topology_profile`、`history_dir`。
 - `roles` / `existing_services`：
   - Encoder 与 Decoder 支持按角色配置 `mode: "create" | "reuse"`（或通过顶层 `existing_services` 声明复用），并支持 `service_count >= 1`（单进程多 service、每 service 单活跃会话，容量以实测为准）。
   - `profile` 支持 `auto`、`h100`、`h200`、`b300`；用户侧无 `role_launcher` 开关，统一走 profile launcher。
