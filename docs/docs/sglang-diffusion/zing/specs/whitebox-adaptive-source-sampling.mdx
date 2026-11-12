@@ -104,6 +104,21 @@ keep their own ordering. Native input waits wake for complete encoder dependenci
 or controls rather than dispatching an incomplete group on a fixed collection
 timeout. Existing clients that do not opt into demand receive no new event type.
 
+Demand publication must not block the next compute dispatch behind RGB output.
+Each generation owns one sender and one replaceable pending observation, never
+a queue of old snapshots. The sender takes the transport lock before reading the
+current published-input state and allocating its sequence; input-wait accounting
+is updated at the actual scheduling boundaries independently of send delay.
+Failure cancels and joins the generation and publisher; successful completion or
+cancellation discards unsent advisory state, with no messages in the next session.
+Hard source credit and output ownership are unchanged.
+
+The output writer waits for decoder materialization and builds the payload before
+acquiring the transport lock. A split frame header and its binary pixels remain
+one atomic send group; control messages may pass between complete frame batches,
+but never between a header and its pixels. The existing bounded output task keeps
+chunk and condition order, including cancellation of unconsumed async references.
+
 Each segment starts with bounded latest supply to observe attainable pipeline
 cadence independently of a soft admission gate. A probe spans at least two
 seconds after its first output anchor. Capture version/PTS progress must show

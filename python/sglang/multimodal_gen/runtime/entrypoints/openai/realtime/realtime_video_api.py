@@ -225,14 +225,6 @@ def _sync_batch_realtime_metadata(batch: "Req", result: OutputBatch) -> None:
             setattr(batch, batch_field, metadata[metadata_field])
 
 
-class _NullAsyncContext:
-    async def __aenter__(self):
-        return None
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        return False
-
-
 def _safe_len(value) -> int:
     try:
         return len(value)
@@ -655,15 +647,28 @@ def _log_realtime_chunk_timing(
 
 
 async def _generate_loop(ws: WebSocket, session: GenerateSession):
+    from sglang.multimodal_gen.runtime.realtime.source_demand import (
+        SourceDemandPublisher,
+    )
+
     server_args = get_global_server_args()
     deployment_backend = _resolve_realtime_vae_backend(session, server_args)
+    publisher = (
+        SourceDemandPublisher(session.adapter, session, ws)
+        if callable(getattr(session.adapter, "source_demand_message", None))
+        else None
+    )
     if uses_remote_vae(deployment_backend):
-        return await _generate_loop_async_vae(ws, session, server_args)
-    if session.vae_worker_url:
-        raise ValueError(
-            "Gateway supplied a remote VAE worker while realtime_vae_backend=local"
-        )
-    return await _generate_loop_local(ws, session)
+        generation = _generate_loop_async_vae(ws, session, server_args, publisher)
+    else:
+        if session.vae_worker_url:
+            raise ValueError(
+                "Gateway supplied a remote VAE worker while realtime_vae_backend=local"
+            )
+        generation = _generate_loop_local(ws, session, publisher)
+    if publisher is not None:
+        return await publisher.run(generation)
+    return await generation
 
 
 def _resolve_realtime_vae_backend(
@@ -733,10 +738,7 @@ async def _send_remote_frame_batch(
         },
         metrics=batch.metrics,
     )
-    send_group = getattr(ws, "send_group", None)
-    send_context = send_group() if send_group is not None else _NullAsyncContext()
-    async with send_context:
-        partial_stats = await session.adapter.send_output(ws, session, partial, batch)
+    partial_stats = await session.adapter.send_output(ws, session, partial, batch)
     _merge_send_stats(send_stats, partial_stats)
 
 
@@ -917,7 +919,9 @@ async def _complete_remote_chunk(
     session.generate_chunk_completed(chunk)
 
 
-async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
+async def _generate_loop_async_vae(
+    ws, session: GenerateSession, server_args, demand_publisher=None
+):
     adapter = session.adapter
     if adapter is None or session.request is None:
         raise ValueError("realtime adapter and request must be initialized")
@@ -974,9 +978,11 @@ async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
                 await coordinator.finish()
 
             wait_started = time.perf_counter()
-            await _send_source_demand(adapter, session, ws, waiting=True)
+            await _send_source_demand(
+                adapter, session, ws, waiting=True, publisher=demand_publisher
+            )
             await adapter.wait_for_next_chunk(session)
-            await _send_source_demand(adapter, session, ws)
+            await _send_source_demand(adapter, session, ws, publisher=demand_publisher)
             await adapter.prepare_conditioning(session, server_args)
             wait_ms = (time.perf_counter() - wait_started) * 1000.0
             log_realtime_trace(
@@ -994,7 +1000,9 @@ async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
                 chunk = session.new_chunk()
                 batch = adapter.prepare_next_request(session, server_args, chunk)
                 session.bind_chunk_request(chunk, batch)
-                await _send_source_demand(adapter, session, ws)
+                await _send_source_demand(
+                    adapter, session, ws, publisher=demand_publisher
+                )
             except BaseException as exc:
                 observe_stage_seconds(
                     "chunk_prepare",
@@ -1218,7 +1226,10 @@ def _is_source_progress_only(adapter, result):
     )
 
 
-async def _send_source_demand(adapter, session, ws, *, waiting=False):
+async def _send_source_demand(adapter, session, ws, *, waiting=False, publisher=None):
+    if publisher is not None:
+        publisher.publish(waiting=waiting)
+        return
     observe = getattr(adapter, "source_demand_message", None)
     message = (
         observe(session, waiting_for_input=waiting) if observe is not None else None
@@ -1227,14 +1238,18 @@ async def _send_source_demand(adapter, session, ws, *, waiting=False):
         await ws.send_bytes(msgspec.msgpack.encode(message))
 
 
-async def _wait_for_source_input(adapter, session, pending_send_task, ws):
-    await _send_source_demand(adapter, session, ws, waiting=True)
+async def _wait_for_source_input(
+    adapter, session, pending_send_task, ws, demand_publisher=None
+):
+    await _send_source_demand(
+        adapter, session, ws, waiting=True, publisher=demand_publisher
+    )
     if pending_send_task is None or not getattr(
         adapter, "source_decoder_overlap", False
     ):
         await _flush_source_credit(ws, adapter)
         await adapter.wait_for_next_chunk(session)
-        await _send_source_demand(adapter, session, ws)
+        await _send_source_demand(adapter, session, ws, publisher=demand_publisher)
         return
     # A failed output cannot return source credit. Do not leave the next input
     # wait stranded behind that failure; the loop still owns the output task.
@@ -1249,7 +1264,7 @@ async def _wait_for_source_input(adapter, session, pending_send_task, ws):
             # credit. Release it before waiting on credit-dependent input.
             await _flush_source_credit(ws, adapter)
         await ready
-        await _send_source_demand(adapter, session, ws)
+        await _send_source_demand(adapter, session, ws, publisher=demand_publisher)
         if pending_send_task.done():
             pending_send_task.result()
     finally:
@@ -1258,7 +1273,9 @@ async def _wait_for_source_input(adapter, session, pending_send_task, ws):
         await _await_realtime_task(ready)
 
 
-async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
+async def _generate_loop_local(
+    ws: WebSocket, session: GenerateSession, demand_publisher=None
+):
     adapter = session.adapter
     if adapter is None:
         raise ValueError("realtime adapter is not initialized")
@@ -1286,7 +1303,9 @@ async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
             server_args = get_global_server_args()
 
             wait_started = time.perf_counter()
-            await _wait_for_source_input(adapter, session, pending_send_task, ws)
+            await _wait_for_source_input(
+                adapter, session, pending_send_task, ws, demand_publisher
+            )
             await adapter.prepare_conditioning(session, server_args)
             wait_for_next_chunk_ms = (time.perf_counter() - wait_started) * 1000
             log_realtime_trace(
@@ -1317,7 +1336,9 @@ async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
                     chunk,
                 )
                 session.bind_chunk_request(chunk, batch)
-                await _send_source_demand(adapter, session, ws)
+                await _send_source_demand(
+                    adapter, session, ws, publisher=demand_publisher
+                )
             except BaseException as exc:
                 observe_stage_seconds(
                     "chunk_prepare",
@@ -1500,45 +1521,44 @@ async def _send_output_and_log(
         event_id=getattr(batch, "realtime_event_id", None),
     )
     pace_wait_ms = await _wait_for_realtime_output_slot(session, batch, result)
-    send_group = getattr(ws, "send_group", None)
-    send_context = send_group() if send_group is not None else _NullAsyncContext()
-    async with send_context:
-        send_stats = await session.adapter.send_output(
-            ws,
+    # Materialization/decoder waits must not hold the transport lock. The raw
+    # output adapter owns the atomic header/payload write for each ready batch.
+    send_stats = await session.adapter.send_output(
+        ws,
+        session,
+        result,
+        batch,
+    )
+    if send_stats["num_frames"] > 0:
+        _mark_session_playable_from_server_output(
             session,
-            result,
-            batch,
+            source="output_batch_sent",
+            request_id=chunk.request_id,
+            chunk_index=batch.block_idx,
+            event_id=getattr(batch, "realtime_event_id", None),
         )
-        if send_stats["num_frames"] > 0:
-            _mark_session_playable_from_server_output(
-                session,
-                source="output_batch_sent",
-                request_id=chunk.request_id,
-                chunk_index=batch.block_idx,
-                event_id=getattr(batch, "realtime_event_id", None),
-            )
-        send_stats["pace_wait_ms"] = pace_wait_ms
-        chunk_total_ms = (time.perf_counter() - chunk_started) * 1000
-        _log_realtime_chunk_timing(
-            session,
-            chunk,
-            batch,
-            request_prepare_ms,
-            scheduler_forward_ms,
-            chunk_total_ms,
-            send_stats,
-        )
-        await _send_chunk_telemetry(
-            ws,
-            session,
-            chunk,
-            batch,
-            request_prepare_ms=request_prepare_ms,
-            scheduler_forward_ms=scheduler_forward_ms,
-            chunk_total_ms=chunk_total_ms,
-            send_stats=send_stats,
-            stage_metrics=stage_metrics,
-        )
+    send_stats["pace_wait_ms"] = pace_wait_ms
+    chunk_total_ms = (time.perf_counter() - chunk_started) * 1000
+    _log_realtime_chunk_timing(
+        session,
+        chunk,
+        batch,
+        request_prepare_ms,
+        scheduler_forward_ms,
+        chunk_total_ms,
+        send_stats,
+    )
+    await _send_chunk_telemetry(
+        ws,
+        session,
+        chunk,
+        batch,
+        request_prepare_ms=request_prepare_ms,
+        scheduler_forward_ms=scheduler_forward_ms,
+        chunk_total_ms=chunk_total_ms,
+        send_stats=send_stats,
+        stage_metrics=stage_metrics,
+    )
     return send_stats
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import time
+from contextlib import nullcontext
 from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypedDict
@@ -762,11 +763,15 @@ class RawRGBRealtimeOutputAdapter:
                     header_payload = _pack_frame_batch_header(header)
                     stats["header_pack_ms"] += timer.mark_ms()
 
-                    await ws.send_bytes(header_payload)
-                    stats["header_write_ms"] += timer.mark_ms()
+                    # Keep split wire messages atomic, but acquire only after
+                    # RGB materialization and payload construction have finished.
+                    group = getattr(ws, "send_group", None)
+                    async with group() if group is not None else nullcontext():
+                        await ws.send_bytes(header_payload)
+                        stats["header_write_ms"] += timer.mark_ms()
 
-                    await ws.send_bytes(transport_payload.payload)
-                    stats["raw_write_ms"] += timer.mark_ms()
+                        await ws.send_bytes(transport_payload.payload)
+                        stats["raw_write_ms"] += timer.mark_ms()
 
                     stats["ws_payload_bytes"] += len(header_payload) + len(
                         transport_payload.payload

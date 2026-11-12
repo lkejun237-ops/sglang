@@ -41,6 +41,10 @@ def test_critical_path_observer_failure_cancels_unconsumed_async_output(
 
     class _Adapter:
         @staticmethod
+        def is_control_work(_session):
+            return False
+
+        @staticmethod
         async def wait_for_next_chunk(_session):
             return None
 
@@ -72,7 +76,7 @@ def test_critical_path_observer_failure_cancels_unconsumed_async_output(
         del server_args
         raise RuntimeError("critical-path observer failed")
 
-    async def ignore_error_message(_message, _websocket):
+    async def ignore_error_message(_message, _websocket, **_kwargs):
         return None
 
     monkeypatch.setattr(

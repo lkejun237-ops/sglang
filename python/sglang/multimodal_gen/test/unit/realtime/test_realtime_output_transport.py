@@ -1136,3 +1136,144 @@ def test_progressive_rgb_is_sent_before_later_parts_are_ready(
     finally:
         publisher.close()
     assert not any(tmp_path.iterdir())
+
+
+def test_decoder_materialization_does_not_hold_the_output_send_group(
+    monkeypatch, tmp_path
+):
+    import time
+
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
+        realtime_video_api as api,
+    )
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session import (
+        GenerateSession,
+    )
+
+    monkeypatch.setenv(SHARED_MEMORY_DIR_ENV, str(tmp_path))
+    frame = bytes([1, 2, 3])
+    reference, producer = _published_raw_rgb_reference(
+        frame, root=tmp_path, chunk_index=0, width=1, height=1, batch_num_frames=[1]
+    )
+    started, release = threading.Event(), threading.Event()
+    original = realtime_output_adapter.materialize_async_raw_rgb_frame_batches
+
+    def blocked(reference):
+        started.set()
+        assert release.wait(3)
+        return original(reference)
+
+    monkeypatch.setattr(
+        realtime_output_adapter, "materialize_async_raw_rgb_frame_batches", blocked
+    )
+    monkeypatch.setattr(
+        api, "_mark_session_playable_from_server_output", lambda *a, **k: None
+    )
+    result = OutputBatch(
+        raw_frame_shared_memory_ref=reference,
+        raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
+        raw_frame_metadata=dict(
+            format="rgb24", width=1, height=1, channels=3, bytes_per_frame=3
+        ),
+    )
+    batch = SimpleNamespace(
+        block_idx=0,
+        request_id="req-0",
+        width=1,
+        height=1,
+        enable_upscaling=False,
+        realtime_event_id=0,
+        realtime_trace_id="test",
+        realtime_output_format="raw",
+        realtime_preview_max_width=None,
+        output_compression=None,
+        condition_inputs={},
+    )
+
+    async def run():
+        messages = []
+
+        class Socket:
+            async def send_bytes(self, payload):
+                messages.append(payload)
+
+        class Adapter:
+            async def send_output(self, ws, session, result, batch):
+                return await RawRGBRealtimeOutputAdapter().send(
+                    ws, session, result, batch
+                )
+
+        session = GenerateSession()
+        session.id, session.generation_id = "session-1", "generation-1"
+        session.adapter = Adapter()
+        ws = api._LockedRealtimeWebSocket(Socket())
+        task = asyncio.create_task(
+            api._send_output_and_log(
+                ws,
+                session,
+                session.new_chunk(),
+                batch,
+                result,
+                0,
+                0,
+                time.perf_counter(),
+                {},
+            )
+        )
+        try:
+            assert await asyncio.to_thread(started.wait, 1)
+            await asyncio.wait_for(ws.send_bytes(b"control"), 1)
+            assert messages == [b"control"]
+        finally:
+            release.set()
+            await asyncio.wait_for(task, 2)
+        assert result.raw_frame_shared_memory_ref is None
+
+    try:
+        asyncio.run(run())
+    finally:
+        release.set()
+        producer.join(timeout=2)
+    assert not producer.is_alive()
+    assert not list(tmp_path.iterdir())
+
+
+def test_ready_frame_header_and_pixels_stay_atomic_without_an_outer_group(monkeypatch):
+    from sglang.multimodal_gen.runtime.realtime.websocket_transport import (
+        _LockedRealtimeWebSocket,
+    )
+
+    monkeypatch.setattr(realtime_output_adapter, "FRAME_BATCH_PACK_OFFLOAD_BYTES", 1)
+
+    async def run():
+        messages, control_tasks = [], []
+
+        class Socket:
+            async def send_bytes(self, payload):
+                messages.append(payload)
+                if len(messages) == 1:
+                    control_tasks.append(asyncio.create_task(ws.send_bytes(b"control")))
+                    await asyncio.sleep(0)
+
+        ws = _LockedRealtimeWebSocket(Socket())
+        result = OutputBatch(
+            raw_frame_batches=[[b"abc"]],
+            raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
+            raw_frame_metadata=dict(
+                format="rgb24", width=1, height=1, channels=3, bytes_per_frame=3
+            ),
+        )
+        batch = SimpleNamespace(
+            block_idx=0,
+            request_id="req",
+            realtime_event_id=0,
+            realtime_output_format="raw",
+            realtime_preview_max_width=None,
+            output_compression=None,
+        )
+        await RawRGBRealtimeOutputAdapter().send(ws, SimpleNamespace(), result, batch)
+        await asyncio.gather(*control_tasks)
+        assert msgspec.msgpack.decode(messages[0])["type"] == "frame_batch_header"
+        assert messages[1:] == [b"abc", b"control"]
+
+    asyncio.run(run())

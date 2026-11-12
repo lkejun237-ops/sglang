@@ -394,3 +394,44 @@ def test_startup_receipts_are_not_suppressed_as_source_progress(receipt_type):
         },
     )
     assert not realtime_video_api._is_source_progress_only(adapter, result)
+
+
+def test_native_demand_does_not_serialize_next_dispatch_with_rgb_writer(
+    pipeline, monkeypatch
+):
+    """The real dispatcher must advance even when an older RGB group is blocked."""
+
+    async def run():
+        p = pipeline
+        p.session.adapter.source_demand_message = lambda session, **kwargs: {
+            "type": "source.demand",
+            "next": session.next_chunk_index,
+        }
+        original_output = realtime_video_api._send_output_and_log
+
+        async def locked_output(ws, *args):
+            async with ws.send_group():
+                return await original_output(ws, *args)
+
+        monkeypatch.setattr(realtime_video_api, "_send_output_and_log", locked_output)
+
+        class Socket:
+            async def send_bytes(self, payload):
+                await asyncio.sleep(0)
+
+        ws = realtime_video_api._LockedRealtimeWebSocket(Socket())
+        task = asyncio.create_task(realtime_video_api._generate_loop(ws, p.session))
+        try:
+            await asyncio.wait_for(p.output_started.wait(), 2)
+            await asyncio.wait_for(p.second_started.wait(), 2)
+            await asyncio.wait_for(p.second_completed.wait(), 2)
+            assert p.started == [0, 1] and p.sent == []
+            p.output_release.set()
+            await asyncio.wait_for(task, 2)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        assert p.sent == [(0, 0), (1, 0), (2, 0)]
+        assert not p.errors and not p.cancelled
+
+    asyncio.run(run())

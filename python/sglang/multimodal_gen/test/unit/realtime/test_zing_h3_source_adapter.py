@@ -3666,3 +3666,25 @@ def test_native_demand_waits_for_dependency_or_eos_not_fixed_timeout(configured,
     asyncio.run(run())
     assert adapter.joint_wait["policy"] == "source_dependency"
     assert adapter.joint_wait["reason"] == ("control" if eos else "ready")
+
+
+def test_native_input_wait_timing_survives_coalesced_unsent_feedback(
+    configured, monkeypatch
+):
+    adapter, session = initialize()
+    adapter.source_demand_protocol = "source-demand-v1"
+    adapter.ready["source_flow"] = {"protocol": "clip17-source-flow-v1"}
+    clock = [10.0]
+    monkeypatch.setattr(source.time, "monotonic", lambda: clock[0])
+    try:
+        assert adapter.observe_source_input_wait(waiting_for_input=True)
+        clock[0] = 10.25
+        assert not adapter.observe_source_input_wait(waiting_for_input=False)
+        clock[0] = 12.0
+        message = adapter.source_demand_message(session, waiting_for_input=False)
+        # No message was sent while input was missing. Transport delay must
+        # neither erase the real wait nor inflate it to the writer delay.
+        assert message["input_wait_ms"] == 250
+        assert not message["waiting_for_source"]
+    finally:
+        adapter.dispose(session)

@@ -782,6 +782,22 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         target, _ = self._joint_wait_target()
         return self.dispatched_source_frames + target
 
+    def observe_source_input_wait(self, *, waiting_for_input=True):
+        """Measure input waits independently of delayed/coalesced wire feedback."""
+        if not getattr(self, "source_demand_protocol", None) or (
+            self.startup_enabled and self.startup_phase != "attached"
+        ):
+            return False
+        accepted = self.dispatched_source_frames + self.pending_frames
+        waiting = waiting_for_input and accepted < self.source_input_required_end()
+        now = time.monotonic()
+        if waiting and self._source_wait_started is None:
+            self._source_wait_started = now
+        elif not waiting and self._source_wait_started is not None:
+            self._source_wait_seconds += now - self._source_wait_started
+            self._source_wait_started = None
+        return waiting
+
     def source_demand_message(self, session, *, waiting_for_input=True):
         """Native input demand, not a claim that in-flight GPU work is finished."""
         if (
@@ -800,13 +816,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         # otherwise an in-progress acknowledgement produces a torn snapshot
         # where queued != accepted - dispatched and aborts a healthy session.
         accepted = self.dispatched_source_frames + self.pending_frames
-        waiting = waiting_for_input and accepted < required
+        waiting = self.observe_source_input_wait(waiting_for_input=waiting_for_input)
         now = time.monotonic()
-        if waiting and self._source_wait_started is None:
-            self._source_wait_started = now
-        elif not waiting and self._source_wait_started is not None:
-            self._source_wait_seconds += now - self._source_wait_started
-            self._source_wait_started = None
         state = (
             accepted,
             required,
