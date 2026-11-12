@@ -583,6 +583,14 @@ class SourceSession(InteractiveSession):
         from .source_conditions import SourceConditions
 
         def create(envelope, emit, check):
+            # A native reset reuses this factory with a fresh segment. Keep each
+            # callback's identity frozen, including a late result from an old one.
+            receipt_ids = copy.deepcopy(
+                self.journal.snapshot.get("model_context_segment_ids")
+            )
+            if receipt_ids and receipt_ids["segment_id"] != envelope["segmentId"]:
+                receipt_ids = None
+
             def fenced():
                 check()
                 if self.closed or self.binding_ended:
@@ -695,7 +703,11 @@ class SourceSession(InteractiveSession):
 
             async def instruction_receipt(instruction, phase, reason):
                 fenced()
-                await self.emit_instruction_receipt(instruction, phase, reason, ids)
+                if receipt_ids is None:
+                    raise RenderError("SOURCE_EPOCH_MISMATCH")
+                await self.emit_instruction_receipt(
+                    instruction, phase, reason, receipt_ids
+                )
 
             adapter.instruction_receipt = instruction_receipt
             adapter.debug = getattr(self, "condition_debug", None)

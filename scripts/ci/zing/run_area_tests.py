@@ -39,6 +39,7 @@ AREA_FILES = [
         "test_whitebox_startup_prewarm.py",
         "test_whitebox_opening_presentation.py",
         "test_whitebox_context_intervention.py",
+        "test_whitebox_instruction_receipt_scope.py",
         "test_whitebox_receipt_delta.py",
         "test_whitebox_ui_history.py",
         "test_whitebox_error_origins.py",
