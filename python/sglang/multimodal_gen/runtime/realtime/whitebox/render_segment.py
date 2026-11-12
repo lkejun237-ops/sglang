@@ -244,6 +244,9 @@ class RenderSegment(InteractiveSession):
         self.clip_switch = (
             ready.get("source_condition_switch_protocol") == "clip-barrier-v1"
         )
+        self.condition_early_release = (
+            self.clip_switch and ready.get("source_condition_early_release") is True
+        )
         self.model_reference_limit = ready.get("max_references", 9)
         large_revision = os.environ.get("WHITEBOX_LARGE_REFERENCE_MODEL_REVISION")
         if large_revision and self.assignment.denoiser.model_revision != large_revision:
@@ -289,9 +292,12 @@ class RenderSegment(InteractiveSession):
 
     def model_source_allowed(self, sent):
         switch = self.condition_switch
-        return switch is None or (
-            switch.get("boundary") is not None and sent < switch["boundary"]
-        )
+        if switch is None:
+            return True
+        boundary = switch.get("boundary")
+        if boundary is None:
+            boundary = switch.get("provisional_boundary")
+        return boundary is not None and sent < boundary
 
     def model_output_references(self, message, references):
         # model_output_condition has selected this output event's actual media.
@@ -398,6 +404,9 @@ class RenderSegment(InteractiveSession):
                     ):
                         self.prompt_available.set()
                         continue
+                    if getattr(self, "condition_early_release", False):
+                        watermark = max(self.selected_frames, 17)
+                        switch["provisional_boundary"] = ((watermark + 16) // 17) * 17
                     self.condition_switch = switch
 
                     def remember(event_id):
@@ -432,7 +441,7 @@ class RenderSegment(InteractiveSession):
                         await self._notify_source_admission()
                         ready = await switch["ready"]
                         if (
-                            ready.get("state") == "kv_ready"
+                            ready.get("state") in {"kv_ready", "source_ready"}
                             and ready.get("prompt_version") != item["version"]
                         ):
                             raise RenderError("REVISION_CONFLICT")
@@ -456,6 +465,8 @@ class RenderSegment(InteractiveSession):
                         * 1000,
                         kv_ready=accepted.get("state") == "accepted"
                         and ready.get("state") == "kv_ready",
+                        source_ready=accepted.get("state") == "accepted"
+                        and ready.get("state") == "source_ready",
                     )
                     self.condition_switch = None
                 await self._notify_source_admission()
@@ -796,8 +807,10 @@ class RenderSegment(InteractiveSession):
                 self.upstream.init["source_condition_switch_protocol"] = (
                     "clip-barrier-v1"
                 )
+                self.upstream.init["source_condition_early_release"] = True
             else:
                 self.upstream.init.pop("source_condition_switch_protocol", None)
+                self.upstream.init.pop("source_condition_early_release", None)
             self.ready.set()
             self.output_task = asyncio.create_task(self._pump())
             self.render_task = asyncio.create_task(self._render())

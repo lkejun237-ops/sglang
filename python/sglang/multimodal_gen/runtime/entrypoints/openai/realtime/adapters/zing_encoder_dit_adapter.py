@@ -107,6 +107,12 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
                 if value["type"] != "session.opened":
                     continue
                 if (
+                    self.condition_switch_protocol
+                    and getattr(request, "source_condition_early_release", False)
+                    and value.get("async_inputs") is True
+                ):
+                    self.ready["source_condition_early_release"] = True
+                if (
                     value.get("source_output_release_protocol")
                     == "valid-source-frames-v1"
                 ):
@@ -238,6 +244,10 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
 
     def prepare_next_request(self, session, server_args, chunk):
         batch = super().prepare_next_request(session, server_args, chunk)
+        if self.ready.get("source_condition_early_release"):
+            update = batch.extra.get("zing_prompt_update")
+            if update is not None and "source_boundary" in update:
+                update["allow_early_release"] = True
         batch.extra["zing_dit_source_records"] = [
             [r.source_id, r.start, r.end] for r in self.ledger.records
         ]
@@ -283,6 +293,9 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
                     )
                 )
             )
+        source_ready = result.usage.get("zing_condition_source_ready")
+        if source_ready is not None:
+            await ws.send_bytes(msgspec.msgpack.encode(source_ready))
         for item in result.realtime_handoff["dit_latents"]:
             require(
                 item["latent_start"] == self.latents_sent, "Invalid DiT latent order."

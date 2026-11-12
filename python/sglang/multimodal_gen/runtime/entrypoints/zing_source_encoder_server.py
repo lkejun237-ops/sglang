@@ -54,7 +54,7 @@ class EncoderConditioning:
 
     def dispose(self):
         self.inputs = self.prompt = self.event_id = self.failed_update = None
-        self.cache_key = None
+        self.cache_key = self.active_cache_key = None
         self.cache_lookup = {}
         self.cache_hit = False
         self.cache_write = False
@@ -76,7 +76,7 @@ class EncoderConditioning:
                 key: value for key, value in self.candidates.items() if key > event_id
             }
         if event_id in self.cache_candidates:
-            self.cache_request = self.cache_candidates[event_id]
+            self.cache_request, self.active_cache_key = self.cache_candidates[event_id]
             self.cache_candidates = {
                 key: value
                 for key, value in self.cache_candidates.items()
@@ -91,7 +91,7 @@ class EncoderConditioning:
         if event_id == self.event_id:
             self.failed_update = (self.prompt, event_id)
 
-    def _lookup(self, batch, preview=None, update=None):
+    def _lookup(self, batch, preview=None, update=None, *, reuse_active=False):
         query = getattr(self, "cache_query", None)
         if query is None:
             return None
@@ -125,7 +125,6 @@ class EncoderConditioning:
                 update.get("prompt", batch.sampling_params.prompt),
                 update,
             )
-            self.cache_candidates[update["event_id"]] = request
         self.cache_key = preparation_key(
             self.codecs,
             request,
@@ -133,6 +132,14 @@ class EncoderConditioning:
             command["config"],
             identity["identity"],
         )
+        if update is not None:
+            self.cache_candidates[update["event_id"]] = request, self.cache_key
+            if reuse_active and self.cache_key == self.active_cache_key:
+                # Send the active tensors so DiT can validate and rebuild even
+                # if it cannot reuse its resident Block0.
+                self.cache_hit = False
+                self.cache_lookup = {}
+                return self.inputs
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.cache_logging import (
             batch_context,
         )
@@ -260,6 +267,7 @@ class EncoderConditioning:
                 )
             self.prompt = batch.sampling_params.prompt
             self.event_id = batch.realtime_event_id
+            self.active_cache_key = self.cache_key
             output = self._condition(
                 self.inputs,
                 self.event_id,
@@ -279,7 +287,15 @@ class EncoderConditioning:
                 self.failed_update = update
             else:
                 try:
-                    candidate = self._lookup(batch, update=update_command)
+                    allow_early_release = (
+                        async_updates
+                        and "source_boundary" in update_command
+                        and update_command.get("allow_early_release") is True
+                    )
+                    candidate = self._lookup(
+                        batch, update=update_command, reuse_active=allow_early_release
+                    )
+                    reuse_active = candidate is not None and candidate is self.inputs
                     if candidate is not None:
                         positive = candidate.positive
                     else:
@@ -311,10 +327,13 @@ class EncoderConditioning:
                         update[1],
                         version,
                         include_inputs=on_condition is not None
+                        and not reuse_active
                         and (async_updates or "references" in update_command),
                     )
                     if on_condition is not None:
                         sent = True
+                        if reuse_active and allow_early_release:
+                            output["release_source"] = True
                         on_condition("conditioning", **output)
                         output = None
                 except ConditionError as exc:
@@ -331,9 +350,7 @@ class EncoderConditioning:
                     self.failed_update = None
                     if on_condition is None:
                         self.inputs = candidate
-                        self.cache_request = self.cache_candidates.pop(
-                            update[1], self.cache_request
-                        )
+                        self.confirm_applied(update[1])
             if self.failed_update == update and on_condition is not None and not sent:
                 # DiT already discarded pending state when it rejected a sent
                 # candidate. Only local preparation failures need cancellation.
@@ -357,6 +374,7 @@ class SourceEncoderExecutor:
             self.conditioning.cache_query = self._cache_query
         self._dit_final_frames = None
         self._dit_latents = 0
+        self.pending_condition_ready = None
         self._dit_committed_frames = 0
         self._enc_emitted_pixels = 0
         self._enc_frame_wait_ms = {}
@@ -517,6 +535,7 @@ class SourceEncoderExecutor:
                 self._dit_final_frames = None
                 self._dit_latents = 0
                 self._dit_committed_frames = 0
+                self.pending_condition_ready = None
                 self._enc_emitted_pixels = 0
                 self._enc_frame_wait_ms = {}
                 self.startup_preparation = None
@@ -548,6 +567,7 @@ class SourceEncoderExecutor:
             self._dit_final_frames = None
             self._dit_latents = 0
             self._dit_committed_frames = 0
+            self.pending_condition_ready = None
             self._enc_emitted_pixels = 0
             self._enc_frame_wait_ms = {}
             self.startup_preparation = None
@@ -560,6 +580,7 @@ class SourceEncoderExecutor:
         dit_outputs = []
         notices = []
         condition_ready = []
+        source_ready = None
         condition_prepared = []
         cache_reports = []
 
@@ -594,6 +615,12 @@ class SourceEncoderExecutor:
                             result["code"], "This request is too large for this server"
                         )
                     if getattr(self.dit_link, "async_inputs", False):
+                        pending = self.pending_condition_ready
+                        if (
+                            pending is not None
+                            and pending["event_id"] == result["event_id"]
+                        ):
+                            self.pending_condition_ready = None
                         self.conditioning.reject(result["event_id"])
                         notices.append(result)
                         continue
@@ -606,17 +633,20 @@ class SourceEncoderExecutor:
                         )
                     rejection = result
                 elif result["type"] == "conditioning.ready":
-                    command = batch.extra.get("zing_prompt_update", {})
+                    update = batch.extra.get("zing_prompt_update", {})
+                    expected = self.pending_condition_ready or dict(
+                        event_id=update.get("event_id"),
+                        prompt_version=update.get("prompt_version"),
+                        source_frame_index=update.get("source_boundary"),
+                    )
                     if (
-                        result.get("event_id") != command.get("event_id")
-                        or result.get("prompt_version") != command.get("prompt_version")
-                        or result.get("source_frame_index")
-                        != command.get("source_boundary")
+                        any(result.get(key) != value for key, value in expected.items())
                         or condition_ready
                     ):
                         raise ValueError(
                             "DiT condition readiness does not match the request"
                         )
+                    self.pending_condition_ready = None
                     self.conditioning.confirm_applied(result["event_id"])
                     condition_ready.append(
                         dict(
@@ -645,7 +675,8 @@ class SourceEncoderExecutor:
             if rejection is not None:
                 raise ConditionError(rejection["code"], "Condition update was rejected")
 
-        def send_dit(kind, **payload):
+        def send_dit(kind, *, release_source=False, **payload):
+            nonlocal source_ready
             if kind == "conditioning":
                 payload.update(
                     {
@@ -660,16 +691,27 @@ class SourceEncoderExecutor:
                     payload["source_boundary"] = boundary
                 if command.get("startup", {}).get("op") == "prepare":
                     payload["source_prepare"] = self.startup_preparation
-            consume_results(
-                self.dit_link.send(
-                    kind,
-                    request_id=batch.request_id,
-                    chunk_index=batch.block_idx,
-                    **payload,
-                ),
+            results = self.dit_link.send(
                 kind,
-                payload,
+                request_id=batch.request_id,
+                chunk_index=batch.block_idx,
+                **payload,
+                **({"wait_for_boundary": False} if release_source else {}),
             )
+            if release_source:
+                expected = dict(
+                    event_id=payload["event_id"],
+                    prompt_version=payload["prompt_version"],
+                    source_frame_index=payload["source_boundary"],
+                )
+                self.pending_condition_ready = expected
+                source_ready = dict(
+                    type="control_ack",
+                    kind="prompt.update",
+                    state="source_ready",
+                    **expected,
+                )
+            consume_results(results, kind, payload)
 
         try:
             if self.dit_link is not None and getattr(
@@ -701,6 +743,10 @@ class SourceEncoderExecutor:
             ]
             if condition_ready:
                 result.usage["zing_condition_ready"] = condition_ready[0]
+            if source_ready is not None and not any(
+                notice["event_id"] == source_ready["event_id"] for notice in notices
+            ):
+                result.usage["zing_condition_source_ready"] = source_ready
             if cache_reports:
                 result.realtime_handoff["cache_reports"] = cache_reports
             return result

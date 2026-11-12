@@ -2481,7 +2481,11 @@ class SourceSession(InteractiveSession):
         if (
             message.get("type") == "control_ack"
             and message.get("kind") == "prompt.update"
-            and message.get("state") == "kv_ready"
+            and (
+                message.get("state") == "kv_ready"
+                or message.get("state") == "source_ready"
+                and getattr(segment, "condition_early_release", False)
+            )
         ):
             switch = getattr(segment, "condition_switch", None)
             boundary = switch.get("boundary") if switch else None

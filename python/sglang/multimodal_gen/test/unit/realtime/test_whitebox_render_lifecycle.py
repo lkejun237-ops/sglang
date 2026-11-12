@@ -1216,6 +1216,104 @@ def test_end_freezes_unsent_condition_dispatch(already_draining):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("selected", [33, 34])
+def test_clip_switch_finishes_old_clip_before_accepted_and_resumes_on_source_ready(
+    selected,
+):
+    from sglang.multimodal_gen.runtime.realtime.whitebox.render_segment import (
+        RenderSegment,
+    )
+    from sglang.multimodal_gen.runtime.realtime.whitebox.render_source import (
+        SourceSession,
+    )
+
+    async def scenario():
+        segment = object.__new__(RenderSegment)
+        segment.segment_id = "segment"
+        segment.condition_early_release = True
+        segment.condition_switch = segment.pending_prompt = None
+        segment.prompt_by_event = {}
+        segment.active_reference_descriptors = []
+        segment.selected_frames = selected
+        segment.last_selected_source = selected - 1
+        segment.closed_event = asyncio.Event()
+        segment.source_admission_ready = asyncio.Event()
+        segment.source_admission_ready.set()
+        segment.prompt_available = asyncio.Event()
+        segment.prompt_available.set()
+        segment.sink = SimpleNamespace(idle=asyncio.Event())
+        segment.sink.idle.set()
+        segment.cancel_requested = False
+        segment.source_view = SimpleNamespace(stopped=asyncio.Event())
+        segment.source_send_lock = asyncio.Lock()
+        segment.model_wire_lock = asyncio.Lock()
+        segment.model_wire_sequence = 0
+        segment.model_admission_condition = asyncio.Condition()
+        segment.config = SimpleNamespace(startup_seconds=1)
+
+        async def latest(_):
+            return 50, (SimpleNamespace(index=49), 0)
+
+        segment.owner = SimpleNamespace(
+            latest=SimpleNamespace(get=latest, version=50),
+            journal=SimpleNamespace(
+                snapshot={
+                    "segment": dict(
+                        segment_id="segment",
+                        state="streaming",
+                        applied_version=1,
+                        prompt_queue=[
+                            dict(
+                                version=2,
+                                text="original",
+                                effective={"source_frame_index": 0},
+                            )
+                        ],
+                    )
+                }
+            ),
+        )
+        sent = asyncio.Future()
+
+        async def send(wire):
+            sent.set_result(msgspec.msgpack.decode(wire))
+
+        task = asyncio.create_task(
+            segment._condition_controls(SimpleNamespace(send=send))
+        )
+        try:
+            event = await asyncio.wait_for(sent, 1)
+            assert segment.model_source_allowed(selected) is (selected == 33)
+            assert not segment.model_source_allowed(34)
+            receipt = dict(
+                type="control_ack",
+                kind="prompt.update",
+                event_id=event["event_id"],
+                prompt_version=2,
+                source_frame_index=34,
+            )
+            for state in ("accepted", "source_ready"):
+                assert await SourceSession.segment_model_control(
+                    segment.owner, segment, dict(receipt, state=state)
+                )
+            async with segment.model_admission_condition:
+                await asyncio.wait_for(
+                    segment.model_admission_condition.wait_for(
+                        lambda: segment.model_source_allowed(34)
+                    ),
+                    1,
+                )
+            assert segment.source_resume_after == 50
+            assert segment.pending_prompt["event_id"] == event["event_id"]
+            assert segment.resume_condition_evidence["source_ready"]
+            assert not segment.resume_condition_evidence["kv_ready"]
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("seconds", [1, 300, 1800, 7200])
 def test_configured_regional_play_duration(seconds, monkeypatch):
     from sglang.multimodal_gen.runtime.realtime.whitebox.render_source import (

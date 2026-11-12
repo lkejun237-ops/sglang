@@ -1274,6 +1274,10 @@ def test_decoder_startup_normalizes_nccl_for_each_launch_mode(
         decoder_worker.main()
 
 
+# The parent also waits for Python imports and teardown on each spawned rank.
+STARTUP_PROCESS_TIMEOUT = 60
+
+
 def _startup_rank(rank, rendezvous, output, fail):
     from datetime import timedelta
 
@@ -1331,7 +1335,7 @@ def test_both_ranks_finish_service_startup_or_fail_together(tmp_path, fail):
         for process in processes:
             process.start()
         for process in processes:
-            process.join(timeout=30)
+            process.join(timeout=STARTUP_PROCESS_TIMEOUT)
             assert not process.is_alive(), "A rank remained blocked during startup"
             assert process.exitcode == 0
     finally:
@@ -1483,8 +1487,7 @@ def test_pre_distributed_bind_failure_is_published_to_both_ranks(tmp_path, failu
             for process in processes:
                 process.start()
             for process in processes:
-                # The join budget also includes each spawned rank's Python imports.
-                process.join(timeout=30)
+                process.join(timeout=STARTUP_PROCESS_TIMEOUT)
                 assert not process.is_alive(), (
                     "A peer remained blocked after pre-bind failure"
                 )

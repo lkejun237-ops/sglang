@@ -130,7 +130,7 @@ class DiTLinkClient:
             self.owner = None
             raise
 
-    def send(self, kind, **fields):
+    def send(self, kind, *, wait_for_boundary=True, **fields):
         if self.owner is None:
             raise ValueError("Encoder/DiT session is not initialized")
         message = dict(
@@ -144,6 +144,7 @@ class DiTLinkClient:
             or kind in ("source.end", "session.cancel")
             or kind == "conditioning"
             and fields.get("source_boundary") is not None
+            and wait_for_boundary
             or kind == "conditioning"
             and fields.get("source_prepare") is not None
         ):

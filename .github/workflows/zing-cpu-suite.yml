@@ -28,7 +28,8 @@ env:
 jobs:
   cpu-suite:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # DiT shards run CPU multiprocess integration tests in both trials.
+    timeout-minutes: ${{ inputs.suite == 'dit-pipeline-contracts' && 45 || 30 }}
     env:
       CPU_SUITE: ${{ inputs.suite }}
       SHARD_INDEX: ${{ inputs.shard-index }}

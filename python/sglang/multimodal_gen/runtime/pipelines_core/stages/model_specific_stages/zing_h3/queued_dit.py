@@ -492,6 +492,8 @@ class QueuedDiTSession:
                 except ConditionError as exc:
                     if task["initial"]:
                         raise
+                    if getattr(self.state, "closed", False):
+                        raise RuntimeError("DiT condition rebuild failed") from exc
                     self.conditioning_notice = {
                         "code": exc.code,
                         "event_id": task["event_id"],

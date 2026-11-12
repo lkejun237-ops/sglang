@@ -1213,6 +1213,7 @@ def _is_source_progress_only(adapter, result):
         # A clip-barrier rebuild returns no RGB, but Room cannot resume source
         # admission until send_output delivers this kv_ready control receipt.
         and usage.get("zing_condition_ready") is None
+        and usage.get("zing_condition_source_ready") is None
         and not handoff.get("cache_reports")
         and not handoff.get("conditioning_notices")
         and not usage.get("zing_source_complete")

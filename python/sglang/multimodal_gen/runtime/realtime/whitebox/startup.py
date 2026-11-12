@@ -443,6 +443,7 @@ class PlayStartup:
                         "source_prepare_protocol": self.protocol,
                         "source_prompt_protocol": "ordered-boundary-v2",
                         "source_condition_switch_protocol": "clip-barrier-v1",
+                        "source_condition_early_release": True,
                         "source_demand_protocol": "source-demand-v1",
                     }
                     init = self.geometry.model_init(init)

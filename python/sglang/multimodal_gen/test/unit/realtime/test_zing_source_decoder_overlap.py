@@ -362,15 +362,18 @@ def test_condition_ready_with_no_rgb_is_delivered_after_previous_output(pipeline
     asyncio.run(run())
 
 
-def test_condition_ready_is_not_suppressed_as_source_progress():
+@pytest.mark.parametrize(
+    "receipt", ["zing_condition_ready", "zing_condition_source_ready"]
+)
+def test_condition_ready_is_not_suppressed_as_source_progress(receipt):
     adapter = SimpleNamespace(source_decoder_overlap=True)
     usage = {"zing_source_consumed_end": 17, "zing_source_dispatch_steps": 0}
     result = OutputBatch(usage=usage, raw_frame_batches=[])
     assert realtime_video_api._is_source_progress_only(adapter, result)
-    result.usage["zing_condition_ready"] = {
+    result.usage[receipt] = {
         "type": "control_ack",
         "kind": "prompt.update",
-        "state": "kv_ready",
+        "state": "source_ready" if receipt.endswith("source_ready") else "kv_ready",
         "prompt_version": 2,
         "source_frame_index": 17,
         "event_id": 1,
