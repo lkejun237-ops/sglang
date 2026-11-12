@@ -94,6 +94,12 @@ def _probe_seedleap_fp8_sm90_backend() -> bool:
         return False
 
     try:
+        is_backend_available = getattr(sl_sm90, "is_cutlass_backend_available", None)
+        if callable(is_backend_available):
+            return bool(is_backend_available())
+        has_prebuilt = getattr(sl_sm90, "has_prebuilt_cutlass_ext", None)
+        if callable(has_prebuilt) and has_prebuilt():
+            return True
         if hasattr(sl_sm90, "_find_cutlass_root"):
             if sl_sm90._find_cutlass_root() is None:
                 return False

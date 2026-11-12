@@ -197,3 +197,60 @@ def test_invalid_mirror_is_rejected_before_any_build(builder, flag, url):
     with pytest.raises(SystemExit) as error:
         builder("room", flag, url)
     assert error.value.code == 2
+
+
+def test_model_build_uses_pinned_base_image_without_kernels_checkout(
+    builder, capsys, monkeypatch, tmp_path
+):
+    base = "registry.example/base@sha256:" + "0" * 64
+    calls, exports, gates = builder("model", "--base", base)
+    assert len(calls) == 1
+    (argv,), options = calls[0]
+    expected = [
+        "docker",
+        "build",
+        "--file",
+        "docker/whitebox-model.Dockerfile",
+        "--target",
+        "model",
+        "--tag",
+        "fixture:release",
+        "--build-arg",
+        "WHITEBOX_SOURCE_SHA=" + SOURCE,
+        "--build-arg",
+        "WHITEBOX_SOURCE_BRANCH=main",
+        "--build-arg",
+        "WHITEBOX_SDK_SHA=" + SDK,
+        "--label",
+        "org.opencontainers.image.revision=" + SOURCE,
+        "--label",
+        "com.seedleap.worldkit.revision=" + SDK,
+        "--build-arg",
+        "MODEL_BASE_IMAGE=" + base,
+        "--platform",
+        "linux/amd64",
+        ".",
+    ]
+    assert argv == expected
+    assert options["check"] is True
+    assert gates == []
+    assert len(exports) == 2
+    assert exports[0][0][:2] == (release.REPO, SOURCE)
+    assert exports[1][0][:2] == (tmp_path / "sdk", SDK)
+    assert exports[1][1] == {"room_sdk": False}
+    assert json.loads(capsys.readouterr().out) == {
+        "schema_version": 1,
+        "source_branch": "main",
+        "source_sha": SOURCE,
+        "sdk_sha": SDK,
+        "local_image_tag": "fixture:release",
+        "component": "model",
+        "storage": None,
+        "deployed": False,
+    }
+
+    with pytest.raises(SystemExit) as error:
+        builder(
+            "model", "--base", base, "--kernels-checkout", str(tmp_path / "kernels")
+        )
+    assert error.value.code == 2

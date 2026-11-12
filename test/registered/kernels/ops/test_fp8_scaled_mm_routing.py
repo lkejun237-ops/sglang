@@ -126,6 +126,13 @@ def _ensure_mock_torch(monkeypatch):
             cuda_mod.get_device_capability = lambda dev=None: (9, 0)
             monkeypatch.setattr(torch, "cuda", cuda_mod, raising=False)
             monkeypatch.setitem(sys.modules, "torch.cuda", cuda_mod)
+        else:
+            monkeypatch.setattr(
+                torch.cuda,
+                "get_device_capability",
+                lambda dev=None: (9, 0),
+                raising=False,
+            )
 
 
 def _load_prefer_torch():
@@ -576,6 +583,78 @@ def test_sm90_forward_aot_non_sm90_capability_falls_back_directly(monkeypatch):
     torch = sys.modules["torch"]
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda dev=None: (8, 0))
 
+    mat_a, mat_b, scales_a, scales_b, out_dtype, bias = _make_tensors(128, 5376, 5376)
+    op = Fp8ScaledMMOp()
+    res = op.forward_aot(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=bias)
+
+    assert res == "sgl_fallback_out"
+    mock_sl_ops.fp8_scaled_mm.assert_not_called()
+    mock_sgl.fp8_scaled_mm.assert_called_once_with(
+        mat_a, mat_b, scales_a, scales_b, out_dtype, bias
+    )
+
+
+def test_sm90_prebuilt_wheel_without_cutlass_headers_routes_to_seedleap(monkeypatch):
+    """Prebuilt AOT wheel in a headerless container routes to seedleap_kernels."""
+    mock_sl_ops, mock_sgl = _setup_mock_backends(
+        monkeypatch,
+        seedleap_installed=True,
+        cutlass_root=None,
+        seedleap_return="seedleap_prebuilt_out",
+    )
+    sl_sm90 = sys.modules["seedleap_kernels.backends.cuda.fp8_gemm_sm90"]
+    sl_sm90.has_prebuilt_cutlass_ext = MagicMock(return_value=True)
+    sl_sm90.is_cutlass_backend_available = MagicMock(return_value=True)
+    _probe_seedleap_fp8_sm90_backend.cache_clear()
+
+    assert _is_seedleap_fp8_sm90_available() is True
+    mat_a, mat_b, scales_a, scales_b, out_dtype, bias = _make_tensors(128, 5376, 5376)
+    op = Fp8ScaledMMOp()
+    res = op.forward_aot(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=bias)
+
+    assert res == "seedleap_prebuilt_out"
+    mock_sl_ops.fp8_scaled_mm.assert_called_once_with(
+        mat_a,
+        mat_b,
+        scales_a,
+        scales_b,
+        bias=bias,
+        out_dtype=out_dtype,
+        backend="auto",
+    )
+    mock_sgl.fp8_scaled_mm.assert_not_called()
+
+
+def test_sm90_has_prebuilt_fallback_probe_without_cutlass_headers(monkeypatch):
+    """When only has_prebuilt_cutlass_ext is exposed, headerless probe succeeds."""
+    _setup_mock_backends(
+        monkeypatch,
+        seedleap_installed=True,
+        cutlass_root=None,
+    )
+    sl_sm90 = sys.modules["seedleap_kernels.backends.cuda.fp8_gemm_sm90"]
+    sl_sm90.has_prebuilt_cutlass_ext = MagicMock(return_value=True)
+    _probe_seedleap_fp8_sm90_backend.cache_clear()
+
+    assert _is_seedleap_fp8_sm90_available() is True
+
+
+def test_sm90_jit_disabled_without_prebuilt_ext_falls_back_cleanly(monkeypatch):
+    """When JIT is disabled and prebuilt .so is absent, fallback cleanly."""
+    monkeypatch.setenv("SEEDLEAP_KERNELS_DISABLE_JIT", "1")
+    mock_sl_ops, mock_sgl = _setup_mock_backends(
+        monkeypatch,
+        seedleap_installed=True,
+        cutlass_root=Path("/mock/cutlass"),
+        seedleap_side_effect=RuntimeError("JIT must never be invoked"),
+        sgl_return="sgl_fallback_out",
+    )
+    sl_sm90 = sys.modules["seedleap_kernels.backends.cuda.fp8_gemm_sm90"]
+    sl_sm90.has_prebuilt_cutlass_ext = MagicMock(return_value=False)
+    sl_sm90.is_cutlass_backend_available = MagicMock(return_value=False)
+    _probe_seedleap_fp8_sm90_backend.cache_clear()
+
+    assert _is_seedleap_fp8_sm90_available() is False
     mat_a, mat_b, scales_a, scales_b, out_dtype, bias = _make_tensors(128, 5376, 5376)
     op = Fp8ScaledMMOp()
     res = op.forward_aot(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=bias)

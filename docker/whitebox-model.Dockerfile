@@ -18,12 +18,16 @@ ARG WHITEBOX_SDK_SHA=unmanaged
 RUN python -c 'import json,sys; json.dump(dict(schema_version=1,source_branch=sys.argv[4],source_sha=sys.argv[1],sdk_sha=sys.argv[2]),open(sys.argv[3],"w"))' "$WHITEBOX_SOURCE_SHA" "$WHITEBOX_SDK_SHA" /opt/whitebox/release.json "$WHITEBOX_SOURCE_BRANCH"
 ENV PYTHONPATH=/opt/whitebox/python \
     WHITEBOX_RELEASE_MANIFEST=/opt/whitebox/release.json \
-    SGLANG_LIGHTWEIGHT_RUNTIME=1
+    SGLANG_LIGHTWEIGHT_RUNTIME=1 \
+    SEEDLEAP_KERNELS_DISABLE_JIT=1
 RUN python -c 'import pathlib, torch, transformers, zmq, sglang; assert pathlib.Path(sglang.__file__).resolve() == pathlib.Path("/opt/whitebox/python/sglang/__init__.py"); print(torch.__version__)'
 RUN python -c 'from sglang.multimodal_gen.runtime.realtime.source_transport import SourceTransportBudget; SourceTransportBudget().websocket_options()'
 # --help stops before the Decoder loads Lynn. Import its real implementation so
 # an older dependency base cannot defer this failure until GPUs are allocated.
 RUN python -c 'import diffusers; assert diffusers.__version__ == "0.41.0"; import sglang.multimodal_gen.runtime.models.vaes.lynn_streaming.loader'
+# Verify MODEL_BASE_IMAGE ships the prebuilt binary seedleap-kernels wheel
+# (no runtime nvcc/JIT compilation permitted in production).
+RUN python /opt/whitebox/deploy/whitebox/verify_model_kernels.py --manifest /opt/whitebox/release.json
 # Model weights, regional bundle, logs, conditioning secrets and local cache are
 # mounted independently. The builder does not read or alter any of them.
 ENTRYPOINT ["python", "/opt/whitebox/deploy/whitebox/model_service.py"]

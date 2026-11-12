@@ -70,6 +70,11 @@ python deploy/whitebox/release.py build \
 `--component model --base <CUDA依赖镜像>@sha256:<digest>` 构建模型运行镜像。
 H200/B300 可以使用不同的 CUDA/torch/kernel 依赖镜像，但都从同一完整 SGLang SHA 取源码。
 依赖镜像须与该版本原生扩展 ABI 兼容，首次切换必须验证；源码覆盖本身不证明兼容。
+其中 `MODEL_BASE_IMAGE` 必须预装 AOT 预编译二进制 `seedleap-kernels` wheel（禁止使用 `py3-none-any` 纯源码包或运行期 `nvcc` JIT 编译）。
+`docker/whitebox-model.Dockerfile` 在构建期设置 `SEEDLEAP_KERNELS_DISABLE_JIT=1`，并通过 `deploy/whitebox/verify_model_kernels.py` 强制校验预编译扩展、必需算子导出与 PyTorch 主次版本 ABI，同时将 `kernels_version` 与 `kernels_git_sha` 记录到 `/opt/whitebox/release.json`。
+已实测验证含预编译 `seedleap-kernels`（`c9bb3c89a08cd37f0649035e0e14f89ad4137eba`，`sm_90a`，PyTorch `2.13.0+cu130`，两地共享同一 OCI `ImageId` `4ab90764d8fede24f4567eed52be45e250bb9fea92c6b657e828e97c23ac036a` 与全部 72 层 `diff_ids`）的固定依赖镜像如下（原回滚基线 `v0.5.19-cu130-hub1.33@sha256:894eb66a6f96755d439e07045c27dac2dd5087d7caa5ea5f4d534bf7a500740a` 在两地均原样保留）：
+- 上海：`whitebox-shanghai-registry-vpc.cn-shanghai.cr.aliyuncs.com/whitebox/sglang:v0.5.19-cu130-hub1.33-seedleap-kernels-c9bb3c89@sha256:0433130f16790ecb2b483820d4b947c7b65197261c264e286fa7939b509428e5`
+- 泰国：`zing-thailand-registry-vpc.ap-southeast-7.cr.aliyuncs.com/zing/sglang:v0.5.19-cu130-hub1.33-seedleap-kernels-c9bb3c89@sha256:ec9f5111b4c048dd4d66b7b083b1b024281dcc8ddd6ac1d828b220ca0374e9c0`
 
 构建机下载受限时，可显式添加 `--pip-index-url https://mirrors.aliyun.com/pypi/simple/`
 和 `--go-proxy https://goproxy.cn`。只使用不含凭据、查询参数或片段的公共 HTTPS 镜像；
