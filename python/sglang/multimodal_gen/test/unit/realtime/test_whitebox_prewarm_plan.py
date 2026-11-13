@@ -735,9 +735,14 @@ def test_dynamic_members_open_independent_plan_windows_only_with_descriptor(
                 model_binding=object(),
                 config=SimpleNamespace(startup_seconds=10),
             )
-            inference = object.__new__(SourceInference)
-            inference.source, inference.manual, inference.prewarm = source, True, None
-            return inference
+            return SourceInference(
+                source,
+                dict(
+                    source_operation="create.manual",
+                    inference_control="manual",
+                    prompt="A multiplayer world",
+                ),
+            )
 
         capability = {"prewarmPlanProtocol": startup_prewarm.PROTOCOL}
         a, b, legacy = member(capability), member(capability), member({})

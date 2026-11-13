@@ -136,8 +136,6 @@ RUN corepack enable && corepack prepare pnpm@10.14.0 --activate
 WORKDIR /opt/worldkit
 COPY .whitebox-sdk/ ./
 RUN pnpm install --frozen-lockfile --ignore-scripts
-RUN pnpm exec vitest run packages/stream-host/tests/capture-hold.test.ts \
-      packages/stream-host/tests/raw-producer.test.ts packages/stream-host/tests/raw-session.test.ts
 
 FROM base AS room-process-init
 USER root
@@ -203,6 +201,10 @@ ARG WHITEBOX_TEST_ALLOW_DEVELOPMENT_RELEASE=0
 ENV WHITEBOX_ALLOW_DEVELOPMENT_RELEASE=$WHITEBOX_TEST_ALLOW_DEVELOPMENT_RELEASE
 COPY python/sglang/multimodal_gen/test /app/python/sglang/multimodal_gen/test
 RUN pip install --no-cache-dir pytest==9.0.2 pyzmq==27.2.0
+# The sealed cutscene regression generates and verifies media with the Room's FFmpeg and Chromium.
+RUN cd /opt/worldkit && node node_modules/vitest/vitest.mjs run \
+      packages/stream-host/tests/capture-hold.test.ts \
+      packages/stream-host/tests/raw-producer.test.ts packages/stream-host/tests/raw-session.test.ts
 USER whitebox
 # A real sealed world, two real native-pixel CLI processes, no server UI compositor.
 # All HTTP, Coordinator, H3 and archive dependencies are local fixtures.
