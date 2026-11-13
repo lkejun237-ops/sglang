@@ -802,7 +802,7 @@ async def exchange(
                     )
                     written = (
                         await asyncio.to_thread(received_file.write, payload)
-                        if received_file.mode == "raw"
+                        if received_file.mode in ("raw", "video")
                         else received_file.write(payload)
                     )
                     if written != len(payload):
@@ -1127,7 +1127,7 @@ def parser():
     )
     parser.add_argument(
         "--media-mode",
-        choices=("metrics", "representative", "raw", "full"),
+        choices=("metrics", "representative", "raw", "full", "video"),
         default="representative",
     )
     parser.add_argument(

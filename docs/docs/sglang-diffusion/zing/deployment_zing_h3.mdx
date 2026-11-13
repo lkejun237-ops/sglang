@@ -8,6 +8,58 @@ description: "供 Codex 与部署同学使用的 H100/H200/B300 部署决策、�
 下面是已有部署经验，只有对应版本、输入和配置的实测结论；
 实验补丁、显存快照、未验收画质均单独标注。新部署先选择一行，再沿证据入口取得原配置。
 
+2026-11-13 新增 Encoder 数值重排开关：`MINIMAX_H3_ENCODER_NUMERICAL_OPTIMIZATIONS=0`
+在 worker 启动前设置后，source/reference 回退原计算路径，关闭新快速引擎及旧 source 融合 GN；
+保留原 channels-last 策略和历史/padding 搬运。默认 `1` 保持已有行为。
+全 tile 合批、NTHWC、bias/GN 融合相互依赖，关闭时成组回退；不覆盖显式旧 tile batch/SP/采样配置。
+GPU 作业使用冻结源码 `c72e987233`，回归文件 26 项全过（含 8 项 CUDA 用例）；
+关闭模式相对显式旧计算顺序的 fixture 逐位一致，不代表真实 checkpoint 的逐张量 parity。
+本轮固定两个 FAST 开关为 1，仅改变数值开关 0/1；1027 AR+DMD step10000、
+泰国 4×L20D / E1+DiT SP2+D1 / BF16 / FA4 / compiled AdaLN / graphs / resident，
+实际 `mem-fraction-static=0.85`、W6/S3、Block0 cache 关闭、seed=42，Qwen 六项优化均为 0。
+复用 `product-case-20261103` 全 8 case：7 个 832×480 输出、1 个 480 源到 1280×736 输出。
+每侧每 case 独立诊断 1 次预热+1 次请求；停采确认后性能 1 次预热+3 次正式，另录完整视频。
+成功计数、逐 case 中位数/P95/n、三角色耗时/显存及完整视频统一见
+[同一产品对比报告的数值开关对照](https://review-cdn.loopit.com.cn/reports/pr691-encoder-product-ab/20261112-r4/index.html)。
+allocator 常驻在请求前读取；driver 首个采样在请求内，不能当作常驻，峰值也仅为采样值。
+组件分位数为 histogram 区间；Encoder 显存为 Qwen/reference/source 共享进程，DiT 逐 rank。
+人工画质与真实 checkpoint 的逐张量 parity 尚未验收；下方 `fd3461fe7e` 历史 FAST 总开关结果
+不作为本轮数值关闭模式验收，也不与本轮不同源码的结果混算收益。
+随后合入 main `6591315bbf`（含 Decoder SM90 opt-in 和完整视频工具更新）后，整组组合尚未重新做 GPU 复测；
+上述数据仍只验收 `c72e987233`，不重标为合入后的全链路结果。
+
+## H3 Visual Encoder H100 单卡融合加速（2026-11-12，单卡组件与独立启动验证通过）
+
+2026-11-12 审查修复：快速路径拒绝越过输入画布的名义 tile，并将非 SiLU 的 `FusedGroupNorm3D` 回退至原路径。修复版本 `fd3461fe7e` 在泰国 B300 的回归文件 18 项全过，并完成下述完整产品用例 A/B；以下 H100 组件结果仍保留其原始版本边界。
+
+基于 `c304535582` 为单卡 BF16 场景引入全 Tile 批处理、全栈物理 `[B, T, H, W, C]`（零拷贝 `channels_last_3d` 视图）、5 类 HBM3 合并访存 Triton 融合核、34 层卷积 FP32 偏置延迟吸收、双槽锁页内存异步 `uint8` H2D 与 SM90 cuDNN WGMMA 搜索策略；默认开启（`MINIMAX_H3_ENCODER_SINGLE_GPU_FAST=1`、`MINIMAX_H3_FAST_VISUAL_ENCODE=1`），显式设为 `0` 或多卡/deterministic 模式自动回退原路径。详细设计与算子归因见[单卡融合加速方案](/docs/sglang-diffusion/zing/plans/ENCODER_H100_FAST_SINGLE_GPU)。
+
+在上海 H100 单卡（`e01-cn-2zd4xi8m505`，`NVIDIA L20Z` SM90 / 132 SMs / 81,559 MiB，隔离卡 `GPU-6d5005a8-3721-3368-3cb1-893d25094c1c`，PyTorch 2.13.0+cu130 / Triton 3.7.1）加载 1027 AR+DMD step10000 配套 H3 Video VAE（`load_decoder=False`，BF16）执行同条件 Baseline（`=0`）与 Candidate（`=1`）对照（`repeats=9`，34 帧流式序列 `1+8+8+8+8+1`）：
+
+- **`832×480`（目标 `< 20 ms`，已达标）**：渐进首帧 `pop(T=1)` 端到端中位数 `66.984 → 18.901 ms`（P95 `67.109 → 19.289 ms`，`3.54×`，纯 GPU 中位数 `18.606 ms`）；参考图单帧 `encode_visual(T=1)` 中位数 `36.683 → 17.567 ms`（P95 `37.374 → 19.704 ms`，`2.09×`）；稳态 `pop(T=8)` 折合每帧 `26.827 → 11.900 ms`（`2.25×`）；34 帧流式均摊每帧 `28.836 → 12.306 ms`（P95 `57.210 → 12.484 ms`，`34.68 → 81.26 FPS`，`2.34×`）。仅 VAE 进程常驻 allocated `769.95 → 769.95 MiB`，请求峰值 allocated `21,355.23 → 10,937.41 MiB`（`-48.8%`），峰值 reserved `32,192.0 → 13,620.0 MiB`（`-57.7%`）。
+- **`1280×736`（目标 `< 60 ms`，已达标）**：渐进首帧 `pop(T=1)` 端到端中位数 `155.700 → 38.957 ms`（P95 `165.328 → 40.497 ms`，`4.00×`，纯 GPU 中位数 `38.302 ms`）；`encode_visual(T=1)` 中位数 `82.887 → 36.799 ms`（P95 `84.282 → 39.180 ms`，`2.25×`）；稳态 `pop(T=8)` 折合每帧 `62.778 → 29.394 ms`（`2.14×`）；34 帧流式均摊每帧 `67.456 → 29.963 ms`（P95 `67.733 → 30.135 ms`，`14.82 → 33.37 FPS`，`2.25×`）。仅 VAE 进程常驻 allocated `822.75 → 823.11 MiB`，峰值 allocated `26,598.60 → 27,270.17 MiB`，峰值 reserved `37,728.0 → 39,876.0 MiB`。
+- **`1312×736`（目标 `< 60 ms`，已达标）**：渐进首帧 `pop(T=1)` 端到端中位数 `155.828 → 38.930 ms`（P95 `156.092 → 40.212 ms`，`4.00×`）；`encode_visual(T=1)` 中位数 `82.967 → 36.792 ms`（`2.26×`）；34 帧流式均摊每帧 `67.481 → 29.941 ms`（`33.40 FPS`，`2.25×`）；仅 VAE 进程峰值 reserved `55,600.0 → 39,880.0 MiB`（`-28.3%`）。
+- **数值精度、生命周期与启动验证**：三个分辨率 34 帧流式 `moments` 相对原版 BF16 基线 RRMSE 均为 `0.00422–0.00425`（余弦相似度 `≥ 0.9996`），`dispose()` 后 `retained_bytes == 0`；273 项 SM90 CUDA 单测全部通过。独立 `zing_source_encoder_server`（含 Source VAE + Qwen FP8）启动预热通过，`/health` 在 `30.19 秒`（Source VAE 含 480p/736p 预热 `6.09 秒`、Qwen 文本编码 `24.10 秒`）后由 503 转为 200；测试后 Pod/凭据已清理且 GPU 0 驱动显存回到 `0 MiB`。原始回执：`oss://leap-world-shanghai/world-model/benchmarks/encoder-fast-h100/c30453558261b3474f5ee666a924a262285cf01a/r6/results.tar.gz`。
+- **未测范围与边界**：上述 H100 记录仅覆盖单卡 H3 Visual Encoder（Source VAE / Reference VAE）与独立 Encoder 启动；不代表 H100 三角色 E2E 收益。修复后 B300 产品用例结果见下一节，不能将 H100 单组件倍数直接外推。
+
+## 修复后 B300 产品用例 A/B（2026-11-12，画质待人工评估）
+
+冻结源码 `fd3461fe7e`，泰国 4×L20D（CC10.3，每卡 287,428,771,840 bytes），
+Encoder 1 卡 + DiT SP2 + Decoder 1 卡，BF16 / FA4 / compiled AdaLN / CUDA graphs / resident，
+Block0 cache 关闭。只将两个 Encoder 快速路径开关从 0 改为 1；模型、输入、seed=42 与其余配置一致。
+`product-case-20261103` 八个完整 case：七个 832×480 输出，一个 480p source → 1280×736 输出。
+每组每 case 一次完整预热、三次正式 metrics 请求；另各录一次完整视频，共 80 次请求全部成功、无缺帧。
+480p 各 case TTFF 中位数下降 6.7%–20.6%，全程 FPS 上升 0.8%–1.6%；
+736p TTFF 1.028→0.875 s（−14.9%），全程 FPS 22.610→22.731（+0.54%），n=3，不能据此断言尾延迟稳定。
+
+视频为独立视觉轮的全帧原尺寸 24 FPS / CRF18 输出，支持同步播放、逐帧与叠加。
+三组动态 case 的部分实际条件生效位置相差 17–34 帧，页面逐项显示；不能把这些差异全归因于数值误差。
+全部 RGB 输入哈希一致，输出哈希不同，未声称像素一致或画质通过。
+本轮未采集三角色的 CUDA 分项耗时与请求级 allocated/reserved 峰值（独立 Encoder 协议尚不支持请求 profiler）；
+Qwen、参考图 VAE、source VAE 及 DiT/Decoder 分项显存与耗时仍未验证，须在同配置补齐分项采集后再作归因。
+完整配置、原始数据入口、逐 case 中位数/P95、输入条件与视频见
+[产品用例 A/B 对比报告](https://review-cdn.loopit.com.cn/reports/pr691-encoder-product-ab/20261112-r4/index.html)（办公网/VPN）。
+
 ## 组件监控（2026-11-12，模型性能与线上接入未验证）
 
 部署启动器自动设置角色 service/lane 与每次启动独立的 Prometheus 多进程目录，

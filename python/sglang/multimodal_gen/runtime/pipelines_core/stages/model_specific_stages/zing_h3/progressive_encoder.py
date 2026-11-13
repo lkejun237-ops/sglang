@@ -197,14 +197,12 @@ class H3ProgressiveEncoderSession:
         # A local preparation failure must rendezvous with peers before their
         # device collective; pending cache state is committed only at the end.
         error = None
+        use_fast_uint8 = False
         try:
             needed = 1 if self._clip_frames == 0 else 8
             count = min(needed, self.buffered_frames)
+            length = 1 if needed == 1 else (count + 3) // 4
             frames = self._pixels[:, :count]
-            if count < needed:
-                frames = torch.cat(
-                    (frames, frames[:, -1:].expand(-1, needed - count, -1, -1)), 1
-                )
             model = self.cache.model
             parameter = next(model.encoder.parameters())
             config = self.codecs.runtime["vae_config"]
@@ -228,9 +226,19 @@ class H3ProgressiveEncoderSession:
                 raise ValueError(
                     "Encoder weights must be loaded in the configured dtype"
                 )
-            pixels = frames[None].to(device=parameter.device, dtype=dtype).div(255)
-            mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
-            std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
+            can_fast = getattr(self.cache, "can_encode_uint8_fast", None)
+            use_fast_uint8 = bool(
+                callable(can_fast)
+                and can_fast(int(frames.shape[2]), int(frames.shape[3]))
+            )
+            if not use_fast_uint8:
+                if count < needed:
+                    frames = torch.cat(
+                        (frames, frames[:, -1:].expand(-1, needed - count, -1, -1)), 1
+                    )
+                pixels = frames[None].to(device=parameter.device, dtype=dtype).div(255)
+                mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
+                std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
         except Exception as exc:
             error = exc
         self.cache.agree("prepared", error=error)
@@ -246,14 +254,18 @@ class H3ProgressiveEncoderSession:
                 self.encode_mode, self.cudnn_benchmark_limit
             ) as encode_policy,
         ):
-            moments, states, work = self.cache.encode((pixels - mean) / std)
+            if use_fast_uint8:
+                moments, states, work = self.cache.encode_uint8_frames(
+                    frames, needed_frames=needed, valid_latents=length
+                )
+            else:
+                moments, states, work = self.cache.encode((pixels - mean) / std)
             self.cache.last_execution["encode_policy"] = dict(
                 encode_policy, encode_dtype=self.encode_dtype
             )
         error = None
         try:
-            length = 1 if needed == 1 else (count + 3) // 4
-            values = moments[:, :, :length].clone()
+            values = moments if use_fast_uint8 else moments[:, :, :length].clone()
             remaining = (
                 self._pixels[:, count:].clone()
                 if count < self.buffered_frames

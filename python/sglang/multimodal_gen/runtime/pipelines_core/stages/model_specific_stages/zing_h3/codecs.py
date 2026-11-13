@@ -37,6 +37,8 @@ from .media_input import ZingH3MediaInput, _sample_max_area_config
 from .packing import H3InferenceInputs
 from .visual_encoding import encode_clips
 
+_DEFAULT_ENCODE_CLIPS = encode_clips
+
 # Default checkpoint reference preprocessing is larger than the output canvas.
 _STATIC_REFERENCE_MAX_AREA = 1032192
 
@@ -202,8 +204,21 @@ class ZingH3Codecs(ZingH3MediaInput):
                 native,
                 make_encoder_layout(model, weights=model._progressive_encoder_weights),
             )
+            if next(model.encoder.parameters()).device.type == "cuda":
+                from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.fast_encoder import (
+                    is_fast_single_gpu_model_supported,
+                    prepare_fast_single_gpu_encoder,
+                )
+
+                if is_fast_single_gpu_model_supported(model):
+                    prepare_fast_single_gpu_encoder(model)
+                else:
+                    model._fast_single_gpu_encoder = None
+            else:
+                model._fast_single_gpu_encoder = None
         else:
             model._progressive_encoder_weights = {}
+            model._fast_single_gpu_encoder = None
 
     def warmup_source_vae(self):
         """Warm prepared source tile kernels before the caller advertises ready."""
@@ -237,7 +252,23 @@ class ZingH3Codecs(ZingH3MediaInput):
                     warmup.commit(pending, work)
             finally:
                 warmup.clear()
-            torch.cuda.synchronize(next(model.encoder.parameters()).device)
+            param_dev = next(model.encoder.parameters()).device
+            if (
+                param_dev.type == "cuda"
+                and getattr(model, "_fast_single_gpu_encoder", None) is not None
+                and warmup.numerical_optimizations
+                and os.environ.get("MINIMAX_H3_FAST_ENCODER_WARMUP", "1") == "1"
+                and os.environ.get("MINIMAX_H3_ENCODER_SINGLE_GPU_FAST", "1") == "1"
+                and getattr(CausalEncoderCache, "__module__", "").endswith(
+                    ".progressive"
+                )
+            ):
+                from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.fast_encoder import (
+                    warmup_fast_single_gpu_encoder,
+                )
+
+                warmup_fast_single_gpu_encoder(model)
+            torch.cuda.synchronize(param_dev)
 
     @staticmethod
     def _stats(config, latent, audio=False):
@@ -382,6 +413,148 @@ class ZingH3Codecs(ZingH3MediaInput):
             presentation_fn=minimax_h3_ref2va_video_presentation,
         )
 
+    def _can_fast_visual_encode_profile(
+        self, frames, *, check_encode_clips_hook=False
+    ) -> bool:
+        from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.fast_encoder import (
+            encoder_numerical_optimizations_enabled,
+        )
+
+        if not encoder_numerical_optimizations_enabled():
+            return False
+        if (
+            os.environ.get("MINIMAX_H3_FAST_VISUAL_ENCODE", "1") != "1"
+            or os.environ.get("MINIMAX_H3_ENCODER_SINGLE_GPU_FAST", "1") != "1"
+            or bool(os.environ.get("MINIMAX_H3_PROGRESSIVE_ENCODER_TILE_BATCH_SIZE"))
+        ):
+            return False
+        if (
+            torch.are_deterministic_algorithms_enabled()
+            or torch.backends.cudnn.deterministic
+            or torch.compiler.is_compiling()
+        ):
+            return False
+        if check_encode_clips_hook and encode_clips is not _DEFAULT_ENCODE_CLIPS:
+            return False
+        vae_cfg = self.runtime.get("vae_config", {})
+        if (
+            vae_cfg.get("encode_mode") != "performance"
+            or vae_cfg.get("encode_dtype") != "bfloat16"
+        ):
+            return False
+        if (
+            not isinstance(frames, torch.Tensor)
+            or frames.dtype != torch.uint8
+            or frames.ndim != 4
+            or frames.shape[0] != 3
+            or frames.shape[1] < 1
+        ):
+            return False
+        if (
+            getattr(self, "vae_frames_per_chunk", None),
+            getattr(self, "vae_latents_per_chunk", None),
+            getattr(self, "temporal_ratio", None),
+        ) != (17, 5, 4):
+            return False
+        if torch.distributed.is_initialized():
+            from sglang.multimodal_gen.runtime.distributed import (
+                get_sp_group,
+                model_parallel_is_initialized,
+            )
+            from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.klvae import (
+                get_tile_parallel_state,
+            )
+
+            if (
+                torch.distributed.get_world_size() > 1
+                and not model_parallel_is_initialized()
+            ):
+                return False
+            if (
+                model_parallel_is_initialized()
+                and getattr(get_sp_group(), "world_size", 1) > 1
+            ):
+                return False
+            if get_tile_parallel_state()[1] > 1:
+                return False
+        model = self.modules["video_vae"]
+        if getattr(model, "stack_tiling", False):
+            return False
+        try:
+            param = next(model.parameters())
+        except StopIteration:
+            return False
+        if param.device.type != "cuda":
+            return False
+        from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.fast_encoder import (
+            _build_tile_geometry_plan,
+            has_custom_encoder_hooks_or_patches,
+            is_fast_single_gpu_model_supported,
+            triton_available,
+        )
+
+        if not triton_available() or not is_fast_single_gpu_model_supported(model):
+            return False
+        assets = getattr(model, "_fast_single_gpu_encoder", None)
+        if has_custom_encoder_hooks_or_patches(
+            model, assets=assets, allow_quant_conv_forward=False
+        ):
+            return False
+        height, width = int(frames.shape[2]), int(frames.shape[3])
+        if assets is not None and assets.device == param.device:
+            from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.fast_encoder import (
+                get_tile_geometry_plan,
+            )
+
+            try:
+                get_tile_geometry_plan(assets, model, height, width)
+            except ValueError:
+                return False
+        else:
+            try:
+                _build_tile_geometry_plan(
+                    model,
+                    height,
+                    width,
+                    device=torch.device("cpu"),
+                    dtype=torch.bfloat16,
+                )
+            except ValueError:
+                return False
+        return True
+
+    def _try_fast_encode_moments(self, frames, *, check_encode_clips_hook=False):
+        if not self._can_fast_visual_encode_profile(
+            frames, check_encode_clips_hook=check_encode_clips_hook
+        ):
+            return None
+        from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.fast_encoder import (
+            encode_uint8_sequence_fast_single_gpu,
+            prepare_fast_single_gpu_encoder,
+        )
+
+        model = self.modules["video_vae"]
+        assets = getattr(model, "_fast_single_gpu_encoder", None)
+        param = next(model.encoder.parameters())
+        if (
+            assets is None
+            or assets.device != param.device
+            or assets.dtype != param.dtype
+        ):
+            assets = prepare_fast_single_gpu_encoder(model)
+        if assets is None:
+            return None
+        try:
+            return encode_uint8_sequence_fast_single_gpu(
+                model,
+                assets,
+                frames,
+                frames_per_chunk=self.vae_frames_per_chunk,
+                temporal_ratio=self.temporal_ratio,
+            )
+        except ValueError:
+            return None
+
     def encode_visual(self, frames, *, metric_operation="source"):
         from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 
@@ -396,26 +569,11 @@ class ZingH3Codecs(ZingH3MediaInput):
             # Only the encoder changes precision. Decoder weights remain FP32.
             model.encoder.to(dtype=dtype)
             model.quant_conv.to(dtype=dtype)
-            pixels = frames[None].to(device=device, dtype=dtype).div(255)
-            mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
-            std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
-            pixels = (pixels - mean) / std
-            count = pixels.shape[2]
-            if count != 1 and count % self.vae_frames_per_chunk:
-                pixels = torch.cat(
-                    (
-                        pixels,
-                        pixels[:, :, -1:].expand(
-                            -1, -1, -count % self.vae_frames_per_chunk, -1, -1
-                        ),
-                    ),
-                    2,
-                )
             with (
                 component_timer(
                     "encoder",
                     operation=metric_operation,
-                    frames=count,
+                    frames=frames.shape[1],
                     height=frames.shape[-2],
                     width=frames.shape[-1],
                 ),
@@ -424,21 +582,41 @@ class ZingH3Codecs(ZingH3MediaInput):
                     self.runtime["vae_config"].get("cudnn_benchmark_limit"),
                 ),
             ):
-                moments = torch.cat(
-                    encode_clips(
-                        model,
-                        list(pixels.split(self.vae_frames_per_chunk, dim=2)),
-                        self.runtime["vae_config"]["encode_tile_batch_size"],
-                    ),
-                    2,
+                moments = self._try_fast_encode_moments(
+                    frames, check_encode_clips_hook=True
                 )
-                chunks, tail = divmod(count - 1, self.vae_frames_per_chunk)
-                length = (
-                    chunks * self.vae_latents_per_chunk
-                    + 1
-                    + math.ceil(tail / self.temporal_ratio)
-                )
-                posterior = DiagonalGaussianDistribution(moments[:, :, :length])
+                if moments is None:
+                    pixels = frames[None].to(device=device, dtype=dtype).div(255)
+                    mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
+                    std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
+                    pixels = (pixels - mean) / std
+                    count = pixels.shape[2]
+                    if count != 1 and count % self.vae_frames_per_chunk:
+                        pixels = torch.cat(
+                            (
+                                pixels,
+                                pixels[:, :, -1:].expand(
+                                    -1, -1, -count % self.vae_frames_per_chunk, -1, -1
+                                ),
+                            ),
+                            2,
+                        )
+                    moments = torch.cat(
+                        encode_clips(
+                            model,
+                            list(pixels.split(self.vae_frames_per_chunk, dim=2)),
+                            self.runtime["vae_config"]["encode_tile_batch_size"],
+                        ),
+                        2,
+                    )
+                    chunks, tail = divmod(count - 1, self.vae_frames_per_chunk)
+                    length = (
+                        chunks * self.vae_latents_per_chunk
+                        + 1
+                        + math.ceil(tail / self.temporal_ratio)
+                    )
+                    moments = moments[:, :, :length]
+                posterior = DiagonalGaussianDistribution(moments)
                 generator = torch.Generator(device="cpu").manual_seed(
                     self.runtime["vae_config"]["posterior_seed"]
                 )
@@ -483,19 +661,19 @@ class ZingH3Codecs(ZingH3MediaInput):
 
         frames = item["frames"]
         model = self.modules["video_vae"]
-        profile = json.dumps(
-            {
-                "shape": list(frames.shape),
-                "dtype": str(frames.dtype),
-                "vae": self.runtime["vae_config"],
-                "mean": self.va.latents_mean,
-                "std": self.va.latents_std,
-                "cudnn_benchmark_limit": torch.backends.cudnn.benchmark_limit,
-                "cudnn_tf32": torch.backends.cudnn.allow_tf32,
-                "matmul_tf32": torch.backends.cuda.matmul.allow_tf32,
-            },
-            sort_keys=True,
-        )
+        profile_payload = {
+            "shape": list(frames.shape),
+            "dtype": str(frames.dtype),
+            "vae": self.runtime["vae_config"],
+            "mean": self.va.latents_mean,
+            "std": self.va.latents_std,
+            "cudnn_benchmark_limit": torch.backends.cudnn.benchmark_limit,
+            "cudnn_tf32": torch.backends.cudnn.allow_tf32,
+            "matmul_tf32": torch.backends.cuda.matmul.allow_tf32,
+        }
+        if self._can_fast_visual_encode_profile(frames, check_encode_clips_hook=True):
+            profile_payload["fast_visual_encode"] = True
+        profile = json.dumps(profile_payload, sort_keys=True)
         digest = hashlib.sha256(profile.encode())
         digest.update(frames.contiguous().numpy().tobytes())
         identity = digest.hexdigest()
@@ -539,13 +717,16 @@ class ZingH3Codecs(ZingH3MediaInput):
         dtype = getattr(torch, self.runtime["vae_config"]["encode_dtype"])
         model.encoder.to(dtype=dtype)
         model.quant_conv.to(dtype=dtype)
-        pixels = frames[None].to(device=device, dtype=dtype).div(255)
-        mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
-        std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
         with _visual_encode_policy(
             self.runtime["vae_config"]["encode_mode"],
             self.runtime["vae_config"].get("cudnn_benchmark_limit"),
         ):
+            moments = self._try_fast_encode_moments(frames)
+            if moments is not None:
+                return moments
+            pixels = frames[None].to(device=device, dtype=dtype).div(255)
+            mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
+            std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
             return model._adaptive_encode((pixels - mean) / std)
 
     def sample_streaming_visual_moments(self, moments, *, latent_start, noise_version):

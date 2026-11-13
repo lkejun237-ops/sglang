@@ -1640,6 +1640,7 @@
                     "pages": [
                       "docs/sglang-diffusion/zing/overview",
                       "docs/sglang-diffusion/zing/deployment_zing_h3",
+                      "docs/sglang-diffusion/zing/plans/ENCODER_H100_FAST_SINGLE_GPU",
                       "docs/sglang-diffusion/zing/plans/whitebox-manual-releases",
                       "docs/sglang-diffusion/zing/plans/whitebox-room-manual-expansion",
                       "docs/sglang-diffusion/zing/plans/whitebox-effective-config-20261109",
@@ -1647,7 +1648,6 @@
                       "docs/sglang-diffusion/zing/plans/BLOCK0_PAGED_L1",
                       "docs/sglang-diffusion/whitebox/specs/world-model-context",
                       "docs/sglang-diffusion/zing_h3/specs/whitebox-sink-api.zh-CN",
-                      "docs/sglang-diffusion/zing/plans/BLOCK0_PAGED_L1",
                       "docs/sglang-diffusion/zing/prompt-reference-budgets",
                       "docs/sglang-diffusion/zing/architecture",
                       "docs/sglang-diffusion/zing/realtime-streaming",

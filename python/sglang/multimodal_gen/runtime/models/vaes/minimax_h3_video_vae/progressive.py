@@ -19,6 +19,14 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from .conv import BaseConv3d
+from .fast_encoder import (
+    encoder_numerical_optimizations_enabled,
+    get_tile_geometry_plan,
+    has_custom_encoder_hooks_or_patches,
+    run_fast_single_gpu_step,
+    stage_uint8_to_gpu,
+    triton_available,
+)
 from .norm import FusedGroupNorm3D, TemporalIsolatedGroupNorm
 from .progressive_layout import make_encoder_layout
 from .spatial_padding import spatial_pad
@@ -99,7 +107,8 @@ class CausalEncoderCache:
         )
         self.encode_mode = encode_mode
         # Experimental execution choices are snapshotted per session, never read in kernels.
-        self.fused_norm_input = (
+        self.numerical_optimizations = encoder_numerical_optimizations_enabled()
+        self.fused_norm_input = self.numerical_optimizations and (
             os.environ.get("MINIMAX_H3_PROGRESSIVE_FUSED_NORM_INPUT", "1") == "1"
         )
         self.fused_conv_input = (
@@ -143,6 +152,25 @@ class CausalEncoderCache:
         self._multi_frame_layout = (
             layouts[1] if use_channels_last else self._native_layout
         )
+        self.single_gpu_fast_requested = (
+            os.environ.get("MINIMAX_H3_ENCODER_SINGLE_GPU_FAST", "1") == "1"
+        )
+        self._fast_assets = getattr(model, "_fast_single_gpu_encoder", None)
+        self._use_fast_single_gpu = (
+            self.single_gpu_fast_requested
+            and self.numerical_optimizations
+            and use_channels_last
+            and self._fast_assets is not None
+            and model.encoder.conv_in.weight.device.type == "cuda"
+            and self.group is None
+            and (self.available_group is None or self.available_group.world_size == 1)
+            and self.tile_batch_size is None
+            and not getattr(model, "stack_tiling", False)
+            and self.spatial_padding == "reflect2d"
+            and self.fused_norm_input
+            and self.fused_conv_input
+            and triton_available()
+        )
         self.model = model
         self.states = {}
         self.temporal_positions = 0
@@ -150,6 +178,45 @@ class CausalEncoderCache:
     @property
     def channels_last(self):
         return self._multi_frame_layout.channels_last
+
+    @property
+    def fast_single_gpu(self):
+        if not self._use_fast_single_gpu or torch.compiler.is_compiling():
+            return False
+        if (
+            torch.are_deterministic_algorithms_enabled()
+            or torch.backends.cudnn.deterministic
+        ):
+            return False
+        if "forward" in self.__dict__ or type(self).forward is not _ORIG_CACHE_FORWARD:
+            return False
+        assets = self._fast_assets
+        conv_in_w = self.model.encoder.conv_in.weight
+        quant_w = self.model.quant_conv.weight
+        if (
+            conv_in_w.device != assets.device
+            or conv_in_w.dtype != torch.bfloat16
+            or conv_in_w.dtype != assets.dtype
+            or quant_w.device != assets.device
+            or quant_w.dtype != assets.dtype
+        ):
+            return False
+        if has_custom_encoder_hooks_or_patches(
+            self.model, assets=assets, allow_quant_conv_forward=True
+        ):
+            return False
+        return True
+
+    def can_encode_uint8_fast(self, height: int, width: int) -> bool:
+        if "encode" in self.__dict__ or type(self).encode is not _ORIG_CACHE_ENCODE:
+            return False
+        if not self.fast_single_gpu:
+            return False
+        try:
+            get_tile_geometry_plan(self._fast_assets, self.model, height, width)
+        except ValueError:
+            return False
+        return True
 
     def conv(self, layer, x, states, key, layout, *, normalization=None):
         x = layout.input(x)
@@ -306,8 +373,189 @@ class CausalEncoderCache:
         if any(item != values[0][1] for _, item in values):
             raise RuntimeError("Progressive encoder rank state mismatch")
 
+    def _finalize_fast_execution(
+        self,
+        *,
+        input_shape: list[int],
+        result: torch.Tensor,
+        pending: dict,
+        work: int,
+        layer_work: dict[str, int],
+        opt_counts: dict[str, int],
+        geom,
+    ):
+        for k, v in opt_counts.items():
+            self.optimization_counts[k] = self.optimization_counts.get(k, 0) + v
+        self.layer_work = dict(layer_work)
+        local_ids = list(range(geom.num_tiles))
+        reason = self.default_fallback_reason or (
+            "disabled"
+            if self.tile_mode == "replicated"
+            else (
+                "non_tiled_encoder"
+                if not self.model.encoder_tiling
+                else "single_rank_or_uninitialized_group"
+            )
+        )
+        t_in = input_shape[2]
+        execution = dict(
+            channels_last_3d=True,
+            fast_single_gpu=True,
+            spatial_padding=self.spatial_padding,
+            requested_mode=self.requested_mode,
+            encode_mode=self.encode_mode,
+            performance_auto=self.performance_auto,
+            effective_mode="replicated",
+            fallback_reason=reason,
+            group=self.group_name if self.available_group is not None else None,
+            group_ranks=(
+                list(self.available_group.ranks)
+                if self.available_group is not None
+                else []
+            ),
+            rank=0,
+            world_size=1,
+            encoder_ranks=1,
+            participating_group_ranks=1,
+            replicated_copies=1,
+            tile_count=geom.num_tiles,
+            local_tile_ids=local_ids,
+            backend_policy=dict(
+                cudnn_benchmark=torch.backends.cudnn.benchmark,
+                cudnn_deterministic=torch.backends.cudnn.deterministic,
+                deterministic_algorithms=torch.are_deterministic_algorithms_enabled(),
+            ),
+            stack_tiling=False,
+            tile_batch_size=geom.num_tiles,
+            tile_batches=[local_ids],
+            local_tile_shapes=[
+                [1, 3, t_in, geom.tile_h, geom.tile_w] for _ in local_ids
+            ],
+            input_shape=input_shape,
+            output_shape=list(result.shape),
+            dtype=str(result.dtype),
+            temporal_positions=work,
+            layer_temporal_positions=dict(layer_work),
+            cache_bytes=sum(
+                t.untyped_storage().nbytes()
+                for t, _ in pending.values()
+                if t is not None
+            ),
+            gather_calls=0,
+            gather_input_bytes=0,
+            gather_output_bytes=0,
+            input_optimizations=dict(
+                fused_norm_input=self.fused_norm_input,
+                fused_conv_input=self.fused_conv_input,
+                counts=dict(self.optimization_counts),
+            ),
+        )
+        if self.last_execution is None:
+            logger.info("Progressive encoder tile execution: %s", execution)
+        self.last_execution = execution
+
+    @torch.no_grad()
+    def encode_uint8_frames(
+        self,
+        frames: torch.Tensor,
+        *,
+        needed_frames: int,
+        valid_latents: int | None = None,
+    ):
+        height, width = int(frames.shape[2]), int(frames.shape[3])
+        geom = get_tile_geometry_plan(self._fast_assets, self.model, height, width)
+        local_ids = tuple(range(geom.num_tiles))
+        layout = (
+            (1, 3),
+            (height, width),
+            str(self._fast_assets.dtype),
+            geom.geometry_tuple,
+            local_ids,
+            False,
+            (local_ids,),
+            False,
+        )
+        if self._layout is not None and layout != self._layout:
+            raise ValueError("Progressive tile layout cannot change within a clip")
+        gpu_frames = stage_uint8_to_gpu(self._fast_assets, frames)
+        with torch.profiler.record_function("H3ProgressiveFastSingleGPU"):
+            result, pending, work, layer_work, opt_counts, geom = (
+                run_fast_single_gpu_step(
+                    self.model,
+                    self._fast_assets,
+                    frames_uint8=gpu_frames,
+                    needed_frames=needed_frames,
+                    valid_latents=valid_latents,
+                    current_states=self.states,
+                )
+            )
+        self._layout = layout
+        self._finalize_fast_execution(
+            input_shape=[1, 3, int(needed_frames), height, width],
+            result=result,
+            pending=pending,
+            work=work,
+            layer_work=layer_work,
+            opt_counts=opt_counts,
+            geom=geom,
+        )
+        return result, pending, work
+
     @torch.no_grad()
     def encode(self, x):
+        if (
+            self.fast_single_gpu
+            and x.ndim == 5
+            and x.shape[0] == 1
+            and x.shape[1] == 3
+            and x.dtype == self._fast_assets.dtype
+            and x.device == self._fast_assets.device
+        ):
+            height, width = int(x.shape[3]), int(x.shape[4])
+            geom = None
+            try:
+                geom = get_tile_geometry_plan(
+                    self._fast_assets, self.model, height, width
+                )
+            except ValueError:
+                geom = None
+            if geom is not None:
+                local_ids = tuple(range(geom.num_tiles))
+                layout = (
+                    tuple(x.shape[:2]),
+                    tuple(x.shape[3:]),
+                    str(x.dtype),
+                    geom.geometry_tuple,
+                    local_ids,
+                    False,
+                    (local_ids,),
+                    False,
+                )
+                if self._layout is not None and layout != self._layout:
+                    raise ValueError(
+                        "Progressive tile layout cannot change within a clip"
+                    )
+                with torch.profiler.record_function("H3ProgressiveFastSingleGPU"):
+                    result, pending, work, layer_work, opt_counts, geom = (
+                        run_fast_single_gpu_step(
+                            self.model,
+                            self._fast_assets,
+                            pixels_bf16=x,
+                            current_states=self.states,
+                        )
+                    )
+                self._layout = layout
+                self._finalize_fast_execution(
+                    input_shape=list(x.shape),
+                    result=result,
+                    pending=pending,
+                    work=work,
+                    layer_work=layer_work,
+                    opt_counts=opt_counts,
+                    geom=geom,
+                )
+                return result, pending, work
+
         model = self.model
         pending = {}
         work = 0
@@ -490,6 +738,7 @@ class CausalEncoderCache:
         self._layout = layout
         execution = dict(
             channels_last_3d=self.channels_last,
+            fast_single_gpu=False,
             spatial_padding=self.spatial_padding,
             requested_mode=self.requested_mode,
             encode_mode=self.encode_mode,
@@ -549,3 +798,7 @@ class CausalEncoderCache:
     def clear(self):
         self.states = {}
         self._layout = None
+
+
+_ORIG_CACHE_FORWARD = CausalEncoderCache.forward
+_ORIG_CACHE_ENCODE = CausalEncoderCache.encode

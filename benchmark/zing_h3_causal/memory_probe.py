@@ -45,6 +45,8 @@ def emit(kind, **fields):
 def history(clear=False):
     import torch
 
+    if os.environ.get("ZING_BENCHMARK_MEMORY_HISTORY", "1") == "0":
+        return
     torch.cuda.memory._record_memory_history(
         enabled="all",
         context="all",
@@ -75,7 +77,11 @@ def start():
         visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
         max_entries=MAX_ENTRIES,
         torch_version=torch.__version__,
-        record_stacks="python",
+        record_stacks=(
+            "none"
+            if os.environ.get("ZING_BENCHMARK_MEMORY_HISTORY", "1") == "0"
+            else "python"
+        ),
     )
     (root / ("process-%d.json" % os.getpid())).write_text(
         json.dumps(identity, indent=2)

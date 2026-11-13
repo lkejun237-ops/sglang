@@ -7,6 +7,55 @@
   },
   "tests": [
     {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_h3_fast_single_gpu_encoder.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "MIXED",
+      "approved": true,
+      "allowed_skips": [
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_fast_single_gpu_encoder.py::test_cuda_fast_kernels_and_progressive_parity",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_fast_single_gpu_encoder.py::test_cuda_transactional_fault_injection_and_zero_retained_bytes",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_fast_single_gpu_encoder.py::test_cuda_fast_visual_encode_and_moments_parity[1]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_fast_single_gpu_encoder.py::test_cuda_fast_visual_encode_and_moments_parity[5]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_fast_single_gpu_encoder.py::test_cuda_fast_visual_encode_and_moments_parity[17]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_fast_single_gpu_encoder.py::test_cuda_fast_visual_encode_and_moments_parity[20]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_fast_single_gpu_encoder.py::test_fast_encoder_dynamic_dtype_hook_and_chunking_guards",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_fast_single_gpu_encoder.py::test_cuda_numerical_optimization_off_matches_legacy",
+          "reason": "Requires CUDA and Triton"
+        }
+      ],
+      "sources": [
+        "main"
+      ],
+      "reason": "CPU policy/admission, tile bounds and activation regressions; numerical-off CUDA parity is registered but not yet run on GPU.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "9826529588ec053748036819098d945ba2acc225214e6025ee2859cd16114143"
+      },
+      "source_sha256": "9826529588ec053748036819098d945ba2acc225214e6025ee2859cd16114143"
+    },
+    {
       "path": "python/sglang/multimodal_gen/test/unit/test_zing_codec_warmup.py",
       "suite": "dit-pipeline-contracts",
       "status": "CPU_PASS",
@@ -12344,6 +12393,31 @@
           }
         }
       }
+    },
+    {
+      "path": "benchmark/zing_h3_causal/encoder_fast_validation/test_video_capture.py",
+      "suite": "benchmark-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [
+        {
+          "nodeid": "benchmark/zing_h3_causal/encoder_fast_validation/test_video_capture.py::test_full_video_keeps_every_frame_at_original_size_and_24fps",
+          "reason": "FFmpeg required"
+        },
+        {
+          "nodeid": "benchmark/zing_h3_causal/encoder_fast_validation/test_video_capture.py::test_review_builder_checks_inputs_and_escapes_prompt",
+          "reason": "FFmpeg required"
+        }
+      ],
+      "sources": [
+        "main"
+      ],
+      "reason": "Five local CPU tests passed, including histogram delta units, GPU UUID mapping and request worker identity; video cases require FFmpeg/ffprobe. Linux CI remains independent.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "6e9e387c292aa017451726452435cdbf43a6435b9180450efa7bdc56e3e2b065"
+      },
+      "source_sha256": "6e9e387c292aa017451726452435cdbf43a6435b9180450efa7bdc56e3e2b065"
     },
     {
       "path": "benchmark/zing_h3_causal/tests/test_full_video_capture.py",
