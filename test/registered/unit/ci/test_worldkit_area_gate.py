@@ -24,6 +24,7 @@ def test_area_gate_runs_real_child_receipts_and_requires_aggregate_success(
     roots = module.AREA_FILES
     assert roots[0].endswith("test_whitebox_area_handoff.py")
     assert {
+        "test_whitebox_inference_reset.py",
         "test_source_prepare_contract.py",
         "test_whitebox_startup.py",
         "test_whitebox_room_cleanup.py",

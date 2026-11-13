@@ -529,7 +529,9 @@ class RenderJournal:
 
         return await self.command(command, transition, duplicate=duplicate)
 
-    async def settle_inference(self, request_id, revision, *, state, code=None):
+    async def settle_inference(
+        self, request_id, revision, *, state, code=None, preserve_intent=False
+    ):
         def settle(value):
             current = value["inference"]
             operation = value["operations"][request_id]
@@ -539,6 +541,19 @@ class RenderJournal:
                     inference=copy.deepcopy(current),
                     superseded_by_inference_revision=current["revision"],
                 )
+                return operation
+            if preserve_intent:
+                # Native reset retires this opening, not the accepted desire to
+                # keep inference enabled. Its historical result remains separate
+                # from the fresh server-owned lifecycle operation.
+                operation.update(
+                    inference=dict(
+                        enabled=current["enabled"], revision=revision, state=state
+                    ),
+                    state="failed" if code else "completed",
+                )
+                if code:
+                    operation["code"] = code
                 return operation
             current.update(state=state)
             if code:

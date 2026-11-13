@@ -139,6 +139,30 @@ Events do not restart segments automatically. Desired World state and consumer
 execution timers survive; consumed onset text is not replayed. Old segment
 receipts remain queryable and cannot update the successor adapter.
 
+For manual-inference sources, an authenticated native `source.reset` is a
+source-lifecycle boundary. The server retains the accepted `enabled=true` intent,
+fences old model delivery, and retires the original preparation, model child and
+resources before opening a fresh segment. Recovery keeps the inference revision
+with `state=starting` and optional `phase=preparing_source`; it does not replay
+`model.inference.configure` or rewrite a completed configure result. The existing
+disable command remains available during this phase. Disable, source close and
+later source generations fence pending recovery; repeated resets coalesce before
+allocation. Unknown cleanup leaves inference failed with `RELEASE_UNKNOWN` and
+cannot allocate another model. Non-reset model/transport failures retain their
+existing explicit recovery behavior.
+
+Harness sources obtain a fresh full condition from the new native consumer
+through a new journal-owned lifecycle operation. Ordinary fixed-input native
+Worlds use the immutable launch prompt, seed and references with a post-reset
+source frame. Retired buffered frames cannot become F0: capture admission checks
+the exact new presentation ID and SDK epoch. Segment-local text supplements are
+empty in the successor; old conditions and prompt overrides are not replayed.
+Disabled sources stay disabled, while World input and whitebox preview remain
+alive. Model delivery is independent of display selection; recovery adds no
+display command or override of the existing display controller. Automatic
+internal sources and member-prefill startup retain their existing lifecycle
+owners; this recovery applies to the manual inference switch.
+
 Normal `render.end` with drain freezes new dispatch while an already dispatched
 condition may still receive real source frames and settle. Its wait shares the
 existing cleanup deadline; explicit cancel remains a separate termination path.
@@ -179,6 +203,14 @@ release/new-segment/model-init with one lease, old-result fencing, lifecycle-onl
 idempotency, real authenticated local WebSocket loss after durable commit,
 original request/cursor recovery and preview-only degradation. These checks use a
 controlled CPU model and do not establish GPU/visual or full SDK-browser parity.
+`test_whitebox_inference_reset.py` covers ordinary native reset ingress, fresh F0,
+single-child release, repeated reset, disable/close races, failed cleanup,
+explicit-display CAS conflicts and LocalRoomEngine/MemberEngine reset forwarding.
+The full source/condition fixture also covers manual Harness reset with and
+without startup assets. Transport handshakes and model output are controlled CPU
+fixtures; bound GPU admission, live prefill/RTC, deployed Room recovery and visible
+Player acceptance require separate validation against exact deployed source and
+SDK identities.
 
 ### Player text supplements for ordinary Worlds
 

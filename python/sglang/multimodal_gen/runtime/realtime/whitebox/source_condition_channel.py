@@ -66,6 +66,7 @@ class CLIConditionChannel:
         self.subscription_probe_ready = asyncio.Event()
         self.subscription_probe_error = None
         self.on_recovery_failed = None
+        self.on_source_reset = None
         self.source_generation = 0
         self.reset_task = None
         self.reset_transport_generation = None
@@ -310,6 +311,11 @@ class CLIConditionChannel:
         self.reset_task.add_done_callback(
             lambda task: task.exception() if not task.cancelled() else None
         )
+        # Capture accepted intent synchronously with the authenticated source
+        # fence, before the retired opening can publish a terminal result.
+        notify = getattr(self, "on_source_reset", None)
+        if notify is not None:
+            notify(self.source_generation, self.reset_task)
 
     async def probe_subscription_pause(self, *, timeout):
         """Prove the actual World binding can pause while preview stays active."""

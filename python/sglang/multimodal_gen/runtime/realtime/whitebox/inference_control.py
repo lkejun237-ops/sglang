@@ -7,6 +7,7 @@ import logging
 import os
 from types import SimpleNamespace
 from typing import NamedTuple
+from uuid import uuid4
 
 import msgspec
 
@@ -38,6 +39,7 @@ class SourceInference:
         self.prewarm = None
         self.task = None
         self.task_scope = None
+        self.recovery = self.recovery_task = None
         self.lock = asyncio.Lock()
         self.frozen = copy.deepcopy(message)
         if self.manual:
@@ -80,6 +82,7 @@ class SourceInference:
             channel.suspended = True
 
     def dispatch(self, operation):
+        self.cancel_recovery()
         previous = self.task
         if previous is not None and not previous.done():
             previous.cancel()
@@ -87,9 +90,7 @@ class SourceInference:
         self.task_scope = InferenceTaskScope(
             task=self.task,
             revision=operation["inference"]["revision"],
-            source_generation=getattr(
-                getattr(self.source, "context_channel", None), "source_generation", None
-            ),
+            source_generation=self.source_generation(),
             request_id=operation["request_id"],
         )
 
@@ -101,13 +102,144 @@ class SourceInference:
         if (
             scope is not None
             and scope.revision == revision
-            and scope.source_generation
-            != getattr(
-                getattr(self.source, "context_channel", None), "source_generation", None
-            )
+            and scope.source_generation != self.source_generation()
         ):
             raise RenderError("SOURCE_EPOCH_MISMATCH")
         return True
+
+    def source_generation(self):
+        return getattr(
+            getattr(self.source, "context_channel", None),
+            "source_generation",
+            getattr(self.source, "native_source_generation", None),
+        )
+
+    def cancel_recovery(self):
+        self.recovery = None
+        task = getattr(self, "recovery_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def recovering(self, revision=None):
+        recovery = getattr(self, "recovery", None)
+        source = self.source
+        current = source.journal.snapshot["inference"]
+        return (
+            recovery is not None
+            and current["enabled"]
+            and current["revision"] == recovery.revision
+            and (revision is None or revision == recovery.revision)
+            and not any(
+                getattr(source, name, False)
+                for name in ("closing", "close_requested", "closed", "binding_ended")
+            )
+        )
+
+    def source_reset(self, generation, retiring):
+        """Retain enabled intent; the authenticated channel owns retirement."""
+        state = self.source.journal.snapshot["inference"]
+        self.cancel_recovery()
+        if (
+            not self.manual
+            or getattr(self.source, "member_prefill", None) is not None
+            or not state["enabled"]
+            or state.get("code") == "RELEASE_UNKNOWN"
+            or any(
+                getattr(self.source, name, False)
+                for name in ("closing", "close_requested", "closed", "binding_ended")
+            )
+        ):
+            return
+        recovery = self.recovery = SimpleNamespace(
+            revision=state["revision"],
+            generation=generation,
+            operation_id=uuid4().hex,
+        )
+        self.fence()
+        # Never dispatch from inside reset_task: enable must await that exact
+        # task, including adapter close, before it can reserve fresh compute.
+        self.recovery_task = self.source.spawn_control(
+            self.recover_source(recovery, retiring)
+        )
+
+    async def recover_source(self, recovery, retiring):
+        source = self.source
+
+        def current():
+            return (
+                self.recovery is recovery
+                and self.recovering()
+                and self.source_generation() == recovery.generation
+            )
+
+        async def status(state, code=None):
+            def update(value):
+                if not current():
+                    return
+                value["inference"].update(state=state)
+                value["inference"].pop("code", None)
+                value["inference"].pop("phase", None)
+                if state == "starting":
+                    value["inference"]["phase"] = "preparing_source"
+                if code:
+                    value["inference"]["code"] = code
+
+            await source.journal.update(update, settlement=True)
+            # Feedback cannot hold source retirement/close behind backpressure.
+            source.spawn_control(source.status_snapshot())
+
+        cleaned = False
+        try:
+            await status("starting")
+            await asyncio.shield(retiring)
+            cleaned = True
+            if not current():
+                return
+            async with self.lock:
+                if not current():
+                    return
+                if source.context_channel is not None:
+                    # A reset before init has no admitted segment to retire,
+                    # but its reserved identities still belong to the old SDK.
+                    def fresh_reservation(value):
+                        if value["segment"] is None:
+                            value["model_context_segment_ids"] = None
+
+                    await source.journal.update(fresh_reservation)
+                    await source.journal.reserve_model_context_segment()
+                operation = dict(
+                    operation_id="source-reset:" + recovery.operation_id,
+                    inference=dict(enabled=True, revision=recovery.revision),
+                )
+                self.task = asyncio.current_task()
+                self.task_scope = InferenceTaskScope(
+                    self.task, recovery.revision, recovery.generation, ""
+                )
+                await self.enable(operation)
+                if current():
+                    await status("enabled")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if current():
+                code = public_error(
+                    error, recovery.operation_id, default="INITIALIZATION_FAILED"
+                )["code"]
+                if cleaned:
+                    try:
+                        async with self.lock:
+                            await self.disable(
+                                reset_generation=recovery.generation,
+                                expected_revision=recovery.revision,
+                            )
+                    except Exception:
+                        code = "RELEASE_UNKNOWN"
+                else:
+                    code = "RELEASE_UNKNOWN"
+                await status("failed", code)
+        finally:
+            if self.recovery is recovery:
+                self.recovery = None
 
     async def run(self, operation, previous=None):
         if previous is not None:
@@ -118,7 +250,9 @@ class SourceInference:
             # A new intent must not hold the inference lock while its native
             # source retirement needs that lock to finish original cleanup.
             retiring = getattr(
-                getattr(source, "context_channel", None), "reset_task", None
+                getattr(source, "context_channel", None),
+                "reset_task",
+                getattr(source, "native_reset_task", None),
             )
             if operation["inference"]["enabled"] and retiring is not None:
                 await asyncio.shield(retiring)
@@ -156,11 +290,7 @@ class SourceInference:
             if operation["inference"]["enabled"]:
                 try:
                     scope = getattr(self, "task_scope", None)
-                    generation = getattr(
-                        getattr(source, "context_channel", None),
-                        "source_generation",
-                        None,
-                    )
+                    generation = self.source_generation()
                     if (
                         scope is not None
                         and scope.revision == revision
@@ -174,7 +304,11 @@ class SourceInference:
                 except Exception:
                     code = "RELEASE_UNKNOWN"
             result = await source.journal.settle_inference(
-                operation["request_id"], revision, state="failed", code=code
+                operation["request_id"],
+                revision,
+                state="failed",
+                code=code,
+                preserve_intent=self.recovering(revision),
             )
             await source.operation_message(result)
             await source.status_snapshot()
@@ -195,6 +329,8 @@ class SourceInference:
             )
         if getattr(source, "first_presented_required", False):
             source.require_opening_presentation_player()
+        if not self.current(revision):
+            return
         # Unknown previous cleanup cannot be bypassed by creating a new parent.
         binding = source.model_binding
         if binding is not None and binding.lease.resource_state not in {
@@ -243,7 +379,11 @@ class SourceInference:
         else:
             async with asyncio.timeout(source.config.startup_seconds):
                 while not source.retained.frames:
+                    if not self.current(revision):
+                        return
                     await asyncio.sleep(0.01)
+            if not self.current(revision):
+                return
             version, frame, captured, _ = source.retained.frames[-1]
             state = await source.journal.read()
             command = self.command("render.start", operation, state)
@@ -255,6 +395,8 @@ class SourceInference:
             )
             segment_parameters(command)
             references = await source.assets.resolve(command["references"])
+            if not self.current(revision):
+                return
             result = await source.journal.start(command)
             await source.operation_message(result)
             expected_segment_id = result["segment_id"]
@@ -494,6 +636,7 @@ class SourceInference:
         source = self.source
         if (
             not self.manual
+            or self.recovering(revision)
             or getattr(source, "closing", False)
             or getattr(source, "close_requested", False)
             or getattr(source, "member_prefill", None) is not None
@@ -524,7 +667,7 @@ class SourceInference:
     async def retire_preparation(self, code):
         """Retire the reset opening, independent of prewarm/segment creation."""
         scope = getattr(self, "task_scope", None)
-        generation = getattr(self.source.context_channel, "source_generation", None)
+        generation = self.source_generation()
         newer_intent = (
             scope is not None
             and generation is not None
@@ -574,7 +717,11 @@ class SourceInference:
             operation = self.source.journal.snapshot["operations"].get(scope.request_id)
             if operation is not None and operation["state"] == "accepted":
                 operation = await self.source.journal.settle_inference(
-                    scope.request_id, scope.revision, state="failed", code=code
+                    scope.request_id,
+                    scope.revision,
+                    state="failed",
+                    code=code,
+                    preserve_intent=self.recovering(revision),
                 )
             operation = copy.deepcopy(operation)
 
@@ -587,6 +734,10 @@ class SourceInference:
         self.source.spawn_control(publish())
 
     async def close(self):
+        self.cancel_recovery()
+        recovery = getattr(self, "recovery_task", None)
+        if recovery is not None:
+            await asyncio.gather(recovery, return_exceptions=True)
         if self.task is not None and not self.task.done():
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)

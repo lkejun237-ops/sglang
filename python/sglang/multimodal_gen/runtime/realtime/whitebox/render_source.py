@@ -52,6 +52,13 @@ class SourceLatest(LatestFrame):
 
     async def put(self, value):
         frame, captured = value
+        expected = getattr(self.owner, "native_reset_identity", None)
+        if expected is not None:
+            native = (
+                (frame.provenance or {}).get("cli_frame_header", {}).get("source", {})
+            )
+            if (native.get("presentationId"), native.get("sdkEpoch")) != expected:
+                return
         frame = replace(
             frame,
             provenance={**(frame.provenance or {}), **self.owner.source_identity()},
@@ -103,6 +110,8 @@ class SourceSession(InteractiveSession):
         self.source_conditions = None
         self.condition_debug = None
         self.context_channel = None
+        self.native_source_generation = 0
+        self.native_reset_task = self.native_reset_identity = None
         self.context_seed = 42
         self.context_startup_request_id = None
         self.startup = None
@@ -574,6 +583,13 @@ class SourceSession(InteractiveSession):
         if capability is None:
             capability = getattr(self.engine, "descriptor", {}).get("modelContext")
         if capability is None:
+            reset_binder = getattr(self.engine, "bind_source_reset", None)
+            if (
+                getattr(getattr(self, "inference", None), "manual", False)
+                and getattr(self, "member_prefill", None) is None
+                and reset_binder is not None
+            ):
+                reset_binder(self.native_source_reset)
             return
         if binder is None:
             raise RenderError("CAPABILITY_UNAVAILABLE")
@@ -720,6 +736,29 @@ class SourceSession(InteractiveSession):
             **({"start_suspended": True} if not self.inference_enabled() else {}),
         )
         self.context_channel.on_recovery_failed = self.context_recovery_failed
+        if getattr(getattr(self, "inference", None), "manual", False):
+            self.context_channel.on_source_reset = self.inference.source_reset
+
+    def native_source_reset(self, reset):
+        """Ordinary native Worlds share the inference owner's recovery path."""
+        self.native_source_generation += 1
+        self.native_reset_identity = (reset["presentationId"], reset["sdkEpoch"])
+        self.retained.clear()
+        self.inference.fence()
+        previous = self.native_reset_task
+
+        async def retire():
+            if previous is not None:
+                await asyncio.shield(previous)
+            await self.inference.retire_preparation("MODEL_CONTEXT_STALE_SOURCE")
+
+        self.native_reset_task = asyncio.create_task(retire())
+        self.native_reset_task.add_done_callback(
+            lambda task: task.exception() if not task.cancelled() else None
+        )
+        self.inference.source_reset(
+            self.native_source_generation, self.native_reset_task
+        )
 
     async def context_recovery_failed(self, code, *, source_reset=None):
         segment = self.current_segment
@@ -774,6 +813,13 @@ class SourceSession(InteractiveSession):
 
     def inference_enabled(self):
         return (self.journal.snapshot or {}).get("inference", {}).get("enabled", True)
+
+    def inference_source_generation(self):
+        return getattr(
+            getattr(self, "context_channel", None),
+            "source_generation",
+            getattr(self, "native_source_generation", None),
+        )
 
     def emit_prewarm_observation(self, event):
         observer = getattr(self, "prewarm_observer", None)
@@ -1305,9 +1351,7 @@ class SourceSession(InteractiveSession):
                     raise RenderError("CAPABILITY_UNAVAILABLE")
                 if command.get("enabled") is True:
                     self.require_opening_presentation_player()
-                source_generation = getattr(
-                    getattr(self, "context_channel", None), "source_generation", None
-                )
+                source_generation = self.inference_source_generation()
                 result = await self.journal.configure_inference(command)
                 state = await self.journal.read()
                 self.display_mode = state["display_mode"]
@@ -1319,10 +1363,9 @@ class SourceSession(InteractiveSession):
                 await self.operation_message(result)
                 await self.status_snapshot()
                 if result["state"] == "accepted" and not result.get("duplicate"):
-                    if command["enabled"] and source_generation != getattr(
-                        getattr(self, "context_channel", None),
-                        "source_generation",
-                        None,
+                    if (
+                        command["enabled"]
+                        and source_generation != self.inference_source_generation()
                     ):
                         # The receipt/status awaits cannot carry old source intent
                         # into a reset generation, even before a task existed.
@@ -1331,6 +1374,9 @@ class SourceSession(InteractiveSession):
                             result["inference"]["revision"],
                             state="failed",
                             code="MODEL_CONTEXT_STALE_SOURCE",
+                            preserve_intent=getattr(
+                                self.inference, "recovering", lambda _: False
+                            )(result["inference"]["revision"]),
                         )
                         await self.operation_message(result)
                         await self.status_snapshot()
@@ -2748,6 +2794,11 @@ class SourceSession(InteractiveSession):
             if getattr(self, "context_channel", None) is not None:
                 try:
                     await self.context_channel.close()
+                except Exception as error:
+                    failures.append(error)
+            if getattr(self, "native_reset_task", None) is not None:
+                try:
+                    await asyncio.shield(self.native_reset_task)
                 except Exception as error:
                     failures.append(error)
             if self.current_segment and not self.current_segment.closed_event.is_set():

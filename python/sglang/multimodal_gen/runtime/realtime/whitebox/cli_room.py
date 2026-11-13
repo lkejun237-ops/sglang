@@ -1667,6 +1667,7 @@ class NativeCLIView(CLIView):
 
     def __init__(self, room):
         super().__init__(room)
+        self.on_source_reset = None
         self.source_identity = None
         self.pending_reset = None
         self.credited_generation = None
@@ -1698,6 +1699,10 @@ class NativeCLIView(CLIView):
         self.pending_reset = value
         if self.model_context is not None:
             self.model_context.retire_source(value)
+        elif self.on_source_reset is not None:
+            # The native control reader validates reset identity. Its source
+            # owner fences synchronously and retires model work independently.
+            self.on_source_reset(value)
         self.configured.clear()
         # Native reset revokes old UI/input/AREA and model-context evidence,
         # while retaining the Room session, source clock and world resources.
@@ -1718,6 +1723,9 @@ class NativeCLIView(CLIView):
         await self.control.send(
             json.dumps({"type": "ui.resync", "epoch": self.descriptor["epoch"]})
         )
+
+    def bind_source_reset(self, callback):
+        self.on_source_reset = callback
 
     async def _reconfigure(self, value):
         generation = value.get("mediaGeneration")

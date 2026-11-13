@@ -119,6 +119,18 @@ class LocalRoomEngine:
             **({"start_suspended": True} if start_suspended else {}),
         )
 
+    def bind_source_reset(self, callback):
+        engine = self.runtime.player(self.stream_id)["engine"]
+        binder = getattr(engine, "bind_source_reset", None)
+        if binder is not None:
+
+            def reset(value):
+                entry = self.runtime.players.get(self.stream_id)
+                if not self.closed and entry is not None and entry["engine"] is engine:
+                    callback(value)
+
+            binder(reset)
+
     def check_model_context(self):
         if self.closed or self.runtime.player(self.stream_id)["engine"] is not getattr(
             self, "_context_engine", None

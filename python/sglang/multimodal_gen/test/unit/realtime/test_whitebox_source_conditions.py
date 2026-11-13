@@ -7,7 +7,7 @@ import json
 import threading
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from PIL import Image
@@ -1771,8 +1771,9 @@ def test_resource_reader_uses_final_auth_and_refuses_redirect(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize("with_startup", [False, True])
+@pytest.mark.parametrize("manual_reset", [False, True, "preparing"])
 def test_full_source_owner_initial_output_then_update_uses_single_mock_model(
-    tmp_path, monkeypatch, with_startup
+    tmp_path, monkeypatch, with_startup, manual_reset
 ):
     import msgspec
     from test_whitebox_interactive import BrowserUI, Engine
@@ -1819,7 +1820,9 @@ def test_full_source_owner_initial_output_then_update_uses_single_mock_model(
             metadata = {}
             descriptor = {"modelContext": cap}
 
-            async def bind_model_context(self, segment_id, create_adapter):
+            async def bind_model_context(
+                self, segment_id, create_adapter, start_suspended=False
+            ):
                 c["segmentId"] = segment_id
                 c["payloadHash"] = payload_hash(c)
 
@@ -1828,7 +1831,27 @@ def test_full_source_owner_initial_output_then_update_uses_single_mock_model(
 
                 self.adapter = create_adapter(c, emit, lambda: None)
 
+                from sglang.multimodal_gen.runtime.realtime.whitebox.source_condition_channel import (
+                    CLIConditionChannel,
+                )
+
+                channel = CLIConditionChannel(
+                    SimpleNamespace(
+                        descriptor={"epoch": c["source"]["epoch"], "modelContext": cap},
+                        transport_generation=0,
+                        control=SimpleNamespace(send=AsyncMock()),
+                        closed=False,
+                        stopped=False,
+                    )
+                )
+                channel.segment, channel.adapter = segment_id, self.adapter
+                channel.probe_subscription_pause = AsyncMock()
+                channel.suspended = start_suspended
+
                 async def switch_segment(segment_id):
+                    if c["segmentId"] == segment_id and not self.adapter.closed:
+                        channel.suspended = False
+                        return
                     await self.adapter.close()
                     c.update(
                         segmentId=segment_id,
@@ -1838,10 +1861,11 @@ def test_full_source_owner_initial_output_then_update_uses_single_mock_model(
                     )
                     c["payloadHash"] = payload_hash(c)
                     self.adapter = create_adapter(c, emit, lambda: None)
+                    channel.segment, channel.adapter = segment_id, self.adapter
+                    channel.suspended = False
 
-                return SimpleNamespace(
-                    close=lambda: self.adapter.close(), switch_segment=switch_segment
-                )
+                channel.switch_segment = switch_segment
+                return channel
 
             async def read_model_context_resource(self, handle):
                 raise AssertionError("empty references")
@@ -1937,6 +1961,14 @@ def test_full_source_owner_initial_output_then_update_uses_single_mock_model(
                         whitebox=dict(world_id="world"),
                         prompt="legacy preview",
                         seed=19,
+                        **(
+                            {
+                                "source_operation": "create.manual",
+                                "inference_control": "manual",
+                            }
+                            if manual_reset
+                            else {}
+                        ),
                         **({"startup": startup} if with_startup else {}),
                     )
                 )
@@ -1955,7 +1987,7 @@ def test_full_source_owner_initial_output_then_update_uses_single_mock_model(
             )
             ready = next(m for m in messages if m.get("type") == "session.ready")
             assert ready.get("display_mode", "whitebox") == (
-                "model" if with_startup else "whitebox"
+                "model" if with_startup and not manual_reset else "whitebox"
             )
             assert ready["capabilities"]["model_context"] == "worldkit-model-context-v1"
             assert ready["capabilities"]["model_context_instruction"] is True
@@ -1963,9 +1995,45 @@ def test_full_source_owner_initial_output_then_update_uses_single_mock_model(
                 k: journal.snapshot["model_context_segment_ids"][k]
                 for k in ("segment_id", "segment_epoch")
             }
-            if with_startup:
+            if with_startup and not manual_reset:
                 assert ready["startup_request_id"] == startup["request_id"]
                 assert "startup_prepare_protocol" not in ready["capabilities"]
+            if manual_reset:
+                from test_whitebox_render_contract import command
+
+                await owner.command(
+                    command(
+                        "model.inference.configure",
+                        "original-enable",
+                        enabled=True,
+                        expected_inference_revision=0,
+                    )
+                )
+                if manual_reset == "preparing":
+                    original_ids = copy.deepcopy(
+                        journal.snapshot["model_context_segment_ids"]
+                    )
+                    assert journal.snapshot["segment"] is None and not leases.opens
+                    c["source"].update(
+                        presentationId="reset-before-init",
+                        sdkEpoch=c["source"]["sdkEpoch"] + 1,
+                    )
+                    owner.context_channel.retire_source(
+                        dict(
+                            type="source.reset",
+                            epoch=c["source"]["epoch"],
+                            presentationId=c["source"]["presentationId"],
+                            sdkEpoch=c["source"]["sdkEpoch"],
+                        )
+                    )
+                    await asyncio.wait_for(
+                        asyncio.shield(owner.context_channel.reset_task), 5
+                    )
+                    await wait(lambda: c["conditionId"] == "after-eos")
+                    assert all(
+                        journal.snapshot["model_context_segment_ids"][k] != v
+                        for k, v in original_ids.items()
+                    )
             await engine.adapter.handle(c)
             await engine.adapter.preparation
             assert receipts[-1]["phase"] == "prepared" and not leases.opens
@@ -1989,6 +2057,32 @@ def test_full_source_owner_initial_output_then_update_uses_single_mock_model(
             assert (
                 len(leases.opens) == 1 and leases.opens[0].init["prompt"] == c["prompt"]
             )
+            if manual_reset:
+                await wait(lambda: journal.snapshot["inference"]["state"] == "enabled")
+                if manual_reset == "preparing":
+                    original = journal.snapshot["operations"]["original-enable"]
+                    assert (
+                        original["state"] == "failed"
+                        and original["code"] == "MODEL_CONTEXT_STALE_SOURCE"
+                    )
+                    assert journal.snapshot["inference"] == dict(
+                        enabled=True, revision=1, state="enabled"
+                    )
+                    assert len(leases.opens) == leases.active == 1
+                    assert (
+                        len(
+                            [
+                                o
+                                for o in journal.snapshot["operations"].values()
+                                if o["op"] == "model.inference.configure"
+                            ]
+                        )
+                        == 1
+                    )
+                    return
+                original_enable = copy.deepcopy(
+                    journal.snapshot["operations"]["original-enable"]
+                )
             assert leases.opens[0].init["references"] == []
             assert leases.opens[0].init["seed"] == (7 if with_startup else 19)
             update = copy.deepcopy(c)
@@ -2013,20 +2107,38 @@ def test_full_source_owner_initial_output_then_update_uses_single_mock_model(
                 r["promptVersion"] for r in receipts if r["phase"] == "applied"
             ] == [1, 2]
             first = owner.current_segment
-            await first.stop()
-            assert first.closed_event.is_set() and leases.active == 0
-            assert not engine.closed and not owner.finished.is_set()
-            state = await journal.read()
-            await owner.command(
-                dict(
-                    type="command",
-                    op="render.context.start",
-                    request_id="context-after-eos",
-                    source_session_id="source",
-                    source_epoch="epoch",
-                    expected_render_revision=state["render_revision"],
+            if manual_reset:
+                c["source"].update(
+                    presentationId="native-reset", sdkEpoch=c["source"]["sdkEpoch"] + 1
                 )
-            )
+                owner.context_channel.retire_source(
+                    dict(
+                        type="source.reset",
+                        epoch=c["source"]["epoch"],
+                        presentationId=c["source"]["presentationId"],
+                        sdkEpoch=c["source"]["sdkEpoch"],
+                    )
+                )
+                await asyncio.wait_for(
+                    asyncio.shield(owner.context_channel.reset_task), 5
+                )
+                await wait(lambda: c["conditionId"] == "after-eos")
+                assert first.closed_event.is_set() and leases.active == 0
+            else:
+                await first.stop()
+                assert first.closed_event.is_set() and leases.active == 0
+                assert not engine.closed and not owner.finished.is_set()
+                state = await journal.read()
+                await owner.command(
+                    dict(
+                        type="command",
+                        op="render.context.start",
+                        request_id="context-after-eos",
+                        source_session_id="source",
+                        source_epoch="epoch",
+                        expected_render_revision=state["render_revision"],
+                    )
+                )
             await engine.adapter.handle(c)
             await engine.adapter.preparation
             await engine.adapter.handle(commit(c, 9))
@@ -2041,6 +2153,22 @@ def test_full_source_owner_initial_output_then_update_uses_single_mock_model(
             assert leases.opens[1].init["seed"] == (7 if with_startup else 19)
             assert owner.current_segment.segment_id != first.segment_id
             assert journal.snapshot["segment"]["accepted_version"] == 1
+            if manual_reset:
+                await wait(lambda: journal.snapshot["inference"]["state"] == "enabled")
+                assert journal.snapshot["inference"] == dict(
+                    enabled=True, revision=1, state="enabled"
+                )
+                assert (
+                    journal.snapshot["operations"]["original-enable"] == original_enable
+                )
+                restarts = [
+                    o
+                    for o in journal.snapshot["operations"].values()
+                    if o["op"] == "render.context.start"
+                ]
+                assert len(restarts) == 1 and restarts[0]["request_id"].startswith(
+                    "inference:source-reset:"
+                )
             before_late = len(receipts)
             await owner.operation_message(
                 journal.snapshot["operations"][first.segment["request_id"]]

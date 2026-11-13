@@ -629,6 +629,11 @@ Run `test_whitebox.py` and the gateway/coordinator/world regression tests under
 directory in the lightweight CPU environment. Tests cover local reservations,
 lease fences, deadlines, actual H.264 PTS/pixels, delayed prompt application,
 unknown input evidence, arbitrary states, UI composition and archive retries.
+For manual native-reset inference recovery, include
+`test_whitebox_inference_reset.py`, `test_whitebox_inference_control.py`,
+`test_whitebox_source_reset_recovery.py` and `test_whitebox_source_conditions.py`.
+The [owning lifecycle contract](../../docs/docs/sglang-diffusion/zing_h3/specs/whitebox-render-segments.md#world-owned-model-conditions-and-recovery)
+states the supported reset scope and separate GPU/Player validation boundary.
 RTC integration clients must independently consume each subscription's reliable
 control channel while member actions await cleanup; completing mock RTP handoffs
 does not drain those controls. The member-isolation regression sends 513 real
