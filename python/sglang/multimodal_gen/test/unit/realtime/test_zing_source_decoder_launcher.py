@@ -179,7 +179,7 @@ def test_build_role_command_decoder_missing_config_rejected():
 # ==============================================================================
 
 
-@pytest.mark.parametrize("override", [None, "0"])
+@pytest.mark.parametrize("override", [None, "0", "1"])
 def test_start_role_workers_spawns_and_sets_ports(monkeypatch, override):
     launcher = _load_role_launcher()
     monkeypatch.setattr(launcher.sys, "platform", "linux")
@@ -191,6 +191,7 @@ def test_start_role_workers_spawns_and_sets_ports(monkeypatch, override):
         "SGLANG_LYNN_PACKED_QKV",
         "SGLANG_LYNN_FUSED_QK_NORM",
         "SGLANG_LYNN_COMPILED_FFN",
+        "SGLANG_LYNN_SM90_FAST_DECODE",
     )
     for name in (*encoder_flags, *decoder_flags):
         if override is None:
@@ -239,7 +240,7 @@ def test_start_role_workers_spawns_and_sets_ports(monkeypatch, override):
 
     for info, flags in ((enc_info, encoder_flags), (dec_info, decoder_flags)):
         assert {name: info["env"][name] for name in flags} == {
-            name: override or "1" for name in flags
+            name: override if override is not None else "1" for name in flags
         }
 
     assert args.disagg_encoder_port == 31001

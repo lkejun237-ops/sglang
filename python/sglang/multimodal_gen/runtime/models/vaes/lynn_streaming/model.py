@@ -46,6 +46,7 @@ class StreamState(msgspec.Struct):
     # tile id -> per-layer (K before RoPE, V), each [B, history spatial tokens, heads, head_dim]
     tiles: dict = {}
     execution_signature: tuple | None = None
+    sm90_lease: object | None = None
 
 
 class StreamingDecoder(nn.Module):
@@ -243,6 +244,12 @@ class StreamingDecoder(nn.Module):
         stitch the full frame locally. Every rank must call this in lockstep.
         Not retryable: a failure part-way leaves `state` half-updated.
         """
+        frames, state, _ = self._decode_step_impl(
+            z_t, state, group=group, clamp_output=False
+        )
+        return frames, state
+
+    def _decode_step_impl(self, z_t, state, group=None, *, clamp_output=False):
         if (
             z_t.ndim != 5
             or z_t.shape[2] != 1
@@ -269,6 +276,57 @@ class StreamingDecoder(nn.Module):
             )
         state.geometry = geometry
         phase = state.latent_index % self.protocol.phases
+        if world_size == 1 and self.execution.options.sm90_fast_decode:
+            engine = self.execution.sm90_engine
+            lease = state.sm90_lease
+            if (
+                state.latent_index > 0
+                and engine is not None
+                and lease is not None
+                and getattr(lease, "active", False)
+                and getattr(lease, "engine", None) is engine
+            ):
+                # Overlap host parameter/hook signature verification with CUDA Graph
+                # execution so steady-state decode steps incur zero host launch bubble.
+                frames = engine.decode_step(
+                    z_t, state, phase, clamp_output=clamp_output
+                )
+                signature = parameter_signature(self)
+                if (
+                    state.execution_signature is not None
+                    and state.execution_signature != signature
+                ) or not engine.matches_model(self, z_t.device, signature):
+                    if frames is not None and z_t.is_cuda:
+                        torch.cuda.current_stream(z_t.device).synchronize()
+                    raise ValueError(
+                        "Lynn weights or device changed during an active stream"
+                    )
+                if frames is not None:
+                    self.execution.counts["sm90_fast_decode"] += 1
+                    state.execution_signature = signature
+                    state.latent_index += 1
+                    return frames, state, clamp_output
+            else:
+                signature = parameter_signature(self)
+                if (
+                    state.execution_signature is not None
+                    and state.execution_signature != signature
+                ):
+                    raise ValueError(
+                        "Lynn weights or device changed during an active stream"
+                    )
+                frames = self.execution.run_sm90_step(
+                    self,
+                    z_t,
+                    state,
+                    phase,
+                    signature=signature,
+                    clamp_output=clamp_output,
+                )
+                if frames is not None:
+                    state.execution_signature = signature
+                    state.latent_index += 1
+                    return frames, state, clamp_output
         # The only place the latent is de-normalized.
         z_t = z_t.float() * self.latent_std + self.latent_mean
         ys, hs, oy, xs, ws, ox = self._tile_layout(z_t)
@@ -307,7 +365,7 @@ class StreamingDecoder(nn.Module):
         ]
         frames = self._stitch_tiles(rows, oy, ox)
         state.latent_index += 1
-        return frames, state
+        return frames, state, False
 
     @staticmethod
     def _init_pixel_workspace(state, group, tile_count, shape, device):

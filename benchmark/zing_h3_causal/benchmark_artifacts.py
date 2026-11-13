@@ -17,6 +17,7 @@ TIMING_SCOPE = (
 def media_timing_scope(mode):
     return {
         "raw": "client_delivery_with_full_rgb_hash_and_rgb_file_backpressure",
+        "full": "client_delivery_with_full_rgb_hash_and_rgb_file_backpressure; full_video_encode_after_request",
         "metrics": "client_delivery_with_full_rgb_hash; no_media_write",
         "representative": "client_delivery_with_full_rgb_hash_and_bounded_sampling; video_encode_after_request",
     }[mode]
@@ -67,7 +68,7 @@ class MediaCapture:
         *,
         retention_budget_bytes=DEFAULT_RETENTION_BYTES,
     ):
-        if mode not in ("metrics", "representative", "raw"):
+        if mode not in ("metrics", "representative", "raw", "full"):
             raise ValueError("Invalid media mode")
         if min(width, height) < 1 or (
             expected_frames is not None and expected_frames < 1
@@ -100,18 +101,28 @@ class MediaCapture:
         self.saved_indices = []
         self.raw = None
         self.path = self.output / (
-            "output.rgb" if mode == "raw" else "representative.mp4"
+            "output.rgb"
+            if mode == "raw"
+            else "output.mp4"
+            if mode == "full"
+            else "representative.mp4"
         )
         self.output.mkdir(parents=True, exist_ok=True)
+        self.spool_path = self.output / ".full-video.rgb"
         if mode == "raw":
             self.raw = self.path.open("xb")
+        elif mode == "full":
+            needed = (expected_frames or 1) * self.frame_bytes + (1 << 30)
+            if shutil.disk_usage(self.output).free < needed:
+                raise RuntimeError("Insufficient scratch space for full video capture")
+            self.raw = self.spool_path.open("xb")
         # File-like name retained for callers that instrument disk writes.
         self.name = str(self.path)
 
     def write(self, payload):
         if len(payload) % self.frame_bytes:
             raise ValueError("Incomplete RGB frame in media capture")
-        if self.raw is not None and self.bytes + len(
+        if self.mode == "raw" and self.bytes + len(
             payload
         ) > self.retention_budget_bytes - (64 << 20):
             raise RuntimeError("Raw output exceeds the experiment retention budget")
@@ -136,6 +147,46 @@ class MediaCapture:
         try:
             if self.raw is not None:
                 self.raw.close()
+            if self.mode == "full" and self.bytes:
+                # Scratch RGB may exceed the final retention budget; encode only
+                # after request timing, then discard this capture's exact spool.
+                subprocess.run(
+                    [
+                        self.ffmpeg,
+                        "-v",
+                        "error",
+                        "-nostdin",
+                        "-n",
+                        "-f",
+                        "rawvideo",
+                        "-pix_fmt",
+                        "rgb24",
+                        "-s",
+                        f"{self.width}x{self.height}",
+                        "-r",
+                        "24",
+                        "-i",
+                        str(self.spool_path),
+                        "-an",
+                        "-c:v",
+                        "libx264",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-threads",
+                        "2",
+                        "-preset",
+                        "fast",
+                        "-crf",
+                        "10",
+                        "-movflags",
+                        "+faststart",
+                        str(self.path),
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    timeout=1800,
+                    check=True,
+                )
             if self.mode == "representative" and self.frames:
                 width = max(2, min(640, self.width) // 2 * 2)
                 height = max(2, round(self.height * width / self.width / 2) * 2)
@@ -183,10 +234,12 @@ class MediaCapture:
         except BaseException as exc:
             error = type(exc).__name__
             # A failed encoder must not leave a file that looks like valid media.
-            if self.mode == "representative":
+            if self.mode in ("representative", "full"):
                 self.path.unlink(missing_ok=True)
             raise
         finally:
+            if self.mode == "full":
+                self.spool_path.unlink(missing_ok=True)
             self.frames.clear()
             self.receipt = {
                 "mode": self.mode,
@@ -209,6 +262,9 @@ class MediaCapture:
                     else None
                 ),
                 "encoding_after_request": True,
+                "full_video_encoding": "H264 CRF10 yuv420p 24fps; visualization, not pixel parity"
+                if self.mode == "full"
+                else None,
                 "error": error,
                 "timing_scope": self.timing_scope,
             }

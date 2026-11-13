@@ -295,11 +295,28 @@ R69同一Decoder进程在736三次完整供流会话后，allocated约4.875GiB�
 其他因素仍需检查。480／736同条件前后GPU对照与整体三组件复测当前未完成，
 速度和显存收益未验证，不据此修改产品demo。
 
-## VAE 可选执行优化（2026-11-03）
+## VAE 可选执行优化（2026-11-03 / 2026-11-12 SM90 Decoder 更新）
 
 当前 H3 渐进 Encoder 与 26 层 EMA BF16 Lynn
-默认开启 Encoder 两项融合及 Lynn QKV/QK norm/FFN，workspace/整块 CUDA Graph/compile 已移除（2026-11-05 review 收缩范围）；原权重、stable解码和逐latent输出保留。开关、职责和证据见
+默认开启 Encoder 两项融合、Lynn QKV/QK norm/FFN。SM90 单卡快速解码引擎于 2026-11-13 按用户确认默认开启（`SGLANG_LYNN_SM90_FAST_DECODE=1`）；完整 product-case 冻结 latent Decoder A/B 已完成，三角色 E2E 与人工画质仍待验收（旧版 workspace/整块 CUDA Graph/compile 已于 2026-11-05 移除）；原权重、stable解码和逐latent输出保留。`SGLANG_LYNN_SM90_FAST_DECODE=1` 在 SM90（H100 / L20Z，CC 9.0）单卡（`world_size == 1`）上自动启用 Hopper WGMMA FP8 投影、FP8 FlashAttention-3、浅层 4 层 Full-Tile / 深层 22 层双线性唯一网格混合、6 模式静态池化 CUDA Graph 预捕获与稳态 CPU–GPU 签名校验异步重叠；在非 SM90（如 B300）、`world_size > 1`、CPU 或 latent 空间尺寸小于 `16×16` 时自动无感回退块内融合或参考路径，也可设 `SGLANG_LYNN_SM90_FAST_DECODE=0` 显式关闭。开关、职责和证据见
 [VAE执行优化方案](/docs/sglang-diffusion/zing/plans/VAE_EXECUTION_OPTIMIZATIONS)。
+
+2026-11-12 review 修复：SM90 引擎最多保留一个尺寸的 Graph/KV 槽位，尺寸切换时释放闲置槽位，活跃槽位不被其他流驱逐；FFN 容器与 SwiGLU 的自定义 hook/forward 纳入准入和稳态校验。补充 5 层 GPU 回归以覆盖深层混合。修复后离线产品对照见下；人工画质和生产 E2E 仍待验收。
+
+
+
+2026-11-13 / `66f035a5aa` 默认值复测：同一张上述 H100、同一 1027 step010000 模型，重新捕获全部 8 个 `product-case-20261103`（15,988 帧）并冻结一次 DiT latent；仅比较显式 `SGLANG_LYNN_SM90_FAST_DECODE=0` 与未设置变量的默认开启组，其余选项逐项核对相同。每例每组完整预热 1 次、正式 3 次。480 CUDA push 中位加速 **2.94–3.39×**；736 **3.07×**，中位/P95 `161.867/200.655 → 52.680/64.745 ms`，每组 `n=306`。显存口径及数值与下述历史轮一致：常驻 allocated 上升，峰值 reserved 降低。所有正式重复的完整 uint8 RGB 组内哈希一致；不代表开关前后像素等价或人工画质通过。完整同步视频、逐 case Host/CUDA 与常驻/峰值显存见 [11 月 13 日默认开关对照](https://review-cdn.loopit.com.cn/reports/pr693-decoder-20261112/rev-03/index.html)。仅为离线 Decoder 对照，Encoder/DiT A/B 与三角色 E2E 未测。
+
+2026-11-12 / `7ef9b16b78`：同一张上海 H100（L20Z / CUDA CC 9.0，81,559 MiB），26 层 EMA BF16 Lynn，完整 `product-case-20261103` 8 例 / 15,988 帧；两组读取相同的冻结 DiT latent，每例 1 次完整预热 + 3 次正式回放。离线 CUDA Decoder push 中位数加速：7 个 `832×480` case 为 **2.93–3.12×**；`1280×736` 为 **3.05×**，中位/P95 `165.312/204.537 → 54.131/68.377 ms`（每组 `n=306`）。计时不含文件 IO、H2D 与视频编码，不是客户端 FPS/TTFF。
+Decoder 进程常驻 allocated：480 约 `4026–4049 → 6724–6748 MiB`，736 `4094 → 9024 MiB`；请求峰值 reserved 分别 `9386 → 7434 MiB`、`17924 → 10768 MiB`。常驻 allocated 增加，不能概括为全面省显存；峰值含输出/可视化临时张量，不是组件独占 driver 显存。B300 仅生成一次共享 latent；Encoder/DiT 未做同条件 A/B，三角色 E2E、TTFF、生产 FPS 和人工画质未验证。此轮测试时为 opt-in；2026-11-13 已按用户确认改为默认开启。逐 case Host/CUDA、样本与 allocated/reserved 原始记录、输入/模型/源码身份和同步完整视频见 [PR #693 验收入口](https://github.com/seedleap/sglang/pull/693)。
+
+以下为原作者、修复前短序列证据，不能与上述完整产品 case 直接比较：
+
+2026-11-12，代码快照 `1c0246cfec` 在上海 H100 单卡（`NVIDIA L20Z`，SM90/132 SM，Torch `2.13.0+cu130`）运行官方 `benchmark_vae_execution.py decoder`（34 帧 = 10 latent steps，5 repeats，稳态样本 `n = 35`）：
+- `832×480`（12 tiles）：稳态单步 `steady_push_ms` 从 `baseline` 中位 `35.441 ms` / P95 `35.490 ms`、`decoder-block` 中位 `30.183 ms` / P95 `30.905 ms` 降至 `decoder-sm90` **中位 `9.759 ms` / P95 `9.824 ms`**（最大 `9.872 ms`，相对加速 `3.63×` / `3.09×`）；`peak_reserved` `7232.0 MiB`（低于 `baseline` `7590.0 MiB` 与 `decoder-block` `8150.0 MiB`），`[0,1]` RGB PSNR `41.809 dB`。
+- `1280×736`（28 tiles）：稳态单步 `steady_push_ms` 从 `baseline` 中位 `81.347 ms` / P95 `81.993 ms`、`decoder-block` 中位 `68.345 ms` / P95 `70.828 ms` 降至 `decoder-sm90` **中位 `22.361 ms` / P95 `23.099 ms`**（最大 `23.314 ms`，相对加速 `3.64×` / `3.06×`）；`peak_reserved` `9990.0 MiB`（较 `baseline` `13232.0 MiB` 节省 `3242.0 MiB`、较 `decoder-block` `13792.0 MiB` 节省 `3802.0 MiB`），`[0,1]` RGB PSNR `43.849 dB`。
+- 生产预热 `warmup_decoder(width=832, height=480)` 耗时 `6.696 s` 一次性捕获全部 6 种时序环模式，首个真实会话在独立私有 CUDA Stream 上零重捕获运行；跨流重复逐位一致（`exact_repeat = True`），并发第二流安全回退且不窃取首流租约。
+- 验证边界：本次为上海 H100（SM90）单卡 Decoder 组件基准与 222 项单测/生产契约验收；Encoder 与 DiT 代码未修改，H200 / B300、SP 多卡、完整三角色 `product-case-20261029` 在线流 E2E 及人工主观画质尚未在本 PR 重测。
 
 2026-11-05，`a44609ba9893` 的 VAE 改动覆盖此前成功快照并保留 main #520 EOS 修复，
 L20Z/SM90 四卡、480、W6/S3、FA4/SP2、DiT Graph 关闭，默认五项开启的完整预热与正式请求均 360/360，prompt/EOS 通过；正式单次 18.209 FPS，RGB 与历史 r21 一致。

@@ -594,7 +594,12 @@ def _retained_exception_worker(rank, world_size, path, failure_point):
     storage_handles = []
     try:
         model = _model()
-        latent = _latent(2, GEOMETRIES[4])
+        latent = _latent(3 if failure_point == "output_cat" else 2, GEOMETRIES[4])
+        clean = model.new_stream(group=group)
+        try:
+            expected = clean.push(latent)
+        finally:
+            clean.close()
         stream = model.new_stream(group=group)
         stream.push(latent[:, :, :1])
         # Storage weak handles observe the C++ allocation, including ownership
@@ -633,13 +638,24 @@ def _retained_exception_worker(rank, world_size, path, failure_point):
             else (model, "_blend", fail_blend)
         )
         armed = False
+        completed_steps = 0
         original_step = model.decode_step
-        failing_latent = latent[:, :, 1:2]
+        failing_latent = latent[:, :, 1:]
+        if failure_point == "latent_transfer":
+            # Matching-device inputs now avoid a redundant transfer. A meta
+            # input reaches the transfer boundary without allocating a GPU.
+            failing_latent = failing_latent.to("meta")
+        if failure_point == "output_empty":
+            # The stream now reuses its empty output for a matching geometry.
+            stream.empty = None
 
         def arm_output_failure(*args, **kwargs):
-            nonlocal armed
+            nonlocal armed, completed_steps
             result = original_step(*args, **kwargs)
-            armed = True
+            completed_steps += 1
+            # A single output no longer needs cat; arm only after both steps
+            # so the injected failure targets the final RGB concatenation.
+            armed = completed_steps == (2 if failure_point == "output_cat" else 1)
             return result
 
         if failure_point in ("output_cat", "output_empty", "latent_transfer"):
@@ -703,7 +719,7 @@ def _retained_exception_worker(rank, world_size, path, failure_point):
         actual = recovered.push(latent)
         _assert_equal(
             actual,
-            model.decode(latent, model.protocol.frame_count(2)),
+            expected,
             "session after retained synchronous exception",
         )
         recovered.close()

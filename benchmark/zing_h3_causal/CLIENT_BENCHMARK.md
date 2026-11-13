@@ -607,3 +607,9 @@ DiT target latent 和 Decoder RGB；不得把 source 缩小后又放大来代替
 比较结果时核对实际 Encoder shape、target latent shape 和 Decoder 输出，不仅检查 CLI。
 全程 FPS 与首包后 FPS仍按输出帧统计。Source VAE、DiT、独立 Decoder 的实际 CUDA
 执行区间应另采诊断；调用方提交 remote decode 的 Host scope 不能当作 Decoder 耗时。
+
+## 完整画质评估视频
+
+连续 source 可显式传 `--media-mode full`：每个 case 的首个正式请求保留原尺寸、全部帧的 24 FPS H.264（CRF 10、yuv420p）视频。其余重复只保留指标和完整 RGB 哈希。RGB 暂存与哈希在接收路径上，编码在请求计时结束后执行；与 metrics 模式的历史结果不能直接归因比较。临时 RGB 可能大于最终 2 GiB 留存预算，编码后只删除本次的暂存文件；完整 MP4、回执和指标仍受实验总留存预算约束。视频用于肉眼评估，不是无损像素 parity。
+
+`run_sm90_product_review.py` 提供隔离单卡的 SM90 开/关对照入口，固定 `product-case-20261103` 全部 8 个原始 case、seed、4→2 schedule 和相同部署配置。它使用 text CPU offload、SP1，本布局的 E2E 不能冒充生产三角色性能验收。

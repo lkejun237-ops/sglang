@@ -43,6 +43,10 @@ class LynnStream:
     def close(self):
         if self.state is not None:
             # A failure traceback may still refer to the state after close.
+            lease = self.state.sm90_lease
+            self.state.sm90_lease = None
+            if lease is not None:
+                lease.release()
             self.state.pixel_send = self.state.pixel_recv = None
             self.state.execution_signature = None
         self.state = None
@@ -56,23 +60,45 @@ class LynnStream:
             raise ValueError("Lynn expects nonempty normalized N24THW latents")
         try:
             device = self.model.latent_mean.device
-            latent = latent.to(device=device)
-            outputs = []
-            with (
-                # The caller owns EOS trimming when frame_limit is unknown.
-                component_timer("decoder", completed_frames=0) as timer,
-                torch.autocast(device.type, dtype=self.model.compute_dtype),
-            ):
-                for z_t in latent.split(1, dim=2):
-                    frames, self.state = self.model.decode_step(
-                        z_t, self.state, self.group
-                    )
-                    outputs.append(frames)
+            if latent.device != device:
+                latent = latent.to(device=device)
+            # The caller owns EOS trimming when frame_limit is unknown.
+            with component_timer("decoder", completed_frames=0) as timer:
+                if (
+                    latent.shape[2] == 1
+                    and "decode_step" not in self.model.__dict__
+                    and hasattr(self.model, "_decode_step_impl")
+                ):
+                    with torch.autocast(device.type, dtype=self.model.compute_dtype):
+                        frames, self.state, clamped = self.model._decode_step_impl(
+                            latent, self.state, self.group, clamp_output=True
+                        )
                     self.latents_seen += 1
-                timer.frames = sum(output.shape[2] for output in outputs)
-                timer.resolution = f"{outputs[-1].shape[-1]}x{outputs[-1].shape[-2]}"
-            result = torch.cat(outputs, dim=2).clamp_(0, 1)
-            self.empty = result.new_empty((*result.shape[:2], 0, *result.shape[3:]))
+                    result = frames if clamped else frames.clamp_(0, 1)
+                else:
+                    outputs = []
+                    with torch.autocast(device.type, dtype=self.model.compute_dtype):
+                        for z_t in latent.split(1, dim=2):
+                            frames, self.state = self.model.decode_step(
+                                z_t, self.state, self.group
+                            )
+                            outputs.append(frames)
+                            self.latents_seen += 1
+                    result = (
+                        outputs[0].clamp_(0, 1)
+                        if len(outputs) == 1
+                        else torch.cat(outputs, dim=2).clamp_(0, 1)
+                    )
+                timer.frames = result.shape[2]
+                timer.resolution = f"{result.shape[-1]}x{result.shape[-2]}"
+            empty_shape = (*result.shape[:2], 0, *result.shape[3:])
+            if (
+                self.empty is None
+                or self.empty.shape != empty_shape
+                or self.empty.dtype != result.dtype
+                or self.empty.device != result.device
+            ):
+                self.empty = result.new_empty(empty_shape)
             if self.frame_limit is not None:
                 result = result[:, :, : max(0, self.frame_limit - self.frames_emitted)]
             self.frames_emitted += result.shape[2]

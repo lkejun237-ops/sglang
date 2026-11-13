@@ -1127,7 +1127,7 @@ def parser():
     )
     parser.add_argument(
         "--media-mode",
-        choices=("metrics", "representative", "raw"),
+        choices=("metrics", "representative", "raw", "full"),
         default="representative",
     )
     parser.add_argument(

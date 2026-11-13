@@ -633,7 +633,7 @@ def parser():
     )
     result.add_argument(
         "--media-mode",
-        choices=("metrics", "representative", "raw"),
+        choices=("metrics", "representative", "raw", "full"),
         default="representative",
     )
     result.add_argument("--ffmpeg", default="ffmpeg")

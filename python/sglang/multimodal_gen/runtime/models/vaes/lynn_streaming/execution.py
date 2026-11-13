@@ -17,6 +17,7 @@ class LynnExecutionOptions:
     packed_qkv: bool = False
     fused_qk_norm: bool = False
     compiled_ffn: bool = False
+    sm90_fast_decode: bool = False
 
     @classmethod
     def from_env(cls):
@@ -30,26 +31,34 @@ class LynnExecutionOptions:
             packed_qkv=flag("PACKED_QKV", "1"),
             fused_qk_norm=flag("FUSED_QK_NORM", "1"),
             compiled_ffn=flag("COMPILED_FFN", "1"),
+            sm90_fast_decode=flag("SM90_FAST_DECODE", "1"),
         )
 
     @property
     def block_enabled(self):
-        return self.packed_qkv or self.fused_qk_norm or self.compiled_ffn
+        return (
+            self.packed_qkv
+            or self.fused_qk_norm
+            or self.compiled_ffn
+            or self.sm90_fast_decode
+        )
 
 
 def parameter_signature(module):
     # Host metadata only; no device synchronization or tensor-value readback.
     return tuple(
-        (
-            id(p),
-            p._version,
-            p.device,
-            p.dtype,
-            tuple(p.shape),
-            tuple(p.stride()),
-            p.data_ptr(),
-        )
-        for p in module.parameters()
+        [
+            (
+                id(p),
+                p._version,
+                p.device,
+                p.dtype,
+                p.shape,
+                p.stride(),
+                p.data_ptr(),
+            )
+            for p in module.parameters()
+        ]
     )
 
 
@@ -75,11 +84,48 @@ class LynnBlockExecution:
         self.options = options
         self.packed = {}
         self.ffns = {}
-        self.counts = {"packed_qkv": 0, "compiled_ffn": 0, "fallback": 0}
+        self.sm90_engine = None
+        self._step_signature = None
+        self.counts = {
+            "packed_qkv": 0,
+            "compiled_ffn": 0,
+            "sm90_fast_decode": 0,
+            "fallback": 0,
+        }
 
     def clear(self):
         self.packed.clear()
         self.ffns.clear()
+        if self.sm90_engine is not None:
+            self.sm90_engine.clear()
+            self.sm90_engine = None
+
+    def run_sm90_step(
+        self, model, z_t, state, phase, *, signature=None, clamp_output=False
+    ):
+        if not self.options.sm90_fast_decode:
+            return None
+        from .sm90_fast_decode import (
+            LynnSm90FastEngine,
+            get_or_create_sm90_engine,
+        )
+
+        self._step_signature = signature
+        try:
+            engine = get_or_create_sm90_engine(self, model, z_t)
+        finally:
+            self._step_signature = None
+        if engine is None:
+            return None
+        if isinstance(engine, LynnSm90FastEngine):
+            frames = engine.decode_step(z_t, state, phase, clamp_output=clamp_output)
+        else:
+            frames = engine.decode_step(z_t, state, phase)
+            if clamp_output and frames is not None:
+                frames = frames.clamp_(0, 1)
+        if frames is not None:
+            self.counts["sm90_fast_decode"] += 1
+        return frames
 
     def prepare_qkv(self, block):
         if not self.options.packed_qkv:

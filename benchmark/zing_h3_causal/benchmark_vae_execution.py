@@ -264,6 +264,7 @@ def decoder(args):
     for cell in args.cells or (
         "baseline",
         "decoder-block",
+        "decoder-sm90",
     ):
         os.environ.update(cell_environment(cell))
         model.execution = LynnBlockExecution(LynnExecutionOptions.from_env())
@@ -326,7 +327,7 @@ def main():
         *(
             ("encoder-norm", "encoder-copy", "encoder-all")
             if args.component == "encoder"
-            else ("decoder-block",)
+            else ("decoder-block", "decoder-sm90")
         ),
     }
     if args.cells is not None and (

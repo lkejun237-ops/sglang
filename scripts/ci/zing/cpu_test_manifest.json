@@ -11484,70 +11484,56 @@
         {
           "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_lynn_execution.py::test_cuda_stream_parity_and_output_ownership[options2]",
           "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_lynn_execution.py::test_sm90_shallow_and_deep_streams[2]",
+          "reason": "Requires CUDA and Triton"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_lynn_execution.py::test_sm90_shallow_and_deep_streams[5]",
+          "reason": "Requires CUDA and Triton"
         }
       ],
       "sources": [
         "main"
       ],
-      "reason": "Two complete Linux CPU trials passed for this test source after white_box/main integration; only explicit CUDA-only skips remain.",
+      "reason": "Two pinned Linux Python 3.11 / Torch 2.8.0+cpu Docker trials passed; only the explicitly listed CUDA cases are skipped.",
       "dependencies": [
         "torch",
         "diffusers"
       ],
       "trial_evidence": {
-        "source_sha256": "76d96668a81c3c395b15f71621c4e0930fdd36452355fdecdf71692a3917b261",
-        "tested_head": "e5b50be82965ecfaa0c4209b9aac047f89ac8bfa",
-        "receipt": "/Users/kejun/.codex/tmp/merge-main-whitebox-thailand-20261108/cpu-evidence-r4/ordinary-r2-0/receipt.json",
-        "receipt_sha256": "2a6572113b6fd8863f1d86a83ad33df59315ca58043d77ea1e2a66152430c2e9",
-        "archive": "oss://leap-world-shanghai/world-model/whitebox-releases/main-whitebox-thailand-20261108/cpu-evidence-r4.tgz",
-        "archive_sha256": "11efe6006cfa80fabbe00010af416548ce7bc9ab42a1250f0d6df7601e9062f9",
+        "source_sha256": "4f5918a93a12bdb3f8457449c61a23dd6ab779c32a2f622f6fa3503e782940e9",
+        "tested_head": "822336a80ae93215730550da29f005100b286e4a",
+        "receipt": "/evidence/execution/receipt.json",
+        "receipt_archive_path": "execution/receipt.json",
+        "receipt_sha256": "45ec91f78b1791782d67e34b47bcf61de2d06337801bc8f41ed1f7254c02bcf6",
+        "archive": "oss://leap-world-shanghai/codex-experiments/pr693-product-review-20261112-r1/cpu-validation-review-r1.tar.gz",
+        "archive_sha256": "c800addceab40d3208bd14628759a4e3ffc8c5a355f2355ff635a913817743a1",
         "trials": [
           {
             "trial": 1,
-            "passed": 5,
-            "collected": 8,
-            "skipped": 3,
-            "duration_seconds": 5.049567988025956,
-            "exit_code": 0,
-            "log_path": "ordinary-r2-0/cpu-64-trial-1.log",
-            "junit_path": "ordinary-r2-0/cpu-64-trial-1.xml",
-            "log_sha256": "5be2e61ef9f3d0eb00807d0d4efaab91c6ed20d982bfd041ec5aa6762ea3236a",
-            "junit_sha256": "2f87fa3bfa4ded11d7bd125a6412ee55aaa805fff50c7b9760425711e12a63e4"
+            "passed": 12,
+            "collected": 17,
+            "skipped": 5,
+            "duration_seconds": 9.707053212999995,
+            "log_path": "/evidence/execution/cpu-0-trial-1.log",
+            "junit_path": "/evidence/execution/cpu-0-trial-1.xml"
           },
           {
             "trial": 2,
-            "passed": 5,
-            "collected": 8,
-            "skipped": 3,
-            "duration_seconds": 4.8126423170324415,
-            "exit_code": 0,
-            "log_path": "ordinary-r2-0/cpu-64-trial-2.log",
-            "junit_path": "ordinary-r2-0/cpu-64-trial-2.xml",
-            "log_sha256": "612e06682b978a380cdea548f62327e5a5ce592d815bcb979ba49408209189f1",
-            "junit_sha256": "66595eab571fe979e4bc21bc0d25d39476d914059b403ce5c0fa9a27453107dc"
+            "passed": 12,
+            "collected": 17,
+            "skipped": 5,
+            "duration_seconds": 7.935990629000116,
+            "log_path": "/evidence/execution/cpu-0-trial-2.log",
+            "junit_path": "/evidence/execution/cpu-0-trial-2.xml"
           }
         ],
         "environment": {
-          "python": "3.11.14",
-          "platform": "Linux-5.10.134-19.8.al8.x86_64-x86_64-with-glibc2.39"
-        },
-        "manifest_sha256": "192f23c16420b9ed686e82d17a83c1cb41ae93842274fa2a2f9add04e1c221da",
-        "tooling_sha256": {
-          "check_python.py": "edced74edc439191f8ff97373e71fbb50d1469cff016c7163f0cb80d93ede73b",
-          "check_room_init.py": "d60e4851901eb5e0bfac7e78b7618fcc483616707a90b1cf135787bff00935d3",
-          "common.py": "52128fc66405da6918eecb98a73d76f322aa3fbe6fec9b55c0a3ff9924cb8f4b",
-          "prepare_media_tooling.py": "27dcceabd6c24076929108bc9c72431a64a22764a770cc222049619ec6912139",
-          "run_area_tests.py": "b3b4feead224895cf66df953faea5c3c98ec095e165bba1180b87d10c494a3f2",
-          "run_cpu_tests.py": "f5981aec18cde4485454b14e473453533fd57bc98aa1af8631fc9148c3be479f",
-          "run_prefill_tests.py": "2e283c138b1ad5fa606df9db2658677779505173987b6a09ea52547c4ed6f489",
-          "run_role_pool_tests.py": "2061f12b5ea32240f96579d55f408673f779bf1d3df84a162b12b641f0091d90",
-          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
-          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
-          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
-          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
-        },
-        "environment_recipe": {
-          "python_version": "3.11",
+          "python": "3.11.18",
+          "platform": "Linux amd64 under Docker Desktop emulation",
+          "torch": "2.8.0+cpu",
           "requirements_sha256": {
             "scripts/ci/zing/requirements-cpu.txt": "5b4b5a6b39bc8d729acbc53612527e881e24202c706f960773d6c8cf83014f48",
             "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
@@ -12355,6 +12341,108 @@
             "MKL_NUM_THREADS": "1",
             "OMP_NUM_THREADS": "1",
             "OPENBLAS_NUM_THREADS": "1"
+          }
+        }
+      }
+    },
+    {
+      "path": "benchmark/zing_h3_causal/tests/test_full_video_capture.py",
+      "suite": "benchmark-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two pinned Linux Python 3.11 / Torch 2.8.0+cpu Docker trials passed; the complete FFmpeg frame roundtrip is verified.",
+      "dependencies": [
+        "ffmpeg"
+      ],
+      "trial_evidence": {
+        "source_sha256": "d4a77f03994c4446fb7b34b33a21a1ababaab8ec485511d3ef369e128a43261b",
+        "tested_head": "822336a80ae93215730550da29f005100b286e4a",
+        "receipt": "/evidence/benchmark/receipt.json",
+        "receipt_archive_path": "benchmark/receipt.json",
+        "receipt_sha256": "2e9734df2f02652fec9eb86c6f5aaa9d4acc4bcf64f502c39a9a120c07a3bb58",
+        "archive": "oss://leap-world-shanghai/codex-experiments/pr693-product-review-20261112-r1/cpu-validation-review-r1.tar.gz",
+        "archive_sha256": "c800addceab40d3208bd14628759a4e3ffc8c5a355f2355ff635a913817743a1",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 1,
+            "collected": 1,
+            "skipped": 0,
+            "duration_seconds": 0.7988895419999835,
+            "log_path": "/evidence/benchmark/cpu-0-trial-1.log",
+            "junit_path": "/evidence/benchmark/cpu-0-trial-1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 1,
+            "collected": 1,
+            "skipped": 0,
+            "duration_seconds": 0.5490495840000449,
+            "log_path": "/evidence/benchmark/cpu-0-trial-2.log",
+            "junit_path": "/evidence/benchmark/cpu-0-trial-2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.18",
+          "platform": "Linux amd64 under Docker Desktop emulation",
+          "torch": "2.8.0+cpu",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "5b4b5a6b39bc8d729acbc53612527e881e24202c706f960773d6c8cf83014f48",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
+          }
+        }
+      }
+    },
+    {
+      "path": "benchmark/zing_h3_causal/tests/test_sm90_review_cleanup.py",
+      "suite": "benchmark-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Two pinned Linux Python 3.11 / Torch 2.8.0+cpu Docker trials passed; real Linux process-group and zombie cleanup is verified.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "967934df9e67c75dad2e19b33182ad8c4c45ca706cabe7028a0095d81be3a9bf",
+        "tested_head": "822336a80ae93215730550da29f005100b286e4a",
+        "receipt": "/evidence/benchmark/receipt.json",
+        "receipt_archive_path": "benchmark/receipt.json",
+        "receipt_sha256": "2e9734df2f02652fec9eb86c6f5aaa9d4acc4bcf64f502c39a9a120c07a3bb58",
+        "archive": "oss://leap-world-shanghai/codex-experiments/pr693-product-review-20261112-r1/cpu-validation-review-r1.tar.gz",
+        "archive_sha256": "c800addceab40d3208bd14628759a4e3ffc8c5a355f2355ff635a913817743a1",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 1,
+            "collected": 1,
+            "skipped": 0,
+            "duration_seconds": 0.40174258299998655,
+            "log_path": "/evidence/benchmark/cpu-1-trial-1.log",
+            "junit_path": "/evidence/benchmark/cpu-1-trial-1.xml"
+          },
+          {
+            "trial": 2,
+            "passed": 1,
+            "collected": 1,
+            "skipped": 0,
+            "duration_seconds": 0.37712229099997785,
+            "log_path": "/evidence/benchmark/cpu-1-trial-2.log",
+            "junit_path": "/evidence/benchmark/cpu-1-trial-2.xml"
+          }
+        ],
+        "environment": {
+          "python": "3.11.18",
+          "platform": "Linux amd64 under Docker Desktop emulation",
+          "torch": "2.8.0+cpu",
+          "requirements_sha256": {
+            "scripts/ci/zing/requirements-cpu.txt": "5b4b5a6b39bc8d729acbc53612527e881e24202c706f960773d6c8cf83014f48",
+            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
           }
         }
       }

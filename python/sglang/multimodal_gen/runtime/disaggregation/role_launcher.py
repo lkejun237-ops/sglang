@@ -41,6 +41,7 @@ def _role_environment(server_args, role, devices):
                 "SGLANG_LYNN_PACKED_QKV",
                 "SGLANG_LYNN_FUSED_QK_NORM",
                 "SGLANG_LYNN_COMPILED_FFN",
+                "SGLANG_LYNN_SM90_FAST_DECODE",
             )
         )
         for name in names:

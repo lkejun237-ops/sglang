@@ -207,7 +207,7 @@ def test_decoder_completed_frames_exclude_tail_padding(monkeypatch, mode):
 
     model = SimpleNamespace(
         protocol=protocol,
-        init_stream=lambda: SimpleNamespace(index=0),
+        init_stream=lambda: SimpleNamespace(index=0, sm90_lease=None),
         latent_mean=torch.zeros(24),
         compute_dtype=torch.bfloat16,
         spatial_ratio=16,
@@ -416,3 +416,43 @@ assert b'zing_child_frames_total 17.0' in prometheus_latest()
         timeout=20,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_single_latent_fast_path_keeps_decoder_metrics():
+    import torch
+
+    from sglang.multimodal_gen.runtime.models.vaes.lynn_streaming.stream import (
+        LynnStream,
+    )
+
+    class Model:
+        latent_mean = torch.zeros(24)
+        compute_dtype = torch.bfloat16
+        protocol = None
+
+        def init_stream(self):
+            return SimpleNamespace(sm90_lease=None)
+
+        def _decode_step_impl(self, latent, state, group, *, clamp_output):
+            assert clamp_output
+            return torch.zeros(1, 3, 4, 32, 32), state, True
+
+    timer = metrics.ComponentTimer("decoder", width=32, height=32)
+    tag = labels(timer)
+    before = value("sglang_zing_component_frames_total", tag)
+    completed_tag = dict(tag)
+    del completed_tag["measurement"]
+    completed_before = value(
+        "sglang_zing_component_completed_frames_total", completed_tag
+    )
+    stream = LynnStream(Model(), frame_limit=2)
+    try:
+        assert stream.push(torch.zeros(1, 24, 1, 2, 2)).shape[2] == 2
+        assert value("sglang_zing_component_frames_total", tag) - before == 4
+        assert (
+            value("sglang_zing_component_completed_frames_total", completed_tag)
+            - completed_before
+            == 2
+        )
+    finally:
+        stream.close()

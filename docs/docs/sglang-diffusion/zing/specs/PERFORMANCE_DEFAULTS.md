@@ -208,8 +208,8 @@ H200 FP8 组合另有三个旧 case 全程 9.897–10.493 FPS，不能视为 BF1
 完整配置、版本、P95 和原始证据入口见
 [736p 部署性能更新](../deployment_zing_h3.mdx#736p-部署性能更新2026-10-30)。
 
-## VAE 执行默认值（2026-11-05）
+## VAE 执行默认值（2026-11-05 / 2026-11-12 更新）
 
-按用户指定，`MINIMAX_H3_PROGRESSIVE_FUSED_NORM_INPUT`、`MINIMAX_H3_PROGRESSIVE_FUSED_CONV_INPUT`、`SGLANG_LYNN_PACKED_QKV`、`SGLANG_LYNN_FUSED_QK_NORM`、`SGLANG_LYNN_COMPILED_FFN` 默认 `1`；workspace、整块 CUDA Graph/compile 的选项和生产分支已移除。显式环境变量优先，已有部署需移除旧的关闭覆盖并重启对应 worker。Lynn 显式传入 execution_options 时沿用调用者配置。
+按用户指定，`MINIMAX_H3_PROGRESSIVE_FUSED_NORM_INPUT`、`MINIMAX_H3_PROGRESSIVE_FUSED_CONV_INPUT`、`SGLANG_LYNN_PACKED_QKV`、`SGLANG_LYNN_FUSED_QK_NORM`、`SGLANG_LYNN_COMPILED_FFN` 五项默认 `1`；`SGLANG_LYNN_SM90_FAST_DECODE` 于 2026-11-13 按用户确认默认 `1`；完整 product-case 冻结 latent Decoder A/B 已完成，三角色 E2E 与人工画质仍待验收；旧版 workspace、整块 compile 的选项已移除。显式环境变量优先，已有部署需移除旧的关闭覆盖并重启对应 worker。Lynn 显式传入 `execution_options` 时沿用调用者配置；`SGLANG_LYNN_SM90_FAST_DECODE=1` 仅在 SM90（CC 9.0）单卡（`world_size == 1`）且输入满足架构准入条件时激活，在非 SM90、多卡 SP、CPU 或小尺寸输入上自动无感回退块内融合或参考路径。
 
-这是运行默认策略，不是严格无损或整体 FPS 提升承诺。当前 P2 输入布局修复尚未重跑 GPU，历史证据及精度/硬件边界见 [VAE 执行方案](../plans/VAE_EXECUTION_OPTIMIZATIONS.md)。
+这是运行默认策略，不是严格无损或端到端整体 FPS 提升承诺。2026-11-12 已在上海 H100（`NVIDIA L20Z`, SM90, `1c0246cfec`）完成单卡 Lynn Decoder 组件验收（`832×480` 稳态单步中位 `9.759 ms` / P95 `9.824 ms`；`1280×736` 稳态单步中位 `22.361 ms` / P95 `23.099 ms`），完整三角色在线流 E2E、H200/B300 及精度/硬件边界见 [VAE 执行方案](../plans/VAE_EXECUTION_OPTIMIZATIONS.md)。
