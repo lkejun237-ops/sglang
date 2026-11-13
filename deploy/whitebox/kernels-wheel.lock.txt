@@ -1,0 +1,3 @@
+# Managed by deploy/whitebox/bump_kernels_wheel.py (prebuilt binary CUDA wheel only).
+seedleap-kernels==0.1.0.dev4 \
+    --hash=sha256:96a3c6434adcdce905ac53c29a246e79196ed6eb51ba970195062d45aee15e47

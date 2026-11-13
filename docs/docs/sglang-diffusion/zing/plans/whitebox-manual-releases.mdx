@@ -70,17 +70,17 @@ python deploy/whitebox/release.py build \
 `--component model --base <CUDA依赖镜像>@sha256:<digest>` 构建模型运行镜像。
 H200/B300 可以使用不同的 CUDA/torch/kernel 依赖镜像，但都从同一完整 SGLang SHA 取源码。
 依赖镜像须与该版本原生扩展 ABI 兼容，首次切换必须验证；源码覆盖本身不证明兼容。
-其中 `MODEL_BASE_IMAGE` 必须预装 AOT 预编译二进制 `seedleap-kernels` wheel（禁止使用 `py3-none-any` 纯源码包或运行期 `nvcc` JIT 编译）。
-`docker/whitebox-model.Dockerfile` 在构建期设置 `SEEDLEAP_KERNELS_DISABLE_JIT=1`，并通过 `deploy/whitebox/verify_model_kernels.py` 强制校验预编译扩展、必需算子导出与 PyTorch 主次版本 ABI，同时将 `kernels_version` 与 `kernels_git_sha` 记录到 `/opt/whitebox/release.json`。
+其中 `MODEL_BASE_IMAGE` 提供固定 CUDA / PyTorch 环境及基线预编译二进制 `seedleap-kernels` wheel（禁止使用 `py3-none-any` 纯源码包或运行期 `nvcc` JIT 编译）；仓库内 `deploy/whitebox/kernels-wheel.lock.txt` 通过 `pip --require-hashes`（配合 `--no-index --no-deps --force-reinstall --only-binary=:all:` 与显式 `--find-links` 静态 `index.html`）锁定预编译二进制 `seedleap-kernels` wheel 的精确版本与 SHA256，并在复制 SGLang 业务源码前完成覆盖安装以复用 Docker 层缓存。
+日常更新 `seedleap-kernels` 仅需在仓库运行 `python deploy/whitebox/bump_kernels_wheel.py` 强制下载核验并更新 `kernels-wheel.lock.txt`，部署侧原有的 `release.py build --component model --base ...` 命令无需改动，`--base` 底包也无需随算子小版本频繁更换（仅在升级 CUDA 或 PyTorch 主次版本时更新底包）。
+`docker/whitebox-model.Dockerfile` 在构建期设置 `SEEDLEAP_KERNELS_DISABLE_JIT=1`，并通过 `deploy/whitebox/verify_model_kernels.py --manifest /opt/whitebox/release.json --lockfile /opt/whitebox/deploy/whitebox/kernels-wheel.lock.txt` 强制校验已安装版本与锁文件完全一致、预编译扩展符号导出及 PyTorch 主次版本 ABI，同时将 `kernels_version` 与 `kernels_git_sha` 记录到 `/opt/whitebox/release.json`。
 已实测验证含预编译 `seedleap-kernels`（`c9bb3c89a08cd37f0649035e0e14f89ad4137eba`，`sm_90a`，PyTorch `2.13.0+cu130`，两地共享同一 OCI `ImageId` `4ab90764d8fede24f4567eed52be45e250bb9fea92c6b657e828e97c23ac036a` 与全部 72 层 `diff_ids`）的固定依赖镜像如下（原回滚基线 `v0.5.19-cu130-hub1.33@sha256:894eb66a6f96755d439e07045c27dac2dd5087d7caa5ea5f4d534bf7a500740a` 在两地均原样保留）：
 - 上海：`whitebox-shanghai-registry-vpc.cn-shanghai.cr.aliyuncs.com/whitebox/sglang:v0.5.19-cu130-hub1.33-seedleap-kernels-c9bb3c89@sha256:0433130f16790ecb2b483820d4b947c7b65197261c264e286fa7939b509428e5`
 - 泰国：`zing-thailand-registry-vpc.ap-southeast-7.cr.aliyuncs.com/zing/sglang:v0.5.19-cu130-hub1.33-seedleap-kernels-c9bb3c89@sha256:ec9f5111b4c048dd4d66b7b083b1b024281dcc8ddd6ac1d828b220ca0374e9c0`
 
-构建机下载受限时，可显式添加 `--pip-index-url https://mirrors.aliyun.com/pypi/simple/`
-和 `--go-proxy https://goproxy.cn`。只使用不含凭据、查询参数或片段的公共 HTTPS 镜像；
-先在实际构建机只读核验可达性，不保证镜像下载速度。未设置时保持原有下载源。
-这两个参数只转发为 `PIP_INDEX_URL` / `GOPROXY` 构建参数，不写入运行时环境或发布身份，
-不关闭 TLS、Go 校验和验证或任何构建测试；Go 参数用于 Room 的 RTC 构建阶段。
+构建机下载受限时，可显式添加 `--pip-index-url https://mirrors.aliyun.com/pypi/simple/`、`--go-proxy https://goproxy.cn` 或（针对模型二进制算子包静态链接页）`--kernels-find-links <公共HTTPS链接页>`。只使用不含凭据、查询参数或片段的公共 HTTPS 镜像；
+先在实际构建机只读核验可达性，不保证镜像下载速度。未设置时保持原有下载源（`KERNELS_WHEEL_FIND_LINKS` 默认使用 `https://zing-cdn.loopit.com.cn/releases/seedleap-kernels/simple/seedleap-kernels/index.html`）。
+这三个参数只转发为 `PIP_INDEX_URL` / `GOPROXY` / `KERNELS_WHEEL_FIND_LINKS` 构建参数，不写入运行时环境或发布身份，
+不关闭 TLS、pip `--require-hashes`、Go 校验和验证或任何构建测试；Go 参数用于 Room 的 RTC 构建阶段。
 保留原始依赖版本、SDK pin、main/dev 祖先校验和镜像验收。
 
 需要构建期固定解析地址时，可重复使用 `--build-host HOST:IP`，只转发 Docker 原生

@@ -123,6 +123,16 @@ def test_build_mirrors_only_add_explicit_network_args(
     [
         ("--pip-index-url", "PIP_INDEX_URL", "https://pypi.org/simple"),
         ("--go-proxy", "GOPROXY", "https://goproxy.cn"),
+        (
+            "--kernels-find-links",
+            "KERNELS_WHEEL_FIND_LINKS",
+            "https://zing-cdn.loopit.com.cn/releases/seedleap-kernels/simple/seedleap-kernels/index.html",
+        ),
+        (
+            "--kernels-index-url",
+            "KERNELS_WHEEL_FIND_LINKS",
+            "https://zing-cdn.loopit.com.cn/releases/seedleap-kernels/simple/seedleap-kernels/index.html",
+        ),
     ],
 )
 def test_one_mirror_does_not_override_other_download_defaults(
@@ -131,7 +141,9 @@ def test_one_mirror_does_not_override_other_download_defaults(
     calls, _, _ = builder("room", flag, value)
     argv = calls[0][0][0]
     network_args = [
-        arg for arg in argv if arg.startswith(("PIP_INDEX_URL=", "GOPROXY="))
+        arg
+        for arg in argv
+        if arg.startswith(("PIP_INDEX_URL=", "GOPROXY=", "KERNELS_WHEEL_FIND_LINKS="))
     ]
     assert network_args == [name + "=" + value]
 
@@ -178,7 +190,15 @@ def test_invalid_build_host_rejected_before_build(builder, value):
     assert error.value.code == 2
 
 
-@pytest.mark.parametrize("flag", ["--pip-index-url", "--go-proxy"])
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--pip-index-url",
+        "--go-proxy",
+        "--kernels-find-links",
+        "--kernels-index-url",
+    ],
+)
 @pytest.mark.parametrize(
     "url",
     [
@@ -252,5 +272,34 @@ def test_model_build_uses_pinned_base_image_without_kernels_checkout(
     with pytest.raises(SystemExit) as error:
         builder(
             "model", "--base", base, "--kernels-checkout", str(tmp_path / "kernels")
+        )
+    assert error.value.code == 2
+
+
+def test_model_build_accepts_optional_kernels_find_links(builder, capsys):
+    base = "registry.example/base@sha256:" + "0" * 64
+    find_links = (
+        "https://mirror.example/releases/seedleap-kernels/simple/"
+        "seedleap-kernels/index.html"
+    )
+    calls, _, _ = builder("model", "--base", base, "--kernels-find-links", find_links)
+    assert len(calls) == 1
+    (argv,), _ = calls[0]
+    assert argv[-5:] == [
+        "--build-arg",
+        "KERNELS_WHEEL_FIND_LINKS=" + find_links,
+        "--platform",
+        "linux/amd64",
+        ".",
+    ]
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as error:
+        builder(
+            "model",
+            "--base",
+            base,
+            "--kernels-find-links",
+            "http://mirror.example/releases/seedleap-kernels/simple/seedleap-kernels/index.html",
         )
     assert error.value.code == 2

@@ -196,6 +196,7 @@ def build(args):
         for option, name in (
             ("pip_index_url", "PIP_INDEX_URL"),
             ("go_proxy", "GOPROXY"),
+            ("kernels_find_links", "KERNELS_WHEEL_FIND_LINKS"),
         ):
             value = getattr(args, option, None)
             if value is not None:
@@ -292,6 +293,13 @@ def main():
         "--go-proxy",
         type=mirror_url,
         help="Optional public HTTPS Go module proxy; no credentials",
+    )
+    b.add_argument(
+        "--kernels-find-links",
+        "--kernels-index-url",
+        dest="kernels_find_links",
+        type=mirror_url,
+        help="Optional public HTTPS find-links page for seedleap-kernels; no credentials",
     )
     b.add_argument(
         "--build-host",

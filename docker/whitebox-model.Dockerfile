@@ -10,6 +10,13 @@ ARG PIP_INDEX_URL=https://pypi.org/simple
 RUN python -m pip install --no-cache-dir --index-url "$PIP_INDEX_URL" \
       uvicorn==0.39.0 websockets==15.0.1 \
       diffusers==0.41.0 huggingface_hub==1.33.0
+# Install the hash-locked prebuilt binary seedleap-kernels wheel before copying
+# SGLang source so routine Python changes reuse this cached image layer.
+ARG KERNELS_WHEEL_FIND_LINKS=https://zing-cdn.loopit.com.cn/releases/seedleap-kernels/simple/seedleap-kernels/index.html
+COPY deploy/whitebox/kernels-wheel.lock.txt /opt/whitebox/deploy/whitebox/kernels-wheel.lock.txt
+RUN python -m pip install --no-cache-dir --no-index --no-deps --force-reinstall --only-binary=:all: --require-hashes \
+      --find-links "$KERNELS_WHEEL_FIND_LINKS" \
+      -r /opt/whitebox/deploy/whitebox/kernels-wheel.lock.txt
 COPY python/sglang /opt/whitebox/python/sglang
 COPY deploy/whitebox /opt/whitebox/deploy/whitebox
 ARG WHITEBOX_SOURCE_SHA=unmanaged
@@ -25,9 +32,11 @@ RUN python -c 'from sglang.multimodal_gen.runtime.realtime.source_transport impo
 # --help stops before the Decoder loads Lynn. Import its real implementation so
 # an older dependency base cannot defer this failure until GPUs are allocated.
 RUN python -c 'import diffusers; assert diffusers.__version__ == "0.41.0"; import sglang.multimodal_gen.runtime.models.vaes.lynn_streaming.loader'
-# Verify MODEL_BASE_IMAGE ships the prebuilt binary seedleap-kernels wheel
-# (no runtime nvcc/JIT compilation permitted in production).
-RUN python /opt/whitebox/deploy/whitebox/verify_model_kernels.py --manifest /opt/whitebox/release.json
+# Verify the installed prebuilt binary seedleap-kernels wheel matches the lockfile
+# and ABI contract (no runtime nvcc/JIT compilation permitted in production).
+RUN python /opt/whitebox/deploy/whitebox/verify_model_kernels.py \
+      --manifest /opt/whitebox/release.json \
+      --lockfile /opt/whitebox/deploy/whitebox/kernels-wheel.lock.txt
 # Model weights, regional bundle, logs, conditioning secrets and local cache are
 # mounted independently. The builder does not read or alter any of them.
 ENTRYPOINT ["python", "/opt/whitebox/deploy/whitebox/model_service.py"]

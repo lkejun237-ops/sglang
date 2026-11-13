@@ -7,7 +7,9 @@ for payload/import checks.
 """
 
 import base64
+import contextlib
 import hashlib
+import http.server
 import importlib.metadata
 import json
 import os
@@ -16,6 +18,8 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+import threading
+import urllib.request
 import uuid
 import venv
 import zipfile
@@ -344,11 +348,62 @@ def test_model_dockerfile_enforces_prebuilt_kernels_without_compilation():
             "Docker build context"
         )
     assert MODEL_DOCKERFILE.is_file()
+    lockfile_on_disk = ROOT / "deploy/whitebox/kernels-wheel.lock.txt"
+    assert lockfile_on_disk.is_file()
+    lock_text = lockfile_on_disk.read_text(encoding="utf-8")
+    assert "seedleap-kernels==" in lock_text
+    assert "--hash=sha256:" in lock_text
+
     instructions = []
     for line in MODEL_DOCKERFILE.read_text().replace("\\\n", " ").splitlines():
         words = shlex.split(line, comments=True)
         if words:
             instructions.append((words[0], words[1:]))
+
+    arg_defs = [arg for op, args in instructions if op == "ARG" for arg in args]
+    assert (
+        "KERNELS_WHEEL_FIND_LINKS=https://zing-cdn.loopit.com.cn/releases/seedleap-kernels/simple/seedleap-kernels/index.html"
+        in arg_defs
+    )
+
+    lock_copy_idx = next(
+        (
+            idx
+            for idx, (op, args) in enumerate(instructions)
+            if op == "COPY"
+            and args
+            == [
+                "deploy/whitebox/kernels-wheel.lock.txt",
+                "/opt/whitebox/deploy/whitebox/kernels-wheel.lock.txt",
+            ]
+        ),
+        None,
+    )
+    assert lock_copy_idx is not None
+
+    sglang_copy_idx = next(
+        (
+            idx
+            for idx, (op, args) in enumerate(instructions)
+            if op == "COPY" and args == ["python/sglang", "/opt/whitebox/python/sglang"]
+        ),
+        None,
+    )
+    assert sglang_copy_idx is not None
+    assert lock_copy_idx < sglang_copy_idx
+
+    kernels_pip_idx = next(
+        (
+            idx
+            for idx, (op, args) in enumerate(instructions)
+            if op == "RUN"
+            and "pip install" in " ".join(args)
+            and "/opt/whitebox/deploy/whitebox/kernels-wheel.lock.txt" in " ".join(args)
+        ),
+        None,
+    )
+    assert kernels_pip_idx is not None
+    assert lock_copy_idx < kernels_pip_idx < sglang_copy_idx
 
     env_args = [arg for op, args in instructions if op == "ENV" for arg in args]
     assert "SEEDLEAP_KERNELS_DISABLE_JIT=1" in env_args
@@ -357,7 +412,8 @@ def test_model_dockerfile_enforces_prebuilt_kernels_without_compilation():
 
     expected_gate = (
         "python /opt/whitebox/deploy/whitebox/verify_model_kernels.py "
-        "--manifest /opt/whitebox/release.json"
+        "--manifest /opt/whitebox/release.json "
+        "--lockfile /opt/whitebox/deploy/whitebox/kernels-wheel.lock.txt"
     )
     run_commands = [" ".join(args) for op, args in instructions if op == "RUN"]
     assert any(expected_gate in cmd for cmd in run_commands)
@@ -369,8 +425,19 @@ def test_model_dockerfile_enforces_prebuilt_kernels_without_compilation():
         assert "nvcc" not in line.lower()
 
     pip_commands = [cmd for cmd in run_commands if "pip install" in cmd]
-    assert len(pip_commands) == 1
+    assert len(pip_commands) == 2
     assert "/opt/whitebox" not in pip_commands[0]
+    for required_token in (
+        "--no-cache-dir",
+        "--no-index",
+        "--no-deps",
+        "--force-reinstall",
+        "--only-binary=:all:",
+        "--require-hashes",
+        "--find-links $KERNELS_WHEEL_FIND_LINKS",
+        "-r /opt/whitebox/deploy/whitebox/kernels-wheel.lock.txt",
+    ):
+        assert required_token in pip_commands[1]
 
 
 REQUIRED_KERNEL_OPS = (
@@ -855,6 +922,27 @@ def test_verify_model_kernels_loads_real_compiled_wheel_in_isolated_venv(tmp_pat
     }
     clean_env["SEEDLEAP_KERNELS_DISABLE_JIT"] = "1"
 
+    stale_sha = "0" * 40
+    stale_build_info_py = build_info_py.replace(expected_sha, stale_sha)
+    old_wheelhouse = tmp_path / "old_wheelhouse"
+    old_wheelhouse.mkdir(parents=True, exist_ok=True)
+    stale_kernels_whl = _build_wheel_archive(
+        old_wheelhouse,
+        dist_name="seedleap-kernels",
+        version="0.2.0",
+        tag=wheel_tag,
+        purelib=False,
+        files={
+            "seedleap_kernels/__init__.py": b'__version__ = "0.2.0"\n',
+            "seedleap_kernels/_build_info.py": stale_build_info_py.encode("utf-8"),
+            "seedleap_kernels/ops/__init__.py": ("\n".join(ops_lines)).encode("utf-8"),
+            "seedleap_kernels/backends/__init__.py": b"",
+            "seedleap_kernels/backends/cuda/__init__.py": b"",
+            "seedleap_kernels/backends/cuda/fp8_gemm_sm90.py": sm90_py.encode("utf-8"),
+            f"seedleap_kernels/backends/cuda/{so_file.name}": so_file.read_bytes(),
+        },
+    )
+
     subprocess.run(
         [
             str(venv_python),
@@ -865,7 +953,7 @@ def test_verify_model_kernels_loads_real_compiled_wheel_in_isolated_venv(tmp_pat
             "--no-deps",
             "--only-binary=:all:",
             str(torch_whl),
-            str(kernels_whl),
+            str(stale_kernels_whl),
         ],
         env=clean_env,
         check=True,
@@ -873,6 +961,139 @@ def test_verify_model_kernels_loads_real_compiled_wheel_in_isolated_venv(tmp_pat
         text=True,
         timeout=60,
     )
+
+    bump_script = ROOT / "deploy/whitebox/bump_kernels_wheel.py"
+    lockfile_path = tmp_path / "kernels-wheel.lock.txt"
+    bump_proc = subprocess.run(
+        [
+            str(venv_python),
+            "-I",
+            str(bump_script),
+            "--wheel-file",
+            str(kernels_whl),
+            "--lockfile",
+            str(lockfile_path),
+        ],
+        env=clean_env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert bump_proc.returncode == 0, bump_proc.stdout + bump_proc.stderr
+
+    # Simulate OSS REST static object layout where trailing-slash directories
+    # return 404 NoSuchKey and only explicit index.html / wheel objects exist.
+    oss_root = tmp_path / "oss_static"
+    oss_wheels_dir = oss_root / "releases" / "seedleap-kernels" / "wheels"
+    oss_simple_dir = (
+        oss_root / "releases" / "seedleap-kernels" / "simple" / "seedleap-kernels"
+    )
+    oss_wheels_dir.mkdir(parents=True, exist_ok=True)
+    oss_simple_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(kernels_whl, oss_wheels_dir / kernels_whl.name)
+    kernels_whl_sha = hashlib.sha256(kernels_whl.read_bytes()).hexdigest()
+    (oss_simple_dir / "index.html").write_text(
+        "<!DOCTYPE html>\n<html><body>\n"
+        f'<a href="../../wheels/{kernels_whl.name}#sha256={kernels_whl_sha}">'
+        f"{kernels_whl.name}</a>\n"
+        "</body></html>\n",
+        encoding="utf-8",
+    )
+
+    class StrictOssObjectHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            rel = self.path.split("?", 1)[0].split("#", 1)[0]
+            if rel.endswith("/") or ".." in rel:
+                self.send_error(404, "NoSuchKey")
+                return
+            target = (oss_root / rel.lstrip("/")).resolve()
+            if not target.is_relative_to(oss_root.resolve()) or not target.is_file():
+                self.send_error(404, "NoSuchKey")
+                return
+            data = target.read_bytes()
+            ctype = (
+                "text/html; charset=utf-8"
+                if target.suffix == ".html"
+                else "application/octet-stream"
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, format, *args):  # noqa: A002
+            pass
+
+    oss_server = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), StrictOssObjectHandler
+    )
+    oss_thread = threading.Thread(target=oss_server.serve_forever, daemon=True)
+    oss_thread.start()
+    find_links_url = (
+        f"http://127.0.0.1:{oss_server.server_port}"
+        "/releases/seedleap-kernels/simple/seedleap-kernels/index.html"
+    )
+    try:
+        bad_hash_lock = tmp_path / "bad-hash.lock.txt"
+        bad_hash_lock.write_text(
+            "seedleap-kernels==0.2.0 \\\n    --hash=sha256:" + ("f" * 64) + "\n",
+            encoding="utf-8",
+        )
+        bad_hash_proc = subprocess.run(
+            [
+                str(venv_python),
+                "-m",
+                "pip",
+                "install",
+                "--no-cache-dir",
+                "--no-index",
+                "--no-deps",
+                "--force-reinstall",
+                "--only-binary=:all:",
+                "--require-hashes",
+                "--trusted-host",
+                "127.0.0.1",
+                "--find-links",
+                find_links_url,
+                "-r",
+                str(bad_hash_lock),
+            ],
+            env=clean_env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert bad_hash_proc.returncode != 0
+
+        subprocess.run(
+            [
+                str(venv_python),
+                "-m",
+                "pip",
+                "install",
+                "--no-cache-dir",
+                "--no-index",
+                "--no-deps",
+                "--force-reinstall",
+                "--only-binary=:all:",
+                "--require-hashes",
+                "--trusted-host",
+                "127.0.0.1",
+                "--find-links",
+                find_links_url,
+                "-r",
+                str(lockfile_path),
+            ],
+            env=clean_env,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    finally:
+        oss_server.shutdown()
+        oss_server.server_close()
 
     run_cwd = tmp_path / "empty_cwd"
     run_cwd.mkdir(parents=True, exist_ok=True)
@@ -894,7 +1115,15 @@ def test_verify_model_kernels_loads_real_compiled_wheel_in_isolated_venv(tmp_pat
 
     verify_script = ROOT / "deploy/whitebox/verify_model_kernels.py"
     completed = subprocess.run(
-        [str(venv_python), "-I", str(verify_script), "--manifest", str(manifest_path)],
+        [
+            str(venv_python),
+            "-I",
+            str(verify_script),
+            "--manifest",
+            str(manifest_path),
+            "--lockfile",
+            str(lockfile_path),
+        ],
         cwd=str(run_cwd),
         env=clean_env,
         capture_output=True,
@@ -919,6 +1148,28 @@ def test_verify_model_kernels_loads_real_compiled_wheel_in_isolated_venv(tmp_pat
         "kernels_git_sha": expected_sha,
     }
 
+    wrong_lockfile = tmp_path / "wrong-kernels-wheel.lock.txt"
+    wrong_lockfile.write_text(
+        "seedleap-kernels==0.1.9 \\\n    --hash=sha256:" + ("a" * 64) + "\n",
+        encoding="utf-8",
+    )
+    mismatch_proc = subprocess.run(
+        [
+            str(venv_python),
+            "-I",
+            str(verify_script),
+            "--lockfile",
+            str(wrong_lockfile),
+        ],
+        cwd=str(run_cwd),
+        env=clean_env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert mismatch_proc.returncode != 0
+    assert "does not match locked version" in mismatch_proc.stderr
+
     missing_manifest = tmp_path / "does_not_exist_release.json"
     missing_proc = subprocess.run(
         [
@@ -938,6 +1189,510 @@ def test_verify_model_kernels_loads_real_compiled_wheel_in_isolated_venv(tmp_pat
     assert "Release manifest file does not exist" in missing_proc.stderr
 
 
+def test_verify_model_kernels_lockfile_version_check(monkeypatch, tmp_path):
+    vmk = _import_verify_model_kernels()
+    _install_mock_model_kernel_env(monkeypatch, tmp_path, version="0.1.0.dev3")
+
+    # Backward compatibility when --lockfile is omitted.
+    assert vmk.main([]) == 0
+
+    lockfile = tmp_path / "kernels-wheel.lock.txt"
+    lockfile.write_text(
+        "# Managed by deploy/whitebox/bump_kernels_wheel.py (prebuilt binary CUDA wheel only).\n"
+        "seedleap-kernels==0.1.0.dev3 \\\n"
+        "    --hash=sha256:" + ("b" * 64) + "\n",
+        encoding="utf-8",
+    )
+    assert vmk.main(["--lockfile", str(lockfile)]) == 0
+
+    mismatched_lock = tmp_path / "mismatch.lock.txt"
+    mismatched_lock.write_text(
+        "seedleap-kernels==0.1.0.dev0 \\\n    --hash=sha256:" + ("b" * 64) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="does not match locked version"):
+        vmk.main(["--lockfile", str(mismatched_lock)])
+
+    missing_lock = tmp_path / "missing.lock.txt"
+    with pytest.raises(RuntimeError, match="lockfile does not exist"):
+        vmk.main(["--lockfile", str(missing_lock)])
+
+    unhashed_lock = tmp_path / "unhashed.lock.txt"
+    unhashed_lock.write_text("seedleap-kernels==0.1.0.dev3\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="Invalid kernels wheel lockfile"):
+        vmk.main(["--lockfile", str(unhashed_lock)])
+
+
+def _import_bump_kernels_wheel():
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import bump_kernels_wheel
+
+    return bump_kernels_wheel
+
+
+def _make_sample_kernels_wheel(
+    wheel_dir: Path,
+    *,
+    version: str = "0.1.0.dev3",
+    tag: str = "cp312-cp312-linux_x86_64",
+    purelib: bool = False,
+    include_so: bool = True,
+    git_sha: str = "c9bb3c89a08cd37f0649035e0e14f89ad4137eba",
+    aot_cuda: bool = True,
+) -> Path:
+    build_info_py = (
+        "BUILD_INFO = {\n"
+        f"    'aot_cuda': {aot_cuda!r},\n"
+        "    'compiled_extensions': [\n"
+        "        'seedleap_kernels.backends.cuda._fp8_gemm_sm90_ext'\n"
+        "    ],\n"
+        "    'cuda_archs': ['90a'],\n"
+        "    'cuda_version': '13.0',\n"
+        f"    'git_sha': {git_sha!r},\n"
+        "    'torch_version': '2.13.0+cu130',\n"
+        "}\n"
+    ).encode("utf-8")
+    files: dict[str, bytes] = {
+        "seedleap_kernels/__init__.py": f'__version__ = "{version}"\n'.encode("utf-8"),
+        "seedleap_kernels/_build_info.py": build_info_py,
+    }
+    if include_so:
+        files[
+            "seedleap_kernels/backends/cuda/_fp8_gemm_sm90_ext.cpython-312-x86_64-linux-gnu.so"
+        ] = b"\x7fELF-mock-sm90-cutlass-binary"
+    wheel_dir.mkdir(parents=True, exist_ok=True)
+    return _build_wheel_archive(
+        wheel_dir,
+        dist_name="seedleap-kernels",
+        version=version,
+        tag=tag,
+        purelib=purelib,
+        files=files,
+    )
+
+
+@contextlib.contextmanager
+def _serve_directory_over_mock_https(monkeypatch, bkw, root_dir: Path, host: str):
+    class QuietDirectoryHandler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=str(root_dir), **kwargs)
+
+        def log_message(self, format, *args):  # noqa: A002
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), QuietDirectoryHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def loopback_open(url: str, *, allowed_hosts: set[str], timeout: float):
+        bkw.validate_https_url(url)
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(url)
+        assert parsed.hostname is not None
+        if parsed.hostname.lower() not in allowed_hosts:
+            raise ValueError(f"Host {parsed.hostname!r} is not in {allowed_hosts}")
+        if parsed.hostname.lower() != host.lower():
+            raise urllib.error.URLError(f"Unroutable host {parsed.hostname}")
+        local_url = f"http://127.0.0.1:{server.server_port}{parsed.path}"
+        return urllib.request.urlopen(local_url, timeout=timeout)
+
+    monkeypatch.setattr(bkw, "_open_https_stream", loopback_open)
+    try:
+        yield f"https://{host}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_bump_kernels_wheel_remote_upgrade_and_idempotency(
+    monkeypatch, tmp_path, capsys
+):
+    bkw = _import_bump_kernels_wheel()
+    cdn_root = tmp_path / "cdn" / "releases" / "seedleap-kernels"
+    wheels_dir = cdn_root / "wheels"
+    wheels_dir.mkdir(parents=True, exist_ok=True)
+
+    git_sha = "11223344556677889900aabbccddeeff00112233"
+    whl_path = _make_sample_kernels_wheel(
+        wheels_dir, version="0.1.0.dev3", git_sha=git_sha
+    )
+    whl_sha256 = hashlib.sha256(whl_path.read_bytes()).hexdigest()
+
+    latest_payload = {
+        "version": "0.1.0.dev3",
+        "filename": whl_path.name,
+        "url": f"https://zing-cdn.loopit.com.cn/releases/seedleap-kernels/wheels/{whl_path.name}",
+        "sha256": whl_sha256,
+        "git_sha": git_sha,
+    }
+    (cdn_root / "latest.json").write_text(
+        json.dumps(latest_payload, indent=2), encoding="utf-8"
+    )
+
+    lockfile = tmp_path / "kernels-wheel.lock.txt"
+    initial_sha = "bbd9a326f2ec928457e770ddf189b29f5f8c233e98bce042d74b65c5401db97b"
+    lockfile.write_text(
+        "# Managed by deploy/whitebox/bump_kernels_wheel.py (prebuilt binary CUDA wheel only).\n"
+        f"seedleap-kernels==0.1.0.dev0 \\\n    --hash=sha256:{initial_sha}\n",
+        encoding="utf-8",
+    )
+
+    with _serve_directory_over_mock_https(
+        monkeypatch, bkw, tmp_path / "cdn", "zing-cdn.loopit.com.cn"
+    ) as base_url:
+        latest_url = f"{base_url}/releases/seedleap-kernels/latest.json"
+        rc = bkw.main(["--latest-url", latest_url, "--lockfile", str(lockfile)])
+        assert rc == 0
+        summary = json.loads(capsys.readouterr().out.strip())
+        assert summary == {
+            "changed": True,
+            "git_sha": git_sha,
+            "new_version": "0.1.0.dev3",
+            "old_version": "0.1.0.dev0",
+            "sha256": whl_sha256,
+        }
+        expected_lock = (
+            "# Managed by deploy/whitebox/bump_kernels_wheel.py (prebuilt binary CUDA wheel only).\n"
+            f"seedleap-kernels==0.1.0.dev3 \\\n    --hash=sha256:{whl_sha256}\n"
+        )
+        assert lockfile.read_text(encoding="utf-8") == expected_lock
+
+        # Idempotent re-run must report changed=False and leave lockfile untouched.
+        rc2 = bkw.main(["--latest-url", latest_url, "--lockfile", str(lockfile)])
+        assert rc2 == 0
+        summary2 = json.loads(capsys.readouterr().out.strip())
+        assert summary2 == {
+            "changed": False,
+            "git_sha": git_sha,
+            "new_version": "0.1.0.dev3",
+            "old_version": "0.1.0.dev3",
+            "sha256": whl_sha256,
+        }
+        assert lockfile.read_text(encoding="utf-8") == expected_lock
+
+
+def test_bump_kernels_wheel_local_file_mode(tmp_path, capsys):
+    bkw = _import_bump_kernels_wheel()
+    git_sha = "deadbeefcafebabe1234567890abcdef12345678"
+    whl_path = _make_sample_kernels_wheel(
+        tmp_path, version="0.1.0.dev5", git_sha=git_sha
+    )
+    whl_sha256 = hashlib.sha256(whl_path.read_bytes()).hexdigest()
+    lockfile = tmp_path / "new-lock.txt"
+
+    rc = bkw.main(["--wheel-file", str(whl_path), "--lockfile", str(lockfile)])
+    assert rc == 0
+    summary = json.loads(capsys.readouterr().out.strip())
+    assert summary == {
+        "changed": True,
+        "git_sha": git_sha,
+        "new_version": "0.1.0.dev5",
+        "old_version": None,
+        "sha256": whl_sha256,
+    }
+    assert (
+        f"seedleap-kernels==0.1.0.dev5 \\\n    --hash=sha256:{whl_sha256}\n"
+        in lockfile.read_text(encoding="utf-8")
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "http://zing-cdn.loopit.com.cn/releases/seedleap-kernels/latest.json",
+        "https://user:secret@zing-cdn.loopit.com.cn/releases/seedleap-kernels/latest.json",
+        "https://zing-cdn.loopit.com.cn/releases/seedleap-kernels/latest.json?token=abc",
+        "https://zing-cdn.loopit.com.cn/releases/seedleap-kernels/latest.json#frag",
+        "https://zing-cdn.loopit.com.cn/releases/seedleap-kernels/\nlatest.json",
+        "https://localhost/releases/seedleap-kernels/latest.json",
+        "https://127.0.0.1/releases/seedleap-kernels/latest.json",
+        "https://169.254.169.254/latest/meta-data/",
+        "https://[::1]/releases/seedleap-kernels/latest.json",
+        "https://zing-cdn.loopit.com.cn:8443/releases/seedleap-kernels/latest.json",
+    ],
+)
+def test_bump_kernels_wheel_rejects_unsafe_latest_urls(tmp_path, bad_url):
+    bkw = _import_bump_kernels_wheel()
+    lockfile = tmp_path / "kernels-wheel.lock.txt"
+    original = "seedleap-kernels==0.1.0.dev0 \\\n    --hash=sha256:" + ("a" * 64) + "\n"
+    lockfile.write_text(original, encoding="utf-8")
+    with pytest.raises((SystemExit, ValueError)):
+        bkw.main(["--latest-url", bad_url, "--lockfile", str(lockfile)])
+    assert lockfile.read_text(encoding="utf-8") == original
+
+
+def test_bump_kernels_wheel_forbids_no_verify_download_and_invalid_allow_hosts(
+    tmp_path,
+):
+    bkw = _import_bump_kernels_wheel()
+    lockfile = tmp_path / "kernels-wheel.lock.txt"
+    with pytest.raises(SystemExit) as exc:
+        bkw.main(["--no-verify-download", "--lockfile", str(lockfile)])
+    assert exc.value.code == 2
+
+    for bad_host in ("localhost", "127.0.0.1", "169.254.169.254", "[::1]", "intranet"):
+        with pytest.raises((SystemExit, ValueError)):
+            bkw.main(
+                [
+                    "--allow-download-host",
+                    bad_host,
+                    "--lockfile",
+                    str(lockfile),
+                ]
+            )
+
+
+def test_bump_kernels_wheel_archive_and_filename_hardening(monkeypatch, tmp_path):
+    bkw = _import_bump_kernels_wheel()
+
+    # 1. Reject extra '-' components (> 6) or compound 'any' platform tags
+    for bad_name in (
+        "seedleap_kernels-0.1.0.dev3-1-cp312-cp312-linux_x86_64-extra.whl",
+        "seedleap_kernels-0.1.0.dev3-cp312-cp312-linux_x86_64.any.whl",
+        "seedleap_kernels-0.1.0.dev3-cp312-cp312-any.linux_x86_64.whl",
+    ):
+        with pytest.raises(ValueError):
+            bkw.validate_wheel_filename(bad_name, expected_version="0.1.0.dev3")
+
+    base_whl = _make_sample_kernels_wheel(tmp_path / "good", version="0.1.0.dev3")
+
+    # 2. Reject oversized local --wheel-file
+    monkeypatch.setattr(bkw, "MAX_WHEEL_BYTES", 64)
+    with pytest.raises(ValueError, match="maximum size"):
+        bkw.inspect_binary_wheel_file(base_whl)
+    monkeypatch.undo()
+
+    # 3. Reject archive path traversal, absolute path, backslash, or symlink entry
+    for bad_arcname, is_symlink in (
+        ("../escape.py", False),
+        ("/etc/passwd", False),
+        ("seedleap_kernels\\bad.py", False),
+        ("seedleap_kernels/link.so", True),
+    ):
+        forged_whl = (
+            tmp_path
+            / "forged"
+            / "seedleap_kernels-0.1.0.dev3-cp312-cp312-linux_x86_64.whl"
+        )
+        forged_whl.parent.mkdir(parents=True, exist_ok=True)
+        with (
+            zipfile.ZipFile(base_whl, "r") as src,
+            zipfile.ZipFile(forged_whl, "w") as dst,
+        ):
+            for info in src.infolist():
+                dst.writestr(info, src.read(info.filename))
+            bad_info = zipfile.ZipInfo(bad_arcname)
+            if is_symlink:
+                bad_info.external_attr = 0o120777 << 16
+            dst.writestr(bad_info, b"payload")
+        with pytest.raises(ValueError):
+            bkw.inspect_binary_wheel_file(forged_whl)
+
+    # 4. Reject mismatched dist-info directory name
+    wrong_dist_whl = (
+        tmp_path
+        / "wrong_dist"
+        / "seedleap_kernels-0.1.0.dev3-cp312-cp312-linux_x86_64.whl"
+    )
+    wrong_dist_whl.parent.mkdir(parents=True, exist_ok=True)
+    with (
+        zipfile.ZipFile(base_whl, "r") as src,
+        zipfile.ZipFile(wrong_dist_whl, "w") as dst,
+    ):
+        for info in src.infolist():
+            renamed = info.filename.replace(
+                "seedleap_kernels-0.1.0.dev3.dist-info/",
+                "other_pkg-0.1.0.dev3.dist-info/",
+            )
+            dst.writestr(renamed, src.read(info.filename))
+    with pytest.raises(ValueError, match="dist-info"):
+        bkw.inspect_binary_wheel_file(wrong_dist_whl)
+
+    # 5. Reject cumulative uncompressed size exceeding MAX_UNCOMPRESSED_WHEEL_BYTES
+    monkeypatch.setattr(bkw, "MAX_UNCOMPRESSED_WHEEL_BYTES", 32)
+    with pytest.raises(ValueError, match="uncompressed"):
+        bkw.inspect_binary_wheel_file(base_whl)
+
+
+def test_bump_kernels_wheel_rejects_unsafe_redirects():
+    bkw = _import_bump_kernels_wheel()
+    handler = bkw._SafeHTTPSRedirectHandler({"zing-cdn.loopit.com.cn"})
+    req = urllib.request.Request(
+        "https://zing-cdn.loopit.com.cn/releases/seedleap-kernels/latest.json"
+    )
+    with pytest.raises(ValueError, match="HTTPS"):
+        handler.redirect_request(
+            req,
+            None,
+            302,
+            "Found",
+            {},
+            "http://zing-cdn.loopit.com.cn/releases/seedleap-kernels/latest.json",
+        )
+    with pytest.raises(ValueError, match="host"):
+        handler.redirect_request(
+            req,
+            None,
+            302,
+            "Found",
+            {},
+            "https://evil.example/releases/seedleap-kernels/latest.json",
+        )
+
+
+def test_bump_kernels_wheel_rejects_forged_or_corrupted_wheels(monkeypatch, tmp_path):
+    bkw = _import_bump_kernels_wheel()
+    cdn_root = tmp_path / "cdn" / "releases" / "seedleap-kernels"
+    wheels_dir = cdn_root / "wheels"
+    wheels_dir.mkdir(parents=True, exist_ok=True)
+
+    lockfile = tmp_path / "kernels-wheel.lock.txt"
+    original = (
+        "# Managed by deploy/whitebox/bump_kernels_wheel.py (prebuilt binary CUDA wheel only).\n"
+        "seedleap-kernels==0.1.0.dev0 \\\n"
+        "    --hash=sha256:bbd9a326f2ec928457e770ddf189b29f5f8c233e98bce042d74b65c5401db97b\n"
+    )
+    lockfile.write_text(original, encoding="utf-8")
+
+    valid_whl = _make_sample_kernels_wheel(wheels_dir, version="0.1.0.dev4")
+    valid_sha = hashlib.sha256(valid_whl.read_bytes()).hexdigest()
+
+    pure_whl = _make_sample_kernels_wheel(
+        wheels_dir, version="0.1.0.dev4", tag="py3-none-any", purelib=True
+    )
+    pure_sha = hashlib.sha256(pure_whl.read_bytes()).hexdigest()
+
+    fake_pure_platform_whl = _make_sample_kernels_wheel(
+        tmp_path / "fake_pure",
+        version="0.1.0.dev4",
+        tag="cp312-cp312-linux_x86_64",
+        purelib=True,
+    )
+    shutil.copy2(fake_pure_platform_whl, wheels_dir / "fake_pure.whl")
+
+    missing_so_dir = tmp_path / "no_so"
+    missing_so_dir.mkdir()
+    missing_so_whl = _make_sample_kernels_wheel(
+        missing_so_dir, version="0.1.0.dev6", include_so=False
+    )
+    shutil.copy2(missing_so_whl, wheels_dir / missing_so_whl.name)
+    missing_so_sha = hashlib.sha256(missing_so_whl.read_bytes()).hexdigest()
+
+    with _serve_directory_over_mock_https(
+        monkeypatch, bkw, tmp_path / "cdn", "zing-cdn.loopit.com.cn"
+    ) as base_url:
+        latest_file = cdn_root / "latest.json"
+        latest_url = f"{base_url}/releases/seedleap-kernels/latest.json"
+
+        # 1. Reject py3-none-any.whl (both local --wheel-file and remote latest.json)
+        with pytest.raises(ValueError, match="binary"):
+            bkw.main(["--wheel-file", str(pure_whl), "--lockfile", str(lockfile)])
+        latest_file.write_text(
+            json.dumps(
+                {
+                    "version": "0.1.0.dev4",
+                    "filename": pure_whl.name,
+                    "url": f"{base_url}/releases/seedleap-kernels/wheels/{pure_whl.name}",
+                    "sha256": pure_sha,
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="binary"):
+            bkw.main(["--latest-url", latest_url, "--lockfile", str(lockfile)])
+
+        # 2. Reject Root-Is-Purelib: true disguised under platform tag
+        with pytest.raises(ValueError, match="Root-Is-Purelib: false"):
+            bkw.main(
+                [
+                    "--wheel-file",
+                    str(fake_pure_platform_whl),
+                    "--lockfile",
+                    str(lockfile),
+                ]
+            )
+
+        # 3. Reject SHA256 mismatch on remote download
+        latest_file.write_text(
+            json.dumps(
+                {
+                    "version": "0.1.0.dev4",
+                    "filename": valid_whl.name,
+                    "url": f"{base_url}/releases/seedleap-kernels/wheels/{valid_whl.name}",
+                    "sha256": "0" * 64,
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="SHA256 mismatch"):
+            bkw.main(["--latest-url", latest_url, "--lockfile", str(lockfile)])
+
+        # 4. Reject forged wheel missing _fp8_gemm_sm90_ext*.so
+        latest_file.write_text(
+            json.dumps(
+                {
+                    "version": "0.1.0.dev6",
+                    "filename": missing_so_whl.name,
+                    "url": f"{base_url}/releases/seedleap-kernels/wheels/{missing_so_whl.name}",
+                    "sha256": missing_so_sha,
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="_fp8_gemm_sm90_ext"):
+            bkw.main(["--latest-url", latest_url, "--lockfile", str(lockfile)])
+
+        # 5. Reject cross-domain wheel URL or http:// wheel URL in latest.json
+        latest_file.write_text(
+            json.dumps(
+                {
+                    "version": "0.1.0.dev4",
+                    "filename": valid_whl.name,
+                    "url": f"https://other-cdn.example/wheels/{valid_whl.name}",
+                    "sha256": valid_sha,
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="host"):
+            bkw.main(["--latest-url", latest_url, "--lockfile", str(lockfile)])
+
+        latest_file.write_text(
+            json.dumps(
+                {
+                    "version": "0.1.0.dev4",
+                    "filename": valid_whl.name,
+                    "url": f"http://zing-cdn.loopit.com.cn/releases/seedleap-kernels/wheels/{valid_whl.name}",
+                    "sha256": valid_sha,
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="HTTPS"):
+            bkw.main(["--latest-url", latest_url, "--lockfile", str(lockfile)])
+
+        # 6. Reject +local or newline/injected version strings
+        for bad_ver in ("0.1.0+cu130", "0.1.0\n--extra-index-url=https://evil.example"):
+            latest_file.write_text(
+                json.dumps(
+                    {
+                        "version": bad_ver,
+                        "filename": f"seedleap_kernels-{bad_ver}-cp312-cp312-linux_x86_64.whl",
+                        "url": f"{base_url}/releases/seedleap-kernels/wheels/{valid_whl.name}",
+                        "sha256": valid_sha,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with pytest.raises(ValueError, match="version"):
+                bkw.main(["--latest-url", latest_url, "--lockfile", str(lockfile)])
+
+    assert lockfile.read_text(encoding="utf-8") == original
+
+
 def test_candidate_model_payload():
     candidate = os.environ.get("WHITEBOX_MODEL_IMAGE")
     if not candidate:
@@ -947,7 +1702,12 @@ def test_candidate_model_payload():
     script = """
 import json, pathlib, subprocess, sys
 subprocess.run(
-    [sys.executable, '/opt/whitebox/deploy/whitebox/verify_model_kernels.py'],
+    [
+        sys.executable,
+        '/opt/whitebox/deploy/whitebox/verify_model_kernels.py',
+        '--lockfile',
+        '/opt/whitebox/deploy/whitebox/kernels-wheel.lock.txt',
+    ],
     check=True,
 )
 manifest = json.loads(pathlib.Path('/opt/whitebox/release.json').read_text())

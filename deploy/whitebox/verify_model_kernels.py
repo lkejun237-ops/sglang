@@ -41,6 +41,52 @@ def _parse_torch_major_minor(version: str, label: str) -> str:
     return f"{match.group(1)}.{match.group(2)}"
 
 
+def _parse_locked_kernels_version(lockfile_path: Path) -> str:
+    if not lockfile_path.is_file():
+        raise RuntimeError(f"Kernels wheel lockfile does not exist: {lockfile_path}")
+
+    logical_lines: list[str] = []
+    current = ""
+    for raw_line in lockfile_path.read_text(encoding="utf-8").splitlines():
+        stripped = raw_line.strip()
+        if not current and (not stripped or stripped.startswith("#")):
+            continue
+        if stripped.startswith("#"):
+            continue
+        if raw_line.endswith("\\"):
+            current += raw_line[:-1] + " "
+        else:
+            current += raw_line
+            if current.strip():
+                logical_lines.append(current.strip())
+            current = ""
+    if current.strip():
+        logical_lines.append(current.strip())
+
+    if len(logical_lines) != 1:
+        raise RuntimeError(
+            f"Invalid kernels wheel lockfile at {lockfile_path}: expected exactly "
+            f"1 pinned requirement entry, got {len(logical_lines)}."
+        )
+
+    tokens = logical_lines[0].split()
+    req_match = re.fullmatch(r"seedleap-kernels==([0-9A-Za-z._-]+)\Z", tokens[0])
+    hash_tokens = tokens[1:]
+    if (
+        req_match is None
+        or not hash_tokens
+        or not all(
+            re.fullmatch(r"--hash=sha256:[0-9a-f]{64}\Z", token)
+            for token in hash_tokens
+        )
+    ):
+        raise RuntimeError(
+            f"Invalid kernels wheel lockfile at {lockfile_path}: expected "
+            "'seedleap-kernels==<version> --hash=sha256:<64hex>'."
+        )
+    return req_match.group(1)
+
+
 def _is_env_package_path(pkg_file: Path) -> bool:
     whitebox_root = Path("/opt/whitebox")
     resolved_pkg = pkg_file.resolve()
@@ -118,8 +164,15 @@ def verify_model_kernels(
     manifest_path: Path | None = None,
     *,
     load_ext: bool = True,
+    lockfile_path: Path | None = None,
 ) -> dict[str, object]:
     """Verify MODEL_BASE_IMAGE ships an AOT binary seedleap-kernels wheel."""
+    expected_version = (
+        _parse_locked_kernels_version(Path(lockfile_path))
+        if lockfile_path is not None
+        else None
+    )
+
     jit_flag = os.environ.get("SEEDLEAP_KERNELS_DISABLE_JIT", "").strip().lower()
     if jit_flag not in {"1", "true", "yes"}:
         raise RuntimeError(
@@ -134,6 +187,12 @@ def verify_model_kernels(
             "Package 'seedleap-kernels' is not installed in MODEL_BASE_IMAGE. "
             "Rebuild MODEL_BASE_IMAGE with the prebuilt binary seedleap-kernels wheel."
         ) from exc
+
+    if expected_version is not None and str(dist.version) != expected_version:
+        raise RuntimeError(
+            f"Installed 'seedleap-kernels' version {str(dist.version)!r} does not "
+            f"match locked version {expected_version!r} in {lockfile_path}."
+        )
 
     wheel_text = dist.read_text("WHEEL") or ""
     has_non_purelib = any(
@@ -293,13 +352,23 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional release.json manifest path to enrich with kernels metadata.",
     )
     parser.add_argument(
+        "--lockfile",
+        type=Path,
+        default=None,
+        help="Optional kernels-wheel.lock.txt path to assert exact installed version.",
+    )
+    parser.add_argument(
         "--load-ext",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Dlopen and verify exported symbols on the prebuilt SM90 extension.",
     )
     args = parser.parse_args(argv)
-    summary = verify_model_kernels(args.manifest, load_ext=args.load_ext)
+    summary = verify_model_kernels(
+        args.manifest,
+        load_ext=args.load_ext,
+        lockfile_path=args.lockfile,
+    )
     print(json.dumps(summary, sort_keys=True))
     return 0
 
