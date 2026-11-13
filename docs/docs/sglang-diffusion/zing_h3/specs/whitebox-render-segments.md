@@ -1044,6 +1044,18 @@ processing, render revisions or model leases.
 
 See [the control-connection Prefill contract](whitebox-control-prefill.md) for parent worker ownership, optional `render.prepare`, real F0, multiple conditions and native cache receipts. The former `prepared_input` / browser RGB roundtrip is superseded.
 
+### Game-side Harness diagnostics
+
+An authenticated Player debug subscription can inspect the retained public world
+events from a supported single-player CLI source, including with inference off.
+The Room reads the source through its private control connection. The source
+reports each SDK request identity and compiles its immutable committed state into
+prompt and reference metadata without binding or resuming a model consumer. The Player
+can request reference bytes through the existing digest-checked debug endpoint.
+These observations are scoped to the debug attachment and are excluded from
+replay and recording. Deploy the matching Stream Host and Player changes to
+enable the feature. Older sources continue to serve their existing model diagnostics.
+
 ### Player instruction business outcomes
 
 `model.context.instruction.receipt` is reliable control traffic, independent of

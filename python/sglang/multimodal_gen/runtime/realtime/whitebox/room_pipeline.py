@@ -127,6 +127,16 @@ class LocalRoomEngine:
 
             raise RenderError("SOURCE_EPOCH_MISMATCH")
 
+    async def refresh_source_debug(self):
+        engine = getattr(self, "_context_engine", None)
+        reader = getattr(engine, "refresh_source_debug", None)
+        if reader is None:
+            return None
+        self.check_model_context()
+        value = await reader()
+        self.check_model_context()
+        return value
+
     async def read_model_context_resource(self, handle):
         engine = self.runtime.player(self.stream_id)["engine"]
         if engine is not getattr(self, "_context_engine", None):

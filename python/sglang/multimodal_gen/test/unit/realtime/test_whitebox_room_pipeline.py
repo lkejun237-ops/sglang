@@ -1615,3 +1615,31 @@ def test_late_archive_source_output_after_fail_open_does_not_restore_retired_pai
         assert pairs[13] == ("original-source", 100, {"payload": b"source-au"})
 
     asyncio.run(run())
+
+
+def test_source_debug_history_is_read_without_model_admission_and_fenced():
+    async def scenario():
+        calls = []
+        record = {"engine": None}
+        history = [{"conditionId": "source:first"}, {"conditionId": "source:second"}]
+
+        async def refresh():
+            calls.append("read")
+            return history
+
+        engine = SimpleNamespace(refresh_source_debug=refresh)
+        record["engine"] = engine
+        owner = object.__new__(room_pipeline.LocalRoomEngine)
+        owner.closed = False
+        owner.stream_id = "player"
+        owner.runtime = SimpleNamespace(player=lambda _: record)
+        owner._context_engine = engine
+        assert await owner.refresh_source_debug() == history
+        assert calls == ["read"]
+        record["engine"] = object()
+        with pytest.raises(Exception) as caught:
+            await owner.refresh_source_debug()
+        assert caught.value.code == "SOURCE_EPOCH_MISMATCH"
+        assert calls == ["read"]
+
+    asyncio.run(scenario())

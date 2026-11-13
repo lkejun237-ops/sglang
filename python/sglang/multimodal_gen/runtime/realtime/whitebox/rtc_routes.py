@@ -667,8 +667,7 @@ def install_rtc_routes(host, app, token, *, peer_factory=NativeRTC):
                 def observe(condition, receipt):
                     if sub is not pipeline.subscription or sub.closed:
                         return
-                    latest.clear()
-                    latest.update(condition)
+                    latest["model"] = condition
                     if queue.full():
                         queue.get_nowait()
                     queue.put_nowait(
@@ -692,10 +691,77 @@ def install_rtc_routes(host, app, token, *, peer_factory=NativeRTC):
                                     "promptVersion",
                                     "reason",
                                 )
-                                if key in receipt
+                                if receipt.get(key) is not None
                             },
                         )
                     )
+
+                async def poll_source():
+                    previous = None
+                    while sub is pipeline.subscription and not sub.closed:
+                        reader = getattr(
+                            pipeline.session.engine, "refresh_source_debug", None
+                        )
+                        if reader is not None:
+                            try:
+                                conditions = await asyncio.wait_for(reader(), 1) or []
+                                if conditions != previous:
+                                    for key in list(latest):
+                                        if key.startswith("source:"):
+                                            del latest[key]
+                                    rows = []
+                                    for condition in conditions:
+                                        latest[condition["conditionId"]] = condition
+                                        rows.append(
+                                            dict(
+                                                condition_id=condition["conditionId"],
+                                                payload_sha256=condition["payloadHash"],
+                                                prompt=condition["prompt"],
+                                                event_id=condition["eventId"],
+                                                occurrence_id=condition.get(
+                                                    "occurrenceId"
+                                                ),
+                                                simulation_tick=condition[
+                                                    "simulationTick"
+                                                ],
+                                                references=[
+                                                    {
+                                                        key: ref[key]
+                                                        for key in (
+                                                            "picture",
+                                                            "format",
+                                                            "sha256",
+                                                        )
+                                                    }
+                                                    for ref in condition["references"]
+                                                ],
+                                                receipt=condition["receipt"],
+                                            )
+                                        )
+                                    if queue.full():
+                                        queue.get_nowait()
+                                    queue.put_nowait(
+                                        dict(
+                                            type="model.context.debug.source.history",
+                                            rows=rows,
+                                        )
+                                    )
+                                    previous = conditions
+                            except Exception:
+                                if previous:
+                                    for key in list(latest):
+                                        if key.startswith("source:"):
+                                            del latest[key]
+                                    if queue.full():
+                                        queue.get_nowait()
+                                    queue.put_nowait(
+                                        dict(
+                                            type="model.context.debug.source.history",
+                                            rows=[],
+                                        )
+                                    )
+                                    previous = None
+                        await asyncio.sleep(0.5)
 
                 session = pipeline.session
                 session.condition_debug = observe
@@ -703,10 +769,16 @@ def install_rtc_routes(host, app, token, *, peer_factory=NativeRTC):
                     session.source_conditions.debug = observe
                 session.emit_applied_prompt_debug()
                 sender = asyncio.create_task(send_debug(queue))
-                return observe, latest, queue, sender
+                return (
+                    observe,
+                    latest,
+                    queue,
+                    sender,
+                    asyncio.create_task(poll_source()),
+                )
 
             async def stop_debug(subscription):
-                observe, _, _, sender = subscription
+                observe, _, _, sender, poller = subscription
                 session = pipeline.session
                 if session.condition_debug is observe:
                     session.condition_debug = None
@@ -716,13 +788,22 @@ def install_rtc_routes(host, app, token, *, peer_factory=NativeRTC):
                 ):
                     session.source_conditions.debug = None
                 sender.cancel()
-                await asyncio.gather(sender, return_exceptions=True)
+                poller.cancel()
+                await asyncio.gather(sender, poller, return_exceptions=True)
 
             async def send_debug_reference(message):
-                _, latest, queue, _ = debug
+                _, conditions, queue, _, _ = debug
                 condition_id, digest = (
                     message.get("condition_id"),
                     message.get("sha256"),
+                )
+                latest = next(
+                    (
+                        row
+                        for row in conditions.values()
+                        if row and row["conditionId"] == condition_id
+                    ),
+                    {},
                 )
                 ref = next(
                     (
@@ -752,7 +833,7 @@ def install_rtc_routes(host, app, token, *, peer_factory=NativeRTC):
                         if (
                             sub is pipeline.subscription
                             and not sub.closed
-                            and latest.get("conditionId") == condition_id
+                            and any(row is latest for row in conditions.values())
                             and isinstance(data, bytes)
                             and len(data) <= 8 * 1024**2
                             and hashlib.sha256(data).hexdigest() == digest

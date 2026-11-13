@@ -750,6 +750,8 @@ class CLIView:
         self.control = self.media = self.control_task = self.renderer = None
         self.transport_generation = 0
         self.transport_lock = asyncio.Lock()
+        self.source_debug_supported = False
+        self.source_debug_condition = []
         self.model_context = None
         if self.descriptor.get("modelContext") is not None:
             if self.descriptor.get("media", {}).get("kind") != "pixels":
@@ -1006,6 +1008,8 @@ class CLIView:
                 query.update(ui="1", clock="1")
             return urlunsplit(value._replace(query=urlencode(query)))
 
+        self.source_debug_supported = False
+        self.source_debug_condition = []
         self.control = await connect(
             url("ui"),
             subprotocols=protocols,
@@ -1137,10 +1141,30 @@ class CLIView:
                     pending.cancel()
             await asyncio.gather(task, finishing, return_exceptions=True)
 
+    async def refresh_source_debug(self):
+        if not self.source_debug_supported or self.closed or self.stopped:
+            return None
+        control = self.control
+        if control is None:
+            return None
+        await control.send(
+            json.dumps(
+                dict(
+                    type="model.context.source-debug.get",
+                    epoch=self.descriptor["epoch"],
+                )
+            )
+        )
+        return self.source_debug_condition if control is self.control else None
+
     async def _control(self):
         async for wire in self.control:
             value = json.loads(wire)
             kind = value.get("type")
+            if kind == "model.context.source-debug.result":
+                if value.get("epoch") == self.descriptor["epoch"]:
+                    self.source_debug_condition = value.get("conditions", [])
+                continue
             if isinstance(kind, str) and (
                 kind.startswith("model.context.") or kind.startswith("model.condition")
             ):
@@ -1174,6 +1198,7 @@ class CLIView:
             if value.get("epoch") != self.descriptor["epoch"]:
                 raise ValueError("The CLI session was reset")
             if kind == "session.ready":
+                self.source_debug_supported = value.get("sourceDebug") is True
                 if self.external_input and value.get("role") == "spectator":
                     # The browser owns its SDK input lease. Model/source capture
                     # observes media/UI without competing for that controller.
@@ -1331,6 +1356,7 @@ class CLIView:
                 raise ValueError("The CLI session ended or reset")
 
     async def _source_reset(self, value):
+        self.source_debug_condition = []
         raise ValueError("The CLI source was reset")
 
     async def _reconfigure(self, value):
@@ -1668,6 +1694,7 @@ class NativeCLIView(CLIView):
         ):
             raise ValueError("The CLI source reset is stale")
         self.source_identity = current
+        self.source_debug_condition = []
         self.pending_reset = value
         if self.model_context is not None:
             self.model_context.retire_source(value)
