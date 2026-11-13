@@ -845,6 +845,17 @@ def install_rtc_routes(host, app, token, *, peer_factory=NativeRTC):
                 if sub is pipeline.subscription and not sub.closed and not queue.full():
                     queue.put_nowait(reply)
 
+            def is_debug_control(message, *fields):
+                keys = {"type", *fields}
+                if "version" not in message:
+                    return set(message) == keys
+                # Player uses the render-v2 envelope; older callers sent bare controls.
+                return (
+                    set(message) == keys | {"version"}
+                    and type(message["version"]) is int
+                    and message["version"] == 2
+                )
+
             async def receive():
                 nonlocal cancelled, debug, prewarm_observer, plan_observer
                 while True:
@@ -887,7 +898,7 @@ def install_rtc_routes(host, app, token, *, peer_factory=NativeRTC):
                             prewarm_observer = observe_prewarm()
                     elif message.get("type") == "model.context.debug.subscribe":
                         if (
-                            set(message) == {"type"}
+                            is_debug_control(message)
                             and debug is None
                             and debug_available
                             and sub is pipeline.subscription
@@ -895,13 +906,13 @@ def install_rtc_routes(host, app, token, *, peer_factory=NativeRTC):
                         ):
                             debug = open_debug()
                     elif message.get("type") == "model.context.debug.unsubscribe":
-                        if set(message) == {"type"} and debug is not None:
+                        if is_debug_control(message) and debug is not None:
                             await stop_debug(debug)
                             debug = None
                     elif message.get("type") == "model.context.debug.reference.get":
                         if (
                             debug is not None
-                            and set(message) == {"type", "condition_id", "sha256"}
+                            and is_debug_control(message, "condition_id", "sha256")
                             and isinstance(message["condition_id"], str)
                             and isinstance(message["sha256"], str)
                             and sub is pipeline.subscription

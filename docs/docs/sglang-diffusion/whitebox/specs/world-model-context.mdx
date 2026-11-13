@@ -153,8 +153,13 @@ A test Room with `WHITEBOX_PROMPT_DEBUG=1` advertises support in
 `session.attached`. The Player settings switch subscribes or unsubscribes on the
 current RTC connection without reconnecting. The `promptDebug=1` link parameter
 sets the initial switch state. The panel shows the compiled CLI Prompt, condition
-receipt and reference numbers. The same Room serves a selected reference as binary
-image data after checking its condition and SHA-256.
+receipt and reference numbers. Game-side Harness history is available even when
+model inference is off. The same Room serves a selected reference as binary image
+data after checking its condition and SHA-256.
+
+Subscribe, unsubscribe and reference requests use the Player's `version: 2`
+control envelope. The Room also accepts these requests without a version for
+compatibility with older callers.
 
 The Room creates its debug queue only after the current authenticated RTC
 connection subscribes. Unsubscribe drops that connection’s queue and reference

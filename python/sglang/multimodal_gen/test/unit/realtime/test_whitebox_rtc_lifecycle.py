@@ -1,6 +1,7 @@
 """RTC lifecycle tests without a real cloud, browser, or model allocation."""
 
 import asyncio
+import hashlib
 from types import SimpleNamespace
 
 import msgspec
@@ -663,6 +664,184 @@ def test_early_real_subscription_preserves_ice_callback_then_takes_media(
             assert msgspec.msgpack.decode(ws.receive_bytes())["type"] == "rtc.cancelled"
             assert pipeline.rtc_closed.is_set()
             assert host.runtime.rtc_preparation is None
+
+
+@pytest.mark.parametrize("envelope", [{}, {"version": 2}])
+def test_rtc_prompt_debug_reads_harness_history_without_inference(
+    monkeypatch, envelope
+):
+    monkeypatch.setenv("WHITEBOX_PROMPT_DEBUG", "1")
+    image = b"reference payload"
+    digest = hashlib.sha256(image).hexdigest()
+    reference = dict(picture=1, format="png", sha256=digest)
+    receipt = dict(phase="submitted", requestId="input-1")
+    condition = dict(
+        conditionId="source:night-1",
+        payloadHash="payload",
+        prompt="变成黑夜",
+        eventId="weather.night",
+        occurrenceId="night-1",
+        simulationTick=9,
+        references=[dict(reference, resource="reference-1")],
+        receipt=receipt,
+    )
+
+    class Peer:
+        def __init__(self, callback):
+            self.on_event = callback
+            self.connected = asyncio.Event()
+
+        async def start(self):
+            self.connected.set()
+
+        def _check(self):
+            pass
+
+        async def close(self):
+            pass
+
+    async def history():
+        return [condition]
+
+    async def read_reference(resource):
+        assert resource == "reference-1"
+        return image
+
+    class Pipeline:
+        def __init__(self, peer):
+            self.host = host
+            self.user_id = "user"
+            self.terminal = None
+            self.rtc_closed = asyncio.Event()
+            self.session = SimpleNamespace(
+                startup=None,
+                source_epoch="epoch",
+                current_model_stream=None,
+                source_playback=None,
+                current_segment=None,
+                condition_debug=None,
+                source_conditions=None,
+                emit_applied_prompt_debug=lambda: None,
+                engine=SimpleNamespace(
+                    refresh_source_debug=history,
+                    read_model_context_resource=read_reference,
+                ),
+            )
+            self.subscription = RTCSubscription(self, 1, peer)
+            self.subscription.offer_control(dict(type="session.attached"))
+
+        def request_keyframe(self, _):
+            pass
+
+        def accept(self, sub, wire):
+            assert msgspec.msgpack.decode(wire)["type"] == "fixture.probe"
+            sub.offer_control(
+                dict(
+                    type="fixture.state",
+                    subscribed=self.session.condition_debug is not None,
+                )
+            )
+
+        async def close(self, reason):
+            self.subscription.stop(reason)
+            await self.subscription.wait_closed()
+            self.rtc_closed.set()
+
+        def detach(self, sub):
+            sub.stop("DISCONNECTED")
+
+    async def attach(*args, rtc_peer, **kwargs):
+        pipeline = Pipeline(rtc_peer)
+        return pipeline, pipeline.subscription
+
+    host = SimpleNamespace(
+        config=SimpleNamespace(spec=VideoSpec(32, 32)),
+        runtime=SimpleNamespace(epoch="a" * 32, owner_id="room", rooms={}),
+        lock=asyncio.Lock(),
+        sessions={},
+        peer_sessions={},
+        max_sessions=1,
+        attach=attach,
+    )
+    app = FastAPI()
+    install_rtc_routes(host, app, "internal-only", peer_factory=Peer)
+    with (
+        TestClient(app) as client,
+        client.websocket_connect(
+            "/internal/render-rtc", headers={"authorization": "Bearer internal-only"}
+        ) as ws,
+    ):
+
+        def send(**message):
+            ws.send_bytes(msgspec.msgpack.encode(message))
+
+        def receive():
+            return msgspec.msgpack.decode(ws.receive_bytes())
+
+        def assert_subscribed(expected):
+            send(type="fixture.probe")
+            assert receive() == dict(type="fixture.state", subscribed=expected)
+
+        send(
+            user_id="user",
+            message=dict(
+                type="init",
+                control_protocol="whitebox-render-v2",
+                source_operation="create.manual",
+                inference_control="manual",
+                whitebox=dict(game_id="b" * 32),
+            ),
+        )
+        configuration = receive()
+        assert configuration["type"] == "rtc.configuration"
+        assert receive()["prompt_debug_available"] is True
+        send(type="model.context.debug.subscribe", version=3)
+        send(type="model.context.debug.subscribe", version=2, unexpected=True)
+        assert_subscribed(False)
+
+        send(type="model.context.debug.subscribe", **envelope)
+        send(type="fixture.probe")
+        history_message = None
+        item = receive()
+        if item["type"] != "fixture.state":
+            history_message = item
+            item = receive()
+        assert item == dict(type="fixture.state", subscribed=True)
+        assert (history_message if history_message is not None else receive()) == dict(
+            type="model.context.debug.source.history",
+            rows=[
+                dict(
+                    condition_id=condition["conditionId"],
+                    payload_sha256=condition["payloadHash"],
+                    prompt=condition["prompt"],
+                    event_id=condition["eventId"],
+                    occurrence_id=condition["occurrenceId"],
+                    simulation_tick=condition["simulationTick"],
+                    references=[reference],
+                    receipt=receipt,
+                )
+            ],
+        )
+
+        request = dict(
+            type="model.context.debug.reference.get",
+            condition_id=condition["conditionId"],
+            sha256=digest,
+        )
+        send(**request, version=1)
+        assert_subscribed(True)
+        send(**request, **envelope)
+        assert receive() == dict(
+            request, type="model.context.debug.reference", format="png", bytes=image
+        )
+
+        send(type="model.context.debug.unsubscribe", version=3)
+        assert_subscribed(True)
+        send(type="model.context.debug.unsubscribe", **envelope)
+        send(**request, **envelope)
+        assert_subscribed(False)
+        send(type="rtc.cancel", peer_id=configuration["peer_id"])
+        assert receive()["type"] == "rtc.cancelled"
 
 
 @pytest.mark.parametrize("late_consumer", [False, True])
