@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 def main():
@@ -21,7 +22,22 @@ def main():
     p.add_argument("--engine", choices=("docker", "podman"), default="podman")
     p.add_argument("--tag-prefix", required=True)
     p.add_argument("--component", choices=("cpu", "room", "both"), default="both")
+    p.add_argument("--browser-mirror")
     a = p.parse_args()
+    if a.browser_mirror:
+        mirror = urlsplit(a.browser_mirror)
+        if not (
+            mirror.scheme == "http"
+            and mirror.hostname == "127.0.0.1"
+            and mirror.port
+            and not (
+                mirror.username or mirror.password or mirror.query or mirror.fragment
+            )
+            and mirror.path in ("", "/")
+        ):
+            raise ValueError(
+                "Use the verified loopback browser cache without credentials"
+            )
     root = a.context.resolve()
     manifest = json.loads((root / "candidate-source.json").read_text())
     for key in ("source", "sdk"):
@@ -102,6 +118,13 @@ def main():
                 "400000",
                 "--format",
                 "docker",
+            ]
+        if a.browser_mirror:
+            command += [
+                "--network",
+                "host",
+                "--build-arg",
+                "PLAYWRIGHT_DOWNLOAD_HOST=" + a.browser_mirror.rstrip("/"),
             ]
         subprocess.run(command + ["."], cwd=root, check=True)
         result = dict(

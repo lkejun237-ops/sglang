@@ -366,6 +366,6 @@ class DisaggregatedModelLeases(ModelLeases):
                         continue
                 await cleanup
             finally:
-                # A retry needs the HTTP client; close only after positive final release.
-                if self.resource_state == "released":
+                # Only unresolved allocations need the HTTP client for a retry.
+                if self.resource_state in {"none", "released"}:
                     await self.client.aclose()

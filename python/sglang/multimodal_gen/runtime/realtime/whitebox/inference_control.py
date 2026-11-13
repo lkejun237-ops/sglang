@@ -37,6 +37,9 @@ class SourceInference:
         self.manual = mode == "manual"
         self.assets = self.startup = None
         self.prewarm = None
+        self.preparation = None
+        self.preparation_retirement = None
+        self.preparation_failure = None
         self.task = None
         self.task_scope = None
         self.recovery = self.recovery_task = None
@@ -63,6 +66,203 @@ class SourceInference:
                 seed = message.get("seed", 42)
                 if type(seed) is not int or not 0 <= seed < 2**32:
                     raise RenderError("CONDITION_INVALID")
+
+    @property
+    def prepares_on_open(self):
+        # Only an authenticated managed launch may speculate before its actual
+        # CLI descriptor is checked. Preview-less/manual clients keep their path.
+        from ..source_prepare import V2_PROTOCOL
+
+        return bool(
+            self.manual
+            and self.startup is not None
+            and not self.startup.closed
+            and not getattr(self.source, "closing", False)
+            and not getattr(self.source, "closed", False)
+            and not getattr(self.source, "binding_ended", False)
+            and getattr(self.source, "expected_publication", None) is not None
+            and self.assets.frame is not None
+            and self.startup.request["protocol"] == V2_PROTOCOL
+            and getattr(self.source, "member_prefill", None) is None
+            and os.environ.get("WHITEBOX_MODEL_STARTUP_PREPARE") == "1"
+            and os.environ.get("WHITEBOX_BOUND_COMPUTE") == "1"
+        )
+
+    async def prepare_startup(self, init):
+        from .startup import PlayStartup
+
+        source = self.source
+        try:
+            source.start_model_binding(self.frozen)
+            await source.model_binding.wait_ready()
+        except Exception as error:
+            code = public_error(error, None)["code"]
+            binding = source.model_binding
+            if (
+                code not in {"CAPACITY_EXHAUSTED", "CAPABILITY_UNAVAILABLE"}
+                or getattr(error, "cleanup_code", None) == "RELEASE_UNKNOWN"
+                or (
+                    binding is not None
+                    and (
+                        binding.assignment is not None
+                        or binding.lease.resource_state != "none"
+                    )
+                )
+            ):
+                raise
+            # The preview is optional. Only a rejected reservation with no
+            # acquired resources can fall through to whitebox-only startup.
+            if binding is not None:
+                await binding.close()
+                source.model_binding = source.control_prefill = None
+            logging.getLogger(__name__).info(
+                "Skipped optional model preparation source=%s code=%s",
+                source.session_id,
+                code,
+            )
+            return
+        if not self.prepares_on_open:
+            return
+        self.preparation = PlayStartup(source, self.startup.request, assets=self.assets)
+        self.preparation.launch(init)
+
+    async def discard_preparation(self, *, report_failure=False):
+        candidate = self.preparation
+        if candidate is None:
+            return
+        retirement = self.preparation_retirement
+        if retirement is None or retirement[0] is not candidate:
+
+            async def drain():
+                await candidate.close()
+                if candidate.resource_state not in {"none", "released"}:
+                    raise RenderError("RELEASE_UNKNOWN")
+                if self.preparation is candidate:
+                    self.preparation = None
+
+            retirement = self.preparation_retirement = (
+                candidate,
+                asyncio.create_task(drain()),
+            )
+        await asyncio.shield(retirement[1])
+        if (
+            report_failure
+            and candidate.task is not None
+            and candidate.task.done()
+            and not candidate.task.cancelled()
+        ):
+            error = candidate.task.exception()
+            if error is not None:
+                self.preparation_failure = error
+                raise error
+
+    def preparation_matches(self, prompt, seed, references, *, world=False):
+        candidate = self.preparation
+        prepared = candidate.assets.references if candidate is not None else []
+        if world:
+            # SDK upload IDs (e.g. reference-0) are not World Picture labels.
+            # H3 assigns those labels in reference order. Match that ordinal
+            # namespace without changing the prepared request or its fingerprint.
+            prepared = [
+                {**ref, "id": f"<Picture {index + 1}>"}
+                for index, ref in enumerate(prepared)
+            ]
+        return bool(
+            candidate is not None
+            and not candidate.closed
+            and candidate.assets.prompt == prompt
+            and candidate.assets.seed == seed
+            and prepared == references
+        )
+
+    async def wait_preparation(self):
+        candidate = self.preparation
+        if candidate is None:
+            return False
+        try:
+            await candidate.wait(candidate.prepared)
+        except asyncio.CancelledError:
+            if asyncio.current_task().cancelling():
+                raise
+            # A shared candidate may be retired by explicit Prefill/expiry.
+            # That cancels its model task, not this World condition consumer.
+            retirement = self.preparation_retirement
+            try:
+                if retirement is None or retirement[0] is not candidate:
+                    raise RenderError("MODEL_UNAVAILABLE")
+                await asyncio.shield(retirement[1])
+            except Exception as error:
+                self.preparation_failure = error
+                raise
+            return False
+        except Exception as error:
+            # A failed model is not a cache miss. Release what can be proved and
+            # report the original failure; never silently resubmit compute.
+            self.preparation_failure = error
+            await self.discard_preparation()
+            raise
+        return self.preparation is candidate and not candidate.closed
+
+    async def prepared_for(self, prompt, seed, references, *, world=False):
+        if self.preparation is None:
+            return False
+        if not self.preparation_matches(prompt, seed, references, world=world):
+            await self.discard_preparation(report_failure=True)
+            return False
+        return await self.wait_preparation()
+
+    async def prepared_for_condition(self, condition):
+        candidate = self.preparation
+        if candidate is None:
+            return False
+        assets = candidate.assets
+        # SourceConditions has already verified these resource hashes/bytes.
+        expected = [
+            (
+                f"<Picture {index + 1}>",
+                assets.items[name]["format"],
+                assets.items[name]["encoded_sha256"],
+            )
+            for index, name in enumerate(assets.reference_ids)
+        ]
+        actual = [
+            ("<Picture %s>" % ref["picture"], ref["format"], ref["sha256"])
+            for ref in condition["references"]
+        ]
+        if (
+            condition["prompt"] != assets.prompt
+            or getattr(self.source, "context_seed", 42) != assets.seed
+            or actual != expected
+        ):
+            await self.discard_preparation(report_failure=True)
+            return False
+        return await self.wait_preparation()
+
+    async def adopt_preparation(self, first, *, context=None):
+        candidate = self.preparation
+        if candidate is None or candidate.closed:
+            raise RenderError("MODEL_UNAVAILABLE")
+        if not self.source.inference_enabled():
+            raise RenderError("MODEL_UNAVAILABLE")
+        version, (frame, captured) = first
+        candidate.observe_source(version, frame, captured)
+        await candidate.bind_cli(candidate.cli_rgb, candidate.cli_proof)
+        if self.preparation is not candidate or candidate.closed:
+            raise RenderError("MODEL_UNAVAILABLE")
+        if context is not None:
+            ids = self.source.journal.snapshot.get("model_context_segment_ids")
+            if ids is None or ids["segment_id"] != context["segmentId"]:
+                raise RenderError("SEGMENT_EPOCH_MISMATCH")
+            # The World reservation stays unchanged until its condition CAS.
+            # Do not leave a closed candidate's generation in a future retry.
+            candidate.ids.update(
+                {key: ids[key] for key in ("segment_id", "segment_epoch")}
+            )
+        if self.preparation is not candidate or candidate.closed:
+            raise RenderError("MODEL_UNAVAILABLE")
+        self.preparation = None
+        self.source.startup = candidate
+        return candidate.pinned_source
 
     def fence(self, *, drain_pending=False):
         source = self.source
@@ -314,6 +514,7 @@ class SourceInference:
             await source.status_snapshot()
 
     async def enable(self, operation):
+        self.preparation_failure = None
         source = self.source
         revision = operation["inference"]["revision"]
         if source.closed or source.binding_ended:
@@ -377,6 +578,14 @@ class SourceInference:
                     return
                 await channel.switch_segment(expected_segment_id)
         else:
+            references = await source.assets.resolve(source.initial_assets)
+            prepared = await self.prepared_for(
+                self.assets.prompt if self.assets else self.frozen["prompt"],
+                self.assets.seed if self.assets else self.frozen.get("seed", 42),
+                references,
+            )
+            if not self.current(revision):
+                return
             async with asyncio.timeout(source.config.startup_seconds):
                 while not source.retained.frames:
                     if not self.current(revision):
@@ -385,6 +594,8 @@ class SourceInference:
             if not self.current(revision):
                 return
             version, frame, captured, _ = source.retained.frames[-1]
+            if prepared:
+                await self.adopt_preparation((version, (frame, captured)))
             state = await source.journal.read()
             command = self.command("render.start", operation, state)
             command.update(
@@ -397,7 +608,9 @@ class SourceInference:
             references = await source.assets.resolve(command["references"])
             if not self.current(revision):
                 return
-            result = await source.journal.start(command)
+            result = await source.journal.start(
+                command, startup_ids=source.startup.ids if prepared else None
+            )
             await source.operation_message(result)
             expected_segment_id = result["segment_id"]
             source.current_model_stream = result["segment_epoch"]
@@ -425,6 +638,8 @@ class SourceInference:
         # its model connection. Enabled means admission, never visible pixels.
         async with asyncio.timeout(source.config.startup_seconds):
             while self.current(revision):
+                if self.preparation_failure is not None:
+                    raise self.preparation_failure
                 if self.prewarm is not None and self.prewarm.failure is not None:
                     raise self.prewarm.failure
                 segment = source.current_segment
@@ -491,6 +706,10 @@ class SourceInference:
         if reset_generation is None:
             await self.pause_channel()
         cleanup_unknown = False
+        try:
+            await self.discard_preparation()
+        except Exception:
+            cleanup_unknown = True
         if self.prewarm is not None:
             try:
                 await self.prewarm.close()
@@ -741,6 +960,7 @@ class SourceInference:
         if self.task is not None and not self.task.done():
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
+        await self.discard_preparation()
         if self.startup is not None:
             self.startup.closed = True
         if self.assets is not None:

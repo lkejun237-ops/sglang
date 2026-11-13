@@ -3,6 +3,45 @@ title: "Room 并行准备：独立尺寸 S0 条件图"
 description: "prepare v2 将 S0 条件图与 CLI 视频帧解耦，复用既有 Qwen 预处理和源帧时间轴。"
 ---
 
+## Managed Player 与 CLI 并行准备
+
+官网使用 `create.manual` / `inference_control=manual`。经过受管入口验签并绑定
+`expected_publication` 的启动请求，如果携带已校验的 v2 `initial_frame`，且现有
+`WHITEBOX_MODEL_STARTUP_PREPARE=1`、`WHITEBOX_BOUND_COMPUTE=1` 已开启，可以提前准备模型条件。
+不增加客户端字段、另一个 Slot 或模型工作队列；没有预置帧、非受管调用、v1 和成员
+Prefill 仍沿用各自原路径。
+
+`manual` 继续控制生成和显示。带 `intent=model` 的可信预置帧只允许在同一玩家父绑定上
+准备一个有界候选，不会自动启用推理、不提前发布模型画面。原 CLI descriptor/publication
+检查保留；候选计算可与 CLI 加载重叠，实际使用必须等真实 CLI 与用户的模型启用操作。
+
+- `SourceInference` 拥有候选，复用 `PlayStartup` 的 prepare/attach 与失败清理；启动资产
+  由原手动会话持有，候选取消不破坏其后续启动输入。
+- World 提供第一组真实条件后，先验证参考资源，再比较 Prompt、seed、有序图片槽位、
+  格式与内容。SDK 的 `reference-0` 等上传 ID 与 World 的 `<Picture 1>` 属于不同命名空间；
+  仅在真实 World 条件入口按 H3 的参考图顺序映射槽位，不排序、不改字节，不改原准备请求和指纹。匹配则等待该候选完成并跳过重复的 World 开场预热；不匹配则确认候选释放，
+  再走原 World 条件/预热流程。不同条件不能为了复用而改写 World 的权威数据。
+- 真正提交首段时才选取满足 World 生效边界的真实私有视角帧。v2 条件预览不替代视频
+  frame zero，保留真实像素、时间戳与来源身份。World 的 segment/epoch 不变，已准备的
+  model session/generation 与首段创建在同一次 journal CAS 中提交；不提前留下已关闭的代次。
+- 受管普通世界没有 World 条件通道时，仍需显式 enable，再按冻结条件和真实 CLI 帧接续。
+  已建立的 WS/RTC 就绪状态传给候选，生成仍遵循原 attachment 与 first-presented 约束。
+- 用户退出、CLI 失败或超时关闭候选；显式 live-F0 Prefill 优先，先退役可选候选再计算。
+  模型失败不是缓存 miss，清理未知不允许继续借用 compute。取消/失败只作用于该玩家，
+  不暂停共享 World，也不重启其他模型。
+- 如果模型席位不足或当前尺寸缺少模型路由，且 Room 确认预热未取得席位，白模照常启动，
+  游戏输入和 Harness 回执随白模可用。用户手动开启推理时才重新申请席位，按该次请求
+  返回模型可用性。已取得席位或释放状态不明时仍由原绑定完成清理。
+
+预置条件与实际 World 条件不同会退回原路径，因此不能仅凭请求带图就承诺启动提速。
+复用条件、准入等待、CLI 时间、prepared 到实际 attach/首帧的时间应分别观察；准备成功
+不表示浏览器已显示模型画面。CPU 合同验证不替代真实 480/736 GPU 的 TTFF、画质和峰值内存。
+
+阅读顺序：`SourceSession._open_engine` → `SourceInference.prepare_startup` →
+World 条件核对 → `adopt_preparation` → `RenderJournal.model_condition/start` →
+原 `RenderSegment` prepare/attach。协议回归入口为 `test_whitebox_parallel_startup.py`；
+部署状态和性能记录按具体发布回执维护，下文历史记录不代表本候选已上线。
+
 ## 2026-10-29 版本边界补充
 
 共享接收端显式支持 `whitebox-startup-prepare-v1` 和 `whitebox-startup-prepare-v2`，

@@ -10,10 +10,11 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import inspect
 import logging
 import math
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 from .opening_presentation import PROTOCOL as FIRST_PRESENTED_PROTOCOL
 from .opening_presentation import applied_context_operation, retained_first_presented
@@ -288,7 +289,13 @@ class SourceConditions:
         validate_reference,
         check,
         startup_release: (
-            Callable[[dict], tuple[float, asyncio.Future[None]] | None] | None
+            Callable[
+                [dict],
+                tuple[float, asyncio.Future[None]]
+                | None
+                | Awaitable[tuple[float, asyncio.Future[None]] | None],
+            ]
+            | None
         ) = None,
         startup_effective: Callable[[dict], dict | None] | None = None,
         first_presented_supported: Callable[[], bool] = lambda: False,
@@ -575,6 +582,16 @@ class SourceConditions:
         # The startup owner retains the window and its cleanup. This candidate
         # only waits on the shared release decision and its absolute deadline.
         gate = self.startup_release(c)
+        if inspect.isawaitable(gate):
+            gate = await gate
+            self.check()
+            latest = await self.journal.read()
+            if latest.get("model_context_segment_ids") != ids:
+                raise RenderError("SEGMENT_EPOCH_MISMATCH")
+            if not latest.get("inference", {}).get("enabled", True) or latest.get(
+                "inference", {}
+            ).get("revision") != state.get("inference", {}).get("revision"):
+                raise RenderError("MODEL_UNAVAILABLE")
         if gate is None:
             return
         deadline, released = gate

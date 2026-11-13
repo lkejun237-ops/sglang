@@ -149,6 +149,10 @@ class ControlPrefill:
         """Explicit context boundary; a future real frame becomes video F0."""
         state = await self.available()
         self.owner.journal.require_revision(state, command)
+        inference = getattr(self.owner, "inference", None)
+        if getattr(inference, "preparation", None) is not None:
+            # An explicit live-F0 preparation supersedes the optional preview.
+            await inference.discard_preparation(report_failure=True)
         if (
             self.active is not None
             and not self.active.done()
@@ -366,6 +370,9 @@ class ControlPrefill:
     async def start_startup(self, value, refs, first, *, current, observe):
         """Borrow one child for a trusted startup window on its pinned capture."""
         await self.available()
+        inference = getattr(self.owner, "inference", None)
+        if getattr(inference, "preparation", None) is not None:
+            await inference.discard_preparation(report_failure=True)
         parameters = segment_parameters(dict(value, references=refs))
         references = await self.owner.assets.resolve(parameters["references"])
         if not current():

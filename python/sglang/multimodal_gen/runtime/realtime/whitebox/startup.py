@@ -67,6 +67,18 @@ async def open_startup_engine(factory, kwargs, timeout):
         raise
 
 
+def model_transport_ready(owner):
+    """Keep readiness when managed preparation predates its model segment."""
+    owner._model_transport_ready = True
+    candidates = (
+        getattr(owner, "startup", None),
+        getattr(getattr(owner, "inference", None), "preparation", None),
+    )
+    for candidate in candidates:
+        if candidate is not None:
+            candidate.rtc_ready.set()
+
+
 class StartupAssets:
     """Fixed manifest, one in-progress image, ordered idempotent chunks."""
 
@@ -270,9 +282,14 @@ class PlayStartup:
 
     is_startup = True
 
-    def __init__(self, owner, request):
+    def __init__(self, owner, request, *, assets=None):
         self.owner, self.request = owner, copy.deepcopy(request)
-        self.assets = validate_startup(request, owner.config.spec)
+        self.owns_assets = assets is None
+        self.assets = (
+            assets
+            if assets is not None
+            else validate_startup(request, owner.config.spec)
+        )
         self.protocol = request["protocol"]
         self.request_fingerprint = startup_fingerprint(request)
         self.created_at = time.monotonic()
@@ -287,6 +304,8 @@ class PlayStartup:
         )
         self.cli_ready = asyncio.Event()
         self.rtc_ready = asyncio.Event()
+        if getattr(owner, "_model_transport_ready", False):
+            self.rtc_ready.set()
         self.cli_rgb = self.cli_proof = self.pinned_source = None
         self.cli_rgb_sha256 = None
         self.model_cli_rgb_sha256 = None
@@ -471,7 +490,6 @@ class PlayStartup:
                     ):
                         raise RenderError("CAPABILITY_UNAVAILABLE")
                     rgb = self.assets.rgb
-                    frame = self.assets.frame
                     if rgb is None:
                         await self.progress("waiting_source")
                         await self.cli_ready.wait()
@@ -706,4 +724,5 @@ class PlayStartup:
         self.closed = True
         await self.close_attempt()
         self.pinned_source = self.cli_rgb = None
-        self.assets.clear()
+        if self.owns_assets:
+            self.assets.clear()

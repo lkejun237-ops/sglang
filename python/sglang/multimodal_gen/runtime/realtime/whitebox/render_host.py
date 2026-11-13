@@ -941,8 +941,10 @@ class RenderHost:
                 getattr(pipeline.session, "inference", None), "startup", None
             )
             if frozen_startup is not None:
-                if transport == "websocket" and pipeline.session.startup is not None:
-                    pipeline.session.startup.rtc_ready.set()
+                if transport == "websocket":
+                    from .startup import model_transport_ready
+
+                    model_transport_ready(pipeline.session)
                 pipeline.publish(
                     dict(
                         type="startup.accepted",

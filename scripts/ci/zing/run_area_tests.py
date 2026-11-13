@@ -35,6 +35,8 @@ AREA_FILES = [
         "test_whitebox_recording_process.py",
         "test_source_prepare_contract.py",
         "test_whitebox_startup.py",
+        "test_whitebox_parallel_startup.py",
+        "test_whitebox_managed_startup_fetch.py",
         "test_whitebox_source_conditions.py",
         "test_whitebox_prewarm_observation.py",
         "test_whitebox_startup_prewarm.py",

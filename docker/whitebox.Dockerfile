@@ -113,6 +113,9 @@ RUN pip install --no-cache-dir pytest==9.0.2 pyzmq==27.2.0 && \
       python/sglang/multimodal_gen/test/unit/realtime/test_realtime_trace.py \
       python/sglang/multimodal_gen/test/unit/realtime/test_world_gateway_metrics.py \
       --confcutdir=python/sglang/multimodal_gen/test/unit/realtime -q && \
+    python -m pytest \
+      python/sglang/multimodal_gen/test/unit/realtime/test_whitebox_parallel_startup.py \
+      --confcutdir=python/sglang/multimodal_gen/test/unit/realtime -q && \
     python -m pytest deploy/whitebox/test_prepare_assets.py \
       deploy/whitebox/test_room_instance.py \
       deploy/whitebox/test_gpu_guard.py \
@@ -167,6 +170,7 @@ RUN ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i color=black:s=16x16
     python -c 'import json; v=json.load(open("/tmp/whitebox-media-check.json")); s=v["streams"][0]; assert (s["width"],s["height"],int(s["nb_read_frames"])) == (16,16,1); assert float(v["format"]["duration"]) > 0' && \
     rm /tmp/whitebox-media-check.mp4 /tmp/whitebox-media-check.json
 # Keep this version aligned with the pinned SDK's resolved Playwright version.
+ARG PLAYWRIGHT_DOWNLOAD_HOST
 RUN --mount=type=bind,source=deploy/whitebox/debian_main_mirror.py,target=/tmp/debian_main_mirror.py,readonly \
     python /tmp/debian_main_mirror.py -- sh -ec 'node /opt/npm/bin/npx-cli.js --yes --package=playwright@1.62.1 playwright install --with-deps chromium && \
         chmod -R a+rX /opt/playwright && \

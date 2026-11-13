@@ -3,7 +3,7 @@
 `deploy/whitebox/docker_cutover.py` prepares and switches an explicitly authorized
 Room and optional Gateway. It does not build/pull images, change models,
 Coordinator, executor pools, prune storage, remove containers or create cloud
-resources. It requires Linux, Python 3.12, Docker CLI/API and root access to the
+resources. It requires Linux, host Python 3.6+, Docker CLI/API and root access to the
 selected Docker socket, Nginx configuration and `/proc`.
 
 The existing image builder and its source ancestry, native-image and layer-history
@@ -115,3 +115,15 @@ python3.12 -m pytest deploy/whitebox/test_docker_cutover.py -q
 
 Local fake tests and existing release/image-storage tests do not prove a real
 Docker/Nginx cutover or browser playback. Record those gates independently.
+
+A reviewed per-role `startup_prepare: {"expected": "0", "value": "1"}` can enable
+the existing startup preparation switch. The old container, policy environment and
+compiled environment must agree with `expected`; enabling requires the existing
+bound-compute setting. The candidate bundle hash includes this explicit policy
+change, and other runtime settings remain inherited. Omitting it preserves the
+original switch. This is not a generic environment-override interface.
+
+An explicit `codex/` candidate identity sets the isolated-development flag in its
+container and hashed release policy; it does not relabel the image as main.
+The host operator uses portable subprocess pipes. The optional archive-owner
+probe still requires the running Room interpreter to be CPython 3.14.

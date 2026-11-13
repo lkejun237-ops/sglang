@@ -1,4 +1,4 @@
-"""Prepare and switch exactly authorized Docker Room/Gateway images (Python 3.12).
+"""Prepare and switch exactly authorized Docker Room/Gateway images (host Python 3.6+).
 
 Private configuration and receipts stay outside Git. No image build, pull,
 prune, model mutation or container deletion is performed by this operator.
@@ -11,14 +11,14 @@ import hashlib
 import http.client as http_client
 import json
 import os
-from pathlib import Path
 import re
-import socket
 import signal
+import socket
 import subprocess
 import time
+from pathlib import Path
 from urllib.parse import quote
-from urllib.request import Request, HTTPRedirectHandler, build_opener
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 IDLE_METRICS = (
     "world_recording_active_sessions",
@@ -85,7 +85,8 @@ class Docker:
         # Never print Docker output on failure: inspect/probes can contain secrets.
         result = subprocess.run(
             ["docker", "--host", "unix://" + self.socket, *args],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             check=False,
             timeout=120,
         )
@@ -296,6 +297,26 @@ def environment(old):
     return dict(value.split("=", 1) for value in old["Config"]["Env"])
 
 
+def startup_prepare_setting(env, item):
+    change = item.get("startup_prepare")
+    if change is None:
+        return
+    key = "WHITEBOX_MODEL_STARTUP_PREPARE"
+    require(
+        isinstance(change, dict)
+        and set(change) == {"expected", "value"}
+        and change["expected"] in {"0", "1"}
+        and change["value"] in {"0", "1"},
+        "Invalid explicit startup prepare setting",
+    )
+    require(env.get(key) == change["expected"], "Startup prepare setting drifted")
+    require(
+        change["value"] != "1" or env.get("WHITEBOX_BOUND_COMPUTE") == "1",
+        "Startup preparation requires the existing player binding",
+    )
+    env[key] = change["value"]
+
+
 def candidate_body(old, item, bundle_path, digest):
     require(
         old["Id"] == item["old_id"] and old["Name"] == "/" + item["old_name"],
@@ -393,6 +414,9 @@ def candidate_body(old, item, bundle_path, digest):
         host["Mounts"] = mounts
     require(found == expected and bundle_count == 1, "Mount inventory changed")
     env = environment(old)
+    startup_prepare_setting(env, item)
+    if item["branch"].startswith("codex/"):
+        env["WHITEBOX_ALLOW_DEVELOPMENT_RELEASE"] = "1"
     env["WHITEBOX_RELEASE_CONFIG_SHA256"] = digest
     body.update(
         Image=item["image"], Env=[k + "=" + v for k, v in env.items()], HostConfig=host
@@ -507,7 +531,9 @@ def gated_text(config, original):
 
 def nginx_reload():
     for args in (["nginx", "-t"], ["nginx", "-s", "reload"]):
-        result = subprocess.run(args, capture_output=True, timeout=30)
+        result = subprocess.run(
+            args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30
+        )
         require(result.returncode == 0, "Nginx validation/reload failed")
 
 
@@ -716,6 +742,25 @@ def prepare(config, root, engine):
             sdk_sha=item["sdk"],
             release_branch=item["branch"],
         )
+        if item.get("startup_prepare") is not None:
+            policy_env = (
+                bundle["policy"]
+                .setdefault("environment", {})
+                .setdefault(item["role"], {})
+            )
+            # Historical bundles have only compiled environments. Seed these
+            # two controls from the observed runtime, then apply the same guard.
+            for key in ("WHITEBOX_MODEL_STARTUP_PREPARE", "WHITEBOX_BOUND_COMPUTE"):
+                policy_env.setdefault(key, env[key])
+            startup_prepare_setting(policy_env, item)
+            startup_prepare_setting(bundle["environments"][item["role"]], item)
+        if item["branch"].startswith("codex/"):
+            bundle["policy"].setdefault("environment", {}).setdefault(item["role"], {})[
+                "WHITEBOX_ALLOW_DEVELOPMENT_RELEASE"
+            ] = "1"
+            bundle["environments"][item["role"]][
+                "WHITEBOX_ALLOW_DEVELOPMENT_RELEASE"
+            ] = "1"
         digest = fingerprint(
             {"policy": bundle["policy"], "bindings": bundle["bindings"]}
         )
@@ -807,7 +852,11 @@ def switch(
         "Reconcile prior switch before retrying",
     )
     snapshots = proof["snapshots"]
-    for item, candidate in zip(config["containers"], proof["candidates"], strict=True):
+    require(
+        len(config["containers"]) == len(proof["candidates"]),
+        "Candidate count changed",
+    )
+    for item, candidate in zip(config["containers"], proof["candidates"]):
         old = engine.inspect(item["old_id"])
         before = snapshots[item["role"]]
         require(
@@ -856,9 +905,7 @@ def switch(
         reload()
         drained()
         checker(config, engine, snapshots)
-        for item, candidate in zip(
-            config["containers"], proof["candidates"], strict=True
-        ):
+        for item, candidate in zip(config["containers"], proof["candidates"]):
             require(
                 engine.inspect(item["old_id"])["State"]["StartedAt"]
                 == snapshots[item["role"]]["State"]["StartedAt"],

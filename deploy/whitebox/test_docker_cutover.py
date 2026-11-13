@@ -1,10 +1,8 @@
 import copy
 import json
-from pathlib import Path
-
-import pytest
 
 import docker_cutover as cutover
+import pytest
 
 
 def fixture():
@@ -69,6 +67,27 @@ def test_candidate_preserves_runtime_and_removes_only_exact_overlay(tmp_path):
     env = dict(x.split("=", 1) for x in body["Env"])
     assert env["WHITEBOX_CLI_FPS"] == "36" and env["PRIVATE_TOKEN"] == "not-real"
     assert env["WHITEBOX_RELEASE_CONFIG_SHA256"] == "newhash"
+
+
+def test_explicit_startup_setting_is_narrow_and_preserves_original(tmp_path):
+    old, item = fixture()
+    old["Config"]["Env"] += [
+        "WHITEBOX_MODEL_STARTUP_PREPARE=0",
+        "WHITEBOX_BOUND_COMPUTE=1",
+    ]
+    before = copy.deepcopy(old)
+    item["startup_prepare"] = {"expected": "0", "value": "1"}
+    body = cutover.candidate_body(old, item, str(tmp_path / "release.json"), "newhash")
+    env = dict(value.split("=", 1) for value in body["Env"])
+    assert env["WHITEBOX_MODEL_STARTUP_PREPARE"] == "1"
+    assert env["WHITEBOX_CLI_FPS"] == "36" and old == before
+    item["branch"] = "codex/test-isolated-cutover"
+    body = cutover.candidate_body(old, item, str(tmp_path / "release.json"), "newhash")
+    assert "WHITEBOX_ALLOW_DEVELOPMENT_RELEASE=1" in body["Env"]
+    for patch in ({"expected": "1", "value": "0"}, {"expected": "0", "value": "yes"}):
+        item["startup_prepare"] = patch
+        with pytest.raises(ValueError):
+            cutover.candidate_body(old, item, str(tmp_path / "release.json"), "newhash")
 
 
 @pytest.mark.parametrize("mutation", ["unexpected", "wrongsource", "sdkoverlay"])
@@ -228,6 +247,30 @@ def test_prepare_only_creates_and_does_not_mutate_old_bundle(tmp_path, monkeypat
     assert "return 503" not in path.read_text()
 
 
+def test_startup_setting_migrates_legacy_compiled_only_bundle(tmp_path, monkeypatch):
+    monkeypatch.setattr(cutover.os, "chown", lambda *args: None)
+    fake = FakeDocker()
+    fake.old["Config"]["Env"] += [
+        "WHITEBOX_MODEL_STARTUP_PREPARE=0",
+        "WHITEBOX_BOUND_COMPUTE=1",
+    ]
+    fake.bundle["environments"]["room"].update(
+        WHITEBOX_MODEL_STARTUP_PREPARE="0", WHITEBOX_BOUND_COMPUTE="1"
+    )
+    fake.item["startup_prepare"] = {"expected": "0", "value": "1"}
+    before = copy.deepcopy(fake.bundle)
+    cutover.prepare(
+        {"authorized_roles": ["room"], "containers": [fake.item]}, tmp_path, fake
+    )
+    result = json.loads((tmp_path / "room-release.private.json").read_text())
+    assert fake.bundle == before
+    assert (
+        result["policy"]["environment"]["room"]["WHITEBOX_MODEL_STARTUP_PREPARE"] == "1"
+    )
+    assert result["environments"]["room"]["WHITEBOX_MODEL_STARTUP_PREPARE"] == "1"
+    assert (tmp_path / "prepared.json").exists()
+
+
 def test_switch_checks_idle_twice_and_stops_only_authorized_id(tmp_path, monkeypatch):
     config, fake, path = prepared(tmp_path, monkeypatch)
     original = path.read_text()
@@ -339,6 +382,17 @@ def test_rollback_failure_keeps_ingress_closed(tmp_path, monkeypatch):
         )
     assert "return 503" in path.read_text()
     assert json.loads((tmp_path / "rollback.json").read_text())["errors"]
+
+
+def test_candidate_count_drift_fails_before_gate_or_stop(tmp_path, monkeypatch):
+    config, fake, path = prepared(tmp_path, monkeypatch)
+    proof = json.loads((tmp_path / "prepared.json").read_text())
+    proof["candidates"].clear()
+    (tmp_path / "prepared.json").write_text(json.dumps(proof))
+    fake.events.clear()
+    with pytest.raises(ValueError, match="Candidate count changed"):
+        cutover.switch(config, tmp_path, fake)
+    assert fake.events == [] and "return 503" not in path.read_text()
 
 
 def test_prepare_wrong_sdk_never_creates_candidate(tmp_path, monkeypatch):
@@ -586,7 +640,12 @@ def test_pid_file_whitelist_rejects_unreviewed_paths(path):
 
 def test_real_docker_api_uses_http_client_after_http_function_definition(monkeypatch):
     import http.client
+
     assert cutover.http_client is http.client
-    monkeypatch.setattr(cutover.http_client, 'HTTPConnection', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('reached-client')))
-    with pytest.raises(RuntimeError, match='reached-client'):
-        cutover.Docker('/var/run/docker.sock').api('GET','/containers/x/json')
+    monkeypatch.setattr(
+        cutover.http_client,
+        "HTTPConnection",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("reached-client")),
+    )
+    with pytest.raises(RuntimeError, match="reached-client"):
+        cutover.Docker("/var/run/docker.sock").api("GET", "/containers/x/json")

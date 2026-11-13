@@ -166,8 +166,6 @@ class SourceSession(InteractiveSession):
         await self.journal.initialize_inference(
             manual=self.inference.manual and self.member_prefill is None
         )
-        # Ordinary manual preview owns only the live SDK source. Explicit
-        # enable obtains its parent Slot; member-prefill already requests compute.
         if not self.inference.manual or self.member_prefill is not None:
             self.start_model_binding(message)
         if self.member_prefill is not None and self.control_prefill is None:
@@ -231,9 +229,9 @@ class SourceSession(InteractiveSession):
     async def source_model_ready(self, init):
         """A declared world condition source owns init, including member sources.
 
-        Source-first admission is necessary: the descriptor's pinned capability
-        is unavailable before opening the source, and a manual preparation must
-        never race the first complete world-context commit.
+        The descriptor is checked before World activation. A managed preview may
+        already be preparing, but it cannot replace the first authoritative World
+        condition or publish model pixels before explicit enable.
         """
         if getattr(self.engine, "metadata", {}).get("project_input"):
             self.sdk_input_session = await self.engine.player_input_session()
@@ -279,14 +277,21 @@ class SourceSession(InteractiveSession):
             await self.startup.wait(self.startup.admitted)
 
     async def _open_engine(self, world_id, world, init):
-        if self.model_binding is not None:
-            await self.model_binding.wait_ready()
         if getattr(self, "closing", False):
             raise RenderError("PLAYER_EXPIRED")
-        self._sdk_create_started = True
-        self._sdk_create_done.clear()
         try:
+            if self.inference.prepares_on_open:
+                await self.inference.prepare_startup(init)
+            elif self.model_binding is not None:
+                await self.model_binding.wait_ready()
+            if getattr(self, "closing", False):
+                raise RenderError("PLAYER_EXPIRED")
+            self._sdk_create_started = True
+            self._sdk_create_done.clear()
             await super()._open_engine(world_id, world, init)
+        except BaseException:
+            await self.inference.discard_preparation()
+            raise
         finally:
             self._sdk_create_done.set()
 
@@ -640,7 +645,18 @@ class SourceSession(InteractiveSession):
                     else None
                 )
 
-            def startup_release(condition):
+            async def startup_release(condition):
+                if getattr(
+                    getattr(self, "inference", None), "preparation", None
+                ) is not None and await self.inference.prepared_for_condition(
+                    condition
+                ):
+                    window = startup_window()
+                    if window is not None:
+                        await window.close()
+                        if self.inference.prewarm is window:
+                            self.inference.prewarm = None
+                    return None
                 channel = self.context_channel
                 window = startup_window()
                 if (
@@ -711,6 +727,8 @@ class SourceSession(InteractiveSession):
                         startup_effective=startup_effective,
                     )
                     if prewarm_enabled
+                    or getattr(getattr(self, "inference", None), "preparation", None)
+                    is not None
                     else {}
                 ),
             )
@@ -992,6 +1010,34 @@ class SourceSession(InteractiveSession):
         window = getattr(getattr(self, "inference", None), "prewarm", None)
         startup_check = {}
         first = None
+        if getattr(
+            getattr(self, "inference", None), "preparation", None
+        ) is not None and await self.inference.prepared_for(
+            condition["prompt"], getattr(self, "context_seed", 42), resolved, world=True
+        ):
+            from .source_conditions import source_reached
+
+            version = -1
+            async with asyncio.timeout(self.config.startup_seconds):
+                while True:
+                    captured = await self.latest.get(version)
+                    if captured is None:
+                        raise RenderError("SOURCE_EPOCH_MISMATCH")
+                    version, (frame, _) = captured
+                    if source_reached(frame, condition):
+                        break
+            if not self.inference_enabled() or self.context_channel.suspended:
+                raise RenderError("MODEL_UNAVAILABLE")
+            first = await self.inference.adopt_preparation(captured, context=condition)
+            startup_check.update(
+                source_first=first[1][0].index,
+                opening_revision=self.journal.snapshot["inference"]["revision"],
+                prepared_model_ids={
+                    key: self.startup.ids[key]
+                    for key in ("model_session_id", "generation_id")
+                },
+            )
+            window = None
         if (
             window is not None
             and window.segment_id == condition["segmentId"]
@@ -1020,7 +1066,7 @@ class SourceSession(InteractiveSession):
         if operation["op"] == "render.start":
             if window is not None and hasattr(window, "entries"):
                 self.track_prewarm_consumption(window, condition, operation)
-            if first is not None:
+            if first is not None and window is not None:
                 window.first = None
             self.current_model_stream = operation["segment_epoch"]
             await self.outgoing.put(
@@ -1120,6 +1166,9 @@ class SourceSession(InteractiveSession):
             prefill = self.control_prefill
             if prefill is not None:
                 prefill.check_deadline(now)
+            preparation = getattr(getattr(self, "inference", None), "preparation", None)
+            if preparation is not None and now >= preparation.deadline:
+                await self.inference.discard_preparation()
             if (
                 self.startup is not None
                 and not self.startup.started

@@ -517,8 +517,9 @@ def install_rtc_routes(host, app, token, *, peer_factory=NativeRTC):
             )
             if first_presented_available:
                 sub.enable_first_presentation()
-            if pipeline.session.startup is not None:
-                pipeline.session.startup.rtc_ready.set()
+            from .startup import model_transport_ready
+
+            model_transport_ready(pipeline.session)
             async with host.lock:
                 release_reconnect_preparation(previous_pipeline, reservation)
                 if getattr(host.runtime, "rtc_preparation", None) == reservation:

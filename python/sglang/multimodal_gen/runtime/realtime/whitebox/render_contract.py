@@ -615,8 +615,18 @@ class RenderJournal:
         model_context=None,
         opening_revision=None,
         model_context_lifecycle=None,
+        prepared_model_ids=None,
     ):
         parameters = segment_parameters(command)
+        if prepared_model_ids is not None:
+            if model_context is None or set(prepared_model_ids) != {
+                "model_session_id",
+                "generation_id",
+            }:
+                raise RenderError("REQUEST_ID_CONFLICT")
+            prepared_model_ids = {
+                key: identity(value) for key, value in prepared_model_ids.items()
+            }
 
         def transition(state, operation):
             inference = state.get("inference", {})
@@ -687,6 +697,16 @@ class RenderJournal:
                 ):
                     identity(startup_ids[key])
                     segment[key] = startup_ids[key]
+                if prepared_model_ids is not None:
+                    if not context_handoff:
+                        raise RenderError("REQUEST_ID_CONFLICT")
+                    state["model_context_segment_ids"] = {
+                        **startup_ids,
+                        **prepared_model_ids,
+                    }
+                    segment.update(prepared_model_ids)
+            elif prepared_model_ids is not None:
+                raise RenderError("REQUEST_ID_CONFLICT")
             if occupied:
                 state["pending_replace"] = segment
                 current["state"] = "draining"
@@ -1205,6 +1225,7 @@ class RenderJournal:
         opening_revision=None,
         startup_prepared=True,
         first_presented=False,
+        prepared_model_ids=None,
     ):
         from .source_conditions import request_identity
 
@@ -1264,6 +1285,7 @@ class RenderJournal:
                 command,
                 startup_ids=ids,
                 model_context=context,
+                prepared_model_ids=prepared_model_ids,
                 **(
                     {"model_context_lifecycle": condition["lifecycle"]}
                     if first_presented
@@ -1275,6 +1297,8 @@ class RenderJournal:
                     else {}
                 ),
             )
+        if prepared_model_ids is not None:
+            raise RenderError("RENDER_TRANSITION_IN_PROGRESS")
         if segment.get("context_segment_id") != condition["segmentId"]:
             raise RenderError("SEGMENT_EPOCH_MISMATCH")
         command.update(
