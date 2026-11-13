@@ -23,7 +23,9 @@ from sglang.multimodal_gen.runtime.realtime.whitebox.render_assets import Source
 from sglang.multimodal_gen.runtime.realtime.whitebox.render_contract import RenderError
 
 
-def test_pending_writeback_retries_only_verified_clean_prefill():
+@pytest.mark.parametrize("scene", [False, True])
+@pytest.mark.parametrize("failure_after_memory_ready", [False, True])
+def test_retries_only_verified_clean_prefill(scene, failure_after_memory_ready):
     async def run(cleaned):
         attempts = []
         owner = NS(
@@ -35,10 +37,9 @@ def test_pending_writeback_retries_only_verified_clean_prefill():
         )
 
         class Child:
-            failure = "MODEL_OPERATION_FAILED"
-
             def __init__(self):
                 self.first = not attempts
+                self.failure = "MODEL_OPERATION_FAILED" if self.first else None
                 self.resource_state = "released" if cleaned else "release_unknown"
                 self.completed = asyncio.Event()
                 self.completed.set()
@@ -51,7 +52,7 @@ def test_pending_writeback_retries_only_verified_clean_prefill():
                 attempts.append(msgspec.msgpack.decode(raw))
 
             async def recv(self):
-                if self.first:
+                if self.first and not failure_after_memory_ready:
                     raise RenderError(self.failure)
                 return msgspec.msgpack.encode(
                     dict(
@@ -78,19 +79,119 @@ def test_pending_writeback_retries_only_verified_clean_prefill():
         frame = EngineFrame(1, 0, b"fixed-f0", {})
         control.context_id = "ctx"
         control.first = (1, (frame, 0))
-        await control._compute("next", dict(prompt="A", seed=42), [], (1, (frame, 0)))
         messages = []
+        if scene:
+            del control.requests["previous"]
+            control.requests["next"].update(
+                context_id=None, startup_observer=messages.append
+            )
+        snapshot = dict(rgb=b"sealed-s0", width=3, height=1) if scene else None
+        await control._compute(
+            "next",
+            dict(prompt="A", seed=42),
+            [],
+            (1, (frame, 0)),
+            snapshot=snapshot,
+            deadline=time.monotonic() + 2 if scene else None,
+        )
         while not owner.outgoing.empty():
             messages.append(msgspec.msgpack.decode(owner.outgoing.get_nowait()))
         assert len(attempts) == (2 if cleaned else 1)
         assert all(
-            m["source_frame"] == b"fixed-f0" and m["request_id"] == "next"
+            m["source_frame"] == (b"sealed-s0" if scene else b"fixed-f0")
+            and m["request_id"] == "next"
             for m in attempts
         )
         assert messages[-1]["type"] == (
             "prefill.memory_ready" if cleaned else "prefill.failed"
         )
         assert sum(m["type"] == "prefill.retrying" for m in messages) == int(cleaned)
+        assert (control.failure is None) == cleaned
+
+    asyncio.run(run(True))
+    asyncio.run(run(False))
+
+
+def test_scene_prefill_sends_native_condition_pixels_and_waits_for_child_release():
+    async def run(released):
+        messages, receipts = [], []
+        child = NS(completed=asyncio.Event(), resource_state="in_use")
+
+        @asynccontextmanager
+        async def open_child():
+            yield socket, None
+
+        async def send(wire):
+            messages.append(msgspec.msgpack.decode(wire))
+
+        async def recv():
+            return msgspec.msgpack.encode(
+                dict(
+                    type="prefill.memory_ready",
+                    request_id=messages[-1]["request_id"],
+                    cache_key="target-cache",
+                )
+            )
+
+        socket = NS(send=send, recv=recv)
+        child.open = open_child
+        parent = NS(assignment=NS(denoiser=NS(worker_epoch="a", worker_id="b")))
+
+        def borrow(identity, *, kind):
+            assert kind == "prefill"
+            return child
+
+        parent.borrow = borrow
+
+        async def journal():
+            return {}
+
+        def no_live_frame(_):
+            pytest.fail("Scene prefill must not take a live frame")
+
+        owner = NS(
+            binding_ended=False,
+            journal=NS(read=journal),
+            upstream=NS(init={}),
+            model_binding=parent,
+            model_geometry=NS(model_init=lambda init: init, pad_rgb=no_live_frame),
+            source_identity=lambda: dict(source_session_id="s", source_epoch="e"),
+        )
+        prefill = ControlPrefill(owner)
+        snapshot = dict(rgb=bytes([30, 60, 90]) * 6, width=3, height=2)
+        references = [{"id": "<Picture 1>", "format": "png", "payload": b"frozen"}]
+
+        async def observe(receipt):
+            receipts.append(receipt)
+
+        work = asyncio.create_task(
+            prefill.prepare_scene(
+                dict(prompt="Arrive at the forest", seed=42),
+                references,
+                snapshot,
+                current=lambda: True,
+                observe=observe,
+                deadline=time.monotonic() + 1,
+            )
+        )
+        async with asyncio.timeout(1):
+            while not messages:
+                await asyncio.sleep(0)
+        assert messages[0]["source_frame"] == snapshot["rgb"]
+        assert messages[0]["source_frame_size"] == {"width": 3, "height": 2}
+        assert messages[0]["prompt"] == "Arrive at the forest"
+        assert messages[0]["references"] == references
+        assert not work.done()
+        assert receipts[-1]["type"] == "prefill.computing"
+        child.resource_state = "released" if released else "release_unknown"
+        child.completed.set()
+        if released:
+            assert (await work)["cache_key"] == "target-cache"
+        else:
+            with pytest.raises(RenderError) as error:
+                await work
+            assert error.value.code == "RELEASE_UNKNOWN"
+        assert owner.model_binding is parent
 
     asyncio.run(run(True))
     asyncio.run(run(False))

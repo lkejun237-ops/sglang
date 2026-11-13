@@ -881,7 +881,7 @@ def test_explicit_prefill_retires_optional_candidate_before_compute(monkeypatch)
             prefill = ControlPrefill(source)
             entered = asyncio.Event()
 
-            async def compute(*args):
+            async def compute(*args, **kwargs):
                 assert source.inference.preparation is None
                 assert not lease.ws.operations and lease.calls == 1
                 entered.set()
@@ -899,6 +899,196 @@ def test_explicit_prefill_retires_optional_candidate_before_compute(monkeypatch)
             assert lease.releases == 0
         finally:
             await finish_candidate(source, lease, task)
+
+    asyncio.run(run())
+
+
+def test_scene_generate_prepares_sealed_s0_and_pins_exact_live_f0(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from sglang.multimodal_gen.runtime.realtime.whitebox.contracts import EngineFrame
+    from sglang.multimodal_gen.runtime.realtime.whitebox.render_assets import (
+        SourceFrames,
+    )
+
+    async def run():
+        source, lease, task, _, _ = await managed_source(monkeypatch)
+        try:
+            await asyncio.wait_for(lease.ws.preparing.wait(), 1)
+            init = source.inference.preparation.init
+            await source.inference.discard_preparation()
+            original_parent = source.model_binding
+            source.upstream = NS(init=init)
+            source.assets = NS(
+                resolve=AsyncMock(
+                    side_effect=AssertionError("reference bytes were already frozen")
+                )
+            )
+            source.retained = SourceFrames()
+            source.latest = NS(get=AsyncMock())
+            source.engine = NS(stream_id="real-view")
+            header = dict(
+                outputFrameId=9,
+                source=dict(
+                    presentationId="live",
+                    sdkEpoch=1,
+                    simulationTick=20,
+                    sourceTimeUs=700,
+                    worldRevision=2,
+                ),
+            )
+            f0 = bytes([0, 0, 255]) * 32 * 32
+            frame = EngineFrame(
+                7,
+                700,
+                f0,
+                {},
+                provenance={
+                    "capture_pts_us": 700,
+                    "cli_frame_header": header,
+                },
+            )
+            source.retained.append(8, frame, 1)
+            s0 = request(frame_size=(16, 16), protocol=V2_PROTOCOL)["initial_frame"]
+            ref_png = s0["payload"]
+            lease.ws.release_prepare.set()
+            candidate = await source.inference.prepare_scene_generate(
+                dict(
+                    snapshot={**s0, "png": s0["payload"]},
+                    parameters=dict(prompt="Forest", seed=19),
+                    references=[dict(id="<Picture 1>", format="png", payload=ref_png)],
+                    binding=original_parent,
+                    cache=dict(request_id="prefill-forest", cache_key="a" * 64),
+                ),
+                header,
+                asyncio.get_running_loop().time() + 1,
+                transition_id="cut-forest",
+            )
+            assert source.model_binding is original_parent
+            assert lease.calls == 1 and lease.releases == 0
+            assert candidate.pinned_source == (8, (frame, 1))
+            assert candidate.cli_rgb == f0
+            assert candidate.scene_prefill == dict(
+                transition_id="cut-forest",
+                request_id="prefill-forest",
+                condition_rgb_sha256=s0["rgb_sha256"],
+                cache_key="a" * 64,
+            )
+            init, preparation = lease.ws.commands[-2:]
+            assert init["prompt"] == "Forest" and init["seed"] == 19
+            assert init["references"][0]["payload"] == ref_png
+            source.assets.resolve.assert_not_awaited()
+            assert preparation["kind"] == "source.prepare"
+            assert preparation["payload"]["rgb"] == bytes([255, 0, 0]) * 16 * 16
+            assert not any(
+                command.get("kind") == "source.append" for command in lease.ws.commands
+            )
+            candidate.rtc_ready.set()
+            async with candidate.open():
+                await candidate.attach()
+                assert lease.ws.commands[-1]["kind"] == "source.attach"
+                assert candidate.pinned_source[1][0].rgb == f0
+            assert candidate.resource_state == "released"
+            assert source.model_binding is original_parent
+            assert lease.releases == 0
+        finally:
+            await finish_candidate(source, lease, task)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cleaned", [True, False])
+def test_scene_prefill_waits_for_retirement_and_retains_managed_parent(cleaned):
+    from unittest.mock import AsyncMock
+
+    from sglang.multimodal_gen.runtime.realtime.whitebox.inference_control import (
+        SourceInference,
+    )
+
+    async def run():
+        actions = []
+        binding = NS(closed=False, child=None, assignment=NS(player_expires_at=120))
+        refs = [
+            {"id": "<Picture 1>", "asset_id": "sha256:" + "a" * 64, "role": "scene"}
+        ]
+        references = [
+            {"id": "<Picture 1>", "format": "png", "payload": b"sealed reference"}
+        ]
+        snapshot = {"condition": {"prompt": "Forest"}, "rgb": b"sealed"}
+        cache = {"cache_key": "forest"}
+
+        async def disable():
+            actions.append("retire")
+            if not cleaned:
+                raise RenderError("RELEASE_UNKNOWN")
+
+        async def prefill(parameters, refs, value, *, current, observe, deadline):
+            assert current()
+            assert parameters == {"prompt": "Forest", "seed": 19}
+            assert refs is references and value is snapshot
+            actions.append("prefill")
+            return cache
+
+        source = NS(
+            session_id="room",
+            source_epoch="epoch",
+            context_seed=19,
+            binding_ended=False,
+            close_requested=False,
+            model_binding=binding,
+            source_conditions=NS(
+                prepare_references=AsyncMock(return_value=refs),
+                capabilities=lambda: {},
+            ),
+            control_prefill=NS(prepare_scene=prefill),
+            assets=NS(resolve=AsyncMock(return_value=references)),
+            journal=NS(
+                read=AsyncMock(
+                    return_value={"inference": {"state": "enabled", "revision": 3}}
+                ),
+                configure_inference=AsyncMock(
+                    return_value={"request_id": "retire", "inference": {"revision": 4}}
+                ),
+                settle_inference=AsyncMock(),
+            ),
+        )
+        inference = SourceInference.__new__(SourceInference)
+        inference.source, inference.manual, inference.lock = (
+            source,
+            True,
+            asyncio.Lock(),
+        )
+        inference.disable = disable
+        deadline = asyncio.get_running_loop().time() + 1
+        if cleaned:
+            result = await inference.prepare_scene(snapshot)
+            assert (
+                await inference.prefill_scene(result, deadline, observe=lambda _: None)
+                is cache
+            )
+            assert (
+                await inference.prefill_scene(result, deadline, observe=lambda _: None)
+                is cache
+            )
+            source.assets.resolve.assert_awaited_once_with(refs)
+            assert actions == ["retire", "prefill", "prefill"]
+            source.journal.settle_inference.assert_awaited_once_with(
+                "retire", 4, state="disabled"
+            )
+            binding.child = object()
+            with pytest.raises(RenderError) as error:
+                await inference.prefill_scene(result, deadline, observe=lambda _: None)
+            assert error.value.code == "RELEASE_UNKNOWN"
+            assert actions == ["retire", "prefill", "prefill"]
+        else:
+            with pytest.raises(RenderError) as error:
+                await inference.prepare_scene(snapshot)
+            assert error.value.code == "RELEASE_UNKNOWN"
+            assert actions == ["retire"]
+            source.journal.settle_inference.assert_awaited_once_with(
+                "retire", 4, state="failed", code="RELEASE_UNKNOWN"
+            )
+        assert source.model_binding is binding
 
     asyncio.run(run())
 

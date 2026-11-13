@@ -64,8 +64,6 @@ def validate_preview_rgb(rgb, width, height):
 
 def snapshot_rgb(frame, width, height, *, protocol=PROTOCOL):
     """Decode once: v1 matches source size; v2 keeps its native condition size."""
-    from PIL import Image
-
     if not isinstance(frame, dict) or set(frame) != {
         "format",
         "width",
@@ -90,7 +88,22 @@ def snapshot_rgb(frame, width, height, *, protocol=PROTOCOL):
         or rgb_digest(raw) != frame["encoded_sha256"]
     ):
         raise ValueError("Initial frame integrity check failed")
-    if len(raw) < 33 or raw[:8] != b"\x89PNG\r\n\x1a\n" or raw[24] != 8:
+    rgb = decode_snapshot_png(raw, width, height)
+    if rgb_digest(rgb) != frame["rgb_sha256"]:
+        raise ValueError("Initial frame integrity check failed")
+    return rgb
+
+
+def decode_snapshot_png(raw, width, height):
+    """Decode the same native-size, opaque RGB condition for trusted PNG sources."""
+    from PIL import Image
+
+    validate_snapshot_dimensions(width, height)
+    if (
+        not 33 <= len(raw) <= MAX_SNAPSHOT_BYTES
+        or raw[:8] != b"\x89PNG\r\n\x1a\n"
+        or raw[24] != 8
+    ):
         raise ValueError("Initial frame must be an eight-bit PNG")
     if raw[12:16] != b"IHDR" or (
         int.from_bytes(raw[16:20], "big"),
@@ -108,10 +121,7 @@ def snapshot_rgb(frame, width, height, *, protocol=PROTOCOL):
             raise ValueError("Unsupported initial frame format")
         if image.mode == "RGBA" and image.getchannel("A").getextrema() != (255, 255):
             raise ValueError("Initial frame must be opaque")
-        rgb = image.convert("RGB").tobytes()
-    if rgb_digest(rgb) != frame["rgb_sha256"]:
-        raise ValueError("Initial frame integrity check failed")
-    return rgb
+        return image.convert("RGB").tobytes()
 
 
 def condition_fingerprint(

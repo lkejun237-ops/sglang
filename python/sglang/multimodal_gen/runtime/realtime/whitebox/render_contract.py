@@ -49,6 +49,7 @@ MESSAGES = {
     "PLAYER_EXPIRED": "Your play session has reached its time limit.",
     "BINDING_BUDGET_EXHAUSTED": "Your play session has reached its time limit.",
     "MODEL_CONTEXT_SUBSCRIPTION_PAUSE_UNSUPPORTED": "This world cannot safely pause model inference. Please use an updated world version.",
+    "PREFILL_FAILED": "The rendering service could not prepare the next scene.",
     "PREFILL_BUSY": "Please wait for the current rendering operation to finish.",
     "ARCHIVE_CAPACITY_UNAVAILABLE": "Recording is temporarily unavailable. Please try again shortly.",
     "AREA_PRESENTATION_STALE": "The visible area has changed. Please refresh its status.",

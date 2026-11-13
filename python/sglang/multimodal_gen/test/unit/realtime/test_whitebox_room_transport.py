@@ -663,3 +663,174 @@ def test_member_session_selects_private_model_purpose_without_public_leak(
             await server.wait_closed()
 
     asyncio.run(run())
+
+
+def test_scene_entry_accepts_only_the_armed_native_generation(monkeypatch):
+    import base64
+    import hashlib
+    import io
+
+    import httpx
+    from PIL import Image
+
+    async def run():
+        view = view_for("http://127.0.0.1:1", private=False)
+        view.config = {"mediaGeneration": 3, "config": {}}
+        view.credited_generation = 3
+        calls = []
+        target = {"sceneId": "yard", "entryId": "start"}
+        rgb = bytes([1, 2, 3]) * 6
+        stream = io.BytesIO()
+        Image.frombytes("RGB", (3, 2), rgb).save(stream, format="PNG")
+        png = stream.getvalue()
+        digest = hashlib.sha256(png).hexdigest()
+        config_hash = "b" * 64
+        game_build = "c" * 64
+        view.descriptor["modelContext"] = dict(
+            configHash=config_hash, gameBuildHash=game_build
+        )
+        reference = dict(
+            alias="tree",
+            picture=1,
+            format="png",
+            sha256=digest,
+            resource=dict(
+                sessionId=view.descriptor["sessionId"],
+                epoch=view.descriptor["epoch"],
+                gameBuildHash=game_build,
+                configHash=config_hash,
+                compilerVersion=1,
+                resource="tree",
+                sha256=digest,
+            ),
+        )
+        condition = dict(
+            eventId="forest-arrival",
+            configHash=config_hash,
+            contentHash="d" * 64,
+            prompt="A forest <Picture 1>.",
+            references=[reference],
+        )
+        snapshot = dict(
+            state="snapshot",
+            target=target,
+            entryDefinitionHash="a" * 64,
+            image=dict(width=3, height=2, byteLength=len(png), sha256=digest),
+            png=base64.b64encode(png).decode(),
+            condition=condition,
+        )
+
+        async def grant(frames):
+            calls.append(("credit", frames))
+
+        async def request(value):
+            assert value.url.path == "/v1/sessions/alice/scene-entry"
+            assert value.headers["Authorization"] == "Bearer " + "a" * 48
+            command = json.loads(value.content)
+            calls.append(("request", command["action"]))
+            if command["action"] == "hold":
+                assert view.capture_wait.request_id == "entry"
+                return httpx.Response(200, json={"state": "held"})
+            if command["action"] == "prepare":
+                return httpx.Response(200, json={"state": "prepared"})
+            if command["action"] == "snapshot":
+                return httpx.Response(200, json=snapshot)
+            if command["action"] == "publish":
+                assert view.scene_entry_generation == 4
+                # The media configuration may reach the control socket before
+                # the CLI's HTTP response. A normal reset is not involved.
+                await view._reconfigure({"mediaGeneration": 4, "config": {}})
+                return httpx.Response(200, json={"state": "publishing"})
+            if command["action"] == "frame":
+                return httpx.Response(200, json={"state": "publishing", "frame": None})
+            return httpx.Response(200, json={"state": "active", "commitTick": 8})
+
+        async_client = httpx.AsyncClient
+        monkeypatch.setattr(
+            httpx,
+            "AsyncClient",
+            lambda **kwargs: async_client(
+                transport=httpx.MockTransport(request), **kwargs
+            ),
+        )
+        view.grant = grant
+
+        async def control(action, **kwargs):
+            return await view.scene_entry_control(
+                {"action": action, "preparationId": "entry", **kwargs}
+            )
+
+        await control("hold", target=target)
+        assert view.capture_wait.confirmed
+        await control("prepare")
+        assert await control("snapshot") == dict(
+            state="snapshot",
+            target=target,
+            rgb=rgb,
+            rgb_sha256=hashlib.sha256(rgb).hexdigest(),
+            png=png,
+            encoded_sha256=digest,
+            width=3,
+            height=2,
+            entry_definition_sha256="a" * 64,
+            condition=condition,
+        )
+        reference["resource"]["epoch"] += 1
+        with pytest.raises(ValueError, match="SCENE_ENTRY_CONDITION_INVALID"):
+            await control("snapshot")
+        reference["resource"]["epoch"] -= 1
+        snapshot["image"]["sha256"] = "0" * 64
+        with pytest.raises(ValueError, match="SCENE_ENTRY_SNAPSHOT_MISMATCH"):
+            await control("snapshot")
+        with pytest.raises(ValueError, match="generation changed"):
+            await view._reconfigure({"mediaGeneration": 4, "config": {}})
+        assert view.capture_wait.confirmed
+        await control("publish")
+        assert view.scene_entry_media_ready.is_set()
+        assert view.retired_generation == 3
+        assert view.capture_wait.request_id is None
+        assert ("credit", 2) in calls
+        assert await control("frame") == {"state": "publishing", "frame": None}
+        presented = {"source": {"simulationTick": 7}}
+        assert await control("activate", presented=presented) == {
+            "state": "active",
+            "commitTick": 8,
+        }
+        assert await control("activate", presented=presented) == {
+            "state": "active",
+            "commitTick": 8,
+        }
+        assert calls.count(("request", "activate")) == 1
+        with pytest.raises(ValueError, match="generation changed"):
+            await view._reconfigure({"mediaGeneration": 5, "config": {}})
+
+    asyncio.run(run())
+
+
+def test_scene_entry_missing_cli_route_restores_normal_frame_wait(monkeypatch):
+    import httpx
+
+    async def run():
+        view = view_for("http://127.0.0.1:1", private=False)
+        view.config = {"mediaGeneration": 1, "config": {}}
+        client = httpx.AsyncClient
+        monkeypatch.setattr(
+            httpx,
+            "AsyncClient",
+            lambda **kwargs: client(
+                transport=httpx.MockTransport(lambda request: httpx.Response(404)),
+                **kwargs,
+            ),
+        )
+        with pytest.raises(httpx.HTTPStatusError):
+            await view.scene_entry_control(
+                {
+                    "action": "hold",
+                    "preparationId": "entry",
+                    "target": {"sceneId": "yard", "entryId": "start"},
+                }
+            )
+        assert view.scene_entry is None
+        assert view.capture_wait.request_id is None
+
+    asyncio.run(run())

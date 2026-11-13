@@ -1246,10 +1246,17 @@ def test_rtc_attachment_installs_presentation_resolvers_before_receiving_command
     def resolve_opening_offer(*_args):
         raise AssertionError("Attachment does not resolve an offer")
 
+    def verify_scene_model_frame(*_args):
+        raise AssertionError("Attachment does not verify a frame")
+
     sub = SimpleNamespace(
         closed=False,
+        generation=1,
         first_presentation_offers=None,
         resolve_first_presentation_offer=resolve_opening_offer,
+        scene_transition_supported=False,
+        scene_model_supported=False,
+        verify_scene_model_frame=verify_scene_model_frame,
     )
     monkeypatch.setattr(rtc_routes, "RTCSubscription", lambda *args: sub)
     pipeline.subscription = pipeline.create_subscription()
@@ -1258,8 +1265,17 @@ def test_rtc_attachment_installs_presentation_resolvers_before_receiving_command
     assert not pipeline.session.first_presented_player_ready()
     sub.first_presentation_offers = object()
     assert pipeline.session.first_presented_player_ready()
+    assert pipeline.session.resolve_scene_model_frame is verify_scene_model_frame
+    assert pipeline.session.scene_player_generation() is None
+    assert not pipeline.session.scene_model_player_ready()
+    sub.scene_transition_supported = True
+    assert pipeline.session.scene_player_generation() == 1
+    sub.scene_model_supported = True
+    assert pipeline.session.scene_model_player_ready()
     sub.closed = True
     assert not pipeline.session.first_presented_player_ready()
+    assert pipeline.session.scene_player_generation() is None
+    assert not pipeline.session.scene_model_player_ready()
 
 
 def test_rtc_media_carries_the_same_area_offer_as_reliable_history(monkeypatch):

@@ -6,6 +6,7 @@ from types import SimpleNamespace as NS
 import msgspec
 import pytest
 
+from sglang.multimodal_gen.runtime.realtime.whitebox.render_contract import RenderError
 from sglang.multimodal_gen.runtime.realtime.whitebox.rtc_transport import (
     RTCSubscription,
 )
@@ -52,6 +53,60 @@ def make_sub(*, model_cadence=False):
         host=NS(config=config),
     )
     return RTCSubscription(owner, 1, peer), peer, owner
+
+
+def test_scene_model_proof_requires_the_current_stream_and_attachment():
+    async def run():
+        sub, _, owner = make_sub()
+        owner.subscription = sub
+        owner.session.scene_transition = NS(active=True)
+        sub.scene_model_supported = True
+        frame = {"outputFrameId": 11}
+        try:
+            sub.native_event(
+                dict(
+                    type="frame.meta",
+                    track="model",
+                    rtp_timestamp=1,
+                    frame={**media("model", 0), "source": {"cli_frame_header": frame}},
+                )
+            )
+            sub.verify_scene_model_frame("model", frame)
+            owner.session.current_model_stream = "next"
+            with pytest.raises(RenderError) as error:
+                sub.verify_scene_model_frame("model", frame)
+            assert error.value.code == "MODEL_PRESENTATION_STALE"
+            sub.reset_model("next")
+            sub.native_event(
+                dict(
+                    type="frame.meta",
+                    track="model",
+                    rtp_timestamp=2,
+                    frame={**media("model", 1), "source": {"cli_frame_header": frame}},
+                )
+            )
+            assert not sub.scene_model_frames
+            sub.native_event(
+                dict(
+                    type="frame.meta",
+                    track="model",
+                    rtp_timestamp=3,
+                    frame={
+                        **media("model", 0, epoch="next"),
+                        "source": {"cli_frame_header": frame},
+                    },
+                )
+            )
+            sub.verify_scene_model_frame("next", frame)
+            owner.subscription = None
+            with pytest.raises(RenderError) as error:
+                sub.verify_scene_model_frame("next", frame)
+            assert error.value.code == "MODEL_PRESENTATION_STALE"
+        finally:
+            sub.stop("done")
+            await sub.wait_closed()
+
+    asyncio.run(run())
 
 
 def test_cadence_is_opt_in_attachment_local_and_model_only():

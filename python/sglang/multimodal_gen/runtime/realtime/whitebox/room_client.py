@@ -100,6 +100,9 @@ class RemoteEngine:
             "capture_control", dict(action=action, request_id=request_id)
         )
 
+    async def scene_entry_control(self, command):
+        return await self.rpc("scene_entry_control", command)
+
     async def area_status(self):
         return await self.rpc("area_status")
 

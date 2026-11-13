@@ -789,6 +789,10 @@ class RenderSegment(InteractiveSession):
             )
             if getattr(self.leases, "is_startup", False):
                 self.recording.manifest["startup"] = self.leases.receipt()
+                if scene_prefill := getattr(self.leases, "scene_prefill", None):
+                    self.recording.manifest["scene_prefill"] = copy.deepcopy(
+                        scene_prefill
+                    )
             failure_default, failure_stage = "ARCHIVE_FAILED", "archive"
             await self.recording.configure()
             if self.source_view.stopped.is_set():

@@ -92,9 +92,23 @@ def test_room_cache_receipts_reject_other_model_generations_and_remain_bounded()
         segment.segment_id = "seg"
         segment.segment_epoch = "segepoch"
         segment.assignment = NS(session_id="model", generation_id="generation")
-        segment.recording = NS(manifest={})
+        segment.recording = NS(
+            manifest={
+                "scene_prefill": {
+                    "transition_id": "cutscene",
+                    "request_id": "previous-prefill",
+                    "cache_key": "b" * 64,
+                }
+            }
+        )
         source.current_segment = segment
         source.current_model_stream = "segepoch"
+        observed = []
+
+        async def observe(transition_id, cache):
+            observed.append((transition_id, cache))
+
+        source.scene_transition = NS(record_generation_cache=observe)
         for version in range(1, 68):
             receipt = {
                 "key": "a" * 64,
@@ -115,6 +129,12 @@ def test_room_cache_receipts_reject_other_model_generations_and_remain_bounded()
                 sent["prompt_version"] == version
                 and sent["segment_epoch"] == "segepoch"
             )
+        scene_prefill = segment.recording.manifest["scene_prefill"]
+        assert scene_prefill["request_id"] == "previous-prefill"
+        assert scene_prefill["cache_key"] == "b" * 64
+        assert scene_prefill["generation_cache"]["cache_key"] == "a" * 64
+        assert scene_prefill["generation_cache"]["prompt_version"] == 1
+        assert observed == [("cutscene", scene_prefill["generation_cache"])]
         assert len(segment.recording.manifest["model_cache_receipts"]) == 64
         assert (
             segment.recording.manifest["model_cache_receipts"][0]["prompt_version"] == 4

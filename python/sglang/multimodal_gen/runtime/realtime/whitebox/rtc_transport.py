@@ -168,6 +168,9 @@ class RTCSubscription:
         self.owner, self.generation, self.peer = owner, generation, peer
         self.area_challenge = new_id()
         self.first_presentation_offers = None
+        self.scene_transition_supported = False
+        self.scene_model_supported = False
+        self.scene_model_frames = deque(maxlen=256)
         self.closed = False
         self.reason = "DISCONNECTED"
         self.wake = asyncio.Event()
@@ -272,6 +275,7 @@ class RTCSubscription:
 
     def reset_model(self, stream_id):
         self.media["model"].clear("replaced")
+        self.scene_model_frames.clear()
         if self.model_clock is not None:
             self.model_clock = ModelPresentationClock()
         self.stream_ids["model"] = stream_id
@@ -305,6 +309,17 @@ class RTCSubscription:
             self.owner.session, command["offer_id"], command["ui_revision"], state=state
         )
 
+    def verify_scene_model_frame(self, stream_id, frame):
+        if (
+            self.closed
+            or self.owner.subscription is not self
+            or not self.scene_model_supported
+            or stream_id != self.stream_ids["model"]
+            or stream_id != self.owner.session.current_model_stream
+            or (stream_id, frame) not in self.scene_model_frames
+        ):
+            raise RenderError("MODEL_PRESENTATION_STALE", retryable=True)
+
     def native_event(self, message):
         if self.closed:
             return
@@ -320,6 +335,11 @@ class RTCSubscription:
             stream = message["track"]
             if frame.get("media_stream_id") != self.stream_ids[stream]:
                 return
+            if stream == "model" and self.scene_model_supported:
+                scene = getattr(self.owner.session, "scene_transition", None)
+                header = (frame.get("source") or {}).get("cli_frame_header")
+                if scene is not None and scene.active and header is not None:
+                    self.scene_model_frames.append((frame["media_stream_id"], header))
             if stream == "model" and self.first_presentation_offers is not None:
                 offer = self.first_presentation_offers.offer(self.owner.session, frame)
                 if offer is not None:

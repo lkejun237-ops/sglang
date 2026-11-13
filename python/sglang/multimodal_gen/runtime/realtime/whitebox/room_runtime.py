@@ -651,6 +651,36 @@ class RoomRuntime:
             raise ValueError("Capture preparation is unavailable")
         return await callback(action, request_id)
 
+    async def scene_entry_control(self, stream_id, command):
+        entry = self.player(stream_id)
+        room = self.rooms[entry["game_id"]]
+        callback = getattr(entry["engine"], "scene_entry_control", None)
+        if (
+            callback is None
+            or getattr(room["driver"], "max_players", 1) > 1
+            or "control_caller" in room
+        ):
+            raise ValueError("SCENE_ENTRY_SOURCE_UNAVAILABLE")
+        action, operation = command.get("action"), command.get("preparationId")
+        activity = entry["input_activity"]
+        if action == "hold":
+            if activity.waiting not in (None, operation) or self.input_idle_expired(
+                entry
+            ):
+                raise ValueError("SCENE_ENTRY_SOURCE_UNAVAILABLE")
+            activity.pause(operation)
+        try:
+            result = await callback(command)
+        except Exception:
+            if action == "hold":
+                activity.resume(operation, time.monotonic())
+            raise
+        if self.players.get(stream_id) is not entry:
+            raise ValueError("SCENE_ENTRY_SOURCE_CHANGED")
+        if action == "activate":
+            activity.resume(operation, time.monotonic())
+        return result
+
     async def area_status(self, stream_id):
         entry = self.player(stream_id)
         reader = getattr(entry["engine"], "area_status", None)
@@ -1276,6 +1306,8 @@ def create_app(runtime, token):
                     result = await runtime.capture_control(
                         stream_id, body.get("action"), body.get("request_id")
                     )
+                elif operation == "scene_entry_control":
+                    result = await runtime.scene_entry_control(stream_id, body)
                 elif operation == "area_status":
                     result = await runtime.area_status(stream_id)
                 elif operation == "startup_cancel":

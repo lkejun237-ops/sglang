@@ -59,6 +59,9 @@ class LocalRoomEngine:
         room = self.runtime.rooms[entry["game_id"]]
         return getattr(room["driver"], "max_players", 1) > 1 or "control_caller" in room
 
+    async def scene_entry_control(self, command):
+        return await self.runtime.scene_entry_control(self.stream_id, command)
+
     async def area_status(self):
         return await self.runtime.area_status(self.stream_id)
 

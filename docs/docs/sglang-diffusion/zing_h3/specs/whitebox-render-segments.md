@@ -1111,3 +1111,74 @@ Existing prefill/cache business observation remains independent of the Debug UI;
 detailed compiled prompts and reference-image reads remain opt-in diagnostics.
 Test-lane acceptance verifies ordinary non-inference playback; real model application
 requires a model-enabled environment and is not established by a whitebox-only run.
+
+### Scene entry source control
+
+The dedicated native single-player Room adapter can call the CLI owner endpoint
+`POST /v1/sessions/:id/scene-entry` through its original source credential.
+An entry holds the native capture timeout while the CLI has confirmed the hold.
+Publishing the prepared entry permits exactly the next native media generation
+with the same dimensions and format. The Room adapter retires the previous
+generation and renews the existing pixel credits. The original source session,
+source clock and transport remain in use. Activation checks the presented source
+frame and returns its fixed commit tick. Shared rooms and private viewer
+credentials are outside this source-control contract.
+
+This adapter is a prerequisite for cutscene playback. The Player/Room transition
+protocol, media lifecycle and bound model prefill are separate implementation
+steps.
+
+For a complete native single-player delivery with a verified video inventory,
+the Room exposes the optional `worldkit-scene-transition-v1` capability and
+`scene.transition.state` snapshots on its existing control channel. Commands
+bind the original source and the current control connection generation.
+Video playback receipts also bind the current attempt. A playback failure keeps
+the source held and allows another playback attempt. Publication waits for both
+preparation and confirmed playback completion. The Room activates the target
+only after a presentation receipt matches the replacement source generation
+and CLI frame evidence. The Room exposes the same state through `status.get`.
+
+Scene transitions compose after the existing startup, including managed
+startup preparation, and are mutually exclusive with inference configuration
+and ordinary source holds.
+
+### Scene cutscene compatibility
+
+Single-player RTC clients opt into `worldkit-scene-transition-v1` with
+`rtc.offer.scene_transition_protocol`. Only an opted-in attachment receives
+the Room's scene transition capability and state. The current state is included in
+`session.ready` before the Player enables input. Reattachment advances the
+playback attempt for an unfinished video and leaves the original deadline and
+scene preparation in place. The CLI forwards committed
+Harness occurrence identities from the original SDK source. The Room resolves
+the event through the sealed transition inventory and deduplicates the
+original occurrence ID. Debug requests and story occurrences share the scene
+transition state machine.
+
+The original CLI owner's `scene_entry_control(snapshot)` can retrieve the
+verified condition PNG after `prepare` and before `publish`. The CLI decodes
+native-size RGB and returns its digest and dimensions to the Room. Bound
+Prefill can consume these bytes through `source_frame_size` and completes
+only after the child is released. The live video timeline still begins at the
+CLI's first frame of the new generation.
+
+The experimental model path requires `WHITEBOX_SCENE_MODEL_TRANSITIONS=1`,
+a managed bound-compute session, a worker supporting v2 source preparation,
+and Player opt-in via `rtc.offer.scene_model_transition_protocol` with
+`worldkit-scene-model-transition-v1`. Room fences the old feed, confirms
+cleanup before bound Prefill, and publishes the new live source after video
+completion and Prefill readiness. The next generate child uses the same
+sealed condition and pins the exact new live frame. CLI commits the target
+gameplay condition while input remains held. Room requires that the committed
+condition match the prepared model input. It unlocks input after the current
+Player reports a visible frame mapped to the new model RTP stream.
+A worker operation failure can retry the same sealed Prefill request on the
+same parent only after that child reports cleanup, and within the original
+transition deadline. A memory-ready reply with a failed completion is a
+failed attempt. Unconfirmed cleanup blocks another child.
+
+The successor segment archive records `scene_prefill` with the transition ID,
+the original Prefill request ID, the sealed condition's RGB digest, and the
+Prefill cache key when reported. Its `generation_cache` is populated only by
+the successor's validated opening `model.cache` receipt. Compare the two keys
+and use the worker's actual cache result to establish a hit or miss.

@@ -27,6 +27,8 @@ from .render_contract import PROTOCOL, RenderError, source_create_matches
 from .render_host import RenderPipeline
 from .rooms import checked_id, new_id, require_internal_token
 from .rtc_transport import RTCSubscription
+from .scene_transition import MODEL_PROTOCOL as SCENE_MODEL_PROTOCOL
+from .scene_transition import PROTOCOL as SCENE_PROTOCOL
 
 RTC_RECONNECT_SETUP_SECONDS = 13.0
 
@@ -67,6 +69,23 @@ class RTCRenderPipeline(RenderPipeline):
             and not sub.closed
             and sub.first_presentation_offers is not None
         )
+        self.session.scene_player_generation = lambda: (
+            sub.generation
+            if self.subscription is sub
+            and not sub.closed
+            and sub.scene_transition_supported
+            else None
+        )
+
+        def scene_model_ready():
+            return (
+                self.subscription is sub
+                and not sub.closed
+                and sub.scene_model_supported
+            )
+
+        self.session.scene_model_player_ready = scene_model_ready
+        self.session.resolve_scene_model_frame = sub.verify_scene_model_frame
         return sub
 
     async def close(self, reason=None):
@@ -336,6 +355,8 @@ def install_rtc_routes(host, app, token, *, peer_factory=NativeRTC):
         prewarm_store = prewarm_observer = None
         plan_store = plan_observer = None
         first_presented_requested = False
+        scene_transition_requested = False
+        scene_model_requested = False
         prewarm_available = os.environ.get("WHITEBOX_MODEL_CONTEXT_PREWARM") == "1"
         debug_available = os.environ.get("WHITEBOX_PROMPT_DEBUG") == "1"
         signals = asyncio.Queue(maxsize=64)
@@ -466,6 +487,14 @@ def install_rtc_routes(host, app, token, *, peer_factory=NativeRTC):
                             if message.get("peer_id") != reservation:
                                 raise RenderError("SOURCE_EPOCH_MISMATCH")
                             if message.get("type") == "rtc.offer":
+                                scene_transition_requested = (
+                                    message.get("scene_transition_protocol")
+                                    == SCENE_PROTOCOL
+                                )
+                                scene_model_requested = scene_transition_requested and (
+                                    message.get("scene_model_transition_protocol")
+                                    == SCENE_MODEL_PROTOCOL
+                                )
                                 first_presented_requested = (
                                     message.get("model_context_first_presented")
                                     == FIRST_PRESENTED_PROTOCOL
@@ -500,6 +529,21 @@ def install_rtc_routes(host, app, token, *, peer_factory=NativeRTC):
                     await asyncio.gather(connected, return_exceptions=True)
                 peer._check()
                 await signals.join()
+            if (
+                previous_pipeline is not None
+                and getattr(previous_pipeline.session, "scene_transition", None)
+                is not None
+                and previous_pipeline.session.scene_transition.active
+                and (
+                    not scene_transition_requested
+                    or previous_pipeline.session.scene_transition.current.get(
+                        "model_phase"
+                    )
+                    is not None
+                    and not scene_model_requested
+                )
+            ):
+                raise RenderError("CAPABILITY_UNAVAILABLE")
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -517,6 +561,9 @@ def install_rtc_routes(host, app, token, *, peer_factory=NativeRTC):
             )
             if first_presented_available:
                 sub.enable_first_presentation()
+            if isinstance(sub, RTCSubscription):
+                sub.scene_transition_supported = scene_transition_requested
+                sub.scene_model_supported = scene_model_requested
             from .startup import model_transport_ready
 
             model_transport_ready(pipeline.session)
@@ -928,8 +975,31 @@ def install_rtc_routes(host, app, token, *, peer_factory=NativeRTC):
                     wire = await sub.recv()
                     message = msgspec.msgpack.decode(wire)
                     kind = message.get("type")
+                    if not scene_transition_requested:
+                        if kind == "scene.transition.state":
+                            continue
+                        capabilities = message.get("capabilities")
+                        if (
+                            "scene_transition" in message
+                            or isinstance(capabilities, dict)
+                            and "scene_transition_protocol" in capabilities
+                        ):
+                            message.pop("scene_transition", None)
+                            if isinstance(capabilities, dict):
+                                capabilities.pop("scene_transition_protocol", None)
+                            wire = msgspec.msgpack.encode(message)
                     if kind in {"session.attached", "session.ready", "source.status"}:
                         extras = {}
+                        if kind == "session.ready" and scene_transition_requested:
+                            scene = getattr(pipeline.session, "scene_transition", None)
+                            if scene is not None:
+                                await scene.attach(sub.generation)
+                                if sub is not pipeline.subscription or sub.closed:
+                                    return
+                                extras.update(
+                                    source_session_id=pipeline.session_id,
+                                    scene_transition=scene.snapshot(),
+                                )
                         if first_presented_available and kind != "source.status":
                             extras["model_context_first_presented"] = (
                                 FIRST_PRESENTED_PROTOCOL

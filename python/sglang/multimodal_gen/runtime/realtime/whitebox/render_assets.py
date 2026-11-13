@@ -74,6 +74,13 @@ class SourceFrames:
         self.frames.clear()
         self.bytes = 0
 
+    def scene_frame(self, header):
+        """Find the exact CLI frame acknowledged by scene publication."""
+        for version, frame, captured, _ in self.frames:
+            if (frame.provenance or {}).get("cli_frame_header") == header:
+                return version, (frame, captured)
+        return None
+
 
 class SourceAssets:
     def __init__(

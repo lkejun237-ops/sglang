@@ -5,6 +5,7 @@ import asyncio
 import copy
 import logging
 import os
+import re
 from types import SimpleNamespace
 from typing import NamedTuple
 from uuid import uuid4
@@ -280,6 +281,250 @@ class SourceInference:
         if channel is not None:
             # Fence synchronously, before any socket, journal or cleanup await.
             channel.suspended = True
+
+    async def fence_scene(self):
+        segment = self.source.current_segment
+        self.fence()
+        if segment is not None:
+            # A selected frame may already be awaiting archive or wire I/O
+            # inside this lock. Wait for that send before allowing video.
+            async with segment.source_send_lock:
+                pass
+
+    async def prepare_scene(self, snapshot):
+        """Retire the current generate child and freeze the successor inputs."""
+        source = self.source
+        condition = snapshot.get("condition")
+        binding = source.model_binding
+        if (
+            not self.manual
+            or not condition
+            or binding is None
+            or binding.closed
+            or getattr(binding.assignment, "player_expires_at", None) is None
+            or source.source_conditions is None
+        ):
+            raise RenderError("CAPABILITY_UNAVAILABLE")
+
+        def current():
+            return (
+                not source.binding_ended
+                and not source.close_requested
+                and source.model_binding is binding
+                and not binding.closed
+            )
+
+        async with self.lock:
+            state = await source.journal.read()
+            if not current() or state["inference"]["state"] != "enabled":
+                raise RenderError("RENDER_TRANSITION_IN_PROGRESS")
+            operation = await source.journal.configure_inference(
+                dict(
+                    type="command",
+                    version=2,
+                    op="model.inference.configure",
+                    request_id=uuid4().hex,
+                    source_session_id=source.session_id,
+                    source_epoch=source.source_epoch,
+                    enabled=False,
+                    expected_inference_revision=state["inference"]["revision"],
+                )
+            )
+            request, revision = (
+                operation["request_id"],
+                operation["inference"]["revision"],
+            )
+            try:
+                # The cutscene already fenced capture and source feed. Pending
+                # work settles via the original segment retirement path.
+                await self.disable()
+            except Exception:
+                await source.journal.settle_inference(
+                    request, revision, state="failed", code="RELEASE_UNKNOWN"
+                )
+                raise
+            await source.journal.settle_inference(request, revision, state="disabled")
+            if not current():
+                raise RenderError("RELEASE_UNKNOWN")
+
+        adapter = source.source_conditions
+        refs = await adapter.prepare_references(condition, adapter.capabilities())
+        validated = segment_parameters(
+            dict(prompt=condition["prompt"], seed=source.context_seed, references=refs)
+        )
+        references = await source.assets.resolve(validated["references"])
+        parameters = {key: validated[key] for key in ("prompt", "seed")}
+        return dict(
+            snapshot=snapshot,
+            parameters=parameters,
+            references=references,
+            binding=binding,
+        )
+
+    async def prefill_scene(self, model_input, deadline, *, observe):
+        source = self.source
+        binding = model_input["binding"]
+
+        def current():
+            return (
+                not source.binding_ended
+                and not source.close_requested
+                and source.model_binding is binding
+                and not binding.closed
+            )
+
+        if not current() or binding.child is not None:
+            raise RenderError("RELEASE_UNKNOWN")
+        try:
+            return await source.control_prefill.prepare_scene(
+                model_input["parameters"],
+                model_input["references"],
+                model_input["snapshot"],
+                current=current,
+                observe=observe,
+                deadline=deadline,
+            )
+        except RenderError as error:
+            if error.code == "PREFILL_FAILED" and (
+                not current() or binding.child is not None
+            ):
+                raise RenderError("RELEASE_UNKNOWN") from error
+            raise
+
+    async def prepare_scene_generate(
+        self, model_input, frame, deadline, *, transition_id
+    ):
+        """Open a successor on the same parent with independent S0 and F0."""
+        from ..source_prepare import V2_PROTOCOL, rgb_digest
+        from .startup import PlayStartup
+
+        source = self.source
+        binding = source.model_binding
+        if (
+            binding is not model_input["binding"]
+            or binding.closed
+            or binding.child is not None
+        ):
+            raise RenderError("RELEASE_UNKNOWN")
+        if self.preparation is not None:
+            raise RenderError("RENDER_TRANSITION_IN_PROGRESS")
+        snapshot = model_input["snapshot"]
+        references = model_input["references"]
+        request = dict(
+            protocol=V2_PROTOCOL,
+            request_id=uuid4().hex,
+            intent="model",
+            initial_render=dict(
+                **model_input["parameters"],
+                references=[
+                    dict(
+                        **ref,
+                        encoded_size=len(ref["payload"]),
+                        encoded_sha256=rgb_digest(ref["payload"]),
+                    )
+                    for ref in references
+                ],
+            ),
+            initial_frame=dict(
+                format="png",
+                width=snapshot["width"],
+                height=snapshot["height"],
+                payload=snapshot["png"],
+                encoded_size=len(snapshot["png"]),
+                encoded_sha256=snapshot["encoded_sha256"],
+                rgb_sha256=snapshot["rgb_sha256"],
+            ),
+        )
+        candidate = PlayStartup(source, request)
+        candidate.require_matching_condition = True
+        cache = model_input["cache"]
+        candidate.scene_prefill = dict(
+            transition_id=transition_id,
+            request_id=cache["request_id"],
+            condition_rgb_sha256=snapshot["rgb_sha256"],
+        )
+        cache_key = cache.get("cache_key")
+        if isinstance(cache_key, str) and re.fullmatch(r"[a-f0-9]{64}", cache_key):
+            candidate.scene_prefill["cache_key"] = cache_key
+        candidate.deadline = min(deadline, candidate.deadline)
+        # A newer CLI frame cannot substitute for the publish receipt.
+        cursor = -1
+        async with asyncio.timeout_at(candidate.deadline):
+            while (first := source.retained.scene_frame(frame)) is None:
+                observed = await source.latest.get(cursor)
+                if observed is None:
+                    raise RenderError("SOURCE_EPOCH_MISMATCH")
+                cursor, (observed_frame, _) = observed
+                header = (observed_frame.provenance or {}).get("cli_frame_header", {})
+                if header.get("outputFrameId", -1) > frame["outputFrameId"]:
+                    first = source.retained.scene_frame(frame)
+                    if first is None:
+                        raise RenderError("SOURCE_EPOCH_MISMATCH")
+                    break
+        if (
+            source.model_binding is not binding
+            or binding.closed
+            or source.close_requested
+        ):
+            raise RenderError("INVALID_SOURCE")
+        candidate.observe_source(first[0], *first[1])
+        self.preparation = candidate
+        try:
+            candidate.launch(source.upstream.init)
+            await candidate.bind_cli(candidate.cli_rgb, candidate.cli_proof)
+        except BaseException:
+            await self.discard_preparation()
+            raise
+        return candidate
+
+    async def start_scene_generate(self, candidate):
+        source = self.source
+        if self.preparation is not candidate or candidate.closed:
+            raise RenderError("MODEL_UNAVAILABLE")
+        async with self.lock:
+            state = await source.journal.read()
+            operation = await source.journal.configure_inference(
+                dict(
+                    type="command",
+                    version=2,
+                    op="model.inference.configure",
+                    request_id=uuid4().hex,
+                    source_session_id=source.session_id,
+                    source_epoch=source.source_epoch,
+                    enabled=True,
+                    expected_inference_revision=state["inference"]["revision"],
+                )
+            )
+            request_id = operation["request_id"]
+            revision = operation["inference"]["revision"]
+            try:
+                await self.enable(operation)
+                segment = source.current_segment
+                if (
+                    not self.current(revision)
+                    or segment is None
+                    or segment.leases is not candidate
+                ):
+                    raise RenderError("MODEL_UNAVAILABLE")
+                while not segment.first_decodable:
+                    if segment.closed_event.is_set():
+                        raise RenderError(segment.failure_code or "MODEL_UNAVAILABLE")
+                    await asyncio.sleep(0.01)
+            except BaseException as error:
+                code = public_error(
+                    error, source.trace_id, default="MODEL_UNAVAILABLE"
+                )["code"]
+                try:
+                    await self.disable(expected_revision=revision)
+                except Exception:
+                    code = "RELEASE_UNKNOWN"
+                await source.journal.settle_inference(
+                    request_id, revision, state="failed", code=code
+                )
+                raise
+            await source.journal.settle_inference(request_id, revision, state="enabled")
+            await source.status_snapshot()
+            return segment.segment_epoch
 
     def dispatch(self, operation):
         self.cancel_recovery()
@@ -660,6 +905,7 @@ class SourceInference:
             or source.control_prefill is None
             or source.model_binding is None
             or getattr(source, "member_prefill", None) is not None
+            or getattr(self.preparation, "require_matching_condition", False)
         ):
             return
         from .startup_prewarm import StartupPrewarm

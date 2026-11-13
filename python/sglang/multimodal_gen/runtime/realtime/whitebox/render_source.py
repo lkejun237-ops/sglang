@@ -10,6 +10,7 @@ import logging
 import os
 import time
 from dataclasses import replace
+from types import SimpleNamespace
 from uuid import uuid4
 
 import msgspec
@@ -35,6 +36,9 @@ from .render_contract import (
     segment_parameters,
 )
 from .render_segment import RenderSegment
+from .scene_transition import COMMANDS as SCENE_COMMANDS
+from .scene_transition import PROTOCOL as SCENE_PROTOCOL
+from .scene_transition import SceneTransition
 
 
 def configured_render_play_seconds():
@@ -59,9 +63,10 @@ class SourceLatest(LatestFrame):
             )
             if (native.get("presentationId"), native.get("sdkEpoch")) != expected:
                 return
+        provenance = dict(frame.provenance or {})
+        provenance.pop("scene_occurrences", None)
         frame = replace(
-            frame,
-            provenance={**(frame.provenance or {}), **self.owner.source_identity()},
+            frame, provenance={**provenance, **self.owner.source_identity()}
         )
         self.owner.retained.append(self.version + 1, frame, captured)
         prefill = getattr(self.owner, "control_prefill", None)
@@ -83,6 +88,20 @@ class SourceSession(InteractiveSession):
     player_finish_task = _source_close_task = None
     first_presented_required = False
     first_presented_player_ready = None
+    scene_player_generation = None
+    scene_model_player_ready = None
+    resolve_scene_model_frame = None
+    scene_exclusive_operations = SCENE_COMMANDS | {
+        "model.inference.configure",
+        "source.pause",
+        "source.resume",
+        "render.prepare",
+        "render.start",
+        "render.replace",
+        "render.context.start",
+        "display.configure",
+        "model.context.intervention",
+    }
 
     def __init__(self, host, journal, *, source_epoch, **kwargs):
         self.host, self.journal, self.source_epoch = host, journal, source_epoch
@@ -104,6 +123,8 @@ class SourceSession(InteractiveSession):
         self.control_tokens = 4.0
         self.control_token_time = time.monotonic()
         self.area_state = None
+        self.scene_transition = None
+        self.scene_admission = asyncio.Lock()
         self.resolve_area_offer = None
         self.resolve_first_presentation_offer = None
         self.protocol = PROTOCOL
@@ -418,6 +439,28 @@ class SourceSession(InteractiveSession):
                 source_state="ready", source_identity=self.source_identity()
             )
         )
+        scene_inventory = getattr(self.engine, "metadata", {}).get("scene_transitions")
+        scene_source = getattr(self.engine, "scene_entry_control", None)
+        if (
+            scene_inventory is not None
+            and scene_source is not None
+            and not getattr(self.engine, "shared_world", False)
+        ):
+            self.scene_transition = SceneTransition(
+                scene_inventory,
+                scene_source,
+                self.emit_scene_transition,
+                lambda: self.player_remaining_seconds,
+                model_lifecycle=SimpleNamespace(
+                    fence=self.inference.fence_scene,
+                    prepare=self.inference.prepare_scene,
+                    prefill=self.inference.prefill_scene,
+                    generate=self.inference.prepare_scene_generate,
+                    start=self.inference.start_scene_generate,
+                    discard=self.inference.discard_preparation,
+                ),
+                verify_model_frame=self.verify_scene_model_frame,
+            )
         model_startup = (
             self.startup is not None or self.context_startup_request_id is not None
         )
@@ -475,6 +518,11 @@ class SourceSession(InteractiveSession):
                 protocol=PROTOCOL,
                 render_segments=True,
                 source_pause=self.source_pause.supported,
+                **(
+                    {"scene_transition_protocol": SCENE_PROTOCOL}
+                    if self.scene_transition is not None
+                    else {}
+                ),
                 model_inference_control=self.inference.manual
                 and self.member_prefill is None,
                 model_context_instruction=self.inference.manual
@@ -1010,11 +1058,18 @@ class SourceSession(InteractiveSession):
         window = getattr(getattr(self, "inference", None), "prewarm", None)
         startup_check = {}
         first = None
-        if getattr(
-            getattr(self, "inference", None), "preparation", None
-        ) is not None and await self.inference.prepared_for(
-            condition["prompt"], getattr(self, "context_seed", 42), resolved, world=True
-        ):
+        candidate = getattr(getattr(self, "inference", None), "preparation", None)
+        if candidate is not None:
+            matched = await self.inference.prepared_for(
+                condition["prompt"],
+                getattr(self, "context_seed", 42),
+                resolved,
+                world=True,
+            )
+            if not matched and getattr(candidate, "require_matching_condition", False):
+                self.inference.preparation_failure = RenderError("CONDITION_INVALID")
+                raise self.inference.preparation_failure
+        if candidate is not None and matched:
             from .source_conditions import source_reached
 
             version = -1
@@ -1094,8 +1149,33 @@ class SourceSession(InteractiveSession):
         await self.finished.wait()
 
     async def source_state(self, state):
+        provenance = dict(state.get("source") or {})
+        occurrences = provenance.pop("scene_occurrences", ())
+        if occurrences:
+            scene = self.scene_transition
+            generation = (
+                self.scene_player_generation() if self.scene_player_generation else None
+            )
+            if scene is not None and generation is not None:
+                async with self.scene_admission:
+                    journal = await self.journal.read()
+                    if (
+                        generation == self.scene_player_generation()
+                        and self.can_start_scene(journal)
+                    ):
+                        await scene.attach(generation)
+                        for occurrence in occurrences:
+                            try:
+                                await scene.trigger(
+                                    occurrence,
+                                    model=journal["inference"]["state"] == "enabled",
+                                )
+                            except RenderError as error:
+                                logging.getLogger(__name__).info(
+                                    "Scene occurrence declined: %s", error.code
+                                )
         state = dict(state, **self.source_identity())
-        state["source"] = {**(state.get("source") or {}), **self.source_identity()}
+        state["source"] = {**provenance, **self.source_identity()}
         await super().source_state(state)
 
     async def _media(
@@ -1314,7 +1394,70 @@ class SourceSession(InteractiveSession):
                 msgspec.msgpack.encode(error.message(message.get("request_id")))
             )
 
+    async def emit_scene_transition(self, state):
+        await self.outgoing.put(
+            msgspec.msgpack.encode(
+                dict(
+                    version=2,
+                    type="scene.transition.state",
+                    **self.source_identity(),
+                    connection_generation=self.scene_transition.generation,
+                    scene_transition=state,
+                )
+            )
+        )
+
+    def can_start_scene(self, state):
+        inference_state = (state.get("inference") or {}).get("state")
+        return (
+            not self.binding_ended
+            and not self.close_requested
+            and (
+                inference_state == "disabled"
+                and (
+                    self.current_segment is None
+                    or self.current_segment.closed_event.is_set()
+                )
+                or inference_state == "enabled"
+                and self.can_start_model_scene()
+            )
+            and not self.source_pause.active
+            and (self.control_prefill is None or self.control_prefill.resumed)
+            and (
+                self.control_prefill is None
+                or self.control_prefill.active is None
+                or self.control_prefill.active.done()
+            )
+        )
+
+    def can_start_model_scene(self):
+        binding = self.model_binding
+        return (
+            os.environ.get("WHITEBOX_SCENE_MODEL_TRANSITIONS") == "1"
+            and self.inference.manual
+            and self.source_conditions is not None
+            and binding is not None
+            and not binding.closed
+            and getattr(binding.assignment, "player_expires_at", None) is not None
+            and self.scene_model_player_ready is not None
+            and self.scene_model_player_ready()
+        )
+
+    def verify_scene_model_frame(self, stream_id, frame):
+        if self.resolve_scene_model_frame is None:
+            raise RenderError("CAPABILITY_UNAVAILABLE")
+        self.resolve_scene_model_frame(stream_id, frame)
+
     async def command(self, command):
+        if (
+            getattr(self, "scene_transition", None) is not None
+            and command.get("op") in self.scene_exclusive_operations
+        ):
+            async with self.scene_admission:
+                return await self._command(command)
+        return await self._command(command)
+
+    async def _command(self, command):
         request_id = command.get("request_id")
         try:
             if (
@@ -1351,6 +1494,39 @@ class SourceSession(InteractiveSession):
                 raise RenderError("INVALID_COMMAND")
             state = await self.journal.read()
             self.journal.validate_scope(state, command)
+            op = command.get("op")
+            scene = getattr(self, "scene_transition", None)
+            if op in SCENE_COMMANDS:
+                if (
+                    scene is None
+                    or self.binding_ended
+                    or self.close_requested
+                    or self.scene_player_generation is None
+                    or self.scene_player_generation()
+                    != getattr(self, "control_generation", None)
+                ):
+                    raise RenderError("CAPABILITY_UNAVAILABLE")
+                generation = getattr(self, "control_generation", None)
+                if (
+                    generation is None
+                    or command.get("connection_generation") != generation
+                ):
+                    raise RenderError("INVALID_COMMAND")
+                if op == "scene.transition.request" and not self.can_start_scene(state):
+                    raise RenderError("RENDER_TRANSITION_IN_PROGRESS")
+                await scene.attach(generation)
+                await scene.command(
+                    command,
+                    model=op == "scene.transition.request"
+                    and state["inference"]["state"] == "enabled",
+                )
+                return
+            if (
+                scene is not None
+                and scene.active
+                and op in self.scene_exclusive_operations
+            ):
+                raise RenderError("RENDER_TRANSITION_IN_PROGRESS")
             if command.get("op") in {
                 "model.context.intervention",
                 "model.context.intervention.get",
@@ -2057,6 +2233,9 @@ class SourceSession(InteractiveSession):
                 }
             }
 
+        scene = getattr(self, "scene_transition", None)
+        if scene is not None:
+            await scene.attach(getattr(self, "control_generation", None))
         operation = state["operations"].get(operation_request_id)
         if (
             operation is not None
@@ -2074,6 +2253,11 @@ class SourceSession(InteractiveSession):
                     operation_request_id=operation_request_id,
                     connection_generation=getattr(self, "control_generation", None),
                     **self.source_identity(),
+                    **(
+                        {"scene_transition": scene.snapshot()}
+                        if scene is not None
+                        else {}
+                    ),
                     source_state=self.source_state_value,
                     source_pause=(
                         self.source_pause.snapshot()
@@ -2425,7 +2609,16 @@ class SourceSession(InteractiveSession):
         )
         # Persist bounded per-version evidence with the segment, as well as
         # sending the receipt over the existing reliable control connection.
-        receipts = segment.recording.manifest.setdefault("model_cache_receipts", [])
+        manifest = segment.recording.manifest
+        scene_prefill = manifest.get("scene_prefill")
+        if scene_prefill is not None and cache["prompt_version"] == 1:
+            # Only the successor's opening condition consumed this preparation.
+            scene_prefill.setdefault("generation_cache", copy.deepcopy(cache))
+            if scene := getattr(self, "scene_transition", None):
+                await scene.record_generation_cache(
+                    scene_prefill["transition_id"], cache
+                )
+        receipts = manifest.setdefault("model_cache_receipts", [])
         if not any(r["prompt_version"] == cache["prompt_version"] for r in receipts):
             receipts.append(copy.deepcopy(cache))
             del receipts[:-64]
@@ -2824,6 +3017,9 @@ class SourceSession(InteractiveSession):
                 sdk = asyncio.create_task(self._sdk_cleanup_for(assignment))
         failures = []
         try:
+            scene = getattr(self, "scene_transition", None)
+            if scene is not None:
+                await scene.close()
             pause = getattr(self, "source_pause", None)
             if pause is not None:
                 try:

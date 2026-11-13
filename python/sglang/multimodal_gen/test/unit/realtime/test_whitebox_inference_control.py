@@ -33,6 +33,41 @@ async def ordinary_query_source():
     return journal, scope
 
 
+def test_scene_fence_waits_for_in_flight_source_send():
+    from sglang.multimodal_gen.runtime.realtime.whitebox.inference_control import (
+        SourceInference,
+    )
+
+    async def run():
+        lock = asyncio.Lock()
+        stopped = asyncio.Event()
+        segment = SimpleNamespace(
+            source_send_lock=lock,
+            source_view=SimpleNamespace(stop=stopped.set),
+            publishing=True,
+        )
+        channel = SimpleNamespace(suspended=False)
+        source = SimpleNamespace(
+            current_segment=segment,
+            current_model_stream="old",
+            display_mode="model",
+            journal=SimpleNamespace(snapshot={}),
+            context_channel=channel,
+        )
+        inference = SourceInference.__new__(SourceInference)
+        inference.source, inference.prewarm = source, None
+
+        async with lock:
+            fence = asyncio.create_task(inference.fence_scene())
+            await asyncio.wait_for(stopped.wait(), 1)
+            assert not fence.done()
+            assert not segment.publishing and channel.suspended
+            assert source.current_model_stream is None
+        await asyncio.wait_for(fence, 1)
+
+    asyncio.run(run())
+
+
 def test_ordinary_query_composes_and_clears_through_original_prompt_queue():
     async def run():
         journal, scope = await ordinary_query_source()

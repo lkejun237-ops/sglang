@@ -3,6 +3,7 @@
 
 import asyncio
 import hashlib
+import inspect
 import time
 from uuid import uuid4
 
@@ -351,7 +352,9 @@ class ControlPrefill:
                 request["receipt"], observed_epoch_ms=time.time() * 1000
             )
         if "startup_observer" in request:
-            request["startup_observer"](public)
+            observed = request["startup_observer"](public)
+            if inspect.isawaitable(observed):
+                await observed
         else:
             await self.owner.outgoing.put(msgspec.msgpack.encode(public))
         if (
@@ -369,12 +372,50 @@ class ControlPrefill:
 
     async def start_startup(self, value, refs, first, *, current, observe):
         """Borrow one child for a trusted startup window on its pinned capture."""
+        return await self._start_trusted(
+            value, refs, first, current=current, observe=observe
+        )
+
+    async def prepare_scene(
+        self, parameters, references, snapshot, *, current, observe, deadline
+    ):
+        """Prefill on the existing parent using the CLI's verified condition PNG."""
+        work = await self._start_trusted(
+            parameters,
+            references,
+            None,
+            current=current,
+            observe=observe,
+            snapshot=snapshot,
+            deadline=deadline,
+        )
+        if work is None:
+            raise RenderError("INVALID_SOURCE")
+        result = await work
+        if self.failure is not None:
+            raise self.failure
+        if result is None:
+            raise RenderError("PREFILL_FAILED")
+        return result
+
+    async def _start_trusted(
+        self,
+        parameters,
+        references,
+        first,
+        *,
+        current,
+        observe,
+        snapshot=None,
+        deadline=None,
+    ):
         await self.available()
         inference = getattr(self.owner, "inference", None)
         if getattr(inference, "preparation", None) is not None:
             await inference.discard_preparation(report_failure=True)
-        parameters = segment_parameters(dict(value, references=refs))
-        references = await self.owner.assets.resolve(parameters["references"])
+        if snapshot is None:
+            parameters = segment_parameters(dict(parameters, references=references))
+            references = await self.owner.assets.resolve(parameters["references"])
         if not current():
             return None
         if (
@@ -393,7 +434,14 @@ class ControlPrefill:
 
         async def run():
             await self.receipt(dict(type="prefill.accepted", request_id=request_id))
-            await self._compute(request_id, parameters, references, first)
+            return await self._compute(
+                request_id,
+                parameters,
+                references,
+                first,
+                snapshot=snapshot,
+                deadline=deadline,
+            )
 
         self.active = asyncio.create_task(run())
         return self.active
@@ -487,12 +535,19 @@ class ControlPrefill:
             for key, value in self.requests.items()
         )
 
-    async def _compute(self, request_id, parameters, references, first):
+    async def _compute(
+        self, request_id, parameters, references, first, *, snapshot=None, deadline=None
+    ):
         child = None
         request = self.requests[request_id]
         startup = "startup_observer" in request
 
         def remaining():
+            if deadline is not None:
+                seconds = deadline - time.monotonic()
+                if seconds <= 0:
+                    raise TimeoutError("Scene prefill deadline exceeded")
+                return seconds
             return self.owner.config.startup_seconds if startup else self.remaining()
 
         try:
@@ -504,10 +559,18 @@ class ControlPrefill:
                 prompt=parameters["prompt"],
                 seed=parameters["seed"],
                 references=references,
-                source_frame=geometry.pad_rgb(first[1][0].rgb),
                 persist=True,
                 record_model_inputs=True,
             )
+            if snapshot is None:
+                init["source_frame"] = geometry.pad_rgb(first[1][0].rgb)
+            else:
+                init.update(
+                    source_frame=snapshot["rgb"],
+                    source_frame_size={
+                        key: snapshot[key] for key in ("width", "height")
+                    },
+                )
             await self.receipt(dict(type="prefill.computing", request_id=request_id))
             for attempt in range(3):
                 remaining()
@@ -536,9 +599,9 @@ class ControlPrefill:
                             await ws.send(msgspec.msgpack.encode(init))
                             # One accepted-input receipt may precede the result.
                             # Use a single deadline; receipts cannot extend compute time.
-                            deadline = time.monotonic() + remaining()
+                            reply_deadline = time.monotonic() + remaining()
                             while True:
-                                timeout = deadline - time.monotonic()
+                                timeout = reply_deadline - time.monotonic()
                                 if timeout <= 0:
                                     raise asyncio.TimeoutError()
                                 message = msgspec.msgpack.decode(
@@ -560,31 +623,35 @@ class ControlPrefill:
                         await asyncio.wait_for(child.completed.wait(), timeout)
                         if child.resource_state != "released":
                             raise RenderError("RELEASE_UNKNOWN")
+                        if getattr(child, "failure", None):
+                            raise RenderError(child.failure)
                     if not startup:
                         self.resolve(request["context_id"])
                     await self.receipt(message)
-                    return
+                    return request["receipt"]
                 except RenderError as error:
-                    # Native async writeback can still hold CPU fill buffers
-                    # after memory_ready. Retry only a failed, verified-clean
-                    # child while earlier writes are pending, never uncertain
-                    # cleanup or an input/protocol rejection. No model output
-                    # was emitted; the original request and pinned F0 stay fixed.
+                    # Retry only an explicitly cleaned worker failure. Scene
+                    # Prefill can retry the sealed input within its original
+                    # deadline, including the first transition in a session.
                     if (
-                        startup
-                        or attempt == 2
-                        # Internal worker failures are sanitized to RENDER_FAILED.
+                        attempt == 2
                         or error.code != "RENDER_FAILED"
                         or child.resource_state != "released"
                         or getattr(child, "failure", None) != "MODEL_OPERATION_FAILED"
-                        or not self._pending_persistence(request_id)
                         or self.closed
+                        or (
+                            snapshot is None
+                            and (startup or not self._pending_persistence(request_id))
+                        )
                     ):
+                        raise
+                    backoff = 0.5 * (attempt + 1)
+                    if deadline is not None and remaining() <= backoff:
                         raise
                     await self.receipt(
                         dict(type="prefill.retrying", request_id=request_id)
                     )
-                    await asyncio.sleep(0.5 * (attempt + 1))
+                    await asyncio.sleep(backoff)
         except asyncio.CancelledError:
             if child is not None and child.resource_state not in {"none", "released"}:
                 self.failure = RenderError("RELEASE_UNKNOWN")

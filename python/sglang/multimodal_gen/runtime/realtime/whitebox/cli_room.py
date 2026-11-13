@@ -413,6 +413,12 @@ def validate_descriptor(value, spec, *, fps=None):
         from .source_conditions import validate_capability
 
         validate_capability(value["modelContext"])
+    if "sceneTransitions" in value:
+        from .scene_transition import read_scene_transitions
+
+        if not native or value.get("accessMode") == "capability":
+            raise ValueError("Unsupported scene transition source")
+        read_scene_transitions(value["sceneTransitions"])
     return value
 
 
@@ -752,6 +758,7 @@ class CLIView:
         self.transport_lock = asyncio.Lock()
         self.source_debug_supported = False
         self.source_debug_condition = []
+        self.scene_occurrences = []
         self.model_context = None
         if self.descriptor.get("modelContext") is not None:
             if self.descriptor.get("media", {}).get("kind") != "pixels":
@@ -797,6 +804,11 @@ class CLIView:
             "world_build_hash": self.descriptor.get("worldBuildHash"),
             "ui_bundle_hash": self.descriptor.get("uiBundleHash"),
             "max_players": 1,
+            **(
+                {"scene_transitions": self.descriptor["sceneTransitions"]}
+                if "sceneTransitions" in self.descriptor
+                else {}
+            ),
             "source_codec": (
                 "rgb24"
                 if self.descriptor.get("media", {}).get("kind") == "pixels"
@@ -1006,6 +1018,8 @@ class CLIView:
                 query["token"] = self.descriptor["accessToken"]
             if channel == "ui":
                 query.update(ui="1", clock="1")
+                if not private and "sceneTransitions" in self.descriptor:
+                    query["sceneOccurrences"] = "1"
             return urlunsplit(value._replace(query=urlencode(query)))
 
         self.source_debug_supported = False
@@ -1240,7 +1254,15 @@ class CLIView:
                 )
                 self.ready.set()
             elif kind == "source.reset":
+                self.scene_occurrences.clear()
                 await self._source_reset(value)
+            elif kind == "scene.occurrence":
+                from .scene_transition import read_scene_occurrence
+
+                if len(self.scene_occurrences) < 128:
+                    self.scene_occurrences.append(
+                        read_scene_occurrence(value.get("occurrence"))
+                    )
             elif kind == "media.config":
                 config = value.get("config", {})
                 if self.descriptor.get("media", {}).get("kind") == "pixels":
@@ -1674,6 +1696,125 @@ class NativeCLIView(CLIView):
         self.credited_transport = None
         self.first_generation = self.retired_generation = None
         self.last_frame_identity = self.last_frame_transport = None
+        self.scene_entry_lock = asyncio.Lock()
+        self.scene_entry = None
+        self.scene_entry_target = None
+        self.scene_entry_commit = None
+        self.scene_entry_generation = None
+        self.scene_entry_media_ready = asyncio.Event()
+        self.scene_entry_active = None
+
+    async def scene_entry_control(self, command):
+        """Drive the dedicated source with its CLI owner credential."""
+        action, preparation_id = command.get("action"), command.get("preparationId")
+        states = {
+            "hold": "held",
+            "prepare": "prepared",
+            "snapshot": "snapshot",
+            "publish": "publishing",
+            "frame": "publishing",
+            "commit": "committed",
+            "activate": "active",
+        }
+        if (
+            action not in states
+            or not isinstance(preparation_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", preparation_id)
+            or self.descriptor.get("accessMode") == "capability"
+        ):
+            raise ValueError("SCENE_ENTRY_SOURCE_UNAVAILABLE")
+        async with self.scene_entry_lock:
+            new_hold = action == "hold" and self.scene_entry is None
+            if action == "hold":
+                if self.scene_entry is None:
+                    if self.pending_reset is not None or self.config is None:
+                        raise ValueError("SCENE_ENTRY_SOURCE_UNAVAILABLE")
+                    self.capture_wait.pending(preparation_id)
+                    self.scene_entry = preparation_id
+                    self.scene_entry_target = copy.deepcopy(command["target"])
+                    self.scene_entry_media_ready.clear()
+                    self.scene_entry_active = None
+                elif (
+                    self.scene_entry != preparation_id
+                    or command.get("target") != self.scene_entry_target
+                ):
+                    raise ValueError("SCENE_ENTRY_SOURCE_BUSY")
+            elif (
+                action == "activate"
+                and self.scene_entry is None
+                and self.scene_entry_active
+            ):
+                old_id, presented, receipt = self.scene_entry_active
+                if preparation_id == old_id and command.get("presented") == presented:
+                    return copy.deepcopy(receipt)
+                raise ValueError("SCENE_ENTRY_SOURCE_STALE")
+            elif self.scene_entry != preparation_id:
+                raise ValueError("SCENE_ENTRY_SOURCE_STALE")
+
+            if action == "publish" and self.scene_entry_generation is None:
+                # Config can arrive over the original WS before HTTP settles.
+                self.scene_entry_generation = self.config["mediaGeneration"] + 1
+
+            async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
+                response = await client.post(
+                    f"{self.descriptor['baseUrl']}/v1/sessions/{self.descriptor['sessionId']}/scene-entry",
+                    headers={
+                        "Authorization": "Bearer " + self.descriptor["accessToken"]
+                    },
+                    json=command,
+                )
+                if new_hold and response.status_code in (403, 404, 405):
+                    self.capture_wait.resumed(preparation_id)
+                    self.scene_entry = None
+                    self.scene_entry_target = None
+                response.raise_for_status()
+                receipt = response.json()
+            if not isinstance(receipt, dict) or receipt.get("state") != states[action]:
+                raise ValueError("SCENE_ENTRY_SOURCE_RECEIPT_INVALID")
+            if action == "hold" and not self.capture_wait.confirmed:
+                self.capture_wait.held(preparation_id)
+            elif action == "snapshot":
+                from .scene_transition import read_scene_condition, read_scene_snapshot
+
+                snapshot = dict(
+                    state="snapshot",
+                    **read_scene_snapshot(receipt, self.scene_entry_target),
+                )
+                if "condition" in receipt:
+                    snapshot["condition"] = read_scene_condition(
+                        receipt["condition"], self.descriptor
+                    )
+                return snapshot
+            elif action == "frame" and receipt.get("frame") is not None:
+                frame = read_frame_identity(receipt["frame"])
+                if frame["mediaGeneration"] != self.scene_entry_generation or any(
+                    frame[key] != self.descriptor[key] for key in ("sessionId", "epoch")
+                ):
+                    raise ValueError("SCENE_ENTRY_SOURCE_RECEIPT_INVALID")
+            elif action == "commit":
+                tick = receipt.get("commitTick")
+                if not safe_int(tick, 1) or self.scene_entry_commit not in (None, tick):
+                    raise ValueError("SCENE_ENTRY_SOURCE_RECEIPT_INVALID")
+                self.scene_entry_commit = tick
+            elif action == "activate":
+                tick = receipt.get("commitTick")
+                if self.scene_entry_commit is not None:
+                    valid_tick = type(tick) is int and tick == self.scene_entry_commit
+                else:
+                    valid_tick = safe_int(
+                        tick, command["presented"]["source"]["simulationTick"] + 1
+                    )
+                if not valid_tick:
+                    raise ValueError("SCENE_ENTRY_SOURCE_RECEIPT_INVALID")
+                self.scene_entry_active = (
+                    preparation_id,
+                    copy.deepcopy(command["presented"]),
+                    copy.deepcopy(receipt),
+                )
+                self.scene_entry = self.scene_entry_generation = None
+                self.scene_entry_target = None
+                self.scene_entry_commit = None
+            return receipt
 
     def credit_window(self):
         return min(2, MAX_PIXELS // self.spec.frame_bytes)
@@ -1687,6 +1828,8 @@ class NativeCLIView(CLIView):
             or not 1 <= len(value["presentationId"]) <= 128
         ):
             raise ValueError("Invalid CLI source reset")
+        if self.scene_entry is not None:
+            raise ValueError("SCENE_ENTRY_SOURCE_CHANGED")
         current = (value["presentationId"], value["sdkEpoch"])
         if current == self.source_identity:
             return
@@ -1729,18 +1872,28 @@ class NativeCLIView(CLIView):
 
     async def _reconfigure(self, value):
         generation = value.get("mediaGeneration")
+        scene_publish = self.scene_entry_generation == generation
         if (
-            self.pending_reset is None
+            (self.pending_reset is None and not scene_publish)
             or not safe_int(generation, 1)
             or generation != self.config["mediaGeneration"] + 1
             or value["config"] != self.config["config"]
         ):
             raise ValueError("The CLI video generation changed")
+        if scene_publish:
+            if (
+                self.pending_reset is not None
+                or self.capture_wait.request_id != self.scene_entry
+            ):
+                raise ValueError("SCENE_ENTRY_SOURCE_CHANGED")
+            self.capture_wait.resumed(self.scene_entry)
         self.pending_reset = None
         self.retired_generation = self.config["mediaGeneration"]
         self.config = value
         if self.credited_generation is not None:
             await self.grant(self.credit_window())
+        if scene_publish:
+            self.scene_entry_media_ready.set()
 
     async def grant(self, frames=1, *, generation=None, transport=None):
         current = self.config["mediaGeneration"]
@@ -1836,6 +1989,13 @@ class NativeCLIView(CLIView):
             if transport != self.transport_generation:
                 continue
             header, rgb = decode_native_packet(wire, self.descriptor, self.spec)
+            generation = header["mediaGeneration"]
+            if self.scene_entry is not None:
+                if generation != self.scene_entry_generation:
+                    continue
+                await self._wait_or_error(self.scene_entry_media_ready.wait())
+                if self.stopped or transport != self.transport_generation:
+                    continue
             source = header["source"]
             bootstrap = received_transport != transport
             received_transport = transport
@@ -1897,7 +2057,11 @@ class NativeCLIView(CLIView):
                 await self._wait_or_error(self.configured.wait())
             if self.finish_requested.is_set() or self.end_reason is not None:
                 return
-            generation = header["mediaGeneration"]
+            if (
+                self.scene_entry is not None
+                and generation != self.scene_entry_generation
+            ):
+                continue
             if (
                 self.retired_generation is not None
                 and self.first_generation is not None
@@ -1944,6 +2108,16 @@ class NativeCLIView(CLIView):
             self.last_frame_identity = canonical(header)
             self.last_frame_transport = transport
             frame_id, source_pts = header["outputFrameId"], source["sourceTimeUs"]
+            occurrences = [
+                row
+                for row in self.scene_occurrences
+                if row["simulationTick"] <= source["simulationTick"]
+            ]
+            self.scene_occurrences = [
+                row
+                for row in self.scene_occurrences
+                if row["simulationTick"] > source["simulationTick"]
+            ]
             yield EngineFrame(
                 index,
                 self.spec.pts(index),
@@ -1962,6 +2136,7 @@ class NativeCLIView(CLIView):
                     ),
                     "capture_pts_us": source["sourceTimeUs"] - origin,
                     "capture_origin_us": origin,
+                    **({"scene_occurrences": occurrences} if occurrences else {}),
                     **self._area_provenance(header),
                 },
             )

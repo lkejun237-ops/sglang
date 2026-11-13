@@ -1061,6 +1061,9 @@ class InteractiveSession(WhiteboxUpstream):
                     if item is None:
                         break
                     async with self.source_send_lock:
+                        stopped = getattr(self.latest, "stopped", None)
+                        if stopped is not None and stopped.is_set():
+                            break
                         if not self.model_source_allowed(sent) or item[0] <= getattr(
                             self, "source_resume_after", 0
                         ):
