@@ -139,3 +139,15 @@ Decoder overlap 和 defer-final；AdaLN=resident、W6/S0、每玩家期限1800�
 ## 手动增加 Room 实例
 
 可选 `room_pool_compatibility` 启用动态 owner 目录。`room_instance.py` 生成新实例的独立启动输入，`room_pool.py` 执行显式登记、检查、排空与移除；均不会重启其他服务。首次启用需要正常升级，新实例必须使用独立身份、数据目录和媒体端点。见 [Room 手动扩容](../../docs/docs/sglang-diffusion/zing/plans/whitebox-room-manual-expansion.md)。
+
+## Resident renderer recovery SDK pin
+
+The Room SDK pin includes Worldkit #1196: native startup fails promptly when a
+World binding cannot initialize, resident workers check WebGL before lending a
+page, and failed renderers are retired after session cleanup. Replacement retry
+budgets apply per failure, with request/worker/stage diagnostics.
+
+Build only after the pinned SDK commit is reachable from Worldkit `dev`. The SDK
+PR regression results and actual Room image/cutover/playback evidence are separate.
+Default Shanghai rollout must verify the original 720p World and worker replacement
+without restarting the Room; the pin alone does not activate this behavior.

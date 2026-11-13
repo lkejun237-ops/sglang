@@ -44,6 +44,11 @@ only mode/stage/completion, and does not print raw exceptions or Docker output.
   group active/queued/waiting counters and any returned role lease counters.
   `metrics` must expose all four recording/pending-work gauges; missing evidence
   rejects the switch. These endpoints must describe the actual owners being switched.
+- The interpreter probe retains failed join history without treating it as active
+  work only when the exact stream admission is retired and its original Room has
+  a successful cleanup receipt for the same owner epoch and publication. Missing
+  Rooms or idle CLI workers alone are insufficient. Other runtime, recording and
+  model lease counters must still be idle; the probe never deletes these fences.
 - `nginx`: exact absolute config path, original raw-text SHA256, unique route marker,
   and complete list of HTTP/WS admission paths, including prefixed/unprefixed and
   managed control entry points when exposed. The operator inserts exact 503

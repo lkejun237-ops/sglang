@@ -3,7 +3,6 @@ from collections import deque
 from types import SimpleNamespace
 
 import pytest
-
 from docker_idle_probe import archive_snapshot
 
 PREFIX = "sglang.multimodal_gen.runtime.realtime.whitebox."
@@ -76,6 +75,75 @@ def test_snapshot_allows_closed_history_without_mutation():
         assert result["retained_recordings"] == 1
         assert set(result["counters"].values()) == {0}
         assert recording.closed is True and manager.live_recordings["old"] is recording
+    finally:
+        loop.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        None,
+        "unfinished",
+        "admission",
+        "epoch",
+        "publication",
+        "receipt",
+        "retirement",
+        "room",
+    ],
+)
+def test_failed_join_history_requires_original_owner_cleanup(mutation):
+    loop, manager, runtime, recording = fixture()
+    try:
+        runtime.epoch = "epoch"
+        attempt = {"sdk_started": True, "failed": True}
+        runtime.join_attempts["stream"] = attempt
+        admission = dict(
+            stream_id="stream",
+            status="retired",
+            binding=dict(
+                gameId="game", ownerEpoch="epoch", publicationId="publication"
+            ),
+        )
+        receipt = dict(
+            game_id="game",
+            room_cleanup_complete=True,
+            retire_status="succeeded",
+            invocation={
+                "createContext": {
+                    "frozenPublication": {"world": {"publicationId": "publication"}}
+                }
+            },
+        )
+        runtime.control = SimpleNamespace(
+            admissions={"a": admission}, creates={"c": receipt}
+        )
+        if mutation == "unfinished":
+            attempt["failed"] = False
+        elif mutation == "admission":
+            admission["status"] = "blocked"
+        elif mutation == "epoch":
+            admission["binding"]["ownerEpoch"] = "previous-owner"
+        elif mutation == "publication":
+            admission["binding"]["publicationId"] = "other-publication"
+        elif mutation == "receipt":
+            receipt["room_cleanup_complete"] = False
+        elif mutation == "retirement":
+            receipt["retire_status"] = "unknown"
+        elif mutation == "room":
+            receipt["game_id"] = "other-room"
+        result = archive_snapshot([manager, runtime, recording], "owner")
+        assert result["counters"]["runtime_join_attempts"] == int(mutation is not None)
+        assert runtime.join_attempts["stream"] is attempt
+        assert len(runtime.join_attempts) == 1
+        # An actual remaining owner still blocks cutover even with a receipt.
+        runtime.rooms["other-room"] = {}
+        assert (
+            archive_snapshot([manager, runtime, recording], "owner")["counters"][
+                "runtime_rooms"
+            ]
+            == 1
+        )
     finally:
         loop.close()
 

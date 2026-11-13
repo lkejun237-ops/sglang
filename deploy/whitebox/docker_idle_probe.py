@@ -72,6 +72,42 @@ def archive_snapshot(objects, owner_id):
     counters["runtime_player_closures"] = sum(
         unfinished(t) for t in runtime["player_closures"].values()
     )
+    # Older Room owners retain failed joins after whole-Room retirement. Count
+    # only receipts from this owner and the exact original publication; absence
+    # of a Room, a failed task or an empty CLI alone never proves cleanup.
+    control = runtime.get("control")
+    if control is not None:
+        control = fields(control)
+        for stream_id, attempt in runtime["join_attempts"].items():
+            if attempt.get("failed") is not True:
+                continue
+            admissions = [
+                a
+                for a in control["admissions"].values()
+                if a.get("stream_id") == stream_id
+            ]
+            if len(admissions) != 1 or admissions[0].get("status") != "retired":
+                continue
+            binding = admissions[0]["binding"]
+            if binding["ownerEpoch"] != runtime["epoch"]:
+                continue
+            creates = [
+                c
+                for c in control["creates"].values()
+                if c["game_id"] == binding["gameId"]
+            ]
+            if len(creates) != 1:
+                continue
+            receipt = creates[0]
+            if (
+                receipt.get("room_cleanup_complete") is True
+                and receipt.get("retire_status") == "succeeded"
+                and receipt["invocation"]["createContext"]["frozenPublication"][
+                    "world"
+                ]["publicationId"]
+                == binding["publicationId"]
+            ):
+                counters["runtime_join_attempts"] -= 1
     recordings = manager["live_recordings"]
     if type(recordings) is not dict:
         raise ValueError("Unknown live recording registry")
@@ -131,10 +167,10 @@ def __whitebox_cutover_idle_probe_v1():
     import hashlib
     import json
     import os
-    from pathlib import Path
     import sys
     import threading
     import time
+    from pathlib import Path
 
     script = Path("/tmp/whitebox-cutover-probe-v1/probe.py")
     request_file = script.with_name("request.json")
