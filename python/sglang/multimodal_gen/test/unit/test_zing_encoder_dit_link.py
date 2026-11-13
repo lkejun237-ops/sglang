@@ -397,14 +397,33 @@ def test_session_init_prompt_boundary_eos_cancel_and_reuse(model, pooled):  # no
     assert created[-1].closed
     outputs = []
     client.open(dict(init, generation_id="next"))
-    client.send(
+    preparation = dict(
+        identity=dict(
+            preparation_id="prepare-next",
+            source_session_id="s",
+            source_epoch="source",
+            worker_epoch="worker",
+            condition_fingerprint="a" * 64,
+        ),
+        protocol="whitebox-startup-prepare-v2",
+        preview_sha256="b" * 64,
+        preview_size=[2, 2],
+    )
+    replies = client.send(
         "conditioning",
         tensors=h.condition(10),
         event_id=10,
         prompt_version=1,
         inputs=input_metadata(h),
+        source_prepare=preparation,
     )
     current = created[-1]
+    assert current.state.device is None
+    assert [
+        reply["preparation"]
+        for reply in replies
+        if reply["type"] == "conditioning.prepared"
+    ] == [preparation]
     for start, end in ((0, 1), (1, 3), (3, 5), (5, 8), (8, 10), (10, 13)):
         if start == 1:
             client.send(

@@ -366,9 +366,13 @@ def create_link_session(
 
         # Match the integrated condition barrier: all ranks finish their CUDA
         # dependencies before publishing the same event/version/boundary.
-        if worker.state.device.type == "cuda":
+        device = worker.state.device
+        if device is None:
+            # Initial conditioning can finish before the first source frame.
+            device = next(sampler.generator.parameters()).device
+        if device.type == "cuda":
             event = torch.cuda.Event()
-            event.record(torch.cuda.current_stream(worker.state.device))
+            event.record(torch.cuda.current_stream(device))
             event.synchronize()
         if any(value != receipt for value in coordinate_validation(receipt)):
             raise ValueError("Condition readiness differs across DiT ranks")
