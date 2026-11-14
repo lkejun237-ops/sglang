@@ -200,6 +200,10 @@ USER root
 ARG WHITEBOX_TEST_ALLOW_DEVELOPMENT_RELEASE=0
 ENV WHITEBOX_ALLOW_DEVELOPMENT_RELEASE=$WHITEBOX_TEST_ALLOW_DEVELOPMENT_RELEASE
 COPY python/sglang/multimodal_gen/test /app/python/sglang/multimodal_gen/test
+# The CLI fixture uses ps to track and reap the browser and encoder processes.
+RUN --mount=type=bind,source=deploy/whitebox/debian_main_mirror.py,target=/tmp/debian_main_mirror.py,readonly \
+    python /tmp/debian_main_mirror.py -- sh -ec 'apt-get update && \
+        apt-get install -y --no-install-recommends procps && rm -rf /var/lib/apt/lists/*'
 RUN pip install --no-cache-dir pytest==9.0.2 pyzmq==27.2.0
 # The sealed cutscene regression generates and verifies media with the Room's FFmpeg and Chromium.
 RUN cd /opt/worldkit && node node_modules/vitest/vitest.mjs run \
