@@ -160,7 +160,7 @@ def read_scene_transitions(value):
         or not isinstance(value["transitions"], list)
         or not isinstance(value["videos"], list)
         or not 1 <= len(value["transitions"]) <= 128
-        or not 1 <= len(value["videos"]) <= 128
+        or len(value["videos"]) > 128
     ):
         raise ValueError("Invalid scene transition inventory")
     videos = {}
@@ -195,16 +195,18 @@ def read_scene_transitions(value):
         videos[path] = row
     transitions, triggers = {}, {}
     for row in value["transitions"]:
-        if not isinstance(row, dict) or set(row) - {"trigger"} != {
+        if not isinstance(row, dict) or set(row) - {"trigger", "video"} != {
             "id",
-            "video",
             "target",
         }:
             raise ValueError("Invalid scene transition declaration")
         transition_id = identity(row["id"])
-        if transition_id in transitions or row["video"] not in videos:
+        path = row.get("video")
+        if transition_id in transitions or (
+            "video" in row and (not isinstance(path, str) or path not in videos)
+        ):
             raise ValueError("Invalid scene transition declaration")
-        transitions[transition_id] = (entry(row["target"]), videos[row["video"]])
+        transitions[transition_id] = (entry(row["target"]), videos.get(path))
         if "trigger" in row:
             trigger = row["trigger"]
             if not isinstance(trigger, dict) or set(trigger) != {"eventId"}:
@@ -213,7 +215,9 @@ def read_scene_transitions(value):
             if event_id in triggers:
                 raise ValueError("Duplicate scene transition trigger")
             triggers[event_id] = transition_id
-    if {video["path"] for _, video in transitions.values()} != set(videos):
+    if {video["path"] for _, video in transitions.values() if video is not None} != set(
+        videos
+    ):
         raise ValueError("Invalid scene transition video coverage")
     entries = {canonical(entry(row)) for row in value["entries"]}
     initial = entry(value["initial"])

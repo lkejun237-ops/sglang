@@ -10,12 +10,14 @@ from sglang.multimodal_gen.runtime.realtime.whitebox.scene_transition import (
 )
 
 
-@pytest.mark.parametrize("story", [False, True])
+@pytest.mark.parametrize(
+    "story,with_video", [(False, True), (True, True), (True, False)]
+)
 @pytest.mark.parametrize(
     "model,commit_fails", [(False, False), (True, False), (True, True)]
 )
 def test_cutscene_waits_for_playback_preparation_and_target_presentation(
-    story, model, commit_fails
+    story, with_video, model, commit_fails
 ):
     async def run():
         source_calls = []
@@ -118,13 +120,13 @@ def test_cutscene_waits_for_playback_preparation_and_target_presentation(
                 schemaVersion=1,
                 initial=initial,
                 entries=[initial, target],
-                videos=[video],
+                videos=[video] if with_video else [],
                 transitions=[
                     dict(
                         id="chapter",
                         target=target,
-                        video=video["path"],
                         trigger={"eventId": "enter.forest"},
+                        **({"video": video["path"]} if with_video else {}),
                     )
                 ],
             ),
@@ -192,55 +194,68 @@ def test_cutscene_waits_for_playback_preparation_and_target_presentation(
             expected_calls = (["fence"] if model else []) + ["hold", "prepare"]
             assert source_calls == expected_calls
             transition_id = playing["transition_id"]
-            await send(
-                "media",
-                "blocked",
-                transition_id=transition_id,
-                playback_attempt=1,
-                media_state="failed",
-            )
-            assert (await next_state("playing"))["media_state"] == "failed"
-            await send(
-                "retry", "retry", transition_id=transition_id, playback_attempt=1
-            )
-            assert (await next_state("playing"))["playback_attempt"] == 2
-            await transition.attach(2)
-            assert (await next_state("playing"))["playback_attempt"] == 3
-            await transition.attach(1)
-            assert transition.generation == 2
-            assert transition.snapshot()["playback_attempt"] == 3
-            assert snapshots.empty()
-            with pytest.raises(RenderError):
+            assert playing["receipt"]["has_video"] is with_video
+            playback_attempt = 3 if with_video else 1
+            if with_video:
                 await send(
                     "media",
-                    "stale",
+                    "blocked",
                     transition_id=transition_id,
-                    playback_attempt=2,
+                    playback_attempt=1,
+                    media_state="failed",
+                )
+                assert (await next_state("playing"))["media_state"] == "failed"
+                await send(
+                    "retry", "retry", transition_id=transition_id, playback_attempt=1
+                )
+                assert (await next_state("playing"))["playback_attempt"] == 2
+                await transition.attach(2)
+                assert (await next_state("playing"))["playback_attempt"] == 3
+                await transition.attach(1)
+                assert transition.generation == 2
+                assert transition.snapshot()["playback_attempt"] == 3
+                assert snapshots.empty()
+                with pytest.raises(RenderError):
+                    await send(
+                        "media",
+                        "stale",
+                        transition_id=transition_id,
+                        playback_attempt=2,
+                        media_state="ended",
+                    )
+                await send(
+                    "media",
+                    "play",
+                    generation=2,
+                    transition_id=transition_id,
+                    playback_attempt=3,
+                    media_state="playing",
+                )
+                await next_state("playing")
+                await send(
+                    "media",
+                    "end",
+                    generation=2,
+                    transition_id=transition_id,
+                    playback_attempt=3,
                     media_state="ended",
                 )
-            await send(
-                "media",
-                "play",
-                generation=2,
-                transition_id=transition_id,
-                playback_attempt=3,
-                media_state="playing",
-            )
-            await next_state("playing")
-            await send(
-                "media",
-                "end",
-                generation=2,
-                transition_id=transition_id,
-                playback_attempt=3,
-                media_state="ended",
-            )
-            assert (await next_state("playing"))["media_ended"]
+                assert (await next_state("playing"))["media_ended"]
+            else:
+                assert playing["video"] is None and playing["media_ended"]
+                with pytest.raises(RenderError):
+                    await send(
+                        "media",
+                        "unexpected-video",
+                        transition_id=transition_id,
+                        playback_attempt=1,
+                        media_state="ended",
+                    )
             deadline = transition.deadline
             await transition.attach(3)
             recovered = transition.snapshot()
             assert recovered["media_state"] == "ended"
-            assert recovered["playback_attempt"] == 3
+            assert recovered["playback_attempt"] == playback_attempt
             assert transition.deadline == deadline
             assert snapshots.empty()
             assert source_calls == expected_calls
@@ -266,7 +281,7 @@ def test_cutscene_waits_for_playback_preparation_and_target_presentation(
                     )
                     retrying = await next_state("playing")
                     assert "prefill_retryable" not in retrying["receipt"]
-                    assert retrying["playback_attempt"] == 3
+                    assert retrying["playback_attempt"] == playback_attempt
                     expected_calls += ["prefill"]
                 memory = (await next_state("playing"))["receipt"]
                 assert memory["condition_rgb_sha256"] == "a" * 64
