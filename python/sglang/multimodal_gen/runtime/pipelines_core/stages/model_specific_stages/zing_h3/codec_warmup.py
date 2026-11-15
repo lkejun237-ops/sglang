@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Small local requests for already loaded Encoder and Decoder workers."""
 
+import json
 import logging
 import time
 
@@ -21,7 +22,19 @@ def warmup_encoder(codecs):
     started = time.monotonic()
     codecs.warmup_source_vae()
     warmup_text_encoder(codecs)
-    logger.info("Encoder warmup completed in %.3fs", time.monotonic() - started)
+    elapsed_s = round(time.monotonic() - started, 3)
+    summary = {
+        "role": "encoder",
+        "warmed_up": True,
+        "elapsed_s": elapsed_s,
+        "stages": ["source_vae", "qwen_text_encoder"],
+    }
+    from sglang.multimodal_gen.runtime.realtime.worker_http import publish_role_warmup
+
+    publish_role_warmup("encoder", summary)
+    logger.info("Encoder warmup completed in %.3fs", elapsed_s)
+    print("WARMUP_COMPLETED " + json.dumps(summary, sort_keys=True), flush=True)
+    return summary
 
 
 def warmup_text_encoder(codecs):
@@ -117,9 +130,23 @@ def warmup_decoder(model, *, group=None, agree=None, width=832, height=480):
     finally:
         if stream is not None:
             stream.close()
+    elapsed_s = round(time.monotonic() - started, 3)
+    summary = {
+        "role": "decoder",
+        "warmed_up": True,
+        "elapsed_s": elapsed_s,
+        "width": width,
+        "height": height,
+        "frames": 1,
+    }
+    from sglang.multimodal_gen.runtime.realtime.worker_http import publish_role_warmup
+
+    publish_role_warmup("decoder", summary)
     logger.info(
         "Decoder latent warmup completed at %sx%s in %.3fs",
         width,
         height,
-        time.monotonic() - started,
+        elapsed_s,
     )
+    print("WARMUP_COMPLETED " + json.dumps(summary, sort_keys=True), flush=True)
+    return summary

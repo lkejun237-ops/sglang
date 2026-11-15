@@ -153,7 +153,15 @@ def test_single_latent_replay_completes_and_releases_for_next_request(
     random_state = torch.random.get_rng_state().clone()
     context = get_forward_context_or_none()
     for count in (1, 2):
-        warmup_dit(model, codecs, create, height=32, width=32)
+        summary = warmup_dit(model, codecs, create, height=32, width=32)
+        assert summary["role"] == "dit"
+        assert summary["warmed_up"] is True
+        assert summary["elapsed_s"] >= 0.0
+        assert (
+            summary["width"] == 32
+            and summary["height"] == 32
+            and summary["latent_frames"] == 1
+        )
         assert len(workers) == len(outputs) == count
         assert workers[-1].closed
         assert workers[-1].state.closed

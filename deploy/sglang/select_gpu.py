@@ -20,6 +20,8 @@ def select(gpus, processes, pods):
         ):
             env = {v["name"]: v.get("value") for v in container.get("env", [])}
             visible = env.get("NVIDIA_VISIBLE_DEVICES")
+            if visible in ("void", "none"):
+                continue
             if visible in ("all", "") or (
                 "NVIDIA_VISIBLE_DEVICES" in env and visible is None
             ):

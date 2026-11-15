@@ -1,9 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 """Small HTTP host for role workers; model execution stays on its owner thread."""
 
+import os
 import socket
 import threading
 import time
+import weakref
+
+_WARMUP_LOCK = threading.Lock()
+_ACTIVE_SERVERS: "weakref.WeakSet[WorkerHTTPServer]" = weakref.WeakSet()
+_PUBLISHED_WARMUP_BY_ROLE: dict[str, dict] = {}
+
+
+def publish_role_warmup(role: str, info: dict) -> None:
+    """Automatically bind warmup metadata to active (and subsequent) WorkerHTTPServers for ``role``."""
+    if not isinstance(info, dict) or not info:
+        return
+    snapshot = dict(info)
+    with _WARMUP_LOCK:
+        if not os.environ.get("PYTEST_CURRENT_TEST"):
+            _PUBLISHED_WARMUP_BY_ROLE[role] = dict(snapshot)
+        targets = [srv for srv in _ACTIVE_SERVERS if srv.role == role]
+    for srv in targets:
+        srv.record_warmup(snapshot)
 
 
 def install_health_routes(app, state):
@@ -31,7 +50,14 @@ class WorkerHTTPServer:
         from fastapi import FastAPI
 
         self.ready = False
+        self.warmup = None
         self.role = role
+        with _WARMUP_LOCK:
+            if not os.environ.get("PYTEST_CURRENT_TEST"):
+                prior = _PUBLISHED_WARMUP_BY_ROLE.get(role)
+                if prior is not None:
+                    self.warmup = dict(prior)
+            _ACTIVE_SERVERS.add(self)
         self.app = FastAPI() if app is None else app
         if app is None:
             install_health_routes(self.app, self.status)
@@ -72,20 +98,33 @@ class WorkerHTTPServer:
             self.socket.close()
             raise
 
+    def record_warmup(self, info):
+        if isinstance(info, dict) and info:
+            self.warmup = dict(info)
+
     def status(self):
-        return {
-            "role": self.role,
-            "ready": self.ready
+        ready = (
+            self.ready
             and not (
                 getattr(getattr(self, "connections", None), "restart_required", False)
             )
             and not any(
                 peer.restart_required for peer in getattr(self, "connection_peers", [])
-            ),
+            )
+        )
+        payload = {
+            "role": self.role,
+            "ready": ready,
         }
+        if self.warmup is not None:
+            payload["warmed_up"] = bool(self.warmup.get("warmed_up", True))
+            payload["warmup"] = dict(self.warmup)
+        return payload
 
     def close(self):
         self.ready = False
+        with _WARMUP_LOCK:
+            _ACTIVE_SERVERS.discard(self)
         self.server.should_exit = True
         self.thread.join(timeout=10)
         self.socket.close()

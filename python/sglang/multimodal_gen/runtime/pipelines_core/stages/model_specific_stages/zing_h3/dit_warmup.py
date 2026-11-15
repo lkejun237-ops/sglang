@@ -2,6 +2,7 @@
 """One local request through the loaded DiT's ordinary input service."""
 
 import asyncio
+import json
 import logging
 import time
 from collections import deque
@@ -175,9 +176,26 @@ def warmup_dit(model, codecs, create_session, *, parallel=None, height=480, widt
             # EOS closes the request, and cancel clears the service owner.
             # Direct cleanup also covers a failed link that cannot send cancel.
             channel.close()
+    elapsed_s = round(time.monotonic() - started, 3)
+    summary = {
+        "role": "dit",
+        "warmed_up": True,
+        "elapsed_s": elapsed_s,
+        "width": width,
+        "height": height,
+        "latent_frames": 1,
+    }
     logger.info(
         "DiT startup warmup completed: %sx%s T=1 elapsed_s=%.3f",
         width,
         height,
-        time.monotonic() - started,
+        elapsed_s,
     )
+    if consensus.leader:
+        from sglang.multimodal_gen.runtime.realtime.worker_http import (
+            publish_role_warmup,
+        )
+
+        publish_role_warmup("dit", summary)
+        print("WARMUP_COMPLETED " + json.dumps(summary, sort_keys=True), flush=True)
+    return summary

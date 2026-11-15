@@ -1182,3 +1182,226 @@ def test_metrics_boot_isolation_and_receipt(live_assets, exited_launcher):
     assert first["enabled"] is True
     # Shared-model services expose the same registry; advertise only the base HTTP.
     assert first["url"] == "http://10.0.0.122:31000/metrics"
+
+
+def test_stage_assets_by_role_stages_only_role_hot_weights_and_links_rest(tmp_path):
+    src = tmp_path / "mounted"
+    contents = {
+        "model/transformer/part.safetensors": b"dit-hot-weights",
+        "model/video_vae/vae.safetensors": b"encoder-vae-weights",
+        "model/processor/tokenizer.json": b'{"tok":1}',
+        "model/text_encoder/qwen.safetensors": b"cold-text-encoder",
+        "model/zing_config.json": b"{}",
+        "model/model_index.json": b"{}",
+        "model/EXPORT_COMPLETE.json": b"{}",
+        "lynn/decoder.pt": b"decoder-lynn-weights",
+        "adaln-table-unsplit/table.safetensors": b"dit-adaln-table",
+        "adaln-table-unsplit/manifest.json": b"{}",
+    }
+    for rel, raw in contents.items():
+        p = src / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(raw)
+
+    # 1. Encoder copies video_vae + processor, symlinks transformer / adaln / lynn.
+    enc_dst = tmp_path / "enc_local"
+    launch.stage_assets(
+        {"role": "encoder", "stage_from": str(src), "model": str(enc_dst / "model")}
+    )
+    assert not (enc_dst / "model/video_vae/vae.safetensors").is_symlink()
+    assert (
+        enc_dst / "model/video_vae/vae.safetensors"
+    ).read_bytes() == b"encoder-vae-weights"
+    assert not (enc_dst / "model/processor/tokenizer.json").is_symlink()
+    assert (enc_dst / "model/transformer").is_symlink()
+    assert (enc_dst / "adaln-table-unsplit").is_symlink()
+    assert (enc_dst / "lynn").is_symlink()
+
+    # 2. Decoder copies lynn, symlinks transformer / video_vae / adaln.
+    dec_dst = tmp_path / "dec_local"
+    launch.stage_assets(
+        {"role": "decoder", "stage_from": str(src), "model": str(dec_dst / "model")}
+    )
+    assert not (dec_dst / "lynn").is_symlink()
+    assert not (dec_dst / "lynn/decoder.pt").is_symlink()
+    assert (dec_dst / "lynn/decoder.pt").read_bytes() == b"decoder-lynn-weights"
+    assert (dec_dst / "model/transformer").is_symlink()
+    assert (dec_dst / "model/video_vae").is_symlink()
+    assert (dec_dst / "adaln-table-unsplit").is_symlink()
+
+    # 3. DiT copies transformer + adaln-table-unsplit, symlinks video_vae / lynn.
+    dit_dst = tmp_path / "dit_local"
+    launch.stage_assets(
+        {"role": "dit", "stage_from": str(src), "model": str(dit_dst / "model")}
+    )
+    assert not (dit_dst / "model/transformer/part.safetensors").is_symlink()
+    assert not (dit_dst / "adaln-table-unsplit/table.safetensors").is_symlink()
+    assert (dit_dst / "model/video_vae").is_symlink()
+    assert (dit_dst / "lynn").is_symlink()
+
+
+def test_encoder_defaults_zing_source_prepare_env_without_overriding_explicit(
+    live_assets,
+):
+    enc = live_assets.assets("encoder")
+    _, default_env = launch.command(enc, live_assets.root, "10.0.0.122", "enc-w")
+    assert default_env["SGLANG_ZING_SOURCE_PREPARE"] == "1"
+
+    enc_override = {**enc, "environment": {"SGLANG_ZING_SOURCE_PREPARE": "0"}}
+    launch.validate_config(enc_override)
+    _, explicit_env = launch.command(
+        enc_override, live_assets.root, "10.0.0.122", "enc-w"
+    )
+    assert explicit_env["SGLANG_ZING_SOURCE_PREPARE"] == "0"
+
+
+def test_pai_render_resolves_image_auth_file_without_storing_inline_secret(
+    live_assets, tmp_path
+):
+    c = live_assets.assets("dit")
+    auth_file = tmp_path / "ACR_IMAGE_AUTH"
+    auth_file.write_text("secret-acr-auth-token\n")
+    site = dict(
+        schema=1,
+        image="test@sha256:" + "c" * 64,
+        image_auth_file=str(auth_file),
+        job_spec=dict(
+            Type="Worker",
+            PodCount=1,
+            QuotaId="quota3l8bnv9a35n",
+            RestartPolicy="Never",
+            ResourceConfig={"GPU": "1"},
+            ImageConfig={"DockerRegistry": "registry.example", "Username": "user"},
+        ),
+        data_sources=[],
+    )
+    out = tmp_path / "rendered"
+    launch.render(c, runtime_manifest(), site, out)
+    pai = json.loads((out / "pai.json").read_text())
+    assert pai["JobSpecs"][0]["ImageConfig"]["Auth"] == "secret-acr-auth-token"
+    assert "Auth" not in site["job_spec"]["ImageConfig"]
+
+    with pytest.raises(ValueError, match="image_auth_file"):
+        launch.render(
+            c,
+            runtime_manifest(),
+            {**site, "image_auth_file": "relative/secret"},
+            tmp_path / "bad-rel",
+        )
+
+
+def test_assets_cli_sized_weights_records_bytes_and_sha256(
+    live_assets, tmp_path, monkeypatch
+):
+    c = live_assets.assets("dit")
+    cfg_path = tmp_path / "dit-config.json"
+    cfg_path.write_text(json.dumps(c))
+    out_receipt = tmp_path / "sized-assets.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "launch.py",
+            "assets",
+            "--config",
+            str(cfg_path),
+            "--output",
+            str(out_receipt),
+            "--sized-weights",
+        ],
+    )
+    launch.main()
+    data = json.loads(out_receipt.read_text())
+    weight_key = str(Path(c["model"]) / "model.safetensors")
+    cfg_key = str(Path(c["model"]) / "zing_config.json")
+    assert isinstance(data["files"][weight_key], dict)
+    assert set(data["files"][weight_key]) == {"bytes", "sha256"}
+    assert isinstance(data["files"][cfg_key], str)
+
+    c["asset_receipt"] = str(out_receipt)
+    c["asset_receipt_sha256"] = source.digest(out_receipt)
+    launch.verify_assets(c)
+
+
+def test_select_gpu_ignores_void_and_none_nvidia_visible_devices():
+    import select_gpu
+
+    gpus = [
+        {"uuid": "GPU-free-0", "memory": 0, "name": "H100", "total_memory_mib": 81559}
+    ]
+    pods = {
+        "items": [
+            {
+                "spec": {
+                    "containers": [
+                        {
+                            "env": [
+                                {"name": "NVIDIA_VISIBLE_DEVICES", "value": "void"},
+                                {"name": "NVIDIA_VISIBLE_DEVICES", "value": "none"},
+                            ]
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    assert select_gpu.select(gpus, [], pods) == "GPU-free-0"
+
+
+def test_run_records_warmed_up_and_stage_timings_in_receipt(live_assets):
+    from unittest.mock import MagicMock, Mock
+
+    c = live_assets.assets("encoder")
+    source.write_json(
+        live_assets.root / "verified-source.json",
+        dict(commit="a" * 40, archive_sha256="b" * 64),
+    )
+    polls = [None, 0]
+    child = Mock(pid=4321)
+    child.poll.side_effect = lambda: polls.pop(0) if polls else 0
+    child.wait.return_value = 0
+
+    health_resp = MagicMock()
+    health_resp.__enter__.return_value.read.return_value = json.dumps(
+        {
+            "ready": True,
+            "role": "encoder",
+            "warmed_up": True,
+            "warmup": {"role": "encoder", "warmed_up": True, "elapsed_s": 3.21},
+        }
+    ).encode()
+
+    opener = Mock()
+    opener.open.return_value = health_resp
+
+    with (
+        patch.object(launch, "reachable_ip", return_value="10.0.0.122"),
+        patch.object(launch, "probe_source", return_value={}),
+        patch.object(launch.subprocess, "check_output", return_value="GPU-fixture"),
+        patch.object(launch.subprocess, "Popen", return_value=child),
+        patch.object(launch.urllib.request, "build_opener", return_value=opener),
+        patch.object(launch.socket, "socket"),
+        patch.object(launch.signal, "signal"),
+        patch.object(launch.time, "sleep"),
+    ):
+        rc = launch.run(c, live_assets.root / "source", "a" * 40, "b" * 64)
+    assert rc == 0
+    saved = json.loads((live_assets.root / "receipt.json").read_text())
+    assert saved["status"] == "exited"
+    assert saved["warmed_up"] is True
+    assert saved["warmup"]["elapsed_s"] == 3.21
+    for k in ("stage_assets_s", "verify_assets_s", "worker_ready_s", "total_boot_s"):
+        assert k in saved["timings_s"]
+
+
+@pytest.mark.parametrize("missing_key", ["model_id", "component", "ema", "model"])
+def test_verify_assets_rejects_incomplete_receipt_metadata_with_value_error(
+    live_assets, missing_key
+):
+    c = live_assets.assets("encoder")
+    receipt = json.loads(Path(c["asset_receipt"]).read_text())
+    receipt.pop(missing_key, None)
+    Path(c["asset_receipt"]).write_text(json.dumps(receipt))
+    c["asset_receipt_sha256"] = source.digest(c["asset_receipt"])
+    with pytest.raises(ValueError, match="Model identity or component mismatch"):
+        launch.verify_assets(c)

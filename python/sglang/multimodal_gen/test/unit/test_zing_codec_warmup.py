@@ -31,12 +31,16 @@ def test_encoder_warms_source_vae_before_one_text_request_with_forward_context()
             "row_role": torch.zeros(3, dtype=torch.long),
         }
 
-    warmup_encoder(
+    summary = warmup_encoder(
         SimpleNamespace(
             warmup_source_vae=lambda: calls.append("source_vae"),
             encode_condition=encode,
         )
     )
+    assert summary["role"] == "encoder"
+    assert summary["warmed_up"] is True
+    assert summary["elapsed_s"] >= 0.0
+    assert summary["stages"] == ["source_vae", "qwen_text_encoder"]
     assert calls == ["source_vae", (WARMUP_PROMPT, [])]
     assert get_forward_context_or_none() is before
 
@@ -95,7 +99,11 @@ def test_decoder_runs_one_real_latent_and_releases_stream(model, monkeypatch):
 
     monkeypatch.setattr(model, "new_stream", new_stream)
     random_state = torch.random.get_rng_state().clone()
-    warmup_decoder(model, width=12, height=12)
+    summary = warmup_decoder(model, width=12, height=12)
+    assert summary["role"] == "decoder"
+    assert summary["warmed_up"] is True
+    assert summary["elapsed_s"] >= 0.0
+    assert summary["width"] == 12 and summary["height"] == 12 and summary["frames"] == 1
     assert len(inputs) == len(streams) == 1
     assert inputs[0].shape == (1, 24, 1, 3, 3)
     assert streams[0].latents_seen == streams[0].frames_emitted == 1

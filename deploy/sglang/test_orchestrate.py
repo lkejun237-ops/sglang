@@ -3272,3 +3272,1817 @@ def test_skill_and_orchestration_doc_cli_examples_parse_cleanly():
         "rollback",
         "down",
     }
+
+
+def test_all_h200_topology_minimal_spec_expansion_and_default_cpu_16():
+    minimal = {
+        "schema": 1,
+        "topology": "h200",
+        "model_id": "model1027",
+        "model": "/opt/whitebox/assets/model",
+        "stage_from": "/mnt/serving-assets",
+        "asset_receipt": "/mnt/oss/assets.json",
+        "asset_receipt_sha256": "a" * 64,
+        "image": "registry.example/sglang@sha256:" + "c" * 64,
+        "target": copy.deepcopy(orch.TARGET),
+    }
+    expanded = orch.expand_minimal_spec(minimal)
+    assert set(expanded["sites"]) == {"h200"}
+    rc = expanded["sites"]["h200"]["job_spec"]["ResourceConfig"]
+    assert rc == {"GPU": "1", "CPU": "16", "Memory": "128Gi", "SharedMemory": "64Gi"}
+    for role in orch.ROLES:
+        assert orch.is_pai_role(expanded, role) is True
+        assert expanded["roles"][role]["profile"] == "h200"
+        assert expanded["roles"][role]["stage_from"] == "/mnt/serving-assets"
+
+
+def test_probe_h200_inventory_detects_gpu_and_cpu_starvation_without_h100_blockers(
+    tmp_path,
+):
+    minimal = {
+        "schema": 1,
+        "topology": "h200",
+        "model_id": "model1027",
+        "model": "/opt/whitebox/assets/model",
+        "asset_receipt": "/mnt/oss/assets.json",
+        "asset_receipt_sha256": "a" * 64,
+        "image": "registry.example/sglang@sha256:" + "c" * 64,
+        "target": copy.deepcopy(orch.TARGET),
+    }
+    cloud = Mock(timeout=1)
+    # H100 has zero idle GPUs, which must NOT block an all-H200 topology!
+    cloud.eflo.return_value = json.dumps(
+        {
+            "gpus": "",
+            "processes": "",
+            "pods": {"items": []},
+            "images": {"images": []},
+            "models": {},
+            "busy_ports": [],
+        }
+    )
+
+    def make_jobs(count, cpu_each):
+        jobs = [
+            {
+                "JobId": f"dlc-busy-{i}",
+                "DisplayName": f"busy-{i}",
+                "Status": "Running",
+                "UserId": "other",
+                "ResourceId": "quota3l8bnv9a35n",
+            }
+            for i in range(count)
+        ]
+        details = {
+            f"dlc-busy-{i}": {
+                "JobId": f"dlc-busy-{i}",
+                "Status": "Running",
+                "JobSpecs": [
+                    {
+                        "PodCount": 1,
+                        "Image": "registry.example/sglang@sha256:" + "c" * 64,
+                        "ResourceConfig": {"GPU": "1", "CPU": str(cpu_each)},
+                    }
+                ],
+            }
+            for i in range(count)
+        }
+        return jobs, details
+
+    # Case 1: 5 GPUs running * 14 CPUs = 70 CPUs used; 3 new H200 roles * 16 CPUs = 48 -> fits (8 GPUs, 118 CPUs <= 120), zero H100 needed.
+    jobs_ok, details_ok = make_jobs(5, 14)
+    cloud.cli.return_value = {"Jobs": jobs_ok, "TotalCount": len(jobs_ok)}
+    cloud.get_job.side_effect = lambda jid: details_ok[jid]
+    ev_ok = orch.probe(copy.deepcopy(minimal), tmp_path / "probe-ok", cloud)
+    assert ev_ok["blockers"] == []
+    assert ev_ok["h200_inventory"]["running_gpus"] == 5
+    assert ev_ok["h200_inventory"]["requested_pai_gpus"] == 3
+    assert ev_ok["h200_inventory"]["requested_pai_cpus"] == 48
+
+    # Case 2: 5 GPUs running * 32 CPUs = 160 CPUs used; +48 = 208 > 192 -> CPU starvation blocker!
+    jobs_cpu, details_cpu = make_jobs(5, 32)
+    cloud.cli.return_value = {"Jobs": jobs_cpu, "TotalCount": len(jobs_cpu)}
+    cloud.get_job.side_effect = lambda jid: details_cpu[jid]
+    ev_cpu = orch.probe(copy.deepcopy(minimal), tmp_path / "probe-cpu", cloud)
+    assert any("CPU" in b for b in ev_cpu["blockers"])
+
+
+def test_submit_all_pai_roles_runs_in_parallel_and_records_timings_sla(
+    spec, tmp_path, monkeypatch
+):
+    import threading
+
+    for role in orch.ROLES:
+        spec["roles"][role]["profile"] = "h200"
+    spec["sites"] = {"h200": spec["sites"]["h200"]}
+    checked = orch.validate_spec(spec)
+    manifest = dict(
+        schema=1,
+        commit="b" * 40,
+        sha256="c" * 64,
+        uri="oss://leap-world-shanghai/test/"
+        + "b" * 40
+        + "/"
+        + "c" * 64
+        + "/source.tar",
+        tools={
+            n: source.digest(Path(__file__).with_name(n))
+            for n in ("launch.py", "source.py", "select_gpu.py", "orchestrate.py")
+        },
+    )
+    run_state = dict(
+        schema=1,
+        run_id="d" * 32,
+        target=copy.deepcopy(orch.TARGET),
+        phase="planned",
+        generation=0,
+        source=manifest,
+        spec=checked,
+        resources={},
+    )
+    orch.render_roles(run_state, tmp_path)
+    (tmp_path / "source").mkdir()
+    arc = tmp_path / "source/source.tar"
+    arc.write_bytes(b"archive")
+    run_state["source"]["sha256"] = source.digest(arc)
+
+    barrier = threading.Barrier(3, timeout=5)
+    persisted_before_submit = []
+
+    def parallel_submit(job_payload):
+        # Verify write-ahead state.json already has all 3 roles before any submit finishes!
+        on_disk = orch.read(tmp_path / "state.json")
+        persisted_before_submit.append(set(on_disk["resources"]))
+        barrier.wait()
+        name = job_payload["DisplayName"]
+        role = next(r for r in orch.ROLES if f"sglang-{r}-" in name)
+        return f"dlc-par-{role}"
+
+    def fake_receipt(resource, role):
+        cfg = orch.read(tmp_path / f"{role}-0/role.json")
+        http_port = launch.role_ports(cfg)["http_port"]
+        return dict(
+            schema=1,
+            role=role,
+            status="ready",
+            commit=manifest["commit"],
+            archive_sha256=run_state["source"]["sha256"],
+            model_id="model1027",
+            asset_receipt_sha256="a" * 64,
+            worker_id=f"{role}-par",
+            role_config_sha256=hashlib.sha256(
+                json.dumps(cfg, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+            http=f"http://10.0.0.15{orch.ROLES.index(role)}:{http_port}",
+            gpu=f"GPU-{role}-h200, H200, 140000, 0",
+            warmed_up=True,
+            warmup={"role": role, "warmed_up": True, "elapsed_s": 2.5},
+        )
+
+    cloud = Mock(timeout=1)
+    cloud.submit_job.side_effect = parallel_submit
+    cloud.receipt.side_effect = fake_receipt
+    monkeypatch.setattr(
+        orch,
+        "http",
+        lambda url, payload=None, token=None, cloud=None: {
+            "ready": True,
+            "role": next(
+                r for r in orch.ROLES if f"10.0.0.15{orch.ROLES.index(r)}" in url
+            ),
+            "warmed_up": True,
+        },
+    )
+
+    orch.submit(run_state, tmp_path, cloud)
+    assert len(persisted_before_submit) == 3
+    assert all(s == set(orch.ROLES) for s in persisted_before_submit)
+    assert run_state["phase"] == "ready"
+    assert run_state["timings_sec"]["within_10min_sla"] is True
+    assert "submit_sec" in run_state["timings_sec"]
+    assert "wait_ready_sec" in run_state["timings_sec"]
+    summary = orch.write_deployment_summary(run_state, tmp_path)
+    assert summary["acceptance_gates"]["within_10min_sla"] is True
+    assert summary["acceptance_gates"]["all_roles_warmed_up"] is True
+
+
+def test_eflo_http_forwards_structured_http_error_and_remote_selftest_uses_eflo_relay(
+    state, monkeypatch
+):
+    from urllib.error import HTTPError
+
+    cloud = Mock(timeout=1)
+    cloud.eflo.return_value = json.dumps(
+        {
+            "__eflo_http_error__": 403,
+            "reason": "Forbidden",
+            "body": '{"error":"MANAGED_CONTROL_REQUIRED"}',
+        }
+    )
+    monkeypatch.setattr(
+        orch,
+        "build_opener",
+        Mock(
+            return_value=Mock(
+                open=Mock(side_effect=OSError("Network unreachable from laptop"))
+            )
+        ),
+    )
+    with pytest.raises(HTTPError) as exc_info:
+        orch.http("http://10.0.0.150:31000/get_connection_status", cloud=cloud)
+    assert exc_info.value.code == 403
+    assert "MANAGED_CONTROL_REQUIRED" in exc_info.value.read().decode()
+
+    # All-PAI deployment (no K3s pod UIDs) runs remote_selftest via Eflo /usr/bin/python3.12 relay.
+    for r in orch.ROLES:
+        state["resources"][r].pop("uid", None)
+        state["resources"][r].pop("namespace", None)
+        state["resources"][r]["job_id"] = f"dlc-{r}"
+    captured_scripts = []
+
+    def relay_eflo(script):
+        captured_scripts.append(script)
+        return '{"status":"passed","frames":4}\n'
+
+    cloud.eflo.side_effect = relay_eflo
+    addrs = {r: state["resources"][r]["receipt"]["http"] for r in orch.ROLES}
+    wids = {r: state["resources"][r]["receipt"]["worker_id"] for r in orch.ROLES}
+    res = orch.remote_selftest(state, addrs, wids, cloud)
+    assert res == {"status": "passed", "frames": 4}
+    assert "/opt/sglang/bin/python" in captured_scripts[-1]
+    assert "run --rm --net-host" in captured_scripts[-1]
+    assert "PY=/usr/bin/python3.12" in captured_scripts[-1]
+    assert "kubectl" not in captured_scripts[-1]
+    # Ensure the generated Python snippet passed to -c is syntactically valid!
+    import shlex as _shlex
+
+    tokens = _shlex.split(captured_scripts[-1])
+    c_idx = tokens.index("-c")
+    compile(tokens[c_idx + 1], "<selftest_relay>", "exec")
+
+
+def test_reusing_pai_pinned_encoder_decoder_validates_job_and_compatibility_domain(
+    spec, tmp_path, monkeypatch
+):
+    spec["existing_services"] = {
+        "encoder": {
+            "http": "http://10.0.0.151:31000",
+            "worker_id": "enc-pai",
+            "gpu": "GPU-enc-pai",
+            "boot_epoch": "enc-be",
+            "pai": True,
+            "job_id": "dlc-enc-1",
+            "job_name": "sglang-encoder-fixed",
+        },
+        "decoder": {
+            "http": "http://10.0.0.152:36000",
+            "worker_id": "dec-pai",
+            "gpu": "GPU-dec-pai",
+            "boot_epoch": "dec-be",
+            "pai": True,
+            "job_id": "dlc-dec-1",
+            "job_name": "sglang-decoder-fixed",
+        },
+    }
+    spec["roles"] = {"dit": spec["roles"]["dit"]}
+    spec["sites"] = {"h200": spec["sites"]["h200"]}
+    checked = orch.validate_spec(spec)
+    manifest = dict(
+        schema=1,
+        commit="b" * 40,
+        sha256="c" * 64,
+        uri="oss://leap-world-shanghai/test/"
+        + "b" * 40
+        + "/"
+        + "c" * 64
+        + "/source.tar",
+        tools={
+            n: source.digest(Path(__file__).with_name(n))
+            for n in ("launch.py", "source.py", "select_gpu.py", "orchestrate.py")
+        },
+    )
+    st = dict(
+        schema=1,
+        run_id="1" * 32,
+        target=copy.deepcopy(orch.TARGET),
+        phase="submitted",
+        generation=0,
+        source=manifest,
+        spec=checked,
+        resources={
+            r: orch.reused_resource("1" * 32, checked["model_id"], r, entry)
+            for r, entry in checked["existing_services"].items()
+        },
+    )
+    orch.render_roles(st, tmp_path)
+    dit_cfg = orch.read(tmp_path / "dit-0/role.json")
+    st["resources"]["dit"] = dict(
+        run_id="1" * 32,
+        generation=0,
+        name="sglang-dit-owned",
+        job_id="dlc-dit-1",
+        status="submitted",
+        expected_job=orch.read(tmp_path / "dit-0/pai.json"),
+    )
+
+    cloud = Mock(timeout=1)
+    cloud.get_job.side_effect = lambda jid: {
+        "JobId": jid,
+        "WorkspaceId": orch.TARGET["workspace_id"],
+        "ResourceId": orch.TARGET["quota_id"],
+        "DisplayName": (
+            "sglang-encoder-fixed"
+            if jid == "dlc-enc-1"
+            else ("sglang-decoder-fixed" if jid == "dlc-dec-1" else "sglang-dit-owned")
+        ),
+        "Status": "Running",
+    }
+    cloud.receipt.return_value = dict(
+        schema=1,
+        role="dit",
+        status="ready",
+        commit=manifest["commit"],
+        archive_sha256=manifest["sha256"],
+        model_id=checked["model_id"],
+        asset_receipt_sha256="a" * 64,
+        worker_id="dit-owned",
+        role_config_sha256=hashlib.sha256(
+            json.dumps(dit_cfg, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        http="http://10.0.0.153:33000",
+        gpu="GPU-dit-pai",
+        warmed_up=True,
+    )
+
+    monkeypatch.setenv("ROLE_POOL_SIGNING_KEY", "s" * 32)
+    monkeypatch.setenv("ROLE_POOL_OPERATOR_TOKEN", "op-token")
+    wrong_compat = {"enabled": True}
+
+    def fake_http(url, payload=None, token=None, cloud=None):
+        if url.endswith("/health"):
+            role = (
+                "encoder"
+                if ":31000/" in url
+                else ("decoder" if ":36000/" in url else "dit")
+            )
+            return {"ready": True, "role": role, "warmed_up": True}
+        if "/get_connection_status" in url:
+            raise RuntimeError("HTTP 403 MANAGED_CONTROL_REQUIRED")
+        if url.endswith("/managed/identity"):
+            role = "encoder" if ":31000/" in url else "decoder"
+            wid = "enc-pai" if role == "encoder" else "dec-pai"
+            be = "enc-be" if role == "encoder" else "dec-be"
+            return {
+                "service": {"worker_id": wid, "role": role, "service_id": f"{wid}/0"},
+                "boot_epoch": be,
+                "control_epoch": checked["pool"]["control_epoch"],
+            }
+        if url.endswith("/v1/role-pool/process-status"):
+            return {
+                "process": {
+                    "state": "ready",
+                    "manifest": {
+                        "compatibility": (
+                            "other-tenant-group"
+                            if wrong_compat["enabled"]
+                            else checked["pool"]["compatibility"]
+                        ),
+                        "network_domain": checked["pool"]["network_domain"],
+                    },
+                }
+            }
+        raise AssertionError(url)
+
+    monkeypatch.setattr(orch, "http", fake_http)
+    with pytest.raises(
+        ValueError, match="compatibility or network_domain does not match"
+    ):
+        orch.wait_ready(st, tmp_path, cloud)
+
+    wrong_compat["enabled"] = False
+    orch.wait_ready(st, tmp_path, cloud)
+    assert st["phase"] == "ready"
+
+
+def test_verify_pool_checks_exact_compatibility_group_capacity_when_room_token_present(
+    state, tmp_path, monkeypatch
+):
+    w_configs = orch.worker_configs(state)
+    for r in orch.ROLES:
+        state["resources"][r]["receipt"]["worker_config"] = w_configs[r]
+    state["attachment"] = {
+        "identities": {
+            r: {
+                "process_id": f"{r}-worker",
+                "boot_epoch": f"{r}-boot",
+                "service_id": f"{r}-worker/0",
+            }
+            for r in orch.ROLES
+        }
+    }
+    monkeypatch.setenv("ROLE_POOL_SIGNING_KEY", "s" * 32)
+    monkeypatch.setenv("ROLE_POOL_OPERATOR_TOKEN", "op-secret")
+    monkeypatch.setenv("WHITEBOX_ROOM_TOKEN", "room-secret")
+    free_slots_holder = {"slots": 0}
+
+    def fake_http(url, payload=None, token=None, cloud=None):
+        if "/v1/capacity?" in url:
+            # Simulate shared route showing another tenant's busy group (free_slots=0)
+            return {
+                "backend": "role_pool",
+                "profile": "480",
+                "roles": {"model_group": {"free_slots": 0}},
+            }
+        if url.endswith("/v1/role-pool/capacity"):
+            assert token == "room-secret"
+            assert payload["compatibility"] == state["spec"]["pool"]["compatibility"]
+            return {"free_slots": free_slots_holder["slots"]}
+        if url.endswith("/managed/identity"):
+            role = (
+                "encoder"
+                if ":31000/" in url
+                else ("dit" if ":33000/" in url else "decoder")
+            )
+            return {
+                "service": {
+                    "worker_id": f"{role}-worker",
+                    "role": role,
+                    "service_id": f"{role}-worker/0",
+                },
+                "boot_epoch": f"{role}-boot",
+                "control_epoch": state["spec"]["pool"]["control_epoch"],
+            }
+        if url.endswith("/v1/role-pool/process-status"):
+            role = payload["process_id"].removesuffix("-worker")
+            return {
+                "process": {
+                    "state": "ready",
+                    "seen_at": orch.time.time(),
+                    "manifest": state["resources"][role]["receipt"]["worker_config"],
+                }
+            }
+        raise AssertionError(url)
+
+    monkeypatch.setattr(orch, "http", fake_http)
+    cloud = Mock(timeout=0.05)
+
+    with pytest.raises(OSError, match="No ready player group in compatibility pool"):
+        orch.verify_pool(state, tmp_path, cloud=cloud)
+
+    free_slots_holder["slots"] = 1
+    orch.verify_pool(state, tmp_path, cloud=cloud)
+    assert state["attachment"]["compatibility_capacity"]["480"]["free_slots"] == 1
+
+
+def test_history_strips_inline_image_auth_and_rollback_previous_syncs_oss(
+    state, tmp_path, monkeypatch
+):
+    history_dir = tmp_path / "history"
+    auth_file = tmp_path / "ACR_AUTH"
+    auth_file.write_text("super-secret-acr-auth\n")
+    monkeypatch.setenv("SGLANG_PAI_IMAGE_AUTH_FILE", str(auth_file))
+
+    for c in state["spec"]["roles"].values():
+        c["secret_files"] = {k: "/secrets/" + k for k in launch.SECRET_ENV}
+    state["spec"]["sites"]["h200"]["image_auth_file"] = str(auth_file)
+    state["spec"]["sites"]["h200"]["job_spec"]["ImageConfig"] = {
+        "DockerRegistry": "registry.example",
+        "Username": "user",
+        "Auth": "inline-secret-must-never-persist",
+    }
+
+    # Save V1 (ready) and V2 (ready, active)
+    v1 = copy.deepcopy(state)
+    v1["deployment_id"] = "deploy-20261114T100000Z-v1stable"
+    v1["created_at"] = "2026-11-14T10:00:00Z"
+    v1["phase"] = "ready"
+    rec_v1 = orch.save_history_record(v1, tmp_path / "v1", history_dir=history_dir)
+    serialized_v1 = json.dumps(rec_v1)
+    assert "inline-secret-must-never-persist" not in serialized_v1
+    assert rec_v1["rollback_bundle"]["site_secret_references"]["h200"][
+        "image_auth_file"
+    ] == str(auth_file)
+    assert (
+        "Auth"
+        not in rec_v1["rollback_bundle"]["spec"]["sites"]["h200"]["job_spec"][
+            "ImageConfig"
+        ]
+    )
+
+    v2 = copy.deepcopy(state)
+    v2["deployment_id"] = "deploy-20261114T110000Z-v2canary"
+    v2["created_at"] = "2026-11-14T11:00:00Z"
+    v2["phase"] = "ready"
+    orch.save(tmp_path / "v2/state.json", v2)
+    orch.save_history_record(v2, tmp_path / "v2", history_dir=history_dir)
+
+    resolved_prev = orch.resolve_previous_deployment_id(
+        history_dir, current_deployment_id=v2["deployment_id"]
+    )
+    assert resolved_prev == "deploy-20261114T100000Z-v1stable"
+
+    def fake_prepare(repo_arg, commit_arg, out_dir, oss_prefix_arg):
+        out_dir.mkdir(parents=True, exist_ok=False)
+        payload = b"verified-v1-archive"
+        (out_dir / "source.tar").write_bytes(payload)
+        return {
+            "schema": 1,
+            "commit": commit_arg,
+            "sha256": v1["source"]["sha256"],
+            "uri": v1["source"]["uri"],
+            "tools": v1["source"]["tools"],
+        }
+
+    v1_arc = tmp_path / "v1_arc.tar"
+    v1_arc.write_bytes(b"verified-v1-archive")
+    v1["source"]["sha256"] = source.digest(v1_arc)
+    v1["source"]["uri"] = (
+        f"oss://leap-world-shanghai/test/{v1['source']['commit']}/{v1['source']['sha256']}/source.tar"
+    )
+    orch.save_history_record(v1, tmp_path / "v1", history_dir=history_dir)
+
+    monkeypatch.setattr(orch, "prepare", fake_prepare)
+    monkeypatch.setattr(orch, "down", lambda st, d, c: None)
+    monkeypatch.setattr(
+        orch,
+        "submit",
+        lambda st, d, c: st.update(phase="ready") or orch.save(d / "state.json", st),
+    )
+    rb_dir = tmp_path / "rb-out"
+    rb_state = orch.rollback_deployment(
+        history_dir,
+        resolved_prev,
+        rb_dir,
+        Mock(timeout=1),
+        execute=True,
+        yes=True,
+        current_state_path=tmp_path / "v2/state.json",
+    )
+    assert rb_state["rollback_of"] == "deploy-20261114T100000Z-v1stable"
+    rendered_pai = orch.read(rb_dir / "dit-0/pai.json")
+    assert rendered_pai["JobSpecs"][0]["ImageConfig"]["Auth"] == "super-secret-acr-auth"
+
+    # Verify Cloud.sync_history_artifacts uploads via aliyun oss cp with top-level --endpoint.
+    oss_cmds = []
+    monkeypatch.setattr(
+        orch.subprocess, "run", lambda argv, **kw: oss_cmds.append(list(argv))
+    )
+    orch.write_deployment_summary(rb_state, rb_dir)
+    orch.save_history_record(rb_state, rb_dir, history_dir=history_dir)
+    cloud = orch.Cloud(target=rb_state["target"], aliyun_profile="test-op")
+    synced = cloud.sync_history_artifacts(
+        history_dir, rb_state["deployment_id"], summary_dir=rb_dir
+    )
+    assert len(synced) >= 3
+    assert all("--endpoint" in cmd for cmd in oss_cmds)
+
+
+def test_verify_traffic_quality_decode_psnr_ssim_and_deployment_summary_gate(
+    state, tmp_path
+):
+    import verify_traffic_quality as vtq
+
+    w, h = 64, 48
+    frames_base = []
+    frames_near = []
+    frames_black = []
+    for idx in range(16):
+        pixels = bytearray()
+        near_pixels = bytearray()
+        for y in range(h):
+            for x in range(w):
+                r = (x * 4 + idx * 5) % 256
+                g = (y * 5 + idx * 3) % 256
+                b = ((x + y) * 3 + idx * 7) % 256
+                pixels.extend((r, g, b))
+                near_pixels.extend((min(255, r + (idx % 2)), g, b))
+        frames_base.append(bytes(pixels))
+        frames_near.append(bytes(near_pixels))
+        frames_black.append(b"\x00" * (w * h * 3))
+
+    batches = [
+        {
+            "output_frame_start": i,
+            "num_frames": 1,
+            "width": w,
+            "height": h,
+            "encoding": "raw",
+            "payload": f,
+        }
+        for i, f in enumerate(frames_base)
+    ]
+    decoded = vtq.decode_frame_batches_to_rgb(
+        batches, expected_width=w, expected_height=h
+    )
+    assert decoded == frames_base
+
+    # Without a pinned baseline, intrinsic quality may pass, but quality_unchanged MUST fail-closed to False!
+    base_eval = vtq.evaluate_visual_quality(
+        frames_base, width=w, height=h, min_frames=16
+    )
+    assert base_eval["intrinsic_quality"]["passed"] is True
+    assert base_eval["quality_unchanged"] is False
+    assert base_eval["is_baseline"] is True
+
+    # Even with baseline_frames, missing baseline_identity MUST fail-closed to False!
+    unbound_eval = vtq.evaluate_visual_quality(
+        frames_near,
+        width=w,
+        height=h,
+        min_frames=16,
+        baseline_frames=frames_base,
+        baseline_identity=None,
+    )
+    assert unbound_eval["quality_unchanged"] is False
+
+    base_dir = tmp_path / "pinned-baseline"
+    vtq.save_frames_png(frames_base, base_dir / "frames", width=w, height=h)
+    base_manifest = vtq.write_baseline_manifest(
+        base_dir,
+        frames=frames_base,
+        width=w,
+        height=h,
+        case_id="shanghai_drive_baseline",
+        seed=886410,
+        inference_steps=2,
+    )
+
+    near_eval = vtq.evaluate_visual_quality(
+        frames_near,
+        width=w,
+        height=h,
+        min_frames=16,
+        baseline_frames=frames_base,
+        baseline_identity=base_manifest,
+    )
+    assert near_eval["quality_unchanged"] is True
+    assert near_eval["baseline_comparison"]["mean_psnr_db"] > 45.0
+    assert near_eval["baseline_comparison"]["mean_ssim"] > 0.99
+
+    black_eval = vtq.evaluate_visual_quality(
+        frames_black,
+        width=w,
+        height=h,
+        min_frames=16,
+        baseline_frames=frames_base,
+        baseline_identity=base_manifest,
+    )
+    assert black_eval["quality_unchanged"] is False
+
+    # Bind to deployment state and verify acceptance_gates in deployment.json.
+    run_dir = tmp_path / "dep-qual"
+    run_dir.mkdir()
+    state["phase"] = "ready"
+    orch.save(run_dir / "state.json", state)
+    with pytest.raises(
+        ValueError, match="Baseline recording output cannot be attached"
+    ):
+        vtq.attach_verification_to_deployment(run_dir / "state.json", base_eval)
+    summary = vtq.attach_verification_to_deployment(run_dir / "state.json", near_eval)
+    assert summary["acceptance_gates"]["quality_unchanged"] is True
+
+
+def test_last_receipt_prefers_gpu_uuid_over_nested_runtime_gpu_in_truncated_pai_log():
+    truncated_line = (
+        '{"schema":1,"role":"dit","archive_sha256":"'
+        + ("a" * 64)
+        + '","worker_id":"dit-test","status":"ready","runtime":{"torch":"2.13.0","gpu":"NVIDIA L20X"},'
+        '"gpu":"GPU-31ae5499-2973-a77a-2b80-61fe52b8e01a, NVIDIA L20X, 143771 MiB, 1 MiB","pod":"dlc-'
+    )
+    parsed = orch.last_receipt(truncated_line, "dit")
+    assert (
+        parsed["gpu"]
+        == "GPU-31ae5499-2973-a77a-2b80-61fe52b8e01a, NVIDIA L20X, 143771 MiB, 1 MiB"
+    )
+
+
+def test_check_role_warmup_and_pool_capacity_reads_nested_model_group_free_slots(
+    monkeypatch,
+):
+    import verify_traffic_quality as vtq
+
+    def fake_http_json(url, payload=None, token=None, timeout=10.0):
+        if url.endswith("/health"):
+            role = (
+                "encoder"
+                if "31000" in url
+                else ("dit" if "33000" in url else "decoder")
+            )
+            return {"ready": True, "role": role, "warmed_up": True}
+        if "/v1/capacity?" in url:
+            return {"backend": "role_pool", "profile": "480"}
+        if url.endswith("/v1/role-pool/capacity"):
+            return {
+                "backend": "role_pool",
+                "profile": "480",
+                "roles": {"model_group": {"free_slots": 1, "active_sessions": 0}},
+            }
+        raise AssertionError(url)
+
+    monkeypatch.setattr(vtq, "_http_json", fake_http_json)
+    report = vtq.check_role_warmup_and_pool_capacity(
+        role_urls={
+            "encoder": "http://10.0.0.10:31000",
+            "dit": "http://10.0.0.11:33000",
+            "decoder": "http://10.0.0.12:36000",
+        },
+        coordinator_url="http://10.0.0.121:28181",
+        routing_revision="whitebox-copy-model1027-480",
+        compatibility="h200-deploy-verify-20261114",
+        profile="480",
+        network_domain="shanghai-vpc-h100-h200",
+        room_token="t" * 64,
+    )
+    assert report["all_roles_warmed_up"] is True
+    assert (
+        report["capacity"]["exact_group_capacity"]["roles"]["model_group"]["free_slots"]
+        == 1
+    )
+
+
+def test_infer_denoising_steps_from_state_handles_csv_and_list():
+    import verify_traffic_quality as vtq
+
+    assert (
+        vtq.infer_denoising_steps_from_state(
+            {
+                "spec": {
+                    "roles": {
+                        "dit": {"dit_options": {"zing_denoising_step_list": "1000,500"}}
+                    }
+                }
+            }
+        )
+        == 2
+    )
+    assert (
+        vtq.infer_denoising_steps_from_state(
+            {
+                "spec": {
+                    "roles": {
+                        "dit": {
+                            "dit_options": {
+                                "zing_denoising_step_list": [1000, 750, 500, 250]
+                            }
+                        }
+                    }
+                }
+            }
+        )
+        == 4
+    )
+    assert vtq.infer_denoising_steps_from_state({}) is None
+
+
+def test_decode_mp4_to_rgb_uses_ffmpeg_rawvideo_pipeline(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    import verify_traffic_quality as vtq
+
+    fake_mp4 = tmp_path / "model.mp4"
+    fake_mp4.write_bytes(b"mp4")
+    w, h = 8, 6
+    expected = [bytes([10 + i]) * (w * h * 3) for i in range(4)]
+
+    monkeypatch.setattr(vtq.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(
+        vtq.subprocess,
+        "run",
+        lambda *a, **kw: SimpleNamespace(
+            returncode=0, stdout=b"".join(expected), stderr=b""
+        ),
+    )
+    decoded = vtq.decode_mp4_to_rgb(fake_mp4, expected_width=w, expected_height=h)
+    assert decoded == expected
+
+
+def test_resolve_previous_deployment_id_does_not_skip_cleanly_stopped_v1_over_older_v0(
+    state, tmp_path
+):
+    history_dir = tmp_path / "history"
+    base_state = copy.deepcopy(state)
+    base_state["spec"]["target"] = copy.deepcopy(orch.TARGET)
+
+    for dep_id, ts, phase in (
+        ("deploy-20261114T090000Z-v0full", "2026-11-14T09:00:00Z", "ready"),
+        ("deploy-20261114T100000Z-v1reuse", "2026-11-14T10:00:00Z", "stopped"),
+        ("deploy-20261114T110000Z-v2reuse", "2026-11-14T11:00:00Z", "ready"),
+    ):
+        st = copy.deepcopy(base_state)
+        st["deployment_id"] = dep_id
+        st["created_at"] = ts
+        st["phase"] = phase
+        d = tmp_path / dep_id
+        orch.save(d / "state.json", st)
+        orch.save_history_record(st, d, history_dir=history_dir)
+
+    assert (
+        orch.resolve_previous_deployment_id(
+            history_dir, current_deployment_id="deploy-20261114T110000Z-v2reuse"
+        )
+        == "deploy-20261114T100000Z-v1reuse"
+    )
+
+
+def test_submit_sends_image_auth_to_pai_without_persisting_auth_in_state_json(
+    state, tmp_path, monkeypatch
+):
+    auth_file = tmp_path / "acr_auth.secret"
+    auth_file.write_text("top-secret-acr-auth-value\n")
+    out_dir = tmp_path / "auth-run"
+    out_dir.mkdir()
+    (out_dir / "source").mkdir()
+    (out_dir / "source/source.tar").write_bytes(b"fake-source-archive")
+    st = copy.deepcopy(state)
+    new_sha = source.digest(out_dir / "source/source.tar")
+    st["source"]["sha256"] = new_sha
+    st["source"]["uri"] = (
+        f"oss://leap-world-shanghai/test/{st['source']['commit']}/{new_sha}/source.tar"
+    )
+    st["resources"] = {}
+    st["spec"]["target"] = copy.deepcopy(orch.TARGET)
+    st["spec"]["existing_services"] = {
+        "encoder": {"http": "http://10.0.0.10:31000", "worker_id": "enc-0"},
+        "decoder": {"http": "http://10.0.0.11:36000", "worker_id": "dec-0"},
+    }
+    st["spec"]["roles"]["encoder"]["mode"] = "reuse"
+    st["spec"]["roles"]["decoder"]["mode"] = "reuse"
+    st["spec"]["sites"]["h200"]["image_auth_file"] = str(auth_file)
+    orch.render_roles(st, out_dir)
+    orch.save(out_dir / "state.json", st)
+
+    submitted_payloads = []
+    cloud = Mock(timeout=1)
+    cloud.upload_source = Mock()
+    cloud.submit_job = Mock(
+        side_effect=lambda payload: (
+            submitted_payloads.append(copy.deepcopy(payload)) or "dlc-auth-check-1"
+        )
+    )
+    monkeypatch.setattr(orch, "wait_ready", lambda s, d, c: None)
+
+    orch.submit(st, out_dir, cloud)
+
+    assert len(submitted_payloads) == 1
+    assert (
+        submitted_payloads[0]["JobSpecs"][0]["ImageConfig"]["Auth"]
+        == "top-secret-acr-auth-value"
+    )
+    persisted_text = (out_dir / "state.json").read_text()
+    assert "top-secret-acr-auth-value" not in persisted_text
+    persisted_state = orch.read(out_dir / "state.json")
+    assert "Auth" not in persisted_state["resources"]["dit"]["expected_job"][
+        "JobSpecs"
+    ][0].get("ImageConfig", {})
+
+
+def test_fixed_environment_oss_history_prefixes_and_legacy_thailand_bucket_guard():
+    assert (
+        orch.resolve_oss_history_prefix(
+            {"environment": "selftest", "region": "cn-shanghai"}
+        )
+        == "oss://leap-world-shanghai/sglang/deployments/selftest"
+    )
+    assert (
+        orch.resolve_oss_history_prefix(
+            {"environment": "selftest", "region": "ap-southeast-7"}
+        )
+        == "oss://leap-worldmodel-thailand-single-az/sglang/deployments/selftest"
+    )
+    assert (
+        orch.resolve_oss_history_prefix(
+            {"environment": "dev-h200-smoke", "region": "cn-shanghai"}
+        )
+        == "oss://leap-world-shanghai/sglang/deployments/selftest/dev-h200-smoke"
+    )
+    assert (
+        orch.resolve_oss_history_prefix({"environment": "test-shanghai-copy"})
+        == "oss://leap-world-shanghai/sglang/deployments/test-shanghai-copy"
+    )
+    assert (
+        orch.resolve_oss_history_prefix({"environment": "prod-shanghai"})
+        == "oss://leap-world-shanghai/sglang/deployments/prod-shanghai"
+    )
+    assert (
+        orch.resolve_oss_history_prefix({"environment": "prod-thailand"})
+        == "oss://leap-worldmodel-thailand-single-az/sglang/deployments/prod-thailand"
+    )
+
+    bad_thailand = {
+        "environment": "prod-thailand",
+        "region": "ap-southeast-7",
+        "workspace_id": "ws-th",
+        "quota_id": "quota-th",
+        "coordinator_url": "http://10.2.0.10:18181",
+        "pool_id": "prod-th-pool",
+        "room_url": "http://10.2.0.11:8092",
+        "wtp_url": "https://wtp-th.example.com",
+        "oss_prefix": "oss://leap-worldmodel-thailand/sglang/orchestration",
+    }
+    with pytest.raises(ValueError, match="leap-worldmodel-thailand-single-az"):
+        orch.check_target(bad_thailand)
+
+    good_thailand = {
+        **bad_thailand,
+        "oss_prefix": "oss://leap-worldmodel-thailand-single-az/sglang/orchestration",
+    }
+    orch.check_target(good_thailand)
+
+
+def test_default_oss_archiving_merges_remote_index_and_optional_local_mirror(
+    state, tmp_path, monkeypatch, capsys
+):
+    parser = orch.build_arg_parser()
+    for argv in (
+        ["up", "--spec", "s.json", "--output", "out", "--commit", "a" * 40],
+        ["selftest", "--state", "st.json"],
+        ["attach", "--state", "st.json"],
+        ["down", "--state", "st.json"],
+        ["rollback", "--previous", "--output", "rb"],
+    ):
+        ns = parser.parse_args(argv)
+        assert ns.sync_oss is True
+        assert ns.history_dir is None
+
+    ns_disabled = parser.parse_args(
+        [
+            "attach",
+            "--state",
+            "st.json",
+            "--no-sync-oss",
+            "--local-history-dir",
+            "/tmp/h",
+        ]
+    )
+    assert ns_disabled.sync_oss is False
+    assert ns_disabled.history_dir == Path("/tmp/h")
+
+    # Simulate an in-memory OSS bucket backing fixed environment prefixes.
+    fake_oss_objects = {}
+    prefix = "oss://leap-world-shanghai/sglang/deployments/test-shanghai-copy"
+    legacy_index_bytes = json.dumps(
+        {
+            "schema": 1,
+            "deployments": [
+                {
+                    "deployment_id": "deploy-20261114T080000Z-existing",
+                    "run_id": "0" * 32,
+                    "created_at": "2026-11-14T08:00:00Z",
+                    "phase": "ready",
+                    "environment": "test-shanghai-copy",
+                }
+            ],
+        }
+    ).encode()
+    fake_oss_objects[f"{prefix}/index.json"] = legacy_index_bytes
+
+    def fake_upload(self, local_path, uri):
+        fake_oss_objects[uri] = Path(local_path).read_bytes()
+
+    def fake_download(self, uri, local_path):
+        if uri not in fake_oss_objects:
+            return False
+        p = Path(local_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(fake_oss_objects[uri])
+        return True
+
+    def fake_list(self, uri_prefix):
+        norm = uri_prefix.rstrip("/") + "/"
+        return sorted(
+            k for k in fake_oss_objects if k.startswith(norm) and not k.endswith("/")
+        )
+
+    monkeypatch.setattr(orch.Cloud, "upload_source", fake_upload)
+    monkeypatch.setattr(orch.Cloud, "download_oss_optional", fake_download)
+    monkeypatch.setattr(orch.Cloud, "list_oss_objects", fake_list)
+
+    st = copy.deepcopy(state)
+    st["deployment_id"] = "deploy-20261115T090000Z-newoss"
+    st["created_at"] = "2026-11-15T09:00:00Z"
+    st["phase"] = "ready"
+    for c in st["spec"]["roles"].values():
+        c["secret_files"] = {k: "/secrets/" + k for k in launch.SECRET_ENV}
+    run_dir = tmp_path / "run-default-oss"
+    orch.write_deployment_summary(st, run_dir)
+    orch.save_history_record(st, run_dir)
+    # Without --local-history-dir, only staging under run_dir/history exists (never repo .sglang-deployments).
+    assert (run_dir / "history" / f"{st['deployment_id']}.json").is_file()
+    assert orch.optional_local_history_dir(st) is None
+
+    cloud = orch.Cloud(target=st["target"], aliyun_profile="test-op")
+    orch._maybe_sync_oss_history(st, run_dir, cloud)
+    assert f"{prefix}/{st['deployment_id']}.json" in fake_oss_objects
+    assert f"{prefix}/{st['deployment_id']}/deployment.json" in fake_oss_objects
+    assert f"{prefix}/{st['deployment_id']}/DEPLOYMENT.md" in fake_oss_objects
+    assert any(
+        k.startswith(f"{prefix}/entries/{st['deployment_id']}/") and k.endswith(".json")
+        for k in fake_oss_objects
+    )
+    assert any(
+        k.startswith(f"{prefix}/records/{st['deployment_id']}/") and k.endswith(".json")
+        for k in fake_oss_objects
+    )
+    # Legacy index.json is NEVER overwritten by writers; read-side merges legacy + immutable shards.
+    assert fake_oss_objects[f"{prefix}/index.json"] == legacy_index_bytes
+
+    # CLI `history` and `show` read directly from OSS by default without --local-history-dir!
+    orch.main(
+        [
+            "history",
+            "--environment",
+            "test-shanghai-copy",
+            "--aliyun-profile",
+            "test-op",
+        ]
+    )
+    hist_out = json.loads(capsys.readouterr().out)
+    assert [d["deployment_id"] for d in hist_out] == [
+        "deploy-20261114T080000Z-existing",
+        "deploy-20261115T090000Z-newoss",
+    ]
+
+    orch.main(
+        [
+            "show",
+            "--environment",
+            "test-shanghai-copy",
+            "--deployment-id",
+            st["deployment_id"],
+            "--aliyun-profile",
+            "test-op",
+        ]
+    )
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["deployment_id"] == st["deployment_id"]
+
+    # Optional --local-history-dir mirrors artifacts locally as well.
+    mirror_dir = tmp_path / "optional-local-mirror"
+    orch._maybe_sync_oss_history(st, run_dir, cloud, history_dir=mirror_dir)
+    assert (mirror_dir / f"{st['deployment_id']}.json").is_file()
+    assert (mirror_dir / "index.json").is_file()
+
+
+def test_verify_traffic_quality_stdlib_png_roundtrip_without_pillow(
+    tmp_path, monkeypatch
+):
+    import verify_traffic_quality as vtq
+
+    monkeypatch.setitem(sys.modules, "PIL", None)
+    w, h = 32, 24
+    frames = []
+    for idx in range(3):
+        buf = bytearray()
+        for y in range(h):
+            for x in range(w):
+                buf.extend(((x * 7 + idx) % 256, (y * 11 + idx) % 256, (x ^ y) % 256))
+        frames.append(bytes(buf))
+    out_dir = tmp_path / "png-frames"
+    saved = vtq.save_frames_png(frames, out_dir, width=w, height=h)
+    assert len(saved) == 3
+    loaded, lw, lh = vtq.load_frames_png(out_dir)
+    assert (lw, lh) == (w, h)
+    assert loaded == frames
+
+
+def test_fail_closed_baseline_manifest_and_cli_mode_separation(tmp_path):
+    import verify_traffic_quality as vtq
+
+    parser = vtq.build_arg_parser()
+    # Candidate `run` and `compare-dirs` MUST require --baseline-dir (cannot omit it).
+    with pytest.raises(SystemExit):
+        parser.parse_args(["run", "--output-dir", str(tmp_path / "out")])
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "compare-dirs",
+                "--candidate-dir",
+                str(tmp_path / "cand"),
+                "--output",
+                str(tmp_path / "cmp.json"),
+            ]
+        )
+    # `record-baseline` does not accept `--state` so it can never mutate a candidate deployment.
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "record-baseline",
+                "--state",
+                str(tmp_path / "state.json"),
+                "--output-dir",
+                str(tmp_path / "base"),
+            ]
+        )
+
+    w, h = 32, 24
+    frames = []
+    for idx in range(16):
+        buf = bytearray()
+        for y in range(h):
+            for x in range(w):
+                buf.extend(
+                    ((x * 5 + idx * 7) % 256, (y * 9 + idx * 3) % 256, (x + y) % 256)
+                )
+        frames.append(bytes(buf))
+
+    unpinned_dir = tmp_path / "unpinned-base"
+    vtq.save_frames_png(frames, unpinned_dir / "frames", width=w, height=h)
+    # Missing baseline_manifest.json fails closed.
+    with pytest.raises(ValueError, match="missing required baseline_manifest.json"):
+        vtq.load_verified_baseline(unpinned_dir, expected_width=w, expected_height=h)
+
+    manifest = vtq.write_baseline_manifest(
+        unpinned_dir,
+        frames=frames,
+        width=w,
+        height=h,
+        case_id="shanghai_drive_baseline",
+        seed=886410,
+        inference_steps=2,
+    )
+    loaded, lw, lh, loaded_manifest = vtq.load_verified_baseline(
+        unpinned_dir,
+        expected_width=w,
+        expected_height=h,
+        expected_case_id="shanghai_drive_baseline",
+        expected_seed=886410,
+        expected_inference_steps=2,
+    )
+    assert loaded == frames
+    assert (lw, lh) == (w, h)
+    assert loaded_manifest["frames_sha256"] == manifest["frames_sha256"]
+
+    # Seed / case_id / inference_steps mismatch fails closed!
+    with pytest.raises(ValueError, match="Baseline seed"):
+        vtq.load_verified_baseline(
+            unpinned_dir, expected_width=w, expected_height=h, expected_seed=999999
+        )
+    with pytest.raises(ValueError, match="Baseline case_id"):
+        vtq.load_verified_baseline(
+            unpinned_dir,
+            expected_width=w,
+            expected_height=h,
+            expected_case_id="wrong_case",
+        )
+    with pytest.raises(ValueError, match="Baseline inference_steps"):
+        vtq.load_verified_baseline(
+            unpinned_dir,
+            expected_width=w,
+            expected_height=h,
+            expected_inference_steps=4,
+        )
+
+    # Tampering a frame invalidates frames_sha256 and fails closed!
+    vtq.save_frames_png(
+        [b"\x10" * (w * h * 3)] + frames[1:], unpinned_dir / "frames", width=w, height=h
+    )
+    with pytest.raises(ValueError, match="do not match pinned baseline_manifest.json"):
+        vtq.load_verified_baseline(unpinned_dir, expected_width=w, expected_height=h)
+
+
+def test_traffic_ready_gate_requires_traffic_accepted_and_fails_on_failed_session(
+    state, tmp_path
+):
+    import verify_traffic_quality as vtq
+
+    st = copy.deepcopy(state)
+    st["phase"] = "ready"
+    for c in st["spec"]["roles"].values():
+        c["secret_files"] = {k: "/secrets/" + k for k in launch.SECRET_ENV}
+    st["attachment"] = {
+        "identities": {
+            r: {
+                "process_id": f"{r}-worker",
+                "boot_epoch": f"{r}-boot",
+                "service_id": f"{r}-worker/0",
+            }
+            for r in orch.ROLES
+        }
+    }
+    run_dir = tmp_path / "dep-traffic-gate"
+    run_dir.mkdir()
+    orch.save(run_dir / "state.json", st)
+
+    # 1. Pool attached alone without live traffic verification MUST have traffic_ready == False.
+    pre_summary = orch.write_deployment_summary(st, run_dir)
+    assert pre_summary["pool_attached"] is True
+    assert pre_summary["acceptance_gates"]["traffic_ready"] is False
+
+    # 2. Failed live traffic verification (e.g. lease not released or insufficient frames) MUST keep traffic_ready == False!
+    failed_traffic_report = {
+        "schema": 1,
+        "deployment_id": st.get("deployment_id"),
+        "traffic_accepted": False,
+        "warmup_verified": True,
+        "quality_unchanged": False,
+        "is_baseline": False,
+        "baseline_identity": None,
+        "intrinsic_quality": {"passed": False},
+        "baseline_comparison": None,
+    }
+    failed_summary = vtq.attach_verification_to_deployment(
+        run_dir / "state.json", failed_traffic_report
+    )
+    assert failed_summary["pool_attached"] is True
+    assert failed_summary["acceptance_gates"]["traffic_ready"] is False
+    assert failed_summary["acceptance_gates"]["quality_unchanged"] is False
+
+    # 3. Only when pool_attached is True AND traffic_accepted is True does traffic_ready become True.
+    passed_traffic_report = {
+        **failed_traffic_report,
+        "traffic_accepted": True,
+    }
+    passed_summary = vtq.attach_verification_to_deployment(
+        run_dir / "state.json", passed_traffic_report
+    )
+    assert passed_summary["acceptance_gates"]["traffic_ready"] is True
+
+
+def test_reused_roles_missing_or_false_warmed_up_fail_closed_in_precheck_and_summary(
+    state, tmp_path, monkeypatch
+):
+    import verify_traffic_quality as vtq
+
+    # 1. Precheck: reused encoder missing `warmed_up` field or reporting `warmed_up=False` fails closed.
+    encoder_health_payload = {"ready": True, "role": "encoder"}  # No warmed_up key!
+
+    def fake_http_json(url, payload=None, token=None, timeout=10.0):
+        if url.endswith("/health"):
+            if "31000" in url:
+                return dict(encoder_health_payload)
+            role = "dit" if "33000" in url else "decoder"
+            return {"ready": True, "role": role, "warmed_up": True}
+        raise AssertionError(url)
+
+    monkeypatch.setattr(vtq, "_http_json", fake_http_json)
+    urls = {
+        "encoder": "http://10.0.0.10:31000",
+        "dit": "http://10.0.0.11:33000",
+        "decoder": "http://10.0.0.12:36000",
+    }
+    rep_missing = vtq.check_role_warmup_and_pool_capacity(
+        role_urls=urls,
+        coordinator_url=None,
+        routing_revision=None,
+        compatibility=None,
+        profile="480",
+        network_domain="shanghai-vpc-h100-h200",
+        room_token=None,
+    )
+    assert rep_missing["all_roles_warmed_up"] is False
+    assert rep_missing["roles"]["encoder"]["warmed_up"] is False
+    assert rep_missing["roles"]["encoder"]["explicit_warmup_flag"] is False
+
+    encoder_health_payload["warmed_up"] = False
+    rep_false = vtq.check_role_warmup_and_pool_capacity(
+        role_urls=urls,
+        coordinator_url=None,
+        routing_revision=None,
+        compatibility=None,
+        profile="480",
+        network_domain="shanghai-vpc-h100-h200",
+        room_token=None,
+    )
+    assert rep_false["all_roles_warmed_up"] is False
+    assert rep_false["roles"]["encoder"]["warmed_up"] is False
+
+    # 2. Deployment summary: reused encoder/decoder without explicit warmed_up=True MUST NOT default to True!
+    st = copy.deepcopy(state)
+    st["phase"] = "ready"
+    st["spec"]["existing_services"] = {
+        "encoder": {
+            "http": "http://10.0.0.10:31000",
+            "worker_id": "enc-legacy",
+            "gpu": "GPU-enc",
+            "boot_epoch": "be-enc",
+        },
+        "decoder": {
+            "http": "http://10.0.0.12:36000",
+            "worker_id": "dec-warmed",
+            "gpu": "GPU-dec",
+            "boot_epoch": "be-dec",
+        },
+    }
+    st["spec"]["roles"] = {"dit": st["spec"]["roles"]["dit"]}
+    st["resources"]["encoder"] = orch.reused_resource(
+        st["run_id"], "model1027", "encoder", st["spec"]["existing_services"]["encoder"]
+    )
+    st["resources"]["decoder"] = orch.reused_resource(
+        st["run_id"], "model1027", "decoder", st["spec"]["existing_services"]["decoder"]
+    )
+    # Dit and decoder explicitly report warmed_up=True, but reused encoder omits warmed_up:
+    st["resources"]["dit"]["receipt"]["warmed_up"] = True
+    st["resources"]["decoder"]["receipt"]["warmed_up"] = True
+    assert "warmed_up" not in st["resources"]["encoder"]["receipt"]
+
+    sum_missing = orch.write_deployment_summary(st, tmp_path / "sum-missing")
+    assert sum_missing["roles"]["encoder"]["warmup"]["warmed_up"] is False
+    assert sum_missing["roles"]["dit"]["warmup"]["warmed_up"] is True
+    assert sum_missing["roles"]["decoder"]["warmup"]["warmed_up"] is True
+    assert sum_missing["acceptance_gates"]["all_roles_warmed_up"] is False
+
+    # Reused decoder explicitly reporting warmed_up=False also fails closed:
+    st["resources"]["encoder"]["receipt"]["warmed_up"] = True
+    st["resources"]["decoder"]["receipt"]["warmed_up"] = False
+    sum_false = orch.write_deployment_summary(st, tmp_path / "sum-false")
+    assert sum_false["roles"]["decoder"]["warmup"]["warmed_up"] is False
+    assert sum_false["acceptance_gates"]["all_roles_warmed_up"] is False
+
+    # Only when all three roles (owned + reused) explicitly report warmed_up=True does the gate pass:
+    st["resources"]["decoder"]["receipt"]["warmed_up"] = True
+    sum_all_ok = orch.write_deployment_summary(st, tmp_path / "sum-ok")
+    assert sum_all_ok["acceptance_gates"]["all_roles_warmed_up"] is True
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_quality_cli_reads_coordinator_from_state_target(
+    state, tmp_path, monkeypatch, override
+):
+    import verify_traffic_quality as vtq
+
+    state_path = tmp_path / "state.json"
+    orch.save(state_path, state)
+    monkeypatch.setattr(
+        vtq, "load_verified_baseline", lambda *a, **kw: ([], 832, 480, {})
+    )
+    expected = (
+        "http://override:18181" if override else state["target"]["coordinator_url"]
+    )
+
+    def precheck(**kwargs):
+        assert kwargs["coordinator_url"] == expected
+        raise RuntimeError("precheck reached expected Coordinator")
+
+    monkeypatch.setattr(vtq, "check_role_warmup_and_pool_capacity", precheck)
+    argv = [
+        "run",
+        "--state",
+        str(state_path),
+        "--output-dir",
+        str(tmp_path / "quality"),
+        "--baseline-dir",
+        str(tmp_path / "baseline"),
+    ]
+    if override:
+        argv += ["--coordinator-url", expected]
+    with pytest.raises(RuntimeError, match="precheck reached expected Coordinator"):
+        vtq.main(argv)
+
+
+@pytest.mark.parametrize("difference", ["environment", "model_id", "route"])
+def test_previous_rollback_skips_unrelated_deployments(state, tmp_path, difference):
+    store = tmp_path / "scope-history"
+    for i, dep_id in enumerate(("stable", "unrelated", "current")):
+        st = copy.deepcopy(state)
+        st.update(
+            deployment_id=dep_id, created_at=f"2026-11-15T0{i}:00:00Z", phase="ready"
+        )
+        if dep_id == "unrelated":
+            if difference == "environment":
+                st["target"]["environment"] = "other-environment"
+            else:
+                st["spec"][difference] = "other-" + difference
+        orch.save_history_record(st, history_dir=store)
+    assert orch.resolve_previous_deployment_id(store, "current") == "stable"
+    (store / "stable.json").unlink()
+    # With no matching stable version, fail instead of falling back to an unrelated entry.
+    index = orch.read(store / "index.json")
+    index["deployments"] = [
+        e for e in index["deployments"] if e["deployment_id"] != "stable"
+    ]
+    orch.save(store / "index.json", index)
+    with pytest.raises(ValueError, match="No previous stable deployment matches"):
+        orch.resolve_previous_deployment_id(store, "current")
+    with pytest.raises(ValueError, match="absent from history"):
+        orch.resolve_previous_deployment_id(store, "missing")
+
+
+def test_explicit_rollback_scope_mismatch_cannot_stop_current(
+    state, tmp_path, monkeypatch
+):
+    state["deployment_id"] = "current"
+    current_path = tmp_path / "current.json"
+    orch.save(current_path, state)
+    target = copy.deepcopy(state)
+    target["deployment_id"] = "unrelated"
+    target["target"]["environment"] = "other-environment"
+    store = tmp_path / "scope-history"
+    orch.save_history_record(target, history_dir=store)
+    down = Mock()
+    monkeypatch.setattr(orch, "down", down)
+    with pytest.raises(ValueError, match="does not match the current deployment"):
+        orch.rollback_deployment(
+            store,
+            "unrelated",
+            tmp_path / "rollback",
+            Mock(),
+            current_state_path=current_path,
+            execute=True,
+            yes=True,
+        )
+    down.assert_not_called()
+    assert not (tmp_path / "rollback").exists()
+
+
+def test_rollback_sla_includes_stopping_previous_deployment(
+    state, tmp_path, monkeypatch
+):
+    state["phase"] = "ready"
+    state["selftest"] = dict(
+        status="passed",
+        source=state["source"],
+        worker_ids={
+            r: state["resources"][r]["receipt"]["worker_id"] for r in orch.ROLES
+        },
+    )
+    state["timings_sec"] = dict(up_total_sec=500, selftest_sec=20, stop_previous_sec=40)
+    monkeypatch.setenv("ROLE_POOL_SIGNING_KEY", "s" * 32)
+    monkeypatch.setenv("ROLE_POOL_OPERATOR_TOKEN", "test")
+    monkeypatch.setattr(orch, "worker_configs", lambda st: {})
+    monkeypatch.setattr(
+        orch, "http", lambda *a, **kw: dict(backend="role_pool", profile="480")
+    )
+    monkeypatch.setattr(orch, "_preflight_or_reconcile_owned_endpoints", Mock())
+    monkeypatch.setattr(orch, "_attach_owned_endpoints_in_place", Mock())
+    monkeypatch.setattr(orch, "verify_pool", Mock())
+    ticks = iter((0, 0, 50))
+    monkeypatch.setattr(orch.time, "monotonic", lambda: next(ticks))
+    orch.attach(state, tmp_path, Mock(timeout=100), execute=True, in_place=True)
+    assert state["timings_sec"]["end_to_end_sec"] == 610
+    assert state["timings_sec"]["within_10min_sla"] is False
+
+
+def test_oss_history_distinguishes_not_found_from_errors_and_never_overwrites_index(
+    state, tmp_path, monkeypatch, capsys
+):
+    from types import SimpleNamespace
+
+    cloud = orch.Cloud(target=copy.deepcopy(orch.TARGET), aliyun_profile="test-op")
+
+    # 1. Explicit 404 NoSuchKey returns False for download_oss_optional and [] for empty list_oss_objects.
+    monkeypatch.setattr(
+        orch.subprocess,
+        "run",
+        lambda argv, **kw: SimpleNamespace(
+            returncode=1,
+            stdout="FinishWithError: Scanned 1 objects. Error num: 1.\n",
+            stderr='\x1b[1;31mERROR: oss: service returned error: StatusCode=404, ErrorCode=NoSuchKey, ErrorMessage="The specified key does not exist."\x1b[0m\n',
+        ),
+    )
+    assert (
+        cloud.download_oss_optional(
+            "oss://leap-world-shanghai/sglang/deployments/test-shanghai-copy/missing.json",
+            tmp_path / "missing.json",
+        )
+        is False
+    )
+    assert not (tmp_path / "missing.json").exists()
+
+    monkeypatch.setattr(
+        orch.subprocess,
+        "run",
+        lambda argv, **kw: SimpleNamespace(
+            returncode=0,
+            stdout="Object Number is: 0\n\n0.12(s) elapsed\n",
+            stderr="",
+        ),
+    )
+    assert (
+        cloud.list_oss_objects(
+            "oss://leap-world-shanghai/sglang/deployments/test-shanghai-copy/entries/"
+        )
+        == []
+    )
+
+    # 2. Non-NotFound CLI errors (403 AccessDenied, 429 SlowDown, 503 ServiceUnavailable,
+    #    404 NoSuchBucket, network timeout, unknown silent rc=1) MUST fail-closed with RuntimeError!
+    for bad_stderr in (
+        "ERROR: oss: service returned error: StatusCode=403, ErrorCode=AccessDenied",
+        "ERROR: oss: service returned error: StatusCode=429, ErrorCode=SlowDown",
+        "ERROR: oss: service returned error: StatusCode=503, ErrorCode=ServiceUnavailable",
+        "ERROR: oss: service returned error: StatusCode=404, ErrorCode=NoSuchBucket",
+        "ERROR: dial tcp 10.0.0.1:443: i/o timeout",
+        "",
+    ):
+        monkeypatch.setattr(
+            orch.subprocess,
+            "run",
+            lambda argv, _err=bad_stderr, **kw: SimpleNamespace(
+                returncode=1, stdout="", stderr=_err
+            ),
+        )
+        with pytest.raises(RuntimeError, match="OSS download failed"):
+            cloud.download_oss_optional(
+                "oss://leap-world-shanghai/sglang/deployments/test-shanghai-copy/index.json",
+                tmp_path / "err.json",
+            )
+        with pytest.raises(RuntimeError, match="OSS list failed"):
+            cloud.list_oss_objects(
+                "oss://leap-world-shanghai/sglang/deployments/test-shanghai-copy/entries/"
+            )
+
+    # 3. End-to-end simulated OSS with legacy index.json (v1) + shard (v2):
+    #    Transient read/list failure MUST NEVER overwrite remote index.json and MUST fail-closed
+    #    on `history` and `rollback --previous` rather than treating history as empty or picking wrong version!
+    fake_oss = {}
+    prefix = "oss://leap-world-shanghai/sglang/deployments/test-shanghai-copy"
+    read_failure = {"mode": None}
+
+    def _cli_sim(argv, **kw):
+        op_idx = argv.index("oss")
+        subcmd = argv[op_idx + 1]
+        if subcmd == "cp":
+            src, dst = argv[op_idx + 3], argv[op_idx + 4]
+            if src.startswith("oss://"):
+                if read_failure["mode"] == "download":
+                    return SimpleNamespace(
+                        returncode=1,
+                        stdout="",
+                        stderr="ERROR: oss: service returned error: StatusCode=503, ErrorCode=ServiceUnavailable",
+                    )
+                if src not in fake_oss:
+                    return SimpleNamespace(
+                        returncode=1,
+                        stdout="",
+                        stderr='ERROR: oss: service returned error: StatusCode=404, ErrorCode=NoSuchKey, ErrorMessage="The specified key does not exist."',
+                    )
+                Path(dst).parent.mkdir(parents=True, exist_ok=True)
+                Path(dst).write_bytes(fake_oss[src])
+                return SimpleNamespace(returncode=0, stdout="Succeed\n", stderr="")
+            else:
+                fake_oss[dst] = Path(src).read_bytes()
+                return SimpleNamespace(returncode=0, stdout="Succeed\n", stderr="")
+        if subcmd == "ls":
+            if read_failure["mode"] == "list":
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="ERROR: oss: service returned error: StatusCode=403, ErrorCode=AccessDenied",
+                )
+            uri_prefix = argv[op_idx + 2]
+            matches = sorted(
+                k for k in fake_oss if k.startswith(uri_prefix) and not k.endswith("/")
+            )
+            lines = "\n".join(matches)
+            body = (
+                lines + "\n" if lines else ""
+            ) + f"Object Number is: {len(matches)}\n"
+            return SimpleNamespace(returncode=0, stdout=body, stderr="")
+        raise AssertionError(f"Unexpected oss command: {argv}")
+
+    monkeypatch.setattr(orch.subprocess, "run", _cli_sim)
+
+    def _make_dep(dep_id, created_at):
+        st = copy.deepcopy(state)
+        st["deployment_id"] = dep_id
+        st["created_at"] = created_at
+        st["phase"] = "ready"
+        for c in st["spec"]["roles"].values():
+            c["secret_files"] = {k: "/secrets/" + k for k in launch.SECRET_ENV}
+        d = tmp_path / dep_id
+        orch.save(d / "state.json", st)
+        orch.write_deployment_summary(st, d)
+        rec = orch.save_history_record(st, d)
+        return st, d, rec
+
+    st_v1, d_v1, rec_v1 = _make_dep(
+        "deploy-20261115T010000Z-v1", "2026-11-15T01:00:00Z"
+    )
+    # Seed v1 into legacy remote index.json + direct record to verify legacy preservation!
+    legacy_index_raw = json.dumps(
+        {"schema": 1, "deployments": [orch.build_history_index_entry(rec_v1)]},
+        indent=2,
+        sort_keys=True,
+    ).encode()
+    fake_oss[f"{prefix}/index.json"] = legacy_index_raw
+    fake_oss[f"{prefix}/{st_v1['deployment_id']}.json"] = (
+        d_v1 / "history" / f"{st_v1['deployment_id']}.json"
+    ).read_bytes()
+
+    st_v2, d_v2, _ = _make_dep("deploy-20261115T020000Z-v2", "2026-11-15T02:00:00Z")
+    cloud.sync_history_artifacts(
+        d_v2 / "history", st_v2["deployment_id"], summary_dir=d_v2
+    )
+
+    # Inject transient 503 on OSS downloads while archiving v3:
+    # Remote legacy `index.json` MUST NOT be overwritten!
+    read_failure["mode"] = "download"
+    st_v3, d_v3, _ = _make_dep("deploy-20261115T030000Z-v3", "2026-11-15T03:00:00Z")
+    cloud.sync_history_artifacts(
+        d_v3 / "history", st_v3["deployment_id"], summary_dir=d_v3
+    )
+    assert fake_oss[f"{prefix}/index.json"] == legacy_index_raw
+
+    # While OSS download or list is failing, `history` and `rollback --previous` MUST fail-closed!
+    for mode in ("download", "list"):
+        read_failure["mode"] = mode
+        with pytest.raises(RuntimeError, match="OSS (download|list) failed"):
+            orch.main(
+                [
+                    "history",
+                    "--environment",
+                    "test-shanghai-copy",
+                    "--aliyun-profile",
+                    "test-op",
+                ]
+            )
+        with pytest.raises(RuntimeError, match="OSS (download|list) failed"):
+            orch.main(
+                [
+                    "rollback",
+                    "--previous",
+                    "--current-state",
+                    str(d_v3 / "state.json"),
+                    "--output",
+                    str(tmp_path / f"rb-fail-{mode}"),
+                    "--aliyun-profile",
+                    "test-op",
+                ]
+            )
+
+    # Once transient failure clears, all 3 deployments [v1, v2, v3] are intact and `rollback --previous` picks v2!
+    read_failure["mode"] = None
+    orch.main(
+        [
+            "history",
+            "--environment",
+            "test-shanghai-copy",
+            "--aliyun-profile",
+            "test-op",
+        ]
+    )
+    recovered = json.loads(capsys.readouterr().out)
+    assert [e["deployment_id"] for e in recovered] == [
+        "deploy-20261115T010000Z-v1",
+        "deploy-20261115T020000Z-v2",
+        "deploy-20261115T030000Z-v3",
+    ]
+    orch.main(
+        [
+            "rollback",
+            "--previous",
+            "--current-state",
+            str(d_v3 / "state.json"),
+            "--output",
+            str(tmp_path / "rb-plan-ok"),
+            "--aliyun-profile",
+            "test-op",
+        ]
+    )
+    rb_plan_out = json.loads(capsys.readouterr().out)
+    assert rb_plan_out["rollback_of"] == "deploy-20261115T020000Z-v2"
+
+
+def test_concurrent_oss_history_writers_preserve_all_entries_and_rollback_previous_is_exact(
+    state, tmp_path, monkeypatch, capsys
+):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    oss_lock = threading.Lock()
+    fake_oss = {}
+
+    def fake_upload(self, local_path, uri):
+        data = Path(local_path).read_bytes()
+        with oss_lock:
+            fake_oss[uri] = data
+
+    def fake_download(self, uri, local_path):
+        with oss_lock:
+            data = fake_oss.get(uri)
+        if data is None:
+            return False
+        p = Path(local_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        return True
+
+    def fake_list(self, uri_prefix):
+        norm = uri_prefix.rstrip("/") + "/"
+        with oss_lock:
+            return sorted(
+                k for k in fake_oss if k.startswith(norm) and not k.endswith("/")
+            )
+
+    monkeypatch.setattr(orch.Cloud, "upload_source", fake_upload)
+    monkeypatch.setattr(orch.Cloud, "download_oss_optional", fake_download)
+    monkeypatch.setattr(orch.Cloud, "list_oss_objects", fake_list)
+
+    specs = [
+        ("deploy-20261115T010000Z-v1", "2026-11-15T01:00:00Z", "ready", None),
+        ("deploy-20261115T020000Z-v2", "2026-11-15T02:00:00Z", "ready", None),
+        (
+            "deploy-20261115T023000Z-other-model",
+            "2026-11-15T02:30:00Z",
+            "ready",
+            "other-model-id",
+        ),
+        ("deploy-20261115T030000Z-v3", "2026-11-15T03:00:00Z", "ready", None),
+    ]
+    prepared_runs = {}
+    for dep_id, created_at, phase, custom_model in specs:
+        st = copy.deepcopy(state)
+        st["deployment_id"] = dep_id
+        st["created_at"] = created_at
+        st["phase"] = phase
+        if custom_model:
+            st["spec"]["model_id"] = custom_model
+        for c in st["spec"]["roles"].values():
+            c["secret_files"] = {k: "/secrets/" + k for k in launch.SECRET_ENV}
+        d = tmp_path / dep_id
+        orch.save(d / "state.json", st)
+        orch.write_deployment_summary(st, d)
+        orch.save_history_record(st, d)
+        prepared_runs[dep_id] = (st, d)
+
+    # Also prepare a lifecycle update for v1 transitioning ready -> stopped in its own staging dir!
+    st_v1_stopped = copy.deepcopy(prepared_runs["deploy-20261115T010000Z-v1"][0])
+    st_v1_stopped["phase"] = "stopped"
+    d_v1_stopped = tmp_path / "v1-stopped-stage"
+    orch.save(d_v1_stopped / "state.json", st_v1_stopped)
+    orch.write_deployment_summary(st_v1_stopped, d_v1_stopped)
+    orch.save_history_record(st_v1_stopped, d_v1_stopped)
+
+    tasks = [
+        (st["deployment_id"], d, st["target"]) for st, d in prepared_runs.values()
+    ] + [(st_v1_stopped["deployment_id"], d_v1_stopped, st_v1_stopped["target"])]
+
+    barrier = threading.Barrier(len(tasks))
+
+    def _concurrent_writer(item):
+        dep_id, run_dir, target = item
+        c = orch.Cloud(target=target, aliyun_profile="test-op")
+        barrier.wait(timeout=10)
+        return c.sync_history_artifacts(
+            run_dir / "history", dep_id, summary_dir=run_dir
+        )
+
+    with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+        results = list(pool.map(_concurrent_writer, tasks))
+    assert len(results) == 5
+
+    # Verify zero lost updates: all 4 deployment_ids are present, and v1 merged deterministically to `stopped`.
+    orch.main(
+        [
+            "history",
+            "--environment",
+            "test-shanghai-copy",
+            "--aliyun-profile",
+            "test-op",
+        ]
+    )
+    merged_hist = json.loads(capsys.readouterr().out)
+    assert [e["deployment_id"] for e in merged_hist] == [
+        "deploy-20261115T010000Z-v1",
+        "deploy-20261115T020000Z-v2",
+        "deploy-20261115T023000Z-other-model",
+        "deploy-20261115T030000Z-v3",
+    ]
+    by_id = {e["deployment_id"]: e for e in merged_hist}
+    assert by_id["deploy-20261115T010000Z-v1"]["phase"] == "stopped"
+
+    # Verify `rollback --previous` from v3 skips `other-model` and selects exact predecessor `v2` (never misses v2!).
+    _, d_v3 = prepared_runs["deploy-20261115T030000Z-v3"]
+    orch.main(
+        [
+            "rollback",
+            "--previous",
+            "--current-state",
+            str(d_v3 / "state.json"),
+            "--output",
+            str(tmp_path / "rb-concurrent-ok"),
+            "--aliyun-profile",
+            "test-op",
+        ]
+    )
+    rb_plan = json.loads(capsys.readouterr().out)
+    assert rb_plan["rollback_of"] == "deploy-20261115T020000Z-v2"
+
+
+def test_resolve_previous_deployment_id_fails_closed_when_predecessor_record_missing_or_corrupt(
+    state, tmp_path
+):
+    store = tmp_path / "corrupt-pred-store"
+    for dep_id, ts in (
+        ("deploy-20261115T010000Z-v0", "2026-11-15T01:00:00Z"),
+        ("deploy-20261115T020000Z-v1", "2026-11-15T02:00:00Z"),
+        ("deploy-20261115T030000Z-v2", "2026-11-15T03:00:00Z"),
+    ):
+        st = copy.deepcopy(state)
+        st["deployment_id"] = dep_id
+        st["created_at"] = ts
+        st["phase"] = "ready"
+        orch.save_history_record(st, history_dir=store)
+
+    # 1. If immediate predecessor v1 lacks rollback_bundle, MUST fail-closed (never skip v1 to pick stale v0!).
+    v1_file = store / "deploy-20261115T020000Z-v1.json"
+    v1_rec = orch.read(v1_file)
+    del v1_rec["rollback_bundle"]
+    orch.save(v1_file, v1_rec)
+    with pytest.raises(ValueError, match="missing a valid rollback_bundle"):
+        orch.resolve_previous_deployment_id(store, "deploy-20261115T030000Z-v2")
+
+    # 2. If immediate predecessor v1 record file is missing while indexed, MUST raise FileNotFoundError!
+    v1_file.unlink()
+    with pytest.raises(FileNotFoundError, match="deploy-20261115T020000Z-v1"):
+        orch.resolve_previous_deployment_id(store, "deploy-20261115T030000Z-v2")

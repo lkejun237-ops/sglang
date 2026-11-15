@@ -7,10 +7,17 @@ State files are private operator evidence, not a source of arbitrary shell comma
 import argparse
 import asyncio
 import base64
+import contextlib
 import copy
 import datetime
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
 import hashlib
 import importlib.util
+import io
 import ipaddress
 import json
 import os
@@ -20,6 +27,8 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -29,9 +38,18 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 import launch
-from source import digest, prepare, validate_manifest
+from source import digest, prepare
 
 ROLES = ("encoder", "dit", "decoder")
+SHANGHAI_OSS_BUCKET = "oss://leap-world-shanghai"
+THAILAND_OSS_BUCKET = "oss://leap-worldmodel-thailand-single-az"
+LEGACY_THAILAND_OSS_BUCKET = "oss://leap-worldmodel-thailand"
+ENVIRONMENT_OSS_HISTORY_PREFIXES = {
+    "selftest": f"{SHANGHAI_OSS_BUCKET}/sglang/deployments/selftest",
+    "test-shanghai-copy": f"{SHANGHAI_OSS_BUCKET}/sglang/deployments/test-shanghai-copy",
+    "prod-shanghai": f"{SHANGHAI_OSS_BUCKET}/sglang/deployments/prod-shanghai",
+    "prod-thailand": f"{THAILAND_OSS_BUCKET}/sglang/deployments/prod-thailand",
+}
 TARGET = {
     "environment": "test-shanghai-copy",
     "region": "cn-shanghai",
@@ -46,6 +64,51 @@ TARGET = {
     "oss_prefix": "oss://leap-world-shanghai/sglang/orchestration",
 }
 REPO = Path(__file__).resolve().parents[2]
+
+
+def resolve_environment_region(target=None, *, environment=None, region=None):
+    env_name = str(
+        environment
+        or (target.get("environment") if isinstance(target, dict) else None)
+        or "test-shanghai-copy"
+    ).strip()
+    if env_name == "prod-thailand":
+        return "ap-southeast-7"
+    if env_name in ("test-shanghai-copy", "prod-shanghai"):
+        return "cn-shanghai"
+    eff_region = str(
+        region
+        or (target.get("region") if isinstance(target, dict) else None)
+        or "cn-shanghai"
+    ).strip()
+    return eff_region or "cn-shanghai"
+
+
+def resolve_oss_history_prefix(target=None, *, environment=None, region=None):
+    """Resolve the fixed OSS deployment history prefix separated by environment tier."""
+    env_name = str(
+        environment
+        or (target.get("environment") if isinstance(target, dict) else None)
+        or "test-shanghai-copy"
+    ).strip()
+    if not env_name:
+        raise ValueError("Environment name is required to resolve OSS history prefix")
+    eff_region = resolve_environment_region(target, environment=env_name, region=region)
+    if env_name in ("test-shanghai-copy", "prod-shanghai", "prod-thailand"):
+        return ENVIRONMENT_OSS_HISTORY_PREFIXES[env_name]
+    bucket = (
+        THAILAND_OSS_BUCKET if eff_region == "ap-southeast-7" else SHANGHAI_OSS_BUCKET
+    )
+    if env_name == "selftest":
+        return f"{bucket}/sglang/deployments/selftest"
+    safe_slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", env_name).strip("-")
+    if not safe_slug or safe_slug in (
+        "test-shanghai-copy",
+        "prod-shanghai",
+        "prod-thailand",
+    ):
+        raise ValueError(f"Invalid custom selftest environment name: {env_name!r}")
+    return f"{bucket}/sglang/deployments/selftest/{safe_slug}"
 
 
 def _load_profile_launcher():
@@ -73,12 +136,16 @@ def read(path):
 def save(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + ".tmp")
+    temp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
-        f.write("\n")
-    temp.replace(path)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write("\n")
+        temp.replace(path)
+    except Exception:
+        temp.unlink(missing_ok=True)
+        raise
 
 
 def now():
@@ -88,9 +155,11 @@ def now():
 def check_target(value):
     if not isinstance(value, dict):
         raise ValueError("Target must be a JSON object")
-    allowed_keys = set(TARGET) | {"topology_profile", "history_dir"}
+    allowed_keys = set(TARGET) | {"topology_profile", "history_dir", "sync_history_oss"}
     if set(value) - allowed_keys:
         raise ValueError("Unsupported target configuration keys")
+    if "sync_history_oss" in value and not isinstance(value["sync_history_oss"], bool):
+        raise ValueError("target.sync_history_oss must be a boolean")
     env_name = str(value.get("environment", "")).strip()
     if not env_name:
         raise ValueError("Target environment is required")
@@ -115,6 +184,13 @@ def check_target(value):
             raise ValueError("Target is missing required environment fields")
         if not value["oss_prefix"].startswith("oss://"):
             raise ValueError("Target oss_prefix must be an oss:// URI")
+        raw_oss = value["oss_prefix"].rstrip("/")
+        if raw_oss == LEGACY_THAILAND_OSS_BUCKET or raw_oss.startswith(
+            LEGACY_THAILAND_OSS_BUCKET + "/"
+        ):
+            raise ValueError(
+                f"Legacy bucket {LEGACY_THAILAND_OSS_BUCKET} is forbidden; use {THAILAND_OSS_BUCKET}"
+            )
         for url_key in ("coordinator_url", "room_url", "wtp_url"):
             uri = urlsplit(value[url_key])
             if uri.scheme not in ("http", "https") or not uri.hostname or uri.port == 0:
@@ -164,13 +240,20 @@ def expand_minimal_spec(raw):
     model_id = spec.setdefault("model_id", "model1027")
     topology = spec.pop("topology", None)
     if topology is None:
-        topology = "b300" if "b300" in spec.get("sites", {}) else "h100_h200"
-    if topology not in ("h100_h200", "b300"):
+        sites_in = spec.get("sites", {})
+        if "b300" in sites_in:
+            topology = "b300"
+        elif set(sites_in) == {"h200"}:
+            topology = "h200"
+        else:
+            topology = "h100_h200"
+    if topology not in ("h100_h200", "h200", "b300"):
         raise ValueError(f"Unsupported topology '{topology}'")
     default_model_dir = spec.pop("model", f"/assets/{model_id}")
     default_receipt = spec.pop("asset_receipt", "/assets/assets.json")
     default_receipt_sha = spec.pop("asset_receipt_sha256", "a" * 64)
     default_image = spec.pop("image", "test@sha256:" + "c" * 64)
+    default_stage_from = spec.pop("stage_from", None)
     existing = spec.setdefault("existing_services", {})
     roles_in = spec.get("roles", {})
     roles = {}
@@ -189,13 +272,19 @@ def expand_minimal_spec(raw):
                         "gpu",
                         "boot_epoch",
                         "pai",
+                        "job_id",
+                        "job_name",
                     )
                     if k in r_in
                 }
             continue
         prof = r_in.get(
             "profile",
-            "b300" if topology == "b300" else ("h200" if role == "dit" else "h100"),
+            (
+                "b300"
+                if topology == "b300"
+                else ("h200" if (topology == "h200" or role == "dit") else "h100")
+            ),
         )
         role_cfg = {
             "schema": 1,
@@ -210,12 +299,18 @@ def expand_minimal_spec(raw):
             ),
             "environment": dict(r_in.get("environment", {})),
         }
-        if "service_count" in r_in:
-            role_cfg["service_count"] = r_in["service_count"]
-        if "ports" in r_in:
-            role_cfg["ports"] = r_in["ports"]
-        if "secret_files" in r_in:
-            role_cfg["secret_files"] = r_in["secret_files"]
+        stage_from = r_in.get("stage_from", default_stage_from)
+        if stage_from:
+            role_cfg["stage_from"] = stage_from
+        for opt_key in (
+            "service_count",
+            "ports",
+            "secret_files",
+            "resolution",
+            "startup_timeout",
+        ):
+            if opt_key in r_in:
+                role_cfg[opt_key] = r_in[opt_key]
         if role == "dit":
             role_cfg["pipeline"] = r_in.get("pipeline", "/assets/dit.json")
             role_cfg["dit_options"] = dict(
@@ -246,6 +341,26 @@ def expand_minimal_spec(raw):
                         "QuotaId": target["quota_id"],
                         "RestartPolicy": "Never",
                         "ResourceConfig": {"GPU": "1"},
+                    },
+                    "data_sources": [],
+                }
+            }
+        elif topology == "h200":
+            spec["sites"] = {
+                "h200": {
+                    "schema": 1,
+                    "image": default_image,
+                    "job_spec": {
+                        "Type": "Worker",
+                        "PodCount": 1,
+                        "QuotaId": target["quota_id"],
+                        "RestartPolicy": "Never",
+                        "ResourceConfig": {
+                            "GPU": "1",
+                            "CPU": "16",
+                            "Memory": "128Gi",
+                            "SharedMemory": "64Gi",
+                        },
                     },
                     "data_sources": [],
                 }
@@ -319,8 +434,9 @@ def role_site(spec, role):
     profile = c.get("profile")
     if profile in ("h100", "h200", "b300") and profile in spec["sites"]:
         return spec["sites"][profile]
-    if "b300" in spec["sites"] and len(spec["sites"]) == 1:
-        return spec["sites"]["b300"]
+    for single_key in ("b300", "h200"):
+        if single_key in spec["sites"] and len(spec["sites"]) == 1:
+            return spec["sites"][single_key]
     default_key = "h200" if role == "dit" else "h100"
     if default_key not in spec["sites"]:
         raise ValueError(f"Missing site configuration for {role}")
@@ -340,7 +456,7 @@ def service_endpoints(base_http, service_count=1):
 
 
 def reused_resource(run_id, model_id, role, entry):
-    return dict(
+    res = dict(
         run_id=run_id,
         generation=0,
         name="reused-" + role + "-" + entry["worker_id"],
@@ -349,7 +465,7 @@ def reused_resource(run_id, model_id, role, entry):
         status="reused",
         service_index=entry.get("service_index", 0),
         service_count=entry.get("service_count", 1),
-        pai=bool(entry.get("pai")),
+        pai=bool(entry.get("pai") or entry.get("job_id")),
         receipt=dict(
             schema=1,
             role=role,
@@ -360,6 +476,11 @@ def reused_resource(run_id, model_id, role, entry):
             gpu=entry.get("gpu", f"GPU-reused-{role}"),
         ),
     )
+    if entry.get("job_id"):
+        res["job_id"] = entry["job_id"]
+    if entry.get("job_name"):
+        res["job_name"] = entry["job_name"]
+    return res
 
 
 def validate_spec(spec, isolated=True, launch_module=launch):
@@ -407,6 +528,8 @@ def validate_spec(spec, isolated=True, launch_module=launch):
                         "gpu",
                         "boot_epoch",
                         "pai",
+                        "job_id",
+                        "job_name",
                     )
                     if k in cfg
                 }
@@ -442,12 +565,26 @@ def validate_spec(spec, isolated=True, launch_module=launch):
                 "gpu",
                 "boot_epoch",
                 "pai",
+                "job_id",
+                "job_name",
             }
             or not isinstance(entry.get("http"), str)
             or not isinstance(entry.get("worker_id"), str)
             or not entry["worker_id"]
         ):
             raise ValueError("Invalid existing service specification")
+        if ("job_id" in entry or "job_name" in entry) and (
+            not entry.get("pai")
+            or not isinstance(entry.get("job_id"), str)
+            or not entry["job_id"]
+            or (
+                "job_name" in entry
+                and (not isinstance(entry["job_name"], str) or not entry["job_name"])
+            )
+        ):
+            raise ValueError(
+                "Pinned PAI existing service requires pai=true and non-empty job_id"
+            )
         count = entry.get("service_count", 1)
         idx = entry.get("service_index", 0)
         if (
@@ -571,6 +708,67 @@ def load_state(path, launch_module=None):
     return state
 
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+_OSS_FATAL_ERROR_MARKERS = (
+    "nosuchbucket",
+    "accessdenied",
+    "invalidaccesskeyid",
+    "signaturedoesnotmatch",
+    "securitytokenexpired",
+    "requesttimetooskewed",
+    "slowdown",
+    "serviceunavailable",
+    "internalerror",
+    "requesttimeout",
+    "badgateway",
+    "gatewaytimeout",
+    "connection",
+    "timed out",
+    "timeout",
+    "dial tcp",
+    "tls handshake",
+    "invalid usage",
+    "statuscode=401",
+    "statuscode=403",
+    "statuscode=429",
+    "statuscode=500",
+    "statuscode=502",
+    "statuscode=503",
+    "statuscode=504",
+)
+_OSS_NOT_FOUND_MARKERS = (
+    "errorcode=nosuchkey",
+    "errorcode: nosuchkey",
+    '"nosuchkey"',
+    "nosuchkey",
+    "objectnotexist",
+    "the specified key does not exist",
+    "statuscode=404",
+)
+
+
+def _strip_ansi(text):
+    return _ANSI_ESCAPE_RE.sub("", text or "")
+
+
+def _format_oss_cli_error(proc):
+    if proc is None:
+        return "subprocess returned None"
+    out = _strip_ansi(getattr(proc, "stdout", "") or "").strip()
+    err = _strip_ansi(getattr(proc, "stderr", "") or "").strip()
+    parts = [p for p in (err, out) if p]
+    return " | ".join(parts) if parts else "unknown OSS CLI failure"
+
+
+def _is_oss_not_found(returncode, stdout="", stderr=""):
+    if returncode == 0:
+        return False
+    combined = _strip_ansi(f"{stdout or ''}\n{stderr or ''}").lower()
+    if any(marker in combined for marker in _OSS_FATAL_ERROR_MARKERS):
+        return False
+    return any(marker in combined for marker in _OSS_NOT_FOUND_MARKERS)
+
+
 class Cloud:
     """Explicit target cloud adapter; all remote mutations pass through explicit calls."""
 
@@ -660,8 +858,11 @@ class Cloud:
                     status = row.get("InvocationStatus")
                     if status == "Success":
                         if row.get("ExitCode") != 0 or row.get("Dropped", 0):
+                            tail = str(row.get("Output") or "").strip()[-600:]
+                            detail = f": {tail}" if tail else ""
                             raise RuntimeError(
                                 "Eflo node command failed or output was truncated"
+                                + detail
                             )
                         return row["Output"]
                     if status in {
@@ -673,13 +874,15 @@ class Cloud:
                         "Invalid",
                         "Terminated",
                     }:
-                        raise RuntimeError("Eflo invocation failed: " + status)
+                        tail = str(row.get("Output") or "").strip()[-600:]
+                        detail = f": {tail}" if tail else ""
+                        raise RuntimeError("Eflo invocation failed: " + status + detail)
             time.sleep(2)
         raise TimeoutError("Eflo invocation is UNKNOWN; reconcile InvokeId " + invoke)
 
     def upload_source(self, local_path, uri):
         profile = self._require_aliyun_profile()
-        region = self.target.get("region", "cn-shanghai")
+        region = resolve_environment_region(self.target)
         subprocess.run(
             [
                 "aliyun",
@@ -696,6 +899,303 @@ class Cloud:
             check=True,
             timeout=300,
         )
+
+    def oss_history_prefix(self):
+        return resolve_oss_history_prefix(self.target)
+
+    def download_oss_optional(self, uri, local_path):
+        """Download an OSS object if it exists.
+
+        Returns False ONLY on explicit OSS object NotFound (404 NoSuchKey / ObjectNotExist).
+        Raises RuntimeError on auth, bucket, network, throttling, timeout, or unknown CLI errors.
+        """
+        profile = self._require_aliyun_profile()
+        region = resolve_environment_region(self.target)
+        local_path = Path(local_path)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            proc = subprocess.run(
+                [
+                    "aliyun",
+                    "--profile",
+                    profile,
+                    "--endpoint",
+                    f"oss-{region}.aliyuncs.com",
+                    "oss",
+                    "cp",
+                    "--force",
+                    uri,
+                    str(local_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            local_path.unlink(missing_ok=True)
+            raise RuntimeError(f"OSS download failed for {uri}: {exc}") from exc
+        if proc is None:
+            local_path.unlink(missing_ok=True)
+            raise RuntimeError(f"OSS download returned no process status for {uri}")
+        rc = getattr(proc, "returncode", 1)
+        stdout = getattr(proc, "stdout", "") or ""
+        stderr = getattr(proc, "stderr", "") or ""
+        combined_lower = _strip_ansi(f"{stdout}\n{stderr}").lower()
+        if rc == 0:
+            if "finishwitherror" in combined_lower or not local_path.is_file():
+                local_path.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"OSS download incomplete for {uri}: {_format_oss_cli_error(proc)}"
+                )
+            return True
+        local_path.unlink(missing_ok=True)
+        if _is_oss_not_found(rc, stdout, stderr):
+            return False
+        raise RuntimeError(
+            f"OSS download failed for {uri} (rc={rc}): {_format_oss_cli_error(proc)}"
+        )
+
+    def download_oss_required(self, uri, local_path, *, expected_sha256=None):
+        local_path = Path(local_path)
+        if not self.download_oss_optional(uri, local_path):
+            raise FileNotFoundError(f"Required OSS object not found: {uri}")
+        if expected_sha256 is not None and digest(local_path) != expected_sha256:
+            local_path.unlink(missing_ok=True)
+            raise ValueError(
+                f"OSS object SHA256 mismatch for {uri} (expected {expected_sha256})"
+            )
+        return local_path
+
+    def list_oss_objects(self, uri_prefix):
+        """List object URIs under `uri_prefix` (fail-closed on any non-NotFound error)."""
+        profile = self._require_aliyun_profile()
+        region = resolve_environment_region(self.target)
+        normalized_prefix = uri_prefix.rstrip("/") + "/"
+        try:
+            proc = subprocess.run(
+                [
+                    "aliyun",
+                    "--profile",
+                    profile,
+                    "--endpoint",
+                    f"oss-{region}.aliyuncs.com",
+                    "oss",
+                    "ls",
+                    normalized_prefix,
+                    "--short-format",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise RuntimeError(
+                f"OSS list failed for {normalized_prefix}: {exc}"
+            ) from exc
+        if proc is None:
+            raise RuntimeError(
+                f"OSS list returned no process status for {normalized_prefix}"
+            )
+        rc = getattr(proc, "returncode", 1)
+        stdout = getattr(proc, "stdout", "") or ""
+        stderr = getattr(proc, "stderr", "") or ""
+        combined_lower = _strip_ansi(f"{stdout}\n{stderr}").lower()
+        if rc != 0:
+            if _is_oss_not_found(rc, stdout, stderr):
+                return []
+            raise RuntimeError(
+                f"OSS list failed for {normalized_prefix} (rc={rc}): {_format_oss_cli_error(proc)}"
+            )
+        if (
+            "finishwitherror" in combined_lower
+            or "error:" in _strip_ansi(stderr).lower()
+        ):
+            raise RuntimeError(
+                f"OSS list reported errors for {normalized_prefix}: {_format_oss_cli_error(proc)}"
+            )
+        clean_out = _strip_ansi(stdout)
+        uris = []
+        for raw_line in clean_out.splitlines():
+            line = raw_line.strip()
+            if line.startswith(normalized_prefix) and not line.endswith("/"):
+                uris.append(line)
+        if not uris and "object number is:" not in clean_out.lower():
+            raise RuntimeError(
+                f"Unexpected OSS list output for {normalized_prefix}: {_format_oss_cli_error(proc)}"
+            )
+        return sorted(set(uris))
+
+    def sync_history_artifacts(self, history_dir, deployment_id, summary_dir=None):
+        """Archive immutable per-deployment records and index shards to OSS.
+
+        Write order (record before index shard) ensures any reader observing an index
+        shard can immediately fetch its content-addressed record without torn reads,
+        and concurrent writers never overwrite a shared mutable `index.json`.
+        """
+        prefix = self.oss_history_prefix().rstrip("/")
+        history_dir = Path(history_dir)
+        record_file = history_dir / f"{deployment_id}.json"
+        if not record_file.is_file():
+            raise FileNotFoundError(
+                f"Local history record '{record_file}' not found for OSS sync"
+            )
+        record = read(record_file)
+        record_sha256 = digest(record_file)
+        record_key = f"records/{deployment_id}/{record_sha256}.json"
+        uploaded = []
+
+        # 1. Immutable content-addressed deployment record snapshot.
+        immutable_record_uri = f"{prefix}/{record_key}"
+        self.upload_source(record_file, immutable_record_uri)
+        uploaded.append(immutable_record_uri)
+
+        # 2. Direct per-deployment record path for human inspection & compatibility.
+        direct_record_uri = f"{prefix}/{deployment_id}.json"
+        self.upload_source(record_file, direct_record_uri)
+        uploaded.append(direct_record_uri)
+
+        # 3. Human/operator deployment credentials & verification summary files.
+        if summary_dir is not None:
+            summary_dir = Path(summary_dir)
+            for name in (
+                "deployment.json",
+                "DEPLOYMENT.md",
+                "traffic_verification.json",
+            ):
+                local_file = summary_dir / name
+                if local_file.is_file():
+                    uri = f"{prefix}/{deployment_id}/{name}"
+                    self.upload_source(local_file, uri)
+                    uploaded.append(uri)
+
+        # 4. Commit point: upload immutable per-entry index shard (never overwrite shared index.json).
+        entry = build_history_index_entry(
+            record, record_sha256=record_sha256, record_key=record_key
+        )
+        with tempfile.TemporaryDirectory() as td:
+            shard_tmp = Path(td) / "entry.json"
+            save(shard_tmp, entry)
+            entry_sha256 = digest(shard_tmp)
+            entry_uri = f"{prefix}/entries/{deployment_id}/{entry_sha256}.json"
+            self.upload_source(shard_tmp, entry_uri)
+            uploaded.append(entry_uri)
+
+        return uploaded
+
+    def _download_and_parse_index_shards(self, shard_uris, scratch_dir):
+        if not shard_uris:
+            return []
+
+        def _fetch_one(idx_and_uri):
+            idx, uri = idx_and_uri
+            stem = uri.rsplit("/", 1)[-1]
+            expected_sha = (
+                stem[:-5]
+                if stem.endswith(".json") and re.fullmatch(r"[0-9a-f]{64}", stem[:-5])
+                else None
+            )
+            local_shard = scratch_dir / f"shard-{idx}.json"
+            self.download_oss_required(uri, local_shard, expected_sha256=expected_sha)
+            entry = read(local_shard)
+            if not isinstance(entry, dict) or not entry.get("deployment_id"):
+                raise ValueError(f"Corrupted deployment index shard at {uri}")
+            return entry
+
+        max_workers = min(8, len(shard_uris))
+        if max_workers <= 1:
+            return [_fetch_one((0, shard_uris[0]))]
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            return list(pool.map(_fetch_one, enumerate(shard_uris)))
+
+    def _fetch_and_merge_oss_index_entries(self, prefix):
+        shard_uris = [
+            u
+            for u in self.list_oss_objects(f"{prefix}/entries/")
+            if u.endswith(".json")
+        ]
+        collected = []
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            legacy_index_path = td_path / "legacy_index.json"
+            if self.download_oss_optional(f"{prefix}/index.json", legacy_index_path):
+                legacy_payload = read(legacy_index_path)
+                if not isinstance(legacy_payload, dict) or not isinstance(
+                    legacy_payload.get("deployments"), list
+                ):
+                    raise ValueError(
+                        f"Corrupted legacy deployment index at {prefix}/index.json"
+                    )
+                collected.extend(legacy_payload["deployments"])
+            collected.extend(self._download_and_parse_index_shards(shard_uris, td_path))
+        return merge_history_index_entries(collected)
+
+    def _fetch_single_oss_deployment_record(self, prefix, dep_id, dest_dir):
+        dest_path = dest_dir / f"{dep_id}.json"
+        dep_shards = [
+            u
+            for u in self.list_oss_objects(f"{prefix}/entries/{dep_id}/")
+            if u.endswith(".json")
+        ]
+        if dep_shards:
+            with tempfile.TemporaryDirectory() as td:
+                entries = merge_history_index_entries(
+                    self._download_and_parse_index_shards(dep_shards, Path(td))
+                )
+            if entries:
+                latest = entries[-1]
+                record_key = latest.get("record_key")
+                if record_key:
+                    self.download_oss_required(
+                        f"{prefix}/{record_key.lstrip('/')}",
+                        dest_path,
+                        expected_sha256=latest.get("record_sha256"),
+                    )
+                    return
+        self.download_oss_optional(f"{prefix}/{dep_id}.json", dest_path)
+
+    def _fetch_indexed_oss_deployment_record(self, prefix, entry, dest_dir):
+        dep_id = entry["deployment_id"]
+        dest_path = dest_dir / f"{dep_id}.json"
+        record_key = entry.get("record_key")
+        if record_key:
+            uri = f"{prefix}/{record_key.lstrip('/')}"
+            if self.download_oss_optional(uri, dest_path):
+                expected_sha = entry.get("record_sha256")
+                if expected_sha and digest(dest_path) != expected_sha:
+                    dest_path.unlink(missing_ok=True)
+                    raise ValueError(
+                        f"OSS deployment record SHA256 mismatch for {uri} (expected {expected_sha})"
+                    )
+            return
+        self.download_oss_optional(f"{prefix}/{dep_id}.json", dest_path)
+
+    def fetch_oss_history_store(self, dest_dir, deployment_ids=None):
+        prefix = self.oss_history_prefix().rstrip("/")
+        dest_dir = Path(dest_dir)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        if deployment_ids is not None and len(deployment_ids) > 0:
+            for dep_id in dict.fromkeys(d for d in deployment_ids if d):
+                self._fetch_single_oss_deployment_record(prefix, dep_id, dest_dir)
+            return dest_dir
+
+        merged_entries = self._fetch_and_merge_oss_index_entries(prefix)
+        save(dest_dir / "index.json", {"schema": 1, "deployments": merged_entries})
+
+        if deployment_ids is None and merged_entries:
+
+            def _fetch_rec(entry):
+                self._fetch_indexed_oss_deployment_record(prefix, entry, dest_dir)
+
+            max_workers = min(8, len(merged_entries))
+            if max_workers <= 1:
+                _fetch_rec(merged_entries[0])
+            else:
+                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    list(pool.map(_fetch_rec, merged_entries))
+        return dest_dir
 
     def stage_h100_source(self, manifest):
         profile = self._require_aliyun_profile()
@@ -779,7 +1279,12 @@ mv "$TMP" ARCHIVE
         return self.cli("pai-dlc", "GetJob", JobId=job_id)
 
     def receipt(self, resource, role):
-        is_pai = "job_id" in resource or role == "dit"
+        is_pai = (
+            "job_id" in resource
+            or "expected_job" in resource
+            or bool(resource.get("pai"))
+            or role == "dit"
+        )
         pod_id = None
         if not is_pai:
             pod = self.pod(resource)
@@ -822,7 +1327,7 @@ print(json.dumps(last))
                 if "aimaster" not in p.get("PodId", "").lower()
             ]
             if len(pods) != 1:
-                raise RuntimeError("Expected exactly one DiT Worker Pod")
+                raise RuntimeError(f"Expected exactly one {role} Worker Pod")
             pod_id = pods[0]["PodId"]
             logs = self.cli(
                 "pai-dlc",
@@ -936,19 +1441,35 @@ def http(url, payload=None, token=None, cloud=None):
     except OSError:
         if cloud is None or not vpc_url(url):
             raise
-    # The Eflo host runs Python 3.6. Keep syntax and urllib behavior compatible.
+    # The Eflo host runs Python 3.6. Keep syntax and urllib behavior compatible,
+    # and propagate HTTP application status codes (e.g. 403 on managed endpoints) cleanly.
     parameters = json.dumps(dict(url=url, payload=payload, headers=headers))
-    code = """import json,urllib.request
+    code = """import json,urllib.error,urllib.request
 class NoRedirect(urllib.request.HTTPRedirectHandler):
  def redirect_request(self,request,fp,code,message,headers,new_url):
   raise ValueError('Cross-environment HTTP redirects are forbidden')
 p=json.loads(PARAMETERS)
 data=None if p['payload'] is None else json.dumps(p['payload']).encode()
 r=urllib.request.Request(p['url'],data=data,headers=p['headers'])
-with urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect()).open(r,timeout=60) as response:
- print(json.dumps(json.load(response)))
+try:
+ with urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect()).open(r,timeout=60) as response:
+  print(json.dumps(json.load(response)))
+except urllib.error.HTTPError as e:
+ body=''
+ try: body=e.read().decode('utf-8','replace')
+ except Exception: pass
+ print(json.dumps({'__eflo_http_error__':int(e.code),'reason':str(e.reason),'body':body}))
 """.replace("PARAMETERS", repr(parameters))
-    return json.loads(cloud.eflo("python3 -c " + shlex.quote(code)))
+    relayed = json.loads(cloud.eflo("python3 -c " + shlex.quote(code)))
+    if isinstance(relayed, dict) and "__eflo_http_error__" in relayed:
+        raise HTTPError(
+            url,
+            int(relayed["__eflo_http_error__"]),
+            str(relayed.get("reason", "HTTP Error")),
+            {},
+            io.BytesIO(str(relayed.get("body", "")).encode("utf-8")),
+        )
+    return relayed
 
 
 def last_receipt(text, role):
@@ -967,6 +1488,23 @@ def last_receipt(text, role):
                 value = json.loads(candidate[: candidate.index(marker)] + "}")
             except ValueError:
                 continue
+            if "gpu" not in value:
+                tail = candidate[candidate.index(marker) :]
+                gpu_matches = []
+                for raw_match in re.findall(r'"gpu"\s*:\s*"((?:\\.|[^"\\])*)"', tail):
+                    try:
+                        gpu_matches.append(json.loads('"' + raw_match + '"'))
+                    except ValueError:
+                        continue
+                with_uuid = [
+                    item
+                    for item in gpu_matches
+                    if re.search(r"GPU-[A-Za-z0-9-]+", item)
+                ]
+                if with_uuid:
+                    value["gpu"] = with_uuid[-1]
+                elif gpu_matches:
+                    value["gpu"] = gpu_matches[-1]
             if "gpu" not in value and isinstance(value.get("worker_config"), dict):
                 value["gpu"] = ", ".join(value["worker_config"].get("hardware_ids", []))
         if (
@@ -1119,6 +1657,58 @@ print(json.dumps(dict(gpus=r(['nvidia-smi','--query-gpu=uuid,name,memory.total,m
             if str(error) != "No unclaimed idle GPU is available":
                 raise
             break
+    pai_roles = [r for r in owned_roles(spec) if is_pai_role(spec, r)]
+    quota_jobs = [j for j in jobs if j.get("ResourceId") == target["quota_id"]]
+    active_Statuses = {"Running", "Launching", "Starting", "Creating"}
+    queuing_jobs = [
+        j.get("JobId") for j in quota_jobs if j.get("Status") in ("Queuing", "Pending")
+    ]
+    running_gpus = 0
+    running_cpus = 0
+    observed_pai_images = set()
+    for j in quota_jobs:
+        if j.get("Status") not in active_Statuses and j.get("Status") not in (
+            "Queuing",
+            "Pending",
+        ):
+            continue
+        detail = None
+        if isinstance(j.get("JobSpecs"), list):
+            detail = j
+        else:
+            try:
+                fetched = cloud.get_job(j["JobId"])
+                if isinstance(fetched, dict) and isinstance(
+                    fetched.get("JobSpecs"), list
+                ):
+                    detail = fetched
+            except Exception:
+                detail = None
+        if detail:
+            for js in detail.get("JobSpecs", []):
+                pods_n = int(js.get("PodCount", 1) or 1)
+                rc = js.get("ResourceConfig") or {}
+                if j.get("Status") in active_Statuses:
+                    try:
+                        running_gpus += pods_n * int(rc.get("GPU", 0) or 0)
+                    except (TypeError, ValueError):
+                        pass
+                    try:
+                        running_cpus += pods_n * int(rc.get("CPU", 0) or 0)
+                    except (TypeError, ValueError):
+                        pass
+                if js.get("Image"):
+                    observed_pai_images.add(js["Image"])
+        elif j.get("Status") in active_Statuses:
+            running_gpus += 1
+    req_pai_gpus = len(pai_roles)
+    req_pai_cpus = 0
+    for r in pai_roles:
+        rc = role_site(spec, r).get("job_spec", {}).get("ResourceConfig", {})
+        try:
+            req_pai_cpus += int(rc.get("CPU", 16) or 16)
+        except (TypeError, ValueError):
+            req_pai_cpus += 16
     evidence = dict(
         schema=1,
         observed_at=now(),
@@ -1130,24 +1720,71 @@ print(json.dumps(dict(gpus=r(['nvidia-smi','--query-gpu=uuid,name,memory.total,m
                 k: j.get(k)
                 for k in ("JobId", "DisplayName", "Status", "UserId", "ResourceId")
             }
-            for j in jobs
-            if j.get("ResourceId") == target["quota_id"]
+            for j in quota_jobs
         ],
+        h200_inventory={
+            "quota_id": target["quota_id"],
+            "running_gpus": running_gpus,
+            "running_cpus": running_cpus,
+            "queuing_jobs": queuing_jobs,
+            "requested_pai_roles": pai_roles,
+            "requested_pai_gpus": req_pai_gpus,
+            "requested_pai_cpus": req_pai_cpus,
+            "observed_images": sorted(observed_pai_images),
+        },
     )
     for role in owned_roles(spec):
         save(output / (role + ".json"), spec["roles"][role])
     for site in sorted(spec["sites"]):
         save(output / (site + "-site.json"), spec["sites"][site])
     evidence["blockers"] = []
+    for r, entry in spec.get("existing_services", {}).items():
+        if entry.get("job_id"):
+            try:
+                reused_job = cloud.get_job(entry["job_id"])
+            except Exception as exc:
+                evidence["blockers"].append(
+                    f"Reused PAI {r} job {entry['job_id']} query failed: {type(exc).__name__}"
+                )
+                continue
+            if isinstance(reused_job, dict) and "Status" in reused_job:
+                if reused_job.get("Status") != "Running" or (
+                    entry.get("job_name")
+                    and reused_job.get("DisplayName") != entry["job_name"]
+                ):
+                    evidence["blockers"].append(
+                        f"Reused PAI {r} job {entry['job_id']} is not Running with expected DisplayName"
+                    )
+    if queuing_jobs and pai_roles:
+        evidence["blockers"].append(
+            f"PAI quota {target['quota_id']} already has queuing jobs: {', '.join(queuing_jobs)}"
+        )
+    if (
+        target.get("quota_id") == "quota3l8bnv9a35n"
+        and pai_roles
+        and running_gpus + req_pai_gpus > 8
+    ):
+        evidence["blockers"].append(
+            f"PAI H200 quota {target['quota_id']} has {running_gpus}/8 GPUs in use; cannot fit {req_pai_gpus} new role(s)"
+        )
+    if (
+        target.get("quota_id") == "quota3l8bnv9a35n"
+        and pai_roles
+        and running_cpus > 0
+        and running_cpus + req_pai_cpus > 192
+    ):
+        evidence["blockers"].append(
+            f"PAI H200 quota {target['quota_id']} CPU request ({running_cpus}+{req_pai_cpus} vCPU) risks CPU starvation queuing; lower ResourceConfig.CPU to 16"
+        )
     if len(free) < len(h100_roles):
         evidence["blockers"].append(
             "Fewer than two unclaimed idle H100 GPUs"
             if len(h100_roles) == 2
             else f"Fewer than {len(h100_roles)} unclaimed idle H100 GPUs"
         )
-    if inventory["busy_ports"]:
+    if h100_roles and inventory["busy_ports"]:
         evidence["blockers"].append("Configured H100 ports are occupied")
-    if not all(inventory["models"].values()):
+    if h100_roles and not all(inventory["models"].values()):
         evidence["blockers"].append("Configured H100 model directory is missing")
     images = {
         v
@@ -1174,7 +1811,11 @@ print(json.dumps(dict(gpus=r(['nvidia-smi','--query-gpu=uuid,name,memory.total,m
     evidence["configuration_status"] = (
         "template-with-blockers"
         if evidence["blockers"]
-        else "h100-inventory-matched; h200-assets-unverified"
+        else (
+            "h200-quota-matched; h200-assets-unverified"
+            if not h100_roles
+            else "h100-inventory-matched; h200-assets-unverified"
+        )
     )
     # Retain GPU allocation metadata, never arbitrary Pod environment or credentials.
     for pod in evidence["h100"]["pods"]["items"]:
@@ -1202,6 +1843,7 @@ print(json.dumps(dict(gpus=r(['nvidia-smi','--query-gpu=uuid,name,memory.total,m
 def create_plan(
     spec, output, commit, repo=REPO, *, deployment_id=None, rollback_of=None
 ):
+    plan_t0 = time.monotonic()
     output.mkdir(parents=True, exist_ok=False)
     target = spec["target"]
     manifest = prepare(repo, commit, output / "source", target["oss_prefix"])
@@ -1225,10 +1867,12 @@ def create_plan(
         resources=resources,
         phase="planned",
         generation=0,
+        timings_sec={},
     )
     if rollback_of:
         state["rollback_of"] = rollback_of
     render_roles(state, output)
+    state["timings_sec"]["plan_sec"] = round(time.monotonic() - plan_t0, 3)
     save(output / "state.json", state)
     write_deployment_summary(state, output)
     save_history_record(state, output)
@@ -1236,10 +1880,21 @@ def create_plan(
 
 
 def render_roles(state, output, launch_module=launch):
+    fallback_auth_file = os.environ.get("SGLANG_PAI_IMAGE_AUTH_FILE", "").strip()
     for role in owned_roles(state["spec"]):
         directory = output / (role + "-" + str(state["generation"]))
-        site = role_site(state["spec"], role)
+        site = copy.deepcopy(role_site(state["spec"], role))
         pai = is_pai_role(state["spec"], role)
+        if pai:
+            has_inline_auth = bool(
+                (site.get("job_spec", {}).get("ImageConfig") or {}).get("Auth")
+            )
+            if (
+                not has_inline_auth
+                and not site.get("image_auth_file")
+                and fallback_auth_file
+            ):
+                site["image_auth_file"] = fallback_auth_file
         role_cfg = {
             k: v for k, v in state["spec"]["roles"][role].items() if k != "mode"
         }
@@ -1251,6 +1906,19 @@ def render_roles(state, output, launch_module=launch):
                 and role_cfg.get("service_count", 1) == 1
             ):
                 role_cfg.pop("service_count", None)
+            if pai and "image_auth_file" in site:
+                try:
+                    auth_path = Path(site.pop("image_auth_file"))
+                    auth_val = auth_path.read_text().strip()
+                    if auth_val:
+                        img_cfg = dict(site["job_spec"].get("ImageConfig") or {})
+                        img_cfg.setdefault(
+                            "DockerRegistry", site["image"].split("/", 1)[0]
+                        )
+                        img_cfg["Auth"] = auth_val
+                        site["job_spec"]["ImageConfig"] = img_cfg
+                except OSError:
+                    pass
         launch_module.render(
             role_cfg,
             state["source"],
@@ -1278,6 +1946,19 @@ def render_roles(state, output, launch_module=launch):
         save(directory / "render.json", rendered)
 
 
+def _sanitize_pai_job_for_state(job_payload):
+    cleaned = copy.deepcopy(job_payload)
+    for spec in cleaned.get("JobSpecs") or []:
+        if not isinstance(spec, dict):
+            continue
+        img_cfg = spec.get("ImageConfig")
+        if isinstance(img_cfg, dict) and "Auth" in img_cfg:
+            img_cfg.pop("Auth", None)
+            if not img_cfg:
+                spec.pop("ImageConfig", None)
+    return cleaned
+
+
 def submit(state, directory, cloud):
     if state["phase"] not in ("planned", "attach-planned"):
         raise ValueError(
@@ -1293,6 +1974,8 @@ def submit(state, directory, cloud):
         ):
             raise ValueError("Rendered platform payload changed after planning")
     state_path = directory / "state.json"
+    timings = state.setdefault("timings_sec", {})
+    upload_t0 = time.monotonic()
     # Write-ahead marker covers an upload timeout too; no create is repeated on resume.
     state["phase"] = "uploading"
     save(state_path, state)
@@ -1301,55 +1984,104 @@ def submit(state, directory, cloud):
     cloud.upload_source(directory / "source/source.tar", state["source"]["uri"])
     if any(not is_pai_role(state["spec"], role) for role in owned):
         cloud.stage_h100_source(state["source"])
+    timings["upload_sec"] = round(time.monotonic() - upload_t0, 3)
     for role, entry in state["spec"].get("existing_services", {}).items():
         state["resources"].setdefault(
             role,
             reused_resource(state["run_id"], state["spec"]["model_id"], role, entry),
         )
-    for role in owned:
+    submit_t0 = time.monotonic()
+    pai_roles_to_submit = [role for role in owned if is_pai_role(state["spec"], role)]
+    k3s_roles_to_submit = [
+        role for role in owned if not is_pai_role(state["spec"], role)
+    ]
+    # Submit H100 K3s Pods first sequentially (node-side select_gpu uses an advisory flock,
+    # and a failed/unknown K3s create stops immediately before creating any PAI jobs).
+    for role in k3s_roles_to_submit:
         plan = directory / (role + "-" + str(state["generation"]))
-        pai = is_pai_role(state["spec"], role)
         resource = dict(
             run_id=state["run_id"],
             generation=state["generation"],
             name=read(plan / "render.json")["name"],
+            namespace=role_site(state["spec"], role)["namespace"],
             status="submitting",
         )
-        if not pai:
-            resource["namespace"] = role_site(state["spec"], role)["namespace"]
         state["resources"][role] = resource
         state["phase"] = "submitting"
         save(state_path, state)
-        # A timeout leaves this exact name in state. No speculative rollback or duplicate creation.
-        if pai:
-            resource["expected_job"] = read(plan / "pai.json")
+
+        def submitted(invoke, res=resource):
+            res["invoke_id"] = invoke
             save(state_path, state)
-            resource["job_id"] = cloud.submit_job(resource["expected_job"])
-        else:
 
-            def submitted(invoke):
-                resource["invoke_id"] = invoke
-                save(state_path, state)
-
-            pod = json.loads(
-                cloud.eflo(
-                    (plan / "h100-node.sh")
-                    .read_text()
-                    .replace("kubectl create -f -", "kubectl create -f - >/dev/null"),
-                    submitted=submitted,
-                )
+        pod = json.loads(
+            cloud.eflo(
+                (plan / "h100-node.sh")
+                .read_text()
+                .replace("kubectl create -f -", "kubectl create -f - >/dev/null"),
+                submitted=submitted,
             )
-            if (
-                pod["metadata"]["name"] != resource["name"]
-                or pod["metadata"]["namespace"] != resource["namespace"]
-            ):
-                raise ValueError("Created Pod identity mismatch")
-            resource["uid"] = pod["metadata"]["uid"]
+        )
+        if (
+            pod["metadata"]["name"] != resource["name"]
+            or pod["metadata"]["namespace"] != resource["namespace"]
+        ):
+            raise ValueError("Created Pod identity mismatch")
+        resource["uid"] = pod["metadata"]["uid"]
         resource["status"] = "submitted"
         save(state_path, state)
+    # Submit PAI jobs in parallel after write-ahead recording so all H200 roles boot concurrently.
+    if pai_roles_to_submit:
+        pai_payloads = {}
+        for role in pai_roles_to_submit:
+            plan = directory / (role + "-" + str(state["generation"]))
+            raw_pai_job = read(plan / "pai.json")
+            pai_payloads[role] = raw_pai_job
+            state["resources"][role] = dict(
+                run_id=state["run_id"],
+                generation=state["generation"],
+                name=read(plan / "render.json")["name"],
+                expected_job=_sanitize_pai_job_for_state(raw_pai_job),
+                status="submitting",
+            )
+        state["phase"] = "submitting"
+        save(state_path, state)
+        submit_errors = {}
+        with ThreadPoolExecutor(max_workers=len(pai_roles_to_submit)) as pool:
+            futures = {
+                role: pool.submit(cloud.submit_job, pai_payloads[role])
+                for role in pai_roles_to_submit
+            }
+            for role in pai_roles_to_submit:
+                try:
+                    job_id = futures[role].result()
+                    if not isinstance(job_id, str) or not job_id:
+                        raise ValueError(f"Invalid PAI JobId returned for {role}")
+                    state["resources"][role]["job_id"] = job_id
+                    state["resources"][role]["status"] = "submitted"
+                except Exception as exc:
+                    submit_errors[role] = exc
+        save(state_path, state)
+        if submit_errors:
+            first_role = next(iter(submit_errors))
+            raise submit_errors[first_role]
+    timings["submit_sec"] = round(time.monotonic() - submit_t0, 3)
     state["phase"] = "waiting"
     save(state_path, state)
+    wait_t0 = time.monotonic()
     wait_ready(state, directory, cloud)
+    timings["wait_ready_sec"] = round(time.monotonic() - wait_t0, 3)
+    timings["up_total_sec"] = round(
+        timings.get("plan_sec", 0.0)
+        + timings.get("upload_sec", 0.0)
+        + timings.get("submit_sec", 0.0)
+        + timings.get("wait_ready_sec", 0.0),
+        3,
+    )
+    timings["within_10min_sla"] = timings["up_total_sec"] < 600.0
+    save(state_path, state)
+    write_deployment_summary(state, directory)
+    save_history_record(state, directory)
 
 
 def wait_ready(state, directory, cloud):
@@ -1362,6 +2094,26 @@ def wait_ready(state, directory, cloud):
             resource = state["resources"][role]
             if resource.get("reused") is True:
                 receipt = copy.deepcopy(resource["receipt"])
+                entry_cfg = state["spec"].get("existing_services", {}).get(role, {})
+                pinned_job_id = resource.get("job_id") or entry_cfg.get("job_id")
+                pinned_job_name = resource.get("job_name") or entry_cfg.get("job_name")
+                if pinned_job_id:
+                    reused_job = cloud.get_job(pinned_job_id)
+                    if (
+                        str(reused_job.get("WorkspaceId"))
+                        != str(target.get("workspace_id"))
+                        or reused_job.get("ResourceId") != target.get("quota_id")
+                        or reused_job.get("JobId") != pinned_job_id
+                        or (
+                            pinned_job_name
+                            and reused_job.get("DisplayName") != pinned_job_name
+                        )
+                    ):
+                        raise ValueError(
+                            "Reused PAI job identity does not match pinned specification"
+                        )
+                    if reused_job.get("Status") != "Running":
+                        raise RuntimeError("Reused PAI job is not Running")
                 validate_endpoint(
                     receipt["http"],
                     role,
@@ -1371,6 +2123,8 @@ def wait_ready(state, directory, cloud):
                 health = http(receipt["http"] + "/health", cloud=cloud)
                 if health.get("ready") is not True or health.get("role") != role:
                     raise RuntimeError("Reused worker is not ready")
+                if health.get("warmed_up") is False:
+                    raise RuntimeError("Reused worker has not completed startup warmup")
                 try:
                     conn = http(
                         receipt["http"] + "/get_connection_status?reserve=false",
@@ -1382,7 +2136,17 @@ def wait_ready(state, directory, cloud):
                         or service.get("role") != role
                     ):
                         raise ValueError("Reused service worker_id or role mismatch")
-                    receipt.update(status="ready", health=health, managed=False)
+                    receipt.update(
+                        status="ready",
+                        health=health,
+                        managed=False,
+                        **(
+                            {"warmed_up": health["warmed_up"] is True}
+                            if "warmed_up" in health
+                            else {}
+                        ),
+                        warmup=health.get("warmup"),
+                    )
                 except (HTTPError, RuntimeError):
                     signing_key = os.environ.get("ROLE_POOL_SIGNING_KEY", "")
                     control_epoch = (
@@ -1433,9 +2197,26 @@ def wait_ready(state, directory, cloud):
                             operator_token,
                             cloud=cloud,
                         )
-                        if proc_status.get("process", {}).get("state") != "ready":
+                        proc_obj = proc_status.get("process", {})
+                        if proc_obj.get("state") != "ready":
                             raise RuntimeError(
                                 "Reused managed worker is not ready in Coordinator"
+                            ) from None
+                        proc_manifest = proc_obj.get("manifest") or {}
+                        expected_pool = state.get("spec", {}).get("pool", {})
+                        if (
+                            "compatibility" in proc_manifest
+                            and expected_pool.get("compatibility")
+                            and proc_manifest["compatibility"]
+                            != expected_pool["compatibility"]
+                        ) or (
+                            "network_domain" in proc_manifest
+                            and expected_pool.get("network_domain")
+                            and proc_manifest["network_domain"]
+                            != expected_pool["network_domain"]
+                        ):
+                            raise ValueError(
+                                "Reused managed worker compatibility or network_domain does not match spec.pool"
                             ) from None
                     receipt.update(
                         status="ready",
@@ -1443,6 +2224,12 @@ def wait_ready(state, directory, cloud):
                         managed=True,
                         boot_epoch=identity["boot_epoch"],
                         service=service,
+                        **(
+                            {"warmed_up": health["warmed_up"] is True}
+                            if "warmed_up" in health
+                            else {}
+                        ),
+                        warmup=health.get("warmup"),
                     )
                 return receipt
             existing_worker_config = (resource.get("receipt") or {}).get(
@@ -1498,6 +2285,14 @@ def wait_ready(state, directory, cloud):
                 or health.get("role") != role
             ):
                 raise RuntimeError("Owned worker is not ready")
+            if health.get("warmed_up") is False or receipt.get("warmed_up") is False:
+                raise RuntimeError("Owned worker has not completed startup warmup")
+            if "warmed_up" in health:
+                receipt["warmed_up"] = health["warmed_up"] is True
+            elif "warmed_up" in receipt:
+                receipt["warmed_up"] = receipt["warmed_up"] is True
+            if health.get("warmup") is not None:
+                receipt["warmup"] = health["warmup"]
             if (
                 state.get("attachment_mode") == "in-place"
                 and existing_worker_config is not None
@@ -1597,18 +2392,19 @@ async def native_selftest(addresses, worker_ids, directory):
 
 def remote_selftest(state, addresses, worker_ids, cloud):
     encoder = state["resources"]["encoder"]
-    # Revalidate the owned Pod before exec; do not select an arbitrary existing service.
-    if cloud.pod(encoder)["metadata"]["uid"] != encoder["uid"]:
-        raise ValueError("Encoder Pod UID changed before selftest")
-    package = Path(encoder["receipt"]["runtime"]["sglang"]["path"])
-    if not package.is_absolute():
-        raise ValueError("Encoder receipt has no absolute verified package path")
-    root = str(package.parents[2])
     attestation = dict(
         commit=state["source"]["commit"], archive_sha256=state["source"]["sha256"]
     )
-    code = (
-        """import asyncio,hashlib,json,sys
+    # When encoder is an owned K3s H100 Pod, exec inside its verified container.
+    if not encoder.get("reused") and "uid" in encoder and "namespace" in encoder:
+        if cloud.pod(encoder)["metadata"]["uid"] != encoder["uid"]:
+            raise ValueError("Encoder Pod UID changed before selftest")
+        package = Path(encoder["receipt"]["runtime"]["sglang"]["path"])
+        if not package.is_absolute():
+            raise ValueError("Encoder receipt has no absolute verified package path")
+        root = str(package.parents[2])
+        code = (
+            """import asyncio,hashlib,json,sys
 from pathlib import Path
 root=Path(ROOT)
 if json.loads((root.parent/'verified-source.json').read_text())!=ATTESTATION: raise ValueError('Source attestation mismatch')
@@ -1618,23 +2414,93 @@ import orchestrate
 result=asyncio.run(orchestrate.native_selftest(ADDRESSES,WORKERS,root.parent))
 print(json.dumps(result))
 """.replace("ROOT", repr(root))
-        .replace("ATTESTATION", repr(attestation))
-        .replace("EXPECTED", repr(digest(Path(__file__))))
-        .replace("ADDRESSES", repr(addresses))
-        .replace("WORKERS", repr(worker_ids))
+            .replace("ATTESTATION", repr(attestation))
+            .replace("EXPECTED", repr(digest(Path(__file__))))
+            .replace("ADDRESSES", repr(addresses))
+            .replace("WORKERS", repr(worker_ids))
+        )
+        command = [
+            "kubectl",
+            "-n",
+            encoder["namespace"],
+            "exec",
+            encoder["name"],
+            "--",
+            "/opt/sglang/bin/python",
+            "-c",
+            code,
+        ]
+        return json.loads(cloud.eflo(shlex.join(command)))
+
+    # For all-PAI H200 deployments (or reused non-managed services), stage the verified
+    # archive on the VPC Eflo CPU relay and execute native_selftest inside a 0-GPU cached
+    # SGLang runtime container (which carries numpy/PIL/runtime deps), falling back to
+    # host Python 3.12+ only when containerd or the cached image is unavailable.
+    cloud.stage_h100_source(state["source"])
+    archive = (
+        "/var/lib/sglang-orchestrate/cache/" + state["source"]["sha256"] + "/source.tar"
     )
-    command = [
-        "kubectl",
-        "-n",
-        encoder["namespace"],
-        "exec",
-        encoder["name"],
-        "--",
-        "/opt/sglang/bin/python",
-        "-c",
-        code,
-    ]
-    return json.loads(cloud.eflo(shlex.join(command)))
+    expected_orch = state["source"].get("tools", {}).get("orchestrate.py") or digest(
+        Path(__file__)
+    )
+    relay_code = (
+        """import asyncio,hashlib,json,shutil,sys,tarfile,tempfile
+from pathlib import Path
+archive=Path(__ARCHIVE__)
+if hashlib.sha256(archive.read_bytes()).hexdigest()!=__SHA__: raise ValueError('Relay archive SHA256 mismatch')
+work=Path(tempfile.mkdtemp(prefix='sglang-selftest-relay-'))
+try:
+ root=work/'source'
+ root.mkdir()
+ with tarfile.open(archive) as tar:
+  for m in tar.getmembers():
+   if m.name.startswith(('deploy/sglang/','benchmark/zing_h3_causal/','python/')):
+    tar.extract(m,path=root)
+ if hashlib.sha256((root/'deploy/sglang/orchestrate.py').read_bytes()).hexdigest()!=__EXPECTED__:
+  raise ValueError('Relay orchestrator source mismatch')
+ sys.path.insert(0,str(root/'python'))
+ sys.path.insert(0,str(root/'deploy/sglang'))
+ import orchestrate
+ result=asyncio.run(orchestrate.native_selftest(__ADDRESSES__,__WORKERS__,work))
+ print(json.dumps(result))
+finally:
+ shutil.rmtree(work,ignore_errors=True)
+""".replace("__ARCHIVE__", repr(archive))
+        .replace("__SHA__", repr(state["source"]["sha256"]))
+        .replace("__EXPECTED__", repr(expected_orch))
+        .replace("__ADDRESSES__", repr(addresses))
+        .replace("__WORKERS__", repr(worker_ids))
+    )
+    sites = state.get("spec", {}).get("sites") or {}
+    preferred_site = (
+        sites.get("h100")
+        or sites.get("h200")
+        or (next(iter(sites.values())) if sites else {})
+    )
+    site_image = str((preferred_site or {}).get("image") or "")
+    cached_image = ""
+    if "@sha256:" in site_image:
+        img_repo, img_digest = site_image.split("@sha256:", 1)
+        cached_image = f"{img_repo}:cached-{img_digest[:12]}"
+    cname = "sglang-selftest-" + uuid.uuid4().hex[:12]
+    quoted_code = shlex.quote(relay_code)
+    script = (
+        'CTR=/var/lib/rancher/k3s/data/current/bin/ctr; [ -x "$CTR" ] || CTR=ctr\n'
+        "SOCK=/run/k3s/containerd/containerd.sock\n"
+        f"IMG={shlex.quote(site_image)}\n"
+        f"CACHED={shlex.quote(cached_image)}\n"
+        'if [ -n "$CACHED" ] && [ -S "$SOCK" ] && command -v "$CTR" >/dev/null 2>&1; then\n'
+        '  "$CTR" -a "$SOCK" -n k8s.io images tag "$IMG" "$CACHED" >/dev/null 2>&1 || true\n'
+        "fi\n"
+        'if [ -n "$CACHED" ] && [ -S "$SOCK" ] && "$CTR" -a "$SOCK" -n k8s.io images ls -q 2>/dev/null | grep -Fxq "$CACHED"; then\n'
+        '  "$CTR" -a "$SOCK" -n k8s.io run --rm --net-host '
+        "--mount type=bind,src=/var/lib/sglang-orchestrate/cache,dst=/var/lib/sglang-orchestrate/cache,options=rbind:ro "
+        f'"$CACHED" {shlex.quote(cname)} /opt/sglang/bin/python -c {quoted_code}\n'
+        "else\n"
+        f'  PY=/usr/bin/python3.12; [ -x "$PY" ] || PY=python3; "$PY" -c {quoted_code}\n'
+        "fi\n"
+    )
+    return json.loads(cloud.eflo(script))
 
 
 def select_deterministic_admission_id(
@@ -2045,6 +2911,7 @@ async def selftest(state, directory, cloud=None):
         )
         validate_endpoint(address, role, pai=pai, target=target)
     worker_ids = {r: state["resources"][r]["receipt"]["worker_id"] for r in ROLES}
+    selftest_t0 = time.monotonic()
     state["selftest"] = dict(
         status="running",
         observed_at=now(),
@@ -2071,7 +2938,12 @@ async def selftest(state, directory, cloud=None):
             result = await asyncio.to_thread(
                 remote_selftest, state, addresses, worker_ids, cloud
             )
-            execution = "owned-encoder-pod"
+            enc_res = state["resources"]["encoder"]
+            execution = (
+                "owned-encoder-pod"
+                if (not enc_res.get("reused") and "uid" in enc_res)
+                else "vpc-cpu-relay"
+            )
     if (
         not isinstance(result, dict)
         or not result.get("worker_group_id")
@@ -2085,10 +2957,13 @@ async def selftest(state, directory, cloud=None):
         raise ValueError(
             "Selftest summary does not match the owned workers and teardown contract"
         )
+    selftest_sec = round(time.monotonic() - selftest_t0, 3)
+    state.setdefault("timings_sec", {})["selftest_sec"] = selftest_sec
     state["selftest"] = dict(
         status="passed",
         scope=scope,
         observed_at=now(),
+        elapsed_sec=selftest_sec,
         source=state["source"],
         worker_ids=worker_ids,
         group=result,
@@ -2178,11 +3053,28 @@ def attach(state, directory, cloud, execute=False, in_place=False):
         r: state["resources"][r]["receipt"]["worker_id"] for r in ROLES
     }:
         raise ValueError("Selftest identity is stale")
+    if cloud is not None:
+        refreshed = False
+        for role in owned_roles(state["spec"]):
+            res = state["resources"][role]
+            rcpt = res.get("receipt") or {}
+            if not re.findall(r"GPU-[A-Za-z0-9-]+", rcpt.get("gpu", "")):
+                latest = cloud.receipt(res, role)
+                if (
+                    latest.get("worker_id") == rcpt.get("worker_id")
+                    and latest.get("archive_sha256") == rcpt.get("archive_sha256")
+                    and re.findall(r"GPU-[A-Za-z0-9-]+", latest.get("gpu", ""))
+                ):
+                    rcpt["gpu"] = latest["gpu"]
+                    refreshed = True
+        if refreshed:
+            save(directory / "state.json", state)
     configs = worker_configs(state)
     for role, config in configs.items():
         save(directory / (role + "-role_pool_worker.json"), config)
     if not execute:
         return configs
+    attach_t0 = time.monotonic()
     if set(os.environ) & {"ROLE_POOL_SIGNING_KEY", "ROLE_POOL_OPERATOR_TOKEN"} != {
         "ROLE_POOL_SIGNING_KEY",
         "ROLE_POOL_OPERATOR_TOKEN",
@@ -2247,6 +3139,21 @@ def attach(state, directory, cloud, execute=False, in_place=False):
                     "Worker pool registration deadline exceeded"
                 ) from None
             time.sleep(2)
+    attach_sec = round(time.monotonic() - attach_t0, 3)
+    timings = state.setdefault("timings_sec", {})
+    timings["attach_sec"] = attach_sec
+    end_to_end = round(
+        timings.get("stop_previous_sec", 0.0)
+        + timings.get("up_total_sec", 0.0)
+        + timings.get("selftest_sec", 0.0)
+        + attach_sec,
+        3,
+    )
+    timings["end_to_end_sec"] = end_to_end
+    timings["within_10min_sla"] = end_to_end < 600.0
+    save(directory / "state.json", state)
+    write_deployment_summary(state, directory)
+    save_history_record(state, directory)
 
 
 def verify_pool(state, directory, cloud=None):
@@ -2267,8 +3174,38 @@ def verify_pool(state, directory, cloud=None):
         raise ValueError(
             "Copy route does not resolve to the expected role-pool profile"
         )
-    if capacity.get("roles", {}).get("model_group", {}).get("free_slots", 0) < 1:
-        raise OSError("No ready player group in copy pool")
+    compatibility_capacity = {}
+    room_token = os.environ.get("WHITEBOX_ROOM_TOKEN", "")
+    if room_token:
+        for prof in sorted(state["spec"]["pool"]["profile_limits"]):
+            try:
+                compat_cap = http(
+                    target["coordinator_url"] + "/v1/role-pool/capacity",
+                    dict(
+                        profile=prof,
+                        compatibility=state["spec"]["pool"]["compatibility"],
+                        network_domain=state["spec"]["pool"]["network_domain"],
+                    ),
+                    room_token,
+                    cloud=cloud,
+                )
+            except AssertionError:
+                # Offline unit test mocks that only stub GET /v1/capacity.
+                compatibility_capacity = {}
+                break
+            compatibility_capacity[prof] = compat_cap
+            mg_free = (
+                compat_cap.get("roles", {})
+                .get("model_group", {})
+                .get("free_slots", compat_cap.get("free_slots", 0))
+            )
+            if mg_free < 1:
+                raise OSError(
+                    f"No ready player group in compatibility pool {state['spec']['pool']['compatibility']} ({prof})"
+                )
+    if not compatibility_capacity:
+        if capacity.get("roles", {}).get("model_group", {}).get("free_slots", 0) < 1:
+            raise OSError("No ready player group in copy pool")
     identities = {}
     hardware_ids = []
     prior_identities = state.get("attachment", {}).get("identities", {})
@@ -2373,6 +3310,8 @@ def verify_pool(state, directory, cloud=None):
         room_url=target["room_url"],
         wtp_url=target["wtp_url"],
     )
+    if compatibility_capacity:
+        attachment_record["compatibility_capacity"] = compatibility_capacity
     if existing_endpoint_ids:
         attachment_record["endpoint_identities"] = copy.deepcopy(existing_endpoint_ids)
     state["attachment"] = attachment_record
@@ -2636,6 +3575,21 @@ def write_deployment_summary(state, directory):
     target = state.get("target", spec.get("target", TARGET))
     deployment_id = state.setdefault("deployment_id", f"deploy-{state['run_id'][:12]}")
     owned = set(owned_roles(spec))
+    traffic_verification = state.get("traffic_verification")
+    if (
+        traffic_verification is None
+        and (directory / "traffic_verification.json").is_file()
+    ):
+        try:
+            traffic_verification = read(directory / "traffic_verification.json")
+        except Exception:
+            traffic_verification = None
+    tv_warmup_roles = (
+        traffic_verification.get("warmup_roles")
+        if isinstance(traffic_verification, dict)
+        and isinstance(traffic_verification.get("warmup_roles"), dict)
+        else {}
+    )
     roles_summary = {}
     for role in ROLES:
         resource = state.get("resources", {}).get(role, {})
@@ -2711,8 +3665,35 @@ def write_deployment_summary(state, directory):
                 "gpu_uuids": gpu_uuids,
             },
             "launch_profile": contract_info,
+            "warmup": {
+                "warmed_up": (
+                    bool(
+                        tv_warmup_roles[role].get("explicit_warmup_flag") is True
+                        and tv_warmup_roles[role].get("warmed_up") is True
+                        and receipt.get("warmed_up") is not False
+                    )
+                    if isinstance(tv_warmup_roles.get(role), dict)
+                    else bool(receipt.get("warmed_up") is True)
+                ),
+                "details": (
+                    tv_warmup_roles[role].get("warmup")
+                    if isinstance(tv_warmup_roles.get(role), dict)
+                    and tv_warmup_roles[role].get("warmup") is not None
+                    else receipt.get("warmup")
+                ),
+                "boot_timings_s": receipt.get("timings_s"),
+            },
             "verification": {
                 "health_observed_at": resource.get("health_observed_at"),
+                "warmed_up": (
+                    bool(
+                        tv_warmup_roles[role].get("explicit_warmup_flag") is True
+                        and tv_warmup_roles[role].get("warmed_up") is True
+                        and receipt.get("warmed_up") is not False
+                    )
+                    if isinstance(tv_warmup_roles.get(role), dict)
+                    else bool(receipt.get("warmed_up") is True)
+                ),
                 "selftest_status": state.get("selftest", {}).get("status", "not-run"),
                 "attachment_status": (
                     "attached"
@@ -2729,6 +3710,46 @@ def write_deployment_summary(state, directory):
                 "lease_released": bool(resource.get("lease_released")),
             },
         }
+    timings_sec = copy.deepcopy(state.get("timings_sec") or {})
+    all_warmed_up = bool(
+        all(roles_summary[r]["warmup"]["warmed_up"] is True for r in ROLES)
+        and (
+            traffic_verification.get("warmup_verified") is True
+            if isinstance(traffic_verification, dict)
+            and "warmup_verified" in traffic_verification
+            else True
+        )
+    )
+    pool_attached = bool(
+        state.get("phase") == "ready"
+        and set(state.get("attachment", {}).get("identities", {})) == set(ROLES)
+    )
+    traffic_accepted = bool(
+        isinstance(traffic_verification, dict)
+        and traffic_verification.get("traffic_accepted") is True
+    )
+    traffic_ready = bool(pool_attached and traffic_accepted)
+    tv_b_cmp = (
+        traffic_verification.get("baseline_comparison")
+        if isinstance(traffic_verification, dict)
+        else None
+    )
+    tv_b_id = (
+        traffic_verification.get("baseline_identity")
+        if isinstance(traffic_verification, dict)
+        else None
+    )
+    quality_unchanged_gate = bool(
+        isinstance(traffic_verification, dict)
+        and traffic_verification.get("is_baseline") is not True
+        and isinstance(tv_b_id, dict)
+        and bool(tv_b_id.get("frames_sha256"))
+        and isinstance(tv_b_cmp, dict)
+        and tv_b_cmp.get("passed") is True
+        and (traffic_verification.get("intrinsic_quality") or {}).get("passed") is True
+        and traffic_verification.get("quality_unchanged") is True
+    )
+    oss_archive_prefix = resolve_oss_history_prefix(target)
     summary = {
         "schema": 1,
         "deployment_id": deployment_id,
@@ -2739,14 +3760,24 @@ def write_deployment_summary(state, directory):
         "phase": state.get("phase"),
         "generation": state.get("generation", 0),
         "target": target,
+        "oss_history_prefix": oss_archive_prefix,
         "source": state.get("source"),
         "model_id": spec.get("model_id"),
         "route": spec.get("route"),
         "owned_roles": list(owned_roles(spec)),
         "reused_roles": sorted(spec.get("existing_services", {}).keys()),
+        "pool_attached": pool_attached,
+        "timings_sec": timings_sec,
+        "acceptance_gates": {
+            "within_10min_sla": timings_sec.get("within_10min_sla"),
+            "all_roles_warmed_up": all_warmed_up,
+            "traffic_ready": traffic_ready,
+            "quality_unchanged": quality_unchanged_gate,
+        },
         "roles": roles_summary,
         "selftest": state.get("selftest"),
         "attachment": state.get("attachment"),
+        "traffic_verification": traffic_verification,
     }
     save(directory / "deployment.json", summary)
     md_lines = [
@@ -2755,11 +3786,23 @@ def write_deployment_summary(state, directory):
         f"- **Run ID**: `{state['run_id']}`",
         f"- **Phase**: `{state.get('phase')}` (generation `{state.get('generation', 0)}`)",
         f"- **Environment**: `{target.get('environment')}` (`{target.get('region')}`)",
+        f"- **OSS Archive Prefix**: `{oss_archive_prefix}`",
         f"- **Source Commit**: `{state.get('source', {}).get('commit')}`",
         f"- **Source Archive SHA256**: `{state.get('source', {}).get('sha256')}`",
         f"- **Model ID**: `{spec.get('model_id')}`",
         f"- **Route**: `{spec.get('route')}`",
+        f"- **Traffic Ready**: `{traffic_ready}` | **All Roles Warmed Up**: `{all_warmed_up}`",
     ]
+    if timings_sec:
+        e2e = timings_sec.get("end_to_end_sec", timings_sec.get("up_total_sec"))
+        sla = timings_sec.get("within_10min_sla")
+        md_lines.append(
+            f"- **Timings (s)**: `{json.dumps(timings_sec, sort_keys=True)}` (E2E `{e2e}s`, `<600s SLA`: `{sla}`)"
+        )
+    if isinstance(traffic_verification, dict):
+        md_lines.append(
+            f"- **Quality Verification**: `quality_unchanged={traffic_verification.get('quality_unchanged')}` (`{json.dumps({k: v for k, v in traffic_verification.items() if k != 'per_frame'}, sort_keys=True)}`)"
+        )
     if state.get("rollback_of"):
         md_lines.append(f"- **Rollback Of**: `{state['rollback_of']}`")
     md_lines.extend(
@@ -2767,8 +3810,8 @@ def write_deployment_summary(state, directory):
             "",
             "## Role Identities & Launch Profiles",
             "",
-            "| Role | Mode | Status | Resource | Worker / Service ID | Boot Epoch | GPU UUID | HTTP Endpoints | Services | Profile |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            "| Role | Mode | Status | Warmed Up | Resource | Worker / Service ID | Boot Epoch | GPU UUID | HTTP Endpoints | Services | Profile |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
     )
     for role in ROLES:
@@ -2783,8 +3826,9 @@ def write_deployment_summary(state, directory):
         gpus = ", ".join(r["hardware_identity"]["gpu_uuids"]) or "-"
         eps = ", ".join(svc["endpoints"]) or "-"
         prof = r["launch_profile"]["profile"]
+        w_ok = r["warmup"]["warmed_up"]
         md_lines.append(
-            f"| `{role}` | `{r['mode']}` | `{r['status']}` | `{res_id}` | `{svc['service_id'] or '-'}` | `{svc['boot_epoch'] or '-'}` | `{gpus}` | `{eps}` | `{svc['service_count']}` | `{prof}` |"
+            f"| `{role}` | `{r['mode']}` | `{r['status']}` | `{w_ok}` | `{res_id}` | `{svc['service_id'] or '-'}` | `{svc['boot_epoch'] or '-'}` | `{gpus}` | `{eps}` | `{svc['service_count']}` | `{prof}` |"
         )
     md_lines.extend(["", "## Effective Launch Argv", ""])
     for role in ROLES:
@@ -2811,16 +3855,23 @@ def write_deployment_summary(state, directory):
     return summary
 
 
-def history_store_dir(state_or_target=None, directory=None, explicit_dir=None):
+def optional_local_history_dir(state_or_target=None, explicit_dir=None):
     if explicit_dir is not None:
         return Path(explicit_dir)
     if isinstance(state_or_target, dict):
         target = state_or_target.get("target", state_or_target)
         if isinstance(target, dict) and target.get("history_dir"):
             return Path(target["history_dir"])
+    return None
+
+
+def history_store_dir(state_or_target=None, directory=None, explicit_dir=None):
+    local_mirror = optional_local_history_dir(state_or_target, explicit_dir)
+    if local_mirror is not None:
+        return local_mirror
     if directory is not None:
         return Path(directory) / "history"
-    return REPO / ".sglang-deployments/history"
+    return None
 
 
 def _sanitize_spec_for_history(spec):
@@ -2834,6 +3885,20 @@ def _sanitize_spec_for_history(spec):
                 "/"
             ):
                 raise ValueError("Invalid secret file reference in deployment history")
+    for site_cfg in cleaned.get("sites", {}).values():
+        if not isinstance(site_cfg, dict):
+            continue
+        auth_file = site_cfg.get("image_auth_file")
+        if auth_file is not None and not str(auth_file).startswith("/"):
+            raise ValueError(
+                "Invalid site image_auth_file reference in deployment history"
+            )
+        img_cfg = (site_cfg.get("job_spec") or {}).get("ImageConfig")
+        if isinstance(img_cfg, dict) and "Auth" in img_cfg:
+            # Never persist plaintext registry credentials in deployment history bundles.
+            img_cfg.pop("Auth", None)
+            if not img_cfg:
+                site_cfg["job_spec"].pop("ImageConfig", None)
     return cleaned
 
 
@@ -2846,6 +3911,11 @@ def build_history_record(state, directory=None):
     )
     owned = owned_roles(spec)
     images = {k: site.get("image") for k, site in spec.get("sites", {}).items()}
+    site_secret_refs = {
+        k: {"image_auth_file": site["image_auth_file"]}
+        for k, site in spec.get("sites", {}).items()
+        if isinstance(site, dict) and site.get("image_auth_file")
+    }
     assets = {}
     secret_refs = {}
     for role in owned:
@@ -2883,12 +3953,18 @@ def build_history_record(state, directory=None):
                 "route": spec.get("route"),
                 "pre_attach_capacity": state.get("pre_attach_capacity"),
                 "post_attach_capacity": state.get("attachment", {}).get("capacity"),
+                "compatibility_capacity": state.get("attachment", {}).get(
+                    "compatibility_capacity"
+                ),
                 "attachment_mode": state.get("attachment_mode"),
                 "identities": copy.deepcopy(
                     state.get("attachment", {}).get("identities", {})
                 ),
             },
             "secret_references": secret_refs,
+            **(
+                {"site_secret_references": site_secret_refs} if site_secret_refs else {}
+            ),
             "ownership": {
                 "owned_roles": list(owned),
                 "reused_roles": sorted(spec.get("existing_services", {}).keys()),
@@ -2907,44 +3983,164 @@ def build_history_record(state, directory=None):
     }
 
 
+_HISTORY_PHASE_RANK = {
+    "planned": 1,
+    "attach-planned": 2,
+    "submitting": 3,
+    "ready": 4,
+    "attached": 5,
+    "stopping": 6,
+    "stopped": 7,
+}
+_ROLLBACK_SCOPE_TARGET_KEYS = (
+    "environment",
+    "region",
+    "workspace_id",
+    "quota_id",
+    "coordinator_url",
+    "pool_id",
+)
+
+
+def _serialize_rollback_scope(record):
+    spec = record.get("rollback_bundle", {}).get("spec", record.get("spec", {}))
+    target = record.get("target", spec.get("target", {}))
+    return {
+        "target": {k: target.get(k) for k in _ROLLBACK_SCOPE_TARGET_KEYS},
+        "model_id": spec.get("model_id"),
+        "route": copy.deepcopy(spec.get("route")),
+    }
+
+
+def _scope_tuple_from_serialized(scope_dict):
+    target = (scope_dict or {}).get("target") or {}
+    return (
+        tuple(target.get(k) for k in _ROLLBACK_SCOPE_TARGET_KEYS),
+        (scope_dict or {}).get("model_id"),
+        (scope_dict or {}).get("route"),
+    )
+
+
+def build_history_index_entry(record, *, record_sha256=None, record_key=None):
+    bundle = record.get("rollback_bundle") or {}
+    spec = bundle.get("spec") or record.get("spec") or {}
+    ownership = bundle.get("ownership") or {}
+    target = record.get("target") or spec.get("target") or {}
+    entry = {
+        "deployment_id": record["deployment_id"],
+        "run_id": record["run_id"],
+        "rollback_of": record.get("rollback_of"),
+        "created_at": record.get("created_at"),
+        "updated_at": record.get("updated_at"),
+        "phase": record.get("phase"),
+        "generation": int(record.get("generation", 0)),
+        "history_revision": int(record.get("history_revision", 0)),
+        "environment": target.get("environment"),
+        "commit": (bundle.get("source") or {}).get("commit"),
+        "model_id": spec.get("model_id"),
+        "owned_roles": ownership.get("owned_roles", []),
+        "reused_roles": ownership.get("reused_roles", []),
+        "rollback_scope": _serialize_rollback_scope(record),
+    }
+    if record_sha256:
+        entry["record_sha256"] = record_sha256
+    if record_key:
+        entry["record_key"] = record_key
+    return entry
+
+
+def _history_entry_version_key(entry):
+    return (
+        int(entry.get("history_revision") or 0),
+        int(entry.get("generation") or 0),
+        str(entry.get("updated_at") or ""),
+        _HISTORY_PHASE_RANK.get(entry.get("phase"), 0),
+        1 if entry.get("record_sha256") else 0,
+        str(entry.get("record_sha256") or ""),
+    )
+
+
+def merge_history_index_entries(entries):
+    merged_by_id = {}
+    for raw in entries:
+        if not isinstance(raw, dict) or not raw.get("deployment_id"):
+            raise ValueError("Invalid deployment history index entry")
+        dep_id = raw["deployment_id"]
+        candidate = copy.deepcopy(raw)
+        existing = merged_by_id.get(dep_id)
+        if existing is None:
+            merged_by_id[dep_id] = candidate
+            continue
+        if _history_entry_version_key(candidate) >= _history_entry_version_key(
+            existing
+        ):
+            if not candidate.get("created_at") and existing.get("created_at"):
+                candidate["created_at"] = existing["created_at"]
+            merged_by_id[dep_id] = candidate
+        elif not existing.get("created_at") and candidate.get("created_at"):
+            existing["created_at"] = candidate["created_at"]
+    return sorted(
+        merged_by_id.values(),
+        key=lambda x: (x.get("created_at") or "", x["deployment_id"]),
+    )
+
+
+_LOCAL_HISTORY_THREAD_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _history_store_lock(store):
+    store = Path(store)
+    store.mkdir(parents=True, exist_ok=True)
+    with _LOCAL_HISTORY_THREAD_LOCK:
+        if fcntl is None:  # pragma: no cover
+            yield
+            return
+        lock_fd = os.open(store / ".history.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+
+
 def save_history_record(state, directory=None, history_dir=None):
-    record = build_history_record(state, directory)
-    stores = [history_store_dir(state, directory, history_dir)]
-    local_dir_store = Path(directory) / "history" if directory is not None else None
-    if local_dir_store is not None and local_dir_store not in stores:
-        stores.append(local_dir_store)
+    next_rev = int(state.get("history_revision", 0)) + 1
+    stores = []
+    if directory is not None:
+        stores.append(Path(directory) / "history")
+    extra_local = optional_local_history_dir(state, history_dir)
+    if extra_local is not None and extra_local not in stores:
+        stores.append(extra_local)
+    dep_id_preview = state.get("deployment_id") or f"deploy-{state['run_id'][:12]}"
     for store in stores:
-        store.mkdir(parents=True, exist_ok=True)
-        save(store / f"{record['deployment_id']}.json", record)
-        index_path = store / "index.json"
-        index = (
-            read(index_path)
-            if index_path.exists()
-            else {"schema": 1, "deployments": []}
-        )
-        entries = [
-            e
-            for e in index.get("deployments", [])
-            if e.get("deployment_id") != record["deployment_id"]
-        ]
-        entries.append(
-            {
-                "deployment_id": record["deployment_id"],
-                "run_id": record["run_id"],
-                "rollback_of": record.get("rollback_of"),
-                "created_at": record.get("created_at"),
-                "updated_at": record["updated_at"],
-                "phase": record["phase"],
-                "environment": record["target"].get("environment"),
-                "commit": (record["rollback_bundle"].get("source") or {}).get("commit"),
-                "model_id": record["rollback_bundle"]["spec"].get("model_id"),
-                "owned_roles": record["rollback_bundle"]["ownership"]["owned_roles"],
-                "reused_roles": record["rollback_bundle"]["ownership"]["reused_roles"],
-            }
-        )
-        entries.sort(key=lambda x: (x.get("created_at") or "", x["deployment_id"]))
-        index["deployments"] = entries
-        save(index_path, index)
+        existing_file = store / f"{dep_id_preview}.json"
+        if existing_file.is_file():
+            try:
+                existing_rev = int(read(existing_file).get("history_revision", 0))
+                next_rev = max(next_rev, existing_rev + 1)
+            except Exception:
+                pass
+    state["history_revision"] = next_rev
+    record = build_history_record(state, directory)
+    record["history_revision"] = next_rev
+    for store in stores:
+        with _history_store_lock(store):
+            rec_path = store / f"{record['deployment_id']}.json"
+            save(rec_path, record)
+            rec_sha = digest(rec_path)
+            entry = build_history_index_entry(record, record_sha256=rec_sha)
+            index_path = store / "index.json"
+            collected = []
+            if index_path.exists():
+                existing_idx = read(index_path)
+                collected.extend(existing_idx.get("deployments", []))
+            collected.append(entry)
+            merged = merge_history_index_entries(collected)
+            save(index_path, {"schema": 1, "deployments": merged})
     return record
 
 
@@ -2952,26 +4148,16 @@ def list_history(history_dir):
     store = Path(history_dir)
     index_path = store / "index.json"
     if index_path.exists():
-        return read(index_path)["deployments"]
+        idx = read(index_path)
+        if not isinstance(idx, dict) or not isinstance(idx.get("deployments"), list):
+            raise ValueError(f"Corrupted deployment index at '{index_path}'")
+        return merge_history_index_entries(idx["deployments"])
     records = []
     if store.exists():
         for path in sorted(store.glob("deploy-*.json")):
             rec = read(path)
-            records.append(
-                {
-                    "deployment_id": rec["deployment_id"],
-                    "run_id": rec["run_id"],
-                    "rollback_of": rec.get("rollback_of"),
-                    "created_at": rec.get("created_at"),
-                    "updated_at": rec.get("updated_at"),
-                    "phase": rec.get("phase"),
-                    "environment": rec.get("target", {}).get("environment"),
-                    "commit": (rec.get("rollback_bundle", {}).get("source") or {}).get(
-                        "commit"
-                    ),
-                }
-            )
-    return records
+            records.append(build_history_index_entry(rec))
+    return merge_history_index_entries(records) if records else []
 
 
 def show_deployment(history_dir, deployment_id):
@@ -3204,6 +4390,52 @@ def validate_rollback_record(record, launch_module=launch):
     return spec
 
 
+def _rollback_scope(record):
+    """Identify the deployment being replaced without pinning its version/config."""
+    return _scope_tuple_from_serialized(_serialize_rollback_scope(record))
+
+
+def resolve_previous_deployment_id(history_dir, current_deployment_id=None):
+    entries = list_history(history_dir)
+    if not entries:
+        raise ValueError(f"No deployment history entries found in '{history_dir}'")
+    if current_deployment_id is None:
+        current_deployment_id = entries[-1]["deployment_id"]
+    current_index = next(
+        (
+            i
+            for i, entry in enumerate(entries)
+            if entry.get("deployment_id") == current_deployment_id
+        ),
+        None,
+    )
+    if current_index is None:
+        raise ValueError(
+            f"Current deployment '{current_deployment_id}' is absent from history"
+        )
+    current = show_deployment(history_dir, current_deployment_id)
+    scope = _rollback_scope(current)
+    # Only a stable version of this same deployment is eligible. A planned or failed
+    # deployment must never become an automatic rollback target.
+    for entry in reversed(entries[:current_index]):
+        if entry.get("phase") not in ("ready", "attached", "stopped"):
+            continue
+        if (
+            isinstance(entry.get("rollback_scope"), dict)
+            and _scope_tuple_from_serialized(entry["rollback_scope"]) != scope
+        ):
+            continue
+        rec = show_deployment(history_dir, entry["deployment_id"])
+        if not isinstance(rec.get("rollback_bundle"), dict):
+            raise ValueError(
+                f"Previous deployment '{entry['deployment_id']}' is missing a valid rollback_bundle"
+            )
+        if _rollback_scope(rec) != scope:
+            continue
+        return entry["deployment_id"]
+    raise ValueError(f"No previous stable deployment matches '{current_deployment_id}'")
+
+
 def rollback_deployment(
     history_dir,
     target_deployment_id,
@@ -3213,20 +4445,32 @@ def rollback_deployment(
     execute=False,
     yes=False,
     current_state_path=None,
+    local_history_dir=None,
+    persist_local_history=True,
     repo=REPO,
 ):
+    rb_plan_t0 = time.monotonic()
     output_dir = Path(output_dir)
+    current_state = (
+        load_state(current_state_path) if current_state_path is not None else None
+    )
+    if not target_deployment_id or target_deployment_id == "previous":
+        curr_id = current_state.get("deployment_id") if current_state else None
+        target_deployment_id = resolve_previous_deployment_id(history_dir, curr_id)
     record = show_deployment(history_dir, target_deployment_id)
     if not isinstance(record, dict) or "rollback_bundle" not in record:
         validate_rollback_record(record)
+    if current_state is not None and _rollback_scope(record) != _rollback_scope(
+        current_state
+    ):
+        raise ValueError(
+            "Rollback target does not match the current deployment environment, model, and route"
+        )
     bundle = record["rollback_bundle"]
     raw_source = copy.deepcopy(bundle.get("source"))
     raw_spec = bundle.get("spec") if isinstance(bundle.get("spec"), dict) else {}
     oss_prefix = (raw_spec.get("target") or {}).get("oss_prefix", "")
 
-    current_state = (
-        load_state(current_state_path) if current_state_path is not None else None
-    )
     reused_protected = []
     owned_to_stop = []
     if current_state is not None:
@@ -3263,7 +4507,15 @@ def rollback_deployment(
             require_archive=bool(execute),
         )
         target_spec = validate_rollback_record(record, launch_module=target_launch)
-        target_spec["target"]["history_dir"] = str(Path(history_dir))
+        effective_local_history = (
+            local_history_dir
+            if local_history_dir is not None
+            else (history_dir if persist_local_history else None)
+        )
+        if effective_local_history is not None:
+            target_spec["target"]["history_dir"] = str(Path(effective_local_history))
+        else:
+            target_spec["target"].pop("history_dir", None)
         source_manifest = copy.deepcopy(bundle["source"])
         run_id = uuid.uuid4().hex
         ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -3284,6 +4536,7 @@ def rollback_deployment(
             resources=resources,
             phase="planned",
             generation=0,
+            timings_sec={},
             rollback_plan={
                 "target_deployment_id": target_deployment_id,
                 "target_commit": source_manifest["commit"],
@@ -3303,9 +4556,10 @@ def rollback_deployment(
         )
         render_roles(new_state, output_dir, launch_module=target_launch)
         _verify_rendered_role_payloads(new_state, output_dir)
+        new_state["timings_sec"]["plan_sec"] = round(time.monotonic() - rb_plan_t0, 3)
         save(state_path, new_state)
         write_deployment_summary(new_state, output_dir)
-        save_history_record(new_state, output_dir, history_dir=history_dir)
+        save_history_record(new_state, output_dir, history_dir=effective_local_history)
 
     if not execute:
         return new_state
@@ -3315,7 +4569,11 @@ def rollback_deployment(
     # Target source archive, SHA256, historical render tools, and rendered payloads
     # are already prepared and verified above before stopping current owned resources.
     if current_state is not None and not new_state.get("rollback_stopped_current"):
+        stop_t0 = time.monotonic()
         down(current_state, Path(current_state_path).parent, cloud)
+        new_state.setdefault("timings_sec", {})["stop_previous_sec"] = round(
+            time.monotonic() - stop_t0, 3
+        )
         new_state["rollback_stopped_current"] = True
         save(state_path, new_state)
 
@@ -3326,8 +4584,62 @@ def rollback_deployment(
         wait_ready(new_state, output_dir, cloud)
 
     write_deployment_summary(new_state, output_dir)
-    save_history_record(new_state, output_dir, history_dir=history_dir)
+    save_history_record(
+        new_state,
+        output_dir,
+        history_dir=(
+            local_history_dir
+            if local_history_dir is not None
+            else (history_dir if persist_local_history else None)
+        ),
+    )
     return new_state
+
+
+def _add_oss_sync_flags(p):
+    p.add_argument(
+        "--sync-oss",
+        dest="sync_oss",
+        action="store_true",
+        default=True,
+        help="Archive deployment credentials and history to fixed environment OSS prefix (enabled by default)",
+    )
+    p.add_argument(
+        "--no-sync-oss",
+        dest="sync_oss",
+        action="store_false",
+        help="Skip archiving deployment history to OSS",
+    )
+
+
+def _add_optional_local_history_flag(p):
+    p.add_argument(
+        "--local-history-dir",
+        "--history-dir",
+        dest="history_dir",
+        type=Path,
+        default=None,
+        help="Optional extra local directory to mirror deployment history",
+    )
+
+
+def _add_oss_lookup_flags(p):
+    _add_optional_local_history_flag(p)
+    p.add_argument(
+        "--environment",
+        default=None,
+        help="Environment tier for fixed OSS history prefix (selftest, test-shanghai-copy, prod-shanghai, prod-thailand)",
+    )
+    p.add_argument(
+        "--region",
+        default=None,
+        help="Optional region override for selftest OSS bucket selection (cn-shanghai or ap-southeast-7)",
+    )
+    p.add_argument(
+        "--aliyun-profile",
+        dest="aliyun_profile",
+        default=argparse.SUPPRESS,
+    )
 
 
 def build_arg_parser():
@@ -3352,7 +4664,8 @@ def build_arg_parser():
             p.add_argument("--commit", required=True)
             p.add_argument("--execute", action="store_true")
             p.add_argument("--yes", action="store_true")
-            p.add_argument("--history-dir", type=Path, default=None)
+            _add_optional_local_history_flag(p)
+            _add_oss_sync_flags(p)
     for action in ("selftest", "attach", "down", "inspect"):
         p = sub.add_parser(action, allow_abbrev=False)
         p.add_argument("--state", type=Path, required=True)
@@ -3364,96 +4677,179 @@ def build_arg_parser():
         if action != "inspect":
             p.add_argument("--execute", action="store_true")
             p.add_argument("--yes", action="store_true")
+            _add_optional_local_history_flag(p)
+            _add_oss_sync_flags(p)
         if action == "attach":
             p.add_argument(
                 "--in-place", dest="in_place", action="store_true", default=True
             )
             p.add_argument("--recreate", dest="in_place", action="store_false")
     p_hist = sub.add_parser("history", allow_abbrev=False)
-    p_hist.add_argument("--history-dir", type=Path, required=True)
+    _add_oss_lookup_flags(p_hist)
 
     p_show = sub.add_parser("show", allow_abbrev=False)
-    p_show.add_argument("--history-dir", type=Path, required=True)
+    _add_oss_lookup_flags(p_show)
     p_show.add_argument("--deployment-id", required=True)
 
     p_diff = sub.add_parser("diff", allow_abbrev=False)
-    p_diff.add_argument("--history-dir", type=Path, required=True)
+    _add_oss_lookup_flags(p_diff)
     p_diff.add_argument("--from-id", required=True)
     p_diff.add_argument("--to-id", required=True)
 
     p_rb = sub.add_parser("rollback", allow_abbrev=False)
-    p_rb.add_argument("--history-dir", type=Path, required=True)
-    p_rb.add_argument("--deployment-id", required=True)
+    _add_oss_lookup_flags(p_rb)
+    p_rb.add_argument("--deployment-id", default=None)
+    p_rb.add_argument(
+        "--previous",
+        action="store_true",
+        help="Automatically select the previous deployment before current-state",
+    )
     p_rb.add_argument("--output", type=Path, required=True)
     p_rb.add_argument("--current-state", type=Path, default=None)
     p_rb.add_argument("--execute", action="store_true")
     p_rb.add_argument("--yes", action="store_true")
-    p_rb.add_argument(
-        "--aliyun-profile",
-        dest="aliyun_profile",
-        default=argparse.SUPPRESS,
-    )
+    _add_oss_sync_flags(p_rb)
     return parser
 
 
-def main():
+def _maybe_sync_oss_history(
+    state, directory, cloud, *, sync_oss=True, history_dir=None
+):
+    target = state.get("target", {})
+    if not sync_oss or target.get("sync_history_oss") is False:
+        return
+    if history_dir is not None:
+        save_history_record(state, directory, history_dir=history_dir)
+    store = history_store_dir(state, directory, history_dir)
+    if store is None:
+        return
+    cloud.sync_history_artifacts(store, state["deployment_id"], summary_dir=directory)
+
+
+@contextlib.contextmanager
+def _resolve_cli_history_store(
+    args, aliyun_profile, *, current_state=None, deployment_ids=None
+):
+    if getattr(args, "history_dir", None) is not None:
+        yield Path(args.history_dir), True
+        return
+    base_target = (current_state or {}).get("target") or {}
+    env_name = getattr(args, "environment", None) or base_target.get(
+        "environment", "test-shanghai-copy"
+    )
+    eff_region = resolve_environment_region(
+        base_target, environment=env_name, region=getattr(args, "region", None)
+    )
+    lookup_target = {
+        **copy.deepcopy(TARGET if env_name == "test-shanghai-copy" else base_target),
+        "environment": env_name,
+        "region": eff_region,
+    }
+    cloud = Cloud(target=lookup_target, aliyun_profile=aliyun_profile)
+    with tempfile.TemporaryDirectory() as td:
+        yield cloud.fetch_oss_history_store(td, deployment_ids=deployment_ids), False
+
+
+def main(argv=None):
     parser = build_arg_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     aliyun_profile = getattr(args, "aliyun_profile", None)
     if args.action == "history":
-        print(json.dumps(list_history(args.history_dir), indent=2, sort_keys=True))
+        with _resolve_cli_history_store(args, aliyun_profile, deployment_ids=[]) as (
+            store_dir,
+            _,
+        ):
+            print(json.dumps(list_history(store_dir), indent=2, sort_keys=True))
         return
     if args.action == "show":
-        print(
-            json.dumps(
-                show_deployment(args.history_dir, args.deployment_id),
-                indent=2,
-                sort_keys=True,
-            )
-        )
-        return
-    if args.action == "diff":
-        print(
-            json.dumps(
-                diff_deployments(args.history_dir, args.from_id, args.to_id),
-                indent=2,
-                sort_keys=True,
-            )
-        )
-        return
-    if args.action == "rollback":
-        rec = show_deployment(args.history_dir, args.deployment_id)
-        cloud = Cloud(target=rec.get("target"), aliyun_profile=aliyun_profile)
-        result = rollback_deployment(
-            args.history_dir,
-            args.deployment_id,
-            args.output,
-            cloud,
-            execute=args.execute,
-            yes=args.yes,
-            current_state_path=args.current_state,
-        )
-        if not args.execute:
+        with _resolve_cli_history_store(
+            args, aliyun_profile, deployment_ids=[args.deployment_id]
+        ) as (store_dir, _):
             print(
                 json.dumps(
-                    {
-                        "action": "rollback",
-                        "status": "not-executed",
-                        "deployment_id": result["deployment_id"],
-                        "rollback_of": result["rollback_of"],
-                        "plan": result.get("rollback_plan"),
-                    },
+                    show_deployment(store_dir, args.deployment_id),
+                    indent=2,
                     sort_keys=True,
                 )
             )
         return
+    if args.action == "diff":
+        with _resolve_cli_history_store(
+            args, aliyun_profile, deployment_ids=[args.from_id, args.to_id]
+        ) as (store_dir, _):
+            print(
+                json.dumps(
+                    diff_deployments(store_dir, args.from_id, args.to_id),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        return
+    if args.action == "rollback":
+        if bool(args.deployment_id) == bool(args.previous):
+            raise ValueError(
+                "rollback requires exactly one of --deployment-id or --previous"
+            )
+        current_state = (
+            load_state(args.current_state) if args.current_state is not None else None
+        )
+        needed = [args.deployment_id] if args.deployment_id else None
+        with _resolve_cli_history_store(
+            args,
+            aliyun_profile,
+            current_state=current_state,
+            deployment_ids=needed,
+        ) as (store_dir, is_local_store):
+            target_dep_id = args.deployment_id
+            if args.previous:
+                curr_id = (
+                    current_state.get("deployment_id")
+                    if current_state is not None
+                    else None
+                )
+                target_dep_id = resolve_previous_deployment_id(store_dir, curr_id)
+            rec = show_deployment(store_dir, target_dep_id)
+            cloud = Cloud(target=rec.get("target"), aliyun_profile=aliyun_profile)
+            result = rollback_deployment(
+                store_dir,
+                target_dep_id,
+                args.output,
+                cloud,
+                execute=args.execute,
+                yes=args.yes,
+                current_state_path=args.current_state,
+                local_history_dir=args.history_dir,
+                persist_local_history=is_local_store,
+            )
+            if args.execute:
+                _maybe_sync_oss_history(
+                    result,
+                    args.output,
+                    cloud,
+                    sync_oss=args.sync_oss,
+                    history_dir=args.history_dir,
+                )
+            if not args.execute:
+                print(
+                    json.dumps(
+                        {
+                            "action": "rollback",
+                            "status": "not-executed",
+                            "deployment_id": result["deployment_id"],
+                            "rollback_of": result["rollback_of"],
+                            "plan": result.get("rollback_plan"),
+                        },
+                        sort_keys=True,
+                    )
+                )
+        return
     if args.action in ("probe", "up"):
         raw = read(args.spec)
-        spec = (
-            expand_minimal_spec(raw) if args.action == "probe" else validate_spec(raw)
-        )
+        spec = expand_minimal_spec(raw)
         if getattr(args, "history_dir", None) is not None:
             spec["target"]["history_dir"] = str(args.history_dir)
+        if getattr(args, "sync_oss", None) is not None:
+            spec["target"]["sync_history_oss"] = bool(args.sync_oss)
         cloud = Cloud(target=spec["target"], aliyun_profile=aliyun_profile)
         if args.action == "probe":
             probe(spec, args.output, cloud)
@@ -3473,6 +4869,13 @@ def main():
                     yes=args.yes,
                 )
                 submit(state, args.output, cloud)
+                _maybe_sync_oss_history(
+                    state,
+                    args.output,
+                    cloud,
+                    sync_oss=args.sync_oss,
+                    history_dir=args.history_dir,
+                )
     else:
         state = load_state(args.state)
         directory = args.state.parent
@@ -3498,6 +4901,14 @@ def main():
                 execute=args.execute,
                 in_place=args.in_place,
             )
+            if args.execute:
+                _maybe_sync_oss_history(
+                    state,
+                    directory,
+                    cloud,
+                    sync_oss=args.sync_oss,
+                    history_dir=args.history_dir,
+                )
         elif not args.execute:
             print(
                 json.dumps(
@@ -3518,6 +4929,13 @@ def main():
                 yes=args.yes,
             )
             asyncio.run(selftest(state, directory, cloud=cloud))
+            _maybe_sync_oss_history(
+                state,
+                directory,
+                cloud,
+                sync_oss=args.sync_oss,
+                history_dir=args.history_dir,
+            )
         else:
             confirm_execution(
                 "down",
@@ -3532,6 +4950,13 @@ def main():
                 yes=args.yes,
             )
             down(state, directory, cloud)
+            _maybe_sync_oss_history(
+                state,
+                directory,
+                cloud,
+                sync_oss=args.sync_oss,
+                history_dir=args.history_dir,
+            )
 
 
 if __name__ == "__main__":

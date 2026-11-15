@@ -243,14 +243,16 @@ world-model-all-in-one负责现场环境、观测和证据回写。开发验证�
 | --- | --- |
 | prepare/render/run、归档校验、导入核验、原生worker argv、H100选卡、回执和失败退出 | 已实现；CPU合同测试通过 |
 | OSS上传 | 没有专用publish命令；外层调用既有ossutil并记录上传结果；容器下载/验hash已实现 |
-| 平台提交/查重/UNKNOWN对账、实际imageID与JobPod回读、回执长期归档 | 本PR提供请求文件与准确CLI；没有自动submit/inspect/rollback命令，由外层按授权执行 |
-| 模型池注册/签名接线 | orchestrate.py 生成 Worker Agent 配置并核验注册身份；仅 CPU 测试，未实机验收 |
+| 平台提交/查重/UNKNOWN对账、实际imageID与JobPod回读、回执长期归档 | `launch.py` 提供底层渲染与启动回执；`orchestrate.py` 提供 `probe/up/inspect/selftest/attach/down/history/show/diff/rollback` 全套受控编排与 OSS 同步 |
+| 模型池注册/签名接线 | `orchestrate.py` 生成 Worker Agent 配置、核验注册身份与精确组容量，已在上海 H200 实机完成新建三角色、复用 E/D 与跨版本回滚验收 |
 | 实际出帧、浏览器业务E2E | 独立验收层；原生建组自测或 ready 不代表生成/业务通过 |
 | 上海1102 serving/table精确路径和model/schedule/CUDA provenance、480/736及SP1显存、OSS/Eflo/PAI实测 | 未验收；正式部署前须关闭对应缺口 |
 
 #17可以先完成skill设计；命令集成需对照本PR最终main SHA，底层缺口反馈本PR，不能在skill里发明不存在的publish/submit/verify命令。
 
 本轮新增 role 字段、环境前缀、端口、资产 hash 生成模式及 profile launcher 接线详见 [编排合同](ORCHESTRATION.md#配置输入)。
-`launch.py assets --config ROLE.json --output NEW_ASSETS.json --extra-file /absolute/external/weights`
-生成新的本地 hash 清单（允许多次 extra-file）；不传 output 则核验现有清单。
+`launch.py assets --config ROLE.json --output NEW_ASSETS.json --sized-weights --extra-file /absolute/external/weights`
+生成新的本地 hash 清单（允许多次 `--extra-file`；传 `--sized-weights` 为 `.safetensors/.pt/.bin` 权重记录 `{bytes, sha256}` 以加速冷启动校验，JSON 配置仍保持全文 SHA256）；不传 `--output` 则核验现有清单。
+`stage_assets` 按角色按需本地预拷热权重（`dit`: `transformer` + `adaln-table-unsplit`；`encoder`: `video_vae` + `processor`；`decoder`: `lynn`），其余目录建立符号链接。PAI site 支持 `image_auth_file` 从外部受控密钥文件注入 `ImageConfig.Auth`，避免明文凭据进入配置或历史记录。原生 worker 启动完成真实推理预热后在 `/health` 与 `receipt.json` 中记录 `warmed_up: true`、`warmup` 摘要及分阶段耗时 `timings_s`。
 生成时 role 的 asset_receipt_sha256 可先填 64 个 0，再用输出摘要冻结；这不代表原始导出来源已验证。
+部署后的流量接入与逐帧 PSNR/SSIM 画质比对统一使用 `deploy/sglang/verify_traffic_quality.py`（支持 VPC 内 `run` 实时回放与离线 `compare-dirs` 帧目录比对，自动回写 `traffic_verification.json` 与 `deployment.json`）。

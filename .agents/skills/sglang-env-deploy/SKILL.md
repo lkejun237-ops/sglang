@@ -16,7 +16,7 @@ description: 在已授权的目标环境部署、复用、检查或回滚 SGLang
   缺失信息先从已指定部署的 spec/state/history 和仓库配方取得；仍无法确定才询问，不能猜测现场 IP、UUID 或资产目录。
 - 支持测试与生产环境；使用真实环境名和目标地址，执行范围须覆盖用户已授权的精确环境、模型池和 owned 资源。
   Gateway/Coordinator/Room/WTP/SDK 的发布不在本 skill 范围；已有 Coordinator 仅作为模型侧注册/租约接线依赖。
-- 新建三角色与仅新建 DiT、借用现有 Encoder/Decoder 都可用。每 service 单活跃会话；E/D 多 service 须有实际进程预算，
+- 新建三角色（含全 H200 `topology: "h200"` 新建 `1 Encoder + 1 DiT + 1 Decoder`，默认 `CPU: "16"` 防配额饥饿）与仅新建 H200 DiT、复用现有 H100/H200 Encoder/Decoder（PAI 实例支持固定 `pai: true, job_id, job_name` 核验身份与 `compatibility` 域一致）都可用。每 service 单活跃会话；E/D 多 service 须有实际进程预算，
   不把多 service 当作已验证容量。reuse 仅借用/释放本次组或租约，不重启、重复注册、drain 或 retire 共享服务。
 - 使用前读 `benchmark/AI_INFRA_TEST_MACHINES.md`、`AI_INFRA_TASK_OWNERS.md` 和
   `docs/docs/sglang-diffusion/zing/deployment_zing_h3.mdx`，按数字 UserId 分清提交账号与业务负责人，重新核验占用。
@@ -113,10 +113,10 @@ python3 deploy/sglang/orchestrate.py attach --aliyun-profile shengdong \
 
 ## 历史、回滚与交付
 
-- 使用 `history --history-dir ...`、`show --history-dir ... --deployment-id ...`、
-  `diff --history-dir ... --from-id ... --to-id ...` 回读已持久保存的记录。
-- 回滚先运行 `rollback --history-dir ... --deployment-id ... --current-state ... --output <新目录>` 看计划；
-  仅在回滚授权内追加 `--execute --yes`。必须具备完整 rollback_bundle，不仅是一份摘要，不能要求重获旧 UUID/Pod/Job 身份。
+- 部署凭据与历史默认归档至按环境隔离的固定 OSS 路径前缀（`selftest`：`oss://leap-world-shanghai/sglang/deployments/selftest` 或泰国 `oss://leap-worldmodel-thailand-single-az/sglang/deployments/selftest`；`test-shanghai-copy`：`oss://leap-world-shanghai/sglang/deployments/test-shanghai-copy`；`prod-shanghai`：`oss://leap-world-shanghai/sglang/deployments/prod-shanghai`；`prod-thailand`：`oss://leap-worldmodel-thailand-single-az/sglang/deployments/prod-thailand`），可选传 `--local-history-dir <dir>` 额外镜像保存到本地目录（PAI 镜像拉取凭据通过 `image_auth_file` 或 `SGLANG_PAI_IMAGE_AUTH_FILE` 注入，历史记录自动脱敏）。使用 `history --environment ...`、`show --environment ... --deployment-id ...`、`diff --environment ... --from-id ... --to-id ...` 可直接从 OSS 回读记录。
+- 回滚支持 `--previous` 自动从 OSS（或 `--local-history-dir`）定位当前部署之前的上一可用版本（含升版时已通过 `down` 优雅停止且具备完整 `rollback_bundle` 的紧邻上一版，或 `--deployment-id <id>` 指定目标版本），先运行 `rollback --previous --current-state ... --output <新目录>` 看计划；
+  仅在回滚授权内追加 `--execute --yes`。必须具备完整 rollback_bundle，不仅是一份摘要，不能要求重获旧 UUID/Pod/Job 身份，且绝不停止或重置 `reuse` 共享角色。
+- 部署后准入核验（全部门禁 Fail-Closed）：检查 `deployment.json` 中 `timings_sec`（`< 600s` 10 分钟 SLA）、新建与复用全部三角色 `/health` 显式返回 `warmed_up: true`（缺失字段或 `false` 均判定未通过），并在 VPC 内运行 `deploy/sglang/verify_traffic_quality.py run --state ... --baseline-dir ... --output-dir ...`（首次基线录制使用独立分离的 `record-baseline` 子命令生成 `baseline_manifest.json`）核验真实 Coordinator 接流会话（`traffic_accepted: true` 才会使 `acceptance_gates.traffic_ready` 通过）及绑定身份基线的逐帧 PSNR/SSIM/luma 画质门禁（产出 `traffic_verification.json`）。
 - 清理仅使用保存 state 的 `down --state ... --execute --yes`，仅在该资源清理授权内执行。
   stopped-unretired 状态通过同一 state 重试完成退役；reuse 服务、共享缓存、其他部署和活跃会话不在清理范围。
 - 保存 `state.json`、原始 receipt、`deployment.json`、`DEPLOYMENT.md`、history/rollback_bundle、平台回读及测试结果。

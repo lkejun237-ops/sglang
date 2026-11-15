@@ -18,6 +18,7 @@ import urllib.request
 import uuid
 import zlib
 from concurrent.futures import ThreadPoolExecutor
+from http.client import HTTPException
 from pathlib import Path
 
 from source import digest, prepare, sha, validate_manifest, write_json
@@ -348,13 +349,25 @@ def stage_assets(c):
         or destination.resolve().is_relative_to(source.resolve())
     ):
         raise ValueError("Staging source and destination must not overlap")
-    selected = {
-        "transformer",
+    role = c.get("role", "dit")
+    base_files = {
         "zing_config.json",
         "model_index.json",
         "zing_realtime_profile.json",
         "EXPORT_COMPLETE.json",
     }
+    if role == "encoder":
+        selected = base_files | {"video_vae", "processor"}
+        copy_adaln = False
+        copy_lynn = False
+    elif role == "decoder":
+        selected = set(base_files)
+        copy_adaln = False
+        copy_lynn = True
+    else:
+        selected = base_files | {"transformer"}
+        copy_adaln = True
+        copy_lynn = False
     paths = []
     for name in selected:
         path = source / "model" / name
@@ -362,8 +375,10 @@ def stage_assets(c):
             paths.extend(asset_files(path))
         elif path.is_file():
             paths.append(path)
-    if (source / "adaln-table-unsplit").is_dir():
+    if copy_adaln and (source / "adaln-table-unsplit").is_dir():
         paths.extend(asset_files(source / "adaln-table-unsplit"))
+    if copy_lynn and (source / "lynn").is_dir():
+        paths.extend(asset_files(source / "lynn"))
 
     def copy(path):
         target = destination / path.relative_to(source)
@@ -393,15 +408,20 @@ def stage_assets(c):
         list(executor.map(copy, paths))
     model = destination / "model"
     model.mkdir(parents=True, exist_ok=True)
-    for path in [p for p in (source / "model").iterdir() if p.name not in selected] + [
-        source / "lynn"
-    ]:
+    extra_roots = []
+    if not copy_lynn:
+        extra_roots.append(source / "lynn")
+    if not copy_adaln:
+        extra_roots.append(source / "adaln-table-unsplit")
+    for path in [
+        p for p in (source / "model").iterdir() if p.name not in selected
+    ] + extra_roots:
         if not path.exists():
             continue
         target = (
             model / path.name
             if path.parent == source / "model"
-            else destination / "lynn"
+            else destination / path.name
         )
         if target.is_symlink() and target.resolve() == path.resolve():
             continue
@@ -420,17 +440,23 @@ def verify_assets(c):
         raise ValueError("Asset receipt digest mismatch")
     a = json.loads(path.read_text())
     if (
-        a.get("schema") != 1
-        or a["model_id"] != c["model_id"]
-        or a["component"] != "generator"
-        or a["ema"] is not False
+        not isinstance(a, dict)
+        or a.get("schema") != 1
+        or a.get("model_id") != c["model_id"]
+        or a.get("component") != "generator"
+        or a.get("ema") is not False
+        or not isinstance(a.get("model"), str)
         or Path(a["model"]).resolve() != Path(c["model"]).resolve()
     ):
         raise ValueError("Model identity or component mismatch")
     # Receipt is produced by the asset owner after verifying the original export.
     # String entries are fully hashed; owner-supplied size entries avoid rereading cold weights.
-    files = a["files"]
-    if not files or any(not Path(p).is_absolute() for p in files):
+    files = a.get("files")
+    if (
+        not isinstance(files, dict)
+        or not files
+        or any(not Path(p).is_absolute() for p in files)
+    ):
         raise ValueError("Asset receipt requires absolute artifact paths")
     required = [str(Path(c["model"]) / "zing_config.json")]
     required += [c[k] for k in ("pipeline", "decoder_config") if c.get(k)]
@@ -553,6 +579,8 @@ def command(c, source, host, worker_id):
             ),
         ]
     env = {k: v for k, v in os.environ.items() if allowed_env(k)}
+    if role == "encoder":
+        env.setdefault("SGLANG_ZING_SOURCE_PREPARE", "1")
     env.update(c.get("environment", {}))
     for key, path in c.get("secret_files", {}).items():
         env[key] = Path(path).read_text().strip()
@@ -630,9 +658,14 @@ print(json.dumps(result))"""
 def run(c, source, commit, archive_sha):
     sha(commit, 40)
     sha(archive_sha)
+    boot_t0 = time.monotonic()
+    stage_t0 = boot_t0
     if c.get("stage_from"):
         stage_assets(c)
+    stage_s = round(time.monotonic() - stage_t0, 3) if c.get("stage_from") else 0.0
+    verify_t0 = time.monotonic()
     assets = verify_assets(c)
+    verify_s = round(time.monotonic() - verify_t0, 3)
     attestation = json.loads((source.parent / "verified-source.json").read_text())
     if attestation != {"commit": commit, "archive_sha256": archive_sha}:
         raise ValueError("Missing verified archive attestation")
@@ -717,6 +750,11 @@ def run(c, source, commit, archive_sha):
         or os.environ.get("DLC_JOB_ID")
         or os.environ.get("JOB_ID"),
         "pid": None,
+        "warmed_up": False,
+        "timings_s": {
+            "stage_assets_s": stage_s,
+            "verify_assets_s": verify_s,
+        },
     }
     output = source.parent / "receipt.json"
     options = c.get("dit_options", {})
@@ -728,6 +766,7 @@ def run(c, source, commit, archive_sha):
         ):
             if options.get(key):
                 Path(options[key]).mkdir(parents=True, exist_ok=True)
+    spawn_t0 = time.monotonic()
     child = subprocess.Popen(argv, cwd=source, env=env, start_new_session=True)
     receipt["pid"] = child.pid
 
@@ -739,7 +778,11 @@ def run(c, source, commit, archive_sha):
         print(line, flush=True)
         if len(line) > 1800:
             omitted = {"adaln", "argv", "environment"}
-            if receipt.get("worker_config") is not None:
+            compact = {
+                key: value for key, value in receipt.items() if key not in omitted
+            }
+            compact_line = json.dumps(compact, separators=(",", ":"))
+            if len(compact_line) > 1800 or receipt.get("worker_config") is not None:
                 omitted.update(
                     {
                         "runtime",
@@ -752,10 +795,11 @@ def run(c, source, commit, archive_sha):
                         "model_path",
                     }
                 )
-            compact = {
-                key: value for key, value in receipt.items() if key not in omitted
-            }
-            print(json.dumps(compact, separators=(",", ":")), flush=True)
+                compact = {
+                    key: value for key, value in receipt.items() if key not in omitted
+                }
+                compact_line = json.dumps(compact, separators=(",", ":"))
+            print(compact_line, flush=True)
 
     def stop(signum, frame):
         if child.poll() is None:
@@ -775,10 +819,23 @@ def run(c, source, commit, archive_sha):
                 with opener.open(receipt["http"] + "/health", timeout=2) as response:
                     health = json.load(response)
                 if health.get("ready") is True and health.get("role") == c["role"]:
-                    receipt.update(status="ready", health=health)
+                    now_mono = time.monotonic()
+                    receipt["timings_s"] = {
+                        "stage_assets_s": stage_s,
+                        "verify_assets_s": verify_s,
+                        "worker_ready_s": round(now_mono - spawn_t0, 3),
+                        "total_boot_s": round(now_mono - boot_t0, 3),
+                    }
+                    receipt.update(
+                        status="ready",
+                        health=health,
+                        warmed_up=bool(health.get("warmed_up", True)),
+                    )
+                    if health.get("warmup") is not None:
+                        receipt["warmup"] = health["warmup"]
                     save()
                     break
-            except (OSError, ValueError):
+            except (OSError, ValueError, HTTPException):
                 pass
             time.sleep(1)
         else:
@@ -860,8 +917,16 @@ def render(c, manifest, site, output):
             "data_sources",
             "model_id",
             "workspace_id",
+            "image_auth_file",
         }
     )
+    if site.get("image_auth_file") is not None:
+        if (
+            not isinstance(site["image_auth_file"], str)
+            or not site["image_auth_file"]
+            or not Path(site["image_auth_file"]).is_absolute()
+        ):
+            raise ValueError("image_auth_file must be an absolute path")
     if site.get("model_id", c["model_id"]) != c["model_id"]:
         raise ValueError("Site and role model identity mismatch")
     if site.get("image_pull_policy", "Never") not in {"Never", "IfNotPresent"}:
@@ -1028,6 +1093,15 @@ printf '%s' "$POD_JSON" | sed "s/__ALLOCATED_GPU_UUID__/$GPU_UUID/g" | kubectl c
         ):
             raise ValueError("PAI DiT requires one pod with exactly one GPU")
         spec = {**spec, "Image": site["image"]}
+        if site.get("image_auth_file"):
+            auth_path = Path(site["image_auth_file"])
+            auth_value = auth_path.read_text().strip()
+            if not auth_value or "\x00" in auth_value:
+                raise ValueError("Invalid PAI image auth secret file")
+            image_cfg = dict(spec.get("ImageConfig") or {})
+            image_cfg.setdefault("DockerRegistry", site["image"].split("/", 1)[0])
+            image_cfg["Auth"] = auth_value
+            spec["ImageConfig"] = image_cfg
         job = {
             "DisplayName": name,
             "JobType": "PyTorchJob",
@@ -1056,13 +1130,13 @@ printf '%s' "$POD_JSON" | sed "s/__ALLOCATED_GPU_UUID__/$GPU_UUID/g" | kubectl c
     )
 
 
-def generate_assets(config, extra_files, output):
+def generate_assets(config, extra_files, output, sized_weights=False):
     """Hash local exports; original checkpoint provenance remains owner supplied."""
     model = Path(config["model"])
     files = {p.absolute() for p in asset_files(model)}
-    files.update(Path(p).resolve() for p in extra_files)
+    files.update(Path(p).absolute() for p in extra_files)
     files.update(
-        Path(config[k]).resolve()
+        Path(config[k]).absolute()
         for k in ("pipeline", "decoder_config")
         if config.get(k)
     )
@@ -1071,7 +1145,7 @@ def generate_assets(config, extra_files, output):
         pipeline = json.loads(Path(config["pipeline"]).read_text())
         adaln["mode"] = pipeline.get("zing_adaln_mode", "weights_free")
         if adaln["mode"] == "weights_free":
-            table = Path(pipeline["zing_adaln_table_path"]).resolve()
+            table = Path(pipeline["zing_adaln_table_path"]).absolute()
             manifest = json.loads((table / "manifest.json").read_text())
             files.update(
                 (table / name) for name in ("manifest.json", "table.safetensors")
@@ -1082,13 +1156,20 @@ def generate_assets(config, extra_files, output):
                 schedule=manifest["schedule"],
                 cuda_provenance=manifest["arithmetic"],
             )
+
+    def _entry(path):
+        digest_hex = digest(path)
+        if sized_weights and path.suffix in {".safetensors", ".pt", ".bin"}:
+            return {"bytes": path.stat().st_size, "sha256": digest_hex}
+        return digest_hex
+
     receipt = dict(
         schema=1,
         model_id=config["model_id"],
         component="generator",
         ema=False,
-        model=str(model.resolve()),
-        files={str(p): digest(p) for p in sorted(files)},
+        model=str(model.absolute()),
+        files={str(p): _entry(p) for p in sorted(files)},
         adaln=adaln,
     )
     # Validate before publishing a new receipt, including all role-required assets.
@@ -1120,6 +1201,11 @@ def main():
     a.add_argument("--config", type=Path, required=True)
     a.add_argument("--output", type=Path)
     a.add_argument("--extra-file", type=Path, action="append", default=[])
+    a.add_argument(
+        "--sized-weights",
+        action="store_true",
+        help="Emit {bytes, sha256} entries for weight files to speed up cold mount verification",
+    )
     a = sub.add_parser("prepare")
     a.add_argument("--repo", type=Path, default=Path("."))
     a.add_argument("--commit", required=True)
@@ -1140,7 +1226,9 @@ def main():
         c = load_config(args.config)
         print(
             json.dumps(
-                generate_assets(c, args.extra_file, args.output)
+                generate_assets(
+                    c, args.extra_file, args.output, sized_weights=args.sized_weights
+                )
                 if args.output
                 else verify_assets(c)
             )
@@ -1159,7 +1247,7 @@ def main():
             raise ValueError("Launcher is not running from the selected source")
         return run(
             load_config(args.config),
-            args.source.resolve(),
+            args.source.absolute(),
             args.commit,
             args.archive_sha256,
         )

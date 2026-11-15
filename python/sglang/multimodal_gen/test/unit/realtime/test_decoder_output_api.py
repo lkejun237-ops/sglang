@@ -14,7 +14,10 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.shm_publisher import
     SharedMemoryFramePublisher,
 )
 from sglang.multimodal_gen.runtime.realtime.decoder_output import DecoderOutputBroker
-from sglang.multimodal_gen.runtime.realtime.worker_http import WorkerHTTPServer
+from sglang.multimodal_gen.runtime.realtime.worker_http import (
+    WorkerHTTPServer,
+    publish_role_warmup,
+)
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
     cancel_async_raw_rgb_frame_reference,
 )
@@ -32,6 +35,29 @@ def test_http_health_stays_responsive_and_port_conflict_is_fatal():
             assert response.status == status
             assert json.loads(response.read()) == {"role": "dit", "ready": ready}
             connection.close()
+        warmup_summary = {
+            "role": "dit",
+            "warmed_up": True,
+            "elapsed_s": 1.25,
+            "width": 832,
+            "height": 480,
+            "latent_frames": 1,
+        }
+        # Warmup pipelines call publish_role_warmup(role, summary) automatically so
+        # worker entrypoints do not need to remember an explicit server.record_warmup().
+        publish_role_warmup("dit", warmup_summary)
+        server.ready = True
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        connection.request("GET", "/health")
+        response = connection.getresponse()
+        assert response.status == 200
+        assert json.loads(response.read()) == {
+            "role": "dit",
+            "ready": True,
+            "warmed_up": True,
+            "warmup": warmup_summary,
+        }
+        connection.close()
         with pytest.raises(OSError):
             WorkerHTTPServer("decoder", "127.0.0.1", port)
     finally:
