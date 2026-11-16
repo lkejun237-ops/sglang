@@ -665,7 +665,23 @@ def test_member_session_selects_private_model_purpose_without_public_leak(
     asyncio.run(run())
 
 
-def test_scene_entry_accepts_only_the_armed_native_generation(monkeypatch):
+@pytest.mark.parametrize(
+    "commit_tick,activation_tick,accepted",
+    [
+        (None, 6, False),
+        (None, 7, False),
+        (None, 8, True),
+        (6, 6, False),
+        (6, 7, False),
+        (6, 8, True),
+        # Presentation stays below commit to isolate the condition boundary.
+        pytest.param(8, 8, False, id="condition_commit_same_tick_rejected"),
+        pytest.param(8, 9, True, id="condition_commit_next_tick_accepted"),
+    ],
+)
+def test_scene_entry_accepts_only_the_armed_native_generation(
+    monkeypatch, commit_tick, activation_tick, accepted
+):
     import base64
     import hashlib
     import io
@@ -743,7 +759,13 @@ def test_scene_entry_accepts_only_the_armed_native_generation(monkeypatch):
                 return httpx.Response(200, json={"state": "publishing"})
             if command["action"] == "frame":
                 return httpx.Response(200, json={"state": "publishing", "frame": None})
-            return httpx.Response(200, json={"state": "active", "commitTick": 8})
+            if command["action"] == "commit":
+                return httpx.Response(
+                    200, json={"state": "committed", "commitTick": commit_tick}
+                )
+            return httpx.Response(
+                200, json={"state": "active", "commitTick": activation_tick}
+            )
 
         async_client = httpx.AsyncClient
         monkeypatch.setattr(
@@ -791,14 +813,26 @@ def test_scene_entry_accepts_only_the_armed_native_generation(monkeypatch):
         assert view.capture_wait.request_id is None
         assert ("credit", 2) in calls
         assert await control("frame") == {"state": "publishing", "frame": None}
+        if commit_tick is not None:
+            assert await control("commit") == {
+                "state": "committed",
+                "commitTick": commit_tick,
+            }
         presented = {"source": {"simulationTick": 7}}
+        if not accepted:
+            with pytest.raises(ValueError, match="SCENE_ENTRY_SOURCE_RECEIPT_INVALID"):
+                await control("activate", presented=presented)
+            assert view.scene_entry == "entry"
+            assert view.scene_entry_commit == commit_tick
+            assert view.scene_entry_active is None
+            return
         assert await control("activate", presented=presented) == {
             "state": "active",
-            "commitTick": 8,
+            "commitTick": activation_tick,
         }
         assert await control("activate", presented=presented) == {
             "state": "active",
-            "commitTick": 8,
+            "commitTick": activation_tick,
         }
         assert calls.count(("request", "activate")) == 1
         with pytest.raises(ValueError, match="generation changed"):

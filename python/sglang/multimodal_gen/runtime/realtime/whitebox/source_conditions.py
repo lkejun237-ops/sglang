@@ -705,6 +705,25 @@ class SourceConditions:
                 "Model condition preparation did not complete", exc_info=error
             )
 
+    async def commit(self, current, committed):
+        try:
+            operation = await self.submit(committed, current["references"])
+        except Exception as error:
+            async with self.lock:
+                if self.closed:
+                    return
+                self.check()
+                # Preserve an original CAS whose external receipt was lost.
+                if not await self.original(committed):
+                    if isinstance(error, RenderError) and not error.retryable:
+                        current.update(state="rejected", reason=error.code)
+                    await self.candidate_receipt(committed, current)
+            return
+        async with self.lock:
+            if not self.closed:
+                self.check()
+                await self.receipt(committed, "accepted", operation)
+
     async def handle(self, value):
         kind = value.get("type")
         if kind == "model.condition":
@@ -745,6 +764,12 @@ class SourceConditions:
             if current and current["condition"]["conditionId"] == value["conditionId"]:
                 if current["condition"]["payloadHash"] != value["payloadHash"]:
                     raise invalid("MODEL_CONTEXT_PAYLOAD_HASH")
+                if (
+                    kind == "model.condition.commit"
+                    and "committed_effective" in current
+                    and current["committed_effective"] != value["effective"]
+                ):
+                    raise invalid("MODEL_CONTEXT_COMMIT_CONFLICT")
             elif current and current["state"] in ("preparing", "prepared", "committed"):
                 raise invalid("MODEL_CONTEXT_BACKPRESSURE")
             elif kind != "model.condition":
@@ -784,17 +809,14 @@ class SourceConditions:
                     current["condition"], effective=copy.deepcopy(value["effective"])
                 )
                 current["state"] = "committed"
-                try:
-                    operation = await self.submit(committed, current["references"])
-                except Exception as error:
-                    # The original CAS wins even if its reply failed. Only a
-                    # definite rejection without an operation frees the candidate.
-                    if not await self.original(value):
-                        if isinstance(error, RenderError) and not error.retryable:
-                            current.update(state="rejected", reason=error.code)
-                        await self.candidate_receipt(value, current)
-                    return
-                await self.receipt(value, "accepted", operation)
+                current["committed_effective"] = copy.deepcopy(value["effective"])
+                # Submission may need a future source frame whose sample is
+                # delivered by this same control reader. Keep the operation owned
+                # through close, while allowing that reader to advance.
+                submission = asyncio.create_task(self.commit(current, committed))
+                self.preparations.add(submission)
+                submission.add_done_callback(self.preparation_done)
+                return submission
             else:
                 raise invalid("MODEL_CONTEXT_NOT_PREPARED")
 

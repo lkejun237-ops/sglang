@@ -1061,6 +1061,12 @@ class SourceSession(InteractiveSession):
         first = None
         candidate = getattr(getattr(self, "inference", None), "preparation", None)
         if candidate is not None:
+            # Host reconciliation may still commit a retired segment's condition.
+            # Resolve that receipt without consuming or invalidating the successor
+            # preparation, even when the old and new prompts happen to match.
+            ids = self.journal.snapshot.get("model_context_segment_ids")
+            if ids is None or ids["segment_id"] != condition["segmentId"]:
+                raise RenderError("SEGMENT_EPOCH_MISMATCH")
             matched = await self.inference.prepared_for(
                 condition["prompt"],
                 getattr(self, "context_seed", 42),

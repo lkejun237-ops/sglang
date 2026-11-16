@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import msgspec
 import pytest
-from test_whitebox_source_conditions import condition, setup
+from test_whitebox_source_conditions import condition, handle_settled, setup
 
 from sglang.multimodal_gen.runtime.realtime.whitebox.contracts import VideoSpec
 from sglang.multimodal_gen.runtime.realtime.whitebox.control_prefill import (
@@ -311,7 +311,8 @@ def test_prewarm_and_formal_start_share_pinned_capture_and_bound_slot(tmp_path, 
             assert not (await room.journal.read())["operations"]
             if change == "reopen":
                 await room.journal.update(lambda s: s["inference"].update(revision=8))
-            await adapter.handle(
+            await handle_settled(
+                adapter,
                 request_identity(c)
                 | dict(
                     type="model.condition.commit",
@@ -321,7 +322,7 @@ def test_prewarm_and_formal_start_share_pinned_capture_and_bound_slot(tmp_path, 
                         if change == "new-boundary"
                         else receipts[-1]["startupEffective"]
                     ),
-                )
+                ),
             )
             if change == "reopen":
                 assert receipts[-1]["phase"] == "rejected"

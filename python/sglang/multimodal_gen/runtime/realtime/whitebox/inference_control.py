@@ -44,6 +44,7 @@ class SourceInference:
         self.task = None
         self.task_scope = None
         self.recovery = self.recovery_task = None
+        self.scene_retirement = None
         self.lock = asyncio.Lock()
         self.frozen = copy.deepcopy(message)
         if self.manual:
@@ -284,6 +285,14 @@ class SourceInference:
 
     async def fence_scene(self):
         segment = self.source.current_segment
+        # Stopping this source can finish its segment before target preparation
+        # creates the disable operation. That normal terminal receipt belongs to
+        # this exact cutscene intent, not a model failure or a newer inference.
+        self.scene_retirement = (
+            (segment, self.source.journal.snapshot.get("inference", {}).get("revision"))
+            if segment is not None
+            else None
+        )
         self.fence()
         if segment is not None:
             # A selected frame may already be awaiting archive or wire I/O
@@ -343,6 +352,8 @@ class SourceInference:
                     request, revision, state="failed", code="RELEASE_UNKNOWN"
                 )
                 raise
+            finally:
+                self.scene_retirement = None
             await source.journal.settle_inference(request, revision, state="disabled")
             if not current():
                 raise RenderError("RELEASE_UNKNOWN")
@@ -1110,6 +1121,14 @@ class SourceInference:
 
         def failed(state):
             inference = state["inference"]
+            retiring = getattr(self, "scene_retirement", None)
+            if (
+                code is None
+                and retiring is not None
+                and retiring[0] is segment
+                and retiring[1] == inference["revision"]
+            ):
+                return False
             if (
                 not inference["enabled"]
                 or source.current_segment is not segment
@@ -1199,6 +1218,7 @@ class SourceInference:
         self.source.spawn_control(publish())
 
     async def close(self):
+        self.scene_retirement = None
         self.cancel_recovery()
         recovery = getattr(self, "recovery_task", None)
         if recovery is not None:

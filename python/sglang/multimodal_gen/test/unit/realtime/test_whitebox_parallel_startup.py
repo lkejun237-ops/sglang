@@ -622,7 +622,13 @@ def test_async_preparation_cannot_bypass_changed_opening_revision(tmp_path):
     asyncio.run(run())
 
 
-def test_world_condition_commit_adopts_prepared_child_atomically(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "retired_prompt,current_prompt",
+    [(None, "snow"), ("snow", "snow"), ("old scene", "snow"), (None, "changed")],
+)
+def test_world_condition_commit_adopts_prepared_child_atomically(
+    tmp_path, monkeypatch, retired_prompt, current_prompt
+):
     from unittest.mock import AsyncMock
 
     from test_whitebox_source_conditions import condition
@@ -709,6 +715,29 @@ def test_world_condition_commit_adopts_prepared_child_atomically(tmp_path, monke
                 return t
 
             source.spawn_control = spawn
+            if retired_prompt is not None:
+                # A Host may reconcile its old committed condition while the
+                # successor's prepared child waits for the new segment CAS.
+                candidate.require_matching_condition = True
+                retired = dict(c, segmentId="retired-segment", prompt=retired_prompt)
+                retired["payloadHash"] = payload_hash(retired)
+                with pytest.raises(RenderError) as error:
+                    await source.submit_source_condition(retired, [])
+                assert error.value.code == "SEGMENT_EPOCH_MISMATCH"
+                assert source.inference.preparation is candidate
+                assert source.inference.preparation_failure is None
+                assert not candidate.closed
+                source.latest.get.assert_not_awaited()
+            if current_prompt != "snow":
+                candidate.require_matching_condition = True
+                c.update(prompt=current_prompt)
+                c["payloadHash"] = payload_hash(c)
+                with pytest.raises(RenderError) as error:
+                    await source.submit_source_condition(c, [])
+                assert error.value.code == "CONDITION_INVALID"
+                assert source.inference.preparation is None
+                assert source.inference.preparation_failure is error.value
+                return
             op = await source.submit_source_condition(c, [])
             await asyncio.gather(*work)
             state = await source.journal.read()

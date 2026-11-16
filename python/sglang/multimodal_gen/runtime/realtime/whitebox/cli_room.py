@@ -1798,13 +1798,12 @@ class NativeCLIView(CLIView):
                 self.scene_entry_commit = tick
             elif action == "activate":
                 tick = receipt.get("commitTick")
+                # Condition commit and gameplay activation are separate fixed
+                # ticks. Gameplay starts only after the presented target frame.
+                minimum = command["presented"]["source"]["simulationTick"] + 1
                 if self.scene_entry_commit is not None:
-                    valid_tick = type(tick) is int and tick == self.scene_entry_commit
-                else:
-                    valid_tick = safe_int(
-                        tick, command["presented"]["source"]["simulationTick"] + 1
-                    )
-                if not valid_tick:
+                    minimum = max(minimum, self.scene_entry_commit + 1)
+                if not safe_int(tick, minimum):
                     raise ValueError("SCENE_ENTRY_SOURCE_RECEIPT_INVALID")
                 self.scene_entry_active = (
                     preparation_id,

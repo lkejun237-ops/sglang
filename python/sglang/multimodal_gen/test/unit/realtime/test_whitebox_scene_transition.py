@@ -11,13 +11,19 @@ from sglang.multimodal_gen.runtime.realtime.whitebox.scene_transition import (
 
 
 @pytest.mark.parametrize(
-    "story,with_video", [(False, True), (True, True), (True, False)]
+    "story,with_video,prepare_first",
+    [
+        (False, True, False),
+        (True, True, False),
+        (True, False, False),
+        (True, True, True),
+    ],
 )
 @pytest.mark.parametrize(
     "model,commit_fails", [(False, False), (True, False), (True, True)]
 )
 def test_cutscene_waits_for_playback_preparation_and_target_presentation(
-    story, with_video, model, commit_fails
+    story, with_video, prepare_first, model, commit_fails
 ):
     async def run():
         source_calls = []
@@ -232,15 +238,16 @@ def test_cutscene_waits_for_playback_preparation_and_target_presentation(
                     media_state="playing",
                 )
                 await next_state("playing")
-                await send(
-                    "media",
-                    "end",
-                    generation=2,
-                    transition_id=transition_id,
-                    playback_attempt=3,
-                    media_state="ended",
-                )
-                assert (await next_state("playing"))["media_ended"]
+                if not prepare_first:
+                    await send(
+                        "media",
+                        "end",
+                        generation=2,
+                        transition_id=transition_id,
+                        playback_attempt=3,
+                        media_state="ended",
+                    )
+                    assert (await next_state("playing"))["media_ended"]
             else:
                 assert playing["video"] is None and playing["media_ended"]
                 with pytest.raises(RenderError):
@@ -254,7 +261,19 @@ def test_cutscene_waits_for_playback_preparation_and_target_presentation(
             deadline = transition.deadline
             await transition.attach(3)
             recovered = transition.snapshot()
-            assert recovered["media_state"] == "ended"
+            if prepare_first:
+                playback_attempt += 1
+                assert (await next_state("playing"))["media_state"] == "waiting"
+                await send(
+                    "media",
+                    "resumed-play",
+                    generation=3,
+                    transition_id=transition_id,
+                    playback_attempt=playback_attempt,
+                    media_state="playing",
+                )
+                assert not (await next_state("playing"))["media_ended"]
+            assert recovered["media_state"] == ("waiting" if prepare_first else "ended")
             assert recovered["playback_attempt"] == playback_attempt
             assert transition.deadline == deadline
             assert snapshots.empty()
@@ -271,7 +290,8 @@ def test_cutscene_waits_for_playback_preparation_and_target_presentation(
                 if story:
                     failed = await next_state("playing")
                     assert failed["receipt"]["prefill_retryable"]
-                    assert failed["media_ended"] and not failed["scene_prepared"]
+                    assert failed["media_ended"] is (not prepare_first)
+                    assert not failed["scene_prepared"]
                     assert transition.deadline == deadline
                     await send(
                         "retry_prefill",
@@ -290,6 +310,21 @@ def test_cutscene_waits_for_playback_preparation_and_target_presentation(
                 )
                 persisted = (await next_state("playing"))["receipt"]
                 assert persisted["prefill"]["persistence"] == "persisted"
+            if prepare_first:
+                prepared = await next_state("playing")
+                assert prepared["scene_prepared"] and not prepared["media_ended"]
+                assert prepared["media_state"] == "playing"
+                assert source_calls == expected_calls
+                assert "generate" not in source_calls and "commit" not in source_calls
+                assert snapshots.empty()
+                await send(
+                    "media",
+                    "end-after-preparation",
+                    generation=3,
+                    transition_id=transition_id,
+                    playback_attempt=playback_attempt,
+                    media_state="ended",
+                )
             await next_state("starting")
             expected_calls += ["publish", "frame"]
             if model:

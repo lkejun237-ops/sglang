@@ -133,6 +133,20 @@ Encoder 启动验证：Source VAE 的 256×256、1/8 帧各执行一次，Qwen �
 常驻与峰值显存；上述启动验证不代表首请求性能收益。
 后续验证沿用 [benchmark 入口](https://github.com/seedleap/sglang/blob/main/benchmark/zing_h3_causal/CLIENT_BENCHMARK.md)，并检查预热后的首个正常请求及其资源释放。
 
+## 场景过场 prefill 生命周期修复（2026-11-16，CPU 验证）
+
+任务分支修复旧段正常结束的退役竞态、旧条件对新预热的误消费、控制读取协程等待源帧的循环依赖，
+并把条件提交 tick 与真实呈现后的玩法激活 tick 分开校验。固定 Workbench 的真实
+CLI／Room／RTC／Player 通过 loopback CPU 角色夹具运行；不包含 GPU 部署或角色注册。
+模型计算、真实缓存命中／持久化、480／736 的三角色耗时和显存对照均未测，历史硬件结果不得外推到本分支。
+精确版本、复跑入口、失败回归与业务证据见
+[Workbench CPU 场景过场验收记录](../../../../benchmark/whitebox/SCENE_TRANSITION_CPU_20261116.md)。
+Room SDK pin 已更新为 Worldkit `dev` 可达提交 `ba45dffc9dc42f2ec8bd435068555489eb687aa0`，
+包含配套协议修复，并保留条件提交／玩法激活的独立 tick 校验；SDK 的 dev 祖先门禁已满足。
+CPU 原始回执的源码版本与验证范围见上述验收记录。本轮未验收当前 pin 的正式 Room 镜像构建／部署，
+也未验收真实 GPU 模型计算、缓存命中或画质，不能将已有 CPU 结果外推为这些阶段已通过。
+
+
 ## Whitebox 自适应、录制与清理整合验证（2026-11-10）
 
 上海副本以 `412589f5` / SDK `4c10ad26` 完整镜像验证自适应供帧、有界PI、模型输入录制与

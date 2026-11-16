@@ -153,6 +153,65 @@ async def setup(tmp_path, *, reference_size=(2, 2), startup_release=None):
     return adapter, c, journal, receipts, submits, gate
 
 
+async def handle_settled(adapter, value):
+    """Tests asserting completed receipts explicitly await owned submission."""
+    submission = await adapter.handle(value)
+    if submission is not None:
+        await submission
+
+
+@pytest.mark.parametrize("close_pending", [False, True])
+@pytest.mark.parametrize("conflicting_boundary", [False, True])
+def test_commit_does_not_block_source_control_reader(
+    tmp_path, close_pending, conflicting_boundary
+):
+    async def scenario():
+        a, c, journal, receipts, submits, resources = await setup(tmp_path)
+        entered, release = asyncio.Event(), asyncio.Event()
+        original_submit = a.submit
+
+        async def submit(value, references):
+            entered.set()
+            await release.wait()  # Source frames need later control samples.
+            return await original_submit(value, references)
+
+        a.submit = submit
+        resources.set()
+        try:
+            await a.handle(c)
+            await a.preparation
+            commit = request_identity(c) | dict(
+                type="model.condition.commit",
+                controlSequence=c["controlSequence"] + 1,
+                effective=c["effective"],
+            )
+            await asyncio.wait_for(a.handle(commit), 0.2)
+            await asyncio.wait_for(entered.wait(), 1)
+            assert not submits
+            await asyncio.wait_for(a.handle(commit), 0.2)
+            if conflicting_boundary:
+                changed = copy.deepcopy(commit)
+                changed["controlSequence"] += 1
+                changed["effective"]["sourceFrameId"] += 20
+                with pytest.raises(ValueError, match="MODEL_CONTEXT_COMMIT_CONFLICT"):
+                    await a.handle(changed)
+            if close_pending:
+                await a.close()
+                release.set()
+                assert not (await journal.read())["operations"]
+            else:
+                release.set()
+                async with asyncio.timeout(1):
+                    while not submits:
+                        await asyncio.sleep(0)
+                assert len(submits) == 1
+                assert receipts[-1]["phase"] == "accepted"
+        finally:
+            await a.close()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "outcome", ["stale-prepare", "stale-receipt", "receipt-failure", "cancel"]
 )
@@ -175,7 +234,7 @@ def test_prepare_completion_observes_errors_without_admitting_stale_source(
             raise RuntimeError("Condition receipt delivery failed")
 
         try:
-            await a.handle(c)
+            await handle_settled(a, c)
             # Let preparation block on the real resource reader before retirement.
             await asyncio.sleep(0)
             if outcome == "cancel":
@@ -199,7 +258,7 @@ def test_prepare_completion_observes_errors_without_admitting_stale_source(
                     with pytest.raises(
                         ValueError, match="^MODEL_CONTEXT_STALE_SOURCE$"
                     ):
-                        await a.handle(c)
+                        await handle_settled(a, c)
                     with pytest.raises(
                         ValueError, match="^MODEL_CONTEXT_STALE_SOURCE$"
                     ):
@@ -230,7 +289,7 @@ def test_opt_in_debug_observes_original_prompt_and_references_at_receipt(tmp_pat
     async def scenario():
         adapter, condition, _, receipts, submits, gate = await setup(tmp_path)
         assert adapter.debug is None
-        await adapter.handle(condition)
+        await handle_settled(adapter, condition)
         assert receipts[-1]["phase"] == "queued"
         assert "prompt" not in receipts[-1] and "references" not in receipts[-1]
         observed = []
@@ -245,7 +304,7 @@ def test_opt_in_debug_observes_original_prompt_and_references_at_receipt(tmp_pat
             controlSequence=condition["controlSequence"] + 1,
             effective=condition["effective"],
         )
-        await adapter.handle(commit)
+        await handle_settled(adapter, commit)
         assert [receipt["phase"] for _, receipt in observed] == ["prepared", "accepted"]
         assert observed[-1][0]["prompt"] == condition["prompt"]
         assert observed[-1][0]["references"] == condition["references"]
@@ -259,7 +318,7 @@ def test_opt_in_debug_observes_original_prompt_and_references_at_receipt(tmp_pat
 def test_prepare_commit_dedup_and_original_journal(tmp_path):
     async def scenario():
         a, c, journal, receipts, submits, gate = await setup(tmp_path)
-        await a.handle(c)
+        await handle_settled(a, c)
         assert not submits and receipts[-1]["phase"] == "queued"
         assert not (await journal.read())["operations"]
         gate.set()
@@ -275,8 +334,8 @@ def test_prepare_commit_dedup_and_original_journal(tmp_path):
             controlSequence=c["controlSequence"] + 1,
             effective=c["effective"],
         )
-        await a.handle(commit)
-        await a.handle(commit)
+        await handle_settled(a, commit)
+        await handle_settled(a, commit)
         assert len(submits) == 1
         assert (
             receipts[-1]["phase"] == "accepted" and receipts[-1]["promptVersion"] == 1
@@ -291,7 +350,7 @@ def test_prepare_commit_dedup_and_original_journal(tmp_path):
             reason="obsolete",
             controlSequence=commit["controlSequence"] + 1,
         )
-        await a.handle(withdraw)
+        await handle_settled(a, withdraw)
         assert len(submits) == 1 and receipts[-1]["phase"] == "accepted"
         await a.close()
 
@@ -314,18 +373,19 @@ def test_startup_release_keeps_query_queued_and_withdraws_only_old_condition(tmp
         )
         resources.set()
         try:
-            await a.handle(c)
+            await handle_settled(a, c)
             assert await asyncio.wait_for(entered.get(), 1) == c["conditionId"]
             await a.reconcile([request_identity(c)])
             assert [r["phase"] for r in receipts] == ["queued", "queued"]
             with pytest.raises(ValueError, match="MODEL_CONTEXT_NOT_PREPARED"):
-                await a.handle(
+                await handle_settled(
+                    a,
                     request_identity(c)
                     | dict(
                         type="model.condition.commit",
                         controlSequence=c["controlSequence"] + 1,
                         effective=c["effective"],
-                    )
+                    ),
                 )
             assert not (await journal.read())["operations"]
 
@@ -349,7 +409,7 @@ def test_startup_release_keeps_query_queued_and_withdraws_only_old_condition(tmp
             successor.update(
                 conditionId="new-startup", controlSequence=c["controlSequence"] + 2
             )
-            await a.handle(successor)
+            await handle_settled(a, successor)
             assert await asyncio.wait_for(entered.get(), 1) == successor["conditionId"]
             assert receipts[-1]["phase"] == "queued"
             released.set_result(None)
@@ -360,13 +420,14 @@ def test_startup_release_keeps_query_queued_and_withdraws_only_old_condition(tmp
                 if r["phase"] == "prepared"
             ] == [(successor["conditionId"], "prepared")]
 
-            await a.handle(
+            await handle_settled(
+                a,
                 request_identity(successor)
                 | dict(
                     type="model.condition.commit",
                     controlSequence=successor["controlSequence"] + 1,
                     effective=successor["effective"],
-                )
+                ),
             )
             assert len(submits) == 1 and submits[0]["op"] == "render.start"
 
@@ -375,7 +436,7 @@ def test_startup_release_keeps_query_queued_and_withdraws_only_old_condition(tmp
             )
             await a.reconcile([request_identity(successor)])
             later = dict(successor, conditionId="same-segment-update")
-            await a.handle(later)
+            await handle_settled(a, later)
             await a.preparation
             assert receipts[-1]["phase"] == "prepared" and entered.empty()
         finally:
@@ -393,7 +454,7 @@ def test_startup_release_timeout_does_not_release_shared_window(tmp_path):
         )
         resources.set()
         try:
-            await a.handle(c)
+            await handle_settled(a, c)
             await asyncio.wait_for(a.preparation, 1)
             assert [r["phase"] for r in receipts] == ["queued", "rejected"]
             assert receipts[-1]["reason"] == "RELEASE_UNKNOWN"
@@ -420,7 +481,7 @@ def test_startup_release_cannot_prepare_after_opening_changes(tmp_path, change):
         )
         resources.set()
         try:
-            await a.handle(c)
+            await handle_settled(a, c)
             await asyncio.wait_for(entered.wait(), 1)
             if change == "reservation":
                 await journal.update(
@@ -479,16 +540,17 @@ def test_withdraw_during_asset_write_keeps_successor_preparation_valid(
         gate.set()
         with patch.object(Path, "open", open_file):
             try:
-                await a.handle(c)
+                await handle_settled(a, c)
                 old = a.preparation
                 assert await asyncio.to_thread(entered.wait, 3)
-                await a.handle(
+                await handle_settled(
+                    a,
                     request_identity(c)
                     | dict(
                         type="model.condition.withdraw",
                         controlSequence=c["controlSequence"] + 1,
                         reason="state-changed",
-                    )
+                    ),
                 )
                 await asyncio.sleep(0)
                 if cancellations == 2:
@@ -499,7 +561,7 @@ def test_withdraw_during_asset_write_keeps_successor_preparation_valid(
                 newer = copy.deepcopy(c)
                 newer.update(conditionId="fresh", prompt="Fresh complete condition")
                 newer["payloadHash"] = payload_hash(newer)
-                await a.handle(newer)
+                await handle_settled(a, newer)
                 assert not (await journal.read())["operations"]
                 resume.set()
                 await asyncio.gather(old, return_exceptions=True)
@@ -571,8 +633,9 @@ def test_failed_asset_write_can_retry_without_a_partial_cache_entry(tmp_path):
 def test_withdraw_cancels_only_preparation(tmp_path):
     async def scenario():
         a, c, journal, receipts, submits, gate = await setup(tmp_path)
-        await a.handle(c)
-        await a.handle(
+        await handle_settled(a, c)
+        await handle_settled(
+            a,
             {k: c[k] for k in a.envelope}
             | dict(
                 type="model.condition.withdraw",
@@ -580,7 +643,7 @@ def test_withdraw_cancels_only_preparation(tmp_path):
                 payloadHash=c["payloadHash"],
                 controlSequence=c["controlSequence"] + 1,
                 reason="obsolete",
-            )
+            ),
         )
         gate.set()
         await asyncio.sleep(0)
@@ -661,15 +724,16 @@ def test_complete_condition_recovers_after_definite_prompt_failure(
         )
         recovered["payloadHash"] = payload_hash(recovered)
         gate.set()
-        await a.handle(recovered)
+        await handle_settled(a, recovered)
         await a.preparation
-        await a.handle(
+        await handle_settled(
+            a,
             request_identity(recovered)
             | dict(
                 type="model.condition.commit",
                 controlSequence=recovered["controlSequence"] + 1,
                 effective=recovered["effective"],
-            )
+            ),
         )
         assert receipts[-1]["phase"] == "accepted"
         assert receipts[-1]["promptVersion"] == 3
@@ -706,7 +770,7 @@ def test_definite_commit_rejection_is_terminal_and_frees_next_condition(tmp_path
         )
         rejected["payloadHash"] = payload_hash(rejected)
         gate.set()
-        await a.handle(rejected)
+        await handle_settled(a, rejected)
         await a.preparation
         assert receipts[-1]["phase"] == "prepared"
         await journal.update(lambda s: s["segment"].update(state="ended"))
@@ -715,7 +779,7 @@ def test_definite_commit_rejection_is_terminal_and_frees_next_condition(tmp_path
             controlSequence=rejected["controlSequence"] + 1,
             effective=rejected["effective"],
         )
-        await a.handle(commit)
+        await handle_settled(a, commit)
         for replay in (
             lambda: a.handle(commit),
             lambda: a.handle(rejected),
@@ -737,15 +801,16 @@ def test_definite_commit_rejection_is_terminal_and_frees_next_condition(tmp_path
         next_c = copy.deepcopy(rejected)
         next_c.update(conditionId="next", prompt="new complete condition")
         next_c["payloadHash"] = payload_hash(next_c)
-        await a.handle(next_c)
+        await handle_settled(a, next_c)
         await a.preparation
-        await a.handle(
+        await handle_settled(
+            a,
             request_identity(next_c)
             | dict(
                 type="model.condition.commit",
                 controlSequence=next_c["controlSequence"] + 1,
                 effective=next_c["effective"],
-            )
+            ),
         )
         assert receipts[-1]["phase"] == "accepted"
         assert receipts[-1]["promptVersion"] == 2
@@ -769,27 +834,27 @@ def test_uncertain_commit_stays_unknown_without_resubmitting(tmp_path, retryable
 
         a.submit = unavailable
         gate.set()
-        await a.handle(c)
+        await handle_settled(a, c)
         await a.preparation
         commit = request_identity(c) | dict(
             type="model.condition.commit",
             controlSequence=c["controlSequence"] + 1,
             effective=c["effective"],
         )
-        await a.handle(commit)
+        await handle_settled(a, commit)
         assert receipts[-1]["phase"] == "unknown"
         await a.reconcile([request_identity(c)])
         assert receipts[-1]["phase"] == "unknown"
-        await a.handle(c)
+        await handle_settled(a, c)
         assert receipts[-1]["phase"] == "unknown"
-        await a.handle(commit)
+        await handle_settled(a, commit)
         assert receipts[-1]["phase"] == "unknown"
         assert len(attempts) == 1 and not submits
         assert not (await journal.read())["operations"]
         next_c = copy.deepcopy(c)
         next_c["conditionId"] = "next"
         with pytest.raises(ValueError, match="MODEL_CONTEXT_BACKPRESSURE"):
-            await a.handle(next_c)
+            await handle_settled(a, next_c)
         await a.close()
 
     asyncio.run(scenario())
@@ -806,17 +871,17 @@ def test_commit_error_after_cas_reconciles_original_operation(tmp_path):
 
         a.submit = lost_reply
         gate.set()
-        await a.handle(c)
+        await handle_settled(a, c)
         await a.preparation
         commit = request_identity(c) | dict(
             type="model.condition.commit",
             controlSequence=c["controlSequence"] + 1,
             effective=c["effective"],
         )
-        await a.handle(commit)
+        await handle_settled(a, commit)
         assert receipts[-1]["phase"] == "accepted"
         original_receipt = receipts[-1]
-        await a.handle(commit)
+        await handle_settled(a, commit)
         await a.reconcile([request_identity(c)])
         assert receipts[-1] == original_receipt
         assert len(submits) == 1
@@ -843,7 +908,7 @@ def test_reference_clear_unsupported_and_hash_fail_before_prepared(tmp_path):
         a.capabilities = lambda: dict(
             max_references=9, max_reference_bytes=8 << 20, reference_updates=False
         )
-        await a.handle(c)
+        await handle_settled(a, c)
         await a.preparation
         assert receipts[-1]["reason"] == "REFERENCE_UPDATE_UNSUPPORTED"
         assert not submits
@@ -854,10 +919,10 @@ def test_reference_clear_unsupported_and_hash_fail_before_prepared(tmp_path):
         )
         c["payloadHash"] = payload_hash(c)
         gate.set()
-        await a.handle(c)
+        await handle_settled(a, c)
         await a.preparation
         assert receipts[-1]["reason"] == "MODEL_CONTEXT_RESOURCE_HASH"
-        await a.handle(c)
+        await handle_settled(a, c)
         await a.reconcile([request_identity(c)])
         assert receipts[-1]["phase"] == "rejected"
         assert receipts[-1]["reason"] == "MODEL_CONTEXT_RESOURCE_HASH"
@@ -882,7 +947,7 @@ def test_complete_reference_replacement_including_empty(tmp_path):
         c["onsetOccurrenceIds"] = []
         c["references"] = []
         c["payloadHash"] = payload_hash(c)
-        await a.handle(c)
+        await handle_settled(a, c)
         await a.preparation
         commit = {k: c[k] for k in a.envelope} | dict(
             type="model.condition.commit",
@@ -891,12 +956,12 @@ def test_complete_reference_replacement_including_empty(tmp_path):
             controlSequence=c["controlSequence"] + 1,
             effective=c["effective"],
         )
-        await a.handle(commit)
+        await handle_settled(a, commit)
         assert journal.snapshot["segment"]["prompt_queue"][0]["references"] == []
         changed = copy.deepcopy(commit)
         changed["effective"]["sourceFrameId"] += 1
         with pytest.raises(ValueError, match="COMMIT_CONFLICT"):
-            await a.handle(changed)
+            await handle_settled(a, changed)
         await a.close()
 
     asyncio.run(scenario())
@@ -1333,7 +1398,7 @@ def test_native_reset_fences_inflight_handoff_and_condition_cursor(
         try:
             if waiting_at == "adapter-close":
                 # Real close awaits its actual cancelled preparation, not a fake close.
-                await old.handle(c)
+                await handle_settled(old, c)
                 await asyncio.sleep(0)
                 assert old.preparations
             if waiting_at == "samples":
@@ -1663,6 +1728,7 @@ def test_checkpoint_recovers_original_preparing_candidate_and_committed_query(tm
             effective=c["effective"],
         )
         await channel.consume(commit)
+        await asyncio.gather(*a.preparations)
         original = receipts[-1]
         snapshot.update(
             controlSequence=8,
@@ -1703,7 +1769,7 @@ def test_old_epoch_and_changed_original_member_reject_before_resource(tmp_path):
         stale["audience"]["consumerEpoch"] = "old"
         stale["payloadHash"] = payload_hash(stale)
         with pytest.raises(ValueError, match="STALE_SOURCE"):
-            await a.handle(stale)
+            await handle_settled(a, stale)
         assert not a.preparation and not submits
 
         def retired():
@@ -1711,7 +1777,7 @@ def test_old_epoch_and_changed_original_member_reject_before_resource(tmp_path):
 
         a.check = retired
         with pytest.raises(ValueError, match="STALE_SOURCE"):
-            await a.handle(c)
+            await handle_settled(a, c)
         assert not a.preparation and not (await journal.read())["operations"]
         await a.close()
 
@@ -2570,7 +2636,7 @@ def test_explicit_context_segment_restart_uses_current_full_condition(tmp_path):
     async def scenario():
         a, c, journal, receipts, submits, gate = await setup(tmp_path)
         gate.set()
-        await a.handle(c)
+        await handle_settled(a, c)
         await a.preparation
         commit = dict(
             request_identity(c),
@@ -2578,7 +2644,7 @@ def test_explicit_context_segment_restart_uses_current_full_condition(tmp_path):
             controlSequence=c["controlSequence"] + 1,
             effective=c["effective"],
         )
-        await a.handle(commit)
+        await handle_settled(a, commit)
         old = await journal.read()
         sid = old["segment"]["segment_id"]
         await journal.prompt_applied(sid, 1, dict(first_output_frame=0, num_frames=1))
@@ -2620,16 +2686,17 @@ def test_explicit_context_segment_restart_uses_current_full_condition(tmp_path):
             ),
             check=lambda: None,
         )
-        await next_adapter.handle(current)
+        await handle_settled(next_adapter, current)
         await next_adapter.preparation
         assert receipts[-1]["phase"] == "prepared"
-        await next_adapter.handle(
+        await handle_settled(
+            next_adapter,
             dict(
                 request_identity(current),
                 type="model.condition.commit",
                 controlSequence=11,
                 effective=current["effective"],
-            )
+            ),
         )
         state = await journal.read()
         assert state["source_state"] == "ready"
@@ -3447,20 +3514,21 @@ def test_close_waits_for_withdrawn_image_commit_before_releasing_assets(
         monkeypatch.setattr(asyncio, "to_thread", delayed_thread)
         closing = old = successor = None
         try:
-            await a.handle(c)
+            await handle_settled(a, c)
             old = a.preparation
             await entered.wait()
-            await a.handle(
+            await handle_settled(
+                a,
                 {
                     **request_identity(c),
                     "type": "model.condition.withdraw",
                     "controlSequence": 3,
                     "reason": "obsolete",
-                }
+                },
             )
             next_c = dict(c, conditionId="successor", controlSequence=4)
             next_c["payloadHash"] = payload_hash(next_c)
-            await a.handle(next_c)
+            await handle_settled(a, next_c)
             successor = a.preparation
             closing = asyncio.create_task(a.close())
             await asyncio.sleep(0.01)
@@ -3806,16 +3874,17 @@ def test_source_owner_checks_h3_reference_geometry_before_commit(
             if prior_applied:
                 data = image_bytes((128, 128))
                 initial = reference_condition("valid-initial")
-                await adapter.handle(initial)
+                await handle_settled(adapter, initial)
                 await adapter.preparation
                 assert receipts[-1]["phase"] == "prepared"
-                await adapter.handle(
+                await handle_settled(
+                    adapter,
                     request_identity(initial)
                     | dict(
                         type="model.condition.commit",
                         controlSequence=2,
                         effective=initial["effective"],
-                    )
+                    ),
                 )
                 await journal.update(lambda s: s["segment"].update(state="streaming"))
                 await journal.prompt_applied(
@@ -3832,7 +3901,7 @@ def test_source_owner_checks_h3_reference_geometry_before_commit(
             submissions = len(submits)
             data = image_bytes(size)
             candidate = reference_condition("geometry-candidate")
-            await adapter.handle(candidate)
+            await handle_settled(adapter, candidate)
             await adapter.preparation
             assert receipts[-1]["phase"] == expected
             if expected == "rejected":
@@ -5430,7 +5499,7 @@ def test_instruction_receipt_recovers_from_operation_without_candidate(tmp_path)
     async def run():
         adapter, value, journal, receipts, submits, gate = await setup(tmp_path)
         value["instruction"] = {"requestId": "user-durable", "revision": 3}
-        await adapter.handle(value)
+        await handle_settled(adapter, value)
         gate.set()
         await adapter.preparation
         commit = {k: copy.deepcopy(value[k]) for k in adapter.envelope}
@@ -5441,7 +5510,7 @@ def test_instruction_receipt_recovers_from_operation_without_candidate(tmp_path)
             controlSequence=value["controlSequence"] + 1,
             effective=value["effective"],
         )
-        await adapter.handle(commit)
+        await handle_settled(adapter, commit)
         operation = submits[0]
         assert operation["model_context_instruction"] == value["instruction"]
         await journal.prompt_applied(

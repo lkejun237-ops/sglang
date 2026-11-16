@@ -68,6 +68,62 @@ def test_scene_fence_waits_for_in_flight_source_send():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize(
+    "scope", ["retiring", "retiring-error", "new-segment", "new-revision"]
+)
+def test_scene_fence_terminal_receipt_preserves_only_its_original_intent(scope):
+    from sglang.multimodal_gen.runtime.realtime.whitebox.inference_control import (
+        SourceInference,
+    )
+
+    async def run():
+        journal, _ = await ordinary_query_source()
+        stopped = asyncio.Event()
+        segment = SimpleNamespace(
+            source_send_lock=asyncio.Lock(),
+            source_view=SimpleNamespace(stop=stopped.set),
+            publishing=True,
+        )
+        source = SimpleNamespace(
+            journal=journal,
+            current_segment=segment,
+            current_model_stream="original",
+            display_mode="model",
+            context_channel=None,
+            status_snapshot=AsyncMock(),
+        )
+        owner = SourceInference(
+            source,
+            dict(
+                source_operation="create.manual",
+                inference_control="manual",
+                prompt="Original scene.",
+            ),
+        )
+        await owner.fence_scene()
+        assert stopped.is_set()
+        # The actual segment can finish between fence and target preparation.
+        if scope == "new-segment":
+            segment = source.current_segment = SimpleNamespace(
+                source_view=SimpleNamespace(stop=lambda: None), publishing=True
+            )
+        elif scope == "new-revision":
+            await journal.update(lambda state: state["inference"].update(revision=1))
+        await owner.segment_ended(
+            segment, "MODEL_UNAVAILABLE" if scope == "retiring-error" else None
+        )
+        inference = journal.snapshot["inference"]
+        if scope == "retiring":
+            assert inference["state"] == "enabled"
+            assert "code" not in inference
+            source.status_snapshot.assert_not_awaited()
+        else:
+            assert inference["state"] == "failed"
+            assert inference["code"] == "MODEL_UNAVAILABLE"
+
+    asyncio.run(run())
+
+
 def test_ordinary_query_composes_and_clears_through_original_prompt_queue():
     async def run():
         journal, scope = await ordinary_query_source()
