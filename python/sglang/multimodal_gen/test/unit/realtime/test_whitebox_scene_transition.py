@@ -7,13 +7,32 @@ import pytest
 from sglang.multimodal_gen.runtime.realtime.whitebox.render_contract import RenderError
 from sglang.multimodal_gen.runtime.realtime.whitebox.scene_transition import (
     SceneTransition,
+    read_scene_transitions,
 )
+
+
+@pytest.mark.parametrize("missing_entries", [True, False])
+def test_entry_only_inventory_still_requires_a_declared_initial_entry(missing_entries):
+    initial = {"sceneId": "yard", "entryId": "start"}
+    with pytest.raises(ValueError, match="Invalid scene transition"):
+        read_scene_transitions(
+            dict(
+                schemaVersion=1,
+                initial=initial
+                if missing_entries
+                else {"sceneId": "unknown", "entryId": "start"},
+                entries=[] if missing_entries else [initial],
+                transitions=[],
+                videos=[],
+            )
+        )
 
 
 @pytest.mark.parametrize(
     "story,with_video,prepare_first",
     [
         (False, True, False),
+        (False, False, False),
         (True, True, False),
         (True, False, False),
         (True, True, True),
@@ -127,14 +146,18 @@ def test_cutscene_waits_for_playback_preparation_and_target_presentation(
                 initial=initial,
                 entries=[initial, target],
                 videos=[video] if with_video else [],
-                transitions=[
-                    dict(
-                        id="chapter",
-                        target=target,
-                        trigger={"eventId": "enter.forest"},
-                        **({"video": video["path"]} if with_video else {}),
-                    )
-                ],
+                transitions=(
+                    []
+                    if not story and not with_video
+                    else [
+                        dict(
+                            id="chapter",
+                            target=target,
+                            trigger={"eventId": "enter.forest"},
+                            **({"video": video["path"]} if with_video else {}),
+                        )
+                    ]
+                ),
             ),
             source,
             snapshots.put,
@@ -185,7 +208,7 @@ def test_cutscene_waits_for_playback_preparation_and_target_presentation(
                     "request",
                     "request",
                     expected_revision=0,
-                    transition="chapter",
+                    **({"transition": "chapter"} if with_video else {"target": target}),
                     with_model=model,
                 )
             await next_state("entering")

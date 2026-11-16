@@ -159,7 +159,7 @@ def read_scene_transitions(value):
         or not 1 <= len(value["entries"]) <= 128 * 128
         or not isinstance(value["transitions"], list)
         or not isinstance(value["videos"], list)
-        or not 1 <= len(value["transitions"]) <= 128
+        or not 0 <= len(value["transitions"]) <= 128
         or len(value["videos"]) > 128
     ):
         raise ValueError("Invalid scene transition inventory")
