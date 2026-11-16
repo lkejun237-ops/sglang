@@ -3,8 +3,55 @@
 
 import asyncio
 import copy
+import json
+import logging
+import time
 
 from .render_contract import RenderError
+
+logger = logging.getLogger(__name__)
+
+
+class AutoSinkPolicy:
+    """Room operator configuration, shared by the active model segments."""
+
+    def __init__(self, path):
+        self.path = path
+        self.config = None
+        self.next_read = 0.0
+
+    def read(self, now):
+        if now < self.next_read:
+            return self.config
+        self.next_read = now + 1
+        try:
+            with self.path.open() as source:
+                value = json.loads(source.read(4097))
+            if not isinstance(value, dict) or type(value.get("enabled")) is not bool:
+                raise ValueError("Auto sink requires a boolean switch")
+            if value["enabled"]:
+                interval = value.get("interval_cycles")
+                method = value.get("method", "copy")
+                if (
+                    set(value) - {"enabled", "interval_cycles", "method"}
+                    or type(interval) is not int
+                    or not 1 <= interval < 2**64
+                    or method not in ("copy", "rebuild")
+                ):
+                    raise ValueError(
+                        "Auto sink requires a positive cycle interval and a valid method"
+                    )
+                value = dict(enabled=True, interval_cycles=interval, method=method)
+            elif value != {"enabled": False}:
+                raise ValueError("Auto sink disable takes only the switch")
+            self.config = value
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            logger.warning(
+                "Invalid auto sink policy; retaining the last valid configuration"
+            )
+        return self.config
 
 
 class SinkControl:
@@ -13,8 +60,46 @@ class SinkControl:
         self.supported = False
         self.pending = None
         self.snapshot = None
+        self.auto_policy = None
+        self.auto_config = None
+        self.auto_event_id = None
         self.idle = asyncio.Event()
         self.idle.set()
+
+    async def sync_auto(self, ws, *, now=None):
+        """Send configuration changes under the segment's source send lock."""
+        segment = self.segment
+        if (
+            segment.model_source_ended
+            or segment.source_view.stopped.is_set()
+            or segment.cancel_requested
+        ):
+            return
+        config = self.auto_policy.read(time.monotonic() if now is None else now)
+        if config is not None and config != self.auto_config:
+
+            def remember(event_id):
+                self.auto_event_id = event_id
+                self.auto_config = config
+
+            await segment.send_model_event(
+                ws, "sink.auto", config, before_send=remember
+            )
+
+    async def watch_auto(self, ws):
+        segment = self.segment
+        try:
+            while not segment.model_source_ended and not segment.closed_event.is_set():
+                try:
+                    await asyncio.wait_for(segment.source_view.stopped.wait(), 1)
+                    return
+                except asyncio.TimeoutError:
+                    async with segment.source_send_lock:
+                        await self.sync_auto(ws)
+        except Exception:
+            logger.exception(
+                "Auto sink policy stopped for segment %s", segment.segment_id
+            )
 
     @property
     def busy(self):
@@ -158,6 +243,12 @@ class SinkControl:
                 # Keep the operation fenced. Late actual output may still settle it.
 
     async def control(self, message):
+        if (
+            self.auto_policy is not None
+            and message.get("type") == "control_ack"
+            and message.get("kind") == "sink.auto"
+        ):
+            return True
         pending = self.pending
         if pending is None or message.get("event_id") != pending["event_id"]:
             return False
@@ -188,6 +279,27 @@ class SinkControl:
             sink_chunk_ids=ids,
             sink_event_id=event_id,
         )
+        if self.auto_policy is not None:
+            for name in (
+                "sink_config_event_id",
+                "sink_refresh_count",
+                "sink_refresh_method",
+                "sink_refresh_latent",
+            ):
+                if name in message:
+                    snapshot[name] = message[name]
+            if (
+                self.auto_event_id is not None
+                and snapshot.get("sink_config_event_id") == self.auto_event_id
+                and (self.snapshot or {}).get("sink_config_event_id")
+                != self.auto_event_id
+            ):
+                logger.info(
+                    "Auto sink config applied segment=%s event=%s config=%s",
+                    self.segment.segment_id,
+                    self.auto_event_id,
+                    self.auto_config,
+                )
         pending = self.pending
         applied = (
             pending is not None

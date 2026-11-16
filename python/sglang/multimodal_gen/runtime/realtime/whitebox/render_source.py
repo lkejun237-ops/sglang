@@ -15,6 +15,7 @@ from uuid import uuid4
 
 import msgspec
 
+from ..zing_source_stream import CLIP_BARRIER_V2
 from .area_contract import AREA_PROTOCOL
 from .contracts import capture_pts
 from .interactive import InteractiveSession, LatestFrame
@@ -2769,12 +2770,16 @@ class SourceSession(InteractiveSession):
         if (
             message.get("type") == "control_ack"
             and message.get("kind") == "prompt.update"
-            and (
-                message.get("state") == "kv_ready"
-                or message.get("state") == "source_ready"
-                and getattr(segment, "condition_early_release", False)
-            )
+            and message.get("state") in {"kv_ready", "source_ready"}
         ):
+            expected = (
+                "source_ready"
+                if getattr(segment, "condition_switch_protocol", None)
+                == CLIP_BARRIER_V2
+                else "kv_ready"
+            )
+            if message["state"] != expected:
+                return True
             switch = getattr(segment, "condition_switch", None)
             boundary = switch.get("boundary") if switch else None
             if switch and boundary is None and switch["accepted"].done():

@@ -746,7 +746,11 @@ class RenderHost:
             16 * 1024**2,
         )
         from .condition_refresh import ConditionRefreshPolicy
+        from .sink_control import AutoSinkPolicy
 
+        self.auto_sink_policy = AutoSinkPolicy(
+            runtime.spool / ".runtime" / "sink-auto.json"
+        )
         self.condition_refresh_policy = ConditionRefreshPolicy(
             runtime.spool / ".runtime" / "condition-refresh.json"
         )

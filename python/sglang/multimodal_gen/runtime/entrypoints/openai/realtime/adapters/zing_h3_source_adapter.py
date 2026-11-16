@@ -62,6 +62,7 @@ from sglang.multimodal_gen.runtime.realtime.zing_input_budget import (
     count_prompt_tokens,
 )
 from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
+    CLIP_BARRIER_V2,
     SourceLedger,
     SourceLimits,
     default_source_encoder,
@@ -615,7 +616,6 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         self.prompt_boundary = None
         self.committed_source_frames = 0
         self._source_switch_end = None
-        self._source_released_event = None
         self.condition_switch_protocol = getattr(
             request, "source_condition_switch_protocol", None
         )
@@ -624,6 +624,10 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             or (
                 self.ordered_prompts
                 and self.reference_updates
+                and (
+                    self.condition_switch_protocol != CLIP_BARRIER_V2
+                    or getattr(self, "external_condition_barrier", False)
+                )
                 and (
                     getattr(args.pipeline_config, "decoder_type", None)
                     == "lynn_streaming"
@@ -1857,6 +1861,9 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             return
 
         ready_condition = (result.usage or {}).get("zing_condition_ready")
+        source_ready_protocol = (
+            getattr(self, "condition_switch_protocol", None) == CLIP_BARRIER_V2
+        )
         if getattr(self, "_budget_reference_update", None) is not None:
             event_id, count = self._budget_reference_update
             if (
@@ -1885,16 +1892,17 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         source_ready = (result.usage or {}).get("zing_condition_source_ready")
         if source_ready is not None:
             require(
-                self.ready.get("source_condition_early_release") is True
+                source_ready_protocol
                 and source_ready["event_id"] == self.prompt_inflight
                 and source_ready["prompt_version"] == self.public_prompt_version
                 and source_ready["source_frame_index"] == self._source_switch_end,
                 "Invalid source condition release receipt.",
             )
-            self._source_released_event = self.prompt_inflight
             self._source_switch_end = None
-        if ready_condition is not None and (
-            ready_condition.get("event_id") == self.prompt_inflight
+        if (
+            not source_ready_protocol
+            and ready_condition is not None
+            and ready_condition.get("event_id") == self.prompt_inflight
         ):
             self._source_switch_end = None
         more_work = (result.usage or {}).get("zing_source_more_work", False)
@@ -1908,8 +1916,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             if (
                 ready_condition is not None
                 and ready_condition.get("event_id") == self.prompt_inflight
-                and getattr(self, "_source_released_event", None)
-                != self.prompt_inflight
+                and not source_ready_protocol
             ) or any(
                 block.get("event_id", block.get("prompt_event_id"))
                 == self.prompt_inflight
@@ -1917,11 +1924,9 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                 for block in usage.get("zing_realtime_blocks", [])
             ):
                 self.prompt_inflight = None
-                self._source_released_event = None
             notice = getattr(result, "conditioning_notice", None)
             if notice and notice.get("event_id") == self.prompt_inflight:
                 self.prompt_inflight = None
-                self._source_released_event = None
                 self._source_switch_end = None
         if self.source_append_overlap:
             capacity = (result.usage or {}).get("zing_source_append_capacity_frames")

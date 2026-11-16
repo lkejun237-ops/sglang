@@ -16,8 +16,12 @@ from .render_contract import RenderError
 class BoundChild:
     def __init__(self, parent, kind, session_id, generation_id):
         self.parent, self.kind = parent, kind
+        lease = getattr(parent, "lease", None)
         self.supports_condition_barrier = getattr(
-            getattr(parent, "lease", None), "supports_condition_barrier", True
+            lease, "supports_condition_barrier", True
+        )
+        self.condition_switch_protocol = getattr(
+            lease, "condition_switch_protocol", "clip-barrier-v1"
         )
         self.session_id, self.generation_id = session_id, generation_id
         self.id = uuid4().hex

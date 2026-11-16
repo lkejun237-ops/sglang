@@ -745,7 +745,10 @@ def run_preflight_checks(
             },
             "5_protocol_and_reference_capability": {
                 "required_source_prompt_protocol": "ordered-boundary-v2",
-                "required_condition_switch_protocol": "clip-barrier-v1",
+                "accepted_condition_switch_protocols": [
+                    "clip-barrier-v1",
+                    "clip-barrier-v2",
+                ],
                 "required_prompt_reference_updates": True,
                 "required_max_references": 12,
                 "configured_num_inference_steps": int(
@@ -2013,9 +2016,12 @@ async def _run_single_segment_flow(
             "generation_id": proto_msg.get("generation_id"),
         }
         if proto_msg:
-            if proto_msg.get("condition_switch_protocol") != "clip-barrier-v1":
+            if proto_msg.get("condition_switch_protocol") not in {
+                "clip-barrier-v1",
+                "clip-barrier-v2",
+            }:
                 raise RuntimeError(
-                    f"PREFLIGHT_PROTOCOL_MISMATCH: expected clip-barrier-v1, got {proto_msg}"
+                    f"PREFLIGHT_PROTOCOL_MISMATCH: expected a clip barrier, got {proto_msg}"
                 )
             if not proto_msg.get("prompt_reference_updates"):
                 raise RuntimeError(
@@ -2702,7 +2708,7 @@ def _render_report_md(summary: dict[str, Any]) -> str:
         f"| 2. Prompt 与参考图占位契约 | `passed={pf_info.get('2_prompt_and_reference_contract', {}).get('passed')}` | 校验 `{pf_info.get('2_prompt_and_reference_contract', {}).get('conditions_checked')}` 组 `<Video 1>` 与 `<Picture 1..N>` 映射 |",
         f"| 3. 服务版本与身份配置 | `passed={pf_info.get('3_service_identity_and_health', {}).get('passed')}` | `{json.dumps(pf_info.get('3_service_identity_and_health', {}).get('details', {}), ensure_ascii=False)}` |",
         f"| 4. 空闲容量与非抢占准入 | `passed={pf_info.get('4_idle_capacity_and_non_preemption', {}).get('passed')}` | `{json.dumps(pf_info.get('4_idle_capacity_and_non_preemption', {}).get('details', {}), ensure_ascii=False)}` |",
-        "| 5. 协议能力与参考图上限 | `verified` | `ordered-boundary-v2` + `clip-barrier-v1` + `prompt_reference_updates=True` + `max_references>=12` |",
+        "| 5. 协议能力与参考图上限 | `verified` | `ordered-boundary-v2` + `clip-barrier-v1/v2` + `prompt_reference_updates=True` + `max_references>=12` |",
         f"| 6. Cache Key 隔离与资源归还 | `verified` | `seed_base={summary.get('seed_base')}` 隔离各 Step/A-B 臂；`all_leases_released={post_info.get('all_leases_released')}` |",
         "",
         "## 1. Block 0 Cache 生效与持久化指标",

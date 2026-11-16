@@ -175,8 +175,9 @@ class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
     group_id: Optional[str] = None
     type: Literal["init"]
     source_prompt_protocol: Optional[Literal["ordered-boundary-v2"]] = None
-    source_condition_switch_protocol: Optional[Literal["clip-barrier-v1"]] = None
-    source_condition_early_release: bool = False
+    source_condition_switch_protocol: Optional[
+        Literal["clip-barrier-v1", "clip-barrier-v2"]
+    ] = None
     source_demand_protocol: Optional[Literal["source-demand-v1"]] = None
     source_prepare_protocol: Optional[
         Literal["whitebox-startup-prepare-v1", "whitebox-startup-prepare-v2"]

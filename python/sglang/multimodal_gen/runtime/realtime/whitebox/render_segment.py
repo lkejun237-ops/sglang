@@ -15,6 +15,7 @@ from itertools import islice
 import msgspec
 
 from ..source_prepare import V2_PROTOCOL
+from ..zing_source_stream import CLIP_BARRIER_V2
 from .contracts import capture_pts
 from .diagnostics import WhiteboxDiagnostic, public_error
 from .interactive import InteractiveSession
@@ -170,6 +171,7 @@ class RenderSegment(InteractiveSession):
         self.model_ws = self.assignment = None
         self.model_ready = asyncio.Event()
         self.model_init_dispatched = False
+        self.model_source_ended = False
         self.closed_event = asyncio.Event()
         self.first_decodable = False
         self.first_output_at = None
@@ -198,6 +200,7 @@ class RenderSegment(InteractiveSession):
         self.source_admission_ready = asyncio.Event()
         self.condition_switch = None
         self.clip_switch = False
+        self.condition_switch_protocol = None
         self.source_resume_after = 0
         self.resume_condition_evidence = None
         self.last_selected_source = None
@@ -241,12 +244,16 @@ class RenderSegment(InteractiveSession):
             self.latest.select_start(self.segment["start_boundary"])
         self.model_ws, self.assignment = ws, assignment
         self.prompt_reference_updates = ready.get("prompt_reference_updates") is True
-        self.clip_switch = (
-            ready.get("source_condition_switch_protocol") == "clip-barrier-v1"
-        )
-        self.condition_early_release = (
-            self.clip_switch and ready.get("source_condition_early_release") is True
-        )
+        self.condition_switch_protocol = ready.get("source_condition_switch_protocol")
+        self.clip_switch = self.condition_switch_protocol in {
+            "clip-barrier-v1",
+            CLIP_BARRIER_V2,
+        }
+        if (
+            getattr(self.leases, "condition_switch_protocol", None) == CLIP_BARRIER_V2
+            and self.condition_switch_protocol != CLIP_BARRIER_V2
+        ):
+            raise RenderError("CAPABILITY_UNAVAILABLE")
         self.model_reference_limit = ready.get("max_references", 9)
         large_revision = os.environ.get("WHITEBOX_LARGE_REFERENCE_MODEL_REVISION")
         if large_revision and self.assignment.denoiser.model_revision != large_revision:
@@ -264,6 +271,11 @@ class RenderSegment(InteractiveSession):
         )
         self.resource_state = "reserved"
         self.sink.supported = ready.get("sink_updates") is True
+        if (
+            self.condition_switch_protocol == CLIP_BARRIER_V2
+            and ready.get("auto_sink_updates") is True
+        ):
+            self.sink.auto_policy = getattr(self.owner.host, "auto_sink_policy", None)
         self.model_ready.set()
         await self.owner.segment_status(
             self,
@@ -284,7 +296,7 @@ class RenderSegment(InteractiveSession):
         if self.clip_switch:
             self.tasks.add(asyncio.create_task(self._condition_controls(ws)))
             policy = getattr(self.owner.host, "condition_refresh_policy", None)
-            if policy is not None:
+            if policy is not None and self.condition_switch_protocol != CLIP_BARRIER_V2:
                 from .condition_refresh import PeriodicConditionRefresh
 
                 self.periodic_refresh = PeriodicConditionRefresh(self, policy)
@@ -404,7 +416,10 @@ class RenderSegment(InteractiveSession):
                     ):
                         self.prompt_available.set()
                         continue
-                    if getattr(self, "condition_early_release", False):
+                    if (
+                        getattr(self, "condition_switch_protocol", None)
+                        == CLIP_BARRIER_V2
+                    ):
                         watermark = max(self.selected_frames, 17)
                         switch["provisional_boundary"] = ((watermark + 16) // 17) * 17
                     self.condition_switch = switch
@@ -554,6 +569,9 @@ class RenderSegment(InteractiveSession):
         self.selected_frames = local + 1
         self.submitted = self.owner.submitted
         await self.owner.before_segment_source(self, ws, frame, local)
+        if local == 0 and self.sink.auto_policy is not None:
+            await self.sink.sync_auto(ws)
+            self.tasks.add(asyncio.create_task(self.sink.watch_auto(ws)))
 
     async def model_control(self, message):
         if await self.sink.control(message):
@@ -808,13 +826,11 @@ class RenderSegment(InteractiveSession):
                 source_prompt_protocol="ordered-boundary-v2",
             )
             if getattr(self.leases, "supports_condition_barrier", True):
-                self.upstream.init["source_condition_switch_protocol"] = (
-                    "clip-barrier-v1"
+                self.upstream.init["source_condition_switch_protocol"] = getattr(
+                    self.leases, "condition_switch_protocol", "clip-barrier-v1"
                 )
-                self.upstream.init["source_condition_early_release"] = True
             else:
                 self.upstream.init.pop("source_condition_switch_protocol", None)
-                self.upstream.init.pop("source_condition_early_release", None)
             self.ready.set()
             self.output_task = asyncio.create_task(self._pump())
             self.render_task = asyncio.create_task(self._render())

@@ -958,6 +958,7 @@ def test_v2_segment_starts_with_pinned_cli_pixels_not_condition_preview():
 
     async def run():
         segment = object.__new__(RenderSegment)
+        segment.sink = NS(auto_policy=None)
         native = bytes(SPEC.frame_bytes)
         segment.leases = NS(
             is_startup=True,

@@ -8,14 +8,15 @@ an SDK member and cannot supply or bypass a real player's SDK cleanup receipt.
 
 ## Conditions and startup
 
-Room reserves a complete codec boundary for an ordered Prompt/reference update.
-Encoder dispatches the remaining old source, then sends an ordered synchronous
-condition barrier to DiT. DiT checks its accepted and committed positions, drains
-pending source, calls the original `activate_prompt_at_source_boundary`, and
-confirms CUDA completion and identical SP receipts before `kv_ready`. Room then
-resumes with a fresh capture. No future source frame is needed to unblock this
-barrier. Identical complete conditions keep the original resident-prefix reuse
-path; their receipt is `bypass`, not an L1 hit.
+Room and the split Encoder use `clip-barrier-v2`. Room finishes the old clip at
+boundary B. After preparing the candidate and submitting it in FIFO order,
+Encoder returns `source_ready` so Room can resume with a fresh capture. DiT
+drains the old source, verifies B, and uses the original admission and
+`activate_prompt_at_source_boundary` before processing source at or beyond B.
+It confirms CUDA completion and identical SP receipts before `kv_ready`.
+Identical complete conditions can reuse the resident prefix and report
+`bypass`. Different conditions use their own Block0 and candidate references.
+The first RGB bearing the new version confirms application.
 
 `source.prepare` v1/v2 uses the existing immutable preview/identity contract.
 Encoder prepares the original Qwen/reference condition and waits for the connected
@@ -25,9 +26,10 @@ have identical pixels **and dimensions**. v1 retains the exact first-frame check
 v2 retains its independently sized preview semantics. Old peers lacking the
 negotiated capabilities fail explicitly instead of silently omitting the fence.
 
-The Room's existing 5-second refresh scheduler and Sink on/refresh/off controls
-are reused. They do not create another player, open another Slot, change the
-sampling schedule, or extend input-idle/player deadlines.
+Room sends changes to its hot-reloaded auto sink configuration over the existing
+model connection. DiT schedules the refresh in committed 5-latent cycles. A due
+refresh at the prompt boundary is absorbed by the prompt rebuild. Manual Sink
+on/refresh/off controls keep their existing session and event ownership.
 
 ## Public upload Prefill
 
@@ -57,7 +59,7 @@ restart or quarantine a healthy model group.
 Required validation uses real input identities and request/worker epochs: both
 user WebSocket and CLI-originated Prefill; ten distinct keys warmed **before**
 recall, all ten classified as L1 hits; separate L2 read/promotion and GPU restore;
-5-second refresh; Sink on/refresh/off; scene changes, cancellation, expiry,
+auto sink configure, refresh and disable; Sink on/refresh/off; scene changes, cancellation, expiry,
 reconnect, next-player reuse, recording and sustained visual quality. CPU protocol
 tests do not prove CUDA, checkpoint quality or real-game CLI output. No runtime
 configuration switch substitutes for the missing native protocol implementation.

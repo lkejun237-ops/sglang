@@ -27,6 +27,7 @@ class DiTLinkClient:
         self.async_inputs = False
         self.pending_results = []
         self.cache_identity = None
+        self.condition_switch_protocol = None
 
     def _validate_reply(self, reply):
         transfer = reply.get("transfer_id")
@@ -123,8 +124,11 @@ class DiTLinkClient:
             raise ValueError("An Encoder/DiT session is already active")
         self.owner = message["session_id"], message["generation_id"]
         try:
-            opened = self.exchange(dict(message, type="session.init"))
+            wire = dict(message, type="session.init")
+            protocol = wire.pop("source_condition_switch_protocol", None)
+            opened = self.exchange(wire)
             self.async_inputs = any(r.get("async_inputs", False) for r in opened)
+            self.condition_switch_protocol = protocol
             return opened
         except BaseException:
             self.owner = None
@@ -184,6 +188,7 @@ class DiTLinkClient:
             # must not become a no-op and falsely acknowledge GPU cleanup.
             self.owner = None
             self.async_inputs = False
+            self.condition_switch_protocol = None
 
     def disconnect(self):
         """Close this link without terminating the remote model worker."""

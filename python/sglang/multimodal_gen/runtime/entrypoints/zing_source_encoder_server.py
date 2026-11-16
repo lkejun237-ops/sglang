@@ -224,7 +224,14 @@ class EncoderConditioning:
             }
         return output
 
-    def forward(self, batch, on_condition=None, *, async_updates=False):
+    def forward(
+        self,
+        batch,
+        on_condition=None,
+        *,
+        async_updates=False,
+        condition_switch_protocol=None,
+    ):
         from copy import copy
 
         from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
@@ -233,6 +240,9 @@ class EncoderConditioning:
         )
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.source_session import (
             source_preview,
+        )
+        from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
+            CLIP_BARRIER_V2,
         )
 
         command = batch.extra["zing_source_command"]
@@ -287,13 +297,13 @@ class EncoderConditioning:
                 self.failed_update = update
             else:
                 try:
-                    allow_early_release = (
+                    release_source = (
                         async_updates
                         and "source_boundary" in update_command
-                        and update_command.get("allow_early_release") is True
+                        and condition_switch_protocol == CLIP_BARRIER_V2
                     )
                     candidate = self._lookup(
-                        batch, update=update_command, reuse_active=allow_early_release
+                        batch, update=update_command, reuse_active=release_source
                     )
                     reuse_active = candidate is not None and candidate is self.inputs
                     if candidate is not None:
@@ -330,9 +340,11 @@ class EncoderConditioning:
                         and not reuse_active
                         and (async_updates or "references" in update_command),
                     )
+                    self.prompt, self.event_id = update
+                    self.failed_update = None
                     if on_condition is not None:
                         sent = True
-                        if reuse_active and allow_early_release:
+                        if release_source:
                             output["release_source"] = True
                         on_condition("conditioning", **output)
                         output = None
@@ -346,8 +358,6 @@ class EncoderConditioning:
                     output = None
                     notice = dict(code=exc.code, event_id=update[1])
                 else:
-                    self.prompt, self.event_id = update
-                    self.failed_update = None
                     if on_condition is None:
                         self.inputs = candidate
                         self.confirm_applied(update[1])
@@ -915,7 +925,12 @@ class SourceEncoderExecutor:
                     batch,
                     on_condition=send_dit if self.dit_link is not None else None,
                     **(
-                        {"async_updates": True}
+                        {
+                            "async_updates": True,
+                            "condition_switch_protocol": getattr(
+                                self.dit_link, "condition_switch_protocol", None
+                            ),
+                        }
                         if getattr(self.dit_link, "async_inputs", False)
                         else {}
                     ),

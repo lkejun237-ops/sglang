@@ -1883,10 +1883,25 @@ def test_async_link_condition_ready_can_be_collected_after_send(early):
     assert not channel.replies
 
 
-@pytest.mark.parametrize("outcome", ["ready", "rejected", "different-key"])
-def test_split_encoder_releases_source_early_only_for_active_key(monkeypatch, outcome):
+@pytest.mark.parametrize(
+    ("protocol", "key", "outcome"),
+    [
+        ("clip-barrier-v2", "same", "ready"),
+        ("clip-barrier-v2", "hit", "ready"),
+        ("clip-barrier-v2", "miss", "ready"),
+        ("clip-barrier-v2", "miss", "rejected"),
+        ("clip-barrier-v2", "miss", "immediate-rejection"),
+        ("clip-barrier-v1", "miss", "ready"),
+    ],
+)
+def test_split_encoder_releases_source_after_candidate_send(
+    monkeypatch, protocol, key, outcome
+):
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
         prompt_update,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.dit_preparation import (
+        prepared_message,
     )
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.packing import (
         H3InferenceInputs,
@@ -1899,6 +1914,7 @@ def test_split_encoder_releases_source_early_only_for_active_key(monkeypatch, ou
     )
     worker.codecs.encode_condition = lambda *_: pytest.fail("Unexpected Qwen call")
     worker.codecs.prepare = lambda *_, **__: initial
+    worker.codecs.modules = {"video_vae": torch.nn.Linear(1, 1)}
     worker.conditioning = EncoderConditioning(worker.codecs, encode_tensor=lambda t: t)
     worker.conditioning.cache_query = worker._cache_query
     prepared = []
@@ -1908,43 +1924,54 @@ def test_split_encoder_releases_source_early_only_for_active_key(monkeypatch, ou
         return active.positive, None
 
     monkeypatch.setattr(prompt_update, "prepare_prompt_update", prepare_update)
-    messages, replies, lookups = [], [], []
+    messages, lookups = [], []
+    delayed_reply = None
     ready = dict(
         type="conditioning.ready", event_id=5, prompt_version=2, source_frame_index=17
     )
 
+    early = protocol == "clip-barrier-v2"
+    rejected = dict(type="conditioning.rejected", event_id=5, code="CONDITION_INVALID")
+
     class Link:
         async_inputs = True
+        condition_switch_protocol = protocol
 
         def cache_control(self, op, **fields):
             if op == "identity":
                 return {"identity": {"model": "test"}}
             assert op == "lookup"
             lookups.append(fields["cache_key"])
+            if key == "hit" and len(lookups) > 1:
+                return {"hit": True, "inputs": prepared_message(initial)}
             return {"hit": False}
 
         def collect(self):
-            current = replies[:]
-            replies.clear()
-            return current
+            return []
 
         def send(self, kind, *, wait_for_boundary=True, **fields):
             messages.append((kind, fields))
             if "source_boundary" in fields:
-                assert wait_for_boundary is (outcome == "different-key")
+                assert wait_for_boundary is not early
                 assert fields["source_boundary"] == 17
+                if outcome == "immediate-rejection":
+                    return [rejected]
                 if wait_for_boundary:
                     return [ready]
+            if kind == "source.end" and delayed_reply is not None:
+                return [delayed_reply]
             return []
 
     worker.dit_link = Link()
+
+    target_prompt = "original" if key == "same" else "changed"
 
     def dispatch(index, start, count, *, update=None, end=False):
         request = batch(index, start, count, end=end)[0]
         request.extra["zing_source_command"]["config"]["fps"] = 24
         request.extra["zing_dit_source_records"] = []
         request.sampling_params = NS(
-            prompt=update["prompt"] if update else "original",
+            prompt=target_prompt if index else "original",
             zing_request={"prompt": "original"},
         )
         request.realtime_event_id = 5 if index else None
@@ -1960,42 +1987,47 @@ def test_split_encoder_releases_source_early_only_for_active_key(monkeypatch, ou
         event_id=5,
         prompt_version=2,
         source_boundary=17,
-        allow_early_release=True,
-        prompt="changed" if outcome == "different-key" else "original",
+        prompt=target_prompt,
     )
-    receipt = dispatch(1, 17, 0, update=update).usage
+    switched = dispatch(1, 17, 0, update=update)
+    receipt = switched.usage
     assert [kind for kind, _ in messages] == [
         "conditioning",
         "source.moments",
         "conditioning",
     ]
-    if outcome == "different-key":
-        assert prepared == ["changed"] and len(lookups) == 2
+    assert len(lookups) == (1 if key == "same" else 2)
+    assert prepared == (["changed"] if key == "miss" else [])
+    assert messages[-1][1]["cache_hit"] is (key == "hit")
+    if not early:
         assert receipt["zing_condition_ready"]["state"] == "kv_ready"
         assert "zing_condition_source_ready" not in receipt
         assert worker.conditioning.active_cache_key == lookups[-1]
         return
 
-    assert not prepared and lookups == [active_key]
-    assert receipt["zing_condition_source_ready"]["state"] == "source_ready"
+    if outcome == "immediate-rejection":
+        assert "zing_condition_source_ready" not in receipt
+        assert switched.conditioning_notice["event_id"] == 5
+        assert worker.conditioning.failed_update == ("changed", 5)
+    else:
+        assert receipt["zing_condition_source_ready"]["state"] == "source_ready"
     assert "zing_condition_ready" not in receipt
     assert receipt["zing_source_committed_end"] == 0
-    if outcome == "ready":
-        replies.append(ready)
-    else:
-        replies.append(
-            dict(type="conditioning.rejected", event_id=5, code="CONDITION_INVALID")
-        )
+    # Accept source work before the delayed model receipt is available.
+    if outcome != "immediate-rejection":
+        delayed_reply = ready if outcome == "ready" else rejected
     result = dispatch(2, 17, 17, end=True)
     assert [kind for kind, _ in messages][-2:] == ["source.moments", "source.end"]
     assert result.usage["zing_source_complete"]
     assert worker.pending_condition_ready is None
-    assert worker.conditioning.active_cache_key == active_key
     if outcome == "ready":
         assert result.usage["zing_condition_ready"]["event_id"] == 5
+        assert worker.conditioning.active_cache_key == lookups[-1]
     else:
-        assert result.conditioning_notice["event_id"] == 5
+        if outcome == "rejected":
+            assert result.conditioning_notice["event_id"] == 5
         assert "zing_condition_ready" not in result.usage
+        assert worker.conditioning.active_cache_key == active_key
         assert worker.conditioning.inputs is initial
 
 
@@ -2169,7 +2201,9 @@ def test_expected_prefill_capacity_rejection_does_not_poison_encoder_group(monke
 def test_condition_ready_clears_inflight_prompt_and_reference_budget(early):
     adapter = ZingEncoderDiTAdapter()
     adapter.startup_enabled = False
-    adapter.condition_switch_protocol = "zing_h3_source_condition_switch.v1"
+    adapter.condition_switch_protocol = (
+        "clip-barrier-v2" if early else "clip-barrier-v1"
+    )
     adapter._pending_prompt_command = None
     adapter._pending_sink_command = None
     adapter.ordered_prompts = True
@@ -2178,7 +2212,6 @@ def test_condition_ready_clears_inflight_prompt_and_reference_budget(early):
     adapter.source_work_quantum = 0
     adapter.prompt_inflight = 18
     adapter.public_prompt_version = 2
-    adapter.ready = {"source_condition_early_release": early}
     adapter._source_switch_end = 17
     adapter._budget_reference_count = 2
     adapter._budget_reference_update = (18, 6)
@@ -2390,9 +2423,12 @@ def test_encoder_client_cache_disk_delete_entries_guards_busy_and_delegates():
 
 
 @pytest.mark.parametrize("advertise", [False, True])
-@pytest.mark.parametrize("async_inputs", [False, True])
+@pytest.mark.parametrize(
+    ("protocol", "async_inputs"),
+    [("clip-barrier-v1", False), ("clip-barrier-v2", False), ("clip-barrier-v2", True)],
+)
 def test_independent_input_forwards_verified_decoder_flow(
-    configured, advertise, async_inputs
+    configured, advertise, protocol, async_inputs
 ):
     from test_zing_h3_source_adapter import _enable_reference_updates
 
@@ -2415,6 +2451,9 @@ def test_independent_input_forwards_verified_decoder_flow(
         }
 
         async def open_dit(message):
+            assert message.get("source_condition_switch_protocol") == (
+                protocol if protocol == "clip-barrier-v2" else None
+            )
             return [
                 dict(
                     type="session.opened",
@@ -2433,14 +2472,19 @@ def test_independent_input_forwards_verified_decoder_flow(
             zing_realtime_api_version=1,
             source_stream=dict(format="rgb24", width=32, height=32, fps=24),
             source_prompt_protocol="ordered-boundary-v2",
-            source_condition_switch_protocol="clip-barrier-v1",
-            source_condition_early_release=True,
+            source_condition_switch_protocol=protocol,
             source_demand_protocol="source-demand-v1",
         )
         try:
+            if protocol == "clip-barrier-v2" and not async_inputs:
+                with pytest.raises(
+                    ValueError, match="does not support condition switching"
+                ):
+                    await adapter.on_init(session, request)
+                return
             await adapter.on_init(session, request)
             ready = adapter.session_ready_message(session)
-            assert (ready.get("source_condition_early_release") is True) == async_inputs
+            assert ready["source_condition_switch_protocol"] == protocol
             if advertise:
                 assert adapter.ready["source_flow"] == capabilities["source_flow"]
                 assert (

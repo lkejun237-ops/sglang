@@ -21,6 +21,8 @@ from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
     require,
 )
 
+CLIP_BARRIER_V2 = "clip-barrier-v2"
+
 
 def progressive_source_dependency(latent_end):
     """Required real pixels for the clip17 encoder's 1/2/2 latent groups."""

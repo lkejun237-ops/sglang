@@ -214,18 +214,25 @@ Sink 策略及 L1/L2 预算仍按已冻结配置明确传入，不以合并变�
 本候选尚未完成 CPU 集成、GPU 或线上验收。主线历史 480/H100 结果不证明
 泰国 480 输入/736 输出、B300、FP8 的新组合通过；合并后的功能、画质和性能分别报告。
 
-## Split Whitebox 同 key 刷新提前放行（2026-11-11，候选）
+## Split Whitebox 条件切换与周期 Sink 刷新
 
-Room 与 split Encoder 协商 `source_condition_early_release` 后，Encoder 在封口处计算
-完整 Block0 key。候选 key 与当前已生效条件相同时，Encoder 复用已生效的条件输入，
-跳过远端 lookup 和 Qwen／参考图 VAE，按序发送候选并回 `source_ready`。
-Room 从新采集的帧恢复供帧。DiT 保留 FIFO 顺序，在旧 clip 完成后独立重建动态历史 KV，
-并在各 rank 确认后回 `kv_ready`。首个带新版本的非空输出确认 `applied`。
-异 key 继续用 `kv_ready` 放行。提前放行后若 DiT 拒绝条件准入，使用旧条件继续；
-重建失败导致会话状态失效时，当前模型段结束。
+Room 与 split Encoder 成对升级，使用 `clip-barrier-v2`。在完整旧 clip 后，Encoder 准备
+候选并按 FIFO 提交，随后用 `source_ready` 恢复 Room 供帧。同 key 复用已生效的 Encoder 输入，
+异 key 继续走 Block0 lookup 与候选准备。DiT 在边界完成准入、历史 KV 重建和各 rank 确认后回
+`kv_ready`。首个带新版本的非空 RGB 确认 `applied`。明确准入拒绝时继续用旧条件，重建失败
+导致会话状态失效时结束当前模型段。
 
-本候选的 480／736 GPU 时序、端到端性能、画质和分角色显存尚未验证。计划用相同输入、
-模型及 SP 配方对照 main 与候选，另验证与周期 Sink 在同一边界触发的行为。
+支持 `auto_sink_updates` 的 split 段在首帧前读取 Room 的
+`$WHITEBOX_ROOM_SPOOL/.runtime/sink-auto.json`，运行中每秒检查配置，配置变化时发
+`sink.auto`。开启示例为 `{"enabled":true,"interval_cycles":8,"method":"copy"}`。
+每周期是 5 个已提交 latent，方法省略时为 `copy`，也可选 `rebuild`。
+`{"enabled":false}` 关闭当前段和后续段的自动刷新。通过原子替换文件更新配置。
+文件缺失或内容无效时沿用上次有效配置，新 Room 进程在首次读到有效配置前沿用模型默认值。
+从输出的 `sink_config_event_id` 核对配置生效，用 `sink_refresh_count` 和
+`sink_refresh_latent` 观察实际刷新。同一边界到期时由 prompt 重建吸收本轮刷新。
+
+Split 段使用上述周期配置。旧 `condition-refresh.json` 的秒数配置继续用于 v1 路径。
+480／736 的 GPU 时序、画质和分角色显存待实测。
 
 ## 相同条件刷新与 GPU Prefix 复用（2026-11-06，代码候选，未部署）
 

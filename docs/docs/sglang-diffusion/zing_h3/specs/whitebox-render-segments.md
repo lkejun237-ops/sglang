@@ -613,7 +613,8 @@ audio generation.
 
 ### Prompt/reference switching with source skipping
 
-Workers that advertise `source_condition_switch_protocol=clip-barrier-v1` and
+Workers that advertise `clip-barrier-v1` or `clip-barrier-v2` as their condition
+switch protocol and
 `prompt_reference_updates=true` accept a full text/reference change in the same
 segment. Use `effective.policy=at_or_after` and
 `source_policy=skip_during_switch`; strict boundaries are rejected for this
@@ -625,9 +626,12 @@ limit is not a promise that every image resolution fits the GPU pool.
 The Room confirms new reference files in the recorder before handing the
 candidate to H3. Text-only changes retain the existing image latents and archive
 paths. The Worker reserves a complete 17-frame source clip boundary B. The Room
-may finish that old clip, then admits no local source index at or beyond B until
-the Worker returns `kv_ready` after candidate preparation, five-latent history
-rebuilding and rank agreement. This control dispatch does not need future RGB.
+may finish that old clip and waits at B. On the paired split path
+(`clip-barrier-v2`), Encoder returns `source_ready` after submitting the prepared
+candidate in FIFO order. The v1 path waits for `kv_ready`. In both protocols,
+DiT processes source at B only after candidate admission, five-latent history
+rebuilding and rank agreement, or under the old condition after explicit
+admission rejection. This control dispatch does not need future RGB.
 
 The world, input handling, source preview and source archive continue during
 the pause. On readiness, the Room takes a newly captured frame, retaining its

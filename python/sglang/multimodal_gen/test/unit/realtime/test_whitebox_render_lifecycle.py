@@ -1230,7 +1230,7 @@ def test_clip_switch_finishes_old_clip_before_accepted_and_resumes_on_source_rea
     async def scenario():
         segment = object.__new__(RenderSegment)
         segment.segment_id = "segment"
-        segment.condition_early_release = True
+        segment.condition_switch_protocol = "clip-barrier-v2"
         segment.condition_switch = segment.pending_prompt = None
         segment.prompt_by_event = {}
         segment.active_reference_descriptors = []
@@ -1292,10 +1292,14 @@ def test_clip_switch_finishes_old_clip_before_accepted_and_resumes_on_source_rea
                 prompt_version=2,
                 source_frame_index=34,
             )
-            for state in ("accepted", "source_ready"):
+            for state in ("accepted", "kv_ready"):
                 assert await SourceSession.segment_model_control(
                     segment.owner, segment, dict(receipt, state=state)
                 )
+            assert not segment.model_source_allowed(34)
+            assert await SourceSession.segment_model_control(
+                segment.owner, segment, dict(receipt, state="source_ready")
+            )
             async with segment.model_admission_condition:
                 await asyncio.wait_for(
                     segment.model_admission_condition.wait_for(

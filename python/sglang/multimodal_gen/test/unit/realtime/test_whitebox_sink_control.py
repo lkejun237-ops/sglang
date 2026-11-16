@@ -12,7 +12,10 @@ from sglang.multimodal_gen.runtime.realtime.whitebox.interactive import (
     InteractiveSession,
 )
 from sglang.multimodal_gen.runtime.realtime.whitebox.render_contract import RenderError
-from sglang.multimodal_gen.runtime.realtime.whitebox.sink_control import SinkControl
+from sglang.multimodal_gen.runtime.realtime.whitebox.sink_control import (
+    AutoSinkPolicy,
+    SinkControl,
+)
 
 
 async def fixture():
@@ -55,6 +58,7 @@ async def fixture():
         pending_prompt=None,
         condition_switch=None,
         cancel_requested=False,
+        model_source_ended=False,
         source_view=SimpleNamespace(stopped=asyncio.Event()),
         source_send_lock=asyncio.Lock(),
         model_wire_lock=asyncio.Lock(),
@@ -429,5 +433,82 @@ def test_sink_cancel_during_dispatch_journal_commit_cannot_send_after_stop():
         assert receipts[-1]["state"] == "reconciling"
         assert receipts[-1].get("never_applied") is not True
         assert owner.journal.snapshot["operations"]["change"]["state"] == "reconciling"
+
+    asyncio.run(run())
+
+
+def test_auto_sink_hot_updates_use_the_existing_wire_and_leave_prompt_unchanged(
+    tmp_path,
+):
+    async def run():
+        sink, owner, _, sent, _, _ = await fixture()
+        segment = sink.segment
+        ws = segment.model_ws
+        policy = sink.auto_policy = AutoSinkPolicy(tmp_path / "sink-auto.json")
+        segment.model_wire_sequence = 4  # An attached startup already used events.
+        await sink.sync_auto(ws, now=0)
+        assert sent == []
+
+        policy.path.write_text('{"enabled": true, "interval_cycles": 8}')
+        await sink.sync_auto(ws, now=1)
+        first = sent[-1]
+        assert first == dict(
+            type="event",
+            kind="sink.auto",
+            event_id=5,
+            payload=dict(enabled=True, interval_cycles=8, method="copy"),
+        )
+        assert await sink.control(
+            dict(type="control_ack", kind="sink.auto", event_id=5, stage="accepted")
+        )
+        assert "sink_config_event_id" not in sink.snapshot
+
+        # Real frames confirm both configuration and subsequent refresh progress.
+        snapshot = await sink.output(
+            dict(output(None, True), sink_config_event_id=5, sink_refresh_count=0)
+        )
+        assert snapshot["sink_config_event_id"] == 5
+        snapshot = await sink.output(
+            dict(
+                output(None, True),
+                sink_config_event_id=5,
+                sink_refresh_count=1,
+                sink_refresh_method="copy",
+                sink_refresh_latent=40,
+            )
+        )
+        assert snapshot["sink_refresh_count"] == 1
+        assert owner.journal.snapshot["segment"]["sink"]["sink_refresh_latent"] == 40
+
+        policy.path.write_text('{"enabled": true, "interval_cycles": 0}')
+        await sink.sync_auto(ws, now=2)
+        policy.path.unlink()
+        await sink.sync_auto(ws, now=3)
+        assert sent == [first]
+
+        policy.path.write_text(
+            '{"enabled": true, "interval_cycles": 4, "method": "rebuild"}'
+        )
+        await sink.sync_auto(ws, now=4)
+        assert sent[-1]["payload"] == dict(
+            enabled=True, interval_cycles=4, method="rebuild"
+        )
+        await sink.sync_auto(ws, now=5)
+        assert len(sent) == 2
+
+        policy.path.write_text('{"enabled": false}')
+        await sink.sync_auto(ws, now=6)
+        assert sent[-1]["payload"] == {"enabled": False}
+        assert [row["event_id"] for row in sent] == [5, 6, 7]
+        assert {row["kind"] for row in sent} == {"sink.auto"}
+        current = owner.journal.snapshot["segment"]
+        assert current["applied_version"] == current["accepted_version"] == 1
+        assert not current["prompt_queue"]
+        assert set(owner.journal.snapshot["operations"]) == {"start"}
+
+        segment.model_source_ended = True
+        policy.path.write_text('{"enabled": true, "interval_cycles": 4}')
+        await sink.sync_auto(ws, now=7)
+        assert len(sent) == 3
 
     asyncio.run(run())

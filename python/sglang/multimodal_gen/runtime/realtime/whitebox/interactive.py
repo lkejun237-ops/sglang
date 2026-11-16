@@ -1178,6 +1178,7 @@ class InteractiveSession(WhiteboxUpstream):
                         condition,
                     )
                 ended = True
+                self.model_source_ended = True
                 await self.send_model_event(
                     ws, "source.end", dict(source_frame_end=sent)
                 )

@@ -55,7 +55,14 @@ def methods(sampling_schedule=None):
         if not ok:
             raise ValueError(message)
 
-    ns = dict(Base=Base, asyncio=asyncio, time=time, require=require, asdict=asdict)
+    ns = dict(
+        Base=Base,
+        CLIP_BARRIER_V2="clip-barrier-v2",
+        asyncio=asyncio,
+        time=time,
+        require=require,
+        asdict=asdict,
+    )
     exec(
         compile(
             ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])),

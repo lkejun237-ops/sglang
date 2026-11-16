@@ -22,7 +22,10 @@
 及内部 `lookup.reuse_source=resident_gpu_prefix`，相关准备/恢复阶段标记skipped。
 它不是L1 hit，更不能当作零耗时。真实条件变化仍使用原路径，支持原缓存行为。
 
-## 纯服务端动态配置
+## v1 路径的服务端动态配置
+
+`clip-barrier-v2` 的 split Room 段使用 [周期 Sink 配置](../../zing/deployment_zing_h3.mdx)，
+周期刷新由 DiT 调度。以下秒数配置用于 v1 路径。
 
 运维在 Room 的已有运行配置目录管理：
 

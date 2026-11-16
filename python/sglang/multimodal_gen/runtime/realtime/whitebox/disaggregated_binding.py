@@ -14,6 +14,7 @@ import httpx
 from ..coordinator import SessionAssignment, WorkerSlot
 from ..role_pool.contracts import PoolError, digest
 from ..role_pool.transport import PooledBoundSocket
+from ..zing_source_stream import CLIP_BARRIER_V2
 from .interactive import ModelLeases
 from .render_contract import RenderError
 
@@ -48,6 +49,7 @@ def _select_preferred_admission_id(preferred: dict, avoid: dict | None = None) -
 
 class DisaggregatedModelLeases(ModelLeases):
     supports_condition_barrier = True
+    condition_switch_protocol = CLIP_BARRIER_V2
 
     def __init__(self, *args, config=None, profile_hint=None, **kwargs):
         super().__init__(*args, **kwargs)

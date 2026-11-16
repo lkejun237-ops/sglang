@@ -10,6 +10,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_a
     empty_frame_send_stats,
 )
 from sglang.multimodal_gen.runtime.realtime.zing_contracts import PixelRange, require
+from sglang.multimodal_gen.runtime.realtime.zing_source_stream import CLIP_BARRIER_V2
 
 from .zing_h3_source_adapter import ZingH3SourceStreamAdapter
 from .zing_source_encoder_adapter import ZingSourceEncoderAdapter
@@ -72,6 +73,11 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
                         request, "realtime_preview_max_width", None
                     ),
                     trace_id=getattr(session, "trace_id", None),
+                    **(
+                        {"source_condition_switch_protocol": CLIP_BARRIER_V2}
+                        if self.condition_switch_protocol == CLIP_BARRIER_V2
+                        else {}
+                    ),
                 )
             )
             self.output_kind = next(
@@ -86,7 +92,11 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
                 require(
                     any(
                         value.get("source_condition_switch_protocol")
-                        == self.condition_switch_protocol
+                        == "clip-barrier-v1"
+                        and (
+                            self.condition_switch_protocol != CLIP_BARRIER_V2
+                            or value.get("async_inputs") is True
+                        )
                         for value in (opened or [])
                         if value.get("type") == "session.opened"
                     ),
@@ -106,12 +116,6 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
             for value in opened or []:
                 if value["type"] != "session.opened":
                     continue
-                if (
-                    self.condition_switch_protocol
-                    and getattr(request, "source_condition_early_release", False)
-                    and value.get("async_inputs") is True
-                ):
-                    self.ready["source_condition_early_release"] = True
                 if (
                     value.get("source_output_release_protocol")
                     == "valid-source-frames-v1"
@@ -244,10 +248,6 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
 
     def prepare_next_request(self, session, server_args, chunk):
         batch = super().prepare_next_request(session, server_args, chunk)
-        if self.ready.get("source_condition_early_release"):
-            update = batch.extra.get("zing_prompt_update")
-            if update is not None and "source_boundary" in update:
-                update["allow_early_release"] = True
         batch.extra["zing_dit_source_records"] = [
             [r.source_id, r.start, r.end] for r in self.ledger.records
         ]
