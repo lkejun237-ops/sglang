@@ -816,6 +816,49 @@ def prepared_cache_cutover(tmp_path, monkeypatch):
     return config, fake, nginx, secret
 
 
+def test_condition_switch_cutover_freezes_only_the_selected_route(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(cutover.os, "chown", lambda *args: None)
+    old = {
+        "Id": "room",
+        "Config": {"Env": ["WHITEBOX_ROLE_POOL_CONFIG=/run/pool.json"]},
+    }
+    document = {"routes": {"a": {"profile": "480"}, "b": {"profile": "736"}}}
+    raw = json.dumps(document).encode()
+    engine = SimpleNamespace(file=lambda cid, target: raw)
+    item = {
+        "role": "room",
+        "room_condition_switch": {
+            "expected_pool_sha256": cutover.sha(raw),
+            "route": "a",
+            "value": "clip-barrier-v1",
+        },
+    }
+    binding = cutover.prepare_room_cache_route(old, item, tmp_path, engine, (0, 0))
+    assert binding["old_sha256"] == cutover.sha(raw)
+    assert json.loads((tmp_path / "room-role-pool.private.json").read_text()) == {
+        "routes": {
+            "a": {"profile": "480", "condition_switch_protocol": "clip-barrier-v1"},
+            "b": document["routes"]["b"],
+        }
+    }
+    assert json.loads(raw) == document
+    for patch in (
+        {"expected_pool_sha256": "drift"},
+        {"route": "missing"},
+        {"value": "unknown"},
+    ):
+        invalid = {
+            **item,
+            "room_condition_switch": {**item["room_condition_switch"], **patch},
+        }
+        with pytest.raises(ValueError, match="condition switch route"):
+            cutover.prepare_room_cache_route(old, invalid, tmp_path, engine, (0, 0))
+
+
 def test_cache_routing_and_explicit_selection_cannot_both_own_role_hints():
     item = {
         "role": "room",

@@ -13,6 +13,15 @@ from .diagnostics import log_player_failure
 from .render_contract import RenderError
 
 
+def verify_condition_switch_ready(lease, ready):
+    requested = getattr(lease, "condition_switch_protocol", None)
+    if (
+        requested is not None
+        and ready.get("source_condition_switch_protocol") != requested
+    ):
+        raise RenderError("CAPABILITY_UNAVAILABLE")
+
+
 class BoundChild:
     def __init__(self, parent, kind, session_id, generation_id):
         self.parent, self.kind = parent, kind
@@ -20,9 +29,8 @@ class BoundChild:
         self.supports_condition_barrier = getattr(
             lease, "supports_condition_barrier", True
         )
-        self.condition_switch_protocol = getattr(
-            lease, "condition_switch_protocol", "clip-barrier-v1"
-        )
+        if hasattr(lease, "condition_switch_protocol"):
+            self.condition_switch_protocol = lease.condition_switch_protocol
         self.session_id, self.generation_id = session_id, generation_id
         self.id = uuid4().hex
         self.opened = asyncio.Event()

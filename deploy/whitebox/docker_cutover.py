@@ -443,6 +443,10 @@ def gateway_prefill_environment(env, item):
 
 def prepare_room_cache_route(old, item, root, engine, owner):
     if item.get("gateway_prefill") is not None:
+        require(
+            item.get("room_condition_switch") is None,
+            "Condition switch route belongs to Room only",
+        )
         env = environment(old)
         gateway_prefill_environment(env, item)
         require(
@@ -467,24 +471,39 @@ def prepare_room_cache_route(old, item, root, engine, owner):
             new=previous is None,
         )
     change = item.get("room_cache")
-    if change is None:
+    protocol = item.get("room_condition_switch")
+    if change is None and protocol is None:
         return None
-    require(item["role"] == "room", "Cache route belongs to Room only")
+    require(item["role"] == "room", "Role pool route belongs to Room only")
     target = environment(old)["WHITEBOX_ROLE_POOL_CONFIG"]
     require(Path(target).is_absolute(), "Role pool config path must be absolute")
     raw = engine.file(old["Id"], target)
     require(len(raw) <= 1024**2, "Role pool config is too large")
     document = json.loads(raw)
-    route = document["routes"][change["route"]]
-    require(
-        route["compatibility"] == change["expected_compatibility"],
-        "Role pool route changed",
-    )
-    require(
-        re.fullmatch(r"[A-Za-z0-9_.-]{1,256}", change["compatibility"]),
-        "Invalid candidate compatibility",
-    )
-    route["compatibility"] = change["compatibility"]
+    if change is not None:
+        route = document["routes"][change["route"]]
+        require(
+            route["compatibility"] == change["expected_compatibility"],
+            "Role pool route changed",
+        )
+        require(
+            re.fullmatch(r"[A-Za-z0-9_.-]{1,256}", change["compatibility"]),
+            "Invalid candidate compatibility",
+        )
+        route["compatibility"] = change["compatibility"]
+    if protocol is not None:
+        require(
+            isinstance(protocol, dict)
+            and set(protocol) == {"route", "expected_pool_sha256", "value"}
+            and protocol["expected_pool_sha256"] == sha(raw)
+            and protocol["value"] in ("clip-barrier-v1", "clip-barrier-v2")
+            and isinstance(protocol["route"], str)
+            and protocol["route"] in document.get("routes", {}),
+            "Invalid or changed Room condition switch route",
+        )
+        document["routes"][protocol["route"]]["condition_switch_protocol"] = protocol[
+            "value"
+        ]
     path = root / "room-role-pool.private.json"
     write_private(path, document)
     os.chown(path, *owner)
@@ -564,7 +583,10 @@ def candidate_body(old, item, bundle_path, digest, config_binding=None):
     if config_binding is not None:
         require(
             (
-                item.get("room_cache") is not None
+                (
+                    item.get("room_cache") is not None
+                    or item.get("room_condition_switch") is not None
+                )
                 and item["role"] == "room"
                 and config_binding["target"]
                 == environment(old)["WHITEBOX_ROLE_POOL_CONFIG"]
@@ -664,7 +686,11 @@ def candidate_body(old, item, bundle_path, digest, config_binding=None):
     )
     require(
         bool(config_binding)
-        == bool(item.get("room_cache") or item.get("gateway_prefill")),
+        == bool(
+            item.get("room_cache")
+            or item.get("room_condition_switch")
+            or item.get("gateway_prefill")
+        ),
         "Cache route binding missing",
     )
     env = environment(old)

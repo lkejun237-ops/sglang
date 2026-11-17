@@ -23,6 +23,7 @@ from ..source_prepare import (
 )
 from .contracts import VideoSpec
 from .diagnostics import model_preparation_error
+from .model_binding import verify_condition_switch_ready
 from .model_geometry import ModelGeometry
 from .render_contract import (
     MAX_REFERENCE_BYTES,
@@ -523,6 +524,7 @@ class PlayStartup:
                         )
                     ):
                         raise RenderError("CAPABILITY_UNAVAILABLE")
+                    verify_condition_switch_ready(self.lease, self.ready)
                     rgb = self.assets.rgb
                     if rgb is None:
                         await self.progress("waiting_source")

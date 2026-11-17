@@ -70,6 +70,10 @@ class DisaggregatedModelLeases(ModelLeases):
             if key not in routes:
                 raise RenderError("CAPABILITY_UNAVAILABLE")
             self.config = {**self.config, **routes[key]}
+        protocol = self.config.get("condition_switch_protocol", CLIP_BARRIER_V2)
+        if protocol not in ("clip-barrier-v1", CLIP_BARRIER_V2):
+            raise RenderError("CAPABILITY_UNAVAILABLE")
+        self.condition_switch_protocol = protocol
         preferred_raw = os.environ.get("WHITEBOX_PREFERRED_SERVICE_IDS", "")
         avoid_raw = os.environ.get("WHITEBOX_AVOID_SERVICE_IDS", "")
         self.preferred_service_ids = (

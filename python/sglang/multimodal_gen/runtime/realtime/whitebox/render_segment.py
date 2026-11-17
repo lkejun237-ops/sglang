@@ -22,6 +22,7 @@ from .contracts import capture_pts
 from .diagnostics import WhiteboxDiagnostic, public_error
 from .inference_timing import public_timing, room_elapsed_ms, trigger_source
 from .interactive import InteractiveSession
+from .model_binding import verify_condition_switch_ready
 from .playback import H264PlaybackEncoder
 from .render_contract import RenderError, canonical
 from .reports import SessionReport
@@ -260,11 +261,7 @@ class RenderSegment(InteractiveSession):
             "clip-barrier-v1",
             CLIP_BARRIER_V2,
         }
-        if (
-            getattr(self.leases, "condition_switch_protocol", None) == CLIP_BARRIER_V2
-            and self.condition_switch_protocol != CLIP_BARRIER_V2
-        ):
-            raise RenderError("CAPABILITY_UNAVAILABLE")
+        verify_condition_switch_ready(self.leases, ready)
         self.condition_early_release = (
             self.condition_switch_protocol == "clip-barrier-v1"
             and ready.get("source_condition_early_release") is True

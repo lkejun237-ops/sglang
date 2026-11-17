@@ -287,6 +287,71 @@ def test_preview_admission_with_unknown_cleanup_preserves_original_owner(monkeyp
     asyncio.run(run())
 
 
+@pytest.mark.parametrize(
+    "configured", [None, "clip-barrier-v1", "clip-barrier-v2", "unknown"]
+)
+def test_split_route_condition_switch_contract(configured):
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.runtime.realtime.whitebox.model_binding import (
+        BoundChild,
+        verify_condition_switch_ready,
+    )
+
+    async def run():
+        route = {"profile": "480", "startup_seconds": 30}
+        if configured is not None:
+            route["condition_switch_protocol"] = configured
+
+        def leases():
+            return DisaggregatedModelLeases(
+                None,
+                None,
+                user_id="fixture",
+                model_revision="region",
+                vae_fingerprint="local",
+                trace_id="fixture",
+                max_bytes=1024,
+                config={"routes": {"region:480": route, "region:736": {}}},
+                profile_hint="480",
+            )
+
+        if configured == "unknown":
+            with pytest.raises(RenderError) as exc:
+                leases()
+            assert exc.value.code == "CAPABILITY_UNAVAILABLE"
+            return
+        lease = leases()
+        try:
+            expected = configured or "clip-barrier-v2"
+            child = BoundChild(SimpleNamespace(lease=lease), "generate", "s", "g")
+            assert (
+                child.condition_switch_protocol
+                == lease.condition_switch_protocol
+                == expected
+            )
+            for peer in (None, "clip-barrier-v1", "clip-barrier-v2"):
+                ready = {"source_condition_switch_protocol": peer}
+                if peer == expected:
+                    verify_condition_switch_ready(child, ready)
+                else:
+                    with pytest.raises(RenderError) as exc:
+                        verify_condition_switch_ready(child, ready)
+                    assert exc.value.code == "CAPABILITY_UNAVAILABLE"
+            legacy_child = BoundChild(
+                SimpleNamespace(lease=SimpleNamespace()), "generate", "s", "g"
+            )
+            assert (
+                getattr(legacy_child, "condition_switch_protocol", "clip-barrier-v1")
+                == "clip-barrier-v1"
+            )
+            verify_condition_switch_ready(legacy_child, {})
+        finally:
+            await lease.client.aclose()
+
+    asyncio.run(run())
+
+
 def test_rejected_role_pool_admission_closes_client_without_reserving_compute(
     monkeypatch,
 ):

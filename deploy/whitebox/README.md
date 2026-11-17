@@ -220,3 +220,9 @@ other messages remain `UNCLASSIFIED_FAILURE` with the exception type. Correlate
 these records with WTP's `runtime-control-request-failed` and
 `runtime-control-outcome-unconfirmed` events. Local tests mock cloud/model transport;
 source tests do not establish deployed behavior or real GPU health.
+
+### 分离部署的条件切换协议
+
+Room 在角色池配置中按模型路由读取 `condition_switch_protocol`，默认 `clip-barrier-v2`。接入只支持旧协议的 Encoder 和 DiT 时，在对应 `routes` 条目指定 `clip-barrier-v1`。同一路由的各角色须支持所选协议。Room 会核对模型就绪回执，Prompt 更新继续使用相应版本的 clip 边界和就绪确认。
+
+Docker 切换配置可为 Room 指定 `room_condition_switch`，其中 `route` 为当前路由名，`value` 为该路由支持的协议，`expected_pool_sha256` 为当前角色池配置文件的 SHA-256。准备阶段复制角色池文件，仅修改指定路由并作为新 Room 的只读挂载；旧 Room 的配置可用于恢复。
