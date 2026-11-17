@@ -201,6 +201,7 @@ def build_role_contract(
             **ENCODER_ENV,
             **CONDITIONING_ENV,
             "NCCL_GRAPH_REGISTER": "0",
+            "SGLANG_ZING_SOURCE_PREPARE": "1",
             "SGLANG_ZING_SOURCE_PROMPT_JOINT": "1",
         }
         defaults["--session-max-lifetime-s"] = server_policy(profile)[

@@ -20,7 +20,7 @@ from prometheus_client import (
     generate_latest,
 )
 
-from sglang.multimodal_gen.runtime.realtime.whitebox.telemetry import (
+from sglang.multimodal_gen.runtime.realtime.chunk_telemetry import (
     CHUNK_FIELDS,
     CLI_STARTUP_STAGES,
     TTFF_METRIC_STAGES,

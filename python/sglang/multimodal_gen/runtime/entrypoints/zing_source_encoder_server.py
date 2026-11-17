@@ -645,6 +645,11 @@ class SourceEncoderExecutor:
         options = batch.extra["zing_prefill"]
         command = batch.extra["zing_source_command"]
         command["appends"] = [{"payload": {"data": options["source_frame"]}}]
+        if options.get("source_frame_size"):
+            command["startup"] = {
+                "rgb": options["source_frame"],
+                **options["source_frame_size"],
+            }
         try:
             with (
                 torch.inference_mode(),

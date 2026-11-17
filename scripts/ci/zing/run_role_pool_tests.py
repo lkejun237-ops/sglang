@@ -27,6 +27,8 @@ for name in (
 import pytest
 
 TESTS = [
+    "python/sglang/multimodal_gen/test/unit/realtime/test_sglang_whitebox_boundary.py",
+    "python/sglang/multimodal_gen/test/unit/realtime/test_golden_wire_parity.py",
     "python/sglang/multimodal_gen/test/unit/realtime/test_role_pool.py",
     "python/sglang/multimodal_gen/test/unit/realtime/test_role_pool_transport.py",
     "python/sglang/multimodal_gen/test/unit/realtime/test_worker_connections.py",

@@ -467,7 +467,7 @@ def _emit_realtime_result_stage_traces(
 
 
 def _collect_realtime_result_stage_metrics(result: Any) -> dict[str, float]:
-    from sglang.multimodal_gen.runtime.realtime.whitebox.telemetry import (
+    from sglang.multimodal_gen.runtime.realtime.chunk_telemetry import (
         h3_host_durations,
     )
 

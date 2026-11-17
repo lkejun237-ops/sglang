@@ -130,6 +130,7 @@ def test_encoder_owns_qwen_and_vae_options_without_dit_graphs():
     for key in launcher.CONDITIONING_ENV:
         assert env[key] == "1"
     assert env["MINIMAX_H3_PROGRESSIVE_ENCODER_TILING"] == "auto"
+    assert env["SGLANG_ZING_SOURCE_PREPARE"] == "1"
     assert not any(k.startswith("SGLANG_ZING_DENOISE") for k in env)
     assert contract("decoder")["environment"] == {}
     dit = contract("dit")["environment"]

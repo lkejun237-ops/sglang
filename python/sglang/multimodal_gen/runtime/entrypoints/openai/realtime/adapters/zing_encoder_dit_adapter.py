@@ -513,7 +513,7 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
                 )
             )
         for report in result.realtime_handoff.get("cache_reports", []):
-            from sglang.multimodal_gen.runtime.realtime.whitebox.cache_receipt import (
+            from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
                 public_cache_receipt,
             )
 

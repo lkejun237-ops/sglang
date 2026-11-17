@@ -1389,11 +1389,11 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             or not getattr(self, "condition_switch_protocol", None)
         ):
             raise ValueError("Deferred KV readiness is not supported by this session")
-        from sglang.multimodal_gen.runtime.realtime.whitebox.render_contract import (
-            prompt_text,
+        from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
+            validate_prompt_text,
         )
 
-        prompt_text(payload["text"])
+        validate_prompt_text(payload["text"])
         target, version = payload["min_source_frame"], payload["version"]
         if (
             self.prompt_inflight is not None
@@ -1999,7 +1999,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         sub_batch = copy(batch)
         sub_batch.extra = {**batch.extra, "zing_source_output_blocks": source_blocks}
         total = await super().send_output(ws, session, result, sub_batch)
-        from sglang.multimodal_gen.runtime.realtime.whitebox.cache_receipt import (
+        from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
             public_cache_receipt,
         )
 

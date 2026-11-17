@@ -344,3 +344,98 @@ def test_encoder_update_keys_match_prefill_after_applied_reference_replacement()
     assert queries[-1] == preparation_key(
         codecs, request("p3", "first"), None, config, {}
     )
+
+
+def test_encoder_prefill_honors_source_frame_size_and_matches_startup_key():
+    from types import SimpleNamespace as NS
+
+    import torch
+
+    from sglang.multimodal_gen.runtime.entrypoints.zing_source_encoder_server import (
+        EncoderConditioning,
+        SourceEncoderExecutor,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.dit_preparation import (
+        prepared_message,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.packing import (
+        H3InferenceInputs,
+    )
+
+    prepared = H3InferenceInputs(
+        output_type="video",
+        conditions=[],
+        media=[],
+        positive={
+            "context": torch.ones(2, 4),
+            "row_role": torch.zeros(2, dtype=torch.int64),
+        },
+        visual={"reference": torch.ones(1, 2, 1, 2, 2)},
+        audio={},
+        source_visual=None,
+        visual_shape=(1, 2, 2),
+        audio_shape=None,
+        pixel_frame_count=1,
+        sample_count=None,
+        sample_rate=24000,
+        condition_media=[],
+    )
+    codecs = NS(
+        spatial_ratio=8,
+        encode_condition=lambda *args: None,
+        modules={"video_vae": torch.nn.Linear(1, 1)},
+    )
+    seen_keys = []
+
+    class Link:
+        def cache_control(self, operation, **arguments):
+            if operation == "identity":
+                return {"identity": {}}
+            if operation == "lookup":
+                seen_keys.append(arguments["cache_key"])
+                return {"hit": True, "inputs": prepared_message(prepared)}
+            assert operation == "prefill"
+            return {
+                "cache_key": arguments["cache_key"],
+                "hit": True,
+                "entries": 1,
+                "evictions": 0,
+            }
+
+    # Unpadded 4x2 RGB24 snapshot (24 bytes) while target config is 16x16 (768 bytes)
+    raw_rgb = bytes(range(24))
+    config = {"width": 16, "height": 16, "fps": 24}
+    req = {"prompt": "p", "media": [], "conditions": []}
+
+    prefill_cond = EncoderConditioning(codecs)
+    executor = SourceEncoderExecutor(codecs, conditioning=prefill_cond, dit_link=Link())
+    prefill_batch = NS(
+        sampling_params=NS(prompt="p", zing_request=req),
+        realtime_event_id=1,
+        extra={
+            "zing_prefill": {
+                "source_frame": raw_rgb,
+                "source_frame_size": {"width": 4, "height": 2},
+                "force": False,
+                "game_id": "game",
+            },
+            "zing_source_command": {"config": dict(config)},
+        },
+    )
+    out = executor.forward([prefill_batch])
+    assert out.usage["zing_prefill"]["hit"] is True
+
+    startup_cond = EncoderConditioning(codecs)
+    startup_cond.cache_query = Link().cache_control
+    startup_batch = NS(
+        sampling_params=NS(prompt="p", zing_request=req),
+        realtime_event_id=1,
+        extra={
+            "zing_source_command": {
+                "config": dict(config),
+                "startup": {"rgb": raw_rgb, "width": 4, "height": 2},
+            }
+        },
+    )
+    startup_cond.forward(startup_batch)
+    assert len(seen_keys) == 2 and seen_keys[0] == seen_keys[1]
