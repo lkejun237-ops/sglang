@@ -4,7 +4,23 @@ SGLang 的生产源码分支使用 `main`。本仓库 PR CI 执行测试；云�
 Worldkit CLI/Stream Host 使用其 `dev` 分支可达的不可变提交，无需先合入 SDK 的 `white_box` 分支。
 手工构建器和 Jenkins 都会校验提交的祖先关系；`sdk-revision.txt` 独立于 SGLang `main` 提交固定 SDK 的精确源码版本。
 
-Room SDK pin `fc2adae7e6f79f9f2dc0c45afc6f5668f6472a00` includes the
+Room SDK pin `4ed1d009456723de747777546a01818d1075c0ce` includes
+[Worldkit #1285](https://github.com/seedleap/worldkit-monorepo/pull/1285).
+An ordinary device input waiting for capacity could fail player media with
+`PLAYER_INPUT_CAPACITY_TIMEOUT` before sampling or dispatch when a previous,
+already-consumed input RPC reply was delayed. The Host now coalesces that unsent
+wait while retaining mapper state; dispatched failures, action deadlines and
+release/binding fences retain their existing semantics.
+The SDK regression used two native browser members and a 3.5-second consumed-input
+reply delay: the old code ended the first source; the fix kept both sources and
+subsequent independent controls usable. This is a controlled reproduction, not
+proof of the cause of online RPC latency. The pin advances from `c79f1e057135ce648653d322327eafb0bffb909f`
+and also includes intervening SDK dev changes; it is not an isolated backport.
+Only newly built Room images consume this pin. Image/native-component gates and
+acceptance on the verified `test-shanghai-copy` route remain pending; this change
+does not deploy services, change GPU routing or update existing members.
+
+Historical Room SDK pin `fc2adae7e6f79f9f2dc0c45afc6f5668f6472a00` includes the
 [Worldkit #1268](https://github.com/seedleap/worldkit-monorepo/pull/1268)
 connection-lifecycle fix. It fences proven unsent input during socket shutdown
 without terminating the member source; sent or uncertain failures remain errors.
