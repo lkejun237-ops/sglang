@@ -373,19 +373,10 @@ def install_gateway_room_control(app, proxy, *, verifier=None):
                     or not route["owner_epoch"]
                 ):
                     raise ValueError("The original ended owner is unavailable")
-                op = body["createContext"]["operation"]
                 # control_route has verified the original caller and complete
-                # invocation. Ended is a routing fence, never a cleanup receipt.
-                return JSONResponse(
-                    dict(
-                        operationId=op["operationId"],
-                        parametersSha256=op["parametersSha256"],
-                        status="failed",
-                        errorCode="ROOM_ENDED",
-                        cleanupComplete=False,
-                    ),
-                    headers={"Cache-Control": "no-store"},
-                )
+                # invocation. Ended fences new work, but the original Room can
+                # still retain its failure and positive cleanup receipt. Query
+                # that owner below; the route alone proves neither outcome.
             response = await proxy.client.post(
                 origin.rstrip("/") + "/internal/room-control",
                 json={"verifiedCaller": caller, "request": body, "route": route},

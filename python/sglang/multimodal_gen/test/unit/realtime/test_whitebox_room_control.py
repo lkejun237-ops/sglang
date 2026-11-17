@@ -1089,7 +1089,7 @@ def test_production_composition_preserves_ordinary_room_arguments_and_cleanup(
 @pytest.mark.parametrize(
     "route_state", ["ended", "active", "expired", "missing", "wrong-world", "no-owner"]
 )
-def test_gateway_observes_exact_ended_operation_without_claiming_cleanup(route_state):
+def test_gateway_queries_exact_ended_owner_without_claiming_cleanup(route_state):
     async def run():
         directory = RoomDirectory(MemoryRoomStore(), {"a": "http://room"})
         body = request_body()
@@ -1138,21 +1138,215 @@ def test_gateway_observes_exact_ended_operation_without_claiming_cleanup(route_s
                     headers={"Authorization": "Bearer " + ticket(raw)},
                 )
                 if route_state == "ended":
-                    assert result.json() == dict(
-                        operationId="op-original",
-                        parametersSha256="a" * 64,
-                        status="failed",
-                        errorCode="ROOM_ENDED",
-                        cleanupComplete=False,
-                    )
-                    assert calls == []
+                    assert result.json() == {"status": "unknown"}
+                    assert len(calls) == 1
+                    assert calls[0].url == "http://room/internal/room-control"
+                    assert json.loads(calls[0].content)["request"] == query
                 else:
                     assert result.json().get("errorCode") != "ROOM_ENDED"
-                    if route_state == "expired":
+                    if route_state in {"expired", "missing"}:
                         assert result.json()["status"] == "unknown"
+                        assert calls == []
+                    elif route_state in {"wrong-world", "no-owner"}:
+                        assert result.status_code == 409
                         assert calls == []
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "failure", ["cleaned", "unconfirmed", "unreachable", "restarted"]
+)
+@pytest.mark.parametrize(
+    "path", ["/v1/whitebox/room-control", "/backends/minwm/v1/whitebox/room-control"]
+)
+def test_gateway_reads_original_failed_room_cleanup_receipt(tmp_path, failure, path):
+    from sglang.multimodal_gen.runtime.realtime.whitebox.contracts import VideoSpec
+    from sglang.multimodal_gen.runtime.realtime.whitebox.room_runtime import (
+        RoomRuntime,
+        create_app,
+    )
+    from sglang.multimodal_gen.runtime.realtime.whitebox.room_startup import (
+        FactoryCleanupReceipt,
+        startup_cleanup_error,
+    )
+
+    async def run():
+        starts = []
+
+        async def factory(**kwargs):
+            starts.append(kwargs)
+            error = ValueError("The original CLI failed to start")
+            if failure == "unconfirmed":
+                raise error
+            raise startup_cleanup_error(
+                error, FactoryCleanupReceipt(kwargs["trace_id"])
+            )
+
+        directory = RoomDirectory(MemoryRoomStore(), {"a": "http://room"})
+        runtime = RoomRuntime(
+            directory=directory,
+            owner_id="a",
+            driver_factory=factory,
+            spool=tmp_path / "original",
+            spec=VideoSpec(32, 32),
+        )
+        room_app = create_app(runtime, "internal")
+        replacement = None
+        calls = []
+        try:
+            body = request_body()
+            # Match the WTP journal's original subject/kind/request identity.
+            operation = body["createContext"]["operation"]
+            operation["operationId"] = (
+                "op-"
+                + hashlib.sha256(
+                    json.dumps(
+                        [CALLER["subject"], "createRoom", operation["requestId"]],
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest()
+            )
+            route = await directory.control_route(CALLER, body, create=True)
+            await runtime.control.handle(CALLER, body, route)
+            await runtime.control.drain()
+            ended = await directory.lookup(route["game_id"])
+            assert ended["status"] == "ended"
+            assert ended["owner_epoch"] == runtime.epoch
+            assert len(starts) == 1
+
+            if failure == "restarted":
+                replacement = RoomRuntime(
+                    directory=directory,
+                    owner_id="a",
+                    driver_factory=factory,
+                    spool=tmp_path / "replacement",
+                    spec=VideoSpec(32, 32),
+                )
+                assert replacement.epoch != runtime.epoch
+                room_app = create_app(replacement, "internal")
+
+            async def observe(request):
+                calls.append(json.loads(request.content))
+
+            def unreachable(request):
+                raise httpx.ConnectError(
+                    "The original owner is unavailable", request=request
+                )
+
+            transport = (
+                httpx.MockTransport(unreachable)
+                if failure == "unreachable"
+                else httpx.ASGITransport(room_app)
+            )
+            async with httpx.AsyncClient(
+                transport=transport, event_hooks={"request": [observe]}
+            ) as backend:
+                gateway = FastAPI()
+                install_gateway_room_control(
+                    gateway,
+                    SimpleNamespace(
+                        directory=directory,
+                        owners={"a": "http://room"},
+                        token="internal",
+                        client=backend,
+                    ),
+                    verifier=RoomControlCapabilities(SECRET, {"wtp"}, now=lambda: 100),
+                )
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(gateway), base_url="http://gateway"
+                ) as client:
+                    query = {**body, "action": "getOperation"}
+                    raw = json.dumps(query).encode()
+                    for index in range(1, 3):
+                        response = await client.post(
+                            path,
+                            content=raw,
+                            headers={
+                                "Authorization": "Bearer "
+                                + ticket(raw, jti=f"{index:032x}")
+                            },
+                        )
+                        assert response.status_code == 200
+                        expected = {
+                            "operationId": operation["operationId"],
+                            "parametersSha256": "a" * 64,
+                            "status": "unknown",
+                        }
+                        if failure == "cleaned":
+                            expected.update(
+                                status="failed",
+                                cleanupComplete=True,
+                                errorCode="CLI_STARTUP_FAILED",
+                            )
+                        assert response.json() == expected
+            assert len(calls) == 2
+            assert all(
+                call == {"verifiedCaller": CALLER, "request": query, "route": ended}
+                for call in calls
+            )
+            assert len(starts) == 1  # Queries never restart the failed CLI.
+            assert not runtime.rooms and not runtime.players
+            if failure == "cleaned":
+                _check_wtp_failed_room_receipt(body, response.json())
+        finally:
+            if replacement is not None:
+                await replacement.close()
+            await runtime.close()
+
+    asyncio.run(run())
+
+
+def _check_wtp_failed_room_receipt(body, outcome):
+    """Opt-in consumer check against the actual, explicitly selected WTP source."""
+    import os
+    import subprocess
+
+    root = os.environ.get("WHITEBOX_TEST_WTP_ROOT")
+    if not root:
+        return
+    subprocess.run(
+        ["node", "--input-type=module", "-", root],
+        input="""
+import assert from 'node:assert/strict';
+import {pathToFileURL} from 'node:url';
+const root=process.argv[2];
+const load=name=>import(pathToFileURL(`${root}/server/${name}.mjs`));
+const {createMultiplayerRoomControl}=await load('multiplayer-room-control');
+const {createMultiplayerControlOperations}=await load('multiplayer-control-operations');
+const {memoryDocuments}=await load('interactive-production-test-helper');
+const {body,outcome}=JSON.parse(process.env.WHITEBOX_TEST_ROOM_RECEIPT);
+const subject='intranet:browser-a', op=body.createContext.operation;
+const operations=createMultiplayerControlOperations({documents:memoryDocuments()});
+const begun=await operations.begin({subject,kind:'createRoom',requestId:op.requestId,
+ parameters:{selector:body.createContext.frozenPublication.world,videoSpec:body.videoSpec,cliFps:body.cliFps}});
+assert.equal(begun.operation.operationId,outcome.operationId);
+const identity={subject,operationId:outcome.operationId};
+await operations.freeze({...identity,context:{createContext:body.createContext}});
+await operations.issue(identity);
+await operations.settle({...identity,status:'unknown',errorCode:'RUNTIME_RESULT_UNKNOWN'});
+let queries=0;
+const forbidden=()=>{throw Error('Observation must not create another Room');};
+const service=createMultiplayerRoomControl({operations,serviceId:'wtp',
+ content:{prepare:forbidden},runtime:{create:forbidden,getOperation:async()=>{queries++;return outcome;}},
+ authorize:async()=>true,normalizeOptions:forbidden});
+const result=await service.getOperation(identity);
+assert.equal(result.operation.status,'failed');
+assert.equal(result.operation.errorCode,'CLI_STARTUP_FAILED');
+assert.equal(result.cleanupRequired,undefined);
+assert.equal((await operations.readPrivate(identity)).retirementConfirmed,true);
+assert.deepEqual(await service.getOperation(identity),result);
+assert.equal(queries,1);
+""",
+        text=True,
+        check=True,
+        env={
+            **os.environ,
+            "WHITEBOX_TEST_ROOM_RECEIPT": json.dumps(
+                {"body": body, "outcome": outcome}
+            ),
+        },
+    )
 
 
 def test_ended_admission_requires_original_caller_binding_and_owner():
