@@ -6,6 +6,7 @@ from copy import copy
 from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
 from sglang.multimodal_gen.runtime.realtime.zing_kv_pool import ZingKVPoolAdmissionError
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.zing_ttff_timing import measure
 
 logger = init_logger(__name__)
 _CAPACITY_MESSAGE = "This request is too large. Try fewer images or a shorter prompt."
@@ -20,6 +21,7 @@ def prepare_prompt_update(
     use_component,
     conditioning,
     prefix_latent_frames=5,
+    preparation_metrics=None,
 ):
     """Return Qwen features and an optional complete reference replacement."""
     if "references" in command:
@@ -34,9 +36,11 @@ def prepare_prompt_update(
             prompt,
             use_component,
             conditioning=conditioning,
+            preparation_metrics=preparation_metrics,
         )
         return candidate.positive, candidate
-    return conditioning(prompt, inputs.condition_media), None
+    with measure(preparation_metrics, "qwen_prepare"):
+        return conditioning(prompt, inputs.condition_media), None
 
 
 def admit_prompt_update(
@@ -48,6 +52,7 @@ def admit_prompt_update(
     source_shape,
     total_frames=None,
     prompt_update=True,
+    prompt_joint=None,
 ):
     """Check capacity before a prepared condition can replace active KV."""
     if getattr(stage, "kv_pool", None) is None:
@@ -75,7 +80,9 @@ def admit_prompt_update(
             prompt_prefix_frames=ZingH3Packer.PROMPT_SWITCH_PREFIX_FRAMES
             if prompt_update
             else 0,
-            prompt_joint=getattr(sampler, "prompt_joint", False),
+            prompt_joint=getattr(sampler, "prompt_joint", False)
+            if prompt_joint is None
+            else prompt_joint,
         )
     except ZingKVPoolAdmissionError as exc:
         logger.warning("Prompt update rejected by KV pool: %s", exc.detail)

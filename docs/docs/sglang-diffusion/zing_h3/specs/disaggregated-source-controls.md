@@ -18,6 +18,24 @@ Identical complete conditions can reuse the resident prefix and report
 `bypass`. Different conditions use their own Block0 and candidate references.
 The first RGB bearing the new version confirms application.
 
+The optional deferred-KV protocol keeps `kv_ready` unchanged. An Encoder advertising
+`source_condition_deferred_kv=true` accepts `allow_deferred_kv=true` on a clip-barrier
+prompt update. When the DiT's prompt-joint policy is enabled, it freezes history at
+the boundary and returns `conditioning.ready(kv_deferred=true)`, translated to
+`control_ack(state=source_ready)`. Room resumes fresh source on this receipt; KV
+materialization and the joint first step happen after that source arrives.
+`source_ready` does not mean KV completion or prompt application. Only the matching
+new-version output confirms application. CUDA dependencies and SP receipt agreement
+still complete before readiness. No capability/request means the original serial
+barrier, including mixed-version Room/Encoder/DiT deployments. Resident-prefix
+reuse may finish synchronously and still return `kv_ready`.
+
+Standalone DiT CLI `--zing-source-prompt-joint` / `--no-zing-source-prompt-joint`
+overrides `SGLANG_ZING_SOURCE_PROMPT_JOINT`; its unconfigured default is false.
+This differs from integrated ServerArgs defaults. Real joint execution still
+requires supported source/target layout; unsupported layouts use existing fallback.
+See [design and validation](../../zing/plans/serving-ttff-breakdown.md).
+
 `source.prepare` v1/v2 uses the existing immutable preview/identity contract.
 Encoder prepares the original Qwen/reference condition and waits for the connected
 DiT's confirmation. `source.prepared(level=condition)` is not an assertion that a
@@ -66,6 +84,16 @@ configuration switch substitutes for the missing native protocol implementation.
 
 Current implementation work has CPU protocol evidence. GPU/SP2, real-game media
 and ten-entry resident-hit acceptance remain pending until recorded in the PR.
+
+
+### 按模型会话开启详细计时
+
+模型 init 可选 `detailed_timing`（严格 boolean，默认 false）。Encoder 将该值写入自己的
+source config 和 DiT session.open；DiT 的 Decoder output_session 原样携带该值。每个
+角色在会话内固定读取，下一会话重新取值；不允许 prompt.update 临时改变采样策略。
+关闭时不创建本 PR 详细 timing/CUDA events，不发送 model.timing；已有 cache 回执与
+执行 fence 保持原逻辑。Room 的基础成功 TTFF 不依赖此开关。开启不保证旧角色具备埋点，
+缺失保持显式，部署需配套三角色。见 [TTFF 方案](../../zing/plans/serving-ttff-breakdown.md)。
 
 ## Request-scoped frame latency diagnostics
 

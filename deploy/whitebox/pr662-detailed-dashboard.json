@@ -1,0 +1,487 @@
+{
+  "uid": "sglang-test-pr662-detailed-timing",
+  "title": "上海测试 · PR #662 首帧与 Prompt 切换详细分时",
+  "schemaVersion": 38,
+  "version": 0,
+  "timezone": "browser",
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "tags": [
+    "test-shanghai-copy",
+    "pr662"
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "title": "首帧：Room 端平均等待（5 分钟窗口）",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "whitebox-sh-native"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1000 * sum(rate(world_model_critical_path_stage_duration_seconds_sum{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=\"whitebox_ttff_initial_room_host_segment_setup_to_first_rgb\"}[5m])) / sum(rate(world_model_critical_path_stage_duration_seconds_count{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=\"whitebox_ttff_initial_room_host_segment_setup_to_first_rgb\"}[5m]))",
+          "legendFormat": "{{stage}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Prompt 切换：Room 端平均等待（5 分钟窗口）",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "whitebox-sh-native"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1000 * sum(rate(world_model_critical_path_stage_duration_seconds_sum{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=\"whitebox_ttff_prompt_switch_room_host_room_accept_to_first_rgb\"}[5m])) / sum(rate(world_model_critical_path_stage_duration_seconds_count{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=\"whitebox_ttff_prompt_switch_room_host_room_accept_to_first_rgb\"}[5m]))",
+          "legendFormat": "{{stage}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "首帧 · 其他链路 / Room 分时均值",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "whitebox-sh-native"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1000 * sum by (stage) (rate(world_model_critical_path_stage_duration_seconds_sum{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=~\"whitebox_ttff_initial_room_.*\"}[5m])) / sum by (stage) (rate(world_model_critical_path_stage_duration_seconds_count{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=~\"whitebox_ttff_initial_room_.*\"}[5m]))",
+          "legendFormat": "{{stage}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "切换 · 其他链路 / Room 分时均值",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "whitebox-sh-native"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1000 * sum by (stage) (rate(world_model_critical_path_stage_duration_seconds_sum{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=~\"whitebox_ttff_prompt_switch_room_.*\"}[5m])) / sum by (stage) (rate(world_model_critical_path_stage_duration_seconds_count{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=~\"whitebox_ttff_prompt_switch_room_.*\"}[5m]))",
+          "legendFormat": "{{stage}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "首帧 · Encoder 分时均值",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "whitebox-sh-native"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1000 * sum by (stage) (rate(world_model_critical_path_stage_duration_seconds_sum{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=~\"whitebox_ttff_initial_encoder_.*\"}[5m])) / sum by (stage) (rate(world_model_critical_path_stage_duration_seconds_count{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=~\"whitebox_ttff_initial_encoder_.*\"}[5m]))",
+          "legendFormat": "{{stage}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "切换 · Encoder 分时均值",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "whitebox-sh-native"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1000 * sum by (stage) (rate(world_model_critical_path_stage_duration_seconds_sum{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=~\"whitebox_ttff_prompt_switch_encoder_.*\"}[5m])) / sum by (stage) (rate(world_model_critical_path_stage_duration_seconds_count{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=~\"whitebox_ttff_prompt_switch_encoder_.*\"}[5m]))",
+          "legendFormat": "{{stage}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "title": "首帧 · DiT 分时均值",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "whitebox-sh-native"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 27
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1000 * sum by (stage) (rate(world_model_critical_path_stage_duration_seconds_sum{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=~\"whitebox_ttff_initial_dit_.*\"}[5m])) / sum by (stage) (rate(world_model_critical_path_stage_duration_seconds_count{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=~\"whitebox_ttff_initial_dit_.*\"}[5m]))",
+          "legendFormat": "{{stage}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "切换 · DiT 分时均值",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "whitebox-sh-native"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 27
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1000 * sum by (stage) (rate(world_model_critical_path_stage_duration_seconds_sum{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=~\"whitebox_ttff_prompt_switch_dit_.*\"}[5m])) / sum by (stage) (rate(world_model_critical_path_stage_duration_seconds_count{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=~\"whitebox_ttff_prompt_switch_dit_.*\"}[5m]))",
+          "legendFormat": "{{stage}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "title": "首帧 · Decoder 分时均值",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "whitebox-sh-native"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 36
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1000 * sum by (stage) (rate(world_model_critical_path_stage_duration_seconds_sum{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=~\"whitebox_ttff_initial_decoder_.*\"}[5m])) / sum by (stage) (rate(world_model_critical_path_stage_duration_seconds_count{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=~\"whitebox_ttff_initial_decoder_.*\"}[5m]))",
+          "legendFormat": "{{stage}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "切换 · Decoder 分时均值",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "whitebox-sh-native"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 36
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1000 * sum by (stage) (rate(world_model_critical_path_stage_duration_seconds_sum{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=~\"whitebox_ttff_prompt_switch_decoder_.*\"}[5m])) / sum by (stage) (rate(world_model_critical_path_stage_duration_seconds_count{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=~\"whitebox_ttff_prompt_switch_decoder_.*\"}[5m]))",
+          "legendFormat": "{{stage}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "title": "首帧 · 当前进程累计分时均值（含无操作会话，非逐 case）",
+      "type": "table",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "whitebox-sh-native"
+      },
+      "gridPos": {
+        "h": 14,
+        "w": 12,
+        "x": 0,
+        "y": 45
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1000 * sum by (stage) (world_model_critical_path_stage_duration_seconds_sum{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=~\"whitebox_ttff_initial_.*\"}) / sum by (stage) (world_model_critical_path_stage_duration_seconds_count{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=~\"whitebox_ttff_initial_.*\"})",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Value"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "id": 12,
+      "title": "切换 · 当前进程累计分时均值（含无操作会话，非逐 case）",
+      "type": "table",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "whitebox-sh-native"
+      },
+      "gridPos": {
+        "h": 14,
+        "w": 12,
+        "x": 12,
+        "y": 45
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1000 * sum by (stage) (world_model_critical_path_stage_duration_seconds_sum{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=~\"whitebox_ttff_prompt_switch_.*\"}) / sum by (stage) (world_model_critical_path_stage_duration_seconds_count{business_line_id=\"world-model-data\",region=\"cn-shanghai\",pool=\"test-shanghai-copy\",service=\"room\",result=\"success\",stage=~\"whitebox_ttff_prompt_switch_.*\"})",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Value"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true
+      }
+    }
+  ],
+  "description": "真实 Prometheus 数据，无固定值补位。Host/CUDA 与嵌套分项不得相加；无新会话时 5 分钟 rate 无样本属正常。 底部累计表用于首次接入后查看既有计数均值，不重建历史时间线，也不按 world/trace 过滤。"
+}

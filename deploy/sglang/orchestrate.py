@@ -511,10 +511,6 @@ def validate_spec(spec, isolated=True, launch_module=launch):
         if mode not in (None, "create", "reuse"):
             raise ValueError(f"Unsupported role mode '{mode}' for {role}")
         if mode == "reuse":
-            if role == "dit":
-                raise ValueError(
-                    "existing_services may only reuse encoder and/or decoder"
-                )
             if role not in existing:
                 existing = dict(existing)
                 spec["existing_services"] = existing
@@ -534,8 +530,8 @@ def validate_spec(spec, isolated=True, launch_module=launch):
                     if k in cfg
                 }
             roles_dict.pop(role, None)
-    if set(existing) - {"encoder", "decoder"}:
-        raise ValueError("existing_services may only reuse encoder and/or decoder")
+    if set(existing) - set(ROLES):
+        raise ValueError("Unknown existing service role")
     owned = owned_roles(spec)
     if (
         spec.get("model_id")
@@ -573,6 +569,17 @@ def validate_spec(spec, isolated=True, launch_module=launch):
             or not entry["worker_id"]
         ):
             raise ValueError("Invalid existing service specification")
+        count = entry.get("service_count", 1)
+        # A retry may keep its DiT in the creating run while the original run
+        # owns E/D. Pin the single-GPU PAI identity; never claim its ownership.
+        if role == "dit" and (
+            entry.get("pai") is not True
+            or not entry.get("job_id")
+            or not entry.get("job_name")
+            or count != 1
+            or entry.get("service_index", 0) != 0
+        ):
+            raise ValueError("DiT reuse requires a pinned single-service PAI job")
         if ("job_id" in entry or "job_name" in entry) and (
             not entry.get("pai")
             or not isinstance(entry.get("job_id"), str)
@@ -585,7 +592,6 @@ def validate_spec(spec, isolated=True, launch_module=launch):
             raise ValueError(
                 "Pinned PAI existing service requires pai=true and non-empty job_id"
             )
-        count = entry.get("service_count", 1)
         idx = entry.get("service_index", 0)
         if (
             type(count) is not int
@@ -2131,6 +2137,32 @@ def wait_ready(state, directory, cloud):
                         cloud=cloud,
                     )
                     service = conn.get("service", {})
+                    if not service and resource.get("pai") and resource.get("job_id"):
+                        # Native non-reserving queries intentionally omit descriptors.
+                        # Authenticate the endpoint against its pinned PAI job instead
+                        # of acquiring a lease from a read-only inspection.
+                        pinned = {**resource, "name": reused_job["DisplayName"]}
+                        verify_job(reused_job, pinned, target)
+                        observed = cloud.receipt(pinned, role)
+                        validate_endpoint(
+                            observed["http"], role, pai=True, target=target
+                        )
+                        endpoints = service_endpoints(
+                            observed["http"], resource.get("service_count", 1)
+                        )
+                        if (
+                            observed.get("worker_id") != receipt["worker_id"]
+                            or observed.get("role") != role
+                            or observed.get("model_id") != receipt["model_id"]
+                            or observed.get("status") != "ready"
+                            or endpoints[resource.get("service_index", 0)]
+                            != receipt["http"]
+                        ):
+                            raise ValueError(
+                                "Reused PAI receipt does not match the service"
+                            )
+                        receipt.update(observed, http=receipt["http"])
+                        service = observed
                     if (
                         service.get("worker_id") != receipt["worker_id"]
                         or service.get("role") != role

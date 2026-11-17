@@ -8,6 +8,49 @@ description: "供 Codex 与部署同学使用的 H100/H200/B300 部署决策、�
 下面是已有部署经验，只有对应版本、输入和配置的实测结论；
 实验补丁、显存快照、未验收画质均单独标注。新部署先选择一行，再沿证据入口取得原配置。
 
+## 生产 TTFF 分时观测（2026-11-10，代码候选，未部署）
+
+新增分离 Encoder/DiT/Decoder 的首输出与条件切换阶段计时、Room 等待分解、
+逐版本 cache/计时追加归档和离线 CSV 导出。Host 与 CUDA stream 区间分别记录，
+异步查询 event，计时热路径不新增同步或 SP collective；重叠区间不得相加作为 TTFF。
+实现与字段口径见 [生产 TTFF 分时观测](plans/serving-ttff-breakdown.md)。
+条件切换另补 Room journal 接纳至首 RGB 的六段路径、逐段覆盖率与分位数；
+客户端发送起点按 #662 范围明确待接入，不能将 Room 总窗口称为客户端 TTFF。
+2026-11-11 reviewer 修订：基础首帧/切换总窗口常开；详细角色计时和 JSONL 归档改为
+render 请求 `detailed_timing=true` 显式开启，默认关闭。开关沿分离三角色的会话传递，
+下一 render 重新取值。可选计时缓冲与必需视频/参考图的容量和确认序号隔离。
+2026-11-13 增补当前 segment 的 `model.timing.configure` 动态覆盖：原控制连接上按
+session/generation 与 timing revision 校验，三角色确认生效边界；无需为了切换当前
+会话再重启 Room。旧角色未声明能力时拒绝；新世界完整首帧仍需创建时开启。
+本次还合入 #687 的 remote conditioning prefix 聚合指标，部署同一源码可共同验证；
+独立 Encoder 本地 Qwen 不自动提供该指标，须确认实际 conditioning 拓扑与采集绑定。
+该新增控制需要 Room、Encoder、DiT、Decoder 配套升级，目前未部署；动态切换瞬间的
+调度开销、480/736 三角色耗时/显存、SP/NCCL 和真实模型效果尚未实测。详见同一设计文档。
+复用已有上海、泰国和副本 Grafana 看板的 region/pool/service 标签，不另建看板。
+实际请求方式、分时口径、查询和验证状态见上述方案；历史版本 CPU 结果不替代新版本验证。
+
+已有候选的上海副本试玩见本页 2026-11-12 A/B 条目；本轮动态控制尚未部署。
+详细计时 on/off 与 prompt-joint on/off 必须分组做同条件 A/B；
+H100/H200/B300、480/736 三角色耗时/显存、CUDA Graph/SP、观测开销和线上采集均未验收。
+
+2026-11-16 现场补充：上海副本 Room `bf5371c0d26c` 已确认动态开关三角色回执，
+但 OSS 流式归档漏消费独立计时队列，导致 JSONL 为空。#662 补齐消费/排空与失败释放，
+不改变模型或 metrics 接口；真实 spawned worker 与 HTTP 存储回归共 28 项通过。
+源码修复尚未表示 Room 已更新，GPU 开销本轮未测；现场与验证边界见
+[OSS 流式归档补齐](plans/serving-ttff-breakdown.md#oss-流式归档补齐2026-11-16)。
+
+## 分离式 Prompt 联合执行候选（2026-11-11）
+
+基于 main `2200bb3f` 补齐独立 DiT 的 prompt-joint 参数与生产切换屏障。
+独立 DiT 显式 `--zing-source-prompt-joint` / `--no-zing-source-prompt-joint` 优先于
+`SGLANG_ZING_SOURCE_PROMPT_JOINT`，未配置保持 false。Room/Encoder 须支持新的
+`source_ready` 协商，才能在 KV 尚待新 source 时恢复供帧；旧端保持串行 `kv_ready`。
+配置开启不等于联合命中，需核对 `forward_counts.prompt_joint` 与回退证据。
+本候选尚未部署，H100/H200/B300、SP/CUDA Graph、480/736 的 TTFF、三角色耗时和
+常驻/峰值显存均未测；不得套用旧离线加速比。部署前按同条件 baseline 补齐两档验收。
+[设计、兼容性与当前验证](plans/serving-ttff-breakdown.md)。
+
+
 2026-11-13 新增 Encoder 数值重排开关：`MINIMAX_H3_ENCODER_NUMERICAL_OPTIMIZATIONS=0`
 在 worker 启动前设置后，source/reference 回退原计算路径，关闭新快速引擎及旧 source 融合 GN；
 保留原 channels-last 策略和历史/padding 搬运。默认 `1` 保持已有行为。
@@ -2680,6 +2723,28 @@ OSS 内容寻址、本地安全解包和真实导入来源检查，以及上海 
 `deploy/sglang/orchestrate.py` 与 `deploy/sglang/launch.py` 统一通过 `sglang.multimodal_gen.tools.zing_h3_profile_launcher --mode independent` → `zing_h3_role_launcher.py` 启动各独立角色，集成式 bundle 通过 `deploy/whitebox/model_service.py` 委托 `zing_h3_profile_launcher --mode integrated`，移除用户侧 `role_launcher` 分支。支持参数化 `target` 环境配置（覆盖 H100 Encoder/Decoder + H200 SP1 DiT，以及 B300 三角色拓扑）、Encoder/Decoder `create`/`reuse` 混合编排与多 service 单活跃会话、自动生成 `deployment.json`/`DEPLOYMENT.md` 及 `history`/`show`/`diff`/`rollback` 受控回滚（契约见 `deploy/sglang/ORCHESTRATION.md`）。
 - **已实测范围（`test-shanghai-copy`，`832×480`，`model1027`）**：基于 `d180d0071dc3` 完成 H100 新建 Encoder + H200 新建 SP1 DiT + H100 复用常驻 Decoder（`adaptive-test-decoder-20261109-r2`）实机部署（`deploy-20261110T115739Z-88e645ef`）、Coordinator 租约 `selftest`、原地 `attach`、4-Case 真实生成（4/4 PASS）、真实 Chromium 浏览器首帧/按键/换词/正常结束/取消/单会话互斥/断连恢复及受控回滚演练（`deploy-20261110T181155Z-b99af6d7`），复用 Decoder 全程保持原 `boot_epoch`。
 - **当前未验证边界**：`test-shanghai-copy` Coordinator 当前仅注册 `480` 档，故 `1280×736` 档在本环境阻塞未测（不以 480 外推）；B300 三角色拓扑与 `h200_sp2` 档本轮仅完成源码与离线单测验证，尚未执行 B300 实机 GPU 部署验收。完整实机回执与浏览器证据见 [上海 `test-shanghai-copy` 实机验收记录](../../../../benchmark/whitebox/sglang_shanghai_copy_20261110.md)。
+
+#### PR #662 网页计时 A/B（2026-11-12，待完整验收）
+
+同一候选 Room 以 `WHITEBOX_DETAILED_TIMING=0` / `1` 分两轮部署；未传会话参数的
+网页试玩使用该默认值，显式 `detailed_timing` bool 优先。只切换 Room，三角色、模型、
+SDK 与有效联合配置保持不变。须等待当前 Room 游戏结束；保留两轮共同的基础 TTFF，
+不把未采集的详细分项当作零。当前新 H200 SP1 组三角色健康/自测/挂载通过，
+Room 完整业务、采集开销和736档仍未验证。入口：[设计与验证边界](plans/serving-ttff-breakdown.md)。
+
+### 2026-11-13：#662 独立 Encoder prefix 接线候选（未部署）
+
+独立 Encoder 可选复用本机已加载的 QwenPrefixCache，避免为当前三角色测试额外加载远端
+Qwen。`SGLANG_ZING_QWEN_PREFIX_BYTES=4294967296` 为本轮计划预算（每 service 4 GiB），
+默认 0 关闭；需按实际显存验收，不能由配置值推断命中。新管理 `/metrics` 使用专用只读
+Bearer 文件；与 render detailed_timing 独立。会话释放/失败清理与可观测口径见
+[接线设计](specs/conditioning-prefix-api.zh-CN.md#独立-encoder-接线方案2026-11-13开发中)。
+当前仅实现候选，CPU 回归进行中；GPU 480/736、完整三角色性能/显存与线上入库均未验收。
+
+
+### 2026-11-13｜PR #662 + #687 部署准备（未 GPU 验收）
+
+独立Encoder在已有Qwen模型内接入prefix，计划缓存预算4GiB；模型1027、480/SP1与联合设置保持原对照。候选 `b6d6945ee5b5` 的CPU回归97项通过，未启动GPU性能/显存对照；736未验证。FC采集代码与Grafana面板已发布，仍待测试采集角色的新只读命令授权和真实样本验收。现场Room已更新为main32d61，须保留新基线改动后接入详细计时，不能直接覆回旧Room。设计和现场边界见[conditioning prefix接线](specs/conditioning-prefix-api.zh-CN.md)。
 
 
 ### 2026-11-12 统一渐进输入输出与需求供帧（上海副本专项）

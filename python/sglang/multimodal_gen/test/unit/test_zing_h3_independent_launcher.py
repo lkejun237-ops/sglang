@@ -4,6 +4,7 @@
 import argparse
 import ast
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -53,6 +54,7 @@ def worker_parser(role):
     tree = ast.parse(path.read_text())
     namespace = {
         "argparse": argparse,
+        "os": os,
         "Path": Path,
         "__doc__": "worker parser contract",
     }

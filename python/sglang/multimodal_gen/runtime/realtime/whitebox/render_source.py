@@ -1661,6 +1661,12 @@ class SourceSession(InteractiveSession):
                 return
             if self.binding_ended or self.close_requested:
                 raise RenderError("LIMIT_EXCEEDED")
+            if op == "model.timing.configure":
+                current = self.current_segment
+                if current is None:
+                    raise RenderError("MODEL_UNAVAILABLE")
+                await current.timing_control.command(command)
+                return
             if op == "model.sink":
                 current = self.current_segment
                 if current is None:
@@ -2632,6 +2638,8 @@ class SourceSession(InteractiveSession):
         await self.outgoing.put(msgspec.msgpack.encode(message))
 
     async def segment_finished(self, segment, outcome, code):
+        if getattr(segment, "timing_control", None) is not None:
+            await segment.timing_control.finish()
         if getattr(segment, "sink", None) is not None:
             await segment.sink.finish()
         diagnostic = getattr(segment, "failure_diagnostic", {})
@@ -2769,7 +2777,8 @@ class SourceSession(InteractiveSession):
             before_send=remember,
         )
 
-    async def segment_model_control(self, segment, message):
+    async def segment_model_control(self, segment, message, *, received_at=None):
+        received_at = time.perf_counter() if received_at is None else received_at
         pending = segment.pending_prompt
         if pending is None or message.get("event_id") != pending["event_id"]:
             return False
@@ -2782,6 +2791,7 @@ class SourceSession(InteractiveSession):
                 "source_ready"
                 if getattr(segment, "condition_switch_protocol", None)
                 == CLIP_BARRIER_V2
+                or getattr(segment, "deferred_kv_ready", False)
                 else "kv_ready"
             )
             if message["state"] != expected:
@@ -2792,6 +2802,7 @@ class SourceSession(InteractiveSession):
                 boundary = switch["accepted"].result().get("source_frame_index")
             if switch and message.get("source_frame_index") == boundary:
                 if not switch["ready"].done():
+                    switch["ready_received_at"] = received_at
                     switch["ready"].set_result(message)
             return True
         if (
@@ -2800,6 +2811,7 @@ class SourceSession(InteractiveSession):
         ):
             switch = getattr(segment, "condition_switch", None)
             if switch and not switch["accepted"].done():
+                switch["accepted_received_at"] = received_at
                 switch["accepted"].set_result(message)
             accepted = message.get("state") == "accepted"
             if pending["strict"]:
@@ -2824,6 +2836,7 @@ class SourceSession(InteractiveSession):
         if message.get("type") == "error" and message.get("fatal") is False:
             switch = getattr(segment, "condition_switch", None)
             if switch and not switch["ready"].done():
+                switch["ready_received_at"] = received_at
                 switch["ready"].set_result({"state": "rejected"})
             result = await self.journal.prompt_failed(
                 segment.segment_id,

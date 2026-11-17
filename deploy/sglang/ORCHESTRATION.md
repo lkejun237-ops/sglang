@@ -114,9 +114,44 @@ python3 deploy/sglang/verify_traffic_quality.py run \
 
 ## 6. 验收边界
 
+PAI Encoder/Decoder 复用时可在 `existing_services.<role>` 固定 `pai: true`、
+`job_id` 和 `job_name`。旧版 native 的无预留查询只返回可用状态；编排器通过
+该作业的运行回执核对 worker、模型及 HTTP 地址，不为只读 inspect 取得租约。
+全 PAI 三角色自测使用目标中已配置的 Eflo CPU 节点和 Python 3.12，运行本工具
+配套的同一份标准 `worker_group_master.py`，不借用或重启他人的 GPU Pod。
+
+接入前必须从实际 Room/Coordinator 主机检查新角色 HTTP/WS 地址可达。
+创建成功或从 H100 节点可达不能替代这项检查。需要新增网络规则时，先保存
+源/目标 `/32`、逐个端口和本次资源归属的计划，只添加测试控制机与本次角色
+所需的私网规则；保存云端规则回执并复测，清理时只撤销本任务新增的规则。
+当前 `probe/up` 不自动配置安全组，不可把其成功误认为平台网络已通过。
+
 - `inspect` 与 `/health` 仅证明进程就绪与配置身份匹配，不代表通信组可建或业务出帧。
 - `selftest` 仅证明隔离通信组 `build → quiesce → destroy` 生命周期正常，不代表模型生成质量或帧率。
 - `attach` 仅证明角色已注册到 Coordinator 且路由容量可见，不代表 Room/WTP 真实浏览器 WebRTC 呈现通过；完整端到端验收需结合 4-Case 真实模型回归与浏览器出帧证据。
+
+## 失败角色重试后的记录衔接
+
+`benchmark/whitebox/reconcile_role_retry.py` 用于同一源码、目标和模型的 PAI 单角色重试。
+原作业须实时确认为 Failed，新作业须 Running；其余角色必须与原记录逐一匹配。
+工具只更新本地部署记录并保存不可覆盖的恢复副本，不创建、重启或注册任何 Worker。
+原部署继续拥有 E/D，重试部署继续拥有 DiT；互相引用对方服务，避免迁移所有权。
+DiT reuse 仅接受显式 job_id/job_name 的 PAI 单 GPU、单 service，沿用共享服务保护。
+历史失败资源保存在 replaced_resources；两份 selftest 都清除，必须重新 inspect、自测。
+
+```bash
+python benchmark/whitebox/reconcile_role_retry.py \
+  --original-state /private/original/state.json --retry-state /private/retry/state.json \
+  --role dit --route <existing-test-route> --compatibility <verified-route-compatibility> \
+  --aliyun-profile <profile> --execute
+```
+
+先确认目标测试路由、profile 和模型合同相符且没有活跃会话，再做上述本地配置调整。
+依次对两份记录执行 inspect/selftest（不可并发占用同一组）；随后两份记录分别执行
+`attach --in-place --execute --yes`，各自仅挂载 owned 角色。注册后的容量核验等待另一
+份记录挂载完成，因此两个 attach 可并行。down 仍须分别对两份记录执行，仅各自
+停止 owned 角色。已挂载或部分执行失败时先核对恢复副本与实时身份，不自动重复修复。
+路由 compatibility 是既有调度键；实际 SP 和源码身份以角色回执为准，不从键名推断。
 
 ## 预热、验收工具、镜像和回滚的边界
 

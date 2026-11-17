@@ -335,6 +335,36 @@ def test_prompt_failure_retains_version_chain_and_requires_explicit_rebase():
     run(scenario())
 
 
+def test_prompt_retry_preserves_original_room_admission_clock():
+    from sglang.multimodal_gen.runtime.realtime.whitebox.inference_timing import (
+        room_elapsed_ms,
+    )
+
+    async def scenario():
+        journal, scope = await started()
+        request = command(
+            "prompt.replace",
+            "timed",
+            **scope,
+            expected_prompt_version=1,
+            prompt_version=2,
+            prompt="new scene",
+            effective={"source_frame_index": 17},
+        )
+        await journal.prompt(request)
+        before = copy.deepcopy(
+            journal.snapshot["segment"]["prompt_queue"][0]["room_admission"]
+        )
+        duplicate = await journal.prompt(request)
+        assert duplicate["duplicate"]
+        assert (
+            journal.snapshot["segment"]["prompt_queue"][0]["room_admission"] == before
+        )
+        assert room_elapsed_ms(before, before["at"] + 1) == 1000
+
+    run(scenario())
+
+
 def test_strict_prompt_is_not_accepted_until_worker_reserves_boundary():
     async def scenario():
         journal, identity = await started()
@@ -1145,3 +1175,71 @@ def test_cancel_interrupts_an_admitted_end_waiting_for_condition_output():
             await asyncio.gather(*tasks, return_exceptions=True)
 
     run(scenario())
+
+
+def test_detailed_timing_is_strict_and_scoped_to_each_render():
+    from sglang.multimodal_gen.runtime.realtime.whitebox.render_contract import (
+        segment_parameters,
+    )
+
+    assert segment_parameters({"prompt": "scene"})["detailed_timing"] is False
+    assert (
+        segment_parameters({"prompt": "scene", "detailed_timing": True})[
+            "detailed_timing"
+        ]
+        is True
+    )
+    assert segment_parameters({"prompt": "next scene"})["detailed_timing"] is False
+    for invalid in (1, "true", None, []):
+        with pytest.raises(RenderError):
+            segment_parameters({"prompt": "scene", "detailed_timing": invalid})
+
+
+@pytest.mark.parametrize("default", [False, True])
+@pytest.mark.parametrize("override", [None, False, True])
+def test_room_timing_default_is_persisted_and_request_can_override(
+    monkeypatch, tmp_path, default, override
+):
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.runtime.realtime.whitebox.render_host import RenderHost
+
+    monkeypatch.setenv("WHITEBOX_DETAILED_TIMING", "1" if default else "0")
+    host = RenderHost(SimpleNamespace(spool=tmp_path), None, None, None, None, None)
+
+    async def scenario():
+        journal = RenderJournal(
+            host.store,
+            user_id="u",
+            source_session_id="source",
+            source_epoch="epoch",
+            owner_epoch="owner",
+            detailed_timing_default=host.detailed_timing_default,
+        )
+        await journal.create()
+        await journal.update(lambda state: state.update(source_state="ready"))
+        body = command(
+            "render.start", "start", expected_render_revision=0, prompt="scene"
+        )
+        if override is not None:
+            body["detailed_timing"] = override
+        await journal.start(body)
+        expected = default if override is None else override
+        assert (await journal.read())["segment"]["detailed_timing"] is expected
+        # Startup policy is fixed in this host; an idempotent retry must not
+        # change the existing render even if its process environment changes.
+        monkeypatch.setenv("WHITEBOX_DETAILED_TIMING", "0" if default else "1")
+        assert (await journal.start(body))["duplicate"]
+        assert (await journal.read())["segment"]["detailed_timing"] is expected
+
+    run(scenario())
+
+
+def test_room_rejects_invalid_timing_default(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.runtime.realtime.whitebox.render_host import RenderHost
+
+    monkeypatch.setenv("WHITEBOX_DETAILED_TIMING", "true")
+    with pytest.raises(ValueError, match="WHITEBOX_DETAILED_TIMING must be 0 or 1"):
+        RenderHost(SimpleNamespace(spool=tmp_path), None, None, None, None, None)

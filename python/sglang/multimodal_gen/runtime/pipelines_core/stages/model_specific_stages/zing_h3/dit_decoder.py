@@ -27,6 +27,12 @@ class DiTDecoderOutput:
             self.remote.dispose()
             raise RuntimeError("Decoder connection failed") from self.remote.failure
 
+    def configure_timing(self, message):
+        def call():
+            return self.remote.configure_timing(message)
+
+        return call() if self.parallel is None else self.parallel.leader_call(call)
+
     def output(self, result, message, item):
         self.provenance = result.provenance
         self.remote.output_metadata = dict(

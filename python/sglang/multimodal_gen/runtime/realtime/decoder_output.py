@@ -230,6 +230,32 @@ class DecoderOutputBroker:
             async def send_outputs():
                 adapter = RawRGBRealtimeOutputAdapter()
                 config = session.config
+                pending_timings = []
+
+                async def send_timings(final=False):
+                    retained = []
+                    for timing in pending_timings:
+                        if not timing.finished and not final:
+                            retained.append(timing)
+                            continue
+                        report = timing.snapshot(final=final)
+                        if report["status"] == "pending" and not final:
+                            retained.append(timing)
+                            continue
+                        if final and report["status"] == "pending":
+                            report["status"] = "incomplete"
+                        await ws.send_bytes(
+                            msgspec.msgpack.encode(
+                                dict(
+                                    type="model.timing",
+                                    model_session_id=config["session_id"],
+                                    generation_id=config["generation_id"],
+                                    timing=report,
+                                )
+                            )
+                        )
+                    pending_timings[:] = retained
+
                 identity = dict(
                     session_id=config["session_id"],
                     generation_id=config["generation_id"],
@@ -239,12 +265,14 @@ class DecoderOutputBroker:
                 )
                 last_decoder_timing = None
                 while True:
+                    await send_timings()
                     try:
                         item = session.take()
                     except queue.Empty:
                         await asyncio.sleep(0.005)
                         continue
                     if item["type"] == "session.completed":
+                        await send_timings(final=True)
                         await ws.send_bytes(
                             msgspec.msgpack.encode(dict(item, **identity))
                         )
@@ -360,6 +388,11 @@ class DecoderOutputBroker:
                                 result,
                                 batch,
                             )
+                        timing = item.get("timing")
+                        if timing is not None:
+                            pending_timings.append(timing)
+                            if len(pending_timings) >= 64:
+                                await send_timings(final=True)
                     finally:
                         session.sent()
                     if not config.get("return_stage_timing", False):

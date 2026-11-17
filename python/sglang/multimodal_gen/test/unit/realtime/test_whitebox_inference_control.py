@@ -2226,6 +2226,18 @@ def test_disable_serializes_with_query_waiting_for_model_wire(release_sender):
         )
         segment.model_wire_sequence = 0
         segment.prompt_by_event = {}
+        from sglang.multimodal_gen.runtime.realtime.whitebox.timing_control import (
+            TimingControl,
+        )
+        from sglang.multimodal_gen.runtime.realtime.whitebox.ttff_metrics import (
+            TimingMetrics,
+        )
+
+        segment.detailed_timing = True
+        segment.timing_control = TimingControl(segment)
+        segment.timing_metrics = TimingMetrics()
+        segment.room_timings = {}
+        segment.timing_triggers = {}
         segment.config = SimpleNamespace(startup_seconds=20)
         segment.publishing = True
         segment.resource_state, segment.archive_failure = "released", False

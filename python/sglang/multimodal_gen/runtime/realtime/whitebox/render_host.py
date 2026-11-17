@@ -158,6 +158,7 @@ class RenderPipeline(RoomPipeline):
             source_session_id=self.session_id,
             source_epoch=epoch,
             owner_epoch=self.host.runtime.epoch,
+            detailed_timing_default=self.host.detailed_timing_default,
         )
         return SourceSession(
             self.host,
@@ -582,6 +583,7 @@ class RenderPipeline(RoomPipeline):
                 "source.pause",
                 "source.resume",
                 "model.sink",
+                "model.timing.configure",
             }
             member_prefill = getattr(self.session, "member_prefill", None)
             if member_prefill is not None:
@@ -740,6 +742,10 @@ class RenderHost:
             reports,
         )
         self.coordinator, self.connect = coordinator, connect
+        timing = os.environ.get("WHITEBOX_DETAILED_TIMING", "0")
+        if timing not in {"0", "1"}:
+            raise ValueError("WHITEBOX_DETAILED_TIMING must be 0 or 1")
+        self.detailed_timing_default = timing == "1"
         self.max_sessions, self.grace_seconds, self.history_bytes = (
             max_sources,
             grace_seconds,

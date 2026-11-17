@@ -3,6 +3,64 @@
 
 import math
 
+# Fixed role/stage/clock combinations. These also bound Prometheus cardinality;
+# never derive stage labels from arbitrary model receipts.
+TTFF_HOST_STAGES = {
+    "room": frozenset(
+        "source_session_to_first_rgb segment_setup_to_first_rgb "
+        "segment_setup_to_source_dispatch condition_dequeue_to_first_rgb "
+        "room_accept_to_first_rgb room_accept_to_condition_dequeue "
+        "condition_dequeue_to_model_send room_accept_to_model_send "
+        "sink_idle_wait effective_boundary_wait reference_resolve_store "
+        "send_lock_wait model_wire_lock_wait prompt_send_call "
+        "prompt_send_to_accepted accepted_to_condition_ready old_clip_input_wait "
+        "old_clip_dispatch_to_condition_ready condition_ready_to_resume "
+        "resume_to_fresh_source_dispatch source_dispatch_to_first_rgb "
+        "resume_to_first_rgb".split()
+    ),
+    "encoder": frozenset(
+        "encoder_queue_wait condition_cache_lookup media_prepare qwen_prepare "
+        "qwen_remote_prepare reference_vae source_prepare source_vae_append "
+        "source_vae_pop".split()
+    ),
+    "dit": frozenset(
+        "condition_queue_wait condition_admission condition_activate "
+        "history_kv_rebuild condition_ready_wait condition_to_source_ready "
+        "first_output_compute initial_joint_step0 prompt_joint_step0 "
+        "initial_joint_graph resume_joint_graph source_step0_graph "
+        "denoise_graph denoise_steps condition_prefix_apply".split()
+    ),
+    "decoder": frozenset("decoder_queue_wait vae_decode rgb_copy_publish".split()),
+}
+TTFF_CUDA_STAGES = {
+    "room": frozenset(),
+    "encoder": frozenset(
+        "reference_vae source_prepare source_vae_append source_vae_pop".split()
+    ),
+    "dit": TTFF_HOST_STAGES["dit"]
+    - {"condition_queue_wait", "condition_ready_wait", "condition_to_source_ready"},
+    "decoder": frozenset("vae_decode rgb_copy_publish".split()),
+}
+TTFF_METRIC_STAGES = frozenset(
+    f"whitebox_ttff_{phase}_{role}_{clock}_{stage}"
+    for phase in ("initial", "prompt_switch")
+    for clock, roles in (("host", TTFF_HOST_STAGES), ("cuda", TTFF_CUDA_STAGES))
+    for role, stages in roles.items()
+    for stage in stages
+)
+CLI_STARTUP_STAGES = frozenset(
+    "whitebox_cli_" + key
+    for key in (
+        "preparationMs",
+        "browserLaunchMs",
+        "runtimePrepareMs",
+        "browserContextMs",
+        "worldLoadMs",
+        "environmentInspectionMs",
+        "producerStartMs",
+    )
+)
+
 HOST_FIELDS = (
     "prepare",
     "qwen_init",

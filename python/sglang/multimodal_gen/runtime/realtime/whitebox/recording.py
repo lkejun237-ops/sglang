@@ -621,6 +621,18 @@ class Recording:
         finally:
             await pending
 
+    def inference_timing(self, message):
+        with (self.directory / "inference-timing.jsonl").open(
+            "a", encoding="utf-8"
+        ) as target:
+            target.write(json_line(message))
+
+    async def write_inference_timing(self, message):
+        self.manifest["inference_timing"] = dict(
+            path="inference-timing.jsonl", schema_version=1
+        )
+        await asyncio.to_thread(self.inference_timing, message)
+
     def source_state(self, message):
         # Opaque CLI deltas must survive video frame dropping. This stream is
         # ordered by capture identity, independently of the paired video archive.

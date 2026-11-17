@@ -14,16 +14,21 @@ from itertools import islice
 
 import msgspec
 
+from sglang.multimodal_gen.runtime.utils.zing_ttff_timing import InferenceTiming
+
 from ..source_prepare import V2_PROTOCOL
 from ..zing_source_stream import CLIP_BARRIER_V2
 from .contracts import capture_pts
 from .diagnostics import WhiteboxDiagnostic, public_error
+from .inference_timing import public_timing, room_elapsed_ms, trigger_source
 from .interactive import InteractiveSession
 from .playback import H264PlaybackEncoder
 from .render_contract import RenderError, canonical
 from .reports import SessionReport
 from .sink_control import SinkControl
 from .source_sampling import AdaptiveSourceSampler
+from .timing_control import TimingControl
+from .ttff_metrics import TimingMetrics
 
 
 class SegmentSource:
@@ -193,6 +198,12 @@ class RenderSegment(InteractiveSession):
                 ),
             )
         }
+        self.detailed_timing = state.get("detailed_timing", False)
+        self.timing_control = TimingControl(self)
+        self.room_timings = {1: self._new_room_timing(1)}
+        self.timing_metrics = TimingMetrics()
+        self.timing_triggers = {1: "initial"}
+        self.first_source_dispatch_at = None
         self.pending_prompt = None
         self.periodic_refresh = None
         self.sink = SinkControl(self)
@@ -254,6 +265,9 @@ class RenderSegment(InteractiveSession):
             and self.condition_switch_protocol != CLIP_BARRIER_V2
         ):
             raise RenderError("CAPABILITY_UNAVAILABLE")
+        self.deferred_kv_ready = (
+            self.clip_switch and ready.get("source_condition_deferred_kv") is True
+        )
         self.model_reference_limit = ready.get("max_references", 9)
         large_revision = os.environ.get("WHITEBOX_LARGE_REFERENCE_MODEL_REVISION")
         if large_revision and self.assignment.denoiser.model_revision != large_revision:
@@ -271,6 +285,7 @@ class RenderSegment(InteractiveSession):
         )
         self.resource_state = "reserved"
         self.sink.supported = ready.get("sink_updates") is True
+        self.timing_control.supported = ready.get("timing_updates") is True
         if (
             self.condition_switch_protocol == CLIP_BARRIER_V2
             and ready.get("auto_sink_updates") is True
@@ -286,6 +301,7 @@ class RenderSegment(InteractiveSession):
                 "enabled": None,
                 "pending_request_id": None,
             },
+            timing=self.timing_control.snapshot(),
             model_session_id=assignment.session_id,
             generation_id=assignment.generation_id,
             prompt_reference_updates=self.clip_switch
@@ -320,13 +336,26 @@ class RenderSegment(InteractiveSession):
         async with self.model_admission_condition:
             self.model_admission_condition.notify_all()
 
+    def _new_room_timing(self, version):
+        return InferenceTiming(
+            "room",
+            prompt_version=version,
+            timing_revision=self.timing_control.revision,
+            detailed=self.detailed_timing,
+            allowed_stages=None
+            if self.detailed_timing
+            else {"segment_setup_to_first_rgb", "room_accept_to_first_rgb"},
+        )
+
     async def _condition_controls(self, ws):
         try:
             await self.source_admission_ready.wait()
             while not self.closed_event.is_set():
                 await self.prompt_available.wait()
                 self.prompt_available.clear()
+                sink_wait_started = time.perf_counter()
                 await self.sink.idle.wait()
+                sink_wait_ms = (time.perf_counter() - sink_wait_started) * 1000
                 current = self.owner.journal.snapshot.get("segment")
                 if (
                     not current
@@ -340,6 +369,25 @@ class RenderSegment(InteractiveSession):
                 if not queue:
                     continue
                 item = queue[0]
+                timing = self._new_room_timing(item["version"])
+                timing.identity["request_id"] = item.get("request_id")
+                timing.record(
+                    "room_accept_to_condition_dequeue",
+                    room_elapsed_ms(item.get("room_admission"), timing.started),
+                )
+                timing.record("sink_idle_wait", sink_wait_ms)
+                self.room_timings[item["version"]] = timing
+                self.timing_triggers[item["version"]] = trigger_source(item)
+                # Bound active correlation state; raw receipts are append-only in the archive.
+                if len(self.room_timings) > 64:
+                    old = self.room_timings.pop(next(iter(self.room_timings)))
+                    old.finished = True
+                    report = old.snapshot(final=True)
+                    report["status"] = "incomplete"
+                    await self._archive_timing(report, outcome="no_output_observed")
+                if len(self.timing_triggers) > 256:
+                    self.timing_triggers.pop(next(iter(self.timing_triggers)))
+                boundary_started = time.perf_counter()
                 if item["effective"].get("policy", "at_or_after") != "at_or_after":
                     raise RenderError("EFFECTIVE_BOUNDARY_UNAVAILABLE")
                 effective = item["effective"]
@@ -364,6 +412,11 @@ class RenderSegment(InteractiveSession):
                             break
                     elif actual >= requested:
                         break
+                timing.record(
+                    "effective_boundary_wait",
+                    (time.perf_counter() - boundary_started) * 1000,
+                )
+                references_started = time.perf_counter()
                 descriptors = self.active_reference_descriptors
                 if "references" in item:
                     references = await self.owner.assets.resolve(item["references"])
@@ -387,6 +440,10 @@ class RenderSegment(InteractiveSession):
                         descriptors = await self.recording.add_references(
                             references, wait=True
                         )
+                timing.record(
+                    "reference_resolve_store",
+                    (time.perf_counter() - references_started) * 1000,
+                )
                 candidate = {
                     **item,
                     "strict": False,
@@ -422,10 +479,31 @@ class RenderSegment(InteractiveSession):
                     ):
                         watermark = max(self.selected_frames, 17)
                         switch["provisional_boundary"] = ((watermark + 16) // 17) * 17
+                    timing.record(
+                        "send_lock_wait",
+                        (time.perf_counter() - switch["started_at"]) * 1000,
+                    )
                     self.condition_switch = switch
 
                     def remember(event_id):
+                        send_started_at = time.perf_counter()
+                        switch["model_send_started_at"] = send_started_at
+                        timing.record(
+                            "room_accept_to_model_send",
+                            room_elapsed_ms(
+                                item.get("room_admission"), send_started_at
+                            ),
+                        )
+                        timing.record(
+                            "condition_dequeue_to_model_send",
+                            (send_started_at - timing.started) * 1000,
+                        )
+                        timing.record(
+                            "model_wire_lock_wait",
+                            (send_started_at - wire_wait_started) * 1000,
+                        )
                         candidate["event_id"] = event_id
+                        timing.identity["event_id"] = event_id
                         self.pending_prompt = candidate
                         self.prompt_by_event[event_id] = candidate
 
@@ -436,14 +514,25 @@ class RenderSegment(InteractiveSession):
                         policy="at_or_after",
                         source_policy="skip_during_switch",
                     )
+                    if getattr(self, "deferred_kv_ready", False):
+                        fields["allow_deferred_kv"] = True
                     if "references" in item:
                         fields["references"] = references
+                    wire_wait_started = time.perf_counter()
                     await self.send_model_event(
                         ws, "prompt.update", fields, before_send=remember
                     )
+                sent_at = switch["model_send_started_at"]
+                timing.record(
+                    "prompt_send_call", (time.perf_counter() - sent_at) * 1000
+                )
                 # The worker reserves B, then receives only the remaining old clip.
                 async with asyncio.timeout(self.config.startup_seconds):
                     accepted = await switch["accepted"]
+                    accepted_at = switch["accepted_received_at"]
+                    timing.record(
+                        "prompt_send_to_accepted", (accepted_at - sent_at) * 1000
+                    )
                     if accepted.get("state") == "accepted":
                         boundary = accepted.get("source_frame_index")
                         if (
@@ -453,8 +542,25 @@ class RenderSegment(InteractiveSession):
                         ):
                             raise RenderError("CONDITION_INVALID")
                         switch["boundary"] = boundary
+                        if self.selected_frames == boundary:
+                            switch["old_clip_complete_at"] = accepted_at
                         await self._notify_source_admission()
                         ready = await switch["ready"]
+                        ready_at = switch["ready_received_at"]
+                        timing.record(
+                            "accepted_to_condition_ready",
+                            (ready_at - accepted_at) * 1000,
+                        )
+                        if switch.get("old_clip_complete_at") is not None:
+                            completed_at = switch["old_clip_complete_at"]
+                            timing.record(
+                                "old_clip_input_wait",
+                                (completed_at - accepted_at) * 1000,
+                            )
+                            timing.record(
+                                "old_clip_dispatch_to_condition_ready",
+                                (ready_at - completed_at) * 1000,
+                            )
                         if (
                             ready.get("state") in {"kv_ready", "source_ready"}
                             and ready.get("prompt_version") != item["version"]
@@ -465,6 +571,9 @@ class RenderSegment(InteractiveSession):
                     self.source_resume_after = self.owner.latest.version
                     self.resume_condition_evidence = dict(
                         prompt_version=item["version"],
+                        trigger_source=trigger_source(item),
+                        event_id=candidate.get("event_id"),
+                        timing_report_id=timing.identity["report_id"],
                         boundary=switch["boundary"],
                         previous_source=self.last_selected_source,
                         skipped_captures=max(
@@ -482,6 +591,22 @@ class RenderSegment(InteractiveSession):
                         and ready.get("state") == "kv_ready",
                         source_ready=accepted.get("state") == "accepted"
                         and ready.get("state") == "source_ready",
+                        readiness_state=ready.get("state")
+                        if accepted.get("state") == "accepted"
+                        else None,
+                    )
+                    resumed_at = time.perf_counter()
+                    candidate["timing_resumed_at"] = resumed_at
+                    if accepted.get("state") == "accepted" and ready.get("state") in {
+                        "kv_ready",
+                        "source_ready",
+                    }:
+                        timing.record(
+                            "condition_ready_to_resume", (resumed_at - ready_at) * 1000
+                        )
+                    timing.record(
+                        "switch_to_resume",
+                        (time.perf_counter() - switch["started_at"]) * 1000,
                     )
                     self.condition_switch = None
                 await self._notify_source_admission()
@@ -573,7 +698,85 @@ class RenderSegment(InteractiveSession):
             await self.sink.sync_auto(ws)
             self.tasks.add(asyncio.create_task(self.sink.watch_auto(ws)))
 
+    def model_source_dispatch(self, local, dispatched_at):
+        if local == 0:
+            self.first_source_dispatch_at = dispatched_at
+            timing = self.room_timings.get(1)
+            if timing is not None:
+                timing.record(
+                    "segment_setup_to_source_dispatch",
+                    (dispatched_at - timing.started) * 1000,
+                )
+        switch = self.condition_switch
+        if switch is not None and switch.get("boundary") == local + 1:
+            switch["old_clip_complete_at"] = dispatched_at
+        condition = self.pending_prompt
+        if (
+            condition is not None
+            and condition.get("timing_resumed_at") is not None
+            and "timing_first_source_dispatch_at" not in condition
+        ):
+            # Keep both endpoints on their owning condition. Later dispatches
+            # must not overwrite the first, and rejected prompts own no sample.
+            condition["timing_first_source_dispatch_at"] = dispatched_at
+            timing = self.room_timings.get(condition["version"])
+            if timing is not None:
+                timing.record(
+                    "resume_to_fresh_source_dispatch",
+                    (dispatched_at - condition["timing_resumed_at"]) * 1000,
+                )
+
+    async def _archive_timing(self, timing, **fields):
+        self.timing_metrics.observe(
+            timing,
+            trigger=self.timing_triggers.get(timing.get("prompt_version"), "unknown"),
+        )
+        if timing.get("role") == "room":
+            detailed = timing.get("detailed", self.detailed_timing)
+        elif timing.get("role") == "cache":
+            detailed = self.detailed_timing
+        else:
+            detailed = self.timing_control.ever_enabled
+        if not detailed or self.recording is None:
+            return
+        await self.recording.write_inference_timing(
+            dict(
+                **timing,
+                **fields,
+                segment_id=self.segment_id,
+                segment_epoch=self.segment_epoch,
+                **self.owner.source_identity(),
+                model_session_id=self.assignment.session_id
+                if self.assignment
+                else None,
+                generation_id=self.assignment.generation_id
+                if self.assignment
+                else None,
+                worker_epoch=getattr(self.assignment.denoiser, "worker_epoch", None)
+                if self.assignment
+                else None,
+                trigger_source=self.timing_triggers.get(
+                    timing.get("prompt_version"), "unknown"
+                ),
+            )
+        )
+
     async def model_control(self, message):
+        received_at = time.perf_counter()
+        if await self.timing_control.control(message):
+            return True
+        if message.get("type") == "model.timing":
+            if not self.timing_control.ever_enabled:
+                return True
+            timing = public_timing(message.get("timing"))
+            if (
+                timing is not None
+                and self.assignment is not None
+                and message.get("model_session_id") == self.assignment.session_id
+                and message.get("generation_id") == self.assignment.generation_id
+            ):
+                await self._archive_timing(timing)
+            return True
         if await self.sink.control(message):
             return True
         if message.get("type") == "model.cache":
@@ -590,12 +793,17 @@ class RenderSegment(InteractiveSession):
                 and message.get("generation_id") == self.assignment.generation_id
             ):
                 await self.owner.segment_cache_receipt(self, cache)
+                await self._archive_timing(dict(role="cache", **cache))
             return True
-        return await self.owner.segment_model_control(self, message)
+        return await self.owner.segment_model_control(
+            self, message, received_at=received_at
+        )
 
     async def model_output_condition(self, message, pending, selection, rendering):
+        received_at = time.perf_counter()
+        received_monotonic = time.monotonic()
         if self.first_output_at is None:
-            self.first_output_at = time.perf_counter()
+            self.first_output_at = received_at
         sink = await self.sink.output(message)
         condition = self.prompt_by_event.get(message.get("event_id"))
         if condition is None:
@@ -604,6 +812,42 @@ class RenderSegment(InteractiveSession):
             "reference_descriptors", self.active_reference_descriptors
         )
         first = pending[message["output_frame_start"]][0]
+        timing = self.room_timings.pop(condition["version"], None)
+        if timing is not None:
+            now = received_at
+            if condition["version"] > 1:
+                timing.record(
+                    "room_accept_to_first_rgb",
+                    room_elapsed_ms(condition.get("room_admission"), now),
+                )
+                for field, stage in (
+                    ("timing_first_source_dispatch_at", "source_dispatch_to_first_rgb"),
+                    ("timing_resumed_at", "resume_to_first_rgb"),
+                ):
+                    if condition.get(field) is not None:
+                        timing.record(stage, (now - condition[field]) * 1000)
+            timing.identity.update(
+                event_id=message.get("event_id"),
+                output_frame_start=message["output_frame_start"],
+            )
+            timing.record(
+                "segment_setup_to_first_rgb"
+                if condition["version"] == 1
+                else "condition_dequeue_to_first_rgb",
+                (now - timing.started) * 1000,
+            )
+            if condition["version"] == 1 and self.first_source_dispatch_at is not None:
+                timing.record(
+                    "source_dispatch_to_first_rgb",
+                    (now - self.first_source_dispatch_at) * 1000,
+                )
+            if condition["version"] == 1:
+                timing.record(
+                    "source_session_to_first_rgb",
+                    (received_monotonic - self.owner.bound_at) * 1000,
+                )
+            timing.finished = True
+            await self._archive_timing(timing.snapshot())
         if "area_binding" in condition:
             condition.setdefault(
                 "effective_source",
@@ -780,6 +1024,7 @@ class RenderSegment(InteractiveSession):
             self.recording.manifest.update(
                 model_geometry=self.model_geometry.receipt(),
                 recording_kind="render_segment",
+                detailed_timing=self.detailed_timing,
                 dataset_status="excluded_unvalidated",
                 source_session_id=self.owner.session_id,
                 source_epoch=self.owner.source_epoch,
@@ -824,6 +1069,7 @@ class RenderSegment(InteractiveSession):
                 references=self.references,
                 seed=state["seed"],
                 source_prompt_protocol="ordered-boundary-v2",
+                detailed_timing=self.detailed_timing,
             )
             if getattr(self.leases, "supports_condition_barrier", True):
                 self.upstream.init["source_condition_switch_protocol"] = getattr(
@@ -908,6 +1154,12 @@ class RenderSegment(InteractiveSession):
                     self.recording.manifest["startup"] = self.leases.receipt()
                 self.archive_failure = bool(getattr(self.recording, "failure", None))
                 try:
+                    for timing in self.room_timings.values():
+                        timing.finished = True
+                        report = timing.snapshot(final=True)
+                        report["status"] = "incomplete"
+                        await self._archive_timing(report, outcome=outcome)
+                    self.room_timings.clear()
                     self.recording.manifest["rendering"].update(
                         source_frames_captured=self.owner.submitted,
                         selected_source_frames=self.selected_frames,

@@ -337,3 +337,64 @@ def test_cancelled_archive_admission_closes_started_worker_and_releases_capacity
         await recording.manager.close()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("timing_first", [False, True])
+def test_timing_priority_preserves_video_reference_ack_and_final_manifest(
+    tmp_path, timing_first
+):
+    async def run():
+        manager, recording, spec = await make_recording(tmp_path, queue_depth=1)
+        encoder = H264PlaybackEncoder(spec)
+        try:
+            recording.manifest["video_streams"] = {
+                "whitebox": encoder.stream,
+                "model": encoder.stream,
+            }
+            await recording.configure()
+            while recording._completed_sequence < recording._offered_sequence:
+                await asyncio.sleep(0.001)
+            # Reference confirmation must remain independent of optional ACKs.
+            await recording.write_inference_timing({"revision": 0})
+            queued, size, operation, value = recording.timing_items[0]
+            recording.timing_items[0] = (
+                queued - recording.manager.max_age - 1,
+                size,
+                operation,
+                value,
+            )
+            await recording.add_references([], wait=True)
+            assert recording.manifest["inference_timing"]["incomplete"]
+            assert recording._completed_sequence == recording._offered_sequence == 2
+            rgb = bytes(spec.frame_bytes)
+            encoded = encoder.encode(0, rgb)
+            if timing_first:
+                await recording.write_inference_timing({"revision": 1})
+            assert recording.pair(
+                EngineFrame(
+                    0, 0, rgb, {}, effective_input={}, provenance={"capture_pts_us": 0}
+                ),
+                encoded,
+                encoded,
+                "world",
+            )
+            if not timing_first:
+                await recording.write_inference_timing({"revision": 1})
+            # Optional byte overflow must neither fail the video nor advance ACKs.
+            await recording.write_inference_timing(
+                {"oversized": "x" * recording.TIMING_QUEUE_BYTES}
+            )
+            assert recording.failure is None and recording._offered_sequence == 3
+            await recording.finish("completed")
+            assert recording.failure is None
+            assert recording._completed_sequence == 3
+            assert recording.pending_bytes == recording.timing_bytes == 0
+            manifest = json.loads((recording.directory / "manifest.json").read_text())
+            assert manifest["recording_status"] == "complete"
+            assert manifest["inference_timing"]["incomplete"]
+            assert (recording.directory / "inference-timing.jsonl").stat().st_size > 0
+        finally:
+            encoder.close()
+            await manager.close()
+
+    asyncio.run(run())

@@ -1418,7 +1418,7 @@ class _ReplaySourceSession(SourceSession):
                 if (
                     message.get("type") == "control_ack"
                     and message.get("kind") == "prompt.update"
-                    and message.get("state") == "kv_ready"
+                    and message.get("state") in {"kv_ready", "source_ready"}
                     and message.get("prompt_version") not in ready_versions
                 ):
                     ready_versions.add(message.get("prompt_version"))
@@ -1457,6 +1457,7 @@ async def _run_single_segment_flow(
     preserve_switch_boundaries: bool,
     flow_mode: str = "natural",
     realtime_pacing: bool,
+    detailed_timing: bool = False,
     pacing_speed: float,
     capture_fps: int | None = None,
     repeat_warm_prefill: bool = False,
@@ -1993,6 +1994,7 @@ async def _run_single_segment_flow(
             prompt=recording_meta["prompt"],
             seed=primary_seed,
             references=initial_refs,
+            **({"detailed_timing": True} if detailed_timing else {}),
         )
         await _wait_for(
             lambda: (
@@ -2112,6 +2114,7 @@ async def _run_single_segment_flow(
                     "prompt_switch_ttff_ms": prompt_switch_ttff_ms,
                     "skipped_captures": int(manifest_sw["skipped_captures"]),
                     "kv_ready": bool(manifest_sw["kv_ready"]),
+                    "readiness_state": manifest_sw.get("readiness_state"),
                     "reference_count": len(sw["mapped_references"]),
                     "cache_receipt": cache_receipt,
                 }
@@ -2189,6 +2192,7 @@ async def _run_single_segment_flow(
                 prompt=secondary_segment_recording["prompt"],
                 seed=sec_seed,
                 references=sec_refs,
+                **({"detailed_timing": True} if detailed_timing else {}),
             )
             await _wait_for(
                 lambda: (
@@ -2253,6 +2257,7 @@ async def _run_single_segment_flow(
         return {
             "case_id": case_id,
             "flow_mode": flow_mode,
+            "detailed_timing_requested": detailed_timing,
             "target_output_frames": effective_target_frames,
             "world_id": recording_meta["world_id"],
             "recording_id": rec_id,
@@ -2361,6 +2366,7 @@ async def _run_source_replay_suite(
     preserve_switch_boundaries: bool = False,
     flow_mode: str = "natural",
     realtime_pacing: bool = False,
+    detailed_timing: bool = False,
     pacing_speed: float = 1.0,
     capture_fps: int | None = None,
     synthesize_if_missing: bool = False,
@@ -2419,6 +2425,7 @@ async def _run_source_replay_suite(
     # Step 1: Shanghai Drive Baseline (Cold vs Warm Prefill + Session TTFF)
     case1_res = await _run_single_segment_flow(
         case_id="shanghai_drive_baseline",
+        detailed_timing=detailed_timing,
         recording_meta=cases_by_id["shanghai_drive_baseline"],
         media_root=media_root,
         spool_dir=spool_dir / "step1",
@@ -2442,6 +2449,7 @@ async def _run_source_replay_suite(
     c2_meta = cases_by_id["marvel_overdrive_rapid_switch"]
     case2_res = await _run_single_segment_flow(
         case_id="marvel_overdrive_rapid_switch",
+        detailed_timing=detailed_timing,
         recording_meta=c2_meta,
         media_root=media_root,
         spool_dir=spool_dir / "step2",
@@ -2467,6 +2475,7 @@ async def _run_source_replay_suite(
     dark_miss_cache = MockSglangCacheStore()
     dark_miss_res = await _run_single_segment_flow(
         case_id="dark_horns_ref_expansion_miss",
+        detailed_timing=detailed_timing,
         recording_meta=c3_meta,
         media_root=media_root,
         spool_dir=spool_dir / "step3_miss",
@@ -2488,6 +2497,7 @@ async def _run_source_replay_suite(
     dark_hit_cache = MockSglangCacheStore()
     dark_hit_res = await _run_single_segment_flow(
         case_id="dark_horns_ref_expansion_hit",
+        detailed_timing=detailed_timing,
         recording_meta=c3_meta,
         media_root=media_root,
         spool_dir=spool_dir / "step3_hit",
@@ -2535,6 +2545,7 @@ async def _run_source_replay_suite(
     c4_meta = cases_by_id["wuxia_jiahao_multi_prefill"]
     case4_res = await _run_single_segment_flow(
         case_id="wuxia_jiahao_multi_prefill",
+        detailed_timing=detailed_timing,
         recording_meta=c4_meta,
         media_root=media_root,
         spool_dir=spool_dir / "step4",
@@ -2579,6 +2590,7 @@ async def _run_source_replay_suite(
         "suite_name": suite_data["name"],
         "test_kind": "room-sglang-source-replay",
         "flow_mode": flow_mode,
+        "detailed_timing_requested": detailed_timing,
         "length_mode": "full-output-target" if full_frames else "short-output-target",
         "connection": (
             dict(
@@ -2903,6 +2915,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="natural: unmodified Room admission; deterministic: replay-only boundary gate",
     )
     p_run.add_argument(
+        "--detailed-timing",
+        action="store_true",
+        help="Request per-render detailed TTFF timing; default leaves the field absent",
+    )
+    p_run.add_argument(
         "--full-frames",
         action="store_true",
         help="Use historical output-frame counts for every segment, including secondary segments; wall time and capture counts may differ",
@@ -3001,6 +3018,7 @@ def main(argv: list[str] | None = None) -> int:
                 full_frames=args.full_frames,
                 preserve_switch_boundaries=args.preserve_switch_boundaries,
                 flow_mode=args.flow_mode,
+                detailed_timing=args.detailed_timing,
                 realtime_pacing=args.realtime_pacing,
                 pacing_speed=args.pacing_speed,
                 capture_fps=args.capture_fps,

@@ -1,0 +1,348 @@
+"""Fixed Shanghai test-copy source binding; no calls occur at import time.
+
+Only the two versioned non-parameterized host readers and current workspace
+1453237 DLC GETs are used. Host packets contain sanitized evidence, never Redis
+credentials. A previous packet is never substituted after a failed source read.
+"""
+import hashlib
+import base64
+import ipaddress
+import json
+import math
+import re
+import time
+import urllib.error
+import urllib.request
+
+from cloud_io import CloudReadError, RegionalAPI, Sources, MetricSink, HTTPReadError, NoRedirect
+from observer_metrics import METRICS, CODES
+from targets import labels
+
+ENVIRONMENT = 'test-shanghai-copy'
+HOSTS = {'controls': 'i-uf6c531tfst14m1omwc7', 'pool': 'i-uf64tq336pfj2x7ei6m5'}
+COORDINATOR = '10.0.1.37:18181'
+ROOM = '10.0.1.34:8092'
+ROLES = {'encoder', 'dit', 'decoder'}
+# These explicit ports must match the reviewed current test role-pool contract.
+ROLE_PORTS = {'encoder': {29110, 31000}, 'dit': {23300, 33000}, 'decoder': {29210, 36000}}
+MAX_PACKET_BYTES = 131072
+
+
+def write_error(status, body):
+    """Keep only fixed service error categories, never a response/message."""
+    error = HTTPReadError(status)
+    text = body.decode('utf-8', errors='replace') if isinstance(body, bytes) else ''
+    # Both Prometheus text/errors and ordinary SLS JSON occur on this route.
+    # Presence classifications reveal no arbitrary response values.
+    error.response_kind = 'text' if text else 'empty'
+    error.response_hints = [name for name, marker in (
+        ('access_key', 'accesskey'), ('token', 'token'), ('expired', 'expired'),
+        ('invalid', 'invalid'), ('permission', 'permission'), ('policy', 'policy'),
+        ('project', 'project'), ('owner_mismatch', 'not belong'), ('vpc', 'vpc'),
+        ('authentication', 'authentication'), ('authorization', 'authorization'))
+        if marker in text.lower()]
+    for action in ('log:RemoteWritePrometheus', 'log:PostLogStoreLogs'):
+        if action in text:
+            error.denied_action = action
+    try:
+        value = json.loads(body)
+        error.response_kind = 'json_object' if isinstance(value, dict) else 'json_other'
+        for key in ('errorCode', 'errorType', 'code', 'Code'):
+            code = value.get(key)
+            if code in {'Unauthorized', 'AccessDenied', 'InvalidAccessKeyId', 'SignatureNotMatch',
+                        'SecurityTokenExpired', 'InvalidSecurityToken', 'InvalidAccessKeyId.NotFound',
+                        'unauthorized', 'forbidden', 'UnauthorizedException'}:
+                error.service_code = code
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return error
+
+
+class CopyMetricSink(MetricSink):
+    """Same validated endpoint and STS auth, with bounded test-only errors."""
+    def write(self, batch):
+        key, secret, token = self.api.credentials
+        auth = base64.b64encode((key + ':' + secret + '$' + token).encode()).decode()
+        request = urllib.request.Request(self.url, data=batch.body, method='POST',
+            headers={**batch.headers, 'Authorization': 'Basic ' + auth})
+        opener = urllib.request.build_opener(NoRedirect(), urllib.request.HTTPSHandler())
+        try:
+            with opener.open(request, timeout=4) as response:
+                if response.status not in (200, 204):
+                    raise write_error(response.status, response.read(8192))
+                if len(response.read(65537)) > 65536:
+                    raise CloudReadError('http_response_budget')
+        except urllib.error.HTTPError as error:
+            try:
+                projected = write_error(error.code, error.read(8192))
+            finally:
+                error.close()
+            raise projected from None
+        return True
+
+
+def stamp(value):
+    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+        raise CloudReadError('copy_source_time')
+    return float(value)
+
+
+def identifier(value):
+    if not isinstance(value, str) or not 1 <= len(value) <= 256 or any(ord(c) < 32 for c in value):
+        raise CloudReadError('copy_source_identity')
+    return value
+
+
+def digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+
+
+class CopyAPI(RegionalAPI):
+    def __init__(self):
+        super().__init__('cn-shanghai')
+
+    def rpc(self, product, version, action, params):
+        if product != 'Ecs' or action not in {'InvokeCommand', 'DescribeInvocationResults'}:
+            raise CloudReadError('copy_rpc_scope')
+        return super().rpc(product, version, action, params)
+
+    def roa(self, product, version, action, path, params=None):
+        if product != 'pai-dlc' or action not in {'ListJobs', 'GetJob'}:
+            raise CloudReadError('copy_roa_scope')
+        return super().roa(product, version, action, path, params)
+
+
+def validate_config(value):
+    keys = {'region', 'environment', 'business_line_id', 'state_instance', 'state_table',
+            'remote_write_url', 'host_commands'}
+    if (not isinstance(value, dict) or set(value) != keys or value['region'] != 'cn-shanghai' or
+            value['environment'] != ENVIRONMENT or value['business_line_id'] != 'world-model-data' or
+            value['state_instance'] != 'pai-sh-state' or value['state_table'] != 'notification_state'):
+        raise CloudReadError('copy_config_scope')
+    commands = value['host_commands']
+    if (not isinstance(commands, dict) or set(commands) != set(HOSTS) or
+            any(not isinstance(v, str) or not re.fullmatch(r'c-[A-Za-z0-9]+', v) for v in commands.values()) or
+            len(set(commands.values())) != 2):
+        raise CloudReadError('copy_command_scope')
+    # MetricSink validates the exact existing regional MetricStore URL before I/O.
+    return value
+
+
+class CopySources:
+    def __init__(self, api, cfg, clock=time.time, sleep=time.sleep):
+        if api.region != 'cn-shanghai':
+            raise CloudReadError('copy_region')
+        self.api, self.cfg, self.clock, self.sleep = api, validate_config(cfg), clock, sleep
+        self.packets, self.jobs = {}, None
+
+    def _packet(self, raw, kind):
+        if not isinstance(raw, str) or len(raw.encode()) > MAX_PACKET_BYTES:
+            raise CloudReadError('copy_packet_budget')
+        from copy_host_snapshot import decode_packet
+        value = decode_packet(raw)
+        if (not isinstance(value, dict) or value.get('schema_version') != 1 or
+                value.get('environment_id') != ENVIRONMENT or value.get('host_kind') != kind or
+                value.get('host_instance_id') != HOSTS[kind] or not isinstance(value.get('sources'), dict) or
+                not 0 <= self.clock() - stamp(value.get('observed_at')) < 30):
+            raise CloudReadError('copy_packet_scope_or_freshness')
+        identifier(value.get('proof_id'))
+        return value
+
+    def capture(self):
+        self.packets, self.jobs = {}, None
+        # Fetch the bounded complete DLC inventory before the short-lived host
+        # heartbeats. This is a read-only reuse; production Sources is unmodified.
+        dlc = Sources(self.api, {})
+        try:
+            self.jobs = dlc.dlc_snapshot('cn-shanghai')
+        except Exception:
+            self.jobs = None
+        pending = {}
+        for kind, instance in HOSTS.items():
+            try:
+                result = self.api.rpc('Ecs', '2014-05-26', 'InvokeCommand', {
+                    'RegionId': 'cn-shanghai', 'CommandId': self.cfg['host_commands'][kind],
+                    'InstanceId.1': instance, 'Timed': 'false'})
+                pending[kind] = identifier(result.get('InvokeId'))
+            except Exception:
+                pass
+        for _ in range(18):
+            if not pending:
+                break
+            for kind, invoke in list(pending.items()):
+                try:
+                    result = self.api.rpc('Ecs', '2014-05-26', 'DescribeInvocationResults', {
+                        'RegionId': 'cn-shanghai', 'InvokeId': invoke, 'InstanceId': HOSTS[kind],
+                        'ContentEncoding': 'PlainText'})
+                    rows = result.get('Invocation', {}).get('InvocationResults', {}).get('InvocationResult', [])
+                    if not isinstance(rows, list) or len(rows) > 1:
+                        raise CloudReadError('copy_command_result_shape')
+                    if not rows:
+                        continue
+                    row = rows[0]
+                    if (row.get('CommandId') != self.cfg['host_commands'][kind] or
+                            row.get('InstanceId') != HOSTS[kind]):
+                        raise CloudReadError('copy_command_result_identity')
+                    state = row.get('InvocationStatus')
+                    if state == 'Success':
+                        if row.get('Dropped') != 0 or row.get('ExitCode') != 0:
+                            raise CloudReadError('copy_command_result_incomplete')
+                        self.packets[kind] = self._packet(row.get('Output'), kind)
+                        del pending[kind]
+                    elif state in {'Failed', 'Timeout', 'Stopped'}:
+                        del pending[kind]
+                except Exception:
+                    del pending[kind]
+            if pending:
+                self.sleep(.25)
+        return self
+
+    def source(self, kind, name, max_age=30, require_complete=True):
+        packet = self.packets.get(kind, {})
+        if not 0 <= self.clock() - stamp(packet.get('observed_at')) < 30:
+            raise CloudReadError('copy_packet_stale')
+        value = packet.get('sources', {}).get(name)
+        if (not isinstance(value, dict) or require_complete and value.get('complete') is not True or
+                not 0 <= self.clock() - stamp(value.get('observed_at')) < max_age or
+                not isinstance(value.get('data'), dict)):
+            raise CloudReadError('copy_source_unavailable')
+        return value['data'], value['observed_at'], packet['proof_id']
+
+    def observations(self, kind, name, allowed_services):
+        # A packet may contain one failed health source and another valid HTTP
+        # observation. The host's immutable identity gate still covers both.
+        data, observed, _ = self.source(kind, name, require_complete=False)
+        rows = data.get('observations')
+        if not isinstance(rows, list) or len(rows) > 64:
+            raise CloudReadError('copy_observation_budget')
+        result = []
+        for row in rows:
+            if (not isinstance(row, dict) or set(row) != {'service', 'name', 'value', 'extra'} or
+                    row['service'] not in allowed_services or row['name'] not in METRICS or
+                    not isinstance(row['extra'], dict)):
+                raise CloudReadError('copy_observation_scope')
+            # Host snapshots cannot manufacture FC-owned log counters/coverage.
+            if row['name'] in {'whitebox_log_error_events_total', 'whitebox_cleanup_pending_seconds',
+                               'whitebox_source_last_success_timestamp_seconds'}:
+                raise CloudReadError('copy_source_owned_metric')
+            result.append((row['service'], row['name'], row['value'], row['extra']))
+        return result, observed, data
+
+    def binding(self, registry):
+        value, _, _ = self.source('controls', 'binding')
+        routes = value.get('routes')
+        if (value.get('coordinator_target') != COORDINATOR or value.get('backend') != 'role_pool' or
+                not isinstance(routes, list) or not 1 <= len(routes) <= 16 or
+                registry.get('route') not in routes):
+            raise CloudReadError('copy_controls_pool_binding')
+
+    def prove_pool(self):
+        snapshot, _, packet_id = self.source('pool', 'registry', max_age=15)
+        self.binding(snapshot)
+        observed, verified = stamp(snapshot.get('observed_at')), stamp(snapshot.get('verified_at'))
+        now = self.clock()
+        if (snapshot.get('schema_version') != 1 or snapshot.get('backend') != 'role_pool' or
+                snapshot.get('complete') is not True or not observed <= verified <= now or now - observed >= 15):
+            raise CloudReadError('copy_registry_freshness')
+        identifier(snapshot.get('pool_id')); identifier(snapshot.get('control_epoch'))
+        processes = snapshot.get('processes')
+        if not isinstance(processes, list) or not 1 <= len(processes) <= 16:
+            raise CloudReadError('copy_process_budget')
+        if (not isinstance(self.jobs, dict) or self.jobs.get('complete') is not True or
+                self.jobs.get('workspace_id') != '1453237' or self.jobs.get('region') != 'cn-shanghai' or
+                not 0 <= now - stamp(self.jobs.get('observed_at')) < 60):
+            raise CloudReadError('copy_dlc_snapshot_unavailable')
+        ids, services, targets_seen, dlc_ids, rows, health, expiry = set(), set(), set(), set(), [], [], []
+        for process in processes:
+            pid, role = identifier(process.get('process_id')), process.get('role')
+            boot = identifier(process.get('boot_epoch'))
+            seen = stamp(process.get('seen_at'))
+            descriptors = process.get('services')
+            if (pid in ids or role not in ROLES or process.get('state') != 'ready' or not 0 <= now - seen < 10 or
+                    not isinstance(descriptors, list) or not 1 <= len(descriptors) <= 16):
+                raise CloudReadError('copy_process_identity_or_freshness')
+            ids.add(pid); expiry.append(seen + 10)
+            proof = {'process_id': pid, 'boot_epoch': boot, 'role': role, 'targets': []}
+            for service in descriptors:
+                sid = identifier(service.get('service_id'))
+                target = service.get('target')
+                try:
+                    ip, port = target.split(':')
+                    if ipaddress.ip_address(ip) not in ipaddress.ip_network('10.0.0.0/24') or int(port) not in ROLE_PORTS[role]:
+                        raise ValueError()
+                except Exception:
+                    raise CloudReadError('copy_role_endpoint_scope') from None
+                identifier(service.get('descriptor_hash'))
+                at, status = stamp(service.get('health_at')), service.get('health_status')
+                if (sid in services or target in targets_seen or len(services) >= 16 or
+                        not observed <= at <= verified or not 0 <= now - at < 10 or
+                        status is not None and (type(status) is not int or not 100 <= status <= 599)):
+                    raise CloudReadError('copy_role_health_identity')
+                services.add(sid); targets_seen.add(target); proof['targets'].append(target); health.append((status, at))
+                if role == 'dit':
+                    matches = []
+                    for job in self.jobs.get('items', []):
+                        if job.get('status') != 'Running':
+                            continue
+                        for pod in job.get('pods', []):
+                            if ip in [pod.get('ip')] + [i.get('ip') for i in pod.get('interfaces', [])]:
+                                matches.append((job.get('job_id'), pod.get('pod_uid')))
+                    if len(matches) != 1 or not all(matches[0]) or matches[0] in dlc_ids:
+                        raise CloudReadError('copy_dit_dlc_ambiguous')
+                    jid, uid = matches[0]
+                    dlc_ids.add((jid, uid))
+                    current = self.api.roa('pai-dlc', '2020-12-03', 'GetJob', '/api/v1/jobs/' + jid, {'NeedDetail': 'true'})
+                    matched = [p for p in current.get('Pods', []) if p.get('PodUid') == uid and
+                               ip in [p.get('Ip')] + [i.get('Ip') for i in p.get('PodIps', [])]]
+                    if str(current.get('WorkspaceId')) != '1453237' or current.get('Status') != 'Running' or len(matched) != 1:
+                        raise CloudReadError('copy_dit_dlc_changed')
+                    proof.update(job_id=jid, pod_uid=uid, identity_source='role_pool_registry_and_dlc')
+            rows.append(proof)
+        if {row['role'] for row in rows} != ROLES or self.clock() >= min(expiry):
+            raise CloudReadError('copy_required_role_missing_or_expired')
+        failures = [status for status, _ in health if status is not None and status != 200]
+        up = 0 if failures else 1 if all(s == 200 for s, _ in health) else None
+        return {'pool_id': snapshot['pool_id'], 'control_epoch': snapshot['control_epoch'], 'route': snapshot['route'],
+                'processes': rows, 'up': up, 'http_status': failures[0] if failures else 200 if up == 1 else None,
+                'observed_at': min(at for _, at in health), 'valid_until': min(expiry),
+                'proof_id': digest([packet_id, rows, snapshot['pool_id'], snapshot['control_epoch']])}
+
+    def room(self):
+        data, observed, packet_id = self.source('controls', 'room_metrics')
+        identity = identifier(data.get('identity'))
+        if data.get('target') != ROOM or not isinstance(data.get('text'), str):
+            raise CloudReadError('copy_room_source_scope')
+        proof = {'status': 'matched', 'complete': True, 'target': ROOM,
+                 'labels': labels('cn-shanghai', 'room', environment=ENVIRONMENT),
+                 'observed_at': observed, 'valid_until': observed + 30,
+                 'proof_id': digest([packet_id, identity, ROOM])}
+        return data['text'], proof, observed
+
+    def logs(self):
+        windows = []
+        for kind in HOSTS:
+            try:
+                # Positive events in a bounded partial window remain evidence;
+                # its complete=False prevents zero baselines/clearance claims.
+                data, _, _ = self.source(kind, 'logs', require_complete=False)
+                rows = data.get('windows')
+                if not isinstance(rows, list) or len(rows) > 4:
+                    raise CloudReadError('copy_log_budget')
+                windows.extend(rows)
+            except Exception:
+                pass
+        result = []
+        for service in ('gateway', 'coordinator', 'room', 'sglang'):
+            rows = [w for w in windows if isinstance(w, dict) and w.get('service') == service]
+            if len(rows) != 1:
+                result.append({'service': service, 'complete': False, 'items': []})
+                continue
+            window = rows[0]
+            items = window.get('items')
+            if (not isinstance(items, list) or len(items) > 24 or
+                    any(not isinstance(e, dict) or e.get('service') != service or
+                        e.get('error_code') not in CODES | {None} for e in items)):
+                result.append({'service': service, 'complete': False, 'items': []})
+            else:
+                result.append(window)
+        return result

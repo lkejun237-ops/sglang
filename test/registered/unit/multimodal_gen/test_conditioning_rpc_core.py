@@ -301,6 +301,7 @@ def assert_ok(response):
     header, tensors = unpack(response.content)
     assert header["schema_version"] == 1
     assert header["cache"] in {"miss", "joined", "hit"}
+    assert "qwen_prefix" not in header and "result_source" not in header
     assert set(tensors) == {"context", "row_role"}
     assert tensors["context"].dtype == torch.bfloat16
     assert tensors["row_role"].dtype == torch.int64
@@ -378,6 +379,7 @@ def test_task_rpc_hashes_pixels_once_through_native_and_rejects_forgery(monkeypa
 
         def encode_ids(self, ids, *, prefix_cache, media_identity, **features):
             assert prefix_cache is not None
+            prefix_cache.reused_rows, prefix_cache.encoded_rows = 0, ids.numel()
             self.identities.append(media_identity)
             return super().encode_ids(ids, **features)
 
@@ -831,6 +833,21 @@ def test_t5_t6_t18_eight_waiters_encode_once_and_stats_match():
             }
             assert stats.json()["queue_depth"] == 0
             assert stats.json()["response_bytes"] > 0
+            registry = app.metrics.registry
+            assert (
+                registry.get_sample_value(
+                    "world_model_conditioning_encodes_total",
+                    {"prefix_outcome": "unknown"},
+                )
+                == 1
+            )
+            for source, count in (("encoding", 1), ("joined", 7), ("result_cache", 1)):
+                assert (
+                    registry.get_sample_value(
+                        "world_model_conditioning_results_total", {"source": source}
+                    )
+                    == count
+                )
             assert_idle(app)
         finally:
             encoder.release.set()

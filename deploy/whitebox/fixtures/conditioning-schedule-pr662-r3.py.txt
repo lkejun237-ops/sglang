@@ -1,0 +1,231 @@
+"""Isolated test-shanghai-copy collector; source reads + own telemetry/state only.
+
+This entrypoint never sends notifications, invokes a business endpoint that
+allocates a session, or updates the production collector's state/configuration.
+Its deployment/package/root are independent of both production functions.
+"""
+import json
+import os
+import time
+import copy
+from dataclasses import replace
+
+from collector_state import CollectorLease, FencedSink
+from copy_sources import CopyAPI, CopySources, CopyMetricSink, ENVIRONMENT, identifier, validate_config
+from notification_state import OTSBackend
+from observer_metrics import batch, CODES
+from production import log_changes
+from relay import build_remote_write, assert_sendable
+
+
+def config():
+    if os.environ.get('WHITEBOX_REGION') != 'cn-shanghai':
+        raise ValueError('copy_runtime_region')
+    return validate_config(json.loads(os.environ['WHITEBOX_CONFIG']))
+
+
+def state_backend(api, cfg):
+    import tablestore
+    key, secret, token = api.credentials
+    client = tablestore.OTSClient('https://pai-sh-state.cn-shanghai.ots.aliyuncs.com',
+        key, secret, 'pai-sh-state', sts_token=token, socket_timeout=3, max_retry_time=0)
+    return OTSBackend(client, cfg['state_table'])
+
+
+def report_round_error(error, started, completed_rounds):
+    # Only bounded structural facts reach logs. In particular never serialize
+    # the exception message, URL, traceback, source payload or credentials.
+    name = type(error).__name__
+    event = {'kind': 'copy_collector_round_error',
+             'error_type': name if name.isidentifier() and len(name) <= 80 else 'Exception',
+             'elapsed_seconds': round(max(0, time.monotonic() - started), 3),
+             'completed_rounds': completed_rounds}
+    status = getattr(error, 'code', None)
+    if type(status) is int and 100 <= status <= 599:
+        event['http_status'] = status
+    code = getattr(error, 'service_code', None)
+    if code in {'Unauthorized', 'AccessDenied', 'InvalidAccessKeyId', 'SignatureNotMatch',
+                'SecurityTokenExpired', 'InvalidSecurityToken', 'InvalidAccessKeyId.NotFound',
+                'unauthorized', 'forbidden', 'UnauthorizedException'}:
+        event['service_code'] = code
+    action = getattr(error, 'denied_action', None)
+    if action in {'log:RemoteWritePrometheus', 'log:PostLogStoreLogs'}:
+        event['denied_action'] = action
+    response_kind = getattr(error, 'response_kind', None)
+    if response_kind in {'empty', 'text', 'json_object', 'json_other'}:
+        event['response_kind'] = response_kind
+    hints = getattr(error, 'response_hints', [])
+    event_hints = [hint for hint in hints if hint in {
+        'access_key', 'token', 'expired', 'invalid', 'permission', 'policy', 'project',
+        'owner_mismatch', 'vpc', 'authentication', 'authorization'}]
+    if event_hints:
+        event['response_hints'] = event_hints
+    reasons = {'metric_batch_expired', 'collector_lease_lost', 'copy_owned_write_unconfirmed'}
+    if len(error.args) == 1 and isinstance(error.args[0], str) and error.args[0] in reasons:
+        event['reason'] = error.args[0]
+    print(json.dumps(event, sort_keys=True), flush=True)
+
+
+def run_round(api, cfg, lease, sink, clock=time.time, source_factory=CopySources):
+    source = source_factory(api, cfg, clock=clock).capture()
+    coverage, metric_summary, versions = {}, {}, {}
+    owned = []
+    # Each source keeps its real source observation time. Partial host packets
+    # may still carry a proved healthy Room; packet.complete is not global green.
+    for kind, name, allowed in (('controls', 'controls', {'gateway', 'room'}),
+                                ('pool', 'controls', {'coordinator'}),
+                                ('pool', 'capacity', {'coordinator'})):
+        try:
+            values, at, data = source.observations(kind, name, allowed)
+            if name == 'capacity':
+                # Capacity is independent HTTP evidence. An unavailable worker
+                # registry must not hide the requested real 0/0 P0 signal. The
+                # host binds these metadata to the same 18181 PID/config before
+                # and after reading capacity; controls bind its current route.
+                source.source('pool', 'capacity')
+                metadata = data.get('metadata', {})
+                route = metadata.get('route')
+                if (metadata.get('backend') != 'role_pool' or metadata.get('capacity_unit') != 'player_group' or
+                        not isinstance(route, dict) or set(route) != {'profile', 'compatibility', 'network_domain'} or
+                        metadata.get('profile') != route.get('profile')):
+                    raise ValueError('copy_capacity_route_or_unit')
+                identifier(metadata.get('pool_id')); identifier(metadata.get('control_epoch'))
+                for value in route.values():
+                    identifier(value)
+                source.binding(metadata)
+            for service in allowed:
+                rows = [(metric, value, extra) for owner, metric, value, extra in values if owner == service]
+                if rows:
+                    # Ordinary host HTTP sources have a 30s source TTL. Keep
+                    # their actual observation timestamp, even if a slower
+                    # independent registry read consumed >10s of that lifetime.
+                    owned.append((service, rows, at, at + 30))
+                health = [value for metric, value, _ in rows if metric == 'whitebox_component_up']
+                if health:
+                    coverage[service] = len(health) == 1 and health[0] == 1
+                for metric, _, extra in rows:
+                    if metric == 'whitebox_build_info':
+                        versions[service] = extra
+        except Exception:
+            for service in allowed:
+                coverage.setdefault(service, False)
+    pool_proof = None
+    try:
+        pool_proof = source.prove_pool()
+        coverage['registry'] = True
+        coverage['sglang'] = pool_proof['up'] == 1
+        if pool_proof['up'] is not None:
+            rows = [('whitebox_component_up', pool_proof['up'], {}),
+                    ('whitebox_component_observed_at_seconds', pool_proof['observed_at'], {})]
+            if pool_proof['http_status'] is not None:
+                rows.append(('whitebox_component_http_status', pool_proof['http_status'], {}))
+            at = pool_proof['observed_at']
+            owned.append(('sglang', rows, at, min(at + 10, pool_proof['valid_until'])))
+    except Exception:
+        coverage['registry'], coverage['sglang'] = False, False
+
+    try:
+        text, proof, at = source.room()
+        metric_batch = build_remote_write(text, labels=proof['labels'], target=proof['target'],
+            proof=proof, sampled_at=at, now=clock())
+        if metric_batch.series_count:
+            assert_sendable(metric_batch, proof=proof, now=clock())
+            if sink.write(metric_batch) is not True:
+                raise ValueError('copy_room_write_unconfirmed')
+        metric_summary = {'status': 'written' if metric_batch.series_count else 'unobserved',
+                          'series': metric_batch.series_count, 'sampled_at_ms': metric_batch.sampled_at_ms}
+    except Exception:
+        metric_summary = {'status': 'unknown', 'reason': 'room_source_or_write_unproved'}
+    coverage['metrics'] = metric_summary['status'] == 'written'
+
+    _, record = lease.read_owned()
+    windows = source.logs()
+    changes, errors, log_ok = log_changes(record, windows, clock())
+    coverage['logs'] = log_ok
+    counters = []
+    for key, count in changes['error_counts'].items():
+        service, code = key.split('|')
+        if service in {'gateway', 'coordinator', 'room', 'sglang'} and code in CODES:
+            counters.append((service, 'whitebox_log_error_events_total', count, {'error_code': code}))
+    # Zero counters require a current complete window across every required
+    # source. Missing model logs never silently establish clean baselines.
+    if log_ok:
+        for service in ('gateway', 'coordinator', 'room', 'sglang'):
+            for code in CODES:
+                if service + '|' + code not in changes['error_counts']:
+                    counters.append((service, 'whitebox_log_error_events_total', 0, {'error_code': code}))
+    now = clock()
+    for service, pending in changes['cleanup_pending'].items():
+        if 0 <= now - pending['last'] < 90:
+            counters.append((service, 'whitebox_cleanup_pending_seconds', pending['last'] - pending['first'], {}))
+    for service in ('gateway', 'coordinator', 'room', 'sglang'):
+        rows = [(name, value, extra) for owner, name, value, extra in counters if owner == service]
+        if rows:
+            owned.append((service, rows, now, now + 10))
+    if log_ok:
+        at = clock()
+        owned.append(('sglang', [('whitebox_source_last_success_timestamp_seconds',
+            min(w['observed_at'] for w in windows), {'component': 'logs'})], at, at + 10))
+    if pool_proof and clock() < pool_proof['valid_until']:
+        at = clock()
+        owned.append(('sglang', [('whitebox_source_last_success_timestamp_seconds',
+            pool_proof['observed_at'], {'component': 'registry'})], at, min(at + 10, pool_proof['valid_until'])))
+    for service, observations, at, deadline in owned:
+        value = batch('cn-shanghai', service, observations, now=at,
+                      generation=lease.fence, environment=ENVIRONMENT)
+        value = replace(value, valid_until=deadline)
+        if sink.write(value) is not True:
+            raise RuntimeError('copy_owned_write_unconfirmed')
+    # The workspace list is transient discovery input, not this deployment's
+    # inventory. Persist only immutable Pod identities proved in this round.
+    proved = {(p.get('job_id'), p.get('pod_uid')) for p in (pool_proof or {}).get('processes', [])
+              if p.get('job_id') and p.get('pod_uid')}
+    current_tasks = []
+    for job in (source.jobs or {}).get('items', []):
+        pods = [p for p in job.get('pods', []) if (job.get('job_id'), p.get('pod_uid')) in proved]
+        if pods:
+            projected = copy.deepcopy(job)
+            projected['pods'] = copy.deepcopy(pods)
+            current_tasks.append(projected)
+    changes.update(environment=ENVIRONMENT, observed_at=clock(), coverage=coverage,
+                   metric_summary=metric_summary, versions=versions,
+                   worker_identity=pool_proof, current_tasks=current_tasks)
+    lease.checkpoint(changes)
+    return {'coverage': coverage, 'room_series_written': metric_summary.get('series', 0),
+            'new_error_events': len(errors), 'notifications_sent': 0}
+
+
+def handler(event, context=None):
+    if os.environ.get('COLLECTION_ENABLED') != 'true':
+        return {'mode': 'disabled', 'notifications_sent': 0}
+    if isinstance(event, (bytes, str)):
+        if len(event) > 65536:
+            raise ValueError('copy_event_budget')
+        event = json.loads(event)
+    if (not isinstance(event, dict) or set(event) - {'triggerTime', 'triggerName', 'payload', 'mode'} or
+            event.get('mode', 'collect') != 'collect'):
+        raise ValueError('copy_collection_event_required')
+    cfg = config()
+    api = CopyAPI()
+    lease = CollectorLease(state_backend(api, cfg), 'cn-shanghai', time.time, environment=ENVIRONMENT)
+    if not lease.claim():
+        return {'mode': 'busy', 'notifications_sent': 0}
+    sink = FencedSink(CopyMetricSink(api, cfg['remote_write_url']), lease)
+    started, rounds = time.monotonic(), []
+    try:
+        for offset in (0, 30):
+            remaining = offset - (time.monotonic() - started)
+            if remaining > 0:
+                time.sleep(remaining)
+            if time.monotonic() - started > 38:
+                break
+            lease.assert_owned()
+            rounds.append(run_round(api, cfg, lease, sink))
+        lease.checkpoint({}, release=True)
+    except Exception as error:
+        # No source payload, exception text or credentials reach FC logs. The
+        # uncertain lease expires; no older batch/source is retried.
+        report_round_error(error, started, len(rounds))
+        return {'mode': 'unknown', 'reason': 'copy_collection_failed',
+                'completed_rounds': len(rounds), 'notifications_sent': 0}
+    return {'mode': 'collect', 'rounds': rounds, 'notifications_sent': 0}

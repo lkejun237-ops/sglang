@@ -193,6 +193,7 @@ class RemoteLynnDecoder:
         self.host = config.get("host", "127.0.0.1")
         self.auto_output = config.get("auto_output", False)
         self.output_session = config.get("output_session")
+        self.timing_updates = False
         self.oneway = config.get("oneway", False)
         if type(self.oneway) is not bool or (
             self.oneway and not (self.auto_output and self.output_session)
@@ -280,6 +281,7 @@ class RemoteLynnDecoder:
             self.failure = error
 
     def _opened(self, reply):
+        self.timing_updates = reply.get("timing_updates") is True
         self.output_attachment = reply.get("output_attachment")
         self.oneway = self.oneway and bool(
             self.output_attachment and reply.get("oneway_supported")
@@ -505,6 +507,11 @@ class RemoteLynnDecoder:
         if not isinstance(reply, dict) or not reply.get("ok"):
             raise RuntimeError(self._failure_message())
         return reply
+
+    def configure_timing(self, message):
+        if not self.timing_updates or self.closed or self.total_frames is not None:
+            raise ValueError("Decoder timing control is unavailable")
+        return self._request("timing.configure", **message)
 
     def _build_chunk_frame_timings(
         self,

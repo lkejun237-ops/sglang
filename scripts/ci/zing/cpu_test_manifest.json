@@ -5073,11 +5073,35 @@
       "approved": true,
       "allowed_skips": [
         {
-          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_cached_prefix_matches_uncached_queued_dit[cuda-cross_chunk]",
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_cached_prefix_matches_uncached_queued_dit[cuda-False-False-cross_chunk]",
           "reason": "CUDA is required for the GPU queue regression"
         },
         {
-          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_cached_prefix_matches_uncached_queued_dit[cuda-off]",
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_cached_prefix_matches_uncached_queued_dit[cuda-False-False-off]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_cached_prefix_matches_uncached_queued_dit[cuda-False-True-cross_chunk]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_cached_prefix_matches_uncached_queued_dit[cuda-False-True-off]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_cached_prefix_matches_uncached_queued_dit[cuda-True-False-cross_chunk]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_cached_prefix_matches_uncached_queued_dit[cuda-True-False-off]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_cached_prefix_matches_uncached_queued_dit[cuda-True-True-cross_chunk]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_cached_prefix_matches_uncached_queued_dit[cuda-True-True-off]",
           "reason": "CUDA is required for the GPU queue regression"
         },
         {
@@ -5102,6 +5126,30 @@
         },
         {
           "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_pooled_session_releases_after_cancel_or_output_failure[cuda-True]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_production_prompt_joint_barrier_matches_serial_and_releases[cuda-cross_chunk-False-False]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_production_prompt_joint_barrier_matches_serial_and_releases[cuda-cross_chunk-False-True]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_production_prompt_joint_barrier_matches_serial_and_releases[cuda-cross_chunk-True-False]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_production_prompt_joint_barrier_matches_serial_and_releases[cuda-cross_chunk-True-True]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_production_prompt_joint_barrier_matches_serial_and_releases[cuda-off-False-False]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_production_prompt_joint_barrier_matches_serial_and_releases[cuda-off-False-True]",
           "reason": "CUDA is required for the GPU queue regression"
         },
         {
@@ -7388,6 +7436,10 @@
         },
         {
           "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_queued_dit.py::test_control_backpressure_and_output_failure_release_state[cuda]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_queued_dit.py::test_dynamic_timing_does_not_relabel_later_output_as_first[cuda]",
           "reason": "CUDA is required for the GPU queue regression"
         },
         {

@@ -53,6 +53,7 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
                     return_stage_timing=bool(
                         getattr(request, "return_stage_timing", False)
                     ),
+                    detailed_timing=self.config.get("detailed_timing", False),
                     seed=request.seed
                     if request.seed is not None
                     else ZingH3SamplingParams.seed,
@@ -112,7 +113,15 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
                     ),
                     "The connected model does not support source preparation.",
                 )
-            self.ready.update(output_kind=self.output_kind)
+            self.timing_revision = 0
+            self.timing_updates = any(
+                v.get("timing_updates") is True
+                for v in (opened or [])
+                if v["type"] == "session.opened"
+            )
+            self.ready.update(
+                output_kind=self.output_kind, timing_updates=self.timing_updates
+            )
             for value in opened or []:
                 if value["type"] != "session.opened":
                     continue
@@ -217,7 +226,55 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
                     )
                 )
                 return True
+            if data.get("type") == "event" and data.get("kind") == "timing.configure":
+                await self._configure_timing(ws, session, data, message_bytes)
+                return True
             return await super().ingest_wire_event(ws, session, data, message_bytes)
+
+    async def _configure_timing(self, ws, session, data, message_bytes):
+        from sglang.multimodal_gen.runtime.utils.zing_ttff_timing import (
+            validate_timing_update,
+        )
+
+        payload, event_id = data.get("payload"), data.get("event_id")
+        require(
+            self.timing_updates and not self.ledger.closed and self.end is None,
+            "Timing control is unavailable for this session.",
+        )
+        require(
+            message_bytes <= self.max_message_bytes
+            and isinstance(payload, dict)
+            and set(payload)
+            == {"session_id", "generation_id", "enabled", "timing_revision"}
+            and payload.get("session_id") == session.id
+            and payload.get("generation_id") == session.generation_id
+            and type(event_id) is int
+            and event_id > self.ledger.event_id,
+            "Please refresh the session status before changing timing.",
+        )
+        try:
+            validate_timing_update(payload, self.timing_revision)
+        except ValueError:
+            require(False, "Please refresh the timing status before changing it.")
+        self.ledger.event_id = event_id
+        receipt = await session.execution_client.configure_timing(payload)
+        self.timing_revision = payload["timing_revision"]
+        self.config["detailed_timing"] = payload["enabled"]
+        session.mark_client_activity()
+        await ws.send_bytes(
+            msgspec.msgpack.encode(
+                dict(
+                    type="control_ack",
+                    kind="timing.configure",
+                    event_id=event_id,
+                    model_session_id=session.id,
+                    generation_id=session.generation_id,
+                    enabled=receipt["enabled"],
+                    timing_revision=receipt["timing_revision"],
+                    boundaries=receipt["boundaries"],
+                )
+            )
+        )
 
     async def drain_connection(self):
         import asyncio
@@ -374,6 +431,17 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
         if result.usage.get("zing_condition_ready") is not None:
             await ws.send_bytes(
                 msgspec.msgpack.encode(result.usage["zing_condition_ready"])
+            )
+        for report in result.realtime_handoff.get("timing_reports", []):
+            await ws.send_bytes(
+                msgspec.msgpack.encode(
+                    dict(
+                        type="model.timing",
+                        model_session_id=session.id,
+                        generation_id=session.generation_id,
+                        timing=report,
+                    )
+                )
             )
         for report in result.realtime_handoff.get("cache_reports", []):
             from sglang.multimodal_gen.runtime.realtime.whitebox.cache_receipt import (

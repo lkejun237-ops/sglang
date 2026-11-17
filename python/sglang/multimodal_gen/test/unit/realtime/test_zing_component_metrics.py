@@ -357,10 +357,15 @@ def test_qwen_counts_sampled_media_before_temporal_padding():
 
 
 def test_qwen_scrape_keeps_existing_authentication():
+    from sglang.multimodal_gen.runtime.conditioning.metrics import ConditioningMetrics
     from sglang.multimodal_gen.runtime.conditioning.service import ConditioningService
 
     service = object.__new__(ConditioningService)
-    service.credentials = {"secret": {"tenant": "test"}}
+    service.metrics = ConditioningMetrics()
+    service.credentials = {
+        "secret": {"tenant": "test"},
+        "admin": {"tenant": "test", "admin": True},
+    }
     service.limits = SimpleNamespace(max_header_bytes=4096)
     service._closed = False
     service._requests = set()
@@ -380,7 +385,9 @@ def test_qwen_scrape_keeps_existing_authentication():
 
     denied = asyncio.run(request([]))
     assert denied[0]["status"] == 401
-    accepted = asyncio.run(request([(b"authorization", b"Bearer secret")]))
+    forbidden = asyncio.run(request([(b"authorization", b"Bearer secret")]))
+    assert forbidden[0]["status"] == 403
+    accepted = asyncio.run(request([(b"authorization", b"Bearer admin")]))
     assert accepted[0]["status"] == 200
     assert b"sglang_zing_component_duration_seconds" in accepted[1]["body"]
 
@@ -388,12 +395,7 @@ def test_qwen_scrape_keeps_existing_authentication():
 def test_multiprocess_export_includes_child_samples(tmp_path):
     # Prometheus chooses its value implementation at import time. The setting
     # must exist before starting Python, just as in a deployed model worker.
-    import inspect
-
-    from sglang.multimodal_gen.runtime.realtime import critical_path_metrics
-
-    code = (
-        """
+    code = """
 import os
 from prometheus_client import Counter
 frames = Counter('zing_child_frames_total', 'Child frames')
@@ -401,13 +403,9 @@ if os.fork() == 0:
     frames.inc(17)
     os._exit(0)
 os.wait()
-"""
-        + inspect.getsource(critical_path_metrics.prometheus_latest)
-        + """
-from prometheus_client import generate_latest
+from sglang.multimodal_gen.runtime.realtime.critical_path_metrics import prometheus_latest
 assert b'zing_child_frames_total 17.0' in prometheus_latest()
 """
-    )
     result = subprocess.run(
         [sys.executable, "-c", code],
         env={**os.environ, "PROMETHEUS_MULTIPROC_DIR": str(tmp_path)},

@@ -21,6 +21,10 @@
 | `--realtime-max-sessions` | 1 |
 | `--realtime-max-sessions-per-worker` | 1 |
 
+上表描述集成式 `ServerArgs`，不代表独立 `dit_worker` 的解析默认值。
+独立 DiT 的 prompt-joint 接线与显式正/反 CLI、环境变量回退见
+[生产 Prompt 联合执行](serving-ttff-breakdown.md)；其未配置默认 false。
+
 例如在已有四卡启动命令中删除上述显式参数，仍采用同样的流水线策略。
 需要串行对照时，在原命令追加：
 

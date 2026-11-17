@@ -360,7 +360,7 @@ class StreamingRecording(AsyncRecording):
             self.worker_ready = True
             self.startup_complete.set()
             while not self.failure:
-                if not self.items:
+                if not self.items and not self.timing_items:
                     if self.final_outcome is not None:
                         self.manifest["trace"] = (
                             self.trace_snapshot() if self.trace_snapshot else []
@@ -400,14 +400,24 @@ class StreamingRecording(AsyncRecording):
                         if self.reference_waiters:
                             self.offer("archive_status", None)
                     continue
-                self.pending = self.items.popleft()
-                queued, size, kind, value = self.pending
+                optional = not self.items
+                if optional:
+                    # Keep telemetry outside required queue budgets and ACKs,
+                    # just as in the disk-backed AsyncRecording worker.
+                    item = self.timing_items.popleft()
+                else:
+                    item = self.pending = self.items.popleft()
+                queued, size, kind, value = item
                 age_limit = (
                     1.0
                     if kind in ("source_rgb", "selected_source_rgb", "model_rgb")
                     else self.manager.max_age
                 )
                 if time.monotonic() - queued > age_limit:
+                    if optional:
+                        self.timing_bytes -= size
+                        self.manifest["inference_timing"]["incomplete"] = True
+                        continue
                     raise TimeoutError("Archive queue expired")
                 commands.put_nowait((kind, value))
                 reply, result = await self._reply(replies, self.manager.max_age)
@@ -429,10 +439,13 @@ class StreamingRecording(AsyncRecording):
                 self.object_buffer_bytes = result.get("object_buffer_bytes", 0)
                 self.produced_bytes = result.get("produced_bytes", 0)
                 self.confirmed_upload_bytes = result.get("confirmed_upload_bytes", 0)
-                self.pending_bytes -= size
-                self.pending = None
-                self._completed_sequence += 1
-                self._acknowledged.set()
+                if optional:
+                    self.timing_bytes -= size
+                else:
+                    self.pending_bytes -= size
+                    self.pending = None
+                    self._completed_sequence += 1
+                    self._acknowledged.set()
         except asyncio.CancelledError:
             self.degrade("ARCHIVE_CANCELLED")
         except Exception:
@@ -455,6 +468,10 @@ class StreamingRecording(AsyncRecording):
                     ipc.close()
             self.pending = None
             self.items.clear()
+            if self.timing_items or self.timing_bytes:
+                self.manifest["inference_timing"]["incomplete"] = True
+            self.timing_items.clear()
+            self.timing_bytes = 0
             self.pending_bytes = 0
             self.upload_buffer_bytes = self.object_buffer_bytes = 0
             self.kwargs = {}

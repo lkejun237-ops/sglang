@@ -14,6 +14,8 @@ import time
 from contextlib import contextmanager
 from uuid import uuid4
 
+from .inference_timing import room_admission
+
 PROTOCOL = "whitebox-render-v2"
 MAX_OPERATIONS = 1024
 MAX_PENDING_PROMPTS = 16
@@ -43,6 +45,8 @@ OCCUPIED_SEGMENTS = {
 MESSAGES = {
     "SOURCE_PAUSE_BUSY": "The game is already being prepared or paused. Please try again shortly.",
     "SOURCE_PAUSE_UNCONFIRMED": "The game pause could not be confirmed. Check its status or resume the original pause.",
+    "TIMING_UPDATE_BUSY": "Wait for the current timing change to finish.",
+    "TIMING_UPDATE_UNKNOWN": "The timing change is unconfirmed. Query its original request.",
     "SINK_UPDATE_BUSY": "Wait for the current model control to finish.",
     "SINK_UPDATE_UNKNOWN": "The sink operation is unconfirmed. Query its original request.",
     "PLAYER_IDLE_TIMEOUT": "Your play session ended because there was no input. Please start again.",
@@ -237,7 +241,7 @@ def area_binding(command):
         raise RenderError("CONDITION_INVALID") from error
 
 
-def segment_parameters(command):
+def segment_parameters(command, *, detailed_timing_default=False):
     prompt = command.get("prompt")
     if isinstance(prompt, dict):
         if (
@@ -250,6 +254,9 @@ def segment_parameters(command):
     prompt = prompt_text(prompt)
     seed = command.get("seed", 42)
     if type(seed) is not int or not 0 <= seed < 2**32:
+        raise RenderError("INVALID_COMMAND")
+    detailed_timing = command.get("detailed_timing", detailed_timing_default)
+    if type(detailed_timing) is not bool:
         raise RenderError("INVALID_COMMAND")
     refs = reference_parameters(command.get("references", []))
     wait = command.get("capacity_wait_ms", 0)
@@ -266,6 +273,7 @@ def segment_parameters(command):
         references=copy.deepcopy(refs),
         region_id=region,
         start_boundary=boundary(command.get("start_boundary"), start=True),
+        detailed_timing=detailed_timing,
         capacity_wait_ms=wait if command.get("wait_for_capacity", False) else 0,
         **area_binding(command),
         **(
@@ -289,8 +297,10 @@ class RenderJournal:
         owner_epoch,
         retention=86400,
         clock=time.time,
+        detailed_timing_default=False,
     ):
         self.store, self.clock, self.retention = store, clock, retention
+        self.detailed_timing_default = detailed_timing_default
         self.user_id = user_id
         self.source_session_id = identity(source_session_id)
         self.source_epoch, self.owner_epoch = (
@@ -618,7 +628,9 @@ class RenderJournal:
         model_context_lifecycle=None,
         prepared_model_ids=None,
     ):
-        parameters = segment_parameters(command)
+        parameters = segment_parameters(
+            command, detailed_timing_default=self.detailed_timing_default
+        )
         if prepared_model_ids is not None:
             if model_context is None or set(prepared_model_ids) != {
                 "model_session_id",
@@ -928,6 +940,7 @@ class RenderJournal:
             item = dict(
                 request_id=command["request_id"],
                 version=version,
+                room_admission=room_admission(),
                 text=next_text,
                 sha256=hashlib.sha256(next_text.encode()).hexdigest(),
                 effective=effective,
@@ -1448,6 +1461,7 @@ class RenderJournal:
             item = dict(
                 request_id=request_id,
                 version=version + 1,
+                room_admission=room_admission(),
                 text=segment["prompt"],
                 sha256=segment["prompt_sha256"],
                 effective=dict(source_frame_index=0, policy="at_or_after"),

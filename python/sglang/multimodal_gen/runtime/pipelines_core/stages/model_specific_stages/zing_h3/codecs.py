@@ -31,6 +31,7 @@ from sglang.multimodal_gen.runtime.realtime.zing_component_metrics import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.zing_stage_timing import handoff, stage_span
+from sglang.multimodal_gen.runtime.utils.zing_ttff_timing import measure
 
 from .decoder import decoder_adapter
 from .media_input import ZingH3MediaInput, _sample_max_area_config
@@ -398,7 +399,9 @@ class ZingH3Codecs(ZingH3MediaInput):
                     "These reference images are too large for this server",
                 )
 
-    def encode_condition(self, prompt, media):
+    def encode_condition(
+        self, prompt, media, *, prefix_cache=None, media_identity=None
+    ):
         if getattr(self, "conditioning_mode", "local") != "local":
             raise ConditionError(
                 "CONDITION_INVALID", "External conditioning cannot use a local encoder"
@@ -411,6 +414,8 @@ class ZingH3Codecs(ZingH3MediaInput):
             media,
             max_rows=16384 if getattr(self, "compute_plan", None) is not None else None,
             presentation_fn=minimax_h3_ref2va_video_presentation,
+            prefix_cache=prefix_cache,
+            media_identity=media_identity,
         )
 
     def _can_fast_visual_encode_profile(
@@ -913,7 +918,7 @@ class ZingH3Codecs(ZingH3MediaInput):
                         output_ids=[f"{request_id}:reference:{item['id']}"],
                     ) as span:
                         with (
-                            preparation_metrics.measure("reference_vae")
+                            preparation_metrics.measure("reference_vae", cuda=True)
                             if preparation_metrics is not None
                             else nullcontext()
                         ):
@@ -1013,7 +1018,14 @@ class ZingH3Codecs(ZingH3MediaInput):
         return media + normalized, normalized, conditions
 
     def prepare_reference_update(
-        self, active, references, prompt, use_component, *, conditioning
+        self,
+        active,
+        references,
+        prompt,
+        use_component,
+        *,
+        conditioning,
+        preparation_metrics=None,
     ):
         """Build a complete candidate without changing active media or stream state.
 
@@ -1026,9 +1038,10 @@ class ZingH3Codecs(ZingH3MediaInput):
 
         error = None
         try:
-            media, normalized, conditions = self.prepare_reference_media(
-                active, references
-            )
+            with measure(preparation_metrics, "media_prepare"):
+                media, normalized, conditions = self.prepare_reference_media(
+                    active, references
+                )
         except (ValueError, OSError) as exc:
             error = exc
         if not all(coordinate_validation(error is None)):
@@ -1037,7 +1050,8 @@ class ZingH3Codecs(ZingH3MediaInput):
             ) from error
         # Retained presentation is already normalized; only new references change.
         self.validate_compute_inputs(prompt, media)
-        positive = conditioning(prompt, media)
+        with measure(preparation_metrics, "qwen_prepare"):
+            positive = conditioning(prompt, media)
         candidate = copy(active)
         candidate.conditions = conditions
         candidate.condition_media = media
@@ -1050,7 +1064,8 @@ class ZingH3Codecs(ZingH3MediaInput):
             with use_component("video_vae"):
                 for item in normalized:
                     if item["id"] in reference_ids:
-                        candidate.visual[item["id"]] = self.encode_reference(item)
+                        with measure(preparation_metrics, "reference_vae", cuda=True):
+                            candidate.visual[item["id"]] = self.encode_reference(item)
         self._log_reference_cache()
         return candidate
 

@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.conditioning.service import ConditioningServi
 from sglang.multimodal_gen.runtime.conditioning.wire import (
     decode_response,
     encode_request,
+    unpack_message,
 )
 
 
@@ -257,6 +258,7 @@ def test_service_successive_requests_preserve_protocol_and_cache_policy(
                 assert messages[0]["status"] == 200
                 payload = b"".join(m.get("body", b"") for m in messages)
                 if mode == "http":
+                    metadata, _ = unpack_message(payload)
                     result = decode_response(
                         payload, service.profile.profile_id, digest
                     )
@@ -265,13 +267,29 @@ def test_service_successive_requests_preserve_protocol_and_cache_policy(
                     )
                 else:
                     records = _Records(chunks([payload]))
-                    assert (await records.read())["input_digest"] == digest
+                    metadata = await records.read()
+                    assert metadata["input_digest"] == digest
                     assert await records.read() == {"done": digest}
                     assert service.cache.current_bytes == 0
                     assert service.nccl.busy is False
+                assert "qwen_prefix" not in metadata
+                assert "result_source" not in metadata
                 assert all(n == 0 for n in service.ledger.snapshot()["global"].values())
             assert service.encoder.calls == (
                 ["http"] * 2 if mode == "http" else ["device"] * 3
+            )
+            registry = service.metrics.registry
+            assert registry.get_sample_value(
+                "world_model_conditioning_encodes_total", {"prefix_outcome": "unknown"}
+            ) == (2 if mode == "http" else 3)
+            assert registry.get_sample_value(
+                "world_model_conditioning_results_total", {"source": "result_cache"}
+            ) == (1 if mode == "http" else 0)
+            assert (
+                registry.get_sample_value(
+                    "world_model_conditioning_reused_tokens_count"
+                )
+                == 0
             )
         finally:
             await service.close()

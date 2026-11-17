@@ -101,6 +101,7 @@ class StreamingData:
         self.report_frames = TextObject(self.object("report-frames.jsonl"))
         self.output_contexts = TextObject(self.object("output-contexts.jsonl"))
         self.source_states = TextObject(self.object("source-states.jsonl"))
+        self.inference_timings = TextObject(self.object("inference-timing.jsonl"))
         names = ("whitebox",) if kwargs.get("source_only") else ("whitebox", "model")
         self.encoders = {
             name: H264MuxFile(
@@ -226,6 +227,8 @@ class StreamingData:
                 # A condition switch may use this image after the worker ACK.
                 # Confirm its immutable object before returning that receipt.
                 self.objects[descriptor["path"]].finish()
+        elif kind == "inference_timing":
+            self.inference_timings.write(json_line(value))
         elif kind == "model_input":
             from .model_inputs import PATH, archive_model_input
 
@@ -331,6 +334,7 @@ class StreamingData:
             self, "_output_context_frames", 0
         )
         self.source_states.close()
+        self.inference_timings.close()
         counts = {name: mux.count for name, mux in self.encoders.items()}
         complete = (
             outcome == "completed"

@@ -21,7 +21,7 @@ class Block0Telemetry:
             self.finished = self.clock()
 
     @contextmanager
-    def measure(self, name):
+    def measure(self, name, *, cuda=False):
         start = self.clock()
         status = "executed"
         try:

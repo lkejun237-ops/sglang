@@ -411,6 +411,7 @@ def test_effective_prompt_snapshots_resolve_prefill_switch_reject_and_clear(tmp_
     confirm_input(capture, init)
     segment = object.__new__(RenderSegment)
     segment.first_output_at = None
+    segment.room_timings = {}
     segment.active_reference_descriptors = reference_descriptors(old_images)
     segment.periodic_refresh = None
     segment.segment_id, segment.segment_epoch = "segment", "epoch"

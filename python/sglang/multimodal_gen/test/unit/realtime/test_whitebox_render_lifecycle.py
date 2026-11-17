@@ -109,6 +109,7 @@ class OrderedWorker(Worker):
             if getattr(self, "clip_switch", False):
                 message.update(
                     source_condition_switch_protocol="clip-barrier-v1",
+                    source_condition_deferred_kv=getattr(self, "deferred_kv", False),
                     prompt_reference_updates=True,
                     max_references=21,
                     max_reference_bytes=64 << 20,
@@ -130,7 +131,9 @@ class OrderedWorker(Worker):
             dict(
                 type="control_ack",
                 kind="prompt.update",
-                state="kv_ready",
+                state="source_ready"
+                if getattr(self, "deferred_kv", False)
+                else "kv_ready",
                 event_id=self.prompt_id,
                 prompt_version=candidate["payload"]["version"],
                 source_frame_index=end,
@@ -340,7 +343,8 @@ def test_source_current_and_finishing_recorders_have_three_bounded_slots(tmp_pat
 
 
 class StrictLeases:
-    def __init__(self, spec, release_protocol=None):
+    def __init__(self, spec, release_protocol=None, deferred_kv=False):
+        self.deferred_kv = deferred_kv
         self.spec = spec
         self.release_protocol = release_protocol
         self.active = 0
@@ -353,6 +357,7 @@ class StrictLeases:
         self.active += 1
         self.resource_state = "reserved"
         worker = OrderedWorker(self.spec)
+        worker.deferred_kv = self.deferred_kv
         worker.source_capacity = 51
         worker.clip_switch = self.release_protocol == "clip-barrier-v1"
         worker.release_protocol = (
@@ -365,6 +370,7 @@ class StrictLeases:
                 SimpleNamespace(
                     session_id="model",
                     generation_id="generation",
+                    player_expires_at=None,
                     denoiser=SimpleNamespace(
                         worker_id="exclusive", model_revision="test"
                     ),
@@ -376,19 +382,20 @@ class StrictLeases:
             self.resource_state = "released"
 
 
+@pytest.mark.parametrize("deferred_kv", [False, True])
 @pytest.mark.parametrize("capture_clock", [False, True])
 @pytest.mark.parametrize("sampling", ["latest", "adaptive"])
 @pytest.mark.parametrize(
     "release_protocol", [None, "valid-source-frames-v1", "clip-barrier-v1"]
 )
 def test_source_survives_four_segments_and_ordered_prompt_updates(
-    tmp_path, release_protocol, capture_clock, sampling
+    tmp_path, release_protocol, capture_clock, sampling, deferred_kv
 ):
     async def run():
         spec = VideoSpec(32, 32)
         engine = Engine(spec)
         engine.stream_id = "view"
-        leases = StrictLeases(spec, release_protocol)
+        leases = StrictLeases(spec, release_protocol, deferred_kv)
         archives = AsyncArchiveManager(recorder_slots=3)
         journal = RenderJournal(
             MemoryRoomStore(),
@@ -621,7 +628,16 @@ def test_source_survives_four_segments_and_ordered_prompt_updates(
                         assert segment.dropped_before_model > 0
                         evidence = segment.recording.manifest["condition_switches"]
                         assert len(evidence) == 3 and all(
-                            row["kv_ready"] for row in evidence
+                            row["kv_ready"] is (not deferred_kv) for row in evidence
+                        )
+                        assert all(
+                            row["readiness_state"]
+                            == ("source_ready" if deferred_kv else "kv_ready")
+                            for row in evidence
+                        )
+                        assert all(
+                            c.get("allow_deferred_kv", False) is deferred_kv
+                            for c in leases.opens[0].switched
                         )
                         assert all(row["skipped_captures"] > 0 for row in evidence)
                         assert all(
@@ -1226,10 +1242,17 @@ def test_clip_switch_finishes_old_clip_before_accepted_and_resumes_on_source_rea
     from sglang.multimodal_gen.runtime.realtime.whitebox.render_source import (
         SourceSession,
     )
+    from sglang.multimodal_gen.runtime.realtime.whitebox.timing_control import (
+        TimingControl,
+    )
 
     async def scenario():
         segment = object.__new__(RenderSegment)
         segment.segment_id = "segment"
+        segment.detailed_timing = False
+        segment.timing_control = TimingControl(segment)
+        segment.room_timings = {}
+        segment.timing_triggers = {}
         segment.condition_switch_protocol = "clip-barrier-v2"
         segment.condition_switch = segment.pending_prompt = None
         segment.prompt_by_event = {}
@@ -1606,7 +1629,7 @@ def test_recorded_video_engine_with_source_session_prefill_and_switch(
     asyncio.run(run())
 
 
-def test_four_case_sglang_suite_mock_worker_end_to_end(tmp_path):
+def test_four_case_sglang_suite_mock_worker_end_to_end(tmp_path, monkeypatch):
     import importlib.util
     import json
     import sys
@@ -1626,6 +1649,16 @@ def test_four_case_sglang_suite_mock_worker_end_to_end(tmp_path):
     sys.modules["wb_four_case_suite_e2e"] = suite_mod
     spec_mod.loader.exec_module(suite_mod)
 
+    render_commands = []
+    source_send = suite_mod.SourceSession.send
+
+    async def capture_render(self, raw):
+        command = msgspec.msgpack.decode(raw)
+        if command.get("op") == "render.start":
+            render_commands.append(command)
+        return await source_send(self, raw)
+
+    monkeypatch.setattr(suite_mod.SourceSession, "send", capture_render)
     media_dir = tmp_path / "media"
     out_dir = tmp_path / "out"
     rc = suite_mod.main(
@@ -1640,6 +1673,7 @@ def test_four_case_sglang_suite_mock_worker_end_to_end(tmp_path):
             "--max-frames-after-last-event",
             "4",
             "--synthesize-fixtures",
+            "--detailed-timing",
         ]
     )
     assert rc == 0
@@ -1648,6 +1682,10 @@ def test_four_case_sglang_suite_mock_worker_end_to_end(tmp_path):
     assert summary_path.exists()
     assert report_path.exists()
     summary = json.loads(summary_path.read_text())
+    assert summary["detailed_timing_requested"] is True
+    assert len(render_commands) == 6  # Includes both Dark Horns arms and reopening.
+    assert all(command["detailed_timing"] is True for command in render_commands)
+    render_commands.clear()
     assert len(summary["cases"]) == 4
     overview = summary["metrics_overview"]
     assert overview["block0_cache"]["cold_prefill_to_memory_ms"] > 0
@@ -1692,6 +1730,8 @@ def test_four_case_sglang_suite_mock_worker_end_to_end(tmp_path):
         == 0
     )
     assert before == {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in before}
+    assert len(render_commands) == 6
+    assert all("detailed_timing" not in command for command in render_commands)
     secondary = summary["cases"][-1]["secondary_segment"]
     assert secondary["condition_recording_id"] != secondary["source_recording_id"]
     assert "recording_id" not in secondary
@@ -1787,7 +1827,8 @@ def test_four_case_oss_alias_preserves_object_hash(tmp_path, monkeypatch):
     assert (tmp_path / "record/whitebox.mp4").read_bytes() == b"verified"
 
 
-def test_four_case_gate_advances_from_ack_without_observation_race(monkeypatch):
+@pytest.mark.parametrize("state", ["kv_ready", "source_ready"])
+def test_four_case_gate_advances_from_ack_without_observation_race(monkeypatch, state):
     import importlib.util
     import sys
     from pathlib import Path
@@ -1816,7 +1857,7 @@ def test_four_case_gate_advances_from_ack_without_observation_race(monkeypatch):
         assert not segment.model_source_allowed(17)
         # A complete switch may happen before capacity_available runs again.
         ack = dict(
-            type="control_ack", kind="prompt.update", state="kv_ready", prompt_version=2
+            type="control_ack", kind="prompt.update", state=state, prompt_version=2
         )
         await segment.model_control(ack)
         assert segment.model_source_allowed(17)
@@ -2019,3 +2060,41 @@ def test_replay_explicit_synthesis_only_fills_missing_files(tmp_path):
                 mode="mock-worker",
             )
         )
+
+
+@pytest.mark.parametrize("capability", [False, True])
+@pytest.mark.parametrize("protocol", ["clip-barrier-v1", "clip-barrier-v2"])
+@pytest.mark.parametrize("event,boundary", [(7, 17), (8, 17), (7, 34)])
+def test_room_deferred_readiness_requires_capability_and_matching_switch(
+    capability, protocol, event, boundary
+):
+    async def run():
+        loop = asyncio.get_running_loop()
+        switch = dict(
+            boundary=17, accepted=loop.create_future(), ready=loop.create_future()
+        )
+        segment = SimpleNamespace(
+            pending_prompt={"event_id": 7},
+            condition_switch_protocol=protocol,
+            deferred_kv_ready=capability,
+            condition_switch=switch,
+        )
+        owner = object.__new__(SourceSession)
+        message = dict(
+            type="control_ack",
+            kind="prompt.update",
+            state="source_ready",
+            event_id=event,
+            prompt_version=2,
+            source_frame_index=boundary,
+        )
+        await owner.segment_model_control(segment, message)
+        assert switch["ready"].done() is (
+            (protocol == "clip-barrier-v2" or capability)
+            and event == 7
+            and boundary == 17
+        )
+        # Readiness never consumes the pending prompt or reports it applied.
+        assert segment.pending_prompt == {"event_id": 7}
+
+    asyncio.run(run())

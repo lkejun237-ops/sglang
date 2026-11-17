@@ -1154,6 +1154,7 @@ class InteractiveSession(WhiteboxUpstream):
                             admission_wait_ms,
                             blocked_ms,
                         )
+                        self.model_source_dispatch(local, time.perf_counter())
                         await self.send_model_event(
                             ws,
                             "source.append",
@@ -1540,6 +1541,9 @@ class InteractiveSession(WhiteboxUpstream):
         pass
 
     async def before_model_source(self, ws, frame, local):
+        pass
+
+    def model_source_dispatch(self, local, dispatched_at):
         pass
 
     async def model_control(self, message):

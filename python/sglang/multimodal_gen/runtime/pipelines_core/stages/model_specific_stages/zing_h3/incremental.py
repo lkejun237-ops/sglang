@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.realtime.zing_component_metrics import (
     component_timer,
 )
 from sglang.multimodal_gen.runtime.realtime.zing_contracts import Provenance
+from sglang.multimodal_gen.runtime.utils.zing_ttff_timing import measure
 
 from .packing import H3InferenceInputs, H3RowRole
 from .realtime import ZingH3RealtimeState
@@ -671,12 +672,14 @@ class SourceReadySession:
             return
         self._rebuild_pending_prompt(defer_prefix=defer_prefix)
 
-    def activate_prompt_at_source_boundary(self, boundary):
-        """Rebuild an admitted condition without needing a future source chunk.
+    def activate_prompt_at_source_boundary(self, boundary, *, defer_prefix=False):
+        """Prepare an admitted condition without needing a future source chunk.
 
         The source adapter has fenced admission at a full codec clip. Only
         already committed history is used; global source and RNG cursors stay
-        unchanged. A failed destructive rebuild closes the session.
+        unchanged. Negotiated joint execution can retain frozen packs until new
+        source arrives; that receipt means source-ready, not completed KV.
+        A failed destructive rebuild closes the session.
         """
         if (
             self.closed
@@ -694,7 +697,9 @@ class SourceReadySession:
         ):
             raise ValueError("The condition switch boundary is not ready")
         try:
-            self._rebuild_pending_prompt()
+            self._rebuild_pending_prompt(
+                defer_prefix=defer_prefix and self.prompt_joint
+            )
         except BaseException:
             self.dispose()
             raise
@@ -702,6 +707,7 @@ class SourceReadySession:
             event_id=self.prompt.event_id,
             prompt_version=self.prompt.prompt_version,
             source_frame_index=boundary,
+            **({"kv_deferred": True} if self._pending_prefix is not None else {}),
         )
 
     def _rebuild_pending_prompt(self, *, defer_prefix=False):
@@ -765,13 +771,16 @@ class SourceReadySession:
         if error is not None:
             raise error
         if reuse:
-            origin, latent_end = self.sampler.rebuild_prompt_prefix(
-                inputs,
-                candidate.condition,
-                self.recent_visual,
-                self.cache,
-                reuse_prefix=True,
-            )
+            with measure(
+                getattr(self, "ttff_timing", None), "history_kv_rebuild", cuda=True
+            ):
+                origin, latent_end = self.sampler.rebuild_prompt_prefix(
+                    inputs,
+                    candidate.condition,
+                    self.recent_visual,
+                    self.cache,
+                    reuse_prefix=True,
+                )
             self.metrics["gpu_prefix_reuses"] = (
                 self.metrics.get("gpu_prefix_reuses", 0) + 1
             )
@@ -806,17 +815,23 @@ class SourceReadySession:
                 self._pending_prefix = packs
                 self.cache.clear()
             else:
-                origin, latent_end = self.sampler.rebuild_prompt_prefix(
-                    inputs, candidate.condition, self.recent_visual, self.cache
-                )
+                with measure(
+                    getattr(self, "ttff_timing", None), "history_kv_rebuild", cuda=True
+                ):
+                    origin, latent_end = self.sampler.rebuild_prompt_prefix(
+                        inputs, candidate.condition, self.recent_visual, self.cache
+                    )
         else:
-            origin, latent_end = self.sampler.rebuild_prompt_prefix(
-                inputs,
-                candidate.condition,
-                self.recent_visual,
-                self.cache,
-                **({"restore_prefix": restore_prefix} if restore_prefix else {}),
-            )
+            with measure(
+                getattr(self, "ttff_timing", None), "history_kv_rebuild", cuda=True
+            ):
+                origin, latent_end = self.sampler.rebuild_prompt_prefix(
+                    inputs,
+                    candidate.condition,
+                    self.recent_visual,
+                    self.cache,
+                    **({"restore_prefix": restore_prefix} if restore_prefix else {}),
+                )
         if latent_end != 5:
             raise ValueError("Prompt-switch prefix does not meet the next model block")
         if candidate.inputs is not None:
@@ -1483,13 +1498,24 @@ class SourceReadySession:
         current, origin = self._prepare(ready, prompt, self.media_origin)
         with self.rng.random_stream(self.sampler.device, self.seed):
             self._apply_pending_sink(ready, current)
-            first = self._initial_prediction(current, prompt)
+            with measure(
+                getattr(self, "ttff_timing", None), "initial_joint_step0", cuda=True
+            ):
+                first = self._initial_prediction(current, prompt)
             if first is None:
-                self._apply_prefix(current, prompt)
+                with measure(
+                    getattr(self, "ttff_timing", None),
+                    "condition_prefix_apply",
+                    cuda=True,
+                ):
+                    self._apply_prefix(current, prompt)
             if self._pending_prefix is None:
                 self.sampler.step(current, first_prediction=first)
             else:
-                first = self._prefix_prediction(current, False)
+                with measure(
+                    getattr(self, "ttff_timing", None), "prompt_joint_step0", cuda=True
+                ):
+                    first = self._prefix_prediction(current, False)
                 self.sampler.step(current, first_prediction=first)
         return self._finish(ready, current, prompt, origin)
 
@@ -1578,14 +1604,34 @@ class SourceReadySession:
                         ),
                     )
                     if self._pending_prefix is not None:
-                        first = self._prefix_prediction(current, graph_eligible)
+                        with measure(
+                            getattr(self, "ttff_timing", None),
+                            "prompt_joint_step0",
+                            cuda=True,
+                        ):
+                            first = self._prefix_prediction(current, graph_eligible)
                     if cold_init:
-                        first = graphs.initialization(sampler, current)
+                        with measure(
+                            getattr(self, "ttff_timing", None),
+                            "initial_joint_graph",
+                            cuda=True,
+                        ):
+                            first = graphs.initialization(sampler, current)
                     else:
                         if first is None:
-                            first = self._initial_prediction(current, prompt)
+                            with measure(
+                                getattr(self, "ttff_timing", None),
+                                "initial_joint_step0",
+                                cuda=True,
+                            ):
+                                first = self._initial_prediction(current, prompt)
                         if first is None:
-                            self._apply_prefix(current, prompt)
+                            with measure(
+                                getattr(self, "ttff_timing", None),
+                                "condition_prefix_apply",
+                                cuda=True,
+                            ):
+                                self._apply_prefix(current, prompt)
                     # A prompt rebuild has already cleared the old active block.
                     # Otherwise its values are the tail of the existing history.
                     if (
@@ -1614,7 +1660,12 @@ class SourceReadySession:
                         if packs is None:
                             sampler._forward(final, self.cache, "final")
                         elif graph_eligible:
-                            first = graphs.resume(sampler, current, packs)
+                            with measure(
+                                getattr(self, "ttff_timing", None),
+                                "resume_joint_graph",
+                                cuda=True,
+                            ):
+                                first = graphs.resume(sampler, current, packs)
                         else:
                             first = sampler._predict_joint(
                                 packs,
@@ -1632,7 +1683,12 @@ class SourceReadySession:
                     )
                     if graph_eligible:
                         if first is None:
-                            first = graphs.recovery(sampler, current)
+                            with measure(
+                                getattr(self, "ttff_timing", None),
+                                "source_step0_graph",
+                                cuda=True,
+                            ):
+                                first = graphs.recovery(sampler, current)
                         if (
                             not defer_final
                             and len(self.pending) > 1
@@ -1643,9 +1699,18 @@ class SourceReadySession:
                             next_state, _ = self._prepare(
                                 self.pending[1], prompt, origin, previous=current
                             )
-                        video, next_first = graphs.chunk(
-                            sampler, current, first, next_state, defer_final=defer_final
-                        )
+                        with measure(
+                            getattr(self, "ttff_timing", None),
+                            "denoise_graph",
+                            cuda=True,
+                        ):
+                            video, next_first = graphs.chunk(
+                                sampler,
+                                current,
+                                first,
+                                next_state,
+                                defer_final=defer_final,
+                            )
                         sound = None
                     else:
                         if first is None:
@@ -1665,21 +1730,26 @@ class SourceReadySession:
                             and self.pending_sink is None
                             and not self._auto_sink_blocks(ready.chunk.end)
                         )
-                        video, sound = sampler._sample_block(
-                            current.visual,
-                            current.audio,
-                            current.positive,
-                            current.negative,
-                            self.cache,
-                            vs,
-                            aus,
-                            source,
-                            target,
-                            start,
-                            end,
-                            first_prediction=first,
-                            defer_final=lookahead or defer_final,
-                        )
+                        with measure(
+                            getattr(self, "ttff_timing", None),
+                            "denoise_steps",
+                            cuda=True,
+                        ):
+                            video, sound = sampler._sample_block(
+                                current.visual,
+                                current.audio,
+                                current.positive,
+                                current.negative,
+                                self.cache,
+                                vs,
+                                aus,
+                                source,
+                                target,
+                                start,
+                                end,
+                                first_prediction=first,
+                                defer_final=lookahead or defer_final,
+                            )
                         if lookahead:
                             next_state, _ = self._prepare(
                                 self.pending[1], prompt, origin, previous=current

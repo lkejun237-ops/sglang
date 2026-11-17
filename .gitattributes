@@ -1,0 +1,5 @@
+# This reviewed source fixture is SHA-pinned; preserve its LF bytes on Windows.
+/deploy/whitebox/fixtures/conditioning-relay-pr662-r3.py.txt -text
+/deploy/whitebox/fixtures/conditioning-schedule-pr662-r3.py.txt -text
+
+deploy/whitebox/fixtures/conditioning-sources-pr662-r3.py.txt -text

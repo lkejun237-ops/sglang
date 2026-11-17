@@ -125,6 +125,7 @@ def test_external_sink_control_and_prompt_share_the_original_session(model):
         assert h.worker.state.closed
 
     asyncio.run(run())
+    assert h.worker.timing_buffer.drain(final=True) == []
 
 
 def _sink_harness(model, frames=30, *, defer_final=False, pooled_kv=False):
@@ -608,6 +609,7 @@ def test_prompt_bypasses_incomplete_group_and_reuses_original_kv_rebuild(
     model, joint_forward
 ):
     h = Harness(model, joint_forward=joint_forward)
+    h.worker.detailed_timing = True
 
     async def run():
         await h.prompt(10)
@@ -647,6 +649,25 @@ def test_prompt_bypasses_incomplete_group_and_reuses_original_kv_rebuild(
         (8, 10),
         (10, 13),
     ]
+    reports = h.worker.timing_buffer.drain(final=True)
+    output_reports = [
+        r
+        for r in reports
+        if any(s["stage"] == "first_output_compute" for s in r["stages"])
+    ]
+    assert [(r["event_id"], r["prompt_version"]) for r in output_reports] == [
+        (10, 1),
+        (13, 4),
+        (14, 5),
+    ]
+    assert all(
+        any(s["stage"] == "condition_to_source_ready" for s in r["stages"])
+        for r in output_reports
+    )
+    assert all(
+        any(s["stage"] == "history_kv_rebuild" for s in r["stages"])
+        for r in output_reports[1:]
+    )
     assert len(h.rebuilds) == 2
     for index, (_, prefix) in zip((3, 5), h.rebuilds):
         torch.testing.assert_close(
@@ -985,3 +1006,38 @@ def test_session_exit_releases_shared_packer_prefix_memo(model, exit_kind):
         assert h.packer._prefix_memo is None
     finally:
         session.dispose()
+
+
+@torch.no_grad()
+def test_dynamic_timing_does_not_relabel_later_output_as_first(model):
+    h = Harness(model, frames=8)
+
+    async def run():
+        await h.prompt(10)
+        await h.drain_ready()
+        await h.source(0, 1)
+        await h.drain_ready()
+        assert h.worker.timed_output_event == 10
+        assert not h.worker.timing_buffer.pending
+        h.worker.configure_timing(
+            dict(
+                session_id=h.worker.identity[0],
+                generation_id=h.worker.identity[1],
+                enabled=True,
+                timing_revision=1,
+            )
+        )
+        await h.source(1, 5)
+        await h.drain_ready()
+        assert not h.worker.timing_buffer.pending
+        h.worker.configure_timing(
+            dict(
+                session_id=h.worker.identity[0],
+                generation_id=h.worker.identity[1],
+                enabled=False,
+                timing_revision=2,
+            )
+        )
+        h.worker.close()
+
+    asyncio.run(run())

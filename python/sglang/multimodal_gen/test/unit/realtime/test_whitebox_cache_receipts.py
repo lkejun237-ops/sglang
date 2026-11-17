@@ -74,6 +74,9 @@ def test_room_cache_receipts_reject_other_model_generations_and_remain_bounded()
     from sglang.multimodal_gen.runtime.realtime.whitebox.render_segment import (
         RenderSegment,
     )
+    from sglang.multimodal_gen.runtime.realtime.whitebox.ttff_metrics import (
+        TimingMetrics,
+    )
 
     async def run():
         source = object.__new__(SourceSession)
@@ -91,15 +94,27 @@ def test_room_cache_receipts_reject_other_model_generations_and_remain_bounded()
         segment.owner = source
         segment.segment_id = "seg"
         segment.segment_epoch = "segepoch"
-        segment.assignment = NS(session_id="model", generation_id="generation")
-        segment.recording = NS(
-            manifest={
-                "scene_prefill": {
-                    "transition_id": "cutscene",
-                    "request_id": "previous-prefill",
-                    "cache_key": "b" * 64,
-                }
-            }
+        segment.assignment = NS(
+            session_id="model",
+            generation_id="generation",
+            denoiser=NS(worker_epoch="worker"),
+        )
+        archived = []
+
+        async def archive(report):
+            archived.append(report)
+
+        segment.recording = NS(manifest={}, write_inference_timing=archive)
+        segment.detailed_timing = True
+        from sglang.multimodal_gen.runtime.realtime.whitebox.timing_control import (
+            TimingControl,
+        )
+
+        segment.timing_control = TimingControl(segment)
+        segment.timing_metrics = TimingMetrics()
+        segment.timing_triggers = {1: "initial"}
+        segment.recording.manifest["scene_prefill"] = dict(
+            transition_id="cutscene", request_id="previous-prefill", cache_key="b" * 64
         )
         source.current_segment = segment
         source.current_model_stream = "segepoch"
@@ -129,6 +144,23 @@ def test_room_cache_receipts_reject_other_model_generations_and_remain_bounded()
                 sent["prompt_version"] == version
                 and sent["segment_epoch"] == "segepoch"
             )
+        from sglang.multimodal_gen.runtime.utils.zing_ttff_timing import InferenceTiming
+
+        timing = InferenceTiming("dit", prompt_version=3, event_id=7)
+        timing.record("history_kv_rebuild", 20)
+        timing.finished = True
+        message = dict(
+            type="model.timing",
+            model_session_id="model",
+            generation_id="other",
+            timing=timing.snapshot(),
+        )
+        assert await segment.model_control(message)
+        assert len(archived) == 67
+        assert await segment.model_control(dict(message, generation_id="generation"))
+        assert archived.pop()["event_id"] == 7
+        assert len(archived) == 67
+        assert [row["prompt_version"] for row in archived] == list(range(1, 68))
         scene_prefill = segment.recording.manifest["scene_prefill"]
         assert scene_prefill["request_id"] == "previous-prefill"
         assert scene_prefill["cache_key"] == "b" * 64

@@ -78,6 +78,8 @@ def _operation(kind, args, enqueued_at):
         elif kind == "configure":
             _recording.manifest = args[0]
             write_manifest(_recording.directory, _recording.manifest)
+        elif kind == "inference_timing":
+            _recording.inference_timing(args[0])
         elif kind == "source_state":
             _recording.source_state(args[0])
         elif kind == "references":
@@ -292,6 +294,12 @@ class ProcessRecording:
 
     async def configure(self):
         await self._enqueue("configure", (copy.deepcopy(self.manifest),))
+
+    async def write_inference_timing(self, message):
+        self.manifest["inference_timing"] = dict(
+            path="inference-timing.jsonl", schema_version=1
+        )
+        await self._enqueue("inference_timing", (copy.deepcopy(message),))
 
     async def write_source_state(self, message):
         await self._enqueue("source_state", (copy.deepcopy(message),))

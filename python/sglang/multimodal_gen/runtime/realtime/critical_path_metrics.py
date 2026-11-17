@@ -13,9 +13,18 @@ from contextlib import contextmanager
 from functools import lru_cache
 from typing import Any, Iterator
 
-from prometheus_client import CONTENT_TYPE_LATEST, Histogram, generate_latest
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    Histogram,
+    generate_latest,
+)
 
-from sglang.multimodal_gen.runtime.realtime.whitebox.telemetry import CHUNK_FIELDS
+from sglang.multimodal_gen.runtime.realtime.whitebox.telemetry import (
+    CHUNK_FIELDS,
+    CLI_STARTUP_STAGES,
+    TTFF_METRIC_STAGES,
+)
 
 CRITICAL_PATH_BUCKETS = (
     0.0005,
@@ -97,6 +106,7 @@ VALID_STAGES = frozenset(
 # Fixed field names only; no session IDs or user-controlled metric labels.
 
 VALID_STAGES = VALID_STAGES | {"whitebox_h3_telemetry_" + name for name in CHUNK_FIELDS}
+VALID_STAGES = VALID_STAGES | TTFF_METRIC_STAGES | CLI_STARTUP_STAGES
 
 CRITICAL_PATH_STAGE_SECONDS = Histogram(
     "world_model_critical_path_stage_duration_seconds",
@@ -384,14 +394,15 @@ def observe_coordinator_capacity_reservation_seconds(
     return True
 
 
-def prometheus_latest() -> bytes:
+def prometheus_latest(extra_registry: CollectorRegistry | None = None) -> bytes:
     if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
-        from prometheus_client import CollectorRegistry, multiprocess
+        from prometheus_client import multiprocess
 
         registry = CollectorRegistry()
         multiprocess.MultiProcessCollector(registry)
         return generate_latest(registry)
-    return generate_latest()
+    body = generate_latest()
+    return body if extra_registry is None else body + generate_latest(extra_registry)
 
 
 def prometheus_content_type() -> str:

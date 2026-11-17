@@ -1116,6 +1116,16 @@ detailed compiled prompts and reference-image reads remain opt-in diagnostics.
 Test-lane acceptance verifies ordinary non-inference playback; real model application
 requires a model-enabled environment and is not established by a whitebox-only run.
 
+
+### 按 render 开启详细分时
+
+`render.start` / `render.replace` 可选 `detailed_timing`（严格 boolean，默认 false）。
+仅对当前 render 生效，后续 prompt 继承，下次 render 未传则关闭。Room 将该值放入模型
+init，分离 Encoder/DiT/Decoder 按会话消费；关闭时基础首帧/切换 TTFF 仍进入 metrics，
+但不生成角色详细回执或计时 JSONL。已开始的自动 startup 不追补详细计时；需要诊断时
+显式创建新 render。配套角色须升级，未提供的字段不估算。完整口径和采集接入见
+[TTFF 方案](../../zing/plans/serving-ttff-breakdown.md)。
+
 ### Scene entry source control
 
 The dedicated native single-player Room adapter can call the CLI owner endpoint

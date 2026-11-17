@@ -43,6 +43,10 @@ from sglang.multimodal_gen.runtime.realtime.zing_source_stream import (
     remote_decode_progressive,
 )
 from sglang.multimodal_gen.runtime.utils.bounded_process_log import diagnostic_print
+from sglang.multimodal_gen.runtime.utils.zing_ttff_timing import (
+    InferenceTiming,
+    measure,
+)
 
 from .decoder_transport import bridge_group, receive_latent
 from .source_decoder import check_latent_append
@@ -78,6 +82,21 @@ def _queue_chunk_timing(entry, command, timeout_seconds):
         timeout_seconds,
         discard_if_stopped=True,
     )
+
+
+def configure_decoder_timing(entry, command):
+    from sglang.multimodal_gen.runtime.utils.zing_ttff_timing import (
+        validate_timing_update,
+    )
+
+    identity = entry["timing_identity"]
+    if any(command.get(k) != identity.get(k) for k in ("session_id", "generation_id")):
+        raise ValueError("Decoder timing session or generation does not match")
+    validate_timing_update(command, entry["timing_revision"])
+    # Already-submitted jobs retain their timing objects. No GPU fence is added.
+    entry["detailed_timing"] = command["enabled"]
+    entry["timing_revision"] = command["timing_revision"]
+    return dict(ok=True, output_frame_start=entry["service"].submitted_frames)
 
 
 def initialize_runtime_imports():
@@ -233,7 +252,7 @@ class _DecodeService:
             raise ValueError("Decoder slices do not match valid output frames")
         return counts
 
-    def submit(self, frames, reference, *, timing_state=None):
+    def submit(self, frames, reference, *, timing_state=None, timing=None):
         """Move the pending latents into one decode job without waiting for it."""
         pending = self.valid_frame_end - self.submitted_frames
         if frames != pending:
@@ -243,6 +262,8 @@ class _DecodeService:
         ticket = self._step_gate.issue() if self._step_gate is not None else None
         job = dict(
             latents=self._pending,
+            timing=timing,
+            queued_at=time.perf_counter(),
             slices=self.output_slices(frames) if self.progressive else None,
             frames=frames,
             reference=reference,
@@ -325,6 +346,12 @@ class _DecodeService:
             if isinstance(timing_state, dict):
                 sub_ns = timing_state.get("submitted_mono_ns", dec_start_ns)
                 timing_state["wait_ms"] = max(0.0, (dec_start_ns - sub_ns) / 1e6)
+            timing = job.get("timing")
+            if timing is not None:
+                timing.record(
+                    "decoder_queue_wait",
+                    (time.perf_counter() - job["queued_at"]) * 1000,
+                )
             error = decoded = None
             try:
                 with (
@@ -345,7 +372,8 @@ class _DecodeService:
                                 else [latent]
                             )
                             for piece in pieces:
-                                produced = self._stream.push(piece)
+                                with measure(timing, "vae_decode", cuda=True):
+                                    produced = self._stream.push(piece)
                                 self._held = (
                                     produced
                                     if self._held is None
@@ -356,14 +384,18 @@ class _DecodeService:
                                 ):
                                     decoded = self._take(job["slices"][part_index])
                                     if job["reference"] is not None:
-                                        self.publisher.publish_slice(
-                                            job["reference"], part_index, decoded
-                                        )
+                                        with measure(
+                                            timing, "rgb_copy_publish", cuda=True
+                                        ):
+                                            self.publisher.publish_slice(
+                                                job["reference"], part_index, decoded
+                                            )
                                     part_index += 1
                         if job["slices"] is None:
                             decoded = self._take(job["frames"])
                             if job["reference"] is not None:
-                                self.publisher.publish(job["reference"], decoded)
+                                with measure(timing, "rgb_copy_publish", cuda=True):
+                                    self.publisher.publish(job["reference"], decoded)
                         elif part_index != len(job["slices"]):
                             raise ValueError(
                                 "Decoder did not publish every valid slice"
@@ -392,6 +424,8 @@ class _DecodeService:
             finally:
                 if self._step_gate is not None and ticket is not None:
                     self._step_gate.leave(ticket)
+                if timing is not None:
+                    timing.finished = True
                 job["done"].set()
             index += 1
 
@@ -1221,6 +1255,11 @@ def main():
                         output_session = None
                         try:
                             requested = command["session"]
+                            detailed_timing = (command.get("output_session") or {}).get(
+                                "detailed_timing", False
+                            )
+                            if type(detailed_timing) is not bool:
+                                raise ValueError("Invalid detailed timing mode")
                             if not isinstance(requested, str) or not requested:
                                 raise ValueError("Invalid decoder session")
                             if type(command.get("auto_output", False)) is not bool:
@@ -1306,6 +1345,9 @@ def main():
                                 channel=new_channel,
                                 auto_output=command.get("auto_output", False),
                                 output_session=output_session,
+                                detailed_timing=detailed_timing,
+                                timing_revision=0,
+                                timing_identity=(command.get("output_session") or {}),
                             )
                             channels_by_token[new_token] = new_channel
                             service, bridge, token, channel = (
@@ -1322,6 +1364,7 @@ def main():
                             )
                             if output_session is not None:
                                 reply["oneway_supported"] = True
+                                reply["timing_updates"] = True
                                 reply["output_attachment"] = dict(
                                     token=output_session.token,
                                     path="/v1/realtime_video/output",
@@ -1353,6 +1396,7 @@ def main():
                         "output",
                         "chunk_timing",
                         "source_progress",
+                        "timing.configure",
                         "finish",
                         "close",
                     ):
@@ -1406,6 +1450,30 @@ def main():
                                 "Decoder output length does not match its frames"
                             )
                         reference = metadata = None
+                        timing = None
+                        output_meta = command.get("output_metadata", {})
+                        event_id = output_meta.get("event_id")
+                        if (
+                            frames
+                            and entry["detailed_timing"]
+                            and type(output_meta.get("prompt_version")) is int
+                            and event_id != entry.get("ttff_output_event", object())
+                        ):
+                            entry["ttff_output_event"] = event_id
+                            timing = InferenceTiming(
+                                "decoder",
+                                timing_revision=entry["timing_revision"],
+                                event_id=event_id,
+                                prompt_version=output_meta.get("prompt_version"),
+                                generation_id=command.get("generation_id"),
+                                rank=rank,
+                                device=service.device,
+                                output_frame_start=output_meta.get(
+                                    "output_frame_start"
+                                ),
+                            )
+                        if frames:
+                            entry["ttff_output_event"] = event_id
                         direct_output = entry.get("output_session")
                         if frames:
                             if rank == 0:
@@ -1450,7 +1518,10 @@ def main():
                             )
                             try:
                                 service.submit(
-                                    frames, reference, timing_state=timing_state
+                                    frames,
+                                    reference,
+                                    timing_state=timing_state,
+                                    timing=timing,
                                 )
                                 submitted = True
                                 if direct_output is not None:
@@ -1461,6 +1532,7 @@ def main():
                                             metadata=metadata,
                                             output_metadata=command["output_metadata"],
                                             timing_state=timing_state,
+                                            timing=timing,
                                         ),
                                         args.timeout_seconds,
                                         discard_if_stopped=True,
@@ -1486,6 +1558,8 @@ def main():
                     elif op == "chunk_timing":
                         if rank == 0:
                             _queue_chunk_timing(entry, command, args.timeout_seconds)
+                    elif op == "timing.configure":
+                        reply = configure_decoder_timing(entry, command)
                     elif op == "source_progress":
                         if rank == 0:
                             direct_output = entry.get("output_session")

@@ -170,6 +170,8 @@ class VideoRemixRequest(BaseModel):
 class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
     # Opt-in accepted-input receipts; raw media remain on the existing upload.
     record_model_inputs: StrictBool = False
+    # Per-session diagnostics; basic Room TTFF remains available when disabled.
+    detailed_timing: StrictBool = False
     cache_write: StrictBool = False
     game_id: Optional[str] = None
     group_id: Optional[str] = None

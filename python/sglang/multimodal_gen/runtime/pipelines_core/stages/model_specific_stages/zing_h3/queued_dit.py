@@ -15,6 +15,12 @@ import torch
 
 from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
 from sglang.multimodal_gen.runtime.realtime.polling_task_queue import PollingTaskQueue
+from sglang.multimodal_gen.runtime.utils.zing_ttff_timing import (
+    InferenceTiming,
+    TimingBuffer,
+    measure,
+    validate_timing_update,
+)
 
 
 class QueuedDiTSession:
@@ -35,6 +41,7 @@ class QueuedDiTSession:
         max_control_tasks=10,
         max_condition_bytes=256 << 20,
         return_stage_timing=False,
+        detailed_timing=False,
     ):
         if not session_id or not generation_id:
             raise ValueError("DiT session identity is required")
@@ -42,6 +49,13 @@ class QueuedDiTSession:
             raise ValueError("DiT queue budgets must be positive")
         self.return_stage_timing = return_stage_timing
         self.identity = session_id, generation_id
+        if type(detailed_timing) is not bool:
+            raise ValueError("Invalid detailed timing mode")
+        self.detailed_timing = detailed_timing
+        self.timing_revision = 0
+        self.timing_buffer = TimingBuffer()
+        self.condition_timings = {}
+        self.timed_output_event = object()
         self.create_session = create_session
         self.bridge, self.sample_moments = bridge, sample_moments
         self.on_output, self.validate_condition = on_output, validate_condition
@@ -74,6 +88,18 @@ class QueuedDiTSession:
             ready=self._queue_ready,
             poll_interval_s=poll_interval_s,
         )
+
+    def configure_timing(self, message):
+        # Called by the ordered input owner between model tasks, never a side thread.
+        self._open()
+        if self.eos_received or self.complete:
+            raise ValueError("DiT input has ended")
+        if (message.get("session_id"), message.get("generation_id")) != self.identity:
+            raise ValueError("DiT input session or generation does not match")
+        validate_timing_update(message, self.timing_revision)
+        self.detailed_timing = message["enabled"]
+        self.timing_revision = message["timing_revision"]
+        return dict(source_frame_end=self.bridge.accepted_pixels)
 
     def _queue_ready(self, queue):
         if self.closed:
@@ -192,6 +218,12 @@ class QueuedDiTSession:
                     raise ValueError("Invalid source preparation")
                 preparation_identity(preparation["identity"])
             boundary = message.get("source_boundary")
+            if "allow_deferred_kv" in message and (
+                type(message["allow_deferred_kv"]) is not bool
+                or cancelled
+                or boundary is None
+            ):
+                raise ValueError("Invalid deferred condition readiness")
             if boundary is not None and (
                 cancelled
                 or not self.initial_received
@@ -354,6 +386,7 @@ class QueuedDiTSession:
             task = dict(message)
         else:
             raise ValueError("Unsupported DiT input message")
+        task["_queued_at"] = time.perf_counter()
         self.queue.append(task)
         if kind == "source.end":
             self.eos_received = True
@@ -406,6 +439,27 @@ class QueuedDiTSession:
 
     async def _process(self, queue):
         task = queue.popleft()
+        timing = None
+        if (
+            self.detailed_timing
+            and task["type"] == "conditioning"
+            and type(task.get("prompt_version")) is int
+        ):
+            timing = InferenceTiming(
+                "dit",
+                timing_revision=self.timing_revision,
+                event_id=task.get("event_id"),
+                prompt_version=task.get("prompt_version"),
+                session_id=self.identity[0],
+                generation_id=self.identity[1],
+                rank=torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0,
+            )
+            timing.record(
+                "condition_queue_wait",
+                (time.perf_counter() - task["_queued_at"]) * 1000,
+            )
         self.in_flight = True
         try:
             if task["type"] == "sink.update":
@@ -442,7 +496,8 @@ class QueuedDiTSession:
                         candidate = None
                         task.pop("_reuse_gpu_prefix", None)
                         if self.prepare_condition is not None:
-                            candidate = self.prepare_condition(task)
+                            with measure(timing, "condition_admission", cuda=True):
+                                candidate = self.prepare_condition(task)
                         if self.validate_condition is not None:
                             self.validate_condition(task["tensors"])
                         if task["initial"]:
@@ -475,7 +530,7 @@ class QueuedDiTSession:
                             boundary = task.get("source_boundary")
                             if boundary is not None:
                                 # All earlier source messages have drained on this
-                                # single writer. Rebuild without waiting for a
+                                # single writer. Prepare without waiting for a
                                 # future source frame: Room is fenced at B.
                                 if (
                                     self.bridge.accepted_pixels != boundary
@@ -484,10 +539,23 @@ class QueuedDiTSession:
                                     raise ValueError(
                                         "The source condition barrier is not drained"
                                     )
-                                ready = self.state.activate_prompt_at_source_boundary(
-                                    boundary
-                                )
-                                self.confirm_condition_ready(ready)
+                                self.state.ttff_timing = timing
+                                try:
+                                    with measure(
+                                        timing, "condition_activate", cuda=True
+                                    ):
+                                        ready = self.state.activate_prompt_at_source_boundary(
+                                            boundary,
+                                            **(
+                                                {"defer_prefix": True}
+                                                if task.get("allow_deferred_kv")
+                                                else {}
+                                            ),
+                                        )
+                                finally:
+                                    self.state.ttff_timing = None
+                                with measure(timing, "condition_ready_wait"):
+                                    self.confirm_condition_ready(ready)
                                 self.condition_ready = ready
                 except ConditionError as exc:
                     if task["initial"]:
@@ -501,6 +569,15 @@ class QueuedDiTSession:
                 finally:
                     self.control_tasks -= 1
                     self.condition_bytes -= task["nbytes"]
+                    if timing is not None:
+                        self.timing_buffer.add(timing)
+                        self.condition_timings[task.get("event_id")] = (
+                            time.perf_counter()
+                        )
+                        if len(self.condition_timings) > 64:
+                            self.condition_timings.pop(
+                                next(iter(self.condition_timings))
+                            )
             elif task["type"] == "source.group":
                 chunk = task["chunk"]
                 dit_start_ns = time.perf_counter_ns() if self.return_stage_timing else 0
@@ -524,31 +601,84 @@ class QueuedDiTSession:
                 # per-forward graph route rejects after-step0 window eviction.
                 # Exhaust the iterator after delivering its one result, and
                 # close it explicitly if the output consumer fails or cancels.
-                with closing(self.state.drain_ready(max_outputs=1)) as outputs:
-                    for result in outputs:
-                        ev_dit_end = None
-                        visual = getattr(result, "visual", None)
-                        if (
-                            ev_dit_start is not None
-                            and isinstance(visual, torch.Tensor)
-                            and visual.is_cuda
-                        ):
-                            ev_dit_end = torch.cuda.Event(enable_timing=True)
-                            ev_dit_end.record(torch.cuda.current_stream(visual.device))
-                        self.last_output_timing_ctx = (
-                            dict(
-                                dit_start_ns=dit_start_ns,
-                                input_timings=input_timings,
-                                ev_dit_start=ev_dit_start,
-                                ev_dit_end=ev_dit_end,
+                candidate = self.state.pending_prompt or self.state.prompt
+                event_id = candidate.event_id
+                first = event_id != self.timed_output_event
+                timing = (
+                    InferenceTiming(
+                        "dit",
+                        timing_revision=self.timing_revision,
+                        event_id=event_id,
+                        prompt_version=candidate.prompt_version,
+                        session_id=self.identity[0],
+                        generation_id=self.identity[1],
+                        rank=torch.distributed.get_rank()
+                        if torch.distributed.is_initialized()
+                        else 0,
+                    )
+                    if self.detailed_timing
+                    and first
+                    and type(candidate.prompt_version) is int
+                    else None
+                )
+                compute_started = time.perf_counter()
+                self.state.ttff_timing = timing
+                try:
+                    with closing(self.state.drain_ready(max_outputs=1)) as outputs:
+                        while True:
+                            try:
+                                with measure(timing, "first_output_compute", cuda=True):
+                                    result = next(outputs)
+                            except StopIteration:
+                                break
+                            if timing is not None:
+                                # Bind to the actual applied result, never a speculative candidate.
+                                timing.identity.update(
+                                    event_id=result.prompt_event_id,
+                                    prompt_version=result.prompt_version,
+                                    **result.provenance.metadata(),
+                                )
+                                if result.prompt_event_id != self.timed_output_event:
+                                    prepared_at = self.condition_timings.pop(
+                                        result.prompt_event_id, None
+                                    )
+                                    if prepared_at is not None:
+                                        timing.record(
+                                            "condition_to_source_ready",
+                                            (compute_started - prepared_at) * 1000,
+                                        )
+                                    self.timing_buffer.add(timing)
+                                    self.timed_output_event = result.prompt_event_id
+                                timing = None
+                                self.state.ttff_timing = None
+                            self.timed_output_event = result.prompt_event_id
+                            ev_dit_end = None
+                            visual = getattr(result, "visual", None)
+                            if (
+                                ev_dit_start is not None
+                                and isinstance(visual, torch.Tensor)
+                                and visual.is_cuda
+                            ):
+                                ev_dit_end = torch.cuda.Event(enable_timing=True)
+                                ev_dit_end.record(
+                                    torch.cuda.current_stream(visual.device)
+                                )
+                            self.last_output_timing_ctx = (
+                                dict(
+                                    dit_start_ns=dit_start_ns,
+                                    input_timings=input_timings,
+                                    ev_dit_start=ev_dit_start,
+                                    ev_dit_end=ev_dit_end,
+                                )
+                                if input_timings is not None
+                                else None
                             )
-                            if input_timings is not None
-                            else None
-                        )
-                        try:
-                            await self.on_output(result)
-                        finally:
-                            self.last_output_timing_ctx = None
+                            try:
+                                await self.on_output(result)
+                            finally:
+                                self.last_output_timing_ctx = None
+                finally:
+                    self.state.ttff_timing = None
             else:
                 if not self.state.ended:
                     self.state.finish()

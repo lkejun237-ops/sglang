@@ -119,6 +119,8 @@ def _worker(
                     archive_pts_us={"whitebox": frame.provenance["capture_pts_us"]},
                 )
                 last_frame = frame.index
+            elif kind == "inference_timing":
+                recording.inference_timing(value)
             elif kind == "state":
                 recording.source_state(value)
             elif kind == "configure":
@@ -214,6 +216,7 @@ def _persist_failure(directory, manifest):
             "archive_failure",
             "last_successful_frame",
             "missing_frame_range",
+            "inference_timing",
             "upload_status",
             "upload_failure",
         ):
@@ -291,6 +294,9 @@ def _payload_size(value, depth=0):
 class AsyncRecording:
     """Frame admission never waits; condition changes can confirm asset writes."""
 
+    TIMING_QUEUE_DEPTH = 32
+    TIMING_QUEUE_BYTES = 256 * 1024
+
     def __init__(self, manager, kwargs):
         self.manager, self.kwargs = manager, kwargs
         self.directory, self.spec, self.trace_id = (
@@ -343,6 +349,8 @@ class AsyncRecording:
             },
         )
         self.items = deque()
+        self.timing_items = deque()
+        self.timing_bytes = 0
         self.pending_bytes = 0
         self.pending = None
         self.last_frame = -1
@@ -387,6 +395,8 @@ class AsyncRecording:
         if self.failure:
             return
         self.failure = reason
+        if self.timing_bytes:
+            self.manifest["inference_timing"]["incomplete"] = True
         self.accepting = False
         self.items.clear()
         self.pending_bytes = self.pending[1] if self.pending else 0
@@ -465,6 +475,30 @@ class AsyncRecording:
                     self._acknowledged.clear()
                     await self._acknowledged.wait()
         return reference_descriptors(references)
+
+    async def write_inference_timing(self, message):
+        self.manifest.setdefault(
+            "inference_timing", dict(path="inference-timing.jsonl", schema_version=1)
+        )
+        # Optional telemetry never consumes required queue capacity or the
+        # sequence used to confirm reference writes. The same worker drains it
+        # only when no required operation is waiting.
+        try:
+            size = _payload_size(message)
+            if (
+                not self.accepting
+                or len(self.timing_items) >= self.TIMING_QUEUE_DEPTH
+                or self.timing_bytes + size > self.TIMING_QUEUE_BYTES
+            ):
+                self.manifest["inference_timing"]["incomplete"] = True
+                return
+            snapshot = copy.deepcopy(message)
+        except (ValueError, RecursionError, MemoryError, TypeError):
+            self.manifest["inference_timing"]["incomplete"] = True
+            return
+        self.timing_items.append((time.monotonic(), size, "inference_timing", snapshot))
+        self.timing_bytes += size
+        self.wake.set()
 
     async def write_source_state(self, message):
         self.offer("state", message)
@@ -559,7 +593,7 @@ class AsyncRecording:
             self.worker_ready = True
             self.startup_complete.set()
             while not self.failure:
-                if not self.items:
+                if not self.items and not self.timing_items:
                     if self.final_outcome is not None:
                         commands.put_nowait(
                             (
@@ -581,9 +615,19 @@ class AsyncRecording:
                         if not self.process.is_alive():
                             raise RuntimeError("WORKER_EXITED")
                     continue
-                self.pending = self.items.popleft()
-                queued, size, operation, value = self.pending
+                optional = not self.items
+                if optional:
+                    # In-flight telemetry retains its separate byte budget and
+                    # must not look like a pending required queue operation.
+                    item = self.timing_items.popleft()
+                else:
+                    item = self.pending = self.items.popleft()
+                queued, size, operation, value = item
                 if time.monotonic() - queued > self.manager.max_age:
+                    if optional:
+                        self.timing_bytes -= size
+                        self.manifest["inference_timing"]["incomplete"] = True
+                        continue
                     raise TimeoutError("QUEUE_TOO_OLD")
                 observe_duration(
                     "archive_queue_wait",
@@ -600,10 +644,13 @@ class AsyncRecording:
                 observe_duration(
                     "archive_worker_" + operation, result["duration_ms"], self.trace_id
                 )
-                self.pending_bytes -= size
-                self.pending = None
-                self._completed_sequence += 1
-                self._acknowledged.set()
+                if optional:
+                    self.timing_bytes -= size
+                else:
+                    self.pending_bytes -= size
+                    self.pending = None
+                    self._completed_sequence += 1
+                    self._acknowledged.set()
         except asyncio.CancelledError:
             self.degrade("ARCHIVE_CANCELLED")
         except Exception:
@@ -625,6 +672,10 @@ class AsyncRecording:
                     ipc.close()
             self.pending = None
             self.items.clear()
+            if self.timing_items or self.timing_bytes:
+                self.manifest["inference_timing"]["incomplete"] = True
+            self.timing_items.clear()
+            self.timing_bytes = 0
             self.pending_bytes = 0
             # Drop init image snapshots as soon as the process is finished.
             self.kwargs = {}

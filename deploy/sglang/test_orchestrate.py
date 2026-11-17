@@ -4,6 +4,7 @@ import asyncio
 import base64
 import copy
 import hashlib
+import importlib.util
 import json
 import os
 import sys
@@ -16,6 +17,95 @@ sys.path.insert(0, str(Path(__file__).parent))
 import launch
 import orchestrate as orch
 import source
+
+
+@pytest.mark.parametrize("missing", ["job_id", "job_name", "pai"])
+def test_reused_dit_requires_cloud_identity(spec, missing):
+    entry = dict(
+        http="http://10.0.0.122:33000",
+        worker_id="dit-worker",
+        pai=True,
+        job_id="dlc-owned",
+        job_name="owned-dit",
+    )
+    entry.pop(missing)
+    spec["existing_services"] = {"dit": entry}
+    with pytest.raises(ValueError, match="DiT reuse requires"):
+        orch.validate_spec(spec)
+
+
+@pytest.mark.parametrize(
+    "failure", [None, "running-original", "wrong-worker", "wrong-source"]
+)
+def test_reconcile_retry_preserves_ownership(state, tmp_path, failure):
+    path = orch.REPO / "benchmark/whitebox/reconcile_role_retry.py"
+    module_spec = importlib.util.spec_from_file_location("reconcile_retry", path)
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    original_path = tmp_path / "state.json"
+    retry_path = tmp_path / "retry/state.json"
+    retry = copy.deepcopy(state)
+    retry["run_id"] = "e" * 32
+    retry["deployment_id"] = "deploy-retry"
+    retry["spec"]["existing_services"] = {}
+    for role in ("encoder", "decoder"):
+        receipt = state["resources"][role]["receipt"]
+        entry = {k: receipt[k] for k in ("worker_id", "http", "gpu")}
+        retry["spec"]["existing_services"][role] = entry
+        retry["resources"][role] = orch.reused_resource(
+            retry["run_id"], "model1027", role, entry
+        )
+    replacement = retry["resources"]["dit"]
+    replacement.update(
+        run_id=retry["run_id"], name="sglang-dit-eeeeeeeeeeee-0", job_id="dlc-retry"
+    )
+    replacement["receipt"]["worker_id"] = "dit-retry"
+    if failure == "wrong-worker":
+        retry["resources"]["encoder"]["receipt"]["worker_id"] = "encoder-unrelated"
+        retry["spec"]["existing_services"]["encoder"]["worker_id"] = "encoder-unrelated"
+    if failure == "wrong-source":
+        retry["source"]["commit"] = "f" * 40
+    orch.save(retry_path, retry)
+    jobs = {}
+    for s, status in ((state, "Failed"), (retry, "Running")):
+        resource = s["resources"]["dit"]
+        jobs[resource["job_id"]] = dict(
+            JobId=resource["job_id"],
+            DisplayName=resource["name"],
+            WorkspaceId=orch.TARGET["workspace_id"],
+            ResourceId=orch.TARGET["quota_id"],
+            Status=status,
+            JobSpecs=[dict(PodCount=1, ResourceConfig={"GPU": "1"})],
+        )
+    if failure == "running-original":
+        jobs["dlc-owned"]["Status"] = "Running"
+    cloud = Mock(get_job=lambda job_id: jobs[job_id])
+    before = original_path.read_bytes(), retry_path.read_bytes()
+    if failure:
+        with pytest.raises(ValueError):
+            module.reconcile(
+                original_path,
+                retry_path,
+                "dit",
+                "test-480",
+                "test-recovery",
+                cloud,
+                True,
+            )
+        assert before == (original_path.read_bytes(), retry_path.read_bytes())
+        assert not (tmp_path / "state.before-reconcile.json").exists()
+        return
+    module.reconcile(
+        original_path, retry_path, "dit", "test-480", "test-recovery", cloud, True
+    )
+    recovered, retried = orch.load_state(original_path), orch.load_state(retry_path)
+    assert orch.owned_roles(recovered["spec"]) == ("encoder", "decoder")
+    assert orch.owned_roles(retried["spec"]) == ("dit",)
+    assert recovered["replaced_resources"][0]["resource"]["job_id"] == "dlc-owned"
+    assert recovered["resources"]["dit"]["reused"] is True
+    assert recovered["phase"] == retried["phase"] == "waiting"
+    assert "selftest" not in recovered and "selftest" not in retried
+    assert (tmp_path / "state.before-reconcile.json").read_bytes() == before[0]
 
 
 @pytest.fixture
@@ -381,6 +471,69 @@ def test_ready_requires_runtime_and_live_health(state, tmp_path, monkeypatch):
     state["resources"]["dit"]["receipt"]["commit"] = "f" * 40
     with pytest.raises(ValueError, match="identity mismatch"):
         orch.wait_ready(state, tmp_path, cloud)
+
+
+@pytest.mark.parametrize("mismatch", [None, "worker_id", "http", "model_id", "job"])
+def test_native_pai_reuse_checks_pinned_job_without_reservation(
+    state, tmp_path, monkeypatch, mismatch
+):
+    observed = copy.deepcopy(state["resources"]["encoder"]["receipt"])
+    observed["http"] = "http://10.0.0.123:31000"
+    entry = dict(
+        http=observed["http"],
+        worker_id=observed["worker_id"],
+        pai=True,
+        job_id="dlc-reused",
+        job_name="existing-encoder",
+    )
+    state["spec"]["existing_services"] = {"encoder": entry}
+    state["spec"]["roles"].pop("encoder")
+    state["resources"]["encoder"] = orch.reused_resource(
+        state["run_id"], "model1027", "encoder", entry
+    )
+    orch.validate_spec(state["spec"])
+    cloud = Mock(timeout=1)
+    cloud.get_job.return_value = dict(
+        JobId=entry["job_id"],
+        DisplayName=entry["job_name"],
+        Status="Running",
+        WorkspaceId=orch.TARGET["workspace_id"],
+        ResourceId=orch.TARGET["quota_id"],
+        JobSpecs=[dict(PodCount=1, ResourceConfig={"GPU": "1"})],
+    )
+    cloud.receipt.side_effect = lambda resource, role: (
+        observed if role == "encoder" else resource["receipt"]
+    )
+    calls = []
+
+    def request(url, **kwargs):
+        calls.append(url)
+        if url.endswith("/get_connection_status?reserve=false"):
+            return {"state": "available"}  # Actual native non-reserving response.
+        assert url.endswith("/health")
+        role = next(
+            r
+            for r in orch.ROLES
+            if state["resources"][r]["receipt"]["http"] + "/health" == url
+        )
+        return {"role": role, "ready": True}
+
+    monkeypatch.setattr(orch, "http", request)
+    if mismatch == "job":
+        cloud.get_job.return_value["JobId"] = "dlc-replacement"
+    elif mismatch:
+        observed[mismatch] = "different"
+    if mismatch:
+        with pytest.raises(ValueError):
+            orch.wait_ready(state, tmp_path, cloud)
+    else:
+        orch.wait_ready(state, tmp_path, cloud)
+        assert state["phase"] == "ready"
+        assert state["resources"]["encoder"]["receipt"]["commit"] == observed["commit"]
+    assert all(
+        "get_connection_status" not in url or "reserve=false" in url for url in calls
+    )
+    cloud.submit_job.assert_not_called()
 
 
 def test_ready_timeout_keeps_resource_ids(state, tmp_path, monkeypatch):

@@ -89,6 +89,7 @@ def recorded(tmp_path):
         data.blob("references/original.bin", old_reference)
         data.blob("references/rain.bin", new_reference)
         conditions = SimpleNamespace(
+            room_timings={},
             first_output_at=None,
             sink=SimpleNamespace(output=nothing),
             prompt_by_event={

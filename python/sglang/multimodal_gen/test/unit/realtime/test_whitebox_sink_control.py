@@ -239,8 +239,9 @@ def test_sink_prompt_rebuild_updates_anchor_without_replaying_user_request():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("timing_control", [False, True])
 def test_real_source_segment_routes_sink_and_input_without_waiting_for_model(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, timing_control
 ):
     from test_whitebox_render_lifecycle import (
         AsyncArchiveManager,
@@ -258,6 +259,7 @@ def test_real_source_segment_routes_sink_and_input_without_waiting_for_model(
     async def emit(worker, message):
         if message["type"] == "session.ready":
             message["sink_updates"] = True
+            message["timing_updates"] = True
         if message["type"] in {"frame_batch", "frame_batch_header"}:
             enabled = getattr(worker, "sink_enabled", False)
             message.update(
@@ -269,6 +271,26 @@ def test_real_source_segment_routes_sink_and_input_without_waiting_for_model(
 
     async def send(worker, wire):
         message = msgspec.msgpack.decode(wire)
+        if message.get("kind") == "timing.configure":
+            payload = message["payload"]
+            worker.events.append(message)
+            await worker.emit(
+                dict(
+                    type="control_ack",
+                    kind="timing.configure",
+                    event_id=message["event_id"],
+                    model_session_id=payload["session_id"],
+                    generation_id=payload["generation_id"],
+                    enabled=payload["enabled"],
+                    timing_revision=payload["timing_revision"],
+                    boundaries=dict(
+                        encoder=dict(command_index=1),
+                        dit=dict(source_frame_end=1),
+                        decoder=dict(output_frame_start=1),
+                    ),
+                )
+            )
+            return
         if message.get("kind") in {"sink.refresh", "sink.off"}:
             worker.sink_event = message["event_id"]
             worker.sink_enabled = message["kind"] == "sink.refresh"
@@ -371,7 +393,17 @@ def test_real_source_segment_routes_sink_and_input_without_waiting_for_model(
             for i, action in enumerate(("on", "refresh", "off"), 1):
                 cmd = dict(
                     type="command",
-                    **command("model.sink", f"sink-{i}", **scope, action=action),
+                    **(
+                        command(
+                            "model.timing.configure",
+                            f"sink-{i}",
+                            **scope,
+                            enabled=i != 2,
+                            expected_timing_revision=i - 1,
+                        )
+                        if timing_control
+                        else command("model.sink", f"sink-{i}", **scope, action=action)
+                    ),
                 )
                 await source.send(msgspec.msgpack.encode(cmd))
                 await source.send(
@@ -391,7 +423,17 @@ def test_real_source_segment_routes_sink_and_input_without_waiting_for_model(
                         != "completed"
                     ):
                         await asyncio.sleep(0.01)
-                assert segment.sink.snapshot["enabled"] is (action != "off")
+                if timing_control:
+                    assert segment.detailed_timing is (i != 2)
+                    assert segment.timing_control.revision == i
+                    assert (
+                        segment.recording.manifest["timing_changes"][-1][
+                            "timing_revision"
+                        ]
+                        == i
+                    )
+                else:
+                    assert segment.sink.snapshot["enabled"] is (action != "off")
             assert leases.active == 1 and len(leases.opens) == 1
             assert source.current_segment is segment and not engine.closed
             await source.close()

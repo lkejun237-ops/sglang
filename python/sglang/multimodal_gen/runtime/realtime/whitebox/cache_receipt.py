@@ -57,6 +57,18 @@ def public_cache_receipt(value):
             else None
         ),
         timings=dict(
-            elapsed_host_ms=duration(details.get("elapsed_host_ms")), stages=stages
+            elapsed_host_ms=duration(details.get("elapsed_host_ms")),
+            stages=stages,
+            cuda_ms={
+                name: duration(value)
+                for name, value in list(
+                    (
+                        details.get("cuda_ms")
+                        if isinstance(details.get("cuda_ms"), dict)
+                        else {}
+                    ).items()
+                )[:32]
+                if isinstance(name, str) and re.fullmatch(r"[a-z0-9_]{1,64}", name)
+            },
         ),
     )

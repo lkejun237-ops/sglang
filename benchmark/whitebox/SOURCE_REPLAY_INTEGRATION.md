@@ -14,7 +14,7 @@ Room 的 Latest-Wins、credit、参考图归档、切词屏障及清理代码保
 `--flow-mode natural`（默认）直接使用 `SourceSession`，不安装测试专用 admission 闸门，
 用于观察真实 Room 策略下的选帧、丢帧、切词延迟。
 `--flow-mode deterministic` 使用测试子类，在目标模型输入计数处关闭 admission，
-由真实 `kv_ready` 回执推进闸门，并要求实际切词边界与请求一致；用于精确边界回归。
+由真实 `kv_ready` 或协商后的 `source_ready` 回执推进闸门，并要求实际切词边界与请求一致；用于精确边界回归。后者仅允许恢复供帧，不代表 KV 已完成；报告保留 `readiness_state` 和真实 `kv_ready` 布尔值。
 该测试闸门不是生产 Room 的供帧策略，其等待时间不能用来证明生产吞吐量收益。
 两种模式分别记录，不能混合统计。
 
@@ -102,6 +102,15 @@ recording_id 指代混合输入；prepare 中另有实际 F0 帧号与 RGB SHA�
 退出成功后检查 `summary.json` 和 `REPORT.md`：mode、flow_mode、length_mode、源码/输入身份、
 目标与实际帧数、错误、租约释放。Session TTFF 从 render.start 到 Room 首个可解码模型帧，
 不包含此前的独立 prefill，也不包含浏览器展示延迟。
+
+`--detailed-timing` 在每个 `render.start` 中发送 `detailed_timing=true`，覆盖首段和
+同源重开段，后续 prompt 切换继承该段设置；默认不发送该字段，便于与未支持此字段的
+旧版本做对照。报告的 `detailed_timing_requested` 只记录请求开关，实际采集需检查
+模型回执和归档阶段数据。该开关不设置 `return_stage_timing`。
+
+计时开销对照使用同一冻结输入和配置，分别测原版、PR 详细计时关闭、PR 详细计时开启；
+同名 case 的各轮 seed 对齐、cache 冷热分别核验，预热与正式样本分开统计。该回放
+使用进程内 Room，不测已部署 Room 的 HTTP scrape、世界资源加载或浏览器显示开销。
 缓存 Cold/Warm 和 A/B 必须有真实命中类型和 cache key；预热臂匹配预热 key，F0 SHA 一致。
 A/B 使用不同 seed 隔离热缓存，不能作为固定 seed 的生成效果对照。
 持久化时间区分 Worker 计时与 client receipt 计时；未观测到持久化回执不能从 L1 Hit 推断已落盘。

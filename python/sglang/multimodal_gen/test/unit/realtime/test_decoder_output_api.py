@@ -104,9 +104,17 @@ def test_direct_decoder_reuses_frame_protocol_and_releases_shm(
                     height=4,
                     identity=dict(identity, request_id="r", chunk_index=0),
                 )
+                from sglang.multimodal_gen.runtime.utils.zing_ttff_timing import (
+                    InferenceTiming,
+                )
+
+                timing = InferenceTiming("decoder", event_id=7, prompt_version=2)
+                timing.record("vae_decode", 12.5)
+                timing.finished = True
                 session.put(
                     dict(
                         type="decoder.frames",
+                        timing=timing,
                         reference=reference,
                         metadata=dict(
                             format="rgb24",
@@ -147,6 +155,16 @@ def test_direct_decoder_reuses_frame_protocol_and_releases_shm(
                 assert frame["encoding"] == output_format
                 if output_format == "raw":
                     assert frame["payload"] == bytes([255]) * 48
+                report = msgspec.msgpack.decode(ws.receive_bytes())
+                assert report["type"] == "model.timing"
+                assert (
+                    report["model_session_id"] == "s" and report["generation_id"] == "g"
+                )
+                assert (
+                    report["timing"]["event_id"] == 7
+                    and report["timing"]["prompt_version"] == 2
+                )
+                assert report["timing"]["stages"][0]["host_ms"] == 12.5
                 consumed = msgspec.msgpack.decode(ws.receive_bytes())
                 assert consumed == dict(
                     type="source.consumed", source_frame_end=1, source_bytes_end=48

@@ -227,5 +227,5 @@ def test_four_model_segments_keep_working_with_immediate_codecs(tmp_path, monkey
 
     monkeypatch.setattr(fixture, "WhiteboxConfig", immediate_config)
     fixture.test_source_survives_four_segments_and_ordered_prompt_updates(
-        tmp_path, "valid-source-frames-v1", True, "adaptive"
+        tmp_path, "valid-source-frames-v1", True, "adaptive", deferred_kv=False
     )

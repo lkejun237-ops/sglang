@@ -509,6 +509,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             total_frames=request.num_frames,
         )
         self.ledger = SourceLedger(**{**self.config, "limits": limits})
+        self.config["detailed_timing"] = getattr(request, "detailed_timing", False)
         self.pending, self.available = deque(), asyncio.Event()
         self._source_reservations, self._inflight_reservations = {}, []
         self._s0_reservation = None
@@ -694,6 +695,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             self.ready["source_condition_switch_protocol"] = (
                 self.condition_switch_protocol
             )
+            if getattr(self, "external_condition_barrier", False):
+                self.ready["source_condition_deferred_kv"] = True
         if getattr(args.pipeline_config, "decoder_type", None) == "lynn_streaming":
             self.ready["source_output_release_protocol"] = "valid-source-frames-v1"
             if self.source_encoder["mode"] == "progressive" and self.clip == 17:
@@ -1275,6 +1278,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             )
             if self.condition_switch_protocol:
                 command["source_boundary"] = boundary
+                if payload.get("allow_deferred_kv"):
+                    command["allow_deferred_kv"] = True
             if "references" in payload:
                 code = "CONDITION_INVALID"
                 require(
@@ -1371,9 +1376,17 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         if (
             not isinstance(payload, dict)
             or not required <= set(payload)
-            or set(payload) - required - {"references", "source_policy"}
+            or set(payload)
+            - required
+            - {"references", "source_policy", "allow_deferred_kv"}
         ):
             raise ValueError("Invalid prompt control")
+        if "allow_deferred_kv" in payload and (
+            type(payload["allow_deferred_kv"]) is not bool
+            or not getattr(self, "external_condition_barrier", False)
+            or not getattr(self, "condition_switch_protocol", None)
+        ):
+            raise ValueError("Deferred KV readiness is not supported by this session")
         from sglang.multimodal_gen.runtime.realtime.whitebox.render_contract import (
             prompt_text,
         )

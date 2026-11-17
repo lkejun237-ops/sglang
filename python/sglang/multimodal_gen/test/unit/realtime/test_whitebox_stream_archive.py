@@ -265,7 +265,27 @@ def test_real_streamed_video_preserves_pixels_absolute_pts_and_inputs_without_di
         data.operation(
             "report", (hashlib.sha256(b"capability").hexdigest(), time.time())
         )
+        timing_rows = [
+            dict(
+                report_id="a" * 32,
+                revision=rev,
+                role="dit",
+                prompt_version=2,
+                stages=[],
+            )
+            for rev in (1, 2)
+        ]
+        for row in timing_rows:
+            data.operation("inference_timing", row)
         result = data.finish("completed", manifest)
+        raw_timings = client.objects[
+            ("b", manifest["object_prefix"] + "inference-timing.jsonl")
+        ][0]
+        assert [json.loads(line) for line in raw_timings.splitlines()] == timing_rows
+        assert (
+            result["objects"]["inference-timing.jsonl"]["sha256"]
+            == hashlib.sha256(raw_timings).hexdigest()
+        )
         assert result["recording_status"] == result["upload_status"] == "complete"
         assert result["archive_storage"] == STORAGE
         report_index = [
@@ -536,6 +556,112 @@ def test_reference_wait_confirms_streamed_object_before_session_finish(
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("expire_first", [False, True])
+def test_streamed_timing_drains_before_finish_without_consuming_required_acks(
+    tmp_path, local_s3, expire_first
+):
+    from sglang.multimodal_gen.runtime.realtime.whitebox.recording import S3ArchiveStore
+
+    fake, endpoint = local_s3
+
+    async def run():
+        manager = StreamingArchiveManager(
+            S3ArchiveStore("bucket", endpoint, "ap-southeast-7"),
+            index_prefix="test",
+            queue_depth=1,
+            max_age=10,
+        )
+        spec = VideoSpec(64, 64)
+        encoder = H264PlaybackEncoder(spec)
+        prefix = "test/" + "f" * 32 + "/"
+        record = await manager.create_recording(
+            directory=tmp_path / ("f" * 32),
+            spec=spec,
+            world_id="w",
+            trace_id="streamed-timing",
+            inference={},
+            ui={"mode": "browser", "files": {}},
+            references=[],
+            object_prefix=prefix,
+        )
+        try:
+            await asyncio.wait_for(record.startup_complete.wait(), 10)
+            assert record.worker_ready, record.failure
+            record.manifest["video_streams"] = {
+                "whitebox": encoder.stream,
+                "model": encoder.stream,
+            }
+            await record.configure()
+            async with asyncio.timeout(5):
+                while record.pending_bytes:
+                    await asyncio.sleep(0.001)
+            rows = [{"role": "encoder", "timing_revision": 0}]
+            await record.write_inference_timing(rows[0])
+            if expire_first:
+                queued, size, kind, value = record.timing_items[0]
+                record.timing_items[0] = (queued - 11, size, kind, value)
+                rows.clear()
+            # The reference ACK cannot be satisfied by a timing-only ACK.
+            await asyncio.wait_for(record.add_references([], wait=True), 5)
+            assert record._completed_sequence == record._offered_sequence == 2
+            rgb = bytes(spec.frame_bytes)
+            encoded = encoder.encode(0, rgb)
+            assert record.pair(
+                EngineFrame(
+                    0, 0, rgb, {}, effective_input={}, provenance={"capture_pts_us": 0}
+                ),
+                encoded,
+                encoded,
+                "w",
+            )
+            rows.append({"role": "dit", "timing_revision": 2})
+            await record.write_inference_timing(rows[-1])
+            await asyncio.wait_for(record.finish("completed"), 15)
+            assert record.failure is None
+            assert record._completed_sequence == record._offered_sequence == 3
+            assert record.pending_bytes == record.timing_bytes == 0
+            assert not record.timing_items
+            raw = fake.objects[("bucket", prefix + "inference-timing.jsonl")][0]
+            assert [json.loads(line) for line in raw.splitlines()] == rows
+            manifest = json.loads(fake.objects[("bucket", prefix + "manifest.json")][0])
+            assert manifest["recording_status"] == "complete"
+            assert manifest["videos"]["model"]["frames"] == 1
+            assert manifest["inference_timing"].get("incomplete", False) == expire_first
+            assert (
+                manifest["objects"]["inference-timing.jsonl"]["sha256"]
+                == hashlib.sha256(raw).hexdigest()
+            )
+            assert not record.directory.exists()
+        finally:
+            encoder.close()
+            await manager.close()
+
+    asyncio.run(run())
+
+
+def test_streamed_timing_failure_releases_optional_queue(tmp_path):
+    async def run():
+        manager = StreamingArchiveManager(index_prefix="test")
+        record = await manager.create_recording(
+            directory=tmp_path / ("f" * 32),
+            spec=VideoSpec(64, 64),
+            world_id="w",
+            trace_id="unavailable-timing-store",
+            inference={},
+            ui={"mode": "browser"},
+            references=[],
+            object_prefix="test/failure/",
+        )
+        await record.write_inference_timing({"role": "encoder"})
+        await record.finish("completed")
+        assert record.failure == "ARCHIVE_UNAVAILABLE"
+        assert record.manifest["inference_timing"]["incomplete"]
+        assert not record.timing_items and record.timing_bytes == 0
+        await manager.close()
+
+    asyncio.run(run())
+
+
 def test_spawned_worker_real_sdk_reports_replay_and_optional_ui_never_create_archive_files(
     tmp_path, local_s3
 ):
@@ -703,7 +829,7 @@ def test_four_model_segments_and_prompt_updates_keep_playing_without_any_archive
         lambda **kw: StreamingArchiveManager(index_prefix="test", **kw),
     )
     lifecycle.test_source_survives_four_segments_and_ordered_prompt_updates(
-        tmp_path, "valid-source-frames-v1", True, "adaptive"
+        tmp_path, "valid-source-frames-v1", True, "adaptive", deferred_kv=False
     )
     assert not list(tmp_path.rglob("*.mp4"))
     assert not list(tmp_path.rglob("*.jsonl"))

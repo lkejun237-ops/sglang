@@ -644,7 +644,7 @@ def test_connected_encoder_sends_qwen_before_vae_and_keeps_native_tensors():
         def __init__(self):
             self.inputs = inputs
 
-        def forward(self, b, on_condition=None):
+        def forward(self, b, on_condition=None, timing=None):
             from dataclasses import fields
 
             message = dict(
@@ -680,7 +680,8 @@ def test_connected_encoder_sends_qwen_before_vae_and_keeps_native_tensors():
     )
     request = batch(0, 0, 17)
     request[0].extra["zing_dit_source_records"] = [[1, 0, 17]]
-    worker.forward(request)
+    result = worker.forward(request)
+    assert not result.realtime_handoff["timing_reports"]
     assert sent == ["conditioning", "source.moments"]
     # Prompt-only dispatch must not repeat first-message metadata or VAE work.
     worker.forward(batch(1, 17, 0))
@@ -695,12 +696,14 @@ def test_connected_encoder_sends_qwen_before_vae_and_keeps_native_tensors():
     "source,target",
     [((32, 32), (32, 32)), ((32, 32), (64, 64)), ((832, 480), (1280, 736))],
 )
+@pytest.mark.parametrize("detailed_timing", [False, True])
 @pytest.mark.parametrize("timing_enabled", [False, True])
 def test_connected_api_initializes_dit_before_any_source(
     configured,  # noqa: F811
     source,
     target,
     timing_enabled,
+    detailed_timing,
 ):
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.zing_encoder_dit_adapter import (
         ZingEncoderDiTAdapter,
@@ -723,12 +726,14 @@ def test_connected_api_initializes_dit_before_any_source(
             prompt="first",
             size=f"{width}x{height}",
             seed=None,
+            detailed_timing=detailed_timing,
             zing_realtime_api_version=1,
             source_stream=dict(
                 format="rgb24", width=source_width, height=source_height, fps=24
             ),
         )
         await adapter.on_init(session, request)
+        assert adapter.config["detailed_timing"] is detailed_timing
         assert not adapter.pending and not adapter.dispatched_source_frames
         assert sent == [
             dict(
@@ -736,6 +741,7 @@ def test_connected_api_initializes_dit_before_any_source(
                 generation_id=session.generation_id,
                 async_inputs=True,
                 return_stage_timing=timing_enabled,
+                detailed_timing=detailed_timing,
                 seed=42,
                 width=width,
                 height=height,
@@ -1245,7 +1251,9 @@ def test_encoder_reference_candidates_use_original_codec_and_commit_on_output():
         calls.append((prompt, current))
         return positive
 
-    def update(active, references, prompt, use, *, conditioning):
+    def update(
+        active, references, prompt, use, *, conditioning, preparation_metrics=None
+    ):
         assert active is initial or active.condition_media == []
         if prompt == "invalid":
             raise ConditionError("CONDITION_INVALID", "Invalid reference candidate")
@@ -2040,7 +2048,7 @@ def test_encoder_startup_uses_exact_preview_and_waits_for_dit_confirmation():
     calls = []
 
     class Conditions:
-        def forward(self, batch, on_condition):
+        def forward(self, batch, on_condition, timing=None):
             calls.append(batch.extra["zing_source_command"]["startup"]["rgb"])
             on_condition("conditioning", event_id=None, prompt_version=1)
 
@@ -2195,6 +2203,139 @@ def test_expected_prefill_capacity_rejection_does_not_poison_encoder_group(monke
     with pytest.raises(ConditionError, match="waiting for capacity"):
         client._forward([])
     assert not failed
+
+
+@pytest.mark.parametrize(
+    "allowed,deferred",
+    [(False, False), (True, False), (True, True), (False, True), (True, "yes")],
+)
+def test_encoder_condition_readiness_preserves_negotiated_semantics(allowed, deferred):
+    confirmed = []
+
+    class Conditions:
+        def forward(self, batch, on_condition, **kwargs):
+            on_condition("conditioning", event_id=7, prompt_version=2)
+            return None, None
+
+        def confirm_applied(self, event):
+            confirmed.append(event)
+
+    class Link:
+        async_inputs = True
+
+        def collect(self):
+            return []
+
+        def send(self, kind, **fields):
+            assert kind == "conditioning"
+            assert fields["source_boundary"] == 17
+            assert fields.get("allow_deferred_kv", False) is allowed
+            return [
+                dict(
+                    type="conditioning.ready",
+                    event_id=7,
+                    prompt_version=2,
+                    source_frame_index=17,
+                    kv_deferred=deferred,
+                )
+            ]
+
+    executor = SourceEncoderExecutor(None, conditioning=Conditions(), dit_link=Link())
+    executor.owner = ("session", "generation")
+    executor.encoder = NS(ready=False, ended=False)
+    executor.timed_source_event = object()  # Session initialization already ran.
+    command = dict(config={}, appends=[], end=None)
+    update = dict(event_id=7, prompt_version=2, source_boundary=17)
+    if allowed:
+        update["allow_deferred_kv"] = True
+    batch = NS(
+        extra={"zing_source_command": command, "zing_prompt_update": update},
+        request_id="request",
+        block_idx=0,
+        realtime_session_id="session",
+        realtime_generation_id="generation",
+    )
+    if (deferred and not allowed) or type(deferred) is not bool:
+        with pytest.raises(ValueError, match="readiness does not match"):
+            executor.forward([batch])
+        assert confirmed == []
+    else:
+        result = executor.forward([batch])
+        assert result.usage["zing_condition_ready"] == dict(
+            type="control_ack",
+            kind="prompt.update",
+            event_id=7,
+            prompt_version=2,
+            source_frame_index=17,
+            state="source_ready" if deferred else "kv_ready",
+        )
+        assert result.usage["zing_realtime_blocks"] == []
+
+
+@pytest.mark.parametrize("allowed", [None, False, True, "yes"])
+def test_encoder_negotiates_and_forwards_deferred_condition_permission(
+    configured, allowed
+):
+    from test_zing_h3_source_adapter import _enable_reference_updates
+
+    _enable_reference_updates(configured, split=False)
+
+    async def run():
+        adapter, session = ZingEncoderDiTAdapter(), GenerateSession()
+        session.set_adapter(adapter)
+
+        async def open_dit(message):
+            # Older DiT advertises only the existing barrier; it may return
+            # kv_ready even when the new Encoder understands deferred readiness.
+            return [
+                dict(
+                    type="session.opened",
+                    output_kind="dit_latents",
+                    source_condition_switch_protocol="clip-barrier-v1",
+                )
+            ]
+
+        session.execution_client = NS(open_dit=open_dit)
+        request = RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="first",
+            size="32x32",
+            zing_realtime_api_version=1,
+            source_stream=dict(format="rgb24", width=32, height=32, fps=24),
+            source_prompt_protocol="ordered-boundary-v2",
+            source_condition_switch_protocol="clip-barrier-v1",
+        )
+        await adapter.on_init(session, request)
+        session.set_request(request)
+        try:
+            assert adapter.ready["source_condition_deferred_kv"] is True
+            payload = dict(
+                text="changed",
+                version=2,
+                min_source_frame=0,
+                policy="at_or_after",
+                source_policy="skip_during_switch",
+            )
+            if allowed is not None:
+                payload["allow_deferred_kv"] = allowed
+            event = dict(
+                type="event", kind="prompt.update", event_id=1, payload=payload
+            )
+            socket = PromptSocket()
+            await adapter.ingest_wire_event(socket, session, event, 1024)
+            if isinstance(allowed, str):
+                assert socket.messages[-1]["state"] == "rejected"
+                assert adapter._pending_prompt_command is None
+            else:
+                assert socket.messages[-1]["state"] == "accepted"
+                assert adapter._pending_prompt_command.get(
+                    "allow_deferred_kv", False
+                ) is (allowed is True)
+                assert adapter._pending_prompt_command["source_boundary"] == 17
+        finally:
+            adapter.dispose(session)
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("early", [False, True])

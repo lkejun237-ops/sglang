@@ -48,10 +48,29 @@ class DiTLinkClient:
         while self.channel.poll():
             reply = self.channel.receive()
             self._validate_reply(reply)
+            self.pending_results.extend(self._timing_replies(reply))
             if reply["type"] != "input.processed":
                 self.pending_results.append(reply)
-                if len(self.pending_results) > 128:
-                    raise ValueError("DiT notifications exceed their bounded budget")
+            if (
+                len(self.pending_results) > 256
+                or sum(item["type"] != "model.timing" for item in self.pending_results)
+                > 128
+            ):
+                raise ValueError("DiT notifications exceed their bounded budget")
+
+    def _timing_replies(self, reply):
+        if self.owner is None:
+            return []
+        return [
+            dict(
+                type="model.timing",
+                session_id=self.owner[0],
+                generation_id=self.owner[1],
+                transfer_id=reply["transfer_id"],
+                timing=report,
+            )
+            for report in reply.get("timing_reports", [])
+        ]
 
     def has_output_notifications(self):
         if self.failed or not self.async_inputs or self.owner is None:
@@ -91,6 +110,9 @@ class DiTLinkClient:
                 if not self.async_inputs and reply.get("transfer_id") != sequence:
                     raise ValueError("DiT reply does not match the input message")
                 self._validate_reply(reply)
+                outputs.extend(self._timing_replies(reply))
+                if len(outputs) > 256:
+                    raise ValueError("DiT reply exceeds the output budget")
                 if reply["type"] in ("input.processed", "input.rejected"):
                     if reply["type"] == "input.rejected":
                         raise ValueError("DiT rejected the session identity")
@@ -106,7 +128,9 @@ class DiTLinkClient:
                 ):
                     raise ValueError("DiT output belongs to another session")
                 outputs.append(reply)
-                if len(outputs) > (128 if self.async_inputs else 10):
+                if sum(item["type"] != "model.timing" for item in outputs) > (
+                    128 if self.async_inputs else 10
+                ):
                     raise ValueError("DiT reply exceeds the output budget")
         except BaseException:
             from sglang.multimodal_gen.runtime.utils.realtime_video import (
@@ -145,7 +169,7 @@ class DiTLinkClient:
         )
         if (
             not self.async_inputs
-            or kind in ("source.end", "session.cancel")
+            or kind in ("source.end", "session.cancel", "timing.configure")
             or kind == "conditioning"
             and fields.get("source_boundary") is not None
             and wait_for_boundary
@@ -243,6 +267,7 @@ class DiTInputService:
         self.sequence += 1
         identity = message.get("session_id"), message.get("generation_id")
         kind = message["type"]
+        final_timings = []
 
         def reply(kind, **fields):
             self.channel.send(dict(type=kind, transfer_id=sequence, **fields))
@@ -426,6 +451,13 @@ class DiTInputService:
                         generation_id=identity[1],
                         output_kind="rgb",
                         **capabilities,
+                        timing_updates=bool(
+                            getattr(
+                                getattr(self.decoder, "remote", None),
+                                "timing_updates",
+                                False,
+                            )
+                        ),
                         async_inputs=bool(
                             getattr(
                                 getattr(self.decoder, "remote", None), "oneway", False
@@ -452,7 +484,49 @@ class DiTInputService:
                             else {}
                         ),
                     )
+            elif kind == "timing.configure":
+                from sglang.multimodal_gen.runtime.utils.zing_ttff_timing import (
+                    validate_timing_update,
+                )
+
+                error = None
+                try:
+                    validate_timing_update(message, self.worker.timing_revision)
+                    if (
+                        self.worker.closed
+                        or self.worker.eos_received
+                        or self.worker.complete
+                    ):
+                        raise ValueError("DiT timing control is unavailable")
+                except Exception as exc:
+                    error = exc
+                _sync_step_error(error)
+                # The input queue has drained earlier commands. The Decoder ACK is
+                # returned through its existing leader collective before changing DiT.
+                decoder_boundary = self.decoder.configure_timing(
+                    {
+                        key: message[key]
+                        for key in (
+                            "session_id",
+                            "generation_id",
+                            "enabled",
+                            "timing_revision",
+                        )
+                    }
+                )
+                dit_boundary = self.worker.configure_timing(message)
+                reply(
+                    "timing.configured",
+                    session_id=identity[0],
+                    generation_id=identity[1],
+                    enabled=message["enabled"],
+                    timing_revision=message["timing_revision"],
+                    boundaries=dict(dit=dit_boundary, decoder=decoder_boundary),
+                )
             elif kind == "session.cancel":
+                buffer = getattr(self.worker, "timing_buffer", None)
+                if buffer:
+                    final_timings = buffer.drain(final=True)
                 self._close_decoder()
                 self.worker.close()
                 self.worker = self.owner = None
@@ -549,7 +623,12 @@ class DiTInputService:
                         source_frames=self.worker.bridge.accepted_pixels,
                     )
                     self.worker.close()
-            reply("input.processed")
+            buffer = getattr(self.worker, "timing_buffer", None)
+            reply(
+                "input.processed",
+                timing_reports=final_timings
+                + (buffer.drain(final=self.worker.complete) if buffer else []),
+            )
         except BaseException as exc:
             if isinstance(exc, ConditionError) and kind == "conditioning":
                 if initial_condition:

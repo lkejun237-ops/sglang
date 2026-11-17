@@ -416,6 +416,13 @@ def test_model_mapping_uses_actual_condition_event_and_aligned_original_source()
         segment.sink = SinkControl(segment)
         segment.periodic_refresh = None
         segment.first_output_at = None
+        from sglang.multimodal_gen.runtime.realtime.whitebox.ttff_metrics import (
+            TimingMetrics,
+        )
+
+        segment.detailed_timing = True
+        segment.timing_metrics = TimingMetrics()
+        segment.room_timings = {}
         segment.segment_id = "segment"
         segment.segment_epoch = "segment-epoch"
         segment.segment = {"seed": 42}

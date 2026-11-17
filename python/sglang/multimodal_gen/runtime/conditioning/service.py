@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 from .cache import ConditioningCache, tensor_bytes
 from .contract import ConditionError, _tensor_spec, canonical_json, safe_json
+from .metrics import ConditioningMetrics
 from .prefix_task import SinglePrefixTask
 from .resources import AdmissionLedger, BoundedExecutor, ResourceLimits
 from .wire import decode_request, pack_message
@@ -130,7 +131,17 @@ class EncodeQueue:
                 )
             if task is None:
                 self.cache.put(key, condition)
-            return condition
+            stats = None
+            if task is not None and hasattr(task.cache, "reused_rows"):
+                # Snapshot on the sole encoder thread before task release can
+                # clear the counters. Only the queue consumes these statistics.
+                stats = dict(
+                    hit=task.cache.reused_rows > 0,
+                    reused_tokens=task.cache.reused_rows,
+                    encoded_tokens=task.cache.encoded_rows,
+                    total_tokens=condition["context"].shape[0],
+                )
+            return condition, stats
 
     async def _run(self):
         while True:
@@ -150,9 +161,9 @@ class EncodeQueue:
                 self.pool, self._forward, flight.value, flight.key
             )
             try:
-                condition = await asyncio.shield(future)
+                condition, prefix_stats = await asyncio.shield(future)
                 flight.encode_ms = max(0, (self.clock() - started) * 1000)
-                self.on_encoded(flight)
+                self.on_encoded(flight, prefix_stats)
                 flight.future.set_result(condition)
             except Exception as error:
                 if not isinstance(error, ConditionError):
@@ -248,6 +259,7 @@ class ConditioningService:
         )
         self.flights = {}
         self._stats = defaultdict(self._new_stats)
+        self.metrics = ConditioningMetrics()
         self.queue = EncodeQueue(
             encoder,
             self.cache,
@@ -283,10 +295,11 @@ class ConditioningService:
             queue_ms=deque(maxlen=1024),
         )
 
-    def _encoded(self, flight):
+    def _encoded(self, flight, prefix_stats):
         stats = self._stats[flight.key[0]]
         stats["encode_ms"].append(flight.encode_ms)
         stats["queue_ms"].append(flight.queue_ms)
+        self.metrics.encoded(prefix_stats, flight.encode_ms, flight.queue_ms)
 
     def _authenticate(self, headers):
         if sum(len(k) + len(v) + 4 for k, v in headers) > self.limits.max_header_bytes:
@@ -339,13 +352,18 @@ class ConditioningService:
                 raise ConditionError("CONDITION_UNAVAILABLE")
             path, method = scope["path"], scope["method"]
             if path == "/metrics" and method == "GET":
+                if not principal.get("admin", False):
+                    return await self._json(
+                        send, 403, {"error": "Admin credentials required"}
+                    )
                 from sglang.multimodal_gen.runtime.realtime.critical_path_metrics import (
                     prometheus_content_type,
                     prometheus_latest,
                 )
 
+                body = prometheus_latest(self.metrics.registry)
                 return await self._response(
-                    send, 200, prometheus_latest(), prometheus_content_type().encode()
+                    send, 200, body, prometheus_content_type().encode()
                 )
             if path == PREFIX + "/profile" and method == "GET":
                 return await self._json(
@@ -812,6 +830,11 @@ class ConditioningService:
                 self._stats[tenant]["hit"] += 1
             if prefix_task is not None and prefix_task.closed:
                 raise ConditionError("CONDITION_TASK_EXPIRED")
+            result_source = {
+                "hit": "result_cache",
+                "miss": "encoding",
+                "joined": "joined",
+            }[status]
             if self.nccl is not None:
                 control_bytes = await self._send_nccl(
                     send,
@@ -822,6 +845,7 @@ class ConditioningService:
                     bridge_id=bridge_id,
                 )
                 self._stats[tenant]["response_bytes"] += control_bytes
+                self.metrics.results.labels(result_source).inc()
                 return
             response = await self._cpu_run(
                 pack_message,
@@ -851,6 +875,7 @@ class ConditioningService:
             # completes. Headers/framing are covered by the bounded CPU executor.
             await self._send_response(send, response, watcher, deadline)
             self._stats[tenant]["response_bytes"] += len(response)
+            self.metrics.results.labels(result_source).inc()
         except ConditionError as error:
             if error.code == "CONDITION_BUSY":
                 self._stats[tenant]["admission_rejected"] += 1

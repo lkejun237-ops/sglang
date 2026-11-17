@@ -10,12 +10,19 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import fields
 from pathlib import Path
+
+from sglang.multimodal_gen.runtime.utils.zing_ttff_timing import (
+    InferenceTiming,
+    TimingBuffer,
+    measure,
+)
 
 
 def tensor_payload(tensor):
@@ -39,16 +46,28 @@ class EncoderConditioning:
         cache_bytes=256 << 20,
         encode_tensor=tensor_payload,
         prompt_switch_prefix_latent_frames=5,
+        prefix_cache_bytes=0,
+        metrics=None,
     ):
         from sglang.multimodal_gen.runtime.conditioning.worker import LocalConditioner
 
         self.codecs = codecs
         self.encode_tensor = encode_tensor
         self.prompt_switch_prefix_latent_frames = prompt_switch_prefix_latent_frames
-        self.conditioner = LocalConditioner(
+        conditioner = LocalConditioner
+        options = {}
+        if prefix_cache_bytes or metrics is not None:
+            from sglang.multimodal_gen.runtime.conditioning.local_prefix import (
+                SessionPrefixConditioner,
+            )
+
+            conditioner = SessionPrefixConditioner
+            options = dict(prefix_bytes=prefix_cache_bytes, metrics=metrics)
+        self.conditioner = conditioner(
             codecs.encode_condition,
             hashlib.sha256(str(id(codecs)).encode()).hexdigest(),
             cache_bytes=cache_bytes,
+            **options,
         )
         self.dispose()
 
@@ -63,6 +82,9 @@ class EncoderConditioning:
         self.pending_inputs = None
         self.candidates = {}
         self.conditioner.identity_state.dispose()
+        clear_prefix = getattr(self.conditioner, "clear_prefix", None)
+        if clear_prefix is not None:
+            clear_prefix()
 
     def confirm_applied(self, event_id):
         # Match SourceStreamingSession: a prepared reference candidate becomes
@@ -231,6 +253,7 @@ class EncoderConditioning:
         *,
         async_updates=False,
         condition_switch_protocol=None,
+        timing=None,
     ):
         from copy import copy
 
@@ -266,7 +289,8 @@ class EncoderConditioning:
                 if startup is not None
                 else command["appends"][0]["payload"]["data"],
             )
-            self.inputs = self._lookup(batch, preview)
+            with measure(timing, "condition_cache_lookup"):
+                self.inputs = self._lookup(batch, preview)
             if self.inputs is None:
                 self.inputs = self.codecs.prepare(
                     batch.sampling_params.zing_request,
@@ -274,7 +298,11 @@ class EncoderConditioning:
                     retain_condition_media=True,
                     source_preview=preview,
                     conditioning=self.conditioner,
+                    preparation_metrics=timing,
                 )
+            else:
+                if timing is not None:
+                    timing.skip("qwen_prepare", "reference_vae")
             self.prompt = batch.sampling_params.prompt
             self.event_id = batch.realtime_event_id
             self.active_cache_key = self.cache_key
@@ -302,11 +330,16 @@ class EncoderConditioning:
                         and "source_boundary" in update_command
                         and condition_switch_protocol == CLIP_BARRIER_V2
                     )
-                    candidate = self._lookup(
-                        batch, update=update_command, reuse_active=release_source
-                    )
+                    with measure(timing, "condition_cache_lookup"):
+                        candidate = self._lookup(
+                            batch,
+                            update=update_command,
+                            reuse_active=release_source,
+                        )
                     reuse_active = candidate is not None and candidate is self.inputs
                     if candidate is not None:
+                        if timing is not None:
+                            timing.skip("qwen_prepare", "reference_vae")
                         positive = candidate.positive
                     else:
                         positive, candidate = prepare_prompt_update(
@@ -317,6 +350,7 @@ class EncoderConditioning:
                             use_component=lambda _: nullcontext(),
                             conditioning=self.conditioner,
                             prefix_latent_frames=self.prompt_switch_prefix_latent_frames,
+                            preparation_metrics=timing,
                         )
                     if candidate is None:
                         candidate = copy(self.inputs)
@@ -389,6 +423,7 @@ class SourceEncoderExecutor:
         self._enc_emitted_pixels = 0
         self._enc_frame_wait_ms = {}
         self.owner = self.encoder = None
+        self.timing_buffer = TimingBuffer()
         self.command_index = 0
         self.consumed = 0
         self.startup_preparation = None
@@ -583,16 +618,49 @@ class SourceEncoderExecutor:
             self.startup_preparation = None
             self.startup_attached = False
             self.owner, self.command_index, self.consumed = owner, 0, 0
+            self.timing_buffer = TimingBuffer()
+            self.timed_source_event = object()
         if owner != self.owner or batch.block_idx != self.command_index:
             raise ValueError("Source session identity or chunk sequence does not match")
         config = command["config"]
+        override = getattr(self, "timing_override", None)
+        timing_revision = 0
+        if override is not None and override["identity"] == owner:
+            config = dict(config, detailed_timing=override["enabled"])
+            timing_revision = override["timing_revision"]
 
+        update = batch.extra.get("zing_prompt_update", {})
+        timing_version = update.get(
+            "prompt_version", getattr(batch, "realtime_prompt_version", None)
+        )
+        timing_event = update.get("event_id", getattr(batch, "realtime_event_id", None))
+        timing = (
+            InferenceTiming(
+                "encoder",
+                timing_revision=timing_revision,
+                event_id=timing_event,
+                prompt_version=timing_version,
+                request_id=batch.request_id,
+                session_id=owner[0],
+                generation_id=owner[1],
+                source_frame_start=(command.get("appends") or [{}])[0]
+                .get("payload", {})
+                .get("source_frame_start"),
+            )
+            if config.get("detailed_timing", False)
+            and type(timing_version) is int
+            and timing_event != self.timed_source_event
+            else None
+        )
+        if timing is not None and "_ttff_queue_wait_ms" in batch.extra:
+            timing.record("encoder_queue_wait", batch.extra.pop("_ttff_queue_wait_ms"))
         dit_outputs = []
         notices = []
         condition_ready = []
         source_ready = None
         condition_prepared = []
         cache_reports = []
+        timing_reports = []
 
         def consume_results(results, kind=None, payload=None):
             rejection = None
@@ -604,6 +672,7 @@ class SourceEncoderExecutor:
                     "decoder.input_sent",
                 ):
                     self.conditioning.confirm_applied(result.get("event_id"))
+                    self.timed_source_event = result.get("event_id")
                     self._dit_committed_frames = max(
                         self._dit_committed_frames,
                         result["output_frame_start"] + result["num_frames"],
@@ -628,7 +697,7 @@ class SourceEncoderExecutor:
                         pending = self.pending_condition_ready
                         if (
                             pending is not None
-                            and pending["event_id"] == result["event_id"]
+                            and pending["identity"]["event_id"] == result["event_id"]
                         ):
                             self.pending_condition_ready = None
                         self.conditioning.reject(result["event_id"])
@@ -644,14 +713,28 @@ class SourceEncoderExecutor:
                     rejection = result
                 elif result["type"] == "conditioning.ready":
                     update = batch.extra.get("zing_prompt_update", {})
-                    expected = self.pending_condition_ready or dict(
-                        event_id=update.get("event_id"),
-                        prompt_version=update.get("prompt_version"),
-                        source_frame_index=update.get("source_boundary"),
+                    pending = self.pending_condition_ready
+                    expected = (
+                        pending["identity"]
+                        if pending
+                        else dict(
+                            event_id=update.get("event_id"),
+                            prompt_version=update.get("prompt_version"),
+                            source_frame_index=update.get("source_boundary"),
+                        )
                     )
                     if (
                         any(result.get(key) != value for key, value in expected.items())
                         or condition_ready
+                        or type(result.get("kv_deferred", False)) is not bool
+                        or (
+                            result.get("kv_deferred")
+                            and not (
+                                pending["allow_deferred_kv"]
+                                if pending
+                                else update.get("allow_deferred_kv") is True
+                            )
+                        )
                     ):
                         raise ValueError(
                             "DiT condition readiness does not match the request"
@@ -662,7 +745,9 @@ class SourceEncoderExecutor:
                         dict(
                             type="control_ack",
                             kind="prompt.update",
-                            state="kv_ready",
+                            state="source_ready"
+                            if result.get("kv_deferred")
+                            else "kv_ready",
                             event_id=result["event_id"],
                             prompt_version=result["prompt_version"],
                             source_frame_index=result["source_frame_index"],
@@ -677,6 +762,8 @@ class SourceEncoderExecutor:
                             "DiT preparation does not match the source capture"
                         )
                     condition_prepared.append(result["preparation"])
+                elif result["type"] == "model.timing":
+                    timing_reports.append(result["timing"])
                 elif result["type"] == "model.cache":
                     cache_reports.append(result["usage"]["zing_block0_cache"])
                 elif result["type"] != "session.completed":
@@ -699,6 +786,10 @@ class SourceEncoderExecutor:
                 )
                 if boundary is not None:
                     payload["source_boundary"] = boundary
+                    if batch.extra.get("zing_prompt_update", {}).get(
+                        "allow_deferred_kv"
+                    ):
+                        payload["allow_deferred_kv"] = True
                 if command.get("startup", {}).get("op") == "prepare":
                     payload["source_prepare"] = self.startup_preparation
             results = self.dit_link.send(
@@ -714,7 +805,10 @@ class SourceEncoderExecutor:
                     prompt_version=payload["prompt_version"],
                     source_frame_index=payload["source_boundary"],
                 )
-                self.pending_condition_ready = expected
+                self.pending_condition_ready = dict(
+                    identity=expected,
+                    allow_deferred_kv=payload.get("allow_deferred_kv") is True,
+                )
                 source_ready = dict(
                     type="control_ack",
                     kind="prompt.update",
@@ -733,11 +827,15 @@ class SourceEncoderExecutor:
                 consume_results(self.dit_link.collect())
             if command.get("startup") is not None:
                 result = self._forward_startup(
-                    batch, command, send_dit, condition_prepared
+                    batch, command, send_dit, condition_prepared, timing=timing
                 )
             else:
                 result = self._forward_source(
-                    batch, command, config, outputs_state=(dit_outputs, send_dit)
+                    batch,
+                    command,
+                    config,
+                    outputs_state=(dit_outputs, send_dit),
+                    timing=timing,
                 )
             if notices:
                 result.realtime_handoff["conditioning_notices"] = notices
@@ -757,6 +855,12 @@ class SourceEncoderExecutor:
                 notice["event_id"] == source_ready["event_id"] for notice in notices
             ):
                 result.usage["zing_condition_source_ready"] = source_ready
+            if timing is not None:
+                self.timing_buffer.add(timing)
+            timing_reports.extend(
+                self.timing_buffer.drain(final=bool(command.get("end")))
+            )
+            result.realtime_handoff["timing_reports"] = timing_reports
             if cache_reports:
                 result.realtime_handoff["cache_reports"] = cache_reports
             return result
@@ -775,7 +879,7 @@ class SourceEncoderExecutor:
                     cancel_async_raw_rgb_frame_reference(item["reference"])
             raise
 
-    def _forward_startup(self, batch, command, send_dit, confirmations):
+    def _forward_startup(self, batch, command, send_dit, confirmations, *, timing=None):
         import torch
 
         from sglang.multimodal_gen.runtime.managers.forward_context import (
@@ -825,7 +929,9 @@ class SourceEncoderExecutor:
                     torch.inference_mode(),
                     set_forward_context(current_timestep=0, attn_metadata=None),
                 ):
-                    self.conditioning.forward(batch, on_condition=send_dit)
+                    self.conditioning.forward(
+                        batch, on_condition=send_dit, timing=timing
+                    )
                 if confirmations != [expected]:
                     raise ValueError("DiT did not confirm source preparation")
             elif expected != self.startup_preparation:
@@ -881,7 +987,7 @@ class SourceEncoderExecutor:
         self._enc_emitted_pixels = max(self._enc_emitted_pixels, cur_px)
         return frame_timings, stream_synced
 
-    def _forward_source(self, batch, command, config, *, outputs_state):
+    def _forward_source(self, batch, command, config, *, outputs_state, timing=None):
         import torch
 
         from sglang.multimodal_gen.runtime.managers.forward_context import (
@@ -924,6 +1030,7 @@ class SourceEncoderExecutor:
                 condition, notice = self.conditioning.forward(
                     batch,
                     on_condition=send_dit if self.dit_link is not None else None,
+                    timing=timing,
                     **(
                         {
                             "async_updates": True,
@@ -958,23 +1065,30 @@ class SourceEncoderExecutor:
                     )
                     for f_idx in range(f_start, f_start + f_count):
                         self._enc_frame_wait_ms[f_idx] = wait_ms
-                pixels = torch.frombuffer(bytearray(payload["data"]), dtype=torch.uint8)
-                pixels = pixels.reshape(
-                    payload["num_frames"], config["height"], config["width"], 3
-                ).permute(3, 0, 1, 2)
-                if geometry is not None:
-                    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.media_geometry import (
-                        SourceGeometry,
+                with measure(timing, "source_prepare", cuda=True):
+                    pixels = torch.frombuffer(
+                        bytearray(payload["data"]), dtype=torch.uint8
                     )
+                    pixels = pixels.reshape(
+                        payload["num_frames"], config["height"], config["width"], 3
+                    ).permute(3, 0, 1, 2)
+                    if geometry is not None:
+                        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.media_geometry import (
+                            SourceGeometry,
+                        )
 
-                    pixels = SourceGeometry(**geometry).resize(pixels)
-                self.encoder.append(pixels, frame_start=payload["source_frame_start"])
+                        pixels = SourceGeometry(**geometry).resize(pixels)
+                with measure(timing, "source_vae_append", cuda=True):
+                    self.encoder.append(
+                        pixels, frame_start=payload["source_frame_start"]
+                    )
             if command["end"] is not None:
                 self._dit_final_frames = command["end"]["frame_end"]
                 self.encoder.finish()
             outputs = []
             while self.encoder.ready and len(outputs) < 10:
-                value = self.encoder.pop()
+                with measure(timing, "source_vae_pop", cuda=True):
+                    value = self.encoder.pop()
                 if self.dit_link is not None:
                     frame_timings, stream_synced = None, False
                     if timing_enabled:
@@ -1017,6 +1131,10 @@ class SourceEncoderExecutor:
                         )
                     )
                 self.consumed = value.source_dependency_end
+                if timing is not None:
+                    timing.identity["source_dependency_end"] = (
+                        value.source_dependency_end
+                    )
                 if any(item["type"] == "decoder.frames" for item in dit_outputs):
                     # Return references before reserving another batch of RGB.
                     # The API can consume them while the next dispatch runs.
@@ -1052,7 +1170,7 @@ class EncoderClient:
 
     async def forward(self, request):
         return await asyncio.get_running_loop().run_in_executor(
-            self.pool, self._forward, request
+            self.pool, self._forward, request, time.perf_counter()
         )
 
     async def cache_disk(self, operation, **arguments):
@@ -1073,6 +1191,52 @@ class EncoderClient:
 
         return await asyncio.get_running_loop().run_in_executor(self.pool, call)
 
+    async def configure_timing(self, message):
+        return await asyncio.get_running_loop().run_in_executor(
+            self.pool, self._configure_timing, message
+        )
+
+    def _configure_timing(self, message):
+        from sglang.multimodal_gen.runtime.utils.zing_ttff_timing import (
+            validate_timing_update,
+        )
+
+        executor = self.executor
+        identity = message["session_id"], message["generation_id"]
+        if executor.dit_link.owner != identity or executor.owner not in (
+            None,
+            identity,
+        ):
+            raise ValueError("Encoder timing session or generation does not match")
+        previous = getattr(executor, "timing_override", None)
+        validate_timing_update(message, previous["timing_revision"] if previous else 0)
+        replies = executor.dit_link.send(
+            "timing.configure",
+            enabled=message["enabled"],
+            timing_revision=message["timing_revision"],
+        )
+        acknowledgements = [r for r in replies if r["type"] == "timing.configured"]
+        executor.dit_link.pending_results.extend(
+            r for r in replies if r["type"] != "timing.configured"
+        )
+        if len(acknowledgements) != 1:
+            raise RuntimeError("Missing timing acknowledgement")
+        receipt = acknowledgements[0]
+        if any(
+            receipt.get(k) != message[k]
+            for k in ("session_id", "generation_id", "enabled", "timing_revision")
+        ):
+            raise RuntimeError("Invalid timing acknowledgement")
+        executor.timing_override = dict(
+            identity=identity,
+            enabled=message["enabled"],
+            timing_revision=message["timing_revision"],
+        )
+        receipt["boundaries"]["encoder"] = dict(
+            command_index=getattr(executor, "command_index", 0)
+        )
+        return receipt
+
     async def open_dit(self, message):
         return await asyncio.get_running_loop().run_in_executor(
             self.pool, self._open_dit, message
@@ -1092,20 +1256,45 @@ class EncoderClient:
                         "The connection is closing. Please wait before starting again.",
                     )
         try:
-            return self.executor.dit_link.open(message)
+            result = self.executor.dit_link.open(message)
+            self.executor.timing_override = None
+            return result
         except BaseException:
             if controller is not None:
                 controller.failed()
             raise
 
-    def _forward(self, request):
+    def _forward(self, request, queued_at=None):
         import torch
 
         from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
 
         try:
+            enabled = False
+            if isinstance(request, list) and len(request) == 1:
+                batch = request[0]
+                enabled = (
+                    batch.extra.get("zing_source_command", {})
+                    .get("config", {})
+                    .get("detailed_timing", False)
+                )
+                override = getattr(self.executor, "timing_override", None)
+                if override is not None and override["identity"] == (
+                    batch.realtime_session_id,
+                    batch.realtime_generation_id,
+                ):
+                    enabled = override["enabled"]
+            if queued_at is not None and enabled:
+                request[0].extra["_ttff_queue_wait_ms"] = (
+                    time.perf_counter() - queued_at
+                ) * 1000
             result = self.executor.forward(request)
             torch.cuda.synchronize()
+            # Resolve after the pre-existing execution fence; telemetry adds no sync.
+            if isinstance(request, list) and hasattr(self.executor, "timing_buffer"):
+                result.realtime_handoff.setdefault("timing_reports", []).extend(
+                    self.executor.timing_buffer.drain()
+                )
         except BaseException as exc:
             from sglang.multimodal_gen.runtime.realtime.cleanup_watchdog import (
                 CleanupWatchdog,
@@ -1134,7 +1323,11 @@ def create_apps(
     connection_ports=None,
     pipeline_config=None,
     session_max_lifetime_s=None,
+    prefix_cache_bytes=0,
+    metrics_token=None,
 ):
+    if type(prefix_cache_bytes) is not int or prefix_cache_bytes < 0:
+        raise ValueError("Invalid Qwen prefix cache byte budget")
     from sglang.multimodal_gen.runtime.realtime.worker_services import service_ports
 
     peers = service_ports(service_count, dit=dit_port).get(
@@ -1258,6 +1451,8 @@ def create_apps(
                                 codecs,
                                 prompt_switch_prefix_latent_frames=args.pipeline_config.prompt_switch_prefix_latent_frames,
                                 cache_bytes=args.zing_conditioning_local_cache_bytes,
+                                prefix_cache_bytes=prefix_cache_bytes,
+                                metrics=apps[len(executors)].state.conditioning_metrics,
                                 encode_tensor=(lambda value: value.detach())
                                 if link is not None
                                 else tensor_payload,
@@ -1276,6 +1471,12 @@ def create_apps(
                 failure = None
                 try:
                     for executor in executors:
+                        try:
+                            if executor.conditioning is not None:
+                                executor.conditioning.dispose()
+                        except Exception as exc:
+                            logging.exception("Encoder conditioning shutdown failed")
+                            failure = failure or exc
                         if executor.dit_link is not None:
                             try:
                                 if connection_ports is not None:
@@ -1338,6 +1539,14 @@ def create_apps(
     apps = []
     for index, peer in enumerate(peers):
         app = FastAPI(lifespan=lifespan if index == 0 else None)
+        from sglang.multimodal_gen.runtime.conditioning.metrics import (
+            ConditioningMetrics,
+        )
+
+        app.state.conditioning_metrics = (
+            ConditioningMetrics() if metrics_token is not None else None
+        )
+        app.state.conditioning_metrics_token = metrics_token
         # Admission and mutable request state belong to a service, not the
         # process-global controller used by the original single endpoint.
         app.state.realtime_admission_controller = RealtimeAdmissionController(
@@ -1396,8 +1605,23 @@ async def serve_services(apps, args, *, host, ports):
         loop.add_signal_handler(sig, stop.set)
     health, business = [], []
     try:
-        for port in ports["http"]:
-            health.append(WorkerHTTPServer("encoder", host, port))
+        from sglang.multimodal_gen.runtime.conditioning.metrics import (
+            install_metrics_route,
+        )
+
+        for service_app, port in zip(apps, ports["http"]):
+            health.append(
+                WorkerHTTPServer(
+                    "encoder",
+                    host,
+                    port,
+                    install=lambda app, owner=service_app: install_metrics_route(
+                        app,
+                        owner.state.conditioning_metrics,
+                        owner.state.conditioning_metrics_token,
+                    ),
+                )
+            )
         # All apps share this one model lifespan and CUDA execution thread.
         async with apps[0].router.lifespan_context(apps[0]):
             try:
@@ -1468,6 +1692,18 @@ def main():
     )
     parser.add_argument("--service-count", type=int, default=1)
     parser.add_argument(
+        "--qwen-prefix-cache-bytes",
+        type=int,
+        default=os.environ.get("SGLANG_ZING_QWEN_PREFIX_BYTES", "0"),
+        help="Per-service session Qwen KV budget in bytes; 0 disables prefix reuse",
+    )
+    parser.add_argument(
+        "--conditioning-metrics-token-file",
+        type=Path,
+        default=os.environ.get("SGLANG_ZING_CONDITIONING_METRICS_TOKEN_FILE"),
+        help="Dedicated read-only bearer credential file for management /metrics",
+    )
+    parser.add_argument(
         "--session-max-lifetime-s",
         type=float,
         help="Hard session lifetime from first server output dispatch; defaults to the standard realtime limit",
@@ -1476,6 +1712,15 @@ def main():
         "--http-port", type=int, help="Base management port; defaults to port + 1000"
     )
     cli = parser.parse_args()
+    metrics_token = None
+    if cli.conditioning_metrics_token_file is not None:
+        with cli.conditioning_metrics_token_file.open("rb") as source:
+            raw = source.read(4097)
+        if len(raw) > 4096:
+            raise ValueError("Invalid conditioning metrics credential")
+        metrics_token = raw.decode("ascii").strip()
+        if not metrics_token or any(not 33 <= ord(c) <= 126 for c in metrics_token):
+            raise ValueError("Invalid conditioning metrics credential")
 
     from sglang.multimodal_gen.runtime.realtime.zing_nccl import configure_zing_nccl
 
@@ -1512,6 +1757,8 @@ def main():
             service_count=cli.service_count,
             connection_ports=connection_ports,
             session_max_lifetime_s=cli.session_max_lifetime_s,
+            prefix_cache_bytes=cli.qwen_prefix_cache_bytes,
+            metrics_token=metrics_token,
             pipeline_config=json.loads(cli.pipeline_config_path.read_text())
             if cli.pipeline_config_path
             else None,

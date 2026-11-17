@@ -66,6 +66,7 @@ AREA_FILES = [
         "test_whitebox_player_idle.py",
         "test_whitebox_model_binding.py",
         "test_whitebox_cache_receipts.py",
+        "test_inference_timing.py",
         "test_bound_video.py",
         "test_player_lifecycle.py",
         "test_player_room_lifecycle.py",

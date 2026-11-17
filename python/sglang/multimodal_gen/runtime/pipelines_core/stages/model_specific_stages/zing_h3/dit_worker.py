@@ -49,15 +49,18 @@ def _initialize_service_descriptor(ports, parallel, *, timeout, startup_failure=
 
 
 def create_link_session(
-    sampler, codecs, init, output, *, stage=None, defer_final=False
+    sampler, codecs, init, output, *, stage=None, defer_final=False, prompt_joint=False
 ):
     from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
         Provenance,
         SourceSpan,
     )
 
+    if type(init.get("detailed_timing", False)) is not bool:
+        raise ValueError("Invalid detailed timing mode")
     if (
         type(defer_final) is not bool
+        or type(prompt_joint) is not bool
         or type(init.get("seed")) is not int
         or init["seed"] < 0
         or any(
@@ -168,6 +171,11 @@ def create_link_session(
                     for k in ("height", "width")
                 ),
                 prompt_update=not message["initial"],
+                prompt_joint=prompt_joint
+                and (
+                    message.get("source_boundary") is None
+                    or message.get("allow_deferred_kv", False)
+                ),
             )
         else:
             _, height, width = candidate.visual_shape
@@ -232,6 +240,7 @@ def create_link_session(
             initial_prompt_version=version,
             acquire_storage=acquire_storage if kv_pool is not None else None,
             defer_final=defer_final,
+            prompt_joint=prompt_joint,
         )
 
         cache = None if stage is None else stage.block0_cache
@@ -378,6 +387,7 @@ def create_link_session(
             raise ValueError("Condition readiness differs across DiT ranks")
 
     worker = QueuedDiTSession(
+        detailed_timing=init.get("detailed_timing", False),
         session_id=init["session_id"],
         generation_id=init["generation_id"],
         bridge=bridge,
@@ -463,6 +473,12 @@ def argument_parser():
         help="Override the deployment profile's joint-forward policy",
     )
     parser.add_argument(
+        "--zing-source-prompt-joint",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Join prompt history with the next source/target step; overrides SGLANG_ZING_SOURCE_PROMPT_JOINT",
+    )
+    parser.add_argument(
         "--zing-source-defer-final",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -503,6 +519,15 @@ def argument_parser():
     parser.add_argument("--zing-block0-cache-gc-stale-s", type=float, default=600.0)
     parser.add_argument("--zing-block0-cache-gc-low-watermark", type=float, default=0.9)
     return parser
+
+
+def prompt_joint_policy(cli):
+    """Resolve at the process boundary; sessions receive an explicit boolean."""
+    if cli.zing_source_prompt_joint is not None:
+        return cli.zing_source_prompt_joint
+    from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
+
+    return get_bool_env_var("SGLANG_ZING_SOURCE_PROMPT_JOINT", "false")
 
 
 def main():
@@ -692,6 +717,7 @@ def main():
                 ),
             )
             stage.deployment_sampling = schedule
+            prompt_joint = prompt_joint_policy(cli)
             if cli.zing_source_defer_final is not None:
                 defer_final = cli.zing_source_defer_final
             elif "SGLANG_ZING_SOURCE_DEFER_FINAL" in os.environ:
@@ -708,6 +734,7 @@ def main():
                     dict(
                         joint_forward=params.zing_joint_forward,
                         source_defer_final=defer_final,
+                        source_prompt_joint=prompt_joint,
                         **{
                             key: schedule.get(key)
                             for key in (
@@ -735,6 +762,7 @@ def main():
                     output,
                     stage=stage,
                     defer_final=defer_final,
+                    prompt_joint=prompt_joint,
                 )
 
             from .dit_preparation import DiTPreparation

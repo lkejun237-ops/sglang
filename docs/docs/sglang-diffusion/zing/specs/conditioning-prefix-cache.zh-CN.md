@@ -745,3 +745,5 @@ Qwen 缓存契约测试迁入 `test/unit/conditioning/test_qwen_prefix.py`，随
 - Ruff、isort、语法、bare-pytest、包内注册限制和 diff 检查通过；全仓注册检查唯一报告 main 未改的 `test/registered/kernels/ops/test_fp8_scaled_mm_routing.py` 缺注册，不在本轮扩修。Mintlify CLI 不可用，未做全站构建。
 
 原始日志、JUnit、CI receipt 与文件哈希保存于 `D:/sglang400-review-fixes-20261110/`。新增 RPC 测试早期缺少 Content-Type 被正确拒绝，另修正同批图像 shape 夹具；失败记录保留，未放宽产品校验。没有新增 GPU/端到端实验，因此不报告本轮减少了多少毫秒，也不宣称既有 FP8/BF16 数值差异已修复。
+
+后续监控扩展见 [Qwen 前缀复用：Prometheus / Grafana 指标](conditioning-prefix-api.zh-CN.md)，不扩展业务 API 响应。

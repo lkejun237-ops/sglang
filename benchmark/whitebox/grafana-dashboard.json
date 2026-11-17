@@ -2,7 +2,7 @@
   "title": "Whitebox playtest service",
   "uid": "whitebox-playtest",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 3,
   "refresh": "10s",
   "tags": [
     "whitebox",
@@ -26,7 +26,7 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "query": "label_values(world_model_critical_path_stage_duration_seconds_count, cluster_id)"
+        "query": "label_values({__name__=~\"world_model_critical_path_stage_duration_seconds_count|world_model_conditioning_encodes_total\"}, cluster_id)"
       },
       {
         "name": "service_id",
@@ -38,7 +38,7 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "query": "label_values(world_model_critical_path_stage_duration_seconds_count{cluster_id=~\"$cluster_id\"}, service_id)"
+        "query": "label_values({__name__=~\"world_model_critical_path_stage_duration_seconds_count|world_model_conditioning_encodes_total\",cluster_id=~\"$cluster_id\"}, service_id)"
       }
     ]
   },
@@ -210,6 +210,299 @@
           "legendFormat": "{{stage}} {{worker_role}} {{pod}}"
         }
       ]
+    },
+    {
+      "id": 7,
+      "type": "row",
+      "title": "Qwen prefix / conditioning",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 8,
+      "title": "Qwen 任务前缀命中率",
+      "type": "timeseries",
+      "description": "成功编码任务中有统计的 hit/(hit+miss)。未知统计不进入分母；无样本时无数据。 复用既有 cluster/service 筛选；抓取目标需附加 cluster_id/service_id 标签。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 25
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (job,instance) (rate(world_model_conditioning_encodes_total{cluster_id=~\"$cluster_id\",service_id=~\"$service_id\",prefix_outcome=\"hit\"}[$__rate_interval])) / (sum by (job,instance) (rate(world_model_conditioning_encodes_total{cluster_id=~\"$cluster_id\",service_id=~\"$service_id\",prefix_outcome=~\"hit|miss\"}[$__rate_interval])) > 0)",
+          "legendFormat": "{{job}} {{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "title": "Qwen token 复用比例",
+      "type": "timeseries",
+      "description": "复用 token/总 token，包含视觉展开和模板。每个成功任务仅记一次。 复用既有 cluster/service 筛选；抓取目标需附加 cluster_id/service_id 标签。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 25
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (job,instance) (rate(world_model_conditioning_tokens_total{cluster_id=~\"$cluster_id\",service_id=~\"$service_id\",kind=\"reused\"}[$__rate_interval])) / (sum by (job,instance) (rate(world_model_conditioning_tokens_total{cluster_id=~\"$cluster_id\",service_id=~\"$service_id\",kind=\"total\"}[$__rate_interval])) > 0)",
+          "legendFormat": "{{job}} {{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "成功编码任务速率（含 unknown）",
+      "type": "timeseries",
+      "description": "unknown 代表未启用或未提供前缀统计，不是 miss；不包含失败任务。 复用既有 cluster/service 筛选；抓取目标需附加 cluster_id/service_id 标签。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 33
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(world_model_conditioning_encodes_total{cluster_id=~\"$cluster_id\",service_id=~\"$service_id\"}[$__rate_interval])",
+          "legendFormat": "{{job}} {{instance}} {{prefix_outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "title": "复用、新编、总 token 速率",
+      "type": "timeseries",
+      "description": "成功任务且有已知统计；结果缓存和 joined 消费不重复计数。 复用既有 cluster/service 筛选；抓取目标需附加 cluster_id/service_id 标签。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 33
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(world_model_conditioning_tokens_total{cluster_id=~\"$cluster_id\",service_id=~\"$service_id\"}[$__rate_interval])",
+          "legendFormat": "{{job}} {{instance}} {{kind}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "tps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "title": "Conditioning 编码耗时 P95",
+      "type": "timeseries",
+      "description": "包含 encoder 内预处理、CPU staging（HTTP）及 executor 返回开销；非纯 Qwen GPU 计时。 复用既有 cluster/service 筛选；抓取目标需附加 cluster_id/service_id 标签。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 41
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (job,instance,prefix_outcome,le) (rate(world_model_conditioning_encode_duration_seconds_bucket{cluster_id=~\"$cluster_id\",service_id=~\"$service_id\"}[$__rate_interval])))",
+          "legendFormat": "{{job}} {{instance}} {{prefix_outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "title": "复用长度 P95",
+      "type": "timeseries",
+      "description": "直方图聚合近似值，不提供逐请求查询。包含已知 miss 的零长度。 复用既有 cluster/service 筛选；抓取目标需附加 cluster_id/service_id 标签。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 41
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (job,instance,le) (rate(world_model_conditioning_reused_tokens_bucket{cluster_id=~\"$cluster_id\",service_id=~\"$service_id\"}[$__rate_interval])))",
+          "legendFormat": "{{job}} {{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "title": "编码排队耗时 P95",
+      "type": "timeseries",
+      "description": "仅最终成功的任务；不包含队列外媒体校验与上传。 复用既有 cluster/service 筛选；抓取目标需附加 cluster_id/service_id 标签。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 49
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (job,instance,le) (rate(world_model_conditioning_queue_duration_seconds_bucket{cluster_id=~\"$cluster_id\",service_id=~\"$service_id\"}[$__rate_interval])))",
+          "legendFormat": "{{job}} {{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 15,
+      "title": "结果交付速率",
+      "type": "timeseries",
+      "description": "HTTP/NCCL 响应完成后计数；encoding/joined/result_cache 不代表额外模型执行。 复用既有 cluster/service 筛选；抓取目标需附加 cluster_id/service_id 标签。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 49
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(world_model_conditioning_results_total{cluster_id=~\"$cluster_id\",service_id=~\"$service_id\"}[$__rate_interval])",
+          "legendFormat": "{{job}} {{instance}} {{source}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
     }
   ]
 }

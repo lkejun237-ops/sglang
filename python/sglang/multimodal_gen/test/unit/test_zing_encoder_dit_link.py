@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.dit_worker import (
     argument_parser,
     create_link_session,
+    prompt_joint_policy,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.packing import (
     H3InferenceInputs,
@@ -988,7 +989,11 @@ cpu_dma = cpu_dma_fixture
 
 @torch.no_grad()
 @pytest.mark.parametrize("joint_forward", ["off", "cross_chunk"])
-def test_cached_prefix_matches_uncached_queued_dit(model, cpu_dma, joint_forward):
+@pytest.mark.parametrize("barrier_joint", [False, True])
+@pytest.mark.parametrize("split", [False, True])
+def test_cached_prefix_matches_uncached_queued_dit(
+    model, cpu_dma, joint_forward, barrier_joint, split
+):
     if next(model.parameters()).is_cuda:
         pytest.skip("CPU DMA fixture; real CUDA restore is validated separately")
 
@@ -1000,7 +1005,7 @@ def test_cached_prefix_matches_uncached_queued_dit(model, cpu_dma, joint_forward
     )
     from sglang.multimodal_gen.test.unit.realtime.zing_cache_fixtures import cpu_cache
 
-    h = Harness(model, joint_forward=joint_forward)
+    h = Harness(model, joint_forward=joint_forward, split_first_latent=split)
     codecs = SimpleNamespace(
         target_fps=24,
         spatial_ratio=1,
@@ -1021,13 +1026,15 @@ def test_cached_prefix_matches_uncached_queued_dit(model, cpu_dma, joint_forward
         stage.kv_pool._pool._slots[0].kv_cache, rows=64, page_rows=2
     )
 
-    async def run(cached):
+    async def run(cached, enabled=False):
         results = []
 
         async def output(result):
             results.append(result.visual.clone())
 
-        worker = create_link_session(h.sampler(), codecs, init, output, stage=stage)
+        worker = create_link_session(
+            h.sampler(), codecs, init, output, stage=stage, prompt_joint=enabled
+        )
         worker.source_records = [[1, 0, 43]]
         await worker.put(
             dict(
@@ -1045,7 +1052,7 @@ def test_cached_prefix_matches_uncached_queued_dit(model, cpu_dma, joint_forward
         while worker.queue:
             await worker.queue.run_once()
         for start, end in ((0, 1), (1, 3), (3, 5), (5, 8), (8, 10), (10, 13)):
-            if start == 1:
+            if start == (5 if barrier_joint else 1):
                 await worker.put(
                     dict(
                         type="conditioning",
@@ -1056,10 +1063,19 @@ def test_cached_prefix_matches_uncached_queued_dit(model, cpu_dma, joint_forward
                         cache_key="b" * 64,
                         cache_hit=cached,
                         cache_write=not cached,
+                        **(
+                            dict(source_boundary=17, allow_deferred_kv=True)
+                            if barrier_joint
+                            else {}
+                        ),
                     )
                 )
                 while worker.queue:
                     await worker.queue.run_once()
+                if barrier_joint:
+                    assert worker.condition_ready.get("kv_deferred", False) is (
+                        enabled and (not cached or joint_forward == "cross_chunk")
+                    )
             await worker.put(
                 dict(
                     type="source.latents",
@@ -1115,9 +1131,20 @@ def test_cached_prefix_matches_uncached_queued_dit(model, cpu_dma, joint_forward
         source_shape=(2, 2),
     )
     assert len(stage.block0_cache.entries["a" * 64].page_ids) > 1
-    actual = asyncio.run(run(True))
+    actual = asyncio.run(run(True, enabled=barrier_joint))
     assert len(actual) == len(baseline) > 0
-    assert all(torch.equal(a, b) for a, b in zip(actual, baseline))
+    for a, b in zip(actual, baseline):
+        torch.testing.assert_close(
+            a, b, atol=0.03 if barrier_joint else 0, rtol=0.03 if barrier_joint else 0
+        )
+    if barrier_joint:
+        stage.block0_cache = cpu_cache(
+            stage.kv_pool._pool._slots[0].kv_cache, rows=64, page_rows=2
+        )
+        miss = asyncio.run(run(False, enabled=True))
+        assert set(stage.block0_cache.entries) == {"a" * 64, "b" * 64}
+        for a, b in zip(miss, baseline):
+            torch.testing.assert_close(a, b, atol=0.03, rtol=0.03)
 
 
 @torch.no_grad()
@@ -1649,3 +1676,181 @@ def test_initial_pool_rejection_allows_inflight_ack_cancel_and_reuse(
         assert stage.kv_pool.available == 1 and not client.failed
     finally:
         client.release("good")
+
+
+@pytest.mark.parametrize(
+    "env,expected", [(None, False), ("0", False), ("1", True), ("invalid", False)]
+)
+def test_dit_prompt_joint_policy_cli_overrides_environment(monkeypatch, env, expected):
+    if env is None:
+        monkeypatch.delenv("SGLANG_ZING_SOURCE_PROMPT_JOINT", raising=False)
+    else:
+        monkeypatch.setenv("SGLANG_ZING_SOURCE_PROMPT_JOINT", env)
+    parser = argument_parser()
+    assert prompt_joint_policy(parser.parse_args(["--model", "fixture"])) is expected
+    for flag, value in [
+        ("--zing-source-prompt-joint", True),
+        ("--no-zing-source-prompt-joint", False),
+    ]:
+        assert (
+            prompt_joint_policy(parser.parse_args(["--model", "fixture", flag]))
+            is value
+        )
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("split", [False, True])
+@pytest.mark.parametrize(
+    "joint_forward,defer_final",
+    [("cross_chunk", False), ("cross_chunk", True), ("off", False)],
+)
+def test_production_prompt_joint_barrier_matches_serial_and_releases(
+    model, split, joint_forward, defer_final
+):
+    # Real production factory + transport + pooled tiny DiT. No future source is
+    # sent until conditioning.ready, mirroring Room's clip barrier.
+    h = Harness(model, split_first_latent=split, joint_forward=joint_forward)
+    results = []
+    for enabled, allowed in [(False, True), (True, False), (True, True)]:
+        channel = LocalChannel()
+        workers = []
+        codecs = SimpleNamespace(
+            target_fps=24,
+            spatial_ratio=1,
+            temporal_ratio=4,
+            vae_frames_per_chunk=17,
+            vae_latents_per_chunk=5,
+        )
+        codecs.sample_streaming_visual_moments = lambda value, **kwargs: value
+        stage = pooled_stage(h, codecs)
+
+        def create(init, output):
+            worker = create_link_session(
+                h.sampler(),
+                codecs,
+                init,
+                output,
+                stage=stage,
+                prompt_joint=enabled,
+                defer_final=defer_final,
+            )
+            workers.append(worker)
+            return worker
+
+        channel.service = DiTInputService(
+            SimpleNamespace(send=channel.replies.append), create
+        )
+        client = DiTLinkClient(channel)
+        client.open(
+            dict(
+                session_id="s",
+                generation_id="g",
+                seed=7,
+                width=2,
+                height=2,
+                fps=24,
+                detailed_timing=True,
+            )
+        )
+        client.send(
+            "conditioning",
+            tensors=h.condition(10),
+            event_id=10,
+            prompt_version=1,
+            inputs=input_metadata(h),
+        )
+        client.send(
+            "source.moments",
+            tensor=h.inputs.source_visual[:, :, :5],
+            latent_start=0,
+            latent_end=5,
+            source_dependency_end=17,
+            source_records=[[1, 0, 17]],
+        )
+        state = workers[-1].state
+        assert state.prompt_joint is enabled
+        before = state.next_latent
+        ready = client.send(
+            "conditioning",
+            tensors=h.condition(11),
+            event_id=11,
+            prompt_version=2,
+            source_boundary=17,
+            allow_deferred_kv=allowed,
+        )
+        receipt = next(r for r in ready if r["type"] == "conditioning.ready")
+        assert receipt.get("kv_deferred", False) is (enabled and allowed)
+        assert receipt["source_frame_index"] == 17 and receipt["prompt_version"] == 2
+        assert state.next_latent == before == 5
+        assert state.metrics["forward_counts"].get("prompt_joint", 0) == 0
+        prepared_stages = {
+            row["stage"]
+            for reply in ready
+            if reply["type"] == "model.timing"
+            and reply["timing"]["prompt_version"] == 2
+            for row in reply["timing"]["stages"]
+        }
+        assert "condition_activate" in prepared_stages
+        assert "prompt_joint_step0" not in prepared_stages
+        output = client.send(
+            "source.moments",
+            tensor=h.inputs.source_visual[:, :, 5:10],
+            latent_start=5,
+            latent_end=10,
+            source_dependency_end=34,
+            source_records=[[2, 17, 34]],
+        )
+        generated = [r for r in output if r["type"] == "dit.latents"]
+        assert generated and all(
+            r["prompt_version"] == 2 and r["event_id"] == 11 for r in generated
+        )
+        assert bool(state.metrics["forward_counts"].get("prompt_joint", 0)) is (
+            enabled and allowed and joint_forward == "cross_chunk"
+        )
+        output_stages = {
+            row["stage"]
+            for reply in output
+            if reply["type"] == "model.timing"
+            and reply["timing"]["prompt_version"] == 2
+            for row in reply["timing"]["stages"]
+        }
+        assert "first_output_compute" in output_stages
+        if enabled and allowed:
+            assert "prompt_joint_step0" in output_stages
+        results.append(torch.cat([r["tensor"] for r in generated], dim=2))
+        client.release("s")
+        assert workers[-1].closed and stage.kv_pool.available == 1
+        # Cancellation after readiness must release the deferred packs and pool.
+        client.open(
+            dict(
+                session_id="s", generation_id="next", seed=7, width=2, height=2, fps=24
+            )
+        )
+        client.send(
+            "conditioning",
+            tensors=h.condition(10),
+            event_id=10,
+            prompt_version=1,
+            inputs=input_metadata(h),
+        )
+        client.send(
+            "source.moments",
+            tensor=h.inputs.source_visual[:, :, :5],
+            latent_start=0,
+            latent_end=5,
+            source_dependency_end=17,
+            source_records=[[1, 0, 17]],
+        )
+        client.send(
+            "conditioning",
+            tensors=h.condition(11),
+            event_id=11,
+            prompt_version=2,
+            source_boundary=17,
+            allow_deferred_kv=allowed,
+        )
+        cancelled = workers[-1].state
+        client.release("s")
+        assert cancelled._pending_prefix is None and stage.kv_pool.available == 1
+    torch.testing.assert_close(results[0], results[1], atol=0, rtol=0)
+    torch.testing.assert_close(results[0], results[2], atol=0.03, rtol=0.03)

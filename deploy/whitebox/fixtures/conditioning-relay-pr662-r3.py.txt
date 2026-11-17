@@ -1,0 +1,402 @@
+"""Pure bounded Prometheus text -> remote_write v1 preparation; no I/O or SDK.
+
+Only a fresh caller-proved target may produce a batch. ``sampled_at`` is the
+actual HTTP scrape observation time, never a timestamp supplied by exposition.
+The caller must obtain a CURRENT proof, not a persisted last-good proof, and
+call ``assert_sendable`` immediately before every send/retry. This module has
+no cache, resend queue, source-health gauge, or delivery implementation.
+
+Wire contracts: https://prometheus.io/docs/specs/prw/remote_write_spec/
+https://github.com/google/snappy/blob/main/format_description.txt
+Raw metrics are limited to the Room histograms and exact stages requested in
+the SGLang monitoring handoff. Generic SGLang and Coordinator exporter metrics
+are excluded. No missing stage, histogram bucket, rate, or zero is synthesized.
+"""
+
+from dataclasses import dataclass, fields
+from datetime import datetime
+import hashlib
+import json
+import math
+import re
+import struct
+
+
+class RelayError(ValueError):
+    """A safe reason code only; never include source text or label values."""
+
+
+@dataclass(frozen=True)
+class Limits:
+    max_input_bytes: int = 1_048_576
+    max_lines: int = 20_000
+    max_line_bytes: int = 16_384
+    max_series: int = 4_096
+    max_labels_per_series: int = 32
+    max_label_name_bytes: int = 128
+    max_label_value_bytes: int = 512
+    max_output_bytes: int = 2_097_152
+
+
+@dataclass(frozen=True)
+class RemoteWriteBatch:
+    body: bytes
+    series_count: int
+    sampled_at_ms: int
+    valid_until: float
+    target: str
+    labels: tuple
+    proof_digest: str
+    ignored_samples: int
+    dropped_labels: int
+
+    @property
+    def headers(self):
+        # A new dictionary prevents a caller mutating another batch's headers.
+        return {
+            'Content-Encoding': 'snappy',
+            'Content-Type': 'application/x-protobuf',
+            'User-Agent': 'whitebox-fc-relay/1',
+            'X-Prometheus-Remote-Write-Version': '0.1.0',
+        }
+
+
+IDENTITY_KEYS = frozenset({'region', 'service', 'deployment_id', 'business_line_id', 'pool'})
+DEPLOYMENTS = {'cn-shanghai': 'zing-demo-shanghai-01', 'ap-southeast-7': 'zing-demo-thailand-01'}
+FRESHNESS_SECONDS = 120
+_NAME = re.compile(r'[A-Za-z_:][A-Za-z0-9_:]*')
+_LABEL = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+_NUMBER = re.compile(r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?')
+_INTEGER = re.compile(r'[+-]?\d+')
+_CRITICAL = frozenset('world_model_critical_path_stage_duration_seconds_' + s for s in ('bucket', 'sum', 'count'))
+RD_STAGES = frozenset({
+    'whitebox_session_ttff',
+    'whitebox_prompt_switch_ttff',
+    'whitebox_condition_switch_host',
+    'whitebox_h3_telemetry_clip17_total_ms',
+    'whitebox_h3_telemetry_chunk_total_ms',
+    'whitebox_engine_start',
+    'whitebox_h3_source_to_output',
+    'whitebox_engine_frame_wait',
+} | {'whitebox_h3_telemetry_h3_' + stage + '_host_ms' for stage in
+     ('encoder', 'dit', 'decoder', 'bridge', 'input_copy', 'prompt')})
+# An allowlist also excludes unknown per-user/cardinality dimensions. Erasing a
+# dimension must never merge two series: duplicate final labelsets abort a batch.
+_SOURCE_LABELS = frozenset({
+    'stage', 'result', 'le', 'quantile', 'model_name', 'model', 'name',
+    'dp_rank', 'tp_rank', 'pp_rank', 'rank', 'role', 'worker_role',
+    'error_code', 'reason', 'status', 'component', 'engine', 'codec', 'lane', 'scope',
+    'environment', 'platform_environment', 'source_environment',
+    'source_platform_environment', 'sglang_environment', 'sglang_platform_environment',
+})
+_UNSAFE_PARTS = frozenset({'session', 'request', 'prompt', 'trace', 'span', 'user',
+                           'client', 'conversation', 'segment', 'token', 'job', 'pod'})
+_ALIASES = {'deployment': 'deployment_id', 'business_line': 'business_line_id'}
+
+
+def _limits(limits):
+    if not isinstance(limits, Limits):
+        raise RelayError('invalid_limits')
+    ceiling = Limits()
+    for field in fields(Limits):
+        value = getattr(limits, field.name)
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= getattr(ceiling, field.name):
+            raise RelayError('invalid_limits')
+
+
+def _stamp(value):
+    try:
+        if isinstance(value, bool):
+            raise ValueError()
+        if isinstance(value, (int, float)):
+            result = float(value)
+        elif isinstance(value, str):
+            parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            if parsed.tzinfo is None:
+                raise ValueError()
+            result = parsed.timestamp()
+        else:
+            raise ValueError()
+        if not math.isfinite(result) or result < 0 or result * 1000 >= 2 ** 63:
+            raise ValueError()
+        return result
+    except (ValueError, TypeError, OverflowError):
+        raise RelayError('invalid_observation_time') from None
+
+
+def _string(value, maximum, reason, *, empty=False):
+    try:
+        valid = (isinstance(value, str) and (empty or bool(value)) and
+                 len(value.encode('utf-8')) <= maximum and
+                 not any(ord(c) < 32 or ord(c) == 127 for c in value))
+    except UnicodeEncodeError:
+        valid = False
+    if not valid:
+        raise RelayError(reason)
+    return value
+
+
+def _identity(labels, limits):
+    if not isinstance(labels, dict) or set(labels) != IDENTITY_KEYS:
+        raise RelayError('invalid_fixed_labels')
+    result = {key: _string(value, limits.max_label_value_bytes, 'invalid_fixed_labels')
+              for key, value in labels.items()}
+    copy_scope = (result['region'] == 'cn-shanghai' and result['deployment_id'] == 'test-shanghai-copy'
+                  and result['pool'] == 'test-shanghai-copy')
+    production_scope = (result['region'] in DEPLOYMENTS and
+                        result['deployment_id'] == DEPLOYMENTS[result['region']] and
+                        result['pool'] != 'test-shanghai-copy')
+    if (not (copy_scope or production_scope) or
+            result['business_line_id'] != 'world-model-data' or result['service'] not in {'sglang', 'gateway', 'coordinator', 'room'}):
+        raise RelayError('fixed_scope_outside_reviewed_deployments')
+    return result
+
+
+def _proof(proof, target, labels, now):
+    if (not isinstance(proof, dict) or proof.get('status') != 'matched' or proof.get('complete') is not True or
+            proof.get('target') != target or proof.get('labels') != labels):
+        raise RelayError('target_proof_unavailable_or_wrong_scope')
+    proof_id = _string(proof.get('proof_id'), 256, 'invalid_target_proof_id')
+    observed, until = _stamp(proof.get('observed_at')), _stamp(proof.get('valid_until'))
+    if observed > now or now - observed > FRESHNESS_SECONDS or until <= now or not observed < until <= observed + FRESHNESS_SECONDS:
+        raise RelayError('target_proof_stale_future_or_expired')
+    document = {'proof_id': proof_id, 'target': target, 'labels': labels,
+                'observed_at': observed, 'valid_until': until}
+    digest = hashlib.sha256(json.dumps(document, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    return observed, until, digest
+
+
+def _allowed(name):
+    return name in _CRITICAL
+
+
+def _labels(text, start, limits):
+    """Parse a Prometheus label set; only \\n, \\\" and \\\\ are escapes."""
+    result, position = {}, start + 1
+    while True:
+        while position < len(text) and text[position] in ' \t':
+            position += 1
+        if position >= len(text):
+            raise RelayError('invalid_label_set')
+        if text[position] == '}':
+            return result, position + 1
+        match = _LABEL.match(text, position)
+        if not match:
+            raise RelayError('invalid_label_name')
+        name, position = match.group(), match.end()
+        if len(name) > limits.max_label_name_bytes or name in result or len(result) >= limits.max_labels_per_series:
+            raise RelayError('duplicate_or_excessive_source_labels')
+        while position < len(text) and text[position] in ' \t':
+            position += 1
+        if position >= len(text) or text[position] != '=':
+            raise RelayError('invalid_label_set')
+        position += 1
+        while position < len(text) and text[position] in ' \t':
+            position += 1
+        if position >= len(text) or text[position] != '"':
+            raise RelayError('invalid_label_set')
+        position += 1
+        value = []
+        while position < len(text) and text[position] != '"':
+            char = text[position]
+            position += 1
+            if char == '\\':
+                if position >= len(text) or text[position] not in ('n', '"', '\\'):
+                    raise RelayError('invalid_label_escape')
+                char = {'n': '\n', '"': '"', '\\': '\\'}[text[position]]
+                position += 1
+            elif ord(char) < 32 or ord(char) == 127:
+                raise RelayError('invalid_label_value')
+            value.append(char)
+        if position >= len(text):
+            raise RelayError('invalid_label_set')
+        position += 1
+        value = ''.join(value)
+        if len(value.encode('utf-8')) > limits.max_label_value_bytes:
+            raise RelayError('source_label_value_too_large')
+        result[name] = value
+        while position < len(text) and text[position] in ' \t':
+            position += 1
+        if position >= len(text) or text[position] not in ',}':
+            raise RelayError('invalid_label_set')
+        if text[position] == '}':
+            return result, position + 1
+        position += 1
+
+
+def _parse(text, identity, target, limits):
+    if isinstance(text, bytes):
+        if len(text) > limits.max_input_bytes:
+            raise RelayError('input_too_large')
+        try:
+            text = text.decode('utf-8')
+        except UnicodeDecodeError:
+            raise RelayError('invalid_utf8') from None
+    if not isinstance(text, str):
+        raise RelayError('invalid_text')
+    try:
+        size = len(text.encode('utf-8'))
+    except UnicodeEncodeError:
+        raise RelayError('invalid_utf8') from None
+    if size > limits.max_input_bytes:
+        raise RelayError('input_too_large')
+    # Prometheus text uses LF, optionally CRLF, not arbitrary Unicode line breaks.
+    lines = text.split('\n')
+    if len(lines) > limits.max_lines:
+        raise RelayError('too_many_lines')
+    samples, seen, ignored, dropped = [], set(), 0, 0
+    for line in lines:
+        if len(line.encode('utf-8')) > limits.max_line_bytes:
+            raise RelayError('line_too_large')
+        line = line.rstrip('\r').strip(' \t')
+        if not line or line.startswith('#'):
+            continue
+        match = _NAME.match(line)
+        if not match or len(match.group()) > 256:
+            raise RelayError('invalid_metric_name')
+        name, position = match.group(), match.end()
+        if position < len(line) and line[position] not in '{ \t':
+            raise RelayError('invalid_metric_name')
+        if identity['service'] != 'room' or not _allowed(name):
+            ignored += 1
+            continue
+        source = {}
+        if position < len(line) and line[position] == '{':
+            source, position = _labels(line, position, limits)
+        if source.get('stage') not in RD_STAGES or name.endswith('_bucket') and not source.get('le'):
+            ignored += 1
+            continue
+        if position >= len(line) or line[position] not in ' \t':
+            raise RelayError('missing_sample_value')
+        parts = line[position:].split()
+        if len(parts) not in (1, 2) or not _NUMBER.fullmatch(parts[0]):
+            raise RelayError('invalid_or_nonfinite_sample')
+        value = float(parts[0])
+        if not math.isfinite(value):
+            raise RelayError('invalid_or_nonfinite_sample')
+        if len(parts) == 2:
+            if len(parts[1]) > 20 or not _INTEGER.fullmatch(parts[1]) or not -(2 ** 63) <= int(parts[1]) < 2 ** 63:
+                raise RelayError('invalid_supplied_timestamp')
+            # Ignore exporter-provided timestamps, including future/old values.
+        labels = dict(identity, instance=target, __name__=name)
+        for key, val in source.items():
+            # The reviewed exporters use runtime roles as their service label.
+            # Preserve that dimension without letting it override target identity.
+            if key == 'service' and val in {'room': {'room_runtime', 'denoiser'}, 'sglang': {'denoiser'}}.get(identity['service'], set()):
+                labels['exporter_service'] = val
+                continue
+            canonical = _ALIASES.get(key, key)
+            if canonical in identity:
+                if val != identity[canonical]:
+                    raise RelayError('source_fixed_label_conflict')
+                continue
+            if key in {'__name__', 'instance'}:
+                if val != labels[key]:
+                    raise RelayError('source_fixed_label_conflict')
+                continue
+            unsafe = bool(set(key.lower().split('_')) & _UNSAFE_PARTS)
+            if key not in _SOURCE_LABELS or unsafe or not val:
+                dropped += 1
+                continue
+            labels[key] = val
+        if len(labels) > limits.max_labels_per_series:
+            raise RelayError('too_many_output_labels')
+        if any(len(key.encode()) > limits.max_label_name_bytes or
+               len(val.encode()) > limits.max_label_value_bytes for key, val in labels.items()):
+            raise RelayError('output_label_too_large')
+        labelset = tuple(sorted(labels.items()))
+        if labelset in seen:
+            raise RelayError('series_collision_after_label_projection')
+        seen.add(labelset)
+        samples.append((labelset, value))
+        if len(samples) > limits.max_series:
+            raise RelayError('too_many_series')
+    return sorted(samples), ignored, dropped
+
+
+def _varint(number):
+    result = bytearray()
+    while number > 127:
+        result.append((number & 127) | 128)
+        number >>= 7
+    result.append(number)
+    return bytes(result)
+
+
+def _message(field, value):
+    return _varint((field << 3) | 2) + _varint(len(value)) + value
+
+
+def _protobuf(samples, timestamp, maximum):
+    result = bytearray()
+    for labels, value in samples:
+        series = bytearray()
+        for name, text in labels:
+            label = _message(1, name.encode()) + _message(2, text.encode())
+            series += _message(1, label)
+        # Sample { double value=1; int64 timestamp=2 }; TimeSeries samples=2.
+        sample = b'\x09' + struct.pack('<d', value) + b'\x10' + _varint(timestamp)
+        series += _message(2, sample)
+        result += _message(1, series)  # WriteRequest timeseries=1.
+        if len(result) > maximum:
+            raise RelayError('output_too_large')
+    return bytes(result)
+
+
+def _snappy_block(data):
+    """Valid raw Snappy block using literals only; no framed-stream prefix.
+
+    This trades compression ratio for a portable stdlib-only FC package. Encoded
+    bytes are close to the protobuf size, not evidence of billed ingest bytes.
+    """
+    result = bytearray(_varint(len(data)))
+    # Multiple 64KiB literals are legal; no Snappy native dependency is needed.
+    for offset in range(0, len(data), 65_536):
+        literal = data[offset:offset + 65_536]
+        n = len(literal) - 1
+        if n < 60:
+            result.append(n << 2)
+        else:
+            width = (n.bit_length() + 7) // 8
+            result.append((59 + width) << 2)
+            result += n.to_bytes(width, 'little')
+        result += literal
+    return bytes(result)
+
+
+def build_remote_write(text, *, labels, target, proof, sampled_at, now, limits=Limits()):
+    """Return a bounded immutable batch; an empty batch contains no fake zeros.
+
+    Proof is a CURRENT caller attestation with matched/complete, proof_id, target,
+    observed_at, valid_until and the same fixed labels. ``proof_id`` must change
+    when pod/worker identity or proof generation changes. A pure encoder cannot
+    itself verify a DLC/Coordinator query; that remains the caller's obligation.
+    A batch with series_count=0 should be skipped by the transport.
+    """
+    _limits(limits)
+    identity = _identity(labels, limits)
+    target = _string(target, 256, 'invalid_target')
+    current, sampled = _stamp(now), _stamp(sampled_at)
+    observed, until, digest = _proof(proof, target, identity, current)
+    if sampled < observed or sampled > current or current - sampled > FRESHNESS_SECONDS or sampled >= until:
+        raise RelayError('sample_stale_future_or_outside_proof')
+    samples, ignored, dropped = _parse(text, identity, target, limits)
+    millis = int(sampled * 1000)
+    body = _snappy_block(_protobuf(samples, millis, limits.max_output_bytes))
+    if len(body) > limits.max_output_bytes:
+        raise RelayError('output_too_large')
+    return RemoteWriteBatch(body, len(samples), millis, min(until, sampled + FRESHNESS_SECONDS),
+                            target, tuple(sorted(identity.items())), digest, ignored, dropped)
+
+
+def assert_sendable(batch, *, proof, now):
+    """Revalidate immediately before a send/retry; never substitute last-good proof."""
+    if not isinstance(batch, RemoteWriteBatch):
+        raise RelayError('invalid_batch')
+    current = _stamp(now)
+    _, _, digest = _proof(proof, batch.target, dict(batch.labels), current)
+    if digest != batch.proof_digest or current >= batch.valid_until or current * 1000 < batch.sampled_at_ms:
+        raise RelayError('batch_proof_changed_or_expired')
+    return True
+
+RD_STAGES = RD_STAGES | frozenset(['whitebox_cli_browserContextMs', 'whitebox_cli_browserLaunchMs', 'whitebox_cli_environmentInspectionMs', 'whitebox_cli_preparationMs', 'whitebox_cli_producerStartMs', 'whitebox_cli_runtimePrepareMs', 'whitebox_cli_worldLoadMs', 'whitebox_ttff_initial_decoder_cuda_rgb_copy_publish', 'whitebox_ttff_initial_decoder_cuda_vae_decode', 'whitebox_ttff_initial_decoder_host_decoder_queue_wait', 'whitebox_ttff_initial_decoder_host_rgb_copy_publish', 'whitebox_ttff_initial_decoder_host_vae_decode', 'whitebox_ttff_initial_dit_cuda_condition_activate', 'whitebox_ttff_initial_dit_cuda_condition_admission', 'whitebox_ttff_initial_dit_cuda_condition_prefix_apply', 'whitebox_ttff_initial_dit_cuda_denoise_graph', 'whitebox_ttff_initial_dit_cuda_denoise_steps', 'whitebox_ttff_initial_dit_cuda_first_output_compute', 'whitebox_ttff_initial_dit_cuda_history_kv_rebuild', 'whitebox_ttff_initial_dit_cuda_initial_joint_graph', 'whitebox_ttff_initial_dit_cuda_initial_joint_step0', 'whitebox_ttff_initial_dit_cuda_prompt_joint_step0', 'whitebox_ttff_initial_dit_cuda_resume_joint_graph', 'whitebox_ttff_initial_dit_cuda_source_step0_graph', 'whitebox_ttff_initial_dit_host_condition_activate', 'whitebox_ttff_initial_dit_host_condition_admission', 'whitebox_ttff_initial_dit_host_condition_prefix_apply', 'whitebox_ttff_initial_dit_host_condition_queue_wait', 'whitebox_ttff_initial_dit_host_condition_ready_wait', 'whitebox_ttff_initial_dit_host_condition_to_source_ready', 'whitebox_ttff_initial_dit_host_denoise_graph', 'whitebox_ttff_initial_dit_host_denoise_steps', 'whitebox_ttff_initial_dit_host_first_output_compute', 'whitebox_ttff_initial_dit_host_history_kv_rebuild', 'whitebox_ttff_initial_dit_host_initial_joint_graph', 'whitebox_ttff_initial_dit_host_initial_joint_step0', 'whitebox_ttff_initial_dit_host_prompt_joint_step0', 'whitebox_ttff_initial_dit_host_resume_joint_graph', 'whitebox_ttff_initial_dit_host_source_step0_graph', 'whitebox_ttff_initial_encoder_cuda_reference_vae', 'whitebox_ttff_initial_encoder_cuda_source_prepare', 'whitebox_ttff_initial_encoder_cuda_source_vae_append', 'whitebox_ttff_initial_encoder_cuda_source_vae_pop', 'whitebox_ttff_initial_encoder_host_condition_cache_lookup', 'whitebox_ttff_initial_encoder_host_encoder_queue_wait', 'whitebox_ttff_initial_encoder_host_media_prepare', 'whitebox_ttff_initial_encoder_host_qwen_prepare', 'whitebox_ttff_initial_encoder_host_qwen_remote_prepare', 'whitebox_ttff_initial_encoder_host_reference_vae', 'whitebox_ttff_initial_encoder_host_source_prepare', 'whitebox_ttff_initial_encoder_host_source_vae_append', 'whitebox_ttff_initial_encoder_host_source_vae_pop', 'whitebox_ttff_initial_room_host_accepted_to_condition_ready', 'whitebox_ttff_initial_room_host_condition_dequeue_to_first_rgb', 'whitebox_ttff_initial_room_host_condition_dequeue_to_model_send', 'whitebox_ttff_initial_room_host_condition_ready_to_resume', 'whitebox_ttff_initial_room_host_effective_boundary_wait', 'whitebox_ttff_initial_room_host_model_wire_lock_wait', 'whitebox_ttff_initial_room_host_old_clip_dispatch_to_condition_ready', 'whitebox_ttff_initial_room_host_old_clip_input_wait', 'whitebox_ttff_initial_room_host_prompt_send_call', 'whitebox_ttff_initial_room_host_prompt_send_to_accepted', 'whitebox_ttff_initial_room_host_reference_resolve_store', 'whitebox_ttff_initial_room_host_resume_to_first_rgb', 'whitebox_ttff_initial_room_host_resume_to_fresh_source_dispatch', 'whitebox_ttff_initial_room_host_room_accept_to_condition_dequeue', 'whitebox_ttff_initial_room_host_room_accept_to_first_rgb', 'whitebox_ttff_initial_room_host_room_accept_to_model_send', 'whitebox_ttff_initial_room_host_segment_setup_to_first_rgb', 'whitebox_ttff_initial_room_host_segment_setup_to_source_dispatch', 'whitebox_ttff_initial_room_host_send_lock_wait', 'whitebox_ttff_initial_room_host_sink_idle_wait', 'whitebox_ttff_initial_room_host_source_dispatch_to_first_rgb', 'whitebox_ttff_initial_room_host_source_session_to_first_rgb', 'whitebox_ttff_prompt_switch_decoder_cuda_rgb_copy_publish', 'whitebox_ttff_prompt_switch_decoder_cuda_vae_decode', 'whitebox_ttff_prompt_switch_decoder_host_decoder_queue_wait', 'whitebox_ttff_prompt_switch_decoder_host_rgb_copy_publish', 'whitebox_ttff_prompt_switch_decoder_host_vae_decode', 'whitebox_ttff_prompt_switch_dit_cuda_condition_activate', 'whitebox_ttff_prompt_switch_dit_cuda_condition_admission', 'whitebox_ttff_prompt_switch_dit_cuda_condition_prefix_apply', 'whitebox_ttff_prompt_switch_dit_cuda_denoise_graph', 'whitebox_ttff_prompt_switch_dit_cuda_denoise_steps', 'whitebox_ttff_prompt_switch_dit_cuda_first_output_compute', 'whitebox_ttff_prompt_switch_dit_cuda_history_kv_rebuild', 'whitebox_ttff_prompt_switch_dit_cuda_initial_joint_graph', 'whitebox_ttff_prompt_switch_dit_cuda_initial_joint_step0', 'whitebox_ttff_prompt_switch_dit_cuda_prompt_joint_step0', 'whitebox_ttff_prompt_switch_dit_cuda_resume_joint_graph', 'whitebox_ttff_prompt_switch_dit_cuda_source_step0_graph', 'whitebox_ttff_prompt_switch_dit_host_condition_activate', 'whitebox_ttff_prompt_switch_dit_host_condition_admission', 'whitebox_ttff_prompt_switch_dit_host_condition_prefix_apply', 'whitebox_ttff_prompt_switch_dit_host_condition_queue_wait', 'whitebox_ttff_prompt_switch_dit_host_condition_ready_wait', 'whitebox_ttff_prompt_switch_dit_host_condition_to_source_ready', 'whitebox_ttff_prompt_switch_dit_host_denoise_graph', 'whitebox_ttff_prompt_switch_dit_host_denoise_steps', 'whitebox_ttff_prompt_switch_dit_host_first_output_compute', 'whitebox_ttff_prompt_switch_dit_host_history_kv_rebuild', 'whitebox_ttff_prompt_switch_dit_host_initial_joint_graph', 'whitebox_ttff_prompt_switch_dit_host_initial_joint_step0', 'whitebox_ttff_prompt_switch_dit_host_prompt_joint_step0', 'whitebox_ttff_prompt_switch_dit_host_resume_joint_graph', 'whitebox_ttff_prompt_switch_dit_host_source_step0_graph', 'whitebox_ttff_prompt_switch_encoder_cuda_reference_vae', 'whitebox_ttff_prompt_switch_encoder_cuda_source_prepare', 'whitebox_ttff_prompt_switch_encoder_cuda_source_vae_append', 'whitebox_ttff_prompt_switch_encoder_cuda_source_vae_pop', 'whitebox_ttff_prompt_switch_encoder_host_condition_cache_lookup', 'whitebox_ttff_prompt_switch_encoder_host_encoder_queue_wait', 'whitebox_ttff_prompt_switch_encoder_host_media_prepare', 'whitebox_ttff_prompt_switch_encoder_host_qwen_prepare', 'whitebox_ttff_prompt_switch_encoder_host_qwen_remote_prepare', 'whitebox_ttff_prompt_switch_encoder_host_reference_vae', 'whitebox_ttff_prompt_switch_encoder_host_source_prepare', 'whitebox_ttff_prompt_switch_encoder_host_source_vae_append', 'whitebox_ttff_prompt_switch_encoder_host_source_vae_pop', 'whitebox_ttff_prompt_switch_room_host_accepted_to_condition_ready', 'whitebox_ttff_prompt_switch_room_host_condition_dequeue_to_first_rgb', 'whitebox_ttff_prompt_switch_room_host_condition_dequeue_to_model_send', 'whitebox_ttff_prompt_switch_room_host_condition_ready_to_resume', 'whitebox_ttff_prompt_switch_room_host_effective_boundary_wait', 'whitebox_ttff_prompt_switch_room_host_model_wire_lock_wait', 'whitebox_ttff_prompt_switch_room_host_old_clip_dispatch_to_condition_ready', 'whitebox_ttff_prompt_switch_room_host_old_clip_input_wait', 'whitebox_ttff_prompt_switch_room_host_prompt_send_call', 'whitebox_ttff_prompt_switch_room_host_prompt_send_to_accepted', 'whitebox_ttff_prompt_switch_room_host_reference_resolve_store', 'whitebox_ttff_prompt_switch_room_host_resume_to_first_rgb', 'whitebox_ttff_prompt_switch_room_host_resume_to_fresh_source_dispatch', 'whitebox_ttff_prompt_switch_room_host_room_accept_to_condition_dequeue', 'whitebox_ttff_prompt_switch_room_host_room_accept_to_first_rgb', 'whitebox_ttff_prompt_switch_room_host_room_accept_to_model_send', 'whitebox_ttff_prompt_switch_room_host_segment_setup_to_first_rgb', 'whitebox_ttff_prompt_switch_room_host_segment_setup_to_source_dispatch', 'whitebox_ttff_prompt_switch_room_host_send_lock_wait', 'whitebox_ttff_prompt_switch_room_host_sink_idle_wait', 'whitebox_ttff_prompt_switch_room_host_source_dispatch_to_first_rgb', 'whitebox_ttff_prompt_switch_room_host_source_session_to_first_rgb'])
