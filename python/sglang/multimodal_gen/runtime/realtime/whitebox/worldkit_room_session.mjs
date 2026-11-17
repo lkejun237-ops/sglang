@@ -88,7 +88,10 @@ try {
     };
     if (session.input && session.input.baseUrl !== `${connection.baseUrl}/v1/sessions/${session.sessionId}/`)
       throw Error('ROOM_PUBLIC_INPUT_INVALID');
+    // Preserve audio for native SDK fallback, through the same public capability
+    // boundary as input resources. Never expose the private Room origin.
     const published = parseSessionDescriptor({...session, baseUrl: publicOrigin,
+      ...(session.audio ? {audio: {...session.audio, manifestUrl: prefix + '/audio/project-audio.json'}} : {}),
       ...(session.input ? {input: {...session.input, baseUrl: prefix + '/'}} : {}),
       ui: {...session.ui, moduleUrl: rewrite(session.ui.moduleUrl),
         styles: session.ui.styles.map(style => ({...style, url: rewrite(style.url)}))}});

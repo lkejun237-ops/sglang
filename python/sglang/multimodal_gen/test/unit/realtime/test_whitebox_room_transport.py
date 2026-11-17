@@ -396,6 +396,8 @@ def sdk_descriptor(base):
         "stale-binding",
         "missing-render",
         "public-input",
+        "public-audio",
+        "private-audio",
     ],
 )
 def test_member_helper_uses_actual_sdk_read_session_and_checks_private_identity(
@@ -432,6 +434,12 @@ def test_member_helper_uses_actual_sdk_read_session_and_checks_private_identity(
             key: descriptor[key]
             for key in ["sessionId", "baseUrl", "accessToken", "accessMode"]
         }
+        if bad in {"public-input", "public-audio", "private-audio"}:
+            descriptor["audio"] = dict(
+                manifestUrl=descriptor["baseUrl"]
+                + "/v1/sessions/render-alice/audio/project-audio.json",
+                manifestSha256="e" * 64,
+            )
         if bad == "public-input":
             descriptor["input"] = dict(
                 schemaVersion=1,
@@ -440,6 +448,7 @@ def test_member_helper_uses_actual_sdk_read_session_and_checks_private_identity(
                 adapters=[],
                 baseUrl=descriptor["baseUrl"] + "/v1/sessions/render-alice/",
             )
+        if bad in {"public-input", "public-audio"}:
             descriptor["ui"]["moduleUrl"] = (
                 descriptor["baseUrl"]
                 + "/ui/"
@@ -500,7 +509,7 @@ def test_member_helper_uses_actual_sdk_read_session_and_checks_private_identity(
                             uiRoot=str(tmp_path / "ui"),
                             **(
                                 {"publicOrigin": "https://gateway.test"}
-                                if bad == "public-input"
+                                if bad in {"public-input", "public-audio"}
                                 else {}
                             ),
                         )
@@ -508,12 +517,17 @@ def test_member_helper_uses_actual_sdk_read_session_and_checks_private_identity(
                 ),
                 15,
             )
-            if bad in (None, "public-input"):
+            if bad in (None, "public-input", "public-audio", "private-audio"):
                 assert process.returncode == 0, stderr.decode()
                 result = json.loads(stdout)
                 assert (
                     result["epoch"] == 3
                 )  # Minimal SessionConnection deliberately has no epoch.
+                if bad in {"public-input", "public-audio"}:
+                    assert result["audio"] == {
+                        "manifestUrl": "https://gateway.test/v1/sessions/render-alice/audio/project-audio.json",
+                        "manifestSha256": descriptor["audio"]["manifestSha256"],
+                    }
                 if bad == "public-input":
                     assert (
                         result["input"]["baseUrl"]
@@ -522,7 +536,9 @@ def test_member_helper_uses_actual_sdk_read_session_and_checks_private_identity(
                     assert (
                         result["input"]["manifest"] == descriptor["input"]["manifest"]
                     )
-                else:
+                elif bad not in {"public-audio"}:
+                    if bad == "private-audio":
+                        assert result["audio"] == descriptor["audio"]
                     assert result["streams"]["pixels"]["url"].endswith(
                         "/v1/sessions/render-alice/pixels"
                     )

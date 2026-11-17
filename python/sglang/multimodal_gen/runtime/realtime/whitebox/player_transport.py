@@ -294,6 +294,20 @@ def input_asset_path(asset):
     return asset
 
 
+def sdk_resource_path(namespace, asset):
+    if namespace == "player-input":
+        return input_asset_path(asset)
+    from .project_audio import audio_path_allowed
+
+    if (
+        namespace != "audio"
+        or not audio_path_allowed(asset)
+        or re.search(r"[\x00-\x1f\x7f]", asset)
+    ):
+        raise ValueError("The player audio resource is unavailable")
+    return asset
+
+
 def publish_input_session(session, public_origin):
     """Project an existing scoped SDK grant; never publish the CLI admin token."""
     public_origin = origin(public_origin)
@@ -543,24 +557,23 @@ def install_player_runtime(app, token, runtime, *, config=None, client=None):
         except (ValueError, KeyError, httpx.HTTPError):
             raise HTTPException(404, "The player resource is unavailable") from None
 
-    @app.get(
-        "/internal/player-streams/{stream_id}/{session_id}/player-input/{asset:path}"
-    )
-    async def input_resource(
+    async def sdk_resource(
         stream_id: str,
         session_id: str,
         asset: str,
         request: Request,
-        authorization: str = Header(default=""),
+        authorization: str,
+        namespace: str,
     ):
         require_internal_token(token, authorization)
         allowed(request)
         try:
-            asset = input_asset_path(asset)
+            asset = sdk_resource_path(namespace, asset)
             capability = request.headers.get("x-worldkit-viewer-capability", "")
             entry, descriptor = transport.viewer(stream_id, session_id, capability)
             config.require_member_origin(request.headers.get("origin"), entry)
-            if not isinstance(descriptor.get("input"), dict):
+            declaration = descriptor.get("audio" if namespace == "audio" else "input")
+            if not isinstance(declaration, dict):
                 raise ValueError()
             epoch = descriptor["epoch"]
 
@@ -568,7 +581,7 @@ def install_player_runtime(app, token, runtime, *, config=None, client=None):
                 content_type, content = await get_bytes(
                     upstream,
                     descriptor["baseUrl"].rstrip("/")
-                    + f"/v1/sessions/{session_id}/player-input/{asset}",
+                    + f"/v1/sessions/{session_id}/{namespace}/{asset}",
                     maximum=MAX_UI_BYTES,
                     headers={"Authorization": "Bearer " + capability},
                 )
@@ -590,6 +603,32 @@ def install_player_runtime(app, token, runtime, *, config=None, client=None):
                 return await read(upstream)
         except (ValueError, KeyError, httpx.HTTPError):
             raise HTTPException(404, "The player resource is unavailable") from None
+
+    @app.get(
+        "/internal/player-streams/{stream_id}/{session_id}/player-input/{asset:path}"
+    )
+    async def input_resource(
+        stream_id: str,
+        session_id: str,
+        asset: str,
+        request: Request,
+        authorization: str = Header(default=""),
+    ):
+        return await sdk_resource(
+            stream_id, session_id, asset, request, authorization, "player-input"
+        )
+
+    @app.get("/internal/player-streams/{stream_id}/{session_id}/audio/{asset:path}")
+    async def audio_resource(
+        stream_id: str,
+        session_id: str,
+        asset: str,
+        request: Request,
+        authorization: str = Header(default=""),
+    ):
+        return await sdk_resource(
+            stream_id, session_id, asset, request, authorization, "audio"
+        )
 
     @app.websocket("/internal/player-streams/{stream_id}/{session_id}/{channel}")
     async def wire(websocket: WebSocket, stream_id: str, session_id: str, channel: str):
@@ -737,19 +776,20 @@ def install_player_gateway(app, proxy, *, config=None):
     async def input_preflight(session_id: str, asset: str, request: Request):
         return await preflight(session_id, request)
 
-    @app.get("/v1/sessions/{session_id}/player-input/{asset:path}")
-    async def input_resource(session_id: str, asset: str, request: Request):
+    async def sdk_resource(
+        session_id: str, asset: str, request: Request, namespace: str
+    ):
         allowed(request)
         authorization = request.headers.get("authorization", "")
         if not re.fullmatch(r"Bearer [a-f0-9]{48}", authorization):
             raise HTTPException(403, "The player request is unavailable")
         try:
-            asset = input_asset_path(asset)
+            asset = sdk_resource_path(namespace, asset)
             binding, base = await route(session_id)
             content_type, content = await get_bytes(
                 proxy.client,
                 base
-                + f"/internal/player-streams/{binding['stream_id']}/{session_id}/player-input/{asset}",
+                + f"/internal/player-streams/{binding['stream_id']}/{session_id}/{namespace}/{asset}",
                 maximum=MAX_UI_BYTES,
                 headers={
                     "Authorization": "Bearer " + proxy.token,
@@ -772,6 +812,18 @@ def install_player_gateway(app, proxy, *, config=None):
             )
         except (ValueError, KeyError, httpx.HTTPError):
             raise HTTPException(404, "The player resource is unavailable") from None
+
+    @app.get("/v1/sessions/{session_id}/player-input/{asset:path}")
+    async def input_resource(session_id: str, asset: str, request: Request):
+        return await sdk_resource(session_id, asset, request, "player-input")
+
+    @app.options("/v1/sessions/{session_id}/audio/{asset:path}")
+    async def audio_preflight(session_id: str, asset: str, request: Request):
+        return await preflight(session_id, request)
+
+    @app.get("/v1/sessions/{session_id}/audio/{asset:path}")
+    async def audio_resource(session_id: str, asset: str, request: Request):
+        return await sdk_resource(session_id, asset, request, "audio")
 
     @app.get("/v1/sessions/{session_id}/ui/{ui_hash}/{asset:path}")
     async def ui(session_id: str, ui_hash: str, asset: str, request: Request):

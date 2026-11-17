@@ -1025,7 +1025,8 @@ def test_browser_input_observation_uses_original_room_log_and_receipt_identity()
     asyncio.run(run())
 
 
-def test_sealed_input_resources_cross_gateway_room_with_exact_viewer_capability():
+@pytest.mark.parametrize("namespace", ["player-input", "audio"])
+def test_sealed_resources_cross_gateway_room_with_exact_viewer_capability(namespace):
     async def run():
         capability = "a" * 48
         stream = "1" * 32
@@ -1041,6 +1042,10 @@ def test_sealed_input_resources_cross_gateway_room_with_exact_viewer_capability(
             accessToken=capability,
             baseUrl="http://127.0.0.1:65432",
             input={"abiVersion": "player-input/1"},
+            audio={
+                "manifestUrl": "http://127.0.0.1:65432/v1/sessions/sdk-a/audio/project-audio.json",
+                "manifestSha256": "c" * 64,
+            },
         )
         entry["engine"] = SimpleNamespace(descriptor=descriptor)
         config = PlayerTransportConfig(
@@ -1052,8 +1057,8 @@ def test_sealed_input_resources_cross_gateway_room_with_exact_viewer_capability(
             calls.append(request)
             assert request.headers["authorization"] == "Bearer " + capability
             assert "cookie" not in request.headers
-            assert request.url.path.startswith("/v1/sessions/sdk-a/player-input/")
-            if request.url.path.endswith("/retired.js"):
+            assert request.url.path.startswith(f"/v1/sessions/sdk-a/{namespace}/")
+            if request.url.path.endswith(("/retired.js", "/retired.wav")):
                 descriptor["epoch"] += 1
             return httpx.Response(
                 200,
@@ -1096,15 +1101,20 @@ def test_sealed_input_resources_cross_gateway_room_with_exact_viewer_capability(
                         "origin": config.player_origin,
                         "authorization": "Bearer " + capability,
                     }
-                    for asset in [
-                        "manifest.json",
-                        "module.js",
-                        "worker.js",
-                        "hands.wasm",
-                        "model.task",
-                    ]:
+                    assets = (
+                        ["project-audio.json", "assets/audio/sound.wav"]
+                        if namespace == "audio"
+                        else [
+                            "manifest.json",
+                            "module.js",
+                            "worker.js",
+                            "hands.wasm",
+                            "model.task",
+                        ]
+                    )
+                    for asset in assets:
                         response = await browser.get(
-                            "/v1/sessions/sdk-a/player-input/" + asset, headers=headers
+                            f"/v1/sessions/sdk-a/{namespace}/" + asset, headers=headers
                         )
                         assert (
                             response.status_code == 200
@@ -1114,8 +1124,8 @@ def test_sealed_input_resources_cross_gateway_room_with_exact_viewer_capability(
                             response.headers["access-control-allow-origin"]
                             == config.player_origin
                         )
-                    assert len(calls) == 5
-                    path = "/v1/sessions/sdk-a/player-input/module.js"
+                    assert len(calls) == len(assets)
+                    path = f"/v1/sessions/sdk-a/{namespace}/{assets[0]}"
                     assert (
                         await browser.get(
                             path, headers={"origin": config.player_origin}
@@ -1139,7 +1149,7 @@ def test_sealed_input_resources_cross_gateway_room_with_exact_viewer_capability(
                     ).status_code == 404
                     assert (
                         await browser.get(
-                            path.replace("module.js", "%252e%252e/source.ts"),
+                            path.replace(assets[0], "%252e%252e/source.ts"),
                             headers=headers,
                         )
                     ).status_code == 404
@@ -1152,13 +1162,24 @@ def test_sealed_input_resources_cross_gateway_room_with_exact_viewer_capability(
                         },
                     )
                     assert preflight.status_code == 204
+                    declaration_key = "audio" if namespace == "audio" else "input"
+                    declaration = descriptor.pop(declaration_key)
+                    assert (await browser.get(path, headers=headers)).status_code == 404
+                    assert len(calls) == len(assets)
+                    descriptor[declaration_key] = declaration
                     entry["control_admission"]["leaving"] = True
                     assert (await browser.get(path, headers=headers)).status_code == 404
-                    assert len(calls) == 5
+                    assert len(calls) == len(assets)
                     entry["control_admission"]["leaving"] = False
                     assert (
                         await browser.get(
-                            path.replace("module.js", "retired.js"), headers=headers
+                            path.replace(
+                                assets[0],
+                                "assets/audio/retired.wav"
+                                if namespace == "audio"
+                                else "retired.js",
+                            ),
+                            headers=headers,
                         )
                     ).status_code == 404
 
