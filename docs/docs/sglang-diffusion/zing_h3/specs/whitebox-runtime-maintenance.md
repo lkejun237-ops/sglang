@@ -667,3 +667,14 @@ for large legal semantic batches/bindings in both live journal modes, while
 oversized semantic and ordinary events still fail archival. Run it with the lightweight CPU pytest
 entry above. The existing control relay expiry tests verify the unchanged
 transport protection; these local tests do not measure production disk latency.
+
+### Failed multiplayer create after the directory ends the route
+
+When the sealed publication needs more members than the Room host supports,
+the Room reports `ROOM_HOST_CAPACITY_INSUFFICIENT`. The Room attaches its
+cleanup receipt only after the original allocation has been retired.
+
+For an ended create route, Gateway queries the original Room using the
+original caller and operation. WTP checks the operation ID and parameter hash
+and requires complete cleanup before treating the failure as confirmed. The
+ended route continues to fence the original request while the receipt is pending.

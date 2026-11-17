@@ -321,7 +321,7 @@ def test_deployment_capacity_cannot_silently_reduce_sealed_game(
     async def run():
         configure(tmp_path, monkeypatch, driver_module)
         monkeypatch.setenv("WHITEBOX_MAX_PLAYERS", "1")
-        with pytest.raises(ValueError, match="ROOM_HOST_CAPACITY_INSUFFICIENT"):
+        with pytest.raises(ValueError, match="requires more players"):
             await driver_module.worldkit_room(
                 world_id="source/world", spec=VideoSpec(32, 32), trace_id="test"
             )
@@ -396,8 +396,8 @@ def test_controlled_factory_emits_cleanup_receipt_after_original_cli_is_reaped(
         if cancelled:
             assert task.cancelled()
         else:
-            assert caught.value.code == "CLI_STARTUP_FAILED"
-            assert "ROOM_HOST_CAPACITY_INSUFFICIENT" in str(caught.value.__cause__)
+            assert caught.value.code == "ROOM_HOST_CAPACITY_INSUFFICIENT"
+            assert caught.value.__cause__.code == caught.value.code
         assert instances[0].process.returncode is not None
         assert not instances[0].directory.exists()
         assert (tmp_path / "closed").exists()

@@ -26,6 +26,7 @@ from .cli_room import (
     prepare_delivery,
     validate_descriptor,
 )
+from .diagnostics import WhiteboxDiagnostic
 from .room_startup import (
     FactoryCleanupReceipt,
     MemberCleanupReceipt,
@@ -292,7 +293,7 @@ class WorldkitRoom:
         ) != self.create_context["frozenPublication"].get("playConfiguration"):
             raise ValueError("ROOM_FROZEN_PLAY_CONFIGURATION_CHANGED")
         if capacity > len(self.slots):
-            raise ValueError("ROOM_HOST_CAPACITY_INSUFFICIENT")
+            raise WhiteboxDiagnostic("ROOM_HOST_CAPACITY_INSUFFICIENT", "admission")
         self.max_players = capacity
 
     def check_open(self):
@@ -696,7 +697,7 @@ async def worldkit_room(
         # temporary files. A thrown/cancelled close never creates this receipt.
         diagnostic = error
         if (
-            not isinstance(error, asyncio.CancelledError)
+            not isinstance(error, (asyncio.CancelledError, WhiteboxDiagnostic))
             and room.diagnostics
             and not room.diagnostics.cancelled()
         ):

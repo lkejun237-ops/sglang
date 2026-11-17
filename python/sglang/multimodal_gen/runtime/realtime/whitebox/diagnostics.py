@@ -79,6 +79,7 @@ MESSAGES = {
     "STREAM_STARTUP_TIMEOUT": "The world took too long to start. Please try again.",
     "STREAM_STARTUP_ABORTED": "World startup was cancelled or reached its time limit.",
     "STREAM_STARTUP_FAILED": "The world could not start. Please try again.",
+    "ROOM_HOST_CAPACITY_INSUFFICIENT": "This room requires more players than the server supports.",
     "CLI_STARTUP_FAILED": "The world could not start. Please try again.",
 }
 STAGES = {
