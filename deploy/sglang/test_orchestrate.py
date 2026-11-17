@@ -425,7 +425,12 @@ def test_environment_allows_agent_and_zing_but_keeps_source_isolation(
 
 
 @pytest.mark.parametrize(
-    "model_id", ["model1027", "zing-h3-dmd-1103-step2000-generator"]
+    "model_id",
+    [
+        "model1027",
+        "zing-h3-dmd-1103-step2000-generator",
+        "zing-h3-dmd-1115-step1700-generator",
+    ],
 )
 def test_asset_generation_and_tamper(tmp_path, spec, model_id):
     model = tmp_path / model_id

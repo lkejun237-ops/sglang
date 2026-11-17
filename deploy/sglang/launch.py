@@ -24,7 +24,12 @@ from pathlib import Path
 from source import digest, prepare, sha, validate_manifest, write_json
 
 MODEL_ID = "zing-h3-dmd-1102-step2000-generator"
-MODEL_IDS = {MODEL_ID, "model1027", "zing-h3-dmd-1103-step2000-generator"}
+MODEL_IDS = {
+    MODEL_ID,
+    "model1027",
+    "zing-h3-dmd-1103-step2000-generator",
+    "zing-h3-dmd-1115-step1700-generator",
+}
 ROLE_POOL_SECRETS = {"ROLE_POOL_SIGNING_KEY", "ROLE_POOL_REGISTRATION_TOKEN"}
 SECRET_ENV = ROLE_POOL_SECRETS | {
     "WHITEBOX_CACHE_RECORDING_SECRET",

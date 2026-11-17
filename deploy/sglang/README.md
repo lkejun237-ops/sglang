@@ -34,6 +34,8 @@
 
 ## 模型与资产边界
 
+`zing-h3-dmd-1115-step1700-generator` 对应 `h3-dmd-sp4-06-1115-7f9d9f5/checkpoints/global_step_001700/generator/model.pt`，原始文件 SHA-256 为 `47f303f3f01f52e51303bcefbdf05bdb1d4baba3dd41df21728ec9daf04eb85e`。使用离线 AdaLN 表的部署须核对该 generator、实际去噪节奏和目标硬件的验证回执。
+
 上海副本测试可显式指定 `zing-h3-dmd-1103-step2000-generator`，对应 `h3-dmd-sp4-06-1103-from-1kstep/checkpoints/global_step_002000/generator`。三个角色和 site 使用同一模型身份，资产回执应来自该 checkpoint 的 serving 导出；使用 weights-free 模式时，AdaLN 表须与该导出和实际推理 schedule 匹配。
 
 此外仍支持 `model1027` 和 `zing-h3-dmd-1102-step2000-generator`。1102 对应
