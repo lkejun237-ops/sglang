@@ -238,3 +238,6 @@ FROM room-runtime AS room
 COPY --from=room-checks /tmp/whitebox-cli-passed /app/whitebox-cli-passed
 COPY --from=room-checks /tmp/whitebox-immediate-codec-passed /app/whitebox-immediate-codec-passed
 COPY deploy/whitebox/cli-gpu-preflight.mjs /app/cli-gpu-preflight.mjs
+# Check the render-enabled startup import in the final image, where pytest
+# cannot supply undeclared runtime dependencies.
+RUN --network=none python -c 'from sglang.multimodal_gen.runtime.realtime.whitebox.render_host import RenderHost'
