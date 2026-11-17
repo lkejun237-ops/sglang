@@ -1,0 +1,212 @@
+# World-scoped Block0 cache
+
+Implementation status: development branch; native Mooncake/OSS, GPU performance,
+and browser validation are not yet complete. CPU contract evidence does not prove
+native storage behavior, rendering quality, or release readiness.
+
+A host runs one Mooncake 0.3.13 Master and one RAM/SSD Store. Every model Slot is a
+pure client of that host; dynamic GPU KV remains private to the player. L1 is the
+Store's RAM, L2 is native local NVMe offload, and L3 is direct regional OSS. This
+implementation does not mount OSS through FUSE or share RAM across hosts.
+
+## Identity and completion
+
+The existing SDK Prefill payload is unchanged. Room supplies the trusted bare
+`world_id` and enables `cache_write`; Gateway obtains the same identity from
+its signed world envelope. The logical key includes world, effective prompt,
+ordered reference contents, model/layout and geometry. S0 pixels are omitted only
+for world-scoped requests; the cached preparation still contains the original
+S0-derived conditioning. Reuse therefore requires visual acceptance, especially
+when online S0 differs. Non-world requests retain the exact S0 key.
+
+An internal artifact UUID identifies one complete set of SP shards. It is not a
+client parameter. All ranks must consume that same artifact. A failed fill cannot
+supply some layers to a different fill with the same logical key. `.complete`
+semantics are implemented by the empty OSS object named `complete`, written after
+the artifact payloads and manifest. Reads still check identity, geometry, lengths,
+and actual transfer success; no full tensor hash pre-pass is performed.
+
+An L3 restore fetches up to four payload objects concurrently and imports them
+in manifest order. Outstanding downloads and data awaiting import share a
+per-restore payload budget of twice `tiers.max_object_bytes`. The
+`l3_download` span sums individual GET durations, which can overlap.
+
+Online Prefill returns `prefill.memory_ready` when L1 is complete and cleanup is
+confirmed; it does not wait for L2/L3 or repair missing durable copies on a hit.
+Normal generation uses bounded private snapshots for optional background writes;
+a full queue or exhausted snapshot budget skips that write, not gameplay.
+`tiers.snapshot_bytes=0` disables optional snapshots, so operators must supply a
+measured nonzero budget before validating ordinary generation writeback.
+
+The OSS availability probe uses one wall-clock budget across the world fence,
+current pointer, completion marker, and manifest. `tiers.oss_probe_timeout_s`
+defaults to 1 second. On timeout, Prefill may recompute and reports
+`l3_probe_timeout`; a delayed metadata reply cannot start a restore. A confirmed
+hit uses the existing transfer deadline for payload reads and GPU preparation
+follows the usual serving path. The budget does not cap source hold or Prefill duration.
+
+Explicit `persist=true` selects offline durability: L3 if enabled, otherwise L2.
+The existing compute lease is released at memory-ready, then the CPU observer
+waits for the target. Missing/disabled targets, queue rejection, and failed writes
+cannot be reported as durable success. A durable request may fill a missing target
+copy even when L1 already hits.
+
+For the sparse compatibility candidate, Mooncake also carries the complete
+`fp8-residual-v1` Block0 representation when the resolved worker enables
+three-tier attention. Ordinary workers retain `bf16-raw-v1`. The two formats have
+separate compatibility identities and manifests; neither is inferred from a GPU
+name, and one request does not write both. See the
+[dual-format adaptation contract](sparse-block0-mooncake.md). Native GPU and
+storage performance for this codec remain unvalidated.
+
+All L3 writers deduplicate by region/prefix, world deletion epoch, model
+namespace, and logical cache key. A recomputation can have a different artifact
+UUID and still reuse the published archive. Before exporting KV the writer
+checks the current manifest, completion marker, expiry and payload sizes. A
+reused receipt contains the stored artifact ID, `deduplicated=true` and zero
+uploaded bytes. Reuse preserves the original expiry. A missing payload or an
+expired archive can be replaced.
+
+Concurrent workers coordinate with unique upload intents and a prefix-scoped
+ListObjectsV2 under `uploads/`. Only the sole registered writer may start the
+payload transfer. Readers keep using the existing archive format. Failed or
+cancelled publishers retire their own intent. A surviving intent after a crash
+blocks new uploads for that key until its owner is verified stopped and the
+exact intent is retired. Upgrade every writer sharing the prefix to coordinate
+simultaneous cold publications.
+
+## Configuration and startup
+
+Examples live in `deploy/whitebox/cache/*.example.json`; they are not applied to
+production automatically. Review RAM, GPU snapshot, disk budgets and actual local
+filesystem before using an example. Every client and the host Store must use the
+same frozen policy. Block0 transfers require RDMA. Omit `protocol` or set it to
+`rdma`, unset `MC_FORCE_TCP`, and expose an active verbs device to both processes.
+Use `rdma_devices` to select host-specific HCAs. Confirm the chosen HCAs in the Store
+and worker logs, then verify a GPU KV restore. L1/L2/L3 and write edges are separate switches. Native L2 is
+owned only by the host Store; never start an SSD owner for every Slot against the
+same directory. Startup must verify the pinned native flags and replica behavior.
+
+```sh
+PYTHONPATH=python python deploy/whitebox/cache_store.py --config /etc/sglang/cache.json
+# Model / DiT launch arguments:
+# --zing-block0-cache-backend mooncake --zing-block0-mooncake-config /etc/sglang/cache.json
+```
+
+World-only S0 reuse and these three tiers require the Mooncake backend. The
+legacy local backend continues to accept existing games but retains S0 equality
+in its key; it does not claim world-only offline/online reuse. Select Mooncake
+explicitly in the matching test deployment; no container source overlays.
+
+L2 uses native bucket LRU, logical/physical byte caps, bounded offload buffers and
+filesystem watermarks. A PAI container's local overlay may be selected explicitly
+with `allow_overlay_l2=true` after checking its real capacity; OSS/FUSE/NFS remain
+rejected. Store readiness records the actual filesystem. Overlay storage survives
+worker-process restarts but is not promised to survive pod replacement, and is
+not labelled NVMe without evidence of its backing device. L3 read TTL is seven days; a cache-prefix-only OSS Lifecycle
+rule on the dedicated `data/` child prefix must also expire physical objects,
+noncurrent versions and incomplete multipart uploads. `control/` fences and
+`uploads/` ownership intents are separate; do not expire them merely because a
+remote writer has been silent. A crashed writer remains explicitly unconfirmed
+until its actual owner is verified stopped and its exact intent is retired. Installing that rule is a deployment operation, not something
+performed by model startup. Do not alter the video recording prefix's retention.
+
+| Environment | Bucket | Dedicated cache prefix |
+| --- | --- | --- |
+| test-shanghai-copy | leap-world-shanghai | sglang-block0-cache/v2/test-shanghai-copy/ |
+| prod-shanghai | leap-world-shanghai | sglang-block0-cache/v2/prod-shanghai/ |
+| prod-thailand | loopit-rd-th-shared-1728199219479827 | sglang-block0-cache/v2/prod-thailand/ |
+
+The maintained all-role launcher accepts `model.cache_backend="mooncake"` with
+an absolute `bindings.cache_config`. Start the host Store once before model slots;
+the launcher does not start a separate Store for each Slot. Existing regional
+policies retain their local backend until this explicit configuration is selected.
+
+Use the regional internal OSS endpoint and the normal workload credential chain;
+never place credentials in a committed JSON file. PAI jobs may use their assigned
+RAM role: the cache reads and refreshes `/mnt/.alibabacloud/credentials`; it does
+not freeze a submission-time STS token. Explicit AWS-compatible environment
+credentials retain precedence. Verify the role can access the selected regional
+bucket before running the GPU matrix. Online hits do not extend TTL.
+
+## Offline batch
+
+The Prefill Gateway adds `POST /v1/realtime_video/prefill/batch`, content type
+`application/msgpack`, with `{items: [{world, authorization, payload}]}`. `payload`
+is bytes containing the existing native Prefill message with `persist=true`.
+Each item has its own existing signed submit capability (world/user/request ID,
+payload digest and length). The server verifies the whole envelope before running
+items, at most eight items and 64 MiB total; one local batch runs at a time.
+
+The HTTP response waits for final per-item results and reports `succeeded`,
+`partial`, or `failed`, plus `durable_count`. Item execution uses existing shared
+request claims and model leases. Resubmitting the same signed payload/request ID
+observes the existing result rather than duplicating compute. Disconnecting the
+observer does not authorize another attempt; per-item status remains available
+through the existing capability-protected status API. The capability issuer and
+current SDK may be used without adding a business cache-version parameter.
+
+## Delete a world from L3
+
+The native model/Encoder HTTP service exposes:
+
+- `POST /v1/zing/cache/delete-world` with JSON `{world_id: "world-..."}`.
+- `GET /v1/zing/cache/operations/{operation_id}` for the deletion result.
+
+Both require `Authorization: Bearer ...` matching the configured
+`SGLANG_CACHE_ADMIN_TOKEN` (at least 32 bytes). The operator-facing endpoint should
+remain on the managed private network. Bucket/region/prefix come only from the
+server's Mooncake configuration. An accepted response is HTTP 202, not completion.
+The operation never acquires a GPU Slot or evicts live L1/L2.
+
+For an independent Encoder, pass its server-owned
+`--zing-block0-mooncake-config` as well as the DiT configuration. Normal writers
+need object read/write/delete and list permissions; retiring a completed upload
+intent uses exact-object deletion. World administration additionally requires
+`oss:ListObjectVersions`, `oss:DeleteObjectVersion`, and
+`oss:ListMultipartUploads` for its configured cache prefix. A workload role with
+only ordinary object permissions must not report administrative cleanup as
+successful. Versioned buckets retain old intent versions until explicit world
+cleanup; use an unversioned cache bucket or bound those versions
+separately when enabling bucket versioning.
+
+The world fence covers all model namespaces in this environment. Cache payloads
+are under `data/<world-hash>/`, and tiny fences/intents under `control/` and
+`uploads/`; the separate roots keep data TTL from reviving an old upload epoch. Old uploads
+cannot become visible in the new epoch. `pending` means a writer has not been
+confirmed drained; retry deletion after checking it, rather than interpreting
+logical invisibility as reclaimed storage. Jobs are bounded and kept in memory
+for one hour; a process restart loses the observer record, so a missing record is
+unknown, not proof of completion. A later new generation or durable batch may
+create fresh cache data. Explicit deletion is not a permanent ban on the world.
+
+## Receipts and recordings
+
+`model.cache` preserves actual `l1_hit`, `l2_hit`, or `l3_hit`, artifact identity
+and bounded Host/CUDA stage measurements. Source and segment recordings append
+`cache-events.jsonl`; its envelope carries the existing source/segment/session
+identities and prompt version. Join it to `model-inputs/events.jsonl`,
+`output-contexts` and frame/input metadata; a cache receipt alone does not prove a
+frame has already appeared in the browser. Early Prefill admission rejection is
+also recorded. Optional metadata overflow increments `manifest.cache_events.dropped`
+and does not fail playback or the video archive. Missing receipts remain explicit.
+
+With `WHITEBOX_CACHE_RECORDING_ENABLED=1` on Room and the same platform-managed
+`WHITEBOX_CACHE_RECORDING_SECRET` (at least 32 bytes) on Room and model workers,
+Room signs its existing
+source-video prefix. Model workers append bounded JSON receipts under that
+recording's `cache-operations/`, including writes that finish after the player
+releases its Slot. No client-provided bucket or endpoint is used. These optional
+append-only receipts are an asynchronous extension, explicitly listed in the
+manifest separately from the finalized video objects and their digests; missing
+receipts remain unknown. Recording errors do not block inference and are counted
+and logged on the model worker. The existing video retention applies to them.
+The existing `WHITEBOX_INTERNAL_TOKEN` is a fallback for deployments already
+sharing it; a dedicated recording secret avoids changing service authorization.
+
+Read spans distinguish native index lookup, L2 replica promotion, OSS metadata,
+OSS download and native import. Write spans distinguish native export, OSS upload
+and marker publication; `l2_replica_wait` measures native readiness observation,
+not an invented disk-device IO duration. Parallel Host spans must not be added as
+end-to-end latency. Actual CUDA restore timing remains separate. GPU, full-size
+KV and server-chain validation are still required.

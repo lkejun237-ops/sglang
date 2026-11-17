@@ -14,6 +14,9 @@ def main():
     p.add_argument("snapshot", type=Path)
     p.add_argument("images", type=Path)
     p.add_argument("output", type=Path)
+    p.add_argument("--room-only", action="store_true")
+    p.add_argument("--name-suffix", default="")
+    p.add_argument("--room-selection", type=Path)
     a = p.parse_args()
     prefix = "/var/lib/whitebox-shanghai-copy/managed-parallel-startup-20261113/"
     if not all(
@@ -28,6 +31,8 @@ def main():
     specs = []
     current = {}
     for role, component, port in [("room", "room", 8092), ("gateway", "cpu", 18080)]:
+        if a.room_only and role != "room":
+            continue
         before = json.loads((a.snapshot / (role + "-inspect.private.json")).read_text())
         old = engine.inspect(before["Id"])
         if not old["State"]["Running"] or old["Name"] != before["Name"]:
@@ -51,7 +56,8 @@ def main():
                 "candidate_name": "whitebox-sh-copy-"
                 + role
                 + "-managed-"
-                + image["source"][:12],
+                + image["source"][:12]
+                + a.name_suffix,
                 "image": image["image"],
                 "source": image["source"],
                 "sdk": image["sdk"],
@@ -68,6 +74,12 @@ def main():
                 "version_url": "http://127.0.0.1:" + str(port) + "/v1/whitebox/version",
             }
         )
+        if role == "room" and a.room_selection:
+            selection = json.loads(a.room_selection.read_text())
+            specs[-1]["service_selection"] = {
+                key: {"expected": env.get(key), "value": json.dumps(value)}
+                for key, value in selection.items()
+            }
     room, env = current["room"]
     cfg = json.loads(engine.file(room["Id"], env["WHITEBOX_ROLE_POOL_CONFIG"]))
     endpoints = []
@@ -110,7 +122,7 @@ def main():
             paths += [base + path, "/whitebox" + base + path]
     value = {
         "docker_socket": "/run/worldkit-audio-docker/docker.sock",
-        "authorized_roles": ["room", "gateway"],
+        "authorized_roles": [item["role"] for item in specs],
         "containers": specs,
         "idle": {
             "room_status": {

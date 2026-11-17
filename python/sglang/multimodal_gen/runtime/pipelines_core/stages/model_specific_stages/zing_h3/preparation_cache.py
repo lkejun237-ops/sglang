@@ -45,6 +45,7 @@ def preparation_request(codecs, request):
             "session_id",
             "force",
             "cache_write",
+            "cache_recording",
         }
     }
     if "messages" in request:
@@ -80,19 +81,44 @@ def preparation_request(codecs, request):
     return content(request)
 
 
-def preparation_key(codecs, request, preview, config, identity):
-    """One content key shared by startup and prompt switches within this stage."""
-    identity = dict(
-        request=preparation_request(codecs, request),
-        source={name: config[name] for name in ("width", "height")},
-        **identity,
-        s0=None
+def preview_sha256(preview):
+    return (
+        None
         if preview is None
         else hashlib.sha256(
             preview["frames"].contiguous().numpy().tobytes()
-        ).hexdigest(),
+        ).hexdigest()
     )
-    if preview is not None:
+
+
+def preparation_key(codecs, request, preview, config, identity):
+    """One content key shared by startup and prompt switches within this stage."""
+    frozen = preparation_request(codecs, request)
+    world_id = frozen.pop("world_id", None)
+    if world_id is not None and (
+        not isinstance(world_id, str)
+        or not world_id.strip()
+        or len(world_id.encode("utf-8")) > 256
+        or any(ord(c) < 32 for c in world_id)
+    ):
+        raise ValueError("Invalid cache world identity")
+    world_scoped = identity.get("world_scoped_key", True)
+    identity = dict(
+        request=frozen,
+        source={name: config[name] for name in ("width", "height")},
+        **{k: v for k, v in identity.items() if k != "world_scoped_key"},
+    )
+    if world_id is not None:
+        # World-scoped reuse intentionally retains the preparation produced by
+        # the cached S0. The actual S0 remains input/recording evidence, not a
+        # pixel-equality gate. Model/layout and all other conditions still match.
+        identity.update(
+            scope="world-block0-v1" if world_scoped else "world-pixel-block0-v1",
+            world_id=world_id,
+        )
+    if world_id is None or not world_scoped:
+        identity["s0"] = preview_sha256(preview)
+    if preview is not None and (world_id is None or not world_scoped):
         frames = preview["frames"]
         if tuple(frames.shape) != (3, 1, config["height"], config["width"]):
             # white_box S0 v2 accepts native-sized conditioning previews. Equal
@@ -117,14 +143,15 @@ def inputs_on(inputs, device, *, snapshot=False):
             for name, value in values.items()
         }
 
-    # condition_media stays on CPU for later prompt/reference updates.
+    # The Encoder/DiT bridge receives media tensors on the DiT device.
+    # Disk and Store conditioning payloads require ordinary CPU tensors.
     media = inputs.condition_media
-    if snapshot and media is not None:
+    if media is not None and (snapshot or torch.device(device).type == "cpu"):
         media = [
             {
-                name: value.detach().to("cpu", copy=True)
+                name: value.detach().to("cpu", copy=snapshot)
                 if isinstance(value, torch.Tensor)
-                else deepcopy(value)
+                else (deepcopy(value) if snapshot else value)
                 for name, value in item.items()
             }
             for item in media
@@ -155,6 +182,7 @@ class PreparationEntry:
     fill_started: float | None = None
     disk_task: threading.Event | None = None
     auxiliary_bytes: int = 0
+    baseline_s0_sha256: str | None = None
 
     @property
     def page_ids(self):
@@ -173,10 +201,15 @@ class PrefixRestore:
     started: float
     ready_at_consumer: bool | None = None
     lead_ms: float | None = None
+    compressed_ready: object = None
+    compressed_payload: tuple | None = None
 
     def wait(self):
-        if self.end is not None:
-            self.end.synchronize()
+        completion = (
+            self.compressed_ready if self.compressed_ready is not None else self.end
+        )
+        if completion is not None:
+            completion.synchronize()
 
     @property
     def cuda_ms(self):
@@ -192,6 +225,27 @@ class PrefixRestore:
         # initialization); subsequent forwards retain the usual mutation guard.
         if self.entry.model_signature is not None:
             cache.bind_model(self.entry.model_signature)
+        if self.compressed_payload is not None:
+            from sglang.multimodal_gen.runtime.models.dits import zing_h3_prefix_codec
+
+            zing_h3_prefix_codec.restore(
+                cache,
+                self.positions,
+                self.blocks,
+                self.compressed_payload,
+                self.entry.positions,
+            )
+            if self.positions.is_cuda:
+                self.compressed_ready = torch.cuda.Event()
+                self.compressed_ready.record(
+                    torch.cuda.current_stream(self.positions.device)
+                )
+                for value in self.compressed_payload:
+                    value.record_stream(
+                        torch.cuda.current_stream(self.positions.device)
+                    )
+            self.compressed_payload = None
+            return
         cache.update(
             self.positions,
             self.blocks,
@@ -203,6 +257,13 @@ class PrefixRestore:
                 torch.zeros_like(self.entry.positions[:, 0], dtype=torch.long),
             ),
         )
+        if getattr(cache, "_compressed_kv_enabled", False) and self.positions.is_cuda:
+            # Native transfer completion precedes rebuilding the device's
+            # private FP8 store. Keep that readiness boundary explicit.
+            self.compressed_ready = torch.cuda.Event()
+            self.compressed_ready.record(
+                torch.cuda.current_stream(self.positions.device)
+            )
 
 
 def _prompt_preview(request):
@@ -246,6 +307,14 @@ class Block0PreparationCache:
                 raise ValueError("Unknown Block0 cache backend")
             return object.__new__(impl)
         return object.__new__(cls)
+
+    def bind_world(
+        self, key, world_id, *, s0_sha256=None, observer_token=None, context=None
+    ):
+        # Legacy local storage retains S0 in key_identity. Supplying trusted
+        # world metadata must not break an existing game during configuration
+        # rollout, and must never weaken that backend's byte-equality contract.
+        return None
 
     def lookup(self, key, *, allow_disk=False, protected=()):
         raise NotImplementedError
@@ -375,6 +444,10 @@ class LocalPagedBackend(Block0PreparationCache):
     Only explicit preload/prefill may promote from Tier-2 disk. Every
     published L1 entry is written back to disk on a daemon thread.
     """
+
+    @property
+    def key_identity(self):
+        return {**self.identity, "world_scoped_key": False}
 
     def __init__(
         self,
@@ -845,6 +918,9 @@ class LocalPagedBackend(Block0PreparationCache):
             started,
         )
         entry.auxiliary_bytes = auxiliary
+        # Compressed generation exports owned raw snapshots. Keep them alive
+        # through the asynchronous D2H copy, then release all raw GPU history.
+        entry.source_layers = prefix.layers
         # Own the pages even if event construction or a later copy submission
         # fails. A failed drain must never return still-active pages to the pool.
         self.pending = (entry, None)
@@ -854,11 +930,15 @@ class LocalPagedBackend(Block0PreparationCache):
             with torch.cuda.stream(self.stream):
                 for layer, part, start, value in data.slices():
                     value.copy_(
-                        prefix.layers[layer][part][start : start + value.shape[0]],
+                        entry.source_layers[layer][part][
+                            start : start + value.shape[0]
+                        ],
                         non_blocking=True,
                     )
                 done.record()
             self.pending = (entry, done)
+            if getattr(prefix, "export_owned", False):
+                cache.release_prefix_export()
         except BaseException:
             self.finish_fill()
             raise
@@ -882,6 +962,7 @@ class LocalPagedBackend(Block0PreparationCache):
                 self.pending = None
                 return
             done.synchronize()
+            entry.source_layers = ()
             self.entries[entry.key] = entry
             self.pending = None
             cache_event(
@@ -1245,7 +1326,12 @@ def fill_prepared_prefix(
             storage = lease.kv_cache
         state = None
         try:
-            state = sampler.initialize(inputs, visual, storage=storage)
+            state = sampler.initialize(
+                inputs,
+                visual,
+                storage=storage,
+                retain_prefix_layers=getattr(cache, "requires_raw_prefix", True),
+            )
             cache.fill(
                 key,
                 inputs,

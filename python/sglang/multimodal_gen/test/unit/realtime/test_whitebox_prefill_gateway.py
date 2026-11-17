@@ -171,7 +171,9 @@ def test_prefill_releases_gpu_before_disk_and_reconnect_does_not_submit_twice(
             vae_fingerprint="local",
             store=store,
         )
-        raw = msgspec.msgpack.encode({"type": "prefill", "request_id": "case-one"})
+        raw = msgspec.msgpack.encode(
+            {"type": "prefill", "request_id": "case-one", "persist": True}
+        )
         digest = hashlib.sha256(raw).hexdigest()
         token = ticket("case-one", digest, len(raw))
         socket = Socket(token, raw)
@@ -318,3 +320,228 @@ def test_actual_lease_releases_once_while_disk_socket_stays_open():
         assert upstream.closed and reservations.releases == count
 
     asyncio.run(exercise())
+
+
+def test_online_returns_memory_but_batch_waits_durability_and_reuses_identity(
+    monkeypatch,
+):
+    async def exercise():
+        disk, released = asyncio.Event(), asyncio.Event()
+        sent, opened = [], []
+
+        class Upstream:
+            def __init__(self):
+                self.reads = 0
+
+            async def send(self, value):
+                self.native = msgspec.msgpack.decode(value)
+                sent.append(self.native)
+
+            async def recv(self):
+                self.reads += 1
+                if self.reads == 1:
+                    return msgspec.msgpack.encode(
+                        dict(type="prefill.ready", capabilities={"persistence": True})
+                    )
+                value = dict(request_id=self.native["request_id"], session_id="bound")
+                if self.reads == 2:
+                    return msgspec.msgpack.encode(
+                        dict(value, type="prefill.memory_ready")
+                    )
+                assert self.native["persist"]
+                await disk.wait()
+                assert released.is_set()
+                return msgspec.msgpack.encode(dict(value, type="prefill.persisted"))
+
+        class Lease:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            @asynccontextmanager
+            async def open(self):
+                opened.append(True)
+                yield Upstream(), NS(session_id="bound")
+
+            async def release_compute(self):
+                released.set()
+
+        monkeypatch.setattr(gateway, "create_model_leases", Lease)
+        manager = gateway.PrefillGateway(
+            coordinator=None,
+            connect=None,
+            secret=SECRET,
+            model_revision="m",
+            vae_fingerprint="v",
+            store=gateway.MemoryPrefillStore(),
+        )
+        raw = msgspec.msgpack.encode(dict(type="prefill", request_id="case-one"))
+        socket = Socket(
+            ticket("case-one", hashlib.sha256(raw).hexdigest(), len(raw)), raw
+        )
+        await asyncio.wait_for(manager.serve(socket), 2)
+        result = await manager.store.get(gateway.request_key("u", WORLD, "case-one"))
+        assert result["state"] == "memory_ready" and not disk.is_set()
+        assert sent[0]["persist"] is False
+        assert sent[0]["world_id"] == "world-one" and sent[0]["cache_write"] is True
+        raw = msgspec.msgpack.encode(
+            dict(type="prefill", request_id="batch-one", persist=True)
+        )
+        envelope = msgspec.msgpack.encode(
+            dict(
+                items=[
+                    dict(
+                        world=WORLD,
+                        payload=raw,
+                        authorization=ticket(
+                            "batch-one", hashlib.sha256(raw).hexdigest(), len(raw)
+                        ),
+                    )
+                ]
+            )
+        )
+
+        async def stream():
+            yield envelope
+
+        request = NS(headers={"content-type": "application/msgpack"}, stream=stream)
+        released.clear()
+        running = asyncio.create_task(manager.batch(request))
+        await asyncio.wait_for(released.wait(), 2)
+        assert not running.done(), "Batch cannot return success at memory_ready"
+        disk.set()
+        batch = await asyncio.wait_for(running, 2)
+        assert batch["state"] == "succeeded" and batch["durable_count"] == 1
+        assert len(opened) == 2
+        assert (await manager.batch(request))["state"] == "succeeded"
+        assert len(opened) == 2, "Same request must not compute twice"
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_world_deletion_requires_admin_and_does_not_reserve_compute(monkeypatch):
+    import threading
+
+    import pytest
+    from fastapi import HTTPException
+
+    from sglang.multimodal_gen.runtime.realtime.cache_admin import (
+        WorldCacheDeletion,
+        authorize,
+    )
+
+    token = "test-admin-" + "a" * 32
+    monkeypatch.setenv("SGLANG_CACHE_ADMIN_TOKEN", token)
+    with pytest.raises(HTTPException) as denied:
+        authorize(NS(headers={}))
+    assert denied.value.status_code == 403
+    authorize(NS(headers={"authorization": "Bearer " + token}))
+    gate = threading.Event()
+    seen = []
+
+    class Archive:
+        def __init__(self, policy, namespace):
+            assert namespace == "management"
+
+        def delete_world(self, world):
+            seen.append(world)
+            assert gate.wait(2)
+            return dict(state="completed", deleted=3)
+
+        def close(self):
+            pass
+
+    async def exercise():
+        owner = WorldCacheDeletion(None, archive_factory=Archive)
+        row = owner.submit("test/world")
+        assert row["state"] == "pending"
+        assert owner.submit("test/world")["operation_id"] == row["operation_id"]
+        gate.set()
+        await asyncio.gather(*owner.tasks.values())
+        assert owner.jobs[row["operation_id"]]["state"] == "completed"
+        assert seen == ["test/world"] and not owner.tasks
+
+    asyncio.run(exercise())
+
+
+def test_world_deletion_admin_auth_survives_managed_role_transport(monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from sglang.multimodal_gen.runtime.realtime.cache_admin import router
+    from sglang.multimodal_gen.runtime.realtime.role_pool.native_http import (
+        install_managed_transport,
+    )
+
+    token = "cache-admin-test-" + "a" * 32
+    monkeypatch.setenv("SGLANG_CACHE_ADMIN_TOKEN", token)
+    calls = []
+    operation_id = "a" * 32
+    record = {"operation_id": operation_id, "state": "pending"}
+
+    def submit(world):
+        calls.append(world)
+        return record
+
+    def forbidden_business(*_):
+        raise AssertionError("Cache administration must not request a player Slot")
+
+    app = FastAPI()
+    app.include_router(router, prefix="/v1/zing/cache")
+    app.state.world_cache_deletion = NS(
+        submit=submit, prune=lambda: None, jobs={operation_id: record}
+    )
+    install_managed_transport(app, NS(managed=NS(business=forbidden_business)))
+    with TestClient(app) as client:
+        path = "/v1/zing/cache/delete-world"
+        assert client.post(path, json={"world_id": "owned"}).status_code == 403
+        headers = {"Authorization": "Bearer " + token}
+        assert (
+            client.post(path, headers=headers, json={"world_id": "owned"}).status_code
+            == 202
+        )
+        status = "/v1/zing/cache/operations/" + operation_id
+        assert client.get(status).status_code == 403
+        assert client.get(status, headers=headers).json() == record
+        # Legacy native cache mutation still needs its managed business claim.
+        assert client.post("/v1/zing/cache/clear", headers=headers).status_code == 403
+    assert calls == ["owned"]
+
+
+def test_batch_retries_known_rate_rejection_but_not_unknown_claim(monkeypatch):
+    import pytest
+
+    class Store:
+        def __init__(self, error):
+            self.error, self.calls = error, 0
+
+        async def claim(self, key, record):
+            self.calls += 1
+            if self.calls == 1:
+                raise self.error
+            return True, record
+
+    async def sleep(_):
+        pass
+
+    monkeypatch.setattr(gateway.asyncio, "sleep", sleep)
+
+    async def run():
+        known = Store(gateway.PrefillRateLimited("busy"))
+        manager = gateway.PrefillGateway(
+            coordinator=None,
+            connect=None,
+            secret=SECRET,
+            model_revision="m",
+            vae_fingerprint="v",
+            store=known,
+        )
+        assert (await manager._claim_batch_item("k", {}))[0]
+        assert known.calls == 2
+        unknown = Store(ConnectionError("write result unknown"))
+        manager.store = unknown
+        with pytest.raises(ConnectionError):
+            await manager._claim_batch_item("k", {})
+        assert unknown.calls == 1
+
+    asyncio.run(run())

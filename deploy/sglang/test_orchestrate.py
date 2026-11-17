@@ -424,16 +424,20 @@ def test_environment_allows_agent_and_zing_but_keeps_source_isolation(
         launch.validate_config(c)
 
 
-def test_model1027_asset_generation_and_tamper(tmp_path, spec):
-    model = tmp_path / "model1027"
+@pytest.mark.parametrize(
+    "model_id", ["model1027", "zing-h3-dmd-1103-step2000-generator"]
+)
+def test_asset_generation_and_tamper(tmp_path, spec, model_id):
+    model = tmp_path / model_id
     model.mkdir()
     (model / "zing_config.json").write_text("{}")
     weights = model / "weights.safetensors"
     weights.write_bytes(b"weights")
-    c = {**spec["roles"]["encoder"], "model": str(model)}
+    c = {**spec["roles"]["encoder"], "model": str(model), "model_id": model_id}
+    launch.validate_config(c)
     result = launch.generate_assets(c, [], tmp_path / "assets.json")
     c.update(result)
-    assert launch.verify_assets(c)["model_id"] == "model1027"
+    assert launch.verify_assets(c)["model_id"] == model_id
     weights.write_bytes(b"changed")
     with pytest.raises(ValueError, match="digest mismatch"):
         launch.verify_assets(c)
@@ -1729,6 +1733,14 @@ def test_truncated_receipt_still_rejects_invalid_prefix_schema_or_role(candidate
         orch.last_receipt(candidate, "dit")
 
 
+def test_receipt_recovers_complete_gpu_after_runtime_but_not_partial_gpu():
+    prefix = '{"schema":1,"role":"dit","archive_sha256":"a","runtime":{}}'
+    truncated = prefix[:-1] + ',"gpu":"GPU-observed, NVIDIA L20X","pod":"cut'
+    assert orch.last_receipt(truncated, "dit")["gpu"] == "GPU-observed, NVIDIA L20X"
+    partial = prefix[:-1] + ',"gpu":"GPU-unfinished'
+    assert "gpu" not in orch.last_receipt(partial, "dit")
+
+
 @pytest.mark.parametrize(
     "plan_ids,hash_kind,accepted",
     [
@@ -1783,6 +1795,72 @@ def test_wait_ready_accepts_only_original_or_allocated_gpu_config_hash(
     assert path.read_bytes() == before
 
 
+@pytest.mark.parametrize("status", ["ready", "stopped-unretired"])
+def test_down_requires_operator_before_any_partial_stop(
+    state, tmp_path, monkeypatch, status
+):
+    monkeypatch.delenv("ROLE_POOL_OPERATOR_TOKEN", raising=False)
+    state["resources"]["dit"]["status"] = status
+    state["attachment"] = {
+        "identities": {"dit": {"process_id": "dit", "boot_epoch": "boot"}}
+    }
+    before = copy.deepcopy(state)
+    cloud = Mock()
+    with pytest.raises(ValueError, match="operator credentials"):
+        orch.down(state, tmp_path, cloud)
+    assert not cloud.mock_calls
+    assert state == before
+
+
+def test_down_rejects_unreconciled_partial_attachment(state, tmp_path):
+    state["attachment"] = {"endpoint_intents": {"dit": {"endpoint": {"pending": True}}}}
+    cloud = Mock()
+    with pytest.raises(ValueError, match="partial pool attachment"):
+        orch.down(state, tmp_path, cloud)
+    assert not cloud.mock_calls
+
+
+def test_down_does_not_accept_a_legacy_incomplete_retirement(state, tmp_path):
+    state["resources"]["dit"]["status"] = "deleted"
+    state["attachment"] = {
+        "identities": {"dit": {"process_id": "dit", "boot_epoch": "boot"}}
+    }
+    cloud = Mock()
+    with pytest.raises(ValueError, match="no pool retirement receipt"):
+        orch.down(state, tmp_path, cloud)
+    assert not cloud.mock_calls
+
+
+def _idle_status(state, body, *, safe=True):
+    return {
+        "process": {
+            "manifest": {
+                **body,
+                "pool_id": state["target"]["pool_id"],
+                "control_epoch": state["spec"]["pool"]["control_epoch"],
+            },
+            "used": {"slots": 0},
+            "observations": {},
+        },
+        "safe_to_stop": safe,
+    }
+
+
+def _mock_authorized_dit_release(run_state, monkeypatch):
+    original_http = orch.http
+
+    def release_http(url, payload=None, token=None, cloud=None):
+        if url.endswith("/process-status"):
+            return _idle_status(run_state, payload)
+        if url.rsplit("/", 1)[-1] in ("drain", "confirm-stopped", "retire-process"):
+            assert payload["process_id"] == "dit-owned"
+            return {"ok": True}
+        return original_http(url, payload, token, cloud=cloud)
+
+    monkeypatch.setenv("ROLE_POOL_OPERATOR_TOKEN", "o" * 32)
+    monkeypatch.setattr(orch, "http", release_http)
+
+
 def test_down_retires_attached_pool_processes_after_stop(state, tmp_path, monkeypatch):
     monkeypatch.setenv("ROLE_POOL_OPERATOR_TOKEN", "o" * 64)
     state["attachment"] = {
@@ -1800,7 +1878,9 @@ def test_down_retires_attached_pool_processes_after_stop(state, tmp_path, monkey
         orch,
         "http",
         lambda url, body=None, token=None, cloud=None: (
-            calls.append((url, body, token)) or {"ok": True}
+            _idle_status(state, body)
+            if url.endswith("/process-status")
+            else calls.append((url, body, token)) or {"ok": True}
         ),
     )
     cloud = Mock(timeout=1)
@@ -2066,6 +2146,10 @@ def test_reusing_existing_encoder_decoder_services_and_multi_service(
         **run_state["resources"]["dit"]["expected_job"],
     }
     monkeypatch.delenv("ROLE_POOL_OPERATOR_TOKEN", raising=False)
+    with pytest.raises(ValueError, match="operator credentials"):
+        orch.down(run_state, tmp_path, cloud)
+    cloud.cli.assert_not_called()
+    _mock_authorized_dit_release(run_state, monkeypatch)
     orch.down(run_state, tmp_path, cloud)
     cloud.cli.assert_called_once_with("pai-dlc", "StopJob", JobId="dlc-dit-only")
     cloud.eflo.assert_not_called()
@@ -2195,6 +2279,8 @@ def test_down_retries_coordinator_confirm_and_retire_after_pod_deleted(
     fail_stage = {"mode": "confirm"}
 
     def coordinator_http(url, payload=None, token=None, cloud=None):
+        if url.endswith("/process-status"):
+            return _idle_status(state, payload)
         calls.append((url, payload["process_id"]))
         if (
             fail_stage["mode"] == "confirm"
@@ -2915,6 +3001,10 @@ def test_managed_reused_services_coordinator_selftest_and_lease_release(
         **run_state["resources"]["dit"]["expected_job"],
     }
     monkeypatch.delenv("ROLE_POOL_OPERATOR_TOKEN", raising=False)
+    with pytest.raises(ValueError, match="operator credentials"):
+        orch.down(run_state, tmp_path, cloud)
+    cloud.cli.assert_not_called()
+    _mock_authorized_dit_release(run_state, monkeypatch)
     orch.down(run_state, tmp_path, cloud)
     assert close_calls[-1]["admission_id"] == "adm-active"
     assert close_calls[-1]["allocation_id"] == "alloc-active"
@@ -5239,3 +5329,197 @@ def test_resolve_previous_deployment_id_fails_closed_when_predecessor_record_mis
     v1_file.unlink()
     with pytest.raises(FileNotFoundError, match="deploy-20261115T020000Z-v1"):
         orch.resolve_previous_deployment_id(store, "deploy-20261115T030000Z-v2")
+
+
+def _tested_ram_release(state, directory):
+    state["phase"] = "ready"
+    state["selftest"] = {
+        "status": "passed",
+        "source": dict(state["source"]),
+        "worker_ids": {
+            r: state["resources"][r]["receipt"]["worker_id"] for r in orch.ROLES
+        },
+    }
+    path = directory / "state.json"
+    orch.save(path, state)
+    return path
+
+
+def test_ram_publish_only_attaches_the_reviewed_state_once(
+    state, tmp_path, monkeypatch
+):
+    import ram_publish as pub
+
+    path = _tested_ram_release(state, tmp_path)
+    release = pub.approved_release(orch.load_state(path))
+    inbox, cloud = Mock(), Mock()
+    monkeypatch.delenv("ROLE_POOL_OPERATOR_TOKEN", raising=False)
+    with pytest.raises(ValueError, match="operator credentials"):
+        pub.serve(path, release, inbox, cloud, 0)
+    assert not inbox.mock_calls
+    monkeypatch.setenv("ROLE_POOL_OPERATOR_TOKEN", "o" * 32)
+    monkeypatch.setenv("ROLE_POOL_SIGNING_KEY", "s" * 32)
+    expected_scope = {
+        "pool_id": orch.TARGET["pool_id"],
+        "control_epoch": state["spec"]["pool"]["control_epoch"],
+    }
+    native = Mock(return_value=expected_scope)
+    monkeypatch.setattr(orch, "http", native)
+    attach = Mock()
+    monkeypatch.setattr(orch, "attach", attach)
+    inbox.requested.return_value = False
+    with pytest.raises(TimeoutError):
+        pub.serve(path, release, inbox, cloud, 0)
+    attach.assert_not_called()
+    inbox.requested.return_value = True
+    native.side_effect = PermissionError("403")
+    with pytest.raises(PermissionError, match="403"):
+        pub.serve(path, release, inbox, cloud, 0)
+    assert not list(tmp_path.glob("ram-attach-*.intent"))
+    attach.assert_not_called()
+    native.side_effect = None
+    receipt = pub.serve(path, release, inbox, cloud, 0)
+    assert receipt["status"] == "attached"
+    assert receipt == pub.serve(path, release, inbox, cloud, 0)
+    attach.assert_called_once_with(
+        orch.load_state(path), tmp_path, cloud, execute=True, in_place=True
+    )
+    inbox.requested.assert_called_with("test-shanghai-copy/attach/" + release)
+    native.assert_called_with(
+        orch.TARGET["coordinator_url"] + "/v1/role-pool/operator-check", {}, "o" * 32
+    )
+
+
+def test_ram_publish_rejects_drift_and_unknown_outcome(state, tmp_path, monkeypatch):
+    import ram_publish as pub
+
+    path = _tested_ram_release(state, tmp_path)
+    release = pub.approved_release(orch.load_state(path))
+    monkeypatch.setenv("ROLE_POOL_OPERATOR_TOKEN", "o" * 32)
+    monkeypatch.setenv("ROLE_POOL_SIGNING_KEY", "s" * 32)
+    inbox, cloud = Mock(), Mock()
+    original = path.read_bytes()
+
+    def change_state(_):
+        state["spec"]["route"] = "different"
+        orch.save(path, state)
+        return True
+
+    inbox.requested.side_effect = change_state
+    with pytest.raises(ValueError, match="changed while waiting"):
+        pub.serve(path, release, inbox, cloud, 0)
+    assert not cloud.mock_calls
+    path.write_bytes(original)
+    inbox.requested.side_effect = None
+    inbox.requested.return_value = True
+    monkeypatch.setattr(
+        orch,
+        "http",
+        lambda *a: {
+            "pool_id": orch.TARGET["pool_id"],
+            "control_epoch": state["spec"]["pool"]["control_epoch"],
+        },
+    )
+    attach = Mock(side_effect=TimeoutError("unknown"))
+    monkeypatch.setattr(orch, "attach", attach)
+    with pytest.raises(TimeoutError):
+        pub.serve(path, release, inbox, cloud, 0)
+    with pytest.raises(RuntimeError, match="reconciliation"):
+        pub.serve(path, release, inbox, cloud, 0)
+    assert attach.call_count == 1
+
+
+def test_ram_publish_destination_and_requests_are_bounded(state, tmp_path, monkeypatch):
+    import ram_publish as pub
+
+    path = _tested_ram_release(state, tmp_path)
+    local = orch.load_state(path)
+    for side in (local["target"], local["spec"]["target"]):
+        with patch.dict(side, environment="prod-shanghai"):
+            with pytest.raises(ValueError, match="Shanghai test pool"):
+                pub.approved_release(local)
+    for bad in ("test-shanghai-copy", "../prod", "a" * 63, "a" * 65):
+        with pytest.raises(ValueError):
+            pub.request_key(bad)
+    account = "1720000000000000"
+    bucket = "sglang-shcopy-publish-" + account
+    info = {
+        "Bucket": {
+            "Owner": {"ID": account},
+            "Name": bucket,
+            "Location": "oss-cn-shanghai",
+            "AccessControlList": {"Grant": "private"},
+            "BlockPublicAccess": "true",
+        }
+    }
+    api = Mock(side_effect=[{"AccountId": account}, info, {}])
+    monkeypatch.setattr(pub.ReleaseInbox, "cli", api)
+    monkeypatch.delenv("ROLE_POOL_OPERATOR_TOKEN", raising=False)
+    release = pub.approved_release(local)
+    pub.main(
+        ["request", "--release", release, "--aliyun-profile", "caller", "--execute"]
+    )
+    args = api.call_args.args
+    assert (
+        args[:3] == ("ossutil", "api", "put-object")
+        and args[args.index("--bucket") + 1] == bucket
+    )
+    assert args[args.index("--key") + 1] == "test-shanghai-copy/attach/" + release
+    assert args[args.index("--body") + 1] == ""
+    info["Bucket"]["BlockPublicAccess"] = "false"
+    api.side_effect = [{"AccountId": account}, info]
+    with pytest.raises(ValueError, match="private Shanghai publish bucket"):
+        pub.ReleaseInbox("caller")
+
+
+@pytest.mark.parametrize("condition", ["denied", "busy", "not-drained"])
+def test_down_preserves_jobs_until_native_release_is_confirmed(
+    state, tmp_path, monkeypatch, condition
+):
+    state["attachment"] = {
+        "identities": {
+            role: {"process_id": role, "boot_epoch": "boot"} for role in orch.ROLES
+        }
+    }
+    cloud = Mock(timeout=0)
+    cloud.pod.side_effect = lambda r: {"metadata": {"uid": r["uid"]}}
+    cloud.get_job.side_effect = lambda _: job(state["resources"]["dit"], "Running")
+    monkeypatch.setenv("ROLE_POOL_OPERATOR_TOKEN", "o" * 32)
+
+    def check(url, body, token, cloud):
+        if condition == "denied":
+            raise PermissionError("403")
+        result = _idle_status(state, body, safe=False)
+        if condition == "busy":
+            result["process"]["used"]["slots"] = 1
+        return result
+
+    monkeypatch.setattr(orch, "http", check)
+    with pytest.raises((PermissionError, ValueError, TimeoutError)):
+        orch.down(state, tmp_path, cloud)
+    cloud.cli.assert_not_called()
+    cloud.eflo.assert_not_called()
+    assert not any(r.get("status") == "deleted" for r in state["resources"].values())
+
+
+def test_ram_inbox_uses_only_an_exact_empty_marker():
+    import ram_publish as pub
+
+    inbox = object.__new__(pub.ReleaseInbox)
+    key = pub.request_key("a" * 64)
+    inbox.oss = Mock(
+        side_effect=[
+            {"KeyCount": "0"},
+            {"KeyCount": "1", "Contents": {"Key": key + "-other", "Size": "0"}},
+            {"KeyCount": "1", "Contents": [{"Key": key, "Size": "5"}]},
+            {"KeyCount": "1", "Contents": {"Key": key, "Size": "0"}},
+            PermissionError("RAM denied"),
+        ]
+    )
+    assert not inbox.requested(key)
+    assert not inbox.requested(key)
+    with pytest.raises(ValueError, match="marker"):
+        inbox.requested(key)
+    assert inbox.requested(key)
+    with pytest.raises(PermissionError):
+        inbox.requested(key)

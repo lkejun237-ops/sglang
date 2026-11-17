@@ -693,6 +693,7 @@ class WhiteboxUpstream:
         if selected_source and not getattr(self, "source_only", False):
             raise ValueError("AREA_SOURCE_UNSUPPORTED")
         world_id = world["world_id"]
+        cache_world_id = world_id
         cli_fps_override(world.get("cli_fps"))
         self.requested_capture_fps = world.get("cli_fps")
         if world.get("cli_fps") is not None and not hasattr(
@@ -743,6 +744,9 @@ class WhiteboxUpstream:
         spec = self.config.spec
         init = dict(
             type="init",
+            world_id=cache_world_id,
+            game_id=world_id,
+            cache_write=True,
             prompt=prompt,
             seed=seed,
             references=references,
@@ -969,6 +973,19 @@ class WhiteboxUpstream:
                 settings=self.config.source_encoding,
             )
         self.recording.manifest["playback"] = dict(self.playback.stream)
+        from ..cache_observer import issue_recording
+
+        cache_recording = issue_recording(
+            init["world_id"], self.recording.manifest["object_prefix"]
+        )
+        if cache_recording is not None:
+            init["cache_recording"] = cache_recording
+            self.recording.manifest["cache_operations"] = dict(
+                prefix="cache-operations/",
+                publication="asynchronous_append_only",
+                coverage="check_actual_receipts",
+                included_in_video_object_digest=False,
+            )
         await self.recording.configure()
         async with self.writer:
             await self.upstream.send(msgspec.msgpack.encode(init))

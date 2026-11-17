@@ -1824,15 +1824,19 @@ async def _run_single_segment_flow(
                 else (
                     cache_nested.get("hit")
                     if cache_nested.get("hit") is not None
-                    else (cache_result in {"l1_hit", "l2_hit"})
+                    else (cache_result in {"l1_hit", "l2_hit", "l3_hit"})
                 )
             )
             timings_dict = mem_ready.get("timings") or mem_ready.get("timing") or {}
-            raw_mem_ms = (
-                mem_ready.get("prefill_to_memory_ms")
-                or timings_dict.get("elapsed_host_ms")
-                or wall_ms
-            )
+            raw_mem_ms = mem_ready.get("prefill_to_memory_ms")
+            memory_timing_source = "worker"
+            if raw_mem_ms is None:
+                # A split DiT span starts after the Encoder's deep-tier lookup.
+                # Use arrival of the actual ready event for the full client wait.
+                raw_mem_ms = (
+                    prefill_receipt_times[(pf_req_id, "prefill.memory_ready")] - t0
+                ) * 1000
+                memory_timing_source = "client_receipt"
             mem_ms = round(float(raw_mem_ms), 3)
 
             persisted = None
@@ -1881,6 +1885,7 @@ async def _run_single_segment_flow(
                 "cache_result": cache_result,
                 "hit": hit,
                 "prefill_to_memory_ms": mem_ms,
+                "memory_timing_source": memory_timing_source,
                 "prefill_to_persisted_ms": persisted_ms,
                 "persistence_state": persistence_state,
                 "persistence_timing_source": persistence_timing_source,
@@ -1904,6 +1909,9 @@ async def _run_single_segment_flow(
             "context_id": ctx_id,
             "f0_source_frame_index": f0_index,
             "f0_source_frame_sha256": f0_sha256,
+            "start_boundary": prep_done.get(
+                "start_boundary", {"source_frame_index": f0_index}
+            ),
             "primary_prefill": first_pf,
             "warm_prefill": warm_pf,
             "extra_prefills": extra_pf_results,
@@ -1927,7 +1935,7 @@ async def _run_single_segment_flow(
         assert source.control_prefill is not None, "ControlPrefill must be initialized"
         await source.model_binding.wait_ready()
 
-        # Pin F0 immediately so source capture is held while references upload & prefill
+        # Snapshot the condition before uploading references and running Prefill.
         prep_done = await _prepare_f0()
 
         initial_refs, sha_to_aid = await _upload_recording_refs(recording_meta, rec_dir)
@@ -1983,14 +1991,14 @@ async def _run_single_segment_flow(
             extra_conditions=extra_prefill_conds,
         )
 
-        # Start Segment 1 with prepared context_id & F0 start_boundary
+        # Start with the boundary advertised for this context.
         state = await journal.read()
         start_wall = time.perf_counter()
         await _send_cmd(
             "render.start",
             expected_render_revision=state["render_revision"],
             context_id=prep_info["context_id"],
-            start_boundary={"source_frame_index": prep_info["f0_source_frame_index"]},
+            start_boundary=prep_info["start_boundary"],
             prompt=recording_meta["prompt"],
             seed=primary_seed,
             references=initial_refs,
@@ -2064,7 +2072,9 @@ async def _run_single_segment_flow(
                 references=sw["mapped_references"],
                 source_policy=sw.get("source_policy", "skip_during_switch"),
                 effective={
-                    "source_frame_index": prep_info["f0_source_frame_index"]
+                    "source_frame_index": segment.recording.manifest[
+                        "start_boundary_actual"
+                    ]["source_frame_index"]
                     + prev_frame_trigger,
                     "policy": "at_or_after",
                 },
@@ -2186,9 +2196,7 @@ async def _run_single_segment_flow(
                 "render.start",
                 expected_render_revision=state["render_revision"],
                 context_id=sec_prep["context_id"],
-                start_boundary={
-                    "source_frame_index": sec_prep["f0_source_frame_index"]
-                },
+                start_boundary=sec_prep["start_boundary"],
                 prompt=secondary_segment_recording["prompt"],
                 seed=sec_seed,
                 references=sec_refs,
@@ -2266,6 +2274,8 @@ async def _run_single_segment_flow(
             "lease_release_verified": lease_release_verified,
             "prepare": prep_info,
             "source_resumed_paused_ms": resumed_receipt.get("paused_ms"),
+            "prefill_start": seg1_manifest.get("prefill_start"),
+            "start_boundary_actual": seg1_manifest.get("start_boundary_actual"),
             "whitebox_session_ttff_ms": session_ttff_ms,
             "model_cache_receipts": list(seg1_manifest.get("model_cache_receipts", [])),
             "condition_switches": switch_metrics,
@@ -2709,7 +2719,7 @@ def _render_report_md(summary: dict[str, Any]) -> str:
         "# Room–SGLang 白膜供帧回放集成测试报告",
         "",
         f"- 运行模式：`{summary['mode']}`；供帧：`{summary['flow_mode']}`；长度：`{summary['length_mode']}`（`seed_base={summary.get('seed_base')}`）",
-        "- 编排链路：`SourceSession` -> `ControlPrefill.prepare(hold F0)` -> `ControlPrefill.submit` -> `RenderSegment(start_boundary=F0)` -> `ControlPrefill.resume` -> `RenderSegment.switch` -> `render.end`",
+        "- 编排链路：`SourceSession` -> `ControlPrefill.prepare(condition snapshot)` -> `ControlPrefill.submit` -> `RenderSegment(advertised start boundary)` -> `ControlPrefill.resume` -> `RenderSegment.switch` -> `render.end`",
         f"- 前置条件校验（Preflight 6 项）：`{summary.get('preflight', {}).get('status', 'unknown')}`；测试后租约释放核验：`all_leases_released={post_info.get('all_leases_released')}`",
         "",
         "## 0. 前置条件校验（Preflight Check）",

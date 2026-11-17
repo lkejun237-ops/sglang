@@ -6,6 +6,9 @@ from copy import copy
 import msgspec.msgpack
 
 from sglang.multimodal_gen.configs.sample.zing_h3 import ZingH3SamplingParams
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter import (
+    RealtimeChunkInputs,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_adapter import (
     empty_frame_send_stats,
 )
@@ -26,6 +29,8 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
         import asyncio
 
         self.connection_admission = asyncio.Lock()
+        self._prompt_preparation_event = None
+        self._selected_prompt_preparation = None
         connection_app = getattr(self, "connection_app", None)
         if connection_app is not None:
             controller = connection_app.state.worker_connections
@@ -126,6 +131,12 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
                 if value["type"] != "session.opened":
                     continue
                 if (
+                    self.condition_switch_protocol == "clip-barrier-v1"
+                    and getattr(request, "source_condition_early_release", False)
+                    and value.get("async_inputs") is True
+                ):
+                    self.ready["source_condition_early_release"] = True
+                if (
                     value.get("source_output_release_protocol")
                     == "valid-source-frames-v1"
                 ):
@@ -180,6 +191,27 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
             and getattr(link, "has_output_notifications", lambda: False)()
         )
 
+    def _condition_prepare_ready(self):
+        command = self._pending_prompt_command
+        return (
+            (
+                getattr(self, "condition_switch_protocol", None) == CLIP_BARRIER_V2
+                or getattr(self, "ready", {}).get("source_condition_early_release")
+                is True
+            )
+            and command is not None
+            and "source_boundary" in command
+            and not command.get("rejected")
+            and command["event_id"] != getattr(self, "_prompt_preparation_event", None)
+            and self.dispatched_source_frames > 0
+            and self.end is None
+            and not self.more_work
+            and not self.pending
+            and getattr(self, "_pending_sink_command", None) is None
+            and getattr(self, "_pending_sink_auto_command", None) is None
+            and not self._condition_control_ready()
+        )
+
     def has_control_work(self):
         if self.startup_enabled and self.startup_phase != "attached":
             return self.startup_command is not None
@@ -187,6 +219,7 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
             return super().has_control_work() or self._has_dit_output()
         return (
             self._condition_control_ready()
+            or self._condition_prepare_ready()
             or self._has_dit_output()
             or (
                 (
@@ -203,7 +236,14 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
             return await ZingH3SourceStreamAdapter.wait_for_next_chunk(self, session)
         return await super().wait_for_next_chunk(session)
 
+    def is_control_work(self, session):
+        # Like startup preparation, this RPC does not consume a source command
+        # index or max_chunks budget and cannot overlap another active dispatch.
+        return self._condition_prepare_ready() or super().is_control_work(session)
+
     def clear_state(self, session):
+        self._prompt_preparation_event = None
+        self._selected_prompt_preparation = None
         super().clear_state(session)
         app = getattr(self, "connection_app", None)
         if app is not None and getattr(app.state, "connection_adapter", None) is self:
@@ -303,14 +343,34 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
 
         self.ledger.dispose()
 
+    def sample_chunk_inputs(self, session, server_args, chunk, chunk_size):
+        if getattr(chunk, "control_only", False) and self._condition_prepare_ready():
+            self._selected_prompt_preparation = copy(self._pending_prompt_command)
+            self._prompt_preparation_event = self._pending_prompt_command["event_id"]
+            # Keep old source batches on their old condition until the complete
+            # clip boundary. Prepared is neither accepted activation nor applied.
+            return RealtimeChunkInputs(prompt=session.request.prompt)
+        return super().sample_chunk_inputs(session, server_args, chunk, chunk_size)
+
     def prepare_next_request(self, session, server_args, chunk):
         batch = super().prepare_next_request(session, server_args, chunk)
+        if getattr(self, "_selected_prompt_preparation", None) is not None:
+            batch.extra["zing_prompt_prepare"] = self._selected_prompt_preparation
+            self._selected_prompt_preparation = None
+        if self.ready.get("source_condition_early_release"):
+            update = batch.extra.get("zing_prompt_update")
+            if update is not None and "source_boundary" in update:
+                update["allow_early_release"] = True
         batch.extra["zing_dit_source_records"] = [
             [r.source_id, r.start, r.end] for r in self.ledger.records
         ]
         return batch
 
     def _take_source_input(self):
+        if getattr(self, "_selected_prompt_preparation", None) is not None:
+            # A source group may arrive after the control dispatch was selected.
+            # Leave it queued; preparation must not consume or relabel its frames.
+            return [], None
         appends, end = super()._take_source_input()
         if self.output_attachment:
             # Execution now owns these inputs. Decoder can return client credit
@@ -334,9 +394,18 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
     async def _send_connected_output(self, ws, session, result, batch):
         total = empty_frame_send_stats()
         if result.usage.get("zing_startup_ready") is not None:
-            await ws.send_bytes(
-                msgspec.msgpack.encode(result.usage["zing_startup_ready"])
-            )
+            ready = dict(result.usage["zing_startup_ready"])
+            reports = result.realtime_handoff.get("timing_reports", [])
+            if reports:
+                ready["timing_reports"] = [
+                    dict(
+                        model_session_id=session.id,
+                        generation_id=session.generation_id,
+                        timing=report,
+                    )
+                    for report in reports
+                ]
+            await ws.send_bytes(msgspec.msgpack.encode(ready))
             return total
         for notice in result.realtime_handoff.get("conditioning_notices", []):
             await ws.send_bytes(

@@ -861,7 +861,9 @@ class ZingH3GenerationStage(PipelineStage):
                         dict(rank=rank, **value) for rank, value in enumerate(per_rank)
                     ],
                     "_disk_descriptor": persistence_descriptor(
-                        self.block0_cache, entry
+                        self.block0_cache,
+                        entry,
+                        requested=batch.extra["zing_prefill"].get("persist", False),
                     ),
                 }
             labels = batch.extra["zing_prefill"]

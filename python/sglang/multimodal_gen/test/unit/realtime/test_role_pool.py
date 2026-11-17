@@ -621,6 +621,24 @@ def test_internal_api_separates_registration_room_and_operator_credentials():
                 transport=httpx.ASGITransport(app=app), base_url="http://control"
             ) as client,
         ):
+            for token in ("", "r" * 32, "m" * 32, "wrong"):
+                denied = await client.post(
+                    "/v1/role-pool/operator-check",
+                    json={},
+                    headers={"Authorization": "Bearer " + token},
+                )
+                assert denied.status_code == 403
+            verified = await client.post(
+                "/v1/role-pool/operator-check",
+                json={},
+                headers={"Authorization": "Bearer " + "o" * 32},
+            )
+            assert verified.status_code == 200
+            assert verified.json() == {
+                "pool_id": store.pool_id,
+                "control_epoch": store.epoch,
+            }
+
             body = dict(process_id="e", boot_epoch="e-boot")
             assert (
                 await client.post(
@@ -1102,6 +1120,42 @@ def test_prefill_kind_is_immutable_and_cannot_accept_fake_sdk_cleanup():
                     "admit-a", a["allocation_id"], sdk_cleanup=sdk_receipt(a)
                 )
             await controller.close("admit-a", a["allocation_id"])
+
+    asyncio.run(run())
+
+
+def test_prefill_renewal_keeps_role_failure_evidence_without_releasing(monkeypatch):
+    async def run():
+        store, values = await populated()
+        control, managers, client = await native_cluster(store, values)
+        async with client:
+            a = await control.admit(**request(), operation="prefill")
+            encoder = managers[a["topology"]["encoder"]["service_id"]]
+            encoder.child_started("s", "g")
+            assert (await control.renew("admit-a", a["allocation_id"]))[
+                "state"
+            ] == "bound"
+            rpc = control.rpc
+
+            async def failed_encoder(a, role, action, **kwargs):
+                if role == "encoder" and action == "renew":
+                    raise PoolError("GROUP_TRANSPORT_LOST", 503)
+                return await rpc(a, role, action, **kwargs)
+
+            monkeypatch.setattr(control, "rpc", failed_encoder)
+            with pytest.raises(PoolError, match="GROUP_UNAVAILABLE"):
+                await control.renew("admit-a", a["allocation_id"])
+            snapshot = await store.get("admit-a")
+            assert snapshot["state"] == "quarantined"
+            assert snapshot["renewal_failure"]["roles"] == {
+                "encoder": {"code": "GROUP_TRANSPORT_LOST"}
+            }
+            assert encoder.children["s"]["state"] == "active"
+            assert encoder.owner["allocation_id"] == a["allocation_id"]
+            encoder.child_cleaned("s", "g")
+            assert (await control.close("admit-a", a["allocation_id"]))[
+                "state"
+            ] == "released"
 
     asyncio.run(run())
 

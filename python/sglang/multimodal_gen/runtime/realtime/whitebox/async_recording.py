@@ -133,6 +133,11 @@ def _worker(
                 target = recording.directory / "ui_bundle" / name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(data)
+            elif kind == "cache_event":
+                from .cache_events import PATH
+
+                with (recording.directory / PATH).open("a") as output:
+                    output.write(json_line(value))
             elif kind == "model_input":
                 from .model_inputs import PATH, archive_model_input
 
@@ -413,7 +418,7 @@ class AsyncRecording:
         self._acknowledged.set()
         observe_duration("archive_offer_rejected", 0, self.trace_id, result="error")
 
-    def offer(self, kind, value, *, size=None):
+    def offer(self, kind, value, *, size=None, optional=False):
         if not self.accepting:
             self.rejected += 1
             return False
@@ -439,7 +444,8 @@ class AsyncRecording:
         except (ValueError, RecursionError, MemoryError, TypeError):
             reason = "METADATA_TOO_LARGE"
         self.rejected += 1
-        self.degrade(reason)
+        if not optional:
+            self.degrade(reason)
         return False
 
     def pair(self, frame, source, encoded, prompt):

@@ -66,6 +66,12 @@ def release_identity(role: str) -> dict:
         ):
             raise ValueError("Mounted release configuration digest does not match")
         expected = bundle["environments"][role]
+        pin = bundle["bindings"].get("control_credential_refs")
+        if pin is not None and role in ("room", "gateway", "coordinator"):
+            if os.environ.get("WHITEBOX_CONTROL_CREDENTIAL_REFS") != pin:
+                raise ValueError(
+                    "Control credential references differ from the release bundle"
+                )
         # Only release-owned values are compared. Authentication settings and
         # unrelated platform config remain in the existing secret/config store.
         mismatches = sorted(
@@ -87,6 +93,13 @@ def install_release_route(app, role: str):
     # Freeze at process startup: changing a mounted manifest cannot make an old
     # process claim to run newly deployed code.
     identity = release_identity(role)
+    if (
+        role in ("room", "gateway", "coordinator")
+        and "WHITEBOX_CONTROL_CREDENTIAL_REFS" in os.environ
+    ):
+        from .control_bindings import verify
+
+        identity["control_binding_sha256"] = verify(role)
     app.state.whitebox_release = identity
 
     @app.get("/v1/whitebox/version", include_in_schema=False)

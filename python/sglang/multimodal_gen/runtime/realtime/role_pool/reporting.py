@@ -20,6 +20,10 @@ _LOCK = threading.RLock()
 class ProcessReporter:
     def __init__(self, config, process_id, role):
         self.config, self.process_id, self.role = config, process_id, role
+        if "WHITEBOX_CONTROL_CREDENTIAL_REFS" in os.environ:
+            from ..control_bindings import verify
+
+            verify("worker", config)
         self.role_token = os.environ[config["role_token_env"]]
         self.process = ProcessAuthority(
             capacity=config["capacity"],

@@ -137,9 +137,8 @@ histogram_quantile(0.95,
 `--no-zing-source-prompt-joint` 优先于环境变量，未配置 false；集成式 ServerArgs 的
 默认值不同。Room/Encoder 协商 source_condition_deferred_kv 后才发送 allow_deferred_kv。
 2026-11-16 同步 main `6247343cc2fd` 后，新路径遵循 `clip-barrier-v2` 的 source_ready
-与自动 sink 协商；旧 v1 只在显式声明 deferred KV 能力时接纳 source_ready。
-其他 v1 会话继续等待 kv_ready，不把不匹配协议的回执当作切换完成。
-条件 cache 查询与 Room 各阶段计时继续包围原操作，不改变新协议的放行条件。
+与自动 sink 协商。旧 v1 显式协商 early release 或 deferred KV 时接纳 source_ready，
+v1 同步完成时仍可返回 kv_ready；v2 只用 source_ready 放行。Room 同时校验切换事件与边界。
 DiT 在旧 clip 安全边界准备历史，返回 kv_deferred；Encoder 转为 source_ready，Room
 恢复新 source 后再执行已有联合 forward。只有新版本实际 RGB 才结束 TTFF/确认 applied。
 旧端、未协商、关闭和不支持布局仍走串行 kv_ready；KV admission、cache、取消、释放和
@@ -317,7 +316,7 @@ Windows 挂载路径上的广泛 transport 回归未完成（进程中止，部�
 
 两个入口职责不同：Room `/metrics` 提供首帧/切换分时；remote conditioning 服务的
 管理员认证 `/metrics` 提供前缀 hit/miss/unknown、复用 token、编码/排队和交付来源。
-独立 Encoder 的本地 Qwen 路径不因本次合并自动获得后一组指标，部署时必须核实实际目标。
+独立 Encoder 的本地 Qwen 路径通过 SessionPrefixConditioner 接入同一组 prefix 指标；以独立认证的 Encoder /metrics 采集。部署时仍须区分本地与 remote conditioning 目标。
 conditioning 聚合指标常开，不由 render 的 detailed_timing 控制。后续计时 A/B 应使用
 同一个合并 SHA，两组保留相同 prefix 配置与采集，只切 detailed_timing，不能混入算法差异。
 
@@ -331,6 +330,60 @@ ZIP 不代表已经绑定或上线。测试 FC 的发布权限限制也不会因
 `87fad76a03525b62d5574cfbd9a09203bafaa4aa67c6abbec00102e407e5c539`。
 逐条比较确认：4034 个原有 ZIP entry 内容不变，仅修改 `relay.py`，新增两个
 conditioning 指标模块，未删除 entry。此包尚未发布、未注册 conditioning 目标。
+
+
+## 共享测试分支（2026-11-13）
+
+用户选择以 `main@f27559be499487b9374cc325289e49b81261e4e1` 新建
+`codex/shared-test-ttff-prefix`，合入 #662
+`b53707917d973807d58833a90583d956d79f66fa`（已含 #687 与独立 Encoder prefix 接线）。
+该分支用于多人共用的功能集成验收；未合入 main，未更新在线服务。
+它包含 main 的后续优化，不能冒称与先前 GPU 基线仅差计时开关的 A/B。
+
+### 使用与开关
+
+- Room 部署设置 `WHITEBOX_DETAILED_TIMING=1`；显式 render 请求仍可覆盖，当前会话可走
+  `model.timing.configure` 协议。仅环境变量不够，必须部署本分支的 Room 和三角色。
+- 独立 Encoder 设置 `SGLANG_ZING_QWEN_PREFIX_BYTES=4294967296` 作为本次测试预算，
+  `SGLANG_ZING_CONDITIONING_METRICS_TOKEN_FILE` 指向部署的只读密钥文件；密钥不入库。
+  Prefix 指标常开，和 detailed_timing 独立。预算仍需目标卡实测，不能保证所有档位都可用。
+- main 的 `return_stage_timing` 继续控制逐帧时间线；不因 TTFF 计时开启而自动开启它。
+  集成测试覆盖两个 boolean 的四种组合，不能把两套指标重复相加当作端到端耗时。
+- Grafana 需要采集实际目标及认证绑定，提交分支不等于采集已上线。
+
+### 合并边界与阅读重点
+
+保留 main 的 Encoder 数值路径、逐帧时间线、source early-release、provisional boundary、
+Decoder 渐进输出与集中 open-response 解析，再接入 #662 的阶段计时与动态控制。
+Encoder 的 source 准备和 cache 查找保留原语义并加计时；Decoder job 同时持有逐帧
+`timing_state` 与 TTFF `timing`，生命周期各自沿原通道完成。Room 对 source_ready 的接纳
+要求 peer 声明 early-release 或 deferred-KV 能力。Remote conditioning 的 /metrics
+保留管理员鉴权，同时暴露 main 原有全局指标与 prefix 专用 registry。
+
+Review 路线：Encoder adapter/init → SourceEncoderExecutor → DiTInputService →
+Decoder remote/_opened/submit → DecoderOutputBroker → Room TimingControl/RenderSegment。
+重点检查四种开关组合、延迟回执、缓存命中、取消释放、两套计时没有覆盖彼此。
+复用现有 SGLang explicit control 与异步 event 观测结构，不增加新的调度层或全局采样开关。
+
+### 验证
+
+本次以新 main SHA 冻结配置，读取 PERFORMANCE_DEFAULTS、PIPELINE_DEFAULTS。
+合并前旧候选的 CPU/GPU 结果只保留原 SHA；共享分支必须重新跑冲突相关 CPU 回归。
+静态语法、Ruff（Python 3.12）与 diff whitespace 检查通过。
+
+- `17c358c189b169a4d72fa7e03ee02fd1ab1487f5`：三角色/conditioning CPU 回归
+  491 passed、49 skipped、1 deselected，另有 3 subtests passed；部署与采集工具 169 passed。
+- `49363d35cf4be197c5366569cb8a41cc39eab2a1`：Room 生命周期/计时 153 passed、
+  2 deselected（两项组件测试已归入上面的三角色套件）。后续运行时代码仅改 Encoder 回执校验，
+  Room 源码没有变化。
+- 修复合并引入的 deferred-KV 回执读取了 source 请求而非 prompt 请求的问题；
+  延迟到后续 source dispatch 的回执使用冻结的原请求授权，新增该组合回归通过。
+- 49 项 skip 保留实际测试条件；历史 fixture 测试首次因源码归档无 `.git` 失败，最终排除，
+  未完成其固定旧提交对照。CPU harness 替换不可用的 GPU import 边界，不验证 CUDA/NCCL。
+
+480/736 真 GPU、NCCL、显存、真实首帧/切换与 Grafana 入库均未验证，不能根据 CPU 结果
+宣称零性能影响或已经可在线试玩。详细命令、初次失败和复测边界见
+[共享分支 CPU 验证记录](../../../../../benchmark/whitebox/SHARED_TTFF_PREFIX_20261113.md)。
 
 ## OSS 流式归档补齐（2026-11-16）
 

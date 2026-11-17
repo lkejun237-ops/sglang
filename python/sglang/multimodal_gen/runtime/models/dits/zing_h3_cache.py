@@ -141,7 +141,15 @@ class ZingFixedForwardKVPlan:
     """
 
     def __init__(
-        self, cache, current_positions, *, ends, clean_rows, prefix=False, after=None
+        self,
+        cache,
+        current_positions,
+        *,
+        ends,
+        clean_rows,
+        prefix=False,
+        after=None,
+        current_blocks=None,
     ):
         pool_info = getattr(cache, "_fixed_pool_info", None)
         if pool_info is None or pool_info[0] is not cache.storage:
@@ -163,6 +171,7 @@ class ZingFixedForwardKVPlan:
         self.capacity = cache.capacity
         self.rows = current_positions.shape[0]
         self.clean_rows, self.ends = clean_rows, tuple(ends)
+        self.prefix = prefix
         if not self.ends or self.ends[-1] != self.rows:
             raise ValueError("Fixed Zing KV branches must cover all current rows")
         if not 0 <= clean_rows <= self.rows:
@@ -301,6 +310,12 @@ class ZingFixedForwardKVPlan:
             self.compressed_kv = None
             self.compressed_kv_by_layer = None
         self.tensors = tensors
+        self.compressed_attention_layout = None
+        self.prefix_export_layers = None
+        if compressed_active:
+            from .zing_h3_compressed_view import configure_plan
+
+            configure_plan(self, cache, current_positions, current_blocks)
 
     def prepare_history_reuse(self, cache):
         """Plan a stable prefix from the last successful rotation publication.
@@ -421,6 +436,7 @@ class ZingKVChunk:
     host_positions: torch.Tensor | None = None
     # L2-normalized target key mean descriptor for rolling scene sink refresh.
     descriptor: torch.Tensor | None = None
+    export_owned: bool = False
 
     @property
     def temporal_chunk_id(self):
@@ -562,6 +578,7 @@ class ZingH3KVCache:
         rope_position_mode: str = "absolute",
         rope_max_frame_gap: int = 12,
         storage: list[ZingLayerStore] | None = None,
+        retain_prefix_layers: bool = False,
     ):
         if num_layers < 1 or local_frames < -1 or sink_frames < 0:
             raise ValueError("Invalid Zing KV layer count or frame limits")
@@ -609,6 +626,9 @@ class ZingH3KVCache:
         else:
             self._logical_capacity = None
         self.storage = storage
+        # Explicit preparation/export owns these temporary raw views until its
+        # copy completes. Ordinary compressed generation retains no raw history.
+        self.retain_prefix_layers = retain_prefix_layers
         # Main-store allocations/growth and compactions, counted apart from
         # derived RoPE/position metadata, which is never pooled.
         self.stats = {
@@ -724,6 +744,7 @@ class ZingH3KVCache:
         self.adaln_projection_cache = None
         self.eviction_target_block = None
         self.prefix = None
+        self._prefix_compressed_blocks = None
         self.pending_source = None
         self.committed = []
         self.active = None
@@ -738,6 +759,7 @@ class ZingH3KVCache:
         self._raw_store_versions = {}
         self._raw_write_epochs = {}
         self._length = 0
+        self._compressed_part_layout = ()
         self._rotated_stores = {}
         self._rotated_store_signatures = {}
         self._effective_history_positions = None
@@ -767,7 +789,10 @@ class ZingH3KVCache:
         if getattr(self, "_compressed_kv_stores", None) is not None:
             for store in self._compressed_kv_stores:
                 if store is not None:
-                    store.clear()
+                    if getattr(self, "_bookkeeping_only", False):
+                        store.num_blocks = 0
+                    else:
+                        store.clear()
         elif getattr(self, "_compressed_kv_store", None) is not None:
             self._compressed_kv_store.clear()
         if not getattr(self, "_bookkeeping_only", False):
@@ -885,6 +910,20 @@ class ZingH3KVCache:
 
     def validate_prefix_reset(self):
         prefix = self.prefix
+        compressed = getattr(self, "_compressed_kv_stores", None)
+        counts = self._prefix_compressed_blocks
+        if getattr(self, "_compressed_kv_enabled", False):
+            complete_layers = (
+                compressed is not None
+                and counts is not None
+                and len(compressed) == len(counts) == self.num_layers
+                and all(
+                    store is not None and 0 < count <= store.num_blocks
+                    for store, count in zip(compressed, counts)
+                )
+            )
+        else:
+            complete_layers = len(self._stores) == self.num_layers
         if (
             prefix is None
             or prefix.offset != 0
@@ -897,7 +936,7 @@ class ZingH3KVCache:
                 )
             )
             or self.eviction_target_block is not None
-            or len(self._stores) != self.num_layers
+            or not complete_layers
         ):
             raise ValueError(
                 f"Resident prefix reset requires complete static KV: offset={getattr(prefix, 'offset', None)} block={getattr(prefix, 'block', None)} source={self.pending_source is not None} eviction={self.eviction_target_block} layers={len(self._stores)}/{self.num_layers}"
@@ -915,6 +954,31 @@ class ZingH3KVCache:
         A deferred target final may be discarded just as in a normal rebuild.
         """
         prefix = self.validate_prefix_reset()
+        compressed = getattr(self, "_compressed_kv_stores", None)
+        if getattr(self, "_compressed_kv_enabled", False) and compressed:
+            # The raw scratch rows are not authoritative in compressed mode.
+            # Keep the already-quantized prefix bit-for-bit, and retire only
+            # dynamic blocks while preserving graph-visible buffer addresses.
+            counts = self._prefix_compressed_blocks
+            for store, count in zip(compressed, counts):
+                if getattr(self, "_bookkeeping_only", False):
+                    store.num_blocks = count
+                else:
+                    store.retain_prefix_blocks(count)
+            signature, layouts = self._model_signature, self.layer_layouts
+            self._compressed_kv_stores = self._compressed_kv_store = None
+            try:
+                self.clear()
+            finally:
+                self._compressed_kv_stores = compressed
+                self._compressed_kv_store = compressed[0]
+            prefix.layers = ()
+            self.prefix = prefix
+            self._prefix_compressed_blocks = counts
+            self._model_signature, self.layer_layouts = signature, layouts
+            self._length = prefix.positions.shape[0]
+            self._compressed_part_layout = ((0, self._length),)
+            return
         stores = self._stores
         versions, epochs = self._raw_store_versions, self._raw_write_epochs
         signature, layouts = self._model_signature, self.layer_layouts
@@ -1163,9 +1227,24 @@ class ZingH3KVCache:
             None if self.pending_source is None else copy.copy(self.pending_source)
         )
         shadow._bookkeeping_only = True
+        if self._compressed_kv_stores is not None:
+            # Only metadata is private. GPU arrays keep their leased addresses.
+            shadow._compressed_kv_stores = [
+                None if store is None else copy.copy(store)
+                for store in self._compressed_kv_stores
+            ]
+            shadow._compressed_kv_store = shadow._compressed_kv_stores[0]
         shadow._attention_positions_memo = None
         shadow._last_compaction_spans = ()
         return shadow
+
+    def release_prefix_export(self):
+        """A cache writer has taken ownership; generation retains FP8 only."""
+        if getattr(self, "_compressed_kv_enabled", False):
+            self.retain_prefix_layers = False
+            if self.prefix is not None and self.prefix.export_owned:
+                self.prefix.layers = ()
+                self.prefix.export_owned = False
 
     def publish_plan(self, shadow):
         """Publish successful device execution's host effects exactly once."""
@@ -1196,16 +1275,17 @@ class ZingH3KVCache:
             or getattr(self, "_bookkeeping_only", False)
             or self._sink_signal_manual
             or not self.committed
-            or not self._stores
+            or (not self._stores and not getattr(self, "_compressed_kv_enabled", False))
         ):
             return
         rep_layer = self.num_layers // 2
         store = self._stores.get(rep_layer)
-        if store is None:
+        compressed = getattr(self, "_compressed_kv_enabled", False)
+        if store is None and not compressed:
             return
-        keys = store[0]
+        keys = None if compressed else store[0]
         # Avoid triggering custom __torch_function__ traps (e.g. DeviceOnly in host-sync tests).
-        if type(keys) is not torch.Tensor:
+        if not compressed and type(keys) is not torch.Tensor:
             return
         seen_ids = {uid for uid, _ in self._sink_recent_descs}
         for chunk in self.committed:
@@ -1217,7 +1297,28 @@ class ZingH3KVCache:
                 )
                 start = chunk.offset + (chunk.positions.shape[0] - tgt_rows)
                 stop = chunk.offset + chunk.positions.shape[0]
-                if 0 <= start < stop <= keys.shape[0]:
+                if compressed:
+                    value = self._compressed_kv_stores[rep_layer]
+                    part_block = 0
+                    for part_start, count in self._compressed_part_layout:
+                        blocks = (count + 63) // 64
+                        if part_start == start and part_start + count == stop:
+                            means = value.k_blk_mean[
+                                :, part_block : part_block + blocks
+                            ].float()
+                            weights = value.block_valid_len[
+                                part_block : part_block + blocks
+                            ].float()
+                            vec = (
+                                (means * weights[None, :, None]).sum(1)
+                                / weights.sum().clamp_min(1)
+                            ).reshape(-1)
+                            chunk.descriptor = torch.nn.functional.normalize(
+                                vec, dim=0, eps=1e-6
+                            )
+                            break
+                        part_block += blocks
+                elif 0 <= start < stop <= keys.shape[0]:
                     vec = keys[start:stop].float().mean(dim=0).reshape(-1)
                     chunk.descriptor = torch.nn.functional.normalize(
                         vec, dim=0, eps=1e-6
@@ -1461,28 +1562,13 @@ class ZingH3KVCache:
             )
 
     def _sync_compressed_kv_store(self, retained):
-        """Keep ZingCompressedKVStore blocks aligned with retained chunks after eviction."""
-        if getattr(self, "_compressed_kv_stores", None) is None:
-            if getattr(self, "_compressed_kv_store", None) is not None:
-                self._compressed_kv_stores = [self._compressed_kv_store]
-            else:
-                return
-        valid_chunk_ids = {c.temporal_chunk_id for c in retained}
-        if self.prefix is not None:
-            valid_chunk_ids.add(self.prefix.temporal_chunk_id)
+        """Compact complete source/target parts without reading device owner IDs."""
+        if not getattr(self, "_compressed_kv_enabled", False):
+            return
+        chunks = ([self.prefix] if self.prefix is not None else []) + list(retained)
         if self.pending_source is not None:
-            valid_chunk_ids.add(self.pending_source.temporal_chunk_id)
-
-        for l_idx, store in enumerate(self._compressed_kv_stores):
-            if store is None or store.num_blocks == 0:
-                continue
-            blk_chunk = store.block_chunk_id[: store.num_blocks].cpu().tolist()
-            if any(cid != -999 and cid not in valid_chunk_ids for cid in blk_chunk):
-                # Pure compressed-domain in-place compaction: zero raw16 reliance & pointer invariant
-                store.compact_retained_chunks(valid_chunk_ids)
-
-        if self._compressed_kv_stores:
-            self._compressed_kv_store = self._compressed_kv_stores[0]
+            chunks.append(self.pending_source)
+        self.move_store_rows(tuple((c.offset, c.positions.shape[0]) for c in chunks))
 
     def update_sink(self, operation, *, current_id):
         """Select existing clean chunks at a quiescent native block boundary."""
@@ -1524,6 +1610,35 @@ class ZingH3KVCache:
         Device rows only: chunk offsets, length and rope bookkeeping stay with
         the caller (a planning transaction publishes them later).
         """
+        if getattr(self, "_compressed_kv_enabled", False):
+            selected, layout, block, destination = [], [], 0, 0
+            # Snapshot of physical parts, independent of a host list that may
+            # already have dropped/trimmed a source or promoted a target sink.
+            for offset, count in self._compressed_part_layout:
+                blocks = (count + 63) // 64
+                if any(
+                    start <= offset and offset + count <= start + rows
+                    for start, rows in spans
+                ):
+                    selected.extend(range(block, block + blocks))
+                    layout.append((destination, count))
+                    destination += count
+                elif any(
+                    start < offset + count and offset < start + rows
+                    for start, rows in spans
+                ):
+                    raise ValueError("Compressed compaction splits a committed part")
+                block += blocks
+            if destination != sum(rows for _, rows in spans):
+                raise ValueError("Compressed compaction does not cover retained rows")
+            for store in self._compressed_kv_stores or ():
+                if store is not None:
+                    if getattr(self, "_bookkeeping_only", False):
+                        store.num_blocks = len(selected)
+                    else:
+                        store.compact_blocks(selected)
+            self._compressed_part_layout = tuple(layout)
+            return
         runs = _compaction_runs(spans)
         if not runs:
             return
@@ -1549,7 +1664,9 @@ class ZingH3KVCache:
         self._last_compaction_spans = spans
         for layer in self._stores:
             self._observe_raw_store(layer)
-        if not getattr(self, "_bookkeeping_only", False):
+        if getattr(self, "_compressed_kv_enabled", False) or not getattr(
+            self, "_bookkeeping_only", False
+        ):
             self.move_store_rows(spans)
         for layer in self._stores:
             self._mark_raw_store(layer)
@@ -1558,6 +1675,8 @@ class ZingH3KVCache:
             chunk.offset = offset
             offset += chunk.positions.shape[0]
         self._length = offset
+        if getattr(self, "_compressed_kv_enabled", False):
+            return  # Raw scratch is not an authoritative historical view.
         if self.pooled and len(self._stores) == self.num_layers:
             stores = tuple(self._stores[i] for i in range(self.num_layers))
             for chunk in chunks:
@@ -2406,6 +2525,13 @@ class ZingH3KVCache:
         chunk.position_signature = self._tensor_signature(positions)
         if not has_compressed_kv:
             chunk.layers = self._chunk_layers(offset, rows)
+        elif block == 0 and self.retain_prefix_layers:
+            chunk.layers = (
+                tuple(layers)
+                if bookkeeping_only
+                else tuple((k.detach().clone(), v.detach().clone()) for k, v in layers)
+            )
+            chunk.export_owned = not bookkeeping_only
         else:
             chunk.layers = ()
 
@@ -2431,11 +2557,25 @@ class ZingH3KVCache:
                         )
                     if store_l is not None:
                         try:
-                            store_l.append_chunk(
-                                k_l, v_l, chunk_id=chunk.temporal_chunk_id
-                            )
+                            # Prefix has its own namespace. An odd source block
+                            # and its following even target belong to one chunk.
+                            owner = -1 if block == 0 else (block - 1) // 2
+                            store_l.append_chunk(k_l, v_l, chunk_id=owner)
                         except Exception:
-                            pass
+                            # A partial per-layer write is not a committed KV
+                            # state. Revoke it instead of advancing silently.
+                            self.clear()
+                            raise
+        elif bookkeeping_only and has_compressed_kv:
+            for store in self._compressed_kv_stores or ():
+                if store is not None:
+                    store.num_blocks += (rows + 63) // 64
+                    if store.num_blocks > store.max_blocks:
+                        raise ZingKVCapacityError(
+                            "Compressed KV plan exceeds block capacity"
+                        )
+        if has_compressed_kv:
+            self._compressed_part_layout += ((offset, rows),)
         return chunk
 
     def update(self, positions, block_idx, phase, frames, layers=None, validation=None):
@@ -2487,6 +2627,11 @@ class ZingH3KVCache:
                 chunk.host_positions = checked[0].detach().clone()
         if phase == "prefix":
             self.prefix = chunk
+            stores = getattr(self, "_compressed_kv_stores", None)
+            if stores:
+                self._prefix_compressed_blocks = tuple(
+                    store.num_blocks if store is not None else 0 for store in stores
+                )
         elif phase == "source":
             self.pending_source = chunk
         else:

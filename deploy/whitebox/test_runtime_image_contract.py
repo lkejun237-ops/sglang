@@ -425,7 +425,7 @@ def test_model_dockerfile_enforces_prebuilt_kernels_without_compilation():
         assert "nvcc" not in line.lower()
 
     pip_commands = [cmd for cmd in run_commands if "pip install" in cmd]
-    assert len(pip_commands) == 2
+    assert len(pip_commands) == 3
     assert "/opt/whitebox" not in pip_commands[0]
     for required_token in (
         "--no-cache-dir",
@@ -438,6 +438,11 @@ def test_model_dockerfile_enforces_prebuilt_kernels_without_compilation():
         "-r /opt/whitebox/deploy/whitebox/kernels-wheel.lock.txt",
     ):
         assert required_token in pip_commands[1]
+    isolated = [command for command in pip_commands if "--target" in command]
+    assert len(isolated) == 1
+    assert "--target /opt/mooncake-cuda12" in isolated[0]
+    assert "--no-deps" in isolated[0]
+    assert "nvidia-cuda-runtime-cu12==12.8.90" in isolated[0]
 
 
 REQUIRED_KERNEL_OPS = (

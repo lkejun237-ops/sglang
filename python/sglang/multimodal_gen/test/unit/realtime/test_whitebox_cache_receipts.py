@@ -248,3 +248,51 @@ def test_pending_restore_report_never_waits_or_fabricates_cuda_time():
     )
     report = state._take_block0_report([{}])
     assert report["cache_result"] == "l2_hit" and report["cuda_ms"] == {}
+
+
+def test_l3_provenance_survives_two_hops_without_exposing_native_payload():
+    value = dict(
+        cache_key="a" * 64,
+        prompt_version=2,
+        cache_result="l3_hit",
+        lookup=dict(
+            source_layer="l3",
+            artifact_id="b" * 32,
+            baseline_s0_sha256="c" * 64,
+            online_s0_sha256="d" * 64,
+            private_path="secret",
+        ),
+        cuda_ms={"restore": 2.5},
+    )
+    receipt = public_cache_receipt(value)
+    assert receipt["source_layer"] == "l3"
+    assert receipt["artifact_id"] == "b" * 32
+    assert receipt["timings"]["cuda_ms"]["restore"] == 2.5
+    assert "secret" not in str(receipt)
+    assert public_cache_receipt(receipt) == receipt
+
+
+def test_optional_cache_event_overflow_does_not_fail_recording():
+    from collections import deque
+
+    from sglang.multimodal_gen.runtime.realtime.whitebox.async_recording import (
+        AsyncRecording,
+    )
+    from sglang.multimodal_gen.runtime.realtime.whitebox.cache_events import (
+        record_cache_event,
+    )
+
+    recording = object.__new__(AsyncRecording)
+    recording.manifest = {}
+    recording.accepting = True
+    recording.rejected = 0
+    recording.pending = None
+    recording.items = deque()
+    recording.pending_bytes = 0
+    recording.manager = NS(max_age=10, queue_depth=0, queue_bytes=1024)
+    recording.degrade = lambda _: pytest.fail(
+        "Optional telemetry must not fail the archive"
+    )
+    assert not record_cache_event(recording, {"type": "model.cache"})
+    assert recording.manifest["cache_events"]["dropped"] == 1
+    assert recording.accepting

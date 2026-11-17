@@ -187,13 +187,16 @@ async def managed_source(
     return source, lease, task, entered, finish
 
 
-def test_managed_preview_prepares_while_cli_is_blocked(monkeypatch):
+@pytest.mark.parametrize("detailed_timing", [False, True])
+def test_managed_preview_prepares_while_cli_is_blocked(monkeypatch, detailed_timing):
     async def run():
         source, lease, task, entered, finish = await managed_source(monkeypatch)
+        source.journal.detailed_timing_default = detailed_timing
         try:
             await asyncio.wait_for(entered.wait(), 1)
             await asyncio.wait_for(lease.ws.preparing.wait(), 1)
             assert not task.done() and not finish.is_set()
+            assert lease.ws.commands[0]["detailed_timing"] is detailed_timing
             assert lease.calls == 1 and lease.releases == 0
             assert source.inference.manual
             assert source.startup is None  # No automatic render/display transition.
@@ -324,6 +327,153 @@ def test_rejected_role_pool_admission_closes_client_without_reserving_compute(
             assert lease.client.is_closed
         finally:
             await lease.client.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "operation,wait_ms,expected_attempts,expected_error",
+    [
+        ("prefill", 1000, 2, "ROLE_IDENTITY_CHANGED"),
+        ("prefill", 0, 1, "CAPACITY_EXHAUSTED"),
+        ("bound", 1000, 1, "CAPACITY_EXHAUSTED"),
+    ],
+)
+def test_only_explicit_batch_wait_retries_capacity_with_same_identity(
+    monkeypatch, operation, wait_ms, expected_attempts, expected_error
+):
+    async def run():
+        monkeypatch.delenv("WHITEBOX_PREFERRED_SERVICE_IDS", raising=False)
+        lease = DisaggregatedModelLeases(
+            None,
+            None,
+            user_id="batch-fixture",
+            model_revision="fixture",
+            vae_fingerprint="local",
+            trace_id="fixture",
+            max_bytes=1024,
+            strict_release=True,
+            capacity_wait_ms=wait_ms,
+            operation_path="/v1/realtime_video/" + operation,
+            config={
+                "profile": "fixture",
+                "compatibility": "fixture",
+                "network_domain": "fixture",
+                "player_ttl_seconds": 300,
+            },
+        )
+        attempts = []
+
+        async def control(action, body):
+            if action == "admit":
+                attempts.append(dict(body))
+                raise PoolError(
+                    "CAPACITY_EXHAUSTED"
+                    if len(attempts) == 1
+                    else "ROLE_IDENTITY_CHANGED"
+                )
+            assert action == "get"
+            raise PoolError("ADMISSION_NOT_FOUND", 404)
+
+        monkeypatch.setattr(lease, "control", control)
+        with pytest.raises(PoolError, match=expected_error):
+            async with lease.open():
+                pytest.fail("No allocation was granted")
+        assert len(attempts) == expected_attempts
+        assert all(value == attempts[0] for value in attempts)
+        assert lease.resource_state == "none" and lease.client.is_closed
+
+    asyncio.run(run())
+
+
+def test_batch_capacity_wait_cancellation_does_not_wait_for_the_capacity_deadline(
+    monkeypatch,
+):
+    async def run():
+        monkeypatch.delenv("WHITEBOX_PREFERRED_SERVICE_IDS", raising=False)
+        lease = DisaggregatedModelLeases(
+            None,
+            None,
+            user_id="batch-cancel-fixture",
+            model_revision="fixture",
+            vae_fingerprint="local",
+            trace_id="fixture",
+            max_bytes=1024,
+            strict_release=True,
+            capacity_wait_ms=60000,
+            operation_path="/v1/realtime_video/prefill",
+            config={
+                "profile": "fixture",
+                "compatibility": "fixture",
+                "network_domain": "fixture",
+                "player_ttl_seconds": 300,
+            },
+        )
+        started, calls = asyncio.Event(), []
+
+        async def control(action, body):
+            calls.append(action)
+            if action == "admit":
+                started.set()
+                raise PoolError("CAPACITY_EXHAUSTED")
+            if action == "cancel":
+                return {"state": "cancelled"}
+            assert action == "get"
+            raise PoolError("ADMISSION_NOT_FOUND", 404)
+
+        async def enter():
+            async with lease.open():
+                pytest.fail("No allocation was granted")
+
+        monkeypatch.setattr(lease, "control", control)
+        task = asyncio.create_task(enter())
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+        assert calls == ["admit", "cancel", "get"]
+        assert lease.resource_state == "none" and lease.client.is_closed
+
+    asyncio.run(run())
+
+
+def test_batch_capacity_wait_has_a_deadline(monkeypatch):
+    async def run():
+        monkeypatch.delenv("WHITEBOX_PREFERRED_SERVICE_IDS", raising=False)
+        lease = DisaggregatedModelLeases(
+            None,
+            None,
+            user_id="batch-fixture",
+            model_revision="fixture",
+            vae_fingerprint="local",
+            trace_id="fixture",
+            max_bytes=1024,
+            strict_release=True,
+            capacity_wait_ms=1,
+            operation_path="/v1/realtime_video/prefill",
+            config={
+                "profile": "fixture",
+                "compatibility": "fixture",
+                "network_domain": "fixture",
+                "player_ttl_seconds": 300,
+            },
+        )
+        attempts = []
+
+        async def control(action, body):
+            if action == "admit":
+                attempts.append(body)
+                raise PoolError("CAPACITY_EXHAUSTED")
+            assert action == "get"
+            raise PoolError("ADMISSION_NOT_FOUND", 404)
+
+        monkeypatch.setattr(lease, "control", control)
+        with pytest.raises(PoolError, match="CAPACITY_EXHAUSTED"):
+            async with asyncio.timeout(2):
+                async with lease.open():
+                    pytest.fail("No allocation was granted")
+        assert 1 <= len(attempts) <= 2
+        assert lease.resource_state == "none" and lease.client.is_closed
 
     asyncio.run(run())
 

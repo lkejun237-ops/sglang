@@ -44,6 +44,74 @@ from sglang.multimodal_gen.test.unit.test_zing_h3_queued_dit import (  # noqa: F
 model = model_fixture
 
 
+@torch.no_grad()
+@pytest.mark.parametrize("detailed_timing", [False, True])
+def test_initial_condition_prepares_before_first_source(model, detailed_timing):
+    h = Harness(model)
+    codecs = SimpleNamespace(
+        target_fps=24,
+        spatial_ratio=1,
+        temporal_ratio=4,
+        vae_frames_per_chunk=17,
+        vae_latents_per_chunk=5,
+    )
+    outputs = []
+
+    async def output(result):
+        outputs.append(result)
+
+    worker = create_link_session(
+        h.sampler(),
+        codecs,
+        dict(
+            session_id="s",
+            generation_id="g",
+            seed=7,
+            width=2,
+            height=2,
+            fps=24,
+            detailed_timing=detailed_timing,
+        ),
+        output,
+    )
+    receipt = dict(
+        protocol="whitebox-startup-prepare-v2",
+        identity=dict(
+            preparation_id="prepare",
+            source_session_id="source",
+            source_epoch="1",
+            worker_epoch="worker",
+            condition_fingerprint="a" * 64,
+        ),
+        preview_sha256="b" * 64,
+        preview_size=[2, 2],
+    )
+
+    async def run():
+        await worker.put(
+            dict(
+                type="conditioning",
+                session_id="s",
+                generation_id="g",
+                tensors=h.condition(10),
+                event_id=10,
+                inputs=input_metadata(h),
+                source_prepare=receipt,
+            )
+        )
+        while worker.queue:
+            await worker.queue.run_once()
+        assert worker.condition_prepared == receipt
+        assert worker.state.device is None
+        assert worker.bridge.accepted_pixels == 0
+        assert not outputs
+
+    try:
+        asyncio.run(run())
+    finally:
+        worker.close()
+
+
 def test_dit_cache_storage_is_explicit_and_preserves_mount_validation(
     tmp_path, monkeypatch
 ):

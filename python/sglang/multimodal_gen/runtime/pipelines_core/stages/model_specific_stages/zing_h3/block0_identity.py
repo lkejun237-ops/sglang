@@ -137,6 +137,50 @@ def storage_mounted(root):
     )
 
 
+def execution_identity(model):
+    """Resolved server recipe, independent of worker IDs and deployment paths.
+
+    KV is BF16 even with FP8 weights. Its dtype alone cannot distinguish the
+    preparations produced by different quantization or sparse-attention recipes.
+    """
+    from sglang.multimodal_gen.runtime.models.dits import zing_h3_sparse_attn as sparse
+
+    quant = model.quant_config
+    precision = {
+        "weight_dtypes": sorted({str(p.dtype) for p in model.parameters()}),
+        "quantization": None,
+    }
+    if quant is not None:
+        precision["quantization"] = {
+            "mode": quant.get_name(),
+            "selected_linears": sorted(quant.selected),
+            "activation_scheme": quant.backend.activation_scheme,
+            "weight_block_size": quant.backend.weight_block_size,
+            "coverage": dict(quant.coverage),
+        }
+    mode = sparse.get_sparse_mode()
+    attention = {"mode": mode}
+    if mode != "dense":
+        attention.update(
+            min_chunk=sparse.get_min_sparse_chunk(),
+            budget_tau=sparse.get_sparse_budget_tau(mode),
+            three_tier=sparse.is_three_tier_enabled(mode),
+            virtual_mean=sparse.is_virtual_mean_enabled(mode),
+            triage_score=sparse.is_triage_score_enabled(mode),
+            price_pi=sparse.get_sparse_price_pi(mode),
+            c_rf=sparse.get_sparse_c_rf(mode),
+            alpha_triage=sparse.get_sparse_alpha_triage(mode),
+        )
+    if sparse.is_three_tier_enabled(mode):
+        from sglang.multimodal_gen.runtime.models.dits.zing_h3_compressed_view import (
+            LAYOUT_VERSION,
+        )
+
+        attention["three_tier"] = True
+        attention["compressed_layout"] = LAYOUT_VERSION
+    return {"precision": precision, "attention": attention}
+
+
 def build_identity(stage, args, *, device):
     """Trust the immutable export's config; check small metadata across SP ranks."""
     from sglang.multimodal_gen.runtime.conditioning.worker import coordinate_validation
@@ -163,6 +207,7 @@ def build_identity(stage, args, *, device):
                 "ring": group.ring_world_size,
             },
             "kv_dtype": str(stores[0].k.dtype),
+            "execution": execution_identity(stage.modules["transformer"]),
         }
         digest = fingerprint(identity)
     except Exception as exc:

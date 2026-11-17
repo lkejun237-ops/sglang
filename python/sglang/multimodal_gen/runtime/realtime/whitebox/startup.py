@@ -315,6 +315,7 @@ class PlayStartup:
         self.task = None
         self.lease = None
         self.event_sequence = 0
+        self.timing_reports = []
 
     def _ids(self):
         return {
@@ -354,6 +355,12 @@ class PlayStartup:
 
     def launch(self, init):
         self.init = copy.deepcopy(init)
+        self.init.setdefault(
+            "detailed_timing",
+            getattr(
+                getattr(self.owner, "journal", None), "detailed_timing_default", False
+            ),
+        )
         source = init["source_stream"]
         self.geometry = ModelGeometry(
             VideoSpec(source["width"], source["height"], source["fps"]),
@@ -418,6 +425,32 @@ class PlayStartup:
             if message.get("type") == expected:
                 if message.get("identity") != self.identity:
                     raise RenderError("SOURCE_EPOCH_MISMATCH")
+                # Preparation precedes Render creation. Retain bounded, validated
+                # reports until the original model connection is handed over.
+                from .inference_timing import public_timing
+
+                reports = message.get("timing_reports", [])
+                if not isinstance(reports, list) or len(reports) > 256:
+                    raise RenderError("CONDITION_INVALID")
+                for report in reports:
+                    if not isinstance(report, dict):
+                        continue
+                    timing = public_timing(report.get("timing"))
+                    if (
+                        timing is not None
+                        and report.get("model_session_id") == self.assignment.session_id
+                        and report.get("generation_id") == self.assignment.generation_id
+                    ):
+                        if len(self.timing_reports) >= 256:
+                            raise RenderError("CONDITION_INVALID")
+                        self.timing_reports.append(
+                            dict(
+                                type="model.timing",
+                                model_session_id=self.assignment.session_id,
+                                generation_id=self.assignment.generation_id,
+                                timing=timing,
+                            )
+                        )
                 return message
             if message.get("type") not in {"source.prepare.accepted", "heartbeat"}:
                 raise model_preparation_error(
@@ -725,5 +758,6 @@ class PlayStartup:
         self.closed = True
         await self.close_attempt()
         self.pinned_source = self.cli_rgb = None
+        self.timing_reports.clear()
         if self.owns_assets:
             self.assets.clear()

@@ -321,3 +321,27 @@ def test_fill_accepts_host_positions_and_waits_on_kv_device(monkeypatch):
         entry.data.pages[0, 1, entry.page_ids[0], :3], cache.prefix.layers[0][1]
     )
     done.synchronize.assert_called_once()
+
+
+def test_world_cache_reuses_different_s0_without_merging_effective_conditions():
+    codecs = NS(remote_read_fs=None)
+    config = dict(width=32, height=32, fps=24)
+    a = dict(frames=torch.zeros(3, 1, 32, 32, dtype=torch.uint8))
+    b = dict(frames=torch.ones_like(a["frames"]))
+    request = dict(world_id="world-a", prompt="scene", media=[])
+    model = dict(model="model-a", sp={"size": 2})
+    key = preparation_key(codecs, request, a, config, model)
+    assert preparation_key(codecs, request, b, config, model) == key
+    assert request["world_id"] == "world-a"  # The frozen input is not mutated.
+    for change in (
+        {"world_id": "world-b"},
+        {"prompt": "changed"},
+        {"media": [{"type": "image", "payload": b"other"}]},
+    ):
+        assert preparation_key(codecs, dict(request, **change), a, config, model) != key
+    assert (
+        preparation_key(codecs, request, a, config, dict(model, model="model-b")) != key
+    )
+    assert preparation_key(codecs, request, a, dict(config, width=64), model) != key
+    with pytest.raises(ValueError, match="world identity"):
+        preparation_key(codecs, dict(request, world_id="  "), a, config, model)

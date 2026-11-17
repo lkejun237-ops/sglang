@@ -397,14 +397,20 @@ def test_multiprocess_export_includes_child_samples(tmp_path):
     # must exist before starting Python, just as in a deployed model worker.
     code = """
 import os
-from prometheus_client import Counter
+from prometheus_client import CollectorRegistry, Counter
+from sglang.multimodal_gen.runtime.realtime.critical_path_metrics import prometheus_latest
 frames = Counter('zing_child_frames_total', 'Child frames')
+extra = CollectorRegistry()
+hits = Counter('zing_child_hits_total', 'Private registry hits', registry=extra)
 if os.fork() == 0:
     frames.inc(17)
+    hits.inc(3)
     os._exit(0)
 os.wait()
-from sglang.multimodal_gen.runtime.realtime.critical_path_metrics import prometheus_latest
-assert b'zing_child_frames_total 17.0' in prometheus_latest()
+body = prometheus_latest(extra)
+assert b'zing_child_frames_total 17.0' in body
+assert b'zing_child_hits_total 3.0' in body
+assert body.count(b'# HELP zing_child_hits_total ') == 1
 """
     result = subprocess.run(
         [sys.executable, "-c", code],

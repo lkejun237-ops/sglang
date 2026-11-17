@@ -349,6 +349,16 @@ def build_integrated_group_commands(
     ]
     if m.get("quantization", "none") == "fp8":
         dit += ["--quantization", "fp8", "--direct-gpu-weight-loading", "false"]
+    if m.get("cache_backend", "local") == "mooncake":
+        cache_config = bundle["bindings"].get("cache_config")
+        if not isinstance(cache_config, str) or not Path(cache_config).is_absolute():
+            raise ValueError("Mooncake requires an absolute host cache configuration")
+        dit += [
+            "--zing-block0-cache-backend",
+            "mooncake",
+            "--zing-block0-mooncake-config",
+            cache_config,
+        ]
     quantum = m["source_work_quantum"]
     dit += ["--zing-source-work-quantum", str(quantum)]
     dit += ["--zing-source-encoder-mode", "overlap" if quantum else "serial"]

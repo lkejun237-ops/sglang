@@ -1718,9 +1718,7 @@ class SourceSession(InteractiveSession):
                 if command.get("context_id") is not None:
                     if prefill is None:
                         raise RenderError("CAPABILITY_UNAVAILABLE")
-                    first = prefill.resolve(command["context_id"])
-                    if boundary != {"source_frame_index": first[1][0].index}:
-                        raise RenderError("PREFILL_INPUT_MISMATCH")
+                    first = prefill.start_frame(command["context_id"], boundary)
                 if first is None and boundary != {"mode": "next_available"}:
                     first = self.retained.exact(boundary)
                     if first is None:
@@ -2622,6 +2620,9 @@ class SourceSession(InteractiveSession):
         )
         # Persist bounded per-version evidence with the segment, as well as
         # sending the receipt over the existing reliable control connection.
+        from .cache_events import record_cache_event
+
+        record_cache_event(segment.recording, message)
         manifest = segment.recording.manifest
         scene_prefill = manifest.get("scene_prefill")
         if scene_prefill is not None and cache["prompt_version"] == 1:
@@ -2787,14 +2788,19 @@ class SourceSession(InteractiveSession):
             and message.get("kind") == "prompt.update"
             and message.get("state") in {"kv_ready", "source_ready"}
         ):
-            expected = (
-                "source_ready"
-                if getattr(segment, "condition_switch_protocol", None)
-                == CLIP_BARRIER_V2
-                or getattr(segment, "deferred_kv_ready", False)
-                else "kv_ready"
+            is_v2 = (
+                getattr(segment, "condition_switch_protocol", None) == CLIP_BARRIER_V2
             )
-            if message["state"] != expected:
+            if message["state"] == "source_ready":
+                if not (
+                    is_v2
+                    or getattr(segment, "condition_early_release", False)
+                    or getattr(segment, "deferred_kv_ready", False)
+                ):
+                    return True
+            elif is_v2:
+                # v2 opens the source boundary only on source_ready. A v1 peer
+                # can finish synchronously with kv_ready even when it supports deferral.
                 return True
             switch = getattr(segment, "condition_switch", None)
             boundary = switch.get("boundary") if switch else None

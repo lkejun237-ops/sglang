@@ -243,6 +243,7 @@ def test_sink_prompt_rebuild_updates_anchor_without_replaying_user_request():
 def test_real_source_segment_routes_sink_and_input_without_waiting_for_model(
     tmp_path, monkeypatch, timing_control
 ):
+    monkeypatch.delenv("WHITEBOX_BOUND_COMPUTE", raising=False)
     from test_whitebox_render_lifecycle import (
         AsyncArchiveManager,
         BrowserUI,

@@ -19,7 +19,9 @@ def _fingerprint(value):
     ).hexdigest()
 
 
-def persistence_descriptor(cache, entry):
+def persistence_descriptor(cache, entry, *, requested=True):
+    if hasattr(cache, "request_persistence"):
+        return cache.request_persistence(entry) if requested else None
     disk = getattr(cache, "disk_cache", None)
     if disk is None:
         return None
@@ -42,6 +44,8 @@ def persistence_descriptor(cache, entry):
 
 def inspect_block0_persistence(cache, descriptor):
     """Use the disk backend's public directory contract, including native v3."""
+    if descriptor.get("schema") == "zing-block0-tier-state-v1":
+        return cache.persistence_status(descriptor)
     disk = getattr(cache, "disk_cache", None)
     if disk is None:
         return {"state": "failed", "code": "CACHE_PERSISTENCE_UNAVAILABLE"}
@@ -50,6 +54,10 @@ def inspect_block0_persistence(cache, descriptor):
 
 
 def inspect_persistence(root, descriptor):
+    if descriptor.get("schema") == "zing-block0-tier-state-v1":
+        from .cache_tiers import read_persistence_state
+
+        return read_persistence_state(root, descriptor)
     if descriptor.get("schema") == "zing-block0-v3":
         return _inspect_managed_persistence(root, descriptor)
     for name in ("key", "model", "layout"):

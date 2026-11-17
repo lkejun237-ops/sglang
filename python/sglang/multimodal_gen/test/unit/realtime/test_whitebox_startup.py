@@ -268,6 +268,8 @@ def test_room_pins_one_live_view_without_changing_world_clock():
 def test_source_segment_handoff_runs_real_room_pipeline_once(
     tmp_path, monkeypatch, with_frame, mismatch, protocol
 ):
+    # This fixture provides a legacy child lease, not a bound parent slot.
+    monkeypatch.delenv("WHITEBOX_BOUND_COMPUTE", raising=False)
     from test_whitebox_interactive import BrowserUI
     from test_whitebox_render_lifecycle import OrderedWorker
 
@@ -962,6 +964,7 @@ def test_v2_segment_starts_with_pinned_cli_pixels_not_condition_preview():
         native = bytes(SPEC.frame_bytes)
         segment.leases = NS(
             is_startup=True,
+            timing_reports=[],
             protocol=V2_PROTOCOL,
             rgb=b"independent-preview",
             cli_rgb_sha256=hashlib.sha256(native).hexdigest(),
@@ -1327,6 +1330,7 @@ def test_video_start_still_rejects_a_changed_pinned_cli_frame():
     segment.segment = {}
     segment.leases = NS(
         is_startup=True,
+        timing_reports=[],
         protocol=V2_PROTOCOL,
         cli_rgb_sha256=hashlib.sha256(RGB).hexdigest(),
     )
@@ -1335,5 +1339,48 @@ def test_video_start_still_rejects_a_changed_pinned_cli_frame():
         with pytest.raises(RenderError) as error:
             await segment.before_model_source(None, NS(rgb=bytes(len(RGB))), 0)
         assert error.value.code == "SOURCE_EPOCH_MISMATCH"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("generation", ["generation", "foreign-generation"])
+def test_preparation_timing_stays_private_until_matching_render_handoff(generation):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from sglang.multimodal_gen.runtime.utils.zing_ttff_timing import InferenceTiming
+
+    async def run():
+        startup = object.__new__(PlayStartup)
+        startup.event_sequence = 0
+        startup.identity = {"preparation": "same"}
+        startup.assignment = SimpleNamespace(
+            session_id="session", generation_id="generation"
+        )
+        startup.timing_reports = []
+        timing = InferenceTiming("encoder", prompt_version=1)
+        timing.record("qwen", 12.0)
+        report = timing.snapshot()
+        startup._model_send = AsyncMock()
+        startup._model_reply = AsyncMock(
+            return_value={
+                "type": "source.prepared",
+                "identity": startup.identity,
+                "timing_reports": [
+                    {
+                        "model_session_id": "session",
+                        "generation_id": generation,
+                        "timing": report,
+                    }
+                ],
+            }
+        )
+        await startup._event("source.prepare", {}, "source.prepared")
+        assert len(startup.timing_reports) == (1 if generation == "generation" else 0)
+        if startup.timing_reports:
+            buffered = startup.timing_reports[0]
+            assert buffered["type"] == "model.timing"
+            assert buffered["timing"]["report_id"] == report["report_id"]
+            assert buffered["timing"]["stages"][0]["host_ms"] == 12.0
 
     asyncio.run(run())

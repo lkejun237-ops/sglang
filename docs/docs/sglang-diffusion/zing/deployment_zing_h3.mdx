@@ -145,6 +145,42 @@ GPU 作业 `dlc17ve8ej3b9apm` 完成 12/12 正式请求，但在停止三角色�
 allocated/reserved 常驻/真实峰值矩阵尚未完整验证，不用旧版或其他配置结果补齐。
 开发者接入已部署 Coordinator、隔离 Worker、分辨率选择与原始证据入口见
 [逐帧耗时分解使用说明](https://github.com/seedleap/sglang/blob/sglang_latency_breakdown_visualization/benchmark/whitebox/LATENCY_BREAKDOWN.md)。
+## 生产 TTFF 分时观测（2026-11-10，代码候选，未部署）
+
+新增分离 Encoder/DiT/Decoder 的首输出与条件切换阶段计时、Room 等待分解、
+逐版本 cache/计时追加归档和离线 CSV 导出。Host 与 CUDA stream 区间分别记录，
+异步查询 event，计时热路径不新增同步或 SP collective；重叠区间不得相加作为 TTFF。
+实现与字段口径见 [生产 TTFF 分时观测](plans/serving-ttff-breakdown.md)。
+条件切换另补 Room journal 接纳至首 RGB 的六段路径、逐段覆盖率与分位数；
+客户端发送起点按 #662 范围明确待接入，不能将 Room 总窗口称为客户端 TTFF。
+2026-11-11 reviewer 修订：基础首帧/切换总窗口常开；详细角色计时和 JSONL 归档改为
+render 请求 `detailed_timing=true` 显式开启，默认关闭。开关沿分离三角色的会话传递，
+下一 render 重新取值。可选计时缓冲与必需视频/参考图的容量和确认序号隔离。
+2026-11-13 增补当前 segment 的 `model.timing.configure` 动态覆盖：原控制连接上按
+session/generation 与 timing revision 校验，三角色确认生效边界；无需为了切换当前
+会话再重启 Room。旧角色未声明能力时拒绝；新世界完整首帧仍需创建时开启。
+本次还合入 #687 的 remote conditioning prefix 聚合指标，部署同一源码可共同验证；
+独立 Encoder 本地 Qwen 已补入 SessionPrefixConditioner 与认证 metrics，仍须确认实际 conditioning 拓扑与采集绑定。
+该新增控制需要 Room、Encoder、DiT、Decoder 配套升级，目前未部署；动态切换瞬间的
+调度开销、480/736 三角色耗时/显存、SP/NCCL 和真实模型效果尚未实测。详见同一设计文档。
+复用已有上海、泰国和副本 Grafana 看板的 region/pool/service 标签，不另建看板。
+实际请求方式、分时口径、查询和验证状态见上述方案；历史版本 CPU 结果不替代新版本验证。
+
+已有候选的上海副本试玩见本页 2026-11-12 A/B 条目；本轮动态控制尚未部署。
+详细计时 on/off 与 prompt-joint on/off 必须分组做同条件 A/B；
+H100/H200/B300、480/736 三角色耗时/显存、CUDA Graph/SP、观测开销和线上采集均未验收。
+
+## 分离式 Prompt 联合执行候选（2026-11-11）
+
+基于 main `2200bb3f` 补齐独立 DiT 的 prompt-joint 参数与生产切换屏障。
+独立 DiT 显式 `--zing-source-prompt-joint` / `--no-zing-source-prompt-joint` 优先于
+`SGLANG_ZING_SOURCE_PROMPT_JOINT`，未配置保持 false。Room/Encoder 须支持新的
+`source_ready` 协商，才能在 KV 尚待新 source 时恢复供帧；旧端保持串行 `kv_ready`。
+配置开启不等于联合命中，需核对 `forward_counts.prompt_joint` 与回退证据。
+本候选尚未部署，H100/H200/B300、SP/CUDA Graph、480/736 的 TTFF、三角色耗时和
+常驻/峰值显存均未测；不得套用旧离线加速比。部署前按同条件 baseline 补齐两档验收。
+[设计、兼容性与当前验证](plans/serving-ttff-breakdown.md)。
+
 
 ## 独立 Worker 启动预热（2026-11-11，Encoder / DiT SP2 / Decoder 启动验证通过）
 
@@ -290,6 +326,13 @@ Room 与 split Encoder 成对升级，使用 `clip-barrier-v2`。在完整旧 cl
 
 Split 段使用上述周期配置。旧 `condition-refresh.json` 的秒数配置继续用于 v1 路径。
 480／736 的 GPU 时序、画质和分角色显存待实测。
+
+双端协商切换协议后，Encoder 还可在等待源帧、没有现成源组或续算工作时，以原会话的控制 RPC
+提前准备一份候选。控制 RPC 不消耗 source command index 或 max_chunks；不增加 GPU
+会话或后台 CUDA 线程。旧源仍用旧条件，原 clip 边界及候选身份相符后才消费准备结果。
+候选使用独立张量快照；拒绝、EOS 和释放保留原 active 条件与清理语义。
+这不会抢先处理已经排队的源组，但慢准备可能超过短暂缺帧窗口，需实际测量吞吐。
+
 
 ## 相同条件刷新与 GPU Prefix 复用（2026-11-06，代码候选，未部署）
 
@@ -615,7 +658,7 @@ Mooncake 由独立 Master/Store 管理共享 pinned L1；Worker 只在启动时�
   "master_http_url": "http://master:9003",
   "metadata_server": "P2PHANDSHAKE",
   "metadata_buffer_bytes": 67108864,
-  "protocol": "tcp",
+  "protocol": "rdma",
   "namespace": "zing_b0"
 }
 ```
@@ -625,7 +668,8 @@ Mooncake 由独立 Master/Store 管理共享 pinned L1；Worker 只在启动时�
 不配置持久化路径。Store 的 `global_segment_size` 为共享池预算，`local_buffer_size` 可为 0。
 设置 `MC_STORE_PIN_MEMORY_MAX_BYTES` 至少等于整池预算，并核对 Store 日志 `size=pinned`。
 GPU 指针直传要求 Store 可见 CUDA driver/device、memlock 足够；RDMA 还需设备及权限。
-客户端和 Store 的 `protocol` 同时改为 rdma，且不能残留 `MC_FORCE_TCP=1`；以实际传输日志为准。
+Store 与模型客户端共用同一配置。省略 `protocol` 时使用 RDMA；显式填写 `tcp` 会导致启动失败。清除 `MC_FORCE_TCP`（包括值为 `0` 或空字符串的情况）。保持 `MC_MS_AUTO_DISC` 未设置或为 `0`，使原生 SDK 使用指定的网卡。
+默认从当前容器的 verbs 设备中选择有 ACTIVE 端口的 HCA；也可以通过 `rdma_devices` 填写本节点的网卡名，多张用逗号分隔。上海副本已验证 `mlx5_0`；泰国按当地实际设备选择。部署验收应同时核对 Store 和客户端的 RDMA/HCA 日志，并实际恢复 GPU KV。
 
 **Mooncake 不使用 L2，不读取/写入/迁移/清理旧磁盘缓存，也没有持久化恢复。**
 L2 list/delete/clear 返回 HTTP 501；preload 只检查共享完整性；unload 删除共享条目并影响所有
@@ -2769,3 +2813,103 @@ Bearer 文件；与 render detailed_timing 独立。会话释放/失败清理与
 main f736 的原生需求消息会在下一轮scheduler提交前等待与RGB共用的发送锁；输出端又可能持锁等待异步解码，存在削弱计算/输出重叠的路径。候选将需求反馈合并为每会话最多一个待发送状态，在获得锁后取一致快照；失败或取消由生成循环收尾，不增加硬信用、不重放旧代消息。RGB只在就绪帧头/像素实际写入时持锁，解码物化和编码准备均在锁外，帧顺序与原子消息对保留。
 
 CPU阻塞回归入口为 `benchmark/whitebox/source_demand_cpu_regression.py`。候选fdb8cec2c6在完整f736依赖镜像的隔离CPU容器内525项回归通过；同一测试在未修改f736源码上复现两项发送锁阻塞超时。覆盖真实API调度、解码物化、帧头/像素原子写、反馈合并/最新快照、发送失败、取消、信用、启动/条件回执和异步VAE。先前522通过/1失败是已有清理测试夹具未实现现有is_control_work接口，修正夹具后完整通过。用户已停止新增线上试玩，未重启、部署或运行GPU基准。真实FPS、480/736效果、三角色耗时/峰值显存和浏览器呈现均尚未验证，不宣称18FPS已恢复至历史水平。
+
+
+### World-scoped three-tier cache
+
+**2026-11-15 · 上海测试 H200 SP1 · 1103 step 2000。** 在 `284c856be5` 上用相同的真实录像输入、提示词、参考图和种子对照 Dense 与 `SGLANG_ZING_SPARSE_ATTN_MODE=sparse_095`、`SGLANG_ZING_SPARSE_THREE_TIER=1`。三个世界在 832×480、1280×736 均取得配对视频，每段完整解码 136 帧。图缓存默认上限 32 时，黑湖 736 在连续第三场预热失败，重启后通过。两组都设 `SGLANG_ZING_DENOISE_CUDA_GRAPH_MAX=4` 后，736 的三世界连续复测 6/6 通过。上海行 480 的 Sparse 输出有车后暗色拖影；上海行和黑湖未采 profiler 的 480 样本中，DiT 耗时分别从 6.43、6.99 秒增至 46.62、48.31 秒。保留 Dense 默认。本轮服务端视频对照关闭了 Block0 持久化，1103 与三级缓存的在线联合验收、B300 仍待验证。[逐项数据与验证边界](https://github.com/seedleap/world-model-all-in-one/blob/main/evidence/2026-11-15-shcopy-h200-1103-sparse-quality.json)
+
+**2026-11-13 · 兼容改造初版。**
+
+The `codex/sparse-block0-mooncake-20261113` candidate based on Mooncake `002f9f0641`
+adds compressed-view/current-write and Block0 snapshot lifecycle adaptation.
+Mooncake now has a dual-format candidate: ordinary recipes retain BF16 KV;
+three-tier recipes persist the complete FP8 representation and restore it without
+requantization. Formats and SP layouts are isolated; a request writes one variant.
+Its explicit recipe requires `SGLANG_ZING_SPARSE_ATTN_MODE=sparse_095`,
+`SGLANG_ZING_SPARSE_THREE_TIER=1` and Block0 on. S0 preview pixels and shape are
+excluded from the trusted world-scoped key. This version materializes/re-packs
+one attention layer and routes each step afresh; temporary GPU memory and latency
+may increase. **Current-version H200 FPS, 480/736 quality, CUDA graph execution,
+and Encoder/DiT/Decoder latency/peak memory are unmeasured.** No production Slot
+has been changed by this development task. See the
+[adaptation contract and verification limits](specs/sparse-block0-mooncake.md).
+
+The isolated Mooncake tiered-cache branch changes S0 key equality to trusted world
+identity, introduces immutable SP artifacts and bounded GPU snapshots, and uses
+native SSD offload plus regional OSS. These changes can affect memory, latency
+and visual conditioning. Current CPU contracts are not performance or quality
+acceptance. Do not reuse historical Mooncake timing as evidence for this path.
+Configuration, completion and management contracts are in
+[Block0 tiered cache](specs/block0-tiered-cache.mdx). Baseline/candidate GPU and
+three dynamic-game browser validation remain required before release.
+
+The cache identity also includes the loaded DiT weight dtypes, resolved FP8
+layer selection/kernel coverage and sparse-attention settings. Equal BF16 KV
+dtype does not establish compatibility between BF16 and FP8 weights, or dense
+and sparse recipes. This is derived inside the server; SDK parameters are
+unchanged. SP layout remains a separate part of the identity. This additional
+recipe boundary has targeted CPU coverage; it has not yet been deployed or
+validated on GPU. Existing artifacts under the older identity are cold misses.
+
+2026-11-13 candidate `3d83b8cd` on the authorized Shanghai copy E1/SP1/D1 Slot:
+one model/API component fixture used verified Lake-town publication conditions
+and reference images, with a reference-derived test S0 (not live gameplay).
+Cold Prefill reported L1-ready in 6.18 s, released the group by 7.30 s, and
+reported L3 persistence at 58.03 s; OSS held the 2.45 GB artifact and complete
+marker. A separate session with different S0 bytes hit the same L1 key and
+returned memory-ready in 194 ms. These are single-sample component results,
+not GPU KV restoration during generation, a latency comparison, browser
+acceptance or the validation of the newer recipe fingerprint. Reproducible
+managed-pool probe: `benchmark/whitebox/check_prefill_pool.py`; exact-artifact
+native retirement for cloud-recall testing:
+`benchmark/whitebox/retire_prefill_probe_replica.py` (test cache scope only).
+
+#### PR #662 网页计时 A/B（2026-11-12，待完整验收）
+
+同一候选 Room 以 `WHITEBOX_DETAILED_TIMING=0` / `1` 分两轮部署；未传会话参数的
+网页试玩使用该默认值，显式 `detailed_timing` bool 优先。只切换 Room，三角色、模型、
+SDK 与有效联合配置保持不变。须等待当前 Room 游戏结束；保留两轮共同的基础 TTFF，
+不把未采集的详细分项当作零。当前新 H200 SP1 组三角色健康/自测/挂载通过，
+Room 完整业务、采集开销和736档仍未验证。入口：[设计与验证边界](plans/serving-ttff-breakdown.md)。
+
+### 2026-11-13：#662 独立 Encoder prefix 接线候选（未部署）
+
+独立 Encoder 可选复用本机已加载的 QwenPrefixCache，避免为当前三角色测试额外加载远端
+Qwen。`SGLANG_ZING_QWEN_PREFIX_BYTES=4294967296` 为本轮计划预算（每 service 4 GiB），
+默认 0 关闭；需按实际显存验收，不能由配置值推断命中。新管理 `/metrics` 使用专用只读
+Bearer 文件；与 render detailed_timing 独立。会话释放/失败清理与可观测口径见
+[接线设计](specs/conditioning-prefix-api.zh-CN.md#独立-encoder-接线方案2026-11-13开发中)。
+当前仅实现候选，CPU 回归进行中；GPU 480/736、完整三角色性能/显存与线上入库均未验收。
+
+
+### 2026-11-13｜PR #662 + #687 部署准备（未 GPU 验收）
+
+独立Encoder在已有Qwen模型内接入prefix，计划缓存预算4GiB；模型1027、480/SP1与联合设置保持原对照。候选 `b6d6945ee5b5` 的CPU回归97项通过，未启动GPU性能/显存对照；736未验证。FC采集代码与Grafana面板已发布，仍待测试采集角色的新只读命令授权和真实样本验收。现场Room已更新为main32d61，须保留新基线改动后接入详细计时，不能直接覆回旧Room。设计和现场边界见[conditioning prefix接线](specs/conditioning-prefix-api.zh-CN.md)。
+
+
+### 2026-11-13 共享 TTFF / prefix 测试分支（未部署）
+
+`codex/shared-test-ttff-prefix` 从 main `f27559be4994` 整合 #662/#687，保留 main 的
+逐帧时间线和模型优化。测试部署要求 Room detailed_timing 与 Encoder prefix 指标开启；
+两个计时接口独立，旧原版 A/B 数据不重标为本组合性能。`17c358c189b1` 模型 CPU 491 项、部署工具 169 项通过；Room 不变部分在 `49363d35cf4b` 153 项通过。
+480/736 GPU/显存与在线验收未完成。配置、合并边界和结果更新见
+[同一 TTFF 设计文档](plans/serving-ttff-breakdown.md#共享测试分支2026-11-13)。
+
+### 2026-11-13 综合测试分支（未完成部署验收）
+
+`codex/managed-parallel-startup-ttff-prefix` 保留5ff1065并行启动与SDK d67107d，
+整合#662/#687，补齐提前条件准备的分时回执交接。Room详细计时开启、Encoder prefix预算4GiB；
+仅test-shanghai-copy，1027/480。当前版本GPU性能、显存、736均未验证；
+状态与证据见[综合版本说明](plans/managed-ttff-prefix-integration.md)。
+
+#### 独立Encoder与Room提前准备开关（2026-11-13）
+
+Room使用`WHITEBOX_MODEL_STARTUP_PREPARE=1`时，独立Encoder必须启用
+`SGLANG_ZING_SOURCE_PREPARE=1`。否则init被拒绝并报告
+`This worker does not support early preparation.`，不能将其归因为GPU容量不足。
+原生`deploy/sglang/launch.py`默认给Encoder启用该协商能力；显式环境覆盖0仍关闭。
+此默认不触发额外预热，具体准备由请求协议驱动。CPU启动配置回归与真实平台验证
+分别记录于managed-ttff-prefix-integration.md；当前尚未完成修复后的GPU/TTFF验收。
+
+2026-11-14 共享测试组启动检查：cachetiers综合源码06d04b805c96开启source提前准备后，首source前的DiT条件确认暴露state.device未初始化缺陷；当前分支改为使用已接纳condition的实际设备完成CUDA屏障。全程两步、原checkpoint、分块与KV策略均不变。当前版本GPU首帧/切换尚未验收，不复用旧性能结论；详见[综合测试部署记录](plans/managed-ttff-prefix-integration.md)。

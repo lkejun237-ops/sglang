@@ -49,6 +49,8 @@ class SuiteRolePool:
         video_size=(832, 480),
     ):
         self.video_size = list(video_size)
+        # Keep one suite's lifecycle checks, without reusing a previous run's player.
+        self.run_id = uuid4().hex
         self.supplied_client = client
         self.control_client = None
         self.workers = workers
@@ -317,7 +319,7 @@ class SuiteRolePool:
             None,
             connect,
             config=self.config,
-            user_id="four-case-" + trace_id,
+            user_id="four-case-" + self.run_id + "-" + trace_id,
             model_revision=self.revision,
             vae_fingerprint="local",
             trace_id=trace_id,

@@ -34,6 +34,7 @@
     "reference_max_images": 21,
     "source_work_quantum": 1,
     "mem_fraction_static": 0.8,
+    "cache_backend": "local",
     "cache_host_gb": 416,
     "cache_disk_gb": 700,
     "cache_dir": "",
@@ -90,6 +91,7 @@
       "WHITEBOX_BOUND_COMPUTE": "1",
       "WHITEBOX_MODEL_STARTUP_PREPARE": "1",
       "WHITEBOX_PREFILL_ENABLED": "1",
+      "WHITEBOX_CACHE_RECORDING_ENABLED": "0",
       "WHITEBOX_CLI_RESOURCE_TRANSPORT": "auto"
     },
     "gateway": {

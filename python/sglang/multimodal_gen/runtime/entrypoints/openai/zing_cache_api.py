@@ -18,12 +18,16 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.z
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.disk_cache import (
     Block0DiskCache,
 )
+from sglang.multimodal_gen.runtime.realtime.cache_admin import (
+    router as world_cache_router,
+)
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.shared_capacity import CapacityUnavailable
 
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/zing/cache", tags=["Zing cache"])
+router.include_router(world_cache_router)
 _ID_PATTERN = "^[0-9a-f]{64}$"
 
 

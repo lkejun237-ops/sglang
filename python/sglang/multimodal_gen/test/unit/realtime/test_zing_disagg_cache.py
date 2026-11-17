@@ -7,6 +7,8 @@ from collections import deque
 from contextlib import nullcontext
 from pathlib import Path
 
+import pytest
+
 from sglang.multimodal_gen.runtime.realtime.polling_task_queue import PollingTaskQueue
 
 LINK = (
@@ -192,8 +194,10 @@ def test_encoder_cache_hit_skips_qwen_and_reference_preparation():
     assert encoder.inputs.condition_media[0]["frames"].device.type == "cpu"
 
 
+@pytest.mark.parametrize("origin_tier", ["l1_hit", "l2_hit", "l3_hit"])
 def test_encoder_prefill_uses_existing_conditioner_and_never_starts_source_vae(
     monkeypatch,
+    origin_tier,
 ):
     from types import SimpleNamespace as NS
 
@@ -219,6 +223,10 @@ def test_encoder_prefill_uses_existing_conditioner_and_never_starts_source_vae(
             cache_key = "a" * 64
             cache_hit = hit
             cache_request = {"prompt": "p"}
+            cache_lookup = {
+                "lookup": {"cache_result": origin_tier},
+                "rank_lookups": [{"cache_result": origin_tier}],
+            }
             conditioner = NS(identity_state=NS(identity="fixture"))
 
             def forward(self, batch):
@@ -235,7 +243,14 @@ def test_encoder_prefill_uses_existing_conditioner_and_never_starts_source_vae(
                 assert (arguments["inputs"] is None) is hit
                 assert arguments["game_id"] == "game"
                 calls.append(operation)
-                return {"cache_key": "a" * 64, "hit": hit, "entries": 1, "evictions": 0}
+                return {
+                    "cache_key": "a" * 64,
+                    "hit": hit,
+                    "entries": 1,
+                    "evictions": 0,
+                    "timings": {"cache_result": "l1_hit" if hit else "miss"},
+                    "rank_timings": [{"cache_result": "l1_hit" if hit else "miss"}],
+                }
 
         executor = SourceEncoderExecutor(
             NS(spatial_ratio=1), conditioning=Conditioning(), dit_link=Link()
@@ -252,6 +267,14 @@ def test_encoder_prefill_uses_existing_conditioner_and_never_starts_source_vae(
         )
         result = executor.forward([batch])
         assert result.usage["zing_prefill"]["hit"] is hit
+        assert result.usage["zing_prefill"]["cache_result"] == (
+            origin_tier if hit else "miss"
+        )
+        if hit:
+            assert (
+                result.usage["zing_prefill"]["rank_timings"][0]["cache_result"]
+                == origin_tier
+            )
         assert calls == ["prefill"] and released == [True]
         assert executor.encoder is None and executor.owner is None
 

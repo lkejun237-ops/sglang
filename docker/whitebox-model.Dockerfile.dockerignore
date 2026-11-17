@@ -7,6 +7,11 @@
 !benchmark/
 !benchmark/whitebox/
 !benchmark/whitebox/**
+!benchmark/zing_h3_causal/
+!benchmark/zing_h3_causal/check_native_cache_tiers.py
+!benchmark/zing_h3_causal/cache_validation_service.py
+!benchmark/zing_h3_causal/worker_group_master.py
+!benchmark/zing_h3_causal/check_cache_oss.py
 !docker/
 !docker/whitebox.Dockerfile
 !.whitebox-sdk/

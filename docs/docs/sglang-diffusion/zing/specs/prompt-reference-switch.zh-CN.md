@@ -603,3 +603,30 @@ RPC请求由4字节JSON长度、JSON头、8字节safetensors头长度、8字节�
 测试命令、逐文件JUnit、固定工具及初次失败/修正入口后的原始记录在 `D:/sglang317-main-merge-20261021-r1/`；最终采用独立conditioning进程与普通测试逐文件进程，未为混用测试入口产生的失败修改产品代码。
 
 环境为WSL Python3.11.15/Torch2.8.0+cpu；conditioning使用仓库专用CPU harness，采样执行真实小模型CPU算术与模拟collective，不是CUDA/NCCL验收。未新增云/GPU推理或性能测试，历史推理/性能结果不视为本轮合并提交验收。
+
+
+## 2026-11-13 split 条件准备前移与异 key 供帧（开发候选，未部署）
+
+外部仍使用同一 `prompt.update` 与既有 `source_condition_early_release` 协商，
+没有新增游戏/SDK接口。未协商、非split或非异步DiT沿原同步边界路径。
+
+- Encoder等源时若已有初始化条件、没有待执行源组/续算/EOS/Sink控制，允许一份
+  原会话内部候选准备。不是第二个Prefill会话，也不暂停共享World时钟。
+- 该控制RPC保留源命令序号和max_chunks预算；一旦选中，不带走随后到达的旧源组。
+  同一候选仅尝试一次。已有可执行源组时优先处理源，不强行抢占。
+- 提前准备冻结Prompt、完整有序参考图、event/version、source boundary和基准active
+  身份，并复制候选张量，避免后续源编码复用scratch覆盖。prepared不修改active。
+- 原边界到达后，完整命令和基准身份相同才消费候选；不匹配则丢弃并沿正常准备路径
+  重新核实。可恢复准备失败推迟到原边界反馈，不能在旧clip未完成时改变active。
+- 新候选准备完成后按原单写者FIFO提交conditioning，无论same key、L1 hit或miss，
+  均可返回source_ready；DiT仍执行真实容量/身份校验、历史重建和rank一致确认。
+- source_ready仅解除源准入；kv_ready及首个新event非空输出仍分别确认重建和生效。
+  迟到拒绝恢复旧输入及其condition identity；EOS/释放丢弃未激活候选。
+
+本候选不改变5-latent重建、3+2采样、Slot/信用预算或画质参数，不合并显式/周期
+刷新。准备成本、候选快照内存和短暂源等待窗口的取舍仍需480/736同条件GPU验证；
+CPU编排测试不能证明数值一致、FPS或可见延迟收益。本轮仅开发，不部署。
+
+候选准备的`ENCODER_CONDITION_PREPARED`日志仅记录session/generation/request/event、
+版本、原边界、Host耗时及错误码，不包含Prompt或参考图内容；Host跨度不代表CUDA
+完成时间。缓存查询的event身份来自候选，不能错误归属到仍在生成的旧条件。

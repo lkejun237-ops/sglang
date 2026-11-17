@@ -1249,11 +1249,11 @@ def test_clip_switch_finishes_old_clip_before_accepted_and_resumes_on_source_rea
     async def scenario():
         segment = object.__new__(RenderSegment)
         segment.segment_id = "segment"
-        segment.detailed_timing = False
+        segment.condition_switch_protocol = "clip-barrier-v2"
+        segment.detailed_timing = True
         segment.timing_control = TimingControl(segment)
         segment.room_timings = {}
         segment.timing_triggers = {}
-        segment.condition_switch_protocol = "clip-barrier-v2"
         segment.condition_switch = segment.pending_prompt = None
         segment.prompt_by_event = {}
         segment.active_reference_descriptors = []
@@ -1606,13 +1606,20 @@ def test_recorded_video_engine_with_source_session_prefill_and_switch(
             repeat_warm_prefill=True,
             prewarm_switch_conditions=True,
         )
-        assert res["prepare"]["f0_source_frame_index"] == 0
-        assert res["prepare"]["primary_prefill"]["cache_result"] == "miss"
-        assert res["prepare"]["primary_prefill"]["prefill_to_persisted_ms"] >= 30
+        prepared_index = res["prepare"]["f0_source_frame_index"]
+        assert res["prefill_start"]["conditioning_source_frame_index"] == prepared_index
         assert (
-            res["prepare"]["primary_prefill"]["persistence_timing_source"]
-            == "client_receipt"
+            res["prefill_start"]["conditioning_frame_sha256"]
+            == res["prepare"]["f0_source_frame_sha256"]
         )
+        assert res["start_boundary_actual"]["source_frame_index"] > prepared_index
+        assert res["prepare"]["start_boundary"] == {"mode": "next_available"}
+        assert res["source_resumed_paused_ms"] == 0
+        assert res["prepare"]["primary_prefill"]["cache_result"] == "miss"
+        # Room's online call returns at L1. No persistence observation must be
+        # fabricated from memory-ready, even when the mock supports delayed IO.
+        assert res["prepare"]["primary_prefill"]["prefill_to_persisted_ms"] is None
+        assert res["prepare"]["primary_prefill"]["persistence_timing_source"] is None
         assert res["prepare"]["warm_prefill"]["cache_result"] == "l1_hit"
         assert res["whitebox_session_ttff_ms"] > 0
         assert len(res["condition_switches"]) == 1
@@ -1624,7 +1631,7 @@ def test_recorded_video_engine_with_source_session_prefill_and_switch(
         control_actions = [
             c[0] for c in res["steady_state_flow"]["capture_control_log"]
         ]
-        assert control_actions == ["hold", "resume"]
+        assert control_actions == []
 
     asyncio.run(run())
 
@@ -2062,11 +2069,20 @@ def test_replay_explicit_synthesis_only_fills_missing_files(tmp_path):
         )
 
 
-@pytest.mark.parametrize("capability", [False, True])
-@pytest.mark.parametrize("protocol", ["clip-barrier-v1", "clip-barrier-v2"])
+@pytest.mark.parametrize(
+    "protocol,early_release,deferred,ready_states",
+    [
+        ("clip-barrier-v1", False, False, {"kv_ready"}),
+        ("clip-barrier-v1", True, False, {"source_ready", "kv_ready"}),
+        ("clip-barrier-v1", False, True, {"source_ready", "kv_ready"}),
+        ("clip-barrier-v2", False, False, {"source_ready"}),
+        ("clip-barrier-v2", False, True, {"source_ready"}),
+    ],
+)
+@pytest.mark.parametrize("state", ["source_ready", "kv_ready"])
 @pytest.mark.parametrize("event,boundary", [(7, 17), (8, 17), (7, 34)])
 def test_room_deferred_readiness_requires_capability_and_matching_switch(
-    capability, protocol, event, boundary
+    protocol, early_release, deferred, ready_states, state, event, boundary
 ):
     async def run():
         loop = asyncio.get_running_loop()
@@ -2076,23 +2092,22 @@ def test_room_deferred_readiness_requires_capability_and_matching_switch(
         segment = SimpleNamespace(
             pending_prompt={"event_id": 7},
             condition_switch_protocol=protocol,
-            deferred_kv_ready=capability,
+            condition_early_release=early_release,
+            deferred_kv_ready=deferred,
             condition_switch=switch,
         )
         owner = object.__new__(SourceSession)
         message = dict(
             type="control_ack",
             kind="prompt.update",
-            state="source_ready",
+            state=state,
             event_id=event,
             prompt_version=2,
             source_frame_index=boundary,
         )
         await owner.segment_model_control(segment, message)
         assert switch["ready"].done() is (
-            (protocol == "clip-barrier-v2" or capability)
-            and event == 7
-            and boundary == 17
+            state in ready_states and event == 7 and boundary == 17
         )
         # Readiness never consumes the pending prompt or reports it applied.
         assert segment.pending_prompt == {"event_id": 7}

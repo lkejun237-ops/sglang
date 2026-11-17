@@ -71,11 +71,19 @@ class DiTPreparation:
         if cache is None:
             return {"code": "cache_unavailable"}
         if operation == "identity":
-            return {"identity": cache.identity}
+            return {"identity": getattr(cache, "key_identity", cache.identity)}
         if operation in ("preload", "unload", "status"):
             return cache.control(ZingCacheReq(operation, **arguments), busy=busy)
         if operation == "lookup":
             key = arguments["cache_key"]
+            if arguments.get("world_id") is not None:
+                cache.bind_world(
+                    key,
+                    arguments["world_id"],
+                    s0_sha256=arguments.get("s0_sha256"),
+                    observer_token=arguments.get("cache_recording"),
+                    context=arguments.get("_trace"),
+                )
             if (
                 not isinstance(key, str)
                 or len(key) != 64
@@ -122,16 +130,26 @@ class DiTPreparation:
 
             if busy:
                 return {"code": "cache_busy"}
+            if getattr(cache, "tiers", None) is not None and not cache.tiers.l1:
+                return {"code": "cache_unavailable"}
+            if arguments.get("world_id") is not None:
+                cache.bind_world(
+                    arguments["cache_key"],
+                    arguments["world_id"],
+                    observer_token=arguments.get("cache_recording"),
+                    context=arguments.get("_trace"),
+                )
             from .block0_telemetry import Block0Telemetry
             from .preparation_cache import coordinate_validation
 
             telemetry = Block0Telemetry()
             began = time.perf_counter()
-            existing = (
-                None
-                if arguments.get("force", False)
-                else cache.lookup(arguments["cache_key"], allow_disk=True)
-            )
+            if arguments.get("force", False):
+                existing = None
+            elif arguments.get("resident_only") and cache.backend == "mooncake":
+                existing = cache.lookup(arguments["cache_key"], resident_only=True)
+            else:
+                existing = cache.lookup(arguments["cache_key"], allow_disk=True)
             lookup = (
                 {
                     "cache_result": "miss",
@@ -173,9 +191,9 @@ class DiTPreparation:
                 telemetry.skip("block0_prepare_and_l1_fill")
                 return {
                     "cache_key": existing.key,
-                    "_disk_descriptor": persistence_descriptor(cache, existing)
-                    if getattr(cache, "disk_cache", None) is not None
-                    else None,
+                    "_disk_descriptor": persistence_descriptor(
+                        cache, existing, requested=arguments.get("persist", False)
+                    ),
                     "hit": True,
                     "entries": cache.entry_count,
                     "evictions": cache.evictions,
@@ -226,9 +244,9 @@ class DiTPreparation:
             )
             return {
                 "cache_key": entry.key,
-                "_disk_descriptor": persistence_descriptor(cache, entry)
-                if getattr(cache, "disk_cache", None) is not None
-                else None,
+                "_disk_descriptor": persistence_descriptor(
+                    cache, entry, requested=arguments.get("persist", False)
+                ),
                 "hit": False,
                 "entries": cache.entry_count,
                 "evictions": cache.evictions,

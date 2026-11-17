@@ -1,4 +1,4 @@
-"""Full immutable-source CPU/Room test images; never deploys or edits containers.
+"""Full immutable-source CPU/Room/model test images; never deploys or edits containers.
 
 Input is a clean exported Git context with a per-file SHA256 manifest. Production
 builds continue to use deploy/whitebox/release.py and its main ancestry checks.
@@ -21,8 +21,11 @@ def main():
     p.add_argument("--context", required=True, type=Path)
     p.add_argument("--engine", choices=("docker", "podman"), default="podman")
     p.add_argument("--tag-prefix", required=True)
-    p.add_argument("--component", choices=("cpu", "room", "both"), default="both")
+    p.add_argument(
+        "--component", choices=("cpu", "room", "both", "model"), default="both"
+    )
     p.add_argument("--browser-mirror")
+    p.add_argument("--model-base", help="Verified dependency image pinned by sha256")
     a = p.parse_args()
     if a.browser_mirror:
         mirror = urlsplit(a.browser_mirror)
@@ -38,6 +41,10 @@ def main():
             raise ValueError(
                 "Use the verified loopback browser cache without credentials"
             )
+    if a.component == "model" and not re.fullmatch(
+        r"[^\s]+@sha256:[a-f0-9]{64}", a.model_base or ""
+    ):
+        raise ValueError("Model dependency base must be pinned by digest")
     root = a.context.resolve()
     manifest = json.loads((root / "candidate-source.json").read_text())
     for key in ("source", "sdk"):
@@ -85,9 +92,15 @@ def main():
             a.engine,
             "build",
             "--file",
-            "docker/whitebox.Dockerfile",
+            "docker/whitebox-model.Dockerfile"
+            if component == "model"
+            else "docker/whitebox.Dockerfile",
             "--target",
-            "release" if component == "cpu" else "room",
+            "model"
+            if component == "model"
+            else "release"
+            if component == "cpu"
+            else "room",
             "--tag",
             tag,
             "--build-arg",
@@ -107,6 +120,8 @@ def main():
             "--label",
             "com.seedleap.worldkit.revision=" + manifest["sdk"],
         ]
+        if component == "model":
+            command += ["--build-arg", "MODEL_BASE_IMAGE=" + a.model_base]
         if a.engine == "podman":
             command += [
                 "--layers",
@@ -133,7 +148,9 @@ def main():
             source=manifest["source"],
             sdk=manifest["sdk"],
             branch=manifest["branch"],
-            storage=inspect_local(tag, component, run=engine_run),
+            storage=inspect_local(tag, component, run=engine_run)
+            if component != "model"
+            else None,
         )
         results.append(result)
         (root / "candidate-build-results.json").write_text(

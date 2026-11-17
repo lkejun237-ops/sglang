@@ -9,6 +9,8 @@ import os
 import sys
 import threading
 import time
+from concurrent.futures import Future
+from dataclasses import replace
 from types import SimpleNamespace as NS
 
 import pytest
@@ -47,6 +49,7 @@ class MemoryStore:
         self.closed = False
         self.groups = {}
         self.fail_keys = set()
+        self.fail_suffix = None
         self.exist_queries = []
         self.before_exists = None
 
@@ -63,7 +66,9 @@ class MemoryStore:
         assert len(config.group_ids) == 1
         if self.exit_on_conditions and key.endswith(":cond"):
             os._exit(17)
-        if key in self.fail_keys:
+        if key in self.fail_keys or (
+            self.fail_suffix and key.endswith(self.fail_suffix)
+        ):
             return -100
         if key in self.objects:
             return -705
@@ -81,6 +86,9 @@ class MemoryStore:
 
     def is_exist(self, key):
         return int(key in self.objects)
+
+    def get_size(self, key):
+        return len(self.objects.get(key, b""))
 
     def batch_is_exist(self, keys):
         keys = list(keys)
@@ -133,7 +141,7 @@ class MemoryStore:
         self.closed = True
 
 
-def provider(store=None, *, rank=0, world=1, rows=13, layers=3):
+def provider(store=None, *, rank=0, world=1, rows=13, layers=3, config=None):
     store = MemoryStore() if store is None else store
     storage = [
         NS(
@@ -161,7 +169,7 @@ def provider(store=None, *, rank=0, world=1, rows=13, layers=3):
         pool,
         backend="mooncake",
         identity={"sp": {"size": world}},
-        config={},
+        config=config if config is not None else {"tiers": {"snapshot_bytes": 1 << 20}},
         rank=rank,
         world_size=world,
         client=store,
@@ -236,7 +244,7 @@ def test_optional_fill_uses_physical_slot_capacity_and_returns_acceptance():
         assert not b.can_store(16)
         assert b.fill(KEY, inputs(), "condition", None, cache, required=False)
         b.register(KEY, "game", "group")
-        assert b.finish_fill() is not None
+        assert b.finish_fill(wait=True) is not None
         assert b.select_keys("game", "group") == [KEY]
     finally:
         b.close()
@@ -293,6 +301,7 @@ def test_stage_starts_mooncake_with_real_cpu_kv_pool_without_disk(
             {
                 "master_server_address": "localhost:50051",
                 "master_http_url": "http://localhost:9003",
+                "rdma_devices": "unit-hca",
             }
         )
     )
@@ -334,7 +343,7 @@ def test_stage_starts_mooncake_with_real_cpu_kv_pool_without_disk(
         assert isinstance(stage.block0_cache, MooncakeBackend)
         assert not hasattr(stage.block0_cache, "pages")
         assert store.register_calls > 0
-        assert setup_calls[0][2:4] == (0, 64 << 20)
+        assert setup_calls[0][2:6] == (0, 64 << 20, "rdma", "unit-hca")
     finally:
         stage.block0_cache.close()
 
@@ -456,7 +465,7 @@ def test_native_group_spans_ranks_and_business_bindings():
         a.register(KEY, "game-b", "group-b")
         assert len(store.objects) == 7  # 3 layers, conditions, manifest, 2 labels
         assert set(store.groups.values()) == {a._base(KEY)}
-        assert ":g2:" in a._namespace
+        assert ":g3:" in a._namespace
     finally:
         a.close()
         b.close()
@@ -527,19 +536,17 @@ def test_partial_failure_retry_and_same_key_reuse_keep_shared_objects(failure):
     b, cache, store = provider()
     other, target, _ = provider(store)
     try:
-        failed = {
-            "layer": b._layer_keys(KEY)[1],
-            "conditions": b._cond_key(KEY),
-            "manifest": b._manifest_key(KEY),
-        }[failure]
-        store.fail_keys.add(failed)
+        failed = {"layer": ":kv:l01", "conditions": ":cond", "manifest": ":manifest"}[
+            failure
+        ]
+        store.fail_suffix = failed
         assert write(b, cache) is None
         assert store.objects  # Real partial success, rather than all writes failing.
         assert not store.get(b._manifest_key(KEY))
         assert b.lookup(KEY) is None
         assert set(store.groups.values()) == {b._base(KEY)}
         partial = dict(store.objects)
-        store.fail_keys.clear()
+        store.fail_suffix = None
         assert write(other, target) is not None
         assert all(store.objects[key] == value for key, value in partial.items())
         other.restore(target, other.lookup(KEY)).wait()
@@ -547,9 +554,9 @@ def test_partial_failure_retry_and_same_key_reuse_keep_shared_objects(failure):
         published = dict(store.objects)
         # A failed concurrent/repeated fill must not roll back another writer's
         # complete result. Every key is immutable and still belongs to its group.
-        store.fail_keys.add(failed)
+        store.fail_suffix = failed
         assert write(b, cache) is None
-        assert dict(store.objects) == published
+        assert all(store.objects[key] == value for key, value in published.items())
         assert other.lookup(KEY) is not None
     finally:
         b.close()
@@ -734,9 +741,10 @@ def test_explicit_dit_prefill_reports_unpublished_entry(monkeypatch, backend, co
     monkeypatch.setattr(dit_preparation, "fill_prepared_prefix", lambda *a, **k: None)
     monkeypatch.setattr(dit_preparation, "prepared_inputs", lambda v: NS(positive={}))
     monkeypatch.setattr(dit_preparation, "inputs_on", lambda v, device: v)
+    lookups = []
     cache = NS(
         backend=backend,
-        lookup=lambda *a, **k: None,
+        lookup=lambda key, **kwargs: lookups.append(kwargs),
         last_lookup={"cache_result": "miss", "miss_reason": "not_resident"},
     )
     transformer = NS(parameters=lambda: iter([torch.zeros(1)]))
@@ -753,12 +761,17 @@ def test_explicit_dit_prefill_reports_unpublished_entry(monkeypatch, backend, co
         "prefill",
         dict(
             cache_key=KEY,
+            resident_only=backend == "mooncake",
             inputs={},
             request={},
             source_shape=[1, 1],
         ),
         busy=False,
     ) == {"code": code}
+
+    assert lookups == (
+        [{"resident_only": True}] if backend == "mooncake" else [{"allow_disk": True}]
+    )
 
 
 def test_integrated_prefill_reports_unpublished_entry(monkeypatch, caplog):
@@ -876,3 +889,134 @@ def test_real_cpu_ranks_publish_or_exit_without_partial_manifest(tmp_path, fault
                 if child.is_alive():
                     child.terminate()
                 child.join(5)
+
+
+def test_different_world_preparations_never_mix_failed_attempt_objects():
+    first, original, store = provider()
+    second, replacement, _ = provider(store)
+    try:
+        # A partially uploaded S0 A must not donate KV to a later S0 B fill.
+        store.fail_suffix = ":cond"
+        assert write(first, original) is None
+        failed_keys = set(store.objects)
+        for k, v in replacement.prefix.layers:
+            k.fill_(71)
+            v.fill_(72)
+        store.fail_suffix = None
+        committed = write(second, replacement)
+        assert committed is not None
+        assert not failed_keys.intersection(committed.data.keys)
+        for slot in original.storage:
+            slot.k.fill_(-99)
+            slot.v.fill_(-99)
+        first.restore(original, first.lookup(KEY)).wait()
+        for slot in original.storage:
+            assert (slot.k[1:-1] == 71).all()
+            assert (slot.v[1:-1] == 72).all()
+    finally:
+        first.close()
+        second.close()
+
+
+def test_optional_writeback_does_not_block_lookup_and_owns_immutable_kv():
+    b, cache, store = provider(config={"tiers": {"snapshot_bytes": 1 << 20}})
+    entered, release = threading.Event(), threading.Event()
+
+    def delay():
+        entered.set()
+        assert release.wait(5)
+
+    store.before_write = delay
+    try:
+        assert b.fill(KEY, inputs(), "condition", None, cache, required=False)
+        assert entered.wait(2)
+        # A hot-path lookup must not wait for the blocked background Store put.
+        before = time.monotonic()
+        assert b.lookup(KEY) is None
+        assert time.monotonic() - before < 0.5
+        for slot in cache.storage:
+            slot.k.fill_(-99)
+            slot.v.fill_(-99)
+        release.set()
+        assert b.finish_fill(wait=True) is not None
+        b.restore(cache, b.lookup(KEY)).wait()
+        assert_restored(cache)
+    finally:
+        release.set()
+        b.close()
+
+
+@pytest.mark.parametrize("device", ["cuda", "mps"])
+def test_optional_fill_persists_reference_media_received_on_accelerator(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    if device == "mps" and not torch.backends.mps.is_available():
+        pytest.skip("MPS is unavailable")
+    backend, cache, _ = provider()
+    try:
+        prepared = inputs()
+        original = prepared.condition_media[0]["frames"].clone()
+        prepared.condition_media[0]["frames"] = original.to(device)
+        assert backend.fill(KEY, prepared, "condition", None, cache, required=False)
+        assert backend.finish_fill(wait=True) is not None
+        persisted = backend.lookup(KEY).inputs.condition_media[0]["frames"]
+        assert persisted.device.type == "cpu" and torch.equal(persisted, original)
+        assert prepared.condition_media[0]["frames"].device.type == device
+    finally:
+        backend.close()
+
+
+def test_optional_writeback_respects_explicit_snapshot_budget():
+    b, cache, store = provider(config={"tiers": {"snapshot_bytes": 1}})
+    try:
+        assert not b.fill(KEY, inputs(), "condition", None, cache, required=False)
+        assert not store.objects and b.pending is None
+    finally:
+        b.close()
+
+
+def test_polls_wait_for_native_promotion_receipt():
+    backend, cache, _ = provider()
+    try:
+        entry = write(backend, cache)
+        backend.tiers = replace(backend.tiers, l2=True, online_wait_ms=0)
+        future = Future()
+        backend._loads[KEY] = future
+        # The group is resident, but its original L2 retrieval is still running.
+        assert backend.lookup(KEY) is None
+        future.set_result({"source_layer": "l2", "entry": entry, "stages": {}})
+        assert backend.lookup(KEY) is not None
+        assert backend.last_lookup["cache_result"] == "l2_hit"
+        assert backend.lookup(KEY) is not None
+        assert backend.last_lookup["cache_result"] == "l1_hit"
+    finally:
+        backend.close()
+
+
+def test_disk_marker_promotes_group_before_second_descriptor_query():
+    backend, cache, _ = provider()
+    try:
+        entry = write(backend, cache)
+        result = backend._load_tiers(KEY, marker_layers={"l2"})
+        assert result["entry"].data.artifact_id == entry.data.artifact_id
+        assert result["source_layer"] == "l2"
+    finally:
+        backend.close()
+
+
+def test_disk_promotion_reads_large_members_without_using_metadata_scratch():
+    backend, cache, store = provider()
+    try:
+        entry = write(backend, cache)
+        key = entry.data.keys[0]
+        backend._metadata_bytes = len(store.objects[key]) - 1
+        # The registered read must work even when this member exceeds SDK scratch.
+        policy = replace(backend.tiers, l2=True)
+        backend.replicas.policy = policy
+        backend.replicas.layers = lambda keys: {k: {"l2"} for k in keys}
+        backend.replicas.wait = lambda keys, tier, deadline: True
+        registrations = store.register_calls
+        assert backend.replicas.promote([key], float("inf"))
+        assert store.register_calls == registrations + 1
+    finally:
+        backend.close()

@@ -24,6 +24,21 @@ sys.modules["zing_h3_sparse_attn"] = sparse_mod
 spec.loader.exec_module(sparse_mod)
 
 
+def test_native_attention_inputs_from_layer_and_parity_workspace():
+    workspace = torch.arange(2 * 3 * 4 * 6 * 8, dtype=torch.int32).reshape(
+        2, 3, 4, 6, 8
+    )
+    normalize = sparse_mod._native_attention_input
+    first = workspace[0, 0]
+    assert normalize(first) is first
+    assert normalize(None) is None
+    for view in (workspace[1, 2], workspace[1, 2, :, :3], first.transpose(1, 2)):
+        actual = normalize(view)
+        assert actual.storage_offset() == 0
+        assert actual.is_contiguous()
+        assert torch.equal(actual, view)
+
+
 def test_sparse_mode_switching_and_envs():
     """Verify mode getters/setters and environment variable synchronization."""
     orig_mode = os.environ.get("SGLANG_ZING_SPARSE_ATTN_MODE")
@@ -2183,10 +2198,10 @@ def test_compressed_kv_store_chunk_boundary_and_memory_footprint():
     store = sparse_mod.ZingCompressedKVStore(
         max_blocks=32, num_heads=H, head_dim=D, device=torch.device("cpu")
     )
-    # Verify per-block-per-head byte footprint is 18,248 B (17.82 KB vs 49,152 B raw = -62.9%)
+    # Verify per-block-per-head byte footprint is 18,245 B (17.82 KB vs 49,152 B raw = -62.9%)
     bytes_per_blk_head = store.bytes_per_block_per_head()
     raw_bytes_per_blk_head = 3 * 64 * 128 * 2  # 49,152 B
-    assert bytes_per_blk_head == 18248, f"Expected 18248 B, got {bytes_per_blk_head}"
+    assert bytes_per_blk_head == 18245, f"Expected 18245 B, got {bytes_per_blk_head}"
     reduction = 1.0 - (bytes_per_blk_head / raw_bytes_per_blk_head)
     assert reduction > 0.62, f"Expected >62% reduction, got {reduction:.4f}"
 
@@ -2649,7 +2664,7 @@ def test_frame_2d_square_partition_and_vectorized_total_variance_three_tier():
     # 3. ZingCompressedKVStore vectorized Law of Total Variance across non-64 2D partition blocks
     H, D = 4, 128
     store = sparse_mod.ZingCompressedKVStore(max_blocks=16, num_heads=H, head_dim=D)
-    assert store.bytes_per_block_per_head() == 18248
+    assert store.bytes_per_block_per_head() == 18245
     k_frame = torch.randn((390, H, D), dtype=torch.bfloat16)
     v_frame = torch.randn((390, H, D), dtype=torch.bfloat16)
     k_perm = (

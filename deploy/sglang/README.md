@@ -34,8 +34,9 @@
 
 ## 模型与资产边界
 
-角色与 site 现在可选择 `model1027` 或 `zing-h3-dmd-1102-step2000-generator`，三角色不得混用身份。
-后者对应
+上海副本测试可显式指定 `zing-h3-dmd-1103-step2000-generator`，对应 `h3-dmd-sp4-06-1103-from-1kstep/checkpoints/global_step_002000/generator`。三个角色和 site 使用同一模型身份，资产回执应来自该 checkpoint 的 serving 导出；使用 weights-free 模式时，AdaLN 表须与该导出和实际推理 schedule 匹配。
+
+此外仍支持 `model1027` 和 `zing-h3-dmd-1102-step2000-generator`。1102 对应
 `h3-dmd-sp4-05-1102-ac3d5b28/global_step_002000/generator`，非 EMA。
 原始权重：
 

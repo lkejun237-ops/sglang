@@ -62,6 +62,11 @@ def install_pool_routes(
     async def heartbeat(request: Request):
         return await handle(request, lambda b: store.heartbeat(**b), role=True)
 
+    @app.post("/v1/role-pool/operator-check")
+    async def operator_check(request: Request):
+        await payload(request, operator=True)
+        return {"pool_id": store.pool_id, "control_epoch": store.epoch}
+
     @app.post("/v1/role-pool/drain")
     async def drain(request: Request):
         return await handle(

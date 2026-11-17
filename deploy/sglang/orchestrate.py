@@ -466,6 +466,7 @@ def reused_resource(run_id, model_id, role, entry):
         service_index=entry.get("service_index", 0),
         service_count=entry.get("service_count", 1),
         pai=bool(entry.get("pai") or entry.get("job_id")),
+        **{k: entry[k] for k in ("job_id", "job_name") if k in entry},
         receipt=dict(
             schema=1,
             role=role,
@@ -592,6 +593,13 @@ def validate_spec(spec, isolated=True, launch_module=launch):
             raise ValueError(
                 "Pinned PAI existing service requires pai=true and non-empty job_id"
             )
+        if "job_id" in entry or "job_name" in entry:
+            if (
+                entry.get("pai") is not True
+                or not re.fullmatch(r"dlc[a-zA-Z0-9-]+", entry.get("job_id", ""))
+                or not re.fullmatch(r"[a-zA-Z0-9-]+", entry.get("job_name", ""))
+            ):
+                raise ValueError("PAI reuse requires a pinned job_id and job_name")
         idx = entry.get("service_index", 0)
         if (
             type(count) is not int
@@ -778,7 +786,10 @@ def _is_oss_not_found(returncode, stdout="", stderr=""):
 class Cloud:
     """Explicit target cloud adapter; all remote mutations pass through explicit calls."""
 
-    def __init__(self, timeout=1200, target=None, aliyun_profile=None):
+    def __init__(
+        self, timeout=1200, target=None, aliyun_profile=None, *, relay_vpc_http=True
+    ):
+        self.relay_vpc_http = relay_vpc_http
         self.timeout = timeout
         self.target = copy.deepcopy(target or TARGET)
         self.aliyun_profile = (
@@ -1445,7 +1456,11 @@ def http(url, payload=None, token=None, cloud=None):
         # An HTTP response proves connectivity; never replay an application rejection.
         raise
     except OSError:
-        if cloud is None or not vpc_url(url):
+        if (
+            cloud is None
+            or not getattr(cloud, "relay_vpc_http", True)
+            or not vpc_url(url)
+        ):
             raise
     # The Eflo host runs Python 3.6. Keep syntax and urllib behavior compatible,
     # and propagate HTTP application status codes (e.g. 403 on managed endpoints) cleanly.
@@ -1513,6 +1528,18 @@ def last_receipt(text, role):
                     value["gpu"] = gpu_matches[-1]
             if "gpu" not in value and isinstance(value.get("worker_config"), dict):
                 value["gpu"] = ", ".join(value["worker_config"].get("hardware_ids", []))
+            if "gpu" not in value:
+                # Unmanaged workers put GPU identity after runtime. PAI may cut
+                # a later field even though both runtime and GPU are complete.
+                try:
+                    start = candidate.index(marker) + len(',"runtime":')
+                    _, end = json.JSONDecoder().raw_decode(candidate[start:])
+                    tail = candidate[start + end :]
+                    match = re.match(r',\s*"gpu"\s*:\s*("(?:[^"\\]|\\.)*")', tail)
+                    if match:
+                        value["gpu"] = json.loads(match.group(1))
+                except ValueError:
+                    pass
         if (
             isinstance(value, dict)
             and value.get("schema") == 1
@@ -2137,11 +2164,15 @@ def wait_ready(state, directory, cloud):
                         cloud=cloud,
                     )
                     service = conn.get("service", {})
-                    if not service and resource.get("pai") and resource.get("job_id"):
+                    if not service and resource.get("pai") and pinned_job_id:
                         # Native non-reserving queries intentionally omit descriptors.
                         # Authenticate the endpoint against its pinned PAI job instead
                         # of acquiring a lease from a read-only inspection.
-                        pinned = {**resource, "name": reused_job["DisplayName"]}
+                        pinned = {
+                            **resource,
+                            "job_id": pinned_job_id,
+                            "name": pinned_job_name,
+                        }
                         verify_job(reused_job, pinned, target)
                         observed = cloud.receipt(pinned, role)
                         validate_endpoint(
@@ -2621,7 +2652,8 @@ def _preflight_or_reconcile_owned_endpoints(
     for role in owned:
         receipt = state["resources"][role]["receipt"]
         role_cfg = state["spec"]["roles"][role]
-        if set(role_cfg.get("secret_files", {})) != launch.SECRET_ENV:
+        mounted = set(role_cfg.get("secret_files", {}))
+        if not launch.ROLE_POOL_SECRETS <= mounted <= launch.SECRET_ENV:
             raise ValueError(
                 "Attach requires pre-mounted platform secret files for every role"
             )
@@ -2783,6 +2815,18 @@ def _attach_owned_endpoints_in_place(state, directory, configs, authority, cloud
         save(directory / "state.json", state)
 
 
+def require_attach_credentials(pool_id=None):
+    if "WHITEBOX_CONTROL_CREDENTIAL_REFS" in os.environ:
+        from control_bindings import verify
+
+        verify("model_publisher", {"pool_id": pool_id} if pool_id else None)
+    required = ("ROLE_POOL_SIGNING_KEY", "ROLE_POOL_OPERATOR_TOKEN")
+    if not all(os.environ.get(name, "").strip() for name in required):
+        raise ValueError(
+            "Attach verification requires local signing and operator credentials"
+        )
+
+
 def _attach_owned_in_place(state, directory, cloud):
     configs = worker_configs(state)
     for role, config in configs.items():
@@ -2790,13 +2834,7 @@ def _attach_owned_in_place(state, directory, cloud):
     owned = owned_roles(state["spec"])
     if not owned:
         return configs
-    if set(os.environ) & {"ROLE_POOL_SIGNING_KEY", "ROLE_POOL_OPERATOR_TOKEN"} != {
-        "ROLE_POOL_SIGNING_KEY",
-        "ROLE_POOL_OPERATOR_TOKEN",
-    }:
-        raise ValueError(
-            "Attach verification requires local signing and operator credentials"
-        )
+    require_attach_credentials(state.get("target", TARGET)["pool_id"])
     contracts = pool_contract()
     authority = contracts.Credentials(
         os.environ["ROLE_POOL_SIGNING_KEY"],
@@ -3107,13 +3145,7 @@ def attach(state, directory, cloud, execute=False, in_place=False):
     if not execute:
         return configs
     attach_t0 = time.monotonic()
-    if set(os.environ) & {"ROLE_POOL_SIGNING_KEY", "ROLE_POOL_OPERATOR_TOKEN"} != {
-        "ROLE_POOL_SIGNING_KEY",
-        "ROLE_POOL_OPERATOR_TOKEN",
-    }:
-        raise ValueError(
-            "Attach verification requires local signing and operator credentials"
-        )
+    require_attach_credentials(state.get("target", TARGET)["pool_id"])
     # Validate existing route and all inputs before stopping any owned resource.
     capacity = http(
         target["coordinator_url"]
@@ -3352,8 +3384,60 @@ def verify_pool(state, directory, cloud=None):
     save_history_record(state, directory)
 
 
+def _owned_process_status(target, pool, identity, token, cloud):
+    body = {k: identity[k] for k in ("process_id", "boot_epoch")}
+    result = http(
+        target["coordinator_url"] + "/v1/role-pool/process-status",
+        body,
+        token,
+        cloud=cloud,
+    )
+    process = result["process"]
+    expected = {
+        **body,
+        "pool_id": target["pool_id"],
+        "control_epoch": pool["control_epoch"],
+    }
+    if any(process["manifest"].get(k) != value for k, value in expected.items()):
+        raise ValueError("Coordinator process identity changed before stop")
+    return result
+
+
 def down(state, directory, cloud):
     target = state.get("target", TARGET)
+    attachment = state.get("attachment", {})
+    identities = attachment.get("identities", {})
+    operator_token = os.environ.get("ROLE_POOL_OPERATOR_TOKEN", "").strip()
+    # A physical stop is not recoverable through the cloud API alone once a
+    # worker is attached. Check the entire group before changing a lease or job.
+    for role, resource in state["resources"].items():
+        if resource.get("reused") is True:
+            continue
+        identity = identities.get(role)
+        if identity is None and (
+            attachment.get("endpoint_intents", {}).get(role)
+            or attachment.get("endpoint_identities", {}).get(role)
+        ):
+            raise ValueError(
+                f"Reconcile partial pool attachment for {role} before down"
+            )
+        if role in identities:
+            if not isinstance(identity, dict) or not all(
+                identity.get(key) for key in ("process_id", "boot_epoch")
+            ):
+                raise ValueError(
+                    f"Incomplete pool identity for {role}; reconcile before down"
+                )
+            if resource.get("status") == "deleted":
+                if not resource.get("retired"):
+                    raise ValueError(
+                        f"Cloud deletion for {role} has no pool retirement receipt"
+                    )
+            elif not operator_token:
+                raise ValueError(
+                    "Stopping attached roles requires pool operator credentials"
+                )
+
     # Preflight every exact identity before deleting any resource.
     for role, resource in state["resources"].items():
         if resource.get("status") == "deleted" or resource.get("reused") is True:
@@ -3370,8 +3454,20 @@ def down(state, directory, cloud):
                 pod = cloud.pod(resource)
                 if pod["metadata"]["uid"] != resource["uid"]:
                     raise ValueError("Pod UID changed; refusing deletion")
-    identities = state.get("attachment", {}).get("identities", {})
-    operator_token = os.environ.get("ROLE_POOL_OPERATOR_TOKEN", "")
+    for role, identity in identities.items():
+        resource = state["resources"][role]
+        if resource.get("status") != "deleted" and not resource.get("reused"):
+            status = _owned_process_status(
+                target, state["spec"]["pool"], identity, operator_token, cloud
+            )
+            if resource.get("status") != "stopped-unretired":
+                process = status["process"]
+                if any(process["used"].values()) or any(
+                    observation.get("owner") is not None
+                    for observation in process["observations"].values()
+                ):
+                    raise ValueError("Attached worker is in use; stop was not executed")
+
     # For reused services, never restart/drain/retire/stop; only release any lease/group owned by this run.
     for role, resource in state["resources"].items():
         if resource.get("reused") is not True:
@@ -3379,7 +3475,11 @@ def down(state, directory, cloud):
         lease = resource.get("active_lease") or state.get("active_leases", {}).get(role)
         if isinstance(lease, dict) and not resource.get("lease_released"):
             room_token = os.environ.get("WHITEBOX_ROOM_TOKEN", "")
-            if lease.get("admission_id") and lease.get("allocation_id") and room_token:
+            if lease.get("admission_id") and lease.get("allocation_id"):
+                if not room_token.strip():
+                    raise ValueError(
+                        "Releasing a Room admission requires its Room credential"
+                    )
                 http(
                     target["coordinator_url"] + "/v1/role-pool/close",
                     dict(
@@ -3406,6 +3506,8 @@ def down(state, directory, cloud):
                     operator_token,
                     cloud=cloud,
                 )
+            else:
+                raise ValueError("Cannot confirm release of the reused worker lease")
             resource["lease_released"] = True
             save(directory / "state.json", state)
     for role, resource in state["resources"].items():
@@ -3424,6 +3526,18 @@ def down(state, directory, cloud):
                     operator_token,
                     cloud=cloud,
                 )
+                deadline = time.monotonic() + cloud.timeout
+                while (
+                    _owned_process_status(
+                        target, state["spec"]["pool"], identity, operator_token, cloud
+                    ).get("safe_to_stop")
+                    is not True
+                ):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            "Native safe-to-stop receipt is still pending"
+                        )
+                    time.sleep(1)
             if is_pai:
                 stop_error = None
                 try:

@@ -1165,7 +1165,10 @@ async def run_replay_session(
                 "render.start",
                 expected_render_revision=state["render_revision"],
                 context_id=prep_done["context_id"],
-                start_boundary={"source_frame_index": prep_done["source_frame_index"]},
+                start_boundary=prep_done.get(
+                    "start_boundary",
+                    {"source_frame_index": prep_done["source_frame_index"]},
+                ),
                 prompt=case_meta["prompt"],
                 seed=int(case_meta["seed"]),
                 references=initial_refs,

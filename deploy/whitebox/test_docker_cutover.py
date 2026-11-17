@@ -69,6 +69,92 @@ def test_candidate_preserves_runtime_and_removes_only_exact_overlay(tmp_path):
     assert env["WHITEBOX_RELEASE_CONFIG_SHA256"] == "newhash"
 
 
+def gateway_prefill_fixture(tmp_path):
+    old, item = fixture()
+    old["Config"]["Env"] = [
+        value.replace("WHITEBOX_ROLE=room", "WHITEBOX_ROLE=gateway")
+        for value in old["Config"]["Env"]
+    ] + ["WHITEBOX_PREFILL_ENABLED=0", "WHITEBOX_RTC_AUTH_SECRET=" + "r" * 40]
+    item["role"] = "gateway"
+    pool = {
+        "coordinator_url": "http://10.0.1.37:18181",
+        "room_token_env": "ADAPTIVE_ROLE_POOL_ROOM_TOKEN",
+        "routes": {"model:832x480": {"profile": "480", "compatibility": "test"}},
+    }
+    values = {
+        "WHITEBOX_PREFILL_ENABLED": "1",
+        "WHITEBOX_PREFILL_REDIS_URL": "redis://default:private@127.0.0.1:6379/0",
+        "WHITEBOX_MODEL_BACKEND": "role_pool",
+        "WHITEBOX_ROLE_POOL_CONFIG": cutover.GATEWAY_PREFILL_POOL,
+        pool["room_token_env"]: "t" * 40,
+    }
+    for name, value in (("environment", values), ("pool", pool)):
+        (tmp_path / (name + ".json")).write_text(json.dumps(value))
+    env = cutover.environment(old)
+    item["gateway_prefill"] = {
+        **{
+            name + suffix: str(tmp_path / (name + ".json"))
+            if suffix == "_file"
+            else cutover.sha((tmp_path / (name + ".json")).read_bytes())
+            for name in ("environment", "pool")
+            for suffix in ("_file", "_sha256")
+        },
+        "expected_sha256": {
+            key: cutover.sha(env[key].encode()) if key in env else None
+            for key in values
+        },
+    }
+    return old, item, values
+
+
+def test_prefill_candidate_adds_only_frozen_pool_and_keeps_original(
+    tmp_path, monkeypatch
+):
+    old, item, values = gateway_prefill_fixture(tmp_path)
+    before = copy.deepcopy(old)
+    monkeypatch.setattr(cutover.os, "chown", lambda *args: None)
+    binding = cutover.prepare_room_cache_route(old, item, tmp_path, None, (0, 0))
+    assert binding["new"] and binding["old_sha256"] is None
+    body = cutover.candidate_body(old, item, str(tmp_path / "release"), "new", binding)
+    env = dict(value.split("=", 1) for value in body["Env"])
+    assert all(env[key] == value for key, value in values.items())
+    assert env["PRIVATE_TOKEN"] == "not-real" and old == before
+    assert (
+        str(tmp_path / "gateway-role-pool.private.json")
+        + ":"
+        + cutover.GATEWAY_PREFILL_POOL
+        + ":ro"
+        in body["HostConfig"]["Binds"]
+    )
+
+
+@pytest.mark.parametrize(
+    "change", ["old-env", "file", "extra-key", "missing-auth", "wrong-role"]
+)
+def test_prefill_candidate_rejects_drift_and_incomplete_authority(tmp_path, change):
+    old, item, values = gateway_prefill_fixture(tmp_path)
+    if change == "old-env":
+        old["Config"]["Env"].append("WHITEBOX_MODEL_BACKEND=unexpected")
+    elif change == "file":
+        (tmp_path / "pool.json").write_text("{}")
+    elif change == "extra-key":
+        values["PYTHONPATH"] = "/unreviewed/source"
+        (tmp_path / "environment.json").write_text(json.dumps(values))
+        item["gateway_prefill"]["environment_sha256"] = cutover.sha(
+            (tmp_path / "environment.json").read_bytes()
+        )
+    elif change == "missing-auth":
+        old["Config"]["Env"] = [
+            v
+            for v in old["Config"]["Env"]
+            if not v.startswith("WHITEBOX_RTC_AUTH_SECRET=")
+        ]
+    else:
+        item["role"] = "room"
+    with pytest.raises(ValueError):
+        cutover.gateway_prefill_environment(cutover.environment(old), item)
+
+
 def test_explicit_startup_setting_is_narrow_and_preserves_original(tmp_path):
     old, item = fixture()
     old["Config"]["Env"] += [
@@ -269,6 +355,33 @@ def test_startup_setting_migrates_legacy_compiled_only_bundle(tmp_path, monkeypa
     )
     assert result["environments"]["room"]["WHITEBOX_MODEL_STARTUP_PREPARE"] == "1"
     assert (tmp_path / "prepared.json").exists()
+
+
+def test_selection_is_consistent_in_container_and_release_bundle(tmp_path, monkeypatch):
+    monkeypatch.setattr(cutover.os, "chown", lambda *args: None)
+    fake = FakeDocker()
+    key = "WHITEBOX_PREFERRED_SERVICE_IDS"
+    value = json.dumps({"encoder": "new-encoder/0"})
+    fake.item["service_selection"] = {key: {"expected": None, "value": value}}
+    before = copy.deepcopy(fake.bundle)
+    cutover.prepare(
+        {"authorized_roles": ["room"], "containers": [fake.item]}, tmp_path, fake
+    )
+    result = json.loads((tmp_path / "room-release.private.json").read_text())
+    assert fake.bundle == before
+    assert result["policy"]["environment"]["room"][key] == value
+    assert result["environments"]["room"][key] == value
+    assert cutover.environment(fake.containers["candidate"])[key] == value
+    with pytest.raises(ValueError, match="drifted"):
+        cutover.service_selection_settings({key: "{}"}, fake.item)
+    for patch in (
+        {"PRIVATE_TOKEN": {"expected": None, "value": value}},
+        {"WHITEBOX_AVOID_SERVICE_IDS": {"expected": None, "value": value}},
+    ):
+        with pytest.raises(ValueError):
+            cutover.service_selection_settings(
+                {}, {"role": "room", "service_selection": patch}
+            )
 
 
 def test_switch_checks_idle_twice_and_stops_only_authorized_id(tmp_path, monkeypatch):
@@ -649,3 +762,189 @@ def test_real_docker_api_uses_http_client_after_http_function_definition(monkeyp
     )
     with pytest.raises(RuntimeError, match="reached-client"):
         cutover.Docker("/var/run/docker.sock").api("GET", "/containers/x/json")
+
+
+def prepared_cache_cutover(tmp_path, monkeypatch):
+    monkeypatch.setattr(cutover.os, "chown", lambda *args: None)
+    fake = FakeDocker()
+    target = "/run/whitebox/role-pool-room.json"
+    fake.old["Config"]["Env"] += [
+        "WHITEBOX_ROLE_POOL_CONFIG=" + target,
+        "WHITEBOX_OSS_PREFIX=white_box_game_record/old/",
+        'WHITEBOX_PREFERRED_SERVICE_IDS={"encoder":"previous/0"}',
+        'WHITEBOX_AVOID_SERVICE_IDS={"encoder":["other/0"]}',
+    ]
+    fake.old["HostConfig"]["Binds"].append("/private/role-pool.json:" + target + ":ro")
+    fake.route = {
+        "coordinator_url": "http://pool:18181",
+        "routes": {
+            "selected": {"profile": "480", "compatibility": "old"},
+            "legacy": {"profile": "480", "compatibility": "untouched"},
+        },
+    }
+    original_file = fake.file
+    fake.file = lambda cid, path: (
+        json.dumps(fake.route).encode() if path == target else original_file(cid, path)
+    )
+    secret = tmp_path / "recording-secret"
+    secret.write_text("test-only-cache-recording-secret-" * 2)
+    fake.item["room_cache"] = {
+        "route": "selected",
+        "expected_compatibility": "old",
+        "compatibility": "new",
+        "expected_recording_prefix": "white_box_game_record/old/",
+        "recording_prefix": "white_box_game_record/new/",
+        "recording_secret_file": str(secret),
+        "recording_secret_sha256": cutover.sha(secret.read_bytes()),
+        "expected_recording_secret_sha256": None,
+    }
+    nginx = tmp_path / "nginx.conf"
+    nginx.write_text("server {\n location /whitebox/ { proxy_pass http://room; }\n}")
+    config = {
+        "docker_socket": "/run/test.sock",
+        "authorized_roles": ["room"],
+        "containers": [fake.item],
+        "nginx": {
+            "pid_file": "/run/nginx.pid",
+            "path": str(nginx),
+            "sha256": cutover.sha(nginx.read_bytes()),
+            "marker": " location /whitebox/",
+            "paths": ["/v1/webrtc/play"],
+        },
+    }
+    cutover.prepare(config, tmp_path, fake)
+    return config, fake, nginx, secret
+
+
+def test_cache_routing_and_explicit_selection_cannot_both_own_role_hints():
+    item = {
+        "role": "room",
+        "room_cache": {"recording_prefix": "x"},
+        "service_selection": {"WHITEBOX_PREFERRED_SERVICE_IDS": {}},
+    }
+    with pytest.raises(ValueError, match="both set role hints"):
+        cutover.room_cache_environment({}, item)
+
+
+def test_cache_cutover_freezes_only_selected_route_and_preserves_rollback(
+    tmp_path, monkeypatch
+):
+    config, fake, nginx, secret = prepared_cache_cutover(tmp_path, monkeypatch)
+    assert fake.route["routes"]["selected"]["compatibility"] == "old"
+    candidate_route = json.loads((tmp_path / "room-role-pool.private.json").read_text())
+    assert candidate_route["routes"]["selected"]["compatibility"] == "new"
+    assert candidate_route["routes"]["legacy"] == fake.route["routes"]["legacy"]
+    candidate = fake.containers["candidate"]
+    env = cutover.environment(candidate)
+    assert env["WHITEBOX_CACHE_RECORDING_SECRET"] == secret.read_text()
+    assert env["WHITEBOX_OSS_PREFIX"] == "white_box_game_record/new/"
+    assert env["WHITEBOX_CACHE_RECORDING_ENABLED"] == "1"
+    assert env["WHITEBOX_PREFERRED_SERVICE_IDS"] == ""
+    assert env["WHITEBOX_AVOID_SERVICE_IDS"] == ""
+    assert env["PRIVATE_TOKEN"] == "not-real" and env["WHITEBOX_CLI_FPS"] == "36"
+    assert (
+        "/private/role-pool.json:/run/whitebox/role-pool-room.json:ro"
+        in fake.old["HostConfig"]["Binds"]
+    )
+    bundle = json.loads((tmp_path / "room-release.private.json").read_text())
+    assert "WHITEBOX_CACHE_RECORDING_SECRET" not in bundle["policy"].get(
+        "environment", {}
+    ).get("room", {})
+
+    def readiness(item, value):
+        if value.get("id") == "candidate":
+            raise ValueError("candidate failed")
+
+    with pytest.raises(ValueError, match="candidate failed"):
+        cutover.switch(
+            config,
+            tmp_path,
+            fake,
+            checker=lambda *args: None,
+            reload=lambda: None,
+            drain=lambda spec: lambda: None,
+            ready=readiness,
+        )
+    assert fake.containers[fake.item["old_id"]]["State"]["Running"]
+    assert fake.route["routes"]["selected"]["compatibility"] == "old"
+    assert "return 503" not in nginx.read_text()
+
+
+@pytest.mark.parametrize("change", ["old-route", "candidate-route", "credential"])
+def test_cache_cutover_config_drift_never_stops_old(tmp_path, monkeypatch, change):
+    config, fake, nginx, secret = prepared_cache_cutover(tmp_path, monkeypatch)
+    if change == "old-route":
+        fake.route["routes"]["selected"]["compatibility"] = "unexpected"
+    elif change == "candidate-route":
+        (tmp_path / "room-role-pool.private.json").write_text("{}")
+    else:
+        secret.write_text("rotated-without-review")
+    with pytest.raises(ValueError):
+        cutover.switch(
+            config,
+            tmp_path,
+            fake,
+            checker=lambda *args: None,
+            reload=lambda: None,
+            drain=lambda spec: lambda: None,
+            ready=lambda *args: None,
+        )
+    assert fake.events == [] and "return 503" not in nginx.read_text()
+
+
+def test_publisher_idle_uses_scoped_job_bindings(monkeypatch):
+    room_url = "http://127.0.0.1:8092/internal/worlds/runtime"
+    pool_url = "http://127.0.0.1:18081/v1/role-pool/capacity"
+    room_key = "WHITEBOX_INTERNAL_TOKEN"
+    pool_key = "ADAPTIVE_ROLE_POOL_ROOM_TOKEN"
+    spec = {
+        "credential_source": "publisher",
+        "room_status": {
+            "url": room_url,
+            "token_env": room_key,
+            "body": {"operation": "status"},
+        },
+        "role_pools": [{"url": pool_url, "token_env": pool_key}],
+        "metrics": {"url": "http://127.0.0.1:8092/metrics"},
+    }
+    replies = {
+        room_url: {"service": {"active": 0, "queued": 0, "workers": []}},
+        pool_url: {
+            "roles": {
+                "model_group": {
+                    "active_sessions": 0,
+                    "queued_sessions": 0,
+                    "waiting_sessions": 0,
+                }
+            }
+        },
+        spec["metrics"]["url"]: "\n".join(m + " 0" for m in cutover.IDLE_METRICS),
+    }
+    calls = []
+
+    def http(url, *, token, **kwargs):
+        calls.append((url, token))
+        return replies[url]
+
+    monkeypatch.setattr(cutover, "http", http)
+    monkeypatch.setenv(room_key, "fixture-room")
+    monkeypatch.setenv(room_key + "_AUDIENCE", room_url)
+    monkeypatch.setenv(pool_key + "_AUDIENCE", pool_url)
+    monkeypatch.delenv(pool_key, raising=False)
+    with pytest.raises(ValueError, match="not bound"):
+        cutover.idle({"idle": spec}, None, {})
+    monkeypatch.setenv(pool_key, "fixture-pool")
+    spec["role_pools"][0]["url"] = "http://unrelated.invalid/capacity"
+    with pytest.raises(ValueError, match="does not cover"):
+        cutover.idle({"idle": spec}, None, {})
+    spec["role_pools"][0]["url"] = pool_url
+    calls.clear()
+    cutover.idle({"idle": spec}, None, {})
+    assert calls == [
+        (room_url, "fixture-room"),
+        (pool_url, "fixture-pool"),
+        (spec["metrics"]["url"], None),
+    ]
+    replies[room_url]["service"]["active"] = 1
+    with pytest.raises(ValueError, match="Room is busy"):
+        cutover.idle({"idle": spec}, None, {})

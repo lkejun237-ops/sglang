@@ -265,6 +265,10 @@ class RenderSegment(InteractiveSession):
             and self.condition_switch_protocol != CLIP_BARRIER_V2
         ):
             raise RenderError("CAPABILITY_UNAVAILABLE")
+        self.condition_early_release = (
+            self.condition_switch_protocol == "clip-barrier-v1"
+            and ready.get("source_condition_early_release") is True
+        )
         self.deferred_kv_ready = (
             self.clip_switch and ready.get("source_condition_deferred_kv") is True
         )
@@ -627,27 +631,38 @@ class RenderSegment(InteractiveSession):
     def model_presentation_frame(self, frame, local):
         if local != 0 or not self.segment.get("context_id"):
             return frame
-        # F0 remains the actual capture used by prefill. Place its video sample
-        # near resume, one source interval before fresh F1. Do not relabel its
-        # capture time, input receipts, UI source clock or full-source recording.
-        shift = max(0, self.prefill_hold_us - self.config.spec.pts(1))
+        if self.segment.get("start_boundary") == {"mode": "next_available"}:
+            return frame
+        # Legacy exact-frame playback can start on an older snapshot. Adjust
+        # only presentation time; snapshot age is separate from a clock hold.
+        age_us = getattr(self, "prefill_snapshot_age_us", 0)
+        shift = max(0, max(self.prefill_hold_us, age_us) - self.config.spec.pts(1))
         return replace(
             frame,
             provenance={
                 **(frame.provenance or {}),
                 "model_presentation_pts_us": capture_pts(frame) + shift,
                 "prefill_hold_us": self.prefill_hold_us,
+                "prefill_snapshot_age_us": age_us,
             },
         )
 
     async def before_model_source(self, ws, frame, local):
         context_id = self.segment.get("context_id")
         if local == 0 and context_id is not None:
-            prepared = self.owner.control_prefill.resolve(context_id)
-            if frame.index != prepared[1][0].index or frame.rgb != prepared[1][0].rgb:
-                raise RenderError("PREFILL_INPUT_MISMATCH")
-            await self.owner.control_prefill.resume(context_id)
-            self.prefill_hold_us = round(self.owner.control_prefill.paused_ms * 1000)
+            prefill = self.owner.control_prefill
+            snapshot = await prefill.consume_start(
+                context_id, self.segment["start_boundary"], frame
+            )
+            self.prefill_hold_us = round(prefill.paused_ms * 1000)
+            self.prefill_snapshot_age_us = round(prefill.snapshot_age_ms * 1000)
+            self.recording.manifest["prefill_start"] = dict(
+                context_id=context_id,
+                source_mode=prefill.source_mode,
+                conditioning_source_frame_index=snapshot.index,
+                conditioning_frame_sha256=hashlib.sha256(snapshot.rgb).hexdigest(),
+                paused_ms=prefill.paused_ms,
+            )
         if getattr(self.leases, "is_startup", False) and local == 0:
             # V2's independently sized condition preview is not a video frame.
             # Bind video zero to the pinned original CLI frame instead.

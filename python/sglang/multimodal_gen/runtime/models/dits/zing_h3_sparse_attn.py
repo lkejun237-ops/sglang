@@ -23867,12 +23867,12 @@ class ZingCompressedKVStore:
         self.k_blk_scale = torch.ones((H, M), dtype=torch.float32, device=self.device)
         self.v_blk_scale = torch.ones((H, M), dtype=torch.float32, device=self.device)
 
-        # 5. Second-order moments & chunk-boundary metadata (8 B + 16 B = 24 B/blk)
+        # 5. Second-order moments and chunk-boundary metadata
         self.tau_k = torch.zeros((H, M), dtype=torch.float32, device=self.device)
         self.rho_kv = torch.zeros((H, M), dtype=torch.float32, device=self.device)
         self.block_valid_len = torch.zeros((M,), dtype=torch.int32, device=self.device)
         self.block_delta_t = torch.zeros((M,), dtype=torch.float32, device=self.device)
-        self.block_is_shifted = torch.zeros((M,), dtype=torch.int32, device=self.device)
+        self.block_is_shifted = torch.zeros((M,), dtype=torch.bool, device=self.device)
         self.block_chunk_id = torch.full(
             (M,), -999, dtype=torch.int32, device=self.device
         )
@@ -23934,7 +23934,7 @@ class ZingCompressedKVStore:
 
     @staticmethod
     def bytes_per_block_per_head() -> int:
-        """Return exact resident byte footprint per (block, head) matching allocated tensors (18,248 B = 17.82 KB)."""
+        """Return exact resident byte footprint per (block, head) matching allocated tensors (18,245 B = 17.82 KiB)."""
         return (
             8192  # k_res_fp8 [64, 128] FP8
             + 8192  # v_res_fp8 [128, 64] FP8 (V_colmajor)
@@ -23948,7 +23948,7 @@ class ZingCompressedKVStore:
             + 128  # v_blk_mean_fp8 [128, 1] FP8 (V_colmajor)
             + 8  # k_blk_scale + v_blk_scale [1] FP32 each
             + 8  # tau_k + rho_kv [1] FP32 each
-            + 16  # block_valid_len + block_delta_t + block_is_shifted + block_chunk_id [1] 4B each
+            + 13  # valid length, delta and chunk ID (4 B each), shifted flag (1 B)
         )
 
     def clear(self) -> None:
@@ -23962,6 +23962,22 @@ class ZingCompressedKVStore:
         self._router_stats["tau_k_between"].zero_()
         self._router_stats["tau_k_within"].zero_()
         self._router_stats["alpha_k"].fill_(0.5)
+
+    def retain_prefix_blocks(self, count: int) -> None:
+        """Retire dynamic blocks without requantizing the immutable prefix.
+
+        A source block can share the prefix's chunk ID, so a resident prefix
+        reset must use the boundary recorded at prefix publication, not IDs.
+        All graph-visible allocations and retained bytes keep their identity.
+        """
+        if type(count) is not int or not 0 < count <= self.num_blocks:
+            raise ValueError("Invalid compressed prefix boundary")
+        self.block_chunk_id[count:].fill_(-999)
+        self.block_valid_len[count:].zero_()
+        self.block_delta_t[count:].zero_()
+        self.block_is_shifted[count:].zero_()
+        self.num_blocks = count
+        self.window_delta_t = 0.0
 
     def compact_retained_chunks(self, valid_chunk_ids: set[int] | list[int]) -> int:
         """In-place compaction of retained blocks belonging to valid_chunk_ids.
@@ -23977,6 +23993,14 @@ class ZingCompressedKVStore:
 
         cids = self.block_chunk_id[: self.num_blocks].cpu().tolist()
         keep_blks = [b for b, cid in enumerate(cids) if cid in valid_chunk_ids]
+        return self.compact_blocks(keep_blks)
+
+    def compact_blocks(self, keep_blks: list[int]) -> int:
+        """Apply an owner-validated host compaction map, preserving allocations."""
+        if keep_blks != sorted(set(keep_blks)) or any(
+            type(b) is not int or not 0 <= b < self.num_blocks for b in keep_blks
+        ):
+            raise ValueError("Invalid compressed KV compaction map")
         K = len(keep_blks)
         if K == self.num_blocks and keep_blks == list(range(self.num_blocks)):
             return K
@@ -24057,6 +24081,8 @@ class ZingCompressedKVStore:
         *,
         chunk_id: int = 0,
         block_valid_lengths: list[int] | torch.Tensor | None = None,
+        block_start: int | None = None,
+        publish: bool = True,
     ) -> tuple[int, int]:
         """Vectorized append of one chunk [L_chunk, H, D] aligned to fresh block boundary [b_start, b_end).
 
@@ -24087,7 +24113,9 @@ class ZingCompressedKVStore:
             if n_blks == 0:
                 return self.num_blocks, self.num_blocks
 
-        b_start = self.num_blocks
+        b_start = self.num_blocks if block_start is None else block_start
+        if type(b_start) is not int or b_start < 0:
+            raise ValueError("Invalid compressed KV write offset")
         b_end = b_start + n_blks
         if b_end > self.max_blocks:
             raise RuntimeError(
@@ -24095,7 +24123,9 @@ class ZingCompressedKVStore:
             )
 
         self.block_valid_len[b_start:b_end] = valid_lens
-        self.block_chunk_id[b_start:b_end] = int(chunk_id)
+        self.block_chunk_id[b_start:b_end] = (
+            chunk_id if isinstance(chunk_id, torch.Tensor) else int(chunk_id)
+        )
         self.block_is_shifted[b_start:b_end] = 0
         self.block_delta_t[b_start:b_end] = 0.0
 
@@ -24197,7 +24227,8 @@ class ZingCompressedKVStore:
         self._router_stats["tau_k_within"][:, b_start:b_end] = tk_within
         self._router_stats["alpha_k"][:, b_start:b_end] = alpha_blk
 
-        self.num_blocks = b_end
+        if publish:
+            self.num_blocks = b_end
         return b_start, b_end
 
     def apply_window_shift(
@@ -25700,6 +25731,16 @@ def _three_tier_compressed_sdpa_reference(
     return out.to(q.dtype)
 
 
+def _native_attention_input(tensor: torch.Tensor | None) -> torch.Tensor | None:
+    """The native kernel requires contiguous inputs starting at storage offset zero."""
+    if tensor is None:
+        return None
+    # A contiguous slice of a layer or parity slot can still have a nonzero offset.
+    if tensor.storage_offset() != 0:
+        return tensor.clone(memory_format=torch.contiguous_format)
+    return tensor.contiguous()
+
+
 def launch_zing_block_sparse_attn(
     q: torch.Tensor,
     k: torch.Tensor | None,
@@ -25725,6 +25766,7 @@ def launch_zing_block_sparse_attn(
     q_win: torch.Tensor | None = None,
     enable_three_tier: bool = False,
     block_valid_len: torch.Tensor | None = None,
+    require_native_compressed: bool = False,
 ) -> torch.Tensor:
     """Launch _zing_block_sparse_attn_fwd_kernel on [L_q, H, D] tensors (or CPU reference)."""
     if (
@@ -25776,23 +25818,11 @@ def launch_zing_block_sparse_attn(
                     if "v_scale" not in ckv_arg and "v_res_scale" in ckv_arg:
                         ckv_arg["v_scale"] = ckv_arg["v_res_scale"]
 
-                if q is not None and getattr(q, "storage_offset", lambda: 0)() != 0:
-                    q = q.clone()
-                if k is not None and getattr(k, "storage_offset", lambda: 0)() != 0:
-                    k = k.clone()
-                if v is not None and getattr(v, "storage_offset", lambda: 0)() != 0:
-                    v = v.clone()
-                if (
-                    cand_idx is not None
-                    and getattr(cand_idx, "storage_offset", lambda: 0)() != 0
-                ):
-                    cand_idx = cand_idx.clone()
-
                 return _slk_bsa(
-                    q,
-                    k,
-                    v,
-                    cand_idx=cand_idx,
+                    _native_attention_input(q),
+                    _native_attention_input(k),
+                    _native_attention_input(v),
+                    cand_idx=_native_attention_input(cand_idx),
                     exempt_start=M_cand * BLOCK_SIZE,
                     total_kv_len=L_k,
                     softmax_scale=scale,
@@ -25802,14 +25832,17 @@ def launch_zing_block_sparse_attn(
                     sparse_meta=meta_branch_gpu,
                     enable_virtual_mean=enable_virtual_mean,
                     compressed_kv=ckv_arg,
-                    skim_idx=skim_idx,
-                    num_skim=skim_cnt,
+                    skim_idx=_native_attention_input(skim_idx),
+                    num_skim=_native_attention_input(skim_cnt),
                     enable_skim=skim_idx is not None and skim_cnt is not None,
                     block_valid_len=block_valid_len,
-                    q_win=q_win,
+                    q_win=_native_attention_input(q_win),
                 )
-            except (ImportError, TypeError):
-                pass
+            except (ImportError, TypeError) as error:
+                if require_native_compressed:
+                    raise RuntimeError(
+                        "Native compressed attention kernel is unavailable or incompatible"
+                    ) from error
         return _three_tier_compressed_sdpa_reference(
             q,
             k,
@@ -26651,6 +26684,10 @@ def fused_route_and_build_masks(
     if compressed_kv is not None:
         if k_blk_mean is None:
             k_blk_mean = compressed_kv.get("k_blk_mean")
+        if v_blk_mean is None:
+            v_blk_mean = compressed_kv.get("v_blk_mean")
+        if rho_kv is None:
+            rho_kv = compressed_kv.get("rho_kv")
         if tau_k is None:
             tau_k = compressed_kv.get("tau_k")
         if (
@@ -28914,6 +28951,11 @@ def _populate_plan_sparse_tensors(
         "sparse_num_full": num_full_cpu.to(device=dev),
     }
 
+    if getattr(kv_plan, "compressed_attention_layout", None) is not None:
+        # The v2 adapter builds a complete, rotated layer view during execution.
+        # Never expose uninitialized resident capacity as live attention rows.
+        return
+
     # Ensure ZingCompressedKVStore instances are bound and passed to fixed_tensors per layer
     active_modes = (
         {sp.mode for sp in sparse_branches.values()} if sparse_branches else set()
@@ -29316,6 +29358,13 @@ def attach_sparse_specs_to_plan(
                 spec.companion_step0_spec = nxt
 
     kv_plan._sparse_branches = sparse_branches
+    if getattr(kv_plan, "compressed_attention_layout", None) is not None:
+        from .zing_h3_compressed_view import branch_spec
+
+        kv_plan._compressed_branch_specs = {
+            branch: branch_spec(kv_plan, spec)
+            for branch, spec in sparse_branches.items()
+        }
     _populate_plan_sparse_tensors(kv_plan, sparse_branches, plan=plan)
     return sparse_branches
 

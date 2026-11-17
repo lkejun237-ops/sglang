@@ -277,7 +277,20 @@ def test_real_streamed_video_preserves_pixels_absolute_pts_and_inputs_without_di
         ]
         for row in timing_rows:
             data.operation("inference_timing", row)
+        # The integrated deployment records cache receipts alongside the
+        # independent detailed-timing stream; neither writer may hide the other.
+        from sglang.multimodal_gen.runtime.realtime.whitebox.cache_events import PATH
+
+        cache_event = dict(
+            type="prefill.memory_ready", request_id="prefill", cache_result="l3_hit"
+        )
+        data.operation("cache_event", cache_event)
         result = data.finish("completed", manifest)
+        raw_cache = client.objects[("b", manifest["object_prefix"] + PATH)][0]
+        assert [json.loads(line) for line in raw_cache.splitlines()] == [cache_event]
+        assert (
+            result["objects"][PATH]["sha256"] == hashlib.sha256(raw_cache).hexdigest()
+        )
         raw_timings = client.objects[
             ("b", manifest["object_prefix"] + "inference-timing.jsonl")
         ][0]

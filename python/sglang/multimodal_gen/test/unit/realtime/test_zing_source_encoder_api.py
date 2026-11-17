@@ -1344,6 +1344,75 @@ def test_encoder_reference_candidates_use_original_codec_and_commit_on_output():
     assert sent[-1]["event_id"] == 8 and "inputs" not in sent[-1]
 
 
+def test_independent_encoder_world_cache_management_uses_server_configuration(
+    monkeypatch, tmp_path
+):
+    import json
+
+    from sglang.multimodal_gen.runtime import server_args
+    from sglang.multimodal_gen.runtime.entrypoints.zing_source_encoder_server import (
+        create_apps,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        encoder_worker,
+    )
+    from sglang.multimodal_gen.runtime.realtime.cache_admin import manager
+
+    path = tmp_path / "cache.json"
+    path.write_text(
+        json.dumps(
+            {
+                "tiers": {
+                    "l3": True,
+                    "bucket": "test-cache",
+                    "region": "cn-shanghai",
+                    "endpoint": "https://oss-cn-shanghai.aliyuncs.com",
+                }
+            }
+        )
+    )
+    observed = []
+
+    def args_from_kwargs(**kwargs):
+        return SimpleNamespace(realtime_session_lease_ttl_s=60, **kwargs)
+
+    monkeypatch.setattr(
+        encoder_worker,
+        "initialize_runtime_imports",
+        lambda: (
+            SimpleNamespace(
+                from_kwargs=args_from_kwargs, realtime_session_max_lifetime_s=600
+            ),
+            observed.append,
+        ),
+    )
+    apps, args = create_apps(
+        tmp_path,
+        cache_config=str(path),
+        prefix_cache_bytes=4 << 30,
+        metrics_token="separate-read-only-metrics-token",
+    )
+    monkeypatch.setattr(server_args, "get_global_server_args", lambda: observed[0])
+    owner = manager(SimpleNamespace(app=apps[0]))
+    assert owner.policy.bucket == "test-cache"
+    assert args.zing_block0_mooncake_config == str(path)
+    assert apps[0].state.conditioning_metrics is not None
+    assert (
+        apps[0].state.conditioning_metrics_token == "separate-read-only-metrics-token"
+    )
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("SGLANG_CACHE_ADMIN_TOKEN", "test-management-token-" * 3)
+    response = TestClient(apps[0]).post(
+        "/v1/zing/cache/delete-world", json={"world_id": "world-test"}
+    )
+    assert response.status_code == 403
+    assert (
+        response.json()["detail"]
+        == "Cache management authorization could not be verified"
+    )
+
+
 @pytest.mark.parametrize("service_count", [1, 2, 3])
 def test_encoder_services_load_once_and_keep_admission_and_conditions_private(
     monkeypatch, tmp_path, service_count
@@ -2182,6 +2251,43 @@ def test_standalone_prefill_reports_l2_lookup_without_claiming_gpu_restore(monke
     assert len(result["rank_timings"]) == 2
 
 
+@pytest.mark.parametrize("handoff", [None, {"dit_latents": []}])
+@pytest.mark.parametrize("reports", [[], [{"stage": "source_vae"}]])
+def test_encoder_timing_handles_prefill_without_realtime_handoff(
+    monkeypatch, handoff, reports
+):
+    from sglang.multimodal_gen.runtime.entrypoints.zing_source_encoder_server import (
+        EncoderClient,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    result = OutputBatch(usage={"zing_prefill": {"cache_key": "test"}})
+    result.realtime_handoff = None if handoff is None else dict(handoff)
+    pending = list(reports)
+
+    def drain():
+        ready = list(pending)
+        pending.clear()
+        return ready
+
+    executor = NS(
+        forward=lambda _: result,
+        timing_buffer=NS(drain=drain),
+        connection_controller=NS(
+            failed=lambda: pytest.fail("Successful prefill failed")
+        ),
+    )
+    actual = EncoderClient(executor, None)._forward([NS(extra={})])
+    assert actual is result
+    assert actual.usage == {"zing_prefill": {"cache_key": "test"}}
+    assert not pending
+    if reports:
+        assert actual.realtime_handoff == {**(handoff or {}), "timing_reports": reports}
+    else:
+        assert actual.realtime_handoff == handoff
+
+
 def test_expected_prefill_capacity_rejection_does_not_poison_encoder_group(monkeypatch):
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
@@ -2850,3 +2956,373 @@ def test_source_demand_remains_consistent_while_acceptance_write_is_blocked(
             adapter.dispose(session)
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("reports", [[], [{"role": "encoder", "prompt_version": 1}]])
+def test_prepared_response_keeps_timing_reports_on_original_session(reports):
+    import msgspec
+
+    async def run():
+        sent = []
+
+        async def send(raw):
+            sent.append(msgspec.msgpack.decode(raw))
+
+        result = NS(
+            usage={"zing_startup_ready": {"type": "source.prepared", "identity": "p"}},
+            realtime_handoff={"timing_reports": reports},
+        )
+        await ZingEncoderDiTAdapter()._send_connected_output(
+            NS(send_bytes=send),
+            NS(id="session", generation_id="generation"),
+            result,
+            None,
+        )
+        assert len(sent) == 1 and sent[0]["type"] == "source.prepared"
+        assert sent[0].get("timing_reports", []) == [
+            dict(model_session_id="session", generation_id="generation", timing=r)
+            for r in reports
+        ]
+
+    asyncio.run(run())
+
+
+def _prepared_condition_case(
+    monkeypatch, *, hit=False, fail=False, with_reference=False
+):
+    """Real Encoder owner and source buffer; controlled model work/DiT peer."""
+    from dataclasses import replace
+
+    from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3 import (
+        prompt_update,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.dit_preparation import (
+        prepared_message,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.packing import (
+        H3InferenceInputs,
+    )
+
+    worker, encodes = executor()
+    initial = H3InferenceInputs(
+        "video",
+        [],
+        [],
+        {"context": torch.ones(2, 3)},
+        {},
+        {},
+        None,
+        (5, 1, 1),
+        None,
+        17,
+        None,
+        24000,
+    )
+    scratch = {"context": torch.full((2, 3), 2.0)}
+    candidate = replace(initial, positive=scratch)
+    if with_reference:
+        candidate.visual = {"new-ref": torch.full((1, 2, 1, 1, 1), 3.0)}
+        candidate.condition_media = [
+            {"type": "image", "frames": torch.ones(3, 1, 1, 1)}
+        ]
+        candidate.media = [{"id": "new-ref", "type": "image"}]
+        candidate.conditions = [{"content_id": "new-ref", "role": "reference"}]
+    worker.codecs.prepare = lambda *_, **__: initial
+    worker.codecs.encode_condition = lambda *_: pytest.fail("Unexpected Qwen call")
+    worker.codecs.modules = {"video_vae": torch.nn.Linear(1, 1)}
+    worker.conditioning = EncoderConditioning(worker.codecs, encode_tensor=lambda t: t)
+    worker.conditioning.cache_query = worker._cache_query
+    prepared, lookups, messages, replies = [], [], [], []
+    lookup_events = []
+
+    def prepare_update(_, active, prompt, *args, **kwargs):
+        assert active is worker.conditioning.inputs
+        prepared.append(prompt)
+        if fail:
+            raise ConditionError("CONDITION_INVALID", "Candidate exceeds capacity")
+        return scratch, candidate
+
+    monkeypatch.setattr(prompt_update, "prepare_prompt_update", prepare_update)
+
+    class Link:
+        async_inputs = True
+
+        def cache_control(self, operation, **fields):
+            if operation == "identity":
+                return {"identity": {"model": "test"}}
+            assert operation == "lookup"
+            lookups.append(fields["cache_key"])
+            lookup_events.append(fields["_trace"].get("event_id"))
+            if hit and len(lookups) > 1:
+                return dict(
+                    hit=True,
+                    inputs=prepared_message(candidate),
+                    conditioning_identity="prepared-identity",
+                )
+            return {"hit": False}
+
+        def release(self, session_id):
+            assert session_id == "s"
+            messages.append(("session.cancel", {"session_id": session_id}, True))
+
+        def collect(self):
+            out = replies[:]
+            replies.clear()
+            return out
+
+        def send(self, kind, *, wait_for_boundary=True, **fields):
+            messages.append((kind, fields, wait_for_boundary))
+            if kind == "conditioning" and "source_boundary" in fields:
+                if wait_for_boundary:
+                    return [
+                        dict(
+                            type="conditioning.ready",
+                            event_id=fields["event_id"],
+                            prompt_version=fields["prompt_version"],
+                            source_frame_index=fields["source_boundary"],
+                        )
+                    ]
+            return []
+
+    worker.dit_link = Link()
+
+    command_index = 0
+
+    def dispatch(
+        index, start, count, *, prepare=None, update=None, new=False, end=False
+    ):
+        nonlocal command_index
+        req = batch(index, start, count, end=end)[0]
+        req.block_idx = command_index
+        req.extra["zing_source_command"]["config"]["fps"] = 24
+        req.extra["zing_dit_source_records"] = []
+        req.sampling_params = NS(
+            prompt=update["prompt"] if update else "new" if new else "old",
+            zing_request={"prompt": "old", "media": [], "conditions": []},
+        )
+        req.realtime_event_id = 5 if update or new else None
+        req.realtime_prompt_version = 2 if update or new else 1
+        if prepare:
+            req.extra["zing_prompt_prepare"] = prepare
+        if update:
+            req.extra["zing_prompt_update"] = update
+        result = worker.forward([req])
+        if prepare is None:
+            command_index += 1
+        assert worker.command_index == command_index
+        return result
+
+    command = dict(
+        prompt="new", event_id=5, prompt_version=2, source_boundary=34, references=[]
+    )
+    if with_reference:
+        command["references"] = [
+            dict(id="new-ref", type="image", format="png", payload=b"encoded-reference")
+        ]
+    dispatch(0, 0, 17)
+    return NS(
+        worker=worker,
+        dispatch=dispatch,
+        command=command,
+        initial=initial,
+        candidate=candidate,
+        scratch=scratch,
+        prepared=prepared,
+        lookups=lookups,
+        lookup_events=lookup_events,
+        messages=messages,
+        replies=replies,
+        encodes=encodes,
+    )
+
+
+@pytest.mark.parametrize("hit", [False, True])
+@pytest.mark.parametrize("with_reference", [False, True])
+def test_prepared_condition_keeps_old_source_epoch_and_consumes_once(
+    monkeypatch, hit, with_reference
+):
+    c = _prepared_condition_case(monkeypatch, hit=hit, with_reference=with_reference)
+    state = c.worker.conditioning
+    old_key = state.active_cache_key
+    c.dispatch(1, 17, 0, prepare=c.command)
+    assert state.inputs is c.initial and state.prompt == "old"
+    assert state.active_cache_key == state.cache_key == old_key
+    assert state.pending_inputs is None
+    assert len(c.lookups) == 2
+    assert c.lookup_events == [None, 5]
+    assert c.prepared == ([] if hit else ["new"])
+    # Simulate reusable model/transport scratch changing while old source runs.
+    c.scratch["context"].fill_(99)
+    frozen = state.prepared_condition["inputs"]
+    torch.testing.assert_close(frozen.positive["context"], torch.full((2, 3), 2.0))
+    if with_reference:
+        assert "new-ref" not in c.initial.visual
+        c.candidate.visual["new-ref"].fill_(99)
+        c.candidate.condition_media[0]["frames"].fill_(99)
+        torch.testing.assert_close(
+            frozen.visual["new-ref"], torch.full((1, 2, 1, 1, 1), 3.0)
+        )
+        torch.testing.assert_close(
+            frozen.condition_media[0]["frames"], torch.ones(3, 1, 1, 1)
+        )
+    c.dispatch(2, 17, 17)
+    assert [k for k, _, _ in c.messages] == [
+        "conditioning",
+        "source.moments",
+        "source.moments",
+    ]
+    assert state.inputs is c.initial and state.prepared_condition is not None
+    receipt = c.dispatch(3, 34, 0, update=dict(c.command, allow_early_release=True))
+    assert receipt.usage["zing_condition_source_ready"]["state"] == "source_ready"
+    assert state.active_cache_key == old_key
+    assert state.prepared_condition is None and len(c.lookups) == 2
+    assert c.messages[-1][2] is False
+    c.replies.append(
+        dict(
+            type="conditioning.ready",
+            event_id=5,
+            prompt_version=2,
+            source_frame_index=34,
+        )
+    )
+    c.dispatch(4, 34, 17, new=True, end=True)
+    assert state.inputs is frozen and state.active_cache_key == c.lookups[-1]
+    torch.testing.assert_close(
+        state.inputs.positive["context"], torch.full((2, 3), 2.0)
+    )
+    assert c.prepared == ([] if hit else ["new"])
+
+
+def test_prepared_failure_waits_for_boundary_and_preserves_active_state(monkeypatch):
+    c = _prepared_condition_case(monkeypatch, fail=True)
+    state = c.worker.conditioning
+    old_key = state.active_cache_key
+    c.dispatch(1, 17, 0, prepare=c.command)
+    assert state.prepared_condition["error_code"] == "CONDITION_INVALID"
+    assert 5 not in state.cache_candidates
+    assert state.inputs is c.initial and state.active_cache_key == old_key
+    assert len(c.messages) == 2  # No new condition or cancellation sent early.
+    c.dispatch(2, 17, 17)
+    rejected = c.dispatch(3, 34, 0, update=dict(c.command, allow_early_release=True))
+    assert rejected.conditioning_notice["event_id"] == 5
+    assert "zing_condition_source_ready" not in rejected.usage
+    assert c.prepared == ["new"]
+    assert state.prepared_condition is None
+    assert state.inputs is c.initial and state.active_cache_key == old_key
+
+
+def test_changed_candidate_does_not_consume_stale_preparation(monkeypatch):
+    c = _prepared_condition_case(monkeypatch)
+    c.dispatch(1, 17, 0, prepare=c.command)
+    c.dispatch(2, 17, 17)
+    c.dispatch(
+        3, 34, 0, update=dict(c.command, prompt="replacement", allow_early_release=True)
+    )
+    assert c.prepared == ["new", "replacement"]
+    assert len(c.lookups) == 3
+    assert c.worker.conditioning.prepared_condition is None
+
+
+@pytest.mark.parametrize("finish", ["eos", "release"])
+def test_pending_preparation_is_discarded_without_activation(monkeypatch, finish):
+    c = _prepared_condition_case(monkeypatch)
+    c.dispatch(1, 17, 0, prepare=c.command)
+    assert c.worker.conditioning.prepared_condition is not None
+    if finish == "eos":
+        c.dispatch(2, 17, 0, end=True)
+    else:
+        c.worker.forward(ReleaseRealtimeSessionReq(session_id="s"))
+    assert c.worker.conditioning.prepared_condition is None
+    assert len([m for m in c.messages if m[0] == "conditioning"]) == 1
+
+
+def test_nonnegotiated_prompt_switch_still_waits_for_dit(monkeypatch):
+    c = _prepared_condition_case(monkeypatch)
+    c.dispatch(1, 17, 17)
+    result = c.dispatch(2, 34, 0, update=c.command)
+    assert c.messages[-1][2] is True
+    assert result.usage["zing_condition_ready"]["state"] == "kv_ready"
+    assert "zing_condition_source_ready" not in result.usage
+
+
+@pytest.mark.parametrize(
+    "blocked", [None, "source", "continuation", "eos", "legacy", "sink"]
+)
+def test_split_candidate_prepare_only_uses_source_idle_window(monkeypatch, blocked):
+    from collections import deque
+
+    adapter = ZingEncoderDiTAdapter()
+    command = dict(prompt="new", event_id=5, prompt_version=2, source_boundary=34)
+    adapter._pending_prompt_command = command
+    adapter.ready = {"source_condition_early_release": blocked != "legacy"}
+    adapter._prompt_preparation_event = None
+    adapter._selected_prompt_preparation = None
+    adapter.condition_switch_protocol = "clip-barrier-v1"
+    adapter.startup_enabled = False
+    adapter.prompt_event, adapter.public_prompt_version = 1, 1
+    adapter.dispatched_source_frames = 17
+    adapter.end = {"frame_end": 17} if blocked == "eos" else None
+    adapter.end_dispatched = False
+    adapter.more_work = blocked == "continuation"
+    adapter.pending = deque([{"kind": "source"}] if blocked == "source" else [])
+    adapter.input_arranger = NS(buffered_frames=3)
+    adapter.ledger = NS(accepted_frames=20, records=[])
+    adapter._pending_sink_command = {} if blocked == "sink" else None
+    adapter._pending_sink_auto_command = None
+    assert adapter._condition_prepare_ready() is (blocked is None)
+    if blocked is not None:
+        return
+    session = GenerateSession()
+    session.request = NS(prompt="old", max_chunks=2)
+    session.next_chunk_index = session.generate_chunk_cnt = 1
+    chunk = session.new_chunk(control_only=adapter.is_control_work(session))
+    assert chunk.control_only and chunk.index == session.next_chunk_index == 1
+    inputs = adapter.sample_chunk_inputs(session, None, chunk, 17)
+    assert inputs.prompt == "old" and session.request.prompt == "old"
+    assert adapter.prompt_event == 1 and adapter.public_prompt_version == 1
+    assert adapter._pending_prompt_command is command
+    assert not adapter._condition_prepare_ready()  # At most once per candidate.
+    # Arrival races with request construction: keep the old source queued.
+    source = {"kind": "source", "identity": "old-epoch"}
+    adapter.pending.append(source)
+    assert adapter._take_source_input() == ([], None)
+    assert list(adapter.pending) == [source]
+    assert adapter.dispatched_source_frames == 17
+
+    def prepare_base(self, session, args, chunk):
+        assert self._take_source_input() == ([], None)
+        return NS(extra={})
+
+    monkeypatch.setattr(ZingSourceEncoderAdapter, "prepare_next_request", prepare_base)
+    request = adapter.prepare_next_request(session, None, chunk)
+    assert request.extra["zing_prompt_prepare"] == command
+    assert "zing_prompt_update" not in request.extra
+    assert adapter._selected_prompt_preparation is None
+    assert list(adapter.pending) == [source]
+    session.generate_chunk_completed(chunk)
+    assert not session.reached_max_chunks()
+    assert session.generate_chunk_cnt == session.next_chunk_index == 1
+    assert session.new_chunk().index == 1
+
+
+def test_late_dit_rejection_restores_active_condition_identity(monkeypatch):
+    c = _prepared_condition_case(monkeypatch, hit=True)
+    state = c.worker.conditioning
+    old_key, old_identity = (
+        state.active_cache_key,
+        state.conditioner.identity_state.identity,
+    )
+    c.dispatch(1, 17, 0, prepare=c.command)
+    c.dispatch(2, 17, 17)
+    c.dispatch(3, 34, 0, update=dict(c.command, allow_early_release=True))
+    assert state.conditioner.identity_state.identity == "prepared-identity"
+    c.replies.append(
+        dict(type="conditioning.rejected", event_id=5, code="CONDITION_INVALID")
+    )
+    result = c.dispatch(4, 34, 17, new=True, end=True)
+    assert result.conditioning_notice["event_id"] == 5
+    assert state.inputs is c.initial and state.active_cache_key == old_key
+    assert state.conditioner.identity_state.identity == old_identity
+    assert state.conditioner.identity_state.positive is c.initial.positive
+    assert state.prepared_condition is None and not state.conditioning_identities

@@ -23,9 +23,13 @@ After ending the previous model segment, send:
 }
 ```
 
-The Room acknowledges the operation, stops the dedicated CLI World's simulation clock, drains already-started captures, and captures exactly one new RGB frame. It retains that frame as this model context's F0. An `operation.result` with `state: "completed"` contains `context_id`, `source_frame_index`, `source_pts_us`, and `source_frame_sha256`; it never exports RGB to the browser.
+For a dedicated game with a Room-supplied world ID, Room takes a snapshot of the next identified frame from the player's live view. The game clock, preview, player input and source recording continue throughout preparation. The response carries `source_mode: "world_snapshot"`, the conditioning frame index, PTS and SHA256, and a recommended `start_boundary: {"mode":"next_available"}`. Keep the snapshot for the context's Prefill requests. When the model is ready, send the advertised boundary to start on fresh video in the same CLI session, epoch and media generation. The segment recording stores the conditioning snapshot and actual video start separately.
 
-The CLI's authenticated `POST /v1/sessions/{id}/capture` is an internal source-control endpoint (`action: hold|resume`, `requestId`). Shared/multiplayer views cannot pause their authoritative World through this endpoint. The same SDK clock is resumed, without replacing the World or replaying repeated still frames. Source capture, UI and full-source archive timestamps keep the real hold gap. Only the new model segment places F0 near resume on a separate `model_presentation_pts_us` timeline; its selected-source/model pair uses that same playback time. Original capture timestamps, source frame IDs, input receipts and wall latency remain intact. The hold is bounded (10-second first-capture timeout, 300-second safety release); the Room context expires at 270 seconds.
+World-scoped Mooncake keys permit reuse across different S0 pixels for the same effective conditions. The model still validates the complete cache key. Clients that need pixel-exact S0 (for example a local pixel-keyed cache) can explicitly request the original snapshot index. Pinning those bytes does not pause the world. For compatibility the dedicated client receives `prefill.source_resumed` with `paused_ms: 0` for a running-world snapshot. Snapshot age and native clock pause are recorded separately.
+
+Shared member views retain the `private_view_snapshot` contract and their exact-frame boundary. Sources without a world identity keep the dedicated `exclusive_capture_hold` contract: CLI stops the clock, drains captures and returns one exact F0 until start or cancellation. Dedicated contexts retain their 270-second deadline; shared member snapshots expire after 120 seconds. Player idle time continues while a snapshot is available. Explicit source pauses, scene transitions, parent Slot ownership, serial model children and cleanup deadlines are independent of this snapshot.
+
+For the legacy exclusive hold, the CLI's authenticated `POST /v1/sessions/{id}/capture` is an internal source-control endpoint (`action: hold|resume`, `requestId`). Shared/multiplayer views cannot pause their authoritative World through this endpoint. The same SDK clock is resumed, without replacing the World or replaying repeated still frames. Source capture, UI and full-source archive timestamps keep the real hold gap. Only the new model segment places F0 near resume on a separate `model_presentation_pts_us` timeline; its selected-source/model pair uses that same playback time. Original capture timestamps, source frame IDs, input receipts and wall latency remain intact. The hold is bounded (10-second first-capture timeout, 300-second safety release); the Room context expires at 270 seconds.
 
 The Room's ordinary 15-second media-read deadline follows capture state. A
 pending authenticated hold has a bounded acknowledgement wait; a confirmed
@@ -34,12 +38,12 @@ reads already in progress. Control connection failure still ends the read.
 After a confirmed resume, the source has a fresh 15-second frame budget.
 
 Player input inactivity starts on the first validated source frame, not source
-readiness or input received before that frame. Exclusive foreground preparation
+readiness or input received before that frame. Legacy exclusive foreground preparation
 and Prefill suspend input inactivity without releasing the player's parent Slot.
 The first `memory_ready` after verified child cleanup restores a full inactivity
 budget for the user's start command, while F0 remains held. Duplicate replies
 do not extend that budget. A cancelled/resumed source restores the budget only
-when a new source frame arrives. Shared-world snapshot Prefill neither pauses
+when a new source frame arrives. Live snapshot Prefill neither pauses
 the World nor suspends or resets input inactivity.
 
 The context deadline starts at accepted preparation and is shared by all its
@@ -74,7 +78,7 @@ Native CPU writeback buffers can remain occupied after `memory_ready`. If a late
 
 ## Start the selected condition
 
-A client may start without any Prefill, after only A is ready, or after A/B/C are ready. To use prepared F0, the original render command includes the returned context and exact boundary:
+A client may start without any Prefill, after only A is ready, or after A/B/C are ready. Use the returned context and start boundary. A dedicated game snapshot defaults to the next live frame:
 
 ```json
 {
@@ -83,15 +87,15 @@ A client may start without any Prefill, after only A is ready, or after A/B/C ar
   "source_session_id": "SOURCE", "source_epoch": "EPOCH",
   "expected_render_revision": 0,
   "context_id": "context-01",
-  "start_boundary": {"source_frame_index": 123},
+  "start_boundary": {"mode": "next_available"},
   "prompt": "Complete current condition text", "seed": 42,
   "references": [{"id": "<Picture 1>", "asset_id": "sha256:CONTENT_HASH"}]
 }
 ```
 
-The first selected RGB is exactly the pinned F0. The source resumes before subsequent input frames are required. Native lookup decides L1/L2/miss from the actual inputs, regardless of which group was prepared last. No selected Prompt is required to have been prefilled. Subsequent normal `prompt.replace` uses the same context's S0. A new scene ends the child segment and prepares a new context/F0 while retaining the parent worker reservation.
+For an exact-frame start the first selected RGB matches the snapshot. A live start takes a newer source frame. Native lookup decides L1/L2/miss from the actual inputs, regardless of which group was prepared last. No selected Prompt is required to have been prefilled. Subsequent normal `prompt.replace` uses the same context's S0. A new scene ends the child segment and prepares a new context/F0 while retaining the parent worker reservation.
 
-`render.prepare.cancel` with `context_id` cancels outstanding prefill compute, verifies cleanup, resumes the source and releases its pinned RGB. Source close performs the same cleanup. Heartbeats and cancellation do not wait behind GPU Prefill work in the connection receive loop. Normal WASD/action handling resumes with the source clock; inputs cannot mutate a held F0.
+`render.prepare.cancel` with `context_id` cancels outstanding prefill compute, verifies cleanup, resumes the source and releases its pinned RGB. Source close performs the same cleanup. Heartbeats and cancellation do not wait behind GPU Prefill work in the connection receive loop. For a live snapshot WASD/action handling continues during Prefill; subsequent inputs do not change the saved RGB.
 
 ## Acceptance and metrics
 

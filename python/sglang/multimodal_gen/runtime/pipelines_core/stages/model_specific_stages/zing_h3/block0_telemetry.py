@@ -57,6 +57,9 @@ class Block0Telemetry:
                 - self.started
             )
             * 1000,
-            "stages": {name: dict(value) for name, value in self.stages.items()},
+            "stages": {
+                **self.lookup_details.get("stages", {}),
+                **{name: dict(value) for name, value in self.stages.items()},
+            },
             "cuda_ms": dict(self.cuda),
         }

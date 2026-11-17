@@ -17,8 +17,8 @@ import socket
 import subprocess
 import time
 from pathlib import Path
-from urllib.parse import quote
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.parse import quote, urlsplit
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 IDLE_METRICS = (
     "world_recording_active_sessions",
@@ -317,7 +317,218 @@ def startup_prepare_setting(env, item):
     env[key] = change["value"]
 
 
-def candidate_body(old, item, bundle_path, digest):
+def room_cache_environment(env, item):
+    """Explicit cache rollout settings; no general environment override."""
+    require(
+        not (item.get("room_cache") and item.get("service_selection")),
+        "Room cache routing and explicit service selection both set role hints",
+    )
+    change = item.get("room_cache")
+    if change is None:
+        return {}
+    require(item["role"] == "room", "Cache settings belong to Room only")
+    require(
+        env.get("WHITEBOX_OSS_PREFIX") == change["expected_recording_prefix"],
+        "Recording prefix changed",
+    )
+    prefix = change["recording_prefix"]
+    require(
+        re.fullmatch(r"white_box_game_record/[A-Za-z0-9_/-]+", prefix)
+        and ".." not in prefix,
+        "Invalid recording prefix",
+    )
+    previous = env.get("WHITEBOX_CACHE_RECORDING_SECRET")
+    require(
+        (sha(previous.encode()) if previous is not None else None)
+        == change.get("expected_recording_secret_sha256"),
+        "Recording credential changed",
+    )
+    path = Path(change["recording_secret_file"])
+    require(path.is_absolute() and path.stat().st_size <= 4096, "Invalid secret file")
+    raw = path.read_bytes()
+    require(sha(raw) == change["recording_secret_sha256"], "Secret file changed")
+    value = raw.decode("ascii").strip()
+    require(
+        len(value) >= 32 and all(33 <= ord(char) <= 126 for char in value),
+        "Invalid recording credential",
+    )
+    require(
+        env.get("WHITEBOX_CACHE_RECORDING_ENABLED") in {None, "0", "1"},
+        "Invalid current cache recording setting",
+    )
+    return {
+        "WHITEBOX_OSS_PREFIX": prefix,
+        "WHITEBOX_CACHE_RECORDING_SECRET": value,
+        "WHITEBOX_CACHE_RECORDING_ENABLED": "1",
+        # The new compatibility selects this complete role group. Old global
+        # preferences can name a service outside it and block every admission.
+        "WHITEBOX_PREFERRED_SERVICE_IDS": "",
+        "WHITEBOX_AVOID_SERVICE_IDS": "",
+    }
+
+
+GATEWAY_PREFILL_POOL = "/run/whitebox/role-pool-prefill.json"
+
+
+def gateway_prefill_environment(env, item):
+    """Enable batch only with a frozen pool, credential and Redis binding."""
+    change = item.get("gateway_prefill")
+    if change is None:
+        return {}
+    require(item["role"] == "gateway", "Prefill settings belong to Gateway only")
+    documents = {}
+    for name in ("environment", "pool"):
+        path = Path(change[name + "_file"])
+        require(
+            path.is_absolute() and path.stat().st_size <= 1024**2,
+            "Invalid private binding",
+        )
+        raw = path.read_bytes()
+        require(sha(raw) == change[name + "_sha256"], "Private prefill binding changed")
+        documents[name] = json.loads(raw)
+    values, pool = documents["environment"], documents["pool"]
+    token = pool.get("room_token_env", "")
+    require(
+        re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}_TOKEN", token),
+        "Invalid room credential name",
+    )
+    keys = {
+        "WHITEBOX_PREFILL_ENABLED",
+        "WHITEBOX_PREFILL_REDIS_URL",
+        "WHITEBOX_MODEL_BACKEND",
+        "WHITEBOX_ROLE_POOL_CONFIG",
+        token,
+    }
+    require(
+        set(values) == keys and set(change["expected_sha256"]) == keys,
+        "Unreviewed prefill environment",
+    )
+    for key in keys:
+        previous = env.get(key)
+        require(
+            (sha(previous.encode()) if previous is not None else None)
+            == change["expected_sha256"][key],
+            "Gateway prefill environment changed",
+        )
+        require(
+            isinstance(values[key], str) and "\n" not in values[key],
+            "Invalid environment value",
+        )
+    require(
+        values["WHITEBOX_PREFILL_ENABLED"] == "1"
+        and values["WHITEBOX_MODEL_BACKEND"] == "role_pool"
+        and values["WHITEBOX_ROLE_POOL_CONFIG"] == GATEWAY_PREFILL_POOL
+        and len(values[token]) >= 32
+        and len(env.get("WHITEBOX_RTC_AUTH_SECRET", "")) >= 32,
+        "Prefill authorization or backend is incomplete",
+    )
+    redis = urlsplit(values["WHITEBOX_PREFILL_REDIS_URL"])
+    coordinator = urlsplit(pool.get("coordinator_url", ""))
+    require(
+        redis.scheme in {"redis", "rediss"}
+        and redis.hostname
+        and not redis.query
+        and not redis.fragment
+        and re.fullmatch(r"/\d+", redis.path)
+        and coordinator.scheme in {"http", "https"}
+        and coordinator.hostname
+        and coordinator.username is None
+        and coordinator.password is None
+        and isinstance(pool.get("routes"), dict)
+        and pool["routes"],
+        "Prefill result store or pool route is incomplete",
+    )
+    return values
+
+
+def prepare_room_cache_route(old, item, root, engine, owner):
+    if item.get("gateway_prefill") is not None:
+        env = environment(old)
+        gateway_prefill_environment(env, item)
+        require(
+            env.get("WHITEBOX_ROLE_POOL_CONFIG") in {None, GATEWAY_PREFILL_POOL},
+            "Existing pool path changed",
+        )
+        change = item["gateway_prefill"]
+        raw = Path(change["pool_file"]).read_bytes()
+        path = root / "gateway-role-pool.private.json"
+        write_private(path, json.loads(raw))
+        os.chown(path, *owner)
+        previous = (
+            engine.file(old["Id"], GATEWAY_PREFILL_POOL)
+            if env.get("WHITEBOX_ROLE_POOL_CONFIG")
+            else None
+        )
+        return dict(
+            target=GATEWAY_PREFILL_POOL,
+            old_sha256=sha(previous) if previous is not None else None,
+            path=str(path),
+            sha256=sha(path.read_bytes()),
+            new=previous is None,
+        )
+    change = item.get("room_cache")
+    if change is None:
+        return None
+    require(item["role"] == "room", "Cache route belongs to Room only")
+    target = environment(old)["WHITEBOX_ROLE_POOL_CONFIG"]
+    require(Path(target).is_absolute(), "Role pool config path must be absolute")
+    raw = engine.file(old["Id"], target)
+    require(len(raw) <= 1024**2, "Role pool config is too large")
+    document = json.loads(raw)
+    route = document["routes"][change["route"]]
+    require(
+        route["compatibility"] == change["expected_compatibility"],
+        "Role pool route changed",
+    )
+    require(
+        re.fullmatch(r"[A-Za-z0-9_.-]{1,256}", change["compatibility"]),
+        "Invalid candidate compatibility",
+    )
+    route["compatibility"] = change["compatibility"]
+    path = root / "room-role-pool.private.json"
+    write_private(path, document)
+    os.chown(path, *owner)
+    return dict(
+        target=target,
+        old_sha256=sha(raw),
+        path=str(path),
+        sha256=sha(path.read_bytes()),
+    )
+
+
+def service_selection_settings(env, item):
+    """Apply only reviewed Room selection hints, with an exact drift guard."""
+    changes = item.get("service_selection", {})
+    require(isinstance(changes, dict), "Invalid service selection settings")
+    for key, change in changes.items():
+        require(
+            item["role"] == "room"
+            and key in {"WHITEBOX_PREFERRED_SERVICE_IDS", "WHITEBOX_AVOID_SERVICE_IDS"}
+            and isinstance(change, dict)
+            and set(change) == {"expected", "value"},
+            "Invalid service selection setting",
+        )
+        require(env.get(key) == change["expected"], "Service selection setting drifted")
+        require(isinstance(change["value"], str), "Service selection must be JSON")
+        value = json.loads(change["value"])
+        require(isinstance(value, dict), "Service selection must be an object")
+        for role, services in value.items():
+            services = [services] if isinstance(services, str) else services
+            require(
+                role in {"encoder", "dit", "decoder"}
+                and isinstance(services, list)
+                and bool(services)
+                and all(isinstance(s, str) and bool(s) for s in services),
+                "Invalid selected service IDs",
+            )
+            if key == "WHITEBOX_AVOID_SERVICE_IDS":
+                require(
+                    isinstance(value[role], list), "Avoid service IDs must be lists"
+                )
+        env[key] = change["value"]
+
+
+def candidate_body(old, item, bundle_path, digest, config_binding=None):
     require(
         old["Id"] == item["old_id"] and old["Name"] == "/" + item["old_name"],
         "Old container identity changed",
@@ -349,6 +560,22 @@ def candidate_body(old, item, bundle_path, digest):
     found = set()
     bundle_target = environment(old)["WHITEBOX_RELEASE_BUNDLE"]
     bundle_count = 0
+    config_count = 0
+    if config_binding is not None:
+        require(
+            (
+                item.get("room_cache") is not None
+                and item["role"] == "room"
+                and config_binding["target"]
+                == environment(old)["WHITEBOX_ROLE_POOL_CONFIG"]
+            )
+            or (
+                item.get("gateway_prefill") is not None
+                and item["role"] == "gateway"
+                and config_binding["target"] == GATEWAY_PREFILL_POOL
+            ),
+            "Unreviewed config binding",
+        )
     binds = []
     for bind in host.get("Binds") or []:
         parts = bind.split(":")
@@ -377,6 +604,12 @@ def candidate_body(old, item, bundle_path, digest):
             require(len(parts) == 3 and parts[2] == "ro", "Bundle must be read-only")
             parts[0] = bundle_path
             bundle_count += 1
+        if config_binding is not None and target == config_binding["target"]:
+            require(
+                len(parts) == 3 and parts[2] == "ro", "Role config must be read-only"
+            )
+            parts[0] = config_binding["path"]
+            config_count += 1
         binds.append(":".join(parts))
     host["Binds"] = binds
     mounts = []
@@ -409,12 +642,36 @@ def candidate_body(old, item, bundle_path, digest):
             )
             mount["Source"] = bundle_path
             bundle_count += 1
+        if config_binding is not None and target == config_binding["target"]:
+            require(
+                mount.get("ReadOnly") and mount["Type"] == "bind",
+                "Role config must be read-only",
+            )
+            mount["Source"] = config_binding["path"]
+            config_count += 1
         mounts.append(mount)
     if "Mounts" in host:
         host["Mounts"] = mounts
+    if config_binding is not None and config_binding.get("new"):
+        require(config_count == 0, "Unexpected pre-existing pool mount")
+        host["Binds"].append(
+            config_binding["path"] + ":" + config_binding["target"] + ":ro"
+        )
+        config_count = 1
     require(found == expected and bundle_count == 1, "Mount inventory changed")
+    require(
+        config_count == (1 if config_binding else 0), "Config mount inventory changed"
+    )
+    require(
+        bool(config_binding)
+        == bool(item.get("room_cache") or item.get("gateway_prefill")),
+        "Cache route binding missing",
+    )
     env = environment(old)
+    env.update(room_cache_environment(env, item))
+    env.update(gateway_prefill_environment(env, item))
     startup_prepare_setting(env, item)
+    service_selection_settings(env, item)
     if item["branch"].startswith("codex/"):
         env["WHITEBOX_ALLOW_DEVELOPMENT_RELEASE"] = "1"
     env["WHITEBOX_RELEASE_CONFIG_SHA256"] = digest
@@ -457,7 +714,7 @@ def validate_metrics(text):
         )
 
 
-def http(url, *, body=None, token=None, raw=False):
+def http(url, *, body=None, token=None, raw=False, direct=False):
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = "Bearer " + token
@@ -469,23 +726,58 @@ def http(url, *, body=None, token=None, raw=False):
         def redirect_request(self, *args, **kwargs):
             return None
 
-    with build_opener(NoRedirect).open(request, timeout=15) as response:
+    opener = (
+        build_opener(ProxyHandler({}), NoRedirect)
+        if direct
+        else build_opener(NoRedirect)
+    )
+    with opener.open(request, timeout=15) as response:
         data = response.read(4 * 1024 * 1024 + 1)
     require(len(data) <= 4 * 1024 * 1024, "HTTP evidence is too large")
     return data.decode() if raw else json.loads(data)
 
 
 def idle(config, engine, snapshots):
-    def read(endpoint, raw=False):
-        token = None
-        if endpoint.get("token_env"):
-            token = environment(snapshots[endpoint["token_role"]])[
-                endpoint["token_env"]
-            ]
-        return http(endpoint["url"], body=endpoint.get("body"), token=token, raw=raw)
-
     spec = config["idle"]
-    value = read(spec["room_status"])
+    source = spec.get("credential_source", "container")
+    if "WHITEBOX_CONTROL_CREDENTIAL_REFS" in os.environ:
+        from control_bindings import verify
+
+        require(
+            source == "publisher",
+            "Managed control bindings require publisher credentials",
+        )
+        verify("route_publisher")
+    require(source in ("container", "publisher"), "Unknown idle credential source")
+
+    def read(endpoint, raw=False, publisher_env=None):
+        token = None
+        name = endpoint.get("token_env")
+        if source == "publisher":
+            require(name == publisher_env, "Unexpected publisher credential reference")
+            if name:
+                require(
+                    os.environ.get(name + "_AUDIENCE") == endpoint["url"],
+                    "Publisher credential does not cover this endpoint",
+                )
+                token = os.environ.get(name)
+                require(token and token.strip(), "Publisher credential is not bound")
+        elif name:
+            token = environment(snapshots[endpoint["token_role"]])[name]
+        return http(
+            endpoint["url"],
+            body=endpoint.get("body"),
+            token=token,
+            raw=raw,
+            direct=source == "publisher",
+        )
+
+    if source == "publisher":
+        require(
+            spec["room_status"].get("body") == {"operation": "status"},
+            "Publisher Room check requires the status operation",
+        )
+    value = read(spec["room_status"], publisher_env="WHITEBOX_INTERNAL_TOKEN")
     service = value["service"]
     require(service.get("active") == service.get("queued") == 0, "Room is busy")
     require(
@@ -499,7 +791,7 @@ def idle(config, engine, snapshots):
     )
     require(spec["role_pools"], "Role pool evidence missing")
     for endpoint in spec["role_pools"]:
-        validate_pool(read(endpoint))
+        validate_pool(read(endpoint, publisher_env="ADAPTIVE_ROLE_POOL_ROOM_TOKEN"))
     require(
         ("metrics" in spec) != ("manager_probe" in spec),
         "Exactly one recording evidence owner is required",
@@ -622,6 +914,27 @@ def nginx_drain(config):
 
 
 def validate_config(config):
+    if (
+        "control_credential_refs" in config
+        or "WHITEBOX_CONTROL_CREDENTIAL_REFS" in os.environ
+    ):
+        from control_bindings import REFS_ENV, parse_manifest, verify
+
+        require(
+            config["idle"].get("credential_source") == "publisher",
+            "Managed control bindings require the independent publisher",
+        )
+        require(
+            REFS_ENV in os.environ
+            and "control_credential_refs" in config
+            and parse_manifest(os.environ[REFS_ENV])
+            == config["idle"].get(
+                "control_credential_refs", config["control_credential_refs"]
+            ),
+            "Publisher and deployment control binding manifests differ",
+        )
+        parse_manifest(json.dumps(config["control_credential_refs"]))
+        verify("route_publisher")
     if "nginx" in config:
         require(
             Path(config["nginx"]["path"]).is_absolute()
@@ -737,6 +1050,14 @@ def prepare(config, root, engine):
         env = environment(old)
         raw_bundle = engine.file(old["Id"], env["WHITEBOX_RELEASE_BUNDLE"])
         bundle = json.loads(raw_bundle)
+        if (
+            "control_credential_refs" in bundle.get("bindings", {})
+            or "WHITEBOX_CONTROL_CREDENTIAL_REFS" in env
+        ):
+            require(
+                "control_credential_refs" in config,
+                "Existing managed bindings require a reviewed target manifest",
+            )
         bundle["policy"].update(
             source_sha=item["source"],
             sdk_sha=item["sdk"],
@@ -754,6 +1075,45 @@ def prepare(config, root, engine):
                 policy_env.setdefault(key, env[key])
             startup_prepare_setting(policy_env, item)
             startup_prepare_setting(bundle["environments"][item["role"]], item)
+        if item.get("service_selection"):
+            policy_env = (
+                bundle["policy"]
+                .setdefault("environment", {})
+                .setdefault(item["role"], {})
+            )
+            for key in item["service_selection"]:
+                if key in env:
+                    policy_env.setdefault(key, env[key])
+            service_selection_settings(policy_env, item)
+            service_selection_settings(bundle["environments"][item["role"]], item)
+        cache_env = room_cache_environment(env, item)
+        if cache_env:
+            policy_env = (
+                bundle["policy"]
+                .setdefault("environment", {})
+                .setdefault(item["role"], {})
+            )
+            for key in (
+                "WHITEBOX_OSS_PREFIX",
+                "WHITEBOX_CACHE_RECORDING_ENABLED",
+                "WHITEBOX_PREFERRED_SERVICE_IDS",
+                "WHITEBOX_AVOID_SERVICE_IDS",
+            ):
+                policy_env[key] = cache_env[key]
+            # Secrets stay in private runtime bindings, not public policy metadata.
+            bundle["environments"][item["role"]].update(cache_env)
+        prefill_env = gateway_prefill_environment(env, item)
+        if prefill_env:
+            public = (
+                bundle["policy"].setdefault("environment", {}).setdefault("gateway", {})
+            )
+            for key in (
+                "WHITEBOX_PREFILL_ENABLED",
+                "WHITEBOX_MODEL_BACKEND",
+                "WHITEBOX_ROLE_POOL_CONFIG",
+            ):
+                public[key] = prefill_env[key]
+            bundle["environments"]["gateway"].update(prefill_env)
         if item["branch"].startswith("codex/"):
             bundle["policy"].setdefault("environment", {}).setdefault(item["role"], {})[
                 "WHITEBOX_ALLOW_DEVELOPMENT_RELEASE"
@@ -761,6 +1121,14 @@ def prepare(config, root, engine):
             bundle["environments"][item["role"]][
                 "WHITEBOX_ALLOW_DEVELOPMENT_RELEASE"
             ] = "1"
+        if "control_credential_refs" in config:
+            from control_bindings import REFS_ENV
+
+            serialized = json.dumps(
+                config["control_credential_refs"], sort_keys=True, separators=(",", ":")
+            )
+            bundle["bindings"]["control_credential_refs"] = serialized
+            bundle["environments"][item["role"]][REFS_ENV] = serialized
         digest = fingerprint(
             {"policy": bundle["policy"], "bindings": bundle["bindings"]}
         )
@@ -775,7 +1143,18 @@ def prepare(config, root, engine):
             "Candidate owner proof missing",
         )
         os.chown(path, *owner)
-        body = candidate_body(old, item, str(path), digest)
+        config_binding = prepare_room_cache_route(old, item, root, engine, owner)
+        body = candidate_body(old, item, str(path), digest, config_binding)
+        if "control_credential_refs" in config:
+            body["Env"] = [v for v in body["Env"] if not v.startswith(REFS_ENV + "=")]
+            body["Env"].append(REFS_ENV + "=" + serialized)
+            from control_bindings import verify
+
+            verify(
+                item["role"],
+                environ=dict(v.split("=", 1) for v in body["Env"]),
+                preparing=True,
+            )
         created = engine.api(
             "POST",
             "/containers/create?name=" + quote(item["candidate_name"], safe=""),
@@ -800,9 +1179,19 @@ def prepare(config, root, engine):
                 "body": body,
                 "config_sha256": digest,
                 "old_bundle_sha256": sha(raw_bundle),
+                **(
+                    {
+                        "control_binding_sha256": fingerprint(
+                            config["control_credential_refs"]
+                        )
+                    }
+                    if "control_credential_refs" in config
+                    else {}
+                ),
                 "snapshot": candidate,
                 "bundle_path": str(path),
                 "bundle_sha256": sha(path.read_bytes()),
+                "config_binding": config_binding,
             }
         )
     write_private(
@@ -825,6 +1214,12 @@ def wait_ready(item, candidate, reader=http):
                 and value["config_sha256"] == candidate["config_sha256"],
                 "Candidate runtime identity mismatch",
             )
+            if "control_binding_sha256" in candidate:
+                require(
+                    value.get("control_binding_sha256")
+                    == candidate["control_binding_sha256"],
+                    "Candidate control binding versions differ",
+                )
             require(reader(item["health_url"])["status"] == "ok", "Candidate unhealthy")
             return
         except (OSError, ValueError, KeyError):
@@ -870,6 +1265,19 @@ def switch(
             == candidate["old_bundle_sha256"],
             "Old mounted bundle changed",
         )
+        room_cache_environment(environment(old), item)
+        gateway_prefill_environment(environment(old), item)
+        binding = candidate.get("config_binding")
+        if binding is not None:
+            require(
+                (
+                    binding.get("new")
+                    or sha(engine.file(old["Id"], binding["target"]))
+                    == binding["old_sha256"]
+                )
+                and sha(Path(binding["path"]).read_bytes()) == binding["sha256"],
+                "Role pool config changed since preparation",
+            )
         current = engine.inspect(candidate["id"])
         require(
             current["State"]["Status"] == "created"

@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "role": "dit",
+  "model_id": "zing-h3-dmd-1102-step2000-generator",
+  "model": "/REQUIRES_VERIFIED_SHANGHAI_ASSETS/model",
+  "asset_receipt": "/REQUIRES_VERIFIED_SHANGHAI_ASSETS/assets.json",
+  "asset_receipt_sha256": "REQUIRES_VERIFIED_ASSET_RECEIPT_SHA256",
+  "pipeline": "/REQUIRES_VERIFIED_SHANGHAI_ASSETS/dit-pipeline.json",
+  "profile": "auto",
+  "resolution": "480",
+  "service_count": 1,
+  "environment": {
+    "OMP_NUM_THREADS": "1",
+    "SGLANG_ZING_SPARSE_ATTN_MODE": "sparse_095",
+    "SGLANG_ZING_SPARSE_THREE_TIER": "1"
+  },
+  "startup_timeout": 900,
+  "ports": {
+    "port": 34000,
+    "http_port": 33000,
+    "rendezvous_port": 35000
+  },
+  "dit_options": {
+    "zing_block0_cache_mode": "on",
+    "zing_block0_cache_backend": "mooncake",
+    "zing_block0_mooncake_config": "/REQUIRES_VERIFIED_SHANGHAI_ASSETS/cache.json"
+  }
+}

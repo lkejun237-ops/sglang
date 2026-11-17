@@ -45,3 +45,5 @@ python3 deploy/sglang/launch.py assets --config /private/deploy/dit.json
 属于其冻结源码、模型、输入和环境；不是任意新源码/1102/736/B300的统一通过证明。
 当前技能文档可用离线parser与既有合同回归验证，不需要为文档补测申请GPU或改线上服务。
 模型ready、通信组selftest、真实出帧、池注册与浏览器业务E2E各有单独结果；释放未知也不能报告验收通过。
+
+上海副本支持由获准的 RAM 用户通过 `deploy/sglang/ram_publish.py request` 发起一次已自测版本的挂载。发布作业以自己的原生身份执行，命令、权限范围和回执含义见 `deploy/sglang/ORCHESTRATION.md` 的“上海测试池由 RAM 用户发起挂载”。自测、挂载及玩家出帧分别核验。

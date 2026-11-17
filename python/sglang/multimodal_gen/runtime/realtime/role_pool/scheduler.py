@@ -266,14 +266,21 @@ class GroupController:
         results = await asyncio.gather(
             *(self.rpc(a, r, "renew", timeout=5) for r in ROLES), return_exceptions=True
         )
-        if any(
-            isinstance(v, BaseException) or v.get("state") != "connected"
-            for v in results
-        ):
+        failures = {
+            role: {"code": getattr(value, "code", type(value).__name__)}
+            if isinstance(value, BaseException)
+            else {"state": value.get("state")}
+            for role, value in zip(ROLES, results)
+            if isinstance(value, BaseException) or value.get("state") != "connected"
+        }
+        if failures:
             await self.store.update(
                 admission_id,
                 allocation_id,
-                lambda value: value.update(state="quarantined"),
+                lambda value: value.update(
+                    state="quarantined",
+                    renewal_failure={"at": self.clock(), "roles": failures},
+                ),
             )
             raise PoolError("GROUP_UNAVAILABLE", 503)
         return a

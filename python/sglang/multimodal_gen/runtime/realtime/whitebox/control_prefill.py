@@ -35,12 +35,17 @@ class ControlPrefill:
         self.pending_proof = None
         self.resumed = True
         self.paused_ms = 0.0
-        self.snapshot_mode = False
+        self.source_mode = "exclusive_capture_hold"
+        self.snapshot_age_ms = 0.0
         self.snapshot_after = 0
         self.snapshot_consumed = False
         self.resume_after = None
         self.recovery = None
         self.failure = None
+
+    @property
+    def snapshot_mode(self):
+        return self.source_mode != "exclusive_capture_hold"
 
     def _activity(self):
         runtime = getattr(getattr(self.owner, "host", None), "runtime", None)
@@ -109,8 +114,7 @@ class ControlPrefill:
                 header.get(key) is not None
                 for key in ("sessionId", "epoch", "mediaGeneration", "outputFrameId")
             ):
-                # This stream is the existing player's private SDK view. A
-                # fresh native frame pins F0 without stopping the shared clock.
+                # Only accept a fresh, identified frame from this source/view.
                 self.pending_proof = dict(header)
         if (
             self.pending_frame is not None
@@ -147,7 +151,7 @@ class ControlPrefill:
             return await self._prepare(command)
 
     async def _prepare(self, command):
-        """Explicit context boundary; a future real frame becomes video F0."""
+        """Capture one real conditioning frame for this preparation context."""
         state = await self.available()
         self.owner.journal.require_revision(state, command)
         inference = getattr(self.owner, "inference", None)
@@ -164,14 +168,25 @@ class ControlPrefill:
             await self.resume(self.context_id)
         self.context_id = identity(command["request_id"])
         self.first = None
-        self.snapshot_mode = bool(getattr(self.owner.engine, "shared_world", False))
+        if getattr(self.owner.engine, "shared_world", False):
+            self.source_mode = "private_view_snapshot"
+        elif (getattr(getattr(self.owner, "upstream", None), "init", None) or {}).get(
+            "world_id"
+        ):
+            # Room supplies this world identity to both Prefill and generation.
+            self.source_mode = "world_snapshot"
+        else:
+            self.source_mode = "exclusive_capture_hold"
+        self.snapshot_age_ms = 0.0
         self.snapshot_after = (
             getattr(self.owner.latest, "version", 0) if self.snapshot_mode else 0
         )
         self.snapshot_consumed = False
         self.resume_after = None
         self.recovery = None
-        self.expires = time.monotonic() + (120 if self.snapshot_mode else 270)
+        self.expires = time.monotonic() + (
+            120 if self.source_mode == "private_view_snapshot" else 270
+        )
         self.paused_ms = 0.0
         self.pending_proof = None
         self.pending_frame = asyncio.get_running_loop().create_future()
@@ -183,8 +198,7 @@ class ControlPrefill:
 
         async def pin():
             try:
-                # CLI stops its authoritative simulation clock and publishes
-                # exactly one fresh F0. It does not stream repeated still frames.
+                # Non-world sources retain the exact-F0 capture protocol.
                 if not self.snapshot_mode:
                     self.resumed = False
                     held = await self.owner.engine.capture_control(
@@ -214,9 +228,12 @@ class ControlPrefill:
                     source_frame_index=frame.index,
                     source_pts_us=capture_pts(frame),
                     source_frame_sha256=hashlib.sha256(frame.rgb).hexdigest(),
-                    source_mode="private_view_snapshot"
-                    if self.snapshot_mode
-                    else "exclusive_capture_hold",
+                    source_mode=self.source_mode,
+                    start_boundary=(
+                        {"mode": "next_available"}
+                        if self.source_mode == "world_snapshot"
+                        else {"source_frame_index": frame.index}
+                    ),
                 )
                 await self.owner.operation_message(receipt)
             except asyncio.CancelledError:
@@ -250,12 +267,25 @@ class ControlPrefill:
             if not self.snapshot_consumed and self.first is not None:
                 latest = self.owner.latest.value
                 if latest is not None:
-                    self.paused_ms = (
+                    self.snapshot_age_ms = (
                         max(0, capture_pts(latest[0]) - capture_pts(self.first[1][0]))
                         / 1000
                     )
                 self.snapshot_consumed = True
-            return  # Never send hold/resume to a shared World.
+                if self.source_mode == "world_snapshot":
+                    # Existing dedicated clients wait for this acknowledgement.
+                    # The source was live throughout; there was no clock RPC.
+                    await self.owner.outgoing.put(
+                        msgspec.msgpack.encode(
+                            dict(
+                                type="prefill.source_resumed",
+                                context_id=context_id,
+                                source_mode=self.source_mode,
+                                paused_ms=0,
+                            )
+                        )
+                    )
+            return
         if not self.resumed:
             self._pause_idle()
             after = getattr(self.owner.latest, "version", 0)
@@ -276,6 +306,58 @@ class ControlPrefill:
                 )
             )
 
+    @staticmethod
+    def _same_capture_epoch(first, frame):
+        old_proof, new_proof = first.provenance or {}, frame.provenance or {}
+        before, current = (
+            proof.get("cli_frame_header", {}) for proof in (old_proof, new_proof)
+        )
+        old_source, new_source = before.get("source", {}), current.get("source", {})
+        return (
+            all(
+                before.get(k) is not None and current.get(k) == before[k]
+                for k in ("sessionId", "epoch", "mediaGeneration")
+            )
+            and all(
+                old_source.get(k) == new_source.get(k)
+                for k in ("presentationId", "sdkEpoch")
+            )
+            and all(
+                old_proof.get(k) == new_proof.get(k)
+                for k in ("source_session_id", "source_epoch", "view_id")
+            )
+        )
+
+    def start_frame(self, context_id, boundary):
+        first = self.resolve(context_id)
+        if self.source_mode == "world_snapshot" and boundary == {
+            "mode": "next_available"
+        }:
+            return None
+        if boundary != {"source_frame_index": first[1][0].index}:
+            raise RenderError("PREFILL_INPUT_MISMATCH")
+        return first
+
+    async def consume_start(self, context_id, boundary, frame):
+        snapshot = self.resolve(context_id)[1][0]
+        if self.source_mode == "world_snapshot" and boundary == {
+            "mode": "next_available"
+        }:
+            before = (snapshot.provenance or {}).get("cli_frame_header", {})
+            current = (frame.provenance or {}).get("cli_frame_header", {})
+            if (
+                frame.index <= snapshot.index
+                or type(current.get("outputFrameId")) is not int
+                or type(before.get("outputFrameId")) is not int
+                or current["outputFrameId"] <= before["outputFrameId"]
+                or not self._same_capture_epoch(snapshot, frame)
+            ):
+                raise RenderError("SOURCE_EPOCH_MISMATCH")
+        elif frame.index != snapshot.index or frame.rgb != snapshot.rgb:
+            raise RenderError("PREFILL_INPUT_MISMATCH")
+        await self.resume(context_id)
+        return snapshot
+
     def resolve(self, context_id):
         if (
             context_id != self.context_id
@@ -283,6 +365,12 @@ class ControlPrefill:
             or time.monotonic() >= self.expires
         ):
             raise RenderError("START_SOURCE_EXPIRED")
+        if self.source_mode == "world_snapshot":
+            latest = self.owner.latest.value
+            if latest is None or not self._same_capture_epoch(
+                self.first[1][0], latest[0]
+            ):
+                raise RenderError("SOURCE_EPOCH_MISMATCH")
         return self.first
 
     async def receipt(self, message):
@@ -346,6 +434,9 @@ class ControlPrefill:
             request["receipt"] = public
         recording = getattr(self.owner, "recording", None)
         if recording is not None:
+            from .cache_events import record_cache_event
+
+            record_cache_event(recording, public)
             # The existing manifest finalizer persists metadata; no synchronous
             # storage operation is inserted before memory_ready or playback.
             recording.manifest.setdefault("prefill", {})[message["request_id"]] = dict(
@@ -514,6 +605,20 @@ class ControlPrefill:
                 self._compute(request_id, parameters, references, first)
             )
         except RenderError as error:
+            from .cache_events import record_cache_event
+
+            record_cache_event(
+                getattr(self.owner, "recording", None),
+                dict(
+                    type="prefill.failed",
+                    request_id=request_id
+                    if isinstance(request_id, str) and len(request_id) <= 128
+                    else None,
+                    admission_state="rejected",
+                    code=error.code,
+                    **self.owner.source_identity(),
+                ),
+            )
             await self.owner.outgoing.put(
                 msgspec.msgpack.encode(
                     dict(
@@ -529,6 +634,7 @@ class ControlPrefill:
     def _pending_persistence(self, request_id):
         return any(
             key != request_id
+            and value.get("persistence_requested", False)
             and value.get("ready_emitted")
             and value.get("receipt", {}).get("type") != "prefill.persisted"
             and value.get("receipt", {}).get("persistence_state") != "failed"
@@ -559,7 +665,7 @@ class ControlPrefill:
                 prompt=parameters["prompt"],
                 seed=parameters["seed"],
                 references=references,
-                persist=True,
+                persist=False,
                 record_model_inputs=True,
             )
             if snapshot is None:

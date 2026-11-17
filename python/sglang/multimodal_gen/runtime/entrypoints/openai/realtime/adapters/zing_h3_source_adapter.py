@@ -196,6 +196,8 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
 
         validate_labels(request.game_id, request.group_id)
         self.cache_options = dict(
+            world_id=request.world_id,
+            cache_recording=request.cache_recording,
             cache_write=request.cache_write,
             game_id=request.game_id,
             group_id=request.group_id,
@@ -1647,6 +1649,11 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         content = list(initial_media)
         content.append(dict(type="text", text=chunk_inputs.prompt))
         params.zing_request = dict(
+            **(
+                {"world_id": session.request.world_id}
+                if session.request.world_id
+                else {}
+            ),
             messages=[
                 dict(role="user", content=content),
                 dict(
@@ -1671,7 +1678,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                         if initial_media
                     ],
                 ),
-            ]
+            ],
         )
         params.zing_joint_forward = self.profile.get("joint_forward", "cross_chunk")
         params.zing_window_eviction_timing = self.profile.get(

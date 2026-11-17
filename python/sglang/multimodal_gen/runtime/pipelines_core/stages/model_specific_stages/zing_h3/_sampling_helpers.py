@@ -32,6 +32,12 @@ _GUARDED_ROWS = (
 _HOST_LAYOUT_KEYS = ("row_role", "block_idx", "position_ids", "seq_lens")
 
 
+def _guard_host_metadata(packed):
+    packed[_HOST_GUARD] = tuple(
+        (name, packed[name], tensor_identity(packed[name])) for name in _GUARDED_ROWS
+    )
+
+
 def _host_metadata(packed):
     """Host copies of a selection's rows, unless the caller changed its tensors.
 
@@ -218,10 +224,7 @@ class ZingBlockSamplingHelpers:
                 }
             )
             packed[_HOST_T] = torch.cat([m["host_t"] for m in metadata])
-            packed[_HOST_GUARD] = tuple(
-                (name, packed[name], tensor_identity(packed[name]))
-                for name in _GUARDED_ROWS
-            )
+            _guard_host_metadata(packed)
         from sglang.multimodal_gen.runtime.models.dits.zing_h3_joint import (
             ZingJointUnsupported,
             joint_transaction,
@@ -364,6 +367,8 @@ class ZingBlockSamplingHelpers:
         elif update is not None:
             raise ValueError("H3 cache update requires a cache")
         kwargs.update(_host_metadata(packed) or {})
+        if getattr(cache, "_compressed_kv_enabled", False):
+            kwargs["sparse_sampler"] = self
         if update == "joint":
             kwargs["joint_phases"] = packed["_zing_joint_phases"]
         with maybe_record_function(f"Zing.forward.{update or 'unconditional'}"):
@@ -606,10 +611,7 @@ class ZingBlockSamplingHelpers:
             _HOST_T: t,
             _PREDICT_ROWS: selection,
         }
-        packed[_HOST_GUARD] = tuple(
-            (name, packed[name], tensor_identity(packed[name]))
-            for name in _GUARDED_ROWS
-        )
+        _guard_host_metadata(packed)
         return packed
 
     def _deferred_final(self, cache, recent_visual, layout):
@@ -657,10 +659,7 @@ class ZingBlockSamplingHelpers:
             _HOST_LAYOUT: host,
             _HOST_T: t,
         }
-        packed[_HOST_GUARD] = tuple(
-            (name, packed[name], tensor_identity(packed[name]))
-            for name in _GUARDED_ROWS
-        )
+        _guard_host_metadata(packed)
         return packed
 
     def _block_timesteps(self, roles, *, video_t, audio_t=None, final=False):

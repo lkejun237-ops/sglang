@@ -24,8 +24,12 @@ from pathlib import Path
 from source import digest, prepare, sha, validate_manifest, write_json
 
 MODEL_ID = "zing-h3-dmd-1102-step2000-generator"
-MODEL_IDS = {MODEL_ID, "model1027"}
-SECRET_ENV = {"ROLE_POOL_SIGNING_KEY", "ROLE_POOL_REGISTRATION_TOKEN"}
+MODEL_IDS = {MODEL_ID, "model1027", "zing-h3-dmd-1103-step2000-generator"}
+ROLE_POOL_SECRETS = {"ROLE_POOL_SIGNING_KEY", "ROLE_POOL_REGISTRATION_TOKEN"}
+SECRET_ENV = ROLE_POOL_SECRETS | {
+    "WHITEBOX_CACHE_RECORDING_SECRET",
+    "SGLANG_CACHE_ADMIN_TOKEN",
+}
 ROLE_PORTS = {
     "encoder": {"port": 30000, "http_port": 31000, "rendezvous_port": 32000},
     "dit": {"http_port": 33000, "port": 34000, "rendezvous_port": 35000},
@@ -44,6 +48,7 @@ DIT_OPTIONS = {
     "zing_initial_block_count",
     "zing_block0_cache_mode",
     "zing_block0_cache_backend",
+    "zing_block0_mooncake_config",
     "zing_block0_cache_dir",
     "zing_block0_cache_host_gb",
     "zing_block0_cache_storage",
@@ -145,6 +150,8 @@ MODULES = {
 PORTS = {"encoder": 31000, "dit": 33000, "decoder": 36000}
 # Runtime credentials are explicit and redacted; source and device allocation stay isolated.
 ENV_ALLOW = {
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_EC2_METADATA_DISABLED",
     "WORLD_MODEL_METRIC_LANE",
     "SGLANG_ROLE_POOL_WORKER_CONFIG",
     "ROLE_POOL_SIGNING_KEY",
@@ -238,6 +245,16 @@ def validate_config(c):
         raise ValueError(
             "Secrets must be injected by the platform, never stored in role specs"
         )
+    environment = c.get("environment", {})
+    credential_file = environment.get("AWS_SHARED_CREDENTIALS_FILE")
+    if credential_file is not None and (
+        not isinstance(credential_file, str)
+        or "\0" in credential_file
+        or not Path(credential_file).is_absolute()
+    ):
+        raise ValueError("AWS credentials file must be an absolute mounted path")
+    if environment.get("AWS_EC2_METADATA_DISABLED", "true") not in ("true", "false"):
+        raise ValueError("AWS_EC2_METADATA_DISABLED must be true or false")
     if set(c.get("secret_files", {})) - SECRET_ENV or any(
         not Path(v).is_absolute() for v in c.get("secret_files", {}).values()
     ):
@@ -296,6 +313,11 @@ def validate_config(c):
         )
     if set(options) - DIT_OPTIONS or (options and c["role"] != "dit"):
         raise ValueError("Unknown or non-DiT options")
+    if (
+        "zing_block0_mooncake_config" in options
+        and not Path(str(options["zing_block0_mooncake_config"])).is_absolute()
+    ):
+        raise ValueError("Mooncake configuration path must be absolute")
     if c.get("resolution", "480") not in ("480", "736"):
         raise ValueError("Resolution must be 480 or 736")
     if any(
@@ -582,6 +604,10 @@ def command(c, source, host, worker_id):
     if role == "encoder":
         env.setdefault("SGLANG_ZING_SOURCE_PREPARE", "1")
     env.update(c.get("environment", {}))
+    if role == "encoder":
+        # Room negotiates preparation per request. Advertise support on its
+        # standalone ingress too; an explicit deployment override still wins.
+        env.setdefault("SGLANG_ZING_SOURCE_PREPARE", "1")
     for key, path in c.get("secret_files", {}).items():
         env[key] = Path(path).read_text().strip()
         if not env[key] or "\x00" in env[key]:

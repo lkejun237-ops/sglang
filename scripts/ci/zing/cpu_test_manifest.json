@@ -3962,67 +3962,45 @@
       "sources": [
         "main"
       ],
-      "reason": "Two complete Linux CPU trials passed for this test source after white_box/main integration; only explicit CUDA-only skips remain.",
+      "reason": "Two pinned Linux CPU trials passed, including real Gloo rank contracts. Not GPU or browser acceptance.",
       "dependencies": [],
       "trial_evidence": {
-        "source_sha256": "d9170fc3dfb01a4ee08a99a72b8ade157648a7992a19c8fac1b39a44b6f553b1",
-        "tested_head": "0dc02e326b469b02d2bd30ed5d958ac2af2afbd1",
-        "receipt": "/Users/kejun/.codex/tmp/merge-main-whitebox-thailand-20261108/cpu-evidence-r4/ordinary-r4-ceac/receipt.json",
-        "receipt_sha256": "f844b079efd24267f131786c9eed3096e04147b532cd8a4c9641fb7808222975",
-        "archive": "oss://leap-world-shanghai/world-model/whitebox-releases/main-whitebox-thailand-20261108/cpu-evidence-r4.tgz",
-        "archive_sha256": "11efe6006cfa80fabbe00010af416548ce7bc9ab42a1250f0d6df7601e9062f9",
+        "source_sha256": "1b1fbb08ecc38751d0a86f191999a564a297f0fee45dcb4ef6cb458c4da2b2b5",
+        "tested_head": "3c8ec565741d8848eba71eb49b686101de480ce5",
+        "receipt": "cache-tiers/receipt.json",
+        "receipt_sha256": "110a124929ce96e79f8636f3bf2fb7cef0270c76bcca769e9d708e4e3a9a6df2",
+        "workflow_run": "https://github.com/seedleap/sglang/actions/runs/43244645637",
         "trials": [
           {
             "trial": 1,
-            "passed": 39,
-            "collected": 39,
+            "passed": 40,
+            "collected": 40,
             "skipped": 0,
-            "duration_seconds": 10.312170857971068,
+            "duration_seconds": 43.40708908099998,
             "exit_code": 0,
-            "log_path": "ordinary-r4-ceac/cpu-1-trial-1.log",
-            "junit_path": "ordinary-r4-ceac/cpu-1-trial-1.xml",
-            "log_sha256": "f117cc6c5eefe001d151673dc60ae0a869bb6036c3f6139999f99e93d0b4ff37",
-            "junit_sha256": "d2416f482310d4641b1ca3eee2b2c29fc19ceb86a23f07f404f18c11121a1760"
+            "log_path": "cache-tiers/cpu-0-trial-1.log",
+            "log_sha256": "d4087d6479f300f31dfe189551bc1a6b572ea68c034f9ac98bc8befa1a382cd8",
+            "junit_path": "cache-tiers/cpu-0-trial-1.xml",
+            "junit_sha256": "4e09133748b9026b62070b6ddc1133f09ded5b843085f8da7d823658baaf72d2"
           },
           {
             "trial": 2,
-            "passed": 39,
-            "collected": 39,
+            "passed": 40,
+            "collected": 40,
             "skipped": 0,
-            "duration_seconds": 10.300756215001456,
+            "duration_seconds": 17.224960265999982,
             "exit_code": 0,
-            "log_path": "ordinary-r4-ceac/cpu-1-trial-2.log",
-            "junit_path": "ordinary-r4-ceac/cpu-1-trial-2.xml",
-            "log_sha256": "e73a6962b9b797092242a49ba817b1da4111cab81412235dc7b9fa62de0c4875",
-            "junit_sha256": "19ebe0ce189966602c8888912c9f53638441cb0906057d406d8dabd306002067"
+            "log_path": "cache-tiers/cpu-0-trial-2.log",
+            "log_sha256": "a14a3c694edf33ce0345a46c1c65b1df792a18ceafbf8c3b150ef895b1d99eaa",
+            "junit_path": "cache-tiers/cpu-0-trial-2.xml",
+            "junit_sha256": "d2c7d6a6a37d80351ffe1e7aa4e8d66f0b23949cb6d6c160d569f1a6b6bc1866"
           }
         ],
         "environment": {
-          "python": "3.11.14",
-          "platform": "Linux-5.10.134-19.8.al8.x86_64-x86_64-with-glibc2.39"
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
         },
-        "manifest_sha256": "39297100e5a6269f8c19f428c15f6cd0c564b23aa2d9875cd1d6d9dc29c34677",
-        "tooling_sha256": {
-          "check_python.py": "edced74edc439191f8ff97373e71fbb50d1469cff016c7163f0cb80d93ede73b",
-          "check_room_init.py": "d60e4851901eb5e0bfac7e78b7618fcc483616707a90b1cf135787bff00935d3",
-          "common.py": "52128fc66405da6918eecb98a73d76f322aa3fbe6fec9b55c0a3ff9924cb8f4b",
-          "prepare_media_tooling.py": "27dcceabd6c24076929108bc9c72431a64a22764a770cc222049619ec6912139",
-          "run_area_tests.py": "b3b4feead224895cf66df953faea5c3c98ec095e165bba1180b87d10c494a3f2",
-          "run_cpu_tests.py": "f5981aec18cde4485454b14e473453533fd57bc98aa1af8631fc9148c3be479f",
-          "run_prefill_tests.py": "2e283c138b1ad5fa606df9db2658677779505173987b6a09ea52547c4ed6f489",
-          "run_role_pool_tests.py": "2061f12b5ea32240f96579d55f408673f779bf1d3df84a162b12b641f0091d90",
-          "run_tooling_tests.py": "d67a2b7b54f3a23855d4c3786870784c4f2cca334cfadbca91e7c6e464b36d52",
-          "select_changes.py": "5d340c946157ac72b0b60f6ce9b4432b23409b044aa302046ea703f04932a960",
-          "summarize_results.py": "6225dac3f42daf9fa6a6be6fe7cd61a758feb75fd03a2a89ec820fca6978786d",
-          "zing_pytest_receipt.py": "bb98e1ed480a2eb21f48032135347d1be6f414650875b624affa65f009228bb3"
-        },
-        "environment_recipe": {
-          "python_version": "3.11",
-          "requirements_sha256": {
-            "scripts/ci/zing/requirements-cpu.txt": "5b4b5a6b39bc8d729acbc53612527e881e24202c706f960773d6c8cf83014f48",
-            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
-          }
-        }
+        "manifest_sha256": "c6311db3818df6a6b0989f3709f8bdceecc45904dbfcd192a11318cc8a56b64e"
       }
     },
     {
@@ -5102,6 +5080,14 @@
         },
         {
           "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_cached_prefix_matches_uncached_queued_dit[cuda-True-True-off]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_initial_condition_prepares_before_first_source[cuda-False]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_encoder_dit_link.py::test_initial_condition_prepares_before_first_source[cuda-True]",
           "reason": "CUDA is required for the GPU queue regression"
         },
         {
@@ -11865,14 +11851,23 @@
     {
       "path": "python/sglang/multimodal_gen/test/unit/realtime/test_zing_mooncake_cache.py",
       "suite": "dit-pipeline-contracts",
-      "status": "CPU_PASS",
+      "status": "MIXED",
       "approved": true,
-      "allowed_skips": [],
+      "allowed_skips": [
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/realtime/test_zing_mooncake_cache.py::test_optional_fill_persists_reference_media_received_on_accelerator[cuda]",
+          "reason": "CUDA is unavailable"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/realtime/test_zing_mooncake_cache.py::test_optional_fill_persists_reference_media_received_on_accelerator[mps]",
+          "reason": "MPS is unavailable"
+        }
+      ],
       "sources": [
         "main"
       ],
       "dependencies": [],
-      "reason": "Two fresh pinned Linux CPU trials passed after resolving PR #647, with zero failures, errors, skips or incomplete cases. Exact test source, logs and JUnit receipts are retained in GitHub Actions run 42579643726; GPU/E2E validation is not implied.",
+      "reason": "The CPU suite exercises the cache contracts; the two reference-media persistence cases require CUDA or MPS respectively.",
       "previous_trial_evidence": {
         "source_sha256": "c313caa884d6e4a8f1e8f0d4cf7dae8c3827e891045e1c23f328c4ed7eeda8eb",
         "job_id": "dlc1yh52x7gsddw9",
@@ -11881,301 +11876,42 @@
         "junit_path": "/cpfs/world-model/sglang/evals/block0-mooncake-postcheck-20261107-r3/junit.xml"
       },
       "trial_evidence": {
-        "source_sha256": "a8f319c063f16df97a36a779875b526d2a5f12292a3a18ff83f7a2f0e1c1a2ed",
-        "tested_head": "6e016041135cc4cc9d7e7316b4263a9e42acdbd7",
-        "checkout_sha": "6e016041135cc4cc9d7e7316b4263a9e42acdbd7",
-        "receipt": "https://github.com/seedleap/sglang/actions/runs/42579643726",
-        "artifact_name": "zing-block0-cache-42579643726-1-6e016041135cc4cc9d7e7316b4263a9e42acdbd7",
-        "artifact_id": 13657262311,
-        "artifact_sha256": "ce84d0658c24bb680e03c55d6f37e7c707d3c35522c69d08cf0d5987c34bde46",
-        "receipt_sha256": "bcd6a881b44caab43179194b6123df4adcb2368f477e4d06b223864ea710f444",
+        "source_sha256": "f14b86539c145d7ba50d72b84205b6c21ea0de3db5ebf8596bd16cacbde13769",
+        "tested_head": "3c8ec565741d8848eba71eb49b686101de480ce5",
+        "receipt": "cache-tiers/receipt.json",
+        "receipt_sha256": "110a124929ce96e79f8636f3bf2fb7cef0270c76bcca769e9d708e4e3a9a6df2",
+        "workflow_run": "https://github.com/seedleap/sglang/actions/runs/43244645637",
         "trials": [
           {
             "trial": 1,
-            "passed": 41,
-            "collected": 41,
+            "passed": 44,
+            "collected": 44,
             "skipped": 0,
-            "duration_seconds": 118.28597049999996,
+            "duration_seconds": 139.960997871,
             "exit_code": 0,
-            "log_path": "cpu-6-trial-1.log",
-            "log_sha256": "3d3a2e9ea55ab56718d0afc68d0f29cbea236555bb41ef50f032d55980e3b680",
-            "junit_path": "cpu-6-trial-1.xml",
-            "junit_sha256": "522d9407e1a771b14cf7d55a1c3518c52e381d42035144fa7249c62486f84312"
+            "log_path": "cache-tiers/cpu-1-trial-1.log",
+            "log_sha256": "489e873f820184a8912ea3d895503d77b57a538a1fdafcfc3ee511e7a5ab7777",
+            "junit_path": "cache-tiers/cpu-1-trial-1.xml",
+            "junit_sha256": "205ae11be6e03f9b77e83182b596be2ba3b80a3581107cb8561decb9b73dd5dd"
           },
           {
             "trial": 2,
-            "passed": 41,
-            "collected": 41,
+            "passed": 44,
+            "collected": 44,
             "skipped": 0,
-            "duration_seconds": 119.70385504599994,
+            "duration_seconds": 137.846200969,
             "exit_code": 0,
-            "log_path": "cpu-6-trial-2.log",
-            "log_sha256": "60c35f28624b255ee405ecdd32b699208beaaf58443085751034c1c6f9cba686",
-            "junit_path": "cpu-6-trial-2.xml",
-            "junit_sha256": "f2c5decd188d587de6496f6e83bff9b5a8c13603da2c1ce09d0d7d1a6faa7f58"
+            "log_path": "cache-tiers/cpu-1-trial-2.log",
+            "log_sha256": "924f76f530e52293f5c100ba1b10cd3eee32de4d02277d03885c915b63e31e5c",
+            "junit_path": "cache-tiers/cpu-1-trial-2.xml",
+            "junit_sha256": "c098284a6541a4eb3bdbfec10f2e6e15ecf450160a659f3b271a387f64411e25"
           }
         ],
         "environment": {
-          "dependencies": {
-            "ImageIO": "2.38.1",
-            "Jinja2": "3.1.6",
-            "MarkupSafe": "3.0.3",
-            "PyYAML": "6.0.3",
-            "Pygments": "2.21.0",
-            "accelerate": "1.15.0",
-            "addict": "2.4.0",
-            "aiofiles": "25.1.0",
-            "aiohappyeyeballs": "2.7.1",
-            "aiohttp": "3.14.5",
-            "aiosignal": "1.4.0",
-            "annotated-doc": "0.0.5",
-            "annotated-types": "0.8.0",
-            "antlr4-python3-runtime": "4.9.3",
-            "anyio": "4.15.1",
-            "apache-tvm-ffi": "0.1.11",
-            "asttokens": "3.0.2",
-            "attrs": "26.1.0",
-            "certifi": "2026.7.22",
-            "charset-normalizer": "3.5.2",
-            "click": "8.5.0",
-            "cloudpickle": "3.1.2",
-            "datasets": "5.1.0",
-            "diffusers": "0.41.0",
-            "dill": "0.4.1",
-            "einops": "0.8.2",
-            "executing": "2.3.0",
-            "fastapi": "0.143.0",
-            "filelock": "3.32.3",
-            "frozenlist": "1.8.0",
-            "fsspec": "2026.7.0",
-            "h11": "0.16.0",
-            "hf-xet": "1.7.0",
-            "httpcore": "1.0.9",
-            "httpcore2": "2.13.1",
-            "httpx": "0.28.1",
-            "httpx2": "2.13.1",
-            "huggingface_hub": "1.33.0",
-            "idna": "3.20",
-            "imageio-ffmpeg": "0.6.0",
-            "importlib_metadata": "9.0.1",
-            "iniconfig": "2.3.1",
-            "ipython": "9.17.1",
-            "ipython_pygments_lexers": "1.1.1",
-            "isort": "7.0.0",
-            "jedi": "0.20.0",
-            "jiter": "0.17.0",
-            "loguru": "0.7.3",
-            "markdown-it-py": "4.2.0",
-            "matplotlib-inline": "0.2.2",
-            "mdurl": "0.1.2",
-            "mpmath": "1.3.0",
-            "msgpack": "1.2.3",
-            "msgspec": "0.22.0",
-            "multidict": "7.1.0",
-            "multiprocess": "0.70.19",
-            "networkx": "3.6.1",
-            "numpy": "2.2.6",
-            "omegaconf": "2.3.1",
-            "openai": "3.26.1",
-            "opentelemetry-api": "1.45.1",
-            "orjson": "3.13.0",
-            "packaging": "26.3",
-            "pandas": "3.0.6",
-            "parso": "0.8.7",
-            "partial-json-parser": "0.2.1.1.post7",
-            "pexpect": "4.9.0",
-            "pillow": "12.3.0",
-            "pip": "26.2.2",
-            "pluggy": "1.6.0",
-            "prometheus_client": "0.26.0",
-            "prompt_toolkit": "3.0.53",
-            "propcache": "0.5.4",
-            "psutil": "7.2.2",
-            "ptyprocess": "0.7.0",
-            "pure_eval": "0.2.4",
-            "pyarrow": "26.0.0",
-            "pybase64": "1.5.1",
-            "pydantic": "2.14.0",
-            "pydantic-settings": "2.15.0",
-            "pydantic_core": "2.50.0",
-            "pytest": "8.4.2",
-            "pytest-asyncio": "1.4.0",
-            "python-dateutil": "2.9.0.post0",
-            "python-dotenv": "1.2.4",
-            "python-multipart": "0.0.32",
-            "pyzmq": "27.2.0",
-            "regex": "2026.9.29",
-            "requests": "2.34.2",
-            "rich": "15.0.0",
-            "ruff": "0.15.1",
-            "safetensors": "0.8.0",
-            "scipy": "1.17.1",
-            "sentencepiece": "0.2.2",
-            "setproctitle": "1.3.8",
-            "setuptools": "79.0.1",
-            "shellingham": "1.5.4",
-            "six": "1.17.0",
-            "sniffio": "1.3.1",
-            "stack-data": "0.6.3",
-            "starlette": "1.7.0",
-            "sympy": "1.14.0",
-            "tokenizers": "0.23.3",
-            "torch": "2.8.0+cpu",
-            "torchvision": "0.23.0+cpu",
-            "tqdm": "4.67.1",
-            "traitlets": "5.16.1",
-            "transformers": "5.19.0",
-            "triton": "3.8.0",
-            "truststore": "0.10.4",
-            "typer": "0.27.3",
-            "typing-inspection": "0.4.4",
-            "typing_extensions": "4.16.0",
-            "urllib3": "2.8.0",
-            "uvicorn": "0.39.0",
-            "wcwidth": "0.9.2",
-            "websockets": "15.0.1",
-            "xgrammar": "0.2.1",
-            "xxhash": "4.0.1",
-            "yarl": "1.25.1",
-            "zipp": "4.1.1"
-          },
-          "executable": "/opt/hostedtoolcache/Python/3.11.18/x64/bin/python",
-          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
           "python": "3.11.18",
-          "threads": {
-            "MKL_NUM_THREADS": "1",
-            "OMP_NUM_THREADS": "1",
-            "OPENBLAS_NUM_THREADS": "1"
-          }
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
         },
-        "environment_recipe": {
-          "dependencies": {
-            "ImageIO": "2.38.1",
-            "Jinja2": "3.1.6",
-            "MarkupSafe": "3.0.3",
-            "PyYAML": "6.0.3",
-            "Pygments": "2.21.0",
-            "accelerate": "1.15.0",
-            "addict": "2.4.0",
-            "aiofiles": "25.1.0",
-            "aiohappyeyeballs": "2.7.1",
-            "aiohttp": "3.14.5",
-            "aiosignal": "1.4.0",
-            "annotated-doc": "0.0.5",
-            "annotated-types": "0.8.0",
-            "antlr4-python3-runtime": "4.9.3",
-            "anyio": "4.15.1",
-            "apache-tvm-ffi": "0.1.11",
-            "asttokens": "3.0.2",
-            "attrs": "26.1.0",
-            "certifi": "2026.7.22",
-            "charset-normalizer": "3.5.2",
-            "click": "8.5.0",
-            "cloudpickle": "3.1.2",
-            "datasets": "5.1.0",
-            "diffusers": "0.41.0",
-            "dill": "0.4.1",
-            "einops": "0.8.2",
-            "executing": "2.3.0",
-            "fastapi": "0.143.0",
-            "filelock": "3.32.3",
-            "frozenlist": "1.8.0",
-            "fsspec": "2026.7.0",
-            "h11": "0.16.0",
-            "hf-xet": "1.7.0",
-            "httpcore": "1.0.9",
-            "httpcore2": "2.13.1",
-            "httpx": "0.28.1",
-            "httpx2": "2.13.1",
-            "huggingface_hub": "1.33.0",
-            "idna": "3.20",
-            "imageio-ffmpeg": "0.6.0",
-            "importlib_metadata": "9.0.1",
-            "iniconfig": "2.3.1",
-            "ipython": "9.17.1",
-            "ipython_pygments_lexers": "1.1.1",
-            "isort": "7.0.0",
-            "jedi": "0.20.0",
-            "jiter": "0.17.0",
-            "loguru": "0.7.3",
-            "markdown-it-py": "4.2.0",
-            "matplotlib-inline": "0.2.2",
-            "mdurl": "0.1.2",
-            "mpmath": "1.3.0",
-            "msgpack": "1.2.3",
-            "msgspec": "0.22.0",
-            "multidict": "7.1.0",
-            "multiprocess": "0.70.19",
-            "networkx": "3.6.1",
-            "numpy": "2.2.6",
-            "omegaconf": "2.3.1",
-            "openai": "3.26.1",
-            "opentelemetry-api": "1.45.1",
-            "orjson": "3.13.0",
-            "packaging": "26.3",
-            "pandas": "3.0.6",
-            "parso": "0.8.7",
-            "partial-json-parser": "0.2.1.1.post7",
-            "pexpect": "4.9.0",
-            "pillow": "12.3.0",
-            "pluggy": "1.6.0",
-            "prometheus_client": "0.26.0",
-            "prompt_toolkit": "3.0.53",
-            "propcache": "0.5.4",
-            "psutil": "7.2.2",
-            "ptyprocess": "0.7.0",
-            "pure_eval": "0.2.4",
-            "pyarrow": "26.0.0",
-            "pybase64": "1.5.1",
-            "pydantic": "2.14.0",
-            "pydantic-settings": "2.15.0",
-            "pydantic_core": "2.50.0",
-            "pytest": "8.4.2",
-            "pytest-asyncio": "1.4.0",
-            "python-dateutil": "2.9.0.post0",
-            "python-dotenv": "1.2.4",
-            "python-multipart": "0.0.32",
-            "pyzmq": "27.2.0",
-            "regex": "2026.9.29",
-            "requests": "2.34.2",
-            "rich": "15.0.0",
-            "ruff": "0.15.1",
-            "safetensors": "0.8.0",
-            "scipy": "1.17.1",
-            "sentencepiece": "0.2.2",
-            "setproctitle": "1.3.8",
-            "shellingham": "1.5.4",
-            "six": "1.17.0",
-            "sniffio": "1.3.1",
-            "stack-data": "0.6.3",
-            "starlette": "1.7.0",
-            "sympy": "1.14.0",
-            "tokenizers": "0.23.3",
-            "torch": "2.8.0+cpu",
-            "torchvision": "0.23.0+cpu",
-            "tqdm": "4.67.1",
-            "traitlets": "5.16.1",
-            "transformers": "5.19.0",
-            "triton": "3.8.0",
-            "truststore": "0.10.4",
-            "typer": "0.27.3",
-            "typing-inspection": "0.4.4",
-            "typing_extensions": "4.16.0",
-            "urllib3": "2.8.0",
-            "uvicorn": "0.39.0",
-            "wcwidth": "0.9.2",
-            "websockets": "15.0.1",
-            "xgrammar": "0.2.1",
-            "xxhash": "4.0.1",
-            "yarl": "1.25.1",
-            "zipp": "4.1.1"
-          },
-          "python_version": "3.11",
-          "requirements_sha256": {
-            "scripts/ci/zing/requirements-cpu.txt": "5b4b5a6b39bc8d729acbc53612527e881e24202c706f960773d6c8cf83014f48",
-            "scripts/ci/zing/requirements-torch.txt": "4d3e5d7a30c2359247392691c2d5b9a7bf72aebc15993c1e06940c6689cae1ef"
-          }
-        }
+        "manifest_sha256": "c6311db3818df6a6b0989f3709f8bdceecc45904dbfcd192a11318cc8a56b64e"
       }
     },
     {
@@ -12584,6 +12320,247 @@
       ],
       "reason": "Local CPU contract tests cover seconds/frame units, asynchronous CUDA-event polling with fakes (no GPU validation), cancellation, bounded drops, opt-out and HTTP exposition. GPU 480/736 and collection overhead remain unvalidated.",
       "dependencies": []
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/realtime/test_zing_cache_tiers.py",
+      "suite": "dit-pipeline-contracts",
+      "sources": [
+        "main"
+      ],
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "reason": "Two pinned Linux CPU trials passed, including real Gloo rank contracts. Not GPU or browser acceptance.",
+      "trial_evidence": {
+        "source_sha256": "7b87d3533693e2e52fa1e850863236c9b85fc9c714ed9859b04a338cba34097a",
+        "tested_head": "3c8ec565741d8848eba71eb49b686101de480ce5",
+        "receipt": "cache-tiers/receipt.json",
+        "receipt_sha256": "110a124929ce96e79f8636f3bf2fb7cef0270c76bcca769e9d708e4e3a9a6df2",
+        "workflow_run": "https://github.com/seedleap/sglang/actions/runs/43244645637",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 6,
+            "collected": 6,
+            "skipped": 0,
+            "duration_seconds": 6.058241438999971,
+            "exit_code": 0,
+            "log_path": "cache-tiers/cpu-2-trial-1.log",
+            "log_sha256": "b8a8c2f3776335fbe935bc169d9dce59bdd717f14a0cab5c918dbbfcea2b81a8",
+            "junit_path": "cache-tiers/cpu-2-trial-1.xml",
+            "junit_sha256": "76fa8cc005f8f30d44077535f49de00db56838c462c1e8a8ffdb1013e7dbf5e7"
+          },
+          {
+            "trial": 2,
+            "passed": 6,
+            "collected": 6,
+            "skipped": 0,
+            "duration_seconds": 5.804417928000021,
+            "exit_code": 0,
+            "log_path": "cache-tiers/cpu-2-trial-2.log",
+            "log_sha256": "f3431c16a0616995e381044ed09117dce57f3904048133217437cc9f99586b92",
+            "junit_path": "cache-tiers/cpu-2-trial-2.xml",
+            "junit_sha256": "77e5d60241c97a0578cb0eeb2f6ab0f79982178814a969b39b024a07831e929e"
+          }
+        ],
+        "environment": {
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
+        },
+        "manifest_sha256": "c6311db3818df6a6b0989f3709f8bdceecc45904dbfcd192a11318cc8a56b64e"
+      }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_sparse_preparation_cache.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Reviewed two complete pinned Linux CPU trials at b1bdbd2675; includes real small-model execution, BF16/FP8 transport contracts and fault boundaries. CPU approval is not GPU, native Mooncake/OSS, performance or browser acceptance.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "a6aaa3f766c06668134f54bcb92a47c7af3461cc34382ad64222afddad3fb556",
+        "tested_head": "b1bdbd2675c9f79273a1be080cadf73fe8e10a9d",
+        "workflow_run": "https://github.com/seedleap/sglang/actions/runs/43399053411",
+        "artifact": "zing-block0-cache-43399053411-1-b1bdbd2675c9f79273a1be080cadf73fe8e10a9d",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 16,
+            "collected": 16,
+            "skipped": 0,
+            "exit_code": 0,
+            "junit_case_seconds_sum": 0.196,
+            "log_path": "sparse/trial-1.log",
+            "junit_path": "sparse/trial-1.xml",
+            "log_sha256": "c90a8b4769f0b0eec121869c9e77bc4d614ab9aed32ca94fb4cafd2f61bc37d9",
+            "junit_sha256": "2b939c6c0dc347818275d32f967f68df7837528b141ec25f5fa13407e68749a6"
+          },
+          {
+            "trial": 2,
+            "passed": 16,
+            "collected": 16,
+            "skipped": 0,
+            "exit_code": 0,
+            "junit_case_seconds_sum": 0.126,
+            "log_path": "sparse/trial-2.log",
+            "junit_path": "sparse/trial-2.xml",
+            "log_sha256": "6c6287e70603627b518bdca4208a436d2d4950a3865e5750d31fc0cc1151a37e",
+            "junit_sha256": "2b6d4b357031f852f7a0a2cc6740526b98d1451f330383c08ba8980651356177"
+          }
+        ],
+        "environment": {
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
+        }
+      }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_compressed_view.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Reviewed two complete pinned Linux CPU trials at b1bdbd2675; includes real small-model execution, BF16/FP8 transport contracts and fault boundaries. CPU approval is not GPU, native Mooncake/OSS, performance or browser acceptance.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "9d65ad83de9ebbc4a9334ff5a7c0baeae50391d9835cb882111c40fd42ed7be5",
+        "tested_head": "b1bdbd2675c9f79273a1be080cadf73fe8e10a9d",
+        "workflow_run": "https://github.com/seedleap/sglang/actions/runs/43399053411",
+        "artifact": "zing-block0-cache-43399053411-1-b1bdbd2675c9f79273a1be080cadf73fe8e10a9d",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 6,
+            "collected": 6,
+            "skipped": 0,
+            "exit_code": 0,
+            "junit_case_seconds_sum": 0.013,
+            "log_path": "sparse/trial-1.log",
+            "junit_path": "sparse/trial-1.xml",
+            "log_sha256": "c90a8b4769f0b0eec121869c9e77bc4d614ab9aed32ca94fb4cafd2f61bc37d9",
+            "junit_sha256": "2b939c6c0dc347818275d32f967f68df7837528b141ec25f5fa13407e68749a6"
+          },
+          {
+            "trial": 2,
+            "passed": 6,
+            "collected": 6,
+            "skipped": 0,
+            "exit_code": 0,
+            "junit_case_seconds_sum": 0.013,
+            "log_path": "sparse/trial-2.log",
+            "junit_path": "sparse/trial-2.xml",
+            "log_sha256": "6c6287e70603627b518bdca4208a436d2d4950a3865e5750d31fc0cc1151a37e",
+            "junit_sha256": "2b6d4b357031f852f7a0a2cc6740526b98d1451f330383c08ba8980651356177"
+          }
+        ],
+        "environment": {
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
+        }
+      }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_sparse_cache_contracts.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Reviewed two pinned Linux CPU trials at 6343f911b6, including same-shape compressed routing identity, physical compaction, prefix reset and device-operation replay. Native CUDA and performance remain unvalidated.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "140901c6999884eef23fe389903e8a8b777b308ff5984b188d1a43d4891291aa",
+        "tested_head": "6343f911b669b016978f1e1000360393edbef843",
+        "workflow_run": "https://github.com/seedleap/sglang/actions/runs/43404502055",
+        "artifact": "zing-block0-cache-43404502055-1-6343f911b669b016978f1e1000360393edbef843",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 8,
+            "collected": 8,
+            "skipped": 0,
+            "exit_code": 0,
+            "junit_case_seconds_sum": 0.031,
+            "log_path": "sparse/trial-1.log",
+            "junit_path": "sparse/trial-1.xml",
+            "log_sha256": "6d1114cd42a1cbe2d558364babdab6f3ec5c9490c45614e5afd08af07d17032c",
+            "junit_sha256": "c610700e6e8a3483acb7cc261d51013da3f2aabab21d265993d6241b0f02e3be"
+          },
+          {
+            "trial": 2,
+            "passed": 8,
+            "collected": 8,
+            "skipped": 0,
+            "exit_code": 0,
+            "junit_case_seconds_sum": 0.031,
+            "log_path": "sparse/trial-2.log",
+            "junit_path": "sparse/trial-2.xml",
+            "log_sha256": "4e9f285341836df50f08c26d14c2efa629cffd6959deb0bf461907c405ed52ca",
+            "junit_sha256": "ce335323311d73a5c363528820da7e5d285a9fbfe388bb78c16fc89610aef566"
+          }
+        ],
+        "environment": {
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
+        }
+      }
+    },
+    {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_sparse_forward.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": [
+        "main"
+      ],
+      "reason": "Reviewed two complete pinned Linux CPU trials at b1bdbd2675; includes real small-model execution, BF16/FP8 transport contracts and fault boundaries. CPU approval is not GPU, native Mooncake/OSS, performance or browser acceptance.",
+      "dependencies": [],
+      "trial_evidence": {
+        "source_sha256": "d63bc9f78d4675ceafc6b7bb8bb8763077f8a6abe56911a6b8f6d7b4d1a17060",
+        "tested_head": "b1bdbd2675c9f79273a1be080cadf73fe8e10a9d",
+        "workflow_run": "https://github.com/seedleap/sglang/actions/runs/43399053411",
+        "artifact": "zing-block0-cache-43399053411-1-b1bdbd2675c9f79273a1be080cadf73fe8e10a9d",
+        "trials": [
+          {
+            "trial": 1,
+            "passed": 1,
+            "collected": 1,
+            "skipped": 0,
+            "exit_code": 0,
+            "junit_case_seconds_sum": 0.57,
+            "log_path": "sparse/trial-1.log",
+            "junit_path": "sparse/trial-1.xml",
+            "log_sha256": "c90a8b4769f0b0eec121869c9e77bc4d614ab9aed32ca94fb4cafd2f61bc37d9",
+            "junit_sha256": "2b939c6c0dc347818275d32f967f68df7837528b141ec25f5fa13407e68749a6"
+          },
+          {
+            "trial": 2,
+            "passed": 1,
+            "collected": 1,
+            "skipped": 0,
+            "exit_code": 0,
+            "junit_case_seconds_sum": 0.634,
+            "log_path": "sparse/trial-2.log",
+            "junit_path": "sparse/trial-2.xml",
+            "log_sha256": "6c6287e70603627b518bdca4208a436d2d4950a3865e5750d31fc0cc1151a37e",
+            "junit_sha256": "2b6d4b357031f852f7a0a2cc6740526b98d1451f330383c08ba8980651356177"
+          }
+        ],
+        "environment": {
+          "python": "3.11.18",
+          "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
+        }
+      }
     }
   ],
   "recipes": {

@@ -173,10 +173,14 @@ class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
     # Per-session diagnostics; basic Room TTFF remains available when disabled.
     detailed_timing: StrictBool = False
     cache_write: StrictBool = False
+    world_id: Optional[str] = Field(default=None, min_length=1, max_length=256)
+    # Internal Room capability for append-only metadata beside its video archive.
+    cache_recording: Optional[str] = Field(default=None, max_length=4096, repr=False)
     game_id: Optional[str] = None
     group_id: Optional[str] = None
     type: Literal["init"]
     source_prompt_protocol: Optional[Literal["ordered-boundary-v2"]] = None
+    source_condition_early_release: bool = False  # legacy v1 negotiation
     source_condition_switch_protocol: Optional[
         Literal["clip-barrier-v1", "clip-barrier-v2"]
     ] = None

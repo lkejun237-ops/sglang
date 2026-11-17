@@ -207,7 +207,10 @@ def test_identity_reads_only_export_config_and_votes_across_sp(tmp_path, monkeyp
     pool = NS(
         _pool=NS(_slots=[NS(kv_cache=[NS(k=torch.zeros(1, dtype=torch.bfloat16))])])
     )
-    stage = NS(model_path=str(tmp_path), kv_pool=pool)
+    model = NS(
+        quant_config=None, parameters=lambda: [torch.zeros(1, dtype=torch.bfloat16)]
+    )
+    stage = NS(model_path=str(tmp_path), kv_pool=pool, modules={"transformer": model})
     path = tmp_path / "zing_config.json"
     path.write_text(
         '{"checkpoint_sha256":"abc", "checkpoint":"/old/path", "format_version":2}'
@@ -225,6 +228,52 @@ def test_identity_reads_only_export_config_and_votes_across_sp(tmp_path, monkeyp
     )
     with pytest.raises(ValueError, match="differs or is invalid"):
         block0_identity.build_identity(stage, NS(), device="cpu")
+
+
+def test_cache_recipe_separates_precision_sparse_and_preserves_same_recipe(monkeypatch):
+    from sglang.multimodal_gen.runtime.models.dits import zing_h3_sparse_attn as sparse
+
+    model = NS(
+        quant_config=None, parameters=lambda: [torch.zeros(1, dtype=torch.bfloat16)]
+    )
+    monkeypatch.setenv("SGLANG_ZING_SPARSE_ATTN_MODE", "dense")
+    dense = block0_identity.fingerprint(block0_identity.execution_identity(model))
+    # Unused sparse settings and equivalent dense aliases must not split slots.
+    monkeypatch.setenv("SGLANG_ZING_SPARSE_MIN_CHUNK", "7")
+    monkeypatch.setenv("SGLANG_ZING_SPARSE_ATTN_MODE", "off")
+    assert (
+        block0_identity.fingerprint(block0_identity.execution_identity(model)) == dense
+    )
+    quant = NS(
+        get_name=lambda: "fp8",
+        selected={"b", "a"},
+        backend=NS(activation_scheme="dynamic", weight_block_size=None),
+        coverage={"a": "fp8: cutlass_scaled_mm", "b": "fp8: cutlass_scaled_mm"},
+    )
+    model.quant_config = quant
+    fp8 = block0_identity.fingerprint(block0_identity.execution_identity(model))
+    assert fp8 != dense
+    # Same resolved layers/recipe on another worker retain the same identity.
+    quant.selected = {"a", "b"}
+    quant.coverage = {"b": "fp8: cutlass_scaled_mm", "a": "fp8: cutlass_scaled_mm"}
+    assert block0_identity.fingerprint(block0_identity.execution_identity(model)) == fp8
+    quant.selected = {"a"}
+    assert block0_identity.fingerprint(block0_identity.execution_identity(model)) != fp8
+    model.quant_config = None
+    monkeypatch.setenv("SGLANG_ZING_SPARSE_ATTN_MODE", "sparse_095")
+    sparse095 = block0_identity.fingerprint(block0_identity.execution_identity(model))
+    assert sparse095 != dense
+    monkeypatch.setenv("SGLANG_ZING_SPARSE_ATTN_MODE", "sparse_090")
+    assert (
+        block0_identity.fingerprint(block0_identity.execution_identity(model))
+        != sparse095
+    )
+    monkeypatch.setattr(sparse, "get_sparse_mode", lambda: "sparse_095")
+    monkeypatch.setenv("SGLANG_ZING_SPARSE_MIN_CHUNK", "8")
+    assert (
+        block0_identity.fingerprint(block0_identity.execution_identity(model))
+        != sparse095
+    )
 
 
 def test_sp2_only_publishes_after_both_shards_and_keeps_conditions_per_rank(tmp_path):

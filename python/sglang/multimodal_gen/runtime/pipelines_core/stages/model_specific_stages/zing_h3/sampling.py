@@ -311,7 +311,14 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
 
     @torch.no_grad()
     def initialize(
-        self, inputs, visual, audio=None, *, storage=None, acquire_storage=None
+        self,
+        inputs,
+        visual,
+        audio=None,
+        *,
+        storage=None,
+        acquire_storage=None,
+        retain_prefix_layers=False,
     ):
         """Pack the session and create its cache.
 
@@ -392,6 +399,7 @@ class ZingH3Sampler(ZingBlockSamplingHelpers):
                 rope_max_frame_gap=self.rope_max_frame_gap,
                 reserve_rows=int(pos["block_idx"].numel()),
                 storage=storage,
+                retain_prefix_layers=retain_prefix_layers,
             )
             first_source, first_target, _, _ = spans[0]
             self._agree_sp_boundary(

@@ -15,7 +15,15 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 _context = ContextVar("zing_cache_log_context", default=None)
 _host = socket.gethostname()
-_fields = ("operation_id", "session_id", "event_id", "game_id", "group_id")
+_fields = (
+    "operation_id",
+    "session_id",
+    "generation_id",
+    "prompt_version",
+    "event_id",
+    "game_id",
+    "group_id",
+)
 
 
 def log_context(**fields):
@@ -45,6 +53,8 @@ def batch_context(batch):
     return log_context(
         operation_id=command.get("operation_id") or getattr(batch, "request_id", None),
         session_id=getattr(session, "session_id", getattr(session, "id", None)),
+        generation_id=getattr(session, "generation_id", None),
+        prompt_version=getattr(batch, "realtime_prompt_version", None),
         event_id=getattr(batch, "realtime_event_id", None),
         game_id=command.get("game_id"),
         group_id=command.get("group_id"),

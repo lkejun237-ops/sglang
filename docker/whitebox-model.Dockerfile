@@ -9,7 +9,8 @@ WORKDIR /opt/whitebox
 ARG PIP_INDEX_URL=https://pypi.org/simple
 RUN python -m pip install --no-cache-dir --index-url "$PIP_INDEX_URL" \
       uvicorn==0.39.0 websockets==15.0.1 \
-      diffusers==0.41.0 huggingface_hub==1.33.0
+      diffusers==0.41.0 huggingface_hub==1.33.0 \
+      mooncake-transfer-engine==0.3.13 boto3==1.43.111
 # Install the hash-locked prebuilt binary seedleap-kernels wheel before copying
 # SGLang source so routine Python changes reuse this cached image layer.
 ARG KERNELS_WHEEL_FIND_LINKS=https://zing-cdn.loopit.com.cn/releases/seedleap-kernels/simple/seedleap-kernels/index.html
@@ -17,8 +18,16 @@ COPY deploy/whitebox/kernels-wheel.lock.txt /opt/whitebox/deploy/whitebox/kernel
 RUN python -m pip install --no-cache-dir --no-index --no-deps --force-reinstall --only-binary=:all: --require-hashes \
       --find-links "$KERNELS_WHEEL_FIND_LINKS" \
       -r /opt/whitebox/deploy/whitebox/kernels-wheel.lock.txt
+# The pinned Mooncake wheel links CUDA 12 even in a CUDA 13 model image. Keep
+# its runtime in a separate directory; do not replace Torch's CUDA 13 package.
+RUN python -m pip install --no-cache-dir --no-deps --index-url "$PIP_INDEX_URL" \
+      --target /opt/mooncake-cuda12 nvidia-cuda-runtime-cu12==12.8.90
+RUN python -c 'from pathlib import Path; Path("/etc/ld.so.conf.d/mooncake-cuda12.conf").write_text("/opt/mooncake-cuda12/nvidia/cuda_runtime/lib\n")' && ldconfig
 COPY python/sglang /opt/whitebox/python/sglang
 COPY deploy/whitebox /opt/whitebox/deploy/whitebox
+COPY benchmark/zing_h3_causal/check_native_cache_tiers.py /opt/whitebox/benchmark/zing_h3_causal/check_native_cache_tiers.py
+COPY benchmark/zing_h3_causal/cache_validation_service.py benchmark/zing_h3_causal/worker_group_master.py benchmark/zing_h3_causal/check_cache_oss.py /opt/whitebox/benchmark/zing_h3_causal/
+RUN python /opt/whitebox/deploy/whitebox/verify_cache_dependencies.py --allow-missing-driver
 ARG WHITEBOX_SOURCE_SHA=unmanaged
 ARG WHITEBOX_SOURCE_BRANCH=main
 ARG WHITEBOX_SDK_SHA=unmanaged

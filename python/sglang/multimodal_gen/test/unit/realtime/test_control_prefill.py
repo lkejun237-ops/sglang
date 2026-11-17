@@ -23,10 +23,85 @@ from sglang.multimodal_gen.runtime.realtime.whitebox.render_assets import Source
 from sglang.multimodal_gen.runtime.realtime.whitebox.render_contract import RenderError
 
 
+def test_pending_writeback_retries_only_verified_clean_prefill():
+    async def run(cleaned, durable):
+        attempts = []
+        owner = NS(
+            outgoing=asyncio.Queue(),
+            upstream=NS(init={}),
+            model_geometry=NS(model_init=lambda init: init, pad_rgb=lambda rgb: rgb),
+            config=NS(startup_seconds=2),
+            source_identity=lambda: dict(source_session_id="s", source_epoch="e"),
+        )
+
+        class Child:
+            def __init__(self):
+                self.first = not attempts
+                self.failure = "MODEL_OPERATION_FAILED" if self.first else None
+                self.resource_state = "released" if cleaned else "release_unknown"
+                self.completed = asyncio.Event()
+                self.completed.set()
+
+            @asynccontextmanager
+            async def open(self):
+                yield self, None
+
+            async def send(self, raw):
+                attempts.append(msgspec.msgpack.decode(raw))
+
+            async def recv(self):
+                if self.first:
+                    raise RenderError(self.failure)
+                return msgspec.msgpack.encode(
+                    dict(
+                        type="prefill.memory_ready",
+                        request_id="next",
+                        cache_key="same-key",
+                    )
+                )
+
+        owner.model_binding = NS(
+            assignment=NS(denoiser=NS(worker_epoch="a", worker_id="worker-a")),
+            borrow=lambda *a, **kw: Child(),
+        )
+        control = ControlPrefill(owner)
+        control.expires = time.monotonic() + 270
+        control.requests = {
+            "previous": dict(
+                context_id="ctx",
+                ready_emitted=True,
+                persistence_requested=durable,
+                receipt=dict(type="prefill.memory_ready"),
+            ),
+            "next": dict(context_id="ctx", receipt={}),
+        }
+        frame = EngineFrame(1, 0, b"fixed-f0", {})
+        control.context_id = "ctx"
+        control.first = (1, (frame, 0))
+        await control._compute("next", dict(prompt="A", seed=42), [], (1, (frame, 0)))
+        messages = []
+        while not owner.outgoing.empty():
+            messages.append(msgspec.msgpack.decode(owner.outgoing.get_nowait()))
+        retry = cleaned and durable
+        assert len(attempts) == (2 if retry else 1)
+        assert all(
+            m["source_frame"] == b"fixed-f0" and m["request_id"] == "next"
+            for m in attempts
+        )
+        assert messages[-1]["type"] == (
+            "prefill.memory_ready" if retry else "prefill.failed"
+        )
+        assert sum(m["type"] == "prefill.retrying" for m in messages) == int(retry)
+
+    asyncio.run(run(True, True))
+    asyncio.run(run(False, True))
+    asyncio.run(run(True, False))
+
+
 @pytest.mark.parametrize("scene", [False, True])
 @pytest.mark.parametrize("failure_after_memory_ready", [False, True])
 def test_retries_only_verified_clean_prefill(scene, failure_after_memory_ready):
-    async def run(cleaned):
+    async def run(cleaned, durable):
         attempts = []
         owner = NS(
             outgoing=asyncio.Queue(),
@@ -72,6 +147,7 @@ def test_retries_only_verified_clean_prefill(scene, failure_after_memory_ready):
             "previous": dict(
                 context_id="ctx",
                 ready_emitted=True,
+                persistence_requested=durable,
                 receipt=dict(type="prefill.memory_ready"),
             ),
             "next": dict(context_id="ctx", receipt={}),
@@ -96,20 +172,22 @@ def test_retries_only_verified_clean_prefill(scene, failure_after_memory_ready):
         )
         while not owner.outgoing.empty():
             messages.append(msgspec.msgpack.decode(owner.outgoing.get_nowait()))
-        assert len(attempts) == (2 if cleaned else 1)
+        retry = cleaned and (scene or durable)
+        assert len(attempts) == (2 if retry else 1)
         assert all(
             m["source_frame"] == (b"sealed-s0" if scene else b"fixed-f0")
             and m["request_id"] == "next"
             for m in attempts
         )
         assert messages[-1]["type"] == (
-            "prefill.memory_ready" if cleaned else "prefill.failed"
+            "prefill.memory_ready" if retry else "prefill.failed"
         )
-        assert sum(m["type"] == "prefill.retrying" for m in messages) == int(cleaned)
+        assert sum(m["type"] == "prefill.retrying" for m in messages) == int(retry)
         assert (control.failure is None) == cleaned
 
-    asyncio.run(run(True))
-    asyncio.run(run(False))
+    asyncio.run(run(True, True))
+    asyncio.run(run(False, True))
+    asyncio.run(run(True, False))
 
 
 def test_scene_prefill_sends_native_condition_pixels_and_waits_for_child_release():
@@ -177,6 +255,7 @@ def test_scene_prefill_sends_native_condition_pixels_and_waits_for_child_release
         async with asyncio.timeout(1):
             while not messages:
                 await asyncio.sleep(0)
+        assert messages[0]["persist"] is False
         assert messages[0]["source_frame"] == snapshot["rgb"]
         assert messages[0]["source_frame_size"] == {"width": 3, "height": 2}
         assert messages[0]["prompt"] == "Arrive at the forest"
@@ -197,10 +276,13 @@ def test_scene_prefill_sends_native_condition_pixels_and_waits_for_child_release
     asyncio.run(run(False))
 
 
-@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("mode", ["legacy", "member", "world"])
 def test_true_f0_many_conditions_idempotency_and_busy_do_not_change_active_inputs(
-    shared,
+    mode,
 ):
+    shared = mode == "member"
+    paused = mode == "legacy"
+
     async def run():
         calls = []
         tasks = []
@@ -238,6 +320,8 @@ def test_true_f0_many_conditions_idempotency_and_busy_do_not_change_active_input
                 }
             ),
         )
+        if mode == "world":
+            owner.upstream.init["world_id"] = "world-tested"
         owner.model_geometry = ModelGeometry(VideoSpec(2, 2))
         owner.retained.append(8, frame, 1.0)
 
@@ -264,6 +348,8 @@ def test_true_f0_many_conditions_idempotency_and_busy_do_not_change_active_input
         owner.operation_message = op
         owner.spawn_control = lambda coro: tasks.append(asyncio.create_task(coro))
 
+        computing, release = asyncio.Event(), asyncio.Event()
+
         class Child:
             def __init__(self):
                 self.completed = asyncio.Event()
@@ -279,6 +365,9 @@ def test_true_f0_many_conditions_idempotency_and_busy_do_not_change_active_input
                 self.completed.set()
 
             async def recv(self):
+                if mode == "world" and self.value["request_id"] == "A":
+                    computing.set()
+                    await release.wait()
                 return msgspec.msgpack.encode(
                     dict(
                         type="prefill.memory_ready",
@@ -298,12 +387,12 @@ def test_true_f0_many_conditions_idempotency_and_busy_do_not_change_active_input
         await control.prepare(
             command("render.prepare", "ctx", expected_render_revision=0)
         )
-        if shared:
+        if not paused:
             await asyncio.sleep(0)
             control.observe(8, frame, 1.0)
         await asyncio.gather(*tasks)
         assert control.resolve("ctx")[1][0] is frame
-        assert (activity.waiting is not None) is (not shared)
+        assert (activity.waiting is not None) is paused
         before = activity.last_input
 
         def event(id, prompt):
@@ -319,10 +408,32 @@ def test_true_f0_many_conditions_idempotency_and_busy_do_not_change_active_input
 
         for name in ["A", "B", "C"]:
             await control.submit(event(name, name))
-            assert (activity.waiting is not None) is (not shared)
+            assert (activity.waiting is not None) is paused
+            if mode == "world" and name == "A":
+                from dataclasses import replace
+
+                await asyncio.wait_for(computing.wait(), 1)
+                for index in range(8, 12):
+                    header = dict(
+                        frame.provenance["cli_frame_header"], outputFrameId=index + 1
+                    )
+                    newer = replace(
+                        frame,
+                        index=index,
+                        pts_us=frame.pts_us + 41667 * (index - 7),
+                        rgb=bytes([index]) * 12,
+                        provenance={"cli_frame_header": header},
+                    )
+                    owner.latest.version += 1
+                    owner.latest.value = newer, 2.0
+                    control.observe(owner.latest.version, newer, 2.0)
+                assert (
+                    not control.active.done() and control.resolve("ctx")[1][0] is frame
+                )
+                release.set()
             await control.active
             assert activity.waiting is None
-            assert (activity.last_input > before) is (not shared)
+            assert (activity.last_input > before) is paused
             before = activity.last_input
         native = [x[1] for x in calls if x[0] == "prefill"]
         assert len(native) == 3
@@ -348,8 +459,55 @@ def test_true_f0_many_conditions_idempotency_and_busy_do_not_change_active_input
             msgspec.msgpack.decode(await owner.outgoing.get())["code"] == "PREFILL_BUSY"
         )
         assert len([x for x in calls if x[0] == "prefill"]) == 3
+        if mode == "world":
+            boundary = {"mode": "next_available"}
+            assert control.start_frame("ctx", boundary) is None
+            assert control.start_frame("ctx", {"source_frame_index": 7})[1][0] is frame
+            with pytest.raises(RenderError) as error:
+                control.start_frame("ctx", {"source_frame_index": 99})
+            assert error.value.code == "PREFILL_INPUT_MISMATCH"
+            with pytest.raises(RenderError) as error:
+                await control.consume_start("ctx", boundary, frame)
+            assert error.value.code == "SOURCE_EPOCH_MISMATCH"
+            for field in ("epoch", "mediaGeneration", "sessionId"):
+                stale = replace(
+                    newer, provenance={"cli_frame_header": {**header, field: "stale"}}
+                )
+                with pytest.raises(RenderError) as error:
+                    await control.consume_start("ctx", boundary, stale)
+                assert error.value.code == "SOURCE_EPOCH_MISMATCH"
+            for proof in (
+                {**newer.provenance, "view_id": "other-view"},
+                {
+                    "cli_frame_header": {
+                        **header,
+                        "source": {"presentationId": "next-scene", "sdkEpoch": 2},
+                    }
+                },
+                {
+                    "cli_frame_header": {
+                        **header,
+                        "outputFrameId": frame.provenance["cli_frame_header"][
+                            "outputFrameId"
+                        ],
+                    }
+                },
+            ):
+                with pytest.raises(RenderError) as error:
+                    await control.consume_start(
+                        "ctx", boundary, replace(newer, provenance=proof)
+                    )
+                assert error.value.code == "SOURCE_EPOCH_MISMATCH"
+            captured = await control.consume_start("ctx", boundary, newer)
+            assert captured is frame and captured.rgb != newer.rgb
+            assert control.paused_ms == 0 and control.snapshot_age_ms > 0
+            message = msgspec.msgpack.decode(await owner.outgoing.get())
+            assert (
+                message["type"] == "prefill.source_resumed"
+                and message["paused_ms"] == 0
+            )
         await control.close()
-        if shared:
+        if not paused:
             assert not any(call[0] == "clock" for call in calls)
         else:
             assert ("clock", "resume", "ctx") in calls

@@ -135,7 +135,7 @@ FROM node AS sdk
 RUN corepack enable && corepack prepare pnpm@10.14.0 --activate
 WORKDIR /opt/worldkit
 COPY .whitebox-sdk/ ./
-RUN pnpm install --frozen-lockfile --ignore-scripts
+RUN pnpm install --frozen-lockfile --ignore-scripts && rm -rf asset-library/tests/fixtures/atlas-recording
 
 FROM base AS room-process-init
 USER root
@@ -206,7 +206,11 @@ RUN --mount=type=bind,source=deploy/whitebox/debian_main_mirror.py,target=/tmp/d
         apt-get install -y --no-install-recommends procps && rm -rf /var/lib/apt/lists/*'
 RUN pip install --no-cache-dir pytest==9.0.2 pyzmq==27.2.0
 # The sealed cutscene regression generates and verifies media with the Room's FFmpeg and Chromium.
-RUN cd /opt/worldkit && node node_modules/vitest/vitest.mjs run \
+RUN --mount=type=bind,source=.whitebox-sdk/asset-library/tests/fixtures/atlas-recording,target=/opt/worldkit/asset-library/tests/fixtures/atlas-recording,readonly \
+    --mount=type=tmpfs,target=/tmp/atlas-fixtures \
+    cd /opt/worldkit && export WORLDKIT_PLAYGROUND_CACHE_ROOT=/tmp/atlas-fixtures XDG_RUNTIME_DIR=/tmp/room-check-xdg && \
+    install -d -m 0700 "$XDG_RUNTIME_DIR" && \
+    node asset-library/tools/prepare-test-fixtures.mjs && node node_modules/vitest/vitest.mjs run \
       packages/stream-host/tests/capture-hold.test.ts \
       packages/stream-host/tests/raw-producer.test.ts packages/stream-host/tests/raw-session.test.ts
 USER whitebox

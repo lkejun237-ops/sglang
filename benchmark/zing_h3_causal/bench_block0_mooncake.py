@@ -6,7 +6,9 @@ Run with the same source/image on CPU preparation and GPU workers.
 """
 
 import argparse
+import base64
 import hashlib
+import io
 import json
 import math
 import os
@@ -143,25 +145,78 @@ def prepared():
     )
 
 
-def populate(cache, arena, case, seed=0):
+def archive_reference(folder, expected_manifest, case, device):
+    import torch
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.block0_conditions import (
+        decode_conditions,
+    )
+
+    raw = (folder / "manifest.json").read_bytes()
+    if (
+        hashlib.sha256(raw).hexdigest() != expected_manifest
+        or (folder / "complete").read_bytes() != b""
+    ):
+        raise ValueError("Incomplete archive or unexpected manifest")
+    manifest = json.loads(raw)
+    shape = (case["layers"], 2, case["rows"], case["heads"], case["dim"])
+    expected = {f"l{i:02d}" for i in range(shape[0])} | {"cond"}
+    ref = torch.empty(shape, dtype=torch.int16, device=device)
+    conditions = None
+    for obj in manifest["objects"]:
+        name = obj["key"].rsplit(":", 1)[1]
+        if (
+            name not in expected
+            or obj["file"] != hashlib.sha256(obj["key"].encode()).hexdigest()
+        ):
+            raise ValueError("Unexpected archive object")
+        expected.remove(name)
+        data = bytearray((folder / obj["file"]).read_bytes())
+        if (
+            len(data) != obj["bytes"]
+            or hashlib.sha256(data).hexdigest() != obj["sha256"]
+        ):
+            raise ValueError("Archive payload digest mismatch")
+        if name == "cond":
+            conditions = decode_conditions(
+                torch.load(io.BytesIO(data), map_location="cpu", weights_only=True)
+            )
+        else:
+            dest = ref[int(name[1:])]
+            dest.copy_(torch.frombuffer(data, dtype=torch.int16).reshape(dest.shape))
+    if (
+        expected
+        or conditions is None
+        or tuple(conditions["positions"].shape) != (shape[2], 3)
+    ):
+        raise ValueError("Incomplete archive geometry")
+    return ref, conditions
+
+
+def populate(cache, arena, case, seed=0, reference=None):
     import torch
 
     cache.clear()
     rows = case["rows"]
     arena.fill_(-12345)
-    for layer in range(case["layers"]):
-        for part in range(2):
-            arena[layer, part, 1 : rows + 1].copy_(
-                pattern(
-                    rows,
-                    case["heads"],
-                    case["dim"],
-                    layer * 2 + part,
-                    seed,
-                    arena.device,
+    if reference is not None:
+        ref, conditions = reference
+        arena[:, :, 1 : rows + 1].copy_(ref)
+        positions = conditions["positions"]
+    else:
+        for layer in range(case["layers"]):
+            for part in range(2):
+                arena[layer, part, 1 : rows + 1].copy_(
+                    pattern(
+                        rows,
+                        case["heads"],
+                        case["dim"],
+                        layer * 2 + part,
+                        seed,
+                        arena.device,
+                    )
                 )
-            )
-    positions = torch.arange(rows).reshape(-1, 1).repeat(1, 3)
+        positions = torch.arange(rows).reshape(-1, 1).repeat(1, 3)
     blocks = torch.zeros(rows, dtype=torch.long)
     cache.update(
         positions.to(arena.device),
@@ -173,12 +228,17 @@ def populate(cache, arena, case, seed=0):
     )
 
 
-def verify(arena, case, seed=0):
+def verify(arena, case, seed=0, reference=None):
     import torch
 
     rows = case["rows"]
     assert (arena[:, :, 0] == -12345).all().item(), "leading guard"
     assert (arena[:, :, rows + 1 :] == -12345).all().item(), "tail or guard overwritten"
+    if reference is not None:
+        assert torch.equal(arena[:, :, 1 : rows + 1], reference[0]), (
+            "archive KV content mismatch"
+        )
+        return
     for layer in range(case["layers"]):
         for part in range(2):
             assert torch.equal(
@@ -222,14 +282,17 @@ def provider(pool, case, config, rank=0, world=1, **kwargs):
 def connect(config, segment=0):
     from mooncake.store import MooncakeDistributedStore
 
+    from sglang.multimodal_gen.runtime.realtime.block0_rdma import block0_rdma_devices
+
+    devices = block0_rdma_devices(config)
     client = MooncakeDistributedStore()
     rc = client.setup(
         config["local_hostname"],
         "P2PHANDSHAKE",
         segment,
         0,
-        config["protocol"],
-        "",
+        "rdma",
+        devices,
         config["master_server_address"],
     )
     assert rc == 0, ("setup", rc)
@@ -268,11 +331,26 @@ def worker(root, role):
     with torch.no_grad():
         for case in cases:
             pool, cache, arena = make(case)
+            reference = None
+            fill_args = (prepared(), "condition", None)
+            if "archive" in config:
+                reference = archive_reference(
+                    Path(config["archive"]),
+                    config["manifest_sha256"],
+                    case,
+                    arena.device,
+                )
+                conditions = reference[1]
+                fill_args = (
+                    conditions["inputs"],
+                    conditions.get("conditioning_identity"),
+                    conditions.get("request"),
+                )
             backend = provider(pool, case, config)
             try:
                 if role == "writer":
-                    populate(cache, arena, case)
-                    backend.fill(key(case), prepared(), "condition", None, cache)
+                    populate(cache, arena, case, reference=reference)
+                    backend.fill(key(case), *fill_args, cache)
                     assert backend.finish_fill() is not None
                     backend.register(key(case), "component", case["name"])
                     arena.fill_(-12345)
@@ -307,14 +385,16 @@ def worker(root, role):
                     # Queue a real GPU consumer before the test adds any global fence.
                     first = torch.eq(
                         arena[0, 0, 1 : case["rows"] + 1],
-                        pattern(
+                        reference[0][0, 0]
+                        if reference is not None
+                        else pattern(
                             case["rows"], case["heads"], case["dim"], 0, 0, arena.device
                         ),
                     ).all()
                     transfer.commit(cache)
                     assert first.item(), "consumer stream observed incomplete KV"
                     assert cache.prefix is not None
-                    verify(arena, case)
+                    verify(arena, case, reference=reference)
                     item = dict(
                         name=case["name"],
                         shared_hit=True,
@@ -322,11 +402,15 @@ def worker(root, role):
                         guards_checked=True,
                     )
                     if role == "reader":
-                        item.update(performance(backend, cache, arena, pool, case))
+                        item.update(
+                            performance(
+                                backend, cache, arena, pool, case, reference, fill_args
+                            )
+                        )
                     # Deliberate corruption must be caught by the full verifier.
                     arena[-1, -1, case["rows"], -1, -1] += 1
                     try:
-                        verify(arena, case)
+                        verify(arena, case, reference=reference)
                     except AssertionError:
                         item["corruption_detected"] = True
                     else:
@@ -342,7 +426,7 @@ def worker(root, role):
     save(root / (role + ".json"), result)
 
 
-def performance(backend, cache, arena, pool, case):
+def performance(backend, cache, arena, pool, case, reference, fill_args):
     import torch
 
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.preparation_cache import (
@@ -354,7 +438,7 @@ def performance(backend, cache, arena, pool, case):
     local = Block0PreparationCache(
         pool, max_bytes=max_bytes, identity=identity(case), disk_cache=None
     )
-    local.fill(key(case), prepared(), "condition", None, cache)
+    local.fill(key(case), *fill_args, cache)
     assert local.finish_fill() is not None
     trials = []
     for iteration in range(7):
@@ -375,7 +459,7 @@ def performance(backend, cache, arena, pool, case):
             transfer.commit(cache)
             torch.cuda.synchronize()
             end = time.perf_counter()
-            verify(arena, case)
+            verify(arena, case, reference=reference)
             trials.append(
                 dict(
                     mode=label,
@@ -572,19 +656,65 @@ def sp_worker(root, config, rank):
         dist.destroy_process_group()
 
 
-def run(root, protocol, purpose, cases, segment_bytes, *, fault=None):
+def transport_markers(log, devices):
+    markers = [
+        "Transfer engine auto discovery is disabled for protocol: rdma",
+        "Using specified RDMA devices: " + devices,
+        "rdma_transport.cpp:",
+        *["RDMA device: " + name + "," for name in devices.split(",")],
+    ]
+    if "using TCP transport only" in log:
+        return []
+    return markers if all(marker in log for marker in markers) else []
+
+
+def emit_archive_receipt(protocol, result, reader):
+    raw = json.dumps(
+        {"result": result, "reader": reader}, separators=(",", ":")
+    ).encode()
+    digest = hashlib.sha256(raw).hexdigest()
+    data = base64.b64encode(raw).decode("ascii")
+    chunks = [data[i : i + 1024] for i in range(0, len(data), 1024)]
+    for i, chunk in enumerate(chunks):
+        print("ARCHIVE_RECEIPT", protocol, digest, i, len(chunks), chunk, flush=True)
+
+
+def run(
+    root,
+    purpose,
+    cases,
+    segment_bytes,
+    *,
+    fault=None,
+    archive=None,
+    manifest_sha256=None,
+    rdma_devices="",
+):
+    from sglang.multimodal_gen.runtime.realtime.block0_rdma import block0_rdma_devices
+
+    rdma_devices = block0_rdma_devices({"rdma_devices": rdma_devices})
     root.mkdir(parents=True, exist_ok=False)
-    ip = socket.gethostbyname(socket.gethostname())
+    ip = (
+        "127.0.0.1"
+        if archive is not None
+        else socket.gethostbyname(socket.gethostname())
+    )
     config = dict(
         local_hostname=ip,
         master_server_address=f"{ip}:{port()}",
         master_http_url=f"http://{ip}:{port()}",
-        protocol=protocol,
+        protocol="rdma",
+        rdma_devices=rdma_devices,
         namespace="b0_component",
         segment_bytes=segment_bytes,
         cases=cases,
         fault=fault,
     )
+    if archive is not None:
+        config.update(
+            archive=str(archive),
+            manifest_sha256=manifest_sha256,
+        )
     save(root / "config.json", config)
     env = dict(
         os.environ,
@@ -593,21 +723,18 @@ def run(root, protocol, purpose, cases, segment_bytes, *, fault=None):
         MC_STORE_PIN_MEMORY_MAX_BYTES=str(segment_bytes),
     )
     for name in (
-        "MC_FORCE_TCP",
         "MC_FORCE_SHM",
         "MC_INTRANODE_NVLINK",
         "MC_FORCE_MNNVL",
     ):
         env.pop(name, None)
-    if protocol == "tcp":
-        env["MC_FORCE_TCP"] = "1"
     children, logs = [], []
     roles = (
         ["capacity"]
         if purpose == "capacity"
         else ["writer", "reader", "reader-restart"]
     )
-    result = dict(protocol_requested=protocol, purpose=purpose, passed=False)
+    result = dict(protocol_requested="rdma", purpose=purpose, passed=False)
 
     def start(command, label):
         handle = (root / (label + ".log")).open("w")
@@ -713,7 +840,9 @@ def run(root, protocol, purpose, cases, segment_bytes, *, fault=None):
                     ],
                     role,
                 )
-                assert proc.wait(timeout=240) == 0, role + " failed"
+                assert proc.wait(timeout=600 if archive is not None else 240) == 0, (
+                    role + " failed"
+                )
                 assert json.loads((root / (role + ".json")).read_text())["passed"]
                 assert service.poll() is None
         result["passed"] = True
@@ -743,16 +872,15 @@ def run(root, protocol, purpose, cases, segment_bytes, *, fault=None):
                 else [root / (r + ".log") for r in roles]
             ),
         ]
-        result["transport_log_confirmed"] = all(
-            p.exists()
-            and (
-                "Using RDMA transport"
-                if protocol == "rdma"
-                else "using TCP transport only"
-            )
-            in p.read_text()
-            for p in expected_logs
-        )
+        evidence = {
+            path.stem: transport_markers(path.read_text(), rdma_devices)
+            if path.exists()
+            else []
+            for path in expected_logs
+        }
+        result["transport_log_confirmed"] = all(evidence.values())
+        if archive is not None:
+            result["transport_evidence"] = evidence
         result["passed"] = result["passed"] and result["transport_log_confirmed"]
         save(root / "result.json", result)
         if not result["passed"]:
@@ -766,7 +894,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--role", default="suite")
-    parser.add_argument("--suite", choices=("all", "transfer", "sp"), default="all")
+    parser.add_argument(
+        "--suite", choices=("all", "transfer", "sp", "black-lake-l1"), default="all"
+    )
+    parser.add_argument(
+        "--archive", type=Path, help="Read-only completed Black Lake archive directory"
+    )
+    parser.add_argument("--manifest-sha256")
+    parser.add_argument("--rdma-devices", default="")
     parser.add_argument("--preflight", action="store_true")
     args = parser.parse_args()
     if args.preflight:
@@ -778,7 +913,7 @@ def main():
         return worker(args.root, args.role)
     import torch
 
-    required_gpus = 1 if args.suite == "transfer" else 2
+    required_gpus = 2 if args.suite in ("all", "sp") else 1
     assert torch.cuda.device_count() >= required_gpus, (
         "Insufficient GPUs for selected suite"
     )
@@ -786,22 +921,54 @@ def main():
     full = dict(name="block0-50-layer", layers=50, rows=12288, heads=28, dim=128)
     pressure = dict(name="capacity", layers=3, rows=1024, heads=8, dim=128)
     results = []
+    if args.suite == "black-lake-l1":
+        if not args.archive or not args.manifest_sha256:
+            parser.error("black-lake-l1 requires --archive and --manifest-sha256")
+        case = dict(name="black-lake-l1", layers=50, rows=3998, heads=56, dim=128)
+        result = run(
+            args.root / "rdma",
+            "transfer",
+            [case],
+            12 << 30,
+            archive=args.archive.resolve(),
+            manifest_sha256=args.manifest_sha256,
+            rdma_devices=args.rdma_devices,
+        )
+        results.append(result)
+        reader_file = args.root / "rdma" / "reader.json"
+        reader = json.loads(reader_file.read_text()) if reader_file.exists() else None
+        emit_archive_receipt("rdma", result, reader)
     if args.suite in ("all", "transfer"):
-        results.append(run(args.root / "tcp", "tcp", "transfer", [odd, full], 16 << 30))
         results.append(
-            run(args.root / "capacity", "tcp", "capacity", [pressure], 256 << 20)
+            run(
+                args.root / "capacity",
+                "capacity",
+                [pressure],
+                256 << 20,
+                rdma_devices=args.rdma_devices,
+            )
         )
         results.append(
-            run(args.root / "rdma", "rdma", "transfer", [odd, full], 16 << 30)
+            run(
+                args.root / "rdma",
+                "transfer",
+                [odd, full],
+                16 << 30,
+                rdma_devices=args.rdma_devices,
+            )
         )
     if args.suite in ("all", "sp"):
-        results.append(run(args.root / "sp", "tcp", "sp", [odd], 256 << 20))
-        results.append(
-            run(args.root / "sp-error", "tcp", "sp", [odd], 256 << 20, fault="error")
-        )
-        results.append(
-            run(args.root / "sp-kill", "tcp", "sp", [odd], 256 << 20, fault="kill")
-        )
+        for label, fault in (("sp", None), ("sp-error", "error"), ("sp-kill", "kill")):
+            results.append(
+                run(
+                    args.root / label,
+                    "sp",
+                    [odd],
+                    256 << 20,
+                    fault=fault,
+                    rdma_devices=args.rdma_devices,
+                )
+            )
     passed = all(v["passed"] for v in results)
     save(
         args.root / "GPU_RESULT.json",
@@ -809,7 +976,7 @@ def main():
             passed=passed,
             suite=args.suite,
             results=results,
-            sp_tested=args.suite != "transfer",
+            sp_tested=args.suite in ("all", "sp"),
         ),
     )
     raise SystemExit(0 if passed else 1)

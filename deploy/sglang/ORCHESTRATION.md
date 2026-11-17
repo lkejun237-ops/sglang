@@ -153,6 +153,7 @@ python benchmark/whitebox/reconcile_role_retry.py \
 停止 owned 角色。已挂载或部分执行失败时先核对恢复副本与实时身份，不自动重复修复。
 路由 compatibility 是既有调度键；实际 SP 和源码身份以角色回执为准，不从键名推断。
 
+
 ## 预热、验收工具、镜像和回滚的边界
 
 - `verify_traffic_quality.py` 是部署后由操作人员或部署流程显式运行的验收 CLI，调用示例见上文；`orchestrate.py` 不自动调用它，模型 worker 也不调用它。它通过 Coordinator 发起真实 `SourceSession`，核验出帧、租约释放和基线画质，再把结果写回部署凭据。仅传 `--state` 时，Coordinator 地址取自 `state.target.coordinator_url`；显式 `--coordinator-url` 优先。
@@ -160,3 +161,23 @@ python benchmark/whitebox/reconcile_role_retry.py \
 - 本编排器消费 `sites.*.image` 中固定的 `@sha256:` 镜像，不构建镜像，也不自动安装 seedleap-kernels。仓库另有 `docker/whitebox-model.Dockerfile`，通过 `deploy/whitebox/kernels-wheel.lock.txt` 安装预编译 wheel 并调用 `verify_model_kernels.py` 校验。指定给本编排器的任意其他镜像不能据此视为已包含该 wheel，仍须核验镜像来源和内部依赖。
 - `rollback --previous` 仅选择当前部署之前、环境/region/workspace/quota/Coordinator/pool、模型和路由均匹配的 `ready` / `attached` / `stopped` 历史；不回退到其他环境或仅规划的版本。显式指定历史版本也在停止当前资源前核验相同身份边界。源码 SHA、镜像 digest 和配置允许随目标版本变化。
 - 回滚执行会校验历史源码包和渲染工具、停止当前 owned 资源、按历史配置新建 owned 资源并等待角色就绪，保护 reused 服务。它不是热切换，也不自动完成后续 `selftest`、`attach` 和接流画质验收；这些步骤完成前不能宣称流量已恢复。镜像/资产/凭据不可用、历史复用的 E/D 已停机或配额不足仍会阻止恢复。回滚完整 E2E 统计包含停止旧版本的 `stop_previous_sec`。
+
+### 上海测试池由 RAM 用户发起挂载
+
+`ram_publish.py` 将发布请求和角色池操作分开。受信发布作业在上海 VPC 内准备 state、完成原生 selftest，并选定本次允许挂载的精确状态。发布者只提交该状态的 SHA-256 编号。客户端不能通过请求提供命令、镜像、目标环境或 state 文件。实际挂载仍由原生 `attach --in-place` 完成。
+
+环境维护方需预置同账号的专用上海 OSS 桶 `sglang-shcopy-publish-<AccountId>`，ACL 为 private，启用阻止公共访问，并将请求前缀的写权限限定给已有测试发布授权的 RAM 组。客户端需要查询该桶信息和向 `test-shanghai-copy/attach/*` 执行 `oss:PutObject`；发布作业需要查询该桶信息和列举该前缀。采用 ActionTrail/OSS 访问日志追溯云端调用者。注册、签名及 operator 凭据仍由各自受信作业的受管身份提供。新入口不授予 IAM 权限，云账号登录和 GPU 配额均不能代替发布授权。
+
+1. 受信端运行 `python3 deploy/sglang/ram_publish.py plan --state /private/run/state.json`，取得本次已自测部署的编号。
+2. 受信端在自己的发布目录运行 `python3 deploy/sglang/ram_publish.py serve --state /private/run/state.json --release <编号> --aliyun-profile <发布作业的profile> --execute`。它等候这一次请求，默认最多 900 秒。多个执行器须共享同一份受保护的发布状态目录。
+3. 有权发布的用户运行 `python3 deploy/sglang/ram_publish.py request --release <编号> --aliyun-profile <个人profile> --execute`。可在执行端启动前或启动后发起，重复请求使用相同对象键。省略 `--execute` 只显示请求目标。
+4. 执行端重新核对完整状态，并通过同一 Coordinator 的 `POST /v1/role-pool/operator-check` 检查 operator 及池/epoch，之后执行原生挂载。当前服务须已支持该只读接口。403、状态漂移及身份不符都会终止交接。执行结果不明时通过 native state 和现场身份核销；已开始的同一编号不会自动重放。终端返回 `requested` 表示请求已提交，`attached` 表示该编号的挂载已完成。公开入口需另外核验出帧和 Slot 释放。
+
+新池使用 Podman 启动 Coordinator 和独立发布器时，在受管部署配置中只保存一份
+`{"pool_id":"<pool>","parameter_name":"<OOS 名称>","parameter_id":"<OOS ID>","version":1}`。
+两端在各自启动主机上对同一份配置运行
+`python3 deploy/sglang/pool_operator_binding.py --binding <配置> --aliyun-profile <只读配置>`，
+将返回的 JSON 参数数组用于容器创建。两端继续通过原生 `operator-check` 核对实际凭据、池和控制代次。
+
+该入口面向已由凭据管理方投递 Podman Secret 的部署。Secret 按 `sglang-operator-<OOS ID>-v<版本>` 命名，每个版本独立投递。
+工具只查询 OOS 和 Podman 元数据。待启用参数、版本不符或缺少已投递的 Secret 时，容器启动参数生成失败。

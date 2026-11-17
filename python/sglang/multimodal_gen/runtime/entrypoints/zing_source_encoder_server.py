@@ -15,6 +15,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, nullcontext
+from copy import copy, deepcopy
 from dataclasses import fields
 from pathlib import Path
 
@@ -79,7 +80,10 @@ class EncoderConditioning:
         self.cache_write = False
         self.cache_request = self.cache_preview = None
         self.cache_candidates = {}
+        self.active_conditioning_identity = None
+        self.conditioning_identities = {}
         self.pending_inputs = None
+        self.prepared_condition = None
         self.candidates = {}
         self.conditioner.identity_state.dispose()
         clear_prefix = getattr(self.conditioner, "clear_prefix", None)
@@ -104,14 +108,171 @@ class EncoderConditioning:
                 for key, value in self.cache_candidates.items()
                 if key > event_id
             }
+        if event_id in self.conditioning_identities:
+            self.active_conditioning_identity = self.conditioning_identities[event_id]
+            self.conditioning_identities = {
+                key: value
+                for key, value in self.conditioning_identities.items()
+                if key > event_id
+            }
+            self.conditioner.identity_state.identity = self.active_conditioning_identity
+            self.conditioner.identity_state.positive = self.inputs.positive
 
     def reject(self, event_id):
         self.candidates.pop(event_id, None)
         self.cache_candidates.pop(event_id, None)
+        self.conditioning_identities.pop(event_id, None)
         if self.pending_inputs is not None and self.pending_inputs[0] == event_id:
             self.pending_inputs = None
         if event_id == self.event_id:
             self.failed_update = (self.prompt, event_id)
+            self.conditioner.identity_state.identity = self.active_conditioning_identity
+            self.conditioner.identity_state.positive = self.inputs.positive
+        if self.prepared_condition is not None and (
+            self.prepared_condition["command"]["event_id"] == event_id
+        ):
+            self.prepared_condition = None
+
+    @staticmethod
+    def _preparation_command(command):
+        # Early source admission is transport policy, not candidate content.
+        return {k: v for k, v in command.items() if k != "allow_early_release"}
+
+    def _preparation_state(self):
+        state = self.conditioner.identity_state
+        return (
+            self.cache_key,
+            self.cache_hit,
+            self.cache_lookup,
+            self.cache_write,
+            state.identity,
+            state.positive,
+            dict(state.media_hashes),
+        )
+
+    def _restore_preparation_state(self, value):
+        state = self.conditioner.identity_state
+        (
+            self.cache_key,
+            self.cache_hit,
+            self.cache_lookup,
+            self.cache_write,
+            state.identity,
+            state.positive,
+            state.media_hashes,
+        ) = value
+
+    def _prepare_update(self, batch, command, *, reuse_active, timing=None):
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.prompt_update import (
+            prepare_prompt_update,
+        )
+
+        with measure(timing, "condition_cache_lookup"):
+            candidate = self._lookup(batch, update=command, reuse_active=reuse_active)
+        if candidate is not None:
+            if timing is not None:
+                timing.skip("qwen_prepare", "reference_vae")
+            return candidate
+        positive, candidate = prepare_prompt_update(
+            self.codecs,
+            self.inputs,
+            command.get("prompt", batch.sampling_params.prompt),
+            command,
+            use_component=lambda _: nullcontext(),
+            conditioning=self.conditioner,
+            prefix_latent_frames=self.prompt_switch_prefix_latent_frames,
+            preparation_metrics=timing,
+        )
+        if candidate is None:
+            candidate = copy(self.inputs)
+            candidate.positive = positive
+        return candidate
+
+    def prepare_ahead(self, batch, command, *, timing=None):
+        """Prepare one immutable candidate on the existing Encoder owner.
+
+        This is a serialized, source-idle control dispatch, not another GPU
+        session or a background CUDA thread. It neither activates an epoch nor
+        sends conditioning to DiT before the original source boundary.
+        """
+        from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.preparation_cache import (
+            inputs_on,
+        )
+
+        if self.inputs is None or "source_boundary" not in command:
+            raise ValueError("Condition preparation requires an initialized source")
+        if self.prepared_condition is not None:
+            raise ValueError("A condition candidate is already prepared")
+        active = self._preparation_state()
+        began = time.perf_counter()
+        candidate = None
+        error_code = None
+        try:
+            candidate = self._prepare_update(
+                batch, command, reuse_active=True, timing=timing
+            )
+            if candidate is not self.inputs:
+                # Old source encoding continues before activation. Do not keep
+                # aliases of Qwen/reference-VAE replay or transport scratch.
+                device = next(iter(candidate.positive.values())).device
+                candidate = inputs_on(candidate, device, snapshot=True)
+                self.conditioner.identity_state.positive = candidate.positive
+        except ConditionError as error:
+            # Preserve the ordinary boundary rejection path. Do not publish an
+            # early failure as a new active prompt or retain its traceback.
+            error_code = error.code
+        finally:
+            prepared_state = self._preparation_state() if error_code is None else active
+            self._restore_preparation_state(active)
+        if error_code is not None:
+            self.cache_candidates.pop(command["event_id"], None)
+        self.prepared_condition = dict(
+            command=deepcopy(self._preparation_command(command)),
+            base_inputs=self.inputs,
+            base_event=self.event_id,
+            base_key=self.active_cache_key,
+            inputs=candidate,
+            state=prepared_state,
+            error_code=error_code,
+        )
+        logging.getLogger(__name__).info(
+            "ENCODER_CONDITION_PREPARED %s",
+            json.dumps(
+                dict(
+                    session_id=getattr(batch, "realtime_session_id", None),
+                    generation_id=getattr(batch, "realtime_generation_id", None),
+                    request_id=getattr(batch, "request_id", None),
+                    event_id=command["event_id"],
+                    prompt_version=command.get("prompt_version"),
+                    source_boundary=command["source_boundary"],
+                    host_ms=(time.perf_counter() - began) * 1000,
+                    error_code=error_code,
+                )
+            ),
+        )
+
+    def _take_or_prepare(self, batch, command, *, reuse_active, timing=None):
+        from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
+
+        prepared, self.prepared_condition = self.prepared_condition, None
+        if prepared is not None:
+            if (
+                prepared["command"] == self._preparation_command(command)
+                and prepared["base_inputs"] is self.inputs
+                and prepared["base_event"] == self.event_id
+                and prepared["base_key"] == self.active_cache_key
+            ):
+                self._restore_preparation_state(prepared["state"])
+                if prepared["error_code"] is not None:
+                    raise ConditionError(
+                        prepared["error_code"], "Condition preparation failed"
+                    )
+                return prepared["inputs"]
+            self.cache_candidates.pop(prepared["command"]["event_id"], None)
+        return self._prepare_update(
+            batch, command, reuse_active=reuse_active, timing=timing
+        )
 
     def _lookup(self, batch, preview=None, update=None, *, reuse_active=False):
         query = getattr(self, "cache_query", None)
@@ -128,6 +289,7 @@ class EncoderConditioning:
             inputs_on,
             preparation_key,
             preparation_request,
+            preview_sha256,
             updated_preparation_request,
         )
 
@@ -138,6 +300,7 @@ class EncoderConditioning:
                 self.codecs, batch.sampling_params.zing_request
             )
             self.cache_preview = preview
+            self.cache_preview_sha256 = preview_sha256(preview)
         request = self.cache_request
         if update is not None:
             request = updated_preparation_request(
@@ -161,18 +324,34 @@ class EncoderConditioning:
                 # if it cannot reuse its resident Block0.
                 self.cache_hit = False
                 self.cache_lookup = {}
+                self.conditioner.identity_state.identity = (
+                    self.active_conditioning_identity
+                )
+                self.conditioner.identity_state.positive = self.inputs.positive
                 return self.inputs
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.cache_logging import (
             batch_context,
         )
 
+        trace = batch_context(batch)
+        if update is not None and update.get("event_id") is not None:
+            trace["event_id"] = update["event_id"]
         response = query(
             "lookup",
             cache_key=self.cache_key,
+            **(
+                {
+                    "world_id": command["world_id"],
+                    "s0_sha256": self.cache_preview_sha256,
+                    "cache_recording": command.get("cache_recording"),
+                }
+                if command.get("world_id") is not None
+                else {}
+            ),
             prefill=bool(batch.extra.get("zing_prefill")),
             force=batch.extra.get("zing_prefill", {}).get("force", False),
             prompt_update=update is not None,
-            _trace=batch_context(batch),
+            _trace=trace,
         )
         if response.get("code") == "CONDITION_INVALID":
             from sglang.multimodal_gen.runtime.conditioning.contract import (
@@ -255,12 +434,7 @@ class EncoderConditioning:
         condition_switch_protocol=None,
         timing=None,
     ):
-        from copy import copy
-
         from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.prompt_update import (
-            prepare_prompt_update,
-        )
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.source_session import (
             source_preview,
         )
@@ -269,6 +443,27 @@ class EncoderConditioning:
         )
 
         command = batch.extra["zing_source_command"]
+        preparation = batch.extra.get("zing_prompt_prepare")
+        if preparation is not None:
+            if (
+                not async_updates
+                or on_condition is None
+                or command["appends"]
+                or command.get("end") is not None
+                or "zing_prompt_update" in batch.extra
+            ):
+                raise ValueError("Invalid condition preparation dispatch")
+            self.prepare_ahead(batch, preparation, timing=timing)
+            return None, None
+        if (
+            command.get("end") is not None
+            and "zing_prompt_update" not in batch.extra
+            and self.prepared_condition is not None
+        ):
+            self.cache_candidates.pop(
+                self.prepared_condition["command"]["event_id"], None
+            )
+            self.prepared_condition = None
         update_command = batch.extra.get("zing_prompt_update", {})
         update = (
             update_command.get("prompt", batch.sampling_params.prompt),
@@ -306,6 +501,7 @@ class EncoderConditioning:
             self.prompt = batch.sampling_params.prompt
             self.event_id = batch.realtime_event_id
             self.active_cache_key = self.cache_key
+            self.active_conditioning_identity = self.conditioner.identity_state.identity
             output = self._condition(
                 self.inputs,
                 self.event_id,
@@ -322,39 +518,32 @@ class EncoderConditioning:
             sent = False
             previous = self.prompt, self.event_id
             if update_command.get("rejected"):
+                if self.prepared_condition is not None:
+                    self.cache_candidates.pop(
+                        self.prepared_condition["command"]["event_id"], None
+                    )
+                    self.prepared_condition = None
                 self.failed_update = update
             else:
                 try:
                     release_source = (
                         async_updates
                         and "source_boundary" in update_command
-                        and condition_switch_protocol == CLIP_BARRIER_V2
+                        and (
+                            condition_switch_protocol == CLIP_BARRIER_V2
+                            or update_command.get("allow_early_release") is True
+                        )
                     )
-                    with measure(timing, "condition_cache_lookup"):
-                        candidate = self._lookup(
-                            batch,
-                            update=update_command,
-                            reuse_active=release_source,
-                        )
+                    candidate = self._take_or_prepare(
+                        batch,
+                        update_command,
+                        reuse_active=release_source,
+                        timing=timing,
+                    )
                     reuse_active = candidate is not None and candidate is self.inputs
-                    if candidate is not None:
-                        if timing is not None:
-                            timing.skip("qwen_prepare", "reference_vae")
-                        positive = candidate.positive
-                    else:
-                        positive, candidate = prepare_prompt_update(
-                            self.codecs,
-                            self.inputs,
-                            update[0],
-                            update_command,
-                            use_component=lambda _: nullcontext(),
-                            conditioning=self.conditioner,
-                            prefix_latent_frames=self.prompt_switch_prefix_latent_frames,
-                            preparation_metrics=timing,
-                        )
-                    if candidate is None:
-                        candidate = copy(self.inputs)
-                        candidate.positive = positive
+                    self.conditioning_identities[update[1]] = (
+                        self.conditioner.identity_state.identity
+                    )
                     if on_condition is not None:
                         # Publish the candidate before dispatch: the reply may
                         # already contain the first output using this event.
@@ -388,6 +577,11 @@ class EncoderConditioning:
                     self.pending_inputs = None
                     self.candidates.pop(update[1], None)
                     self.cache_candidates.pop(update[1], None)
+                    self.conditioning_identities.pop(update[1], None)
+                    self.conditioner.identity_state.identity = (
+                        self.active_conditioning_identity
+                    )
+                    self.conditioner.identity_state.positive = self.inputs.positive
                     self.failed_update = update
                     output = None
                     notice = dict(code=exc.code, event_id=update[1])
@@ -466,7 +660,12 @@ class SourceEncoderExecutor:
                 )
 
                 labels = {name: options.get(name) for name in ("game_id", "group_id")}
+                labels["world_id"] = command.get("world_id")
+                labels["cache_recording"] = command.get("cache_recording")
+                labels["persist"] = options.get("persist", False)
                 labels["_trace"] = batch_context(batch)
+                lookup_receipt = getattr(self.conditioning, "cache_lookup", {})
+                origin = lookup_receipt.get("lookup", {})
                 if self.conditioning.cache_hit:
                     # Reuse prefill to register labels even on an existing hit.
                     receipt = self._cache_query(
@@ -485,6 +684,13 @@ class SourceEncoderExecutor:
                         if geometry
                         else [command["config"][k] for k in ("height", "width")]
                     )
+                    if (
+                        origin.get("backend") == "mooncake"
+                        and origin.get("cache_result") == "miss"
+                    ):
+                        # The Encoder already paid the archive lookup budget for
+                        # this key. DiT can still consume a newly published L1.
+                        labels["resident_only"] = True
                     receipt = self._cache_query(
                         "prefill",
                         cache_key=self.conditioning.cache_key,
@@ -508,20 +714,27 @@ class SourceEncoderExecutor:
                     "host_ms": encoder_ms,
                     "status": "executed",
                 }
-                lookup_receipt = getattr(self.conditioning, "cache_lookup", {})
-                origin = lookup_receipt.get("lookup", {})
-                # A first lookup may promote L2; a second bookkeeping lookup
-                # must not turn that request into an advertised L1 hit.
-                if receipt.get("hit") and origin.get("cache_result") == "l2_hit":
-                    timing["cache_result"] = "l2_hit"
-                    timing["lookup"] = origin
+                # Keep the original deep-tier hit, or the metadata timeout
+                # that sent this request down the recompute path.
+                if (
+                    receipt.get("hit")
+                    and origin.get("cache_result") in {"l2_hit", "l3_hit"}
+                    or not receipt.get("hit")
+                    and origin.get("miss_reason") == "l3_probe_timeout"
+                ):
+                    timing.update(
+                        cache_result=origin["cache_result"],
+                        miss_reason=origin.get("miss_reason"),
+                        lookup=origin,
+                    )
                     for rank, value in zip(
                         receipt.get("rank_timings", []),
                         lookup_receipt.get("rank_lookups", []),
                     ):
-                        rank["cache_result"], rank["lookup"] = (
-                            value["cache_result"],
-                            value,
+                        rank.update(
+                            cache_result=value["cache_result"],
+                            miss_reason=value.get("miss_reason"),
+                            lookup=value,
                         )
                 if timing.get("cache_result") is not None:
                     receipt["cache_result"] = timing["cache_result"]
@@ -778,7 +991,13 @@ class SourceEncoderExecutor:
                 payload.update(
                     {
                         name: command.get(name)
-                        for name in ("cache_write", "game_id", "group_id")
+                        for name in (
+                            "world_id",
+                            "cache_recording",
+                            "cache_write",
+                            "game_id",
+                            "group_id",
+                        )
                     }
                 )
                 boundary = batch.extra.get("zing_prompt_update", {}).get(
@@ -1145,7 +1364,8 @@ class SourceEncoderExecutor:
                 and not self.encoder.ready
             ):
                 send_dit("source.end", latent_frames=self._dit_latents)
-        self.command_index += 1
+        if "zing_prompt_prepare" not in batch.extra:
+            self.command_index += 1
         return OutputBatch(
             # An empty RGB list means no media postprocessing in the shared
             # scheduler-client wrapper. Actual output is an explicit handoff.
@@ -1292,9 +1512,13 @@ class EncoderClient:
             torch.cuda.synchronize()
             # Resolve after the pre-existing execution fence; telemetry adds no sync.
             if isinstance(request, list) and hasattr(self.executor, "timing_buffer"):
-                result.realtime_handoff.setdefault("timing_reports", []).extend(
-                    self.executor.timing_buffer.drain()
-                )
+                reports = self.executor.timing_buffer.drain()
+                if reports:
+                    if result.realtime_handoff is None:
+                        result.realtime_handoff = {}
+                    result.realtime_handoff.setdefault("timing_reports", []).extend(
+                        reports
+                    )
         except BaseException as exc:
             from sglang.multimodal_gen.runtime.realtime.cleanup_watchdog import (
                 CleanupWatchdog,
@@ -1323,6 +1547,7 @@ def create_apps(
     connection_ports=None,
     pipeline_config=None,
     session_max_lifetime_s=None,
+    cache_config=None,
     prefix_cache_bytes=0,
     metrics_token=None,
 ):
@@ -1369,6 +1594,7 @@ def create_apps(
         text_encoder_cpu_offload=False,
         zing_conditioning_mode="local",
         zing_conditioning_prefetch=False,
+        zing_block0_mooncake_config=cache_config,
     )
     set_global_server_args(args)
 
@@ -1680,6 +1906,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--pipeline-config-path", type=Path)
+    parser.add_argument(
+        "--zing-block0-mooncake-config",
+        help="Server-owned cache configuration for the world cache management API",
+    )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--advertise-host", default="127.0.0.1")
     parser.add_argument("--worker-id")
@@ -1757,6 +1987,7 @@ def main():
             service_count=cli.service_count,
             connection_ports=connection_ports,
             session_max_lifetime_s=cli.session_max_lifetime_s,
+            cache_config=cli.zing_block0_mooncake_config,
             prefix_cache_bytes=cli.qwen_prefix_cache_bytes,
             metrics_token=metrics_token,
             pipeline_config=json.loads(cli.pipeline_config_path.read_text())

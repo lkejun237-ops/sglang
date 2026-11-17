@@ -9,6 +9,7 @@ const sdk=file=>import(pathToFileURL('/opt/worldkit/packages/stream-player/src/'
 const {WhiteboxClient}=await sdk('whitebox-client.mjs');
 const {buildManagedWhiteboxInit}=await sdk('whitebox-init.mjs');
 const {assembleWhiteboxExecution}=await sdk('whitebox-execution.mjs');
+const {createWhiteboxInferencePort}=await sdk('whitebox-inference.mjs');
 
 const settings = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const root = settings.output, began = performance.now();
@@ -18,7 +19,7 @@ const statesLog = fs.openSync(`${root}/states.jsonl`, 'a');
 const counts = {whitebox: 0, model: 0}, bytes = {whitebox: 0, model: 0};
 const seen = {whitebox: new Set(), model: new Set()}, inputs = new Map(), receipts = new Map();
 const matched = new Set(), latencies = [], frames = [];
-let client, ready, firstModel = null, finished = false, failure = null, currentInput = null;
+let client, inferenceController, ready, firstModel = null, finished = false, failure = null, currentInput = null;
 let held = [], inputTimer, renewalTimer, releaseTimer, activeUntil = null;
 function sanitize(value) {
   return JSON.parse(JSON.stringify(value, (key, item) =>
@@ -67,9 +68,28 @@ function frame(stream, message) {
   }
   acknowledge(stream, message.output_frame_start);
 }
+// The SDK descriptor forbids query parameters. The direct localhost Gateway
+// still multiplexes legacy generate and Whitebox; route only the wire URL.
+class WhiteboxSocket extends WebSocket {
+  constructor(url) {
+    if (url !== settings.url) throw Error('Unexpected signalling URL');
+    const endpoint = new URL(url);
+    endpoint.searchParams.set('whitebox_control', 'v2');
+    // The localhost showcase route namespaces query identities as query:<id>.
+    // Match the signed managed-control subject; otherwise Room rejects attach.
+    if (!settings.subject.startsWith('query:') || settings.subject.length > 246) {
+      throw Error('The local smoke subject must match the Gateway query identity');
+    }
+    endpoint.searchParams.set('user_id', settings.subject.slice(6));
+    endpoint.searchParams.set('trace_id', settings.trace_id);
+    super(endpoint.href);
+  }
+}
 client = new WhiteboxClient({url: settings.url, transport: 'websocket', maxQueuedFrames: 64,
+  WebSocketImpl: WhiteboxSocket,
   codec: {encode, decode},
   onReady: async message => {
+    inferenceController?.sync();
     ready = message;
     fs.writeFileSync(`${root}/ready.private.json`, JSON.stringify(message, (_key, value) => typeof value === 'bigint' ? String(value) : value));
     record('ready', message); acknowledge('whitebox', -1);
@@ -82,12 +102,12 @@ client = new WhiteboxClient({url: settings.url, transport: 'websocket', maxQueue
   onInputSent: (sequence, kind, at_ms) => {
     if (kind !== 'renewal') {inputs.set(sequence, {at_ms, kind, action: currentInput}); record('input_sent', {sequence, kind, at_ms, action: currentInput});}
   },
-  onControl: message => record('control', message),
+  onControl: message => {inferenceController?.receive(message); record('control', message);},
   onRenderStatus: message => record('render', message),
   onDiagnostic: message => record('diagnostic', message),
-  onRecover: message => record('recovery', message),
+  onRecover: message => {inferenceController?.sync(true); record('recovery', message);},
   onError: message => {failure = String(message); record('error', {message: failure});},
-  onClose: () => {finished = true; record('closed');},
+  onClose: () => {inferenceController?.close(); finished = true; record('closed');},
 });
 const references = (settings.references || []).map(ref => ({id: ref.id, format: ref.format, payload: new Uint8Array(fs.readFileSync(ref.file))}));
 let managedOperation;
@@ -134,6 +154,9 @@ async function startManaged(){
   }while(true);
   const descriptor=assembleWhiteboxExecution({signallingUrl:settings.url,attachment:current.attachment,
     execution:current.execution,publication:settings.publication,subject:settings.subject});
+  // Managed attachments expose the SDK inference port through their adapter;
+  // WhiteboxClient.inference is only initialized by a direct manual init.
+  inferenceController=createWhiteboxInferencePort(client,descriptor);
   client.attach(descriptor,{refreshAttachment:async()=>{
     const refreshed=await control('getAttachment');
     if(!refreshed.attachment)throw Error('MANAGED_ATTACHMENT_UNAVAILABLE');
@@ -168,12 +191,12 @@ try {
     if (held.length && !client.closed) client.input({held_keys: held, held_buttons: [], events: []});
   }, 200);
   if (settings.inference_control === 'manual') {
-    await waitUntil(() => client.inference?.read().availability === 'ready', 30000);
-    const current = client.inference.read();
+    await waitUntil(() => {inferenceController.sync(); return inferenceController.port.read().availability === 'ready';}, 30000);
+    const current = inferenceController.port.read();
     if (!current.scope || !current.value) throw Error('Manual inference scope is unavailable');
     if(counts.model!==0)throw Error('MODEL_PIXELS_BEFORE_MANUAL_ENABLE');
     record('manual_model_enable_requested',{model_frames_before_enable:counts.model});
-    await client.inference.configure({scope: current.scope, expectedRevision: current.value.revision, enabled: true});
+    await inferenceController.port.configure({scope: current.scope, expectedRevision: current.value.revision, enabled: true});
     record('manual_model_enable_confirmed');
   }
   await waitUntil(() => firstModel !== null, 240000);

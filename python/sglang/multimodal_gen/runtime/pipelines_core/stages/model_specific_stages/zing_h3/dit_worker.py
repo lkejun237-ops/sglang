@@ -93,6 +93,9 @@ def create_link_session(
         nonlocal lease
         if stage is not None and stage.block0_cache is not None:
             stage.block0_cache.finish_fill()
+            release_copy = getattr(stage.block0_cache, "release_source_copies", None)
+            if release_copy is not None:
+                release_copy()
         if lease is not None:
             lease.release()
             lease = None
@@ -257,10 +260,9 @@ def create_link_session(
                 entry = cache.lookup(message["cache_key"])
                 lookup = dict(cache.last_lookup)
                 earlier = message.get("cache_lookup", {})
-                if (
-                    lookup.get("cache_result") == "l1_hit"
-                    and earlier.get("cache_result") == "l2_hit"
-                ):
+                if lookup.get("cache_result") == "l1_hit" and earlier.get(
+                    "cache_result"
+                ) in {"l2_hit", "l3_hit"}:
                     lookup = dict(earlier)
                 telemetry.cache_result = lookup.get("cache_result", "miss")
                 telemetry.miss_reason = lookup.get("miss_reason")
@@ -275,6 +277,7 @@ def create_link_session(
                     reported=False,
                 )
                 state.capture_initial_prefix = None
+                state.capture_raw_prefix = getattr(cache, "requires_raw_prefix", True)
                 if entry is None and message.get("cache_write", False):
 
                     def capture(prefix):
@@ -309,6 +312,8 @@ def create_link_session(
                             state.cache,
                             required=False,
                         )
+                        if getattr(state.cache, "_compressed_kv_enabled", False):
+                            state.cache.release_prefix_export()
                         if stored:
                             cache.register(
                                 message["cache_key"],
@@ -375,16 +380,21 @@ def create_link_session(
 
         # Match the integrated condition barrier: all ranks finish their CUDA
         # dependencies before publishing the same event/version/boundary.
-        device = worker.state.device
-        if device is None:
-            # Initial conditioning can finish before the first source frame.
-            device = next(sampler.generator.parameters()).device
+        # Early preparation precedes the first source chunk, which initializes
+        # state.device. The admitted condition already owns its actual device.
+        device = worker.state.device or worker.state.prompt.condition["context"].device
         if device.type == "cuda":
             event = torch.cuda.Event()
             event.record(torch.cuda.current_stream(device))
             event.synchronize()
         if any(value != receipt for value in coordinate_validation(receipt)):
             raise ValueError("Condition readiness differs across DiT ranks")
+
+    async def output_and_publish(result):
+        await output(result)
+        cache = None if stage is None else stage.block0_cache
+        if getattr(cache, "backend", None) == "mooncake":
+            cache.finish_fill(wait=False)
 
     worker = QueuedDiTSession(
         detailed_timing=init.get("detailed_timing", False),
@@ -396,7 +406,7 @@ def create_link_session(
         prepare_condition=prepare,
         confirm_condition_ready=confirm_condition_ready,
         release_storage=release_storage,
-        on_output=output,
+        on_output=output_and_publish,
         sample_moments=lambda value, latent_start: (
             codecs.sample_streaming_visual_moments(
                 value, latent_start=latent_start, noise_version=STREAMING_NOISE_VERSION
@@ -410,7 +420,7 @@ def create_link_session(
         if value is None or value["reported"]:
             return None
         transfer, telemetry = value["restore"], value["telemetry"]
-        if transfer is not None:
+        if transfer is not None and transfer.end is not None:
             # Match the integrated telemetry: never synchronize for reporting.
             if not transfer.end.query():
                 return None

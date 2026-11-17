@@ -252,15 +252,26 @@ class ZingSourceStreamState(BaseRealtimeState):
                 stage.codecs,
                 preview,
                 dict(config),
-                self.block0_cache.identity,
+                getattr(self.block0_cache, "key_identity", self.block0_cache.identity),
             )
             self.block0_key = preparation_key(
                 stage.codecs,
                 self.block0_input_request,
                 preview,
                 config,
-                self.block0_cache.identity,
+                getattr(self.block0_cache, "key_identity", self.block0_cache.identity),
             )
+            if self.block0_input_request.get("world_id") is not None:
+                from .preparation_cache import preview_sha256
+
+                self.block0_cache.bind_world(
+                    self.block0_key,
+                    self.block0_input_request["world_id"],
+                    s0_sha256=preview_sha256(preview),
+                    observer_token=command.get("cache_recording"),
+                    context=batch_context(batch),
+                )
+                self.cache_recording = command.get("cache_recording")
             self.block0_entry = self.block0_cache.lookup(self.block0_key)
             self.block0_lookup_ms = (time.perf_counter() - started) * 1000
             lookup = getattr(self.block0_cache, "last_lookup", {})
@@ -389,6 +400,9 @@ class ZingSourceStreamState(BaseRealtimeState):
         )
         if self.block0_cache is not None:
             self.sampler.prepare_prompt_prefix = self._prepare_block0_switch
+            self.sampler.capture_raw_prefix = getattr(
+                self.block0_cache, "requires_raw_prefix", True
+            )
         if self.block0_entry is not None:
             if not cached_joint:
                 self.sampler.restore_initial_prefix = self._restore_block0
@@ -544,6 +558,8 @@ class ZingSourceStreamState(BaseRealtimeState):
         cache = getattr(stage, "block0_cache", None)
         if cache is None:
             raise ValueError("Block0 prefill requires an enabled Block0 cache")
+        if getattr(cache, "tiers", None) is not None and not cache.tiers.l1:
+            raise ValueError("Block0 prefill requires the L1 tier")
         command = batch.extra.get("zing_source_command", {})
         config = dict(config or command.get("config") or {})
         if not {"width", "height", "fps"} <= config.keys():
@@ -568,8 +584,22 @@ class ZingSourceStreamState(BaseRealtimeState):
 
         input_request = preparation_request(stage.codecs, request)
         key = preparation_key(
-            stage.codecs, input_request, source_preview, config, cache.identity
+            stage.codecs,
+            input_request,
+            source_preview,
+            config,
+            getattr(cache, "key_identity", cache.identity),
         )
+        if input_request.get("world_id") is not None:
+            from .preparation_cache import preview_sha256
+
+            cache.bind_world(
+                key,
+                input_request["world_id"],
+                s0_sha256=preview_sha256(source_preview),
+                observer_token=command.get("cache_recording"),
+                context=batch_context(batch),
+            )
         with self.block0_telemetry.measure("cache_lookup"):
             entry = None if force else cache.lookup(key, allow_disk=True)
         lookup = (
@@ -646,7 +676,14 @@ class ZingSourceStreamState(BaseRealtimeState):
                     )
                     cuda_begin.record()
                 with self.block0_telemetry.measure("block0_forward"):
-                    state = sampler.initialize(inputs, visual, storage=storage)
+                    state = sampler.initialize(
+                        inputs,
+                        visual,
+                        storage=storage,
+                        retain_prefix_layers=getattr(
+                            cache, "requires_raw_prefix", True
+                        ),
+                    )
                 if cuda_end is not None:
                     cuda_end.record()
                 with self.block0_telemetry.measure("d2h_and_l1_publish"):
@@ -794,6 +831,8 @@ class ZingSourceStreamState(BaseRealtimeState):
 
     def _fill_block0_after_output(self):
         # Called on the dispatch after the first RGB output has been returned.
+        if getattr(self.block0_cache, "backend", None) == "mooncake":
+            self.block0_cache.finish_fill(wait=False)
         if (
             self.cache_write
             and self.block0_prefix is not None
@@ -811,6 +850,8 @@ class ZingSourceStreamState(BaseRealtimeState):
                 )
                 if stored:
                     self.block0_cache.register(self.block0_key, **self.cache_labels)
+                if getattr(self.sampler.cache, "_compressed_kv_enabled", False):
+                    self.sampler.cache.release_prefix_export()
 
     def _block0_update_key(self, stage, prompt, command):
         """Share the CPU request identity between prefetch and owner lookup."""
@@ -835,7 +876,17 @@ class ZingSourceStreamState(BaseRealtimeState):
                 for item in refs
             ]
         codecs, preview, config, identity = self.block0_key_args
-        return preparation_key(codecs, request, preview, config, identity), request
+        key = preparation_key(codecs, request, preview, config, identity)
+        if request.get("world_id") is not None:
+            from .preparation_cache import preview_sha256
+
+            self.block0_cache.bind_world(
+                key,
+                request["world_id"],
+                s0_sha256=preview_sha256(preview),
+                observer_token=getattr(self, "cache_recording", None),
+            )
+        return key, request
 
     def _start_conditioning_prefetch(self, stage, batch, endpoint, command):
         from sglang.multimodal_gen.runtime.conditioning.prefetch import (
@@ -2092,6 +2143,9 @@ class ZingSourceStreamState(BaseRealtimeState):
         try:
             if self.block0_cache is not None:
                 self.block0_cache.finish_fill()
+                release_copy = getattr(self.block0_cache, "release_source_copies", None)
+                if release_copy is not None:
+                    release_copy()
                 transfer = self.block0_restore
                 if transfer is not None:
                     transfer.wait()

@@ -459,7 +459,10 @@ class ZingChunkGraphs:
         views = []
         for column, count in enumerate(("clean_rows", "rows")):
             ranges = [
-                (plan.kv_plan.write_start, plan.kv_plan.write_start + rows)
+                (0, rows)
+                if getattr(plan.kv_plan, "compressed_attention_layout", None)
+                is not None
+                else (plan.kv_plan.write_start, plan.kv_plan.write_start + rows)
                 for plan in plans
                 if (rows := getattr(plan.kv_plan, count))
             ]
@@ -467,6 +470,23 @@ class ZingChunkGraphs:
                 start = min(begin for begin, _ in ranges)
                 stop = max(end for _, end in ranges)
                 views.extend(pair[column][start:stop] for pair in stores)
+        compressed_plans = [
+            p.kv_plan
+            for p in plans
+            if getattr(p.kv_plan, "compressed_attention_layout", None) is not None
+        ]
+        if compressed_plans:
+            from .zing_h3_compressed_view import mutable_store_views
+
+            ranges = [
+                (dest, dest + (stop - start + 63) // 64)
+                for kv in compressed_plans
+                for start, stop, dest, _ in kv.compressed_clean_parts
+            ]
+            if ranges:
+                begin, end = min(a for a, _ in ranges), max(b for _, b in ranges)
+                for store in compressed_plans[0]._compressed_kv_stores:
+                    views.extend(mutable_store_views(store, begin, end))
         reused = getattr(plans[0].kv_plan, "reused_history_rows", 0)
         if rotated and reused:
             ranges = []
@@ -483,7 +503,20 @@ class ZingChunkGraphs:
         return tuple(views)
 
     def _run(self, kind, plans, tensors, execute, stores, rotated=()):
-        signatures = tuple(plan.signature for plan in plans)
+        # Compressed routing freezes block classifications during capture. A
+        # same-sized prompt/sink change must not replay the previous roles.
+        signatures = tuple(
+            (
+                plan.signature,
+                tuple(
+                    (branch, spec.blk_kind_sig)
+                    for branch, spec in sorted(
+                        getattr(plan.kv_plan, "_compressed_branch_specs", {}).items()
+                    )
+                ),
+            )
+            for plan in plans
+        )
         ckv_addrs = []
         for plan in plans:
             ckv_list = getattr(
@@ -510,6 +543,9 @@ class ZingChunkGraphs:
         sparse_sig = ()
         force_sparse_eager = (
             os.environ.get("ZING_SPARSE_DISABLE_CHUNK_GRAPH", "0") == "1"
+        )
+        force_sparse_eager |= any(
+            getattr(p.kv_plan, "prefix_export_layers", None) is not None for p in plans
         )
         if (
             kind != "prefix_separate"
@@ -831,7 +867,9 @@ class ZingChunkGraphs:
         return height // patch_h, width // patch_w
 
     @staticmethod
-    def _forward_plan(sampler, shadow, packed, phase, after=None, *, target_grid=None):
+    def _forward_plan(
+        sampler, shadow, packed, phase, after=None, *, target_grid=None, generator=None
+    ):
         from sglang.multimodal_gen.runtime.models.dits.zing_h3_cache import (
             ZingFixedForwardKVPlan,
         )
@@ -862,6 +900,7 @@ class ZingChunkGraphs:
         kv = ZingFixedForwardKVPlan(
             shadow,
             positions,
+            current_blocks=blocks,
             ends=ends,
             clean_rows=clean,
             prefix=phase == "prefix"
@@ -879,7 +918,7 @@ class ZingChunkGraphs:
             kv.tensors["current_positions"] = host_to_device(
                 transaction.mapped_positions, packed["x"].device
             )
-        model = sampler.generator
+        model = sampler.generator if generator is None else generator
         if (
             shadow._model_signature is None
             and model.time_embedder._frequency_cache is None
@@ -967,6 +1006,9 @@ class ZingChunkGraphs:
                 shadow=shadow,
                 plan=plan,
             )
+        if kv.prefix_export_layers is not None and shadow.prefix is not None:
+            shadow.prefix.layers = kv.prefix_export_layers
+            shadow.prefix.export_owned = True
         return plan
 
     @staticmethod

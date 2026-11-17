@@ -169,6 +169,7 @@ class SourceReadySession:
         self._pending_prefix = None
         self.defer_final = defer_final
         self.sampler = sampler
+        self.capture_raw_prefix = True
         # Reuse the deployment's graph owner; explicit test/eager overrides are
         # respected, and the existing graph environment switch controls startup.
         model = sampler.generator
@@ -272,6 +273,9 @@ class SourceReadySession:
             rope_position_mode=sampler.rope_position_mode,
             rope_max_frame_gap=sampler.rope_max_frame_gap,
             storage=storage,
+            retain_prefix_layers=getattr(self, "capture_initial_prefix", None)
+            is not None
+            and getattr(self, "capture_raw_prefix", True),
         )
 
     @staticmethod
@@ -1347,6 +1351,10 @@ class SourceReadySession:
 
         sampler, cache = self.sampler, self.cache
         source, target, *_ = current.spans[0]
+        cache.retain_prefix_layers |= (
+            self.capture_initial_prefix is not None
+            and getattr(self, "capture_raw_prefix", True)
+        )
         if (
             not sampler.initial_prefix_joint
             or prompt is self.applied_prompt
@@ -1408,6 +1416,10 @@ class SourceReadySession:
         )
 
     def _apply_prefix(self, current, prompt):
+        self.cache.retain_prefix_layers |= (
+            self.capture_initial_prefix is not None
+            and getattr(self, "capture_raw_prefix", True)
+        )
         if prompt is self.applied_prompt:
             return
         if self._cached_prefix_ready:

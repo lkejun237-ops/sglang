@@ -400,8 +400,15 @@ def test_prefix_metrics_over_real_http_service(encoder, monkeypatch):
             )
         assert response.status_code == 200
         assert "text/plain" in response.headers["content-type"]
+        families = list(text_string_to_metric_families(response.text))
+        names = [family.name for family in families]
+        assert len(names) == len(set(names)), "Metric families must not be duplicated"
+        assert "world_model_critical_path_stage_duration_seconds" in names
         samples = [
-            s for f in text_string_to_metric_families(response.text) for s in f.samples
+            sample
+            for family in families
+            if family.name.startswith("world_model_conditioning_")
+            for sample in family.samples
         ]
 
         def value(name, **labels):
@@ -418,9 +425,7 @@ def test_prefix_metrics_over_real_http_service(encoder, monkeypatch):
         assert value(prefix + "reused_tokens_count") == 5
         assert value(prefix + "results_total", source="encoding") == 5
         assert all(
-            set(s.labels) <= {"prefix_outcome", "kind", "source", "le"}
-            for s in samples
-            if s.name.startswith(prefix)
+            set(s.labels) <= {"prefix_outcome", "kind", "source", "le"} for s in samples
         )
     finally:
         server.should_exit = True

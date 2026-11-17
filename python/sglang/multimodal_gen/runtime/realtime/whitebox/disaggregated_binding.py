@@ -233,6 +233,7 @@ class DisaggregatedModelLeases(ModelLeases):
         }:
             raise RenderError("CAPABILITY_UNAVAILABLE")
         socket = renew = None
+        cancel_requested = False
         try:
             request = dict(
                 admission_id=self.admission_id,
@@ -252,6 +253,14 @@ class DisaggregatedModelLeases(ModelLeases):
 
             async def admit_group():
                 deadline = time.monotonic() + self.config.get("startup_seconds", 480)
+                capacity_deadline = (
+                    min(
+                        deadline,
+                        time.monotonic() + self.request["capacity_wait_ms"] / 1000,
+                    )
+                    if self.model_only and self.request.get("wait_for_capacity")
+                    else 0.0
+                )
                 if (
                     isinstance(self.preferred_service_ids, dict)
                     and self.preferred_service_ids
@@ -287,9 +296,19 @@ class DisaggregatedModelLeases(ModelLeases):
                             break
                         await asyncio.sleep(0.2)
                 while True:
+                    if cancel_requested:
+                        raise PoolError("ADMISSION_CANCELLED")
                     try:
                         return await self.control("admit", request)
                     except PoolError as error:
+                        # A batch's next item may arrive before the released
+                        # roles advertise fresh idle observations. Honor its
+                        # explicit wait budget without changing player admission
+                        # or retrying an uncertain submission with a new identity.
+                        wait_for_capacity = (
+                            error.code == "CAPACITY_EXHAUSTED"
+                            and time.monotonic() < capacity_deadline
+                        )
                         if (
                             error.code
                             not in {
@@ -298,8 +317,8 @@ class DisaggregatedModelLeases(ModelLeases):
                                 "CONTROL_STORE_BUSY",
                                 "CAPACITY_BUSY",
                             }
-                            or time.monotonic() >= deadline
-                        ):
+                            and not wait_for_capacity
+                        ) or time.monotonic() >= deadline:
                             raise
                         await asyncio.sleep(0.2)
 
@@ -307,6 +326,7 @@ class DisaggregatedModelLeases(ModelLeases):
             try:
                 self.group = await asyncio.shield(admit)
             except asyncio.CancelledError:
+                cancel_requested = True
                 await asyncio.shield(
                     self.control(
                         "cancel",

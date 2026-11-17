@@ -1,0 +1,33 @@
+{
+  "namespace": "zing_b0",
+  "local_hostname": "127.0.0.1",
+  "master_server_address": "127.0.0.1:50051",
+  "master_http_url": "http://127.0.0.1:9003",
+  "metadata_server": "P2PHANDSHAKE",
+  "protocol": "rdma",
+  "store_memory_bytes": 51539607552,
+  "metadata_buffer_bytes": 67108864,
+  "tiers": {
+    "l1": true,
+    "l2": true,
+    "l3": true,
+    "l1_to_l2": true,
+    "l1_to_l3": false,
+    "l2_to_l3": true,
+    "retention_days": 7,
+    "snapshot_bytes": 8589934592,
+    "max_pending": 2,
+    "max_object_bytes": 536870912,
+    "deadline_s": 120,
+    "oss_probe_timeout_s": 1.0,
+    "online_wait_ms": 0,
+    "state_directory": "/var/lib/sglang/block0-state/prod-shanghai",
+    "disk_directory": "/mnt/zing-nvme/block0/prod-shanghai",
+    "disk_bytes": 137438953472,
+    "min_free_bytes": 68719476736,
+    "bucket": "leap-world-shanghai",
+    "region": "cn-shanghai",
+    "endpoint": "https://oss-cn-shanghai-internal.aliyuncs.com",
+    "prefix": "sglang-block0-cache/v2/prod-shanghai/"
+  }
+}

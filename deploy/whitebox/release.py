@@ -251,6 +251,15 @@ def verify(bundle, source, sdk, observations):
             "region": bundle["region"],
             "identity_status": "configured",
         }
+        if (
+            role in ("room", "gateway", "coordinator")
+            and "control_credential_refs" in bundle["bindings"]
+        ):
+            from control_bindings import manifest_digest, parse_manifest
+
+            expected["control_binding_sha256"] = manifest_digest(
+                parse_manifest(bundle["bindings"]["control_credential_refs"])
+            )
         if any(version.get(key) != value for key, value in expected.items()):
             raise ValueError(f"Runtime identity mismatch: {role}")
     pins = {observations[role]["version"].get("sdk_sha") for role in RELEASE_ROLES}
@@ -272,6 +281,11 @@ def main():
     )
     plan.add_argument("--region", choices=("shanghai", "thailand"), required=True)
     plan.add_argument("--bindings", type=Path, required=True)
+    plan.add_argument(
+        "--control-credential-refs",
+        type=Path,
+        help="Reviewed Shanghai test OOS identities; metadata only",
+    )
     plan.add_argument("--output", type=Path, required=True)
     b = sub.add_parser(
         "build", help="Explicit local image build, with no push or activation"
@@ -336,7 +350,15 @@ def main():
     args = p.parse_args()
     if args.command == "plan":
         outside_checkout(args.output)
-        bundle = render(load(args.region), json.loads(args.bindings.read_text()))
+        bindings = json.loads(args.bindings.read_text())
+        if args.control_credential_refs:
+            if "control_credential_refs" in bindings:
+                p.error("Specify control credential references only once")
+            refs = json.loads(args.control_credential_refs.read_text())
+            bindings["control_credential_refs"] = json.dumps(
+                refs, sort_keys=True, separators=(",", ":")
+            )
+        bundle = render(load(args.region), bindings)
         # Never overwrite an earlier reviewed release plan implicitly.
         with args.output.open("x") as f:
             json.dump(bundle, f, indent=2)

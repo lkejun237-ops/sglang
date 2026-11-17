@@ -259,6 +259,13 @@ class LaunchTests(unittest.TestCase):
                 self.assertNotIn("TOKEN", env)
                 self.assertEqual(env["WORLD_MODEL_METRIC_SERVICE"], role)
                 self.assertEqual(env["WORLD_MODEL_METRIC_LANE"], "default")
+                if role == "encoder":
+                    self.assertEqual(env["SGLANG_ZING_SOURCE_PREPARE"], "1")
+                    c["environment"] = {"SGLANG_ZING_SOURCE_PREPARE": "0"}
+                    _, overridden = launch.command(
+                        c, self.root, "10.0.0.2", "worker-fixture"
+                    )
+                    self.assertEqual(overridden["SGLANG_ZING_SOURCE_PREPARE"], "0")
                 self.assertEqual(
                     env["PROMETHEUS_MULTIPROC_DIR"],
                     str(self.root.parent / "prometheus" / "worker-fixture"),
@@ -1156,12 +1163,40 @@ def test_examples_reuse_profile_launcher_without_duplicate_acceleration_defaults
         assert data["profile"] == "auto"
         assert "quantization" not in data
         assert "dit_options" not in data
+
     orch_data = json.loads((examples_dir / "orchestration.json").read_text())
     for role, data in orch_data["roles"].items():
         assert "role_launcher" not in data
         assert data["profile"] == "auto"
         assert "quantization" not in data
         assert "dit_options" not in data
+
+
+def test_mooncake_role_reads_mounted_secrets_and_redacts_the_receipt(
+    live_assets, exited_launcher
+):
+    config = live_assets.assets("encoder")
+    names = ("WHITEBOX_CACHE_RECORDING_SECRET", "SGLANG_CACHE_ADMIN_TOKEN")
+    config["secret_files"] = {}
+    for name in names:
+        path = live_assets.root / name
+        path.write_text("private-fixture-" + name)
+        config["secret_files"][name] = str(path)
+    config["environment"] = {
+        "AWS_SHARED_CREDENTIALS_FILE": "/var/run/whitebox-oss/credentials",
+        "AWS_EC2_METADATA_DISABLED": "true",
+    }
+    launch.validate_config(config)
+    _, env = launch.command(config, live_assets.root, "10.0.0.2", "worker-fixture")
+    for name in names:
+        assert env[name] == "private-fixture-" + name
+    assert env["AWS_SHARED_CREDENTIALS_FILE"] == "/var/run/whitebox-oss/credentials"
+    receipt = exited_launcher(config)
+    assert set(names).isdisjoint(receipt["environment"])
+    assert "private-fixture-" not in json.dumps(receipt)
+    config["environment"]["AWS_SHARED_CREDENTIALS_FILE"] = "unmounted"
+    with pytest.raises(ValueError, match="absolute mounted path"):
+        launch.validate_config(config)
 
 
 def test_metrics_boot_isolation_and_receipt(live_assets, exited_launcher):
@@ -1182,6 +1217,35 @@ def test_metrics_boot_isolation_and_receipt(live_assets, exited_launcher):
     assert first["enabled"] is True
     # Shared-model services expose the same registry; advertise only the base HTTP.
     assert first["url"] == "http://10.0.0.122:31000/metrics"
+
+
+@pytest.mark.parametrize(
+    "name,mode,three_tier",
+    [
+        ("dit.sparse-block0-mooncake.json", "sparse_095", "1"),
+        ("dit.bf16-block0-mooncake.json", "dense", "0"),
+    ],
+)
+def test_sparse_block0_recipe_preserves_required_flags(
+    live_assets, monkeypatch, name, mode, three_tier
+):
+    recipe = json.loads((Path(__file__).parent / "examples" / name).read_text())
+    c = live_assets.assets("dit")
+    c["environment"] = recipe["environment"]
+    c["profile"] = recipe["profile"]
+    monkeypatch.setenv("SGLANG_ZING_SPARSE_ATTN_MODE", "incorrect_parent_mode")
+    monkeypatch.setenv("SGLANG_ZING_SPARSE_THREE_TIER", "incorrect_parent_flag")
+    c["dit_options"] = recipe["dit_options"]
+    launch.validate_config(c)
+    argv, env = launch.command(c, live_assets.root, "127.0.0.1", "fixture")
+    assert env["SGLANG_ZING_SPARSE_ATTN_MODE"] == mode
+    assert env["SGLANG_ZING_SPARSE_THREE_TIER"] == three_tier
+    assert argv[argv.index("--zing-block0-cache-mode") + 1] == "on"
+    assert argv[argv.index("--zing-block0-cache-backend") + 1] == "mooncake"
+    assert (
+        argv[argv.index("--zing-block0-mooncake-config") + 1]
+        == recipe["dit_options"]["zing_block0_mooncake_config"]
+    )
 
 
 def test_stage_assets_by_role_stages_only_role_hot_weights_and_links_rest(tmp_path):

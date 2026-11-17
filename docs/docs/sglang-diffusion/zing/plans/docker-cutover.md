@@ -132,3 +132,46 @@ An explicit `codex/` candidate identity sets the isolated-development flag in it
 container and hashed release policy; it does not relabel the image as main.
 The host operator uses portable subprocess pipes. The optional archive-owner
 probe still requires the running Room interpreter to be CPython 3.14.
+
+## Explicit Room cache configuration
+
+An optional Room-only `room_cache` object names one existing `route`, its
+`expected_compatibility` and new `compatibility`, the `expected_recording_prefix`
+and new `recording_prefix`, plus `recording_secret_file`, its exact
+`recording_secret_sha256`, and `expected_recording_secret_sha256` (null when
+previously absent). The secret is a private operator input, never printed or
+placed in the public policy metadata.
+
+Preparation copies the current read-only `WHITEBOX_ROLE_POOL_CONFIG` file, changes
+only the selected route compatibility, and mounts that copy in the stopped
+candidate. Other routes, network addresses, authentication and the original file
+remain unchanged. This explicit rollout enables signed late cache receipts with
+`WHITEBOX_CACHE_RECORDING_ENABLED=1`. That switch and the recording prefix are
+reflected in the release policy and
+the private compiled environment. Source/SDK checks and the admission/recording
+idle gates still apply. Old and candidate route bytes and the secret input are
+rechecked before switch. Rollback restores the original container with its
+original route file, prefix and credentials. This is not an arbitrary mount or
+environment override interface.
+
+The explicit cache route also clears the old Room-wide preferred/avoided service
+IDs. The new compatibility is the group selector; carrying an old preferred
+Encoder into that group can reject all admissions. The original hints remain in
+the untouched rollback container.
+
+### Gateway Prefill bindings
+
+A Gateway candidate can use the explicit `gateway_prefill` change to enable the
+Prefill API with a role-pool route and a Redis result store. Freeze separate
+private JSON files for the environment values and pool configuration, their
+SHA-256 values, and the previous environment-value hashes. The operator accepts
+only the Prefill flag, Redis URI, role-pool backend/path and the pool's named
+room token. Existing RTC authorization is required. It rejects extra environment
+keys and changed inputs before stopping the original service.
+
+The pool mounts read-only at `/run/whitebox/role-pool-prefill.json`. Credentials
+remain in the private runtime bundle; public policy metadata contains only the
+flag, backend and config path. Preparation creates stopped candidates and keeps
+the original configuration for rollback. This binding does not authorize a
+rollout or prove the public batch endpoint works; validate actual admission,
+persistence results, retries and release in the selected environment.

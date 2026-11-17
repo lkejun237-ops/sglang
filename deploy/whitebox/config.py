@@ -67,7 +67,11 @@ BINDINGS = {
     "asset_root",
     "state_root",
 }
-OPTIONAL_BINDINGS = {"room_pool_compatibility"}
+OPTIONAL_BINDINGS = {
+    "room_pool_compatibility",
+    "cache_config",
+    "control_credential_refs",
+}
 
 SECRET_KEYS = {
     "coordinator": ["WHITEBOX_INTERNAL_TOKEN", "REDIS_PASSWORD"],
@@ -195,6 +199,15 @@ def validate(config):
             "Model static memory fraction must be explicit and between zero and one"
         )
     integer(model["cache_host_gb"], 1, 4096, "cache_host_gb")
+    if model.get("cache_backend", "local") not in {"local", "mooncake"}:
+        raise ValueError("Unknown Block0 cache backend")
+    cache_recording = config["environment"]["room"].get(
+        "WHITEBOX_CACHE_RECORDING_ENABLED", "0"
+    )
+    if cache_recording not in {"0", "1"} or (
+        cache_recording == "1" and model.get("cache_backend", "local") != "mooncake"
+    ):
+        raise ValueError("Cache operation recording requires the Mooncake policy")
     integer(model["cache_disk_gb"], 1, 16384, "cache_disk_gb")
     if "cache_host_total_gb" in model:
         integer(
@@ -261,7 +274,9 @@ def validate(config):
             ):
                 raise ValueError(f"Invalid environment entry for {role}")
             if key in {k for keys in SECRET_KEYS.values() for k in keys} | {
-                "WHITEBOX_ROOM_ADMIN_TOKEN"
+                "WHITEBOX_ROOM_ADMIN_TOKEN",
+                "SGLANG_CACHE_ADMIN_TOKEN",
+                "WHITEBOX_CACHE_RECORDING_SECRET",
             }:
                 raise ValueError(
                     "Credentials must be supplied by the platform secret store"
@@ -315,6 +330,19 @@ def render(config, bindings):
         }
         for role in ROLES
     }
+    if "control_credential_refs" in b:
+        from control_bindings import REFS_ENV, parse_manifest
+
+        refs = parse_manifest(b["control_credential_refs"])
+        if c["region"] != refs["region"]:
+            raise ValueError("Control bindings do not match the release region")
+        if (
+            urlsplit(b["gateway_url"]).hostname
+            != "shcopy.world-test-platform.loopit.com.cn"
+        ):
+            raise ValueError("Control bindings require the Shanghai test Gateway")
+        for role in ("room", "gateway", "coordinator"):
+            envs[role][REFS_ENV] = b["control_credential_refs"]
     shared = {
         "WHITEBOX_ROOM_COORDINATOR_URL": b["coordinator_url"],
         "WHITEBOX_ROOM_OWNER_ID": b["owner_id"],
@@ -372,6 +400,9 @@ def render(config, bindings):
             "quantization_scope", "ffn-attention"
         )
     required_secrets = copy.deepcopy(SECRET_KEYS)
+    if envs["room"].get("WHITEBOX_CACHE_RECORDING_ENABLED") == "1":
+        for role in ("room", "model"):
+            required_secrets[role].append("WHITEBOX_CACHE_RECORDING_SECRET")
     if b.get("room_pool_compatibility"):
         for role in ("gateway", "coordinator", "room"):
             envs[role]["WHITEBOX_DYNAMIC_ROOMS"] = "1"

@@ -336,7 +336,18 @@ async def prefill_websocket(ws: WebSocket):
                     }
                 )
                 deadline = time.monotonic() + timeout
-                root = api.get_global_server_args().zing_block0_cache_dir
+                args = api.get_global_server_args()
+                root = args.zing_block0_cache_dir
+                if descriptor.get("schema") == "zing-block0-tier-state-v1":
+                    import json
+                    from pathlib import Path
+
+                    config = json.loads(
+                        Path(args.zing_block0_mooncake_config).read_text()
+                    )
+                    root = config.get("tiers", {}).get(
+                        "state_directory", "/tmp/sglang-block0-state"
+                    )
                 last_progress = time.monotonic()
                 while time.monotonic() < deadline:
                     try:
@@ -427,6 +438,11 @@ async def prefill_websocket(ws: WebSocket):
             if fatal:
                 await ws.close(code=1011)
         except (ValueError, TypeError, KeyError):
+            api.logger.warning(
+                "Prefill request validation failed: request_id=%s",
+                request_id,
+                exc_info=True,
+            )
             cache_event(
                 "prefill_request",
                 "rejected",

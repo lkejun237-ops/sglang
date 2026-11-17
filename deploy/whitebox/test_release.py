@@ -238,6 +238,8 @@ def test_git_archive_excludes_dirty_local_patches_and_secrets(tmp_path):
     for name in (
         "asset-library/subjects/old.glb",
         "asset-library/tests/fixture.glb",
+        "asset-library/tests/fixtures/atlas-recording/recording.json",
+        "asset-library/tests/fixtures/atlas-recording/inputs.zip",
         "asset-library/package.json",
         "packages/stream-host/tests/raw-session.test.ts",
     ):
@@ -273,7 +275,10 @@ def test_git_archive_excludes_dirty_local_patches_and_secrets(tmp_path):
     assert (slim / "asset-library/package.json").is_file()
     assert (slim / "packages/stream-host/tests/raw-session.test.ts").is_file()
     assert not (slim / "asset-library/subjects").exists()
-    assert not (slim / "asset-library/tests").exists()
+    assert not (slim / "asset-library/tests/fixture.glb").exists()
+    for name in ("recording.json", "inputs.zip"):
+        rel = Path("asset-library/tests/fixtures/atlas-recording") / name
+        assert (slim / rel).read_bytes() == (repo / rel).read_bytes()
 
 
 def test_platform_builder_binds_release_identity_to_actual_checkout():
@@ -729,3 +734,50 @@ def test_dynamic_room_pool_is_explicit_and_only_adds_runtime_wiring():
     assert (
         "WHITEBOX_ROOM_ADMIN_TOKEN" not in static["required_secret_keys"]["coordinator"]
     )
+
+
+def test_rendered_shanghai_control_roles_check_the_same_manifest_at_startup(
+    tmp_path, monkeypatch
+):
+    from control_bindings import REFS_ENV, marker
+    from test_control_bindings import manifest
+
+    pins = manifest()
+    serialized = json.dumps(pins, sort_keys=True, separators=(",", ":"))
+    b = json.loads((ROOT / "bindings.example.json").read_text())
+    b["gateway_url"] = "https://shcopy.world-test-platform.loopit.com.cn"
+    b["control_credential_refs"] = serialized
+    plan = render(load("shanghai"), b)
+    with pytest.raises(ValueError, match="region"):
+        render(load("thailand"), b)
+    sf = tmp_path / "release.json"
+    sf.write_text(
+        json.dumps(
+            {"source_sha": "a" * 40, "sdk_sha": "b" * 40, "source_branch": "main"}
+        )
+    )
+    monkeypatch.setenv("WHITEBOX_RELEASE_MANIFEST", str(sf))
+    bf = tmp_path / "bundle"
+    for env in plan["environments"].values():
+        env["WHITEBOX_RELEASE_BUNDLE"] = str(bf)
+    bf.write_text(json.dumps(plan))
+    monkeypatch.setenv("WHITEBOX_RELEASE_BUNDLE", str(bf))
+    identities = set()
+    for role in ("room", "gateway", "coordinator"):
+        for k, v in plan["environments"][role].items():
+            monkeypatch.setenv(k, v)
+        assert plan["environments"][role][REFS_ENV] == serialized
+        for env, purpose in (
+            ("WHITEBOX_INTERNAL_TOKEN", "room_internal"),
+            ("WHITEBOX_RTC_AUTH_SECRET", "rtc"),
+            ("WHITEBOX_ROOM_ADMIN_TOKEN", "room_admin"),
+        ):
+            monkeypatch.setenv(env, "local-fixture-" + purpose)
+            monkeypatch.setenv(env + "_OOS_REF", marker(pins["refs"][purpose]))
+        app = FastAPI()
+        install_release_route(app, role)
+        identities.add(app.state.whitebox_release["control_binding_sha256"])
+        monkeypatch.setenv("WHITEBOX_INTERNAL_TOKEN_OOS_REF", "wrong")
+        with pytest.raises(ValueError, match="room_internal"):
+            install_release_route(FastAPI(), role)
+    assert len(identities) == 1

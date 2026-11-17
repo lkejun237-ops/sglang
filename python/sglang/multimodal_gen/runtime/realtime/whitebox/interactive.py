@@ -896,6 +896,9 @@ class InteractiveSession(WhiteboxUpstream):
                 self.source_admission_ready.set()
             if startup is not None:
                 await startup.attach()
+                for report in startup.timing_reports:
+                    await self.model_control(report)
+                startup.timing_reports.clear()
                 self.model_wire_sequence = startup.event_sequence
             sent = accepted = consumed = received = demand_version = 0
             sampler = getattr(self.latest, "sampler", None)

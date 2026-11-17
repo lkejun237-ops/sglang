@@ -22,6 +22,31 @@ MAX_CHUNK = 1024**2
 TERMINAL = {"persisted", "failed", "cancelled"}
 
 
+class PrefillRateLimited(ValueError):
+    pass
+
+
+def terminal(record):
+    return record["state"] in TERMINAL or (
+        record["state"] == "memory_ready" and not record.get("durable", False)
+    )
+
+
+def bind_world(native, world):
+    from ..cache_archive import world_token
+
+    if not isinstance(world, dict) or set(world) != {"source_id", "world_id"}:
+        raise ValueError("Invalid prefill world identity")
+    for value in world.values():
+        if not isinstance(value, str) or not re.fullmatch(
+            r"[A-Za-z0-9._-]{1,128}", value
+        ):
+            raise ValueError("Invalid prefill world identity")
+    world_token(world["world_id"])
+    # Ownership comes from the signed envelope, never from native payload fields.
+    return {**native, "world_id": world["world_id"], "cache_write": True}
+
+
 class PrefillStatusCors:
     """CORS only for bearer-authorized status reads, never legacy routes."""
 
@@ -112,7 +137,7 @@ class MemoryPrefillStore:
         subject = value.get("subject_hash", "local")
         for bucket, limit in (((minute, subject), 10), ((minute, "global"), 30)):
             if self.rate.get(bucket, 0) >= limit:
-                raise ValueError("Prefill request rate exceeded")
+                raise PrefillRateLimited("Prefill request rate exceeded")
         self.rate[(minute, subject)] = self.rate.get((minute, subject), 0) + 1
         self.rate[(minute, "global")] = self.rate.get((minute, "global"), 0) + 1
         self.values[key] = dict(value)
@@ -157,7 +182,7 @@ class RedisPrefillStore:
             json.dumps(value),
         )
         if result[0] == -1:
-            raise ValueError("Prefill request rate exceeded")
+            raise PrefillRateLimited("Prefill request rate exceeded")
         return result[0] == 1, json.loads(result[1])
 
     async def update(self, key, owner, value):
@@ -183,7 +208,7 @@ def public_result(record):
         for k, v in record.items()
         if k not in {"owner", "payload_sha256", "expires_at", "subject_hash"}
     }
-    if record["state"] not in TERMINAL and time.time() - record["updated_at"] > 600:
+    if not terminal(record) and time.time() - record["updated_at"] > 600:
         result.update(state="unknown", code="PREFILL_STATUS_STALE")
     return result
 
@@ -197,6 +222,7 @@ class PrefillGateway:
         self.model_revision, self.vae_fingerprint = model_revision, vae_fingerprint
         self.tasks = {}
         self.uploads = 0
+        self.batch_tasks = set()
 
     def authorize(self, token, *, origin, world, request_id, operation):
         claims = self.capabilities.verify(
@@ -217,6 +243,7 @@ class PrefillGateway:
 
     async def _run(self, key, record, native, user_id):
         began = time.monotonic()
+        durable = record.get("durable", False)
         lease = create_model_leases(
             self.coordinator,
             self.connect,
@@ -226,7 +253,7 @@ class PrefillGateway:
             trace_id=record["trace_id"],
             max_bytes=MAX_PAYLOAD,
             strict_release=True,
-            capacity_wait_ms=0,
+            capacity_wait_ms=60_000 if record.get("batch") else 0,
             operation_path="/v1/realtime_video/prefill",
             profile_hint=native.get("size"),
         )
@@ -235,15 +262,15 @@ class PrefillGateway:
                 async with lease.open() as (upstream, assignment):
                     admission_ms = (time.monotonic() - began) * 1000
                     ready = msgspec.msgpack.decode(await upstream.recv())
-                    if ready.get("type") != "prefill.ready" or not ready.get(
-                        "capabilities", {}
-                    ).get("persistence"):
+                    if ready.get("type") != "prefill.ready" or (
+                        durable and not ready.get("capabilities", {}).get("persistence")
+                    ):
                         raise RuntimeError("Prefill capability is unavailable")
                     await self._publish(
                         key, record, "computing", admission_ms=admission_ms
                     )
                     await upstream.send(
-                        msgspec.msgpack.encode({**native, "persist": True})
+                        msgspec.msgpack.encode({**native, "persist": durable})
                     )
                     memory_ready = False
                     while True:
@@ -254,6 +281,11 @@ class PrefillGateway:
                         ):
                             raise RuntimeError("Prefill receipt identity mismatch")
                         kind = message.get("type")
+                        # Native non-durable completion is a legacy L1-ready
+                        # alias, never evidence of durable storage.
+                        if kind == "prefill.completed":
+                            kind = "prefill.memory_ready"
+                            message = {**message, "type": kind}
                         if kind in {"prefill.memory_ready", "prefill.persisted"}:
                             if message.get("session_id") != assignment.session_id:
                                 raise RuntimeError("Prefill session identity mismatch")
@@ -261,8 +293,14 @@ class PrefillGateway:
                             await lease.release_compute()
                             memory_ready = True
                             await self._publish(
-                                key, record, "memory_ready", receipt=message
+                                key,
+                                record,
+                                "memory_ready",
+                                receipt=message,
+                                prefill_to_memory_ms=(time.monotonic() - began) * 1000,
                             )
+                            if not durable:
+                                return
                         elif kind == "prefill.persisting":
                             await self._publish(key, record, "persisting")
                         elif kind == "prefill.persisted":
@@ -393,8 +431,12 @@ class PrefillGateway:
                 }
                 if set(native) - allowed:
                     raise ValueError("Unsupported public prefill fields")
+                if type(native.get("persist", False)) is not bool:
+                    raise ValueError("Invalid prefill persistence option")
+                native = bind_world(native, world)
                 now = time.time()
                 record = dict(
+                    durable=native.get("persist", False),
                     request_id=request_id,
                     trace_id=uuid4().hex,
                     state="accepted",
@@ -431,7 +473,7 @@ class PrefillGateway:
                             msgspec.msgpack.encode({"type": "prefill.status", **public})
                         )
                         previous = public
-                    if public["state"] in TERMINAL or public["state"] == "unknown":
+                    if terminal(public) or public["state"] == "unknown":
                         break
                     await asyncio.sleep(0.25)
         except WebSocketDisconnect:
@@ -485,8 +527,209 @@ class PrefillGateway:
             raise HTTPException(404, "The prefill request was not found")
         return public_result(result)
 
+    async def _claim_batch_item(self, key, record):
+        # Only a known atomic rate rejection is retried. Connection failures
+        # have an unknown write outcome and must not replay a claim.
+        began = time.monotonic()
+        async with asyncio.timeout(125):
+            while True:
+                try:
+                    record["batch_rate_wait_ms"] = (time.monotonic() - began) * 1000
+                    return await self.store.claim(key, record)
+                except PrefillRateLimited:
+                    await asyncio.sleep(max(0.1, 60 - time.time() % 60 + 0.05))
+
+    async def batch(self, request):
+        """Wait for durable results, reusing per-item claims and model leases.
+
+        Envelope: msgpack {items: [{world, authorization, payload: bytes}]}.
+        Each payload is the existing signed native Prefill with persist=true.
+        No extra SDK fields or second GPU scheduler are introduced.
+        """
+        if self.batch_tasks:
+            raise HTTPException(429, "A prefill batch is already running")
+        if (
+            request.headers.get("content-type", "").split(";")[0]
+            != "application/msgpack"
+        ):
+            raise HTTPException(415, "A MessagePack batch is required")
+        body = bytearray()
+        async with asyncio.timeout(60):
+            async for chunk in request.stream():
+                if len(body) + len(chunk) > MAX_PAYLOAD:
+                    raise HTTPException(
+                        413, "The prefill batch exceeds its byte budget"
+                    )
+                body.extend(chunk)
+        try:
+            envelope = msgspec.msgpack.decode(body)
+            if not isinstance(envelope, dict) or set(envelope) != {"items"}:
+                raise ValueError()
+            items = envelope["items"]
+            if not isinstance(items, list) or not 1 <= len(items) <= 8:
+                raise ValueError()
+            validated, seen = [], set()
+            for item in items:
+                if not isinstance(item, dict) or set(item) != {
+                    "world",
+                    "authorization",
+                    "payload",
+                }:
+                    raise ValueError()
+                raw = item["payload"]
+                if not isinstance(raw, bytes):
+                    raise ValueError()
+                native = msgspec.msgpack.decode(raw)
+                if (
+                    not isinstance(native, dict)
+                    or native.get("type") != "prefill"
+                    or native.get("persist") is not True
+                ):
+                    raise ValueError()
+                allowed = {
+                    "type",
+                    "request_id",
+                    "prompt",
+                    "seed",
+                    "size",
+                    "source_stream",
+                    "source_frame",
+                    "source_frame_size",
+                    "references",
+                    "zing_realtime_api_version",
+                    "persist",
+                    "persist_timeout_s",
+                }
+                if set(native) - allowed:
+                    raise ValueError()
+                request_id = native.get("request_id")
+                claims = self.authorize(
+                    item["authorization"],
+                    origin=request.headers.get("origin"),
+                    world=item["world"],
+                    request_id=request_id,
+                    operation="submit",
+                )
+                digest = hashlib.sha256(raw).hexdigest()
+                if claims.get("payload_sha256") != digest or claims.get(
+                    "payload_bytes"
+                ) != len(raw):
+                    raise ValueError()
+                key = request_key(claims["sub"], item["world"], request_id)
+                if key in seen:
+                    raise ValueError()
+                seen.add(key)
+                validated.append(
+                    (key, bind_world(native, item["world"]), claims["sub"], digest)
+                )
+        except (ValueError, TypeError, KeyError, msgspec.DecodeError):
+            raise HTTPException(
+                422, "The prefill batch authorization or input is invalid"
+            ) from None
+        if self.batch_tasks:
+            raise HTTPException(429, "A prefill batch is already running")
+
+        async def execute():
+            results = []
+            for key, native, user, digest in validated:
+                now = time.time()
+                record = dict(
+                    request_id=native["request_id"],
+                    trace_id=uuid4().hex,
+                    durable=True,
+                    batch=True,
+                    state="accepted",
+                    owner=uuid4().hex,
+                    payload_sha256=digest,
+                    created_at=now,
+                    updated_at=now,
+                    expires_at=now + 3600,
+                    subject_hash=hashlib.sha256(user.encode()).hexdigest(),
+                )
+                try:
+                    claimed, old = await self._claim_batch_item(key, record)
+                except Exception:
+                    results.append(
+                        dict(
+                            request_id=native["request_id"],
+                            state="unknown",
+                            code="PREFILL_SUBMISSION_UNCONFIRMED",
+                        )
+                    )
+                    continue
+                if old["payload_sha256"] != digest or not old.get("durable"):
+                    results.append(
+                        dict(
+                            request_id=native["request_id"],
+                            state="failed",
+                            code="PREFILL_REQUEST_ID_CONFLICT",
+                        )
+                    )
+                    continue
+                try:
+                    if claimed:
+                        if len(self.tasks) >= 4:
+                            await self._publish(
+                                key, record, "failed", code="PREFILL_BUSY"
+                            )
+                        else:
+                            task = asyncio.create_task(
+                                self._run(key, record, native, user)
+                            )
+                            self.tasks[key] = task
+                            await asyncio.shield(task)
+                    else:
+                        async with asyncio.timeout(550):
+                            while not terminal(old):
+                                await asyncio.sleep(0.25)
+                                old = await self.store.get(key)
+                                if (
+                                    old is None
+                                    or public_result(old)["state"] == "unknown"
+                                ):
+                                    break
+                    result = await self.store.get(key)
+                    results.append(
+                        public_result(result)
+                        if result
+                        else {"request_id": native["request_id"], "state": "unknown"}
+                    )
+                except Exception:
+                    results.append(
+                        dict(
+                            request_id=native["request_id"],
+                            state="unknown",
+                            code="PREFILL_STATUS_UNCONFIRMED",
+                        )
+                    )
+            durable = sum(row["state"] == "persisted" for row in results)
+            return dict(
+                state="succeeded"
+                if durable == len(results)
+                else "partial"
+                if durable
+                else "unknown"
+                if any(row["state"] == "unknown" for row in results)
+                else "failed",
+                durable_count=durable,
+                items=results,
+            )
+
+        task = asyncio.create_task(execute())
+        self.batch_tasks.add(task)
+
+        def finished(task):
+            self.batch_tasks.discard(task)
+            if not task.cancelled():
+                task.exception()
+
+        task.add_done_callback(finished)
+        # A disconnect does not create another compute attempt. Existing per-item
+        # status reads/retry identities remain authoritative.
+        return await asyncio.shield(task)
+
     async def close(self):
-        tasks = list(self.tasks.values())
+        tasks = [*self.batch_tasks, *self.tasks.values()]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -500,3 +743,7 @@ def register_prefill_routes(app, manager):
     @app.get("/v1/realtime_video/prefill/requests/{request_id}")
     async def status(request: Request, request_id: str):
         return await manager.status(request, request_id)
+
+    @app.post("/v1/realtime_video/prefill/batch")
+    async def batch(request: Request):
+        return await manager.batch(request)

@@ -227,6 +227,12 @@ class StreamingData:
                 # A condition switch may use this image after the worker ACK.
                 # Confirm its immutable object before returning that receipt.
                 self.objects[descriptor["path"]].finish()
+        elif kind == "cache_event":
+            from .cache_events import PATH
+
+            if not hasattr(self, "cache_events"):
+                self.cache_events = TextObject(self.object(PATH))
+            self.cache_events.write(json_line(value))
         elif kind == "inference_timing":
             self.inference_timings.write(json_line(value))
         elif kind == "model_input":
@@ -334,6 +340,8 @@ class StreamingData:
             self, "_output_context_frames", 0
         )
         self.source_states.close()
+        if hasattr(self, "cache_events"):
+            self.cache_events.close()
         self.inference_timings.close()
         counts = {name: mux.count for name, mux in self.encoders.items()}
         complete = (

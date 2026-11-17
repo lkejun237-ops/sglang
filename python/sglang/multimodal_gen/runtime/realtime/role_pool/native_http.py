@@ -5,6 +5,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -20,6 +21,15 @@ class ManagedTransport:
         native = getattr(self.owner_app.state, "worker_connections", None)
         managed = getattr(native, "managed", None)
         path = scope.get("path", "")
+        # These CPU-only routes enforce their own cache-admin token. Requiring
+        # a player business claim here would consume model capacity and reject
+        # legitimate administrative requests before that authorization runs.
+        cache_management = scope["type"] == "http" and (
+            scope.get("method") == "POST"
+            and path == "/v1/zing/cache/delete-world"
+            or scope.get("method") == "GET"
+            and re.fullmatch(r"/v1/zing/cache/operations/[a-f0-9]{32}", path)
+        )
         protected = (
             scope["type"] == "websocket"
             or scope["type"] == "http"
@@ -27,6 +37,7 @@ class ManagedTransport:
         )
         if (
             not protected
+            or cache_management
             or managed is None
             and not os.environ.get("SGLANG_ROLE_POOL_WORKER_CONFIG")
         ):

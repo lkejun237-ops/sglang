@@ -15,6 +15,8 @@ before a separately authorized deployment. It does not establish the original503
 
 已构建的准确 Docker 镜像可按[Room/Gateway 候选与切换](../../docs/docs/sglang-diffusion/zing/plans/docker-cutover.md)分阶段准备、空闲切换和回滚；私有配置必须绑定实际线路、完整授权角色和不可变身份。
 
+上海测试入口的独立发布作业可在受管切换配置中设置 `idle.credential_source` 为 `publisher`。凭据管理方将 Room 状态凭据 `WHITEBOX_INTERNAL_TOKEN`、角色池容量凭据 `ADAPTIVE_ROLE_POOL_ROOM_TOKEN` 注入发布作业，并随每项注入同名加 `_AUDIENCE` 的准确检查 URL。两轮空闲检查使用这些作业凭据，缺少绑定、地址不符或原生接口拒绝时均中止切换。
+
 持续维护的操作流程和验证边界见
 [Whitebox 手工发布](../../docs/docs/sglang-diffusion/zing/plans/whitebox-manual-releases.mdx)。
 
@@ -160,3 +162,17 @@ Build only after the pinned SDK commit is reachable from Worldkit `dev`. The SDK
 PR regression results and actual Room image/cutover/playback evidence are separate.
 Default Shanghai rollout must verify the original 720p World and worker replacement
 without restarting the Room; the pin alone does not activate this behavior.
+
+上海测试控制面可用 `release.py plan --control-credential-refs <受管清单>` 让 Room、Gateway 和 Coordinator 的发布配置固定同一套 OOS 引用。清单包含 `environment`、`region`、`pool_id`、`refs`、`audiences`。每个引用只保存 `parameter_name`、`parameter_id`、`version`。用 `deploy/sglang/pool_operator_binding.py --binding <清单> --verify-controls --aliyun-profile <只读配置>` 核对 OOS 元数据，检查会列出全部不匹配的用途。
+
+| 用途 | 使用方 |
+| --- | --- |
+| `room_internal` | Room、Gateway、Room 目录 Coordinator、入口发布作业 |
+| `pool_room` | 启用了角色池接线的 Room/Gateway、模型池 Coordinator、入口发布作业 |
+| `operator` | 模型池 Coordinator、模型发布作业 |
+| `registration` / `signing` | 模型池 Coordinator、GPU Worker。模型发布作业也使用签名身份 |
+| `rtc` / `room_admin` | 启用原生 RTC 的 Room/Gateway、启用动态 Room 注册的目录 Coordinator |
+
+`audiences` 中的 `room_internal` 与 `pool_room` 分别指向实际 Room 状态及池容量 URL。凭据管理方通过原有秘密投递渠道，将值和同名加 `_OOS_REF` 的版本回执一起注入各自的工作负载。回执格式为 `cn-shanghai/<参数名>/<参数 ID>/v<版本>`。元数据按用途共享，组件按各自原生配置读取变量名。入口发布作业还使用两项已绑定的 `_AUDIENCE`。受管清单通过 `WHITEBOX_CONTROL_CREDENTIAL_REFS` 传递，Docker、Podman 和独立进程使用相同校验。运行版本接口只记录清单摘要。
+
+入口切换配置的 `control_credential_refs` 指定目标组件清单，`idle.credential_source` 使用 `publisher`。当来源池与目标池不同时，将当前池的清单另放在 `idle.control_credential_refs` 作原路由占用检查。Room 与 Gateway 在启动前及实际进程启动时核对投递回执，Coordinator 启动、Worker 注册和发布作业交接前也核对本角色依赖。元数据检查仍需配合原生鉴权。已经启动的进程沿用原身份，直至受管发布真正完成。

@@ -85,6 +85,17 @@ def run(bundle, expected, *, retries=0):
     with (state / "launcher.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         facts = hardware(bundle, expected)
+        if bundle["policy"]["model"].get("cache_backend", "local") == "mooncake":
+            from sglang.multimodal_gen.runtime.realtime.block0_rdma import (
+                block0_rdma_devices,
+            )
+            from sglang.multimodal_gen.runtime.realtime.cache_tiers import CacheTiers
+
+            cache_config = json.loads(
+                Path(bundle["bindings"]["cache_config"]).read_text()
+            )
+            block0_rdma_devices(cache_config)
+            CacheTiers.parse(cache_config.get("tiers", {}))
         root = Path(bundle["bindings"]["asset_root"])
         verify_prepared(root, bundle)
         pipeline = json.loads((root / "pipeline.json").read_text())

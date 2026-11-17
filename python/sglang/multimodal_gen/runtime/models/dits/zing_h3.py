@@ -1373,6 +1373,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
         host_layout: ZingHostLayout | None = None,
         host_t: torch.Tensor | None = None,
         joint_phases: tuple[str, ...] | None = None,
+        sparse_sampler=None,
     ):
         """Run one packed Zing document.
 
@@ -1422,6 +1423,65 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             audio_x,
             metadata_device=metadata_device,
         )
+        if cache is not None and getattr(cache, "_compressed_kv_enabled", False):
+            # Eager prefill and graph-disabled streaming use the same physical
+            # KV contract as captured forwards; raw_attention_view cannot read
+            # history that only exists in the resident FP8 store.
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3._sampling_helpers import (
+                _guard_host_metadata,
+            )
+
+            from .zing_h3_denoise_graph import ZingChunkGraphs
+            from .zing_h3_sparse_attn import is_sparse_runtime_enabled
+
+            if (
+                sparse_sampler is None
+                and "active" in (joint_phases or (self_cache_update,))
+                and is_sparse_runtime_enabled()
+            ):
+                raise ValueError(
+                    "Active compressed sparse forward requires the sampling schedule"
+                )
+            if not cache.storage:
+                raise ValueError("Three-tier attention requires pooled KV storage")
+            packed = dict(
+                x=x,
+                t=t,
+                context=context,
+                seq_lens=seq_lens,
+                clean_seq_lens=clean_seq_lens,
+                block_idx=block_idx,
+                position_ids=position_ids,
+                row_role=row_role,
+                audio_x=audio_x,
+            )
+            packed["_zing_host_layout"] = host_layout or ZingHostLayout(
+                **{
+                    name: packed[name].detach().cpu()
+                    for name in (
+                        "seq_lens",
+                        "clean_seq_lens",
+                        "block_idx",
+                        "position_ids",
+                        "row_role",
+                    )
+                }
+            )
+            packed["_zing_host_t"] = host_t if host_t is not None else t.detach().cpu()
+            _guard_host_metadata(packed)
+            if joint_phases is not None:
+                packed["_zing_joint_phases"] = joint_phases
+            shadow = cache.planning_copy()
+            plan = ZingChunkGraphs._forward_plan(
+                sparse_sampler, shadow, packed, self_cache_update, generator=self
+            )
+            try:
+                result = plan.execute()
+                cache.publish_plan(shadow)
+                return result
+            except Exception:
+                cache.clear()
+                raise
         joint = None
         if joint_phases is not None:
             if cache is None or self_cache_update != "joint":
@@ -1988,9 +2048,15 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             )
             full_rope = (
                 _rope_cos_sin_cache(
-                    self.rope(kv_tensors["positions"][None]), dtype=torch.bfloat16
+                    self.rope(
+                        kv_tensors.get(
+                            "compressed_history_positions", kv_tensors.get("positions")
+                        )[None]
+                    ),
+                    dtype=torch.bfloat16,
                 )
                 if kv_plan.rotates_history
+                or "compressed_history_positions" in kv_tensors
                 else None
             )
             times = static["unique_t"]
@@ -2050,6 +2116,7 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             ends,
             clean,
             kv_plan.capacity,
+            getattr(kv_plan, "compressed_signature", None),
             size,
             rank,
             self.experimental_attention_backend,
@@ -2274,6 +2341,13 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
                     v[:, start:stop],
                     tensors=options.fixed_tensors,
                 )
+                if (
+                    getattr(options.fixed_kv, "compressed_attention_layout", None)
+                    is not None
+                ):
+                    from .zing_h3_compressed_view import commit_layer
+
+                    commit_layer(options.fixed_kv, index, options.fixed_tensors)
 
             return _attention(
                 current.attn,
@@ -2342,6 +2416,25 @@ class ZingH3DiTModel(MiniMaxH3DiTModel):
             )
         else:
             q = fused_q
+        if getattr(fixed, "compressed_attention_layout", None) is not None:
+            from .zing_h3_compressed_view import attend
+
+            result = attend(
+                fixed,
+                index,
+                q,
+                options.full_rope,
+                options.fixed_tensors,
+                module.softmax_scale,
+                head_start=options.ulysses_rank * q.shape[1],
+            )
+            if splits is not None:
+                result = _usp_output_all_to_all_varlen(
+                    result[None], splits, head_dim=2
+                )[0]
+            return module.out_proj(
+                result.reshape(total_rows, module.num_heads * module.head_dim)
+            )[0], None
         keys, values = fixed.rotated[index], fixed.stores[index][1]
         from sglang.multimodal_gen.runtime.models.dits.zing_h3_sparse_attn import (
             execute_fixed_block_sparse_branches,

@@ -123,3 +123,12 @@ wait and stream completion is a sender handoff latency, not isolated NCCL kernel
 or link-transfer time. `dit.return_ms` is a broader residual and should not be
 labelled pure network time. See the [replay guide](../../../../../benchmark/whitebox/LATENCY_BREAKDOWN.md)
 for measurement boundaries and same-code off/on experiments.
+
+### 按模型会话开启详细计时
+
+模型 init 可选 `detailed_timing`（严格 boolean，默认 false）。Encoder 将该值写入自己的
+source config 和 DiT session.open；DiT 的 Decoder output_session 原样携带该值。每个
+角色在会话初始化读取，下一会话重新取值；当前会话可通过 model.timing.configure 有序更新，不允许 prompt.update 临时改变采样策略。
+关闭时不创建本 PR 详细 timing/CUDA events，不发送 model.timing；已有 cache 回执与
+执行 fence 保持原逻辑。Room 的基础成功 TTFF 不依赖此开关。开启不保证旧角色具备埋点，
+缺失保持显式，部署需配套三角色。见 [TTFF 方案](../../zing/plans/serving-ttff-breakdown.md)。

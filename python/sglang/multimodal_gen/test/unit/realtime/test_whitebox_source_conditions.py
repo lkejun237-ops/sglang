@@ -1841,6 +1841,8 @@ def test_resource_reader_uses_final_auth_and_refuses_redirect(tmp_path, monkeypa
 def test_full_source_owner_initial_output_then_update_uses_single_mock_model(
     tmp_path, monkeypatch, with_startup, manual_reset
 ):
+    # StrictLeases implements the unbound stream; other suites also test bound mode.
+    monkeypatch.setenv("WHITEBOX_BOUND_COMPUTE", "0")
     import msgspec
     from test_whitebox_interactive import BrowserUI, Engine
     from test_whitebox_render_lifecycle import StrictLeases

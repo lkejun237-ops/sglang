@@ -16,7 +16,7 @@ def public_cache_receipt(value):
         or not re.fullmatch(r"[a-f0-9]{64}", key)
         or type(version) is not int
         or version < 1
-        or result not in {"l1_hit", "l2_hit", "mixed_hit", "miss", "bypass"}
+        or result not in {"l1_hit", "l2_hit", "l3_hit", "mixed_hit", "miss", "bypass"}
     ):
         return None
 
@@ -47,7 +47,7 @@ def public_cache_receipt(value):
                 ),
             )
     reason = value.get("miss_reason")
-    return dict(
+    receipt = dict(
         cache_key=key,
         prompt_version=version,
         cache_result=result,
@@ -72,3 +72,23 @@ def public_cache_receipt(value):
             },
         ),
     )
+    # Preserve consumed-tier provenance across repeated public sanitization.
+    lookup = value.get("lookup")
+    lookup = lookup if isinstance(lookup, dict) else value
+    for field, pattern in (
+        ("artifact_id", r"[a-f0-9]{32}"),
+        ("source_layer", r"l[123]"),
+        ("baseline_s0_sha256", r"[a-f0-9]{64}"),
+        ("online_s0_sha256", r"[a-f0-9]{64}"),
+    ):
+        item = lookup.get(field, value.get(field))
+        if isinstance(item, str) and re.fullmatch(pattern, item):
+            receipt[field] = item
+    cuda = details.get("cuda_ms")
+    if isinstance(cuda, dict):
+        receipt["timings"]["cuda_ms"] = {
+            name: duration(item)
+            for name, item in list(cuda.items())[:32]
+            if isinstance(name, str) and re.fullmatch(r"[a-z0-9_]{1,64}", name)
+        }
+    return receipt

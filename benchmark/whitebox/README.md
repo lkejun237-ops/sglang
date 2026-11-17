@@ -563,6 +563,8 @@ whitebox/<recording_id>/
   states.jsonl
   report-frames.jsonl    # compact archive/source-frame → actual per-stream PTS
   output-contexts.jsonl  # actual model-output prompt/reference transitions
+  cache-events.jsonl    # optional live Prefill/cache receipts, including rejection
+  cache-operations/     # optional signed model-side receipts, may arrive after video close
   whitebox.mp4
   model.mp4
   ui_rendered.mp4
@@ -579,6 +581,17 @@ whitebox/<recording_id>/
   output `event_id`, not the time the user typed it. `input.references` contains
   ordered `{id,path,sha256}` entries; no separate asset-ID index is needed.
 - `states.jsonl`: `{frame,pts_us,states}`; states contents belong to the engine.
+- `cache-events.jsonl`: live source/segment cache receipts; join model session,
+  prompt version and cache key to model-input and output-context/frame records.
+  L1/L2/L3 hits describe actual consumption, not merely submitted prewarming.
+- `cache-operations/*.json`: opt-in, bounded model-side Host spans and background
+  L1/L2/L3 write outcomes under the source recording. These append-only objects
+  can arrive after the video manifest is finalized and are listed as an
+  asynchronous extension, not as immutable members of its video-object digest.
+  Match `session_id`/`generation_id`, operation/event ID, cache key and artifact;
+  missing final receipts remain unknown. `l2_replica_wait` is an observation
+  bound, not measured device IO; overlapping Host spans cannot be summed as E2E.
+  Configuration and boundaries are in the [tiered cache contract](../../docs/docs/sglang-diffusion/zing/specs/block0-tiered-cache.mdx).
 - `manifest.json`: world/recording/trace identity, UTC creation/finalization,
   inference config and deployment metadata, UI identity, timeline, video frame
   counts/encoder settings, object sizes/SHA256, input quality, execution/recording/
