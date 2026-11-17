@@ -53,14 +53,17 @@ def load_configuration(args):
             raise ValueError("Unknown conditioning result transport")
         if type(config) is dict:
             config["result_transport"] = transport
-    required_limits = {field.name for field in fields(ResourceLimits)}
+    limit_fields = {field.name for field in fields(ResourceLimits)}
+    required_limits = limit_fields - {"prefix_cache_bytes"}
+    raw_limits = config.get("limits") if type(config) is dict else None
     if (
-        type(config) is not dict
-        or type(config.get("limits")) is not dict
-        or set(config["limits"]) != required_limits
+        type(raw_limits) is not dict
+        or not required_limits <= raw_limits.keys() <= limit_fields
     ):
-        raise ValueError("All conditioning limits must be explicitly configured")
-    limits = ResourceLimits(**config["limits"])
+        raise ValueError(
+            "All conditioning limits except prefix_cache_bytes must be explicitly configured"
+        )
+    limits = ResourceLimits(**raw_limits)
     if not isinstance(config.get("tokens"), dict) or not config["tokens"]:
         raise ValueError("Conditioning tokens must be explicitly configured")
     for token, principal in config["tokens"].items():

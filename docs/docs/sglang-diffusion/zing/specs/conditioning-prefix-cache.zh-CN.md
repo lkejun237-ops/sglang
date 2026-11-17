@@ -36,7 +36,7 @@ python -m sglang.multimodal_gen.runtime.conditioning.cli serve \
   --config conditioning-service.json --profile conditioning-profile.json
 ```
 
-服务 `limits` 增加 `prefix_cache_bytes`（默认 `4294967296`，4 GiB）和
+服务 `limits.prefix_cache_bytes` 可省略，当前默认 `21474836480`（20 GiB），显式配置优先。服务同时提供
 `prefix_task_idle_s`（默认 `1800` 秒）。字节预算限制保留的 KV、投影后特征和 token/位置元数据，
 不等于总显存或峰值上限；权重、视觉塔、激活、拼接临时张量和 CUDA allocator 另计。
 部署时须根据实际 Qwen token 数和共卡余量设置容量。

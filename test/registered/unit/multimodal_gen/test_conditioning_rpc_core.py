@@ -1293,10 +1293,11 @@ def test_warmup_rgb_s0_matches_online_pixels_and_type(tmp_path):
     ) == inputs.content_identity(prompt, online, profile().profile_id)
 
 
-def test_configuration_requires_every_limit_and_no_artifact_secrets(tmp_path):
+def test_configuration_defaults_only_prefix_cache_limit(tmp_path):
     p = profile()
     (tmp_path / "profile.json").write_bytes(canonical(p.document))
     configured = {f.name: getattr(limits(), f.name) for f in fields(ResourceLimits)}
+    configured["prefix_cache_bytes"] = 4 << 30
     config = {
         "tokens": {"secret": {"tenant": "tenant"}},
         "limits": configured,
@@ -1309,14 +1310,18 @@ def test_configuration_requires_every_limit_and_no_artifact_secrets(tmp_path):
     )
     result = cli.load_configuration(args)
     assert len(result) == 3  # config, profile, limits; no artifact store
+    assert result[2].prefix_cache_bytes == 4 << 30
     for omitted in configured:
-        bad = {
+        incomplete = {
             **config,
             "limits": {k: v for k, v in configured.items() if k != omitted},
         }
-        path.write_text(json.dumps(bad))
-        with pytest.raises(ValueError, match="explicitly"):
-            cli.load_configuration(args)
+        path.write_text(json.dumps(incomplete))
+        if omitted == "prefix_cache_bytes":
+            assert cli.load_configuration(args)[2].prefix_cache_bytes == 20 << 30
+        else:
+            with pytest.raises(ValueError, match="explicitly"):
+                cli.load_configuration(args)
 
 
 def test_warmup_cli_and_removed_artifact_commands():

@@ -1214,6 +1214,9 @@ H100 只在独立 Encoder/Decoder 模式准入。这里的 H100 配方依据 SM9
 不是商业 SKU 认证，也不代表模型已在该显存容量下验证能加载。保留显存/CC 回执；GPU fit 仍需实测。
 Encoder 默认合并 VAE 与 Qwen 六项选项；DiT 只注入自身算子选项，不把 Qwen/Encoder 开关塞给它；
 Decoder 继续使用原 checkpoint/decoder_config 与运行时融合准入。显式环境值仍可覆盖默认值。
+独立 Source Encoder 的 Qwen prefix KV 缓存预算默认 20 GiB（21,474,836,480 字节），
+按需缓存。可用 `SGLANG_ZING_QWEN_PREFIX_BYTES` 覆盖，或通过 `--qwen-prefix-cache-bytes` 指定；
+设为 0 可禁用。20 GiB 配方尚未验证 480p/736p GPU 峰值显存。
 独立入口只接收原生 worker 支持的参数；defer-final 使用布尔开关，不传字符串 true/false。
 H200 DiT 默认 BF16，不向原生 worker 传 `--quantization none`；原生入口以省略该参数表示不启用在线量化。
 独立Encoder在本地执行Qwen，不额外启动remote conditioning RPC；quantum及未暴露的server调度
@@ -2011,7 +2014,9 @@ CPU覆盖实际1280×720、36/60 FPS三编码编解码和原生TCP协商/元素A
 
 2026-10-23 / PR #400，真实链路受测 `569baf7d24`：独立 conditioning 服务新增同任务
 Qwen 前缀 KV 与投影后输出特征复用，按完整 token/位置共同前缀处理已有 event 值替换。
-单活跃任务、默认保留预算 4 GiB、空闲租约 1800 秒；预算不含权重与临时激活，
+单活跃任务，空闲租约 1800 秒。当前省略 `limits.prefix_cache_bytes` 时取 20 GiB，
+已有显式值继续生效。下列历史测试沿用旧版本，20 GiB 峰值显存尚未复测。
+预算不含权重与临时激活，
 共卡部署须重新核算余量。参考媒体内容、数量或顺序改变时整份缓存失效、全量编码；
 只在固定参考图下继续修改 event 时受益。Worker 配置 `prefix_reuse=false` 可恢复原路径。
 B300 TP1/BF16/SDPA 的 480/736 组件验证通过：Qwen 中位耗时 527.94→72.04 / 576.20→75.59 ms，

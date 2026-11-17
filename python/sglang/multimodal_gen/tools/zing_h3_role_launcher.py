@@ -200,6 +200,7 @@ def build_role_contract(
         env = {
             **ENCODER_ENV,
             **CONDITIONING_ENV,
+            "SGLANG_ZING_QWEN_PREFIX_BYTES": str(20 * 1024**3),
             "NCCL_GRAPH_REGISTER": "0",
             "SGLANG_ZING_SOURCE_PREPARE": "1",
             "SGLANG_ZING_SOURCE_PROMPT_JOINT": "1",
