@@ -179,3 +179,28 @@ without restarting the Room; the pin alone does not activate this behavior.
 `audiences` 中的 `room_internal` 与 `pool_room` 分别指向实际 Room 状态及池容量 URL。凭据管理方通过原有秘密投递渠道，将值和同名加 `_OOS_REF` 的版本回执一起注入各自的工作负载。回执格式为 `cn-shanghai/<参数名>/<参数 ID>/v<版本>`。元数据按用途共享，组件按各自原生配置读取变量名。入口发布作业还使用两项已绑定的 `_AUDIENCE`。受管清单通过 `WHITEBOX_CONTROL_CREDENTIAL_REFS` 传递，Docker、Podman 和独立进程使用相同校验。运行版本接口只记录清单摘要。
 
 入口切换配置的 `control_credential_refs` 指定目标组件清单，`idle.credential_source` 使用 `publisher`。当来源池与目标池不同时，将当前池的清单另放在 `idle.control_credential_refs` 作原路由占用检查。Room 与 Gateway 在启动前及实际进程启动时核对投递回执，Coordinator 启动、Worker 注册和发布作业交接前也核对本角色依赖。元数据检查仍需配合原生鉴权。已经启动的进程沿用原身份，直至受管发布真正完成。
+
+## Abnormal Room control diagnostics
+
+Only abnormal control and cleanup outcomes add structured container diagnostics;
+normal creation, pending polling, invitations and successful cleanup stay silent.
+Use `whitebox.player.failed` with `stage=room.control|room.start|room.retire|room.cleanup`,
+`action`, `gameId`, `ownerEpoch`, `operationId` and `publicationId` where available.
+A verified query with no original route/operation may lack a game identity: use
+its original operation ID instead of guessing a replacement Room.
+
+Gateway phases distinguish `route-missing`, `route-expired`, `owner-transport`,
+`owner-route-validation` and `original-operation-missing`. Room retirement also
+identifies `factory-cleanup-unconfirmed`, `cleanup-receipt-missing` and
+`control-record-mismatch`. Cleanup phases identify `sdk-close`, `media-close`,
+`directory-end`, `log-finish`, `capacity-release` and `cleanup-receipt` failures.
+These events preserve existing return values and cleanup fences; they do not
+turn absence or an ended route into a positive cleanup receipt.
+
+Diagnostics omit request bodies, caller subjects, URLs, credentials and raw
+exception messages. A sole ValueError argument matching the ROOM/CLI/SDK/AREA/SCENE
+stable-code namespaces is preserved as a code, including nested startup causes;
+other messages remain `UNCLASSIFIED_FAILURE` with the exception type. Correlate
+these records with WTP's `runtime-control-request-failed` and
+`runtime-control-outcome-unconfirmed` events. Local tests mock cloud/model transport;
+source tests do not establish deployed behavior or real GPU health.

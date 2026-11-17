@@ -20,6 +20,7 @@ from .room_control import (
     exact,
     frozen_publication_identity,
     identities,
+    log_control_failure,
     unknown,
     validate_request,
 )
@@ -152,7 +153,12 @@ class RoomControlRuntime:
                 # Cancellation without a positive owner receipt stays unknown.
                 record["status"] = "unknown"
                 log_player_failure(
-                    "room.start", error, record=record, outcome="unknown"
+                    "room.start",
+                    error,
+                    record=record,
+                    outcome="unknown",
+                    action="createRoom",
+                    owner_epoch=runtime.epoch,
                 )
                 return
             record["startup_failure"] = error
@@ -167,7 +173,12 @@ class RoomControlRuntime:
                 else "unknown"
             )
             log_player_failure(
-                "room.start", error, record=record, outcome=record["status"]
+                "room.start",
+                error,
+                record=record,
+                outcome=record["status"],
+                action="createRoom",
+                owner_epoch=runtime.epoch,
             )
 
     def original_create(self, caller, body, route):
@@ -353,6 +364,15 @@ class RoomControlRuntime:
             ):
                 # A failed factory can have committed resources before its
                 # reply disappeared. Process-local absence is not cleanup.
+                log_player_failure(
+                    "room.retire",
+                    ValueError("ROOM_FACTORY_CLEANUP_UNCONFIRMED"),
+                    record=record,
+                    action="retireRoom",
+                    owner_epoch=self.runtime.epoch,
+                    phase="factory-cleanup-unconfirmed",
+                    outcome="unknown",
+                )
                 record["retire_status"] = "unknown"
                 return
             lock = self.runtime.locks.setdefault(game, asyncio.Lock())
@@ -368,6 +388,17 @@ class RoomControlRuntime:
                     and room.get("control_record") is not record
                 ):
                     # Revalidate after acquiring the original lifecycle lock.
+                    log_player_failure(
+                        "room.retire",
+                        ValueError("ROOM_CLEANUP_RECEIPT_MISSING"),
+                        record=record,
+                        action="retireRoom",
+                        owner_epoch=self.runtime.epoch,
+                        phase="cleanup-receipt-missing"
+                        if room is None
+                        else "control-record-mismatch",
+                        outcome="unknown",
+                    )
                     record["retire_status"] = "unknown"
                     return
                 complete = await self.runtime._end(
@@ -379,7 +410,14 @@ class RoomControlRuntime:
                     if admission["binding"]["gameId"] == game:
                         admission["leaving"], admission["status"] = True, "retired"
         except BaseException as error:
-            log_player_failure("room.retire", error, record=record, outcome="unknown")
+            log_player_failure(
+                "room.retire",
+                error,
+                record=record,
+                outcome="unknown",
+                action="retireRoom",
+                owner_epoch=self.runtime.epoch,
+            )
             record["retire_status"] = "unknown"
 
     async def handle(self, caller, body, route):
@@ -389,6 +427,12 @@ class RoomControlRuntime:
         if "createContext" in body:
             record = self.original_create(caller, body, route)
             if record is None:
+                log_control_failure(
+                    body,
+                    ValueError("ROOM_ORIGINAL_OPERATION_MISSING"),
+                    phase="original-operation-missing",
+                    route=route,
+                )
                 return unknown(body)
             result = self.create_result(record)
             if action != "retireRoom":

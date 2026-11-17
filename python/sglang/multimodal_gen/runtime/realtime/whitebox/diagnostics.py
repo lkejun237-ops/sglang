@@ -206,7 +206,15 @@ def model_preparation_error(message, *, trace_id, operation):
 
 
 def log_player_failure(
-    stage, error, *, record=None, binding=None, outcome="failed", phase=None
+    stage,
+    error,
+    *,
+    record=None,
+    binding=None,
+    outcome="failed",
+    phase=None,
+    action=None,
+    owner_epoch=None,
 ):
     """Best-effort member diagnostics through the existing container stderr collector."""
     import asyncio
@@ -235,19 +243,26 @@ def log_player_failure(
             lease, "_active_assignment", None
         )
         creation = record.get("invocation", {}).get("createContext", {})
-        operation = record.get("admission") or creation.get("operation", {})
+        operation = (
+            record.get("operation")
+            or record.get("admission")
+            or creation.get("operation", {})
+        )
         world = creation.get("frozenPublication", {}).get("world", {})
         member = record.get("binding", {})
         worker = getattr(assignment, "denoiser", None)
         fields = {
             "phase": phase,
+            "action": action,
             "gameId": member.get("gameId") or record.get("game_id"),
-            "ownerEpoch": member.get("ownerEpoch"),
+            "ownerEpoch": member.get("ownerEpoch") or owner_epoch,
             "publicationId": member.get("publicationId") or world.get("publicationId"),
             "worldId": world.get("worldId"),
             "operationId": operation.get("operationId")
             or getattr(lease, "request", {}).get("trace_id"),
             "requestId": operation.get("requestId"),
+            "admissionOperationId": member.get("admissionOperationId")
+            or record.get("admission", {}).get("operationId"),
             "memberId": record.get("member_id"),
             "playerId": record.get("player_id"),
             "modelSessionId": getattr(assignment, "session_id", None)
@@ -260,6 +275,18 @@ def log_player_failure(
 
         def failure(value, depth=0):
             value_code = getattr(value, "code", None) or getattr(value, "reason", None)
+            # Some CLI guards raise a stable code as ValueError's sole argument.
+            # Preserve only this namespace-limited code, never arbitrary messages.
+            if (
+                value_code is None
+                and isinstance(value, ValueError)
+                and len(value.args) == 1
+            ):
+                candidate = value.args[0]
+                if isinstance(candidate, str) and re.fullmatch(
+                    r"(?:ROOM|CLI|SDK|AREA|SCENE)_[A-Z0-9_]{1,80}", candidate
+                ):
+                    value_code = candidate
             result = {
                 "code": (
                     value_code

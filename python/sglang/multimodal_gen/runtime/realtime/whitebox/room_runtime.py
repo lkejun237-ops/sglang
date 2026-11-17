@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse
 
 from .area_contract import area_source_options
 from .contracts import VideoSpec
+from .diagnostics import log_player_failure
 from .maintenance_process import finish_cleanup
 from .metrics import capture_stages, stage
 from .model_geometry import validate_room_spec
@@ -1065,6 +1066,19 @@ class RoomRuntime:
         if room is None:
             return True
         self.retiring[game_id] = room
+
+        def cleanup_failure(error, phase):
+            log_player_failure(
+                "room.cleanup",
+                error,
+                record={**(room.get("control_record") or {}), "game_id": game_id},
+                action="retireRoom",
+                owner_epoch=self.epoch,
+                outcome="unknown",
+                binding=None,
+                phase=phase,
+            )
+
         if room["heartbeat"] is not asyncio.current_task():
             room["heartbeat"].cancel()
             await asyncio.gather(room["heartbeat"], return_exceptions=True)
@@ -1104,16 +1118,24 @@ class RoomRuntime:
         results = await asyncio.gather(
             *(asyncio.wait_for(item, 40) for item in closing), return_exceptions=True
         )
+        for result in results:
+            if isinstance(result, BaseException):
+                cleanup_failure(result, "sdk-close")
         if any(isinstance(result, BaseException) for result in results):
             outcome = "cleanup_failed"
         sdk_complete = not any(isinstance(result, BaseException) for result in results)
         if sdk_complete:
             try:
                 await self.directory.touch(game_id, self.owner_id, self.epoch, end=True)
-            except Exception:
-                pass  # The retired execution is still fenced by its owner epoch.
+            except Exception as error:
+                # The retired execution remains fenced by its original epoch.
+                cleanup_failure(error, "directory-end")
         if media_cleanup is not None:
-            results.extend(await media_cleanup)
+            media_results = await media_cleanup
+            for result in media_results:
+                if isinstance(result, BaseException):
+                    cleanup_failure(result, "media-close")
+            results.extend(media_results)
         if not room.get("log_finalized"):
             self.archives.finalize(room["log"], outcome)
             room["log_finalized"] = True
@@ -1122,7 +1144,8 @@ class RoomRuntime:
         if wait_for_log or control_record is not None:
             try:
                 await asyncio.wait_for(room["log"].finish(outcome), 40)
-            except BaseException:
+            except BaseException as error:
+                cleanup_failure(error, "log-finish")
                 complete = False
         if complete:
             if room.get("route", {}).get("dynamic_owner"):
@@ -1130,10 +1153,8 @@ class RoomRuntime:
                     await self.directory.release_room(
                         game_id, self.owner_id, self.epoch
                     )
-                except Exception:
-                    logging.getLogger(__name__).warning(
-                        "Room capacity release remains unconfirmed: game_id=%s", game_id
-                    )
+                except Exception as error:
+                    cleanup_failure(error, "capacity-release")
                     return False
             if control_record is not None:
                 control_record["room_cleanup_complete"] = True
@@ -1152,11 +1173,7 @@ class RoomRuntime:
                     )
                 except Exception as error:
                     # Older coordinators may not support durable receipts yet.
-                    logging.getLogger(__name__).warning(
-                        "Room cleanup receipt was not persisted: game_id=%s error=%s",
-                        game_id,
-                        type(error).__name__,
-                    )
+                    cleanup_failure(error, "cleanup-receipt")
             if self.retiring.get(game_id) is room:
                 self.retiring.pop(game_id)
             for stream_id, entry in entries.items():

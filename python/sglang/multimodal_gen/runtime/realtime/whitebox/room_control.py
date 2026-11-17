@@ -15,6 +15,7 @@ import httpx
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from .diagnostics import log_player_failure
 from .rooms import checked_id, resolve_owner
 from .rtc_auth import RTCCapabilities
 
@@ -252,6 +253,30 @@ async def read_request(
         raise HTTPException(400, "Invalid room control request") from None
 
 
+def log_control_failure(body, error, *, phase, route=None):
+    """Correlate verified control failures without recording the signed body."""
+    context = body.get("createContext", {})
+    binding = (
+        body.get("execution") or body.get("binding") or body.get("memberBinding") or {}
+    )
+    route = route or {}
+    log_player_failure(
+        "room.control",
+        error,
+        outcome="unknown",
+        phase=phase,
+        action=body.get("action"),
+        owner_epoch=route.get("owner_epoch"),
+        record=dict(
+            invocation=dict(createContext=context),
+            binding=binding,
+            game_id=route.get("game_id"),
+            admission=body.get("admission", {}),
+            operation=body.get("operation"),
+        ),
+    )
+
+
 def unknown(body):
     if "createContext" in body:
         op = body["createContext"]["operation"]
@@ -303,6 +328,7 @@ def install_gateway_room_control(app, proxy, *, verifier=None):
             caller = verifier.verify(authorization[7:], raw=raw, action=body["action"])
         except ValueError:
             raise HTTPException(403, "Room control access was denied") from None
+        route = None
         try:
             if "createContext" in body:
                 route = await proxy.directory.control_route(
@@ -312,6 +338,12 @@ def install_gateway_room_control(app, proxy, *, verifier=None):
                 binding = body.get("binding", body.get("memberBinding"))
                 route = await proxy.directory.lookup(checked_id(binding["gameId"]))
             if route is None or route.get("status") == "expired":
+                log_control_failure(
+                    body,
+                    ValueError("ROOM_ROUTE_UNAVAILABLE"),
+                    phase="route-missing" if route is None else "route-expired",
+                    route=route,
+                )
                 return JSONResponse(
                     unknown(body), headers={"Cache-Control": "no-store"}
                 )
@@ -386,7 +418,11 @@ def install_gateway_room_control(app, proxy, *, verifier=None):
             if len(response.content) > 2 * 1024 * 1024:
                 raise ValueError()
             return JSONResponse(response.json(), headers={"Cache-Control": "no-store"})
-        except httpx.HTTPError:
+        except httpx.HTTPError as error:
+            log_control_failure(body, error, phase="owner-transport", route=route)
             return JSONResponse(unknown(body), headers={"Cache-Control": "no-store"})
-        except ValueError:
+        except ValueError as error:
+            log_control_failure(
+                body, error, phase="owner-route-validation", route=route
+            )
             raise HTTPException(409, "The room operation is unavailable") from None

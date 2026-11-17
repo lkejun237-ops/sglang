@@ -339,3 +339,43 @@ print(json.dumps(dict(original_blocking=before,current_blocking=os.get_blocking(
                     os.close(descriptor)
             if target is not None:
                 target.close()
+
+
+def test_room_start_failure_preserves_safe_code_and_owner_identity(player_log_capture):
+    import json
+
+    from sglang.multimodal_gen.runtime.realtime.whitebox import diagnostics
+
+    error = RuntimeError("private wrapper")
+    error.__cause__ = ValueError("ROOM_HOST_CAPACITY_INSUFFICIENT")
+    diagnostics.log_player_failure(
+        "room.start",
+        error,
+        action="createRoom",
+        owner_epoch="owner-original",
+        record=dict(
+            game_id="room-original",
+            invocation=dict(
+                createContext=dict(
+                    operation=dict(
+                        operationId="create-original", requestId="request-original"
+                    ),
+                    frozenPublication=dict(
+                        world=dict(publicationId="publication-original")
+                    ),
+                )
+            ),
+        ),
+    )
+    rows = [
+        json.loads(row.message)
+        for row in player_log_capture.records
+        if '"event":"whitebox.player.failed"' in row.message
+    ]
+    assert len(rows) == 1
+    assert rows[0]["ownerEpoch"] == "owner-original"
+    assert rows[0]["action"] == "createRoom"
+    assert rows[0]["gameId"] == "room-original"
+    assert rows[0]["operationId"] == "create-original"
+    assert rows[0]["error"]["cause"]["code"] == "ROOM_HOST_CAPACITY_INSUFFICIENT"
+    assert "private wrapper" not in player_log_capture.text

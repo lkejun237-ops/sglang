@@ -185,7 +185,9 @@ def test_gateway_returns_confirmed_close_after_original_route_expires():
     asyncio.run(run())
 
 
-def test_gateway_verifies_before_directory_and_forwards_only_original_internal_hop():
+def test_gateway_verifies_before_directory_and_forwards_only_original_internal_hop(
+    player_log_capture,
+):
     async def run():
         calls = []
         directory = RoomDirectory(MemoryRoomStore(), {"a": "http://room"})
@@ -263,6 +265,18 @@ def test_gateway_verifies_before_directory_and_forwards_only_original_internal_h
                 assert response.status_code == 403 and len(calls) == 1
 
     asyncio.run(run())
+    rows = [
+        json.loads(item.getMessage())
+        for item in player_log_capture.records
+        if '"event":"whitebox.player.failed"' in item.getMessage()
+    ]
+    assert len(rows) == 1  # Missing original route only; normal pending is silent.
+    assert rows[0]["action"] == "getOperation"
+    assert rows[0]["phase"] == "route-missing"
+    assert rows[0]["operationId"] == "op-original"
+    assert rows[0]["error"]["code"] == "ROOM_ROUTE_UNAVAILABLE"
+    assert "intranet:browser-a" not in player_log_capture.text
+    assert SECRET not in player_log_capture.text
 
 
 @pytest.mark.parametrize("cleanup_error", [ValueError, asyncio.CancelledError])
@@ -425,7 +439,7 @@ def test_runtime_create_query_admission_leave_and_retirement_keep_original_owner
     asyncio.run(run())
 
 
-def test_cleanup_absence_is_not_an_original_owner_receipt():
+def test_cleanup_absence_is_not_an_original_owner_receipt(player_log_capture):
     from unittest.mock import AsyncMock
 
     from sglang.multimodal_gen.runtime.realtime.whitebox.room_control_runtime import (
@@ -452,6 +466,15 @@ def test_cleanup_absence_is_not_an_original_owner_receipt():
         )
         await control.retire(creation)
         assert creation["retire_status"] == "unknown"
+        rows = [
+            json.loads(item.getMessage())
+            for item in player_log_capture.records
+            if '"stage":"room.retire"' in item.getMessage()
+        ]
+        assert len(rows) == 1
+        assert rows[0]["phase"] == "cleanup-receipt-missing"
+        assert rows[0]["ownerEpoch"] == runtime.epoch
+        assert rows[0]["gameId"] == creation["game_id"]
         runtime._end.assert_not_called()
         admission = dict(
             task=completed,
@@ -1622,3 +1645,34 @@ def test_member_presence_separates_rtc_connection_from_retained_admission():
     assert owner.member_presence("room")["cleaning"] == 1
     member["status"] = "retired"
     assert not any(owner.member_presence("room").values())
+
+
+def test_leave_control_failure_keeps_leave_and_admission_identity(player_log_capture):
+    from sglang.multimodal_gen.runtime.realtime.whitebox.room_control import (
+        log_control_failure,
+    )
+
+    log_control_failure(
+        dict(
+            action="leavePlayer",
+            operation=dict(operationId="leave-original", requestId="request-original"),
+            memberBinding=dict(
+                gameId="game-original",
+                ownerEpoch="epoch-original",
+                publicationId="publication-original",
+                admissionOperationId="admission-original",
+            ),
+        ),
+        ValueError("ROOM_ROUTE_UNAVAILABLE"),
+        phase="owner-transport",
+    )
+    rows = [
+        json.loads(item.getMessage())
+        for item in player_log_capture.records
+        if '"event":"whitebox.player.failed"' in item.getMessage()
+    ]
+    assert len(rows) == 1
+    assert rows[0]["operationId"] == "leave-original"
+    assert rows[0]["admissionOperationId"] == "admission-original"
+    assert rows[0]["ownerEpoch"] == "epoch-original"
+    assert rows[0]["action"] == "leavePlayer"

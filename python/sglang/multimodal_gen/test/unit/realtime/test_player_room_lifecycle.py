@@ -523,3 +523,62 @@ def test_member_model_reservation_is_deferred_only_for_manual_preview(
                 await owner.reserve(record)
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "failure", [None, "sdk-close", "log-finish", "cleanup-receipt"]
+)
+def test_room_cleanup_logs_only_failed_stage_with_original_identity(
+    player_log_capture, failure
+):
+    async def run():
+        runtime = RoomRuntime.__new__(RoomRuntime)
+        runtime.epoch, runtime.owner_id = "original-epoch", "original-owner"
+        runtime.players, runtime.retiring_players, runtime.retiring = {}, {}, {}
+        runtime.directory = NS(touch=AsyncMock(), confirm_room_cleanup=AsyncMock())
+        runtime.archives = NS(finalize=lambda *_: None)
+        record = dict(
+            caller={},
+            invocation=dict(
+                createContext=dict(
+                    operation=dict(operationId="original-operation"),
+                    frozenPublication=dict(
+                        world=dict(publicationId="original-publication")
+                    ),
+                )
+            ),
+        )
+        heartbeat = asyncio.create_task(asyncio.sleep(100))
+        room = dict(
+            players=set(),
+            heartbeat=heartbeat,
+            route={},
+            control_record=record,
+            driver=NS(close=AsyncMock()),
+            log=NS(finish=AsyncMock()),
+        )
+        runtime.rooms = {"original-game": room}
+        error = RuntimeError("private cleanup failure")
+        if failure == "sdk-close":
+            room["driver"].close.side_effect = error
+        elif failure == "log-finish":
+            room["log"].finish.side_effect = error
+        elif failure == "cleanup-receipt":
+            runtime.directory.confirm_room_cleanup.side_effect = error
+        complete = await runtime._end("original-game", "completed", expected_room=room)
+        assert complete is (failure not in {"sdk-close", "log-finish"})
+        rows = [
+            json.loads(item.getMessage())
+            for item in player_log_capture.records
+            if '"event":"whitebox.player.failed"' in item.getMessage()
+        ]
+        assert len(rows) == (0 if failure is None else 1)
+        if rows:
+            assert rows[0]["phase"] == failure
+            assert rows[0]["action"] == "retireRoom"
+            assert rows[0]["gameId"] == "original-game"
+            assert rows[0]["ownerEpoch"] == "original-epoch"
+            assert rows[0]["operationId"] == "original-operation"
+        assert "private cleanup failure" not in player_log_capture.text
+
+    asyncio.run(run())
