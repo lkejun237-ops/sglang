@@ -1229,3 +1229,41 @@ def test_expired_window_allows_formal_replacement_without_starting_a_plan():
         assert window.task is None
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("world_driven", [False, True])
+def test_automatic_create_only_opens_a_declared_world_plan(monkeypatch, world_driven):
+    from test_whitebox_instruction_receipt_scope import source_with_factory
+
+    from sglang.multimodal_gen.runtime.realtime.whitebox.inference_control import (
+        SourceInference,
+    )
+
+    monkeypatch.setenv("WHITEBOX_MODEL_CONTEXT_PREWARM", "1")
+
+    async def run():
+        source, _, _ = await source_with_factory()
+        source.world_driven = world_driven
+        source.control_prefill = object()
+        source.model_binding = object()
+        source.config = SimpleNamespace(startup_seconds=10)
+        source.engine.shared_world = True
+        source.engine.model_context_capability = {
+            "prewarmPlanProtocol": startup_prewarm.PROTOCOL
+        }
+        source.journal.snapshot["inference"] = dict(enabled=True, revision=0)
+        source.inference = SourceInference(
+            source, dict(type="init", source_operation="create")
+        )
+        assert not source.inference.manual
+        await source.bind_source_conditions()
+        if world_driven:
+            window = source.inference.prewarm
+            assert isinstance(window, startup_prewarm.StartupPrewarmPlan)
+            assert window.segment_id == "old" and window.opening_revision == 0
+            assert window.task is None
+            await window.close()
+        else:
+            assert source.inference.prewarm is None
+
+    asyncio.run(run())

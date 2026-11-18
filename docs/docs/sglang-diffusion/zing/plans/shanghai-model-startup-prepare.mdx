@@ -19,8 +19,9 @@ Prefill 仍沿用各自原路径。
   由原手动会话持有，候选取消不破坏其后续启动输入。
 - World 提供第一组真实条件后，先验证参考资源，再比较 Prompt、seed、有序图片槽位、
   格式与内容。SDK 的 `reference-0` 等上传 ID 与 World 的 `<Picture 1>` 属于不同命名空间；
-  仅在真实 World 条件入口按 H3 的参考图顺序映射槽位，不排序、不改字节，不改原准备请求和指纹。匹配则等待该候选完成并跳过重复的 World 开场预热；不匹配则确认候选释放，
-  再走原 World 条件/预热流程。不同条件不能为了复用而改写 World 的权威数据。
+  仅在真实 World 条件入口按 H3 的参考图顺序映射槽位，不排序、不改字节，不改原准备请求和指纹。
+  没有协商启动预热窗口时，匹配则等待并复用候选；不匹配则确认释放后走原 World 条件流程。
+  不同条件不能为了复用而改写 World 的权威数据。
 - 真正提交首段时才选取满足 World 生效边界的真实私有视角帧。v2 条件预览不替代视频
   frame zero，保留真实像素、时间戳与来源身份。World 的 segment/epoch 不变，已准备的
   model session/generation 与首段创建在同一次 journal CAS 中提交；不提前留下已关闭的代次。
@@ -41,6 +42,27 @@ Prefill 仍沿用各自原路径。
 World 条件核对 → `adopt_preparation` → `RenderJournal.model_condition/start` →
 原 `RenderSegment` prepare/attach。协议回归入口为 `test_whitebox_parallel_startup.py`；
 部署状态和性能记录按具体发布回执维护，下文历史记录不代表本候选已上线。
+
+### 与后续条件预热协作
+
+通用 `WHITEBOX_PREFILL_ENABLED=1` 不代表 World 启动预热计划已开启。Room 还需要
+`WHITEBOX_MODEL_CONTEXT_PREWARM=1`、对应的 CLI descriptor 和订阅能力，以及原玩家模型绑定。
+普通并行准备只计算开场条件，不能据此跳过包含未来 Prompt/参考图的预热计划。
+
+旧客户端的自动 `source_operation=create` 不发送 `inference_control=manual`。
+对已声明 World 条件通道、已经启用推理的这类请求，Room 在首次订阅前也创建同一预热窗口；
+普通非 World 源保持原路径。窗口等待真实通道绑定后再读取协商能力，不因订阅与首条件到达竞态跳过计划。
+
+支持启动窗口时先协商计划，不等待可选并行准备完成：没有候选的计划或无响应到期保留原准备，
+正式提交时仍核对实际条件；存在有效预热候选时，`ControlPrefill` 先确认可选准备子任务释放，
+再在原父绑定上串行计算。不会申请第二个 Slot，也不会并行占用两个模型子任务。
+清理无法确认时把失败保留到预热 owner，阻止后续候选和生成继续借用该子资源。
+
+场景事务的 `require_matching_condition` 准备绑定特定快照和发布回执，继续保持原路径，
+不能为了启动预热将其退役。共享世界仍使用每玩家私有视角，不暂停其他玩家的世界时钟。
+
+当前代码候选的回归覆盖计划协商、空计划复用、原生子任务串行释放及未知清理保护。
+真实 GPU、切换耗时、持续帧率和浏览器验收结果需按测试发布分别登记，不能由 CPU 合同推定。
 
 ## 2026-10-29 版本边界补充
 

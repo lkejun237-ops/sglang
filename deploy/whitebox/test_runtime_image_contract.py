@@ -207,7 +207,8 @@ def test_release_edges_keep_existing_checks_native_tools_and_room_only_sdk():
         "--from=checks",
         "/tmp/whitebox-contracts-passed",
         "/app/whitebox-contracts-passed",
-    ] in copies(graph["room-runtime"])
+    ] in copies(graph["room-verified-runtime"])
+    assert "checks" not in dependencies("room-runtime")
     for marker in ("whitebox-cli-passed", "whitebox-immediate-codec-passed"):
         assert ["--from=room-checks", f"/tmp/{marker}", f"/app/{marker}"] in copies(
             graph["room"]

@@ -10,6 +10,12 @@ description: "供 Codex 与部署同学使用的 H100/H200/B300 部署决策、�
 
 ## 生产 TTFF 分时观测（2026-11-10，代码候选，未部署）
 
+2026-11-18 Room 候选补充：开启 `WHITEBOX_MODEL_CONTEXT_PREWARM=1` 的受管 World
+先协商后续条件计划，再决定复用或串行退役可选并行准备；空计划保留准备，清理未知阻止继续计算。
+保留场景事务的指定快照准备与每玩家单子任务约束。
+该调整不改变三层稀疏或模型精度，当前 GPU 性能与部署尚待验证；详见
+[并行准备与预热协作](plans/shanghai-model-startup-prepare.mdx#与后续条件预热协作)。
+
 新增分离 Encoder/DiT/Decoder 的首输出与条件切换阶段计时、Room 等待分解、
 逐版本 cache/计时追加归档和离线 CSV 导出。Host 与 CUDA stream 区间分别记录，
 异步查询 event，计时热路径不新增同步或 SP collective；重叠区间不得相加作为 TTFF。

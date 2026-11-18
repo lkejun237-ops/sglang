@@ -5,6 +5,7 @@ import hashlib
 import io
 from contextlib import asynccontextmanager
 from types import SimpleNamespace as NS
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import msgspec
@@ -24,6 +25,137 @@ from sglang.multimodal_gen.runtime.realtime.whitebox.interactive import (
 from sglang.multimodal_gen.runtime.realtime.whitebox.model_binding import ModelBinding
 from sglang.multimodal_gen.runtime.realtime.whitebox.render_contract import RenderError
 from sglang.multimodal_gen.runtime.realtime.whitebox.render_source import SourceSession
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+@pytest.mark.parametrize("candidates", [False, True])
+def test_parallel_preparation_does_not_suppress_negotiated_future_plan(
+    monkeypatch, prepared, candidates
+):
+    from test_whitebox_instruction_receipt_scope import source_with_factory
+    from test_whitebox_prewarm_plan import condition, proposal
+
+    from sglang.multimodal_gen.runtime.realtime.whitebox.startup_prewarm_plan import (
+        StartupPrewarmPlan,
+    )
+
+    monkeypatch.setenv("WHITEBOX_MODEL_CONTEXT_PREWARM", "1")
+
+    async def run():
+        source, create, _ = await source_with_factory()
+        c = condition()
+        c.update(segmentId="old", references=[])
+        source.context_seed = 42
+        source.record_startup_prewarm = lambda *args: None
+        source.spawn_control = asyncio.create_task
+        source.context_channel.suspended = False
+        source.context_channel.prewarm_plan_supported = True
+        marker = NS(prepared=asyncio.Event())
+        if prepared:
+            marker.prepared.set()
+
+        async def wait_preparation(_):
+            await marker.prepared.wait()
+            return True
+
+        window = StartupPrewarmPlan(
+            source, "old", 1, asyncio.get_running_loop().time() + 10
+        )
+        source.inference = NS(
+            prewarm=window,
+            preparation=marker,
+            prepared_for_condition=AsyncMock(side_effect=wait_preparation),
+        )
+        frame = NS(
+            provenance={
+                "cli_frame_header": {
+                    "sessionId": c["source"]["sessionId"],
+                    "epoch": c["source"]["epoch"],
+                    "source": {**c["source"], **c["effective"]},
+                }
+            }
+        )
+        source.latest = NS(get=AsyncMock(return_value=(1, (frame, 0))))
+        computed = []
+
+        async def start(value, refs, first, *, current, observe):
+            computed.append(value["prompt"])
+
+            async def complete():
+                observe(
+                    dict(type="prefill.memory_ready", request_id=str(len(computed)))
+                )
+
+            return asyncio.create_task(complete())
+
+        source.control_prefill = NS(failure=None, start_startup=start)
+        emitted = []
+        adapter = create(c, AsyncMock(side_effect=emitted.append), lambda: None)
+        try:
+            # Negotiation must not wait for the optional preview computation,
+            # nor assume that its initial condition warms every future condition.
+            gate = await asyncio.wait_for(adapter.startup_release(c), 0.5)
+            assert gate is not None and source.inference.prewarm is window
+            source.inference.prepared_for_condition.assert_not_awaited()
+            value = proposal(window, c)
+            if not candidates:
+                value["entries"] = []
+                value["budgetMs"] = 0
+            window.receive(value)
+            await asyncio.wait_for(asyncio.shield(gate[1]), 1)
+            await window.sender
+            assert computed == (
+                ["future-0", "future-1", "future-2"] if candidates else []
+            )
+            assert any(
+                m["type"] == "model.context.prewarm.plan.window" for m in emitted
+            )
+            if not candidates:
+                assert source.inference.preparation is marker
+            assert window.failure is None
+        finally:
+            await window.close()
+            await adapter.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("pinned_scene", [False, True])
+def test_preparation_keeps_legacy_or_pinned_scene_route(monkeypatch, pinned_scene):
+    from test_whitebox_instruction_receipt_scope import source_with_factory
+    from test_whitebox_prewarm_plan import condition
+
+    from sglang.multimodal_gen.runtime.realtime.whitebox.startup_prewarm_plan import (
+        StartupPrewarmPlan,
+    )
+
+    monkeypatch.setenv("WHITEBOX_MODEL_CONTEXT_PREWARM", "1")
+
+    async def run():
+        source, create, _ = await source_with_factory()
+        c = condition()
+        c["segmentId"] = "old"
+        window = StartupPrewarmPlan(
+            source, "old", 1, asyncio.get_running_loop().time() + 10
+        )
+        source.inference = NS(
+            preparation=NS(require_matching_condition=pinned_scene),
+            prewarm=window,
+            prepared_for_condition=AsyncMock(return_value=True),
+        )
+        source.context_channel.suspended = False
+        source.context_channel.prewarm_plan_supported = pinned_scene
+        adapter = create(c, AsyncMock(), lambda: None)
+        try:
+            assert await adapter.startup_release(c) is None
+            source.inference.prepared_for_condition.assert_awaited_once_with(c)
+            assert window.retired and window.task is None
+            assert source.inference.prewarm is None
+        finally:
+            await window.close()
+            await adapter.close()
+
+    asyncio.run(run())
 
 
 class PreparationSocket(Socket):
@@ -619,6 +751,87 @@ async def finish_candidate(source, lease, task):
         await source.startup.close()
     await source.inference.close()
     await source.model_binding.close()
+
+
+@pytest.mark.parametrize("cleanup_unknown", [False, True])
+def test_future_prefill_waits_for_prepared_child_cleanup(monkeypatch, cleanup_unknown):
+    from sglang.multimodal_gen.runtime.realtime.whitebox.control_prefill import (
+        ControlPrefill,
+    )
+
+    async def run():
+        source, lease, task, _, _ = await managed_source(monkeypatch)
+        control = ControlPrefill(source)
+        active = None
+        closing, release = asyncio.Event(), asyncio.Event()
+        try:
+            await asyncio.wait_for(lease.ws.preparing.wait(), 1)
+            candidate = source.inference.preparation
+            original_close = candidate.close
+
+            async def close():
+                closing.set()
+                await release.wait()
+                if cleanup_unknown:
+                    raise RenderError("RELEASE_UNKNOWN")
+                await original_close()
+
+            monkeypatch.setattr(candidate, "close", close)
+            source.journal.read = AsyncMock(return_value={})
+            source.assets = NS(resolve=AsyncMock(return_value=[]))
+            control.receipt = AsyncMock()
+            children = []
+
+            async def compute(*args, **kwargs):
+                assert candidate.closed and candidate.resource_state == "released"
+                child = source.model_binding.borrow(
+                    dict(model_session_id="future", generation_id="future"),
+                    kind="prefill",
+                )
+                async with child.open():
+                    children.append(child)
+                    assert lease.calls == 1 and lease.releases == 0
+
+            monkeypatch.setattr(control, "_compute", compute)
+            active = asyncio.create_task(
+                control.start_startup(
+                    dict(prompt="future", seed=42),
+                    [],
+                    (1, (NS(), 0)),
+                    current=lambda: True,
+                    observe=lambda _: None,
+                )
+            )
+            await asyncio.wait_for(closing.wait(), 1)
+            assert not active.done() and not children
+            assert len([m for m in lease.ws.sent if m["type"] == "bound.open"]) == 1
+            release.set()
+            if cleanup_unknown:
+                with pytest.raises(RenderError) as failure:
+                    await active
+                assert failure.value.code == "RELEASE_UNKNOWN"
+                assert control.failure.code == "RELEASE_UNKNOWN"
+                with pytest.raises(RenderError) as failure:
+                    await control.available()
+                assert failure.value.code == "RELEASE_UNKNOWN"
+                assert not children
+            else:
+                work = await active
+                await work
+                assert len(children) == 1 and children[0].resource_state == "released"
+                assert lease.calls == 1 and lease.releases == 0
+        finally:
+            release.set()
+            if active is not None:
+                await asyncio.gather(active, return_exceptions=True)
+            if "candidate" in locals():
+                monkeypatch.setattr(candidate, "close", original_close)
+                # The injected refusal has no native failure; the fixture owner
+                # now closes its original child normally, without a new borrow.
+                source.inference.preparation_retirement = None
+            await finish_candidate(source, lease, task)
+
+    asyncio.run(run())
 
 
 def test_world_handoff_keeps_original_child_and_pins_real_cli_pixels(monkeypatch):

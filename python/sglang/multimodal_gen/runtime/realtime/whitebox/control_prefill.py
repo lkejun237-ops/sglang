@@ -503,7 +503,14 @@ class ControlPrefill:
         await self.available()
         inference = getattr(self.owner, "inference", None)
         if getattr(inference, "preparation", None) is not None:
-            await inference.discard_preparation(report_failure=True)
+            try:
+                await inference.discard_preparation(report_failure=True)
+            except RenderError as error:
+                if error.code == "RELEASE_UNKNOWN":
+                    # The startup plan must not continue to its next candidate
+                    # or release generation onto an unconfirmed child cleanup.
+                    self.failure = error
+                raise
         if snapshot is None:
             parameters = segment_parameters(dict(parameters, references=references))
             references = await self.owner.assets.resolve(parameters["references"])

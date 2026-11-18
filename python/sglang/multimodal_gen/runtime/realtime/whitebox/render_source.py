@@ -650,6 +650,17 @@ class SourceSession(InteractiveSession):
         ids = await self.journal.reserve_model_context_segment(
             getattr(self, "context_startup_ids", None)
         )
+        if (
+            getattr(self, "world_driven", False)
+            and not self.inference.manual
+            and self.inference_enabled()
+        ):
+            # Legacy automatic create has no inference.configure command. Its
+            # declared World still owns future conditions and the same parent.
+            await self.inference.open_prewarm(
+                ids["segment_id"], self.journal.snapshot["inference"]["revision"]
+            )
+        channel_bound = asyncio.Event()
         from .source_conditions import SourceConditions
 
         def create(envelope, emit, check):
@@ -695,34 +706,42 @@ class SourceSession(InteractiveSession):
                 )
 
             async def startup_release(condition):
-                if getattr(
-                    getattr(self, "inference", None), "preparation", None
-                ) is not None and await self.inference.prepared_for_condition(
-                    condition
-                ):
-                    window = startup_window()
-                    if window is not None:
-                        await window.close()
-                        if self.inference.prewarm is window:
-                            self.inference.prewarm = None
-                    return None
+                # Subscription can deliver a condition before bind() returns.
+                # Negotiate against the installed channel, never a transient None.
+                if startup_window() is not None:
+                    await channel_bound.wait()
                 channel = self.context_channel
                 window = startup_window()
+                candidate = getattr(
+                    getattr(self, "inference", None), "preparation", None
+                )
                 if (
                     channel is None
                     or channel.suspended
                     or window is None
+                    or getattr(candidate, "require_matching_condition", False)
                     or window.task is None
                     and not (
                         getattr(channel, "prewarm_supported", False)
                         or getattr(channel, "prewarm_plan_supported", False)
                     )
+                    or getattr(self.engine, "shared_world", False)
+                    and not getattr(channel, "prewarm_plan_supported", False)
                 ):
+                    if (
+                        candidate is not None
+                        and await self.inference.prepared_for_condition(condition)
+                        and window is not None
+                    ):
+                        await window.close()
+                        if self.inference.prewarm is window:
+                            self.inference.prewarm = None
                     return None
-                if getattr(self.engine, "shared_world", False) and not getattr(
-                    channel, "prewarm_plan_supported", False
-                ):
-                    return None
+                # A prepared opening condition says nothing about future World
+                # candidates. Negotiate the startup window before consuming it.
+                # An empty plan keeps the prepared child; an actual Prefill uses
+                # ControlPrefill's verified retirement barrier on the same parent.
+                # Scene transactions with a pinned preparation keep their route.
                 if window.task is None and getattr(
                     channel, "prewarm_plan_supported", False
                 ):
@@ -797,11 +816,14 @@ class SourceSession(InteractiveSession):
             self.source_conditions = adapter
             return adapter
 
-        self.context_channel = await binder(
-            segment_id=ids["segment_id"],
-            create_adapter=create,
-            **({"start_suspended": True} if not self.inference_enabled() else {}),
-        )
+        try:
+            self.context_channel = await binder(
+                segment_id=ids["segment_id"],
+                create_adapter=create,
+                **({"start_suspended": True} if not self.inference_enabled() else {}),
+            )
+        finally:
+            channel_bound.set()
         self.context_channel.on_recovery_failed = self.context_recovery_failed
         if getattr(getattr(self, "inference", None), "manual", False):
             self.context_channel.on_source_reset = self.inference.source_reset

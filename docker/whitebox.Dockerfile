@@ -177,8 +177,8 @@ RUN --mount=type=bind,source=deploy/whitebox/debian_main_mirror.py,target=/tmp/d
 FROM room-browser AS room-runtime
 COPY --from=sdk /opt/worldkit /opt/worldkit
 COPY --from=runtime-source /runtime-source/sglang /app/python/sglang
-COPY --from=immediate-encoder-build /tmp/libwhitebox_x264.so /app/python/sglang/multimodal_gen/runtime/realtime/whitebox/native/libwhitebox_x264.so
-COPY --from=immediate-encoder-build /tmp/whitebox-codec-version.txt /app/WHITEBOX_CODEC_VERSION
+COPY --chmod=0755 --from=immediate-encoder-build /tmp/libwhitebox_x264.so /app/python/sglang/multimodal_gen/runtime/realtime/whitebox/native/libwhitebox_x264.so
+COPY --chmod=0644 --from=immediate-encoder-build /tmp/whitebox-codec-version.txt /app/WHITEBOX_CODEC_VERSION
 COPY --from=rtc-builder /tmp/whitebox-rtc /app/whitebox-rtc
 COPY benchmark/whitebox/run_service.py /app/run_service.py
 USER root
@@ -188,14 +188,19 @@ ARG WHITEBOX_SDK_SHA=unmanaged
 RUN python -c 'import json,sys; json.dump(dict(schema_version=1,source_branch=sys.argv[4],source_sha=sys.argv[1],sdk_sha=sys.argv[2]),open(sys.argv[3],"w"))' "$WHITEBOX_SOURCE_SHA" "$WHITEBOX_SDK_SHA" /app/release.json "$WHITEBOX_SOURCE_BRANCH"
 ENV WHITEBOX_RELEASE_MANIFEST=/app/release.json
 USER whitebox
-COPY --from=checks /tmp/whitebox-contracts-passed /app/whitebox-contracts-passed
 ENV WHITEBOX_CLI_ENTRYPOINT=/opt/worldkit/packages/cli/bin/worldkit.mjs \
     WHITEBOX_ROOM_SPOOL=/var/lib/sglang/whitebox/rooms \
     WHITEBOX_ROLE=room
 USER whitebox
 EXPOSE 8092
 
-FROM room-runtime AS room-checks
+# Production room still requires every gate. The complete room-runtime target
+# can be selected explicitly for an authorized isolated quick test, without
+# claiming the following checks passed or copying their markers.
+FROM room-runtime AS room-verified-runtime
+COPY --from=checks /tmp/whitebox-contracts-passed /app/whitebox-contracts-passed
+
+FROM room-verified-runtime AS room-checks
 USER root
 ARG WHITEBOX_TEST_ALLOW_DEVELOPMENT_RELEASE=0
 ENV WHITEBOX_ALLOW_DEVELOPMENT_RELEASE=$WHITEBOX_TEST_ALLOW_DEVELOPMENT_RELEASE
@@ -234,7 +239,7 @@ RUN WHITEBOX_REQUIRE_NATIVE_X264=1 python -m pytest \
       --confcutdir=python/sglang/multimodal_gen/test/unit/realtime -p no:cacheprovider -q && \
     touch /tmp/whitebox-immediate-codec-passed
 
-FROM room-runtime AS room
+FROM room-verified-runtime AS room
 COPY --from=room-checks /tmp/whitebox-cli-passed /app/whitebox-cli-passed
 COPY --from=room-checks /tmp/whitebox-immediate-codec-passed /app/whitebox-immediate-codec-passed
 COPY deploy/whitebox/cli-gpu-preflight.mjs /app/cli-gpu-preflight.mjs

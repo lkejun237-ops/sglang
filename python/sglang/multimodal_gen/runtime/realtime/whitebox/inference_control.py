@@ -912,7 +912,7 @@ class SourceInference:
         source = self.source
         if (
             os.environ.get("WHITEBOX_MODEL_CONTEXT_PREWARM") != "1"
-            or not self.manual
+            or not (self.manual or getattr(source, "world_driven", False))
             or source.control_prefill is None
             or source.model_binding is None
             or getattr(source, "member_prefill", None) is not None
