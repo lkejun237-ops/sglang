@@ -25,9 +25,12 @@ def owned_store(config, source):
     # that worker so its Mooncake client mounts the same shared segment.
     runtime_env = {
         "MC_STORE_PIN_MEMORY_MAX_BYTES": str(settings["store_memory_bytes"]),
-        "MC_STORE_MEMCPY": "0",
+        # CUDA KV buffers use Mooncake's memcpy compatibility path in the
+        # model worker; the Store/master child remains RDMA-native below.
+        "MC_STORE_MEMCPY": "1",
     }
     env.update(runtime_env)
+    store_env = dict(env, MC_STORE_MEMCPY="0")
     previous_env = {key: os.environ.get(key) for key in runtime_env}
     os.environ.update(runtime_env)
     try:
@@ -39,7 +42,7 @@ def owned_store(config, source):
                 str(path),
             ],
             cwd=source,
-            env=env,
+            env=store_env,
             start_new_session=True,
         )
     except BaseException:
