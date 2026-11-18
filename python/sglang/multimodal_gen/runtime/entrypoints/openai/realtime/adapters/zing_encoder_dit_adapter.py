@@ -131,6 +131,15 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
                 if value["type"] != "session.opened":
                     continue
                 if (
+                    value.get("prompt_control") is not None
+                    and self.condition_switch_protocol
+                ):
+                    self.ready["prompt_control"] = value["prompt_control"]
+                    self.ready["direct_prompt_hits"] = (
+                        self.condition_switch_protocol == CLIP_BARRIER_V2
+                        and value["prompt_control"].get("direct_adoption") is True
+                    )
+                if (
                     self.condition_switch_protocol == "clip-barrier-v1"
                     and getattr(request, "source_condition_early_release", False)
                     and value.get("async_inputs") is True
@@ -166,6 +175,8 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
         command = self._pending_prompt_command
         if command is None or "source_boundary" not in command:
             return False
+        if command.get("prompt_preparation"):
+            return self.end is None
         boundary = command["source_boundary"]
         # Encoder dispatch is the local watermark. The ordered, synchronous
         # DiT barrier drains all earlier messages and checks the true committed
@@ -200,6 +211,7 @@ class ZingEncoderDiTAdapter(ZingSourceEncoderAdapter):
                 is True
             )
             and command is not None
+            and not command.get("prompt_preparation")
             and "source_boundary" in command
             and not command.get("rejected")
             and command["event_id"] != getattr(self, "_prompt_preparation_event", None)

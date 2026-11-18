@@ -75,6 +75,9 @@ class QueuedDiTSession:
         self.conditioning_notice = None
         self.condition_ready = None
         self.condition_prepared = None
+        self.prompt_control = None
+        self.poll_prompt_control = None
+        self.pending_boundary_condition = None
         self.last_output_timing_ctx = None
         self._bridge_accepts_timing = (
             "slice_timing" in inspect.signature(self.bridge.append).parameters
@@ -218,6 +221,13 @@ class QueuedDiTSession:
                     raise ValueError("Invalid source preparation")
                 preparation_identity(preparation["identity"])
             boundary = message.get("source_boundary")
+            ticket = message.get("prompt_preparation")
+            if ticket is not None:
+                if self.prompt_control is None:
+                    raise ValueError("Independent prompt control is unavailable")
+                self.prompt_control.validate(
+                    ticket, boundary, message.get("prompt_version")
+                )
             if "allow_deferred_kv" in message and (
                 type(message["allow_deferred_kv"]) is not bool
                 or cancelled
@@ -341,6 +351,8 @@ class QueuedDiTSession:
                 > self.bridge.capacity_latents
                 or self.bridge.buffered_bytes + nbytes > self.bridge.capacity_bytes
             ):
+                if self.poll_prompt_control is not None:
+                    await self.poll_prompt_control()
                 await asyncio.sleep(self.queue.poll_interval_s)
                 self._open()
             arrived_ns = (
@@ -394,6 +406,12 @@ class QueuedDiTSession:
     def _arrange(self, message):
         if message is not None:
             kind = message["type"]
+            if kind == "conditioning" and message.get("prompt_preparation"):
+                if self.pending_boundary_condition is not None:
+                    raise ValueError("A boundary condition is already pending")
+                self.pending_boundary_condition = message
+                message = None
+                kind = None
             if kind in {
                 "conditioning",
                 "conditioning.cancel",
@@ -403,7 +421,7 @@ class QueuedDiTSession:
                 return [message]
             if kind == "source.end":
                 self.bridge.finish()
-            else:
+            elif message is not None:
                 timing_kwargs = {}
                 if (
                     self.return_stage_timing
@@ -430,11 +448,25 @@ class QueuedDiTSession:
         # consulting next_chunk_size, since it can reset the model phase.
         if self.queue or self.in_flight or self.state is None:
             return []
+        candidate = self.pending_boundary_condition
+        if candidate is not None:
+            boundary = candidate["source_boundary"]
+            if self.state.committed_pixel > boundary:
+                raise ValueError("DiT passed the reserved condition boundary")
+            if self.state.committed_pixel == boundary:
+                self.pending_boundary_condition = None
+                return [candidate]
         if self.bridge.ended and not self.bridge.buffered_latents:
             return [dict(type="source.end")]
         count = self.state.next_chunk_size
         if count is None or not self.bridge.ready_for(count):
             return []
+        if self.prompt_control is not None:
+            # Publish the actual selected block, not the network receive watermark.
+            # The short admission lock closes the race with an HTTP prompt arrival.
+            end = self.bridge.pixel_ends[min(count, self.bridge.buffered_latents) - 1]
+            if not self.prompt_control.start_block(end):
+                return []
         return [dict(type="source.group", chunk=self.bridge.pop(count))]
 
     async def _process(self, queue):
@@ -532,7 +564,8 @@ class QueuedDiTSession:
                                 # All earlier source messages have drained on this
                                 # single writer. Prepare without waiting for a
                                 # future source frame: Room is fenced at B.
-                                if (
+                                independent = task.get("prompt_preparation")
+                                if not independent and (
                                     self.bridge.accepted_pixels != boundary
                                     or self.bridge.buffered_latents
                                 ):
@@ -556,16 +589,50 @@ class QueuedDiTSession:
                                     self.state.ttff_timing = None
                                 with measure(timing, "condition_ready_wait"):
                                     self.confirm_condition_ready(ready)
-                                self.condition_ready = ready
+                                if task.get("direct_hit"):
+                                    outcome = dict(
+                                        ready,
+                                        state="source_ready"
+                                        if ready.get("kv_deferred")
+                                        else "kv_ready",
+                                        cache=self.take_cache_report(task["event_id"]),
+                                    )
+                                else:
+                                    self.condition_ready = ready
+                                    outcome = None
+                                if independent:
+                                    self.prompt_control.finish(
+                                        independent,
+                                        context=task.get("cache_query_context"),
+                                        outcome=outcome,
+                                    )
+                        if task["initial"] or (
+                            task.get("cache_query_context") is not None
+                            and not task.get("prompt_preparation")
+                        ):
+                            if self.prompt_control is not None:
+                                self.prompt_control.publish_context(
+                                    task.get("cache_query_context", {})
+                                )
                 except ConditionError as exc:
                     if task["initial"]:
                         raise
                     if getattr(self.state, "closed", False):
                         raise RuntimeError("DiT condition rebuild failed") from exc
-                    self.conditioning_notice = {
-                        "code": exc.code,
-                        "event_id": task["event_id"],
-                    }
+                    if task.get("prompt_preparation"):
+                        self.prompt_control.finish(
+                            task["prompt_preparation"],
+                            outcome={
+                                "state": "rejected",
+                                "code": exc.code,
+                                "event_id": task["event_id"],
+                            },
+                        )
+                    if not task.get("direct_hit"):
+                        self.conditioning_notice = {
+                            "code": exc.code,
+                            "event_id": task["event_id"],
+                        }
                 finally:
                     self.control_tasks -= 1
                     self.condition_bytes -= task["nbytes"]
@@ -708,6 +775,9 @@ class QueuedDiTSession:
         self.closed = True
         try:
             self.queue.clear()
+            self.pending_boundary_condition = None
+            if self.prompt_control is not None:
+                self.prompt_control.release()
             self.bridge.dispose()
             if self.state is not None:
                 self.state.dispose()

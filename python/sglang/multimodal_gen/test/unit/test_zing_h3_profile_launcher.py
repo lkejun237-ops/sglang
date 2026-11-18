@@ -418,6 +418,33 @@ def test_shared_enabled_pipeline_defaults(profile, quantum, overlap):
     assert "--zing-block0-cache-gc" in command
 
 
+def test_mooncake_does_not_receive_legacy_local_cache_budget_defaults():
+    command = contract(
+        profile="h200",
+        args=[
+            "--zing-block0-cache-backend",
+            "mooncake",
+            "--zing-block0-mooncake-config",
+            "/mnt/mooncake/mooncake.json",
+        ],
+    )["command"]
+    assert command[command.index("--zing-block0-cache-backend") + 1] == "mooncake"
+    assert (
+        command[command.index("--zing-block0-mooncake-config") + 1]
+        == "/mnt/mooncake/mooncake.json"
+    )
+    for option in (
+        "--zing-block0-cache-host-gb",
+        "--zing-block0-cache-host-total-gb",
+        "--zing-block0-cache-disk-gb",
+        "--zing-block0-cache-storage",
+        "--zing-block0-cache-dir",
+        "--zing-block0-cache-budget-root",
+        "--zing-block0-cache-gc",
+    ):
+        assert option not in command
+
+
 def test_custom_cache_directory_owns_gc_budget_root():
     command = contract(args=["--zing-block0-cache-dir=/owned/cache/instance"])[
         "command"

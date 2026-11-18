@@ -1041,3 +1041,98 @@ def test_dynamic_timing_does_not_relabel_later_output_as_first(model):
         h.worker.close()
 
     asyncio.run(run())
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("candidate_early", [False, True])
+@pytest.mark.parametrize("local_hit", [False, True])
+@pytest.mark.parametrize(
+    "joint,defer", [("off", False), ("cross_chunk", False), ("cross_chunk", True)]
+)
+def test_buffered_source_is_reused_by_new_prompt(
+    model, candidate_early, joint, defer, local_hit
+):
+    from sglang.multimodal_gen.runtime.realtime.prompt_control import PromptControl
+
+    h = Harness(
+        model,
+        frames=10,
+        split_first_latent=False,
+        joint_forward=joint,
+        defer_final=defer,
+    )
+    control = PromptControl(
+        lambda *_: dict(
+            hit=local_hit, cache_key="key", lookup={}, cache_query_context={}
+        )
+    )
+    h.worker.take_cache_report = lambda _: None
+    adoption = None
+    token = control.open(("s", "g"))
+    control.publish_context({})
+    h.worker.prompt_control = control
+    h.worker.supports_condition_barrier = True
+    h.worker.confirm_condition_ready = lambda value: None
+
+    async def candidate(receipt):
+        nonlocal adoption
+        if local_hit:
+            # Use the model owner's actual boundary queue with a fixed cached condition.
+            adoption = asyncio.create_task(
+                asyncio.to_thread(
+                    control.adopt, ("s", "g"), token, receipt["ticket"], 11, defer
+                )
+            )
+            async with asyncio.timeout(5):
+                while (message := control.take_candidate()) is None:
+                    await asyncio.sleep(0.001)
+            await h.worker.put(dict(message, tensors=h.condition(11)))
+            return
+        await h.put(
+            "conditioning",
+            event_id=11,
+            prompt_version=2,
+            tensors=h.condition(11),
+            source_boundary=17,
+            prompt_preparation=receipt["ticket"],
+        )
+
+    async def run():
+        await h.prompt(10)
+        await h.drain_ready()
+        # First native block is selected; a later source packet is already
+        # admitted through the end of the next clip before switching.
+        await h.source(0, 3)
+        receipt = control.route(("s", "g"), token, {"version": 2})
+        await h.source(3, 5)
+        await h.source(5, 10)
+        assert h.bridge.accepted_pixels == 34
+        assert receipt["boundary"] == 17
+        if candidate_early:
+            await candidate(receipt)
+        await h.drain_ready()
+        if not candidate_early:
+            assert h.worker.state.committed_pixel == 17
+            assert h.bridge.buffered_latents == 5
+            assert [r.prompt_event_id for r in h.results] == [10, 10]
+            await candidate(receipt)
+            await h.drain_ready()
+        assert h.worker.state.committed_pixel == 34
+        assert h.bridge.accepted_pixels == 34
+        assert h.bridge.buffered_latents == 0
+        assert [r.prompt_event_id for r in h.results] == [10, 10, 11, 11]
+        assert [
+            (r.provenance.pixels.start, r.provenance.pixels.end) for r in h.results
+        ] == [(0, 9), (9, 17), (17, 26), (26, 34)]
+        assert h.worker.condition_bytes == h.worker.control_tasks == 0
+        if local_hit:
+            result = await adoption
+            assert result["event_id"] == 11 and result["source_frame_index"] == 17
+            assert result["state"] in {"source_ready", "kv_ready"}
+        assert control.pending is None
+
+    try:
+        asyncio.run(run())
+    finally:
+        h.worker.close()
+        control.close()

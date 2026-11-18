@@ -1218,7 +1218,10 @@ def test_released_prefill_observes_disk_without_owning_or_mutating_next_player()
     asyncio.run(run())
 
 
-def test_four_case_direct_pool_uses_native_fences_and_releases(monkeypatch):
+@pytest.mark.parametrize("profile,target", [("480", (832, 480)), ("736", (1280, 736))])
+def test_four_case_direct_pool_uses_native_fences_and_releases(
+    monkeypatch, profile, target
+):
     import sys
     from pathlib import Path
 
@@ -1232,8 +1235,12 @@ def test_four_case_direct_pool_uses_native_fences_and_releases(monkeypatch):
             for role in ("encoder", "dit", "decoder")
         ]
         for value in values:
-            value["profile_limits"]["480"].update(
-                source_sizes=[[832, 480]], target_sizes=[[832, 480]], max_references=12
+            value["profiles"] = {profile: value["profiles"]["480"]}
+            value["profile_limits"] = {profile: value["profile_limits"]["480"]}
+            value["profile_limits"][profile].update(
+                source_sizes=[[832, 480]],
+                target_sizes=[list(target)],
+                max_references=12,
             )
         store = RolePoolStore(MemoryRecords(), "test", "control-1")
         control, managers, client = await native_cluster(store, values)
@@ -1249,22 +1256,23 @@ def test_four_case_direct_pool_uses_native_fences_and_releases(monkeypatch):
             async with SuiteRolePool(
                 workers=workers,
                 client=client,
+                target_size=target,
             ) as pool:
                 assert current_pool.get() is pool
                 assert pool.config["compatibility"] == "model-v1"
                 assert pool.config["network_domain"] == "zone-a"
-                assert pool.config["profile"] == "480"
+                assert pool.config["profile"] == profile
                 assert pool.control_epoch == "control-1"
                 assert pool.revision == "model-v1"
                 await pool.wait_idle()
-                a = await pool.control("admit", request("suite"))
+                a = await pool.control("admit", dict(request("suite"), profile=profile))
                 assert a["state"] == "bound"
                 assert all(m.state == "connected" for m in managers.values())
                 with pytest.raises(PoolError, match="SERVICE_OCCUPIED"):
                     # A second authority cannot overwrite the first one's owner.
                     manager = next(iter(managers.values()))
                     manager.process.acquire(
-                        manager.service_id, "other-allocation", "480"
+                        manager.service_id, "other-allocation", profile
                     )
                 result = await pool.control(
                     "close",

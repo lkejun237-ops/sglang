@@ -1646,6 +1646,7 @@
                       "docs/sglang-diffusion/zing/plans/whitebox-effective-config-20261109",
                       "docs/sglang-diffusion/zing/plans/whitebox-pr647-cleanup",
                       "docs/sglang-diffusion/zing/plans/BLOCK0_PAGED_L1",
+                      "docs/sglang-diffusion/zing/plans/block0-query-between-source-groups",
                       "docs/sglang-diffusion/whitebox/specs/world-model-context",
                       "docs/sglang-diffusion/zing_h3/specs/whitebox-sink-api.zh-CN",
                       "docs/sglang-diffusion/zing/prompt-reference-budgets",

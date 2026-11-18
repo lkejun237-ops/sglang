@@ -147,7 +147,18 @@ python3 deploy/sglang/launch.py render --config /private/release/encoder.json \
 H100 site 提供已有 namespace、digest 镜像、`volumes` 和 `volume_mounts`（模型/配置及 ossutil 认证文件的只读挂载）。
 H200 site 的 `job_spec`/`data_sources` 从当前已核实的单卡配额规格、数据源回读，保留一 Pod、一 GPU、Never restart；
 不得从旧四卡 Whitebox JSON 直接改 GPU 数冒充已验证规格。上海挂载以 `GetJob.DataSources` 为准。
+可选 `job_options` 保留同一部署的 `UserVpc`、`Settings`（RDMA、抢占开关、实例规格）、
+`Priority`、`JobMaxRunningTimeMinutes` 和仅含工作负载 Role 引用的 `CredentialConfig`。
+这些字段从当前已授权作业回读，不扩大原网络、权限、GPU 或优先级授权；不接受内嵌 AK/SK
+或自定义 `UserCommand`。无此配置时保持原有默认行为。
 仅路径配置不证明镜像依赖、挂载或跨节点网络已就绪。
+
+如果现役作业在临时盘拼装模型目录，新作业不会继承该目录。可使用
+`docker/zing-model-layout.Dockerfile` 从固定 digest 的 GPU 依赖镜像增加一个模型布局层：
+构建上下文 `model-layout/<release>/` 只包含经过资产回执核验的小型配置文件和指向
+既有只读挂载的符号链接，不包含权重、凭据或运行源码。`COPY --link` 允许复用基底层；
+发布时记录新镜像 digest、布局文件及链接清单，并由原生资产校验器再次校验实际挂载。
+此方式不代替完整源码归档；SGLang 仍从准确提交的完整归档启动。
 
 ## 提交命令（执行会占用 GPU，须另有当次部署授权）
 
@@ -166,6 +177,9 @@ aliyun eflo-controller DescribeInvocations --profile <your-aliyun-profile> --reg
 
 节点脚本持有本工具共享的 flock，读 nvidia-smi 和全 namespace 的 Pod 声明，排除已有进程、显存非零和 Pending Pod 已声明的 UUID；
 然后分配一张卡，使用 NVIDIA runtime、hostNetwork、`imagePullPolicy: Never`，先 kubectl dry-run 再创建。
+私有镜像即使已缓存，kubelet 也可能要求验证拉取凭据；此时在 H100 site 配置
+`image_pull_secrets: ["existing-registry-reader"]` 引用同 namespace 的已有 Secret。
+该字段只保存名称，不下载密钥，也不修改节点的凭据验证策略。
 非 UUID 或含糊的既有 GPU 声明会退出，请平台 owner 先核验，不强行抢卡。
 该锁不能约束其他工具/管理员；实际创建前仍需遵守现有资源归属和调度协调规则。
 Pod IP/Name/UID 用 downward API，随机 Pod 名和 worker UUID 自动生成。

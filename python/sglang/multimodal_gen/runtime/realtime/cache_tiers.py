@@ -7,7 +7,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 class StageTimes:
@@ -178,7 +178,7 @@ class NativeReplicas:
         if policy.l2 and not hasattr(client, "batch_get_replica_desc"):
             raise ValueError("Native L2 requires Mooncake replica descriptors")
 
-    def layers(self, keys):
+    def layers(self, keys, *, include_filesystem=False):
         keys = tuple(keys)
         if not self.policy.l1:
             return {key: set() for key in keys}
@@ -196,22 +196,50 @@ class NativeReplicas:
                     continue
                 if replica.is_memory_replica():
                     layers.add("l1")
-                elif self.policy.l2 and replica.is_local_disk_replica():
+                elif self.policy.l2 and (
+                    replica.is_local_disk_replica()
+                    or (include_filesystem and self._filesystem_replica(replica))
+                ):
                     layers.add("l2")
             result[key] = layers
         return result
 
+    def _filesystem_replica(self, replica):
+        # Master filesystem storage publishes DISK, not the client's LOCAL_DISK variant.
+        # This is durability evidence only: DISK reads do not promote to L1.
+        if not self.policy.disk_directory or not replica.is_disk_replica():
+            return False
+        descriptor = replica.get_disk_descriptor()
+        root = PurePosixPath(self.policy.disk_directory)
+        path = PurePosixPath(descriptor.file_path)
+        return (
+            path.is_absolute()
+            and ".." not in path.parts
+            and path != root
+            and path.is_relative_to(root)
+            and 0 < descriptor.object_size <= self.policy.max_object_bytes
+        )
+
     def memory_ready(self, keys):
         return bool(keys) and all("l1" in v for v in self.layers(keys).values())
 
-    def wait(self, keys, tier, deadline, *, cancelled=lambda: False):
+    def wait(
+        self,
+        keys,
+        tier,
+        deadline,
+        *,
+        cancelled=lambda: False,
+        poll_interval=0.02,
+        include_filesystem=False,
+    ):
         while True:
-            states = self.layers(keys)
+            states = self.layers(keys, include_filesystem=include_filesystem)
             if states and all(tier in v for v in states.values()):
                 return True
             if cancelled() or self.clock() >= deadline:
                 return False
-            time.sleep(min(0.02, max(0, deadline - self.clock())))
+            time.sleep(min(poll_interval, max(0, deadline - self.clock())))
 
     def promote(self, keys, deadline):
         states = self.layers(keys)

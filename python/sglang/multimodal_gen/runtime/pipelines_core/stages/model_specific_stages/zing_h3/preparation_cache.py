@@ -93,6 +93,11 @@ def preview_sha256(preview):
 
 def preparation_key(codecs, request, preview, config, identity):
     """One content key shared by startup and prompt switches within this stage."""
+    return fingerprint(preparation_identity(codecs, request, preview, config, identity))
+
+
+def preparation_identity(codecs, request, preview, config, identity):
+    """CPU metadata sufficient for independent prompt queries; no model state."""
     frozen = preparation_request(codecs, request)
     world_id = frozen.pop("world_id", None)
     if world_id is not None and (
@@ -133,7 +138,7 @@ def preparation_key(codecs, request, preview, config, identity):
     reference_resize = getattr(codecs, "reference_resize", None)
     if reference_resize is not None:
         identity["reference_resize"] = asdict(reference_resize)
-    return fingerprint(identity)
+    return identity
 
 
 def inputs_on(inputs, device, *, snapshot=False):

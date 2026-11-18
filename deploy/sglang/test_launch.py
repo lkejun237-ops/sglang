@@ -649,6 +649,7 @@ def test_h100_render_image_policy_and_source_cache(live_assets, policy, role):
         volumes=[],
         volume_mounts=[],
         image_pull_policy=policy,
+        image_pull_secrets=["existing-registry-reader"],
     )
     output = live_assets.root / "render"
     if policy == "Always":
@@ -675,6 +676,7 @@ def test_h100_render_image_policy_and_source_cache(live_assets, policy, role):
     pod = json.loads(shlex.split(line[len("POD_JSON=") :])[0])
     assert pod["spec"]["hostNetwork"] is True
     assert pod["spec"]["dnsPolicy"] == "ClusterFirstWithHostNet"
+    assert pod["spec"]["imagePullSecrets"] == [{"name": "existing-registry-reader"}]
     container = pod["spec"]["containers"][0]
     assert container["image"] == site["image"]
     assert container["imagePullPolicy"] == policy
@@ -714,6 +716,103 @@ def test_pai_image_config_is_preserved(live_assets):
         json.loads((output / "pai.json").read_text())["JobSpecs"][0]["ImageConfig"]
         == image_config
     )
+
+
+def test_pai_network_and_workload_role_survive_render(live_assets):
+    """A replacement must keep VPC/RDMA and role credentials instead of losing access."""
+    options = {
+        "UserVpc": {
+            "VpcId": "vpc-test",
+            "SwitchId": "vsw-test",
+            "SecurityGroupId": "sg-test",
+            "ExtendedCidrs": ["10.0.1.0/24"],
+        },
+        "Settings": {"EnableRDMA": True, "EnablePreemptibleJob": False},
+        "Priority": 9,
+        "JobMaxRunningTimeMinutes": 0,
+        "CredentialConfig": {
+            "EnableCredentialInject": True,
+            "AliyunEnvRoleKey": "0",
+            "CredentialConfigItems": [
+                {
+                    "Type": "Role",
+                    "Key": "0",
+                    "Roles": [
+                        {
+                            "RoleArn": "acs:ram::1234567890123456:role/test-runtime",
+                            "RoleType": "service",
+                            "AssumeRoleFor": "1234567890123456",
+                            "Policy": '{"Version":"1","Statement":[]}',
+                        }
+                    ],
+                }
+            ],
+        },
+    }
+    site = dict(
+        schema=1,
+        image="test@sha256:" + "c" * 64,
+        job_spec=dict(
+            Type="Worker",
+            PodCount=1,
+            QuotaId="quota3l8bnv9a35n",
+            RestartPolicy="Never",
+            ResourceConfig={"GPU": "1"},
+        ),
+        data_sources=[],
+        job_options=options,
+    )
+    output = live_assets.root / "render"
+    launch.render(live_assets.assets("dit"), runtime_manifest(), site, output)
+    job = json.loads((output / "pai.json").read_text())
+    assert {k: job[k] for k in options} == options
+    assert job["UserCommand"].startswith("export SGLANG_IMAGE_DIGEST=")
+    role = options["CredentialConfig"]["CredentialConfigItems"][0]["Roles"][0]
+    role["AssumeUserInfo"] = {"AccessKeySecret": "must-not-be-rendered"}
+    with pytest.raises(ValueError, match="Inline PAI credentials"):
+        launch.pai_job_options(options)
+    del role["AssumeUserInfo"]
+    del role["Policy"]
+    with pytest.raises(ValueError, match="role policy"):
+        launch.pai_job_options(options)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"UserCommand": "unverified code"},
+        {"Settings": {"EnableRDMA": "true"}},
+        {"CredentialConfig": {"AccessKeySecret": "inline-secret"}},
+        {
+            "UserVpc": {
+                "VpcId": "vpc-test",
+                "SwitchId": "vsw-test",
+                "SecurityGroupId": "sg-test",
+                "ExtendedCidrs": ["not-a-cidr"],
+            }
+        },
+    ],
+)
+def test_pai_options_reject_unverified_commands_or_inline_credentials(
+    live_assets, options
+):
+    site = dict(
+        schema=1,
+        image="test@sha256:" + "c" * 64,
+        job_spec=dict(
+            Type="Worker",
+            PodCount=1,
+            QuotaId="quota3l8bnv9a35n",
+            RestartPolicy="Never",
+            ResourceConfig={"GPU": "1"},
+        ),
+        data_sources=[],
+        job_options=options,
+    )
+    output = live_assets.root / "render"
+    with pytest.raises(ValueError):
+        launch.render(live_assets.assets("dit"), runtime_manifest(), site, output)
+    assert not (output / "pai.json").exists()
 
 
 def test_live_environment_and_dit_options_are_forwarded(live_assets):

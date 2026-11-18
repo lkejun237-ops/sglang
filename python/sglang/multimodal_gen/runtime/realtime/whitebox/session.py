@@ -81,6 +81,7 @@ class WhiteboxConfig:
     source_encoding: dict | None = None
     model_input_frames: int = 34
     pipeline_overlap: bool = False
+    independent_prompt_control: bool = True
     model_output_reserve_frames: int = 4
     model_subclip_admission: bool = False
     rtc_model_cadence: bool = False
@@ -192,6 +193,8 @@ class WhiteboxConfig:
             raise ValueError("Source intra refresh requires a capture-clock Room")
         if type(self.pipeline_overlap) is not bool:
             raise ValueError("Pipeline overlap must be boolean")
+        if type(self.independent_prompt_control) is not bool:
+            raise ValueError("Independent prompt control must be boolean")
         if type(self.model_subclip_admission) is not bool or (
             self.model_subclip_admission
             and not (self.room_owned and self.capture_clock and self.pipeline_overlap)

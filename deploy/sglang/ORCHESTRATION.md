@@ -90,6 +90,13 @@ python3 deploy/sglang/verify_traffic_quality.py run \
 
 ## 4. H200 `<10 分钟` 极速部署与踩坑沉淀
 
+由 `prepare_isolated_role_replay.py` 创建的私有回放组，使用其保存的 **private/state.json**
+执行相同 `down` 命令，不能改用挂载前的旧 state。该状态要求三角色均 owned、单 service、
+Coordinator 为回放专用地址。`private_replay.py` 通过自有 H100 Encoder 的已挂载凭据
+逐项核验签名身份/空闲，再确认原生 drain；Encoder 最后停止。云端 Job/Pod UID 校验
+和停止仍由原生编排器执行，记录 `retirement_scope=private-replay-authority`，不访问共享
+Coordinator、不伪造其退役回执，也不导出密钥。活跃会话、身份变化或 drain 未确认均拒绝停止。
+
 以下实战踩坑均已固化到 `launch.py`、`orchestrate.py` 与 `verify_traffic_quality.py` 中，无需人工手工规避：
 
 1. **PAI H200 CPU 配额饥饿排队防护**：8 卡 H200 节点总 vCPU 有限（约 192~224），若单角色声明 `CPU: "32"`，在已有 5 卡作业运行时新建 3 角色会因 CPU 超限卡在 `Queuing`。`topology: "h200"` 默认采用 `CPU: "16", Memory: "128Gi", SharedMemory: "64Gi"`，`probe` 自动汇总配额在途 GPU/CPU 并提前告警。

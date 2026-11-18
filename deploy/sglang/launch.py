@@ -222,6 +222,7 @@ CONFIG_KEYS = {
     "worker_config",
     "secret_files",
     "stage_from",
+    "manage_cache_store",
 }
 
 
@@ -230,6 +231,16 @@ def load_config(path):
 
 
 def validate_config(c):
+    managed = c.get("manage_cache_store", False)
+    if type(managed) is not bool or (
+        managed
+        and (
+            c.get("role") != "dit"
+            or c.get("dit_options", {}).get("zing_block0_cache_backend") != "mooncake"
+            or not c.get("dit_options", {}).get("zing_block0_mooncake_config")
+        )
+    ):
+        raise ValueError("Owned cache Store requires a DiT Mooncake configuration")
     if (
         c.get("schema") != 1
         or set(c) - CONFIG_KEYS
@@ -687,6 +698,15 @@ print(json.dumps(result))"""
 
 
 def run(c, source, commit, archive_sha):
+    from owned_cache_store import owned_store
+
+    if c.get("manage_cache_store"):
+        validate_config(c)
+    with owned_store(c, Path(source)) as check_store:
+        return _run(c, source, commit, archive_sha, check_store=check_store)
+
+
+def _run(c, source, commit, archive_sha, *, check_store):
     sha(commit, 40)
     sha(archive_sha)
     boot_t0 = time.monotonic()
@@ -844,6 +864,7 @@ def run(c, source, commit, archive_sha):
         deadline = time.monotonic() + c.get("startup_timeout", 900)
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         while time.monotonic() < deadline:
+            check_store()
             if child.poll() is not None:
                 raise RuntimeError("Worker exited before becoming healthy")
             try:
@@ -872,6 +893,7 @@ def run(c, source, commit, archive_sha):
         else:
             raise RuntimeError("Worker startup health deadline exceeded")
         while True:
+            check_store()
             try:
                 code = child.wait(timeout=15)
                 break
@@ -923,6 +945,110 @@ def bootstrap_command(manifest, config):
     ]
 
 
+def pai_job_options(value):
+    """Preserve deployment networking and role references, never inline credentials."""
+    if not isinstance(value, dict) or set(value) - {
+        "UserVpc",
+        "Settings",
+        "CredentialConfig",
+        "Priority",
+        "JobMaxRunningTimeMinutes",
+    }:
+        raise ValueError("Unsupported PAI job option")
+    options = json.loads(json.dumps(value, allow_nan=False))
+    for name, upper in (("Priority", 9), ("JobMaxRunningTimeMinutes", None)):
+        if name in options and (
+            type(options[name]) is not int
+            or options[name] < 0
+            or (upper is not None and options[name] > upper)
+        ):
+            raise ValueError("Invalid PAI scheduling option")
+    if "UserVpc" in options:
+        vpc = options["UserVpc"]
+        if (
+            not isinstance(vpc, dict)
+            or set(vpc) - {"VpcId", "SwitchId", "SecurityGroupId", "ExtendedCidrs"}
+            or any(
+                not isinstance(vpc.get(k), str) or not vpc[k]
+                for k in ("VpcId", "SwitchId", "SecurityGroupId")
+            )
+        ):
+            raise ValueError("Invalid PAI VPC binding")
+        if not isinstance(vpc.get("ExtendedCidrs", []), list):
+            raise ValueError("Invalid PAI VPC CIDRs")
+        for cidr in vpc.get("ExtendedCidrs", []):
+            if not isinstance(cidr, str):
+                raise ValueError("Invalid PAI VPC CIDR")
+            ipaddress.ip_network(cidr)
+    if "Settings" in options:
+        settings = options["Settings"]
+        flags = {"EnableRDMA", "EnablePreemptibleJob", "EnablePriorityPreemption"}
+        if not isinstance(settings, dict) or set(settings) - (
+            flags | {"QuotaInstanceTypes"}
+        ):
+            raise ValueError("Unsupported PAI setting")
+        if any(type(settings[k]) is not bool for k in flags & settings.keys()):
+            raise ValueError("PAI settings require booleans")
+        types = settings.get("QuotaInstanceTypes", [])
+        if not isinstance(types, list) or any(
+            not isinstance(x, str) or not x for x in types
+        ):
+            raise ValueError("Invalid PAI instance types")
+    if "CredentialConfig" in options:
+        config = options["CredentialConfig"]
+        if (
+            not isinstance(config, dict)
+            or set(config)
+            - {"EnableCredentialInject", "AliyunEnvRoleKey", "CredentialConfigItems"}
+            or config.get("EnableCredentialInject") is not True
+        ):
+            raise ValueError("PAI credentials require workload role references")
+        items = config.get("CredentialConfigItems")
+        if not isinstance(items, list) or len(items) != 1:
+            raise ValueError("PAI requires one workload role binding")
+        item = items[0]
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"Type", "Key", "Roles"}
+            or (
+                item["Type"] != "Role"
+                or not isinstance(item["Key"], str)
+                or not item["Key"]
+                or config.get("AliyunEnvRoleKey") != item["Key"]
+                or not isinstance(item["Roles"], list)
+                or len(item["Roles"]) != 1
+            )
+        ):
+            raise ValueError("Invalid PAI workload role binding")
+        role = item["Roles"][0]
+        if (
+            not isinstance(role, dict)
+            or set(role)
+            - {"RoleArn", "RoleType", "AssumeRoleFor", "Policy", "AssumeUserInfo"}
+            or role.get("RoleType") != "service"
+            or not re.fullmatch(
+                r"acs:ram::[0-9]+:role/[A-Za-z0-9_./-]+", str(role.get("RoleArn", ""))
+            )
+        ):
+            raise ValueError("Invalid PAI workload role reference")
+        user = role.pop("AssumeUserInfo", {})
+        if not isinstance(user, dict) or any(user.values()):
+            raise ValueError("Inline PAI credentials are forbidden")
+        if (
+            not isinstance(role.get("AssumeRoleFor"), str)
+            or not role["AssumeRoleFor"].isdigit()
+        ):
+            raise ValueError("Invalid PAI workload role account")
+        if not isinstance(role.get("Policy"), str):
+            raise ValueError("Invalid PAI workload role policy")
+        policy = json.loads(role["Policy"])
+        if not isinstance(policy, dict) or not isinstance(
+            policy.get("Statement"), list
+        ):
+            raise ValueError("Invalid PAI workload role policy")
+    return options
+
+
 def render(c, manifest, site, output):
     validate_manifest(manifest)
     if site.get("schema") != 1:
@@ -939,6 +1065,7 @@ def render(c, manifest, site, output):
             "volume_mounts",
             "model_id",
             "image_pull_policy",
+            "image_pull_secrets",
         }
         if not is_pai
         else {
@@ -949,6 +1076,7 @@ def render(c, manifest, site, output):
             "model_id",
             "workspace_id",
             "image_auth_file",
+            "job_options",
         }
     )
     if site.get("image_auth_file") is not None:
@@ -962,8 +1090,16 @@ def render(c, manifest, site, output):
         raise ValueError("Site and role model identity mismatch")
     if site.get("image_pull_policy", "Never") not in {"Never", "IfNotPresent"}:
         raise ValueError("Unsupported image pull policy")
+    pull_secrets = site.get("image_pull_secrets", [])
+    if not isinstance(pull_secrets, list) or any(
+        not isinstance(name, str)
+        or not re.fullmatch(r"[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?", name)
+        for name in pull_secrets
+    ):
+        raise ValueError("image_pull_secrets must contain Kubernetes Secret names")
     if set(site) - allowed:
         raise ValueError("Unknown site configuration field")
+    job_options = pai_job_options(site.get("job_options", {})) if is_pai else {}
     for name in ("launch.py", "source.py", "select_gpu.py"):
         if manifest.get("tools", {}).get(name) != digest(
             Path(__file__).with_name(name)
@@ -1049,6 +1185,9 @@ def render(c, manifest, site, output):
             },
         }
         # Node local advisory lock prevents two invocations of this launcher selecting the same card.
+        if pull_secrets:
+            # Cached private images can still require kubelet credential verification.
+            pod["spec"]["imagePullSecrets"] = [{"name": name} for name in pull_secrets]
         script = """#!/bin/sh
 set -eu
 exec 9>/tmp/sglang-role-allocation.lock
@@ -1134,6 +1273,7 @@ printf '%s' "$POD_JSON" | sed "s/__ALLOCATED_GPU_UUID__/$GPU_UUID/g" | kubectl c
             image_cfg["Auth"] = auth_value
             spec["ImageConfig"] = image_cfg
         job = {
+            **job_options,
             "DisplayName": name,
             "JobType": "PyTorchJob",
             "WorkspaceId": workspace_id,

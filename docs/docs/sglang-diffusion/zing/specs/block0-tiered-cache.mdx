@@ -26,10 +26,16 @@ semantics are implemented by the empty OSS object named `complete`, written afte
 the artifact payloads and manifest. Reads still check identity, geometry, lengths,
 and actual transfer success; no full tensor hash pre-pass is performed.
 
-An L3 restore fetches up to four payload objects concurrently and imports them
-in manifest order. Outstanding downloads and data awaiting import share a
+An L3 restore fetches payload objects concurrently and imports them in manifest
+order. `SGLANG_ZING_BLOCK0_OSS_DOWNLOAD_CONCURRENCY` sets the per-restore limit
+(positive integer, default `4`), read when the archive client is created. Set
+`SGLANG_ZING_BLOCK0_OSS_DOWNLOAD_CONCURRENCY=10` in the DiT role environment to
+allow up to ten concurrent downloads; recreate the role to apply a change.
+Outstanding downloads and data awaiting import share a
 per-restore payload budget of twice `tiers.max_object_bytes`. The
-`l3_download` span sums individual GET durations, which can overlap.
+byte budget can reduce actual concurrency for large objects; increasing the
+worker limit does not increase that budget or change upload concurrency.
+The `l3_download` span sums individual GET durations, which can overlap.
 
 Online Prefill returns `prefill.memory_ready` when L1 is complete and cleanup is
 confirmed; it does not wait for L2/L3 or repair missing durable copies on a hit.
@@ -85,7 +91,14 @@ same frozen policy. Block0 transfers require RDMA. Omit `protocol` or set it to
 Use `rdma_devices` to select host-specific HCAs. Confirm the chosen HCAs in the Store
 and worker logs, then verify a GPU KV restore. L1/L2/L3 and write edges are separate switches. Native L2 is
 owned only by the host Store; never start an SSD owner for every Slot against the
-same directory. Startup must verify the pinned native flags and replica behavior.
+same directory. The launcher explicitly leaves the Master filesystem root empty:
+`root_fs_dir` would additionally write DISK payloads on Put, duplicating the
+Store-owned LOCAL_DISK path. `enable_offload` and the Store
+`enable_ssd_offload`/`ssd_offload_path` remain enabled for native SSD. The invariant
+is one active local SSD payload replica per object, not one file for an entire
+KV group: bucket metadata and legitimate eviction/refill are separate. Startup
+must verify zero filesystem DISK descriptors and a single native SSD owner.
+Existing filesystem files are not deleted or implicitly migrated by this change.
 
 ```sh
 PYTHONPATH=python python deploy/whitebox/cache_store.py --config /etc/sglang/cache.json
@@ -98,8 +111,8 @@ legacy local backend continues to accept existing games but retains S0 equality
 in its key; it does not claim world-only offline/online reuse. Select Mooncake
 explicitly in the matching test deployment; no container source overlays.
 
-L2 uses native bucket LRU, logical/physical byte caps, bounded offload buffers and
-filesystem watermarks. A PAI container's local overlay may be selected explicitly
+The client-owned LOCAL_DISK backend uses native bucket LRU, logical/physical
+byte caps, bounded offload buffers and filesystem watermarks. A PAI container's local overlay may be selected explicitly
 with `allow_overlay_l2=true` after checking its real capacity; OSS/FUSE/NFS remain
 rejected. Store readiness records the actual filesystem. Overlay storage survives
 worker-process restarts but is not promised to survive pod replacement, and is
@@ -210,3 +223,31 @@ and marker publication; `l2_replica_wait` measures native readiness observation,
 not an invented disk-device IO duration. Parallel Host spans must not be added as
 end-to-end latency. Actual CUDA restore timing remains separate. GPU, full-size
 KV and server-chain validation are still required.
+
+## Filesystem replica compatibility and best-effort writes
+
+Mooncake distinguishes master filesystem `DISK` descriptors from client-owned
+`LOCAL_DISK` descriptors. A completed `DISK` object can satisfy background L2 durability when
+its absolute file path belongs to the configured `tiers.disk_directory` and its
+size fits the object transfer budget. Paths outside that root, parent traversal,
+partial replicas and unknown replica types cannot make a group durable. This
+classification is enabled only by persistence callers and performs no file or
+payload IO. Online layer selection still uses MEMORY and client LOCAL_DISK:
+master DISK reads do not schedule native promotion, so a DISK-only object must
+not consume the recall deadline waiting for L1. It follows the existing OSS/miss
+path instead. Identity, complete-group and actual transfer checks remain required;
+recognizing durability never reports `memory_ready`.
+
+Background persistence checks pending L2 replicas at 250 ms intervals, bounded by
+the existing deadline. Online promotion retains its 20 ms interval. A hot L1 hit
+and online Prefill do not wait for OSS, probe it to repair an archive, or retry a
+full background queue. Optional writes remain best-effort: a full queue may skip
+an artifact and records `queue_full`, without a growing retry backlog. Explicit
+offline `persist=true` keeps its separate durable-success contract. Operators
+must distinguish memory-ready, persisted, skipped and failed observations.
+
+A filesystem descriptor is not proof that native bucket-LRU or disk-byte limits
+apply to that backend. Verify the deployed Store's filesystem access and capacity
+policy independently. This compatibility change has CPU regression coverage;
+GPU recall, OSS writeback and gameplay under upload load require deployment
+verification before claiming an end-to-end pass.

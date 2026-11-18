@@ -44,6 +44,8 @@ def settings(config, disk_total=None):
         f"--port={int(port)}",
         f"--metrics_port={http.port}",
         f"--enable_offload={str(offload).lower()}",
+        # Only the shared Store owns SSD writes; no filesystem copy on each Put.
+        "--root_fs_dir=",
         "--enable_disk_eviction=true",
         "--promotion_on_hit=true",
         "--promotion_admission_threshold=1",
@@ -61,10 +63,7 @@ def settings(config, disk_total=None):
             raise ValueError(
                 "Native L2 free-space reserve leaves no usable disk budget"
             )
-        command += [
-            f"--root_fs_dir={policy.disk_directory}",
-            "--offload_on_evict=false",
-        ]
+        command += ["--offload_on_evict=false"]
         env.update(
             MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR="bucket_storage_backend",
             MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=policy.disk_directory,
@@ -104,7 +103,15 @@ def run(config_path):
 
     from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
-    if importlib.metadata.version("mooncake-transfer-engine") != "0.3.13":
+    try:
+        mooncake_version = importlib.metadata.version("mooncake-transfer-engine")
+    except importlib.metadata.PackageNotFoundError:
+        # Some production images ship the verified Mooncake module and native
+        # master binary without a pip dist-info record. The import above is
+        # already the runtime capability gate; keep the strict version check
+        # whenever metadata is available.
+        mooncake_version = None
+    if mooncake_version not in (None, "0.3.13"):
         raise ValueError("This launcher requires the verified Mooncake 0.3.13 contract")
     config = json.loads(config_path.read_text())
     policy = CacheTiers.parse(config.get("tiers", {}))

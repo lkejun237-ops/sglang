@@ -3408,6 +3408,11 @@ def down(state, directory, cloud):
     attachment = state.get("attachment", {})
     identities = attachment.get("identities", {})
     operator_token = os.environ.get("ROLE_POOL_OPERATOR_TOKEN", "").strip()
+    private = None
+    if state.get("private_replay_authority"):
+        from private_replay import PrivateReplayControl
+
+        private = PrivateReplayControl(state, cloud)
     # A physical stop is not recoverable through the cloud API alone once a
     # worker is attached. Check the entire group before changing a lease or job.
     for role, resource in state["resources"].items():
@@ -3433,7 +3438,7 @@ def down(state, directory, cloud):
                     raise ValueError(
                         f"Cloud deletion for {role} has no pool retirement receipt"
                     )
-            elif not operator_token:
+            elif not operator_token and private is None:
                 raise ValueError(
                     "Stopping attached roles requires pool operator credentials"
                 )
@@ -3457,6 +3462,10 @@ def down(state, directory, cloud):
     for role, identity in identities.items():
         resource = state["resources"][role]
         if resource.get("status") != "deleted" and not resource.get("reused"):
+            if private is not None:
+                if resource.get("status") != "stopped-unretired":
+                    private.verify_idle(role)
+                continue
             status = _owned_process_status(
                 target, state["spec"]["pool"], identity, operator_token, cloud
             )
@@ -3510,13 +3519,23 @@ def down(state, directory, cloud):
                 raise ValueError("Cannot confirm release of the reused worker lease")
             resource["lease_released"] = True
             save(directory / "state.json", state)
-    for role, resource in state["resources"].items():
+    stop_order = list(state["resources"])
+    if private is not None:
+        # The owned Encoder is the credential relay; stop it after both peers.
+        stop_order.sort(key=lambda role: role == "encoder")
+    for role in stop_order:
+        resource = state["resources"][role]
         if resource.get("status") == "deleted" or resource.get("reused") is True:
             continue
         is_pai = "job_id" in resource or is_pai_role(state["spec"], role)
         identity = identities.get(role)
         if resource.get("status") != "stopped-unretired":
-            if identity and operator_token:
+            if private is not None:
+                resource["private_drain_receipt"] = private.verify_idle(
+                    role, drain=True
+                )
+                save(directory / "state.json", state)
+            elif identity and operator_token:
                 http(
                     target["coordinator_url"] + "/v1/role-pool/drain",
                     dict(
@@ -3584,7 +3603,10 @@ def down(state, directory, cloud):
                 )
             resource["status"] = "stopped-unretired"
             save(directory / "state.json", state)
-        if identity and operator_token:
+        if private is not None:
+            resource["retired"] = True
+            resource["retirement_scope"] = "private-replay-authority"
+        elif identity and operator_token:
             stop_receipt = resource.setdefault(
                 "stop_receipt",
                 f"orchestrate-down-{state['run_id']}-{state.get('generation', 0)}-{role}",

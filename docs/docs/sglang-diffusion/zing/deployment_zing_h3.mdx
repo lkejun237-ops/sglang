@@ -8,6 +8,17 @@ description: "供 Codex 与部署同学使用的 H100/H200/B300 部署决策、�
 下面是已有部署经验，只有对应版本、输入和配置的实测结论；
 实验补丁、显存快照、未验收画质均单独标注。新部署先选择一行，再沿证据入口取得原配置。
 
+## Mooncake filesystem L2 compatibility candidate（2026-11-18）
+
+候选基于 main `e5cc9a4c22`，补齐配置磁盘目录下 COMPLETE `DiskReplica` 的后台L2持久化判定，
+在线召回仍仅使用MEMORY/`LocalDiskReplica`，避免DISK-only伪提升等待；保留完整组与传输校验。后台写回等待轮询改为250ms，
+在线召回仍为20ms；OSS尽力上传、队列满可跳过，不延长memory-ready或试玩启动。
+共享Store启动器显式关闭Master额外filesystem写盘，保留原生SSD与OSS；旧文件不自动清理/迁移。
+OSS下载并发可用`SGLANG_ZING_BLOCK0_OSS_DOWNLOAD_CONCURRENCY`配置（默认4），上海副本候选计划设为10；
+仍保留每次恢复`2 × max_object_bytes`的缓冲预算，因此大对象可能达不到10路。不改变上传并发。
+不改变模型权重、精度、缓存key或KV格式。CPU回归通过；真实GPU、OSS及浏览器性能尚待验收。
+[合同与边界](specs/block0-tiered-cache.mdx#filesystem-replica-compatibility-and-best-effort-writes)。
+
 ## 生产 TTFF 分时观测（2026-11-10，代码候选，未部署）
 
 2026-11-18 Room 候选补充：开启 `WHITEBOX_MODEL_CONTEXT_PREWARM=1` 的受管 World
@@ -272,7 +283,7 @@ SDK 控制不等待该门槛，低水位/首帧/条件边界/EOS 直接供给，
 
 候选保留每条SDK输入与回执，只有已知无事件held-state续租不再提升供帧优先级；未知语义输入仍保守。
 以健康完成节奏为基准，加入帧龄/水位PI小幅修正（周期1.0–1.15、每500ms最多0.02、有限积分、D=0），
-不改变最小供帧窗口或硬容量限制。34帧credit的9/17帧批量模拟保持吞吐、P95捕获间隔<85ms；
+不改变最小供帧窗口或硬容量限制。34帧credit的9/17帧批量模拟保持吞吐、P95捕获间隔\<85ms；
 25帧credit仍可能受批量供给约束，不能据此承诺真实改善。新候选无480/736同条件GPU分项性能与显存验收。
 同时纳入当前测试输入修复PR664，SDK固定已部署且dev可达的4c10ad26；完整Room镜像代替源码/SDK挂载。
 契约和边界见上方自适应规范。浏览器由用户测试。
@@ -314,6 +325,22 @@ Sink 策略及 L1/L2 预算仍按已冻结配置明确传入，不以合并变�
 泰国 480 输入/736 输出、B300、FP8 的新组合通过；合并后的功能、画质和性能分别报告。
 
 ## Split Whitebox 条件切换与周期 Sink 刷新
+
+PR #746 候选使用独立会话控制入口：Room 收到可执行的新 prompt 后直接发起 Block0
+查询，不经 Encoder/DiT 模型队列。仅条件采用等待 DiT 已开始块所在的 17 帧片段结束；
+后续已接收的 source/VAE latents 保留。当前只对单 rank 分离服务广告该能力，旧客户端
+及多 rank 保持原协议；缓存命中仍跳过 Qwen。
+新候选协商 `direct_prompt_hits` 后，命中由 DiT 在本地采用，未命中由 Room 转交 Encoder 准备条件。缓存关闭同样可切换。该版 480/736 的 GPU 时延与显存尚待复测；以下实测属于经 Encoder 转交命中结果的版本。
+上海隔离验证采用 H100 Encoder + H200 DiT/Decoder，1103 step2000、sparse095/three_tier、
+两步、cross_chunk/source_prompt_joint 开启。模型 `e6ff9b1bd1e7`、Room `4497a7e4ade0`：
+480 长湖镇、黑湖、掌中天各两轮、共 18 次切词出图通过，逐段回执及释放已记录。首轮曾因 Room 收到
+Encoder source_ready 就取消 ticket 导致超时，已修复为 DiT 采用候选后释放。
+首帧 TTFF 1.941–3.077 s（不含 prefill），切词首 RGB 2.413–8.154 s，存在明显波动；
+后续同服务热缓存协议消融（Room `e9081a12aea1`）两臂各 18 次切词通过：切词 TTFF
+中位数/P95 从旧协议 13.022/30.559 s 降为独立控制 3.603/7.931 s，DiT 首输出计算
+约 1.54 s、Decoder VAE 约 28 ms 基本不变。此为同服务协议选择的实测收益，不是
+历史源码重新部署 baseline；736、三角色显存/画质仍未验收，不能跨档位外推。
+详见[查询调度方案与验收边界](/docs/sglang-diffusion/zing/plans/block0-query-between-source-groups)。
 
 Room 与 split Encoder 成对升级，使用 `clip-barrier-v2`。在完整旧 clip 后，Encoder 准备
 候选并按 FIFO 提交，随后用 `source_ready` 恢复 Room 供帧。同 key 复用已生效的 Encoder 输入，

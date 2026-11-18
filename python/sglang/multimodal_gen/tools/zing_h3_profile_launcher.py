@@ -1173,6 +1173,27 @@ def build_launch_contract(
             effective_initial_blocks = server_defaults.get("--zing-initial-block-count")
         if effective_initial_blocks == "0":
             server_defaults.pop("--zing-initial-denoising-step-list", None)
+        # Mooncake owns Block0 capacity and persistence through its mounted
+        # config. Do not append the legacy local-disk budget defaults (which
+        # can otherwise pin hundreds of GiB and make the command appear to
+        # use the old local backend alongside Mooncake).
+        if argument_value(arguments, "--zing-block0-cache-backend") == "mooncake":
+            for option in (
+                "--zing-block0-cache-host-gb",
+                "--zing-block0-cache-host-total-gb",
+                "--zing-block0-cache-disk-gb",
+                "--zing-block0-cache-storage",
+                "--zing-block0-cache-dir",
+                "--zing-block0-cache-budget-root",
+                "--zing-block0-cache-min-free-gb",
+                "--zing-block0-cache-inflight-gb",
+                "--zing-block0-cache-max-writers",
+                "--zing-block0-cache-gc",
+                "--zing-block0-cache-gc-high-watermark",
+                "--zing-block0-cache-gc-low-watermark",
+                "--zing-block0-cache-capacity-dir",
+            ):
+                server_defaults.pop(option, None)
         if component == "dit":
             if supplied.intersection(
                 {"--encoder-gpus", "--denoiser-gpus", "--decoder-gpus"}

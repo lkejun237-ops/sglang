@@ -404,8 +404,10 @@ def _validate_prompt_and_references(
     prompt_text: str,
     refs: list[dict[str, Any]],
     known_ref_shas: set[str],
+    *,
+    require_video_tag: bool = True,
 ) -> dict[str, Any]:
-    if "<Video 1>" not in prompt_text:
+    if require_video_tag and "<Video 1>" not in prompt_text:
         raise ValueError(f"[{label}] Prompt missing required '<Video 1>' tag")
     pic_nums = {int(m) for m in re.findall(r"<Picture (\d+)>", prompt_text)}
     expected_contiguous = set(range(1, len(pic_nums) + 1))
@@ -426,7 +428,7 @@ def _validate_prompt_and_references(
         "label": label,
         "reference_count": len(refs),
         "picture_tags": sorted(pic_nums),
-        "has_video_tag": True,
+        "has_video_tag": "<Video 1>" in prompt_text,
     }
 
 
@@ -683,6 +685,7 @@ def run_preflight_checks(
                 rec_meta["prompt"],
                 rec_meta.get("references_mapping", []),
                 known_ref_shas,
+                require_video_tag=suite_data.get("execution") != "recorded-cases",
             )
         )
         for sw in rec_meta.get("condition_switches", []):
@@ -692,6 +695,7 @@ def run_preflight_checks(
                     sw["prompt"],
                     sw.get("references", []),
                     known_ref_shas,
+                    require_video_tag=suite_data.get("execution") != "recorded-cases",
                 )
             )
 
@@ -722,7 +726,9 @@ def run_preflight_checks(
             "2_prompt_and_reference_contract": {
                 "passed": True,
                 "conditions_checked": len(prompt_checks),
-                "max_reference_count_required": 12,
+                "max_reference_count_required": max(
+                    (p["reference_count"] for p in prompt_checks), default=0
+                ),
                 "details": prompt_checks,
             },
             "3_service_identity_and_health": {
@@ -1449,6 +1455,7 @@ async def _run_single_segment_flow(
     spool_dir: Path,
     spec: VideoSpec,
     mode: str,
+    model_target: VideoSpec | None = None,
     cache_store: MockSglangCacheStore,
     sglang_url: str | None,
     coordinator_url: str | None = None,
@@ -1458,6 +1465,7 @@ async def _run_single_segment_flow(
     flow_mode: str = "natural",
     realtime_pacing: bool,
     detailed_timing: bool = False,
+    independent_prompt_control: bool = True,
     pacing_speed: float,
     capture_fps: int | None = None,
     repeat_warm_prefill: bool = False,
@@ -1466,6 +1474,7 @@ async def _run_single_segment_flow(
     secondary_segment_recording: dict[str, Any] | None = None,
     seed_override: int | None = None,
     stress_seed_override: int | None = None,
+    source_kind: str = "recorded",
     secondary_seed_override: int | None = None,
 ) -> dict[str, Any]:
     if flow_mode not in {"natural", "deterministic"}:
@@ -1518,7 +1527,7 @@ async def _run_single_segment_flow(
     )
     default_wait_timeout = 180.0 if mode == "real-sglang" else 25.0
 
-    created_engines: list[RecordedVideoEngine] = []
+    created_engines = []
     engine_factory = create_recorded_video_engine(
         mp4_path if mp4_path.exists() else None,
         rgb_frames=(
@@ -1535,6 +1544,18 @@ async def _run_single_segment_flow(
         on_created=created_engines.append,
     )
 
+    if source_kind == "worldkit-live":
+        from live_source_engine import live_source_factory
+
+        engine_factory = live_source_factory(
+            world_id=recording_meta["world_id"],
+            capture_fps=capture_fps,
+            on_created=created_engines.append,
+            identity=recording_meta.get("live_game_identity"),
+        )
+    elif source_kind != "recorded":
+        raise ValueError("Unknown source kind")
+
     archives = AsyncArchiveManager(
         recorder_slots=4,
         queue_depth=512,
@@ -1544,6 +1565,7 @@ async def _run_single_segment_flow(
     )
     journal = RenderJournal(
         MemoryRoomStore(),
+        detailed_timing_default=detailed_timing,
         user_id="suite-user",
         source_session_id=f"src-{case_id}-{uuid4().hex[:6]}",
         source_epoch="epoch-1",
@@ -1582,11 +1604,22 @@ async def _run_single_segment_flow(
             ui_factory=lambda **_: _BrowserUIStub(),
             spool=spool_dir,
             spec=spec,
+            model_target=model_target,
             room_owned=True,
             capture_clock=True,
             pipeline_overlap=True,
+            independent_prompt_control=independent_prompt_control,
             num_inference_steps=int(os.environ.get("WHITEBOX_INFERENCE_STEPS", "4")),
             model_input_frames=int(os.environ.get("WHITEBOX_MODEL_INPUT_FRAMES", "34")),
+            model_subclip_admission=(
+                source_kind == "worldkit-live"
+                and os.environ.get("WHITEBOX_MODEL_SUBCLIP_ADMISSION", "0") == "1"
+            ),
+            model_source_sampling=(
+                os.environ.get("WHITEBOX_MODEL_SOURCE_SAMPLING", "latest")
+                if source_kind == "worldkit-live"
+                else "latest"
+            ),
             startup_seconds=120 if mode == "real-sglang" else 30,
             play_seconds=600,
             drain_seconds=30 if mode == "real-sglang" else 10,
@@ -1638,8 +1671,9 @@ async def _run_single_segment_flow(
             elif mtype == "model.cache":
                 model_cache_messages.append(msg)
             elif mtype == "render.status":
-                if msg.get("phase") == "protocol_ready":
-                    protocol_ready_messages.append(msg)
+                protocol = msg.get("segment", msg)
+                if protocol.get("phase") == "protocol_ready":
+                    protocol_ready_messages.append(protocol)
                 if msg.get("state") == "prompt_applied":
                     key = (msg.get("segment_id", ""), int(msg.get("prompt_version", 0)))
                     prompt_applied_times[key] = now_mono
@@ -1648,6 +1682,8 @@ async def _run_single_segment_flow(
         eff_timeout = default_wait_timeout if timeout_s is None else timeout_s
         async with asyncio.timeout(eff_timeout):
             while True:
+                if input_task is not None and input_task.done():
+                    input_task.result()
                 if error_messages:
                     raise RuntimeError(
                         f"SourceSession emitted error: {error_messages[-1]}"
@@ -1917,7 +1953,9 @@ async def _run_single_segment_flow(
             "extra_prefills": extra_pf_results,
         }
 
+    input_task = None
     consumer_task = asyncio.create_task(_consume())
+    engine_init_started = time.perf_counter()
     lease_release_verified = False
     try:
         world_short = recording_meta["world_id"].split("/")[-1]
@@ -1934,6 +1972,32 @@ async def _run_single_segment_flow(
         assert source.model_binding is not None, "ModelBinding must be initialized"
         assert source.control_prefill is not None, "ControlPrefill must be initialized"
         await source.model_binding.wait_ready()
+
+        if source_kind == "worldkit-live" and getattr(source, "world_driven", False):
+            from live_source_engine import observe_world_run, replay_player_inputs
+
+            segment = await _wait_for(lambda: source.current_segment)
+            batches = await _wait_for(
+                lambda: frame_batches_by_epoch.get(segment.segment_epoch)
+            )
+            input_task = asyncio.create_task(
+                replay_player_inputs(
+                    source, recording_meta["player_inputs"], time.perf_counter()
+                )
+            )
+            return await observe_world_run(
+                source,
+                created_engines[0],
+                recording_meta,
+                segment,
+                batches,
+                input_task,
+                _wait_for,
+                prompt_applied_times,
+                engine_init_started,
+                target_segment_frames,
+                detailed_timing,
+            )
 
         # Snapshot the condition before uploading references and running Prefill.
         prep_done = await _prepare_f0()
@@ -2004,6 +2068,14 @@ async def _run_single_segment_flow(
             references=initial_refs,
             **({"detailed_timing": True} if detailed_timing else {}),
         )
+        if source_kind == "worldkit-live" and recording_meta.get("player_inputs"):
+            from live_source_engine import replay_player_inputs
+
+            input_task = asyncio.create_task(
+                replay_player_inputs(
+                    source, recording_meta["player_inputs"], start_wall
+                )
+            )
         await _wait_for(
             lambda: (
                 source.current_segment is not None
@@ -2019,6 +2091,7 @@ async def _run_single_segment_flow(
         # Validate Precondition 5: Negotiated Worker Protocol & Reference Capacity
         proto_msg = protocol_ready_messages[-1] if protocol_ready_messages else {}
         negotiated_protocol = {
+            "independent_prompt_control": proto_msg.get("independent_prompt_control"),
             "condition_switch_protocol": proto_msg.get("condition_switch_protocol"),
             "prompt_reference_updates": proto_msg.get("prompt_reference_updates"),
             "max_references": proto_msg.get("max_references"),
@@ -2251,6 +2324,7 @@ async def _run_single_segment_flow(
                 ),
             }
 
+        input_sent = await input_task if input_task is not None else []
         await source.unbind("SUITE_COMPLETED")
         await source.close()
         lease_obj = getattr(source.model_binding, "lease", None)
@@ -2265,7 +2339,36 @@ async def _run_single_segment_flow(
         return {
             "case_id": case_id,
             "flow_mode": flow_mode,
+            "source_kind": source_kind,
+            "room_input_policy": {
+                "input_frames": source.config.model_input_frames,
+                "subclip_admission": source.config.model_subclip_admission,
+                "sampling": source.config.model_source_sampling,
+            },
+            "engine_startup_ms": getattr(engine_obj, "startup_ms", None),
+            "engine_init_to_first_rgb_ms": round(
+                (
+                    min(
+                        t
+                        for batches in frame_batches_by_epoch.values()
+                        for t, _ in batches
+                    )
+                    - engine_init_started
+                )
+                * 1000,
+                3,
+            ),
+            "engine_metadata": getattr(engine_obj, "metadata", None),
+            "player_input_source": recording_meta.get("player_input_source"),
+            "player_inputs_sent": input_sent,
+            "player_input_receipts": getattr(engine_obj, "input_receipts", []),
             "detailed_timing_requested": detailed_timing,
+            "independent_prompt_control_requested": independent_prompt_control,
+            "source_size": [spec.width, spec.height],
+            "target_size": [
+                (model_target or spec).width,
+                (model_target or spec).height,
+            ],
             "target_output_frames": effective_target_frames,
             "world_id": recording_meta["world_id"],
             "recording_id": rec_id,
@@ -2291,7 +2394,7 @@ async def _run_single_segment_flow(
                 "source_total_captured_frames": engine_obj.emitted_frames
                 if engine_obj
                 else None,
-                "source_loop_enabled": True,
+                "source_loop_enabled": source_kind == "recorded",
                 "capture_control_log": (
                     list(engine_obj.control_log) if engine_obj else []
                 ),
@@ -2299,6 +2402,9 @@ async def _run_single_segment_flow(
             "secondary_segment": secondary_result,
         }
     finally:
+        if input_task is not None:
+            input_task.cancel()
+            await asyncio.gather(input_task, return_exceptions=True)
         consumer_task.cancel()
         await asyncio.gather(consumer_task, return_exceptions=True)
         await source.close()
@@ -2324,6 +2430,8 @@ async def run_source_replay_suite(
 ):
     from source_replay_role_pool import SuiteRolePool
 
+    video_spec = _suite_video_spec(suite_data)
+    target_spec = _suite_model_target(suite_data) or video_spec
     urls = dict(encoder=encoder_url, dit=dit_url, decoder=decoder_url)
     explicit = any(urls.values())
     if explicit and (not all(urls.values()) or kwargs.get("coordinator_url")):
@@ -2357,10 +2465,139 @@ async def run_source_replay_suite(
             room_token_env=room_token_env,
             signing_secret_env=signing_secret_env,
             control_epoch=control_epoch,
+            video_size=(video_spec.width, video_spec.height),
+            target_size=(target_spec.width, target_spec.height),
         ) as pool:
             await pool.wait_idle()
             return await _run_source_replay_suite(suite_data, **kwargs)
     return await _run_source_replay_suite(suite_data, **kwargs)
+
+
+def _suite_model_target(suite_data):
+    target = suite_data.get("model_target")
+    if target is None:
+        return None
+    if (
+        suite_data.get("execution") != "recorded-cases"
+        or not isinstance(target, dict)
+        or set(target) != {"width", "height"}
+        or any(type(target[k]) is not int for k in target)
+        or (target["width"], target["height"]) not in {(832, 480), (1280, 736)}
+    ):
+        raise ValueError("Recorded model target must be 832x480 or 1280x736")
+    return VideoSpec(target["width"], target["height"], 24)
+
+
+def _suite_video_spec(suite_data):
+    if suite_data.get("execution") != "recorded-cases":
+        return VideoSpec(832, 480, 24)
+    geometries = {
+        (
+            int(c["video"]["width"]),
+            int(c["video"]["height"]),
+            int(c["video"].get("fps", 24)),
+        )
+        for c in suite_data["cases"]
+    }
+    if len(geometries) != 1:
+        raise ValueError("Recorded cases require one frozen video geometry per suite")
+    width, height, fps = geometries.pop()
+    if (width, height) not in {(832, 480), (1280, 736)} or fps != 24:
+        raise ValueError("Recorded cases require 832x480 or 1280x736 at 24 FPS")
+    ids = [c["case_id"] for c in suite_data["cases"]]
+    if len(ids) != len(set(ids)) or any(
+        not re.fullmatch(r"[a-zA-Z0-9_-]+", x) for x in ids
+    ):
+        raise ValueError("Recorded case IDs must be unique path-safe names")
+    return VideoSpec(width, height, fps)
+
+
+async def _run_recorded_cases(suite_data, *, output_dir, preflight, seed_base, common):
+    """Run each frozen condition sequence with a recorded or live source."""
+    repeats = suite_data.get("repeats", 2)
+    source_kind = suite_data.get("source_kind", "recorded")
+    if type(repeats) is not int or repeats < 1:
+        raise ValueError("Suite repeats must be a positive integer")
+    if source_kind not in {"recorded", "worldkit-live"}:
+        raise ValueError("Unknown source kind")
+    if source_kind == "worldkit-live" and common["mode"] != "real-sglang":
+        raise ValueError("Live engine measurements require real model workers")
+    from source_replay_role_pool import current_pool
+
+    results = []
+    summary = dict(
+        schema_version=1,
+        suite_name=suite_data["name"],
+        status="running",
+        test_kind="room-sglang-live-engine"
+        if source_kind == "worldkit-live"
+        else "room-sglang-source-replay",
+        source_kind=source_kind,
+        repeats=repeats,
+        mode=common["mode"],
+        flow_mode=common["flow_mode"],
+        preflight=preflight,
+        seed_base=seed_base,
+        detailed_timing_requested=common["detailed_timing"],
+        cases=results,
+        video=dict(width=common["spec"].width, height=common["spec"].height, fps=24),
+        model_target=suite_data.get("model_target"),
+        timing_scope=(
+            "真实引擎记录引擎初始化至模型首 RGB；录制回放记录 session TTFF。"
+            "两者的终点均为模型返回。"
+        ),
+    )
+
+    def save_progress():
+        (output_dir / "summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
+        )
+
+    save_progress()
+    try:
+        for index, case in enumerate(suite_data["cases"]):
+            for repeat in range(repeats):
+                result = await _run_single_segment_flow(
+                    case_id=case["case_id"],
+                    recording_meta=case,
+                    spool_dir=output_dir / "spool" / case["case_id"] / str(repeat + 1),
+                    cache_store=MockSglangCacheStore(),
+                    seed_override=seed_base + index,
+                    source_kind=source_kind,
+                    **common,
+                )
+                result["repeat"] = repeat + 1
+                results.append(result)
+                save_progress()
+        pool = current_pool.get()
+        summary["capacity_after_suite"] = await pool.wait_idle() if pool else None
+        summary["status"] = "passed"
+    except BaseException as error:
+        summary.update(status="failed", failure_type=type(error).__name__)
+        raise
+    finally:
+        save_progress()
+    lines = [
+        "# 真实引擎测试结果"
+        if source_kind == "worldkit-live"
+        else "# 录制案例回放结果",
+        "",
+        summary["timing_scope"],
+        "",
+        "| Case | 轮次 | 首帧 ms | 切词数 | 会话释放 |",
+        "|---|---:|---:|---:|---|",
+    ]
+    for r in results:
+        ttff = (
+            r["engine_init_to_first_rgb_ms"]
+            if source_kind == "worldkit-live"
+            else r["whitebox_session_ttff_ms"]
+        )
+        lines.append(
+            f"| {r['case_id']} | {r['repeat']} | {ttff} | {len(r['condition_switches'])} | {r.get('lease_release_verified')} |"
+        )
+    (output_dir / "REPORT.md").write_text("\n".join(lines) + "\n")
+    return summary
 
 
 async def _run_source_replay_suite(
@@ -2377,12 +2614,18 @@ async def _run_source_replay_suite(
     flow_mode: str = "natural",
     realtime_pacing: bool = False,
     detailed_timing: bool = False,
+    independent_prompt_control: bool = True,
     pacing_speed: float = 1.0,
     capture_fps: int | None = None,
     synthesize_if_missing: bool = False,
     seed_base: int | None = None,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    if (
+        not independent_prompt_control
+        and suite_data.get("execution") != "recorded-cases"
+    ):
+        raise ValueError("Legacy prompt control comparison requires recorded-cases")
     spool_dir = output_dir / "spool"
     spool_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2428,7 +2671,31 @@ async def _run_source_replay_suite(
         seed_base=effective_seed_base,
     )
 
-    spec = VideoSpec(832, 480, 24)
+    spec = _suite_video_spec(suite_data)
+    if suite_data.get("execution") == "recorded-cases":
+        return await _run_recorded_cases(
+            suite_data,
+            output_dir=output_dir,
+            preflight=preflight_report,
+            seed_base=effective_seed_base,
+            common=dict(
+                media_root=media_root,
+                spec=spec,
+                model_target=_suite_model_target(suite_data),
+                mode=mode,
+                sglang_url=sglang_url,
+                coordinator_url=coordinator_url,
+                max_frames_after_last_event=max_frames_after_last_event,
+                full_frames=full_frames,
+                preserve_switch_boundaries=preserve_switch_boundaries,
+                flow_mode=flow_mode,
+                realtime_pacing=realtime_pacing,
+                detailed_timing=detailed_timing,
+                independent_prompt_control=independent_prompt_control,
+                pacing_speed=pacing_speed,
+                capture_fps=capture_fps,
+            ),
+        )
     cache_store = MockSglangCacheStore()
     cases_by_id = {c["case_id"]: c for c in suite_data["cases"]}
 
@@ -2925,6 +3192,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="natural: unmodified Room admission; deterministic: replay-only boundary gate",
     )
     p_run.add_argument(
+        "--legacy-prompt-control",
+        action="store_true",
+        help="Recorded-cases A/B: use the existing queued protocol with identical model services",
+    )
+    p_run.add_argument(
         "--detailed-timing",
         action="store_true",
         help="Request per-render detailed TTFF timing; default leaves the field absent",
@@ -3029,6 +3301,7 @@ def main(argv: list[str] | None = None) -> int:
                 preserve_switch_boundaries=args.preserve_switch_boundaries,
                 flow_mode=args.flow_mode,
                 detailed_timing=args.detailed_timing,
+                independent_prompt_control=not args.legacy_prompt_control,
                 realtime_pacing=args.realtime_pacing,
                 pacing_speed=args.pacing_speed,
                 capture_fps=args.capture_fps,

@@ -1233,8 +1233,11 @@ def test_end_freezes_unsent_condition_dispatch(already_draining):
 
 
 @pytest.mark.parametrize("selected", [33, 34])
+@pytest.mark.parametrize("path", ["legacy", "ticket", "direct"])
 def test_clip_switch_finishes_old_clip_before_accepted_and_resumes_on_source_ready(
     selected,
+    path,
+    monkeypatch,
 ):
     from sglang.multimodal_gen.runtime.realtime.whitebox.render_segment import (
         RenderSegment,
@@ -1246,7 +1249,53 @@ def test_clip_switch_finishes_old_clip_before_accepted_and_resumes_on_source_rea
         TimingControl,
     )
 
+    independent = path != "legacy"
+
     async def scenario():
+        from sglang.multimodal_gen.runtime.realtime import prompt_control_http
+        from sglang.multimodal_gen.runtime.realtime.prompt_control import PromptControl
+
+        control = PromptControl(lambda *_: {"hit": False})
+        token = control.open(("s", "g"))
+        control.publish_context({})
+        control.start_block(9)
+
+        operations = []
+
+        def request(_, operation, **fields):
+            operations.append(operation)
+            if operation == "route":
+                command = fields["command"]
+                if command["version"] == 2:
+                    assert [ref["id"] for ref in command["reference_digests"]] == [
+                        "new-ref"
+                    ]
+                    return dict(action="adopt", boundary=17, version=2, ticket="1" * 32)
+                assert command == dict(text="third", version=3)
+                return dict(
+                    action="prepare",
+                    boundary=34,
+                    version=3,
+                    ticket="2" * 32,
+                    miss=dict(cache_key="k", lookup={"cache_result": "miss"}),
+                )
+            if operation == "adopt":
+                assert (
+                    not segment.source_send_lock.locked()
+                    and not segment.model_wire_lock.locked()
+                )
+                return dict(
+                    state="source_ready",
+                    source_frame_index=17,
+                    event_id=fields["event_id"],
+                    prompt_version=2,
+                )
+            if operation == "begin":
+                return control.begin(("s", "g"), token, fields["command"])
+            assert operation == "cancel"
+            return control.cancel(("s", "g"), token, fields["ticket"])
+
+        monkeypatch.setattr(prompt_control_http, "request_prompt", request)
         segment = object.__new__(RenderSegment)
         segment.segment_id = "segment"
         segment.condition_switch_protocol = "clip-barrier-v2"
@@ -1258,6 +1307,9 @@ def test_clip_switch_finishes_old_clip_before_accepted_and_resumes_on_source_rea
         segment.prompt_by_event = {}
         segment.active_reference_descriptors = []
         segment.selected_frames = selected
+        segment.prompt_control = (
+            {"protocol": "dit-clip-switch-v1"} if independent else None
+        )
         segment.last_selected_source = selected - 1
         segment.closed_event = asyncio.Event()
         segment.source_admission_ready = asyncio.Event()
@@ -1296,6 +1348,23 @@ def test_clip_switch_finishes_old_clip_before_accepted_and_resumes_on_source_rea
                 }
             ),
         )
+        segment.direct_prompt_hits = path == "direct"
+        segment.encoder_missing_references = None
+        if path == "direct":
+            from unittest.mock import AsyncMock
+
+            new_refs = [dict(id="new-ref", asset_id="asset")]
+            payloads = [dict(id="new-ref", format="png", payload=b"new")]
+            queue = segment.owner.journal.snapshot["segment"]["prompt_queue"]
+            queue[0]["references"] = new_refs
+            segment.model_reference_limit = 3
+            segment.model_reference_bytes = 1024
+            segment.owner.assets = SimpleNamespace(
+                resolve=AsyncMock(return_value=payloads)
+            )
+            segment.recording = SimpleNamespace(
+                add_references=AsyncMock(return_value=[])
+            )
         sent = asyncio.Future()
 
         async def send(wire):
@@ -1305,38 +1374,87 @@ def test_clip_switch_finishes_old_clip_before_accepted_and_resumes_on_source_rea
             segment._condition_controls(SimpleNamespace(send=send))
         )
         try:
+            if path == "direct":
+                async with segment.model_admission_condition:
+                    await asyncio.wait_for(
+                        segment.model_admission_condition.wait_for(
+                            lambda: getattr(segment, "resume_condition_evidence", None)
+                            is not None
+                        ),
+                        2,
+                    )
+                assert operations == ["route", "adopt"] and not sent.done()
+                assert segment.pending_prompt["event_id"] == 1
+                segment.first_output_at = 1
+                segment.sink.output = AsyncMock(return_value=None)
+                segment.owner.segment_prompt_output = AsyncMock()
+                segment.room_timings.clear()
+                segment.periodic_refresh = None
+                segment.segment_epoch = 1
+                segment.pending_prompt["sha256"] = "new"
+                await segment.model_output_condition(
+                    {"event_id": 1, "output_frame_start": 17}, {17: (None,)}, {}, {}
+                )
+                assert segment.encoder_missing_references == new_refs
+                queue[:] = [
+                    dict(version=3, text="third", effective={"source_frame_index": 0})
+                ]
+                segment.pending_prompt = None
+                segment.prompt_available.set()
+                event = await asyncio.wait_for(sent, 2)
+                assert (
+                    event["event_id"] == 2
+                    and event["payload"]["references"] == payloads
+                )
+                assert (
+                    event["payload"]["prompt_preparation"]["miss"]["cache_key"] == "k"
+                )
+                assert operations == ["route", "adopt", "route"]
+                return
             event = await asyncio.wait_for(sent, 1)
-            assert segment.model_source_allowed(selected) is (selected == 33)
-            assert not segment.model_source_allowed(34)
+            assert segment.model_source_allowed(selected) is (
+                independent or selected == 33
+            )
+            assert segment.model_source_allowed(34) is independent
             receipt = dict(
                 type="control_ack",
                 kind="prompt.update",
                 event_id=event["event_id"],
                 prompt_version=2,
-                source_frame_index=34,
+                source_frame_index=17 if independent else 34,
             )
             for state in ("accepted", "kv_ready"):
                 assert await SourceSession.segment_model_control(
                     segment.owner, segment, dict(receipt, state=state)
                 )
-            assert not segment.model_source_allowed(34)
+            assert segment.model_source_allowed(34) is independent
             assert await SourceSession.segment_model_control(
                 segment.owner, segment, dict(receipt, state="source_ready")
             )
             async with segment.model_admission_condition:
                 await asyncio.wait_for(
                     segment.model_admission_condition.wait_for(
-                        lambda: segment.model_source_allowed(34)
+                        lambda: segment.condition_switch is None
                     ),
                     1,
                 )
-            assert segment.source_resume_after == 50
+            if independent:
+                # Encoder can acknowledge before the DiT owner even takes the
+                # candidate. Room must retain the fence and mailbox at this point.
+                assert control.pending is not None
+                assert not control.start_block(26)
+                assert not hasattr(segment, "source_resume_after")
+                control.finish(control.pending["ticket"])
+                assert control.start_block(26)
+            else:
+                assert segment.source_resume_after == 50
             assert segment.pending_prompt["event_id"] == event["event_id"]
             assert segment.resume_condition_evidence["source_ready"]
             assert not segment.resume_condition_evidence["kv_ready"]
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+            control.close()
 
     asyncio.run(scenario())
 
@@ -2021,6 +2139,224 @@ def test_source_replay_modes_and_full_secondary_targets(
         assert f0 in primary_hashes and f0 not in secondary_hashes
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("join_fails", [False, True])
+def test_live_source_owns_engine_cleanup(monkeypatch, join_fails):
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+
+    monkeypatch.syspath_prepend(
+        str(Path(__file__).resolve().parents[6] / "benchmark/whitebox")
+    )
+    import live_source_engine
+
+    class Room:
+        closed = 0
+
+        async def join(self, **kwargs):
+            if join_fails:
+                raise RuntimeError("join failed")
+            return self
+
+        async def frames(self):
+            yield "real-engine-frame"
+
+        async def close(self):
+            self.closed += 1
+
+    room = Room()
+    room.renderer = AsyncMock()
+    room.renderer.asset.return_value = b"ui-image"
+
+    async def cli(**kwargs):
+        assert kwargs["world_id"] == "branch/world"
+        return room
+
+    monkeypatch.setattr(live_source_engine, "cli_room", cli)
+
+    async def run():
+        created = []
+        factory = live_source_engine.live_source_factory(
+            world_id="branch/world", capture_fps=24, on_created=created.append
+        )
+        if join_fails:
+            with pytest.raises(RuntimeError, match="join failed"):
+                await factory(spec=VideoSpec(832, 480, 24), trace_id="test")
+            assert not created
+            assert (await factory.retire_failed_start())["state"] == "not_created"
+        else:
+            engine = await factory(spec=VideoSpec(832, 480, 24), trace_id="test")
+            assert engine.stream_id == "test"
+            assert await engine.ui_asset("ui/icon.png") == b"ui-image"
+            room.renderer.asset.assert_awaited_once_with("ui/icon.png")
+            assert [frame async for frame in engine.frames()] == ["real-engine-frame"]
+            assert engine.emitted_frames == 1
+            await engine.close()
+            assert (await engine.retire())["state"] == "retired"
+        assert room.closed == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_live_failed_start_does_not_invent_retirement(monkeypatch, confirmed):
+    from pathlib import Path
+
+    monkeypatch.syspath_prepend(
+        str(Path(__file__).resolve().parents[6] / "benchmark/whitebox")
+    )
+    import live_source_engine as module
+    from sglang.multimodal_gen.runtime.realtime.whitebox.room_startup import (
+        startup_cleanup_error,
+    )
+
+    async def cli(**kwargs):
+        error = RuntimeError("failed startup")
+        if confirmed:
+            error = startup_cleanup_error(
+                error, module.FactoryCleanupReceipt(kwargs["trace_id"])
+            )
+        raise error
+
+    monkeypatch.setattr(module, "cli_room", cli)
+
+    async def run():
+        factory = module.live_source_factory(
+            world_id="branch/world", capture_fps=24, on_created=lambda _: None
+        )
+        with pytest.raises(Exception):
+            await factory(spec=VideoSpec(832, 480, 24), trace_id="test")
+        if confirmed:
+            assert (await factory.retire_failed_start())["state"] == "not_created"
+        else:
+            with pytest.raises(RuntimeError, match="unconfirmed"):
+                await factory.retire_failed_start()
+
+    asyncio.run(run())
+
+
+def test_live_player_inputs_preserve_timing_and_actions(monkeypatch):
+    from pathlib import Path
+
+    monkeypatch.syspath_prepend(
+        str(Path(__file__).resolve().parents[6] / "benchmark/whitebox")
+    )
+    import live_source_engine
+
+    observed = []
+
+    class Source:
+        async def send(self, wire):
+            observed.append((time.perf_counter(), msgspec.msgpack.decode(wire)))
+
+    events = [
+        {"offset_ms": 0, "input": {"held_keys": ["KeyW"], "events": []}},
+        {
+            "offset_ms": 25,
+            "input": {"held_keys": [], "actions": [{"name": "practice", "params": {}}]},
+        },
+    ]
+    started = time.perf_counter()
+    sent = asyncio.run(
+        live_source_engine.replay_player_inputs(Source(), events, started)
+    )
+    assert [item[1]["sequence"] for item in observed] == [0, 1]
+    assert [item[1]["payload"] for item in observed] == [
+        item["input"] for item in events
+    ]
+    assert observed[1][0] - started >= 0.025
+    assert sent[1]["sent_ms"] >= 25
+
+
+@pytest.mark.parametrize("repeats", [2, 3])
+@pytest.mark.parametrize("independent", [False, True])
+def test_recorded_case_replay_keeps_case_seed_and_repeats_real_room_flow(
+    tmp_path, independent, repeats
+):
+    import importlib.util
+    import json
+    import sys
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parents[6]
+        / "benchmark/whitebox/run_room_sglang_source_replay.py"
+    )
+    module_spec = importlib.util.spec_from_file_location("recorded_case_suite", path)
+    suite = importlib.util.module_from_spec(module_spec)
+    sys.modules[module_spec.name] = suite
+    module_spec.loader.exec_module(suite)
+    meta = dict(
+        case_id="recorded",
+        recording_id="recording",
+        world_id="world",
+        object_prefix="recording/",
+        prompt="Original prompt without a video tag",
+        video=dict(width=832, height=480, fps=24, frames=38),
+        objects={"whitebox.mp4": {}},
+        references_mapping=[],
+        condition_switches=[
+            dict(
+                prompt_version=2,
+                boundary=17,
+                prompt="Updated original prompt",
+                references=[],
+            )
+        ],
+    )
+    data = dict(
+        name="recorded-test",
+        repeats=repeats,
+        execution="recorded-cases",
+        cases=[meta],
+        oss_bucket="unused",
+        oss_endpoint="unused",
+    )
+    result = asyncio.run(
+        suite.run_source_replay_suite(
+            data,
+            media_root=tmp_path / "media",
+            output_dir=tmp_path / "results",
+            mode="mock-worker",
+            synthesize_if_missing=True,
+            seed_base=123,
+            max_frames_after_last_event=4,
+            flow_mode="natural",
+            independent_prompt_control=independent,
+        )
+    )
+    assert result["status"] == "passed"
+    assert all(
+        r["independent_prompt_control_requested"] is independent
+        for r in result["cases"]
+    )
+    assert all(
+        r["negotiated_protocol"]["condition_switch_protocol"] for r in result["cases"]
+    )
+    assert [(r["case_id"], r["seed"], r["repeat"]) for r in result["cases"]] == [
+        ("recorded", 123, repeat) for repeat in range(1, repeats + 1)
+    ]
+    assert all(
+        r["lease_release_verified"] and len(r["condition_switches"]) == 1
+        for r in result["cases"]
+    )
+    assert (
+        json.loads((tmp_path / "results/summary.json").read_text())["status"]
+        == "passed"
+    )
+    assert suite._suite_model_target(data) is None
+    data["model_target"] = dict(width=1280, height=736)
+    assert suite._suite_model_target(data).height == 736
+    assert suite._suite_video_spec(data).height == 480
+    data["model_target"]["height"] = 720
+    with pytest.raises(ValueError, match="1280x736"):
+        suite._suite_model_target(data)
+    meta["video"].update(width=1280, height=736)
+    assert suite._suite_video_spec(data).height == 736
+    meta["video"]["height"] = 720
+    with pytest.raises(ValueError, match="1280x736"):
+        suite._suite_video_spec(data)
 
 
 def test_replay_explicit_synthesis_only_fills_missing_files(tmp_path):

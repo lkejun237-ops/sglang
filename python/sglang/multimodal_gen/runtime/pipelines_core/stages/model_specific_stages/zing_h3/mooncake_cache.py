@@ -122,6 +122,7 @@ class MooncakeBackend(prep.Block0PreparationCache):
         self._loads = {}
         self._origins = {}
         self._load_lock = threading.RLock()
+        self._query_lock = threading.Lock()
         from sglang.multimodal_gen.runtime.realtime.cache_tiers import CacheTiers
 
         self.tiers = CacheTiers.parse(config.get("tiers", {}))
@@ -187,11 +188,14 @@ class MooncakeBackend(prep.Block0PreparationCache):
                 metadata_bytes = config.get("metadata_buffer_bytes", 64 << 20)
                 if type(metadata_bytes) is not int or metadata_bytes <= 0:
                     raise ValueError("Mooncake metadata_buffer_bytes must be positive")
+                global_segment_size = config.get("store_memory_bytes")
+                if type(global_segment_size) is not int or global_segment_size <= 0:
+                    raise ValueError("Mooncake store_memory_bytes must be positive")
                 rc = self.client.setup(
                     config.get("local_hostname")
                     or socket.gethostbyname(socket.gethostname()),
                     config.get("metadata_server", "P2PHANDSHAKE"),
-                    0,
+                    global_segment_size,
                     metadata_bytes,
                     "rdma",
                     rdma_devices,
@@ -704,10 +708,15 @@ class MooncakeBackend(prep.Block0PreparationCache):
         ]
         target = self.tiers.durable_tier
         if target == "l2":
-            ready = all("l2" in v for v in self.replicas.layers(keys).values())
+            ready = all(
+                "l2" in v
+                for v in self.replicas.layers(keys, include_filesystem=True).values()
+            )
             if not ready and not self.tiers.l1_to_l2:
                 return {"state": "failed", "code": "CACHE_WRITEBACK_DISABLED"}
-            ready = ready or self.replicas.wait(keys, "l2", deadline)
+            ready = ready or self.replicas.wait(
+                keys, "l2", deadline, poll_interval=0.25, include_filesystem=True
+            )
             return {
                 "state": "persisted" if ready else "failed",
                 "tier": "l2",
@@ -726,7 +735,9 @@ class MooncakeBackend(prep.Block0PreparationCache):
         if not self.tiers.cloud_write:
             return {"state": "failed", "code": "CACHE_WRITEBACK_DISABLED"}
         if self.tiers.l2_to_l3 and not self.tiers.l1_to_l3:
-            if not self.replicas.wait(keys, "l2", deadline):
+            if not self.replicas.wait(
+                keys, "l2", deadline, poll_interval=0.25, include_filesystem=True
+            ):
                 return {"state": "failed", "code": "CACHE_L2_WRITE_TIMEOUT"}
         future = self.archive.submit(
             world,
@@ -784,7 +795,13 @@ class MooncakeBackend(prep.Block0PreparationCache):
             ready = False
             if self.tiers.l2 and self.tiers.l1_to_l2:
                 with timing.measure("l2_replica_wait"):
-                    ready = self.replicas.wait(keys, "l2", deadline)
+                    ready = self.replicas.wait(
+                        keys,
+                        "l2",
+                        deadline,
+                        poll_interval=0.25,
+                        include_filesystem=True,
+                    )
                 observe(
                     "l2_writeback",
                     state="persisted" if ready else "unconfirmed",
@@ -960,12 +977,27 @@ class MooncakeBackend(prep.Block0PreparationCache):
             baseline_s0_sha256=manifest.get("baseline_s0_sha256"),
         )
 
+    def query_published(self, key):
+        """CPU-only recall; never finalize a GPU fill or enter rank collectives."""
+        with self._query_lock:
+            entry = self._recall(key, False, False)
+            origin = self._origins.pop(key, "l1") if entry is not None else None
+        layer = origin.get("source_layer") if isinstance(origin, dict) else origin
+        return entry, dict(
+            cache_result=layer + "_hit" if entry is not None else "miss",
+            source_layer=layer,
+            stages=origin.get("stages", {}) if isinstance(origin, dict) else {},
+            backend=self.backend,
+        )
+
     def lookup(self, key, *, allow_disk=False, protected=(), resident_only=False):
         started = time.perf_counter()
         self.finish_fill()
         entry = error = None
         try:
-            entry = self._recall(key, allow_disk, resident_only)
+            with self._query_lock:
+                entry = self._recall(key, allow_disk, resident_only)
+                recalled = self._origins.pop(key, "l1") if entry is not None else None
         except ArchiveProbeTimeout:
             error = "l3_probe_timeout"
         except Exception as exc:
@@ -976,7 +1008,7 @@ class MooncakeBackend(prep.Block0PreparationCache):
         hit = entry is not None and all(v == (key, rows, artifact, None) for v in votes)
         if any(v[3] == "l3_probe_timeout" for v in votes):
             error = "l3_probe_timeout"
-        recalled = self._origins.pop(key, "l1") if hit else None
+        recalled = recalled if hit else None
         origin = (
             recalled.get("source_layer") if isinstance(recalled, dict) else recalled
         )

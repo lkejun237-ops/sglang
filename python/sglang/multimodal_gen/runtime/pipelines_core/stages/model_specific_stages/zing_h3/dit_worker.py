@@ -782,6 +782,8 @@ def main():
             )
             create.cache_control = preparation.control
             create.cached_condition = preparation.cached_condition
+            create.query_prompt = preparation.query_prompt
+            create.receive_candidate = preparation.receive_candidate
 
             from .dit_warmup import warmup_dit
 

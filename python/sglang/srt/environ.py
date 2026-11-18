@@ -777,6 +777,9 @@ class Envs:
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
     MOONCAKE_TENANT_ID = EnvStr("default")
 
+    # Zing Block0 OSS payload restore; the byte budget remains independent.
+    SGLANG_ZING_BLOCK0_OSS_DOWNLOAD_CONCURRENCY = EnvInt(4)
+
     # ===================================================================
     # MoRI transport and expert dispatch
     # ===================================================================

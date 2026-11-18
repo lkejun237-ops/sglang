@@ -1280,6 +1280,11 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             )
             if self.condition_switch_protocol:
                 command["source_boundary"] = boundary
+                if payload.get("prompt_preparation") is not None:
+                    receipt = payload["prompt_preparation"]
+                    command["prompt_preparation"] = receipt["ticket"]
+                    if "miss" in receipt:
+                        command["block0_miss"] = receipt["miss"]
                 if payload.get("allow_deferred_kv"):
                     command["allow_deferred_kv"] = True
             if "references" in payload:
@@ -1319,7 +1324,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         self._pending_reference_upload = upload
         self._pending_prompt_command = command
         self.prompt_inflight, self.prompt_boundary = event_id, boundary
-        if self.condition_switch_protocol:
+        if self.condition_switch_protocol and not command.get("prompt_preparation"):
             self._source_switch_end = boundary
         self.available.set()
         await ws.send_bytes(
@@ -1380,7 +1385,7 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
             or not required <= set(payload)
             or set(payload)
             - required
-            - {"references", "source_policy", "allow_deferred_kv"}
+            - {"references", "source_policy", "allow_deferred_kv", "prompt_preparation"}
         ):
             raise ValueError("Invalid prompt control")
         if "allow_deferred_kv" in payload and (
@@ -1405,6 +1410,32 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
         ):
             raise ValueError("Invalid prompt boundary")
         watermark = max(target, self.ledger.accepted_frames, 17)
+        preparation = payload.get("prompt_preparation")
+        if preparation is not None:
+            if (
+                not getattr(self, "ready", {}).get("prompt_control")
+                or not isinstance(preparation, dict)
+                or set(preparation) - {"miss"} != {"ticket", "boundary", "version"}
+                or (
+                    "miss" in preparation
+                    and (
+                        not self.ready.get("direct_prompt_hits")
+                        or not isinstance(preparation["miss"], dict)
+                        or set(preparation["miss"]) != {"cache_key", "lookup"}
+                        or not isinstance(preparation["miss"]["lookup"], dict)
+                    )
+                )
+                or not isinstance(preparation["ticket"], str)
+                or len(preparation["ticket"]) != 32
+                or type(preparation["boundary"]) is not int
+                or preparation["boundary"] < 17
+                or preparation["boundary"] % 17
+                or preparation["version"] != version
+                or payload.get("source_policy") != "retain_during_switch"
+                or payload["policy"] != "at_or_after"
+            ):
+                raise ValueError("Invalid independent prompt preparation")
+            return preparation["boundary"]
         if getattr(self, "condition_switch_protocol", None):
             if (
                 payload.get("source_policy") != "skip_during_switch"
@@ -1915,7 +1946,12 @@ class ZingH3SourceStreamAdapter(BaseRealtimeModelAdapter):
                 source_ready_protocol
                 and source_ready["event_id"] == self.prompt_inflight
                 and source_ready["prompt_version"] == self.public_prompt_version
-                and source_ready["source_frame_index"] == self._source_switch_end,
+                and source_ready["source_frame_index"]
+                == (
+                    self.prompt_boundary
+                    if self.ready.get("prompt_control")
+                    else self._source_switch_end
+                ),
                 "Invalid source condition release receipt.",
             )
             self._source_switch_end = None

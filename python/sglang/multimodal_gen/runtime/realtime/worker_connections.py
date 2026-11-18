@@ -435,6 +435,9 @@ def install_connection_routes(app):
     from .role_pool.native_http import install_managed_routes
 
     install_managed_routes(app)
+    from .prompt_control_http import install_prompt_routes
+
+    install_prompt_routes(app)
 
     @app.get("/get_connection_status")
     async def query(reserve: bool = True):

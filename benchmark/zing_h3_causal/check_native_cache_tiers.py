@@ -1,6 +1,7 @@
 """Isolated CPU smoke for the host Store on an RDMA node, no OSS/GPU access."""
 
 import argparse
+import hashlib
 import json
 import socket
 import subprocess
@@ -25,12 +26,12 @@ def wait_for(check, timeout, label):
     raise TimeoutError(label)
 
 
-def main(root, rdma_devices=""):
+def main(root, rdma_devices="", *, allow_overlay_l2=False, runtime_root=None):
     from sglang.multimodal_gen.runtime.realtime.block0_rdma import block0_rdma_devices
 
     root.mkdir(parents=True, exist_ok=False)
     root = root.resolve()
-    repo = Path(__file__).resolve().parents[2]
+    repo = (runtime_root or Path(__file__).resolve().parents[2]).resolve()
     config = json.loads(
         (repo / "deploy/whitebox/cache/test-shanghai-copy.example.json").read_text()
     )
@@ -48,13 +49,22 @@ def main(root, rdma_devices=""):
         disk_directory=str(root / "disk"),
         disk_bytes=512 << 20,
         min_free_bytes=128 << 20,
+        allow_overlay_l2=allow_overlay_l2,
     )
     path = root / "config.json"
     path.write_text(json.dumps(config))
     process = None
     clients = []
     result = dict(
-        passed=False, mooncake_version="0.3.13", gpu_test=False, oss_test=False
+        passed=False,
+        mooncake_version="0.3.13",
+        gpu_test=False,
+        oss_test=False,
+        allow_overlay_l2=allow_overlay_l2,
+        runtime_root=str(repo),
+        runtime_store_sha256=hashlib.sha256(
+            (repo / "deploy/whitebox/cache_store.py").read_bytes()
+        ).hexdigest(),
     )
     with (root / "store.log").open("w") as log:
         try:
@@ -82,6 +92,9 @@ def main(root, rdma_devices=""):
                 return (root / "state/store-ready.json").is_file()
 
             wait_for(ready, 90, "Native Store readiness")
+            result["store_readiness"] = json.loads(
+                (root / "state/store-ready.json").read_text()
+            )
             for _ in range(2):
                 client = MooncakeDistributedStore()
                 rc = client.setup(
@@ -99,6 +112,22 @@ def main(root, rdma_devices=""):
             writer, reader = clients
             policy = CacheTiers.parse(config["tiers"])
             replicas = NativeReplicas(reader, policy)
+
+            def disk_copies(key):
+                copies = reader.batch_get_replica_desc([key])[key]
+                filesystem = sum(v.is_disk_replica() for v in copies)
+                local = [
+                    v
+                    for v in copies
+                    if v.is_local_disk_replica() and str(v.status).endswith("COMPLETE")
+                ]
+                assert filesystem == 0, "Unexpected duplicate filesystem write"
+                assert len(local) <= 1, "More than one native SSD owner"
+                return dict(
+                    filesystem=filesystem,
+                    native_ssd=len(local),
+                )
+
             payload = b"native-cache-test" * (1 << 16)
             assert writer.put("shared-key", payload, ReplicateConfig()) == 0
             assert reader.get("shared-key") == payload
@@ -106,6 +135,8 @@ def main(root, rdma_devices=""):
             result["cross_client_l1"] = True
             assert replicas.wait(["shared-key"], "l2", time.monotonic() + 60)
             result["native_l2_persisted"] = True
+            result["after_persistence_disk_copies"] = disk_copies("shared-key")
+            assert result["after_persistence_disk_copies"]["native_ssd"] == 1
             # Only this isolated Store is pressured; never evict real player data.
             keys = ["shared-key"]
             for index in range(120):
@@ -131,6 +162,7 @@ def main(root, rdma_devices=""):
             started = time.monotonic()
             assert replicas.promote([cold], time.monotonic() + 60)
             assert replicas.memory_ready([cold]) and reader.get(cold) == payload
+            result["after_recall_disk_copies"] = disk_copies(cold)
             promotion_ms = (time.monotonic() - started) * 1000
             result.update(native_l2_recall=True, l2_to_l1_ms=promotion_ms)
             wait_for(
@@ -198,5 +230,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--rdma-devices", default="")
+    parser.add_argument(
+        "--runtime-root",
+        type=Path,
+        help="Full verified runtime checkout; defaults to this tool's repository.",
+    )
+    parser.add_argument(
+        "--allow-overlay-l2",
+        action="store_true",
+        help="Explicitly validate local container overlay storage (not NVMe evidence).",
+    )
     args = parser.parse_args()
-    main(args.root, args.rdma_devices)
+    main(
+        args.root,
+        args.rdma_devices,
+        allow_overlay_l2=args.allow_overlay_l2,
+        runtime_root=args.runtime_root,
+    )

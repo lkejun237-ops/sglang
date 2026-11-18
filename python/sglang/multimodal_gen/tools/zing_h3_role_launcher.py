@@ -226,6 +226,25 @@ def build_role_contract(
         policy = server_policy(
             profile, argument_value(arguments, "--zing-block0-cache-dir")
         )
+        if argument_value(arguments, "--zing-block0-cache-backend") == "mooncake":
+            # Mooncake owns Block0 capacity and persistence through its mounted
+            # config; do not append the legacy local-disk budget defaults.
+            for option in (
+                "--zing-block0-cache-host-gb",
+                "--zing-block0-cache-host-total-gb",
+                "--zing-block0-cache-disk-gb",
+                "--zing-block0-cache-storage",
+                "--zing-block0-cache-dir",
+                "--zing-block0-cache-budget-root",
+                "--zing-block0-cache-min-free-gb",
+                "--zing-block0-cache-inflight-gb",
+                "--zing-block0-cache-max-writers",
+                "--zing-block0-cache-gc",
+                "--zing-block0-cache-gc-high-watermark",
+                "--zing-block0-cache-gc-low-watermark",
+                "--zing-block0-cache-capacity-dir",
+            ):
+                policy.pop(option, None)
         defaults.update(
             {
                 k: v

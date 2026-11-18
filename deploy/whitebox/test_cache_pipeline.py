@@ -3,10 +3,13 @@
 import threading
 from dataclasses import asdict
 
+import pytest
+
 from sglang.multimodal_gen.runtime.realtime import cache_archive
 from sglang.multimodal_gen.test.unit.realtime.test_zing_cache_tiers import (
     Objects,
     policy,
+    replica,
 )
 from sglang.multimodal_gen.test.unit.realtime.test_zing_mooncake_cache import (
     KEY,
@@ -15,6 +18,79 @@ from sglang.multimodal_gen.test.unit.realtime.test_zing_mooncake_cache import (
     provider,
     write,
 )
+
+
+@pytest.mark.parametrize("fail_upload", [False, True])
+def test_filesystem_writeback_never_delays_or_invalidates_hot_cache(
+    monkeypatch, fail_upload
+):
+    """Completed DISK copies can archive while slow/failed OSS leaves L1 usable."""
+    entered, release = threading.Event(), threading.Event()
+
+    class DelayedObjects(Objects):
+        def put(self, key, value):
+            if len(key.rsplit("/", 1)[-1]) == 64:
+                entered.set()
+                assert release.wait(5)
+            super().put(key, value)
+
+    class Store(MemoryStore):
+        def batch_get_replica_desc(self, keys):
+            return {
+                k: [replica("l1"), replica("filesystem")] if k in self.objects else []
+                for k in keys
+            }
+
+    objects = DelayedObjects()
+    objects.fail = "manifest.json" if fail_upload else None
+    monkeypatch.setattr(cache_archive, "S3CacheObjects", lambda _: objects)
+    backend, cache, _ = provider(
+        Store(),
+        config={
+            "tiers": asdict(
+                policy(
+                    l2=True,
+                    l1_to_l2=True,
+                    l1_to_l3=False,
+                    l2_to_l3=True,
+                    disk_directory="/cache",
+                    disk_bytes=1 << 30,
+                    snapshot_bytes=1 << 20,
+                    deadline_s=3,
+                )
+            )
+        },
+    )
+    try:
+        backend.bind_world(KEY, "world")
+        assert write(backend, cache) is not None
+        assert entered.wait(2)
+        pending = backend._cloud_jobs[KEY]
+        entry = backend.lookup(KEY)
+        assert backend.last_lookup["cache_result"] == "l1_hit"
+        for slot in cache.storage:
+            slot.k[1:-1].zero_()
+            slot.v[1:-1].zero_()
+        backend.restore(cache, entry)
+        assert_restored(cache)
+        assert not pending.done()
+        release.set()
+        if fail_upload:
+            with pytest.raises(OSError, match="injected upload error"):
+                pending.result(timeout=5)
+        else:
+            assert pending.result(timeout=5)["state"] == "persisted"
+        entry = backend.lookup(KEY)
+        assert entry is not None
+        assert backend.last_lookup["cache_result"] == "l1_hit"
+        for slot in cache.storage:
+            slot.k[1:-1].zero_()
+            slot.v[1:-1].zero_()
+        backend.restore(cache, entry)
+        assert_restored(cache)
+    finally:
+        release.set()
+        backend.close()
 
 
 def test_l3_recall_reuses_prepared_bytes_and_hot_hit_does_not_repair(monkeypatch):

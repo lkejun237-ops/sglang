@@ -19,6 +19,55 @@ import orchestrate as orch
 import source
 
 
+@pytest.mark.parametrize("stale", [None, "source", "worker", "reused"])
+def test_private_replay_activation_keeps_platform_routes_untouched(
+    state, tmp_path, stale
+):
+    path = orch.REPO / "benchmark/whitebox/prepare_isolated_role_replay.py"
+    module_spec = importlib.util.spec_from_file_location("private_replay", path)
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    state["phase"] = "ready"
+    state["selftest"] = dict(
+        status="passed",
+        source=copy.deepcopy(state["source"]),
+        worker_ids={
+            r: state["resources"][r]["receipt"]["worker_id"] for r in orch.ROLES
+        },
+    )
+    if stale == "source":
+        state["selftest"]["source"] = {}
+    elif stale == "worker":
+        state["selftest"]["worker_ids"]["encoder"] = "replaced-worker"
+    elif stale == "reused":
+        state["spec"]["existing_services"] = {"encoder": {}}
+    original = copy.deepcopy(state)
+
+    def activate(candidate, directory, configs, authority, cloud):
+        assert candidate["target"]["coordinator_url"] == "http://127.0.0.1:9"
+        assert all(
+            c["coordinator_url"] == "http://127.0.0.1:9" for c in configs.values()
+        )
+        assert candidate["resources"] == original["resources"]
+        assert cloud is None
+
+    with (
+        patch.object(orch, "_preflight_or_reconcile_owned_endpoints") as preflight,
+        patch.object(
+            orch, "_attach_owned_endpoints_in_place", side_effect=activate
+        ) as attach,
+    ):
+        if stale:
+            with pytest.raises(ValueError, match="currently self-tested"):
+                module.prepare(state, tmp_path / "private", "x" * 32)
+            preflight.assert_not_called()
+            attach.assert_not_called()
+        else:
+            module.prepare(state, tmp_path / "private", "x" * 32)
+            attach.assert_called_once()
+    assert state == original
+
+
 @pytest.mark.parametrize("missing", ["job_id", "job_name", "pai"])
 def test_reused_dit_requires_cloud_identity(spec, missing):
     entry = dict(
@@ -1904,6 +1953,111 @@ def test_down_retires_attached_pool_processes_after_stop(state, tmp_path, monkey
         assert stop_call[1]["operator_id"] == "orchestrate-down"
         assert retire_call[0].endswith("/v1/role-pool/retire-process")
         assert retire_call[1]["stop_receipt"] == stop_call[1]["stop_receipt"]
+
+
+@pytest.mark.parametrize(
+    "failure", [None, "boot", "busy", "child", "profile", "drain", "shared"]
+)
+def test_private_replay_down_checks_all_workers_and_stops_controller_last(
+    state, tmp_path, monkeypatch, failure
+):
+    from private_replay import PrivateReplayControl
+
+    monkeypatch.delenv("ROLE_POOL_OPERATOR_TOKEN", raising=False)
+    state["private_replay_authority"] = True
+    state["target"]["coordinator_url"] = "http://127.0.0.1:9"
+    state["spec"]["target"]["coordinator_url"] = "http://127.0.0.1:9"
+    configs = orch.worker_configs(state)
+    state["attachment"] = {"identities": {}}
+    for role, resource in state["resources"].items():
+        resource["receipt"]["worker_config"] = configs[role]
+        state["attachment"]["identities"][role] = dict(
+            process_id=resource["receipt"]["worker_id"],
+            service_id=resource["receipt"]["worker_id"] + "/0",
+            boot_epoch=role + "-boot",
+        )
+    calls = []
+
+    def command(self, role, action):
+        calls.append((role, action))
+        expected = state["attachment"]["identities"][role]
+        cfg = configs[role]
+        if action == "identity":
+            result = dict(
+                boot_epoch=expected["boot_epoch"],
+                control_epoch=cfg["control_epoch"],
+                service=dict(
+                    worker_id=expected["process_id"],
+                    service_id=expected["service_id"],
+                    role=role,
+                ),
+                **{
+                    k: copy.deepcopy(cfg[k])
+                    for k in ("capacity", "profiles", "profile_limits")
+                },
+                deployment={
+                    k: cfg[k]
+                    for k in (
+                        "pool_id",
+                        "compatibility",
+                        "network_domain",
+                        "hardware_ids",
+                    )
+                },
+            )
+            if role == "decoder" and failure == "boot":
+                result["boot_epoch"] = "replaced"
+            if role == "decoder" and failure == "profile":
+                result["profiles"] = {}
+            return result
+        result = dict(
+            boot_epoch=expected["boot_epoch"],
+            service_id=expected["service_id"],
+            state="idle",
+            native_state="idle",
+            owner=None,
+            restart_required=False,
+            children={},
+            draining=action == "drain",
+        )
+        if role == "decoder" and failure == "busy":
+            result["owner"] = {"allocation_id": "live-player"}
+        if role == "decoder" and failure == "child":
+            result["children"] = {"request": {"state": "running"}}
+        if action == "drain" and failure == "drain":
+            result["draining"] = False
+        return result
+
+    monkeypatch.setattr(PrivateReplayControl, "command", command)
+    if failure == "shared":
+        state["target"]["coordinator_url"] = "http://shared:18081"
+    cloud = Mock(timeout=1)
+    cloud.pod.side_effect = lambda r: {"metadata": {"uid": r["uid"]}}
+    cloud.get_job.side_effect = lambda _: job(state["resources"]["dit"], "Stopped")
+    # The private path must never access a shared Coordinator, even if a token exists.
+    monkeypatch.setattr(
+        orch, "http", Mock(side_effect=AssertionError("Coordinator called"))
+    )
+    if failure:
+        with pytest.raises(ValueError, match="Private replay"):
+            orch.down(state, tmp_path, cloud)
+        cloud.cli.assert_not_called()
+        cloud.eflo.assert_not_called()
+    else:
+        orch.down(state, tmp_path, cloud)
+        assert calls[-1] == ("encoder", "drain")
+        assert state["phase"] == "stopped"
+        assert all(
+            r["retirement_scope"] == "private-replay-authority"
+            for r in state["resources"].values()
+        )
+        assert all(
+            r["private_drain_receipt"]["draining"] for r in state["resources"].values()
+        )
+        cloud.reset_mock()
+        orch.down(state, tmp_path, cloud)
+        cloud.cli.assert_not_called()
+        cloud.eflo.assert_not_called()
 
 
 def test_attach_in_place_activates_workers_without_recreating_pods_or_jobs(

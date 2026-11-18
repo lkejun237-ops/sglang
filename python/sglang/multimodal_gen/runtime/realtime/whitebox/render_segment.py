@@ -281,6 +281,13 @@ class RenderSegment(InteractiveSession):
             ready.get("max_message_bytes", self.config.max_message_bytes) - (128 << 10),
         )
         self.active_reference_descriptors = copy.deepcopy(self.recording.references)
+        self.encoder_missing_references = None
+        self.direct_prompt_hits = ready.get("direct_prompt_hits") is True
+        self.prompt_control = (
+            ready.get("prompt_control")
+            if getattr(self.config, "independent_prompt_control", True)
+            else None
+        )
         self.prompt_by_event[None]["reference_descriptors"] = (
             self.active_reference_descriptors
         )
@@ -308,6 +315,7 @@ class RenderSegment(InteractiveSession):
             prompt_reference_updates=self.clip_switch
             and ready.get("prompt_reference_updates") is True,
             condition_switch_protocol=ready.get("source_condition_switch_protocol"),
+            independent_prompt_control=bool(self.prompt_control),
             max_references=self.model_reference_limit,
         )
         if self.clip_switch:
@@ -320,6 +328,10 @@ class RenderSegment(InteractiveSession):
                 self.tasks.add(asyncio.create_task(self.periodic_refresh.run()))
 
     def model_source_allowed(self, sent):
+        if getattr(self, "prompt_control", None):
+            # Retain admitted frames. The DiT fences model execution, while the
+            # existing input/output credits bound source production.
+            return True
         switch = self.condition_switch
         if switch is None:
             return True
@@ -348,7 +360,51 @@ class RenderSegment(InteractiveSession):
             else {"segment_setup_to_first_rgb", "room_accept_to_first_rgb"},
         )
 
+    async def _route_condition(self, item, references):
+        if not getattr(self, "prompt_control", None):
+            return None, False
+        from ..prompt_control_http import request_prompt
+
+        direct = getattr(self, "direct_prompt_hits", False)
+        command = dict(text=item["text"], version=item["version"])
+        if references is not None:
+            if direct:
+                command["reference_digests"] = [
+                    dict(
+                        id=ref["id"],
+                        format=ref["format"],
+                        sha256=hashlib.sha256(ref["payload"]).hexdigest(),
+                    )
+                    for ref in references
+                ]
+            else:
+                command["references"] = references
+        receipt = await asyncio.to_thread(
+            request_prompt,
+            self.prompt_control,
+            "route" if direct else "begin",
+            command=command,
+        )
+        direct_hit = receipt.pop("action", None) == "adopt"
+        return receipt, direct_hit
+
     async def _condition_controls(self, ws):
+        preparation = None
+
+        async def release_preparation():
+            nonlocal preparation
+            if preparation is None:
+                return
+            from ..prompt_control_http import request_prompt
+
+            await asyncio.to_thread(
+                request_prompt,
+                self.prompt_control,
+                "cancel",
+                ticket=preparation["ticket"],
+            )
+            preparation = None
+
         try:
             await self.source_admission_ready.wait()
             while not self.closed_event.is_set():
@@ -418,6 +474,7 @@ class RenderSegment(InteractiveSession):
                     (time.perf_counter() - boundary_started) * 1000,
                 )
                 references_started = time.perf_counter()
+                references = None
                 descriptors = self.active_reference_descriptors
                 if "references" in item:
                     references = await self.owner.assets.resolve(item["references"])
@@ -451,12 +508,27 @@ class RenderSegment(InteractiveSession):
                     "reference_descriptors": descriptors,
                 }
                 loop = asyncio.get_running_loop()
+                route_started = time.perf_counter()
+                preparation, direct_hit = await self._route_condition(item, references)
+                route_received = time.perf_counter()
+                if direct_hit and "references" in item:
+                    candidate["encoder_missing_references"] = item["references"]
+                elif preparation and "miss" in preparation:
+                    candidate["encoder_missing_references"] = None
+                    if (
+                        references is None
+                        and self.encoder_missing_references is not None
+                    ):
+                        references = await self.owner.assets.resolve(
+                            self.encoder_missing_references
+                        )
                 switch = dict(
                     accepted=loop.create_future(),
                     ready=loop.create_future(),
                     boundary=None,
-                    started_at=time.perf_counter(),
+                    started_at=route_started if direct_hit else time.perf_counter(),
                 )
+                lock_started = time.perf_counter()
                 async with self.source_send_lock:
                     current = self.owner.journal.snapshot.get("segment")
                     if (
@@ -472,6 +544,7 @@ class RenderSegment(InteractiveSession):
                     ) and not await self.owner.journal.mark_periodic_dispatch(
                         self.segment_id, item["request_id"]
                     ):
+                        await release_preparation()
                         self.prompt_available.set()
                         continue
                     if (
@@ -482,12 +555,13 @@ class RenderSegment(InteractiveSession):
                         switch["provisional_boundary"] = ((watermark + 16) // 17) * 17
                     timing.record(
                         "send_lock_wait",
-                        (time.perf_counter() - switch["started_at"]) * 1000,
+                        (time.perf_counter() - lock_started) * 1000,
                     )
                     self.condition_switch = switch
 
                     def remember(event_id):
-                        send_started_at = time.perf_counter()
+                        wire_acquired = time.perf_counter()
+                        send_started_at = route_started if direct_hit else wire_acquired
                         switch["model_send_started_at"] = send_started_at
                         timing.record(
                             "room_accept_to_model_send",
@@ -501,7 +575,7 @@ class RenderSegment(InteractiveSession):
                         )
                         timing.record(
                             "model_wire_lock_wait",
-                            (send_started_at - wire_wait_started) * 1000,
+                            (wire_acquired - wire_wait_started) * 1000,
                         )
                         candidate["event_id"] = event_id
                         timing.identity["event_id"] = event_id
@@ -515,18 +589,74 @@ class RenderSegment(InteractiveSession):
                         policy="at_or_after",
                         source_policy="skip_during_switch",
                     )
+                    if preparation is not None:
+                        fields.update(
+                            source_policy="retain_during_switch",
+                            prompt_preparation=preparation,
+                        )
                     if getattr(self, "deferred_kv_ready", False):
                         fields["allow_deferred_kv"] = True
-                    if "references" in item:
+                    if references is not None:
                         fields["references"] = references
                     wire_wait_started = time.perf_counter()
-                    await self.send_model_event(
-                        ws, "prompt.update", fields, before_send=remember
-                    )
+                    if direct_hit:
+                        # Share the monotonic event sequence with the source connection,
+                        # but no Encoder prompt event or GPU dispatch is needed.
+                        async with self.model_wire_lock:
+                            self.model_wire_sequence += 1
+                            remember(self.model_wire_sequence)
+                        switch["accepted_received_at"] = route_received
+                        switch["boundary"] = preparation["boundary"]
+                        switch["accepted"].set_result(
+                            dict(
+                                state="accepted",
+                                source_frame_index=preparation["boundary"],
+                            )
+                        )
+                    else:
+                        await self.send_model_event(
+                            ws, "prompt.update", fields, before_send=remember
+                        )
                 sent_at = switch["model_send_started_at"]
                 timing.record(
-                    "prompt_send_call", (time.perf_counter() - sent_at) * 1000
+                    "prompt_send_call",
+                    ((route_received if direct_hit else time.perf_counter()) - sent_at)
+                    * 1000,
                 )
+                if direct_hit:
+                    from ..prompt_control_http import request_prompt
+
+                    # Waiting for adoption must never hold either source send lock.
+                    receipt = await asyncio.to_thread(
+                        request_prompt,
+                        self.prompt_control,
+                        "adopt",
+                        ticket=preparation["ticket"],
+                        event_id=candidate["event_id"],
+                        allow_deferred_kv=fields.get("allow_deferred_kv", False),
+                    )
+                    if receipt.get("event_id") != candidate["event_id"]:
+                        raise RenderError("REVISION_CONFLICT")
+                    if receipt["state"] == "rejected":
+                        await self.model_control(
+                            dict(type="error", fatal=False, **receipt)
+                        )
+                    else:
+                        if receipt.get("source_frame_index") != preparation[
+                            "boundary"
+                        ] or receipt["state"] not in {"source_ready", "kv_ready"}:
+                            raise RenderError("CONDITION_INVALID")
+                        switch["ready_received_at"] = time.perf_counter()
+                        switch["ready"].set_result(receipt)
+                        if receipt.get("cache"):
+                            await self.model_control(
+                                dict(
+                                    type="model.cache",
+                                    model_session_id=self.assignment.session_id,
+                                    generation_id=self.assignment.generation_id,
+                                    usage={"zing_block0_cache": receipt["cache"]},
+                                )
+                            )
                 # The worker reserves B, then receives only the remaining old clip.
                 async with asyncio.timeout(self.config.startup_seconds):
                     accepted = await switch["accepted"]
@@ -538,7 +668,7 @@ class RenderSegment(InteractiveSession):
                         boundary = accepted.get("source_frame_index")
                         if (
                             type(boundary) is not int
-                            or boundary < self.selected_frames
+                            or (preparation is None and boundary < self.selected_frames)
                             or boundary % 17
                         ):
                             raise RenderError("CONDITION_INVALID")
@@ -567,9 +697,22 @@ class RenderSegment(InteractiveSession):
                             and ready.get("prompt_version") != item["version"]
                         ):
                             raise RenderError("REVISION_CONFLICT")
-                # Sampling resumes after a fresh capture; never replay frames from the pause.
+                # source_ready acknowledges Encoder submission, not DiT adoption.
+                # The model owner releases the fence when it adopts the candidate;
+                # cancelling here can discard a candidate still in its mailbox.
+                retained = preparation is not None
+                if accepted.get("state") == "accepted" and ready.get("state") in {
+                    "kv_ready",
+                    "source_ready",
+                }:
+                    preparation = None
+                else:
+                    await release_preparation()
+                # Legacy switches resume from a fresh capture; independent switches
+                # retain the original source ordering and queued VAE results.
                 async with self.source_send_lock:
-                    self.source_resume_after = self.owner.latest.version
+                    if not retained:
+                        self.source_resume_after = self.owner.latest.version
                     self.resume_condition_evidence = dict(
                         prompt_version=item["version"],
                         trigger_source=trigger_source(item),
@@ -577,7 +720,9 @@ class RenderSegment(InteractiveSession):
                         timing_report_id=timing.identity["report_id"],
                         boundary=switch["boundary"],
                         previous_source=self.last_selected_source,
-                        skipped_captures=max(
+                        skipped_captures=0
+                        if retained
+                        else max(
                             0,
                             self.source_resume_after
                             - getattr(
@@ -607,10 +752,15 @@ class RenderSegment(InteractiveSession):
                         )
                     timing.record(
                         "switch_to_resume",
-                        (time.perf_counter() - switch["started_at"]) * 1000,
+                        (time.perf_counter() - lock_started) * 1000,
                     )
                     self.condition_switch = None
                 await self._notify_source_admission()
+                if (
+                    accepted.get("state") != "accepted"
+                    or ready.get("state") == "rejected"
+                ):
+                    self.prompt_available.set()
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -624,6 +774,14 @@ class RenderSegment(InteractiveSession):
             self.failure_code = self.failure_diagnostic["code"]
             if self.generation_task is not None:
                 self.generation_task.cancel()
+        finally:
+            if preparation is not None:
+                try:
+                    await release_preparation()
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "Failed to release independent prompt preparation"
+                    )
 
     def model_presentation_frame(self, frame, local):
         if local != 0 or not self.segment.get("context_id"):
@@ -820,6 +978,8 @@ class RenderSegment(InteractiveSession):
         condition = self.prompt_by_event.get(message.get("event_id"))
         if condition is None:
             raise RenderError("CONDITION_INVALID")
+        if "encoder_missing_references" in condition:
+            self.encoder_missing_references = condition["encoder_missing_references"]
         self.active_reference_descriptors = condition.get(
             "reference_descriptors", self.active_reference_descriptors
         )

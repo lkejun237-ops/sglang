@@ -302,6 +302,7 @@ def test_stage_starts_mooncake_with_real_cpu_kv_pool_without_disk(
                 "master_server_address": "localhost:50051",
                 "master_http_url": "http://localhost:9003",
                 "rdma_devices": "unit-hca",
+                "store_memory_bytes": 48 << 30,
             }
         )
     )
@@ -343,7 +344,7 @@ def test_stage_starts_mooncake_with_real_cpu_kv_pool_without_disk(
         assert isinstance(stage.block0_cache, MooncakeBackend)
         assert not hasattr(stage.block0_cache, "pages")
         assert store.register_calls > 0
-        assert setup_calls[0][2:6] == (0, 64 << 20, "rdma", "unit-hca")
+        assert setup_calls[0][2:6] == (48 << 30, 64 << 20, "rdma", "unit-hca")
     finally:
         stage.block0_cache.close()
 

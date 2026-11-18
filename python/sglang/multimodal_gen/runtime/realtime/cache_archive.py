@@ -19,12 +19,13 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from uuid import uuid4
 
+from sglang.srt.environ import envs
+
 from .cache_tiers import CacheTiers, StageTimes
 
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 ARTIFACT = re.compile(r"[0-9a-f]{32}\Z")
 SCHEMA = "zing-block0-archive-v1"
-RESTORE_GET_WORKERS = 4
 
 
 def canonical(value):
@@ -204,6 +205,13 @@ class CacheArchive:
     def __init__(self, policy: CacheTiers, namespace, *, objects=None, clock=time.time):
         if not policy.l3:
             raise ValueError("OSS cache tier is disabled")
+        self.download_concurrency = (
+            envs.SGLANG_ZING_BLOCK0_OSS_DOWNLOAD_CONCURRENCY.get()
+        )
+        if type(self.download_concurrency) is not int or self.download_concurrency < 1:
+            raise ValueError(
+                "SGLANG_ZING_BLOCK0_OSS_DOWNLOAD_CONCURRENCY must be a positive integer"
+            )
         self.policy, self.namespace, self.clock = policy, namespace, clock
         self.objects = objects if objects is not None else S3CacheObjects(policy)
         self.prefix = policy.prefix
@@ -593,7 +601,7 @@ class CacheArchive:
         byte_budget = 2 * self.policy.max_object_bytes
         reserved = 0
         with ThreadPoolExecutor(
-            max_workers=RESTORE_GET_WORKERS, thread_name_prefix="block0-download"
+            max_workers=self.download_concurrency, thread_name_prefix="block0-download"
         ) as pool:
             try:
                 for row in value["objects"]:
@@ -606,7 +614,7 @@ class CacheArchive:
                     ):
                         raise ArchiveUnavailable("Invalid cache archive member")
                     while (
-                        len(pending) >= RESTORE_GET_WORKERS
+                        len(pending) >= self.download_concurrency
                         or reserved + size > byte_budget
                     ):
                         reserved -= import_next()

@@ -40,6 +40,14 @@ class DiTGroups:
             rollback=lambda: self.submit("rollback"),
             cleanup_timeout=timeout,
         )
+        self.prompt_control = None
+        if (parallel is None or parallel.world_size == 1) and hasattr(
+            create_session, "query_prompt"
+        ):
+            from .prompt_control import PromptControl
+
+            self.prompt_control = PromptControl(create_session.query_prompt)
+        self.manager.prompt_control = self.prompt_control
 
     def submit(self, kind, *args):
         if kind == "destroy" and self.link is not None:
@@ -114,6 +122,8 @@ class DiTGroups:
             cleanup_guard=self.manager.cleanup_guard,
             abort_transport=self.abort_transport,
         )
+        self.service.prompt_control = self.prompt_control
+        self.service.prompt_control_url = topology["dit"]["endpoints"]["http"]
 
     def _build_transport(self, group, topology):
         import torch
@@ -285,6 +295,7 @@ class DiTGroups:
                     continue
                 if self.service is not None:
                     try:
+                        await self.service.poll_prompt_control()
                         if self.service.queue:
                             await self.service.queue.run_once()
                         elif self.link.poll():
@@ -312,3 +323,5 @@ class DiTGroups:
             self.running = False
             with self.manager.cleanup_guard():
                 await self.destroy(force=True)
+            if self.prompt_control is not None:
+                self.prompt_control.close()

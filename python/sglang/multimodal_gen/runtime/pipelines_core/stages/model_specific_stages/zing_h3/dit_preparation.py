@@ -2,6 +2,7 @@
 """Adapt the existing Block0 owner to Encoder/DiT control messages."""
 
 import time
+from copy import deepcopy
 from dataclasses import fields
 from types import SimpleNamespace
 
@@ -31,13 +32,129 @@ class DiTPreparation:
     def cache(self):
         return self.stage.block0_cache
 
-    def cached_condition(self, message, *, initial):
+    def query_prompt(self, context, command):
+        """Read published CPU conditions without model admission or collectives."""
+        import hashlib
+
+        from .block0_identity import fingerprint
+
+        prompt = command.get("text")
+        from sglang.multimodal_gen.runtime.realtime.zing_contracts import (
+            validate_prompt_text,
+        )
+
+        validate_prompt_text(prompt)
+        if not context and self.cache is None:
+            return dict(hit=False, cache_key=None, lookup={"cache_result": "disabled"})
+        identity = deepcopy(context["identity"])
+        request = identity["request"]
+        request["prompt"] = prompt
+        if "references" in command or "reference_digests" in command:
+            digests = "reference_digests" in command
+            field = "sha256" if digests else "payload"
+            refs = command["reference_digests" if digests else "references"]
+            if not isinstance(refs, list):
+                raise ValueError("Invalid prompt references")
+            media = []
+            seen = {"<Video 1>"}
+            for ref in refs:
+                if (
+                    not isinstance(ref, dict)
+                    or set(ref) != {"id", "format", field}
+                    or not isinstance(ref["id"], str)
+                    or not ref["id"]
+                    or ref["id"] in seen
+                    or ref["format"] not in {"png", "jpeg", "webp"}
+                    or (not digests and not isinstance(ref[field], bytes))
+                    or (
+                        digests
+                        and (
+                            not isinstance(ref[field], str)
+                            or len(ref[field]) != 64
+                            or any(c not in "0123456789abcdef" for c in ref[field])
+                        )
+                    )
+                ):
+                    raise ValueError("Invalid prompt reference")
+                seen.add(ref["id"])
+                media.append(
+                    dict(
+                        id=ref["id"],
+                        type="image",
+                        format=ref["format"],
+                        payload={
+                            "sha256": ref[field]
+                            if digests
+                            else hashlib.sha256(ref[field]).hexdigest()
+                        },
+                    )
+                )
+            old_ids = set(context["reference_ids"])
+            request["media"] = [
+                m for m in request["media"] if m["id"] not in old_ids
+            ] + media
+            request["conditions"] = [
+                dict(content_id=m["id"], role="reference", latent_modalities=["visual"])
+                for m in media
+            ]
+        key = fingerprint(identity)
+        started = time.perf_counter()
+        cache = self.cache
+        # A disabled cache is a genuine miss, not a reason to join a GPU queue.
+        entry = None
+        detail = {}
+        if cache is not None:
+            if getattr(cache, "backend", None) == "mooncake":
+                entry, detail = cache.query_published(key)
+            elif hasattr(cache, "entries"):
+                # Entries are published only after their CPU snapshot is complete.
+                # Retain the condition object, not the evictable KV allocation.
+                entry = cache.entries.get(key)
+        return dict(
+            cache_key=key,
+            hit=entry is not None,
+            cache_query_context=dict(
+                identity=identity,
+                reference_ids=[
+                    item["content_id"] for item in request.get("conditions", [])
+                ],
+            ),
+            lookup={
+                "cache_result": "l1_hit" if entry is not None else "miss",
+                "lookup_host_ms": (time.perf_counter() - started) * 1000,
+                "query_path": "independent",
+                **detail,
+            },
+            **(
+                dict(
+                    inputs=prepared_message(entry.inputs),
+                    admission_request=entry.request,
+                    conditioning_identity=entry.conditioning_identity,
+                )
+                if entry is not None
+                else {}
+            ),
+        )
+
+    def cached_condition(self, message, *, initial, snapshot=None):
         entry = self.cache.lookup(message["cache_key"])
-        if entry is None:
+        if entry is None and snapshot is None:
             raise ValueError("The selected cache entry is no longer available")
-        self.stage.admit_cached_preparation(entry, prompt_update=not initial)
+        admission = (
+            entry
+            if entry is not None
+            else SimpleNamespace(
+                inputs=prepared_inputs(snapshot["inputs"]),
+                request=snapshot["admission_request"],
+            )
+        )
+        self.stage.admit_cached_preparation(admission, prompt_update=not initial)
         device = next(self.stage.modules["transformer"].parameters()).device
-        inputs = inputs_on(entry.inputs, device)
+        inputs = inputs_on(
+            admission.inputs,
+            device,
+        )
+        message = dict(message, cache_hit=entry is not None)
         return dict(
             message,
             tensors=inputs.positive,
@@ -47,6 +164,25 @@ class DiTPreparation:
                 if field.name not in ("positive", "source_visual")
             },
         )
+
+    def receive_candidate(self, message):
+        """Device adoption runs only on the model owner, after CPU transport."""
+        import torch
+
+        device = next(self.stage.modules["transformer"].parameters()).device
+
+        def adopt(value):
+            if isinstance(value, torch.Tensor):
+                return value.to(device)
+            if isinstance(value, dict):
+                return {k: adopt(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [adopt(v) for v in value]
+            if isinstance(value, tuple):
+                return tuple(adopt(v) for v in value)
+            return value
+
+        return adopt(message)
 
     def control(self, operation, arguments, *, busy):
         from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError

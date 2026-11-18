@@ -1,0 +1,156 @@
+---
+title: "切词独立查询与 DiT 执行边界切换"
+description: "Room 独立发起缓存查询；按 DiT 实际执行的片段收尾，保留后续 source。"
+---
+
+## 目标与状态
+
+关联 [PR #746](https://github.com/seedleap/sglang/pull/746)。本轮替换原来的块间查询插队方案。
+独立控制与执行边界方案已实现并在上海隔离 SP1 组完成 480 真实回放及同服务协议消融；
+736、历史源码 baseline、峰值显存与画质尚未验收，PR 仍为草稿。
+
+用户确认：新 Prompt 到达后，查询不等待 Encoder 或 DiT 的推理队列；旧条件只完成
+DiT 已经开始执行的块所在的 17 帧片段。后续尚未推理的 source RGB/独立 VAE
+结果保留，切换后继续使用；不按 Encoder 接收水位延后边界，也不丢弃这些输入。
+
+## 本轮改动与验收边界
+
+Room、Encoder 入口与单 rank DiT 共同协商 `direct_prompt_hits`。用户操作和 17 帧切换边界沿用现有协议。
+
+| DiT 查询结果 | 条件准备和回执 |
+| --- | --- |
+| Block0 命中 | Room 分配输出关联用的事件号，直接请求 DiT 采用已选条目。DiT 在预留边界恢复条件并答复 Room。Encoder 继续编码白膜，整个切词没有 Encoder prompt 事件，也无需传输缓存条件张量。 |
+| Block0 未命中 | DiT 返回准备指令。Room 用现有的 Encoder 会话连接转交 prompt 和所需参考图。Encoder 按同一缓存键核实输入后准备条件，将结果直接提交 DiT。 |
+| 缓存关闭 | 初始条件采用后仍开放控制入口。查询直接返回未命中，复用相同的 Encoder 准备和 DiT 切换流程。 |
+
+已采用的参考图按输出事件归属。若命中时换图，随后仅改文字又未命中，Room 随准备指令补发上一已采用事件的整组有序参考图，包括显式清空。查询阶段传参考图摘要；原图只随需要编码的请求发往 Encoder。DiT 在本地再次检查容量，条目被驱逐时用查询时保留的条件快照做准入。可恢复的拒绝只结束对应事件并释放切换边界；破坏模型状态的异常继续走 worker 故障流程。
+
+审查可从 `RenderSegment._route_condition`、`PromptControl.route/adopt`、`DiTInputService.poll_prompt_control` 追到 `QueuedDiTSession._process`。未命中沿 `EncoderConditioning._lookup` 和既有候选提交接口。Room 持有参考图资产及现有 Encoder 会话连接，因此这里复用该连接转交 DiT 的准备指令。切换成功的业务证据仍是带新事件号的首 RGB。
+
+当前分支 CPU 专项回归 32 项通过，12 个 CUDA 参数用例因本机 WSL 测试环境仅有 CPU 版 PyTorch 跳过。小模型在关闭联合、开启联合及延迟 KV 三种配置下均验证了输出帧归属：0–16 帧用旧事件，17–33 帧用新事件。Room 回归覆盖命中换图后仅改文字的未命中；缓存关闭、容量拒绝恢复与旧协议分别验证。
+
+下文的上海真实游戏与时延记录属于此前经 Encoder 传递 ticket 的实现。本轮 DiT 本地采用尚待同配置 480/736 GPU 对照验证。
+
+## 职责与协议
+
+- Room 发起独立的条件控制请求。服务端接收 Prompt、参考图身份、会话与版本，
+  使用已冻结的模型/分辨率/初始条件身份构造缓存 key。Room 不传输 KV。
+- 独立控制入口发布切词意图，同时在 CPU 缓存执行器启动查询。接口可位于 DiT
+  服务进程，但不得提交到 DiT 推理队列或 Encoder 的单线程模型执行器。
+- DiT 执行线程在每个原生块提交前发布执行位置，并与切词意图的接纳互斥。
+  切换点为接纳时已开始执行的块所属片段末尾；空闲且已完成整片段时不多跑一片。
+  到达边界后停止启动后续片段，保留 SourceBridge 和通信队列中的输入。
+- 缓存命中返回已发布条件的快照/引用；未命中才由 Encoder 准备 Qwen 与参考条件。
+  新候选经事件身份校验后交给 DiT，在已确定边界生效。Encoder 继续拥有 source VAE。
+- 切换只要求模型已执行状态到达边界，不要求已接收 source 水位等于边界或缓冲清空。
+  既有 source 编号、噪声位置、输入额度、输出 provenance 必须连续。
+- Room 保持有界供帧，不执行旧协议的 skip_during_switch；正常反压限制提前量。
+  条件候选准备失败须撤销对应意图并恢复旧条件处理，不得永久堵住 source。
+
+新路径必须通过握手能力协商。旧客户端继续使用原 clip barrier；不悄悄改变旧协议。
+首个实现限已验证的单 rank split 拓扑；多 rank 在独立控制广播/错误同步验证前不得
+广告新能力。此限制必须在部署文档和最终验证范围明确列出。
+
+## 缓存与模型状态边界
+
+当前 lookup 包含 finish_fill、rank 协调、准入和可变统计，不能直接搬到 HTTP 线程。
+新查询只读取已发布条件并进行缓存 I/O，不调用 GPU、模型 collective 或恢复 KV。
+实际恢复与模型准入仍归 DiT 执行线程。必须处理查询后条目失效，不能先跳过 Qwen
+再因缓存引用丢失使会话崩溃。候选保留必要的条件快照；模型恢复阶段重新核验。
+
+当前原生调度可能存在已经按旧条件完成的联合预计算。不得把此类结果视为尚未推理
+的 source：边界发布必须覆盖实际已提交模型工作；仅 source 和独立编码结果可直接复用。
+
+## 验证计划
+
+1. 阻塞 Encoder 与 DiT 模型执行，独立查询仍返回；命中、未命中与缓存错误分别验证。
+2. DiT 正执行第一片段、Encoder 已收第二片段时，边界仍为第一片段末尾。
+3. 片段间请求不额外启动一片；片段中请求完成当前片段，不能半块更换条件。
+4. 缓冲后续 RGB/latents，切换后不丢帧、不重复、不重置 source/noise 编号；新片段
+   确认使用新事件，旧片段保持旧事件。输入额度最终全部归还。
+5. 失败、取消、断连、旧 generation、重复请求、EOS 与下一会话复用。
+6. 真实 Room → 控制入口 → Encoder/DiT → 输出链路及旧协议兼容回归。
+7. GPU 性能仍需同条件 480/736、三角色整体实测；本地 CPU 验证不能替代性能结论。
+
+原方案的 15 项专项和 64 passed/31 skipped 仅属于旧提交，不作为新方案通过证据。
+
+### 当前验证与隔离部署准备
+
+CPU 调度回归 24 项通过，覆盖 cross_chunk 与 defer_final、17 帧边界以及后续 source
+保留；HTTP 鉴权、缓存 key 对齐及 Room 条件控制组合 73 项通过。缓存/Room 的另一组
+107 项通过、2 项跳过后因本地缺少 Node 中止；不记作全套通过。该阶段尚未完成 GPU 验收，
+后续真实回放结果见下文。
+
+上海候选组采用一张 H100 Encoder 与两张 H200（DiT、Decoder），不替换现有组。
+冻结现场源码 `498831bdfbbb3ccb2a3f5f42816c1a3a1c1c7421` 的 1103 step2000 模型和
+sparse095/cross_chunk 设置；候选分支已包含该版本及 main `c2eb00076bc2`。
+部署入口新增显式 `manage_cache_store=true`，仅适用于 DiT + Mooncake：
+`owned_cache_store.py` 监管同一源码的 `deploy/whitebox/cache_store.py`，核对本进程
+PID/预算回执后启动模型；Store 退出使本轮模型失败，并只回收自己创建的进程组。
+默认关闭，不探测或停止共享 Store。启动器与该监管的 CPU 回归 68 项通过。
+该设置用于复现现场原先外置包装脚本的 Store；模型仍通过原生 profile/role launcher 启动。
+新协议、缓存恢复和三角色真实耗时仍必须在该隔离组验收，不能以这些 CPU 结果替代。
+
+候选模型源码 `e6ff9b1bd1e714a08bfd8f43449640a38c209a37` 三角色已完成启动预热。
+H100 首次 Pod 因缺少私有镜像凭据引用停在 ErrImageNeverPull；保持源码、镜像、模型、
+GPU 和端口不变，重建本次尚未运行的 Encoder Pod 并引用已有镜像 Secret 后恢复。
+部署器补充 `image_pull_secrets`（仅名称，不保存凭据），启动器 63 项 CPU 回归通过。
+`prepare_isolated_role_replay.py` 复用原生 attach 核验，仅将本次三 owned 角色交给回放
+进程的私有 authority，不写共享 Coordinator 路由；要求同源码/worker 的原生 selftest
+通过。其旧身份、复用角色拒绝及目标隔离 4 项 CPU 回归通过。建组和模型出帧分别验收。
+
+## 社区实践与审查入口
+
+三案例自然供帧首轮（Room `620ba970a7a8`、模型 `e6ff9b1bd1e7`）在长湖镇 v2
+等待新条件首 RGB 超时，未计作性能通过。Encoder 已发 source_ready，但没有 DiT v2
+计时或新条件输出。排查发现 Room 在 source_ready 后主动取消控制 ticket：该回执仅
+表示 Encoder 已提交候选并允许供帧，不能证明 DiT 已接纳候选。修正为成功交接后由
+DiT 在采用条件时释放 fence；Room 仅在拒绝、交接前异常/取消时撤销。四项 CPU 回归
+覆盖旧协议和独立协议、Encoder 超前接收、早期回执后 ticket/fence 保留。
+失败回放结束后，签名 observe 确认三角色均 idle、owner=null、restart_required=false。
+
+修复后 Room `4497a7e4ade0`、模型仍 `e6ff9b1bd1e7` 的 480 natural 回放 6/6 轮通过：
+长湖镇、黑湖、掌中天各两轮，每轮三次切词，共 18 次新条件出图，所有 lease 已释放。
+独立查询结果接收阶段实测 2.659–55.151 ms；这是 Encoder 读取已发起查询结果的阶段，
+不冒称从 Room 开始发起查询的全部耗时。实际切换边界为 17/34/51，后续已接收输入保留。
+首帧 TTFF 1.941–3.077 s（不含独立 prefill）；切词至首 RGB 2.413–8.154 s，热缓存轮仍
+出现大幅波动，尚不能宣告整体收益。原始 summary、54 份逐段记录和分时保存在
+`D:/CodexArtifacts/ttff-switch-audit-20261116/three-case-r2/`。此轮压缩历史切词位置，使用
+归档 MP4 解码帧，不是原在线逐字节回放。736、同条件 baseline、显存与画质仍待验收。
+
+回放提供 `--legacy-prompt-control` 消融：通过显式 WhiteboxConfig 策略不采用独立能力，
+使用现存队列协议，保持同一已部署模型服务。默认仍采用协商后的独立控制。报告同时保存
+请求模式与实际协议；协议就绪信息读取 render.status.segment，不能因误读顶层而记为 null。
+该消融能隔离协议选择的影响，但不等同于部署旧源码；旧源码 baseline 仍单独标注。
+
+同服务热缓存消融（Room `e9081a12aea1`、模型 `e6ff9b1bd1e7`）两臂各 6/6 轮、
+18 次切词完成且租约全部释放；同 case/seed/版本的 key 与 L1 hit 一致。旧协议切词
+TTFF 中位数/P95 为 13.022/30.559 s，独立控制为 3.603/7.931 s；首帧分别为
+2.602/3.173 s 和 2.528/3.029 s。实际边界从 51/102/153 提前至 17/34/51，切词
+跳帧从 2,352 降为 0。此结论限该组 SP1 热缓存、自然供帧，选帧并非逐字节相同。
+DiT 首输出计算约 1.54 s、Decoder VAE 约 28 ms 基本不变；主要变化为模型接纳更新
+到 source_ready 从中位数 5.804 s 降为 35.5 ms。该回执不是 DiT 已采用条件；恢复后
+至新 RGB 仍有未完全拆出的等待。详见
+[完整逐 case、语义分时与证据](../../../../../benchmark/whitebox/block0_prompt_control_ablation.md)。
+
+736 回放入口使用 832×480 source + 显式 1280×736 model_target，按两者共同选择
+Worker profile，相关 4 项 CPU 回归通过。当前已部署角色只声明 480，不能因此标记
+736 实测通过；需先安全收回本次私有 authority 的 owned 组，再按 736 配置重部署。
+
+私有回放控制器退出后没有共享 Coordinator 进程账本，因此原 `down` 无法退役该组。
+编排器对私有回放状态增加直接签名 identity/observe/drain 检查，仍由原 `down` 校验
+云端精确身份并停止；凭据留在自有 Encoder，最后回收该 Pod。限制三 owned 单 service
+及私有目标，不将共享服务纳入该路径。新增模块只负责原生 drain 证据，不创建第二套
+云资源删除器。Linux 回收/私有回放回归 29 项通过，包含占用、旧 boot、profile 不符、
+未确认 drain、共享目标拒绝与幂等；Windows 两项路径语义失败不计作功能失败。
+
+基线 `5d6d18c0d2b773c43b4063554c19d3e7f7367e86` 的 worker_connections 已将
+HTTP 控制与模型线程分离，但生命周期命令仍在模型线程执行。本方案仅将只读查询
+和切词意图接纳独立处理；GPU 状态与已有通信 collective 仍由原执行者持有。
+这是私有 Zing 协议扩展，不声称上游 SGLang 已采用该协议。
+
+审查重点：边界与提交之间是否有竞态；保留 source 是否改变历史/噪声语义；候选和
+缓存快照谁持有、何时释放；失败是否能解除暂停；是否遗漏 Room 调用与能力协商。
+阅读顺序：本方案 → 独立控制入口 → DiT 原生块调度 → Encoder 条件准备 → Room → 测试。
+当前重点阅读 `dit_preparation.py::query_prompt`、独立 prompt 控制/执行 fence、
+`render_segment.py::_condition_controls` 的候选所有权，以及本文关联的真实回放报告。

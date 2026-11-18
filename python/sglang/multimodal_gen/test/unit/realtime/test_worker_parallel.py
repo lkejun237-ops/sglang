@@ -179,10 +179,14 @@ def exercise_lifecycle(group):
                 self.seen.append(queue.popleft()["type"])
                 self.link.send({"type": "input.processed"})
 
+            async def poll_prompt_control():
+                pass
+
             self.service = SimpleNamespace(
                 queue=PollingTaskQueue(process),
                 worker=None,
                 _close_decoder=lambda: None,
+                poll_prompt_control=poll_prompt_control,
             )
 
         async def destroy(self, *, force=False):
@@ -422,7 +426,7 @@ def test_dit_owner_preserves_failure_category_after_decoder_close(decoder_failed
         SimpleNamespace(send=lambda message: None), None
     )
     service.owner = ("session", "generation")
-    service.worker = SimpleNamespace(put=fail, close=lambda: None)
+    service.worker = SimpleNamespace(put=fail, close=lambda: None, closed=False)
     service.decoder = SimpleNamespace(
         remote=SimpleNamespace(
             failure=RuntimeError("Disconnected") if decoder_failed else None
@@ -440,6 +444,7 @@ def test_dit_owner_preserves_failure_category_after_decoder_close(decoder_failed
     owner = DiTGroups.__new__(DiTGroups)
     owner.running = owner.leader = True
     owner.parallel = None
+    owner.prompt_control = None
     owner.commands = Queue()
     owner.service = service
     owner.link = SimpleNamespace(error=None)

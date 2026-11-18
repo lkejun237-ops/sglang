@@ -7,6 +7,16 @@
   },
   "tests": [
     {
+      "path": "python/sglang/multimodal_gen/test/unit/test_zing_prompt_lookup_scheduling.py",
+      "suite": "dit-pipeline-contracts",
+      "status": "CPU_PASS",
+      "approved": true,
+      "allowed_skips": [],
+      "sources": ["main"],
+      "reason": "Linux CPU source-group scheduling regression; GPU latency and output validation remain separate.",
+      "dependencies": []
+    },
+    {
       "path": "python/sglang/multimodal_gen/test/unit/test_zing_h3_fast_single_gpu_encoder.py",
       "suite": "dit-pipeline-contracts",
       "status": "MIXED",

@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.realtime.cache_tiers import (
     CacheTiers,
     NativeReplicas,
 )
+from sglang.srt.environ import envs
 
 KEY = "a" * 64
 ART = "b" * 32
@@ -289,12 +290,18 @@ def test_marker_last_and_returning_from_enqueue_does_not_wait_for_storage():
         archive.close()
 
 
-@pytest.mark.parametrize(("size", "window"), [(16, 4), (96, 2)])
-def test_restore_bounds_prefetched_members_and_imports_in_manifest_order(size, window):
+@pytest.mark.parametrize(
+    ("concurrency", "size", "window"),
+    [(1, 16, 1), (4, 16, 4), (10, 16, 10), (10, 96, 2)],
+)
+def test_restore_bounds_prefetched_members_and_imports_in_manifest_order(
+    concurrency, size, window
+):
     objects = Objects()
-    archive = CacheArchive(policy(max_object_bytes=100), NSPACE, objects=objects)
+    with envs.SGLANG_ZING_BLOCK0_OSS_DOWNLOAD_CONCURRENCY.override(concurrency):
+        archive = CacheArchive(policy(max_object_bytes=100), NSPACE, objects=objects)
     parts = {
-        f"{NSPACE}:{KEY}:a{ART}:r0:kv:l{i:02}": bytes([i]) * size for i in range(9)
+        f"{NSPACE}:{KEY}:a{ART}:r0:kv:l{i:02}": bytes([i]) * size for i in range(12)
     }
     native = dict(artifact_id=ART, objects={k: len(v) for k, v in parts.items()})
     owners = list(parts)
@@ -359,6 +366,13 @@ def test_failed_restore_does_not_import_past_failed_member(fail_in):
         assert restored == parts
     finally:
         archive.close()
+
+
+@pytest.mark.parametrize("value", [0, -1, None])
+def test_restore_rejects_nonpositive_download_concurrency(value):
+    with envs.SGLANG_ZING_BLOCK0_OSS_DOWNLOAD_CONCURRENCY.override(value):
+        with pytest.raises(ValueError, match="DOWNLOAD_CONCURRENCY"):
+            CacheArchive(policy(), NSPACE, objects=Objects())
 
 
 def test_partial_or_expired_archives_never_restore_as_complete():
@@ -446,12 +460,93 @@ def test_archive_admission_is_bounded_and_duplicate_fill_is_joined():
         archive.close()
 
 
-def replica(kind):
+def replica(kind, *, path="/cache/mooncake_cluster/object", complete=True):
     return NS(
-        status="ReplicaStatus.COMPLETE",
+        status="ReplicaStatus.COMPLETE" if complete else "ReplicaStatus.PROCESSING",
         is_memory_replica=lambda: kind == "l1",
         is_local_disk_replica=lambda: kind == "l2",
+        is_disk_replica=lambda: kind == "filesystem",
+        get_disk_descriptor=lambda: NS(file_path=path, object_size=3),
     )
+
+
+def test_native_filesystem_group_is_durable_without_reading_payloads():
+    """Completed master-offload files must not stall L2-to-OSS publication."""
+    keys = ["manifest", "conditions", "kv.0", "kv.1"]
+    states = {key: [replica("l1"), replica("filesystem")] for key in keys}
+    client = NS(batch_get_replica_desc=lambda names: {k: states[k] for k in names})
+    tiers = NativeReplicas(
+        client,
+        replace(CacheTiers(), l2=True, disk_directory="/cache"),
+        clock=lambda: 10,
+    )
+    assert tiers.wait(keys, "l2", 10, include_filesystem=True)
+    assert tiers.memory_ready(keys)
+    states["kv.1"] = [replica("filesystem", complete=False)]
+    assert not tiers.wait(keys, "l2", 10, include_filesystem=True)
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/other/object", "/cache-other/object", "/cache/../object", "object", "/cache"],
+)
+def test_filesystem_replica_outside_configured_storage_is_not_l2(path):
+    """A generic DISK descriptor does not prove this deployment owns its path."""
+    client = NS(
+        batch_get_replica_desc=lambda keys: {
+            k: [replica("filesystem", path=path)] for k in keys
+        }
+    )
+    tiers = NativeReplicas(
+        client, replace(CacheTiers(), l2=True, disk_directory="/cache")
+    )
+    assert tiers.layers(["kv"], include_filesystem=True) == {"kv": set()}
+
+
+def test_filesystem_durability_does_not_advertise_native_promotion(monkeypatch):
+    """DISK-only reads do not publish L1; never consume the fallback deadline."""
+    from sglang.multimodal_gen.runtime.realtime import cache_tiers
+
+    def forbidden(*args):
+        raise AssertionError("Filesystem durability must not trigger promotion IO")
+
+    client = NS(
+        batch_get_replica_desc=lambda keys: {k: [replica("filesystem")] for k in keys},
+        get=forbidden,
+        get_size=forbidden,
+    )
+    monkeypatch.setattr(cache_tiers.time, "sleep", forbidden)
+    tiers = NativeReplicas(
+        client, replace(CacheTiers(), l2=True, disk_directory="/cache")
+    )
+    assert tiers.layers(["kv"], include_filesystem=True) == {"kv": {"l2"}}
+    assert tiers.layers(["kv"]) == {"kv": set()}
+    assert not tiers.promote(["kv"], float("inf"))
+
+
+def test_background_replica_wait_uses_bounded_polling_without_extending_deadline(
+    monkeypatch,
+):
+    """A missing disk replica must not create a 50Hz background metadata loop."""
+    from sglang.multimodal_gen.runtime.realtime import cache_tiers
+
+    now, sleeps, queries = [0.0], [], []
+
+    def query(keys):
+        queries.append(now[0])
+        return {k: [replica("l1")] for k in keys}
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    monkeypatch.setattr(cache_tiers.time, "sleep", sleep)
+    tiers = NativeReplicas(
+        NS(batch_get_replica_desc=query), CacheTiers(), clock=lambda: now[0]
+    )
+    assert not tiers.wait(["kv"], "l2", 0.6, poll_interval=0.25)
+    assert sleeps == pytest.approx([0.25, 0.25, 0.1])
+    assert len(queries) == 4
 
 
 def test_native_l2_promotion_checks_real_memory_residency():

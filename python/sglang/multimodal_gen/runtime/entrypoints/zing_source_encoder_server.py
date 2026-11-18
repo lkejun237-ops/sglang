@@ -76,6 +76,7 @@ class EncoderConditioning:
         self.inputs = self.prompt = self.event_id = self.failed_update = None
         self.cache_key = self.active_cache_key = None
         self.cache_lookup = {}
+        self.query_identity = None
         self.cache_hit = False
         self.cache_write = False
         self.cache_request = self.cache_preview = None
@@ -148,6 +149,7 @@ class EncoderConditioning:
             state.identity,
             state.positive,
             dict(state.media_hashes),
+            self.query_identity,
         )
 
     def _restore_preparation_state(self, value):
@@ -160,6 +162,7 @@ class EncoderConditioning:
             state.identity,
             state.positive,
             state.media_hashes,
+            self.query_identity,
         ) = value
 
     def _prepare_update(self, batch, command, *, reuse_active, timing=None):
@@ -287,6 +290,7 @@ class EncoderConditioning:
         )
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zing_h3.preparation_cache import (
             inputs_on,
+            preparation_identity,
             preparation_key,
             preparation_request,
             preview_sha256,
@@ -317,8 +321,28 @@ class EncoderConditioning:
             command["config"],
             identity["identity"],
         )
+        self.query_identity = preparation_identity(
+            self.codecs,
+            request,
+            self.cache_preview,
+            command["config"],
+            identity["identity"],
+        )
         if update is not None:
             self.cache_candidates[update["event_id"]] = request, self.cache_key
+            if "block0_miss" in update:
+                miss = update["block0_miss"]
+                if self.cache_key != miss["cache_key"]:
+                    from sglang.multimodal_gen.runtime.conditioning.contract import (
+                        ConditionError,
+                    )
+
+                    raise ConditionError(
+                        "CONDITION_INVALID", "The prompt references have changed"
+                    )
+                self.cache_lookup = {"lookup": miss["lookup"]}
+                self.cache_hit = False
+                return None
             if reuse_active and self.cache_key == self.active_cache_key:
                 # Send the active tensors so DiT can validate and rebuild even
                 # if it cannot reuse its resident Block0.
@@ -336,8 +360,16 @@ class EncoderConditioning:
         trace = batch_context(batch)
         if update is not None and update.get("event_id") is not None:
             trace["event_id"] = update["event_id"]
+        operation = "lookup"
+        if update is not None and update.get("prompt_preparation"):
+            operation = "prompt_result"
         response = query(
-            "lookup",
+            operation,
+            **(
+                {"ticket": update["prompt_preparation"]}
+                if operation == "prompt_result"
+                else {}
+            ),
             cache_key=self.cache_key,
             **(
                 {
@@ -353,6 +385,8 @@ class EncoderConditioning:
             prompt_update=update is not None,
             _trace=trace,
         )
+        if operation == "prompt_result" and response.get("cache_key") != self.cache_key:
+            raise ValueError("Independent prompt cache identity does not match")
         if response.get("code") == "CONDITION_INVALID":
             from sglang.multimodal_gen.runtime.conditioning.contract import (
                 ConditionError,
@@ -389,8 +423,19 @@ class EncoderConditioning:
         visual map for clearing references; omission preserves active references.
         Even a reference-only edit recomputes Qwen against the new images.
         """
+        query_context = (
+            {
+                "cache_query_context": dict(
+                    identity=self.query_identity,
+                    reference_ids=[item["content_id"] for item in inputs.conditions],
+                )
+            }
+            if self.query_identity is not None
+            else {}
+        )
         if self.cache_key is not None and self.cache_hit:
             return dict(
+                **query_context,
                 event_id=event_id,
                 prompt_version=version,
                 cache_key=self.cache_key,
@@ -398,6 +443,7 @@ class EncoderConditioning:
                 cache_lookup=self.cache_lookup.get("lookup", {}),
             )
         output = dict(
+            **query_context,
             event_id=event_id,
             prompt_version=version,
             tensors={
@@ -752,6 +798,22 @@ class SourceEncoderExecutor:
     def _cache_query(self, operation, **arguments):
         if self.dit_link is None:
             return None
+        if operation == "prompt_result":
+            from sglang.multimodal_gen.runtime.conditioning.contract import (
+                ConditionError,
+            )
+            from sglang.multimodal_gen.runtime.realtime.prompt_control_http import (
+                request_prompt,
+            )
+
+            try:
+                return request_prompt(
+                    self.prompt_control, "result", ticket=arguments["ticket"]
+                )
+            except Exception as exc:
+                raise ConditionError(
+                    "CONDITION_INVALID", "The prompt could not be prepared"
+                ) from exc
         try:
             return self.dit_link.cache_control(operation, **arguments)
         except BaseException:
@@ -992,6 +1054,14 @@ class SourceEncoderExecutor:
 
         def send_dit(kind, *, release_source=False, **payload):
             nonlocal source_ready
+            ticket = batch.extra.get("zing_prompt_update", {}).get("prompt_preparation")
+            if kind == "conditioning.cancel" and ticket is not None:
+                from sglang.multimodal_gen.runtime.realtime.prompt_control_http import (
+                    request_prompt,
+                )
+
+                request_prompt(self.prompt_control, "cancel", ticket=ticket)
+                return
             if kind == "conditioning":
                 payload.update(
                     {
@@ -1010,19 +1080,57 @@ class SourceEncoderExecutor:
                 )
                 if boundary is not None:
                     payload["source_boundary"] = boundary
+                    ticket = batch.extra.get("zing_prompt_update", {}).get(
+                        "prompt_preparation"
+                    )
+                    if ticket is not None:
+                        payload["prompt_preparation"] = ticket
                     if batch.extra.get("zing_prompt_update", {}).get(
                         "allow_deferred_kv"
                     ):
                         payload["allow_deferred_kv"] = True
                 if command.get("startup", {}).get("op") == "prepare":
                     payload["source_prepare"] = self.startup_preparation
-            results = self.dit_link.send(
-                kind,
-                request_id=batch.request_id,
-                chunk_index=batch.block_idx,
-                **payload,
-                **({"wait_for_boundary": False} if release_source else {}),
-            )
+            if payload.get("prompt_preparation"):
+                import torch
+
+                from sglang.multimodal_gen.runtime.realtime.prompt_control_http import (
+                    request_prompt,
+                )
+
+                def cpu(value):
+                    if isinstance(value, torch.Tensor):
+                        return value.detach().to("cpu")
+                    if isinstance(value, dict):
+                        return {k: cpu(v) for k, v in value.items()}
+                    if isinstance(value, list):
+                        return [cpu(v) for v in value]
+                    if isinstance(value, tuple):
+                        return tuple(cpu(v) for v in value)
+                    return value
+
+                request_prompt(
+                    self.prompt_control,
+                    "apply",
+                    ticket=payload["prompt_preparation"],
+                    candidate=dict(
+                        type=kind,
+                        session_id=self.owner[0],
+                        generation_id=self.owner[1],
+                        request_id=batch.request_id,
+                        chunk_index=batch.block_idx,
+                        **cpu(payload),
+                    ),
+                )
+                results = self.dit_link.collect()
+            else:
+                results = self.dit_link.send(
+                    kind,
+                    request_id=batch.request_id,
+                    chunk_index=batch.block_idx,
+                    **payload,
+                    **({"wait_for_boundary": False} if release_source else {}),
+                )
             if release_source:
                 expected = dict(
                     event_id=payload["event_id"],
@@ -1482,6 +1590,14 @@ class EncoderClient:
                     )
         try:
             result = self.executor.dit_link.open(message)
+            self.executor.prompt_control = next(
+                (
+                    r.get("prompt_control")
+                    for r in result
+                    if r["type"] == "session.opened"
+                ),
+                None,
+            )
             self.executor.timing_override = None
             return result
         except BaseException:

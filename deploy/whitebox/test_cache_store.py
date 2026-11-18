@@ -35,8 +35,55 @@ def test_disabled_l2_does_not_initialize_disk_or_offload():
     config["tiers"].update(l2=False, l1_to_l2=False, l2_to_l3=False, l1_to_l3=True)
     _, command, env, store = settings(config)
     assert "--enable_offload=false" in command
+    assert "--root_fs_dir=" in command
     assert store["enable_ssd_offload"] is False
     assert not any(key.startswith("MOONCAKE_OFFLOAD") for key in env)
+
+
+def test_native_ssd_does_not_enable_a_second_filesystem_copy():
+    """root_fs_dir adds DISK writes on Put alongside the Store's LOCAL_DISK copy."""
+    policy, command, env, store = settings(configuration(), 1024 << 30)
+    assert "--root_fs_dir=" in command
+    assert not any(
+        arg.startswith("--root_fs_dir=") and arg != "--root_fs_dir=" for arg in command
+    )
+    assert "--enable_offload=true" in command
+    assert store["enable_ssd_offload"] is True
+    assert store["ssd_offload_path"] == policy.disk_directory
+    assert env["MOONCAKE_OFFLOAD_FILE_STORAGE_PATH"] == policy.disk_directory
+
+
+def test_native_probe_diagnostics_are_not_store_configuration(tmp_path, monkeypatch):
+    """Runtime provenance accidentally serialized into tiers must fail locally."""
+    import importlib.util
+    import types
+
+    from sglang.multimodal_gen.runtime.realtime.cache_tiers import CacheTiers
+
+    root = Path(__file__).resolve().parents[2]
+    path = root / "benchmark/zing_h3_causal/check_native_cache_tiers.py"
+    spec = importlib.util.spec_from_file_location("native_cache_probe", path)
+    probe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe)
+    package = types.ModuleType("mooncake")
+    store = types.ModuleType("mooncake.store")
+    store.MooncakeDistributedStore = store.ReplicateConfig = object
+    monkeypatch.setitem(sys.modules, "mooncake", package)
+    monkeypatch.setitem(sys.modules, "mooncake.store", store)
+
+    class ProbeStopped(Exception):
+        pass
+
+    def inspect_config(argv, **_):
+        value = json.loads(Path(argv[-1]).read_text())
+        CacheTiers.parse(value["tiers"])
+        raise ProbeStopped()
+
+    monkeypatch.setattr(probe.subprocess, "Popen", inspect_config)
+    with pytest.raises(ProbeStopped):
+        probe.main(tmp_path / "run", "mlx5_0", runtime_root=root, allow_overlay_l2=True)
+    receipt = json.loads((tmp_path / "run/receipt.json").read_text())
+    assert receipt["runtime_root"] == str(root)
 
 
 def test_release_wires_shared_cache_policy_without_starting_store_per_slot():

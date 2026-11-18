@@ -47,8 +47,10 @@ class SuiteRolePool:
         control_epoch=None,
         client=None,
         video_size=(832, 480),
+        target_size=None,
     ):
         self.video_size = list(video_size)
+        self.target_size = list(target_size or video_size)
         # Keep one suite's lifecycle checks, without reusing a previous run's player.
         self.run_id = uuid4().hex
         self.supplied_client = client
@@ -200,7 +202,7 @@ class SuiteRolePool:
             for p in common
             if all(
                 self.video_size in i["profile_limits"][p]["source_sizes"]
-                and self.video_size in i["profile_limits"][p]["target_sizes"]
+                and self.target_size in i["profile_limits"][p]["target_sizes"]
                 and (
                     bool(self.config["profile"])
                     or i["profile_limits"][p]["max_references"] >= 12
@@ -211,7 +213,7 @@ class SuiteRolePool:
         }
         if len(common) != 1:
             raise ValueError(
-                f"Expected one common {self.video_size[0]}x{self.video_size[1]} profile; use --profile to resolve ambiguity"
+                f"Expected one common source {self.video_size} / target {self.target_size} profile; use --profile to resolve ambiguity"
             )
         profile = next(iter(common))
         limits = [i["profile_limits"][profile] for i in identities.values()]
@@ -323,7 +325,8 @@ class SuiteRolePool:
             model_revision=self.revision,
             vae_fingerprint="local",
             trace_id=trace_id,
-            profile_hint=f"{spec.width}x{spec.height}",
+            profile_hint=segment.get("model_size")
+            or f"{self.target_size[0]}x{self.target_size[1]}",
             max_bytes=64 << 20,
             strict_release=True,
             operation_path="/v1/realtime_video/bound",

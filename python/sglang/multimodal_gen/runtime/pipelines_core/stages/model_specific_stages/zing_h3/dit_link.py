@@ -247,6 +247,8 @@ class DiTInputService:
         abort_transport=None,
     ):
         self.channel, self.create_session = channel, create_session
+        self.prompt_control = None
+        self.prompt_control_url = None
         self.create_decoder = create_decoder
         self.on_failure, self.cleanup_guard = on_failure, cleanup_guard
         self.abort_transport = abort_transport
@@ -256,6 +258,76 @@ class DiTInputService:
         self.stopped = False
         self.queue = PollingTaskQueue(self._process)
         self.sequence = 0
+
+    async def poll_prompt_control(self):
+        """Model-owner side of the independent control mailbox.
+
+        Also called while source admission waits for capacity: a full source
+        buffer must not prevent the candidate that releases its boundary.
+        """
+        worker, control = self.worker, self.prompt_control
+        if worker is None or control is None or worker.closed:
+            return
+        candidate = control.take_candidate()
+        if candidate is not None:
+            from sglang.multimodal_gen.runtime.conditioning.contract import (
+                ConditionError,
+            )
+
+            try:
+                if candidate.get("cache_hit"):
+                    candidate = self.create_session.cached_condition(
+                        candidate,
+                        initial=False,
+                        snapshot=control.prepared(candidate["prompt_preparation"]),
+                    )
+                else:
+                    candidate = self.create_session.receive_candidate(candidate)
+                # Both callers are the same model owner. The source capacity caller
+                # already holds worker._admission, so do not recursively acquire it.
+                await worker._put(candidate)
+            except ConditionError as exc:
+                rejection = dict(event_id=candidate["event_id"], code=exc.code)
+                control.finish(
+                    candidate["prompt_preparation"],
+                    outcome=dict(state="rejected", **rejection),
+                )
+                if not candidate.get("direct_hit"):
+                    worker.conditioning_notice = rejection
+        worker.queue.append(None)
+        while worker.queue:
+            await worker.queue.run_once()
+        for attribute, kind in (
+            ("condition_ready", "conditioning.ready"),
+            ("conditioning_notice", "conditioning.rejected"),
+        ):
+            value = getattr(worker, attribute, None)
+            if value is not None:
+                setattr(worker, attribute, None)
+                self.channel.send(
+                    dict(
+                        type=kind,
+                        # Like output notices, correlate to the last admitted
+                        # transport input; the event/version identifies the prompt.
+                        transfer_id=self.current_transfer,
+                        session_id=self.owner[0],
+                        generation_id=self.owner[1],
+                        **value,
+                    )
+                )
+                if kind == "conditioning.ready":
+                    take = getattr(worker, "take_cache_report", None)
+                    report = take(value.get("event_id")) if take is not None else None
+                    if report is not None:
+                        self.channel.send(
+                            dict(
+                                type="model.cache",
+                                transfer_id=self.current_transfer,
+                                session_id=self.owner[0],
+                                generation_id=self.owner[1],
+                                usage={"zing_block0_cache": report},
+                            )
+                        )
 
     async def _process(self, queue):
         from sglang.multimodal_gen.runtime.conditioning.contract import ConditionError
@@ -421,6 +493,26 @@ class DiTInputService:
 
                 self.worker = self.create_session(message, output)
                 self.owner = identity
+                prompt_attachment = None
+                if self.prompt_control is not None:
+                    from sglang.multimodal_gen.runtime.realtime.prompt_control_http import (
+                        PATH,
+                    )
+                    from sglang.multimodal_gen.runtime.realtime.prompt_control_http import (
+                        PROTOCOL as PROMPT_PROTOCOL,
+                    )
+
+                    token = self.prompt_control.open(identity)
+                    self.worker.prompt_control = self.prompt_control
+                    self.worker.poll_prompt_control = self.poll_prompt_control
+                    prompt_attachment = dict(
+                        protocol=PROMPT_PROTOCOL,
+                        direct_adoption=True,
+                        url=self.prompt_control_url.rstrip("/") + PATH,
+                        token=token,
+                        session_id=identity[0],
+                        generation_id=identity[1],
+                    )
                 if self.create_decoder is not None:
                     self.decoder = self.create_decoder(message)
                     capabilities = dict(
@@ -462,6 +554,11 @@ class DiTInputService:
                             getattr(
                                 getattr(self.decoder, "remote", None), "oneway", False
                             )
+                        ),
+                        **(
+                            {"prompt_control": prompt_attachment}
+                            if prompt_attachment
+                            else {}
                         ),
                         **(
                             {
@@ -555,7 +652,16 @@ class DiTInputService:
                         expand = getattr(self.create_session, "cached_condition", None)
                         if expand is None:
                             raise ValueError("Cached conditioning is unavailable")
-                        message = expand(message, initial=initial_condition)
+                        snapshot = (
+                            {
+                                "snapshot": self.prompt_control.prepared(
+                                    message["prompt_preparation"]
+                                )
+                            }
+                            if message.get("prompt_preparation")
+                            else {}
+                        )
+                        message = expand(message, initial=initial_condition, **snapshot)
                     except BaseException as exc:
                         expand_err = exc
                     _sync_step_error(expand_err)
