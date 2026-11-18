@@ -64,7 +64,8 @@ async def owners():
     room = dict(
         driver=SimpleNamespace(public_session=publish),
         control_record=dict(
-            invocation=dict(createContext=copy.deepcopy(FIXTURE["createContext"]))
+            invocation=dict(createContext=copy.deepcopy(FIXTURE["createContext"])),
+            expires_at_ms=4_102_444_800_000,
         ),
     )
     entries = {stream: entry}

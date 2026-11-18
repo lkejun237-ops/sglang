@@ -289,6 +289,15 @@ def test_runtime_create_query_admission_leave_and_retirement_keep_original_owner
     monkeypatch,
     cleanup_error,
 ):
+    monkeypatch.setenv("WHITEBOX_GAME_SECONDS", "300")
+    clock = SimpleNamespace(time=lambda: 1_800_000_000.125)
+    monkeypatch.setattr(
+        room_control_runtime,
+        "time",
+        SimpleNamespace(
+            time=lambda: clock.time(), monotonic=room_control_runtime.time.monotonic
+        ),
+    )
     from sglang.multimodal_gen.runtime.entrypoints.whitebox_room_server import (
         compose_room_driver,
     )
@@ -341,11 +350,17 @@ def test_runtime_create_query_admission_leave_and_retirement_keep_original_owner
             assert len(starts) == 1
             assert starts[0]["create_context"] == body["createContext"]
             assert (await invoke(request_body("getOperation")))["status"] == "pending"
+            clock.time = lambda: 1_800_000_010.125
             gate.set()
             await control.drain()
             outcome = await invoke(request_body("getOperation"))
             assert outcome["status"] == "succeeded"
             assert outcome["ownerEpoch"] == runtime.epoch
+            assert outcome["expiresAt"] == 1_800_000_300_125
+            clock.time = lambda: 1_800_000_020.125
+            assert await invoke(body) == outcome
+            assert await invoke(request_body("getOperation")) == outcome
+            assert len(starts) == 1
             assert not runtime.players  # Room creation consumes no player slot.
             binding = {
                 "gameId": outcome["gameId"],
@@ -437,6 +452,10 @@ def test_runtime_create_query_admission_leave_and_retirement_keep_original_owner
             assert await invoke(leave) == retired  # Lost replies replay the receipt.
             assert len(cleanup_calls) == 2
             assert not runtime.players and outcome["gameId"] in runtime.rooms
+            clock.time = lambda: 1_800_000_300.125
+            assert (await invoke(request_body("getOperation")))["status"] == "unknown"
+            with pytest.raises(ValueError, match="original publication is unavailable"):
+                control.bound_room(binding)
             close = {**request_body("retireRoom"), "execution": binding}
             assert (await invoke(close))["cleanupComplete"] is False
             await control.drain()

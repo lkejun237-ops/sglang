@@ -1020,7 +1020,7 @@ class RoomRuntime:
                         # One failed player's GPU/SDK cleanup is not owner loss.
                         task = asyncio.create_task(self.leave(stream_id))
                         task.add_done_callback(self._observe_player_cleanup)
-                close_empty = False
+                end_reason = None
                 if self.locks[game_id].locked():
                     # A cold CLI start/join can outlive an owner lease. Continue
                     # renewing independently; do not wait here behind that work.
@@ -1038,15 +1038,27 @@ class RoomRuntime:
                         and not record["task"].done()
                         for record in admissions.values()
                     )
-                    if room["players"] or pending:
+                    record = room.get("control_record")
+                    if (
+                        record is not None
+                        and time.time() * 1000 >= record["expires_at_ms"]
+                    ):
+                        # Fence new joins and wait for original admissions to settle
+                        # before using the existing whole-room cleanup path.
+                        record["retiring"] = room["closing"] = True
+                        if not pending:
+                            end_reason = "expired"
+                    elif record is not None or room["players"] or pending:
+                        # Fixed invitations can rejoin an empty managed room.
                         room.pop("empty_since", None)
                     else:
                         room.setdefault("empty_since", time.monotonic())
                         grace = 15 if room.get("ever_occupied") else 120
                         if time.monotonic() - room["empty_since"] >= grace:
-                            room["closing"] = close_empty = True
-                if close_empty:
-                    await self._end(game_id, "empty", expected_room=room)
+                            room["closing"] = True
+                            end_reason = "empty"
+                if end_reason is not None:
+                    await self._end(game_id, end_reason, expected_room=room)
                     return
         except asyncio.CancelledError:
             raise
@@ -1098,14 +1110,14 @@ class RoomRuntime:
             for stream_id, entry in self.retiring_players.items()
             if entry["game_id"] == game_id
         }
+        admissions = [
+            entry["control_admission"]
+            for entry in entries.values()
+            if "control_admission" in entry
+        ]
         media = getattr(self, "member_media", None)
         media_cleanup = None
         if media is not None:
-            admissions = [
-                entry["control_admission"]
-                for entry in entries.values()
-                if "control_admission" in entry
-            ]
             for admission in admissions:
                 admission["leaving"] = True
             media_cleanup = asyncio.gather(
@@ -1168,14 +1180,19 @@ class RoomRuntime:
                 try:
                     invocation = control_record["invocation"]
                     world = invocation["createContext"]["frozenPublication"]["world"]
+                    binding = dict(
+                        gameId=game_id,
+                        ownerEpoch=self.epoch,
+                        publicationId=world["publicationId"],
+                    )
+                    # Only certify the original members included in this cleanup.
+                    for admission in admissions:
+                        if admission.get("binding") == binding:
+                            admission.update(leaving=True, status="retired")
                     await self.directory.confirm_room_cleanup(
                         control_record["caller"],
                         invocation,
-                        dict(
-                            gameId=game_id,
-                            ownerEpoch=self.epoch,
-                            publicationId=world["publicationId"],
-                        ),
+                        binding,
                         self.owner_id,
                     )
                 except Exception as error:

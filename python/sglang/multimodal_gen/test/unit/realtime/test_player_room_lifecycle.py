@@ -440,6 +440,58 @@ def test_empty_room_tracks_actual_admission_task(monkeypatch, admission_state):
     asyncio.run(run())
 
 
+def test_empty_managed_room_is_retained_until_invitation_expiry(monkeypatch):
+    from sglang.multimodal_gen.runtime.realtime.whitebox import (
+        room_control_runtime,
+        room_runtime,
+    )
+
+    async def run():
+        runtime = RoomRuntime.__new__(RoomRuntime)
+        game = new_id()
+        runtime.owner_id, runtime.epoch = "owner", new_id()
+        record = dict(
+            expires_at_ms=180_000,
+            invocation=dict(
+                createContext=dict(
+                    frozenPublication=dict(world=dict(publicationId="publication"))
+                )
+            ),
+        )
+        room = dict(players=set(), ever_occupied=True, control_record=record)
+        runtime.rooms, runtime.players = {game: room}, {}
+        runtime.locks = {game: asyncio.Lock()}
+        runtime._end = AsyncMock()
+        control = runtime.control = room_control_runtime.RoomControlRuntime(runtime)
+        binding = dict(
+            gameId=game, ownerEpoch=runtime.epoch, publicationId="publication"
+        )
+        now = 0
+        ticks = iter((0, 16, 121, 180))
+
+        async def touch(*_):
+            nonlocal now
+            assert not room.get("closing")
+            now = next(ticks)
+            if now < 180:
+                assert control.bound_room(binding) is room
+
+        runtime.directory = NS(touch=touch)
+        monkeypatch.setattr(room_runtime.asyncio, "sleep", AsyncMock())
+        monkeypatch.setattr(
+            room_runtime, "time", NS(time=lambda: now, monotonic=lambda: now)
+        )
+        monkeypatch.setattr(room_control_runtime, "time", NS(time=lambda: now))
+        await runtime._heartbeat(game)
+
+        runtime._end.assert_awaited_once_with(game, "expired", expected_room=room)
+        assert record["retiring"] and room["closing"]
+        with pytest.raises(ValueError, match="original publication is unavailable"):
+            control.bound_room(binding)
+
+    asyncio.run(run())
+
+
 def test_failed_admission_logs_original_error_and_operation(player_log_capture):
     from sglang.multimodal_gen.runtime.realtime.whitebox.room_control_runtime import (
         RoomControlRuntime,
@@ -580,5 +632,68 @@ def test_room_cleanup_logs_only_failed_stage_with_original_identity(
             assert rows[0]["ownerEpoch"] == "original-epoch"
             assert rows[0]["operationId"] == "original-operation"
         assert "private cleanup failure" not in player_log_capture.text
+
+    asyncio.run(run())
+
+
+def test_room_expiry_confirms_original_member_only_after_cleanup_succeeds():
+    from sglang.multimodal_gen.runtime.realtime.whitebox.room_control_runtime import (
+        RoomControlRuntime,
+    )
+
+    async def run():
+        runtime = RoomRuntime.__new__(RoomRuntime)
+        runtime.owner_id, runtime.epoch = "owner", "epoch"
+        runtime.retiring, runtime.retiring_players = {}, {}
+        runtime.directory = NS(touch=AsyncMock(), confirm_room_cleanup=AsyncMock())
+        runtime.archives = NS(finalize=lambda *_: None)
+        control = runtime.control = RoomControlRuntime(runtime)
+        caller = dict(serviceId="wtp", subject="player")
+        binding = dict(gameId="game", ownerEpoch="epoch", publicationId="publication")
+        operation = dict(operationId="admit", parametersSha256="a" * 64)
+        admission = dict(binding=binding, admission=operation, status="claimed")
+        unconfirmed = dict(binding=binding, status="blocked")
+        control.admissions[control.key(caller, "admit")] = admission
+        control.admissions[control.key(caller, "unconfirmed")] = unconfirmed
+        creation = dict(
+            caller=caller,
+            invocation=dict(
+                createContext=dict(
+                    frozenPublication=dict(world=dict(publicationId="publication"))
+                )
+            ),
+        )
+        room = dict(
+            players={"stream"},
+            heartbeat=asyncio.current_task(),
+            control_record=creation,
+            driver=NS(close=AsyncMock()),
+            log=NS(finish=AsyncMock(side_effect=RuntimeError("Unconfirmed cleanup"))),
+        )
+        runtime.rooms = {"game": room}
+        runtime.players = {
+            "stream": dict(
+                game_id="game",
+                engine=NS(close=AsyncMock(), renderer=NS(close=AsyncMock())),
+                control_admission=admission,
+            )
+        }
+        request = dict(action="getAdmission", binding=binding, admission=operation)
+        route = dict(
+            owner_id="owner", owner_epoch="epoch", game_id="game", status="ended"
+        )
+
+        assert not await runtime._end("game", "expired", expected_room=room)
+        assert (await control.handle(caller, request, route))["status"] == "blocked"
+
+        room["log"].finish.side_effect = None
+        assert await runtime._end("game", "expired", expected_room=room)
+        assert await control.handle(caller, request, route) == dict(
+            admissionOperationId="admit",
+            parametersSha256="a" * 64,
+            status="retired",
+            cleanupComplete=True,
+        )
+        assert unconfirmed["status"] == "blocked"
 
     asyncio.run(run())

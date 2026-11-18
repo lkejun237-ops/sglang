@@ -9,6 +9,7 @@ these observations, but the directory's owner epoch prevents another startup.
 import asyncio
 import copy
 import json
+import os
 import time
 
 from fastapi import Header, HTTPException
@@ -35,6 +36,9 @@ from .rooms import checked_id, new_id, require_internal_token
 class RoomControlRuntime:
     def __init__(self, runtime):
         self.runtime = runtime
+        self.max_seconds = int(os.environ.get("WHITEBOX_GAME_SECONDS", "3600"))
+        if self.max_seconds <= 0:
+            raise ValueError("Invalid managed multiplayer room lifetime")
         self.creates, self.admissions, self.leaves = {}, {}, {}
         self.tasks = set()
         self.closed = False
@@ -69,10 +73,18 @@ class RoomControlRuntime:
             # A successful old create is not a resumable source after retirement
             # or lease loss. Never publish a replacement owner under this ID.
             room = self.runtime.rooms.get(record["game_id"])
-            if room is None or record.get("retiring"):
+            if (
+                room is None
+                or record.get("retiring")
+                or time.time() * 1000 >= record["expires_at_ms"]
+            ):
                 result["status"] = "unknown"
             else:
-                result.update(gameId=record["game_id"], ownerEpoch=self.runtime.epoch)
+                result.update(
+                    gameId=record["game_id"],
+                    ownerEpoch=self.runtime.epoch,
+                    expiresAt=record["expires_at_ms"],
+                )
         elif record["status"] == "failed":
             result.update(
                 cleanupComplete=True, errorCode=record["startup_failure"].code
@@ -202,6 +214,7 @@ class RoomControlRuntime:
                 game_id=route["game_id"],
                 route=route,
                 status="pending",
+                expires_at_ms=int(time.time() * 1000) + self.max_seconds * 1000,
             )
             self.creates[key] = record
             record["task"] = self.dispatch(self.start(record))
@@ -218,7 +231,11 @@ class RoomControlRuntime:
             raise ValueError("The original room execution is unavailable")
         record = room["control_record"]
         world = record["invocation"]["createContext"]["frozenPublication"]["world"]
-        if world["publicationId"] != binding["publicationId"] or record.get("retiring"):
+        if (
+            world["publicationId"] != binding["publicationId"]
+            or record.get("retiring")
+            or time.time() * 1000 >= record["expires_at_ms"]
+        ):
             raise ValueError("The original publication is unavailable")
         return room
 
