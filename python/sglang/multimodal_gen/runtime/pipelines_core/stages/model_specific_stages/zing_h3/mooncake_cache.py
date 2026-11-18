@@ -6,6 +6,7 @@ import ctypes
 import io
 import json
 import logging
+import os
 import re
 import socket
 import threading
@@ -164,6 +165,10 @@ class MooncakeBackend(prep.Block0PreparationCache):
         stores = slots[0].kv_cache
         first = stores[0].k
         self._device = first.device
+        # CUDA buffer registration is not available on every production
+        # RDMA image. In memcpy mode Mooncake transfers through CPU staging
+        # buffers, while the owned Store itself remains RDMA-native.
+        self._memcpy_mode = os.environ.get("MC_STORE_MEMCPY") in ("1", "true", "True")
         self._layers = len(stores)
         self._kv_shape = tuple(first.shape[1:])
         self._dtype = first.dtype
@@ -206,6 +211,8 @@ class MooncakeBackend(prep.Block0PreparationCache):
             for slot in slots:
                 for layer in slot.kv_cache:
                     for tensor in (layer.k, layer.v):
+                        if self._memcpy_mode:
+                            continue
                         storage = tensor.untyped_storage()
                         ptr = storage.data_ptr()
                         if ptr not in self._registered:
@@ -1061,6 +1068,7 @@ class MooncakeBackend(prep.Block0PreparationCache):
         views = []
         packed = []
         registered = []
+        staged = []
         positions = blocks = None
         try:
             if self._transfer_fault:
@@ -1074,11 +1082,23 @@ class MooncakeBackend(prep.Block0PreparationCache):
                 for layer, slot in enumerate(cache.storage):
                     k, v = cache._reserve_store(layer, rows, slot.k, slot.v)
                     views.append((k[:rows], v[:rows]))
-                ptrs, sizes = self._buffers(views, rows)
+                transfer_layers, staged = self._stage_layers(views, destination=True)
+                ptrs, sizes = (
+                    self._register_staged_layers(transfer_layers)[:2]
+                    if self._memcpy_mode
+                    else self._buffers(views, rows)
+                )
+                if self._memcpy_mode:
+                    registered.extend(
+                        value.untyped_storage().data_ptr()
+                        for pair in transfer_layers
+                        for value in pair
+                    )
             else:
                 for _ in range(self._layers):
                     value = kv_codec.allocate(
-                        rows, *self._kv_shape, device=self._device
+                        rows, *self._kv_shape,
+                        device="cpu" if self._memcpy_mode else self._device,
                     )
                     packed.append(value)
                     if (
@@ -1089,6 +1109,8 @@ class MooncakeBackend(prep.Block0PreparationCache):
                             "Compressed restore buffer registration failed"
                         )
                     registered.append(value.data_ptr())
+                    if self._memcpy_mode:
+                        staged.append(value)
                 ptrs = [[v.data_ptr()] for v in packed]
                 sizes = [[v.numel()] for v in packed]
             if self._device.type == "cuda":
@@ -1098,6 +1120,17 @@ class MooncakeBackend(prep.Block0PreparationCache):
             )
             if list(codes) != [sum(pair) for pair in sizes]:
                 raise CacheTransferError(f"Mooncake incomplete KV read: {codes}")
+            if self._memcpy_mode:
+                if self.requires_raw_prefix:
+                    for destination, source in zip(views, staged):
+                        for dst, src in zip(destination, source):
+                            dst.copy_(src)
+                else:
+                    packed_device = []
+                    for value in packed:
+                        device_value = value.to(self._device)
+                        packed_device.append(device_value)
+                    packed = packed_device
         except Exception as exc:
             error = type(exc).__name__
         finally:
@@ -1107,7 +1140,7 @@ class MooncakeBackend(prep.Block0PreparationCache):
                     torch.cuda.synchronize(self._device)
                 except Exception as exc:
                     error = type(exc).__name__
-            if not self._release_owned_buffers(registered, packed):
+            if not self._release_owned_buffers(registered, [*packed, *staged]):
                 error = "CompressedRestoreUnregisterFailed"
         self._agree(error)
         return prep.PrefixRestore(
@@ -1148,7 +1181,11 @@ class MooncakeBackend(prep.Block0PreparationCache):
                 raise ValueError("Block0 requires contiguous K/V buffers")
             for value in pair:
                 storage = value.untyped_storage()
-                if storage.data_ptr() not in self._registered and not owned_export:
+                if (
+                    storage.data_ptr() not in self._registered
+                    and not owned_export
+                    and not self._memcpy_mode
+                ):
                     raise ValueError("Block0 buffer is outside the registered GPU pool")
                 if (
                     value.dtype != self._dtype
@@ -1161,6 +1198,41 @@ class MooncakeBackend(prep.Block0PreparationCache):
             ptrs.append([v.data_ptr() for v in pair])
             sizes.append([v.numel() * v.element_size() for v in pair])
         return ptrs, sizes
+
+    def _stage_layers(self, layers, *, destination=False):
+        """Convert GPU K/V pairs to host buffers for Mooncake memcpy mode."""
+        if not self._memcpy_mode:
+            return layers, []
+        staged, result = [], []
+        for pair in layers:
+            host_pair = []
+            for value in pair:
+                host = (
+                    torch.empty_like(value, device="cpu")
+                    if destination
+                    else value.detach().to(device="cpu").contiguous()
+                )
+                host_pair.append(host)
+                staged.append(host)
+            result.append(tuple(host_pair))
+        return result, staged
+
+    def _register_staged_layers(self, layers):
+        ptrs, sizes, registered = [], [], []
+        for pair in layers:
+            ptr_pair, size_pair = [], []
+            for value in pair:
+                ptr = value.untyped_storage().data_ptr()
+                size = value.untyped_storage().nbytes()
+                rc = self.client.register_buffer(ptr, size)
+                if rc != 0:
+                    raise CacheTransferError(f"Mooncake staged buffer registration failed: {rc}")
+                registered.append(ptr)
+                ptr_pair.append(value.data_ptr())
+                size_pair.append(value.numel() * value.element_size())
+            ptrs.append(ptr_pair)
+            sizes.append(size_pair)
+        return ptrs, sizes, registered
 
     def can_store(self, rows):
         # There is no worker-local host budget. Shared Store capacity is decided
@@ -1250,7 +1322,7 @@ class MooncakeBackend(prep.Block0PreparationCache):
                 if self.requires_raw_prefix
                 else [(v,) for v in kv_codec.snapshot(cache)]
             )
-            if self.requires_raw_prefix:
+            if self.requires_raw_prefix and not self._memcpy_mode:
                 self._buffers(original, rows, owned_export=owned)
             # Optional online writeback owns private GPU snapshots. Queued puts
             # must never read the next prompt's mutated KV storage.
@@ -1357,11 +1429,23 @@ class MooncakeBackend(prep.Block0PreparationCache):
                         ),
                         payload,
                     )
+                    transfer_layers, staged = self._stage_layers(layers)
                     ptrs, sizes = [], []
-                    for pair in layers:
+                    for pair in transfer_layers:
                         ptrs.append([v.data_ptr() for v in pair])
                         sizes.append([v.numel() * v.element_size() for v in pair])
-                        if optional or owned:
+                        if self._memcpy_mode:
+                            for value in pair:
+                                ptr = value.untyped_storage().data_ptr()
+                                rc = self.client.register_buffer(
+                                    ptr, value.untyped_storage().nbytes()
+                                )
+                                if rc != 0:
+                                    raise CacheTransferError(
+                                        "Snapshot staged buffer registration failed"
+                                    )
+                                registered.append(ptr)
+                        elif optional or owned:
                             for value in pair:
                                 ptr = value.untyped_storage().data_ptr()
                                 if (
@@ -1406,7 +1490,7 @@ class MooncakeBackend(prep.Block0PreparationCache):
                         self._import_object(self._cond_key(key, artifact), data, key)
                 finally:
                     if not self._release_owned_buffers(
-                        registered, [v for pair in layers for v in pair]
+                        registered, [v for pair in transfer_layers for v in pair] + staged
                     ):
                         raise CacheTransferError(
                             "Snapshot transfer cleanup is unconfirmed"
