@@ -3,6 +3,8 @@ import asyncio
 import json
 import time
 
+import pytest
+
 from sglang.multimodal_gen.runtime.realtime.whitebox.contracts import VideoSpec
 from sglang.multimodal_gen.runtime.realtime.whitebox.player_idle import (
     PlayerIdlePolicy,
@@ -54,7 +56,8 @@ def test_input_before_first_frame_cannot_arm_or_backdate_idle_timer():
     assert activity.is_expired(1060, 60)
 
 
-def test_only_valid_source_frame_arms_idle_timer(tmp_path):
+@pytest.mark.parametrize("late_frame", [False, True])
+def test_only_valid_source_frame_arms_idle_timer(late_frame):
     from types import SimpleNamespace as NS
 
     import pytest
@@ -96,6 +99,12 @@ def test_only_valid_source_frame_arms_idle_timer(tmp_path):
                 await pending
             assert activity.last_input is None
             await queue.put(EngineFrame(0, 0, bytes(spec.frame_bytes), {}))
+            if late_frame:
+                activity.await_first_frame(time.monotonic() - 1)
+                with pytest.raises(ValueError, match="after the startup deadline"):
+                    await RoomRuntime.next_frame(runtime, "s")
+                assert activity.last_input is None and entry["next"] == 0
+                return
             assert (await RoomRuntime.next_frame(runtime, "s"))["index"] == 0
             first = activity.last_input
             assert first is not None
@@ -222,7 +231,29 @@ def test_policy_hot_reload_disable_and_last_good_value(tmp_path):
     assert policy.timeout(35) == 0
 
 
-def test_inactive_player_leaves_without_ending_active_peer(tmp_path):
+def test_startup_deadline_does_not_move_and_late_first_frame_cannot_cancel_it():
+    activity = PlayerInputActivity()
+    activity.await_first_frame(100)
+    activity.touch(70)
+    activity.await_first_frame(160)
+    assert not activity.startup_expired(99.9)
+    assert activity.startup_expired(100)
+    activity.start(100)
+    assert activity.last_input is None
+    assert activity.startup_expired(101)
+
+    ready = PlayerInputActivity()
+    ready.await_first_frame(100)
+    ready.start(75)
+    assert not ready.startup_expired(130)
+    assert not ready.is_expired(134.9, 60)
+    assert ready.is_expired(135, 60)
+
+
+@pytest.mark.parametrize("first_frame_received", [False, True])
+def test_inactive_player_leaves_without_ending_active_peer(
+    tmp_path, first_frame_received
+):
     async def run():
         directory = RoomDirectory(MemoryRoomStore(), {"a": "http://a"})
         game = new_id()
@@ -251,17 +282,21 @@ def test_inactive_player_leaves_without_ending_active_peer(tmp_path):
 
         a, b = await join(), await join()
         try:
-            await runtime.next_frame(a["stream_id"])
             await runtime.next_frame(b["stream_id"])
             first = runtime.players[a["stream_id"]]
-            first["input_activity"].last_input -= 61
-            # Owner/media traffic is fresh; only the input deadline expires.
-            runtime.player(a["stream_id"])
+            if first_frame_received:
+                await runtime.next_frame(a["stream_id"])
+                first["input_activity"].last_input -= 61
+            else:
+                first["input_activity"].await_first_frame(time.monotonic() - 1)
             deadline = time.monotonic() + 4
             while (
                 a["stream_id"] not in runtime.member_retirements
                 and time.monotonic() < deadline
             ):
+                if a["stream_id"] in runtime.players:
+                    # As with relayed control traffic, keep the owner lease fresh.
+                    runtime.player(a["stream_id"])
                 await asyncio.sleep(0.05)
             assert a["stream_id"] in runtime.member_retirements
             assert b["stream_id"] in runtime.players

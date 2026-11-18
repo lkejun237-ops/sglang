@@ -13,6 +13,10 @@ import pytest
 from fastapi import FastAPI
 from whitebox_player_log_test_utils import player_log_capture as player_log_capture
 
+from sglang.multimodal_gen.runtime.realtime.whitebox import room_control_runtime
+from sglang.multimodal_gen.runtime.realtime.whitebox.player_idle import (
+    PlayerInputActivity,
+)
 from sglang.multimodal_gen.runtime.realtime.whitebox.room_control import (
     RoomControlCapabilities,
     install_gateway_room_control,
@@ -364,6 +368,13 @@ def test_runtime_create_query_admission_leave_and_retirement_keep_original_owner
             assert claimed["status"] == "claimed" and claimed["memberId"]
             await invoke(admission)
             assert len(runtime.players) == 1
+            entry = next(iter(runtime.players.values()))
+            activity = entry["input_activity"]
+            assert activity.startup_deadline is None
+            assert activity.last_input is not None
+            admitted_at = activity.last_input
+            await runtime.next_frame(entry["identity"]["stream_id"])
+            assert activity.last_input == admitted_at
             with pytest.raises(ValueError):
                 await control.handle(
                     {**CALLER, "subject": "stranger"},
@@ -386,7 +397,6 @@ def test_runtime_create_query_admission_leave_and_retirement_keep_original_owner
                     "parametersSha256": "c" * 64,
                 },
             )
-            entry = runtime.players[next(iter(runtime.players))]
             original_close = entry["engine"].close
             cleanup_calls = []
             cleanup_started, cleanup_gate = asyncio.Event(), asyncio.Event()
@@ -1612,6 +1622,77 @@ def test_player_log_failure_preserves_member_cleanup(monkeypatch, sink_error):
         assert record["status"] == "blocked"
         assert record["leaving"] is True
         assert cleanup == ["closed"]
+
+    asyncio.run(run())
+
+
+def test_sdk_fallback_preserves_confirmed_input_during_room_startup(monkeypatch):
+    async def run():
+        started = asyncio.Event()
+        fail_media = asyncio.Event()
+
+        async def join(_):
+            pass
+
+        async def start(record):
+            record["media"] = {"status": "starting"}
+            started.set()
+            await fail_media.wait()
+            record["media"] = {
+                "status": "unavailable",
+                "reason": "MEMBER_MEDIA_UNAVAILABLE",
+            }
+
+        admitted_at = 100
+        monkeypatch.setattr(
+            room_control_runtime, "time", SimpleNamespace(monotonic=lambda: admitted_at)
+        )
+        activity = PlayerInputActivity()
+        entry = dict(engine=SimpleNamespace(), input_activity=activity)
+        runtime = SimpleNamespace(
+            join=join,
+            player=lambda *_args, **_kwargs: entry,
+            member_media=SimpleNamespace(
+                bound_compute=False,
+                host=SimpleNamespace(config=SimpleNamespace(startup_seconds=90)),
+                start=start,
+            ),
+        )
+        control = RoomControlRuntime(runtime)
+        record = dict(
+            stream_id="stream",
+            player_id="player",
+            session_id="session",
+            binding=dict(gameId="game"),
+            caller=CALLER,
+            admission=dict(operationId="admit"),
+            spec={},
+            mediaLaunch={},
+        )
+        await control.admit(
+            record, dict(route=dict(world_id="world"), control_caller={})
+        )
+        await started.wait()
+        activity.observe(
+            "controller",
+            "to-sdk",
+            {"type": "input.state", "input": {"sequence": 1, "heldKeys": ["KeyW"]}},
+            admitted_at + 55,
+        )
+        activity.observe(
+            "controller",
+            "from-sdk",
+            {"type": "input.receipt", "clientId": "controller", "clientSequence": 1},
+            admitted_at + 56,
+        )
+        assert activity.last_input is None
+        assert not activity.is_expired(admitted_at + 61, 60)
+
+        fail_media.set()
+        await control.drain()
+        assert activity.last_input == admitted_at + 55
+        assert not activity.is_expired(admitted_at + 61, 60)
+        assert activity.is_expired(admitted_at + 115, 60)
 
     asyncio.run(run())
 

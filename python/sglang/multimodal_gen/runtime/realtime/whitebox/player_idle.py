@@ -52,6 +52,8 @@ def meaningful_input(value):
 
 class PlayerInputActivity:
     def __init__(self):
+        self.startup_deadline = None
+        self._startup_confirmed_input = None
         self.last_input = None
         self.expired = False
         self.pending = {}
@@ -59,15 +61,41 @@ class PlayerInputActivity:
         self.waiting = None
         self.semantic_bindings = {}
 
+    def await_first_frame(self, deadline):
+        if self.startup_deadline is None:
+            self.startup_deadline = deadline
+
+    def startup_expired(self, now):
+        return (
+            self.last_input is None
+            and self.startup_deadline is not None
+            and now >= self.startup_deadline
+        )
+
     def start(self, now):
-        if self.last_input is None:
+        if self.last_input is None and not self.startup_expired(now):
             self.last_input = now
+
+    def start_sdk_fallback(self, admitted_at):
+        self.start(max(admitted_at, self._startup_confirmed_input or admitted_at))
 
     def touch(self, now):
         # Input can arrive while the source is still preparing. Only a valid
         # source frame arms inactivity; early input must not start that clock.
         if not self.expired and self.last_input is not None:
             self.last_input = max(self.last_input, now)
+
+    def _confirm_input(self, now):
+        if (
+            self.last_input is None
+            and self.startup_deadline is not None
+            and now < self.startup_deadline
+        ):
+            # SDK playback can already be interactive during Room startup.
+            self._startup_confirmed_input = max(
+                now, self._startup_confirmed_input or now
+            )
+        self.touch(now)
 
     def is_expired(self, now, timeout):
         if (
@@ -162,7 +190,7 @@ class PlayerInputActivity:
         if pending is not None and pending[1] == message["stateRevision"]:
             del self.pending[key]
             if message["meaningful"]:
-                self.touch(
+                self._confirm_input(
                     pending[0]
                 )  # Correlated original send time, never late receipt time.
 
@@ -216,4 +244,4 @@ class PlayerInputActivity:
                 if old[:2] == key[:2] and old[2] < key[2]:
                     del self.pending[old]
         if active:
-            self.touch(received)  # A delayed/replayed receipt cannot buy more time.
+            self._confirm_input(received)  # Delayed/replayed receipts do not buy time.

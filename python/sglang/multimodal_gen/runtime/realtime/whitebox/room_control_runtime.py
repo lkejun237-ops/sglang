@@ -288,16 +288,32 @@ class RoomControlRuntime:
             if not isinstance(record["member_id"], str) or not record["member_id"]:
                 raise ValueError("The member identity is unavailable")
             if not record.get("leaving"):
+                activity = entry["input_activity"]
+                admitted_at = time.monotonic()
                 record["status"] = "claimed"
-                entry["input_activity"].start(time.monotonic())
-                if record.get("mediaLaunch") is not None:
-                    owner = getattr(runtime, "member_media", None)
-                    if owner is None:
+                media_launch = record.get("mediaLaunch")
+                owner = getattr(runtime, "member_media", None)
+                if media_launch is not None and owner is not None:
+                    activity.await_first_frame(
+                        admitted_at + owner.host.config.startup_seconds
+                    )
+
+                    async def start_media():
+                        await owner.start(record)
+                        if (
+                            record.get("status") == "claimed"
+                            and not record.get("leaving")
+                            and record.get("media", {}).get("status") == "unavailable"
+                        ):
+                            activity.start_sdk_fallback(admitted_at)
+
+                    record["media_task"] = self.dispatch(start_media())
+                else:
+                    activity.start(admitted_at)
+                    if media_launch is not None:
                         record["media"] = dict(
                             status="unavailable", reason="MEMBER_MEDIA_UNAVAILABLE"
                         )
-                    else:
-                        record["media_task"] = self.dispatch(owner.start(record))
         except BaseException as error:
             log_player_failure(
                 "member.admit",

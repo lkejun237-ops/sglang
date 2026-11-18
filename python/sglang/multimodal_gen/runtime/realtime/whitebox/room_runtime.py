@@ -627,10 +627,16 @@ class RoomRuntime:
                 or frame.pts_us != spec.pts(frame.index)
             ):
                 raise ValueError("The world returned an invalid video frame")
-            entry["next"] += 1
-            entry["input_activity"].start(time.monotonic())
             if self.players.get(stream_id) is not entry:
                 raise ValueError("The player has left the game")
+            activity = entry["input_activity"]
+            now = time.monotonic()
+            if activity.startup_expired(now):
+                raise ValueError(
+                    "The first source frame arrived after the startup deadline"
+                )
+            entry["next"] += 1
+            activity.start(now)
             if entry["engine"].renderer.metadata.get("mode") != "browser":
                 entry["pending"][frame.index] = frame
             room = self.rooms[entry["game_id"]]
@@ -999,7 +1005,8 @@ class RoomRuntime:
                     # A heartbeat during that interval is not owner loss.
                     entry = self.players.get(stream_id)
                     if entry is not None and (
-                        (
+                        entry["input_activity"].startup_expired(time.monotonic())
+                        or (
                             not entry.get("explicit_source_owner")
                             and self.input_idle_expired(entry)
                         )
