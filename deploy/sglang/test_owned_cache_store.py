@@ -39,6 +39,8 @@ def test_owned_store_waits_for_its_receipt_and_reaps_only_its_child(
         assert argv[1] == str(tmp_path / "deploy/whitebox/cache_store.py")
         assert kwargs["start_new_session"] is True
         assert kwargs["cwd"] == tmp_path
+        assert kwargs["env"]["MC_STORE_PIN_MEMORY_MAX_BYTES"] == str(128 << 20)
+        assert kwargs["env"]["MC_STORE_MEMCPY"] == "0"
         (tmp_path / "store-ready.json").write_text(
             json.dumps(
                 dict(
