@@ -78,7 +78,7 @@ def put_bytes(client, bucket, key, data, content_type):
 class StreamingData:
     """Worker-only state. Its directory is a logical recording ID, never a file."""
 
-    def __init__(self, client, config, kwargs, manifest, settings):
+    def __init__(self, client, config, kwargs, manifest, settings, *, on_rgb_read=None):
         self.client, self.config, self.settings = client, config, settings
         self.spec = kwargs["spec"]
         self.model_spec = kwargs.get("model_spec", self.spec)
@@ -120,7 +120,10 @@ class StreamingData:
             from .archive_video import IndependentArchiveVideos
 
             self.independent = IndependentArchiveVideos(
-                self, kwargs["archive_encoding"], kwargs.get("source_only", False)
+                self,
+                kwargs["archive_encoding"],
+                kwargs.get("source_only", False),
+                on_rgb_read=on_rgb_read,
             )
             self.reference_executor = ThreadPoolExecutor(max_workers=1)
         for i, ref in enumerate(kwargs["references"]):
@@ -488,7 +491,14 @@ def streaming_worker(
     data = None
     try:
         client = s3_client(config)
-        data = StreamingData(client, config, kwargs, manifest, settings)
+        data = StreamingData(
+            client,
+            config,
+            kwargs,
+            manifest,
+            settings,
+            on_rgb_read=lambda descriptor: replies.put(("rgb_copied", descriptor)),
+        )
         replies.put(("boot", {}))
         while True:
             kind, value = commands.get()

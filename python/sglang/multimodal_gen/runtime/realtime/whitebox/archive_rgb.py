@@ -93,8 +93,9 @@ class RGBSlots:
 
 
 class RGBReader:
-    def __init__(self, frame_bytes):
+    def __init__(self, frame_bytes, *, on_read=None):
         self.frame_bytes = frame_bytes
+        self.on_read = on_read
         self.buffers = {}
         self.serials = {}
 
@@ -131,8 +132,11 @@ class RGBReader:
             raise ValueError("Archive RGB worker generation changed")
         self.serials[name] = serial
         start = slot * self.frame_bytes
-        # One bounded copy belongs to the codec's retained VFR input.
-        return bytes(memory.buf[start : start + self.frame_bytes])
+        # The codec uses this private copy, so the producer can reuse the slot.
+        rgb = bytes(memory.buf[start : start + self.frame_bytes])
+        if self.on_read is not None:
+            self.on_read(descriptor)
+        return rgb
 
     def close(self):
         for _, memory in self.buffers.values():

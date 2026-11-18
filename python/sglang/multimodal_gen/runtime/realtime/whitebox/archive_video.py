@@ -11,14 +11,14 @@ from .contracts import presentation_pts
 
 
 class IndependentArchiveVideos:
-    def __init__(self, data, config, source_only):
+    def __init__(self, data, config, source_only, *, on_rgb_read=None):
         self.data, self.config, self.source_only = data, config, source_only
-        self.reader = RGBReader(data.spec.frame_bytes)
+        self.reader = RGBReader(data.spec.frame_bytes, on_read=on_rgb_read)
         self.model_spec = getattr(data, "model_spec", data.spec)
         self.model_reader = (
             self.reader
             if self.model_spec == data.spec
-            else RGBReader(self.model_spec.frame_bytes)
+            else RGBReader(self.model_spec.frame_bytes, on_read=on_rgb_read)
         )
         names = ("whitebox",) if source_only else ("whitebox", "model")
         self.codecs = {}

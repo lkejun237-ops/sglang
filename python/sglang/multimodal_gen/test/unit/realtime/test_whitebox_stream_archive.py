@@ -6,8 +6,10 @@ import copy
 import hashlib
 import io
 import json
+import multiprocessing
 import threading
 import time
+from functools import partial
 from types import SimpleNamespace
 
 import av
@@ -26,6 +28,7 @@ from sglang.multimodal_gen.runtime.realtime.whitebox.stream_archive import (
 from sglang.multimodal_gen.runtime.realtime.whitebox.stream_recording import (
     STORAGE,
     StreamingData,
+    streaming_worker,
 )
 from sglang.multimodal_gen.runtime.realtime.whitebox.stream_upload import (
     MultipartObject,
@@ -954,6 +957,87 @@ def test_failure_notice_reconciles_a_committed_manifest_before_overwriting(tmp_p
             == "complete"
         )
         await manager.close()
+
+    asyncio.run(run())
+
+
+def _archive_worker_with_paused_first_encode(resume, fail_encode, *args):
+    from sglang.multimodal_gen.runtime.realtime.whitebox.archive_encoder import (
+        ArchiveVideoEncoder,
+    )
+
+    push = ArchiveVideoEncoder.push
+
+    def paused_push(codec, index, rgb, pts_us):
+        if index == 0:
+            assert resume.wait(5), "Parent did not reuse the copied RGB slot"
+            assert rgb == bytes([70]) * codec.spec.frame_bytes
+            if fail_encode:
+                raise ValueError("Injected encode failure")
+        return push(codec, index, rgb, pts_us)
+
+    ArchiveVideoEncoder.push = paused_push
+    streaming_worker(*args)
+
+
+@pytest.mark.parametrize("fail_encode", [False, True])
+def test_rgb_slot_can_be_reused_before_encoding_completes(
+    tmp_path, local_s3, fail_encode
+):
+    from sglang.multimodal_gen.runtime.realtime.whitebox.recording import S3ArchiveStore
+    from sglang.multimodal_gen.runtime.realtime.whitebox.session import WhiteboxConfig
+
+    _, endpoint = local_s3
+
+    async def run():
+        resume = multiprocessing.get_context("spawn").Event()
+        kwargs, _ = await prototype(tmp_path, source=True)
+        kwargs["archive_encoding"] = WhiteboxConfig(
+            None, None, tmp_path
+        ).archive_encoding
+        spec = kwargs["spec"]
+        manager = StreamingArchiveManager(
+            S3ArchiveStore("bucket", endpoint, "ap-southeast-7"),
+            index_prefix="test",
+        )
+        manager.worker_target = partial(
+            _archive_worker_with_paused_first_encode, resume, fail_encode
+        )
+        try:
+            recording = await manager.create_recording(**kwargs)
+            await recording.prepare_raw()
+            recording.manifest.update(recording_kind="source", rendering={})
+            pool = recording.rgb_slots["whitebox"]
+            first = EngineFrame(0, 0, bytes([70]) * spec.frame_bytes, {})
+            assert recording.source_rgb(first)
+            async with asyncio.timeout(3):
+                while pool.leases:
+                    assert not recording.failure, recording.failure
+                    await asyncio.sleep(0.01)
+            assert recording.pending is not None
+            # Fill the pool so the last offer reuses the first frame's slot.
+            # The child checks the original pixels when its encode resumes.
+            for i in range(1, pool.frames + 1):
+                assert recording.source_rgb(
+                    EngineFrame(i, spec.pts(i), bytes(spec.frame_bytes), {})
+                )
+            resume.set()
+            await asyncio.wait_for(recording.finish("completed"), 10)
+            if fail_encode:
+                assert recording.failure == "STREAM_UPLOAD_FAILED"
+                assert recording.manifest["recording_status"] == "failed"
+            else:
+                assert not recording.failure, recording.failure
+                assert recording.manifest["recording_status"] == "complete"
+                assert (
+                    recording.manifest["videos"]["whitebox"]["frames"]
+                    == pool.frames + 1
+                )
+            assert manager.rgb_budget.used == 0
+            assert not recording.process.is_alive()
+        finally:
+            resume.set()
+            await manager.close()
 
     asyncio.run(run())
 

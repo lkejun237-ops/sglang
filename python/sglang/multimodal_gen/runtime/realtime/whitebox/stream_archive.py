@@ -186,10 +186,12 @@ class StreamingRecording(AsyncRecording):
             "model", "model_rgb", rgb, lambda d: (archived, d, prompt)
         )
 
-    def _release_rgb(self, kind, value):
+    def _release_rgb(self, kind, value, receipt):
         if kind not in ("source_rgb", "selected_source_rgb", "model_rgb"):
-            return
+            raise RuntimeError("Unexpected archive RGB receipt")
         descriptor = value[-1] if kind == "selected_source_rgb" else value[1]
+        if receipt != descriptor:
+            raise RuntimeError("Archive RGB receipt does not match pending frame")
         lane = "model" if kind == "model_rgb" else "whitebox"
         self.rgb_slots[lane].release(descriptor)
 
@@ -408,11 +410,8 @@ class StreamingRecording(AsyncRecording):
                 else:
                     item = self.pending = self.items.popleft()
                 queued, size, kind, value = item
-                age_limit = (
-                    1.0
-                    if kind in ("source_rgb", "selected_source_rgb", "model_rgb")
-                    else self.manager.max_age
-                )
+                is_rgb = kind in ("source_rgb", "selected_source_rgb", "model_rgb")
+                age_limit = 1.0 if is_rgb else self.manager.max_age
                 if time.monotonic() - queued > age_limit:
                     if optional:
                         self.timing_bytes -= size
@@ -420,11 +419,19 @@ class StreamingRecording(AsyncRecording):
                         continue
                     raise TimeoutError("Archive queue expired")
                 commands.put_nowait((kind, value))
+                deadline = time.monotonic() + self.manager.max_age
                 reply, result = await self._reply(replies, self.manager.max_age)
+                if reply == "rgb_copied":
+                    # Release shared memory now, keeping the command pending until ACK.
+                    self._release_rgb(kind, value, result)
+                    reply, result = await self._reply(
+                        replies, max(0, deadline - time.monotonic())
+                    )
+                elif is_rgb and reply == "ack":
+                    raise RuntimeError("Missing archive RGB receipt")
                 if reply != "ack":
                     self.worker_failed(result)
                     raise RuntimeError("Archive upload failed")
-                self._release_rgb(kind, value)
                 for codec, milliseconds in result.get("encoding_ms", {}).items():
                     observe_duration(
                         "archive_" + codec + "_encode", milliseconds, self.trace_id
