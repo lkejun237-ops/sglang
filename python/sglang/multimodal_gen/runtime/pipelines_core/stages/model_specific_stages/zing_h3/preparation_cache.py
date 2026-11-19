@@ -30,6 +30,8 @@ from .storage_payload import serialization_bound
 
 logger = init_logger(__name__)
 
+CACHE_KEY_SCHEMA = "world-condition-g4"
+
 
 def preparation_request(codecs, request):
     """Freeze accepted media contents once; prompt updates reuse these contents."""
@@ -118,7 +120,7 @@ def preparation_identity(codecs, request, preview, config, identity):
         # the cached S0. The actual S0 remains input/recording evidence, not a
         # pixel-equality gate. Model/layout and all other conditions still match.
         identity.update(
-            scope="world-block0-v1" if world_scoped else "world-pixel-block0-v1",
+            scope="world-block0-v2" if world_scoped else "world-pixel-block0-v2",
             world_id=world_id,
         )
     if world_id is None or not world_scoped:
@@ -1065,6 +1067,8 @@ class LocalPagedBackend(Block0PreparationCache):
             "sp_world_size": disk.sp_world_size,
             "geometry": _block0_geometry(entry),
             "prompt_preview": _prompt_preview(entry.request),
+            "cache_key_schema": CACHE_KEY_SCHEMA,
+            "condition_fingerprint": entry.key,
         }
         if disk.budget is not None:
             from .block0_conditions import encode_conditions

@@ -466,10 +466,28 @@ def test_native_group_spans_ranks_and_business_bindings():
         a.register(KEY, "game-b", "group-b")
         assert len(store.objects) == 7  # 3 layers, conditions, manifest, 2 labels
         assert set(store.groups.values()) == {a._base(KEY)}
-        assert ":g3:" in a._namespace
+        assert ":g4:" in a._namespace
     finally:
         a.close()
         b.close()
+
+
+def test_manifest_records_world_condition_identity_and_rejects_mismatch():
+    backend, cache, store = provider()
+    try:
+        backend.bind_world(KEY, "interactive-production/world-a")
+        assert write(backend, cache) is not None
+        manifest_key = backend._manifest_key(KEY)
+        manifest = json.loads(store.get(manifest_key))
+        assert manifest["cache_key_schema"] == prep.CACHE_KEY_SCHEMA
+        assert manifest["condition_fingerprint"] == KEY
+        assert manifest["world_id"] == "interactive-production/world-a"
+
+        manifest["condition_fingerprint"] = OTHER
+        store.objects[manifest_key] = json.dumps(manifest).encode()
+        assert backend.lookup(KEY) is None
+    finally:
+        backend.close()
 
 
 @pytest.mark.parametrize("index_first", [False, True])

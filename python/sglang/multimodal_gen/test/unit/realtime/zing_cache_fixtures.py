@@ -127,6 +127,8 @@ def disk_commit(
         "sp_world_size": cache.sp_world_size,
         "geometry": {"prefix_rows": rows},
         "prompt_preview": f"prompt-{key}",
+        "cache_key_schema": "world-condition-g4",
+        "condition_fingerprint": key,
     }
     entry = cache.commit_entry(
         key, conditions, manifest, {rank: path}, tmp, force=force

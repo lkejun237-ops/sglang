@@ -149,7 +149,7 @@ class MooncakeBackend(prep.Block0PreparationCache):
             )
         # Existing objects cannot acquire group membership retroactively. Keep
         # grouped entries separate from the original ungrouped wire format.
-        self._namespace += ":g3:" + fingerprint(self.identity)
+        self._namespace += ":g4:" + fingerprint(self.identity)
         self._http = config.get("master_http_url", "").rstrip("/")
         self._http_timeout = float(config.get("metadata_timeout_s", 5))
         if not 0 < self._http_timeout <= 60:
@@ -485,6 +485,9 @@ class MooncakeBackend(prep.Block0PreparationCache):
         if (
             native.get("identity") != self.identity
             or native.get("sp_world_size") != self.world_size
+            or native.get("cache_key_schema") != prep.CACHE_KEY_SCHEMA
+            or native.get("condition_fingerprint") != key
+            or native.get("world_id") != world
         ):
             return None
         native = self.archive.restore(
@@ -890,6 +893,9 @@ class MooncakeBackend(prep.Block0PreparationCache):
             else "zing-block0-mooncake-v4",
             kv_encoding=entry.data.encoding,
             artifact_id=entry.data.artifact_id,
+            cache_key_schema=prep.CACHE_KEY_SCHEMA,
+            condition_fingerprint=entry.key,
+            world_id=self._worlds.get(entry.key),
             baseline_s0_sha256=entry.baseline_s0_sha256,
             identity=self.identity,
             sp_world_size=self.world_size,
@@ -928,6 +934,12 @@ class MooncakeBackend(prep.Block0PreparationCache):
                 else "zing-block0-mooncake-v4"
             )
             or manifest.get("kv_encoding", kv_codec.BF16) != self.kv_encoding
+            or manifest.get("cache_key_schema") != prep.CACHE_KEY_SCHEMA
+            or manifest.get("condition_fingerprint") != key
+            or (
+                key in self._worlds
+                and manifest.get("world_id") != self._worlds[key]
+            )
             or manifest.get("identity") != self.identity
             or manifest.get("sp_world_size") != self.world_size
             or type(rows) is not int

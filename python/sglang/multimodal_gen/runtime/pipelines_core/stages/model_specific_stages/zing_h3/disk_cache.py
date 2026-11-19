@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.utils.shared_capacity import CapacityUnavaila
 
 from .block0_conditions import CONDITIONS_SCHEMA, decode_conditions, encode_conditions
 from .block0_identity import SCHEMA
+from .preparation_cache import CACHE_KEY_SCHEMA
 from .cache_logging import cache_event, cache_scope
 from .paged_kv import kv_slices
 from .storage_budget import StorageBudget, tree_bytes
@@ -260,6 +261,8 @@ class Block0DiskCache:
                 and self.identity is not None
                 and manifest.get("identity") != self.identity
             )
+            or manifest.get("cache_key_schema") != CACHE_KEY_SCHEMA
+            or manifest.get("condition_fingerprint") != key
         ):
             return None
         if not isinstance(manifest.get("identity"), dict):
@@ -454,7 +457,14 @@ class Block0DiskCache:
             # there is no read/modify/write merge of rank metadata.
             value = {
                 name: manifest[name]
-                for name in ("identity", "sp_world_size", "geometry", "prompt_preview")
+                for name in (
+                    "identity",
+                    "sp_world_size",
+                    "geometry",
+                    "prompt_preview",
+                    "cache_key_schema",
+                    "condition_fingerprint",
+                )
             }
             value.update(schema=SCHEMA, disk_format=DISK_FORMAT, early_key=key)
             _dump_json(folder / "manifest.json", value)
