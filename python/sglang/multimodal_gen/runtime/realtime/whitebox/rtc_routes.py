@@ -99,6 +99,13 @@ class RTCRenderPipeline(RenderPipeline):
         sub.stop("DISCONNECTED")
         if self.subscription is not sub:
             return
+        inference = getattr(self.session, "inference", None)
+        if (
+            getattr(inference, "initial_requested", False)
+            and inference.initial_request_id is None
+        ):
+            self.session._model_transport_ready = False
+            inference.media_ready.clear()
         self.subscription = None
         if self.retention:
             self.retention.cancel()

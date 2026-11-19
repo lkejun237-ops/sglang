@@ -71,6 +71,10 @@ async def open_startup_engine(factory, kwargs, timeout):
 def model_transport_ready(owner):
     """Keep readiness when managed preparation predates its model segment."""
     owner._model_transport_ready = True
+    inference = getattr(owner, "inference", None)
+    media_ready = getattr(inference, "media_ready", None)
+    if media_ready is not None:
+        media_ready.set()
     candidates = (
         getattr(owner, "startup", None),
         getattr(getattr(owner, "inference", None), "preparation", None),
@@ -362,6 +366,8 @@ class PlayStartup:
                 getattr(self.owner, "journal", None), "detailed_timing_default", False
             ),
         )
+        if getattr(self.owner, "return_stage_timing", False):
+            self.init.update(return_stage_timing=True, detailed_timing=True)
         source = init["source_stream"]
         self.geometry = ModelGeometry(
             VideoSpec(source["width"], source["height"], source["fps"]),

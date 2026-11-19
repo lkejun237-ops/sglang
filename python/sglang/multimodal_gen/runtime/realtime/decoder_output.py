@@ -263,7 +263,8 @@ class DecoderOutputBroker:
                 await ws.send_bytes(
                     msgspec.msgpack.encode(dict(type="output.ready", **identity))
                 )
-                last_decoder_timing = None
+                last_decoder_timing = {}
+                last_decoder_range = None
                 while True:
                     await send_timings()
                     try:
@@ -285,21 +286,26 @@ class DecoderOutputBroker:
                     if item["type"] == "decoder.timing":
                         if not config.get("return_stage_timing", False):
                             continue
-                        dec_info = last_decoder_timing or {}
-                        last_decoder_timing = None
+                        output_range = (
+                            item.get("chunk_index"),
+                            item.get("output_frame_start"),
+                            item.get("num_frames"),
+                        )
+                        dec_info = (
+                            last_decoder_timing
+                            if output_range == last_decoder_range
+                            else {}
+                        )
                         dec_stage = {
-                            "wait_ms": round(
-                                max(0.0, float(dec_info.get("wait_ms", 0.0))), 3
-                            ),
-                            "process_ms": round(
-                                max(0.0, float(dec_info.get("process_ms", 0.0))), 3
-                            ),
-                            "return_ms": round(
-                                max(0.0, float(dec_info.get("return_ms", 0.0))), 3
-                            ),
+                            key: round(value, 3)
+                            for key, value in dec_info.items()
+                            if key in {"wait_ms", "process_ms", "return_ms"}
                         }
                         frames_breakdown = [
-                            dict(entry, decoder=dict(dec_stage))
+                            dict(
+                                entry,
+                                **({"decoder": dict(dec_stage)} if dec_stage else {}),
+                            )
                             for entry in (item.get("frame_stage_breakdown") or ())
                             if isinstance(entry, dict)
                         ]
@@ -309,7 +315,10 @@ class DecoderOutputBroker:
                         summary = {}
                         if frames_breakdown:
                             for role in ("encoder", "dit", "decoder"):
-                                for metric in ("wait_ms", "process_ms", "return_ms"):
+                                metrics = ("wait_ms", "process_ms", "return_ms")
+                                if role == "dit":
+                                    metrics += ("scheduler_wait_ms",)
+                                for metric in metrics:
                                     vals = [
                                         float(row[role][metric])
                                         for row in frames_breakdown
@@ -335,6 +344,11 @@ class DecoderOutputBroker:
                                     output_frame_start=item.get("output_frame_start"),
                                     num_frames=num_frames,
                                     frame_stage_breakdown=frames_breakdown,
+                                    **(
+                                        {"decoder_timing_range_verified": True}
+                                        if dec_stage
+                                        else {}
+                                    ),
                                     **summary,
                                 )
                             )
@@ -405,28 +419,26 @@ class DecoderOutputBroker:
                         + stats_dict.get("msgpack_encode_ms", 0.0)
                     )
                     write_ms = float(stats_dict.get("ws_send_ms", 0.0))
+                    last_decoder_range = (
+                        meta.get("block_idx"),
+                        meta["output_frame_start"],
+                        meta["num_frames"],
+                    )
+                    last_decoder_timing = {
+                        "transport_encode_ms": max(0.0, encode_ms),
+                        "transport_write_ms": max(0.0, write_ms),
+                    }
                     if isinstance(tstate, dict):
+                        last_decoder_timing.update(
+                            {
+                                key: max(0.0, float(tstate[key]))
+                                for key in ("wait_ms", "process_ms")
+                                if type(tstate.get(key)) in (int, float)
+                            }
+                        )
                         done_ns = tstate.get("done_mono_ns")
-                        ret_ms = (
-                            max(0.0, (sent_ns - done_ns) / 1e6)
-                            if type(done_ns) is int
-                            else max(0.0, encode_ms + write_ms)
-                        )
-                        last_decoder_timing = dict(
-                            wait_ms=max(0.0, float(tstate.get("wait_ms", 0.0))),
-                            process_ms=max(0.0, float(tstate.get("process_ms", 0.0))),
-                            return_ms=ret_ms,
-                            transport_encode_ms=max(0.0, encode_ms),
-                            transport_write_ms=max(0.0, write_ms),
-                        )
-                    else:
-                        last_decoder_timing = dict(
-                            wait_ms=0.0,
-                            process_ms=0.0,
-                            return_ms=max(0.0, encode_ms + write_ms),
-                            transport_encode_ms=max(0.0, encode_ms),
-                            transport_write_ms=max(0.0, write_ms),
-                        )
+                        if type(done_ns) is int and 0 <= done_ns <= sent_ns:
+                            last_decoder_timing["return_ms"] = (sent_ns - done_ns) / 1e6
 
             try:
                 message = msgspec.msgpack.decode(

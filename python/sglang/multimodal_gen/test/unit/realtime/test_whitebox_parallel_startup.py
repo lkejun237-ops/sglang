@@ -1561,3 +1561,173 @@ def test_closed_source_cannot_start_a_late_queued_preparation(monkeypatch):
         assert source.inference.preparation is None
 
     asyncio.run(run())
+
+
+def test_managed_preparation_seals_stage_timing_on_the_model_init(monkeypatch):
+    async def run():
+        source, lease, task, entered, finish = await managed_source(monkeypatch)
+        source.return_stage_timing = True
+        source.journal.detailed_timing_default = False
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            await asyncio.wait_for(lease.ws.preparing.wait(), 1)
+            assert lease.ws.commands[0]["return_stage_timing"] is True
+            assert lease.ws.commands[0]["detailed_timing"] is True
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await source.inference.close()
+            await source.model_binding.close()
+
+    asyncio.run(run())
+
+
+def test_room_stage_timing_requires_observed_chunk_and_explicit_frame_indexes():
+    from sglang.multimodal_gen.runtime.realtime.whitebox.telemetry import (
+        ModelStageTiming,
+    )
+
+    manifest = {}
+    archive = ModelStageTiming(manifest, 1, ("session", "generation"))
+    archive.observe_output(3, 1, 2)
+    archive.observe_output(4, 2, 2)
+    archive.observe_output(6, 3, 3)
+    first = {"output_frame": 3, "dit": {"scheduler_wait_ms": 21.0}}
+    second = {"output_frame": 4, "encoder": {"process_ms": 1.25}}
+    third = {"output_frame": 5, "decoder": {"process_ms": 2.0}}
+    message = dict(
+        session_id="session",
+        generation_id="generation",
+        output_frame_start=3,
+        chunk_index=2,
+        num_frames=3,
+        decoder_timing_range_verified=True,
+        frame_stage_breakdown=[first, second, third],
+    )
+    assert archive.receive(dict(message, chunk_index=3)) == []
+    assert archive.receive(dict(message, generation_id="retired")) == []
+    assert (
+        archive.receive(dict(message, num_frames=1, frame_stage_breakdown=[first]))
+        == []
+    )
+    implicit = dict(
+        message, frame_stage_breakdown=[{"dit": first["dit"]}, second, third]
+    )
+    assert archive.receive(implicit) == []
+    rows = archive.receive(message)
+    assert rows == [
+        dict(item, model_epoch=1, chunk_index=2) for item in [first, second, third]
+    ]
+    assert manifest["frame_stage_breakdown"] == rows
+    assert manifest["model_stage_timing"]["output_frames"] == 9
+    assert manifest["model_stage_timing"]["retained_frames"] == 3
+    assert archive.receive(message) == []
+    changed = dict(
+        message,
+        frame_stage_breakdown=[
+            dict(first, dit={"scheduler_wait_ms": 3.2}),
+            second,
+            third,
+        ],
+    )
+    assert archive.receive(changed) == []
+    assert manifest["frame_stage_breakdown"] == []
+    assert manifest["model_stage_timing"]["retained_frames"] == 0
+    assert archive.receive(message) == []
+
+
+@pytest.mark.parametrize("indent", [None, 2])
+def test_manifest_budget_trims_only_optional_stage_timing(indent):
+    import json
+
+    from sglang.multimodal_gen.runtime.realtime.whitebox.recording import manifest_json
+
+    coverage = dict(
+        schema_version=1,
+        requested=True,
+        output_frames=16,
+        retained_frames=16,
+        truncated=False,
+    )
+    rows = [
+        dict(output_frame=i, model_epoch=0, chunk_index=i, dit={"process_ms": 149.125})
+        for i in range(16)
+    ]
+    metadata = "雪" * ((1 << 20) // 3 - 160)
+    manifest = dict(
+        world=metadata,
+        model_stage_timing=coverage,
+        frame_stage_breakdown=rows,
+    )
+
+    encoded = manifest_json(manifest, indent=indent).encode()
+    assert len(encoded) <= 1 << 20
+    saved = json.loads(encoded)
+    assert saved["world"] == metadata
+    retained = saved["model_stage_timing"]
+    assert retained["truncated"] and retained["output_frames"] == 16
+    assert 0 < retained["retained_frames"] < 16
+    assert saved["frame_stage_breakdown"] == rows[: retained["retained_frames"]]
+
+
+@pytest.mark.parametrize("indent", [None, 2])
+@pytest.mark.parametrize("row_count", [0, 1])
+@pytest.mark.parametrize("base_fits", [False, True])
+def test_manifest_budget_omits_optional_metadata_when_marker_does_not_fit(
+    indent, row_count, base_fits
+):
+    import json
+
+    from sglang.multimodal_gen.runtime.realtime.whitebox.recording import manifest_json
+
+    base = {"world": "a" * ((1 << 20) - (30 if base_fits else 0))}
+    original = manifest_json(base, indent=indent)
+    assert (len(original.encode()) <= 1 << 20) is base_fits
+    manifest = dict(
+        base,
+        model_stage_timing=dict(
+            schema_version=1,
+            requested=True,
+            output_frames=1,
+            retained_frames=row_count,
+            truncated=False,
+        ),
+        frame_stage_breakdown=[{"output_frame": 0}] * row_count,
+    )
+    assert manifest_json(manifest, indent=indent) == original
+    assert json.loads(original) == base
+
+
+@pytest.mark.parametrize("proof", [None, False, 1, True])
+def test_stage_archive_preserves_dit_from_legacy_decoder_but_requires_decoder_proof(
+    proof,
+):
+    from sglang.multimodal_gen.runtime.realtime.whitebox.telemetry import (
+        ModelStageTiming,
+    )
+
+    manifest = {}
+    archive = ModelStageTiming(manifest, 0, ("session", "generation"))
+    archive.observe_output(0, 1, 2)
+    message = dict(
+        session_id="session",
+        generation_id="generation",
+        output_frame_start=0,
+        num_frames=1,
+        chunk_index=2,
+        frame_stage_breakdown=[
+            {
+                "output_frame": 0,
+                "encoder": {"process_ms": 7.0},
+                "dit": {"scheduler_wait_ms": 21.0},
+                "decoder": {"process_ms": 0.0},
+            },
+        ],
+    )
+    if proof is not None:
+        message["decoder_timing_range_verified"] = proof
+    (row,) = archive.receive(message)
+    assert row["encoder"] == {"process_ms": 7.0}
+    assert row["dit"] == {"scheduler_wait_ms": 21.0}
+    assert ("decoder" in row) is (proof is True)
+    assert manifest["frame_stage_breakdown"] == [row]

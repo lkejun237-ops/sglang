@@ -285,6 +285,7 @@ def test_zing_contracts_and_telemetry_match_frozen_golden_vectors():
         "encoder_process_ms",
         "encoder_return_ms",
         "dit_wait_ms",
+        "dit_scheduler_wait_ms",
         "dit_process_ms",
         "dit_return_ms",
         "decoder_wait_ms",

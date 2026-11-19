@@ -94,6 +94,23 @@ CUDA event 的 `record` 是异步入流，但仍有记录和消息处理开销�
 Encoder 将已有发送前 stream 同步前移并用标记避免重复。具体成本须以同条件 GPU A/B 为准，
 不能从“没有新增入口同步”推导为“零开销”。该字段也启用既有 stage timing，A/B 代表整个开关的成本。
 
+## 从默认 Game Player 采集
+
+WTP 在签名的单人启动请求内将 `return_stage_timing: true` 放入 frozen msgpack init。
+Room 只为该 source 开启阶段采集。预准备与普通渲染沿用同一选择。
+浏览器重连不会变更它。省略字段或设为 `false` 沿用普通启动。
+
+分段归档的 `manifest.json` 记录 `model_stage_timing`，版本为 1。
+`output_frames` 是 Room 收到的原始 RGB 帧数。
+`retained_frames` 是已归档的阶段行数。`truncated` 表示帧数或字节限制裁剪了行。
+每行 `frame_stage_breakdown` 用 `model_epoch` 和 `output_frame`
+匹配 `states.jsonl` 的 `source.model_epoch` 和 `source.model_source_frame`。
+同一 `chunk_index` 内的帧可共享耗时。未采集的字段缺省。
+旧 Worker 可能只回部分阶段，或完全没有计时行。
+旧 Decoder 能传递 Encoder 和 DiT 计时。Room 仅归档带批次匹配回执的 Decoder 字段。
+Room 用 `source.model_timing.raw_output_elapsed_ms` 标记每批 RGB 的到达时刻。
+这个时刻以本次 Room generation 开始为零点，可求相邻原始输出批次的间隔。
+
 ## 隔离 GPU A/B 复现
 
 `latency_breakdown_gpu_ab.py` 复用原成功 B300 作业的 E1+DiT SP2+D1 启动配置，
@@ -143,11 +160,12 @@ Encoder `return_ms` 从生产者提交发送起计至 DiT 接收完成，包含�
 | `encoder.process_ms` | 本轮开始至 `encoder.pop()` 的生产者 CUDA stream 完成，减去本轮之前 `send_dit` 调用的耗时；包括 Host 准备、拷贝与实际编码，发生 conditioning 时也包含它。不是纯 VAE kernel 时间；一轮多个 pop 时是截至当前 pop 的累计区间。 |
 | `encoder.return_ms` | 提交发送至 DiT I/O 线程完成接收，包含 outbox、传输及接收背压；要求两端 clock domain 一致。 |
 | `dit.wait_ms` | DiT 开始执行减去该 latent 的接收时刻，再减去后验采样的 Host 调用耗时；包括攒 AR chunk、缓冲和任务等待。 |
+| `dit.scheduler_wait_ms` | 从组成当前 chunk 的最后一个输入完成 Host bridge admission，到 DiT 开始处理。包含先前任务占用及轮询等待。它与 `dit.wait_ms` 重叠。 |
 | `dit.process_ms` | 去噪前后 CUDA events 的 elapsed_time，加上该输入后验采样前后的 CUDA events 耗时；CPU 采样回退到 Host 调用耗时。采样 event 在已有下游同步边界之后读取，不在输入路径增加同步。wait 仍按 Host 调用区间扣除采样，两项不是可相加的独占墙钟区间。 |
 | `dit.return_ms` | 当前 CUDA 路径取“DiT Host 开始至 latent 发送完成”的总区间减去 CUDA events 耗时；这是余量，可能含 Host、GPU 排队与传输，不能称为纯网络耗时。无 CUDA event 时退回 Host 区间划分。 |
 | `decoder.wait_ms` | `submit` 入解码任务至解码线程通过 step gate 并开始处理的时间。它不包含 submit 前的 latent 接收与共享内存预留等待。 |
 | `decoder.process_ms` | 解码线程开始至本任务全部 RGB 发布完成，包括 decode、RGB 转换、D2H 和共享内存发布；采用 Host 完成边界。 |
-| `decoder.return_ms` | 任务解码完成至输出 WebSocket 发送结束，包括期间的消费/排队与发送；完成时间缺失时当前实现回退为 payload build + msgpack + WS 发送计时。不是浏览器收到或展示的时间。 |
+| `decoder.return_ms` | 任务解码完成至输出 WebSocket 发送结束，包括期间的消费/排队与发送；完成时间缺失时留空，仍可单独查看传输计时。不是浏览器收到或展示的时间。 |
 
 `transport_encode_ms` 是 payload build 与 msgpack 序列化计时之和，`transport_write_ms`
 是 WS send 调用耗时；这两项属于返回路径的诊断信息，不再加到 `decoder.return_ms` 上。

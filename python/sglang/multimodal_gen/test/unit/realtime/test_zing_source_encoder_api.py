@@ -2451,6 +2451,10 @@ def test_condition_ready_clears_inflight_prompt_and_reference_budget(early):
     adapter.condition_switch_protocol = (
         "clip-barrier-v2" if early else "clip-barrier-v1"
     )
+    adapter.ready = {
+        "type": "session.ready",
+        "source_condition_switch_protocol": adapter.condition_switch_protocol,
+    }
     adapter._pending_prompt_command = None
     adapter._pending_sink_command = None
     adapter.ordered_prompts = True

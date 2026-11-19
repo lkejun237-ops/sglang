@@ -40,11 +40,51 @@ def json_line(value: Any) -> str:
     )
 
 
+def manifest_json(manifest: dict, *, indent=None) -> str:
+    """Fit optional model timings within the WTP report collector's manifest limit."""
+    options = dict(
+        ensure_ascii=False,
+        allow_nan=False,
+        indent=indent,
+        separators=(",", ":") if indent is None else None,
+    )
+    encoded = json.dumps(manifest, **options)
+    coverage = manifest.get("model_stage_timing")
+    limit = 1 << 20
+    if coverage is None or len(encoded.encode("utf-8")) <= limit:
+        return encoded
+
+    rows = manifest.pop("frame_stage_breakdown", [])
+    coverage.update(truncated=True, retained_frames=0)
+    without_rows = json.dumps(manifest, **options)
+    if len(without_rows.encode("utf-8")) > limit:
+        # Preserve the pre-existing archive even if its optional marker alone
+        # exhausts the consumer's manifest budget.
+        manifest.pop("model_stage_timing")
+        return json.dumps(manifest, **options)
+
+    low, high = 0, len(rows)
+    # Serialize in the actual archive format so Unicode metadata and pretty
+    # printing count against the same byte limit as the report collector.
+    while low < high:
+        count = (low + high + 1) // 2
+        manifest["frame_stage_breakdown"] = rows[:count]
+        coverage["retained_frames"] = count
+        if len(json.dumps(manifest, **options).encode("utf-8")) <= limit:
+            low = count
+        else:
+            high = count - 1
+    if low:
+        manifest["frame_stage_breakdown"] = rows[:low]
+    else:
+        manifest.pop("frame_stage_breakdown", None)
+    coverage["retained_frames"] = low
+    return json.dumps(manifest, **options)
+
+
 def write_manifest(directory: Path, manifest: dict) -> None:
     temporary = directory / "manifest.tmp"
-    temporary.write_text(
-        json.dumps(manifest, ensure_ascii=False, allow_nan=False, indent=2)
-    )
+    temporary.write_text(manifest_json(manifest, indent=2), encoding="utf-8")
     temporary.replace(directory / "manifest.json")
 
 

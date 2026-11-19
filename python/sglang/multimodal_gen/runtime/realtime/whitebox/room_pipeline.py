@@ -97,7 +97,12 @@ class LocalRoomEngine:
         return getattr(engine, "descriptor", {}).get("modelContext")
 
     async def bind_model_context(
-        self, *, segment_id, create_adapter, start_suspended=False
+        self,
+        *,
+        segment_id,
+        create_adapter,
+        start_suspended=False,
+        require_subscription_pause=False,
     ):
         engine = self.runtime.player(self.stream_id)["engine"]
         binder = getattr(engine, "bind_model_context", None)
@@ -120,6 +125,11 @@ class LocalRoomEngine:
             segment_id=segment_id,
             create_adapter=create,
             **({"start_suspended": True} if start_suspended else {}),
+            **(
+                {"require_subscription_pause": True}
+                if require_subscription_pause
+                else {}
+            ),
         )
 
     def bind_source_reset(self, callback):

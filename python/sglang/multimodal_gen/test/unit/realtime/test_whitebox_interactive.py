@@ -766,3 +766,50 @@ def test_source_and_model_keep_same_capture_clock_and_separate_admission_wait(tm
             await archives.close()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("remove_recording", [False, True])
+def test_ordinary_telemetry_keeps_numeric_metrics_without_optional_capture(
+    tmp_path, monkeypatch, remove_recording
+):
+    from sglang.multimodal_gen.runtime.realtime.whitebox import interactive
+
+    async def run():
+        session, engine, leases, archives = await setup(tmp_path)
+        recording = session.recording
+        observed = asyncio.Event()
+
+        def measure(name, value, *args, **kwargs):
+            if name == "h3_telemetry_dit_wait_ms" and value == 12:
+                observed.set()
+
+        monkeypatch.setattr(interactive, "observe_duration", measure)
+        try:
+            await engine.push()
+            await receive_until(
+                session,
+                lambda m: m.get("type") == "frame_batch" and m.get("stream") == "model",
+            )
+            if remove_recording:
+                session.recording = None
+            await leases.opens[0].emit(
+                dict(
+                    type="chunk_telemetry",
+                    session_id="s1",
+                    generation_id="g1",
+                    chunk_index=0,
+                    output_frame_start=0,
+                    num_frames=1,
+                    dit_wait_ms=12,
+                    frame_stage_breakdown=[{"output_frame": 0, "dit": {"wait_ms": 12}}],
+                )
+            )
+            await asyncio.wait_for(observed.wait(), 2)
+            assert "frame_stage_breakdown" not in recording.manifest
+            assert "model_stage_timing" not in recording.manifest
+        finally:
+            session.recording = recording
+            await session.close()
+            await archives.close()
+
+    asyncio.run(run())

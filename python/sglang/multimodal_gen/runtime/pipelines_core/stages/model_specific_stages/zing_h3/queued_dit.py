@@ -358,8 +358,6 @@ class QueuedDiTSession:
             arrived_ns = (
                 message.get("_dit_arrived_ns") if self.return_stage_timing else None
             )
-            if self.return_stage_timing and type(arrived_ns) is not int:
-                arrived_ns = time.perf_counter_ns()
             sample_events = None
             if self.return_stage_timing and kind == "source.moments" and value.is_cuda:
                 sample_events = (

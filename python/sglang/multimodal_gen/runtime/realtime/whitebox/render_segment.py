@@ -199,7 +199,10 @@ class RenderSegment(InteractiveSession):
                 ),
             )
         }
-        self.detailed_timing = state.get("detailed_timing", False)
+        self.return_stage_timing = getattr(owner, "return_stage_timing", False)
+        self.detailed_timing = self.return_stage_timing or state.get(
+            "detailed_timing", False
+        )
         self.timing_control = TimingControl(self)
         self.room_timings = {1: self._new_room_timing(1)}
         self.timing_metrics = TimingMetrics()
@@ -1243,6 +1246,8 @@ class RenderSegment(InteractiveSession):
                 source_prompt_protocol="ordered-boundary-v2",
                 detailed_timing=self.detailed_timing,
             )
+            if self.return_stage_timing:
+                self.upstream.init["return_stage_timing"] = True
             if getattr(self.leases, "supports_condition_barrier", True):
                 self.upstream.init["source_condition_switch_protocol"] = getattr(
                     self.leases, "condition_switch_protocol", "clip-barrier-v1"

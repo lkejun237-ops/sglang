@@ -6,7 +6,6 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
-import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -18,6 +17,7 @@ from .recording import (
     InputIntervals,
     Recording,
     json_line,
+    manifest_json,
     reference_descriptors,
 )
 from .stream_upload import (
@@ -47,9 +47,7 @@ def relative_name(name):
 
 
 def put_json(client, bucket, key, value):
-    data = json.dumps(
-        value, ensure_ascii=False, allow_nan=False, separators=(",", ":")
-    ).encode()
+    data = manifest_json(value).encode("utf-8")
     if len(data) > 2 << 20:
         raise ValueError("Archive manifest exceeds its byte budget")
     put_bytes(client, bucket, key, data, "application/json")

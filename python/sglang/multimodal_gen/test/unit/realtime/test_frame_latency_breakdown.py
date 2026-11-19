@@ -325,9 +325,14 @@ def test_remote_decoder_counts_cuda_sampling_instead_of_host_launch_time():
     sample_end.synchronize.assert_not_called()
 
 
-@pytest.mark.parametrize("timing_enabled", [False, True])
+@pytest.mark.parametrize(
+    "timing_enabled, decoder_timing_present, matching_range",
+    [(False, True, True), (True, True, True), (True, False, True), (True, True, False)],
+)
 def test_decoder_output_broker_emits_chunk_telemetry_only_when_timing_present(
     timing_enabled,
+    decoder_timing_present,
+    matching_range,
 ):
     cancelled = []
     broker = DecoderOutputBroker(cancelled.append)
@@ -388,6 +393,7 @@ def test_decoder_output_broker_emits_chunk_telemetry_only_when_timing_present(
                         "reference": {"request_id": "r1", "chunk_index": 0},
                         "metadata": {"format": "rgb24", "width": 4, "height": 4},
                         "output_metadata": {
+                            "block_idx": 7,
                             "output_frame_start": 0,
                             "num_frames": 2,
                             "source_dependency_end": 2,
@@ -400,7 +406,11 @@ def test_decoder_output_broker_emits_chunk_telemetry_only_when_timing_present(
                                 }
                             ],
                         },
-                        "timing_state": {"wait_ms": 0.8, "process_ms": 28.5},
+                        "timing_state": (
+                            {"wait_ms": 0.8, "process_ms": 28.5}
+                            if decoder_timing_present
+                            else None
+                        ),
                     },
                     timeout=5,
                 )
@@ -408,7 +418,7 @@ def test_decoder_output_broker_emits_chunk_telemetry_only_when_timing_present(
                     {
                         "type": "decoder.timing",
                         "request_id": "r1",
-                        "chunk_index": 0,
+                        "chunk_index": 7 if matching_range else 8,
                         "output_frame_start": 0,
                         "num_frames": 2,
                         "frame_stage_breakdown": [
@@ -481,13 +491,24 @@ def test_decoder_output_broker_emits_chunk_telemetry_only_when_timing_present(
                 assert m1["type"] == "frame_batch" and m1["output_frame_start"] == 0
                 assert m2["type"] == "chunk_telemetry"
                 assert m2["num_frames"] == 2
+                assert m2["chunk_index"] == (7 if matching_range else 8)
                 assert m2["encoder_wait_ms"] == 15.0
                 assert m2["dit_process_ms"] == 190.0
-                assert m2["decoder_wait_ms"] == 0.8
-                assert m2["decoder_process_ms"] == 28.5
-                assert m2["decoder_return_ms"] == pytest.approx(1.7, abs=0.05)
                 assert len(m2["frame_stage_breakdown"]) == 2
-                assert m2["frame_stage_breakdown"][0]["decoder"]["process_ms"] == 28.5
+                if decoder_timing_present and matching_range:
+                    assert m2["decoder_timing_range_verified"] is True
+                    assert m2["decoder_wait_ms"] == 0.8
+                    assert m2["decoder_process_ms"] == 28.5
+                    assert "decoder_return_ms" not in m2
+                    assert m2["transport_encode_ms"] == 0.6
+                    assert m2["transport_write_ms"] == 1.1
+                    assert (
+                        m2["frame_stage_breakdown"][0]["decoder"]["process_ms"] == 28.5
+                    )
+                else:
+                    assert "decoder_timing_range_verified" not in m2
+                    assert "decoder_process_ms" not in m2
+                    assert "decoder" not in m2["frame_stage_breakdown"][0]
                 assert m3["type"] == "frame_batch" and m3["output_frame_start"] == 2
                 assert m4["type"] == "session.completed"
 
@@ -968,3 +989,46 @@ assert(nodes.get('subtitle').textContent.includes('</script>'));
         capture_output=True,
         text=True,
     )
+
+
+def test_remote_decoder_reports_measured_scheduler_wait_and_omits_missing_arrivals():
+    decoder = object.__new__(RemoteLynnDecoder)
+    rows = decoder._build_chunk_frame_timings(
+        {
+            "dit_start_ns": 1_000_000_000,
+            "input_timings": [
+                {"pixel_start": 0, "pixel_end": 1, "admitted_ns": 600_000_000},
+                {"pixel_start": 1, "pixel_end": 2, "admitted_ns": 745_000_000},
+            ],
+        },
+        start_frame=0,
+        end_frame=2,
+        send_t0_ns=1_100_000_000,
+        send_done_ns=1_110_000_000,
+    )
+    assert [row["dit"]["scheduler_wait_ms"] for row in rows] == [255.0, 255.0]
+    assert all("wait_ms" not in row["dit"] for row in rows)
+
+
+def test_chunk_timing_uses_model_output_chunk_id_not_encoder_dispatch():
+    decoder = object.__new__(RemoteLynnDecoder)
+    decoder.output_attachment = True
+    decoder.output_session = {"generation_id": "current"}
+    decoder.output_metadata = {"block_idx": 2}
+    decoder.request_id = "encoder-dispatch"
+    decoder.chunk_index = 8
+    decoder.oneway = False
+    decoder._request = Mock()
+    decoder._build_chunk_frame_timings = Mock(return_value=[{"output_frame": 12}])
+
+    decoder._emit_chunk_timing(
+        {},
+        start_frame=12,
+        end_frame=13,
+        send_t0_ns=100,
+        send_done_ns=200,
+    )
+    (op,) = decoder._request.call_args.args
+    assert op == "chunk_timing"
+    assert decoder._request.call_args.kwargs["chunk_index"] == 2
+    assert decoder._request.call_args.kwargs["request_id"] == "encoder-dispatch"

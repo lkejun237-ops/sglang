@@ -196,10 +196,18 @@ class CLIConditionChannel:
         else:
             future.set_result(copy.deepcopy(value))
 
-    async def bind(self, *, segment_id, create_adapter, start_suspended=False):
+    async def bind(
+        self,
+        *,
+        segment_id,
+        create_adapter,
+        start_suspended=False,
+        require_subscription_pause=False,
+    ):
         if self.task is not None:
             raise invalid("MODEL_CONTEXT_WRITER_CONFLICT")
         self.segment, self.create_adapter = identity(segment_id), create_adapter
+        self.require_subscription_pause = require_subscription_pause
         self.task = asyncio.create_task(self.run())
         if start_suspended:
             await self.pause()

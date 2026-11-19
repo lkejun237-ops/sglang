@@ -1799,3 +1799,93 @@ def test_controlled_close_does_not_overwrite_cancellation(
         await owner.close()
 
     asyncio.run(run())
+
+
+def timing_operation(requested, *, operation_id="launch-1"):
+    op = operation()
+    op["operationId"] = operation_id
+    params = op["frozenLaunchParameters"]
+    init = msgspec.msgpack.decode(base64.b64decode(params["initMsgpackBase64"]))
+    if requested is not None:
+        init["return_stage_timing"] = requested
+    params["initMsgpackBase64"] = base64.b64encode(
+        msgspec.msgpack.encode(init)
+    ).decode()
+    return op
+
+
+def test_managed_stage_timing_is_owned_by_one_source(tmp_path, monkeypatch):
+    async def run():
+        owner, control = host(tmp_path, monkeypatch)
+        owner.max_sessions = 2
+        traced = timing_operation(True)
+        regular = timing_operation(None, operation_id="launch-2")
+        try:
+            results = await asyncio.gather(
+                control.start(traced), control.start(regular)
+            )
+            sessions = {
+                pipeline.session_id: pipeline.session for pipeline in Pipeline.created
+            }
+            with_timing, without_timing = (
+                sessions[r["execution"]["sourceSessionId"]] for r in results
+            )
+            assert with_timing.return_stage_timing is True
+            assert without_timing.return_stage_timing is False
+        finally:
+            await owner.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("value", [0, 1, "true", []])
+def test_managed_stage_timing_requires_a_literal_boolean(value):
+    from sglang.multimodal_gen.runtime.realtime.whitebox.player_control import (
+        validate_operation,
+    )
+
+    with pytest.raises(ValueError, match="Invalid frozen single player init"):
+        validate_operation(timing_operation(value))
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_frozen_initial_inference_reaches_only_its_original_source(
+    tmp_path, monkeypatch, enabled
+):
+    async def run():
+        owner, control = host(tmp_path, monkeypatch)
+        op = operation()
+        init = msgspec.msgpack.decode(
+            base64.b64decode(op["frozenLaunchParameters"]["initMsgpackBase64"])
+        )
+        init.update(source_operation="create.manual", inference_control="manual")
+        op["frozenLaunchParameters"]["initMsgpackBase64"] = base64.b64encode(
+            msgspec.msgpack.encode(init)
+        ).decode()
+        op["frozenLaunchParameters"]["enableInferenceOnStart"] = enabled
+        try:
+            await control.start(op)
+            assert Pipeline.created[0].session.initial_inference_enabled is enabled
+            await control.start(op)
+            assert len(Pipeline.created) == 1
+            changed = copy.deepcopy(op)
+            changed["frozenLaunchParameters"]["enableInferenceOnStart"] = not enabled
+            with pytest.raises(ValueError, match="changed"):
+                await control.start(changed)
+            await control.close(op)
+        finally:
+            await owner.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true"])
+def test_initial_inference_rejects_non_boolean_before_allocating(value):
+    from sglang.multimodal_gen.runtime.realtime.whitebox.player_control import (
+        validate_operation,
+    )
+
+    op = operation()
+    op["frozenLaunchParameters"]["enableInferenceOnStart"] = value
+    with pytest.raises(ValueError, match="inference"):
+        validate_operation(op)

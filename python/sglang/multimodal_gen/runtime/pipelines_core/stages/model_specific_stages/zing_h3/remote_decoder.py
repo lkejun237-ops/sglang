@@ -522,9 +522,10 @@ class RemoteLynnDecoder:
         send_t0_ns: int,
         send_done_ns: int,
     ) -> list[dict]:
-        dit_start_ns = timing_ctx.get("dit_start_ns")
-        if type(dit_start_ns) is not int:
-            dit_start_ns = send_t0_ns
+        captured_start_ns = timing_ctx.get("dit_start_ns")
+        dit_start_ns = (
+            captured_start_ns if type(captured_start_ns) is int else send_t0_ns
+        )
         ev_dit_start = timing_ctx.get("ev_dit_start")
         ev_dit_end = timing_ctx.get("ev_dit_end")
         total_dit_plus_ret_ms = max(0.0, (send_done_ns - dit_start_ns) / 1e6)
@@ -538,8 +539,19 @@ class RemoteLynnDecoder:
         else:
             raw_dit_proc_ms = max(0.0, (send_t0_ns - dit_start_ns) / 1e6)
             dit_return_ms = max(0.0, (send_done_ns - send_t0_ns) / 1e6)
+        inputs = timing_ctx.get("input_timings") or ()
+        admitted = [
+            lt.get("admitted_ns") if isinstance(lt, dict) else None for lt in inputs
+        ]
+        scheduler_wait_ms = (
+            round((captured_start_ns - max(admitted)) / 1e6, 3)
+            if admitted
+            and type(captured_start_ns) is int
+            and all(type(at) is int and 0 <= at <= captured_start_ns for at in admitted)
+            else None
+        )
         by_frame: dict[int, dict] = {}
-        for lt in timing_ctx.get("input_timings") or ():
+        for lt in inputs:
             if not isinstance(lt, dict):
                 continue
             p0 = lt.get("pixel_start")
@@ -550,8 +562,8 @@ class RemoteLynnDecoder:
             arrived_ns = lt.get("arrived_ns")
             dit_wait_ms = (
                 max(0.0, (dit_start_ns - arrived_ns) / 1e6 - sample_ms)
-                if type(arrived_ns) is int
-                else 0.0
+                if type(captured_start_ns) is int and type(arrived_ns) is int
+                else None
             )
             # Events are local to this rank and precede the already synchronized
             # DiT/send boundary. Reading them here adds no sampling-path wait.
@@ -569,7 +581,16 @@ class RemoteLynnDecoder:
                 row: dict[str, Any] = {
                     "output_frame": frame_idx,
                     "dit": {
-                        "wait_ms": round(dit_wait_ms, 3),
+                        **(
+                            {"wait_ms": round(dit_wait_ms, 3)}
+                            if dit_wait_ms is not None
+                            else {}
+                        ),
+                        **(
+                            {"scheduler_wait_ms": scheduler_wait_ms}
+                            if scheduler_wait_ms is not None
+                            else {}
+                        ),
                         "process_ms": round(dit_proc_ms, 3),
                         "return_ms": round(dit_return_ms, 3),
                     },
@@ -589,7 +610,6 @@ class RemoteLynnDecoder:
             or {
                 "output_frame": frame_idx,
                 "dit": {
-                    "wait_ms": 0.0,
                     "process_ms": round(raw_dit_proc_ms, 3),
                     "return_ms": round(dit_return_ms, 3),
                 },
@@ -608,6 +628,11 @@ class RemoteLynnDecoder:
     ) -> None:
         if not self.output_attachment or end_frame <= start_frame:
             return
+        # Encoder transport dispatch IDs and model output chunks advance at
+        # different rates. Match the chunk ID written to the RGB header.
+        output_chunk_index = (self.output_metadata or {}).get("block_idx")
+        if type(output_chunk_index) is not int or output_chunk_index < 0:
+            return
         frame_timings = self._build_chunk_frame_timings(
             timing_ctx,
             start_frame=start_frame,
@@ -620,7 +645,7 @@ class RemoteLynnDecoder:
         fields = dict(
             generation_id=self.output_session["generation_id"],
             request_id=self.request_id,
-            chunk_index=self.chunk_index,
+            chunk_index=output_chunk_index,
             output_frame_start=start_frame,
             num_frames=end_frame - start_frame,
             frame_stage_breakdown=frame_timings,

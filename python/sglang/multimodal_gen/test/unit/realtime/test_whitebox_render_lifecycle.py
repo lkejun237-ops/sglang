@@ -432,6 +432,9 @@ def test_source_survives_four_segments_and_ordered_prompt_updates(
             ),
             archives=archives,
         )
+        # Signed launch authorization is independently covered at admission.
+        stage_timing = capture_clock
+        source.return_stage_timing = stage_timing
         messages = []
 
         async def consume():
@@ -517,6 +520,17 @@ def test_source_survives_four_segments_and_ordered_prompt_updates(
                     )
                 )
                 segment = source.current_segment
+                model_init = leases.opens[-1].init
+                assert model_init.get("return_stage_timing", False) is stage_timing
+                coverage = segment.recording.manifest.get("model_stage_timing")
+                if stage_timing:
+                    assert model_init["detailed_timing"] is True
+                    assert coverage["output_frames"] >= 1
+                    assert (
+                        coverage["retained_frames"] == 0
+                    )  # Legacy worker emits no timing.
+                else:
+                    assert coverage is None
                 assert (segment.source_view.sampler is not None) == (
                     sampling == "adaptive"
                 )
@@ -1378,8 +1392,10 @@ def test_clip_switch_finishes_old_clip_before_accepted_and_resumes_on_source_rea
                 async with segment.model_admission_condition:
                     await asyncio.wait_for(
                         segment.model_admission_condition.wait_for(
-                            lambda: getattr(segment, "resume_condition_evidence", None)
-                            is not None
+                            lambda: (
+                                getattr(segment, "resume_condition_evidence", None)
+                                is not None
+                            )
                         ),
                         2,
                     )
@@ -2207,6 +2223,7 @@ def test_live_failed_start_does_not_invent_retirement(monkeypatch, confirmed):
         str(Path(__file__).resolve().parents[6] / "benchmark/whitebox")
     )
     import live_source_engine as module
+
     from sglang.multimodal_gen.runtime.realtime.whitebox.room_startup import (
         startup_cleanup_error,
     )

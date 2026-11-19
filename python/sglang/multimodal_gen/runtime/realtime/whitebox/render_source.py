@@ -82,6 +82,7 @@ class SourceLatest(LatestFrame):
 
 class SourceSession(InteractiveSession):
     source_only = True
+    return_stage_timing = False
     defer_startup_until_source = True
     startup = None
     model_binding = control_prefill = None
@@ -302,7 +303,9 @@ class SourceSession(InteractiveSession):
         if getattr(self, "closing", False):
             raise RenderError("PLAYER_EXPIRED")
         try:
-            if self.inference.prepares_on_open:
+            if self.inference.prepares_on_open or getattr(
+                self.inference, "initial_requested", False
+            ):
                 await self.inference.prepare_startup(init)
             elif self.model_binding is not None:
                 await self.model_binding.wait_ready()
@@ -462,6 +465,11 @@ class SourceSession(InteractiveSession):
                 ),
                 verify_model_frame=self.verify_scene_model_frame,
             )
+        initial_inference = (
+            await self.inference.accept_initial()
+            if getattr(self, "initial_inference_enabled", False) is True
+            else None
+        )
         model_startup = (
             self.startup is not None or self.context_startup_request_id is not None
         )
@@ -584,10 +592,19 @@ class SourceSession(InteractiveSession):
             ready["model_context_segment"] = self.model_context_segment(
                 await self.journal.read()
             )
+        if initial_inference is not None:
+            ready.update(
+                inference=copy.deepcopy(self.journal.snapshot.get("inference")),
+                display_mode=self.display_mode,
+                display_revision=self.revision,
+            )
         await self.outgoing.put(msgspec.msgpack.encode(ready))
         self.ready.set()
         self._spawn(self._preview(), "source-preview")
-        if self.startup is not None:
+        if initial_inference is not None:
+            await self.operation_message(initial_inference)
+            await self.inference.dispatch_initial(initial_inference)
+        if self.startup is not None and not self.inference.manual:
             self._spawn(self._finish_startup(), "model-prepare-handoff")
         await self.preview_done.wait()
         self.source_state_value = "ended"
@@ -650,11 +667,13 @@ class SourceSession(InteractiveSession):
         ids = await self.journal.reserve_model_context_segment(
             getattr(self, "context_startup_ids", None)
         )
+        inference = getattr(self, "inference", None)
+        initial_inference = getattr(inference, "initial_request_id", None) is not None
         if (
-            getattr(self, "world_driven", False)
-            and not self.inference.manual
-            and self.inference_enabled()
-        ):
+            initial_inference
+            or getattr(self, "world_driven", False)
+            and not inference.manual
+        ) and self.inference_enabled():
             # Legacy automatic create has no inference.configure command. Its
             # declared World still owns future conditions and the same parent.
             await self.inference.open_prewarm(
@@ -821,6 +840,7 @@ class SourceSession(InteractiveSession):
                 segment_id=ids["segment_id"],
                 create_adapter=create,
                 **({"start_suspended": True} if not self.inference_enabled() else {}),
+                **({"require_subscription_pause": True} if initial_inference else {}),
             )
         finally:
             channel_bound.set()

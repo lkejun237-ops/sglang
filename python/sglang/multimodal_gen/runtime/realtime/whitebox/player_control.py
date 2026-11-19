@@ -116,7 +116,16 @@ def validate_operation(value):
 
     world_reference(world["sourceId"] + "/" + world["worldId"])
     params = value["frozenLaunchParameters"]
-    exact(params, {"initMsgpackBase64", "transport", "publicationIdentity"})
+    exact(
+        params,
+        {"initMsgpackBase64", "transport", "publicationIdentity"},
+        {"enableInferenceOnStart"},
+    )
+    if (
+        "enableInferenceOnStart" in params
+        and type(params["enableInferenceOnStart"]) is not bool
+    ):
+        raise ValueError("Invalid initial inference intent")
     from .cli_room import publication_identity
 
     selected = publication_identity(params["publicationIdentity"])
@@ -136,7 +145,12 @@ def validate_operation(value):
             not isinstance(init, dict)
             or init.get("type") != "init"
             or init.get("control_protocol") != PROTOCOL
+            or type(init.get("return_stage_timing", False)) is not bool
             or not source_create_matches(init)
+            or (
+                "enableInferenceOnStart" in params
+                and init.get("inference_control") != "manual"
+            )
             or not isinstance(init.get("whitebox"), dict)
             or init["whitebox"].get("source_id") != world["sourceId"]
             or init["whitebox"].get("world_id") != world["worldId"]
@@ -308,9 +322,18 @@ class SinglePlayerControl:
                     # the first attachment and subsequent reconnects.
                     pipeline.rtc_source_profile = body.get("source_encoding_profile")
                 pipeline.single_player_operation = key
+                # Only the verified, frozen operation can opt this source in.
+                pipeline.session.return_stage_timing = init.get(
+                    "return_stage_timing", False
+                )
                 pipeline.session.expected_publication = copy.deepcopy(
                     operation["frozenLaunchParameters"]["publicationIdentity"]
                 )
+                # This intent belongs to the authenticated, frozen launch, not
+                # a mutable media-attachment message or another player's source.
+                pipeline.session.initial_inference_enabled = operation[
+                    "frozenLaunchParameters"
+                ].get("enableInferenceOnStart", False)
                 execution = dict(
                     gameId=value.game_id,
                     sourceSessionId=value.session_id,

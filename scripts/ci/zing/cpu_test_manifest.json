@@ -7431,6 +7431,54 @@
           "reason": "CUDA is required for the GPU queue regression"
         },
         {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_queued_dit.py::test_buffered_source_is_reused_by_new_prompt[cuda-cross_chunk-False-False-False]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_queued_dit.py::test_buffered_source_is_reused_by_new_prompt[cuda-cross_chunk-False-False-True]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_queued_dit.py::test_buffered_source_is_reused_by_new_prompt[cuda-cross_chunk-False-True-False]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_queued_dit.py::test_buffered_source_is_reused_by_new_prompt[cuda-cross_chunk-False-True-True]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_queued_dit.py::test_buffered_source_is_reused_by_new_prompt[cuda-cross_chunk-True-False-False]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_queued_dit.py::test_buffered_source_is_reused_by_new_prompt[cuda-cross_chunk-True-False-True]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_queued_dit.py::test_buffered_source_is_reused_by_new_prompt[cuda-cross_chunk-True-True-False]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_queued_dit.py::test_buffered_source_is_reused_by_new_prompt[cuda-cross_chunk-True-True-True]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_queued_dit.py::test_buffered_source_is_reused_by_new_prompt[cuda-off-False-False-False]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_queued_dit.py::test_buffered_source_is_reused_by_new_prompt[cuda-off-False-False-True]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_queued_dit.py::test_buffered_source_is_reused_by_new_prompt[cuda-off-False-True-False]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
+          "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_queued_dit.py::test_buffered_source_is_reused_by_new_prompt[cuda-off-False-True-True]",
+          "reason": "CUDA is required for the GPU queue regression"
+        },
+        {
           "nodeid": "python/sglang/multimodal_gen/test/unit/test_zing_h3_queued_dit.py::test_control_backpressure_and_output_failure_release_state[cuda]",
           "reason": "CUDA is required for the GPU queue regression"
         },

@@ -46,6 +46,10 @@ class SourceInference:
         self.recovery = self.recovery_task = None
         self.scene_retirement = None
         self.lock = asyncio.Lock()
+        self.media_ready = asyncio.Event()
+        if getattr(source, "_model_transport_ready", False):
+            self.media_ready.set()
+        self.initial_request_id = None
         self.frozen = copy.deepcopy(message)
         if self.manual:
             if not source_create_matches(message):
@@ -96,6 +100,8 @@ class SourceInference:
         source = self.source
         try:
             source.start_model_binding(self.frozen)
+            if source.model_binding is None:
+                return
             await source.model_binding.wait_ready()
         except Exception as error:
             code = public_error(error, None)["code"]
@@ -127,6 +133,91 @@ class SourceInference:
             return
         self.preparation = PlayStartup(source, self.startup.request, assets=self.assets)
         self.preparation.launch(init)
+
+    @property
+    def initial_requested(self):
+        return (
+            self.manual
+            and getattr(self.source, "initial_inference_enabled", False) is True
+            and getattr(self.source, "expected_publication", None) is not None
+        )
+
+    async def accept_initial(self):
+        """Accept the frozen intent before subscribing to the World's condition."""
+        source = self.source
+        if not self.initial_requested or self.initial_request_id is not None:
+            return None
+        presentation_failure = None
+        if source.first_presented_required:
+            try:
+                async with asyncio.timeout(source.config.startup_seconds):
+                    await self.media_ready.wait()
+                source.require_opening_presentation_player()
+            except (RenderError, TimeoutError) as error:
+                presentation_failure = getattr(
+                    error, "code", "MODEL_PRESENTATION_UNSUPPORTED"
+                )
+        if any(
+            getattr(source, name, False)
+            for name in ("closed", "closing", "binding_ended")
+        ):
+            return None
+        state = await source.journal.read()
+        # A later explicit control or source reset wins over the initial intent.
+        if state["inference"]["revision"] != 0 or any(
+            operation.get("op") == "model.inference.configure"
+            for operation in state["operations"].values()
+        ):
+            return None
+        request_id = "initial-inference:" + source.session_id
+        generation = self.source_generation()
+        try:
+            result = await source.journal.configure_inference(
+                dict(
+                    type="command",
+                    op="model.inference.configure",
+                    request_id=request_id,
+                    source_session_id=source.session_id,
+                    source_epoch=source.source_epoch,
+                    expected_inference_revision=0,
+                    enabled=True,
+                )
+            )
+        except RenderError as error:
+            if error.code == "REVISION_CONFLICT":
+                return None
+            raise
+        self.initial_request_id = request_id
+        self.initial_generation = generation
+        if presentation_failure is not None:
+            # Enabling inference may fail without taking down the live whitebox,
+            # just as an explicit configure command may fail after startup.
+            await self.disable()
+            result = await source.journal.settle_inference(
+                request_id,
+                result["inference"]["revision"],
+                state="failed",
+                code=presentation_failure,
+            )
+        source.display_mode = source.journal.snapshot["display_mode"]
+        source.revision = source.journal.snapshot["display_revision"]
+        return result
+
+    async def dispatch_initial(self, operation):
+        current = self.source.journal.snapshot["operations"][operation["request_id"]]
+        if current["state"] != "accepted":
+            return
+        if self.source_generation() != self.initial_generation:
+            result = await self.source.journal.settle_inference(
+                operation["request_id"],
+                operation["inference"]["revision"],
+                state="failed",
+                code="MODEL_CONTEXT_STALE_SOURCE",
+                preserve_intent=self.recovering(operation["inference"]["revision"]),
+            )
+            await self.source.operation_message(result)
+            return
+        self.dispatch(operation)
 
     async def discard_preparation(self, *, report_failure=False):
         candidate = self.preparation
@@ -778,7 +869,11 @@ class SourceInference:
         if getattr(source, "first_presented_required", False):
             source.require_opening_presentation_player()
         channel = source.context_channel
-        if self.manual and channel is not None:
+        initial = (
+            getattr(self, "initial_request_id", None) is not None
+            and operation["request_id"] == self.initial_request_id
+        )
+        if self.manual and channel is not None and not initial:
             # A paused handshake has no model-condition delivery. Validate the
             # actual sealed World binding before reserving any model compute.
             await channel.probe_subscription_pause(
@@ -803,7 +898,23 @@ class SourceInference:
         if not self.current(revision):
             return
         channel = source.context_channel
-        if channel is not None:
+        if channel is not None and initial:
+            # The initial subscription was opened with this accepted intent.
+            # Re-probing/re-switching here would retire the condition/preparation
+            # it has already delivered, recreating the serial startup path.
+            async with asyncio.timeout(source.config.startup_seconds):
+                await channel.bound.wait()
+            channel.check()
+            if channel.suspended:
+                raise RenderError(
+                    channel.subscription_probe_error or "MODEL_CONTEXT_PROTOCOL_INVALID"
+                )
+            if not self.current(revision):
+                return
+            expected_segment_id = source.journal.snapshot["model_context_segment_ids"][
+                "segment_id"
+            ]
+        elif channel is not None:
             state = await source.journal.read()
             reserved, segment = state["model_context_segment_ids"], state["segment"]
             pending_context = (

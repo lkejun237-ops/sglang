@@ -508,6 +508,7 @@ class MockStagePipelineWebSocket:
                 {
                     "type": "frame_batch",
                     "output_frame_start": slice_start,
+                    "chunk_index": chunk_idx,
                     "num_frames": slice_count,
                     "pts_us": self.spec.pts(slice_start),
                     "width": self.spec.width,
@@ -560,10 +561,13 @@ class MockStagePipelineWebSocket:
             op_id,
             {
                 "type": "chunk_telemetry",
+                "session_id": self.active_session_id,
+                "generation_id": self.active_generation_id,
                 "chunk_index": chunk_idx,
                 "output_frame_start": start_idx,
                 "num_frames": count,
                 "frame_stage_breakdown": breakdown,
+                "decoder_timing_range_verified": True,
                 **summary,
             },
         )
@@ -879,10 +883,6 @@ async def run_replay_session(
         in_memory_selected: list[dict[str, Any]] = []
 
         class _TelemetrySourceSession(SourceSession):
-            async def _open_engine(self, world_id, world, init):
-                init["return_stage_timing"] = return_stage_timing
-                return await super()._open_engine(world_id, world, init)
-
             async def segment_status(self, seg, st, **fields):
                 if fields.get("phase") == "protocol_ready" and not getattr(
                     seg, "_latency_hook_installed", False
@@ -960,6 +960,7 @@ async def run_replay_session(
             archives=archives,
         )
 
+        source.return_stage_timing = return_stage_timing
         messages: list[dict[str, Any]] = []
         error_messages: list[dict[str, Any]] = []
         prefill_receipts: list[dict[str, Any]] = []

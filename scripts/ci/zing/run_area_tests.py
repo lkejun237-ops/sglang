@@ -17,6 +17,7 @@ AREA_FILES = [
         "test_whitebox_cli_lifetime.py",
         "test_whitebox_render_contract.py",
         "test_whitebox_inference_control.py",
+        "test_whitebox_initial_inference.py",
         "test_whitebox_inference_reset.py",
         "test_whitebox_sink_control.py",
         "test_condition_refresh.py",

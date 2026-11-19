@@ -91,6 +91,7 @@ CHUNK_FIELDS = frozenset(
         "encoder_process_ms",
         "encoder_return_ms",
         "dit_wait_ms",
+        "dit_scheduler_wait_ms",
         "dit_process_ms",
         "dit_return_ms",
         "decoder_wait_ms",
@@ -101,6 +102,7 @@ CHUNK_FIELDS = frozenset(
 )
 STAGE_ROLE_NAMES = ("encoder", "dit", "decoder")
 STAGE_METRIC_FIELDS = frozenset({"wait_ms", "process_ms", "return_ms"})
+DIT_STAGE_METRIC_FIELDS = STAGE_METRIC_FIELDS | {"scheduler_wait_ms"}
 
 
 def numeric_durations(values, allowed):
@@ -128,15 +130,14 @@ def sanitize_frame_stage_breakdown(items, *, start_frame=None, num_frames=None):
             return []
         frame_idx = entry.get("output_frame")
         if type(frame_idx) is not int or frame_idx < 0:
-            if start_frame is None:
-                return []
-            frame_idx = start_frame + idx
+            return []
         elif start_frame is not None and frame_idx != start_frame + idx:
             return []
         row = {"output_frame": frame_idx}
         has_stage = False
         for role in STAGE_ROLE_NAMES:
-            stage_vals = numeric_durations(entry.get(role), STAGE_METRIC_FIELDS)
+            allowed = DIT_STAGE_METRIC_FIELDS if role == "dit" else STAGE_METRIC_FIELDS
+            stage_vals = numeric_durations(entry.get(role), allowed)
             if stage_vals:
                 row[role] = stage_vals
                 has_stage = True

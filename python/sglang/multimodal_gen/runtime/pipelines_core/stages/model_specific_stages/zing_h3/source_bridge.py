@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bounded ownership transfer from encoder clips to checkpoint AR chunks."""
 
+import time
 from collections import deque
 from dataclasses import dataclass
 
@@ -176,6 +177,7 @@ class SourceChunkBridge:
             for item in slice_timing.get("encoder_frame_timings") or ():
                 if isinstance(item, dict) and type(item.get("frame")) is int:
                     enc_map[item["frame"]] = item
+        admitted_ns = time.perf_counter_ns() if slice_timing is not None else None
         cur_px_start = self.accepted_pixels
         for lat_end_px in actual_ends:
             self.latent_timings.append(
@@ -185,6 +187,7 @@ class SourceChunkBridge:
                     pixel_start=cur_px_start,
                     pixel_end=lat_end_px,
                     arrived_ns=arrived_ns,
+                    admitted_ns=admitted_ns,
                     sample_ms=sample_ms,
                     sample_events=slice_timing.get("sample_events"),
                     encoder_frames={

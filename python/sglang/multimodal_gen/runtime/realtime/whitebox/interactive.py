@@ -31,8 +31,8 @@ from .recording import reference_descriptors
 from .session import WhiteboxUpstream
 from .telemetry import (
     CHUNK_FIELDS,
+    ModelStageTiming,
     numeric_durations,
-    sanitize_frame_stage_breakdown,
 )
 
 log = logging.getLogger(__name__)
@@ -741,6 +741,7 @@ class InteractiveSession(WhiteboxUpstream):
         self.preview_done.set()
 
     async def _generation(self, revision, selection, epoch):
+        generation_started_at = time.perf_counter()
         cursor = self.latest.version  # Start from a newly captured source frame.
         self.model_wire_sequence = 0
         self.model_wire_lock = asyncio.Lock()
@@ -764,6 +765,7 @@ class InteractiveSession(WhiteboxUpstream):
             from .model_inputs import ModelInputCapture
 
             recording = getattr(self, "recording", None)
+            stage_timing_requested = getattr(self, "return_stage_timing", False)
             identity = (
                 getattr(assignment, "session_id", None),
                 getattr(assignment, "generation_id", None),
@@ -772,6 +774,11 @@ class InteractiveSession(WhiteboxUpstream):
                 ModelInputCapture(recording, *identity)
                 if recording is not None
                 and all(isinstance(v, str) and v for v in identity)
+                else None
+            )
+            stage_timing = (
+                ModelStageTiming(recording.manifest, epoch, identity)
+                if stage_timing_requested and capture is not None
                 else None
             )
             if recording is not None and capture is None:
@@ -917,7 +924,6 @@ class InteractiveSession(WhiteboxUpstream):
                     capacity=capacity,
                 )
             submitted_timing = {}
-            telemetry_received = 0
             ended = False
             # Two queued source RGBs plus the active encode. Their reservations
             # are already charged to pairs; no unbounded to_thread fan-out.
@@ -1188,12 +1194,7 @@ class InteractiveSession(WhiteboxUpstream):
                 )
 
             async def outputs():
-                nonlocal \
-                    accepted, \
-                    consumed, \
-                    received, \
-                    telemetry_received, \
-                    demand_version
+                nonlocal accepted, consumed, received, demand_version
                 while True:
                     try:
                         message = msgspec.msgpack.decode(await ws.recv())
@@ -1300,6 +1301,10 @@ class InteractiveSession(WhiteboxUpstream):
                                 ),
                             )
                         self.raw_model_frames += count
+                        if stage_timing is not None:
+                            stage_timing.observe_output(
+                                start, count, message.get("chunk_index")
+                            )
                         for local in range(start, start + count):
                             if self.config.room_owned:
                                 frame, captured, _ = pending[local]
@@ -1331,6 +1336,20 @@ class InteractiveSession(WhiteboxUpstream):
                                         # Room may later emit one preview per frame.
                                         "output_batch_start": start,
                                         "output_batch_frames": count,
+                                        **(
+                                            {
+                                                "raw_output_elapsed_ms": round(
+                                                    (
+                                                        output_received
+                                                        - generation_started_at
+                                                    )
+                                                    * 1000,
+                                                    3,
+                                                )
+                                            }
+                                            if stage_timing_requested
+                                            else {}
+                                        ),
                                         "source_to_raw_output_ms": source_to_output_ms,
                                         "source_to_selection_ms": (
                                             selected_at - captured
@@ -1382,46 +1401,33 @@ class InteractiveSession(WhiteboxUpstream):
                             )
                     elif kind == "chunk_telemetry":
                         durations = numeric_durations(message, CHUNK_FIELDS)
-                        frames = message.get("num_frames")
-                        if (
-                            type(frames) is int
-                            and 0 < frames <= 128
-                            and received - frames == telemetry_received
-                        ):
-                            frame_breakdown = sanitize_frame_stage_breakdown(
-                                message.get("frame_stage_breakdown"),
-                                start_frame=telemetry_received,
-                                num_frames=frames,
-                            )
-                            # Diagnostic-only sideband: never delay already decoded
-                            # pixels while waiting for chunk timings or a subscriber.
+                        frame_breakdown = (
+                            stage_timing.receive(message)
+                            if stage_timing is not None
+                            else []
+                        )
+                        if frame_breakdown:
+                            # RGB ownership is independent of diagnostic delivery.
                             timing = dict(
                                 type="whitebox.model_timing",
                                 model_epoch=epoch,
-                                source_frame_start=telemetry_received,
-                                source_frame_end=received,
-                                chunk_index=message.get("chunk_index"),
-                                durations=durations,
-                                **(
-                                    {"frame_stage_breakdown": frame_breakdown}
-                                    if frame_breakdown
-                                    else {}
-                                ),
+                                source_frame_start=frame_breakdown[0]["output_frame"],
+                                source_frame_end=frame_breakdown[-1]["output_frame"]
+                                + 1,
+                                chunk_index=message["chunk_index"],
+                                durations={
+                                    name: value
+                                    for name, value in durations.items()
+                                    if message.get("decoder_timing_range_verified")
+                                    is True
+                                    or not name.startswith(("decoder_", "transport_"))
+                                },
+                                frame_stage_breakdown=frame_breakdown,
                             )
-                            if frame_breakdown:
-                                retained_breakdown = self.recording.manifest.setdefault(
-                                    "frame_stage_breakdown", []
-                                )
-                                if (
-                                    len(retained_breakdown) + len(frame_breakdown)
-                                    <= 4096
-                                ):
-                                    retained_breakdown.extend(frame_breakdown)
                             try:
                                 self.outgoing.put_nowait(msgspec.msgpack.encode(timing))
                             except asyncio.QueueFull:
                                 pass
-                        telemetry_received = received
                         for name, value in durations.items():
                             observe_duration(
                                 "h3_telemetry_" + name,
